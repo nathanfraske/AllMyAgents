@@ -76,6 +76,8 @@ class HubStore {
   selectedId = $state<string | null>(null)
   settingsOpen = $state(false)
   queues = $state<Record<string, string[]>>({})
+  // One-shot flags: suppress a Codex `userMessage` event when we've already echoed it optimistically.
+  private suppressNextUserMsg: Record<string, boolean> = {}
   lastSeq = 0
 
   queueFor(sessionId: string): string[] {
@@ -112,6 +114,7 @@ class HubStore {
       rest = q.slice(1)
     }
     this.queues = { ...this.queues, [sessionId]: rest }
+    this.pushUserEcho(sessionId, toSend) // show the flushed queued message in the transcript
     void api.send(sessionId, toSend)
   }
 
@@ -280,6 +283,30 @@ class HubStore {
     if (!v) return
     v.turnStartedAt = Date.now()
     v.liveTokens = undefined
+  }
+
+  // Optimistically render the user's message the instant it's sent. Claude never echoes user
+  // text back as an event (only tool results), so without this the transcript jumps straight to
+  // the reply. For Codex we set a one-shot suppress flag so its own userMessage event doesn't
+  // double the bubble. Returns the item key so a failed send can roll it back.
+  pushUserEcho(sessionId: string, text: string): string {
+    const v = this.sessions[sessionId]
+    if (!v) return ''
+    const ts = new Date().toISOString()
+    const key = `user:sent:${v.items.length}:${ts}`
+    this.push(v, { kind: 'user', ts, text, key })
+    this.touch(v, ts)
+    if (v.record.provider === 'codex') this.suppressNextUserMsg[sessionId] = true
+    return key
+  }
+
+  // Roll back an optimistic item (e.g. when the send failed).
+  removeItem(sessionId: string, key: string): void {
+    const v = this.sessions[sessionId]
+    if (!v) return
+    const i = v.items.findIndex((it) => it.key === key)
+    if (i >= 0) v.items.splice(i, 1)
+    delete this.suppressNextUserMsg[sessionId]
   }
 
   // Delete a chat: tell the hub (which stops it + writes a tombstone), then drop it locally.
@@ -538,7 +565,12 @@ class HubStore {
       view.sawReasoning = true
       this.push(view, { kind: 'reasoning', ts, text: (item.text as string) ?? '(reasoning)' })
     } else if (type === 'userMessage') {
-      this.push(view, { kind: 'user', ts, text: asText(item.content) })
+      // Skip the bubble we already rendered optimistically; otherwise echo Codex's own record.
+      if (this.suppressNextUserMsg[view.record.id]) {
+        delete this.suppressNextUserMsg[view.record.id]
+      } else {
+        this.push(view, { kind: 'user', ts, text: asText(item.content) })
+      }
     } else if (type === 'commandExecution') {
       this.push(view, { kind: 'tool', ts, toolName: 'command', toolInput: item.command ?? item, toolResult: item.aggregatedOutput as string | undefined })
     } else if (type === 'fileChange') {
@@ -668,7 +700,9 @@ class HubStore {
     const base = this.basePanes()
     if (base.length === 0) return
     const flat = base.flat()
-    const other = this.sessionList.find((v) => !flat.includes(v.record.id))?.record.id ?? flat[flat.length - 1]
+    // Only split when there's a *different* chat to show — never duplicate the sole chat into
+    // two panes.
+    const other = this.sessionList.find((v) => !flat.includes(v.record.id))?.record.id
     if (!other) return
     const rows = base.map((r) => [...r])
     rows[rows.length - 1]!.push(other)

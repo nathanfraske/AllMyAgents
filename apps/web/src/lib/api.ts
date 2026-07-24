@@ -87,12 +87,23 @@ async function jget<T>(url: string): Promise<T> {
 }
 
 async function jpost<T>(url: string, body?: unknown): Promise<T> {
-  const res = await fetch(HUB_HTTP + url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: body ? JSON.stringify(body) : undefined,
-  })
-  return res.json() as Promise<T>
+  try {
+    const res = await fetch(HUB_HTTP + url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+    })
+    const text = await res.text()
+    try {
+      return JSON.parse(text) as T
+    } catch {
+      // Non-JSON response (e.g. a 500 page) — surface a clean error rather than throwing.
+      return { error: text.slice(0, 200) || `HTTP ${res.status}` } as T
+    }
+  } catch (e) {
+    // Network failure (hub unreachable) — return an error the caller renders, never an unhandled reject.
+    return { error: e instanceof Error ? e.message : 'network error' } as T
+  }
 }
 
 export interface LoginResult {

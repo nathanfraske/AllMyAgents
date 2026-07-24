@@ -16,6 +16,7 @@
     $props()
 
   let text = $state('')
+  let sendErr = $state('')
   let scroller = $state<HTMLDivElement | null>(null)
   let stick = $state(true)
   // per-session picker state, seeded from the record
@@ -85,26 +86,36 @@
 
   async function send(): Promise<void> {
     if (!view || !text.trim()) return
+    const sid0 = view.record.id
     const body = text
     text = ''
+    sendErr = ''
     // Busy? Codex steers the running turn; Claude queues (combined/sent on turn end).
     if (active) {
       if (view.record.provider === 'codex') {
-        const out = await api.steer(view.record.id, body)
-        if (out.error) alert(out.error)
+        const out = await api.steer(sid0, body)
+        if (out.error) {
+          text = body // steer failed — give the draft back
+          sendErr = out.error
+        }
       } else {
-        store.enqueue(view.record.id, body)
+        store.enqueue(sid0, body)
       }
       return
     }
     stick = true
-    store.noteSent(view.record.id) // immediate "received / thinking" feedback
-    const out = await api.send(view.record.id, body, {
+    store.noteSent(sid0) // immediate "received / thinking" feedback
+    const key = store.pushUserEcho(sid0, body) // echo the message immediately
+    const out = await api.send(sid0, body, {
       model: model || undefined,
       effort: options.effort ?? undefined,
       serviceTier: options.serviceTier ?? undefined,
     })
-    if (out.error) alert(out.error)
+    if (out.error) {
+      store.removeItem(sid0, key) // roll back the optimistic bubble
+      text = body // and restore the draft so nothing is lost
+      sendErr = out.error
+    }
   }
 
   async function stop(): Promise<void> {
@@ -117,7 +128,8 @@
   }
 
   function onKey(e: KeyboardEvent): void {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    // Don't send mid-IME-composition (e.g. selecting a candidate with Enter in CJK input).
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault()
       void send()
     }
@@ -190,6 +202,7 @@
       </div>
     {/if}
 
+    {#if sendErr}<div class="senderr" role="alert">⚠ {sendErr} — your message was kept in the box.</div>{/if}
     <div class="composer">
       <textarea rows="2" placeholder={steerable ? 'Steer the running turn… (appended to what Codex is doing now)' : active ? 'Queue a message… (sends when the current turn finishes)' : 'Ask for follow-up changes…  (Enter to send, Shift+Enter for newline)'}
         bind:value={text} onkeydown={onKey}></textarea>
@@ -201,7 +214,7 @@
         <span class="spacer"></span>
         <button class="foot-act" onclick={stop} disabled={!active} title="interrupt current turn">interrupt</button>
         <button class="foot-act" onclick={() => api.stop(view.record.id)} title="stop session">stop</button>
-        <button class="send-btn" class:queue={active} title={steerable ? 'steer into the running turn' : active ? 'queue message' : 'send'} onclick={send} disabled={!text.trim()}>{steerable ? '⤵' : active ? '⏲' : '↑'}</button>
+        <button class="send-btn" class:queue={active} title={steerable ? 'steer into the running turn' : active ? 'queue message' : 'send'} onclick={send} disabled={!text.trim()}><Icon name={steerable ? 'corner-down-right' : active ? 'timer' : 'arrow-up'} size={16} /></button>
       </div>
     </div>
     <div class="checkout dim">
@@ -265,7 +278,11 @@
   .qx:hover { background: var(--surface-3); color: var(--bad-text); }
   .send-btn.queue { background: var(--warn); color: #1a1206; }
   .est { color: var(--muted); }
+  .senderr { color: var(--bad-text); font-size: 0.76rem; margin-bottom: 0.45rem; }
+  .tmeta, .est { font-variant-numeric: tabular-nums; }
   .composer { background: var(--surface); border: 1px solid var(--border-strong); border-radius: 14px; padding: 0.6rem 0.7rem 0.5rem; }
+  .composer:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent); }
+  @media (prefers-reduced-motion: no-preference) { .composer { transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease); } }
   .composer textarea { width: 100%; background: none; border: none; resize: none; padding: 0.1rem 0.2rem; }
   .cfoot { display: flex; align-items: center; gap: 0.4rem; margin-top: 0.35rem; }
   .foot-act { font-size: 0.75rem; color: var(--muted); border: 1px solid var(--border); border-radius: 7px; padding: 0.22rem 0.5rem; }
