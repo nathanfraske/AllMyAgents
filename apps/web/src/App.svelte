@@ -4,6 +4,9 @@
   import ThreadView from './lib/ThreadView.svelte'
   import SettingsModal from './lib/SettingsModal.svelte'
   import Dashboard from './lib/Dashboard.svelte'
+  import Titlebar from './lib/Titlebar.svelte'
+  import { cubicOut } from 'svelte/easing'
+  import type { TransitionConfig } from 'svelte/transition'
 
   void store.init()
 
@@ -176,6 +179,39 @@
     store.endDragSession()
   }
 
+  // Reveal a drop-ghost by growing the SPACE it occupies — flex-grow, its size floor and its
+  // margin all ease up from zero — instead of popping in at full size. Because flex children share
+  // one denominator, animating the ghost's flex-grow makes the surrounding panes glide aside frame
+  // by frame (a plain CSS `transition: flex-grow` on the neighbours can't: their own flex-grow never
+  // changes, only the denominator does). It's bidirectional, so a ghost also eases back out when it
+  // unmounts — which softens the "teleport" when the drop zone jumps cells: the old ghost deflates
+  // as the new one grows in. Honors prefers-reduced-motion (instant, no motion) like the CSS paths.
+  function ghostReveal(
+    _node: Element,
+    { grow = 0.7, axis = 'col' }: { grow?: number; axis?: 'col' | 'row' } = {},
+  ): TransitionConfig {
+    if (typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      return { duration: 0 }
+    }
+    // Match the app's motion tokens: pull --dur-slow at runtime, fall back into the 180–240ms band.
+    const raw =
+      (typeof window !== 'undefined'
+        ? getComputedStyle(document.documentElement).getPropertyValue('--dur-slow').trim()
+        : '') || '220ms'
+    const duration = raw.endsWith('ms') ? parseFloat(raw) || 220 : (parseFloat(raw) || 0.22) * 1000
+    const [floorProp, floorPx] = axis === 'row' ? (['min-height', 48] as const) : (['min-width', 60] as const)
+    return {
+      duration,
+      easing: cubicOut,
+      css: (t: number) =>
+        `opacity:${t};` +
+        `flex-grow:${(t * grow).toFixed(4)};` +
+        `${floorProp}:${(t * floorPx).toFixed(2)}px;` +
+        `margin:${(t * 0.5).toFixed(3)}rem;` +
+        `transform:scale(${(0.96 + 0.04 * t).toFixed(4)})`,
+    }
+  }
+
   let pairToken = $state('')
   function doPair(): void {
     if (pairToken.trim()) void store.pair(pairToken)
@@ -184,6 +220,8 @@
 
 <svelte:window onmousemove={onMove} onmouseup={endDrag} />
 
+<div class="app">
+<Titlebar />
 <div
   class="shell"
   class:dragging={sidebarDrag || !!colDrag}
@@ -204,7 +242,7 @@
       <div class="panes" bind:this={panesEl}>
         {#each paneRows as row, r (r)}
           {#if store.dragSession && store.dropZone?.kind === 'row' && store.dropZone.row === r}
-            <div class="ghost-row"><span>drop here</span></div>
+            <div class="ghost-row" transition:ghostReveal={{ grow: 0.5, axis: 'row' }}><span>drop here</span></div>
           {/if}
           {#if r > 0}
             <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
@@ -213,7 +251,7 @@
           <div class="prow" style="flex: {rowFlex[r] ?? 1} 1 0">
             {#each row as id, c (id + ':' + r + ':' + c)}
               {#if store.dragSession && store.dropZone?.kind === 'col' && store.dropZone.row === r && store.dropZone.col === c}
-                <div class="ghost-pane"><span>drop here</span></div>
+                <div class="ghost-pane" transition:ghostReveal={{ grow: 0.7, axis: 'col' }}><span>drop here</span></div>
               {/if}
               {#if c > 0}
                 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
@@ -222,16 +260,17 @@
               <div class="pane" style="flex: {colFlex[r]?.[c] ?? 1} 1 0"><ThreadView sessionId={id} paneIndex={(rowOffsets[r] ?? 0) + c} multiPane={totalPanes > 1} /></div>
             {/each}
             {#if store.dragSession && store.dropZone?.kind === 'col' && store.dropZone.row === r && store.dropZone.col === row.length}
-              <div class="ghost-pane"><span>drop here</span></div>
+              <div class="ghost-pane" transition:ghostReveal={{ grow: 0.7, axis: 'col' }}><span>drop here</span></div>
             {/if}
           </div>
         {/each}
         {#if store.dragSession && store.dropZone?.kind === 'row' && store.dropZone.row === paneRows.length}
-          <div class="ghost-row"><span>drop here</span></div>
+          <div class="ghost-row" transition:ghostReveal={{ grow: 0.5, axis: 'row' }}><span>drop here</span></div>
         {/if}
       </div>
     {/if}
   </main>
+</div>
 </div>
 {#if store.settingsOpen}
   <SettingsModal onclose={() => (store.settingsOpen = false)} />
@@ -248,7 +287,8 @@
 {/if}
 
 <style>
-  .shell { display: grid; height: 100vh; }
+  .app { display: flex; flex-direction: column; height: 100vh; }
+  .shell { display: grid; flex: 1; min-height: 0; }
   .shell.dragging { cursor: col-resize; user-select: none; }
   .shell.rowdragging { cursor: row-resize; user-select: none; }
   .center { display: flex; flex-direction: column; min-width: 0; }
@@ -284,8 +324,8 @@
     .shell.dragging .prow, .shell.dragging .pane,
     .shell.rowdragging .prow, .shell.rowdragging .pane { transition: none; }
     .pane { animation: pane-in var(--dur-slow) var(--ease); }
-    .ghost-pane, .ghost-row { animation: ghost-in 150ms var(--ease); }
+    /* The drop-ghost's enter/exit (opacity, scale, and the space it takes) is animated in JS via
+       the `ghostReveal` bidirectional transition so neighbours glide as it grows/shrinks; see script. */
     @keyframes pane-in { from { opacity: 0; } to { opacity: 1; } }
-    @keyframes ghost-in { from { opacity: 0; transform: scale(0.96); } to { opacity: 1; transform: none; } }
   }
 </style>

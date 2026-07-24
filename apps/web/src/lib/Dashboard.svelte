@@ -33,7 +33,7 @@
   function shade(turns: number): string {
     // Keep zero-activity cells barely above the surface so the grid reads as a heatmap
     // (bright empties made the whole grid look "half-full"); steepen the active ramp.
-    if (turns === 0) return 'color-mix(in srgb, var(--accent) 5%, var(--surface))'
+    if (turns === 0) return 'color-mix(in srgb, var(--accent) 8%, var(--surface-2))'
     const t = turns / maxTurns
     const pct = t < 0.2 ? 26 : t < 0.5 ? 48 : t < 0.8 ? 72 : 100
     return `color-mix(in srgb, var(--accent) ${pct}%, var(--surface-2))`
@@ -99,16 +99,18 @@
       {/if}
       <div class="hero">
         <img class="logo" src="/logo.png" alt="" />
-        {#if settings.ownerName}
-          <h1>{greeting}</h1>
-        {:else}
-          <h1>Welcome to AllMyAgents.</h1>
-          <div class="nameask">
-            <input placeholder="What should I call you?" bind:value={nameInput} onkeydown={(e) => { if (e.key === 'Enter') saveName() }} />
-            <button class="btn btn-primary" onclick={saveName}>Set</button>
-          </div>
-        {/if}
-        <p class="dim">Drag a chat from the sidebar into this space to open it — drop it beside another to split, or above/below to stack.</p>
+        <div class="herotext">
+          {#if settings.ownerName}
+            <h1>{greeting}</h1>
+          {:else}
+            <h1>Welcome to AllMyAgents.</h1>
+            <div class="nameask">
+              <input placeholder="What should I call you?" bind:value={nameInput} onkeydown={(e) => { if (e.key === 'Enter') saveName() }} />
+              <button class="btn btn-primary" onclick={saveName}>Set</button>
+            </div>
+          {/if}
+          <p class="dim">Drag a chat from the sidebar into this space to open it — drop it beside another to split, or above/below to stack.</p>
+        </div>
       </div>
 
       <div class="tiles">
@@ -138,7 +140,7 @@
                 onclick={() => (selectedDate = d.date)}></button>
             {/each}
           </div>
-          <div class="legend dim"><span>less</span><span class="k" style="background: color-mix(in srgb, var(--accent) 5%, var(--surface))"></span><span class="k" style="background: color-mix(in srgb, var(--accent) 48%, var(--surface-2))"></span><span class="k" style="background: var(--accent)"></span><span>more</span></div>
+          <div class="legend dim"><span>less</span><span class="k" style="background: color-mix(in srgb, var(--accent) 8%, var(--surface-2))"></span><span class="k" style="background: color-mix(in srgb, var(--accent) 48%, var(--surface-2))"></span><span class="k" style="background: var(--accent)"></span><span>more</span></div>
         {/if}
       </section>
 
@@ -222,8 +224,9 @@
   }
   .back { color: var(--muted); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--space-2) var(--space-4); margin-bottom: var(--space-6); font-size: var(--text-sm); }
   .back:hover { border-color: var(--border-accent); color: var(--text); }
-  .hero { margin-bottom: var(--space-7); }
-  .hero .logo { width: 40px; height: 40px; object-fit: contain; margin-bottom: var(--space-4); }
+  .hero { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-5); margin-bottom: var(--space-7); }
+  .hero .logo { width: 64px; height: 64px; object-fit: contain; flex: none; }
+  .herotext { flex: 1 1 auto; min-width: 0; }
   h1 { font-size: var(--text-xl); font-weight: var(--fw-semibold); margin: 0 0 var(--space-3); }
   .nameask { display: flex; gap: var(--space-3); margin: var(--space-4) 0; }
   .nameask input { flex: 1; max-width: 320px; }
@@ -248,13 +251,21 @@
   .prov { display: flex; align-items: center; gap: var(--space-3); font-family: var(--mono); font-size: var(--text-md); font-variant-numeric: tabular-nums; }
   .card { padding: var(--space-5); min-width: 0; }
   .card h3, .detail h3 { margin: 0 0 var(--space-4); font-size: var(--text-2xs); text-transform: uppercase; letter-spacing: var(--ls-label); color: var(--dim); }
-  .cal { display: grid; grid-template-rows: repeat(7, 13px); grid-auto-flow: column; grid-auto-columns: 13px; gap: 3px; }
-  .cell { border-radius: var(--r-xs); padding: 0; border: 0; }
+  /* Fixed 18px square tracks (GitHub-contribution feel) instead of stretched 1fr columns —
+     with only ~15 week-columns, 1fr ballooned each cell to ~50px. Left-aligned via
+     justify-content:start; the grid no longer spans the card, which is fine. */
+  .cal { display: grid; grid-template-rows: repeat(7, 18px); grid-auto-flow: column; grid-auto-columns: 18px; gap: 3px; justify-content: start; }
+  /* Every tile carries a faint inset hairline so the matrix reads cleanly even where the
+     fill is near the card colour (zero-activity days). */
+  .cell { border-radius: var(--r-xs); padding: 0; border: 0; box-shadow: inset 0 0 0 1px var(--border); }
+  .cell.pad { box-shadow: none; }
   .cell:not(.pad) { cursor: pointer; }
-  .cell:not(.pad):hover { outline: 1px solid var(--border-strong); }
-  .cell.selected { outline: 2px solid var(--accent); outline-offset: 1px; transform: scale(1.15); }
+  .cell:not(.pad):hover { box-shadow: inset 0 0 0 1px var(--border-strong); }
+  /* Inset accent ring for the pinned day — stays within the cell bounds (no scale/overlap
+     into neighbouring cells or rows). The :hover pairing keeps the ring on when hovered. */
+  .cell.selected, .cell.selected:hover { box-shadow: inset 0 0 0 2px var(--accent); }
   .legend { display: flex; align-items: center; gap: 4px; font-size: var(--text-2xs); margin-top: var(--space-4); }
-  .legend .k { width: 12px; height: 12px; border-radius: var(--r-xs); display: inline-block; }
+  .legend .k { width: 12px; height: 12px; border-radius: var(--r-xs); display: inline-block; box-shadow: inset 0 0 0 1px var(--border); }
   .projs { display: flex; flex-direction: column; gap: var(--space-4); }
   .ptop { display: flex; justify-content: space-between; font-size: var(--text-sm); margin-bottom: var(--space-1); }
   .pname { font-weight: var(--fw-medium); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -291,7 +302,7 @@
     .tile, .card, .detail { transition: border-color var(--dur) var(--ease), transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease); }
     .tile:hover { transform: translateY(-2px); border-color: var(--border-strong);
       box-shadow: var(--edge-hi), var(--shadow-3); }
-    .cell { transition: outline-color var(--dur) var(--ease), background var(--dur-slow) var(--ease), transform var(--dur) var(--ease); }
+    .cell { transition: box-shadow var(--dur) var(--ease), background var(--dur-slow) var(--ease); }
     .pfill { transition: width var(--dur-slow) var(--ease); }
     .detail { animation: fade-in var(--dur-slow) var(--ease); }
     .tip { animation: pop-in var(--dur-fast) var(--ease); }

@@ -230,6 +230,24 @@
     </section>
 
     <section>
+      <h3>Unfiled / detached chats</h3>
+      <label class="opt row2">Default destination
+        <select value={settings.detachedDefaultProjectId ?? ''} onchange={(e) => settings.set('detachedDefaultProjectId', (e.target as HTMLSelectElement).value || null)}>
+          <option value="">Unfiled (scratch)</option>
+          {#each store.projects as p (p.id)}<option value={p.id}>{p.name}</option>{/each}
+        </select>
+      </label>
+      <label class="opt row2">Permission level
+        <select value={settings.detachedDefaultMode} onchange={(e) => settings.set('detachedDefaultMode', (e.target as HTMLSelectElement).value as 'safe' | 'edits' | 'full')}>
+          <option value="safe">Safe (ask)</option>
+          <option value="edits">Edits free</option>
+          <option value="full">Full access (un-restricted)</option>
+        </select>
+      </label>
+      <p class="hint dim">Applies to chats started outside any project — they land in "Unfiled" unless you pick a default destination above. Both settings are just defaults and can be overridden per chat; "Full access" un-restricts detached chats (no approvals).</p>
+    </section>
+
+    <section>
       <h3>Composer</h3>
       <label class="opt"><input type="checkbox" checked={settings.showTokenEstimate} onchange={() => settings.toggleTokenEstimate()} /> Show next-call token estimate under the chatbox</label>
       <label class="opt"><input type="checkbox" checked={settings.combineQueued} onchange={() => settings.toggleCombineQueued()} /> Auto-combine queued messages (before the model reads them)</label>

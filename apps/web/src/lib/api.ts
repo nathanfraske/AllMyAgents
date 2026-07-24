@@ -25,6 +25,8 @@ export interface SessionRecord {
   effort?: string
   serviceTier?: string
   permissionMode?: string
+  title?: string
+  titleSource?: string
   createdAt: string
 }
 
@@ -171,6 +173,35 @@ export interface Instruction {
   updatedAt: string
 }
 
+export interface Memory {
+  id: string
+  scope: string
+  title: string
+  body: string
+  tags: string[]
+  fromSession: string | null
+  fromProfile: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface BusMessage {
+  id: string
+  groupId: string
+  ts: string
+  fromSession: string
+  fromProfile: string
+  fromLabel: string
+  project: string | null
+  toKind: 'session' | 'project'
+  toId: string
+  toSession: string
+  subject: string | null
+  body: string
+  delivered: boolean
+  readAt: string | null
+}
+
 export const api = {
   profiles: () => jget<ProfileInfo[]>('/api/profiles'),
   stats: () => jget<StatsResult>('/api/stats'),
@@ -204,4 +235,17 @@ export const api = {
   auth: () => jget<{ requireToken: boolean; authed: boolean }>('/api/auth'),
   instructions: () => jget<Instruction[]>('/api/instructions'),
   setInstructions: (scope: string, content: string) => jpost<Instruction[]>('/api/instructions', { scope, content }),
+  rename: (id: string, title: string) => jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/title`, { title }),
+  memory: (scope?: string) => jget<Memory[]>(`/api/memory${scope ? `?scope=${encodeURIComponent(scope)}` : ''}`),
+  searchMemory: (q: string, scope?: string) =>
+    jget<Memory[]>(`/api/memory?q=${encodeURIComponent(q)}${scope ? `&scope=${encodeURIComponent(scope)}` : ''}`),
+  writeMemory: (scope: string, title: string, body: string, tags?: string[]) =>
+    jpost<Memory | { error: string }>('/api/memory', { scope, title, body, tags }),
+  bus: (opts: { project?: string; session?: string } = {}) => {
+    const p = new URLSearchParams()
+    if (opts.project) p.set('project', opts.project)
+    if (opts.session) p.set('session', opts.session)
+    const qs = p.toString()
+    return jget<BusMessage[]>(`/api/bus${qs ? `?${qs}` : ''}`)
+  },
 }

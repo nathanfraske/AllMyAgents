@@ -150,11 +150,11 @@
     {#if multiPane}
       <select class="paneselect" value={view.record.id} onchange={(e) => store.setPaneSession(paneIndex, (e.target as HTMLSelectElement).value)}>
         {#each store.sessionList as s (s.record.id)}
-          <option value={s.record.id}>{s.record.profileId} · {(s.record.worktree ?? s.record.cwd).split(/[\\/]/).pop()}</option>
+          <option value={s.record.id}>{s.record.title ?? `${s.record.profileId} · ${(s.record.worktree ?? s.record.cwd).split(/[\\/]/).pop()}`}</option>
         {/each}
       </select>
     {:else}
-      <span class="title">{view.record.profileId}</span>
+      <span class="title">{view.record.title ?? view.record.profileId}</span>
     {/if}
     <span class="statuschip {st.key}"><span class="dot {st.key}"></span>{st.label}</span>
     <span class="sub dim">{view.record.model ?? view.record.provider}</span>

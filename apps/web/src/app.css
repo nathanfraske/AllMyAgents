@@ -1,20 +1,20 @@
 :root {
   /* Critical Error Computing brand palette (criticalerrorcomputing.com) */
-  --bg: #070711;
-  --sidebar: #0d0c1a;
-  --surface: #161526;
-  --surface-2: #1c1b2e;
-  --surface-3: #272640;
+  --bg: #06070e;
+  --sidebar: #0b0c15;
+  --surface: #14151f;
+  --surface-2: #1a1b26;
+  --surface-3: #242534;
   --text: #f5f5f8;
   --muted: #a9a9b7;
   --dim: #8b8b9c; /* lightened to clear WCAG AA (~5:1) on --surface for small meta text */
-  --accent: #ed2398;
-  --accent-hover: #ff2bd6;
+  --accent: #bf3b81;
+  --accent-hover: #cf5194;
   --secondary: #8c67f2;
-  --cyan: #41d9f8;
-  --pop: #39ff14;
+  --cyan: #51acc2;
+  --pop: #4faf41;
   --ok: #5edb81;
-  --working: #41d9f8;
+  --working: #51acc2;
   --warn: #f2a618;
   --bad: #ee0b2a;
   --bad-text: #f84a54;
@@ -150,10 +150,10 @@ code, pre { font-family: var(--mono); }
 .dot {
   width: 8px; height: 8px; border-radius: 50%;
   background: var(--dim); flex: none;
-  --glow: 65, 217, 248;
+  --glow: 81, 172, 194;
   box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08); /* faint resting ring for definition on busy rows */
 }
-.dot.working, .dot.active, .dot.starting { background: var(--working); --glow: 65, 217, 248; }
+.dot.working, .dot.active, .dot.starting { background: var(--working); --glow: 81, 172, 194; }
 .dot.completed { background: var(--ok); }
 .dot.approval { background: var(--warn); --glow: 242, 166, 24; }
 .dot.question { background: var(--secondary); --glow: 140, 103, 242; }

@@ -7,7 +7,16 @@ export interface StatusInfo {
   label: string
 }
 
-export type ItemKind = 'user' | 'assistant' | 'thinking' | 'tool' | 'reasoning' | 'status' | 'error' | 'note'
+export type ItemKind =
+  | 'user'
+  | 'assistant'
+  | 'thinking'
+  | 'tool'
+  | 'reasoning'
+  | 'status'
+  | 'error'
+  | 'note'
+  | 'bus'
 
 export interface ThreadItem {
   key: string
@@ -20,6 +29,11 @@ export interface ThreadItem {
   toolError?: boolean
   reflex?: boolean
   status?: string
+  // Inter-agent bus message (kind: 'bus'): whether this session sent or received it, the other
+  // party's label, and an optional subject. `text` holds the message body.
+  busDir?: 'sent' | 'received'
+  busPeer?: string
+  busSubject?: string
 }
 
 export interface SessionView {
@@ -66,6 +80,79 @@ function asText(content: unknown): string {
   return JSON.stringify(content)
 }
 
+// --- Sidebar ordering (persisted) ---------------------------------------------------------------
+// The user can hand-arrange PROJECT groups and the CHAT rows within each group by dragging. We
+// persist only the chosen order as id lists under namespaced localStorage keys (same convention as
+// `allmyagents.sidebarWidth`) and re-apply them when building the sidebar. Ids missing from a saved
+// list keep their natural order (projects: hub order; chats: recency) and are appended after the
+// known ones, so a freshly created project/chat is never dropped.
+const ORDER_PROJECTS_KEY = 'allmyagents.order.projects'
+const ORDER_CHATS_PREFIX = 'allmyagents.order.chats.'
+
+function loadOrder(key: string): string[] {
+  try {
+    const raw = localStorage.getItem(key)
+    if (raw) {
+      const arr = JSON.parse(raw) as unknown
+      if (Array.isArray(arr)) return arr.filter((x): x is string => typeof x === 'string')
+    }
+  } catch {
+    /* ignore */
+  }
+  return []
+}
+
+function saveOrder(key: string, ids: string[]): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(ids))
+  } catch {
+    /* ignore */
+  }
+}
+
+// Load every persisted chat order up front by scanning the namespaced keys, so saved arrangements
+// apply on the first render after a reload — not only after a group is touched again.
+function loadChatOrders(): Record<string, string[]> {
+  const out: Record<string, string[]> = {}
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i)
+      if (k && k.startsWith(ORDER_CHATS_PREFIX)) out[k.slice(ORDER_CHATS_PREFIX.length)] = loadOrder(k)
+    }
+  } catch {
+    /* ignore */
+  }
+  return out
+}
+
+// Stable-sort `items` by a saved id order. Ids not present in `order` keep their incoming relative
+// order and land after the known ones — never dropped.
+function applyOrder<T>(items: T[], order: string[], idOf: (x: T) => string): T[] {
+  if (order.length === 0) return items
+  const pos = new Map(order.map((id, i) => [id, i]))
+  return items
+    .map((item, i) => ({ item, i }))
+    .sort((a, b) => {
+      const pa = pos.get(idOf(a.item)) ?? Infinity
+      const pb = pos.get(idOf(b.item)) ?? Infinity
+      return pa === pb ? a.i - b.i : pa - pb
+    })
+    .map((x) => x.item)
+}
+
+// Move `fromId` to sit where `toId` currently is. Inserting at toId's original index lands the item
+// before the target when dragging up and after it when dragging down — the natural drag-reorder
+// feel. Returns the SAME array reference when nothing changes, so callers can skip no-op writes.
+function moveInto(ids: string[], fromId: string, toId: string): string[] {
+  const from = ids.indexOf(fromId)
+  const to = ids.indexOf(toId)
+  if (from < 0 || to < 0 || from === to) return ids
+  const next = ids.slice()
+  next.splice(from, 1)
+  next.splice(to, 0, fromId)
+  return next
+}
+
 class HubStore {
   profiles = $state<ProfileInfo[]>([])
   projects = $state<ProjectInfo[]>([])
@@ -77,6 +164,11 @@ class HubStore {
   selectedId = $state<string | null>(null)
   settingsOpen = $state(false)
   queues = $state<Record<string, string[]>>({})
+  // Persisted sidebar arrangement: ordered project ids, and ordered chat ids keyed by group id
+  // ('__none__' for the Unfiled group). Reorder methods update these + localStorage; the sidebar
+  // reads `orderedProjects` / `orderedChats` to apply them.
+  projectOrder = $state<string[]>(loadOrder(ORDER_PROJECTS_KEY))
+  chatOrder = $state<Record<string, string[]>>(loadChatOrders())
   // One-shot flags: suppress a Codex `userMessage` event when we've already echoed it optimistically.
   private suppressNextUserMsg: Record<string, boolean> = {}
   lastSeq = 0
@@ -135,6 +227,42 @@ class HubStore {
     return out
   }
 
+  // --- Sidebar ordering -----------------------------------------------------------------------
+  // Projects in the user's saved order; new/unknown projects appended in hub order.
+  get orderedProjects(): ProjectInfo[] {
+    return applyOrder(this.projects, this.projectOrder, (p) => p.id)
+  }
+
+  // Sort a group's already-bucketed sessions by the saved chat order for that group id. New/unknown
+  // chats keep their incoming (recency) order after the saved ones. Called per group by the sidebar.
+  orderedChats(groupId: string, sessions: SessionView[]): SessionView[] {
+    return applyOrder(sessions, this.chatOrder[groupId] ?? [], (s) => s.record.id)
+  }
+
+  // Full membership of a group (projectId, or '__none__' for unfiled) in recency order — reorder
+  // operates on this, independent of any active sidebar search filter.
+  private groupSessionIds(groupId: string): string[] {
+    return this.sessionList.filter((s) => (s.record.projectId ?? '__none__') === groupId).map((s) => s.record.id)
+  }
+
+  // Drag-reorder a PROJECT group: move `fromId` to `toId`'s slot, persist, stay reactive.
+  reorderProjects(fromId: string, toId: string): void {
+    const cur = applyOrder(this.projects.map((p) => p.id), this.projectOrder, (id) => id)
+    const next = moveInto(cur, fromId, toId)
+    if (next === cur) return
+    this.projectOrder = next
+    saveOrder(ORDER_PROJECTS_KEY, next)
+  }
+
+  // Drag-reorder a CHAT row within its group: move `fromId` to `toId`'s slot, persist, stay reactive.
+  reorderChats(groupId: string, fromId: string, toId: string): void {
+    const cur = applyOrder(this.groupSessionIds(groupId), this.chatOrder[groupId] ?? [], (id) => id)
+    const next = moveInto(cur, fromId, toId)
+    if (next === cur) return
+    this.chatOrder = { ...this.chatOrder, [groupId]: next }
+    saveOrder(ORDER_CHATS_PREFIX + groupId, next)
+  }
+
   async init(): Promise<void> {
     // If the hub enforces a device token and we don't hold a valid one, gate on pairing first.
     const auth = await api.auth().catch(() => ({ requireToken: false, authed: true }))
@@ -190,12 +318,16 @@ class HubStore {
     try {
       const profile = this.profiles.find((p) => p.id === pid)
       const model = profile?.provider === 'codex' ? settings.defaultCodexModel : settings.defaultClaudeModel
+      // A chat opened without an explicit project is "detached/unfiled" — apply the operator's
+      // detached-chat defaults: a default destination project (else stays Unfiled) and a mode.
+      const detached = !projectId
+      const destProject = projectId ?? (detached ? (settings.detachedDefaultProjectId ?? undefined) : undefined)
       const body: Record<string, unknown> = {
         profileId: pid,
-        permissionMode: settings.defaultPermissionMode,
+        permissionMode: detached ? settings.detachedDefaultMode : settings.defaultPermissionMode,
         useWorktree: useWorktree ?? settings.defaultUseWorktree,
       }
-      if (projectId) body.projectId = projectId
+      if (destProject) body.projectId = destProject
       if (model) body.model = model
       const out = await api.spawn(body)
       if (out && !('error' in out)) {
@@ -361,6 +493,24 @@ class HubStore {
     this.removeSessionLocal(id)
   }
 
+  // Rename a chat optimistically (freezes auto-naming). The canonical session/titled echo re-applies
+  // the same value — a visual no-op — so no suppress bookkeeping is needed; only rollback on error.
+  renameSession(id: string, title: string): void {
+    const v = this.sessions[id]
+    if (!v) return
+    const clean = title.trim()
+    if (!clean) return
+    const prev = { title: v.record.title, source: v.record.titleSource }
+    v.record.title = clean
+    v.record.titleSource = 'user'
+    void api.rename(id, clean).then((r) => {
+      if (r && 'error' in r && r.error) {
+        v.record.title = prev.title
+        v.record.titleSource = prev.source
+      }
+    })
+  }
+
   // Remove a session from all local state: the roster, its queue, any panes it occupies, and
   // the selection. Idempotent — also runs when a `session/deleted` event arrives from the hub.
   private removeSessionLocal(id: string): void {
@@ -472,6 +622,28 @@ class HubStore {
         // Skip if we already rendered it optimistically this turn.
         if (this.suppressNextUserMsg[sessionId]) delete this.suppressNextUserMsg[sessionId]
         else this.push(view, { kind: 'user', ts, text: (payload as { text?: string }).text ?? '' })
+        break
+      }
+      case 'session/titled': {
+        const p = payload as { title?: string; source?: string }
+        if (p.title) {
+          view.record.title = p.title
+          if (p.source === 'user' || p.source === 'auto') view.record.titleSource = p.source
+        }
+        break
+      }
+      case 'bus/sent': {
+        // This session sent a message to a teammate / its project.
+        const p = payload as { to?: { kind?: string; id?: string }; subject?: string | null; body?: string; recipients?: number }
+        const peer = p.to?.kind === 'project' ? `project · ${p.recipients ?? 0} agent(s)` : `agent ${(p.to?.id ?? '').slice(0, 8)}`
+        this.push(view, { kind: 'bus', ts, busDir: 'sent', busPeer: peer, busSubject: p.subject ?? undefined, text: p.body ?? '' })
+        break
+      }
+      case 'bus/delivered': {
+        // A teammate's message the hub delivered into this session (rendered as a distinct card).
+        const p = payload as { fromLabel?: string; fromSession?: string; subject?: string | null; body?: string }
+        const peer = p.fromLabel || (p.fromSession ?? '').slice(0, 8)
+        this.push(view, { kind: 'bus', ts, busDir: 'received', busPeer: peer, busSubject: p.subject ?? undefined, text: p.body ?? '' })
         break
       }
       case 'session/status': {
@@ -729,6 +901,9 @@ class HubStore {
   // Place a dragged chat according to the computed drop zone.
   dropAt(zone: DropZone, id: string): void {
     const base = this.basePanes()
+    // Already open in a pane → don't spawn a duplicate view of the same chat (dragging an
+    // already-open chat back into the panes was creating a second identical pane).
+    if (base.some((row) => row.includes(id))) return
     if (base.length === 0) {
       // From the dashboard there is nothing to split — just open the chat.
       this.selectedId = id

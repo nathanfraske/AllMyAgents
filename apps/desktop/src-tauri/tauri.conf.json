@@ -18,9 +18,12 @@
         "height": 820,
         "minWidth": 900,
         "minHeight": 600,
-        "resizable": true
+        "resizable": true,
+        "decorations": false,
+        "dragDropEnabled": false
       }
     ],
+    "withGlobalTauri": true,
     "security": {
       "csp": null
     }

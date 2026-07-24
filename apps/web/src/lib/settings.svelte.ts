@@ -9,6 +9,8 @@ interface Settings {
   defaultCodexModel: string
   defaultUseWorktree: boolean
   ownerName: string
+  detachedDefaultProjectId: string | null
+  detachedDefaultMode: 'safe' | 'edits' | 'full'
 }
 
 const KEY = 'allmyagents.settings'
@@ -24,6 +26,8 @@ const DEFAULTS: Settings = {
   defaultCodexModel: '',
   defaultUseWorktree: true,
   ownerName: '',
+  detachedDefaultProjectId: null,
+  detachedDefaultMode: 'safe',
 }
 
 function load(): Settings {
@@ -47,6 +51,8 @@ class SettingsStore {
   defaultCodexModel = $state('')
   defaultUseWorktree = $state(true)
   ownerName = $state('')
+  detachedDefaultProjectId = $state<string | null>(null)
+  detachedDefaultMode = $state<'safe' | 'edits' | 'full'>('safe')
 
   constructor() {
     const s = load()
@@ -60,6 +66,8 @@ class SettingsStore {
     this.defaultCodexModel = s.defaultCodexModel
     this.defaultUseWorktree = s.defaultUseWorktree
     this.ownerName = s.ownerName
+    this.detachedDefaultProjectId = s.detachedDefaultProjectId
+    this.detachedDefaultMode = s.detachedDefaultMode
   }
 
   save(): void {
@@ -77,6 +85,8 @@ class SettingsStore {
           defaultCodexModel: this.defaultCodexModel,
           defaultUseWorktree: this.defaultUseWorktree,
           ownerName: this.ownerName,
+          detachedDefaultProjectId: this.detachedDefaultProjectId,
+          detachedDefaultMode: this.detachedDefaultMode,
         })
       )
     } catch {

@@ -69,6 +69,16 @@
       {/if}
     </div>
   {/if}
+{:else if item.kind === 'bus'}
+  <div class="bus {item.busDir ?? 'received'}">
+    <div class="bus-hd">
+      <span class="bus-dir">{item.busDir === 'sent' ? '→ sent to' : '← from'}</span>
+      <span class="bus-peer">{item.busPeer}</span>
+      {#if item.busSubject}<span class="bus-subj">{item.busSubject}</span>{/if}
+      {#if fmtTime(item.ts)}<span class="ts" title={new Date(item.ts).toLocaleString()}>{fmtTime(item.ts)}</span>{/if}
+    </div>
+    <div class="bus-body"><Markdown text={item.text ?? ''} /></div>
+  </div>
 {/if}
 
 <style>
