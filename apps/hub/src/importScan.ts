@@ -51,12 +51,30 @@ export interface ImportableChat {
   alreadyImported: boolean
 }
 
+/**
+ * Read-only summary of a project folder's adoptable configuration — surfaced so the user can SEE
+ * what's there. Deliberately values-free: MCP env/headers are credentials, so only names, transport
+ * and a `hasSecrets` flag leave the hub (never the actual values). Wiring these up (Claude MCP
+ * trust, Codex config.toml, a hook runner) is a documented follow-up, not done here.
+ */
+export interface ProjectConfig {
+  mcpServers: { name: string; transport: 'stdio' | 'http' | 'sse'; hasSecrets: boolean }[]
+  /** Hook event names present in .claude/settings*.json (e.g. ["PreToolUse","PostToolUse"]). */
+  hooks: string[]
+  /** Whether .claude/settings*.json defines a permissions allow/deny policy. */
+  hasPermissions: boolean
+  memoryFiles: { name: string; bytes: number }[]
+  /** Config files actually found at the project root (relative names). */
+  sources: string[]
+}
+
 export interface ScanResult {
   path: string
   chats: ImportableChat[]
   /** profileId → count of importable (not-yet-imported) chats found under it. */
   byProfile: Record<string, number>
   scannedProfiles: string[]
+  config: ProjectConfig
   warnings: string[]
 }
 
@@ -404,6 +422,74 @@ function codexIdFromFilename(file: string): string | undefined {
   return m?.[1]
 }
 
+function readJsonFile(file: string): Record<string, unknown> | undefined {
+  try {
+    if (!fs.existsSync(file)) return undefined
+    return JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>
+  } catch {
+    return undefined // malformed config — caller records a warning
+  }
+}
+
+/**
+ * Detect a project folder's adoptable config (MCP servers, hooks, permissions, memory files),
+ * values-free. Reads `<path>/.mcp.json`, `<path>/.claude/settings.json` (+ `.local.json`), and stats
+ * `CLAUDE.md`/`AGENTS.md`. Never opens `.env`, `auth.json`, or `.credentials.json`.
+ */
+export function readProjectConfig(projectPath: string, warnings: string[] = []): ProjectConfig {
+  const sources: string[] = []
+  const mcpServers: ProjectConfig['mcpServers'] = []
+  const mcpPath = path.join(projectPath, '.mcp.json')
+  if (fs.existsSync(mcpPath)) {
+    const mcp = readJsonFile(mcpPath)
+    if (mcp) {
+      sources.push('.mcp.json')
+      const servers = (mcp.mcpServers ?? {}) as Record<string, Record<string, unknown>>
+      for (const [name, def] of Object.entries(servers)) {
+        const type = typeof def.type === 'string' ? (def.type as string) : undefined
+        const transport = type === 'http' || type === 'sse' ? type : 'stdio'
+        const env = def.env as Record<string, unknown> | undefined
+        const headers = def.headers as Record<string, unknown> | undefined
+        const hasSecrets = !!(env && Object.keys(env).length) || !!(headers && Object.keys(headers).length)
+        mcpServers.push({ name, transport, hasSecrets })
+      }
+    } else {
+      warnings.push('malformed .mcp.json')
+    }
+  }
+  // Hooks + permissions live in .claude/settings.json, overridden by settings.local.json.
+  const hookEvents = new Set<string>()
+  let hasPermissions = false
+  for (const rel of ['.claude/settings.json', '.claude/settings.local.json']) {
+    const p = path.join(projectPath, rel.replace('/', path.sep))
+    if (!fs.existsSync(p)) continue
+    const s = readJsonFile(p)
+    if (!s) {
+      warnings.push(`malformed ${rel}`)
+      continue
+    }
+    sources.push(rel)
+    const hooks = s.hooks as Record<string, unknown> | undefined
+    if (hooks && typeof hooks === 'object') {
+      for (const [event, entries] of Object.entries(hooks)) {
+        if (Array.isArray(entries) && entries.length) hookEvents.add(event)
+      }
+    }
+    const perms = s.permissions as Record<string, unknown> | undefined
+    if (perms && (Array.isArray(perms.allow) || Array.isArray(perms.deny))) hasPermissions = true
+  }
+  const memoryFiles: ProjectConfig['memoryFiles'] = []
+  for (const name of ['CLAUDE.md', 'AGENTS.md']) {
+    try {
+      const st = fs.statSync(path.join(projectPath, name))
+      if (st.isFile()) memoryFiles.push({ name, bytes: st.size })
+    } catch {
+      /* absent */
+    }
+  }
+  return { mcpServers, hooks: [...hookEvents], hasPermissions, memoryFiles, sources }
+}
+
 /**
  * Scan every profile for conversations whose recorded cwd is `path` (or nested inside it), skipping
  * hub worktree scratch and marking any already adopted. Bounded, read-only; sends nothing anywhere.
@@ -435,5 +521,6 @@ export async function discoverImportableChats(opts: DiscoverOptions): Promise<Sc
   chats.sort((a, b) => b.lastActivity.localeCompare(a.lastActivity))
   const byProfile: Record<string, number> = {}
   for (const c of chats) if (!c.alreadyImported) byProfile[c.profileId] = (byProfile[c.profileId] ?? 0) + 1
-  return { path: target, chats, byProfile, scannedProfiles, warnings }
+  const config = readProjectConfig(target, warnings)
+  return { path: target, chats, byProfile, scannedProfiles, config, warnings }
 }

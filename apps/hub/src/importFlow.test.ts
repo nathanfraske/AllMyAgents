@@ -13,7 +13,24 @@ import { AgentBus } from './bus.js'
 import { MemoryStore } from './memory.js'
 import { SessionManager } from './sessions.js'
 import { encodeClaudeCwd } from './importScan.js'
+import { CLAUDE_DEFAULT_ID, CODEX_DEFAULT_ID } from './profiles.js'
 import type { HubEvent, Profile } from './types.js'
+
+// Build a SessionManager on temp resources (real hub plumbing, no vendor processes / network).
+function buildManager(tmp: string, profiles: Profile[], dbName = 'hub.db') {
+  const profileMap = new Map(profiles.map((p) => [p.id, p]))
+  const journal = new Journal(path.join(tmp, dbName))
+  const store = new SessionStore(journal.db)
+  const projects = new ProjectStore(journal.db)
+  const approvals = new ApprovalService(journal)
+  const usage = new UsageMonitor(journal, profiles, {})
+  const workspace = new WorkspaceManager(path.join(tmp, 'data', 'worktrees'))
+  const instructions = new InstructionStore(journal.db)
+  const bus = new AgentBus(journal.db)
+  const memory = new MemoryStore(journal.db)
+  const sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, tmp)
+  return { sessions, store, journal, projects, profileMap }
+}
 
 // End-to-end integration of the import path against real hub plumbing (Journal + SessionStore +
 // ProjectStore + SessionManager) on temp resources — no vendor processes, no network. Verifies the
@@ -118,5 +135,83 @@ describe('SessionManager.importChats (integration)', () => {
     const res = await sessions.importChats(projectId, target, ['does-not-exist'])
     expect(res.notFound).toEqual(['does-not-exist'])
     expect(res.imported).toHaveLength(0)
+  })
+})
+
+// Item 2: adopt chats from the user's DEFAULT vendor homes (~/.claude, ~/.codex) — registered as
+// profiles so the imported session binds to the home dir and resumes there. Uses a fixture home.
+describe('SessionManager default-home import (integration)', () => {
+  let tmp: string
+  let home: string
+  let target: string
+  const opened: Journal[] = [] // track journals so we can close their sqlite handles before cleanup
+
+  beforeAll(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-home-flow-'))
+    home = path.join(tmp, 'home')
+    target = path.join(tmp, 'proj')
+    fs.mkdirSync(target, { recursive: true })
+
+    // ~/.claude default home with a transcript for the target folder.
+    const claudeProj = path.join(home, '.claude', 'projects', encodeClaudeCwd(target))
+    fs.mkdirSync(claudeProj, { recursive: true })
+    fs.writeFileSync(
+      path.join(claudeProj, '22222222-2222-2222-2222-222222222222.jsonl'),
+      JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text: 'Home chat one' }] }, cwd: target, sessionId: '22222222-2222-2222-2222-222222222222' })
+    )
+    // ~/.codex default home with a rollout for the target folder.
+    const codexDay = path.join(home, '.codex', 'sessions', '2026', '07', '18')
+    fs.mkdirSync(codexDay, { recursive: true })
+    fs.writeFileSync(
+      path.join(codexDay, 'rollout-2026-07-18T20-52-15-33333333-3333-3333-3333-333333333333.jsonl'),
+      [
+        JSON.stringify({ type: 'session_meta', payload: { session_id: '33333333-3333-3333-3333-333333333333', cwd: target } }),
+        JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: 'Home codex chat' } }),
+      ].join('\n')
+    )
+  })
+
+  afterAll(() => {
+    for (const j of opened) j.db.close() // release sqlite handles so Windows can unlink the temp db
+    fs.rmSync(tmp, { recursive: true, force: true })
+  })
+
+  it('registers the homes as profiles, scans them, and binds imports to the home dir', async () => {
+    const built = buildManager(tmp, [], 'home1.db')
+    opened.push(built.journal)
+    const { sessions, projects } = built
+    sessions.registerDefaultHomes(home) // what boot() does, pointed at the fixture home
+    // Homes are now first-class profiles.
+    const ids = sessions.listProfiles().map((p) => p.id).sort()
+    expect(ids).toEqual([CLAUDE_DEFAULT_ID, CODEX_DEFAULT_ID])
+
+    const projectId = projects.create('proj', target).id
+    const scan = await sessions.scanForImport(target)
+    expect(scan.chats.map((c) => c.profileId).sort()).toEqual([CLAUDE_DEFAULT_ID, CODEX_DEFAULT_ID])
+
+    const ok = await sessions.importChats(projectId, target, ['22222222-2222-2222-2222-222222222222', '33333333-3333-3333-3333-333333333333'])
+    expect(ok.imported).toHaveLength(2)
+    const claude = ok.imported.find((r) => r.provider === 'claude')!
+    expect(claude.profileId).toBe(CLAUDE_DEFAULT_ID) // binds to ~/.claude → resumes with CLAUDE_CONFIG_DIR=~/.claude
+    expect(claude.imported).toBe(true)
+    const codex = ok.imported.find((r) => r.provider === 'codex')!
+    expect(codex.profileId).toBe(CODEX_DEFAULT_ID) // binds to ~/.codex → resumes via CODEX_HOME=~/.codex
+  })
+
+  it('survives a hub restart: boot() re-registers the homes so persisted imports still resolve', () => {
+    // A second manager over the SAME store (simulating a restart) must re-establish the home profile
+    // binding for the persisted claude-default/codex-default sessions, else profileOf would throw.
+    const restarted = buildManager(tmp, [], 'home1.db')
+    opened.push(restarted.journal)
+    restarted.sessions.registerDefaultHomes(home) // boot() does exactly this
+    restarted.sessions.boot()
+    const restoredHomeIds = restarted.sessions
+      .list()
+      .filter((s) => s.imported)
+      .map((s) => s.profileId)
+    // Every restored imported session's owning profile is present in the manager (resolvable).
+    const known = new Set(restarted.sessions.listProfiles().map((p) => p.id))
+    expect(restoredHomeIds.length).toBeGreaterThan(0)
+    for (const pid of restoredHomeIds) expect(known.has(pid)).toBe(true)
   })
 })

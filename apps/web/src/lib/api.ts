@@ -50,11 +50,20 @@ export interface ImportableChat {
   alreadyImported: boolean
 }
 
+export interface ProjectConfig {
+  mcpServers: { name: string; transport: 'stdio' | 'http' | 'sse'; hasSecrets: boolean }[]
+  hooks: string[]
+  hasPermissions: boolean
+  memoryFiles: { name: string; bytes: number }[]
+  sources: string[]
+}
+
 export interface ScanResult {
   path: string
   chats: ImportableChat[]
   byProfile: Record<string, number>
   scannedProfiles: string[]
+  config: ProjectConfig
   warnings: string[]
 }
 

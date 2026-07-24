@@ -11,8 +11,10 @@ import {
   parseClaudeRecords,
   parseCodexRecords,
   discoverImportableChats,
+  readProjectConfig,
   importKey,
 } from './importScan.js'
+import { defaultHomeProfiles, CLAUDE_DEFAULT_ID, CODEX_DEFAULT_ID } from './profiles.js'
 import type { Profile } from './types.js'
 
 describe('encodeClaudeCwd (lossy forward encoding, verified against real dirs)', () => {
@@ -132,6 +134,73 @@ describe('parseCodexRecords (real Codex rollout shape)', () => {
     expect(p.originator).toBe('aiagentapp-spike')
     expect(p.firstPrompt).toBe('Reply with exactly: hub spike ok')
     expect(p.messageCount).toBe(2) // 1 user_message + 1 agent_message
+  })
+})
+
+describe('defaultHomeProfiles (~/.claude + ~/.codex as importable profiles)', () => {
+  let home: string
+  beforeAll(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-home-'))
+    fs.mkdirSync(path.join(home, '.claude'), { recursive: true })
+    fs.mkdirSync(path.join(home, '.codex'), { recursive: true })
+  })
+  afterAll(() => fs.rmSync(home, { recursive: true, force: true }))
+  it('registers both homes as fixed-id profiles when the dirs exist (no cred file required)', () => {
+    const profs = defaultHomeProfiles(home)
+    expect(profs).toEqual([
+      { id: CLAUDE_DEFAULT_ID, provider: 'claude', dir: path.join(home, '.claude') },
+      { id: CODEX_DEFAULT_ID, provider: 'codex', dir: path.join(home, '.codex') },
+    ])
+  })
+  it('omits a home whose directory is absent', () => {
+    const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-nohome-'))
+    fs.mkdirSync(path.join(empty, '.codex'))
+    expect(defaultHomeProfiles(empty).map((p) => p.id)).toEqual([CODEX_DEFAULT_ID])
+    fs.rmSync(empty, { recursive: true, force: true })
+  })
+})
+
+describe('readProjectConfig (values-free surfacing of MCP / hooks / memory)', () => {
+  let dir: string
+  beforeAll(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-cfg-'))
+    fs.writeFileSync(
+      path.join(dir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          github: { command: 'npx', args: ['-y', 'server-github'], env: { GITHUB_TOKEN: 'secret' } },
+          remote: { type: 'http', url: 'https://example.com/mcp' },
+        },
+      })
+    )
+    fs.mkdirSync(path.join(dir, '.claude'))
+    fs.writeFileSync(
+      path.join(dir, '.claude', 'settings.json'),
+      JSON.stringify({ hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo' }] }] }, permissions: { allow: ['Bash'], deny: [] } })
+    )
+    fs.writeFileSync(path.join(dir, 'CLAUDE.md'), 'project memory')
+  })
+  afterAll(() => fs.rmSync(dir, { recursive: true, force: true }))
+  it('lists MCP servers with transport + hasSecrets (never the values), hooks, permissions, memory', () => {
+    const cfg = readProjectConfig(dir)
+    expect(cfg.mcpServers).toEqual([
+      { name: 'github', transport: 'stdio', hasSecrets: true },
+      { name: 'remote', transport: 'http', hasSecrets: false },
+    ])
+    expect(cfg.hooks).toEqual(['PreToolUse'])
+    expect(cfg.hasPermissions).toBe(true)
+    expect(cfg.memoryFiles).toEqual([{ name: 'CLAUDE.md', bytes: fs.statSync(path.join(dir, 'CLAUDE.md')).size }])
+    expect(cfg.sources).toContain('.mcp.json')
+    // Sanity: no secret VALUE leaks into the surfaced config.
+    expect(JSON.stringify(cfg)).not.toContain('secret')
+  })
+  it('returns empty config for a bare folder', () => {
+    const bare = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-bare-'))
+    const cfg = readProjectConfig(bare)
+    expect(cfg.mcpServers).toEqual([])
+    expect(cfg.hooks).toEqual([])
+    expect(cfg.memoryFiles).toEqual([])
+    fs.rmSync(bare, { recursive: true, force: true })
   })
 })
 

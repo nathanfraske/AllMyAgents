@@ -1,12 +1,13 @@
 import crypto from 'node:crypto'
 import path from 'node:path'
+import { defaultHomeProfiles } from './profiles.js'
 import type { ApprovalService } from './approvals.js'
 import type { Journal } from './journal.js'
 import type { ProjectStore } from './projects.js'
 import type { SessionStore } from './store.js'
 import type { UsageMonitor } from './usage.js'
 import type { WorkspaceManager } from './workspace.js'
-import type { ClaudeLimitInfo, Profile, SessionRecord, SessionStatus } from './types.js'
+import type { ClaudeLimitInfo, Profile, Provider, SessionRecord, SessionStatus } from './types.js'
 import { ClaudeDriver } from './adapters/claude.js'
 import { CodexClient, mapCodexTokenUsage } from './adapters/codex.js'
 import { writeManagedInstructions, agentContract } from './instructions.js'
@@ -71,6 +72,14 @@ export class SessionManager {
   }
 
   boot(): void {
+    // Register the user's DEFAULT vendor homes (~/.claude, ~/.codex) as profiles so imported chats
+    // that live there can bind + resume. Done at boot (not construction) so it's a deliberate,
+    // idempotent startup step that also re-establishes the binding for persisted imports after a
+    // hub restart. NOTE: this only adds them to the manager's profile map (used by profileOf at
+    // spawn) — deliberately NOT to the usage-polled set, so the hub never eagerly spawns `/usage`
+    // probes into the user's real ~/.claude or touches ~/.codex's token on a timer. The vendor
+    // process is spawned against the home only when the user explicitly resumes an imported chat.
+    this.registerDefaultHomes()
     for (const record of this.store.all()) {
       if (record.status === 'active' || record.status === 'starting') {
         record.status = 'idle'
@@ -81,8 +90,22 @@ export class SessionManager {
     }
   }
 
+  /** Add the default vendor homes to the profile map (id collisions with managed profiles lose). */
+  registerDefaultHomes(homeDir?: string): void {
+    for (const home of defaultHomeProfiles(homeDir)) {
+      if (this.profiles.has(home.id)) continue
+      this.profiles.set(home.id, home)
+      this.journal.append(null, 'profiles/added', { id: home.id, provider: home.provider, source: 'default-home' })
+    }
+  }
+
   list(): SessionRecord[] {
     return [...this.sessions.values()]
+  }
+
+  /** All profiles the manager can bind to — managed profiles/* PLUS registered default homes. */
+  listProfiles(): { id: string; provider: Provider }[] {
+    return [...this.profiles.values()].map((p) => ({ id: p.id, provider: p.provider }))
   }
 
   private persist(record: SessionRecord): void {

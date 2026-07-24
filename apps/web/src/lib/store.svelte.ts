@@ -1,6 +1,6 @@
 import { api, HUB_WS, getHubToken, setHubToken } from './api'
 import { settings } from './settings.svelte'
-import type { ApprovalRecord, HubEvent, ProfileInfo, ProjectInfo, SessionRecord, UsageSnapshot } from './api'
+import type { ApprovalRecord, HubEvent, ProfileInfo, ProjectInfo, ScanResult, SessionRecord, UsageSnapshot } from './api'
 
 export interface StatusInfo {
   key: string
@@ -95,6 +95,8 @@ function asText(content: unknown): string {
 // known ones, so a freshly created project/chat is never dropped.
 const ORDER_PROJECTS_KEY = 'allmyagents.order.projects'
 const ORDER_CHATS_PREFIX = 'allmyagents.order.chats.'
+// Projects for which the user chose "don't ask again" on the import prompt (persisted set of ids).
+const IMPORT_DISMISSED_KEY = 'allmyagents.import.dismissed'
 
 function loadOrder(key: string): string[] {
   try {
@@ -115,6 +117,10 @@ function saveOrder(key: string, ids: string[]): void {
   } catch {
     /* ignore */
   }
+}
+
+function loadDismissed(): Set<string> {
+  return new Set(loadOrder(IMPORT_DISMISSED_KEY))
 }
 
 // Load every persisted chat order up front by scanning the namespaced keys, so saved arrangements
@@ -182,6 +188,16 @@ class HubStore {
   // The sidebar watches this to play a brief glitch on that row's label, then clears it.
   recentlyChanged = $state<Record<string, number>>({})
   lastSeq = 0
+
+  // --- Import prompt ---------------------------------------------------------------------------
+  // Which project's "import existing chats" panel is open (id + folder path, plus an optional
+  // pre-fetched scan so the auto-prompt path doesn't scan twice). Single source of truth read by
+  // the sidebar; set by the create flow, the per-project button, and the open-project auto-prompt.
+  importPanelFor = $state<{ projectId: string; path: string; preloaded?: ScanResult } | null>(null)
+  // Projects the user said "don't ask again" for (persisted) — never auto-prompted again.
+  importDismissed = $state<Set<string>>(loadDismissed())
+  // Projects already auto-scanned this session, so the open-project prompt fires at most once each.
+  private importChecked = new Set<string>()
 
   queueFor(sessionId: string): string[] {
     return this.queues[sessionId] ?? []
@@ -288,6 +304,8 @@ class HubStore {
     this.projects = await api.projects()
     await this.refreshSideData()
     this.connect()
+    // Offer to adopt existing vendor chats for any project that has un-imported ones (once each).
+    void this.runImportChecks()
   }
 
   // Pair this device by pasting a token (from another device's Settings → Mesh), then load.
@@ -513,7 +531,8 @@ class HubStore {
   // Adopt the selected existing vendor chats into a project. The hub persists them and journals
   // `session/created` + `session/titled`, so they also arrive over the WS (ensure() is idempotent);
   // we optimistically ensure the returned records for instant feedback and refresh the project
-  // roster. Returns counts for a toast/summary. Errors surface as { imported: 0 }.
+  // roster + account list (a default-home import registers ~/.claude/~/.codex as a profile, which
+  // then appears in the picker). Returns counts for a toast/summary. Errors surface as { imported: 0 }.
   async importChats(projectId: string, vendorSessionIds: string[]): Promise<{ imported: number; skipped: number }> {
     const out = await api.importChats(projectId, vendorSessionIds)
     if (!out || 'error' in out) return { imported: 0, skipped: 0 }
@@ -522,7 +541,46 @@ class HubStore {
       this.markGlitch(rec.id)
     }
     await this.refreshProjects()
+    this.profiles = await api.profiles() // surface any newly-registered default-home account
     return { imported: out.imported.length, skipped: out.skipped }
+  }
+
+  // --- Import prompt ---------------------------------------------------------------------------
+  openImportPanel(projectId: string, path: string, preloaded?: ScanResult): void {
+    this.importPanelFor = { projectId, path, preloaded }
+  }
+  closeImportPanel(): void {
+    this.importPanelFor = null
+  }
+  // "Don't ask again" for a project: persist the dismissal and close the panel.
+  dismissImport(projectId: string): void {
+    const next = new Set(this.importDismissed)
+    next.add(projectId)
+    this.importDismissed = next
+    saveOrder(IMPORT_DISMISSED_KEY, [...next])
+    if (this.importPanelFor?.projectId === projectId) this.closeImportPanel()
+  }
+
+  // Scan one project (at most once per session) and auto-open the import panel if it has un-imported
+  // chats and the user hasn't dismissed it. Non-blocking, quiet on empty. Used by the open-project
+  // and expand gestures — a gentle inline prompt, never a modal.
+  async maybePromptImport(projectId: string, path: string): Promise<void> {
+    if (!path || this.importDismissed.has(projectId) || this.importChecked.has(projectId)) return
+    if (this.importPanelFor) return // a panel is already up — don't stack
+    this.importChecked.add(projectId)
+    const res = await api.scanProject(path)
+    if (!res || 'error' in res) return
+    const importable = res.chats.filter((c) => !c.alreadyImported).length
+    if (importable > 0 && !this.importPanelFor) this.openImportPanel(projectId, path, res)
+  }
+
+  // On load, quietly scan each non-dismissed project and pop the prompt for the FIRST one that has
+  // un-imported chats (bounded; stops at the first hit). Fire-and-forget from init().
+  async runImportChecks(): Promise<void> {
+    for (const p of this.projects.slice(0, 20)) {
+      if (this.importPanelFor) return // already prompting — leave the rest for their own gestures
+      await this.maybePromptImport(p.id, p.path)
+    }
   }
 
   status(view: SessionView): StatusInfo {

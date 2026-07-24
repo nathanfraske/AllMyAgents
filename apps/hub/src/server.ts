@@ -278,12 +278,14 @@ export function startServer(opts: ServerOptions): http.Server {
         return
       }
       if (method === 'GET' && url.pathname === '/api/profiles') {
-        json(res, profiles.map((p) => ({ id: p.id, provider: p.provider })))
+        // The manager's view = managed profiles/* PLUS the registered default vendor homes, so the
+        // user's main ~/.claude / ~/.codex accounts (which imported chats bind to) show in the picker.
+        json(res, sessions.listProfiles())
         return
       }
       if (method === 'POST' && url.pathname === '/api/profiles/rescan') {
-        const list = rescanProfiles()
-        json(res, list.map((p) => ({ id: p.id, provider: p.provider })))
+        rescanProfiles() // pick up any newly-added managed logins under profiles/*
+        json(res, sessions.listProfiles())
         return
       }
       // One-click add-account: launches the vendor login in a visible terminal, then

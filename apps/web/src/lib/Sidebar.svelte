@@ -15,24 +15,25 @@
   let newName = $state('')
   let newPath = $state('')
   let createErr = $state('')
-  // Which project's "import existing chats" panel is open (project id + folder path), if any.
-  let importFor = $state<{ id: string; path: string } | null>(null)
 
   function pathFor(id: string): string {
     return store.projects.find((p) => p.id === id)?.path ?? ''
   }
   function openImport(e: MouseEvent, id: string): void {
     e.stopPropagation()
-    importFor = { id, path: pathFor(id) }
+    store.openImportPanel(id, pathFor(id))
   }
   let showUsage = $state(true)
   let collapsed = $state(new Set<string>())
 
   function toggleCollapse(id: string): void {
     const next = new Set(collapsed)
+    const expanding = next.has(id)
     if (next.has(id)) next.delete(id)
     else next.add(id)
     collapsed = next
+    // Expanding a project is an "open project" gesture — offer any un-imported chats (once/session).
+    if (expanding && id !== '__none__') void store.maybePromptImport(id, pathFor(id))
   }
 
   // --- Materialize / rename glitch --------------------------------------------------------------
@@ -260,7 +261,7 @@
     showCreate = false
     await store.refreshProjects()
     // Offer to adopt any existing Claude/Codex chats that already live for this folder.
-    importFor = { id: out.id, path: out.path }
+    store.openImportPanel(out.id, out.path)
   }
 
   async function act(e: MouseEvent, id: string, verb: 'interrupt' | 'stop'): Promise<void> {
@@ -340,8 +341,8 @@
             <button class="gadd" title="new chat here" onclick={() => store.newSession(undefined, g.id)}><Icon name="plus" size={14} /></button>
           {/if}
         </div>
-        {#if importFor?.id === g.id}
-          <ImportChats projectId={g.id} path={importFor.path} onClose={() => (importFor = null)} />
+        {#if store.importPanelFor?.projectId === g.id}
+          <ImportChats projectId={g.id} path={store.importPanelFor.path} preloaded={store.importPanelFor.preloaded} onClose={() => store.closeImportPanel()} />
         {/if}
         {#if isCollapsed && g.sessions.length}
           {@const sum = summarize(g.sessions)}
