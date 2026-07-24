@@ -1,6 +1,7 @@
 <script lang="ts">
   import { store } from './store.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
+  import Icon from './Icon.svelte'
   import type { SessionView } from './store.svelte'
 
   let { view }: { view: SessionView } = $props()
@@ -23,10 +24,10 @@
 </script>
 
 <div class="wrap">
-  <button class="pill-btn" onclick={() => (open = !open)} title="account (swap opens a fresh chat once this one has history)">
+  <button class="pill-btn" class:open onclick={() => (open = !open)} title="account (swap opens a fresh chat once this one has history)">
     {#if current}<ProviderLogo provider={current.provider} size={12} />{/if}
     {view.record.profileId}
-    <span class="chev">▾</span>
+    <span class="chev"><Icon name="chevron-down" size={12} /></span>
   </button>
   {#if open}
     <button class="scrim" onclick={() => (open = false)} aria-label="close"></button>
@@ -37,6 +38,7 @@
           <ProviderLogo provider={p.provider} size={13} />
           <span class="id">{p.id}</span>
           <span class="prov dim">{p.provider}</span>
+          {#if p.id === view.record.profileId}<span class="tick"><Icon name="check" size={13} /></span>{/if}
         </button>
       {/each}
     </div>
@@ -45,14 +47,16 @@
 
 <style>
   .wrap { position: relative; }
-  .chev { font-size: 0.6rem; opacity: 0.7; }
+  .chev { display: inline-grid; opacity: 0.6; }
   .scrim { position: fixed; inset: 0; background: transparent; border: none; z-index: 10; }
-  .menu { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 11; min-width: 200px; background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: 10px; padding: 0.3rem; box-shadow: 0 8px 28px rgba(0,0,0,0.5); }
-  @media (prefers-reduced-motion: no-preference) { .menu { animation: pop-in 0.12s var(--ease); } }
-  .note { font-size: 0.66rem; padding: 0.2rem 0.4rem 0.35rem; }
-  .row { display: flex; align-items: center; gap: 0.45rem; width: 100%; text-align: left; padding: 0.35rem 0.5rem; border-radius: 7px; font-size: 0.82rem; }
+  .menu { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 11; min-width: 200px; background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: var(--r-lg); padding: var(--space-1); box-shadow: var(--shadow-3), var(--edge-hi); }
+  @media (prefers-reduced-motion: no-preference) { .menu { animation: pop-in var(--dur-fast) var(--ease); } }
+  .note { font-size: var(--text-2xs); padding: 0.2rem 0.4rem 0.35rem; }
+  .row { display: flex; align-items: center; gap: var(--space-2); width: 100%; text-align: left; padding: var(--space-2) var(--space-3); border-radius: var(--r-md); font-size: var(--text-sm); }
   .row:hover { background: var(--surface-3); }
-  .row.sel { background: var(--surface-3); color: var(--accent); }
-  .id { font-weight: 500; }
-  .prov { margin-left: auto; font-size: 0.72rem; }
+  .row.sel { background: var(--surface-3); }
+  .row.sel .id { font-weight: var(--fw-semibold); }
+  .id { font-weight: var(--fw-medium); }
+  .prov { margin-left: auto; font-size: var(--text-xs); }
+  .tick { display: inline-grid; color: var(--accent); flex: none; }
 </style>

@@ -152,9 +152,9 @@
       {@const isCollapsed = collapsed.has(g.id)}
       <div class="group">
         <div class="group-head">
-          <button class="folder" onclick={() => toggleCollapse(g.id)}>{isCollapsed ? '▸' : '▾'}</button>
+          <button class="folder" title={isCollapsed ? 'expand' : 'collapse'} onclick={() => toggleCollapse(g.id)}><Icon name={isCollapsed ? 'chevron-right' : 'chevron-down'} size={12} /></button>
           <span class="gname">{g.name}</span>
-          <span class="gcount dim">{g.sessions.length}</span>
+          <span class="gcount dim tnum">{g.sessions.length}</span>
           {#if g.id !== '__none__'}
             <button class="gadd" title="new chat here" onclick={() => store.newSession(undefined, g.id)}><Icon name="plus" size={14} /></button>
           {/if}
@@ -163,10 +163,10 @@
           {@const sum = summarize(g.sessions)}
           <div class="summary" role="button" tabindex="0" onclick={() => toggleCollapse(g.id)} onkeydown={(e) => { if (e.key === 'Enter') toggleCollapse(g.id) }}>
             <span class="logos">{#each sum.providers as pv (pv)}<ProviderLogo provider={pv} size={12} />{/each}</span>
-            {#if sum.working}<span class="sc working" title="working">{sum.working} ▶</span>{/if}
-            {#if sum.review}<span class="sc review" title="ready for review">{sum.review} ⚑</span>{/if}
-            {#if sum.done}<span class="sc done" title="completed">{sum.done} ✓</span>{/if}
-            {#if sum.stalled}<span class="sc stalled" title="stalled / error">{sum.stalled} ✕</span>{/if}
+            {#if sum.working}<span class="sc working" title="working"><Icon name="play" size={10} /><span class="tnum">{sum.working}</span></span>{/if}
+            {#if sum.review}<span class="sc review" title="ready for review"><Icon name="flag" size={10} /><span class="tnum">{sum.review}</span></span>{/if}
+            {#if sum.done}<span class="sc done" title="completed"><Icon name="check" size={11} /><span class="tnum">{sum.done}</span></span>{/if}
+            {#if sum.stalled}<span class="sc stalled" title="stalled / error"><Icon name="x" size={11} /><span class="tnum">{sum.stalled}</span></span>{/if}
           </div>
         {/if}
         {#if !isCollapsed}
@@ -182,11 +182,11 @@
             <span class="dot {st.key}" title={st.label}></span>
             <ProviderLogo provider={s.record.provider} size={13} />
             <span class="rlabel">{label(s)}</span>
-            {#if pending > 0}<span class="pbadge">{pending}</span>{/if}
-            <span class="rtime dim">{relativeTime(s.lastActivity)}</span>
+            {#if pending > 0}<span class="pbadge tnum">{pending}</span>{/if}
+            <span class="rtime dim tnum">{relativeTime(s.lastActivity)}</span>
             <span class="ractions">
-              <button class="mini" title="interrupt" onclick={(e) => act(e, s.record.id, 'interrupt')}>◼</button>
-              <button class="mini" title="stop" onclick={(e) => act(e, s.record.id, 'stop')}>✕</button>
+              <button class="mini" title="interrupt" onclick={(e) => act(e, s.record.id, 'interrupt')}><Icon name="square" size={12} /></button>
+              <button class="mini" title="stop" onclick={(e) => act(e, s.record.id, 'stop')}><Icon name="x" size={13} /></button>
               <button class="mini del" title="delete chat" onclick={(e) => del(e, s.record.id, label(s))}><Icon name="trash" size={12} /></button>
             </span>
           </div>
@@ -201,7 +201,7 @@
 
   <div class="footer">
     <div class="foot-bar">
-      <button class="foot-head" onclick={() => (showUsage = !showUsage)}><span>USAGE</span><span class="dim">{showUsage ? '▾' : '▸'}</span></button>
+      <button class="foot-head" onclick={() => (showUsage = !showUsage)}><span>USAGE</span><span class="dim fchev"><Icon name={showUsage ? 'chevron-down' : 'chevron-right'} size={13} /></span></button>
       <button class="gear" title="settings" onclick={() => (store.settingsOpen = true)}><Icon name="settings" size={15} /></button>
     </div>
     {#if showUsage}<Usage />{/if}
@@ -210,71 +210,68 @@
 
 <style>
   .sidebar { display: flex; flex-direction: column; height: 100vh; background: var(--sidebar); border-right: 1px solid var(--border); }
-  .brand { display: flex; align-items: center; gap: 0.45rem; padding: 0.55rem 0.6rem; }
-  .brandbtn { display: flex; align-items: center; gap: 0.45rem; padding: 0.15rem 0.3rem; border-radius: 7px; }
+  .brand { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-3); }
+  .brandbtn { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-1) var(--space-2); border-radius: var(--r-sm); }
   .brandbtn:hover { background: var(--surface); }
-  .logo { width: 14px; height: 14px; border-radius: 4px; background: linear-gradient(135deg, var(--accent), var(--cyan)); }
-  .name { font-weight: 600; }
-  .tag { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--dim); border: 1px solid var(--border-strong); border-radius: 4px; padding: 0 0.25rem; }
-  .conn { margin-left: auto; width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
+  .logo { width: 16px; height: 16px; border-radius: var(--r-sm); background: linear-gradient(135deg, var(--accent), var(--cyan));
+    box-shadow: 0 0 12px -2px color-mix(in srgb, var(--accent) 60%, transparent); }
+  .name { font-weight: var(--fw-semibold); }
+  .tag { font-size: var(--text-2xs); text-transform: uppercase; letter-spacing: var(--ls-label); color: var(--dim); border: 1px solid var(--border-strong); border-radius: var(--r-xs); padding: 0 0.3rem; }
+  .conn { margin-left: auto; width: 8px; height: 8px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08); }
   .conn.on { background: var(--ok); }
-  .search { position: relative; padding: 0 0.7rem 0.5rem; }
+  .search { position: relative; padding: 0 var(--space-4) var(--space-3); }
   .sicon { position: absolute; left: 1.15rem; top: calc(50% - 0.25rem); transform: translateY(-50%); color: var(--dim); display: grid; }
   .search input { width: 100%; padding-left: 1.9rem; }
-  .sec-head { display: flex; align-items: center; justify-content: space-between; padding: 0.3rem 0.85rem; font-size: 0.66rem; letter-spacing: 0.08em; color: var(--dim); }
+  .sec-head { display: flex; align-items: center; justify-content: space-between; padding: var(--space-2) var(--space-5); font-size: var(--text-2xs); letter-spacing: var(--ls-label); text-transform: uppercase; color: var(--dim); }
   .sec-actions { display: flex; gap: 0.15rem; }
-  .icon { display: grid; place-items: center; color: var(--muted); width: 26px; height: 24px; border-radius: 6px; transition: background 0.12s, color 0.12s; }
+  .icon { display: grid; place-items: center; color: var(--muted); width: 26px; height: 24px; border-radius: var(--r-sm); transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease); }
   .icon:hover { background: var(--surface-2); color: var(--text); }
   .icon.on { background: var(--surface-3); color: var(--accent); }
-  .panel { display: flex; flex-direction: column; gap: 0.35rem; padding: 0.3rem 0.7rem 0.6rem; }
+  .panel { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-2) var(--space-4) var(--space-3); }
   .panel input { width: 100%; }
-  .path-row { display: flex; gap: 0.35rem; }
+  .path-row { display: flex; gap: var(--space-2); }
   .path-row input { flex: 1; }
-  .browse { flex: none; border: 1px solid var(--border-strong); border-radius: 7px; padding: 0 0.5rem; }
-  .browse:hover { border-color: var(--accent); }
-  .mkbtn { background: var(--accent); color: #fff; border-radius: 7px; padding: 0.35rem; font-weight: 500; }
-  .err { color: var(--bad-text); font-size: 0.72rem; }
-  .acctmenu { margin: 0 0.7rem 0.6rem; background: var(--surface); border: 1px solid var(--border-strong); border-radius: 10px; padding: 0.35rem; }
-  .amhead { font-size: 0.66rem; padding: 0.25rem 0.4rem 0.35rem; }
-  .amrow { display: flex; align-items: center; gap: 0.5rem; width: 100%; text-align: left; padding: 0.4rem 0.45rem; border-radius: 7px; }
-  .amrow:hover { background: var(--surface-2); }
-  .amid { font-weight: 500; }
-  .amprov { font-size: 0.72rem; margin-left: auto; }
-  .amempty { padding: 0.4rem; font-size: 0.76rem; }
-  .list { flex: 1; padding: 0 0.4rem; }
-  .group { margin-bottom: 0.4rem; }
-  .group-head { display: flex; align-items: center; gap: 0.35rem; padding: 0.3rem 0.45rem; font-size: 0.78rem; color: var(--muted); }
-  .folder { font-size: 0.62rem; color: var(--dim); width: 14px; }
+  .browse { flex: none; display: grid; place-items: center; border: 1px solid var(--border-strong); border-radius: var(--r-md); padding: 0 0.5rem; color: var(--muted); }
+  .browse:hover { border-color: var(--border-accent); color: var(--text); }
+  .mkbtn { background: var(--accent); color: #fff; border-radius: var(--r-md); padding: var(--space-2); font-weight: var(--fw-medium); box-shadow: var(--edge-hi), var(--shadow-1); }
+  .mkbtn:hover { filter: brightness(1.08); }
+  .err { color: var(--bad-text); font-size: var(--text-xs); }
+  .list { flex: 1; padding: 0 var(--space-2); }
+  .group { margin-bottom: var(--space-2); }
+  .group-head { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); font-size: var(--text-sm); color: var(--muted); }
+  .folder { display: grid; place-items: center; color: var(--dim); width: 16px; height: 16px; }
   .folder:hover { color: var(--text); }
-  .summary { display: flex; align-items: center; gap: 0.45rem; padding: 0.2rem 0.5rem 0.4rem 1.05rem; cursor: pointer; font-size: 0.7rem; }
-  .summary .logos { display: inline-flex; gap: 0.15rem; }
-  .sc { font-family: var(--mono); }
-  .sc.working { color: var(--working); }
-  .sc.review { color: var(--warn); }
-  .sc.done { color: var(--ok); }
-  .sc.stalled { color: var(--bad-text); }
-  .gname { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .gcount { margin-left: auto; font-size: 0.7rem; }
-  .gadd { display: grid; place-items: center; color: var(--dim); width: 20px; height: 20px; border-radius: 5px; opacity: 0; transition: opacity 0.12s, background 0.12s, color 0.12s; }
+  .summary { display: flex; align-items: center; gap: var(--space-2); padding: 0.2rem 0.5rem 0.4rem 1.05rem; cursor: pointer; }
+  .summary .logos { display: inline-flex; gap: 0.15rem; margin-right: 0.1rem; }
+  .sc { display: inline-flex; align-items: center; gap: 0.25rem; font-size: var(--text-2xs); font-weight: var(--fw-medium);
+    padding: 0.1rem 0.35rem; border-radius: var(--r-pill); }
+  .sc.working { color: var(--working); background: color-mix(in srgb, var(--working) 14%, transparent); }
+  .sc.review { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); }
+  .sc.done { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
+  .sc.stalled { color: var(--bad-text); background: color-mix(in srgb, var(--bad-text) 14%, transparent); }
+  .gname { font-weight: var(--fw-medium); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .gcount { margin-left: auto; font-size: var(--text-xs); }
+  .gadd { display: grid; place-items: center; color: var(--dim); width: 20px; height: 20px; border-radius: var(--r-xs); opacity: 0; transition: opacity var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease); }
   .group-head:hover .gadd { opacity: 1; }
   .gadd:hover { background: var(--surface-2); color: var(--accent); }
-  .row { display: flex; align-items: center; gap: 0.45rem; padding: 0.32rem 0.45rem 0.32rem 0.6rem; border-radius: 7px; cursor: pointer; }
-  .row:hover { background: var(--surface); }
-  .row.sel { background: var(--surface-2); }
+  .row { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-2) var(--space-3) var(--space-2) var(--space-4); border-radius: var(--r-md); cursor: pointer; }
+  .row:hover { background: var(--surface-2); }
+  .row.sel { background: var(--surface-2); box-shadow: inset 2px 0 0 var(--accent); }
   .rlabel { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .rtime { font-size: 0.68rem; flex: none; }
-  .pbadge { background: var(--warn); color: #111; border-radius: 999px; padding: 0 0.35rem; font-size: 0.66rem; font-weight: 600; }
+  .row.sel .rlabel { font-weight: var(--fw-medium); }
+  .rtime { font-size: var(--text-xs); flex: none; }
+  .pbadge { background: var(--warn); color: #111; border-radius: var(--r-pill); padding: 0 0.35rem; font-size: var(--text-2xs); font-weight: var(--fw-semibold); }
   .ractions { display: none; gap: 0.15rem; }
   .row:hover .ractions { display: flex; }
   .row:hover .rtime { display: none; }
-  .mini { color: var(--dim); font-size: 0.7rem; width: 18px; height: 18px; border-radius: 4px; }
+  .mini { display: grid; place-items: center; color: var(--dim); width: 20px; height: 20px; border-radius: var(--r-xs); }
   .mini:hover { background: var(--surface-3); color: var(--text); }
-  .mini.del { display: grid; place-items: center; }
   .mini.del:hover { background: var(--surface-3); color: var(--bad-text); }
-  .empty { padding: 1rem 0.7rem; text-align: center; font-size: 0.8rem; }
-  .footer { border-top: 1px solid var(--border); padding: 0.4rem 0.7rem 0.6rem; max-height: 42vh; overflow-y: auto; }
+  .empty { padding: 1rem 0.7rem; text-align: center; font-size: var(--text-sm); }
+  .footer { border-top: 1px solid var(--border-subtle); padding: var(--space-2) var(--space-4) var(--space-3); max-height: 42vh; overflow-y: auto; }
   .foot-bar { display: flex; align-items: center; }
-  .foot-head { display: flex; justify-content: space-between; flex: 1; font-size: 0.66rem; letter-spacing: 0.08em; color: var(--dim); padding: 0.2rem 0; }
-  .gear { display: grid; place-items: center; color: var(--dim); width: 24px; height: 22px; border-radius: 6px; }
+  .foot-head { display: flex; align-items: center; justify-content: space-between; flex: 1; font-size: var(--text-2xs); letter-spacing: var(--ls-label); text-transform: uppercase; color: var(--dim); padding: var(--space-1) 0; }
+  .fchev { display: inline-grid; }
+  .gear { display: grid; place-items: center; color: var(--dim); width: 24px; height: 22px; border-radius: var(--r-sm); }
   .gear:hover { color: var(--text); background: var(--surface-2); }
 </style>

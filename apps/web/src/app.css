@@ -3,13 +3,11 @@
   --bg: #070711;
   --sidebar: #0d0c1a;
   --surface: #161526;
-  --surface-2: #1e1e33;
-  --surface-3: #2a2942;
-  --border: #303049;
-  --border-strong: #4a486d;
+  --surface-2: #1c1b2e;
+  --surface-3: #272640;
   --text: #f5f5f8;
   --muted: #a9a9b7;
-  --dim: #797987;
+  --dim: #8b8b9c; /* lightened to clear WCAG AA (~5:1) on --surface for small meta text */
   --accent: #ed2398;
   --accent-hover: #ff2bd6;
   --secondary: #8c67f2;
@@ -22,16 +20,78 @@
   --bad-text: #f84a54;
   --add: #56d57b;
   --del: #f84a54;
+
+  /* --- Borders: translucent white hairlines (Linear/Vercel/Geist look). Render as a
+     consistent 1px edge over any surface and pick up a hint of what's beneath. Names kept
+     so every existing var(--border…) reference inherits the modern look. --- */
+  --border-subtle: rgba(255, 255, 255, 0.06); /* dividers, table/row lines */
+  --border: rgba(255, 255, 255, 0.10);        /* default card / input edge */
+  --border-strong: rgba(255, 255, 255, 0.16); /* hover, emphasized, menus */
+  --border-accent: color-mix(in srgb, var(--accent) 55%, transparent); /* focused / active */
+
+  /* --- Elevation: a calibrated shadow scale tuned for near-black --bg (deep + soft), plus a
+     top-edge inner highlight — the trick that makes dark surfaces feel "lifted", not "drawn". --- */
+  --shadow-1: 0 1px 2px 0 rgba(0, 0, 0, 0.40);
+  --shadow-2: 0 2px 6px -1px rgba(0, 0, 0, 0.45), 0 1px 2px rgba(0, 0, 0, 0.30);
+  --shadow-3: 0 8px 24px -6px rgba(0, 0, 0, 0.55), 0 2px 6px rgba(0, 0, 0, 0.35);   /* dropdowns, tooltip */
+  --shadow-4: 0 24px 60px -12px rgba(0, 0, 0, 0.65), 0 8px 20px rgba(0, 0, 0, 0.40); /* modal */
+  --edge-hi: inset 0 1px 0 0 rgba(255, 255, 255, 0.05);
+
+  /* --- Radius scale (collapses ~11 ad-hoc radii to 6 steps) --- */
+  --r-xs: 4px;   /* badges, tiny chips, calendar keys */
+  --r-sm: 6px;   /* mini icon buttons, inline code, scrollbar thumb */
+  --r-md: 8px;   /* buttons, inputs, pills, list rows */
+  --r-lg: 12px;  /* cards, tiles, dropdown menus, panels */
+  --r-xl: 16px;  /* composer, modal, drop ghosts */
+  --r-pill: 999px;
+
+  /* --- Spacing scale (4px grid; rem is root-relative = exact px) --- */
+  --space-1: 0.25rem;  /* 4  */
+  --space-2: 0.375rem; /* 6  */
+  --space-3: 0.5rem;   /* 8  */
+  --space-4: 0.75rem;  /* 12 */
+  --space-5: 1rem;     /* 16 */
+  --space-6: 1.25rem;  /* 20 */
+  --space-7: 1.5rem;   /* 24 */
+  --space-8: 2rem;     /* 32 */
+
+  /* --- Type scale (11px legibility floor) + label tracking + weights --- */
+  --text-2xs: 0.6875rem; /* 11px — hard floor; micro-labels, badges */
+  --text-xs: 0.75rem;    /* 12px — meta, times, hints */
+  --text-sm: 0.8125rem;  /* 13px — secondary UI text */
+  --text-base: 0.875rem; /* 14px — body / transcript */
+  --text-md: 1rem;       /* 16px — emphasis */
+  --text-lg: 1.125rem;   /* 18px — modal / panel titles */
+  --text-xl: 1.375rem;   /* 22px — dashboard greeting */
+  --text-2xl: 1.75rem;   /* 28px — big stat numbers */
+  --ls-label: 0.06em;    /* single uppercase-label tracking */
+  --fw-medium: 500;
+  --fw-semibold: 600;
+
+  /* --- Focus ring (a11y). --ring is the box-shadow glow form (used by large surfaces that
+     want to "light up", e.g. the composer); the global keyboard ring below uses outline so it
+     never collides with a surface's own box-shadow / --edge-hi. --- */
+  --ring: 0 0 0 3px color-mix(in srgb, var(--accent) 32%, transparent);
+  --ring-color: color-mix(in srgb, var(--accent) 60%, transparent);
+
   --sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono: "JetBrains Mono", "IBM Plex Mono", ui-monospace, "Cascadia Code", "SF Mono", Menlo, monospace;
   /* Gentle, un-snappy easing + shared durations. --ease is a soft ease-out used for most
      transitions; --ease-out is a slightly longer settle for enters. Keep motion in the
-     ~180–260ms range so nothing feels harsh. */
+     ~120–260ms range so nothing feels harsh. */
   --ease: cubic-bezier(0.33, 0.85, 0.35, 1);
   --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --dur-fast: 120ms;
   --dur: 190ms;
   --dur-slow: 240ms;
   color-scheme: dark;
+}
+
+/* Registered so ContextMeter's conic gauge can animate the sweep on context change. */
+@property --p {
+  syntax: "<number>";
+  inherits: false;
+  initial-value: 0;
 }
 
 @media (prefers-reduced-motion: no-preference) {
@@ -47,7 +107,7 @@ body {
   font-family: var(--sans);
   background: var(--bg);
   color: var(--text);
-  font-size: 13.5px;
+  font-size: var(--text-base);
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
@@ -66,68 +126,114 @@ input, select, textarea {
   color: var(--text);
   background: var(--surface-2);
   border: 1px solid var(--border-strong);
-  border-radius: 8px;
-  padding: 0.35rem 0.55rem;
+  border-radius: var(--r-md);
+  padding: var(--space-2) var(--space-3);
   outline: none;
 }
-input:focus, textarea:focus, select:focus { border-color: var(--accent); }
+input:focus, textarea:focus, select:focus { border-color: var(--border-accent); }
+
+/* Global keyboard focus ring — custom buttons had no :focus-visible styling, so keyboard
+   focus was invisible across the whole app. Low specificity (:where) so components can still
+   opt out; uses outline (not box-shadow) so it renders over any surface without fighting the
+   element's own --edge-hi / shadow, and it tracks border-radius in modern engines. */
+:where(button, a, [role="button"], input, select, textarea):focus-visible {
+  outline: 2px solid var(--ring-color);
+  outline-offset: 2px;
+}
 
 code, pre { font-family: var(--mono); }
+
+/* Tabular figures for any changing numeric readout (timers, %, counts, times) — kills
+   digit-width jitter. Applied via .tnum utility or per-component. */
+.tnum { font-variant-numeric: tabular-nums; }
 
 .dot {
   width: 8px; height: 8px; border-radius: 50%;
   background: var(--dim); flex: none;
+  --glow: 65, 217, 248;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08); /* faint resting ring for definition on busy rows */
 }
-.dot.working, .dot.active, .dot.starting { background: var(--working); box-shadow: 0 0 0 0 rgba(65,217,248,0.5); animation: pulse 1.8s infinite; }
+.dot.working, .dot.active, .dot.starting { background: var(--working); --glow: 65, 217, 248; }
 .dot.completed { background: var(--ok); }
-.dot.approval { background: var(--warn); box-shadow: 0 0 0 0 rgba(242,166,24,0.5); animation: pulse 1.8s infinite; }
-.dot.question { background: var(--secondary); box-shadow: 0 0 0 0 rgba(140,103,242,0.5); animation: pulse 1.8s infinite; }
+.dot.approval { background: var(--warn); --glow: 242, 166, 24; }
+.dot.question { background: var(--secondary); --glow: 140, 103, 242; }
 .dot.idle { background: var(--dim); }
 .dot.error { background: var(--bad-text); }
-.dot.stopped { background: #3a3958; }
-@keyframes pulse {
-  0% { box-shadow: 0 0 0 0 rgba(65,217,248,0.45); }
-  70% { box-shadow: 0 0 0 5px rgba(65,217,248,0); }
-  100% { box-shadow: 0 0 0 0 rgba(65,217,248,0); }
+.dot.stopped { background: var(--surface-3); }
+
+/* Global button system — one token'd source of truth. Components adopt these instead of
+   re-implementing bg/border/radius/hover/press per file. */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: var(--space-2);
+  background: var(--surface-2); border: 1px solid var(--border-strong);
+  border-radius: var(--r-md); padding: var(--space-2) var(--space-4);
+  font-size: var(--text-sm); font-weight: var(--fw-medium); color: var(--text);
+  box-shadow: var(--edge-hi); cursor: pointer;
 }
+.btn:hover:not(:disabled) { border-color: var(--border-accent); }
+.btn:disabled { opacity: 0.55; cursor: default; }
+.btn-primary { background: var(--accent); border-color: transparent; color: #fff; box-shadow: var(--edge-hi), var(--shadow-1); }
+.btn-primary:hover:not(:disabled) { filter: brightness(1.08); border-color: transparent; }
+.btn-ghost { background: transparent; border-color: transparent; color: var(--muted); box-shadow: none; }
+.btn-ghost:hover:not(:disabled) { background: var(--surface-2); color: var(--text); border-color: transparent; }
+.btn-danger { background: var(--bad); border-color: transparent; color: #fff; box-shadow: var(--edge-hi), var(--shadow-1); }
+.btn-danger:hover:not(:disabled) { filter: brightness(1.08); }
+.btn-icon {
+  display: inline-grid; place-items: center; width: 28px; height: 28px;
+  border-radius: var(--r-sm); color: var(--muted); background: transparent; border: none; cursor: pointer;
+}
+.btn-icon:hover { background: var(--surface-2); color: var(--text); }
 
 .pill-btn {
-  display: inline-flex; align-items: center; gap: 0.3rem;
+  display: inline-flex; align-items: center; gap: var(--space-2);
   background: var(--surface-2); border: 1px solid var(--border);
-  border-radius: 8px; padding: 0.28rem 0.55rem; font-size: 0.8rem;
-  color: var(--muted); cursor: pointer;
+  border-radius: var(--r-md); padding: var(--space-2) var(--space-3); font-size: var(--text-sm);
+  color: var(--muted); cursor: pointer; box-shadow: var(--edge-hi);
 }
 .pill-btn:hover { border-color: var(--border-strong); color: var(--text); }
+.pill-btn.open { background: var(--surface-3); border-color: var(--border-strong); color: var(--text); }
 .pill-btn select { background: none; border: none; padding: 0; color: inherit; cursor: pointer; }
 
 .send-btn {
   width: 32px; height: 32px; border-radius: 50%;
   background: var(--accent); color: #fff; display: grid; place-items: center;
-  font-size: 1rem; flex: none;
+  font-size: 1rem; flex: none; box-shadow: var(--shadow-1);
 }
-.send-btn:hover { background: var(--accent-hover); }
-.send-btn:disabled { background: var(--surface-3); color: var(--dim); cursor: not-allowed; }
+.send-btn:hover:not(:disabled) { background: var(--accent-hover); filter: brightness(1.08); }
+.send-btn:disabled { background: var(--surface-3); color: var(--dim); cursor: not-allowed; box-shadow: none; }
 .send-btn.stop { background: var(--bad); }
 
 .muted { color: var(--muted); }
 .dim { color: var(--dim); }
-.scroll { overflow-y: auto; }
-.scroll::-webkit-scrollbar { width: 9px; }
-.scroll::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 6px; border: 2px solid transparent; background-clip: padding-box; }
+.scroll { overflow-y: auto; scrollbar-width: thin; scrollbar-color: rgba(255, 255, 255, 0.14) transparent; }
+.scroll::-webkit-scrollbar { width: 8px; }
+.scroll::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.12); border-radius: var(--r-sm); border: 2px solid transparent; background-clip: padding-box; }
+.scroll::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.22); }
 
 .add { color: var(--add); }
 .del { color: var(--del); }
 
 /* Soft, consistent motion on interactive surfaces — opt-in by default (respects the OS
-   "reduce motion" setting, under which none of these transitions apply). */
+   "reduce motion" setting, under which none of these transitions/animations apply). The
+   status-dot pulse lives here too so reduced-motion users get a calm, static dot. */
 @media (prefers-reduced-motion: no-preference) {
-  button, .pill-btn, .send-btn {
+  button, .btn, .btn-icon, .pill-btn, .send-btn {
     transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease),
-      color var(--dur) var(--ease), filter var(--dur) var(--ease);
+      color var(--dur) var(--ease), filter var(--dur) var(--ease), transform var(--dur-fast) var(--ease),
+      box-shadow var(--dur) var(--ease);
   }
+  .send-btn:active:not(:disabled) { transform: scale(0.94); }
   input, select, textarea {
-    transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
+    transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
   }
   .dot { transition: background var(--dur) var(--ease); }
   .scroll::-webkit-scrollbar-thumb { transition: background var(--dur) var(--ease); }
+
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08), 0 0 0 0 rgba(var(--glow), 0.45); }
+    70%  { box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08), 0 0 0 5px rgba(var(--glow), 0); }
+    100% { box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08), 0 0 0 0 rgba(var(--glow), 0); }
+  }
+  .dot.working, .dot.active, .dot.starting,
+  .dot.approval, .dot.question { animation: pulse 1.8s infinite; }
 }

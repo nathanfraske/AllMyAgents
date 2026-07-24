@@ -60,26 +60,29 @@
 </div>
 
 <style>
-  .usage { display: flex; flex-direction: column; gap: 0.45rem; }
-  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 0.45rem 0.55rem; }
-  .card.blocked { border-color: var(--bad); }
-  .head { display: flex; gap: 0.4rem; align-items: baseline; font-size: 0.82rem; }
-  .tag { font-size: 0.62rem; border-radius: 4px; padding: 0 0.25rem; }
-  .tag.bad { color: var(--bad); border: 1px solid var(--bad); }
-  .line { display: flex; gap: 0.4rem; align-items: center; margin-top: 0.3rem; font-size: 0.74rem; }
-  .line.small { font-size: 0.68rem; margin-top: 0.15rem; }
-  .state { font-weight: 600; }
+  .usage { display: flex; flex-direction: column; gap: var(--space-3); }
+  .card { background: var(--surface); border: 1px solid var(--border-subtle); border-radius: var(--r-md); padding: var(--space-3); box-shadow: var(--edge-hi); }
+  .card.blocked { background: color-mix(in srgb, var(--bad) 8%, var(--surface)); border-color: color-mix(in srgb, var(--bad) 35%, transparent); }
+  .head { display: flex; gap: var(--space-2); align-items: baseline; font-size: var(--text-sm); }
+  .tag { font-size: var(--text-2xs); border-radius: var(--r-xs); padding: 0 0.3rem; }
+  .tag.bad { color: var(--bad-text); background: color-mix(in srgb, var(--bad) 15%, transparent); }
+  .line { display: flex; gap: var(--space-2); align-items: center; margin-top: var(--space-2); font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
+  .line.small { font-size: var(--text-2xs); margin-top: 0.15rem; }
+  .state { font-weight: var(--fw-semibold); }
   .state.ok { color: var(--ok); }
   .state.warn { color: var(--warn); }
-  .state.bad { color: var(--bad); }
+  .state.bad { color: var(--bad-text); }
   .state.idle { color: var(--dim); }
   .reset { margin-left: auto; }
-  .bar { flex: 1; height: 5px; background: var(--surface-3); border-radius: 4px; overflow: hidden; }
-  .fill { height: 100%; background: var(--accent); }
+  .bar { flex: 1; height: 5px; background: var(--surface-3); border-radius: var(--r-pill); overflow: hidden; }
+  .fill { height: 100%; border-radius: var(--r-pill); background: linear-gradient(90deg, var(--accent), var(--accent-hover)); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.2); }
   .fill.hot { background: var(--warn); }
-  .spend { font-size: 0.66rem; margin-top: 0.2rem; }
-  .bad { color: var(--bad); }
-  .small { font-size: 0.68rem; }
-  .bars { margin-top: 0.35rem; }
-  .hint { font-size: 0.66rem; margin-top: 0.2rem; }
+  .spend { font-size: var(--text-2xs); margin-top: var(--space-1); font-variant-numeric: tabular-nums; }
+  .bad { color: var(--bad-text); }
+  .small { font-size: var(--text-2xs); }
+  .bars { margin-top: var(--space-2); }
+  .hint { font-size: var(--text-2xs); margin-top: var(--space-1); }
+  @media (prefers-reduced-motion: no-preference) {
+    .fill { transition: width var(--dur-slow) var(--ease); }
+  }
 </style>

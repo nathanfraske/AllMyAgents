@@ -1,5 +1,6 @@
 <script lang="ts">
   import { modelsFor, findModel, type Provider } from './catalog'
+  import Icon from './Icon.svelte'
 
   let { provider, model, onselect }: { provider: Provider; model?: string; onselect: (slug: string) => void } = $props()
 
@@ -20,10 +21,10 @@
 </script>
 
 <div class="wrap">
-  <button class="pill-btn" onclick={() => (open = !open)}>
+  <button class="pill-btn" class:open onclick={() => (open = !open)}>
     <span class="glyph" class:codex={provider === 'codex'}></span>
     {current?.shortName ?? current?.name ?? 'model'}
-    <span class="chev">▾</span>
+    <span class="chev"><Icon name="chevron-down" size={12} /></span>
   </button>
   {#if open}
     <button class="scrim" onclick={() => (open = false)} aria-label="close"></button>
@@ -36,6 +37,7 @@
           <span class="name">{m.name}</span>
           {#if m.isNew}<span class="badge new">New</span>{/if}
           {#if m.isDefault}<span class="badge def">Default</span>{/if}
+          {#if m.slug === current?.slug}<span class="tick"><Icon name="check" size={13} /></span>{/if}
         </button>
       {/each}
     </div>
@@ -44,18 +46,20 @@
 
 <style>
   .wrap { position: relative; }
-  .glyph { width: 9px; height: 9px; border-radius: 3px; background: var(--secondary); }
+  .glyph { width: 9px; height: 9px; border-radius: var(--r-xs); background: var(--secondary); }
   .glyph.codex { background: var(--ok); }
-  .chev { font-size: 0.6rem; opacity: 0.7; }
+  .chev { display: inline-grid; opacity: 0.6; }
   .scrim { position: fixed; inset: 0; background: transparent; border: none; z-index: 10; }
-  .menu { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 11; min-width: 220px; background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: 10px; padding: 0.3rem; box-shadow: 0 8px 28px rgba(0,0,0,0.5); }
-  @media (prefers-reduced-motion: no-preference) { .menu { animation: pop-in 0.12s var(--ease); } }
-  .search { width: 100%; margin-bottom: 0.3rem; }
-  .row { display: flex; align-items: center; gap: 0.4rem; width: 100%; text-align: left; padding: 0.35rem 0.5rem; border-radius: 7px; font-size: 0.82rem; }
+  .menu { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 11; min-width: 220px; background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: var(--r-lg); padding: var(--space-1); box-shadow: var(--shadow-3), var(--edge-hi); }
+  @media (prefers-reduced-motion: no-preference) { .menu { animation: pop-in var(--dur-fast) var(--ease); } }
+  .search { width: 100%; margin-bottom: var(--space-1); }
+  .row { display: flex; align-items: center; gap: var(--space-2); width: 100%; text-align: left; padding: var(--space-2) var(--space-3); border-radius: var(--r-md); font-size: var(--text-sm); }
   .row:hover { background: var(--surface-3); }
   .row.sel { background: var(--surface-3); }
+  .row.sel .name { font-weight: var(--fw-medium); }
   .name { flex: 1; }
-  .badge { font-size: 0.6rem; border-radius: 4px; padding: 0 0.25rem; }
-  .badge.new { color: var(--warn); border: 1px solid var(--warn); }
+  .tick { display: inline-grid; color: var(--accent); flex: none; }
+  .badge { font-size: var(--text-2xs); border-radius: var(--r-xs); padding: 0 0.3rem; line-height: 1.5; }
+  .badge.new { color: var(--warn); background: color-mix(in srgb, var(--warn) 15%, transparent); }
   .badge.def { color: var(--dim); border: 1px solid var(--border-strong); }
 </style>

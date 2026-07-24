@@ -31,9 +31,11 @@
   )
 
   function shade(turns: number): string {
-    if (turns === 0) return 'var(--surface-3)'
+    // Keep zero-activity cells barely above the surface so the grid reads as a heatmap
+    // (bright empties made the whole grid look "half-full"); steepen the active ramp.
+    if (turns === 0) return 'color-mix(in srgb, var(--accent) 5%, var(--surface))'
     const t = turns / maxTurns
-    const pct = t < 0.2 ? 30 : t < 0.5 ? 50 : t < 0.8 ? 72 : 100
+    const pct = t < 0.2 ? 26 : t < 0.5 ? 48 : t < 0.8 ? 72 : 100
     return `color-mix(in srgb, var(--accent) ${pct}%, var(--surface-2))`
   }
   function monthLabel(date: string): string {
@@ -103,7 +105,7 @@
           <h1>Welcome to CEC AiMesh.</h1>
           <div class="nameask">
             <input placeholder="What should I call you?" bind:value={nameInput} onkeydown={(e) => { if (e.key === 'Enter') saveName() }} />
-            <button class="primary" onclick={saveName}>Set</button>
+            <button class="btn btn-primary" onclick={saveName}>Set</button>
           </div>
         {/if}
         <p class="dim">Drag a chat from the sidebar into this space to open it — drop it beside another to split, or above/below to stack.</p>
@@ -136,7 +138,7 @@
                 onclick={() => (selectedDate = d.date)}></button>
             {/each}
           </div>
-          <div class="legend dim"><span>less</span><span class="k" style="background: var(--surface-3)"></span><span class="k" style="background: color-mix(in srgb, var(--accent) 50%, var(--surface-2))"></span><span class="k" style="background: var(--accent)"></span><span>more</span></div>
+          <div class="legend dim"><span>less</span><span class="k" style="background: color-mix(in srgb, var(--accent) 5%, var(--surface))"></span><span class="k" style="background: color-mix(in srgb, var(--accent) 48%, var(--surface-2))"></span><span class="k" style="background: var(--accent)"></span><span>more</span></div>
         {/if}
       </section>
 
@@ -201,30 +203,33 @@
 {/if}
 
 <style>
-  .dashwrap { height: 100%; overflow-y: auto; container-type: inline-size; }
+  .dashwrap { position: relative; height: 100%; overflow-y: auto; container-type: inline-size; }
+  /* One soft radial accent glow behind the hero so the landing reads as depth, not a flat void. */
+  .dashwrap::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 440px; z-index: 0; pointer-events: none;
+    background: radial-gradient(60% 40% at 20% 0%, color-mix(in srgb, var(--accent) 10%, transparent), transparent 72%); }
   /* Two-column composition: a full-width header row (greeting + stat tiles), then the
      calendar/projects stack on the left paired with the day-detail panel on the right.
      The detail panel stretches to fill the height of the left stack so the right side
      no longer leaves a void. Collapses to a single column when the pane is narrow
      (container query, not viewport, so it reacts to the resizable sidebar and split panes). */
-  .dash { max-width: 1180px; margin: 0 auto; padding: 2rem 1.5rem;
-    display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 1.25rem; align-items: start;
+  .dash { position: relative; z-index: 1; max-width: 1180px; margin: 0 auto; padding: var(--space-8) var(--space-7);
+    display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: var(--space-6); align-items: start;
     grid-template-areas: "top top" "left detail"; }
   .top { grid-area: top; min-width: 0; }
-  .left { grid-area: left; min-width: 0; display: flex; flex-direction: column; gap: 1.25rem; }
+  .left { grid-area: left; min-width: 0; display: flex; flex-direction: column; gap: var(--space-6); }
   @container (max-width: 880px) {
     .dash { grid-template-columns: minmax(0, 1fr); grid-template-areas: "top" "left" "detail"; }
   }
-  .back { color: var(--muted); border: 1px solid var(--border); border-radius: 8px; padding: 0.3rem 0.7rem; margin-bottom: 1.2rem; font-size: 0.82rem; }
-  .back:hover { border-color: var(--accent); color: var(--text); }
-  .hero { margin-bottom: 1.6rem; }
-  .hero .logo { width: 34px; height: 34px; border-radius: 9px; background: linear-gradient(135deg, var(--accent), var(--cyan)); margin-bottom: 0.9rem; }
-  h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 0.5rem; }
-  .nameask { display: flex; gap: 0.5rem; margin: 0.6rem 0; }
+  .back { color: var(--muted); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--space-2) var(--space-4); margin-bottom: var(--space-6); font-size: var(--text-sm); }
+  .back:hover { border-color: var(--border-accent); color: var(--text); }
+  .hero { margin-bottom: var(--space-7); }
+  .hero .logo { width: 36px; height: 36px; border-radius: var(--r-lg); background: linear-gradient(135deg, var(--accent), var(--cyan)); margin-bottom: var(--space-4);
+    box-shadow: 0 0 28px -4px color-mix(in srgb, var(--accent) 60%, transparent); }
+  h1 { font-size: var(--text-xl); font-weight: var(--fw-semibold); margin: 0 0 var(--space-3); }
+  .nameask { display: flex; gap: var(--space-3); margin: var(--space-4) 0; }
   .nameask input { flex: 1; max-width: 320px; }
-  .primary { background: var(--accent); color: #fff; border-radius: 8px; padding: 0.35rem 0.9rem; font-weight: 500; }
-  .hero p { font-size: 0.85rem; margin: 0.4rem 0 0; }
-  .tiles { display: flex; gap: 0.6rem; flex-wrap: wrap; }
+  .hero p { font-size: var(--text-sm); margin: var(--space-3) 0 0; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: var(--space-4); }
 
   /* Modern surface treatment shared by every card-like panel: a soft low-contrast border,
      a faint top inner-highlight and a gentle layered drop shadow for depth, plus a barely
@@ -233,65 +238,63 @@
     background:
       linear-gradient(180deg, rgba(255, 255, 255, 0.025), rgba(255, 255, 255, 0) 55%),
       var(--surface);
-    border: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
-    border-radius: 14px;
-    box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.045),
-      0 1px 2px rgba(0, 0, 0, 0.28),
-      0 12px 30px -8px rgba(0, 0, 0, 0.32);
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    box-shadow: var(--edge-hi), var(--shadow-2);
   }
-  .tile { padding: 0.8rem 1rem; min-width: 100px; }
-  .tile .num { font-size: 1.5rem; font-weight: 600; font-family: var(--mono); }
-  .tile .lbl { font-size: 0.72rem; margin-top: 0.2rem; }
-  .tile.split { display: flex; flex-direction: column; gap: 0.35rem; justify-content: center; }
-  .prov { display: flex; align-items: center; gap: 0.4rem; font-family: var(--mono); font-size: 0.95rem; }
-  .card { padding: 0.9rem 1rem; min-width: 0; }
-  .card h3, .detail h3 { margin: 0 0 0.8rem; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--dim); }
+  .tile { padding: var(--space-4) var(--space-5); min-width: 0; min-height: 84px; display: flex; flex-direction: column; justify-content: center; }
+  .tile .num { font-size: var(--text-2xl); font-weight: var(--fw-semibold); font-family: var(--mono); font-variant-numeric: tabular-nums; line-height: 1.1; }
+  .tile .lbl { font-size: var(--text-xs); margin-top: var(--space-1); }
+  .tile.split { display: flex; flex-direction: column; gap: var(--space-2); justify-content: center; }
+  .prov { display: flex; align-items: center; gap: var(--space-3); font-family: var(--mono); font-size: var(--text-md); font-variant-numeric: tabular-nums; }
+  .card { padding: var(--space-5); min-width: 0; }
+  .card h3, .detail h3 { margin: 0 0 var(--space-4); font-size: var(--text-2xs); text-transform: uppercase; letter-spacing: var(--ls-label); color: var(--dim); }
   .cal { display: grid; grid-template-rows: repeat(7, 13px); grid-auto-flow: column; grid-auto-columns: 13px; gap: 3px; }
-  .cell { border-radius: 3px; padding: 0; border: 0; }
+  .cell { border-radius: var(--r-xs); padding: 0; border: 0; }
   .cell:not(.pad) { cursor: pointer; }
-  .cell:not(.pad):hover { outline: 1px solid var(--text); }
-  .cell.selected { outline: 2px solid var(--text); }
-  .legend { display: flex; align-items: center; gap: 4px; font-size: 0.66rem; margin-top: 0.6rem; }
-  .legend .k { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
-  .projs { display: flex; flex-direction: column; gap: 0.6rem; }
-  .ptop { display: flex; justify-content: space-between; font-size: 0.82rem; margin-bottom: 0.25rem; }
-  .pname { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .pmeta { font-size: 0.72rem; font-family: var(--mono); flex: none; }
-  .pbar { height: 6px; background: var(--surface-3); border-radius: 4px; overflow: hidden; }
-  .pfill { height: 100%; background: linear-gradient(90deg, var(--cyan), var(--accent)); }
-  .empty2 { font-size: 0.82rem; padding: 0.5rem 0; }
+  .cell:not(.pad):hover { outline: 1px solid var(--border-strong); }
+  .cell.selected { outline: 2px solid var(--accent); outline-offset: 1px; transform: scale(1.15); }
+  .legend { display: flex; align-items: center; gap: 4px; font-size: var(--text-2xs); margin-top: var(--space-4); }
+  .legend .k { width: 12px; height: 12px; border-radius: var(--r-xs); display: inline-block; }
+  .projs { display: flex; flex-direction: column; gap: var(--space-4); }
+  .ptop { display: flex; justify-content: space-between; font-size: var(--text-sm); margin-bottom: var(--space-1); }
+  .pname { font-weight: var(--fw-medium); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pmeta { font-size: var(--text-xs); font-family: var(--mono); font-variant-numeric: tabular-nums; flex: none; }
+  .pbar { height: 6px; background: var(--surface-3); border-radius: var(--r-pill); overflow: hidden; }
+  .pfill { height: 100%; border-radius: var(--r-pill); background: linear-gradient(90deg, var(--cyan), var(--accent));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25); }
+  .empty2 { font-size: var(--text-sm); padding: var(--space-3) 0; }
 
   /* Day-detail panel — stretches to the full height of the calendar/projects stack and
      centres its content vertically so it reads as a deliberate pair, not a floating card. */
-  .detail { grid-area: detail; align-self: stretch; display: flex; flex-direction: column; padding: 0.9rem 1rem; }
+  .detail { grid-area: detail; align-self: stretch; display: flex; flex-direction: column; padding: var(--space-5); }
   .dbody { flex: 1; display: flex; flex-direction: column; justify-content: center; }
-  .dhead { font-size: 0.98rem; font-weight: 600; margin-bottom: 0.8rem; line-height: 1.35; }
-  .dstats { display: flex; gap: 0.6rem; margin-bottom: 1rem; }
-  .dstat { flex: 1; background: var(--surface-2); border: 1px solid color-mix(in srgb, var(--border) 40%, transparent); border-radius: 11px; padding: 0.6rem 0.7rem; box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03); }
-  .dstat .num { font-size: 1.35rem; font-weight: 600; font-family: var(--mono); }
-  .dstat .lbl { font-size: 0.68rem; margin-top: 0.15rem; }
-  .dbreak-h { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 0.35rem; }
+  .dhead { font-size: var(--text-md); font-weight: var(--fw-semibold); margin-bottom: var(--space-4); line-height: 1.35; }
+  .dstats { display: flex; gap: var(--space-4); margin-bottom: var(--space-5); }
+  .dstat { flex: 1; background: var(--surface-2); border: 1px solid var(--border-subtle); border-radius: var(--r-lg); padding: var(--space-4); box-shadow: var(--edge-hi); }
+  .dstat .num { font-size: var(--text-xl); font-weight: var(--fw-semibold); font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .dstat .lbl { font-size: var(--text-xs); margin-top: var(--space-1); }
+  .dbreak-h { font-size: var(--text-2xs); text-transform: uppercase; letter-spacing: var(--ls-label); margin-bottom: var(--space-2); }
   .dbreak { display: flex; flex-direction: column; }
-  .drow { display: flex; justify-content: space-between; gap: 0.6rem; font-size: 0.8rem; padding: 0.4rem 0; border-top: 1px solid var(--border); }
+  .drow { display: flex; justify-content: space-between; gap: var(--space-4); font-size: var(--text-sm); padding: var(--space-2) 0; border-top: 1px solid var(--border-subtle); }
   .drow:first-child { border-top: none; }
   .dn { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .dv { font-family: var(--mono); font-size: 0.73rem; flex: none; color: var(--muted); }
+  .dv { font-family: var(--mono); font-size: var(--text-xs); font-variant-numeric: tabular-nums; flex: none; color: var(--muted); }
 
   .tip { position: fixed; z-index: 60; pointer-events: none; background: var(--surface-2); border: 1px solid var(--border-strong);
-    border-radius: 9px; padding: 0.5rem 0.65rem; box-shadow: 0 10px 30px rgba(0,0,0,0.55); min-width: 150px; max-width: 240px; }
-  .tiphead { font-size: 0.76rem; font-weight: 500; margin-bottom: 0.3rem; }
-  .tiprow { display: flex; justify-content: space-between; gap: 0.6rem; font-size: 0.74rem; }
+    border-radius: var(--r-lg); padding: var(--space-3) var(--space-4); box-shadow: var(--shadow-3), var(--edge-hi); min-width: 150px; max-width: 240px; }
+  .tiphead { font-size: var(--text-xs); font-weight: var(--fw-medium); margin-bottom: var(--space-2); font-variant-numeric: tabular-nums; }
+  .tiprow { display: flex; justify-content: space-between; gap: var(--space-4); font-size: var(--text-xs); }
   .tn { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .tv { font-family: var(--mono); flex: none; }
+  .tv { font-family: var(--mono); font-variant-numeric: tabular-nums; flex: none; }
 
   @media (prefers-reduced-motion: no-preference) {
     .tile, .card, .detail { transition: border-color var(--dur) var(--ease), transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease); }
     .tile:hover { transform: translateY(-2px); border-color: var(--border-strong);
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 2px 4px rgba(0, 0, 0, 0.3), 0 16px 34px -8px rgba(0, 0, 0, 0.4); }
-    .cell { transition: outline-color var(--dur) var(--ease), background var(--dur-slow) var(--ease); }
+      box-shadow: var(--edge-hi), var(--shadow-3); }
+    .cell { transition: outline-color var(--dur) var(--ease), background var(--dur-slow) var(--ease), transform var(--dur) var(--ease); }
     .pfill { transition: width var(--dur-slow) var(--ease); }
     .detail { animation: fade-in var(--dur-slow) var(--ease); }
-    .tip { animation: pop-in 120ms var(--ease); }
+    .tip { animation: pop-in var(--dur-fast) var(--ease); }
   }
 </style>

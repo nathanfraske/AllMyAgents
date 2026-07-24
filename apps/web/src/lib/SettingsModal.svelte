@@ -3,6 +3,7 @@
   import { settings } from './settings.svelte'
   import { api, type MeshStatus } from './api'
   import ProviderLogo from './ProviderLogo.svelte'
+  import Icon from './Icon.svelte'
   import { modelsFor } from './catalog'
 
   let { onclose }: { onclose: () => void } = $props()
@@ -132,7 +133,7 @@
 <div class="modal" role="dialog" aria-modal="true" aria-label="Settings">
   <div class="head">
     <h2>Settings</h2>
-    <button class="x" onclick={onclose} aria-label="close">×</button>
+    <button class="btn-icon" onclick={onclose} aria-label="close"><Icon name="x" size={17} /></button>
   </div>
 
   <div class="body">
@@ -154,7 +155,7 @@
             <option value="codex">Codex</option>
           </select>
           <input placeholder="profile name (e.g. claude-work)" bind:value={addName} disabled={loginState === 'waiting'} />
-          <button class="btn primary" onclick={login} disabled={loginState === 'waiting'}>
+          <button class="btn btn-primary" onclick={login} disabled={loginState === 'waiting'}>
             {loginState === 'waiting' ? 'waiting…' : 'Log in'}
           </button>
         </div>
@@ -249,56 +250,50 @@
 </div>
 
 <style>
-  .backdrop { position: fixed; inset: 0; background: rgba(7,7,17,0.55); backdrop-filter: blur(3px); z-index: 40; }
+  .backdrop { position: fixed; inset: 0; background: rgba(7,7,17,0.55); backdrop-filter: blur(6px); z-index: 40; }
   .modal { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 41;
     width: min(560px, 92vw); max-height: 84vh; overflow-y: auto;
-    background: var(--surface); border: 1px solid var(--border-strong); border-radius: 14px;
-    box-shadow: 0 24px 70px rgba(0,0,0,0.6); }
+    background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--r-xl);
+    box-shadow: var(--shadow-4), var(--edge-hi); }
   @keyframes modal-in { from { opacity: 0; } to { opacity: 1; } }
   @media (prefers-reduced-motion: no-preference) {
-    .backdrop { animation: modal-in 0.15s var(--ease); }
-    .modal { animation: modal-in 0.16s var(--ease); }
+    .backdrop { animation: modal-in var(--dur-fast) var(--ease); }
+    .modal { animation: modal-in var(--dur) var(--ease); }
   }
-  .head { display: flex; align-items: center; justify-content: space-between; padding: 0.9rem 1.1rem; border-bottom: 1px solid var(--border); }
-  h2 { margin: 0; font-size: 1.05rem; }
-  .x { font-size: 1.3rem; color: var(--muted); width: 28px; height: 28px; border-radius: 6px; }
-  .x:hover { background: var(--surface-2); color: var(--text); }
-  .body { padding: 1rem 1.1rem 1.3rem; display: flex; flex-direction: column; gap: 1.3rem; }
-  section h3 { margin: 0 0 0.5rem; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--dim); }
-  .accounts { display: flex; flex-direction: column; gap: 0.3rem; margin-bottom: 0.6rem; }
-  .acct { display: flex; align-items: center; gap: 0.5rem; padding: 0.35rem 0.5rem; background: var(--surface-2); border-radius: 7px; }
-  .aid { font-weight: 500; }
-  .aprov { font-size: 0.72rem; margin-left: auto; }
-  .add { display: flex; flex-direction: column; gap: 0.45rem; }
-  .add-row { display: flex; gap: 0.4rem; }
+  .head { display: flex; align-items: center; justify-content: space-between; padding: var(--space-4) var(--space-5); border-bottom: 1px solid var(--border); }
+  h2 { margin: 0; font-size: var(--text-lg); }
+  .body { padding: var(--space-5) var(--space-5) var(--space-6); display: flex; flex-direction: column; gap: var(--space-7); }
+  section h3 { margin: 0 0 var(--space-3); font-size: var(--text-2xs); text-transform: uppercase; letter-spacing: var(--ls-label); color: var(--dim); }
+  .accounts { display: flex; flex-direction: column; gap: var(--space-2); margin-bottom: var(--space-4); }
+  .acct { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-2) var(--space-3); background: var(--surface-2); border-radius: var(--r-md); box-shadow: var(--edge-hi); }
+  .aid { font-weight: var(--fw-medium); }
+  .aprov { font-size: var(--text-xs); margin-left: auto; }
+  .add { display: flex; flex-direction: column; gap: var(--space-3); }
+  .add > .btn { align-self: flex-start; }
+  .add-row { display: flex; gap: var(--space-2); }
   .add-row select { flex: none; }
   .add-row input { flex: 1; }
-  .cmd { display: block; background: var(--bg); border: 1px solid var(--border); border-radius: 7px; padding: 0.45rem 0.6rem; font-size: 0.78rem; color: var(--cyan); }
-  .btn { align-self: flex-start; background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: 8px; padding: 0.35rem 0.7rem; }
-  .btn:hover { border-color: var(--accent); }
   .add-row .btn { flex: none; align-self: stretch; }
-  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  .btn.primary:hover:not(:disabled) { filter: brightness(1.08); }
-  .btn:disabled { opacity: 0.6; cursor: default; }
-  .status { font-size: 0.78rem; line-height: 1.45; margin: 0.1rem 0 0.15rem; }
+  .cmd { display: block; background: var(--bg); border: 1px solid var(--border-subtle); border-radius: var(--r-md); padding: var(--space-3) var(--space-4); font-size: var(--text-xs); color: var(--cyan); }
+  .status { font-size: var(--text-xs); line-height: 1.45; margin: 0.1rem 0 0.15rem; }
   .status.waiting { color: var(--warn); }
   .status.done { color: var(--ok); }
-  .status.error { color: var(--bad); }
-  .opt { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; }
+  .status.error { color: var(--bad-text); }
+  .opt { display: flex; align-items: center; gap: var(--space-3); margin-bottom: var(--space-3); }
   .opt.budget { flex-wrap: wrap; }
   .opt.budget input { width: 6rem; margin-left: auto; }
   .opt.row2 { justify-content: space-between; }
   .opt.row2 select { min-width: 11rem; }
-  .hint { font-size: 0.75rem; line-height: 1.5; }
-  .hint code { background: var(--bg); padding: 0 0.25rem; border-radius: 4px; }
-  .budget-auto { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; margin-bottom: 0.5rem; }
+  .hint { font-size: var(--text-xs); line-height: 1.5; }
+  .hint code { background: var(--bg); padding: 0 0.25rem; border-radius: var(--r-xs); }
+  .budget-auto { display: flex; align-items: center; gap: var(--space-4); flex-wrap: wrap; margin-bottom: var(--space-3); }
   .budget-auto .hint { flex: 1; min-width: 12rem; }
-  .auto-result { background: var(--surface-2); border: 1px solid var(--border); border-radius: 9px; padding: 0.55rem 0.7rem; margin-bottom: 0.6rem; }
-  .auto-total { font-size: 0.8rem; margin-bottom: 0.35rem; }
+  .auto-result { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--r-lg); padding: var(--space-3) var(--space-4); margin-bottom: var(--space-4); box-shadow: var(--edge-hi); }
+  .auto-total { font-size: var(--text-sm); margin-bottom: var(--space-2); }
   .auto-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.15rem; }
-  .auto-list li { font-size: 0.73rem; font-family: var(--mono); }
-  .mesh-status { display: flex; flex-direction: column; gap: 0.4rem; margin-bottom: 0.5rem; }
-  .mstate { font-size: 0.78rem; line-height: 1.45; }
+  .auto-list li { font-size: var(--text-xs); font-family: var(--mono); }
+  .mesh-status { display: flex; flex-direction: column; gap: var(--space-3); margin-bottom: var(--space-3); }
+  .mstate { font-size: var(--text-xs); line-height: 1.45; }
   .mstate.on { color: var(--ok); }
   .mstate.warn { color: var(--warn); }
   .mstate.off { color: var(--muted); }
