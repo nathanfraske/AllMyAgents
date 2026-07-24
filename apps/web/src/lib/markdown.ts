@@ -54,7 +54,9 @@ function escapeHtml(s: string): string {
 function sanitizeProse(html: string): string {
   installHooks()
   return DOMPurify.sanitize(html, {
-    FORBID_TAGS: ['style', 'form', 'iframe', 'object', 'embed', 'link', 'meta', 'base'],
+    // `img` is forbidden too: message text is model-generated, so a remote image src would be a
+    // zero-click exfil beacon / prompt-injection channel (auto-fetched on render).
+    FORBID_TAGS: ['style', 'form', 'iframe', 'object', 'embed', 'link', 'meta', 'base', 'img'],
     FORBID_ATTR: ['style'],
   })
 }

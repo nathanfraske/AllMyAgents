@@ -185,6 +185,18 @@ function originAllowed(origin: string | undefined): boolean {
   return /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)
 }
 
+/**
+ * Reject requests whose Host header isn't loopback (or the desktop origin). This is the companion
+ * to the origin guard that closes DNS rebinding: an attacker page whose domain is rebound to
+ * 127.0.0.1 still sends its OWN domain in Host, never `localhost` — and browsers omit Origin on
+ * same-origin GETs, so the origin guard alone can't stop the read. A missing Host is refused.
+ */
+function hostAllowed(host: string | undefined): boolean {
+  if (!host) return false
+  const name = host.toLowerCase().replace(/:\d+$/, '')
+  return name === '127.0.0.1' || name === 'localhost' || name === '[::1]' || name === '::1' || name === 'tauri.localhost'
+}
+
 /** Extract a device token from an Authorization: Bearer header or the x-hub-token header. */
 function bearerToken(req: http.IncomingMessage): string | undefined {
   const auth = req.headers.authorization
@@ -229,10 +241,15 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, { error: 'forbidden origin' }, 403)
         return
       }
+      // DNS-rebinding guard: the Host must be loopback/desktop (a rebound attacker domain isn't).
+      if (!hostAllowed(req.headers.host)) {
+        json(res, { error: 'forbidden host' }, 403)
+        return
+      }
       if (origin) {
         res.setHeader('Access-Control-Allow-Origin', origin)
         res.setHeader('Vary', 'Origin')
-        res.setHeader('Access-Control-Allow-Headers', 'content-type')
+        res.setHeader('Access-Control-Allow-Headers', 'content-type, authorization')
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
       }
       if (method === 'OPTIONS') {
@@ -470,6 +487,7 @@ export function startServer(opts: ServerOptions): http.Server {
     path: '/ws',
     verifyClient: (info: { origin?: string; req: http.IncomingMessage }) => {
       if (!originAllowed(info.origin)) return false
+      if (!hostAllowed(info.req.headers.host)) return false
       if (!requireToken) return true
       const wsUrl = new URL(info.req.url ?? '/ws', 'http://localhost')
       return tokenMatches(deviceToken, wsUrl.searchParams.get('token') ?? undefined)

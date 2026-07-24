@@ -156,6 +156,8 @@ class HubStore {
     if (auth.authed || !auth.requireToken) {
       this.needsPairing = false
       await this.init()
+    } else {
+      setHubToken('') // reject an invalid token so a bad paste doesn't linger and lock the client
     }
   }
 
@@ -346,6 +348,9 @@ class HubStore {
     const i = v.items.findIndex((it) => it.key === key)
     if (i >= 0) v.items.splice(i, 1)
     delete this.suppressNextUserMsg[sessionId]
+    // The fresh send failed — clear the in-flight markers so the thinking spinner doesn't stick.
+    v.turnStartedAt = undefined
+    v.liveTokens = undefined
   }
 
   // Delete a chat: tell the hub (which stops it + writes a tombstone), then drop it locally.
