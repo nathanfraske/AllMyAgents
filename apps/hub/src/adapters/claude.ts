@@ -32,7 +32,10 @@ export class ClaudeDriver {
     private readonly profileDir: string,
     private readonly cwd: string,
     private readonly onEvent: EventSink,
-    private readonly canUseTool?: ClaudePermissionHandler
+    private readonly canUseTool?: ClaudePermissionHandler,
+    // In-process MCP servers (hub-provided agent tools: inter-agent bus + shared memory). Keyed by
+    // server name; the SDK exposes their tools to the agent as `mcp__<name>__<tool>`.
+    private readonly mcpServers?: Record<string, unknown>
   ) {}
 
   get sessionId(): string | undefined {
@@ -63,6 +66,7 @@ export class ClaudeDriver {
     if (this.canUseTool) {
       options.canUseTool = async (toolName: string, input: unknown) => this.canUseTool!(toolName, input)
     }
+    if (this.mcpServers) options.mcpServers = this.mcpServers
     const q = query({ prompt: finalPrompt, options: options as never })
     this.active = q as unknown as { interrupt(): Promise<void> }
     try {

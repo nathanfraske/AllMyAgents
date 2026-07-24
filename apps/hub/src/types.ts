@@ -30,6 +30,11 @@ export interface SessionRecord {
   effort?: string
   serviceTier?: string
   permissionMode?: 'safe' | 'edits' | 'full'
+  // Human-facing name shown in the sidebar. Auto-derived from the first prompt (titleSource:'auto')
+  // and overridable by the user (titleSource:'user', which freezes auto-naming). Absent → the UI
+  // falls back to the worktree/cwd basename.
+  title?: string
+  titleSource?: 'auto' | 'user'
   createdAt: string
 }
 

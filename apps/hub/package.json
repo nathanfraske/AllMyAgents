@@ -6,20 +6,23 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "build": "tsc -p tsconfig.build.json",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "latest",
     "@anthropic-ai/claude-code": "latest",
     "@openai/codex": "latest",
     "better-sqlite3": "^12",
-    "ws": "^8"
+    "ws": "^8",
+    "zod": "^4.0.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7",
     "@types/node": "^22",
     "@types/ws": "^8",
     "tsx": "^4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^2"
   }
 }

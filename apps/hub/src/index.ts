@@ -12,6 +12,8 @@ import { WorkspaceManager } from './workspace.js'
 import { MeshSite } from './meshSite.js'
 import { getOrCreateDeviceToken } from './deviceToken.js'
 import { InstructionStore } from './instructions.js'
+import { AgentBus } from './bus.js'
+import { MemoryStore } from './memory.js'
 import type { HubConfig } from './types.js'
 
 const repoRoot = path.resolve(import.meta.dirname, '..', '..', '..')
@@ -33,7 +35,9 @@ const usage = new UsageMonitor(journal, profiles, config)
 const workspace = new WorkspaceManager(path.join(repoRoot, 'data', 'worktrees'))
 const projects = new ProjectStore(journal.db)
 const instructions = new InstructionStore(journal.db)
-const sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, repoRoot)
+const bus = new AgentBus(journal.db)
+const memory = new MemoryStore(journal.db)
+const sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, repoRoot)
 usage.setCodexReader((profileId) => sessions.readCodexLimits(profileId))
 sessions.boot()
 usage.startPolling()
@@ -72,7 +76,7 @@ const meshEnable = !(
   config.mesh?.enable === false
 )
 const mesh = new MeshSite({ port, label: config.mesh?.label, enable: meshEnable })
-startServer({ port, defaultCwd: repoRoot, journal, sessions, profiles, approvals, usage, projects, instructions, rescanProfiles, mesh, deviceToken, requireToken })
+startServer({ port, defaultCwd: repoRoot, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, rescanProfiles, mesh, deviceToken, requireToken })
 journal.append(null, 'hub/started', {
   port,
   profiles: profiles.map((p) => ({ id: p.id, provider: p.provider })),

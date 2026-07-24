@@ -1,0 +1,134 @@
+import crypto from 'node:crypto'
+import type Database from 'better-sqlite3'
+
+/**
+ * Shared, scoped agent memory (DESIGN D11, first slice).
+ *
+ * Agents save durable notes ("we decided X", "the build command is Y") that persist across turns
+ * and across sessions, and recall them later — including notes written by a teammate on the same
+ * project. Scope keys mirror the instruction layer (see identity.ts / instructions.ts):
+ *   global | vendor:<provider> | project:<projectId> | account:<profileId>
+ * Read/write access is enforced by the caller passing the identity's allowed scopes
+ * (readableScopes / writableScopes); this store is scope-agnostic persistence + query.
+ */
+export interface Memory {
+  id: string
+  scope: string
+  title: string
+  body: string
+  tags: string[]
+  fromSession: string | null
+  fromProfile: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+interface Row {
+  id: string
+  scope: string
+  title: string
+  body: string
+  tags: string
+  fromSession: string | null
+  fromProfile: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export class MemoryStore {
+  private readonly db: Database.Database
+  private readonly insertStmt: Database.Statement
+  private readonly getStmt: Database.Statement
+  private readonly delStmt: Database.Statement
+
+  constructor(db: Database.Database) {
+    this.db = db
+    db.exec(
+      `CREATE TABLE IF NOT EXISTS memories (
+        id TEXT PRIMARY KEY, scope TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
+        tags TEXT NOT NULL DEFAULT '[]', fromSession TEXT, fromProfile TEXT,
+        createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL)`
+    )
+    db.exec('CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories (scope, updatedAt DESC)')
+    this.insertStmt = db.prepare(
+      `INSERT INTO memories (id, scope, title, body, tags, fromSession, fromProfile, createdAt, updatedAt)
+       VALUES (@id, @scope, @title, @body, @tags, @fromSession, @fromProfile, @createdAt, @updatedAt)`
+    )
+    this.getStmt = db.prepare('SELECT * FROM memories WHERE id = ?')
+    this.delStmt = db.prepare('DELETE FROM memories WHERE id = ?')
+  }
+
+  write(input: {
+    scope: string
+    title: string
+    body: string
+    tags?: string[]
+    fromSession?: string | null
+    fromProfile?: string | null
+  }): Memory {
+    const now = new Date().toISOString()
+    const row: Row = {
+      id: crypto.randomUUID(),
+      scope: input.scope,
+      title: input.title.trim().slice(0, 200),
+      body: input.body.trim(),
+      tags: JSON.stringify((input.tags ?? []).map((t) => String(t).trim()).filter(Boolean).slice(0, 12)),
+      fromSession: input.fromSession ?? null,
+      fromProfile: input.fromProfile ?? null,
+      createdAt: now,
+      updatedAt: now,
+    }
+    this.insertStmt.run(row)
+    return this.hydrate(row)
+  }
+
+  /** Fetch by id, optionally constrained to a set of readable scopes (returns undefined if outside). */
+  get(id: string, scopes?: string[]): Memory | undefined {
+    const r = this.getStmt.get(id) as Row | undefined
+    if (!r) return undefined
+    if (scopes && !scopes.includes(r.scope)) return undefined
+    return this.hydrate(r)
+  }
+
+  list(opts: { scopes?: string[]; limit?: number } = {}): Memory[] {
+    return this.query(opts.scopes, undefined, opts.limit ?? 50)
+  }
+
+  search(query: string, opts: { scopes?: string[]; limit?: number } = {}): Memory[] {
+    return this.query(opts.scopes, query.trim(), opts.limit ?? 20)
+  }
+
+  remove(id: string): void {
+    this.delStmt.run(id)
+  }
+
+  // scopes: undefined = no scope filter (operator/API sees all); [] = nothing readable → empty.
+  private query(scopes: string[] | undefined, q: string | undefined, limit: number): Memory[] {
+    if (scopes && scopes.length === 0) return []
+    const where: string[] = []
+    const params: unknown[] = []
+    if (scopes) {
+      where.push(`scope IN (${scopes.map(() => '?').join(',')})`)
+      params.push(...scopes)
+    }
+    if (q) {
+      const like = '%' + q.replace(/[\\%_]/g, (m) => '\\' + m) + '%'
+      where.push("(title LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\')")
+      params.push(like, like, like)
+    }
+    const sql = `SELECT * FROM memories ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY updatedAt DESC LIMIT ?`
+    params.push(Math.min(Math.max(1, limit), 100))
+    return (this.db.prepare(sql).all(...params) as Row[]).map((r) => this.hydrate(r))
+  }
+
+  private hydrate(r: Row): Memory {
+    let tags: string[] = []
+    try {
+      const v = JSON.parse(r.tags)
+      if (Array.isArray(v)) tags = v.map(String)
+    } catch {
+      /* corrupt tags → none */
+    }
+    return { ...r, tags }
+  }
+}

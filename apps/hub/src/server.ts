@@ -8,6 +8,8 @@ import type { SessionManager } from './sessions.js'
 import type { UsageMonitor } from './usage.js'
 import type { MeshSite } from './meshSite.js'
 import type { InstructionStore } from './instructions.js'
+import type { AgentBus } from './bus.js'
+import type { MemoryStore } from './memory.js'
 import { tokenMatches } from './deviceToken.js'
 import { pickFolder } from './native.js'
 import { computeStats } from './stats.js'
@@ -215,6 +217,8 @@ export interface ServerOptions {
   usage: UsageMonitor
   projects: ProjectStore
   instructions: InstructionStore
+  bus: AgentBus
+  memory: MemoryStore
   rescanProfiles: () => Profile[]
   mesh: MeshSite
   deviceToken: string
@@ -222,7 +226,7 @@ export interface ServerOptions {
 }
 
 export function startServer(opts: ServerOptions): http.Server {
-  const { port, defaultCwd, journal, sessions, profiles, approvals, usage, projects, instructions, rescanProfiles, mesh, deviceToken, requireToken } = opts
+  const { port, defaultCwd, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, rescanProfiles, mesh, deviceToken, requireToken } = opts
   // Same location index.ts scans for profiles (repoRoot/profiles); defaultCwd is repoRoot.
   const profilesDir = path.join(defaultCwd, 'profiles')
 
@@ -364,6 +368,32 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, instructions.list())
         return
       }
+      // Shared agent memory — operator view (all scopes unless ?scope=), and curate notes.
+      if (method === 'GET' && url.pathname === '/api/memory') {
+        const scope = str(url.searchParams.get('scope') ?? undefined)
+        const q = str(url.searchParams.get('q') ?? undefined)
+        const scopes = scope ? [scope] : undefined
+        json(res, q ? memory.search(q, { scopes }) : memory.list({ scopes }))
+        return
+      }
+      if (method === 'POST' && url.pathname === '/api/memory') {
+        const body = await readBody(req)
+        const scope = str(body.scope)
+        const title = str(body.title)
+        const bodyText = str(body.body)
+        if (!scope || !title || !bodyText) {
+          json(res, { error: 'scope, title, body required' }, 400)
+          return
+        }
+        const tags = Array.isArray(body.tags) ? body.tags.map(String) : undefined
+        json(res, memory.write({ scope, title, body: bodyText, tags }))
+        return
+      }
+      // Inter-agent bus history — operator visibility (the transcript itself renders from journal events).
+      if (method === 'GET' && url.pathname === '/api/bus') {
+        json(res, bus.history({ project: str(url.searchParams.get('project') ?? undefined), sessionId: str(url.searchParams.get('session') ?? undefined) }))
+        return
+      }
       if (method === 'GET' && url.pathname === '/api/sessions') {
         json(res, sessions.list())
         return
@@ -446,6 +476,19 @@ export function startServer(opts: ServerOptions): http.Server {
       if (method === 'POST' && steerMatch) {
         const body = await readBody(req)
         await sessions.steer(steerMatch[1] as string, String(body.text ?? ''))
+        json(res, { ok: true })
+        return
+      }
+      // Rename a session (auto-naming override). sanitizeTitle in rename() is the trust boundary.
+      const titleMatch = /^\/api\/sessions\/([^/]+)\/title$/.exec(url.pathname)
+      if (method === 'POST' && titleMatch) {
+        const body = await readBody(req)
+        const t = str(body.title)
+        if (!t) {
+          json(res, { error: 'title required' }, 400)
+          return
+        }
+        sessions.rename(titleMatch[1] as string, t)
         json(res, { ok: true })
         return
       }
