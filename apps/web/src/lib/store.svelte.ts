@@ -134,18 +134,25 @@ class HubStore {
   lastProfileId = $state<string | null>(null)
 
   defaultProfileId(): string | undefined {
+    if (settings.defaultAccount && this.profiles.some((p) => p.id === settings.defaultAccount)) return settings.defaultAccount
     if (this.lastProfileId && this.profiles.some((p) => p.id === this.lastProfileId)) return this.lastProfileId
     return this.profiles[0]?.id
   }
 
-  // Open an empty chat immediately — no prompt/model/etc. up front; configure in the composer.
+  // Open an empty chat immediately — no prompt up front; the composer configures the rest.
+  // Applies the user's settings defaults (permission mode, default model per provider).
   async newSession(profileId?: string, projectId?: string): Promise<void> {
     const pid = profileId ?? this.defaultProfileId()
     if (!pid) {
       this.settingsOpen = true
       return
     }
-    const out = await api.spawn(projectId ? { profileId: pid, projectId } : { profileId: pid })
+    const profile = this.profiles.find((p) => p.id === pid)
+    const model = profile?.provider === 'codex' ? settings.defaultCodexModel : settings.defaultClaudeModel
+    const body: Record<string, unknown> = { profileId: pid, permissionMode: settings.defaultPermissionMode }
+    if (projectId) body.projectId = projectId
+    if (model) body.model = model
+    const out = await api.spawn(body)
     if (out && !('error' in out)) {
       this.lastProfileId = pid
       this.select((out as { id: string }).id)

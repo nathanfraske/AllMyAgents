@@ -184,6 +184,7 @@
   .hbtn:hover:not(:disabled) { border-color: var(--border-strong); color: var(--text); }
   .hbtn:disabled { opacity: 0.4; cursor: default; }
   .stream { flex: 1; display: flex; flex-direction: column; gap: 0.55rem; padding: 1rem 1.1rem; max-width: 900px; width: 100%; margin: 0 auto; }
+  @media (prefers-reduced-motion: no-preference) { .stream > :global(*) { animation: fade-in 0.22s var(--ease); } }
   .pad { padding: 1rem 0; }
   .composer-wrap { padding: 0.5rem 1rem 0.7rem; max-width: 900px; width: 100%; margin: 0 auto; }
   .approval { background: var(--surface); border: 1px solid var(--warn); border-radius: 10px; padding: 0.5rem 0.7rem; margin-bottom: 0.5rem; }

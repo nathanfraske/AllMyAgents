@@ -49,6 +49,7 @@
   .chev { font-size: 0.6rem; opacity: 0.7; }
   .scrim { position: fixed; inset: 0; background: transparent; border: none; z-index: 10; }
   .menu { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 11; min-width: 220px; background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: 10px; padding: 0.3rem; box-shadow: 0 8px 28px rgba(0,0,0,0.5); }
+  @media (prefers-reduced-motion: no-preference) { .menu { animation: pop-in 0.12s var(--ease); } }
   .search { width: 100%; margin-bottom: 0.3rem; }
   .row { display: flex; align-items: center; gap: 0.4rem; width: 100%; text-align: left; padding: 0.35rem 0.5rem; border-radius: 7px; font-size: 0.82rem; }
   .row:hover { background: var(--surface-3); }

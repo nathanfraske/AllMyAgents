@@ -2,6 +2,7 @@
   import { store } from './store.svelte'
   import { settings } from './settings.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
+  import { modelsFor } from './catalog'
 
   let { onclose }: { onclose: () => void } = $props()
 
@@ -60,6 +61,35 @@
     </section>
 
     <section>
+      <h3>Defaults for new chats</h3>
+      <label class="opt row2">Account
+        <select value={settings.defaultAccount} onchange={(e) => settings.set('defaultAccount', (e.target as HTMLSelectElement).value)}>
+          <option value="">last used</option>
+          {#each store.profiles as p (p.id)}<option value={p.id}>{p.id} · {p.provider}</option>{/each}
+        </select>
+      </label>
+      <label class="opt row2">Permission mode
+        <select value={settings.defaultPermissionMode} onchange={(e) => settings.set('defaultPermissionMode', (e.target as HTMLSelectElement).value)}>
+          <option value="safe">Safe (ask)</option>
+          <option value="edits">Edits free</option>
+          <option value="full">Full access</option>
+        </select>
+      </label>
+      <label class="opt row2">Claude model
+        <select value={settings.defaultClaudeModel} onchange={(e) => settings.set('defaultClaudeModel', (e.target as HTMLSelectElement).value)}>
+          <option value="">catalog default</option>
+          {#each modelsFor('claude') as m (m.slug)}<option value={m.slug}>{m.name}</option>{/each}
+        </select>
+      </label>
+      <label class="opt row2">Codex model
+        <select value={settings.defaultCodexModel} onchange={(e) => settings.set('defaultCodexModel', (e.target as HTMLSelectElement).value)}>
+          <option value="">catalog default</option>
+          {#each modelsFor('codex') as m (m.slug)}<option value={m.slug}>{m.name}</option>{/each}
+        </select>
+      </label>
+    </section>
+
+    <section>
       <h3>Composer</h3>
       <label class="opt"><input type="checkbox" checked={settings.showTokenEstimate} onchange={() => settings.toggleTokenEstimate()} /> Show next-call token estimate under the chatbox</label>
       <label class="opt"><input type="checkbox" checked={settings.combineQueued} onchange={() => settings.toggleCombineQueued()} /> Auto-combine queued messages (before the model reads them)</label>
@@ -83,6 +113,11 @@
     width: min(560px, 92vw); max-height: 84vh; overflow-y: auto;
     background: var(--surface); border: 1px solid var(--border-strong); border-radius: 14px;
     box-shadow: 0 24px 70px rgba(0,0,0,0.6); }
+  @keyframes modal-in { from { opacity: 0; } to { opacity: 1; } }
+  @media (prefers-reduced-motion: no-preference) {
+    .backdrop { animation: modal-in 0.15s var(--ease); }
+    .modal { animation: modal-in 0.16s var(--ease); }
+  }
   .head { display: flex; align-items: center; justify-content: space-between; padding: 0.9rem 1.1rem; border-bottom: 1px solid var(--border); }
   h2 { margin: 0; font-size: 1.05rem; }
   .x { font-size: 1.3rem; color: var(--muted); width: 28px; height: 28px; border-radius: 6px; }
@@ -103,6 +138,8 @@
   .opt { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; }
   .opt.budget { flex-wrap: wrap; }
   .opt.budget input { width: 6rem; margin-left: auto; }
+  .opt.row2 { justify-content: space-between; }
+  .opt.row2 select { min-width: 11rem; }
   .hint { font-size: 0.75rem; line-height: 1.5; }
   .hint code { background: var(--bg); padding: 0 0.25rem; border-radius: 4px; }
 </style>

@@ -51,6 +51,7 @@
   .chev { font-size: 0.6rem; opacity: 0.7; }
   .scrim { position: fixed; inset: 0; background: transparent; border: none; z-index: 10; }
   .menu { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 11; min-width: 170px; background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: 10px; padding: 0.35rem; box-shadow: 0 8px 28px rgba(0,0,0,0.5); }
+  @media (prefers-reduced-motion: no-preference) { .menu { animation: pop-in 0.12s var(--ease); } }
   .group { margin-bottom: 0.35rem; }
   .glabel { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.06em; padding: 0.15rem 0.35rem; }
   .opt { display: flex; align-items: center; gap: 0.4rem; width: 100%; text-align: left; padding: 0.3rem 0.5rem; border-radius: 6px; font-size: 0.8rem; }

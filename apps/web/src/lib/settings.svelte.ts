@@ -3,10 +3,23 @@ interface Settings {
   planBudgetUsd: number | null
   showTokenEstimate: boolean
   combineQueued: boolean
+  defaultAccount: string
+  defaultPermissionMode: string
+  defaultClaudeModel: string
+  defaultCodexModel: string
 }
 
 const KEY = 'aiagentapp.settings'
-const DEFAULTS: Settings = { showSpend: false, planBudgetUsd: null, showTokenEstimate: true, combineQueued: true }
+const DEFAULTS: Settings = {
+  showSpend: false,
+  planBudgetUsd: null,
+  showTokenEstimate: true,
+  combineQueued: true,
+  defaultAccount: '',
+  defaultPermissionMode: 'safe',
+  defaultClaudeModel: '',
+  defaultCodexModel: '',
+}
 
 function load(): Settings {
   try {
@@ -23,6 +36,10 @@ class SettingsStore {
   planBudgetUsd = $state<number | null>(null)
   showTokenEstimate = $state(true)
   combineQueued = $state(true)
+  defaultAccount = $state('')
+  defaultPermissionMode = $state('safe')
+  defaultClaudeModel = $state('')
+  defaultCodexModel = $state('')
 
   constructor() {
     const s = load()
@@ -30,6 +47,10 @@ class SettingsStore {
     this.planBudgetUsd = s.planBudgetUsd
     this.showTokenEstimate = s.showTokenEstimate
     this.combineQueued = s.combineQueued
+    this.defaultAccount = s.defaultAccount
+    this.defaultPermissionMode = s.defaultPermissionMode
+    this.defaultClaudeModel = s.defaultClaudeModel
+    this.defaultCodexModel = s.defaultCodexModel
   }
 
   save(): void {
@@ -41,6 +62,10 @@ class SettingsStore {
           planBudgetUsd: this.planBudgetUsd,
           showTokenEstimate: this.showTokenEstimate,
           combineQueued: this.combineQueued,
+          defaultAccount: this.defaultAccount,
+          defaultPermissionMode: this.defaultPermissionMode,
+          defaultClaudeModel: this.defaultClaudeModel,
+          defaultCodexModel: this.defaultCodexModel,
         })
       )
     } catch {
@@ -65,6 +90,11 @@ class SettingsStore {
 
   setBudget(v: number | null): void {
     this.planBudgetUsd = v
+    this.save()
+  }
+
+  set<K extends keyof Settings>(key: K, value: Settings[K]): void {
+    ;(this as unknown as Settings)[key] = value
     this.save()
   }
 }
