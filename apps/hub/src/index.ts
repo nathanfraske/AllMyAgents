@@ -86,10 +86,14 @@ function shutdown(signal: string): void {
   if (shuttingDown) return
   shuttingDown = true
   const done = (): void => process.exit(0)
-  // Cap the cleanup so a hung socket can't wedge shutdown.
+  // Cap the cleanup so a hung socket or child can't wedge shutdown.
   const guard = setTimeout(done, 2500)
   guard.unref?.()
-  void mesh.deregister().finally(() => {
+  // Tear down the vendor children we spawned (codex app-server, in-flight claude queries) so a
+  // standalone hub stop doesn't orphan them, and pull our mesh advert. Both are best-effort and
+  // race the guard above; sessions.shutdown() dispatches the codex kills synchronously so they
+  // land even if the guard fires first.
+  void Promise.allSettled([mesh.deregister(), sessions.shutdown()]).finally(() => {
     clearTimeout(guard)
     console.log(`[hub] ${signal} — stopped`)
     done()

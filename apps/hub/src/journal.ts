@@ -55,4 +55,26 @@ export class Journal extends EventEmitter {
       payload: JSON.parse(r.payload) as unknown,
     }))
   }
+
+  /**
+   * Replay EVERY event with seq > `seq`, in ascending order, exactly once, paging through the DB
+   * in bounded chunks (`pageSize`) so an arbitrarily large journal is never materialized as a
+   * single result set. `since()` alone caps at `pageSize` rows — a lone call silently drops the
+   * tail; this drains until a short page proves the end is reached (H1).
+   *
+   * This is a *synchronous* generator (better-sqlite3 reads are synchronous), so a caller can
+   * drain it and attach a live listener in the same tick with no intervening `await`. That is what
+   * lets the WS handler join replay→live with no gap and no duplicate: single-threaded JS means no
+   * `append()` can interleave between the final page read and `on('event', …)`.
+   */
+  *replay(seq: number, pageSize = 2000): Generator<HubEvent> {
+    let cursor = seq
+    for (;;) {
+      const batch = this.since(cursor, pageSize)
+      for (const event of batch) yield event
+      const last = batch[batch.length - 1]
+      if (batch.length < pageSize || !last) return
+      cursor = last.seq
+    }
+  }
 }

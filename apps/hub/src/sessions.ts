@@ -105,6 +105,14 @@ export class SessionManager {
       client = new CodexClient(
         profile.dir,
         (kind, payload) => {
+          // The app-server child died: any codex session on this profile that was mid-turn will
+          // never get its turn/completed and would hang in `active` forever, so flip the in-flight
+          // ones to `error`. Exit carries no threadId — match by profile. (Journaled once, here.)
+          if (kind === 'codex/exited') {
+            this.journal.append(null, kind, payload)
+            this.failInFlightCodexSessions(profile.id, payload)
+            return
+          }
           const threadId = (payload as { threadId?: string } | null)?.threadId
           const record = threadId ? this.sessionForThread(threadId) : undefined
           this.journal.append(record?.id ?? null, kind, payload)
@@ -352,5 +360,42 @@ export class SessionManager {
     const profile = this.profiles.get(profileId)
     if (!profile) throw new Error(`unknown profile: ${profileId}`)
     return this.codexClientFor(profile).readRateLimits()
+  }
+
+  /**
+   * Global kill-switch: stop every vendor child process this hub spawned — the long-lived Codex
+   * `app-server` children (one per profile) and any in-flight Claude query subprocess — so a
+   * standalone hub stop (SIGINT/SIGTERM) doesn't orphan them (Windows has no job-object
+   * kill-on-parent-death). The Codex kills are dispatched synchronously here, before the first
+   * await, so they still land even if the caller's shutdown guard timer fires early; in-flight
+   * Claude turns are interrupted concurrently. Best-effort and non-throwing.
+   */
+  async shutdown(): Promise<void> {
+    for (const client of this.codexClients.values()) {
+      try {
+        client.stop()
+      } catch {
+        /* best-effort teardown — one child's failure must not block the others */
+      }
+    }
+    await Promise.allSettled([...this.claudeDrivers.values()].map((driver) => driver.interrupt()))
+  }
+
+  // On a Codex app-server crash, move every session bound to that profile that was mid-turn
+  // (`active`) or half-created (`starting`) into `error`, recording why. Without this, a child that
+  // dies AFTER `turn/start` is acked but BEFORE `turn/completed` leaves the session spinning forever
+  // (no pending request remains to reject in that window). setStatus journals `session/status`,
+  // which the UI reads to stop its thinking timer. The exit event carries no threadId, so sessions
+  // are matched by profile rather than thread.
+  private failInFlightCodexSessions(profileId: string, payload: unknown): void {
+    const code = (payload as { code?: unknown } | null)?.code
+    for (const record of this.sessions.values()) {
+      if (record.provider !== 'codex' || record.profileId !== profileId) continue
+      if (record.status !== 'active' && record.status !== 'starting') continue
+      this.journal.append(record.id, 'session/error', {
+        message: `codex app-server exited (${code ?? 'unknown'}) mid-turn`,
+      })
+      this.setStatus(record, 'error')
+    }
   }
 }

@@ -342,7 +342,9 @@ export function startServer(opts: ServerOptions): http.Server {
         return
       }
       if (method === 'GET' && url.pathname === '/api/events') {
-        json(res, journal.since(Number(url.searchParams.get('since') ?? 0)))
+        // Page the full backlog from `since` (not just the first 2000 rows) so a caller polling
+        // over HTTP gets the same complete, gap-free history the WS replay delivers.
+        json(res, [...journal.replay(Number(url.searchParams.get('since') ?? 0))])
         return
       }
       if (method === 'POST' && url.pathname === '/api/sessions') {
@@ -423,8 +425,12 @@ export function startServer(opts: ServerOptions): http.Server {
   const wss = new WebSocketServer({ server, path: '/ws', verifyClient: (info: { origin?: string }) => originAllowed(info.origin) })
   wss.on('connection', (ws, req) => {
     const url = new URL(req.url ?? '/ws', 'http://localhost')
-    for (const event of journal.since(Number(url.searchParams.get('since') ?? 0))) {
-      ws.send(JSON.stringify(event))
+    // Replay the ENTIRE backlog from `since` (paged inside replay() so a huge journal isn't loaded
+    // at once), then attach the live listener — all synchronously, with no `await` between the last
+    // replayed event and journal.on(), so no live event can slip into the gap or be sent twice. The
+    // client additionally dedups on seq <= lastSeq, covering any reconnect overlap.
+    for (const event of journal.replay(Number(url.searchParams.get('since') ?? 0))) {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event))
     }
     const listener = (event: HubEvent): void => {
       if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event))

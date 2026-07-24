@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import readline from 'node:readline'
 
 type EventSink = (kind: string, payload: unknown) => void
@@ -219,6 +219,21 @@ export class CodexClient {
   }
 
   stop(): void {
-    this.child?.kill()
+    const child = this.child
+    if (!child) return
+    // The app-server is spawned via a shell (shell:true), so on Windows `child` is the cmd.exe
+    // wrapper and killing it orphans the real `codex app-server` grandchild — Windows has no
+    // job-object kill-on-parent-death. `taskkill /T /F` terminates the whole tree by PID (the same
+    // approach the desktop shell's kill_hub uses); POSIX gets a direct kill. Best-effort: fall back
+    // to child.kill() if taskkill can't be spawned, and never throw out of a shutdown path.
+    if (process.platform === 'win32' && child.pid !== undefined) {
+      try {
+        spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'])
+      } catch {
+        child.kill()
+      }
+    } else {
+      child.kill()
+    }
   }
 }
