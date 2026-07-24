@@ -7,6 +7,7 @@ interface Settings {
   defaultPermissionMode: string
   defaultClaudeModel: string
   defaultCodexModel: string
+  ownerName: string
 }
 
 const KEY = 'aiagentapp.settings'
@@ -19,6 +20,7 @@ const DEFAULTS: Settings = {
   defaultPermissionMode: 'safe',
   defaultClaudeModel: '',
   defaultCodexModel: '',
+  ownerName: '',
 }
 
 function load(): Settings {
@@ -40,6 +42,7 @@ class SettingsStore {
   defaultPermissionMode = $state('safe')
   defaultClaudeModel = $state('')
   defaultCodexModel = $state('')
+  ownerName = $state('')
 
   constructor() {
     const s = load()
@@ -51,6 +54,7 @@ class SettingsStore {
     this.defaultPermissionMode = s.defaultPermissionMode
     this.defaultClaudeModel = s.defaultClaudeModel
     this.defaultCodexModel = s.defaultCodexModel
+    this.ownerName = s.ownerName
   }
 
   save(): void {

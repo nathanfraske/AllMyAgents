@@ -1,4 +1,5 @@
 import http from 'node:http'
+import path from 'node:path'
 import { WebSocketServer, WebSocket } from 'ws'
 import type { ApprovalService } from './approvals.js'
 import type { Journal } from './journal.js'
@@ -6,7 +7,9 @@ import type { ProjectStore } from './projects.js'
 import type { SessionManager } from './sessions.js'
 import type { UsageMonitor } from './usage.js'
 import { pickFolder } from './native.js'
-import type { HubEvent, Profile } from './types.js'
+import { computeStats } from './stats.js'
+import { startLogin, awaitLogin, credentialsExist } from './loginLauncher.js'
+import type { HubEvent, Profile, Provider } from './types.js'
 
 const PAGE = `<!doctype html>
 <html>
@@ -179,7 +182,9 @@ export interface ServerOptions {
 }
 
 export function startServer(opts: ServerOptions): http.Server {
-  const { port, journal, sessions, profiles, approvals, usage, projects, rescanProfiles } = opts
+  const { port, defaultCwd, journal, sessions, profiles, approvals, usage, projects, rescanProfiles } = opts
+  // Same location index.ts scans for profiles (repoRoot/profiles); defaultCwd is repoRoot.
+  const profilesDir = path.join(defaultCwd, 'profiles')
 
   const server = http.createServer((req, res) => {
     void handle(req, res)
@@ -201,6 +206,57 @@ export function startServer(opts: ServerOptions): http.Server {
       if (method === 'POST' && url.pathname === '/api/profiles/rescan') {
         const list = rescanProfiles()
         json(res, list.map((p) => ({ id: p.id, provider: p.provider })))
+        return
+      }
+      // One-click add-account: launches the vendor login in a visible terminal, then
+      // long-polls until the credentials file appears (login done) or times out.
+      if (method === 'POST' && url.pathname === '/api/accounts/login') {
+        const body = await readBody(req)
+        const provider = body.provider
+        const name = String(body.name ?? '')
+        if (provider !== 'claude' && provider !== 'codex') {
+          json(res, { ok: false, error: 'provider must be claude|codex' }, 400)
+          return
+        }
+        if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
+          json(res, { ok: false, error: 'name must match ^[a-zA-Z0-9_-]+$' }, 400)
+          return
+        }
+        const profileDir = path.join(profilesDir, name)
+        if (credentialsExist(provider as Provider, profileDir)) {
+          json(res, { ok: false, error: `profiles/${name} already has ${provider} credentials` }, 409)
+          return
+        }
+        if (process.platform !== 'win32') {
+          // Headless daemon can't reliably pop a terminal off-Windows; hand back the manual command.
+          json(
+            res,
+            {
+              ok: false,
+              platform: process.platform,
+              manual: `pnpm login:${provider} profiles/${name}`,
+              error: 'auto-launch is Windows-only — run the manual command in a terminal, then Rescan accounts',
+            },
+            501
+          )
+          return
+        }
+        startLogin(provider as Provider, profileDir)
+        // Cap under any inbound-request timeout so the long-poll response always lands.
+        const added = await awaitLogin(provider as Provider, profileDir, { timeoutMs: 270_000 })
+        if (added) {
+          const list = rescanProfiles()
+          const profile = list.find((p) => p.id === name)
+          json(res, { ok: true, added: profile?.id ?? name, provider })
+        } else {
+          json(res, {
+            ok: false,
+            launched: true,
+            timedOut: true,
+            manual: `pnpm login:${provider} profiles/${name}`,
+            error: 'login not detected in time — finish the sign-in in the opened window, then click Rescan accounts',
+          })
+        }
         return
       }
       if (method === 'POST' && url.pathname === '/api/pick-folder') {
@@ -228,6 +284,10 @@ export function startServer(opts: ServerOptions): http.Server {
       }
       if (method === 'GET' && url.pathname === '/api/usage') {
         json(res, usage.list())
+        return
+      }
+      if (method === 'GET' && url.pathname === '/api/stats') {
+        json(res, computeStats(journal.db, projects))
         return
       }
       if (method === 'POST' && url.pathname === '/api/usage/refresh') {

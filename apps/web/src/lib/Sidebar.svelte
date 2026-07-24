@@ -111,8 +111,10 @@
 
 <div class="sidebar">
   <div class="brand">
-    <span class="logo"></span>
-    <span class="name">AiAgentApp</span>
+    <button class="brandbtn" title="home / dashboard" onclick={() => store.goHome()}>
+      <span class="logo"></span>
+      <span class="name">CEC AiMesh</span>
+    </button>
     <span class="tag">fleet</span>
     <span class="conn" class:on={store.connected} title={store.connected ? 'connected' : 'reconnecting'}></span>
   </div>
@@ -166,6 +168,9 @@
           {@const st = store.status(s)}
           {@const pending = store.pendingBySession[s.record.id] ?? 0}
           <div class="row" class:sel={store.selectedId === s.record.id} role="button" tabindex="0"
+            draggable="true"
+            ondragstart={(e) => { store.dragSession = s.record.id; e.dataTransfer?.setData('text/plain', s.record.id) }}
+            ondragend={() => store.endDragSession()}
             onclick={() => store.select(s.record.id)}
             onkeydown={(e) => { if (e.key === 'Enter') store.select(s.record.id) }}>
             <span class="dot {st.key}" title={st.label}></span>
@@ -198,7 +203,9 @@
 
 <style>
   .sidebar { display: flex; flex-direction: column; height: 100vh; background: var(--sidebar); border-right: 1px solid var(--border); }
-  .brand { display: flex; align-items: center; gap: 0.45rem; padding: 0.7rem 0.8rem; }
+  .brand { display: flex; align-items: center; gap: 0.45rem; padding: 0.55rem 0.6rem; }
+  .brandbtn { display: flex; align-items: center; gap: 0.45rem; padding: 0.15rem 0.3rem; border-radius: 7px; }
+  .brandbtn:hover { background: var(--surface); }
   .logo { width: 14px; height: 14px; border-radius: 4px; background: linear-gradient(135deg, var(--accent), var(--cyan)); }
   .name { font-weight: 600; }
   .tag { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--dim); border: 1px solid var(--border-strong); border-radius: 4px; padding: 0 0.25rem; }

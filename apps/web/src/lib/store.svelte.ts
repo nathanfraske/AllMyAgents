@@ -482,6 +482,79 @@ class HubStore {
 
   select(id: string): void {
     this.selectedId = id
+    // In split mode, selecting from the sidebar drives the first (primary) pane.
+    if (this.splitPanes.length) this.splitPanes = [id, ...this.splitPanes.slice(1)]
+  }
+
+  // --- Split / multi-pane layout ---
+  splitPanes = $state<string[]>([])
+  lastLayout = $state<{ selectedId: string | null; splitPanes: string[] } | null>(null)
+
+  // Home to the dashboard, remembering the current chat/pane layout so it can be restored.
+  goHome(): void {
+    if (this.selectedId || this.splitPanes.length) {
+      this.lastLayout = { selectedId: this.selectedId, splitPanes: [...this.splitPanes] }
+    }
+    this.selectedId = null
+    this.splitPanes = []
+  }
+
+  goBack(): void {
+    if (!this.lastLayout) return
+    this.selectedId = this.lastLayout.selectedId
+    this.splitPanes = [...this.lastLayout.splitPanes]
+    this.lastLayout = null
+  }
+  // drag-to-split: the session being dragged and the live insertion index (0..N)
+  dragSession = $state<string | null>(null)
+  dropIndex = $state<number | null>(null)
+
+  paneIds(): string[] {
+    return this.basePanes()
+  }
+
+  insertPane(index: number, id: string): void {
+    const base = [...this.basePanes()]
+    const clamped = Math.max(0, Math.min(index, base.length))
+    base.splice(clamped, 0, id)
+    // more than one pane now → it's a real split
+    if (base.length > 1) this.splitPanes = base
+    this.selectedId = base[0] ?? this.selectedId
+  }
+
+  endDragSession(): void {
+    this.dragSession = null
+    this.dropIndex = null
+  }
+
+  private basePanes(): string[] {
+    if (this.splitPanes.length) return this.splitPanes
+    return this.selectedId ? [this.selectedId] : []
+  }
+
+  startSplit(): void {
+    const base = this.basePanes()
+    if (base.length === 0) return
+    const other = this.sessionList.find((v) => !base.includes(v.record.id))?.record.id ?? base[base.length - 1]
+    this.splitPanes = [...base, other as string]
+  }
+
+  setPaneSession(index: number, id: string): void {
+    const base = [...this.basePanes()]
+    if (index < 0 || index >= base.length) return
+    base[index] = id
+    this.splitPanes = base
+    if (index === 0) this.selectedId = id
+  }
+
+  closePane(index: number): void {
+    const base = this.basePanes().filter((_, i) => i !== index)
+    if (base.length <= 1) {
+      this.splitPanes = []
+      if (base[0]) this.selectedId = base[0]
+    } else {
+      this.splitPanes = base
+    }
   }
 }
 

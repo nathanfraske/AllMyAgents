@@ -87,9 +87,36 @@ async function jpost<T>(url: string, body?: unknown): Promise<T> {
   return res.json() as Promise<T>
 }
 
+export interface LoginResult {
+  ok: boolean
+  added?: string
+  provider?: string
+  launched?: boolean
+  timedOut?: boolean
+  platform?: string
+  manual?: string
+  error?: string
+}
+
+export interface DayStat {
+  date: string
+  turns: number
+  cost: number
+  projects: Record<string, { turns: number; cost: number }>
+}
+export interface StatsResult {
+  days: DayStat[]
+  totalTurns: number
+  totalCost: number
+  totalSessions: number
+}
+
 export const api = {
   profiles: () => jget<ProfileInfo[]>('/api/profiles'),
+  stats: () => jget<StatsResult>('/api/stats'),
   rescanProfiles: () => jpost<ProfileInfo[]>('/api/profiles/rescan'),
+  login: (provider: 'claude' | 'codex', name: string) =>
+    jpost<LoginResult>('/api/accounts/login', { provider, name }),
   pickFolder: () => jpost<{ path: string }>('/api/pick-folder'),
   projects: () => jget<ProjectInfo[]>('/api/projects'),
   createProject: (name: string, path: string) =>

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { store } from './store.svelte'
   import { settings } from './settings.svelte'
+  import { api } from './api'
   import ProviderLogo from './ProviderLogo.svelte'
   import { modelsFor } from './catalog'
 
@@ -10,6 +11,9 @@
   let addName = $state('')
   let rescanning = $state(false)
 
+  let loginState = $state<'idle' | 'waiting' | 'done' | 'error'>('idle')
+  let loginMsg = $state('')
+
   const loginCmd = $derived(
     `pnpm login:${addProvider} profiles/${addName.trim() || (addProvider + '-b')}`
   )
@@ -18,6 +22,37 @@
     rescanning = true
     await store.rescanProfiles()
     rescanning = false
+  }
+
+  // One-click login: opens a terminal/browser on the hub, then waits for the account to
+  // register. Local component state only — no store state for the in-flight login.
+  async function login(): Promise<void> {
+    const name = addName.trim()
+    if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
+      loginState = 'error'
+      loginMsg = 'Enter a profile name first (letters, numbers, dashes or underscores).'
+      return
+    }
+    loginState = 'waiting'
+    loginMsg =
+      addProvider === 'claude'
+        ? 'A terminal will open with Claude — type /login there and finish the browser sign-in…'
+        : 'A terminal and browser will open for Codex sign-in — complete it there…'
+    try {
+      const r = await api.login(addProvider, name)
+      if (r.ok) {
+        loginState = 'done'
+        loginMsg = `Added ${r.added ?? name}. It now appears in your accounts.`
+        await store.rescanProfiles()
+        addName = ''
+      } else {
+        loginState = 'error'
+        loginMsg = r.error ?? 'Login did not complete. Finish the sign-in, then Rescan.'
+      }
+    } catch (e) {
+      loginState = 'error'
+      loginMsg = e instanceof Error ? e.message : 'Login request failed.'
+    }
   }
 
   function onKey(e: KeyboardEvent): void {
@@ -48,13 +83,19 @@
       </div>
       <div class="add">
         <div class="add-row">
-          <select bind:value={addProvider}>
+          <select bind:value={addProvider} disabled={loginState === 'waiting'}>
             <option value="claude">Claude</option>
             <option value="codex">Codex</option>
           </select>
-          <input placeholder="profile name (e.g. claude-work)" bind:value={addName} />
+          <input placeholder="profile name (e.g. claude-work)" bind:value={addName} disabled={loginState === 'waiting'} />
+          <button class="btn primary" onclick={login} disabled={loginState === 'waiting'}>
+            {loginState === 'waiting' ? 'waiting…' : 'Log in'}
+          </button>
         </div>
-        <p class="hint dim">Run this in the project terminal to log in a new account, then Rescan:</p>
+        {#if loginState !== 'idle'}
+          <p class="status {loginState}">{loginMsg}</p>
+        {/if}
+        <p class="hint dim">One click opens a terminal + browser to sign in (Windows). On other platforms, run this manually then Rescan:</p>
         <code class="cmd">{loginCmd}</code>
         <button class="btn" onclick={rescan} disabled={rescanning}>{rescanning ? 'rescanning…' : 'Rescan accounts'}</button>
       </div>
@@ -135,6 +176,14 @@
   .cmd { display: block; background: var(--bg); border: 1px solid var(--border); border-radius: 7px; padding: 0.45rem 0.6rem; font-size: 0.78rem; color: var(--cyan); }
   .btn { align-self: flex-start; background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: 8px; padding: 0.35rem 0.7rem; }
   .btn:hover { border-color: var(--accent); }
+  .add-row .btn { flex: none; align-self: stretch; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.primary:hover:not(:disabled) { filter: brightness(1.08); }
+  .btn:disabled { opacity: 0.6; cursor: default; }
+  .status { font-size: 0.78rem; line-height: 1.45; margin: 0.1rem 0 0.15rem; }
+  .status.waiting { color: var(--warn); }
+  .status.done { color: var(--ok); }
+  .status.error { color: var(--bad); }
   .opt { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; }
   .opt.budget { flex-wrap: wrap; }
   .opt.budget input { width: 6rem; margin-left: auto; }

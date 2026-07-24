@@ -8,8 +8,12 @@
   import PermissionPicker from './PermissionPicker.svelte'
   import AccountPicker from './AccountPicker.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
+  import Icon from './Icon.svelte'
   import { findModel, defaultModelFor } from './catalog'
   import { settings } from './settings.svelte'
+
+  let { sessionId, paneIndex = 0, multiPane = false }: { sessionId?: string; paneIndex?: number; multiPane?: boolean } =
+    $props()
 
   let text = $state('')
   let scroller = $state<HTMLDivElement | null>(null)
@@ -18,7 +22,8 @@
   let modelBySession = $state<Record<string, string>>({})
   let optionsBySession = $state<Record<string, Record<string, string>>>({})
 
-  const view = $derived(store.selectedId ? (store.sessions[store.selectedId] ?? null) : null)
+  const activeId = $derived(sessionId ?? store.selectedId ?? null)
+  const view = $derived(activeId ? (store.sessions[activeId] ?? null) : null)
   const sid = $derived(view?.record.id ?? '')
   const model = $derived(modelBySession[sid] ?? view?.record.model ?? '')
   const options = $derived(optionsBySession[sid] ?? (view?.record.effort ? { effort: view.record.effort } : {}))
@@ -104,11 +109,21 @@
 {:else}
   <div class="head">
     <ProviderLogo provider={view.record.provider} size={16} />
-    <span class="title">{view.record.profileId}</span>
+    {#if multiPane}
+      <select class="paneselect" value={view.record.id} onchange={(e) => store.setPaneSession(paneIndex, (e.target as HTMLSelectElement).value)}>
+        {#each store.sessionList as s (s.record.id)}
+          <option value={s.record.id}>{s.record.profileId} · {(s.record.worktree ?? s.record.cwd).split(/[\\/]/).pop()}</option>
+        {/each}
+      </select>
+    {:else}
+      <span class="title">{view.record.profileId}</span>
+    {/if}
     <span class="statuschip {st.key}"><span class="dot {st.key}"></span>{st.label}</span>
     <span class="sub dim">{view.record.model ?? view.record.provider}</span>
     <span class="spacer"></span>
     {#if view.record.worktree}<span class="wt dim">⑂ {view.record.worktree.split(/[\\/]/).pop()}</span>{/if}
+    <button class="hicon" title="split view" onclick={() => store.startSplit()}><Icon name="columns" size={15} /></button>
+    {#if multiPane}<button class="hicon" title="close pane" onclick={() => store.closePane(paneIndex)}><Icon name="x" size={15} /></button>{/if}
   </div>
 
   <div class="stream scroll" bind:this={scroller} onscroll={onScroll}>
@@ -171,6 +186,9 @@
   .empty { display: grid; place-items: center; height: 100%; }
   .head { display: flex; align-items: center; gap: 0.5rem; padding: 0.6rem 1rem; border-bottom: 1px solid var(--border); }
   .title { font-weight: 600; }
+  .paneselect { max-width: 15rem; font-size: 0.82rem; padding: 0.2rem 0.4rem; }
+  .hicon { display: grid; place-items: center; color: var(--muted); width: 26px; height: 24px; border-radius: 6px; }
+  .hicon:hover { background: var(--surface-2); color: var(--text); }
   .statuschip { display: inline-flex; align-items: center; gap: 0.3rem; font-size: 0.72rem; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 0.05rem 0.45rem; }
   .statuschip.working { color: var(--working); border-color: var(--working); }
   .statuschip.completed { color: var(--ok); border-color: var(--ok); }

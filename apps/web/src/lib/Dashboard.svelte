@@ -1,0 +1,195 @@
+<script lang="ts">
+  import { store } from './store.svelte'
+  import { settings } from './settings.svelte'
+  import { relativeTime } from './time'
+  import { api, type StatsResult, type DayStat } from './api'
+  import ProviderLogo from './ProviderLogo.svelte'
+
+  let nameInput = $state('')
+  let stats = $state<StatsResult | null>(null)
+  let hovered = $state<DayStat | null>(null)
+  let tipX = $state(0)
+  let tipY = $state(0)
+
+  $effect(() => {
+    void api.stats().then((s) => (stats = s))
+  })
+
+  const sessions = $derived(store.sessionList)
+  const totalSessions = $derived(sessions.length)
+  const claudeCount = $derived(sessions.filter((s) => s.record.provider === 'claude').length)
+  const codexCount = $derived(sessions.filter((s) => s.record.provider === 'codex').length)
+
+  const days = $derived(stats?.days ?? [])
+  const maxTurns = $derived(Math.max(1, ...days.map((d) => d.turns)))
+  const firstWeekday = $derived(days.length ? new Date(days[0].date + 'T00:00:00Z').getUTCDay() : 0)
+
+  function shade(turns: number): string {
+    if (turns === 0) return 'var(--surface-3)'
+    const t = turns / maxTurns
+    const pct = t < 0.2 ? 30 : t < 0.5 ? 50 : t < 0.8 ? 72 : 100
+    return `color-mix(in srgb, var(--accent) ${pct}%, var(--surface-2))`
+  }
+  function monthLabel(date: string): string {
+    return new Date(date + 'T00:00:00Z').toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+  }
+
+  interface ProjRow { id: string; name: string; count: number; last: string }
+  const projectRows = $derived.by(() => {
+    const map = new Map<string, ProjRow>()
+    for (const s of sessions) {
+      const key = s.record.projectId ?? '__none__'
+      const nm = key === '__none__' ? 'Unfiled' : (store.projects.find((p) => p.id === key)?.name ?? key)
+      const row = map.get(key) ?? { id: key, name: nm, count: 0, last: '' }
+      row.count++
+      if (!row.last || s.lastActivity > row.last) row.last = s.lastActivity
+      map.set(key, row)
+    }
+    return [...map.values()].sort((a, b) => b.count - a.count)
+  })
+  const maxProjCount = $derived(Math.max(1, ...projectRows.map((r) => r.count)))
+
+  const greeting = $derived.by(() => {
+    const name = settings.ownerName || 'operator'
+    const h = new Date().getHours()
+    const tod = h < 5 ? 'Burning the midnight oil' : h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening'
+    const turns = stats?.totalTurns ?? 0
+    const lines = [
+      `${tod}, ${name}. The fleet is warmed up and waiting.`,
+      `Welcome back, ${name}. ${totalSessions} sessions and the agents still haven't unionized.`,
+      `${tod}, ${name}. ${projectRows.length} project${projectRows.length === 1 ? '' : 's'} on the board — no pressure.`,
+      `Back for more, ${name}? The tokens don't spend themselves.`,
+      `${tod}, ${name}. ${turns} turns and counting. Someone's been busy.`,
+    ]
+    return lines[(h + totalSessions) % lines.length]
+  })
+
+  function saveName(): void {
+    const n = nameInput.trim()
+    if (n) settings.set('ownerName', n)
+  }
+  function onEnter(d: DayStat, e: MouseEvent): void {
+    hovered = d
+    tipX = e.clientX
+    tipY = e.clientY
+  }
+  function topProjects(d: DayStat): Array<[string, { turns: number; cost: number }]> {
+    return Object.entries(d.projects).sort((a, b) => b[1].turns - a[1].turns)
+  }
+</script>
+
+<div class="dash">
+  {#if store.lastLayout}
+    <button class="back" onclick={() => store.goBack()}>← back to your chats</button>
+  {/if}
+  <div class="hero">
+    <div class="logo"></div>
+    {#if settings.ownerName}
+      <h1>{greeting}</h1>
+    {:else}
+      <h1>Welcome to CEC AiMesh.</h1>
+      <div class="nameask">
+        <input placeholder="What should I call you?" bind:value={nameInput} onkeydown={(e) => { if (e.key === 'Enter') saveName() }} />
+        <button class="primary" onclick={saveName}>Set</button>
+      </div>
+    {/if}
+    <p class="dim">Drag a chat from the sidebar into this space to open it — drop it beside another to split.</p>
+  </div>
+
+  <div class="tiles">
+    <div class="tile"><div class="num">{totalSessions}</div><div class="lbl dim">sessions</div></div>
+    <div class="tile"><div class="num">{projectRows.length}</div><div class="lbl dim">projects</div></div>
+    <div class="tile"><div class="num">{stats?.totalTurns ?? '—'}</div><div class="lbl dim">turns (14 wks)</div></div>
+    <div class="tile"><div class="num">${(stats?.totalCost ?? 0).toFixed(2)}</div><div class="lbl dim">spend (14 wks)</div></div>
+    <div class="tile split">
+      <div class="prov"><ProviderLogo provider="claude" size={13} /> {claudeCount}</div>
+      <div class="prov"><ProviderLogo provider="codex" size={13} /> {codexCount}</div>
+    </div>
+  </div>
+
+  <section class="card">
+    <h3>Daily usage — hover a day for the breakdown</h3>
+    {#if days.length === 0}
+      <div class="dim empty2">loading…</div>
+    {:else}
+      <div class="cal">
+        {#each Array(firstWeekday) as _, i (i)}<div class="cell pad"></div>{/each}
+        {#each days as d (d.date)}
+          <div class="cell" style="background: {shade(d.turns)}"
+            role="img" aria-label="{d.date}: {d.turns} turns"
+            onmouseenter={(e) => onEnter(d, e)} onmousemove={(e) => onEnter(d, e)} onmouseleave={() => (hovered = null)}></div>
+        {/each}
+      </div>
+      <div class="legend dim"><span>less</span><span class="k" style="background: var(--surface-3)"></span><span class="k" style="background: color-mix(in srgb, var(--accent) 50%, var(--surface-2))"></span><span class="k" style="background: var(--accent)"></span><span>more</span></div>
+    {/if}
+  </section>
+
+  <section class="card">
+    <h3>Projects by usage</h3>
+    {#if projectRows.length === 0}
+      <div class="dim empty2">no projects yet — create one from the sidebar</div>
+    {:else}
+      <div class="projs">
+        {#each projectRows as r (r.id)}
+          <div class="proj">
+            <div class="ptop"><span class="pname">{r.name}</span><span class="dim pmeta">{r.count} · {r.last ? relativeTime(r.last) : '—'}</span></div>
+            <div class="pbar"><div class="pfill" style="width: {Math.round((r.count / maxProjCount) * 100)}%"></div></div>
+          </div>
+        {/each}
+      </div>
+    {/if}
+  </section>
+</div>
+
+{#if hovered}
+  <div class="tip" style="left: {tipX + 14}px; top: {tipY + 14}px">
+    <div class="tiphead">{monthLabel(hovered.date)} · {hovered.turns} turns{#if hovered.cost > 0} · ${hovered.cost.toFixed(2)}{/if}</div>
+    {#if hovered.turns === 0}
+      <div class="dim">no activity</div>
+    {:else}
+      {#each topProjects(hovered) as [name, p] (name)}
+        <div class="tiprow"><span class="tn">{name}</span><span class="tv dim">{p.turns}{#if p.cost > 0} · ${p.cost.toFixed(2)}{/if}</span></div>
+      {/each}
+    {/if}
+  </div>
+{/if}
+
+<style>
+  .dash { max-width: 860px; width: 100%; margin: 0 auto; padding: 2rem 1.5rem; overflow-y: auto; }
+  .back { color: var(--muted); border: 1px solid var(--border); border-radius: 8px; padding: 0.3rem 0.7rem; margin-bottom: 1.2rem; font-size: 0.82rem; }
+  .back:hover { border-color: var(--accent); color: var(--text); }
+  .hero { margin-bottom: 1.6rem; }
+  .hero .logo { width: 34px; height: 34px; border-radius: 9px; background: linear-gradient(135deg, var(--accent), var(--cyan)); margin-bottom: 0.9rem; }
+  h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 0.5rem; }
+  .nameask { display: flex; gap: 0.5rem; margin: 0.6rem 0; }
+  .nameask input { flex: 1; max-width: 320px; }
+  .primary { background: var(--accent); color: #fff; border-radius: 8px; padding: 0.35rem 0.9rem; font-weight: 500; }
+  .hero p { font-size: 0.85rem; margin: 0.4rem 0 0; }
+  .tiles { display: flex; gap: 0.6rem; flex-wrap: wrap; margin-bottom: 1.2rem; }
+  .tile { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 0.8rem 1rem; min-width: 100px; }
+  .tile .num { font-size: 1.5rem; font-weight: 600; font-family: var(--mono); }
+  .tile .lbl { font-size: 0.72rem; margin-top: 0.2rem; }
+  .tile.split { display: flex; flex-direction: column; gap: 0.35rem; justify-content: center; }
+  .prov { display: flex; align-items: center; gap: 0.4rem; font-family: var(--mono); font-size: 0.95rem; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 0.9rem 1rem; margin-bottom: 1rem; }
+  .card h3 { margin: 0 0 0.8rem; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--dim); }
+  .cal { display: grid; grid-template-rows: repeat(7, 13px); grid-auto-flow: column; grid-auto-columns: 13px; gap: 3px; }
+  .cell { border-radius: 3px; }
+  .cell:not(.pad) { cursor: pointer; }
+  .cell:not(.pad):hover { outline: 1px solid var(--text); }
+  .legend { display: flex; align-items: center; gap: 4px; font-size: 0.66rem; margin-top: 0.6rem; }
+  .legend .k { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+  .projs { display: flex; flex-direction: column; gap: 0.6rem; }
+  .ptop { display: flex; justify-content: space-between; font-size: 0.82rem; margin-bottom: 0.25rem; }
+  .pname { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pmeta { font-size: 0.72rem; font-family: var(--mono); flex: none; }
+  .pbar { height: 6px; background: var(--surface-3); border-radius: 4px; overflow: hidden; }
+  .pfill { height: 100%; background: linear-gradient(90deg, var(--cyan), var(--accent)); }
+  .empty2 { font-size: 0.82rem; padding: 0.5rem 0; }
+  .tip { position: fixed; z-index: 60; pointer-events: none; background: var(--surface-2); border: 1px solid var(--border-strong);
+    border-radius: 9px; padding: 0.5rem 0.65rem; box-shadow: 0 10px 30px rgba(0,0,0,0.55); min-width: 150px; max-width: 240px; }
+  .tiphead { font-size: 0.76rem; font-weight: 500; margin-bottom: 0.3rem; }
+  .tiprow { display: flex; justify-content: space-between; gap: 0.6rem; font-size: 0.74rem; }
+  .tn { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tv { font-family: var(--mono); flex: none; }
+</style>
