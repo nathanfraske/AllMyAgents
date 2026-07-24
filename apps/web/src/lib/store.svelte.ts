@@ -2,6 +2,27 @@ import { api, HUB_WS, getHubToken, setHubToken } from './api'
 import { settings } from './settings.svelte'
 import type { ApprovalRecord, HubEvent, ProfileInfo, ProjectInfo, ScanResult, SessionRecord, UsageSnapshot } from './api'
 
+// Verbose client tracing — on in dev, compiled out of prod builds. Toggle off in dev by setting
+// localStorage['ama:verbose'] = '0'. Surfaces the load/connect/replay/scan milestones so a stall is
+// visible in the console instead of a mystery freeze.
+const VERBOSE = (() => {
+  try {
+    const dev = Boolean((import.meta as { env?: { DEV?: boolean } }).env?.DEV)
+    return dev && localStorage.getItem('ama:verbose') !== '0'
+  } catch {
+    return false
+  }
+})()
+function vlog(...args: unknown[]): void {
+  if (VERBOSE) console.info('%c[ama]', 'color:#c026d3', ...args)
+}
+function perfNow(): number {
+  return typeof performance !== 'undefined' ? performance.now() : Date.now()
+}
+function msSince(t0: number): string {
+  return `${Math.round(perfNow() - t0)}ms`
+}
+
 export interface StatusInfo {
   key: string
   label: string
@@ -293,16 +314,21 @@ class HubStore {
   }
 
   async init(): Promise<void> {
+    const t0 = perfNow()
+    vlog('init: start')
     // If the hub enforces a device token and we don't hold a valid one, gate on pairing first.
     const auth = await api.auth().catch(() => ({ requireToken: false, authed: true }))
     if (auth.requireToken && !auth.authed && !getHubToken()) {
+      vlog('init: needs pairing — stop')
       this.needsPairing = true
       return
     }
     await api.mesh().catch(() => undefined) // bootstrap: capture the token while the hub hands it out
     this.profiles = await api.profiles()
     this.projects = await api.projects()
+    vlog(`init: ${this.profiles.length} profiles, ${this.projects.length} projects (${msSince(t0)})`)
     await this.refreshSideData()
+    vlog(`init: side data loaded (${msSince(t0)}) — connecting WS`)
     this.connect()
     // NOTE: we deliberately do NOT scan every project on load — that walked ~/.codex + ~/.claude and
     // read thousands of transcript files per project, pegging the hub for minutes ("stuck scanning").
@@ -569,9 +595,15 @@ class HubStore {
     if (!path || this.importDismissed.has(projectId) || this.importChecked.has(projectId)) return
     if (this.importPanelFor) return // a panel is already up — don't stack
     this.importChecked.add(projectId)
+    const t0 = perfNow()
+    vlog(`scan: start ${path}`)
     const res = await api.scanProject(path)
-    if (!res || 'error' in res) return
+    if (!res || 'error' in res) {
+      vlog(`scan: failed ${path} (${msSince(t0)})`, res && 'error' in res ? res.error : '')
+      return
+    }
     const importable = res.chats.filter((c) => !c.alreadyImported).length
+    vlog(`scan: done ${path} — ${res.chats.length} chats, ${importable} importable (${msSince(t0)})`)
     if (importable > 0 && !this.importPanelFor) this.openImportPanel(projectId, path, res)
   }
 
@@ -612,6 +644,19 @@ class HubStore {
   async refreshSideData(): Promise<void> {
     this.approvals = await api.approvals()
     this.usage = await api.usage()
+  }
+
+  // Trailing debounce for refreshSideData — collapses a burst of usage/approval events (esp. the
+  // journal replay on connect) into ONE refresh 300ms after the last one, instead of one fetch-pair
+  // per event. Without this, load fired 500+ requests and wedged the whole client.
+  private sideRefreshTimer: ReturnType<typeof setTimeout> | null = null
+  private rosterFetchInFlight = false
+  private scheduleSideRefresh(): void {
+    if (this.sideRefreshTimer) clearTimeout(this.sideRefreshTimer)
+    this.sideRefreshTimer = setTimeout(() => {
+      this.sideRefreshTimer = null
+      void this.refreshSideData()
+    }, 300)
   }
 
   // Optimistically mark a turn as started the instant the user sends — immediate "received /
@@ -722,9 +767,11 @@ class HubStore {
   }
 
   private connect(): void {
+    vlog('ws: connecting (replay from seq 0)')
     const ws = new WebSocket(this.wsUrl(0))
     this.ws = ws
     ws.onopen = () => {
+      vlog('ws: open')
       this.connected = true
     }
     ws.onmessage = (e) => {
@@ -732,15 +779,18 @@ class HubStore {
       this.apply(event)
     }
     ws.onclose = () => {
+      vlog('ws: closed — reconnecting in 1.5s')
       this.connected = false
       setTimeout(() => this.reconnect(), 1500)
     }
   }
 
   private reconnect(): void {
+    vlog(`ws: reconnecting (replay from seq ${this.lastSeq})`)
     const ws = new WebSocket(this.wsUrl(this.lastSeq))
     this.ws = ws
     ws.onopen = () => {
+      vlog('ws: reopened')
       this.connected = true
     }
     ws.onmessage = (e) => this.apply(JSON.parse(e.data as string) as HubEvent)
@@ -750,16 +800,35 @@ class HubStore {
     }
   }
 
+  // Verbose-only: count events in a replay/live burst and log a one-line summary once it settles,
+  // so a big or slow replay is visible in the console (never logs single live events).
+  private replayCount = 0
+  private replayStart = 0
+  private replayTimer: ReturnType<typeof setTimeout> | null = null
+  private noteReplay(): void {
+    if (!VERBOSE) return
+    if (this.replayCount === 0) this.replayStart = perfNow()
+    this.replayCount++
+    if (this.replayTimer) clearTimeout(this.replayTimer)
+    this.replayTimer = setTimeout(() => {
+      if (this.replayCount > 3) vlog(`replay: applied ${this.replayCount} events in ${msSince(this.replayStart)}`)
+      this.replayCount = 0
+      this.replayTimer = null
+    }, 250)
+  }
+
   private apply(event: HubEvent): void {
     if (event.seq <= this.lastSeq) return
     this.lastSeq = event.seq
+    this.noteReplay()
     const { sessionId, kind, ts, payload } = event
 
-    if (kind === 'approval/requested' || kind === 'approval/resolved') {
-      void this.refreshSideData()
-    }
-    if (kind.startsWith('usage/')) {
-      void this.refreshSideData()
+    // Approvals + usage are re-fetched, but COALESCED: a journal replay surfaces hundreds of
+    // usage/approval events in one burst, and firing refreshSideData() per event stormed the hub with
+    // 500+ requests and saturated the browser's ~6-connection pool, so the roster never populated and
+    // any new request (a project scan) stalled behind them. Debounced to a single refresh per burst.
+    if (kind === 'approval/requested' || kind === 'approval/resolved' || kind.startsWith('usage/')) {
+      this.scheduleSideRefresh()
     }
 
     if (!sessionId) return
@@ -774,10 +843,19 @@ class HubStore {
     }
     const view = this.sessions[sessionId]
     if (!view) {
-      // event for a session we haven't seen created yet — fetch the roster lazily
-      void api.sessions().then((list) => {
-        for (const r of list) this.ensure(r)
-      })
+      // Event for a session we haven't seen created yet — fetch the roster lazily, but COALESCED: a
+      // replay burst would otherwise fire one full /api/sessions per unseen event. One in-flight max.
+      if (!this.rosterFetchInFlight) {
+        this.rosterFetchInFlight = true
+        void api
+          .sessions()
+          .then((list) => {
+            for (const r of list) this.ensure(r)
+          })
+          .finally(() => {
+            this.rosterFetchInFlight = false
+          })
+      }
       return
     }
 
