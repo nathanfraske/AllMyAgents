@@ -13,8 +13,10 @@
   let tipY = $state(0)
   // Pinned day for the detail panel. Null → default to the most recent day (today).
   let selectedDate = $state<string | null>(null)
-  // Live width of the calendar grid (bound via bind:clientWidth) → responsive cell sizing.
-  let calWidth = $state(0)
+  // The calendar is a fixed-cell, horizontally-scrollable "rolling buffer": it shows the weeks that
+  // fit the card and you scroll back/forth through the ~year of history, with brief month markers.
+  let calScrollEl = $state<HTMLDivElement | null>(null)
+  const CELL = 15 // px — square heatmap tile
 
   $effect(() => {
     void api.stats().then((s) => (stats = s))
@@ -26,29 +28,62 @@
   const codexCount = $derived(sessions.filter((s) => s.record.provider === 'codex').length)
 
   const days = $derived(stats?.days ?? [])
-  const maxTurns = $derived(Math.max(1, ...days.map((d) => d.turns)))
-  const firstWeekday = $derived(days.length ? new Date(days[0].date + 'T00:00:00Z').getUTCDay() : 0)
-  // Responsive GitHub-style cell sizing: fit `weekCols` columns (plus 3px gaps) into the bound
-  // card width, clamped so a full ~53-week year fills the card (~12–14px) while shorter ranges
-  // never balloon past 20px. Applied inline to `.cal`'s grid tracks.
-  const CAL_GAP = 3
-  const weekCols = $derived(Math.max(1, Math.ceil((firstWeekday + days.length) / 7)))
-  const cellSize = $derived.by(() => {
-    if (!calWidth) return 14
-    const usable = calWidth - (weekCols - 1) * CAL_GAP
-    return Math.max(10, Math.min(20, Math.floor(usable / weekCols)))
+  // Group the days into calendar MONTHS. Each renders as its own 7-row heatmap block (weeks =
+  // columns) with the month name on top and its first day padded to the right weekday; a gap
+  // separates the blocks so it reads like a proper calendar, and navigation is per-month (pageMonth).
+  interface MonthGroup { key: string; label: string; pad: number; days: DayStat[] }
+  const months = $derived.by(() => {
+    const out: MonthGroup[] = []
+    let cur: MonthGroup | null = null
+    for (const d of days) {
+      const dt = new Date(d.date + 'T00:00:00Z')
+      const key = `${dt.getUTCFullYear()}-${dt.getUTCMonth()}`
+      if (!cur || cur.key !== key) {
+        // Year shown on January so a ~year window that crosses a new year stays unambiguous.
+        const label = dt.toLocaleDateString(undefined, {
+          month: 'short',
+          year: dt.getUTCMonth() === 0 ? '2-digit' : undefined,
+          timeZone: 'UTC',
+        })
+        cur = { key, label, pad: dt.getUTCDay(), days: [] }
+        out.push(cur)
+      }
+      cur.days.push(d)
+    }
+    return out
+  })
+  // Page the horizontal buffer one month at a time via the ‹ › controls (the scrollbar is hidden
+  // — see .calscroll). Positions are measured from the live month blocks, so varying month widths
+  // are handled without any layout math.
+  function pageMonth(dir: 1 | -1): void {
+    const el = calScrollEl
+    if (!el) return
+    const base = el.getBoundingClientRect().left
+    const offs = [...el.querySelectorAll<HTMLElement>('.month')].map(
+      (b) => b.getBoundingClientRect().left - base + el.scrollLeft
+    )
+    const cur = el.scrollLeft
+    const target =
+      dir > 0 ? (offs.find((o) => o > cur + 2) ?? el.scrollWidth) : ([...offs].reverse().find((o) => o < cur - 2) ?? 0)
+    el.scrollTo({ left: target, behavior: 'smooth' })
+  }
+  // Default the scroll to the most recent week (right edge) on load / when the range changes; a
+  // manual scroll afterwards is preserved (deps only re-fire on a new day range, not on scroll).
+  $effect(() => {
+    void days.length
+    const el = calScrollEl
+    if (el) requestAnimationFrame(() => (el.scrollLeft = el.scrollWidth))
   })
   // The pinned day, falling back to the newest day so the panel is never empty on load.
   const selectedDay = $derived(
     (selectedDate ? days.find((d) => d.date === selectedDate) : null) ?? days[days.length - 1] ?? null
   )
 
+  // GitHub-style intensity: fixed turns/day thresholds so the heatmap visibly SCALES with usage even
+  // on sparse days (relative-to-max washed every low-activity day to one shade). 0 → faint empty tile.
   function shade(turns: number): string {
-    // Keep zero-activity cells barely above the surface so the grid reads as a heatmap
-    // (bright empties made the whole grid look "half-full"); steepen the active ramp.
-    if (turns === 0) return 'color-mix(in srgb, var(--accent) 8%, var(--surface-2))'
-    const t = turns / maxTurns
-    const pct = t < 0.2 ? 26 : t < 0.5 ? 48 : t < 0.8 ? 72 : 100
+    if (turns <= 0) return 'color-mix(in srgb, var(--accent) 6%, var(--surface-2))'
+    const pct = turns >= 10 ? 100 : turns >= 6 ? 74 : turns >= 3 ? 50 : 28
     return `color-mix(in srgb, var(--accent) ${pct}%, var(--surface-2))`
   }
   function monthLabel(date: string): string {
@@ -192,20 +227,43 @@
 
     <div class="left">
       <section class="card">
-        <h3>Daily usage — click a day for the full breakdown</h3>
+        <div class="cardhd">
+          <h3>Daily usage — click a day for the full breakdown</h3>
+          {#if days.length}
+            <div class="calnav">
+              <button class="calbtn" title="earlier months" aria-label="earlier months" onclick={() => pageMonth(-1)}>‹</button>
+              <button class="calbtn" title="later months" aria-label="later months" onclick={() => pageMonth(1)}>›</button>
+            </div>
+          {/if}
+        </div>
         {#if days.length === 0}
           <div class="dim empty2">loading…</div>
         {:else}
-          <div class="cal" bind:clientWidth={calWidth} style="grid-template-rows: repeat(7, {cellSize}px); grid-auto-columns: {cellSize}px;">
-            {#each Array(firstWeekday) as _, i (i)}<div class="cell pad"></div>{/each}
-            {#each days as d (d.date)}
-              <button type="button" class="cell" class:selected={selectedDay?.date === d.date} style="background: {shade(d.turns)}"
-                aria-label="{d.date}: {d.turns} turns" aria-pressed={selectedDay?.date === d.date}
-                onmouseenter={(e) => onEnter(d, e)} onmousemove={(e) => onEnter(d, e)} onmouseleave={() => (hovered = null)}
-                onclick={() => (selectedDate = d.date)}></button>
-            {/each}
+          <div class="calscroll" bind:this={calScrollEl}>
+            <div class="calmonthsrow">
+              {#each months as mo (mo.key)}
+                <div class="month">
+                  <div class="mlabel">{mo.label}</div>
+                  <div class="mgrid" style="grid-template-rows: repeat(7, {CELL}px); grid-auto-columns: {CELL}px;">
+                    {#each Array(mo.pad) as _, i (i)}<div class="cell pad"></div>{/each}
+                    {#each mo.days as d (d.date)}
+                      <button type="button" class="cell" class:selected={selectedDay?.date === d.date} style="background: {shade(d.turns)}"
+                        aria-label="{d.date}: {d.turns} turns" aria-pressed={selectedDay?.date === d.date}
+                        onmouseenter={(e) => onEnter(d, e)} onmousemove={(e) => onEnter(d, e)} onmouseleave={() => (hovered = null)}
+                        onclick={() => (selectedDate = d.date)}></button>
+                    {/each}
+                  </div>
+                </div>
+              {/each}
+            </div>
           </div>
-          <div class="legend dim"><span>less</span><span class="k" style="background: color-mix(in srgb, var(--accent) 8%, var(--surface-2))"></span><span class="k" style="background: color-mix(in srgb, var(--accent) 48%, var(--surface-2))"></span><span class="k" style="background: var(--accent)"></span><span>more</span></div>
+          <div class="legend dim"><span>less</span>
+            <span class="k" style="background: {shade(0)}"></span>
+            <span class="k" style="background: {shade(1)}"></span>
+            <span class="k" style="background: {shade(3)}"></span>
+            <span class="k" style="background: {shade(6)}"></span>
+            <span class="k" style="background: {shade(10)}"></span>
+            <span>more</span></div>
         {/if}
       </section>
 
@@ -316,10 +374,24 @@
   .prov { display: flex; align-items: center; gap: var(--space-3); font-family: var(--mono); font-size: var(--text-md); font-variant-numeric: tabular-nums; }
   .card { padding: var(--space-5); min-width: 0; }
   .card h3, .detail h3 { margin: 0 0 var(--space-4); font-size: var(--text-2xs); text-transform: uppercase; letter-spacing: var(--ls-label); color: var(--dim); }
-  /* Responsive GitHub-contribution grid. Row height + column width are set inline from the
-     width-derived `cellSize` (see script) so ~53 week-columns fill the card at ~12–14px while
-     shorter ranges cap at 20px. Only flow / gap / alignment live here; gap stays 3px = CAL_GAP. */
-  .cal { display: grid; grid-auto-flow: column; gap: 3px; justify-content: start; }
+  /* GitHub-style heatmap as a horizontally-scrollable "rolling buffer": fixed-size tiles, only the
+     weeks that fit the card are visible, and you scroll back/forth through the ~year. The month
+     labels row shares the column geometry and scrolls with the grid inside .calscroll. */
+  /* Header row so the ‹ › month pager sits opposite the card title. */
+  .cardhd { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-4); }
+  .cardhd h3 { margin: 0; }
+  .calnav { display: flex; gap: 4px; flex: none; }
+  .calbtn { display: grid; place-items: center; width: 22px; height: 22px; border-radius: var(--r-sm); border: 1px solid var(--border);
+    color: var(--muted); font-size: 0.95rem; line-height: 1; }
+  .calbtn:hover { border-color: var(--border-accent); color: var(--text); background: var(--surface-2); }
+  /* Month-segmented heatmap as a per-month PAGINATED buffer: the scrollbar is hidden and the ‹ ›
+     controls step one month at a time (it stays trackpad-scrollable too). */
+  .calscroll { overflow-x: auto; overflow-y: hidden; scrollbar-width: none; scroll-behavior: smooth; }
+  .calscroll::-webkit-scrollbar { display: none; }
+  .calmonthsrow { display: flex; align-items: flex-start; gap: 14px; width: max-content; }
+  .month { display: flex; flex-direction: column; gap: 4px; }
+  .mlabel { font-size: var(--text-2xs); font-weight: var(--fw-medium); letter-spacing: var(--ls-label); text-transform: uppercase; color: var(--dim); }
+  .mgrid { display: grid; grid-auto-flow: column; gap: 3px; }
   /* Every tile carries a faint inset hairline so the matrix reads cleanly even where the
      fill is near the card colour (zero-activity days). */
   .cell { border-radius: var(--r-xs); padding: 0; border: 0; box-shadow: inset 0 0 0 1px var(--border); }
