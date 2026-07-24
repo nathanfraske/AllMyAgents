@@ -18,7 +18,9 @@ export interface StatsResult {
 // Aggregate per-day activity (completed turns), spend, and per-project breakdown from the
 // event journal. A "turn" = a claude/result or codex/turn/completed; cost comes from Claude
 // results (Codex is subscription, no per-turn cost).
-export function computeStats(db: Database.Database, projects: ProjectStore, dayCount = 98): StatsResult {
+// ~53 weeks so the dashboard heatmap fills its card width with small GitHub-style cells (rather
+// than a handful of oversized tiles). Empty days render as zero-activity cells and fill in over time.
+export function computeStats(db: Database.Database, projects: ProjectStore, dayCount = 371): StatsResult {
   const projName = new Map<string, string>()
   for (const p of projects.list()) projName.set(p.id, p.name)
 

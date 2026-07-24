@@ -27,6 +27,10 @@ try {
 }
 
 const journal = new Journal(path.join(repoRoot, 'data', 'hub.db'))
+// Each live WebSocket (pane / device / reconnect) attaches a journal 'event' listener, removed on
+// close — legitimately more than the EventEmitter default of 10 for a multi-pane/fleet hub. Raise
+// the cap so a healthy number of connections doesn't emit a spurious MaxListeners leak warning.
+journal.setMaxListeners(64)
 const store = new SessionStore(journal.db)
 const profiles = scanProfiles(path.join(repoRoot, 'profiles'))
 const profileMap = new Map(profiles.map((p) => [p.id, p]))
