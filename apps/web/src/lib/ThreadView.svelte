@@ -26,12 +26,35 @@
   const activeId = $derived(sessionId ?? store.selectedId ?? null)
   const view = $derived(activeId ? (store.sessions[activeId] ?? null) : null)
   const sid = $derived(view?.record.id ?? '')
-  const model = $derived(modelBySession[sid] ?? view?.record.model ?? '')
-  const options = $derived(optionsBySession[sid] ?? (view?.record.effort ? { effort: view.record.effort } : {}))
+  // A DRAFT sources its picks straight from the record (the composer writes them there via
+  // store.updateDraft), so switching account resets model/traits cleanly. A real session keeps the
+  // per-send override in modelBySession/optionsBySession (unchanged).
+  const isDraft = $derived(!!view?.draft)
+  const model = $derived(view?.draft ? (view.record.model ?? '') : (modelBySession[sid] ?? view?.record.model ?? ''))
+  const options = $derived<Record<string, string>>(
+    view?.draft
+      ? {
+          ...(view.record.effort ? { effort: view.record.effort } : {}),
+          ...(view.record.serviceTier ? { serviceTier: view.record.serviceTier } : {}),
+        }
+      : (optionsBySession[sid] ?? (view?.record.effort ? { effort: view.record.effort } : {}))
+  )
   const modelDef = $derived(
     view ? (findModel(model) ?? defaultModelFor(view.record.provider)) : undefined
   )
   const active = $derived(view?.record.status === 'active' || view?.record.status === 'starting')
+  // Worktree intent: for a draft there is no real worktree path yet, so read the pre-spawn flag.
+  const worktreeOn = $derived(view?.draft ? !!view.draftUseWorktree : !!view?.record.worktree)
+  // Draft-only inline permission picker (the real PermissionPicker posts to the hub, which a draft
+  // has no session for). Mirrors the real picker's modes; writes the choice into the draft record.
+  const PERM_MODES = [
+    { id: 'safe', icon: 'lock', label: 'Safe', desc: 'ask before every tool' },
+    { id: 'edits', icon: 'pencil', label: 'Edits', desc: 'auto-approve file edits' },
+    { id: 'full', icon: 'zap', label: 'Full access', desc: 'no approvals (careful)' },
+  ]
+  let permOpen = $state(false)
+  const draftMode = $derived(view?.record.permissionMode ?? 'safe')
+  const draftModeDef = $derived(PERM_MODES.find((m) => m.id === draftMode) ?? PERM_MODES[0])
   // Codex can append input to a running turn (steer); Claude has no steer, so it queues.
   const steerable = $derived(active && view?.record.provider === 'codex')
   const st = $derived(view ? store.status(view) : { key: 'idle', label: '' })
@@ -78,10 +101,21 @@
   }
 
   function setModel(slug: string): void {
-    if (sid) modelBySession = { ...modelBySession, [sid]: slug }
+    if (!sid) return
+    if (view?.draft) {
+      store.updateDraft(sid, { model: slug || undefined }) // draft picks live on the record
+      return
+    }
+    modelBySession = { ...modelBySession, [sid]: slug }
   }
   function setOption(id: string, value: string): void {
-    if (sid) optionsBySession = { ...optionsBySession, [sid]: { ...options, [id]: value } }
+    if (!sid) return
+    if (view?.draft) {
+      if (id === 'effort') store.updateDraft(sid, { effort: value || undefined })
+      else if (id === 'serviceTier') store.updateDraft(sid, { serviceTier: value || undefined })
+      return
+    }
+    optionsBySession = { ...optionsBySession, [sid]: { ...options, [id]: value } }
   }
 
   async function send(): Promise<void> {
@@ -90,6 +124,17 @@
     const body = text
     text = ''
     sendErr = ''
+    // A DRAFT has no hub session: the first send spawns the real session with this prompt, then the
+    // store swaps this pane over to it. No steering/queueing (there is no running turn to steer).
+    if (view.draft) {
+      stick = true
+      const out = await store.materializeDraft(sid0, body)
+      if (out.error) {
+        text = body // spawn failed — hand the prompt back and keep the draft as it was
+        sendErr = out.error
+      }
+      return
+    }
     // Busy? Codex steers the running turn; Claude queues (combined/sent on turn end).
     if (active) {
       if (view.record.provider === 'codex') {
@@ -147,7 +192,9 @@
 {:else}
   <div class="head">
     <ProviderLogo provider={view.record.provider} size={16} />
-    {#if multiPane}
+    {#if isDraft}
+      <span class="title draftpill" title="new chat — not on the hub until you send the first message">New chat <span class="draftbadge">draft</span></span>
+    {:else if multiPane}
       <select class="paneselect" value={view.record.id} onchange={(e) => store.setPaneSession(paneIndex, (e.target as HTMLSelectElement).value)}>
         {#each store.sessionList as s (s.record.id)}
           <option value={s.record.id}>{s.record.title ?? `${s.record.profileId} · ${(s.record.worktree ?? s.record.cwd).split(/[\\/]/).pop()}`}</option>
@@ -159,8 +206,10 @@
     <span class="statuschip {st.key}"><span class="dot {st.key}"></span>{st.label}</span>
     <span class="sub dim">{view.record.model ?? view.record.provider}</span>
     <span class="spacer"></span>
-    {#if view.record.worktree}
+    {#if !isDraft && view.record.worktree}
       <span class="wt" title="isolated git worktree at {view.record.worktree}"><Icon name="git-branch" size={12} /> {view.record.branch ?? view.record.worktree.split(/[\\/]/).pop()}</span>
+    {:else if isDraft && view.record.projectId}
+      <span class="wt dim" title={worktreeOn ? 'will spawn in an isolated git worktree' : 'will work directly in the project directory'}><Icon name={worktreeOn ? 'git-branch' : 'folder'} size={12} /> {worktreeOn ? 'new worktree' : 'in project'}</span>
     {:else if view.record.projectId}
       <span class="wt dim" title="working directly in the project directory ({view.record.cwd})"><Icon name="folder" size={12} /> in project</span>
     {/if}
@@ -172,7 +221,7 @@
     {#each view.items as item (item.key)}
       <ItemCard {item} />
     {/each}
-    {#if view.items.length === 0 && !thinking}<div class="dim pad">no activity yet — send a message below</div>{/if}
+    {#if view.items.length === 0 && !thinking}<div class="dim pad">{isDraft ? 'New chat — set the account, model and worktree below, then send your first message to start it.' : 'no activity yet — send a message below'}</div>{/if}
     {#if thinking}
       <div class="thinking">
         <span class="dots"><i></i><i></i><i></i></span>
@@ -208,22 +257,44 @@
 
     {#if sendErr}<div class="senderr" role="alert">⚠ {sendErr} — your message was kept in the box.</div>{/if}
     <div class="composer">
-      <textarea rows="2" placeholder={steerable ? 'Steer the running turn… (appended to what Codex is doing now)' : active ? 'Queue a message… (sends when the current turn finishes)' : 'Ask for follow-up changes…  (Enter to send, Shift+Enter for newline)'}
+      <textarea rows="2" placeholder={isDraft ? 'Describe the first task… (Enter to start the chat, Shift+Enter for newline)' : steerable ? 'Steer the running turn… (appended to what Codex is doing now)' : active ? 'Queue a message… (sends when the current turn finishes)' : 'Ask for follow-up changes…  (Enter to send, Shift+Enter for newline)'}
         bind:value={text} onkeydown={onKey}></textarea>
       <div class="cfoot">
         <AccountPicker {view} />
         <ModelPicker provider={view.record.provider} {model} onselect={setModel} />
         {#if modelDef}<TraitsControl descriptors={modelDef.descriptors} values={options} onchange={setOption} />{/if}
-        <PermissionPicker sessionId={view.record.id} mode={view.record.permissionMode ?? 'safe'} />
+        {#if isDraft}
+          <div class="dperm">
+            <button class="pill-btn" class:full={draftMode === 'full'} class:open={permOpen} title="permission mode for this chat" onclick={() => (permOpen = !permOpen)}>
+              <span class="dlead"><Icon name={draftModeDef.icon} size={13} /></span> {draftModeDef.label} <span class="dchev"><Icon name="chevron-down" size={12} /></span>
+            </button>
+            {#if permOpen}
+              <button class="dscrim" onclick={() => (permOpen = false)} aria-label="close"></button>
+              <div class="dmenu">
+                {#each PERM_MODES as m (m.id)}
+                  <button class="dopt" class:sel={m.id === draftMode} onclick={() => { store.updateDraft(view.record.id, { permissionMode: m.id }); permOpen = false }}>
+                    <span class="dic"><Icon name={m.icon} size={15} /></span>
+                    <span class="dtxt"><span class="dl">{m.label}</span><span class="dd dim">{m.desc}</span></span>
+                    {#if m.id === draftMode}<span class="dtick"><Icon name="check" size={13} /></span>{/if}
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {:else}
+          <PermissionPicker sessionId={view.record.id} mode={view.record.permissionMode ?? 'safe'} />
+        {/if}
         {#if store.canToggleWorktree(view)}
           <button class="pill-btn" title="Isolated git worktree vs. work directly in the project — switch before your first message" onclick={() => store.toggleWorktree()}>
-            <Icon name={view.record.worktree ? 'git-branch' : 'folder'} size={13} /> {view.record.worktree ? 'worktree' : 'in project'}
+            <Icon name={worktreeOn ? 'git-branch' : 'folder'} size={13} /> {worktreeOn ? 'worktree' : 'in project'}
           </button>
         {/if}
         <span class="spacer"></span>
-        <button class="foot-act" onclick={stop} disabled={!active} title="interrupt current turn">interrupt</button>
-        <button class="foot-act" onclick={() => api.stop(view.record.id)} title="stop session">stop</button>
-        <button class="send-btn" class:queue={active} title={steerable ? 'steer into the running turn' : active ? 'queue message' : 'send'} onclick={send} disabled={!text.trim()}><Icon name={steerable ? 'corner-down-right' : active ? 'timer' : 'arrow-up'} size={16} /></button>
+        {#if !isDraft}
+          <button class="foot-act" onclick={stop} disabled={!active} title="interrupt current turn">interrupt</button>
+          <button class="foot-act" onclick={() => api.stop(view.record.id)} title="stop session">stop</button>
+        {/if}
+        <button class="send-btn" class:queue={active} title={isDraft ? 'start this chat' : steerable ? 'steer into the running turn' : active ? 'queue message' : 'send'} onclick={send} disabled={!text.trim()}><Icon name={steerable ? 'corner-down-right' : active ? 'timer' : 'arrow-up'} size={16} /></button>
       </div>
     </div>
     <div class="checkout dim">
@@ -232,7 +303,7 @@
         <span class="est" title="rough estimate of the next call's input tokens (re-read context + your draft), ≈ chars/4">~{fmtTokens(estTokens)} tokens next call</span>
       {/if}
       <span class="spacer"></span>
-      <span>{view.record.repo ? '▣ worktree' : '▣ local'} · {view.record.id.slice(0, 8)}</span>
+      <span>{#if isDraft}draft · not started yet{:else}{view.record.repo ? '▣ worktree' : '▣ local'} · {view.record.id.slice(0, 8)}{/if}</span>
     </div>
   </div>
 {/if}
@@ -299,4 +370,31 @@
   .foot-act:disabled { opacity: 0.35; cursor: default; }
   .mode { cursor: default; }
   .checkout { display: flex; gap: 0.5rem; font-size: 0.72rem; padding: 0.35rem 0.4rem 0; }
+
+  /* Draft chat: title badge in the head. */
+  .draftpill { display: inline-flex; align-items: center; gap: 0.4rem; }
+  .draftbadge { font-size: 0.6rem; letter-spacing: 0.08em; text-transform: uppercase; font-weight: var(--fw-semibold);
+    color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+    background: color-mix(in srgb, var(--accent) 12%, transparent); border-radius: var(--r-pill); padding: 0.05rem 0.4rem; }
+
+  /* Draft-only inline permission picker — mirrors PermissionPicker (which can't target a draft,
+     since it posts to the hub and a draft has no session there). */
+  .dperm { position: relative; }
+  .pill-btn.full { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, transparent); }
+  .pill-btn.full .dlead { color: var(--warn); }
+  .dlead { display: inline-grid; color: var(--muted); }
+  .dchev { display: inline-grid; opacity: 0.6; }
+  .dscrim { position: fixed; inset: 0; background: transparent; border: none; z-index: 10; }
+  .dmenu { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 11; min-width: 210px; background: var(--surface-2);
+    border: 1px solid var(--border-strong); border-radius: var(--r-lg); padding: var(--space-1); box-shadow: var(--shadow-3), var(--edge-hi); }
+  @media (prefers-reduced-motion: no-preference) { .dmenu { animation: pop-in var(--dur-fast) var(--ease); } }
+  .dopt { display: flex; align-items: center; gap: var(--space-3); width: 100%; text-align: left; padding: var(--space-3); border-radius: var(--r-md); }
+  .dopt:hover, .dopt.sel { background: var(--surface-3); }
+  .dic { display: inline-grid; place-items: center; width: 1.2rem; color: var(--muted); }
+  .dopt.sel .dic { color: var(--accent); }
+  .dtxt { display: flex; flex-direction: column; }
+  .dopt.sel .dl { font-weight: var(--fw-medium); }
+  .dl { font-size: var(--text-sm); }
+  .dd { font-size: var(--text-xs); }
+  .dtick { margin-left: auto; display: inline-grid; color: var(--accent); flex: none; }
 </style>

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte'
   import { store } from './store.svelte'
   import { settings } from './settings.svelte'
   import { relativeTime } from './time'
@@ -12,6 +13,8 @@
   let tipY = $state(0)
   // Pinned day for the detail panel. Null → default to the most recent day (today).
   let selectedDate = $state<string | null>(null)
+  // Live width of the calendar grid (bound via bind:clientWidth) → responsive cell sizing.
+  let calWidth = $state(0)
 
   $effect(() => {
     void api.stats().then((s) => (stats = s))
@@ -25,6 +28,16 @@
   const days = $derived(stats?.days ?? [])
   const maxTurns = $derived(Math.max(1, ...days.map((d) => d.turns)))
   const firstWeekday = $derived(days.length ? new Date(days[0].date + 'T00:00:00Z').getUTCDay() : 0)
+  // Responsive GitHub-style cell sizing: fit `weekCols` columns (plus 3px gaps) into the bound
+  // card width, clamped so a full ~53-week year fills the card (~12–14px) while shorter ranges
+  // never balloon past 20px. Applied inline to `.cal`'s grid tracks.
+  const CAL_GAP = 3
+  const weekCols = $derived(Math.max(1, Math.ceil((firstWeekday + days.length) / 7)))
+  const cellSize = $derived.by(() => {
+    if (!calWidth) return 14
+    const usable = calWidth - (weekCols - 1) * CAL_GAP
+    return Math.max(10, Math.min(20, Math.floor(usable / weekCols)))
+  })
   // The pinned day, falling back to the newest day so the panel is never empty on load.
   const selectedDay = $derived(
     (selectedDate ? days.find((d) => d.date === selectedDate) : null) ?? days[days.length - 1] ?? null
@@ -76,6 +89,60 @@
     ]
     return lines[(h + totalSessions) % lines.length]
   })
+  const heroText = $derived(settings.ownerName ? greeting : 'Welcome to AllMyAgents.')
+
+  // Matrix-decode entrance. On mount the heading resolves from scrambled glyphs into the real
+  // sentence; when it settles we flip `revealed`, which triggers the staggered card/tile/detail
+  // reveal in CSS. `displayText` feeds the <h1> while scrambling; afterwards the <h1> shows the
+  // live `heroText` so a later name change / stats load stays in sync. All gated on
+  // prefers-reduced-motion — under reduce-motion nothing scrambles and everything shows at once.
+  const reduceMotion =
+    typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true
+  const GLYPHS = '01<>[]{}/|=+*#abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+  const randGlyph = (): string => GLYPHS.charAt((Math.random() * GLYPHS.length) | 0)
+  const scrambleOf = (text: string): string => {
+    let out = ''
+    for (const ch of text) out += ch === ' ' ? ' ' : randGlyph()
+    return out
+  }
+  // untrack: seed the first scramble frame from the current heroText without subscribing —
+  // subsequent target changes are picked up live inside the rAF loop below.
+  let displayText = $state(reduceMotion ? '' : scrambleOf(untrack(() => heroText)))
+  let scrambling = $state(!reduceMotion)
+  let revealed = $state(reduceMotion)
+
+  $effect(() => {
+    if (reduceMotion) return
+    let raf = 0
+    const duration = 700
+    const start = performance.now()
+    let thresholds: number[] = []
+    const step = (now: number): void => {
+      const target = heroText
+      const len = target.length
+      if (thresholds.length !== len) {
+        thresholds = Array.from({ length: len }, (_, i) =>
+          Math.min(0.92, (i / Math.max(1, len)) * 0.35 + Math.random() * 0.7))
+      }
+      const p = Math.min(1, (now - start) / duration)
+      let out = ''
+      for (let i = 0; i < len; i++) {
+        const ch = target.charAt(i)
+        const th = thresholds[i] ?? 1
+        out += ch === ' ' ? ' ' : p >= th ? ch : randGlyph()
+      }
+      displayText = out
+      if (p < 1) {
+        raf = requestAnimationFrame(step)
+      } else {
+        displayText = target
+        scrambling = false
+        revealed = true
+      }
+    }
+    raf = requestAnimationFrame(step)
+    return () => cancelAnimationFrame(raf)
+  })
 
   function saveName(): void {
     const n = nameInput.trim()
@@ -92,7 +159,7 @@
 </script>
 
 <div class="dashwrap scroll">
-  <div class="dash">
+  <div class="dash" class:revealed>
     <div class="top">
       {#if store.lastLayout}
         <button class="back" onclick={() => store.goBack()}>← back to your chats</button>
@@ -100,10 +167,8 @@
       <div class="hero">
         <img class="logo" src="/logo.png" alt="" />
         <div class="herotext">
-          {#if settings.ownerName}
-            <h1>{greeting}</h1>
-          {:else}
-            <h1>Welcome to AllMyAgents.</h1>
+          <h1>{scrambling ? displayText : heroText}</h1>
+          {#if !settings.ownerName}
             <div class="nameask">
               <input placeholder="What should I call you?" bind:value={nameInput} onkeydown={(e) => { if (e.key === 'Enter') saveName() }} />
               <button class="btn btn-primary" onclick={saveName}>Set</button>
@@ -116,8 +181,8 @@
       <div class="tiles">
         <div class="tile"><div class="num">{totalSessions}</div><div class="lbl dim">sessions</div></div>
         <div class="tile"><div class="num">{projectRows.length}</div><div class="lbl dim">projects</div></div>
-        <div class="tile"><div class="num">{stats?.totalTurns ?? '—'}</div><div class="lbl dim">turns (14 wks)</div></div>
-        <div class="tile"><div class="num">${(stats?.totalCost ?? 0).toFixed(2)}</div><div class="lbl dim">spend (14 wks)</div></div>
+        <div class="tile"><div class="num">{stats?.totalTurns ?? '—'}</div><div class="lbl dim">turns (past yr)</div></div>
+        <div class="tile"><div class="num">${(stats?.totalCost ?? 0).toFixed(2)}</div><div class="lbl dim">spend (past yr)</div></div>
         <div class="tile split">
           <div class="prov"><ProviderLogo provider="claude" size={13} /> {claudeCount}</div>
           <div class="prov"><ProviderLogo provider="codex" size={13} /> {codexCount}</div>
@@ -131,7 +196,7 @@
         {#if days.length === 0}
           <div class="dim empty2">loading…</div>
         {:else}
-          <div class="cal">
+          <div class="cal" bind:clientWidth={calWidth} style="grid-template-rows: repeat(7, {cellSize}px); grid-auto-columns: {cellSize}px;">
             {#each Array(firstWeekday) as _, i (i)}<div class="cell pad"></div>{/each}
             {#each days as d (d.date)}
               <button type="button" class="cell" class:selected={selectedDay?.date === d.date} style="background: {shade(d.turns)}"
@@ -251,16 +316,16 @@
   .prov { display: flex; align-items: center; gap: var(--space-3); font-family: var(--mono); font-size: var(--text-md); font-variant-numeric: tabular-nums; }
   .card { padding: var(--space-5); min-width: 0; }
   .card h3, .detail h3 { margin: 0 0 var(--space-4); font-size: var(--text-2xs); text-transform: uppercase; letter-spacing: var(--ls-label); color: var(--dim); }
-  /* Fixed 18px square tracks (GitHub-contribution feel) instead of stretched 1fr columns —
-     with only ~15 week-columns, 1fr ballooned each cell to ~50px. Left-aligned via
-     justify-content:start; the grid no longer spans the card, which is fine. */
-  .cal { display: grid; grid-template-rows: repeat(7, 18px); grid-auto-flow: column; grid-auto-columns: 18px; gap: 3px; justify-content: start; }
+  /* Responsive GitHub-contribution grid. Row height + column width are set inline from the
+     width-derived `cellSize` (see script) so ~53 week-columns fill the card at ~12–14px while
+     shorter ranges cap at 20px. Only flow / gap / alignment live here; gap stays 3px = CAL_GAP. */
+  .cal { display: grid; grid-auto-flow: column; gap: 3px; justify-content: start; }
   /* Every tile carries a faint inset hairline so the matrix reads cleanly even where the
      fill is near the card colour (zero-activity days). */
   .cell { border-radius: var(--r-xs); padding: 0; border: 0; box-shadow: inset 0 0 0 1px var(--border); }
   .cell.pad { box-shadow: none; }
   .cell:not(.pad) { cursor: pointer; }
-  .cell:not(.pad):hover { box-shadow: inset 0 0 0 1px var(--border-strong); }
+  .cell:not(.pad):hover { box-shadow: inset 0 0 0 1.5px rgba(255, 255, 255, 0.85); }
   /* Inset accent ring for the pinned day — stays within the cell bounds (no scale/overlap
      into neighbouring cells or rows). The :hover pairing keeps the ring on when hovered. */
   .cell.selected, .cell.selected:hover { box-shadow: inset 0 0 0 2px var(--accent); }
@@ -304,7 +369,30 @@
       box-shadow: var(--edge-hi), var(--shadow-3); }
     .cell { transition: box-shadow var(--dur) var(--ease), background var(--dur-slow) var(--ease); }
     .pfill { transition: width var(--dur-slow) var(--ease); }
-    .detail { animation: fade-in var(--dur-slow) var(--ease); }
     .tip { animation: pop-in var(--dur-fast) var(--ease); }
+
+    /* Matrix-decode entrance: the stat tiles, both left cards and the detail panel stay hidden
+       while the heading scrambles (no .revealed on .dash), then stagger up once JS resolves the
+       heading and adds .revealed. animation-fill-mode:backwards holds each element's hidden 0%
+       state through its delay so nothing flashes visible before its turn. Under reduce-motion
+       this whole @media block is inert, so everything is simply shown at once. */
+    .dash:not(.revealed) .tile,
+    .dash:not(.revealed) .card,
+    .dash:not(.revealed) .detail { opacity: 0; }
+    .dash.revealed .tile,
+    .dash.revealed .card,
+    .dash.revealed .detail { animation: reveal-up 340ms var(--ease) backwards; }
+    .dash.revealed .tiles .tile:nth-child(1) { animation-delay: 0ms; }
+    .dash.revealed .tiles .tile:nth-child(2) { animation-delay: 40ms; }
+    .dash.revealed .tiles .tile:nth-child(3) { animation-delay: 80ms; }
+    .dash.revealed .tiles .tile:nth-child(4) { animation-delay: 120ms; }
+    .dash.revealed .tiles .tile:nth-child(5) { animation-delay: 160ms; }
+    .dash.revealed .left .card:nth-child(1) { animation-delay: 210ms; }
+    .dash.revealed .left .card:nth-child(2) { animation-delay: 260ms; }
+    .dash.revealed .detail { animation-delay: 320ms; }
+  }
+  @keyframes reveal-up {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
   }
 </style>

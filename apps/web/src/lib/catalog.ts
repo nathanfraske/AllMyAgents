@@ -73,7 +73,8 @@ const BASE_EFFORT = ['low', 'medium', 'high', 'xhigh']
 
 export const MODELS: ModelDef[] = [
   // Claude (Agent SDK)
-  { slug: 'claude-opus-4-8', name: 'Claude Opus 4.8', shortName: 'Opus 4.8', provider: 'claude', isDefault: true, descriptors: [THINKING] },
+  { slug: 'claude-opus-5', name: 'Claude Opus 5', shortName: 'Opus 5', provider: 'claude', isDefault: true, isNew: true, descriptors: [THINKING] },
+  { slug: 'claude-opus-4-8', name: 'Claude Opus 4.8', shortName: 'Opus 4.8', provider: 'claude', descriptors: [THINKING] },
   { slug: 'claude-fable-5', name: 'Claude Fable 5', shortName: 'Fable 5', provider: 'claude', isNew: true, descriptors: [THINKING] },
   { slug: 'claude-sonnet-5', name: 'Claude Sonnet 5', shortName: 'Sonnet 5', provider: 'claude', descriptors: [THINKING] },
   { slug: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', shortName: 'Haiku 4.5', provider: 'claude', descriptors: [] },

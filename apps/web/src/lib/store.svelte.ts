@@ -50,6 +50,13 @@ export interface SessionView {
   turnStartedAt?: number
   // Latest token usage the provider reported for the running turn (realtime counter).
   liveTokens?: { input?: number; output?: number; total?: number }
+  // A local-only DRAFT chat: opened by "new chat" but NOT yet spawned on the hub (no session,
+  // no worktree). Excluded from `sessionList`, so it never shows in the sidebar/dashboard; it is
+  // reached only as the open pane via `sessions[id]`. It materializes into a real session on the
+  // first send. `draftUseWorktree` is the pre-spawn worktree intent (there is no real worktree
+  // path yet) — passed as `useWorktree` when the draft is finally spawned.
+  draft?: boolean
+  draftUseWorktree?: boolean
 }
 
 interface ClaudeBlock {
@@ -171,6 +178,9 @@ class HubStore {
   chatOrder = $state<Record<string, string[]>>(loadChatOrders())
   // One-shot flags: suppress a Codex `userMessage` event when we've already echoed it optimistically.
   private suppressNextUserMsg: Record<string, boolean> = {}
+  // id -> ms timestamp of the last time a chat MATERIALIZED (draft → real) or was (re)TITLED.
+  // The sidebar watches this to play a brief glitch on that row's label, then clears it.
+  recentlyChanged = $state<Record<string, number>>({})
   lastSeq = 0
 
   queueFor(sessionId: string): string[] {
@@ -214,7 +224,10 @@ class HubStore {
   private ws: WebSocket | null = null
 
   get sessionList(): SessionView[] {
-    return Object.values(this.sessions).sort((a, b) => b.lastActivity.localeCompare(a.lastActivity))
+    // Drafts are local-only until they materialize — keep them out of the sidebar + dashboard.
+    return Object.values(this.sessions)
+      .filter((v) => !v.draft)
+      .sort((a, b) => b.lastActivity.localeCompare(a.lastActivity))
   }
 
   get selected(): SessionView | null {
@@ -301,47 +314,106 @@ class HubStore {
     return this.profiles[0]?.id
   }
 
-  // Guards against a second spawn while one is in flight — rapid + clicks were creating
-  // multiple agents. Not $state; it's a control flag, not rendered.
-  private creating = false
-
-  // Open an empty chat immediately — no prompt up front; the composer configures the rest.
-  // Applies the user's settings defaults (permission mode, default model per provider).
+  // Open a new chat as a LOCAL DRAFT — no `api.spawn`, no hub session, no worktree. The draft
+  // becomes the active pane where the composer picks account/model/worktree and the first prompt
+  // is typed; it materializes into a real session on the first send (see `materializeDraft`).
+  // Applies the same defaults the old immediate-spawn path did (detached-chat defaults when no
+  // project, default model per provider, default worktree preference).
   async newSession(profileId?: string, projectId?: string, useWorktree?: boolean): Promise<void> {
-    if (this.creating) return
     const pid = profileId ?? this.defaultProfileId()
     if (!pid) {
       this.settingsOpen = true
       return
     }
-    this.creating = true
-    try {
-      const profile = this.profiles.find((p) => p.id === pid)
-      const model = profile?.provider === 'codex' ? settings.defaultCodexModel : settings.defaultClaudeModel
-      // A chat opened without an explicit project is "detached/unfiled" — apply the operator's
-      // detached-chat defaults: a default destination project (else stays Unfiled) and a mode.
-      const detached = !projectId
-      const destProject = projectId ?? (detached ? (settings.detachedDefaultProjectId ?? undefined) : undefined)
-      const body: Record<string, unknown> = {
+    const profile = this.profiles.find((p) => p.id === pid)
+    const model = profile?.provider === 'codex' ? settings.defaultCodexModel : settings.defaultClaudeModel
+    // A chat opened without an explicit project is "detached/unfiled" — apply the operator's
+    // detached-chat defaults: a default destination project (else stays Unfiled) and a mode.
+    const detached = !projectId
+    const destProject = projectId ?? (detached ? (settings.detachedDefaultProjectId ?? undefined) : undefined)
+    const now = new Date().toISOString()
+    const id = `draft:${crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`}`
+    const view: SessionView = {
+      record: {
+        id,
         profileId: pid,
+        provider: profile?.provider ?? 'claude',
+        projectId: destProject,
+        cwd: '',
+        status: 'idle',
+        model: model || undefined,
         permissionMode: detached ? settings.detachedDefaultMode : settings.defaultPermissionMode,
-        useWorktree: useWorktree ?? settings.defaultUseWorktree,
-      }
-      if (destProject) body.projectId = destProject
-      if (model) body.model = model
-      const out = await api.spawn(body)
-      if (out && !('error' in out)) {
-        // Seed the view optimistically so we navigate to the new chat right away instead of
-        // racing the session/created event (that race was the "didn't take me there" symptom).
-        this.ensure(out as SessionRecord)
-        this.lastProfileId = pid
-        this.select((out as { id: string }).id)
-      } else if (out && 'error' in out) {
-        alert(out.error)
-      }
-    } finally {
-      this.creating = false
+        createdAt: now,
+      },
+      items: [],
+      lastActivity: now,
+      sawReasoning: false,
+      draft: true,
+      draftUseWorktree: useWorktree ?? settings.defaultUseWorktree,
     }
+    this.sessions[id] = view
+    this.lastProfileId = pid
+    this.select(id) // opens the draft as the active pane (and discards any prior unsent draft)
+  }
+
+  // A draft's composer writes its chosen account/model/traits/mode straight into the draft record
+  // (no hub round-trip) — the picks are read back out of the record when the draft materializes.
+  updateDraft(id: string, patch: Partial<SessionRecord>): void {
+    const v = this.sessions[id]
+    if (!v || !v.draft) return
+    Object.assign(v.record, patch)
+  }
+
+  // First send on a draft: spawn the real session with this prompt, then swap the draft's pane
+  // over to it seamlessly. On error, keep the draft intact and hand the error back to the composer
+  // (same pattern as a failed `api.send`). The first user message is rendered exactly once from the
+  // hub's canonical `session/input` echo — `session/created` precedes it, so the view always exists
+  // by the time it lands (no optimistic echo needed, no duplicate).
+  async materializeDraft(draftId: string, text: string): Promise<{ ok?: boolean; error?: string }> {
+    const draft = this.sessions[draftId]
+    if (!draft || !draft.draft) return { error: 'draft is gone' }
+    const r = draft.record
+    const body: Record<string, unknown> = {
+      profileId: r.profileId,
+      permissionMode: r.permissionMode ?? settings.defaultPermissionMode,
+      useWorktree: draft.draftUseWorktree ?? settings.defaultUseWorktree,
+      prompt: text,
+    }
+    if (r.projectId) body.projectId = r.projectId
+    if (r.model) body.model = r.model
+    if (r.effort) body.effort = r.effort
+    if (r.serviceTier) body.serviceTier = r.serviceTier
+    const out = await api.spawn(body)
+    if (!out || 'error' in out) {
+      return { error: (out as { error?: string } | null)?.error ?? 'failed to start the session' }
+    }
+    const rec = out as SessionRecord
+    // Swap draft id → real id everywhere it is referenced, then drop the draft.
+    const { [draftId]: _drop, ...rest } = this.sessions
+    this.sessions = rest
+    this.ensure(rec)
+    if (this.selectedId === draftId) this.selectedId = rec.id
+    if (this.splitPanes.length) {
+      this.splitPanes = this.splitPanes.map((row) => row.map((x) => (x === draftId ? rec.id : x)))
+    }
+    this.lastProfileId = rec.profileId
+    this.noteSent(rec.id) // immediate "received / thinking" feedback while the first turn spins up
+    this.markGlitch(rec.id) // glitch the sidebar label as the chat materializes into its project
+    return { ok: true }
+  }
+
+  // Flag a chat id as just-materialized/renamed so the sidebar can play a one-shot glitch on it.
+  private markGlitch(id: string): void {
+    this.recentlyChanged = { ...this.recentlyChanged, [id]: Date.now() }
+  }
+
+  // Drop an unsent draft from local state. Callers (select-away, closePane) have already moved the
+  // selection/panes off it, so this only needs to remove it from the roster — nothing to clean up
+  // on the hub, since a draft was never spawned there.
+  private discardDraft(id: string): void {
+    if (!this.sessions[id]?.draft) return
+    const { [id]: _drop, ...rest } = this.sessions
+    this.sessions = rest
   }
 
   // Only a fresh project chat (no real turns yet) can switch worktree mode — the worktree is
@@ -351,10 +423,16 @@ class HubStore {
     return !view.items.some((i) => i.kind === 'user' || i.kind === 'assistant')
   }
 
-  // Flip worktree ⇄ direct for the current empty chat by re-creating it (like swapping accounts).
+  // Flip worktree ⇄ direct before the first message. For a DRAFT this is just a local intent flip
+  // (the worktree is created at spawn). For a real empty chat it re-creates it (legacy path; real
+  // sessions always carry the first prompt now, so `canToggleWorktree` is effectively draft-only).
   async toggleWorktree(): Promise<void> {
     const cur = this.selectedId ? this.sessions[this.selectedId] : null
     if (!cur || !this.canToggleWorktree(cur)) return
+    if (cur.draft) {
+      cur.draftUseWorktree = !cur.draftUseWorktree
+      return
+    }
     const next = !cur.record.worktree
     await api.stop(cur.record.id).catch(() => undefined)
     this.removeSessionLocal(cur.record.id)
@@ -371,6 +449,19 @@ class HubStore {
       return
     }
     if (cur.record.profileId === profileId) return
+    // A DRAFT has no hub session yet — reconfigure it in place (no re-spawn, no port). Reset the
+    // model/traits to the new provider's defaults, since the old slug is invalid cross-provider.
+    if (cur.draft) {
+      const profile = this.profiles.find((p) => p.id === profileId)
+      if (!profile) return
+      cur.record.profileId = profileId
+      cur.record.provider = profile.provider
+      cur.record.model = (profile.provider === 'codex' ? settings.defaultCodexModel : settings.defaultClaudeModel) || undefined
+      cur.record.effort = undefined
+      cur.record.serviceTier = undefined
+      this.lastProfileId = profileId
+      return
+    }
     const isEmpty = cur.items.filter((i) => i.kind === 'user' || i.kind === 'assistant').length === 0
     if (isEmpty) {
       await api.stop(cur.record.id).catch(() => undefined)
@@ -629,6 +720,7 @@ class HubStore {
         if (p.title) {
           view.record.title = p.title
           if (p.source === 'user' || p.source === 'auto') view.record.titleSource = p.source
+          this.markGlitch(sessionId) // auto-name-on-materialize or a rename → glitch the sidebar label
         }
         break
       }
@@ -819,6 +911,7 @@ class HubStore {
   }
 
   select(id: string): void {
+    const prev = this.selectedId
     this.selectedId = id
     // In split mode, selecting from the sidebar drives the first (primary) pane (row 0, col 0).
     if (this.splitPanes.length) {
@@ -826,6 +919,11 @@ class HubStore {
       if (rows[0] && rows[0].length) rows[0][0] = id
       else rows.unshift([id])
       this.splitPanes = rows
+    }
+    // Navigating away from an unsent draft that is no longer shown anywhere discards it (nothing
+    // to clean up on the hub). Keeps repeated "new chat" from leaking unreachable drafts.
+    if (prev && prev !== id && this.sessions[prev]?.draft && !this.basePanes().flat().includes(prev)) {
+      this.discardDraft(prev)
     }
   }
 
@@ -950,8 +1048,13 @@ class HubStore {
     const co = this.coord(index)
     if (!co) return
     const rows = this.basePanes().map((r) => [...r])
+    const closedId = rows[co.r]?.[co.c] ?? null
     rows[co.r]!.splice(co.c, 1)
     this.commit(rows)
+    // Closing the last pane that showed a DRAFT discards it (X-ing out an unsent chat is local-only).
+    if (closedId && this.sessions[closedId]?.draft && !this.basePanes().flat().includes(closedId)) {
+      this.discardDraft(closedId)
+    }
   }
 }
 

@@ -81,7 +81,6 @@ beforeEach(() => {
   store.connected = false
   store.settingsOpen = false
   store.lastProfileId = null
-  ;(store as unknown as { creating: boolean }).creating = false
   vi.stubGlobal('alert', vi.fn())
   seedN = 0
 })
@@ -295,28 +294,35 @@ describe('deleteSession / removeSessionLocal', () => {
   })
 })
 
-// --- newSession double-spawn guard ----------------------------------------------------------
+// --- newSession (local draft) + materializeDraft --------------------------------------------
+// A new chat is a LOCAL DRAFT — no hub session until the first send. It's excluded from the
+// roster (sidebar/dashboard) and only spawns for real via materializeDraft.
 
-describe('newSession', () => {
-  it('spawns only once for concurrent calls, then optimistically ensures + navigates', async () => {
-    let resolveSpawn!: (v: SessionRecord) => void
-    vi.mocked(api.spawn).mockImplementationOnce(
-      () => new Promise<SessionRecord>((res) => { resolveSpawn = res })
-    )
-
-    const p1 = store.newSession('p1')
-    const p2 = store.newSession('p1') // must be short-circuited by the `creating` guard
-
-    resolveSpawn(rec('fresh'))
-    await Promise.all([p1, p2])
-
-    expect(api.spawn).toHaveBeenCalledTimes(1)
-    expect(store.sessions.fresh).toBeDefined() // optimistic ensure()
-    expect(store.selectedId).toBe('fresh') // navigation via select()
-    expect(store.lastProfileId).toBe('p1')
+describe('newSession (draft) + materializeDraft', () => {
+  it('creates a local draft (no hub spawn) and selects it', async () => {
+    store.profiles = [{ id: 'p1', provider: 'claude' }]
+    await store.newSession('p1')
+    expect(api.spawn).not.toHaveBeenCalled()
+    const id = store.selectedId
+    expect(id).toMatch(/^draft:/)
+    expect(store.sessions[id!]?.draft).toBe(true)
+    expect(store.sessionList).toEqual([]) // drafts are hidden from the roster
   })
 
-  it('opens settings instead of spawning when there is no profile at all', async () => {
+  it('materializeDraft spawns the real session with the prompt and swaps the pane over', async () => {
+    store.profiles = [{ id: 'p1', provider: 'claude' }]
+    await store.newSession('p1')
+    const draftId = store.selectedId!
+    const out = await store.materializeDraft(draftId, 'hello there')
+    expect(out.error).toBeUndefined()
+    expect(api.spawn).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(api.spawn).mock.calls[0]?.[0]).toMatchObject({ profileId: 'p1', prompt: 'hello there' })
+    expect(store.sessions[draftId]).toBeUndefined() // draft consumed
+    expect(store.sessions.spawned).toBeDefined() // real session ensured
+    expect(store.selectedId).toBe('spawned') // pane swapped onto the real id
+  })
+
+  it('opens settings instead of drafting when there is no profile at all', async () => {
     store.profiles = []
     await store.newSession() // no profileId, no default account
     expect(api.spawn).not.toHaveBeenCalled()

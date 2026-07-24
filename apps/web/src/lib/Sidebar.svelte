@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte'
   import { api } from './api'
   import { store, type SessionView } from './store.svelte'
   import { relativeTime } from './time'
@@ -22,6 +23,32 @@
     else next.add(id)
     collapsed = next
   }
+
+  // --- Materialize / rename glitch --------------------------------------------------------------
+  // The store stamps a chat id into `recentlyChanged` when it MATERIALIZES (draft → real) or is
+  // (re)TITLED. We flip a transient `.glitch` class on that row's label for a short window, then
+  // clear it so a later change can retrigger. `prefers-reduced-motion` is honoured by the CSS
+  // (the keyframes live behind a no-preference media query, so reduced motion just updates instantly).
+  let glitching = $state(new Set<string>())
+  const glitchSeen = new Map<string, number>()
+  $effect(() => {
+    const marks = store.recentlyChanged
+    for (const id in marks) {
+      const ts = marks[id]
+      if (ts == null || glitchSeen.get(id) === ts) continue
+      glitchSeen.set(id, ts)
+      untrack(() => {
+        const next = new Set(glitching)
+        next.add(id)
+        glitching = next
+      })
+      setTimeout(() => {
+        const next = new Set(glitching)
+        next.delete(id)
+        glitching = next
+      }, 760)
+    }
+  })
 
   interface Summary {
     providers: ('claude' | 'codex')[]
@@ -108,64 +135,105 @@
     return out
   })
 
-  // --- Drag-to-reorder (pointer-based) ---------------------------------------------------------
-  // A dedicated grip handle starts a REORDER via pointer events, kept deliberately separate from the
-  // chat row's native HTML drag (which drags a chat OUT into the main pane to open/split it): the
-  // grip is not `draggable`, and while a reorder is armed we cancel the row's native `dragstart`, so
-  // the two gestures never collide. As the pointer moves we hit-test the group/row underneath and
-  // reorder live in the store, so the keyed {#each} items animate (FLIP) to open a gap where the
-  // dragged item will land. The chosen order persists via the store.
-  type ReorderState = { kind: 'project'; id: string } | { kind: 'chat'; groupId: string; id: string }
-  let reordering = $state<ReorderState | null>(null)
-  // Last target we acted on — skip repeats so a stationary pointer over one neighbour can't oscillate.
+  // --- Drag-to-reorder (native HTML5 DnD) ------------------------------------------------------
+  // The whole chat ROW and the project group HEADER are the drag affordance — the SAME native drag a
+  // chat already used to open/split OUT in the pane area. `dragstart` arms a reorder; then `dragover`
+  // fires CONTINUOUSLY on whatever row/header sits under the cursor, so we reorder live in the store
+  // and the keyed {#each} items FLIP to open a gap. Because dragover streams, one gesture slides an
+  // item past many neighbours (continuous multi-move) and a new drag can start immediately — no
+  // pointer-events:none / elementFromPoint / remount fragility.
+  //
+  // A CHAT drag ALSO sets `store.dragSession`, so dragging it OUT over the panes still opens/splits
+  // it (App.svelte drives that off dragSession + cursor position). While the cursor is over the
+  // sidebar we keep `store.dropZone` cleared, so the pane drop-ghost never shows: over the sidebar it
+  // is a REORDER, over the panes it is an OPEN. A PROJECT drag never sets dragSession — reordering
+  // groups is sidebar-local and must never open a pane.
+  type DragState = { kind: 'chat'; groupId: string; id: string } | { kind: 'project'; id: string }
+  let dragging = $state<DragState | null>(null)
+  // Last target id we reordered onto — skip repeats so a stationary cursor can't oscillate.
   let lastOverId: string | null = null
 
   const reduceMotion = typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches
-  // FLIP only WHILE dragging (matches --dur / --ease feel). The list otherwise re-sorts by recency
-  // as agents work; keeping those instant (duration 0) avoids constant shuffling, so the "bump out
-  // of the way" glide is reserved for a deliberate reorder. Reduced-motion disables it entirely.
-  const flipParams = $derived({ duration: reordering && !reduceMotion ? 190 : 0, easing: cubicOut })
+  // FLIP only WHILE dragging (the list otherwise re-sorts by recency as agents work; keeping those
+  // instant avoids constant shuffling, so the glide is reserved for a deliberate reorder). Crucially
+  // the params know WHICH kind is dragging: a PROJECT drag animates the whole GROUP as one unit
+  // (header + its chats glide together) while the per-row flip is turned OFF so the chats ride along
+  // instead of double-animating/snapping; a CHAT drag animates the rows to open a gap. Reduced-motion
+  // disables both (instant reorder, no glide).
+  const dragKind = $derived(dragging?.kind ?? null)
+  const groupFlip = $derived({ duration: dragKind === 'project' && !reduceMotion ? 190 : 0, easing: cubicOut })
+  const rowFlip = $derived({ duration: dragKind === 'chat' && !reduceMotion ? 190 : 0, easing: cubicOut })
 
   function isDragging(kind: 'project' | 'chat', id: string): boolean {
-    return reordering?.kind === kind && reordering.id === id
+    return dragging?.kind === kind && dragging.id === id
   }
 
-  function startReorder(e: PointerEvent, target: ReorderState): void {
-    if (e.button !== 0) return
-    e.preventDefault() // suppress text-selection + help keep the row's native drag from starting
-    e.stopPropagation()
-    reordering = target
+  // dragstart on a CHAT row: arm a chat reorder AND set dragSession, so dragging OUT into the panes
+  // opens/splits it (the drop-to-open path in App.svelte).
+  function startChatDrag(e: DragEvent, groupId: string, id: string): void {
+    dragging = { kind: 'chat', groupId, id }
     lastOverId = null
-    window.addEventListener('pointermove', onReorderMove)
-    window.addEventListener('pointerup', endReorder)
-    window.addEventListener('pointercancel', endReorder)
+    store.dragSession = id
+    e.dataTransfer?.setData('text/plain', id)
+    if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
   }
 
-  function onReorderMove(e: PointerEvent): void {
-    const cur = reordering
+  // dragstart on a group HEADER: arm a project reorder. Deliberately does NOT touch dragSession — a
+  // project drag reorders groups within the sidebar and never opens a pane.
+  function startProjectDrag(e: DragEvent, id: string): void {
+    dragging = { kind: 'project', id }
+    lastOverId = null
+    e.dataTransfer?.setData('text/plain', id)
+    if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
+  }
+
+  function endDrag(): void {
+    dragging = null
+    lastOverId = null
+    store.endDragSession() // clears dragSession + dropZone (a no-op harmless path when a project was dragged)
+  }
+
+  // Live reorder driven by a continuous `dragover`. `groupId` is the group under the cursor; `chatId`
+  // is the chat row under it (undefined over a header). preventDefault marks a valid drop target (so
+  // dragover keeps firing and the move cursor shows); clearing dropZone keeps the pane ghost hidden
+  // while we reorder inside the sidebar. The lastOverId guard — reset to null whenever we hover the
+  // dragged item itself — stops oscillation yet allows immediate re-entry, so a drag can sweep an
+  // item back and forth across the same neighbours fluidly.
+  function dragOverTarget(e: DragEvent, groupId: string, chatId?: string): void {
+    const cur = dragging
     if (!cur) return
     e.preventDefault()
-    // The dragged element has pointer-events:none, so elementFromPoint returns the item beneath.
-    const el = (document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null)?.closest<HTMLElement>(
-      `[data-reorder-kind="${cur.kind}"]`,
-    )
-    const overId = el?.dataset.reorderId
-    if (!overId || overId === cur.id || overId === lastOverId) return
+    store.dropZone = null
     if (cur.kind === 'project') {
-      store.reorderProjects(cur.id, overId)
-      lastOverId = overId
-    } else if (el?.dataset.reorderGroup === cur.groupId) {
-      store.reorderChats(cur.groupId, cur.id, overId)
-      lastOverId = overId
+      // Hovering a group's header OR any of its rows counts as hovering that whole group.
+      if (groupId === cur.id) { lastOverId = null; return }
+      if (groupId === lastOverId || groupId === '__none__') return
+      store.reorderProjects(cur.id, groupId)
+      lastOverId = groupId
+    } else {
+      // A chat reorders only within its OWN group; a header (no chatId) is an inert target.
+      const overId = chatId ?? groupId
+      if (overId === cur.id) { lastOverId = null; return }
+      if (overId === lastOverId) return
+      if (chatId && cur.groupId === groupId) {
+        store.reorderChats(cur.groupId, cur.id, chatId)
+        lastOverId = overId
+      }
     }
   }
 
-  function endReorder(): void {
-    reordering = null
-    lastOverId = null
-    window.removeEventListener('pointermove', onReorderMove)
-    window.removeEventListener('pointerup', endReorder)
-    window.removeEventListener('pointercancel', endReorder)
+  const preventIfDragging = (e: DragEvent): void => { if (dragging) e.preventDefault() }
+
+  // Over sidebar chrome that is not itself a row/header (gaps, empty list space): still a reorder
+  // surface, so keep the pane ghost hidden and accept the drop (which just finalises via dragend).
+  function onListDragOver(e: DragEvent): void {
+    if (!dragging) return
+    e.preventDefault()
+    store.dropZone = null
+  }
+  function onListDrop(e: DragEvent): void {
+    if (!dragging) return
+    e.preventDefault()
   }
 
 
@@ -235,18 +303,21 @@
     </svg>
   {/snippet}
 
-  <div class="list scroll" class:reordering={!!reordering}>
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div class="list scroll" class:reordering={!!dragging} role="presentation" ondragover={onListDragOver} ondrop={onListDrop}>
     {#each groups as g (g.id)}
       {@const isCollapsed = collapsed.has(g.id)}
       {@const reorderable = g.id !== '__none__'}
-      <div class="group" class:dragging={isDragging('project', g.id)} animate:flip={flipParams}
-        data-reorder-kind={reorderable ? 'project' : undefined}
-        data-reorder-id={reorderable ? g.id : undefined}>
-        <div class="group-head">
+      <div class="group" class:dragging={isDragging('project', g.id)} animate:flip={groupFlip}>
+        <!-- The whole header is the project drag handle; '__none__' (Unfiled) is not reorderable. -->
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div class="group-head" class:draghandle={reorderable} draggable={reorderable}
+          ondragstart={(e) => startProjectDrag(e, g.id)}
+          ondragend={endDrag}
+          ondragover={(e) => dragOverTarget(e, g.id)}
+          ondragenter={preventIfDragging}>
           {#if reorderable}
-            <button class="grip" title="drag to reorder project" aria-label="reorder project" draggable="false" tabindex="-1"
-              onpointerdown={(e) => startReorder(e, { kind: 'project', id: g.id })}
-              onclick={(e) => e.stopPropagation()}>{@render gripIcon()}</button>
+            <span class="grip" aria-hidden="true">{@render gripIcon()}</span>
           {/if}
           <button class="folder" title={isCollapsed ? 'expand' : 'collapse'} onclick={() => toggleCollapse(g.id)}><Icon name={isCollapsed ? 'chevron-right' : 'chevron-down'} size={12} /></button>
           <span class="gname">{g.name}</span>
@@ -271,15 +342,14 @@
           {@const pending = store.pendingBySession[s.record.id] ?? 0}
           <div class="row" class:sel={store.selectedId === s.record.id} class:dragging={isDragging('chat', s.record.id)} role="button" tabindex="0"
             draggable={editingId !== s.record.id}
-            animate:flip={flipParams}
-            data-reorder-kind="chat" data-reorder-id={s.record.id} data-reorder-group={g.id}
-            ondragstart={(e) => { if (reordering) { e.preventDefault(); return } store.dragSession = s.record.id; e.dataTransfer?.setData('text/plain', s.record.id) }}
-            ondragend={() => store.endDragSession()}
+            animate:flip={rowFlip}
+            ondragstart={(e) => startChatDrag(e, g.id, s.record.id)}
+            ondragend={endDrag}
+            ondragover={(e) => dragOverTarget(e, g.id, s.record.id)}
+            ondragenter={preventIfDragging}
             onclick={() => store.select(s.record.id)}
             onkeydown={(e) => { if (e.key === 'Enter') store.select(s.record.id) }}>
-            <button class="grip" title="drag to reorder chat" aria-label="reorder chat" draggable="false" tabindex="-1"
-              onpointerdown={(e) => startReorder(e, { kind: 'chat', groupId: g.id, id: s.record.id })}
-              onclick={(e) => e.stopPropagation()}>{@render gripIcon()}</button>
+            <span class="grip" aria-hidden="true">{@render gripIcon()}</span>
             <span class="dot {st.key}" title={st.label}></span>
             <ProviderLogo provider={s.record.provider} size={13} />
             {#if editingId === s.record.id}
@@ -290,7 +360,7 @@
                 onblur={commitRename} />
             {:else}
               <!-- svelte-ignore a11y_no_static_element_interactions -->
-              <span class="rlabel" ondblclick={(e) => startRename(e, s)}>{label(s)}</span>
+              <span class="rlabel" class:glitch={glitching.has(s.record.id)} ondblclick={(e) => startRename(e, s)}>{label(s)}</span>
             {/if}
             {#if pending > 0}<span class="pbadge tnum">{pending}</span>{/if}
             <span class="rtime dim tnum">{relativeTime(s.lastActivity)}</span>
@@ -367,24 +437,43 @@
   .row { position: relative; display: flex; align-items: center; gap: var(--space-3); padding: var(--space-2) var(--space-3) var(--space-2) var(--space-6); border-radius: var(--r-md); cursor: pointer; }
   .row:hover { background: var(--surface-2); }
   .row.sel { background: var(--surface-2); box-shadow: inset 2px 0 0 var(--accent); }
-  /* Drag-to-reorder grip: a faint rail on the left, revealed on hover, that owns the REORDER
-     gesture (pointer-based) — distinct from the row body's native drag-out-to-open. */
+  /* Drag hint: a faint grip rail on the left, revealed on hover, signalling the whole ROW/HEADER is
+     draggable. Purely decorative now (aria-hidden, pointer-events:none) — the native drag lives on
+     the row/header itself, which both REORDERS (over the sidebar) and OPENS/SPLITS (dragged out over
+     the panes). */
   .grip { position: absolute; left: 2px; top: 50%; transform: translateY(-50%); display: grid; place-items: center;
-    width: 16px; height: 18px; color: var(--dim); border-radius: var(--r-xs); cursor: grab; opacity: 0; touch-action: none;
+    width: 16px; height: 18px; color: var(--dim); border-radius: var(--r-xs); opacity: 0; pointer-events: none;
     transition: opacity var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease); }
   .gripicon { display: block; }
-  .group-head:hover .grip, .row:hover .grip { opacity: 0.45; }
-  .group-head .grip:hover, .row .grip:hover { opacity: 1; color: var(--muted); }
-  .grip:active { cursor: grabbing; }
+  /* The header is primarily a drag handle now; the row's main gesture is still click-to-select, so it
+     keeps its pointer cursor and reveals the grip hint on hover. */
+  .group-head.draghandle { cursor: grab; }
+  .group-head:hover .grip, .row:hover .grip { opacity: 0.55; }
   .row.dragging .grip, .group.dragging .grip { opacity: 1; color: var(--muted); }
-  /* Lifted look for the item under the pointer; pointer-events:none lets elementFromPoint read the
-     neighbour beneath so the live FLIP reorder tracks the cursor. */
-  .row.dragging { background: var(--surface-3); box-shadow: var(--shadow-1); opacity: 0.92; z-index: 2; pointer-events: none; }
-  .group.dragging { position: relative; pointer-events: none; z-index: 2; }
+  /* Lifted look for the item being dragged. No pointer-events:none needed — native dragover streams
+     the row/header under the cursor directly, so the live FLIP reorder tracks it with no hit-testing. */
+  .row.dragging { background: var(--surface-3); box-shadow: var(--shadow-1); opacity: 0.9; z-index: 2; }
+  .group.dragging { position: relative; z-index: 2; }
   .group.dragging .group-head { background: var(--surface-3); border-radius: var(--r-md); box-shadow: var(--shadow-1); }
   .list.reordering { user-select: none; cursor: grabbing; }
   .rlabel { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .row.sel .rlabel { font-weight: var(--fw-medium); }
+  /* One-shot glitch when a chat materializes into the list or is renamed. Kept subtle (small
+     jitter + clip slices + a quick accent/secondary RGB-split, opacity never below ~0.8 — no
+     hard flashing). Behind no-preference so reduced motion updates the label instantly. */
+  @media (prefers-reduced-motion: no-preference) {
+    .rlabel.glitch { animation: rlabel-glitch 0.72s var(--ease) 1; }
+    @keyframes rlabel-glitch {
+      0%   { transform: translate(0, 0); clip-path: inset(0 0 0 0); opacity: 1; text-shadow: none; }
+      12%  { transform: translate(-1.5px, 0); clip-path: inset(0 0 62% 0); opacity: 0.82; text-shadow: 1.5px 0 var(--accent), -1.5px 0 var(--secondary); }
+      24%  { transform: translate(1.5px, 0); clip-path: inset(58% 0 0 0); opacity: 1; text-shadow: none; }
+      36%  { transform: translate(-1px, 0); clip-path: inset(30% 0 34% 0); opacity: 0.9; text-shadow: -1.5px 0 var(--accent), 1px 0 var(--secondary); }
+      50%  { transform: translate(1px, 0); clip-path: inset(0 0 18% 0); opacity: 0.86; text-shadow: none; }
+      64%  { transform: translate(0, 0); clip-path: inset(0 0 0 0); opacity: 1; }
+      78%  { transform: translate(-0.5px, 0); opacity: 0.95; text-shadow: 0.5px 0 var(--accent); }
+      100% { transform: translate(0, 0); clip-path: inset(0 0 0 0); opacity: 1; text-shadow: none; }
+    }
+  }
   .rename-input { flex: 1; min-width: 0; font: inherit; font-size: var(--text-sm); background: var(--surface-3); border: 1px solid var(--border-accent); border-radius: var(--r-xs); padding: 0 0.3rem; color: var(--text); }
   .rtime { font-size: var(--text-xs); flex: none; }
   .pbadge { background: var(--warn); color: #111; border-radius: var(--r-pill); padding: 0 0.35rem; font-size: var(--text-2xs); font-weight: var(--fw-semibold); }
