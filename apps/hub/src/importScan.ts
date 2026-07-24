@@ -298,22 +298,28 @@ async function discoverClaudeChats(
   const chats: ImportableChat[] = []
   const warnings: string[] = []
   const projectsDir = path.join(profile.dir, 'projects')
-  if (!fs.existsSync(projectsDir)) return { chats, warnings }
-  for (const dirName of fs.readdirSync(projectsDir)) {
+  let dirNames: string[]
+  try {
+    dirNames = await fs.promises.readdir(projectsDir)
+  } catch {
+    return { chats, warnings } // no projects dir for this profile
+  }
+  for (const dirName of dirNames) {
     if (!isCandidateClaudeDir(dirName, target)) continue
     const dir = path.join(projectsDir, dirName)
-    let dirStat: fs.Stats
+    let files: string[]
     try {
-      dirStat = fs.statSync(dir)
+      const dirStat = await fs.promises.stat(dir)
+      if (!dirStat.isDirectory()) continue
+      files = await fs.promises.readdir(dir)
     } catch {
       continue
     }
-    if (!dirStat.isDirectory()) continue
-    for (const file of fs.readdirSync(dir)) {
+    for (const file of files) {
       if (!file.endsWith('.jsonl')) continue
       const full = path.join(dir, file)
       try {
-        const st = fs.statSync(full)
+        const st = await fs.promises.stat(full)
         const { records } = await readJsonlBounded(full, ctx.maxBytes)
         const parsed = parseClaudeRecords(records)
         // Confirm via the transcript's own cwd field (the folder name is lossy) and skip hub scratch.
@@ -347,15 +353,16 @@ async function discoverClaudeChats(
   return { chats, warnings }
 }
 
-/** Recursively collect `rollout-*.jsonl` files under a Codex `sessions/` tree, newest mtime first. */
-function walkRollouts(root: string, cap: number): string[] {
+/** Recursively collect `rollout-*.jsonl` files under a Codex `sessions/` tree, newest mtime first.
+ * ASYNC (fs.promises) so a deep sessions/ tree never blocks the hub's event loop mid-scan. */
+async function walkRollouts(root: string, cap: number): Promise<string[]> {
   const found: { file: string; mtimeMs: number }[] = []
   const stack = [root]
   while (stack.length) {
     const dir = stack.pop() as string
     let entries: fs.Dirent[]
     try {
-      entries = fs.readdirSync(dir, { withFileTypes: true })
+      entries = await fs.promises.readdir(dir, { withFileTypes: true })
     } catch {
       continue
     }
@@ -364,7 +371,8 @@ function walkRollouts(root: string, cap: number): string[] {
       if (entry.isDirectory()) stack.push(full)
       else if (entry.isFile() && entry.name.startsWith('rollout-') && entry.name.endsWith('.jsonl')) {
         try {
-          found.push({ file: full, mtimeMs: fs.statSync(full).mtimeMs })
+          const st = await fs.promises.stat(full)
+          found.push({ file: full, mtimeMs: st.mtimeMs })
         } catch {
           /* vanished mid-walk — ignore */
         }
@@ -384,10 +392,9 @@ async function discoverCodexChats(
   const chats: ImportableChat[] = []
   const warnings: string[] = []
   const sessionsDir = path.join(profile.dir, 'sessions')
-  if (!fs.existsSync(sessionsDir)) return { chats, warnings }
-  for (const full of walkRollouts(sessionsDir, maxFiles)) {
+  for (const full of await walkRollouts(sessionsDir, maxFiles)) {
     try {
-      const st = fs.statSync(full)
+      const st = await fs.promises.stat(full)
       const { records } = await readJsonlBounded(full, ctx.maxBytes)
       const parsed = parseCodexRecords(records)
       if (!parsed.cwd || !cwdMatches(parsed.cwd, target) || ctx.isExcluded(parsed.cwd)) continue
