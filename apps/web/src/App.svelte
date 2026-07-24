@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { store } from './lib/store.svelte'
+  import { store, type DropZone } from './lib/store.svelte'
   import Sidebar from './lib/Sidebar.svelte'
   import ThreadView from './lib/ThreadView.svelte'
   import SettingsModal from './lib/SettingsModal.svelte'
@@ -105,38 +105,74 @@
   // Drag a chat from the sidebar into the pane area → compute a live drop zone from where the
   // cursor sits inside the hovered pane: left/right third → new column; top/bottom third → new
   // row. The middle falls back to appending a column to the hovered row.
+  //
+  // Geometry is FROZEN at the first dragover: once a ghost is shown it reflows the panes, which
+  // would shift the rects we measure and make the chosen zone oscillate (the "jittery" bug). By
+  // measuring against a snapshot taken before any ghost exists, the zone is stable, and we only
+  // reassign dropZone when the target cell actually changes.
+  interface RowGeom { bottom: number; panes: { left: number; right: number; top: number; bottom: number }[] }
+  let dragGeom: RowGeom[] | null = null
+
+  function captureGeom(): RowGeom[] {
+    const rows = panesEl ? [...panesEl.querySelectorAll<HTMLElement>('.prow')] : []
+    return rows.map((rowEl) => ({
+      bottom: rowEl.getBoundingClientRect().bottom,
+      panes: [...rowEl.querySelectorAll<HTMLElement>('.pane')].map((p) => {
+        const b = p.getBoundingClientRect()
+        return { left: b.left, right: b.right, top: b.top, bottom: b.bottom }
+      }),
+    }))
+  }
+  function sameZone(a: DropZone | null, b: DropZone | null): boolean {
+    if (!a || !b) return a === b
+    if (a.kind !== b.kind) return false
+    if (a.kind === 'row' && b.kind === 'row') return a.row === b.row
+    if (a.kind === 'col' && b.kind === 'col') return a.row === b.row && a.col === b.col
+    return false
+  }
+  function setZone(zone: DropZone): void {
+    if (!sameZone(zone, store.dropZone)) store.dropZone = zone
+  }
+
+  // Drop the frozen snapshot whenever a drag ends, from any source.
+  $effect(() => {
+    if (!store.dragSession) dragGeom = null
+  })
+
   function onDragOver(e: DragEvent): void {
     if (!store.dragSession) return
     e.preventDefault()
-    const rowEls = panesEl ? [...panesEl.querySelectorAll<HTMLElement>('.prow')] : []
-    if (rowEls.length === 0) {
-      store.dropZone = { kind: 'col', row: 0, col: 0 }
+    if (!panesEl) {
+      setZone({ kind: 'col', row: 0, col: 0 })
       return
     }
-    let r = rowEls.length - 1
-    for (let i = 0; i < rowEls.length; i++) {
-      if (e.clientY < rowEls[i]!.getBoundingClientRect().bottom) { r = i; break }
+    if (!dragGeom) dragGeom = captureGeom()
+    const geom = dragGeom
+    if (geom.length === 0) return
+    let r = geom.length - 1
+    for (let i = 0; i < geom.length; i++) {
+      if (e.clientY < geom[i]!.bottom) { r = i; break }
     }
-    const paneEls = [...rowEls[r]!.querySelectorAll<HTMLElement>('.pane')]
-    let c = paneEls.length - 1
-    let prect = paneEls[c]?.getBoundingClientRect()
-    for (let i = 0; i < paneEls.length; i++) {
-      const rect = paneEls[i]!.getBoundingClientRect()
-      if (e.clientX < rect.right) { c = i; prect = rect; break }
+    const panes = geom[r]!.panes
+    let c = panes.length - 1
+    let prect = panes[c]
+    for (let i = 0; i < panes.length; i++) {
+      if (e.clientX < panes[i]!.right) { c = i; prect = panes[i]; break }
     }
-    const fx = prect ? (e.clientX - prect.left) / (prect.width || 1) : 0.5
-    const fy = prect ? (e.clientY - prect.top) / (prect.height || 1) : 0.5
-    if (fx < 0.34) store.dropZone = { kind: 'col', row: r, col: c }
-    else if (fx > 0.66) store.dropZone = { kind: 'col', row: r, col: c + 1 }
-    else if (fy < 0.34) store.dropZone = { kind: 'row', row: r }
-    else if (fy > 0.66) store.dropZone = { kind: 'row', row: r + 1 }
-    else store.dropZone = { kind: 'col', row: r, col: c + 1 }
+    const fx = prect ? (e.clientX - prect.left) / ((prect.right - prect.left) || 1) : 0.5
+    const fy = prect ? (e.clientY - prect.top) / ((prect.bottom - prect.top) || 1) : 0.5
+    if (fx < 0.34) setZone({ kind: 'col', row: r, col: c })
+    else if (fx > 0.66) setZone({ kind: 'col', row: r, col: c + 1 })
+    else if (fy < 0.34) setZone({ kind: 'row', row: r })
+    else if (fy > 0.66) setZone({ kind: 'row', row: r + 1 })
+    else setZone({ kind: 'col', row: r, col: c + 1 })
   }
   function onDrop(e: DragEvent): void {
     const id = store.dragSession
     if (!id) return
     e.preventDefault()
     if (store.dropZone) store.dropAt(store.dropZone, id)
+    dragGeom = null
     store.endDragSession()
   }
 </script>

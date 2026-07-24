@@ -12,6 +12,63 @@ export interface CodexTurnOptions {
   approvalPolicy?: string
 }
 
+/** Normalized token usage forwarded to the UI as a `session/tokens` event (all fields optional). */
+export interface TokenUsage {
+  input?: number
+  output?: number
+  total?: number
+  context?: number
+}
+
+function numField(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+/**
+ * Map a Codex app-server `thread/tokenUsage/updated` notification's params to the hub's normalized
+ * token shape. The exact field names vary by installed app-server version, so this probes both a
+ * nested usage object (`params.usage` / `tokenUsage` / `tokens` / `info`) and the flat params, in
+ * camelCase and snake_case, and never throws on missing fields. Returns undefined when nothing
+ * usable is present. The raw notification is still journaled as `codex/thread/tokenUsage/updated`,
+ * so the live wire shape can be sanity-checked and this mapping widened if the names differ.
+ */
+export function mapCodexTokenUsage(params: unknown): TokenUsage | undefined {
+  if (!params || typeof params !== 'object') return undefined
+  const p = params as Record<string, unknown>
+  const nested = [p.usage, p.tokenUsage, p.tokens, p.info].find(
+    (v): v is Record<string, unknown> => !!v && typeof v === 'object'
+  )
+  const pick = (...keys: string[]): number | undefined => {
+    for (const src of [nested, p]) {
+      if (!src) continue
+      for (const key of keys) {
+        const n = numField(src[key])
+        if (n !== undefined) return n
+      }
+    }
+    return undefined
+  }
+  const input = pick('input_tokens', 'inputTokens', 'input', 'prompt_tokens', 'promptTokens')
+  const output = pick('output_tokens', 'outputTokens', 'output', 'completion_tokens', 'completionTokens')
+  let total = pick('total_tokens', 'totalTokens', 'total', 'total_token_usage', 'totalTokenUsage')
+  if (total === undefined && input !== undefined && output !== undefined) total = input + output
+  const context = pick(
+    'context_window',
+    'contextWindow',
+    'context',
+    'context_tokens',
+    'contextTokens',
+    'used_context_window',
+    'usedContextWindow'
+  )
+  const out: TokenUsage = {}
+  if (input !== undefined) out.input = input
+  if (output !== undefined) out.output = output
+  if (total !== undefined) out.total = total
+  if (context !== undefined) out.context = context
+  return Object.keys(out).length > 0 ? out : undefined
+}
+
 interface Pending {
   method: string
   resolve: (value: unknown) => void

@@ -1,4 +1,4 @@
-import { api } from './api'
+import { api, HUB_WS } from './api'
 import { settings } from './settings.svelte'
 import type { ApprovalRecord, HubEvent, ProfileInfo, ProjectInfo, SessionRecord, UsageSnapshot } from './api'
 
@@ -31,6 +31,11 @@ export interface SessionView {
   contextUsed?: number
   contextWindow?: number
   costUsd?: number
+  // When the current in-flight turn began (ms epoch); undefined when idle. Drives the
+  // "received / thinking" indicator + elapsed timer.
+  turnStartedAt?: number
+  // Latest token usage the provider reported for the running turn (realtime counter).
+  liveTokens?: { input?: number; output?: number; total?: number }
 }
 
 interface ClaudeBlock {
@@ -145,25 +150,38 @@ class HubStore {
     return this.profiles[0]?.id
   }
 
+  // Guards against a second spawn while one is in flight — rapid + clicks were creating
+  // multiple agents. Not $state; it's a control flag, not rendered.
+  private creating = false
+
   // Open an empty chat immediately — no prompt up front; the composer configures the rest.
   // Applies the user's settings defaults (permission mode, default model per provider).
   async newSession(profileId?: string, projectId?: string): Promise<void> {
+    if (this.creating) return
     const pid = profileId ?? this.defaultProfileId()
     if (!pid) {
       this.settingsOpen = true
       return
     }
-    const profile = this.profiles.find((p) => p.id === pid)
-    const model = profile?.provider === 'codex' ? settings.defaultCodexModel : settings.defaultClaudeModel
-    const body: Record<string, unknown> = { profileId: pid, permissionMode: settings.defaultPermissionMode }
-    if (projectId) body.projectId = projectId
-    if (model) body.model = model
-    const out = await api.spawn(body)
-    if (out && !('error' in out)) {
-      this.lastProfileId = pid
-      this.select((out as { id: string }).id)
-    } else if (out && 'error' in out) {
-      alert(out.error)
+    this.creating = true
+    try {
+      const profile = this.profiles.find((p) => p.id === pid)
+      const model = profile?.provider === 'codex' ? settings.defaultCodexModel : settings.defaultClaudeModel
+      const body: Record<string, unknown> = { profileId: pid, permissionMode: settings.defaultPermissionMode }
+      if (projectId) body.projectId = projectId
+      if (model) body.model = model
+      const out = await api.spawn(body)
+      if (out && !('error' in out)) {
+        // Seed the view optimistically so we navigate to the new chat right away instead of
+        // racing the session/created event (that race was the "didn't take me there" symptom).
+        this.ensure(out as SessionRecord)
+        this.lastProfileId = pid
+        this.select((out as { id: string }).id)
+      } else if (out && 'error' in out) {
+        alert(out.error)
+      }
+    } finally {
+      this.creating = false
     }
   }
 
@@ -255,6 +273,41 @@ class HubStore {
     this.usage = await api.usage()
   }
 
+  // Optimistically mark a turn as started the instant the user sends — immediate "received /
+  // thinking" feedback, before the hub's first status event lands. Resets the live token count.
+  noteSent(sessionId: string): void {
+    const v = this.sessions[sessionId]
+    if (!v) return
+    v.turnStartedAt = Date.now()
+    v.liveTokens = undefined
+  }
+
+  // Delete a chat: tell the hub (which stops it + writes a tombstone), then drop it locally.
+  async deleteSession(id: string): Promise<void> {
+    await api.deleteSession(id).catch(() => undefined)
+    this.removeSessionLocal(id)
+  }
+
+  // Remove a session from all local state: the roster, its queue, any panes it occupies, and
+  // the selection. Idempotent — also runs when a `session/deleted` event arrives from the hub.
+  private removeSessionLocal(id: string): void {
+    if (this.sessions[id]) {
+      const { [id]: _drop, ...rest } = this.sessions
+      this.sessions = rest
+    }
+    if (this.queues[id]) {
+      const { [id]: _q, ...restQ } = this.queues
+      this.queues = restQ
+    }
+    if (this.splitPanes.length) {
+      const rows = this.splitPanes.map((r) => r.filter((x) => x !== id))
+      this.commit(rows)
+    }
+    if (!this.selectedId || !this.sessions[this.selectedId]) {
+      this.selectedId = this.splitPanes[0]?.[0] ?? this.sessionList[0]?.record.id ?? null
+    }
+  }
+
   private ensure(record: SessionRecord): SessionView {
     const existing = this.sessions[record.id]
     if (existing) {
@@ -271,9 +324,13 @@ class HubStore {
     view.lastActivity = ts
   }
 
+  private wsBase(): string {
+    // Desktop app → loopback hub directly; browser (dev) → same origin, proxied by Vite.
+    return HUB_WS || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`
+  }
+
   private connect(): void {
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-    const ws = new WebSocket(`${proto}://${location.host}/ws?since=0`)
+    const ws = new WebSocket(`${this.wsBase()}/ws?since=0`)
     this.ws = ws
     ws.onopen = () => {
       this.connected = true
@@ -289,8 +346,7 @@ class HubStore {
   }
 
   private reconnect(): void {
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-    const ws = new WebSocket(`${proto}://${location.host}/ws?since=${this.lastSeq}`)
+    const ws = new WebSocket(`${this.wsBase()}/ws?since=${this.lastSeq}`)
     this.ws = ws
     ws.onopen = () => {
       this.connected = true
@@ -320,6 +376,10 @@ class HubStore {
       this.ensure(payload as SessionRecord)
       return
     }
+    if (kind === 'session/deleted') {
+      this.removeSessionLocal((payload as { id?: string }).id ?? sessionId)
+      return
+    }
     const view = this.sessions[sessionId]
     if (!view) {
       // event for a session we haven't seen created yet — fetch the roster lazily
@@ -334,6 +394,13 @@ class HubStore {
         const status = (payload as { status: string }).status
         view.record.status = status
         this.push(view, { kind: 'status', ts, status })
+        // Turn timing for the thinking indicator: a turn is in flight while active/starting,
+        // settled otherwise. Keep an already-set start time (from the optimistic send).
+        if (status === 'active' || status === 'starting') {
+          if (view.turnStartedAt == null) view.turnStartedAt = Date.now()
+        } else if (status === 'idle' || status === 'error' || status === 'stopped') {
+          view.turnStartedAt = undefined
+        }
         // Flush on idle (turn done) or error (so queued messages aren't orphaned).
         if (status === 'idle' || status === 'error') this.flushQueue(sessionId)
         break
@@ -372,6 +439,7 @@ class HubStore {
         }
         if (p.is_error) this.push(view, { kind: 'error', ts, text: p.result })
         view.lastTurnOk = !p.is_error
+        view.turnStartedAt = undefined
         if (typeof p.total_cost_usd === 'number') view.costUsd = (view.costUsd ?? 0) + p.total_cost_usd
         if (p.modelUsage) {
           let best: { used: number; window: number } | null = null
@@ -396,6 +464,13 @@ class HubStore {
       case 'codex/turn/completed': {
         const status = (payload as { turn?: { status?: string } }).turn?.status
         view.lastTurnOk = status === 'completed' || status === undefined
+        view.turnStartedAt = undefined
+        break
+      }
+      case 'session/tokens': {
+        const p = payload as { input?: number; output?: number; total?: number }
+        const sum = (p.input ?? 0) + (p.output ?? 0)
+        view.liveTokens = { input: p.input, output: p.output, total: p.total ?? (sum > 0 ? sum : undefined) }
         break
       }
       case 'codex/item/completed':
@@ -558,8 +633,8 @@ class HubStore {
     const total = cleaned.reduce((n, r) => n + r.length, 0)
     if (total <= 1) {
       this.splitPanes = []
-      const only = cleaned[0]?.[0]
-      if (only) this.selectedId = only
+      // Collapse to the single remaining pane, or clear to the dashboard when the last closes.
+      this.selectedId = cleaned[0]?.[0] ?? null
     } else {
       this.splitPanes = cleaned
       this.selectedId = cleaned[0]?.[0] ?? this.selectedId

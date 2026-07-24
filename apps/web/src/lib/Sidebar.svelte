@@ -107,6 +107,12 @@
     if (verb === 'interrupt') await api.interrupt(id)
     else await api.stop(id)
   }
+
+  async function del(e: MouseEvent, id: string, name: string): Promise<void> {
+    e.stopPropagation()
+    if (!confirm(`Delete "${name}"? This ends the session and removes the chat from the hub.`)) return
+    await store.deleteSession(id)
+  }
 </script>
 
 <div class="sidebar">
@@ -181,6 +187,7 @@
             <span class="ractions">
               <button class="mini" title="interrupt" onclick={(e) => act(e, s.record.id, 'interrupt')}>◼</button>
               <button class="mini" title="stop" onclick={(e) => act(e, s.record.id, 'stop')}>✕</button>
+              <button class="mini del" title="delete chat" onclick={(e) => del(e, s.record.id, label(s))}><Icon name="trash" size={12} /></button>
             </span>
           </div>
         {/each}
@@ -262,6 +269,8 @@
   .row:hover .rtime { display: none; }
   .mini { color: var(--dim); font-size: 0.7rem; width: 18px; height: 18px; border-radius: 4px; }
   .mini:hover { background: var(--surface-3); color: var(--text); }
+  .mini.del { display: grid; place-items: center; }
+  .mini.del:hover { background: var(--surface-3); color: var(--bad-text); }
   .empty { padding: 1rem 0.7rem; text-align: center; font-size: 0.8rem; }
   .footer { border-top: 1px solid var(--border); padding: 0.4rem 0.7rem 0.6rem; max-height: 42vh; overflow-y: auto; }
   .foot-bar { display: flex; align-items: center; }

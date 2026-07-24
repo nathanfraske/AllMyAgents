@@ -63,7 +63,10 @@ function defaultSocketPath(): string {
  */
 function roundTrip(socketPath: string, cmd: string, args: unknown, timeoutMs: number): Promise<WireResponse> {
   return new Promise((resolve, reject) => {
+    const t0 = Date.now()
+    const dbg = process.env.MESH_DEBUG ? (m: string) => console.log(`[mesh:rt:${cmd}] +${Date.now() - t0}ms ${m}`) : undefined
     const sock = net.connect(socketPath)
+    dbg?.('connecting')
     let settled = false
     let buf = Buffer.alloc(0)
 
@@ -75,9 +78,13 @@ function roundTrip(socketPath: string, cmd: string, args: unknown, timeoutMs: nu
       if (err) reject(err)
       else resolve(value as WireResponse)
     }
-    const timer = setTimeout(() => finish(new Error('mesh: control-socket timeout')), timeoutMs)
+    const timer = setTimeout(() => {
+      dbg?.('TIMEOUT')
+      finish(new Error('mesh: control-socket timeout'))
+    }, timeoutMs)
 
     sock.on('connect', () => {
+      dbg?.('connected; writing request')
       const payload = Buffer.from(JSON.stringify({ cmd, args: args ?? {} }), 'utf8')
       const frame = Buffer.allocUnsafe(4 + 1 + payload.length)
       frame.writeUInt32BE(payload.length + 1, 0) // length counts the tag byte
@@ -86,6 +93,7 @@ function roundTrip(socketPath: string, cmd: string, args: unknown, timeoutMs: nu
       sock.write(frame)
     })
     sock.on('data', (chunk: Buffer) => {
+      dbg?.(`data +${chunk.length}b`)
       buf = Buffer.concat([buf, chunk])
       // Drain whole frames; resolve on the first JSON frame, skip any pushed event/restart frames.
       while (buf.length >= 4) {
@@ -105,8 +113,14 @@ function roundTrip(socketPath: string, cmd: string, args: unknown, timeoutMs: nu
         // tag 2 (event) / 3 (restart) — ignore, keep draining for the response frame.
       }
     })
-    sock.on('error', (err) => finish(err))
-    sock.on('close', () => finish(new Error('mesh: control socket closed before a response')))
+    sock.on('error', (err) => {
+      dbg?.(`error ${(err as NodeJS.ErrnoException).code ?? ''} ${err.message}`)
+      finish(err)
+    })
+    sock.on('close', () => {
+      dbg?.('close before response')
+      finish(new Error('mesh: control socket closed before a response'))
+    })
   })
 }
 
@@ -160,19 +174,38 @@ export class MeshSite {
    */
   async register(): Promise<MeshStatus> {
     if (!this.enabled) return this.update({ nodePresent: false, exposed: false, error: 'mesh exposure disabled' })
-    try {
-      const cur = await roundTrip(this.socketPath, 'site_exposed', {}, 3000)
-      if (!cur.ok) return this.update({ nodePresent: true, exposed: false, error: cur.error ?? 'site_exposed failed' })
-      const exposed: Record<string, string> = { ...((cur.result as Record<string, string>) ?? {}) }
-      exposed[this.siteId()] = this.label
-      const set = await roundTrip(this.socketPath, 'site_set_exposed', { exposed }, 3000)
-      if (!set.ok) return this.update({ nodePresent: true, exposed: false, error: set.error ?? 'site_set_exposed failed' })
-      const now = (set.result as Record<string, string>) ?? exposed
-      return this.update({ nodePresent: true, exposed: this.siteId() in now, error: undefined })
-    } catch (e) {
-      // ENOENT / ECONNREFUSED etc. — no node here. Never throw, never spawn one.
-      return this.update({ nodePresent: false, exposed: false, error: describe(e) })
+    // Retry with backoff: a freshly-started hub can be busy enough (restoring sessions, spawning
+    // vendor children) that the first control-socket round-trip times out even though the node is
+    // healthy — the pipe answers in ~1ms once the hub settles. A few attempts with a generous
+    // timeout makes auto-exposure reliable on a cold start.
+    let lastErr = 'unknown'
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      try {
+        const cur = await roundTrip(this.socketPath, 'site_exposed', {}, 10000)
+        if (!cur.ok) {
+          lastErr = cur.error ?? 'site_exposed failed'
+          break // the node answered but refused — retrying won't help
+        }
+        const exposed: Record<string, string> = { ...((cur.result as Record<string, string>) ?? {}) }
+        exposed[this.siteId()] = this.label
+        const set = await roundTrip(this.socketPath, 'site_set_exposed', { exposed }, 10000)
+        if (!set.ok) {
+          lastErr = set.error ?? 'site_set_exposed failed'
+          break
+        }
+        const now = (set.result as Record<string, string>) ?? exposed
+        return this.update({ nodePresent: true, exposed: this.siteId() in now, error: undefined })
+      } catch (e) {
+        lastErr = describe(e)
+        // A definitive "no node here" — don't retry or spawn one.
+        const code = (e as NodeJS.ErrnoException).code
+        if (code === 'ENOENT' || code === 'ECONNREFUSED') {
+          return this.update({ nodePresent: false, exposed: false, error: lastErr })
+        }
+        if (attempt < 4) await new Promise((r) => setTimeout(r, 750 * attempt))
+      }
     }
+    return this.update({ nodePresent: false, exposed: false, error: lastErr })
   }
 
   /** Best-effort removal of our port from the exposed map (on shutdown or disable). */

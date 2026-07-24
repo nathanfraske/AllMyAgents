@@ -8,7 +8,7 @@ import type { UsageMonitor } from './usage.js'
 import type { WorkspaceManager } from './workspace.js'
 import type { ClaudeLimitInfo, Profile, SessionRecord, SessionStatus } from './types.js'
 import { ClaudeDriver } from './adapters/claude.js'
-import { CodexClient } from './adapters/codex.js'
+import { CodexClient, mapCodexTokenUsage } from './adapters/codex.js'
 
 export interface CreateOptions {
   cwd?: string
@@ -60,6 +60,10 @@ export class SessionManager {
   }
 
   private persist(record: SessionRecord): void {
+    // A turn that was interrupted by delete() can unwind and try to persist after the session was
+    // already removed from the map + store. Don't let that resurrect a deleted session. (boot() and
+    // create() populate the map before persisting, so this never blocks a legitimate write.)
+    if (!this.sessions.has(record.id)) return
     this.store.upsert(record)
   }
 
@@ -105,6 +109,12 @@ export class SessionManager {
           const record = threadId ? this.sessionForThread(threadId) : undefined
           this.journal.append(record?.id ?? null, kind, payload)
           if (record && kind === 'codex/turn/completed') this.setStatus(record, 'idle')
+          // Forward the app-server's token-usage notifications to the UI's live counter. The raw
+          // `codex/thread/tokenUsage/updated` event is still journaled above for field verification.
+          if (record && kind === 'codex/thread/tokenUsage/updated') {
+            const tokens = mapCodexTokenUsage(payload)
+            if (tokens) this.journal.append(record.id, 'session/tokens', tokens)
+          }
         },
         async (method, params) => {
           const threadId = (params as { threadId?: string } | null)?.threadId
@@ -315,6 +325,27 @@ export class SessionManager {
       this.journal.append(sessionId, 'session/worktree-removed', { worktree: record.worktree })
     }
     this.setStatus(record, 'stopped')
+  }
+
+  // Delete a chat/session for good. Idempotent: an unknown id returns ok:false (404-style) and
+  // never throws. The journal is append-only, so the delete is recorded as a `session/deleted`
+  // tombstone rather than by removing rows; SessionStore.remove drops the persisted snapshot that
+  // boot() restores from, so a hub restart won't resurrect it.
+  async delete(sessionId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+    const record = this.sessions.get(sessionId)
+    if (!record) return { ok: false, error: `unknown session: ${sessionId}` }
+    // 1. End any running turn and tear down the worktree via the existing stop path.
+    await this.stop(sessionId).catch(() => undefined)
+    // 2. Tombstone the session in the append-only journal.
+    this.journal.append(sessionId, 'session/deleted', { id: sessionId })
+    // 3. Drop it from the in-memory maps so list() no longer returns it. codexClients is keyed by
+    //    profile and shared across sessions, so it is deliberately left intact.
+    this.sessions.delete(sessionId)
+    this.claudeDrivers.delete(sessionId)
+    this.codexThreads.delete(sessionId)
+    // 4. Remove it from the persisted snapshot so a hub restart doesn't resurrect it.
+    this.store.remove(sessionId)
+    return { ok: true }
   }
 
   readCodexLimits(profileId: string): Promise<unknown> {

@@ -170,6 +170,19 @@ function str(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
+// The hub has full control and (for now) no auth, so a browser request from an unknown web
+// origin must be refused — otherwise any site the user visits could drive the loopback hub
+// (spawn a full-access agent, read the journal). Allowed: no Origin (curl / non-browser /
+// same-origin navigations), the packaged desktop app (tauri.localhost), and any LOOPBACK origin
+// — the dev server, the hub's own served UI, and mesh peers, which all reach it via localhost.
+// A drive-by page's Origin is its own domain, never loopback, so this closes the CSRF/RCE vector.
+// (A real device token — DESIGN D12/D13.1 — is the follow-up; this is the immediate guard.)
+function originAllowed(origin: string | undefined): boolean {
+  if (!origin) return true
+  if (origin === 'http://tauri.localhost' || origin === 'https://tauri.localhost') return true
+  return /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)
+}
+
 export interface ServerOptions {
   port: number
   defaultCwd: string
@@ -196,6 +209,24 @@ export function startServer(opts: ServerOptions): http.Server {
     try {
       const url = new URL(req.url ?? '/', 'http://localhost')
       const { method } = req
+      const origin = req.headers.origin
+      // Refuse browser requests from unknown web origins (drive-by CSRF/RCE guard — see
+      // originAllowed). Non-browser and same-origin callers send no Origin and pass through.
+      if (!originAllowed(origin)) {
+        json(res, { error: 'forbidden origin' }, 403)
+        return
+      }
+      if (origin) {
+        res.setHeader('Access-Control-Allow-Origin', origin)
+        res.setHeader('Vary', 'Origin')
+        res.setHeader('Access-Control-Allow-Headers', 'content-type')
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+      }
+      if (method === 'OPTIONS') {
+        res.writeHead(204)
+        res.end()
+        return
+      }
       if (method === 'GET' && url.pathname === '/') {
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
         res.end(PAGE)
@@ -356,6 +387,12 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, { ok: true })
         return
       }
+      const deleteMatch = /^\/api\/sessions\/([^/]+)\/delete$/.exec(url.pathname)
+      if (method === 'POST' && deleteMatch) {
+        const result = await sessions.delete(deleteMatch[1] as string)
+        json(res, result, result.ok ? 200 : 404)
+        return
+      }
       const sessionAction = /^\/api\/sessions\/([^/]+)\/(input|interrupt|stop)$/.exec(url.pathname)
       if (method === 'POST' && sessionAction) {
         const id = sessionAction[1] as string
@@ -381,7 +418,9 @@ export function startServer(opts: ServerOptions): http.Server {
     }
   }
 
-  const wss = new WebSocketServer({ server, path: '/ws' })
+  // Same origin guard for the event stream — a foreign page must not be able to open /ws and
+  // read the journal. Non-browser clients (no Origin) and loopback/desktop origins are allowed.
+  const wss = new WebSocketServer({ server, path: '/ws', verifyClient: (info: { origin?: string }) => originAllowed(info.origin) })
   wss.on('connection', (ws, req) => {
     const url = new URL(req.url ?? '/ws', 'http://localhost')
     for (const event of journal.since(Number(url.searchParams.get('since') ?? 0))) {

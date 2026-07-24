@@ -48,8 +48,26 @@
     return ctx + Math.ceil(draft.length / 4)
   })
 
+  // "Received / thinking" indicator: a turn is in flight while turnStartedAt is set. A ticking
+  // clock drives the elapsed readout; it only runs while thinking (torn down otherwise).
+  const thinking = $derived(!!view && view.turnStartedAt != null)
+  const liveTok = $derived(view?.liveTokens)
+  let now = $state(Date.now())
+  $effect(() => {
+    if (!thinking) return
+    const iv = setInterval(() => (now = Date.now()), 250)
+    return () => clearInterval(iv)
+  })
+  const elapsedMs = $derived(thinking && view?.turnStartedAt ? Math.max(0, now - view.turnStartedAt) : 0)
+  function fmtElapsed(ms: number): string {
+    const s = Math.floor(ms / 1000)
+    if (s < 60) return `${s}s`
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
+  }
+
   $effect(() => {
     view?.items.length
+    void thinking // also keep pinned to bottom when the thinking row appears
     if (stick && scroller) scroller.scrollTop = scroller.scrollHeight
   })
 
@@ -80,6 +98,7 @@
       return
     }
     stick = true
+    store.noteSent(view.record.id) // immediate "received / thinking" feedback
     const out = await api.send(view.record.id, body, {
       model: model || undefined,
       effort: options.effort ?? undefined,
@@ -130,14 +149,21 @@
     <span class="spacer"></span>
     {#if view.record.worktree}<span class="wt dim">⑂ {view.record.worktree.split(/[\\/]/).pop()}</span>{/if}
     <button class="hicon" title="split view" onclick={() => store.startSplit()}><Icon name="columns" size={15} /></button>
-    {#if multiPane}<button class="hicon" title="close pane" onclick={() => store.closePane(paneIndex)}><Icon name="x" size={15} /></button>{/if}
+    <button class="hicon" title="close (keeps the chat)" onclick={() => store.closePane(paneIndex)}><Icon name="x" size={15} /></button>
   </div>
 
   <div class="stream scroll" bind:this={scroller} onscroll={onScroll}>
     {#each view.items as item (item.key)}
       <ItemCard {item} />
     {/each}
-    {#if view.items.length === 0}<div class="dim pad">no activity yet — send a message below</div>{/if}
+    {#if view.items.length === 0 && !thinking}<div class="dim pad">no activity yet — send a message below</div>{/if}
+    {#if thinking}
+      <div class="thinking">
+        <span class="dots"><i></i><i></i><i></i></span>
+        <span class="tlabel">thinking</span>
+        <span class="tmeta">{fmtElapsed(elapsedMs)}{#if liveTok?.total} · {fmtTokens(liveTok.total)} tokens{/if}</span>
+      </div>
+    {/if}
   </div>
 
   <div class="composer-wrap">
@@ -211,6 +237,17 @@
   .stream { flex: 1; display: flex; flex-direction: column; gap: 0.55rem; padding: 1rem 1.1rem; max-width: 900px; width: 100%; margin: 0 auto; }
   @media (prefers-reduced-motion: no-preference) { .stream > :global(*) { animation: fade-in 0.22s var(--ease); } }
   .pad { padding: 1rem 0; }
+  .thinking { display: flex; align-items: center; gap: 0.5rem; padding: 0.2rem 0.15rem; }
+  .thinking .dots { display: inline-flex; gap: 3px; }
+  .thinking .dots i { width: 5px; height: 5px; border-radius: 50%; background: var(--working); }
+  .tlabel { color: var(--working); font-size: 0.84rem; }
+  .tmeta { color: var(--dim); font-family: var(--mono); font-size: 0.74rem; }
+  @media (prefers-reduced-motion: no-preference) {
+    .thinking .dots i { animation: tbounce 1.1s var(--ease) infinite; }
+    .thinking .dots i:nth-child(2) { animation-delay: 0.15s; }
+    .thinking .dots i:nth-child(3) { animation-delay: 0.3s; }
+    @keyframes tbounce { 0%, 60%, 100% { opacity: 0.35; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-3px); } }
+  }
   .composer-wrap { padding: 0.5rem 1rem 0.7rem; max-width: 900px; width: 100%; margin: 0 auto; }
   .approval { background: var(--surface); border: 1px solid var(--warn); border-radius: 10px; padding: 0.5rem 0.7rem; margin-bottom: 0.5rem; }
   .atop { display: flex; gap: 0.5rem; align-items: center; }

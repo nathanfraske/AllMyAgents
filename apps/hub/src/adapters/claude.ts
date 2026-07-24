@@ -20,6 +20,10 @@ const THINKING_KEYWORD: Record<string, string> = {
   ultrathink: 'ultrathink',
 }
 
+function numField(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
 export class ClaudeDriver {
   private vendorSessionId: string | undefined
   private active: { interrupt(): Promise<void> } | undefined
@@ -63,13 +67,39 @@ export class ClaudeDriver {
     this.active = q as unknown as { interrupt(): Promise<void> }
     try {
       for await (const message of q) {
-        const m = message as { type: string; session_id?: string }
+        const m = message as {
+          type: string
+          session_id?: string
+          usage?: unknown
+          message?: { usage?: unknown }
+        }
         if (typeof m.session_id === 'string') this.vendorSessionId = m.session_id
         this.onEvent(`claude/${m.type}`, message)
+        // Surface token usage to the UI's live counter as the turn streams. Assistant messages
+        // carry usage under `.message.usage` (the Anthropic API message); the final `result`
+        // message carries it at the top level. The SDK gives no total, so we derive it.
+        if (m.type === 'assistant') this.emitTokens(m.message?.usage)
+        else if (m.type === 'result') this.emitTokens(m.usage)
       }
     } finally {
       this.active = undefined
     }
+  }
+
+  // Best-effort: emit a `session/tokens` event from an Anthropic usage object. Fields are
+  // input_tokens/output_tokens (there is no total_tokens on Anthropic usage), so total is the
+  // sum of whichever of the two is present. No-op when the usage object carries neither.
+  private emitTokens(usage: unknown): void {
+    if (!usage || typeof usage !== 'object') return
+    const u = usage as Record<string, unknown>
+    const input = numField(u.input_tokens)
+    const output = numField(u.output_tokens)
+    if (input === undefined && output === undefined) return
+    const out: { input?: number; output?: number; total?: number } = {}
+    if (input !== undefined) out.input = input
+    if (output !== undefined) out.output = output
+    out.total = (input ?? 0) + (output ?? 0)
+    this.onEvent('session/tokens', out)
   }
 
   async interrupt(): Promise<void> {

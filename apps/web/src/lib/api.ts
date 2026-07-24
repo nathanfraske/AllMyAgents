@@ -73,13 +73,21 @@ export interface HubEvent {
   payload: unknown
 }
 
+// In the packaged desktop app the frontend is served from tauri.localhost, so relative URLs
+// never reach the hub. Detect the Tauri webview and target the loopback hub directly. In the
+// browser (dev) the base stays empty and Vite's proxy forwards /api and /ws to the hub.
+const inTauri =
+  typeof window !== 'undefined' && ('__TAURI_INTERNALS__' in window || '__TAURI__' in window)
+export const HUB_HTTP = inTauri ? 'http://127.0.0.1:7777' : ''
+export const HUB_WS = inTauri ? 'ws://127.0.0.1:7777' : ''
+
 async function jget<T>(url: string): Promise<T> {
-  const res = await fetch(url)
+  const res = await fetch(HUB_HTTP + url)
   return res.json() as Promise<T>
 }
 
 async function jpost<T>(url: string, body?: unknown): Promise<T> {
-  const res = await fetch(url, {
+  const res = await fetch(HUB_HTTP + url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: body ? JSON.stringify(body) : undefined,
@@ -145,6 +153,7 @@ export const api = {
     jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/steer`, { text }),
   interrupt: (id: string) => jpost(`/api/sessions/${id}/interrupt`),
   stop: (id: string) => jpost(`/api/sessions/${id}/stop`),
+  deleteSession: (id: string) => jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/delete`),
   setMode: (id: string, permissionMode: string) => jpost(`/api/sessions/${id}/mode`, { permissionMode }),
   decide: (id: string, approve: boolean) => jpost(`/api/approvals/${id}`, { approve }),
   mesh: () => jget<MeshStatus>('/api/mesh'),

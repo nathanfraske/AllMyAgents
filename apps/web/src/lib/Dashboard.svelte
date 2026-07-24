@@ -91,7 +91,7 @@
 
 <div class="dashwrap scroll">
   <div class="dash">
-    <div class="main">
+    <div class="top">
       {#if store.lastLayout}
         <button class="back" onclick={() => store.goBack()}>← back to your chats</button>
       {/if}
@@ -119,7 +119,9 @@
           <div class="prov"><ProviderLogo provider="codex" size={13} /> {codexCount}</div>
         </div>
       </div>
+    </div>
 
+    <div class="left">
       <section class="card">
         <h3>Daily usage — click a day for the full breakdown</h3>
         {#if days.length === 0}
@@ -157,28 +159,30 @@
 
     <aside class="detail">
       <h3>Day detail</h3>
-      {#if selectedDay}
-        <div class="dhead">{fullDate(selectedDay.date)}</div>
-        <div class="dstats">
-          <div class="dstat"><div class="num">{selectedDay.turns}</div><div class="lbl dim">turns</div></div>
-          <div class="dstat"><div class="num">${selectedDay.cost.toFixed(2)}</div><div class="lbl dim">spend</div></div>
-        </div>
-        {#if selectedDay.turns === 0}
-          <div class="dim empty2">No activity on this day.</div>
-        {:else}
-          <div class="dbreak-h dim">By project</div>
-          <div class="dbreak">
-            {#each topProjects(selectedDay) as [name, p] (name)}
-              <div class="drow">
-                <span class="dn">{name}</span>
-                <span class="dv">{p.turns} turn{p.turns === 1 ? '' : 's'}{#if p.cost > 0} · ${p.cost.toFixed(2)}{/if}</span>
-              </div>
-            {/each}
+      <div class="dbody">
+        {#if selectedDay}
+          <div class="dhead">{fullDate(selectedDay.date)}</div>
+          <div class="dstats">
+            <div class="dstat"><div class="num">{selectedDay.turns}</div><div class="lbl dim">turns</div></div>
+            <div class="dstat"><div class="num">${selectedDay.cost.toFixed(2)}</div><div class="lbl dim">spend</div></div>
           </div>
+          {#if selectedDay.turns === 0}
+            <div class="dim empty2">No activity on this day.</div>
+          {:else}
+            <div class="dbreak-h dim">By project</div>
+            <div class="dbreak">
+              {#each topProjects(selectedDay) as [name, p] (name)}
+                <div class="drow">
+                  <span class="dn">{name}</span>
+                  <span class="dv">{p.turns} turn{p.turns === 1 ? '' : 's'}{#if p.cost > 0} · ${p.cost.toFixed(2)}{/if}</span>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        {:else}
+          <div class="dim empty2">Select a day to see its breakdown.</div>
         {/if}
-      {:else}
-        <div class="dim empty2">Select a day to see its breakdown.</div>
-      {/if}
+      </div>
     </aside>
   </div>
 </div>
@@ -198,15 +202,18 @@
 
 <style>
   .dashwrap { height: 100%; overflow-y: auto; container-type: inline-size; }
-  /* Two-column: dashboard content + a sticky day-detail panel that fills the empty space.
-     Collapses to a single column when the pane is narrow (container query, not viewport,
-     so it reacts to the resizable sidebar and split panes). */
+  /* Two-column composition: a full-width header row (greeting + stat tiles), then the
+     calendar/projects stack on the left paired with the day-detail panel on the right.
+     The detail panel stretches to fill the height of the left stack so the right side
+     no longer leaves a void. Collapses to a single column when the pane is narrow
+     (container query, not viewport, so it reacts to the resizable sidebar and split panes). */
   .dash { max-width: 1180px; margin: 0 auto; padding: 2rem 1.5rem;
-    display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 1.25rem; align-items: start; }
-  .main { min-width: 0; }
+    display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 1.25rem; align-items: start;
+    grid-template-areas: "top top" "left detail"; }
+  .top { grid-area: top; min-width: 0; }
+  .left { grid-area: left; min-width: 0; display: flex; flex-direction: column; gap: 1.25rem; }
   @container (max-width: 880px) {
-    .dash { grid-template-columns: minmax(0, 1fr); }
-    .detail { position: static; }
+    .dash { grid-template-columns: minmax(0, 1fr); grid-template-areas: "top" "left" "detail"; }
   }
   .back { color: var(--muted); border: 1px solid var(--border); border-radius: 8px; padding: 0.3rem 0.7rem; margin-bottom: 1.2rem; font-size: 0.82rem; }
   .back:hover { border-color: var(--accent); color: var(--text); }
@@ -217,13 +224,28 @@
   .nameask input { flex: 1; max-width: 320px; }
   .primary { background: var(--accent); color: #fff; border-radius: 8px; padding: 0.35rem 0.9rem; font-weight: 500; }
   .hero p { font-size: 0.85rem; margin: 0.4rem 0 0; }
-  .tiles { display: flex; gap: 0.6rem; flex-wrap: wrap; margin-bottom: 1.2rem; }
-  .tile { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 0.8rem 1rem; min-width: 100px; }
+  .tiles { display: flex; gap: 0.6rem; flex-wrap: wrap; }
+
+  /* Modern surface treatment shared by every card-like panel: a soft low-contrast border,
+     a faint top inner-highlight and a gentle layered drop shadow for depth, plus a barely
+     there top-down sheen. Tuned understated for the near-black CEC theme — no neon. */
+  .tile, .card, .detail {
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.025), rgba(255, 255, 255, 0) 55%),
+      var(--surface);
+    border: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
+    border-radius: 14px;
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.045),
+      0 1px 2px rgba(0, 0, 0, 0.28),
+      0 12px 30px -8px rgba(0, 0, 0, 0.32);
+  }
+  .tile { padding: 0.8rem 1rem; min-width: 100px; }
   .tile .num { font-size: 1.5rem; font-weight: 600; font-family: var(--mono); }
   .tile .lbl { font-size: 0.72rem; margin-top: 0.2rem; }
   .tile.split { display: flex; flex-direction: column; gap: 0.35rem; justify-content: center; }
   .prov { display: flex; align-items: center; gap: 0.4rem; font-family: var(--mono); font-size: 0.95rem; }
-  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 0.9rem 1rem; margin-bottom: 1rem; }
+  .card { padding: 0.9rem 1rem; min-width: 0; }
   .card h3, .detail h3 { margin: 0 0 0.8rem; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--dim); }
   .cal { display: grid; grid-template-rows: repeat(7, 13px); grid-auto-flow: column; grid-auto-columns: 13px; gap: 3px; }
   .cell { border-radius: 3px; padding: 0; border: 0; }
@@ -240,11 +262,13 @@
   .pfill { height: 100%; background: linear-gradient(90deg, var(--cyan), var(--accent)); }
   .empty2 { font-size: 0.82rem; padding: 0.5rem 0; }
 
-  /* Day-detail panel */
-  .detail { position: sticky; top: 2rem; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 0.9rem 1rem; }
+  /* Day-detail panel — stretches to the full height of the calendar/projects stack and
+     centres its content vertically so it reads as a deliberate pair, not a floating card. */
+  .detail { grid-area: detail; align-self: stretch; display: flex; flex-direction: column; padding: 0.9rem 1rem; }
+  .dbody { flex: 1; display: flex; flex-direction: column; justify-content: center; }
   .dhead { font-size: 0.98rem; font-weight: 600; margin-bottom: 0.8rem; line-height: 1.35; }
   .dstats { display: flex; gap: 0.6rem; margin-bottom: 1rem; }
-  .dstat { flex: 1; background: var(--surface-2); border-radius: 10px; padding: 0.6rem 0.7rem; }
+  .dstat { flex: 1; background: var(--surface-2); border: 1px solid color-mix(in srgb, var(--border) 40%, transparent); border-radius: 11px; padding: 0.6rem 0.7rem; box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03); }
   .dstat .num { font-size: 1.35rem; font-weight: 600; font-family: var(--mono); }
   .dstat .lbl { font-size: 0.68rem; margin-top: 0.15rem; }
   .dbreak-h { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 0.35rem; }
@@ -262,8 +286,9 @@
   .tv { font-family: var(--mono); flex: none; }
 
   @media (prefers-reduced-motion: no-preference) {
-    .tile, .card, .detail { transition: border-color var(--dur) var(--ease), transform var(--dur) var(--ease); }
-    .tile:hover { transform: translateY(-2px); border-color: var(--border-strong); }
+    .tile, .card, .detail { transition: border-color var(--dur) var(--ease), transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease); }
+    .tile:hover { transform: translateY(-2px); border-color: var(--border-strong);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 2px 4px rgba(0, 0, 0, 0.3), 0 16px 34px -8px rgba(0, 0, 0, 0.4); }
     .cell { transition: outline-color var(--dur) var(--ease), background var(--dur-slow) var(--ease); }
     .pfill { transition: width var(--dur-slow) var(--ease); }
     .detail { animation: fade-in var(--dur-slow) var(--ease); }

@@ -48,9 +48,18 @@ function rescanProfiles(): typeof profiles {
 }
 
 const port = Number(process.env.HUB_PORT ?? 7777)
-// Optional mesh exposure. Off unless config.mesh.enable (or MESH_EXPOSE=1); the hub still binds
-// only 127.0.0.1 — the local AllMyStuff node dials loopback and tunnels the site to the fleet.
-const meshEnable = process.env.MESH_EXPOSE === '1' || process.env.MESH_EXPOSE === 'true' || config.mesh?.enable === true
+// Mesh exposure is AUTOMATIC: on startup we probe the local AllMyStuff node and, if one is
+// running, register the hub as a "site" so any fleet PC can reach it with zero per-machine setup.
+// The hub still binds only 127.0.0.1 — the node dials loopback and tunnels the site; registration
+// no-ops cleanly when no node is present. Opt out with MESH_EXPOSE=0 or config.mesh.enable=false.
+// Exposure is to the owner's own fleet only (AllMyStuff sites need no cross-owner grant), and the
+// server's origin guard blocks browser drive-bys; a per-device token is the remaining hardening
+// (DESIGN D12/D13.1).
+const meshEnable = !(
+  process.env.MESH_EXPOSE === '0' ||
+  process.env.MESH_EXPOSE === 'false' ||
+  config.mesh?.enable === false
+)
 const mesh = new MeshSite({ port, label: config.mesh?.label, enable: meshEnable })
 startServer({ port, defaultCwd: repoRoot, journal, sessions, profiles, approvals, usage, projects, rescanProfiles, mesh })
 journal.append(null, 'hub/started', {
@@ -62,13 +71,13 @@ console.log(
   `[hub] http://127.0.0.1:${port} — profiles: ${profiles.map((p) => `${p.id}(${p.provider})`).join(', ') || 'none found'} — sessions restored: ${sessions.list().length}`
 )
 
-if (meshEnable) {
-  void mesh.register().then((s) => {
-    if (s.exposed) console.log(`[mesh] exposed as site "${s.label}" (${s.siteId}) — fleet peers open ${s.peerUrl}`)
-    else console.log(`[mesh] not exposed — ${s.error ?? 'unknown'}`)
-    journal.append(null, 'mesh/site', s)
-  })
-}
+// Auto-register — self-detects the node and no-ops if it's absent or exposure is disabled.
+void mesh.register().then((s) => {
+  if (s.exposed) console.log(`[mesh] exposed as site "${s.label}" (${s.siteId}) — fleet peers open ${s.peerUrl}`)
+  else if (s.enabled && s.nodePresent) console.log(`[mesh] node present but not exposed — ${s.error ?? 'unknown'}`)
+  else if (s.enabled) console.log('[mesh] no AllMyStuff node on this machine — hub stays local-only')
+  journal.append(null, 'mesh/site', s)
+})
 
 // Best-effort: pull our site out of the node's exposed map on a clean exit so a stopped hub
 // doesn't linger as a dead advert. The node replaces the whole map, so deregister re-reads first.
