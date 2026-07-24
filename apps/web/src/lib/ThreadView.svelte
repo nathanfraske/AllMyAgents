@@ -31,6 +31,8 @@
     view ? (findModel(model) ?? defaultModelFor(view.record.provider)) : undefined
   )
   const active = $derived(view?.record.status === 'active' || view?.record.status === 'starting')
+  // Codex can append input to a running turn (steer); Claude has no steer, so it queues.
+  const steerable = $derived(active && view?.record.provider === 'codex')
   const st = $derived(view ? store.status(view) : { key: 'idle', label: '' })
   const approvals = $derived(view ? store.approvals.filter((a) => a.sessionId === view.record.id) : [])
   const queue = $derived(sid ? store.queueFor(sid) : [])
@@ -67,9 +69,14 @@
     if (!view || !text.trim()) return
     const body = text
     text = ''
-    // Busy? queue it (combined/sent on turn end); otherwise send now.
+    // Busy? Codex steers the running turn; Claude queues (combined/sent on turn end).
     if (active) {
-      store.enqueue(view.record.id, body)
+      if (view.record.provider === 'codex') {
+        const out = await api.steer(view.record.id, body)
+        if (out.error) alert(out.error)
+      } else {
+        store.enqueue(view.record.id, body)
+      }
       return
     }
     stick = true
@@ -158,7 +165,7 @@
     {/if}
 
     <div class="composer">
-      <textarea rows="2" placeholder={active ? 'Queue a message… (sends when the current turn finishes)' : 'Ask for follow-up changes…  (Enter to send, Shift+Enter for newline)'}
+      <textarea rows="2" placeholder={steerable ? 'Steer the running turn… (appended to what Codex is doing now)' : active ? 'Queue a message… (sends when the current turn finishes)' : 'Ask for follow-up changes…  (Enter to send, Shift+Enter for newline)'}
         bind:value={text} onkeydown={onKey}></textarea>
       <div class="cfoot">
         <AccountPicker {view} />
@@ -168,7 +175,7 @@
         <span class="spacer"></span>
         <button class="foot-act" onclick={stop} disabled={!active} title="interrupt current turn">interrupt</button>
         <button class="foot-act" onclick={() => api.stop(view.record.id)} title="stop session">stop</button>
-        <button class="send-btn" class:queue={active} title={active ? 'queue message' : 'send'} onclick={send} disabled={!text.trim()}>{active ? '⏲' : '↑'}</button>
+        <button class="send-btn" class:queue={active} title={steerable ? 'steer into the running turn' : active ? 'queue message' : 'send'} onclick={send} disabled={!text.trim()}>{steerable ? '⤵' : active ? '⏲' : '↑'}</button>
       </div>
     </div>
     <div class="checkout dim">

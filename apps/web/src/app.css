@@ -24,7 +24,13 @@
   --del: #f84a54;
   --sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono: "JetBrains Mono", "IBM Plex Mono", ui-monospace, "Cascadia Code", "SF Mono", Menlo, monospace;
-  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+  /* Gentle, un-snappy easing + shared durations. --ease is a soft ease-out used for most
+     transitions; --ease-out is a slightly longer settle for enters. Keep motion in the
+     ~180–260ms range so nothing feels harsh. */
+  --ease: cubic-bezier(0.33, 0.85, 0.35, 1);
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --dur: 190ms;
+  --dur-slow: 240ms;
   color-scheme: dark;
 }
 
@@ -111,3 +117,17 @@ code, pre { font-family: var(--mono); }
 
 .add { color: var(--add); }
 .del { color: var(--del); }
+
+/* Soft, consistent motion on interactive surfaces — opt-in by default (respects the OS
+   "reduce motion" setting, under which none of these transitions apply). */
+@media (prefers-reduced-motion: no-preference) {
+  button, .pill-btn, .send-btn {
+    transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease),
+      color var(--dur) var(--ease), filter var(--dur) var(--ease);
+  }
+  input, select, textarea {
+    transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
+  }
+  .dot { transition: background var(--dur) var(--ease); }
+  .scroll::-webkit-scrollbar-thumb { transition: background var(--dur) var(--ease); }
+}

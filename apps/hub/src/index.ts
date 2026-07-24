@@ -9,6 +9,7 @@ import { SessionStore } from './store.js'
 import { startServer } from './server.js'
 import { UsageMonitor } from './usage.js'
 import { WorkspaceManager } from './workspace.js'
+import { MeshSite } from './meshSite.js'
 import type { HubConfig } from './types.js'
 
 const repoRoot = path.resolve(import.meta.dirname, '..', '..', '..')
@@ -47,7 +48,11 @@ function rescanProfiles(): typeof profiles {
 }
 
 const port = Number(process.env.HUB_PORT ?? 7777)
-startServer({ port, defaultCwd: repoRoot, journal, sessions, profiles, approvals, usage, projects, rescanProfiles })
+// Optional mesh exposure. Off unless config.mesh.enable (or MESH_EXPOSE=1); the hub still binds
+// only 127.0.0.1 — the local AllMyStuff node dials loopback and tunnels the site to the fleet.
+const meshEnable = process.env.MESH_EXPOSE === '1' || process.env.MESH_EXPOSE === 'true' || config.mesh?.enable === true
+const mesh = new MeshSite({ port, label: config.mesh?.label, enable: meshEnable })
+startServer({ port, defaultCwd: repoRoot, journal, sessions, profiles, approvals, usage, projects, rescanProfiles, mesh })
 journal.append(null, 'hub/started', {
   port,
   profiles: profiles.map((p) => ({ id: p.id, provider: p.provider })),
@@ -56,3 +61,30 @@ journal.append(null, 'hub/started', {
 console.log(
   `[hub] http://127.0.0.1:${port} — profiles: ${profiles.map((p) => `${p.id}(${p.provider})`).join(', ') || 'none found'} — sessions restored: ${sessions.list().length}`
 )
+
+if (meshEnable) {
+  void mesh.register().then((s) => {
+    if (s.exposed) console.log(`[mesh] exposed as site "${s.label}" (${s.siteId}) — fleet peers open ${s.peerUrl}`)
+    else console.log(`[mesh] not exposed — ${s.error ?? 'unknown'}`)
+    journal.append(null, 'mesh/site', s)
+  })
+}
+
+// Best-effort: pull our site out of the node's exposed map on a clean exit so a stopped hub
+// doesn't linger as a dead advert. The node replaces the whole map, so deregister re-reads first.
+let shuttingDown = false
+function shutdown(signal: string): void {
+  if (shuttingDown) return
+  shuttingDown = true
+  const done = (): void => process.exit(0)
+  // Cap the cleanup so a hung socket can't wedge shutdown.
+  const guard = setTimeout(done, 2500)
+  guard.unref?.()
+  void mesh.deregister().finally(() => {
+    clearTimeout(guard)
+    console.log(`[hub] ${signal} — stopped`)
+    done()
+  })
+}
+process.on('SIGINT', () => shutdown('SIGINT'))
+process.on('SIGTERM', () => shutdown('SIGTERM'))

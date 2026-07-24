@@ -277,6 +277,15 @@ export class SessionManager {
     }
   }
 
+  async steer(sessionId: string, text: string): Promise<void> {
+    const record = this.sessions.get(sessionId)
+    if (!record) throw new Error(`unknown session: ${sessionId}`)
+    if (record.provider !== 'codex') throw new Error('steering is only supported for Codex sessions')
+    const { client, threadId } = await this.ensureCodexThread(record)
+    await client.steer(threadId, text)
+    this.journal.append(sessionId, 'session/steered', { text })
+  }
+
   setMode(sessionId: string, mode: 'safe' | 'edits' | 'full'): void {
     const record = this.sessions.get(sessionId)
     if (!record) throw new Error(`unknown session: ${sessionId}`)

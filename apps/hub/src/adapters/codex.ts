@@ -22,6 +22,8 @@ export class CodexClient {
   private child: ChildProcess | undefined
   private nextId = 1
   private readonly pending = new Map<number, Pending>()
+  // threadId -> id of the turn currently running on that thread (for steer's expectedTurnId)
+  private readonly activeTurns = new Map<string, string>()
   private initPromise: Promise<void> | undefined
 
   constructor(
@@ -104,6 +106,15 @@ export class CodexClient {
       }
       return
     }
+    // Track the active turn per thread so steer can target it: turn/started carries the
+    // new turn's id (params.turn.id); turn/completed and turn/error end that turn.
+    if (msg.method === 'turn/started') {
+      const p = msg.params as { threadId?: string; turn?: { id?: string } } | null
+      if (p?.threadId && p.turn?.id) this.activeTurns.set(p.threadId, p.turn.id)
+    } else if (msg.method === 'turn/completed' || msg.method === 'turn/error') {
+      const p = msg.params as { threadId?: string } | null
+      if (p?.threadId) this.activeTurns.delete(p.threadId)
+    }
     this.onEvent(`codex/${msg.method}`, msg.params ?? null)
   }
 
@@ -131,6 +142,18 @@ export class CodexClient {
 
   async interrupt(threadId: string): Promise<void> {
     await this.request('turn/interrupt', { threadId })
+  }
+
+  // Append user input to the turn currently running on this thread. The app-server requires
+  // expectedTurnId to match the live turn (else -32600), so we send the tracked active turn id.
+  async steer(threadId: string, text: string): Promise<void> {
+    const expectedTurnId = this.activeTurns.get(threadId)
+    if (!expectedTurnId) throw new Error('no active Codex turn to steer')
+    await this.request('turn/steer', {
+      threadId,
+      input: [{ type: 'text', text }],
+      expectedTurnId,
+    })
   }
 
   async readRateLimits(): Promise<unknown> {

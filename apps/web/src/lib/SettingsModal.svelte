@@ -1,11 +1,26 @@
 <script lang="ts">
   import { store } from './store.svelte'
   import { settings } from './settings.svelte'
-  import { api } from './api'
+  import { api, type MeshStatus } from './api'
   import ProviderLogo from './ProviderLogo.svelte'
   import { modelsFor } from './catalog'
 
   let { onclose }: { onclose: () => void } = $props()
+
+  // Mesh remote-access status (loaded once; refreshed after a toggle).
+  let mesh = $state<MeshStatus | null>(null)
+  let meshBusy = $state(false)
+  $effect(() => {
+    void api.mesh().then((m) => (mesh = m))
+  })
+  async function toggleMesh(on: boolean): Promise<void> {
+    meshBusy = true
+    try {
+      mesh = await api.setMesh(on)
+    } finally {
+      meshBusy = false
+    }
+  }
 
   let addProvider = $state<'claude' | 'codex'>('claude')
   let addName = $state('')
@@ -57,6 +72,57 @@
 
   function onKey(e: KeyboardEvent): void {
     if (e.key === 'Escape') onclose()
+  }
+
+  // --- Auto monthly budget from subscription level -------------------------------------
+  // Monthly USD budget per known subscription tier. Deliberately simple, documented anchors
+  // (edit to taste): the entry "Pro" / "Plus" tier ≈ $20, Claude Max 5× ≈ $100, Max 20× ≈ $200.
+  // Keyed by the tier string (normalised to lowercase alphanumerics) as it appears in the live
+  // usage snapshot. The Max* keys are only reachable if a usage source ever reports such a tier
+  // string — Claude accounts today expose only session/week percentages, no dollar tier.
+  const PLAN_BUDGETS: Record<string, number> = {
+    free: 0,
+    plus: 20, // ChatGPT Plus
+    pro: 20, // Claude Pro / ChatGPT entry "Pro"
+    team: 30,
+    business: 30,
+    enterprise: 60,
+    max: 100, max5: 100, max5x: 100, // Claude Max 5×
+    max20: 200, max20x: 200, // Claude Max 20×
+  }
+  // When a tier can't be read (Claude, or an unknown Codex plan), assume the entry tier and flag it.
+  const FALLBACK_USD = 20
+  const norm = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]/g, '')
+
+  let autoResult = $state<{ total: number; lines: string[]; assumed: number } | null>(null)
+
+  // Sum a monthly budget across the user's accounts from live usage data — entirely client-side.
+  // Codex accounts carry `codex.planType` (e.g. "pro"); Claude accounts have no dollar tier.
+  function autoDetectBudget(): void {
+    if (store.profiles.length === 0) {
+      autoResult = { total: 0, lines: ['No accounts detected yet — add one above, then try again.'], assumed: 0 }
+      return
+    }
+    let total = 0
+    let assumed = 0
+    const lines: string[] = []
+    for (const p of store.profiles) {
+      const snap = store.usage.find((u) => u.profileId === p.id)
+      // `planType` is present on Codex snapshots but isn't in the web UsageSnapshot type — read it safely.
+      const planType = (snap?.codex as { planType?: string } | undefined)?.planType
+      if (p.provider === 'codex' && planType && norm(planType) in PLAN_BUDGETS) {
+        const usd = PLAN_BUDGETS[norm(planType)]!
+        total += usd
+        lines.push(`${p.id}: ${planType} → $${usd}/mo`)
+      } else {
+        total += FALLBACK_USD
+        assumed++
+        const why = p.provider === 'claude' ? 'Claude tier not in usage data' : planType ? `unknown plan "${planType}"` : 'no usage data yet'
+        lines.push(`${p.id}: ${why} → assumed $${FALLBACK_USD}/mo`)
+      }
+    }
+    settings.setBudget(total || null)
+    autoResult = { total, lines, assumed }
   }
 </script>
 
@@ -143,7 +209,41 @@
         <input type="number" min="0" placeholder="e.g. 100" value={settings.planBudgetUsd ?? ''}
           onchange={(e) => settings.setBudget(Number((e.target as HTMLInputElement).value) || null)} />
       </label>
-      <p class="hint dim">Spend shows as a percent of the plan budget when set. Claude usage (session / week / model) is polled from the free <code>/usage</code> command.</p>
+      <div class="budget-auto">
+        <button class="btn" onclick={autoDetectBudget}>Auto-detect from plan</button>
+        <span class="hint dim">Sums a monthly budget from each account's detected subscription tier.</span>
+      </div>
+      {#if autoResult}
+        <div class="auto-result">
+          <div class="auto-total">Budget set to <b>${autoResult.total}/mo</b>{#if autoResult.assumed} · {autoResult.assumed} account{autoResult.assumed === 1 ? '' : 's'} fell back to an assumed tier{/if}</div>
+          <ul class="auto-list">
+            {#each autoResult.lines as l (l)}<li class="dim">{l}</li>{/each}
+          </ul>
+        </div>
+      {/if}
+      <p class="hint dim">Spend shows as a percent of the plan budget when set. Claude usage (session / week / model) is polled from the free <code>/usage</code> command — Claude has no dollar tier in the data, so those accounts fall back to the entry tier.</p>
+    </section>
+
+    <section>
+      <h3>Remote access (mesh)</h3>
+      {#if mesh}
+        <label class="opt"><input type="checkbox" checked={mesh.enabled} disabled={meshBusy} onchange={(e) => toggleMesh((e.target as HTMLInputElement).checked)} /> Expose this hub to my AllMyStuff fleet</label>
+        <div class="mesh-status">
+          {#if !mesh.nodePresent && mesh.enabled}
+            <span class="mstate off">No AllMyStuff node detected on this PC — hub stays local-only.</span>
+          {:else if mesh.exposed}
+            <span class="mstate on">Live as "{mesh.label}" ({mesh.siteId}). On another fleet PC, open:</span>
+            <code class="cmd">{mesh.peerUrl}</code>
+          {:else if mesh.enabled}
+            <span class="mstate warn">Enabled, but not exposed{mesh.error ? ` — ${mesh.error}` : ''}.</span>
+          {:else}
+            <span class="dim">Off — your hub stays bound to 127.0.0.1 only.</span>
+          {/if}
+        </div>
+        <p class="hint dim">Rides your AllMyStuff mesh as a "site" (no Tailscale). The hub always stays on loopback — the local node tunnels it to your own devices, which need no grant. <b>Heads-up:</b> the hub grants full control and has no auth yet, so only expose it on a fleet you trust — a per-device token is coming before this is safe to leave on.</p>
+      {:else}
+        <p class="dim">Checking mesh…</p>
+      {/if}
     </section>
   </div>
 </div>
@@ -191,4 +291,15 @@
   .opt.row2 select { min-width: 11rem; }
   .hint { font-size: 0.75rem; line-height: 1.5; }
   .hint code { background: var(--bg); padding: 0 0.25rem; border-radius: 4px; }
+  .budget-auto { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; margin-bottom: 0.5rem; }
+  .budget-auto .hint { flex: 1; min-width: 12rem; }
+  .auto-result { background: var(--surface-2); border: 1px solid var(--border); border-radius: 9px; padding: 0.55rem 0.7rem; margin-bottom: 0.6rem; }
+  .auto-total { font-size: 0.8rem; margin-bottom: 0.35rem; }
+  .auto-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.15rem; }
+  .auto-list li { font-size: 0.73rem; font-family: var(--mono); }
+  .mesh-status { display: flex; flex-direction: column; gap: 0.4rem; margin-bottom: 0.5rem; }
+  .mstate { font-size: 0.78rem; line-height: 1.45; }
+  .mstate.on { color: var(--ok); }
+  .mstate.warn { color: var(--warn); }
+  .mstate.off { color: var(--muted); }
 </style>

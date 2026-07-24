@@ -111,6 +111,19 @@ export interface StatsResult {
   totalSessions: number
 }
 
+export interface MeshStatus {
+  enabled: boolean
+  nodePresent: boolean
+  exposed: boolean
+  port: number
+  label: string
+  siteId: string
+  socketPath: string
+  peerUrl: string
+  error?: string
+  checkedAt?: string
+}
+
 export const api = {
   profiles: () => jget<ProfileInfo[]>('/api/profiles'),
   stats: () => jget<StatsResult>('/api/stats'),
@@ -128,8 +141,12 @@ export const api = {
   spawn: (body: Record<string, unknown>) => jpost<SessionRecord | { error: string }>('/api/sessions', body),
   send: (id: string, text: string, extra: Record<string, unknown> = {}) =>
     jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/input`, { text, ...extra }),
+  steer: (id: string, text: string) =>
+    jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/steer`, { text }),
   interrupt: (id: string) => jpost(`/api/sessions/${id}/interrupt`),
   stop: (id: string) => jpost(`/api/sessions/${id}/stop`),
   setMode: (id: string, permissionMode: string) => jpost(`/api/sessions/${id}/mode`, { permissionMode }),
   decide: (id: string, approve: boolean) => jpost(`/api/approvals/${id}`, { approve }),
+  mesh: () => jget<MeshStatus>('/api/mesh'),
+  setMesh: (enable: boolean) => jpost<MeshStatus>('/api/mesh', { enable }),
 }

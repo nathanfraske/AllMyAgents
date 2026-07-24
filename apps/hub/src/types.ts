@@ -91,6 +91,19 @@ export interface UsageSnapshot {
 
 export type OveragePolicy = 'block' | 'warn' | 'allow'
 
+export interface MeshConfig {
+  /**
+   * Expose the loopback hub as an AllMyStuff "site" so other PCs on the owner's mesh can reach
+   * it. Default OFF: the hub grants full control, so exposure is opt-in until the device-token
+   * gate lands (see DESIGN D13.1). The hub itself always stays bound to 127.0.0.1 — the local
+   * AllMyStuff node dials loopback and tunnels; we never bind a routable interface.
+   */
+  enable?: boolean
+  /** Display label fleet peers see for this site (e.g. in their AllMyStuff Sites tab). */
+  label?: string
+}
+
 export interface HubConfig {
   overage?: Record<string, OveragePolicy>
+  mesh?: MeshConfig
 }

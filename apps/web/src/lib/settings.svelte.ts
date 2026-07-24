@@ -70,6 +70,7 @@ class SettingsStore {
           defaultPermissionMode: this.defaultPermissionMode,
           defaultClaudeModel: this.defaultClaudeModel,
           defaultCodexModel: this.defaultCodexModel,
+          ownerName: this.ownerName,
         })
       )
     } catch {

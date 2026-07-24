@@ -45,6 +45,12 @@ interface ClaudeBlock {
   is_error?: boolean
 }
 
+// Where a dragged chat will land in the 2D pane layout: a new COLUMN inside an existing
+// row (left/right drop), or a whole new ROW (top/bottom drop).
+export type DropZone =
+  | { kind: 'col'; row: number; col: number }
+  | { kind: 'row'; row: number }
+
 function asText(content: unknown): string {
   if (typeof content === 'string') return content
   if (Array.isArray(content)) {
@@ -482,18 +488,31 @@ class HubStore {
 
   select(id: string): void {
     this.selectedId = id
-    // In split mode, selecting from the sidebar drives the first (primary) pane.
-    if (this.splitPanes.length) this.splitPanes = [id, ...this.splitPanes.slice(1)]
+    // In split mode, selecting from the sidebar drives the first (primary) pane (row 0, col 0).
+    if (this.splitPanes.length) {
+      const rows = this.splitPanes.map((r) => [...r])
+      if (rows[0] && rows[0].length) rows[0][0] = id
+      else rows.unshift([id])
+      this.splitPanes = rows
+    }
   }
 
-  // --- Split / multi-pane layout ---
-  splitPanes = $state<string[]>([])
-  lastLayout = $state<{ selectedId: string | null; splitPanes: string[] } | null>(null)
+  // --- Split / multi-pane layout (2D) ---
+  // The main area is a vertical stack of ROWS; each row is a horizontal set of panes
+  // (COLUMNS). `splitPanes` is therefore rows-of-session-ids. Empty = not split (a single
+  // pane derived from `selectedId`); the single-row case reproduces the old horizontal split.
+  splitPanes = $state<string[][]>([])
+  lastLayout = $state<{ selectedId: string | null; splitPanes: string[][] } | null>(null)
+
+  // Canonical 2D structure for rendering + index math. Reads $state so it stays reactive.
+  get panes(): string[][] {
+    return this.basePanes()
+  }
 
   // Home to the dashboard, remembering the current chat/pane layout so it can be restored.
   goHome(): void {
     if (this.selectedId || this.splitPanes.length) {
-      this.lastLayout = { selectedId: this.selectedId, splitPanes: [...this.splitPanes] }
+      this.lastLayout = { selectedId: this.selectedId, splitPanes: this.splitPanes.map((r) => [...r]) }
     }
     this.selectedId = null
     this.splitPanes = []
@@ -502,59 +521,100 @@ class HubStore {
   goBack(): void {
     if (!this.lastLayout) return
     this.selectedId = this.lastLayout.selectedId
-    this.splitPanes = [...this.lastLayout.splitPanes]
+    this.splitPanes = this.lastLayout.splitPanes.map((r) => [...r])
     this.lastLayout = null
   }
-  // drag-to-split: the session being dragged and the live insertion index (0..N)
+
+  // drag-to-split: the session being dragged and the live drop zone (column or new row).
   dragSession = $state<string | null>(null)
-  dropIndex = $state<number | null>(null)
-
-  paneIds(): string[] {
-    return this.basePanes()
-  }
-
-  insertPane(index: number, id: string): void {
-    const base = [...this.basePanes()]
-    const clamped = Math.max(0, Math.min(index, base.length))
-    base.splice(clamped, 0, id)
-    // more than one pane now → it's a real split
-    if (base.length > 1) this.splitPanes = base
-    this.selectedId = base[0] ?? this.selectedId
-  }
+  dropZone = $state<DropZone | null>(null)
 
   endDragSession(): void {
     this.dragSession = null
-    this.dropIndex = null
+    this.dropZone = null
   }
 
-  private basePanes(): string[] {
+  private basePanes(): string[][] {
     if (this.splitPanes.length) return this.splitPanes
-    return this.selectedId ? [this.selectedId] : []
+    return this.selectedId ? [[this.selectedId]] : []
   }
 
+  // Map a row-major flat pane index (what ThreadView is handed) to a (row, col) coordinate.
+  private coord(flat: number): { r: number; c: number } | null {
+    const rows = this.basePanes()
+    let i = flat
+    for (let r = 0; r < rows.length; r++) {
+      const len = rows[r]!.length
+      if (i < len) return { r, c: i }
+      i -= len
+    }
+    return null
+  }
+
+  // Normalise a candidate layout: drop empty rows, then collapse to a single pane when only
+  // one remains (so closing back down to one chat leaves split mode, as before).
+  private commit(rows: string[][]): void {
+    const cleaned = rows.filter((r) => r.length > 0)
+    const total = cleaned.reduce((n, r) => n + r.length, 0)
+    if (total <= 1) {
+      this.splitPanes = []
+      const only = cleaned[0]?.[0]
+      if (only) this.selectedId = only
+    } else {
+      this.splitPanes = cleaned
+      this.selectedId = cleaned[0]?.[0] ?? this.selectedId
+    }
+  }
+
+  // Place a dragged chat according to the computed drop zone.
+  dropAt(zone: DropZone, id: string): void {
+    const base = this.basePanes()
+    if (base.length === 0) {
+      // From the dashboard there is nothing to split — just open the chat.
+      this.selectedId = id
+      this.splitPanes = []
+      return
+    }
+    const rows = base.map((r) => [...r])
+    if (zone.kind === 'row') {
+      const at = Math.max(0, Math.min(zone.row, rows.length))
+      rows.splice(at, 0, [id])
+    } else {
+      const r = Math.max(0, Math.min(zone.row, rows.length - 1))
+      const row = rows[r]!
+      const at = Math.max(0, Math.min(zone.col, row.length))
+      row.splice(at, 0, id)
+    }
+    this.commit(rows)
+  }
+
+  // Split button: add a second column to the last row (horizontal split, as before).
   startSplit(): void {
     const base = this.basePanes()
     if (base.length === 0) return
-    const other = this.sessionList.find((v) => !base.includes(v.record.id))?.record.id ?? base[base.length - 1]
-    this.splitPanes = [...base, other as string]
+    const flat = base.flat()
+    const other = this.sessionList.find((v) => !flat.includes(v.record.id))?.record.id ?? flat[flat.length - 1]
+    if (!other) return
+    const rows = base.map((r) => [...r])
+    rows[rows.length - 1]!.push(other)
+    this.commit(rows)
   }
 
   setPaneSession(index: number, id: string): void {
-    const base = [...this.basePanes()]
-    if (index < 0 || index >= base.length) return
-    base[index] = id
-    this.splitPanes = base
-    if (index === 0) this.selectedId = id
+    const co = this.coord(index)
+    if (!co) return
+    const rows = this.basePanes().map((r) => [...r])
+    rows[co.r]![co.c] = id
+    if (co.r === 0 && co.c === 0) this.selectedId = id
+    this.commit(rows)
   }
 
   closePane(index: number): void {
-    const base = this.basePanes().filter((_, i) => i !== index)
-    if (base.length <= 1) {
-      this.splitPanes = []
-      if (base[0]) this.selectedId = base[0]
-    } else {
-      this.splitPanes = base
-    }
+    const co = this.coord(index)
+    if (!co) return
+    const rows = this.basePanes().map((r) => [...r])
+    rows[co.r]!.splice(co.c, 1)
+    this.commit(rows)
   }
 }
 

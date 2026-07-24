@@ -6,6 +6,7 @@ import type { Journal } from './journal.js'
 import type { ProjectStore } from './projects.js'
 import type { SessionManager } from './sessions.js'
 import type { UsageMonitor } from './usage.js'
+import type { MeshSite } from './meshSite.js'
 import { pickFolder } from './native.js'
 import { computeStats } from './stats.js'
 import { startLogin, awaitLogin, credentialsExist } from './loginLauncher.js'
@@ -179,10 +180,11 @@ export interface ServerOptions {
   usage: UsageMonitor
   projects: ProjectStore
   rescanProfiles: () => Profile[]
+  mesh: MeshSite
 }
 
 export function startServer(opts: ServerOptions): http.Server {
-  const { port, defaultCwd, journal, sessions, profiles, approvals, usage, projects, rescanProfiles } = opts
+  const { port, defaultCwd, journal, sessions, profiles, approvals, usage, projects, rescanProfiles, mesh } = opts
   // Same location index.ts scans for profiles (repoRoot/profiles); defaultCwd is repoRoot.
   const profilesDir = path.join(defaultCwd, 'profiles')
 
@@ -290,6 +292,19 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, computeStats(journal.db, projects))
         return
       }
+      // Mesh site status — lets the UI show the address other fleet PCs use to reach this hub.
+      if (method === 'GET' && url.pathname === '/api/mesh') {
+        json(res, mesh.status())
+        return
+      }
+      // Runtime toggle for exposing the hub as an AllMyStuff site. Registers/deregisters to match.
+      if (method === 'POST' && url.pathname === '/api/mesh') {
+        const body = await readBody(req)
+        const status = await mesh.setEnabled(body.enable === true)
+        journal.append(null, 'mesh/site', status)
+        json(res, status)
+        return
+      }
       if (method === 'POST' && url.pathname === '/api/usage/refresh') {
         await usage.refreshNow()
         json(res, usage.list())
@@ -331,6 +346,13 @@ export function startServer(opts: ServerOptions): http.Server {
           return
         }
         sessions.setMode(modeMatch[1] as string, m)
+        json(res, { ok: true })
+        return
+      }
+      const steerMatch = /^\/api\/sessions\/([^/]+)\/steer$/.exec(url.pathname)
+      if (method === 'POST' && steerMatch) {
+        const body = await readBody(req)
+        await sessions.steer(steerMatch[1] as string, String(body.text ?? ''))
         json(res, { ok: true })
         return
       }
