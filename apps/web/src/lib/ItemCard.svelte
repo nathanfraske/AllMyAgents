@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ThreadItem } from './store.svelte'
+  import Markdown from './Markdown.svelte'
 
   let { item }: { item: ThreadItem } = $props()
   let open = $state(false)
@@ -19,7 +20,7 @@
 {:else if item.kind === 'assistant' || item.kind === 'user'}
   <div class="msg {item.kind}">
     <div class="who">{item.kind}</div>
-    <div class="text" class:clamp={longUser && !showFull}>{item.text}</div>
+    <div class="body" class:clamp={longUser && !showFull}><Markdown text={item.text ?? ''} /></div>
     {#if longUser}
       <button class="more" onclick={() => (showFull = !showFull)}>{showFull ? 'Show less' : 'Show full message'}</button>
     {/if}
@@ -28,7 +29,7 @@
   {#if item.text && item.text.trim()}
     <div class="think">
       <button class="hd" onclick={() => (open = !open)}>{open ? '▾' : '▸'} {item.kind}</button>
-      {#if open}<div class="text think-body">{item.text}</div>{/if}
+      {#if open}<div class="think-body"><Markdown text={item.text} /></div>{/if}
     </div>
   {:else}
     <div class="reasoned dim" title="Claude reasoned about this. Claude Code does not expose the reasoning text on subscription accounts.">✦ reasoned</div>
@@ -55,8 +56,8 @@
   .msg.assistant { background: var(--surface); border: 1px solid var(--border); }
   .msg.user { background: color-mix(in srgb, var(--accent) 10%, transparent); border: 1px solid var(--border-strong); }
   .who { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--dim); margin-bottom: 0.2rem; }
-  .text { white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
-  .text.clamp { max-height: 8.4rem; overflow: hidden; -webkit-mask-image: linear-gradient(#000 70%, transparent); mask-image: linear-gradient(#000 70%, transparent); }
+  .body { word-break: break-word; line-height: 1.5; }
+  .body.clamp { max-height: 8.4rem; overflow: hidden; -webkit-mask-image: linear-gradient(#000 70%, transparent); mask-image: linear-gradient(#000 70%, transparent); }
   .more { margin-top: 0.3rem; font-size: 0.74rem; color: var(--accent); }
   .think { border-left: 2px solid var(--border-strong); padding-left: 0.5rem; }
   .reasoned { font-size: 0.72rem; padding: 0.1rem 0; }
