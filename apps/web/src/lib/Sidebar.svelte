@@ -6,6 +6,7 @@
   import Usage from './Usage.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
   import Icon from './Icon.svelte'
+  import ImportChats from './ImportChats.svelte'
   import { flip } from 'svelte/animate'
   import { cubicOut } from 'svelte/easing'
 
@@ -14,6 +15,16 @@
   let newName = $state('')
   let newPath = $state('')
   let createErr = $state('')
+  // Which project's "import existing chats" panel is open (project id + folder path), if any.
+  let importFor = $state<{ id: string; path: string } | null>(null)
+
+  function pathFor(id: string): string {
+    return store.projects.find((p) => p.id === id)?.path ?? ''
+  }
+  function openImport(e: MouseEvent, id: string): void {
+    e.stopPropagation()
+    importFor = { id, path: pathFor(id) }
+  }
   let showUsage = $state(true)
   let collapsed = $state(new Set<string>())
 
@@ -248,6 +259,8 @@
     newPath = ''
     showCreate = false
     await store.refreshProjects()
+    // Offer to adopt any existing Claude/Codex chats that already live for this folder.
+    importFor = { id: out.id, path: out.path }
   }
 
   async function act(e: MouseEvent, id: string, verb: 'interrupt' | 'stop'): Promise<void> {
@@ -323,9 +336,13 @@
           <span class="gname">{g.name}</span>
           <span class="gcount dim tnum">{g.sessions.length}</span>
           {#if g.id !== '__none__'}
+            <button class="gadd" title="import existing chats" onclick={(e) => openImport(e, g.id)}><Icon name="download" size={13} /></button>
             <button class="gadd" title="new chat here" onclick={() => store.newSession(undefined, g.id)}><Icon name="plus" size={14} /></button>
           {/if}
         </div>
+        {#if importFor?.id === g.id}
+          <ImportChats projectId={g.id} path={importFor.path} onClose={() => (importFor = null)} />
+        {/if}
         {#if isCollapsed && g.sessions.length}
           {@const sum = summarize(g.sessions)}
           <div class="summary" role="button" tabindex="0" onclick={() => toggleCollapse(g.id)} onkeydown={(e) => { if (e.key === 'Enter') toggleCollapse(g.id) }}>
@@ -352,6 +369,7 @@
             <span class="grip" aria-hidden="true">{@render gripIcon()}</span>
             <span class="dot {st.key}" title={st.label}></span>
             <ProviderLogo provider={s.record.provider} size={13} />
+            {#if s.record.imported}<span class="ibadge" title="imported from an existing {s.record.provider} chat"><Icon name="download" size={10} /></span>{/if}
             {#if editingId === s.record.id}
               <input class="rename-input" bind:value={draft} use:focusInput
                 onclick={(e) => e.stopPropagation()}
@@ -456,6 +474,7 @@
   .group.dragging { position: relative; z-index: 2; }
   .group.dragging .group-head { background: var(--surface-3); border-radius: var(--r-md); box-shadow: var(--shadow-1); }
   .list.reordering { user-select: none; cursor: grabbing; }
+  .ibadge { flex: none; display: inline-grid; place-items: center; color: var(--dim); }
   .rlabel { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .row.sel .rlabel { font-weight: var(--fw-medium); }
   /* One-shot glitch when a chat materializes into the list or is renamed. Kept subtle (small

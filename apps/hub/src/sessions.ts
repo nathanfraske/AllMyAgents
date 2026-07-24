@@ -16,6 +16,7 @@ import { buildAgentMcpServer, type AgentServices } from './agentTools.js'
 import type { AgentBus, BusAddress, BusMessage } from './bus.js'
 import type { MemoryStore } from './memory.js'
 import { deriveTitle, sanitizeTitle } from './title.js'
+import { discoverImportableChats, importKey, type ImportableChat, type ScanResult } from './importScan.js'
 
 export interface CreateOptions {
   cwd?: string
@@ -279,6 +280,95 @@ export class SessionManager {
     return record
   }
 
+  // ---- Project import (adopt existing vendor transcripts) ----------------------------------------
+
+  /** The hub's worktrees root — imported transcripts whose cwd lives here are hub scratch, not chats. */
+  private worktreesRoot(): string {
+    return path.join(this.defaultCwd, 'data', 'worktrees')
+  }
+
+  /** Every already-adopted vendor session, keyed profileId::vendorSessionId (import dedupe set). */
+  private importedKeys(): Set<string> {
+    const keys = new Set<string>()
+    for (const r of this.sessions.values()) {
+      if (r.vendorSessionId) keys.add(importKey(r.profileId, r.vendorSessionId))
+    }
+    return keys
+  }
+
+  /**
+   * PREVIEW: scan every profile for Claude/Codex conversations whose recorded cwd is `projectPath`
+   * (or nested inside it), marking any the hub already adopted. Read-only, bounded, sends nothing.
+   */
+  scanForImport(projectPath: string): Promise<ScanResult> {
+    return discoverImportableChats({
+      profiles: [...this.profiles.values()],
+      path: projectPath,
+      importedKeys: this.importedKeys(),
+      worktreesRoot: this.worktreesRoot(),
+    })
+  }
+
+  /**
+   * IMPORT: adopt the selected vendor chats under a project. Re-runs discovery server-side (so the
+   * cwd / provider / owning profile / title are all hub-derived, never client-forgeable), then for
+   * each match builds a SessionRecord with `vendorSessionId` pre-set. That is the whole trick: the
+   * hub's existing lazy-resume machinery (`claudeDriverFor` → `driver.restore`, `ensureCodexThread`
+   * → `resumeThread`) then continues the vendor session on first send — no new adapter code. Dedupe
+   * is by profileId + vendorSessionId; already-adopted ids are skipped. Each import journals
+   * `session/created` then `session/titled`, so the web roster materializes it over the same WS path
+   * a hub-native session uses, filed under the project + auto-named.
+   */
+  async importChats(
+    projectId: string | undefined,
+    projectPath: string,
+    vendorSessionIds: string[]
+  ): Promise<{ imported: SessionRecord[]; skipped: number; notFound: string[] }> {
+    const scan = await this.scanForImport(projectPath)
+    const wanted = new Set(vendorSessionIds)
+    const byId = new Map<string, ImportableChat>()
+    for (const chat of scan.chats) if (wanted.has(chat.vendorSessionId)) byId.set(chat.vendorSessionId, chat)
+    const imported: SessionRecord[] = []
+    let skipped = 0
+    for (const id of wanted) {
+      const chat = byId.get(id)
+      if (!chat || chat.alreadyImported) {
+        skipped++
+        continue
+      }
+      imported.push(this.adoptChat(projectId, chat))
+    }
+    const notFound = [...wanted].filter((id) => !byId.has(id))
+    return { imported, skipped, notFound }
+  }
+
+  /** Persist one adopted transcript as an idle, imported SessionRecord + journal it into the roster. */
+  private adoptChat(projectId: string | undefined, chat: ImportableChat): SessionRecord {
+    const id = crypto.randomUUID()
+    const title = sanitizeTitle(chat.title) || undefined
+    // No worktree: an imported chat resumes IN PLACE (resume must see the same working tree the
+    // transcript references) — unlike create(), which may spin up an isolated worktree.
+    const record: SessionRecord = {
+      id,
+      profileId: chat.profileId,
+      provider: chat.provider,
+      projectId,
+      cwd: chat.cwd,
+      status: 'idle',
+      vendorSessionId: chat.vendorSessionId,
+      model: chat.model,
+      title,
+      titleSource: title ? 'auto' : undefined,
+      imported: true,
+      createdAt: new Date().toISOString(),
+    }
+    this.sessions.set(id, record)
+    this.persist(record)
+    this.journal.append(id, 'session/created', record)
+    if (title) this.journal.append(id, 'session/titled', { title, source: 'auto' })
+    return record
+  }
+
   private async runClaudeTurn(
     record: SessionRecord,
     prompt: string,
@@ -510,7 +600,10 @@ export class SessionManager {
   async delete(sessionId: string): Promise<{ ok: true } | { ok: false; error: string }> {
     const record = this.sessions.get(sessionId)
     if (!record) return { ok: false, error: `unknown session: ${sessionId}` }
-    // 1. End any running turn and tear down the worktree via the existing stop path.
+    // 1. End any running turn and tear down the worktree via the existing stop path. Note: an
+    //    IMPORTED session (record.imported) carries no repo/worktree and this path never touches
+    //    the filesystem — deleting it drops only the hub record, never the source vendor transcript
+    //    (the user's own Claude/Codex history, which may live in their real home dir). See §3.4.
     await this.stop(sessionId).catch(() => undefined)
     // 2. Tombstone the session in the append-only journal.
     this.journal.append(sessionId, 'session/deleted', { id: sessionId })

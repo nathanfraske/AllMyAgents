@@ -510,6 +510,21 @@ class HubStore {
     this.projects = await api.projects()
   }
 
+  // Adopt the selected existing vendor chats into a project. The hub persists them and journals
+  // `session/created` + `session/titled`, so they also arrive over the WS (ensure() is idempotent);
+  // we optimistically ensure the returned records for instant feedback and refresh the project
+  // roster. Returns counts for a toast/summary. Errors surface as { imported: 0 }.
+  async importChats(projectId: string, vendorSessionIds: string[]): Promise<{ imported: number; skipped: number }> {
+    const out = await api.importChats(projectId, vendorSessionIds)
+    if (!out || 'error' in out) return { imported: 0, skipped: 0 }
+    for (const rec of out.imported) {
+      this.ensure(rec)
+      this.markGlitch(rec.id)
+    }
+    await this.refreshProjects()
+    return { imported: out.imported.length, skipped: out.skipped }
+  }
+
   status(view: SessionView): StatusInfo {
     const pending = this.approvals.filter((a) => a.sessionId === view.record.id)
     if (pending.length > 0) {

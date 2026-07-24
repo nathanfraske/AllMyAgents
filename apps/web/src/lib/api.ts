@@ -27,7 +27,41 @@ export interface SessionRecord {
   permissionMode?: string
   title?: string
   titleSource?: string
+  // Adopted from an existing vendor transcript via project-import (vs. spawned by the hub).
+  imported?: boolean
   createdAt: string
+}
+
+// One existing Claude/Codex conversation found on disk that can be adopted under a project.
+export interface ImportableChat {
+  provider: 'claude' | 'codex'
+  vendorSessionId: string
+  profileId: string
+  cwd: string
+  title: string
+  firstPrompt?: string
+  aiTitle?: string
+  lastActivity: string
+  messageCount: number
+  model?: string
+  gitBranch?: string
+  sizeBytes: number
+  transcriptPath: string
+  alreadyImported: boolean
+}
+
+export interface ScanResult {
+  path: string
+  chats: ImportableChat[]
+  byProfile: Record<string, number>
+  scannedProfiles: string[]
+  warnings: string[]
+}
+
+export interface ImportResult {
+  imported: SessionRecord[]
+  skipped: number
+  notFound: string[]
 }
 
 export interface ApprovalRecord {
@@ -212,6 +246,10 @@ export const api = {
   projects: () => jget<ProjectInfo[]>('/api/projects'),
   createProject: (name: string, path: string) =>
     jpost<ProjectInfo | { error: string }>('/api/projects', { name, path }),
+  // Project import: preview existing vendor chats under a folder, then adopt the selected ones.
+  scanProject: (path: string) => jpost<ScanResult | { error: string }>('/api/projects/scan', { path }),
+  importChats: (projectId: string, vendorSessionIds: string[]) =>
+    jpost<ImportResult | { error: string }>(`/api/projects/${projectId}/import`, { vendorSessionIds }),
   sessions: () => jget<SessionRecord[]>('/api/sessions'),
   approvals: () => jget<ApprovalRecord[]>('/api/approvals'),
   usage: () => jget<UsageSnapshot[]>('/api/usage'),

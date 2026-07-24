@@ -352,6 +352,37 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, project)
         return
       }
+      // Project import — PREVIEW: scan a folder for existing Claude/Codex conversations across every
+      // profile whose recorded cwd belongs to it. Read-only (bounded head reads); nothing is written
+      // or sent anywhere. Body-based (not a query string) to match /api/projects + Windows paths.
+      if (method === 'POST' && url.pathname === '/api/projects/scan') {
+        const body = await readBody(req)
+        const p = str(body.path)
+        if (!p) {
+          json(res, { error: 'path required' }, 400)
+          return
+        }
+        json(res, await sessions.scanForImport(p))
+        return
+      }
+      // Project import — COMMIT: adopt the selected vendor chats as hub sessions under the project.
+      // They appear in the sidebar (auto-named, filed under the project) over the same /ws path a
+      // native session uses, and resume the real vendor transcript on first send.
+      const importMatch = /^\/api\/projects\/([^/]+)\/import$/.exec(url.pathname)
+      if (method === 'POST' && importMatch) {
+        const project = projects.get(importMatch[1] as string)
+        if (!project) {
+          json(res, { error: `unknown project: ${importMatch[1]}` }, 404)
+          return
+        }
+        const body = await readBody(req)
+        const ids = Array.isArray(body.vendorSessionIds)
+          ? body.vendorSessionIds.filter((x): x is string => typeof x === 'string')
+          : []
+        const result = await sessions.importChats(project.id, project.path, ids)
+        json(res, result)
+        return
+      }
       // Operator profile + scoped instructions, materialized into each agent at spawn.
       if (method === 'GET' && url.pathname === '/api/instructions') {
         json(res, instructions.list())

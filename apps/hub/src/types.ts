@@ -35,6 +35,11 @@ export interface SessionRecord {
   // falls back to the worktree/cwd basename.
   title?: string
   titleSource?: 'auto' | 'user'
+  // True when this record was ADOPTED from an existing vendor transcript (Claude Code / Codex) via
+  // the project-import flow rather than spawned by the hub. Drives a sidebar badge and the
+  // delete-never-unlinks guard (the source transcript is the user's own history — never removed).
+  // Optional key → no store migration; absent means hub-native.
+  imported?: boolean
   createdAt: string
 }
 

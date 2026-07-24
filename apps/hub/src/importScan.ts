@@ -1,0 +1,439 @@
+/**
+ * Project import — discover existing Claude Code / Codex conversations on disk whose recorded
+ * working directory belongs to a folder, so the hub can adopt them as auto-named sessions.
+ *
+ * Grounded in the REAL on-disk formats on this machine (inspected 2026-07-24):
+ *
+ *  - Claude Code: `<CLAUDE_CONFIG_DIR>/projects/<encoded-cwd>/<session-uuid>.jsonl`, one file per
+ *    session. `encoded-cwd = cwd.replace(/[^a-zA-Z0-9]/g,'-')` — deterministic FORWARD but lossy in
+ *    reverse (`foo bar`, `foo-bar`, `foo.bar` all collide), so we use it only to *narrow* candidate
+ *    folders and then CONFIRM by reading the `cwd` field inside the transcript. Records are one JSON
+ *    object per line; the session uuid (filename stem, also `sessionId` on every record) is the
+ *    resume id. A `user` record's `message.content` is a string OR a block array — and is frequently
+ *    a `tool_result` array rather than real user text, so the first *prompt* is the first `user`
+ *    record that yields an actual `text` block. `ai-title.aiTitle` is Claude's own generated label.
+ *
+ *  - Codex: `<CODEX_HOME>/sessions/YYYY/MM/DD/rollout-<ISO>-<session_id>.jsonl`, date-partitioned
+ *    (NOT keyed by cwd — must walk + read line 1). Line 1 is `session_meta` with `payload.cwd`
+ *    (real backslash path) and `payload.session_id` (the `thread/resume` id). The cleanest first
+ *    prompt is the first `event_msg` whose `payload.type === 'user_message'` (its `payload.message`
+ *    is a plain string) — this skips the injected developer/plugin `response_item` framing.
+ *
+ * Everything below the parse helpers is bounded file I/O (glob + streamed head reads, capped bytes),
+ * never a whole-file `JSON.parse` — real transcripts reach many MB.
+ */
+import fs from 'node:fs'
+import path from 'node:path'
+import readline from 'node:readline'
+import { deriveTitle, sanitizeTitle } from './title.js'
+import type { Profile, Provider } from './types.js'
+
+export interface ImportableChat {
+  provider: Provider
+  /** Claude session uuid / Codex session_id — the vendor resume id. */
+  vendorSessionId: string
+  /** The profile (config dir) that owns the transcript; the import binds + resumes under it. */
+  profileId: string
+  cwd: string
+  /** Auto-name: deriveTitle(firstUserMessage), falling back to Claude's ai-title, then a generic. */
+  title: string
+  firstPrompt?: string
+  aiTitle?: string
+  /** ISO — the transcript file's mtime (reliable; the tail record often carries no timestamp). */
+  lastActivity: string
+  messageCount: number
+  model?: string
+  gitBranch?: string
+  sizeBytes: number
+  /** Absolute path to the source transcript (hub-internal; never sent to the browser wholesale). */
+  transcriptPath: string
+  /** Already adopted as a hub SessionRecord (dedupe by profileId + vendorSessionId). */
+  alreadyImported: boolean
+}
+
+export interface ScanResult {
+  path: string
+  chats: ImportableChat[]
+  /** profileId → count of importable (not-yet-imported) chats found under it. */
+  byProfile: Record<string, number>
+  scannedProfiles: string[]
+  warnings: string[]
+}
+
+export interface DiscoverOptions {
+  profiles: Profile[]
+  path: string
+  /** `${profileId}::${vendorSessionId}` for every hub session that already carries a vendor id. */
+  importedKeys: Set<string>
+  /** Hub-internal worktrees root — transcripts whose cwd lives here are hub scratch, never offered. */
+  worktreesRoot?: string
+  maxBytesPerFile?: number
+  maxCodexFiles?: number
+}
+
+const MAX_SCAN_BYTES = 4 * 1024 * 1024 // read at most 4 MB of a transcript to build its scan card
+const MAX_CODEX_FILES = 2000 // bound the Codex walk (newest first) on huge histories
+
+/** The dedupe key: a vendor session is identified by its owning profile + its vendor id. */
+export function importKey(profileId: string, vendorSessionId: string): string {
+  return `${profileId}::${vendorSessionId}`
+}
+
+/** Claude's lossy forward cwd → folder-name encoding. Used only to narrow candidate folders. */
+export function encodeClaudeCwd(cwd: string): string {
+  return cwd.replace(/[^a-zA-Z0-9]/g, '-')
+}
+
+/** Normalize a path for comparison: unify separators, drop trailing slash, lowercase (Windows). */
+export function normPath(p: string): string {
+  return p.replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase()
+}
+
+/** True when `recordCwd` is the target folder itself or nested inside it. */
+export function cwdMatches(recordCwd: string, target: string): boolean {
+  const a = normPath(recordCwd)
+  const b = normPath(target)
+  return a === b || a.startsWith(b + '/')
+}
+
+/** True when `cwd` is the hub's worktrees root or inside it (hub scratch — excluded from import). */
+export function isUnderWorktrees(cwd: string, worktreesRoot?: string): boolean {
+  if (!worktreesRoot) return false
+  const a = normPath(cwd)
+  const w = normPath(worktreesRoot)
+  return a === w || a.startsWith(w + '/')
+}
+
+/**
+ * Whether a Claude `projects/<dir>` folder could hold transcripts for `target` or a subfolder.
+ * A path inside `target` encodes to `enc(target)` + '-' + …, so this prefix test is a sound
+ * (case-insensitive) SUPERSET filter — it may over-include a sibling like `foo-x` for target
+ * `foo`, which the per-transcript `cwd` confirmation then rejects. Cheap narrowing, never trusted.
+ */
+export function isCandidateClaudeDir(dirName: string, target: string): boolean {
+  const enc = encodeClaudeCwd(target).toLowerCase()
+  const d = dirName.toLowerCase()
+  return d === enc || d.startsWith(enc + '-')
+}
+
+// Injected / synthetic user-message wrappers that are never a real first prompt.
+function isSyntheticUserText(t: string): boolean {
+  return (
+    /^<(command-|local-command|bash-|user-memory|system-)/i.test(t) ||
+    /^Caveat: The messages below/i.test(t) ||
+    /^\[Request interrupted/i.test(t)
+  )
+}
+
+// The hub's Claude adapter prepends a thinking-budget keyword as the prompt's OWN first line
+// (`ultrathink\n\n<prompt>`), so an imported transcript's first user message starts with it. Strip a
+// leading standalone keyword line so the title/preview reflect the real prompt, not "ultrathink".
+function stripThinkingPreamble(text: string): string {
+  return text.replace(/^\s*(ultrathink|megathink|think hard|think)\s*(\r?\n)+/i, '').trim() || text.trim()
+}
+
+/** First real user text from a Claude `message.content` (string, or the first `text` block). */
+function firstUserText(content: unknown): string | undefined {
+  if (typeof content === 'string') {
+    const t = content.trim()
+    return t && !isSyntheticUserText(t) ? stripThinkingPreamble(t) : undefined
+  }
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block && typeof block === 'object' && (block as { type?: string }).type === 'text') {
+        const t = String((block as { text?: unknown }).text ?? '').trim()
+        if (t && !isSyntheticUserText(t)) return stripThinkingPreamble(t)
+      }
+    }
+  }
+  return undefined
+}
+
+export interface ParsedClaude {
+  sessionId?: string
+  cwd?: string
+  firstPrompt?: string
+  aiTitle?: string
+  model?: string
+  gitBranch?: string
+  messageCount: number
+}
+
+/** Pure: fold an array of parsed Claude JSONL records into the fields a scan card needs. */
+export function parseClaudeRecords(records: unknown[]): ParsedClaude {
+  const out: ParsedClaude = { messageCount: 0 }
+  for (const rec of records) {
+    if (!rec || typeof rec !== 'object') continue
+    const r = rec as Record<string, unknown>
+    if (typeof r.sessionId === 'string' && !out.sessionId) out.sessionId = r.sessionId
+    if (typeof r.cwd === 'string' && !out.cwd) out.cwd = r.cwd
+    if (typeof r.gitBranch === 'string' && !out.gitBranch) out.gitBranch = r.gitBranch
+    if (r.type === 'ai-title' && typeof r.aiTitle === 'string' && r.aiTitle.trim() && !out.aiTitle) {
+      out.aiTitle = r.aiTitle.trim()
+    }
+    if (r.type === 'user' || r.type === 'assistant') {
+      out.messageCount++
+      const message = r.message as { role?: string; model?: string; content?: unknown } | undefined
+      if (r.type === 'assistant' && !out.model && typeof message?.model === 'string') out.model = message.model
+      if (r.type === 'user' && !out.firstPrompt && r.isMeta !== true) {
+        const text = firstUserText(message?.content)
+        if (text) out.firstPrompt = text
+      }
+    }
+  }
+  return out
+}
+
+export interface ParsedCodex {
+  sessionId?: string
+  cwd?: string
+  firstPrompt?: string
+  originator?: string
+  cliVersion?: string
+  model?: string
+  messageCount: number
+}
+
+/** Pure: fold an array of parsed Codex rollout records into the fields a scan card needs. */
+export function parseCodexRecords(records: unknown[]): ParsedCodex {
+  const out: ParsedCodex = { messageCount: 0 }
+  for (const rec of records) {
+    if (!rec || typeof rec !== 'object') continue
+    const r = rec as Record<string, unknown>
+    const payload = (r.payload ?? {}) as Record<string, unknown>
+    if (r.type === 'session_meta') {
+      if (typeof payload.session_id === 'string') out.sessionId = payload.session_id
+      else if (typeof payload.id === 'string') out.sessionId = payload.id
+      if (typeof payload.cwd === 'string') out.cwd = payload.cwd
+      if (typeof payload.originator === 'string') out.originator = payload.originator
+      if (typeof payload.cli_version === 'string') out.cliVersion = payload.cli_version
+    } else if (r.type === 'event_msg') {
+      if (payload.type === 'user_message') {
+        out.messageCount++
+        if (!out.firstPrompt && typeof payload.message === 'string') {
+          const t = payload.message.trim()
+          if (t && !isSyntheticUserText(t)) out.firstPrompt = t
+        }
+      } else if (payload.type === 'agent_message') {
+        out.messageCount++
+      }
+    } else if (r.type === 'turn_context' && typeof payload.model === 'string' && !out.model) {
+      out.model = payload.model
+    }
+  }
+  return out
+}
+
+/** Compose the auto-name: deriveTitle(firstPrompt) preferred (per spec), else ai-title, else generic. */
+function composeTitle(provider: Provider, firstPrompt?: string, aiTitle?: string): string {
+  const derived = firstPrompt ? deriveTitle(firstPrompt) : ''
+  if (derived) return derived
+  if (aiTitle) return sanitizeTitle(aiTitle)
+  return provider === 'claude' ? 'imported Claude chat' : 'imported Codex chat'
+}
+
+/**
+ * Read a JSONL transcript line-by-line, parsing each line, until `maxBytes` is consumed. Bounds
+ * multi-MB files (the scan only needs head-ish fields + a count); a truncated read yields a floor
+ * count, never a hang. Malformed lines are skipped.
+ */
+async function readJsonlBounded(file: string, maxBytes: number): Promise<{ records: unknown[]; truncated: boolean }> {
+  const records: unknown[] = []
+  let bytes = 0
+  let truncated = false
+  const stream = fs.createReadStream(file, { encoding: 'utf8' })
+  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity })
+  try {
+    for await (const line of rl) {
+      bytes += Buffer.byteLength(line) + 1
+      const t = line.trim()
+      if (t) {
+        try {
+          records.push(JSON.parse(t))
+        } catch {
+          /* skip a malformed line — a partial write or a non-JSON row shouldn't abort the scan */
+        }
+      }
+      if (bytes >= maxBytes) {
+        truncated = true
+        break
+      }
+    }
+  } finally {
+    rl.close()
+    stream.destroy()
+  }
+  return { records, truncated }
+}
+
+interface Ctx {
+  maxBytes: number
+  imported: Set<string>
+  isExcluded: (cwd: string) => boolean
+}
+
+async function discoverClaudeChats(
+  profile: Profile,
+  target: string,
+  ctx: Ctx
+): Promise<{ chats: ImportableChat[]; warnings: string[] }> {
+  const chats: ImportableChat[] = []
+  const warnings: string[] = []
+  const projectsDir = path.join(profile.dir, 'projects')
+  if (!fs.existsSync(projectsDir)) return { chats, warnings }
+  for (const dirName of fs.readdirSync(projectsDir)) {
+    if (!isCandidateClaudeDir(dirName, target)) continue
+    const dir = path.join(projectsDir, dirName)
+    let dirStat: fs.Stats
+    try {
+      dirStat = fs.statSync(dir)
+    } catch {
+      continue
+    }
+    if (!dirStat.isDirectory()) continue
+    for (const file of fs.readdirSync(dir)) {
+      if (!file.endsWith('.jsonl')) continue
+      const full = path.join(dir, file)
+      try {
+        const st = fs.statSync(full)
+        const { records } = await readJsonlBounded(full, ctx.maxBytes)
+        const parsed = parseClaudeRecords(records)
+        // Confirm via the transcript's own cwd field (the folder name is lossy) and skip hub scratch.
+        if (!parsed.cwd || !cwdMatches(parsed.cwd, target) || ctx.isExcluded(parsed.cwd)) continue
+        // Only offer real conversations: a transcript with no human prompt and no ai-title is a
+        // command probe (e.g. the hub's own `/usage` rate-limit reads run in apps/hub) or an empty
+        // session — not a chat worth importing.
+        if (!parsed.firstPrompt && !parsed.aiTitle) continue
+        const vendorSessionId = parsed.sessionId ?? path.basename(file, '.jsonl')
+        chats.push({
+          provider: 'claude',
+          vendorSessionId,
+          profileId: profile.id,
+          cwd: parsed.cwd,
+          title: composeTitle('claude', parsed.firstPrompt, parsed.aiTitle),
+          firstPrompt: parsed.firstPrompt,
+          aiTitle: parsed.aiTitle,
+          lastActivity: st.mtime.toISOString(),
+          messageCount: parsed.messageCount,
+          model: parsed.model,
+          gitBranch: parsed.gitBranch,
+          sizeBytes: st.size,
+          transcriptPath: full,
+          alreadyImported: ctx.imported.has(importKey(profile.id, vendorSessionId)),
+        })
+      } catch (err) {
+        warnings.push(`unreadable Claude transcript ${dirName}/${file}: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+  }
+  return { chats, warnings }
+}
+
+/** Recursively collect `rollout-*.jsonl` files under a Codex `sessions/` tree, newest mtime first. */
+function walkRollouts(root: string, cap: number): string[] {
+  const found: { file: string; mtimeMs: number }[] = []
+  const stack = [root]
+  while (stack.length) {
+    const dir = stack.pop() as string
+    let entries: fs.Dirent[]
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) stack.push(full)
+      else if (entry.isFile() && entry.name.startsWith('rollout-') && entry.name.endsWith('.jsonl')) {
+        try {
+          found.push({ file: full, mtimeMs: fs.statSync(full).mtimeMs })
+        } catch {
+          /* vanished mid-walk — ignore */
+        }
+      }
+    }
+  }
+  found.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  return found.slice(0, cap).map((f) => f.file)
+}
+
+async function discoverCodexChats(
+  profile: Profile,
+  target: string,
+  ctx: Ctx,
+  maxFiles: number
+): Promise<{ chats: ImportableChat[]; warnings: string[] }> {
+  const chats: ImportableChat[] = []
+  const warnings: string[] = []
+  const sessionsDir = path.join(profile.dir, 'sessions')
+  if (!fs.existsSync(sessionsDir)) return { chats, warnings }
+  for (const full of walkRollouts(sessionsDir, maxFiles)) {
+    try {
+      const st = fs.statSync(full)
+      const { records } = await readJsonlBounded(full, ctx.maxBytes)
+      const parsed = parseCodexRecords(records)
+      if (!parsed.cwd || !cwdMatches(parsed.cwd, target) || ctx.isExcluded(parsed.cwd)) continue
+      // Skip rollouts with no human prompt (empty / system-only sessions aren't chats).
+      if (!parsed.firstPrompt) continue
+      const vendorSessionId = parsed.sessionId ?? codexIdFromFilename(full)
+      if (!vendorSessionId) continue
+      chats.push({
+        provider: 'codex',
+        vendorSessionId,
+        profileId: profile.id,
+        cwd: parsed.cwd,
+        title: composeTitle('codex', parsed.firstPrompt),
+        firstPrompt: parsed.firstPrompt,
+        lastActivity: st.mtime.toISOString(),
+        messageCount: parsed.messageCount,
+        model: parsed.model,
+        sizeBytes: st.size,
+        transcriptPath: full,
+        alreadyImported: ctx.imported.has(importKey(profile.id, vendorSessionId)),
+      })
+    } catch (err) {
+      warnings.push(`unreadable Codex rollout ${path.basename(full)}: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+  return { chats, warnings }
+}
+
+/** Recover a Codex session_id from a `rollout-<ISO>-<uuid>.jsonl` filename (fallback only). */
+function codexIdFromFilename(file: string): string | undefined {
+  const m = /rollout-\d{4}-\d{2}-\d{2}T[\d-]+-([0-9a-fA-F-]{36})\.jsonl$/.exec(path.basename(file))
+  return m?.[1]
+}
+
+/**
+ * Scan every profile for conversations whose recorded cwd is `path` (or nested inside it), skipping
+ * hub worktree scratch and marking any already adopted. Bounded, read-only; sends nothing anywhere.
+ */
+export async function discoverImportableChats(opts: DiscoverOptions): Promise<ScanResult> {
+  const target = opts.path
+  const chats: ImportableChat[] = []
+  const warnings: string[] = []
+  const scannedProfiles: string[] = []
+  const ctx: Ctx = {
+    maxBytes: opts.maxBytesPerFile ?? MAX_SCAN_BYTES,
+    imported: opts.importedKeys,
+    isExcluded: (cwd) => isUnderWorktrees(cwd, opts.worktreesRoot),
+  }
+  const maxCodexFiles = opts.maxCodexFiles ?? MAX_CODEX_FILES
+  for (const profile of opts.profiles) {
+    scannedProfiles.push(profile.id)
+    try {
+      const res =
+        profile.provider === 'claude'
+          ? await discoverClaudeChats(profile, target, ctx)
+          : await discoverCodexChats(profile, target, ctx, maxCodexFiles)
+      chats.push(...res.chats)
+      warnings.push(...res.warnings)
+    } catch (err) {
+      warnings.push(`scan failed for profile ${profile.id}: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+  chats.sort((a, b) => b.lastActivity.localeCompare(a.lastActivity))
+  const byProfile: Record<string, number> = {}
+  for (const c of chats) if (!c.alreadyImported) byProfile[c.profileId] = (byProfile[c.profileId] ?? 0) + 1
+  return { path: target, chats, byProfile, scannedProfiles, warnings }
+}
