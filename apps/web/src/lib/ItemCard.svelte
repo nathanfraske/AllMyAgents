@@ -1,6 +1,8 @@
 <script lang="ts">
   import type { ThreadItem } from './store.svelte'
   import Markdown from './Markdown.svelte'
+  import DiffView from './DiffView.svelte'
+  import { fileDiffsFromItem } from './diff'
 
   let { item }: { item: ThreadItem } = $props()
   let open = $state(false)
@@ -9,6 +11,11 @@
   const longUser = $derived(
     item.kind === 'user' && !!item.text && (item.text.length > 600 || item.text.split('\n').length > 8)
   )
+
+  // File-create/edit tool calls (Claude Edit/Write/MultiEdit, Codex fileChange) render as rich
+  // syntax-highlighted diffs; null when the item isn't a recognizable file edit, in which case
+  // the generic tool rendering below is kept.
+  const diffs = $derived(item.kind === 'tool' ? fileDiffsFromItem(item) : null)
 </script>
 
 {#if item.kind === 'status'}
@@ -35,17 +42,28 @@
     <div class="reasoned dim" title="Claude reasoned about this. Claude Code does not expose the reasoning text on subscription accounts.">✦ reasoned</div>
   {/if}
 {:else if item.kind === 'tool'}
-  <div class="tool" class:reflex={item.reflex}>
-    <button class="hd" onclick={() => (open = !open)}>
-      {open ? '▾' : '▸'} <span class="tname">{item.toolName}</span>
-      {#if item.reflex}<span class="reflex-tag" title="tool call with no preceding reasoning">reflex</span>{/if}
-      {#if item.toolError}<span class="fail">error</span>{/if}
-    </button>
-    {#if open}
-      <pre class="io">{JSON.stringify(item.toolInput, null, 2)}</pre>
-      {#if item.toolResult}<pre class="io out" class:fail={item.toolError}>{item.toolResult.slice(0, 2000)}</pre>{/if}
-    {/if}
-  </div>
+  {#if diffs && diffs.length}
+    <div class="diffs">
+      {#each diffs as d, i (i)}
+        <DiffView diff={d} />
+      {/each}
+      {#if item.toolError}
+        <div class="diff-err">{item.toolName} failed{#if item.toolResult} — {item.toolResult.slice(0, 300)}{/if}</div>
+      {/if}
+    </div>
+  {:else}
+    <div class="tool" class:reflex={item.reflex}>
+      <button class="hd" onclick={() => (open = !open)}>
+        {open ? '▾' : '▸'} <span class="tname">{item.toolName}</span>
+        {#if item.reflex}<span class="reflex-tag" title="tool call with no preceding reasoning">reflex</span>{/if}
+        {#if item.toolError}<span class="fail">error</span>{/if}
+      </button>
+      {#if open}
+        <pre class="io">{JSON.stringify(item.toolInput, null, 2)}</pre>
+        {#if item.toolResult}<pre class="io out" class:fail={item.toolError}>{item.toolResult.slice(0, 2000)}</pre>{/if}
+      {/if}
+    </div>
+  {/if}
 {/if}
 
 <style>
@@ -71,4 +89,6 @@
   .io { background: var(--bg); border-radius: 6px; padding: 0.4rem 0.5rem; font-size: 0.72rem; overflow-x: auto; margin: 0.3rem 0 0; }
   .io.out { color: var(--muted); }
   .io.fail { color: var(--bad); }
+  .diffs { display: flex; flex-direction: column; gap: 0.4rem; }
+  .diff-err { color: var(--bad-text); background: color-mix(in srgb, var(--bad) 12%, transparent); border: 1px solid var(--bad); border-radius: 6px; padding: 0.3rem 0.5rem; font-size: 0.74rem; font-family: var(--mono); word-break: break-word; }
 </style>
