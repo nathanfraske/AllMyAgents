@@ -118,7 +118,7 @@
 <div class="sidebar">
   <div class="brand">
     <button class="brandbtn" title="home / dashboard" onclick={() => store.goHome()}>
-      <span class="logo"></span>
+      <img class="logo" src="/logo.png" alt="" />
       <span class="name">AllMyAgents</span>
     </button>
     <span class="tag">fleet</span>
@@ -213,8 +213,7 @@
   .brand { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-3); }
   .brandbtn { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-1) var(--space-2); border-radius: var(--r-sm); }
   .brandbtn:hover { background: var(--surface); }
-  .logo { width: 16px; height: 16px; border-radius: var(--r-sm); background: linear-gradient(135deg, var(--accent), var(--cyan));
-    box-shadow: 0 0 12px -2px color-mix(in srgb, var(--accent) 60%, transparent); }
+  .logo { width: 18px; height: 18px; object-fit: contain; }
   .name { font-weight: var(--fw-semibold); }
   .tag { font-size: var(--text-2xs); text-transform: uppercase; letter-spacing: var(--ls-label); color: var(--dim); border: 1px solid var(--border-strong); border-radius: var(--r-xs); padding: 0 0.3rem; }
   .conn { margin-left: auto; width: 8px; height: 8px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08); }

@@ -98,7 +98,7 @@
         <button class="back" onclick={() => store.goBack()}>← back to your chats</button>
       {/if}
       <div class="hero">
-        <div class="logo"></div>
+        <img class="logo" src="/logo.png" alt="" />
         {#if settings.ownerName}
           <h1>{greeting}</h1>
         {:else}
@@ -223,8 +223,7 @@
   .back { color: var(--muted); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--space-2) var(--space-4); margin-bottom: var(--space-6); font-size: var(--text-sm); }
   .back:hover { border-color: var(--border-accent); color: var(--text); }
   .hero { margin-bottom: var(--space-7); }
-  .hero .logo { width: 36px; height: 36px; border-radius: var(--r-lg); background: linear-gradient(135deg, var(--accent), var(--cyan)); margin-bottom: var(--space-4);
-    box-shadow: 0 0 28px -4px color-mix(in srgb, var(--accent) 60%, transparent); }
+  .hero .logo { width: 40px; height: 40px; object-fit: contain; margin-bottom: var(--space-4); }
   h1 { font-size: var(--text-xl); font-weight: var(--fw-semibold); margin: 0 0 var(--space-3); }
   .nameask { display: flex; gap: var(--space-3); margin: var(--space-4) 0; }
   .nameask input { flex: 1; max-width: 320px; }
