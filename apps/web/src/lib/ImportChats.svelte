@@ -77,7 +77,7 @@
   </div>
 
   {#if scanning}
-    <div class="imsg dim">Scanning your accounts for chats in this folder…</div>
+    <div class="imsg dim scanning">Scanning every Claude &amp; Codex account for this folder — this can take a few seconds…</div>
   {:else if error}
     <div class="imsg err">{error}</div>
   {:else if done}
@@ -141,6 +141,10 @@
   .imsg { font-size: var(--text-sm); padding: var(--space-2) 0; }
   .imsg.err { color: var(--bad-text); }
   .imsg.ok { color: var(--ok); }
+  @media (prefers-reduced-motion: no-preference) {
+    .scanning { animation: iscan 1.4s ease-in-out infinite; }
+    @keyframes iscan { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
+  }
   .isum { font-size: var(--text-sm); color: var(--text); }
   .ilist { display: flex; flex-direction: column; gap: 1px; max-height: 34vh; overflow-y: auto; }
   .ichat { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-2); border-radius: var(--r-sm); cursor: pointer; font-size: var(--text-sm); }
