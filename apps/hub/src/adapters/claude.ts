@@ -10,6 +10,14 @@ export type ClaudePermissionHandler = (
 export interface ClaudeTurnOptions {
   model?: string
   permissionMode?: 'safe' | 'edits' | 'full'
+  effort?: string
+}
+
+// Claude Code recognizes thinking-budget keywords in the prompt text.
+const THINKING_KEYWORD: Record<string, string> = {
+  think: 'think',
+  megathink: 'think hard',
+  ultrathink: 'ultrathink',
 }
 
 export class ClaudeDriver {
@@ -38,6 +46,8 @@ export class ClaudeDriver {
   async send(prompt: string, turnOptions: ClaudeTurnOptions = {}): Promise<void> {
     if (this.active) throw new Error('claude session is already running a turn')
     const env = { ...process.env, CLAUDE_CONFIG_DIR: this.profileDir } as Record<string, string>
+    const keyword = turnOptions.effort ? THINKING_KEYWORD[turnOptions.effort] : undefined
+    const finalPrompt = keyword ? `${keyword}\n\n${prompt}` : prompt
     const options: Record<string, unknown> = {
       env,
       cwd: this.cwd,
@@ -49,7 +59,7 @@ export class ClaudeDriver {
     if (this.canUseTool) {
       options.canUseTool = async (toolName: string, input: unknown) => this.canUseTool!(toolName, input)
     }
-    const q = query({ prompt, options: options as never })
+    const q = query({ prompt: finalPrompt, options: options as never })
     this.active = q as unknown as { interrupt(): Promise<void> }
     try {
       for await (const message of q) {

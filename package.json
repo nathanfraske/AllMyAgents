@@ -2,6 +2,7 @@
   "name": "aiagentapp",
   "private": true,
   "version": "0.0.1",
+  "license": "MIT",
   "packageManager": "pnpm@10.14.0",
   "scripts": {
     "hub:dev": "pnpm --filter hub dev",

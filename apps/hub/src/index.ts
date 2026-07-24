@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { ApprovalService } from './approvals.js'
 import { Journal } from './journal.js'
+import { ProjectStore } from './projects.js'
 import { scanProfiles } from './profiles.js'
 import { SessionManager } from './sessions.js'
 import { SessionStore } from './store.js'
@@ -27,13 +28,26 @@ const profileMap = new Map(profiles.map((p) => [p.id, p]))
 const approvals = new ApprovalService(journal)
 const usage = new UsageMonitor(journal, profiles, config)
 const workspace = new WorkspaceManager(path.join(repoRoot, 'data', 'worktrees'))
-const sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, repoRoot)
+const projects = new ProjectStore(journal.db)
+const sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, repoRoot)
 usage.setCodexReader((profileId) => sessions.readCodexLimits(profileId))
 sessions.boot()
 usage.startPolling()
 
+const profilesDir = path.join(repoRoot, 'profiles')
+function rescanProfiles(): typeof profiles {
+  for (const p of scanProfiles(profilesDir)) {
+    if (!profileMap.has(p.id)) {
+      profileMap.set(p.id, p)
+      usage.addProfile(p) // pushes into the shared `profiles` array (same reference)
+      journal.append(null, 'profiles/added', { id: p.id, provider: p.provider })
+    }
+  }
+  return profiles
+}
+
 const port = Number(process.env.HUB_PORT ?? 7777)
-startServer({ port, defaultCwd: repoRoot, journal, sessions, profiles, approvals, usage })
+startServer({ port, defaultCwd: repoRoot, journal, sessions, profiles, approvals, usage, projects, rescanProfiles })
 journal.append(null, 'hub/started', {
   port,
   profiles: profiles.map((p) => ({ id: p.id, provider: p.provider })),

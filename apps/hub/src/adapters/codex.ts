@@ -8,6 +8,7 @@ export type CodexApprovalHandler = (method: string, params: unknown) => Promise<
 export interface CodexTurnOptions {
   model?: string
   effort?: string
+  serviceTier?: string
   approvalPolicy?: string
 }
 
@@ -123,6 +124,7 @@ export class CodexClient {
     const params: Record<string, unknown> = { threadId, input: [{ type: 'text', text }] }
     if (opts.model) params.model = opts.model
     if (opts.effort) params.effort = opts.effort
+    if (opts.serviceTier) params.serviceTier = opts.serviceTier
     if (opts.approvalPolicy) params.approvalPolicy = opts.approvalPolicy
     await this.request('turn/start', params)
   }

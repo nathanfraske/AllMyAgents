@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import path from 'node:path'
 import type { ApprovalService } from './approvals.js'
 import type { Journal } from './journal.js'
+import type { ProjectStore } from './projects.js'
 import type { SessionStore } from './store.js'
 import type { UsageMonitor } from './usage.js'
 import type { WorkspaceManager } from './workspace.js'
@@ -12,15 +13,18 @@ import { CodexClient } from './adapters/codex.js'
 export interface CreateOptions {
   cwd?: string
   repo?: string
+  projectId?: string
   prompt?: string
   model?: string
   effort?: string
+  serviceTier?: string
   permissionMode?: 'safe' | 'edits' | 'full'
 }
 
 export interface TurnOverride {
   model?: string
   effort?: string
+  serviceTier?: string
 }
 
 export class SessionManager {
@@ -36,6 +40,7 @@ export class SessionManager {
     private readonly approvals: ApprovalService,
     private readonly usage: UsageMonitor,
     private readonly workspace: WorkspaceManager,
+    private readonly projects: ProjectStore,
     private readonly defaultCwd: string
   ) {}
 
@@ -153,23 +158,35 @@ export class SessionManager {
     if (!profile) throw new Error(`unknown profile: ${profileId}`)
     this.usage.assertNotBlocked(profileId)
     const id = crypto.randomUUID()
+    // Resolve a project (named folder) into a working directory / repo, if given.
+    // An explicit cwd (e.g. a handoff/port reusing an existing worktree) wins over the
+    // project path and skips worktree creation, while still tagging the project for grouping.
     let cwd = opts.cwd ?? this.defaultCwd
+    let repo = opts.repo
+    if (opts.projectId && !opts.cwd) {
+      const project = this.projects.get(opts.projectId)
+      if (!project) throw new Error(`unknown project: ${opts.projectId}`)
+      cwd = project.path
+      if (this.workspace.isRepo(project.path)) repo = project.path
+    }
     let worktree: string | undefined
-    if (opts.repo) {
-      worktree = this.workspace.create(opts.repo, id)
+    if (repo) {
+      worktree = this.workspace.create(repo, id)
       cwd = worktree
-      this.journal.append(id, 'session/worktree-created', { repo: opts.repo, worktree })
+      this.journal.append(id, 'session/worktree-created', { repo, worktree })
     }
     const record: SessionRecord = {
       id,
       profileId,
       provider: profile.provider,
+      projectId: opts.projectId,
       cwd,
-      repo: opts.repo,
+      repo,
       worktree,
       status: 'starting',
       model: opts.model,
       effort: opts.effort,
+      serviceTier: opts.serviceTier,
       permissionMode: opts.permissionMode,
       createdAt: new Date().toISOString(),
     }
@@ -197,7 +214,7 @@ export class SessionManager {
     const driver = this.claudeDriverFor(record)
     this.setStatus(record, 'active')
     try {
-      await driver.send(prompt, { model: record.model, permissionMode: record.permissionMode })
+      await driver.send(prompt, { model: record.model, permissionMode: record.permissionMode, effort: record.effort })
       if (driver.sessionId) {
         record.vendorSessionId = driver.sessionId
         this.persist(record)
@@ -231,6 +248,7 @@ export class SessionManager {
       await client.sendTurn(threadId, prompt, {
         model: record.model,
         effort: record.effort,
+        serviceTier: record.serviceTier,
         approvalPolicy:
           record.permissionMode === 'full' ? 'never' : record.permissionMode ? 'onRequest' : undefined,
       })
@@ -248,8 +266,9 @@ export class SessionManager {
     if (record.status === 'stopped') throw new Error('session is stopped')
     this.usage.assertNotBlocked(record.profileId)
     if (override.model) record.model = override.model
-    if (override.effort) record.effort = override.effort
-    if (override.model || override.effort) this.persist(record)
+    if (override.effort !== undefined) record.effort = override.effort
+    if (override.serviceTier !== undefined) record.serviceTier = override.serviceTier
+    if (override.model || override.effort !== undefined || override.serviceTier !== undefined) this.persist(record)
     if (record.provider === 'claude') {
       if (this.claudeDrivers.get(sessionId)?.busy) throw new Error('a turn is already in progress')
       void this.runClaudeTurn(record, text)

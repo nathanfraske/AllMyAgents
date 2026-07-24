@@ -2,8 +2,10 @@ import http from 'node:http'
 import { WebSocketServer, WebSocket } from 'ws'
 import type { ApprovalService } from './approvals.js'
 import type { Journal } from './journal.js'
+import type { ProjectStore } from './projects.js'
 import type { SessionManager } from './sessions.js'
 import type { UsageMonitor } from './usage.js'
+import { pickFolder } from './native.js'
 import type { HubEvent, Profile } from './types.js'
 
 const PAGE = `<!doctype html>
@@ -172,10 +174,12 @@ export interface ServerOptions {
   profiles: Profile[]
   approvals: ApprovalService
   usage: UsageMonitor
+  projects: ProjectStore
+  rescanProfiles: () => Profile[]
 }
 
 export function startServer(opts: ServerOptions): http.Server {
-  const { port, journal, sessions, profiles, approvals, usage } = opts
+  const { port, journal, sessions, profiles, approvals, usage, projects, rescanProfiles } = opts
 
   const server = http.createServer((req, res) => {
     void handle(req, res)
@@ -192,6 +196,26 @@ export function startServer(opts: ServerOptions): http.Server {
       }
       if (method === 'GET' && url.pathname === '/api/profiles') {
         json(res, profiles.map((p) => ({ id: p.id, provider: p.provider })))
+        return
+      }
+      if (method === 'POST' && url.pathname === '/api/profiles/rescan') {
+        const list = rescanProfiles()
+        json(res, list.map((p) => ({ id: p.id, provider: p.provider })))
+        return
+      }
+      if (method === 'POST' && url.pathname === '/api/pick-folder') {
+        const picked = await pickFolder()
+        json(res, { path: picked })
+        return
+      }
+      if (method === 'GET' && url.pathname === '/api/projects') {
+        json(res, projects.list())
+        return
+      }
+      if (method === 'POST' && url.pathname === '/api/projects') {
+        const body = await readBody(req)
+        const project = projects.create(String(body.name ?? ''), String(body.path ?? ''))
+        json(res, project)
         return
       }
       if (method === 'GET' && url.pathname === '/api/sessions') {
@@ -221,9 +245,11 @@ export function startServer(opts: ServerOptions): http.Server {
         const record = await sessions.create(String(body.profileId ?? ''), {
           cwd: str(body.cwd),
           repo: str(body.repo),
+          projectId: str(body.projectId),
           prompt: str(body.prompt),
           model: str(body.model),
           effort: str(body.effort),
+          serviceTier: str(body.serviceTier),
           permissionMode: pm === 'safe' || pm === 'edits' || pm === 'full' ? pm : undefined,
         })
         json(res, record)
@@ -254,7 +280,11 @@ export function startServer(opts: ServerOptions): http.Server {
         const verb = sessionAction[2] as string
         if (verb === 'input') {
           const body = await readBody(req)
-          await sessions.send(id, String(body.text ?? ''), { model: str(body.model), effort: str(body.effort) })
+          await sessions.send(id, String(body.text ?? ''), {
+            model: str(body.model),
+            effort: body.effort === undefined ? undefined : String(body.effort),
+            serviceTier: body.serviceTier === undefined ? undefined : String(body.serviceTier),
+          })
         } else if (verb === 'interrupt') {
           await sessions.interrupt(id)
         } else {

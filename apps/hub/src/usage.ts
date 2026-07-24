@@ -41,6 +41,17 @@ export class UsageMonitor {
     return [...this.snapshots.values()]
   }
 
+  addProfile(p: Profile): void {
+    if (this.snapshots.has(p.id)) return
+    this.profiles.push(p)
+    this.snapshots.set(p.id, {
+      profileId: p.id,
+      provider: p.provider,
+      updatedAt: new Date().toISOString(),
+      blocked: false,
+    })
+  }
+
   policyFor(profileId: string): OveragePolicy {
     return this.config.overage?.[profileId] ?? 'block'
   }

@@ -30,7 +30,7 @@
         {#each u.claudeUsage as line (line.label)}
           <div class="bars">
             <div class="line small"><span class="muted">{line.label.replace('Current ', '')}</span>
-              <span class="reset dim">{line.percent}%</span></div>
+              <span class="reset dim">{line.percent}%{#if line.resetsAt} · {resetIn(line.resetsAt)}{/if}</span></div>
             <div class="bar"><div class="fill" class:hot={line.percent > 85} style="width:{line.percent}%"></div></div>
           </div>
         {/each}

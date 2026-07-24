@@ -1,5 +1,11 @@
 import { api } from './api'
-import type { ApprovalRecord, HubEvent, ProfileInfo, SessionRecord, UsageSnapshot } from './api'
+import { settings } from './settings.svelte'
+import type { ApprovalRecord, HubEvent, ProfileInfo, ProjectInfo, SessionRecord, UsageSnapshot } from './api'
+
+export interface StatusInfo {
+  key: string
+  label: string
+}
 
 export type ItemKind = 'user' | 'assistant' | 'thinking' | 'tool' | 'reasoning' | 'status' | 'error' | 'note'
 
@@ -21,6 +27,7 @@ export interface SessionView {
   items: ThreadItem[]
   lastActivity: string
   sawReasoning: boolean
+  lastTurnOk?: boolean
   contextUsed?: number
   contextWindow?: number
   costUsd?: number
@@ -50,12 +57,52 @@ function asText(content: unknown): string {
 
 class HubStore {
   profiles = $state<ProfileInfo[]>([])
+  projects = $state<ProjectInfo[]>([])
   sessions = $state<Record<string, SessionView>>({})
   approvals = $state<ApprovalRecord[]>([])
   usage = $state<UsageSnapshot[]>([])
   connected = $state(false)
   selectedId = $state<string | null>(null)
+  settingsOpen = $state(false)
+  queues = $state<Record<string, string[]>>({})
   lastSeq = 0
+
+  queueFor(sessionId: string): string[] {
+    return this.queues[sessionId] ?? []
+  }
+
+  enqueue(sessionId: string, text: string): void {
+    const q = [...(this.queues[sessionId] ?? []), text]
+    this.queues = { ...this.queues, [sessionId]: q }
+  }
+
+  editQueued(sessionId: string, index: number, text: string): void {
+    const q = [...(this.queues[sessionId] ?? [])]
+    if (index < 0 || index >= q.length) return
+    q[index] = text
+    this.queues = { ...this.queues, [sessionId]: q }
+  }
+
+  removeQueued(sessionId: string, index: number): void {
+    const q = (this.queues[sessionId] ?? []).filter((_, i) => i !== index)
+    this.queues = { ...this.queues, [sessionId]: q }
+  }
+
+  private flushQueue(sessionId: string): void {
+    const q = this.queues[sessionId]
+    if (!q || q.length === 0) return
+    let toSend: string
+    let rest: string[]
+    if (settings.combineQueued) {
+      toSend = q.join('\n\n')
+      rest = []
+    } else {
+      toSend = q[0] as string
+      rest = q.slice(1)
+    }
+    this.queues = { ...this.queues, [sessionId]: rest }
+    void api.send(sessionId, toSend)
+  }
 
   private ws: WebSocket | null = null
 
@@ -75,8 +122,119 @@ class HubStore {
 
   async init(): Promise<void> {
     this.profiles = await api.profiles()
+    this.projects = await api.projects()
     await this.refreshSideData()
     this.connect()
+  }
+
+  async rescanProfiles(): Promise<void> {
+    this.profiles = await api.rescanProfiles()
+  }
+
+  lastProfileId = $state<string | null>(null)
+
+  defaultProfileId(): string | undefined {
+    if (this.lastProfileId && this.profiles.some((p) => p.id === this.lastProfileId)) return this.lastProfileId
+    return this.profiles[0]?.id
+  }
+
+  // Open an empty chat immediately — no prompt/model/etc. up front; configure in the composer.
+  async newSession(profileId?: string, projectId?: string): Promise<void> {
+    const pid = profileId ?? this.defaultProfileId()
+    if (!pid) {
+      this.settingsOpen = true
+      return
+    }
+    const out = await api.spawn(projectId ? { profileId: pid, projectId } : { profileId: pid })
+    if (out && !('error' in out)) {
+      this.lastProfileId = pid
+      this.select((out as { id: string }).id)
+    } else if (out && 'error' in out) {
+      alert(out.error)
+    }
+  }
+
+  // Swap the account "at will". Empty chat → seamless re-create under the new account.
+  // A chat with history → PORT: carry the conversation context + working files into a fresh
+  // session on the target account (auth is per-account, so we move the work, not the auth).
+  async useAccount(profileId: string): Promise<void> {
+    const cur = this.selectedId ? this.sessions[this.selectedId] : null
+    if (!cur) {
+      await this.newSession(profileId)
+      return
+    }
+    if (cur.record.profileId === profileId) return
+    const isEmpty = cur.items.filter((i) => i.kind === 'user' || i.kind === 'assistant').length === 0
+    if (isEmpty) {
+      await api.stop(cur.record.id).catch(() => undefined)
+      await this.newSession(profileId, cur.record.projectId)
+    } else {
+      await this.portTo(profileId)
+    }
+  }
+
+  private buildTranscript(view: SessionView): string {
+    const lines: string[] = []
+    for (const it of view.items) {
+      if (it.kind === 'user') lines.push(`User: ${it.text ?? ''}`)
+      else if (it.kind === 'assistant') lines.push(`Assistant: ${it.text ?? ''}`)
+      else if (it.kind === 'tool') lines.push(`[tool call: ${it.toolName ?? ''}]`)
+    }
+    let t = lines.join('\n\n')
+    if (t.length > 8000) t = '…(earlier context trimmed)…\n\n' + t.slice(-8000)
+    return t
+  }
+
+  // Port the current conversation to a new session under `profileId`, reusing the same
+  // working directory (files travel) and seeding the target agent with the transcript.
+  // The original chat is left intact as a snapshot.
+  async portTo(profileId: string): Promise<void> {
+    const cur = this.selectedId ? this.sessions[this.selectedId] : null
+    if (!cur) return
+    const cwd = cur.record.worktree ?? cur.record.cwd
+    const transcript = this.buildTranscript(cur)
+    const prompt =
+      `You are taking over a conversation that was running on a different account. The working ` +
+      `directory and files are unchanged. Here is the context so far:\n\n${transcript}\n\n` +
+      `Briefly confirm you have the context, then wait for the next instruction.`
+    const body: Record<string, unknown> = { profileId, cwd, prompt }
+    if (cur.record.projectId) body.projectId = cur.record.projectId
+    const out = await api.spawn(body)
+    if (out && !('error' in out)) {
+      this.lastProfileId = profileId
+      this.select((out as { id: string }).id)
+    } else if (out && 'error' in out) {
+      alert(out.error)
+    }
+  }
+
+  async refreshProjects(): Promise<void> {
+    this.projects = await api.projects()
+  }
+
+  status(view: SessionView): StatusInfo {
+    const pending = this.approvals.filter((a) => a.sessionId === view.record.id)
+    if (pending.length > 0) {
+      const isQuestion = pending.some((a) => {
+        const tool = (a.payload as { toolName?: string } | null)?.toolName ?? a.kind
+        return /AskUserQuestion|ExitPlanMode|elicitation|user.input/i.test(String(tool))
+      })
+      return isQuestion ? { key: 'question', label: 'awaiting answer' } : { key: 'approval', label: 'needs approval' }
+    }
+    switch (view.record.status) {
+      case 'starting':
+        return { key: 'starting', label: 'starting' }
+      case 'active':
+        return { key: 'working', label: 'working' }
+      case 'error':
+        return { key: 'error', label: 'error' }
+      case 'stopped':
+        return { key: 'stopped', label: 'stopped' }
+      case 'idle':
+        return view.lastTurnOk ? { key: 'completed', label: 'completed' } : { key: 'idle', label: 'ready' }
+      default:
+        return { key: 'idle', label: view.record.status }
+    }
   }
 
   async refreshSideData(): Promise<void> {
@@ -163,6 +321,8 @@ class HubStore {
         const status = (payload as { status: string }).status
         view.record.status = status
         this.push(view, { kind: 'status', ts, status })
+        // Flush on idle (turn done) or error (so queued messages aren't orphaned).
+        if (status === 'idle' || status === 'error') this.flushQueue(sessionId)
         break
       }
       case 'session/mode': {
@@ -198,6 +358,7 @@ class HubStore {
           modelUsage?: Record<string, { inputTokens?: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number; contextWindow?: number }>
         }
         if (p.is_error) this.push(view, { kind: 'error', ts, text: p.result })
+        view.lastTurnOk = !p.is_error
         if (typeof p.total_cost_usd === 'number') view.costUsd = (view.costUsd ?? 0) + p.total_cost_usd
         if (p.modelUsage) {
           let best: { used: number; window: number } | null = null
@@ -213,19 +374,25 @@ class HubStore {
         break
       }
       case 'codex/thread/tokenUsage/updated': {
-        const p = payload as { usage?: { total_tokens?: number; input_tokens?: number }; contextWindow?: number; modelContextWindow?: number }
-        const used = p.usage?.total_tokens ?? p.usage?.input_tokens
-        const win = p.contextWindow ?? p.modelContextWindow
+        const tu = (payload as { tokenUsage?: { last?: { inputTokens?: number; totalTokens?: number }; modelContextWindow?: number } }).tokenUsage
+        const used = tu?.last?.inputTokens ?? tu?.last?.totalTokens
         if (typeof used === 'number') view.contextUsed = used
-        if (typeof win === 'number') view.contextWindow = win
+        if (typeof tu?.modelContextWindow === 'number') view.contextWindow = tu.modelContextWindow
+        break
+      }
+      case 'codex/turn/completed': {
+        const status = (payload as { turn?: { status?: string } }).turn?.status
+        view.lastTurnOk = status === 'completed' || status === undefined
         break
       }
       case 'codex/item/completed':
         this.applyCodexItem(view, ts, payload)
         break
-      case 'codex/item/agentMessage/delta':
-        this.appendDelta(view, ts, (payload as { delta: string }).delta)
+      case 'codex/item/agentMessage/delta': {
+        const p = payload as { itemId?: string; delta?: string }
+        if (p.itemId && typeof p.delta === 'string') this.upsertCodexText(view, ts, p.itemId, p.delta, true)
         break
+      }
       default:
         break
     }
@@ -239,10 +406,12 @@ class HubStore {
     for (const block of content) {
       if (block.type === 'text' && block.text) {
         this.push(view, { kind: 'assistant', ts, text: block.text })
-      } else if (block.type === 'thinking') {
+      } else if (block.type === 'thinking' || block.type === 'redacted_thinking') {
         view.sawReasoning = true
         sawThinkingThisTurn = true
-        this.push(view, { kind: 'thinking', ts, text: block.thinking || '(redacted by API — thinking not enabled)' })
+        // Claude Code withholds reasoning text on subscription accounts (signature only),
+        // so block.thinking is typically empty — render a "reasoned" marker, not fake text.
+        this.push(view, { kind: 'thinking', ts, text: (block.thinking ?? '').trim() })
       } else if (block.type === 'tool_use') {
         this.push(view, {
           kind: 'tool',
@@ -275,11 +444,8 @@ class HubStore {
     if (!item) return
     const type = item.type as string
     if (type === 'agentMessage') {
-      const id = item.id as string
-      const existing = view.items.find((i) => i.key === `codex:${id}`)
-      const text = (item.text as string) ?? ''
-      if (existing) existing.text = text
-      else this.push(view, { kind: 'assistant', ts, text, key: `codex:${id}` })
+      // Same item id as the streamed deltas — replace, never duplicate.
+      this.upsertCodexText(view, ts, item.id as string, (item.text as string) ?? '', false)
     } else if (type === 'reasoning') {
       view.sawReasoning = true
       this.push(view, { kind: 'reasoning', ts, text: (item.text as string) ?? '(reasoning)' })
@@ -294,10 +460,13 @@ class HubStore {
     }
   }
 
-  private appendDelta(view: SessionView, ts: string, delta: string): void {
-    const last = view.items[view.items.length - 1]
-    if (last && last.kind === 'assistant') last.text = (last.text ?? '') + delta
-    else this.push(view, { kind: 'assistant', ts, text: delta })
+  // Upsert a Codex agent message by its item id: streamed deltas (append) and the final
+  // item/completed (replace) target the same item, so the message renders exactly once.
+  private upsertCodexText(view: SessionView, ts: string, itemId: string, text: string, append: boolean): void {
+    const key = `codex:${itemId}`
+    const item = view.items.find((i) => i.key === key)
+    if (item) item.text = append ? (item.text ?? '') + text : text
+    else this.push(view, { kind: 'assistant', ts, text, key })
   }
 
   private push(view: SessionView, item: Partial<ThreadItem> & { kind: ItemKind; ts: string }): void {
@@ -310,3 +479,8 @@ class HubStore {
 }
 
 export const store = new HubStore()
+
+// Dev-only handle for debugging/automation in the browser console.
+if (typeof window !== 'undefined' && import.meta.env.DEV) {
+  ;(window as unknown as { __hubStore: HubStore }).__hubStore = store
+}

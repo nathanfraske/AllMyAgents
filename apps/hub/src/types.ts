@@ -6,12 +6,20 @@ export interface Profile {
   dir: string
 }
 
+export interface Project {
+  id: string
+  name: string
+  path: string
+  createdAt: string
+}
+
 export type SessionStatus = 'starting' | 'active' | 'idle' | 'stopped' | 'error'
 
 export interface SessionRecord {
   id: string
   profileId: string
   provider: Provider
+  projectId?: string
   cwd: string
   repo?: string
   worktree?: string
@@ -19,6 +27,7 @@ export interface SessionRecord {
   vendorSessionId?: string
   model?: string
   effort?: string
+  serviceTier?: string
   permissionMode?: 'safe' | 'edits' | 'full'
   createdAt: string
 }
@@ -65,6 +74,7 @@ export interface ClaudeUsageLine {
   label: string
   percent: number
   resets: string
+  resetsAt?: number
 }
 
 export interface UsageSnapshot {

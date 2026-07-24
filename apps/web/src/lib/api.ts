@@ -3,10 +3,18 @@ export interface ProfileInfo {
   provider: 'claude' | 'codex'
 }
 
+export interface ProjectInfo {
+  id: string
+  name: string
+  path: string
+  createdAt: string
+}
+
 export interface SessionRecord {
   id: string
   profileId: string
   provider: 'claude' | 'codex'
+  projectId?: string
   cwd: string
   repo?: string
   worktree?: string
@@ -14,6 +22,7 @@ export interface SessionRecord {
   vendorSessionId?: string
   model?: string
   effort?: string
+  serviceTier?: string
   permissionMode?: string
   createdAt: string
 }
@@ -31,6 +40,7 @@ export interface ClaudeUsageLine {
   label: string
   percent: number
   resets: string
+  resetsAt?: number
 }
 
 export interface UsageSnapshot {
@@ -79,6 +89,11 @@ async function jpost<T>(url: string, body?: unknown): Promise<T> {
 
 export const api = {
   profiles: () => jget<ProfileInfo[]>('/api/profiles'),
+  rescanProfiles: () => jpost<ProfileInfo[]>('/api/profiles/rescan'),
+  pickFolder: () => jpost<{ path: string }>('/api/pick-folder'),
+  projects: () => jget<ProjectInfo[]>('/api/projects'),
+  createProject: (name: string, path: string) =>
+    jpost<ProjectInfo | { error: string }>('/api/projects', { name, path }),
   sessions: () => jget<SessionRecord[]>('/api/sessions'),
   approvals: () => jget<ApprovalRecord[]>('/api/approvals'),
   usage: () => jget<UsageSnapshot[]>('/api/usage'),

@@ -25,10 +25,14 @@
     {/if}
   </div>
 {:else if item.kind === 'thinking' || item.kind === 'reasoning'}
-  <div class="think">
-    <button class="hd" onclick={() => (open = !open)}>{open ? '▾' : '▸'} {item.kind}</button>
-    {#if open}<div class="text think-body">{item.text}</div>{/if}
-  </div>
+  {#if item.text && item.text.trim()}
+    <div class="think">
+      <button class="hd" onclick={() => (open = !open)}>{open ? '▾' : '▸'} {item.kind}</button>
+      {#if open}<div class="text think-body">{item.text}</div>{/if}
+    </div>
+  {:else}
+    <div class="reasoned dim" title="Claude reasoned about this. Claude Code does not expose the reasoning text on subscription accounts.">✦ reasoned</div>
+  {/if}
 {:else if item.kind === 'tool'}
   <div class="tool" class:reflex={item.reflex}>
     <button class="hd" onclick={() => (open = !open)}>
@@ -55,6 +59,7 @@
   .text.clamp { max-height: 8.4rem; overflow: hidden; -webkit-mask-image: linear-gradient(#000 70%, transparent); mask-image: linear-gradient(#000 70%, transparent); }
   .more { margin-top: 0.3rem; font-size: 0.74rem; color: var(--accent); }
   .think { border-left: 2px solid var(--border-strong); padding-left: 0.5rem; }
+  .reasoned { font-size: 0.72rem; padding: 0.1rem 0; }
   .think-body { font-style: italic; color: var(--muted); font-size: 0.82rem; margin-top: 0.25rem; }
   .hd { background: none; border: none; color: var(--muted); padding: 0.15rem 0; cursor: pointer; font-size: 0.8rem; }
   .tool { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 0.3rem 0.5rem; }
