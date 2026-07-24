@@ -90,6 +90,7 @@ export interface DiscoverOptions {
 }
 
 const MAX_SCAN_BYTES = 4 * 1024 * 1024 // read at most 4 MB of a transcript to build its scan card
+const CODEX_SCAN_BYTES = 1024 * 1024 // ...but Codex rollouts reach many MB each; 1 MB head is plenty
 const MAX_CODEX_FILES = 2000 // bound the Codex walk (newest first) on huge histories
 
 /** The dedupe key: a vendor session is identified by its owning profile + its vendor id. */
@@ -212,34 +213,80 @@ export interface ParsedCodex {
   messageCount: number
 }
 
+/** Pure: fold ONE parsed Codex rollout record into the running scan-card accumulator. */
+function foldCodexRecord(out: ParsedCodex, r: Record<string, unknown>): void {
+  const payload = (r.payload ?? {}) as Record<string, unknown>
+  if (r.type === 'session_meta') {
+    if (typeof payload.session_id === 'string') out.sessionId = payload.session_id
+    else if (typeof payload.id === 'string') out.sessionId = payload.id
+    if (typeof payload.cwd === 'string') out.cwd = payload.cwd
+    if (typeof payload.originator === 'string') out.originator = payload.originator
+    if (typeof payload.cli_version === 'string') out.cliVersion = payload.cli_version
+  } else if (r.type === 'event_msg') {
+    if (payload.type === 'user_message') {
+      out.messageCount++
+      if (!out.firstPrompt && typeof payload.message === 'string') {
+        const t = payload.message.trim()
+        if (t && !isSyntheticUserText(t)) out.firstPrompt = t
+      }
+    } else if (payload.type === 'agent_message') {
+      out.messageCount++
+    }
+  } else if (r.type === 'turn_context' && typeof payload.model === 'string' && !out.model) {
+    out.model = payload.model
+  }
+}
+
 /** Pure: fold an array of parsed Codex rollout records into the fields a scan card needs. */
 export function parseCodexRecords(records: unknown[]): ParsedCodex {
   const out: ParsedCodex = { messageCount: 0 }
   for (const rec of records) {
     if (!rec || typeof rec !== 'object') continue
-    const r = rec as Record<string, unknown>
-    const payload = (r.payload ?? {}) as Record<string, unknown>
-    if (r.type === 'session_meta') {
-      if (typeof payload.session_id === 'string') out.sessionId = payload.session_id
-      else if (typeof payload.id === 'string') out.sessionId = payload.id
-      if (typeof payload.cwd === 'string') out.cwd = payload.cwd
-      if (typeof payload.originator === 'string') out.originator = payload.originator
-      if (typeof payload.cli_version === 'string') out.cliVersion = payload.cli_version
-    } else if (r.type === 'event_msg') {
-      if (payload.type === 'user_message') {
-        out.messageCount++
-        if (!out.firstPrompt && typeof payload.message === 'string') {
-          const t = payload.message.trim()
-          if (t && !isSyntheticUserText(t)) out.firstPrompt = t
-        }
-      } else if (payload.type === 'agent_message') {
-        out.messageCount++
-      }
-    } else if (r.type === 'turn_context' && typeof payload.model === 'string' && !out.model) {
-      out.model = payload.model
-    }
+    foldCodexRecord(out, rec as Record<string, unknown>)
   }
   return out
+}
+
+/**
+ * Stream a Codex rollout only as far as it's worth reading. `cwd` lives on the FIRST record
+ * (`session_meta`), so the moment we know it we bail on any rollout that isn't this folder's — a
+ * non-match then costs ~one line instead of the whole (often multi-MB, up to gigabytes across a
+ * heavy history) file. A matching rollout keeps streaming for the first prompt + a floor message
+ * count, capped at `maxBytes`. Returns null when the rollout doesn't belong to `target`.
+ */
+async function readCodexRollout(
+  file: string,
+  matches: (cwd: string) => boolean,
+  maxBytes: number
+): Promise<ParsedCodex | null> {
+  const out: ParsedCodex = { messageCount: 0 }
+  let bytes = 0
+  let cwdDecided = false
+  const stream = fs.createReadStream(file, { encoding: 'utf8' })
+  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity })
+  try {
+    for await (const line of rl) {
+      bytes += Buffer.byteLength(line) + 1
+      const t = line.trim()
+      if (t) {
+        try {
+          foldCodexRecord(out, JSON.parse(t) as Record<string, unknown>)
+        } catch {
+          /* skip a malformed / partial line */
+        }
+        // As soon as session_meta gives us a cwd, drop the file if it isn't this folder's.
+        if (!cwdDecided && out.cwd) {
+          cwdDecided = true
+          if (!matches(out.cwd)) return null
+        }
+      }
+      if (bytes >= maxBytes) break // floor count is fine for a scan card; don't read gigabytes
+    }
+  } finally {
+    rl.close()
+    stream.destroy()
+  }
+  return out.cwd && matches(out.cwd) ? out : null
 }
 
 /** Compose the auto-name: deriveTitle(firstPrompt) preferred (per spec), else ai-title, else generic. */
@@ -392,14 +439,16 @@ async function discoverCodexChats(
   const chats: ImportableChat[] = []
   const warnings: string[] = []
   const sessionsDir = path.join(profile.dir, 'sessions')
+  const codexCap = Math.min(ctx.maxBytes, CODEX_SCAN_BYTES)
+  // cwd match + not hub scratch — passed into the streaming reader so a non-matching rollout is
+  // dropped after its first line instead of being read in full.
+  const matches = (cwd: string): boolean => cwdMatches(cwd, target) && !ctx.isExcluded(cwd)
   for (const full of await walkRollouts(sessionsDir, maxFiles)) {
     try {
+      const parsed = await readCodexRollout(full, matches, codexCap)
+      // Null = wrong folder (bailed early). Also skip rollouts with no human prompt (system-only).
+      if (!parsed || !parsed.cwd || !parsed.firstPrompt) continue
       const st = await fs.promises.stat(full)
-      const { records } = await readJsonlBounded(full, ctx.maxBytes)
-      const parsed = parseCodexRecords(records)
-      if (!parsed.cwd || !cwdMatches(parsed.cwd, target) || ctx.isExcluded(parsed.cwd)) continue
-      // Skip rollouts with no human prompt (empty / system-only sessions aren't chats).
-      if (!parsed.firstPrompt) continue
       const vendorSessionId = parsed.sessionId ?? codexIdFromFilename(full)
       if (!vendorSessionId) continue
       chats.push({

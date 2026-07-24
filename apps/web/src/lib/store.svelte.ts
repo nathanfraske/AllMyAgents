@@ -304,8 +304,9 @@ class HubStore {
     this.projects = await api.projects()
     await this.refreshSideData()
     this.connect()
-    // Offer to adopt existing vendor chats for any project that has un-imported ones (once each).
-    void this.runImportChecks()
+    // NOTE: we deliberately do NOT scan every project on load — that walked ~/.codex + ~/.claude and
+    // read thousands of transcript files per project, pegging the hub for minutes ("stuck scanning").
+    // The import prompt now fires lazily, for the ONE project you actually open (see maybePromptImport).
   }
 
   // Pair this device by pasting a token (from another device's Settings → Mesh), then load.
