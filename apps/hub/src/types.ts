@@ -123,8 +123,18 @@ export interface SecurityConfig {
   requireToken?: boolean
 }
 
+export interface FeaturesConfig {
+  /**
+   * Automatic hub-side memory recall: before each turn, surface the memories most relevant to the
+   * prompt into the agent's context (so it recalls without calling memory_search). On by default;
+   * set false to disable. Benign + helpful, so it's a plain feature flag, not a danger-zone toggle.
+   */
+  autoMemoryRecall?: boolean
+}
+
 export interface HubConfig {
   overage?: Record<string, OveragePolicy>
   mesh?: MeshConfig
   security?: SecurityConfig
+  features?: FeaturesConfig
 }

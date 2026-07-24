@@ -41,7 +41,9 @@ const projects = new ProjectStore(journal.db)
 const instructions = new InstructionStore(journal.db)
 const bus = new AgentBus(journal.db)
 const memory = new MemoryStore(journal.db)
-const sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, repoRoot)
+// Automatic hub-side memory recall (memory.ts) — on unless config.features.autoMemoryRecall === false.
+const autoMemoryRecall = config.features?.autoMemoryRecall !== false
+const sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, autoMemoryRecall, repoRoot)
 usage.setCodexReader((profileId) => sessions.readCodexLimits(profileId))
 sessions.boot()
 usage.startPolling()

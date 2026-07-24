@@ -12,7 +12,7 @@ import { ClaudeDriver } from './adapters/claude.js'
 import { CodexClient, mapCodexTokenUsage } from './adapters/codex.js'
 import { writeManagedInstructions, agentContract } from './instructions.js'
 import type { InstructionStore } from './instructions.js'
-import { identityOf } from './identity.js'
+import { identityOf, readableScopes } from './identity.js'
 import { buildAgentMcpServer, type AgentServices } from './agentTools.js'
 import type { AgentBus, BusAddress, BusMessage } from './bus.js'
 import type { MemoryStore } from './memory.js'
@@ -44,6 +44,9 @@ export class SessionManager {
   private readonly claudeDrivers = new Map<string, ClaudeDriver>()
   private readonly codexClients = new Map<string, CodexClient>()
   private readonly codexThreads = new Map<string, string>()
+  // Per-session set of memory ids already auto-recalled into context, so the same memory isn't
+  // re-injected turn after turn (automatic recall; gated by autoMemoryRecall).
+  private readonly recalledIds = new Map<string, Set<string>>()
 
   constructor(
     private readonly journal: Journal,
@@ -56,6 +59,7 @@ export class SessionManager {
     private readonly instructions: InstructionStore,
     private readonly bus: AgentBus,
     private readonly memory: MemoryStore,
+    private readonly autoMemoryRecall: boolean,
     private readonly defaultCwd: string
   ) {}
 
@@ -392,6 +396,23 @@ export class SessionManager {
     return record
   }
 
+  // Automatic memory recall: prepend the memories most relevant to this turn's text (that weren't
+  // already recalled this session) as a labeled context block, and journal `memory/recalled`. It's
+  // just prompt text, so Codex gets it too. No-op when disabled or nothing is relevant. Benign — no gate.
+  private withRecall(record: SessionRecord, prompt: string): string {
+    if (!this.autoMemoryRecall) return prompt
+    const seen = this.recalledIds.get(record.id) ?? new Set<string>()
+    const hits = this.memory
+      .recall(prompt, { scopes: readableScopes(identityOf(record)), limit: 5 })
+      .filter((m) => !seen.has(m.id))
+    if (!hits.length) return prompt
+    for (const m of hits) seen.add(m.id)
+    this.recalledIds.set(record.id, seen)
+    this.journal.append(record.id, 'memory/recalled', { count: hits.length, titles: hits.map((m) => m.title) })
+    const block = hits.map((m) => `- [${m.scope}] ${m.title}: ${m.body.slice(0, 240)}`).join('\n')
+    return `<<RECALLED FROM MEMORY — relevant notes you or a teammate saved earlier; use if helpful>>\n${block}\n<<END RECALLED>>\n\n${prompt}`
+  }
+
   private async runClaudeTurn(
     record: SessionRecord,
     prompt: string,
@@ -400,7 +421,7 @@ export class SessionManager {
     const driver = this.claudeDriverFor(record)
     this.setStatus(record, 'active')
     try {
-      await driver.send(prompt, { model: record.model, permissionMode, effort: record.effort })
+      await driver.send(this.withRecall(record, prompt), { model: record.model, permissionMode, effort: record.effort })
       if (driver.sessionId) {
         record.vendorSessionId = driver.sessionId
         this.persist(record)
@@ -435,7 +456,7 @@ export class SessionManager {
     this.setStatus(record, 'active')
     try {
       const { client, threadId } = await this.ensureCodexThread(record)
-      await client.sendTurn(threadId, prompt, {
+      await client.sendTurn(threadId, this.withRecall(record, prompt), {
         model: record.model,
         effort: record.effort,
         serviceTier: record.serviceTier,

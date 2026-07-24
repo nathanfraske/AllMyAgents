@@ -28,7 +28,7 @@ function buildManager(tmp: string, profiles: Profile[], dbName = 'hub.db') {
   const instructions = new InstructionStore(journal.db)
   const bus = new AgentBus(journal.db)
   const memory = new MemoryStore(journal.db)
-  const sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, tmp)
+  const sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, false, tmp)
   return { sessions, store, journal, projects, profileMap }
 }
 
@@ -74,7 +74,7 @@ describe('SessionManager.importChats (integration)', () => {
     const instructions = new InstructionStore(journal.db)
     const bus = new AgentBus(journal.db)
     const memory = new MemoryStore(journal.db)
-    sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, tmp)
+    sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, false, tmp)
 
     projectId = projects.create('MyApp', target).id
     journal.on('event', (e) => events.push(e))

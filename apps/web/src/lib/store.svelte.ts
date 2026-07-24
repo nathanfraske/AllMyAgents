@@ -811,6 +811,13 @@ class HubStore {
         this.push(view, { kind: 'bus', ts, busDir: 'received', busPeer: peer, busSubject: p.subject ?? undefined, text: p.body ?? '' })
         break
       }
+      case 'memory/recalled': {
+        // The hub auto-surfaced relevant memories into this turn's context (memory.ts recall).
+        const p = payload as { count?: number; titles?: string[] }
+        const n = p.count ?? 0
+        this.push(view, { kind: 'note', ts, text: `✦ recalled ${n} memor${n === 1 ? 'y' : 'ies'}${p.titles?.length ? ' — ' + p.titles.join(', ') : ''}` })
+        break
+      }
       case 'session/status': {
         const status = (payload as { status: string }).status
         view.record.status = status

@@ -98,6 +98,27 @@ export class MemoryStore {
     return this.query(opts.scopes, query.trim(), opts.limit ?? 20)
   }
 
+  /**
+   * Surface the memories most RELEVANT to a turn's text — for automatic hub-side recall, so an agent
+   * doesn't have to think to call memory_search. Offline keyword-overlap scoring: salient terms from
+   * the text are matched against each in-scope memory's title/body/tags, ranked by hit count then
+   * recency. Returns [] when nothing is salient or nothing matches (so recall stays quiet unless it
+   * genuinely has something).
+   */
+  recall(text: string, opts: { scopes?: string[]; limit?: number } = {}): Memory[] {
+    const terms = salientTerms(text)
+    if (!terms.length) return []
+    const scored: Array<{ m: Memory; score: number }> = []
+    for (const m of this.list({ scopes: opts.scopes, limit: 500 })) {
+      const hay = `${m.title} ${m.body} ${m.tags.join(' ')}`.toLowerCase()
+      let score = 0
+      for (const t of terms) if (hay.includes(t)) score++
+      if (score > 0) scored.push({ m, score })
+    }
+    scored.sort((a, b) => b.score - a.score || b.m.updatedAt.localeCompare(a.m.updatedAt))
+    return scored.slice(0, Math.max(1, opts.limit ?? 5)).map((x) => x.m)
+  }
+
   remove(id: string): void {
     this.delStmt.run(id)
   }
@@ -131,4 +152,27 @@ export class MemoryStore {
     }
     return { ...r, tags }
   }
+}
+
+// Common words carry no signal for keyword-overlap recall; drop them (plus very short tokens) so
+// only meaningful terms drive relevance.
+const STOPWORDS = new Set(
+  ('the a an and or but of to in on for with at by from as is are was were be been being it its this ' +
+    'that these those you your yours we our ours they them their he she him her his i me my mine will ' +
+    'would can could should shall do does did done have has had having not no nor yes if then else when ' +
+    'what which who whom how why where whose there here about into over under out up down off than too ' +
+    'very just also only more most some any all each both few many much such own same so per via '
+  ).split(/\s+/)
+)
+
+function salientTerms(text: string): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const raw of text.toLowerCase().split(/[^a-z0-9]+/)) {
+    if (raw.length < 4 || STOPWORDS.has(raw) || seen.has(raw)) continue
+    seen.add(raw)
+    out.push(raw)
+    if (out.length >= 24) break
+  }
+  return out
 }
