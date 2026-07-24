@@ -14,7 +14,8 @@ import { getOrCreateDeviceToken } from './deviceToken.js'
 import { InstructionStore } from './instructions.js'
 import { AgentBus } from './bus.js'
 import { MemoryStore } from './memory.js'
-import type { HubConfig } from './types.js'
+import { PracticeStore } from './practices.js'
+import type { DangerFlags, HubConfig } from './types.js'
 
 const repoRoot = path.resolve(import.meta.dirname, '..', '..', '..')
 
@@ -41,9 +42,17 @@ const projects = new ProjectStore(journal.db)
 const instructions = new InstructionStore(journal.db)
 const bus = new AgentBus(journal.db)
 const memory = new MemoryStore(journal.db)
+const practices = new PracticeStore(journal.db)
 // Automatic hub-side memory recall (memory.ts) — on unless config.features.autoMemoryRecall === false.
 const autoMemoryRecall = config.features?.autoMemoryRecall !== false
-const sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, autoMemoryRecall, repoRoot)
+// Danger Zone flags — resolved to safe defaults (OFF) from config, then shared by reference with the
+// SessionManager (which reads them live when gating tools) and the server (which mutates + persists
+// them on POST /api/config/danger). Same object → a toggle flip takes effect without a restart.
+const danger: DangerFlags = {
+  busCanUseRiskyTools: config.danger?.busCanUseRiskyTools === true,
+  autoApprovePractices: config.danger?.autoApprovePractices === true,
+}
+const sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, repoRoot)
 usage.setCodexReader((profileId) => sessions.readCodexLimits(profileId))
 sessions.boot()
 usage.startPolling()
@@ -82,7 +91,7 @@ const meshEnable = !(
   config.mesh?.enable === false
 )
 const mesh = new MeshSite({ port, label: config.mesh?.label, enable: meshEnable })
-startServer({ port, defaultCwd: repoRoot, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, rescanProfiles, mesh, deviceToken, requireToken })
+startServer({ port, defaultCwd: repoRoot, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken })
 journal.append(null, 'hub/started', {
   port,
   profiles: profiles.map((p) => ({ id: p.id, provider: p.provider })),

@@ -852,6 +852,23 @@ class HubStore {
           text: `scope guard denied ${(payload as { toolName: string }).toolName}: ${(payload as { reason: string }).reason}`,
         })
         break
+      case 'approval/auto-denied-bus':
+        this.push(view, {
+          kind: 'error',
+          ts,
+          text: `bus-turn guard denied ${(payload as { toolName?: string }).toolName ?? 'a risky tool'} — a teammate-message turn can't write practices`,
+        })
+        break
+      case 'practice/wrote':
+      case 'practice/edited': {
+        const p = payload as { scope?: string; title?: string }
+        this.push(view, {
+          kind: 'note',
+          ts,
+          text: `✦ ${kind === 'practice/wrote' ? 'recorded' : 'edited'} practice [${p.scope ?? '?'}]${p.title ? ' — ' + p.title : ''}`,
+        })
+        break
+      }
       case 'claude/assistant':
         this.applyClaudeAssistant(view, ts, payload)
         break

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { store } from './store.svelte'
   import { settings } from './settings.svelte'
-  import { api, type MeshStatus, type Instruction } from './api'
+  import { api, type MeshStatus, type Instruction, type Practice, type DangerFlags } from './api'
   import ProviderLogo from './ProviderLogo.svelte'
   import Icon from './Icon.svelte'
   import { modelsFor } from './catalog'
@@ -39,6 +39,32 @@
     instructions = await api.setInstructions(instrScope, instrContent)
     instrSaved = true
     setTimeout(() => (instrSaved = false), 1400)
+  }
+
+  // Danger Zone — safe-default guardrail toggles + the agent-authored practices review list. Kept
+  // collapsed behind an explicit reveal so it's never flipped by accident. Both toggles default OFF.
+  let dangerRevealed = $state(false)
+  let danger = $state<DangerFlags>({ busCanUseRiskyTools: false, autoApprovePractices: false })
+  let practices = $state<Practice[]>([])
+  $effect(() => {
+    void api.danger().then((d) => (danger = d))
+  })
+  $effect(() => {
+    void api.practices().then((p) => (practices = p))
+  })
+  async function setDanger(patch: Partial<DangerFlags>): Promise<void> {
+    danger = await api.setDanger(patch)
+  }
+  async function revokePractice(id: string): Promise<void> {
+    await api.revokePractice(id)
+    practices = await api.practices()
+  }
+  function practiceProvenance(p: Practice): string {
+    const bits: string[] = []
+    if (p.fromProfile) bits.push(p.fromProfile)
+    if (p.fromSession) bits.push(`session ${p.fromSession.slice(0, 8)}`)
+    bits.push(new Date(p.updatedAt).toLocaleDateString())
+    return bits.join(' · ')
   }
 
   let revealToken = $state(false)
@@ -327,6 +353,42 @@
       <textarea class="instr" rows="6" bind:value={instrContent} placeholder="e.g. I'm the operator. Terse commits, no emoji. Prefer pnpm. Ask before anything destructive."></textarea>
       <button class="btn btn-primary" onclick={saveInstructions}>{instrSaved ? 'Saved ✓' : 'Save'}</button>
     </section>
+
+    <section class="danger">
+      <h3>Danger Zone</h3>
+      {#if !dangerRevealed}
+        <p class="hint dim">Guardrails are safe defaults you can loosen — this is your own self-hosted tool. Review agent-authored practices and relax the gates here.</p>
+        <button class="btn danger-reveal" onclick={() => (dangerRevealed = true)}>I understand these reduce safety — show them</button>
+      {:else}
+        <div class="danger-body">
+          <label class="opt"><input type="checkbox" checked={danger.autoApprovePractices} onchange={(e) => setDanger({ autoApprovePractices: (e.target as HTMLInputElement).checked })} /> Auto-approve agent practices at project / global / fleet scope</label>
+          <p class="hint dim warnrow">Off (safe): an agent recording a convention that affects teammates or the whole fleet waits for your approval. On: those writes apply immediately, no prompt. (Your own-account practices are always immediate either way.)</p>
+
+          <label class="opt"><input type="checkbox" checked={danger.busCanUseRiskyTools} onchange={(e) => setDanger({ busCanUseRiskyTools: (e.target as HTMLInputElement).checked })} /> Let teammate-message (bus) turns use risky tools</label>
+          <p class="hint dim warnrow">Off (safe): a turn triggered by another agent's message can't write practices at all. On: a semi-trusted teammate message can drive a practice write — a persistence vector.</p>
+
+          <h4>Agent-authored practices</h4>
+          <p class="hint dim">Durable conventions agents recorded, materialized into future agents at spawn. Revoking one removes it from future spawns (running sessions are unaffected until respawn).</p>
+          {#if practices.length === 0}
+            <p class="hint dim empty">No agent-authored practices yet.</p>
+          {:else}
+            <ul class="prac-list">
+              {#each practices as p (p.id)}
+                <li class="prac">
+                  <div class="prac-head">
+                    <span class="prac-scope">{p.scope}</span>
+                    <span class="prac-title">{p.title}</span>
+                    <button class="btn btn-danger prac-revoke" onclick={() => revokePractice(p.id)}>Revoke</button>
+                  </div>
+                  <div class="prac-body dim">{p.body}</div>
+                  <div class="prac-prov dim">{practiceProvenance(p)}</div>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </div>
+      {/if}
+    </section>
   </div>
 </div>
 
@@ -382,4 +444,18 @@
   .tlabel { font-size: var(--text-xs); }
   .token { flex: 1; min-width: 9rem; overflow: hidden; text-overflow: ellipsis; }
   .instr { width: 100%; font-family: var(--mono); font-size: var(--text-xs); resize: vertical; margin-bottom: var(--space-2); line-height: 1.5; }
+  .danger h3 { color: var(--bad-text); }
+  .danger-reveal { border-color: var(--bad); color: var(--bad-text); }
+  .danger-body { display: flex; flex-direction: column; gap: var(--space-2); border: 1px solid var(--bad); border-radius: var(--r-lg); padding: var(--space-4); }
+  .danger-body .warnrow { margin: 0 0 var(--space-3) calc(1rem + var(--space-3)); }
+  .danger-body h4 { margin: var(--space-3) 0 var(--space-1); font-size: var(--text-xs); }
+  .danger-body .empty { margin: 0; }
+  .prac-list { list-style: none; margin: var(--space-1) 0 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-3); }
+  .prac { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--space-3) var(--space-4); box-shadow: var(--edge-hi); }
+  .prac-head { display: flex; align-items: center; gap: var(--space-3); }
+  .prac-scope { font-family: var(--mono); font-size: var(--text-2xs); color: var(--cyan); background: var(--bg); padding: 0.05rem 0.35rem; border-radius: var(--r-xs); }
+  .prac-title { font-weight: var(--fw-medium); font-size: var(--text-sm); }
+  .prac-revoke { margin-left: auto; padding: 0.15rem 0.5rem; font-size: var(--text-2xs); }
+  .prac-body { font-size: var(--text-xs); line-height: 1.5; margin-top: var(--space-2); white-space: pre-wrap; }
+  .prac-prov { font-size: var(--text-2xs); font-family: var(--mono); margin-top: var(--space-2); }
 </style>

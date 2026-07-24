@@ -132,9 +132,40 @@ export interface FeaturesConfig {
   autoMemoryRecall?: boolean
 }
 
+/**
+ * Danger Zone toggles — SAFE DEFAULTS the owner can flip in Settings to trade safety for autonomy.
+ * This is an MIT, self-hosted, single-owner tool, so guardrails are safe defaults + toggles, never
+ * un-disable-able hard blocks: provenance, audit, and the kill-switch stay as VISIBILITY, and these
+ * flags let the owner go fully permissive. Every toggle defaults OFF (the safe choice).
+ *
+ * `DangerConfig` is the on-disk / API shape (both optional); `DangerFlags` is the resolved runtime
+ * object (both present) that the gating code reads live — see index.ts, sessions.ts, agentTools.ts.
+ */
+export interface DangerConfig {
+  /**
+   * Allow risky in-process tools (agent practice writes above account scope — and, in a later slice,
+   * hook proposals) to run on BUS turns (turns caused by a semi-trusted teammate message). Default
+   * OFF: a teammate's message can never drive a persistence-class write.
+   */
+  busCanUseRiskyTools?: boolean
+  /**
+   * Auto-approve agent practice writes/edits to project / global / vendor scope without an operator
+   * prompt. Default OFF: those writes (which reshape teammates' or the whole fleet's behavior) wait
+   * on operator approval. Writes to the agent's own account scope are always immediate regardless.
+   */
+  autoApprovePractices?: boolean
+}
+
+/** Resolved Danger Zone flags (both always present; index.ts fills defaults from DangerConfig). */
+export interface DangerFlags {
+  busCanUseRiskyTools: boolean
+  autoApprovePractices: boolean
+}
+
 export interface HubConfig {
   overage?: Record<string, OveragePolicy>
   mesh?: MeshConfig
   security?: SecurityConfig
   features?: FeaturesConfig
+  danger?: DangerConfig
 }

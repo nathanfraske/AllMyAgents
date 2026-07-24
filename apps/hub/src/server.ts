@@ -1,3 +1,4 @@
+import fs from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
 import { WebSocketServer, WebSocket } from 'ws'
@@ -10,11 +11,12 @@ import type { MeshSite } from './meshSite.js'
 import type { InstructionStore } from './instructions.js'
 import type { AgentBus } from './bus.js'
 import type { MemoryStore } from './memory.js'
+import type { PracticeStore } from './practices.js'
 import { tokenMatches } from './deviceToken.js'
 import { pickFolder } from './native.js'
 import { computeStats } from './stats.js'
 import { startLogin, awaitLogin, credentialsExist } from './loginLauncher.js'
-import type { HubEvent, Profile, Provider } from './types.js'
+import type { DangerFlags, HubEvent, Profile, Provider } from './types.js'
 
 const PAGE = `<!doctype html>
 <html>
@@ -219,14 +221,37 @@ export interface ServerOptions {
   instructions: InstructionStore
   bus: AgentBus
   memory: MemoryStore
+  practices: PracticeStore
+  /** Live Danger Zone flags — the same object SessionManager reads; mutated + persisted on POST. */
+  danger: DangerFlags
   rescanProfiles: () => Profile[]
   mesh: MeshSite
   deviceToken: string
   requireToken: boolean
 }
 
+// Merge the Danger Zone flags into data/config.json (preserving every other config key) so a toggle
+// survives a hub restart. Best-effort — a persist failure leaves the in-memory flag set (live) but
+// unsaved; it never throws into the request path.
+function persistDanger(repoRoot: string, danger: DangerFlags): void {
+  try {
+    const p = path.join(repoRoot, 'data', 'config.json')
+    let cfg: Record<string, unknown> = {}
+    try {
+      cfg = JSON.parse(fs.readFileSync(p, 'utf8')) as Record<string, unknown>
+    } catch {
+      /* no config yet — start fresh */
+    }
+    cfg.danger = { busCanUseRiskyTools: danger.busCanUseRiskyTools, autoApprovePractices: danger.autoApprovePractices }
+    fs.mkdirSync(path.dirname(p), { recursive: true })
+    fs.writeFileSync(p, JSON.stringify(cfg, null, 2))
+  } catch {
+    /* persistence is best-effort */
+  }
+}
+
 export function startServer(opts: ServerOptions): http.Server {
-  const { port, defaultCwd, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, rescanProfiles, mesh, deviceToken, requireToken } = opts
+  const { port, defaultCwd, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken } = opts
   // Same location index.ts scans for profiles (repoRoot/profiles); defaultCwd is repoRoot.
   const profilesDir = path.join(defaultCwd, 'profiles')
 
@@ -399,6 +424,41 @@ export function startServer(opts: ServerOptions): http.Server {
         }
         instructions.set(scope, String(body.content ?? ''))
         json(res, instructions.list())
+        return
+      }
+      // Agent-authored practices — operator review surface. GET lists them (optionally filtered by
+      // ?scope=) with provenance so the owner can audit what the fleet has taught itself; the revoke
+      // route below deletes one. Practices are WRITTEN by agents (via the gated practice_* tools),
+      // never here — this is visibility + kill-switch, per the safe-defaults model.
+      if (method === 'GET' && url.pathname === '/api/practices') {
+        const scope = str(url.searchParams.get('scope') ?? undefined)
+        json(res, practices.list({ scopes: scope ? [scope] : undefined }))
+        return
+      }
+      const practiceRevokeMatch = /^\/api\/practices\/([^/]+)\/revoke$/.exec(url.pathname)
+      if (method === 'POST' && practiceRevokeMatch) {
+        const pid = practiceRevokeMatch[1] as string
+        const existing = practices.get(pid)
+        practices.remove(pid)
+        // Journal the revoke (append-only audit) even though the row is hard-deleted.
+        journal.append(null, 'practice/revoked', { id: pid, scope: existing?.scope ?? null, title: existing?.title ?? null })
+        json(res, { ok: !!existing }, existing ? 200 : 404)
+        return
+      }
+      // Danger Zone toggles — safe-default guardrail switches the owner can flip (this is an MIT,
+      // single-owner tool). GET reads the live flags; POST merges + persists them to data/config.json
+      // and mutates the shared object in place so SessionManager's gating sees the change immediately.
+      if (method === 'GET' && url.pathname === '/api/config/danger') {
+        json(res, { ...danger })
+        return
+      }
+      if (method === 'POST' && url.pathname === '/api/config/danger') {
+        const body = await readBody(req)
+        if (typeof body.busCanUseRiskyTools === 'boolean') danger.busCanUseRiskyTools = body.busCanUseRiskyTools
+        if (typeof body.autoApprovePractices === 'boolean') danger.autoApprovePractices = body.autoApprovePractices
+        persistDanger(defaultCwd, danger)
+        journal.append(null, 'config/danger', { ...danger })
+        json(res, { ...danger })
         return
       }
       // Shared agent memory — operator view (all scopes unless ?scope=), and curate notes.

@@ -228,6 +228,24 @@ export interface Memory {
   updatedAt: string
 }
 
+// An agent-authored working convention, materialized into future agents' instructions at spawn.
+export interface Practice {
+  id: string
+  scope: string
+  title: string
+  body: string
+  fromSession: string | null
+  fromProfile: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+// Danger Zone toggles — safe-default guardrail switches (both default false / OFF).
+export interface DangerFlags {
+  busCanUseRiskyTools: boolean
+  autoApprovePractices: boolean
+}
+
 export interface BusMessage {
   id: string
   groupId: string
@@ -288,6 +306,12 @@ export const api = {
     jget<Memory[]>(`/api/memory?q=${encodeURIComponent(q)}${scope ? `&scope=${encodeURIComponent(scope)}` : ''}`),
   writeMemory: (scope: string, title: string, body: string, tags?: string[]) =>
     jpost<Memory | { error: string }>('/api/memory', { scope, title, body, tags }),
+  // Agent-authored practices — operator review + revoke (writes come from agents via gated tools).
+  practices: () => jget<Practice[]>('/api/practices'),
+  revokePractice: (id: string) => jpost<{ ok?: boolean; error?: string }>(`/api/practices/${id}/revoke`),
+  // Danger Zone toggles.
+  danger: () => jget<DangerFlags>('/api/config/danger'),
+  setDanger: (patch: Partial<DangerFlags>) => jpost<DangerFlags>('/api/config/danger', patch),
   bus: (opts: { project?: string; session?: string } = {}) => {
     const p = new URLSearchParams()
     if (opts.project) p.set('project', opts.project)

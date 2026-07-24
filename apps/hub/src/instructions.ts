@@ -87,11 +87,21 @@ export function agentContract(provider: 'claude' | 'codex'): string {
   return ['## Teammate agents (managed by AllMyAgents)', intro, trust].join('\n\n')
 }
 
-const BEGIN = '<!-- AllMyAgents operator instructions (managed by the hub — edit them in Settings, not here) -->'
-const END = '<!-- /AllMyAgents operator instructions -->'
+// Two INDEPENDENT managed regions, each idempotently strip-and-replaced. The operator region holds
+// authoritative operator intent; the practices region holds agent-authored conventions. They are
+// kept visually + structurally distinct (different fences) so an operator — or an auditing agent —
+// can always tell operator intent from agent-authored convention, and revoke one without the other.
+const OP_BEGIN = '<!-- AllMyAgents operator instructions (managed by the hub — edit them in Settings, not here) -->'
+const OP_END = '<!-- /AllMyAgents operator instructions -->'
+const PRACTICE_BEGIN = '<!-- AllMyAgents agent-authored practices (written by agents, not the operator — auditable & revocable in Settings) -->'
+const PRACTICE_END = '<!-- /AllMyAgents agent-authored practices -->'
 
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function stripRegion(text: string, begin: string, end: string): string {
+  return text.replace(new RegExp(`${escapeRegExp(begin)}[\\s\\S]*?${escapeRegExp(end)}\\n*`), '')
 }
 
 function fileFor(provider: 'claude' | 'codex'): string {
@@ -99,11 +109,18 @@ function fileFor(provider: 'claude' | 'codex'): string {
 }
 
 /**
- * Prepend a hub-managed instruction block to the session's native instruction file, preserving any
- * existing repo/user content. Idempotent — a prior managed block is replaced; blank content strips
- * it (and removes a file the hub solely created). Best-effort: never throws into the spawn path.
+ * Prepend the hub-managed blocks to the session's native instruction file, preserving any existing
+ * repo/user content. Writes TWO independently-managed regions — operator instructions, then
+ * agent-authored practices — each idempotently replaced. Blank content for a region strips just that
+ * region; when both are blank the whole managed prefix is removed (and a file the hub solely created
+ * is deleted). Best-effort: never throws into the spawn path.
  */
-export function writeManagedInstructions(cwd: string, provider: 'claude' | 'codex', content: string): void {
+export function writeManagedInstructions(
+  cwd: string,
+  provider: 'claude' | 'codex',
+  operator: string,
+  practices = ''
+): void {
   try {
     const file = path.join(cwd, fileFor(provider))
     let existing = ''
@@ -112,11 +129,15 @@ export function writeManagedInstructions(cwd: string, provider: 'claude' | 'code
     } catch {
       /* no file yet */
     }
-    const stripped = existing
-      .replace(new RegExp(`${escapeRegExp(BEGIN)}[\\s\\S]*?${escapeRegExp(END)}\\n*`), '')
-      .replace(/^\s+/, '')
-    const body = content.trim()
-    if (!body) {
+    // Strip BOTH prior managed regions before re-composing, so each is idempotent and independently
+    // revocable (removing a region's content drops just that region on the next spawn).
+    const stripped = stripRegion(stripRegion(existing, OP_BEGIN, OP_END), PRACTICE_BEGIN, PRACTICE_END).replace(/^\s+/, '')
+    const blocks: string[] = []
+    const op = operator.trim()
+    const pr = practices.trim()
+    if (op) blocks.push(`${OP_BEGIN}\n\n${op}\n\n${OP_END}\n`)
+    if (pr) blocks.push(`${PRACTICE_BEGIN}\n\n${pr}\n\n${PRACTICE_END}\n`)
+    if (!blocks.length) {
       if (stripped) fs.writeFileSync(file, stripped)
       else if (existing) {
         try {
@@ -127,8 +148,8 @@ export function writeManagedInstructions(cwd: string, provider: 'claude' | 'code
       }
       return
     }
-    const block = `${BEGIN}\n\n${body}\n\n${END}\n`
-    fs.writeFileSync(file, stripped ? `${block}\n${stripped}` : block)
+    const managed = blocks.join('\n')
+    fs.writeFileSync(file, stripped ? `${managed}\n${stripped}` : managed)
   } catch {
     /* materialization is best-effort — a failure here must not break session spawn */
   }

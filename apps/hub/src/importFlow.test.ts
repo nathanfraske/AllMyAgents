@@ -11,6 +11,7 @@ import { WorkspaceManager } from './workspace.js'
 import { InstructionStore } from './instructions.js'
 import { AgentBus } from './bus.js'
 import { MemoryStore } from './memory.js'
+import { PracticeStore } from './practices.js'
 import { SessionManager } from './sessions.js'
 import { encodeClaudeCwd } from './importScan.js'
 import { CLAUDE_DEFAULT_ID, CODEX_DEFAULT_ID } from './profiles.js'
@@ -28,7 +29,8 @@ function buildManager(tmp: string, profiles: Profile[], dbName = 'hub.db') {
   const instructions = new InstructionStore(journal.db)
   const bus = new AgentBus(journal.db)
   const memory = new MemoryStore(journal.db)
-  const sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, false, tmp)
+  const practices = new PracticeStore(journal.db)
+  const sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, { busCanUseRiskyTools: false, autoApprovePractices: false }, false, tmp)
   return { sessions, store, journal, projects, profileMap }
 }
 
@@ -74,7 +76,8 @@ describe('SessionManager.importChats (integration)', () => {
     const instructions = new InstructionStore(journal.db)
     const bus = new AgentBus(journal.db)
     const memory = new MemoryStore(journal.db)
-    sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, false, tmp)
+    const practices = new PracticeStore(journal.db)
+    sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, { busCanUseRiskyTools: false, autoApprovePractices: false }, false, tmp)
 
     projectId = projects.create('MyApp', target).id
     journal.on('event', (e) => events.push(e))

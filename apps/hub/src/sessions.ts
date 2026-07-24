@@ -16,8 +16,31 @@ import { identityOf, readableScopes } from './identity.js'
 import { buildAgentMcpServer, type AgentServices } from './agentTools.js'
 import type { AgentBus, BusAddress, BusMessage } from './bus.js'
 import type { MemoryStore } from './memory.js'
+import type { PracticeStore } from './practices.js'
+import type { DangerFlags } from './types.js'
 import { deriveTitle, sanitizeTitle } from './title.js'
 import { discoverImportableChats, importKey, type ImportableChat, type ScanResult } from './importScan.js'
+
+// The in-process agent tools (`mcp__allmyagents__*`) split by risk. SAFE tools are auto-allowed in
+// canUseTool (bus + memory reads/writes + practice reads — all ACL-enforced in-tool). SELF-GATING
+// tools (practice writes above account scope, and later hook_propose) are NOT auto-allowed: their
+// handlers self-gate by awaiting the operator (see agentTools.ts), which fires even under `full`
+// where canUseTool is skipped entirely. Any allmyagents tool in neither set falls through to the
+// generic approval gate — a safe default for a future tool that hasn't been classified yet.
+const AUTO_ALLOW_TOOLS = new Set([
+  'mcp__allmyagents__list_agents',
+  'mcp__allmyagents__send_message',
+  'mcp__allmyagents__read_messages',
+  'mcp__allmyagents__memory_write',
+  'mcp__allmyagents__memory_search',
+  'mcp__allmyagents__memory_read',
+  'mcp__allmyagents__practice_read',
+  'mcp__allmyagents__practice_list',
+])
+const SELF_GATING_TOOLS = new Set([
+  'mcp__allmyagents__practice_write',
+  'mcp__allmyagents__practice_edit',
+])
 
 export interface CreateOptions {
   cwd?: string
@@ -47,6 +70,12 @@ export class SessionManager {
   // Per-session set of memory ids already auto-recalled into context, so the same memory isn't
   // re-injected turn after turn (automatic recall; gated by autoMemoryRecall).
   private readonly recalledIds = new Map<string, Set<string>>()
+  // Sessions whose CURRENT in-flight turn was caused by a (semi-trusted) teammate bus message. A
+  // turn is single-flight per session, so this is an accurate "this session's live turn is
+  // bus-caused" flag for the whole window a tool handler can run in. Toggled by runClaudeTurn /
+  // runCodexTurn via their `origin` param; read by the self-gate + canUseTool to hard-deny risky
+  // in-process tools on bus turns (unless danger.busCanUseRiskyTools).
+  private readonly busTurnSessions = new Set<string>()
 
   constructor(
     private readonly journal: Journal,
@@ -59,19 +88,29 @@ export class SessionManager {
     private readonly instructions: InstructionStore,
     private readonly bus: AgentBus,
     private readonly memory: MemoryStore,
+    private readonly practices: PracticeStore,
+    // Live Danger Zone flags (shared object reference — the server mutates it in place on
+    // POST /api/config/danger, so the gating code below always reads the current values).
+    private readonly danger: DangerFlags,
     private readonly autoMemoryRecall: boolean,
     private readonly defaultCwd: string
   ) {}
 
-  // Capabilities the per-session agent MCP tools (inter-agent bus + shared memory) call into. Built
-  // on demand (after construction, so this.memory is set); every method takes the caller's id, which
-  // the hub — not the agent — supplies, so a tool call is always attributed + scope-checked.
+  // Capabilities the per-session agent MCP tools (inter-agent bus + shared memory + practices) call
+  // into. Built on demand (after construction, so this.memory/this.practices are set); every method
+  // takes the caller's id, which the hub — not the agent — supplies, so a tool call is always
+  // attributed + scope-checked. requireApproval/isBusTurn/danger/journal power the gate-live self-gate.
   private agentServices(): AgentServices {
     return {
       send: (from, to, subject, body) => this.busSend(from.sessionId, to, subject, body),
       inbox: (sessionId) => this.busInbox(sessionId),
       roster: (sessionId) => this.busRoster(sessionId),
       memory: this.memory,
+      practices: this.practices,
+      requireApproval: (id, kind, payload) => this.approvals.request(id.sessionId, kind, payload),
+      isBusTurn: (sessionId) => this.busTurnSessions.has(sessionId),
+      danger: () => this.danger,
+      journal: (sessionId, kind, payload) => this.journal.append(sessionId, kind, payload),
     }
   }
 
@@ -210,9 +249,23 @@ export class SessionManager {
           }
         },
         async (toolName, input) => {
-          // The hub's own agent tools (inter-agent bus + shared memory) are safe + ACL-enforced
-          // in-tool; gating them behind human approval would defeat autonomous coordination.
-          if (toolName.startsWith('mcp__allmyagents__')) return { behavior: 'allow', updatedInput: input }
+          // The hub's own SAFE agent tools (inter-agent bus + shared memory reads/writes + practice
+          // reads) are ACL-enforced in-tool; gating them behind human approval would defeat
+          // autonomous coordination.
+          if (AUTO_ALLOW_TOOLS.has(toolName)) return { behavior: 'allow', updatedInput: input }
+          // RISKY in-process tools (practice writes above account scope; later hook_propose) are not
+          // auto-allowed. They self-gate inside their own handler (works even under `full`, where
+          // this callback is skipped). Here — the non-`full` path — we add a second, independent
+          // barrier: hard-deny on a bus turn (unless the owner opted in), else allow and defer the
+          // authoritative operator decision to the handler's own requireApproval (so there's a
+          // single prompt, not two).
+          if (SELF_GATING_TOOLS.has(toolName)) {
+            if (this.busTurnSessions.has(record.id) && !this.danger.busCanUseRiskyTools) {
+              this.journal.append(record.id, 'approval/auto-denied-bus', { toolName })
+              return { behavior: 'deny', message: 'a turn caused by a teammate (bus) message may not write practices' }
+            }
+            return { behavior: 'allow', updatedInput: input }
+          }
           const scopeError = this.checkWriteScope(record, toolName, input)
           if (scopeError) {
             this.journal.append(record.id, 'approval/auto-denied-scope', { toolName, reason: scopeError })
@@ -262,11 +315,15 @@ export class SessionManager {
     }
     // Materialize the hub's teammate/bus trust contract + the operator's scoped instructions into
     // the session's native instruction file (CLAUDE.md / AGENTS.md) so the agent reads them as
-    // first-class context. Best-effort.
+    // first-class context. Agent-authored PRACTICES go into a SEPARATE, clearly-labeled block (never
+    // mixed with operator intent), so both are independently auditable + revocable. Best-effort.
     const operatorText = this.instructions.materialize({ provider: profile.provider, projectId: opts.projectId, profileId })
     const instructionText = [agentContract(profile.provider), operatorText].filter((s) => s.trim()).join('\n\n')
-    writeManagedInstructions(cwd, profile.provider, instructionText)
-    if (instructionText) this.journal.append(id, 'session/instructions', { chars: instructionText.length })
+    const practiceText = this.practices.materialize({ provider: profile.provider, projectId: opts.projectId, profileId })
+    writeManagedInstructions(cwd, profile.provider, instructionText, practiceText)
+    if (instructionText || practiceText) {
+      this.journal.append(id, 'session/instructions', { chars: instructionText.length, practiceChars: practiceText.length })
+    }
     const record: SessionRecord = {
       id,
       profileId,
@@ -416,10 +473,14 @@ export class SessionManager {
   private async runClaudeTurn(
     record: SessionRecord,
     prompt: string,
-    permissionMode = record.permissionMode
+    permissionMode = record.permissionMode,
+    origin: 'operator' | 'bus' = 'operator'
   ): Promise<void> {
     const driver = this.claudeDriverFor(record)
     this.setStatus(record, 'active')
+    // Tag the in-flight turn's provenance so risky in-process tool handlers can hard-deny on a
+    // bus (teammate-message-caused) turn. Cleared in finally, so the flag is scoped to this turn.
+    if (origin === 'bus') this.busTurnSessions.add(record.id)
     try {
       await driver.send(this.withRecall(record, prompt), { model: record.model, permissionMode, effort: record.effort })
       if (driver.sessionId) {
@@ -432,6 +493,8 @@ export class SessionManager {
         message: err instanceof Error ? err.message : String(err),
       })
       this.setStatus(record, 'error')
+    } finally {
+      this.busTurnSessions.delete(record.id)
     }
   }
 
@@ -451,9 +514,13 @@ export class SessionManager {
   private async runCodexTurn(
     record: SessionRecord,
     prompt: string,
-    permissionMode = record.permissionMode
+    permissionMode = record.permissionMode,
+    origin: 'operator' | 'bus' = 'operator'
   ): Promise<void> {
     this.setStatus(record, 'active')
+    // Same bus-turn provenance tag as runClaudeTurn (Codex has no MCP tools yet, but tagging both
+    // paths uniformly keeps the self-gate correct if/when Codex gains risky in-process tools).
+    if (origin === 'bus') this.busTurnSessions.add(record.id)
     try {
       const { client, threadId } = await this.ensureCodexThread(record)
       await client.sendTurn(threadId, this.withRecall(record, prompt), {
@@ -467,6 +534,8 @@ export class SessionManager {
         message: err instanceof Error ? err.message : String(err),
       })
       this.setStatus(record, 'error')
+    } finally {
+      this.busTurnSessions.delete(record.id)
     }
   }
 
@@ -610,8 +679,10 @@ export class SessionManager {
     }
     const framed = frameBusMessages(pending)
     const clamped = clampMode(record.permissionMode)
-    if (record.provider === 'claude') void this.runClaudeTurn(record, framed, clamped)
-    else void this.runCodexTurn(record, framed, clamped)
+    // origin: 'bus' tags the turn so risky in-process tools self-gate (hard-deny) — a teammate
+    // message is semi-trusted and must never drive a practice/hook write on its own.
+    if (record.provider === 'claude') void this.runClaudeTurn(record, framed, clamped, 'bus')
+    else void this.runCodexTurn(record, framed, clamped, 'bus')
   }
 
   async interrupt(sessionId: string): Promise<void> {
