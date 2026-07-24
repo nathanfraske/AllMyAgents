@@ -195,6 +195,7 @@
           {#each modelsFor('codex') as m (m.slug)}<option value={m.slug}>{m.name}</option>{/each}
         </select>
       </label>
+      <label class="opt"><input type="checkbox" checked={settings.defaultUseWorktree} onchange={(e) => settings.set('defaultUseWorktree', (e.target as HTMLInputElement).checked)} /> New chats in a project use an isolated git worktree (off = work directly in the project folder)</label>
     </section>
 
     <section>

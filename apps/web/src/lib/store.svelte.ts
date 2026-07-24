@@ -159,7 +159,7 @@ class HubStore {
 
   // Open an empty chat immediately — no prompt up front; the composer configures the rest.
   // Applies the user's settings defaults (permission mode, default model per provider).
-  async newSession(profileId?: string, projectId?: string): Promise<void> {
+  async newSession(profileId?: string, projectId?: string, useWorktree?: boolean): Promise<void> {
     if (this.creating) return
     const pid = profileId ?? this.defaultProfileId()
     if (!pid) {
@@ -170,7 +170,11 @@ class HubStore {
     try {
       const profile = this.profiles.find((p) => p.id === pid)
       const model = profile?.provider === 'codex' ? settings.defaultCodexModel : settings.defaultClaudeModel
-      const body: Record<string, unknown> = { profileId: pid, permissionMode: settings.defaultPermissionMode }
+      const body: Record<string, unknown> = {
+        profileId: pid,
+        permissionMode: settings.defaultPermissionMode,
+        useWorktree: useWorktree ?? settings.defaultUseWorktree,
+      }
       if (projectId) body.projectId = projectId
       if (model) body.model = model
       const out = await api.spawn(body)
@@ -186,6 +190,23 @@ class HubStore {
     } finally {
       this.creating = false
     }
+  }
+
+  // Only a fresh project chat (no real turns yet) can switch worktree mode — the worktree is
+  // created at spawn, so changing it means re-spawning.
+  canToggleWorktree(view: SessionView): boolean {
+    if (!view.record.projectId) return false
+    return !view.items.some((i) => i.kind === 'user' || i.kind === 'assistant')
+  }
+
+  // Flip worktree ⇄ direct for the current empty chat by re-creating it (like swapping accounts).
+  async toggleWorktree(): Promise<void> {
+    const cur = this.selectedId ? this.sessions[this.selectedId] : null
+    if (!cur || !this.canToggleWorktree(cur)) return
+    const next = !cur.record.worktree
+    await api.stop(cur.record.id).catch(() => undefined)
+    this.removeSessionLocal(cur.record.id)
+    await this.newSession(cur.record.profileId, cur.record.projectId, next)
   }
 
   // Swap the account "at will". Empty chat → seamless re-create under the new account.

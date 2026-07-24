@@ -359,6 +359,7 @@ export function startServer(opts: ServerOptions): http.Server {
           effort: str(body.effort),
           serviceTier: str(body.serviceTier),
           permissionMode: pm === 'safe' || pm === 'edits' || pm === 'full' ? pm : undefined,
+          useWorktree: typeof body.useWorktree === 'boolean' ? body.useWorktree : undefined,
         })
         json(res, record)
         return

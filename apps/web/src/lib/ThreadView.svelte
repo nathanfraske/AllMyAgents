@@ -159,7 +159,11 @@
     <span class="statuschip {st.key}"><span class="dot {st.key}"></span>{st.label}</span>
     <span class="sub dim">{view.record.model ?? view.record.provider}</span>
     <span class="spacer"></span>
-    {#if view.record.worktree}<span class="wt dim">⑂ {view.record.worktree.split(/[\\/]/).pop()}</span>{/if}
+    {#if view.record.worktree}
+      <span class="wt" title="isolated git worktree at {view.record.worktree}"><Icon name="git-branch" size={12} /> {view.record.branch ?? view.record.worktree.split(/[\\/]/).pop()}</span>
+    {:else if view.record.projectId}
+      <span class="wt dim" title="working directly in the project directory ({view.record.cwd})"><Icon name="folder" size={12} /> in project</span>
+    {/if}
     <button class="hicon" title="split view" onclick={() => store.startSplit()}><Icon name="columns" size={15} /></button>
     <button class="hicon" title="close (keeps the chat)" onclick={() => store.closePane(paneIndex)}><Icon name="x" size={15} /></button>
   </div>
@@ -211,6 +215,11 @@
         <ModelPicker provider={view.record.provider} {model} onselect={setModel} />
         {#if modelDef}<TraitsControl descriptors={modelDef.descriptors} values={options} onchange={setOption} />{/if}
         <PermissionPicker sessionId={view.record.id} mode={view.record.permissionMode ?? 'safe'} />
+        {#if store.canToggleWorktree(view)}
+          <button class="pill-btn" title="Isolated git worktree vs. work directly in the project — switch before your first message" onclick={() => store.toggleWorktree()}>
+            <Icon name={view.record.worktree ? 'git-branch' : 'folder'} size={13} /> {view.record.worktree ? 'worktree' : 'in project'}
+          </button>
+        {/if}
         <span class="spacer"></span>
         <button class="foot-act" onclick={stop} disabled={!active} title="interrupt current turn">interrupt</button>
         <button class="foot-act" onclick={() => api.stop(view.record.id)} title="stop session">stop</button>
@@ -243,7 +252,7 @@
   .statuschip.error { color: var(--bad-text); border-color: var(--bad); }
   .sub { font-size: 0.78rem; }
   .spacer { flex: 1; }
-  .wt { font-size: 0.75rem; font-family: var(--mono); }
+  .wt { font-size: 0.75rem; font-family: var(--mono); color: var(--muted); display: inline-flex; align-items: center; gap: 0.25rem; }
   .hbtn { font-size: 0.76rem; color: var(--muted); border: 1px solid var(--border); border-radius: 7px; padding: 0.22rem 0.5rem; }
   .hbtn:hover:not(:disabled) { border-color: var(--border-strong); color: var(--text); }
   .hbtn:disabled { opacity: 0.4; cursor: default; }

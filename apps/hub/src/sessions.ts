@@ -19,6 +19,9 @@ export interface CreateOptions {
   effort?: string
   serviceTier?: string
   permissionMode?: 'safe' | 'edits' | 'full'
+  // When spawning into a git project: create an isolated worktree (default), or set false to
+  // work directly in the project directory.
+  useWorktree?: boolean
 }
 
 export interface TurnOverride {
@@ -185,13 +188,18 @@ export class SessionManager {
       const project = this.projects.get(opts.projectId)
       if (!project) throw new Error(`unknown project: ${opts.projectId}`)
       cwd = project.path
-      if (this.workspace.isRepo(project.path)) repo = project.path
+      // Worktree by default when the project is a git repo; `useWorktree: false` works directly
+      // in the project directory (no isolation).
+      if (this.workspace.isRepo(project.path) && opts.useWorktree !== false) repo = project.path
     }
     let worktree: string | undefined
+    let branch: string | undefined
     if (repo) {
-      worktree = this.workspace.create(repo, id)
+      const wt = this.workspace.create(repo, id)
+      worktree = wt.worktree
+      branch = wt.branch
       cwd = worktree
-      this.journal.append(id, 'session/worktree-created', { repo, worktree })
+      this.journal.append(id, 'session/worktree-created', { repo, worktree, branch })
     }
     const record: SessionRecord = {
       id,
@@ -201,6 +209,7 @@ export class SessionManager {
       cwd,
       repo,
       worktree,
+      branch,
       status: 'starting',
       model: opts.model,
       effort: opts.effort,

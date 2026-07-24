@@ -23,6 +23,7 @@ export interface SessionRecord {
   cwd: string
   repo?: string
   worktree?: string
+  branch?: string
   status: SessionStatus
   vendorSessionId?: string
   model?: string

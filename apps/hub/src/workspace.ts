@@ -19,12 +19,13 @@ export class WorkspaceManager {
     }
   }
 
-  create(repo: string, sessionId: string): string {
+  create(repo: string, sessionId: string): { worktree: string; branch: string } {
     if (!this.isRepo(repo)) throw new Error(`not a git repository: ${repo}`)
     const short = sessionId.slice(0, 8)
     const target = path.join(this.worktreesRoot, short)
-    this.git(repo, ['worktree', 'add', '-b', `agent/${short}`, target])
-    return target
+    const branch = `agent/${short}`
+    this.git(repo, ['worktree', 'add', '-b', branch, target])
+    return { worktree: target, branch }
   }
 
   remove(repo: string, worktree: string): void {

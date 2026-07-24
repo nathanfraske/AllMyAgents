@@ -7,6 +7,7 @@ interface Settings {
   defaultPermissionMode: string
   defaultClaudeModel: string
   defaultCodexModel: string
+  defaultUseWorktree: boolean
   ownerName: string
 }
 
@@ -20,6 +21,7 @@ const DEFAULTS: Settings = {
   defaultPermissionMode: 'safe',
   defaultClaudeModel: '',
   defaultCodexModel: '',
+  defaultUseWorktree: true,
   ownerName: '',
 }
 
@@ -42,6 +44,7 @@ class SettingsStore {
   defaultPermissionMode = $state('safe')
   defaultClaudeModel = $state('')
   defaultCodexModel = $state('')
+  defaultUseWorktree = $state(true)
   ownerName = $state('')
 
   constructor() {
@@ -54,6 +57,7 @@ class SettingsStore {
     this.defaultPermissionMode = s.defaultPermissionMode
     this.defaultClaudeModel = s.defaultClaudeModel
     this.defaultCodexModel = s.defaultCodexModel
+    this.defaultUseWorktree = s.defaultUseWorktree
     this.ownerName = s.ownerName
   }
 
@@ -70,6 +74,7 @@ class SettingsStore {
           defaultPermissionMode: this.defaultPermissionMode,
           defaultClaudeModel: this.defaultClaudeModel,
           defaultCodexModel: this.defaultCodexModel,
+          defaultUseWorktree: this.defaultUseWorktree,
           ownerName: this.ownerName,
         })
       )
