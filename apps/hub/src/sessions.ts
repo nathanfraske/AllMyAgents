@@ -228,6 +228,7 @@ export class SessionManager {
     this.sessions.set(id, record)
     this.persist(record)
     this.journal.append(id, 'session/created', record)
+    if (opts.prompt) this.journal.append(id, 'session/input', { text: opts.prompt })
 
     if (profile.provider === 'claude') {
       this.claudeDriverFor(record)
@@ -304,6 +305,9 @@ export class SessionManager {
     if (override.effort !== undefined) record.effort = override.effort
     if (override.serviceTier !== undefined) record.serviceTier = override.serviceTier
     if (override.model || override.effort !== undefined || override.serviceTier !== undefined) this.persist(record)
+    // Journal the user's message so it's part of the replayable transcript (Claude never echoes
+    // user text back as an event; without this the user's turns vanish on reload). Timestamped.
+    this.journal.append(sessionId, 'session/input', { text })
     if (record.provider === 'claude') {
       if (this.claudeDrivers.get(sessionId)?.busy) throw new Error('a turn is already in progress')
       void this.runClaudeTurn(record, text)

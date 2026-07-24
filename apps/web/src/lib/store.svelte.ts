@@ -337,7 +337,9 @@ class HubStore {
     const key = `user:sent:${v.items.length}:${ts}`
     this.push(v, { kind: 'user', ts, text, key })
     this.touch(v, ts)
-    if (v.record.provider === 'codex') this.suppressNextUserMsg[sessionId] = true
+    // Suppress the canonical session/input event (and Codex's own userMessage) that the hub will
+    // echo back over the WS, so the optimistic bubble isn't duplicated.
+    this.suppressNextUserMsg[sessionId] = true
     return key
   }
 
@@ -465,6 +467,13 @@ class HubStore {
     }
 
     switch (kind) {
+      case 'session/input': {
+        // The canonical user message (journaled by the hub, so it replays + is timestamped).
+        // Skip if we already rendered it optimistically this turn.
+        if (this.suppressNextUserMsg[sessionId]) delete this.suppressNextUserMsg[sessionId]
+        else this.push(view, { kind: 'user', ts, text: (payload as { text?: string }).text ?? '' })
+        break
+      }
       case 'session/status': {
         const status = (payload as { status: string }).status
         view.record.status = status
@@ -613,12 +622,8 @@ class HubStore {
       view.sawReasoning = true
       this.push(view, { kind: 'reasoning', ts, text: (item.text as string) ?? '(reasoning)' })
     } else if (type === 'userMessage') {
-      // Skip the bubble we already rendered optimistically; otherwise echo Codex's own record.
-      if (this.suppressNextUserMsg[view.record.id]) {
-        delete this.suppressNextUserMsg[view.record.id]
-      } else {
-        this.push(view, { kind: 'user', ts, text: asText(item.content) })
-      }
+      // Ignored — the user's message is rendered from the canonical session/input event; echoing
+      // Codex's own userMessage here too would duplicate it.
     } else if (type === 'commandExecution') {
       this.push(view, { kind: 'tool', ts, toolName: 'command', toolInput: item.command ?? item, toolResult: item.aggregatedOutput as string | undefined })
     } else if (type === 'fileChange') {

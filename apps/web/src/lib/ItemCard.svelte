@@ -16,6 +16,11 @@
   // syntax-highlighted diffs; null when the item isn't a recognizable file edit, in which case
   // the generic tool rendering below is kept.
   const diffs = $derived(item.kind === 'tool' ? fileDiffsFromItem(item) : null)
+
+  function fmtTime(ts: string): string {
+    const d = new Date(ts)
+    return isNaN(d.getTime()) ? '' : d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+  }
 </script>
 
 {#if item.kind === 'status'}
@@ -26,7 +31,7 @@
   <div class="err">{item.text}</div>
 {:else if item.kind === 'assistant' || item.kind === 'user'}
   <div class="msg {item.kind}">
-    <div class="who">{item.kind}</div>
+    <div class="who">{item.kind}{#if fmtTime(item.ts)}<span class="ts" title={new Date(item.ts).toLocaleString()}>{fmtTime(item.ts)}</span>{/if}</div>
     <div class="body" class:clamp={longUser && !showFull}><Markdown text={item.text ?? ''} /></div>
     {#if longUser}
       <button class="more" onclick={() => (showFull = !showFull)}>{showFull ? 'Show less' : 'Show full message'}</button>
@@ -73,7 +78,8 @@
   .msg { border-radius: 8px; padding: 0.5rem 0.7rem; }
   .msg.assistant { background: var(--surface); border: 1px solid var(--border); }
   .msg.user { background: color-mix(in srgb, var(--accent) 10%, transparent); border: 1px solid var(--border-strong); }
-  .who { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--dim); margin-bottom: 0.2rem; }
+  .who { display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--dim); margin-bottom: 0.2rem; }
+  .ts { font-variant-numeric: tabular-nums; text-transform: none; letter-spacing: 0; }
   .body { word-break: break-word; line-height: 1.5; }
   .body.clamp { max-height: 8.4rem; overflow: hidden; -webkit-mask-image: linear-gradient(#000 70%, transparent); mask-image: linear-gradient(#000 70%, transparent); }
   .more { margin-top: 0.3rem; font-size: 0.74rem; color: var(--accent); }
