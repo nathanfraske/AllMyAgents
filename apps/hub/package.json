@@ -1,0 +1,24 @@
+{
+  "name": "hub",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "latest",
+    "@anthropic-ai/claude-code": "latest",
+    "@openai/codex": "latest",
+    "better-sqlite3": "^12",
+    "ws": "^8"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7",
+    "@types/node": "^22",
+    "@types/ws": "^8",
+    "tsx": "^4",
+    "typescript": "^5"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "spikes",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "login": "tsx src/login.ts",
+    "claude-min": "tsx src/claude-min.ts",
+    "codex-min": "tsx src/codex-min.ts",
+    "codex-usage": "tsx src/codex-usage.ts",
+    "two-accounts": "tsx src/two-claude-accounts.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "latest",
+    "@anthropic-ai/claude-code": "latest",
+    "@openai/codex": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "tsx": "^4",
+    "typescript": "^5"
+  }
+}

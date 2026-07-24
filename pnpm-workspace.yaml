@@ -1,0 +1,10 @@
+packages:
+  - spikes
+  - apps/*
+  - packages/*
+
+onlyBuiltDependencies:
+  - '@anthropic-ai/claude-code'
+  - '@openai/codex'
+  - better-sqlite3
+  - esbuild

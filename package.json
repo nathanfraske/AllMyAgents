@@ -1,0 +1,18 @@
+{
+  "name": "aiagentapp",
+  "private": true,
+  "version": "0.0.1",
+  "packageManager": "pnpm@10.14.0",
+  "scripts": {
+    "hub:dev": "pnpm --filter hub dev",
+    "hub:typecheck": "pnpm --filter hub typecheck",
+    "web:dev": "pnpm --filter web dev",
+    "web:check": "pnpm --filter web check",
+    "login:claude": "pnpm --filter spikes run login claude",
+    "login:codex": "pnpm --filter spikes run login codex",
+    "spike:claude": "pnpm --filter spikes claude-min",
+    "spike:codex": "pnpm --filter spikes codex-min",
+    "spike:codex-usage": "pnpm --filter spikes codex-usage",
+    "spike:two-accounts": "pnpm --filter spikes two-accounts"
+  }
+}
