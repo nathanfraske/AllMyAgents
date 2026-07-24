@@ -1,0 +1,5 @@
+# Rust / Tauri build output
+src-tauri/target/
+
+# Tauri-generated code (schemas, mobile projects, etc.)
+src-tauri/gen/

@@ -7,6 +7,8 @@
   "scripts": {
     "hub:dev": "pnpm --filter hub dev",
     "hub:typecheck": "pnpm --filter hub typecheck",
+    "desktop": "pnpm --filter desktop tauri dev",
+    "desktop:build": "pnpm --filter desktop tauri build",
     "web:dev": "pnpm --filter web dev",
     "web:check": "pnpm --filter web check",
     "login:claude": "pnpm --filter spikes run login claude",

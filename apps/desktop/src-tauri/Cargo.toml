@@ -1,0 +1,24 @@
+[package]
+name = "cec-aimesh-desktop"
+version = "0.0.1"
+description = "CEC AiMesh desktop shell"
+authors = ["CEC"]
+edition = "2021"
+rust-version = "1.77"
+
+# main.rs is a thin shim that calls into this library's `run()`. Naming the lib
+# `<pkg>_lib` and building it as staticlib/cdylib keeps parity with the standard
+# Tauri 2 template (and its future mobile support); harmless on desktop.
+[lib]
+name = "cec_aimesh_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

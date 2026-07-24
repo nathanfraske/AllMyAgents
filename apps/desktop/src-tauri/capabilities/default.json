@@ -1,0 +1,22 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permissions for the main CEC AiMesh window: native open/save file dialogs (the folder picker that replaces the old PowerShell popup), opening external links in the OS browser, and executing the dev hub command. NOTE: in dev the Node hub is actually spawned by the Rust host in setup() via std::process (not gated by capabilities); the shell:allow-execute scope below simply also permits the webview to launch that same command if we ever move the spawn to the frontend.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "shell:allow-open",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "hub-dev",
+          "cmd": "cmd",
+          "args": ["/C", "pnpm", "hub:dev"]
+        }
+      ]
+    }
+  ]
+}
