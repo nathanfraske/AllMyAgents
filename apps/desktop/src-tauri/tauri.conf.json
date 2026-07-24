@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "pnpm --filter web dev",
     "devUrl": "http://localhost:5273",
-    "beforeBuildCommand": "pnpm --filter web build",
+    "beforeBuildCommand": "pnpm --filter web build && pnpm -w run hub:bundle",
     "frontendDist": "../../web/dist"
   },
   "app": {
@@ -28,6 +28,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": ["hub-runtime/**/*"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

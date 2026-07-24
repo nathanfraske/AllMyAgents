@@ -7,6 +7,8 @@
   "scripts": {
     "hub:dev": "pnpm --filter hub dev",
     "hub:typecheck": "pnpm --filter hub typecheck",
+    "hub:build": "pnpm --filter hub build",
+    "hub:bundle": "node scripts/bundle-hub.mjs",
     "desktop": "pnpm --filter desktop tauri dev",
     "desktop:build": "pnpm --filter desktop tauri build",
     "web:dev": "pnpm --filter web dev",

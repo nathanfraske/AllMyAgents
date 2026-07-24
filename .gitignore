@@ -5,3 +5,7 @@ data/
 profiles/
 *.log
 .env
+
+# Generated portable-hub payload (Node runtime + compiled hub) — rebuilt by
+# scripts/bundle-hub.mjs during `tauri build`; never commit the shipped binaries.
+/apps/desktop/src-tauri/hub-runtime/
