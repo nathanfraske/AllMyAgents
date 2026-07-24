@@ -140,7 +140,7 @@ export class MeshSite {
 
   constructor(opts: { port: number; label?: string; enable?: boolean; socketPath?: string }) {
     this.port = opts.port
-    this.label = opts.label ?? 'CEC AiMesh Hub'
+    this.label = opts.label ?? 'AllMyAgents'
     this.enabled = opts.enable ?? false
     this.socketPath = opts.socketPath ?? defaultSocketPath()
     this.last = {

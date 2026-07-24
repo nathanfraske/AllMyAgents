@@ -1,4 +1,4 @@
-# AiAgentApp — design and central roadmap
+# AllMyAgents — design and central roadmap
 
 Working title. A self-hosted hub + GUI that manages any number of Claude Code and OpenAI Codex agents across any number of accounts, on Windows and WSL, with any linked agent promotable to orchestrator ("brains"), hub-routed agent-to-agent messaging, shared per-project memory, and phone remote access over our own mesh (AllMyStuff / MyOwnMesh) instead of vendor relays.
 
@@ -200,7 +200,7 @@ Live status of the incremental UI/feature polish. Done items verified in-browser
 
 Done: projects/folders (create + spawn-into, worktree auto, sidebar grouped, collapsible with collapsed summary = provider logos + done/review/stalled/working counts); Claude thinking wiring (effort→keyword injection); richer status (working/completed/needs-approval/awaiting-answer/error/stopped/ready + dots + header chip); platform logos (Anthropic burst / OpenAI blossom); real Codex model catalog from live `model/list` (5.6 Sol/Terra/Luna, 5.5, 5.4, 5.4 Mini, 5.3 Codex Spark) with Effort (low→max→ultra, per-model) + Speed (serviceTier Standard/Fast) as two `·`-joined axes, wired end-to-end; settings modal (Claude-Code style: centered, blurred translucent backdrop) housing usage settings + accounts list + add-account; native folder picker (Windows FolderBrowserDialog via hub `/api/pick-folder`); profile rescan endpoint; stop/interrupt moved to composer footer; MIT license.
 
-Also done: Inter + JetBrains Mono fonts; subtle animations (thread fade-in, modal/menu pop-in, reduced-motion respected); settings "Defaults for new chats" (account, permission mode, per-provider model); resizable sidebar (drag handle, persisted). Repo published: github.com/nathanfraske/CEC-AiMesh (public, MIT).
+Also done: Inter + JetBrains Mono fonts; subtle animations (thread fade-in, modal/menu pop-in, reduced-motion respected); settings "Defaults for new chats" (account, permission mode, per-provider model); resizable sidebar (drag handle, persisted). Repo published: github.com/nathanfraske/AllMyAgents (public, MIT).
 
 Queue (next):
 - **Cleaner logins at scale**: (a) one-click in-app add-account — hub spawns the vendor login in a PTY and streams status back, no terminal typing; (b) import existing logins — detect Claude config dirs already logged in elsewhere and copy `.credentials.json` into a new profile (Claude dirs are copyable); Codex must re-auth per profile (single-use rotating refresh tokens — never copy auth.json); (c) guided multi-add for several accounts in a row. Usage at scale is already cheap (free `/usage` + `account/rateLimits/read`); the work is UI: a dedicated, scrollable, sortable-by-headroom usage dashboard (move out of the sidebar footer) + staggered polls + on-demand refresh, feeding the continuity engine's "which account has headroom."

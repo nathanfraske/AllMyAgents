@@ -48,7 +48,7 @@ there is no separate mechanism for it.
 |---|---|---|---|---|
 | **owner / global** | (all selectors null) | every agent, every account, every vendor | **user only** (house rules); brains may *propose* global promotions the user approves | "Operator = <owner name>. Never touch `~/.codex`. Prefer pnpm." |
 | **vendor** | `vendor` | every agent of one vendor | user or **brains** (workers propose only) | "All Codex sessions: repo uses ESM, no CommonJS." |
-| **project** | `project_id` (± `vendor`) | every session in a project | any in-project agent (proposes; commit per policy) | "Project CEC-AiMesh: hub binds 127.0.0.1:7777; ports 7777/5273 are reserved." |
+| **project** | `project_id` (± `vendor`) | every session in a project | any in-project agent (proposes; commit per policy) | "Project AllMyAgents: hub binds 127.0.0.1:7777; ports 7777/5273 are reserved." |
 | **account** | `profile_id` (± `project_id`) | every session on one account | agents on that account (usually auto-derived) | "Account claude-b has the higher weekly ceiling — prefer for long jobs." |
 | **session** | `session_id` | one session (scratch) | the session itself | ephemeral working notes; rarely materialized beyond the owning session |
 
@@ -178,7 +178,7 @@ that file from `cwd` as first-class context, so no vendor-specific plumbing is n
 Layout (stable prefix first for caching):
 
 ```
-# Hub-managed context (do not edit; managed by the CEC-AiMesh hub)
+# Hub-managed context (do not edit; managed by the AllMyAgents hub)
 ## Operator & house rules            <- owner/global tier (rarely changes)
 ## <vendor> conventions              <- vendor tier
 ## Project: <name>                   <- project tier + project-scoped Commons pins

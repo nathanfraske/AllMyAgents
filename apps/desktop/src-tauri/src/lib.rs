@@ -1,4 +1,4 @@
-//! CEC AiMesh desktop shell.
+//! AllMyAgents desktop shell.
 //!
 //! Wraps the existing Svelte web UI in a native window and, in development,
 //! spawns the Node hub (`pnpm hub:dev`) as a managed child process so the app
@@ -112,7 +112,7 @@ pub fn run() {
             Ok(())
         })
         .build(tauri::generate_context!())
-        .expect("error while building the CEC AiMesh desktop application")
+        .expect("error while building the AllMyAgents desktop application")
         .run(|app_handle, event| {
             // Tear the hub down when the app is exiting so we don't leak node
             // processes across dev restarts.

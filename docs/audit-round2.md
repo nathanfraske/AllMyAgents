@@ -1,4 +1,4 @@
-# CEC-AiMesh — Audit Round 2
+# AllMyAgents — Audit Round 2
 
 Scope: correctness + security + consistency review of the features shipped in the last ~10 commits
 (`a347d5d` … `5a40277`), focused on six areas: the device token, the origin/CORS guard, mesh

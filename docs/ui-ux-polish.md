@@ -1,4 +1,4 @@
-# CEC AiMesh — Interaction & UX Polish Backlog
+# AllMyAgents — Interaction & UX Polish Backlog
 
 A prioritized, concrete audit of the **interaction design & UX** of the `apps/web` frontend (Svelte 5 + Vite). Scope is the *how it feels to use* lane — flows, feedback, states, discoverability, keyboard, IA, consistency, a11y, onboarding. Pure visual aesthetics (palette, spacing, type) are covered by a separate pass and only touched here where they cross into usability (contrast, focus rings, motion).
 

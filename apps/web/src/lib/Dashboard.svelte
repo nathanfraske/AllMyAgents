@@ -102,7 +102,7 @@
         {#if settings.ownerName}
           <h1>{greeting}</h1>
         {:else}
-          <h1>Welcome to CEC AiMesh.</h1>
+          <h1>Welcome to AllMyAgents.</h1>
           <div class="nameask">
             <input placeholder="What should I call you?" bind:value={nameInput} onkeydown={(e) => { if (e.key === 'Enter') saveName() }} />
             <button class="btn btn-primary" onclick={saveName}>Set</button>

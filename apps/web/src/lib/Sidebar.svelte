@@ -119,7 +119,7 @@
   <div class="brand">
     <button class="brandbtn" title="home / dashboard" onclick={() => store.goHome()}>
       <span class="logo"></span>
-      <span class="name">CEC AiMesh</span>
+      <span class="name">AllMyAgents</span>
     </button>
     <span class="tag">fleet</span>
     <span class="conn" class:on={store.connected} title={store.connected ? 'connected' : 'reconnecting'}></span>

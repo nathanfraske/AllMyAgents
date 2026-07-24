@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "CEC AiMesh",
+  "productName": "AllMyAgents",
   "version": "0.0.1",
-  "identifier": "direct.cec.aimesh",
+  "identifier": "direct.cec.allmyagents",
   "build": {
     "beforeDevCommand": "pnpm --filter web dev",
     "devUrl": "http://localhost:5273",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "CEC AiMesh",
+        "title": "AllMyAgents",
         "width": 1280,
         "height": 820,
         "minWidth": 900,

@@ -18,7 +18,7 @@ const PAGE = `<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>AiAgentApp hub</title>
+<title>AllMyAgents hub</title>
 <style>
   body { font-family: system-ui, sans-serif; margin: 1.5rem; background: #14141a; color: #e4e4ec; }
   h1 { font-size: 1.2rem; } h2 { font-size: 1rem; margin-top: 1.25rem; }
@@ -33,7 +33,7 @@ const PAGE = `<!doctype html>
 </style>
 </head>
 <body>
-<h1>AiAgentApp hub — P1</h1>
+<h1>AllMyAgents hub — P1</h1>
 <div class="row">
   <select id="profile"></select>
   <input id="repo" size="28" placeholder="git repo (optional → worktree)">

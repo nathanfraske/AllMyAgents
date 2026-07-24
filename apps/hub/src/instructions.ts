@@ -57,8 +57,8 @@ export class InstructionStore {
   }
 }
 
-const BEGIN = '<!-- CEC-AiMesh operator instructions (managed by the hub — edit them in Settings, not here) -->'
-const END = '<!-- /CEC-AiMesh operator instructions -->'
+const BEGIN = '<!-- AllMyAgents operator instructions (managed by the hub — edit them in Settings, not here) -->'
+const END = '<!-- /AllMyAgents operator instructions -->'
 
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')

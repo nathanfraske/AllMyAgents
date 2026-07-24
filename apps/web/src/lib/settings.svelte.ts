@@ -11,7 +11,8 @@ interface Settings {
   ownerName: string
 }
 
-const KEY = 'aiagentapp.settings'
+const KEY = 'allmyagents.settings'
+const LEGACY_KEY = 'aiagentapp.settings' // migrate settings saved under the pre-rename key
 const DEFAULTS: Settings = {
   showSpend: false,
   planBudgetUsd: null,
@@ -27,7 +28,7 @@ const DEFAULTS: Settings = {
 
 function load(): Settings {
   try {
-    const raw = localStorage.getItem(KEY)
+    const raw = localStorage.getItem(KEY) ?? localStorage.getItem(LEGACY_KEY)
     if (raw) return { ...DEFAULTS, ...(JSON.parse(raw) as Partial<Settings>) }
   } catch {
     /* ignore */

@@ -1,4 +1,4 @@
-# CEC-AiMesh — correctness, security & consistency audit
+# AllMyAgents — correctness, security & consistency audit
 
 Audit date: 2026-07-23. Scope: `apps/hub/src/**`, `apps/web/src/lib/**` + `App.svelte`, `apps/desktop/src-tauri/**`, cross-referenced against `DESIGN.md`. Read-only review; no source was modified, no servers/builds run.
 

@@ -1,4 +1,4 @@
-# CEC AiMesh — Visual Polish Backlog
+# AllMyAgents — Visual Polish Backlog
 
 A prioritized, concrete list of **visual/aesthetic** modernization work for the web frontend
 (`apps/web/src`). Scope is strictly look-and-feel: color, type, spacing, borders/radii/shadows,

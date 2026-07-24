@@ -3,5 +3,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    cec_aimesh_desktop_lib::run()
+    allmyagents_desktop_lib::run()
 }

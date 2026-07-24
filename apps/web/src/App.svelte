@@ -22,7 +22,7 @@
     return offs
   })
 
-  let sidebarWidth = $state(Number(localStorage.getItem('aiagentapp.sidebarWidth')) || 264)
+  let sidebarWidth = $state(Number(localStorage.getItem('allmyagents.sidebarWidth') || localStorage.getItem('aiagentapp.sidebarWidth')) || 264)
   let sidebarDrag = $state(false)
 
   let panesEl = $state<HTMLDivElement | null>(null)
@@ -96,7 +96,7 @@
   function endDrag(): void {
     if (sidebarDrag) {
       sidebarDrag = false
-      localStorage.setItem('aiagentapp.sidebarWidth', String(sidebarWidth))
+      localStorage.setItem('allmyagents.sidebarWidth', String(sidebarWidth))
     }
     colDrag = null
     rowDrag = null

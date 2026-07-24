@@ -126,7 +126,7 @@ export class CodexClient {
       this.initPromise = undefined
     })
     await this.request('initialize', {
-      clientInfo: { name: 'aiagentapp-hub', title: 'AiAgentApp hub', version: '0.0.1' },
+      clientInfo: { name: 'allmyagents-hub', title: 'AllMyAgents hub', version: '0.0.1' },
     })
     this.send({ method: 'initialized' })
   }
