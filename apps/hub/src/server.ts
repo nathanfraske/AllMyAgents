@@ -7,6 +7,7 @@ import type { ProjectStore } from './projects.js'
 import type { SessionManager } from './sessions.js'
 import type { UsageMonitor } from './usage.js'
 import type { MeshSite } from './meshSite.js'
+import type { InstructionStore } from './instructions.js'
 import { tokenMatches } from './deviceToken.js'
 import { pickFolder } from './native.js'
 import { computeStats } from './stats.js'
@@ -201,6 +202,7 @@ export interface ServerOptions {
   approvals: ApprovalService
   usage: UsageMonitor
   projects: ProjectStore
+  instructions: InstructionStore
   rescanProfiles: () => Profile[]
   mesh: MeshSite
   deviceToken: string
@@ -208,7 +210,7 @@ export interface ServerOptions {
 }
 
 export function startServer(opts: ServerOptions): http.Server {
-  const { port, defaultCwd, journal, sessions, profiles, approvals, usage, projects, rescanProfiles, mesh, deviceToken, requireToken } = opts
+  const { port, defaultCwd, journal, sessions, profiles, approvals, usage, projects, instructions, rescanProfiles, mesh, deviceToken, requireToken } = opts
   // Same location index.ts scans for profiles (repoRoot/profiles); defaultCwd is repoRoot.
   const profilesDir = path.join(defaultCwd, 'profiles')
 
@@ -327,6 +329,22 @@ export function startServer(opts: ServerOptions): http.Server {
         const body = await readBody(req)
         const project = projects.create(String(body.name ?? ''), String(body.path ?? ''))
         json(res, project)
+        return
+      }
+      // Operator profile + scoped instructions, materialized into each agent at spawn.
+      if (method === 'GET' && url.pathname === '/api/instructions') {
+        json(res, instructions.list())
+        return
+      }
+      if (method === 'POST' && url.pathname === '/api/instructions') {
+        const body = await readBody(req)
+        const scope = str(body.scope)
+        if (!scope) {
+          json(res, { error: 'scope required' }, 400)
+          return
+        }
+        instructions.set(scope, String(body.content ?? ''))
+        json(res, instructions.list())
         return
       }
       if (method === 'GET' && url.pathname === '/api/sessions') {

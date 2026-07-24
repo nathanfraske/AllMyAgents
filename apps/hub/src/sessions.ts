@@ -9,6 +9,8 @@ import type { WorkspaceManager } from './workspace.js'
 import type { ClaudeLimitInfo, Profile, SessionRecord, SessionStatus } from './types.js'
 import { ClaudeDriver } from './adapters/claude.js'
 import { CodexClient, mapCodexTokenUsage } from './adapters/codex.js'
+import { writeManagedInstructions } from './instructions.js'
+import type { InstructionStore } from './instructions.js'
 
 export interface CreateOptions {
   cwd?: string
@@ -44,6 +46,7 @@ export class SessionManager {
     private readonly usage: UsageMonitor,
     private readonly workspace: WorkspaceManager,
     private readonly projects: ProjectStore,
+    private readonly instructions: InstructionStore,
     private readonly defaultCwd: string
   ) {}
 
@@ -201,6 +204,11 @@ export class SessionManager {
       cwd = worktree
       this.journal.append(id, 'session/worktree-created', { repo, worktree, branch })
     }
+    // Materialize the operator's scoped instructions into the session's native instruction file
+    // (CLAUDE.md / AGENTS.md) so the agent reads them as first-class context. Best-effort.
+    const instructionText = this.instructions.materialize({ provider: profile.provider, projectId: opts.projectId, profileId })
+    writeManagedInstructions(cwd, profile.provider, instructionText)
+    if (instructionText) this.journal.append(id, 'session/instructions', { chars: instructionText.length })
     const record: SessionRecord = {
       id,
       profileId,

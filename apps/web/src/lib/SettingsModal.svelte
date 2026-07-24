@@ -1,7 +1,7 @@
 <script lang="ts">
   import { store } from './store.svelte'
   import { settings } from './settings.svelte'
-  import { api, type MeshStatus } from './api'
+  import { api, type MeshStatus, type Instruction } from './api'
   import ProviderLogo from './ProviderLogo.svelte'
   import Icon from './Icon.svelte'
   import { modelsFor } from './catalog'
@@ -21,6 +21,24 @@
     } finally {
       meshBusy = false
     }
+  }
+
+  // Operator profile + scoped instructions.
+  let instructions = $state<Instruction[]>([])
+  let instrScope = $state('global')
+  let instrContent = $state('')
+  let instrSaved = $state(false)
+  $effect(() => {
+    void api.instructions().then((list) => (instructions = list))
+  })
+  $effect(() => {
+    const scope = instrScope
+    instrContent = instructions.find((i) => i.scope === scope)?.content ?? ''
+  })
+  async function saveInstructions(): Promise<void> {
+    instructions = await api.setInstructions(instrScope, instrContent)
+    instrSaved = true
+    setTimeout(() => (instrSaved = false), 1400)
   }
 
   let revealToken = $state(false)
@@ -275,6 +293,22 @@
         <p class="dim">Checking mesh…</p>
       {/if}
     </section>
+
+    <section>
+      <h3>Operator profile &amp; instructions</h3>
+      <p class="hint dim">House rules loaded into every agent at spawn, through the vendor's own CLAUDE.md / AGENTS.md. Scopes stack general → specific (global → vendor → project → account). Existing chats pick up changes on their next spawn.</p>
+      <label class="opt row2">Scope
+        <select bind:value={instrScope}>
+          <option value="global">Global — every agent</option>
+          <option value="vendor:claude">All Claude</option>
+          <option value="vendor:codex">All Codex</option>
+          {#each store.projects as p (p.id)}<option value="project:{p.id}">Project · {p.name}</option>{/each}
+          {#each store.profiles as pr (pr.id)}<option value="account:{pr.id}">Account · {pr.id}</option>{/each}
+        </select>
+      </label>
+      <textarea class="instr" rows="6" bind:value={instrContent} placeholder="e.g. I'm the operator. Terse commits, no emoji. Prefer pnpm. Ask before anything destructive."></textarea>
+      <button class="btn btn-primary" onclick={saveInstructions}>{instrSaved ? 'Saved ✓' : 'Save'}</button>
+    </section>
   </div>
 </div>
 
@@ -329,4 +363,5 @@
   .token-row { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-2); flex-wrap: wrap; }
   .tlabel { font-size: var(--text-xs); }
   .token { flex: 1; min-width: 9rem; overflow: hidden; text-overflow: ellipsis; }
+  .instr { width: 100%; font-family: var(--mono); font-size: var(--text-xs); resize: vertical; margin-bottom: var(--space-2); line-height: 1.5; }
 </style>

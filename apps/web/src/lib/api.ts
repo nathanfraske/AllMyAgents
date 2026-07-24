@@ -165,6 +165,12 @@ export interface MeshStatus {
   token?: string
 }
 
+export interface Instruction {
+  scope: string
+  content: string
+  updatedAt: string
+}
+
 export const api = {
   profiles: () => jget<ProfileInfo[]>('/api/profiles'),
   stats: () => jget<StatsResult>('/api/stats'),
@@ -196,4 +202,6 @@ export const api = {
   },
   setMesh: (enable: boolean) => jpost<MeshStatus>('/api/mesh', { enable }),
   auth: () => jget<{ requireToken: boolean; authed: boolean }>('/api/auth'),
+  instructions: () => jget<Instruction[]>('/api/instructions'),
+  setInstructions: (scope: string, content: string) => jpost<Instruction[]>('/api/instructions', { scope, content }),
 }
