@@ -10,6 +10,7 @@ import { startServer } from './server.js'
 import { UsageMonitor } from './usage.js'
 import { WorkspaceManager } from './workspace.js'
 import { MeshSite } from './meshSite.js'
+import { getOrCreateDeviceToken } from './deviceToken.js'
 import type { HubConfig } from './types.js'
 
 const repoRoot = path.resolve(import.meta.dirname, '..', '..', '..')
@@ -48,6 +49,14 @@ function rescanProfiles(): typeof profiles {
 }
 
 const port = Number(process.env.HUB_PORT ?? 7777)
+// Device token — proof of an authorized device. Generated + persisted under data/. Enforcement
+// is opt-in (HUB_REQUIRE_TOKEN or config.security.requireToken) so local-only use is unaffected;
+// turn it on for fleet/remote exposure.
+const deviceToken = getOrCreateDeviceToken(path.join(repoRoot, 'data'))
+const requireToken =
+  process.env.HUB_REQUIRE_TOKEN === '1' ||
+  process.env.HUB_REQUIRE_TOKEN === 'true' ||
+  config.security?.requireToken === true
 // Mesh exposure is AUTOMATIC: on startup we probe the local AllMyStuff node and, if one is
 // running, register the hub as a "site" so any fleet PC can reach it with zero per-machine setup.
 // The hub still binds only 127.0.0.1 — the node dials loopback and tunnels the site; registration
@@ -61,7 +70,7 @@ const meshEnable = !(
   config.mesh?.enable === false
 )
 const mesh = new MeshSite({ port, label: config.mesh?.label, enable: meshEnable })
-startServer({ port, defaultCwd: repoRoot, journal, sessions, profiles, approvals, usage, projects, rescanProfiles, mesh })
+startServer({ port, defaultCwd: repoRoot, journal, sessions, profiles, approvals, usage, projects, rescanProfiles, mesh, deviceToken, requireToken })
 journal.append(null, 'hub/started', {
   port,
   profiles: profiles.map((p) => ({ id: p.id, provider: p.provider })),
@@ -70,6 +79,7 @@ journal.append(null, 'hub/started', {
 console.log(
   `[hub] http://127.0.0.1:${port} — profiles: ${profiles.map((p) => `${p.id}(${p.provider})`).join(', ') || 'none found'} — sessions restored: ${sessions.list().length}`
 )
+console.log(`[hub] device token ${requireToken ? 'REQUIRED for /api + /ws' : 'not enforced (local)'} — pair remote devices from Settings → Mesh`)
 
 // Auto-register — self-detects the node and no-ops if it's absent or exposure is disabled.
 void mesh.register().then((s) => {

@@ -104,7 +104,17 @@ export interface MeshConfig {
   label?: string
 }
 
+export interface SecurityConfig {
+  /**
+   * Require a device token on every /api + /ws request. Off by default (pure-loopback local use
+   * is fine behind the origin guard); turn it on for fleet/remote exposure — a genuinely remote
+   * device must then present the token to reach the hub. See deviceToken.ts.
+   */
+  requireToken?: boolean
+}
+
 export interface HubConfig {
   overage?: Record<string, OveragePolicy>
   mesh?: MeshConfig
+  security?: SecurityConfig
 }

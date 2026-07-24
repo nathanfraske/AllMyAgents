@@ -1,4 +1,4 @@
-import { api, HUB_WS } from './api'
+import { api, HUB_WS, getHubToken, setHubToken } from './api'
 import { settings } from './settings.svelte'
 import type { ApprovalRecord, HubEvent, ProfileInfo, ProjectInfo, SessionRecord, UsageSnapshot } from './api'
 
@@ -73,6 +73,7 @@ class HubStore {
   approvals = $state<ApprovalRecord[]>([])
   usage = $state<UsageSnapshot[]>([])
   connected = $state(false)
+  needsPairing = $state(false)
   selectedId = $state<string | null>(null)
   settingsOpen = $state(false)
   queues = $state<Record<string, string[]>>({})
@@ -135,10 +136,27 @@ class HubStore {
   }
 
   async init(): Promise<void> {
+    // If the hub enforces a device token and we don't hold a valid one, gate on pairing first.
+    const auth = await api.auth().catch(() => ({ requireToken: false, authed: true }))
+    if (auth.requireToken && !auth.authed && !getHubToken()) {
+      this.needsPairing = true
+      return
+    }
+    await api.mesh().catch(() => undefined) // bootstrap: capture the token while the hub hands it out
     this.profiles = await api.profiles()
     this.projects = await api.projects()
     await this.refreshSideData()
     this.connect()
+  }
+
+  // Pair this device by pasting a token (from another device's Settings → Mesh), then load.
+  async pair(token: string): Promise<void> {
+    setHubToken(token.trim())
+    const auth = await api.auth().catch(() => ({ requireToken: true, authed: false }))
+    if (auth.authed || !auth.requireToken) {
+      this.needsPairing = false
+      await this.init()
+    }
   }
 
   async rescanProfiles(): Promise<void> {
@@ -376,9 +394,13 @@ class HubStore {
     // Desktop app → loopback hub directly; browser (dev) → same origin, proxied by Vite.
     return HUB_WS || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`
   }
+  private wsUrl(since: number): string {
+    const t = getHubToken()
+    return `${this.wsBase()}/ws?since=${since}${t ? `&token=${encodeURIComponent(t)}` : ''}`
+  }
 
   private connect(): void {
-    const ws = new WebSocket(`${this.wsBase()}/ws?since=0`)
+    const ws = new WebSocket(this.wsUrl(0))
     this.ws = ws
     ws.onopen = () => {
       this.connected = true
@@ -394,7 +416,7 @@ class HubStore {
   }
 
   private reconnect(): void {
-    const ws = new WebSocket(`${this.wsBase()}/ws?since=${this.lastSeq}`)
+    const ws = new WebSocket(this.wsUrl(this.lastSeq))
     this.ws = ws
     ws.onopen = () => {
       this.connected = true

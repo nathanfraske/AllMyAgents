@@ -23,6 +23,19 @@
     }
   }
 
+  let revealToken = $state(false)
+  let copied = $state(false)
+  async function copyToken(t: string | undefined): Promise<void> {
+    if (!t) return
+    try {
+      await navigator.clipboard.writeText(t)
+      copied = true
+      setTimeout(() => (copied = false), 1400)
+    } catch {
+      /* ignore */
+    }
+  }
+
   let addProvider = $state<'claude' | 'codex'>('claude')
   let addName = $state('')
   let rescanning = $state(false)
@@ -242,7 +255,22 @@
             <span class="dim">Off — your hub stays bound to 127.0.0.1 only.</span>
           {/if}
         </div>
-        <p class="hint dim">Rides your AllMyStuff mesh as a "site" (no Tailscale). The hub always stays on loopback — the local node tunnels it to your own devices, which need no grant. <b>Heads-up:</b> the hub grants full control and has no auth yet, so only expose it on a fleet you trust — a per-device token is coming before this is safe to leave on.</p>
+        <p class="hint dim">Rides your AllMyStuff mesh as a "site" (no Tailscale). The hub always stays on loopback — the local node tunnels it to your own devices, which need no grant.</p>
+        {#if mesh.token}
+          <div class="token-row">
+            <span class="tlabel dim">Device token</span>
+            <code class="cmd token">{revealToken ? mesh.token : '•'.repeat(28)}</code>
+            <button class="btn" onclick={() => (revealToken = !revealToken)}>{revealToken ? 'hide' : 'show'}</button>
+            <button class="btn" onclick={() => copyToken(mesh?.token)}>{copied ? 'copied' : 'copy'}</button>
+          </div>
+        {/if}
+        <p class="hint dim">
+          {#if mesh.requireToken}
+            Token <b>required</b> for every request. Pair a phone or another PC by entering this token there once.
+          {:else}
+            Token enforcement is <b>off</b> — devices reach the hub freely on your fleet. Turn it on (set <code>security.requireToken</code> in <code>data/config.json</code> or run with <code>HUB_REQUIRE_TOKEN=1</code>, then restart the hub) before exposing to anything you don't fully trust; devices already connected keep working.
+          {/if}
+        </p>
       {:else}
         <p class="dim">Checking mesh…</p>
       {/if}
@@ -298,4 +326,7 @@
   .mstate.on { color: var(--ok); }
   .mstate.warn { color: var(--warn); }
   .mstate.off { color: var(--muted); }
+  .token-row { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-2); flex-wrap: wrap; }
+  .tlabel { font-size: var(--text-xs); }
+  .token { flex: 1; min-width: 9rem; overflow: hidden; text-overflow: ellipsis; }
 </style>

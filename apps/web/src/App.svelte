@@ -175,6 +175,11 @@
     dragGeom = null
     store.endDragSession()
   }
+
+  let pairToken = $state('')
+  function doPair(): void {
+    if (pairToken.trim()) void store.pair(pairToken)
+  }
 </script>
 
 <svelte:window onmousemove={onMove} onmouseup={endDrag} />
@@ -231,6 +236,16 @@
 {#if store.settingsOpen}
   <SettingsModal onclose={() => (store.settingsOpen = false)} />
 {/if}
+{#if store.needsPairing}
+  <div class="pairing-overlay">
+    <div class="pair-card">
+      <h2>Pair this device</h2>
+      <p class="dim">This hub requires a device token. On a device that's already connected, open <b>Settings → Mesh</b>, copy the token, and paste it here.</p>
+      <input placeholder="device token" bind:value={pairToken} onkeydown={(e) => { if (e.key === 'Enter') doPair() }} />
+      <button class="pair-btn" onclick={doPair} disabled={!pairToken.trim()}>Pair device</button>
+    </div>
+  </div>
+{/if}
 
 <style>
   .shell { display: grid; height: 100vh; }
@@ -247,6 +262,13 @@
     background: color-mix(in srgb, var(--accent) 12%, transparent); display: grid; place-items: center; }
   .ghost-pane span, .ghost-row span { color: var(--accent); font-size: 0.8rem; font-weight: 500; }
   .empty.dropping { outline: 2px dashed var(--accent); outline-offset: -1rem; border-radius: 16px; color: var(--accent); }
+  .pairing-overlay { position: fixed; inset: 0; z-index: 50; background: var(--bg); display: grid; place-items: center; }
+  .pair-card { width: min(420px, 90vw); background: var(--surface); border: 1px solid var(--border-strong); border-radius: 14px; padding: 1.5rem; display: flex; flex-direction: column; gap: 0.8rem; box-shadow: var(--shadow-4, 0 24px 70px rgba(0,0,0,0.6)); }
+  .pair-card h2 { margin: 0; font-size: 1.1rem; }
+  .pair-card p { font-size: 0.82rem; line-height: 1.5; margin: 0; }
+  .pair-card input { width: 100%; font-family: var(--mono); }
+  .pair-btn { align-self: flex-start; background: var(--accent); color: #fff; border-radius: 8px; padding: 0.45rem 0.9rem; font-weight: 500; }
+  .pair-btn:disabled { opacity: 0.5; cursor: default; }
   .handle, .pane-handle, .row-handle { background: transparent; flex: none; }
   .handle, .pane-handle { cursor: col-resize; }
   .pane-handle { width: 5px; border-left: 1px solid var(--border); }

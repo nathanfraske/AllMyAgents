@@ -82,8 +82,27 @@ const inTauri =
 export const HUB_HTTP = inTauri ? 'http://127.0.0.1:7777' : ''
 export const HUB_WS = inTauri ? 'ws://127.0.0.1:7777' : ''
 
+// Device token (localStorage-backed). Sent as a Bearer header on every request and as ?token= on
+// the WebSocket. Empty until the hub hands it over during the pre-enforcement window, or the user
+// pairs a remote device by pasting it.
+let hubToken = (typeof localStorage !== 'undefined' && localStorage.getItem('hub.token')) || ''
+export function getHubToken(): string {
+  return hubToken
+}
+export function setHubToken(t: string): void {
+  hubToken = t
+  try {
+    localStorage.setItem('hub.token', t)
+  } catch {
+    /* ignore */
+  }
+}
+function authHeaders(): Record<string, string> {
+  return hubToken ? { authorization: `Bearer ${hubToken}` } : {}
+}
+
 async function jget<T>(url: string): Promise<T> {
-  const res = await fetch(HUB_HTTP + url)
+  const res = await fetch(HUB_HTTP + url, { headers: authHeaders() })
   return res.json() as Promise<T>
 }
 
@@ -91,7 +110,7 @@ async function jpost<T>(url: string, body?: unknown): Promise<T> {
   try {
     const res = await fetch(HUB_HTTP + url, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...authHeaders() },
       body: body ? JSON.stringify(body) : undefined,
     })
     const text = await res.text()
@@ -142,6 +161,8 @@ export interface MeshStatus {
   peerUrl: string
   error?: string
   checkedAt?: string
+  requireToken?: boolean
+  token?: string
 }
 
 export const api = {
@@ -168,6 +189,11 @@ export const api = {
   deleteSession: (id: string) => jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/delete`),
   setMode: (id: string, permissionMode: string) => jpost(`/api/sessions/${id}/mode`, { permissionMode }),
   decide: (id: string, approve: boolean) => jpost(`/api/approvals/${id}`, { approve }),
-  mesh: () => jget<MeshStatus>('/api/mesh'),
+  mesh: async (): Promise<MeshStatus> => {
+    const m = await jget<MeshStatus>('/api/mesh')
+    if (m.token) setHubToken(m.token) // bootstrap: capture the token while the hub still hands it out
+    return m
+  },
   setMesh: (enable: boolean) => jpost<MeshStatus>('/api/mesh', { enable }),
+  auth: () => jget<{ requireToken: boolean; authed: boolean }>('/api/auth'),
 }

@@ -7,6 +7,7 @@ import type { ProjectStore } from './projects.js'
 import type { SessionManager } from './sessions.js'
 import type { UsageMonitor } from './usage.js'
 import type { MeshSite } from './meshSite.js'
+import { tokenMatches } from './deviceToken.js'
 import { pickFolder } from './native.js'
 import { computeStats } from './stats.js'
 import { startLogin, awaitLogin, credentialsExist } from './loginLauncher.js'
@@ -183,6 +184,14 @@ function originAllowed(origin: string | undefined): boolean {
   return /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)
 }
 
+/** Extract a device token from an Authorization: Bearer header or the x-hub-token header. */
+function bearerToken(req: http.IncomingMessage): string | undefined {
+  const auth = req.headers.authorization
+  if (auth && auth.startsWith('Bearer ')) return auth.slice(7).trim()
+  const x = req.headers['x-hub-token']
+  return typeof x === 'string' ? x : undefined
+}
+
 export interface ServerOptions {
   port: number
   defaultCwd: string
@@ -194,10 +203,12 @@ export interface ServerOptions {
   projects: ProjectStore
   rescanProfiles: () => Profile[]
   mesh: MeshSite
+  deviceToken: string
+  requireToken: boolean
 }
 
 export function startServer(opts: ServerOptions): http.Server {
-  const { port, defaultCwd, journal, sessions, profiles, approvals, usage, projects, rescanProfiles, mesh } = opts
+  const { port, defaultCwd, journal, sessions, profiles, approvals, usage, projects, rescanProfiles, mesh, deviceToken, requireToken } = opts
   // Same location index.ts scans for profiles (repoRoot/profiles); defaultCwd is repoRoot.
   const profilesDir = path.join(defaultCwd, 'profiles')
 
@@ -225,6 +236,17 @@ export function startServer(opts: ServerOptions): http.Server {
       if (method === 'OPTIONS') {
         res.writeHead(204)
         res.end()
+        return
+      }
+      const authed = tokenMatches(deviceToken, bearerToken(req))
+      // Public probe so an unpaired client can learn whether pairing is required (never gated).
+      if (method === 'GET' && url.pathname === '/api/auth') {
+        json(res, { requireToken, authed })
+        return
+      }
+      // Device-token gate (opt-in). When on, every /api call must present a valid token.
+      if (requireToken && !authed && url.pathname.startsWith('/api/')) {
+        json(res, { error: 'device token required', requireToken: true }, 401)
         return
       }
       if (method === 'GET' && url.pathname === '/') {
@@ -324,8 +346,10 @@ export function startServer(opts: ServerOptions): http.Server {
         return
       }
       // Mesh site status — lets the UI show the address other fleet PCs use to reach this hub.
+      // Includes the device token when the caller is local/authed, so it can be copied to pair
+      // another device (withheld from unauthenticated callers once enforcement is on).
       if (method === 'GET' && url.pathname === '/api/mesh') {
-        json(res, mesh.status())
+        json(res, { ...mesh.status(), requireToken, token: !requireToken || authed ? deviceToken : undefined })
         return
       }
       // Runtime toggle for exposing the hub as an AllMyStuff site. Registers/deregisters to match.
@@ -423,7 +447,16 @@ export function startServer(opts: ServerOptions): http.Server {
 
   // Same origin guard for the event stream — a foreign page must not be able to open /ws and
   // read the journal. Non-browser clients (no Origin) and loopback/desktop origins are allowed.
-  const wss = new WebSocketServer({ server, path: '/ws', verifyClient: (info: { origin?: string }) => originAllowed(info.origin) })
+  const wss = new WebSocketServer({
+    server,
+    path: '/ws',
+    verifyClient: (info: { origin?: string; req: http.IncomingMessage }) => {
+      if (!originAllowed(info.origin)) return false
+      if (!requireToken) return true
+      const wsUrl = new URL(info.req.url ?? '/ws', 'http://localhost')
+      return tokenMatches(deviceToken, wsUrl.searchParams.get('token') ?? undefined)
+    },
+  })
   wss.on('connection', (ws, req) => {
     const url = new URL(req.url ?? '/ws', 'http://localhost')
     // Replay the ENTIRE backlog from `since` (paged inside replay() so a huge journal isn't loaded
