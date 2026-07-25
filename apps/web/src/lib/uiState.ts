@@ -105,6 +105,42 @@ export function loadOpenAgentPanels(): string[] {
   return []
 }
 
+// Messages you typed while a turn was running, per session. They live client-side until the turn ends,
+// so a refresh used to silently throw away text you had already committed to sending — persist them.
+const QUEUES_KEY = 'allmyagents.ui.queuedMessages'
+
+export function loadQueues(): Record<string, string[]> {
+  try {
+    const raw = localStorage.getItem(QUEUES_KEY)
+    if (raw) {
+      const v = JSON.parse(raw) as unknown
+      if (v && typeof v === 'object' && !Array.isArray(v)) {
+        const out: Record<string, string[]> = {}
+        for (const [k, list] of Object.entries(v as Record<string, unknown>)) {
+          if (Array.isArray(list)) {
+            const texts = list.filter((x): x is string => typeof x === 'string')
+            if (texts.length) out[k] = texts
+          }
+        }
+        return out
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return {}
+}
+
+export function saveQueues(queues: Record<string, string[]>): void {
+  try {
+    // Drop empty lists so the entry does not grow forever as chats come and go.
+    const trimmed = Object.fromEntries(Object.entries(queues).filter(([, v]) => v.length > 0))
+    localStorage.setItem(QUEUES_KEY, JSON.stringify(trimmed))
+  } catch {
+    /* ignore */
+  }
+}
+
 export function saveOpenAgentPanels(ids: string[]): void {
   try {
     localStorage.setItem(AGENT_PANELS_KEY, JSON.stringify(ids))

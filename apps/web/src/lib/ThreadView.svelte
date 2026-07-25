@@ -136,7 +136,13 @@
 
   // "Received / thinking" indicator: a turn is in flight while turnStartedAt is set. A ticking
   // clock drives the elapsed readout; it only runs while thinking (torn down otherwise).
-  const thinking = $derived(!!view && view.turnStartedAt != null)
+  // In flight while we have a start time OR the record itself says active/starting. The status check is
+  // the safety net for a turn this client never watched BEGIN — one kicked off by a teammate's bus
+  // message rather than by you typing, or one already running when the app loaded — where no optimistic
+  // start time was ever set locally. Status is hub-owned and replayed, so it is the honest signal.
+  const thinking = $derived(
+    !!view && (view.turnStartedAt != null || view.record.status === 'active' || view.record.status === 'starting')
+  )
   const liveTok = $derived(view?.liveTokens)
   let now = $state(Date.now())
   $effect(() => {
@@ -145,6 +151,8 @@
     return () => clearInterval(iv)
   })
   const elapsedMs = $derived(thinking && view?.turnStartedAt ? Math.max(0, now - view.turnStartedAt) : 0)
+  // Blank rather than a fake "0s" when we are thinking but never learned when the turn began.
+  const elapsedLabel = $derived(view?.turnStartedAt != null ? fmtElapsed(elapsedMs) : '')
   function fmtElapsed(ms: number): string {
     const s = Math.floor(ms / 1000)
     if (s < 60) return `${s}s`
@@ -413,7 +421,7 @@
       <div class="thinking">
         <span class="dots"><i></i><i></i><i></i></span>
         <span class="tlabel">thinking</span>
-        <span class="tmeta">{fmtElapsed(elapsedMs)}{#if liveTok?.total} · {fmtTokens(liveTok.total)} tokens{/if}</span>
+        <span class="tmeta">{elapsedLabel}{#if liveTok?.total}{elapsedLabel ? ' · ' : ''}{fmtTokens(liveTok.total)} tokens{/if}</span>
       </div>
     {/if}
   </div>

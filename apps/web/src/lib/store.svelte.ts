@@ -1,7 +1,7 @@
 import { api, HUB_WS, getHubToken, setHubToken } from './api'
 import { settings } from './settings.svelte'
 import { alertDialog } from './dialog.svelte'
-import { loadLastLayout, saveLastLayout, type PersistedLayout } from './uiState'
+import { loadLastLayout, saveLastLayout, loadQueues, saveQueues, type PersistedLayout } from './uiState'
 import { rowFate } from './fleetMerge'
 import type { ApprovalRecord, FleetSite, HistoryItem, HistoryPage, HubEvent, ProfileInfo, ProjectInfo, ScanResult, SessionRecord, UsageSnapshot } from './api'
 
@@ -221,7 +221,9 @@ class HubStore {
   needsPairing = $state(false)
   selectedId = $state<string | null>(null)
   settingsOpen = $state(false)
-  queues = $state<Record<string, string[]>>({})
+  // Queued messages survive a refresh: you already committed to sending that text, so losing it because
+  // the page reloaded is data loss. Restored from localStorage and re-saved on every mutation.
+  queues = $state<Record<string, string[]>>(loadQueues())
   // Persisted sidebar arrangement: ordered project ids, and ordered chat ids keyed by group id
   // ('__none__' for the Unfiled group). Reorder methods update these + localStorage; the sidebar
   // reads `orderedProjects` / `orderedChats` to apply them.
@@ -258,6 +260,7 @@ class HubStore {
   enqueue(sessionId: string, text: string): void {
     const q = [...(this.queues[sessionId] ?? []), text]
     this.queues = { ...this.queues, [sessionId]: q }
+    saveQueues(this.queues)
   }
 
   editQueued(sessionId: string, index: number, text: string): void {
@@ -265,11 +268,13 @@ class HubStore {
     if (index < 0 || index >= q.length) return
     q[index] = text
     this.queues = { ...this.queues, [sessionId]: q }
+    saveQueues(this.queues)
   }
 
   removeQueued(sessionId: string, index: number): void {
     const q = (this.queues[sessionId] ?? []).filter((_, i) => i !== index)
     this.queues = { ...this.queues, [sessionId]: q }
+    saveQueues(this.queues)
   }
 
   private flushQueue(sessionId: string): void {
@@ -285,6 +290,7 @@ class HubStore {
       rest = q.slice(1)
     }
     this.queues = { ...this.queues, [sessionId]: rest }
+    saveQueues(this.queues)
     this.pushUserEcho(sessionId, toSend) // show the flushed queued message in the transcript
     void api.send(sessionId, toSend)
   }
@@ -370,11 +376,11 @@ class HubStore {
     this.projects = await api.projects()
     vlog(`init: ${this.profiles.length} profiles, ${this.projects.length} projects (${msSince(t0)})`)
     await this.refreshSideData()
-    // Come back where you left off: reopen the chat(s) + split layout that were open last time, instead
-    // of landing on the home screen and making you click back in (Setting, default on). Runs AFTER the
-    // session roster loads so the ids resolve; if nothing survived, restoreLastLayout() no-ops and the
-    // home screen's manual "Reopen" offer remains the fallback.
-    if (settings.autoReopenLastChats) this.restoreLastLayout()
+    // Come back where you left off (Setting, default on). This only ARMS it: the session roster does not
+    // exist yet here — sessions arrive over the WS replay below — so restoring now would find no ids,
+    // silently give up, AND consume the manual offer. ensure() fires the actual restore once sessions
+    // land. (That ordering bug is exactly why the first version of this never reopened anything.)
+    this.autoRestorePending = settings.autoReopenLastChats
     vlog(`init: side data loaded (${msSince(t0)}) — connecting WS`)
     this.connect()
     // Fire-and-forget: pull the fleet roster and merge any remote machines' projects/sessions
@@ -448,6 +454,7 @@ class HubStore {
       draftUseWorktree: useWorktree ?? settings.defaultUseWorktree,
     }
     this.sessions[id] = view
+    this.scheduleAutoRestore() // sessions are arriving — the pending auto-reopen can now resolve ids
     this.lastProfileId = pid
     this.select(id) // opens the draft as the active pane (and discards any prior unsent draft)
   }
@@ -1468,6 +1475,29 @@ class HubStore {
   // offers the operator's most recent real layout).
   dismissRestore(): void {
     this.restorableLayout = null
+    this.autoRestorePending = false // an explicit dismissal must not be overridden by the auto-reopen
+  }
+
+  // --- Auto-reopen the last layout ---------------------------------------------------------------
+  // Armed in init(), fired from ensure() once the WS replay has actually delivered sessions. Debounced
+  // so we restore against the WHOLE roster rather than whichever session happened to arrive first.
+  private autoRestorePending = false
+  private autoRestoreTimer: ReturnType<typeof setTimeout> | null = null
+
+  private scheduleAutoRestore(): void {
+    if (!this.autoRestorePending || this.autoRestoreTimer) return
+    this.autoRestoreTimer = setTimeout(() => {
+      this.autoRestoreTimer = null
+      if (!this.autoRestorePending) return
+      // Never override a chat the operator already opened themselves during startup.
+      if (this.selectedId || this.splitPanes.length) {
+        this.autoRestorePending = false
+        return
+      }
+      if (!this.restorableLayout || Object.keys(this.sessions).length === 0) return // try again on the next arrival
+      this.autoRestorePending = false
+      this.restoreLastLayout()
+    }, 250)
   }
 
   // drag-to-split: the session being dragged and the live drop zone (column or new row).
