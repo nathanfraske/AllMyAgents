@@ -366,6 +366,40 @@ describe('SessionManager.attachWorker — the exactly-once replay cursor (hub si
     expect(marks).toContain('new2')
   })
 
+  // THE PRODUCTION OUTAGE (2026-07-25). The test above covers a respawn while the record is still 'active'.
+  // But when a worker actually DIES, its exit handling flips sessions to idle/error BEFORE the hub
+  // re-attaches — so the sweep's old `status === 'active' || 'starting'` test failed, the in-memory guard
+  // survived from the dead era, and EVERY event of every later turn compared <= it and was dropped. Agents
+  // ran, tools worked, and nothing they said ever reached the journal or the UI for ~22 minutes. The reset
+  // must therefore key on "the worker does not hold this session", never on the session's status.
+  it('clears the guard for a session ALREADY flipped idle by the worker exit (silent-output regression)', async () => {
+    const h = buildHub()
+    seedRecord(h.store, 's', 'active')
+    h.sessions.loadRecords()
+    for (let wq = 1; wq <= 165; wq++) h.sessions.ingestWorkerEvent('s', wq, 'claude/text', { mark: `old${wq}` })
+    h.setLive([{ sessionId: 's', status: 'active', lastWseq: 165 }])
+    await h.sessions.attachWorker()
+
+    // The worker dies. Its exit path fails the in-flight session FIRST, so the record is NOT active by the
+    // time the hub re-attaches to the respawned worker — the case the original reset silently skipped.
+    h.sessions.applyLifecycle({ t: 'turnError', sessionId: 's', wseq: 166, message: 'codex app-server exited (1) mid-turn' })
+    h.setLive([])
+    await h.sessions.attachWorker()
+
+    // The fresh worker's first events (wseq 1, 2 — far below the dead era's 165) MUST be journaled.
+    h.sessions.ingestWorkerEvent('s', 1, 'claude/text', { mark: 'fresh1' })
+    h.sessions.ingestWorkerEvent('s', 2, 'claude/text', { mark: 'fresh2' })
+    const marks = h.journal
+      .since(0)
+      .filter((e) => e.sessionId === 's')
+      .map((e) => (e.payload as { mark?: string }).mark)
+    expect(marks).toContain('fresh1')
+    expect(marks).toContain('fresh2')
+    // And the durable baseline is rebased too, so a LATER hub restart cannot re-derive a cursor from the
+    // dead era and swallow the fresh one all over again.
+    expect(h.journal.since(0).some((e) => e.sessionId === 's' && e.kind === WSEQ_RESET_KIND)).toBe(true)
+  })
+
   it('F1: a fresh post-respawn wseq sequence FOLLOWED BY a re-attach journals every fresh event exactly once', async () => {
     // The case the audit named as missing: a worker RESPAWN (wseq restarts at 1) and then a SECOND hub
     // restart. The successor re-derives since[sid] from the DURABLE cursor, so that cursor must reflect the
