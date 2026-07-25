@@ -1021,7 +1021,17 @@ class HubStore {
     this.pendingEvents.push(event)
     if (this.flushScheduled) return
     this.flushScheduled = true
-    queueMicrotask(() => this.flushEvents())
+    // MUST be a macrotask. queueMicrotask drains at the end of the SAME task that queued it, and every
+    // WebSocket message is its own task — so a microtask flush batched exactly ONE event and the
+    // transcript still rebuilt itself line by line. Deferring to the next frame lets a whole burst of
+    // messages land in `pendingEvents` first, which is the entire point.
+    const run = (): void => this.flushEvents()
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(run)
+      setTimeout(run, 50) // rAF never fires in a hidden/background tab; flushEvents is idempotent
+    } else {
+      setTimeout(run, 16) // non-browser (tests/SSR): one flush per ~frame
+    }
   }
 
   /**

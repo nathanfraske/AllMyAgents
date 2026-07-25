@@ -526,6 +526,18 @@ describe('event batching (replay does not render frame-by-frame)', () => {
     ;(store as unknown as { flushEvents(): void }).flushEvents()
   }
 
+  // The bug the FIRST attempt shipped: queueMicrotask drains at the end of the same task that queued
+  // it, and each WebSocket message is its own task — so it batched exactly one event and the transcript
+  // still replayed line by line. Awaiting a microtask here proves the flush is NOT microtask-scheduled.
+  it('does not flush on a microtask boundary (macrotask deferral is what makes batching real)', async () => {
+    ingest(evt({ seq: 1, kind: 'session/created', sessionId: 's1', payload: rec('s1') }))
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(store.sessions.s1).toBeUndefined()
+    flush()
+    expect(store.sessions.s1).toBeDefined()
+  })
+
   it('buffers instead of applying immediately, then applies the whole batch in order', () => {
     ingest(evt({ seq: 1, kind: 'session/created', sessionId: 's1', payload: rec('s1') }))
     ingest(evt({ seq: 2, kind: 'session/input', sessionId: 's1', payload: { text: 'first' } }))
