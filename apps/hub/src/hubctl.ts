@@ -18,9 +18,23 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { sendToHub, waitForHubMsg, healthCheck, type HubMsg } from './restartHandshake.js'
+import { defaultWorkerSocket } from './workerTransport.js'
 
 /** The hard public singleton the web client hardcodes (`api.ts:145`). Blue owns it; green takes it on promote. */
 const FIXED_PORT = 7777
+
+/**
+ * Worker mode (docs/agent-worker-impl.md §5) is OPT-IN — the hard requirement is that flag-off is
+ * byte-identical to today. It is enabled when the operator sets HUB_WORKER_SOCKET (an explicit socket
+ * path) or HUB_WORKER=1 (use the platform default path) in hubctl's environment. When enabled, hubctl
+ * spawns the agent worker as a sibling of the hub (before blue, outliving every flip) and injects
+ * HUB_WORKER_SOCKET into every hub so blue AND green connect to the same worker — which lights index.ts's
+ * Phase-2 flag. When DISABLED (neither set, the default), no worker is spawned and nothing is injected, so
+ * every supervised hub runs the in-process executor exactly as before.
+ */
+const dataDir = path.resolve(import.meta.dirname, '..', '..', '..', 'data')
+const workerEnabled = !!process.env.HUB_WORKER_SOCKET || process.env.HUB_WORKER === '1'
+const workerSocket: string | undefined = workerEnabled ? defaultWorkerSocket(dataDir) : undefined
 
 type HubColor = 'blue' | 'green'
 
@@ -45,6 +59,11 @@ const children = new Set<ChildProcess>()
 
 /** The live hub's `restart-request` listener, tracked so we detach it when `live` changes. */
 let restartListener: ((m: unknown) => void) | null = null
+
+/** The current agent-worker child (worker mode only). Tracked so its exit handler can respawn it. */
+let workerHandle: ChildProcess | null = null
+/** Set while a signal/fatal teardown is killing the tree, so the worker's exit handler doesn't respawn. */
+let tearingDown = false
 
 function log(msg: string): void {
   console.log(`[hubctl] ${msg}`)
@@ -79,7 +98,9 @@ function spawnHub(port: number, color: HubColor): HubHandle {
   const { cmd, args } = hubLaunchCommand()
   const child = spawn(cmd, args, {
     stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
-    env: { ...process.env, HUB_PORT: String(port), HUB_SUPERVISED: '1' },
+    // Worker mode (opt-in) injects HUB_WORKER_SOCKET so blue AND green connect to the same worker; when
+    // disabled the spread adds nothing, so the env is byte-identical to today (docs/agent-worker-impl.md §5.1).
+    env: { ...process.env, HUB_PORT: String(port), HUB_SUPERVISED: '1', ...(workerSocket ? { HUB_WORKER_SOCKET: workerSocket } : {}) },
   })
   const handle: HubHandle = { child, color, port, restored: 0, state: 'booting' }
   children.add(child)
@@ -96,6 +117,46 @@ function spawnHub(port: number, color: HubColor): HubHandle {
     }
   })
   return handle
+}
+
+/**
+ * How to launch the agent worker — the same prod-JS/dev-TS resolution as {@link hubLaunchCommand}, but
+ * resolving `agentWorker.js`/`agentWorker.ts` next to this file. Dev is the absence of a built
+ * `dist/index.js` (the identical signal hubLaunchCommand uses) or an explicit HUBCTL_DEV=1.
+ */
+function workerLaunchCommand(): { cmd: string; args: string[] } {
+  const dir = import.meta.dirname
+  const dev = process.env.HUBCTL_DEV === '1' || !fs.existsSync(path.join(dir, 'index.js'))
+  return dev
+    ? { cmd: process.execPath, args: ['--import', 'tsx/esm', path.join(dir, 'agentWorker.ts')] }
+    : { cmd: process.execPath, args: [path.join(dir, 'agentWorker.js')] }
+}
+
+/**
+ * Spawn the agent worker as a supervised sibling of the hub (docs/agent-worker-impl.md §5.1). Same stdio
+ * shape as spawnHub (the IPC slot is unused for now — §5.2's worker-unreachable signal is out of the first
+ * cut). The worker is meant to be ALWAYS-UP: on an unexpected exit (not a hubctl teardown) respawn it, and
+ * the hubs' auto-reconnecting WorkerClients re-attach; a turn that was live is lost (degrades to Phase-1
+ * semantics — re-attach across a WORKER restart is out of scope here). Only called in worker mode, so
+ * `workerSocket` is defined (guarded regardless).
+ */
+function spawnWorker(): void {
+  if (!workerSocket) return
+  const { cmd, args } = workerLaunchCommand()
+  const child = spawn(cmd, args, {
+    stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+    env: { ...process.env, HUB_WORKER_SOCKET: workerSocket },
+  })
+  workerHandle = child
+  children.add(child)
+  child.on('error', (err) => log(`worker failed to spawn: ${String(err)}`))
+  child.on('exit', (code, signal) => {
+    children.delete(child)
+    const wasCurrent = workerHandle === child
+    if (wasCurrent) workerHandle = null
+    log(`worker exited (code=${code ?? 'null'} signal=${signal ?? 'null'})${tearingDown ? '' : ' — respawning'}`)
+    if (!tearingDown && wasCurrent) spawnWorker()
+  })
 }
 
 /** Make `handle` the live hub and (re-)wire the `restart-request` listener onto it. */
@@ -155,6 +216,12 @@ function reap(handle: HubHandle, graceMs: number): void {
 
 /** Boot the first hub (blue) on the fixed port and wait for it to become ready. */
 async function boot(): Promise<void> {
+  // Worker mode (opt-in): the worker is a sibling born BEFORE blue so blue can connect on its first turn.
+  // No health-check gate — a hub with no worker yet simply retries its connect loop (§5.1).
+  if (workerSocket) {
+    log(`spawning agent worker (socket ${workerSocket})`)
+    spawnWorker()
+  }
   log(`booting hub (blue) on :${FIXED_PORT}`)
   const blue = spawnHub(FIXED_PORT, 'blue')
   const ready = await waitForHubMsg(blue.child, 'ready', 20_000)
@@ -227,6 +294,7 @@ async function restart(reason: string): Promise<void> {
 
 /** On a shell signal, tear down every hub tree and exit. (The desktop shell also taskkills our tree.) */
 function teardown(signal: NodeJS.Signals): void {
+  tearingDown = true // stop the worker's exit handler from respawning it into a teardown
   log(`${signal} — tearing down hub(s) and exiting`)
   for (const child of children) killTree(child)
   process.exit(0)
@@ -236,6 +304,7 @@ process.on('SIGTERM', () => teardown('SIGTERM'))
 
 log(`supervisor starting (pid ${process.pid})`)
 boot().catch((err) => {
+  tearingDown = true // a fatal boot tears the tree down; don't let the worker respawn into it
   log(`fatal: hub failed to boot: ${String(err)}`)
   for (const child of children) killTree(child)
   process.exit(1)

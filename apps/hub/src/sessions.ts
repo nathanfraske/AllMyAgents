@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { defaultHomeProfiles } from './profiles.js'
+import { mapCodexTokenUsage } from './adapters/codex.js'
 import { readHistoryPage, locateTranscript, type HistoryPage } from './transcript.js'
 import type { ApprovalService } from './approvals.js'
 import type { Journal } from './journal.js'
@@ -9,7 +10,7 @@ import type { ProjectStore } from './projects.js'
 import type { SessionStore } from './store.js'
 import type { UsageMonitor } from './usage.js'
 import type { WorkspaceManager } from './workspace.js'
-import type { Profile, Provider, SessionRecord, SessionStatus } from './types.js'
+import type { ClaudeLimitInfo, Profile, Provider, SessionRecord, SessionStatus } from './types.js'
 import { writeManagedInstructions, agentContract } from './instructions.js'
 import type { InstructionStore } from './instructions.js'
 import { identityOf, readableScopes } from './identity.js'
@@ -18,7 +19,7 @@ import type { MemoryStore } from './memory.js'
 import type { PracticeStore } from './practices.js'
 import type { DangerFlags } from './types.js'
 import { InProcessExecutor, type Executor, type InProcessExecutorHubHooks } from './executor.js'
-import type { WorkerSessionSpec } from './workerProtocol.js'
+import type { WorkerSessionSpec, WorkerToHub } from './workerProtocol.js'
 import { deriveTitle, sanitizeTitle } from './title.js'
 import { discoverImportableChats, importKey, type ImportableChat, type ScanResult } from './importScan.js'
 
@@ -96,30 +97,9 @@ export class SessionManager {
   private buildHubHooks(): InProcessExecutorHubHooks {
     return {
       journal: (sessionId, kind, payload) => this.journal.append(sessionId, kind, payload),
-      setStatus: (sessionId, status) => {
-        const record = this.sessions.get(sessionId)
-        if (record) {
-          this.setStatus(record, status)
-          return
-        }
-        // Session deleted mid-turn: the pre-seam turn loop still held the record object and ran
-        // setStatus on it, which journaled session/status (persist + deliverBus both no-op once the
-        // session is gone from the roster). Preserve exactly that trailing event so a delete-during-turn
-        // is byte-identical.
-        this.journal.append(sessionId, 'session/status', { status })
-        if (status === 'idle') setImmediate(() => this.deliverBus(sessionId))
-      },
-      persistVendorSessionId: (sessionId, vendorSessionId) => {
-        const record = this.sessions.get(sessionId)
-        if (record) {
-          record.vendorSessionId = vendorSessionId
-          this.persist(record)
-        }
-      },
-      recall: (sessionId, prompt) => {
-        const record = this.sessions.get(sessionId)
-        return record ? this.withRecall(record, prompt) : prompt
-      },
+      setStatus: (sessionId, status) => this.setStatusById(sessionId, status),
+      persistVendorSessionId: (sessionId, vendorSessionId) => this.persistVendorSessionIdById(sessionId, vendorSessionId),
+      recall: (sessionId, prompt) => this.recallForWorker(sessionId, prompt),
       onCodexExit: (profileId, payload) => {
         // A PLANNED retire (blue-green) kills our own codex child on purpose — don't mislabel its
         // in-flight sessions as crashes (docs/agent-detachment-impl.md §4.2 #7). Phase 1 still loses
@@ -129,6 +109,90 @@ export class SessionManager {
       busSend: (fromSessionId, to, subject, body) => this.busSend(fromSessionId, to, subject, body),
       busInbox: (sessionId) => this.busInbox(sessionId),
       busRoster: (sessionId) => this.busRoster(sessionId),
+    }
+  }
+
+  /**
+   * Apply a status transition by session id, with the delete-during-turn fallback the in-process turn loop
+   * relied on. When the record is still in the roster this is the normal setStatus (persist + journal
+   * session/status + idle→deliverBus); when it was deleted mid-turn the trailing session/status is still
+   * journaled (persist + deliverBus both no-op once the session is gone), so a delete-during-turn stays
+   * byte-identical. Shared by the in-process hub hooks and the worker's applyLifecycle (§3.2).
+   */
+  private setStatusById(sessionId: string, status: SessionStatus): void {
+    const record = this.sessions.get(sessionId)
+    if (record) {
+      this.setStatus(record, status)
+      return
+    }
+    this.journal.append(sessionId, 'session/status', { status })
+    if (status === 'idle') setImmediate(() => this.deliverBus(sessionId))
+  }
+
+  /** Persist a freshly-learned vendor session id onto the record (no-op once the session is deleted). */
+  private persistVendorSessionIdById(sessionId: string, vendorSessionId: string): void {
+    const record = this.sessions.get(sessionId)
+    if (record) {
+      record.vendorSessionId = vendorSessionId
+      this.persist(record)
+    }
+  }
+
+  /**
+   * Augment a prompt with auto-recalled memories (withRecall stays hub-side, §4.2). Public because the
+   * WorkerExecutor — which runs IN the hub process — calls it to recall-augment a prompt BEFORE it crosses
+   * to the worker (which holds no MemoryStore); the in-process executor reaches it through the hub hook.
+   * Returns the prompt unchanged for an unknown session (or when recall is disabled / finds nothing).
+   */
+  recallForWorker(sessionId: string, prompt: string): string {
+    const record = this.sessions.get(sessionId)
+    return record ? this.withRecall(record, prompt) : prompt
+  }
+
+  /**
+   * Re-home the hub-side side effects of a worker vendor event (docs/agent-worker-impl.md §3.2). In worker
+   * mode the driver callbacks no longer run these inline; the worker streams every vendor event tagged with
+   * its per-session wseq, and the hub journals it (via appendWorker, tagging the wseq that seeds the durable
+   * re-attach cursor — consumed in step 5) and re-runs exactly the conditions the in-process driver
+   * callbacks ran: claude usage accounting (rate_limit → noteClaude, result → noteClaudeCost) and the codex
+   * token-usage → session/tokens derivation. Status / vendorSessionId are NOT sniffed here — they ride the
+   * explicit lifecycle stream (applyLifecycle).
+   */
+  ingestWorkerEvent(sessionId: string, wseq: number, kind: string, payload: unknown): void {
+    this.journal.appendWorker(sessionId, kind, payload, wseq)
+    const profileId = this.sessions.get(sessionId)?.profileId
+    if (kind === 'claude/rate_limit_event') {
+      const info = (payload as { rate_limit_info?: ClaudeLimitInfo }).rate_limit_info
+      if (info && profileId) this.usage.noteClaude(profileId, info)
+    } else if (kind === 'claude/result') {
+      const cost = (payload as { total_cost_usd?: number }).total_cost_usd
+      if (profileId) this.usage.noteClaudeCost(profileId, cost)
+    } else if (kind === 'codex/thread/tokenUsage/updated') {
+      const tokens = mapCodexTokenUsage(payload)
+      if (tokens) this.journal.append(sessionId, 'session/tokens', tokens)
+    }
+  }
+
+  /**
+   * Drive the hub's status machine from a worker turn-lifecycle message (docs/agent-worker-impl.md §3.2),
+   * reusing the SAME record-keyed methods the in-process hub hooks bind: turnStarted → active; turnCompleted
+   * → persist the vendorSessionId (if the worker learned one — a claude turn does mid-flight) + idle;
+   * turnError → journal session/error + error. Status is thus driven by explicit lifecycle, never sniffed
+   * from event kinds (cleaner than the pre-seam codex/turn/completed sniff).
+   */
+  applyLifecycle(msg: Extract<WorkerToHub, { t: 'turnStarted' | 'turnCompleted' | 'turnError' }>): void {
+    switch (msg.t) {
+      case 'turnStarted':
+        this.setStatusById(msg.sessionId, 'active')
+        return
+      case 'turnCompleted':
+        if (msg.vendorSessionId) this.persistVendorSessionIdById(msg.sessionId, msg.vendorSessionId)
+        this.setStatusById(msg.sessionId, 'idle')
+        return
+      case 'turnError':
+        this.journal.append(msg.sessionId, 'session/error', { message: msg.message })
+        this.setStatusById(msg.sessionId, 'error')
+        return
     }
   }
 

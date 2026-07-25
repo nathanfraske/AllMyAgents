@@ -15,7 +15,9 @@ import { InstructionStore } from './instructions.js'
 import { AgentBus } from './bus.js'
 import { MemoryStore } from './memory.js'
 import { PracticeStore } from './practices.js'
-import { InProcessExecutor } from './executor.js'
+import { InProcessExecutor, type Executor } from './executor.js'
+import { WorkerExecutor } from './workerExecutor.js'
+import { WorkerClient } from './workerTransport.js'
 import type { DangerFlags, HubConfig } from './types.js'
 import { RestartController, type RestartState } from './restartController.js'
 import { SCHEMA_VERSION, type SupervisorMsg } from './restartHandshake.js'
@@ -56,12 +58,24 @@ const danger: DangerFlags = {
   autoApprovePractices: config.danger?.autoApprovePractices === true,
   autoApproveRestart: config.danger?.autoApproveRestart === true,
 }
-// Agent execution runs behind the Executor seam (docs/agent-worker-impl.md §4.1). Today the only
-// implementation is the in-process one, built from the same hub services SessionManager uses; the
-// SessionManager binds its hub-half side effects (status/persist/recall/journal/bus) onto it. A later
-// slice adds a WorkerExecutor (a supervised sibling process) behind the same interface — not built here.
-const executor = new InProcessExecutor({ approvals, usage, danger, memory, practices })
-const sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, repoRoot, executor)
+// Agent execution runs behind the Executor seam (docs/agent-worker-impl.md §4.1). The implementation is
+// chosen by the presence of HUB_WORKER_SOCKET (§4.4, the Phase-2 feature flag hubctl injects when worker
+// mode is opted into): absent → the in-process executor (byte-identical to today); present → a
+// WorkerExecutor that relays every method to the long-lived agent worker over a WorkerClient and drives
+// the hub's side effects from the worker→hub event/lifecycle streams (ingestWorkerEvent / applyLifecycle /
+// recall / requestRestart). The callbacks forward to `sessions`, assigned just below — they only fire once
+// a worker message arrives (well after assignment), so the forward reference is safe.
+const workerSocket = process.env.HUB_WORKER_SOCKET
+let sessions: SessionManager
+const executor: Executor = workerSocket
+  ? new WorkerExecutor(new WorkerClient(workerSocket, { danger: () => danger }), {
+      ingestWorkerEvent: (sessionId, wseq, kind, payload) => sessions.ingestWorkerEvent(sessionId, wseq, kind, payload),
+      applyLifecycle: (msg) => sessions.applyLifecycle(msg),
+      recall: (sessionId, prompt) => sessions.recallForWorker(sessionId, prompt),
+      requestRestart: (reason, bySession) => void sessions.requestRestart(reason, bySession),
+    })
+  : new InProcessExecutor({ approvals, usage, danger, memory, practices })
+sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, repoRoot, executor)
 usage.setCodexReader((profileId) => sessions.readCodexLimits(profileId))
 
 // --- Blue-green restart wiring (docs/agent-detachment-impl.md §1.6) --------------------------------

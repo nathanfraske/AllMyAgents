@@ -122,6 +122,9 @@ log(`shipped Node runtime: ${nodeName} (${process.version}) + npm`)
 
 // 7. Validate the shipped payload — our code + the runtime, nothing vendor.
 must(path.join(outHub, 'dist', 'index.js'), 'hub entry in payload')
+// The agent worker (docs/agent-worker-impl.md §3) ships in the same dist/ tree the whole copy above
+// already carries; assert it made the payload so a hubctl worker spawn can never miss its entry.
+must(path.join(outHub, 'dist', 'agentWorker.js'), 'agent worker entry in payload')
 must(path.join(outHub, 'package.json'), 'hub manifest in payload')
 must(path.join(outNodeDir, nodeName), 'node runtime in payload')
 must(path.join(outNodeDir, 'node_modules', 'npm', 'bin', 'npm-cli.js'), 'npm in payload')
