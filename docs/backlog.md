@@ -10,19 +10,37 @@ browser/computer/visualization, auto-recall) — not gaps. The real gaps:
 
 - **P0 — VERIFY live behaviors (security-relevant), then govern.** `profiles/claude-a/.claude.json` has
   `"tengu_claudeai_mcp_connectors": true` and the hub sets NO connector kill-switch, so the operator's
-  claude.ai connectors may already reach hub Claude agents via the vendor cloud (a data-egress path).
-  Also verify the installed Agent-SDK `settingSources` default and whether Codex's built-in `image_gen`
-  is exposed to our unmanaged app-server client. Then make a deliberate decision (safe-default +
-  Danger-Zone toggle) for connectors + vendor auto-memory (which runs in parallel with hub memory).
+  claude.ai connectors may already reach hub Claude agents via the vendor cloud.
+  - **Plain English:** "connectors" are the integrations you've linked to your Claude account through
+    Anthropic's cloud — Google Drive, GitHub, Gmail, and the like. With this flag on, an agent running
+    inside the hub may be able to call those integrations — i.e. reach into your linked accounts — via
+    the vendor cloud, even though you never wired them into the hub yourself. The danger: an agent
+    chewing on untrusted text (an imported chat, a scraped web page) could be talked into pulling data
+    from, or pushing data to, one of those connected accounts.
+  - **Decision (matches the safe-default + toggle philosophy):** default the connector kill-switch ON
+    (connectors unreachable by agents), expose a Danger-Zone toggle to allow them. Make the same
+    deliberate call for vendor auto-memory (which today runs in parallel with hub memory).
+  - Also verify the installed Agent-SDK `settingSources` default and whether Codex's built-in `image_gen`
+    is exposed to our unmanaged app-server client. (Verification agent running as of 2026-07-24.)
 - **P1 — Claude skill asymmetry.** Codex agents auto-load their profile's bundled skills (imagegen,
   ~20 artifact-template docs, review-agent, github recipes); our Claude profiles ship NO skills / no
-  plugins, so Claude agents get no skill library at all. Provision a scope-governed Claude skill set
-  (materialized like practices, `instructions.ts`).
+  plugins, so Claude agents get no skill library at all. Provision a scope-governed Claude skill set,
+  materialized like practices (`instructions.ts`). **Harvest the public skills** (the vendor's open
+  skills repo / community sets) rather than authoring from scratch — curate + scope-gate what we import.
 - **G1 (P0) — review-feedback loop, exposed to agents.** Operator leaves PR-style inline comments on a
   turn's diff → thread as feedback.md/json (open/resolved). Leapfrog T3Code (their #345 "not planned")
-  by making it an agent MCP tool the agent reads/resolves itself.
-- **G2–G5 (git-lifecycle):** per-turn changed-files diff + checkpoint/rollback; hub-owned
-  commit/push/PR; plan-then-execute gate; quick-actions / project-scripts.
+  by making it an agent MCP tool the agent reads/resolves itself. **Gate behind a Settings toggle (hard
+  off-switch):** when disabled, agents cannot arm a review-comment monitor at all. Prefer an event-driven
+  push (operator submits → hub injects the comments into the thread on the next turn) over agent-side
+  polling, so an armed monitor costs ~0 idle tokens; the toggle is the absolute off regardless.
+- **G2 — per-turn diff + checkpoint/rollback.** Show a changed-files diff per turn; snapshot before a
+  turn so the operator can roll back a bad one.
+- **G3 — hub-owned git lifecycle.** Commit / push / open-PR driven from the hub (not only from inside the
+  agent's shell), so the operator can act on a turn's output directly.
+- **G4 — plan-then-execute gate.** An explicit plan step the operator approves before the agent executes
+  (beyond the vendor plan-mode), surfaced in the hub UI.
+- **G5 — quick-actions / project-scripts.** Per-project saved commands the operator can fire at a session
+  (lint, test, build, deploy) without retyping.
 - **P2:** self-hosted scheduler (scheduled-tasks equivalent); document-artifact rendering (pdf/docx/
   xlsx/pptx/dataviz); `$`-picker skill curation; outward-facing hub MCP server; per-session MCP passthrough.
 
