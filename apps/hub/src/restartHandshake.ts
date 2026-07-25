@@ -77,8 +77,14 @@ export function waitForHubMsg<T extends HubMsg['type']>(
 export async function healthCheck(port: number, opts: { expectRestored: number }): Promise<void> {
   const health = await getJson(port, '/api/health', 4000)
   if (health?.boot !== 'complete') throw new Error(`health: boot=${health?.boot}`)
-  if (typeof health.restoredSessions === 'number' && health.restoredSessions !== opts.expectRestored) {
-    throw new Error(`health: restored ${health.restoredSessions} != expected ${opts.expectRestored}`)
+  // Guard against LOSING sessions in the flip: green must restore AT LEAST as many as expected. Sessions
+  // created during blue's life legitimately make green's count HIGHER (expectRestored is blue's boot-time
+  // count, frozen at boot), which is not a loss — so only a SHORTFALL aborts. A prior exact `!==` here
+  // false-aborted a perfectly healthy flip whenever any session was created between blue's boot and the
+  // restart. (Follow-up for full robustness against DELETIONS during blue's life: pass blue's LIVE
+  // /api/health count as expectRestored instead of the frozen blue.restored — see hubctl.ts restart().)
+  if (typeof health.restoredSessions === 'number' && health.restoredSessions < opts.expectRestored) {
+    throw new Error(`health: green restored ${health.restoredSessions} < expected ${opts.expectRestored} — sessions would be lost, aborting flip`)
   }
   const authStatus = await getStatus(port, '/api/auth', 4000)
   if (authStatus !== 200) throw new Error(`health: /api/auth returned ${authStatus}`)
