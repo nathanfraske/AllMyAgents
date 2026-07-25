@@ -87,6 +87,26 @@ approval without going ungated; `escalate` / checker-down falls back to operator
 Plugs into `canUseTool`/`onApproval` (fast-path safe reads; a relay in worker mode). Full scope + the
 risk×requested policy table + open questions in `docs/auto-mode-safety-checker.md`. Not implemented.
 
+## Transcript & diff UX (requested 2026-07-25)
+
+- **Work-epoch collapse (Codex-style wrap) — Settings toggle + polish.** Collapse a whole work epoch to a
+  compact card: **the kickoff message → "worked X min" → the agent's end-of-work summary + a diff / files-
+  changed box**, expandable on demand to the full mid-work back-and-forth + tool calls. Codex especially (it
+  emits a natural end-of-work wrap) but useful for both. A Settings toggle (collapsed-by-default vs. full
+  transcript). Lives in the ThreadView render + the history viewer; the "epoch" boundary = a user prompt and
+  everything the agent did until it next went idle.
+- **Diff viewer above the composer ("the big one", high-value).** A live diff box above the chatbox showing
+  the session's **current worktree** changes: files changed + per-file/total **+/−** (additions/deletions),
+  expandable per file. This is essentially T3Code-parity gap **G2** (per-turn diff + checkpoint/rollback — see
+  the tooling-gaps section) surfaced as a persistent panel rather than per-turn; **build them together.** The
+  plumbing mostly exists: the hub owns the session `worktree` (WorkspaceManager), and `apps/web/src/lib/diff.ts`
+  already renders diffs — needs a `GET /api/sessions/:id/diff` (git diff of the worktree) feeding a panel.
+- **Compaction notices + triggers.** The **trigger** (`/compact`) is already scoped in the slash-command work
+  (task #9). The missing piece is the **notice**: detect the vendor compaction event → journal an additive
+  kind → render a "context compacted here" divider in the transcript (the web `apply()` `default: break`s
+  unknown kinds, so it's additive/safe). Plus an optional **auto-compaction threshold** setting (fire
+  `/compact` at a context-size threshold). Add the notice + the auto-threshold toggle.
+
 ## Critical-agent tier (requested 2026-07-24)
 
 An opt-in per-agent designation for maximum restart durability, ON TOP of the Phase-2 worker model
