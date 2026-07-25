@@ -3,6 +3,22 @@
 Not-yet-built items surfaced during the agent-detachment / worker work. Ordered roughly by the order
 they came up; not a priority ranking.
 
+## Cross-vendor parity (principle — 2026-07-25)
+
+**A first-class goal: Claude and Codex agents get the SAME hub-provided fleet capabilities.** Vendor-native
+extras (Codex's `multi_agent_v1`, Claude's `Agent` sub-agents; each vendor's bundled skills) are fine as
+bonuses, but nothing the HUB provides — comms/bus, memory, practices, behavioral steering, the tool surface —
+should depend on which vendor an agent runs. Treat it as a capability matrix (Claude × Codex) kept equal.
+Known asymmetries to close:
+- **Bus/comms:** Codex has no `allmyagents` tools (Claude does) → task #11 (standalone MCP for Codex).
+- **Skills:** Codex auto-loads bundled skills; Claude ships none → provision a scope-governed Claude skill set
+  (tooling-gaps P1).
+- **Behavioral:** both must be STEERED to the hub's capabilities (the bus-vs-sub-agent practice above) — a
+  vendor's overlapping native capability must not win by default.
+
+New features should ship for BOTH vendors — or explicitly note the gap + a parity task — rather than land
+Claude-only.
+
 ## Alpha release (post-worker milestone) → docs/alpha-release-plan.md
 
 After the always-on worker lands + is audited: package the full installable bundle as a real user would
@@ -142,6 +158,13 @@ entries to evict. Cap is Settings-configurable; safe default on.
   toggle + a scope), journal each search/read for audit, and treat any retrieved chatlog content as **DATA,
   never instructions** (a read log is semi-trusted, exactly like a bus message — prompt-injection boundary).
   Turns the fleet's whole history into a searchable shared brain.
+- **Habitual "reach OUT over the bus, don't spawn a sub-agent" practice.** Recurring (observed 2026-07-25):
+  asked to "message an agent," Codex defaults to its native `multi_agent_v1` (spawn a sub-agent) instead of the
+  fleet bus, so it never communicates out. Even once #11 wires the tools into Codex, ship a **default practice /
+  materialized instruction** that disambiguates — to reach a TEAMMATE (an existing fleet session) use the
+  `mcp__allmyagents__` bus (list_agents/send_message/read_messages); spawning a sub-agent creates a NEW child,
+  not a message to a teammate. **General principle:** when a vendor's native capability **overlaps** a hub
+  capability, steer agents to the hub's via a materialized practice — don't rely on them choosing it.
 
 ## Curator agent — designated hub/app lifecycle agent (requested 2026-07-25)
 
