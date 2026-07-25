@@ -16,11 +16,13 @@ or the installer. This composes with the existing pre-push audit rules + noreply
 
 ## Definition of "parity" for alpha
 
-- Always-on worker landed + audited: live turns + their sub-agents + running tasks survive a hub restart.
+- ✅ **DONE** — Always-on worker landed + audited: live turns + their sub-agents + running tasks survive a
+  hub restart. Acceptance-PROVEN end-to-end (`docs/agent-worker-impl.md` §12, `pnpm accept:restart`).
 - Core UX coherent: import viewer (real last-turn times, working/errored states), restart survival,
   Danger-Zone toggles, settings, resizable panes.
-- **P0 connector default resolved** (kill-switch defaulted safe + toggle) — don't ship an artifact that
-  may egress to vendor cloud connectors by default. See docs/backlog.md + the P0 verify.
+- ✅ **DONE** — **P0 connector default resolved** (#8): the hub writes `disableClaudeAiConnectors:true` into
+  managed claude profiles by default (no cloud-connector egress), flippable via the Danger-Zone
+  `enableClaudeConnectors` toggle. No artifact ships egressing to vendor connectors by default.
 - Known-broken paths closed (e.g. the `/api/health` `port: 0` cosmetic bug from the blue-green promotion).
 - Feature flags that ship **ON** for alpha: `HUB_SUPERVISED=1`, `HUB_WORKER_SOCKET` set. Dev harness
   kept: tsx-based hub spawn, verbose logging, feature flags visible.
