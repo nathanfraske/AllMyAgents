@@ -3,11 +3,25 @@
   // Self-contained — it renders its own edge toggle and overlays the right side of ITS pane (so split
   // view gets one panel per pane). Reads only derived data (agentTree.ts) from the items it is given.
   import { buildAgentRuns, summarizeRuns, latestActivity, type AgentTreeItem, type AgentRun } from './agentTree'
+  import { loadOpenAgentPanels, saveOpenAgentPanels } from './uiState'
   import Icon from './Icon.svelte'
 
-  let { items }: { items: AgentTreeItem[] } = $props()
+  let { items, sessionId }: { items: AgentTreeItem[]; sessionId: string } = $props()
 
-  let open = $state(false)
+  // Popped-out state is remembered PER CHAT, so the panel is still open when you come back to this chat
+  // after a reload or a hub restart (the runs themselves rebuild from journal history).
+  // `open` is DERIVED from the id set + the current sessionId — a pane can be re-pointed at a different
+  // chat without remounting, and reading the set once at init would leave the panel showing the previous
+  // chat's state.
+  let openIds = $state(new Set(loadOpenAgentPanels()))
+  const open = $derived(openIds.has(sessionId))
+  function setOpen(v: boolean): void {
+    const next = new Set(openIds)
+    if (v) next.add(sessionId)
+    else next.delete(sessionId)
+    openIds = next
+    saveOpenAgentPanels([...next])
+  }
   let expanded = $state<string | null>(null)
   let now = $state(Date.now())
 
@@ -42,7 +56,7 @@
 
 {#if runs.length}
   {#if !open}
-    <button class="tab" class:live={summary.running > 0} onclick={() => (open = true)} title="Show the agents this chat spawned">
+    <button class="tab" class:live={summary.running > 0} onclick={() => setOpen(true)} title="Show the agents this chat spawned">
       <span class="dot {summary.running ? 'run' : summary.failed ? 'fail' : 'ok'}"></span>
       {summary.running ? `${summary.running} running` : `${summary.total} agent${summary.total === 1 ? '' : 's'}`}
     </button>
@@ -53,7 +67,7 @@
         <span class="dim counts">
           {#if summary.running}{summary.running} running · {/if}{summary.done} done{#if summary.failed} · {summary.failed} failed{/if}
         </span>
-        <button class="x" onclick={() => (open = false)} title="Close">✕</button>
+        <button class="x" onclick={() => setOpen(false)} title="Close">✕</button>
       </header>
 
       <div class="plist scroll">

@@ -677,6 +677,19 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, { ok: true })
         return
       }
+      // Per-chat model / thinking effort / service tier, written through the moment it is picked so the
+      // choice belongs to the RECORD (surviving a pane switch, an app reload, and a hub restart) rather
+      // than to the composer component. specOf feeds these to both vendors. '' clears back to default.
+      const settingsMatch = /^\/api\/sessions\/([^/]+)\/settings$/.exec(url.pathname)
+      if (method === 'POST' && settingsMatch) {
+        const body = await readBody(req)
+        const patch: { model?: string; effort?: string; serviceTier?: string } = {}
+        if (body.model !== undefined) patch.model = String(body.model ?? '')
+        if (body.effort !== undefined) patch.effort = String(body.effort ?? '')
+        if (body.serviceTier !== undefined) patch.serviceTier = String(body.serviceTier ?? '')
+        json(res, sessions.setSettings(settingsMatch[1] as string, patch))
+        return
+      }
       const steerMatch = /^\/api\/sessions\/([^/]+)\/steer$/.exec(url.pathname)
       if (method === 'POST' && steerMatch) {
         const body = await readBody(req)

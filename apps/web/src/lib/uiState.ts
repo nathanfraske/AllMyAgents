@@ -28,6 +28,8 @@ export interface PersistedLayout {
 
 const LAYOUT_KEY = 'allmyagents.ui.lastLayout'
 const FOLDERS_KEY = 'allmyagents.ui.collapsedFolders'
+/** Chats whose agent side panel is popped out — so it is still open after a reload or a hub restart. */
+const AGENT_PANELS_KEY = 'allmyagents.ui.openAgentPanels'
 
 function isStringMatrix(v: unknown): v is string[][] {
   return Array.isArray(v) && v.every((row) => Array.isArray(row) && row.every((x) => typeof x === 'string'))
@@ -82,6 +84,30 @@ export function loadCollapsedFolders(): string[] {
 export function saveCollapsedFolders(ids: string[]): void {
   try {
     localStorage.setItem(FOLDERS_KEY, JSON.stringify(ids))
+  } catch {
+    /* ignore */
+  }
+}
+
+// Session ids whose agent side panel is popped out. Per-chat rather than global: you open it for the
+// chat that is running agents, and it should still be open when you come back to that chat — including
+// after an app reload or a hub restart. Same defensive parse as the folder state.
+export function loadOpenAgentPanels(): string[] {
+  try {
+    const raw = localStorage.getItem(AGENT_PANELS_KEY)
+    if (raw) {
+      const v = JSON.parse(raw) as unknown
+      if (Array.isArray(v)) return v.filter((x): x is string => typeof x === 'string')
+    }
+  } catch {
+    /* ignore */
+  }
+  return []
+}
+
+export function saveOpenAgentPanels(ids: string[]): void {
+  try {
+    localStorage.setItem(AGENT_PANELS_KEY, JSON.stringify(ids))
   } catch {
     /* ignore */
   }

@@ -366,6 +366,9 @@ export const api = {
   stop: (id: string) => jpost(`/api/sessions/${id}/stop`),
   deleteSession: (id: string) => jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/delete`),
   setMode: (id: string, permissionMode: string) => jpost(`/api/sessions/${id}/mode`, { permissionMode }),
+  /** Persist a per-chat model / thinking effort / service tier immediately (survives reload + restart). */
+  setSettings: (id: string, patch: { model?: string; effort?: string; serviceTier?: string }) =>
+    jpost<SessionRecord>(`/api/sessions/${id}/settings`, patch),
   decide: (id: string, approve: boolean) => jpost(`/api/approvals/${id}`, { approve }),
   mesh: async (): Promise<MeshStatus> => {
     const m = await jget<MeshStatus>('/api/mesh')

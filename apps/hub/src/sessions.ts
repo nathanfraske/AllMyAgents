@@ -998,6 +998,30 @@ export class SessionManager {
     this.journal.append(sessionId, 'session/mode', { permissionMode: mode })
   }
 
+  /**
+   * Persist the per-chat model / thinking effort / service tier the MOMENT the operator picks it, instead
+   * of only as a side effect of the next send (`send`'s override). Without this the choice lives in the
+   * composer component, so switching panes, reloading the app, or restarting the hub silently reverted it.
+   *
+   * Cross-vendor by construction: `specOf` feeds these three fields into every turn spec for BOTH the
+   * Claude and Codex drivers, so the record is the single source of truth for either. An empty string
+   * clears a field back to the profile/catalog default.
+   */
+  setSettings(sessionId: string, patch: { model?: string; effort?: string; serviceTier?: string }): SessionRecord {
+    const record = this.sessions.get(sessionId)
+    if (!record) throw new Error(`unknown session: ${sessionId}`)
+    if (patch.model !== undefined) record.model = patch.model || undefined
+    if (patch.effort !== undefined) record.effort = patch.effort || undefined
+    if (patch.serviceTier !== undefined) record.serviceTier = patch.serviceTier || undefined
+    this.persist(record)
+    this.journal.append(sessionId, 'session/settings', {
+      model: record.model ?? null,
+      effort: record.effort ?? null,
+      serviceTier: record.serviceTier ?? null,
+    })
+    return record
+  }
+
   /** Auto-derive a title from the first substantive prompt. Fires once; never clobbers a rename. */
   private autoTitle(record: SessionRecord, text: string): void {
     if (record.titleSource) return // 'auto' → already named; 'user' → frozen

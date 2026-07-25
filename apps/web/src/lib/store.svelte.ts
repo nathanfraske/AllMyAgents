@@ -1052,7 +1052,14 @@ class HubStore {
         // Turn timing for the thinking indicator: a turn is in flight while active/starting,
         // settled otherwise. Keep an already-set start time (from the optimistic send).
         if (status === 'active' || status === 'starting') {
-          if (view.turnStartedAt == null) view.turnStartedAt = Date.now()
+          // Use the EVENT's timestamp, never `now`. This same event replays from the journal on an app
+          // reload or a hub restart, and `Date.now()` would restart the "thinking for…" clock at zero
+          // every time — so a turn that genuinely survived a restart (worker mode) looked brand new.
+          // The event ts is the real turn start, so the elapsed time stays true across both.
+          if (view.turnStartedAt == null) {
+            const started = Date.parse(ts)
+            view.turnStartedAt = Number.isFinite(started) ? started : Date.now()
+          }
         } else if (status === 'idle' || status === 'error' || status === 'stopped') {
           view.turnStartedAt = undefined
         }
@@ -1064,6 +1071,15 @@ class HubStore {
         const pm = (payload as { permissionMode?: string }).permissionMode
         if (pm === 'safe' || pm === 'edits' || pm === 'full') view.record.permissionMode = pm
         this.push(view, { kind: 'note', ts, text: `permission mode → ${pm}` })
+        break
+      }
+      // The hub confirming a per-chat model/effort/tier change. Replayed on reconnect too, so the pills
+      // show the persisted truth after a reload or a hub restart — for either vendor.
+      case 'session/settings': {
+        const p = payload as { model?: string | null; effort?: string | null; serviceTier?: string | null }
+        if (p.model !== undefined) view.record.model = p.model ?? undefined
+        if (p.effort !== undefined) view.record.effort = p.effort ?? undefined
+        if (p.serviceTier !== undefined) view.record.serviceTier = p.serviceTier ?? undefined
         break
       }
       case 'session/error':

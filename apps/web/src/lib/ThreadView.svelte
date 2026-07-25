@@ -23,9 +23,6 @@
   let sendErr = $state('')
   let scroller = $state<HTMLDivElement | null>(null)
   let stick = $state(true)
-  // per-session picker state, seeded from the record
-  let modelBySession = $state<Record<string, string>>({})
-  let optionsBySession = $state<Record<string, Record<string, string>>>({})
   // `/` command picker: the textarea (for refocus after completion), the profile's on-disk custom
   // commands, the highlighted row, and an Escape-dismissal latch.
   let taRef = $state<HTMLTextAreaElement | null>(null)
@@ -36,19 +33,15 @@
   const activeId = $derived(sessionId ?? store.selectedId ?? null)
   const view = $derived(activeId ? (store.sessions[activeId] ?? null) : null)
   const sid = $derived(view?.record.id ?? '')
-  // A DRAFT sources its picks straight from the record (the composer writes them there via
-  // store.updateDraft), so switching account resets model/traits cleanly. A real session keeps the
-  // per-send override in modelBySession/optionsBySession (unchanged).
+  // Both drafts and real sessions now source their picks from the RECORD — a draft's live on the local
+  // draft record, a real session's are persisted hub-side (setModel/setOption write through). One source
+  // of truth means the pills always show what the next turn will actually use, for either vendor.
   const isDraft = $derived(!!view?.draft)
-  const model = $derived(view?.draft ? (view.record.model ?? '') : (modelBySession[sid] ?? view?.record.model ?? ''))
-  const options = $derived<Record<string, string>>(
-    view?.draft
-      ? {
-          ...(view.record.effort ? { effort: view.record.effort } : {}),
-          ...(view.record.serviceTier ? { serviceTier: view.record.serviceTier } : {}),
-        }
-      : (optionsBySession[sid] ?? (view?.record.effort ? { effort: view.record.effort } : {}))
-  )
+  const model = $derived(view?.record.model ?? '')
+  const options = $derived<Record<string, string>>({
+    ...(view?.record.effort ? { effort: view.record.effort } : {}),
+    ...(view?.record.serviceTier ? { serviceTier: view.record.serviceTier } : {}),
+  })
   const modelDef = $derived(
     view ? (findModel(model) ?? defaultModelFor(view.record.provider)) : undefined
   )
@@ -169,22 +162,29 @@
     stick = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 60
   }
 
+  // Model / thinking-effort / tier picks WRITE THROUGH to the hub immediately for a real session, so the
+  // choice belongs to the record and survives switching panes, reloading, and a hub restart (it used to
+  // live in this component's state and silently reverted). Optimistic locally, then confirmed by the
+  // hub's `session/settings` event. A draft has no hub session yet, so its picks stay on the draft record.
   function setModel(slug: string): void {
-    if (!sid) return
-    if (view?.draft) {
+    if (!sid || !view) return
+    if (view.draft) {
       store.updateDraft(sid, { model: slug || undefined }) // draft picks live on the record
       return
     }
-    modelBySession = { ...modelBySession, [sid]: slug }
+    view.record.model = slug || undefined
+    void api.setSettings(sid, { model: slug })
   }
   function setOption(id: string, value: string): void {
-    if (!sid) return
-    if (view?.draft) {
+    if (!sid || !view) return
+    if (view.draft) {
       if (id === 'effort') store.updateDraft(sid, { effort: value || undefined })
       else if (id === 'serviceTier') store.updateDraft(sid, { serviceTier: value || undefined })
       return
     }
-    optionsBySession = { ...optionsBySession, [sid]: { ...options, [id]: value } }
+    if (id === 'effort') view.record.effort = value || undefined
+    else if (id === 'serviceTier') view.record.serviceTier = value || undefined
+    void api.setSettings(sid, { [id]: value })
   }
 
   // Accept the highlighted picker row. `runIfComplete` (Enter/click) runs a no-arg command straight
@@ -228,8 +228,7 @@
     if (!view) return
     switch (res.kind) {
       case 'model':
-        if (view.draft) store.updateDraft(sid0, { model: res.model })
-        else modelBySession = { ...modelBySession, [sid0]: res.model } // same pending override the pill sets
+        setModel(res.model) // same write-through the pill uses (draft → record, real → hub)
         store.pushLocalNote(sid0, `model → ${res.label} · applies to your next message`)
         break
       case 'mode':
@@ -421,7 +420,7 @@
 
   <!-- Sub-agents this chat spawned. Self-contained popout anchored to THIS pane, so split view gets one
        panel per pane; renders nothing until an agent is actually spawned. -->
-  <AgentPanel items={view.items} />
+  <AgentPanel items={view.items} sessionId={view.record.id} />
 
   <div class="composer-wrap">
     <!-- The agent's task board, directly above the chatbar. -->
