@@ -13,7 +13,9 @@ import type { WorkspaceManager } from './workspace.js'
 import type { ClaudeLimitInfo, Profile, Provider, SessionRecord, SessionStatus } from './types.js'
 import { writeManagedInstructions, agentContract } from './instructions.js'
 import type { InstructionStore } from './instructions.js'
-import { identityOf, readableScopes } from './identity.js'
+import { identityOf, readableScopes, type SessionIdentity } from './identity.js'
+import { runAgentTool, type AgentServices } from './agentToolCore.js'
+import { writeCodexAgentMcpConfig } from './codexMcpConfig.js'
 import type { AgentBus, BusAddress, BusMessage } from './bus.js'
 import type { MemoryStore } from './memory.js'
 import type { PracticeStore } from './practices.js'
@@ -71,6 +73,22 @@ export class SessionManager {
   // restored sessions via attachWorker() (driven off the worker 'attached' event) instead of the blunt
   // reconcileStale() sweep. Flag-off (in-process) keeps every boot/reconcile path byte-identical.
   private readonly workerMode: boolean
+  // A session whose CURRENT in-flight turn was caused by a (semi-trusted) teammate bus message. The
+  // in-process executor keeps its OWN copy for the Claude self-gate; this hub-side copy backs the CODEX
+  // agent-tool path (execAgentTool's isBusTurn), which runs out-of-band from the bridge and has no view
+  // of the executor's set. Set in deliverBus when a bus turn is kicked off; cleared in setStatus when the
+  // session leaves 'active' (turn done/failed/stopped), so it spans the whole bus turn.
+  private readonly busTurnSessions = new Set<string>()
+  // Codex profiles whose config.toml `[mcp_servers.allmyagents]` we've already (re)written this boot —
+  // so the lazy per-profile materialization (ensureCodexMcpConfig, driven from specOf/readCodexLimits) is
+  // written once before the app-server starts, not re-read+rewritten on every turn.
+  private readonly codexConfigWritten = new Set<string>()
+  // How a Codex session reaches the shared agent tools: the hub writes an `allmyagents` MCP server into
+  // each Codex profile's config.toml pointing at this bridge script, and the bridge forwards calls back to
+  // the hub (over hubUrl, authenticated by secret). Null when unset (tests / a hub with no built bridge) —
+  // then no Codex config is written and Codex simply lacks the tools, exactly as before. Set once at boot
+  // via setCodexBridge (index.ts).
+  private codexBridge: { bridgePath: string; hubUrl: string; secret: string; nodePath?: string } | null = null
 
   constructor(
     private readonly journal: Journal,
@@ -305,6 +323,12 @@ export class SessionManager {
    *  same SessionIdentity for MCP attribution. */
   private specOf(record: SessionRecord): WorkerSessionSpec {
     const profile = this.profileOf(record)
+    // Before the executor lazily spawns this Codex profile's app-server (which reads config.toml on
+    // first use), make sure the `allmyagents` MCP server is registered so Codex gets the same tools as
+    // Claude. Guarded to once per profile, and a no-op until setCodexBridge wires the bridge (so tests /
+    // dev-from-.ts runs write nothing). Replaces the branch's codexClientFor hook, which moved into the
+    // executor — specOf is the hub-side chokepoint every codex turn/thread flows through.
+    if (record.provider === 'codex') this.ensureCodexMcpConfig(profile)
     return {
       sessionId: record.id,
       provider: record.provider,
@@ -319,6 +343,110 @@ export class SessionManager {
       serviceTier: record.serviceTier,
       permissionMode: record.permissionMode,
       vendorSessionId: record.vendorSessionId,
+    }
+  }
+
+  // ---- Codex agent-tool bridge (cross-vendor parity: give Codex the mcp__allmyagents__* tools) -----
+
+  /** Wire the Codex agent-tool bridge (index.ts, once at boot). Enables writing the `allmyagents` MCP
+   *  server into each Codex profile's config.toml so Codex agents get the tools. */
+  setCodexBridge(cfg: { bridgePath: string; hubUrl: string; secret: string; nodePath?: string }): void {
+    this.codexBridge = cfg
+  }
+
+  /**
+   * Register the hub's `allmyagents` MCP server in a Codex profile's config.toml, so `codex app-server`
+   * loads it and Codex agents get the same `mcp__allmyagents__*` tools as Claude. Written BEFORE the
+   * app-server starts (from specOf / readCodexLimits, on first use of the profile), so the server is
+   * present when the first thread spawns its MCP child. Idempotent + best-effort — a failure just means
+   * this Codex profile lacks the tools (journaled), never a broken spawn.
+   */
+  private ensureCodexMcpConfig(profile: Profile): void {
+    if (!this.codexBridge || this.codexConfigWritten.has(profile.id)) return
+    try {
+      const file = writeCodexAgentMcpConfig(profile.dir, {
+        bridgePath: this.codexBridge.bridgePath,
+        hubUrl: this.codexBridge.hubUrl,
+        secret: this.codexBridge.secret,
+        profileId: profile.id,
+        nodePath: this.codexBridge.nodePath,
+      })
+      this.codexConfigWritten.add(profile.id)
+      this.journal.append(null, 'codex/mcp-config-written', { profileId: profile.id, file })
+    } catch (err) {
+      this.journal.append(null, 'codex/mcp-config-error', {
+        profileId: profile.id,
+        message: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+
+  /**
+   * Resolve which Codex SESSION a bridge call belongs to. Codex passes NO thread/session id to an MCP
+   * server (verified on codex 0.145); the one per-session signal it gives a stdio MCP child is the
+   * child's cwd (= the thread's session dir). The agent cannot spoof it — it is the child process's own
+   * working directory, set by codex, not a tool argument — so mapping (profileId, cwd) → session is a
+   * hub-derived attribution, the same posture as deriving the worktree from the record in checkWriteScope.
+   * Returns undefined (caller refuses) when it can't attribute UNIQUELY, so an ambiguous call is never
+   * mis-attributed. Worktree sessions have unique cwds; the ambiguous case is multiple non-worktree /
+   * imported Codex sessions on one profile sharing a dir — then we tiebreak on the lone `active` session
+   * (a tool call happens mid-turn), else refuse.
+   */
+  private resolveCodexIdentity(profileId: string, cwd: string): SessionIdentity | undefined {
+    const target = path.resolve(cwd).toLowerCase()
+    const matches = [...this.sessions.values()].filter(
+      (r) =>
+        r.provider === 'codex' &&
+        r.profileId === profileId &&
+        r.status !== 'stopped' &&
+        path.resolve(r.cwd).toLowerCase() === target
+    )
+    if (matches.length === 1) return identityOf(matches[0])
+    if (matches.length === 0) return undefined
+    const active = matches.filter((r) => r.status === 'active')
+    return active.length === 1 ? identityOf(active[0]) : undefined
+  }
+
+  /**
+   * The provider-agnostic hub capabilities the shared agent tool bodies (agentToolCore.ts) call into —
+   * the Codex counterpart of the in-process executor's own agentServices(). Bus goes through this
+   * manager's same ACL-enforcing busSend/busInbox/busRoster; memory/practices/approvals/danger/journal
+   * are the shared hub services; isBusTurn reads the hub-side bus-turn set (execAgentTool runs out-of-band
+   * from the bridge, so it cannot see the executor's set). Every method takes the CALLER identity the hub
+   * resolved, never agent input.
+   */
+  private agentServices(): AgentServices {
+    return {
+      send: (from, to, subject, body) => this.busSend(from.sessionId, to, subject, body),
+      inbox: (sessionId) => this.busInbox(sessionId),
+      roster: (sessionId) => this.busRoster(sessionId),
+      memory: this.memory,
+      practices: this.practices,
+      requireApproval: (id, kind, payload) => this.approvals.request(id.sessionId, kind, payload),
+      isBusTurn: (sessionId) => this.busTurnSessions.has(sessionId),
+      danger: () => this.danger,
+      journal: (sessionId, kind, payload) => this.journal.append(sessionId, kind, payload),
+    }
+  }
+
+  /**
+   * Execute a shared agent tool on behalf of a Codex session (called by the /internal/agent-tool route
+   * the bridge posts to). Resolves the caller identity from (profileId, cwd), then runs the SAME
+   * provider-agnostic tool body the Claude path runs, through the SAME agentServices — so ACL
+   * (same-project bus, scope-checked memory/practices) and the practice gate (incl. the bus-turn
+   * hard-deny, since the body reads isBusTurn) are enforced identically. Never throws: attribution
+   * failures + tool errors come back as a model-readable string.
+   */
+  async execAgentTool(profileId: string, cwd: string, tool: string, args: unknown): Promise<string> {
+    const identity = this.resolveCodexIdentity(profileId, cwd)
+    if (!identity) {
+      this.journal.append(null, 'codex/agent-tool-unattributed', { profileId, cwd, tool })
+      return `Not attributed — the hub could not tell which of your Codex sessions is calling (no unique live session for this working directory on profile ${profileId}).`
+    }
+    try {
+      return await runAgentTool(tool, args, { identity, services: this.agentServices() })
+    } catch (err) {
+      return `Tool error: ${err instanceof Error ? err.message : String(err)}`
     }
   }
 
@@ -544,6 +672,9 @@ export class SessionManager {
 
   private setStatus(record: SessionRecord, status: SessionStatus): void {
     record.status = status
+    // A bus-caused turn's provenance (read by the Codex agent-tool self-gate — execAgentTool's isBusTurn)
+    // spans the whole turn; clear it whenever the session leaves the active state (turn done/failed/stopped).
+    if (status !== 'active') this.busTurnSessions.delete(record.id)
     this.persist(record)
     this.journal.append(record.id, 'session/status', { status })
     // A session that just went idle can now receive any queued teammate messages. Deferred to a
@@ -920,6 +1051,10 @@ export class SessionManager {
     // message is semi-trusted and must never drive a practice/hook write on its own. The clamped
     // permission mode rides in the spec (a bus-triggered turn never inherits full/bypass).
     const spec = { ...this.specOf(record), permissionMode: clampMode(record.permissionMode) }
+    // Tag this bus-caused turn so a Codex agent tool call (bridge → execAgentTool) sees isBusTurn and
+    // hard-denies practice writes — the same self-gate provenance the executor tags for the Claude path.
+    // Cleared when the session leaves 'active' (setStatus), so it spans the whole turn.
+    this.busTurnSessions.add(record.id)
     void this.executor.runTurn(spec, framed, 'bus')
   }
 
@@ -969,6 +1104,9 @@ export class SessionManager {
   readCodexLimits(profileId: string): Promise<unknown> {
     const profile = this.profiles.get(profileId)
     if (!profile) throw new Error(`unknown profile: ${profileId}`)
+    // This also lazily spawns the profile's codex app-server — register the MCP config first (same
+    // reason as specOf; guarded to once per profile, no-op without a wired bridge).
+    this.ensureCodexMcpConfig(profile)
     return this.executor.readCodexLimits(profileId, profile.dir)
   }
 

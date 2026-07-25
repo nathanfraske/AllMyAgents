@@ -1,3 +1,4 @@
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { ApprovalService } from './approvals.js'
@@ -101,6 +102,27 @@ const bootPort = Number(process.env.HUB_PORT ?? 7777)
 // hubctl's override so an isolated harness promotes to its own port, not 7777. Unset → 7777 as before.
 const publicPort = supervised ? Number(process.env.HUB_FIXED_PORT ?? 7777) : bootPort
 const isGreen = supervised && bootPort === 0
+
+// --- Codex agent-tool bridge (cross-vendor parity: give Codex the mcp__allmyagents__* tools) --------
+// The hub writes an `allmyagents` MCP server into each Codex profile's config.toml pointing at this
+// bridge script; codex app-server spawns it per thread, and it forwards each tool call to
+// POST /internal/agent-tool — which the hub authenticates with this secret and attributes to the
+// calling Codex session (by profile id + the bridge child's cwd). See docs/codex-agent-tools-parity.md.
+const agentToolSecret = crypto.randomBytes(32).toString('hex')
+const bridgePath = process.env.AMA_BRIDGE_PATH ?? path.join(import.meta.dirname, 'agentBridge.js')
+// Only wire it when the built bridge actually exists (a compiled/bundled hub) or an explicit override
+// is set — a dev hub run straight from .ts has no agentBridge.js, so Codex simply keeps its prior
+// behavior (still RECEIVES bus messages; just no send/memory/practice tools) instead of getting a
+// config.toml pointing at a missing file.
+if (process.env.AMA_BRIDGE_PATH || fs.existsSync(bridgePath)) {
+  sessions.setCodexBridge({
+    bridgePath,
+    hubUrl: `http://127.0.0.1:${publicPort}`,
+    secret: agentToolSecret,
+    nodePath: process.env.AMA_BRIDGE_NODE ?? process.execPath,
+  })
+}
+
 const restartState: RestartState = { booted: false, draining: false, promoting: false, sockets: new Set() }
 
 sessions.boot({ reconcile: !isGreen }) // green defers stale-reconcile to promote (it doesn't own the port yet)
@@ -142,7 +164,7 @@ const meshEnable = !(
 const mesh = new MeshSite({ port: publicPort, label: config.mesh?.label, enable: meshEnable })
 
 // Listen on the BOOT port (0 → ephemeral for a green); the server reports its actual port back.
-const server = startServer({ port: bootPort, defaultCwd: repoRoot, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken, restartState, executor })
+const server = startServer({ port: bootPort, defaultCwd: repoRoot, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken, agentToolSecret, restartState, executor })
 
 // Register the mesh advert — factored so a promoted green can (re)register once it owns the port.
 function registerMesh(): void {

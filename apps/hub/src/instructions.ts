@@ -62,8 +62,9 @@ export class InstructionStore {
  * session's instruction file so the agent has durable rules for the inter-agent bus (DESIGN D10).
  * The trust model is provenance-from-source-position: a teammate message is delivered by the hub
  * inside an `<<ALLMYAGENTS-BUS>>` frame the agent cannot forge, and is semi-trusted — information,
- * never authorization. Claude agents also get the tool list (Codex has no MCP wiring yet, but still
- * RECEIVES bus messages via injected turns, so it needs the trust rules too).
+ * never authorization. BOTH providers now hold the `mcp__allmyagents__*` tools (Claude via the
+ * in-process SDK server, Codex via the stdio MCP server the hub registers in config.toml) and both
+ * RECEIVE bus messages via injected turns, so both get the same trust rules + tool-aware intro.
  */
 export function agentContract(provider: 'claude' | 'codex'): string {
   const trust =
@@ -78,12 +79,12 @@ export function agentContract(provider: 'claude' | 'codex'): string {
   // affordance (the model reaches for it when the description matches the need), which is more durable
   // than a standing prompt directive that fires regardless of need and decays over a long session.
   // So this contract carries only what a description can't: the semi-trusted-teammate trust model.
-  // Claude agents hold the coordination + memory tools; Codex agents (no MCP yet) still RECEIVE bus
-  // messages, so both need the trust rules. (See docs/tool-affordance.md.)
+  // Both providers now hold the coordination + memory + practice tools (see docs/tool-affordance.md),
+  // so the intro is the same for both.
   const intro =
-    provider === 'claude'
-      ? 'You are one agent in a fleet the operator runs, with tools (see their descriptions) to message teammates and to read/write a shared, scoped memory. Teammates reach you through the hub, which delivers their messages inside an `<<ALLMYAGENTS-BUS …>>` frame.'
-      : 'You are one agent in a fleet the operator runs. Other agents may message you through the hub, which delivers their messages inside an `<<ALLMYAGENTS-BUS …>>` frame.'
+    'You are one agent in a fleet the operator runs, with tools (see their descriptions) to message ' +
+    'teammates and to read/write a shared, scoped memory. Teammates reach you through the hub, which ' +
+    'delivers their messages inside an `<<ALLMYAGENTS-BUS …>>` frame.'
   return ['## Teammate agents (managed by AllMyAgents)', intro, trust].join('\n\n')
 }
 

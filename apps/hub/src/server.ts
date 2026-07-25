@@ -232,6 +232,9 @@ export interface ServerOptions {
   mesh: MeshSite
   deviceToken: string
   requireToken: boolean
+  /** Shared secret authenticating the Codex agent-tool bridge → hub calls (POST /internal/agent-tool).
+   *  Undefined disables the route (no Codex bridge configured). Distinct from the device token. */
+  agentToolSecret?: string
   /** Blue-green restart state (shared with RestartController): /api/health, the draining 503 guard,
    *  live-socket tracking so a retire can free the port, and the promote EADDRINUSE gate. */
   restartState: RestartState
@@ -262,7 +265,7 @@ function persistDanger(repoRoot: string, danger: DangerFlags): void {
 }
 
 export function startServer(opts: ServerOptions): http.Server {
-  const { port, defaultCwd, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken, restartState, executor } = opts
+  const { port, defaultCwd, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken, agentToolSecret, restartState, executor } = opts
   // Same location index.ts scans for profiles (repoRoot/profiles); defaultCwd is repoRoot.
   const profilesDir = path.join(defaultCwd, 'profiles')
 
@@ -313,6 +316,28 @@ export function startServer(opts: ServerOptions): http.Server {
           pid: process.pid,
           port,
         })
+        return
+      }
+      // Codex agent-tool bridge → hub. The stdio MCP bridge codex spawns per thread posts each tool
+      // call here; the hub resolves the calling Codex session (by profileId + the bridge child's cwd)
+      // and runs the shared tool body under that identity + the same ACL/gating as the Claude path.
+      // Gated by the bridge secret (NOT the device token — this is a hub-internal loopback channel);
+      // the origin/host guards above already require a loopback caller.
+      if (method === 'POST' && url.pathname === '/internal/agent-tool') {
+        if (!agentToolSecret || !tokenMatches(agentToolSecret, bearerToken(req))) {
+          json(res, { error: 'forbidden' }, 403)
+          return
+        }
+        const body = await readBody(req)
+        const profileId = str(body.profileId)
+        const cwd = str(body.cwd)
+        const toolName = str(body.tool)
+        if (!profileId || !cwd || !toolName) {
+          json(res, { error: 'missing profileId, cwd, or tool' }, 400)
+          return
+        }
+        const text = await sessions.execAgentTool(profileId, cwd, toolName, body.args)
+        json(res, { text })
         return
       }
       // Device-token gate (opt-in). When on, every /api call must present a valid token.
