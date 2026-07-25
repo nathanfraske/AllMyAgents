@@ -364,6 +364,11 @@ class HubStore {
   async init(): Promise<void> {
     const t0 = perfNow()
     vlog('init: start')
+    // ARM the auto-reopen FIRST, before anything can load sessions. ensure() is what fires it, so if a
+    // session arrives before this flag is set (refreshSideData populating the roster, say) the trigger is
+    // missed and never comes back — every session is already ensured, so no further ensure() happens.
+    // This is deliberately the very first statement for that reason.
+    this.autoRestorePending = settings.autoReopenLastChats
     // If the hub enforces a device token and we don't hold a valid one, gate on pairing first.
     const auth = await api.auth().catch(() => ({ requireToken: false, authed: true }))
     if (auth.requireToken && !auth.authed && !getHubToken()) {
@@ -376,11 +381,9 @@ class HubStore {
     this.projects = await api.projects()
     vlog(`init: ${this.profiles.length} profiles, ${this.projects.length} projects (${msSince(t0)})`)
     await this.refreshSideData()
-    // Come back where you left off (Setting, default on). This only ARMS it: the session roster does not
-    // exist yet here — sessions arrive over the WS replay below — so restoring now would find no ids,
-    // silently give up, AND consume the manual offer. ensure() fires the actual restore once sessions
-    // land. (That ordering bug is exactly why the first version of this never reopened anything.)
-    this.autoRestorePending = settings.autoReopenLastChats
+    // Belt and braces: if sessions were already loaded above, ensure() has come and gone, so nudge the
+    // restore directly. scheduleAutoRestore is idempotent and re-arms itself while the roster is empty.
+    this.scheduleAutoRestore()
     vlog(`init: side data loaded (${msSince(t0)}) — connecting WS`)
     this.connect()
     // Fire-and-forget: pull the fleet roster and merge any remote machines' projects/sessions
@@ -1484,7 +1487,7 @@ class HubStore {
   private autoRestorePending = false
   private autoRestoreTimer: ReturnType<typeof setTimeout> | null = null
 
-  private scheduleAutoRestore(): void {
+  private scheduleAutoRestore(attempt = 0): void {
     if (!this.autoRestorePending || this.autoRestoreTimer) return
     this.autoRestoreTimer = setTimeout(() => {
       this.autoRestoreTimer = null
@@ -1494,9 +1497,17 @@ class HubStore {
         this.autoRestorePending = false
         return
       }
-      if (!this.restorableLayout || Object.keys(this.sessions).length === 0) return // try again on the next arrival
-      this.autoRestorePending = false
-      this.restoreLastLayout()
+      if (this.restorableLayout && Object.keys(this.sessions).length > 0) {
+        this.autoRestorePending = false
+        this.restoreLastLayout()
+        return
+      }
+      // Roster not populated yet. RETRY rather than waiting to be nudged: sessions can arrive from the WS
+      // replay, a roster fetch, or the fleet merge, and tying the trigger to one of those paths is what
+      // made the first two attempts at this silently never fire. ~10s of retries, then give up and leave
+      // the manual "Reopen" offer intact.
+      if (attempt < 40) this.scheduleAutoRestore(attempt + 1)
+      else this.autoRestorePending = false
     }, 250)
   }
 
