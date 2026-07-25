@@ -94,8 +94,26 @@ export class MemoryStore {
     return this.query(opts.scopes, undefined, opts.limit ?? 50)
   }
 
+  /**
+   * Agent/operator-facing search. Exact SUBSTRING first (precise for a short phrase or an id, and
+   * identical to the original behavior), then — only when that finds nothing — the SAME salient-term
+   * overlap ranking {@link recall} uses.
+   *
+   * Why the fallback: the substring pass matches the WHOLE query verbatim, so any natural multi-word
+   * question ("dev-harness gating build artifact codex bridge") missed every memory unless that exact
+   * string appeared in one. Agents phrase searches in sentences, so the tool they are told to use for
+   * recall answered "No matching memories" while a perfect match sat one row away — a SILENT recall
+   * failure (observed live: a note was unfindable by its own topic words seconds after being written).
+   * Scope filtering is applied on BOTH paths (the fallback passes `scopes` straight through), so a
+   * broadened query can never surface a memory the caller could not already read.
+   */
   search(query: string, opts: { scopes?: string[]; limit?: number } = {}): Memory[] {
-    return this.query(opts.scopes, query.trim(), opts.limit ?? 20)
+    const q = query.trim()
+    const limit = opts.limit ?? 20
+    if (!q) return this.query(opts.scopes, undefined, limit)
+    const exact = this.query(opts.scopes, q, limit)
+    if (exact.length) return exact
+    return this.recall(q, { scopes: opts.scopes, limit })
   }
 
   /**
