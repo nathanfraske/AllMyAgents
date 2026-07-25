@@ -373,6 +373,9 @@ export const api = {
   reopen: (id: string) => jpost<{ ok?: boolean; status?: string; error?: string }>(`/api/sessions/${id}/reopen`),
   deleteSession: (id: string) => jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/delete`),
   setMode: (id: string, permissionMode: string) => jpost(`/api/sessions/${id}/mode`, { permissionMode }),
+  /** "Always allow this tool in this chat" (allow=false revokes). Takes effect on the next tool call. */
+  allowTool: (id: string, toolName: string, allow = true) =>
+    jpost<SessionRecord>(`/api/sessions/${id}/allow-tool`, { toolName, allow }),
   /** Persist a per-chat model / thinking effort / service tier immediately (survives reload + restart). */
   setSettings: (id: string, patch: { model?: string; effort?: string; serviceTier?: string }) =>
     jpost<SessionRecord>(`/api/sessions/${id}/settings`, patch),

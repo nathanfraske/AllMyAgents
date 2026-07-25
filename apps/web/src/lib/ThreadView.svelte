@@ -379,6 +379,20 @@
     await store.refreshSideData()
   }
 
+  /** "Always allow" — grant the tool for this chat FIRST, then approve the request that prompted it, so
+   *  the operator is not asked again for the same tool. The grant is hub-side, so it applies immediately. */
+  async function allowAlways(id: string, toolName: string): Promise<void> {
+    if (!view) return
+    await api.allowTool(view.record.id, toolName)
+    await decide(id, true)
+  }
+
+  /** The tool a pending approval is about, when it is a tool approval at all (kind 'claude/tool'). */
+  function approvalTool(payload: unknown): string | null {
+    const name = (payload as { toolName?: unknown } | null)?.toolName
+    return typeof name === 'string' && name ? name : null
+  }
+
   function onKey(e: KeyboardEvent): void {
     // The command picker owns the arrow/Tab/Enter/Escape keys while it is open.
     if (cmdOpen) {
@@ -415,10 +429,22 @@
     }
   }
 
+  /**
+   * Render what is actually being asked. This used to be `toolName + JSON.stringify(input).slice(0, 200)`
+   * on ONE line, which was unreadable for anything structured — a tool whose input carries a question and
+   * a list of options got truncated mid-JSON, so the operator could not even see what they were approving,
+   * let alone answer it. Pretty-print, and give it enough room to be legible (the box scrolls).
+   */
   function summarizeApproval(payload: unknown): string {
     const p = payload as { toolName?: string; input?: unknown }
-    if (p.toolName) return `${p.toolName}  ${JSON.stringify(p.input ?? {}).slice(0, 200)}`
-    return JSON.stringify(payload).slice(0, 220)
+    const body = p?.toolName ? p.input : payload
+    let text: string
+    try {
+      text = typeof body === 'string' ? body : JSON.stringify(body ?? {}, null, 2)
+    } catch {
+      text = String(body)
+    }
+    return text.length > 4000 ? `${text.slice(0, 4000)}\n… (truncated)` : text
   }
 </script>
 
@@ -479,10 +505,24 @@
 
     {#each approvals as a (a.id)}
       <div class="approval">
-        <div class="atop"><span class="alabel">PENDING APPROVAL</span><span class="dim">{a.kind}</span></div>
+        <div class="atop">
+          <span class="alabel">PENDING APPROVAL</span>
+          <span class="dim">{approvalTool(a.payload) ?? a.kind}</span>
+        </div>
         <pre class="abody">{summarizeApproval(a.payload)}</pre>
         <div class="aacts">
           <button class="abtn ok" onclick={() => decide(a.id, true)}>Approve once</button>
+          {#if approvalTool(a.payload)}
+            <!-- The answer this prompt never offered. Without it, a long task re-asks for the SAME tool
+                 indefinitely, and any prompt the operator misses fails closed after the timeout. -->
+            <button
+              class="abtn"
+              title="Stop asking about this tool in this chat. Undo it in the permission menu."
+              onclick={() => allowAlways(a.id, approvalTool(a.payload) as string)}
+            >
+              Always allow {approvalTool(a.payload)}
+            </button>
+          {/if}
           <button class="abtn" onclick={() => decide(a.id, false)}>Decline</button>
         </div>
       </div>
@@ -606,8 +646,10 @@
   .approval { background: var(--surface); border: 1px solid var(--warn); border-radius: 10px; padding: 0.5rem 0.7rem; margin-bottom: 0.5rem; }
   .atop { display: flex; gap: 0.5rem; align-items: center; }
   .alabel { font-size: 0.66rem; letter-spacing: 0.08em; color: var(--warn); }
-  .abody { margin: 0.35rem 0; font-size: 0.74rem; color: var(--muted); max-height: 6rem; overflow: auto; white-space: pre-wrap; word-break: break-all; }
-  .aacts { display: flex; gap: 0.4rem; }
+  /* Taller + break-word (not break-all): the body is now pretty-printed, so it must stay readable rather
+     than shattering identifiers mid-token. Still capped and scrollable so it can't push out the composer. */
+  .abody { margin: 0.35rem 0; font-size: 0.74rem; color: var(--muted); max-height: 14rem; overflow: auto; white-space: pre-wrap; word-break: break-word; font-family: var(--mono); }
+  .aacts { display: flex; gap: 0.4rem; flex-wrap: wrap; }
   .abtn { font-size: 0.76rem; border: 1px solid var(--border-strong); border-radius: 7px; padding: 0.25rem 0.6rem; color: var(--muted); }
   .abtn.ok { border-color: var(--ok); color: var(--ok); }
   .abtn:hover { color: var(--text); }

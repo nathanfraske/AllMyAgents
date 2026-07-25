@@ -13,10 +13,30 @@ interface PendingEntry {
   promise: Promise<boolean>
 }
 
+/** Decides whether a request may skip the operator entirely. `true` → auto-approve; anything else → ask. */
+export type AutoApprovePolicy = (sessionId: string, kind: string, payload: unknown) => boolean
+
 export class ApprovalService {
   private readonly pendingMap = new Map<string, PendingEntry>()
+  private autoApprove: AutoApprovePolicy | undefined
 
   constructor(private readonly journal: Journal) {}
+
+  /**
+   * Install the policy that lets a request bypass the operator prompt (see {@link request}).
+   *
+   * This class had NO auto-approve path at all: every request journaled `approval/requested` and blocked
+   * until the operator answered or the 10-minute timeout failed it CLOSED. That meant "full access" chats
+   * still prompted on every tool — the permission mode was enforced (unreliably) out in each executor's
+   * canUseTool rather than here, at the one place both executors actually funnel through.
+   *
+   * Set from index.ts once the SessionManager exists (it owns the records the policy reads). Because the
+   * decision is made HERE, in the hub, a mode or allowlist change takes effect on the very next tool call
+   * without respawning the long-lived agent worker.
+   */
+  setAutoApprove(policy: AutoApprovePolicy): void {
+    this.autoApprove = policy
+  }
 
   pending(): ApprovalRecord[] {
     return [...this.pendingMap.values()].map((e) => e.record)
@@ -48,6 +68,18 @@ export class ApprovalService {
       // re-journal. In-process callers never supply an id, so this is worker-mode only (flag-off unchanged).
       const resolved = this.journal.resolvedApproval(id)
       if (resolved !== undefined) return Promise.resolve(resolved === 'approved')
+    }
+    // Auto-approval (full access, or a tool the operator chose "always allow" for in this chat). Checked
+    // AFTER the dedup/resolved-before-crash lookups above so a re-issued id still returns its recorded
+    // decision, and BEFORE any prompt is journaled — an auto-approved call must never appear as pending,
+    // never start the timeout timer, and never reach the operator's approval queue.
+    //
+    // Still journaled, as `approval/auto-approved` rather than `approval/requested`: silently running
+    // privileged tools with no audit trail would be strictly worse than prompting. The operator can see
+    // everything that ran on their behalf without having been asked.
+    if (this.autoApprove?.(sessionId, kind, payload) === true) {
+      this.journal.append(sessionId, 'approval/auto-approved', { id: id ?? null, kind, payload })
+      return Promise.resolve(true)
     }
     const record: ApprovalRecord = {
       id: id ?? crypto.randomUUID(),

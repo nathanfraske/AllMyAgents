@@ -103,6 +103,11 @@ const executor: Executor = workerSocket
   : new InProcessExecutor({ approvals, usage, danger, memory, practices })
 sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, repoRoot, executor)
 usage.setCodexReader((profileId) => sessions.readCodexLimits(profileId))
+// Let full-access chats and "always allow" grants skip the operator prompt. Installed here because the
+// policy reads session records, and ApprovalService is constructed before the SessionManager exists.
+// Deciding it in the hub (rather than in each executor's canUseTool) is what makes it take effect on the
+// next tool call without respawning the long-lived agent worker.
+approvals.setAutoApprove((sessionId, kind, payload) => sessions.isAutoApproved(sessionId, kind, payload))
 
 // --- Blue-green restart wiring (docs/agent-detachment-impl.md §1.6) --------------------------------
 // hubctl launches us with HUB_SUPERVISED=1 + an IPC channel. A booting "green" gets HUB_PORT=0

@@ -1013,6 +1013,56 @@ export class SessionManager {
   }
 
   /**
+   * The hub-side approval policy (installed on ApprovalService via setAutoApprove). Returns true when this
+   * request must NOT reach the operator.
+   *
+   * Two ways a tool skips the prompt:
+   *   - the chat is in `full` (full access) mode — the operator has already said "don't ask me";
+   *   - the operator previously answered "always allow" for this tool name in this chat.
+   *
+   * Deciding it here, rather than in each executor's canUseTool, is what makes it reliable AND immediate:
+   * this is the single chokepoint both the worker relay and the in-process gate funnel through, and it
+   * lives in the hub, so a change applies to the very next tool call without respawning the agent worker.
+   */
+  isAutoApproved(sessionId: string, kind: string, payload: unknown): boolean {
+    const record = this.sessions.get(sessionId)
+    if (!record) return false
+    if (record.permissionMode === 'full') return true
+    const toolName = (payload as { toolName?: unknown } | null)?.toolName
+    return typeof toolName === 'string' && (record.allowedTools?.includes(toolName) ?? false)
+  }
+
+  /**
+   * "Always allow this tool in this chat" — the answer the approval prompt never offered. Every prompt was
+   * approve-once, so an operator running a long task had to re-approve the same tool indefinitely, and any
+   * prompt they missed failed closed after the timeout.
+   *
+   * Persisted on the record (a JSON blob, so no migration) and journaled, so it survives a hub restart and
+   * is visible in the transcript. Idempotent.
+   */
+  allowTool(sessionId: string, toolName: string): SessionRecord {
+    const record = this.sessions.get(sessionId)
+    if (!record) throw new Error(`unknown session: ${sessionId}`)
+    if (!toolName) throw new Error('toolName is required')
+    const next = new Set(record.allowedTools ?? [])
+    next.add(toolName)
+    record.allowedTools = [...next]
+    this.persist(record)
+    this.journal.append(sessionId, 'session/tool-allowed', { toolName, allowedTools: record.allowedTools })
+    return record
+  }
+
+  /** Revoke an "always allow" grant, so the tool prompts again. The escape hatch for a mis-click. */
+  disallowTool(sessionId: string, toolName: string): SessionRecord {
+    const record = this.sessions.get(sessionId)
+    if (!record) throw new Error(`unknown session: ${sessionId}`)
+    record.allowedTools = (record.allowedTools ?? []).filter((t) => t !== toolName)
+    this.persist(record)
+    this.journal.append(sessionId, 'session/tool-disallowed', { toolName, allowedTools: record.allowedTools })
+    return record
+  }
+
+  /**
    * Persist the per-chat model / thinking effort / service tier the MOMENT the operator picks it, instead
    * of only as a side effect of the next send (`send`'s override). Without this the choice lives in the
    * composer component, so switching panes, reloading the app, or restarting the hub silently reverted it.

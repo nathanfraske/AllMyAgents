@@ -678,6 +678,25 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, { ok: true })
         return
       }
+      // "Always allow <tool> in this chat" / its undo. The approval prompt only ever offered approve-once,
+      // so a long task re-prompted for the same tool forever and any missed prompt failed closed. The grant
+      // is read by sessions.isAutoApproved via the hub's approval policy, so it applies to the very next
+      // tool call — including one already mid-turn — with no worker respawn.
+      const allowToolMatch = /^\/api\/sessions\/([^/]+)\/allow-tool$/.exec(url.pathname)
+      if (method === 'POST' && allowToolMatch) {
+        const body = await readBody(req)
+        const toolName = str(body.toolName)
+        if (!toolName) {
+          json(res, { error: 'toolName is required' }, 400)
+          return
+        }
+        const record =
+          body.allow === false
+            ? sessions.disallowTool(allowToolMatch[1] as string, toolName)
+            : sessions.allowTool(allowToolMatch[1] as string, toolName)
+        json(res, record)
+        return
+      }
       // Per-chat model / thinking effort / service tier, written through the moment it is picked so the
       // choice belongs to the RECORD (surviving a pane switch, an app reload, and a hub restart) rather
       // than to the composer component. specOf feeds these to both vendors. '' clears back to default.
