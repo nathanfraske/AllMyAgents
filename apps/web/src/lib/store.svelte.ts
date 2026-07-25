@@ -962,15 +962,32 @@ class HubStore {
       vlog('ws: open')
       this.connected = true
     }
-    ws.onmessage = (e) => {
-      const event = JSON.parse(e.data as string) as HubEvent
-      this.apply(event)
-    }
+    ws.onmessage = (e) => this.ingest(JSON.parse(e.data as string) as HubEvent)
     ws.onclose = () => {
       vlog('ws: closed — reconnecting in 1.5s')
       this.connected = false
       setTimeout(() => this.reconnect(), 1500)
     }
+  }
+
+  // Events arrive one WebSocket message at a time, and a reconnect replays the WHOLE backlog that way.
+  // Applying each one immediately means a render (and a re-scroll) per event, so opening a chat after a
+  // refresh visibly REPLAYS the transcript — you watch it build itself line by line down to the bottom.
+  // Buffering into the next microtask collapses each burst into a single render + a single scroll, while
+  // preserving order exactly. A live event is delayed by well under a frame, which is imperceptible.
+  private pendingEvents: HubEvent[] = []
+  private flushScheduled = false
+
+  private ingest(event: HubEvent): void {
+    this.pendingEvents.push(event)
+    if (this.flushScheduled) return
+    this.flushScheduled = true
+    queueMicrotask(() => {
+      this.flushScheduled = false
+      const batch = this.pendingEvents
+      this.pendingEvents = []
+      for (const ev of batch) this.apply(ev)
+    })
   }
 
   private reconnect(): void {
@@ -981,7 +998,7 @@ class HubStore {
       vlog('ws: reopened')
       this.connected = true
     }
-    ws.onmessage = (e) => this.apply(JSON.parse(e.data as string) as HubEvent)
+    ws.onmessage = (e) => this.ingest(JSON.parse(e.data as string) as HubEvent)
     ws.onclose = () => {
       this.connected = false
       setTimeout(() => this.reconnect(), 1500)
