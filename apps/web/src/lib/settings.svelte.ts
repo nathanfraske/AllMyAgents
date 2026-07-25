@@ -43,10 +43,33 @@ const DEFAULTS: Settings = {
   autoCheckUpdates: true,
 }
 
+/**
+ * Bump when a DEFAULT changes in a way that should reach existing installs.
+ *
+ * Changing a default only affects people who have never saved settings — everyone else keeps the value
+ * persisted under the OLD default forever, silently. That is not academic: `autoReopenLastChats` shipped
+ * default-ON, was changed to default-OFF on request, and existing installs kept auto-reopening (the app
+ * would show home, then jump into the last chat a moment later) because `true` was already in storage.
+ */
+const SETTINGS_VERSION = 2
+/** Keys whose persisted value is discarded when migrating TO that version, so the new default applies. */
+const RESET_ON_VERSION: Record<number, (keyof Settings)[]> = {
+  2: ['autoReopenLastChats'],
+}
+
 function load(): Settings {
   try {
     const raw = localStorage.getItem(KEY) ?? localStorage.getItem(LEGACY_KEY)
-    if (raw) return { ...DEFAULTS, ...(JSON.parse(raw) as Partial<Settings>) }
+    if (raw) {
+      const stored = JSON.parse(raw) as Partial<Settings> & { _v?: number }
+      const from = typeof stored._v === 'number' ? stored._v : 1
+      if (from < SETTINGS_VERSION) {
+        for (let v = from + 1; v <= SETTINGS_VERSION; v++) {
+          for (const key of RESET_ON_VERSION[v] ?? []) delete stored[key]
+        }
+      }
+      return { ...DEFAULTS, ...stored }
+    }
   } catch {
     /* ignore */
   }
@@ -108,6 +131,7 @@ class SettingsStore {
           detachedDefaultMode: this.detachedDefaultMode,
           autoSwitchToNewChat: this.autoSwitchToNewChat,
           autoReopenLastChats: this.autoReopenLastChats,
+          _v: SETTINGS_VERSION, // so a future default change can migrate this install (see load)
           autoCheckUpdates: this.autoCheckUpdates,
         })
       )
