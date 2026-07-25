@@ -381,6 +381,13 @@ class HubStore {
     this.projects = await api.projects()
     vlog(`init: ${this.profiles.length} profiles, ${this.projects.length} projects (${msSince(t0)})`)
     await this.refreshSideData()
+    // Per-chat settings (permission mode, model, thinking effort, title) are rebuilt from replayed
+    // `session/created` events, which carry the record AS IT WAS AT CREATION — so a mode you changed
+    // later rendered stale on a fresh load. Overlay the hub's CURRENT roster once the replay has
+    // landed. Twice, because "the replay has landed" is not an event we get: the second pass catches a
+    // slow/large backlog. Cheap (one GET) and idempotent.
+    setTimeout(() => void this.syncRecordsFromHub(), 800)
+    setTimeout(() => void this.syncRecordsFromHub(), 3000)
     // Belt and braces: if sessions were already loaded above, ensure() has come and gone, so nudge the
     // restore directly. scheduleAutoRestore is idempotent and re-arms itself while the roster is empty.
     this.scheduleAutoRestore()
@@ -393,6 +400,33 @@ class HubStore {
     // NOTE: we deliberately do NOT scan every project on load — that walked ~/.codex + ~/.claude and
     // read thousands of transcript files per project, pegging the hub for minutes ("stuck scanning").
     // The import prompt now fires lazily, for the ONE project you actually open (see maybePromptImport).
+  }
+
+  /**
+   * Overlay the hub's CURRENT session roster onto the records the WS replay rebuilt.
+   *
+   * The client reconstructs sessions from replayed `session/created` events, and that payload is the
+   * record as it was AT CREATION. Anything changed afterwards through a dedicated route — the permission
+   * mode, model, thinking effort, service tier, title — is only corrected if the matching later event
+   * also replays. The hub is authoritative for all of them (specOf feeds these exact fields into every
+   * turn), so re-reading /api/sessions is the honest fix rather than trusting event reconstruction.
+   *
+   * Deliberately does NOT touch `status` or activity: those belong to the live event stream, and
+   * stomping them here would resurrect the class of bug where a stale write pins a chat on the wrong
+   * state. Settings only.
+   */
+  async syncRecordsFromHub(): Promise<void> {
+    const rows = await api.sessions().catch(() => [] as SessionRecord[])
+    if (!Array.isArray(rows)) return
+    for (const rec of rows) {
+      const v = this.sessions[rec.id]
+      if (!v || v.draft) continue // not merged yet (a later pass catches it), or a local draft we own
+      v.record.permissionMode = rec.permissionMode
+      v.record.model = rec.model
+      v.record.effort = rec.effort
+      v.record.serviceTier = rec.serviceTier
+      if (rec.title) v.record.title = rec.title
+    }
   }
 
   // Pair this device by pasting a token (from another device's Settings → Mesh), then load.
