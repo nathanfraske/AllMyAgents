@@ -204,6 +204,15 @@ alive across the bounce) and resumes on the new code. This is exactly the restar
 - Distinct from the curator (operator-facing) and the auto-mode safety checker (per-action arbiter), though all
   three are trusted hub-adjacent roles that could share the isolation/gating machinery.
 
+## Write-dedup relies on sync stores (caveat — from the 6+7 audit, 2026-07-25)
+
+Cross-hub write exactly-once across a blue-green flip currently rests on the memory/practice/bus stores being
+**synchronous** (a served write's ack is processed before blue's worker socket drops, so green never needs to
+dedup it; the in-memory `servedWrites` cache can't span hub processes). A HARD crash of blue (persist-before-ack
+lost) OR a future **async** store would reopen a double-write window. Carry into any async-store migration: give
+writes **durable, journal-based exactly-once** (like approvals get via `resolvedApproval`), not just the
+in-memory `servedWrites` cache. (Distinct from F1 — the worker-respawn callId collision — which is being fixed.)
+
 ## Critical-agent tier (requested 2026-07-24)
 
 An opt-in per-agent designation for maximum restart durability, ON TOP of the Phase-2 worker model
