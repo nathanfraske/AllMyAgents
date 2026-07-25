@@ -591,9 +591,20 @@ export async function discoverImportableChats(opts: DiscoverOptions): Promise<Sc
       warnings.push(`scan failed for profile ${profile.id}: ${err instanceof Error ? err.message : String(err)}`)
     }
   }
-  chats.sort((a, b) => b.lastActivity.localeCompare(a.lastActivity))
+  // A single Codex session commonly spans MANY rollout files that all carry the SAME session_id
+  // (every resume writes a fresh file). Collapse to ONE card per (profile, vendor session), keeping
+  // the most-recently-active rollout — which is what a resume actually continues. Without this the
+  // picker showed 95 copies of one chat AND emitted 95 identical keyed-list keys, which crashes the
+  // render (Svelte throws on duplicate {#each} keys) and freezes the panel on "Scanning…".
+  const byKey = new Map<string, ImportableChat>()
+  for (const c of chats) {
+    const k = importKey(c.profileId, c.vendorSessionId)
+    const prev = byKey.get(k)
+    if (!prev || c.lastActivity > prev.lastActivity) byKey.set(k, c)
+  }
+  const unique = [...byKey.values()].sort((a, b) => b.lastActivity.localeCompare(a.lastActivity))
   const byProfile: Record<string, number> = {}
-  for (const c of chats) if (!c.alreadyImported) byProfile[c.profileId] = (byProfile[c.profileId] ?? 0) + 1
+  for (const c of unique) if (!c.alreadyImported) byProfile[c.profileId] = (byProfile[c.profileId] ?? 0) + 1
   const config = readProjectConfig(target, warnings)
-  return { path: target, chats, byProfile, scannedProfiles, config, warnings }
+  return { path: target, chats: unique, byProfile, scannedProfiles, config, warnings }
 }

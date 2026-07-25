@@ -88,7 +88,7 @@
     {:else}
       <div class="isum">Found <b>{importable.length}</b> chat{importable.length === 1 ? '' : 's'} across {foundProfiles.join(', ')}</div>
       <div class="ilist scroll">
-        {#each result.chats as c (c.profileId + c.vendorSessionId)}
+        {#each result.chats as c (c.transcriptPath)}
           {@const disabled = c.alreadyImported}
           <label class="ichat" class:disabled>
             <input type="checkbox" checked={disabled || selected.has(c.vendorSessionId)} {disabled} onchange={() => toggle(c.vendorSessionId)} />
