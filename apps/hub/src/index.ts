@@ -4,7 +4,7 @@ import path from 'node:path'
 import { ApprovalService } from './approvals.js'
 import { Journal } from './journal.js'
 import { ProjectStore } from './projects.js'
-import { scanProfiles } from './profiles.js'
+import { scanProfiles, setClaudeConnectorPolicy } from './profiles.js'
 import { SessionManager } from './sessions.js'
 import { SessionStore } from './store.js'
 import { startServer } from './server.js'
@@ -63,7 +63,12 @@ const danger: DangerFlags = {
   busCanUseRiskyTools: config.danger?.busCanUseRiskyTools === true,
   autoApprovePractices: config.danger?.autoApprovePractices === true,
   autoApproveRestart: config.danger?.autoApproveRestart === true,
+  enableClaudeConnectors: config.danger?.enableClaudeConnectors === true,
 }
+// Apply the connector policy to managed claude profiles at boot (safe default OFF → connectors suppressed).
+// The SDK reads disableClaudeAiConnectors from each profile's settings.json, so this makes the flag
+// authoritative on startup; the Danger-Zone toggle re-applies it on a flip (server.ts). Never touches ~/.claude.
+setClaudeConnectorPolicy(profiles, danger.enableClaudeConnectors === true)
 // Agent execution runs behind the Executor seam (docs/agent-worker-impl.md §4.1). The implementation is
 // chosen by the presence of HUB_WORKER_SOCKET (§4.4, the Phase-2 feature flag hubctl injects when worker
 // mode is opted into): absent → the in-process executor (byte-identical to today); present → a

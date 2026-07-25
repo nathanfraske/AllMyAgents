@@ -17,6 +17,7 @@ import { pickFolder } from './native.js'
 import { computeStats } from './stats.js'
 import { buildFleet, probeHubHealth } from './fleet.js'
 import { startLogin, awaitLogin, credentialsExist } from './loginLauncher.js'
+import { setClaudeConnectorPolicy } from './profiles.js'
 import type { DangerFlags, HubEvent, Profile, Provider } from './types.js'
 import type { Executor } from './executor.js'
 import type { RestartState } from './restartController.js'
@@ -505,6 +506,12 @@ export function startServer(opts: ServerOptions): http.Server {
         if (typeof body.busCanUseRiskyTools === 'boolean') danger.busCanUseRiskyTools = body.busCanUseRiskyTools
         if (typeof body.autoApprovePractices === 'boolean') danger.autoApprovePractices = body.autoApprovePractices
         if (typeof body.autoApproveRestart === 'boolean') danger.autoApproveRestart = body.autoApproveRestart
+        if (typeof body.enableClaudeConnectors === 'boolean') {
+          danger.enableClaudeConnectors = body.enableClaudeConnectors
+          // Re-apply to managed claude profiles' settings.json so the SDK picks up the change on the next
+          // turn (managed profiles only — never ~/.claude). Best-effort; safe default is OFF (suppressed).
+          setClaudeConnectorPolicy(profiles, body.enableClaudeConnectors)
+        }
         persistDanger(defaultCwd, danger)
         // Keep the worker's cached danger() live in worker mode (§4.4). No-op in-process (the in-process
         // executor reads the shared `danger` object directly and implements no pushDanger).

@@ -1,0 +1,60 @@
+import { describe, it, expect } from 'vitest'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { setClaudeConnectorPolicy, CLAUDE_DEFAULT_ID } from './profiles.js'
+import type { Profile } from './types.js'
+
+function tmpProfile(id: string, provider: 'claude' | 'codex', settings?: Record<string, unknown>): Profile {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `ama-prof-${id}-`))
+  if (settings) fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify(settings, null, 2))
+  return { id, provider, dir }
+}
+function readSettings(p: Profile): Record<string, unknown> {
+  return JSON.parse(fs.readFileSync(path.join(p.dir, 'settings.json'), 'utf8')) as Record<string, unknown>
+}
+
+describe('setClaudeConnectorPolicy', () => {
+  it('disables connectors (writes true) for a managed claude profile when the flag is OFF', () => {
+    const p = tmpProfile('claude-a', 'claude')
+    const written = setClaudeConnectorPolicy([p], false)
+    expect(written).toEqual(['claude-a'])
+    expect(readSettings(p).disableClaudeAiConnectors).toBe(true)
+  })
+
+  it('enables connectors (writes false) when the flag is ON', () => {
+    const p = tmpProfile('claude-a', 'claude', { disableClaudeAiConnectors: true })
+    setClaudeConnectorPolicy([p], true)
+    expect(readSettings(p).disableClaudeAiConnectors).toBe(false)
+  })
+
+  it('preserves other settings.json fields (merge, not overwrite)', () => {
+    const p = tmpProfile('claude-a', 'claude', { hooks: { PreToolUse: [] }, custom: 42 })
+    setClaudeConnectorPolicy([p], false)
+    const s = readSettings(p)
+    expect(s.disableClaudeAiConnectors).toBe(true)
+    expect(s.hooks).toEqual({ PreToolUse: [] })
+    expect(s.custom).toBe(42)
+  })
+
+  it('is idempotent — no rewrite when already at the target value', () => {
+    const p = tmpProfile('claude-a', 'claude', { disableClaudeAiConnectors: true })
+    const written = setClaudeConnectorPolicy([p], false) // target !enable = true, already true
+    expect(written).toEqual([])
+  })
+
+  it('never touches codex profiles or the real ~/.claude default home', () => {
+    const codex = tmpProfile('codex-a', 'codex')
+    const home = tmpProfile(CLAUDE_DEFAULT_ID, 'claude')
+    const written = setClaudeConnectorPolicy([codex, home], false)
+    expect(written).toEqual([])
+    expect(fs.existsSync(path.join(codex.dir, 'settings.json'))).toBe(false)
+    expect(fs.existsSync(path.join(home.dir, 'settings.json'))).toBe(false)
+  })
+
+  it('creates settings.json when a managed claude profile has none', () => {
+    const p = tmpProfile('claude-b', 'claude') // no settings.json yet
+    setClaudeConnectorPolicy([p], false)
+    expect(readSettings(p).disableClaudeAiConnectors).toBe(true)
+  })
+})

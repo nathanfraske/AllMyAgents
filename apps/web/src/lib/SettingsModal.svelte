@@ -44,7 +44,7 @@
   // Danger Zone — safe-default guardrail toggles + the agent-authored practices review list. Kept
   // collapsed behind an explicit reveal so it's never flipped by accident. Both toggles default OFF.
   let dangerRevealed = $state(false)
-  let danger = $state<DangerFlags>({ busCanUseRiskyTools: false, autoApprovePractices: false, autoApproveRestart: false })
+  let danger = $state<DangerFlags>({ busCanUseRiskyTools: false, autoApprovePractices: false, autoApproveRestart: false, enableClaudeConnectors: false })
   let practices = $state<Practice[]>([])
   $effect(() => {
     void api.danger().then((d) => (danger = d))
@@ -393,6 +393,9 @@
 
           <label class="opt"><input type="checkbox" checked={danger.autoApproveRestart} onchange={(e) => setDanger({ autoApproveRestart: (e.target as HTMLInputElement).checked })} /> Auto-approve agent hub restarts</label>
           <p class="hint dim warnrow">Default off — an agent's restart_hub tool waits on your approval; the operator restart below never needs it.</p>
+
+          <label class="opt"><input type="checkbox" checked={danger.enableClaudeConnectors} onchange={(e) => setDanger({ enableClaudeConnectors: (e.target as HTMLInputElement).checked })} /> Enable claude.ai cloud connectors for Claude sessions</label>
+          <p class="hint dim warnrow">Off (safe): the hub suppresses claude.ai cloud MCP connectors for managed Claude sessions — no data egress to vendor cloud connectors. On: they load as configured. Applies to managed profiles only, on the next turn.</p>
 
           <h4>Agent-authored practices</h4>
           <p class="hint dim">Durable conventions agents recorded, materialized into future agents at spawn. Revoking one removes it from future spawns (running sessions are unaffected until respawn).</p>

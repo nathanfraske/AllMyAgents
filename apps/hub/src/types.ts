@@ -163,6 +163,12 @@ export interface DangerConfig {
   autoApprovePractices?: boolean
   // default OFF → restart_hub waits on operator approval
   autoApproveRestart?: boolean
+  /**
+   * Re-enable claude.ai cloud MCP connectors for managed Claude sessions. Default OFF (safe): the hub
+   * writes `disableClaudeAiConnectors: true` into each managed claude profile's settings.json so the SDK
+   * suppresses cloud connectors — no egress to vendor connectors by default. ON allows them.
+   */
+  enableClaudeConnectors?: boolean
 }
 
 /** Resolved Danger Zone flags (both always present; index.ts fills defaults from DangerConfig). */
@@ -171,6 +177,10 @@ export interface DangerFlags {
   autoApprovePractices: boolean
   // default OFF → restart_hub waits on operator approval
   autoApproveRestart?: boolean
+  // default OFF (absent → treated as false) → managed claude profiles get disableClaudeAiConnectors=true.
+  // Only READ in index.ts (boot) + server.ts (toggle) via the shared danger object index.ts fully populates;
+  // optional so the many DangerFlags literals (worker + tests) that don't set it still typecheck.
+  enableClaudeConnectors?: boolean
 }
 
 export interface HubConfig {

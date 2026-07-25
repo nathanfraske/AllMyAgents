@@ -47,3 +47,35 @@ function isDir(p: string): boolean {
     return false
   }
 }
+
+/**
+ * Apply the claude.ai-connector policy to every MANAGED claude profile's settings.json (merge-preserving):
+ * sets `disableClaudeAiConnectors = !enable` so the Claude SDK suppresses (default, safe) or allows cloud
+ * MCP connectors for hub-managed sessions. Only touches AllMyAgents-managed `profiles/*` — never the user's
+ * real `~/.claude` (CLAUDE_DEFAULT_ID is skipped), and never codex profiles. Idempotent (skips a profile
+ * already at the target value) and best-effort per profile (a write failure is swallowed). Driven at boot +
+ * on the `enableClaudeConnectors` Danger-Zone toggle. Returns the profile ids it (re)wrote.
+ */
+export function setClaudeConnectorPolicy(profiles: Profile[], enable: boolean): string[] {
+  const written: string[] = []
+  for (const p of profiles) {
+    if (p.provider !== 'claude' || p.id === CLAUDE_DEFAULT_ID) continue
+    const file = path.join(p.dir, 'settings.json')
+    try {
+      let obj: Record<string, unknown> = {}
+      try {
+        const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown
+        if (parsed && typeof parsed === 'object') obj = parsed as Record<string, unknown>
+      } catch {
+        /* missing or invalid settings.json → start from an empty object */
+      }
+      if (obj.disableClaudeAiConnectors === !enable) continue // already correct — no rewrite (no churn)
+      obj.disableClaudeAiConnectors = !enable
+      fs.writeFileSync(file, JSON.stringify(obj, null, 2) + '\n')
+      written.push(p.id)
+    } catch {
+      /* best-effort: a profile we can't write just keeps whatever its settings.json already says */
+    }
+  }
+  return written
+}

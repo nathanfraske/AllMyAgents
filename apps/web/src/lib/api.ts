@@ -290,6 +290,7 @@ export interface DangerFlags {
   busCanUseRiskyTools: boolean
   autoApprovePractices: boolean
   autoApproveRestart?: boolean
+  enableClaudeConnectors?: boolean
 }
 
 export interface BusMessage {
