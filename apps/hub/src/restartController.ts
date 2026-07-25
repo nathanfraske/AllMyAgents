@@ -25,6 +25,7 @@ export interface RestartControllerDeps {
   sessions: SessionManager
   journal: Journal
   state: RestartState
+  publicPort: number //           the fixed public port (7777) — green promotes to it; blue re-claims it on rollback
   send: (msg: unknown) => void // process.send, bound
   onPromoted: () => void //       start deferred services (usage polling + mesh) once we own the port
 }
@@ -77,7 +78,18 @@ export class RestartController {
     }
     server.once('error', onError)
     server.once('listening', onListening)
-    server.listen(port, '127.0.0.1')
+    // Green is ALREADY listening on its ephemeral boot port — close that listener first (destroying the
+    // health-check sockets so close() completes promptly) before binding the fixed public port. Calling
+    // listen() while already listening throws ERR_SERVER_ALREADY_LISTEN.
+    for (const s of state.sockets) {
+      try {
+        s.destroy()
+      } catch {
+        /* gone */
+      }
+    }
+    state.sockets.clear()
+    server.close(() => server.listen(port, '127.0.0.1'))
   }
 
   /**
@@ -92,8 +104,19 @@ export class RestartController {
     process.exit(0)
   }
 
-  /** BLUE: green failed — we were never disturbed; journal the abort so the operator sees it. */
+  /**
+   * BLUE: green failed. Journal the abort. If we had ALREADY drained (released the port) when green
+   * failed, re-claim the fixed port so the hub isn't left dark — green never bound it (it failed at
+   * health-check or its own listen), so the port is free for us again. If green failed BEFORE our
+   * drain, state.draining is false and we were never disturbed.
+   */
   abort(error: string): void {
-    this.deps.journal.append(null, 'hub/restart-aborted', { error })
+    const { server, journal, state, publicPort } = this.deps
+    journal.append(null, 'hub/restart-aborted', { error })
+    if (state.draining) {
+      state.draining = false
+      server.once('error', (e: NodeJS.ErrnoException) => console.error(`[hub] rollback re-listen failed: ${e.message}`))
+      server.listen(publicPort, '127.0.0.1')
+    }
   }
 }

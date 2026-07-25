@@ -147,6 +147,7 @@ if (supervised && process.send) {
     sessions,
     journal,
     state: restartState,
+    publicPort,
     send,
     onPromoted: () => {
       usage.startPolling()
