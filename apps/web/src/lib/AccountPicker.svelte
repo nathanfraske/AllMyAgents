@@ -1,5 +1,6 @@
 <script lang="ts">
   import { store } from './store.svelte'
+  import { confirmDialog } from './dialog.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
   import Icon from './Icon.svelte'
   import type { SessionView } from './store.svelte'
@@ -14,8 +15,9 @@
     open = false
     if (profileId === view.record.profileId) return
     if (hasHistory) {
-      const ok = confirm(
-        `Move this chat to "${profileId}"?\n\nThe conversation context and working files are ported to a new chat on that account (auth can't be swapped mid-conversation, so the work is moved, not the login). The original chat is kept as a snapshot.`
+      const ok = await confirmDialog(
+        `Move this chat to "${profileId}"?\n\nThe conversation context and working files are ported to a new chat on that account (auth can't be swapped mid-conversation, so the work is moved, not the login). The original chat is kept as a snapshot.`,
+        { confirmLabel: 'Move chat' }
       )
       if (!ok) return
     }

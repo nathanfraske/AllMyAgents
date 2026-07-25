@@ -3,6 +3,7 @@
   import Sidebar from './lib/Sidebar.svelte'
   import ThreadView from './lib/ThreadView.svelte'
   import SettingsModal from './lib/SettingsModal.svelte'
+  import ConfirmDialog from './lib/ConfirmDialog.svelte'
   import Dashboard from './lib/Dashboard.svelte'
   import Titlebar from './lib/Titlebar.svelte'
   import { cubicOut } from 'svelte/easing'
@@ -285,6 +286,8 @@
     </div>
   </div>
 {/if}
+<!-- In-app confirm/alert (mounted once) — the native dialogs no-op in the desktop webview. -->
+<ConfirmDialog />
 
 <style>
   .app { display: flex; flex-direction: column; height: 100vh; }

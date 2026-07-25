@@ -2,6 +2,7 @@
   import { untrack } from 'svelte'
   import { api } from './api'
   import { store, type SessionView } from './store.svelte'
+  import { confirmDialog } from './dialog.svelte'
   import { relativeTime } from './time'
   import Usage from './Usage.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
@@ -284,7 +285,11 @@
 
   async function del(e: MouseEvent, id: string, name: string): Promise<void> {
     e.stopPropagation()
-    if (!confirm(`Delete "${name}"? This ends the session and removes the chat from the hub.`)) return
+    const ok = await confirmDialog(`Delete "${name}"? This ends the session and removes the chat from the hub.`, {
+      confirmLabel: 'Delete',
+      danger: true,
+    })
+    if (!ok) return
     await store.deleteSession(id)
   }
 </script>

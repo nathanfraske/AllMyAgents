@@ -1,5 +1,6 @@
 import { api, HUB_WS, getHubToken, setHubToken } from './api'
 import { settings } from './settings.svelte'
+import { alertDialog } from './dialog.svelte'
 import type { ApprovalRecord, HistoryItem, HistoryPage, HubEvent, ProfileInfo, ProjectInfo, ScanResult, SessionRecord, UsageSnapshot } from './api'
 
 // Verbose client tracing — on in dev, compiled out of prod builds. Toggle off in dev by setting
@@ -554,7 +555,7 @@ class HubStore {
       this.lastProfileId = profileId
       this.select((out as { id: string }).id)
     } else if (out && 'error' in out) {
-      alert(out.error)
+      void alertDialog(out.error)
     }
   }
 
