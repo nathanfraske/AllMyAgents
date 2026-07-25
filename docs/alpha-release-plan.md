@@ -50,11 +50,35 @@ or the installer. This composes with the existing pre-push audit rules + noreply
 - Release notes / CHANGELOG; README install section with alpha caveats + prereqs + the dev-harness note.
 - (Post-first-alpha) a GitHub Action to build the Tauri bundle in CI so releases aren't hand-built.
 
+## Auto-updater (must ship IN alpha.1)
+
+Updating a fleet of boxes by hand is the exact pain to avoid, so the updater ships in the **first** alpha —
+then alpha.2+ update themselves. Tauri v2 updater, pulling straight from the **GitHub release page** (the
+clean, no-extra-infra path — a dedicated update server or hosted service would be *more* infra, not less):
+- **Endpoint = GitHub's stable latest-release URL**: `.../releases/latest/download/latest.json`, which always
+  resolves to the newest release's manifest (version + per-platform signed installer URLs, themselves
+  `releases/latest/download/<installer>`). No separate update server, no gh-pages — GitHub hosts the manifest
+  and the binaries.
+- **Signing keypair** — the only piece beyond GitHub, and it's just a key, not a server: public key in
+  `tauri.conf.json`, private key a CI/release secret (never in the repo). The updater verifies the signature
+  before installing (it is a code-exec path, so this is load-bearing).
+- **CI does the work**: `tauri-action` builds + signs the bundles, generates `latest.json`, and attaches
+  everything to the GitHub release on tag — so cutting a release *is* publishing an update.
+- **One updater updates everything**: the hub ships inside the app bundle, so a single app update carries the
+  new hub too — no separate hub-update path.
+- **UX + consent** (safe-default philosophy): check on launch + a "Check for updates" button in Settings; on
+  an available update, NOTIFY and let the operator click "Update now" (download → verify → install → relaunch)
+  — never silent auto-install. Settings toggle for auto-check (default on). A "push to the whole fleet over
+  the mesh" convenience is a nice post-alpha follow-up.
+
 ## Sequence
 
 1. Land + audit the always-on worker. *(in progress — gates everything below)*
 2. Close known-broken paths (health `port`, etc.); flip alpha feature flags on by default.
 3. First-run app-data materialization + **template** profiles + path resolution off the dev cwd.
 4. Tauri bundle config → produce installer; smoke-test the *installed* app on a clean Windows profile.
-5. Security/credential scrub + pre-push audit (the landmine section) + P0 connector default resolved.
-6. Tag + pre-release + notes.
+5. **Wire the Tauri v2 auto-updater** — signing keypair, GitHub `latest/download/latest.json` endpoint,
+   `tauri-action` to build/sign/publish, check-on-launch + a Settings "Check for updates" button. **Must be
+   in alpha.1** so alpha.2+ update themselves.
+6. Security/credential scrub + pre-push audit (the landmine section) + P0 connector default resolved.
+7. Tag + pre-release + notes — which also publishes the updater manifest, so alpha.2+ auto-update.
