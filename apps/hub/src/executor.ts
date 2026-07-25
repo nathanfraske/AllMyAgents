@@ -106,6 +106,7 @@ export interface InProcessExecutorHubHooks {
   busSend(fromSessionId: string, to: BusAddress, subject: string | undefined, body: string): { ok: boolean; delivered: number; error?: string }
   busInbox(sessionId: string): BusMessage[]
   busRoster(sessionId: string): { sessionId: string; label: string; provider: string; status: string }[]
+  busPeek(callerSessionId: string, targetSessionId: string): { found: boolean; summary?: string }
 }
 
 /**
@@ -149,6 +150,7 @@ export class InProcessExecutor implements Executor {
       send: (from, to, subject, body) => this.h.busSend(from.sessionId, to, subject, body),
       inbox: (sessionId) => this.h.busInbox(sessionId),
       roster: (sessionId) => this.h.busRoster(sessionId),
+      peek: (caller, target) => this.h.busPeek(caller, target),
       memory: this.services.memory,
       practices: this.services.practices,
       requireApproval: (id, kind, payload) => this.services.approvals.request(id.sessionId, kind, payload),

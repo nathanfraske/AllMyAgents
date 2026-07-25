@@ -154,6 +154,15 @@ export class Journal extends EventEmitter {
     }))
   }
 
+  /** The most recent event (kind + ts) for a session, or undefined if it has none. Read-only; used by the
+   *  peek_agent tool to summarize a teammate's latest activity without interrupting them. */
+  lastEventForSession(sessionId: string): { kind: string; ts: string } | undefined {
+    const row = this.db
+      .prepare('SELECT kind, ts FROM events WHERE session = ? ORDER BY seq DESC LIMIT 1')
+      .get(sessionId) as { kind: string; ts: string } | undefined
+    return row ?? undefined
+  }
+
   /**
    * Replay EVERY event with seq > `seq`, in ascending order, exactly once, paging through the DB
    * in bounded chunks (`pageSize`) so an arbitrarily large journal is never materialized as a

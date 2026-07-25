@@ -149,6 +149,7 @@ export class SessionManager {
       busSend: (fromSessionId, to, subject, body) => this.busSend(fromSessionId, to, subject, body),
       busInbox: (sessionId) => this.busInbox(sessionId),
       busRoster: (sessionId) => this.busRoster(sessionId),
+      busPeek: (callerSessionId, targetSessionId) => this.busPeek(callerSessionId, targetSessionId),
     }
   }
 
@@ -289,6 +290,10 @@ export class SessionManager {
         return this.busInbox((args as { sessionId: string }).sessionId)
       case 'bus.roster':
         return this.busRoster((args as { sessionId: string }).sessionId)
+      case 'bus.peek': {
+        const a = args as { caller: string; target: string }
+        return this.busPeek(a.caller, a.target)
+      }
       case 'memory.write':
         return this.memory.write(args as Parameters<MemoryStore['write']>[0])
       case 'memory.search': {
@@ -420,6 +425,7 @@ export class SessionManager {
       send: (from, to, subject, body) => this.busSend(from.sessionId, to, subject, body),
       inbox: (sessionId) => this.busInbox(sessionId),
       roster: (sessionId) => this.busRoster(sessionId),
+      peek: (caller, target) => this.busPeek(caller, target),
       memory: this.memory,
       practices: this.practices,
       requireApproval: (id, kind, payload) => this.approvals.request(id.sessionId, kind, payload),
@@ -1022,6 +1028,33 @@ export class SessionManager {
     return [...this.sessions.values()]
       .filter((r) => r.id !== sessionId && r.status !== 'stopped' && (r.projectId ?? null) === project)
       .map((r) => ({ sessionId: r.id, label: identityOf(r).label, provider: r.provider, status: r.status }))
+  }
+
+  /**
+   * Read-only snapshot of a teammate's current activity for the `peek_agent` tool — same-project ACL (like
+   * busRoster), never sends a message or interrupts the target. Returns a one-line summary, or found:false
+   * for an unknown / self / stopped / cross-project target (fails closed, same scope as the bus).
+   */
+  busPeek(callerSessionId: string, targetSessionId: string): { found: boolean; summary?: string } {
+    const caller = this.sessions.get(callerSessionId)
+    if (!caller) return { found: false }
+    const t = this.sessions.get(targetSessionId)
+    if (!t || t.id === callerSessionId || t.status === 'stopped' || (t.projectId ?? null) !== (caller.projectId ?? null)) {
+      return { found: false }
+    }
+    const doing = t.status === 'active' ? 'actively working' : t.status === 'idle' ? 'idle (waiting)' : t.status
+    const ago = (ms: number): string => {
+      if (!Number.isFinite(ms) || ms < 0) return 'just now'
+      const s = Math.round(ms / 1000)
+      if (s < 60) return `${s}s ago`
+      const m = Math.round(s / 60)
+      if (m < 60) return `${m}m ago`
+      const h = Math.round(m / 60)
+      return h < 24 ? `${h}h ago` : `${Math.round(h / 24)}d ago`
+    }
+    const last = this.journal.lastEventForSession(t.id)
+    const tail = last ? ` — last activity ${ago(Date.now() - Date.parse(last.ts))} (${last.kind})` : ''
+    return { found: true, summary: `${identityOf(t).label} (${t.provider}) is ${doing}${tail}` }
   }
 
   /**

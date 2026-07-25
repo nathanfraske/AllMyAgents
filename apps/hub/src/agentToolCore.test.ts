@@ -28,6 +28,7 @@ function makeHarness(opts: {
   approve?: boolean
   isBusTurn?: boolean
   danger?: DangerFlags
+  peek?: { found: boolean; summary?: string }
 } = {}): Harness {
   const memory = new MemoryStore(new Database(':memory:'))
   const practices = new PracticeStore(new Database(':memory:'))
@@ -41,6 +42,7 @@ function makeHarness(opts: {
     },
     inbox: () => (opts.inbox ?? []) as never,
     roster: () => opts.roster ?? [],
+    peek: (_caller, _target) => opts.peek ?? { found: false },
     memory,
     practices,
     requireApproval: async (_id, kind, payload) => {
@@ -55,11 +57,12 @@ function makeHarness(opts: {
 }
 
 describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)', () => {
-  it('exposes exactly the 10 mcp__allmyagents__ tools, each with a description + schema', () => {
+  it('exposes exactly the 11 mcp__allmyagents__ tools, each with a description + schema', () => {
     expect(AGENT_TOOLS.map((t) => t.name)).toEqual([
       'list_agents',
       'send_message',
       'read_messages',
+      'peek_agent',
       'memory_write',
       'memory_search',
       'memory_read',
@@ -105,6 +108,20 @@ describe('list_agents / read_messages', () => {
     expect(out).toContain('from brains (deadbeefxx)') // FULL sender session id (Bug2), not truncated
     expect(out).toContain('hi')
     expect(out).toContain('ping')
+  })
+})
+
+describe('peek_agent (read-only teammate activity)', () => {
+  it('renders the hub-built activity summary for a valid teammate', async () => {
+    const h = makeHarness({ peek: { found: true, summary: 'worker (claude) is actively working — last activity 3s ago (claude/assistant)' } })
+    const out = await runAgentTool('peek_agent', { to_session: 'peer99' }, { identity: idA, services: h.services })
+    expect(out).toBe('worker (claude) is actively working — last activity 3s ago (claude/assistant)')
+  })
+
+  it('reports a friendly miss when the target is unknown / cross-project (found:false)', async () => {
+    const h = makeHarness({ peek: { found: false } })
+    const out = await runAgentTool('peek_agent', { to_session: 'nope' }, { identity: idA, services: h.services })
+    expect(out).toMatch(/No such teammate/)
   })
 })
 

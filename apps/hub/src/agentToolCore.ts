@@ -51,6 +51,8 @@ export interface AgentServices {
   inbox(sessionId: string): Awaitable<BusMessage[]>
   /** The teammates the caller can message (same project, not itself, not stopped). */
   roster(sessionId: string): Awaitable<{ sessionId: string; label: string; provider: string; status: string }[]>
+  /** A read-only one-line snapshot of a teammate's current activity (peek_agent) — no message, no interrupt. */
+  peek(callerSessionId: string, targetSessionId: string): Awaitable<{ found: boolean; summary?: string }>
   memory: MemoryServices
   /** Agent-writable practices (durable conventions materialized into future agents). */
   practices: PracticeServices
@@ -148,6 +150,19 @@ const readMessages = defineTool({
           `[${i + 1}] from ${m.fromLabel} (${m.fromSession})${m.subject ? ` — ${m.subject}` : ''}\n${m.body}`
       )
       .join('\n\n')
+  },
+})
+
+const peekAgent = defineTool({
+  name: 'peek_agent',
+  description:
+    'See what a teammate agent is currently doing — their status and last activity — WITHOUT interrupting them or sending a message. Give `to_session` (from list_agents). Use it to check on a teammate before deciding whether to message them.',
+  schema: { to_session: z.string().describe('the teammate session id from list_agents') },
+  run: async (args, { identity, services }) => {
+    const r = await services.peek(identity.sessionId, args.to_session)
+    return r.found && r.summary
+      ? r.summary
+      : 'No such teammate on your project (check list_agents for a valid session id).'
   },
 })
 
@@ -300,6 +315,7 @@ export const AGENT_TOOLS: readonly AgentToolSpec[] = [
   listAgents,
   sendMessage,
   readMessages,
+  peekAgent,
   memoryWrite,
   memorySearch,
   memoryRead,

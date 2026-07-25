@@ -84,6 +84,7 @@ export type RelayMethod =
   | 'bus.send'
   | 'bus.inbox'
   | 'bus.roster'
+  | 'bus.peek'
   | 'memory.write'
   | 'memory.search'
   | 'memory.get'
