@@ -11,6 +11,9 @@ interface Settings {
   ownerName: string
   detachedDefaultProjectId: string | null
   detachedDefaultMode: 'safe' | 'edits' | 'full'
+  // On the first send in a new chat, switch the active pane to the freshly-spawned session (so you land
+  // on the chat you just started instead of staying on the previous one). Default on.
+  autoSwitchToNewChat: boolean
 }
 
 const KEY = 'allmyagents.settings'
@@ -28,6 +31,7 @@ const DEFAULTS: Settings = {
   ownerName: '',
   detachedDefaultProjectId: null,
   detachedDefaultMode: 'safe',
+  autoSwitchToNewChat: true,
 }
 
 function load(): Settings {
@@ -53,6 +57,7 @@ class SettingsStore {
   ownerName = $state('')
   detachedDefaultProjectId = $state<string | null>(null)
   detachedDefaultMode = $state<'safe' | 'edits' | 'full'>('safe')
+  autoSwitchToNewChat = $state(true)
 
   constructor() {
     const s = load()
@@ -68,6 +73,7 @@ class SettingsStore {
     this.ownerName = s.ownerName
     this.detachedDefaultProjectId = s.detachedDefaultProjectId
     this.detachedDefaultMode = s.detachedDefaultMode
+    this.autoSwitchToNewChat = s.autoSwitchToNewChat
   }
 
   save(): void {
@@ -87,6 +93,7 @@ class SettingsStore {
           ownerName: this.ownerName,
           detachedDefaultProjectId: this.detachedDefaultProjectId,
           detachedDefaultMode: this.detachedDefaultMode,
+          autoSwitchToNewChat: this.autoSwitchToNewChat,
         })
       )
     } catch {

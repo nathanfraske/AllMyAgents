@@ -468,7 +468,10 @@ class HubStore {
     const { [draftId]: _drop, ...rest } = this.sessions
     this.sessions = rest
     this.ensure(rec)
-    if (this.selectedId === draftId) this.selectedId = rec.id
+    // Auto-switch the active pane to the freshly-spawned chat (Setting, default on) so the first send lands
+    // you ON the new chat — including when you sent from a split/background pane that wasn't the selected
+    // one. Off keeps the old behavior: only follow the new chat if you were already viewing the draft.
+    if (settings.autoSwitchToNewChat || this.selectedId === draftId) this.selectedId = rec.id
     if (this.splitPanes.length) {
       this.splitPanes = this.splitPanes.map((row) => row.map((x) => (x === draftId ? rec.id : x)))
     }
