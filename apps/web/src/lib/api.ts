@@ -8,6 +8,11 @@ export interface ProjectInfo {
   name: string
   path: string
   createdAt: string
+  // Fleet origin (CLIENT-INJECTED by the store's fleet merge — the hub never sends these). Set only
+  // for a project pulled from a REMOTE fleet site; its `id` is namespaced `${siteId}:${realId}`.
+  // Absent → this hub's own (local) project, shown unbadged exactly as before.
+  siteId?: string
+  siteLabel?: string
 }
 
 export interface SessionRecord {
@@ -32,6 +37,11 @@ export interface SessionRecord {
   // Real last-turn time of an imported transcript — the sidebar shows/sorts by this, not import time.
   lastActivity?: string
   createdAt: string
+  // Fleet origin (CLIENT-INJECTED by the store's fleet merge — the hub never sends these). Set only
+  // for a session pulled from a REMOTE fleet site; both `id` and `projectId` are namespaced
+  // `${siteId}:${realId}`. Absent → this hub's own (local) session, shown unbadged as before.
+  siteId?: string
+  siteLabel?: string
 }
 
 // One existing Claude/Codex conversation found on disk that can be adopted under a project.
@@ -166,8 +176,12 @@ function authHeaders(): Record<string, string> {
   return hubToken ? { authorization: `Bearer ${hubToken}` } : {}
 }
 
-async function jget<T>(url: string): Promise<T> {
-  const res = await fetch(HUB_HTTP + url, { headers: authHeaders() })
+// `base` defaults to the single local hub (HUB_HTTP); the fleet merge passes a REMOTE site's mapped
+// loopback base (http://localhost:<localPort>) to pull that machine's read-only roster.
+// TODO(full drive-remote, L): a remote site under `requireToken` needs ITS OWN token here — today we
+// reuse the single local `hubToken` (fine while enforcement is off, the first-cut assumption).
+async function jget<T>(url: string, base: string = HUB_HTTP): Promise<T> {
+  const res = await fetch(base + url, { headers: authHeaders() })
   return res.json() as Promise<T>
 }
 
@@ -228,6 +242,17 @@ export interface MeshStatus {
   checkedAt?: string
   requireToken?: boolean
   token?: string
+}
+
+// One machine in the unified fleet view (GET /api/fleet). `local:true` is THIS hub. For a remote
+// site, `baseUrl` is a loopback port the mesh maps to that peer's hub; the store pulls its
+// /api/projects + /api/sessions when `online`, namespacing every id with `${siteId}:`.
+export interface FleetSite {
+  siteId: string
+  label: string
+  local: boolean
+  baseUrl: string
+  online: boolean
 }
 
 export interface Instruction {
@@ -294,6 +319,13 @@ export const api = {
   projects: () => jget<ProjectInfo[]>('/api/projects'),
   createProject: (name: string, path: string) =>
     jpost<ProjectInfo | { error: string }>('/api/projects', { name, path }),
+  // --- Unified fleet view (first cut, read-only) ---
+  // The fleet roster: this hub + every reachable co-owned peer's hub, badged by machine.
+  fleet: () => jget<FleetSite[]>('/api/fleet'),
+  // Pull a roster from an ARBITRARY site base (a remote fleet site's mapped loopback base), not just
+  // the hard-wired local hub — how the store aggregates remote machines read-only.
+  projectsFrom: (base: string) => jget<ProjectInfo[]>('/api/projects', base),
+  sessionsFrom: (base: string) => jget<SessionRecord[]>('/api/sessions', base),
   // Project import: preview existing vendor chats under a folder, then adopt the selected ones.
   scanProject: (path: string) => jpost<ScanResult | { error: string }>('/api/projects/scan', { path }),
   importChats: (projectId: string, vendorSessionIds: string[]) =>

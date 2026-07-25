@@ -29,6 +29,19 @@ interface WireResponse {
   error?: string
 }
 
+/**
+ * One co-owned machine in the owner's fleet, as the node's `owned_roster` reports it
+ * (node/src/mesh.rs `fleet_roster_value` :9667 → `OwnedMember` in
+ * crates/allmystuff-protocol/src/app.rs:402). `device` is the canonical node id that
+ * `site_map`/`site_unmap` key on; `label` is a cosmetic display name (may be empty).
+ */
+export interface FleetMember {
+  device: string
+  label: string
+  /** Governance role projection ('owner' | 'controller' | 'member') when the roster carries one. */
+  role?: string
+}
+
 export interface MeshStatus {
   /** Runtime toggle — whether we're trying to expose at all. */
   enabled: boolean
@@ -228,5 +241,66 @@ export class MeshSite {
     if (on) return this.register()
     await this.deregister()
     return this.update({ exposed: false, error: undefined })
+  }
+
+  // --- Fleet discovery + routing (unified-across-mesh view, first cut) --------------------------
+  // These call the SAME node control socket + framing `register()` uses, just pointed at the
+  // directory/routing commands the node already exposes (docs/mesh-unified-fleet.md §1). All are
+  // fail-soft: no node here, or any error, yields empty/null — never a throw into the request path,
+  // so a single-machine hub with no node behaves exactly as before (owned_roster fails fast with
+  // ENOENT/ECONNREFUSED → []).
+
+  /**
+   * The fleet directory: every co-owned machine (node id + label) as `owned_roster` reports it
+   * (node_control.rs:1668 → mesh.rs `fleet_roster_value` :9667; reply envelope `{ ok, result }` per
+   * node_control.rs `WireResponse::ok` :642). `result.members` is `[{ device, label, role }]`, or
+   * absent/`[]` when this node isn't in a fleet (`empty_owned()` mesh.rs:17586). Returns [] on any
+   * error or when no node is running here.
+   */
+  async ownedRoster(timeoutMs = 4000): Promise<FleetMember[]> {
+    try {
+      const r = await roundTrip(this.socketPath, 'owned_roster', {}, timeoutMs)
+      if (!r.ok) return []
+      const members = (r.result as { members?: unknown } | undefined)?.members
+      if (!Array.isArray(members)) return []
+      const out: FleetMember[] = []
+      for (const raw of members) {
+        const m = raw as { device?: unknown; label?: unknown; role?: unknown }
+        if (typeof m.device !== 'string' || m.device.length === 0) continue
+        out.push({
+          device: m.device,
+          label: typeof m.label === 'string' ? m.label : '',
+          role: typeof m.role === 'string' ? m.role : undefined,
+        })
+      }
+      return out
+    } catch {
+      return []
+    }
+  }
+
+  /**
+   * Bind (idempotently) a local loopback port that tunnels to `node`'s hub on `port` — so
+   * `http://localhost:<localPort>` is that peer's hub (node_control.rs:1612 → mesh.rs `site_map`
+   * :14618; success reply `{ localPort }`). Returns null when the node refuses (its own device →
+   * "that's this device", so self is naturally excluded), the peer is offline/unreachable, or no
+   * node is running here. Default `port` is the well-known hub port 7777.
+   *
+   * NOTE (first cut): we do NOT use `site_remote_list` to pre-filter which peers actually expose a
+   * hub — its answer arrives as an async `allmystuff://node-sites` EVENT (mesh.rs:14526/14592), and
+   * this hub's `roundTrip` only returns the first JSON reply frame (it skips event frames), so it
+   * can't capture that reply. The pragmatic MVP (docs/mesh-unified-fleet.md §5.5) is to map each
+   * member then probe `/api/health` — a machine not running a hub simply fails the probe. Capturing
+   * the event to know exposure BEFORE mapping is part of the full drive-remote (L) work.
+   */
+  async siteMap(node: string, port = 7777, timeoutMs = 4000): Promise<number | null> {
+    try {
+      const r = await roundTrip(this.socketPath, 'site_map', { node, port }, timeoutMs)
+      if (!r.ok) return null
+      const lp = (r.result as { localPort?: unknown } | undefined)?.localPort
+      return typeof lp === 'number' ? lp : null
+    } catch {
+      return null
+    }
   }
 }

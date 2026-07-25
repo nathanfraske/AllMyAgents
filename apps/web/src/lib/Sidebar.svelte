@@ -135,6 +135,9 @@
     id: string
     name: string
     sessions: SessionView[]
+    // Set only for a project that lives on a REMOTE fleet machine → renders a small site badge.
+    // Absent for this hub's own (local) projects, so the single-machine view is unchanged.
+    siteLabel?: string
   }
 
   const groups = $derived.by(() => {
@@ -152,7 +155,7 @@
     const out: Group[] = []
     for (const p of store.orderedProjects) {
       const ss = byProject.get(p.id) ?? []
-      if (ss.length || !filter) out.push({ id: p.id, name: p.name, sessions: store.orderedChats(p.id, ss) })
+      if (ss.length || !filter) out.push({ id: p.id, name: p.name, siteLabel: p.siteLabel, sessions: store.orderedChats(p.id, ss) })
     }
     const none = byProject.get('__none__')
     if (none?.length) out.push({ id: '__none__', name: 'Unfiled', sessions: store.orderedChats('__none__', none) })
@@ -347,6 +350,7 @@
           {/if}
           <button class="folder" title={isCollapsed ? 'expand' : 'collapse'} onclick={() => toggleCollapse(g.id)}><Icon name={isCollapsed ? 'chevron-right' : 'chevron-down'} size={12} /></button>
           <span class="gname">{g.name}</span>
+          {#if g.siteLabel}<span class="sbadge" title="on {g.siteLabel}"><Icon name="server" size={9} />{g.siteLabel}</span>{/if}
           <span class="gcount dim tnum">{g.sessions.length}</span>
           {#if g.id !== '__none__'}
             <button class="gadd" title="import existing chats" onclick={(e) => openImport(e, g.id)}><Icon name="download" size={13} /></button>
@@ -393,6 +397,7 @@
               <!-- svelte-ignore a11y_no_static_element_interactions -->
               <span class="rlabel" class:glitch={glitching.has(s.record.id)} ondblclick={(e) => startRename(e, s)}>{label(s)}</span>
             {/if}
+            {#if s.record.siteLabel}<span class="rbadge" title="on {s.record.siteLabel} (remote fleet machine)"><Icon name="server" size={9} /></span>{/if}
             {#if pending > 0}<span class="pbadge tnum">{pending}</span>{/if}
             {#if warnOf(s, st)}
               <span class="rwarn" title={warnTitle(st)} aria-label={warnTitle(st)}><Icon name="alert-triangle" size={12} /></span>
@@ -495,6 +500,14 @@
   .group.dragging .group-head { background: var(--surface-3); border-radius: var(--r-md); box-shadow: var(--shadow-1); }
   .list.reordering { user-select: none; cursor: grabbing; }
   .ibadge { flex: none; display: inline-grid; place-items: center; color: var(--dim); }
+  /* Fleet machine/site tags: a labelled pill on a remote project header, and a compact icon marker on
+     a remote chat row (its label rides in the tooltip). Only rendered for REMOTE sites, so the
+     single-machine view shows neither. */
+  .sbadge { flex: none; display: inline-flex; align-items: center; gap: 0.2rem; max-width: 9rem; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-2xs); font-weight: var(--fw-medium);
+    color: var(--accent); background: color-mix(in srgb, var(--accent) 13%, transparent);
+    border-radius: var(--r-pill); padding: 0.05rem 0.35rem; }
+  .rbadge { flex: none; display: inline-grid; place-items: center; color: var(--accent); opacity: 0.75; }
   .rlabel { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .row.sel .rlabel { font-weight: var(--fw-medium); }
   /* One-shot glitch when a chat materializes into the list or is renamed. Kept subtle (small
