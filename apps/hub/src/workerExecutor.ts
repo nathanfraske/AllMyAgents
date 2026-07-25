@@ -26,6 +26,9 @@ function errText(err: unknown): string {
  *                           still works.
  *   - `resolveApproval`   — a worker `approvalRequest` → `approvals.request(sessionId, kind, payload, id)`,
  *                           the idempotent-id signature (§7.2) so a re-issue across a restart dedups.
+ *   - `attachWorker`      — re-attach to the still-running worker on every (re)connect (§6): reconcile each
+ *                           restored session against the worker's live drivers and replay the in-flight
+ *                           turn's event gap. THE survival mechanism — driven off the 'attached' event.
  */
 export interface WorkerExecutorHubCallbacks {
   ingestWorkerEvent(sessionId: string, wseq: number, kind: string, payload: unknown): void
@@ -34,6 +37,7 @@ export interface WorkerExecutorHubCallbacks {
   requestRestart(reason: string, bySession?: string): void
   runRelay(method: RelayMethod, args: unknown): unknown
   resolveApproval(approvalId: string, sessionId: string, kind: string, payload: unknown): Promise<boolean>
+  attachWorker(): Promise<void>
 }
 
 /**
@@ -45,11 +49,12 @@ export interface WorkerExecutorHubCallbacks {
  * busy; turnCompleted/turnError → idle), with an optimistic set on `runTurn` accept so the hub's
  * "a turn is already in progress" guard stays as tight as the in-process `driver.busy` it replaces.
  *
- * STEP 4 SCOPE (docs/agent-worker-impl.md §3.3, §4.4): turns run in the worker behind the HUB_WORKER_SOCKET
- * flag AND the worker's MCP tool handlers now relay back to hub-owned services — `onRelay` dispatches
- * `rpc` to the hub bus/memory/practices and `approvalRequest` to the operator, and `pushDanger` keeps the
- * worker's cached danger live. Still no re-attach (a hub restart loses the turn — Phase-1 parity): the
- * `'attached'` → `attachWorker()` wseq replay is left unwired with a clear TODO(step 5) marker.
+ * STEP 5 SCOPE (docs/agent-worker-impl.md §6, §7.1): re-attach is now wired. On every WorkerClient
+ * `'attached'` (a fresh hub connecting to the still-running worker, or this hub after a socket flap) the
+ * executor invokes `hub.attachWorker()`, which reconciles each restored session against `listLive()` and
+ * replays the in-flight turn's event gap via `attach(since)` — so a mid-turn survives a hub restart and
+ * finishes on the successor. (Builds on step 4's relays: `onRelay` dispatches `rpc`/`approvalRequest` to
+ * hub-owned services, and `pushDanger` keeps the worker's cached danger live.)
  */
 export class WorkerExecutor implements Executor {
   // Sessions the worker is currently driving a turn for, tracked from the lifecycle stream (authoritative)
@@ -77,8 +82,15 @@ export class WorkerExecutor implements Executor {
       if (msg.t === 'rpc') this.dispatchRpc(msg)
       else this.dispatchApproval(msg)
     })
-    // TODO(step 5): this.client.on('attached', () => hub.attachWorker()) — re-attach + wseq replay after a
-    //   hub restart, so an in-flight turn survives the seam (attachWorker/lastJournaledWseq not built yet).
+    // Re-attach on every (re)connect (§6) — THE survival loop. A fresh hub (started by hubctl after its
+    // predecessor died) or this hub after a socket flap runs attachWorker(): reconcile each restored session
+    // against the worker's still-live drivers and replay the in-flight turn's event gap (listLive + attach),
+    // so a mid-turn finishes on the successor hub. Registered BEFORE connect() so the first 'attached' is
+    // never missed. Best-effort: if the worker drops again mid-reconcile (listLive/attach reject retryably)
+    // the next 'attached' re-drives it — attachWorker is idempotent (the hub's wseq cursor dedups any replay).
+    this.client.on('attached', () => {
+      this.hub.attachWorker().catch((err) => console.warn(`[worker-executor] attachWorker failed: ${errText(err)}`))
+    })
     this.client.connect()
   }
 
@@ -150,9 +162,10 @@ export class WorkerExecutor implements Executor {
   }
 
   async attach(since: Record<string, number>): Promise<void> {
-    // STEP 5: the hub drives this from the WorkerClient's 'attached' event via attachWorker() to replay the
-    // gap after a restart. In step 3 nothing calls it (boot still uses reconcileStale), but the relay is
-    // faithful so it works the moment re-attach is wired.
+    // The hub drives this from attachWorker() (off the 'attached' event, §6): it relays the per-session
+    // durable cursors to the worker, which replays every buffered event with wseq > since[sid] (+ a
+    // worker/attach-gap sentinel if its ring wrapped) onto this channel, then resumes live emission. The
+    // ack resolves only AFTER the worker has written the whole replay, so the gap is drained before we return.
     await this.callAck({ t: 'attach', reqId: nextReqId(), since })
   }
 

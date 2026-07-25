@@ -16,8 +16,14 @@
  * `canUseTool` mirrors InProcessExecutor exactly (AUTO_ALLOW / SELF_GATING bus-hard-deny / checkWriteScope /
  * operator approval RELAY); and the codex approval callback relays to the hub operator too.
  *
+ * STEP 5 SCOPE (docs/agent-worker-impl.md §6, §7.1): gap-correct, exactly-once re-attach is built here.
+ * `listLive()` reports each held session's status (claude → driver.busy, codex → idle) so the hub can decide
+ * each session's fate, and `attach(since)` replays every buffered event with wseq > since[sid] — prefixing
+ * the buffer's worker/attach-gap sentinel if the ring wrapped, and translating the WSEQ_TURN_* markers back
+ * into their lifecycle messages (replayMessage) so the hub's applyLifecycle still drives status. Replay never
+ * re-appends to the buffer, so the durable-cursor loop stays exactly-once.
+ *
  * Still DELIBERATELY deferred with TODO markers:
- *   - Gap-correct `attach(since)` replay + re-attach is STEP 5 (the handler below does a minimal replay).
  *   - Approval reconciliation across a hub restart is STEP 6 (the transport already re-flushes an
  *     outstanding relay on reconnect + the idempotent approvals.request(id) dedups it; the fail-closed
  *     branches here are only the TRUE >HUB_RELAY_TIMEOUT_MS orphan).
@@ -28,7 +34,7 @@ import { ClaudeDriver } from './adapters/claude.js'
 import { CodexClient } from './adapters/codex.js'
 import { buildAgentMcpServer, type AgentServices } from './agentTools.js'
 import { AUTO_ALLOW_TOOLS, SELF_GATING_TOOLS } from './executor.js'
-import { WseqBuffer } from './wseqBuffer.js'
+import { WseqBuffer, type BufferedEvent } from './wseqBuffer.js'
 import { WorkerServer } from './workerTransport.js'
 import type { BusMessage } from './bus.js'
 import type { Memory } from './memory.js'
@@ -43,13 +49,14 @@ import {
   type LiveSession,
   type RelayMethod,
   type WorkerSessionSpec,
+  type WorkerToHub,
 } from './workerProtocol.js'
 
 // The single monotonic per-session wseq space (the wseq buffer) is shared by vendor events AND the turn
 // lifecycle messages — both carry `wseq`. Lifecycle messages are appended under these worker-internal
-// marker kinds so the counter advances in strict send order. Step 3 never drives attach()/replay, so
-// these markers are pure bookkeeping today.
-// TODO(step 5): teach attach()'s replay to re-emit a marker as its lifecycle message, not as an `event`.
+// marker kinds so the counter advances in strict send order. On re-attach (step 5) attach()'s replay
+// translates each marker BACK into its lifecycle message (see replayMessage) rather than re-sending it as
+// a generic `event`, so the hub's applyLifecycle still drives the status transition across the seam.
 const WSEQ_TURN_STARTED = 'worker/turn/started'
 const WSEQ_TURN_COMPLETED = 'worker/turn/completed'
 const WSEQ_TURN_ERROR = 'worker/turn/error'
@@ -179,8 +186,9 @@ export class AgentWorker {
   // worker-local source of truth for isBusTurn (§3.3). Set from runTurn's origin, cleared in `finally`;
   // read by the MCP self-gate (buildWorkerAgentServices.isBusTurn) + canUseTool's SELF_GATING hard-deny.
   private readonly busTurnSessions = new Set<string>()
-  // Sessions with a live turn right now (between turnStarted and turnCompleted/turnError), for listLive's
-  // status and to know which codex sessions to fail on an app-server crash.
+  // Sessions with a live turn right now (between turnStarted and turnCompleted/turnError) — used to know
+  // which codex sessions to fail on an app-server crash. (listLive derives claude status from the driver's
+  // own `busy` flag and reports codex as idle, mirroring InProcessExecutor, so it does not read this.)
   private readonly activeTurns = new Set<string>()
   private readonly buf = new WseqBuffer()
   private readonly server: WorkerServer
@@ -415,26 +423,68 @@ export class AgentWorker {
     return this.codexClientFor(profileId, profileDir).readRateLimits()
   }
 
+  /**
+   * The sessions the worker still holds, for the hub's re-attach decision (§6). Status mirrors
+   * InProcessExecutor.listLive EXACTLY so both executors reconcile identically:
+   *   - claude → the driver's own `busy` flag: a busy driver is a LIVE turn the hub keeps `active` and
+   *     replays across the seam (the Phase-2 win); an idle driver is a warm session with no live turn.
+   *   - codex → always `idle`: a codex turn lives in the app-server child and resumes lazily on the next
+   *     send, so the worker does not replay-survive it — the hub re-attaches it as idle (§6, §11).
+   * `lastWseq` is the session's current buffer head (diagnostic; the hub's replay cursor is its OWN durable
+   * lastJournaledWseq, not this).
+   */
   private listLive(): LiveSession[] {
     const live: LiveSession[] = []
-    for (const sessionId of this.claudeDrivers.keys()) {
-      live.push({ sessionId, status: this.activeTurns.has(sessionId) ? 'active' : 'idle', lastWseq: this.buf.lastWseq(sessionId) })
+    for (const [sessionId, driver] of this.claudeDrivers) {
+      live.push({ sessionId, status: driver.busy ? 'active' : 'idle', lastWseq: this.buf.lastWseq(sessionId) })
     }
     for (const sessionId of this.codexThreads.keys()) {
       if (this.claudeDrivers.has(sessionId)) continue
-      live.push({ sessionId, status: this.activeTurns.has(sessionId) ? 'active' : 'idle', lastWseq: this.buf.lastWseq(sessionId) })
+      live.push({ sessionId, status: 'idle', lastWseq: this.buf.lastWseq(sessionId) })
     }
     return live
   }
 
+  /**
+   * Gap-free, exactly-once re-attach replay (docs/agent-worker-impl.md §7.1) — the survival mechanism.
+   * For each requested session, re-send `buf.since(sid, since[sid])`:
+   *   - the cursor is EXCLUSIVE (strictly wseq > since[sid]), so the successor hub receives only events
+   *     past its durable lastJournaledWseq — no duplicate, no skip (the hub seeds since[sid] FROM that
+   *     cursor, closing the loop);
+   *   - if the cursor predates the retained ring (a hub gone long enough that the oldest events were
+   *     trimmed), buf.since prefixes a synthetic worker/attach-gap sentinel, forwarded like any event so
+   *     the hub journals a VISIBLE gap marker instead of silently losing the span;
+   *   - each message carries its ORIGINAL wseq — replay NEVER re-appends to the buffer or bumps the
+   *     counter (we send from buf.since, not through emit*), and a WSEQ_TURN_* marker replays AS its
+   *     lifecycle message (replayMessage) so the hub's applyLifecycle drives status, not a generic event.
+   * The drain is synchronous, so (single-threaded JS) no live emit can interleave it: replay finishes, then
+   * live emission resumes on the same channel — the replay→live join is gap-free, exactly as the journal's
+   * synchronous replay() joins replay→live for the WS.
+   */
   private attach(since: Record<string, number>): void {
-    // STEP 5 owns gap-correct re-attach. Minimal replay for now: re-emit each requested session's buffered
-    // events with wseq > since[sid] (the buffer prefixes a worker/attach-gap sentinel if the cursor
-    // predates the retained window). Nothing drives this in step 3 (the hub still uses reconcileStale).
     for (const [sessionId, afterWseq] of Object.entries(since)) {
       for (const ev of this.buf.since(sessionId, afterWseq)) {
-        this.server.send({ t: 'event', sessionId, wseq: ev.wseq, kind: ev.kind, payload: ev.payload })
+        this.server.send(this.replayMessage(sessionId, ev))
       }
+    }
+  }
+
+  /**
+   * Re-express a buffered event as the worker→hub message it was ORIGINALLY sent as. A WSEQ_TURN_* marker
+   * becomes its turnStarted/turnCompleted/turnError lifecycle message (so the hub drives status via
+   * applyLifecycle, never by sniffing a generic event kind); every other kind — real vendor events AND the
+   * worker/attach-gap sentinel — replays as a generic `event`. The wseq is the buffered one, verbatim.
+   */
+  private replayMessage(sessionId: string, ev: BufferedEvent): WorkerToHub {
+    switch (ev.kind) {
+      case WSEQ_TURN_STARTED:
+        return { t: 'turnStarted', sessionId, wseq: ev.wseq }
+      case WSEQ_TURN_COMPLETED:
+        return { t: 'turnCompleted', sessionId, wseq: ev.wseq, vendorSessionId: (ev.payload as { vendorSessionId?: string } | null)?.vendorSessionId }
+      case WSEQ_TURN_ERROR:
+        return { t: 'turnError', sessionId, wseq: ev.wseq, message: (ev.payload as { message?: string } | null)?.message ?? 'turn failed' }
+      default:
+        return { t: 'event', sessionId, wseq: ev.wseq, kind: ev.kind, payload: ev.payload }
     }
   }
 

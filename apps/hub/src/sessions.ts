@@ -48,10 +48,22 @@ export class SessionManager {
   // Per-session set of memory ids already auto-recalled into context, so the same memory isn't
   // re-injected turn after turn (automatic recall; gated by autoMemoryRecall).
   private readonly recalledIds = new Map<string, Set<string>>()
+  // Per-session high-water mark of the worker `wseq` already durably journaled — the steady-state
+  // exactly-once cursor (docs/agent-worker-impl.md §7.1). Seeded at re-attach (attachWorker) from the
+  // durable lastJournaledWseq, advanced by ingestWorkerEvent on every journaled event, and dropped when
+  // the worker stops holding the session (restored-stale / delete) so a fresh worker wseq sequence after a
+  // worker respawn is never mistaken for a duplicate. WORKER-MODE ONLY: ingestWorkerEvent is its sole
+  // writer and never runs in-process, so this map stays empty and inert on the flag-off path.
+  private readonly ingestedWseq = new Map<string, number>()
   // Agent execution — the ClaudeDriver / CodexClient children, the per-turn loops, and the in-process
   // agent MCP server — lives behind this seam (docs/agent-worker-impl.md §4.1). In-process by default;
   // a future WorkerExecutor runs the same execution in a supervised sibling with an identical contract.
   private readonly executor: Executor
+  // True when execution runs in the supervised sibling WORKER (index.ts injected a WorkerExecutor because
+  // HUB_WORKER_SOCKET is set) rather than in-process. Gates the re-attach path ONLY: worker mode reconciles
+  // restored sessions via attachWorker() (driven off the worker 'attached' event) instead of the blunt
+  // reconcileStale() sweep. Flag-off (in-process) keeps every boot/reconcile path byte-identical.
+  private readonly workerMode: boolean
 
   constructor(
     private readonly journal: Journal,
@@ -86,6 +98,9 @@ export class SessionManager {
     // Bind the hub-half side effects the in-process executor performs inline while driving a turn.
     // (A non-in-process executor drives these itself via its event streams, so it needs no binding.)
     if (this.executor instanceof InProcessExecutor) this.executor.bindHub(this.buildHubHooks())
+    // Worker mode ⟺ NOT the in-process executor (the default/injected InProcessExecutor is flag-off; an
+    // injected WorkerExecutor is worker mode). Used only to gate the re-attach path, never on a hot path.
+    this.workerMode = !(this.executor instanceof InProcessExecutor)
   }
 
   /**
@@ -159,7 +174,18 @@ export class SessionManager {
    * explicit lifecycle stream (applyLifecycle).
    */
   ingestWorkerEvent(sessionId: string, wseq: number, kind: string, payload: unknown): void {
+    // THE EXACTLY-ONCE INVARIANT — defense-in-depth (docs/agent-worker-impl.md §7.1). The PRIMARY guarantee
+    // is upstream: attachWorker seeds since[sid] = lastJournaledWseq(sid) (the max already durably journaled)
+    // and the worker replays ONLY wseq > since[sid], so a replayed event can never overlap what is journaled
+    // — no double-write, no skip. This guard makes it airtight even if a stale/duplicate wseq ever arrives:
+    // skip any wseq at or below the highest already journaled for this session. The high-water mark is seeded
+    // at re-attach from the durable cursor and dropped when the worker stops holding the session, so a fresh
+    // worker sequence (wseq restarts at 1 after a worker respawn) is NOT mistaken for a duplicate; with no
+    // entry yet (a brand-new turn) we journal freely and start tracking.
+    const seen = this.ingestedWseq.get(sessionId)
+    if (seen !== undefined && wseq <= seen) return
     this.journal.appendWorker(sessionId, kind, payload, wseq)
+    this.ingestedWseq.set(sessionId, wseq)
     const profileId = this.sessions.get(sessionId)?.profileId
     if (kind === 'claude/rate_limit_event') {
       const info = (payload as { rate_limit_info?: ClaudeLimitInfo }).rate_limit_info
@@ -276,6 +302,13 @@ export class SessionManager {
     // process is spawned against the home only when the user explicitly resumes an imported chat.
     this.registerDefaultHomes()
     this.loadRecords()
+    // WORKER MODE: the smart re-attach (attachWorker) decides each restored session's fate against the
+    // still-running worker, and is driven ASYNCHRONOUSLY off the WorkerClient's 'attached' event — not
+    // here. The blunt reconcileStale() must NOT pre-empt it (it would flip a live mid-turn session to idle
+    // before the worker replay lands), and calling attachWorker inline at boot is pointless anyway: the
+    // worker socket isn't connected yet. attachWorker gracefully IS reconcileStale on a cold start
+    // (listLive() empty → every restored session falls into its stale sweep). Flag-off is unchanged below.
+    if (this.workerMode) return
     // A booting GREEN hub (blue-green restart) passes reconcile:false and defers reconcileStale() to
     // `promote` (once it owns the port) — otherwise it would flip a session blue is mid-turn on to idle
     // in the shared store, racing blue's live turn (docs/agent-detachment-impl.md §4.2 #6).
@@ -288,12 +321,85 @@ export class SessionManager {
   }
 
   /** Flip any 'active'|'starting' record left by a crash/restart to 'idle' (its in-process turn is gone).
-   *  Runs only once this hub OWNS the port, so it never races another hub's live turn. Idempotent. */
+   *  Runs only once this hub OWNS the port, so it never races another hub's live turn. Idempotent.
+   *
+   *  WORKER MODE: the smart re-attach (attachWorker) is the reconcile mechanism — it decides each restored
+   *  session's fate against the STILL-RUNNING worker (active→replay, idle, stale) instead of bluntly
+   *  flipping every active session to idle, which would clobber a live mid-turn the worker is still driving.
+   *  attachWorker normally runs off the WorkerClient's 'attached' event; routing this hub-side reconcile hook
+   *  (a promoted green calls it from restartController.promote) to it keeps promote from UNDOING a turn
+   *  attachWorker just restored on connect, and it gracefully IS this sweep when the worker holds nothing.
+   *  FLAG-OFF (in-process) is byte-identical: the blunt sweep below runs exactly as it always has. */
   reconcileStale(): void {
+    if (this.workerMode) {
+      void this.attachWorker().catch((err) => console.warn(`[hub] attachWorker (reconcileStale) failed: ${err instanceof Error ? err.message : String(err)}`))
+      return
+    }
     for (const record of this.sessions.values()) {
       if (record.status === 'active' || record.status === 'starting') {
         record.status = 'idle'
         this.journal.append(record.id, 'session/restored-stale', { note: 'hub restarted mid-turn' })
+        this.store.upsert(record)
+      }
+    }
+  }
+
+  /** The durable exactly-once re-attach cursor for a session: the highest worker `wseq` already journaled,
+   *  or 0 if none (docs/agent-worker-impl.md §7.1). attachWorker() seeds each live session's replay from
+   *  this, and the worker replays only wseq > it — so no event is journaled twice and none is skipped. */
+  lastJournaledWseq(sessionId: string): number {
+    return this.journal.lastJournaledWseq(sessionId)
+  }
+
+  /**
+   * Re-attach to the still-running worker after a (re)connect (docs/agent-worker-impl.md §6) — the Phase-2
+   * survival mechanism, and the riskiest slice: an off-by-one here would duplicate or drop transcript
+   * events for a LIVE turn across the exact seam the feature exists to protect. Driven off the WorkerClient's
+   * 'attached' event (via the WorkerExecutor callback), NOT called inline in boot(): the worker connection is
+   * async + auto-reconnecting, so this runs whenever a fresh hub — or this hub after a socket flap — attaches.
+   *
+   * For each session the worker still holds (executor.listLive()):
+   *   - status 'active' (a live claude turn) → keep the record `active` across the seam and set its replay
+   *     cursor to the DURABLE lastJournaledWseq(sid). THE EXACTLY-ONCE INVARIANT: the hub journals worker
+   *     events via appendWorker(…, wseq), so lastJournaledWseq is the high-water mark of what is durably
+   *     recorded; the worker replays ONLY wseq > since[sid]; therefore no event is journaled twice and none
+   *     is skipped — the same cursor guarantee journal.replay() gives the WS, extended across the worker
+   *     boundary. (ingestWorkerEvent enforces it a second time as defense-in-depth; we seed its high-water
+   *     mark to the same cursor here.)
+   *   - status 'idle' (the worker holds the driver but no live turn) → setStatus(idle), exactly as today.
+   * Then, for every active session, executor.attach(since) makes the worker replay the gap (wseq > cursor,
+   * plus a worker/attach-gap sentinel if its ring wrapped) and resume live emission — the turn finishes here.
+   *
+   * Every active|starting roster record the worker does NOT claim is truly stale (a worker that never heard
+   * of it, or was respawned fresh) → the normal Phase-1 restored-stale path. On a COLD start listLive() is
+   * empty, so `since` stays empty, attach is skipped, and every restored session falls into the stale sweep
+   * — attachWorker gracefully IS reconcileStale when there is nothing to re-attach to.
+   */
+  async attachWorker(): Promise<void> {
+    const live = await this.executor.listLive()
+    const liveIds = new Set(live.map((s) => s.sessionId))
+    const since: Record<string, number> = {}
+    for (const s of live) {
+      const record = this.sessions.get(s.sessionId)
+      if (!record) continue // the worker holds a session we deleted → ignore it
+      if (s.status === 'active') {
+        record.status = 'active' // keep the live turn active across the seam (already persisted active)
+        const cursor = this.lastJournaledWseq(s.sessionId) // the DURABLE exactly-once replay cursor (§7.1)
+        since[s.sessionId] = cursor
+        this.ingestedWseq.set(s.sessionId, cursor) // seed the steady-state high-water mark to the same cursor
+      } else {
+        this.setStatus(record, 'idle') // driver alive but no live turn
+      }
+    }
+    // Replay the gap for every active session: the worker re-sends wseq > since[sid] (+ a worker/attach-gap
+    // sentinel if its ring wrapped), then resumes live emission — the turn finishes on this hub.
+    if (Object.keys(since).length) await this.executor.attach(since)
+    // Stale sweep: a roster record still active|starting that the worker does NOT hold is genuinely stale.
+    for (const record of this.sessions.values()) {
+      if ((record.status === 'active' || record.status === 'starting') && !liveIds.has(record.id)) {
+        record.status = 'idle'
+        this.ingestedWseq.delete(record.id) // the worker isn't holding it; a fresh worker turn restarts wseq
+        this.journal.append(record.id, 'session/restored-stale', { note: 'worker had no live driver' })
         this.store.upsert(record)
       }
     }
@@ -754,6 +860,7 @@ export class SessionManager {
     //    codex thread). The executor's codexClients map is keyed by profile + shared across sessions,
     //    so it is deliberately left intact — only this session's driver/thread is dropped.
     this.sessions.delete(sessionId)
+    this.ingestedWseq.delete(sessionId) // drop the exactly-once cursor — the worker forgets its wseq buffer too (a no-op in-process)
     await this.executor.stopSession(sessionId)
     // 4. Remove it from the persisted snapshot so a hub restart doesn't resurrect it.
     this.store.remove(sessionId)
