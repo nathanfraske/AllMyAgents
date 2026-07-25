@@ -1,6 +1,6 @@
 import path from 'node:path'
 import { ClaudeDriver } from './adapters/claude.js'
-import { CodexClient, mapCodexTokenUsage } from './adapters/codex.js'
+import { CodexClient, mapCodexTokenUsage, codexRequestResult, isOwnAgentServerRequest } from './adapters/codex.js'
 import { buildAgentMcpServer, type AgentServices } from './agentTools.js'
 import type { SessionIdentity } from './identity.js'
 import type { ApprovalService } from './approvals.js'
@@ -218,10 +218,12 @@ export class InProcessExecutor implements Executor {
           }
         },
         async (method, params) => {
+          // Our own agent MCP server needs no prompt (parity with the Claude AUTO_ALLOW set).
+          if (isOwnAgentServerRequest(method, params)) return codexRequestResult(method, true)
           const threadId = (params as { threadId?: string } | null)?.threadId
           const sessionId = threadId ? this.sessionIdForThread(threadId) : undefined
           const approved = await this.services.approvals.request(sessionId ?? 'unattributed', `codex/${method}`, params)
-          return approved ? { decision: 'accept' } : { decision: 'decline' }
+          return codexRequestResult(method, approved)
         }
       )
       this.codexClients.set(profileId, client)

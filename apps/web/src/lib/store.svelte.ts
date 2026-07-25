@@ -986,7 +986,17 @@ class HubStore {
       this.flushScheduled = false
       const batch = this.pendingEvents
       this.pendingEvents = []
-      for (const ev of batch) this.apply(ev)
+      // Isolate every event: a batch has already been dequeued, so ONE throwing event would silently
+      // swallow every event after it in the same flush — tool calls and thinking blocks simply stop
+      // appearing, with nothing in the UI to say why. Before batching, a bad event could only kill its
+      // own message handler; batching made that failure mode much worse, so contain it explicitly.
+      for (const ev of batch) {
+        try {
+          this.apply(ev)
+        } catch (err) {
+          console.error('[store] failed to apply event', ev?.kind, ev?.seq, err)
+        }
+      }
     })
   }
 

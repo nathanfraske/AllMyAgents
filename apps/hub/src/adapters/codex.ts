@@ -3,6 +3,7 @@ import readline from 'node:readline'
 import fs from 'node:fs'
 import path from 'node:path'
 import { createRequire } from 'node:module'
+import { AGENT_MCP_SERVER_NAME } from '../codexMcpConfig.js'
 
 /**
  * Absolute path to the codex CLI entry, or null if we cannot find it.
@@ -38,6 +39,34 @@ function codexEntry(): string | null {
 type EventSink = (kind: string, payload: unknown) => void
 
 export type CodexApprovalHandler = (method: string, params: unknown) => Promise<unknown>
+
+/** Codex server-request method for an MCP **elicitation** (a server asking the user), as opposed to the
+ *  exec/patch approvals. Codex raises one the first time a thread uses a given MCP server's tool. */
+export const CODEX_ELICITATION_METHOD = 'mcpServer/elicitation/request'
+
+/**
+ * Build the JSON-RPC result codex expects for a server request. THE SHAPES DIFFER and getting it wrong is
+ * silent: an elicitation follows the MCP spec (`{action}`) while exec/patch approvals use `{decision}`, and
+ * answering an elicitation with `{decision:'accept'}` is read as a REJECTION — the agent is simply told
+ * "user rejected MCP tool call". Observed exactly that: an approved Codex tool call came back rejected.
+ */
+export function codexRequestResult(method: string, approved: boolean): Record<string, string> {
+  return method === CODEX_ELICITATION_METHOD
+    ? { action: approved ? 'accept' : 'decline' }
+    : { decision: approved ? 'accept' : 'decline' }
+}
+
+/**
+ * True when the request is codex asking permission to use OUR OWN hub-registered MCP server. Auto-accepted,
+ * mirroring the Claude side's AUTO_ALLOW set: the hub wrote that server into the profile config itself, the
+ * tool bodies run IN the hub, and they already enforce the same-project ACL, scope checks, and the practice
+ * self-gate. Prompting the operator once per thread for the hub's own bus/memory tools is pure friction and
+ * breaks cross-vendor parity, since Claude never prompts for them.
+ */
+export function isOwnAgentServerRequest(method: string, params: unknown): boolean {
+  if (method !== CODEX_ELICITATION_METHOD) return false
+  return (params as { serverName?: unknown } | null)?.serverName === AGENT_MCP_SERVER_NAME
+}
 
 export interface CodexTurnOptions {
   model?: string

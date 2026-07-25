@@ -31,7 +31,7 @@
  */
 import path from 'node:path'
 import { ClaudeDriver } from './adapters/claude.js'
-import { CodexClient } from './adapters/codex.js'
+import { CodexClient, codexRequestResult, isOwnAgentServerRequest } from './adapters/codex.js'
 import { buildAgentMcpServer, type AgentServices } from './agentTools.js'
 import { AUTO_ALLOW_TOOLS, SELF_GATING_TOOLS } from './executor.js'
 import { WseqBuffer, type BufferedEvent } from './wseqBuffer.js'
@@ -555,16 +555,18 @@ export class AgentWorker {
    *  in-process does), relays an operator approval, and maps the decision. A HubUnavailableError past the
    *  transient bound declines (safe terminal — the codex approval protocol has no retryable-text channel;
    *  the agent can retry the action). */
-  private async codexApproval(method: string, params: unknown): Promise<{ decision: 'accept' | 'decline' }> {
+  private async codexApproval(method: string, params: unknown): Promise<Record<string, string>> {
+    // Our own agent MCP server needs no prompt (parity with the Claude AUTO_ALLOW set).
+    if (isOwnAgentServerRequest(method, params)) return codexRequestResult(method, true)
     const threadId = (params as { threadId?: string } | null)?.threadId
     const sessionId = threadId ? this.sessionForThread(threadId) : undefined
     try {
       const approved = await this.relayApproval(sessionId ?? 'unattributed', `codex/${method}`, params)
-      return approved ? { decision: 'accept' } : { decision: 'decline' }
+      return codexRequestResult(method, approved)
     } catch {
       // TODO(step 6): a codex approval in flight across a hub restart is re-flushed by the transport +
       // deduped by the idempotent approvals.request(id); this decline is only the TRUE >45s-orphan terminal.
-      return { decision: 'decline' }
+      return codexRequestResult(method, false)
     }
   }
 
