@@ -280,13 +280,30 @@ async function readCodexRollout(
           if (!matches(out.cwd)) return null
         }
       }
-      if (bytes >= maxBytes) break // floor count is fine for a scan card; don't read gigabytes
+      // Stop the moment this rollout is confirmed ours AND we have the first prompt — that's all a
+      // scan card needs. Without this we streamed up to `maxBytes` of EVERY matching rollout (~1 MB ×
+      // ~100 files = ~100 MB per scan), which is the 2 s "won't populate" stall on a big project. The
+      // message count is then a floor, which is fine for a preview. `maxBytes` remains the safety cap
+      // for a rollout whose first user turn is unusually deep in the file.
+      if ((cwdDecided && out.firstPrompt) || bytes >= maxBytes) break
     }
   } finally {
     rl.close()
     stream.destroy()
   }
   return out.cwd && matches(out.cwd) ? out : null
+}
+
+/**
+ * A short single-line preview of a first prompt for the scan card. Codex/Claude first messages are
+ * frequently tens of KB of pasted content (one AllMyStuff session was 54 KB) — sending the full text
+ * for every chat bloated the scan response to 650 KB+. The browser only shows this as a tooltip, so a
+ * preview is all it needs; the auto-title is derived hub-side from the FULL text before truncation.
+ */
+function previewText(text: string | undefined, max = 280): string | undefined {
+  if (!text) return text
+  const oneLine = text.replace(/\s+/g, ' ').trim()
+  return oneLine.length > max ? `${oneLine.slice(0, max)}…` : oneLine
 }
 
 /** Compose the auto-name: deriveTitle(firstPrompt) preferred (per spec), else ai-title, else generic. */
@@ -382,7 +399,7 @@ async function discoverClaudeChats(
           profileId: profile.id,
           cwd: parsed.cwd,
           title: composeTitle('claude', parsed.firstPrompt, parsed.aiTitle),
-          firstPrompt: parsed.firstPrompt,
+          firstPrompt: previewText(parsed.firstPrompt),
           aiTitle: parsed.aiTitle,
           lastActivity: st.mtime.toISOString(),
           messageCount: parsed.messageCount,
@@ -457,7 +474,7 @@ async function discoverCodexChats(
         profileId: profile.id,
         cwd: parsed.cwd,
         title: composeTitle('codex', parsed.firstPrompt),
-        firstPrompt: parsed.firstPrompt,
+        firstPrompt: previewText(parsed.firstPrompt),
         lastActivity: st.mtime.toISOString(),
         messageCount: parsed.messageCount,
         model: parsed.model,
