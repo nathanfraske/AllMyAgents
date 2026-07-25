@@ -38,7 +38,10 @@ export type HubToWorker =
   | { t: 'readCodexLimits'; reqId: string; profileId: string; profileDir: string }
   // pushes (no reqId):
   | { t: 'dangerUpdate'; danger: DangerFlags }
-  | { t: 'draining' } // pre-flip: hold new relays before the socket drops (§8.4)
+  // pre-flip: hold new relays before the socket drops (§8.4). `on:false` is the RELEASE — a rolled-back
+  // flip (RestartController.abort) un-drains so the held relays flow again instead of wrongly timing out
+  // (the M2 correctness item). Absent/true = start draining.
+  | { t: 'draining'; on?: boolean }
   | { t: 'approvalResolved'; approvalId: string; approved: boolean }
   | { t: 'rpcResult'; callId: string; ok: boolean; value?: unknown; error?: string }
 
@@ -87,6 +90,12 @@ export type RelayMethod =
 export const HUB_RECONNECT_INTERVAL_MS = 1_000 // hub WorkerClient reconnect cadence (matches the web WS)
 export const HUB_RELAY_TIMEOUT_MS = 45_000 //     transient→terminal bound; covers a restart AND a rollback (§8.3)
 export const RELAY_QUEUE_MAX = 1_000 //           worker relay-lane bound; overflow = terminal for that call (§8.1)
+// L6: a DELIVERED rpc relay awaits the hub's reply with NO reach-a-hub timer (a delivered call is already at
+// a hub). This is a generous backstop on that wait so a wedged hub that accepts the frame but never replies
+// can't hang the tool forever. Well above a flip window (HUB_RELAY_TIMEOUT_MS) yet well under the SDK's
+// patience; the approvalRequest path is deliberately EXEMPT (it legitimately blocks on a human up to the
+// hub's 10-min ApprovalService timeout, which always replies), so only rpc(bus/memory/practices) get it.
+export const HUB_RELAY_DELIVERED_BACKSTOP_MS = 120_000
 
 /** The ONE retryable shape a tool returns when a relay exceeds the transient bound — never a permanent
  *  "denied"/"disabled"/"gone" shape, which an agent reads as a broken system (§8.3). */

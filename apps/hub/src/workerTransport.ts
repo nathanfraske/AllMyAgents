@@ -28,6 +28,7 @@ import path from 'node:path'
 import { EventEmitter } from 'node:events'
 import {
   HUB_RECONNECT_INTERVAL_MS,
+  HUB_RELAY_DELIVERED_BACKSTOP_MS,
   HUB_RELAY_TIMEOUT_MS,
   HubUnavailableError,
   RELAY_QUEUE_MAX,
@@ -254,6 +255,10 @@ export interface WorkerServerHandlers {
 export class WorkerServer {
   private server: net.Server | undefined
   private current: WorkerFrameChannel | undefined
+  /** Every accepted channel not yet closed — the current one, a retiring predecessor mid-swap, and any
+   *  connection still awaiting its `hello`. Tracked so `close()` can destroy EVERY socket, not just the
+   *  current one, and never leak an accepted-but-unpromoted connection (L4). */
+  private readonly channels = new Set<WorkerFrameChannel>()
   /** Highest `attachEpoch` promoted so far; a `hello` below this is refused (§2.3). */
   private currentEpoch = Number.NEGATIVE_INFINITY
   /** Pre-flip hold: the current channel is about to drop, so new sends queue instead of racing it (§8.4). */
@@ -347,12 +352,13 @@ export class WorkerServer {
     const entry: PendingRelay = { key, msg, resolve, reject, promise, timer: undefined }
     this.pendingRelays.set(key, entry)
     if (this.channelReady()) {
-      // Delivered to a live hub; await the reply (which may take up to the hub's own timeout — e.g. an
-      // approval waits on a human). No transient timer while delivered: the 45s bound governs REACHING a
-      // hub, not the reply latency (§8.3).
+      // Delivered to a live hub; await the reply. No reach-a-hub timer while delivered: the 45s bound governs
+      // REACHING a hub, not the reply latency — an approval legitimately waits on a human (§8.3). L6 arms a
+      // generous rpc-only backstop so a wedged hub that never replies still can't hang the tool forever.
       this.write(msg)
+      this.armDeliveredBackstop(entry)
     } else {
-      this.armTimer(entry)
+      this.armTimer(entry, HUB_RELAY_TIMEOUT_MS)
     }
     return promise
   }
@@ -365,7 +371,9 @@ export class WorkerServer {
   onHub(msg: HubToWorker): void {
     switch (msg.t) {
       case 'draining':
-        this.setDraining()
+        // on:false is the RELEASE — a rolled-back flip un-drains so the held relays flow again (§8.4, M2).
+        if (msg.on === false) this.release()
+        else this.setDraining()
         return
       case 'rpcResult':
       case 'approvalResolved':
@@ -400,7 +408,11 @@ export class WorkerServer {
       this.pendingRelays.delete(entry.key)
       entry.reject(new HubUnavailableError())
     }
-    this.current?.destroy()
+    // L4: destroy EVERY accepted channel — the current one, a retiring predecessor, and any connection still
+    // awaiting its hello — so a worker shutdown never leaks a socket. Each destroy() fires 'closed', which
+    // removes it from the set; snapshot first so we don't mutate the set mid-iteration.
+    for (const channel of [...this.channels]) channel.destroy()
+    this.channels.clear()
     this.current = undefined
     const server = this.server
     this.server = undefined
@@ -412,9 +424,13 @@ export class WorkerServer {
 
   private onConnection(socket: net.Socket): void {
     const channel = new WorkerFrameChannel(socket)
+    this.channels.add(channel) // L4: track from accept, before its hello — removed when it closes
     // A connection is not promoted until its `hello` clears the epoch guard.
     channel.on('message', (msg: unknown) => this.dispatch(msg as HubToWorker, channel))
-    channel.on('closed', () => this.onChannelClosed(channel))
+    channel.on('closed', () => {
+      this.channels.delete(channel)
+      this.onChannelClosed(channel)
+    })
     debug('hub connection opened (awaiting hello)')
   }
 
@@ -462,15 +478,33 @@ export class WorkerServer {
     this.detach()
   }
 
-  /** No live hub for now: re-arm the transient timer on every pending relay (they await a fresh attach). */
+  /**
+   * Un-drain (§8.4, the M2 correctness item): a rolled-back flip means blue stays live, so clear the
+   * pre-flip hold and resume delivering. If our channel is still current, flush the relays we held during
+   * the drain window straight back to it — WITHOUT this, a rollback would leave every held relay pending
+   * until it wrongly timed out to HubUnavailableError even though the hub never actually went away. If no
+   * channel is attached (blue's was displaced by a booted-then-dead green), the next hello's attach() does
+   * the flush instead; either way the held relays flow again rather than sitting stuck rejecting.
+   */
+  private release(): void {
+    this.draining = false
+    if (this.channelReady()) this.flushRelays()
+  }
+
+  /** No live hub for now: switch every pending relay to the reach-a-hub bound (dropping any delivered-rpc
+   *  backstop) — they await a fresh attach that will re-flush them. */
   private detach(): void {
-    for (const entry of this.pendingRelays.values()) this.armTimer(entry)
+    for (const entry of this.pendingRelays.values()) {
+      this.clearTimer(entry)
+      this.armTimer(entry, HUB_RELAY_TIMEOUT_MS)
+    }
   }
 
   private flushRelays(): void {
     for (const entry of this.pendingRelays.values()) {
       this.clearTimer(entry) // delivered to the fresh hub; stop counting against the reach-a-hub bound
       this.write(entry.msg)
+      this.armDeliveredBackstop(entry) // L6: a generous backstop on the re-delivered rpc
     }
   }
 
@@ -482,16 +516,29 @@ export class WorkerServer {
     entry.resolve(msg)
   }
 
-  private armTimer(entry: PendingRelay): void {
+  /**
+   * L6: arm a generous backstop on a DELIVERED relay so a wedged hub that accepts the frame but never replies
+   * can't hang the tool forever. Only rpc(bus/memory/practices) gets it — an approvalRequest legitimately
+   * blocks on a human up to the hub's own 10-min ApprovalService timeout (which always replies), so a
+   * backstop there would wrongly time out a slow-but-valid approval. The terminal shape is the same retryable
+   * HubUnavailableError, mapped to HUB_UNAVAILABLE_TEXT at the tool boundary (§8.3).
+   */
+  private armDeliveredBackstop(entry: PendingRelay): void {
+    if (entry.msg.t === 'rpc') this.armTimer(entry, HUB_RELAY_DELIVERED_BACKSTOP_MS)
+  }
+
+  private armTimer(entry: PendingRelay, ms: number): void {
     if (entry.timer) return
-    entry.timer = setTimeout(() => {
+    const timer = setTimeout(() => {
       // Identity guard: only settle if THIS entry still owns its slot. Coalescing means it always does,
       // but this keeps a stale timer from ever cross-evicting a live entry under future refactors.
       if (this.pendingRelays.get(entry.key) === entry) {
         this.pendingRelays.delete(entry.key)
         entry.reject(new HubUnavailableError())
       }
-    }, HUB_RELAY_TIMEOUT_MS)
+    }, ms)
+    timer.unref?.() // L8: a relay bound must never keep the (immortal) worker's event loop alive on its own
+    entry.timer = timer
   }
 
   private clearTimer(entry: PendingRelay): void {
@@ -557,7 +604,10 @@ export class WorkerClient extends EventEmitter {
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined
   private stopped = false
   private readonly pending = new Map<string, PendingCall>()
-  private readonly attachEpoch: number
+  // Mutable: normally fixed at construction, but the RELEASE path (signalDraining(false)) bumps it so a
+  // fresh hello can reclaim the channel from a displaced-then-dead green whose higher epoch would otherwise
+  // refuse blue's reconnect forever (§8.4, M2).
+  private attachEpoch: number
   private readonly dangerOf: () => DangerFlags
 
   constructor(
@@ -615,6 +665,7 @@ export class WorkerClient extends EventEmitter {
       const timer = setTimeout(() => {
         if (this.pending.delete(msg.reqId)) reject(new HubUnavailableError())
       }, HUB_RELAY_TIMEOUT_MS)
+      timer.unref?.() // L8: a pending command must not keep the hub's event loop alive on its own
       this.pending.set(msg.reqId, { resolve: resolve as (r: CommandReply) => void, reject, timer })
       this.rawSend(msg)
     })
@@ -626,9 +677,29 @@ export class WorkerClient extends EventEmitter {
     else debug(`dropping ${msg.t} — worker not attached`)
   }
 
-  /** Pre-flip signal (blue's `drain()`, §8.4): the worker holds relays before this socket drops. */
-  signalDraining(): void {
-    this.send({ t: 'draining' })
+  /**
+   * Pre-flip drain signal (`draining=true`, blue's `drain()`) and its RELEASE (`draining=false`, blue's
+   * `abort()` on a rolled-back flip), §8.4:
+   *   - DRAIN: the worker holds new relays before this socket drops, so a planned flip has zero failed
+   *     in-flight sends.
+   *   - RELEASE (the M2 correctness item): un-drain so the held relays flow again rather than sit until they
+   *     wrongly time out. If our channel is still current, an un-drain push clears the worker's hold + flushes
+   *     in place. If our channel was displaced (a booted-then-dead green replaced it and bumped the worker's
+   *     epoch past ours, so our plain reconnect would be refused forever), bump to a FRESH, higher epoch so
+   *     the next (already-scheduled) reconnect's hello reclaims the channel — whose attach() clears the hold
+   *     and flushes.
+   */
+  signalDraining(draining = true): void {
+    if (draining) {
+      this.send({ t: 'draining' })
+      return
+    }
+    if (this.isAttached()) {
+      this.rawSend({ t: 'draining', on: false })
+      return
+    }
+    this.attachEpoch = Math.max(this.attachEpoch + 1, Date.now())
+    this.connect() // idempotent; if a socket already exists the scheduled reconnect carries the fresh epoch
   }
 
   onEvent(cb: (msg: Extract<WorkerToHub, { t: 'event' }>) => void): void {
@@ -712,10 +783,12 @@ export class WorkerClient extends EventEmitter {
 
   private scheduleReconnect(): void {
     if (this.stopped || this.reconnectTimer) return
-    this.reconnectTimer = setTimeout(() => {
+    const timer = setTimeout(() => {
       this.reconnectTimer = undefined
       this.connect()
     }, HUB_RECONNECT_INTERVAL_MS)
+    timer.unref?.() // L8: the reconnect loop must not keep the hub's event loop alive on its own
+    this.reconnectTimer = timer
   }
 
   private clearReconnect(): void {

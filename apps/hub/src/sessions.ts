@@ -43,6 +43,12 @@ export interface TurnOverride {
   serviceTier?: string
 }
 
+// Turn-boundary-preferred flip (docs/agent-worker-impl.md §8.4): when a restart is requested mid-turn, hold
+// the signal until the roster goes idle — but no longer than this, after which we flip anyway (the turn
+// survives the flip regardless via re-attach). ~one turn, so an ordinary restart almost always lands cleanly
+// between turns without stalling a genuinely long turn indefinitely.
+export const RESTART_MAX_DEFER_MS = 120_000
+
 export class SessionManager {
   private readonly sessions = new Map<string, SessionRecord>()
   // Per-session set of memory ids already auto-recalled into context, so the same memory isn't
@@ -235,10 +241,12 @@ export class SessionManager {
       case 'turnCompleted':
         if (msg.vendorSessionId) this.persistVendorSessionIdById(msg.sessionId, msg.vendorSessionId)
         this.setStatusById(msg.sessionId, 'idle', replay)
+        if (!replay) this.maybeFireDeferredRestart() // a turn boundary (§8.4): flip a deferred restart if idle
         return
       case 'turnError':
         if (!replay) this.journal.append(msg.sessionId, 'session/error', { message: msg.message })
         this.setStatusById(msg.sessionId, 'error', replay)
+        if (!replay) this.maybeFireDeferredRestart() // a turn boundary (§8.4): flip a deferred restart if idle
         return
     }
   }
@@ -449,13 +457,62 @@ export class SessionManager {
   // Injected from index.ts under supervision: ask the hubctl supervisor to blue-green restart. Null
   // when unsupervised (standalone dev / a plain hub) — the restart tool/route then reports unavailable.
   private restartSignal: ((reason: string, bySession?: string) => void) | null = null
+  // A restart request deferred to the next turn boundary because a session was mid-turn (§8.4 optimization,
+  // WORKER MODE ONLY). Fired from applyLifecycle when the roster goes idle, or by the max-defer timer.
+  private deferredRestart: { reason: string; bySession?: string; timer: ReturnType<typeof setTimeout> } | null = null
   setRestartSignal(fn: (reason: string, bySession?: string) => void): void {
     this.restartSignal = fn
   }
+
+  /**
+   * Ask the supervisor to blue-green restart. Returns false only when unsupervised (no signal wired).
+   *
+   * TURN-BOUNDARY-PREFERRED FLIP (docs/agent-worker-impl.md §8.4, an OPTIMIZATION not a correctness gate —
+   * mid-turn re-attach already survives a flip). WORKER MODE ONLY: if any session is mid-turn, defer the
+   * signal to the next turnCompleted (or a ~2-min max-defer, after which we flip anyway) so the ordinary
+   * restart lands between turns and touches no live relay. All idle → signal immediately, exactly as today.
+   * FLAG-OFF is byte-identical: the in-process path never defers (no worker to survive the flip), so it
+   * signals immediately just as before.
+   */
   requestRestart(reason: string, bySession?: string): boolean {
     if (!this.restartSignal) return false
+    if (this.workerMode && this.anyTurnBusy()) {
+      this.deferRestart(reason, bySession)
+      return true
+    }
     this.restartSignal(reason, bySession)
     return true
+  }
+
+  /** True while any roster session has a live turn (the "prefer a turn boundary" test, §8.4). */
+  private anyTurnBusy(): boolean {
+    for (const id of this.sessions.keys()) if (this.executor.isBusy(id)) return true
+    return false
+  }
+
+  /** Hold a restart until the roster goes idle, bounded by a max-defer after which we flip regardless. Idempotent
+   *  while one is pending (a second request keeps the earlier deadline — a restart is already queued). */
+  private deferRestart(reason: string, bySession?: string): void {
+    if (this.deferredRestart) return
+    const timer = setTimeout(() => this.fireDeferredRestart(), RESTART_MAX_DEFER_MS)
+    timer.unref?.()
+    this.deferredRestart = { reason, bySession, timer }
+    this.journal.append(bySession ?? null, 'hub/restart-deferred', { reason, note: 'a session is mid-turn — flipping at the next turn boundary' })
+  }
+
+  /** Fire a deferred restart now (a turn boundary reached the idle roster, or the max-defer elapsed). */
+  private fireDeferredRestart(): void {
+    const pending = this.deferredRestart
+    if (!pending) return
+    clearTimeout(pending.timer)
+    this.deferredRestart = null
+    this.restartSignal?.(pending.reason, pending.bySession)
+  }
+
+  /** At a turn boundary (applyLifecycle turnCompleted/turnError), flip a deferred restart once the whole
+   *  roster is idle. WORKER MODE ONLY (applyLifecycle never runs in-process). */
+  private maybeFireDeferredRestart(): void {
+    if (this.deferredRestart && !this.anyTurnBusy()) this.fireDeferredRestart()
   }
 
   /** Add the default vendor homes to the profile map (id collisions with managed profiles lose). */

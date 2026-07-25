@@ -181,6 +181,10 @@ if (supervised && process.send) {
       usage.startPolling()
       registerMesh()
     },
+    // §8.4: drain() signals the worker to hold relays before blue's socket drops; abort() un-drains a
+    // rolled-back flip. No-op in-process (the in-process executor implements no signalDraining), so the
+    // flag-off restart path is byte-identical.
+    executor,
   })
   sessions.setRestartSignal((reason, bySession) => send({ type: 'restart-request', reason, bySession }))
   process.on('message', (msg: SupervisorMsg) => {

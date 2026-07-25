@@ -8,6 +8,7 @@
  */
 import type http from 'node:http'
 import type { Socket } from 'node:net'
+import type { Executor } from './executor.js'
 import type { Journal } from './journal.js'
 import type { SessionManager } from './sessions.js'
 
@@ -28,6 +29,11 @@ export interface RestartControllerDeps {
   publicPort: number //           the fixed public port (7777) — green promotes to it; blue re-claims it on rollback
   send: (msg: unknown) => void // process.send, bound
   onPromoted: () => void //       start deferred services (usage polling + mesh) once we own the port
+  // The execution seam (docs/agent-worker-impl.md §8.4). Only its `signalDraining?` is used here — to hold
+  // worker relays before blue's socket drops (drain) and un-drain a rolled-back flip (abort). WORKER-MODE
+  // ONLY: the in-process executor implements no signalDraining, so both calls are a no-op and the flag-off
+  // restart path is byte-identical.
+  executor: Executor
 }
 
 export class RestartController {
@@ -39,7 +45,11 @@ export class RestartController {
    * open forever; the clients auto-reconnect to green — then close the listener and signal `released`.
    */
   async drain(): Promise<void> {
-    const { server, journal, state, send } = this.deps
+    const { server, journal, state, send, executor } = this.deps
+    // FIRST, before we close anything: tell the worker we're draining so it HOLDS new relays (queues them
+    // without racing the about-to-die socket) — a planned flip then has zero failed in-flight sends; green's
+    // attach flushes them (§8.4). No-op in-process (no worker to drain), so flag-off is unchanged.
+    executor.signalDraining?.(true)
     state.draining = true
     journal.append(null, 'hub/draining', {})
     for (const s of state.sockets) {
@@ -111,8 +121,14 @@ export class RestartController {
    * drain, state.draining is false and we were never disturbed.
    */
   abort(error: string): void {
-    const { server, journal, state, publicPort } = this.deps
+    const { server, journal, state, publicPort, executor } = this.deps
     journal.append(null, 'hub/restart-aborted', { error })
+    // RELEASE the drain hold (the M2 correctness item, §8.4): green failed, blue is staying live, so un-drain
+    // the worker or every relay the live turn held during the drain window would sit until it wrongly timed
+    // out to HubUnavailableError even though the hub never went away. Unconditional + idempotent: it is a
+    // harmless no-op when the worker was never draining (green failed before blue's drain()), and the release
+    // when it was — so we always pair the drain with its release. No-op in-process (no worker).
+    executor.signalDraining?.(false)
     if (state.draining) {
       state.draining = false
       server.once('error', (e: NodeJS.ErrnoException) => console.error(`[hub] rollback re-listen failed: ${e.message}`))

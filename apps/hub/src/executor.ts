@@ -44,6 +44,15 @@ export interface Executor {
    * (docs/agent-worker-impl.md §4.4). Called from POST /api/config/danger on change.
    */
   pushDanger?(danger: DangerFlags): void
+  /**
+   * Pre-flip drain signal (`true`, from RestartController.drain) and its release (`false`, from
+   * RestartController.abort on a rolled-back flip), §8.4. WORKER-MODE ONLY: the worker holds new relays
+   * before blue's socket drops (zero failed in-flight sends), and the release un-drains so a rollback's held
+   * relays flow again instead of wrongly timing out (the M2 correctness item). The in-process executor drives
+   * turns in-hub with no socket to drain, so it never implements this — `executor.signalDraining?.(…)` is a
+   * no-op in-process, keeping the flag-off restart path byte-identical.
+   */
+  signalDraining?(draining: boolean): void
 }
 
 // The in-process agent tools (`mcp__allmyagents__*`) split by risk. SAFE tools are auto-allowed in

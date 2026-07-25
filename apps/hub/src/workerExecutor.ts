@@ -7,6 +7,20 @@ function errText(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
+/** The relay `rpc` methods that MUTATE durable state — a re-flushed one (same stable callId) must return the
+ *  first result instead of writing a second row (§8.2). Reads are naturally idempotent, so they are not
+ *  cached (a re-flushed read just re-runs and returns fresh data). Exactly the doc's list. */
+const WRITE_RELAY_METHODS = new Set<RelayMethod>(['memory.write', 'practices.write', 'bus.send'])
+/** How long a served write's result stays cached for a possible re-flush. Comfortably above the transient
+ *  bound (HUB_RELAY_TIMEOUT_MS = 45s, past which a relay is terminal and never re-flushed) so every legitimate
+ *  re-flush hits, while keeping the cache short-lived (§8.2). */
+const WRITE_CACHE_TTL_MS = 60_000
+/** Hard cap so a long-running hub can't grow the served-write cache without bound (evicts oldest-first). */
+const WRITE_CACHE_MAX = 1_000
+
+/** The body of an `rpcResult` (minus the wire envelope): a served relay's outcome, cacheable for dedup. */
+type RpcReplyBody = { ok: true; value: unknown } | { ok: false; error: string }
+
 /**
  * What a {@link WorkerExecutor} needs back from the hub (SessionManager). The worker holds no durable
  * state, so every side effect a turn used to run inline (docs/agent-worker-impl.md §4.1) is re-homed to
@@ -60,6 +74,11 @@ export class WorkerExecutor implements Executor {
   // Sessions the worker is currently driving a turn for, tracked from the lifecycle stream (authoritative)
   // plus an optimistic add on runTurn accept (a synchronous bridge until the worker's turnStarted lands).
   private readonly busySessions = new Set<string>()
+  // The successor's short-lived served-callId → write-result cache (§8.2). A re-flushed write relay (same
+  // stable callId, e.g. the socket dropped between our write and its reply) returns the FIRST result instead
+  // of executing a second time, so memory.write / practices.write / bus.send run exactly once across a flip.
+  // Keyed by the worker's stable rpc callId; bounded by size + TTL (short-lived, see the constants above).
+  private readonly servedWrites = new Map<string, { reply: Promise<RpcReplyBody>; at: number }>()
 
   constructor(
     private readonly client: WorkerClient,
@@ -184,17 +203,70 @@ export class WorkerExecutor implements Executor {
     this.client.send({ t: 'dangerUpdate', danger })
   }
 
-  /** Dispatch a worker `rpc` relay to the hub's real services and answer with the correlated `rpcResult`.
-   *  `runRelay` is synchronous today (the stores are sync) but awaited so a future async store still works. */
+  /**
+   * Pre-flip drain signal + its release (§8.4), forwarded to the worker over the WorkerClient. WORKER-MODE
+   * ONLY (the in-process executor has no socket to drain, so it never implements Executor.signalDraining).
+   * Called from RestartController.drain(true) / abort(false).
+   */
+  signalDraining(draining: boolean): void {
+    this.client.signalDraining(draining)
+  }
+
+  /**
+   * Dispatch a worker `rpc` relay to the hub's real services and answer with the correlated `rpcResult`.
+   * WRITE methods (§8.2) are served through a short-lived served-callId cache so a re-flushed write — same
+   * stable callId, e.g. the socket dropped between our write and its reply during a flip — returns the FIRST
+   * result instead of executing a second time (exactly-once). The cached promise also coalesces a re-flush
+   * that races the original still in-flight. `runRelay` is synchronous today (the stores are sync) but
+   * awaited so a future async store still works.
+   */
   private dispatchRpc(msg: Extract<WorkerToHub, { t: 'rpc' }>): void {
-    void (async (): Promise<void> => {
+    const reply = this.servedWrite(msg.callId) ?? this.serveRpc(msg)
+    void reply.then((body) => {
+      this.client.send(
+        body.ok
+          ? { t: 'rpcResult', callId: msg.callId, ok: true, value: body.value }
+          : { t: 'rpcResult', callId: msg.callId, ok: false, error: body.error }
+      )
+    })
+  }
+
+  /** A previously-served WRITE result for this stable callId, if still cached and fresh (§8.2) — else
+   *  undefined (a fresh call, an expired entry, or a read, which is never cached). */
+  private servedWrite(callId: string): Promise<RpcReplyBody> | undefined {
+    const hit = this.servedWrites.get(callId)
+    if (!hit) return undefined
+    if (Date.now() - hit.at > WRITE_CACHE_TTL_MS) {
+      this.servedWrites.delete(callId)
+      return undefined
+    }
+    return hit.reply
+  }
+
+  /** Run one relay against the hub's services, caching a WRITE's result for re-flush dedup (§8.2). */
+  private serveRpc(msg: Extract<WorkerToHub, { t: 'rpc' }>): Promise<RpcReplyBody> {
+    const reply = (async (): Promise<RpcReplyBody> => {
       try {
-        const value = await this.hub.runRelay(msg.method, msg.args)
-        this.client.send({ t: 'rpcResult', callId: msg.callId, ok: true, value })
+        return { ok: true, value: await this.hub.runRelay(msg.method, msg.args) }
       } catch (err) {
-        this.client.send({ t: 'rpcResult', callId: msg.callId, ok: false, error: errText(err) })
+        return { ok: false, error: errText(err) }
       }
     })()
+    if (WRITE_RELAY_METHODS.has(msg.method)) this.rememberWrite(msg.callId, reply)
+    return reply
+  }
+
+  /** Cache a served write for re-flush dedup, bounded by size + TTL. An ERRORED write did not persist, so it
+   *  is evicted on settle — a later re-flush then gets a fresh attempt (only a SUCCESS is the cached result). */
+  private rememberWrite(callId: string, reply: Promise<RpcReplyBody>): void {
+    this.servedWrites.set(callId, { reply, at: Date.now() })
+    void reply.then((body) => {
+      if (!body.ok) this.servedWrites.delete(callId)
+    })
+    if (this.servedWrites.size > WRITE_CACHE_MAX) {
+      const oldest = this.servedWrites.keys().next().value
+      if (oldest !== undefined) this.servedWrites.delete(oldest)
+    }
   }
 
   /** Dispatch a worker `approvalRequest` to the operator (via the idempotent approvals.request) and answer
