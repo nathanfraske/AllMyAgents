@@ -3,6 +3,14 @@
 Not-yet-built items surfaced during the agent-detachment / worker work. Ordered roughly by the order
 they came up; not a priority ranking.
 
+## Alpha release (post-worker milestone) → docs/alpha-release-plan.md
+
+After the always-on worker lands + is audited: package the full installable bundle as a real user would
+get it (Tauri installer, `%APPDATA%` app-data layout, first-run setup), **dev harnesses enabled for
+alpha**, and cut an initial **pre-release** GitHub alpha. Hard gate before any public artifact: ship
+**template** profiles — never the operator's real credentials — and resolve the P0 connector default.
+Full definition-of-parity, bundle scope, security gates, and sequence in `docs/alpha-release-plan.md`.
+
 ## Tooling gaps — from the T3Code + vendor-app research (docs/t3code-tooling-gaps.md, docs/vendor-app-tooling.md)
 
 AllMyAgents already LEADS on the deep agent tooling (bus, scoped memory, practices, hooks,
