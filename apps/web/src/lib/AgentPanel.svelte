@@ -2,11 +2,13 @@
   // Popout side panel: the sub-agents this chat has spawned, what each is doing, and how it ended.
   // Self-contained — it renders its own edge toggle and overlays the right side of ITS pane (so split
   // view gets one panel per pane). Reads only derived data (agentTree.ts) from the items it is given.
-  import { buildAgentRuns, summarizeRuns, latestActivity, type AgentTreeItem, type AgentRun } from './agentTree'
+  import { buildAgentRuns, summarizeRuns, latestActivity, type AgentRun } from './agentTree'
   import { loadOpenAgentPanels, saveOpenAgentPanels } from './uiState'
+  import type { ThreadItem } from './store.svelte'
+  import ItemCard from './ItemCard.svelte'
   import Icon from './Icon.svelte'
 
-  let { items, sessionId }: { items: AgentTreeItem[]; sessionId: string } = $props()
+  let { items, sessionId }: { items: ThreadItem[]; sessionId: string } = $props()
 
   // Popped-out state is remembered PER CHAT, so the panel is still open when you come back to this chat
   // after a reload or a hub restart (the runs themselves rebuild from journal history).
@@ -37,7 +39,7 @@
     return () => clearInterval(t)
   })
 
-  function dur(r: AgentRun): string {
+  function dur(r: AgentRun<ThreadItem>): string {
     const end = r.endedAt ? Date.parse(r.endedAt) : now
     const s = Math.max(0, Math.round((end - Date.parse(r.startedAt)) / 1000))
     if (!Number.isFinite(s)) return ''
@@ -45,7 +47,7 @@
   }
 
   /** One line describing the agent's most recent signal — the "what is it doing right now" answer. */
-  function nowDoing(r: AgentRun): string {
+  function nowDoing(r: AgentRun<ThreadItem>): string {
     const last = latestActivity(r)
     if (!last) return r.status === 'running' ? 'starting…' : 'no activity recorded'
     if (last.kind === 'tool') return `${last.toolName ?? 'tool'}`
@@ -88,12 +90,12 @@
             {#if expanded === r.id}
               <div class="detail">
                 {#if r.activity.length}
+                  <!-- Rendered with the SAME ItemCard the main transcript uses, so a sub-agent's tool
+                       calls, diffs, reasoning and messages read exactly as they would in a chat — just
+                       segregated into this panel instead of flooding the conversation. -->
                   <div class="acts">
-                    {#each r.activity.slice(-40) as a, i (i)}
-                      <div class="act">
-                        <span class="akind dim">{a.kind === 'tool' ? (a.toolName ?? 'tool') : a.kind}</span>
-                        {#if a.kind !== 'tool' && a.text}<span class="atext">{a.text.replace(/\s+/g, ' ').slice(0, 240)}</span>{/if}
-                      </div>
+                    {#each r.activity.slice(-120) as a (a.key)}
+                      <ItemCard item={a} />
                     {/each}
                   </div>
                 {:else}
@@ -146,9 +148,6 @@
   .doing { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .detail { margin-top: 0.45rem; border-top: 1px dashed var(--border); padding-top: 0.4rem; }
   .acts { display: flex; flex-direction: column; gap: 0.2rem; max-height: 40vh; overflow-y: auto; }
-  .act { display: flex; gap: 0.35rem; font-size: 0.72rem; }
-  .akind { flex: none; }
-  .atext { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .empty { font-size: 0.72rem; padding: 0.2rem 0; }
   .result { margin-top: 0.4rem; }
   .rlabel { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.04em; }

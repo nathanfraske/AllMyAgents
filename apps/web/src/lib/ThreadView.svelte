@@ -71,6 +71,8 @@
   // draft record, a real session's are persisted hub-side (setModel/setOption write through). One source
   // of truth means the pills always show what the next turn will actually use, for either vendor.
   const isDraft = $derived(!!view?.draft)
+  // The main transcript shows only the MAIN thread; sub-agent output lives in the agent panel.
+  const mainItems = $derived((view?.items ?? []).filter((i) => !i.agentId))
   const model = $derived(view?.record.model ?? '')
   const options = $derived<Record<string, string>>({
     ...(view?.record.effort ? { effort: view.record.effort } : {}),
@@ -447,7 +449,10 @@
   </div>
 
   <div class="stream scroll" bind:this={scroller} onscroll={onScroll}>
-    {#each view.items as item (item.key)}
+    <!-- Items produced INSIDE a spawned sub-agent are excluded here and rendered in the agent panel
+         instead: a background agent's tool spam would otherwise bury the conversation you are actually
+         having. `agentId` is set only for sub-agent output, so the main thread is unaffected. -->
+    {#each mainItems as item (item.key)}
       <ItemCard {item} />
     {/each}
     {#if view.items.length === 0 && !thinking}<div class="dim pad">{isDraft ? 'New chat — set the account, model and worktree below, then send your first message to start it.' : 'no activity yet — send a message below'}</div>{/if}

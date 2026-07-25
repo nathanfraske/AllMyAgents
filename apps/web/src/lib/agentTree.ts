@@ -33,7 +33,9 @@ export const SPAWN_TOOLS = new Set(['Agent', 'Task'])
 
 export type AgentStatus = 'running' | 'done' | 'failed'
 
-export interface AgentRun {
+/** Generic over the item type so a caller passing full ThreadItems gets ThreadItems back in `activity`
+ *  — that is what lets the panel render a sub-agent's output with the same ItemCard the main thread uses. */
+export interface AgentRun<T extends AgentTreeItem = AgentTreeItem> {
   /** The spawning tool_use id — also the `agentId` its own items carry. */
   id: string
   /** Human label for the run (the spawn's `description`, else its task description). */
@@ -47,7 +49,7 @@ export interface AgentRun {
   /** The agent's returned report (truncated by the transport, not here). */
   result?: string
   /** Everything the agent itself produced, in order. */
-  activity: AgentTreeItem[]
+  activity: T[]
   /** Tool calls the agent made — the cheapest "is it actually working" signal. */
   toolCount: number
   /** Set when this agent was spawned by ANOTHER agent, enabling real nesting. */
@@ -59,31 +61,67 @@ function str(v: unknown): string | undefined {
 }
 
 /**
+ * A BACKGROUND spawn's tool_result is a LAUNCH ACK ("Async agent launched successfully … agentId: …"),
+ * not the agent's report — it comes back within a second while the agent runs for minutes. Treating
+ * "has a result" as "finished" therefore marked every background agent done the instant it started, and
+ * froze its duration at ~0s. Detect the ack so those runs stay RUNNING until real completion.
+ */
+function launchAckId(result: string | undefined): string | undefined {
+  if (!result) return undefined
+  return /agentId[":\s]+([a-z0-9]{6,})/i.exec(result)?.[1]
+}
+
+/**
+ * Completion for a background agent arrives later as a task notification naming its agentId. Scan the
+ * transcript for one so a finished background run stops reading as running.
+ */
+function backgroundOutcome(items: readonly AgentTreeItem[], agentId: string): { done: boolean; failed: boolean; ts?: string } {
+  for (const it of items) {
+    const text = it.text ?? it.toolResult ?? ''
+    if (!text.includes(agentId)) continue
+    if (/task-notification|status>|completed|finished|stopped/i.test(text)) {
+      return { done: true, failed: /\bstopped\b|\berror\b|\bfailed\b/i.test(text), ts: it.ts }
+    }
+  }
+  return { done: false, failed: false }
+}
+
+/**
  * Build every agent run in this chat, in spawn order. Runs with no matching activity still appear (an
  * agent that has not emitted anything yet is exactly what you want to SEE — it is the "is it stuck?"
  * case), so presence in this list is driven by the spawn call, never by whether output arrived.
  */
-export function buildAgentRuns(items: readonly AgentTreeItem[]): AgentRun[] {
-  const runs: AgentRun[] = []
-  const byId = new Map<string, AgentRun>()
+export function buildAgentRuns<T extends AgentTreeItem>(items: readonly T[]): AgentRun<T>[] {
+  const runs: AgentRun<T>[] = []
+  const byId = new Map<string, AgentRun<T>>()
 
   for (const it of items) {
     if (it.kind !== 'tool' || !it.toolName || !SPAWN_TOOLS.has(it.toolName) || !it.toolUseId) continue
     const input = (it.toolInput ?? {}) as { description?: unknown; subagent_type?: unknown; run_in_background?: unknown }
-    const run: AgentRun = {
+    const run: AgentRun<T> = {
       id: it.toolUseId,
       description: str(input.description) ?? str(it.taskDescription) ?? 'agent',
       subagentType: str(input.subagent_type),
       background: input.run_in_background === true,
       startedAt: it.ts,
       endedAt: it.toolResultTs,
-      // A run is RUNNING until its tool_result lands; the result's error flag decides done vs failed.
+      // A foreground run is RUNNING until its tool_result lands; the error flag decides done vs failed.
       status: it.toolResult === undefined ? 'running' : it.toolError ? 'failed' : 'done',
       result: it.toolResult,
       activity: [],
       toolCount: 0,
       // If the spawn call itself happened inside another agent, this run is nested under it.
       parentId: it.agentId,
+    }
+    // Background: the result is only an ACK, so ignore it as a completion signal and look for the real
+    // outcome later in the transcript. Until that arrives the run is genuinely still going — which is
+    // also what keeps its elapsed timer ticking instead of freezing at the ack.
+    const ackId = run.background ? launchAckId(it.toolResult) : undefined
+    if (ackId) {
+      const outcome = backgroundOutcome(items, ackId)
+      run.status = outcome.done ? (outcome.failed ? 'failed' : 'done') : 'running'
+      run.endedAt = outcome.done ? outcome.ts : undefined
+      run.result = outcome.done ? it.toolResult : undefined // the ack is not a report; don't show it as one
     }
     runs.push(run)
     byId.set(run.id, run)
@@ -114,6 +152,6 @@ export function summarizeRuns(runs: readonly AgentRun[]): { running: number; don
 }
 
 /** The agent's most recent signal, for a one-line "what is it doing now" in the panel. */
-export function latestActivity(run: AgentRun): AgentTreeItem | undefined {
+export function latestActivity<T extends AgentTreeItem>(run: AgentRun<T>): T | undefined {
   return run.activity.length ? run.activity[run.activity.length - 1] : undefined
 }
