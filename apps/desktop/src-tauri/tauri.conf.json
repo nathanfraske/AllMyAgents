@@ -46,10 +46,18 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "createUpdaterArtifacts": false,
+    "createUpdaterArtifacts": true,
     "windows": {
       "nsis": {
         "installMode": "currentUser"
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "10.15",
+      "dmg": {
+        "windowSize": { "width": 660, "height": 400 },
+        "appPosition": { "x": 180, "y": 170 },
+        "applicationFolderPosition": { "x": 480, "y": 170 }
       }
     }
   },
@@ -58,7 +66,7 @@
       "endpoints": [
         "https://github.com/nathanfraske/AllMyAgents/releases/latest/download/latest.json"
       ],
-      "pubkey": "PASTE_TAURI_MINISIGN_PUBLIC_KEY_HERE",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYyMzI1RUNFOUJCNThCMTAKUldRUWk3V2J6bDR5OHErOEZISjVDZkc3djQ1ZlRTRWQ5NXhSZU83UVBXL1VSRmgrTlJVd2pyTDQK",
       "windows": {
         "installMode": "passive"
       }

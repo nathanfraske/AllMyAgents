@@ -243,7 +243,7 @@
         {#if loginState !== 'idle'}
           <p class="status {loginState}">{loginMsg}</p>
         {/if}
-        <p class="hint dim">One click opens a terminal + browser to sign in (Windows). On other platforms, run this manually then Rescan:</p>
+        <p class="hint dim">One click opens a terminal + browser to sign in (Windows and macOS). On other platforms, run this manually then Rescan:</p>
         <code class="cmd">{loginCmd}</code>
         <button class="btn" onclick={rescan} disabled={rescanning}>{rescanning ? 'rescanning…' : 'Rescan accounts'}</button>
       </div>

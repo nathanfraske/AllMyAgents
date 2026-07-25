@@ -288,11 +288,16 @@ export class CodexClient {
   stop(): void {
     const child = this.child
     if (!child) return
-    // The app-server is spawned via a shell (shell:true), so on Windows `child` is the cmd.exe
-    // wrapper and killing it orphans the real `codex app-server` grandchild — Windows has no
-    // job-object kill-on-parent-death. `taskkill /T /F` terminates the whole tree by PID (the same
-    // approach the desktop shell's kill_hub uses); POSIX gets a direct kill. Best-effort: fall back
-    // to child.kill() if taskkill can't be spawned, and never throw out of a shutdown path.
+    // Windows has no kill-on-parent-death, so killing `child` alone orphans everything under it —
+    // the codex app-server's own children (MCP servers, exec'd tools), plus the cmd.exe→app-server
+    // grandchild in the legacy `shell:true` fallback path above. `taskkill /T /F` terminates the whole
+    // tree by PID (the same approach the desktop shell's kill_hub uses). Best-effort: fall back to
+    // child.kill() if taskkill can't be spawned, and never throw out of a shutdown path.
+    //
+    // POSIX (macOS/Linux) gets a direct kill, deliberately: `child` shares the HUB's process group, so
+    // hubctl's group-kill (killTree in hubctl.ts) sweeps it and all of its descendants on teardown.
+    // Giving it its OWN group here would make a single-session stop() tidier but would remove it from
+    // that sweep — the leak on quit is far worse than the one on session close.
     if (process.platform === 'win32' && child.pid !== undefined) {
       try {
         spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'])

@@ -104,6 +104,13 @@ function spawnHub(port: number, color: HubColor): HubHandle {
   const { cmd, args } = hubLaunchCommand()
   const child = spawn(cmd, args, {
     stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+    // POSIX (macOS/Linux): run each hub as its OWN process-group leader so killTree can signal the
+    // whole group — the hub AND every vendor descendant it spawned (codex app-server, MCP servers) —
+    // in one shot. That is the direct analog of Windows `taskkill /T /F`, which POSIX has no
+    // equivalent of otherwise. NOT set on win32, where `detached` would pop a new console window and
+    // the PID-tree kill already covers descendants. `detached` is orthogonal to the `ipc` stdio slot,
+    // so the blue-green restart handshake is unaffected.
+    detached: process.platform !== 'win32',
     // Worker mode (opt-in) injects HUB_WORKER_SOCKET so blue AND green connect to the same worker; when
     // disabled the spread adds nothing, so the env is byte-identical to today (docs/agent-worker-impl.md §5.1).
     env: { ...process.env, HUB_PORT: String(port), HUB_SUPERVISED: '1', ...(workerSocket ? { HUB_WORKER_SOCKET: workerSocket } : {}) },
@@ -151,6 +158,9 @@ function spawnWorker(): void {
   const { cmd, args } = workerLaunchCommand()
   const child = spawn(cmd, args, {
     stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+    // Same POSIX process-group reasoning as spawnHub: the worker owns the agent SDK subprocesses, so
+    // it must be group-killable as a unit on teardown. No-op on win32 (taskkill /T handles the tree).
+    detached: process.platform !== 'win32',
     env: { ...process.env, HUB_WORKER_SOCKET: workerSocket },
   })
   workerHandle = child
@@ -199,10 +209,19 @@ function killTree(child: ChildProcess): void {
       }
     }
   } else {
+    // POSIX (macOS/Linux): the child was spawned `detached`, so it LEADS a process group whose id
+    // equals its pid. Signalling a NEGATIVE pid targets that whole group, so the hub/worker and every
+    // descendant that inherited the group (codex app-server, MCP servers, in-flight node) die
+    // together — the POSIX equivalent of `taskkill /T /F`. Fall back to a plain kill if the group
+    // send fails (ESRCH, or a child that somehow never became a leader).
     try {
-      child.kill('SIGKILL')
+      process.kill(-pid, 'SIGKILL')
     } catch {
-      /* best-effort */
+      try {
+        child.kill('SIGKILL')
+      } catch {
+        /* best-effort */
+      }
     }
   }
 }

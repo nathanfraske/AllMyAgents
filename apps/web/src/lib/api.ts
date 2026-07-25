@@ -368,6 +368,9 @@ export const api = {
   compact: (id: string) => jpost<CompactResult>(`/api/sessions/${id}/compact`),
   interrupt: (id: string) => jpost(`/api/sessions/${id}/interrupt`),
   stop: (id: string) => jpost(`/api/sessions/${id}/stop`),
+  // The inverse of stop(): revive a stopped/errored chat to idle so it's usable again (composer frees,
+  // bus-reachable). Fixes stop() being a permanent one-way brick.
+  reopen: (id: string) => jpost<{ ok?: boolean; status?: string; error?: string }>(`/api/sessions/${id}/reopen`),
   deleteSession: (id: string) => jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/delete`),
   setMode: (id: string, permissionMode: string) => jpost(`/api/sessions/${id}/mode`, { permissionMode }),
   /** Persist a per-chat model / thinking effort / service tier immediately (survives reload + restart). */

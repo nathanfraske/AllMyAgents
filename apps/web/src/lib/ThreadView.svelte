@@ -82,6 +82,10 @@
     view ? (findModel(model) ?? defaultModelFor(view.record.provider)) : undefined
   )
   const active = $derived(view?.record.status === 'active' || view?.record.status === 'starting')
+  // A stopped chat is otherwise a dead end — stop() had no inverse, so the composer bounced every send
+  // off the hub's 'stopped' guard forever. Surface a Reopen affordance instead of interrupt/stop so the
+  // operator can revive it in one click (api.reopen → hub setStatus idle → journaled status un-sticks it).
+  const stopped = $derived(view?.record.status === 'stopped')
   // Worktree intent: for a draft there is no real worktree path yet, so read the pre-spawn flag.
   const worktreeOn = $derived(view?.draft ? !!view.draftUseWorktree : !!view?.record.worktree)
   // Draft-only inline permission picker (the real PermissionPicker posts to the hub, which a draft
@@ -544,8 +548,12 @@
         {/if}
         <span class="spacer"></span>
         {#if !isDraft}
-          <button class="foot-act" onclick={stop} disabled={!active} title="interrupt current turn">interrupt</button>
-          <button class="foot-act" onclick={() => api.stop(view.record.id)} title="stop session">stop</button>
+          {#if stopped}
+            <button class="foot-act" onclick={() => api.reopen(view.record.id)} title="reopen this stopped chat so you can use it again">reopen</button>
+          {:else}
+            <button class="foot-act" onclick={stop} disabled={!active} title="interrupt current turn">interrupt</button>
+            <button class="foot-act" onclick={() => api.stop(view.record.id)} title="stop session">stop</button>
+          {/if}
         {/if}
         <button class="send-btn" class:queue={active} title={isDraft ? 'start this chat' : steerable ? 'steer into the running turn' : active ? 'queue message' : 'send'} onclick={send} disabled={!text.trim()}><Icon name={steerable ? 'corner-down-right' : active ? 'timer' : 'arrow-up'} size={16} /></button>
       </div>

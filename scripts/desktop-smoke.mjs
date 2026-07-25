@@ -45,17 +45,27 @@ const REPO_ROOT = join(__dirname, '..')
 const HUB_HOST = '127.0.0.1'
 const HUB_PORT = 7777
 
-// Windows-only path today (this is a Windows-first project). On other platforms Tauri emits a
-// differently-named binary with no .exe suffix; branch here if/when we smoke-test elsewhere.
-const EXE_PATH = join(
-  REPO_ROOT,
-  'apps',
-  'desktop',
-  'src-tauri',
-  'target',
-  'release',
-  'cec-aimesh-desktop.exe'
-)
+// Where `tauri build` leaves something launchable. The candidates differ by OS, so we take the first
+// that exists rather than hardcoding one:
+//   Windows — target/release/<crate>.exe (crate name from Cargo.toml, NOT the productName).
+//   macOS   — prefer the .app bundle's inner binary (named after `productName`), because that is what
+//             a user actually runs and it is the only form where Tauri resolves `resource_dir()` to
+//             Contents/Resources — i.e. where the bundled hub payload lives. The bare
+//             target/release/<crate> binary is the fallback for an unbundled `cargo build --release`.
+//   Linux   — the bare binary (no bundle indirection).
+const TARGET_RELEASE = join(REPO_ROOT, 'apps', 'desktop', 'src-tauri', 'target', 'release')
+const CRATE_BIN = 'allmyagents-desktop' // [package].name in apps/desktop/src-tauri/Cargo.toml
+const PRODUCT = 'AllMyAgents' // productName in tauri.conf.json
+const EXE_CANDIDATES =
+  process.platform === 'win32'
+    ? [join(TARGET_RELEASE, `${CRATE_BIN}.exe`), join(TARGET_RELEASE, `${PRODUCT}.exe`)]
+    : process.platform === 'darwin'
+      ? [
+          join(TARGET_RELEASE, 'bundle', 'macos', `${PRODUCT}.app`, 'Contents', 'MacOS', PRODUCT),
+          join(TARGET_RELEASE, CRATE_BIN),
+        ]
+      : [join(TARGET_RELEASE, CRATE_BIN)]
+const EXE_PATH = EXE_CANDIDATES.find((p) => existsSync(p)) ?? EXE_CANDIDATES[0]
 
 const STAY_ALIVE_MS = 10_000 // how long the process must survive to count as "not a crash"
 const ALIVE_POLL_MS = 500
@@ -131,7 +141,10 @@ async function main() {
 
   // 1) binary present?
   if (!existsSync(EXE_PATH)) {
-    fail(`release binary not found at ${EXE_PATH}. Build it first: pnpm desktop:build`)
+    fail(
+      `release binary not found. Build it first: pnpm desktop:build\n` +
+        `  looked for:\n${EXE_CANDIDATES.map((p) => `    • ${p}`).join('\n')}`
+    )
     return
   }
   console.log('[smoke] release binary found.')

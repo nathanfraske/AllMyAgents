@@ -78,12 +78,26 @@ for (let i = 0; i < 120; i++) {
   await sleep(500)
 }
 const text = (() => { try { return fs.readFileSync(log, 'utf8') } catch { return '' } })()
-const pipes = (() => { try { return fs.readdirSync('\\\\.\\pipe\\') } catch { return [] } })()
+
+// Is the worker endpoint actually up? The endpoint SHAPE is platform-specific (workerTransport.ts
+// `defaultWorkerSocket`): a Windows named pipe, which is listed out of the `\\.\pipe\` namespace, vs.
+// a POSIX unix-domain socket, which is an ordinary file under the data dir. Check the right one — on
+// macOS the pipe listing simply throws, which would have silently failed this check forever.
+const workerEndpointUp = (() => {
+  if (process.platform === 'win32') {
+    try {
+      return fs.readdirSync('\\\\.\\pipe\\').some((p) => String(p).includes('allmyagents-worker'))
+    } catch { return false }
+  }
+  try {
+    return fs.statSync(path.join(tmp, 'worker.sock')).isSocket()
+  } catch { return false }
+})()
 
 const checks = {
   hubBooted: health?.boot === 'complete',
   workerSpawned: /spawning agent worker/.test(text),
-  workerPipeUp: pipes.some((p) => String(p).includes('allmyagents-worker')),
+  workerPipeUp: workerEndpointUp,
   restoredRoster: typeof health?.restoredSessions === 'number' && health.restoredSessions > 0,
   // The health-port fix: blue binds the fixed port directly, so this must be the real port, never 0.
   healthPortCorrect: health?.port === PORT,
@@ -93,8 +107,19 @@ console.log('health:', JSON.stringify(health))
 console.log('checks:', JSON.stringify(checks, null, 1))
 if (liveSessions) console.log(`restored ${health?.restoredSessions} of the live roster's ${liveSessions} sessions`)
 
-try { if (child.pid) spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F']) } catch { /* ignore */ }
-await sleep(1200) // let the worker pipe close before anything else claims it
+// Tear the rehearsal tree down. Windows: `taskkill /T /F` walks the PID tree. POSIX: hubctl was NOT
+// spawned detached, so it is not a group leader here — SIGTERM it instead and let its own signal
+// handler group-kill the hubs + worker it spawned (hubctl.ts `teardown`), then SIGKILL as a backstop.
+if (child.pid) {
+  if (process.platform === 'win32') {
+    try { spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F']) } catch { /* ignore */ }
+  } else {
+    try { child.kill('SIGTERM') } catch { /* ignore */ }
+    await sleep(1500)
+    try { child.kill('SIGKILL') } catch { /* ignore */ }
+  }
+}
+await sleep(1200) // let the worker endpoint close before anything else claims it
 
 const bad = Object.entries(checks).filter(([, v]) => !v).map(([k]) => k)
 if (bad.length) {

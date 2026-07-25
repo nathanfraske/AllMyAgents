@@ -266,4 +266,30 @@ describe('defaultWorkerSocket', () => {
     if (process.platform === 'win32') expect(got).toBe('\\\\.\\pipe\\allmyagents-worker')
     else expect(got).toBe('/data/worker.sock')
   })
+
+  // macOS/BSD cap `sockaddr_un.sun_path` at 104 bytes and bind() fails with an opaque ENAMETOOLONG
+  // past it. An installed macOS build's data dir (~/Library/Application Support/AllMyAgents/data) is
+  // long enough that a deep home or checkout can cross the line, so the endpoint must degrade to a
+  // short temp path instead of producing a worker nobody can connect to. Windows named pipes have no
+  // such limit, so the guard is POSIX-only.
+  it('degrades to a short temp path when the data dir would overflow the unix socket limit', () => {
+    delete process.env.HUB_WORKER_SOCKET
+    const deep = `/${'nested-directory'.repeat(12)}/data` // comfortably over 104 bytes
+    const got = defaultWorkerSocket(deep)
+    if (process.platform === 'win32') {
+      expect(got).toBe('\\\\.\\pipe\\allmyagents-worker')
+    } else {
+      expect(got).not.toContain(deep)
+      expect(Buffer.byteLength(got)).toBeLessThan(104)
+      expect(got).toMatch(/ama-worker-\d+\.sock$/)
+    }
+  })
+
+  // Both sides (hubctl injecting HUB_WORKER_SOCKET, and any process recomputing it) must land on the
+  // SAME endpoint, so the fallback has to be deterministic — never randomised per call.
+  it('is deterministic for the same input', () => {
+    delete process.env.HUB_WORKER_SOCKET
+    const deep = `/${'nested-directory'.repeat(12)}/data`
+    expect(defaultWorkerSocket(deep)).toBe(defaultWorkerSocket(deep))
+  })
 })

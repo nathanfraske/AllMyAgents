@@ -1,8 +1,10 @@
-# Release — build + sign the desktop installers for Windows and macOS on a version tag, generate the
-# Tauri v2 updater artifacts + latest.json, and attach everything to a GitHub PRE-release.
+name: Release
+
+# Build + sign the desktop installers for Windows and macOS on a version tag, generate the Tauri v2
+# updater artifacts + latest.json, and attach everything to a GitHub PRE-release.
 #
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
-#  ONE-TIME SETUP BEFORE THE FIRST RELEASE (the updater signing keypair — a key, not a server):
+#  ⚠️ OPERATOR SETUP #1 — the UPDATER signing keypair (required; a key, not a server)
 #
 #  1. Generate a minisign keypair with the Tauri CLI (run once, locally, keep the private key secret):
 #
@@ -10,7 +12,7 @@
 #       (or:  npx @tauri-apps/cli signer generate -w ./ama-updater.key )
 #
 #     It prints a PUBLIC KEY and writes the PRIVATE KEY to ./ama-updater.key (protected by the
-#     password you choose). NEVER commit either file.
+#     password you choose). NEVER commit either file — move both out of the repo immediately.
 #
 #  2. Paste the PUBLIC KEY into apps/desktop/src-tauri/tauri.conf.json → plugins.updater.pubkey
 #     (replacing the PASTE_TAURI_MINISIGN_PUBLIC_KEY_HERE placeholder) AND flip
@@ -25,16 +27,59 @@
 #  3. Add two GitHub Actions repository secrets (Settings → Secrets and variables → Actions):
 #         TAURI_SIGNING_PRIVATE_KEY           = the full contents of ama-updater.key
 #         TAURI_SIGNING_PRIVATE_KEY_PASSWORD  = the password you set in step 1 (empty string if none)
-#     These are the CI secret PLACEHOLDERS referenced below — this workflow does not contain a key.
+#     These are the CI secret PLACEHOLDERS referenced below — this workflow contains no key.
 #
-#  After that, pushing a tag like `v0.1.0-alpha.1` cuts the release; alpha.2+ then auto-update.
+#  Losing the private key means no existing install can ever be updated again. Back it up.
 #
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+#  ⚠️ OPERATOR SETUP #2 — macOS CODE SIGNING + NOTARIZATION (optional; needed for a clean install)
+#
+#  Without this the .app/.dmg is UNSIGNED: Gatekeeper quarantines it and the user must right-click →
+#  Open (or `xattr -dr com.apple.quarantine /Applications/AllMyAgents.app`) on first launch. The
+#  build below still succeeds — every APPLE_* env var is read from a secret that is simply empty
+#  until the operator sets it, and both tauri-action and `tauri build` skip signing when they are.
+#
+#  It requires a paid Apple Developer Program membership ($99/yr) — an operator purchase decision.
+#  Once you have one:
+#
+#  a. Create a "Developer ID Application" certificate in the Apple Developer portal, download it,
+#     and export it from Keychain Access as a .p12 with a password. Then base64 it:
+#         base64 -i DeveloperIDApplication.p12 | pbcopy
+#     Repository secrets:
+#         APPLE_CERTIFICATE           = that base64 blob
+#         APPLE_CERTIFICATE_PASSWORD  = the .p12 export password
+#         KEYCHAIN_PASSWORD           = any random string (a throwaway CI keychain password)
+#         APPLE_SIGNING_IDENTITY      = "Developer ID Application: <YOUR NAME> (<TEAMID>)"
+#                                       — exactly as `security find-identity -v -p codesigning` prints it
+#
+#  b. For NOTARIZATION (what actually silences Gatekeeper), create an app-specific password at
+#     appleid.apple.com → Sign-In and Security → App-Specific Passwords. Repository secrets:
+#         APPLE_ID       = your Apple ID email
+#         APPLE_PASSWORD = that app-specific password (NOT your Apple ID password)
+#         APPLE_TEAM_ID  = your 10-character team id (Apple Developer → Membership)
+#
+#  c. Set "signingIdentity" in apps/desktop/src-tauri/tauri.conf.json → bundle.macOS to the same
+#     string as APPLE_SIGNING_IDENTITY, or leave it unset and rely on the env var alone.
+#
+#  d. NOTE — the installer embeds a Node binary (scripts/bundle-hub.mjs stages it as a Tauri
+#     resource). A signed .app must have every embedded Mach-O signed too, and hardened runtime +
+#     notarization may need entitlements for it. If notarization rejects the bundle over the
+#     embedded `node`, add an entitlements plist (com.apple.security.cs.allow-jit and
+#     com.apple.security.cs.allow-unsigned-executable-memory are the usual pair for a JS runtime)
+#     and point bundle.macOS.entitlements at it. This has NOT been exercised — see the "Known gaps"
+#     section of docs/alpha-cut-checklist.md.
+#
+#  ⚠️ Windows Authenticode signing is a separate, also-unset decision: without it SmartScreen warns
+#     on first run. Tauri reads WINDOWS_CERTIFICATE / WINDOWS_CERTIFICATE_PASSWORD the same way.
+#
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
 #  NOTE on the updater endpoint: tauri.conf.json points at
 #    .../releases/latest/download/latest.json
 #  GitHub's `/releases/latest` resolves to the newest NON-prerelease. While every alpha is a
 #  pre-release there is no "latest" for it to resolve to, so either (a) promote one release out of
 #  pre-release, or (b) temporarily point the endpoint at the per-tag URL
 #  .../releases/download/<tag>/latest.json until a stable release exists.
+#  See docs/alpha-cut-checklist.md step 9.
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -46,18 +91,29 @@ on:
 permissions:
   contents: write
 
+# A re-pushed tag should not race a run already publishing to the same release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     name: build (${{ matrix.platform }})
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        # The task's two release runners. Each builds for its own host arch, which is important here:
-        # scripts/bundle-hub.mjs ships the *runner's* Node binary as a sidecar, so the app arch and the
-        # bundled Node arch must match. macos-latest is Apple Silicon (arm64); an Intel-Mac (x86_64)
-        # build would need an added macos-13 matrix entry — a follow-up, not wired here.
+        # The two release runners. Each builds for its OWN host arch, and that is load-bearing:
+        # scripts/bundle-hub.mjs ships the RUNNER'S Node binary inside the app, so the app arch and
+        # the bundled Node arch must match. That is also why we do NOT build a universal macOS binary
+        # (`--target universal-apple-darwin`) — the app would be universal but carry an arm64-only
+        # Node, and Rosetta would not save it.
+        #
+        # macos-latest is Apple Silicon (arm64) only, so there is currently NO Intel build. To add
+        # one, append `macos-13` (the last x86_64 image) to this list — everything else in the job is
+        # already arch-agnostic and tauri-action will attach both DMGs to the same release.
         platform: [macos-latest, windows-latest]
-    runs-on: ${{ matrix.platform }}
 
     steps:
       - name: Checkout
@@ -92,17 +148,45 @@ jobs:
       - name: Credential-firewall self-test
         run: pnpm run bundle:audit
 
+      # A release whose installers carry no updater artifacts cannot ever auto-update the fleet, and
+      # that is silent otherwise — you only find out when alpha.2 never reaches anyone. Warn loudly
+      # (not fatal: an operator may deliberately cut an unsigned smoke-test build).
+      - name: Warn if the updater signing key is missing
+        shell: bash
+        env:
+          HAS_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+        run: |
+          if [ "$HAS_KEY" != "true" ]; then
+            echo "::warning title=No updater signing key::TAURI_SIGNING_PRIVATE_KEY is not set. This release will ship installers with NO signed updater artifacts and NO latest.json, so no installed build can auto-update from it. See the OPERATOR SETUP #1 header in .github/workflows/release.yml."
+          fi
+
       # tauri-action runs `tauri build` in apps/desktop: builds the installers (Windows .msi + NSIS,
-      # macOS .app + .dmg via the config's `targets: "all"`), and because bundle.createUpdaterArtifacts
-      # is true + the signing key is present, it also emits the SIGNED updater artifacts and (with
-      # includeUpdaterJson) the latest.json manifest — all uploaded to a GitHub pre-release.
+      # macOS .app + .dmg — tauri.conf.json's `targets` list is filtered per host OS), and, once
+      # bundle.createUpdaterArtifacts is true and the signing key is present, also emits the SIGNED
+      # updater artifacts and (with includeUpdaterJson) the latest.json manifest — all uploaded to a
+      # GitHub pre-release.
       - name: Build, sign, and publish (tauri-action)
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Updater signing key — supplied by the repo secrets from the ONE-TIME SETUP above.
+          # --- Updater signing (OPERATOR SETUP #1) -------------------------------------------------
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # --- macOS code signing + notarization (OPERATOR SETUP #2) -------------------------------
+          # Every one of these is an EMPTY string until the operator adds the secret, and both
+          # tauri-action and `tauri build` treat empty as "skip signing / skip notarization", so the
+          # macOS build succeeds unsigned today and becomes signed + notarized the moment they exist.
+          # No key or identity is committed here.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # --- Windows Authenticode (also optional, also empty until set) --------------------------
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         with:
           projectPath: apps/desktop
           tagName: ${{ github.ref_name }}
@@ -110,7 +194,14 @@ jobs:
           releaseBody: |
             AllMyAgents ${{ github.ref_name }} — alpha pre-release.
 
-            Prerequisites: a dev toolchain (Node + the Codex CLI) must be present; see the README.
+            Prerequisites: a working internet connection on FIRST run (the app fetches its runtime
+            dependencies and the vendor CLIs from npm then). See the README.
+
             Installers below; alpha.2+ auto-update via the bundled Tauri updater.
+
+            macOS: this build is not notarized. Gatekeeper will block the first launch — right-click
+            the app and choose Open, or run
+            `xattr -dr com.apple.quarantine /Applications/AllMyAgents.app`.
+            Windows: SmartScreen will warn on first run (no Authenticode certificate yet).
           prerelease: true
           includeUpdaterJson: true

@@ -32,3 +32,10 @@ serde_json = "1"
 # and every call site is behind `#[cfg(desktop)]`.
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2"
+
+# POSIX process-group teardown of the hub tree — `kill(-pgid, SIGTERM/SIGKILL)` in
+# `kill_hub`, the macOS/Linux stand-in for Windows' `taskkill /T /F`. libc is
+# already in the dependency graph via tauri; naming it directly just exposes
+# `kill`/`SIG*` on unix targets. Target-gated, so a Windows build never sees it.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

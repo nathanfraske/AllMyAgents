@@ -343,18 +343,53 @@ const staged = {
 fs.writeFileSync(path.join(outHub, 'package.json'), `${JSON.stringify(staged, null, 2)}\n`)
 
 // 6. Ship the Node runtime (MIT) + npm, so the first-run install has everything
-//    it needs with zero system prerequisites. npm lives next to node.exe in the
-//    official distribution.
+//    it needs with zero system prerequisites.
+//
+//    WHERE npm LIVES DIFFERS BY PLATFORM, and getting this wrong is a hard build
+//    failure on macOS:
+//      Windows  <prefix>\node.exe          + <prefix>\node_modules\npm
+//      macOS    <prefix>/bin/node          + <prefix>/lib/node_modules/npm
+//      Linux    same as macOS
+//    (Homebrew, nvm, fnm, asdf and the official .pkg all follow the POSIX
+//    bin/ + lib/node_modules/ layout.) We search the known locations rather than
+//    assuming one, and STAGE into the single Windows-shaped layout
+//    `node/node_modules/npm` on every platform — that is the layout the desktop
+//    shell hardcodes (`bundled_node_dir()/node_modules/npm/bin/npm-cli.js` in
+//    apps/desktop/src-tauri/src/lib.rs) and the one the credential allowlist
+//    matches, so the payload is platform-identical even though the source isn't.
 const nodeSrcDir = path.dirname(process.execPath)
 const nodeName = path.basename(process.execPath) // node.exe / node
-fs.copyFileSync(process.execPath, path.join(outNodeDir, nodeName))
-const npmSrc = path.join(nodeSrcDir, 'node_modules', 'npm')
-if (!fs.existsSync(path.join(npmSrc, 'bin', 'npm-cli.js'))) {
-  throw new Error(`[bundle-hub] npm not found next to node at ${npmSrc}. Install Node from nodejs.org (bundles npm).`)
+const stagedNode = path.join(outNodeDir, nodeName)
+fs.copyFileSync(process.execPath, stagedNode)
+// copyFileSync preserves the source mode, but be explicit: a Node binary that
+// loses its exec bit produces an unbootable install, and the failure would only
+// show up on a user's Mac.
+if (process.platform !== 'win32') fs.chmodSync(stagedNode, 0o755)
+
+const npmCandidates = [
+  path.join(nodeSrcDir, 'node_modules', 'npm'), // Windows: next to node.exe
+  path.join(nodeSrcDir, '..', 'lib', 'node_modules', 'npm'), // macOS/Linux: <prefix>/lib/node_modules
+  path.join(nodeSrcDir, '..', 'node_modules', 'npm'), // some relocatable/nvm-ish layouts
+]
+const npmSrc = npmCandidates.map((p) => path.resolve(p)).find((p) => fs.existsSync(path.join(p, 'bin', 'npm-cli.js')))
+if (!npmSrc) {
+  throw new Error(
+    `[bundle-hub] npm not found alongside node (${process.execPath}). Looked in:\n` +
+      npmCandidates.map((p) => `  • ${path.resolve(p)}`).join('\n') +
+      `\nInstall Node from nodejs.org (its distribution bundles npm) and re-run.`
+  )
 }
-log('copying npm (for first-run install)…')
-fs.cpSync(npmSrc, path.join(outNodeDir, 'node_modules', 'npm'), { recursive: true })
-log(`shipped Node runtime: ${nodeName} (${process.version}) + npm`)
+log(`copying npm from ${npmSrc} (for first-run install)…`)
+// `dereference` on POSIX: npm's tree contains symlinks (node_modules/.bin/*).
+// Copying them as symlinks would produce dangling links in the installed app AND
+// smuggle content past the credential audit, which walks real files. Resolving
+// them to real files keeps the payload self-contained and fully auditable.
+// Windows keeps the historical (symlink-free) copy so its payload is unchanged.
+fs.cpSync(npmSrc, path.join(outNodeDir, 'node_modules', 'npm'), {
+  recursive: true,
+  dereference: process.platform !== 'win32',
+})
+log(`shipped Node runtime: ${nodeName} (${process.version}, ${process.platform}-${process.arch}) + npm`)
 
 // 7. Validate the shipped payload — our code + the runtime, nothing vendor.
 must(path.join(outHub, 'dist', 'index.js'), 'hub entry in payload')

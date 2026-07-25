@@ -49,9 +49,29 @@ async function health() { try { return (await req('GET', '/api/health')).json } 
 async function sessionOf(sid) { try { const l = (await req('GET', '/api/sessions')).json; return Array.isArray(l) ? l.find((s) => s.id === sid) : null } catch { return null } }
 function logText() { try { return fs.readFileSync(LOG, 'utf8') } catch { return '' } }
 
+/** Synchronous sleep — finish() runs on the exit path and cannot await. */
+function sleepSync(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms) }
+
+/**
+ * Tear down the isolated hubctl tree. Windows: `taskkill /T /F` walks the PID tree. POSIX: hubctl is
+ * not spawned detached here, so it is not a process-group leader and a group signal would miss — send
+ * it SIGTERM so its own handler group-kills the hubs + worker it owns (hubctl.ts `teardown`), then
+ * SIGKILL as a backstop for a hubctl that hung.
+ */
+function killHubctlTree(child) {
+  if (!child?.pid) return
+  if (process.platform === 'win32') {
+    try { spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F']) } catch { /* best-effort */ }
+    return
+  }
+  try { child.kill('SIGTERM') } catch { /* best-effort */ }
+  sleepSync(1500)
+  try { child.kill('SIGKILL') } catch { /* best-effort */ }
+}
+
 let hubctl = null
 function finish(code) {
-  try { if (hubctl?.pid) spawnSync('taskkill', ['/PID', String(hubctl.pid), '/T', '/F']) } catch {}
+  killHubctlTree(hubctl)
   results.log = logText().split(/\r?\n/).slice(-50)
   try { fs.writeFileSync(path.join(DATA_DIR, 'result.json'), JSON.stringify(results, null, 2)) } catch {}
   console.log('\n=== ACCEPTANCE ' + (code === 0 ? 'PASS ✅' : 'FAIL ❌') + ' ===')

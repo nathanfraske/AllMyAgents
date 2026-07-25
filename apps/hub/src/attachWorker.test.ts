@@ -395,6 +395,30 @@ describe('SessionManager.attachWorker — the exactly-once replay cursor (hub si
       .map((e) => (e.payload as { mark?: string }).mark)
     expect(marks).toContain('fresh1')
     expect(marks).toContain('fresh2')
+  })
+
+  // THE OTHER HALF OF THE SAME OUTAGE. The stale sweep used to set `record.status = 'idle'` directly and
+  // journal only a `session/restored-stale` note. Clients react to `session/status` and nothing else, so
+  // every open UI stayed pinned on "active" for a turn that no longer existed — the chat looked frozen,
+  // the operator hit Stop, and (before reopen() existed) that was a permanent brick. A stale sweep MUST
+  // emit a client-visible status event, not just mutate the record.
+  it('journals a client-visible session/status when a worker death sweeps a session stale', async () => {
+    const h = buildHub()
+    seedRecord(h.store, 's', 'active')
+    h.sessions.loadRecords()
+    h.setLive([{ sessionId: 's', status: 'active', lastWseq: 3 }])
+    await h.sessions.attachWorker()
+
+    h.setLive([]) // the worker died and respawned holding nothing
+    await h.sessions.attachWorker()
+
+    const forSession = h.journal.since(0).filter((e) => e.sessionId === 's')
+    const statusEvents = forSession.filter((e) => e.kind === 'session/status')
+    expect(statusEvents.length).toBeGreaterThan(0)
+    expect((statusEvents.at(-1)!.payload as { status?: string }).status).toBe('idle')
+    // The human-readable breadcrumb stays too — it explains WHY, but it is not what un-sticks a client.
+    expect(forSession.some((e) => e.kind === 'session/restored-stale')).toBe(true)
+    expect(h.sessions.list().find((r) => r.id === 's')!.status).toBe('idle')
     // And the durable baseline is rebased too, so a LATER hub restart cannot re-derive a cursor from the
     // dead era and swallow the fresh one all over again.
     expect(h.journal.since(0).some((e) => e.sessionId === 's' && e.kind === WSEQ_RESET_KIND)).toBe(true)

@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Permissions for the main AllMyAgents window: native open/save file dialogs (the folder picker that replaces the old PowerShell popup), opening external links in the OS browser, and executing the dev hub command. NOTE: in dev the Node hub is actually spawned by the Rust host in setup() via std::process (not gated by capabilities); the shell:allow-execute scope below simply also permits the webview to launch that same command if we ever move the spawn to the frontend.",
+  "description": "Permissions for the main AllMyAgents window: native open/save file dialogs (the folder picker that replaces the old PowerShell popup), opening external links in the OS browser, the auto-updater (check/download/install, always behind an explicit click), and executing the dev hub command. NOTE: in dev the Node hub is actually spawned by the Rust host in setup() via std::process (not gated by capabilities); the shell:allow-execute scope below simply also permits the webview to launch that same command if we ever move the spawn to the frontend — hence two entries, a Windows one (pnpm is a .cmd shim so it goes through cmd) and a POSIX one (pnpm is exec'd directly), matching spawn_hub_dev() in lib.rs.",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -15,13 +15,19 @@
     "dialog:allow-open",
     "dialog:allow-save",
     "shell:allow-open",
+    "updater:default",
     {
       "identifier": "shell:allow-execute",
       "allow": [
         {
-          "name": "hub-dev",
+          "name": "hub-dev-windows",
           "cmd": "cmd",
-          "args": ["/C", "pnpm", "hub:dev"]
+          "args": ["/C", "pnpm", "hubctl:dev"]
+        },
+        {
+          "name": "hub-dev-unix",
+          "cmd": "pnpm",
+          "args": ["hubctl:dev"]
         }
       ]
     }

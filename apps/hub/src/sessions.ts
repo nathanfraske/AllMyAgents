@@ -508,9 +508,12 @@ export class SessionManager {
     }
     for (const record of this.sessions.values()) {
       if (record.status === 'active' || record.status === 'starting') {
-        record.status = 'idle'
         this.journal.append(record.id, 'session/restored-stale', { note: 'hub restarted mid-turn' })
-        this.store.upsert(record)
+        // setStatus, NOT a silent `record.status = 'idle'` + upsert: it journals a `session/status` event,
+        // which is the ONLY thing a connected client reacts to. Setting the field quietly left every open
+        // UI pinned on "active" forever for a turn that was already gone — the chat looked frozen, and an
+        // operator reasonably hit Stop, which used to be a terminal brick. Persistence comes with it.
+        this.setStatus(record, 'idle')
       }
     }
   }
@@ -599,9 +602,10 @@ export class SessionManager {
       if (!hadGuard && !wasLive) continue // never carried a worker era — nothing to rebase
       this.journal.append(record.id, WSEQ_RESET_KIND, { reason: 'worker respawn — wseq restarts at 1' })
       if (wasLive) {
-        record.status = 'idle'
         this.journal.append(record.id, 'session/restored-stale', { note: 'worker had no live driver' })
-        this.store.upsert(record)
+        // Same reason as reconcileStale: a client only un-sticks on a journaled `session/status`. A worker
+        // respawn that silently flipped the record left the UI showing a live turn that no longer existed.
+        this.setStatus(record, 'idle')
       }
     }
   }
@@ -1187,6 +1191,23 @@ export class SessionManager {
       this.journal.append(sessionId, 'session/worktree-removed', { worktree: record.worktree })
     }
     this.setStatus(record, 'stopped')
+  }
+
+  /**
+   * Bring a STOPPED (or errored) session back to a usable idle state — the missing inverse of {@link stop}.
+   * Without this, stop() was a one-way BRICK: send() hard-rejects a 'stopped' record (see the guard in
+   * send()), the bus excludes it (busRoster/busSend), and NO reconcile/attach path ever transitions it
+   * back — so the chat was unrecoverable across reloads and hub restarts, the only exit being to delete it.
+   * setStatus journals the session/status transition (so every client un-sticks and its composer frees) and
+   * persists it (so a subsequent hub restart keeps it idle). Idempotent and safe: a session that is not
+   * stopped/errored is left exactly as-is; an unknown id is a no-op. Does NOT recreate a torn-down worktree
+   * — a stopped worktree chat reopens working directly in its cwd, which is the honest post-stop state.
+   */
+  reopen(sessionId: string): { ok: boolean; status?: SessionStatus } {
+    const record = this.sessions.get(sessionId)
+    if (!record) return { ok: false }
+    if (record.status === 'stopped' || record.status === 'error') this.setStatus(record, 'idle')
+    return { ok: true, status: record.status }
   }
 
   // Delete a chat/session for good. Idempotent: an unknown id returns ok:false (404-style) and

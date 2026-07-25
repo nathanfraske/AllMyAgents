@@ -395,21 +395,22 @@ export function startServer(opts: ServerOptions): http.Server {
           json(res, { ok: false, error: `profiles/${name} already has ${provider} credentials` }, 409)
           return
         }
-        if (process.platform !== 'win32') {
-          // Headless daemon can't reliably pop a terminal off-Windows; hand back the manual command.
+        if (!startLogin(provider as Provider, profileDir)) {
+          // No reliable way to pop a visible terminal here (Linux/other — Windows and macOS both
+          // launch one); hand back the manual command so the operator can finish the flow by hand.
           json(
             res,
             {
               ok: false,
               platform: process.platform,
               manual: `pnpm login:${provider} profiles/${name}`,
-              error: 'auto-launch is Windows-only — run the manual command in a terminal, then Rescan accounts',
+              error:
+                'auto-launch is available on Windows and macOS — run the manual command in a terminal, then Rescan accounts',
             },
             501
           )
           return
         }
-        startLogin(provider as Provider, profileDir)
         // Cap under any inbound-request timeout so the long-poll response always lands.
         const added = await awaitLogin(provider as Provider, profileDir, { timeoutMs: 270_000 })
         if (added) {
@@ -741,7 +742,7 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, result, result.ok ? 200 : 404)
         return
       }
-      const sessionAction = /^\/api\/sessions\/([^/]+)\/(input|interrupt|stop)$/.exec(url.pathname)
+      const sessionAction = /^\/api\/sessions\/([^/]+)\/(input|interrupt|stop|reopen)$/.exec(url.pathname)
       if (method === 'POST' && sessionAction) {
         const id = sessionAction[1] as string
         const verb = sessionAction[2] as string
@@ -754,6 +755,12 @@ export function startServer(opts: ServerOptions): http.Server {
           })
         } else if (verb === 'interrupt') {
           await sessions.interrupt(id)
+        } else if (verb === 'reopen') {
+          // The inverse of stop(): revive a stopped/errored session to idle so it's usable + bus-reachable
+          // again. Returns the resulting status so the caller can confirm the transition (404 if unknown id).
+          const r = sessions.reopen(id)
+          json(res, r, r.ok ? 200 : 404)
+          return
         } else {
           await sessions.stop(id)
         }

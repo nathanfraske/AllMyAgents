@@ -146,9 +146,13 @@ clean, no-extra-infra path — a dedicated update server or hosted service would
 ## Still open, and honest about it
 
 - **No code signing.** Neither Windows Authenticode nor macOS notarization. SmartScreen and Gatekeeper
-  will both warn. An operator purchase decision, orthogonal to the updater key.
-- **macOS is built but unproven** — nobody has installed and run it; `macos-latest` is Apple Silicon
-  only, so there is no Intel build.
+  will both warn. An operator purchase decision, orthogonal to the updater key. `release.yml` already
+  reads every `APPLE_*` / `WINDOWS_CERTIFICATE*` secret and skips signing while they are empty, so
+  turning it on is "add the secrets", not "change the workflow" — see its `OPERATOR SETUP #2` header.
+- **macOS is built and CI-verified but unproven on hardware** — `macos-latest` compiles the shell,
+  runs the hub + web suites, and stages the real installer payload, but nobody has installed and run
+  the `.app`. `macos-latest` is Apple Silicon only, so there is no Intel build (deliberate: the
+  bundler ships the runner's own Node, so a universal app would still carry an arm64-only runtime).
 - **`defaultCwd`.** With no project selected, the hub's fallback working directory is its own staged
   hub dir under `%LOCALAPPDATA%` — a strange place to point an agent. Harmless if a project is picked
   first; worth changing to the user's home before a non-alpha release.

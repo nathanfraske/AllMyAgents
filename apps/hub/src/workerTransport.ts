@@ -24,6 +24,7 @@
  */
 import net from 'node:net'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { EventEmitter } from 'node:events'
 import {
@@ -816,7 +817,19 @@ export class WorkerClient extends EventEmitter {
  */
 export function defaultWorkerSocket(dataDir: string): string {
   if (process.env.HUB_WORKER_SOCKET) return process.env.HUB_WORKER_SOCKET
-  return process.platform === 'win32'
-    ? '\\\\.\\pipe\\allmyagents-worker' // Windows named pipe (no filesystem cleanup needed)
-    : path.join(dataDir, 'worker.sock') // unix domain socket under data/
+  if (process.platform === 'win32') return '\\\\.\\pipe\\allmyagents-worker' // named pipe: no fs cleanup
+
+  // POSIX: a unix domain socket under data/, so it is co-located with the rest of the hub's state and
+  // scoped to the invoking user by that directory's permissions.
+  //
+  // macOS/BSD gotcha: `sockaddr_un.sun_path` is only 104 bytes (Linux gives 108), and bind() fails
+  // with ENAMETOOLONG — not a clear error — past it. An installed macOS build's data dir is
+  // `~/Library/Application Support/AllMyAgents/data`, already ~55 chars before the home prefix, and a
+  // deep dev checkout can be worse. So when the natural path won't fit, fall back to a short,
+  // per-user path under the OS temp dir. Deterministic (uid-keyed, not random) because the hub and
+  // every worker/hub process must independently compute the SAME endpoint.
+  const natural = path.join(dataDir, 'worker.sock')
+  if (Buffer.byteLength(natural) < 100) return natural
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 0
+  return path.join(os.tmpdir(), `ama-worker-${uid}.sock`)
 }

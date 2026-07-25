@@ -60,6 +60,19 @@ fn hub_already_running() -> bool {
     }
 }
 
+/// Put a spawned child in its OWN process group on POSIX (macOS/Linux) so the exit handler can tear
+/// the WHOLE tree down with a single process-group signal — see `kill_hub`. Windows has `taskkill /T`
+/// to walk the PID tree; POSIX has no equivalent, so the group has to be set up at spawn time.
+///
+/// No-op on Windows, where `CREATE_NEW_PROCESS_GROUP` would also detach the console and is not needed.
+#[cfg(unix)]
+fn set_own_group(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
+}
+#[cfg(not(unix))]
+fn set_own_group(_cmd: &mut Command) {}
+
 // ---------------------------------------------------------------------------
 // Dev path — spawn `pnpm hub:dev` from the source tree. UNCHANGED.
 // ---------------------------------------------------------------------------
@@ -107,6 +120,7 @@ fn spawn_hub_dev() -> Option<Child> {
     };
     cmd.current_dir(&repo_root);
     cmd.env("HUB_WORKER", hub_worker_flag()); // live turns survive a hub restart (see hub_worker_flag)
+    set_own_group(&mut cmd); // POSIX: own process group so kill_hub can group-signal the whole tree
 
     match cmd.spawn() {
         Ok(child) => {
@@ -260,7 +274,7 @@ fn release_needs_install(app: &AppHandle) -> bool {
 /// Minimal base64 (no dependency) for embedding the splash HTML in a data: URL.
 fn base64(input: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = *chunk.get(1).unwrap_or(&0) as u32;
@@ -373,7 +387,7 @@ fn release_boot(app: AppHandle, splash: Option<WebviewWindow>) {
             .current_dir(&dest_hub)
             // Node on PATH so npm's lifecycle scripts (e.g. better-sqlite3's
             // prebuild-install) that shell out to `node` resolve it.
-            .env("PATH", prepend_path(&[node_dir.clone()]))
+            .env("PATH", prepend_path(std::slice::from_ref(&node_dir)))
             .status();
         match status {
             Ok(s) if s.success() => {
@@ -420,17 +434,17 @@ fn release_boot(app: AppHandle, splash: Option<WebviewWindow>) {
     // Node dir (so the codex .bin shim's `node` fallback resolves).
     let bin_dir = dest_hub.join("node_modules").join(".bin");
     let entry = dest_hub.join("dist").join("hubctl.js");
-    let spawn = Command::new(&node_cmd)
-        .arg(&entry)
+    let mut cmd = Command::new(&node_cmd);
+    cmd.arg(&entry)
         .current_dir(&home)
         .env("PATH", prepend_path(&[bin_dir, node_dir]))
         .env("HUB_WORKER", hub_worker_flag()) // live turns survive a hub restart (see hub_worker_flag)
         // hubctl forwards its whole env to every hub it supervises (blue AND green),
         // so setting these here pins the data + profile roots across restarts too.
         .env("HUB_DATA_DIR", &hub_data_dir)
-        .env("HUB_PROFILES_DIR", &hub_profiles_dir)
-        .spawn();
-    match spawn {
+        .env("HUB_PROFILES_DIR", &hub_profiles_dir);
+    set_own_group(&mut cmd); // POSIX: own process group so kill_hub can group-signal the whole tree
+    match cmd.spawn() {
         Ok(child) => {
             eprintln!("[desktop] spawned bundled hub (pid {}) — {}", child.id(), entry.display());
             if let Some(state) = app.try_state::<HubProcess>() {
@@ -547,16 +561,37 @@ async fn updater_install(app: AppHandle) -> Result<(), String> {
     app.restart();
 }
 
-/// Best-effort teardown of the hub child and its whole process tree.
+/// Best-effort teardown of the hub child and its whole process tree. The child is spawned in its own
+/// process group (`set_own_group`), which is what makes the POSIX branch below able to reach the
+/// descendants at all.
 fn kill_hub(child: &mut Child) {
     let pid = child.id();
-    // On Windows the child may itself have spawned a tree (pnpm/node, or the
-    // bundled node → codex app-server); killing just the parent orphans them, so
-    // taskkill the whole tree first.
-    if cfg!(windows) {
+    // Windows: the child spawned a tree of its own (pnpm→node→hubctl→hub→codex app-server); killing
+    // just the parent orphans all of it, because Windows has no kill-on-parent-death. `taskkill /T /F`
+    // walks the PID tree and terminates the lot.
+    #[cfg(windows)]
+    {
         let _ = Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .output();
+    }
+    // POSIX (macOS/Linux) has no kill-on-parent-death either, and no `taskkill /T`. Signal the child's
+    // process GROUP instead — `kill(-pgid, …)`, the group id being the pid of the leader we spawned.
+    //
+    // SIGTERM FIRST, deliberately: hubctl installs a SIGTERM handler whose teardown group-kills each
+    // hub and the agent worker (which run in their OWN groups — see spawnHub/killTree in hubctl.ts, so
+    // they are NOT in this group and a single signal here would miss them). Give it a moment to do
+    // that, then SIGKILL this group as the backstop for a hubctl that hung or ignored the term.
+    #[cfg(unix)]
+    {
+        let pgid = pid as i32;
+        unsafe {
+            libc::kill(-pgid, libc::SIGTERM);
+        }
+        thread::sleep(Duration::from_millis(1500));
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
     }
     let _ = child.kill();
     let _ = child.wait();

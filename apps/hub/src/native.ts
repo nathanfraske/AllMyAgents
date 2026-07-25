@@ -50,41 +50,88 @@ public static class ModernFolderPicker {
 [Console]::Out.Write([ModernFolderPicker]::Pick())
 `
 
+/**
+ * Open the OS-native folder picker and resolve the chosen ABSOLUTE path, or `''` if the user
+ * cancelled / no picker is available. Backs `POST /api/pick-folder`, so it must behave the same on
+ * every platform the app ships on:
+ *
+ *   - **Windows** — the modern `IFileOpenDialog` via the generated PowerShell script above.
+ *   - **macOS**   — AppleScript `choose folder` through `osascript`: the real Finder picker, present
+ *                   on every macOS install, no extra dependency. `POSIX path of` converts the
+ *                   AppleScript alias to a slash path; it comes back WITH a trailing slash, which we
+ *                   strip so callers get the same shape Windows returns. Cancelling raises AppleScript
+ *                   error -128, i.e. a non-zero exit → `''`.
+ *   - **Linux**   — zenity (GTK) first, then kdialog (KDE); `''` if neither is installed.
+ *
+ * The hub is headless, so every one of these shells out to a helper that owns its own window.
+ */
 export function pickFolder(): Promise<string> {
+  if (process.platform === 'win32') return pickFolderWindows()
+  if (process.platform === 'darwin') {
+    return tryPicker('osascript', [
+      '-e',
+      'POSIX path of (choose folder with prompt "Select a project folder")',
+    ]).then((v) => stripTrailingSlash(v ?? ''))
+  }
+  // Linux/other: try the two ubiquitous desktop dialogs in turn. `null` (command not installed) is
+  // the ONLY signal that falls through — a real cancel resolves '' and must not pop a second dialog.
+  return tryPicker('zenity', ['--file-selection', '--directory', '--title=Select a project folder']).then((v) =>
+    v !== null ? v : tryPicker('kdialog', ['--getexistingdirectory', os.homedir()]).then((k) => k ?? '')
+  )
+}
+
+// Drops one trailing slash (macOS `POSIX path of` always appends one to a folder), keeping a bare
+// "/" intact. NOTE: no example path in this comment on purpose — the bundler's credential firewall
+// content-scans shipped code for absolute per-user home paths and would reject the payload.
+function stripTrailingSlash(p: string): string {
+  return p.length > 1 && p.endsWith('/') ? p.slice(0, -1) : p
+}
+
+function pickFolderWindows(): Promise<string> {
+  const scriptPath = path.join(os.tmpdir(), 'aiagentapp-folderpick.ps1')
+  try {
+    fs.writeFileSync(scriptPath, PS_SCRIPT, 'utf8')
+  } catch {
+    return Promise.resolve('')
+  }
+  return tryPicker('powershell', ['-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', scriptPath]).then(
+    (v) => v ?? ''
+  )
+}
+
+/**
+ * Spawn a picker command and resolve its selection:
+ *   - trimmed stdout on a clean (exit 0) selection,
+ *   - `''` on a non-zero exit (the user cancelled) or on the 3-minute timeout,
+ *   - `null` when the command itself could not be spawned (ENOENT — not installed), which is the one
+ *     signal the Linux path uses to fall through to the next picker.
+ */
+function tryPicker(cmd: string, args: string[]): Promise<string | null> {
   return new Promise((resolve) => {
-    if (process.platform !== 'win32') {
-      resolve('')
-      return
-    }
-    const scriptPath = path.join(os.tmpdir(), 'aiagentapp-folderpick.ps1')
-    try {
-      fs.writeFileSync(scriptPath, PS_SCRIPT, 'utf8')
-    } catch {
-      resolve('')
-      return
-    }
-    const child = spawn(
-      'powershell',
-      ['-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
-      { windowsHide: true }
-    )
     let out = ''
+    let settled = false
+    const done = (v: string | null): void => {
+      if (settled) return
+      settled = true
+      resolve(v)
+    }
+    const child = spawn(cmd, args, { windowsHide: true })
     const timer = setTimeout(() => {
       try {
         child.kill()
       } catch {
         /* ignore */
       }
-      resolve(out.trim())
+      done('')
     }, 180_000)
     child.stdout.on('data', (d: Buffer) => (out += d.toString()))
     child.on('error', () => {
       clearTimeout(timer)
-      resolve('')
+      done(null)
     })
-    child.on('exit', () => {
+    child.on('exit', (code) => {
       clearTimeout(timer)
-      resolve(out.trim())
+      done(code === 0 ? out.trim() : '')
     })
   })
 }

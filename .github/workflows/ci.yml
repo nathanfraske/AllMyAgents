@@ -1,7 +1,12 @@
 name: CI
 
-# Cross-OS functional gate: run the hub + web suites on Windows, macOS, and Linux so a change that
-# only works on one platform (a Windows-ism, a POSIX-ism) fails here rather than in a user's install.
+# Cross-OS functional gate. Windows is the primary target and macOS is the second release target, so
+# both must stay green; Linux is carried as a cheap POSIX canary for the JS half (it catches a
+# Windows-ism long before a Mac would, and costs the least runner time of the three).
+#
+# The gates here are the SAME commands docs/alpha-cut-checklist.md step 3 tells the operator to run
+# locally, plus the credential-firewall self-test and a real payload stage. If it is green here, the
+# checklist's "green gates" step is already satisfied.
 on:
   push:
     branches: [main]
@@ -13,9 +18,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ---------------------------------------------------------------------------------------------
+  # JS/TS gates — hub + web. Fast, no Rust toolchain, so it runs on all three OSes.
+  # ---------------------------------------------------------------------------------------------
   gates:
-    name: gates (${{ matrix.os }})
+    name: js gates (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       # Never let one OS failing hide the result on the others.
       fail-fast: false
@@ -50,10 +59,93 @@ jobs:
       - name: Hub — typecheck (tsc --noEmit)
         run: pnpm --filter hub typecheck
 
-      # ---- Web gate: apps/web → svelte-check + vitest run --------------------------------------------
-      # (package.json scripts: check = "svelte-check --tsconfig ./tsconfig.json", test = "vitest run")
+      # ---- Web gate: apps/web → svelte-check + vitest run + vite build --------------------------------
       - name: Web — svelte-check
         run: pnpm --filter web check
 
       - name: Web — unit tests (vitest)
         run: pnpm --filter web test
+
+      # The desktop bundle embeds this build via tauri.conf.json's `frontendDist`, so a broken Vite
+      # build breaks the installer, not just the dev server. Cheap, and it also produces the
+      # apps/web/dist that the Rust job's tauri-build step validates.
+      - name: Web — production build (vite)
+        run: pnpm --filter web build
+
+      # ---- Packaging gates --------------------------------------------------------------------------
+      # 1. Prove the credential firewall still FIRES (synthetic payload seeded with one leak of each
+      #    class). Guards docs/alpha-release-plan.md "The landmine"; costs ~2s.
+      - name: Bundle — credential-firewall self-test
+        run: pnpm run bundle:audit
+
+      # 2. Stage the REAL payload. This is the per-OS packaging gate: it compiles the hub, locates the
+      #    platform's Node + npm (their layouts differ — npm sits next to node.exe on Windows but under
+      #    <prefix>/lib/node_modules on macOS/Linux), and runs the credential audit for real. A macOS
+      #    packaging regression fails HERE rather than at release time.
+      - name: Bundle — stage the real hub payload (runs the audit for real)
+        run: pnpm run hub:bundle
+
+  # ---------------------------------------------------------------------------------------------
+  # Rust gate — the Tauri shell. Only on the two RELEASE targets: those are the platforms whose
+  # binaries we ship, and the shell's platform branches (taskkill vs. POSIX process groups) only exist
+  # for them. Adding Linux would mean installing the whole libwebkit2gtk toolchain for a target we do
+  # not release, so it is deliberately out.
+  # ---------------------------------------------------------------------------------------------
+  rust:
+    name: tauri shell (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # Caches ~/.cargo/registry, ~/.cargo/git and the crate's target/ dir, keyed on Cargo.lock + the
+      # toolchain. `workspaces` points at the crate root because it is not at the repo root.
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'apps/desktop/src-tauri -> target'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # tauri-build (the crate's build.rs) validates tauri.conf.json, and `frontendDist` points at
+      # apps/web/dist — so the web build has to exist before cargo touches the crate.
+      - name: Build the web UI (tauri-build validates frontendDist)
+        run: pnpm --filter web build
+
+      # Stage the Tauri resource payload too: tauri.conf.json declares `resources: ["hub-runtime/**/*"]`
+      # and a missing resource dir is a config-validation failure at build.rs time.
+      - name: Stage the hub payload (tauri resource)
+        run: pnpm run hub:bundle
+
+      - name: cargo check
+        working-directory: apps/desktop/src-tauri
+        run: cargo check --all-targets
+
+      # `-D warnings` makes clippy an actual gate. NOTE for maintainers: `stable` moves, so a toolchain
+      # bump can introduce a brand-new lint and fail this step on untouched code. When that happens,
+      # fix the finding (preferred) or add a targeted `#[allow(...)]` with a reason — do not drop the
+      # `-D`, which would silently turn the gate back into advice.
+      - name: cargo clippy
+        working-directory: apps/desktop/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
