@@ -1,5 +1,39 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import readline from 'node:readline'
+import fs from 'node:fs'
+import path from 'node:path'
+import { createRequire } from 'node:module'
+
+/**
+ * Absolute path to the codex CLI entry, or null if we cannot find it.
+ *
+ * WHY THIS EXISTS: the app-server used to be started as `spawn('codex app-server', { shell: true })`,
+ * i.e. resolved through PATH. That silently couples the hub to HOW it was launched — the desktop starts
+ * it via `cmd /C pnpm hubctl:dev`, and it is *pnpm* that injects `node_modules/.bin` into PATH. Start the
+ * SAME hub any other way (a direct `node hubctl.js`, a service, a scheduler, or an installed build whose
+ * environment nobody controls) and `codex` is not on PATH, so the shell — not codex — exits 1. Every Codex
+ * turn then dies instantly with "codex app-server exited (1)" and an empty stderr, which points at
+ * completely the wrong thing. Observed exactly that way in production. Resolving from our own
+ * node_modules and launching with our own node removes the entire class, and matters most for the alpha,
+ * where the installed app's environment is not ours to predict.
+ */
+function codexEntry(): string | null {
+  const rel = path.join('@openai', 'codex', 'bin', 'codex.js')
+  // Both src/adapters/*.ts and dist/adapters/*.js sit two levels under the hub package root.
+  for (const base of ['..', '../..', '../../..']) {
+    const candidate = path.resolve(import.meta.dirname, base, 'node_modules', rel)
+    try {
+      if (fs.existsSync(candidate)) return candidate
+    } catch {
+      /* keep looking */
+    }
+  }
+  try {
+    return createRequire(import.meta.url).resolve('@openai/codex/bin/codex.js')
+  } catch {
+    return null
+  }
+}
 
 type EventSink = (kind: string, payload: unknown) => void
 
@@ -107,10 +141,14 @@ export class CodexClient {
   }
 
   private async startInner(): Promise<void> {
-    const child = spawn('codex app-server', {
-      shell: true,
-      env: { ...process.env, CODEX_HOME: this.profileDir },
-    })
+    const env = { ...process.env, CODEX_HOME: this.profileDir }
+    const entry = codexEntry()
+    // Preferred: our own node running the resolved entry — no shell, no PATH dependency (see codexEntry).
+    // Fallback keeps the historical PATH lookup so an unusual layout we cannot resolve still works.
+    const child = entry
+      ? spawn(process.execPath, [entry, 'app-server'], { env })
+      : spawn('codex app-server', { shell: true, env })
+    if (!entry) this.onEvent('codex/spawn-fallback', { reason: 'could not resolve @openai/codex; using PATH lookup' })
     this.child = child
     if (child.stdout) {
       const rl = readline.createInterface({ input: child.stdout })
