@@ -348,8 +348,15 @@ export class InProcessExecutor implements Executor {
   async steer(sessionId: string, text: string): Promise<void> {
     const client = this.codexSessionClients.get(sessionId)
     const threadId = this.codexThreads.get(sessionId)
-    // Steering only applies to a codex session with a live turn; CodexClient.steer enforces the
+    // Steering only applies to a codex session with a LIVE turn; CodexClient.steer enforces the
     // active-turn requirement (expectedTurnId), throwing if there is none.
+    // AUDIT/F1 (intentional narrowing, 2026-07-24): the pre-seam steer routed through ensureCodexThread,
+    // which would RESUME a persisted-but-not-live thread (journaling session/thread-resumed + warming the
+    // cache) *before* throwing 'no active Codex turn to steer'. We no longer do that pointless
+    // resume-then-reject: steering a session with no live turn rejects immediately, with no journal event
+    // or thread-cache side effect. Caller-visible result (the rejection) is unchanged, and real turns still
+    // resume+journal via runCodexTurn on their next send. Deliberately NOT restored — preserving it would
+    // widen steer()'s interface to carry a WorkerSessionSpec into the already-built worker protocol.
     if (!client || !threadId) throw new Error('no active Codex turn to steer')
     await client.steer(threadId, text)
   }
@@ -373,6 +380,11 @@ export class InProcessExecutor implements Executor {
     // The in-process lift of delete()'s driver-map cleanup (`claudeDrivers.delete` + `codexThreads.delete`).
     // The codexClients map is keyed by profile + shared across sessions, so it is deliberately left
     // intact. Interrupt is NOT re-issued here: every caller (delete → stop) has already interrupted.
+    // AUDIT/F3 (keep synchronous, 2026-07-24): the hub's delete() removes the session record and calls
+    // stopSession in the SAME synchronous run, and this method has no await before the codexThreads.delete
+    // below — that ordering is load-bearing. sessionIdForThread() reads sessionId straight from
+    // codexThreads, so if a thread ever outlived its record a stray codex callback would mis-attribute
+    // (setStatus / session/tokens on a dead session). Do NOT insert an await before these deletes.
     this.claudeDrivers.delete(sessionId)
     this.codexThreads.delete(sessionId)
     this.codexSessionClients.delete(sessionId)

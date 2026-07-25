@@ -16,25 +16,34 @@ Full definition-of-parity, bundle scope, security gates, and sequence in `docs/a
 AllMyAgents already LEADS on the deep agent tooling (bus, scoped memory, practices, hooks,
 browser/computer/visualization, auto-recall) — not gaps. The real gaps:
 
-- **P0 — VERIFY live behaviors (security-relevant), then govern.** `profiles/claude-a/.claude.json` has
-  `"tengu_claudeai_mcp_connectors": true` and the hub sets NO connector kill-switch, so the operator's
-  claude.ai connectors may already reach hub Claude agents via the vendor cloud.
+- **P0 — CONFIRMED live exposure (security-critical), govern it.** The hub's own journal (`data/hub.db`,
+  `claude/system` init events) shows a claude.ai **Google Drive** connector reaching `status:"connected"`
+  with 8 live cloud tools **inside a real hub Claude session** — hub Claude agents can reach the operator's
+  linked claude.ai integrations through Anthropic's cloud **today**. No connector has actually been
+  *invoked* yet (zero tool calls in the journal) → exposure, not active use.
+  - **Mechanism (corrected):** NOT the `tengu_claudeai_mcp_connectors` flag (that string has no code path).
+    `query()` spawns the full `claude.exe`, which fetches the account's connectors over OAuth; the hub sets
+    none of the real kill-switches (`disableClaudeAiConnectors` / `ENABLE_CLAUDEAI_MCP_SERVERS` / managed-mcp).
   - **Plain English:** "connectors" are the integrations you've linked to your Claude account through
-    Anthropic's cloud — Google Drive, GitHub, Gmail, and the like. With this flag on, an agent running
-    inside the hub may be able to call those integrations — i.e. reach into your linked accounts — via
-    the vendor cloud, even though you never wired them into the hub yourself. The danger: an agent
-    chewing on untrusted text (an imported chat, a scraped web page) could be talked into pulling data
-    from, or pushing data to, one of those connected accounts.
-  - **Decision (matches the safe-default + toggle philosophy):** default the connector kill-switch ON
-    (connectors unreachable by agents), expose a Danger-Zone toggle to allow them. Make the same
-    deliberate call for vendor auto-memory (which today runs in parallel with hub memory).
-  - Also verify the installed Agent-SDK `settingSources` default and whether Codex's built-in `image_gen`
-    is exposed to our unmanaged app-server client. (Verification agent running as of 2026-07-24.)
-- **P1 — Claude skill asymmetry.** Codex agents auto-load their profile's bundled skills (imagegen,
-  ~20 artifact-template docs, review-agent, github recipes); our Claude profiles ship NO skills / no
-  plugins, so Claude agents get no skill library at all. Provision a scope-governed Claude skill set,
-  materialized like practices (`instructions.ts`). **Harvest the public skills** (the vendor's open
-  skills repo / community sets) rather than authoring from scratch — curate + scope-gate what we import.
+    Anthropic's cloud — Google Drive, Gmail, Calendar, and the like. A hub agent can call those — i.e.
+    reach into your linked accounts — via the vendor cloud, even though you never wired them into the hub.
+    The danger: an agent chewing on untrusted text (an imported chat, a scraped web page) could be talked
+    into pulling from, or pushing to, one of those accounts.
+  - **Sharp caveat:** connector tool calls normally hit the operator approval prompt — **except** under
+    `full` (bypassPermissions) mode, where `canUseTool` is skipped entirely (`executor.ts:234`,
+    `adapters/claude.ts:65`), so a connector call runs with **no prompt**.
+  - **Fix — APPROVED 2026-07-24 as a Danger-Zone toggle** (`allowClaudeConnectors`, default OFF). Interim
+    static safe-default applied immediately: `"disableClaudeAiConnectors": true` in each Claude profile's
+    `settings.json` (the SDK honors it from any settings source). Toggle build: flip via a DangerFlag the
+    adapter reads; when ON, surface `claude.ai …` tool names + label approvals as vendor-cloud provenance.
+    Same deliberate call still open for vendor auto-memory (parallel to hub memory).
+- **P1 — Claude skills: gap is narrower than the doc said.** Runtime correction: Claude agents do NOT load
+  zero skills — the journal shows **18 bundled skills load every session** (deep-research, code-review,
+  dataviz, artifact-design, …; baked into `claude.exe`). The real gap is (a) no hub-curated **custom** skills
+  and (b) the **document** skills (pdf/docx/xlsx/pptx) genuinely absent from the bundled set. `settingSources`
+  defaults to all sources, so a skill dropped at `profiles/claude-a/skills/<name>/SKILL.md` is auto-discovered
+  (no extra setting); `skills:'all'` (add at `adapters/claude.ts:69`) is the explicit lever. **Harvest the
+  public/document skills** rather than authoring from scratch — curate + scope-gate what we import.
 - **G1 (P0) — review-feedback loop, exposed to agents.** Operator leaves PR-style inline comments on a
   turn's diff → thread as feedback.md/json (open/resolved). Leapfrog T3Code (their #345 "not planned")
   by making it an agent MCP tool the agent reads/resolves itself. **Gate behind a Settings toggle (hard
@@ -51,6 +60,18 @@ browser/computer/visualization, auto-recall) — not gaps. The real gaps:
   (lint, test, build, deploy) without retyping.
 - **P2:** self-hosted scheduler (scheduled-tasks equivalent); document-artifact rendering (pdf/docx/
   xlsx/pptx/dataviz); `$`-picker skill curation; outward-facing hub MCP server; per-session MCP passthrough.
+
+## Fleet: cross-machine project view + machine classification (raised 2026-07-24)
+
+Each machine runs its own hub, auto-registered as an owner-fleet-only AllMyStuff site (`siteId=tcp:<port>`,
+loopback-bound, tunneled via the owner's node — not a vendor relay), so hubs are reachable across the fleet
+today. Two gaps (feasibility scoping in flight as of 2026-07-24):
+- **No unified roster.** You open one site (machine) at a time; there's no single pane aggregating every
+  machine's projects/sessions. Build a fleet roster listing projects across all reachable sites.
+- **No machine tag on projects.** `Project` (types.ts:9) is `{id,name,path,createdAt}` — nothing records
+  which machine the files live on. Add a `siteId`/machine tag + a sidebar machine badge, and route access
+  local-vs-mesh by it. Access model: the **agent runs where the files are local**; you drive it remotely
+  over the mesh — so the machine tag is what routes execution (no file-shipping).
 
 ## Critical-agent tier (requested 2026-07-24)
 
