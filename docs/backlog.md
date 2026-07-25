@@ -143,6 +143,26 @@ entries to evict. Cap is Settings-configurable; safe default on.
   never instructions** (a read log is semi-trusted, exactly like a bus message — prompt-injection boundary).
   Turns the fleet's whole history into a searchable shared brain.
 
+## Curator agent — designated hub/app lifecycle agent (requested 2026-07-25)
+
+A per-agent role: the operator designates ONE agent (a session/profile they converse with) as the "curator"
+— the agent trusted with hub/app **lifecycle**. It composes two grants:
+- **Restart authority** — the per-agent restart ACL + the `restart_hub` tool (both already on this list): the
+  curator is the agent that holds the "may restart this hub/app" grant.
+- **Update management** — its **materialized instructions remind it to check for updates when active** (so a
+  conversation with it surfaces "an update is available"), and it gets `check_updates` / `apply_update` agent
+  tools that drive the Tauri updater (docs/alpha-release-plan.md): read the GitHub `latest.json`, and — with
+  operator consent (safe default) or an opt-in auto-update toggle — download → verify → install → relaunch.
+
+Both restart + update are impactful, so the curator acts **with operator consent by default** (a prompt),
+never silently, unless the owner flips a Danger-Zone auto toggle. Storage: a `curator?: boolean` on the
+session/profile (like the critical-agent tier's `critical?`) + the restart-ACL grant.
+
+**Distinct from the "overseer"** — a separate future role that **lives IN the hub** (a hub-resident oversight/
+monitor service, not a conversational agent). The curator is the lifecycle agent you talk to; the overseer is
+hub-internal. Keep them separate. (The auto-mode safety cross-checker, docs/auto-mode-safety-checker.md, is a
+candidate shape for a hub-resident overseer-class role.)
+
 ## Critical-agent tier (requested 2026-07-24)
 
 An opt-in per-agent designation for maximum restart durability, ON TOP of the Phase-2 worker model
