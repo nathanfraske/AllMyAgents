@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import { redact } from './redact.js'
-import type { HubEvent } from './types.js'
+import type { ApprovalStatus, HubEvent } from './types.js'
 
 /**
  * The per-session marker a restarted hub journals when the worker has respawned and the session's worker
@@ -21,6 +21,9 @@ export class Journal extends EventEmitter {
   private readonly insertWorkerStmt: Database.Statement
   private readonly lastWseqStmt: Database.Statement
   private readonly sinceStmt: Database.Statement
+  // Lazily built the first time a re-issued approval is reconciled (worker mode only — the in-process
+  // executor never supplies a stable id, so this never runs flag-off, keeping the constructor byte-identical).
+  private resolvedApprovalStmt: Database.Statement | undefined
 
   constructor(file: string) {
     super()
@@ -100,6 +103,38 @@ export class Journal extends EventEmitter {
   lastJournaledWseq(sessionId: string): number {
     const row = this.lastWseqStmt.get(sessionId, sessionId, WSEQ_RESET_KIND) as { m: number | null } | undefined
     return row?.m ?? 0
+  }
+
+  /**
+   * The DURABLE resolution of an approval id — `'approved' | 'denied' | 'timeout'` — or `undefined` if the
+   * id was never resolved (docs/agent-worker-impl.md §7.2). A hub restart empties {@link ApprovalService}'s
+   * in-memory pending map, but the operator's decision is durable here (the `approval/resolved` row the dead
+   * hub journaled). When the worker re-issues an outstanding `approvalRequest` on re-attach, a fresh hub reads
+   * that decision from here and answers immediately instead of re-prompting — so an approval resolved BEFORE a
+   * crash is honored EXACTLY ONCE, never re-offered. Reads the latest `approval/resolved` row for the id.
+   *
+   * The lookup statement + its supporting index are built LAZILY on first use so the constructor stays
+   * byte-identical for the flag-off (in-process) path, which never supplies a stable id and so never reaches
+   * this. The index is a partial expression index over just the (rare) `approval/resolved` rows, making the
+   * id match a fast index seek rather than a backward scan of the whole journal even when no row matches (the
+   * common first-time-approval case). Additive + guarded — an older hub rolled back onto the DB simply
+   * ignores it.
+   */
+  resolvedApproval(id: string): ApprovalStatus | undefined {
+    if (!this.resolvedApprovalStmt) {
+      this.db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_events_resolved_approval ON events(json_extract(payload, '$.id')) WHERE kind = 'approval/resolved'"
+      )
+      this.resolvedApprovalStmt = this.db.prepare(
+        "SELECT payload FROM events WHERE kind = 'approval/resolved' AND json_extract(payload, '$.id') = ? ORDER BY seq DESC LIMIT 1"
+      )
+    }
+    const row = this.resolvedApprovalStmt.get(id) as { payload: string } | undefined
+    if (!row) return undefined
+    const status = (JSON.parse(row.payload) as { status?: ApprovalStatus }).status
+    // Only a terminal status counts as "resolved"; anything else (never expected on an approval/resolved row)
+    // is treated as not-resolved so the caller re-prompts rather than silently swallowing the request.
+    return status === 'approved' || status === 'denied' || status === 'timeout' ? status : undefined
   }
 
   since(seq: number, limit = 2000): HubEvent[] {

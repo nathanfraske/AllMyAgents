@@ -139,6 +139,47 @@ describe('AgentWorker.attach — gap-free, exactly-once replay (worker side, §7
   })
 })
 
+describe('worker/attach-gap — end-to-end overflow path (worker emits → hub journals; web tolerates it, §7.1)', () => {
+  it('a ring overflow surfaces ONE gap marker the hub journals like any additive event, cursor + survivors intact', () => {
+    // WORKER: emit past the ring so the oldest events are trimmed; a cursor-0 re-attach then spans the drop.
+    const w = makeWorker()
+    const N = DEFAULT_MAX_PER_SESSION + 5
+    for (let i = 1; i <= N; i++) w.emitEvent('s1', 'claude/text', { i }) // retains wseq 6..N (oldest 5 trimmed)
+    const sent = captureReplay(w)
+    w.attach({ s1: 0 })
+
+    // The worker forwards the synthetic sentinel as a GENERIC event (replayMessage's default arm), so the whole
+    // replay is `event`s — there is no bespoke gap message type the hub would have to learn.
+    expect(sent.every((m) => m.t === 'event')).toBe(true)
+    const events = sent as Array<Extract<WorkerToHub, { t: 'event' }>>
+    expect(events[0]).toMatchObject({ sessionId: 's1', wseq: 5, kind: ATTACH_GAP_KIND, payload: { droppedThrough: 5 } })
+
+    // HUB: ingest the whole replay exactly as WorkerExecutor's onEvent → ingestWorkerEvent does on re-attach.
+    const h = buildHub()
+    seedRecord(h.store, 's1', 'active')
+    h.sessions.loadRecords()
+    const journaled: Array<{ kind: string; payload: unknown }> = []
+    h.journal.on('event', (e) => {
+      if (e.sessionId === 's1') journaled.push({ kind: e.kind, payload: e.payload })
+    })
+    for (const m of events) h.sessions.ingestWorkerEvent(m.sessionId, m.wseq, m.kind, m.payload)
+
+    // The marker is journaled like ANY other kind — NOT special-cased or dropped. The unchanged journal→WS
+    // path then relays it, and the web client tolerates the unknown kind via its `default: break` switch arm
+    // (apps/web store.svelte.ts), so no web change is needed: the transcript shows a VISIBLE gap instead of
+    // silently losing the trimmed span.
+    const gapRows = journaled.filter((e) => e.kind === ATTACH_GAP_KIND)
+    expect(gapRows).toHaveLength(1)
+    expect(gapRows[0]!.payload).toEqual({ droppedThrough: 5 })
+
+    // Exactly-once past the gap: every retained survivor (6..N) is journaled once and the durable re-attach
+    // cursor lands on N — no duplicate, no silent loss beyond the single honest marker.
+    expect(h.sessions.lastJournaledWseq('s1')).toBe(N)
+    const vendorSeqs = journaled.filter((e) => e.kind === 'claude/text').map((e) => (e.payload as { i: number }).i)
+    expect(vendorSeqs).toEqual(Array.from({ length: DEFAULT_MAX_PER_SESSION }, (_v, k) => k + 6)) // 6..N, once each
+  })
+})
+
 describe('AgentWorker.listLive — status semantics mirror InProcessExecutor (§6)', () => {
   it('claude reflects driver.busy; codex is ALWAYS idle across a re-attach', () => {
     const w = makeWorker()

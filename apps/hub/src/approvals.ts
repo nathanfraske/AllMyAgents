@@ -28,16 +28,26 @@ export class ApprovalService {
    *
    * `id` is OPTIONAL and last, so every existing caller (which passes none) is unchanged. When omitted
    * an id is generated as before. A caller that must survive a hub restart — a detached agent worker,
-   * docs/agent-detachment-impl.md §2.5 — supplies a STABLE id so it can RE-ISSUE the same request:
+   * docs/agent-detachment-impl.md §2.5, docs/agent-worker-impl.md §7.2 — supplies a STABLE id so it can
+   * RE-ISSUE the same request. The three re-issue outcomes are all honored exactly once:
    * - id already pending on THIS hub  → dedup no-op: returns the existing pending Promise, creates no
    *   second entry and journals no second `approval/requested`.
-   * - id not pending (e.g. a freshly restarted hub whose in-memory map is empty) → treated as a fresh
-   *   request under that exact id and journaled, which is precisely the re-attach path.
+   * - id already RESOLVED before a crash (in-memory map gone, but the decision is durable in the journal)
+   *   → returns that decision immediately: no re-prompt, no re-journal. This is the resolved-before-crash
+   *   recovery (§7.2) — the worker re-issues on re-attach and the operator's prior approve/deny/timeout is
+   *   applied EXACTLY ONCE instead of the successor hub re-offering an already-decided approval.
+   * - id not pending and not resolved (a freshly restarted hub whose operator never decided) → treated as a
+   *   fresh request under that exact id and journaled, which is precisely the pending-across-restart path.
    */
   request(sessionId: string, kind: string, payload: unknown, id?: string): Promise<boolean> {
     if (id !== undefined) {
       const existing = this.pendingMap.get(id)
       if (existing) return existing.promise // re-issue/dedup: same Promise, no duplicate entry, no re-journal
+      // Resolved-before-crash recovery (§7.2): this hub's in-memory map is empty (a restart), but the
+      // operator's decision may be durable in the journal. Honor it immediately — do NOT re-prompt or
+      // re-journal. In-process callers never supply an id, so this is worker-mode only (flag-off unchanged).
+      const resolved = this.journal.resolvedApproval(id)
+      if (resolved !== undefined) return Promise.resolve(resolved === 'approved')
     }
     const record: ApprovalRecord = {
       id: id ?? crypto.randomUUID(),

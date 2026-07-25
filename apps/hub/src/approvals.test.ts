@@ -133,3 +133,87 @@ describe('ApprovalService — idempotent + re-issuable (agent detachment §2.5)'
     expect(count('approval/resolved')).toBe(1) // only the timeout's resolved event
   })
 })
+
+describe('ApprovalService — resolved-before-crash recovery across a hub restart (§7.2)', () => {
+  // The scenario step 6 fixes: hub A resolves an approval (durably journaled), then crashes BEFORE the
+  // worker's approvalResolved is delivered. On re-attach the worker re-issues the SAME stable id to the
+  // SUCCESSOR hub, whose in-memory pending map is empty. The successor must honor the prior decision from the
+  // journal — immediately, no re-prompt, no re-journal — so the operator's approve/deny/timeout is applied
+  // EXACTLY ONCE and an already-decided approval is never re-offered. A fresh ApprovalService over the SAME
+  // journal is a faithful stand-in for the restarted successor hub.
+
+  it('an approved id re-issued after a restart resolves true immediately — no re-prompt, no re-journal', async () => {
+    const { approvals, journal, count } = fresh()
+    const payload = { scope: 'project:proj1', title: 't', body: 'b' }
+    const p = approvals.request('s1', 'practice/write', payload, 'stable-approved')
+    approvals.resolve('stable-approved', true) // hub A: the operator approves; durably journaled
+    await expect(p).resolves.toBe(true)
+    expect(count('approval/requested')).toBe(1)
+    expect(count('approval/resolved')).toBe(1)
+
+    // Hub A crashes; a SUCCESSOR ApprovalService over the SAME journal starts with an EMPTY pending map.
+    const successor = new ApprovalService(journal)
+    const recovered = successor.request('s1', 'practice/write', payload, 'stable-approved')
+    await expect(recovered).resolves.toBe(true) // the operator's prior approve is recovered from the journal
+    expect(successor.pending()).toHaveLength(0) // NOT re-offered to the operator (no phantom pending entry)
+    expect(count('approval/requested')).toBe(1) // no second request row — recovery does not re-journal
+    expect(count('approval/resolved')).toBe(1) //  nor a second resolved row
+  })
+
+  it('a denied id re-issued after a restart resolves false immediately (the decline is honored once)', async () => {
+    const { approvals, journal, count } = fresh()
+    const p = approvals.request('s1', 'claude/tool', { toolName: 'bash' }, 'stable-denied')
+    approvals.resolve('stable-denied', false)
+    await expect(p).resolves.toBe(false)
+
+    const successor = new ApprovalService(journal)
+    await expect(successor.request('s1', 'claude/tool', { toolName: 'bash' }, 'stable-denied')).resolves.toBe(false)
+    expect(successor.pending()).toHaveLength(0)
+    expect(count('approval/requested')).toBe(1) // the successor did not re-offer it
+  })
+
+  it('a timed-out id re-issued after a restart stays denied (a fail-closed timeout is a durable decision)', async () => {
+    vi.useFakeTimers()
+    const { approvals, journal } = fresh()
+    const p = approvals.request('s1', 'claude/tool', {}, 'stable-timeout')
+    void p.then(() => {})
+    await vi.advanceTimersByTimeAsync(APPROVAL_TIMEOUT_MS)
+    await expect(p).resolves.toBe(false)
+
+    const successor = new ApprovalService(journal)
+    // A timed-out approval was decided (fail-closed) and journaled resolved(timeout) → not re-offered.
+    await expect(successor.request('s1', 'claude/tool', {}, 'stable-timeout')).resolves.toBe(false)
+    expect(successor.pending()).toHaveLength(0)
+  })
+
+  it('an id REQUESTED but never resolved is NOT recovered — the successor re-offers it (pending-across-restart)', async () => {
+    const { approvals, journal, count } = fresh()
+    approvals.request('s1', 'practice/write', { scope: 'project:proj1' }, 'stable-open') // pending, never resolved
+    expect(count('approval/requested')).toBe(1)
+
+    // A journaled REQUEST must not be mistaken for a RESOLUTION: the successor re-creates the pending entry
+    // (the operator still has to decide) rather than returning a phantom value. This guards that recovery
+    // keys strictly on `approval/resolved`, never on `approval/requested`.
+    const successor = new ApprovalService(journal)
+    const p = successor.request('s1', 'practice/write', { scope: 'project:proj1' }, 'stable-open')
+    expect(successor.pending().map((r) => r.id)).toEqual(['stable-open']) // re-offered under the same id
+    expect(count('approval/requested')).toBe(2) // one offer per hub (the dead hub's + the successor's)
+    successor.resolve('stable-open', true) // the operator decides on the successor
+    await expect(p).resolves.toBe(true)
+  })
+
+  it('recovery matches the LATEST decision for an id and never leaks across distinct ids', async () => {
+    const { approvals, journal } = fresh()
+    approvals.request('s1', 'claude/tool', {}, 'id-A')
+    approvals.resolve('id-A', true) // A → approved
+    approvals.request('s2', 'claude/tool', {}, 'id-B')
+    approvals.resolve('id-B', false) // B → denied
+
+    const successor = new ApprovalService(journal)
+    await expect(successor.request('s1', 'claude/tool', {}, 'id-A')).resolves.toBe(true) //  distinct id, correct value
+    await expect(successor.request('s2', 'claude/tool', {}, 'id-B')).resolves.toBe(false) // distinct id, correct value
+    // A never-seen id has no durable decision → a genuine fresh request (re-prompts), proving no false match.
+    successor.request('s3', 'claude/tool', {}, 'id-never')
+    expect(successor.pending().map((r) => r.id)).toEqual(['id-never'])
+  })
+})
