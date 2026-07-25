@@ -714,6 +714,11 @@ export class WorkerClient extends EventEmitter {
   onRestartRequest(cb: (msg: Extract<WorkerToHub, { t: 'restartRequest' }>) => void): void {
     this.on('restartRequest', cb)
   }
+  /** The attached worker's generation handshake (`welcome`), fired on every (re)attach. The WorkerExecutor
+   *  uses it to invalidate its served-write cache across a worker respawn but keep it on a flap (§8.2 / F1). */
+  onWelcome(cb: (msg: Extract<WorkerToHub, { t: 'welcome' }>) => void): void {
+    this.on('welcome', cb)
+  }
 
   /** Whether a live channel is currently attached. */
   isAttached(): boolean {
@@ -755,6 +760,9 @@ export class WorkerClient extends EventEmitter {
         return
       case 'restartRequest':
         this.emit('restartRequest', msg)
+        return
+      case 'welcome':
+        this.emit('welcome', msg)
         return
       default:
         debug(`unhandled worker message ${(msg as { t: string }).t}`)

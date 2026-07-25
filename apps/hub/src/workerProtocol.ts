@@ -47,6 +47,13 @@ export type HubToWorker =
 
 /** Worker → hub. */
 export type WorkerToHub =
+  // handshake reply to the hub's `hello`, sent on every (re)attach: the worker PROCESS's generation id —
+  // stable for the process's life, fresh on every respawn. The hub uses it to tell a RESPAWN (a new
+  // generation → the worker's per-process callSeq reset to wc1, so its callIds collide with the dead
+  // worker's) from a socket FLAP to the SAME process (same generation). It clears its served-write cache on
+  // the former and keeps it on the latter, so §8.2 re-flush dedup still holds while F1 can't return a stale
+  // cached write. Sent BEFORE the transport's on-attach relay re-flush (WorkerServer.attach order).
+  | { t: 'welcome'; generation: string }
   // vendor event stream — the SAME kinds the hub journals today (claude/*, codex/*, session/tokens, …),
   // each tagged sessionId + a per-session monotonic wseq (§7):
   | { t: 'event'; sessionId: string; wseq: number; kind: string; payload: unknown }
@@ -117,6 +124,18 @@ let reqCounter = 0
 export function nextReqId(): string {
   reqCounter += 1
   return `r${reqCounter}`
+}
+
+/**
+ * A fresh, process-unique WORKER GENERATION id — minted once per {@link AgentWorker} at construction and
+ * announced to the hub in the attach handshake (the `welcome` frame). Because the worker's relay callSeq is
+ * a per-PROCESS counter that resets to 0 on every respawn (its callIds repeat as wc1, wc2, …), the hub needs
+ * a process identity to distinguish a RESPAWN (new generation → its reused callIds must NOT hit the dead
+ * worker's served-write cache) from a socket FLAP to the SAME process (same generation → the cache is kept
+ * for §8.2 re-flush dedup). Random, so a respawn can never accidentally reuse its predecessor's value. (F1)
+ */
+export function newWorkerGeneration(): string {
+  return `wg_${crypto.randomBytes(12).toString('hex')}`
 }
 
 /**

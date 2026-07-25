@@ -271,6 +271,9 @@ class FakeWorkerClient extends EventEmitter {
   onRestartRequest(cb: (m: unknown) => void): void {
     this.on('restartRequest', cb)
   }
+  onWelcome(cb: (m: unknown) => void): void {
+    this.on('welcome', cb)
+  }
   isAttached(): boolean {
     return true
   }
@@ -372,6 +375,71 @@ describe('(a) stable-callId write dedup — a re-flushed write executes exactly 
     expect(results).toHaveLength(2)
     expect((results[0].value as { id: string }).id).toBe(seeded.id)
     expect((results[1].value as { id: string }).id).toBe(seeded.id)
+  })
+
+  // --- F1: a served write must NOT survive a worker RESPAWN (only a same-worker flap) --------------
+  // `servedWrites` is keyed by callId ALONE, but a callId is unique only WITHIN one worker process — the
+  // worker's callSeq resets to 0 on a respawn, so wc1, wc2, … repeat. Without the generation handshake the
+  // pre-respawn cache would serve a NEW era's wc1 the DEAD era's result (id=OLD) and the new write would
+  // never run. These two prove the fix: a respawn (new generation) invalidates the cache, while a same-
+  // generation socket flap keeps it so §8.2 re-flush dedup is untouched.
+
+  it('a worker RESPAWN (new generation) drops the stale cache — the new era wc1 RUNS a fresh write, not the dead era result (F1)', async () => {
+    const { sessions, client } = build()
+
+    // Worker ERA 1 attaches (generation wg-era1) and serves wc1 → cached, id = OLD.
+    client.emit('welcome', { generation: 'wg-era1' })
+    const era1Args = { scope: 'account:p1', title: 'Era note', body: 'first era', fromSession: 's1', fromProfile: 'p1' }
+    client.emit('relay', { t: 'rpc', callId: 'wc1', method: 'memory.write', args: era1Args })
+    await flush()
+    const afterEra1 = client.sent.filter((m): m is Extract<HubToWorker, { t: 'rpcResult' }> => m.t === 'rpcResult')
+    expect(afterEra1).toHaveLength(1)
+    const oldId = (afterEra1[0].value as { id: string }).id
+
+    // The worker CRASHES ~10s later and hubctl RESPAWNS it: a fresh process → callSeq resets to 0 (wc1 again)
+    // under a NEW generation. The SAME hub reconnects on the same socket; the successor's `welcome` announces
+    // the new generation AHEAD of any of its rpcs (WorkerServer sends welcome before the relay re-flush).
+    client.emit('welcome', { generation: 'wg-era2' })
+
+    // The resumed/new turn's first write is again wc1 — with DIFFERENT content.
+    const era2Args = { scope: 'account:p1', title: 'Era note', body: 'second era', fromSession: 's1', fromProfile: 'p1' }
+    client.emit('relay', { t: 'rpc', callId: 'wc1', method: 'memory.write', args: era2Args })
+    await flush()
+
+    const results = client.sent.filter((m): m is Extract<HubToWorker, { t: 'rpcResult' }> => m.t === 'rpcResult')
+    expect(results).toHaveLength(2)
+    const newId = (results[1].value as { id: string }).id
+    // The crux: the respawned worker's write RAN — a fresh id, NOT the dead era's cached OLD id.
+    expect(newId).not.toBe(oldId)
+
+    // And the store holds BOTH rows: two real writes ran (the second was NOT served from the stale cache).
+    const rows = sessions.runRelay('memory.search', { query: 'Era', opts: { scopes: ['account:p1'] } }) as Array<{ id: string; body: string }>
+    expect(rows).toHaveLength(2)
+    expect(rows.map((r) => r.body).sort()).toEqual(['first era', 'second era'])
+  })
+
+  it('a same-generation socket FLAP keeps the cache — a re-flushed wc1 returns the cached result, write ran once (§8.2)', async () => {
+    const { sessions, client } = build()
+    const writeArgs = { scope: 'account:p1', title: 'Flap note', body: 'once', fromSession: 's1', fromProfile: 'p1' }
+
+    // Attach (generation wg-1) and serve wc1 → cached, id = ID0.
+    client.emit('welcome', { generation: 'wg-1' })
+    client.emit('relay', { t: 'rpc', callId: 'wc1', method: 'memory.write', args: writeArgs })
+    await flush()
+
+    // A socket FLAP to the SAME worker: the transport re-attaches (SAME generation) and re-flushes the pending
+    // wc1. The generation is unchanged, so the cache is KEPT — the re-flush must dedup, not write a second row.
+    client.emit('welcome', { generation: 'wg-1' })
+    client.emit('relay', { t: 'rpc', callId: 'wc1', method: 'memory.write', args: writeArgs })
+    await flush()
+
+    const results = client.sent.filter((m): m is Extract<HubToWorker, { t: 'rpcResult' }> => m.t === 'rpcResult')
+    expect(results).toHaveLength(2)
+    expect((results[1].value as { id: string }).id).toBe((results[0].value as { id: string }).id) // deduped
+
+    // Exactly one row — the write ran once across the flap.
+    const rows = sessions.runRelay('memory.search', { query: 'Flap', opts: { scopes: ['account:p1'] } }) as unknown[]
+    expect(rows).toHaveLength(1)
   })
 })
 

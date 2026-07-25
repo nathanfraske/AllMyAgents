@@ -78,7 +78,15 @@ export class WorkerExecutor implements Executor {
   // stable callId, e.g. the socket dropped between our write and its reply) returns the FIRST result instead
   // of executing a second time, so memory.write / practices.write / bus.send run exactly once across a flip.
   // Keyed by the worker's stable rpc callId; bounded by size + TTL (short-lived, see the constants above).
+  // A callId is only stable WITHIN one worker process — the worker's callSeq resets to 0 on a respawn — so
+  // this cache is dropped whenever a NEW worker generation attaches (onWorkerGeneration), never consulted
+  // across a respawn; a same-generation flap keeps it (F1).
   private readonly servedWrites = new Map<string, { reply: Promise<RpcReplyBody>; at: number }>()
+  // The generation of the worker whose writes currently populate `servedWrites`. A `welcome` announcing a
+  // DIFFERENT generation is a worker RESPAWN — its reused wc1, wc2, … would collide with the dead worker's
+  // cached results, so the cache is cleared before those callIds are consulted; a same-generation `welcome`
+  // is a socket flap and keeps the cache. Undefined until the first attach. (F1)
+  private currentGeneration: string | undefined
 
   constructor(
     private readonly client: WorkerClient,
@@ -101,6 +109,12 @@ export class WorkerExecutor implements Executor {
       if (msg.t === 'rpc') this.dispatchRpc(msg)
       else this.dispatchApproval(msg)
     })
+    // The attached worker's generation handshake (§8.2 / F1). A CHANGE means the worker RESPAWNED (its
+    // callSeq reset to wc1), so the served-write cache — keyed by callId alone — must be dropped before its
+    // reused callIds are consulted, else a new-era write returns the DEAD era's cached id and never runs.
+    // Arrives ahead of any re-flushed rpc (WorkerServer sends `welcome` before flushing the relay lane), so
+    // the clear always wins the race. A same-generation flap keeps the cache, preserving re-flush dedup.
+    this.client.onWelcome((m) => this.onWorkerGeneration(m.generation))
     // Re-attach on every (re)connect (§6) — THE survival loop. A fresh hub (started by hubctl after its
     // predecessor died) or this hub after a socket flap runs attachWorker(): reconcile each restored session
     // against the worker's still-live drivers and replay the in-flight turn's event gap (listLive + attach),
@@ -229,6 +243,22 @@ export class WorkerExecutor implements Executor {
           : { t: 'rpcResult', callId: msg.callId, ok: false, error: body.error }
       )
     })
+  }
+
+  /**
+   * React to a worker's announced generation (its `welcome`, sent on every attach). A CHANGE means the
+   * worker RESPAWNED: its per-process callSeq reset to 0, so its next writes reuse the callIds wc1, wc2, …
+   * that the DEAD worker already served. `servedWrites` is keyed by callId alone, so those reused ids would
+   * wrongly hit the dead worker's cached results and the new writes would never run (F1) — drop the whole
+   * cache so the respawned worker's writes execute. A SAME-generation welcome is a socket flap to the same
+   * worker: the cache is kept, so a re-flushed write (§8.2) still dedups to its first result. The first
+   * welcome (undefined → G) sets the generation without clearing (there is nothing cached yet).
+   */
+  private onWorkerGeneration(generation: string): void {
+    if (this.currentGeneration !== undefined && this.currentGeneration !== generation) {
+      this.servedWrites.clear()
+    }
+    this.currentGeneration = generation
   }
 
   /** A previously-served WRITE result for this stable callId, if still cached and fresh (§8.2) — else

@@ -44,6 +44,7 @@ import type { DangerFlags } from './types.js'
 import {
   HUB_UNAVAILABLE_TEXT,
   HubUnavailableError,
+  newWorkerGeneration,
   stableApprovalId,
   type HubToWorker,
   type LiveSession,
@@ -199,6 +200,12 @@ export class AgentWorker {
   // WorkerServer keeps the same pending entry (it re-writes the same msg on attach), so the successor hub
   // can dedup a re-sent write by callId (§8.2) — the served-callId cache itself is STEP 7.
   private callSeq = 0
+  // This worker PROCESS's generation id — minted once, announced to every hub that attaches (the `welcome`
+  // handshake). callSeq above resets to 0 on each fresh process, so wc1, wc2, … repeat across a respawn; the
+  // generation lets the hub tell a RESPAWN (new id → drop its now-stale served-write cache, whose reused
+  // callIds would otherwise collide) from a socket FLAP to this same process (same id → keep the cache for
+  // §8.2 re-flush dedup). F1.
+  private readonly generation = newWorkerGeneration()
   // Last Danger Zone flags the hub pushed — via `hello` on every (re)connect (WorkerClient reads the live
   // danger fresh, so this is the fail-safe connect-time push) or a live `dangerUpdate`. Read by the MCP
   // gates through `workerServices.danger()`; safe-default (all-OFF) until the first push.
@@ -209,6 +216,11 @@ export class AgentWorker {
       onMessage: (msg) => this.onCommand(msg),
       onAttach: (info) => {
         this.danger = info.danger
+        // Announce this process's generation to the freshly-attached hub — the handshake reply to its `hello`.
+        // WorkerServer.attach() calls onAttach BEFORE it re-flushes the pending relay lane, so this `welcome`
+        // reaches the hub ahead of any re-flushed rpc; the hub thus updates/clears its served-write cache
+        // before a re-flushed (or new-era) write could be consulted against it (F1).
+        this.server.send({ t: 'welcome', generation: this.generation })
       },
       // onBufferedEvent is deliberately left unset: every event/lifecycle message is appended to the
       // wseq buffer at emit time (to assign its wseq), so the buffer ALREADY retains it — there is nothing
