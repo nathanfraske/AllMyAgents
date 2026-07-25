@@ -292,3 +292,25 @@ stale high-water mark and drops the new turn's gap events).
 If a hub's `WorkerClient` exhausts a long reconnect budget (worker present but wedged), signal hubctl to
 `killTree` + respawn the worker. Kept out of the first cut (failure-amplification risk); plain
 respawn-on-exit covers the common case.
+
+## Worker code updates need a worker restart (found live 2026-07-25) — ALPHA BLOCKER for the updater
+
+A blue-green hub restart intentionally leaves the worker running, so a live turn survives. But the DRIVERS
+run in the worker (`adapters/claude.ts`, `adapters/codex.ts`, `agentWorker.ts`, worker-side tool handlers),
+which means **an edit to driver code is not picked up by a hub restart at all**. Observed exactly that: a
+codex adapter fix landed, the hub was restarted and had the fix, and Codex still failed because the worker
+predated it.
+
+Today the only remedy is killing the worker (hubctl respawns it with the new code), which kills the live
+turns it was hosting — including the agent that asked.
+
+Needed:
+- **Turn-boundary worker refresh**: drain → wait for the roster to go idle (bounded, like
+  `RESTART_MAX_DEFER_MS`) → respawn the worker → re-attach. A `POST /api/restart {worker:true}` or a
+  `restartWorker` supervisor command.
+- **The auto-updater must use it.** An app update that changes driver code while a worker survives applies
+  silently to nothing. Either refresh the worker as part of the update, or report clearly that the running
+  worker is still on the old build.
+- **Surface staleness**: the hub knows its own build/commit; have the worker report its own on `welcome`
+  (the generation handshake already exists) and warn when they diverge, so this is visible instead of
+  looking like "the fix didn't work".

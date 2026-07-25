@@ -888,6 +888,30 @@ so the first launch after enabling it is necessarily a cold restart. `scripts/re
 performs that one-time transition safely from outside the hub's process tree (with a rehearsal in
 `scripts/rehearse-worker-boot.mjs` and an automatic fallback to the previous launch shape).
 
+### ⚠️ The flip side — the worker is a stale-code island
+
+Survival and updatability pull in opposite directions, and the seam is not where you would guess.
+A blue-green restart replaces the **hub** and deliberately leaves the **worker** running (that is what keeps
+a live turn alive). But the worker is where the DRIVERS live — `adapters/claude.ts`, `adapters/codex.ts`,
+`agentWorker.ts`, the agent tool handlers. So:
+
+| Code | Picks up an edit on a hub restart? |
+| --- | --- |
+| Routes, sessions, journal, projects (hub-side) | ✅ yes |
+| Claude/Codex drivers, worker-side tool handlers | ❌ **no — needs a WORKER restart** |
+
+Observed live: a fix to `adapters/codex.ts` was committed, the operator restarted the hub, the hub picked
+the fix up — and Codex kept failing, because the worker spawning codex was still the process started before
+the fix (`hubctl 11:38:17 → worker 11:38:18`, hub `13:03:46`).
+
+**Today's remedy:** kill the worker process; hubctl's exit handler respawns it automatically with the new
+code (`spawnWorker`'s respawn-unless-tearing-down path). Live turns in that worker die — including any
+agent asking for the restart — so it is a turn-boundary operation, not a free one.
+
+**This is an ALPHA-BLOCKING gap for the auto-updater:** shipping an update that touches driver code while a
+worker survives means the update silently does not take effect. The updater must refresh the worker (ideally
+at a turn boundary, draining first) or say plainly that it did not. Tracked in docs/backlog.md.
+
 **What this unlocks:** the dogfooding paradox is broken. The hub can now be repaired, updated, and
 restarted *while it is being used*, without killing the agents doing the work — including the agent doing
 the repair.
