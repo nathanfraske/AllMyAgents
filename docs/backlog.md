@@ -109,6 +109,18 @@ risk×requested policy table + open questions in `docs/auto-mode-safety-checker.
   indicator, so the operator isn't left on read mid-compaction — a `session/status:'compacting'` the composer
   surfaces), and a Settings view of **how** a compaction was done (method + what got summarized/dropped).
 
+## Memory budget monitor + over-cap reminder (requested 2026-07-25)
+
+Shared memory (`memory.ts`, written via `memory_write`, injected by auto-recall / `withRecall`) can grow past
+what's actually **usable** — only so much fits in an agent's recall budget, so an unbounded store wastes space
+and silently drops the tail from recall. Add: (a) a **size monitor** per scope (account/project/global/vendor)
++ overall, tracked against a configurable **usable cap** (default = the recall budget), surfaced like the
+existing usage bars; (b) an **over-cap reminder** — when an agent's `memory_write` pushes a scope past the cap,
+the tool result appends a warning (NOT a hard block, per the permissive philosophy): "this scope is over its
+usable memory budget — older/lower-value entries won't be recalled; consider consolidating or trimming."
+Optional follow-ups: a Settings-gated auto-trim policy (LRU / lowest-relevance) and a suggestion of which
+entries to evict. Cap is Settings-configurable; safe default on.
+
 ## Multi-agent coordination (requested 2026-07-25)
 
 - **Cross-worktree conflict detection + habitual bus coordination.** Same-project agents each work in their own
