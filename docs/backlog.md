@@ -163,6 +163,24 @@ monitor service, not a conversational agent). The curator is the lifecycle agent
 hub-internal. Keep them separate. (The auto-mode safety cross-checker, docs/auto-mode-safety-checker.md, is a
 candidate shape for a hub-resident overseer-class role.)
 
+## Overseer — hub-resident lifecycle coordinator (refined 2026-07-25)
+
+The counterpart to the curator: where the curator is the lifecycle agent the OPERATOR talks to, the overseer
+is a **hub-resident** coordinator that OTHER AGENTS message over the bus to request restarts / lifecycle, and
+it orchestrates them safely. The use it unlocks — **dogfooding the hub from inside the app**: run a dev
+project in the app whose target IS the hub; an agent editing the hub that needs a restart to load its own
+changes CANNOT safely self-restart (it would kill its own in-flight work — the dogfooding paradox), so instead
+it `send_message`s the overseer ("I need a restart to pick up my changes"), and the overseer coordinates a
+blue-green restart in which the requesting agent **survives** (the Phase-2 worker keeps its turn + sub-agents
+alive across the bounce) and resumes on the new code. This is exactly the restart-survivable self-hosting in
+`docs/self-hosting-restart-survival.md`, made concrete by the comms backbone + the worker survival now in build.
+- **Composes:** the bus (request channel) + `requestRestart` + blue-green restart + the Phase-2 worker
+  (requester survives) + the restart gate (danger/consent).
+- **Shape:** likely a special always-on hub agent (or a thin hub service) subscribed to restart-request bus
+  messages — applies the gate, coordinates via hubctl, and reports back over the bus when the hub is live again.
+- Distinct from the curator (operator-facing) and the auto-mode safety checker (per-action arbiter), though all
+  three are trusted hub-adjacent roles that could share the isolation/gating machinery.
+
 ## Critical-agent tier (requested 2026-07-24)
 
 An opt-in per-agent designation for maximum restart durability, ON TOP of the Phase-2 worker model
