@@ -211,6 +211,9 @@ interface PendingRelay {
   readonly msg: RelayLaneMsg
   readonly resolve: (reply: RelayReply) => void
   readonly reject: (err: Error) => void
+  /** The Promise handed to the caller — reused to COALESCE a duplicate/re-issued relay (same stable key)
+   *  onto the in-flight one instead of overwriting + orphaning it (H1). */
+  readonly promise: Promise<RelayReply>
   /** The transient→terminal timer, armed ONLY while waiting for a hub to attach (cleared once delivered). */
   timer: ReturnType<typeof setTimeout> | undefined
 }
@@ -283,6 +286,9 @@ export class WorkerServer {
       server.once('error', reject)
       server.listen(this.socketPath, () => {
         server.off('error', reject)
+        // Keep a PERMANENT error listener so a post-listen server error (accept failure, fd exhaustion,
+        // a late pipe error) is logged, never an unhandled 'error' that crashes the immortal worker (M3).
+        server.on('error', (e) => warn(`worker server error: ${e instanceof Error ? e.message : String(e)}`))
         debug(`listening on ${this.socketPath}`)
         resolve()
       })
@@ -320,23 +326,35 @@ export class WorkerServer {
    * the retryable `HUB_UNAVAILABLE_TEXT` shape (§8.3).
    */
   relay(msg: RelayLaneMsg): Promise<RelayReply> {
-    return new Promise<RelayReply>((resolve, reject) => {
-      // Overflow is terminal for the NEWCOMER — never evict an in-flight relay that has an awaiting caller.
-      if (this.pendingRelays.size >= RELAY_QUEUE_MAX) {
-        reject(new HubUnavailableError())
-        return
-      }
-      const entry: PendingRelay = { key: relayKey(msg), msg, resolve, reject, timer: undefined }
-      this.pendingRelays.set(entry.key, entry)
-      if (this.channelReady()) {
-        // Delivered to a live hub; await the reply (which may take up to the hub's own timeout — e.g. an
-        // approval waits on a human). No transient timer while delivered: the 45s bound governs REACHING
-        // a hub, not the reply latency (§8.3).
-        this.write(msg)
-      } else {
-        this.armTimer(entry)
-      }
+    const key = relayKey(msg)
+    // Coalesce a duplicate/re-issued relay onto the in-flight one. The key is a STABLE per-logical-call
+    // id (a re-send after a reconnect, or the same tool call twice, is the SAME call), so returning the
+    // existing Promise instead of overwriting the map avoids orphaning the prior entry — the H1 hang +
+    // timer leak + queue-accounting break.
+    const existing = this.pendingRelays.get(key)
+    if (existing) return existing.promise
+    let resolve!: (reply: RelayReply) => void
+    let reject!: (err: Error) => void
+    const promise = new Promise<RelayReply>((res, rej) => {
+      resolve = res
+      reject = rej
     })
+    // Overflow is terminal for the NEWCOMER — never evict an in-flight relay that has an awaiting caller.
+    if (this.pendingRelays.size >= RELAY_QUEUE_MAX) {
+      reject(new HubUnavailableError())
+      return promise
+    }
+    const entry: PendingRelay = { key, msg, resolve, reject, promise, timer: undefined }
+    this.pendingRelays.set(key, entry)
+    if (this.channelReady()) {
+      // Delivered to a live hub; await the reply (which may take up to the hub's own timeout — e.g. an
+      // approval waits on a human). No transient timer while delivered: the 45s bound governs REACHING a
+      // hub, not the reply latency (§8.3).
+      this.write(msg)
+    } else {
+      this.armTimer(entry)
+    }
+    return promise
   }
 
   /**
@@ -467,7 +485,12 @@ export class WorkerServer {
   private armTimer(entry: PendingRelay): void {
     if (entry.timer) return
     entry.timer = setTimeout(() => {
-      if (this.pendingRelays.delete(entry.key)) entry.reject(new HubUnavailableError())
+      // Identity guard: only settle if THIS entry still owns its slot. Coalescing means it always does,
+      // but this keeps a stale timer from ever cross-evicting a live entry under future refactors.
+      if (this.pendingRelays.get(entry.key) === entry) {
+        this.pendingRelays.delete(entry.key)
+        entry.reject(new HubUnavailableError())
+      }
     }, HUB_RELAY_TIMEOUT_MS)
   }
 

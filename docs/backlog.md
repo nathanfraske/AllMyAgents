@@ -62,6 +62,20 @@ as defense-in-depth for exactly-once journaling; and ensure `stopSession → wse
 reuses a sessionId while the journal still holds higher `wseq` rows (else `lastJournaledWseq` returns a
 stale high-water mark and drops the new turn's gap events).
 
+## Transport audit — handle when wiring the worker (from the slice-3 audit)
+
+- **M2 (draining release):** `WorkerServer.setDraining()` clears `draining` ONLY on a fresh `hello`. When
+  I wire `RestartController.drain() → signalDraining()`, a ROLLED-BACK flip (blue re-listens via
+  `abort()`, no new hello) would leave the worker stuck `draining=true` → every relay from the live turn
+  rejects `HubUnavailableError` even though blue is healthy. Pair the drain pre-signal with a release:
+  `abort()` drops+reconnects blue's `WorkerClient` (a fresh hello resets it), or add an un-drain push.
+- **L4:** `WorkerServer.close()` can hang on a connected-but-never-`hello` socket (untracked) — track every
+  accepted channel + destroy them all in `close()`.
+- **L6:** a delivered `rpc` relay has no backstop; a hub that accepts but never replies hangs the tool
+  Promise forever — add a generous backstop on delivered `rpc` relays (not `approvalRequest`), or document
+  the hub's always-reply obligation as load-bearing.
+- **L8:** `unref()` the reconnect/relay/call timers so a forgotten `close()` can't pin the event loop.
+
 ## Worker health signal (Phase 2 §5.2)
 
 If a hub's `WorkerClient` exhausts a long reconnect budget (worker present but wedged), signal hubctl to

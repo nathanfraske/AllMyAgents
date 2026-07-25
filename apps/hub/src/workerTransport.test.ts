@@ -164,6 +164,23 @@ describe('WorkerServer relay lane — overflow is terminal for the newcomer (nev
   })
 })
 
+describe('WorkerServer relay lane — coalesces a duplicate/re-issued relay (H1)', () => {
+  it('returns the SAME promise for a repeated key, keeps ONE pending entry, and one reply settles both', async () => {
+    const server = unboundServer()
+    const p1 = server.relay(rpc('c1'))
+    const p2 = server.relay(rpc('c1')) // same stable key — a re-issue, not a new call; must NOT orphan p1
+    expect(p2).toBe(p1)
+    expect(server.pendingRelayCount).toBe(1)
+    const s1 = p1.then((r) => r)
+    const s2 = p2.then((r) => r)
+    server.onHub({ t: 'rpcResult', callId: 'c1', ok: true, value: { ok: 1 } })
+    const [r1, r2] = await Promise.all([s1, s2])
+    expect(r1).toEqual(r2)
+    expect(server.pendingRelayCount).toBe(0)
+    await server.close()
+  })
+})
+
 describe('WorkerServer relay lane — the transient→terminal timeout', () => {
   afterEach(() => {
     vi.useRealTimers()
