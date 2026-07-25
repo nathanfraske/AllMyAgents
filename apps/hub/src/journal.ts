@@ -28,7 +28,15 @@ export class Journal extends EventEmitter {
     // hub can derive the durable re-attach cursor MAX(wseq) (docs/agent-worker-impl.md §7.1). Old rows
     // are NULL. Guarded so re-running on an already-migrated DB is a no-op.
     const hasWseq = (this.db.prepare("SELECT 1 FROM pragma_table_info('events') WHERE name = 'wseq'").get() as unknown) != null
-    if (!hasWseq) this.db.exec('ALTER TABLE events ADD COLUMN wseq INTEGER')
+    if (!hasWseq) {
+      try {
+        this.db.exec('ALTER TABLE events ADD COLUMN wseq INTEGER')
+      } catch (e) {
+        // Swallow a lost race on the FIRST migration (two processes both saw the column absent) — the
+        // column exists either way. Any other ALTER failure is real and re-thrown.
+        if (!/duplicate column/i.test(e instanceof Error ? e.message : String(e))) throw e
+      }
+    }
     this.insertStmt = this.db.prepare('INSERT INTO events (ts, session, kind, payload) VALUES (?, ?, ?, ?)')
     this.insertWorkerStmt = this.db.prepare('INSERT INTO events (ts, session, kind, payload, wseq) VALUES (?, ?, ?, ?, ?)')
     this.lastWseqStmt = this.db.prepare('SELECT MAX(wseq) AS m FROM events WHERE session = ? AND wseq IS NOT NULL')

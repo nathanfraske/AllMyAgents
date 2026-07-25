@@ -121,11 +121,13 @@ export function stableApprovalId(sessionId: string, kind: string, payload: unkno
   return `ap_${h.digest('hex').slice(0, 24)}`
 }
 
-/** Stable JSON for hashing — sorts object keys so equal payloads hash equal regardless of key order. */
+/** Stable JSON for hashing — recursively sorts object keys so equal payloads hash equal regardless of
+ *  key order. Uses CODE-UNIT ordering (not localeCompare) so the canonical form is identical across
+ *  runtimes/locales/ICU versions — the whole point is cross-process determinism. */
 function safeStringify(v: unknown): string {
   return JSON.stringify(v, (_k, val) =>
     val && typeof val === 'object' && !Array.isArray(val)
-      ? Object.fromEntries(Object.entries(val as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)))
+      ? Object.fromEntries(Object.entries(val as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
       : val
   )
 }
