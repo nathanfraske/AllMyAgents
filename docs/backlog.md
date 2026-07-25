@@ -65,7 +65,12 @@ browser/computer/visualization, auto-recall) — not gaps. The real gaps:
 
 Each machine runs its own hub, auto-registered as an owner-fleet-only AllMyStuff site (`siteId=tcp:<port>`,
 loopback-bound, tunneled via the owner's node — not a vendor relay), so hubs are reachable across the fleet
-today. Two gaps (feasibility scoping in flight as of 2026-07-24):
+today. **Feasibility (scoped 2026-07-24 → docs/mesh-unified-fleet.md): S–M for a first cut** — the
+AllMyStuff node already exposes the fleet directory (`owned_roster`) + per-peer hub port-mapping
+(`site_map`) + WebSocket-through-tunnel, so NO node change is needed; it's a small `/api/fleet` endpoint
+(reusing meshSite's socket client) + client-side merge/badge, and zero auth work while `requireToken` is
+off (today's default). Full drive-remote is L (multi-hub WS fan-out + routing mutations to the owning hub
++ the cross-site device-token fork — the one real design decision). Two gaps:
 - **No unified roster.** You open one site (machine) at a time; there's no single pane aggregating every
   machine's projects/sessions. Build a fleet roster listing projects across all reachable sites.
 - **No machine tag on projects.** `Project` (types.ts:9) is `{id,name,path,createdAt}` — nothing records
