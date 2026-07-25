@@ -398,7 +398,6 @@ export class SessionManager {
    */
   async attachWorker(): Promise<void> {
     const live = await this.executor.listLive()
-    const liveIds = new Set(live.map((s) => s.sessionId))
     const since: Record<string, number> = {}
     for (const s of live) {
       const record = this.sessions.get(s.sessionId)
@@ -420,6 +419,17 @@ export class SessionManager {
     // sentinel if its ring wrapped), then resumes live emission — the turn finishes on this hub.
     if (Object.keys(since).length) await this.executor.attach(since)
     // Stale sweep: a roster record still active|starting that the worker does NOT hold is genuinely stale.
+    // N1 (TOCTOU) — re-verify staleness against a FRESH listLive() taken HERE, not the top-of-function
+    // snapshot. Between that snapshot and this sweep we awaited attach() (and, on a concurrent green-flip
+    // double-fire, a sibling attachWorker ran); in that window a respawned worker can RESUME a session into a
+    // fresh era, flipping its status LIVE to 'active' and journaling new wseq rows. Judging staleness by the
+    // STALE snapshot while reading status LIVE would then journal a spurious WSEQ_RESET_KIND *after* those
+    // fresh rows — rebasing lastJournaledWseq to 0, hiding the live era (a successor re-journals it as
+    // duplicates) and wrongly flipping the session idle (which can fire a clamped bus turn). A fresh snapshot
+    // reflects the resume, so a re-attached session is correctly live and skipped. It is read with NO await
+    // before the synchronous loop below, so nothing interleaves between the check and the reset: a session
+    // absent HERE holds no live era at this instant, and its reset can only precede — never hide — later rows.
+    const liveIds = new Set((await this.executor.listLive()).map((s) => s.sessionId))
     for (const record of this.sessions.values()) {
       if ((record.status === 'active' || record.status === 'starting') && !liveIds.has(record.id)) {
         record.status = 'idle'

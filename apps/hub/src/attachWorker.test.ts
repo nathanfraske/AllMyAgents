@@ -172,6 +172,9 @@ interface FakeHub {
   store: SessionStore
   sessions: SessionManager
   setLive: (l: LiveSession[]) => void
+  // Run a hook INSIDE executor.attach() — i.e. between attachWorker's liveIds snapshot and its stale sweep —
+  // to interleave a worker-driven era-2 resumption in that exact window (N1's TOCTOU). null clears it.
+  setOnAttach: (fn: ((since: Record<string, number>) => void | Promise<void>) | null) => void
   attachCalls: Array<Record<string, number>>
   // Every executor.runTurn the manager fired (e.g. a deliverBus-triggered 'bus' turn) — F2 asserts a
   // replayed idle does NOT start one.
@@ -203,6 +206,7 @@ interface HubDeps {
  *  controls and whose runTurn is recorded. */
 function wireHub(deps: HubDeps): FakeHub {
   let liveToReturn: LiveSession[] = []
+  let onAttach: ((since: Record<string, number>) => void | Promise<void>) | null = null
   const attachCalls: Array<Record<string, number>> = []
   const runTurnCalls: Array<{ sessionId: string; origin: 'operator' | 'bus' }> = []
   const fakeExecutor: Executor = {
@@ -217,11 +221,14 @@ function wireHub(deps: HubDeps): FakeHub {
     listLive: async () => liveToReturn,
     attach: async (since) => {
       attachCalls.push(since)
+      // Fire the test hook WHILE attach() is in flight — the window between attachWorker's liveIds snapshot
+      // and its stale sweep (N1). Awaited so a resumption it drives is fully applied before the sweep runs.
+      if (onAttach) await onAttach(since)
     },
     isBusy: () => false,
   }
   const sessions = new SessionManager(deps.journal, deps.store, deps.profiles, deps.approvals, deps.usage, deps.workspace, deps.projects, deps.instructions, deps.bus, deps.memory, deps.practices, SAFE, false, deps.tmp, fakeExecutor)
-  return { journal: deps.journal, store: deps.store, sessions, setLive: (l) => (liveToReturn = l), attachCalls, runTurnCalls, rebuild: () => wireHub(deps) }
+  return { journal: deps.journal, store: deps.store, sessions, setLive: (l) => (liveToReturn = l), setOnAttach: (fn) => (onAttach = fn), attachCalls, runTurnCalls, rebuild: () => wireHub(deps) }
 }
 
 /** A SessionManager wired to a FAKE executor whose listLive()/attach() the test controls. A non-InProcess
@@ -545,5 +552,73 @@ describe('SessionManager.attachWorker — the ingest guard never lowers on a rac
     expect(rows6()).toBe(1)
     h.sessions.ingestWorkerEvent('s', 6, 'claude/text', { wq: 6 }) // a stale re-flush of an already-journaled event
     expect(rows6()).toBe(1) // guard held at 8 → the duplicate was dropped (had it lowered to 0, this would be 2)
+  })
+})
+
+// ================================================================================================
+// HUB SIDE — SessionManager.attachWorker() stale sweep re-verifies staleness at sweep time (N1)
+// ================================================================================================
+
+describe('SessionManager.attachWorker — the stale sweep never resets a session that resumed since the snapshot (N1)', () => {
+  it('an era-2 resumption BETWEEN the liveIds snapshot and the sweep is NOT reset (no spurious marker; cursor keeps era-2; no duplicate re-journal)', async () => {
+    const h = buildHub()
+    // `keeper` is an unrelated session the worker still holds — it makes `since` non-empty so attachWorker
+    // AWAITS executor.attach(), the exact window a respawned worker resumes `s` in. `s` was mid-turn when the
+    // hub died and the worker RESPAWNED, so it is absent from the top-of-function snapshot → a stale-sweep
+    // candidate — until it resumes a fresh era mid-attach.
+    seedRecord(h.store, 'keeper', 'active')
+    seedRecord(h.store, 's', 'active')
+    h.sessions.loadRecords()
+    // Top-of-function snapshot: the worker holds only `keeper`; `s` is absent (its era-1 driver is gone).
+    h.setLive([{ sessionId: 'keeper', status: 'active', lastWseq: 0 }])
+
+    // THE INTERLEAVE: while attachWorker is awaiting executor.attach({keeper:0}) — after the liveIds snapshot,
+    // before the stale sweep — the fresh worker RESUMES `s` into ERA 2: turnStarted flips it active and wseq
+    // 1,2 land in the journal. listLive now reports `s` live (the reality the stale top snapshot missed). This
+    // is the single-call form of the green-flip double-fire: the resume lands inside the snapshot→sweep gap.
+    h.setOnAttach(() => {
+      h.sessions.applyLifecycle({ t: 'turnStarted', sessionId: 's', wseq: 1 }) // era-2 turn begins → s active
+      h.sessions.ingestWorkerEvent('s', 1, 'claude/text', { era: 2, wq: 1 }) //   fresh wseq row journaled
+      h.sessions.ingestWorkerEvent('s', 2, 'claude/text', { era: 2, wq: 2 }) //   fresh wseq row journaled
+      h.setLive([
+        { sessionId: 'keeper', status: 'active', lastWseq: 0 },
+        { sessionId: 's', status: 'active', lastWseq: 2 }, // the worker now holds the resumed session
+      ])
+      h.setOnAttach(null) // one-shot — don't re-resume on any later attach
+    })
+
+    await h.sessions.attachWorker()
+
+    // PROOF 1 — no spurious reset: the sweep re-checks a FRESH listLive() (now including `s`), so the resumed
+    // session is skipped. Pre-fix the STALE snapshot journals a WSEQ_RESET_KIND for `s` AFTER its era-2 rows.
+    const resetRows = h.journal.since(0).filter((e) => e.sessionId === 's' && e.kind === WSEQ_RESET_KIND)
+    expect(resetRows).toHaveLength(0)
+
+    // PROOF 2 — the durable re-attach cursor reflects ERA 2 (max wseq 2), NOT 0. A spurious reset appended
+    // after the era-2 rows would rebase MAX(wseq WHERE seq > reset) to 0, hiding the live era.
+    expect(h.sessions.lastJournaledWseq('s')).toBe(2)
+
+    // PROOF 3 — `s` stays active across the seam; a spurious sweep would wrongly flip it idle (and could then
+    // fire a clamped bus turn on a session the worker is still mid-turn on).
+    expect(h.sessions.list().find((r) => r.id === 's')!.status).toBe('active')
+
+    // PROOF 4 — a SUBSEQUENT re-attach (successor hub, fresh in-memory ingestedWseq) seeds since[s] from the
+    // ERA-2 cursor (2) and does NOT re-journal the era-2 rows as duplicates. Pre-fix since would be 0 and the
+    // worker's replay of wseq 1,2 would be re-journaled (the durable duplication N1 introduces).
+    const h2 = h.rebuild()
+    h2.sessions.loadRecords()
+    h2.setLive([{ sessionId: 's', status: 'active', lastWseq: 2 }])
+    await h2.sessions.attachWorker()
+    expect(h2.attachCalls).toEqual([{ s: 2 }]) // replay only wseq > 2 — the era-2 rows are already durable
+
+    // The worker re-flushes wseq 1,2 (≤ cursor) on replay → DROPPED; a genuinely new wseq 3 is journaled once.
+    h2.sessions.ingestWorkerEvent('s', 1, 'claude/text', { era: 2, wq: 1 })
+    h2.sessions.ingestWorkerEvent('s', 2, 'claude/text', { era: 2, wq: 2 })
+    h2.sessions.ingestWorkerEvent('s', 3, 'claude/text', { era: 2, wq: 3 })
+    const era2 = h2.journal
+      .since(0)
+      .filter((e) => e.sessionId === 's' && (e.payload as { era?: number }).era === 2)
+      .map((e) => (e.payload as { wq: number }).wq)
+    expect(era2).toEqual([1, 2, 3]) // each fresh event present exactly once — no duplicates from a spurious reset
   })
 })
