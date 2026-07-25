@@ -8,6 +8,9 @@ interface PendingEntry {
   record: ApprovalRecord
   resolve: (approved: boolean) => void
   timer: NodeJS.Timeout
+  // The Promise handed back to the original caller. Kept so a re-issue of the same still-pending id
+  // returns the identical Promise instead of minting a duplicate (docs/agent-detachment-impl.md §2.5).
+  promise: Promise<boolean>
 }
 
 export class ApprovalService {
@@ -19,9 +22,25 @@ export class ApprovalService {
     return [...this.pendingMap.values()].map((e) => e.record)
   }
 
-  request(sessionId: string, kind: string, payload: unknown): Promise<boolean> {
+  /**
+   * Request operator approval. Resolves `true` (approved), `false` (denied), or `false` (fail-closed
+   * once the {@link APPROVAL_TIMEOUT_MS} window elapses).
+   *
+   * `id` is OPTIONAL and last, so every existing caller (which passes none) is unchanged. When omitted
+   * an id is generated as before. A caller that must survive a hub restart — a detached agent worker,
+   * docs/agent-detachment-impl.md §2.5 — supplies a STABLE id so it can RE-ISSUE the same request:
+   * - id already pending on THIS hub  → dedup no-op: returns the existing pending Promise, creates no
+   *   second entry and journals no second `approval/requested`.
+   * - id not pending (e.g. a freshly restarted hub whose in-memory map is empty) → treated as a fresh
+   *   request under that exact id and journaled, which is precisely the re-attach path.
+   */
+  request(sessionId: string, kind: string, payload: unknown, id?: string): Promise<boolean> {
+    if (id !== undefined) {
+      const existing = this.pendingMap.get(id)
+      if (existing) return existing.promise // re-issue/dedup: same Promise, no duplicate entry, no re-journal
+    }
     const record: ApprovalRecord = {
-      id: crypto.randomUUID(),
+      id: id ?? crypto.randomUUID(),
       sessionId,
       kind,
       payload,
@@ -29,21 +48,31 @@ export class ApprovalService {
       createdAt: new Date().toISOString(),
     }
     this.journal.append(sessionId, 'approval/requested', record)
-    return new Promise<boolean>((resolve) => {
-      const timer = setTimeout(() => {
-        this.finish(record.id, false, 'timeout')
-      }, APPROVAL_TIMEOUT_MS)
-      this.pendingMap.set(record.id, { record, resolve, timer })
+    let resolve!: (approved: boolean) => void
+    const promise = new Promise<boolean>((res) => {
+      resolve = res
     })
+    const timer = setTimeout(() => {
+      this.finish(record.id, false, 'timeout')
+    }, APPROVAL_TIMEOUT_MS)
+    this.pendingMap.set(record.id, { record, resolve, timer, promise })
+    return promise
   }
 
+  /**
+   * Resolve a pending approval. IDEMPOTENT: resolving an id that is unknown or already resolved
+   * (including one that already timed out) is a safe no-op that returns `false` — it never throws
+   * and never double-settles the already-settled Promise. Returns `true` only when this call is the
+   * one that actually settled a pending entry. (Kept as a boolean so the `/api/approvals/:id` route's
+   * `found ? 200 : 404` contract is preserved.)
+   */
   resolve(id: string, approved: boolean): boolean {
     return this.finish(id, approved, approved ? 'approved' : 'denied')
   }
 
   private finish(id: string, approved: boolean, status: ApprovalRecord['status']): boolean {
     const entry = this.pendingMap.get(id)
-    if (!entry) return false
+    if (!entry) return false // idempotent no-op: unknown or already-resolved/timed-out id
     this.pendingMap.delete(id)
     clearTimeout(entry.timer)
     entry.record.status = status
