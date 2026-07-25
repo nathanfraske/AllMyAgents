@@ -78,6 +78,15 @@ off (today's default). Full drive-remote is L (multi-hub WS fan-out + routing mu
   local-vs-mesh by it. Access model: the **agent runs where the files are local**; you drive it remotely
   over the mesh — so the machine tag is what routes execution (no file-shipping).
 
+## Auto mode — isolated AI safety cross-checker (roadmap; requested 2026-07-25) → docs/auto-mode-safety-checker.md
+
+A new permission tier `auto` between `edits` and `full`: the operator designates a **hub-attached, ISOLATED**
+agent (no bus, no shared memory — uninfluenceable) that reviews each risky action and auto-decides
+allow / deny / escalate by **risk level × whether the action was requested**. Replaces per-action human
+approval without going ungated; `escalate` / checker-down falls back to operator approval (never fail-open).
+Plugs into `canUseTool`/`onApproval` (fast-path safe reads; a relay in worker mode). Full scope + the
+risk×requested policy table + open questions in `docs/auto-mode-safety-checker.md`. Not implemented.
+
 ## Critical-agent tier (requested 2026-07-24)
 
 An opt-in per-agent designation for maximum restart durability, ON TOP of the Phase-2 worker model
