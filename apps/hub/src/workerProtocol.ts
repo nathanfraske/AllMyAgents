@@ -47,10 +47,13 @@ export type WorkerToHub =
   // vendor event stream — the SAME kinds the hub journals today (claude/*, codex/*, session/tokens, …),
   // each tagged sessionId + a per-session monotonic wseq (§7):
   | { t: 'event'; sessionId: string; wseq: number; kind: string; payload: unknown }
-  // turn lifecycle — drives the hub's setStatus + vendorSessionId persistence + deliverBus:
-  | { t: 'turnStarted'; sessionId: string; wseq: number }
-  | { t: 'turnCompleted'; sessionId: string; wseq: number; vendorSessionId?: string }
-  | { t: 'turnError'; sessionId: string; wseq: number; message: string }
+  // turn lifecycle — drives the hub's setStatus + vendorSessionId persistence + deliverBus. `replay` is set
+  // ONLY when the worker re-emits a buffered marker during attach() replay (F2): the hub then restores status
+  // in-memory but does NOT re-journal the already-durable session/status|session/error row, nor fire a
+  // transient-idle deliverBus. Absent (undefined) on every live emission.
+  | { t: 'turnStarted'; sessionId: string; wseq: number; replay?: boolean }
+  | { t: 'turnCompleted'; sessionId: string; wseq: number; vendorSessionId?: string; replay?: boolean }
+  | { t: 'turnError'; sessionId: string; wseq: number; message: string; replay?: boolean }
   // self-gating tool-handler relays (worker's MCP handlers reaching hub-owned services):
   | { t: 'approvalRequest'; approvalId: string; sessionId: string; kind: string; payload: unknown }
   | { t: 'rpc'; callId: string; method: RelayMethod; args: unknown } // callId STABLE across re-flush → hub dedups writes (§8.2)

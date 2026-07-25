@@ -5,6 +5,16 @@ import Database from 'better-sqlite3'
 import { redact } from './redact.js'
 import type { HubEvent } from './types.js'
 
+/**
+ * The per-session marker a restarted hub journals when the worker has respawned and the session's worker
+ * `wseq` will RESTART at 1 for the next worker era (docs/agent-worker-impl.md §7.1 — F1). The reset-aware
+ * {@link Journal.lastJournaledWseq} counts only wseq rows journaled AFTER the latest such marker, so the
+ * durable re-attach cursor rebases to 0 for the new era instead of returning the stale old-era `MAX(wseq)`
+ * (which would seed a too-high cursor and silently DROP the fresh turn's live events). Append-only +
+ * additive: a DB with no marker (old rows, the flag-off path) counts every row exactly as before.
+ */
+export const WSEQ_RESET_KIND = 'session/wseq-reset'
+
 export class Journal extends EventEmitter {
   readonly db: Database.Database
   private readonly insertStmt: Database.Statement
@@ -39,7 +49,16 @@ export class Journal extends EventEmitter {
     }
     this.insertStmt = this.db.prepare('INSERT INTO events (ts, session, kind, payload) VALUES (?, ?, ?, ?)')
     this.insertWorkerStmt = this.db.prepare('INSERT INTO events (ts, session, kind, payload, wseq) VALUES (?, ?, ?, ?, ?)')
-    this.lastWseqStmt = this.db.prepare('SELECT MAX(wseq) AS m FROM events WHERE session = ? AND wseq IS NOT NULL')
+    // RESET-AWARE (docs/agent-worker-impl.md §7.1 — F1): the durable re-attach cursor is the highest wseq
+    // journaled for this session SINCE its latest WSEQ_RESET_KIND marker (COALESCE → 0 when there is none, so
+    // an unmarked/legacy DB counts every row exactly as before). A worker respawn restarts the session's wseq
+    // at 1; journaling a reset marker on the stale-sweep rebases this query so the old era's high wseq can no
+    // longer contaminate the successor's cursor and drop the fresh turn's events.
+    this.lastWseqStmt = this.db.prepare(
+      `SELECT MAX(wseq) AS m FROM events
+         WHERE session = ? AND wseq IS NOT NULL
+           AND seq > COALESCE((SELECT MAX(seq) FROM events WHERE session = ? AND kind = ?), 0)`
+    )
     this.sinceStmt = this.db.prepare(
       'SELECT seq, ts, session, kind, payload FROM events WHERE seq > ? ORDER BY seq ASC LIMIT ?'
     )
@@ -74,10 +93,12 @@ export class Journal extends EventEmitter {
     return event
   }
 
-  /** Highest worker `wseq` durably journaled for a session (0 if none) — the exactly-once re-attach
-   *  cursor handed to the worker's attach(since) at hub boot (docs/agent-worker-impl.md §7.1). */
+  /** Highest worker `wseq` durably journaled for a session SINCE its latest {@link WSEQ_RESET_KIND} marker
+   *  (0 if none) — the exactly-once re-attach cursor handed to the worker's attach(since) at hub boot
+   *  (docs/agent-worker-impl.md §7.1). Reset-aware so a worker respawn (wseq restarts at 1) does not seed a
+   *  stale, too-high cursor from the previous era's rows. */
   lastJournaledWseq(sessionId: string): number {
-    const row = this.lastWseqStmt.get(sessionId) as { m: number | null } | undefined
+    const row = this.lastWseqStmt.get(sessionId, sessionId, WSEQ_RESET_KIND) as { m: number | null } | undefined
     return row?.m ?? 0
   }
 

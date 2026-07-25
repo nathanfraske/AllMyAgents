@@ -474,15 +474,20 @@ export class AgentWorker {
    * becomes its turnStarted/turnCompleted/turnError lifecycle message (so the hub drives status via
    * applyLifecycle, never by sniffing a generic event kind); every other kind — real vendor events AND the
    * worker/attach-gap sentinel — replays as a generic `event`. The wseq is the buffered one, verbatim.
+   *
+   * F2: each replayed lifecycle marker carries `replay: true` so the hub restores in-memory status WITHOUT
+   * re-journaling the already-durable session/status|session/error row or firing a transient-idle deliverBus.
+   * Vendor events need no such flag — the hub dedups them by wseq against its durable cursor. Live emission
+   * (emitTurn*) never sets `replay`.
    */
   private replayMessage(sessionId: string, ev: BufferedEvent): WorkerToHub {
     switch (ev.kind) {
       case WSEQ_TURN_STARTED:
-        return { t: 'turnStarted', sessionId, wseq: ev.wseq }
+        return { t: 'turnStarted', sessionId, wseq: ev.wseq, replay: true }
       case WSEQ_TURN_COMPLETED:
-        return { t: 'turnCompleted', sessionId, wseq: ev.wseq, vendorSessionId: (ev.payload as { vendorSessionId?: string } | null)?.vendorSessionId }
+        return { t: 'turnCompleted', sessionId, wseq: ev.wseq, vendorSessionId: (ev.payload as { vendorSessionId?: string } | null)?.vendorSessionId, replay: true }
       case WSEQ_TURN_ERROR:
-        return { t: 'turnError', sessionId, wseq: ev.wseq, message: (ev.payload as { message?: string } | null)?.message ?? 'turn failed' }
+        return { t: 'turnError', sessionId, wseq: ev.wseq, message: (ev.payload as { message?: string } | null)?.message ?? 'turn failed', replay: true }
       default:
         return { t: 'event', sessionId, wseq: ev.wseq, kind: ev.kind, payload: ev.payload }
     }

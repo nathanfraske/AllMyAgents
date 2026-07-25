@@ -5,7 +5,7 @@ import { defaultHomeProfiles } from './profiles.js'
 import { mapCodexTokenUsage } from './adapters/codex.js'
 import { readHistoryPage, locateTranscript, type HistoryPage } from './transcript.js'
 import type { ApprovalService } from './approvals.js'
-import type { Journal } from './journal.js'
+import { WSEQ_RESET_KIND, type Journal } from './journal.js'
 import type { ProjectStore } from './projects.js'
 import type { SessionStore } from './store.js'
 import type { UsageMonitor } from './usage.js'
@@ -134,12 +134,26 @@ export class SessionManager {
    * journaled (persist + deliverBus both no-op once the session is gone), so a delete-during-turn stays
    * byte-identical. Shared by the in-process hub hooks and the worker's applyLifecycle (§3.2).
    */
-  private setStatusById(sessionId: string, status: SessionStatus): void {
+  private setStatusById(sessionId: string, status: SessionStatus, replay = false): void {
     const record = this.sessions.get(sessionId)
     if (record) {
+      // F2 — attach-REPLAY: on re-attach the worker re-emits the buffered turn-lifecycle markers so the
+      // successor restores in-memory status, but their derived session/status rows are ALREADY durable from
+      // the prior hub. Re-journaling them duplicates transcript rows (out of temporal order in the reconnected
+      // pane) and a replayed idle would schedule a transient deliverBus that could start a clamped bus turn on
+      // a session the worker is still mid-turn on. So a replayed transition updates memory + the store snapshot
+      // ONLY — no journal, no deliverBus. The live post-replay stream drives the real transitions.
+      if (replay) {
+        record.status = status
+        this.persist(record)
+        return
+      }
       this.setStatus(record, status)
       return
     }
+    // Record deleted mid-turn: a replayed marker for a session that is gone is inert (no journal, no deliverBus);
+    // a LIVE marker keeps the byte-identical delete-during-turn fallback (trailing session/status + idle→bus).
+    if (replay) return
     this.journal.append(sessionId, 'session/status', { status })
     if (status === 'idle') setImmediate(() => this.deliverBus(sessionId))
   }
@@ -205,19 +219,26 @@ export class SessionManager {
    * → persist the vendorSessionId (if the worker learned one — a claude turn does mid-flight) + idle;
    * turnError → journal session/error + error. Status is thus driven by explicit lifecycle, never sniffed
    * from event kinds (cleaner than the pre-seam codex/turn/completed sniff).
+   *
+   * F2 — REPLAYED markers (msg.replay, set by the worker's attach() replay): the derived session/status /
+   * session/error rows are already durable from the prior hub, so a replayed marker restores in-memory
+   * status + vendorSessionId WITHOUT re-journaling a duplicate row and WITHOUT a transient-idle deliverBus
+   * (which could start a clamped bus turn on a session still mid-turn in the worker). Final status +
+   * vendorSessionId stay correct; the live post-replay stream drives the real transitions.
    */
   applyLifecycle(msg: Extract<WorkerToHub, { t: 'turnStarted' | 'turnCompleted' | 'turnError' }>): void {
+    const replay = msg.replay === true
     switch (msg.t) {
       case 'turnStarted':
-        this.setStatusById(msg.sessionId, 'active')
+        this.setStatusById(msg.sessionId, 'active', replay)
         return
       case 'turnCompleted':
         if (msg.vendorSessionId) this.persistVendorSessionIdById(msg.sessionId, msg.vendorSessionId)
-        this.setStatusById(msg.sessionId, 'idle')
+        this.setStatusById(msg.sessionId, 'idle', replay)
         return
       case 'turnError':
-        this.journal.append(msg.sessionId, 'session/error', { message: msg.message })
-        this.setStatusById(msg.sessionId, 'error')
+        if (!replay) this.journal.append(msg.sessionId, 'session/error', { message: msg.message })
+        this.setStatusById(msg.sessionId, 'error', replay)
         return
     }
   }
@@ -386,7 +407,11 @@ export class SessionManager {
         record.status = 'active' // keep the live turn active across the seam (already persisted active)
         const cursor = this.lastJournaledWseq(s.sessionId) // the DURABLE exactly-once replay cursor (§7.1)
         since[s.sessionId] = cursor
-        this.ingestedWseq.set(s.sessionId, cursor) // seed the steady-state high-water mark to the same cursor
+        // F3: NEVER LOWER the high-water mark. On a green flip, reconcileStale()'s `void attachWorker()` and
+        // the WorkerClient 'attached' handler can run attachWorker concurrently; a second run that read a
+        // stale-low cursor must not pull the guard back beneath events already journaled+guarded (which would
+        // let a re-flush re-journal them). Seed to the MAX of the existing guard and this cursor.
+        this.ingestedWseq.set(s.sessionId, Math.max(this.ingestedWseq.get(s.sessionId) ?? cursor, cursor))
       } else {
         this.setStatus(record, 'idle') // driver alive but no live turn
       }
@@ -398,7 +423,13 @@ export class SessionManager {
     for (const record of this.sessions.values()) {
       if ((record.status === 'active' || record.status === 'starting') && !liveIds.has(record.id)) {
         record.status = 'idle'
-        this.ingestedWseq.delete(record.id) // the worker isn't holding it; a fresh worker turn restarts wseq
+        // F1: the worker no longer holds this session, so its NEXT worker era restarts wseq at 1. Reset BOTH
+        // the in-memory high-water mark AND the durable baseline: drop the in-memory guard, and journal a
+        // WSEQ_RESET_KIND marker that rebases lastJournaledWseq to 0 for the fresh era (docs §7.1). Without
+        // the durable reset, a SECOND hub restart would re-derive since[sid] from the stale old-era MAX(wseq)
+        // and silently drop the fresh turn's live events. Append-only; the marker precedes any fresh-era row.
+        this.ingestedWseq.delete(record.id)
+        this.journal.append(record.id, WSEQ_RESET_KIND, { reason: 'worker respawn — wseq restarts at 1' })
         this.journal.append(record.id, 'session/restored-stale', { note: 'worker had no live driver' })
         this.store.upsert(record)
       }

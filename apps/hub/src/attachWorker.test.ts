@@ -5,7 +5,7 @@ import path from 'node:path'
 import { AgentWorker } from './agentWorker.js'
 import { ATTACH_GAP_KIND, DEFAULT_MAX_PER_SESSION, WseqBuffer } from './wseqBuffer.js'
 import { SessionManager } from './sessions.js'
-import { Journal } from './journal.js'
+import { Journal, WSEQ_RESET_KIND } from './journal.js'
 import { SessionStore } from './store.js'
 import { ProjectStore } from './projects.js'
 import { ApprovalService } from './approvals.js'
@@ -17,7 +17,7 @@ import { MemoryStore } from './memory.js'
 import { PracticeStore } from './practices.js'
 import type { Executor } from './executor.js'
 import type { LiveSession, WorkerToHub } from './workerProtocol.js'
-import type { DangerFlags, Provider, SessionRecord, SessionStatus } from './types.js'
+import type { DangerFlags, Profile, Provider, SessionRecord, SessionStatus } from './types.js'
 
 // STEP 5 (docs/agent-worker-impl.md §6 + §7.1): after a hub restart a fresh hub re-attaches to the still-
 // running worker and the in-flight turn's events replay gap-free, exactly-once. These tests exercise BOTH
@@ -81,24 +81,25 @@ describe('AgentWorker.attach — gap-free, exactly-once replay (worker side, §7
     const sent = captureReplay(w)
     w.attach({ s1: 0 }) // a fresh hub, nothing journaled yet
     // Markers replay AS their lifecycle messages (so the hub's applyLifecycle drives status, not a generic
-    // journal write); vendor events replay AS events. Order + wseq are strictly preserved.
+    // journal write) and carry replay:true (F2 — the hub restores status without re-journaling the already-
+    // durable rows); vendor events replay AS events. Order + wseq are strictly preserved.
     expect(sent).toEqual([
-      { t: 'turnStarted', sessionId: 's1', wseq: 1 },
+      { t: 'turnStarted', sessionId: 's1', wseq: 1, replay: true },
       { t: 'event', sessionId: 's1', wseq: 2, kind: 'claude/text', payload: { text: 'a' } },
       { t: 'event', sessionId: 's1', wseq: 3, kind: 'claude/text', payload: { text: 'b' } },
-      { t: 'turnCompleted', sessionId: 's1', wseq: 4, vendorSessionId: 'vendor-1' },
+      { t: 'turnCompleted', sessionId: 's1', wseq: 4, vendorSessionId: 'vendor-1', replay: true },
     ])
   })
 
-  it('a turnError marker replays as a turnError lifecycle message carrying its message', () => {
+  it('a turnError marker replays as a turnError lifecycle message carrying its message (replay-flagged)', () => {
     const w = makeWorker()
     w.emitTurnStarted('s1') //        wseq 1
     w.emitTurnError('s1', 'boom') //  wseq 2
     const sent = captureReplay(w)
     w.attach({ s1: 0 })
     expect(sent).toEqual([
-      { t: 'turnStarted', sessionId: 's1', wseq: 1 },
-      { t: 'turnError', sessionId: 's1', wseq: 2, message: 'boom' },
+      { t: 'turnStarted', sessionId: 's1', wseq: 1, replay: true },
+      { t: 'turnError', sessionId: 's1', wseq: 2, message: 'boom', replay: true },
     ])
   })
 
@@ -172,28 +173,43 @@ interface FakeHub {
   sessions: SessionManager
   setLive: (l: LiveSession[]) => void
   attachCalls: Array<Record<string, number>>
+  // Every executor.runTurn the manager fired (e.g. a deliverBus-triggered 'bus' turn) — F2 asserts a
+  // replayed idle does NOT start one.
+  runTurnCalls: Array<{ sessionId: string; origin: 'operator' | 'bus' }>
+  // Build a FRESH SessionManager (fresh in-memory sessions + ingestedWseq) over the SAME durable journal +
+  // stores — a faithful stand-in for a SUCCESSOR hub process after a restart (F1's second-restart re-attach).
+  rebuild: () => FakeHub
 }
 
-/** A SessionManager wired to a FAKE executor whose listLive()/attach() the test controls. A non-InProcess
- *  executor puts the manager in WORKER MODE, so boot()/reconcileStale route to attachWorker (§6). */
-function buildHub(): FakeHub {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-attach-'))
-  const journal = new Journal(path.join(tmp, 'hub.db'))
-  const store = new SessionStore(journal.db)
-  const projects = new ProjectStore(journal.db)
-  const approvals = new ApprovalService(journal)
-  const usage = new UsageMonitor(journal, [], {})
-  const workspace = new WorkspaceManager(path.join(tmp, 'wt'))
-  const instructions = new InstructionStore(journal.db)
-  const bus = new AgentBus(journal.db)
-  const memory = new MemoryStore(journal.db)
-  const practices = new PracticeStore(journal.db)
+/** The durable, process-independent state a hub is built over — shared across a rebuild() so a successor
+ *  SessionManager sees exactly the journal + stores its predecessor left behind. */
+interface HubDeps {
+  tmp: string
+  journal: Journal
+  store: SessionStore
+  projects: ProjectStore
+  approvals: ApprovalService
+  usage: UsageMonitor
+  workspace: WorkspaceManager
+  instructions: InstructionStore
+  bus: AgentBus
+  memory: MemoryStore
+  practices: PracticeStore
+  profiles: Map<string, Profile>
+}
 
+/** Wire a fresh SessionManager (WORKER MODE — a non-InProcess executor routes boot()/reconcileStale to
+ *  attachWorker, §6) over the given durable deps, with a FAKE executor whose listLive()/attach() the test
+ *  controls and whose runTurn is recorded. */
+function wireHub(deps: HubDeps): FakeHub {
   let liveToReturn: LiveSession[] = []
   const attachCalls: Array<Record<string, number>> = []
+  const runTurnCalls: Array<{ sessionId: string; origin: 'operator' | 'bus' }> = []
   const fakeExecutor: Executor = {
     startThread: async () => 'tid',
-    runTurn: async () => {},
+    runTurn: async (spec, _prompt, origin) => {
+      runTurnCalls.push({ sessionId: spec.sessionId, origin })
+    },
     steer: async () => {},
     interrupt: async () => {},
     stopSession: async () => {},
@@ -204,16 +220,39 @@ function buildHub(): FakeHub {
     },
     isBusy: () => false,
   }
-  const sessions = new SessionManager(journal, store, new Map(), approvals, usage, workspace, projects, instructions, bus, memory, practices, SAFE, false, tmp, fakeExecutor)
+  const sessions = new SessionManager(deps.journal, deps.store, deps.profiles, deps.approvals, deps.usage, deps.workspace, deps.projects, deps.instructions, deps.bus, deps.memory, deps.practices, SAFE, false, deps.tmp, fakeExecutor)
+  return { journal: deps.journal, store: deps.store, sessions, setLive: (l) => (liveToReturn = l), attachCalls, runTurnCalls, rebuild: () => wireHub(deps) }
+}
+
+/** A SessionManager wired to a FAKE executor whose listLive()/attach() the test controls. A non-InProcess
+ *  executor puts the manager in WORKER MODE, so boot()/reconcileStale route to attachWorker (§6). */
+function buildHub(): FakeHub {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-attach-'))
+  const journal = new Journal(path.join(tmp, 'hub.db'))
+  const deps: HubDeps = {
+    tmp,
+    journal,
+    store: new SessionStore(journal.db),
+    projects: new ProjectStore(journal.db),
+    approvals: new ApprovalService(journal),
+    usage: new UsageMonitor(journal, [], {}),
+    workspace: new WorkspaceManager(path.join(tmp, 'wt')),
+    instructions: new InstructionStore(journal.db),
+    bus: new AgentBus(journal.db),
+    memory: new MemoryStore(journal.db),
+    practices: new PracticeStore(journal.db),
+    // A profile for the seeded records so a deliverBus-built spec resolves (profileOf) in the F2 bus test.
+    profiles: new Map<string, Profile>([['p1', { id: 'p1', provider: 'claude', dir: path.join(tmp, 'p1') }]]),
+  }
   cleanups.push(() => {
     journal.db.close()
     fs.rmSync(tmp, { recursive: true, force: true })
   })
-  return { journal, store, sessions, setLive: (l) => (liveToReturn = l), attachCalls }
+  return wireHub(deps)
 }
 
-function seedRecord(store: SessionStore, id: string, status: SessionStatus, provider: Provider = 'claude'): void {
-  const rec: SessionRecord = { id, profileId: 'p1', provider, cwd: os.tmpdir(), status, createdAt: new Date().toISOString() }
+function seedRecord(store: SessionStore, id: string, status: SessionStatus, provider: Provider = 'claude', projectId?: string): void {
+  const rec: SessionRecord = { id, profileId: 'p1', provider, projectId, cwd: os.tmpdir(), status, createdAt: new Date().toISOString() }
   store.upsert(rec)
 }
 
@@ -277,6 +316,59 @@ describe('SessionManager.attachWorker — the exactly-once replay cursor (hub si
       .map((e) => (e.payload as { mark?: string }).mark)
     expect(marks).toContain('new1')
     expect(marks).toContain('new2')
+  })
+
+  it('F1: a fresh post-respawn wseq sequence FOLLOWED BY a re-attach journals every fresh event exactly once', async () => {
+    // The case the audit named as missing: a worker RESPAWN (wseq restarts at 1) and then a SECOND hub
+    // restart. The successor re-derives since[sid] from the DURABLE cursor, so that cursor must reflect the
+    // fresh worker era — not the stale, higher old-era MAX(wseq) that would drop the live turn's events.
+    const h = buildHub()
+    seedRecord(h.store, 's', 'active')
+    h.sessions.loadRecords()
+
+    // ERA 1 — a prior worker journaled this turn through wseq 5 on the first hub.
+    for (let wq = 1; wq <= 5; wq++) h.sessions.ingestWorkerEvent('s', wq, 'claude/text', { era: 1, wq })
+    h.setLive([{ sessionId: 's', status: 'active', lastWseq: 5 }])
+    await h.sessions.attachWorker()
+    expect(h.attachCalls.at(-1)).toEqual({ s: 5 })
+
+    // The WORKER crashes + respawns → listLive() empty → 's' swept stale. The stale-sweep rebases the DURABLE
+    // baseline (a WSEQ_RESET_KIND marker) so the next era is measured from 0 — matching the worker's restart.
+    h.setLive([])
+    await h.sessions.attachWorker()
+    expect(h.sessions.list().find((r) => r.id === 's')!.status).toBe('idle')
+
+    // ERA 2 — the session resumes on the FRESH worker, whose per-session wseq RESTARTS at 1.
+    h.sessions.ingestWorkerEvent('s', 1, 'claude/text', { era: 2, wq: 1 })
+    h.sessions.ingestWorkerEvent('s', 2, 'claude/text', { era: 2, wq: 2 })
+    h.sessions.ingestWorkerEvent('s', 3, 'claude/text', { era: 2, wq: 3 })
+
+    // THE F1 INVARIANT: the DURABLE re-attach cursor now reflects ERA 2 (max 3), NOT the contaminated old-era
+    // max (5). Without the reset it would still read 5 (MAX over both eras) and drop the fresh turn's tail.
+    expect(h.sessions.lastJournaledWseq('s')).toBe(3)
+
+    // A SECOND hub restart. A SUCCESSOR hub (fresh in-memory ingestedWseq) re-attaches to the still-running
+    // ERA-2 worker mid-turn, seeding since[s] from the durable cursor.
+    const h2 = h.rebuild()
+    h2.sessions.loadRecords()
+    h2.setLive([{ sessionId: 's', status: 'active', lastWseq: 3 }])
+    await h2.sessions.attachWorker()
+    // Had the cursor stayed contaminated at 5, since[s] would be 5 and the whole ERA-2 tail (wseq ≤ 5) would
+    // be DROPPED. With the reset it is 3, so the worker replays wseq > 3 and the live turn continues.
+    expect(h2.attachCalls).toEqual([{ s: 3 }])
+
+    // The worker replays wseq 4,5,6 (all > 3) → journaled EXACTLY ONCE on the successor; none dropped, none doubled.
+    h2.sessions.ingestWorkerEvent('s', 4, 'claude/text', { era: 2, wq: 4 })
+    h2.sessions.ingestWorkerEvent('s', 5, 'claude/text', { era: 2, wq: 5 })
+    h2.sessions.ingestWorkerEvent('s', 6, 'claude/text', { era: 2, wq: 6 })
+    expect(h2.sessions.lastJournaledWseq('s')).toBe(6)
+
+    // Every ERA-2 event is present exactly once, in order — the fresh turn survived the respawn+restart boundary.
+    const era2 = h2.journal
+      .since(0)
+      .filter((e) => e.sessionId === 's' && (e.payload as { era?: number }).era === 2)
+      .map((e) => (e.payload as { wq: number }).wq)
+    expect(era2).toEqual([1, 2, 3, 4, 5, 6])
   })
 })
 
@@ -359,5 +451,99 @@ describe('SessionManager.attachWorker — the three re-attach outcomes (§6)', (
     await h.sessions.attachWorker()
     expect(h.attachCalls).toEqual([{ known: 0 }]) // only the known session; ghost is ignored
     expect(h.sessions.list().map((r) => r.id)).toEqual(['known'])
+  })
+})
+
+// ================================================================================================
+// HUB SIDE — SessionManager.applyLifecycle() replayed markers are inert on the journal + bus (F2)
+// ================================================================================================
+
+describe('SessionManager.applyLifecycle — replayed markers do not re-journal or start a bus turn (F2)', () => {
+  it('a re-attach does NOT duplicate session/status | session/error rows', async () => {
+    const h = buildHub()
+    seedRecord(h.store, 's', 'active')
+    h.sessions.loadRecords()
+
+    const statusRows = (): number =>
+      h.journal.since(0).filter((e) => e.sessionId === 's' && (e.kind === 'session/status' || e.kind === 'session/error')).length
+
+    // LIVE lifecycle from the prior hub: turnStarted→active (1 session/status), turnError→error (1
+    // session/error + 1 session/status) = 3 durable rows.
+    h.sessions.applyLifecycle({ t: 'turnStarted', sessionId: 's', wseq: 1 })
+    h.sessions.applyLifecycle({ t: 'turnError', sessionId: 's', wseq: 9, message: 'boom' })
+    expect(statusRows()).toBe(3)
+
+    // RE-ATTACH: the worker re-emits the SAME markers flagged replay:true. They restore in-memory status but
+    // must NOT append duplicate (out-of-temporal-order) rows — those are already durable from the prior hub.
+    h.sessions.applyLifecycle({ t: 'turnStarted', sessionId: 's', wseq: 1, replay: true })
+    h.sessions.applyLifecycle({ t: 'turnError', sessionId: 's', wseq: 9, message: 'boom', replay: true })
+    expect(statusRows()).toBe(3) // unchanged — no duplicate session/status | session/error rows
+    expect(h.sessions.list().find((r) => r.id === 's')!.status).toBe('error') // final status still correct
+  })
+
+  it('a replayed turnCompleted vendorSessionId is still persisted (final vendorSessionId stays correct)', async () => {
+    const h = buildHub()
+    seedRecord(h.store, 's', 'active')
+    h.sessions.loadRecords()
+    h.sessions.applyLifecycle({ t: 'turnCompleted', sessionId: 's', wseq: 4, vendorSessionId: 'vendor-xyz', replay: true })
+    expect(h.store.all().find((r) => r.id === 's')!.vendorSessionId).toBe('vendor-xyz')
+  })
+
+  it('a replayed idle does NOT start a bus turn; a LIVE idle still flushes the queue', async () => {
+    const h = buildHub()
+    seedRecord(h.store, 's', 'active', 'claude', 'proj1') // recipient, mid-turn → a bus message queues
+    seedRecord(h.store, 't', 'idle', 'claude', 'proj1') //   a same-project teammate to send from
+    h.sessions.loadRecords()
+
+    // Queue a teammate message for 's'. It is ACTIVE, so deliverBus can't flush it now → it stays pending.
+    expect(h.sessions.busSend('t', { kind: 'session', id: 's' }, 'hi', 'ping')).toEqual({ ok: true, delivered: 1 })
+
+    // A REPLAYED turnCompleted (idle) must NOT schedule deliverBus — else it could start a clamped bus turn on
+    // a session the worker is still driving mid-turn (the ordering hazard F2 calls out).
+    h.sessions.applyLifecycle({ t: 'turnCompleted', sessionId: 's', wseq: 7, replay: true })
+    await new Promise((r) => setImmediate(r)) // let any (wrongly) scheduled deliverBus run
+    expect(h.runTurnCalls).toEqual([]) // no bus turn started
+    expect(h.sessions.list().find((r) => r.id === 's')!.status).toBe('idle') // status restored in memory
+
+    // Contrast — a LIVE idle transition DOES flush the same queued message into a clamped 'bus' turn, proving
+    // the replayed idle was specifically gated (not that delivery is simply broken).
+    h.sessions.applyLifecycle({ t: 'turnCompleted', sessionId: 's', wseq: 8 })
+    await new Promise((r) => setImmediate(r))
+    expect(h.runTurnCalls).toEqual([{ sessionId: 's', origin: 'bus' }])
+  })
+})
+
+// ================================================================================================
+// HUB SIDE — SessionManager.attachWorker() ingest guard never lowers on a raced double-attach (F3)
+// ================================================================================================
+
+describe('SessionManager.attachWorker — the ingest guard never lowers on a raced double-attach (F3)', () => {
+  it('a second attach reading a stale-low cursor does NOT lower the guard (no re-journaled duplicates)', async () => {
+    const h = buildHub()
+    seedRecord(h.store, 's', 'active')
+    h.sessions.loadRecords()
+
+    // A run journaled + guarded this session's turn through wseq 8 (durable cursor 8, in-memory guard 8).
+    for (let wq = 1; wq <= 8; wq++) h.sessions.ingestWorkerEvent('s', wq, 'claude/text', { wq })
+    expect(h.sessions.lastJournaledWseq('s')).toBe(8)
+
+    // Stage the green-flip race outcome: the DURABLE cursor reads LOW (0) for the next attach while the
+    // in-memory guard is still HIGH (8). A WSEQ_RESET_KIND marker rebases the reset-aware MAX(wseq) query to 0
+    // (the concurrent run's stale-low read) WITHOUT clearing the guard.
+    h.journal.append('s', WSEQ_RESET_KIND, { reason: 'stage a stale-low cursor read' })
+    expect(h.sessions.lastJournaledWseq('s')).toBe(0)
+
+    // The racing second attach seeds since[s] from that low cursor (0). The guard must stay 8 — lowering it to
+    // 0 would let the already-journaled wseq 1..8 re-flush and DUPLICATE. Math.max(guard=8, cursor=0) keeps 8.
+    h.setLive([{ sessionId: 's', status: 'active', lastWseq: 8 }])
+    await h.sessions.attachWorker()
+    const guard = (h.sessions as unknown as { ingestedWseq: Map<string, number> }).ingestedWseq
+    expect(guard.get('s')).toBe(8) // NOT lowered to the stale-low cursor (0)
+
+    // Behavioral proof: a re-flush of an already-journaled wseq (6 ≤ 8) is still DROPPED, not re-journaled.
+    const rows6 = (): number => h.journal.since(0).filter((e) => e.sessionId === 's' && (e.payload as { wq?: number }).wq === 6).length
+    expect(rows6()).toBe(1)
+    h.sessions.ingestWorkerEvent('s', 6, 'claude/text', { wq: 6 }) // a stale re-flush of an already-journaled event
+    expect(rows6()).toBe(1) // guard held at 8 → the duplicate was dropped (had it lowered to 0, this would be 2)
   })
 })
