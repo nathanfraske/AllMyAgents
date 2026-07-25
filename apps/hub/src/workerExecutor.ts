@@ -148,12 +148,24 @@ export class WorkerExecutor implements Executor {
     } catch (err) {
       // The worker never took the turn (unreachable / dropped accept). Like the in-process executor,
       // runTurn NEVER rejects — its callers `void` it (claude / bus) or await it as fire-on-accept (codex),
-      // so a rejection would be an unhandled one. Clear the optimistic busy so the session isn't wedged and
-      // swallow: a worker-unreachable turn is simply lost (Phase-1 parity for step 3; step 5's re-attach +
-      // step 8's transient queue make it robust). A codex ACCEPT failure is caught worker-side and reported
+      // so a rejection would be an unhandled one. A codex ACCEPT failure is caught worker-side and reported
       // via turnError instead, so this branch is only the worker-down case (§9.2).
+      //
+      // This used to clear the optimistic busy, console.warn, and swallow — "a worker-unreachable turn is
+      // simply lost". That was silently WORSE than lost. SessionManager.send() has already journaled
+      // `session/input` and returned success by now, and the web client starts its thinking timer off that,
+      // so swallowing left the prompt gone, the spinner running forever, and no signal anywhere a client
+      // could see. `WorkerClient.call()` rejects IMMEDIATELY when unattached (it does not queue), and worker
+      // mode ships on, so this is reachable on cold start (hubctl spawns the worker and the hub races it),
+      // on worker respawn, and on any socket flap.
+      //
+      // Report it through the exact channel a worker-REPORTED failure uses, so every client un-sticks the
+      // same way: turnError → applyLifecycle → journal `session/error` + status 'error'. onTurnLifecycle
+      // clears busy for turnError, but nothing is listening to our synthesized message, so clear it here.
       this.busySessions.delete(spec.sessionId)
+      const message = `agent worker unavailable — the turn was not started (${errText(err)})`
       console.warn(`[worker-executor] runTurn not accepted for ${spec.sessionId}: ${errText(err)}`)
+      this.hub.applyLifecycle({ t: 'turnError', sessionId: spec.sessionId, wseq: 0, message })
     }
   }
 

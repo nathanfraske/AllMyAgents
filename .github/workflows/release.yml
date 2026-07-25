@@ -242,11 +242,28 @@ jobs:
             Prerequisites: a working internet connection on FIRST run (the app fetches its runtime
             dependencies and the vendor CLIs from npm then). See the README.
 
-            Installers below; alpha.2+ auto-update via the bundled Tauri updater.
+            Installers below. Later releases auto-update via the bundled Tauri updater, provided the
+            app version increases — see the note on that in apps/desktop/src-tauri/Cargo.toml.
+
+            This is alpha software. It is published as a normal (non-prerelease) release only so the
+            updater can find it; see the comment on `prerelease:` in .github/workflows/release.yml.
 
             macOS: this build is not notarized. Gatekeeper will block the first launch — right-click
             the app and choose Open, or run
             `xattr -dr com.apple.quarantine /Applications/AllMyAgents.app`.
             Windows: SmartScreen will warn on first run (no Authenticode certificate yet).
-          prerelease: true
+          # NOT a prerelease, deliberately, even though these are alphas.
+          #
+          # tauri.conf.json points the updater at
+          #     https://github.com/nathanfraske/AllMyAgents/releases/latest/download/latest.json
+          # and GitHub's /releases/latest EXCLUDES prereleases. While every release was flagged
+          # prerelease, that endpoint resolved to nothing at all (there had never been a non-prerelease
+          # release), so no installed build could discover any update — while the release notes promised
+          # auto-update. GitHub also refuses `make_latest` on a prerelease, so "prerelease but still
+          # latest" is not an available configuration.
+          #
+          # So the choice is: publish as a normal release, or have no working updater. We publish as a
+          # normal release and carry the alpha warning in the release name and body instead.
+          # If you ever set this back to true, change the updater endpoint in the same commit.
+          prerelease: false
           includeUpdaterJson: true
