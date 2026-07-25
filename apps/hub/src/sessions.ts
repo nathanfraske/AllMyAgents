@@ -581,15 +581,25 @@ export class SessionManager {
     // absent HERE holds no live era at this instant, and its reset can only precede — never hide — later rows.
     const liveIds = new Set((await this.executor.listLive()).map((s) => s.sessionId))
     for (const record of this.sessions.values()) {
-      if ((record.status === 'active' || record.status === 'starting') && !liveIds.has(record.id)) {
+      if (liveIds.has(record.id)) continue // the worker holds it — its era (and its wseq) continue
+      // F1: the worker does NOT hold this session, so its NEXT era restarts wseq at 1. Reset BOTH the
+      // in-memory high-water mark AND the durable baseline: drop the guard, and journal a WSEQ_RESET_KIND
+      // marker that rebases lastJournaledWseq to 0 for the fresh era (docs §7.1). Without the durable
+      // reset, a later hub restart would re-derive since[sid] from the stale old-era MAX(wseq) and silently
+      // drop the fresh turn's live events. Append-only; the marker precedes any fresh-era row.
+      //
+      // THIS RESET IS NOT CONDITIONED ON STATUS — and that is the whole point. It used to only run for a
+      // record still 'active'|'starting', but when a worker DIES its exit handling flips sessions to
+      // idle/error FIRST, so by the time we get here the status test fails and the stale guard survives.
+      // Every event of every later turn then has wseq <= the dead era's mark and is dropped as a duplicate:
+      // the agent runs, its tools work, and NOTHING it says ever reaches the journal or the UI. That is
+      // exactly what a live worker respawn did in production — a silent, total loss of agent output.
+      const hadGuard = this.ingestedWseq.delete(record.id)
+      const wasLive = record.status === 'active' || record.status === 'starting'
+      if (!hadGuard && !wasLive) continue // never carried a worker era — nothing to rebase
+      this.journal.append(record.id, WSEQ_RESET_KIND, { reason: 'worker respawn — wseq restarts at 1' })
+      if (wasLive) {
         record.status = 'idle'
-        // F1: the worker no longer holds this session, so its NEXT worker era restarts wseq at 1. Reset BOTH
-        // the in-memory high-water mark AND the durable baseline: drop the in-memory guard, and journal a
-        // WSEQ_RESET_KIND marker that rebases lastJournaledWseq to 0 for the fresh era (docs §7.1). Without
-        // the durable reset, a SECOND hub restart would re-derive since[sid] from the stale old-era MAX(wseq)
-        // and silently drop the fresh turn's live events. Append-only; the marker precedes any fresh-era row.
-        this.ingestedWseq.delete(record.id)
-        this.journal.append(record.id, WSEQ_RESET_KIND, { reason: 'worker respawn — wseq restarts at 1' })
         this.journal.append(record.id, 'session/restored-stale', { note: 'worker had no live driver' })
         this.store.upsert(record)
       }
