@@ -619,7 +619,7 @@ export class AgentWorker {
    * hard-deny on a bus turn (unless the owner opted in via busCanUseRiskyTools) else allow + defer to the
    * handler's own requireApproval; a Write/Edit outside the worktree is denied; everything else goes to the
    * operator approval gate — which in the worker is a hub RELAY (step 4), no longer the step-3 fail-closed
-   * deny. Under `full` (bypassPermissions) the SDK skips this callback entirely, so tools run freely there.
+   * deny. Under `full` we allow explicitly (see below) rather than relying on the SDK to skip the callback.
    */
   private async canUseTool(
     spec: WorkerSessionSpec,
@@ -639,6 +639,24 @@ export class AgentWorker {
       this.emitEvent(spec.sessionId, 'approval/auto-denied-scope', { toolName, reason: scopeError })
       return { behavior: 'deny', message: scopeError }
     }
+    // FULL ACCESS MEANS FULL ACCESS — never raise an operator prompt in `full` mode.
+    //
+    // The comment above this method used to assert "under `full` (bypassPermissions) the SDK skips this
+    // callback entirely, so tools run freely there", and the whole no-prompt behaviour of full mode rested
+    // on that. It is not true: the SDK documents canUseTool as "called before each tool execution", and an
+    // explicitly-supplied handler is consulted regardless of permissionMode. So every non-auto-allowed tool
+    // still relayed to the hub and prompted the operator — with `full` selected — and a prompt they did not
+    // answer within APPROVAL_TIMEOUT_MS failed CLOSED, killing the tool call with "denied from hub".
+    //
+    // Gate on the mode ourselves instead of trusting the vendor to suppress the callback. This is the same
+    // class of bug as assuming an empty APPLE_CERTIFICATE means "skip signing": inferring a vendor's
+    // behaviour from a plausible-sounding premise instead of gating on it explicitly.
+    //
+    // Deliberately placed AFTER the bus hard-deny and the write-scope check, not before. Those two DENY and
+    // never prompt anyone, so they are not what the operator is complaining about, and the bus self-gate in
+    // particular is a security control against semi-trusted teammate messages — `full` is the operator
+    // trusting THEMSELVES, not the operator trusting another agent's message to act through them.
+    if (spec.permissionMode === 'full') return { behavior: 'allow', updatedInput: input }
     // The generic operator gate: RELAY to the hub (step 4). In-process this is
     // `approvals.request(sessionId, 'claude/tool', {toolName, input})`; here it crosses the socket.
     try {

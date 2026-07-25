@@ -253,8 +253,7 @@ export class InProcessExecutor implements Executor {
           // autonomous coordination.
           if (AUTO_ALLOW_TOOLS.has(toolName)) return { behavior: 'allow', updatedInput: input }
           // RISKY in-process tools (practice writes above account scope; later hook_propose) are not
-          // auto-allowed. They self-gate inside their own handler (works even under `full`, where
-          // this callback is skipped). Here — the non-`full` path — we add a second, independent
+          // auto-allowed. They self-gate inside their own handler. Here we add a second, independent
           // barrier: hard-deny on a bus turn (unless the owner opted in), else allow and defer the
           // authoritative operator decision to the handler's own requireApproval (so there's a
           // single prompt, not two).
@@ -270,6 +269,14 @@ export class InProcessExecutor implements Executor {
             this.h.journal(spec.sessionId, 'approval/auto-denied-scope', { toolName, reason: scopeError })
             return { behavior: 'deny', message: scopeError }
           }
+          // FULL ACCESS MEANS FULL ACCESS — never prompt in `full` mode. This used to rely on the SDK
+          // skipping canUseTool entirely under bypassPermissions; it does not (it documents the handler as
+          // "called before each tool execution"), so full-access sessions were still prompting the operator
+          // on every tool, and an unanswered prompt fails closed after APPROVAL_TIMEOUT_MS. Kept AFTER the
+          // bus hard-deny and scope check: those deny without prompting, and the bus self-gate protects
+          // against semi-trusted teammate messages rather than against the operator. Mirrors
+          // AgentWorker.canUseTool exactly so both executors behave identically.
+          if (spec.permissionMode === 'full') return { behavior: 'allow', updatedInput: input }
           const approved = await this.services.approvals.request(spec.sessionId, 'claude/tool', { toolName, input })
           return approved
             ? { behavior: 'allow', updatedInput: input }
