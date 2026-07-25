@@ -11,6 +11,16 @@
 
   void store.init()
 
+  // Mirror the open layout (selected chat + split panes) to localStorage on every change, so the
+  // next launch can OFFER to reopen it. Reading both here makes the effect reactive; the store only
+  // writes a MEANINGFUL layout (never the empty home state), so the offer survives a restart even
+  // when the operator ends on the home screen. This never auto-restores — it only records.
+  $effect(() => {
+    void store.selectedId
+    void store.splitPanes
+    store.persistCurrentLayout()
+  })
+
   // 2D layout: a vertical stack of rows, each a horizontal set of panes (columns).
   const paneRows = $derived(store.panes)
   const totalPanes = $derived(paneRows.reduce((n, r) => n + r.length, 0))

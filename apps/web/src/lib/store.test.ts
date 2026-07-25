@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from './api'
 import { store } from './store.svelte'
+import { loadLastLayout, saveLastLayout } from './uiState'
 import type { HubEvent, SessionRecord } from './api'
 
 // The store imports ./api (real network / WebSocket) and ./settings.svelte (localStorage).
@@ -64,13 +65,16 @@ function evt(over: Partial<HubEvent> & { seq: number; kind: string }): HubEvent 
   return { ts: '2026-01-01T00:00:05.000Z', sessionId: null, payload: undefined, ...over }
 }
 
-// Reset the singleton between tests — it persists across the file.
+// Reset the singleton between tests — it persists across the file. localStorage is cleared too so
+// the layout-persistence tests don't leak stored state into one another.
 beforeEach(() => {
+  localStorage.clear()
   store.sessions = {}
   store.queues = {}
   store.selectedId = null
   store.splitPanes = []
   store.lastLayout = null
+  store.restorableLayout = null
   store.lastSeq = 0
   store.profiles = []
   store.projects = []
@@ -394,5 +398,117 @@ describe('apply()', () => {
     apply(evt({ seq: 6, kind: 'session/created', sessionId: 'new', payload: rec('new') }))
     expect(store.sessions.new).toBeDefined() // newer, applied
     expect(store.lastSeq).toBe(6)
+  })
+})
+
+// --- cross-restart UI-state persistence -----------------------------------------------------
+// The last-open layout is persisted to localStorage and surfaced on the home screen as a "reopen
+// last session" OFFER. Loading it must NOT auto-select anything — the app opens to home and only
+// applies the layout when the operator accepts the offer.
+
+describe('restore offer (persist / hydrate / restore)', () => {
+  it('hydrateRestorableLayout loads the offer WITHOUT auto-selecting (home stays home)', () => {
+    saveLastLayout({ selectedId: 's1', splitPanes: [['s1', 's2']], title: 'S1', paneCount: 2 })
+    store.selectedId = null
+    store.splitPanes = []
+    store.restorableLayout = null
+
+    store.hydrateRestorableLayout()
+
+    // the offer is loaded...
+    expect(store.restorableLayout).toMatchObject({ selectedId: 's1', paneCount: 2 })
+    // ...but nothing is auto-selected or auto-split — the home screen is untouched.
+    expect(store.selectedId).toBeNull()
+    expect(panes()).toEqual([])
+  })
+
+  it('restoreLastLayout applies the offer to selection + panes, then clears it', () => {
+    seed('s1')
+    seed('s2')
+    store.restorableLayout = { selectedId: 's1', splitPanes: [['s1', 's2']], paneCount: 2 }
+
+    store.restoreLastLayout()
+
+    expect(store.selectedId).toBe('s1')
+    expect(panes()).toEqual([['s1', 's2']])
+    expect(store.restorableLayout).toBeNull()
+  })
+
+  it('restoreLastLayout reopens a single chat when there was no split', () => {
+    seed('s1')
+    store.restorableLayout = { selectedId: 's1', splitPanes: [], paneCount: 1 }
+    store.restoreLastLayout()
+    expect(store.selectedId).toBe('s1')
+    expect(panes()).toEqual([['s1']])
+  })
+
+  it('restoreLastLayout skips sessions that no longer exist', () => {
+    seed('s2') // s1 was deleted since last run
+    store.restorableLayout = { selectedId: 's1', splitPanes: [['s1', 's2']], paneCount: 2 }
+    store.restoreLastLayout()
+    expect(panes()).toEqual([['s2']])
+    expect(store.selectedId).toBe('s2')
+  })
+
+  it('restoreLastLayout stays on home when nothing survives the restart', () => {
+    store.restorableLayout = { selectedId: 'gone', splitPanes: [['gone']], paneCount: 1 }
+    store.restoreLastLayout()
+    expect(store.selectedId).toBeNull()
+    expect(panes()).toEqual([])
+    expect(store.restorableLayout).toBeNull()
+  })
+
+  it('dismissRestore hides the offer without changing the layout', () => {
+    store.selectedId = null
+    store.restorableLayout = { selectedId: 's1', splitPanes: [], paneCount: 1 }
+    store.dismissRestore()
+    expect(store.restorableLayout).toBeNull()
+    expect(store.selectedId).toBeNull()
+    expect(panes()).toEqual([])
+  })
+
+  it('persistCurrentLayout saves a meaningful layout that round-trips through storage', () => {
+    seed('s1', { title: 'Alpha' })
+    seed('s2')
+    store.splitPanes = [['s1', 's2']]
+    store.selectedId = 's1'
+
+    store.persistCurrentLayout()
+
+    expect(loadLastLayout()).toMatchObject({ selectedId: 's1', splitPanes: [['s1', 's2']], title: 'Alpha', paneCount: 2 })
+  })
+
+  it('persistCurrentLayout never overwrites with the empty home layout', () => {
+    saveLastLayout({ selectedId: 's1', splitPanes: [], title: 'kept', paneCount: 1 })
+    store.selectedId = null
+    store.splitPanes = []
+
+    store.persistCurrentLayout() // on the home screen — must be a no-op
+
+    expect(loadLastLayout()).toMatchObject({ selectedId: 's1', title: 'kept' })
+  })
+
+  it('persistCurrentLayout drops an unspawned draft (keeps the last real layout)', () => {
+    saveLastLayout({ selectedId: 's9', splitPanes: [], title: 'kept', paneCount: 1 })
+    store.selectedId = 'draft:abc'
+    store.splitPanes = []
+
+    store.persistCurrentLayout()
+
+    expect(loadLastLayout()).toMatchObject({ selectedId: 's9', title: 'kept' }) // unchanged
+  })
+
+  it('select clears a pending restore offer (opening a chat supersedes it)', () => {
+    store.restorableLayout = { selectedId: 's1', splitPanes: [], paneCount: 1 }
+    store.select('x')
+    expect(store.restorableLayout).toBeNull()
+  })
+
+  it('dropAt clears a pending restore offer', () => {
+    store.selectedId = null
+    store.splitPanes = []
+    store.restorableLayout = { selectedId: 's1', splitPanes: [], paneCount: 1 }
+    store.dropAt({ kind: 'col', row: 0, col: 0 }, 'a')
+    expect(store.restorableLayout).toBeNull()
   })
 })

@@ -1,6 +1,7 @@
 import { api, HUB_WS, getHubToken, setHubToken } from './api'
 import { settings } from './settings.svelte'
 import { alertDialog } from './dialog.svelte'
+import { loadLastLayout, saveLastLayout, type PersistedLayout } from './uiState'
 import type { ApprovalRecord, FleetSite, HistoryItem, HistoryPage, HubEvent, ProfileInfo, ProjectInfo, ScanResult, SessionRecord, UsageSnapshot } from './api'
 
 // Verbose client tracing — on in dev, compiled out of prod builds. Toggle off in dev by setting
@@ -284,6 +285,17 @@ class HubStore {
 
   get selected(): SessionView | null {
     return this.selectedId ? (this.sessions[this.selectedId] ?? null) : null
+  }
+
+  // Human label for a session id — its title, else the last path segment of its worktree/repo/cwd
+  // (same rule the sidebar renders by). '' when the id is unknown. Used by the persisted-layout
+  // snapshot and the restore offer so they can name a session without duplicating the logic.
+  sessionLabel(id: string): string {
+    const v = this.sessions[id]
+    if (!v) return ''
+    if (v.record.title) return v.record.title
+    const p = v.record.worktree ?? v.record.repo ?? v.record.cwd
+    return p.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || p
   }
 
   get pendingBySession(): Record<string, number> {
@@ -1253,6 +1265,7 @@ class HubStore {
   }
 
   select(id: string): void {
+    this.restorableLayout = null // opening a chat directly supersedes the pending restore offer
     const prev = this.selectedId
     this.selectedId = id
     void this.ensureHistory(id)
@@ -1277,6 +1290,13 @@ class HubStore {
   splitPanes = $state<string[][]>([])
   lastLayout = $state<{ selectedId: string | null; splitPanes: string[][] } | null>(null)
 
+  // Cross-restart "reopen your last session" OFFER. Loaded from localStorage at construction (so
+  // it's ready before the first render, same as the order fields) and surfaced on the home screen
+  // by the Dashboard. We deliberately do NOT auto-apply it — no auto-jump into the last chat.
+  // `restoreLastLayout()` applies it on the operator's click; `dismissRestore()` hides it; opening
+  // any chat directly clears it (see `select` / `dropAt`).
+  restorableLayout = $state<PersistedLayout | null>(loadLastLayout())
+
   // Canonical 2D structure for rendering + index math. Reads $state so it stays reactive.
   get panes(): string[][] {
     return this.basePanes()
@@ -1296,6 +1316,55 @@ class HubStore {
     this.selectedId = this.lastLayout.selectedId
     this.splitPanes = this.lastLayout.splitPanes.map((r) => [...r])
     this.lastLayout = null
+  }
+
+  // --- Cross-restart layout persistence --------------------------------------------------------
+  // (Re)load the persisted "reopen last session" offer WITHOUT auto-selecting anything — the home
+  // screen stays home. The constructor already does this once; exposed as a method so it's directly
+  // unit-testable (the singleton is built at import, before a test can seed localStorage).
+  hydrateRestorableLayout(): void {
+    this.restorableLayout = loadLastLayout()
+  }
+
+  // Persist the CURRENT open layout for the next launch — but only a MEANINGFUL one (a real chat is
+  // open or split). Unspawned drafts are dropped (they don't survive a restart), and the empty home
+  // layout is never written, so the "reopen last session" offer survives even when the operator ends
+  // on the home screen (mirrors goHome's in-memory lastLayout policy). Called reactively from App.
+  persistCurrentLayout(): void {
+    const isReal = (id: string): boolean => !id.startsWith('draft:')
+    const rows = this.splitPanes.map((r) => r.filter(isReal)).filter((r) => r.length > 0)
+    const selectedId = this.selectedId && isReal(this.selectedId) ? this.selectedId : (rows[0]?.[0] ?? null)
+    if (!selectedId) return // home, or only an unspawned draft open — keep the last real layout
+    const splitPanes = rows.map((r) => [...r])
+    const paneCount = splitPanes.length > 0 ? splitPanes.reduce((n, r) => n + r.length, 0) : 1
+    saveLastLayout({ selectedId, splitPanes, title: this.sessionLabel(selectedId), paneCount })
+  }
+
+  // Accept the offer: reopen the selected chat + split panes the operator had last time. Sessions
+  // that no longer exist are skipped; if none survive we stay on the home screen. Clears the offer
+  // either way. This is the ONLY path that turns the persisted layout into an active selection.
+  restoreLastLayout(): void {
+    const l = this.restorableLayout
+    this.restorableLayout = null
+    if (!l) return
+    const exists = (id: string): boolean => !!this.sessions[id]
+    const rows = l.splitPanes.map((r) => r.filter(exists)).filter((r) => r.length > 0)
+    if (rows.length > 0) {
+      this.splitPanes = rows.map((r) => [...r])
+      this.selectedId = rows[0]![0]!
+    } else if (l.selectedId && exists(l.selectedId)) {
+      this.splitPanes = []
+      this.selectedId = l.selectedId
+    } else {
+      return // nothing survived the restart — stay on the home screen
+    }
+    for (const id of this.basePanes().flat()) void this.ensureHistory(id)
+  }
+
+  // Dismiss the offer for this session (the persisted layout is left intact — a later restart still
+  // offers the operator's most recent real layout).
+  dismissRestore(): void {
+    this.restorableLayout = null
   }
 
   // drag-to-split: the session being dragged and the live drop zone (column or new row).
@@ -1341,6 +1410,7 @@ class HubStore {
 
   // Place a dragged chat according to the computed drop zone.
   dropAt(zone: DropZone, id: string): void {
+    this.restorableLayout = null // opening/splitting a chat supersedes the pending restore offer
     const base = this.basePanes()
     // Already open in a pane → don't spawn a duplicate view of the same chat (dragging an
     // already-open chat back into the panes was creating a second identical pane).
