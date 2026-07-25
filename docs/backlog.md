@@ -211,7 +211,8 @@ Cross-hub write exactly-once across a blue-green flip currently rests on the mem
 dedup it; the in-memory `servedWrites` cache can't span hub processes). A HARD crash of blue (persist-before-ack
 lost) OR a future **async** store would reopen a double-write window. Carry into any async-store migration: give
 writes **durable, journal-based exactly-once** (like approvals get via `resolvedApproval`), not just the
-in-memory `servedWrites` cache. (Distinct from F1 — the worker-respawn callId collision — which is being fixed.)
+in-memory `servedWrites` cache. (Distinct from F1 — the worker-respawn callId collision — which was FIXED in
+`8f0752d` via a per-worker generation id + a `welcome` handshake that clears the cache only across a respawn.)
 
 ## Critical-agent tier (requested 2026-07-24)
 
