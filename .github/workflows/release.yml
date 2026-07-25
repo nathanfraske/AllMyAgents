@@ -36,8 +36,11 @@ name: Release
 #
 #  Without this the .app/.dmg is UNSIGNED: Gatekeeper quarantines it and the user must right-click →
 #  Open (or `xattr -dr com.apple.quarantine /Applications/AllMyAgents.app`) on first launch. The
-#  build below still succeeds — every APPLE_* env var is read from a secret that is simply empty
-#  until the operator sets it, and both tauri-action and `tauri build` skip signing when they are.
+#  build below still succeeds without any of these secrets, because the "Export signing secrets that
+#  are set" step forwards each APPLE_* var only when it is non-empty, leaving it ABSENT otherwise.
+#  That distinction is load-bearing: an unset secret expands to an empty string, tauri only checks
+#  whether APPLE_CERTIFICATE is present, and an empty certificate makes `security import` fail — which
+#  is exactly how the v0.1.0-alpha.1 macOS release died. Empty is not the same as absent.
 #
 #  It requires a paid Apple Developer Program membership ($99/yr) — an operator purchase decision.
 #  Once you have one:
@@ -160,6 +163,62 @@ jobs:
             echo "::warning title=No updater signing key::TAURI_SIGNING_PRIVATE_KEY is not set. This release will ship installers with NO signed updater artifacts and NO latest.json, so no installed build can auto-update from it. See the OPERATOR SETUP #1 header in .github/workflows/release.yml."
           fi
 
+      # Forward ONLY the signing secrets that actually exist.
+      #
+      # This step is here because of a real failure. The signing vars used to be listed directly in the
+      # tauri-action `env:` block below, on the assumption that an unset secret expands to "" and that
+      # empty means "skip signing". It does not. An unset secret still DEFINES the variable (as an empty
+      # string), tauri-bundler only checks whether APPLE_CERTIFICATE is *present*, and so the macOS job
+      # ran `security import` on an empty certificate and died:
+      #
+      #     security: SecKeychainItemImport: One or more parameters passed to a function were not valid.
+      #     failed to bundle project: failed codesign application: failed to import keychain certificate
+      #
+      # That killed the whole v0.1.0-alpha.1 release even though the .app had already built and bundled
+      # fine (Windows published; macOS did not). "Defined but empty" != "absent" — so we copy each secret
+      # into the job environment only when it is non-empty, and leave it genuinely ABSENT otherwise.
+      # Absent is the state tauri actually treats as "skip", which is what an unsigned alpha needs.
+      - name: Export signing secrets that are set
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          forward() {
+            local name="$1"
+            local value="${!name-}"
+            if [ -z "$value" ]; then
+              echo "skip $name (not set)"
+              return 0
+            fi
+            # Heredoc form: signing keys are multi-line. Random delimiter so a secret cannot smuggle
+            # its own terminator and inject arbitrary environment.
+            local eof="AMA_EOF_${RANDOM}${RANDOM}"
+            {
+              echo "${name}<<${eof}"
+              echo "$value"
+              echo "$eof"
+            } >> "$GITHUB_ENV"
+            echo "forward $name (set)"
+          }
+          for name in \
+            TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD \
+            APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY KEYCHAIN_PASSWORD \
+            APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID \
+            WINDOWS_CERTIFICATE WINDOWS_CERTIFICATE_PASSWORD; do
+            forward "$name"
+          done
+
       # tauri-action runs `tauri build` in apps/desktop: builds the installers (Windows .msi + NSIS,
       # macOS .app + .dmg — tauri.conf.json's `targets` list is filtered per host OS), and, once
       # bundle.createUpdaterArtifacts is true and the signing key is present, also emits the SIGNED
@@ -169,24 +228,10 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # --- Updater signing (OPERATOR SETUP #1) -------------------------------------------------
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # --- macOS code signing + notarization (OPERATOR SETUP #2) -------------------------------
-          # Every one of these is an EMPTY string until the operator adds the secret, and both
-          # tauri-action and `tauri build` treat empty as "skip signing / skip notarization", so the
-          # macOS build succeeds unsigned today and becomes signed + notarized the moment they exist.
-          # No key or identity is committed here.
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          # --- Windows Authenticode (also optional, also empty until set) --------------------------
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          # The signing vars (OPERATOR SETUP #1 and #2) are deliberately NOT listed here. They are
+          # exported by the step above, and only when the corresponding secret is actually set. Do not
+          # add them back: a step-level `env:` entry wins over the job environment, so re-listing one
+          # would define it as an empty string again and resurrect the codesign failure described above.
         with:
           projectPath: apps/desktop
           tagName: ${{ github.ref_name }}
