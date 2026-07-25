@@ -11,6 +11,8 @@
   import Icon from './Icon.svelte'
   import { findModel, defaultModelFor } from './catalog'
   import { settings } from './settings.svelte'
+  import { resolveSlash, builtinsForProvider, builtinNeedsArg, loadProfileCommands, type SlashResult } from './commands'
+  import type { CommandInfo } from './api'
 
   let { sessionId, paneIndex = 0, multiPane = false }: { sessionId?: string; paneIndex?: number; multiPane?: boolean } =
     $props()
@@ -22,6 +24,12 @@
   // per-session picker state, seeded from the record
   let modelBySession = $state<Record<string, string>>({})
   let optionsBySession = $state<Record<string, Record<string, string>>>({})
+  // `/` command picker: the textarea (for refocus after completion), the profile's on-disk custom
+  // commands, the highlighted row, and an Escape-dismissal latch.
+  let taRef = $state<HTMLTextAreaElement | null>(null)
+  let customCommands = $state<CommandInfo[]>([])
+  let cmdIndex = $state(0)
+  let cmdDismissed = $state(false)
 
   const activeId = $derived(sessionId ?? store.selectedId ?? null)
   const view = $derived(activeId ? (store.sessions[activeId] ?? null) : null)
@@ -60,6 +68,65 @@
   const st = $derived(view ? store.status(view) : { key: 'idle', label: '' })
   const approvals = $derived(view ? store.approvals.filter((a) => a.sessionId === view.record.id) : [])
   const queue = $derived(sid ? store.queueFor(sid) : [])
+
+  // --- `/` command picker ------------------------------------------------------------------------
+  type PickItem = { name: string; description: string; kind: 'builtin' | 'custom'; argHint?: string }
+  // Shown while typing a command NAME: a leading "/" then a partial token with no space yet. Once a
+  // space is typed (→ arguments) or the text goes multiline, the query is null and the picker closes.
+  const cmdQuery = $derived.by<string | null>(() => {
+    const m = /^\/(\S*)$/.exec(text)
+    return m ? (m[1] as string).toLowerCase() : null
+  })
+  const allCommands = $derived.by<PickItem[]>(() => {
+    const provider = view?.record.provider ?? 'claude'
+    const builtins = builtinsForProvider(provider).map(
+      (b): PickItem => ({ name: b.name, description: b.description, kind: 'builtin', argHint: b.argHint })
+    )
+    const custom = customCommands.map((c): PickItem => ({ name: c.name, description: c.description, kind: 'custom' }))
+    return [...builtins, ...custom]
+  })
+  const cmdShown = $derived.by<PickItem[]>(() => {
+    if (cmdQuery === null) return []
+    const q = cmdQuery
+    return allCommands
+      .filter((c) => c.name.toLowerCase().includes(q))
+      .sort((a, b) => {
+        const sa = a.name.toLowerCase().startsWith(q) ? 0 : 1
+        const sb = b.name.toLowerCase().startsWith(q) ? 0 : 1
+        return sa !== sb ? sa - sb : a.name.localeCompare(b.name)
+      })
+      .slice(0, 8)
+  })
+  // Open while typing a command name, unless Escape-dismissed or the query already exactly names the
+  // sole remaining command (nothing left to complete — just press Enter to run it).
+  const cmdOpen = $derived(
+    cmdQuery !== null &&
+      !cmdDismissed &&
+      cmdShown.length > 0 &&
+      !(cmdShown.length === 1 && cmdShown[0]?.name.toLowerCase() === cmdQuery)
+  )
+
+  // Load the profile's custom commands for the picker (memoized in the commands module).
+  $effect(() => {
+    const pid = view?.record.profileId
+    if (!pid) {
+      customCommands = []
+      return
+    }
+    let cancelled = false
+    void loadProfileCommands(pid).then((list) => {
+      if (!cancelled) customCommands = list
+    })
+    return () => {
+      cancelled = true
+    }
+  })
+  // Reset the highlighted row + any Escape-dismissal whenever the query changes.
+  $effect(() => {
+    cmdQuery // track
+    cmdIndex = 0
+    cmdDismissed = false
+  })
 
   function fmtTokens(n: number): string {
     return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`
@@ -118,12 +185,103 @@
     optionsBySession = { ...optionsBySession, [sid]: { ...options, [id]: value } }
   }
 
+  // Accept the highlighted picker row. `runIfComplete` (Enter/click) runs a no-arg command straight
+  // away; an arg-taking command (or Tab) just completes the name and waits for the argument.
+  function acceptCmd(i: number, runIfComplete: boolean): void {
+    const c = cmdShown[i]
+    if (!c) return
+    const needsArg = c.kind === 'builtin' && builtinNeedsArg(c.name)
+    if (runIfComplete && !needsArg) {
+      text = `/${c.name}`
+      void send()
+      return
+    }
+    text = `/${c.name}${needsArg ? ' ' : ''}`
+    cmdDismissed = true
+    queueMicrotask(() => taRef?.focus())
+  }
+
+  // Inline `/usage` (and `/cost`) summary from the account snapshot + this session's live counters.
+  function usageSummary(): string {
+    if (!view) return 'no usage data yet'
+    const u = store.usage.find((x) => x.profileId === view.record.profileId)
+    const parts: string[] = []
+    if (u?.claudeUsage?.length) {
+      for (const l of u.claudeUsage) parts.push(`${l.label} ${l.percent}%`)
+    } else if (u?.codex?.usedPercent != null) {
+      parts.push(`weekly ${u.codex.usedPercent}% used`)
+    }
+    if (view.contextUsed && view.contextWindow) {
+      parts.push(`context ${Math.round((view.contextUsed / view.contextWindow) * 100)}% (${fmtTokens(view.contextUsed)}/${fmtTokens(view.contextWindow)})`)
+    }
+    if (view.costUsd) parts.push(`$${view.costUsd.toFixed(4)} this session`)
+    else if (typeof u?.totalCostUsd === 'number') parts.push(`$${u.totalCostUsd.toFixed(4)} this hub run`)
+    return parts.length ? `usage · ${parts.join(' · ')}` : 'no usage data yet'
+  }
+
+  // Execute a resolved built-in against the hub / store (the composer's side of the mapping). Draft
+  // vs. real session is handled here: a draft has no hub session, so model/mode write to the draft
+  // record; a real session posts to the hub. Feedback lands as a local note in the thread.
+  async function runSlash(res: SlashResult, sid0: string): Promise<void> {
+    if (!view) return
+    switch (res.kind) {
+      case 'model':
+        if (view.draft) store.updateDraft(sid0, { model: res.model })
+        else modelBySession = { ...modelBySession, [sid0]: res.model } // same pending override the pill sets
+        store.pushLocalNote(sid0, `model → ${res.label} · applies to your next message`)
+        break
+      case 'mode':
+        if (view.draft) {
+          store.updateDraft(sid0, { permissionMode: res.mode })
+          store.pushLocalNote(sid0, `permission mode → ${res.mode}`)
+        } else {
+          await api.setMode(sid0, res.mode) // hub journals session/mode → renders its own note
+        }
+        break
+      case 'usage':
+        store.pushLocalNote(sid0, usageSummary())
+        break
+      case 'new':
+        // Claude-focused: /clear starts a fresh chat (Codex doesn't reset context this way, but a new
+        // chat is the shared analog — a new thread). Reuses the "new chat" path.
+        await store.newSession(view.record.profileId, view.record.projectId)
+        break
+      case 'compact': {
+        if (view.draft) {
+          store.pushLocalNote(sid0, 'compaction needs a started chat — send a first message, then /compact')
+          break
+        }
+        const out = await api.compact(sid0)
+        store.pushLocalNote(
+          sid0,
+          out?.reason ?? out?.error ?? (out?.supported ? 'compaction requested' : 'compaction not yet supported by the driver')
+        )
+        break
+      }
+      case 'message':
+        store.pushLocalNote(sid0, res.tone === 'error' ? `⚠ ${res.text}` : res.text)
+        break
+      case 'passthrough':
+        break
+    }
+  }
+
   async function send(): Promise<void> {
     if (!view || !text.trim()) return
     const sid0 = view.record.id
     const body = text
     text = ''
     sendErr = ''
+    // Slash-command interception. A leading "/" may map to a hub feature (built-in) — run that action
+    // instead of sending text. CUSTOM commands (commands/*.md) resolve to `passthrough` and continue
+    // down the normal send path, where the driver expands them.
+    if (body.trim().startsWith('/')) {
+      const res = resolveSlash(body.trim(), view.record.provider)
+      if (res.kind !== 'passthrough') {
+        await runSlash(res, sid0)
+        return
+      }
+    }
     // A DRAFT has no hub session: the first send spawns the real session with this prompt, then the
     // store swaps this pane over to it. No steering/queueing (there is no running turn to steer).
     if (view.draft) {
@@ -173,6 +331,34 @@
   }
 
   function onKey(e: KeyboardEvent): void {
+    // The command picker owns the arrow/Tab/Enter/Escape keys while it is open.
+    if (cmdOpen) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault()
+        cmdIndex = (cmdIndex + 1) % cmdShown.length
+        return
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault()
+        cmdIndex = (cmdIndex - 1 + cmdShown.length) % cmdShown.length
+        return
+      }
+      if (e.key === 'Tab') {
+        e.preventDefault()
+        acceptCmd(cmdIndex, false)
+        return
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        cmdDismissed = true
+        return
+      }
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+        e.preventDefault()
+        acceptCmd(cmdIndex, true)
+        return
+      }
+    }
     // Don't send mid-IME-composition (e.g. selecting a candidate with Enter in CJK input).
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault()
@@ -257,8 +443,20 @@
 
     {#if sendErr}<div class="senderr" role="alert">⚠ {sendErr} — your message was kept in the box.</div>{/if}
     <div class="composer">
+      {#if cmdOpen}
+        <div class="cmdmenu">
+          <div class="cmdhint dim">Commands · type to filter · Enter runs or completes · Tab completes · Esc dismisses</div>
+          {#each cmdShown as c, i (c.kind + ':' + c.name)}
+            <button class="cmdrow" class:sel={i === cmdIndex} onmouseenter={() => (cmdIndex = i)} onclick={() => acceptCmd(i, true)}>
+              <span class="cmdname">/{c.name}{#if c.argHint}&nbsp;<span class="cmdarg dim">{c.argHint}</span>{/if}</span>
+              <span class="cmddesc dim">{c.description}</span>
+              <span class="cmdtag {c.kind}">{c.kind === 'builtin' ? 'hub' : 'custom'}</span>
+            </button>
+          {/each}
+        </div>
+      {/if}
       <textarea rows="2" placeholder={isDraft ? 'Describe the first task… (Enter to start the chat, Shift+Enter for newline)' : steerable ? 'Steer the running turn… (appended to what Codex is doing now)' : active ? 'Queue a message… (sends when the current turn finishes)' : 'Ask for follow-up changes…  (Enter to send, Shift+Enter for newline)'}
-        bind:value={text} onkeydown={onKey}></textarea>
+        bind:this={taRef} bind:value={text} onkeydown={onKey}></textarea>
       <div class="cfoot">
         <AccountPicker {view} />
         <ModelPicker provider={view.record.provider} {model} onselect={setModel} />
@@ -360,11 +558,26 @@
   .est { color: var(--muted); }
   .senderr { color: var(--bad-text); font-size: 0.76rem; margin-bottom: 0.45rem; }
   .tmeta, .est { font-variant-numeric: tabular-nums; }
-  .composer { background: var(--surface); border: 1px solid var(--border-strong); border-radius: 14px; padding: 0.6rem 0.7rem 0.5rem; }
+  .composer { position: relative; background: var(--surface); border: 1px solid var(--border-strong); border-radius: 14px; padding: 0.6rem 0.7rem 0.5rem; }
   .composer:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent); }
   @media (prefers-reduced-motion: no-preference) { .composer { transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease); } }
   .composer textarea { width: 100%; background: none; border: none; resize: none; padding: 0.1rem 0.2rem; }
   .cfoot { display: flex; align-items: center; gap: 0.4rem; margin-top: 0.35rem; }
+
+  /* `/` command picker — floats above the composer, type-ahead filtered. */
+  .cmdmenu { position: absolute; bottom: calc(100% + 6px); left: 0; right: 0; z-index: 11; max-height: 320px; overflow-y: auto;
+    background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: var(--r-lg); padding: var(--space-1);
+    box-shadow: var(--shadow-3), var(--edge-hi); }
+  @media (prefers-reduced-motion: no-preference) { .cmdmenu { animation: pop-in var(--dur-fast) var(--ease); } }
+  .cmdhint { font-size: 0.64rem; padding: 0.15rem 0.45rem 0.3rem; }
+  .cmdrow { display: flex; align-items: baseline; gap: 0.55rem; width: 100%; text-align: left; padding: var(--space-2) var(--space-3); border-radius: var(--r-md); }
+  .cmdrow:hover, .cmdrow.sel { background: var(--surface-3); }
+  .cmdname { font-family: var(--mono); font-size: 0.8rem; flex: none; white-space: nowrap; }
+  .cmdarg { font-weight: 400; }
+  .cmddesc { flex: 1; font-size: 0.74rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cmdtag { flex: none; font-size: 0.58rem; letter-spacing: 0.05em; text-transform: uppercase; border-radius: var(--r-xs);
+    padding: 0 0.32rem; border: 1px solid var(--border-strong); color: var(--muted); }
+  .cmdtag.builtin { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
   .foot-act { font-size: 0.75rem; color: var(--muted); border: 1px solid var(--border); border-radius: 7px; padding: 0.22rem 0.5rem; }
   .foot-act:hover:not(:disabled) { border-color: var(--border-strong); color: var(--text); }
   .foot-act:disabled { opacity: 0.35; cursor: default; }

@@ -363,6 +363,15 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, sessions.listProfiles())
         return
       }
+      // A profile's custom slash commands (<configDir>/commands/*.md) — the SAME files the Claude
+      // Agent SDK expands at turn time. Feeds the composer's `/` command picker; the mapped built-ins
+      // are added client-side (they're hub-feature actions, not on-disk files). Empty for a Codex
+      // profile (no command dir) or an unknown id.
+      const commandsMatch = /^\/api\/profiles\/([^/]+)\/commands$/.exec(url.pathname)
+      if (method === 'GET' && commandsMatch) {
+        json(res, sessions.listCommands(decodeURIComponent(commandsMatch[1] as string)))
+        return
+      }
       // One-click add-account: launches the vendor login in a visible terminal, then
       // long-polls until the credentials file appears (login done) or times out.
       if (method === 'POST' && url.pathname === '/api/accounts/login') {
@@ -669,6 +678,16 @@ export function startServer(opts: ServerOptions): http.Server {
         const body = await readBody(req)
         await sessions.steer(steerMatch[1] as string, String(body.text ?? ''))
         json(res, { ok: true })
+        return
+      }
+      // On-demand context compaction (the `/compact` built-in). Honest stub: no driver exposes a
+      // programmatic compaction trigger yet (see SessionManager.compact for the spike write-up), so
+      // this reports { supported: false, reason } and the UI surfaces that instead of silently
+      // no-op'ing. 501 so a caller can feature-detect. TODO(compaction): wire when a driver ships it.
+      const compactMatch = /^\/api\/sessions\/([^/]+)\/compact$/.exec(url.pathname)
+      if (method === 'POST' && compactMatch) {
+        const result = await sessions.compact(compactMatch[1] as string)
+        json(res, result, result.supported ? 200 : 501)
         return
       }
       // Rename a session (auto-naming override). sanitizeTitle in rename() is the trust boundary.

@@ -310,6 +310,21 @@ export interface BusMessage {
   readAt: string | null
 }
 
+// One custom slash command a profile exposes on disk (<configDir>/commands/*.md), enumerated by the
+// hub. Feeds the composer's `/` picker alongside the client-defined built-ins.
+export interface CommandInfo {
+  name: string
+  description: string
+}
+
+// Result of the `/compact` built-in. `supported:false` (+ reason) today — no driver exposes an
+// on-demand compaction trigger yet (the hub returns 501); the composer surfaces the reason.
+export interface CompactResult {
+  supported?: boolean
+  reason?: string
+  error?: string
+}
+
 export const api = {
   profiles: () => jget<ProfileInfo[]>('/api/profiles'),
   stats: () => jget<StatsResult>('/api/stats'),
@@ -343,6 +358,10 @@ export const api = {
     jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/input`, { text, ...extra }),
   steer: (id: string, text: string) =>
     jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/steer`, { text }),
+  // A profile's on-disk custom slash commands (for the `/` command picker).
+  commands: (profileId: string) => jget<CommandInfo[]>(`/api/profiles/${encodeURIComponent(profileId)}/commands`),
+  // Request on-demand context compaction (the `/compact` built-in). See CompactResult.
+  compact: (id: string) => jpost<CompactResult>(`/api/sessions/${id}/compact`),
   interrupt: (id: string) => jpost(`/api/sessions/${id}/interrupt`),
   stop: (id: string) => jpost(`/api/sessions/${id}/stop`),
   deleteSession: (id: string) => jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/delete`),

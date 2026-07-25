@@ -796,6 +796,19 @@ class HubStore {
     return key
   }
 
+  // Push a local-only informational note into a thread — slash-command feedback (/usage output,
+  // "model → X", the /compact not-supported reason, argument help). Not journaled: it's a
+  // client-side annotation, rendered exactly like the hub's own `note` items (session/mode etc.).
+  // Drafts drop these when they materialize into a real session (fresh view), which is fine —
+  // the feedback is ephemeral.
+  pushLocalNote(sessionId: string, text: string): void {
+    const v = this.sessions[sessionId]
+    if (!v) return
+    const ts = new Date().toISOString()
+    this.push(v, { kind: 'note', ts, text })
+    this.touch(v, ts)
+  }
+
   // Roll back an optimistic item (e.g. when the send failed).
   removeItem(sessionId: string, key: string): void {
     const v = this.sessions[sessionId]

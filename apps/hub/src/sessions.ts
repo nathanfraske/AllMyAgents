@@ -24,6 +24,7 @@ import { InProcessExecutor, type Executor, type InProcessExecutorHubHooks } from
 import type { RelayMethod, WorkerSessionSpec, WorkerToHub } from './workerProtocol.js'
 import { deriveTitle, sanitizeTitle } from './title.js'
 import { discoverImportableChats, importKey, type ImportableChat, type ScanResult } from './importScan.js'
+import { readProfileCommands, type CommandInfo } from './commands.js'
 
 export interface CreateOptions {
   cwd?: string
@@ -668,6 +669,18 @@ export class SessionManager {
     return [...this.profiles.values()].map((p) => ({ id: p.id, provider: p.provider }))
   }
 
+  /**
+   * The custom slash commands a profile exposes on disk (`<configDir>/commands/*.md`) — the same
+   * files the Claude Agent SDK expands at turn time. Powers the composer's `/` command picker.
+   * Unknown profile → []. Codex has no equivalent command dir today, so this is empty for Codex
+   * profiles (the picker still shows the mapped built-ins the provider supports).
+   */
+  listCommands(profileId: string): CommandInfo[] {
+    const profile = this.profiles.get(profileId)
+    if (!profile) return []
+    return readProfileCommands(profile.dir)
+  }
+
   private persist(record: SessionRecord): void {
     // A turn that was interrupted by delete() can unwind and try to persist after the session was
     // already removed from the map + store. Don't let that resurrect a deleted session. (boot() and
@@ -942,6 +955,33 @@ export class SessionManager {
     if (record.provider !== 'codex') throw new Error('steering is only supported for Codex sessions')
     await this.executor.steer(sessionId, text)
     this.journal.append(sessionId, 'session/steered', { text })
+  }
+
+  /**
+   * On-demand context compaction (the `/compact` built-in).
+   *
+   * SPIKE RESULT (2026-07-25): NO driver exposes an on-demand compaction trigger.
+   *  - Claude Agent SDK `Query` control surface (interrupt / setModel / setPermissionMode /
+   *    setMaxThinkingTokens / supportedCommands / getContextUsage …) has no `compact()`. Compaction
+   *    happens only AUTOMATICALLY via options (`autoCompactEnabled` / `autoCompactThreshold` /
+   *    `autoCompactWindow`) and is observable after the fact (PreCompact/PostCompact hooks,
+   *    `SDKCompactBoundaryMessage`). The `/compact` slash command is handled by the interactive CLI
+   *    command processor, which is disabled in the headless SDK env (returns "isn't available in
+   *    this environment", num_turns=0 — same bucket as `/help`), so feeding `/compact` as prompt
+   *    text would silently no-op.
+   *  - Codex app-server exposes no `turn/compact` method either.
+   *
+   * So this is an honest stub: it journals the request and reports that the driver can't do it yet,
+   * and the UI surfaces that rather than pretending. TODO(compaction): wire a real trigger the moment
+   * a driver ships one (a future SDK compact control, or streaming-input mode wired end-to-end with a
+   * `/compact` the CLI honors headlessly).
+   */
+  async compact(sessionId: string): Promise<{ supported: boolean; reason: string }> {
+    const record = this.sessions.get(sessionId)
+    if (!record) throw new Error(`unknown session: ${sessionId}`)
+    const reason = `on-demand compaction is not yet supported by the ${record.provider} driver`
+    this.journal.append(sessionId, 'session/compact-requested', { supported: false, provider: record.provider })
+    return { supported: false, reason }
   }
 
   setMode(sessionId: string, mode: 'safe' | 'edits' | 'full'): void {
