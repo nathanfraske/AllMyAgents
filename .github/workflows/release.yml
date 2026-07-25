@@ -1,0 +1,104 @@
+# Release — build + sign the desktop installers for Windows and macOS on a version tag, generate the
+# Tauri v2 updater artifacts + latest.json, and attach everything to a GitHub PRE-release.
+#
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+#  ONE-TIME SETUP BEFORE THE FIRST RELEASE (the updater signing keypair — a key, not a server):
+#
+#  1. Generate a minisign keypair with the Tauri CLI (run once, locally, keep the private key secret):
+#
+#         pnpm --filter desktop exec tauri signer generate -w ./ama-updater.key
+#       (or:  npx @tauri-apps/cli signer generate -w ./ama-updater.key )
+#
+#     It prints a PUBLIC KEY and writes the PRIVATE KEY to ./ama-updater.key (protected by the
+#     password you choose). NEVER commit either file.
+#
+#  2. Paste the PUBLIC KEY into apps/desktop/src-tauri/tauri.conf.json → plugins.updater.pubkey
+#     (replacing the PASTE_TAURI_MINISIGN_PUBLIC_KEY_HERE… placeholder). The public key is safe to
+#     commit — the updater uses it to verify an update's signature before installing it.
+#
+#  3. Add two GitHub Actions repository secrets (Settings → Secrets and variables → Actions):
+#         TAURI_SIGNING_PRIVATE_KEY           = the full contents of ama-updater.key
+#         TAURI_SIGNING_PRIVATE_KEY_PASSWORD  = the password you set in step 1 (empty string if none)
+#     These are the CI secret PLACEHOLDERS referenced below — this workflow does not contain a key.
+#
+#  After that, pushing a tag like `v0.1.0-alpha.1` cuts the release; alpha.2+ then auto-update.
+#
+#  NOTE on the updater endpoint: tauri.conf.json points at
+#    .../releases/latest/download/latest.json
+#  GitHub's `/releases/latest` resolves to the newest NON-prerelease. While every alpha is a
+#  pre-release there is no "latest" for it to resolve to, so either (a) promote one release out of
+#  pre-release, or (b) temporarily point the endpoint at the per-tag URL
+#  .../releases/download/<tag>/latest.json until a stable release exists.
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# tauri-action creates the GitHub Release and uploads the installers/updater assets to it.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # The task's two release runners. Each builds for its own host arch, which is important here:
+        # scripts/bundle-hub.mjs ships the *runner's* Node binary as a sidecar, so the app arch and the
+        # bundled Node arch must match. macos-latest is Apple Silicon (arm64); an Intel-Mac (x86_64)
+        # build would need an added macos-13 matrix entry — a follow-up, not wired here.
+        platform: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Cache the Rust build of the Tauri app (the crate lives under apps/desktop/src-tauri).
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'apps/desktop/src-tauri -> target'
+
+      # Installs all workspaces. tauri.conf.json's beforeBuildCommand then builds the web UI and runs
+      # `hub:bundle` (which stages this runner's Node + the compiled hub as Tauri resources).
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # tauri-action runs `tauri build` in apps/desktop: builds the installers (Windows .msi + NSIS,
+      # macOS .app + .dmg via the config's `targets: "all"`), and because bundle.createUpdaterArtifacts
+      # is true + the signing key is present, it also emits the SIGNED updater artifacts and (with
+      # includeUpdaterJson) the latest.json manifest — all uploaded to a GitHub pre-release.
+      - name: Build, sign, and publish (tauri-action)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Updater signing key — supplied by the repo secrets from the ONE-TIME SETUP above.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: 'AllMyAgents ${{ github.ref_name }}'
+          releaseBody: |
+            AllMyAgents ${{ github.ref_name }} — alpha pre-release.
+
+            Prerequisites: a dev toolchain (Node + the Codex CLI) must be present; see the README.
+            Installers below; alpha.2+ auto-update via the bundled Tauri updater.
+          prerelease: true
+          includeUpdaterJson: true

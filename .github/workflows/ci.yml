@@ -1,0 +1,59 @@
+name: CI
+
+# Cross-OS functional gate: run the hub + web suites on Windows, macOS, and Linux so a change that
+# only works on one platform (a Windows-ism, a POSIX-ism) fails here rather than in a user's install.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Superseded runs on the same branch/PR are cancelled to save runner minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    name: gates (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Never let one OS failing hide the result on the others.
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # pnpm is the repo's package manager (pnpm-lock.yaml, packageManager field). action-setup reads
+      # the exact version from package.json's `packageManager`, so there is one source of truth.
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      # setup-node's `cache: pnpm` keys the pnpm store on pnpm-lock.yaml — the pnpm cache the task asks
+      # for. pnpm must already be on PATH (above) for this to resolve the store dir.
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # ---- Hub gate: apps/hub → vitest run + tsc --noEmit --------------------------------------------
+      # (package.json scripts: test = "vitest run", typecheck = "tsc --noEmit")
+      - name: Hub — unit tests (vitest)
+        run: pnpm --filter hub test
+
+      - name: Hub — typecheck (tsc --noEmit)
+        run: pnpm --filter hub typecheck
+
+      # ---- Web gate: apps/web → svelte-check + vitest run --------------------------------------------
+      # (package.json scripts: check = "svelte-check --tsconfig ./tsconfig.json", test = "vitest run")
+      - name: Web — svelte-check
+        run: pnpm --filter web check
+
+      - name: Web — unit tests (vitest)
+        run: pnpm --filter web test
