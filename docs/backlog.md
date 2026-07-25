@@ -3,6 +3,29 @@
 Not-yet-built items surfaced during the agent-detachment / worker work. Ordered roughly by the order
 they came up; not a priority ranking.
 
+## Tooling gaps — from the T3Code + vendor-app research (docs/t3code-tooling-gaps.md, docs/vendor-app-tooling.md)
+
+AllMyAgents already LEADS on the deep agent tooling (bus, scoped memory, practices, hooks,
+browser/computer/visualization, auto-recall) — not gaps. The real gaps:
+
+- **P0 — VERIFY live behaviors (security-relevant), then govern.** `profiles/claude-a/.claude.json` has
+  `"tengu_claudeai_mcp_connectors": true` and the hub sets NO connector kill-switch, so the operator's
+  claude.ai connectors may already reach hub Claude agents via the vendor cloud (a data-egress path).
+  Also verify the installed Agent-SDK `settingSources` default and whether Codex's built-in `image_gen`
+  is exposed to our unmanaged app-server client. Then make a deliberate decision (safe-default +
+  Danger-Zone toggle) for connectors + vendor auto-memory (which runs in parallel with hub memory).
+- **P1 — Claude skill asymmetry.** Codex agents auto-load their profile's bundled skills (imagegen,
+  ~20 artifact-template docs, review-agent, github recipes); our Claude profiles ship NO skills / no
+  plugins, so Claude agents get no skill library at all. Provision a scope-governed Claude skill set
+  (materialized like practices, `instructions.ts`).
+- **G1 (P0) — review-feedback loop, exposed to agents.** Operator leaves PR-style inline comments on a
+  turn's diff → thread as feedback.md/json (open/resolved). Leapfrog T3Code (their #345 "not planned")
+  by making it an agent MCP tool the agent reads/resolves itself.
+- **G2–G5 (git-lifecycle):** per-turn changed-files diff + checkpoint/rollback; hub-owned
+  commit/push/PR; plan-then-execute gate; quick-actions / project-scripts.
+- **P2:** self-hosted scheduler (scheduled-tasks equivalent); document-artifact rendering (pdf/docx/
+  xlsx/pptx/dataviz); `$`-picker skill curation; outward-facing hub MCP server; per-session MCP passthrough.
+
 ## Critical-agent tier (requested 2026-07-24)
 
 An opt-in per-agent designation for maximum restart durability, ON TOP of the Phase-2 worker model
