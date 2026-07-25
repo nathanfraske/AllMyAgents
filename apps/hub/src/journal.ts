@@ -8,6 +8,8 @@ import type { HubEvent } from './types.js'
 export class Journal extends EventEmitter {
   readonly db: Database.Database
   private readonly insertStmt: Database.Statement
+  private readonly insertWorkerStmt: Database.Statement
+  private readonly lastWseqStmt: Database.Statement
   private readonly sinceStmt: Database.Statement
 
   constructor(file: string) {
@@ -22,7 +24,14 @@ export class Journal extends EventEmitter {
     this.db.exec(
       'CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, session TEXT, kind TEXT NOT NULL, payload TEXT NOT NULL)'
     )
+    // Additive, back-compat: tag worker-relayed events with their per-session worker seq so a restarted
+    // hub can derive the durable re-attach cursor MAX(wseq) (docs/agent-worker-impl.md §7.1). Old rows
+    // are NULL. Guarded so re-running on an already-migrated DB is a no-op.
+    const hasWseq = (this.db.prepare("SELECT 1 FROM pragma_table_info('events') WHERE name = 'wseq'").get() as unknown) != null
+    if (!hasWseq) this.db.exec('ALTER TABLE events ADD COLUMN wseq INTEGER')
     this.insertStmt = this.db.prepare('INSERT INTO events (ts, session, kind, payload) VALUES (?, ?, ?, ?)')
+    this.insertWorkerStmt = this.db.prepare('INSERT INTO events (ts, session, kind, payload, wseq) VALUES (?, ?, ?, ?, ?)')
+    this.lastWseqStmt = this.db.prepare('SELECT MAX(wseq) AS m FROM events WHERE session = ? AND wseq IS NOT NULL')
     this.sinceStmt = this.db.prepare(
       'SELECT seq, ts, session, kind, payload FROM events WHERE seq > ? ORDER BY seq ASC LIMIT ?'
     )
@@ -41,6 +50,27 @@ export class Journal extends EventEmitter {
     }
     this.emit('event', event)
     return event
+  }
+
+  /**
+   * Append a WORKER-relayed event, tagging it with the source per-session `wseq` so a restarted hub can
+   * derive the durable re-attach cursor via lastJournaledWseq (docs/agent-worker-impl.md §7.1). Same
+   * redaction + emit path as append(), so the event reaches reconnected operator panes identically.
+   */
+  appendWorker(sessionId: string, kind: string, payload: unknown, wseq: number): HubEvent {
+    const ts = new Date().toISOString()
+    const clean = redact(JSON.stringify(payload ?? null))
+    const info = this.insertWorkerStmt.run(ts, sessionId, kind, clean, wseq)
+    const event: HubEvent = { seq: Number(info.lastInsertRowid), ts, sessionId, kind, payload: JSON.parse(clean) as unknown }
+    this.emit('event', event)
+    return event
+  }
+
+  /** Highest worker `wseq` durably journaled for a session (0 if none) — the exactly-once re-attach
+   *  cursor handed to the worker's attach(since) at hub boot (docs/agent-worker-impl.md §7.1). */
+  lastJournaledWseq(sessionId: string): number {
+    const row = this.lastWseqStmt.get(sessionId) as { m: number | null } | undefined
+    return row?.m ?? 0
   }
 
   since(seq: number, limit = 2000): HubEvent[] {
