@@ -1,6 +1,6 @@
 import { api, HUB_WS, getHubToken, setHubToken } from './api'
 import { settings } from './settings.svelte'
-import type { ApprovalRecord, HistoryItem, HistoryPage, HubEvent, ProfileInfo, ProjectInfo, ScanResult, SessionRecord, UsageSnapshot } from './api'
+import type { ApprovalRecord, FleetSite, HistoryItem, HistoryPage, HubEvent, ProfileInfo, ProjectInfo, ScanResult, SessionRecord, UsageSnapshot } from './api'
 
 // Verbose client tracing — on in dev, compiled out of prod builds. Toggle off in dev by setting
 // localStorage['ama:verbose'] = '0'. Surfaces the load/connect/replay/scan milestones so a stall is
@@ -216,6 +216,13 @@ class HubStore {
   // The sidebar watches this to play a brief glitch on that row's label, then clears it.
   recentlyChanged = $state<Record<string, number>>({})
   lastSeq = 0
+  // --- Unified fleet view (first cut, read-only) -----------------------------------------------
+  // The fleet roster from GET /api/fleet (this hub + reachable co-owned peers). In the single-machine
+  // case this is just the local entry, so nothing below changes the UI. Remote sites' projects +
+  // sessions are POLLED read-only and merged into `projects`/`sessions` with `${siteId}:` id
+  // namespacing + a site tag for the sidebar badge; the LOCAL hub keeps its live WS + apply() as-is.
+  fleetSites = $state<FleetSite[]>([])
+  private fleetTimer: ReturnType<typeof setInterval> | null = null
 
   // --- Import prompt ---------------------------------------------------------------------------
   // Which project's "import existing chats" panel is open (id + folder path, plus an optional
@@ -337,6 +344,10 @@ class HubStore {
     await this.refreshSideData()
     vlog(`init: side data loaded (${msSince(t0)}) — connecting WS`)
     this.connect()
+    // Fire-and-forget: pull the fleet roster and merge any remote machines' projects/sessions
+    // read-only. Non-blocking so local render stays instant; a no-node/no-peer hub gets just the
+    // local entry and this is a no-op (see refreshFleet).
+    this.startFleet()
     // NOTE: we deliberately do NOT scan every project on load — that walked ~/.codex + ~/.claude and
     // read thousands of transcript files per project, pegging the hub for minutes ("stuck scanning").
     // The import prompt now fires lazily, for the ONE project you actually open (see maybePromptImport).
@@ -559,7 +570,84 @@ class HubStore {
   }
 
   async refreshProjects(): Promise<void> {
-    this.projects = await api.projects()
+    // Preserve any merged REMOTE fleet projects (tagged with siteId) — a local refresh must not drop
+    // the other machines' rows. Local projects (no siteId) come fresh from this hub.
+    const local = await api.projects()
+    const remote = this.projects.filter((p) => p.siteId)
+    this.projects = [...local, ...remote]
+  }
+
+  // --- Unified fleet view (first cut, read-only) -----------------------------------------------
+  // Poll the fleet roster and merge each REMOTE, ONLINE site's projects + sessions. Started
+  // fire-and-forget from init(); a periodic refresh keeps remote rosters roughly current (remote
+  // sites have no live WS in this first cut — that fan-out is the full drive-remote (L) work).
+  private startFleet(): void {
+    if (this.fleetTimer) return // already running (init() can re-run after pairing)
+    void this.refreshFleet()
+    this.fleetTimer = setInterval(() => void this.refreshFleet(), 20000)
+  }
+
+  // Fetch /api/fleet, then for every remote+online site pull its /api/projects + /api/sessions and
+  // merge them with `${siteId}:` id-namespacing (origin attribution + collision-safety) and a site
+  // tag for the sidebar badge. The LOCAL entry is skipped here — it stays on its existing base + live
+  // WS. Byte-identical to today when there are no remote sites and none were previously merged.
+  // TODO(full drive-remote, L): open a WS per remote site (per-site seq cursors) + route mutations
+  //   (spawn/send/steer/stop/mode/approve/rename/delete) to the owning site's base + token, instead
+  //   of this read-only poll. See docs/mesh-unified-fleet.md §5.
+  async refreshFleet(): Promise<void> {
+    const raw = await api.fleet().catch(() => [] as FleetSite[])
+    // Coerce a non-array (an older hub with no /api/fleet returns {error}; a token-gated hub returns
+    // 401 {error}) so a bad shape can't throw out of this fire-and-forget refresh. Empty / failure →
+    // treat as local-only and don't wipe anything already merged on a transient blip.
+    const fleet = Array.isArray(raw) ? raw : []
+    if (fleet.length) this.fleetSites = fleet
+    const remotes = fleet.filter((s) => !s.local && s.online)
+    const hadRemote =
+      this.projects.some((p) => p.siteId) || Object.values(this.sessions).some((v) => v.record.siteId)
+    // Pure single-machine path: nothing remote now, nothing merged before → leave local state
+    // completely untouched (no reassignments, no reactivity churn), exactly as before this feature.
+    if (remotes.length === 0 && !hadRemote) return
+
+    const pulled = await Promise.all(
+      remotes.map(async (site) => {
+        const [projects, sessions] = await Promise.all([
+          api.projectsFrom(site.baseUrl).catch(() => [] as ProjectInfo[]),
+          api.sessionsFrom(site.baseUrl).catch(() => [] as SessionRecord[]),
+        ])
+        return { site, projects, sessions }
+      })
+    )
+
+    const localProjects = this.projects.filter((p) => !p.siteId)
+    const remoteProjects: ProjectInfo[] = []
+    const seenRemoteSessionIds = new Set<string>()
+    for (const { site, projects, sessions } of pulled) {
+      for (const p of projects) {
+        remoteProjects.push({ ...p, id: `${site.siteId}:${p.id}`, siteId: site.siteId, siteLabel: site.label })
+      }
+      for (const s of sessions) {
+        const rec: SessionRecord = {
+          ...s,
+          id: `${site.siteId}:${s.id}`,
+          projectId: s.projectId ? `${site.siteId}:${s.projectId}` : undefined,
+          siteId: site.siteId,
+          siteLabel: site.label,
+        }
+        seenRemoteSessionIds.add(rec.id)
+        // ensure() keys by the namespaced id → never collides with a local (raw-id) session. Refresh
+        // the view's lastActivity too so the sidebar re-sorts remote rows by their real recency
+        // (ensure sets it only on first create, and a remote session has no live WS to bump it).
+        const v = this.ensure(rec)
+        v.lastActivity = rec.lastActivity ?? rec.createdAt
+      }
+    }
+    this.projects = [...localProjects, ...remoteProjects]
+    // Drop remote sessions that vanished (site went offline, or the chat was deleted there). Only
+    // ever touches rows tagged with a siteId — local sessions + drafts are left alone.
+    for (const id of Object.keys(this.sessions)) {
+      const v = this.sessions[id]
+      if (v?.record.siteId && !seenRemoteSessionIds.has(id)) this.removeSessionLocal(id)
+    }
   }
 
   // Adopt the selected existing vendor chats into a project. The hub persists them and journals
@@ -1120,6 +1208,13 @@ class HubStore {
   async ensureHistory(id: string): Promise<void> {
     const view = this.sessions[id]
     if (!view || this.historyPulled.has(id)) return
+    // A REMOTE fleet session has no local transcript to pull — its history + live stream live on its
+    // owning hub (the full drive-remote (L) work). Mark it pulled so opening it is a clean no-op,
+    // never a namespaced-id fetch against THIS hub. See docs/mesh-unified-fleet.md §5.
+    if (view.record.siteId) {
+      this.historyPulled.add(id)
+      return
+    }
     if (!view.record.imported && !view.record.vendorSessionId) return
     // Already has real turns (live session, or history loaded) — nothing to backfill.
     if (view.items.some((i) => i.kind === 'user' || i.kind === 'assistant')) {

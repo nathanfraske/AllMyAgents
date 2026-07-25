@@ -56,6 +56,14 @@
       'M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0z',
       'M18 9a9 9 0 0 1-9 9',
     ],
+    // Machine/site badge for the unified fleet view (two stacked racks + status dots; path-only so it
+    // works with this component's <path>-only renderer).
+    server: [
+      'M4 3h16a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z',
+      'M4 15h16a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-4a1 1 0 0 1 1-1z',
+      'M7 6h.01',
+      'M7 18h.01',
+    ],
   }
 </script>
 

@@ -15,6 +15,7 @@ import type { PracticeStore } from './practices.js'
 import { tokenMatches } from './deviceToken.js'
 import { pickFolder } from './native.js'
 import { computeStats } from './stats.js'
+import { buildFleet, probeHubHealth } from './fleet.js'
 import { startLogin, awaitLogin, credentialsExist } from './loginLauncher.js'
 import type { DangerFlags, HubEvent, Profile, Provider } from './types.js'
 import type { RestartState } from './restartController.js'
@@ -539,6 +540,26 @@ export function startServer(opts: ServerOptions): http.Server {
       // another device (withheld from unauthenticated callers once enforcement is on).
       if (method === 'GET' && url.pathname === '/api/mesh') {
         json(res, { ...mesh.status(), requireToken, token: !requireToken || authed ? deviceToken : undefined })
+        return
+      }
+      // Unified-across-mesh fleet roster (read-only, first cut — docs/mesh-unified-fleet.md). Always
+      // returns THIS hub as the local entry; when an AllMyStuff node is present it adds every
+      // co-owned peer whose hub the node can map a loopback port to, probing /api/health for `online`.
+      // Fail-soft + fast with no node/no peers: mesh.ownedRoster() returns [] immediately, so this is
+      // just the single local entry (the single-machine case). Gated by requireToken like any /api/*.
+      // TODO(full drive-remote, L): rehydrate from `site_mappings` + capture the `allmystuff://
+      //   node-sites` event to know hub exposure before mapping, instead of map-then-probe each poll.
+      if (method === 'GET' && url.pathname === '/api/fleet') {
+        const m = mesh.status()
+        const sites = await buildFleet({
+          localSiteId: m.siteId,
+          localLabel: m.label,
+          localBaseUrl: `http://127.0.0.1:${m.port}`,
+          roster: () => mesh.ownedRoster(),
+          siteMap: (node, p) => mesh.siteMap(node, p),
+          probeHealth: (baseUrl) => probeHubHealth(baseUrl, 1500),
+        })
+        json(res, sites)
         return
       }
       // Runtime toggle for exposing the hub as an AllMyStuff site. Registers/deregisters to match.
