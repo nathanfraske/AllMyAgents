@@ -73,6 +73,11 @@ const executor: Executor = workerSocket
       applyLifecycle: (msg) => sessions.applyLifecycle(msg),
       recall: (sessionId, prompt) => sessions.recallForWorker(sessionId, prompt),
       requestRestart: (reason, bySession) => void sessions.requestRestart(reason, bySession),
+      // The worker's MCP tool handlers reaching hub-owned services (§3.3): an `rpc` runs against the same
+      // bus/memory/practices the in-process executor uses; an `approvalRequest` goes to the operator via
+      // the idempotent approvals.request(id) so a re-issue across a restart dedups (§7.2).
+      runRelay: (method, args) => sessions.runRelay(method, args),
+      resolveApproval: (approvalId, sessionId, kind, payload) => approvals.request(sessionId, kind, payload, approvalId),
     })
   : new InProcessExecutor({ approvals, usage, danger, memory, practices })
 sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, repoRoot, executor)
@@ -127,7 +132,7 @@ const meshEnable = !(
 const mesh = new MeshSite({ port: publicPort, label: config.mesh?.label, enable: meshEnable })
 
 // Listen on the BOOT port (0 → ephemeral for a green); the server reports its actual port back.
-const server = startServer({ port: bootPort, defaultCwd: repoRoot, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken, restartState })
+const server = startServer({ port: bootPort, defaultCwd: repoRoot, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken, restartState, executor })
 
 // Register the mesh advert — factored so a promoted green can (re)register once it owns the port.
 function registerMesh(): void {

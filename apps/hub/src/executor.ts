@@ -37,6 +37,13 @@ export interface Executor {
   attach(since: Record<string, number>): Promise<void>
   /** True while this session's claude driver is mid-turn — backs the "a turn is already in progress" guard. */
   isBusy(sessionId: string): boolean
+  /**
+   * Push the live Danger Zone flags to the executor so the worker's cached `danger()` (read by the MCP
+   * gates, §3.3) stays current. WORKER-MODE ONLY: the in-process executor reads the shared `danger`
+   * object live and never implements this, so `executor.pushDanger?.(danger)` is a no-op in-process
+   * (docs/agent-worker-impl.md §4.4). Called from POST /api/config/danger on change.
+   */
+  pushDanger?(danger: DangerFlags): void
 }
 
 // The in-process agent tools (`mcp__allmyagents__*`) split by risk. SAFE tools are auto-allowed in
@@ -45,7 +52,7 @@ export interface Executor {
 // handlers self-gate by awaiting the operator (see agentTools.ts), which fires even under `full`
 // where canUseTool is skipped entirely. Any allmyagents tool in neither set falls through to the
 // generic approval gate — a safe default for a future tool that hasn't been classified yet.
-const AUTO_ALLOW_TOOLS = new Set([
+export const AUTO_ALLOW_TOOLS = new Set([
   'mcp__allmyagents__list_agents',
   'mcp__allmyagents__send_message',
   'mcp__allmyagents__read_messages',
@@ -55,7 +62,7 @@ const AUTO_ALLOW_TOOLS = new Set([
   'mcp__allmyagents__practice_read',
   'mcp__allmyagents__practice_list',
 ])
-const SELF_GATING_TOOLS = new Set([
+export const SELF_GATING_TOOLS = new Set([
   'mcp__allmyagents__practice_write',
   'mcp__allmyagents__practice_edit',
 ])

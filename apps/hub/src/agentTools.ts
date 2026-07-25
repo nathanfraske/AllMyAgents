@@ -3,10 +3,35 @@ import { z } from 'zod'
 import type { SessionIdentity } from './identity.js'
 import { readableScopes } from './identity.js'
 import type { BusAddress, BusMessage } from './bus.js'
-import type { MemoryStore } from './memory.js'
-import type { PracticeStore } from './practices.js'
+import type { Memory } from './memory.js'
+import type { Practice } from './practices.js'
 import { decidePracticeGate, practiceScope } from './practices.js'
 import type { DangerFlags } from './types.js'
+
+/**
+ * A value the tool handlers may receive either synchronously (the in-process executor, which holds the
+ * real stores) or over an async relay (the worker, which proxies every call back to the hub —
+ * docs/agent-worker-impl.md §3.3). Widening the {@link AgentServices} surface to `Awaitable` lets ONE set
+ * of handler bodies serve both executors: they `await` each service call, which is a no-op on a
+ * synchronous value (so the in-process path is behavior-identical) and resolves the RPC in worker mode.
+ */
+export type Awaitable<T> = T | Promise<T>
+
+/** The subset of `MemoryStore` the agent tools call, widened to `Awaitable` so a worker RPC proxy can
+ *  satisfy it. `MemoryStore` itself still satisfies it — a synchronous return is assignable to `Awaitable`. */
+export interface MemoryServices {
+  write(input: { scope: string; title: string; body: string; tags?: string[]; fromSession?: string | null; fromProfile?: string | null }): Awaitable<Memory>
+  search(query: string, opts: { scopes?: string[]; limit?: number }): Awaitable<Memory[]>
+  get(id: string, scopes?: string[]): Awaitable<Memory | undefined>
+}
+
+/** The subset of `PracticeStore` the agent tools call, widened to `Awaitable` (same rationale as {@link MemoryServices}). */
+export interface PracticeServices {
+  write(input: { scope: string; title: string; body: string; fromSession?: string | null; fromProfile?: string | null }): Awaitable<Practice>
+  edit(id: string, patch: { title?: string; body?: string }): Awaitable<Practice | undefined>
+  get(id: string, scopes?: string[]): Awaitable<Practice | undefined>
+  list(opts?: { scopes?: string[]; limit?: number }): Awaitable<Practice[]>
+}
 
 /**
  * The hub-side capabilities the agent MCP tools call into. SessionManager implements this — it owns
@@ -16,14 +41,14 @@ import type { DangerFlags } from './types.js'
  */
 export interface AgentServices {
   /** Send a bus message from `from` to a teammate (session) or the whole project. */
-  send(from: SessionIdentity, to: BusAddress, subject: string | undefined, body: string): { ok: boolean; delivered: number; error?: string }
+  send(from: SessionIdentity, to: BusAddress, subject: string | undefined, body: string): Awaitable<{ ok: boolean; delivered: number; error?: string }>
   /** Read + mark-read the caller's inbox. */
-  inbox(sessionId: string): BusMessage[]
+  inbox(sessionId: string): Awaitable<BusMessage[]>
   /** The teammates the caller can message (same project, not itself, not stopped). */
-  roster(sessionId: string): { sessionId: string; label: string; provider: string; status: string }[]
-  memory: MemoryStore
+  roster(sessionId: string): Awaitable<{ sessionId: string; label: string; provider: string; status: string }[]>
+  memory: MemoryServices
   /** Agent-writable practices (durable conventions materialized into future agents). */
-  practices: PracticeStore
+  practices: PracticeServices
   /**
    * Block until the operator approves this action, then resolve true/allow or false/deny. This is
    * the SELF-GATE the risky in-process tools call from inside their own handler — it fires even under
@@ -68,7 +93,7 @@ export function buildAgentMcpServer(identity: SessionIdentity, services: AgentSe
         'List the other agents you can message — your teammates on the same project. Returns their session ids (use one verbatim as `to_session`), provider, and current status.',
         {},
         async () => {
-          const roster = services.roster(identity.sessionId)
+          const roster = await services.roster(identity.sessionId)
           if (!roster.length) return textResult('No other agents are currently on your team.')
           return textResult(
             roster
@@ -92,7 +117,7 @@ export function buildAgentMcpServer(identity: SessionIdentity, services: AgentSe
           if (to.kind === 'project' && !identity.projectId) {
             return textResult('You are not in a project, so you must address a specific agent with `to_session` (see list_agents).')
           }
-          const r = services.send(identity, to, args.subject, args.body)
+          const r = await services.send(identity, to, args.subject, args.body)
           return textResult(r.ok ? `Delivered to ${r.delivered} agent(s).` : `Not sent: ${r.error ?? 'unknown error'}`)
         }
       ),
@@ -101,7 +126,7 @@ export function buildAgentMcpServer(identity: SessionIdentity, services: AgentSe
         'Read messages other agents have sent you, and mark them read. Returns newest first.',
         {},
         async () => {
-          const msgs = services.inbox(identity.sessionId)
+          const msgs = await services.inbox(identity.sessionId)
           if (!msgs.length) return textResult('No messages.')
           return textResult(
             msgs
@@ -127,7 +152,7 @@ export function buildAgentMcpServer(identity: SessionIdentity, services: AgentSe
         },
         async (args) => {
           const scope = resolveWriteScope(identity, args.scope)
-          const m = services.memory.write({
+          const m = await services.memory.write({
             scope,
             title: args.title,
             body: args.body,
@@ -146,7 +171,7 @@ export function buildAgentMcpServer(identity: SessionIdentity, services: AgentSe
           limit: z.number().optional(),
         },
         async (args) => {
-          const res = services.memory.search(args.query, { scopes: readableScopes(identity), limit: args.limit })
+          const res = await services.memory.search(args.query, { scopes: readableScopes(identity), limit: args.limit })
           if (!res.length) return textResult('No matching memories.')
           return textResult(
             res.map((m) => `- [${m.scope}] ${m.title} (id ${m.id.slice(0, 8)})\n  ${m.body.slice(0, 300)}`).join('\n')
@@ -158,7 +183,7 @@ export function buildAgentMcpServer(identity: SessionIdentity, services: AgentSe
         'Read a specific memory by id (from memory_search).',
         { id: z.string() },
         async (args) => {
-          const m = services.memory.get(args.id, readableScopes(identity))
+          const m = await services.memory.get(args.id, readableScopes(identity))
           return m ? textResult(`[${m.scope}] ${m.title}\n\n${m.body}`) : textResult('Not found, or outside your access.')
         }
       ),
@@ -185,7 +210,7 @@ export function buildAgentMcpServer(identity: SessionIdentity, services: AgentSe
             const approved = await services.requireApproval(identity, 'practice/write', { scope, title: args.title, body: args.body })
             if (!approved) return textResult('Not recorded — the operator declined (or the request timed out).')
           }
-          const p = services.practices.write({
+          const p = await services.practices.write({
             scope,
             title: args.title,
             body: args.body,
@@ -205,7 +230,7 @@ export function buildAgentMcpServer(identity: SessionIdentity, services: AgentSe
           body: z.string().optional(),
         },
         async (args) => {
-          const existing = services.practices.get(args.id, readableScopes(identity))
+          const existing = await services.practices.get(args.id, readableScopes(identity))
           if (!existing) return textResult('Not found, or outside your access.')
           const ownAccount = existing.scope === `account:${identity.profileId}`
           const gate = decidePracticeGate({ ownAccount, isBusTurn: services.isBusTurn(identity.sessionId), danger: services.danger() })
@@ -217,7 +242,7 @@ export function buildAgentMcpServer(identity: SessionIdentity, services: AgentSe
             const approved = await services.requireApproval(identity, 'practice/edit', { id: args.id, scope: existing.scope, title: args.title, body: args.body })
             if (!approved) return textResult('Not applied — the operator declined (or the request timed out).')
           }
-          const updated = services.practices.edit(args.id, { title: args.title, body: args.body })
+          const updated = await services.practices.edit(args.id, { title: args.title, body: args.body })
           if (!updated) return textResult('Not found.')
           services.journal(identity.sessionId, 'practice/edited', { id: updated.id, scope: updated.scope, title: updated.title })
           return textResult(`Updated practice ${updated.id.slice(0, 8)} (${updated.scope}).`)
@@ -228,7 +253,7 @@ export function buildAgentMcpServer(identity: SessionIdentity, services: AgentSe
         'Read one practice by id (from practice_list).',
         { id: z.string() },
         async (args) => {
-          const p = services.practices.get(args.id, readableScopes(identity))
+          const p = await services.practices.get(args.id, readableScopes(identity))
           return p ? textResult(`[${p.scope}] ${p.title}\n\n${p.body}`) : textResult('Not found, or outside your access.')
         }
       ),
@@ -239,7 +264,7 @@ export function buildAgentMcpServer(identity: SessionIdentity, services: AgentSe
         async (args) => {
           const visible = readableScopes(identity)
           const scopes = args.scope ? visible.filter((s) => s === args.scope) : visible
-          const rows = services.practices.list({ scopes })
+          const rows = await services.practices.list({ scopes })
           if (!rows.length) return textResult('No practices recorded yet.')
           return textResult(
             rows.map((p) => `- [${p.scope}] ${p.title} (id ${p.id.slice(0, 8)})\n  ${p.body.slice(0, 200)}`).join('\n')

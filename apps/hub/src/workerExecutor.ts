@@ -1,6 +1,7 @@
 import type { Executor } from './executor.js'
 import type { WorkerClient } from './workerTransport.js'
-import { nextReqId, type HubToWorker, type LiveSession, type WorkerSessionSpec, type WorkerToHub } from './workerProtocol.js'
+import type { DangerFlags } from './types.js'
+import { nextReqId, type HubToWorker, type LiveSession, type RelayMethod, type WorkerSessionSpec, type WorkerToHub } from './workerProtocol.js'
 
 function errText(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
@@ -19,12 +20,20 @@ function errText(err: unknown): string {
  *                           loop, untouched.
  *   - `requestRestart`    — the restart_hub tool relayed worker→hub → hubctl (wired now; the tool itself
  *                           lands with the MCP relays in a later slice).
+ *   - `runRelay`          — a worker MCP tool handler's `rpc(method,args)` dispatched to the hub's real
+ *                           services (bus/memory/practices) — the SAME calls InProcessExecutor.agentServices
+ *                           makes, just over the socket (§3.3). Sync today; awaited so a future async store
+ *                           still works.
+ *   - `resolveApproval`   — a worker `approvalRequest` → `approvals.request(sessionId, kind, payload, id)`,
+ *                           the idempotent-id signature (§7.2) so a re-issue across a restart dedups.
  */
 export interface WorkerExecutorHubCallbacks {
   ingestWorkerEvent(sessionId: string, wseq: number, kind: string, payload: unknown): void
   applyLifecycle(msg: Extract<WorkerToHub, { t: 'turnStarted' | 'turnCompleted' | 'turnError' }>): void
   recall(sessionId: string, prompt: string): string
   requestRestart(reason: string, bySession?: string): void
+  runRelay(method: RelayMethod, args: unknown): unknown
+  resolveApproval(approvalId: string, sessionId: string, kind: string, payload: unknown): Promise<boolean>
 }
 
 /**
@@ -36,10 +45,11 @@ export interface WorkerExecutorHubCallbacks {
  * busy; turnCompleted/turnError → idle), with an optimistic set on `runTurn` accept so the hub's
  * "a turn is already in progress" guard stays as tight as the in-process `driver.busy` it replaces.
  *
- * STEP 3 SCOPE (docs/agent-worker-impl.md §9.3): turns run in the worker behind the HUB_WORKER_SOCKET
- * flag, with no re-attach yet (a hub restart still loses the turn — Phase-1 parity). The relay stream
- * (bus/memory/practices/approval MCP handlers) and the `'attached'` → `attachWorker()` re-attach are left
- * unwired here with clear TODO markers.
+ * STEP 4 SCOPE (docs/agent-worker-impl.md §3.3, §4.4): turns run in the worker behind the HUB_WORKER_SOCKET
+ * flag AND the worker's MCP tool handlers now relay back to hub-owned services — `onRelay` dispatches
+ * `rpc` to the hub bus/memory/practices and `approvalRequest` to the operator, and `pushDanger` keeps the
+ * worker's cached danger live. Still no re-attach (a hub restart loses the turn — Phase-1 parity): the
+ * `'attached'` → `attachWorker()` wseq replay is left unwired with a clear TODO(step 5) marker.
  */
 export class WorkerExecutor implements Executor {
   // Sessions the worker is currently driving a turn for, tracked from the lifecycle stream (authoritative)
@@ -60,8 +70,13 @@ export class WorkerExecutor implements Executor {
       this.hub.applyLifecycle(m)
     })
     this.client.onRestartRequest((m) => this.hub.requestRestart(m.reason, m.bySession))
-    // TODO(step 4): this.client.onRelay(...) — the worker's MCP tool handlers (bus/memory/practices) and
-    //   requireApproval relayed back to hub-owned services, replied via client.send({t:'rpcResult'|...}).
+    // The worker's MCP tool handlers reaching hub-owned services (§3.3): an `rpc` dispatches to the hub's
+    // bus/memory/practices; an `approvalRequest` blocks on the operator. Each is answered on this same
+    // channel (rpcResult / approvalResolved); the WorkerServer correlates the reply by callId/approvalId.
+    this.client.onRelay((msg) => {
+      if (msg.t === 'rpc') this.dispatchRpc(msg)
+      else this.dispatchApproval(msg)
+    })
     // TODO(step 5): this.client.on('attached', () => hub.attachWorker()) — re-attach + wseq replay after a
     //   hub restart, so an in-flight turn survives the seam (attachWorker/lastJournaledWseq not built yet).
     this.client.connect()
@@ -143,6 +158,43 @@ export class WorkerExecutor implements Executor {
 
   isBusy(sessionId: string): boolean {
     return this.busySessions.has(sessionId)
+  }
+
+  /**
+   * Push the live Danger Zone flags to the worker so its cached `danger()` (read by the MCP gates, §3.3)
+   * stays current — called from POST /api/config/danger on CHANGE (server.ts). Best-effort: dropped if the
+   * worker is momentarily unattached, but never permanently lost — the WorkerClient's `hello` re-sends the
+   * current danger on the next (re)connect (index.ts builds it with `{ danger: () => danger }`), which is
+   * the fail-safe connect-time push. The worker defaults to all-OFF/safe until the first of the two lands.
+   */
+  pushDanger(danger: DangerFlags): void {
+    this.client.send({ t: 'dangerUpdate', danger })
+  }
+
+  /** Dispatch a worker `rpc` relay to the hub's real services and answer with the correlated `rpcResult`.
+   *  `runRelay` is synchronous today (the stores are sync) but awaited so a future async store still works. */
+  private dispatchRpc(msg: Extract<WorkerToHub, { t: 'rpc' }>): void {
+    void (async (): Promise<void> => {
+      try {
+        const value = await this.hub.runRelay(msg.method, msg.args)
+        this.client.send({ t: 'rpcResult', callId: msg.callId, ok: true, value })
+      } catch (err) {
+        this.client.send({ t: 'rpcResult', callId: msg.callId, ok: false, error: errText(err) })
+      }
+    })()
+  }
+
+  /** Dispatch a worker `approvalRequest` to the operator (via the idempotent approvals.request) and answer
+   *  with `approvalResolved`. resolveApproval resolves true/false (fail-closed on its own 10-min timeout)
+   *  and never rejects in practice; if it ever does, reply fail-closed so the worker's relay can't hang. */
+  private dispatchApproval(msg: Extract<WorkerToHub, { t: 'approvalRequest' }>): void {
+    this.hub
+      .resolveApproval(msg.approvalId, msg.sessionId, msg.kind, msg.payload)
+      .then((approved) => this.client.send({ t: 'approvalResolved', approvalId: msg.approvalId, approved }))
+      .catch((err) => {
+        console.warn(`[worker-executor] approval resolve failed for ${msg.approvalId}: ${errText(err)}`)
+        this.client.send({ t: 'approvalResolved', approvalId: msg.approvalId, approved: false })
+      })
   }
 
   /** Issue a command whose reply is a plain `ack`, throwing the worker's error when `ok:false`. */

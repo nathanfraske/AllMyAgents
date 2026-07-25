@@ -19,7 +19,7 @@ import type { MemoryStore } from './memory.js'
 import type { PracticeStore } from './practices.js'
 import type { DangerFlags } from './types.js'
 import { InProcessExecutor, type Executor, type InProcessExecutorHubHooks } from './executor.js'
-import type { WorkerSessionSpec, WorkerToHub } from './workerProtocol.js'
+import type { RelayMethod, WorkerSessionSpec, WorkerToHub } from './workerProtocol.js'
 import { deriveTitle, sanitizeTitle } from './title.js'
 import { discoverImportableChats, importKey, type ImportableChat, type ScanResult } from './importScan.js'
 
@@ -193,6 +193,54 @@ export class SessionManager {
         this.journal.append(msg.sessionId, 'session/error', { message: msg.message })
         this.setStatusById(msg.sessionId, 'error')
         return
+    }
+  }
+
+  /**
+   * Dispatch a worker MCP tool handler's `rpc(method,args)` relay to the hub's real services
+   * (docs/agent-worker-impl.md §3.3) — the SAME bus/store calls InProcessExecutor.agentServices() runs
+   * in-process, just invoked over the socket. The worker only ever sends the ten methods below (they are
+   * the AgentServices surface minus the worker-local isBusTurn/danger and the separate approval channel);
+   * an unknown method throws (surfaced to the worker as `rpcResult.ok:false`). Synchronous — the stores
+   * are synchronous — but the WorkerExecutor awaits it so a future async store still works. Every method's
+   * result is JSON-serialized back as `rpcResult.value`.
+   */
+  runRelay(method: RelayMethod, args: unknown): unknown {
+    switch (method) {
+      case 'bus.send': {
+        const a = args as { fromSessionId: string; to: BusAddress; subject?: string; body: string }
+        return this.busSend(a.fromSessionId, a.to, a.subject, a.body)
+      }
+      case 'bus.inbox':
+        return this.busInbox((args as { sessionId: string }).sessionId)
+      case 'bus.roster':
+        return this.busRoster((args as { sessionId: string }).sessionId)
+      case 'memory.write':
+        return this.memory.write(args as Parameters<MemoryStore['write']>[0])
+      case 'memory.search': {
+        const a = args as { query: string; opts?: { scopes?: string[]; limit?: number } }
+        return this.memory.search(a.query, a.opts)
+      }
+      case 'memory.get': {
+        const a = args as { id: string; scopes?: string[] }
+        return this.memory.get(a.id, a.scopes)
+      }
+      case 'practices.write':
+        return this.practices.write(args as Parameters<PracticeStore['write']>[0])
+      case 'practices.edit': {
+        const a = args as { id: string; patch: { title?: string; body?: string } }
+        return this.practices.edit(a.id, a.patch)
+      }
+      case 'practices.get': {
+        const a = args as { id: string; scopes?: string[] }
+        return this.practices.get(a.id, a.scopes)
+      }
+      case 'practices.list':
+        return this.practices.list((args ?? {}) as { scopes?: string[]; limit?: number })
+      default: {
+        const unreachable: never = method
+        throw new Error(`unknown relay method: ${String(unreachable)}`)
+      }
     }
   }
 

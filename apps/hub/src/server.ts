@@ -18,6 +18,7 @@ import { computeStats } from './stats.js'
 import { buildFleet, probeHubHealth } from './fleet.js'
 import { startLogin, awaitLogin, credentialsExist } from './loginLauncher.js'
 import type { DangerFlags, HubEvent, Profile, Provider } from './types.js'
+import type { Executor } from './executor.js'
 import type { RestartState } from './restartController.js'
 import { SCHEMA_VERSION } from './restartHandshake.js'
 
@@ -234,6 +235,10 @@ export interface ServerOptions {
   /** Blue-green restart state (shared with RestartController): /api/health, the draining 503 guard,
    *  live-socket tracking so a retire can free the port, and the promote EADDRINUSE gate. */
   restartState: RestartState
+  /** The execution seam (docs/agent-worker-impl.md §4.4). Only its `pushDanger?` is used here — to push a
+   *  Danger Zone change to the worker's cached danger. In-process it has no pushDanger, so the call below
+   *  is a no-op; flag-off behavior is unchanged. */
+  executor: Executor
 }
 
 // Merge the Danger Zone flags into data/config.json (preserving every other config key) so a toggle
@@ -257,7 +262,7 @@ function persistDanger(repoRoot: string, danger: DangerFlags): void {
 }
 
 export function startServer(opts: ServerOptions): http.Server {
-  const { port, defaultCwd, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken, restartState } = opts
+  const { port, defaultCwd, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken, restartState, executor } = opts
   // Same location index.ts scans for profiles (repoRoot/profiles); defaultCwd is repoRoot.
   const profilesDir = path.join(defaultCwd, 'profiles')
 
@@ -476,6 +481,9 @@ export function startServer(opts: ServerOptions): http.Server {
         if (typeof body.autoApprovePractices === 'boolean') danger.autoApprovePractices = body.autoApprovePractices
         if (typeof body.autoApproveRestart === 'boolean') danger.autoApproveRestart = body.autoApproveRestart
         persistDanger(defaultCwd, danger)
+        // Keep the worker's cached danger() live in worker mode (§4.4). No-op in-process (the in-process
+        // executor reads the shared `danger` object directly and implements no pushDanger).
+        executor.pushDanger?.(danger)
         journal.append(null, 'config/danger', { ...danger })
         json(res, { ...danger })
         return

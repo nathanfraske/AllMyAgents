@@ -9,21 +9,41 @@
  * the hub: each vendor event becomes a wseq-tagged `event` message, and each turn emits explicit
  * `turnStarted` / `turnCompleted` / `turnError` lifecycle messages the hub turns into status transitions.
  *
- * STEP 3 SCOPE (docs/agent-worker-impl.md §9.3): a spawn→turn→idle cycle runs in the worker behind the
- * HUB_WORKER_SOCKET flag, both providers, with NO re-attach yet (Phase-1 parity — a hub restart still
- * loses the turn). Two things are DELIBERATELY deferred with TODO markers:
- *   - The `buildAgentMcpServer` wiring + the AgentServices RPC proxies (bus/memory/practices/approval)
- *     are STEP 4: the claude driver here runs with NO in-process MCP server, and both providers' approval
- *     gates fail CLOSED (deny) rather than reach an operator that isn't relayed yet.
- *   - Gap-correct `attach(since)` replay is STEP 5: the handler below does a minimal buffer replay.
+ * STEP 4 SCOPE (docs/agent-worker-impl.md §3.3, §4.4, §8.3): the in-process MCP server + its AgentServices
+ * are now wired as RPC proxies back to the hub. The claude driver runs `buildAgentMcpServer` (UNCHANGED)
+ * with a relay-backed AgentServices (bus/memory/practices → `rpc`, requireApproval → the approvalRequest
+ * channel, worker-local isBusTurn, hub-cached danger), every tool body wrapped in withRetryableHubErrors;
+ * `canUseTool` mirrors InProcessExecutor exactly (AUTO_ALLOW / SELF_GATING bus-hard-deny / checkWriteScope /
+ * operator approval RELAY); and the codex approval callback relays to the hub operator too.
+ *
+ * Still DELIBERATELY deferred with TODO markers:
+ *   - Gap-correct `attach(since)` replay + re-attach is STEP 5 (the handler below does a minimal replay).
+ *   - Approval reconciliation across a hub restart is STEP 6 (the transport already re-flushes an
+ *     outstanding relay on reconnect + the idempotent approvals.request(id) dedups it; the fail-closed
+ *     branches here are only the TRUE >HUB_RELAY_TIMEOUT_MS orphan).
+ *   - Transient-gap queue tuning (drain pre-signal, stable-callId write dedup) is STEP 7.
  */
 import path from 'node:path'
 import { ClaudeDriver } from './adapters/claude.js'
 import { CodexClient } from './adapters/codex.js'
+import { buildAgentMcpServer, type AgentServices } from './agentTools.js'
+import { AUTO_ALLOW_TOOLS, SELF_GATING_TOOLS } from './executor.js'
 import { WseqBuffer } from './wseqBuffer.js'
 import { WorkerServer } from './workerTransport.js'
+import type { BusMessage } from './bus.js'
+import type { Memory } from './memory.js'
+import type { Practice } from './practices.js'
+import type { SessionIdentity } from './identity.js'
 import type { DangerFlags } from './types.js'
-import type { HubToWorker, LiveSession, WorkerSessionSpec } from './workerProtocol.js'
+import {
+  HUB_UNAVAILABLE_TEXT,
+  HubUnavailableError,
+  stableApprovalId,
+  type HubToWorker,
+  type LiveSession,
+  type RelayMethod,
+  type WorkerSessionSpec,
+} from './workerProtocol.js'
 
 // The single monotonic per-session wseq space (the wseq buffer) is shared by vendor events AND the turn
 // lifecycle messages — both carry `wseq`. Lifecycle messages are appended under these worker-internal
@@ -44,6 +64,107 @@ function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
+/** The worker reconstructs SessionIdentity straight from the spec (fields line up 1:1 with identity.ts);
+ *  matches identityOf(record) because the hub built spec.label via identityOf. Mirrors executor.ts. */
+function identityFromSpec(spec: WorkerSessionSpec): SessionIdentity {
+  return {
+    sessionId: spec.sessionId,
+    profileId: spec.profileId,
+    provider: spec.provider,
+    projectId: spec.projectId,
+    label: spec.label,
+  }
+}
+
+/**
+ * The RPC-proxy dependencies a worker {@link AgentServices} closes over. Extracted (with
+ * {@link buildWorkerAgentServices}) so the proxy shapes are unit-testable without a socket — a fake relay
+ * records the emitted messages.
+ */
+export interface WorkerAgentServiceDeps {
+  /** Relay `rpc(method,args)` to the hub and resolve with `rpcResult.value` (throws on ok:false, and
+   *  propagates HubUnavailableError past the transient bound — the tool wrapper maps that to retryable text). */
+  relayRpc: (method: RelayMethod, args: unknown) => Promise<unknown>
+  /** Relay an operator-approval request (stable id) and resolve true/false; throws HubUnavailableError past
+   *  the bound — it NEVER returns false on a gap (§8.3), so a gap can't read as an operator "denied". */
+  relayApproval: (sessionId: string, kind: string, payload: unknown) => Promise<boolean>
+  /** Worker-local: is this session's in-flight turn bus-caused? (§3.3) */
+  isBusTurn: (sessionId: string) => boolean
+  /** Worker-cached Danger Zone flags (hub-pushed via hello on connect + dangerUpdate on change; safe until
+   *  the first push). */
+  danger: () => DangerFlags
+  /** Audit journal → emitted into the wseq'd event stream, so the hub journals + dedups it like a vendor
+   *  event (§3.3) — there is no separate un-deduped journal channel. */
+  journal: (sessionId: string, kind: string, payload: unknown) => void
+}
+
+/**
+ * Build the worker's {@link AgentServices} — the capability object the (UNCHANGED) in-process MCP tool
+ * handlers call into. Every hub-owned capability becomes an RPC proxy over the WorkerServer relay lane
+ * (docs/agent-worker-impl.md §3.3): bus/memory/practices → `rpc(...)`, requireApproval → the
+ * approvalRequest channel; only isBusTurn (worker-local), danger (hub-cached), and journal (the wseq'd
+ * event stream) resolve with no round-trip. The proxies PROPAGATE HubUnavailableError rather than
+ * collapsing a gap into a falsy "denied" value; {@link wrapRetryableHubErrors} maps that terminal error to
+ * the retryable HUB_UNAVAILABLE_TEXT at the tool boundary (§8.3).
+ *
+ * Identity-agnostic (every method takes the caller id/identity the hub supplies), so ONE object serves
+ * every session — buildAgentMcpServer binds the per-session identity. Mirrors InProcessExecutor.agentServices().
+ */
+export function buildWorkerAgentServices(deps: WorkerAgentServiceDeps): AgentServices {
+  return {
+    send: (from, to, subject, body) =>
+      deps.relayRpc('bus.send', { fromSessionId: from.sessionId, to, subject, body }) as Promise<{ ok: boolean; delivered: number; error?: string }>,
+    inbox: (sessionId) => deps.relayRpc('bus.inbox', { sessionId }) as Promise<BusMessage[]>,
+    roster: (sessionId) =>
+      deps.relayRpc('bus.roster', { sessionId }) as Promise<{ sessionId: string; label: string; provider: string; status: string }[]>,
+    memory: {
+      write: (input) => deps.relayRpc('memory.write', input) as Promise<Memory>,
+      search: (query, opts) => deps.relayRpc('memory.search', { query, opts }) as Promise<Memory[]>,
+      get: (id, scopes) => deps.relayRpc('memory.get', { id, scopes }) as Promise<Memory | undefined>,
+    },
+    practices: {
+      write: (input) => deps.relayRpc('practices.write', input) as Promise<Practice>,
+      edit: (id, patch) => deps.relayRpc('practices.edit', { id, patch }) as Promise<Practice | undefined>,
+      get: (id, scopes) => deps.relayRpc('practices.get', { id, scopes }) as Promise<Practice | undefined>,
+      list: (opts) => deps.relayRpc('practices.list', opts ?? {}) as Promise<Practice[]>,
+    },
+    requireApproval: (id, kind, payload) => deps.relayApproval(id.sessionId, kind, payload),
+    isBusTurn: deps.isBusTurn,
+    danger: deps.danger,
+    journal: deps.journal,
+  }
+}
+
+/**
+ * Wrap every tool handler in a freshly-built MCP server so a HubUnavailableError bubbling out of an
+ * AgentServices RPC proxy (a hub gone past the transient bound) returns the retryable HUB_UNAVAILABLE_TEXT
+ * result instead of a thrown/`isError` shape an agent reads as broken (§8.3). buildAgentMcpServer is
+ * UNCHANGED, so the wrap is applied post-build to the MCP SDK's registered-tool table
+ * (createSdkMcpServer stores each tool under `instance._registeredTools[name].handler`). Defensive: if the
+ * SDK's internal shape ever changes we log and skip — a HubUnavailableError then still surfaces as an error
+ * result whose message IS HUB_UNAVAILABLE_TEXT, so it stays retryable, just less clean.
+ */
+export function wrapRetryableHubErrors(server: ReturnType<typeof buildAgentMcpServer>): void {
+  const table = (server as unknown as { instance?: { _registeredTools?: Record<string, { handler?: unknown }> } }).instance?._registeredTools
+  if (!table) {
+    console.warn('[worker] could not access the MCP tool table to wrap retryable-hub-errors — a HubUnavailableError will surface as an error result')
+    return
+  }
+  for (const entry of Object.values(table)) {
+    const original = entry.handler
+    if (typeof original !== 'function') continue
+    const fn = original as (...a: unknown[]) => Promise<unknown>
+    entry.handler = async (...args: unknown[]): Promise<unknown> => {
+      try {
+        return await fn(...args)
+      } catch (err) {
+        if (err instanceof HubUnavailableError) return { content: [{ type: 'text', text: HUB_UNAVAILABLE_TEXT }] }
+        throw err
+      }
+    }
+  }
+}
+
 /**
  * The worker's execution core. Owns the driver maps + turn loops (the driver HALF of InProcessExecutor)
  * and a {@link WorkerServer} speaking the typed hub↔worker protocol. Constructed with the socket path;
@@ -55,16 +176,24 @@ export class AgentWorker {
   private readonly codexThreads = new Map<string, string>() //               sessionId → threadId
   private readonly codexSessionClients = new Map<string, CodexClient>() //   sessionId → its (shared) client, for id-only ops
   // Sessions whose CURRENT in-flight turn was caused by a (semi-trusted) teammate bus message — the
-  // worker-local source of truth for isBusTurn (§3.3). Set from runTurn's origin, cleared in `finally`.
-  // Unused in step 3 (no MCP tools consult it yet); it is wired now so the maps match InProcessExecutor.
+  // worker-local source of truth for isBusTurn (§3.3). Set from runTurn's origin, cleared in `finally`;
+  // read by the MCP self-gate (buildWorkerAgentServices.isBusTurn) + canUseTool's SELF_GATING hard-deny.
   private readonly busTurnSessions = new Set<string>()
   // Sessions with a live turn right now (between turnStarted and turnCompleted/turnError), for listLive's
   // status and to know which codex sessions to fail on an app-server crash.
   private readonly activeTurns = new Set<string>()
   private readonly buf = new WseqBuffer()
   private readonly server: WorkerServer
-  // Last Danger Zone flags the hub pushed (via hello on connect, or a dangerUpdate). Cached for the
-  // worker-local `danger()` the MCP gates read — consumed in STEP 4; harmless to track now.
+  // The per-session in-process MCP tools' capability object — RPC proxies back to the hub (§3.3). Built
+  // once (identity-agnostic; buildAgentMcpServer binds the per-session identity) and reused by every driver.
+  private readonly workerServices: AgentServices
+  // A worker-local monotonic id for each logical relay `rpc` call. STABLE across a re-flush because the
+  // WorkerServer keeps the same pending entry (it re-writes the same msg on attach), so the successor hub
+  // can dedup a re-sent write by callId (§8.2) — the served-callId cache itself is STEP 7.
+  private callSeq = 0
+  // Last Danger Zone flags the hub pushed — via `hello` on every (re)connect (WorkerClient reads the live
+  // danger fresh, so this is the fail-safe connect-time push) or a live `dangerUpdate`. Read by the MCP
+  // gates through `workerServices.danger()`; safe-default (all-OFF) until the first push.
   private danger: DangerFlags = SAFE_DANGER
 
   constructor(socketPath: string) {
@@ -76,6 +205,13 @@ export class AgentWorker {
       // onBufferedEvent is deliberately left unset: every event/lifecycle message is appended to the
       // wseq buffer at emit time (to assign its wseq), so the buffer ALREADY retains it — there is nothing
       // extra to buffer here (§2.3: a pure observability sink the transport never depends on).
+    })
+    this.workerServices = buildWorkerAgentServices({
+      relayRpc: (method, args) => this.relayRpc(method, args),
+      relayApproval: (sessionId, kind, payload) => this.relayApproval(sessionId, kind, payload),
+      isBusTurn: (sessionId) => this.busTurnSessions.has(sessionId),
+      danger: () => this.danger,
+      journal: (sessionId, kind, payload) => this.emitEvent(sessionId, kind, payload),
     })
   }
 
@@ -307,6 +443,12 @@ export class AgentWorker {
   private claudeDriverFor(spec: WorkerSessionSpec): ClaudeDriver {
     let driver = this.claudeDrivers.get(spec.sessionId)
     if (!driver) {
+      // The per-session in-process MCP server (inter-agent bus + shared memory + practices), bound to this
+      // session's identity so every call is attributed to the real caller. Its AgentServices are RPC
+      // proxies back to the hub (§3.3); every tool body is wrapped so a hub gone past the transient bound
+      // returns the retryable HUB_UNAVAILABLE_TEXT rather than a thrown/denied shape (§8.3).
+      const mcp = buildAgentMcpServer(identityFromSpec(spec), this.workerServices)
+      wrapRetryableHubErrors(mcp)
       driver = new ClaudeDriver(
         spec.profileDir,
         spec.cwd,
@@ -314,10 +456,7 @@ export class AgentWorker {
         // event just gets a wseq and is streamed to the hub, which re-homes the side effects (§3.2).
         (kind, payload) => this.emitEvent(spec.sessionId, kind, payload),
         (toolName, input) => this.canUseTool(spec, toolName, input),
-        // STEP 3: no in-process MCP server. TODO(step 4): construct { allmyagents: buildAgentMcpServer(
-        //   identityFromSpec(spec), <RPC-proxy AgentServices>) } — bus/memory/practices relayed to the hub,
-        //   requireApproval over the approvalRequest channel, worker-local isBusTurn, hub-cached danger.
-        undefined
+        { allmyagents: mcp }
       )
       if (spec.vendorSessionId) driver.restore(spec.vendorSessionId)
       this.claudeDrivers.set(spec.sessionId, driver)
@@ -331,16 +470,33 @@ export class AgentWorker {
       const created = new CodexClient(
         profileDir,
         (kind, payload) => this.onCodexEvent(created, kind, payload),
-        // STEP 3: the codex app-server approval callback can't reach the operator yet (no relay), so it
-        // fails CLOSED — never auto-accept an unapproved codex action. Under `full` (approvalPolicy
-        // 'never') the app-server won't ask, so this only bites under safe/edits.
-        // TODO(step 4): relay to the hub as { t:'approvalRequest' } and honor the operator's decision.
-        async () => ({ decision: 'decline' })
+        // The codex app-server approval callback RELAYS to the hub operator (step 4), replacing the step-3
+        // fail-closed decline. Mirrors InProcessExecutor's codex approval (executor.ts): attribute by
+        // threadId→sessionId, request `codex/<method>`, accept/decline on the operator's decision. Under
+        // `full` (approvalPolicy 'never') the app-server won't ask, so this only fires under safe/edits.
+        (method, params) => this.codexApproval(method, params)
       )
       client = created
       this.codexClients.set(profileId, client)
     }
     return client
+  }
+
+  /** The codex app-server approval relay (§3.3). Resolves the sessionId from the request's threadId (as
+   *  in-process does), relays an operator approval, and maps the decision. A HubUnavailableError past the
+   *  transient bound declines (safe terminal — the codex approval protocol has no retryable-text channel;
+   *  the agent can retry the action). */
+  private async codexApproval(method: string, params: unknown): Promise<{ decision: 'accept' | 'decline' }> {
+    const threadId = (params as { threadId?: string } | null)?.threadId
+    const sessionId = threadId ? this.sessionForThread(threadId) : undefined
+    try {
+      const approved = await this.relayApproval(sessionId ?? 'unattributed', `codex/${method}`, params)
+      return approved ? { decision: 'accept' } : { decision: 'decline' }
+    } catch {
+      // TODO(step 6): a codex approval in flight across a hub restart is re-flushed by the transport +
+      // deduped by the idempotent approvals.request(id); this decline is only the TRUE >45s-orphan terminal.
+      return { decision: 'decline' }
+    }
   }
 
   /** The codex client event callback (per profile). Resolves the sessionId from the threadId, streams the
@@ -374,25 +530,71 @@ export class AgentWorker {
   }
 
   /**
-   * The claude permission callback (§3.3), worker step-3 shape. The worker-LOCAL write-scope guard runs
-   * with no hub round-trip; the operator approval gate is a hub RELAY that is not wired until step 4, so
-   * anything reaching it fails CLOSED (deny) rather than silently auto-allowing — never weaken the gate.
-   * Under `full` (bypassPermissions) the SDK skips this callback entirely, so tools run freely there.
+   * The claude permission callback (§3.3). Mirrors InProcessExecutor.claudeDriverFor's canUseTool EXACTLY
+   * (executor.ts): the hub's own SAFE agent tools (AUTO_ALLOW) are allowed; risky SELF_GATING tools
+   * hard-deny on a bus turn (unless the owner opted in via busCanUseRiskyTools) else allow + defer to the
+   * handler's own requireApproval; a Write/Edit outside the worktree is denied; everything else goes to the
+   * operator approval gate — which in the worker is a hub RELAY (step 4), no longer the step-3 fail-closed
+   * deny. Under `full` (bypassPermissions) the SDK skips this callback entirely, so tools run freely there.
    */
   private async canUseTool(
     spec: WorkerSessionSpec,
     toolName: string,
     input: unknown
   ): Promise<{ behavior: 'allow'; updatedInput: unknown } | { behavior: 'deny'; message: string }> {
-    const scopeError = this.checkWriteScope(spec, toolName, input)
-    if (scopeError) return { behavior: 'deny', message: scopeError }
-    // TODO(step 4): relay the operator approval gate — services.approvals.request → { t:'approvalRequest' }
-    //   → hub → operator → { t:'approvalResolved' }. Also fold back the AUTO_ALLOW allmyagents tools + the
-    //   SELF_GATING bus-turn hard-deny once the MCP server is wired. Until then, fail closed.
-    return {
-      behavior: 'deny',
-      message: 'operator approval is unavailable in worker mode until the approval relay ships (step 4)',
+    if (AUTO_ALLOW_TOOLS.has(toolName)) return { behavior: 'allow', updatedInput: input }
+    if (SELF_GATING_TOOLS.has(toolName)) {
+      if (this.busTurnSessions.has(spec.sessionId) && !this.danger.busCanUseRiskyTools) {
+        this.emitEvent(spec.sessionId, 'approval/auto-denied-bus', { toolName })
+        return { behavior: 'deny', message: 'a turn caused by a teammate (bus) message may not write practices' }
+      }
+      return { behavior: 'allow', updatedInput: input }
     }
+    const scopeError = this.checkWriteScope(spec, toolName, input)
+    if (scopeError) {
+      this.emitEvent(spec.sessionId, 'approval/auto-denied-scope', { toolName, reason: scopeError })
+      return { behavior: 'deny', message: scopeError }
+    }
+    // The generic operator gate: RELAY to the hub (step 4). In-process this is
+    // `approvals.request(sessionId, 'claude/tool', {toolName, input})`; here it crosses the socket.
+    try {
+      const approved = await this.relayApproval(spec.sessionId, 'claude/tool', { toolName, input })
+      return approved ? { behavior: 'allow', updatedInput: input } : { behavior: 'deny', message: 'denied from hub' }
+    } catch (err) {
+      // A hub gone past the transient bound (HubUnavailableError): canUseTool has no retryable-text channel
+      // (it can only allow/deny), so fail CLOSED with the retryable text as the deny reason — the agent can
+      // retry. This is the ONLY terminal difference from the in-process gate.
+      // TODO(step 6): a tool approval in flight across a hub restart is re-flushed by the transport +
+      // deduped by the idempotent approvals.request(id); this deny is only the TRUE >45s-orphan terminal.
+      if (err instanceof HubUnavailableError) return { behavior: 'deny', message: HUB_UNAVAILABLE_TEXT }
+      throw err
+    }
+  }
+
+  // ---- Hub relays (the worker's MCP handlers reaching hub-owned services, §3.3) -----------------
+
+  private nextCallId(): string {
+    this.callSeq += 1
+    return `wc${this.callSeq}`
+  }
+
+  /** Relay one `rpc(method,args)` to the hub and resolve with its `rpcResult.value`. Throws on `ok:false`
+   *  (a hub-side dispatch error) and PROPAGATES HubUnavailableError past the transient bound (§8.3). */
+  private async relayRpc(method: RelayMethod, args: unknown): Promise<unknown> {
+    const reply = await this.server.relay({ t: 'rpc', callId: this.nextCallId(), method, args })
+    if (reply.t !== 'rpcResult') throw new Error(`relay ${method}: unexpected reply ${reply.t}`)
+    if (!reply.ok) throw new Error(reply.error ?? `relay ${method} failed`)
+    return reply.value
+  }
+
+  /** Relay an operator-approval request under a STABLE id (so a re-issue after a hub restart collides on
+   *  the successor's idempotent approvals.request, §7.2/§8.2) and resolve true/false. PROPAGATES
+   *  HubUnavailableError past the bound — it NEVER returns false on a gap (that would read as "denied"). */
+  private async relayApproval(sessionId: string, kind: string, payload: unknown): Promise<boolean> {
+    const approvalId = stableApprovalId(sessionId, kind, payload)
+    const reply = await this.server.relay({ t: 'approvalRequest', approvalId, sessionId, kind, payload })
+    if (reply.t !== 'approvalResolved') throw new Error(`approval ${kind}: unexpected reply ${reply.t}`)
+    return reply.approved
   }
 
   private checkWriteScope(spec: WorkerSessionSpec, toolName: string, input: unknown): string | undefined {
