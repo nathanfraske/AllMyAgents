@@ -970,34 +970,22 @@ class HubStore {
     }
   }
 
-  // Events arrive one WebSocket message at a time, and a reconnect replays the WHOLE backlog that way.
-  // Applying each one immediately means a render (and a re-scroll) per event, so opening a chat after a
-  // refresh visibly REPLAYS the transcript — you watch it build itself line by line down to the bottom.
-  // Buffering into the next microtask collapses each burst into a single render + a single scroll, while
-  // preserving order exactly. A live event is delayed by well under a frame, which is imperceptible.
-  private pendingEvents: HubEvent[] = []
-  private flushScheduled = false
-
+  /**
+   * Apply one event straight through, isolated so a single bad event can never take down the stream.
+   *
+   * REVERTED (deliberately): this used to buffer events and flush them on a microtask, to stop a chat
+   * visibly re-playing itself line by line after a refresh. That optimisation coincided with events
+   * ceasing to reach the UI at all — tool calls and thinking blocks vanishing while the journal kept
+   * recording them perfectly — so it is gone. A cosmetic scroll improvement is not worth any risk to the
+   * one path that puts agent output on screen. If it is retried, it needs a real test around the flush,
+   * not just a code read.
+   */
   private ingest(event: HubEvent): void {
-    this.pendingEvents.push(event)
-    if (this.flushScheduled) return
-    this.flushScheduled = true
-    queueMicrotask(() => {
-      this.flushScheduled = false
-      const batch = this.pendingEvents
-      this.pendingEvents = []
-      // Isolate every event: a batch has already been dequeued, so ONE throwing event would silently
-      // swallow every event after it in the same flush — tool calls and thinking blocks simply stop
-      // appearing, with nothing in the UI to say why. Before batching, a bad event could only kill its
-      // own message handler; batching made that failure mode much worse, so contain it explicitly.
-      for (const ev of batch) {
-        try {
-          this.apply(ev)
-        } catch (err) {
-          console.error('[store] failed to apply event', ev?.kind, ev?.seq, err)
-        }
-      }
-    })
+    try {
+      this.apply(event)
+    } catch (err) {
+      console.error('[store] failed to apply event', event?.kind, event?.seq, err)
+    }
   }
 
   private reconnect(): void {
