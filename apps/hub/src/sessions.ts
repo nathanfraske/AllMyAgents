@@ -1,6 +1,8 @@
 import crypto from 'node:crypto'
+import fs from 'node:fs'
 import path from 'node:path'
 import { defaultHomeProfiles } from './profiles.js'
+import { readHistoryPage, locateTranscript, type HistoryPage } from './transcript.js'
 import type { ApprovalService } from './approvals.js'
 import type { Journal } from './journal.js'
 import type { ProjectStore } from './projects.js'
@@ -394,6 +396,29 @@ export class SessionManager {
   }
 
   /**
+   * Read an imported session's on-disk history (bounded, tail-first) so the thread renders its real
+   * conversation. Resolves the vendor file from the persisted `transcriptPath`, falling back to a
+   * locate-by-vendor-id for records adopted before that field existed (and caching the result). Empty
+   * for hub-native sessions (their history is the journal, already replayed over the WS).
+   */
+  async readHistory(sessionId: string, opts: { beforeByte?: number } = {}): Promise<HistoryPage> {
+    const record = this.sessions.get(sessionId)
+    if (!record) throw new Error(`unknown session: ${sessionId}`)
+    if (!record.vendorSessionId) return { items: [], olderCursor: null, hasOlder: false } // hub-native
+    let file = record.transcriptPath
+    if (!file || !fs.existsSync(file)) {
+      const profile = this.profiles.get(record.profileId)
+      file = profile ? await locateTranscript(profile.dir, record.provider, record.vendorSessionId) : undefined
+      if (file) {
+        record.transcriptPath = file // cache the resolved path so the next open is a direct read
+        this.persist(record)
+      }
+    }
+    if (!file) return { items: [], olderCursor: null, hasOlder: false }
+    return readHistoryPage(file, record.provider, opts)
+  }
+
+  /**
    * IMPORT: adopt the selected vendor chats under a project. Re-runs discovery server-side (so the
    * cwd / provider / owning profile / title are all hub-derived, never client-forgeable), then for
    * each match builds a SessionRecord with `vendorSessionId` pre-set. That is the whole trick: the
@@ -444,6 +469,7 @@ export class SessionManager {
       title,
       titleSource: title ? 'auto' : undefined,
       imported: true,
+      transcriptPath: chat.transcriptPath, // so the thread can render its on-disk history on open
       createdAt: new Date().toISOString(),
     }
     this.sessions.set(id, record)

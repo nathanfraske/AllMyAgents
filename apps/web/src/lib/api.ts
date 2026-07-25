@@ -67,6 +67,24 @@ export interface ScanResult {
   warnings: string[]
 }
 
+// One render-ready turn from an imported chat's on-disk transcript (mirrors the hub's HistoryItem).
+export interface HistoryItem {
+  kind: 'user' | 'assistant' | 'reasoning' | 'tool'
+  text?: string
+  toolName?: string
+  toolInput?: unknown
+  toolResult?: string
+  toolError?: boolean
+  ts?: string
+}
+
+export interface HistoryPage {
+  items: HistoryItem[]
+  /** Byte offset to pass back as `before` to page OLDER; null at the file start. */
+  olderCursor: number | null
+  hasOlder: boolean
+}
+
 export interface ImportResult {
   imported: SessionRecord[]
   skipped: number
@@ -278,6 +296,9 @@ export const api = {
   importChats: (projectId: string, vendorSessionIds: string[]) =>
     jpost<ImportResult | { error: string }>(`/api/projects/${projectId}/import`, { vendorSessionIds }),
   sessions: () => jget<SessionRecord[]>('/api/sessions'),
+  // On-demand vendor transcript history for an imported chat (bounded tail; `before` byte cursor pages older).
+  history: (id: string, before?: number) =>
+    jget<HistoryPage>(`/api/sessions/${id}/history${before != null ? `?before=${before}` : ''}`),
   approvals: () => jget<ApprovalRecord[]>('/api/approvals'),
   usage: () => jget<UsageSnapshot[]>('/api/usage'),
   refreshUsage: () => jpost<UsageSnapshot[]>('/api/usage/refresh'),

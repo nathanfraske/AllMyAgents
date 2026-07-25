@@ -40,6 +40,10 @@ export interface SessionRecord {
   // delete-never-unlinks guard (the source transcript is the user's own history — never removed).
   // Optional key → no store migration; absent means hub-native.
   imported?: boolean
+  // Absolute path to the source vendor transcript for an imported session — lets the hub read its
+  // on-disk history on demand (see transcript.ts). Cached on first lookup for records adopted before
+  // this field existed. Optional → no store migration.
+  transcriptPath?: string
   createdAt: string
 }
 

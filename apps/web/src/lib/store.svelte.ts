@@ -1,6 +1,6 @@
 import { api, HUB_WS, getHubToken, setHubToken } from './api'
 import { settings } from './settings.svelte'
-import type { ApprovalRecord, HubEvent, ProfileInfo, ProjectInfo, ScanResult, SessionRecord, UsageSnapshot } from './api'
+import type { ApprovalRecord, HistoryItem, HistoryPage, HubEvent, ProfileInfo, ProjectInfo, ScanResult, SessionRecord, UsageSnapshot } from './api'
 
 // Verbose client tracing — on in dev, compiled out of prod builds. Toggle off in dev by setting
 // localStorage['ama:verbose'] = '0'. Surfaces the load/connect/replay/scan milestones so a stall is
@@ -50,6 +50,9 @@ export interface ThreadItem {
   toolError?: boolean
   reflex?: boolean
   status?: string
+  // True for a turn reconstructed from the vendor transcript on open (imported chats), vs a live/
+  // journaled event. Drives condensed rendering + a "history" affordance; carries no precise ts.
+  historical?: boolean
   // Inter-agent bus message (kind: 'bus'): whether this session sent or received it, the other
   // party's label, and an optional subject. `text` holds the message body.
   busDir?: 'sent' | 'received'
@@ -78,6 +81,10 @@ export interface SessionView {
   // path yet) — passed as `useWorktree` when the draft is finally spawned.
   draft?: boolean
   draftUseWorktree?: boolean
+  // Imported-chat history (loaded on open from the vendor transcript). `loadingHistory` gates a
+  // spinner; `historyOlderCursor` is the byte offset for "load older" (null when fully loaded).
+  loadingHistory?: boolean
+  historyOlderCursor?: number | null
 }
 
 interface ClaudeBlock {
@@ -1086,9 +1093,55 @@ class HubStore {
     view.items.push({ key: item.key ?? `i${view.items.length}:${item.ts}`, ...item } as ThreadItem)
   }
 
+  // Sessions whose vendor history we've already pulled (or decided not to), so opening a chat repeatedly
+  // doesn't refetch. Cleared for a session only if it's removed.
+  private historyPulled = new Set<string>()
+
+  private toThreadItem(h: HistoryItem, key: string, fallbackTs: string): ThreadItem {
+    return { key, kind: h.kind, ts: h.ts ?? fallbackTs, text: h.text, toolName: h.toolName, toolInput: h.toolInput, toolResult: h.toolResult, toolError: h.toolError, historical: true }
+  }
+
+  // Lazily pull an IMPORTED chat's on-disk transcript the first time it's opened and prepend it above
+  // any live turns — so the thread shows real history instead of an empty pane. Hub-native chats skip
+  // this (their history already replays over the WS). Never clobbers a thread that already has content.
+  async ensureHistory(id: string): Promise<void> {
+    const view = this.sessions[id]
+    if (!view || this.historyPulled.has(id)) return
+    if (!view.record.imported && !view.record.vendorSessionId) return
+    // Already has real turns (live session, or history loaded) — nothing to backfill.
+    if (view.items.some((i) => i.kind === 'user' || i.kind === 'assistant')) {
+      this.historyPulled.add(id)
+      return
+    }
+    this.historyPulled.add(id)
+    view.loadingHistory = true
+    const page = await api.history(id).catch(() => null)
+    view.loadingHistory = false
+    if (!page || !page.items.length) return
+    const ts = view.record.createdAt
+    const hist = page.items.map((h, i) => this.toThreadItem(h, `hist:${i}`, ts))
+    view.items = [...hist, ...view.items] // prepend history; live turns (if any) stay below
+    view.historyOlderCursor = page.hasOlder ? page.olderCursor : null
+  }
+
+  // Page OLDER history above what's shown (the "load older" affordance for long imported chats).
+  async loadOlderHistory(id: string): Promise<void> {
+    const view = this.sessions[id]
+    if (!view || view.historyOlderCursor == null || view.loadingHistory) return
+    const cursor = view.historyOlderCursor
+    view.loadingHistory = true
+    const page: HistoryPage | null = await api.history(id, cursor).catch(() => null)
+    view.loadingHistory = false
+    if (!page) return
+    const older = page.items.map((h, i) => this.toThreadItem(h, `hist:o${cursor}:${i}`, view.record.createdAt))
+    view.items = [...older, ...view.items] // older turns go above everything already shown
+    view.historyOlderCursor = page.hasOlder ? page.olderCursor : null
+  }
+
   select(id: string): void {
     const prev = this.selectedId
     this.selectedId = id
+    void this.ensureHistory(id)
     // In split mode, selecting from the sidebar drives the first (primary) pane (row 0, col 0).
     if (this.splitPanes.length) {
       const rows = this.splitPanes.map((r) => [...r])

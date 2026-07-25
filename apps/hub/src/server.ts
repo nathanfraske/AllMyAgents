@@ -585,6 +585,21 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, { ok: true })
         return
       }
+      // On-demand vendor transcript history for an imported chat (bounded tail; `before` byte cursor
+      // pages older). Read-only; empty for hub-native sessions (their history replays over the WS).
+      const historyMatch = /^\/api\/sessions\/([^/]+)\/history$/.exec(url.pathname)
+      if (method === 'GET' && historyMatch) {
+        try {
+          const before = url.searchParams.get('before')
+          const page = await sessions.readHistory(historyMatch[1] as string, {
+            beforeByte: before && before !== '' ? Number(before) : undefined,
+          })
+          json(res, page)
+        } catch (e) {
+          json(res, { error: e instanceof Error ? e.message : 'history failed' }, 404)
+        }
+        return
+      }
       const deleteMatch = /^\/api\/sessions\/([^/]+)\/delete$/.exec(url.pathname)
       if (method === 'POST' && deleteMatch) {
         const result = await sessions.delete(deleteMatch[1] as string)

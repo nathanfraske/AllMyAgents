@@ -19,7 +19,15 @@
 
   function fmtTime(ts: string): string {
     const d = new Date(ts)
-    return isNaN(d.getTime()) ? '' : d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+    if (isNaN(d.getTime())) return ''
+    const time = d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+    // Prepend a date for turns not from today (mainly imported history spanning previous days) so a
+    // multi-day conversation reads clearly instead of a wall of bare times.
+    const now = new Date()
+    const sameDay = d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate()
+    if (sameDay) return time
+    const opts: Intl.DateTimeFormatOptions = d.getFullYear() === now.getFullYear() ? { month: 'short', day: 'numeric' } : { year: 'numeric', month: 'short', day: 'numeric' }
+    return `${d.toLocaleDateString(undefined, opts)}, ${time}`
   }
 </script>
 
