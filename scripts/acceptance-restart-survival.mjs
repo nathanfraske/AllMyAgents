@@ -109,10 +109,18 @@ function fail(msg, extra) { step('FAIL: ' + msg, extra); results.error = msg; fi
   if (restart.status !== 202) fail('restart not accepted (202 expected)', restart)
 
   // 5) observe the flip: live pid changes blue -> green (a REAL hub restart)
-  let greenPid = null, statusAtFlip = '(unknown)'
+  let greenPid = null, statusAtFlip = '(unknown)', healthPortAfterFlip = null
   for (let i = 0; i < 200; i++) {
     const hh = await health()
-    if (hh && hh.boot === 'complete' && hh.pid !== bluePid) { greenPid = hh.pid; const s = await sessionOf(sid); statusAtFlip = s?.status ?? '(unknown)'; break }
+    if (hh && hh.boot === 'complete' && hh.pid !== bluePid) {
+      greenPid = hh.pid
+      // A promoted green booted on an ephemeral port and re-listened on the fixed one; health must report
+      // the port it is ACTUALLY on (it used to echo the boot port — 0 — for the rest of its life).
+      healthPortAfterFlip = hh.port
+      const s = await sessionOf(sid)
+      statusAtFlip = s?.status ?? '(unknown)'
+      break
+    }
     await sleep(200)
   }
   if (!greenPid) fail('no flip observed — hub pid never changed', { tail: logText().slice(-3000) })
@@ -148,13 +156,14 @@ function fail(msg, extra) { step('FAIL: ' + msg, extra); results.error = msg; fi
     sentinelAfterGreenBoot: sentinelEvs.some((e) => e.seq > greenBootSeq),
     completedCleanly: finalStatus === 'idle',
     resultOnGreen: !!resultOnGreen,
+    healthPortAfterFlip: healthPortAfterFlip === PORT,
   }
   results.checks = checks
   results.pids = { bluePid, greenPid }
   results.counts = { events: events.length, hubStarted: hubStarted.length, sessionEvents: sess.length, blueSide: blueSide.length, greenSide: greenSide.length }
   step('journal checks', checks)
   step('counts', results.counts)
-  const required = ['twoHubEras', 'pidChanged', 'turnStraddledFlip', 'sentinelPresent', 'sentinelAfterGreenBoot', 'completedCleanly', 'resultOnGreen']
+  const required = ['twoHubEras', 'pidChanged', 'turnStraddledFlip', 'sentinelPresent', 'sentinelAfterGreenBoot', 'completedCleanly', 'resultOnGreen', 'healthPortAfterFlip']
   const failed = required.filter((k) => !checks[k])
   results.pass = failed.length === 0
   if (!results.pass) fail('survival checks failed: ' + failed.join(', '), checks)
