@@ -177,10 +177,14 @@ function rescanProfiles(): typeof profiles {
   return profiles
 }
 
-// Device token — proof of an authorized device. Generated + persisted under data/. Enforcement
-// is opt-in (HUB_REQUIRE_TOKEN or config.security.requireToken) so local-only use is unaffected;
-// turn it on for fleet/remote exposure.
-const deviceToken = getOrCreateDeviceToken(path.join(repoRoot, 'data'))
+// Device token — proof of an authorized device. Generated + persisted under `dataDir` alongside the
+// journal + config, which is what HUB_DATA_DIR already promised ("journal/config/worktrees/device-token
+// root", line 29). It used to hardcode `repoRoot/data`, so an installed build — the only configuration
+// that sets HUB_DATA_DIR — would have split its token away from the rest of its state. Unset
+// HUB_DATA_DIR resolves to exactly the same path as before, so dev is unchanged. Enforcement is opt-in
+// (HUB_REQUIRE_TOKEN or config.security.requireToken) so local-only use is unaffected; turn it on for
+// fleet/remote exposure.
+const deviceToken = getOrCreateDeviceToken(dataDir)
 const requireToken =
   process.env.HUB_REQUIRE_TOKEN === '1' ||
   process.env.HUB_REQUIRE_TOKEN === 'true' ||

@@ -13,8 +13,14 @@
 #     password you choose). NEVER commit either file.
 #
 #  2. Paste the PUBLIC KEY into apps/desktop/src-tauri/tauri.conf.json → plugins.updater.pubkey
-#     (replacing the PASTE_TAURI_MINISIGN_PUBLIC_KEY_HERE… placeholder). The public key is safe to
+#     (replacing the PASTE_TAURI_MINISIGN_PUBLIC_KEY_HERE placeholder) AND flip
+#     bundle.createUpdaterArtifacts from false to true in the same file. The public key is safe to
 #     commit — the updater uses it to verify an update's signature before installing it.
+#
+#     WHY createUpdaterArtifacts ships as `false`: with it true, `tauri build` FAILS unless a private
+#     signing key is present in the environment. Leaving it false keeps a plain local
+#     `pnpm desktop:build` working for anyone with a checkout and no key; flipping it is a one-line,
+#     one-time change the operator makes when the keypair exists.
 #
 #  3. Add two GitHub Actions repository secrets (Settings → Secrets and variables → Actions):
 #         TAURI_SIGNING_PRIVATE_KEY           = the full contents of ama-updater.key
@@ -79,6 +85,12 @@ jobs:
       # `hub:bundle` (which stages this runner's Node + the compiled hub as Tauri resources).
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      # Prove the bundle's credential firewall still fires BEFORE we build anything. This is the
+      # landmine guard from docs/alpha-release-plan.md; the real audit then runs inside hub:bundle
+      # (invoked by tauri.conf.json's beforeBuildCommand) and fails the build on any leak.
+      - name: Credential-firewall self-test
+        run: pnpm run bundle:audit
 
       # tauri-action runs `tauri build` in apps/desktop: builds the installers (Windows .msi + NSIS,
       # macOS .app + .dmg via the config's `targets: "all"`), and because bundle.createUpdaterArtifacts

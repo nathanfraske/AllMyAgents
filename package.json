@@ -10,6 +10,7 @@
     "hub:typecheck": "pnpm --filter hub typecheck",
     "hub:build": "pnpm --filter hub build",
     "hub:bundle": "node scripts/bundle-hub.mjs",
+    "bundle:audit": "node scripts/bundle-hub.mjs --self-test",
     "accept:restart": "node scripts/acceptance-restart-survival.mjs",
     "desktop": "pnpm --filter desktop tauri dev",
     "desktop:build": "pnpm --filter desktop tauri build",

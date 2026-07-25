@@ -15,6 +15,21 @@
 //!   that runs. Later launches detect the deps and skip straight to spawn.
 //!   Because the vendor binaries are pulled from npm at runtime (not shipped),
 //!   the installer redistributes nothing beyond Node (MIT) and our own code.
+//!
+//! Two writable roots, and the split is deliberate:
+//!
+//! * `hub_home()` — `<app_local_data_dir>/hub`: the app's own CODE (staged
+//!   `dist/` + the fetched `node_modules`). Regenerable, machine-specific, never
+//!   roams, safe to delete.
+//! * `app_data_root()` — `%APPDATA%\AllMyAgents`: the OPERATOR'S data —
+//!   `data/` (journal, config, worktrees, device token) and `profiles/` (the
+//!   managed vendor logins). Passed to the hub as `HUB_DATA_DIR` /
+//!   `HUB_PROFILES_DIR` so an installed build never writes into the repo or the
+//!   read-only install dir.
+//!
+//! Both are RELEASE-only. `tauri dev` still spawns `pnpm hubctl:dev` with neither
+//! env var set, so a developer checkout keeps using the repo's `data/` +
+//! `profiles/` byte-identically to before.
 
 use std::ffi::OsString;
 use std::fs;
@@ -161,13 +176,65 @@ fn bundled_node_dir(app: &AppHandle) -> Option<PathBuf> {
     Some(app.path().resource_dir().ok()?.join("hub-runtime").join("node"))
 }
 
-/// Writable "hub home" that becomes the hub's runtime `repoRoot`
-/// (`<app_local_data_dir>/hub`). The hub creates `data/` + `profiles/` under it,
-/// and the first-run `npm install` writes `apps/hub/node_modules` under it. The
-/// hub derives `repoRoot` as three levels up from its own `dist/` dir, so the
-/// entry must live at `<home>/apps/hub/dist/index.js`.
+/// Writable "hub home" that holds the app's own CODE: the staged `apps/hub/dist`
+/// plus the `apps/hub/node_modules` the first-run `npm install` creates
+/// (`<app_local_data_dir>/hub`). Machine-specific and fully regenerable, which is
+/// why it lives in LOCAL app data (never roams) and why the operator's data does
+/// NOT live here — see `app_data_root`.
+///
+/// The hub derives its `repoRoot` as three levels up from its own `dist/` dir, so
+/// the entry must live at `<home>/apps/hub/dist/index.js`.
 fn hub_home(app: &AppHandle) -> Option<PathBuf> {
     Some(app.path().app_local_data_dir().ok()?.join("hub"))
+}
+
+/// The per-user APP-DATA root for an installed build — `%APPDATA%\AllMyAgents` on
+/// Windows, `~/Library/Application Support/AllMyAgents` on macOS,
+/// `~/.local/share/AllMyAgents` on Linux (docs/alpha-release-plan.md).
+///
+/// This is where the OPERATOR'S data lives: the journal + config + worktrees
+/// (`data/`) and the managed vendor profiles with their credentials
+/// (`profiles/`). Deliberately product-named rather than identifier-named so it is
+/// findable by a human doing a backup or a credential scrub, and deliberately
+/// separate from `hub_home` so wiping/reinstalling the regenerable hub code can
+/// never take the operator's chats and logins with it.
+///
+/// RELEASE ONLY. The dev path (`spawn_hub_dev`) sets neither env var, so a
+/// developer checkout keeps using the repo's `data/` + `profiles/` exactly as
+/// before — see `materialize_app_data`.
+fn app_data_root(app: &AppHandle) -> Option<PathBuf> {
+    // `data_dir()` is the OS per-user data root (%APPDATA% on Windows). Fall back
+    // to the identifier-scoped app dir if the OS root can't be resolved.
+    let base = app
+        .path()
+        .data_dir()
+        .ok()
+        .map(|d| d.join("AllMyAgents"))
+        .or_else(|| app.path().app_data_dir().ok())?;
+    Some(base)
+}
+
+/// First-run materialization of the app-data layout: create
+/// `<app_data_root>/data` and `<app_data_root>/profiles` and hand back the pair to
+/// pass to the hub as `HUB_DATA_DIR` / `HUB_PROFILES_DIR` (apps/hub/src/index.ts).
+///
+/// Both are created EMPTY. The bundle ships no profile and therefore no
+/// credential (scripts/bundle-hub.mjs enforces that); the operator's first login
+/// in the app creates `profiles/<id>` here, on their own machine.
+///
+/// Passing the vars explicitly — instead of relying on the hub's "three levels up
+/// from dist/" derivation — is the whole point: it pins the installed app's data
+/// to a per-user location that is never the repo and never the (read-only,
+/// Program Files) install dir, whatever the process cwd happens to be.
+fn materialize_app_data(app: &AppHandle) -> std::io::Result<(PathBuf, PathBuf)> {
+    let root = app_data_root(app).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "could not resolve the per-user app-data directory")
+    })?;
+    let data = root.join("data");
+    let profiles = root.join("profiles");
+    fs::create_dir_all(&data)?;
+    fs::create_dir_all(&profiles)?;
+    Ok((data, profiles))
 }
 
 /// The install marker: present + matching the shipped manifest ⇒ deps are ready.
@@ -333,6 +400,21 @@ fn release_boot(app: AppHandle, splash: Option<WebviewWindow>) {
         }
     }
 
+    // First-run app-data materialization: journal/config/worktrees + managed
+    // profiles go to the per-user app-data root, NEVER the repo or the install dir.
+    let (hub_data_dir, hub_profiles_dir) = match materialize_app_data(&app) {
+        Ok(pair) => pair,
+        Err(e) => {
+            splash_error(&splash, &format!("Could not create the app-data directory: {e}"));
+            return;
+        }
+    };
+    eprintln!(
+        "[desktop] app data: HUB_DATA_DIR={} HUB_PROFILES_DIR={}",
+        hub_data_dir.display(),
+        hub_profiles_dir.display()
+    );
+
     // Spawn the hub with the bundled Node. PATH carries the hub's own .bin (so the
     // codex adapter's `codex app-server` shell lookup resolves) and the bundled
     // Node dir (so the codex .bin shim's `node` fallback resolves).
@@ -343,6 +425,10 @@ fn release_boot(app: AppHandle, splash: Option<WebviewWindow>) {
         .current_dir(&home)
         .env("PATH", prepend_path(&[bin_dir, node_dir]))
         .env("HUB_WORKER", hub_worker_flag()) // live turns survive a hub restart (see hub_worker_flag)
+        // hubctl forwards its whole env to every hub it supervises (blue AND green),
+        // so setting these here pins the data + profile roots across restarts too.
+        .env("HUB_DATA_DIR", &hub_data_dir)
+        .env("HUB_PROFILES_DIR", &hub_profiles_dir)
         .spawn();
     match spawn {
         Ok(child) => {
@@ -373,6 +459,94 @@ fn release_boot(app: AppHandle, splash: Option<WebviewWindow>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Auto-updater — notify-then-consent, NEVER a silent install.
+//
+// Design (docs/alpha-release-plan.md "Auto-updater"): the Tauri v2 updater pulls
+// `latest.json` straight off the GitHub release page and verifies a minisign
+// signature before it will install anything (it is a code-exec path). The whole
+// interaction is driven from Rust and exposed to the web UI as two ordinary
+// commands, so apps/web needs NO new npm dependency — it reaches them through the
+// same `window.__TAURI__` global bridge it already uses for the window controls
+// (apps/web/src/lib/updater.svelte.ts).
+//
+// ⚠️ OPERATOR TODO — the updater is INERT until a signing keypair exists.
+// `tauri.conf.json` ships `plugins.updater.pubkey` as the literal placeholder
+// PASTE_TAURI_MINISIGN_PUBLIC_KEY_HERE and `bundle.createUpdaterArtifacts` as
+// false (so a keyless checkout still builds). The exact commands to fix that are
+// in docs/alpha-cut-checklist.md step 1 and the header of
+// .github/workflows/release.yml. No key, public or private, is committed to this
+// repo. Until then `updater_check` reports the unconfigured state as a plain
+// error string, which the UI shows verbatim rather than failing silently.
+// ---------------------------------------------------------------------------
+
+/// What the UI needs to decide whether to prompt. `available: false` means "you
+/// are up to date"; the other fields are then just the running version.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateInfo {
+    available: bool,
+    current_version: String,
+    version: String,
+    notes: Option<String>,
+    date: Option<String>,
+}
+
+/// Ask the release endpoint whether a newer signed build exists. Read-only: it
+/// downloads and installs NOTHING. Errors (offline, endpoint 404 because no
+/// release exists yet, missing/placeholder pubkey) come back as a string the UI
+/// renders as-is instead of a silent failure.
+#[cfg(desktop)]
+#[tauri::command]
+async fn updater_check(app: AppHandle) -> Result<UpdateInfo, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let current = app.package_info().version.to_string();
+    let updater = app.updater().map_err(|e| {
+        format!("Updater is not configured yet ({e}). An updater signing key has to be generated and its public key pasted into tauri.conf.json before updates can be checked — see docs/alpha-cut-checklist.md.")
+    })?;
+    match updater.check().await {
+        Ok(Some(update)) => Ok(UpdateInfo {
+            available: true,
+            current_version: current,
+            version: update.version.clone(),
+            notes: update.body.clone(),
+            date: update.date.map(|d| d.to_string()),
+        }),
+        Ok(None) => Ok(UpdateInfo {
+            available: false,
+            current_version: current.clone(),
+            version: current,
+            notes: None,
+            date: None,
+        }),
+        Err(e) => Err(format!("Could not check for updates: {e}")),
+    }
+}
+
+/// Download + verify + install the available update, then relaunch. Only ever
+/// called from an explicit "Update now" click — there is no code path that
+/// reaches this without the operator consenting. The signature check happens
+/// inside `download_and_install`; a bad signature fails here rather than
+/// installing.
+#[cfg(desktop)]
+#[tauri::command]
+async fn updater_install(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let updater = app.updater().map_err(|e| format!("Updater is not configured yet ({e})."))?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| format!("Could not check for updates: {e}"))?
+        .ok_or_else(|| "No update is available.".to_string())?;
+    update
+        .download_and_install(|_chunk, _total| {}, || {})
+        .await
+        .map_err(|e| format!("Update failed: {e}"))?;
+    // The hub child is torn down by the Exit handler in `run()` before the process
+    // goes away, so the new build starts from a clean slate.
+    app.restart();
+}
+
 /// Best-effort teardown of the hub child and its whole process tree.
 fn kill_hub(child: &mut Child) {
     let pid = child.id();
@@ -391,10 +565,19 @@ fn kill_hub(child: &mut Child) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         // Native OS file/folder dialogs and opening external links in the browser.
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_shell::init());
+
+    // Auto-updater — desktop only. Registering the plugin does not contact the
+    // network; nothing is checked until the UI calls `updater_check`.
+    #[cfg(desktop)]
+    let builder = builder
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .invoke_handler(tauri::generate_handler![updater_check, updater_install]);
+
+    builder
         .setup(|app| {
             app.manage(HubProcess(Mutex::new(None)));
 

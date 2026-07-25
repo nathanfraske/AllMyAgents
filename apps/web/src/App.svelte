@@ -6,6 +6,7 @@
   import ConfirmDialog from './lib/ConfirmDialog.svelte'
   import Dashboard from './lib/Dashboard.svelte'
   import Titlebar from './lib/Titlebar.svelte'
+  import UpdateBanner from './lib/UpdateBanner.svelte'
   import { cubicOut } from 'svelte/easing'
   import type { TransitionConfig } from 'svelte/transition'
 
@@ -298,6 +299,8 @@
 {/if}
 <!-- In-app confirm/alert (mounted once) — the native dialogs no-op in the desktop webview. -->
 <ConfirmDialog />
+<!-- Check-on-launch update NOTIFICATION (desktop only, never a silent install). -->
+<UpdateBanner />
 
 <style>
   .app { display: flex; flex-direction: column; height: 100vh; }

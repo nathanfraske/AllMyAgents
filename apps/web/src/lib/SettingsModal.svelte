@@ -5,6 +5,7 @@
   import ProviderLogo from './ProviderLogo.svelte'
   import Icon from './Icon.svelte'
   import { modelsFor } from './catalog'
+  import { updater, updatesSupported } from './updater.svelte'
 
   let { onclose }: { onclose: () => void } = $props()
 
@@ -379,6 +380,27 @@
       <button class="btn btn-primary" onclick={saveInstructions}>{instrSaved ? 'Saved ✓' : 'Save'}</button>
     </section>
 
+    {#if updatesSupported}
+      <section>
+        <h3>Updates</h3>
+        <p class="hint dim">Updates are pulled from this project's GitHub releases and their signature is verified before anything is installed. An available update is only ever offered — it is never installed without you clicking Update now.</p>
+        <label class="opt"><input type="checkbox" checked={settings.autoCheckUpdates} onchange={(e) => settings.set('autoCheckUpdates', (e.target as HTMLInputElement).checked)} /> Check for updates on launch</label>
+        <div class="upd-row">
+          <button class="btn" onclick={() => updater.check()} disabled={updater.busy}>{updater.busy ? 'Checking…' : 'Check for updates'}</button>
+          {#if updater.info?.available}
+            <button class="btn btn-primary" onclick={() => updater.install()} disabled={updater.busy}>Update to {updater.info.version}</button>
+          {/if}
+        </div>
+        {#if updater.error}
+          <p class="hint upd-err">{updater.error}</p>
+        {:else if updater.info?.available}
+          <p class="hint dim">Version {updater.info.version} is available (you're on {updater.info.currentVersion}).{updater.info.notes ? ` ${updater.info.notes}` : ''}</p>
+        {:else if updater.checked && updater.info}
+          <p class="hint dim">You're up to date — version {updater.info.currentVersion}.</p>
+        {/if}
+      </section>
+    {/if}
+
     <section class="danger">
       <h3>Danger Zone</h3>
       {#if !dangerRevealed}
@@ -470,6 +492,8 @@
   .opt.row2 { justify-content: space-between; }
   .opt.row2 select { min-width: 11rem; }
   .hint { font-size: var(--text-xs); line-height: 1.5; }
+  .upd-row { display: flex; gap: var(--space-3); flex-wrap: wrap; margin: var(--space-3) 0 var(--space-2); }
+  .upd-err { color: var(--bad); }
   .hint code { background: var(--bg); padding: 0 0.25rem; border-radius: var(--r-xs); }
   .budget-auto { display: flex; align-items: center; gap: var(--space-4); flex-wrap: wrap; margin-bottom: var(--space-3); }
   .budget-auto .hint { flex: 1; min-width: 12rem; }
