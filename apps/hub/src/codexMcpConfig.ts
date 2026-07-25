@@ -25,6 +25,13 @@ export interface CodexAgentMcpOptions {
   profileId: string
   /** Node executable to launch the bridge with (default 'node'). */
   nodePath?: string
+  /**
+   * Extra node args placed BEFORE the bridge path. A BUILT hub needs none (plain `node dist/agentBridge.js`);
+   * a DEV hub running from source points at `agentBridge.ts` and passes the tsx ESM loader here, e.g.
+   * `['--import', 'file:///…/tsx/dist/esm/index.mjs']`. The loader must be an ABSOLUTE specifier: codex
+   * spawns the bridge with the THREAD's cwd, so a bare `tsx/esm` would resolve against that dir and fail.
+   */
+  nodeArgs?: string[]
   /** MCP server name (default 'allmyagents' — do not change without updating the namespace + ACL). */
   serverName?: string
 }
@@ -48,7 +55,8 @@ export function renderCodexAgentMcpBlock(opts: CodexAgentMcpOptions): string {
   const lines = [
     `[mcp_servers.${name}]`,
     `command = ${tomlStr(node)}`,
-    `args = [${tomlStr(fwd(opts.bridgePath))}]`,
+    // node args (dev tsx loader, if any) come first, then the bridge entry itself.
+    `args = [${[...(opts.nodeArgs ?? []), fwd(opts.bridgePath)].map(tomlStr).join(', ')}]`,
     '',
     `[mcp_servers.${name}.env]`,
     `AMA_HUB_URL = ${tomlStr(opts.hubUrl)}`,

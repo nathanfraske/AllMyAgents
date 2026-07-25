@@ -316,7 +316,11 @@ export function startServer(opts: ServerOptions): http.Server {
           restoredSessions: sessions.list().length,
           schemaVersion: SCHEMA_VERSION,
           pid: process.pid,
-          port,
+          // The port we are ACTUALLY listening on, not the boot port. A promoted green booted on an
+          // ephemeral port (HUB_PORT=0) and then re-listened on the fixed public port, so the boot value
+          // would report `0` for the rest of that hub's life (the known-broken health path in the alpha
+          // plan — observed live on a promoted green). Falls back to the boot port before the listener is up.
+          port: (server.address() as { port?: number } | null)?.port ?? port,
         })
         return
       }

@@ -85,7 +85,7 @@ Why this shape:
 | **`codexMcpConfig.ts`** (new) | Writes/idempotently refreshes `[mcp_servers.allmyagents]` (+ `.env`) into a profile's `config.toml`, **owning only our table** and preserving all other operator config / MCP servers. |
 | **`sessions.ts`** (edited) | `setCodexBridge()` + `ensureCodexMcpConfig()` (writes the config before the app-server starts, on first use of a Codex profile); `resolveCodexIdentity(profileId, cwd)` (the attribution); `execAgentTool(profileId, cwd, tool, args)` (resolve identity → run the shared body via `agentServices()`). |
 | **`server.ts`** (edited) | `POST /internal/agent-tool`, gated by the bridge secret (timing-safe `tokenMatches`), origin/host-guarded to loopback, → `sessions.execAgentTool`. |
-| **`index.ts`** (edited) | Generates the bridge secret, computes the bridge path (`dist/agentBridge.js`), and wires `setCodexBridge` + passes the secret to the server — only when the built bridge exists, so a dev hub run from `.ts` degrades gracefully (Codex keeps receiving bus messages, just without the tools). |
+| **`index.ts`** (edited) | Generates the bridge secret and wires `setCodexBridge` + passes the secret to the server. `resolveAgentBridge()` picks the launch: a BUILT hub uses `dist/agentBridge.js` (plain node); a DEV hub (running from source under tsx) uses `agentBridge.ts` + the tsx ESM loader as an absolute file URL. Only when neither exists does it skip, and Codex then degrades gracefully (still receives bus messages, no tools). |
 | **`instructions.ts`** (edited) | The materialized agent contract now says both providers hold the tools (was "Codex has no MCP wiring yet"). |
 
 Tests (36 new; suite 124 → 165, all green): `agentToolCore.test.ts` (the shared bodies + ACL + the
@@ -177,9 +177,17 @@ Two live checks beyond the unit suite (both PASS):
 
 ## 8. Notes / smaller follow-ups (not blockers)
 
-- **Bridge path / dev runs.** The config points at `dist/agentBridge.js`; the wiring only activates when
-  that file exists (bundled/compiled hub) or `AMA_BRIDGE_PATH` is set. A hub run straight from `.ts` via
-  tsx therefore won't hand Codex the tools until built — Codex still receives bus messages meanwhile.
+- ~~**Bridge path / dev runs.**~~ **FIXED 2026-07-25 (found by dogfooding from inside the running app).**
+  The wiring used to activate only when `dist/agentBridge.js` existed — but the desktop app runs the hub
+  from SOURCE (`pnpm hubctl:dev` → tsx), where that file never exists, so the entire Codex tool surface
+  silently no-opped in the one runtime the operator actually uses. `resolveAgentBridge()` (index.ts) now
+  falls back to `agentBridge.ts` launched with the tsx ESM loader, passed as an **absolute file URL**:
+  codex spawns the bridge with the THREAD's cwd, so a bare `tsx/esm` specifier would resolve against that
+  unrelated directory and fail. `codexMcpConfig` gained `nodeArgs` (rendered before the bridge path) to
+  carry it. Verified end-to-end by spawning the bridge exactly as codex does — the forward-slashed `.ts`
+  path from our TOML renderer, from a foreign cwd — and driving real JSON-RPC: `initialize` →
+  serverInfo `allmyagents`, `tools/list` → all **11** tools, `tools/call` → forwarded to the hub carrying
+  the child's cwd (the attribution signal), the bearer secret, and the profile id.
 - **Bridge secret + blue-green.** The secret is generated per boot and the bridge posts to the public
   port. A blue-green handoff briefly has blue's in-flight bridges holding the old secret; they'd get a
   403 from a promoted green, but those sessions are retiring anyway. Persisting the secret (like the

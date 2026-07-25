@@ -49,6 +49,20 @@ function isDir(p: string): boolean {
 }
 
 /**
+ * True for an AllMyAgents-MANAGED profile (`profiles/*`), false for the user's real vendor homes
+ * (`~/.claude`, `~/.codex`).
+ *
+ * THE RULE this encodes: the hub configures what it manages, never the user's vendor home. Those dirs are
+ * shared with their ordinary Claude Code / Codex CLI + IDE usage OUTSIDE this app, so writing our policy
+ * into them would leak hub behavior into unrelated sessions — a suppressed-connector setting they didn't
+ * ask for, or an MCP bridge pointed at a hub that isn't running. Both the connector policy (#8) and the
+ * Codex agent-tool bridge (#11) gate on this; new hub-writes-vendor-config paths should too.
+ */
+export function isManagedProfile(profileId: string): boolean {
+  return profileId !== CLAUDE_DEFAULT_ID && profileId !== CODEX_DEFAULT_ID
+}
+
+/**
  * Apply the claude.ai-connector policy to every MANAGED claude profile's settings.json (merge-preserving):
  * sets `disableClaudeAiConnectors = !enable` so the Claude SDK suppresses (default, safe) or allows cloud
  * MCP connectors for hub-managed sessions. Only touches AllMyAgents-managed `profiles/*` — never the user's
@@ -59,7 +73,7 @@ function isDir(p: string): boolean {
 export function setClaudeConnectorPolicy(profiles: Profile[], enable: boolean): string[] {
   const written: string[] = []
   for (const p of profiles) {
-    if (p.provider !== 'claude' || p.id === CLAUDE_DEFAULT_ID) continue
+    if (p.provider !== 'claude' || !isManagedProfile(p.id)) continue
     const file = path.join(p.dir, 'settings.json')
     try {
       let obj: Record<string, unknown> = {}

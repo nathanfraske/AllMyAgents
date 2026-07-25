@@ -53,6 +53,20 @@ fn hub_already_running() -> bool {
 /// compile time via `CARGO_MANIFEST_DIR` (`apps/desktop/src-tauri`) walked up
 /// three levels — correct for `tauri dev` on a developer's machine, invalid for a
 /// shipped bundle (which uses the release path below instead).
+/// Value for `HUB_WORKER` on the hub we spawn.
+///
+/// Worker mode (docs/agent-worker-impl.md) ships **ON** per docs/alpha-release-plan.md: hubctl then spawns
+/// the agent worker as a SIBLING that outlives the hub, so a live agent turn — and its sub-agents — survive
+/// a hub restart (blue-green update or crash) instead of dying with the process. That is what makes the app
+/// safely repairable while in use. Proven end-to-end by `pnpm accept:restart`.
+///
+/// An explicit operator setting always wins, so `HUB_WORKER=0` still runs the legacy in-process path.
+/// NOTE: worker mode is entered when hubctl STARTS — a running hub cannot grow a worker, so the first
+/// launch after this change is a normal (cold) start; every restart after it is survivable.
+fn hub_worker_flag() -> String {
+    std::env::var("HUB_WORKER").unwrap_or_else(|_| "1".to_string())
+}
+
 fn spawn_hub_dev() -> Option<Child> {
     if hub_already_running() {
         eprintln!("[desktop] hub already reachable on {HUB_ADDR} — not spawning a second one");
@@ -77,6 +91,7 @@ fn spawn_hub_dev() -> Option<Child> {
         c
     };
     cmd.current_dir(&repo_root);
+    cmd.env("HUB_WORKER", hub_worker_flag()); // live turns survive a hub restart (see hub_worker_flag)
 
     match cmd.spawn() {
         Ok(child) => {
@@ -327,6 +342,7 @@ fn release_boot(app: AppHandle, splash: Option<WebviewWindow>) {
         .arg(&entry)
         .current_dir(&home)
         .env("PATH", prepend_path(&[bin_dir, node_dir]))
+        .env("HUB_WORKER", hub_worker_flag()) // live turns survive a hub restart (see hub_worker_flag)
         .spawn();
     match spawn {
         Ok(child) => {

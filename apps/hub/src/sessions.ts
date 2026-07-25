@@ -1,7 +1,7 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { defaultHomeProfiles } from './profiles.js'
+import { defaultHomeProfiles, isManagedProfile } from './profiles.js'
 import { mapCodexTokenUsage } from './adapters/codex.js'
 import { readHistoryPage, locateTranscript, type HistoryPage } from './transcript.js'
 import type { ApprovalService } from './approvals.js'
@@ -89,7 +89,7 @@ export class SessionManager {
   // the hub (over hubUrl, authenticated by secret). Null when unset (tests / a hub with no built bridge) —
   // then no Codex config is written and Codex simply lacks the tools, exactly as before. Set once at boot
   // via setCodexBridge (index.ts).
-  private codexBridge: { bridgePath: string; hubUrl: string; secret: string; nodePath?: string } | null = null
+  private codexBridge: { bridgePath: string; hubUrl: string; secret: string; nodePath?: string; nodeArgs?: string[] } | null = null
 
   constructor(
     private readonly journal: Journal,
@@ -356,7 +356,7 @@ export class SessionManager {
 
   /** Wire the Codex agent-tool bridge (index.ts, once at boot). Enables writing the `allmyagents` MCP
    *  server into each Codex profile's config.toml so Codex agents get the tools. */
-  setCodexBridge(cfg: { bridgePath: string; hubUrl: string; secret: string; nodePath?: string }): void {
+  setCodexBridge(cfg: { bridgePath: string; hubUrl: string; secret: string; nodePath?: string; nodeArgs?: string[] }): void {
     this.codexBridge = cfg
   }
 
@@ -369,6 +369,11 @@ export class SessionManager {
    */
   private ensureCodexMcpConfig(profile: Profile): void {
     if (!this.codexBridge || this.codexConfigWritten.has(profile.id)) return
+    // MANAGED profiles only — never the operator's real `~/.codex`. That config.toml is shared with their
+    // ordinary `codex` CLI/IDE usage OUTSIDE this app; registering our bridge there would make every plain
+    // codex run spawn a child pointed at a hub that may not be running. Same posture as the connector
+    // policy skipping `~/.claude` (#8): the hub configures what it manages, not the user's vendor home.
+    if (!isManagedProfile(profile.id)) return
     try {
       const file = writeCodexAgentMcpConfig(profile.dir, {
         bridgePath: this.codexBridge.bridgePath,
@@ -376,6 +381,7 @@ export class SessionManager {
         secret: this.codexBridge.secret,
         profileId: profile.id,
         nodePath: this.codexBridge.nodePath,
+        nodeArgs: this.codexBridge.nodeArgs,
       })
       this.codexConfigWritten.add(profile.id)
       this.journal.append(null, 'codex/mcp-config-written', { profileId: profile.id, file })

@@ -1,6 +1,8 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
 import { ApprovalService } from './approvals.js'
 import { Journal } from './journal.js'
 import { ProjectStore } from './projects.js'
@@ -119,14 +121,39 @@ const isGreen = supervised && bootPort === 0
 // POST /internal/agent-tool — which the hub authenticates with this secret and attributes to the
 // calling Codex session (by profile id + the bridge child's cwd). See docs/codex-agent-tools-parity.md.
 const agentToolSecret = crypto.randomBytes(32).toString('hex')
-const bridgePath = process.env.AMA_BRIDGE_PATH ?? path.join(import.meta.dirname, 'agentBridge.js')
-// Only wire it when the built bridge actually exists (a compiled/bundled hub) or an explicit override
-// is set — a dev hub run straight from .ts has no agentBridge.js, so Codex simply keeps its prior
-// behavior (still RECEIVES bus messages; just no send/memory/practice tools) instead of getting a
-// config.toml pointing at a missing file.
-if (process.env.AMA_BRIDGE_PATH || fs.existsSync(bridgePath)) {
+/**
+ * How to launch the bridge that `codex app-server` spawns per thread.
+ *
+ * A BUILT hub has `dist/agentBridge.js` beside us → plain `node <js>`. A DEV hub runs from SOURCE under
+ * tsx, where the sibling is `agentBridge.ts`: it must be launched with the tsx ESM loader, passed as an
+ * ABSOLUTE file URL — codex spawns the bridge with the THREAD's cwd, so a bare `tsx/esm` specifier would
+ * resolve against that unrelated directory and fail. Without this, the whole Codex tool surface silently
+ * no-opped in exactly the dev harness the desktop app uses (`pnpm hubctl:dev` → tsx), which is how the
+ * gap was found — from inside the running app. Returns null when no bridge can be launched at all, in
+ * which case Codex keeps its prior behavior (still RECEIVES bus messages, just no send/memory/practice
+ * tools) rather than getting a config.toml pointing at a missing file.
+ */
+function resolveAgentBridge(): { bridgePath: string; nodeArgs: string[] } | null {
+  const withTsxLoader = (p: string): { bridgePath: string; nodeArgs: string[] } | null => {
+    try {
+      const loader = pathToFileURL(createRequire(import.meta.url).resolve('tsx/esm')).href
+      return { bridgePath: p, nodeArgs: ['--import', loader] }
+    } catch {
+      return null // no tsx resolvable → we cannot run a .ts bridge
+    }
+  }
+  const override = process.env.AMA_BRIDGE_PATH
+  if (override) return override.endsWith('.ts') ? withTsxLoader(override) : { bridgePath: override, nodeArgs: [] }
+  const js = path.join(import.meta.dirname, 'agentBridge.js')
+  if (fs.existsSync(js)) return { bridgePath: js, nodeArgs: [] }
+  const ts = path.join(import.meta.dirname, 'agentBridge.ts')
+  return fs.existsSync(ts) ? withTsxLoader(ts) : null
+}
+const agentBridge = resolveAgentBridge()
+if (agentBridge) {
   sessions.setCodexBridge({
-    bridgePath,
+    bridgePath: agentBridge.bridgePath,
+    nodeArgs: agentBridge.nodeArgs,
     hubUrl: `http://127.0.0.1:${publicPort}`,
     secret: agentToolSecret,
     nodePath: process.env.AMA_BRIDGE_NODE ?? process.execPath,

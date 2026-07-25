@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { setClaudeConnectorPolicy, CLAUDE_DEFAULT_ID } from './profiles.js'
+import { setClaudeConnectorPolicy, isManagedProfile, CLAUDE_DEFAULT_ID, CODEX_DEFAULT_ID } from './profiles.js'
 import type { Profile } from './types.js'
 
 function tmpProfile(id: string, provider: 'claude' | 'codex', settings?: Record<string, unknown>): Profile {
@@ -13,6 +13,19 @@ function tmpProfile(id: string, provider: 'claude' | 'codex', settings?: Record<
 function readSettings(p: Profile): Record<string, unknown> {
   return JSON.parse(fs.readFileSync(path.join(p.dir, 'settings.json'), 'utf8')) as Record<string, unknown>
 }
+
+// The single rule both hub-writes-vendor-config paths gate on (#8 connector policy, #11 codex bridge):
+// configure what we manage, never the user's real ~/.claude / ~/.codex, which their ordinary CLI/IDE use.
+describe('isManagedProfile', () => {
+  it('is false for the user real vendor homes', () => {
+    expect(isManagedProfile(CLAUDE_DEFAULT_ID)).toBe(false)
+    expect(isManagedProfile(CODEX_DEFAULT_ID)).toBe(false)
+  })
+  it('is true for AllMyAgents-managed profiles', () => {
+    expect(isManagedProfile('claude-a')).toBe(true)
+    expect(isManagedProfile('codex-a')).toBe(true)
+  })
+})
 
 describe('setClaudeConnectorPolicy', () => {
   it('disables connectors (writes true) for a managed claude profile when the flag is OFF', () => {

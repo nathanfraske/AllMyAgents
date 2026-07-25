@@ -34,6 +34,23 @@ describe('renderCodexAgentMcpBlock', () => {
     const toml = renderCodexAgentMcpBlock({ ...OPTS, secret: 'a"b\\c' })
     expect(toml).toContain('AMA_HUB_SECRET = "a\\"b\\\\c"')
   })
+
+  // A DEV hub runs from source, so the bridge is agentBridge.TS and needs the tsx ESM loader in front of
+  // it. Without this the dev harness the desktop app actually uses (pnpm hubctl:dev) wires no bridge at
+  // all and Codex silently loses the whole tool surface.
+  it('places nodeArgs (the dev tsx loader) BEFORE the bridge path', () => {
+    const loader = 'file:///C:/repo/node_modules/tsx/dist/esm/index.mjs'
+    const toml = renderCodexAgentMcpBlock({
+      ...OPTS,
+      bridgePath: 'C:\\Users\\Admin\\hub\\src\\agentBridge.ts',
+      nodeArgs: ['--import', loader],
+    })
+    expect(toml).toContain(`args = ["--import", "${loader}", "C:/Users/Admin/hub/src/agentBridge.ts"]`)
+  })
+
+  it('omits nodeArgs entirely when not given (built-hub path unchanged)', () => {
+    expect(renderCodexAgentMcpBlock(OPTS)).toContain('args = ["C:/Users/Admin/hub/agentBridge.js"]')
+  })
 })
 
 describe('upsert / strip (preserve the operator config; own only our table)', () => {
