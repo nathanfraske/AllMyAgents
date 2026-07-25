@@ -44,6 +44,9 @@ export interface SessionRecord {
   // on-disk history on demand (see transcript.ts). Cached on first lookup for records adopted before
   // this field existed. Optional → no store migration.
   transcriptPath?: string
+  // ISO time of the LAST turn in the source transcript (for imported chats) — the sidebar shows/sorts
+  // by this so an import reads its real recency, not the moment it was imported. Absent → hub-native.
+  lastActivity?: string
   createdAt: string
 }
 

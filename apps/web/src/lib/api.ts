@@ -29,6 +29,8 @@ export interface SessionRecord {
   titleSource?: string
   // Adopted from an existing vendor transcript via project-import (vs. spawned by the hub).
   imported?: boolean
+  // Real last-turn time of an imported transcript — the sidebar shows/sorts by this, not import time.
+  lastActivity?: string
   createdAt: string
 }
 

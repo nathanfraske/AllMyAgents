@@ -36,6 +36,18 @@
     if (expanding && id !== '__none__') void store.maybePromptImport(id, pathFor(id))
   }
 
+  // A turn stuck 'active' with no completion for this long reads as stalled — worth a warning glance.
+  const STALL_MS = 3 * 60 * 1000
+  function isStalled(s: SessionView): boolean {
+    return s.record.status === 'active' && !!s.turnStartedAt && Date.now() - s.turnStartedAt > STALL_MS
+  }
+  function warnOf(s: SessionView, st: { key: string }): boolean {
+    return st.key === 'error' || isStalled(s)
+  }
+  function warnTitle(st: { key: string }): string {
+    return st.key === 'error' ? 'errored — needs attention' : 'stalled — no progress for a while'
+  }
+
   // --- Materialize / rename glitch --------------------------------------------------------------
   // The store stamps a chat id into `recentlyChanged` when it MATERIALIZES (draft → real) or is
   // (re)TITLED. We flip a transient `.glitch` class on that row's label for a short window, then
@@ -382,7 +394,14 @@
               <span class="rlabel" class:glitch={glitching.has(s.record.id)} ondblclick={(e) => startRename(e, s)}>{label(s)}</span>
             {/if}
             {#if pending > 0}<span class="pbadge tnum">{pending}</span>{/if}
-            <span class="rtime dim tnum">{relativeTime(s.lastActivity)}</span>
+            {#if warnOf(s, st)}
+              <span class="rwarn" title={warnTitle(st)} aria-label={warnTitle(st)}><Icon name="alert-triangle" size={12} /></span>
+              <span class="rtime dim tnum">{relativeTime(s.lastActivity)}</span>
+            {:else if st.key === 'working' || st.key === 'starting'}
+              <span class="rtime rdots" title={st.label} aria-label="working"><i></i><i></i><i></i></span>
+            {:else}
+              <span class="rtime dim tnum">{relativeTime(s.lastActivity)}</span>
+            {/if}
             <span class="ractions">
               <button class="mini" title="rename" onclick={(e) => startRename(e, s)}><Icon name="pencil" size={12} /></button>
               <button class="mini" title="interrupt" onclick={(e) => act(e, s.record.id, 'interrupt')}><Icon name="square" size={12} /></button>
@@ -493,13 +512,21 @@
       78%  { transform: translate(-0.5px, 0); opacity: 0.95; text-shadow: 0.5px 0 var(--accent); }
       100% { transform: translate(0, 0); clip-path: inset(0 0 0 0); opacity: 1; text-shadow: none; }
     }
+    .rdots i { animation: rdot 1.1s ease-in-out infinite; }
+    .rdots i:nth-child(2) { animation-delay: 0.18s; }
+    .rdots i:nth-child(3) { animation-delay: 0.36s; }
+    @keyframes rdot { 0%, 80%, 100% { opacity: 0.35; transform: translateY(0); } 40% { opacity: 1; transform: translateY(-1.5px); } }
   }
   .rename-input { flex: 1; min-width: 0; font: inherit; font-size: var(--text-sm); background: var(--surface-3); border: 1px solid var(--border-accent); border-radius: var(--r-xs); padding: 0 0.3rem; color: var(--text); }
   .rtime { font-size: var(--text-xs); flex: none; }
+  /* "working" indicator: three dots that pulse in sequence (falls back to static dots w/ reduced motion). */
+  .rdots { display: inline-flex; align-items: center; gap: 3px; flex: none; }
+  .rdots i { width: 3px; height: 3px; border-radius: 50%; background: var(--accent); opacity: 0.4; }
+  .rwarn { flex: none; display: inline-grid; place-items: center; color: var(--bad-text, #e5484d); }
   .pbadge { background: var(--warn); color: #111; border-radius: var(--r-pill); padding: 0 0.35rem; font-size: var(--text-2xs); font-weight: var(--fw-semibold); }
   .ractions { display: none; gap: 0.15rem; }
   .row:hover .ractions { display: flex; }
-  .row:hover .rtime { display: none; }
+  .row:hover .rtime, .row:hover .rdots, .row:hover .rwarn { display: none; }
   .mini { display: grid; place-items: center; color: var(--dim); width: 20px; height: 20px; border-radius: var(--r-xs); }
   .mini:hover { background: var(--surface-3); color: var(--text); }
   .mini.del:hover { background: var(--surface-3); color: var(--bad-text); }

@@ -415,7 +415,17 @@ export class SessionManager {
       }
     }
     if (!file) return { items: [], olderCursor: null, hasOlder: false }
-    return readHistoryPage(file, record.provider, opts)
+    const page = await readHistoryPage(file, record.provider, opts)
+    // Backfill last-turn time for a record adopted before `lastActivity` existed, so the sidebar sorts
+    // it by real recency next boot (the tail's last item is the most recent turn).
+    if (!record.lastActivity && !opts.beforeByte && page.items.length) {
+      const lastTs = page.items[page.items.length - 1]?.ts
+      if (lastTs) {
+        record.lastActivity = lastTs
+        this.persist(record)
+      }
+    }
+    return page
   }
 
   /**
@@ -470,6 +480,7 @@ export class SessionManager {
       titleSource: title ? 'auto' : undefined,
       imported: true,
       transcriptPath: chat.transcriptPath, // so the thread can render its on-disk history on open
+      lastActivity: chat.lastActivity, // real last-turn time → sidebar shows/sorts by recency, not import time
       createdAt: new Date().toISOString(),
     }
     this.sessions.set(id, record)

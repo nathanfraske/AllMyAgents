@@ -754,7 +754,7 @@ class HubStore {
       existing.record = record
       return existing
     }
-    const view: SessionView = { record, items: [], lastActivity: record.createdAt, sawReasoning: false }
+    const view: SessionView = { record, items: [], lastActivity: record.lastActivity ?? record.createdAt, sawReasoning: false }
     // (context/cost fields populated from result + tokenUsage events)
     this.sessions[record.id] = view
     return view
@@ -1122,6 +1122,11 @@ class HubStore {
     const hist = page.items.map((h, i) => this.toThreadItem(h, `hist:${i}`, ts))
     view.items = [...hist, ...view.items] // prepend history; live turns (if any) stay below
     view.historyOlderCursor = page.hasOlder ? page.olderCursor : null
+    // Reflect the real last-turn time in the sidebar (time + recency sort) the moment history loads —
+    // fixes an imported chat that showed/sorted by its import time. For an existing import (no stored
+    // lastActivity) override outright, since the real last-turn time is EARLIER than the import time.
+    const newestTs = hist[hist.length - 1]?.ts
+    if (newestTs && (!view.record.lastActivity || newestTs > view.lastActivity)) view.lastActivity = newestTs
   }
 
   // Page OLDER history above what's shown (the "load older" affordance for long imported chats).
