@@ -564,3 +564,33 @@ describe('event batching (replay does not render frame-by-frame)', () => {
     expect(texts).toContain('survivor')
   })
 })
+
+
+// A replayed session/deleted used to HIJACK the home screen: removeSessionLocal tested `!selectedId`,
+// which is true when you are deliberately on home, and filled it with the most recently active chat.
+// Deletions replay on every reconnect, so each refresh threw you into an unrelated chat.
+describe('session removal does not hijack the home screen', () => {
+  it('stays on home when an unrelated chat is removed', () => {
+    seed('a')
+    seed('b')
+    store.selectedId = null // home, deliberately
+    apply(evt({ seq: 1, kind: 'session/deleted', sessionId: 'a', payload: { id: 'a' } }))
+    expect(store.selectedId).toBeNull()
+  })
+
+  it('clears the selection when the OPEN chat is the one removed', () => {
+    seed('a')
+    seed('b')
+    store.selectedId = 'a'
+    apply(evt({ seq: 1, kind: 'session/deleted', sessionId: 'a', payload: { id: 'a' } }))
+    expect(store.selectedId).toBeNull()
+  })
+
+  it('leaves an unrelated open chat alone', () => {
+    seed('a')
+    seed('b')
+    store.selectedId = 'b'
+    apply(evt({ seq: 1, kind: 'session/deleted', sessionId: 'a', payload: { id: 'a' } }))
+    expect(store.selectedId).toBe('b')
+  })
+})

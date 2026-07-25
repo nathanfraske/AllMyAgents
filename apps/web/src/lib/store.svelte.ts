@@ -958,8 +958,13 @@ class HubStore {
       const rows = this.splitPanes.map((r) => r.filter((x) => x !== id))
       this.commit(rows)
     }
-    if (!this.selectedId || !this.sessions[this.selectedId]) {
-      this.selectedId = this.splitPanes[0]?.[0] ?? this.sessionList[0]?.record.id ?? null
+    // Only move the selection if the removed chat WAS the one open (or the selection is now dangling).
+    // The old test was `!this.selectedId`, which is TRUE on the home screen — so every removal filled the
+    // empty selection with sessionList[0], the most recently active chat. Deletions replay from the
+    // journal on every reconnect, so each refresh landed you in an unrelated chat instead of home.
+    // Being on the home screen is a deliberate state, not a gap to be filled.
+    if (this.selectedId === id || (this.selectedId && !this.sessions[this.selectedId])) {
+      this.selectedId = this.splitPanes[0]?.[0] ?? null
     }
   }
 
