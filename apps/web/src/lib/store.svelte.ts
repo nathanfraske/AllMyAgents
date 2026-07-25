@@ -50,6 +50,20 @@ export interface ThreadItem {
   toolInput?: unknown
   toolResult?: string
   toolError?: boolean
+  /** For a `tool` item: the vendor tool_use id. A spawned agent's items point back at it via `agentId`. */
+  toolUseId?: string
+  /** When the tool_result arrived — the only honest end-time for a spawned agent (its duration). */
+  toolResultTs?: string
+  /**
+   * Sub-agent attribution, straight off the event envelope (`parent_tool_use_id`). Set when this item was
+   * produced INSIDE an agent spawned by an `Agent`/`Task` tool call; undefined for the main thread. The
+   * hub has always journaled this — it was simply never read — so the agent tree is reconstructable from
+   * existing history with no hub change. See agentTree.ts.
+   */
+  agentId?: string
+  /** The spawned agent's type + task, also carried on the envelope (e.g. `general-purpose`). */
+  subagentType?: string
+  taskDescription?: string
   reflex?: boolean
   status?: string
   // True for a turn reconstructed from the vendor transcript on open (imported chats), vs a live/
@@ -1149,24 +1163,40 @@ class HubStore {
   }
 
   private applyClaudeAssistant(view: SessionView, ts: string, payload: unknown): void {
-    const content = (payload as { message?: { content?: ClaudeBlock[] } }).message?.content
+    const p = payload as {
+      message?: { content?: ClaudeBlock[] }
+      parent_tool_use_id?: string | null
+      subagent_type?: string
+      task_description?: string
+    }
+    const content = p.message?.content
     if (!Array.isArray(content)) return
+    // Sub-agent attribution off the envelope: anything produced inside a spawned agent carries the
+    // spawning tool_use id (+ its type/task). Undefined here means "the main thread". Threaded onto every
+    // item so the agent panel can group a run's activity without touching the hub.
+    const agentId = p.parent_tool_use_id ?? undefined
+    const subagentType = p.subagent_type
+    const taskDescription = p.task_description
     let sawThinkingThisTurn = false
     for (const block of content) {
       if (block.type === 'text' && block.text) {
-        this.push(view, { kind: 'assistant', ts, text: block.text })
+        this.push(view, { kind: 'assistant', ts, text: block.text, agentId, subagentType, taskDescription })
       } else if (block.type === 'thinking' || block.type === 'redacted_thinking') {
         view.sawReasoning = true
         sawThinkingThisTurn = true
         // Claude Code withholds reasoning text on subscription accounts (signature only),
         // so block.thinking is typically empty — render a "reasoned" marker, not fake text.
-        this.push(view, { kind: 'thinking', ts, text: (block.thinking ?? '').trim() })
+        this.push(view, { kind: 'thinking', ts, text: (block.thinking ?? '').trim(), agentId, subagentType, taskDescription })
       } else if (block.type === 'tool_use') {
         this.push(view, {
           kind: 'tool',
           ts,
           toolName: block.name,
           toolInput: block.input,
+          toolUseId: block.id,
+          agentId,
+          subagentType,
+          taskDescription,
           reflex: !sawThinkingThisTurn && !view.sawReasoning,
           key: `tool:${block.id}`,
         })
@@ -1183,6 +1213,7 @@ class HubStore {
         if (item) {
           item.toolResult = asText(block.content)
           item.toolError = block.is_error === true
+          item.toolResultTs = ts // completion time — gives a spawned agent a real duration
         }
       }
     }
