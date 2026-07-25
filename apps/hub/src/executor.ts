@@ -333,7 +333,7 @@ export class InProcessExecutor implements Executor {
         model: spec.model,
         effort: spec.effort,
         serviceTier: spec.serviceTier,
-        approvalPolicy: spec.permissionMode === 'full' ? 'never' : spec.permissionMode ? 'onRequest' : undefined,
+        approvalPolicy: spec.permissionMode === 'full' ? 'never' : spec.permissionMode ? 'on-request' : undefined,
       })
     } catch (err) {
       this.h.journal(spec.sessionId, 'session/error', {

@@ -65,14 +65,14 @@ export function buildAgentMcpServer(identity: SessionIdentity, services: AgentSe
     tools: [
       tool(
         'list_agents',
-        'List the other agents you can message — your teammates on the same project. Returns their short session ids (use one as `to_session`), provider, and current status.',
+        'List the other agents you can message — your teammates on the same project. Returns their session ids (use one verbatim as `to_session`), provider, and current status.',
         {},
         async () => {
           const roster = services.roster(identity.sessionId)
           if (!roster.length) return textResult('No other agents are currently on your team.')
           return textResult(
             roster
-              .map((a) => `- ${a.label} — session ${a.sessionId.slice(0, 8)} (${a.provider}, ${a.status})`)
+              .map((a) => `- ${a.label} — session ${a.sessionId} (${a.provider}, ${a.status})`)
               .join('\n')
           )
         }
@@ -107,7 +107,7 @@ export function buildAgentMcpServer(identity: SessionIdentity, services: AgentSe
             msgs
               .map(
                 (m, i) =>
-                  `[${i + 1}] from ${m.fromLabel} (${m.fromSession.slice(0, 8)})${m.subject ? ` — ${m.subject}` : ''}\n${m.body}`
+                  `[${i + 1}] from ${m.fromLabel} (${m.fromSession})${m.subject ? ` — ${m.subject}` : ''}\n${m.body}`
               )
               .join('\n\n')
           )
