@@ -181,18 +181,59 @@ describe('worker/attach-gap — end-to-end overflow path (worker emits → hub j
 })
 
 describe('AgentWorker.listLive — status semantics mirror InProcessExecutor (§6)', () => {
-  it('claude reflects driver.busy; codex is ALWAYS idle across a re-attach', () => {
+  it('claude reflects driver.busy; a codex thread with NO live turn is idle', () => {
     const w = makeWorker()
     w.claudeDrivers.set('c-busy', { busy: true })
     w.claudeDrivers.set('c-idle', { busy: false })
-    w.codexThreads.set('x-codex', 'thread-1') // a codex thread the worker still holds
+    w.codexThreads.set('x-codex', 'thread-1') // a codex thread the worker still holds, but no turn running
     w.emitEvent('c-busy', 'claude/text', {}) // give a couple of sessions a non-zero head
     w.emitEvent('x-codex', 'codex/item', {})
 
     const byId = new Map(w.listLive().map((s) => [s.sessionId, s]))
     expect(byId.get('c-busy')).toMatchObject({ status: 'active', lastWseq: 1 }) // busy claude driver → active
     expect(byId.get('c-idle')).toMatchObject({ status: 'idle', lastWseq: 0 }) //   idle claude driver → idle
-    expect(byId.get('x-codex')).toMatchObject({ status: 'idle', lastWseq: 1 }) //  codex → idle even mid-hold
+    expect(byId.get('x-codex')).toMatchObject({ status: 'idle', lastWseq: 1 }) //  warm thread, no turn → idle
+  })
+
+  /**
+   * REGRESSION (Codex turns did not replay-survive a hub restart, contradicting §3.4).
+   *
+   * listLive used to hard-code EVERY codex session to 'idle'. SessionManager.attachWorker only builds a
+   * replay cursor for sessions the worker reports 'active' — everything else takes setStatus(idle) and is
+   * never passed to executor.attach(). So a codex turn that was mid-flight across a hub restart kept
+   * running in the surviving app-server child and kept buffering events in the worker, and the successor
+   * hub silently dropped that whole gap: no journal rows, no UI, and the chat sitting there idle while the
+   * agent was demonstrably still working.
+   *
+   * That contradicted the documented goal head-on. docs/agent-worker-impl.md §3.4 claims Claude sub-agents
+   * AND "Codex sub-tasks" survive "for free" and calls it "the single most valuable structural consequence
+   * of the move" — but only the Claude half was ever wired up.
+   *
+   * `activeTurns` already tracked exactly this (added by emitTurnStarted, cleared by
+   * emitTurnCompleted/emitTurnError); listLive just refused to read it for codex.
+   */
+  it('a codex session with a LIVE turn reports active, so the hub replays its gap (§3.4)', () => {
+    const w = makeWorker()
+    w.codexThreads.set('x-codex', 'thread-1')
+    w.emitTurnStarted('x-codex') // a turn is in flight inside the app-server child
+    w.emitEvent('x-codex', 'codex/item', {}) // …and it is still producing events across the seam
+
+    const byId = new Map(w.listLive().map((s) => [s.sessionId, s]))
+    expect(byId.get('x-codex')?.status).toBe('active')
+  })
+
+  it('a codex session returns to idle once its turn completes or errors', () => {
+    const w = makeWorker()
+    w.codexThreads.set('done', 'thread-done')
+    w.codexThreads.set('failed', 'thread-failed')
+    w.emitTurnStarted('done')
+    w.emitTurnCompleted('done')
+    w.emitTurnStarted('failed')
+    w.emitTurnError('failed', 'boom')
+
+    const byId = new Map(w.listLive().map((s) => [s.sessionId, s]))
+    expect(byId.get('done')?.status).toBe('idle')
+    expect(byId.get('failed')?.status).toBe('idle')
   })
 })
 

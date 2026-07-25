@@ -163,7 +163,12 @@ export class WorkerExecutor implements Executor {
       // same way: turnError → applyLifecycle → journal `session/error` + status 'error'. onTurnLifecycle
       // clears busy for turnError, but nothing is listening to our synthesized message, so clear it here.
       this.busySessions.delete(spec.sessionId)
-      const message = `agent worker unavailable — the turn was not started (${errText(err)})`
+      // Deliberately says "not confirmed", not "not started". The ACK is what failed, and a socket can drop
+      // AFTER the worker accepted the turn but BEFORE its ack reaches us — in which case the turn really is
+      // running and a later re-attach can legitimately replay its turnStarted. Claiming "not started" would
+      // be a lie in exactly that case. Surfacing an honest "unknown" is still far better than the silent
+      // loss this replaced; true exactly-once accept would need reqId dedup on the worker side.
+      const message = `agent worker unavailable — the turn was not confirmed and may not have started (${errText(err)})`
       console.warn(`[worker-executor] runTurn not accepted for ${spec.sessionId}: ${errText(err)}`)
       this.hub.applyLifecycle({ t: 'turnError', sessionId: spec.sessionId, wseq: 0, message })
     }

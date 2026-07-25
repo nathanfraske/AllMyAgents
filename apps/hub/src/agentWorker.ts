@@ -442,10 +442,19 @@ export class AgentWorker {
    * InProcessExecutor.listLive EXACTLY so both executors reconcile identically:
    *   - claude → the driver's own `busy` flag: a busy driver is a LIVE turn the hub keeps `active` and
    *     replays across the seam (the Phase-2 win); an idle driver is a warm session with no live turn.
-   *   - codex → always `idle`: a codex turn lives in the app-server child and resumes lazily on the next
-   *     send, so the worker does not replay-survive it — the hub re-attaches it as idle (§6, §11).
+   *   - codex → `activeTurns`: a live codex turn runs inside the app-server child, which the worker owns and
+   *     which therefore OUTLIVES a hub restart exactly like a claude driver does. So a codex session with a
+   *     turn in flight is `active` and replays its gap; a warm thread with no turn is `idle`.
    * `lastWseq` is the session's current buffer head (diagnostic; the hub's replay cursor is its OWN durable
    * lastJournaledWseq, not this).
+   *
+   * Codex used to be hard-coded `idle` here, on the reasoning that a codex turn "resumes lazily on the next
+   * send". That silently broke the documented goal (§3.4: Claude sub-agents AND *Codex sub-tasks* survive
+   * "for free"). SessionManager.attachWorker only builds a replay cursor for sessions reported `active`;
+   * everything else is set idle and never passed to executor.attach(). So a codex turn crossing a hub
+   * restart kept running and kept buffering events in the worker, while the successor hub dropped that
+   * entire gap — no journal rows, no UI, and the chat sitting idle while the agent was still working. The
+   * app-server child survives either way; only the hub's willingness to drain it was missing.
    */
   private listLive(): LiveSession[] {
     const live: LiveSession[] = []
@@ -454,7 +463,11 @@ export class AgentWorker {
     }
     for (const sessionId of this.codexThreads.keys()) {
       if (this.claudeDrivers.has(sessionId)) continue
-      live.push({ sessionId, status: 'idle', lastWseq: this.buf.lastWseq(sessionId) })
+      live.push({
+        sessionId,
+        status: this.activeTurns.has(sessionId) ? 'active' : 'idle',
+        lastWseq: this.buf.lastWseq(sessionId),
+      })
     }
     return live
   }

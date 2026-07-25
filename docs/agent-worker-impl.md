@@ -344,6 +344,22 @@ grandchildren) **completely undisturbed**. There is **no sub-agent-specific code
 the executor relocates the whole tree, and re-attach (§6) simply re-subscribes to the events it keeps
 emitting. This is the single most valuable structural consequence of the move.
 
+> **Correction — "no sub-agent-specific code" was wrong, and it cost us the Codex half.**
+> Relocating the subtree is necessary but NOT sufficient. The processes do survive untouched, but the
+> successor hub still has to be *willing to drain* them: `SessionManager.attachWorker` only builds a replay
+> cursor for sessions the worker reports `active`, and everything else is set idle and never passed to
+> `executor.attach()`. `AgentWorker.listLive` hard-coded every Codex session to `idle`, so for a long time a
+> Codex turn crossing a restart kept running and kept buffering events in the worker while the hub silently
+> discarded that entire gap — no journal rows, no UI, chat sitting idle while the agent was still working.
+> The paragraph above is exactly why nobody noticed: it says the survival is free, so no one checked the one
+> line that gated it. Fixed by deriving Codex status from `activeTurns`. Claude was always correct here
+> because it derives from the driver's own `busy` flag.
+>
+> Verification status, stated plainly: the parent-turn survival path is proven end to end by
+> `pnpm accept:restart`. The **sub-agent** half of this claim is supported by code inspection (sub-agent
+> events carry `parent_tool_use_id` / `subagent_type` verbatim through the buffer and the replay) but is
+> **not** covered by any runtime test yet. Treat it as reasoned, not demonstrated, until that harness exists.
+
 ### 3.5 What the worker deliberately does NOT do
 
 No `Journal`, no `SessionStore`/`ProjectStore`/`AgentBus`/`MemoryStore`/`PracticeStore`/`InstructionStore`,
