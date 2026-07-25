@@ -16,6 +16,8 @@ import { AgentBus } from './bus.js'
 import { MemoryStore } from './memory.js'
 import { PracticeStore } from './practices.js'
 import type { DangerFlags, HubConfig } from './types.js'
+import { RestartController, type RestartState } from './restartController.js'
+import { SCHEMA_VERSION, type SupervisorMsg } from './restartHandshake.js'
 
 const repoRoot = path.resolve(import.meta.dirname, '..', '..', '..')
 
@@ -51,11 +53,24 @@ const autoMemoryRecall = config.features?.autoMemoryRecall !== false
 const danger: DangerFlags = {
   busCanUseRiskyTools: config.danger?.busCanUseRiskyTools === true,
   autoApprovePractices: config.danger?.autoApprovePractices === true,
+  autoApproveRestart: config.danger?.autoApproveRestart === true,
 }
 const sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, repoRoot)
 usage.setCodexReader((profileId) => sessions.readCodexLimits(profileId))
-sessions.boot()
-usage.startPolling()
+
+// --- Blue-green restart wiring (docs/agent-detachment-impl.md §1.6) --------------------------------
+// hubctl launches us with HUB_SUPERVISED=1 + an IPC channel. A booting "green" gets HUB_PORT=0
+// (ephemeral) and promotes to the fixed public port 7777 only after passing the supervisor's
+// health-check; an unsupervised standalone hub behaves exactly as before.
+const supervised = process.env.HUB_SUPERVISED === '1' && typeof process.send === 'function'
+const bootPort = Number(process.env.HUB_PORT ?? 7777)
+const publicPort = supervised ? 7777 : bootPort
+const isGreen = supervised && bootPort === 0
+const restartState: RestartState = { booted: false, draining: false, promoting: false, sockets: new Set() }
+
+sessions.boot({ reconcile: !isGreen }) // green defers stale-reconcile to promote (it doesn't own the port yet)
+if (!isGreen) usage.startPolling() //     green starts polling only once it owns the port (on promote)
+restartState.booted = true
 
 const profilesDir = path.join(repoRoot, 'profiles')
 function rescanProfiles(): typeof profiles {
@@ -69,7 +84,6 @@ function rescanProfiles(): typeof profiles {
   return profiles
 }
 
-const port = Number(process.env.HUB_PORT ?? 7777)
 // Device token — proof of an authorized device. Generated + persisted under data/. Enforcement
 // is opt-in (HUB_REQUIRE_TOKEN or config.security.requireToken) so local-only use is unaffected;
 // turn it on for fleet/remote exposure.
@@ -84,31 +98,80 @@ const requireToken =
 // no-ops cleanly when no node is present. Opt out with MESH_EXPOSE=0 or config.mesh.enable=false.
 // Exposure is to the owner's own fleet only (AllMyStuff sites need no cross-owner grant), and the
 // server's origin guard blocks browser drive-bys; a per-device token is the remaining hardening
-// (DESIGN D12/D13.1).
+// (DESIGN D12/D13.1). Advertises the PUBLIC port (a green boots ephemeral but promotes to 7777).
 const meshEnable = !(
   process.env.MESH_EXPOSE === '0' ||
   process.env.MESH_EXPOSE === 'false' ||
   config.mesh?.enable === false
 )
-const mesh = new MeshSite({ port, label: config.mesh?.label, enable: meshEnable })
-startServer({ port, defaultCwd: repoRoot, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken })
-journal.append(null, 'hub/started', {
-  port,
-  profiles: profiles.map((p) => ({ id: p.id, provider: p.provider })),
-  restoredSessions: sessions.list().length,
-})
-console.log(
-  `[hub] http://127.0.0.1:${port} — profiles: ${profiles.map((p) => `${p.id}(${p.provider})`).join(', ') || 'none found'} — sessions restored: ${sessions.list().length}`
-)
-console.log(`[hub] device token ${requireToken ? 'REQUIRED for /api + /ws' : 'not enforced (local)'} — pair remote devices from Settings → Mesh`)
+const mesh = new MeshSite({ port: publicPort, label: config.mesh?.label, enable: meshEnable })
 
-// Auto-register — self-detects the node and no-ops if it's absent or exposure is disabled.
-void mesh.register().then((s) => {
-  if (s.exposed) console.log(`[mesh] exposed as site "${s.label}" (${s.siteId}) — fleet peers open ${s.peerUrl}`)
-  else if (s.enabled && s.nodePresent) console.log(`[mesh] node present but not exposed — ${s.error ?? 'unknown'}`)
-  else if (s.enabled) console.log('[mesh] no AllMyStuff node on this machine — hub stays local-only')
-  journal.append(null, 'mesh/site', s)
+// Listen on the BOOT port (0 → ephemeral for a green); the server reports its actual port back.
+const server = startServer({ port: bootPort, defaultCwd: repoRoot, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken, restartState })
+
+// Register the mesh advert — factored so a promoted green can (re)register once it owns the port.
+function registerMesh(): void {
+  void mesh.register().then((s) => {
+    if (s.exposed) console.log(`[mesh] exposed as site "${s.label}" (${s.siteId}) — fleet peers open ${s.peerUrl}`)
+    else if (s.enabled && s.nodePresent) console.log(`[mesh] node present but not exposed — ${s.error ?? 'unknown'}`)
+    else if (s.enabled) console.log('[mesh] no AllMyStuff node on this machine — hub stays local-only')
+    journal.append(null, 'mesh/site', s)
+  })
+}
+
+server.once('listening', () => {
+  const actualPort = (server.address() as { port?: number } | null)?.port ?? bootPort
+  journal.append(null, 'hub/started', {
+    port: actualPort,
+    profiles: profiles.map((p) => ({ id: p.id, provider: p.provider })),
+    restoredSessions: sessions.list().length,
+  })
+  console.log(
+    `[hub] http://127.0.0.1:${actualPort} — profiles: ${profiles.map((p) => `${p.id}(${p.provider})`).join(', ') || 'none found'} — sessions restored: ${sessions.list().length}`
+  )
+  console.log(`[hub] device token ${requireToken ? 'REQUIRED for /api + /ws' : 'not enforced (local)'} — pair remote devices from Settings → Mesh`)
+  // Tell the supervisor we're up (report the ACTUAL port so it health-checks green's ephemeral port).
+  if (supervised && process.send) {
+    process.send({ type: 'ready', port: actualPort, restored: sessions.list().length, schemaVersion: SCHEMA_VERSION })
+  }
+  // Blue / standalone own the port at boot → advertise now. Green defers mesh to promote.
+  if (!isGreen) registerMesh()
 })
+
+// Under supervision, wire the restart handshake: the hub asks hubctl to flip; hubctl drives
+// drain/promote/retire back to us. onPromoted starts the services green deferred until it owns the port.
+if (supervised && process.send) {
+  const send = process.send.bind(process)
+  const controller = new RestartController({
+    server,
+    sessions,
+    journal,
+    state: restartState,
+    send,
+    onPromoted: () => {
+      usage.startPolling()
+      registerMesh()
+    },
+  })
+  sessions.setRestartSignal((reason, bySession) => send({ type: 'restart-request', reason, bySession }))
+  process.on('message', (msg: SupervisorMsg) => {
+    if (!msg || typeof msg !== 'object') return
+    switch (msg.type) {
+      case 'drain':
+        void controller.drain()
+        break
+      case 'promote':
+        controller.promote(msg.port)
+        break
+      case 'retire':
+        void controller.retire()
+        break
+      case 'restart-aborted':
+        controller.abort(msg.error)
+        break
+    }
+  })
+}
 
 // Best-effort: pull our site out of the node's exposed map on a clean exit so a stopped hub
 // doesn't linger as a dead advert. The node replaces the whole map, so deregister re-reads first.

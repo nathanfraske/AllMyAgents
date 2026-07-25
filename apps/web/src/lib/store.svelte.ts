@@ -883,6 +883,16 @@ class HubStore {
         }
         break
       }
+      case 'session/activity': {
+        // Real last-turn time backfilled for an imported chat (hub-side, on first history read). Apply
+        // it so the sidebar shows/sorts by real recency even across a refresh (this replays from seq 0).
+        const p = payload as { lastActivity?: string }
+        if (p.lastActivity) {
+          view.record.lastActivity = p.lastActivity
+          view.lastActivity = p.lastActivity
+        }
+        break
+      }
       case 'bus/sent': {
         // This session sent a message to a teammate / its project.
         const p = payload as { to?: { kind?: string; id?: string }; subject?: string | null; body?: string; recipients?: number }

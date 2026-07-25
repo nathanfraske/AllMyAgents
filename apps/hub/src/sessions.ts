@@ -116,7 +116,7 @@ export class SessionManager {
     }
   }
 
-  boot(): void {
+  boot(opts?: { reconcile?: boolean }): void {
     // Register the user's DEFAULT vendor homes (~/.claude, ~/.codex) as profiles so imported chats
     // that live there can bind + resume. Done at boot (not construction) so it's a deliberate,
     // idempotent startup step that also re-establishes the binding for persisted imports after a
@@ -125,14 +125,40 @@ export class SessionManager {
     // probes into the user's real ~/.claude or touches ~/.codex's token on a timer. The vendor
     // process is spawned against the home only when the user explicitly resumes an imported chat.
     this.registerDefaultHomes()
-    for (const record of this.store.all()) {
+    this.loadRecords()
+    // A booting GREEN hub (blue-green restart) passes reconcile:false and defers reconcileStale() to
+    // `promote` (once it owns the port) — otherwise it would flip a session blue is mid-turn on to idle
+    // in the shared store, racing blue's live turn (docs/agent-detachment-impl.md §4.2 #6).
+    if (opts?.reconcile !== false) this.reconcileStale()
+  }
+
+  /** Read-only: load persisted records into the roster. Marks nothing — safe for a booting green hub. */
+  loadRecords(): void {
+    for (const record of this.store.all()) this.sessions.set(record.id, record)
+  }
+
+  /** Flip any 'active'|'starting' record left by a crash/restart to 'idle' (its in-process turn is gone).
+   *  Runs only once this hub OWNS the port, so it never races another hub's live turn. Idempotent. */
+  reconcileStale(): void {
+    for (const record of this.sessions.values()) {
       if (record.status === 'active' || record.status === 'starting') {
         record.status = 'idle'
         this.journal.append(record.id, 'session/restored-stale', { note: 'hub restarted mid-turn' })
         this.store.upsert(record)
       }
-      this.sessions.set(record.id, record)
     }
+  }
+
+  // Injected from index.ts under supervision: ask the hubctl supervisor to blue-green restart. Null
+  // when unsupervised (standalone dev / a plain hub) — the restart tool/route then reports unavailable.
+  private restartSignal: ((reason: string, bySession?: string) => void) | null = null
+  setRestartSignal(fn: (reason: string, bySession?: string) => void): void {
+    this.restartSignal = fn
+  }
+  requestRestart(reason: string, bySession?: string): boolean {
+    if (!this.restartSignal) return false
+    this.restartSignal(reason, bySession)
+    return true
   }
 
   /** Add the default vendor homes to the profile map (id collisions with managed profiles lose). */
@@ -207,7 +233,10 @@ export class SessionManager {
           // ones to `error`. Exit carries no threadId — match by profile. (Journaled once, here.)
           if (kind === 'codex/exited') {
             this.journal.append(null, kind, payload)
-            this.failInFlightCodexSessions(profile.id, payload)
+            // A PLANNED retire (blue-green) kills our own codex child on purpose — don't mislabel its
+            // in-flight sessions as crashes (docs/agent-detachment-impl.md §4.2 #7). Phase 1 still loses
+            // the turn; we just don't emit a spurious session/error. (Phase 2's worker removes the kill.)
+            if (!this.retiring) this.failInFlightCodexSessions(profile.id, payload)
             return
           }
           const threadId = (payload as { threadId?: string } | null)?.threadId
@@ -423,6 +452,9 @@ export class SessionManager {
       if (lastTs) {
         record.lastActivity = lastTs
         this.persist(record)
+        // Journal it too, so the real last-turn time survives a page refresh (the WS replays this),
+        // not just the in-memory view update on open. Additive kind; old clients ignore it.
+        this.journal.append(record.id, 'session/activity', { lastActivity: lastTs })
       }
     }
     return page
@@ -783,7 +815,11 @@ export class SessionManager {
    * await, so they still land even if the caller's shutdown guard timer fires early; in-flight
    * Claude turns are interrupted concurrently. Best-effort and non-throwing.
    */
-  async shutdown(): Promise<void> {
+  // Set while a planned retire is tearing us down, so the codex/exited handler doesn't mislabel our
+  // own deliberately-killed children as crashes (see the codex client wiring above).
+  private retiring = false
+  async shutdown(opts?: { graceful?: boolean }): Promise<void> {
+    if (opts?.graceful) this.retiring = true
     for (const client of this.codexClients.values()) {
       try {
         client.stop()

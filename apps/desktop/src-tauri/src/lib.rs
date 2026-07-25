@@ -69,11 +69,11 @@ fn spawn_hub_dev() -> Option<Child> {
     // invoking it directly with std::process fails. On Unix we exec pnpm directly.
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("cmd");
-        c.args(["/C", "pnpm", "hub:dev"]);
+        c.args(["/C", "pnpm", "hubctl:dev"]);
         c
     } else {
         let mut c = Command::new("pnpm");
-        c.args(["hub:dev"]);
+        c.args(["hubctl:dev"]);
         c
     };
     cmd.current_dir(&repo_root);
@@ -81,7 +81,7 @@ fn spawn_hub_dev() -> Option<Child> {
     match cmd.spawn() {
         Ok(child) => {
             eprintln!(
-                "[desktop] spawned hub via `pnpm hub:dev` (pid {}) in {}",
+                "[desktop] spawned hub via `pnpm hubctl:dev` (pid {}) in {}",
                 child.id(),
                 repo_root.display()
             );
@@ -89,7 +89,7 @@ fn spawn_hub_dev() -> Option<Child> {
         }
         Err(e) => {
             eprintln!(
-                "[desktop] could not spawn hub ({e}); continuing. Run `pnpm hub:dev` yourself if the UI can't reach 127.0.0.1:7777."
+                "[desktop] could not spawn hub ({e}); continuing. Run `pnpm hubctl:dev` yourself if the UI can't reach 127.0.0.1:7777."
             );
             None
         }
@@ -322,7 +322,7 @@ fn release_boot(app: AppHandle, splash: Option<WebviewWindow>) {
     // codex adapter's `codex app-server` shell lookup resolves) and the bundled
     // Node dir (so the codex .bin shim's `node` fallback resolves).
     let bin_dir = dest_hub.join("node_modules").join(".bin");
-    let entry = dest_hub.join("dist").join("index.js");
+    let entry = dest_hub.join("dist").join("hubctl.js");
     let spawn = Command::new(&node_cmd)
         .arg(&entry)
         .current_dir(&home)

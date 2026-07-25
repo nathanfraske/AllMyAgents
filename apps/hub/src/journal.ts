@@ -15,6 +15,10 @@ export class Journal extends EventEmitter {
     fs.mkdirSync(path.dirname(file), { recursive: true })
     this.db = new Database(file)
     this.db.pragma('journal_mode = WAL')
+    // Two hub processes briefly share this DB during a blue-green restart (docs/agent-detachment-impl.md
+    // §4.3). WAL allows many readers + one writer, but with NO busy_timeout a concurrent writer throws
+    // SQLITE_BUSY immediately. Wait up to 5s so the sub-second flip window never surfaces a spurious error.
+    this.db.pragma('busy_timeout = 5000')
     this.db.exec(
       'CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, session TEXT, kind TEXT NOT NULL, payload TEXT NOT NULL)'
     )

@@ -17,6 +17,8 @@ import { pickFolder } from './native.js'
 import { computeStats } from './stats.js'
 import { startLogin, awaitLogin, credentialsExist } from './loginLauncher.js'
 import type { DangerFlags, HubEvent, Profile, Provider } from './types.js'
+import type { RestartState } from './restartController.js'
+import { SCHEMA_VERSION } from './restartHandshake.js'
 
 const PAGE = `<!doctype html>
 <html>
@@ -228,6 +230,9 @@ export interface ServerOptions {
   mesh: MeshSite
   deviceToken: string
   requireToken: boolean
+  /** Blue-green restart state (shared with RestartController): /api/health, the draining 503 guard,
+   *  live-socket tracking so a retire can free the port, and the promote EADDRINUSE gate. */
+  restartState: RestartState
 }
 
 // Merge the Danger Zone flags into data/config.json (preserving every other config key) so a toggle
@@ -242,7 +247,7 @@ function persistDanger(repoRoot: string, danger: DangerFlags): void {
     } catch {
       /* no config yet — start fresh */
     }
-    cfg.danger = { busCanUseRiskyTools: danger.busCanUseRiskyTools, autoApprovePractices: danger.autoApprovePractices }
+    cfg.danger = { busCanUseRiskyTools: danger.busCanUseRiskyTools, autoApprovePractices: danger.autoApprovePractices, autoApproveRestart: danger.autoApproveRestart === true }
     fs.mkdirSync(path.dirname(p), { recursive: true })
     fs.writeFileSync(p, JSON.stringify(cfg, null, 2))
   } catch {
@@ -251,7 +256,7 @@ function persistDanger(repoRoot: string, danger: DangerFlags): void {
 }
 
 export function startServer(opts: ServerOptions): http.Server {
-  const { port, defaultCwd, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken } = opts
+  const { port, defaultCwd, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken, restartState } = opts
   // Same location index.ts scans for profiles (repoRoot/profiles); defaultCwd is repoRoot.
   const profilesDir = path.join(defaultCwd, 'profiles')
 
@@ -290,6 +295,18 @@ export function startServer(opts: ServerOptions): http.Server {
       // Public probe so an unpaired client can learn whether pairing is required (never gated).
       if (method === 'GET' && url.pathname === '/api/auth') {
         json(res, { requireToken, authed })
+        return
+      }
+      // Public health probe — the supervisor health-checks a booting green hub with this before any
+      // port handoff. `boot:'complete'` only once sessions.boot() has run (restartState.booted).
+      if (method === 'GET' && url.pathname === '/api/health') {
+        json(res, {
+          boot: restartState.booted ? 'complete' : 'booting',
+          restoredSessions: sessions.list().length,
+          schemaVersion: SCHEMA_VERSION,
+          pid: process.pid,
+          port,
+        })
         return
       }
       // Device-token gate (opt-in). When on, every /api call must present a valid token.
@@ -456,9 +473,23 @@ export function startServer(opts: ServerOptions): http.Server {
         const body = await readBody(req)
         if (typeof body.busCanUseRiskyTools === 'boolean') danger.busCanUseRiskyTools = body.busCanUseRiskyTools
         if (typeof body.autoApprovePractices === 'boolean') danger.autoApprovePractices = body.autoApprovePractices
+        if (typeof body.autoApproveRestart === 'boolean') danger.autoApproveRestart = body.autoApproveRestart
         persistDanger(defaultCwd, danger)
         journal.append(null, 'config/danger', { ...danger })
         json(res, { ...danger })
+        return
+      }
+      // Operator "Restart hub" (Settings → Maintenance). The authenticated operator action IS the
+      // approval, so no gate here (the danger gate is only on the AGENT restart_hub tool). Forwards to
+      // the hubctl supervisor via the injected signal; 503 when unsupervised (plain/standalone hub).
+      if (method === 'POST' && url.pathname === '/api/restart') {
+        const body = await readBody(req)
+        const accepted = sessions.requestRestart(str(body.reason) || 'operator requested', undefined)
+        if (!accepted) {
+          json(res, { error: 'restart unavailable — hub is not running under the supervisor' }, 503)
+          return
+        }
+        json(res, { accepted: true }, 202)
         return
       }
       // Shared agent memory — operator view (all scopes unless ?scope=), and curate notes.
@@ -530,6 +561,12 @@ export function startServer(opts: ServerOptions): http.Server {
         return
       }
       if (method === 'POST' && url.pathname === '/api/sessions') {
+        // Don't let a create land on a hub that's retiring in a blue-green flip — it would spawn a
+        // vendor child about to be killed. The client retries against green after the ~sub-second flip.
+        if (restartState.draining) {
+          json(res, { error: 'restarting' }, 503)
+          return
+        }
         const body = await readBody(req)
         const pm = str(body.permissionMode)
         const record = await sessions.create(String(body.profileId ?? ''), {
@@ -660,8 +697,17 @@ export function startServer(opts: ServerOptions): http.Server {
     ws.on('close', () => journal.off('event', listener))
   })
 
+  // Track live sockets so a blue-green drain can destroy them and free the fixed port promptly (WS
+  // connections are long-lived and would otherwise keep the listener open). See RestartController.drain.
+  server.on('connection', (socket) => {
+    restartState.sockets.add(socket)
+    socket.on('close', () => restartState.sockets.delete(socket))
+  })
   server.on('error', (err: NodeJS.ErrnoException) => {
     if (err.code === 'EADDRINUSE') {
+      // During a promote re-listen the RestartController's own once('error') handler owns this (it
+      // signals promote-failed → the supervisor rolls back to blue). Don't also exit here.
+      if (restartState.promoting) return
       console.error(`[hub] port ${port} is already in use — is another hub instance running? (set HUB_PORT to override)`)
       process.exit(1)
     }

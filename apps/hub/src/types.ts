@@ -161,12 +161,16 @@ export interface DangerConfig {
    * on operator approval. Writes to the agent's own account scope are always immediate regardless.
    */
   autoApprovePractices?: boolean
+  // default OFF → restart_hub waits on operator approval
+  autoApproveRestart?: boolean
 }
 
 /** Resolved Danger Zone flags (both always present; index.ts fills defaults from DangerConfig). */
 export interface DangerFlags {
   busCanUseRiskyTools: boolean
   autoApprovePractices: boolean
+  // default OFF → restart_hub waits on operator approval
+  autoApproveRestart?: boolean
 }
 
 export interface HubConfig {

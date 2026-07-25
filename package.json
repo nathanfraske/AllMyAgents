@@ -6,6 +6,7 @@
   "packageManager": "pnpm@10.14.0",
   "scripts": {
     "hub:dev": "pnpm --filter hub dev",
+    "hubctl:dev": "pnpm --filter hub hubctl:dev",
     "hub:typecheck": "pnpm --filter hub typecheck",
     "hub:build": "pnpm --filter hub build",
     "hub:bundle": "node scripts/bundle-hub.mjs",
