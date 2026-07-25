@@ -1014,11 +1014,37 @@ class HubStore {
    * one path that puts agent output on screen. If it is retried, it needs a real test around the flush,
    * not just a code read.
    */
+  private pendingEvents: HubEvent[] = []
+  private flushScheduled = false
+
   private ingest(event: HubEvent): void {
-    try {
-      this.apply(event)
-    } catch (err) {
-      console.error('[store] failed to apply event', event?.kind, event?.seq, err)
+    this.pendingEvents.push(event)
+    if (this.flushScheduled) return
+    this.flushScheduled = true
+    queueMicrotask(() => this.flushEvents())
+  }
+
+  /**
+   * Apply every buffered event in one pass. Public only so a test can drive the flush deterministically
+   * instead of racing a microtask.
+   *
+   * Order is preserved exactly (FIFO), and each event is applied in ISOLATION: the batch has already
+   * been dequeued, so one throwing event must not swallow the ones behind it. That isolation is not
+   * theoretical caution — when batching first landed without it, a chat's tool calls and thinking blocks
+   * silently stopped rendering while the journal kept recording them perfectly. (The eventual culprit
+   * that time was a stale wseq guard in the hub, fixed in 7491428 — the batching was innocent, which is
+   * why it is back. But the isolation stays.)
+   */
+  flushEvents(): void {
+    this.flushScheduled = false
+    const batch = this.pendingEvents
+    this.pendingEvents = []
+    for (const ev of batch) {
+      try {
+        this.apply(ev)
+      } catch (err) {
+        console.error('[store] failed to apply event', ev?.kind, ev?.seq, err)
+      }
     }
   }
 

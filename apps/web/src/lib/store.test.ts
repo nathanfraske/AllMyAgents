@@ -512,3 +512,43 @@ describe('restore offer (persist / hydrate / restore)', () => {
     expect(store.restorableLayout).toBeNull()
   })
 })
+
+// Opening a chat after a refresh used to visibly REPLAY the transcript — you watched it build itself
+// line by line down to the bottom. Journal events arrive one WebSocket message at a time, so a
+// reconnect applied the whole backlog as hundreds of separate ticks: a render and a re-scroll PER
+// EVENT. Batching collapses each burst into one pass. These tests pin the two properties that matter,
+// because the first attempt at this shipped without them and got blamed for an unrelated outage.
+describe('event batching (replay does not render frame-by-frame)', () => {
+  const ingest = (e: HubEvent): void => {
+    ;(store as unknown as { ingest(x: HubEvent): void }).ingest(e)
+  }
+  const flush = (): void => {
+    ;(store as unknown as { flushEvents(): void }).flushEvents()
+  }
+
+  it('buffers instead of applying immediately, then applies the whole batch in order', () => {
+    ingest(evt({ seq: 1, kind: 'session/created', sessionId: 's1', payload: rec('s1') }))
+    ingest(evt({ seq: 2, kind: 'session/input', sessionId: 's1', payload: { text: 'first' } }))
+    ingest(evt({ seq: 3, kind: 'session/input', sessionId: 's1', payload: { text: 'second' } }))
+    // Nothing applied yet — that is the whole point: one render, not three.
+    expect(store.sessions.s1).toBeUndefined()
+
+    flush()
+
+    const items = store.sessions.s1?.items ?? []
+    const texts = items.filter((i) => i.kind === 'user').map((i) => i.text)
+    expect(texts).toEqual(['first', 'second']) // strict FIFO, no reordering, nothing dropped
+  })
+
+  it('one throwing event cannot swallow the events behind it in the same batch', () => {
+    ingest(evt({ seq: 1, kind: 'session/created', sessionId: 's1', payload: rec('s1') }))
+    // A payload shape the handler will choke on, sandwiched between two good events.
+    ingest(evt({ seq: 2, kind: 'session/input', sessionId: 's1', payload: null }))
+    ingest(evt({ seq: 3, kind: 'session/input', sessionId: 's1', payload: { text: 'survivor' } }))
+
+    flush()
+
+    const texts = (store.sessions.s1?.items ?? []).filter((i) => i.kind === 'user').map((i) => i.text)
+    expect(texts).toContain('survivor')
+  })
+})
