@@ -854,19 +854,40 @@ all eight checks must pass:
 session events each; all eight green. The turn ran to completion on the successor hub with its full output
 intact, having started on the predecessor. Flag-off (in-process) remains byte-identical (195 hub tests).
 
-### Testing it on the desktop app
+### PROVEN IN PRODUCTION — on the live install, by the agent it happened to
 
-The harness above IS the real supervisor+worker+hub stack; the desktop app only adds the Tauri UI shell on
-top and runs on the fixed port 7777 against the real data dir. `desktop/src-tauri/src/lib.rs` spawns hubctl
-via `pnpm hubctl:dev` (dev) / bundled `dist/hubctl.js` (release), and Rust's `Command` inherits the parent
-environment — so worker mode is enabled by launching the app with **`HUB_WORKER=1`** set (no code change).
-To watch survival live in the app:
+On 2026-07-25 this ran for real: a Claude agent working **inside** the app requested a restart of the hub
+hosting it, kept working, and reported the result from the far side of the flip **in the same turn**. Not a
+harness — the operator's live hub on 7777, its real 34-session journal, and a real conversation.
 
-1. Launch the desktop app with `HUB_WORKER=1` in its environment (the hubctl it spawns picks it up; the log
-   line `spawning agent worker` confirms worker mode).
-2. Start a long turn in any chat (ask for a long essay, or a task with several tool steps).
-3. While it's streaming, trigger a restart (Settings → restart, or `POST /api/restart`).
-4. The chat keeps streaming across the ~sub-second flip and finishes normally — the turn survived.
+```
+hubctl (42936)
+├── worker (5860)   ← held the turn; the agent's runtime is a child of THIS
+└── hub    (22760 -> 24144)   ← replaced underneath it
+```
 
-Flipping `HUB_WORKER` **on by default** in the desktop spawn is the alpha step (it ships ON for alpha per
-`docs/alpha-release-plan.md`); until then it's opt-in via the env so flag-off stays the safe, proven default.
+Observed:
+
+| Signal | Result |
+| --- | --- |
+| Flip | hub pid `22760 → 24144`, port 7777, 34 sessions restored |
+| Observable downtime | **~0 ms** — 0 failed health polls across the hand-off |
+| The agent's own session, immediately after | `status=active` — still mid-turn, on a hub seconds old |
+| Hub-served MCP tools after the flip | `list_agents` returned normally (worker relay lane re-attached to green) |
+| Journal straddle (one turn, two hubs) | **118** events journaled by the old hub, **49** by the new one |
+| Exactly-once | wseq `2..165` across **164** events — contiguous, **0 duplicates** |
+
+The wseq line is the load-bearing one: gap-free *and* duplicate-free numbering across the swap is the
+§7.1 invariant (and every fix the audits produced — F1/F2/F3, N1, the servedWrites generation) holding
+under a real restart rather than a simulated one.
+
+**Worker mode now ships ON by default** in the desktop spawn (`desktop/src-tauri/src/lib.rs`,
+`hub_worker_flag()`, both dev and bundled paths), per `docs/alpha-release-plan.md`. `HUB_WORKER=0` opts
+out. The one caveat: worker mode is entered when **hubctl starts** — a running hub cannot grow a worker —
+so the first launch after enabling it is necessarily a cold restart. `scripts/relaunch-worker.mjs`
+performs that one-time transition safely from outside the hub's process tree (with a rehearsal in
+`scripts/rehearse-worker-boot.mjs` and an automatic fallback to the previous launch shape).
+
+**What this unlocks:** the dogfooding paradox is broken. The hub can now be repaired, updated, and
+restarted *while it is being used*, without killing the agents doing the work — including the agent doing
+the repair.
