@@ -9,40 +9,18 @@ import type { ProjectStore } from './projects.js'
 import type { SessionStore } from './store.js'
 import type { UsageMonitor } from './usage.js'
 import type { WorkspaceManager } from './workspace.js'
-import type { ClaudeLimitInfo, Profile, Provider, SessionRecord, SessionStatus } from './types.js'
-import { ClaudeDriver } from './adapters/claude.js'
-import { CodexClient, mapCodexTokenUsage } from './adapters/codex.js'
+import type { Profile, Provider, SessionRecord, SessionStatus } from './types.js'
 import { writeManagedInstructions, agentContract } from './instructions.js'
 import type { InstructionStore } from './instructions.js'
 import { identityOf, readableScopes } from './identity.js'
-import { buildAgentMcpServer, type AgentServices } from './agentTools.js'
 import type { AgentBus, BusAddress, BusMessage } from './bus.js'
 import type { MemoryStore } from './memory.js'
 import type { PracticeStore } from './practices.js'
 import type { DangerFlags } from './types.js'
+import { InProcessExecutor, type Executor, type InProcessExecutorHubHooks } from './executor.js'
+import type { WorkerSessionSpec } from './workerProtocol.js'
 import { deriveTitle, sanitizeTitle } from './title.js'
 import { discoverImportableChats, importKey, type ImportableChat, type ScanResult } from './importScan.js'
-
-// The in-process agent tools (`mcp__allmyagents__*`) split by risk. SAFE tools are auto-allowed in
-// canUseTool (bus + memory reads/writes + practice reads — all ACL-enforced in-tool). SELF-GATING
-// tools (practice writes above account scope, and later hook_propose) are NOT auto-allowed: their
-// handlers self-gate by awaiting the operator (see agentTools.ts), which fires even under `full`
-// where canUseTool is skipped entirely. Any allmyagents tool in neither set falls through to the
-// generic approval gate — a safe default for a future tool that hasn't been classified yet.
-const AUTO_ALLOW_TOOLS = new Set([
-  'mcp__allmyagents__list_agents',
-  'mcp__allmyagents__send_message',
-  'mcp__allmyagents__read_messages',
-  'mcp__allmyagents__memory_write',
-  'mcp__allmyagents__memory_search',
-  'mcp__allmyagents__memory_read',
-  'mcp__allmyagents__practice_read',
-  'mcp__allmyagents__practice_list',
-])
-const SELF_GATING_TOOLS = new Set([
-  'mcp__allmyagents__practice_write',
-  'mcp__allmyagents__practice_edit',
-])
 
 export interface CreateOptions {
   cwd?: string
@@ -66,18 +44,13 @@ export interface TurnOverride {
 
 export class SessionManager {
   private readonly sessions = new Map<string, SessionRecord>()
-  private readonly claudeDrivers = new Map<string, ClaudeDriver>()
-  private readonly codexClients = new Map<string, CodexClient>()
-  private readonly codexThreads = new Map<string, string>()
   // Per-session set of memory ids already auto-recalled into context, so the same memory isn't
   // re-injected turn after turn (automatic recall; gated by autoMemoryRecall).
   private readonly recalledIds = new Map<string, Set<string>>()
-  // Sessions whose CURRENT in-flight turn was caused by a (semi-trusted) teammate bus message. A
-  // turn is single-flight per session, so this is an accurate "this session's live turn is
-  // bus-caused" flag for the whole window a tool handler can run in. Toggled by runClaudeTurn /
-  // runCodexTurn via their `origin` param; read by the self-gate + canUseTool to hard-deny risky
-  // in-process tools on bus turns (unless danger.busCanUseRiskyTools).
-  private readonly busTurnSessions = new Set<string>()
+  // Agent execution — the ClaudeDriver / CodexClient children, the per-turn loops, and the in-process
+  // agent MCP server — lives behind this seam (docs/agent-worker-impl.md §4.1). In-process by default;
+  // a future WorkerExecutor runs the same execution in a supervised sibling with an identical contract.
+  private readonly executor: Executor
 
   constructor(
     private readonly journal: Journal,
@@ -95,24 +68,89 @@ export class SessionManager {
     // POST /api/config/danger, so the gating code below always reads the current values).
     private readonly danger: DangerFlags,
     private readonly autoMemoryRecall: boolean,
-    private readonly defaultCwd: string
-  ) {}
+    private readonly defaultCwd: string,
+    // The execution seam. Optional: defaults to an in-process executor built from this manager's own
+    // services, so existing callers/tests are unchanged; index.ts injects one explicitly.
+    executor?: Executor
+  ) {
+    this.executor =
+      executor ??
+      new InProcessExecutor({
+        approvals: this.approvals,
+        usage: this.usage,
+        danger: this.danger,
+        memory: this.memory,
+        practices: this.practices,
+      })
+    // Bind the hub-half side effects the in-process executor performs inline while driving a turn.
+    // (A non-in-process executor drives these itself via its event streams, so it needs no binding.)
+    if (this.executor instanceof InProcessExecutor) this.executor.bindHub(this.buildHubHooks())
+  }
 
-  // Capabilities the per-session agent MCP tools (inter-agent bus + shared memory + practices) call
-  // into. Built on demand (after construction, so this.memory/this.practices are set); every method
-  // takes the caller's id, which the hub — not the agent — supplies, so a tool call is always
-  // attributed + scope-checked. requireApproval/isBusTurn/danger/journal power the gate-live self-gate.
-  private agentServices(): AgentServices {
+  /**
+   * The hub-half side effects the in-process executor calls back into as it drives a turn
+   * (docs/agent-worker-impl.md §4.1): status transitions, vendor-session persistence, memory recall,
+   * journal writes, bus delivery, and codex-exit handling all stay hub-side — the executor invokes
+   * them by session id. This is the in-process analogue of the worker→hub lifecycle/event streams.
+   */
+  private buildHubHooks(): InProcessExecutorHubHooks {
     return {
-      send: (from, to, subject, body) => this.busSend(from.sessionId, to, subject, body),
-      inbox: (sessionId) => this.busInbox(sessionId),
-      roster: (sessionId) => this.busRoster(sessionId),
-      memory: this.memory,
-      practices: this.practices,
-      requireApproval: (id, kind, payload) => this.approvals.request(id.sessionId, kind, payload),
-      isBusTurn: (sessionId) => this.busTurnSessions.has(sessionId),
-      danger: () => this.danger,
       journal: (sessionId, kind, payload) => this.journal.append(sessionId, kind, payload),
+      setStatus: (sessionId, status) => {
+        const record = this.sessions.get(sessionId)
+        if (record) {
+          this.setStatus(record, status)
+          return
+        }
+        // Session deleted mid-turn: the pre-seam turn loop still held the record object and ran
+        // setStatus on it, which journaled session/status (persist + deliverBus both no-op once the
+        // session is gone from the roster). Preserve exactly that trailing event so a delete-during-turn
+        // is byte-identical.
+        this.journal.append(sessionId, 'session/status', { status })
+        if (status === 'idle') setImmediate(() => this.deliverBus(sessionId))
+      },
+      persistVendorSessionId: (sessionId, vendorSessionId) => {
+        const record = this.sessions.get(sessionId)
+        if (record) {
+          record.vendorSessionId = vendorSessionId
+          this.persist(record)
+        }
+      },
+      recall: (sessionId, prompt) => {
+        const record = this.sessions.get(sessionId)
+        return record ? this.withRecall(record, prompt) : prompt
+      },
+      onCodexExit: (profileId, payload) => {
+        // A PLANNED retire (blue-green) kills our own codex child on purpose — don't mislabel its
+        // in-flight sessions as crashes (docs/agent-detachment-impl.md §4.2 #7). Phase 1 still loses
+        // the turn; we just don't emit a spurious session/error. (Phase 2's worker removes the kill.)
+        if (!this.retiring) this.failInFlightCodexSessions(profileId, payload)
+      },
+      busSend: (fromSessionId, to, subject, body) => this.busSend(fromSessionId, to, subject, body),
+      busInbox: (sessionId) => this.busInbox(sessionId),
+      busRoster: (sessionId) => this.busRoster(sessionId),
+    }
+  }
+
+  /** The subset of a record the executor's driver needs (docs/agent-worker-impl.md §1.1). Built from the
+   *  record + resolved profile; label matches identityOf(record) so the worker/executor reconstructs the
+   *  same SessionIdentity for MCP attribution. */
+  private specOf(record: SessionRecord): WorkerSessionSpec {
+    const profile = this.profileOf(record)
+    return {
+      sessionId: record.id,
+      provider: record.provider,
+      profileId: record.profileId,
+      profileDir: profile.dir,
+      cwd: record.cwd,
+      worktree: record.worktree,
+      projectId: record.projectId,
+      label: identityOf(record).label,
+      model: record.model,
+      effort: record.effort,
+      serviceTier: record.serviceTier,
+      permissionMode: record.permissionMode,
+      vendorSessionId: record.vendorSessionId,
     }
   }
 
@@ -202,121 +240,6 @@ export class SessionManager {
     return profile
   }
 
-  private checkWriteScope(record: SessionRecord, toolName: string, input: unknown): string | undefined {
-    if (!record.worktree) return undefined
-    if (!['Write', 'Edit', 'NotebookEdit'].includes(toolName)) return undefined
-    const filePath = (input as { file_path?: string } | null)?.file_path
-    if (!filePath) return undefined
-    const resolved = path.resolve(record.cwd, filePath).toLowerCase()
-    const root = record.worktree.toLowerCase()
-    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
-      return `write to ${filePath} is outside this session's worktree (${record.worktree}) — use a path inside the worktree`
-    }
-    return undefined
-  }
-
-  private sessionForThread(threadId: string): SessionRecord | undefined {
-    for (const [sessionId, tid] of this.codexThreads) {
-      if (tid === threadId) return this.sessions.get(sessionId)
-    }
-    return undefined
-  }
-
-  private codexClientFor(profile: Profile): CodexClient {
-    let client = this.codexClients.get(profile.id)
-    if (!client) {
-      client = new CodexClient(
-        profile.dir,
-        (kind, payload) => {
-          // The app-server child died: any codex session on this profile that was mid-turn will
-          // never get its turn/completed and would hang in `active` forever, so flip the in-flight
-          // ones to `error`. Exit carries no threadId — match by profile. (Journaled once, here.)
-          if (kind === 'codex/exited') {
-            this.journal.append(null, kind, payload)
-            // A PLANNED retire (blue-green) kills our own codex child on purpose — don't mislabel its
-            // in-flight sessions as crashes (docs/agent-detachment-impl.md §4.2 #7). Phase 1 still loses
-            // the turn; we just don't emit a spurious session/error. (Phase 2's worker removes the kill.)
-            if (!this.retiring) this.failInFlightCodexSessions(profile.id, payload)
-            return
-          }
-          const threadId = (payload as { threadId?: string } | null)?.threadId
-          const record = threadId ? this.sessionForThread(threadId) : undefined
-          this.journal.append(record?.id ?? null, kind, payload)
-          if (record && kind === 'codex/turn/completed') this.setStatus(record, 'idle')
-          // Forward the app-server's token-usage notifications to the UI's live counter. The raw
-          // `codex/thread/tokenUsage/updated` event is still journaled above for field verification.
-          if (record && kind === 'codex/thread/tokenUsage/updated') {
-            const tokens = mapCodexTokenUsage(payload)
-            if (tokens) this.journal.append(record.id, 'session/tokens', tokens)
-          }
-        },
-        async (method, params) => {
-          const threadId = (params as { threadId?: string } | null)?.threadId
-          const record = threadId ? this.sessionForThread(threadId) : undefined
-          const approved = await this.approvals.request(record?.id ?? 'unattributed', `codex/${method}`, params)
-          return approved ? { decision: 'accept' } : { decision: 'decline' }
-        }
-      )
-      this.codexClients.set(profile.id, client)
-    }
-    return client
-  }
-
-  private claudeDriverFor(record: SessionRecord): ClaudeDriver {
-    let driver = this.claudeDrivers.get(record.id)
-    if (!driver) {
-      const profile = this.profileOf(record)
-      driver = new ClaudeDriver(
-        profile.dir,
-        record.cwd,
-        (kind, payload) => {
-          this.journal.append(record.id, kind, payload)
-          if (kind === 'claude/rate_limit_event') {
-            const info = (payload as { rate_limit_info?: ClaudeLimitInfo }).rate_limit_info
-            if (info) this.usage.noteClaude(record.profileId, info)
-          } else if (kind === 'claude/result') {
-            const cost = (payload as { total_cost_usd?: number }).total_cost_usd
-            this.usage.noteClaudeCost(record.profileId, cost)
-          }
-        },
-        async (toolName, input) => {
-          // The hub's own SAFE agent tools (inter-agent bus + shared memory reads/writes + practice
-          // reads) are ACL-enforced in-tool; gating them behind human approval would defeat
-          // autonomous coordination.
-          if (AUTO_ALLOW_TOOLS.has(toolName)) return { behavior: 'allow', updatedInput: input }
-          // RISKY in-process tools (practice writes above account scope; later hook_propose) are not
-          // auto-allowed. They self-gate inside their own handler (works even under `full`, where
-          // this callback is skipped). Here — the non-`full` path — we add a second, independent
-          // barrier: hard-deny on a bus turn (unless the owner opted in), else allow and defer the
-          // authoritative operator decision to the handler's own requireApproval (so there's a
-          // single prompt, not two).
-          if (SELF_GATING_TOOLS.has(toolName)) {
-            if (this.busTurnSessions.has(record.id) && !this.danger.busCanUseRiskyTools) {
-              this.journal.append(record.id, 'approval/auto-denied-bus', { toolName })
-              return { behavior: 'deny', message: 'a turn caused by a teammate (bus) message may not write practices' }
-            }
-            return { behavior: 'allow', updatedInput: input }
-          }
-          const scopeError = this.checkWriteScope(record, toolName, input)
-          if (scopeError) {
-            this.journal.append(record.id, 'approval/auto-denied-scope', { toolName, reason: scopeError })
-            return { behavior: 'deny', message: scopeError }
-          }
-          const approved = await this.approvals.request(record.id, 'claude/tool', { toolName, input })
-          return approved
-            ? { behavior: 'allow', updatedInput: input }
-            : { behavior: 'deny', message: 'denied from hub' }
-        },
-        // Per-session in-process MCP server: the inter-agent bus + shared-memory tools, bound to
-        // this session's identity so every call is attributed to the real caller.
-        { allmyagents: buildAgentMcpServer(identityOf(record), this.agentServices()) }
-      )
-      if (record.vendorSessionId) driver.restore(record.vendorSessionId)
-      this.claudeDrivers.set(record.id, driver)
-    }
-    return driver
-  }
-
   async create(profileId: string, opts: CreateOptions): Promise<SessionRecord> {
     const profile = this.profiles.get(profileId)
     if (!profile) throw new Error(`unknown profile: ${profileId}`)
@@ -380,17 +303,16 @@ export class SessionManager {
     }
 
     if (profile.provider === 'claude') {
-      this.claudeDriverFor(record)
       this.setStatus(record, 'idle')
-      if (opts.prompt) void this.runClaudeTurn(record, opts.prompt)
+      // The executor builds the driver lazily on this first runTurn (driver construction has no
+      // observable side effect, so lazy-vs-eager is invisible). Fire-and-forget, as before.
+      if (opts.prompt) void this.executor.runTurn(this.specOf(record), opts.prompt, 'operator')
     } else {
-      const client = this.codexClientFor(profile)
-      const threadId = await client.startThread(cwd)
-      this.codexThreads.set(id, threadId)
+      const threadId = await this.executor.startThread(this.specOf(record))
       record.vendorSessionId = threadId
       this.persist(record)
       this.setStatus(record, 'idle')
-      if (opts.prompt) await this.runCodexTurn(record, opts.prompt)
+      if (opts.prompt) await this.executor.runTurn(this.specOf(record), opts.prompt, 'operator')
     }
     return record
   }
@@ -539,75 +461,6 @@ export class SessionManager {
     return `<<RECALLED FROM MEMORY — relevant notes you or a teammate saved earlier; use if helpful>>\n${block}\n<<END RECALLED>>\n\n${prompt}`
   }
 
-  private async runClaudeTurn(
-    record: SessionRecord,
-    prompt: string,
-    permissionMode = record.permissionMode,
-    origin: 'operator' | 'bus' = 'operator'
-  ): Promise<void> {
-    const driver = this.claudeDriverFor(record)
-    this.setStatus(record, 'active')
-    // Tag the in-flight turn's provenance so risky in-process tool handlers can hard-deny on a
-    // bus (teammate-message-caused) turn. Cleared in finally, so the flag is scoped to this turn.
-    if (origin === 'bus') this.busTurnSessions.add(record.id)
-    try {
-      await driver.send(this.withRecall(record, prompt), { model: record.model, permissionMode, effort: record.effort })
-      if (driver.sessionId) {
-        record.vendorSessionId = driver.sessionId
-        this.persist(record)
-      }
-      this.setStatus(record, 'idle')
-    } catch (err) {
-      this.journal.append(record.id, 'session/error', {
-        message: err instanceof Error ? err.message : String(err),
-      })
-      this.setStatus(record, 'error')
-    } finally {
-      this.busTurnSessions.delete(record.id)
-    }
-  }
-
-  private async ensureCodexThread(record: SessionRecord): Promise<{ client: CodexClient; threadId: string }> {
-    const client = this.codexClientFor(this.profileOf(record))
-    let threadId = this.codexThreads.get(record.id)
-    if (!threadId) {
-      if (!record.vendorSessionId) throw new Error('codex session has no persisted thread id')
-      await client.resumeThread(record.vendorSessionId)
-      threadId = record.vendorSessionId
-      this.codexThreads.set(record.id, threadId)
-      this.journal.append(record.id, 'session/thread-resumed', { threadId })
-    }
-    return { client, threadId }
-  }
-
-  private async runCodexTurn(
-    record: SessionRecord,
-    prompt: string,
-    permissionMode = record.permissionMode,
-    origin: 'operator' | 'bus' = 'operator'
-  ): Promise<void> {
-    this.setStatus(record, 'active')
-    // Same bus-turn provenance tag as runClaudeTurn (Codex has no MCP tools yet, but tagging both
-    // paths uniformly keeps the self-gate correct if/when Codex gains risky in-process tools).
-    if (origin === 'bus') this.busTurnSessions.add(record.id)
-    try {
-      const { client, threadId } = await this.ensureCodexThread(record)
-      await client.sendTurn(threadId, this.withRecall(record, prompt), {
-        model: record.model,
-        effort: record.effort,
-        serviceTier: record.serviceTier,
-        approvalPolicy: permissionMode === 'full' ? 'never' : permissionMode ? 'onRequest' : undefined,
-      })
-    } catch (err) {
-      this.journal.append(record.id, 'session/error', {
-        message: err instanceof Error ? err.message : String(err),
-      })
-      this.setStatus(record, 'error')
-    } finally {
-      this.busTurnSessions.delete(record.id)
-    }
-  }
-
   async send(sessionId: string, text: string, override: TurnOverride = {}): Promise<void> {
     const record = this.sessions.get(sessionId)
     if (!record) throw new Error(`unknown session: ${sessionId}`)
@@ -622,10 +475,10 @@ export class SessionManager {
     this.journal.append(sessionId, 'session/input', { text })
     this.autoTitle(record, text)
     if (record.provider === 'claude') {
-      if (this.claudeDrivers.get(sessionId)?.busy) throw new Error('a turn is already in progress')
-      void this.runClaudeTurn(record, text)
+      if (this.executor.isBusy(sessionId)) throw new Error('a turn is already in progress')
+      void this.executor.runTurn(this.specOf(record), text, 'operator')
     } else {
-      await this.runCodexTurn(record, text)
+      await this.executor.runTurn(this.specOf(record), text, 'operator')
     }
   }
 
@@ -633,8 +486,7 @@ export class SessionManager {
     const record = this.sessions.get(sessionId)
     if (!record) throw new Error(`unknown session: ${sessionId}`)
     if (record.provider !== 'codex') throw new Error('steering is only supported for Codex sessions')
-    const { client, threadId } = await this.ensureCodexThread(record)
-    await client.steer(threadId, text)
+    await this.executor.steer(sessionId, text)
     this.journal.append(sessionId, 'session/steered', { text })
   }
 
@@ -733,7 +585,7 @@ export class SessionManager {
   private deliverBus(sessionId: string): void {
     const record = this.sessions.get(sessionId)
     if (!record || record.status !== 'idle') return
-    if (record.provider === 'claude' && this.claudeDrivers.get(sessionId)?.busy) return
+    if (record.provider === 'claude' && this.executor.isBusy(sessionId)) return
     const pending = this.bus.pending(sessionId)
     if (!pending.length) return
     this.bus.markDelivered(pending.map((m) => m.id))
@@ -747,22 +599,17 @@ export class SessionManager {
       })
     }
     const framed = frameBusMessages(pending)
-    const clamped = clampMode(record.permissionMode)
     // origin: 'bus' tags the turn so risky in-process tools self-gate (hard-deny) — a teammate
-    // message is semi-trusted and must never drive a practice/hook write on its own.
-    if (record.provider === 'claude') void this.runClaudeTurn(record, framed, clamped, 'bus')
-    else void this.runCodexTurn(record, framed, clamped, 'bus')
+    // message is semi-trusted and must never drive a practice/hook write on its own. The clamped
+    // permission mode rides in the spec (a bus-triggered turn never inherits full/bypass).
+    const spec = { ...this.specOf(record), permissionMode: clampMode(record.permissionMode) }
+    void this.executor.runTurn(spec, framed, 'bus')
   }
 
   async interrupt(sessionId: string): Promise<void> {
     const record = this.sessions.get(sessionId)
     if (!record) throw new Error(`unknown session: ${sessionId}`)
-    if (record.provider === 'claude') {
-      await this.claudeDrivers.get(sessionId)?.interrupt()
-    } else {
-      const threadId = this.codexThreads.get(sessionId)
-      if (threadId) await this.codexClientFor(this.profileOf(record)).interrupt(threadId)
-    }
+    await this.executor.interrupt(sessionId)
     this.journal.append(sessionId, 'session/interrupted', {})
   }
 
@@ -791,11 +638,11 @@ export class SessionManager {
     await this.stop(sessionId).catch(() => undefined)
     // 2. Tombstone the session in the append-only journal.
     this.journal.append(sessionId, 'session/deleted', { id: sessionId })
-    // 3. Drop it from the in-memory maps so list() no longer returns it. codexClients is keyed by
-    //    profile and shared across sessions, so it is deliberately left intact.
+    // 3. Drop it from the roster so list() no longer returns it, and from the executor (its driver /
+    //    codex thread). The executor's codexClients map is keyed by profile + shared across sessions,
+    //    so it is deliberately left intact — only this session's driver/thread is dropped.
     this.sessions.delete(sessionId)
-    this.claudeDrivers.delete(sessionId)
-    this.codexThreads.delete(sessionId)
+    await this.executor.stopSession(sessionId)
     // 4. Remove it from the persisted snapshot so a hub restart doesn't resurrect it.
     this.store.remove(sessionId)
     return { ok: true }
@@ -804,30 +651,26 @@ export class SessionManager {
   readCodexLimits(profileId: string): Promise<unknown> {
     const profile = this.profiles.get(profileId)
     if (!profile) throw new Error(`unknown profile: ${profileId}`)
-    return this.codexClientFor(profile).readRateLimits()
+    return this.executor.readCodexLimits(profileId, profile.dir)
   }
 
   /**
-   * Global kill-switch: stop every vendor child process this hub spawned — the long-lived Codex
+   * Global kill-switch: stop every vendor child process the executor spawned — the long-lived Codex
    * `app-server` children (one per profile) and any in-flight Claude query subprocess — so a
    * standalone hub stop (SIGINT/SIGTERM) doesn't orphan them (Windows has no job-object
-   * kill-on-parent-death). The Codex kills are dispatched synchronously here, before the first
-   * await, so they still land even if the caller's shutdown guard timer fires early; in-flight
-   * Claude turns are interrupted concurrently. Best-effort and non-throwing.
+   * kill-on-parent-death). In-process the executor owns those children, so the hub delegates to
+   * InProcessExecutor.shutdownVendors (which dispatches the Codex kills synchronously — before its
+   * first await — so they land even if the caller's shutdown guard timer fires early, and interrupts
+   * in-flight Claude turns concurrently). Best-effort and non-throwing.
    */
-  // Set while a planned retire is tearing us down, so the codex/exited handler doesn't mislabel our
-  // own deliberately-killed children as crashes (see the codex client wiring above).
+  // Set while a planned retire is tearing us down, so the codex/exited handler (onCodexExit hook)
+  // doesn't mislabel our own deliberately-killed children as crashes.
   private retiring = false
   async shutdown(opts?: { graceful?: boolean }): Promise<void> {
     if (opts?.graceful) this.retiring = true
-    for (const client of this.codexClients.values()) {
-      try {
-        client.stop()
-      } catch {
-        /* best-effort teardown — one child's failure must not block the others */
-      }
-    }
-    await Promise.allSettled([...this.claudeDrivers.values()].map((driver) => driver.interrupt()))
+    // A non-in-process executor keeps its vendor children alive across a hub stop by design (that is
+    // the whole point of the worker), so there is nothing for the hub to tear down in that mode.
+    if (this.executor instanceof InProcessExecutor) await this.executor.shutdownVendors()
   }
 
   // On a Codex app-server crash, move every session bound to that profile that was mid-turn

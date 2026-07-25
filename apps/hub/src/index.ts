@@ -15,6 +15,7 @@ import { InstructionStore } from './instructions.js'
 import { AgentBus } from './bus.js'
 import { MemoryStore } from './memory.js'
 import { PracticeStore } from './practices.js'
+import { InProcessExecutor } from './executor.js'
 import type { DangerFlags, HubConfig } from './types.js'
 import { RestartController, type RestartState } from './restartController.js'
 import { SCHEMA_VERSION, type SupervisorMsg } from './restartHandshake.js'
@@ -55,7 +56,12 @@ const danger: DangerFlags = {
   autoApprovePractices: config.danger?.autoApprovePractices === true,
   autoApproveRestart: config.danger?.autoApproveRestart === true,
 }
-const sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, repoRoot)
+// Agent execution runs behind the Executor seam (docs/agent-worker-impl.md §4.1). Today the only
+// implementation is the in-process one, built from the same hub services SessionManager uses; the
+// SessionManager binds its hub-half side effects (status/persist/recall/journal/bus) onto it. A later
+// slice adds a WorkerExecutor (a supervised sibling process) behind the same interface — not built here.
+const executor = new InProcessExecutor({ approvals, usage, danger, memory, practices })
+const sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, repoRoot, executor)
 usage.setCodexReader((profileId) => sessions.readCodexLimits(profileId))
 
 // --- Blue-green restart wiring (docs/agent-detachment-impl.md §1.6) --------------------------------
