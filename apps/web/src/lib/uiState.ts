@@ -141,6 +141,39 @@ export function saveQueues(queues: Record<string, string[]>): void {
   }
 }
 
+// Unsent composer text, per chat. Switching panes or reloading must not throw away something you were
+// halfway through writing — and it belongs to the CHAT, not to the pane you happened to be looking at.
+const COMPOSER_KEY = 'allmyagents.ui.composerDrafts'
+
+export function loadComposerDrafts(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(COMPOSER_KEY)
+    if (raw) {
+      const v = JSON.parse(raw) as unknown
+      if (v && typeof v === 'object' && !Array.isArray(v)) {
+        const out: Record<string, string> = {}
+        for (const [k, text] of Object.entries(v as Record<string, unknown>)) {
+          if (typeof text === 'string' && text !== '') out[k] = text
+        }
+        return out
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return {}
+}
+
+export function saveComposerDrafts(drafts: Record<string, string>): void {
+  try {
+    // Prune empties (a sent message clears its draft) so the entry cannot grow without bound.
+    const trimmed = Object.fromEntries(Object.entries(drafts).filter(([, v]) => v !== ''))
+    localStorage.setItem(COMPOSER_KEY, JSON.stringify(trimmed))
+  } catch {
+    /* ignore */
+  }
+}
+
 export function saveOpenAgentPanels(ids: string[]): void {
   try {
     localStorage.setItem(AGENT_PANELS_KEY, JSON.stringify(ids))

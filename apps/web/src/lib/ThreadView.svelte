@@ -13,6 +13,8 @@
   import TaskStrip from './TaskStrip.svelte'
   import { findModel, defaultModelFor } from './catalog'
   import { settings } from './settings.svelte'
+  import { untrack } from 'svelte'
+  import { loadComposerDrafts, saveComposerDrafts } from './uiState'
   import { resolveSlash, builtinsForProvider, builtinNeedsArg, loadProfileCommands, type SlashResult } from './commands'
   import type { CommandInfo } from './api'
 
@@ -20,6 +22,38 @@
     $props()
 
   let text = $state('')
+  // Unsent composer text lives with the CHAT, not this component: switching panes, tabbing away, or
+  // reloading keeps whatever you were mid-way through writing. `drafts` is a plain cache (never $state)
+  // so writing it from an effect cannot feed back into reactivity.
+  let drafts = loadComposerDrafts()
+  let draftFor = $state('')
+
+  // Swap the composer's contents when the pane points at a different chat: stash the outgoing text,
+  // restore the incoming one. untrack() so reading/writing `text` here never re-triggers this effect.
+  $effect(() => {
+    const id = sid
+    untrack(() => {
+      if (id === draftFor) return
+      if (draftFor) {
+        drafts = { ...drafts, [draftFor]: text }
+        saveComposerDrafts(drafts)
+      }
+      text = drafts[id] ?? ''
+      draftFor = id
+    })
+  })
+
+  // Persist while typing, debounced. Sending clears `text`, which prunes the entry on the next tick.
+  $effect(() => {
+    const t = text
+    const id = draftFor
+    if (!id) return
+    const timer = setTimeout(() => {
+      drafts = { ...drafts, [id]: t }
+      saveComposerDrafts(drafts)
+    }, 300)
+    return () => clearTimeout(timer)
+  })
   let sendErr = $state('')
   let scroller = $state<HTMLDivElement | null>(null)
   let stick = $state(true)
