@@ -2,6 +2,7 @@ import { api, HUB_WS, getHubToken, setHubToken } from './api'
 import { settings } from './settings.svelte'
 import { alertDialog } from './dialog.svelte'
 import { loadLastLayout, saveLastLayout, type PersistedLayout } from './uiState'
+import { rowFate } from './fleetMerge'
 import type { ApprovalRecord, FleetSite, HistoryItem, HistoryPage, HubEvent, ProfileInfo, ProjectInfo, ScanResult, SessionRecord, UsageSnapshot } from './api'
 
 // Verbose client tracing — on in dev, compiled out of prod builds. Toggle off in dev by setting
@@ -369,6 +370,11 @@ class HubStore {
     this.projects = await api.projects()
     vlog(`init: ${this.profiles.length} profiles, ${this.projects.length} projects (${msSince(t0)})`)
     await this.refreshSideData()
+    // Come back where you left off: reopen the chat(s) + split layout that were open last time, instead
+    // of landing on the home screen and making you click back in (Setting, default on). Runs AFTER the
+    // session roster loads so the ids resolve; if nothing survived, restoreLastLayout() no-ops and the
+    // home screen's manual "Reopen" offer remains the fallback.
+    if (settings.autoReopenLastChats) this.restoreLastLayout()
     vlog(`init: side data loaded (${msSince(t0)}) — connecting WS`)
     this.connect()
     // Fire-and-forget: pull the fleet roster and merge any remote machines' projects/sessions
@@ -625,21 +631,35 @@ class HubStore {
   //   (spawn/send/steer/stop/mode/approve/rename/delete) to the owning site's base + token, instead
   //   of this read-only poll. See docs/mesh-unified-fleet.md §5.
   async refreshFleet(): Promise<void> {
-    const raw = await api.fleet().catch(() => [] as FleetSite[])
-    // Coerce a non-array (an older hub with no /api/fleet returns {error}; a token-gated hub returns
-    // 401 {error}) so a bad shape can't throw out of this fire-and-forget refresh. Empty / failure →
-    // treat as local-only and don't wipe anything already merged on a transient blip.
-    const fleet = Array.isArray(raw) ? raw : []
-    if (fleet.length) this.fleetSites = fleet
-    const remotes = fleet.filter((s) => !s.local && s.online)
+    const raw = await api.fleet().catch(() => null)
+    // A non-array means we could not learn the roster at all (an older hub with no /api/fleet returns
+    // {error}; a token-gated hub returns 401 {error}). buildFleet always returns at least the local
+    // entry, so an empty array means the same thing.
+    const fleet = Array.isArray(raw) && raw.length ? raw : null
     const hadRemote =
       this.projects.some((p) => p.siteId) || Object.values(this.sessions).some((v) => v.record.siteId)
-    // Pure single-machine path: nothing remote now, nothing merged before → leave local state
-    // completely untouched (no reassignments, no reactivity churn), exactly as before this feature.
-    if (remotes.length === 0 && !hadRemote) return
+    if (!fleet) {
+      // NEVER wipe merged rows because WE could not ask. Losing the roster is our problem, not evidence
+      // that another machine's projects stopped existing — flag them unreachable and keep them.
+      if (hadRemote) this.flagRemoteUnreachable()
+      return
+    }
+    this.fleetSites = fleet
+    const remoteSites = fleet.filter((s) => !s.local)
+    if (!remoteSites.length) {
+      // No peers in the roster. If we HAD peers, that is far more likely the mesh node being down than
+      // every machine being unpaired at once — keep their rows, flagged unreachable. With no peers and
+      // nothing previously merged this is the pure single-machine path: leave local state completely
+      // untouched (no reassignments, no reactivity churn), exactly as before this feature.
+      if (hadRemote) this.flagRemoteUnreachable()
+      return
+    }
+    const knownSiteIds = new Set(remoteSites.map((s) => s.siteId))
+    const onlineSites = remoteSites.filter((s) => s.online)
+    const onlineSiteIds = new Set(onlineSites.map((s) => s.siteId))
 
     const pulled = await Promise.all(
-      remotes.map(async (site) => {
+      onlineSites.map(async (site) => {
         const [projects, sessions] = await Promise.all([
           api.projectsFrom(site.baseUrl).catch(() => [] as ProjectInfo[]),
           api.sessionsFrom(site.baseUrl).catch(() => [] as SessionRecord[]),
@@ -648,12 +668,11 @@ class HubStore {
       })
     )
 
-    const localProjects = this.projects.filter((p) => !p.siteId)
     const remoteProjects: ProjectInfo[] = []
     const seenRemoteSessionIds = new Set<string>()
     for (const { site, projects, sessions } of pulled) {
       for (const p of projects) {
-        remoteProjects.push({ ...p, id: `${site.siteId}:${p.id}`, siteId: site.siteId, siteLabel: site.label })
+        remoteProjects.push({ ...p, id: `${site.siteId}:${p.id}`, siteId: site.siteId, siteLabel: site.label, siteOnline: true })
       }
       for (const s of sessions) {
         const rec: SessionRecord = {
@@ -662,21 +681,42 @@ class HubStore {
           projectId: s.projectId ? `${site.siteId}:${s.projectId}` : undefined,
           siteId: site.siteId,
           siteLabel: site.label,
+          siteOnline: true,
         }
         seenRemoteSessionIds.add(rec.id)
         // ensure() keys by the namespaced id → never collides with a local (raw-id) session. Refresh
         // the view's lastActivity too so the sidebar re-sorts remote rows by their real recency
         // (ensure sets it only on first create, and a remote session has no live WS to bump it).
         const v = this.ensure(rec)
+        v.record.siteOnline = true
         v.lastActivity = rec.lastActivity ?? rec.createdAt
       }
     }
-    this.projects = [...localProjects, ...remoteProjects]
-    // Drop remote sessions that vanished (site went offline, or the chat was deleted there). Only
-    // ever touches rows tagged with a siteId — local sessions + drafts are left alone.
+    // Rows from a machine we could NOT reach are kept exactly as last seen and flagged unreachable —
+    // "that box is off", not "your projects are gone". A row is only forgotten when we can actually see
+    // its site and it no longer offers it, or when the site left the fleet. See fleetMerge.rowFate.
+    const carried = this.projects
+      .filter((p) => !!p.siteId && rowFate({ siteId: p.siteId, knownSiteIds, onlineSiteIds, seenNow: false }) === 'mark-offline')
+      .map((p) => ({ ...p, siteOnline: false }))
+    const localProjects = this.projects.filter((p) => !p.siteId)
+    this.projects = [...localProjects, ...remoteProjects, ...carried]
+
     for (const id of Object.keys(this.sessions)) {
       const v = this.sessions[id]
-      if (v?.record.siteId && !seenRemoteSessionIds.has(id)) this.removeSessionLocal(id)
+      const site = v?.record.siteId
+      if (!v || !site) continue // local sessions + drafts are never touched here
+      const fate = rowFate({ siteId: site, knownSiteIds, onlineSiteIds, seenNow: seenRemoteSessionIds.has(id) })
+      if (fate === 'drop') this.removeSessionLocal(id)
+      else if (fate === 'mark-offline') v.record.siteOnline = false
+    }
+  }
+
+  /** Mark every merged remote row unreachable — we lost the roster, which says nothing about whether
+   *  those machines are actually up. Keeps the rows visible rather than making work disappear. */
+  private flagRemoteUnreachable(): void {
+    this.projects = this.projects.map((p) => (p.siteId && p.siteOnline !== false ? { ...p, siteOnline: false } : p))
+    for (const v of Object.values(this.sessions)) {
+      if (v.record.siteId && v.record.siteOnline !== false) v.record.siteOnline = false
     }
   }
 

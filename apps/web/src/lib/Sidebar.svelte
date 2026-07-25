@@ -4,6 +4,7 @@
   import { store, type SessionView } from './store.svelte'
   import { confirmDialog } from './dialog.svelte'
   import { relativeTime } from './time'
+  import { shouldBadgeNodes } from './fleetMerge'
   import Usage from './Usage.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
   import Icon from './Icon.svelte'
@@ -147,7 +148,16 @@
     // Set only for a project that lives on a REMOTE fleet machine → renders a small site badge.
     // Absent for this hub's own (local) projects, so the single-machine view is unchanged.
     siteLabel?: string
+    // False when that machine did not answer the last roster probe: the rows are the last known state,
+    // shown dimmed rather than deleted, so "the box is off" never looks like "my work disappeared".
+    siteOnline?: boolean
   }
+
+  // Node badges only matter once the fleet has more than one machine; on a single-machine install they
+  // are pure noise, so the sidebar looks exactly as it always has. The local machine's label comes from
+  // the roster's `local` entry.
+  const multiSite = $derived(shouldBadgeNodes(store.fleetSites.length))
+  const localLabel = $derived(store.fleetSites.find((s) => s.local)?.label ?? 'this machine')
 
   const groups = $derived.by(() => {
     const q = filter.toLowerCase()
@@ -164,7 +174,7 @@
     const out: Group[] = []
     for (const p of store.orderedProjects) {
       const ss = byProject.get(p.id) ?? []
-      if (ss.length || !filter) out.push({ id: p.id, name: p.name, siteLabel: p.siteLabel, sessions: store.orderedChats(p.id, ss) })
+      if (ss.length || !filter) out.push({ id: p.id, name: p.name, siteLabel: p.siteLabel, siteOnline: p.siteOnline, sessions: store.orderedChats(p.id, ss) })
     }
     const none = byProject.get('__none__')
     if (none?.length) out.push({ id: '__none__', name: 'Unfiled', sessions: store.orderedChats('__none__', none) })
@@ -363,7 +373,18 @@
           {/if}
           <button class="folder" title={isCollapsed ? 'expand' : 'collapse'} onclick={() => toggleCollapse(g.id)}><Icon name={isCollapsed ? 'chevron-right' : 'chevron-down'} size={12} /></button>
           <span class="gname">{g.name}</span>
-          {#if g.siteLabel}<span class="sbadge" title="on {g.siteLabel}"><Icon name="server" size={9} />{g.siteLabel}</span>{/if}
+          {#if multiSite}
+            <span
+              class="sbadge"
+              class:off={g.siteLabel != null && g.siteOnline === false}
+              title={g.siteLabel
+                ? `on ${g.siteLabel}${g.siteOnline === false ? ' — unreachable, showing the last known state' : ' — reachable'}`
+                : `on ${localLabel} (this machine)`}
+            >
+              <span class="sdot {g.siteLabel == null ? 'here' : g.siteOnline === false ? 'down' : 'up'}"></span>
+              <Icon name="server" size={9} />{g.siteLabel ?? localLabel}
+            </span>
+          {/if}
           <span class="gcount dim tnum">{g.sessions.length}</span>
           {#if g.id !== '__none__'}
             <button class="gadd" title="import existing chats" onclick={(e) => openImport(e, g.id)}><Icon name="download" size={13} /></button>
@@ -520,6 +541,12 @@
     text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-2xs); font-weight: var(--fw-medium);
     color: var(--accent); background: color-mix(in srgb, var(--accent) 13%, transparent);
     border-radius: var(--r-pill); padding: 0.05rem 0.35rem; }
+  /* Reachability: a machine that did not answer reads as muted-with-a-dead-dot, never as missing. */
+  .sbadge.off { color: var(--text-dim, #9a9aa8); background: color-mix(in srgb, currentColor 12%, transparent); }
+  .sdot { width: 5px; height: 5px; border-radius: 50%; flex: none; }
+  .sdot.up { background: #2e9e63; }
+  .sdot.here { background: currentColor; opacity: 0.55; }
+  .sdot.down { background: #d08b3a; }
   .rbadge { flex: none; display: inline-grid; place-items: center; color: var(--accent); opacity: 0.75; }
   .rlabel { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .row.sel .rlabel { font-weight: var(--fw-medium); }

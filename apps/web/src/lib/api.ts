@@ -13,6 +13,8 @@ export interface ProjectInfo {
   // Absent → this hub's own (local) project, shown unbadged exactly as before.
   siteId?: string
   siteLabel?: string
+  /** Whether that machine answered the last roster probe. False = last-known rows, machine unreachable. */
+  siteOnline?: boolean
 }
 
 export interface SessionRecord {
@@ -42,6 +44,8 @@ export interface SessionRecord {
   // `${siteId}:${realId}`. Absent → this hub's own (local) session, shown unbadged as before.
   siteId?: string
   siteLabel?: string
+  /** Whether that machine answered the last roster probe. False = last-known row, machine unreachable. */
+  siteOnline?: boolean
 }
 
 // One existing Claude/Codex conversation found on disk that can be adopted under a project.

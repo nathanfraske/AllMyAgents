@@ -14,6 +14,9 @@ interface Settings {
   // On the first send in a new chat, switch the active pane to the freshly-spawned session (so you land
   // on the chat you just started instead of staying on the previous one). Default on.
   autoSwitchToNewChat: boolean
+  // On launch/reload, reopen the chat(s) and split layout that were open last time instead of showing
+  // the home screen with a "reopen" offer. Default on. Off falls back to the manual offer.
+  autoReopenLastChats: boolean
 }
 
 const KEY = 'allmyagents.settings'
@@ -32,6 +35,7 @@ const DEFAULTS: Settings = {
   detachedDefaultProjectId: null,
   detachedDefaultMode: 'safe',
   autoSwitchToNewChat: true,
+  autoReopenLastChats: true,
 }
 
 function load(): Settings {
@@ -58,6 +62,7 @@ class SettingsStore {
   detachedDefaultProjectId = $state<string | null>(null)
   detachedDefaultMode = $state<'safe' | 'edits' | 'full'>('safe')
   autoSwitchToNewChat = $state(true)
+  autoReopenLastChats = $state(true)
 
   constructor() {
     const s = load()
@@ -74,6 +79,7 @@ class SettingsStore {
     this.detachedDefaultProjectId = s.detachedDefaultProjectId
     this.detachedDefaultMode = s.detachedDefaultMode
     this.autoSwitchToNewChat = s.autoSwitchToNewChat
+    this.autoReopenLastChats = s.autoReopenLastChats
   }
 
   save(): void {
@@ -94,6 +100,7 @@ class SettingsStore {
           detachedDefaultProjectId: this.detachedDefaultProjectId,
           detachedDefaultMode: this.detachedDefaultMode,
           autoSwitchToNewChat: this.autoSwitchToNewChat,
+          autoReopenLastChats: this.autoReopenLastChats,
         })
       )
     } catch {
