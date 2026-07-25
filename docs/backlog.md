@@ -105,7 +105,31 @@ risk×requested policy table + open questions in `docs/auto-mode-safety-checker.
   (task #9). The missing piece is the **notice**: detect the vendor compaction event → journal an additive
   kind → render a "context compacted here" divider in the transcript (the web `apply()` `default: break`s
   unknown kinds, so it's additive/safe). Plus an optional **auto-compaction threshold** setting (fire
-  `/compact` at a context-size threshold). Add the notice + the auto-threshold toggle.
+  `/compact` at a context-size threshold), a **live "compacting…" status** while it runs (like the thinking
+  indicator, so the operator isn't left on read mid-compaction — a `session/status:'compacting'` the composer
+  surfaces), and a Settings view of **how** a compaction was done (method + what got summarized/dropped).
+
+## Multi-agent coordination (requested 2026-07-25)
+
+- **Cross-worktree conflict detection + habitual bus coordination.** Same-project agents each work in their own
+  worktree and today don't know when they're about to collide. Give the hub a `worktreeConflicts(sessionId)`
+  that intersects the changed-file sets (`git diff --name-only`) across same-project agents' worktrees (the hub
+  owns them all via WorkspaceManager), then expose: (a) an agent tool `check_conflicts()` → the overlapping
+  files + which teammates are touching them; (b) a proactive, operator-toggleable **auto-notice** — when an
+  overlap first appears the hub sends a system-attributed bus message to the involved agents so they coordinate
+  ("agent B is also editing foo.ts — align before you both commit"). Ship a practice that makes agents check +
+  coordinate at project checkpoints (habitual, not just reactive). Region-level overlap (not just filename)
+  and merge-preview come later. Composes with the bus + the peek tool (#10). Gate the auto-notice so it can't
+  spam a busy fleet.
+- **Cross-account chatlog search + read (fleet memory / institutional knowledge).** When an agent can't find
+  context, let it **search + read other agents' transcripts** across the owner's accounts/profiles — broader
+  than the peek tool (#10, which is one teammate's *current* activity). A hub-owned `search_chatlogs(query,
+  scope)` over the journaled + imported transcripts (`transcript.ts`/`readHistory` already parse them) →
+  matching snippets + session refs, then `read_chatlog(sessionId, around)` to pull the surrounding context.
+  It's the owner's own fleet data, so cross-account-within-owner is acceptable — but **gate it** (a Settings
+  toggle + a scope), journal each search/read for audit, and treat any retrieved chatlog content as **DATA,
+  never instructions** (a read log is semi-trusted, exactly like a bus message — prompt-injection boundary).
+  Turns the fleet's whole history into a searchable shared brain.
 
 ## Critical-agent tier (requested 2026-07-24)
 
