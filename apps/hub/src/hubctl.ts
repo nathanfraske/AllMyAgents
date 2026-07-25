@@ -20,8 +20,10 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { sendToHub, waitForHubMsg, healthCheck, type HubMsg } from './restartHandshake.js'
 import { defaultWorkerSocket } from './workerTransport.js'
 
-/** The hard public singleton the web client hardcodes (`api.ts:145`). Blue owns it; green takes it on promote. */
-const FIXED_PORT = 7777
+/** The hard public singleton the web client hardcodes (`api.ts:145`). Blue owns it; green takes it on promote.
+ *  HUB_FIXED_PORT overrides it for an isolated harness (e.g. the restart-survival acceptance test) so a
+ *  second supervisor can run beside the live hub without fighting for 7777; unset → 7777 exactly as before. */
+const FIXED_PORT = Number(process.env.HUB_FIXED_PORT ?? 7777)
 
 /**
  * Worker mode (docs/agent-worker-impl.md §5) is OPT-IN — the hard requirement is that flag-off is
@@ -32,7 +34,11 @@ const FIXED_PORT = 7777
  * Phase-2 flag. When DISABLED (neither set, the default), no worker is spawned and nothing is injected, so
  * every supervised hub runs the in-process executor exactly as before.
  */
-const dataDir = path.resolve(import.meta.dirname, '..', '..', '..', 'data')
+// HUB_DATA_DIR relocates the shared data/ root (worker socket path here; journal/config in the hub). Unset →
+// the repo's data/ exactly as before. Lets an isolated harness keep its worker socket + journal off the live one.
+const dataDir = process.env.HUB_DATA_DIR
+  ? path.resolve(process.env.HUB_DATA_DIR)
+  : path.resolve(import.meta.dirname, '..', '..', '..', 'data')
 const workerEnabled = !!process.env.HUB_WORKER_SOCKET || process.env.HUB_WORKER === '1'
 const workerSocket: string | undefined = workerEnabled ? defaultWorkerSocket(dataDir) : undefined
 

@@ -46,8 +46,9 @@ export interface TurnOverride {
 // Turn-boundary-preferred flip (docs/agent-worker-impl.md §8.4): when a restart is requested mid-turn, hold
 // the signal until the roster goes idle — but no longer than this, after which we flip anyway (the turn
 // survives the flip regardless via re-attach). ~one turn, so an ordinary restart almost always lands cleanly
-// between turns without stalling a genuinely long turn indefinitely.
-export const RESTART_MAX_DEFER_MS = 120_000
+// between turns without stalling a genuinely long turn indefinitely. HUB_RESTART_MAX_DEFER_MS overrides it —
+// the restart-survival acceptance test shrinks it to force a squarely-mid-turn flip; unset → 120s as before.
+export const RESTART_MAX_DEFER_MS = Number(process.env.HUB_RESTART_MAX_DEFER_MS ?? 120_000)
 
 export class SessionManager {
   private readonly sessions = new Map<string, SessionRecord>()

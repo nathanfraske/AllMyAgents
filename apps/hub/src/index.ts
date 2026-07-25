@@ -23,16 +23,21 @@ import { RestartController, type RestartState } from './restartController.js'
 import { SCHEMA_VERSION, type SupervisorMsg } from './restartHandshake.js'
 
 const repoRoot = path.resolve(import.meta.dirname, '..', '..', '..')
+// HUB_DATA_DIR relocates the journal/config/worktrees/device-token root off the repo's data/. Profiles keep
+// their real repo path so auth still resolves. Unset → repo data/ (byte-identical to today); set only by an
+// isolated harness (e.g. the restart-survival acceptance test) to keep its DB + state off the live hub's.
+const dataDir = process.env.HUB_DATA_DIR ? path.resolve(process.env.HUB_DATA_DIR) : path.join(repoRoot, 'data')
+if (process.env.HUB_DATA_DIR) fs.mkdirSync(dataDir, { recursive: true })
 
 let config: HubConfig = {}
-const configPath = path.join(repoRoot, 'data', 'config.json')
+const configPath = path.join(dataDir, 'config.json')
 try {
   config = JSON.parse(fs.readFileSync(configPath, 'utf8')) as HubConfig
 } catch {
   /* no config yet — defaults apply (overage: block) */
 }
 
-const journal = new Journal(path.join(repoRoot, 'data', 'hub.db'))
+const journal = new Journal(path.join(dataDir, 'hub.db'))
 // Each live WebSocket (pane / device / reconnect) attaches a journal 'event' listener, removed on
 // close — legitimately more than the EventEmitter default of 10 for a multi-pane/fleet hub. Raise
 // the cap so a healthy number of connections doesn't emit a spurious MaxListeners leak warning.
@@ -42,7 +47,7 @@ const profiles = scanProfiles(path.join(repoRoot, 'profiles'))
 const profileMap = new Map(profiles.map((p) => [p.id, p]))
 const approvals = new ApprovalService(journal)
 const usage = new UsageMonitor(journal, profiles, config)
-const workspace = new WorkspaceManager(path.join(repoRoot, 'data', 'worktrees'))
+const workspace = new WorkspaceManager(path.join(dataDir, 'worktrees'))
 const projects = new ProjectStore(journal.db)
 const instructions = new InstructionStore(journal.db)
 const bus = new AgentBus(journal.db)
@@ -92,7 +97,9 @@ usage.setCodexReader((profileId) => sessions.readCodexLimits(profileId))
 // health-check; an unsupervised standalone hub behaves exactly as before.
 const supervised = process.env.HUB_SUPERVISED === '1' && typeof process.send === 'function'
 const bootPort = Number(process.env.HUB_PORT ?? 7777)
-const publicPort = supervised ? 7777 : bootPort
+// The fixed public port a green promotes to / a rollback re-claims — HUB_FIXED_PORT keeps it in lockstep with
+// hubctl's override so an isolated harness promotes to its own port, not 7777. Unset → 7777 as before.
+const publicPort = supervised ? Number(process.env.HUB_FIXED_PORT ?? 7777) : bootPort
 const isGreen = supervised && bootPort === 0
 const restartState: RestartState = { booted: false, draining: false, promoting: false, sockets: new Set() }
 
