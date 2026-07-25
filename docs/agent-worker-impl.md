@@ -822,3 +822,51 @@ with zero front-end work.
 - **Codex `thread/resume` after a *worker* crash mid-turn** — the one path that still kills a turn; confirm
   the resumed thread continues cleanly (idle resume is exercised by import; mid-turn-kill + resume is the
   new case, shared with the Phase-1 spike in `agent-detachment-impl.md` §7).
+
+## 12. Acceptance — PROVEN ✅
+
+The headline claim ("a live agent turn survives a hub restart") is proven **end-to-end and full-stack** —
+a real `hubctl` blue-green flip with a real Claude turn running in a real supervised worker, not a unit
+simulation. Reproduce with:
+
+```
+pnpm accept:restart            # scripts/acceptance-restart-survival.mjs
+```
+
+It launches an **isolated** worker-mode `hubctl` (its own temp `HUB_DATA_DIR` + `HUB_FIXED_PORT=7799`, so it
+never touches a live hub on 7777), starts a ~1000-word Claude turn, then POSTs `/api/restart` **while the
+turn is in flight**. A shrunk `HUB_RESTART_MAX_DEFER_MS=3000` forces the flip squarely mid-turn (the real
+production path when a restart can't wait for a turn boundary). It then asserts survival from the journal —
+all eight checks must pass:
+
+| Check | Meaning |
+| --- | --- |
+| `twoHubEras` | two `hub/started` rows — blue and green both booted |
+| `pidChanged` | the live `/api/health` pid changed (a real process restart, not a no-op) |
+| `liveAtFlip` | the session was `active` at the moment the pid flipped |
+| `turnStraddledFlip` | the SAME turn's events span the flip — blue journaled the start, green the rest |
+| `sentinelPresent` | the end-of-turn sentinel reached the journal (full output, not truncated) |
+| `sentinelAfterGreenBoot` | the sentinel was journaled AFTER green booted — the turn's *end* landed on the successor |
+| `completedCleanly` | final status `idle` (a clean `turnCompleted`, not `error`) |
+| `resultOnGreen` | `claude/result` journaled by green |
+
+**Result:** two independent PASS runs — pid `5260→42468` and `42300→12864`; 10 blue-side + 6 green-side
+session events each; all eight green. The turn ran to completion on the successor hub with its full output
+intact, having started on the predecessor. Flag-off (in-process) remains byte-identical (195 hub tests).
+
+### Testing it on the desktop app
+
+The harness above IS the real supervisor+worker+hub stack; the desktop app only adds the Tauri UI shell on
+top and runs on the fixed port 7777 against the real data dir. `desktop/src-tauri/src/lib.rs` spawns hubctl
+via `pnpm hubctl:dev` (dev) / bundled `dist/hubctl.js` (release), and Rust's `Command` inherits the parent
+environment — so worker mode is enabled by launching the app with **`HUB_WORKER=1`** set (no code change).
+To watch survival live in the app:
+
+1. Launch the desktop app with `HUB_WORKER=1` in its environment (the hubctl it spawns picks it up; the log
+   line `spawning agent worker` confirms worker mode).
+2. Start a long turn in any chat (ask for a long essay, or a task with several tool steps).
+3. While it's streaming, trigger a restart (Settings → restart, or `POST /api/restart`).
+4. The chat keeps streaming across the ~sub-second flip and finishes normally — the turn survived.
+
+Flipping `HUB_WORKER` **on by default** in the desktop spawn is the alpha step (it ships ON for alpha per
+`docs/alpha-release-plan.md`); until then it's opt-in via the env so flag-off stays the safe, proven default.

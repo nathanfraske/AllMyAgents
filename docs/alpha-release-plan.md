@@ -73,7 +73,9 @@ clean, no-extra-infra path — a dedicated update server or hosted service would
 
 ## Sequence
 
-1. Land + audit the always-on worker. *(in progress — gates everything below)*
+1. Land + audit the always-on worker. *(DONE — acceptance-PROVEN end-to-end: a live Claude turn survives a
+   real mid-turn hubctl blue-green restart. See `docs/agent-worker-impl.md` §12; reproduce with
+   `pnpm accept:restart`. Flag-off stays byte-identical, 195 hub tests.)*
 2. Close known-broken paths (health `port`, etc.); flip alpha feature flags on by default.
 3. First-run app-data materialization + **template** profiles + path resolution off the dev cwd.
 4. Tauri bundle config → produce installer; smoke-test the *installed* app on a clean Windows profile.
