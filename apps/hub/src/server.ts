@@ -217,6 +217,9 @@ function bearerToken(req: http.IncomingMessage): string | undefined {
 export interface ServerOptions {
   port: number
   defaultCwd: string
+  /** The managed-profiles root (HUB_PROFILES_DIR or repo profiles/) — where the login flow creates a new
+   *  profile dir. Threaded from index.ts so it stays in lockstep with where the hub SCANS profiles. */
+  profilesDir: string
   journal: Journal
   sessions: SessionManager
   profiles: Profile[]
@@ -266,9 +269,7 @@ function persistDanger(repoRoot: string, danger: DangerFlags): void {
 }
 
 export function startServer(opts: ServerOptions): http.Server {
-  const { port, defaultCwd, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken, agentToolSecret, restartState, executor } = opts
-  // Same location index.ts scans for profiles (repoRoot/profiles); defaultCwd is repoRoot.
-  const profilesDir = path.join(defaultCwd, 'profiles')
+  const { port, defaultCwd, profilesDir, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken, agentToolSecret, restartState, executor } = opts
 
   const server = http.createServer((req, res) => {
     void handle(req, res)

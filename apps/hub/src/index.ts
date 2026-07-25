@@ -29,6 +29,11 @@ const repoRoot = path.resolve(import.meta.dirname, '..', '..', '..')
 // isolated harness (e.g. the restart-survival acceptance test) to keep its DB + state off the live hub's.
 const dataDir = process.env.HUB_DATA_DIR ? path.resolve(process.env.HUB_DATA_DIR) : path.join(repoRoot, 'data')
 if (process.env.HUB_DATA_DIR) fs.mkdirSync(dataDir, { recursive: true })
+// HUB_PROFILES_DIR relocates the managed-profiles root (auth creds + settings) off the repo's profiles/ —
+// the alpha step toward keeping credentials out of the repo/bundle path (%APPDATA%/AllMyAgents/profiles on a
+// real install). Unset → repo profiles/ (byte-identical to today). The scan, login, and rescan all use it.
+const profilesDir = process.env.HUB_PROFILES_DIR ? path.resolve(process.env.HUB_PROFILES_DIR) : path.join(repoRoot, 'profiles')
+if (process.env.HUB_PROFILES_DIR) fs.mkdirSync(profilesDir, { recursive: true })
 
 let config: HubConfig = {}
 const configPath = path.join(dataDir, 'config.json')
@@ -44,7 +49,7 @@ const journal = new Journal(path.join(dataDir, 'hub.db'))
 // the cap so a healthy number of connections doesn't emit a spurious MaxListeners leak warning.
 journal.setMaxListeners(64)
 const store = new SessionStore(journal.db)
-const profiles = scanProfiles(path.join(repoRoot, 'profiles'))
+const profiles = scanProfiles(profilesDir)
 const profileMap = new Map(profiles.map((p) => [p.id, p]))
 const approvals = new ApprovalService(journal)
 const usage = new UsageMonitor(journal, profiles, config)
@@ -134,7 +139,6 @@ sessions.boot({ reconcile: !isGreen }) // green defers stale-reconcile to promot
 if (!isGreen) usage.startPolling() //     green starts polling only once it owns the port (on promote)
 restartState.booted = true
 
-const profilesDir = path.join(repoRoot, 'profiles')
 function rescanProfiles(): typeof profiles {
   for (const p of scanProfiles(profilesDir)) {
     if (!profileMap.has(p.id)) {
@@ -169,7 +173,7 @@ const meshEnable = !(
 const mesh = new MeshSite({ port: publicPort, label: config.mesh?.label, enable: meshEnable })
 
 // Listen on the BOOT port (0 → ephemeral for a green); the server reports its actual port back.
-const server = startServer({ port: bootPort, defaultCwd: repoRoot, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken, agentToolSecret, restartState, executor })
+const server = startServer({ port: bootPort, defaultCwd: repoRoot, profilesDir, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken, agentToolSecret, restartState, executor })
 
 // Register the mesh advert — factored so a promoted green can (re)register once it owns the port.
 function registerMesh(): void {
