@@ -9,6 +9,7 @@
   import ImportChats from './ImportChats.svelte'
   import { flip } from 'svelte/animate'
   import { cubicOut } from 'svelte/easing'
+  import { loadCollapsedFolders, saveCollapsedFolders } from './uiState'
 
   let filter = $state('')
   let showCreate = $state(false)
@@ -24,7 +25,14 @@
     store.openImportPanel(id, pathFor(id))
   }
   let showUsage = $state(true)
-  let collapsed = $state(new Set<string>())
+  // Folder open/collapsed state, restored immediately on load so the sidebar looks exactly as the
+  // operator left it across app restarts. The Set holds the COLLAPSED group ids; anything not in it
+  // is expanded (the default). `toggleCollapse` reassigns the Set, so the persistence effect below
+  // re-runs on every change and mirrors it to localStorage.
+  let collapsed = $state(new Set<string>(loadCollapsedFolders()))
+  $effect(() => {
+    saveCollapsedFolders([...collapsed])
+  })
 
   function toggleCollapse(id: string): void {
     const next = new Set(collapsed)

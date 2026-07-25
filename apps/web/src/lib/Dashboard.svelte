@@ -5,6 +5,7 @@
   import { relativeTime } from './time'
   import { api, type StatsResult, type DayStat } from './api'
   import ProviderLogo from './ProviderLogo.svelte'
+  import Icon from './Icon.svelte'
 
   let nameInput = $state('')
   let stats = $state<StatsResult | null>(null)
@@ -126,6 +127,19 @@
   })
   const heroText = $derived(settings.ownerName ? greeting : 'Welcome to AllMyAgents.')
 
+  // Cross-restart "reopen your last session" offer. The store loads it from localStorage at startup
+  // (without auto-selecting anything); we surface it here on the home screen. Prefer the live roster
+  // label once the session has streamed in, falling back to the label captured when the layout was
+  // saved, then a generic phrase. Accept restores selectedId + splitPanes; dismiss just hides it.
+  const restore = $derived(store.restorableLayout)
+  const restoreLabel = $derived.by(() => {
+    const r = store.restorableLayout
+    if (!r) return ''
+    const live = r.selectedId ? store.sessionLabel(r.selectedId) : ''
+    return live || r.title || 'your last session'
+  })
+  const restoreCount = $derived(store.restorableLayout?.paneCount ?? 1)
+
   // Matrix-decode entrance. On mount the heading resolves from scrambled glyphs into the real
   // sentence; when it settles we flip `revealed`, which triggers the staggered card/tile/detail
   // reveal in CSS. `displayText` feeds the <h1> while scrambling; afterwards the <h1> shows the
@@ -196,6 +210,19 @@
 <div class="dashwrap scroll">
   <div class="dash" class:revealed>
     <div class="top">
+      {#if restore}
+        <div class="restore" role="region" aria-label="reopen your last session">
+          <span class="ricon"><Icon name="rotate-ccw" size={17} /></span>
+          <div class="rtext">
+            <div class="rtitle">{restoreCount > 1 ? 'Restore your last split view' : 'Reopen your last session'}</div>
+            <div class="rsub dim">{restoreLabel}{#if restoreCount > 1} · {restoreCount} panes{/if}</div>
+          </div>
+          <div class="ract">
+            <button class="btn btn-primary" onclick={() => store.restoreLastLayout()}>Reopen</button>
+            <button class="btn btn-ghost" title="dismiss" aria-label="dismiss" onclick={() => store.dismissRestore()}><Icon name="x" size={15} /></button>
+          </div>
+        </div>
+      {/if}
       {#if store.lastLayout}
         <button class="back" onclick={() => store.goBack()}>← back to your chats</button>
       {/if}
@@ -347,6 +374,21 @@
   }
   .back { color: var(--muted); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--space-2) var(--space-4); margin-bottom: var(--space-6); font-size: var(--text-sm); }
   .back:hover { border-color: var(--border-accent); color: var(--text); }
+
+  /* "Reopen your last session" offer — a restrained accent-tinted card at the top of the home
+     screen. Named so the operator knows what will reopen; Reopen restores the exact layout, the
+     × dismisses. Deliberately understated to fit the near-black theme (no neon). */
+  .restore { display: flex; align-items: center; gap: var(--space-4); margin-bottom: var(--space-6);
+    padding: var(--space-4) var(--space-5); border-radius: var(--r-lg);
+    border: 1px solid var(--border-accent);
+    background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 10%, transparent), transparent 70%), var(--surface);
+    box-shadow: var(--edge-hi), var(--shadow-2); }
+  .restore .ricon { flex: none; display: grid; place-items: center; width: 34px; height: 34px; border-radius: var(--r-md);
+    color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+  .restore .rtext { flex: 1; min-width: 0; }
+  .restore .rtitle { font-size: var(--text-sm); font-weight: var(--fw-medium); }
+  .restore .rsub { font-size: var(--text-xs); margin-top: 0.1rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .restore .ract { flex: none; display: flex; align-items: center; gap: var(--space-2); }
   .hero { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-5); margin-bottom: var(--space-7); }
   .hero .logo { width: 64px; height: 64px; object-fit: contain; flex: none; }
   .herotext { flex: 1 1 auto; min-width: 0; }
