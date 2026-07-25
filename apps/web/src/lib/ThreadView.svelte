@@ -9,6 +9,8 @@
   import AccountPicker from './AccountPicker.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
   import Icon from './Icon.svelte'
+  import AgentPanel from './AgentPanel.svelte'
+  import TaskStrip from './TaskStrip.svelte'
   import { findModel, defaultModelFor } from './catalog'
   import { settings } from './settings.svelte'
   import { resolveSlash, builtinsForProvider, builtinNeedsArg, loadProfileCommands, type SlashResult } from './commands'
@@ -417,7 +419,14 @@
     {/if}
   </div>
 
+  <!-- Sub-agents this chat spawned. Self-contained popout anchored to THIS pane, so split view gets one
+       panel per pane; renders nothing until an agent is actually spawned. -->
+  <AgentPanel items={view.items} />
+
   <div class="composer-wrap">
+    <!-- The agent's task board, directly above the chatbar. -->
+    <TaskStrip items={view.items} />
+
     {#each approvals as a (a.id)}
       <div class="approval">
         <div class="atop"><span class="alabel">PENDING APPROVAL</span><span class="dim">{a.kind}</span></div>

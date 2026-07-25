@@ -308,7 +308,9 @@
   .empty { display: grid; place-items: center; height: 100%; }
   .panes { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
   .prow { display: flex; flex: 1 1 0; min-width: 0; min-height: 0; }
-  .pane { flex: 1 1 0; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+  /* `position: relative` makes each pane the containing block for its own overlays (the agent popout
+     panel), so in split view every pane gets its own instead of one floating over the whole app. */
+  .pane { flex: 1 1 0; min-width: 0; min-height: 0; display: flex; flex-direction: column; position: relative; }
   .ghost-pane { flex: 0.7 1 0; min-width: 60px; margin: 0.5rem; border: 2px dashed var(--accent); border-radius: 12px;
     background: color-mix(in srgb, var(--accent) 12%, transparent); display: grid; place-items: center; }
   .ghost-row { flex: 0.5 1 0; min-height: 48px; margin: 0.5rem; border: 2px dashed var(--accent); border-radius: 12px;
