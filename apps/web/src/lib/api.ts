@@ -260,10 +260,11 @@ export interface Practice {
   updatedAt: string
 }
 
-// Danger Zone toggles — safe-default guardrail switches (both default false / OFF).
+// Danger Zone toggles — safe-default guardrail switches (all default false / OFF).
 export interface DangerFlags {
   busCanUseRiskyTools: boolean
   autoApprovePractices: boolean
+  autoApproveRestart?: boolean
 }
 
 export interface BusMessage {
@@ -335,6 +336,8 @@ export const api = {
   // Danger Zone toggles.
   danger: () => jget<DangerFlags>('/api/config/danger'),
   setDanger: (patch: Partial<DangerFlags>) => jpost<DangerFlags>('/api/config/danger', patch),
+  // Operator "Restart hub" — forwards to the supervisor (202 accepted); 503 {error} when unsupervised.
+  restartHub: () => jpost<{ accepted?: boolean; error?: string }>('/api/restart', { reason: 'operator' }),
   bus: (opts: { project?: string; session?: string } = {}) => {
     const p = new URLSearchParams()
     if (opts.project) p.set('project', opts.project)

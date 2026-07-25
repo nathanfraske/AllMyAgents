@@ -44,7 +44,7 @@
   // Danger Zone — safe-default guardrail toggles + the agent-authored practices review list. Kept
   // collapsed behind an explicit reveal so it's never flipped by accident. Both toggles default OFF.
   let dangerRevealed = $state(false)
-  let danger = $state<DangerFlags>({ busCanUseRiskyTools: false, autoApprovePractices: false })
+  let danger = $state<DangerFlags>({ busCanUseRiskyTools: false, autoApprovePractices: false, autoApproveRestart: false })
   let practices = $state<Practice[]>([])
   $effect(() => {
     void api.danger().then((d) => (danger = d))
@@ -65,6 +65,29 @@
     if (p.fromSession) bits.push(`session ${p.fromSession.slice(0, 8)}`)
     bits.push(new Date(p.updatedAt).toLocaleDateString())
     return bits.join(' · ')
+  }
+
+  // Operator "Restart hub" (Maintenance). The authenticated operator action IS its own approval, so
+  // no danger gate. Happy path returns 202 {accepted}; the hub blue-green flips in ~1s and the web
+  // client auto-reconnects, so no reload. Unsupervised (plain) hubs return 503 {error}.
+  let restartState = $state<'idle' | 'restarting' | 'error'>('idle')
+  let restartMsg = $state('')
+  async function restartHub(): Promise<void> {
+    restartState = 'restarting'
+    restartMsg = 'restarting… (the app reconnects automatically)'
+    const r = await api.restartHub()
+    if (r.error) {
+      restartState = 'error'
+      restartMsg = r.error
+    } else {
+      // Accepted — hold the inline notice ~3s while the flip + auto-reconnect happen, then clear.
+      setTimeout(() => {
+        if (restartState === 'restarting') {
+          restartState = 'idle'
+          restartMsg = ''
+        }
+      }, 3000)
+    }
   }
 
   let revealToken = $state(false)
@@ -367,6 +390,9 @@
           <label class="opt"><input type="checkbox" checked={danger.busCanUseRiskyTools} onchange={(e) => setDanger({ busCanUseRiskyTools: (e.target as HTMLInputElement).checked })} /> Let teammate-message (bus) turns use risky tools</label>
           <p class="hint dim warnrow">Off (safe): a turn triggered by another agent's message can't write practices at all. On: a semi-trusted teammate message can drive a practice write — a persistence vector.</p>
 
+          <label class="opt"><input type="checkbox" checked={danger.autoApproveRestart} onchange={(e) => setDanger({ autoApproveRestart: (e.target as HTMLInputElement).checked })} /> Auto-approve agent hub restarts</label>
+          <p class="hint dim warnrow">Default off — an agent's restart_hub tool waits on your approval; the operator restart below never needs it.</p>
+
           <h4>Agent-authored practices</h4>
           <p class="hint dim">Durable conventions agents recorded, materialized into future agents at spawn. Revoking one removes it from future spawns (running sessions are unaffected until respawn).</p>
           {#if practices.length === 0}
@@ -386,6 +412,17 @@
               {/each}
             </ul>
           {/if}
+
+          <h4>Maintenance</h4>
+          <div class="restart-row">
+            <button class="btn" onclick={restartHub} disabled={restartState === 'restarting'}>
+              {restartState === 'restarting' ? 'restarting…' : 'Restart hub'}
+            </button>
+            {#if restartState !== 'idle'}
+              <span class="restart-msg {restartState}">{restartMsg}</span>
+            {/if}
+          </div>
+          <p class="hint dim">Cleanly recycles the hub under the supervisor (blue-green flip — sub-second, running sessions restored). No approval needed; a plain hub with no supervisor can't self-restart.</p>
         </div>
       {/if}
     </section>
@@ -458,4 +495,8 @@
   .prac-revoke { margin-left: auto; padding: 0.15rem 0.5rem; font-size: var(--text-2xs); }
   .prac-body { font-size: var(--text-xs); line-height: 1.5; margin-top: var(--space-2); white-space: pre-wrap; }
   .prac-prov { font-size: var(--text-2xs); font-family: var(--mono); margin-top: var(--space-2); }
+  .restart-row { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }
+  .restart-msg { font-size: var(--text-xs); line-height: 1.45; }
+  .restart-msg.restarting { color: var(--warn); }
+  .restart-msg.error { color: var(--bad-text); }
 </style>
