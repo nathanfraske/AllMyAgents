@@ -1025,7 +1025,10 @@ class HubStore {
       default:
         break
     }
-    this.touch(view, ts)
+    // `session/activity` carries the REAL (older) last-turn time for an imported chat, and a
+    // title/rename is not fresh activity — neither may bump lastActivity to the event's "now" time,
+    // which regressed imported chats to "just now" on import + on open.
+    if (kind !== 'session/activity' && kind !== 'session/titled') this.touch(view, ts)
   }
 
   private applyClaudeAssistant(view: SessionView, ts: string, payload: unknown): void {
