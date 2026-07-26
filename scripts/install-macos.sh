@@ -87,8 +87,25 @@ if [ -e "$DEST_DIR/$APP" ]; then
 fi
 
 say "Installing to $DEST_DIR..."
-cp -R "$TMP/mnt/$APP" "$DEST_DIR/" 2>/dev/null || sudo cp -R "$TMP/mnt/$APP" "$DEST_DIR/" || die "could not copy into $DEST_DIR"
+USED_SUDO=0
+if ! cp -R "$TMP/mnt/$APP" "$DEST_DIR/" 2>/dev/null; then
+  sudo cp -R "$TMP/mnt/$APP" "$DEST_DIR/" || die "could not copy into $DEST_DIR"
+  USED_SUDO=1
+fi
 hdiutil detach "$TMP/mnt" >/dev/null 2>&1 || true
+
+# THE APP MUST BE OWNED BY THE USER WHO WILL RUN IT, or auto-update silently stops working.
+#
+# On macOS the Tauri updater replaces the .app bundle in place, running as the logged-in user. A
+# root-owned bundle — which is exactly what `sudo cp` above leaves behind — cannot be written by that
+# user, so every future update fails. The app keeps offering the update and it keeps not applying,
+# which is a far worse failure than a noisy one: it looks like the updater is broken rather than the
+# permissions. /Applications is group-writable by admins, so the sudo path is rare, but "rare" here
+# means "one tester whose updates mysteriously never stick".
+if [ "$USED_SUDO" = 1 ]; then
+  sudo chown -R "$(id -u):$(id -g)" "$DEST_DIR/$APP" || die "installed, but could not hand ownership back to you — auto-update would fail"
+fi
+[ -w "$DEST_DIR/$APP" ] || die "installed, but $DEST_DIR/$APP is not writable by you — auto-update would fail"
 
 # Belt and braces. Nothing above should have set the flag, but a previous BROWSER download of the same
 # app can leave a quarantined copy behind, and on some setups the attribute is inherited rather than
