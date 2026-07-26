@@ -14,14 +14,85 @@ const USER_MAX = 60
  * Names for new chats. Surnames only: short enough for a sidebar row, and a name rather than a
  * description, which is the point — a chat you can refer to ("what did Hopper decide?") before it has
  * done anything worth describing.
+ *
+ * Split into two pools so the owner can choose (see {@link ChatNamePool}). The only offered choices are
+ * "women" and "everyone" — there is deliberately no men-only option. Plain ASCII throughout: these are
+ * matched, stored and typed by operators, so Gödel is `Godel` and Spärck Jones is `Sparck`.
  */
-export const CHAT_NAMES = [
-  'Hopper', 'Fermi', 'Lagrange', 'Curie', 'Noether', 'Meitner', 'Raman', 'Bose',
-  'Franklin', 'Faraday', 'Turing', 'Hubble', 'Sagan', 'Lovelace', 'Ramanujan', 'Euler',
-  'Gauss', 'Maxwell', 'Planck', 'Dirac', 'Feynman', 'Payne', 'Rubin', 'Leavitt',
-  'Tharp', 'Cannon', 'Germain', 'Kovalevskaya', 'Wu', 'Yalow', 'Elion', 'Hodgkin',
-  'Chandrasekhar', 'Bhabha', 'Tesla', 'Carver', 'Just', 'Ochoa', 'Mirzakhani', 'Tu',
+
+/**
+ * Women in computing and science.
+ *
+ * Heavy on computing on purpose, because this is a computing tool and the field's history is fuller than
+ * its reputation: the ENIAC programmers (Bartik, Holberton), the compiler and language people (Hopper,
+ * Sammet, Goldberg, Liskov, Allen), the networks that everything else runs on (Perlman), the chip design
+ * that made modern processors possible (Conway), and the flight software that landed Apollo (Hamilton).
+ *
+ * Johnson, Vaughan, Jackson and Darden are the NASA mathematicians of Hidden Figures — Katherine Johnson
+ * computed the trajectories, Dorothy Vaughan ran the computing group and taught herself FORTRAN when the
+ * machines arrived, Mary Jackson became NASA's first Black female engineer, Christine Darden led the
+ * sonic-boom work.
+ */
+export const WOMEN_CHAT_NAMES = [
+  // Computing
+  'Hopper', 'Lovelace', 'Liskov', 'Allen', 'Perlman', 'Goldberg', 'Conway', 'Hamilton',
+  'Bartik', 'Holberton', 'Keller', 'Sammet', 'Borg', 'Wing', 'Shaw', 'Klawe',
+  'Estrin', 'Rees', 'Granville', 'Blum', 'Sparck', 'Lamarr',
+  // NASA — the Hidden Figures mathematicians, and Annie Easley's rocket-propulsion code
+  'Johnson', 'Vaughan', 'Jackson', 'Darden', 'Easley', 'Ride', 'Jemison', 'Roman',
+  // Physics, chemistry, mathematics
+  'Curie', 'Noether', 'Meitner', 'Franklin', 'Germain', 'Kovalevskaya', 'Wu', 'Yalow',
+  'Elion', 'Hodgkin', 'Ochoa', 'Mirzakhani', 'Tu', 'Clarke', 'Strickland', 'Arnold',
+  'Charpentier', 'Doudna', 'Kariko', 'Blackburn', 'Greider', 'Cori', 'McClintock', 'Ball',
+  // Astronomy and earth science
+  'Payne', 'Rubin', 'Leavitt', 'Tharp', 'Cannon', 'Burnell', 'Ghez', 'Faber',
+  'Herschel', 'Somerville', 'Anning',
 ] as const
+
+/**
+ * Men in computing and science — the rest of the pool, used only when the owner picks "everyone".
+ *
+ * Same bias toward computing: the theory (Turing, Church, Kleene, Godel, Shannon), the languages and
+ * systems (Backus, McCarthy, Dijkstra, Hoare, Knuth, Wirth, Ritchie, Thompson), the network (Cerf, Kahn,
+ * Postel, Berners-Lee), the interfaces (Engelbart, Kay, Sutherland), the cryptography (Diffie, Hellman,
+ * Rivest, Shamir, Adleman), complexity (Karp, Cook, Yao, Valiant, Rabin), and modern machine learning
+ * (Hinton, LeCun, Bengio).
+ */
+export const MEN_CHAT_NAMES = [
+  // Computing — theory
+  'Turing', 'Church', 'Kleene', 'Godel', 'Shannon', 'Neumann', 'Hilbert', 'Boole',
+  'Frege', 'Babbage', 'Karp', 'Cook', 'Yao', 'Valiant', 'Rabin', 'Hamming',
+  // Computing — languages, systems, practice
+  'Knuth', 'Dijkstra', 'Hoare', 'Backus', 'McCarthy', 'Minsky', 'Codd', 'Ritchie',
+  'Thompson', 'Kernighan', 'Torvalds', 'Stallman', 'Milner', 'Naur', 'Wirth', 'Strachey',
+  'Iverson', 'Perlis', 'Newell', 'Simon', 'Wilkes', 'Corbato', 'Lamport', 'Wiener',
+  // Networks, interfaces, cryptography
+  'Cerf', 'Kahn', 'Postel', 'Engelbart', 'Kay', 'Sutherland', 'Diffie', 'Hellman',
+  'Rivest', 'Shamir', 'Adleman',
+  // Machine learning
+  'Hinton', 'LeCun', 'Bengio',
+  // Physics, mathematics, chemistry
+  'Fermi', 'Lagrange', 'Raman', 'Bose', 'Faraday', 'Hubble', 'Sagan', 'Ramanujan',
+  'Euler', 'Gauss', 'Maxwell', 'Planck', 'Dirac', 'Feynman', 'Chandrasekhar', 'Bhabha',
+  'Tesla', 'Carver', 'Just',
+] as const
+
+/** Which pool a new chat's name is drawn from. There is no men-only option, by design. */
+export type ChatNamePool = 'women' | 'everyone'
+
+/** The default pool when nothing is configured. */
+export const DEFAULT_CHAT_NAME_POOL: ChatNamePool = 'everyone'
+
+/**
+ * The full pool. Women first so that "everyone" is not a list where the women are an appendix — the
+ * generator walks from a hashed offset, so order does not bias selection, but it does decide what a
+ * reader sees first.
+ */
+export const CHAT_NAMES = [...WOMEN_CHAT_NAMES, ...MEN_CHAT_NAMES] as const
+
+export function chatNamesFor(pool: ChatNamePool = DEFAULT_CHAT_NAME_POOL): readonly string[] {
+  return pool === 'women' ? WOMEN_CHAT_NAMES : CHAT_NAMES
+}
 
 /**
  * A stable name for a new chat, derived from its session id so it can never be rolled twice.
