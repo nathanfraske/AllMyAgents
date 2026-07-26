@@ -148,7 +148,13 @@ async function up() {
     env,
     cwd: HUB,
     stdio: ['ignore', logFd, logFd],
-    detached: process.platform !== 'win32',
+    // Detached on EVERY platform. Detaching only on POSIX meant the Windows child stayed tied to this
+    // launcher's process group and died the moment `up` returned — the sandbox reported itself healthy
+    // (it genuinely was, briefly) and then vanished, which reads as "the hub crashed" rather than "the
+    // thing that started it exited". windowsHide keeps a detached child from opening a console window;
+    // stdout/stderr already go to the log file.
+    detached: true,
+    windowsHide: true,
   })
   child.unref()
   fs.writeFileSync(PIDFILE, String(child.pid))
@@ -204,16 +210,39 @@ async function status() {
   console.log(`log       ${LOG}`)
 }
 
+/**
+ * The throwaway APP: a Vite dev server whose proxy points at the sandbox hub instead of the live one.
+ *
+ * Runs on its own port so it cannot collide with a dev server the operator already has open, and it is
+ * the real web UI — same code the desktop shell loads — so the full lifecycle (spawn, approve, interrupt,
+ * stop, restart) can be exercised end to end against disposable state. Blocking, because it is a server:
+ * Ctrl-C stops it, and it does not touch the sandbox hub's lifecycle either way.
+ */
+async function app() {
+  if (!(await health())) {
+    console.error(`no sandbox hub on ${PORT}. Run 'node scripts/sandbox.mjs up' first.`)
+    process.exit(1)
+  }
+  const webPort = Number(process.env.SANDBOX_WEB_PORT ?? 5274) // 5273 is the normal dev server
+  console.log(`sandbox app  http://127.0.0.1:${webPort}  →  hub 127.0.0.1:${PORT}`)
+  const child = spawn(
+    process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm',
+    ['--filter', 'web', 'dev', '--port', String(webPort), '--strictPort'],
+    { cwd: REPO, stdio: 'inherit', env: { ...process.env, HUB_URL: `http://127.0.0.1:${PORT}` } }
+  )
+  await new Promise((resolve) => child.on('exit', resolve))
+}
+
 async function reset() {
   await down()
   fs.rmSync(ROOT, { recursive: true, force: true })
   console.log(`sandbox state deleted: ${ROOT}`)
 }
 
-const commands = { up, down, status, reset, logs: () => console.log(tail(200)) }
+const commands = { up, down, status, reset, app, logs: () => console.log(tail(200)) }
 const run = commands[cmd]
 if (!run) {
-  console.error(`unknown command '${cmd}'. Use: up | down | status | logs | reset`)
+  console.error(`unknown command '${cmd}'. Use: up | app | down | status | logs | reset`)
   process.exit(2)
 }
 await run()

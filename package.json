@@ -25,6 +25,8 @@
     "sandbox": "node scripts/sandbox.mjs",
     "sandbox:up": "node scripts/sandbox.mjs up",
     "sandbox:down": "node scripts/sandbox.mjs down",
-    "sandbox:reset": "node scripts/sandbox.mjs reset"
+    "sandbox:reset": "node scripts/sandbox.mjs reset",
+    "sandbox:app": "node scripts/sandbox.mjs app",
+    "drive": "node scripts/sandbox-drive.mjs"
   }
 }
