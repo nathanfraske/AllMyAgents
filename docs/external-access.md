@@ -140,15 +140,23 @@ rules. The default should simply not be "everything".
 
 **L overall**, dominated by B.4 rather than by MCP itself.
 
-1. **HTTP transport for the existing server (M).** Streamable HTTP alongside stdio, still loopback-bound,
-   still device-token-gated. Useful on its own — it is what a *local* external process (a CLI, a script)
-   would use — and it proves the transport without touching auth or exposure.
-2. **External identity minting + the allow-list (M).** B.2 and B.5. Do this *before* anything is reachable
-   from outside, so the endpoint is never briefly permissive.
-3. **OAuth + exposure (L).** B.4. The real work.
+1. **HTTP transport + external identity + the allow-list, as ONE slice (M).** Streamable HTTP alongside
+   stdio, still loopback-bound and device-token-gated.
 
-Steps 1 and 2 are worth doing regardless — they are the parts that make step 3 safe rather than the parts
-that make it possible.
+   These were originally listed as two steps, which was wrong: the transport cannot ship without them.
+   Every tool body demands a caller identity (B.2), so the moment an HTTP request can reach a tool, the
+   question "whose identity does this run as" is already answered — either deliberately, or by whatever
+   placeholder got typed first. There is no coherent intermediate state where the transport exists and
+   identity does not, and a placeholder identity is precisely the bug B.2 exists to prevent. Same for the
+   allow-list: a transport that reaches every tool and is narrowed afterwards has an interval where it
+   does not.
+
+2. **OAuth + exposure (L).** B.4. The real work, and the only part that makes the endpoint reachable from
+   outside.
+
+Slice 1 is worth building regardless of whether slice 2 ever happens — a *local* external process (a CLI,
+a script, another agent on the same machine) can use it as-is, and it is what makes slice 2 safe rather
+than merely possible.
 
 ---
 
