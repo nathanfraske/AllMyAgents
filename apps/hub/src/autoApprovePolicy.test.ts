@@ -277,10 +277,21 @@ describe('SessionManager.isAutoApproved — full access is not a blanket yes', (
       expect(s.isAutoApproved('s1', 'practice/write', { scope: 'project:p' })).toBe(false)
     })
 
-    it('frees a Codex file change too, for cross-vendor parity', () => {
+    /**
+     * Edits mode is Claude-only, deliberately. This test previously asserted the opposite — I had freed
+     * Codex file changes "for cross-vendor parity" and rolled it back after review, then failed to update
+     * the test, which is how CI caught it.
+     *
+     * The two are not the same act. The Claude branch is only safe because checkWriteScope has ALREADY
+     * denied out-of-worktree writes inside canUseTool before this policy runs. A Codex file-change
+     * approval reaches ApprovalService straight from the app-server, never passes through containment,
+     * carries no paths (they live on a preceding item), and may carry a grantRoot that WIDENS writable
+     * scope. Freeing it would grant an uncontained write on the strength of a mode whose promise is
+     * "auto-approve file edits *in this worktree*". Parity of wording is not parity of guarantee.
+     */
+    it('does NOT free a Codex file change, which never passes through containment', () => {
       const s = editsChat()
-      expect(s.isAutoApproved('s1', 'codex/item/fileChange/requestApproval', {})).toBe(true)
-      // …but not command execution, which is not an edit.
+      expect(s.isAutoApproved('s1', 'codex/item/fileChange/requestApproval', {})).toBe(false)
       expect(s.isAutoApproved('s1', 'codex/item/commandExecution/requestApproval', {})).toBe(false)
     })
 
