@@ -260,10 +260,14 @@ describe('defaultWorkerSocket', () => {
     expect(defaultWorkerSocket('/data')).toBe('/custom/worker.sock')
   })
 
-  it('falls back to the platform default under data/ when the env var is absent', () => {
+  // The Windows expectation here USED to be the fixed pipe `\\.\pipe\allmyagents-worker`, which is the
+  // bug it was meant to describe: a named pipe is a GLOBAL name, so every hub on the machine shared one
+  // worker however isolated its port and database were. The endpoint is now keyed by data dir on both
+  // platforms; see workerSocketIsolation.test.ts for the properties that actually matter.
+  it('falls back to a data-dir-keyed default when the env var is absent', () => {
     delete process.env.HUB_WORKER_SOCKET
     const got = defaultWorkerSocket('/data')
-    if (process.platform === 'win32') expect(got).toBe('\\\\.\\pipe\\allmyagents-worker')
+    if (process.platform === 'win32') expect(got).toMatch(/^\\\\\.\\pipe\\allmyagents-worker-[0-9a-f]+$/)
     else expect(got).toBe('/data/worker.sock')
   })
 
@@ -277,7 +281,9 @@ describe('defaultWorkerSocket', () => {
     const deep = `/${'nested-directory'.repeat(12)}/data` // comfortably over 104 bytes
     const got = defaultWorkerSocket(deep)
     if (process.platform === 'win32') {
-      expect(got).toBe('\\\\.\\pipe\\allmyagents-worker')
+      // Named pipes have no length limit, so the POSIX degradation does not apply — but the name is still
+      // keyed by data dir, so a deep path must not collapse onto some other instance's endpoint.
+      expect(got).toMatch(/^\\\\\.\\pipe\\allmyagents-worker-[0-9a-f]+$/)
     } else {
       expect(got).not.toContain(deep)
       expect(Buffer.byteLength(got)).toBeLessThan(104)
