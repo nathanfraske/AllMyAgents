@@ -29,13 +29,19 @@
  *     branches here are only the TRUE >HUB_RELAY_TIMEOUT_MS orphan).
  *   - Transient-gap queue tuning (drain pre-signal, stable-callId write dedup) is STEP 7.
  */
-import path from 'node:path'
 import { ClaudeDriver } from './adapters/claude.js'
-import { CodexClient, codexRequestResult, isOwnAgentServerRequest } from './adapters/codex.js'
+import {
+  CodexClient,
+  codexRequestResult,
+  isOwnAgentServerRequest,
+  codexTurnErrorMessage,
+  codexTurnOutcome,
+} from './adapters/codex.js'
 import { buildAgentMcpServer, type AgentServices } from './agentTools.js'
 import { AUTO_ALLOW_TOOLS, SELF_GATING_TOOLS } from './executor.js'
 import { WseqBuffer, type BufferedEvent } from './wseqBuffer.js'
 import { WorkerServer } from './workerTransport.js'
+import { checkWriteScope } from './writeScope.js'
 import type { BusMessage } from './bus.js'
 import type { Memory } from './memory.js'
 import type { Practice } from './practices.js'
@@ -610,7 +616,21 @@ export class AgentWorker {
     // Turn completion is detected here (codex-specific) and re-expressed as the uniform turnCompleted
     // lifecycle — the hub no longer sniffs `codex/turn/completed` (§3.2). Codex's vendorSessionId is the
     // threadId, already persisted at startThread, so it is not re-sent here.
-    if (kind === 'codex/turn/completed') this.emitTurnCompleted(sessionId)
+    if (kind === 'codex/turn/completed') {
+      // Every codex turn — success, interruption, failure — arrives as turn/completed; turn.status tells
+      // them apart. Emitting turnCompleted unconditionally reported a FAILED turn as a successful one,
+      // which is the false-green this project has now produced three separate ways.
+      const outcome = codexTurnOutcome(payload)
+      if (outcome.kind === 'failed') this.emitTurnError(sessionId, outcome.message)
+      else this.emitTurnCompleted(sessionId)
+    }
+    // A failed Codex turn is TERMINAL and must emit a lifecycle, exactly like a completed one. Only
+    // `turn/completed` used to, so `turn/error` left this session in `activeTurns` forever: the hub's
+    // busySessions stayed set, the "a turn is already in progress" guard refused every later send, and —
+    // now that listLive derives Codex status from activeTurns so turns can replay-survive — a successor
+    // hub would go on reporting the dead turn as active across every restart. Deliberately NOT mapped to
+    // turnCompleted: that would resurrect the false-green we just removed from the Claude path.
+    else if (kind === 'codex/turn/error') this.emitTurnError(sessionId, codexTurnErrorMessage(payload))
   }
 
   /**
@@ -639,24 +659,17 @@ export class AgentWorker {
       this.emitEvent(spec.sessionId, 'approval/auto-denied-scope', { toolName, reason: scopeError })
       return { behavior: 'deny', message: scopeError }
     }
-    // FULL ACCESS MEANS FULL ACCESS — never raise an operator prompt in `full` mode.
-    //
-    // The comment above this method used to assert "under `full` (bypassPermissions) the SDK skips this
-    // callback entirely, so tools run freely there", and the whole no-prompt behaviour of full mode rested
-    // on that. It is not true: the SDK documents canUseTool as "called before each tool execution", and an
-    // explicitly-supplied handler is consulted regardless of permissionMode. So every non-auto-allowed tool
-    // still relayed to the hub and prompted the operator — with `full` selected — and a prompt they did not
-    // answer within APPROVAL_TIMEOUT_MS failed CLOSED, killing the tool call with "denied from hub".
-    //
-    // Gate on the mode ourselves instead of trusting the vendor to suppress the callback. This is the same
-    // class of bug as assuming an empty APPLE_CERTIFICATE means "skip signing": inferring a vendor's
-    // behaviour from a plausible-sounding premise instead of gating on it explicitly.
-    //
-    // Deliberately placed AFTER the bus hard-deny and the write-scope check, not before. Those two DENY and
-    // never prompt anyone, so they are not what the operator is complaining about, and the bus self-gate in
-    // particular is a security control against semi-trusted teammate messages — `full` is the operator
-    // trusting THEMSELVES, not the operator trusting another agent's message to act through them.
-    if (spec.permissionMode === 'full') return { behavior: 'allow', updatedInput: input }
+    // NOTE: `full` is deliberately NOT short-circuited here. An earlier fix did exactly that — allow
+    // locally whenever spec.permissionMode === 'full' — which stopped the spurious prompts but created a
+    // SECOND permission authority inside the worker, and a worse one:
+    //   - it never reaches the hub, so nothing is journaled: full-access tool runs had no audit trail;
+    //   - it never consults the hub's policy, so the bus-origin clamp, the eligible-kind whitelist and the
+    //     never-auto-approve list were all bypassed for exactly the mode that most needs them;
+    //   - `spec` is captured at TURN START, so switching the chat Full → Safe mid-turn changed the pill
+    //     and changed nothing else. The operator would believe they had tightened access while every
+    //     remaining tool in that turn still ran unchecked. Tightening must never be cosmetic.
+    // Relaying always, and letting the hub's single policy decide, costs one round-trip and buys back the
+    // audit trail, the provenance checks, and a mode the operator can actually change mid-turn.
     // The generic operator gate: RELAY to the hub (step 4). In-process this is
     // `approvals.request(sessionId, 'claude/tool', {toolName, input})`; here it crosses the socket.
     try {
@@ -699,17 +712,10 @@ export class AgentWorker {
     return reply.approved
   }
 
+  /** Worktree containment. Shared with InProcessExecutor via ./writeScope.js — see the note there on why
+   *  this must not exist twice, and on the NotebookEdit escape both copies used to have. */
   private checkWriteScope(spec: WorkerSessionSpec, toolName: string, input: unknown): string | undefined {
-    if (!spec.worktree) return undefined
-    if (!['Write', 'Edit', 'NotebookEdit'].includes(toolName)) return undefined
-    const filePath = (input as { file_path?: string } | null)?.file_path
-    if (!filePath) return undefined
-    const resolved = path.resolve(spec.cwd, filePath).toLowerCase()
-    const root = spec.worktree.toLowerCase()
-    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
-      return `write to ${filePath} is outside this session's worktree (${spec.worktree}) — use a path inside the worktree`
-    }
-    return undefined
+    return checkWriteScope(spec, toolName, input)
   }
 
   private sessionForThread(threadId: string): string | undefined {

@@ -222,6 +222,26 @@ describe('AgentWorker.listLive — status semantics mirror InProcessExecutor (§
     expect(byId.get('x-codex')?.status).toBe('active')
   })
 
+  /**
+   * REGRESSION — a FAILED codex turn used to leave the session live forever.
+   *
+   * The adapter treats turn/error as terminal (it clears its own activeTurns for both completed and
+   * error), but the worker emitted a lifecycle only for turn/completed. So on turn/error the session
+   * stayed in activeTurns: the hub's busy set stayed set, "a turn is already in progress" refused every
+   * later send, and — now that listLive derives codex status from activeTurns — a successor hub would
+   * report the dead turn as active across every restart. A chat bricked by a turn that had already ended.
+   */
+  it('a codex turn/error ends the turn instead of leaving the session live forever', () => {
+    const w = makeWorker()
+    w.codexThreads.set('x-codex', 'thread-1')
+    w.emitTurnStarted('x-codex')
+    expect(new Map(w.listLive().map((s) => [s.sessionId, s])).get('x-codex')?.status).toBe('active')
+
+    // The worker's own codex event path must translate the failure into a terminal lifecycle.
+    w.emitTurnError('x-codex', 'boom')
+    expect(new Map(w.listLive().map((s) => [s.sessionId, s])).get('x-codex')?.status).toBe('idle')
+  })
+
   it('a codex session returns to idle once its turn completes or errors', () => {
     const w = makeWorker()
     w.codexThreads.set('done', 'thread-done')

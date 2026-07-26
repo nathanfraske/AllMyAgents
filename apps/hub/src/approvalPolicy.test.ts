@@ -97,6 +97,21 @@ describe('ApprovalService — auto-approve policy', () => {
   })
 
   /**
+   * SECURITY — the policy must be a positive whitelist of ordinary execution permissions, never
+   * "full ⇒ every kind". These assertions encode the shape; SessionManager.isAutoApproved implements it
+   * and is covered by sessions-level tests. Kept here so the contract is stated where the gate lives.
+   */
+  it('an unrecognised approval kind is never auto-approved by a permissive policy shape', () => {
+    const { approvals } = makeService()
+    // A policy that only says yes to ordinary tool execution, as SessionManager's does.
+    approvals.setAutoApprove((_s, kind) => kind === 'claude/tool')
+
+    void approvals.request('s1', 'practice/write', { scope: 'project:p' })
+    expect(approvals.pending()).toHaveLength(1) // a self-gated kind still reaches the operator
+    approvals.resolve(approvals.pending()[0]!.id, false)
+  })
+
+  /**
    * Ordering guard: the resolved-before-crash recovery (§7.2) must still win over the policy. A worker
    * re-issuing a stable id after a hub restart has to get the operator's ORIGINAL decision — including a
    * DENIAL — rather than being silently re-decided by a policy that has since become permissive.
@@ -109,5 +124,31 @@ describe('ApprovalService — auto-approve policy', () => {
     const fresh = new ApprovalService(journal) // successor hub: in-memory map is empty, journal is durable
     fresh.setAutoApprove(() => true)
     await expect(fresh.request('s1', 'claude/tool', { toolName: 'Bash' }, 'stable-id')).resolves.toBe(false)
+  })
+
+  /**
+   * SECURITY — a recovered decision must be applied ONCE, not become a standing grant.
+   *
+   * The worker derives the approval id from the payload (stableApprovalId(sessionId, kind, payload)), so
+   * byte-identical invocations collide. While the durable-decision lookup was unbounded, the recovery
+   * meant for "the worker is re-issuing the request that was in flight when the hub died" silently
+   * answered every later identical call too: "Approve once" became approve-this-payload-forever, and
+   * because the lookup runs BEFORE any policy, the grant was reusable across trust origins — a teammate's
+   * bus turn emitting bytes the operator had once approved would execute unprompted.
+   */
+  it('applies a recovered decision only once, so approve-once cannot become a standing grant', async () => {
+    const { approvals, journal } = makeService()
+    void approvals.request('s1', 'claude/tool', { toolName: 'Bash' }, 'same-payload-id')
+    approvals.resolve('same-payload-id', true) // the operator approved this exact payload, once
+
+    const fresh = new ApprovalService(journal)
+    // First re-issue is the legitimate post-restart recovery: it inherits the decision without prompting.
+    await expect(fresh.request('s1', 'claude/tool', { toolName: 'Bash' }, 'same-payload-id')).resolves.toBe(true)
+    expect(fresh.pending()).toHaveLength(0)
+
+    // A LATER invocation with the same content is a new call, not a re-issue: it must be asked about.
+    void fresh.request('s1', 'claude/tool', { toolName: 'Bash' }, 'same-payload-id')
+    expect(fresh.pending()).toHaveLength(1)
+    fresh.resolve(fresh.pending()[0]!.id, false)
   })
 })

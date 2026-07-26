@@ -25,6 +25,7 @@ import type { RelayMethod, WorkerSessionSpec, WorkerToHub } from './workerProtoc
 import { deriveTitle, sanitizeTitle } from './title.js'
 import { discoverImportableChats, importKey, type ImportableChat, type ScanResult } from './importScan.js'
 import { readProfileCommands, type CommandInfo } from './commands.js'
+import { EDIT_TOOLS } from './writeScope.js'
 
 export interface CreateOptions {
   cwd?: string
@@ -80,6 +81,13 @@ export class SessionManager {
   // of the executor's set. Set in deliverBus when a bus turn is kicked off; cleared in setStatus when the
   // session leaves 'active' (turn done/failed/stopped), so it spans the whole bus turn.
   private readonly busTurnSessions = new Set<string>()
+  // Sessions whose CURRENT in-flight turn this hub process started FOR THE OPERATOR (send/create with a
+  // prompt). Auto-approval requires membership here — it is deliberately a positive signal rather than
+  // "not in busTurnSessions", because both sets are in-memory and a hub restart empties them. Absence
+  // therefore means "provenance unknown", which must fail CLOSED (ask the operator): a bus turn whose
+  // clamped spec lives only in the surviving worker would otherwise be judged by the STORED session mode
+  // on the successor hub and silently bypass the clamp again. Cleared in setStatus alongside the bus tag.
+  private readonly operatorTurnSessions = new Set<string>()
   // Codex profiles whose config.toml `[mcp_servers.allmyagents]` we've already (re)written this boot —
   // so the lazy per-profile materialization (ensureCodexMcpConfig, driven from specOf/readCodexLimits) is
   // written once before the app-server starts, not re-read+rewritten on every turn.
@@ -713,7 +721,10 @@ export class SessionManager {
     record.status = status
     // A bus-caused turn's provenance (read by the Codex agent-tool self-gate — execAgentTool's isBusTurn)
     // spans the whole turn; clear it whenever the session leaves the active state (turn done/failed/stopped).
-    if (status !== 'active') this.busTurnSessions.delete(record.id)
+    if (status !== 'active') {
+      this.busTurnSessions.delete(record.id)
+      this.operatorTurnSessions.delete(record.id) // turn over → provenance no longer established
+    }
     this.persist(record)
     this.journal.append(record.id, 'session/status', { status })
     // A session that just went idle can now receive any queued teammate messages. Deferred to a
@@ -789,17 +800,27 @@ export class SessionManager {
       this.autoTitle(record, opts.prompt)
     }
 
+    // A first prompt is an operator turn exactly like a later send, so it gets the same provenance tag —
+    // otherwise the opening message of a full-access chat would prompt for approvals while every
+    // follow-up did not. It must be tagged AFTER setStatus(idle), which clears provenance on any
+    // non-active transition, and immediately before the accepted runTurn.
     if (profile.provider === 'claude') {
       this.setStatus(record, 'idle')
       // The executor builds the driver lazily on this first runTurn (driver construction has no
       // observable side effect, so lazy-vs-eager is invisible). Fire-and-forget, as before.
-      if (opts.prompt) void this.executor.runTurn(this.specOf(record), opts.prompt, 'operator')
+      if (opts.prompt) {
+        this.operatorTurnSessions.add(id)
+        void this.executor.runTurn(this.specOf(record), opts.prompt, 'operator')
+      }
     } else {
       const threadId = await this.executor.startThread(this.specOf(record))
       record.vendorSessionId = threadId
       this.persist(record)
       this.setStatus(record, 'idle')
-      if (opts.prompt) await this.executor.runTurn(this.specOf(record), opts.prompt, 'operator')
+      if (opts.prompt) {
+        this.operatorTurnSessions.add(id)
+        await this.executor.runTurn(this.specOf(record), opts.prompt, 'operator')
+      }
     }
     return record
   }
@@ -953,6 +974,14 @@ export class SessionManager {
     if (!record) throw new Error(`unknown session: ${sessionId}`)
     if (record.status === 'stopped') throw new Error('session is stopped')
     this.usage.assertNotBlocked(record.profileId)
+    // ADMISSION BEFORE SIDE EFFECTS. The busy check used to sit below, after the input had already been
+    // journaled and the chat auto-titled — so a rejected send left a durable `session/input` the model
+    // never received. The client rolls its optimistic bubble back on the error, but the canonical row
+    // survives and reappears on reload: a message that looks sent, was never answered, and can rename the
+    // chat and persist model/effort overrides from a turn that did not happen. Reject first, then mutate.
+    if (record.provider === 'claude' && this.executor.isBusy(sessionId)) {
+      throw new Error('a turn is already in progress')
+    }
     if (override.model) record.model = override.model
     if (override.effort !== undefined) record.effort = override.effort
     if (override.serviceTier !== undefined) record.serviceTier = override.serviceTier
@@ -961,8 +990,15 @@ export class SessionManager {
     // user text back as an event; without this the user's turns vanish on reload). Timestamped.
     this.journal.append(sessionId, 'session/input', { text })
     this.autoTitle(record, text)
+    // Operator provenance is established ONLY immediately before an ACCEPTED runTurn (see
+    // operatorTurnSessions). Tagging earlier — e.g. above the busy check — would let a rejected send
+    // relabel a turn that is already running: a direct /input arriving during an active BUS turn would
+    // journal, tag the session as operator-origin, and then throw, leaving the teammate-caused turn
+    // wearing operator provenance so its next approval auto-runs under the stored `full` mode. That is
+    // the same bypass through a different door, so the tag goes after every path that can reject.
+    // (admission already happened above, before any journal/title/override side effect)
+    this.operatorTurnSessions.add(sessionId)
     if (record.provider === 'claude') {
-      if (this.executor.isBusy(sessionId)) throw new Error('a turn is already in progress')
       void this.executor.runTurn(this.specOf(record), text, 'operator')
     } else {
       await this.executor.runTurn(this.specOf(record), text, 'operator')
@@ -1016,9 +1052,15 @@ export class SessionManager {
    * The hub-side approval policy (installed on ApprovalService via setAutoApprove). Returns true when this
    * request must NOT reach the operator.
    *
-   * Two ways a tool skips the prompt:
-   *   - the chat is in `full` (full access) mode — the operator has already said "don't ask me";
-   *   - the operator previously answered "always allow" for this tool name in this chat.
+   * ALL of the following must hold, and the order is deliberate:
+   *   1. the in-flight turn was started by THIS hub for the OPERATOR (positive provenance — see below);
+   *   2. the approval `kind` is ordinary tool execution (an explicit set, never a prefix match);
+   *   3. the tool is not an interactive decision (a question is not a capability);
+   *   4. and only then: the chat is in `full` mode, or the tool carries an "always allow" grant.
+   *
+   * Every one of 1–3 exists because a mode-only version of this shipped and silently removed a protection
+   * that already existed elsewhere in this file. Treat "full access" as an answer to "may I run tools
+   * without asking", NOT as an answer to "may anything at all proceed unattended".
    *
    * Deciding it here, rather than in each executor's canUseTool, is what makes it reliable AND immediate:
    * this is the single chokepoint both the worker relay and the in-process gate funnel through, and it
@@ -1027,8 +1069,66 @@ export class SessionManager {
   isAutoApproved(sessionId: string, kind: string, payload: unknown): boolean {
     const record = this.sessions.get(sessionId)
     if (!record) return false
-    if (record.permissionMode === 'full') return true
+
+    // (1) ONLY A TURN THIS HUB STARTED FOR THE OPERATOR MAY SKIP THE PROMPT — a POSITIVE test, not
+    // "isn't a bus turn". deliverBus builds its spec with clampMode(record.permissionMode) so a
+    // teammate-caused turn never runs as `full` — "that would let a teammate message drive unapproved
+    // destructive actions". The first version of this policy read the STORED mode and handed that back.
+    // Checking `!busTurnSessions.has(...)` instead would still have been wrong, because BOTH sets are
+    // hub memory: restart the hub mid-bus-turn and the successor boots with empty sets while the worker
+    // carries on holding the only copy of the clamped spec. Its next relayed approval would then be
+    // judged by the stored `full` and auto-approved — the same bypass, reachable through the one event
+    // this project specifically guarantees (a live turn surviving a hub restart).
+    // Requiring positive provenance fails CLOSED there: unknown origin ⇒ ask. The cost is one extra
+    // prompt for a turn that outlived its hub, which is the right price.
+    // Ambiguity fails closed too. These are two independent ambient sets, and nothing guarantees they are
+    // mutually exclusive — a turn that failed before its lifecycle cleanup can leave a stale operator
+    // marker that a later bus delivery then joins. Requiring "operator" alone would let the operator
+    // marker WIN that tie. Only operator-and-not-bus may proceed; bus, both, or neither all ask.
+    if (this.busTurnSessions.has(sessionId)) return false
+    if (!this.operatorTurnSessions.has(sessionId)) return false
+
+    // (2) ONLY ORDINARY EXECUTION PERMISSIONS ARE ELIGIBLE — an explicit set, never a prefix match.
+    // Some approvals are self-gated BY DESIGN and must reach a human even under full access:
+    //   - practice/write + practice/edit change how FUTURE teammates behave, fleet-wide;
+    //   - a Codex MCP elicitation is a question with content, not a capability grant.
+    // This deliberately does NOT use `kind.startsWith('codex/')`: CodexClient routes EVERY app-server
+    // request through the approval handler as `codex/<method>`, so a prefix test would auto-approve any
+    // new or unexpected server request the vendor introduces — an open-ended rule wearing a whitelist's
+    // clothes. An unlisted kind falls through to asking, so an unfamiliar gate is gated by default.
+    if (!AUTO_APPROVABLE_KINDS.has(kind)) return false
+
+    // (3) INTERACTIVE DECISIONS ARE NOT CAPABILITIES. Auto-running AskUserQuestion/ExitPlanMode answers
+    // nothing — it just executes them with no input — so "don't ask me" must not silence them.
     const toolName = (payload as { toolName?: unknown } | null)?.toolName
+    if (typeof toolName === 'string' && NEVER_AUTO_APPROVED_TOOLS.has(toolName)) return false
+
+    if (record.permissionMode === 'full') return true
+
+    // "Edits" mode has to actually free edits. The picker offers it as "auto-approve file edits", but
+    // nothing implemented that: `acceptEdits` was passed to the SDK, which then consulted our own
+    // canUseTool anyway (it is "called before each tool execution"), and no rule here covered it — so an
+    // Edits chat prompted on every Write exactly like Safe. Now that this policy is the single authority,
+    // it is the one place the mode's advertised meaning can be made true.
+    //
+    // Containment still applies first: checkWriteScope denies an out-of-worktree write in canUseTool,
+    // before any approval is requested, so freeing edits never widens WHERE they may land.
+    if (record.permissionMode === 'edits') {
+      // Claude only. The Claude path is safe to free because checkWriteScope has ALREADY denied any write
+      // outside the worktree, inside canUseTool, before this policy is ever consulted.
+      //
+      // Codex file-change approvals are deliberately NOT freed here, though I briefly did so "for
+      // cross-vendor parity". They are not the same act: a Codex approval reaches ApprovalService directly
+      // from the app-server, never passing through checkWriteScope, and the request carries no paths — the
+      // changes live on a preceding item, and it may carry a grantRoot that widens writable scope. So
+      // auto-approving it would have granted an unbounded, uncontained write on the strength of a mode
+      // whose promise is "auto-approve file edits *in this worktree*". Parity of WORDING is not parity of
+      // GUARANTEE, and freeing the weaker one to match is how a safe feature becomes an unsafe one.
+      // Restoring this needs path correlation (itemId → the fileChange item's paths, canonicalised through
+      // the same guard) and/or pinning the turn's sandboxPolicy writableRoots to the worktree.
+      if (kind === 'claude/tool' && typeof toolName === 'string' && EDIT_TOOLS.has(toolName)) return true
+    }
+
     return typeof toolName === 'string' && (record.allowedTools?.includes(toolName) ?? false)
   }
 
@@ -1044,6 +1144,11 @@ export class SessionManager {
     const record = this.sessions.get(sessionId)
     if (!record) throw new Error(`unknown session: ${sessionId}`)
     if (!toolName) throw new Error('toolName is required')
+    // Refused at the source, not just hidden in the UI: a standing grant for an interactive decision tool
+    // would make every future question run itself with no answer, which is worse than being asked.
+    if (NEVER_AUTO_APPROVED_TOOLS.has(toolName)) {
+      throw new Error(`${toolName} asks you to decide something, so it cannot be always-allowed`)
+    }
     const next = new Set(record.allowedTools ?? [])
     next.add(toolName)
     record.allowedTools = [...next]
@@ -1334,6 +1439,46 @@ export class SessionManager {
 
 // A bus-delivered turn is triggered by another agent, so its permissions are clamped: it never runs
 // with `full` (bypass) — that would let a teammate message drive unapproved destructive actions.
+/**
+ * Tools that ASK THE OPERATOR SOMETHING rather than request a capability. Approving one of these does not
+ * answer it — it just runs the tool with no input — so they can never be auto-approved and can never be
+ * "always allowed", no matter the permission mode. Silencing a question is not the same as granting a
+ * permission, and treating them alike means the operator stops seeing questions they were meant to answer.
+ */
+const NEVER_AUTO_APPROVED_TOOLS = new Set(['AskUserQuestion', 'ExitPlanMode'])
+
+/**
+ * Approval kinds that represent ORDINARY TOOL EXECUTION and may therefore be auto-approved by full access
+ * or an always-allow grant. Everything else — practice writes, MCP elicitations, and any gate added later
+ * — falls through to the operator.
+ *
+ * Listed explicitly rather than matched by prefix. Codex surfaces every app-server request as
+ * `codex/<method>`, so `startsWith('codex/')` would silently enrol any future request type the vendor
+ * adds. If a Codex execution method is missing here the failure mode is an extra prompt, which is the
+ * direction this should fail in; add the exact method name when one is observed.
+ */
+const AUTO_APPROVABLE_KINDS = new Set([
+  'claude/tool',
+  // Codex app-server approval methods, surfaced by CodexClient as `codex/<method>`. The `item/*` names are
+  // what the currently-installed Codex speaks; the two bare names are the older spelling, kept so a
+  // downgrade does not silently start prompting. Listing a name that no longer exists is inert.
+  //
+  // PROVENANCE: these were read out of the compiled Codex binary, not from a type definition, because the
+  // app-server is native and our adapter forwards method strings generically — so nothing in this repo
+  // declares them. Treat them as observed rather than specified, and confirm against a real captured
+  // request when one is available. The failure mode if a name is wrong or missing is an extra approval
+  // prompt, never an unasked-for execution, which is the direction this list must fail in.
+  'codex/item/commandExecution/requestApproval',
+  'codex/item/fileChange/requestApproval',
+  'codex/execCommandApproval',
+  'codex/applyPatchApproval',
+  // DELIBERATELY ABSENT: 'codex/item/permissions/requestApproval'. Despite matching the naming pattern it
+  // is not ordinary command execution — it negotiates capability grants (filesystem root, network access,
+  // additional permissions), which is a different question from "may this command run". Auto-approving a
+  // request to WIDEN what the agent may do, because the operator said "don't ask me about tool calls", is
+  // the same category error as the full-access-means-everything bug this whole list exists to prevent.
+])
+
 function clampMode(mode: SessionRecord['permissionMode']): 'safe' | 'edits' | 'full' {
   return mode === 'full' ? 'edits' : mode ?? 'safe'
 }

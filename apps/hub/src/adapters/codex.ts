@@ -50,6 +50,53 @@ export const CODEX_ELICITATION_METHOD = 'mcpServer/elicitation/request'
  * answering an elicitation with `{decision:'accept'}` is read as a REJECTION — the agent is simply told
  * "user rejected MCP tool call". Observed exactly that: an approved Codex tool call came back rejected.
  */
+/**
+ * Best-effort human reason from a `codex/turn/error` payload, shared by both executors so the two report
+ * a failed Codex turn identically.
+ *
+ * NEVER returns blank. A terminal event whose message renders as an empty string produces exactly the
+ * failure this project keeps hitting: the UI shows *something went wrong* with no way to learn what, or
+ * worse, an empty error card. Same rule as the Claude result path, which had to stop reading a field that
+ * does not exist on the error shape.
+ */
+export function codexTurnErrorMessage(payload: unknown): string {
+  const p = payload as { error?: unknown; message?: unknown } | null
+  const err = p?.error
+  const fromError =
+    typeof err === 'string' ? err : typeof (err as { message?: unknown } | null)?.message === 'string' ? ((err as { message: string }).message) : undefined
+  const direct = typeof p?.message === 'string' ? p.message : undefined
+  return (fromError ?? direct ?? '').trim() || 'codex reported a turn error with no message'
+}
+
+/** How a Codex turn actually ended. `unknown` is deliberately distinct from `completed`. */
+export type CodexTurnOutcome =
+  | { kind: 'completed' }
+  | { kind: 'interrupted' }
+  | { kind: 'failed'; message: string }
+  | { kind: 'unknown' }
+
+/**
+ * Read the terminal outcome from a `codex/turn/completed` payload.
+ *
+ * EVERY turn ends with turn/completed — success, interruption and failure alike — and `turn.status`
+ * (completed | interrupted | failed) is what distinguishes them, with `turn.error` carrying the reason.
+ * Both executors used to treat the event itself as success and never look at the status, so a genuinely
+ * FAILED Codex turn stopped the spinner and reported plain "ready", with the reason discarded. That is the
+ * same defect as the blank Claude error card, arrived at from the opposite direction: there we rendered an
+ * error with no text, here we render no error at all.
+ *
+ * An unrecognised or missing status returns `unknown`, never `completed`. Treating "I do not recognise
+ * this" as success is how a failure gets a green tick.
+ */
+export function codexTurnOutcome(payload: unknown): CodexTurnOutcome {
+  const turn = (payload as { turn?: { status?: unknown; error?: unknown } } | null)?.turn
+  const status = typeof turn?.status === 'string' ? turn.status : undefined
+  if (status === 'completed') return { kind: 'completed' }
+  if (status === 'interrupted') return { kind: 'interrupted' }
+  if (status === 'failed') return { kind: 'failed', message: codexTurnErrorMessage(turn) }
+  return { kind: 'unknown' }
+}
+
 export function codexRequestResult(method: string, approved: boolean): Record<string, string> {
   return method === CODEX_ELICITATION_METHOD
     ? { action: approved ? 'accept' : 'decline' }

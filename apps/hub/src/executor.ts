@@ -1,6 +1,12 @@
-import path from 'node:path'
 import { ClaudeDriver } from './adapters/claude.js'
-import { CodexClient, mapCodexTokenUsage, codexRequestResult, isOwnAgentServerRequest } from './adapters/codex.js'
+import {
+  CodexClient,
+  mapCodexTokenUsage,
+  codexRequestResult,
+  isOwnAgentServerRequest,
+  codexTurnErrorMessage,
+  codexTurnOutcome,
+} from './adapters/codex.js'
 import { buildAgentMcpServer, type AgentServices } from './agentTools.js'
 import type { SessionIdentity } from './identity.js'
 import type { ApprovalService } from './approvals.js'
@@ -10,6 +16,7 @@ import type { PracticeStore } from './practices.js'
 import type { BusAddress, BusMessage } from './bus.js'
 import type { ClaudeLimitInfo, DangerFlags, SessionStatus } from './types.js'
 import type { LiveSession, WorkerSessionSpec } from './workerProtocol.js'
+import { checkWriteScope } from './writeScope.js'
 
 /**
  * The Executor seam (docs/agent-worker-impl.md §4.1). Agent execution — the ClaudeDriver / CodexClient
@@ -172,17 +179,10 @@ export class InProcessExecutor implements Executor {
     }
   }
 
+  /** Worktree containment. Shared with AgentWorker via ./writeScope.js — see the note there on why this
+   *  must not exist twice, and on the NotebookEdit escape both copies used to have. */
   private checkWriteScope(spec: WorkerSessionSpec, toolName: string, input: unknown): string | undefined {
-    if (!spec.worktree) return undefined
-    if (!['Write', 'Edit', 'NotebookEdit'].includes(toolName)) return undefined
-    const filePath = (input as { file_path?: string } | null)?.file_path
-    if (!filePath) return undefined
-    const resolved = path.resolve(spec.cwd, filePath).toLowerCase()
-    const root = spec.worktree.toLowerCase()
-    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
-      return `write to ${filePath} is outside this session's worktree (${spec.worktree}) — use a path inside the worktree`
-    }
-    return undefined
+    return checkWriteScope(spec, toolName, input)
   }
 
   private sessionIdForThread(threadId: string): string | undefined {
@@ -209,7 +209,29 @@ export class InProcessExecutor implements Executor {
           const threadId = (payload as { threadId?: string } | null)?.threadId
           const sessionId = threadId ? this.sessionIdForThread(threadId) : undefined
           this.h.journal(sessionId ?? null, kind, payload)
-          if (sessionId && kind === 'codex/turn/completed') this.h.setStatus(sessionId, 'idle')
+          if (sessionId && kind === 'codex/turn/completed') {
+            // EVERY codex turn ends here — success, interruption and failure alike — and turn.status is
+            // what tells them apart. This used to unconditionally setStatus('idle'), so a FAILED turn
+            // reported plain "ready" and its reason was thrown away.
+            const outcome = codexTurnOutcome(payload)
+            if (outcome.kind === 'failed') {
+              this.h.journal(sessionId, 'session/error', { message: outcome.message })
+              this.h.setStatus(sessionId, 'error')
+            } else {
+              // completed / interrupted / unknown all settle the turn; only `completed` is a success, and
+              // the web store decides how to LABEL it from the same turn.status.
+              this.h.setStatus(sessionId, 'idle')
+            }
+          }
+          // A failed Codex turn is TERMINAL and must move the session, exactly like a completed one.
+          // Only `turn/completed` used to transition, so `turn/error` left the record 'active' forever:
+          // the spinner never stopped, no reason was ever shown, and the "a turn is already in progress"
+          // guard then refused every later send. The chat was bricked by a turn that had already ended —
+          // the adapter itself treats turn/error as terminal (it clears its activeTurns for both).
+          else if (sessionId && kind === 'codex/turn/error') {
+            this.h.journal(sessionId, 'session/error', { message: codexTurnErrorMessage(payload) })
+            this.h.setStatus(sessionId, 'error')
+          }
           // Forward the app-server's token-usage notifications to the UI's live counter. The raw
           // `codex/thread/tokenUsage/updated` event is still journaled above for field verification.
           if (sessionId && kind === 'codex/thread/tokenUsage/updated') {
@@ -269,14 +291,11 @@ export class InProcessExecutor implements Executor {
             this.h.journal(spec.sessionId, 'approval/auto-denied-scope', { toolName, reason: scopeError })
             return { behavior: 'deny', message: scopeError }
           }
-          // FULL ACCESS MEANS FULL ACCESS — never prompt in `full` mode. This used to rely on the SDK
-          // skipping canUseTool entirely under bypassPermissions; it does not (it documents the handler as
-          // "called before each tool execution"), so full-access sessions were still prompting the operator
-          // on every tool, and an unanswered prompt fails closed after APPROVAL_TIMEOUT_MS. Kept AFTER the
-          // bus hard-deny and scope check: those deny without prompting, and the bus self-gate protects
-          // against semi-trusted teammate messages rather than against the operator. Mirrors
-          // AgentWorker.canUseTool exactly so both executors behave identically.
-          if (spec.permissionMode === 'full') return { behavior: 'allow', updatedInput: input }
+          // `full` is deliberately NOT short-circuited here — see the matching note in
+          // AgentWorker.canUseTool. Deciding it locally would bypass the hub's single policy (audit trail,
+          // bus-origin clamp, eligible-kind whitelist) and would freeze the mode at turn start, so
+          // tightening a live chat Full → Safe would be cosmetic. ApprovalService.request consults the
+          // policy and returns immediately for an auto-approved call, so this costs no prompt.
           const approved = await this.services.approvals.request(spec.sessionId, 'claude/tool', { toolName, input })
           return approved
             ? { behavior: 'allow', updatedInput: input }

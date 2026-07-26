@@ -4,6 +4,16 @@ import type { ApprovalRecord } from './types.js'
 
 const APPROVAL_TIMEOUT_MS = 10 * 60 * 1000
 
+/**
+ * How long after hub startup a durable approval decision may still be applied to a re-issued id.
+ *
+ * A successor hub re-attaches to the surviving worker within seconds, and the worker re-flushes its
+ * outstanding relays immediately, so the legitimate recovery window is short. Beyond it, a request
+ * carrying an already-decided (content-derived) id is treated as a genuinely new invocation and asked
+ * about again. Generous relative to re-attach, tiny relative to "forever", which is what it replaced.
+ */
+const RESOLVED_RECOVERY_WINDOW_MS = 2 * 60 * 1000
+
 interface PendingEntry {
   record: ApprovalRecord
   resolve: (approved: boolean) => void
@@ -19,6 +29,10 @@ export type AutoApprovePolicy = (sessionId: string, kind: string, payload: unkno
 export class ApprovalService {
   private readonly pendingMap = new Map<string, PendingEntry>()
   private autoApprove: AutoApprovePolicy | undefined
+  /** When this hub process started, bounding the resolved-before-crash recovery (see {@link request}). */
+  private readonly bootAt = Date.now()
+  /** Ids already served from a durable decision, so one recovery never becomes a standing grant. */
+  private readonly recoveredIds = new Set<string>()
 
   constructor(private readonly journal: Journal) {}
 
@@ -66,8 +80,29 @@ export class ApprovalService {
       // Resolved-before-crash recovery (§7.2): this hub's in-memory map is empty (a restart), but the
       // operator's decision may be durable in the journal. Honor it immediately — do NOT re-prompt or
       // re-journal. In-process callers never supply an id, so this is worker-mode only (flag-off unchanged).
-      const resolved = this.journal.resolvedApproval(id)
-      if (resolved !== undefined) return Promise.resolve(resolved === 'approved')
+      //
+      // BOUNDED, because the id is CONTENT-DERIVED. The worker builds it as
+      // stableApprovalId(sessionId, kind, payload), so two invocations with byte-identical payloads share
+      // an id — there is no per-invocation identity to distinguish "the worker is re-issuing the request
+      // that was in flight when the hub died" from "the same command is being run a second time". While
+      // this lookup was unbounded, the first meaning silently granted the second: "Approve once" became
+      // "approve this exact payload forever in this chat", a denial became permanent for exact retries,
+      // and — worst of all — the decision was reusable ACROSS TRUST ORIGINS, since it is consulted before
+      // any policy runs. A teammate's bus turn producing bytes the operator had once approved would
+      // execute with no prompt and no provenance check.
+      //
+      // The recovery only ever needed to cover re-issues that arrive as a successor hub re-attaches, which
+      // happens seconds after boot. Restricting it to a window after startup, and to once per id, keeps
+      // that guarantee while making an ordinary later invocation a fresh request that is asked about
+      // again. This is a containment measure, not the cure: the real fix is per-invocation identity at the
+      // source (the SDK supplies toolUseID/requestId), after which this can key on a true request id.
+      if (!this.recoveredIds.has(id) && Date.now() - this.bootAt <= RESOLVED_RECOVERY_WINDOW_MS) {
+        const resolved = this.journal.resolvedApproval(id)
+        if (resolved !== undefined) {
+          this.recoveredIds.add(id)
+          return Promise.resolve(resolved === 'approved')
+        }
+      }
     }
     // Auto-approval (full access, or a tool the operator chose "always allow" for in this chat). Checked
     // AFTER the dedup/resolved-before-crash lookups above so a re-issued id still returns its recorded

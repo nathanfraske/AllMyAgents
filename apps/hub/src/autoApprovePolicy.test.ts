@@ -1,0 +1,303 @@
+import { describe, expect, it, afterEach } from 'vitest'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { SessionManager } from './sessions.js'
+import { ApprovalService } from './approvals.js'
+import { Journal } from './journal.js'
+import { SessionStore } from './store.js'
+import { ProjectStore } from './projects.js'
+import { UsageMonitor } from './usage.js'
+import { WorkspaceManager } from './workspace.js'
+import { InstructionStore } from './instructions.js'
+import { AgentBus } from './bus.js'
+import { MemoryStore } from './memory.js'
+import { PracticeStore } from './practices.js'
+import type { DangerFlags, SessionRecord } from './types.js'
+
+/**
+ * SECURITY REGRESSION — the hub-side auto-approve policy must not become a blanket "full ⇒ yes".
+ *
+ * Two ways the first version was wrong, both of which silently removed a protection that already existed:
+ *
+ * 1. IT IGNORED THE BUS CLAMP. deliverBus builds its turn spec with clampMode(record.permissionMode) so a
+ *    teammate-caused turn never runs as `full` — the comment there says plainly that otherwise "a teammate
+ *    message [could] drive unapproved destructive actions". The policy read the STORED mode instead, so on
+ *    any chat saved as Full Access a bus message could have run Bash with no operator approval. That is the
+ *    bus injection firewall, defeated by a permissions convenience.
+ *
+ * 2. IT IGNORED THE KIND. practice/write and practice/edit are self-gated on purpose: they change how
+ *    FUTURE teammates behave across the fleet, so they ask even under full access. A mode-only check
+ *    auto-approved them.
+ *
+ * Interactive decision tools are a third case: approving AskUserQuestion does not answer it, it runs it
+ * with no input, so it must never be auto-approved or always-allowed.
+ */
+
+const SAFE: DangerFlags = { busCanUseRiskyTools: false, autoApprovePractices: false, autoApproveRestart: false }
+const dirs: string[] = []
+const opened: Journal[] = []
+afterEach(() => {
+  for (const j of opened.splice(0)) j.db.close()
+  for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true })
+})
+
+function makeSessions(): { sessions: SessionManager; seed: (over?: Partial<SessionRecord>) => SessionRecord } {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-autoapprove-'))
+  dirs.push(dir)
+  const journal = new Journal(path.join(dir, 'hub.db'))
+  opened.push(journal)
+  const store = new SessionStore(journal.db)
+  const sessions = new SessionManager(
+    journal,
+    store,
+    new Map(),
+    new ApprovalService(journal),
+    new UsageMonitor(journal, [], {}),
+    new WorkspaceManager(path.join(dir, 'wt')),
+    new ProjectStore(journal.db),
+    new InstructionStore(journal.db),
+    new AgentBus(journal.db),
+    new MemoryStore(journal.db),
+    new PracticeStore(journal.db),
+    SAFE,
+    false,
+    dir
+  )
+  const seed = (over: Partial<SessionRecord> = {}): SessionRecord => {
+    const record: SessionRecord = {
+      id: 's1',
+      profileId: 'p1',
+      provider: 'claude',
+      cwd: dir,
+      status: 'idle',
+      createdAt: new Date().toISOString(),
+      permissionMode: 'full',
+      ...over,
+    } as SessionRecord
+    ;(sessions as unknown as { sessions: Map<string, SessionRecord> }).sessions.set(record.id, record)
+    return record
+  }
+  return { sessions, seed }
+}
+
+/** Establish operator provenance for the in-flight turn, exactly as send() does. */
+function markOperatorTurn(sessions: SessionManager, id: string): void {
+  ;(sessions as unknown as { operatorTurnSessions: Set<string> }).operatorTurnSessions.add(id)
+}
+
+/** Mark the session as running a bus-caused turn, exactly as deliverBus does. */
+function markBusTurn(sessions: SessionManager, id: string): void {
+  ;(sessions as unknown as { busTurnSessions: Set<string> }).busTurnSessions.add(id)
+}
+
+describe('SessionManager.isAutoApproved — full access is not a blanket yes', () => {
+  it('auto-approves an ordinary tool in full access', () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'full' })
+    markOperatorTurn(sessions, 's1')
+    expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(true)
+  })
+
+  it('does NOT auto-approve a teammate-caused (bus) turn, even on a full-access chat', () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'full' })
+    markBusTurn(sessions, 's1')
+    // deliverBus clamped this turn away from `full`; the policy must honour that, not the stored mode.
+    expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(false)
+  })
+
+  /**
+   * AMBIGUITY FAILS CLOSED. The two provenance sets are independent ambient state and nothing guarantees
+   * they are mutually exclusive: a turn that failed before its lifecycle cleanup can leave a stale
+   * operator marker which a later bus delivery then joins. Requiring "operator" alone would let the
+   * operator marker win that tie, so the bus check is evaluated FIRST.
+   */
+  it('fails closed when BOTH provenance markers are set', () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'full' })
+    markOperatorTurn(sessions, 's1')
+    markBusTurn(sessions, 's1')
+    expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(false)
+  })
+
+  /**
+   * THE RESTART CASE, which is why provenance is a POSITIVE test rather than "not a bus turn".
+   * Both provenance sets are hub memory. Restart the hub mid-bus-turn and the successor boots with them
+   * empty while the surviving worker still holds the only copy of the clamped spec. A "deny if bus"
+   * check would find nothing to deny, read the stored `full`, and reopen the bypass — through the exact
+   * event this project guarantees (a live turn outliving its hub).
+   */
+  it('fails CLOSED when turn provenance is unknown, e.g. a turn that outlived its hub', () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'full' }) // successor hub: record restored, both provenance sets empty
+    expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(false)
+  })
+
+  it('never auto-approves practice writes, which change how future teammates behave', () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'full' })
+    markOperatorTurn(sessions, 's1')
+    expect(sessions.isAutoApproved('s1', 'practice/write', { scope: 'project:p' })).toBe(false)
+    expect(sessions.isAutoApproved('s1', 'practice/edit', { id: 'p9' })).toBe(false)
+  })
+
+  it('never auto-approves a Codex MCP elicitation (a question, not a capability)', () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'full', provider: 'codex' })
+    markOperatorTurn(sessions, 's1')
+    expect(sessions.isAutoApproved('s1', 'codex/mcpServer/elicitation/request', {})).toBe(false)
+    // …but ordinary Codex exec/patch approvals are ordinary execution, for cross-vendor parity.
+    expect(sessions.isAutoApproved('s1', 'codex/item/commandExecution/requestApproval', {})).toBe(true)
+    expect(sessions.isAutoApproved('s1', 'codex/item/fileChange/requestApproval', {})).toBe(true)
+    expect(sessions.isAutoApproved('s1', 'codex/execCommandApproval', {})).toBe(true) // older spelling
+  })
+
+  /**
+   * `item/permissions/requestApproval` matches the same naming pattern as the execution approvals but asks
+   * a categorically different question: it negotiates capability grants (filesystem root, network access).
+   * Auto-approving a request to WIDEN what the agent may do, because the operator said "don't ask me about
+   * tool calls", is the same category error as the full-access-means-everything bug this list prevents.
+   */
+  it('never auto-approves a Codex capability-grant request, only execution', () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'full', provider: 'codex' })
+    markOperatorTurn(sessions, 's1')
+    expect(sessions.isAutoApproved('s1', 'codex/item/permissions/requestApproval', {})).toBe(false)
+  })
+
+  /**
+   * Codex surfaces EVERY app-server request as `codex/<method>`, so a `startsWith('codex/')` whitelist
+   * would enrol any request type the vendor adds later. The earlier version of this test only checked
+   * 'some/future-gate' — which never had the codex prefix, so it passed while the hole was wide open.
+   */
+  it('does not auto-approve an unknown codex/* request just because of its prefix', () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'full', provider: 'codex' })
+    markOperatorTurn(sessions, 's1')
+    expect(sessions.isAutoApproved('s1', 'codex/future/destructiveRequest', {})).toBe(false)
+  })
+
+  it('never auto-approves an interactive decision tool, so questions keep reaching the operator', () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'full' })
+    markOperatorTurn(sessions, 's1')
+    expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'AskUserQuestion' })).toBe(false)
+    expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'ExitPlanMode' })).toBe(false)
+  })
+
+  it('refuses to record an always-allow grant for an interactive decision tool', () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'safe' })
+    expect(() => sessions.allowTool('s1', 'AskUserQuestion')).toThrow(/cannot be always-allowed/)
+  })
+
+  it('an unrecognised approval kind falls through to asking, rather than being granted by default', () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'full' })
+    markOperatorTurn(sessions, 's1')
+    expect(sessions.isAutoApproved('s1', 'some/future-gate', { toolName: 'Bash' })).toBe(false)
+  })
+
+  it('an allowlist grant only covers the tool granted, and only for tool-execution kinds', () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'safe' })
+    markOperatorTurn(sessions, 's1')
+    sessions.allowTool('s1', 'Bash')
+    expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(true)
+    expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Write' })).toBe(false)
+    // a different gate whose payload merely happens to mention the same tool name is NOT covered
+    expect(sessions.isAutoApproved('s1', 'practice/write', { toolName: 'Bash' })).toBe(false)
+  })
+
+  it('an allowlist grant does not survive into a teammate-caused turn either', () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'safe' })
+    sessions.allowTool('s1', 'Bash')
+    markBusTurn(sessions, 's1')
+    expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(false)
+  })
+
+  /**
+   * A REJECTED send must not relabel a turn that is already running.
+   *
+   * send() journals and auto-titles before it checks whether a turn is in flight. If provenance were
+   * tagged there too, a direct /input arriving during an active BUS turn (a second client, an API caller,
+   * a UI race) would mark the session operator-origin and THEN throw — leaving the teammate-caused turn
+   * wearing operator provenance, so its next approval auto-runs under the stored `full` mode. Same
+   * bypass, different door. The tag therefore lives after every path that can reject.
+   */
+  it('a send rejected as busy does not grant operator provenance to a running bus turn', async () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'full' })
+    markBusTurn(sessions, 's1')
+    // The executor reports a turn already in flight, exactly as during a live bus turn.
+    ;(sessions as unknown as { executor: { isBusy(id: string): boolean } }).executor = {
+      isBusy: () => true,
+    } as never
+
+    await expect(sessions.send('s1', 'hello')).rejects.toThrow(/already in progress/)
+    expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(false)
+  })
+
+  /**
+   * "Edits" mode must actually free edits.
+   *
+   * The picker offers it as "auto-approve file edits", but nothing implemented that: `acceptEdits` was
+   * passed to the SDK, which consulted our own canUseTool regardless, and no policy rule covered it — so
+   * an Edits chat prompted on every Write exactly like Safe. The mode was advertised and never delivered.
+   * These assertions are at the POLICY boundary, which is where the mode's meaning now lives; the worker
+   * relay tests in permissionMode.test.ts cover the mechanics and remain correct.
+   */
+  describe('edits mode', () => {
+    const editsChat = () => {
+      const h = makeSessions()
+      h.seed({ permissionMode: 'edits' })
+      markOperatorTurn(h.sessions, 's1')
+      return h.sessions
+    }
+
+    it('auto-approves the file-edit tools', () => {
+      const s = editsChat()
+      for (const tool of ['Write', 'Edit', 'MultiEdit', 'NotebookEdit']) {
+        expect(s.isAutoApproved('s1', 'claude/tool', { toolName: tool })).toBe(true)
+      }
+    })
+
+    it('still asks for anything that is not a file edit', () => {
+      const s = editsChat()
+      expect(s.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(false)
+      expect(s.isAutoApproved('s1', 'claude/tool', { toolName: 'WebFetch' })).toBe(false)
+    })
+
+    it('still asks for interactive decisions and self-gated kinds', () => {
+      const s = editsChat()
+      expect(s.isAutoApproved('s1', 'claude/tool', { toolName: 'AskUserQuestion' })).toBe(false)
+      expect(s.isAutoApproved('s1', 'claude/tool', { toolName: 'ExitPlanMode' })).toBe(false)
+      expect(s.isAutoApproved('s1', 'practice/write', { scope: 'project:p' })).toBe(false)
+    })
+
+    it('frees a Codex file change too, for cross-vendor parity', () => {
+      const s = editsChat()
+      expect(s.isAutoApproved('s1', 'codex/item/fileChange/requestApproval', {})).toBe(true)
+      // …but not command execution, which is not an edit.
+      expect(s.isAutoApproved('s1', 'codex/item/commandExecution/requestApproval', {})).toBe(false)
+    })
+
+    it('does not free edits for a teammate-caused turn', () => {
+      const { sessions, seed } = makeSessions()
+      seed({ permissionMode: 'edits' })
+      markBusTurn(sessions, 's1')
+      expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Write' })).toBe(false)
+    })
+  })
+
+  it('revoking a grant makes the tool ask again', () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'safe' })
+    markOperatorTurn(sessions, 's1')
+    sessions.allowTool('s1', 'Bash')
+    sessions.disallowTool('s1', 'Bash')
+    expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(false)
+  })
+})

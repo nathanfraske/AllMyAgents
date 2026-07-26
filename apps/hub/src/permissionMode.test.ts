@@ -51,24 +51,41 @@ const specWith = (permissionMode: 'safe' | 'edits' | 'full'): WorkerSessionSpec 
     permissionMode,
   }) as unknown as WorkerSessionSpec
 
-describe('AgentWorker.canUseTool — `full` must never raise an operator prompt', () => {
-  it('runs a plain tool with NO approval relay when permissionMode is full', async () => {
+describe('AgentWorker.canUseTool — the hub owns the decision, in every mode', () => {
+  /**
+   * The worker must NOT decide `full` locally. Doing so stopped the spurious prompts but created a second
+   * permission authority with no audit trail, no bus-origin clamp, no eligible-kind whitelist, and a mode
+   * frozen at turn start — so tightening a live chat Full → Safe would have changed the pill and nothing
+   * else. Relaying always is what makes the hub's policy the single, live, audited authority.
+   *
+   * "No prompt in full access" is still true; it is now the HUB's answer (ApprovalService's auto-approve
+   * policy returns immediately) rather than a decision the worker made on its own.
+   */
+  it('relays even in full access, so the hub can audit and apply its policy', async () => {
     const { worker, relayed } = makeGate()
     const res = await worker.canUseTool(specWith('full'), 'Bash', { command: 'ls' })
     expect(res.behavior).toBe('allow')
-    expect(relayed()).toBe(0) // the point: the operator was never asked
+    expect(relayed()).toBe(1)
   })
 
-  it('still asks the operator in safe mode, so the gate is not simply disabled', async () => {
+  it('relays in safe mode', async () => {
     const { worker, relayed } = makeGate()
     const res = await worker.canUseTool(specWith('safe'), 'Bash', { command: 'ls' })
     expect(res.behavior).toBe('allow') // our stub approved it
     expect(relayed()).toBe(1)
   })
 
-  it('still asks in edits mode for a non-edit tool', async () => {
+  it('relays in edits mode for a non-edit tool', async () => {
     const { worker, relayed } = makeGate()
     await worker.canUseTool(specWith('edits'), 'Bash', { command: 'ls' })
     expect(relayed()).toBe(1)
+  })
+
+  /** A denial from the hub is honoured whatever the chat's mode says — the hub is the authority. */
+  it('denies when the hub denies, even on a full-access chat', async () => {
+    const { worker } = makeGate()
+    ;(worker as unknown as { relayApproval: () => Promise<boolean> }).relayApproval = async () => false
+    const res = await worker.canUseTool(specWith('full'), 'Bash', { command: 'ls' })
+    expect(res.behavior).toBe('deny')
   })
 })
