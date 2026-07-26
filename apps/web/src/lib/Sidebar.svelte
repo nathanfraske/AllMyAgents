@@ -91,7 +91,9 @@
     // "delete folder" reads like "delete its contents" and this one genuinely does not.
     if (count > 0) {
       const ok = await confirmDialog(
-        `Delete the folder "${f.name}"? Its ${count} chat${count === 1 ? '' : 's'} move back into the project — no chat is deleted.`,
+        // The VERB has to agree too, not just the noun — "Its 1 chat move back" is what you get from
+        // pluralising only the noun, and a delete confirmation is the last place to look careless.
+        `Delete the folder "${f.name}"? Its ${count} ${count === 1 ? 'chat moves' : 'chats move'} back into the project — no chat is deleted.`,
         { confirmLabel: 'Delete folder' }
       )
       if (!ok) return
