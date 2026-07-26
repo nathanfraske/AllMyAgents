@@ -15,4 +15,4 @@ profiles/
 # working-dir checkouts are machine-local scratch. Never commit them.
 .claude/worktrees/
 # Disposable test hub state (scripts/sandbox.mjs) — journal DB, worktrees, config.
-.sandbox/
+.sandbox*/
