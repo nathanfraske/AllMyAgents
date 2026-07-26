@@ -1172,8 +1172,18 @@ export class SessionManager {
     // mutually exclusive — a turn that failed before its lifecycle cleanup can leave a stale operator
     // marker that a later bus delivery then joins. Requiring "operator" alone would let the operator
     // marker WIN that tie. Only operator-and-not-bus may proceed; bus, both, or neither all ask.
-    if (this.busTurnSessions.has(sessionId)) return false
-    if (!this.operatorTurnSessions.has(sessionId)) return false
+    //
+    // …UNLESS the owner has turned this off in the Danger Zone. The whole check above answers "who caused
+    // this turn", and an owner who set a chat to Full Access may reasonably mean it for every turn in that
+    // chat — a teammate's message, a monitor firing, a turn that outlived its hub. Off by default, because
+    // the reasoning that built this check has not stopped being true: a teammate agent can be mistaken or
+    // prompt-injected, and this hands it the chat's full grant unattended. What it does NOT do is widen the
+    // rules below — the kind whitelist, ask-rules, non-capability tools and write containment are about
+    // WHAT is being asked, not who asked, and every one of them still applies.
+    if (this.danger.fullAccessAnyOrigin !== true) {
+      if (this.busTurnSessions.has(sessionId)) return false
+      if (!this.operatorTurnSessions.has(sessionId)) return false
+    }
 
     // (2) ONLY ORDINARY EXECUTION PERMISSIONS ARE ELIGIBLE — an explicit set, never a prefix match.
     // Some approvals are self-gated BY DESIGN and must reach a human even under full access:
@@ -1435,8 +1445,13 @@ export class SessionManager {
     const framed = frameBusMessages(pending)
     // origin: 'bus' tags the turn so risky in-process tools self-gate (hard-deny) — a teammate
     // message is semi-trusted and must never drive a practice/hook write on its own. The clamped
-    // permission mode rides in the spec (a bus-triggered turn never inherits full/bypass).
-    const spec = { ...this.specOf(record), permissionMode: clampMode(record.permissionMode) }
+    // permission mode rides in the spec, so by default a bus-triggered turn never inherits full/bypass.
+    // The Danger Zone flag lifts the clamp for owners who want the mode they picked to apply to every
+    // turn in the chat; the self-gates above are separate and keep their own busCanUseRiskyTools switch.
+    const spec = {
+      ...this.specOf(record),
+      permissionMode: clampMode(record.permissionMode, this.danger.fullAccessAnyOrigin === true),
+    }
     // Tag this bus-caused turn so a Codex agent tool call (bridge → execAgentTool) sees isBusTurn and
     // hard-denies practice writes — the same self-gate provenance the executor tags for the Claude path.
     // Cleared when the session leaves 'active' (setStatus), so it spans the whole turn.
@@ -1594,8 +1609,21 @@ const AUTO_APPROVABLE_KINDS = new Set([
   // the same category error as the full-access-means-everything bug this whole list exists to prevent.
 ])
 
-function clampMode(mode: SessionRecord['permissionMode']): 'safe' | 'edits' | 'full' {
-  return mode === 'full' ? 'edits' : mode ?? 'safe'
+/**
+ * The permission mode a BUS-caused turn runs at.
+ *
+ * Default (`anyOrigin` false): `full` is clamped down to `edits`, so a teammate's message can never drive
+ * a chat at the level the operator granted for their own use.
+ *
+ * With the Danger Zone flag ON the operator's chosen mode passes through untouched. The argument for
+ * that: the clamp made the mode picker lie — you select Full Access, the app quietly runs something else,
+ * and an unattended agent stalls on a prompt you are not there to answer. The argument against it is
+ * equally real and is why this is OFF by default and lives in the Danger Zone.
+ */
+function clampMode(mode: SessionRecord['permissionMode'], anyOrigin = false): 'safe' | 'edits' | 'full' {
+  const m = mode ?? 'safe'
+  if (anyOrigin) return m
+  return m === 'full' ? 'edits' : m
 }
 
 // Wrap queued messages in the hub-only sentinel frame the agent contract describes: the frame is the

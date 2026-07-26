@@ -297,6 +297,7 @@ export interface DangerFlags {
   autoApprovePractices: boolean
   autoApproveRestart?: boolean
   enableClaudeConnectors?: boolean
+  fullAccessAnyOrigin?: boolean
 }
 
 export interface BusMessage {

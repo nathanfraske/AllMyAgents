@@ -177,6 +177,19 @@ export interface DangerConfig {
    * suppresses cloud connectors — no egress to vendor connectors by default. ON allows them.
    */
   enableClaudeConnectors?: boolean
+  /**
+   * Make a chat's permission mode authoritative for EVERY turn, whoever started it — a teammate's bus
+   * message, a monitor firing, anything. Default OFF, which keeps the clamp: a non-operator turn runs at
+   * most `edits` and never auto-approves.
+   *
+   * ON is the operator saying "Full Access means full access". The reasoning against it is real — a
+   * teammate agent can be wrong or prompt-injected, and this hands it whatever the chat was granted with
+   * nobody watching — but so is the reasoning for it: silently downgrading a mode the operator explicitly
+   * chose makes the picker lie, and an unattended agent that stops dead on a prompt nobody sees is its own
+   * kind of failure. This is a single-owner tool; the mode picker is the guardrail, and this flag decides
+   * whether it means what it says.
+   */
+  fullAccessAnyOrigin?: boolean
 }
 
 /** Resolved Danger Zone flags (both always present; index.ts fills defaults from DangerConfig). */
@@ -189,6 +202,10 @@ export interface DangerFlags {
   // Only READ in index.ts (boot) + server.ts (toggle) via the shared danger object index.ts fully populates;
   // optional so the many DangerFlags literals (worker + tests) that don't set it still typecheck.
   enableClaudeConnectors?: boolean
+  // default OFF (absent → treated as false) → non-operator turns stay clamped and never auto-approve.
+  // ON makes the chat's mode authoritative for every origin. Always read as `=== true` so an unset flag
+  // in any of the literals scattered across the worker + tests is the SAFE value, never the permissive one.
+  fullAccessAnyOrigin?: boolean
 }
 
 export interface HubConfig {

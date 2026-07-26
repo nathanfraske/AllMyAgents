@@ -42,7 +42,7 @@ afterEach(() => {
   for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true })
 })
 
-function makeSessions(): { sessions: SessionManager; seed: (over?: Partial<SessionRecord>) => SessionRecord } {
+function makeSessions(danger: DangerFlags = SAFE): { sessions: SessionManager; seed: (over?: Partial<SessionRecord>) => SessionRecord } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-autoapprove-'))
   dirs.push(dir)
   const journal = new Journal(path.join(dir, 'hub.db'))
@@ -60,7 +60,7 @@ function makeSessions(): { sessions: SessionManager; seed: (over?: Partial<Sessi
     new AgentBus(journal.db),
     new MemoryStore(journal.db),
     new PracticeStore(journal.db),
-    SAFE,
+    danger,
     false,
     dir
   )
@@ -329,6 +329,93 @@ describe('SessionManager.isAutoApproved — full access is not a blanket yes', (
     markOperatorTurn(sessions, 's1')
     sessions.allowTool('s1', 'Bash')
     sessions.disallowTool('s1', 'Bash')
+    expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(false)
+  })
+})
+
+/**
+ * The Danger Zone opt-out from the origin check above.
+ *
+ * The operator's case for it: clamping a mode they explicitly chose makes the picker lie. You set a chat
+ * to Full Access, a teammate messages it or a monitor fires, and the agent stops dead on an approval
+ * prompt you are not there to answer — an unattended agent that silently blocks is its own failure.
+ *
+ * The case against it is everything the tests above describe, and it has not stopped being true. So this
+ * is OFF by default and lives behind the Danger Zone reveal. What matters here is the BLAST RADIUS: it
+ * relaxes exactly one question — "who caused this turn" — and nothing else. The kind whitelist, forced
+ * ask-rules, and non-capability tools are about WHAT is being asked, and a teammate must not be able to
+ * rewrite fleet-wide practices or widen its own sandbox just because the owner stopped being asked about
+ * Bash. Those tests are the point of this block; the two permissive ones merely show the flag works.
+ */
+const ANY_ORIGIN: DangerFlags = { ...SAFE, fullAccessAnyOrigin: true }
+
+describe('SessionManager.isAutoApproved — fullAccessAnyOrigin (Danger Zone, default OFF)', () => {
+  it('auto-approves a teammate-caused (bus) turn on a full-access chat', () => {
+    const { sessions, seed } = makeSessions(ANY_ORIGIN)
+    seed({ permissionMode: 'full' })
+    markBusTurn(sessions, 's1')
+    expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(true)
+  })
+
+  /** A monitor firing, or a turn that outlived its hub: no provenance marker at all, previously an
+   *  automatic ask. This is the case the operator hit — work stalling with nobody watching. */
+  it('auto-approves a turn with NO provenance marker at all', () => {
+    const { sessions, seed } = makeSessions(ANY_ORIGIN)
+    seed({ permissionMode: 'full' })
+    expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(true)
+  })
+
+  /** Origin-blind is not mode-blind. The flag says WHO may skip the prompt, never WHAT they may skip. */
+  it('still respects the chat mode — a safe-mode chat asks, whoever started the turn', () => {
+    const { sessions, seed } = makeSessions(ANY_ORIGIN)
+    seed({ permissionMode: 'safe' })
+    markBusTurn(sessions, 's1')
+    expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(false)
+  })
+
+  it('still refuses practice writes — a teammate must not reshape fleet-wide behavior unprompted', () => {
+    const { sessions, seed } = makeSessions(ANY_ORIGIN)
+    seed({ permissionMode: 'full' })
+    markBusTurn(sessions, 's1')
+    expect(sessions.isAutoApproved('s1', 'practice/write', {})).toBe(false)
+    expect(sessions.isAutoApproved('s1', 'practice/edit', {})).toBe(false)
+  })
+
+  /** Capability WIDENING stays gated: "stop asking me about tool calls" is not "grant yourself more". */
+  it('still refuses a Codex permissions/capability request', () => {
+    const { sessions, seed } = makeSessions(ANY_ORIGIN)
+    seed({ permissionMode: 'full', provider: 'codex' })
+    markBusTurn(sessions, 's1')
+    expect(sessions.isAutoApproved('s1', 'codex/item/permissions/requestApproval', {})).toBe(false)
+  })
+
+  it("still honours the user's own permissions.ask rule", () => {
+    const { sessions, seed } = makeSessions(ANY_ORIGIN)
+    seed({ permissionMode: 'full' })
+    markBusTurn(sessions, 's1')
+    expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash', matchedAskRule: { rule: 'Bash' } })).toBe(false)
+  })
+
+  it('still refuses interactive decision tools — approving one answers nothing', () => {
+    const { sessions, seed } = makeSessions(ANY_ORIGIN)
+    seed({ permissionMode: 'full' })
+    markBusTurn(sessions, 's1')
+    expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'AskUserQuestion' })).toBe(false)
+  })
+
+  it('still refuses an unknown approval kind — an unfamiliar gate stays gated', () => {
+    const { sessions, seed } = makeSessions(ANY_ORIGIN)
+    seed({ permissionMode: 'full' })
+    markBusTurn(sessions, 's1')
+    expect(sessions.isAutoApproved('s1', 'codex/somethingNewTheVendorAdded', {})).toBe(false)
+  })
+
+  /** Guards the default: absent must read as false everywhere, so a DangerFlags literal that predates
+   *  this flag (the worker's, the tests') keeps the clamp rather than silently opting in. */
+  it('is OFF when the flag is absent — the clamp holds', () => {
+    const { sessions, seed } = makeSessions({ busCanUseRiskyTools: false, autoApprovePractices: false })
+    seed({ permissionMode: 'full' })
+    markBusTurn(sessions, 's1')
     expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(false)
   })
 })

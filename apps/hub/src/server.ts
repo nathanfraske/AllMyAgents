@@ -246,30 +246,53 @@ export interface ServerOptions {
    *  Danger Zone change to the worker's cached danger. In-process it has no pushDanger, so the call below
    *  is a no-op; flag-off behavior is unchanged. */
   executor: Executor
+  /** THE path index.ts loaded config from (`<HUB_DATA_DIR ?? repoRoot/data>/config.json`), passed in
+   *  rather than re-derived, so a persisted Danger Zone toggle lands in the file the hub actually reads
+   *  back at boot. Deriving it here is what silently broke persistence in the installed app. */
+  configPath: string
 }
 
-// Merge the Danger Zone flags into data/config.json (preserving every other config key) so a toggle
-// survives a hub restart. Best-effort — a persist failure leaves the in-memory flag set (live) but
-// unsaved; it never throws into the request path.
-function persistDanger(repoRoot: string, danger: DangerFlags): void {
+/**
+ * Merge the Danger Zone flags into the hub's config.json (preserving every other key) so a toggle
+ * survives a restart.
+ *
+ * TAKES THE REAL CONFIG PATH, and this is the whole bug it exists to fix. This used to derive its own
+ * path as `<repoRoot>/data/config.json` while index.ts READ from `<dataDir>/config.json`, where dataDir
+ * is `HUB_DATA_DIR ?? <repoRoot>/data`. Those agree only when HUB_DATA_DIR is unset — i.e. in dev. The
+ * installed desktop app always sets it, so every Danger Zone toggle was written to a file the hub never
+ * reads (and, from an installed app, to a repo directory that may not exist or be writable at all — the
+ * best-effort catch then swallowed that silently). The operator flipped a switch, the UI echoed it back
+ * because the in-memory flag really had changed, and the setting was gone on the next restart.
+ *
+ * Persisting a subset had the same effect for one flag: `enableClaudeConnectors` was simply not written,
+ * so it reverted on every restart even in dev. The spread now covers whatever DangerFlags holds, so a
+ * new flag cannot be forgotten here — the failure mode was silent, and adding a field is the moment it
+ * would recur.
+ *
+ * Still best-effort — an unwritable config must not fail the request — but no longer silent: a failure
+ * is journaled so a toggle that will not survive a restart is visible rather than merely disappointing.
+ */
+export function persistDanger(configPath: string, danger: DangerFlags, journal: Journal): void {
   try {
-    const p = path.join(repoRoot, 'data', 'config.json')
     let cfg: Record<string, unknown> = {}
     try {
-      cfg = JSON.parse(fs.readFileSync(p, 'utf8')) as Record<string, unknown>
+      cfg = JSON.parse(fs.readFileSync(configPath, 'utf8')) as Record<string, unknown>
     } catch {
       /* no config yet — start fresh */
     }
-    cfg.danger = { busCanUseRiskyTools: danger.busCanUseRiskyTools, autoApprovePractices: danger.autoApprovePractices, autoApproveRestart: danger.autoApproveRestart === true }
-    fs.mkdirSync(path.dirname(p), { recursive: true })
-    fs.writeFileSync(p, JSON.stringify(cfg, null, 2))
-  } catch {
-    /* persistence is best-effort */
+    cfg.danger = { ...danger }
+    fs.mkdirSync(path.dirname(configPath), { recursive: true })
+    fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2))
+  } catch (err) {
+    journal.append(null, 'config/danger-persist-failed', {
+      path: configPath,
+      message: err instanceof Error ? err.message : String(err),
+    })
   }
 }
 
 export function startServer(opts: ServerOptions): http.Server {
-  const { port, defaultCwd, profilesDir, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken, agentToolSecret, restartState, executor } = opts
+  const { port, defaultCwd, profilesDir, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken, agentToolSecret, restartState, executor, configPath } = opts
 
   const server = http.createServer((req, res) => {
     void handle(req, res)
@@ -521,13 +544,14 @@ export function startServer(opts: ServerOptions): http.Server {
         if (typeof body.busCanUseRiskyTools === 'boolean') danger.busCanUseRiskyTools = body.busCanUseRiskyTools
         if (typeof body.autoApprovePractices === 'boolean') danger.autoApprovePractices = body.autoApprovePractices
         if (typeof body.autoApproveRestart === 'boolean') danger.autoApproveRestart = body.autoApproveRestart
+        if (typeof body.fullAccessAnyOrigin === 'boolean') danger.fullAccessAnyOrigin = body.fullAccessAnyOrigin
         if (typeof body.enableClaudeConnectors === 'boolean') {
           danger.enableClaudeConnectors = body.enableClaudeConnectors
           // Re-apply to managed claude profiles' settings.json so the SDK picks up the change on the next
           // turn (managed profiles only — never ~/.claude). Best-effort; safe default is OFF (suppressed).
           setClaudeConnectorPolicy(profiles, body.enableClaudeConnectors)
         }
-        persistDanger(defaultCwd, danger)
+        persistDanger(configPath, danger, journal)
         // Keep the worker's cached danger() live in worker mode (§4.4). No-op in-process (the in-process
         // executor reads the shared `danger` object directly and implements no pushDanger).
         executor.pushDanger?.(danger)

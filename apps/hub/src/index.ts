@@ -71,6 +71,7 @@ const danger: DangerFlags = {
   autoApprovePractices: config.danger?.autoApprovePractices === true,
   autoApproveRestart: config.danger?.autoApproveRestart === true,
   enableClaudeConnectors: config.danger?.enableClaudeConnectors === true,
+  fullAccessAnyOrigin: config.danger?.fullAccessAnyOrigin === true,
 }
 // Apply the connector policy to managed claude profiles at boot (safe default OFF → connectors suppressed).
 // The SDK reads disableClaudeAiConnectors from each profile's settings.json, so this makes the flag
@@ -209,7 +210,7 @@ const meshEnable = !(
 const mesh = new MeshSite({ port: publicPort, label: config.mesh?.label, enable: meshEnable })
 
 // Listen on the BOOT port (0 → ephemeral for a green); the server reports its actual port back.
-const server = startServer({ port: bootPort, defaultCwd: repoRoot, profilesDir, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken, agentToolSecret, restartState, executor })
+const server = startServer({ port: bootPort, defaultCwd: repoRoot, profilesDir, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken, agentToolSecret, restartState, executor, configPath })
 
 // Register the mesh advert — factored so a promoted green can (re)register once it owns the port.
 function registerMesh(): void {

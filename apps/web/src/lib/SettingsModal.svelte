@@ -45,7 +45,7 @@
   // Danger Zone — safe-default guardrail toggles + the agent-authored practices review list. Kept
   // collapsed behind an explicit reveal so it's never flipped by accident. Both toggles default OFF.
   let dangerRevealed = $state(false)
-  let danger = $state<DangerFlags>({ busCanUseRiskyTools: false, autoApprovePractices: false, autoApproveRestart: false, enableClaudeConnectors: false })
+  let danger = $state<DangerFlags>({ busCanUseRiskyTools: false, autoApprovePractices: false, autoApproveRestart: false, enableClaudeConnectors: false, fullAccessAnyOrigin: false })
   let practices = $state<Practice[]>([])
   $effect(() => {
     void api.danger().then((d) => (danger = d))
@@ -413,6 +413,9 @@
 
           <label class="opt"><input type="checkbox" checked={danger.busCanUseRiskyTools} onchange={(e) => setDanger({ busCanUseRiskyTools: (e.target as HTMLInputElement).checked })} /> Let teammate-message (bus) turns use risky tools</label>
           <p class="hint dim warnrow">Off (safe): a turn triggered by another agent's message can't write practices at all. On: a semi-trusted teammate message can drive a practice write — a persistence vector.</p>
+
+          <label class="opt"><input type="checkbox" checked={danger.fullAccessAnyOrigin} onchange={(e) => setDanger({ fullAccessAnyOrigin: (e.target as HTMLInputElement).checked })} /> Apply a chat's permission mode to turns it didn't start</label>
+          <p class="hint dim warnrow">Off (safe): a turn started by a teammate's message runs at most "Edits" and still asks, even in a Full Access chat. On: the mode you picked applies to every turn in that chat — a teammate messaging it, a monitor firing — so it won't stall on a prompt while you're away. That also means a teammate agent that's mistaken or has been fed a malicious instruction gets the same free rein you granted yourself. Practice writes and permission-widening requests are gated separately and are unaffected by this.</p>
 
           <label class="opt"><input type="checkbox" checked={danger.autoApproveRestart} onchange={(e) => setDanger({ autoApproveRestart: (e.target as HTMLInputElement).checked })} /> Auto-approve agent hub restarts</label>
           <p class="hint dim warnrow">Default off — an agent's restart_hub tool waits on your approval; the operator restart below never needs it.</p>
