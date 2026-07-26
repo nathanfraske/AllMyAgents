@@ -1,0 +1,12 @@
+# Shell scripts MUST check out with LF endings, even on Windows.
+#
+# This repo is developed on Windows and ships scripts that run on macOS and Linux. A .sh file checked
+# out with CRLF fails in ways that read as logic bugs rather than encoding ones — bash takes the
+# trailing \r as part of the last token on the line, so you get "unbound variable" or "command not
+# found" naming something that is plainly right there in the file.
+*.sh text eol=lf
+
+# Same reasoning for anything else consumed by a POSIX tool where a stray \r changes behaviour.
+*.mjs text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

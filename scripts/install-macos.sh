@@ -48,7 +48,7 @@ TAG="${AMA_TAG:-}"
 API="https://api.github.com/repos/${REPO}/releases/latest"
 [ -n "$TAG" ] && API="https://api.github.com/repos/${REPO}/releases/tags/${TAG}"
 
-say "Looking up the ${TAG:-latest} release…"
+say "Looking up the ${TAG:-latest} release..."
 RELEASE_JSON="$(curl -fsSL "$API")" || die "could not reach the GitHub API. Are you online?"
 
 VERSION="$(printf '%s' "$RELEASE_JSON" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name",""))')"
@@ -66,7 +66,7 @@ for a in assets:
 ')"
 [ -n "$URL" ] || die "release ${VERSION:-latest} has no .dmg for $ARCH_LABEL ($ARCH). Ask for an ${ARCH} build to be published."
 
-say "Downloading $VERSION for $ARCH_LABEL…"
+say "Downloading $VERSION for $ARCH_LABEL..."
 TMP="$(mktemp -d)"
 # shellcheck disable=SC2064
 trap "rm -rf '$TMP'; hdiutil detach '$TMP/mnt' >/dev/null 2>&1 || true" EXIT
@@ -76,17 +76,17 @@ DMG="$TMP/AllMyAgents.dmg"
 # instead is what produces "AllMyAgents is damaged and can't be opened".
 curl -fL --progress-bar -o "$DMG" "$URL" || die "download failed"
 
-say "Mounting…"
+say "Mounting..."
 mkdir -p "$TMP/mnt"
 hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$TMP/mnt" >/dev/null || die "could not mount the disk image"
 [ -d "$TMP/mnt/$APP" ] || die "the disk image does not contain $APP"
 
 if [ -e "$DEST_DIR/$APP" ]; then
-  say "Replacing the existing $DEST_DIR/$APP…"
+  say "Replacing the existing $DEST_DIR/$APP..."
   rm -rf "$DEST_DIR/$APP" 2>/dev/null || sudo rm -rf "$DEST_DIR/$APP" || die "could not remove the old install"
 fi
 
-say "Installing to $DEST_DIR…"
+say "Installing to $DEST_DIR..."
 cp -R "$TMP/mnt/$APP" "$DEST_DIR/" 2>/dev/null || sudo cp -R "$TMP/mnt/$APP" "$DEST_DIR/" || die "could not copy into $DEST_DIR"
 hdiutil detach "$TMP/mnt" >/dev/null 2>&1 || true
 
@@ -97,18 +97,18 @@ hdiutil detach "$TMP/mnt" >/dev/null 2>&1 || true
 xattr -dr com.apple.quarantine "$DEST_DIR/$APP" 2>/dev/null || true
 
 if xattr -p com.apple.quarantine "$DEST_DIR/$APP" >/dev/null 2>&1; then
-  die "the app is still quarantined — Gatekeeper will block it. Run: xattr -dr com.apple.quarantine '$DEST_DIR/$APP'"
+  die "the app is still quarantined -- Gatekeeper will block it. Run: xattr -dr com.apple.quarantine '$DEST_DIR/$APP'"
 fi
 
 # The embedded Node runtime is what the hub actually runs on. If it cannot execute, the app launches
 # to a window that never connects — which is a much more confusing failure than not installing at all.
 NODE="$DEST_DIR/$APP/Contents/Resources/hub-runtime/node/node"
 if [ -x "$NODE" ]; then
-  "$NODE" --version >/dev/null 2>&1 || die "the bundled Node runtime will not execute — the app would start but never connect"
+  "$NODE" --version >/dev/null 2>&1 || die "the bundled Node runtime will not execute -- the app would start but never connect"
 fi
 
-printf '\n\033[32m✓\033[0m Installed %s to %s\n\n' "${VERSION:-AllMyAgents}" "$DEST_DIR/$APP"
+printf '\n\033[32mOK\033[0m Installed %s to %s\n\n' "${VERSION:-AllMyAgents}" "$DEST_DIR/$APP"
 echo "Open it from Applications, or run:  open '$DEST_DIR/$APP'"
 echo
-echo "First launch needs an internet connection — it fetches the hub's dependencies and the vendor"
+echo "First launch needs an internet connection -- it fetches the hub's dependencies and the vendor"
 echo "CLIs from npm, which takes a couple of minutes. The window says so while it works."
