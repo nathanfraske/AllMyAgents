@@ -215,6 +215,31 @@ const STABLE_MS = 60_000
 let consecutiveFailures = 0
 let reviving = false
 
+/**
+ * Does a hub on this port actually SERVE, as opposed to merely exist?
+ *
+ * The stable-window check used to accept "the process object is still the one I spawned", which a wedged
+ * hub satisfies perfectly — and a wedged hub is indistinguishable from a healthy one to an operator
+ * staring at a window that will not load. Asking it a question is the only honest test.
+ *
+ * Deliberately tolerant: any answer at all from /api/health counts. This is a liveness probe, not a
+ * correctness one, and being strict about the body would turn a schema change into a spurious respawn.
+ */
+async function hubAnswersHealth(port: number, timeoutMs = 3_000): Promise<boolean> {
+  try {
+    const ctl = new AbortController()
+    const t = setTimeout(() => ctl.abort(), timeoutMs)
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: ctl.signal })
+      return res.ok
+    } finally {
+      clearTimeout(t)
+    }
+  } catch {
+    return false
+  }
+}
+
 async function reviveLiveHub(): Promise<void> {
   if (reviving || tearingDown) return
   reviving = true
@@ -226,22 +251,47 @@ async function reviveLiveHub(): Promise<void> {
       log(`live hub is down — respawning in ${wait}ms (attempt ${consecutiveFailures})`)
       await new Promise((r) => setTimeout(r, wait))
       if (tearingDown) return
+      let candidate: HubHandle | undefined
       try {
-        const next = spawnHub(FIXED_PORT, 'blue')
+        candidate = spawnHub(FIXED_PORT, 'blue')
+        const next = candidate
         const ready = await waitForHubMsg(next.child, 'ready', 20_000)
         next.port = ready.port
         next.restored = ready.restored
         setLive(next)
+        candidate = undefined // adopted; the failure path below must not kill it
         log(`hub recovered on :${next.port} — ${next.restored} session(s) restored`)
         // Only declare success once it has SURVIVED a while. A hub that boots, reports ready, and dies a
         // second later is still a crash loop, and treating that as recovery would reset the backoff every
         // time and turn the cap into a hot loop.
+        //
+        // SURVIVED means "still answering", not "still a process". This used to compare object identity
+        // only, so a hub that was alive but wedged — an event loop blocked, a native addon spinning —
+        // counted as recovered and reset the backoff. A supervisor that accepts a process it cannot talk
+        // to is measuring the wrong thing, which is the same mistake as exiting when the child dies.
         const settled = next
         setTimeout(() => {
-          if (live === settled) consecutiveFailures = 0
+          if (live !== settled) return
+          if (settled.child.exitCode !== null || settled.child.signalCode !== null) return
+          void hubAnswersHealth(settled.port ?? FIXED_PORT).then((ok) => {
+            if (live !== settled) return
+            if (ok) {
+              consecutiveFailures = 0
+            } else {
+              // Alive but not serving. Treat it as a failed attempt and go round again rather than
+              // leaving the operator with a process that exists and a hub that does not.
+              log('hub is running but not answering /api/health — treating as failed and respawning')
+              killTree(settled.child)
+            }
+          })
         }, STABLE_MS).unref?.()
         return
       } catch (err) {
+        // KILL THE CANDIDATE BEFORE TRYING AGAIN. A spawn that never reached `ready` is still a live
+        // process holding the port, the SQLite lock and (in worker mode) a socket. Leaving it behind and
+        // spawning another accumulates siblings that then make every later attempt fail for a *different*
+        // reason than the original one — a self-inflicted crash loop layered on top of the real fault.
+        if (candidate) killTree(candidate.child)
         log(`respawn attempt ${consecutiveFailures} failed: ${String(err)}`)
         // loop and try again after a longer wait
       }
@@ -405,8 +455,24 @@ process.on('SIGTERM', () => teardown('SIGTERM'))
 
 log(`supervisor starting (pid ${process.pid})`)
 boot().catch((err) => {
-  tearingDown = true // a fatal boot tears the tree down; don't let the worker respawn into it
-  log(`fatal: hub failed to boot: ${String(err)}`)
-  for (const child of children) killTree(child)
-  process.exit(1)
+  // A FIRST boot that fails must NOT end the supervisor — this was the brick.
+  //
+  // reviveLiveHub() only runs when a hub that already reached `live` dies. On the very first boot a
+  // pre-ready failure landed here, tore the whole tree down and exited, so the shipped promise of
+  // "respawn with backoff, never give up" was false for precisely the case it was written for: a hub
+  // that cannot start. Killing a healthy hub recovered every time in testing; a hub that could not reach
+  // ready was never tested, and that is the one the operator actually hit.
+  //
+  // The distinction that matters is transient vs deterministic. Retrying is right for both — a
+  // deterministic fault (a corrupt DB, a half-installed dependency, a port held by something else)
+  // usually needs a human or an agent to change something on disk, and the supervisor's job is to be
+  // alive and trying when that happens, so the fix takes effect without the operator knowing to relaunch
+  // anything. Exiting guarantees the opposite: nothing is running to notice the repair.
+  //
+  // So: fall into the same capped-backoff loop, which never gives up, and say plainly what is happening.
+  // The retry is cheap and the cap means a permanently broken install settles into one quiet attempt
+  // every 30s rather than a hot loop.
+  log(`hub failed its FIRST boot: ${String(err)}`)
+  log('supervisor staying up and retrying — fix the cause and it will come back on its own')
+  void reviveLiveHub()
 })
