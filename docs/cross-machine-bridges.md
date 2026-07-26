@@ -14,13 +14,28 @@ follows from confirmed pieces but has not been executed end-to-end against two r
 
 **Shipped (the S–M first cut).** `buildFleet` (`apps/hub/src/fleet.ts:58`) asks the node for the owned
 roster, calls `site_map(device, 7777)` for each member, probes `/api/health`, and returns a `FleetSite[]`
-where **every remote site already carries a usable `baseUrl`** — a `localhost:<port>` tunnel to that peer's
-hub. The client merges each site's projects/sessions under `${siteId}:`-namespaced ids and badges the row
-by machine. — CONFIRMED
+carrying a `localhost:<port>` `baseUrl` per site. The client merges each site's projects/sessions under
+`${siteId}:`-namespaced ids and badges the row by machine. — CONFIRMED
 
-That last point is the important one: **the routing primitive already exists and already works.** The hard
-part the spec worried about — discovery and reaching a peer's hub — is done. What is missing is everything
-on the *client* side that assumes there is exactly one hub.
+### 1.0 That baseUrl is NOT usable by the client, and this changes the architecture
+
+An earlier draft of this document said "every remote site already carries a usable `baseUrl`" and
+concluded the routing primitive was done. **That is wrong, and the error is load-bearing.**
+
+`site_map` is called by *the hub's* node and opens a loopback port **on the hub machine**
+(`meshSite.ts:282`, `fleet.ts:74`). The client then fetches that `http://localhost:<port>` **directly**
+from the browser (`api.ts:185`, `store.svelte.ts:836`). That works only while the browser and the
+mapping-owning node are the same machine.
+
+**On a phone, `localhost` is the phone.** So the shipped direct-pull fleet view cannot work remotely at
+all — which matters because remote-from-phone is the stated goal of the whole feature. The `baseUrl` is
+usable *by the local hub process*, not by whatever is rendering the UI.
+
+Consequence: the local-hub gateway (§3) is **a topology requirement, not an ergonomics preference**. There
+is no version of client-side fan-out that works from a phone, at any level of token convenience, because
+the addresses are meaningless off-machine. — CONFIRMED by review
+
+The rest of §1 still holds: everything client-side assumes exactly one hub.
 
 **Not shipped, and the client is single-hub throughout:**
 
@@ -32,39 +47,83 @@ on the *client* side that assumes there is exactly one hub.
 | Remote history | Explicitly a no-op | `store.svelte.ts:1753` — marks pulled, returns |
 | Accounts | Local hub only | `api.profiles()`; `scanProfiles(profilesDir)` at boot |
 
-### 1.1 What a user hits today
+### 1.1 What a user hits today — worse than a bad error message
 
-Opening a remote chat works and shows the merged row. **Sending to it does not.** `api.send(sessionId, …)`
-posts the namespaced id (`tcp:1234:abc-def`) to the *local* hub, which has never heard of that session, so
-it 404s; the store re-queues the message and shows the hub's error text. — CONFIRMED (code path)
+Opening a remote chat works and shows the merged row. Sending to it does not, and an earlier draft here
+described the failure too kindly: it said the namespaced id reaches the local hub, 404s, and shows
+"unknown session".
 
-The user-visible result is a chat that looks ordinary and fails with **"unknown session"**. That is the
-worst available wording: it reads as data loss rather than as "this chat lives on another machine". Fixing
-the *message* is cheap and worth doing before any of the architecture below.
+**The account-switch path does not fail that way.** Review found (`store.svelte.ts:716`, `:760`) that an
+apparently-empty remote chat **strips the namespaced id and creates a LOCAL draft under the remote project
+id**, and a non-empty one **ports via a local `spawn` using the remote cwd/project metadata**. So instead
+of an error, the operator can get a local chat pointed at another machine's paths. That is a data-integrity
+problem, not a wording problem. — CONFIRMED by review
+
+Every remote mutation therefore has to be **guarded, not merely re-worded**, and the guard list is longer
+than "send": steer, model/settings, permission mode, allow-tool, compact, interrupt, stop, reopen, rename,
+delete, approval decisions, and account switching. Current call sites are visibly unscoped
+(`ThreadView.svelte:215`, `:318`, `:604`).
+
+### 1.2 Reachable is not authorized
+
+`/api/health` is public (`server.ts:380`), so a token-enforcing peer answers the probe and is shown
+**online** — while its roster request returns 401. `jget` checks neither `res.ok` nor the payload shape
+(`api.ts:189`), so the store then iterates something that is not an array (`store.svelte.ts:836`).
+
+`reachable` and `authorized` must be distinct states, and upstream responses must be validated before use.
+This is a live bug today, independent of everything else in this document. — CONFIRMED by review
 
 ---
 
-## 2. Accounts: the answer is affinity, not pooling
+## 2. Accounts: site affinity, with per-site credential binding
 
 This was the open question — can accounts be shared across machines, or does each machine use its own?
 
-**They cannot be pooled, and the reason is structural rather than a missing feature.**
+An earlier draft answered "they cannot be pooled, and the reason is structural". **That was too absolute.**
+The remote hub does launch the vendor under its own profile directory (`CLAUDE_CONFIG_DIR`,
+`adapters/claude.ts:69`; `CODEX_HOME`, `adapters/codex.ts:265`), but a *synchronised* credential file would
+also be on that machine's disk. So the architecture does not prove impossibility — it proves credentials
+must be **provisioned per site**.
 
-- Profiles are per-hub: each hub scans its own `profilesDir` at boot (`index.ts`, `scanProfiles`), and the
-  managed profile directory holds the *vendor CLI's own credential files*. — CONFIRMED
-- Execution is pinned to the machine that has the files. Each hub owns its own drivers, worktrees, journal
-  and SQLite; a remote project's turn runs on the remote hub, in the remote worktree. — CONFIRMED
-  (`docs/mesh-unified-fleet.md` §4, and unchanged since)
+The right invariant:
 
-So a remote project's turn **runs inside the remote hub's process**, and that process can only authenticate
-with credentials on *its own* disk. There is no point at which the local machine's account could be used
-without shipping credentials over the mesh — which we should not do: it copies long-lived vendor tokens
-between machines, multiplies the blast radius of any one machine being compromised, and is squarely the
-kind of thing vendor terms exist to discourage.
+> Execution and profiles have **site affinity**; every executing site must have usable credentials.
+> A profile's identity is `(siteId, profileId)`, not `profileId`.
 
-**Therefore: log in on both machines.** Each vendor allows a subscription on multiple devices, so
-`claude-a` on the desktop and `claude-a` on the laptop are two logins of the same account, and each hub
-holds its own. The app's job is not to pool them — it is to **stop pretending they are interchangeable**.
+### 2.0 Can you just sync the credential files? Mostly no, and it depends on the vendor
+
+Reviewed against the installed CLIs (Claude Code 2.1.218, Codex 0.145.0) and vendor source. — CONFIRMED by
+review, credential *values* never printed.
+
+| What you'd sync | Verdict |
+|---|---|
+| Whole `CLAUDE_CONFIG_DIR` / `CODEX_HOME` | **Trap.** Holds sessions, caches, plugins, logs and live SQLite/WAL alongside credentials. |
+| Codex `auth.json` | **Trap** under ordinary async sync — see below. |
+| Claude `.credentials.json` | **Viable with caveats**, and only on a genuinely shared store. |
+
+**Codex is the harder case, and the rotation concern is real.** It persists a replacement refresh token
+back into `auth.json`, explicitly treats `refresh_token_reused` as a *permanent* failure, and rewrites the
+file by truncation with **no cross-process lock and no atomic temp-file rename**. It does reload storage
+immediately before refreshing and skips the grant if another writer got there first — so if A's refreshed
+file reaches B *before* B refreshes, it recovers correctly. But two copied access tokens share an expiry,
+both machines refresh inside the same window, and eventual-consistency sync can lose that race. The loser
+hits a permanent "sign in again", which the hub may surface merely as a failed turn.
+
+**Claude is materially better.** 2.1.218 embeds `.oauth_refresh.lock`, sibling-token adoption and
+refresh-race recovery, with changelog entries fixing exactly these concurrent-session races. Concurrent
+Claude processes sharing *one physical store* is plausibly supported. That is **not** the same as
+Syncthing/Drive-style replication, where each machine can take its own local lock before either lock
+propagates and both then spend the same token.
+
+Shared credentials stay viable only if *all* of these hold: sync the credential file only, never the
+directory; one refresh writer (or only one machine active on that credential at a time); atomic, ordered,
+fenced replication with no bidirectional last-writer-wins; new credentials reach every reader before an old
+refresh token can be reused; readers reload after propagation and fail closed while stale; lock files are
+never synced. At that point you have built a credential coordinator, not folder sync.
+
+**So: log in per site remains the default — for operational reasons, not structural impossibility and not
+security.** Two independent logins each hold their own token, so there is no rotation race at all. Static
+API-key auth is a much easier case, having no rotating refresh lineage.
 
 ### 2.1 The latent bug this creates
 
@@ -88,8 +147,15 @@ lands — at which point the request reaches the remote hub carrying a `profileI
 of, and (since the fix in this release) comes back a clean `400 unknown profile` listing the profiles that
 *do* exist. Better than a 500, still a thing we should never have offered.
 
-**Fix, and it is small:** make the fleet payload carry each site's profiles, and filter the picker by the
-target row's `siteId`. The account list becomes a function of *where this chat will run*.
+**Fix — and "filter it by site" is not available yet.** `FleetSite` carries no profiles at all
+(`fleet.ts:15`), so there is nothing to filter *against*; an earlier draft proposed filtering as if the
+data were already there. — CONFIRMED by review
+
+The honest first move is to **disable** the picker on a remote row and display the recorded remote
+profile + site read-only, so the app states which machine's account is in play without pretending it can
+change it. Fetching remote profiles (lazily, via the gateway in §3) turns that back into a real picker
+later. Keep topology (`/api/fleet`) separate from profile data, so a slow or unauthorized peer degrades the
+account list rather than the roster.
 
 ---
 
@@ -157,9 +223,19 @@ still does not stream — you would be poll-refreshing. Worth shipping anyway: i
 The real work, and the reason the spec rated the full thing L.
 
 The local hub subscribes to each peer's `/ws` and re-exposes a **multiplexed** stream with per-site
-cursors, so the client keeps one connection. Do **not** merge peer events into the local journal — the
-journal is this machine's durable record and polluting it with another machine's events would corrupt
-replay, the `wseq` cursor logic, and every existing assumption about `seq` monotonicity.
+cursors, so the client keeps one connection.
+
+**Do not merge peer events into the local journal** — but the reason given in an earlier draft was wrong,
+and a wrong reason is worth correcting even when the conclusion survives. It claimed foreign events would
+corrupt replay, the `wseq` cursor and `seq` monotonicity. In fact `seq` is SQLite `AUTOINCREMENT`, so
+appended foreign rows stay monotonic (`journal.ts:38`); `wseq` is a worker-only column whose cursor query
+ignores null-`wseq` rows entirely (`journal.ts:55`, `:85`); and client-visible `HubEvent` does not even
+carry `wseq` (`api.ts:150`). With `(siteId, remoteSeq)` idempotency and namespaced sessions, replication
+could in fact be implemented safely. — CONFIRMED by review
+
+The real reasons not to: the local journal is the authoritative record of *this machine's* execution, so
+foreign rows duplicate ownership, grow storage without bound, and create awkward stale-event semantics on
+replay. Use a transient relay, or a separate federation-cursor/cache table.
 
 Client: `lastSeq` becomes a per-site map, and `apply()` branches get tagged by origin site. Spec §5.2.
 
