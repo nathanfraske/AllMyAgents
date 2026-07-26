@@ -138,9 +138,26 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
-          $exe = Get-ChildItem -Path "$env:LOCALAPPDATA\Programs","$env:ProgramFiles","${env:ProgramFiles(x86)}" `
-                   -Filter 'AllMyAgents.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $exe) { Write-Host '::error::AllMyAgents.exe not found after install'; exit 1 }
+          # The installed binary is named for the CRATE (allmyagents-desktop.exe), not for productName —
+          # there is no mainBinaryName in tauri.conf.json. Searching for AllMyAgents.exe found nothing and
+          # reported it as an install failure, which is the same productName-vs-crate-name trap that made
+          # scripts/desktop-smoke.mjs silently skip the real bundle on macOS. Accept either, and if neither
+          # is present, LIST what actually landed rather than asserting absence.
+          $roots = @("$env:LOCALAPPDATA\Programs", "$env:ProgramFiles", "${env:ProgramFiles(x86)}") |
+                     Where-Object { $_ -and (Test-Path $_) }
+          $exe = Get-ChildItem -Path $roots -Include 'allmyagents-desktop.exe','AllMyAgents.exe' `
+                   -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) {
+            Write-Host '::error::no AllMyAgents binary found after install. What the MSI actually placed:'
+            foreach ($r in $roots) {
+              Get-ChildItem -Path $r -Filter '*llmy*' -Recurse -Depth 3 -ErrorAction SilentlyContinue |
+                Select-Object -First 40 | ForEach-Object { Write-Host "  $($_.FullName)" }
+            }
+            Write-Host '--- msiexec INSTALL/TARGETDIR lines ---'
+            Select-String -Path C:\msi.log -Pattern 'INSTALLDIR|TARGETDIR|Installing file|Product:' -ErrorAction SilentlyContinue |
+              Select-Object -First 25 | ForEach-Object { Write-Host "  $($_.Line.Trim())" }
+            exit 1
+          }
           Write-Host "exe: $($exe.FullName)"
 
           Write-Host "--- what a dev shell has that an Explorer launch does not ---"
