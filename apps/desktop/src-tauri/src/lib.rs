@@ -865,7 +865,7 @@ fn kill_hub(child: &mut Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
-    logln("[desktop] hub (pid {pid}) torn down");
+    logln(&format!("[desktop] hub (pid {pid}) torn down"));
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
