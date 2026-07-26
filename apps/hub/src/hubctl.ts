@@ -111,6 +111,11 @@ function spawnHub(port: number, color: HubColor): HubHandle {
     // the PID-tree kill already covers descendants. `detached` is orthogonal to the `ipc` stdio slot,
     // so the blue-green restart handshake is unaffected.
     detached: process.platform !== 'win32',
+    // Windows: never allocate a console window for a child. The desktop shell is a GUI app with no
+    // console of its own, so each console child it launches — the hub, then this worker, then the
+    // vendor CLIs beneath them — otherwise gets its own black window sitting in front of the app.
+    // Inherited stdio still flows to whatever the supervisor was started with.
+    windowsHide: true,
     // Worker mode (opt-in) injects HUB_WORKER_SOCKET so blue AND green connect to the same worker; when
     // disabled the spread adds nothing, so the env is byte-identical to today (docs/agent-worker-impl.md §5.1).
     env: { ...process.env, HUB_PORT: String(port), HUB_SUPERVISED: '1', ...(workerSocket ? { HUB_WORKER_SOCKET: workerSocket } : {}) },
@@ -161,6 +166,11 @@ function spawnWorker(): void {
     // Same POSIX process-group reasoning as spawnHub: the worker owns the agent SDK subprocesses, so
     // it must be group-killable as a unit on teardown. No-op on win32 (taskkill /T handles the tree).
     detached: process.platform !== 'win32',
+    // Windows: never allocate a console window for a child. The desktop shell is a GUI app with no
+    // console of its own, so each console child it launches — the hub, then this worker, then the
+    // vendor CLIs beneath them — otherwise gets its own black window sitting in front of the app.
+    // Inherited stdio still flows to whatever the supervisor was started with.
+    windowsHide: true,
     env: { ...process.env, HUB_WORKER_SOCKET: workerSocket },
   })
   workerHandle = child

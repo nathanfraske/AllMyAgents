@@ -73,6 +73,24 @@ fn set_own_group(cmd: &mut Command) {
 #[cfg(not(unix))]
 fn set_own_group(_cmd: &mut Command) {}
 
+/// Windows: start the child WITHOUT allocating a console window.
+///
+/// The desktop shell is a GUI app with no console of its own, so every console child it launches gets a
+/// fresh black window — the hub, and then the agent worker and vendor CLIs beneath it. They flash up and
+/// sit there for the whole session, in front of the app, looking like something is wrong. There is no
+/// setting to hide them after the fact; it has to be requested at spawn time.
+///
+/// CREATE_NO_WINDOW (0x0800_0000) suppresses the console without detaching the process, so the PID-tree
+/// teardown in `kill_hub` still works exactly as before. It is deliberately NOT CREATE_NEW_PROCESS_GROUP,
+/// which would also break that teardown.
+#[cfg(windows)]
+fn hide_console(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+}
+#[cfg(not(windows))]
+fn hide_console(_cmd: &mut Command) {}
+
 // ---------------------------------------------------------------------------
 // Dev path — spawn `pnpm hub:dev` from the source tree. UNCHANGED.
 // ---------------------------------------------------------------------------
@@ -121,6 +139,7 @@ fn spawn_hub_dev() -> Option<Child> {
     cmd.current_dir(&repo_root);
     cmd.env("HUB_WORKER", hub_worker_flag()); // live turns survive a hub restart (see hub_worker_flag)
     set_own_group(&mut cmd); // POSIX: own process group so kill_hub can group-signal the whole tree
+    hide_console(&mut cmd); // Windows: no stray black console window in front of the app
 
     match cmd.spawn() {
         Ok(child) => {
@@ -444,6 +463,7 @@ fn release_boot(app: AppHandle, splash: Option<WebviewWindow>) {
         .env("HUB_DATA_DIR", &hub_data_dir)
         .env("HUB_PROFILES_DIR", &hub_profiles_dir);
     set_own_group(&mut cmd); // POSIX: own process group so kill_hub can group-signal the whole tree
+    hide_console(&mut cmd); // Windows: no stray black console window in front of the app
     match cmd.spawn() {
         Ok(child) => {
             eprintln!("[desktop] spawned bundled hub (pid {}) — {}", child.id(), entry.display());
