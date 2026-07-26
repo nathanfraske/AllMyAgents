@@ -79,6 +79,11 @@ describe('ClaudeDriver permission wiring', () => {
       behavior: 'deny',
       message: 'outside the worktree',
     })
-    expect(handler).toHaveBeenCalledWith('Write', { file_path: '/etc/passwd' })
+    // Assert the arguments we care about rather than the exact arity: the adapter deliberately forwards a
+    // THIRD argument (the SDK's permission context, which carries matchedAskRule), so an exact-args
+    // matcher would fail on a trailing `undefined` that is not what this test is about.
+    const [name, input] = handler.mock.calls[0]!
+    expect(name).toBe('Write')
+    expect(input).toEqual({ file_path: '/etc/passwd' })
   })
 })
