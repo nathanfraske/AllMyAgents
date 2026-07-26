@@ -543,7 +543,7 @@ export class AgentWorker {
         // onEvent: split from the in-process version — NO hub side effects here (no journal/usage). Each
         // event just gets a wseq and is streamed to the hub, which re-homes the side effects (§3.2).
         (kind, payload) => this.emitEvent(spec.sessionId, kind, payload),
-        (toolName, input) => this.canUseTool(spec, toolName, input),
+        (toolName, input, context) => this.canUseTool(spec, toolName, input, context),
         { allmyagents: mcp }
       )
       if (spec.vendorSessionId) driver.restore(spec.vendorSessionId)
@@ -644,7 +644,8 @@ export class AgentWorker {
   private async canUseTool(
     spec: WorkerSessionSpec,
     toolName: string,
-    input: unknown
+    input: unknown,
+    context?: { matchedAskRule?: { source: string; toolName: string; ruleContent?: string } }
   ): Promise<{ behavior: 'allow'; updatedInput: unknown } | { behavior: 'deny'; message: string }> {
     if (AUTO_ALLOW_TOOLS.has(toolName)) return { behavior: 'allow', updatedInput: input }
     if (SELF_GATING_TOOLS.has(toolName)) {
@@ -673,7 +674,12 @@ export class AgentWorker {
     // The generic operator gate: RELAY to the hub (step 4). In-process this is
     // `approvals.request(sessionId, 'claude/tool', {toolName, input})`; here it crosses the socket.
     try {
-      const approved = await this.relayApproval(spec.sessionId, 'claude/tool', { toolName, input })
+      const approved = await this.relayApproval(spec.sessionId, 'claude/tool', {
+        toolName,
+        input,
+        // Carried so the hub's auto-approve policy can honour a user-configured ask rule.
+        matchedAskRule: context?.matchedAskRule,
+      })
       return approved ? { behavior: 'allow', updatedInput: input } : { behavior: 'deny', message: 'denied from hub' }
     } catch (err) {
       // A hub gone past the transient bound (HubUnavailableError): canUseTool has no retryable-text channel

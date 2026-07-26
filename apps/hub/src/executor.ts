@@ -65,9 +65,16 @@ export interface Executor {
 // The in-process agent tools (`mcp__allmyagents__*`) split by risk. SAFE tools are auto-allowed in
 // canUseTool (bus + memory reads/writes + practice reads — all ACL-enforced in-tool). SELF-GATING
 // tools (practice writes above account scope, and later hook_propose) are NOT auto-allowed: their
-// handlers self-gate by awaiting the operator (see agentTools.ts), which fires even under `full`
-// where canUseTool is skipped entirely. Any allmyagents tool in neither set falls through to the
-// generic approval gate — a safe default for a future tool that hasn't been classified yet.
+// handlers self-gate by awaiting the operator (see agentTools.ts), an independent barrier inside the
+// tool itself. Any allmyagents tool in neither set falls through to the generic approval gate — a safe
+// default for a future tool that hasn't been classified yet.
+//
+// This used to say the in-tool gate matters because "canUseTool is skipped entirely under `full`". That
+// WAS true of the vendor's bypassPermissions mode, and is now deliberately false: the driver no longer
+// maps our modes onto the SDK's permissionMode, precisely so this callback always runs (see the note in
+// adapters/claude.ts). Left corrected rather than deleted, because a stale comment saying the callback is
+// skipped is an active invitation to "optimise" the bypass back in and silently disable every guard
+// behind it.
 export const AUTO_ALLOW_TOOLS = new Set([
   'mcp__allmyagents__list_agents',
   'mcp__allmyagents__send_message',
@@ -104,6 +111,9 @@ export interface InProcessExecutorHubHooks {
   journal(sessionId: string | null, kind: string, payload: unknown): void
   /** Apply a status transition (persist + journal session/status + idle→deliverBus), by session id. */
   setStatus(sessionId: string, status: SessionStatus): void
+  /** End a turn BADLY: journal the reason and move to 'error' as ONE decision. Never journal a
+   *  session/error directly — the hub checks operator intent here (a Stop must not be painted red). */
+  failTurn(sessionId: string, message: string): void
   /** Persist a freshly-learned vendor session id (claude driver.sessionId) onto the record. */
   persistVendorSessionId(sessionId: string, vendorSessionId: string): void
   /** Augment a prompt with auto-recalled memories (withRecall stays hub-side; journals memory/recalled). */
@@ -215,8 +225,7 @@ export class InProcessExecutor implements Executor {
             // reported plain "ready" and its reason was thrown away.
             const outcome = codexTurnOutcome(payload)
             if (outcome.kind === 'failed') {
-              this.h.journal(sessionId, 'session/error', { message: outcome.message })
-              this.h.setStatus(sessionId, 'error')
+              this.h.failTurn(sessionId, outcome.message)
             } else {
               // completed / interrupted / unknown all settle the turn; only `completed` is a success, and
               // the web store decides how to LABEL it from the same turn.status.
@@ -229,8 +238,7 @@ export class InProcessExecutor implements Executor {
           // guard then refused every later send. The chat was bricked by a turn that had already ended —
           // the adapter itself treats turn/error as terminal (it clears its activeTurns for both).
           else if (sessionId && kind === 'codex/turn/error') {
-            this.h.journal(sessionId, 'session/error', { message: codexTurnErrorMessage(payload) })
-            this.h.setStatus(sessionId, 'error')
+            this.h.failTurn(sessionId, codexTurnErrorMessage(payload))
           }
           // Forward the app-server's token-usage notifications to the UI's live counter. The raw
           // `codex/thread/tokenUsage/updated` event is still journaled above for field verification.
@@ -269,7 +277,7 @@ export class InProcessExecutor implements Executor {
             this.services.usage.noteClaudeCost(spec.profileId, cost)
           }
         },
-        async (toolName, input) => {
+        async (toolName, input, context) => {
           // The hub's own SAFE agent tools (inter-agent bus + shared memory reads/writes + practice
           // reads) are ACL-enforced in-tool; gating them behind human approval would defeat
           // autonomous coordination.
@@ -296,7 +304,12 @@ export class InProcessExecutor implements Executor {
           // bus-origin clamp, eligible-kind whitelist) and would freeze the mode at turn start, so
           // tightening a live chat Full → Safe would be cosmetic. ApprovalService.request consults the
           // policy and returns immediately for an auto-approved call, so this costs no prompt.
-          const approved = await this.services.approvals.request(spec.sessionId, 'claude/tool', { toolName, input })
+          const approved = await this.services.approvals.request(spec.sessionId, 'claude/tool', {
+            toolName,
+            input,
+            // Carried so the hub's auto-approve policy can honour a user-configured ask rule.
+            matchedAskRule: context?.matchedAskRule,
+          })
           return approved
             ? { behavior: 'allow', updatedInput: input }
             : { behavior: 'deny', message: 'denied from hub' }
@@ -359,10 +372,7 @@ export class InProcessExecutor implements Executor {
       if (driver.sessionId) this.h.persistVendorSessionId(spec.sessionId, driver.sessionId)
       this.h.setStatus(spec.sessionId, 'idle')
     } catch (err) {
-      this.h.journal(spec.sessionId, 'session/error', {
-        message: err instanceof Error ? err.message : String(err),
-      })
-      this.h.setStatus(spec.sessionId, 'error')
+      this.h.failTurn(spec.sessionId, err instanceof Error ? err.message : String(err))
     } finally {
       this.busTurnSessions.delete(spec.sessionId)
     }
@@ -382,10 +392,7 @@ export class InProcessExecutor implements Executor {
         approvalPolicy: spec.permissionMode === 'full' ? 'never' : spec.permissionMode ? 'on-request' : undefined,
       })
     } catch (err) {
-      this.h.journal(spec.sessionId, 'session/error', {
-        message: err instanceof Error ? err.message : String(err),
-      })
-      this.h.setStatus(spec.sessionId, 'error')
+      this.h.failTurn(spec.sessionId, err instanceof Error ? err.message : String(err))
     } finally {
       this.busTurnSessions.delete(spec.sessionId)
     }

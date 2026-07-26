@@ -308,6 +308,16 @@ class HubStore {
       this.pendingFlush.delete(sessionId)
       const view = this.sessions[sessionId]
       if (!view || view.record.status !== 'idle') return
+      // Require a turn that actually SUCCEEDED, not merely a session that is idle. `idle` is reached by
+      // several paths that are not "the previous turn finished and the next one should start": a reopen,
+      // a stale-session reconcile after a worker loss, and the unwind of an operator interrupt all land
+      // there. Firing queued text on any of them means the operator's Stop, or a crash recovery, silently
+      // launches work they never re-authorised — and after a Stop the worktree is already gone, so it
+      // would run against a directory that no longer exists.
+      //
+      // lastTurnOk is true only for a Claude success or a Codex `completed`; interrupted and unknown
+      // outcomes leave it undefined, which correctly holds the queue for the operator to send by hand.
+      if (view.lastTurnOk !== true) return
       void this.flushQueue(sessionId)
     }, 0)
   }
@@ -421,6 +431,32 @@ class HubStore {
     saveOrder(ORDER_CHATS_PREFIX + groupId, next)
   }
 
+  /**
+   * Fetch the optional bootstrap data, never throwing, and retry the parts that failed.
+   *
+   * Split out of init() because it must not be able to prevent connect(). Each call is caught
+   * individually so one unavailable endpoint degrades one panel rather than the whole app, and a failure
+   * schedules a bounded retry — a hub that was merely still starting will answer a second later, and the
+   * operator should not have to reload to find that out.
+   */
+  private async loadBootstrapData(attempt = 0): Promise<void> {
+    let failed = false
+    const profiles = await api.profiles().catch(() => null)
+    if (profiles) this.profiles = profiles
+    else failed = true
+    const projects = await api.projects().catch(() => null)
+    if (projects) this.projects = projects
+    else failed = true
+    await this.refreshSideData().catch(() => {
+      failed = true
+    })
+    // Bounded, and only for what actually failed. The WebSocket has its own reconnect loop; this covers
+    // the plain GETs, which have none.
+    if (failed && attempt < 5) {
+      setTimeout(() => void this.loadBootstrapData(attempt + 1), 1000 * (attempt + 1))
+    }
+  }
+
   async init(): Promise<void> {
     const t0 = perfNow()
     vlog('init: start')
@@ -437,10 +473,17 @@ class HubStore {
       return
     }
     await api.mesh().catch(() => undefined) // bootstrap: capture the token while the hub hands it out
-    this.profiles = await api.profiles()
-    this.projects = await api.projects()
-    vlog(`init: ${this.profiles.length} profiles, ${this.projects.length} projects (${msSince(t0)})`)
-    await this.refreshSideData()
+    // OPTIONAL SIDE DATA MUST NEVER STOP THE SOCKET FROM BEING CREATED.
+    //
+    // These three awaits used to be uncaught, and connect() — the ONLY place the WebSocket is ever
+    // built — runs after them. App.svelte calls `void store.init()`, so a single transient rejection
+    // threw out of init, was swallowed, and left the app with no socket and no retry: permanently blank
+    // until a manual reload. On a cold/first launch the hub is still starting while the UI mounts, so
+    // that is the EXPECTED ordering rather than a rare race — the app could brick itself on the one run
+    // where the operator has the least idea what is wrong.
+    //
+    // Each fetch now degrades its own panel and the transport comes up regardless.
+    await this.loadBootstrapData()
     // Per-chat settings (permission mode, model, thinking effort, title) are rebuilt from replayed
     // `session/created` events, which carry the record AS IT WAS AT CREATION — so a mode you changed
     // later rendered stale on a fresh load. Overlay the hub's CURRENT roster once the replay has

@@ -147,6 +147,7 @@ export class SessionManager {
     return {
       journal: (sessionId, kind, payload) => this.journal.append(sessionId, kind, payload),
       setStatus: (sessionId, status) => this.setStatusById(sessionId, status),
+      failTurn: (sessionId, message) => this.failTurn(sessionId, message),
       persistVendorSessionId: (sessionId, vendorSessionId) => this.persistVendorSessionIdById(sessionId, vendorSessionId),
       recall: (sessionId, prompt) => this.recallForWorker(sessionId, prompt),
       onCodexExit: (profileId, payload) => {
@@ -172,6 +173,27 @@ export class SessionManager {
   private setStatusById(sessionId: string, status: SessionStatus, replay = false): void {
     const record = this.sessions.get(sessionId)
     if (record) {
+      // STOP IS OPERATOR INTENT AND A TURN'S OWN TERMINAL EVENT MAY NOT UNDO IT.
+      //
+      // stop() interrupts and then marks the record 'stopped', but interrupting does not make the turn's
+      // terminal event disappear — the vendor still reports how the turn ended, and it arrives AFTER
+      // stop() has already returned (the SDK documents the interrupt receipt as preceding the interrupted
+      // turn's result). Both executors then routed that terminal through here unconditionally, so a
+      // 'stopped' record was flipped straight back to 'idle' — persisted and journaled. Stop appeared to
+      // work and then silently undid itself.
+      //
+      // That composes badly in three directions: idle schedules deliverBus, so a queued teammate message
+      // could start a fresh turn on the stopped chat; the web flushes queued messages on idle, so the
+      // operator's own queued prompt could restart it; and stop() has by then REMOVED the worktree, so
+      // whatever restarts runs against a directory that no longer exists.
+      //
+      // Guarded here because this is the one seam both executors' lifecycles pass through. reopen() calls
+      // setStatus directly and is therefore unaffected — un-stopping stays an explicit operator action.
+      //
+      // NOT sufficient on its own: with reopen, a stale terminal from the OLD turn can still settle a NEW
+      // one (Stop → Reopen → send → old completion arrives → idle). Fixing that needs per-turn identity
+      // so a terminal only settles the turn it belongs to; this fence only stops the resurrection.
+      if (record.status === 'stopped') return
       // F2 — attach-REPLAY: on re-attach the worker re-emits the buffered turn-lifecycle markers so the
       // successor restores in-memory status, but their derived session/status rows are ALREADY durable from
       // the prior hub. Re-journaling them duplicates transcript rows (out of temporal order in the reconnected
@@ -263,19 +285,30 @@ export class SessionManager {
    */
   applyLifecycle(msg: Extract<WorkerToHub, { t: 'turnStarted' | 'turnCompleted' | 'turnError' }>): void {
     const replay = msg.replay === true
+    // An operator Stop suppresses the WHOLE derived terminal side effect, not merely the status write.
+    // Fencing only setStatusById left the branch below still journaling a durable `session/error` for a
+    // chat the operator had deliberately stopped — a red card that then replays forever, which is exactly
+    // the "error next to something I stopped on purpose" symptom. The status was right and the transcript
+    // was still lying. A guard has to cover every effect derived from the event, not the one that happens
+    // to be easiest to assert.
+    const stopped = this.sessions.get(msg.sessionId)?.status === 'stopped'
     switch (msg.t) {
       case 'turnStarted':
+        if (stopped) return
         this.setStatusById(msg.sessionId, 'active', replay)
         return
       case 'turnCompleted':
+        // The vendor thread id is still worth keeping even for a stopped chat: it is invisible state that
+        // lets a later reopen resume the same conversation, not a claim about how the turn ended.
         if (msg.vendorSessionId) this.persistVendorSessionIdById(msg.sessionId, msg.vendorSessionId)
-        this.setStatusById(msg.sessionId, 'idle', replay)
+        if (!stopped) this.setStatusById(msg.sessionId, 'idle', replay)
         if (!replay) this.maybeFireDeferredRestart() // a turn boundary (§8.4): flip a deferred restart if idle
         return
       case 'turnError':
-        if (!replay) this.journal.append(msg.sessionId, 'session/error', { message: msg.message })
-        this.setStatusById(msg.sessionId, 'error', replay)
-        if (!replay) this.maybeFireDeferredRestart() // a turn boundary (§8.4): flip a deferred restart if idle
+        if (!replay) this.failTurn(msg.sessionId, msg.message)
+        else if (!stopped) this.setStatusById(msg.sessionId, 'error', replay)
+        // Still a turn boundary even when stopped — the turn really did end, so a deferred restart may go.
+        if (!replay) this.maybeFireDeferredRestart()
         return
     }
   }
@@ -563,6 +596,12 @@ export class SessionManager {
     for (const s of live) {
       const record = this.sessions.get(s.sessionId)
       if (!record) continue // the worker holds a session we deleted → ignore it
+      // A STOPPED chat stays stopped, whatever the worker still holds. stop() never drops the driver
+      // (only delete does), so the worker keeps reporting the session and this loop used to reconcile it
+      // straight back to 'idle' — on every hub restart, with no mid-turn timing needed. The operator's
+      // Stop was undone by a routine re-attach. Worker liveness describes what the WORKER holds; it is not
+      // evidence about what the operator asked for.
+      if (record.status === 'stopped') continue
       if (s.status === 'active') {
         record.status = 'active' // keep the live turn active across the seam (already persisted active)
         const cursor = this.lastJournaledWseq(s.sessionId) // the DURABLE exactly-once replay cursor (§7.1)
@@ -979,7 +1018,13 @@ export class SessionManager {
     // never received. The client rolls its optimistic bubble back on the error, but the canonical row
     // survives and reappears on reload: a message that looks sent, was never answered, and can rename the
     // chat and persist model/effort overrides from a turn that did not happen. Reject first, then mutate.
-    if (record.provider === 'claude' && this.executor.isBusy(sessionId)) {
+    // PROVIDER-NEUTRAL. This guard used to test only Claude, because only Claude's driver exposes a busy
+    // flag (InProcessExecutor.isBusy inspects claudeDrivers alone). A second Codex send therefore sailed
+    // past it: the input was journaled and titled, the route answered {ok:true}, and runCodexTurn caught
+    // the app-server's rejection internally — journaling session/error and clearing busy while the FIRST,
+    // still-running turn carried on. One accepted turn, reported as failed, with a phantom prompt in the
+    // transcript. The record's own status is the vendor-independent fact, so it leads.
+    if (record.status === 'active' || record.status === 'starting' || this.executor.isBusy(sessionId)) {
       throw new Error('a turn is already in progress')
     }
     if (override.model) record.model = override.model
@@ -1049,6 +1094,27 @@ export class SessionManager {
   }
 
   /**
+   * Record that a turn FAILED: the durable reason and the status transition, together, in one place.
+   *
+   * Both halves must be decided as one. They were not: the worker path journaled `session/error` and then
+   * called setStatusById, and the in-process executor did the same at four separate sites. When a fence
+   * was added to setStatusById so an operator's Stop could not be undone, it suppressed only the second
+   * half — so a stopped chat kept its status but still received a durable red error card that replays
+   * forever. The status was right and the transcript lied.
+   *
+   * A guard that covers one effect of an event and not the others is not a guard. Every caller that ends
+   * a turn badly goes through here, so the intent check cannot be bypassed and the two execution modes
+   * cannot drift apart again.
+   */
+  failTurn(sessionId: string, message: string): void {
+    // An operator Stop is terminal intent. The interrupted turn's own failure is not news, and painting it
+    // red is actively misleading — the operator asked for it to end.
+    if (this.sessions.get(sessionId)?.status === 'stopped') return
+    this.journal.append(sessionId, 'session/error', { message })
+    this.setStatusById(sessionId, 'error')
+  }
+
+  /**
    * The hub-side approval policy (installed on ApprovalService via setAutoApprove). Returns true when this
    * request must NOT reach the operator.
    *
@@ -1098,7 +1164,15 @@ export class SessionManager {
     // clothes. An unlisted kind falls through to asking, so an unfamiliar gate is gated by default.
     if (!AUTO_APPROVABLE_KINDS.has(kind)) return false
 
-    // (3) INTERACTIVE DECISIONS ARE NOT CAPABILITIES. Auto-running AskUserQuestion/ExitPlanMode answers
+    // (3) A USER-CONFIGURED ASK RULE OUTRANKS OUR AUTO-APPROVAL. The SDK marks a request forced by a
+    // `permissions.ask` rule and says of it: hosts "running host-side auto-approval should treat asks
+    // carrying this field as rule-forced: the user's stated intent is a human prompt". Since the hub is
+    // now the single approval authority, that obligation is ours. Note this only became reachable when
+    // Full started genuinely auto-approving — before, it prompted for everything by accident, so the rule
+    // was honoured without anyone implementing it.
+    if ((payload as { matchedAskRule?: unknown } | null)?.matchedAskRule) return false
+
+    // (4) INTERACTIVE DECISIONS ARE NOT CAPABILITIES. Auto-running AskUserQuestion/ExitPlanMode answers
     // nothing — it just executes them with no input — so "don't ask me" must not silence them.
     const toolName = (payload as { toolName?: unknown } | null)?.toolName
     if (typeof toolName === 'string' && NEVER_AUTO_APPROVED_TOOLS.has(toolName)) return false

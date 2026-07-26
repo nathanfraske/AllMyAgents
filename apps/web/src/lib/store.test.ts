@@ -387,7 +387,10 @@ describe('apply()', () => {
   it('session/status idle flushes any queued message to the hub', async () => {
     seed('st2')
     store.enqueue('st2', 'pending')
-    apply(evt({ seq: 1, kind: 'session/status', sessionId: 'st2', payload: { status: 'idle' } }))
+    // A queue flush now requires a turn that actually SUCCEEDED, not merely an idle session — idle is
+    // also reached by reopen, stale reconcile and interrupt unwind. Drive the real sequence.
+    apply(evt({ seq: 1, kind: 'claude/result', sessionId: 'st2', payload: { is_error: false, result: 'ok' } }))
+    apply(evt({ seq: 2, kind: 'session/status', sessionId: 'st2', payload: { status: 'idle' } }))
     await new Promise((r) => setTimeout(r, 0))
     expect(api.send).toHaveBeenCalledWith('st2', 'pending')
     expect(store.queueFor('st2')).toEqual([])
@@ -600,6 +603,50 @@ describe('session removal does not hijack the home screen', () => {
 })
 
 /**
+ * REGRESSION — a cold launch could brick the app permanently.
+ *
+ * init() awaited profiles/projects/side-data UNCAUGHT, and connect() — the only place the WebSocket is
+ * ever created — ran after them. App.svelte calls `void store.init()`, so one transient rejection threw
+ * out of init, was swallowed, and left the app with no socket and no retry: blank until a manual reload.
+ * On a cold or first launch the hub is still starting while the UI mounts, so that ordering is the
+ * EXPECTED case — the app was most likely to brick on the very first run.
+ */
+describe('init — optional side data must never stop the socket', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('still connects when a bootstrap fetch fails', async () => {
+    const connect = vi.spyOn(store as unknown as { connect(): void }, 'connect').mockImplementation(() => {})
+    ;(api.profiles as unknown as { mockRejectedValueOnce(v: unknown): void }).mockRejectedValueOnce(
+      new Error('ECONNREFUSED')
+    )
+
+    await store.init()
+
+    expect(connect).toHaveBeenCalledTimes(1)
+    connect.mockRestore()
+  })
+
+  it('retries the failed fetch instead of leaving the panel empty forever', async () => {
+    vi.useFakeTimers()
+    const connect = vi.spyOn(store as unknown as { connect(): void }, 'connect').mockImplementation(() => {})
+    ;(api.profiles as unknown as { mockRejectedValueOnce(v: unknown): void }).mockRejectedValueOnce(
+      new Error('still booting')
+    )
+
+    await store.init()
+    expect(api.profiles).toHaveBeenCalledTimes(1)
+
+    await vi.advanceTimersByTimeAsync(1200)
+    expect((api.profiles as unknown as { mock: { calls: unknown[] } }).mock.calls.length).toBeGreaterThan(1)
+
+    connect.mockRestore()
+    vi.useRealTimers()
+  })
+})
+
+/**
  * REGRESSION — a queued message must never vanish.
  *
  * flushQueue used to dequeue, persist the removal, echo the message, and `void api.send(...)` without ever
@@ -637,14 +684,43 @@ describe('queued messages — replay must not send, and a failed send must not l
     expect(store.queues['a']).toEqual(['must not lose'])
   })
 
+  /** The realistic completion sequence: the turn's result, then the idle status. */
+  const completeTurn = (id: string, startSeq: number): void => {
+    apply(evt({ seq: startSeq, kind: 'claude/result', sessionId: id, payload: { is_error: false, result: 'ok' } }))
+    apply(evt({ seq: startSeq + 1, kind: 'session/status', sessionId: id, payload: { status: 'idle' } }))
+  }
+
   it('sends once when the final replayed state really is idle', async () => {
     seed('a')
     store.queues = { a: ['go'] }
     apply(evt({ seq: 1, kind: 'session/status', sessionId: 'a', payload: { status: 'active' } }))
-    apply(evt({ seq: 2, kind: 'session/status', sessionId: 'a', payload: { status: 'idle' } }))
+    completeTurn('a', 2)
     await tick()
     expect(api.send).toHaveBeenCalledTimes(1)
     expect(api.send).toHaveBeenCalledWith('a', 'go')
+  })
+
+  /**
+   * Idle alone is not permission to send. An operator Stop, a reopen, and a stale-session reconcile after
+   * a worker loss all reach idle — and after a Stop the worktree has already been removed, so an
+   * auto-flush would launch un-reauthorised work against a directory that no longer exists.
+   */
+  it('does not send on an idle that follows an interrupt rather than a completed turn', async () => {
+    seed('a')
+    store.queues = { a: ['do not restart me'] }
+    apply(evt({ seq: 1, kind: 'session/status', sessionId: 'a', payload: { status: 'active' } }))
+    apply(
+      evt({
+        seq: 2,
+        kind: 'claude/result',
+        sessionId: 'a',
+        payload: { is_error: true, terminal_reason: 'aborted_streaming' },
+      })
+    )
+    apply(evt({ seq: 3, kind: 'session/status', sessionId: 'a', payload: { status: 'idle' } }))
+    await tick()
+    expect(api.send).not.toHaveBeenCalled()
+    expect(store.queues['a']).toEqual(['do not restart me'])
   })
 
   it('restores the text and withdraws the bubble when the send fails', async () => {
@@ -653,7 +729,7 @@ describe('queued messages — replay must not send, and a failed send must not l
     ;(api.send as unknown as { mockResolvedValueOnce(v: unknown): void }).mockResolvedValueOnce({
       error: 'hub unavailable',
     })
-    apply(evt({ seq: 1, kind: 'session/status', sessionId: 'a', payload: { status: 'idle' } }))
+    completeTurn('a', 1)
     await tick()
     await tick()
     expect(store.queues['a']).toEqual(['keep me']) // still recoverable

@@ -607,6 +607,44 @@ describe('SessionManager.attachWorker — the three re-attach outcomes (§6)', (
     expect(h.sessions.list().find((r) => r.id === 'c')!.status).toBe('idle')
   })
 
+  /**
+   * REGRESSION — a re-attach revived a chat the operator had STOPPED.
+   *
+   * stop() interrupts and marks the record stopped but never drops the driver (only delete does), so the
+   * worker goes on reporting the session. This loop then reconciled it straight back to 'idle' — on every
+   * hub restart, needing no mid-turn timing at all. Worker liveness describes what the WORKER still
+   * holds; it is not evidence about what the operator asked for. And since stop() has already removed the
+   * worktree, a revived chat points at a directory that no longer exists.
+   */
+  it('never revives a STOPPED session, whatever the worker still holds', async () => {
+    const h = buildHub()
+    seedRecord(h.store, 'stopped-one', 'stopped')
+    h.sessions.loadRecords()
+    h.setLive([{ sessionId: 'stopped-one', status: 'idle', lastWseq: 3 }])
+
+    await h.sessions.attachWorker()
+
+    expect(h.sessions.list().find((r) => r.id === 'stopped-one')?.status).toBe('stopped')
+    expect(h.attachCalls).toEqual([]) // and it is never asked to replay
+    const revived = h.journal
+      .since(0)
+      .filter((e) => e.sessionId === 'stopped-one' && e.kind === 'session/status')
+      .map((e) => (e.payload as { status?: string })?.status)
+    expect(revived).not.toContain('idle')
+  })
+
+  it('never revives a stopped session even when the worker calls it active', async () => {
+    const h = buildHub()
+    seedRecord(h.store, 'stopped-two', 'stopped')
+    h.sessions.loadRecords()
+    h.setLive([{ sessionId: 'stopped-two', status: 'active', lastWseq: 5 }])
+
+    await h.sessions.attachWorker()
+
+    expect(h.sessions.list().find((r) => r.id === 'stopped-two')?.status).toBe('stopped')
+    expect(h.attachCalls).toEqual([])
+  })
+
   it('ignores a live session the hub has no record for (worker holds one we deleted)', async () => {
     const h = buildHub()
     seedRecord(h.store, 'known', 'active')
@@ -624,6 +662,95 @@ describe('SessionManager.attachWorker — the three re-attach outcomes (§6)', (
 // ================================================================================================
 // HUB SIDE — SessionManager.applyLifecycle() replayed markers are inert on the journal + bus (F2)
 // ================================================================================================
+
+/**
+ * REGRESSION — Stop undid itself.
+ *
+ * Interrupting a turn does not delete the turn's terminal event: the vendor still reports how it ended,
+ * and that arrives AFTER stop() has returned and marked the record 'stopped'. Both executors routed the
+ * terminal through setStatusById unconditionally, so 'stopped' was flipped back to 'idle' — persisted and
+ * journaled. Stop appeared to work, then quietly reverted.
+ *
+ * The consequences compose: idle schedules bus delivery, the web flushes queued messages on a completed
+ * turn, and stop() has by then REMOVED the worktree — so a resurrected chat could start executing against
+ * a directory that no longer exists.
+ */
+describe('SessionManager — an operator Stop survives the interrupted turn\'s own terminal event', () => {
+  it('a late turnCompleted cannot move a stopped session back to idle', () => {
+    const h = buildHub()
+    seedRecord(h.store, 's', 'stopped')
+    h.sessions.loadRecords()
+
+    h.sessions.applyLifecycle({ t: 'turnCompleted', sessionId: 's', wseq: 7 })
+
+    expect(h.sessions.list().find((r) => r.id === 's')?.status).toBe('stopped')
+    const statuses = h.journal
+      .since(0)
+      .filter((e) => e.sessionId === 's' && e.kind === 'session/status')
+      .map((e) => (e.payload as { status?: string })?.status)
+    expect(statuses).not.toContain('idle')
+  })
+
+  /**
+   * The status is only half of it. Fencing setStatusById alone still left applyLifecycle journaling a
+   * durable `session/error` for a chat the operator had deliberately stopped — a red card that replays
+   * forever, which is the exact "error beside something I stopped on purpose" symptom. The first version
+   * of this test asserted only the status and passed while the transcript still lied.
+   */
+  it('a late turnError neither errors a stopped session NOR journals a red card for it', () => {
+    const h = buildHub()
+    seedRecord(h.store, 's', 'stopped')
+    h.sessions.loadRecords()
+    const errorRows = (): number => h.journal.since(0).filter((e) => e.sessionId === 's' && e.kind === 'session/error').length
+    const before = errorRows()
+
+    h.sessions.applyLifecycle({ t: 'turnError', sessionId: 's', wseq: 8, message: 'boom' })
+
+    expect(h.sessions.list().find((r) => r.id === 's')?.status).toBe('stopped')
+    expect(errorRows()).toBe(before) // no durable error card for an intentional stop
+  })
+
+  /** A live session must still report its failures — the fence is about stopped chats, not about errors. */
+  it('still journals a real error for a session that was not stopped', () => {
+    const h = buildHub()
+    seedRecord(h.store, 'live', 'active')
+    h.sessions.loadRecords()
+
+    h.sessions.applyLifecycle({ t: 'turnError', sessionId: 'live', wseq: 8, message: 'boom' })
+
+    expect(h.sessions.list().find((r) => r.id === 'live')?.status).toBe('error')
+    expect(h.journal.since(0).filter((e) => e.sessionId === 'live' && e.kind === 'session/error')).toHaveLength(1)
+  })
+
+  /**
+   * A rejected second send must leave NO trace. The busy guard used to test only Claude (its driver is
+   * the only one exposing a busy flag), so a second Codex send was journaled and auto-titled, answered
+   * {ok:true}, and then had its rejection caught internally — clearing busy and marking the FIRST,
+   * still-running turn as errored. The record's own status is the vendor-independent fact.
+   */
+  it('rejects a send while a turn is in progress, before journaling anything', async () => {
+    const h = buildHub()
+    seedRecord(h.store, 'busy-one', 'active')
+    h.sessions.loadRecords()
+    const before = h.journal.since(0).length
+
+    await expect(h.sessions.send('busy-one', 'second prompt')).rejects.toThrow(/already in progress/)
+
+    // No session/input, no auto-title, no override persistence — nothing at all.
+    expect(h.journal.since(0).length).toBe(before)
+  })
+
+  /** Un-stopping stays an explicit operator action: reopen() goes through setStatus, not the fence. */
+  it('reopen still un-stops the session', () => {
+    const h = buildHub()
+    seedRecord(h.store, 's', 'stopped')
+    h.sessions.loadRecords()
+
+    h.sessions.reopen('s')
+
+    expect(h.sessions.list().find((r) => r.id === 's')?.status).toBe('idle')
+  })
+})
 
 describe('SessionManager.applyLifecycle — replayed markers do not re-journal or start a bus turn (F2)', () => {
   it('a re-attach does NOT duplicate session/status | session/error rows', async () => {

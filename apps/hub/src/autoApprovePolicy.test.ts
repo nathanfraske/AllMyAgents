@@ -178,6 +178,26 @@ describe('SessionManager.isAutoApproved — full access is not a blanket yes', (
     expect(sessions.isAutoApproved('s1', 'codex/future/destructiveRequest', {})).toBe(false)
   })
 
+  /**
+   * The SDK marks a request forced by a user's `permissions.ask` rule and states that hosts running
+   * host-side auto-approval "should treat asks carrying this field as rule-forced: the user's stated
+   * intent is a human prompt". Only reachable once Full genuinely auto-approves — before that it prompted
+   * for everything by accident, so the rule was honoured without anyone implementing it.
+   */
+  it('never overrides a user-configured ask rule, even in full access', () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'full' })
+    markOperatorTurn(sessions, 's1')
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', {
+        toolName: 'Bash',
+        matchedAskRule: { source: 'user_settings', toolName: 'Bash' },
+      })
+    ).toBe(false)
+    // …and the same tool without the rule is still auto-approved, so this is not a blanket disable.
+    expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(true)
+  })
+
   it('never auto-approves an interactive decision tool, so questions keep reaching the operator', () => {
     const { sessions, seed } = makeSessions()
     seed({ permissionMode: 'full' })
