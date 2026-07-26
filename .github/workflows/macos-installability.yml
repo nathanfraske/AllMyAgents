@@ -402,7 +402,16 @@ jobs:
           AMA_TAG: ${{ github.event.inputs.tag || github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          KEY="darwin-$(uname -m)"   # tauri uses darwin-aarch64 / darwin-x86_64
+          # Tauri's platform keys are darwin-aarch64 / darwin-x86_64. `uname -m` says arm64 on Apple
+          # Silicon, NOT aarch64, so the two disagree on exactly one architecture — and only that one.
+          # Intel matches by luck (x86_64 both ways), which is why the first version of this gate passed
+          # on Intel and failed on Apple Silicon claiming a manifest entry was missing that was plainly
+          # there. Map it explicitly, the same way scripts/install-macos.sh already does.
+          case "$(uname -m)" in
+            arm64) KEY="darwin-aarch64" ;;
+            x86_64) KEY="darwin-x86_64" ;;
+            *) echo "::error::unrecognised architecture $(uname -m)"; exit 1 ;;
+          esac
           URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${AMA_TAG}/latest.json"
           curl -fsSL "$URL" -o /tmp/latest.json || { echo "::error::no latest.json published for $AMA_TAG — the app cannot auto-update at all"; exit 1; }
           KEY="$KEY" /usr/bin/python3 - <<'PY'
