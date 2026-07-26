@@ -71,7 +71,12 @@ describe('ClaudeDriver permission wiring', () => {
   })
 
   it('passes the handler decision through unchanged, including a denial', async () => {
-    const handler = vi.fn(async () => ({ behavior: 'deny' as const, message: 'outside the worktree' }))
+    // Parameters are declared so the mock's recorded call tuple is typed — a zero-arg vi.fn infers
+    // `calls: []`, and destructuring one is a compile error rather than a test failure.
+    const handler = vi.fn(async (_toolName: string, _input: unknown) => ({
+      behavior: 'deny' as const,
+      message: 'outside the worktree',
+    }))
     await makeDriver(handler).send('hi', { permissionMode: 'full' })
 
     const installed = captured[0]!.canUseTool as (t: string, i: unknown) => Promise<unknown>
