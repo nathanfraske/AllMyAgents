@@ -594,3 +594,188 @@ describe('session removal does not hijack the home screen', () => {
     expect(store.selectedId).toBe('b')
   })
 })
+
+/**
+ * REGRESSION — a queued message must never vanish.
+ *
+ * flushQueue used to dequeue, persist the removal, echo the message, and `void api.send(...)` without ever
+ * checking the result. `jpost` RESOLVES with `{error}` rather than throwing, so any failure destroyed the
+ * queued text while leaving a bubble claiming it had been sent; a reload removed the bubble too and the
+ * message had never existed anywhere.
+ *
+ * And it was reachable without any failure at all: the WebSocket replays the journal from seq 0 on every
+ * connect with no replay-complete marker, so an OLD `session/status idle` from a previous turn flushed the
+ * queue during catch-up — before replay reached the `active` that says the session is busy right now.
+ */
+describe('queued messages — replay must not send, and a failed send must not lose text', () => {
+  const tick = () => new Promise((r) => setTimeout(r, 0))
+  // The api mock is module-level and this file's global beforeEach does not reset call history, so an
+  // earlier test's send would make "was never called" pass or fail for the wrong reason.
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  /**
+   * NOTE ON WHAT THIS DOES AND DOES NOT PROVE. It drives both events in ONE tick, so it verifies only
+   * that a status superseded within the same batch cannot send. It does NOT prove replay safety: every
+   * WebSocket message arrives as its own task, so a real replay backlog spans several batches and the
+   * deferred check can run before the later `active` is delivered. Closing that needs a replay-complete
+   * envelope from the server (see scheduleQueueFlush). Written this way deliberately rather than named
+   * "does not send during replay", which would be a test whose name asserts a guarantee it never checks.
+   */
+  it('does not send when an idle is superseded within the same batch', async () => {
+    seed('a')
+    store.queues = { a: ['must not lose'] }
+    apply(evt({ seq: 1, kind: 'session/status', sessionId: 'a', payload: { status: 'idle' } }))
+    apply(evt({ seq: 2, kind: 'session/status', sessionId: 'a', payload: { status: 'active' } }))
+    await tick()
+    expect(api.send).not.toHaveBeenCalled()
+    expect(store.queues['a']).toEqual(['must not lose'])
+  })
+
+  it('sends once when the final replayed state really is idle', async () => {
+    seed('a')
+    store.queues = { a: ['go'] }
+    apply(evt({ seq: 1, kind: 'session/status', sessionId: 'a', payload: { status: 'active' } }))
+    apply(evt({ seq: 2, kind: 'session/status', sessionId: 'a', payload: { status: 'idle' } }))
+    await tick()
+    expect(api.send).toHaveBeenCalledTimes(1)
+    expect(api.send).toHaveBeenCalledWith('a', 'go')
+  })
+
+  it('restores the text and withdraws the bubble when the send fails', async () => {
+    seed('a')
+    store.queues = { a: ['keep me'] }
+    ;(api.send as unknown as { mockResolvedValueOnce(v: unknown): void }).mockResolvedValueOnce({
+      error: 'hub unavailable',
+    })
+    apply(evt({ seq: 1, kind: 'session/status', sessionId: 'a', payload: { status: 'idle' } }))
+    await tick()
+    await tick()
+    expect(store.queues['a']).toEqual(['keep me']) // still recoverable
+    const items = store.sessions['a']!.items
+    expect(items.some((i) => i.kind === 'user' && i.text === 'keep me')).toBe(false) // no false "sent"
+    expect(items.some((i) => /not sent/i.test(i.text ?? ''))).toBe(true) // and the operator is told
+  })
+
+  it('does not fire the queue into a failure on an error status', async () => {
+    seed('a')
+    store.queues = { a: ['do not spend me'] }
+    apply(evt({ seq: 1, kind: 'session/status', sessionId: 'a', payload: { status: 'error' } }))
+    await tick()
+    expect(api.send).not.toHaveBeenCalled()
+    expect(store.queues['a']).toEqual(['do not spend me'])
+  })
+})
+
+/**
+ * REGRESSION — red "errors" appearing next to output that was perfectly fine.
+ *
+ * Three independent sources, all of which painted a successful or deliberate outcome as a failure:
+ *   - `claude/result` read `p.result` for the error text, but the SDK's SDKResultError shape has NO
+ *     `result` field (it carries `errors: string[]`), so a genuine failure rendered a BLANK red card;
+ *   - an operator interrupt ends the query with terminal_reason 'aborted_streaming' / 'aborted_tools'
+ *     and is_error set, so pressing stop produced an error item and a failed turn;
+ *   - the auto-denied guardrails were rendered as `error` even though the guardrail firing is the system
+ *     working as designed and the turn usually goes on to succeed.
+ */
+describe('turn outcome — only real failures may look like failures', () => {
+  const items = (id: string) => store.sessions[id]!.items
+  const errors = (id: string) => items(id).filter((i) => i.kind === 'error')
+
+  it('shows the reason from errors[] instead of a blank error card', () => {
+    seed('a')
+    apply(
+      evt({
+        seq: 1,
+        kind: 'claude/result',
+        sessionId: 'a',
+        payload: { is_error: true, subtype: 'error_during_execution', errors: ['boom'], terminal_reason: 'api_error' },
+      })
+    )
+    expect(errors('a')).toHaveLength(1)
+    expect(errors('a')[0]!.text).toBe('boom')
+    expect(store.sessions['a']!.lastTurnOk).toBe(false)
+  })
+
+  it('never renders an error with no text at all', () => {
+    seed('a')
+    apply(evt({ seq: 1, kind: 'claude/result', sessionId: 'a', payload: { is_error: true, terminal_reason: 'model_error' } }))
+    expect(errors('a')).toHaveLength(1)
+    expect(errors('a')[0]!.text).toBeTruthy()
+  })
+
+  // `errors: ['']` is length-1, so a `??` chain accepts the empty string and still renders a blank card.
+  it('never renders a blank error when errors[] holds only empty/whitespace entries', () => {
+    seed('a')
+    apply(
+      evt({
+        seq: 1,
+        kind: 'claude/result',
+        sessionId: 'a',
+        payload: { is_error: true, errors: ['  ', ''], terminal_reason: 'api_error' },
+      })
+    )
+    expect(errors('a')).toHaveLength(1)
+    expect(errors('a')[0]!.text?.trim()).toBeTruthy()
+  })
+
+  /**
+   * An interrupt must be NEUTRAL — neither red nor green. status() renders idle + lastTurnOk===true as
+   * "completed", so marking a deliberately-cut-short turn as ok would simply swap a false failure for a
+   * false success. Asserting the rendered STATUS, not just the flag, is what catches that.
+   */
+  it('treats an operator interrupt as neutral — not failed, and not completed either', () => {
+    seed('a')
+    apply(
+      evt({
+        seq: 1,
+        kind: 'claude/result',
+        sessionId: 'a',
+        payload: { is_error: true, terminal_reason: 'aborted_streaming', result: 'Request interrupted by user' },
+      })
+    )
+    apply(evt({ seq: 2, kind: 'session/status', sessionId: 'a', payload: { status: 'idle' } }))
+    expect(errors('a')).toHaveLength(0) // pressing stop is not an error
+    expect(items('a').some((i) => i.kind === 'note' && /interrupt/i.test(i.text ?? ''))).toBe(true)
+    expect(store.status(store.sessions['a']!).key).not.toBe('completed')
+  })
+
+  /**
+   * A new turn invalidates the old verdict. Otherwise a turn that ends without a result — worker loss,
+   * restored-stale, anything going straight back to idle — inherits the previous turn's success.
+   */
+  it('does not report a lost turn as completed by reusing the previous turn verdict', () => {
+    seed('a')
+    apply(evt({ seq: 1, kind: 'claude/result', sessionId: 'a', payload: { is_error: false, result: 'ok' } }))
+    apply(evt({ seq: 2, kind: 'session/status', sessionId: 'a', payload: { status: 'active' } }))
+    expect(store.sessions['a']!.lastTurnOk).toBeUndefined()
+    apply(evt({ seq: 3, kind: 'session/status', sessionId: 'a', payload: { status: 'idle' } }))
+    expect(store.status(store.sessions['a']!).key).not.toBe('completed')
+  })
+
+  it('keeps a successful turn green when a guardrail denied a tool along the way', () => {
+    seed('a')
+    apply(
+      evt({
+        seq: 1,
+        kind: 'approval/auto-denied-scope',
+        sessionId: 'a',
+        payload: { toolName: 'Write', reason: 'outside the worktree' },
+      })
+    )
+    apply(evt({ seq: 2, kind: 'claude/result', sessionId: 'a', payload: { is_error: false, result: 'done' } }))
+    expect(errors('a')).toHaveLength(0)
+    expect(store.sessions['a']!.lastTurnOk).toBe(true)
+    // still surfaced, just not as a failure
+    expect(items('a').some((i) => /scope guard denied Write/.test(i.text ?? ''))).toBe(true)
+  })
+
+  it('does not leave a stale success standing after a session error', () => {
+    seed('a')
+    apply(evt({ seq: 1, kind: 'claude/result', sessionId: 'a', payload: { is_error: false, result: 'ok' } }))
+    expect(store.sessions['a']!.lastTurnOk).toBe(true)
+    apply(evt({ seq: 2, kind: 'session/error', sessionId: 'a', payload: { message: 'worker unavailable' } }))
+    expect(store.sessions['a']!.lastTurnOk).toBe(false)
+  })
+})

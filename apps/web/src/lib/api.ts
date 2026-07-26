@@ -32,6 +32,8 @@ export interface SessionRecord {
   effort?: string
   serviceTier?: string
   permissionMode?: string
+  /** Tools the operator chose "always allow" for in this chat. Shown (and revocable) in the permission menu. */
+  allowedTools?: string[]
   title?: string
   titleSource?: string
   // Adopted from an existing vendor transcript via project-import (vs. spawned by the hub).

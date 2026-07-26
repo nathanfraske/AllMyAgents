@@ -2,8 +2,13 @@
   import { api } from './api'
   import Icon from './Icon.svelte'
 
-  let { sessionId, mode }: { sessionId: string; mode: string } = $props()
+  // `allowedTools` are the per-chat "always allow" grants made from an approval prompt. They are listed
+  // here because this is where the approval prompt's tooltip says to undo them — a promise that was made
+  // before the list existed, so the grants were effectively permanent and invisible.
+  let { sessionId, mode, allowedTools = [] }: { sessionId: string; mode: string; allowedTools?: string[] } =
+    $props()
   let open = $state(false)
+  let revokeError = $state<string | null>(null)
 
   const MODES = [
     { id: 'safe', icon: 'lock', label: 'Safe', desc: 'ask before every tool' },
@@ -15,6 +20,14 @@
   async function pick(id: string): Promise<void> {
     open = false
     await api.setMode(sessionId, id)
+  }
+
+  /** Revoke an "always allow" grant so the tool prompts again. Surfaces failure instead of silently
+   *  leaving the operator believing a permission was withdrawn when it was not. */
+  async function revoke(toolName: string): Promise<void> {
+    revokeError = null
+    const res = (await api.allowTool(sessionId, toolName, false)) as { error?: string }
+    if (res?.error) revokeError = `could not revoke ${toolName}: ${res.error}`
   }
 </script>
 
@@ -32,6 +45,17 @@
           {#if m.id === current.id}<span class="tick"><Icon name="check" size={13} /></span>{/if}
         </button>
       {/each}
+      {#if allowedTools.length}
+        <div class="sep"></div>
+        <div class="grouphead dim">Always allowed in this chat</div>
+        {#each allowedTools as t (t)}
+          <div class="grant">
+            <span class="gname">{t}</span>
+            <button class="revoke" title={`Ask again before using ${t}`} onclick={() => revoke(t)}>Revoke</button>
+          </div>
+        {/each}
+        {#if revokeError}<div class="gerr">{revokeError}</div>{/if}
+      {/if}
     </div>
   {/if}
 </div>
@@ -55,4 +79,11 @@
   .l { font-size: var(--text-sm); }
   .d { font-size: var(--text-xs); }
   .tick { margin-left: auto; display: inline-grid; color: var(--accent); flex: none; }
+  .sep { height: 1px; background: var(--border); margin: var(--space-2) var(--space-1); }
+  .grouphead { font-size: var(--text-xs); padding: 0 var(--space-3) var(--space-1); }
+  .grant { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-1) var(--space-3); }
+  .gname { font-size: var(--text-xs); font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .revoke { margin-left: auto; font-size: var(--text-xs); color: var(--muted); border: 1px solid var(--border); border-radius: var(--r-sm); padding: 0 var(--space-2); flex: none; }
+  .revoke:hover { color: var(--bad-text); border-color: var(--bad); }
+  .gerr { font-size: var(--text-xs); color: var(--bad-text); padding: var(--space-1) var(--space-3); }
 </style>

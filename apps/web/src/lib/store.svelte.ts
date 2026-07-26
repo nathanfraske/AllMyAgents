@@ -277,7 +277,52 @@ class HubStore {
     saveQueues(this.queues)
   }
 
-  private flushQueue(sessionId: string): void {
+  /** Sessions with a queue flush already scheduled for the end of this tick (see scheduleQueueFlush). */
+  private readonly pendingFlush = new Set<string>()
+
+  /**
+   * Defer the flush to the end of the tick and re-read the session's status before sending, so a status
+   * that is immediately superseded within the same batch cannot trigger a send.
+   *
+   * WHAT THIS DOES NOT DO — and an earlier version of this comment wrongly claimed it did. It is NOT a
+   * replay barrier. The WebSocket replays the journal from seq 0 on every connect with no
+   * replay-complete marker, and — per `ingest` below — EVERY WebSocket message arrives as its own task,
+   * with batching bounded by a frame rather than by the backlog. So a large replay spans many tasks: an
+   * old `session/status idle` can end one batch, this timer can fire, and the `active` that says the
+   * session is actually busy right now arrives only in a later batch. Deferring narrows the window to a
+   * single batch; it does not close it, and under load it will not.
+   *
+   * THE REAL FIX, still open: the server should emit a non-journal replay-complete control envelope after
+   * its synchronous replay loop and before live delivery, and the client must run no mutating replay side
+   * effect until it sees that envelope — then re-read the final status once. That envelope is a statement
+   * about STREAM position ("everything through seq N has been delivered"), not a second opinion about
+   * whether a session is busy, so it does not add another authority; `record.status` stays the only one.
+   *
+   * The transactional rollback in flushQueue below is independent of this and does hold: whatever causes
+   * a send to fail, the text goes back on the queue rather than vanishing.
+   */
+  private scheduleQueueFlush(sessionId: string): void {
+    if (this.pendingFlush.has(sessionId)) return // one flush per session per tick — replay bursts many
+    this.pendingFlush.add(sessionId)
+    setTimeout(() => {
+      this.pendingFlush.delete(sessionId)
+      const view = this.sessions[sessionId]
+      if (!view || view.record.status !== 'idle') return
+      void this.flushQueue(sessionId)
+    }, 0)
+  }
+
+  /**
+   * Send the head of a session's queue, TRANSACTIONALLY: if the send fails, the text goes back on the
+   * queue and the optimistic bubble is withdrawn.
+   *
+   * This used to dequeue, persist the removal, echo the message, and then `void api.send(...)` without
+   * ever looking at the result. `jpost` RESOLVES with `{error}` rather than throwing, so every failure —
+   * hub down, worker unavailable, session busy — silently destroyed the queued text while leaving a bubble
+   * claiming it had been sent. A reload then removed the bubble too, and the message had never existed
+   * anywhere. That is the same divergence ThreadView.send() already handles correctly for direct sends.
+   */
+  private async flushQueue(sessionId: string): Promise<void> {
     const q = this.queues[sessionId]
     if (!q || q.length === 0) return
     let toSend: string
@@ -291,8 +336,23 @@ class HubStore {
     }
     this.queues = { ...this.queues, [sessionId]: rest }
     saveQueues(this.queues)
-    this.pushUserEcho(sessionId, toSend) // show the flushed queued message in the transcript
-    void api.send(sessionId, toSend)
+    const key = this.pushUserEcho(sessionId, toSend) // show the flushed queued message in the transcript
+    const res = (await api.send(sessionId, toSend)) as { error?: string } | undefined
+    if (!res?.error) return
+    // Put it back at the HEAD so ordering survives, withdraw the echo (which also clears the suppress
+    // flag and the thinking spinner), and say so — a queued message must never disappear silently.
+    const current = this.queues[sessionId] ?? []
+    this.queues = { ...this.queues, [sessionId]: [toSend, ...current] }
+    saveQueues(this.queues)
+    this.removeItem(sessionId, key)
+    const view = this.sessions[sessionId]
+    if (view) {
+      this.push(view, {
+        kind: 'note',
+        ts: new Date().toISOString(),
+        text: `⚠ queued message was not sent (${res.error}) — it is still queued`,
+      })
+    }
   }
 
   private ws: WebSocket | null = null
@@ -1192,6 +1252,11 @@ class HubStore {
         // Turn timing for the thinking indicator: a turn is in flight while active/starting,
         // settled otherwise. Keep an already-set start time (from the optimistic send).
         if (status === 'active' || status === 'starting') {
+          // A NEW turn invalidates the previous turn's verdict. Without this the flag was only ever
+          // overwritten by a *result*, so a turn that ended without one — a worker loss, a restored-stale
+          // sweep, any path that goes straight back to idle — inherited the last turn's `true` and was
+          // presented as a green "completed" it never earned.
+          view.lastTurnOk = undefined
           // Use the EVENT's timestamp, never `now`. This same event replays from the journal on an app
           // reload or a hub restart, and `Date.now()` would restart the "thinking for…" clock at zero
           // every time — so a turn that genuinely survived a restart (worker mode) looked brand new.
@@ -1203,14 +1268,38 @@ class HubStore {
         } else if (status === 'idle' || status === 'error' || status === 'stopped') {
           view.turnStartedAt = undefined
         }
-        // Flush on idle (turn done) or error (so queued messages aren't orphaned).
-        if (status === 'idle' || status === 'error') this.flushQueue(sessionId)
+        // Flush queued messages when the turn genuinely FINISHED — deferred, so a replayed historical
+        // idle cannot send (see scheduleQueueFlush).
+        //
+        // Deliberately NOT on 'error' any more. That was meant to keep queued messages from being
+        // orphaned, but it fired them straight back into whatever had just failed: with the worker
+        // unavailable, each send produced another error status, which flushed the next message, and so on
+        // until the queue drained into a dead worker. An error boundary should surface the queue for the
+        // operator to retry, not spend it. The text stays queued and goes on the next real completion.
+        if (status === 'idle') this.scheduleQueueFlush(sessionId)
         break
       }
       case 'session/mode': {
         const pm = (payload as { permissionMode?: string }).permissionMode
         if (pm === 'safe' || pm === 'edits' || pm === 'full') view.record.permissionMode = pm
         this.push(view, { kind: 'note', ts, text: `permission mode → ${pm}` })
+        break
+      }
+      // The hub confirming an "always allow" grant or its revoke. Without this the permission menu only
+      // learned about grants on a full record resync, so a tool the operator had just allowed (or just
+      // revoked) was missing from the list they were looking at.
+      case 'session/tool-allowed':
+      case 'session/tool-disallowed': {
+        const p = payload as { toolName?: string; allowedTools?: string[] }
+        if (p.allowedTools) view.record.allowedTools = p.allowedTools
+        this.push(view, {
+          kind: 'note',
+          ts,
+          text:
+            kind === 'session/tool-allowed'
+              ? `always allowing ${p.toolName} in this chat`
+              : `${p.toolName} will ask again`,
+        })
         break
       }
       // The hub confirming a per-chat model/effort/tier change. Replayed on reconnect too, so the pills
@@ -1224,22 +1313,29 @@ class HubStore {
       }
       case 'session/error':
         this.push(view, { kind: 'error', ts, text: (payload as { message: string }).message })
+        // Also invalidate the last-turn verdict. Without this, a session-level failure left an EARLIER
+        // success standing, so status() kept reporting the stale 'completed' from the previous turn while
+        // a red error sat in the transcript.
+        view.lastTurnOk = false
         break
       case 'session/worktree-created':
         this.push(view, { kind: 'note', ts, text: `worktree: ${(payload as { worktree: string }).worktree}` })
         break
+      // A guardrail firing is the system WORKING, not the turn failing — the agent is told no and usually
+      // carries on to succeed. These were rendered as red `error` items, which is a large part of why
+      // errors appeared beside output that was perfectly fine. Kept clearly visible, but as notes.
       case 'approval/auto-denied-scope':
         this.push(view, {
-          kind: 'error',
+          kind: 'note',
           ts,
-          text: `scope guard denied ${(payload as { toolName: string }).toolName}: ${(payload as { reason: string }).reason}`,
+          text: `⚠ scope guard denied ${(payload as { toolName: string }).toolName}: ${(payload as { reason: string }).reason}`,
         })
         break
       case 'approval/auto-denied-bus':
         this.push(view, {
-          kind: 'error',
+          kind: 'note',
           ts,
-          text: `bus-turn guard denied ${(payload as { toolName?: string }).toolName ?? 'a risky tool'} — a teammate-message turn can't write practices`,
+          text: `⚠ bus-turn guard denied ${(payload as { toolName?: string }).toolName ?? 'a risky tool'} — a teammate-message turn can't write practices`,
         })
         break
       case 'practice/wrote':
@@ -1261,12 +1357,45 @@ class HubStore {
       case 'claude/result': {
         const p = payload as {
           is_error?: boolean
+          subtype?: string
           result?: string
+          errors?: string[]
+          terminal_reason?: string
           total_cost_usd?: number
           modelUsage?: Record<string, { inputTokens?: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number; contextWindow?: number }>
         }
-        if (p.is_error) this.push(view, { kind: 'error', ts, text: p.result })
-        view.lastTurnOk = !p.is_error
+        // This used to be `if (p.is_error) push({kind:'error', text: p.result})`, which was wrong twice.
+        //
+        // 1. THE TEXT WAS ALWAYS EMPTY ON A REAL FAILURE. The SDK has two result shapes: SDKResultSuccess
+        //    carries `result: string`, but SDKResultError carries `errors: string[]` and NO `result` field
+        //    at all. So every genuine failure rendered a red card with nothing in it, while the actual
+        //    reason sat unread in `errors`.
+        // 2. AN INTENTIONAL INTERRUPT WAS PAINTED AS A FAILURE. Pressing stop ends the query with
+        //    terminal_reason 'aborted_streaming' / 'aborted_tools'. That is the operator getting what they
+        //    asked for, not an error — but is_error made it red and set lastTurnOk=false, so the chat
+        //    showed a failure next to output that was fine.
+        const interrupted = p.terminal_reason === 'aborted_streaming' || p.terminal_reason === 'aborted_tools'
+        if (interrupted) {
+          this.push(view, { kind: 'note', ts, text: 'interrupted' })
+          // UNDEFINED, not true. `lastTurnOk` is a two-state flag standing in for a three-state outcome,
+          // and status() renders idle+true as a green "completed" — so marking an interrupt as ok would
+          // relabel a turn the operator deliberately cut short as successfully finished, trading one false
+          // terminal state for another. Undefined falls through to "ready", which is the honest answer.
+          // (The durable fix is an explicit completed|interrupted|failed outcome; this flag cannot hold it.)
+          view.lastTurnOk = undefined
+        } else if (p.is_error) {
+          // Never render a blank error: prefer the structured reasons, then the success-shaped text, then
+          // whatever the SDK told us about why the loop ended. Entries are trimmed and empties dropped —
+          // `errors: ['']` is length-1, so a `??` chain would accept the empty string and still render a
+          // blank card, which is the very bug this branch exists to prevent.
+          const fromErrors = (p.errors ?? []).map((e) => String(e).trim()).filter(Boolean).join('\n')
+          const text =
+            fromErrors || p.result?.trim() || `turn failed (${p.terminal_reason ?? p.subtype ?? 'unknown error'})`
+          this.push(view, { kind: 'error', ts, text })
+          view.lastTurnOk = false
+        } else {
+          view.lastTurnOk = true
+        }
         view.turnStartedAt = undefined
         if (typeof p.total_cost_usd === 'number') view.costUsd = (view.costUsd ?? 0) + p.total_cost_usd
         if (p.modelUsage) {
@@ -1290,8 +1419,15 @@ class HubStore {
         break
       }
       case 'codex/turn/completed': {
+        // Every codex turn ends here; turn.status distinguishes completed | interrupted | failed.
+        //
+        // `status === undefined` used to count as SUCCESS, so a malformed or unrecognised terminal event
+        // rendered a green "completed" — the same false-green as the Claude interrupt path, reached by a
+        // different route. Unknown is now neutral: it settles the turn without claiming it worked.
         const status = (payload as { turn?: { status?: string } }).turn?.status
-        view.lastTurnOk = status === 'completed' || status === undefined
+        if (status === 'completed') view.lastTurnOk = true
+        else if (status === 'failed') view.lastTurnOk = false
+        else view.lastTurnOk = undefined // interrupted, or a status we do not recognise → neither
         view.turnStartedAt = undefined
         break
       }

@@ -381,9 +381,18 @@
 
   /** "Always allow" — grant the tool for this chat FIRST, then approve the request that prompted it, so
    *  the operator is not asked again for the same tool. The grant is hub-side, so it applies immediately. */
+  let grantError = $state<string | null>(null)
   async function allowAlways(id: string, toolName: string): Promise<void> {
     if (!view) return
-    await api.allowTool(view.record.id, toolName)
+    grantError = null
+    // jpost RESOLVES with {error} rather than throwing, so an unchecked await here looked like success.
+    // Approving anyway would have quietly downgraded "always allow" to "approve once" — the operator gets
+    // prompted again later with no idea the grant never took.
+    const res = (await api.allowTool(view.record.id, toolName)) as { error?: string }
+    if (res?.error) {
+      grantError = `could not always-allow ${toolName}: ${res.error}`
+      return
+    }
     await decide(id, true)
   }
 
@@ -517,7 +526,7 @@
                  indefinitely, and any prompt the operator misses fails closed after the timeout. -->
             <button
               class="abtn"
-              title="Stop asking about this tool in this chat. Undo it in the permission menu."
+              title="Stop asking about this tool in this chat. Revoke it in the permission menu."
               onclick={() => allowAlways(a.id, approvalTool(a.payload) as string)}
             >
               Always allow {approvalTool(a.payload)}
@@ -525,6 +534,7 @@
           {/if}
           <button class="abtn" onclick={() => decide(a.id, false)}>Decline</button>
         </div>
+        {#if grantError}<div class="aerr">{grantError}</div>{/if}
       </div>
     {/each}
 
@@ -579,7 +589,11 @@
             {/if}
           </div>
         {:else}
-          <PermissionPicker sessionId={view.record.id} mode={view.record.permissionMode ?? 'safe'} />
+          <PermissionPicker
+            sessionId={view.record.id}
+            mode={view.record.permissionMode ?? 'safe'}
+            allowedTools={view.record.allowedTools ?? []}
+          />
         {/if}
         {#if store.canToggleWorktree(view)}
           <button class="pill-btn" title="Isolated git worktree vs. work directly in the project — switch before your first message" onclick={() => store.toggleWorktree()}>
@@ -650,6 +664,7 @@
      than shattering identifiers mid-token. Still capped and scrollable so it can't push out the composer. */
   .abody { margin: 0.35rem 0; font-size: 0.74rem; color: var(--muted); max-height: 14rem; overflow: auto; white-space: pre-wrap; word-break: break-word; font-family: var(--mono); }
   .aacts { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+  .aerr { margin-top: 0.35rem; font-size: 0.74rem; color: var(--bad-text); }
   .abtn { font-size: 0.76rem; border: 1px solid var(--border-strong); border-radius: 7px; padding: 0.25rem 0.6rem; color: var(--muted); }
   .abtn.ok { border-color: var(--ok); color: var(--ok); }
   .abtn:hover { color: var(--text); }
