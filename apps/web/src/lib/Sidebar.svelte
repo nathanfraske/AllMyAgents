@@ -12,6 +12,18 @@
   import { flip } from 'svelte/animate'
   import { cubicOut } from 'svelte/easing'
   import { loadCollapsedFolders, saveCollapsedFolders } from './uiState'
+  import {
+    createFolder,
+    deleteFolder,
+    isFolderId,
+    loadFolderState,
+    moveChatToFolder,
+    partitionByFolder,
+    renameFolder,
+    saveFolderState,
+    type ChatFolder,
+    type FolderBucket,
+  } from './folders'
 
   let filter = $state('')
   let showCreate = $state(false)
@@ -36,6 +48,14 @@
     saveCollapsedFolders([...collapsed])
   })
 
+  // Chat FOLDERS live in the same collapsed set (their ids are `folder:`-prefixed so they cannot
+  // collide with a project id) — so a collapsed folder survives a restart through the persistence
+  // that already existed for project groups, rather than a second parallel mechanism.
+  let folders = $state(loadFolderState())
+  $effect(() => {
+    saveFolderState(folders)
+  })
+
   function toggleCollapse(id: string): void {
     const next = new Set(collapsed)
     const expanding = next.has(id)
@@ -43,7 +63,55 @@
     else next.add(id)
     collapsed = next
     // Expanding a project is an "open project" gesture — offer any un-imported chats (once/session).
-    if (expanding && id !== '__none__') void store.maybePromptImport(id, pathFor(id))
+    // Folder ids are excluded: expanding a folder is not opening a project, and its id is not a path.
+    if (expanding && id !== '__none__' && !isFolderId(id)) void store.maybePromptImport(id, pathFor(id))
+  }
+
+  // --- Folders ---------------------------------------------------------------------------------
+  // A folder is a CLIENT-ONLY sub-group inside a project group (see folders.ts for why it is not a
+  // hub table). Creating one drops it in expanded and immediately opens its name for editing —
+  // a folder called "New folder" that you then have to hunt for the rename button on is a dead end.
+  function addFolder(e: MouseEvent, groupId: string): void {
+    e.stopPropagation()
+    const made = createFolder(folders, groupId)
+    folders = made.state
+    // Expand the group directly rather than via toggleCollapse: that path also fires the
+    // "you opened a project, want to import its chats?" scan, and adding a folder is not that gesture.
+    if (collapsed.has(groupId)) {
+      const next = new Set(collapsed)
+      next.delete(groupId)
+      collapsed = next
+    }
+    startFolderRename(made.folder)
+  }
+
+  async function removeFolder(e: MouseEvent, f: ChatFolder, count: number): Promise<void> {
+    e.stopPropagation()
+    // Only ask when something is actually inside — and say plainly that the chats survive, because
+    // "delete folder" reads like "delete its contents" and this one genuinely does not.
+    if (count > 0) {
+      const ok = await confirmDialog(
+        `Delete the folder "${f.name}"? Its ${count} chat${count === 1 ? '' : 's'} move back into the project — no chat is deleted.`,
+        { confirmLabel: 'Delete folder' }
+      )
+      if (!ok) return
+    }
+    folders = deleteFolder(folders, f.id)
+  }
+
+  // Inline rename, same shape as the chat rename below it: Enter commits, Esc cancels, blur commits.
+  // Native prompt() is not an option — the desktop webview silently suppresses it (see dialog.svelte.ts).
+  let editingFolderId = $state<string | null>(null)
+  let folderDraft = $state('')
+  function startFolderRename(f: ChatFolder, e?: Event): void {
+    e?.stopPropagation()
+    editingId = null // never leave a chat rename half-open behind a folder rename
+    editingFolderId = f.id
+    folderDraft = f.name
+  }
+  function commitFolderRename(): void {
+    if (editingFolderId) folders = renameFolder(folders, editingFolderId, folderDraft)
+    editingFolderId = null
   }
 
   // A turn stuck 'active' with no completion for this long reads as stalled — worth a warning glance.
@@ -129,6 +197,7 @@
   let draft = $state('')
   function startRename(e: Event, s: SessionView): void {
     e.stopPropagation()
+    editingFolderId = null // and vice versa — only one inline editor is ever open
     editingId = s.record.id
     draft = label(s)
   }
@@ -144,7 +213,12 @@
   interface Group {
     id: string
     name: string
+    /** Every chat in the group, folders or not — the count + collapsed summary read this. */
     sessions: SessionView[]
+    /** The group's folders, each with the chats filed under it (order preserved from `sessions`). */
+    foldered: FolderBucket<SessionView>[]
+    /** Chats in the group that are in no folder. `foldered` + `loose` always re-covers `sessions`. */
+    loose: SessionView[]
     // Set only for a project that lives on a REMOTE fleet machine → renders a small site badge.
     // Absent for this hub's own (local) projects, so the single-machine view is unchanged.
     siteLabel?: string
@@ -171,15 +245,56 @@
       arr.push(s)
       byProject.set(key, arr)
     }
+    // Split each group's ordered chats across its folders. Anything whose folder was deleted (or
+    // belongs to another group) comes back in `loose`, so stale persisted state costs a folder and
+    // never a chat — see partitionByFolder.
+    const build = (id: string, name: string, sessions: SessionView[], site?: Partial<Group>): Group => {
+      const part = partitionByFolder(folders, id, sessions, (s) => s.record.id)
+      // With no search, an EMPTY folder still renders — it has to, or it could never be a drop
+      // destination. While searching it is pure noise: you are looking for chats, not for a target.
+      const buckets = filter ? part.folders.filter((b) => b.items.length > 0) : part.folders
+      return { id, name, sessions, foldered: buckets, loose: part.loose, ...site }
+    }
     const out: Group[] = []
     for (const p of store.orderedProjects) {
       const ss = byProject.get(p.id) ?? []
-      if (ss.length || !filter) out.push({ id: p.id, name: p.name, siteLabel: p.siteLabel, siteOnline: p.siteOnline, sessions: store.orderedChats(p.id, ss) })
+      if (ss.length || !filter) out.push(build(p.id, p.name, store.orderedChats(p.id, ss), { siteLabel: p.siteLabel, siteOnline: p.siteOnline }))
     }
     const none = byProject.get('__none__')
-    if (none?.length) out.push({ id: '__none__', name: 'Unfiled', sessions: store.orderedChats('__none__', none) })
+    if (none?.length) out.push(build('__none__', 'Unfiled', store.orderedChats('__none__', none)))
     return out
   })
+
+  // --- Flattened render list -------------------------------------------------------------------
+  // One group renders as a FLAT sequence of entries (folder header, chat row, empty-folder drop
+  // target) rather than nested lists. That is not cosmetic: `animate:flip` only works on the
+  // immediate child of a keyed {#each}, so nesting the folder chats in their own inner each would
+  // have split the group into several animation scopes and a chat dragged INTO a folder would jump
+  // instead of gliding. Flat + one wrapper element per entry keeps the whole group in one scope.
+  //
+  // `railId` is the folder whose vertical rail the entry sits inside (null = not in a folder), which
+  // is also exactly what a drag needs to know to decide "move into" vs "reorder within".
+  type Entry =
+    | { key: string; kind: 'folder'; railId: null; railEnd: false; folder: ChatFolder; count: number }
+    | { key: string; kind: 'empty'; railId: string; railEnd: true; folder: ChatFolder }
+    | { key: string; kind: 'chat'; railId: string | null; railEnd: boolean; s: SessionView }
+
+  function entriesFor(g: Group): Entry[] {
+    const out: Entry[] = []
+    for (const b of g.foldered) {
+      out.push({ key: `f:${b.folder.id}`, kind: 'folder', railId: null, railEnd: false, folder: b.folder, count: b.items.length })
+      if (collapsed.has(b.folder.id)) continue
+      if (b.items.length === 0) {
+        out.push({ key: `e:${b.folder.id}`, kind: 'empty', railId: b.folder.id, railEnd: true, folder: b.folder })
+        continue
+      }
+      b.items.forEach((s, i) => {
+        out.push({ key: `c:${s.record.id}`, kind: 'chat', railId: b.folder.id, railEnd: i === b.items.length - 1, s })
+      })
+    }
+    for (const s of g.loose) out.push({ key: `c:${s.record.id}`, kind: 'chat', railId: null, railEnd: false, s })
+    return out
+  }
 
   // --- Drag-to-reorder (native HTML5 DnD) ------------------------------------------------------
   // The whole chat ROW and the project group HEADER are the drag affordance — the SAME native drag a
@@ -194,10 +309,24 @@
   // sidebar we keep `store.dropZone` cleared, so the pane drop-ghost never shows: over the sidebar it
   // is a REORDER, over the panes it is an OPEN. A PROJECT drag never sets dragSession — reordering
   // groups is sidebar-local and must never open a pane.
-  type DragState = { kind: 'chat'; groupId: string; id: string } | { kind: 'project'; id: string }
+  //
+  // FOLDERS ride on the same gesture with one extra rule: while the cursor is over a container the
+  // dragged chat is NOT already in (another folder, or the group's ungrouped area), we do NOT reorder
+  // — we only PREVIEW a move by setting `folderDrop`, and commit it on the sidebar's own `drop`.
+  // Committing live on dragover would suck a chat into every folder it merely passed over; and doing
+  // it on `dragend` instead would also fire for a drop over the PANES, silently refiling a chat you
+  // only meant to open. Drop is the one event that means "here".
+  type DragState = { kind: 'chat'; groupId: string; id: string; folderId: string | null } | { kind: 'project'; id: string }
   let dragging = $state<DragState | null>(null)
+  // Where a chat-drop would land: the group + the folder (null = out of any folder, back to ungrouped).
+  // Null when the hovered container is the one the chat is already in, so nothing lights up for a no-op.
+  let folderDrop = $state<{ groupId: string; folderId: string | null } | null>(null)
   // Last target id we reordered onto — skip repeats so a stationary cursor can't oscillate.
   let lastOverId: string | null = null
+
+  function isDropTarget(groupId: string, folderId: string | null): boolean {
+    return folderDrop?.groupId === groupId && folderDrop.folderId === folderId
+  }
 
   const reduceMotion = typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches
   // FLIP only WHILE dragging (the list otherwise re-sorts by recency as agents work; keeping those
@@ -216,8 +345,9 @@
 
   // dragstart on a CHAT row: arm a chat reorder AND set dragSession, so dragging OUT into the panes
   // opens/splits it (the drop-to-open path in App.svelte).
-  function startChatDrag(e: DragEvent, groupId: string, id: string): void {
-    dragging = { kind: 'chat', groupId, id }
+  function startChatDrag(e: DragEvent, groupId: string, id: string, folderId: string | null): void {
+    dragging = { kind: 'chat', groupId, id, folderId }
+    folderDrop = null
     lastOverId = null
     store.dragSession = id
     e.dataTransfer?.setData('text/plain', id)
@@ -228,6 +358,7 @@
   // project drag reorders groups within the sidebar and never opens a pane.
   function startProjectDrag(e: DragEvent, id: string): void {
     dragging = { kind: 'project', id }
+    folderDrop = null
     lastOverId = null
     e.dataTransfer?.setData('text/plain', id)
     if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
@@ -235,6 +366,10 @@
 
   function endDrag(): void {
     dragging = null
+    // Dropped somewhere that is not the sidebar (the panes, or nowhere at all) — discard the preview
+    // WITHOUT applying it. `drop` always fires before `dragend`, so a real sidebar drop has already
+    // committed by the time we get here.
+    folderDrop = null
     lastOverId = null
     store.endDragSession() // clears dragSession + dropZone (a no-op harmless path when a project was dragged)
   }
@@ -245,23 +380,39 @@
   // while we reorder inside the sidebar. The lastOverId guard — reset to null whenever we hover the
   // dragged item itself — stops oscillation yet allows immediate re-entry, so a drag can sweep an
   // item back and forth across the same neighbours fluidly.
-  function dragOverTarget(e: DragEvent, groupId: string, chatId?: string): void {
+  // `folderId` is the container under the cursor: the folder a row/header/placeholder belongs to, or
+  // null for the group header and the ungrouped rows (which is what makes dragging a chat OUT work —
+  // it is just a move to the null container, never an orphaning).
+  function dragOverTarget(e: DragEvent, groupId: string, chatId?: string, folderId: string | null = null): void {
     const cur = dragging
     if (!cur) return
     e.preventDefault()
     store.dropZone = null
     if (cur.kind === 'project') {
+      folderDrop = null
       // Hovering a group's header OR any of its rows counts as hovering that whole group.
       if (groupId === cur.id) { lastOverId = null; return }
       if (groupId === lastOverId || groupId === '__none__') return
       store.reorderProjects(cur.id, groupId)
       lastOverId = groupId
     } else {
-      // A chat reorders only within its OWN group; a header (no chatId) is an inert target.
+      // Another project's rows: nothing to offer. The hub owns `projectId` and exposes no route to
+      // change it, so a chat can only be filed into a folder of the project it already belongs to.
+      if (groupId !== cur.groupId) { folderDrop = null; return }
+      if (folderId !== cur.folderId) {
+        // Different container → this is a MOVE. Preview only; reordering here as well would shuffle
+        // the list underneath a gesture that is on its way somewhere else.
+        folderDrop = { groupId, folderId }
+        lastOverId = null
+        return
+      }
+      folderDrop = null
+      // Same container → the original behaviour: live reorder. A header/placeholder (no chatId) is
+      // an inert target.
       const overId = chatId ?? groupId
       if (overId === cur.id) { lastOverId = null; return }
       if (overId === lastOverId) return
-      if (chatId && cur.groupId === groupId) {
+      if (chatId) {
         store.reorderChats(cur.groupId, cur.id, chatId)
         lastOverId = overId
       }
@@ -277,9 +428,18 @@
     e.preventDefault()
     store.dropZone = null
   }
+  // The ONE place a folder move is committed. Every zone inside the sidebar list lets its `drop`
+  // bubble up to here, so there is a single commit point rather than a handler per folder — and a
+  // drop over the PANES never reaches it, which is exactly why drag-to-open still just opens.
   function onListDrop(e: DragEvent): void {
     if (!dragging) return
     e.preventDefault()
+    const target = folderDrop
+    if (dragging.kind === 'chat' && target && target.groupId === dragging.groupId) {
+      const next = moveChatToFolder(folders, dragging.id, target.folderId)
+      if (next !== folders) folders = next
+    }
+    folderDrop = null
   }
 
 
@@ -363,7 +523,7 @@
       <div class="group" class:dragging={isDragging('project', g.id)} animate:flip={groupFlip}>
         <!-- The whole header is the project drag handle; '__none__' (Unfiled) is not reorderable. -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
-        <div class="group-head" class:draghandle={reorderable} draggable={reorderable}
+        <div class="group-head" class:draghandle={reorderable} class:droptarget={isDropTarget(g.id, null)} draggable={reorderable}
           ondragstart={(e) => startProjectDrag(e, g.id)}
           ondragend={endDrag}
           ondragover={(e) => dragOverTarget(e, g.id)}
@@ -386,6 +546,9 @@
             </span>
           {/if}
           <span class="gcount dim tnum">{g.sessions.length}</span>
+          <!-- Unfiled gets this one too: chats land there by default, so it is the group that most
+               needs tidying, and a folder there costs the hub nothing (see folders.ts). -->
+          <button class="gadd" title="new folder" onclick={(e) => addFolder(e, g.id)}><Icon name="folder-plus" size={13} /></button>
           {#if g.id !== '__none__'}
             <button class="gadd" title="import existing chats" onclick={(e) => openImport(e, g.id)}><Icon name="download" size={13} /></button>
             <button class="gadd" title="new chat here" onclick={() => store.newSession(undefined, g.id)}><Icon name="plus" size={14} /></button>
@@ -405,48 +568,88 @@
           </div>
         {/if}
         {#if !isCollapsed}
-        {#each g.sessions as s (s.record.id)}
-          {@const st = store.status(s)}
-          {@const pending = store.pendingBySession[s.record.id] ?? 0}
-          <div class="row" class:sel={store.selectedId === s.record.id} class:dragging={isDragging('chat', s.record.id)} role="button" tabindex="0"
-            draggable={editingId !== s.record.id}
-            animate:flip={rowFlip}
-            ondragstart={(e) => startChatDrag(e, g.id, s.record.id)}
-            ondragend={endDrag}
-            ondragover={(e) => dragOverTarget(e, g.id, s.record.id)}
-            ondragenter={preventIfDragging}
-            onclick={() => store.select(s.record.id)}
-            onkeydown={(e) => { if (e.key === 'Enter') store.select(s.record.id) }}>
-            <span class="grip" aria-hidden="true">{@render gripIcon()}</span>
-            <span class="dot {st.key}" title={st.label}></span>
-            <ProviderLogo provider={s.record.provider} size={13} />
-            {#if s.record.imported}<span class="ibadge" title="imported from an existing {s.record.provider} chat"><Icon name="download" size={10} /></span>{/if}
-            {#if editingId === s.record.id}
-              <input class="rename-input" bind:value={draft} use:focusInput
-                onclick={(e) => e.stopPropagation()}
-                onpointerdown={(e) => e.stopPropagation()}
-                onkeydown={(e) => { if (e.key === 'Enter') commitRename(); else if (e.key === 'Escape') editingId = null }}
-                onblur={commitRename} />
-            {:else}
+        <!-- One flat keyed list per group: folder headers, chat rows and empty-folder drop targets
+             share a wrapper element so `animate:flip` stays legal (it must sit on the immediate child
+             of a keyed each) and the whole group animates as one scope. `.infolder` draws the
+             indent + the vertical rail; adjacent entries' rails join into one continuous line. -->
+        {#each entriesFor(g) as en (en.key)}
+          <div class="entry" class:infolder={en.railId !== null} class:railend={en.railEnd}
+            class:railhot={en.railId !== null && isDropTarget(g.id, en.railId)} animate:flip={rowFlip}>
+            {#if en.kind === 'folder'}
+              {@const f = en.folder}
+              {@const fCollapsed = collapsed.has(f.id)}
               <!-- svelte-ignore a11y_no_static_element_interactions -->
-              <span class="rlabel" class:glitch={glitching.has(s.record.id)} ondblclick={(e) => startRename(e, s)}>{label(s)}</span>
-            {/if}
-            {#if s.record.siteLabel}<span class="rbadge" title="on {s.record.siteLabel} (remote fleet machine)"><Icon name="server" size={9} /></span>{/if}
-            {#if pending > 0}<span class="pbadge tnum">{pending}</span>{/if}
-            {#if warnOf(s, st)}
-              <span class="rwarn" title={warnTitle(st)} aria-label={warnTitle(st)}><Icon name="alert-triangle" size={12} /></span>
-              <span class="rtime dim tnum">{relativeTime(s.lastActivity)}</span>
-            {:else if st.key === 'working' || st.key === 'starting'}
-              <span class="rtime rdots" title={st.label} aria-label="working"><i></i><i></i><i></i></span>
+              <div class="folder-head" class:droptarget={isDropTarget(g.id, f.id)}
+                ondragover={(e) => dragOverTarget(e, g.id, undefined, f.id)}
+                ondragenter={preventIfDragging}>
+                <button class="folder" title={fCollapsed ? 'expand folder' : 'collapse folder'} onclick={() => toggleCollapse(f.id)}><Icon name={fCollapsed ? 'chevron-right' : 'chevron-down'} size={12} /></button>
+                <span class="ficon" aria-hidden="true"><Icon name="folder" size={12} /></span>
+                {#if editingFolderId === f.id}
+                  <input class="rename-input" bind:value={folderDraft} use:focusInput
+                    onclick={(e) => e.stopPropagation()}
+                    onpointerdown={(e) => e.stopPropagation()}
+                    onkeydown={(e) => { if (e.key === 'Enter') commitFolderRename(); else if (e.key === 'Escape') editingFolderId = null }}
+                    onblur={commitFolderRename} />
+                {:else}
+                  <!-- svelte-ignore a11y_no_static_element_interactions -->
+                  <span class="fname" title="double-click to rename" ondblclick={(e) => startFolderRename(f, e)}>{f.name}</span>
+                {/if}
+                <span class="gcount dim tnum">{en.count}</span>
+                <span class="factions">
+                  <button class="mini" title="rename folder" onclick={(e) => startFolderRename(f, e)}><Icon name="pencil" size={12} /></button>
+                  <button class="mini del" title="delete folder (chats stay)" onclick={(e) => removeFolder(e, f, en.count)}><Icon name="trash" size={12} /></button>
+                </span>
+              </div>
+            {:else if en.kind === 'empty'}
+              <!-- An empty folder MUST stay visible and droppable, or it could never become non-empty. -->
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
+              <div class="fempty dim" class:droptarget={isDropTarget(g.id, en.folder.id)}
+                ondragover={(e) => dragOverTarget(e, g.id, undefined, en.folder.id)}
+                ondragenter={preventIfDragging}>drag chats here</div>
             {:else}
-              <span class="rtime dim tnum">{relativeTime(s.lastActivity)}</span>
+              {@const s = en.s}
+              {@const st = store.status(s)}
+              {@const pending = store.pendingBySession[s.record.id] ?? 0}
+              <div class="row" class:sel={store.selectedId === s.record.id} class:dragging={isDragging('chat', s.record.id)} role="button" tabindex="0"
+                draggable={editingId !== s.record.id}
+                ondragstart={(e) => startChatDrag(e, g.id, s.record.id, en.railId)}
+                ondragend={endDrag}
+                ondragover={(e) => dragOverTarget(e, g.id, s.record.id, en.railId)}
+                ondragenter={preventIfDragging}
+                onclick={() => store.select(s.record.id)}
+                onkeydown={(e) => { if (e.key === 'Enter') store.select(s.record.id) }}>
+                <span class="grip" aria-hidden="true">{@render gripIcon()}</span>
+                <span class="dot {st.key}" title={st.label}></span>
+                <ProviderLogo provider={s.record.provider} size={13} />
+                {#if s.record.imported}<span class="ibadge" title="imported from an existing {s.record.provider} chat"><Icon name="download" size={10} /></span>{/if}
+                {#if editingId === s.record.id}
+                  <input class="rename-input" bind:value={draft} use:focusInput
+                    onclick={(e) => e.stopPropagation()}
+                    onpointerdown={(e) => e.stopPropagation()}
+                    onkeydown={(e) => { if (e.key === 'Enter') commitRename(); else if (e.key === 'Escape') editingId = null }}
+                    onblur={commitRename} />
+                {:else}
+                  <!-- svelte-ignore a11y_no_static_element_interactions -->
+                  <span class="rlabel" class:glitch={glitching.has(s.record.id)} ondblclick={(e) => startRename(e, s)}>{label(s)}</span>
+                {/if}
+                {#if s.record.siteLabel}<span class="rbadge" title="on {s.record.siteLabel} (remote fleet machine)"><Icon name="server" size={9} /></span>{/if}
+                {#if pending > 0}<span class="pbadge tnum">{pending}</span>{/if}
+                {#if warnOf(s, st)}
+                  <span class="rwarn" title={warnTitle(st)} aria-label={warnTitle(st)}><Icon name="alert-triangle" size={12} /></span>
+                  <span class="rtime dim tnum">{relativeTime(s.lastActivity)}</span>
+                {:else if st.key === 'working' || st.key === 'starting'}
+                  <span class="rtime rdots" title={st.label} aria-label="working"><i></i><i></i><i></i></span>
+                {:else}
+                  <span class="rtime dim tnum">{relativeTime(s.lastActivity)}</span>
+                {/if}
+                <span class="ractions">
+                  <button class="mini" title="rename" onclick={(e) => startRename(e, s)}><Icon name="pencil" size={12} /></button>
+                  <button class="mini" title="interrupt" onclick={(e) => act(e, s.record.id, 'interrupt')}><Icon name="square" size={12} /></button>
+                  <button class="mini" title="stop" onclick={(e) => act(e, s.record.id, 'stop')}><Icon name="x" size={13} /></button>
+                  <button class="mini del" title="delete chat" onclick={(e) => del(e, s.record.id, label(s))}><Icon name="trash" size={12} /></button>
+                </span>
+              </div>
             {/if}
-            <span class="ractions">
-              <button class="mini" title="rename" onclick={(e) => startRename(e, s)}><Icon name="pencil" size={12} /></button>
-              <button class="mini" title="interrupt" onclick={(e) => act(e, s.record.id, 'interrupt')}><Icon name="square" size={12} /></button>
-              <button class="mini" title="stop" onclick={(e) => act(e, s.record.id, 'stop')}><Icon name="x" size={13} /></button>
-              <button class="mini del" title="delete chat" onclick={(e) => del(e, s.record.id, label(s))}><Icon name="trash" size={12} /></button>
-            </span>
           </div>
         {/each}
         {/if}
@@ -511,6 +714,41 @@
   .gadd { display: grid; place-items: center; color: var(--dim); width: 20px; height: 20px; border-radius: var(--r-xs); opacity: 0; transition: opacity var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease); }
   .group-head:hover .gadd { opacity: 1; }
   .gadd:hover { background: var(--surface-2); color: var(--accent); }
+
+  /* --- Folders -------------------------------------------------------------------------------
+     Every row of a group (folder header, chat, empty-folder target) is wrapped in one `.entry`,
+     which is what carries the grouping visual: `.infolder` indents and draws a 1px rail down its
+     left edge, and because the entries are adjacent block boxes with no vertical gap, the rails of
+     consecutive members join into ONE continuous line under the folder header. `.railend` caps it
+     with a short foot so the group reads as enclosed rather than merely started. All of it is
+     token-driven (--space-*, --border*, --accent), so it tracks the palette instead of pinning px. */
+  .entry { position: relative; }
+  .entry.infolder { margin-left: calc(var(--space-6) + var(--space-1)); padding-left: var(--space-2); border-left: 1px solid var(--border); }
+  .entry.infolder .row { padding-left: var(--space-3); }
+  .entry.railend::after { content: ''; position: absolute; left: 0; bottom: 0; width: var(--space-3); height: 1px; background: var(--border); }
+  /* Drop preview: the whole rail lights up, so you can see WHICH folder will take the chat even when
+     the cursor is over one of its members rather than its header. */
+  .entry.railhot { border-left-color: var(--accent); }
+  .entry.railhot.railend::after { background: var(--accent); }
+
+  .folder-head { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-1) var(--space-3) var(--space-1) var(--space-6);
+    font-size: var(--text-sm); color: var(--muted); border-radius: var(--r-sm); }
+  .folder-head:hover { background: var(--surface-2); }
+  .ficon { display: inline-grid; place-items: center; color: var(--dim); }
+  .fname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: text; }
+  .factions { display: none; gap: 0.15rem; }
+  .folder-head:hover .factions { display: flex; }
+  /* Empty folders stay on screen precisely so they can be dropped into — the placeholder is the
+     hit target, and it says what to do rather than looking like a rendering bug. */
+  .fempty { padding: var(--space-2) var(--space-3); font-size: var(--text-xs); font-style: italic;
+    border: 1px dashed var(--border); border-radius: var(--r-sm); margin: var(--space-1) 0; text-align: center; }
+  /* Shared drop-target highlight for a folder header, an empty folder, and (for a drag back OUT) the
+     project header itself. */
+  .folder-head.droptarget, .fempty.droptarget, .group-head.droptarget {
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    box-shadow: inset 0 0 0 1px var(--border-accent); border-radius: var(--r-sm); }
+  .fempty.droptarget { border-style: solid; border-color: transparent; color: var(--text); }
+
   .row { position: relative; display: flex; align-items: center; gap: var(--space-3); padding: var(--space-2) var(--space-3) var(--space-2) var(--space-6); border-radius: var(--r-md); cursor: pointer; }
   .row:hover { background: var(--surface-2); }
   .row.sel { background: var(--surface-2); box-shadow: inset 2px 0 0 var(--accent); }

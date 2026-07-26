@@ -68,6 +68,12 @@ export function saveLastLayout(layout: PersistedLayout): void {
 
 // Load the set of COLLAPSED folder/group ids (anything not listed is expanded — the default).
 // Returns [] on absent/malformed, filtering to strings so a corrupt entry can't poison the Set.
+//
+// ONE set holds two kinds of id: a sidebar PROJECT group ('__none__' for Unfiled) and a chat FOLDER
+// inside one (`folder:<uuid>` — see folders.ts, which prefixes ids precisely so the two can share this
+// key without an ambiguous entry collapsing the wrong thing). Ids for things that no longer exist are
+// kept rather than pruned: projects and folders both load after this does, so "forget what I don't
+// recognise" would throw the state away on every cold start.
 export function loadCollapsedFolders(): string[] {
   try {
     const raw = localStorage.getItem(FOLDERS_KEY)
