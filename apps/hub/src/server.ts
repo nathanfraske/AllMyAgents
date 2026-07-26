@@ -169,12 +169,36 @@ function json(res: http.ServerResponse, value: unknown, status = 200): void {
   res.end(JSON.stringify(value))
 }
 
+/**
+ * A request body is CLIENT input, so a malformed one is a 400, not a 500.
+ *
+ * This used to `JSON.parse` unguarded, so `{ not json` threw out of the handler and the catch-all
+ * answered 500 — "the server broke" for what is plainly a bad request. That misreads the fault, and it
+ * puts an unhandled throw on the request path of a hub that agents drive automatically. This project
+ * has already been bricked once by an unguarded JSON.parse (a malformed journal row crash-looping the
+ * app), which is reason enough not to leave another one on a public route.
+ *
+ * {@link BadRequestError} is caught by the handler and turned into a 400.
+ */
+class BadRequestError extends Error {}
+
 async function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = []
   for await (const chunk of req) chunks.push(chunk as Buffer)
   const raw = Buffer.concat(chunks).toString('utf8')
   if (!raw.trim()) return {}
-  return JSON.parse(raw) as Record<string, unknown>
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch (err) {
+    throw new BadRequestError(`invalid JSON body: ${err instanceof Error ? err.message : String(err)}`)
+  }
+  // A JSON body may legally be a string, number, or array; every caller here indexes it as an object,
+  // so anything else would read as a silent bag of undefineds rather than an error.
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new BadRequestError('body must be a JSON object')
+  }
+  return parsed as Record<string, unknown>
 }
 
 function str(value: unknown): string | undefined {
@@ -711,7 +735,21 @@ export function startServer(opts: ServerOptions): http.Server {
         }
         const body = await readBody(req)
         const pm = str(body.permissionMode)
-        const record = await sessions.create(String(body.profileId ?? ''), {
+        // Validate the profile HERE rather than letting sessions.create throw into the catch-all. An
+        // unknown profile id is a bad request — the caller named an account that does not exist — and
+        // answering 500 told the UI the hub had broken, which is both wrong and unactionable. The list
+        // is included because the realistic causes are a typo and a stale client whose account list
+        // predates a rescan, and both are answered by seeing what actually exists.
+        const requestedProfile = String(body.profileId ?? '')
+        if (!profiles.some((p) => p.id === requestedProfile)) {
+          json(
+            res,
+            { error: `unknown profile: ${requestedProfile || '(none given)'}`, known: profiles.map((p) => p.id) },
+            400
+          )
+          return
+        }
+        const record = await sessions.create(requestedProfile, {
           cwd: str(body.cwd),
           repo: str(body.repo),
           projectId: str(body.projectId),
@@ -854,6 +892,13 @@ export function startServer(opts: ServerOptions): http.Server {
       }
       json(res, { error: 'not found' }, 404)
     } catch (err) {
+      // Bad input is the CLIENT's fault: answer 400 so a caller can tell "I sent nonsense" from "the
+      // hub is broken". Reserving 500 for genuine server faults also keeps it meaningful as a signal —
+      // a 500 in the log should be worth investigating, not routine noise from a fuzzed route.
+      if (err instanceof BadRequestError) {
+        json(res, { error: err.message }, 400)
+        return
+      }
       json(res, { error: err instanceof Error ? err.message : String(err) }, 500)
     }
   }
