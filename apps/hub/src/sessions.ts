@@ -602,6 +602,12 @@ export class SessionManager {
       // Stop was undone by a routine re-attach. Worker liveness describes what the WORKER holds; it is not
       // evidence about what the operator asked for.
       if (record.status === 'stopped') continue
+      // A turn that survived the restart keeps the provenance it was started with. Without this the
+      // successor hub has no idea who caused the running turn, so `isAutoApproved` fails closed and a
+      // Full Access chat starts raising approvals mid-work for tools it had been running freely — the
+      // agent stalls on a prompt the operator never expected and may not even see. Read back from the
+      // journal so provenance lasts as long as the turn, not as long as the process.
+      if (s.status === 'active') this.restoreTurnOrigin(record.id)
       if (s.status === 'active') {
         record.status = 'active' // keep the live turn active across the seam (already persisted active)
         const cursor = this.lastJournaledWseq(s.sessionId) // the DURABLE exactly-once replay cursor (§7.1)
@@ -861,6 +867,7 @@ export class SessionManager {
       // observable side effect, so lazy-vs-eager is invisible). Fire-and-forget, as before.
       if (opts.prompt) {
         this.operatorTurnSessions.add(id)
+        this.journal.append(id, 'session/turn-origin', { origin: 'operator' })
         void this.executor.runTurn(this.specOf(record), opts.prompt, 'operator')
       }
     } else {
@@ -870,6 +877,7 @@ export class SessionManager {
       this.setStatus(record, 'idle')
       if (opts.prompt) {
         this.operatorTurnSessions.add(id)
+        this.journal.append(id, 'session/turn-origin', { origin: 'operator' })
         await this.executor.runTurn(this.specOf(record), opts.prompt, 'operator')
       }
     }
@@ -1055,6 +1063,7 @@ export class SessionManager {
     // the same bypass through a different door, so the tag goes after every path that can reject.
     // (admission already happened above, before any journal/title/override side effect)
     this.operatorTurnSessions.add(sessionId)
+    this.journal.append(sessionId, 'session/turn-origin', { origin: 'operator' })
     if (record.provider === 'claude') {
       void this.executor.runTurn(this.specOf(record), text, 'operator')
     } else {
@@ -1278,6 +1287,18 @@ export class SessionManager {
   }
 
   /** Auto-derive a title from the first substantive prompt. Fires once; never clobbers a rename. */
+  /**
+   * Restore a still-running turn's provenance from the journal after a hub restart.
+   *
+   * Deliberately re-derived rather than assumed: a turn with no recorded origin stays unknown, and
+   * unknown still fails closed. This only recovers what was actually written down.
+   */
+  private restoreTurnOrigin(sessionId: string): void {
+    const origin = this.journal.lastTurnOrigin(sessionId)
+    if (origin === 'operator') this.operatorTurnSessions.add(sessionId)
+    else if (origin === 'bus') this.busTurnSessions.add(sessionId)
+  }
+
   /** Every title currently in use, so a generated name can avoid colliding with a visible one. */
   private titlesInUse(): Set<string> {
     const names = new Set<string>()
@@ -1420,6 +1441,7 @@ export class SessionManager {
     // hard-denies practice writes — the same self-gate provenance the executor tags for the Claude path.
     // Cleared when the session leaves 'active' (setStatus), so it spans the whole turn.
     this.busTurnSessions.add(record.id)
+    this.journal.append(record.id, 'session/turn-origin', { origin: 'bus' })
     void this.executor.runTurn(spec, framed, 'bus')
   }
 

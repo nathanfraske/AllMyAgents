@@ -127,11 +127,20 @@ function spawnHub(port: number, color: HubColor): HubHandle {
     children.delete(child)
     const expected = handle.state === 'retired'
     log(`hub(${color}) exited (code=${code ?? 'null'} signal=${signal ?? 'null'})${expected ? '' : ' — UNEXPECTED'}`)
-    // If the LIVE hub dies on its own (a crash, not a planned retire) and no flip is running, nothing
-    // is on 7777 and hubctl can't recover it — exit so the desktop shell's probe surfaces the failure.
+    // The LIVE hub died on its own (a crash, not a planned retire) with no flip running: nothing is on
+    // 7777. RECOVER IT.
+    //
+    // This used to `process.exit(1)`, on the reasoning that "hubctl can't recover it — exit so the
+    // desktop shell's probe surfaces the failure". The desktop shell has no such probe: it checks the
+    // port once, before spawning, and never again. So the handoff was to nobody. In practice the app sat
+    // there with no hub, no error and no recovery, and the operator saw a window that had simply stopped
+    // working — twice in one day, once from a crash loop that no amount of relaunching could clear.
+    //
+    // A supervisor that exits when its child dies is not supervising. Respawn with backoff instead, the
+    // same shape the agent worker above already uses.
     if (!expected && live === handle && !flipInFlight) {
-      log('live hub died with no flip in progress — exiting supervisor')
-      process.exit(1)
+      live = null
+      void reviveLiveHub()
     }
   })
   return handle
@@ -183,6 +192,63 @@ function spawnWorker(): void {
     log(`worker exited (code=${code ?? 'null'} signal=${signal ?? 'null'})${tearingDown ? '' : ' — respawning'}`)
     if (!tearingDown && wasCurrent) spawnWorker()
   })
+}
+
+/**
+ * Bring the live hub back after a crash, retrying until it sticks.
+ *
+ * Backoff is capped rather than unbounded, and it NEVER gives up. Those are deliberate and they trade
+ * against each other:
+ *   - Giving up is what produced today's outage. A hub that is unreachable forever, with the app still
+ *     open, is the worst possible end state — the operator cannot tell a crash from a hang from a bug,
+ *     and relaunching does not help because the supervisor is already gone.
+ *   - Retrying hot is the other failure: a hub that dies instantly on boot (a corrupt journal row, a bad
+ *     migration) would spin the CPU and flood the log. Hence the cap.
+ * A crash-looping hub therefore settles into a slow, quiet retry that recovers by itself the moment the
+ * underlying problem is fixed — including a fix applied by an agent, which is the point of this app.
+ *
+ * `consecutiveFailures` resets once a hub has stayed up for STABLE_MS, so an unrelated crash weeks later
+ * starts from a fast retry rather than inheriting an old penalty.
+ */
+const BACKOFF_MS = [500, 1_000, 2_000, 5_000, 10_000, 20_000, 30_000]
+const STABLE_MS = 60_000
+let consecutiveFailures = 0
+let reviving = false
+
+async function reviveLiveHub(): Promise<void> {
+  if (reviving || tearingDown) return
+  reviving = true
+  try {
+    for (;;) {
+      if (tearingDown) return
+      const wait = BACKOFF_MS[Math.min(consecutiveFailures, BACKOFF_MS.length - 1)] as number
+      consecutiveFailures++
+      log(`live hub is down — respawning in ${wait}ms (attempt ${consecutiveFailures})`)
+      await new Promise((r) => setTimeout(r, wait))
+      if (tearingDown) return
+      try {
+        const next = spawnHub(FIXED_PORT, 'blue')
+        const ready = await waitForHubMsg(next.child, 'ready', 20_000)
+        next.port = ready.port
+        next.restored = ready.restored
+        setLive(next)
+        log(`hub recovered on :${next.port} — ${next.restored} session(s) restored`)
+        // Only declare success once it has SURVIVED a while. A hub that boots, reports ready, and dies a
+        // second later is still a crash loop, and treating that as recovery would reset the backoff every
+        // time and turn the cap into a hot loop.
+        const settled = next
+        setTimeout(() => {
+          if (live === settled) consecutiveFailures = 0
+        }, STABLE_MS).unref?.()
+        return
+      } catch (err) {
+        log(`respawn attempt ${consecutiveFailures} failed: ${String(err)}`)
+        // loop and try again after a longer wait
+      }
+    }
+  } finally {
+    reviving = false
+  }
 }
 
 /** Make `handle` the live hub and (re-)wire the `restart-request` listener onto it. */

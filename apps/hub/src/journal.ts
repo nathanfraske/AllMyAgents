@@ -161,6 +161,29 @@ export class Journal extends EventEmitter {
 
   /** The most recent event (kind + ts) for a session, or undefined if it has none. Read-only; used by the
    *  peek_agent tool to summarize a teammate's latest activity without interrupting them. */
+  /**
+   * The origin of the session's most recent turn — who caused it — or undefined if it has never run one.
+   *
+   * Turn provenance decides whether the hub may auto-approve a tool call (an operator's own turn may; a
+   * teammate's bus message must not). It used to live only in hub memory, which meant a hub restart
+   * ERASED it: a turn that survived the restart lost the fact that the operator started it, and its very
+   * next tool call raised an approval nobody was expecting — a Full Access chat silently blocked, mid-work.
+   *
+   * Reading it back from the journal makes provenance survive exactly as long as the turn does.
+   */
+  lastTurnOrigin(sessionId: string): 'operator' | 'bus' | undefined {
+    const row = this.db
+      .prepare("SELECT payload FROM events WHERE session = ? AND kind = 'session/turn-origin' ORDER BY seq DESC LIMIT 1")
+      .get(sessionId) as { payload: string } | undefined
+    if (!row) return undefined
+    try {
+      const origin = (JSON.parse(row.payload) as { origin?: unknown }).origin
+      return origin === 'operator' || origin === 'bus' ? origin : undefined
+    } catch {
+      return undefined
+    }
+  }
+
   lastEventForSession(sessionId: string): { kind: string; ts: string } | undefined {
     const row = this.db
       .prepare('SELECT kind, ts FROM events WHERE session = ? ORDER BY seq DESC LIMIT 1')
