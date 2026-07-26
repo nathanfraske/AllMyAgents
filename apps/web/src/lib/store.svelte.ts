@@ -482,8 +482,13 @@ class HubStore {
     // that is the EXPECTED ordering rather than a rare race — the app could brick itself on the one run
     // where the operator has the least idea what is wrong.
     //
-    // Each fetch now degrades its own panel and the transport comes up regardless.
-    await this.loadBootstrapData()
+    // The transport comes up FIRST and is never awaited behind optional data. Catching each fetch was not
+    // enough on its own: a hub that accepts the socket but never answers (exactly what a still-starting
+    // one does) leaves the await pending forever, so connect() is still never reached and the app is
+    // still blank with no retry. Not awaiting removes rejection AND hang in one move, and the side data
+    // is genuinely optional — the transcript stream is what the operator is waiting for.
+    this.connect()
+    void this.loadBootstrapData()
     // Per-chat settings (permission mode, model, thinking effort, title) are rebuilt from replayed
     // `session/created` events, which carry the record AS IT WAS AT CREATION — so a mode you changed
     // later rendered stale on a fresh load. Overlay the hub's CURRENT roster once the replay has
@@ -494,8 +499,7 @@ class HubStore {
     // Belt and braces: if sessions were already loaded above, ensure() has come and gone, so nudge the
     // restore directly. scheduleAutoRestore is idempotent and re-arms itself while the roster is empty.
     this.scheduleAutoRestore()
-    vlog(`init: side data loaded (${msSince(t0)}) — connecting WS`)
-    this.connect()
+    vlog(`init: bootstrap dispatched, WS connecting (${msSince(t0)})`)
     // Fire-and-forget: pull the fleet roster and merge any remote machines' projects/sessions
     // read-only. Non-blocking so local render stays instant; a no-node/no-peer hub gets just the
     // local entry and this is a no-op (see refreshFleet).

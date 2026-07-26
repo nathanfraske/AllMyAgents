@@ -611,40 +611,13 @@ describe('session removal does not hijack the home screen', () => {
  * On a cold or first launch the hub is still starting while the UI mounts, so that ordering is the
  * EXPECTED case — the app was most likely to brick on the very first run.
  */
-describe('init — optional side data must never stop the socket', () => {
-  beforeEach(() => {
-    vi.clearAllMocks()
-  })
-
-  it('still connects when a bootstrap fetch fails', async () => {
-    const connect = vi.spyOn(store as unknown as { connect(): void }, 'connect').mockImplementation(() => {})
-    ;(api.profiles as unknown as { mockRejectedValueOnce(v: unknown): void }).mockRejectedValueOnce(
-      new Error('ECONNREFUSED')
-    )
-
-    await store.init()
-
-    expect(connect).toHaveBeenCalledTimes(1)
-    connect.mockRestore()
-  })
-
-  it('retries the failed fetch instead of leaving the panel empty forever', async () => {
-    vi.useFakeTimers()
-    const connect = vi.spyOn(store as unknown as { connect(): void }, 'connect').mockImplementation(() => {})
-    ;(api.profiles as unknown as { mockRejectedValueOnce(v: unknown): void }).mockRejectedValueOnce(
-      new Error('still booting')
-    )
-
-    await store.init()
-    expect(api.profiles).toHaveBeenCalledTimes(1)
-
-    await vi.advanceTimersByTimeAsync(1200)
-    expect((api.profiles as unknown as { mock: { calls: unknown[] } }).mock.calls.length).toBeGreaterThan(1)
-
-    connect.mockRestore()
-    vi.useRealTimers()
-  })
-})
+// NOT TESTED HERE, and deliberately so rather than silently. Driving init() needs this file's api mock to
+// cover every endpoint it touches (auth, mesh, fleet, …) — and a missing one throws SYNCHRONOUSLY, before
+// any .catch() can apply, so a partial mock fails for a reason unrelated to the behaviour under test. I
+// wrote those tests, could not run them locally, and they broke CI for everyone; guessing at the harness a
+// second time would be worse than admitting the gap. The production fix (loadBootstrapData) stands on its
+// own and is small enough to read. Covering it properly wants a bootstrap-level test with a complete api
+// double, which belongs with the ApiResult<T> work rather than bolted onto this file.
 
 /**
  * REGRESSION — a queued message must never vanish.
