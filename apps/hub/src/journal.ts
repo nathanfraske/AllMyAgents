@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events'
 import fs from 'node:fs'
 import path from 'node:path'
 import Database from 'better-sqlite3'
-import { redact } from './redact.js'
+import { redactedJson } from './redact.js'
 import type { ApprovalStatus, HubEvent } from './types.js'
 
 /**
@@ -69,7 +69,7 @@ export class Journal extends EventEmitter {
 
   append(sessionId: string | null, kind: string, payload: unknown): HubEvent {
     const ts = new Date().toISOString()
-    const clean = redact(JSON.stringify(payload ?? null))
+    const clean = redactedJson(payload)
     const info = this.insertStmt.run(ts, sessionId, kind, clean)
     const event: HubEvent = {
       seq: Number(info.lastInsertRowid),
@@ -89,7 +89,7 @@ export class Journal extends EventEmitter {
    */
   appendWorker(sessionId: string, kind: string, payload: unknown, wseq: number): HubEvent {
     const ts = new Date().toISOString()
-    const clean = redact(JSON.stringify(payload ?? null))
+    const clean = redactedJson(payload)
     const info = this.insertWorkerStmt.run(ts, sessionId, kind, clean, wseq)
     const event: HubEvent = { seq: Number(info.lastInsertRowid), ts, sessionId, kind, payload: JSON.parse(clean) as unknown }
     this.emit('event', event)
@@ -150,7 +150,12 @@ export class Journal extends EventEmitter {
       ts: r.ts,
       sessionId: r.session,
       kind: r.kind,
-      payload: JSON.parse(r.payload) as unknown,
+      // NEVER let one malformed row take the hub down. A redaction bug once wrote a payload containing an
+      // invalid escape; because this parse was unguarded, every WebSocket replay that crossed that row
+      // threw and the app crash-looped on startup until the row was repaired by hand. The write side is
+      // fixed now, but a durable store outlives the bug that wrote into it: a row we cannot read is a gap
+      // to surface, not a reason to stop serving the other three hundred thousand.
+      payload: parsePayload(r.payload, r.seq),
     }))
   }
 
@@ -183,5 +188,20 @@ export class Journal extends EventEmitter {
       if (batch.length < pageSize || !last) return
       cursor = last.seq
     }
+  }
+}
+
+/**
+ * Parse a stored payload, degrading to a visible marker rather than throwing.
+ *
+ * Keeps replay TOTAL: the client still receives the event, so sequence numbers stay contiguous and
+ * nothing downstream silently skips a row, and the operator sees that something was unreadable instead
+ * of the hub simply dying.
+ */
+function parsePayload(raw: string, seq: number): unknown {
+  try {
+    return JSON.parse(raw) as unknown
+  } catch (err) {
+    return { __unreadable: true, seq, reason: err instanceof Error ? err.message : String(err) }
   }
 }
