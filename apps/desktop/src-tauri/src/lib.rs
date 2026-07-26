@@ -36,7 +36,7 @@ use std::fs;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -95,13 +95,67 @@ const HUB_ADDR: &str = "127.0.0.1:7777";
 /// (already running, spawn failed, or first-run setup is still in progress).
 struct HubProcess(Mutex<Option<Child>>);
 
-/// Is the hub already listening? If so we don't spawn a second one — the user may
-/// be running `pnpm hub:dev` in their own terminal, or a prior instance is alive.
-fn hub_already_running() -> bool {
-    match HUB_ADDR.parse::<SocketAddr>() {
-        Ok(addr) => TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok(),
-        Err(_) => false,
+/// What is (or isn't) on the hub port.
+enum HubProbe {
+    /// OUR hub answered `/api/health` with the shape our hub returns. Don't spawn a second one.
+    Ours,
+    /// Nothing is listening — safe to spawn.
+    Vacant,
+    /// Something answered a TCP connect but is NOT our hub: a foreign service, a hung previous hub,
+    /// or an orphaned process still holding the port. We cannot bind 7777 over it, and it is not the
+    /// hub, so it must never be mistaken for one — see `probe_hub` and `release_boot`.
+    Foreign,
+}
+
+/// Probe 127.0.0.1:7777 and decide whether OUR hub is there.
+///
+/// A bare TCP connect is not proof of a hub. The old check treated any successful connect as "the hub
+/// is up" and skipped spawning — so a foreign service on the port, a hung previous hub, or an orphaned
+/// process still accepting connections all made the app silently wire itself to a stranger with no hub
+/// of its own and no sign to the user. So we speak HTTP: GET `/api/health` and require the JSON our hub
+/// returns (apps/hub/src/server.ts — a `boot` state plus a `schemaVersion`). Anything else — connection
+/// refused, no/garbled response, non-2xx, unparseable body, or the wrong shape — is NOT our hub.
+///
+/// A booting green answers 200 with `boot:"booting"`; that is still our hub, so it counts as `Ours`.
+fn probe_hub() -> HubProbe {
+    let Ok(addr) = HUB_ADDR.parse::<SocketAddr>() else { return HubProbe::Vacant };
+    let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_millis(500)) {
+        Ok(s) => s,
+        Err(_) => return HubProbe::Vacant, // connection refused / nothing listening
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(1500)));
+    // Minimal HTTP/1.0 request. `Host` MUST be loopback or the hub's DNS-rebinding guard 403s us
+    // (server.ts hostAllowed); `Connection: close` makes the server end the body with EOF so a single
+    // read-to-end gets the whole response.
+    let req = "GET /api/health HTTP/1.0\r\nHost: 127.0.0.1\r\nAccept: application/json\r\nConnection: close\r\n\r\n";
+    if stream.write_all(req.as_bytes()).is_err() {
+        return HubProbe::Foreign; // connected but won't take the request — not a healthy hub
     }
+    let mut buf = Vec::new();
+    if stream.read_to_end(&mut buf).is_err() && buf.is_empty() {
+        return HubProbe::Foreign; // connected then said nothing (or timed out with no bytes)
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let body = if let Some(i) = text.find("\r\n\r\n") {
+        &text[i + 4..]
+    } else if let Some(i) = text.find("\n\n") {
+        &text[i + 2..]
+    } else {
+        return HubProbe::Foreign; // no header/body boundary — not an HTTP response we understand
+    };
+    if !text.lines().next().unwrap_or("").contains(" 200") {
+        return HubProbe::Foreign;
+    }
+    match serde_json::from_str::<serde_json::Value>(body.trim()) {
+        Ok(v) if v.get("schemaVersion").is_some() && v.get("boot").is_some() => HubProbe::Ours,
+        _ => HubProbe::Foreign,
+    }
+}
+
+/// Readiness predicate for the post-spawn wait: true only once OUR hub is answering health.
+fn hub_health_ok() -> bool {
+    matches!(probe_hub(), HubProbe::Ours)
 }
 
 /// Put a spawned child in its OWN process group on POSIX (macOS/Linux) so the exit handler can tear
@@ -158,9 +212,20 @@ fn hub_worker_flag() -> String {
 }
 
 fn spawn_hub_dev() -> Option<Child> {
-    if hub_already_running() {
-        logln("[desktop] hub already reachable on {HUB_ADDR} — not spawning a second one");
-        return None;
+    match probe_hub() {
+        HubProbe::Ours => {
+            logln(&format!("[desktop] our hub already answering on {HUB_ADDR} — not spawning a second one"));
+            return None;
+        }
+        HubProbe::Foreign => {
+            // Something holds the port but it is not our hub. Spawning would only fail to bind, so
+            // don't — say why in the log (a dev has a terminal to read it) and let them free the port.
+            logln(&format!(
+                "[desktop] {HUB_ADDR} is occupied by something that is not our hub — not spawning. Stop the other process (or `pnpm hubctl:dev` already running) and retry."
+            ));
+            return None;
+        }
+        HubProbe::Vacant => {}
     }
 
     // apps/desktop/src-tauri  ->  ../  ../  ../  =>  repo root
@@ -383,27 +448,65 @@ fn base64(input: &[u8]) -> String {
     out
 }
 
-const SPLASH_HTML: &str = r#"<!doctype html><html><head><meta charset="utf-8"><style>
-html,body{margin:0;height:100%;font-family:'Segoe UI',system-ui,sans-serif;background:#1b1d22;color:#e7e9ee;display:flex;align-items:center;justify-content:center}
+/// Shared splash/error styling. The spinner is hidden in the error state, so the same page serves both
+/// the "installing…" splash and a fatal "no hub" message.
+const SPLASH_CSS: &str = r#"html,body{margin:0;height:100%;font-family:'Segoe UI',system-ui,sans-serif;background:#1b1d22;color:#e7e9ee;display:flex;align-items:center;justify-content:center}
 .box{text-align:center;padding:28px 36px;max-width:420px}
 .spin{width:34px;height:34px;border:3px solid #3a3f4b;border-top-color:#6ea8fe;border-radius:50%;margin:0 auto 18px;animation:r .9s linear infinite}
 @keyframes r{to{transform:rotate(360deg)}}
 h1{font-size:15px;font-weight:600;margin:0 0 8px}
 p{font-size:12.5px;color:#a7adba;margin:0;line-height:1.55}
 body[data-state=error] .spin{display:none}
-body[data-state=error] h1{color:#ff8a8a}
-</style></head><body>
-<div class="box">
-<div class="spin" id="spin"></div>
-<h1 id="msg">First-run setup — installing dependencies…</h1>
-<p id="sub">This happens once and needs an internet connection. It may take a minute.</p>
-</div></body></html>"#;
+body[data-state=error] h1{color:#ff8a8a}"#;
+
+/// Minimal HTML escaping for text baked straight into the splash page (a message can carry a path or a
+/// child's exit string — neither is trusted to be markup-safe).
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Build the splash/error page with its message baked in. Baking (rather than eval'ing after load) is
+/// what lets `make_error_window` show text on a window the instant it is created, with no DOM-ready race.
+fn splash_page(error: bool, heading: &str, sub: &str) -> String {
+    format!(
+        r#"<!doctype html><html><head><meta charset="utf-8"><style>{css}</style></head><body{state}>
+<div class="box"><div class="spin" id="spin"></div>
+<h1 id="msg">{heading}</h1>
+<p id="sub">{sub}</p></div></body></html>"#,
+        css = SPLASH_CSS,
+        state = if error { r#" data-state="error""# } else { "" },
+        heading = html_escape(heading),
+        sub = html_escape(sub),
+    )
+}
 
 /// Best-effort setup window shown while the first-run install runs.
 fn make_splash(app: &AppHandle) -> Option<WebviewWindow> {
-    let url = format!("data:text/html;base64,{}", base64(SPLASH_HTML.as_bytes()));
+    let html = splash_page(
+        false,
+        "First-run setup — installing dependencies…",
+        "This happens once and needs an internet connection. It may take a minute.",
+    );
+    let url = format!("data:text/html;base64,{}", base64(html.as_bytes()));
     WebviewWindowBuilder::new(app, "setup", WebviewUrl::External(url.parse().ok()?))
         .title("AllMyAgents — first-run setup")
+        .inner_size(480.0, 260.0)
+        .center()
+        .resizable(false)
+        .always_on_top(true)
+        .build()
+        .ok()
+}
+
+/// Standalone error window for the no-splash case. A normal launch (deps already installed) shows no
+/// setup window, so a hub that fails to come up then would have nowhere to report it — the same silent
+/// "no hub, no explanation" state that hid the Windows path bug from two testers. The message is baked
+/// into the page rather than eval'd so it is visible the moment the window opens.
+fn make_error_window(app: &AppHandle, msg: &str) -> Option<WebviewWindow> {
+    let html = splash_page(true, msg, "Close this window, then reopen AllMyAgents.");
+    let url = format!("data:text/html;base64,{}", base64(html.as_bytes()));
+    WebviewWindowBuilder::new(app, "hub-error", WebviewUrl::External(url.parse().ok()?))
+        .title("AllMyAgents — hub could not start")
         .inner_size(480.0, 260.0)
         .center()
         .resizable(false)
@@ -415,7 +518,7 @@ fn make_splash(app: &AppHandle) -> Option<WebviewWindow> {
 /// Flip the splash into an error state (keeps the window open + closeable so the
 /// user can read the message), and log it.
 fn splash_error(splash: &Option<WebviewWindow>, msg: &str) {
-    logln("[desktop] setup error: {msg}");
+    logln(&format!("[desktop] setup error: {msg}"));
     if let Some(w) = splash {
         let js = format!(
             "document.body.setAttribute('data-state','error');\
@@ -426,16 +529,47 @@ fn splash_error(splash: &Option<WebviewWindow>, msg: &str) {
     }
 }
 
+/// Surface a fatal "no hub" boot failure so it can NEVER fail silently — the invisible failure is
+/// precisely what made the earlier hub-startup bugs unreportable. Flip the setup window to its error
+/// state if one is up (first run), otherwise open a standalone error window (a normal launch has none).
+/// Always logs via `splash_error`/`logln`.
+fn boot_error(app: &AppHandle, splash: &Option<WebviewWindow>, msg: &str) {
+    if splash.is_some() {
+        splash_error(splash, msg);
+    } else {
+        logln(&format!("[desktop] boot error: {msg}"));
+        let _ = make_error_window(app, msg);
+    }
+}
+
 /// The release boot sequence, run on a background thread so the UI stays
 /// responsive while `npm install` runs.
 fn release_boot(app: AppHandle, splash: Option<WebviewWindow>) {
-    // Reachability guard — never spawn a second hub.
-    if hub_already_running() {
-        logln("[desktop] hub already reachable on {HUB_ADDR} — not spawning");
-        if let Some(w) = &splash {
-            let _ = w.close();
+    // Reachability guard — prove what is on the port before deciding, and never spawn a second hub.
+    match probe_hub() {
+        HubProbe::Ours => {
+            logln(&format!("[desktop] our hub already answering on {HUB_ADDR} — not spawning"));
+            if let Some(w) = &splash {
+                let _ = w.close();
+            }
+            return;
         }
-        return;
+        HubProbe::Foreign => {
+            // The port is taken by something that is not our hub (a leftover/hung hub, an orphaned
+            // process still accepting, or an unrelated service). We cannot bind 7777 over it, so
+            // spawning would only fail to bind — and silently carrying on would wire the app to a
+            // stranger that answers on the hub's port. Neither is honest. Tell the user and stop.
+            boot_error(
+                &app,
+                &splash,
+                &format!(
+                    "Another program is using port 7777, which AllMyAgents needs for its hub. Close whatever is using it (or restart your computer), then reopen AllMyAgents. Details are in the log: {}",
+                    log_path(&app).map(|p| p.display().to_string()).unwrap_or_else(|| "(no log)".into())
+                ),
+            );
+            return;
+        }
+        HubProbe::Vacant => {}
     }
 
     // Resolve the shipped payload + bundled Node, and the writable hub home.
@@ -564,18 +698,45 @@ fn release_boot(app: AppHandle, splash: Option<WebviewWindow>) {
         }
     }
 
-    // Wait until the hub is listening, then dismiss the splash. Bounded so a slow
-    // or failed start can't leave the window up forever.
+    // Spawning is not the same as running. A hub that starts and then dies during module linking (a bad
+    // native addon, a missing dep) — or one whose port got taken between the guard above and here, so it
+    // exits on EADDRINUSE — would otherwise leave the app looking fine with no hub behind it. So don't
+    // assert success, VERIFY it: poll /api/health until OUR hub answers, the child exits, or we time out,
+    // and route every not-ready outcome through the visible error path with the log location. This runs
+    // on the release_boot worker thread, so the wait blocks nothing on the UI thread.
     let deadline = Instant::now() + Duration::from_secs(60);
+    let mut ready = false;
+    let mut exited: Option<String> = None;
     while Instant::now() < deadline {
-        if hub_already_running() {
+        if hub_health_ok() {
+            ready = true;
             break;
+        }
+        // Fail fast if the child is already gone rather than waiting out the whole timeout.
+        if let Some(state) = app.try_state::<HubProcess>() {
+            if let Ok(mut g) = state.0.lock() {
+                if let Some(child) = g.as_mut() {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        exited = Some(status.to_string());
+                        break;
+                    }
+                }
+            }
         }
         thread::sleep(Duration::from_millis(300));
     }
-    if let Some(w) = &splash {
-        let _ = w.close();
+    if ready {
+        if let Some(w) = &splash {
+            let _ = w.close();
+        }
+        return;
     }
+    let log_hint = log_path(&app).map(|p| p.display().to_string()).unwrap_or_else(|| "(no log)".into());
+    let detail = match exited {
+        Some(status) => format!("The hub started but exited before it was ready ({status})."),
+        None => "The hub started but did not become ready in time.".to_string(),
+    };
+    boot_error(&app, &splash, &format!("{detail} Its log may say why: {log_hint}"));
 }
 
 // ---------------------------------------------------------------------------
