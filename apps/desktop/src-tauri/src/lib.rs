@@ -36,11 +36,55 @@ use std::fs;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::Mutex;
+use std::io::Write;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+
+/// Where the desktop shell's diagnostics land, once `init_log` has run.
+static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
+
+/// `<app_local_data_dir>/logs/desktop.log` — beside the hub home, on the local (never-roaming) disk.
+pub fn log_path(app: &AppHandle) -> Option<PathBuf> {
+    Some(app.path().app_local_data_dir().ok()?.join("logs").join("desktop.log"))
+}
+
+/// Start writing diagnostics to a FILE as well as stderr.
+///
+/// Everything this shell knows about a failed startup went to `eprintln!`, and a GUI-launched app has no
+/// stderr anywhere a person can read — no console on Windows, nothing in Finder. So when two testers'
+/// hubs failed to start, the app had already explained why, ten times over, into a void. They could only
+/// report "it doesn't work", and there was no way to ask it anything.
+///
+/// Best-effort throughout: logging must never be the reason startup fails. If the file cannot be opened
+/// the shell carries on with stderr alone.
+fn init_log(app: &AppHandle) {
+    let Some(path) = log_path(app) else { return };
+    let _ = fs::create_dir_all(path.parent().unwrap_or(&path));
+    // Truncate rather than append past a sane size: this is a startup diagnostic, not an audit trail,
+    // and an unbounded log on a machine nobody is watching is its own small bug.
+    if fs::metadata(&path).map(|m| m.len() > 2_000_000).unwrap_or(false) {
+        let _ = fs::remove_file(&path);
+    }
+    let _ = LOG_FILE.set(path);
+    logln(&format!(
+        "=== AllMyAgents {} starting — {} ===",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS
+    ));
+}
+
+/// Write one diagnostic line to stderr AND (once initialised) the log file.
+fn logln(msg: &str) {
+    eprintln!("{msg}");
+    if let Some(path) = LOG_FILE.get() {
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{msg}");
+        }
+    }
+}
 
 /// Where the hub listens. Kept in one place so the reachability probe and the
 /// spawn paths agree.
@@ -115,7 +159,7 @@ fn hub_worker_flag() -> String {
 
 fn spawn_hub_dev() -> Option<Child> {
     if hub_already_running() {
-        eprintln!("[desktop] hub already reachable on {HUB_ADDR} — not spawning a second one");
+        logln("[desktop] hub already reachable on {HUB_ADDR} — not spawning a second one");
         return None;
     }
 
@@ -143,17 +187,17 @@ fn spawn_hub_dev() -> Option<Child> {
 
     match cmd.spawn() {
         Ok(child) => {
-            eprintln!(
+            logln(&format!(
                 "[desktop] spawned hub via `pnpm hubctl:dev` (pid {}) in {}",
                 child.id(),
                 repo_root.display()
-            );
+            ));
             Some(child)
         }
         Err(e) => {
-            eprintln!(
+            logln(&format!(
                 "[desktop] could not spawn hub ({e}); continuing. Run `pnpm hubctl:dev` yourself if the UI can't reach 127.0.0.1:7777."
-            );
+            ));
             None
         }
     }
@@ -174,11 +218,43 @@ fn node_exe_name() -> &'static str {
 /// Build a PATH value with `dirs` prepended to the inherited PATH. Cross-platform
 /// (uses the OS path separator via `join_paths`).
 fn prepend_path(dirs: &[PathBuf]) -> OsString {
-    let mut paths: Vec<PathBuf> = dirs.to_vec();
+    let mut paths: Vec<PathBuf> = dirs.iter().map(|p| plain(p)).collect();
     if let Some(existing) = std::env::var_os("PATH") {
         paths.extend(std::env::split_paths(&existing));
     }
     std::env::join_paths(paths).unwrap_or_default()
+}
+
+/// Strip Windows' verbatim `\\?\` prefix before a path is handed to a NON-RUST child process.
+///
+/// THIS IS WHY THE HUB NEVER STARTED ON WINDOWS. Tauri's `resource_dir()` / `app_local_data_dir()` go
+/// through Rust's `canonicalize`, which returns verbatim paths — `\\?\C:\Program Files\AllMyAgents\…`.
+/// Rust handles those fine, so everything on our side looked correct, and macOS has no such prefix so
+/// every macOS test passed. Node does NOT handle them: given a `\\?\`-prefixed script path it misparses
+/// the root and dies with
+///
+///     Error: EISDIR: illegal operation on a directory, lstat 'C:'
+///         at resolveMainPath
+///
+/// which is what a real tester's install produced. It hit BOTH child spawns — the first-run
+/// `npm-cli.js` and the `hubctl.js` that is the hub itself — so on Windows the app could never get a hub
+/// no matter how healthy everything else was.
+///
+/// The failure was invisible for two compounding reasons: nothing writes a log file, so the message went
+/// to a stderr no GUI user has; and the npm branch reported ANY non-zero exit as "an internet connection
+/// is required", so the one clue that did surface blamed the user's network for a path bug.
+///
+/// `\\?\UNC\server\share` maps back to `\\server\share`; a plain `\\?\C:\…` loses the prefix. Anything
+/// without the prefix is returned unchanged, so this is a no-op on macOS and Linux.
+fn plain(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest.to_string());
+    }
+    p.to_path_buf()
 }
 
 /// Recursively copy `src` into `dst` (creating `dst`). Plain files + dirs only —
@@ -339,7 +415,7 @@ fn make_splash(app: &AppHandle) -> Option<WebviewWindow> {
 /// Flip the splash into an error state (keeps the window open + closeable so the
 /// user can read the message), and log it.
 fn splash_error(splash: &Option<WebviewWindow>, msg: &str) {
-    eprintln!("[desktop] setup error: {msg}");
+    logln("[desktop] setup error: {msg}");
     if let Some(w) = splash {
         let js = format!(
             "document.body.setAttribute('data-state','error');\
@@ -355,7 +431,7 @@ fn splash_error(splash: &Option<WebviewWindow>, msg: &str) {
 fn release_boot(app: AppHandle, splash: Option<WebviewWindow>) {
     // Reachability guard — never spawn a second hub.
     if hub_already_running() {
-        eprintln!("[desktop] hub already reachable on {HUB_ADDR} — not spawning");
+        logln("[desktop] hub already reachable on {HUB_ADDR} — not spawning");
         if let Some(w) = &splash {
             let _ = w.close();
         }
@@ -399,11 +475,13 @@ fn release_boot(app: AppHandle, splash: Option<WebviewWindow>) {
     let marker = deps_marker(&dest_hub);
     let have = fs::read_to_string(&marker).unwrap_or_default();
     if want.is_empty() || want != have {
-        eprintln!("[desktop] first-run: installing hub dependencies via npm…");
+        logln("[desktop] first-run: installing hub dependencies via npm…");
+        // plain(): a verbatim \\?\ path here is what made every Windows install fail — node cannot
+        // resolve a `\\?\`-prefixed main module and exits before npm starts. See plain().
         let status = Command::new(&node_cmd)
-            .arg(&npm_cli)
+            .arg(plain(&npm_cli))
             .args(["install", "--omit=dev", "--no-audit", "--no-fund", "--loglevel=error"])
-            .current_dir(&dest_hub)
+            .current_dir(plain(&dest_hub))
             // Node on PATH so npm's lifecycle scripts (e.g. better-sqlite3's
             // prebuild-install) that shell out to `node` resolve it.
             .env("PATH", prepend_path(std::slice::from_ref(&node_dir)))
@@ -411,14 +489,19 @@ fn release_boot(app: AppHandle, splash: Option<WebviewWindow>) {
         match status {
             Ok(s) if s.success() => {
                 let _ = fs::write(&marker, &want);
-                eprintln!("[desktop] hub dependencies installed");
+                logln("[desktop] hub dependencies installed");
             }
             Ok(s) => {
+                // Do NOT claim this is a network problem. It said "an internet connection is required"
+                // for ANY non-zero exit, so a path bug that made node die before npm even started was
+                // reported to two testers as their wifi being at fault — which is precisely why the
+                // failure went undiagnosed. State what actually happened and where to look.
                 splash_error(
                     &splash,
                     &format!(
-                        "Could not download dependencies (npm exit {}). An internet connection is required the first time you run AllMyAgents.",
-                        s.code().unwrap_or(-1)
+                        "Could not install the hub's dependencies (npm exited {}). This is usually a missing internet connection on first run, but the details are in the log: {}",
+                        s.code().unwrap_or(-1),
+                        log_path(&app).map(|p| p.display().to_string()).unwrap_or_else(|| "(no log)".into())
                     ),
                 );
                 return;
@@ -442,11 +525,11 @@ fn release_boot(app: AppHandle, splash: Option<WebviewWindow>) {
             return;
         }
     };
-    eprintln!(
+    logln(&format!(
         "[desktop] app data: HUB_DATA_DIR={} HUB_PROFILES_DIR={}",
         hub_data_dir.display(),
         hub_profiles_dir.display()
-    );
+    ));
 
     // Spawn the hub with the bundled Node. PATH carries the hub's own .bin (so the
     // codex adapter's `codex app-server` shell lookup resolves) and the bundled
@@ -454,8 +537,10 @@ fn release_boot(app: AppHandle, splash: Option<WebviewWindow>) {
     let bin_dir = dest_hub.join("node_modules").join(".bin");
     let entry = dest_hub.join("dist").join("hubctl.js");
     let mut cmd = Command::new(&node_cmd);
-    cmd.arg(&entry)
-        .current_dir(&home)
+    // `plain()` on every path that crosses into Node: a verbatim \\?\ prefix makes node misparse the
+    // script path and die before it runs a line of our code. See plain().
+    cmd.arg(plain(&entry))
+        .current_dir(plain(&home))
         .env("PATH", prepend_path(&[bin_dir, node_dir]))
         .env("HUB_WORKER", hub_worker_flag()) // live turns survive a hub restart (see hub_worker_flag)
         // hubctl forwards its whole env to every hub it supervises (blue AND green),
@@ -466,7 +551,7 @@ fn release_boot(app: AppHandle, splash: Option<WebviewWindow>) {
     hide_console(&mut cmd); // Windows: no stray black console window in front of the app
     match cmd.spawn() {
         Ok(child) => {
-            eprintln!("[desktop] spawned bundled hub (pid {}) — {}", child.id(), entry.display());
+            logln(&format!("[desktop] spawned bundled hub (pid {}) — {}", child.id(), entry.display()));
             if let Some(state) = app.try_state::<HubProcess>() {
                 if let Ok(mut g) = state.0.lock() {
                     *g = Some(child);
@@ -619,7 +704,7 @@ fn kill_hub(child: &mut Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
-    eprintln!("[desktop] hub (pid {pid}) torn down");
+    logln("[desktop] hub (pid {pid}) torn down");
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -638,6 +723,10 @@ pub fn run() {
 
     builder
         .setup(|app| {
+            // FIRST thing, before anything can fail: without this every startup diagnostic goes to a
+            // stderr that a GUI-launched app does not have, which is how two testers' hubs failed with
+            // no recoverable explanation.
+            init_log(&app.handle().clone());
             app.manage(HubProcess(Mutex::new(None)));
 
             if cfg!(debug_assertions) {

@@ -27,6 +27,10 @@ on:
         description: 'Release tag to install (blank = latest)'
         required: false
         default: ''
+      source:
+        description: 'Build the MSI from this commit instead of installing a release'
+        required: false
+        default: 'false'
   schedule:
     - cron: '41 5 * * *'
 
@@ -113,20 +117,53 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Building here rather than only testing a published MSI is what lets a FIX be verified before it
+      # ships. Without it the loop is "cut a release, hope, ask a tester" — which is how a Windows-only
+      # path bug survived a release in the first place.
+      - name: Install toolchain (source build)
+        if: github.event.inputs.source == 'true'
+        uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        if: github.event.inputs.source == 'true'
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        if: github.event.inputs.source == 'true'
+      - uses: swatinem/rust-cache@v2
+        if: github.event.inputs.source == 'true'
+        with:
+          workspaces: 'apps/desktop/src-tauri -> target'
+
+      - name: Build the MSI from this commit
+        if: github.event.inputs.source == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pnpm install --frozen-lockfile
+          pnpm --filter desktop exec tauri build --bundles msi --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          Copy-Item apps\desktop\src-tauri\target\release\bundle\msi\*.msi artifacts\
+
       - name: Download and silently install the MSI
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AMA_TAG: ${{ github.event.inputs.tag }}
+          AMA_SOURCE: ${{ github.event.inputs.source }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $tag = $env:AMA_TAG
-          if ([string]::IsNullOrWhiteSpace($tag)) {
-            $tag = (gh release view --repo $env:GITHUB_REPOSITORY --json tagName -q .tagName)
+          if ($env:AMA_SOURCE -ne 'true') {
+            $tag = $env:AMA_TAG
+            if ([string]::IsNullOrWhiteSpace($tag)) {
+              $tag = (gh release view --repo $env:GITHUB_REPOSITORY --json tagName -q .tagName)
+            }
+            Write-Host "installing published $tag"
+            New-Item -ItemType Directory -Force artifacts | Out-Null
+            gh release download $tag --repo $env:GITHUB_REPOSITORY -p '*.msi' -D artifacts --clobber
+          } else {
+            Write-Host "installing the MSI built from this commit"
           }
-          Write-Host "installing $tag"
-          New-Item -ItemType Directory -Force artifacts | Out-Null
-          gh release download $tag --repo $env:GITHUB_REPOSITORY -p '*.msi' -D artifacts --clobber
           $msi = (Get-ChildItem artifacts\*.msi | Select-Object -First 1).FullName
           Write-Host "msi: $msi"
           # Per-user install, silent, with a verbose MSI log — the same path the installer UI takes.
