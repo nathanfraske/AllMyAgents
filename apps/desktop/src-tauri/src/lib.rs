@@ -602,6 +602,25 @@ fn release_boot(app: AppHandle, splash: Option<WebviewWindow>) {
         splash_error(&splash, &format!("Could not stage the hub manifest: {e}"));
         return;
     }
+    // THE LOCKFILE HAS TO TRAVEL WITH THE MANIFEST, or pinning the manifest is cosmetic.
+    //
+    // The first-run install below runs plain `npm install` in this staged directory, and npm only honours
+    // a lockfile that is sitting next to the package.json it is installing. Pin the direct dependencies
+    // without shipping the lock and the TRANSITIVE graph is still resolved fresh on each user's machine at
+    // whatever moment they happen to install — which is the bug being fixed, just one level down and
+    // harder to see.
+    //
+    // Best-effort by design: a payload with no lockfile still installs (unpinned, as before) rather than
+    // refusing to start. bundle-hub.mjs asserts the lockfile made the payload, so a build that forgets it
+    // fails there — where a developer is watching — instead of here, on a user's first launch.
+    let lock = payload_hub.join("package-lock.json");
+    if lock.exists() {
+        if let Err(e) = fs::copy(&lock, dest_hub.join("package-lock.json")) {
+            logln(&format!("[desktop] could not stage the lockfile ({e}); install will resolve unpinned"));
+        }
+    } else {
+        logln("[desktop] no lockfile in the payload — dependency versions will resolve unpinned");
+    }
 
     // Deps ready when the marker matches the shipped manifest (handles first run
     // and dependency changes shipped by an app update).
