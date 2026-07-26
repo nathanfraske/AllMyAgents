@@ -335,3 +335,83 @@ jobs:
           pkill -f allmyagents-desktop 2>/dev/null || true
           pkill -f hubctl 2>/dev/null || true
           rm -rf "/Applications/${{ steps.install.outputs.app }}" 2>/dev/null || true
+
+  # ---------------------------------------------------------------------------------------------
+  # The SUPPORTED install path, and the one that has to keep working without an Apple Developer ID.
+  #
+  # scripts/install-macos.sh fetches the DMG with curl. `com.apple.quarantine` is written by the
+  # program that downloads a file — browsers write it, curl does not — so an app installed this way is
+  # never flagged as web-downloaded, Gatekeeper is never consulted, and it opens normally despite being
+  # unsigned. Nothing is disabled and no signature is faked; we simply do not mark our own download as
+  # untrusted-from-the-web.
+  #
+  # This job exists because that property is INVISIBLE and easy to lose. Anything that reintroduces
+  # quarantine — switching to a browser-equivalent fetch, a release asset served via a redirect some
+  # tool flags, an OS change — turns the one-command install back into "damaged and can't be opened"
+  # with nothing in the diff to suggest it. So the assertion is not "the script exited 0", it is "the
+  # installed app carries no quarantine attribute AND actually launches AND the hub answers".
+  # ---------------------------------------------------------------------------------------------
+  curl-install:
+    name: one-command install (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-latest, macos-15-intel]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Runs the script FROM THIS CHECKOUT, not from raw.githubusercontent, so a PR tests its own
+      # version of the installer rather than whatever is currently on main.
+      - name: Install via scripts/install-macos.sh
+        env:
+          AMA_TAG: ${{ github.event.inputs.tag || github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          bash scripts/install-macos.sh
+
+      - name: GATE — the installed app is NOT quarantined
+        run: |
+          set -euo pipefail
+          APP=/Applications/AllMyAgents.app
+          [ -d "$APP" ] || { echo "::error::the installer reported success but $APP does not exist"; exit 1; }
+          if xattr -p com.apple.quarantine "$APP" 2>/dev/null; then
+            echo "::error::the installed app IS quarantined — Gatekeeper will refuse it and the one-command install is broken"; exit 1
+          fi
+          # The embedded Node matters as much as the app: a quarantined runtime means the window opens
+          # and never connects, which is a worse failure than not installing.
+          NODE="$APP/Contents/Resources/hub-runtime/node/node"
+          if xattr -p com.apple.quarantine "$NODE" 2>/dev/null; then
+            echo "::error::the bundled node is quarantined — the hub would never start"; exit 1
+          fi
+          echo "no quarantine attribute on the app or the bundled node"
+
+      # THE claim, stated as a test: a user who ran one command gets a working app. No xattr step, no
+      # System Settings detour, no dialog. If this passes, the install genuinely "just works".
+      - name: GATE — it launches and the hub answers, with no workaround
+        run: |
+          set -uo pipefail
+          APP=/Applications/AllMyAgents.app
+          EXE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist")"
+          "$APP/Contents/MacOS/$EXE" > /tmp/ama-stdout.log 2> /tmp/ama-stderr.log &
+          PID=$!
+          ok=0
+          for i in $(seq 1 150); do
+            kill -0 "$PID" 2>/dev/null || { echo "::error::the app exited after ~$((i*2))s"; break; }
+            curl -fsS --max-time 3 http://127.0.0.1:7777/api/health -o /tmp/health.json 2>/dev/null && { ok=1; break; }
+            sleep 2
+          done
+          tail -c 4000 /tmp/ama-stderr.log || true
+          [ "$ok" = 1 ] || { echo "::error::hub never answered /api/health"; kill "$PID" 2>/dev/null || true; exit 1; }
+          echo "health: $(cat /tmp/health.json)"
+          kill "$PID" 2>/dev/null || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          pkill -f allmyagents-desktop 2>/dev/null || true
+          pkill -f hubctl 2>/dev/null || true
+          rm -rf /Applications/AllMyAgents.app 2>/dev/null || true
