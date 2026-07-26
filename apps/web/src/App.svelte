@@ -234,6 +234,29 @@
 
 <div class="app">
 <Titlebar />
+<!--
+  Hub outage banner. The supervisor restarts a dead hub by itself, but until it does the app can only
+  show stale content, and previously said so with a 6px grey dot in the sidebar — so a hub that had
+  actually died looked like an app that had simply stopped working.
+
+  Deliberately NOT shown for the first few seconds: an ordinary blue-green restart drops the socket for
+  under a second, and a banner that flashes on every restart teaches you to ignore it. Past that, the
+  wording tracks what the supervisor is really doing — retry backoff runs out to 30s between attempts,
+  so a long gap is expected behaviour rather than a hang, and saying so is the difference between
+  "waiting" and "broken".
+-->
+{#if store.hubDownSeconds >= 4}
+  <div class="hubdown" role="status">
+    <span class="spin"></span>
+    {#if store.hubDownSeconds < 20}
+      Lost connection to the hub — reconnecting…
+    {:else}
+      The hub stopped. It's being restarted automatically — retries back off to 30s, so this can take a
+      moment. Your agents' work is unaffected; they run in a separate process.
+    {/if}
+    <span class="elapsed">{store.hubDownSeconds}s</span>
+  </div>
+{/if}
 <div
   class="shell"
   class:dragging={sidebarDrag || !!colDrag}
@@ -304,6 +327,23 @@
 
 <style>
   .app { display: flex; flex-direction: column; height: 100vh; }
+  .hubdown {
+    display: flex; align-items: center; gap: var(--space-2);
+    padding: var(--space-2) var(--space-4);
+    background: var(--warn-bg, rgba(180, 120, 0, 0.14));
+    color: var(--warn-text, #d08700);
+    border-bottom: 1px solid var(--warn, rgba(180, 120, 0, 0.4));
+    font-size: var(--text-xs); line-height: 1.4;
+  }
+  .hubdown .elapsed { margin-left: auto; font-variant-numeric: tabular-nums; opacity: 0.75; flex: none; }
+  .hubdown .spin {
+    width: 10px; height: 10px; flex: none; border-radius: 50%;
+    border: 2px solid currentColor; border-right-color: transparent;
+    animation: hubspin 0.9s linear infinite;
+  }
+  @keyframes hubspin { to { transform: rotate(360deg); } }
+  /* Respect the OS "reduce motion" setting — a permanent spinner is exactly the kind of thing it exists for. */
+  @media (prefers-reduced-motion: reduce) { .hubdown .spin { animation: none; } }
   .shell { display: grid; flex: 1; min-height: 0; }
   .shell.dragging { cursor: col-resize; user-select: none; }
   .shell.rowdragging { cursor: row-resize; user-select: none; }

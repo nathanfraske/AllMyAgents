@@ -211,7 +211,9 @@ function moveInto(ids: string[], fromId: string, toId: string): string[] {
   return next
 }
 
-class HubStore {
+// Exported for tests, which need a FRESH instance per case — the singleton below carries state between
+// them. Application code should always use `store`, never construct a second one.
+export class HubStore {
   profiles = $state<ProfileInfo[]>([])
   projects = $state<ProjectInfo[]>([])
   sessions = $state<Record<string, SessionView>>({})
@@ -1108,18 +1110,53 @@ class HubStore {
     return `${this.wsBase()}/ws?since=${since}${t ? `&token=${encodeURIComponent(t)}` : ''}`
   }
 
+  /**
+   * How long the hub has been unreachable, in seconds — 0 whenever it is up.
+   *
+   * `connected` alone could not answer the question the operator actually had. A hub outage and a
+   * sub-second blue-green flip both set it false, so the only honest thing to render from it was a 6px
+   * dot; when the hub died for real, the app showed a blank window and a grey dot, and looked broken
+   * rather than degraded. Elapsed time separates the two: a restart is over before anyone could read a
+   * banner, an outage keeps counting.
+   */
+  hubDownSeconds = $state(0)
+  private downSince: number | null = null
+  private downTicker: ReturnType<typeof setInterval> | null = null
+
+  private markConnected(): void {
+    this.connected = true
+    this.downSince = null
+    this.hubDownSeconds = 0
+    if (this.downTicker) {
+      clearInterval(this.downTicker)
+      this.downTicker = null
+    }
+  }
+
+  /** Idempotent: reconnect attempts fail repeatedly during one outage, and the clock must measure the
+   *  outage rather than restarting on every failed retry. */
+  private markDisconnected(): void {
+    this.connected = false
+    if (this.downSince === null) this.downSince = Date.now()
+    if (!this.downTicker) {
+      this.downTicker = setInterval(() => {
+        if (this.downSince !== null) this.hubDownSeconds = Math.round((Date.now() - this.downSince) / 1000)
+      }, 1000)
+    }
+  }
+
   private connect(): void {
     vlog('ws: connecting (replay from seq 0)')
     const ws = new WebSocket(this.wsUrl(0))
     this.ws = ws
     ws.onopen = () => {
       vlog('ws: open')
-      this.connected = true
+      this.markConnected()
     }
     ws.onmessage = (e) => this.ingest(JSON.parse(e.data as string) as HubEvent)
     ws.onclose = () => {
       vlog('ws: closed — reconnecting in 1.5s')
-      this.connected = false
+      this.markDisconnected()
       setTimeout(() => this.reconnect(), 1500)
     }
   }
@@ -1184,11 +1221,11 @@ class HubStore {
     this.ws = ws
     ws.onopen = () => {
       vlog('ws: reopened')
-      this.connected = true
+      this.markConnected()
     }
     ws.onmessage = (e) => this.ingest(JSON.parse(e.data as string) as HubEvent)
     ws.onclose = () => {
-      this.connected = false
+      this.markDisconnected()
       setTimeout(() => this.reconnect(), 1500)
     }
   }
