@@ -1,0 +1,189 @@
+name: clean-machine install
+
+# Does the SHIPPED app start its hub on a machine that is not a developer's?
+#
+# We already have a macOS installability job, and it passes. It also launched the app binary from a CI
+# shell, which inherits the runner's developer environment: node, npm, git, python and a full PATH. Two
+# real testers — one macOS, one Windows — installed the same release and got no hub. So the passing test
+# was measuring the wrong machine.
+#
+# THE ONE THING THIS JOB DOES DIFFERENTLY: it scrubs PATH down to what a GUI-launched app actually gets
+# before starting anything. On macOS, launchd hands a Finder-launched app roughly /usr/bin:/bin:/usr/sbin:
+# /sbin — not the user's shell PATH. On Windows an Explorer-launched process gets the system PATH without
+# whatever a dev shell added. If the hub only spawns when a toolchain happens to be on PATH, that is the
+# bug, and this is the job that shows it.
+#
+# It also CAPTURES STDERR TO A FILE and always uploads it. The shell has ten eprintln! diagnostics and
+# writes no log anywhere, so on a real user's machine every one of them is discarded — which is why two
+# failures produced no information. Here they become an artifact.
+#
+# This job is expected to FAIL until the spawn bug is fixed. That is the point: it is a reproduction
+# first and a regression test afterwards.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to install (blank = latest)'
+        required: false
+        default: ''
+  schedule:
+    - cron: '41 5 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clean-install-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: clean macOS (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-latest, macos-15-intel]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install from the release, exactly as a user would
+        env:
+          AMA_TAG: ${{ github.event.inputs.tag }}
+        run: bash scripts/install-macos.sh
+
+      # Everything above may use the runner's tools. Everything below must not.
+      - name: Launch with a GUI-equivalent environment
+        id: launch
+        run: |
+          set -uo pipefail
+          APP=/Applications/AllMyAgents.app
+          EXE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist")"
+
+          echo "--- what a dev shell has that a GUI launch does not ---"
+          echo "shell PATH: $PATH"
+          command -v node npm git || true
+
+          # A Finder-launched app does not get the user's shell PATH. Reproduce that.
+          CLEAN_PATH=/usr/bin:/bin:/usr/sbin:/sbin
+          echo "launching with PATH=$CLEAN_PATH"
+
+          env -i \
+            HOME="$HOME" \
+            PATH="$CLEAN_PATH" \
+            TMPDIR="${TMPDIR:-/tmp}" \
+            "$APP/Contents/MacOS/$EXE" > /tmp/ama-out.log 2> /tmp/ama-err.log &
+          APP_PID=$!
+
+          ok=0
+          for i in $(seq 1 150); do
+            if ! kill -0 "$APP_PID" 2>/dev/null; then echo "::warning::app process exited after ~$((i*2))s"; break; fi
+            if curl -fsS --max-time 3 http://127.0.0.1:7777/api/health -o /tmp/health.json 2>/dev/null; then ok=1; break; fi
+            sleep 2
+          done
+
+          echo "=== [desktop] diagnostics (the ones a real user never sees) ==="
+          cat /tmp/ama-err.log || true
+          cat /tmp/ama-out.log || true
+
+          kill "$APP_PID" 2>/dev/null || true
+          if [ "$ok" != 1 ]; then
+            echo "::error::REPRODUCED — the hub never came up with a GUI-equivalent PATH. Diagnostics above."
+            exit 1
+          fi
+          echo "hub answered: $(cat /tmp/health.json)"
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clean-macos-${{ matrix.runner }}
+          path: |
+            /tmp/ama-out.log
+            /tmp/ama-err.log
+            /tmp/health.json
+          if-no-files-found: warn
+
+  windows:
+    name: clean Windows
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download and silently install the MSI
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AMA_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:AMA_TAG
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            $tag = (gh release view --repo $env:GITHUB_REPOSITORY --json tagName -q .tagName)
+          }
+          Write-Host "installing $tag"
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          gh release download $tag --repo $env:GITHUB_REPOSITORY -p '*.msi' -D artifacts --clobber
+          $msi = (Get-ChildItem artifacts\*.msi | Select-Object -First 1).FullName
+          Write-Host "msi: $msi"
+          # Per-user install, silent, with a verbose MSI log — the same path the installer UI takes.
+          $p = Start-Process msiexec.exe -ArgumentList @('/i', "`"$msi`"", '/qn', '/l*v', 'C:\msi.log') -Wait -PassThru
+          Write-Host "msiexec exit: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { Get-Content C:\msi.log -Tail 60; throw "msiexec failed" }
+
+      - name: Launch with a GUI-equivalent environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $exe = Get-ChildItem -Path "$env:LOCALAPPDATA\Programs","$env:ProgramFiles","${env:ProgramFiles(x86)}" `
+                   -Filter 'AllMyAgents.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { Write-Host '::error::AllMyAgents.exe not found after install'; exit 1 }
+          Write-Host "exe: $($exe.FullName)"
+
+          Write-Host "--- what a dev shell has that an Explorer launch does not ---"
+          foreach ($t in 'node','npm','git') {
+            $c = Get-Command $t -ErrorAction SilentlyContinue
+            Write-Host ("  {0}: {1}" -f $t, $(if ($c) { $c.Source } else { '(absent)' }))
+          }
+
+          # An Explorer-launched process does not inherit a dev shell's PATH additions. Reproduce that.
+          $clean = "$env:SystemRoot\system32;$env:SystemRoot;$env:SystemRoot\system32\Wbem"
+          Write-Host "launching with PATH=$clean"
+          $env:PATH = $clean
+
+          $p = Start-Process -FilePath $exe.FullName -PassThru `
+                 -RedirectStandardOutput C:\ama-out.log -RedirectStandardError C:\ama-err.log
+          $ok = $false
+          foreach ($i in 1..150) {
+            if ($p.HasExited) { Write-Host "::warning::app exited after ~$($i*2)s (code $($p.ExitCode))"; break }
+            try {
+              Invoke-WebRequest -Uri http://127.0.0.1:7777/api/health -TimeoutSec 3 -UseBasicParsing -OutFile C:\health.json
+              $ok = $true; break
+            } catch { Start-Sleep -Seconds 2 }
+          }
+
+          Write-Host "=== [desktop] diagnostics (the ones a real user never sees) ==="
+          if (Test-Path C:\ama-err.log) { Get-Content C:\ama-err.log }
+          if (Test-Path C:\ama-out.log) { Get-Content C:\ama-out.log }
+
+          if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+          if (-not $ok) {
+            Write-Host '::error::REPRODUCED — the hub never came up with an Explorer-equivalent PATH. Diagnostics above.'
+            exit 1
+          }
+          Write-Host "hub answered: $(Get-Content C:\health.json -Raw)"
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clean-windows
+          path: |
+            C:\ama-out.log
+            C:\ama-err.log
+            C:\health.json
+            C:\msi.log
+          if-no-files-found: warn
