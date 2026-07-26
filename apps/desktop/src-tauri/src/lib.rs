@@ -504,14 +504,18 @@ fn release_boot(app: AppHandle, splash: Option<WebviewWindow>) {
 // same `window.__TAURI__` global bridge it already uses for the window controls
 // (apps/web/src/lib/updater.svelte.ts).
 //
-// ⚠️ OPERATOR TODO — the updater is INERT until a signing keypair exists.
-// `tauri.conf.json` ships `plugins.updater.pubkey` as the literal placeholder
-// PASTE_TAURI_MINISIGN_PUBLIC_KEY_HERE and `bundle.createUpdaterArtifacts` as
-// false (so a keyless checkout still builds). The exact commands to fix that are
-// in docs/alpha-cut-checklist.md step 1 and the header of
-// .github/workflows/release.yml. No key, public or private, is committed to this
-// repo. Until then `updater_check` reports the unconfigured state as a plain
-// error string, which the UI shows verbatim rather than failing silently.
+// The updater IS configured: `tauri.conf.json` carries a real
+// `plugins.updater.pubkey` and `bundle.createUpdaterArtifacts` is true. (This
+// comment used to say the opposite — placeholder pubkey, artifacts off — and was
+// simply left behind when the key landed, which is worse than no comment, because
+// it is the note a reader would trust.)
+//
+// Consequence worth knowing: with `createUpdaterArtifacts` true, `tauri build`
+// FAILS without TAURI_SIGNING_PRIVATE_KEY. A keyless checkout needs
+//     --config '{"bundle":{"createUpdaterArtifacts":false}}'
+// No key, public or private, is committed to this repo. If the updater is ever
+// unconfigured again, `updater_check` reports that state as a plain error string
+// which the UI shows verbatim rather than failing silently.
 // ---------------------------------------------------------------------------
 
 /// What the UI needs to decide whether to prompt. `available: false` means "you

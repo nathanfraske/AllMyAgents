@@ -1,0 +1,337 @@
+name: macOS installability
+
+# Does the macOS artifact we ship actually INSTALL and RUN on a Mac?
+#
+# The release workflow proves only that a .dmg was PRODUCED. Nothing ever proved one could be opened,
+# which is how v0.1.3-alpha.4 shipped a bundle with no _CodeSignature at all: Gatekeeper refused it as
+# "damaged and can't be opened", testers reported the app would not install, and every CI job was green.
+#
+# THE LOAD-BEARING STEP HERE IS "Simulate a browser download". A CI-built or gh-downloaded file carries
+# no com.apple.quarantine xattr; a tester's browser download does. Without stamping it on by hand, every
+# Gatekeeper assertion below passes vacuously — which is exactly the shape of the hole this fills. If
+# quarantine ever fails to propagate, the job fails rather than quietly testing nothing.
+#
+# HOW IT FAILS USEFULLY: the verdicts are compared against EXPECT_SPCTL / EXPECT_CODESIGN below, so the
+# job fails if reality drifts in EITHER direction — signing silently regressing, or notarization starting
+# to work while the release notes still tell people to run xattr. Today's honest expectation is a sealed
+# but un-notarized bundle: codesign verifies, Gatekeeper still rejects. The job therefore also asserts
+# that the WORKAROUND WE DOCUMENT actually produces a launchable app, so it has teeth in the meantime.
+
+on:
+  release:
+    types: [published]
+  pull_request:
+    paths:
+      - 'apps/desktop/**'
+      - 'scripts/bundle-hub.mjs'
+      - 'scripts/desktop-smoke.mjs'
+      - '.github/workflows/macos-installability.yml'
+      - '.github/workflows/release.yml'
+  schedule:
+    # Weekly. Apple tightens Gatekeeper without asking; better this notices than a tester.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to verify (blank = build from this ref)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-install-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The DECLARED, intentional state. Change these only in the same commit that changes reality.
+  #   EXPECT_CODESIGN=pass     ad-hoc signing seals the bundle (release.yml sets APPLE_SIGNING_IDENTITY=-)
+  #   EXPECT_SPCTL=rejected    not notarized — needs a paid Developer ID
+  EXPECT_CODESIGN: pass # "pass" | "fail"
+  EXPECT_SPCTL: rejected # "rejected" | "accepted"
+
+jobs:
+  installability:
+    name: install + gatekeeper + smoke (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both architectures the release ships. macos-latest is Apple Silicon; macos-15-intel is the
+        # surviving x86_64 hosted image (macos-13 was retired 2025-12-04) and lasts until August 2027.
+        runner: [macos-latest, macos-15-intel]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Record the runner image
+        run: |
+          set -euo pipefail
+          uname -m
+          sw_vers
+          echo "### \`${{ matrix.runner }}\` — $(sw_vers -productName) $(sw_vers -productVersion) ($(uname -m))" >> "$GITHUB_STEP_SUMMARY"
+
+      # Two paths on purpose. For a release we DOWNLOAD the published artifact — highest fidelity, since
+      # it is literally the file a tester gets, and it costs no Rust build. For a PR we build here, so a
+      # packaging regression fails on the PR that caused it.
+      - name: Resolve what to verify
+        id: what
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-$RELEASE_TAG}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [ -n "$TAG" ]; then echo "mode=download" >> "$GITHUB_OUTPUT"; else echo "mode=build" >> "$GITHUB_OUTPUT"; fi
+          # The DMG for THIS runner's architecture. Tauri names them _aarch64 and _x64.
+          if [ "$(uname -m)" = "arm64" ]; then echo "arch=aarch64" >> "$GITHUB_OUTPUT"; else echo "arch=x64" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Download the published DMG for this architecture
+        if: steps.what.outputs.mode == 'download'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          ARCH="${{ steps.what.outputs.arch }}"
+          gh release download "${{ steps.what.outputs.tag }}" -R "$GITHUB_REPOSITORY" -p "*_${ARCH}.dmg" -D artifacts --clobber
+          # An arch we build for but never publish is exactly the failure an Intel tester hit: the only
+          # DMG was arm64 and their Mac refused it outright. Missing artifact = failed job, not a skip.
+          ls artifacts/*_"$ARCH".dmg >/dev/null 2>&1 \
+            || { echo "::error::release ${{ steps.what.outputs.tag }} publishes no *_${ARCH}.dmg — testers on this architecture have no build"; exit 1; }
+          ls -la artifacts
+
+      - name: Install pnpm
+        if: steps.what.outputs.mode == 'build'
+        uses: pnpm/action-setup@v4
+
+      - name: Install Node
+        if: steps.what.outputs.mode == 'build'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Rust
+        if: steps.what.outputs.mode == 'build'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        if: steps.what.outputs.mode == 'build'
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'apps/desktop/src-tauri -> target'
+
+      - name: Install dependencies
+        if: steps.what.outputs.mode == 'build'
+        run: pnpm install --frozen-lockfile
+
+      # createUpdaterArtifacts is true in tauri.conf.json, which makes `tauri build` fail without the
+      # signing key — and a PR from a fork has no secrets. Override it off: this job verifies
+      # installability, not the updater. APPLE_SIGNING_IDENTITY=- reproduces what release.yml does when
+      # no Developer ID secret is present, so the PR build is sealed the same way a release build is.
+      - name: Build the macOS bundle
+        if: steps.what.outputs.mode == 'build'
+        env:
+          APPLE_SIGNING_IDENTITY: '-'
+        run: |
+          set -euo pipefail
+          pnpm --filter desktop exec tauri build \
+            --bundles app,dmg \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          mkdir -p artifacts
+          cp apps/desktop/src-tauri/target/release/bundle/dmg/*.dmg artifacts/
+
+      # See the header. Without this the whole job is decorative.
+      - name: Simulate a browser download (stamp com.apple.quarantine)
+        run: |
+          set -euo pipefail
+          for dmg in artifacts/*.dmg; do
+            xattr -w com.apple.quarantine "0081;$(printf '%x' "$(date +%s)");Safari;$(uuidgen)" "$dmg"
+            echo "quarantined $dmg -> $(xattr -p com.apple.quarantine "$dmg")"
+          done
+
+      - name: Mount the DMG and install to /Applications
+        id: install
+        run: |
+          set -euo pipefail
+          DMG="$(ls artifacts/*.dmg | head -n1)"
+          hdiutil attach "$DMG" -nobrowse -readonly -mountpoint /tmp/ama-mnt
+          ls -la@ /tmp/ama-mnt
+
+          # No /Applications symlink means there is nothing to drag onto — the documented install
+          # gesture would be impossible.
+          [ -L /tmp/ama-mnt/Applications ] \
+            || { echo "::error::the DMG has no /Applications symlink — drag-to-install has no target"; exit 1; }
+
+          APP="$(ls -d /tmp/ama-mnt/*.app | head -n1)"
+          DEST="/Applications/$(basename "$APP")"
+          rm -rf "$DEST"
+          cp -R "$APP" /Applications/   # the exact gesture a user performs
+          hdiutil detach /tmp/ama-mnt
+          echo "app=$(basename "$APP")" >> "$GITHUB_OUTPUT"
+          echo "dest=$DEST" >> "$GITHUB_OUTPUT"
+
+          # If quarantine did not survive the copy, this job is not reproducing the tester's path and
+          # every verdict below is meaningless. Fail loudly rather than report a green lie.
+          xattr -p com.apple.quarantine "$DEST" \
+            || { echo "::error::quarantine did not propagate to $DEST — this job is not reproducing a real download"; exit 1; }
+
+      - name: Bundle structure
+        run: |
+          set -euo pipefail
+          DEST="${{ steps.install.outputs.dest }}"
+          if [ -d "$DEST/Contents/_CodeSignature" ]; then
+            echo "- \`_CodeSignature/\` present (bundle is sealed)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- \`_CodeSignature/\` **ABSENT** — no resource seal" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          EXE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$DEST/Contents/Info.plist")"
+          echo "CFBundleExecutable=$EXE"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$DEST/Contents/Info.plist"
+          [ -x "$DEST/Contents/MacOS/$EXE" ] \
+            || { echo "::error::CFBundleExecutable '$EXE' missing or not executable — the bundle cannot launch"; exit 1; }
+          # The app arch and the Node it ships must match: bundle-hub.mjs copies the RUNNER'S node, and a
+          # mismatch here is unrunnable in a way no signing fix would explain.
+          lipo -archs "$DEST/Contents/MacOS/$EXE"
+          lipo -archs "$DEST/Contents/Resources/hub-runtime/node/node"
+
+      # codesign -dvvv SUCCEEDS even on a completely unsigned bundle (it reads the linker's ad-hoc
+      # signature on the main executable), so it is captured for diagnosis and deliberately NOT a gate.
+      - name: Signature detail (informational)
+        continue-on-error: true
+        run: codesign -dvvv "${{ steps.install.outputs.dest }}" 2>&1 | tee /tmp/codesign-d.txt
+
+      - name: GATE — codesign --verify matches EXPECT_CODESIGN
+        run: |
+          set -uo pipefail
+          set +e
+          codesign --verify --deep --strict --verbose=4 "${{ steps.install.outputs.dest }}" 2>&1 | tee /tmp/codesign-verify.txt
+          RC=${PIPESTATUS[0]}
+          set -e
+          { echo "### codesign --verify"; echo '```'; cat /tmp/codesign-verify.txt; echo "exit=$RC"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$EXPECT_CODESIGN" = pass ] && [ "$RC" -ne 0 ]; then
+            echo "::error::EXPECT_CODESIGN=pass but codesign --verify failed (exit $RC) — the bundle lost its seal, which is what made Gatekeeper call it 'damaged'"; exit 1
+          fi
+          if [ "$EXPECT_CODESIGN" = fail ] && [ "$RC" -eq 0 ]; then
+            echo "::error::EXPECT_CODESIGN=fail but codesign --verify passed — signing now works; update EXPECT_CODESIGN"; exit 1
+          fi
+
+      # THE verdict. spctl --assess is what Gatekeeper actually decides: 0 = accepted, non-zero = rejected.
+      # Unsigned or ad-hoc => rejected ("no usable signature"); signed but not notarized => also rejected
+      # ("Unnotarized Developer ID"). Only signed AND notarized AND stapled returns 0. Asserting on the
+      # exit code rather than the wording keeps this stable as Apple rewords the messages.
+      - name: GATE — Gatekeeper verdict matches EXPECT_SPCTL
+        run: |
+          set -uo pipefail
+          DEST="${{ steps.install.outputs.dest }}"
+          set +e
+          spctl --assess --type execute --verbose=4 "$DEST" 2>&1 | tee /tmp/spctl.txt
+          RC=${PIPESTATUS[0]}
+          set -e
+          { echo "### spctl --assess"; echo '```'; cat /tmp/spctl.txt; echo "exit=$RC"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$EXPECT_SPCTL" = accepted ] && [ "$RC" -ne 0 ]; then
+            echo "::error::EXPECT_SPCTL=accepted but Gatekeeper REJECTED the app — testers cannot install this"; exit 1
+          fi
+          if [ "$EXPECT_SPCTL" = rejected ] && [ "$RC" -eq 0 ]; then
+            echo "::error::EXPECT_SPCTL=rejected but Gatekeeper ACCEPTED the app — notarization works now; update EXPECT_SPCTL and drop the xattr step from the release notes"; exit 1
+          fi
+          if [ "$EXPECT_SPCTL" = rejected ]; then
+            echo "::warning title=Not notarized::Gatekeeper rejects this build. Testers must run 'xattr -dr com.apple.quarantine $DEST'. Right-click -> Open does NOT work on macOS 15+."
+          fi
+
+      # The workaround we PRINT IN THE RELEASE NOTES has to actually work, or the notes are a lie. This is
+      # what gives the job teeth while there is no Developer ID.
+      - name: GATE — the documented xattr workaround clears quarantine
+        run: |
+          set -euo pipefail
+          DEST="${{ steps.install.outputs.dest }}"
+          xattr -dr com.apple.quarantine "$DEST"
+          if xattr -p com.apple.quarantine "$DEST" 2>/dev/null; then
+            echo "::error::quarantine survived 'xattr -dr' on the bundle root"; exit 1
+          fi
+          # -r must also have reached the ~113 MB embedded Node under Contents/Resources, or the hub
+          # cannot spawn and the app is broken in a way the operator would blame on the app.
+          NODE="$DEST/Contents/Resources/hub-runtime/node/node"
+          if xattr -p com.apple.quarantine "$NODE" 2>/dev/null; then
+            echo "::error::quarantine survived on the embedded node — the documented command is insufficient"; exit 1
+          fi
+          echo "embedded node runs: $("$NODE" --version)"
+
+      # Direct exec of the inner binary, NOT `open`: Gatekeeper gates LaunchServices rather than exec, so
+      # `open` can neither prove the block (that is spctl's job above) nor reliably report success — it
+      # returns before the app is up. Direct exec is deterministic and still exercises the real release
+      # path: resource_dir() -> Contents/Resources, first-run npm install, bundled-node hub spawn.
+      #
+      # continue-on-error only because window creation on a hosted runner session is the one thing not yet
+      # confirmed on these images. PROMOTE TO A HARD GATE (delete the flag) after the first green run.
+      - name: SMOKE — app launches and the bundled hub answers /api/health
+        continue-on-error: true
+        id: smoke
+        run: |
+          set -uo pipefail
+          DEST="${{ steps.install.outputs.dest }}"
+          EXE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$DEST/Contents/Info.plist")"
+          if lsof -nP -iTCP:7777 -sTCP:LISTEN >/dev/null 2>&1; then
+            echo "::error::something already listens on 7777; the app will not spawn its own hub"; exit 1
+          fi
+          "$DEST/Contents/MacOS/$EXE" > /tmp/ama-stdout.log 2> /tmp/ama-stderr.log &
+          APP_PID=$!
+          ok=0
+          # First run does an npm install (better-sqlite3 prebuild fetch) before the hub can start.
+          for i in $(seq 1 150); do
+            kill -0 "$APP_PID" 2>/dev/null || { echo "::error::app exited after ~$((i*2))s"; break; }
+            curl -fsS --max-time 3 http://127.0.0.1:7777/api/health -o /tmp/health.json 2>/dev/null && { ok=1; break; }
+            sleep 2
+          done
+          echo "--- stderr tail ---"; tail -c 8000 /tmp/ama-stderr.log || true
+          if [ "$ok" != 1 ]; then
+            echo "::error::hub never answered /api/health within 300s"
+            kill "$APP_PID" 2>/dev/null || true
+            exit 1
+          fi
+          cat /tmp/health.json
+          { echo "### /api/health"; echo '```json'; cat /tmp/health.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          # Quitting must take the hub and worker with it — kill_hub's process-group teardown.
+          kill "$APP_PID" 2>/dev/null || true
+          sleep 8
+          if pgrep -fl 'hubctl|agentWorker'; then
+            echo "::error::orphaned hub/worker processes survived app exit"; exit 1
+          fi
+          echo "clean teardown"
+
+      - name: Report smoke outcome
+        if: always()
+        run: |
+          if [ "${{ steps.smoke.outcome }}" = success ]; then
+            echo "### Smoke: PASS — launched, hub answered, clean teardown" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Smoke: FAIL (not yet a hard gate)" >> "$GITHUB_STEP_SUMMARY"
+            echo "If this is the first run, confirm the hosted runner provides a usable window session before treating it as an app bug. Once green, delete \`continue-on-error\` on the smoke step." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-installability-${{ matrix.runner }}
+          path: |
+            /tmp/codesign-d.txt
+            /tmp/codesign-verify.txt
+            /tmp/spctl.txt
+            /tmp/ama-stdout.log
+            /tmp/ama-stderr.log
+            /tmp/health.json
+          if-no-files-found: warn
+
+      - name: Cleanup
+        if: always()
+        run: |
+          hdiutil detach /tmp/ama-mnt 2>/dev/null || true
+          pkill -f allmyagents-desktop 2>/dev/null || true
+          pkill -f hubctl 2>/dev/null || true
+          rm -rf "/Applications/${{ steps.install.outputs.app }}" 2>/dev/null || true

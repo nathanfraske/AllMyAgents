@@ -282,9 +282,17 @@ ls ~/Library/Application\ Support/direct.cec.allmyagents
 pgrep -fl node                                     # no stray hub
 ```
 
-Open the `.dmg`, drag to Applications, then **right-click → Open** the first time: the build is not
-notarized, so a normal double-click is refused by Gatekeeper (`xattr -dr com.apple.quarantine
-/Applications/AllMyAgents.app` is the scriptable equivalent). Then verify the step-7 list, reading:
+Open the `.dmg`, drag to Applications, then clear the quarantine flag before the first launch:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/AllMyAgents.app
+```
+
+The build is signed only ad-hoc, not notarized, so Gatekeeper refuses it until that runs. **Do not tell
+testers to right-click → Open** — this checklist used to, and it stopped being true: Apple removed that
+Gatekeeper override in macOS 15 Sequoia, so a tester following it hits a dead end and reports that the
+app will not install. The command above is the replacement, and it is what the release notes print.
+Then verify the step-7 list, reading:
 
 - `~/Library/Application Support/AllMyAgents/{data,profiles}` for the app-data roots (`profiles`
   must be empty — the bundle ships none).

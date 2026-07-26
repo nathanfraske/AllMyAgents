@@ -113,10 +113,15 @@ jobs:
         # (`--target universal-apple-darwin`) — the app would be universal but carry an arm64-only
         # Node, and Rosetta would not save it.
         #
-        # macos-latest is Apple Silicon (arm64) only, so there is currently NO Intel build. To add
-        # one, append `macos-13` (the last x86_64 image) to this list — everything else in the job is
-        # already arch-agnostic and tauri-action will attach both DMGs to the same release.
-        platform: [macos-latest, windows-latest]
+        # macos-latest is Apple Silicon (macos-26-arm64 as of this writing). `macos-15-intel` covers
+        # Intel Macs — until it was added, an Intel tester downloading the only DMG got "you can't open
+        # the application because it is not supported on this type of Mac", and no amount of Gatekeeper
+        # workaround helps that.
+        #
+        # It is NOT `macos-13`, which this comment used to recommend: GitHub retired that image on
+        # 2025-12-04, so following the old advice produced an unresolvable runner label. macos-15-intel
+        # is the surviving x86_64 host and is scheduled to last until August 2027.
+        platform: [macos-latest, macos-15-intel, windows-latest]
 
     steps:
       - name: Checkout
@@ -219,6 +224,24 @@ jobs:
             forward "$name"
           done
 
+          # AD-HOC SIGN macOS WHEN THERE IS NO DEVELOPER ID. Without this the shipped .app has no
+          # _CodeSignature at all — only the ad-hoc signature `ld64` stamps on the main executable so it
+          # can run — and Gatekeeper refuses a quarantined bundle with no resource seal as "damaged and
+          # can't be opened". That message is a dead end: it offers no override, and the "right-click and
+          # choose Open" escape everyone still recommends was removed in macOS 15 Sequoia. Testers
+          # correctly reported the app simply would not install.
+          #
+          # `codesign -s -` seals the bundle without any certificate. It does NOT make Gatekeeper happy —
+          # only notarization does that, which needs a paid Developer ID — but it changes the refusal from
+          # "damaged" to "Apple could not verify…", which DOES expose an Open Anyway button in System
+          # Settings, and it makes the documented `xattr -dr` workaround behave predictably.
+          #
+          # Only when APPLE_SIGNING_IDENTITY is absent: a real identity forwarded above must always win.
+          if [ "$RUNNER_OS" = macOS ] && [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            echo "APPLE_SIGNING_IDENTITY=-" >> "$GITHUB_ENV"
+            echo "no Developer ID — falling back to ad-hoc signing (-)"
+          fi
+
       # tauri-action runs `tauri build` in apps/desktop: builds the installers (Windows .msi + NSIS,
       # macOS .app + .dmg — tauri.conf.json's `targets` list is filtered per host OS), and, once
       # bundle.createUpdaterArtifacts is true and the signing key is present, also emits the SIGNED
@@ -248,9 +271,20 @@ jobs:
             This is alpha software. It is published as a normal (non-prerelease) release only so the
             updater can find it; see the comment on `prerelease:` in .github/workflows/release.yml.
 
-            macOS: this build is not notarized. Gatekeeper will block the first launch — right-click
-            the app and choose Open, or run
-            `xattr -dr com.apple.quarantine /Applications/AllMyAgents.app`.
+            **macOS — an extra step is required.** This build is signed only ad-hoc, not notarized
+            (that needs a paid Apple Developer ID), so Gatekeeper blocks the first launch. Drag the app
+            to Applications, then run this in Terminal:
+
+            ```
+            xattr -dr com.apple.quarantine /Applications/AllMyAgents.app
+            ```
+
+            It prints nothing; that is success. Then open the app normally. Do NOT bother
+            right-clicking and choosing Open — Apple removed that override in macOS 15 Sequoia, so the
+            advice you will find in older instructions no longer does anything.
+
+            Pick the DMG matching your Mac: `aarch64` for Apple Silicon (M1 and later), `x64` for Intel.
+
             Windows: SmartScreen will warn on first run (no Authenticode certificate yet).
           # NOT a prerelease, deliberately, even though these are alphas.
           #

@@ -61,6 +61,14 @@ const EXE_CANDIDATES =
     ? [join(TARGET_RELEASE, `${CRATE_BIN}.exe`), join(TARGET_RELEASE, `${PRODUCT}.exe`)]
     : process.platform === 'darwin'
       ? [
+          // The executable INSIDE the .app is named for the crate, not for productName — there is no
+          // `mainBinaryName` in tauri.conf.json, so the bundle's CFBundleExecutable is
+          // `allmyagents-desktop`. This looked for `MacOS/AllMyAgents`, never matched, and silently fell
+          // through to the bare target/release binary — which does not resolve resource_dir() to
+          // Contents/Resources, so the bundled-hub path this script exists to check was never actually
+          // exercised on macOS. CRATE_BIN first, productName kept only as a fallback in case a future
+          // mainBinaryName renames it.
+          join(TARGET_RELEASE, 'bundle', 'macos', `${PRODUCT}.app`, 'Contents', 'MacOS', CRATE_BIN),
           join(TARGET_RELEASE, 'bundle', 'macos', `${PRODUCT}.app`, 'Contents', 'MacOS', PRODUCT),
           join(TARGET_RELEASE, CRATE_BIN),
         ]
