@@ -27,29 +27,54 @@
   let expanded = $state<string | null>(null)
   let now = $state(Date.now())
 
-  const runs = $derived(buildAgentRuns(items))
+  // `now` is threaded in rather than read inside, because staleness is a function of elapsed time: with a
+  // frozen clock a wedged agent would keep reading "running" until some unrelated event re-rendered it.
+  const runs = $derived(buildAgentRuns(items, now))
   const summary = $derived(summarizeRuns(runs))
   // Newest first: a live agent is what you opened the panel for.
   const ordered = $derived([...runs].reverse())
 
-  // Tick only while something is actually running and visible — no idle timers.
+  // Tick only while something is non-terminal and visible — no idle timers. Stalled runs keep the tick
+  // alive so one that comes back to life (a late heartbeat) returns to "running" instead of staying stuck.
   $effect(() => {
-    if (!open || summary.running === 0) return
+    if (!open || summary.running + summary.stalled === 0) return
     const t = setInterval(() => (now = Date.now()), 1000)
     return () => clearInterval(t)
   })
 
-  function dur(r: AgentRun<ThreadItem>): string {
-    const end = r.endedAt ? Date.parse(r.endedAt) : now
-    const s = Math.max(0, Math.round((end - Date.parse(r.startedAt)) / 1000))
+  /** Status → dot class. Four states, four colours: a failed agent must never read like a done one. */
+  function dot(s: AgentRun<ThreadItem>['status']): string {
+    return s === 'running' ? 'run' : s === 'failed' ? 'fail' : s === 'stalled' ? 'stall' : 'ok'
+  }
+
+  /** The label under the result. `stopped` is called out separately from an error — one is a deliberate
+   *  kill, the other is a crash, and collapsing them loses the only thing you'd want to know. */
+  function resultLabel(r: AgentRun<ThreadItem>): string {
+    if (r.outcome === 'stopped') return 'stopped'
+    return r.status === 'failed' ? 'error' : 'returned'
+  }
+
+  function elapsed(ms: number): string {
+    const s = Math.max(0, Math.round(ms / 1000))
     if (!Number.isFinite(s)) return ''
     return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`
+  }
+  function dur(r: AgentRun<ThreadItem>): string {
+    const end = r.endedAt ? Date.parse(r.endedAt) : now
+    return elapsed(end - Date.parse(r.startedAt))
+  }
+  /** How long since we last heard anything — the number that actually explains a stalled run. */
+  function silentFor(r: AgentRun<ThreadItem>): string {
+    return elapsed(now - r.lastSignalAt)
   }
 
   /** One line describing the agent's most recent signal — the "what is it doing right now" answer. */
   function nowDoing(r: AgentRun<ThreadItem>): string {
+    if (r.status === 'stalled') return `no signal for ${silentFor(r)} — last seen ${r.lastTool ?? 'working'}`
     const last = latestActivity(r)
-    if (!last) return r.status === 'running' ? 'starting…' : 'no activity recorded'
+    // A background agent's own messages are not always attributed back to this chat, so the vendor's
+    // heartbeat (`task_progress.last_tool_name`) is often the ONLY thing that can answer this.
+    if (!last) return r.lastTool ?? (r.status === 'running' ? 'starting…' : 'no activity recorded')
     if (last.kind === 'tool') return `${last.toolName ?? 'tool'}`
     if (last.kind === 'thinking') return 'thinking…'
     return (last.text ?? '').replace(/\s+/g, ' ').slice(0, 120)
@@ -59,7 +84,9 @@
 {#if runs.length}
   {#if !open}
     <button class="tab" class:live={summary.running > 0} onclick={() => setOpen(true)} title="Show the agents this chat spawned">
-      <span class="dot {summary.running ? 'run' : summary.failed ? 'fail' : 'ok'}"></span>
+      <!-- Worst-status-wins on the collapsed badge: a failure must not be hidden behind a green dot just
+           because something else is still running. -->
+      <span class="dot {summary.failed ? 'fail' : summary.stalled ? 'stall' : summary.running ? 'run' : 'ok'}"></span>
       {summary.running ? `${summary.running} running` : `${summary.total} agent${summary.total === 1 ? '' : 's'}`}
     </button>
   {:else}
@@ -67,23 +94,32 @@
       <header class="phead">
         <span class="ptitle">Agents</span>
         <span class="dim counts">
-          {#if summary.running}{summary.running} running · {/if}{summary.done} done{#if summary.failed} · {summary.failed} failed{/if}
+          {#if summary.running}{summary.running} running · {/if}{summary.done} done{#if summary.failed} · {summary.failed} failed{/if}{#if summary.stalled} · {summary.stalled} stalled{/if}
         </span>
         <button class="x" onclick={() => setOpen(false)} title="Close">✕</button>
       </header>
 
       <div class="plist scroll">
         {#each ordered as r (r.id)}
+          <!-- `toolCount` counts what this chat SAW; `toolUses` is the vendor's own count, which is the
+               only number available for an agent whose steps were never attributed back here.
+               Declared HERE rather than beside its use below: `{@const}` has to be the immediate child of
+               a block ({#each}/{#if}/…), and inside the plain <div> it reads most naturally in, it is a
+               compile error rather than a runtime one — so it takes the whole dev server down. -->
+          {@const tools = r.toolCount || r.toolUses || 0}
           <div class="run" class:nested={!!r.parentId}>
             <button class="rhead" onclick={() => (expanded = expanded === r.id ? null : r.id)}>
-              <span class="dot {r.status === 'running' ? 'run' : r.status === 'failed' ? 'fail' : 'ok'}"></span>
+              <span class="dot {dot(r.status)}"></span>
               <span class="rdesc" title={r.description}>{r.description}</span>
               <span class="rmeta dim">{dur(r)}</span>
             </button>
             <div class="rsub dim">
+              <!-- The status word is spelled out, not left to the dot alone: colour is the fast read, but
+                   "failed" vs "done" is exactly the distinction that must survive a colourblind viewer. -->
+              <span class="chip st {dot(r.status)}">{r.outcome === 'stopped' ? 'stopped' : r.status}</span>
               {#if r.subagentType}<span class="chip">{r.subagentType}</span>{/if}
               {#if r.background}<span class="chip">background</span>{/if}
-              {#if r.toolCount}<span class="chip">{r.toolCount} tool{r.toolCount === 1 ? '' : 's'}</span>{/if}
+              {#if tools}<span class="chip">{tools} tool{tools === 1 ? '' : 's'}</span>{/if}
               <span class="doing">{nowDoing(r)}</span>
             </div>
 
@@ -101,10 +137,21 @@
                 {:else}
                   <div class="dim empty">This agent hasn't reported anything yet.</div>
                 {/if}
+                <!-- This block used to print the spawn's raw tool_result. For a background agent that is
+                     the launch ACK — ~1KB of internal metadata the SDK says must never be surfaced — so
+                     the panel showed a wall of "agentId: …, output_file: …, do not report its results"
+                     under a "returned" label, as though the agent had said it. agentTree now refuses the
+                     ack outright, and what lands here is the vendor's own summary of the run: the real
+                     report. Nothing at all is shown while a run is still going. -->
                 {#if r.result}
                   <div class="result" class:bad={r.status === 'failed'}>
-                    <div class="rlabel dim">{r.status === 'failed' ? 'error' : 'returned'}</div>
+                    <div class="rlabel dim">{resultLabel(r)}</div>
                     <pre>{r.result.slice(0, 4000)}</pre>
+                  </div>
+                {:else if r.status === 'failed'}
+                  <div class="result bad">
+                    <div class="rlabel dim">{resultLabel(r)}</div>
+                    <pre>The agent {r.outcome === 'stopped' ? 'was stopped' : 'failed'} without returning a report.</pre>
                   </div>
                 {/if}
               </div>
@@ -157,6 +204,13 @@
   .dot.ok { background: #2e9e63; }
   .dot.fail { background: #e06c6c; }
   .dot.run { background: var(--accent); }
+  /* Amber, and NOT pulsing — a stalled agent is precisely the one that is no longer moving. */
+  .dot.stall { background: #d9a441; }
+  .chip.st { text-transform: uppercase; letter-spacing: 0.03em; font-size: 0.62rem; }
+  .chip.st.ok { color: #2e9e63; border-color: #2e9e6355; }
+  .chip.st.fail { color: #e06c6c; border-color: #e06c6c55; }
+  .chip.st.stall { color: #d9a441; border-color: #d9a44155; }
+  .chip.st.run { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, transparent); }
   @media (prefers-reduced-motion: no-preference) {
     .dot.run { animation: pulse 1.4s ease-in-out infinite; }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }

@@ -3,6 +3,7 @@ import { settings } from './settings.svelte'
 import { alertDialog } from './dialog.svelte'
 import { loadLastLayout, saveLastLayout, loadQueues, saveQueues, type PersistedLayout } from './uiState'
 import { rowFate } from './fleetMerge'
+import type { AgentOutcome } from './agentTree'
 import type { ApprovalRecord, FleetSite, HistoryItem, HistoryPage, HubEvent, ProfileInfo, ProjectInfo, ScanResult, SessionRecord, UsageSnapshot } from './api'
 
 // Verbose client tracing — on in dev, compiled out of prod builds. Toggle off in dev by setting
@@ -65,6 +66,19 @@ export interface ThreadItem {
   /** The spawned agent's type + task, also carried on the envelope (e.g. `general-purpose`). */
   subagentType?: string
   taskDescription?: string
+  /**
+   * --- Claude sub-agent task lifecycle, merged onto the SPAWN tool item (see applyClaudeSystem). ---
+   * These are the vendor's own `task_started` / `task_progress` / `task_notification` facts, not
+   * anything inferred from the transcript. All optional: a journal recorded before the ingest existed
+   * simply carries none of them, and agentTree.ts degrades to what the tool_result can support.
+   */
+  agentTaskId?: string
+  agentOutcome?: AgentOutcome
+  agentOutcomeTs?: string
+  agentSummary?: string
+  agentProgressTs?: string
+  agentLastTool?: string
+  agentToolUses?: number
   reflex?: boolean
   status?: string
   // True for a turn reconstructed from the vendor transcript on open (imported chats), vs a live/
@@ -1446,6 +1460,9 @@ export class HubStore {
       case 'claude/user':
         this.applyClaudeUser(view, ts, payload)
         break
+      case 'claude/system':
+        this.applyClaudeSystem(view, ts, payload)
+        break
       case 'claude/result': {
         const p = payload as {
           is_error?: boolean
@@ -1601,6 +1618,84 @@ export class HubStore {
         }
       }
     }
+  }
+
+  /**
+   * The sub-agent lifecycle the UI used to invent.
+   *
+   * The hub has always forwarded EVERY SDK message as `claude/<type>`, so a sub-agent's real bookends have
+   * been sitting in the journal the whole time — but they all arrive as `type: 'system'` with the meaning in
+   * `payload.subtype`, and `apply()` dispatches on `kind`. With no `claude/system` case they fell straight
+   * through `default: break`. This hub's journal holds 283 `task_started`, 437 `task_progress` and 280
+   * `task_notification` rows that were written and then dropped on the floor.
+   *
+   * What the panel showed instead was inferred from the spawn's tool_result — which for a backgrounded
+   * agent is a launch ACK, so every sub-agent read "done" the instant it started and the ack's internal
+   * metadata was rendered as its report. The signal was never missing; it was never read.
+   *
+   * Merged ONTO THE SPAWN ITEM rather than pushed as new items: these are facts about a tool call we
+   * already have (`tool_use_id` is the spawn's own id), exactly as `applyClaudeUser` merges the
+   * tool_result. That keeps the transcript free of lifecycle noise and needs no new ItemKind. Safe because
+   * `task_started` is journaled AFTER the assistant message carrying the tool_use block (verified: 9/9
+   * spawns, 3-4 seq later), so the item always exists by the time these land.
+   *
+   * Background Bash tasks emit the same subtypes; they are self-filtering, since their `tool_use_id`
+   * belongs to a Bash tool item and agentTree only ever reads these fields off an Agent/Task spawn.
+   */
+  private applyClaudeSystem(view: SessionView, ts: string, payload: unknown): void {
+    const p = payload as {
+      subtype?: string
+      task_id?: string
+      tool_use_id?: string
+      status?: string
+      summary?: string
+      subagent_type?: string
+      last_tool_name?: string
+      usage?: { tool_uses?: number }
+      patch?: { status?: string }
+    }
+    // `claude/system` is a firehose (this journal: ~5k `thinking_tokens` rows to 1k task rows). Bail before
+    // touching items for everything that is not a task bookend.
+    //
+    // `background_tasks_changed` is deliberately NOT one of them. The SDK describes it as a level signal
+    // carrying ids only — "do not correlate it with the edge stream" — and notes nothing is emitted at CLI
+    // startup, so a snapshot replayed out of a journal can wedge a run as permanently live. The edge
+    // stream below is the correlatable truth; a level we cannot reset would be worse than no signal.
+    const st = p.subtype
+    if (st !== 'task_started' && st !== 'task_progress' && st !== 'task_notification' && st !== 'task_updated') return
+
+    // `tool_use_id` is present on nearly every row and is the direct key; `task_updated` never carries one
+    // and a handful of `stopped` notifications omit it, so the task id learned from an earlier row is the
+    // fallback. Without it, a killed agent would never lose its "running" dot.
+    const item =
+      (p.tool_use_id ? view.items.find((i) => i.key === `tool:${p.tool_use_id}`) : undefined) ??
+      (p.task_id ? view.items.find((i) => i.agentTaskId === p.task_id) : undefined)
+    if (!item) return
+
+    if (p.task_id) item.agentTaskId = p.task_id
+    if (st === 'task_started') {
+      item.agentProgressTs = ts
+      if (p.subagent_type) item.subagentType = p.subagent_type
+      return
+    }
+    if (st === 'task_progress') {
+      item.agentProgressTs = ts
+      if (p.last_tool_name) item.agentLastTool = p.last_tool_name
+      if (typeof p.usage?.tool_uses === 'number') item.agentToolUses = p.usage.tool_uses
+      return
+    }
+    // Terminal. `task_notification.status` is the vendor's word; `task_updated.patch.status` is the same
+    // fact on a wire-safe patch (and spells a kill `killed`). Only terminal values are applied — a patch
+    // that merely says `running`/`paused` must never clear an outcome we already have.
+    const raw = st === 'task_notification' ? p.status : p.patch?.status
+    const outcome: AgentOutcome | undefined =
+      raw === 'completed' ? 'completed' : raw === 'failed' ? 'failed' : raw === 'stopped' || raw === 'killed' ? 'stopped' : undefined
+    if (!outcome) return
+    item.agentOutcome = outcome
+    item.agentOutcomeTs = ts
+    // The vendor's summary IS the agent's report (thousands of characters of real findings on a completed
+    // run) — the thing the launch-ack blob was standing in for.
+    if (p.summary) item.agentSummary = p.summary
   }
 
   private applyCodexItem(view: SessionView, ts: string, payload: unknown): void {

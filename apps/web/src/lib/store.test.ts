@@ -850,3 +850,119 @@ describe('turn outcome — only real failures may look like failures', () => {
     expect(store.sessions['a']!.lastTurnOk).toBe(false)
   })
 })
+
+/**
+ * THE ROOT CAUSE OF THE "EVERY SUB-AGENT IS DONE" BUG.
+ *
+ * The hub forwards every SDK message as `claude/<type>`, so a sub-agent's real lifecycle arrives as
+ * `claude/system` with the meaning in `payload.subtype`. `apply()` dispatches on `kind`, and with no
+ * `claude/system` case those rows fell through `default: break` — this hub's journal holds hundreds of
+ * `task_started` / `task_progress` / `task_notification` rows that were written and then dropped. The
+ * panel inferred status from the spawn's tool_result instead, which for a backgrounded agent is a launch
+ * ack, so everything read "done" instantly.
+ *
+ * Payload shapes below are verbatim from real journal rows.
+ */
+describe('claude/system — sub-agent task lifecycle ingest', () => {
+  const spawnItem = (id: string) => store.sessions[id]!.items.find((i) => i.toolName === 'Agent')!
+
+  // The assistant message carrying the Agent tool_use block always precedes the lifecycle rows
+  // (verified: 9/9 spawns in this hub's journal, 3-4 seq later), which is what makes merging safe.
+  function seedSpawn(id: string, toolUseId = 'toolu_014ekbTX8TwZMReHWnB4jpw6'): void {
+    seed(id)
+    apply(
+      evt({
+        seq: 1,
+        kind: 'claude/assistant',
+        sessionId: id,
+        payload: {
+          message: {
+            content: [{ type: 'tool_use', id: toolUseId, name: 'Agent', input: { description: 't3code mode UI', subagent_type: 'Explore' } }],
+          },
+        },
+      })
+    )
+  }
+
+  const system = (id: string, seq: number, payload: unknown, ts = '2026-01-01T00:05:00.000Z') =>
+    apply(evt({ seq, kind: 'claude/system', sessionId: id, payload, ts }))
+
+  it('merges task_started onto the spawn item', () => {
+    seedSpawn('a')
+    system('a', 2, {
+      type: 'system', subtype: 'task_started', task_id: 'a8d7352e676bd71b1',
+      tool_use_id: 'toolu_014ekbTX8TwZMReHWnB4jpw6', description: 't3code mode UI',
+      subagent_type: 'Explore', task_type: 'local_agent',
+    })
+    expect(spawnItem('a').agentTaskId).toBe('a8d7352e676bd71b1')
+    expect(spawnItem('a').agentProgressTs).toBe('2026-01-01T00:05:00.000Z')
+  })
+
+  it('records the task_progress heartbeat — the liveness signal behind `stalled`', () => {
+    seedSpawn('a')
+    system('a', 2, {
+      type: 'system', subtype: 'task_progress', task_id: 'acb94dd932f8b8ac1',
+      tool_use_id: 'toolu_014ekbTX8TwZMReHWnB4jpw6', description: 'Running…',
+      usage: { total_tokens: 126455, tool_uses: 42, duration_ms: 533438 }, last_tool_name: 'Bash',
+    })
+    expect(spawnItem('a').agentLastTool).toBe('Bash')
+    expect(spawnItem('a').agentToolUses).toBe(42)
+    expect(spawnItem('a').agentProgressTs).toBe('2026-01-01T00:05:00.000Z')
+  })
+
+  it('records a completed task_notification, including the summary that replaces the launch-ack blob', () => {
+    seedSpawn('a')
+    system('a', 2, {
+      type: 'system', subtype: 'task_notification', task_id: 'b3rklprx0',
+      tool_use_id: 'toolu_014ekbTX8TwZMReHWnB4jpw6', status: 'completed', output_file: '',
+      summary: 'Survey packages and server structure',
+    })
+    expect(spawnItem('a').agentOutcome).toBe('completed')
+    expect(spawnItem('a').agentOutcomeTs).toBe('2026-01-01T00:05:00.000Z')
+    expect(spawnItem('a').agentSummary).toBe('Survey packages and server structure')
+  })
+
+  it('records a failed task_notification', () => {
+    seedSpawn('f')
+    system('f', 2, { type: 'system', subtype: 'task_notification', tool_use_id: 'toolu_014ekbTX8TwZMReHWnB4jpw6', status: 'failed' })
+    expect(spawnItem('f').agentOutcome).toBe('failed')
+  })
+
+  // Kept separate from `failed`: a deliberate kill and a crash are different facts, and flattening them
+  // loses the only thing worth knowing about a run that did not finish.
+  it('records a stopped task_notification as stopped, not as an error', () => {
+    seedSpawn('s')
+    system('s', 2, { type: 'system', subtype: 'task_notification', tool_use_id: 'toolu_014ekbTX8TwZMReHWnB4jpw6', status: 'stopped' })
+    expect(spawnItem('s').agentOutcome).toBe('stopped')
+  })
+
+  // `task_updated` never carries a tool_use_id, and a handful of `stopped` notifications omit it too.
+  // Without the task_id fallback a killed agent would keep its running dot forever.
+  it('correlates by task_id when the row carries no tool_use_id', () => {
+    seedSpawn('a')
+    system('a', 2, { type: 'system', subtype: 'task_started', task_id: 'b8e2xx6j8', tool_use_id: 'toolu_014ekbTX8TwZMReHWnB4jpw6' })
+    system('a', 3, { type: 'system', subtype: 'task_updated', task_id: 'b8e2xx6j8', patch: { status: 'killed', end_time: 1785013571376 } })
+    expect(spawnItem('a').agentOutcome).toBe('stopped')
+  })
+
+  it('a non-terminal task_updated never clears an outcome already recorded', () => {
+    seedSpawn('a')
+    system('a', 2, { type: 'system', subtype: 'task_started', task_id: 'b8e2xx6j8', tool_use_id: 'toolu_014ekbTX8TwZMReHWnB4jpw6' })
+    system('a', 3, { type: 'system', subtype: 'task_notification', task_id: 'b8e2xx6j8', tool_use_id: 'toolu_014ekbTX8TwZMReHWnB4jpw6', status: 'completed' })
+    system('a', 4, { type: 'system', subtype: 'task_updated', task_id: 'b8e2xx6j8', patch: { status: 'running' } })
+    expect(spawnItem('a').agentOutcome).toBe('completed')
+  })
+
+  it('ignores the noisy subtypes and anything it cannot correlate, without throwing', () => {
+    seedSpawn('a')
+    system('a', 2, { type: 'system', subtype: 'thinking_tokens', tokens: 1024 })
+    system('a', 3, { type: 'system', subtype: 'init', tools: [], skills: [] })
+    // background_tasks_changed is deliberately not consumed: the SDK calls it a level signal carrying ids
+    // only, with nothing emitted at CLI startup, so a replayed snapshot could wedge a run as live.
+    system('a', 4, { type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'zzz', task_type: 'local_agent', description: 'x' }] })
+    // A background Bash task: same subtypes, but its tool_use_id belongs to a Bash call, not a spawn.
+    system('a', 5, { type: 'system', subtype: 'task_notification', task_id: 'bjka37p48', tool_use_id: 'toolu_someBashCall', status: 'completed' })
+    expect(spawnItem('a').agentOutcome).toBeUndefined()
+    expect(spawnItem('a').agentTaskId).toBeUndefined()
+  })
+})
