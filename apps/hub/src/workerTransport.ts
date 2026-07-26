@@ -26,6 +26,7 @@ import net from 'node:net'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import crypto from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import {
   HUB_RECONNECT_INTERVAL_MS,
@@ -817,7 +818,21 @@ export class WorkerClient extends EventEmitter {
  */
 export function defaultWorkerSocket(dataDir: string): string {
   if (process.env.HUB_WORKER_SOCKET) return process.env.HUB_WORKER_SOCKET
-  if (process.platform === 'win32') return '\\\\.\\pipe\\allmyagents-worker' // named pipe: no fs cleanup
+  if (process.platform === 'win32') {
+    // KEYED BY DATA DIR, because a Windows named pipe lives in a GLOBAL namespace rather than the
+    // filesystem. A fixed name meant every hub on the machine shared one endpoint no matter what
+    // HUB_DATA_DIR said — so an "isolated" instance (a test harness, an acceptance run, a second
+    // checkout) would silently attach to the LIVE worker and drive the operator's real agents. Isolating
+    // the port and the database was not enough on Windows, and the failure is invisible: everything
+    // connects and looks healthy while two hubs share one worker.
+    //
+    // POSIX never had this — its socket is a real file under the data dir, so isolation came for free,
+    // which is exactly why the Windows case went unnoticed. Hashed rather than embedded because the pipe
+    // name has a length limit and a data dir can be arbitrarily long; lowercased first because Windows
+    // paths are case-insensitive and the hub and worker must derive the SAME endpoint independently.
+    const key = crypto.createHash('sha1').update(path.resolve(dataDir).toLowerCase()).digest('hex').slice(0, 12)
+    return `\\\\.\\pipe\\allmyagents-worker-${key}` // named pipe: no fs cleanup
+  }
 
   // POSIX: a unix domain socket under data/, so it is co-located with the rest of the hub's state and
   // scoped to the invoking user by that directory's permissions.

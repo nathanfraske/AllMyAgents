@@ -14,3 +14,5 @@ profiles/
 # artifacts). The branches live as refs (worktree-agent-*), so the work is safe; the
 # working-dir checkouts are machine-local scratch. Never commit them.
 .claude/worktrees/
+# Disposable test hub state (scripts/sandbox.mjs) — journal DB, worktrees, config.
+.sandbox/

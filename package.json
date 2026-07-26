@@ -21,6 +21,10 @@
     "spike:claude": "pnpm --filter spikes claude-min",
     "spike:codex": "pnpm --filter spikes codex-min",
     "spike:codex-usage": "pnpm --filter spikes codex-usage",
-    "spike:two-accounts": "pnpm --filter spikes two-accounts"
+    "spike:two-accounts": "pnpm --filter spikes two-accounts",
+    "sandbox": "node scripts/sandbox.mjs",
+    "sandbox:up": "node scripts/sandbox.mjs up",
+    "sandbox:down": "node scripts/sandbox.mjs down",
+    "sandbox:reset": "node scripts/sandbox.mjs reset"
   }
 }
