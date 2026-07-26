@@ -36,6 +36,8 @@ import {
   isOwnAgentServerRequest,
   codexTurnErrorMessage,
   codexTurnOutcome,
+  codexTurnPolicy,
+  codexGrantKey,
 } from './adapters/codex.js'
 import { buildAgentMcpServer, type AgentServices } from './agentTools.js'
 import { AUTO_ALLOW_TOOLS, SELF_GATING_TOOLS } from './executor.js'
@@ -371,7 +373,7 @@ export class AgentWorker {
         model: spec.model,
         effort: spec.effort,
         serviceTier: spec.serviceTier,
-        approvalPolicy: spec.permissionMode === 'full' ? 'never' : spec.permissionMode ? 'on-request' : undefined,
+        ...codexTurnPolicy(spec), // approval + sandbox together; see the note on codexTurnPolicy
       })
     } catch (err) {
       this.emitTurnError(spec.sessionId, errMessage(err))
@@ -580,7 +582,10 @@ export class AgentWorker {
     const threadId = (params as { threadId?: string } | null)?.threadId
     const sessionId = threadId ? this.sessionForThread(threadId) : undefined
     try {
-      const approved = await this.relayApproval(sessionId ?? 'unattributed', `codex/${method}`, params)
+      // Give the payload the same `toolName` shape a Claude approval has, so the card title, the
+      // "Always allow" button and the hub's allowlist all work for Codex without a second code path.
+      const approvalPayload = { ...(params as Record<string, unknown> | null), toolName: codexGrantKey(method) }
+      const approved = await this.relayApproval(sessionId ?? 'unattributed', `codex/${method}`, approvalPayload)
       return codexRequestResult(method, approved)
     } catch {
       // TODO(step 6): a codex approval in flight across a hub restart is re-flushed by the transport +

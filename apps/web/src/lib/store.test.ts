@@ -674,13 +674,13 @@ describe('queued messages — replay must not send, and a failed send must not l
   })
 
   /**
-   * Idle alone is not permission to send. An operator Stop, a reopen, and a stale-session reconcile after
-   * a worker loss all reach idle — and after a Stop the worktree has already been removed, so an
-   * auto-flush would launch un-reauthorised work against a directory that no longer exists.
+   * An interrupt SENDS the queue. The operator ended that turn deliberately and their queued follow-up is
+   * usually why — making them re-type it is friction, not safety. (A Stop is different: its status is
+   * 'stopped', never 'idle', so it never reaches the flush at all.)
    */
-  it('does not send on an idle that follows an interrupt rather than a completed turn', async () => {
+  it('sends queued text after an interrupt', async () => {
     seed('a')
-    store.queues = { a: ['do not restart me'] }
+    store.queues = { a: ['the thing I actually wanted'] }
     apply(evt({ seq: 1, kind: 'session/status', sessionId: 'a', payload: { status: 'active' } }))
     apply(
       evt({
@@ -692,8 +692,26 @@ describe('queued messages — replay must not send, and a failed send must not l
     )
     apply(evt({ seq: 3, kind: 'session/status', sessionId: 'a', payload: { status: 'idle' } }))
     await tick()
+    expect(api.send).toHaveBeenCalledWith('a', 'the thing I actually wanted')
+  })
+
+  /** A FAILED turn still holds it: with a broken worker, flushing drains the whole queue into the wall. */
+  it('does not send after a failed turn', async () => {
+    seed('a')
+    store.queues = { a: ['hold me'] }
+    apply(evt({ seq: 1, kind: 'session/status', sessionId: 'a', payload: { status: 'active' } }))
+    apply(
+      evt({
+        seq: 2,
+        kind: 'claude/result',
+        sessionId: 'a',
+        payload: { is_error: true, errors: ['boom'], terminal_reason: 'api_error' },
+      })
+    )
+    apply(evt({ seq: 3, kind: 'session/status', sessionId: 'a', payload: { status: 'idle' } }))
+    await tick()
     expect(api.send).not.toHaveBeenCalled()
-    expect(store.queues['a']).toEqual(['do not restart me'])
+    expect(store.queues['a']).toEqual(['hold me'])
   })
 
   it('restores the text and withdraws the bubble when the send fails', async () => {

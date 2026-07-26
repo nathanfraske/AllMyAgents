@@ -315,9 +315,17 @@ class HubStore {
       // launches work they never re-authorised — and after a Stop the worktree is already gone, so it
       // would run against a directory that no longer exists.
       //
-      // lastTurnOk is true only for a Claude success or a Codex `completed`; interrupted and unknown
-      // outcomes leave it undefined, which correctly holds the queue for the operator to send by hand.
-      if (view.lastTurnOk !== true) return
+      // Only a FAILED turn holds the queue. An interrupt does not: the operator ended that turn on
+      // purpose and their queued follow-up is usually the reason they interrupted, so making them
+      // re-send it by hand is just friction. Requiring success outright (lastTurnOk === true) was too
+      // strict — it stranded queued text after every interrupt.
+      //
+      // A failure still holds, because with a broken worker each send produces another failure, which
+      // would flush the next message, and the whole queue drains into the same wall. And a STOPPED chat
+      // never reaches here at all: its status is 'stopped', not 'idle', so the guard above already
+      // excludes the dangerous case this rule originally existed for (Stop removes the worktree, so
+      // auto-restarting would run against a directory that no longer exists).
+      if (view.lastTurnOk === false) return
       void this.flushQueue(sessionId)
     }, 0)
   }

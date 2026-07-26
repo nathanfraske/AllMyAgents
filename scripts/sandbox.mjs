@@ -135,6 +135,11 @@ async function up() {
     // Never advertise a sandbox on the mesh: a disposable hub must not appear in the operator's fleet
     // roster, and certainly must not be reachable from another machine.
     MESH_EXPOSE: '0',
+    // Force a blue-green flip to land MID-TURN instead of waiting for a turn boundary. The hub defers a
+    // restart while a turn is live, which is right in production and useless in a harness: the whole
+    // reason to restart a test hub is to see what a live turn does across the seam. Short by default here
+    // precisely because that case is the one worth exercising.
+    HUB_RESTART_MAX_DEFER_MS: process.env.SANDBOX_MAX_DEFER_MS ?? '3000',
   }
   if (isolatedProfiles) env.HUB_PROFILES_DIR = PROFILES
   // Inherited supervision vars would make the sandbox think it is a green being promoted by the LIVE

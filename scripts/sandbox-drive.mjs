@@ -227,7 +227,9 @@ const commands = {
         return
       }
     }
-    console.log('(health never changed — check sandbox logs)')
+    // Most often this is a DEFERRED flip, not a failure: the hub waits for a turn boundary before
+    // swapping. Saying "health never changed" invited exactly the wrong conclusion.
+    console.log('(no flip observed — most likely deferred because a turn is live; check `sandbox logs`)')
   },
 
   /**

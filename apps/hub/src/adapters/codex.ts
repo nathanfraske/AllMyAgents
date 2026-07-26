@@ -97,6 +97,22 @@ export function codexTurnOutcome(payload: unknown): CodexTurnOutcome {
   return { kind: 'unknown' }
 }
 
+/**
+ * A stable, human-readable name for the THING a Codex approval is about — 'commandExecution',
+ * 'fileChange', and so on.
+ *
+ * Claude approvals carry `toolName`, and everything downstream keys on it: the card's title, the
+ * "Always allow <tool>" button, the per-chat allowlist, and the policy that reads it back. Codex
+ * approvals carry no such field, so all of that silently did nothing for Codex — the button never
+ * rendered and a grant would have had nothing to match. Deriving the name HERE, once, and putting it in
+ * the payload under the same key means the UI and the policy cannot drift apart: there is one definition
+ * and both sides read it rather than each parsing the method string their own way.
+ */
+export function codexGrantKey(method: string): string {
+  const core = method.replace(/^item\//, '').replace(/\/requestApproval$/, '')
+  return core || method
+}
+
 export function codexRequestResult(method: string, approved: boolean): Record<string, string> {
   return method === CODEX_ELICITATION_METHOD
     ? { action: approved ? 'accept' : 'decline' }
@@ -120,6 +136,41 @@ export interface CodexTurnOptions {
   effort?: string
   serviceTier?: string
   approvalPolicy?: string
+  /** `{ mode, writableRoots }` — what the agent is allowed to touch. See {@link codexTurnPolicy}. */
+  sandboxPolicy?: { type: string; writableRoots?: string[] }
+}
+
+/**
+ * Translate a chat's permission mode into the two settings Codex actually needs — and they must be set
+ * TOGETHER, because they answer different questions:
+ *   - approvalPolicy: may the agent ASK a human?
+ *   - sandboxPolicy:  what may the agent TOUCH?
+ *
+ * Only the first was ever sent, and `full` mapped to `never`. With no sandbox set, Codex defaults to
+ * read-only — so a chat the operator had explicitly put in FULL ACCESS launched an agent that could not
+ * write AND was forbidden to ask, which reads from the inside as a broken agent rather than a permission
+ * setting. Half of a two-part contract, with the missing half defaulting to the strictest value.
+ *
+ * The approval policy is now ALWAYS 'on-request', for every mode, which looks surprising until you see
+ * what it buys: Codex asks the hub, and the HUB decides. That is exactly the Claude arrangement, and it
+ * keeps the things that only exist hub-side — the audit row for anything auto-approved, the bus-origin
+ * clamp, and the ability to tighten a live chat from Full to Safe. Mapping `full` to `never` would hand
+ * the decision to the vendor and lose all three. "No prompts" is the hub's answer to give, not Codex's.
+ *
+ * `full` deliberately does NOT use dangerFullAccess. The operator asking for no prompts is not the same
+ * as asking for unrestricted disk access, and unlike Claude there is no hub-side write-scope check on the
+ * Codex path — so the sandbox root IS the containment. Writable roots stay scoped to the session's own
+ * worktree (or cwd), which is where its work belongs.
+ */
+export function codexTurnPolicy(spec: {
+  permissionMode?: 'safe' | 'edits' | 'full'
+  worktree?: string
+  cwd: string
+}): Pick<CodexTurnOptions, 'approvalPolicy' | 'sandboxPolicy'> {
+  return {
+    approvalPolicy: 'on-request',
+    sandboxPolicy: { type: 'workspaceWrite', writableRoots: [spec.worktree ?? spec.cwd] },
+  }
 }
 
 /** Normalized token usage forwarded to the UI as a `session/tokens` event (all fields optional). */
@@ -308,6 +359,7 @@ export class CodexClient {
     if (opts.effort) params.effort = opts.effort
     if (opts.serviceTier) params.serviceTier = opts.serviceTier
     if (opts.approvalPolicy) params.approvalPolicy = opts.approvalPolicy
+    if (opts.sandboxPolicy) params.sandboxPolicy = opts.sandboxPolicy
     await this.request('turn/start', params)
   }
 

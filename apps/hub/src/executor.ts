@@ -6,6 +6,8 @@ import {
   isOwnAgentServerRequest,
   codexTurnErrorMessage,
   codexTurnOutcome,
+  codexTurnPolicy,
+  codexGrantKey,
 } from './adapters/codex.js'
 import { buildAgentMcpServer, type AgentServices } from './agentTools.js'
 import type { SessionIdentity } from './identity.js'
@@ -252,7 +254,10 @@ export class InProcessExecutor implements Executor {
           if (isOwnAgentServerRequest(method, params)) return codexRequestResult(method, true)
           const threadId = (params as { threadId?: string } | null)?.threadId
           const sessionId = threadId ? this.sessionIdForThread(threadId) : undefined
-          const approved = await this.services.approvals.request(sessionId ?? 'unattributed', `codex/${method}`, params)
+          // Same normalisation as the worker path: Codex approvals carry no toolName, and every
+          // downstream consumer (card title, Always allow, allowlist policy) keys on one.
+          const approvalPayload = { ...(params as Record<string, unknown> | null), toolName: codexGrantKey(method) }
+          const approved = await this.services.approvals.request(sessionId ?? 'unattributed', `codex/${method}`, approvalPayload)
           return codexRequestResult(method, approved)
         }
       )
@@ -389,7 +394,7 @@ export class InProcessExecutor implements Executor {
         model: spec.model,
         effort: spec.effort,
         serviceTier: spec.serviceTier,
-        approvalPolicy: spec.permissionMode === 'full' ? 'never' : spec.permissionMode ? 'on-request' : undefined,
+        ...codexTurnPolicy(spec), // approval + sandbox together; see the note on codexTurnPolicy
       })
     } catch (err) {
       this.h.failTurn(spec.sessionId, err instanceof Error ? err.message : String(err))
