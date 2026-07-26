@@ -49,7 +49,28 @@ API="https://api.github.com/repos/${REPO}/releases/latest"
 [ -n "$TAG" ] && API="https://api.github.com/repos/${REPO}/releases/tags/${TAG}"
 
 say "Looking up the ${TAG:-latest} release..."
-RELEASE_JSON="$(curl -fsSL "$API")" || die "could not reach the GitHub API. Are you online?"
+# Capture the STATUS, because "it failed" and "you are offline" are not the same thing. This said
+# "Are you online?" for every failure, and the first one CI actually hit was a 403 rate limit — telling
+# a perfectly connected machine its network was broken. Anyone behind corporate NAT, a university, or a
+# VPN shares an IP and can hit the same unauthenticated limit of 60 requests/hour.
+# GITHUB_TOKEN, if present, raises that limit; it is optional and never required.
+AUTH=()
+[ -n "${GITHUB_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+# NOTE: a second `trap ... EXIT` below REPLACES this one rather than adding to it, so the later trap
+# cleans up both. Bash has one EXIT trap, and assuming otherwise silently leaks the first target.
+HTTP_BODY="$(mktemp)"
+trap 'rm -f "$HTTP_BODY"' EXIT
+CODE="$(curl -sSL "${AUTH[@]}" -o "$HTTP_BODY" -w '%{http_code}' "$API" 2>/dev/null || echo 000)"
+case "$CODE" in
+  200) RELEASE_JSON="$(cat "$HTTP_BODY")" ;;
+  403|429)
+    die "GitHub rate-limited this machine (HTTP $CODE). This is not a connection problem — the limit is
+per IP address and resets within the hour, so a shared or VPN'd network can hit it. Wait a few minutes and
+try again, or set GITHUB_TOKEN to a personal access token to raise the limit." ;;
+  404) die "no release named '${TAG}' exists in ${REPO}." ;;
+  000) die "could not reach github.com at all. Check your internet connection." ;;
+  *) die "GitHub returned HTTP $CODE looking up the release." ;;
+esac
 
 VERSION="$(printf '%s' "$RELEASE_JSON" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name",""))')"
 # Match this Mac's architecture exactly. Installing an arm64 build on an Intel Mac produces
@@ -69,7 +90,7 @@ for a in assets:
 say "Downloading $VERSION for $ARCH_LABEL..."
 TMP="$(mktemp -d)"
 # shellcheck disable=SC2064
-trap "rm -rf '$TMP'; hdiutil detach '$TMP/mnt' >/dev/null 2>&1 || true" EXIT
+trap "rm -rf '$TMP' '$HTTP_BODY'; hdiutil detach '$TMP/mnt' >/dev/null 2>&1 || true" EXIT
 DMG="$TMP/AllMyAgents.dmg"
 # THE LOAD-BEARING LINE. curl does not set com.apple.quarantine, so what lands here is never flagged
 # as web-downloaded and Gatekeeper is never consulted for it. Downloading this same file in a browser

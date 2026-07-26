@@ -56,6 +56,9 @@ jobs:
       - name: Install from the release, exactly as a user would
         env:
           AMA_TAG: ${{ github.event.inputs.tag }}
+          # CI shares runner IPs and re-runs often, so the unauthenticated 60/hour GitHub limit is hit
+          # quickly — a 403 that has nothing to do with the app. Real users get the anonymous path.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash scripts/install-macos.sh
 
       # Everything above may use the runner's tools. Everything below must not.
@@ -141,7 +144,12 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           pnpm install --frozen-lockfile
-          pnpm --filter desktop exec tauri build --bundles msi --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          # A config FILE, not an inline JSON string: PowerShell strips the double quotes when passing an
+          # argument to a native command, so --config '{"bundle":{...}}' reached tauri as
+          # {bundle:{createUpdaterArtifacts:false}} and was rejected with "key must be a string".
+          # A path has no quotes to lose.
+          '{"bundle":{"createUpdaterArtifacts":false}}' | Set-Content -Path ci-nosign.json -Encoding utf8
+          pnpm --filter desktop exec tauri build --bundles msi --config (Resolve-Path ci-nosign.json).Path
           New-Item -ItemType Directory -Force artifacts | Out-Null
           Copy-Item apps\desktop\src-tauri\target\release\bundle\msi\*.msi artifacts\
 
