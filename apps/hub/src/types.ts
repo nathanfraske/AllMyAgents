@@ -39,7 +39,10 @@ export interface SessionRecord {
   // and overridable by the user (titleSource:'user', which freezes auto-naming). Absent → the UI
   // falls back to the worktree/cwd basename.
   title?: string
-  titleSource?: 'auto' | 'user'
+  /** 'generated' → a scientist surname assigned at creation; kept until the operator renames it, so a
+   *  chat's name never changes under them. 'auto' → derived from the first prompt (legacy path, still
+   *  used for imported/untitled records). 'user' → an explicit rename, which freezes naming entirely. */
+  titleSource?: 'auto' | 'user' | 'generated'
   // True when this record was ADOPTED from an existing vendor transcript (Claude Code / Codex) via
   // the project-import flow rather than spawned by the hub. Drives a sidebar badge and the
   // delete-never-unlinks guard (the source transcript is the user's own history — never removed).

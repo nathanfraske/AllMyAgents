@@ -182,6 +182,13 @@ const commands = {
     })
   },
 
+  /** Set a chat's permission mode, so "does Full actually stop prompting" can be tested rather than argued. */
+  async mode() {
+    const [sid, mode] = [args[0] ?? die('usage: mode <sessionId> <safe|edits|full>'), args[1] ?? die('need a mode')]
+    const r = await req('POST', `/api/sessions/${sid}/mode`, { permissionMode: mode })
+    console.log(JSON.stringify(r.json))
+  },
+
   async approvals() {
     const { json } = await req('GET', '/api/approvals')
     for (const a of json ?? []) console.log(`${a.id}  ${a.sessionId?.slice(0, 8)}  ${a.kind}  ${JSON.stringify(a.payload).slice(0, 120)}`)

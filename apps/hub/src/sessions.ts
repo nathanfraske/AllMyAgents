@@ -22,7 +22,7 @@ import type { PracticeStore } from './practices.js'
 import type { DangerFlags } from './types.js'
 import { InProcessExecutor, type Executor, type InProcessExecutorHubHooks } from './executor.js'
 import type { RelayMethod, WorkerSessionSpec, WorkerToHub } from './workerProtocol.js'
-import { deriveTitle, sanitizeTitle } from './title.js'
+import { deriveTitle, sanitizeTitle, generatedTitle } from './title.js'
 import { discoverImportableChats, importKey, type ImportableChat, type ScanResult } from './importScan.js'
 import { readProfileCommands, type CommandInfo } from './commands.js'
 import { EDIT_TOOLS } from './writeScope.js'
@@ -831,6 +831,18 @@ export class SessionManager {
       permissionMode: opts.permissionMode,
       createdAt: new Date().toISOString(),
     }
+    // Name it now, from its own id, so the chat has a stable handle from the moment it exists. Assigned
+    // HERE rather than in the client because the id is the seed: two independent rolls of "random" cannot
+    // agree, and a name that changed after a reload would be worse than no name. Set before the
+    // session/created journal row so replay reconstructs the same name without a second event.
+    //
+    // titleSource 'generated' also makes autoTitle skip this record (it returns early once a source is
+    // set), which is deliberate: a chat you can refer to as "Hopper" should not silently become "Fix the
+    // login redirect loop" the moment you say something. An explicit rename still wins.
+    //
+    // Only hub-native chats: imported transcripts arrive through adoptChat with their real titles.
+    record.title = generatedTitle(id, this.titlesInUse())
+    record.titleSource = 'generated'
     this.sessions.set(id, record)
     this.persist(record)
     this.journal.append(id, 'session/created', record)
@@ -1266,6 +1278,13 @@ export class SessionManager {
   }
 
   /** Auto-derive a title from the first substantive prompt. Fires once; never clobbers a rename. */
+  /** Every title currently in use, so a generated name can avoid colliding with a visible one. */
+  private titlesInUse(): Set<string> {
+    const names = new Set<string>()
+    for (const r of this.sessions.values()) if (r.title) names.add(r.title)
+    return names
+  }
+
   private autoTitle(record: SessionRecord, text: string): void {
     if (record.titleSource) return // 'auto' → already named; 'user' → frozen
     const title = deriveTitle(text)

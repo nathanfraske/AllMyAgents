@@ -10,6 +10,47 @@
 const AUTO_MAX = 48
 const USER_MAX = 60
 
+/**
+ * Names for new chats. Surnames only: short enough for a sidebar row, and a name rather than a
+ * description, which is the point — a chat you can refer to ("what did Hopper decide?") before it has
+ * done anything worth describing.
+ */
+export const CHAT_NAMES = [
+  'Hopper', 'Fermi', 'Lagrange', 'Curie', 'Noether', 'Meitner', 'Raman', 'Bose',
+  'Franklin', 'Faraday', 'Turing', 'Hubble', 'Sagan', 'Lovelace', 'Ramanujan', 'Euler',
+  'Gauss', 'Maxwell', 'Planck', 'Dirac', 'Feynman', 'Payne', 'Rubin', 'Leavitt',
+  'Tharp', 'Cannon', 'Germain', 'Kovalevskaya', 'Wu', 'Yalow', 'Elion', 'Hodgkin',
+  'Chandrasekhar', 'Bhabha', 'Tesla', 'Carver', 'Just', 'Ochoa', 'Mirzakhani', 'Tu',
+] as const
+
+/**
+ * A stable name for a new chat, derived from its session id so it can never be rolled twice.
+ *
+ * DETERMINISTIC BY DESIGN. The id is the seed, so the hub, a replay of the journal, and a restart all
+ * land on the same name — a chat whose name changed after a reload would be worse than no name at all.
+ * That also means the client must never generate one independently: two rolls of "random" cannot agree.
+ *
+ * On collision it walks ON through the pool rather than suffixing immediately, because Fermi / Curie /
+ * Hopper reads better than Fermi / Fermi 2 / Fermi 3, and with a pool this size collisions are common
+ * rather than exotic (birthday problem: ~40 names means a repeat within the first handful of chats).
+ * Numeric suffixes only appear once the pool is genuinely exhausted, and are then deterministic too.
+ */
+export function generatedTitle(sessionId: string, taken: Iterable<string> = []): string {
+  const used = new Set(taken)
+  let h = 0
+  for (let i = 0; i < sessionId.length; i++) h = (Math.imul(h, 31) + sessionId.charCodeAt(i)) >>> 0
+  const start = h % CHAT_NAMES.length
+  for (let i = 0; i < CHAT_NAMES.length; i++) {
+    const name = CHAT_NAMES[(start + i) % CHAT_NAMES.length] as string
+    if (!used.has(name)) return name
+  }
+  const base = CHAT_NAMES[start] as string
+  for (let n = 2; ; n++) {
+    const candidate = `${base} ${n}`
+    if (!used.has(candidate)) return candidate
+  }
+}
+
 /** Sanitize a user-supplied rename: strip control chars/newlines, collapse whitespace, cap length. */
 export function sanitizeTitle(raw: string): string {
   const clean = raw
