@@ -534,15 +534,23 @@
           <button class="folder" title={isCollapsed ? 'expand' : 'collapse'} onclick={() => toggleCollapse(g.id)}><Icon name={isCollapsed ? 'chevron-right' : 'chevron-down'} size={12} /></button>
           <span class="gname">{g.name}</span>
           {#if multiSite}
+            <!--
+              WHERE this project lives, and whether we can reach it — as an icon, not a word.
+              This used to print the machine's NAME in the row ("AllMyAgents"), which cost up to 9rem of a
+              narrow sidebar to repeat the same string down the whole list, and squeezed out the thing you
+              actually scan for: the chat's own name. The identity belongs in the tooltip, where you go
+              when you want it; the row only needs to answer "mine or elsewhere, and is elsewhere up".
+
+              Shape carries local-vs-remote (monitor vs server) and colour carries reachability, so
+              neither meaning depends on distinguishing two colours at 11px.
+            -->
             <span
-              class="sbadge"
-              class:off={g.siteLabel != null && g.siteOnline === false}
+              class="sbadge {g.siteLabel == null ? 'here' : g.siteOnline === false ? 'down' : 'up'}"
               title={g.siteLabel
-                ? `on ${g.siteLabel}${g.siteOnline === false ? ' — unreachable, showing the last known state' : ' — reachable'}`
+                ? `on ${g.siteLabel} — ${g.siteOnline === false ? 'unreachable, showing the last known state' : 'reachable'}`
                 : `on ${localLabel} (this machine)`}
             >
-              <span class="sdot {g.siteLabel == null ? 'here' : g.siteOnline === false ? 'down' : 'up'}"></span>
-              <Icon name="server" size={9} />{g.siteLabel ?? localLabel}
+              <Icon name={g.siteLabel == null ? 'monitor' : 'server'} size={11} />
             </span>
           {/if}
           <span class="gcount dim tnum">{g.sessions.length}</span>
@@ -775,16 +783,19 @@
   /* Fleet machine/site tags: a labelled pill on a remote project header, and a compact icon marker on
      a remote chat row (its label rides in the tooltip). Only rendered for REMOTE sites, so the
      single-machine view shows neither. */
-  .sbadge { flex: none; display: inline-flex; align-items: center; gap: 0.2rem; max-width: 9rem; overflow: hidden;
-    text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-2xs); font-weight: var(--fw-medium);
-    color: var(--accent); background: color-mix(in srgb, var(--accent) 13%, transparent);
-    border-radius: var(--r-pill); padding: 0.05rem 0.35rem; }
-  /* Reachability: a machine that did not answer reads as muted-with-a-dead-dot, never as missing. */
-  .sbadge.off { color: var(--text-dim, #9a9aa8); background: color-mix(in srgb, currentColor 12%, transparent); }
-  .sdot { width: 5px; height: 5px; border-radius: 50%; flex: none; }
-  .sdot.up { background: #2e9e63; }
-  .sdot.here { background: currentColor; opacity: 0.55; }
-  .sdot.down { background: #d08b3a; }
+  /* Icon only — no text, so no max-width/ellipsis machinery. The machine's name lives in the tooltip;
+     repeating it down every row cost sidebar width that the chat names need more. */
+  .sbadge { flex: none; display: inline-flex; align-items: center; justify-content: center;
+    width: 1.15rem; height: 1.15rem; border-radius: var(--r-sm); }
+  /* This machine: present but recessive. Your own projects are the common case, so the marker's job here
+     is to be available on inspection, not to compete with the chat names for attention. */
+  .sbadge.here { color: var(--text-dim, #9a9aa8); }
+  /* Another machine, answering. */
+  .sbadge.up { color: var(--accent); background: color-mix(in srgb, var(--accent) 13%, transparent); }
+  /* Another machine that did NOT answer. Amber rather than red: the rows below are real chats in their
+     last known state, not errors — you simply cannot act on them right now. Reduced opacity carries the
+     same message a second way, so it survives a viewer who cannot separate amber from the accent. */
+  .sbadge.down { color: #d08b3a; background: color-mix(in srgb, #d08b3a 14%, transparent); opacity: 0.85; }
   .rbadge { flex: none; display: inline-grid; place-items: center; color: var(--accent); opacity: 0.75; }
   .rlabel { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .row.sel .rlabel { font-weight: var(--fw-medium); }
