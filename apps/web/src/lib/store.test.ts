@@ -381,10 +381,14 @@ describe('apply()', () => {
     expect(store.sessions.st1?.record.status).toBe('idle')
   })
 
-  it('session/status idle flushes any queued message to the hub', () => {
+  // The flush is now DEFERRED to the end of the tick, so the status can be superseded before anything is
+  // sent (see scheduleQueueFlush). This test asserted the old synchronous behaviour; awaiting a tick is
+  // the whole change, and the send itself is unchanged.
+  it('session/status idle flushes any queued message to the hub', async () => {
     seed('st2')
     store.enqueue('st2', 'pending')
     apply(evt({ seq: 1, kind: 'session/status', sessionId: 'st2', payload: { status: 'idle' } }))
+    await new Promise((r) => setTimeout(r, 0))
     expect(api.send).toHaveBeenCalledWith('st2', 'pending')
     expect(store.queueFor('st2')).toEqual([])
   })
