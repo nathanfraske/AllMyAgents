@@ -83,6 +83,11 @@ export type ChatNamePool = 'women' | 'everyone'
 /** The default pool when nothing is configured. */
 export const DEFAULT_CHAT_NAME_POOL: ChatNamePool = 'everyone'
 
+/** Narrow an untrusted value (config file, request body) to a pool, falling back to the default. */
+export function asChatNamePool(value: unknown): ChatNamePool {
+  return value === 'women' || value === 'everyone' ? value : DEFAULT_CHAT_NAME_POOL
+}
+
 /**
  * The full pool. Women first so that "everyone" is not a list where the women are an appendix — the
  * generator walks from a hashed offset, so order does not bias selection, but it does decide what a
@@ -105,17 +110,25 @@ export function chatNamesFor(pool: ChatNamePool = DEFAULT_CHAT_NAME_POOL): reado
  * Hopper reads better than Fermi / Fermi 2 / Fermi 3, and with a pool this size collisions are common
  * rather than exotic (birthday problem: ~40 names means a repeat within the first handful of chats).
  * Numeric suffixes only appear once the pool is genuinely exhausted, and are then deterministic too.
+ *
+ * `pool` selects which list to walk, and is deliberately NOT part of the hash: the id alone still picks
+ * the offset, so switching pools does not reshuffle the pool you were already on. Switching DOES mean a
+ * given id names a different chat than it would have — which is fine, and is why the name is written onto
+ * the record at creation (sessions.ts): existing chats keep the name they were born with, and only chats
+ * created after the change draw from the new pool. Determinism is per (id, pool), which is all replay and
+ * restart need, because both replay the pool the chat was actually created under.
  */
-export function generatedTitle(sessionId: string, taken: Iterable<string> = []): string {
+export function generatedTitle(sessionId: string, taken: Iterable<string> = [], pool?: ChatNamePool): string {
+  const names = chatNamesFor(pool)
   const used = new Set(taken)
   let h = 0
   for (let i = 0; i < sessionId.length; i++) h = (Math.imul(h, 31) + sessionId.charCodeAt(i)) >>> 0
-  const start = h % CHAT_NAMES.length
-  for (let i = 0; i < CHAT_NAMES.length; i++) {
-    const name = CHAT_NAMES[(start + i) % CHAT_NAMES.length] as string
+  const start = h % names.length
+  for (let i = 0; i < names.length; i++) {
+    const name = names[(start + i) % names.length] as string
     if (!used.has(name)) return name
   }
-  const base = CHAT_NAMES[start] as string
+  const base = names[start] as string
   for (let n = 2; ; n++) {
     const candidate = `${base} ${n}`
     if (!used.has(candidate)) return candidate

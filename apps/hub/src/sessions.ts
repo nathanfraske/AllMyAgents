@@ -19,10 +19,10 @@ import { writeCodexAgentMcpConfig } from './codexMcpConfig.js'
 import type { AgentBus, BusAddress, BusMessage } from './bus.js'
 import type { MemoryStore } from './memory.js'
 import type { PracticeStore } from './practices.js'
-import type { DangerFlags } from './types.js'
+import type { DangerFlags, HubPrefs } from './types.js'
 import { InProcessExecutor, type Executor, type InProcessExecutorHubHooks } from './executor.js'
 import type { RelayMethod, WorkerSessionSpec, WorkerToHub } from './workerProtocol.js'
-import { deriveTitle, sanitizeTitle, generatedTitle } from './title.js'
+import { deriveTitle, sanitizeTitle, generatedTitle, DEFAULT_CHAT_NAME_POOL } from './title.js'
 import { discoverImportableChats, importKey, type ImportableChat, type ScanResult } from './importScan.js'
 import { readProfileCommands, type CommandInfo } from './commands.js'
 import { EDIT_TOOLS } from './writeScope.js'
@@ -118,7 +118,12 @@ export class SessionManager {
     private readonly defaultCwd: string,
     // The execution seam. Optional: defaults to an in-process executor built from this manager's own
     // services, so existing callers/tests are unchanged; index.ts injects one explicitly.
-    executor?: Executor
+    executor?: Executor,
+    // Live owner preferences (shared object reference, like `danger` above — POST /api/config/prefs
+    // mutates it in place, so the next chat is named from the newly chosen pool without a restart).
+    // Trailing + optional so the existing positional call sites keep compiling; index.ts injects the
+    // shared object, and the default here is the same one the generator would have used anyway.
+    private readonly prefs: HubPrefs = { chatNamePool: DEFAULT_CHAT_NAME_POOL }
   ) {
     this.executor =
       executor ??
@@ -847,7 +852,11 @@ export class SessionManager {
     // login redirect loop" the moment you say something. An explicit rename still wins.
     //
     // Only hub-native chats: imported transcripts arrive through adoptChat with their real titles.
-    record.title = generatedTitle(id, this.titlesInUse())
+    //
+    // The pool is read HERE, per chat, rather than captured at construction, because `prefs` is the same
+    // object the settings route mutates — so changing it in Settings takes effect on the very next chat.
+    // Chats already named keep their name: it lives on the record, not on the current setting.
+    record.title = generatedTitle(id, this.titlesInUse(), this.prefs.chatNamePool)
     record.titleSource = 'generated'
     this.sessions.set(id, record)
     this.persist(record)

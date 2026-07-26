@@ -1,3 +1,5 @@
+import type { ChatNamePool } from './title.js'
+
 export type Provider = 'claude' | 'codex'
 
 export interface Profile {
@@ -148,6 +150,24 @@ export interface FeaturesConfig {
 }
 
 /**
+ * Owner preferences: choices about how the hub presents itself, with no safety dimension at all.
+ *
+ * Separate from FeaturesConfig (which turns hub BEHAVIOUR on and off) and emphatically not Danger Zone —
+ * nothing here trades safety for autonomy, so hiding it behind that section's deliberate reveal would
+ * misrepresent it. `PrefsConfig` is the on-disk / API shape (optional); `HubPrefs` is the resolved
+ * runtime object index.ts fills defaults into and shares by reference.
+ */
+export interface PrefsConfig {
+  /** Which pool a new chat's name is drawn from. Absent → DEFAULT_CHAT_NAME_POOL. See title.ts. */
+  chatNamePool?: ChatNamePool
+}
+
+/** Resolved owner preferences (always present; index.ts fills defaults from PrefsConfig). */
+export interface HubPrefs {
+  chatNamePool: ChatNamePool
+}
+
+/**
  * Danger Zone toggles — SAFE DEFAULTS the owner can flip in Settings to trade safety for autonomy.
  * This is an MIT, self-hosted, single-owner tool, so guardrails are safe defaults + toggles, never
  * un-disable-able hard blocks: provenance, audit, and the kill-switch stay as VISIBILITY, and these
@@ -213,5 +233,6 @@ export interface HubConfig {
   mesh?: MeshConfig
   security?: SecurityConfig
   features?: FeaturesConfig
+  prefs?: PrefsConfig
   danger?: DangerConfig
 }

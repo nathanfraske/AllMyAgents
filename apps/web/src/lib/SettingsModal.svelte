@@ -1,7 +1,7 @@
 <script lang="ts">
   import { store } from './store.svelte'
   import { settings } from './settings.svelte'
-  import { api, type MeshStatus, type Instruction, type Practice, type DangerFlags } from './api'
+  import { api, type MeshStatus, type Instruction, type Practice, type DangerFlags, type HubPrefs } from './api'
   import ProviderLogo from './ProviderLogo.svelte'
   import Icon from './Icon.svelte'
   import { modelsFor } from './catalog'
@@ -41,6 +41,13 @@
     instrSaved = true
     setTimeout(() => (instrSaved = false), 1400)
   }
+
+  // Owner preferences. Hub-side, unlike the `settings` store below it in the same section: the hub names
+  // a chat from its session id as it creates it, so the pool has to be known where the generator runs.
+  let prefs = $state<HubPrefs>({ chatNamePool: 'everyone' })
+  $effect(() => {
+    void api.prefs().then((p) => (prefs = p))
+  })
 
   // Danger Zone — safe-default guardrail toggles + the agent-authored practices review list. Kept
   // collapsed behind an explicit reveal so it's never flipped by accident. Both toggles default OFF.
@@ -276,6 +283,13 @@
           {#each modelsFor('codex') as m (m.slug)}<option value={m.slug}>{m.name}</option>{/each}
         </select>
       </label>
+      <label class="opt row2">Name new chats after
+        <select value={prefs.chatNamePool} onchange={(e) => void api.setPrefs({ chatNamePool: (e.target as HTMLSelectElement).value as HubPrefs['chatNamePool'] }).then((p) => (prefs = p))}>
+          <option value="women">Women in computing and science</option>
+          <option value="everyone">Everyone</option>
+        </select>
+      </label>
+      <p class="hint dim">New chats get a scientist's surname (Hopper, Curie, Turing) drawn from the pool you pick here. Chats already named keep their names.</p>
       <label class="opt"><input type="checkbox" checked={settings.defaultUseWorktree} onchange={(e) => settings.set('defaultUseWorktree', (e.target as HTMLInputElement).checked)} /> New chats in a project use an isolated git worktree (off = work directly in the project folder)</label>
       <label class="opt"><input type="checkbox" checked={settings.autoSwitchToNewChat} onchange={(e) => settings.set('autoSwitchToNewChat', (e.target as HTMLInputElement).checked)} /> Switch to the new chat when you send its first message (off = stay on the chat you were viewing)</label>
       <label class="opt"><input type="checkbox" checked={settings.autoReopenLastChats} onchange={(e) => settings.set('autoReopenLastChats', (e.target as HTMLInputElement).checked)} /> Reopen the chats I had open when the app starts (off = show the home screen with a Reopen button)</label>

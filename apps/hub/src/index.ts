@@ -21,7 +21,8 @@ import { PracticeStore } from './practices.js'
 import { InProcessExecutor, type Executor } from './executor.js'
 import { WorkerExecutor } from './workerExecutor.js'
 import { WorkerClient } from './workerTransport.js'
-import type { DangerFlags, HubConfig } from './types.js'
+import { asChatNamePool } from './title.js'
+import type { DangerFlags, HubConfig, HubPrefs } from './types.js'
 import { RestartController, type RestartState } from './restartController.js'
 import { SCHEMA_VERSION, type SupervisorMsg } from './restartHandshake.js'
 
@@ -73,6 +74,11 @@ const danger: DangerFlags = {
   enableClaudeConnectors: config.danger?.enableClaudeConnectors === true,
   fullAccessAnyOrigin: config.danger?.fullAccessAnyOrigin === true,
 }
+// Owner preferences — resolved from config exactly like `danger` above, and shared by reference with the
+// SessionManager and the server for the same reason: POST /api/config/prefs mutates this object, so the
+// next chat is named from the newly chosen pool without a restart. asChatNamePool tolerates a hand-edited
+// config.json holding nonsense (or the removed men-only value) by falling back to the default.
+const prefs: HubPrefs = { chatNamePool: asChatNamePool(config.prefs?.chatNamePool) }
 // Apply the connector policy to managed claude profiles at boot (safe default OFF → connectors suppressed).
 // The SDK reads disableClaudeAiConnectors from each profile's settings.json, so this makes the flag
 // authoritative on startup; the Danger-Zone toggle re-applies it on a flip (server.ts). Never touches ~/.claude.
@@ -102,7 +108,7 @@ const executor: Executor = workerSocket
       attachWorker: () => sessions.attachWorker(),
     })
   : new InProcessExecutor({ approvals, usage, danger, memory, practices })
-sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, repoRoot, executor)
+sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, repoRoot, executor, prefs)
 usage.setCodexReader((profileId) => sessions.readCodexLimits(profileId))
 // Let full-access chats and "always allow" grants skip the operator prompt. Installed here because the
 // policy reads session records, and ApprovalService is constructed before the SessionManager exists.
@@ -210,7 +216,7 @@ const meshEnable = !(
 const mesh = new MeshSite({ port: publicPort, label: config.mesh?.label, enable: meshEnable })
 
 // Listen on the BOOT port (0 → ephemeral for a green); the server reports its actual port back.
-const server = startServer({ port: bootPort, defaultCwd: repoRoot, profilesDir, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken, agentToolSecret, restartState, executor, configPath })
+const server = startServer({ port: bootPort, defaultCwd: repoRoot, profilesDir, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, agentToolSecret, restartState, executor, configPath })
 
 // Register the mesh advert — factored so a promoted green can (re)register once it owns the port.
 function registerMesh(): void {

@@ -18,7 +18,7 @@ import { computeStats } from './stats.js'
 import { buildFleet, probeHubHealth } from './fleet.js'
 import { startLogin, awaitLogin, credentialsExist } from './loginLauncher.js'
 import { setClaudeConnectorPolicy } from './profiles.js'
-import type { DangerFlags, HubEvent, Profile, Provider } from './types.js'
+import type { DangerFlags, HubEvent, HubPrefs, Profile, Provider } from './types.js'
 import type { Executor } from './executor.js'
 import type { RestartState } from './restartController.js'
 import { SCHEMA_VERSION } from './restartHandshake.js'
@@ -232,6 +232,9 @@ export interface ServerOptions {
   practices: PracticeStore
   /** Live Danger Zone flags — the same object SessionManager reads; mutated + persisted on POST. */
   danger: DangerFlags
+  /** Live owner preferences — same shared-reference trick as `danger`, so a change applies to the next
+   *  chat without a restart. */
+  prefs: HubPrefs
   rescanProfiles: () => Profile[]
   mesh: MeshSite
   deviceToken: string
@@ -253,26 +256,26 @@ export interface ServerOptions {
 }
 
 /**
- * Merge the Danger Zone flags into the hub's config.json (preserving every other key) so a toggle
- * survives a restart.
+ * Merge a top-level block into the hub's config.json (preserving every other key) so a setting the
+ * operator changed survives a restart. Returns null on success, or the failure message.
  *
- * TAKES THE REAL CONFIG PATH, and this is the whole bug it exists to fix. This used to derive its own
- * path as `<repoRoot>/data/config.json` while index.ts READ from `<dataDir>/config.json`, where dataDir
- * is `HUB_DATA_DIR ?? <repoRoot>/data`. Those agree only when HUB_DATA_DIR is unset — i.e. in dev. The
- * installed desktop app always sets it, so every Danger Zone toggle was written to a file the hub never
- * reads (and, from an installed app, to a repo directory that may not exist or be writable at all — the
- * best-effort catch then swallowed that silently). The operator flipped a switch, the UI echoed it back
- * because the in-memory flag really had changed, and the setting was gone on the next restart.
+ * TAKES THE REAL CONFIG PATH, and this is the whole bug it exists to fix. Its caller used to derive its
+ * own path as `<repoRoot>/data/config.json` while index.ts READ from `<dataDir>/config.json`, where
+ * dataDir is `HUB_DATA_DIR ?? <repoRoot>/data`. Those agree only when HUB_DATA_DIR is unset — i.e. in
+ * dev. The installed desktop app always sets it, so every Danger Zone toggle was written to a file the
+ * hub never reads (and, from an installed app, to a repo directory that may not exist or be writable at
+ * all — the best-effort catch then swallowed that silently). The operator flipped a switch, the UI echoed
+ * it back because the in-memory flag really had changed, and the setting was gone on the next restart.
+ * Every settings block goes through this one function so a second setting cannot reintroduce that bug
+ * by hand-rolling its own read-merge-write.
  *
- * Persisting a subset had the same effect for one flag: `enableClaudeConnectors` was simply not written,
- * so it reverted on every restart even in dev. The spread now covers whatever DangerFlags holds, so a
- * new flag cannot be forgotten here — the failure mode was silent, and adding a field is the moment it
- * would recur.
+ * Assigns the block WHOLE rather than merging into the existing one: turning a flag off has to actually
+ * turn it off, and a deep merge would leave the stale `true` in place.
  *
- * Still best-effort — an unwritable config must not fail the request — but no longer silent: a failure
- * is journaled so a toggle that will not survive a restart is visible rather than merely disappointing.
+ * Best-effort by design — an unwritable config must never fail the operator's request — but it reports
+ * the failure rather than swallowing it, so the caller can journal it under its own kind.
  */
-export function persistDanger(configPath: string, danger: DangerFlags, journal: Journal): void {
+function patchConfig(configPath: string, key: string, block: unknown): string | null {
   try {
     let cfg: Record<string, unknown> = {}
     try {
@@ -280,19 +283,38 @@ export function persistDanger(configPath: string, danger: DangerFlags, journal: 
     } catch {
       /* no config yet — start fresh */
     }
-    cfg.danger = { ...danger }
+    cfg[key] = block
     fs.mkdirSync(path.dirname(configPath), { recursive: true })
     fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2))
+    return null
   } catch (err) {
-    journal.append(null, 'config/danger-persist-failed', {
-      path: configPath,
-      message: err instanceof Error ? err.message : String(err),
-    })
+    return err instanceof Error ? err.message : String(err)
   }
 }
 
+/**
+ * Persist the Danger Zone flags.
+ *
+ * Spreads the whole object rather than listing fields: `enableClaudeConnectors` was once simply left out
+ * of a hand-written list and so reverted on every restart, even in dev. Adding a flag is exactly the
+ * moment that silent failure would recur.
+ *
+ * The journal kind stays specific to this block — an operator reading the journal needs to know WHICH
+ * setting will not survive the next restart, not merely that some write failed.
+ */
+export function persistDanger(configPath: string, danger: DangerFlags, journal: Journal): void {
+  const err = patchConfig(configPath, 'danger', { ...danger })
+  if (err) journal.append(null, 'config/danger-persist-failed', { path: configPath, message: err })
+}
+
+/** Persist the owner preferences. Same path, same best-effort contract, its own journal kind. */
+export function persistPrefs(configPath: string, prefs: HubPrefs, journal: Journal): void {
+  const err = patchConfig(configPath, 'prefs', { ...prefs })
+  if (err) journal.append(null, 'config/prefs-persist-failed', { path: configPath, message: err })
+}
+
 export function startServer(opts: ServerOptions): http.Server {
-  const { port, defaultCwd, profilesDir, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, rescanProfiles, mesh, deviceToken, requireToken, agentToolSecret, restartState, executor, configPath } = opts
+  const { port, defaultCwd, profilesDir, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, agentToolSecret, restartState, executor, configPath } = opts
 
   const server = http.createServer((req, res) => {
     void handle(req, res)
@@ -530,6 +552,26 @@ export function startServer(opts: ServerOptions): http.Server {
         // Journal the revoke (append-only audit) even though the row is hard-deleted.
         journal.append(null, 'practice/revoked', { id: pid, scope: existing?.scope ?? null, title: existing?.title ?? null })
         json(res, { ok: !!existing }, existing ? 200 : 404)
+        return
+      }
+      // Owner preferences — ordinary settings with no safety dimension (currently just which pool new
+      // chats are named from), so they get their own route rather than riding on /api/config/danger:
+      // putting a cosmetic choice behind the Danger Zone's deliberate reveal would misrepresent both.
+      // Same shape as the danger routes otherwise — POST mutates the shared object in place, so the next
+      // chat is named from the new pool without a restart, then persists it to the hub's real config.
+      if (method === 'GET' && url.pathname === '/api/config/prefs') {
+        json(res, { ...prefs })
+        return
+      }
+      if (method === 'POST' && url.pathname === '/api/config/prefs') {
+        const body = await readBody(req)
+        // Same shape check the danger route does on its booleans: a value the generator does not
+        // understand is IGNORED, not coerced. Coercing would let a malformed or version-skewed request
+        // quietly reset a pool the owner did choose, back through the default, to 'everyone'.
+        if (body.chatNamePool === 'women' || body.chatNamePool === 'everyone') prefs.chatNamePool = body.chatNamePool
+        persistPrefs(configPath, prefs, journal)
+        journal.append(null, 'config/prefs', { ...prefs })
+        json(res, { ...prefs })
         return
       }
       // Danger Zone toggles — safe-default guardrail switches the owner can flip (this is an MIT,

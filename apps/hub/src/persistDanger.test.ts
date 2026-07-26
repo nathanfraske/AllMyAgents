@@ -2,7 +2,7 @@ import { describe, expect, it, afterEach } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { persistDanger } from './server.js'
+import { persistDanger, persistPrefs } from './server.js'
 import { Journal } from './journal.js'
 import type { DangerFlags } from './types.js'
 
@@ -144,5 +144,31 @@ describe('persistDanger', () => {
     expect(() => persistDanger(configPath, ALL_ON, journal)).not.toThrow()
     const added = journal.since(0).slice(before)
     expect(added.map((e) => e.kind)).toContain('config/danger-persist-failed')
+  })
+})
+
+/**
+ * The owner preferences ride the same writer, so they inherit both fixes above — and introduce one new
+ * way to break: two settings blocks sharing one read-merge-write can clobber each other.
+ */
+describe('persistPrefs', () => {
+  it('writes to the config path it is given, under its own key', () => {
+    const dir = tmp()
+    const configPath = path.join(dir, 'elsewhere', 'config.json')
+    persistPrefs(configPath, { chatNamePool: 'women' }, journalIn(dir))
+    const cfg = JSON.parse(fs.readFileSync(configPath, 'utf8')) as { prefs?: Record<string, unknown> }
+    expect(cfg.prefs).toEqual({ chatNamePool: 'women' }) // how index.ts reads it back at boot
+    expect(fs.existsSync(path.join(dir, 'data', 'config.json'))).toBe(false)
+  })
+
+  it('leaves the danger block alone, and survives it being written afterwards', () => {
+    const dir = tmp()
+    const configPath = path.join(dir, 'config.json')
+    persistDanger(configPath, ALL_ON, journalIn(dir))
+    persistPrefs(configPath, { chatNamePool: 'women' }, journalIn(dir))
+    persistDanger(configPath, ALL_ON, journalIn(dir))
+    const cfg = JSON.parse(fs.readFileSync(configPath, 'utf8')) as Record<string, unknown>
+    expect(cfg.prefs).toEqual({ chatNamePool: 'women' })
+    expect(cfg.danger).toEqual(ALL_ON)
   })
 })

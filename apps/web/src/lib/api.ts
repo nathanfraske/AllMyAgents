@@ -291,6 +291,20 @@ export interface Practice {
   updatedAt: string
 }
 
+/** Which pool new chats are named from. Two choices by design — there is no men-only option. */
+export type ChatNamePool = 'women' | 'everyone'
+
+/**
+ * Owner preferences — plain settings with no safety dimension, so they live outside the Danger Zone.
+ *
+ * Hub-side rather than in the local `settings` store because the HUB generates a chat's name, from its
+ * session id, at the moment the chat is created. A browser-local copy could not be read there, and two
+ * devices disagreeing about the pool would produce chats named from whichever one happened to spawn them.
+ */
+export interface HubPrefs {
+  chatNamePool: ChatNamePool
+}
+
 // Danger Zone toggles — safe-default guardrail switches (all default false / OFF).
 export interface DangerFlags {
   busCanUseRiskyTools: boolean
@@ -401,6 +415,9 @@ export const api = {
   // Agent-authored practices — operator review + revoke (writes come from agents via gated tools).
   practices: () => jget<Practice[]>('/api/practices'),
   revokePractice: (id: string) => jpost<{ ok?: boolean; error?: string }>(`/api/practices/${id}/revoke`),
+  // Owner preferences (hub-side settings that are not safety switches).
+  prefs: () => jget<HubPrefs>('/api/config/prefs'),
+  setPrefs: (patch: Partial<HubPrefs>) => jpost<HubPrefs>('/api/config/prefs', patch),
   // Danger Zone toggles.
   danger: () => jget<DangerFlags>('/api/config/danger'),
   setDanger: (patch: Partial<DangerFlags>) => jpost<DangerFlags>('/api/config/danger', patch),
