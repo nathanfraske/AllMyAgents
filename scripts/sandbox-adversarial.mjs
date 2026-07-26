@@ -38,9 +38,17 @@ function bad(name, detail) {
   failures.push(`${name} — ${detail}`)
   console.log(`  \x1b[31mFAIL\x1b[0m ${name}  ${detail}`)
 }
-/** Assert a MUST-NOT: `condition` true means the system held the line. */
-function must(name, condition, detail = '') {
-  condition ? ok(name, detail) : bad(name, detail || 'expected the system to refuse this')
+/**
+ * Assert a MUST-NOT: `condition` true means the system held the line.
+ *
+ * `whyItFailed` is printed ONLY on failure. It used to print on both, which produced lines like
+ * "PASS hub BOOTS with the poisoned row still on disk  did not come back within 30s" — a passing
+ * assertion carrying its own failure message. Nothing was actually wrong, which is the problem: output
+ * that contradicts itself on the happy path is output you stop reading, and then a real failure scrolls
+ * past unnoticed.
+ */
+function must(name, condition, whyItFailed = '') {
+  condition ? ok(name) : bad(name, whyItFailed || 'expected the system to refuse this')
 }
 
 async function api(method, pathname, body) {
@@ -207,12 +215,94 @@ async function groupMalformed() {
   must('hub is still alive after every malformed request', health.status === 200)
 }
 
+// ---------------------------------------------------------------------------------------------
+// THE BRICK, re-proved on a running hub.
+//
+// A redaction bug once wrote a payload containing an invalid escape. `since()` parsed payloads with an
+// unguarded JSON.parse, so every WebSocket replay that crossed that row threw, and the app crash-looped
+// on startup until the row was repaired by hand — 323,594 events held hostage by one of them. The write
+// side is fixed and there is a unit test for the parse guard, but a durable store outlives the bug that
+// wrote into it: the property that matters is that a hub SERVING a poisoned journal stays up.
+//
+// So this writes a genuinely unparseable payload straight into the sandbox DB, behind the hub's back,
+// and then asks the hub to replay across it.
+// ---------------------------------------------------------------------------------------------
+async function groupPoisonedJournal() {
+  console.log('\n\x1b[1mPoisoned journal row — must degrade, not crash-loop\x1b[0m')
+  const { createRequire } = await import('node:module')
+  const require = createRequire(path.resolve('apps/hub/package.json'))
+  let Database
+  try {
+    Database = require('better-sqlite3')
+  } catch (e) {
+    bad('load better-sqlite3', e.message)
+    return
+  }
+
+  const dbPath = path.resolve('.sandbox/data/hub.db')
+  const db = new Database(dbPath)
+  let seq
+  try {
+    // Exactly the shape that bricked it: a lone backslash orphaned by a naive redaction, which is
+    // invalid JSON rather than merely surprising JSON.
+    const info = db
+      .prepare("INSERT INTO events (ts, session, kind, payload) VALUES (?, ?, ?, ?)")
+      .run(new Date().toISOString(), null, 'adversarial/poison', '{"secret":"abc\\')
+    seq = Number(info.lastInsertRowid)
+    ok(`injected an unparseable payload at seq ${seq}`)
+  } finally {
+    db.close()
+  }
+
+  // The hub must still be serving, and a replay that CROSSES the poisoned row must come back.
+  const health = await api('GET', '/api/health')
+  must('hub is still up with a poisoned row in its journal', health.status === 200)
+
+  const replay = await api('GET', `/api/events?since=${seq - 3}`)
+  must('a replay crossing the poisoned row still responds', replay.status === 200, `status ${replay.status}`)
+
+  const events = Array.isArray(replay.json) ? replay.json : (replay.json.events ?? [])
+  if (Array.isArray(events) && events.length) {
+    const poisoned = events.find((e) => e.seq === seq)
+    must('the poisoned row is RETURNED, not silently skipped', poisoned !== undefined)
+    if (poisoned) {
+      must(
+        'it is marked unreadable rather than passed off as data',
+        poisoned.payload?.__unreadable === true,
+        JSON.stringify(poisoned.payload).slice(0, 120)
+      )
+    }
+    // Contiguity is the point of not skipping: a gap in seq is how a client silently loses events.
+    const seqs = events.map((e) => e.seq)
+    must('sequence numbers stay contiguous across it', seqs.includes(seq))
+  } else {
+    bad('replay returned events', `got ${JSON.stringify(replay.json).slice(0, 160)}`)
+  }
+
+  // And it must survive a RESTART with the poison still on disk — the original brick was a crash LOOP
+  // at startup, which a still-running process would not have shown.
+  const { execSync } = await import('node:child_process')
+  execSync('node scripts/sandbox.mjs down', { stdio: 'ignore' })
+  execSync('node scripts/sandbox.mjs up', { stdio: 'ignore' })
+  let booted = false
+  for (let i = 0; i < 30; i++) {
+    await sleep(1000)
+    const h = await fetch(`${BASE}/api/health`).then((r) => r.ok).catch(() => false)
+    if (h) {
+      booted = true
+      break
+    }
+  }
+  must('hub BOOTS with the poisoned row still on disk', booted, 'did not come back within 30s')
+}
+
 const GROUPS = {
   danger: groupDanger,
   config: groupCorruptConfig,
   race: groupRace,
   prefs: groupPrefs,
   malformed: groupMalformed,
+  poison: groupPoisonedJournal,
 }
 
 const only = process.argv[2]
