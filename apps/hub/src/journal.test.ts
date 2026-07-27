@@ -43,3 +43,78 @@ describe('journal wseq — Phase 2 additions', () => {
     j2.db.close()
   })
 })
+
+describe('journal payload bulk defense', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-jrnl-payload-'))
+  afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }))
+
+  it('keeps attachment metadata and a visible marker but never persists caller-supplied base64 bytes', () => {
+    const j = new Journal(path.join(tmp, 'attachment-bytes.db'))
+    try {
+      const bytes = Buffer.alloc(128 * 1024, 0xab)
+      const base64 = bytes.toString('base64')
+      const event = j.append('s', 'session/input', {
+        text: 'Inspect this image.',
+        attachments: [
+          {
+            id: 'att-1',
+            name: 'screenshot.png',
+            mime: 'image/png',
+            size: bytes.length,
+            path: 'attachments/att-1/screenshot.png',
+            base64,
+            bytes,
+          },
+        ],
+      })
+
+      const stored = j.db.prepare('SELECT payload FROM events WHERE seq = ?').get(event.seq) as {
+        payload: string
+      }
+      expect(stored.payload).not.toContain(base64.slice(0, 1024))
+      expect(() => JSON.parse(stored.payload)).not.toThrow()
+      expect(event.payload).toEqual({
+        text: 'Inspect this image.',
+        attachments: [
+          {
+            id: 'att-1',
+            name: 'screenshot.png',
+            mime: 'image/png',
+            size: bytes.length,
+            path: 'attachments/att-1/screenshot.png',
+            __allmyagentsJournalTruncated: {
+              reason: 'attachment-metadata-only',
+              omittedFields: ['base64', 'bytes'],
+            },
+          },
+        ],
+      })
+      expect(j.since(0)[0]?.payload).toEqual(event.payload)
+    } finally {
+      j.db.close()
+    }
+  })
+
+  it('leaves ordinary large textual transcript fields byte-for-byte intact', () => {
+    const j = new Journal(path.join(tmp, 'large-text.db'))
+    try {
+      const output = 'ordinary textual command output: build step completed successfully\n'.repeat(16_384)
+      const event = j.append('s', 'codex/item/completed', {
+        threadId: 'thread',
+        turnId: 'turn',
+        item: { id: 'command', type: 'commandExecution', aggregatedOutput: output },
+      })
+
+      const stored = j.db.prepare('SELECT payload FROM events WHERE seq = ?').get(event.seq) as {
+        payload: string
+      }
+      expect((JSON.parse(stored.payload) as { item: { aggregatedOutput: string } }).item.aggregatedOutput).toBe(
+        output
+      )
+      expect((event.payload as { item: { aggregatedOutput: string } }).item.aggregatedOutput).toBe(output)
+      expect(stored.payload).not.toContain('__allmyagentsJournalTruncated')
+    } finally {
+      j.db.close()
+    }
+  })
+})

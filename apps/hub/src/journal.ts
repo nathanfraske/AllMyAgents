@@ -7,6 +7,7 @@ import {
   reserveReplicationPruneGate,
   type ReplicationPruneGate,
 } from './journalReplication.js'
+import { sanitizeJournalPayload } from './journalPayload.js'
 import { redactedJson } from './redact.js'
 import type { ApprovalStatus, HubEvent } from './types.js'
 
@@ -212,7 +213,7 @@ export class Journal extends EventEmitter {
 
   append(sessionId: string | null, kind: string, payload: unknown): HubEvent {
     const ts = new Date().toISOString()
-    const clean = redactedJson(payload)
+    const clean = redactedJson(sanitizeJournalPayload(payload))
     const info = this.insertStmt.run(ts, sessionId, kind, clean)
     const event: HubEvent = {
       seq: Number(info.lastInsertRowid),
@@ -232,7 +233,7 @@ export class Journal extends EventEmitter {
    */
   appendWorker(sessionId: string, kind: string, payload: unknown, wseq: number): HubEvent {
     const ts = new Date().toISOString()
-    const clean = redactedJson(payload)
+    const clean = redactedJson(sanitizeJournalPayload(payload))
     const info = this.insertWorkerStmt.run(ts, sessionId, kind, clean, wseq)
     const event: HubEvent = { seq: Number(info.lastInsertRowid), ts, sessionId, kind, payload: JSON.parse(clean) as unknown }
     this.emit('event', event)
