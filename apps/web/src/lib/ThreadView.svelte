@@ -263,11 +263,21 @@
   const st = $derived(view ? store.status(view) : { key: 'idle', label: '' })
   const approvals = $derived(view ? store.approvals.filter((a) => a.sessionId === view.record.id) : [])
   const queue = $derived(sid ? store.queueFor(sid) : [])
-  const workingContext = $derived(
-    view
+  const workingContext = $derived.by(() => {
+    const resolved = view
       ? resolveWorkingContext(view.record, store.projects)
       : { projectName: 'Unfiled', workingDirectory: 'Working directory not set' }
-  )
+    // An Unfiled draft does not have a session id yet, so the hub cannot name its eventual private
+    // workspace. "Working directory not set" read like a broken setting and the guide repeated it.
+    // State the timing honestly until materialization returns the concrete cwd.
+    return isDraft && resolved.workingDirectory === 'Working directory not set'
+      ? { ...resolved, workingDirectory: 'Assigned when this chat starts' }
+      : resolved
+  })
+  // First-run means the hub has no materialized chats yet. The current draft is intentionally excluded
+  // by sessionList; as soon as the user starts one real chat, every later draft gets the normal empty
+  // state instead of permanent onboarding furniture.
+  const showFirstChatGuide = $derived(isDraft && store.sessionList.length === 0)
   // Keep the identifying end before CSS has to squeeze it further. Split panes get a tighter character
   // budget; the path span also uses start-side ellipsis as a final guard for exceptionally narrow panes.
   const shownWorkingDirectory = $derived(
@@ -848,13 +858,15 @@
       {/if}
     {/each}
     {#if view.items.length === 0 && !thinking}
-      {#if isDraft}
+      {#if showFirstChatGuide}
         <FirstChatGuide
           provider={view.record.provider}
           projectName={workingContext.projectName}
           workingDirectory={workingContext.workingDirectory}
           permissionMode={draftMode}
         />
+      {:else if isDraft}
+        <div class="dim pad">describe a task below to start this chat</div>
       {:else}
         <div class="dim pad">no activity yet — send a message below</div>
       {/if}
