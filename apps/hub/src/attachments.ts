@@ -275,7 +275,9 @@ export async function prepareAttachment(
 
 function verifiedSiblingFile(attachment: AttachmentMeta, suffix: string): string {
   if (!ATTACHMENT_ID.test(attachment.id)) throw new Error(`invalid attachment id: ${attachment.id}`)
-  const root = path.resolve(path.dirname(attachment.path))
+  // macOS commonly exposes the same temp directory through `/var` and `/private/var`. Compare canonical
+  // paths so that alias is not mistaken for an escape while a real sidecar symlink still fails containment.
+  const root = fs.realpathSync(path.dirname(attachment.path))
   const candidate = path.resolve(root, `${attachment.id}${suffix}`)
   if (!isInside(root, candidate) || !fs.existsSync(candidate)) {
     throw new Error(`attachment delivery file is unavailable: ${attachment.name}`)
