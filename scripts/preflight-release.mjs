@@ -41,13 +41,20 @@ function run(cmd, opts = {}) {
   return execSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, ...opts })
 }
 
+// Vitest colours its summary, so the line is really:
+//   "Tests \x1b[22m \x1b[1m\x1b[32m462 passed\x1b[39m"
+// Matching that with a pattern written against the plain text silently fails and reports a passing suite as
+// broken — which this script did on its first real run. Strip the escapes before matching rather than
+// trying to write a regex that tolerates them.
+const stripAnsi = (s) => s.replace(/\[[0-9;]*m/g, '')
+
 /** Assert a command's OUTPUT matches, not merely that it exited 0. */
 function expectOutput(cmd, re, label) {
   let out = ''
   try {
-    out = run(cmd)
+    out = stripAnsi(run(cmd))
   } catch (err) {
-    out = `${err.stdout ?? ''}${err.stderr ?? ''}`
+    out = stripAnsi(`${err.stdout ?? ''}${err.stderr ?? ''}`)
     throw new Error(`command failed: ${cmd}\n${out.slice(-800)}`)
   }
   const m = out.match(re)
@@ -97,10 +104,20 @@ check('no unresolved merge markers', () => {
   }
 })
 
-check('working tree is committed', () => {
+check('no uncommitted changes to tracked files', () => {
+  // Untracked files are NOT a release problem: nothing untracked reaches the payload, and this repo
+  // legitimately carries local-only files (agent instruction files, scratch dirs). Failing on them made the
+  // check cry wolf on its first run, and a preflight that is routinely red gets ignored — which is the
+  // failure mode it exists to prevent. Modified TRACKED files are the real risk: they mean the thing tested
+  // is not the thing tagged.
   const out = run('git status --porcelain')
-  if (out.trim()) throw new Error(`uncommitted changes:\n${out.trim().split('\n').slice(0, 8).join('\n')}`)
-  return 'clean'
+  const lines = out.split('\n').filter(Boolean)
+  const modified = lines.filter((l) => !l.startsWith('??'))
+  const untracked = lines.filter((l) => l.startsWith('??'))
+  if (modified.length) {
+    throw new Error(`tracked files modified but not committed — the tag would not match what was tested:\n${modified.slice(0, 8).join('\n')}`)
+  }
+  return untracked.length ? `clean (${untracked.length} untracked, ignored)` : 'clean'
 })
 
 check('nothing unpushed', () => {
@@ -111,18 +128,20 @@ check('nothing unpushed', () => {
 
 console.log('\nDependencies')
 check('every declared hub dependency is installed', () => {
+  // Checked by presence in apps/hub/node_modules, not by require.resolve with a `paths` option. pnpm links
+  // each dependency into the workspace's node_modules and the real files live in the .pnpm store, so a
+  // resolve rooted at a RELATIVE path reports every package missing — this check did exactly that on its
+  // first run and claimed three installed packages were absent while the suite that imports them passed.
+  //
+  // This is not academic: the same class of staleness is real here, because `hub:bundle` prunes
+  // apps/hub/node_modules while staging the payload. Running the bundle and then the tests genuinely does
+  // leave the tree unable to start — that is how a broken suite looked green earlier. So the check must be
+  // right, and it must run BEFORE packaging (it does).
   const pkg = JSON.parse(fs.readFileSync('apps/hub/package.json', 'utf8'))
   const deps = Object.keys(pkg.dependencies ?? {})
-  const missing = deps.filter((d) => {
-    try {
-      run(`node -e "require.resolve('${d}/package.json',{paths:['apps/hub']})"`)
-      return false
-    } catch {
-      return true
-    }
-  })
+  const missing = deps.filter((d) => !fs.existsSync(`apps/hub/node_modules/${d}`))
   if (missing.length) throw new Error(`declared but not installed: ${missing.join(', ')} — run pnpm install`)
-  return `${deps.length} resolved`
+  return `${deps.length} present`
 })
 
 check('shipped npm lockfile covers the runtime deps', () => {
@@ -134,14 +153,22 @@ check('shipped npm lockfile covers the runtime deps', () => {
 })
 
 console.log('\nTests and types (asserting on counts, not exit codes)')
-check('hub tests', () => {
-  const m = expectOutput('pnpm --filter hub test 2>&1', /Tests\s+(?:\S+)?(\d+) passed/, 'hub tests')
-  return `${m[1]} passed`
-})
-check('web tests', () => {
-  const m = expectOutput('pnpm --filter web test 2>&1', /Tests\s+(?:\S+)?(\d+) passed/, 'web tests')
-  return `${m[1]} passed`
-})
+// Vitest's summary is either "Tests  462 passed (462)" or "Tests  4 failed | 353 passed (357)".
+// Both counts are captured deliberately: a pattern that only looks for "N passed" reports a partially
+// failing suite as green. An earlier version here also wrapped the count in an optional `(?:\S+)?`, which
+// backtracked into the number itself and turned "462 passed" into "2 passed" — a check whose output nobody
+// reads closely is barely better than no check, so the count it prints has to be trustworthy.
+const VITEST_SUMMARY = /Tests\s+(?:(\d+) failed\s*\|\s*)?(\d+) passed/
+
+function vitest(cmd, label) {
+  const m = expectOutput(cmd, VITEST_SUMMARY, label)
+  const failedCount = Number(m[1] ?? 0)
+  if (failedCount > 0) throw new Error(`${failedCount} test(s) failing`)
+  return `${m[2]} passed`
+}
+
+check('hub tests', () => vitest('pnpm --filter hub test 2>&1', 'hub tests'))
+check('web tests', () => vitest('pnpm --filter web test 2>&1', 'web tests'))
 check('hub typecheck', () => {
   expectOutput('pnpm --filter hub typecheck 2>&1', /tsc --noEmit/, 'hub typecheck')
   return 'clean'
