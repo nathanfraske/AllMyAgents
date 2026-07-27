@@ -207,12 +207,23 @@ const CMDS = {
     // the caller then waits for a reply to a question nobody was ever asked.
     //
     // So wait for the agent to actually be free, then send.
-    if (s.status === 'active' || s.status === 'starting') {
-      process.stderr.write(`  ${s.title ?? s.id.slice(0, 8)} is mid-turn — waiting for it to finish before sending…\n`)
-      await waitIdle(s.id, { quiet: true })
-    }
-
+    // TRY FIRST, WAIT ONLY IF REFUSED. A hub with mid-turn steering (61ac57e) accepts input during a
+    // live turn and delivers it at the next tool boundary; an older one rejects with "a turn is already
+    // in progress". Checking the status and pre-emptively waiting made this tool permanently unable to
+    // steer even after the hub gained the ability — the operator's own hub is currently 7.5 hours older
+    // than the feature, and this would have kept waiting long after it restarted.
+    //
+    // So attempt the send regardless and let the HUB decide. On a steering hub the correction lands
+    // while the agent can still act on it; on an older one we fall back to exactly the previous
+    // behaviour. No version check, and it upgrades itself the moment the hub does.
     let res = await api('POST', `/api/sessions/${s.id}/input`, { text: body })
+    if (/turn is already in progress/i.test(res?.error ?? '')) {
+      process.stderr.write(`  ${s.title ?? s.id.slice(0, 8)} is mid-turn and this hub cannot steer — waiting for it to finish…\n`)
+      await waitIdle(s.id, { quiet: true })
+      res = await api('POST', `/api/sessions/${s.id}/input`, { text: body })
+    } else if (s.status === 'active' || s.status === 'starting') {
+      process.stderr.write(`  steered ${s.title ?? s.id.slice(0, 8)} mid-turn\n`)
+    }
     // Lost the race: it started another turn between our idle check and our POST. Wait it out and retry
     // rather than failing, since the whole point of this path is an unattended hand-off.
     for (let attempt = 0; attempt < 20 && /turn is already in progress/i.test(res?.error ?? ''); attempt++) {
