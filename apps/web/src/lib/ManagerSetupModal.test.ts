@@ -187,12 +187,18 @@ describe('Manager setup', () => {
     expect(prompt).toMatch(/send_message.*direct.*broadcast/is)
     expect(prompt).toMatch(/practice.*memory/is)
     expect(prompt).toMatch(/native.*spawn_agent.*not.*AllMyAgents/is)
+    expect(prompt).toMatch(/mcp__allmyagents(?:__|\.)spawn_agent/i)
+    expect(prompt).toMatch(/never.*collaboration\.spawn_agent/is)
     expect(prompt).toMatch(/cannot grant.*does not hold/i)
     expect(prompt).toMatch(/profile_id.*codex-a/i)
     expect(prompt).toMatch(/stalls.*blocks.*errors/is)
     expect(prompt).toMatch(/verify.*transcript.*worktree/is)
     expect(prompt).toMatch(/state.*exact granted tools.*redirect.*granted alternative/is)
     expect(prompt).toMatch(/final status.*files.*commits/is)
+
+    const standing = (getByLabelText(/standing manager rules/i) as HTMLTextAreaElement).value
+    expect(standing).toMatch(/mcp__allmyagents(?:__|\.)spawn_agent/i)
+    expect(standing).toMatch(/never.*collaboration\.spawn_agent/is)
   })
 
   it('offers Lane O project creation inline and returns a deferred embedded launch config', async () => {
