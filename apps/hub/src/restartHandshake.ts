@@ -27,6 +27,21 @@ export type HubMsg =
   | { type: 'released' } //      drain done: listener closed, port free
   | { type: 'promoted' } //      now listening on the fixed port
   | { type: 'promote-failed'; error: string } // could not bind the fixed port (EADDRINUSE) → supervisor rolls back
+  /**
+   * Preflight refused to boot: a positively-detected fatal condition (a corrupt database, a data
+   * directory that cannot be written, a schema written by a NEWER hub), found before the hub commits to
+   * starting. See preflight.ts.
+   *
+   * The point is that this is NOT a crash, and the supervisor must be able to tell the difference. A
+   * crash is worth retrying — the cause may be transient, or an agent may repair it on disk while the
+   * supervisor waits. A preflight refusal is deterministic by construction: retrying identically will
+   * fail identically until a human or an agent changes something. Both still retry (never give up is the
+   * whole point), but only this one can say WHAT is wrong and WHAT would fix it, instead of surfacing a
+   * stack trace to someone staring at a window that will not load.
+   *
+   * `recovery` is operator-facing guidance, not a log line — it is the sentence the desktop shell shows.
+   */
+  | { type: 'preflight-failed'; code: string; message: string; recovery: string }
   | { type: 'restart-request'; reason: string; bySession?: string } // hub asks the supervisor to flip
 
 export function sendToHub(child: ChildProcess, msg: SupervisorMsg): void {
@@ -54,6 +69,14 @@ export function waitForHubMsg<T extends HubMsg['type']>(
       } else if (m && typeof m === 'object' && m.type === 'promote-failed' && type === 'promoted') {
         cleanup()
         reject(new Error(`promote failed: ${(m as { error?: string }).error ?? 'unknown'}`))
+      } else if (m && typeof m === 'object' && m.type === 'preflight-failed') {
+        // Preflight found a positively-fatal condition and refused to boot. Without this the child simply
+        // exits and the caller reports "hub exited while waiting for 'ready'" — true, useless, and the
+        // exact log line the operator saw while a corrupt database sat undiagnosed. The hub already knows
+        // both what is wrong and what would fix it; carry that instead of throwing it away.
+        cleanup()
+        const p = m as { code?: string; message?: string; recovery?: string }
+        reject(new Error(`preflight refused to boot [${p.code ?? 'unknown'}]: ${p.message ?? ''} — ${p.recovery ?? ''}`))
       }
     }
     const onExit = (): void => {
