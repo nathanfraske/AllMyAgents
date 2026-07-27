@@ -221,29 +221,67 @@
     stick = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 60
   }
 
+  // --- Per-control action errors ----------------------------------------------------------------
+  // A hub write that fails must say so AT ITS CONTROL, not as a global toast a reader learns to ignore —
+  // a model pill that didn't persist is a different problem from a stop that didn't take. One keyed map
+  // (not five ad-hoc strings that drift): 'settings' renders under the model/effort/tier pills, 'session'
+  // under the interrupt/stop/reopen buttons. `runAction` runs the write and — because jpost resolves a
+  // non-2xx as {error} rather than throwing — records `${label} failed: …` when it did not take, else
+  // clears the slot. Returns whether it took, so an optimistic caller can roll back.
+  let actionErr = $state<Record<string, string>>({})
+  async function runAction(key: string, label: string, fn: () => Promise<unknown>): Promise<boolean> {
+    const out = (await fn()) as { error?: string } | null | undefined
+    actionErr = { ...actionErr, [key]: out?.error ? `${label} failed: ${out.error}` : '' }
+    return !out?.error
+  }
+  // Stale errors belong to the chat that produced them — drop them when the pane points elsewhere.
+  $effect(() => {
+    sid // track
+    actionErr = {}
+  })
+
   // Model / thinking-effort / tier picks WRITE THROUGH to the hub immediately for a real session, so the
   // choice belongs to the record and survives switching panes, reloading, and a hub restart (it used to
   // live in this component's state and silently reverted). Optimistic locally, then confirmed by the
   // hub's `session/settings` event. A draft has no hub session yet, so its picks stay on the draft record.
-  function setModel(slug: string): void {
-    if (!sid || !view) return
-    if (view.draft) {
-      store.updateDraft(sid, { model: slug || undefined }) // draft picks live on the record
-      return
+  //
+  // On a FAILED write we roll the pill BACK to the previous value rather than leave it showing a pick the
+  // hub never persisted: the record is the source of truth the next turn is built from, so a pill that
+  // disagrees with the hub is the UI being confidently wrong — the same silent divergence we've been
+  // killing all day. Reverting keeps pill and hub in agreement (the change simply didn't happen).
+  async function setModel(slug: string): Promise<boolean> {
+    const v = view
+    const s = sid
+    if (!s || !v) return false
+    if (v.draft) {
+      store.updateDraft(s, { model: slug || undefined }) // draft picks live on the record
+      return true
     }
-    view.record.model = slug || undefined
-    void api.setSettings(sid, { model: slug })
+    const prev = v.record.model
+    v.record.model = slug || undefined // optimistic
+    const ok = await runAction('settings', 'model change', () => api.setSettings(s, { model: slug }))
+    if (!ok) v.record.model = prev
+    return ok
   }
-  function setOption(id: string, value: string): void {
-    if (!sid || !view) return
-    if (view.draft) {
-      if (id === 'effort') store.updateDraft(sid, { effort: value || undefined })
-      else if (id === 'serviceTier') store.updateDraft(sid, { serviceTier: value || undefined })
+  async function setOption(id: string, value: string): Promise<void> {
+    const v = view
+    const s = sid
+    if (!s || !v) return
+    if (v.draft) {
+      if (id === 'effort') store.updateDraft(s, { effort: value || undefined })
+      else if (id === 'serviceTier') store.updateDraft(s, { serviceTier: value || undefined })
       return
     }
-    if (id === 'effort') view.record.effort = value || undefined
-    else if (id === 'serviceTier') view.record.serviceTier = value || undefined
-    void api.setSettings(sid, { [id]: value })
+    const prevEffort = v.record.effort
+    const prevTier = v.record.serviceTier
+    if (id === 'effort') v.record.effort = value || undefined
+    else if (id === 'serviceTier') v.record.serviceTier = value || undefined
+    const label = id === 'effort' ? 'thinking effort change' : 'service tier change'
+    const ok = await runAction('settings', label, () => api.setSettings(s, { [id]: value }))
+    if (!ok) {
+      v.record.effort = prevEffort
+      v.record.serviceTier = prevTier
+    }
   }
 
   // Accept the highlighted picker row. `runIfComplete` (Enter/click) runs a no-arg command straight
@@ -286,16 +324,26 @@
   async function runSlash(res: SlashResult, sid0: string): Promise<void> {
     if (!view) return
     switch (res.kind) {
-      case 'model':
-        setModel(res.model) // same write-through the pill uses (draft → record, real → hub)
-        store.pushLocalNote(sid0, `model → ${res.label} · applies to your next message`)
+      case 'model': {
+        const ok = await setModel(res.model) // same write-through the pill uses (draft → record, real → hub)
+        // A slash command's feedback lives in the transcript. Only claim it applied if the write took.
+        store.pushLocalNote(
+          sid0,
+          ok
+            ? `model → ${res.label} · applies to your next message`
+            : `⚠ model change didn't save — kept ${view.record.model ?? 'the previous model'}`
+        )
         break
+      }
       case 'mode':
         if (view.draft) {
           store.updateDraft(sid0, { permissionMode: res.mode })
           store.pushLocalNote(sid0, `permission mode → ${res.mode}`)
         } else {
-          await api.setMode(sid0, res.mode) // hub journals session/mode → renders its own note
+          // On success the hub journals session/mode and renders its own note; on failure say so in the
+          // transcript (where the /mode command was) rather than letting a failed change look applied.
+          const out = (await api.setMode(sid0, res.mode)) as { error?: string }
+          if (out?.error) store.pushLocalNote(sid0, `⚠ permission mode change failed: ${out.error}`)
         }
         break
       case 'usage':
@@ -381,8 +429,19 @@
     }
   }
 
+  // The three session-lifecycle buttons. Each reports a failure at the footer ('session' slot) instead of
+  // doing nothing silently — a button that appears dead is how an operator learns to distrust the controls.
   async function stop(): Promise<void> {
-    if (view) await api.interrupt(view.record.id)
+    const id = view?.record.id
+    if (id) await runAction('session', 'interrupt', () => api.interrupt(id))
+  }
+  async function stopSession(): Promise<void> {
+    const id = view?.record.id
+    if (id) await runAction('session', 'stop', () => api.stop(id))
+  }
+  async function reopenSession(): Promise<void> {
+    const id = view?.record.id
+    if (id) await runAction('session', 'reopen', () => api.reopen(id))
   }
 
   // Per-approval decision error (keyed by approval id so it renders on the right card). Cleared on the
@@ -638,14 +697,23 @@
         <span class="spacer"></span>
         {#if !isDraft}
           {#if stopped}
-            <button class="foot-act" onclick={() => api.reopen(view.record.id)} title="reopen this stopped chat so you can use it again">reopen</button>
+            <button class="foot-act" onclick={reopenSession} title="reopen this stopped chat so you can use it again">reopen</button>
           {:else}
             <button class="foot-act" onclick={stop} disabled={!active} title="interrupt current turn">interrupt</button>
-            <button class="foot-act" onclick={() => api.stop(view.record.id)} title="stop session">stop</button>
+            <button class="foot-act" onclick={stopSession} title="stop session">stop</button>
           {/if}
         {/if}
         <button class="send-btn" class:queue={active} title={isDraft ? 'start this chat' : steerable ? 'steer into the running turn' : active ? 'queue message' : 'send'} onclick={send} disabled={!text.trim()}><Icon name={steerable ? 'corner-down-right' : active ? 'timer' : 'arrow-up'} size={16} /></button>
       </div>
+      <!-- Action failures sit under their own control cluster: settings under the pills (left), session
+           lifecycle under the interrupt/stop/reopen buttons (right) — never a global toast. -->
+      {#if actionErr.settings || actionErr.session}
+        <div class="actionerrs" role="alert">
+          <span class="ae">{actionErr.settings}</span>
+          <span class="spacer"></span>
+          <span class="ae">{actionErr.session}</span>
+        </div>
+      {/if}
     </div>
     <div class="checkout dim">
       <ContextMeter {view} />
@@ -712,6 +780,8 @@
   .send-btn.queue { background: var(--warn); color: #1a1206; }
   .est { color: var(--muted); }
   .senderr { color: var(--bad-text); font-size: 0.76rem; margin-bottom: 0.45rem; }
+  .actionerrs { display: flex; gap: 0.5rem; margin-top: 0.35rem; padding: 0 0.2rem; }
+  .ae { color: var(--bad-text); font-size: 0.72rem; }
   .tmeta, .est { font-variant-numeric: tabular-nums; }
   .composer { position: relative; background: var(--surface); border: 1px solid var(--border-strong); border-radius: 14px; padding: 0.6rem 0.7rem 0.5rem; }
   .composer:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent); }
