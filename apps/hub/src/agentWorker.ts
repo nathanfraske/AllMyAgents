@@ -40,6 +40,7 @@ import {
   codexGrantKey,
 } from './adapters/codex.js'
 import { buildAgentMcpServer, type AgentServices } from './agentTools.js'
+import type { ManagerSpawnResult } from './agentToolCore.js'
 import { AUTO_ALLOW_TOOLS, SELF_GATING_TOOLS } from './executor.js'
 import { WseqBuffer, type BufferedEvent } from './wseqBuffer.js'
 import { WorkerServer } from './workerTransport.js'
@@ -143,12 +144,7 @@ export function buildWorkerAgentServices(deps: WorkerAgentServiceDeps): AgentSer
         error?: string
       }>,
     spawnAgent: (managerSessionId, input) =>
-      deps.relayRpc('manager.spawn', { managerSessionId, input }) as Promise<{
-        ok: boolean
-        sessionId?: string
-        label?: string
-        error?: string
-      }>,
+      deps.relayRpc('manager.spawn', { managerSessionId, input }) as Promise<ManagerSpawnResult>,
     setChildAuthority: (managerSessionId, childSessionId, authorities, tools) =>
       deps.relayRpc('manager.setChildAuthority', {
         managerSessionId,

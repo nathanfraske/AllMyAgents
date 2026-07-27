@@ -24,7 +24,7 @@ import type {
 import { writeManagedInstructions, agentContract } from './instructions.js'
 import type { InstructionStore } from './instructions.js'
 import { identityOf, readableScopes, type SessionIdentity } from './identity.js'
-import { runAgentTool, type AgentServices } from './agentToolCore.js'
+import { runAgentTool, type AgentServices, type ManagerSpawnResult } from './agentToolCore.js'
 import { writeCodexAgentMcpConfig } from './codexMcpConfig.js'
 import type { AgentBus, BusAddress, BusMessage } from './bus.js'
 import type { MemoryStore } from './memory.js'
@@ -1240,68 +1240,84 @@ export class SessionManager {
       throw new Error('startingPrompt must be text no longer than 20,000 characters')
     }
 
-    const previouslyManager = record.isProjectManager === true
-    const previousCeiling = new Set(record.managerDelegation ?? [])
-    record.isProjectManager = config.enabled
-    record.managerMaxLiveChildren = config.enabled ? max : undefined
-    record.managerDelegation = config.enabled && requested.length ? requested : undefined
-    record.managerAllowedProfiles = config.enabled ? allowedProfiles : undefined
-    record.managerAllowedModels = config.enabled ? allowedModels : undefined
-    record.managerAllowedTools = config.enabled ? allowedTools : undefined
-    record.managerAgentTypes = config.enabled && agentTypes.length ? agentTypes : undefined
-    record.managerStartingPrompt = config.enabled && startingPrompt.trim() ? startingPrompt : undefined
+    const affected = [
+      record,
+      ...[...this.sessions.values()].filter((child) => child.parentSessionId === record.id),
+    ]
+    const snapshots = affected.map((current) => [current, structuredClone(current)] as const)
+    try {
+      return this.journal.atomic(() => {
+        const previouslyManager = record.isProjectManager === true
+        const previousCeiling = new Set(record.managerDelegation ?? [])
+        record.isProjectManager = config.enabled
+        record.managerMaxLiveChildren = config.enabled ? max : undefined
+        record.managerDelegation = config.enabled && requested.length ? requested : undefined
+        record.managerAllowedProfiles = config.enabled ? allowedProfiles : undefined
+        record.managerAllowedModels = config.enabled ? allowedModels : undefined
+        record.managerAllowedTools = config.enabled ? allowedTools : undefined
+        record.managerAgentTypes = config.enabled && agentTypes.length ? agentTypes : undefined
+        record.managerStartingPrompt = config.enabled && startingPrompt.trim() ? startingPrompt : undefined
 
-    // Revocation is materialized onto every direct child now AND the approval path re-checks the live
-    // manager record on every action. Either half alone is insufficient: the first makes state legible;
-    // the second closes the mid-turn/cached-record race.
-    const ceiling = new Set(record.managerDelegation ?? [])
-    const toolCeiling = new Set(record.managerAllowedTools ?? [])
-    for (const child of this.sessions.values()) {
-      if (child.parentSessionId !== record.id) continue
-      if (child.delegatedAuthorities?.length) {
-        const next = child.delegatedAuthorities.filter((authority) => ceiling.has(authority))
-        const revoked = child.delegatedAuthorities.filter((authority) => !ceiling.has(authority))
-        if (revoked.length) {
-          child.delegatedAuthorities = next.length ? next : undefined
-          this.persist(child)
-          this.journal.append(record.id, 'manager/delegation-revoked', {
-            managerSessionId: record.id,
-            childSessionId: child.id,
-            authorities: revoked,
-            by: 'operator',
-          })
+        // Revocation is materialized onto every direct child now AND the approval path re-checks the live
+        // manager record on every action. Persist every affected record and its audit rows in the same
+        // SQLite transaction: a killed hub restores either the complete prior grant or complete narrowing.
+        const ceiling = new Set(record.managerDelegation ?? [])
+        const toolCeiling = new Set(record.managerAllowedTools ?? [])
+        for (const child of affected.slice(1)) {
+          if (child.delegatedAuthorities?.length) {
+            const next = child.delegatedAuthorities.filter((authority) => ceiling.has(authority))
+            const revoked = child.delegatedAuthorities.filter((authority) => !ceiling.has(authority))
+            if (revoked.length) {
+              child.delegatedAuthorities = next.length ? next : undefined
+              this.persist(child)
+              this.journal.append(record.id, 'manager/delegation-revoked', {
+                managerSessionId: record.id,
+                childSessionId: child.id,
+                authorities: revoked,
+                by: 'operator',
+              })
+            }
+          }
+          if (child.delegatedTools?.length) {
+            const next = child.delegatedTools.filter((tool) => toolCeiling.has(tool))
+            const revoked = child.delegatedTools.filter((tool) => !toolCeiling.has(tool))
+            if (revoked.length) {
+              child.delegatedTools = next.length ? next : undefined
+              this.persist(child)
+              this.journal.append(record.id, 'manager/tool-delegation-revoked', {
+                managerSessionId: record.id,
+                childSessionId: child.id,
+                tools: revoked,
+                by: 'operator',
+              })
+            }
+          }
         }
+        this.persist(record)
+        this.journal.append(record.id, config.enabled ? 'manager/granted' : 'manager/revoked', {
+          managerSessionId: record.id,
+          maxLiveChildren: record.managerMaxLiveChildren ?? null,
+          delegation: record.managerDelegation ?? [],
+          allowedProfiles: record.managerAllowedProfiles ?? [],
+          allowedModels: record.managerAllowedModels ?? {},
+          allowedTools: record.managerAllowedTools ?? [],
+          agentTypes: record.managerAgentTypes ?? [],
+          startingPrompt: record.managerStartingPrompt ?? '',
+          by: 'operator',
+          previousRole: previouslyManager,
+          removedAuthorities: [...previousCeiling].filter((authority) => !ceiling.has(authority)),
+        })
+        return record
+      })
+    } catch (error) {
+      // A synchronous SQLite failure rolls the rows back; restore the same truth in memory so the next
+      // approval cannot observe a half-applied ceiling until restart.
+      for (const [current, snapshot] of snapshots) {
+        for (const key of Object.keys(current)) delete (current as unknown as Record<string, unknown>)[key]
+        Object.assign(current, snapshot)
       }
-      if (child.delegatedTools?.length) {
-        const next = child.delegatedTools.filter((tool) => toolCeiling.has(tool))
-        const revoked = child.delegatedTools.filter((tool) => !toolCeiling.has(tool))
-        if (revoked.length) {
-          child.delegatedTools = next.length ? next : undefined
-          this.persist(child)
-          this.journal.append(record.id, 'manager/tool-delegation-revoked', {
-            managerSessionId: record.id,
-            childSessionId: child.id,
-            tools: revoked,
-            by: 'operator',
-          })
-        }
-      }
+      throw error
     }
-    this.persist(record)
-    this.journal.append(record.id, config.enabled ? 'manager/granted' : 'manager/revoked', {
-      managerSessionId: record.id,
-      maxLiveChildren: record.managerMaxLiveChildren ?? null,
-      delegation: record.managerDelegation ?? [],
-      allowedProfiles: record.managerAllowedProfiles ?? [],
-      allowedModels: record.managerAllowedModels ?? {},
-      allowedTools: record.managerAllowedTools ?? [],
-      agentTypes: record.managerAgentTypes ?? [],
-      startingPrompt: record.managerStartingPrompt ?? '',
-      by: 'operator',
-      previousRole: previouslyManager,
-      removedAuthorities: [...previousCeiling].filter((authority) => !ceiling.has(authority)),
-    })
-    return record
   }
 
   setChildDelegation(
@@ -1331,51 +1347,59 @@ export class SessionManager {
       throw new Error(`cannot delegate tools outside the operator-granted ceiling: ${outsideTools.join(', ')}`)
     }
 
-    const before = new Set(child.delegatedAuthorities ?? [])
-    child.delegatedAuthorities = normalized.length ? normalized : undefined
-    this.persist(child)
-    const granted = normalized.filter((authority) => !before.has(authority))
-    const revoked = [...before].filter((authority) => !normalized.includes(authority))
-    if (granted.length) {
-      this.journal.append(manager.id, 'manager/delegation-granted', {
-        managerSessionId: manager.id,
-        childSessionId: child.id,
-        authorities: granted,
-        by: manager.id,
+    const snapshot = structuredClone(child)
+    try {
+      return this.journal.atomic(() => {
+        const before = new Set(child.delegatedAuthorities ?? [])
+        child.delegatedAuthorities = normalized.length ? normalized : undefined
+        const granted = normalized.filter((authority) => !before.has(authority))
+        const revoked = [...before].filter((authority) => !normalized.includes(authority))
+        if (tools !== undefined) {
+          const beforeTools = new Set(child.delegatedTools ?? [])
+          child.delegatedTools = normalizedTools!.length ? normalizedTools : undefined
+          const grantedTools = normalizedTools!.filter((tool) => !beforeTools.has(tool))
+          const revokedTools = [...beforeTools].filter((tool) => !normalizedTools!.includes(tool))
+          if (grantedTools.length) {
+            this.journal.append(manager.id, 'manager/tool-delegation-granted', {
+              managerSessionId: manager.id,
+              childSessionId: child.id,
+              tools: grantedTools,
+              by: manager.id,
+            })
+          }
+          if (revokedTools.length) {
+            this.journal.append(manager.id, 'manager/tool-delegation-revoked', {
+              managerSessionId: manager.id,
+              childSessionId: child.id,
+              tools: revokedTools,
+              by: manager.id,
+            })
+          }
+        }
+        this.persist(child)
+        if (granted.length) {
+          this.journal.append(manager.id, 'manager/delegation-granted', {
+            managerSessionId: manager.id,
+            childSessionId: child.id,
+            authorities: granted,
+            by: manager.id,
+          })
+        }
+        if (revoked.length) {
+          this.journal.append(manager.id, 'manager/delegation-revoked', {
+            managerSessionId: manager.id,
+            childSessionId: child.id,
+            authorities: revoked,
+            by: manager.id,
+          })
+        }
+        return child
       })
+    } catch (error) {
+      for (const key of Object.keys(child)) delete (child as unknown as Record<string, unknown>)[key]
+      Object.assign(child, snapshot)
+      throw error
     }
-    if (revoked.length) {
-      this.journal.append(manager.id, 'manager/delegation-revoked', {
-        managerSessionId: manager.id,
-        childSessionId: child.id,
-        authorities: revoked,
-        by: manager.id,
-      })
-    }
-    if (tools !== undefined) {
-      const beforeTools = new Set(child.delegatedTools ?? [])
-      child.delegatedTools = normalizedTools!.length ? normalizedTools : undefined
-      this.persist(child)
-      const grantedTools = normalizedTools!.filter((tool) => !beforeTools.has(tool))
-      const revokedTools = [...beforeTools].filter((tool) => !normalizedTools!.includes(tool))
-      if (grantedTools.length) {
-        this.journal.append(manager.id, 'manager/tool-delegation-granted', {
-          managerSessionId: manager.id,
-          childSessionId: child.id,
-          tools: grantedTools,
-          by: manager.id,
-        })
-      }
-      if (revokedTools.length) {
-        this.journal.append(manager.id, 'manager/tool-delegation-revoked', {
-          managerSessionId: manager.id,
-          childSessionId: child.id,
-          tools: revokedTools,
-          by: manager.id,
-        })
-      }
-    }
-    return child
   }
 
   private managerSetChildAuthority(
@@ -1405,7 +1429,7 @@ export class SessionManager {
       authorities?: DelegatedAuthority[]
       tools?: string[]
     }
-  ): Promise<{ ok: boolean; sessionId?: string; label?: string; error?: string }> {
+  ): Promise<ManagerSpawnResult> {
     const manager = this.sessions.get(managerSessionId)
     if (!manager?.isProjectManager) return { ok: false, error: 'caller is not an operator-marked project manager' }
     const max = manager.managerMaxLiveChildren
@@ -1514,33 +1538,30 @@ export class SessionManager {
         permissionMode: input.permissionMode ?? 'safe',
         useWorktree: input.useWorktree !== false,
         parentSessionId: manager.id,
-        delegatedAuthorities: authorities,
-        delegatedTools: tools,
+        // Persist the child safely NARROW first. The intended grants are applied below with their audit
+        // rows in one transaction; a crash between create and that transaction leaves less authority.
       })
-      this.journal.append(manager.id, 'manager/child-spawned', {
-        managerSessionId: manager.id,
-        childSessionId: child.id,
-        profileId: child.profileId,
-        projectId: child.projectId ?? null,
+      this.journal.atomic(() => {
+        this.journal.append(manager.id, 'manager/child-spawned', {
+          managerSessionId: manager.id,
+          childSessionId: child.id,
+          profileId: child.profileId,
+          projectId: child.projectId ?? null,
+          worktree: child.worktree ?? null,
+        })
+        if (authorities.length || tools.length) {
+          this.setChildDelegation(manager.id, child.id, authorities, tools)
+        }
+      })
+      return {
+        ok: true,
+        sessionId: child.id,
+        label: child.title ?? identityOf(child).label,
         worktree: child.worktree ?? null,
-      })
-      if (authorities.length) {
-        this.journal.append(manager.id, 'manager/delegation-granted', {
-          managerSessionId: manager.id,
-          childSessionId: child.id,
-          authorities,
-          by: manager.id,
-        })
+        cwd: child.cwd,
+        worktreeRequested: child.worktreeRequested ?? input.useWorktree !== false,
+        worktreeFallbackReason: child.worktreeFallbackReason,
       }
-      if (tools.length) {
-        this.journal.append(manager.id, 'manager/tool-delegation-granted', {
-          managerSessionId: manager.id,
-          childSessionId: child.id,
-          tools,
-          by: manager.id,
-        })
-      }
-      return { ok: true, sessionId: child.id, label: child.title ?? identityOf(child).label }
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) }
     }

@@ -78,6 +78,7 @@ export type JournalCondenseResult = {
 
 export class Journal extends EventEmitter {
   readonly db: Database.Database
+  private readonly atomicEventBuffers: HubEvent[][] = []
   private readonly insertStmt: Database.Statement
   private readonly insertWorkerStmt: Database.Statement
   private readonly lastWseqStmt: Database.Statement
@@ -231,7 +232,7 @@ export class Journal extends EventEmitter {
       kind,
       payload: JSON.parse(clean) as unknown,
     }
-    this.emit('event', event)
+    this.publish(event)
     return event
   }
 
@@ -245,8 +246,49 @@ export class Journal extends EventEmitter {
     const clean = redactedJson(sanitizeJournalPayload(payload))
     const info = this.insertWorkerStmt.run(ts, sessionId, kind, clean, wseq)
     const event: HubEvent = { seq: Number(info.lastInsertRowid), ts, sessionId, kind, payload: JSON.parse(clean) as unknown }
-    this.emit('event', event)
+    this.publish(event)
     return event
+  }
+
+  /**
+   * Commit materialized state and its audit rows as one SQLite decision. Events are emitted only after
+   * COMMIT: a crash rolls back both tables, while a committed authority change can never exist without
+   * its journal evidence. Nested callers fold their events into the outer transaction's buffer.
+   */
+  atomic<T>(fn: () => T): T {
+    const events: HubEvent[] = []
+    this.atomicEventBuffers.push(events)
+    try {
+      const value = this.db.transaction(fn).immediate()
+      this.atomicEventBuffers.pop()
+      const parent = this.atomicEventBuffers.at(-1)
+      if (parent) parent.push(...events)
+      else {
+        for (const event of events) {
+          try {
+            this.emit('event', event)
+          } catch (error) {
+            // The durable decision already committed. A subscriber must not turn that into an apparent
+            // rollback in the caller while the database contains the new state.
+            console.warn(
+              `[journal] event subscriber failed after atomic commit (${event.kind}): ${
+                error instanceof Error ? error.message : String(error)
+              }`
+            )
+          }
+        }
+      }
+      return value
+    } catch (error) {
+      this.atomicEventBuffers.pop()
+      throw error
+    }
+  }
+
+  private publish(event: HubEvent): void {
+    const buffer = this.atomicEventBuffers.at(-1)
+    if (buffer) buffer.push(event)
+    else this.emit('event', event)
   }
 
   /** Highest worker `wseq` durably journaled for a session SINCE its latest {@link WSEQ_RESET_KIND} marker

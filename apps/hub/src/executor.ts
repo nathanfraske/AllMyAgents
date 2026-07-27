@@ -10,6 +10,7 @@ import {
   codexGrantKey,
 } from './adapters/codex.js'
 import { buildAgentMcpServer, type AgentServices } from './agentTools.js'
+import type { ManagerSpawnResult } from './agentToolCore.js'
 import type { SessionIdentity } from './identity.js'
 import type { ApprovalService } from './approvals.js'
 import type { UsageMonitor } from './usage.js'
@@ -159,7 +160,7 @@ export interface InProcessExecutorHubHooks {
       authorities?: Array<'commit' | 'push'>
       tools?: string[]
     }
-  ): Promise<{ ok: boolean; sessionId?: string; label?: string; error?: string }>
+  ): Promise<ManagerSpawnResult>
   managerSetChildAuthority(
     managerSessionId: string,
     childSessionId: string,
