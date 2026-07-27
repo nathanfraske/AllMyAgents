@@ -17,7 +17,7 @@ import { tokenMatches } from './deviceToken.js'
 import { pickFolder } from './native.js'
 import { computeStats } from './stats.js'
 import { buildFleet, probeHubHealth } from './fleet.js'
-import { startLogin, awaitLogin, credentialsExist } from './loginLauncher.js'
+import { cancelLogin, credentialsExist, getLogin, startLogin } from './loginLauncher.js'
 import { readProjectConfig } from './importScan.js'
 import { pickableProfiles, setClaudeConnectorPolicy } from './profiles.js'
 import { asFileWriteDiffDensity } from './types.js'
@@ -459,6 +459,7 @@ export function startServer(opts: ServerOptions): http.Server {
     path.join(path.dirname(configPath), 'repositories'),
     (name, projectPath) => projects.create(name, projectPath)
   )
+  const loginNames = new Map<string, string>()
 
   const server = http.createServer((req, res) => {
     void handle(req, res)
@@ -565,8 +566,8 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, sessions.listCommands(decodeURIComponent(commandsMatch[1] as string)))
         return
       }
-      // One-click add-account: launches the vendor login in a visible terminal, then
-      // long-polls until the credentials file appears (login done) or times out.
+      // The hub owns a headless vendor auth process and captures the OAuth URL. The desktop opens the
+      // URL through its native shell; a headless/remote caller gets the same URL to open manually.
       if (method === 'POST' && url.pathname === '/api/accounts/login') {
         const body = await readBody(req)
         const provider = body.provider
@@ -584,37 +585,58 @@ export function startServer(opts: ServerOptions): http.Server {
           json(res, { ok: false, error: `profiles/${name} already has ${provider} credentials` }, 409)
           return
         }
-        if (!startLogin(provider as Provider, profileDir)) {
-          // No reliable way to pop a visible terminal here (Linux/other — Windows and macOS both
-          // launch one); hand back the manual command so the operator can finish the flow by hand.
-          json(
-            res,
-            {
-              ok: false,
-              platform: process.platform,
-              manual: `pnpm login:${provider} profiles/${name}`,
-              error:
-                'auto-launch is available on Windows and macOS — run the manual command in a terminal, then Rescan accounts',
-            },
-            501
-          )
+        const login = await startLogin(provider as Provider, profileDir)
+        const ok = login.status === 'waiting' || login.status === 'complete'
+        if (ok) loginNames.set(login.id, name)
+        json(
+          res,
+          {
+            ok,
+            loginId: login.id,
+            provider,
+            status: login.status,
+            url: login.url,
+            code: login.code,
+            error: login.error,
+            manual: `pnpm login:${provider} profiles/${name}`,
+          },
+          ok ? 200 : 502
+        )
+        return
+      }
+      const accountLoginMatch = /^\/api\/accounts\/login\/([^/]+)$/.exec(url.pathname)
+      if (accountLoginMatch && (method === 'GET' || method === 'DELETE')) {
+        const loginId = decodeURIComponent(accountLoginMatch[1] as string)
+        const login = method === 'DELETE' ? cancelLogin(loginId) : getLogin(loginId)
+        if (!login) {
+          json(res, { ok: false, error: 'unknown or expired login attempt' }, 404)
           return
         }
-        // Cap under any inbound-request timeout so the long-poll response always lands.
-        const added = await awaitLogin(provider as Provider, profileDir, { timeoutMs: 270_000 })
-        if (added) {
+        const name = loginNames.get(loginId)
+        if (login.status === 'complete') {
           const list = rescanProfiles()
           const profile = list.find((p) => p.id === name)
-          json(res, { ok: true, added: profile?.id ?? name, provider })
-        } else {
+          loginNames.delete(loginId)
           json(res, {
-            ok: false,
-            launched: true,
-            timedOut: true,
-            manual: `pnpm login:${provider} profiles/${name}`,
-            error: 'login not detected in time — finish the sign-in in the opened window, then click Rescan accounts',
+            ok: true,
+            loginId,
+            status: login.status,
+            provider: login.provider,
+            added: profile?.id ?? name,
           })
+          return
         }
+        const ok = method === 'DELETE' || login.status === 'capturing' || login.status === 'waiting'
+        if (!ok) loginNames.delete(loginId)
+        json(res, {
+          ok,
+          loginId,
+          provider: login.provider,
+          status: login.status,
+          url: login.url,
+          code: login.code,
+          error: login.error,
+        })
         return
       }
       if (method === 'POST' && url.pathname === '/api/pick-folder') {
