@@ -62,6 +62,8 @@ export interface ThreadItem {
   toolInput?: unknown
   toolResult?: string
   toolError?: boolean
+  /** Durable metadata consumed by TaskStrip but intentionally omitted from the transcript. */
+  taskBoardOnly?: boolean
   /** For a `tool` item: the vendor correlation id. A spawned agent's items point back at it via `agentId`. */
   toolUseId?: string
   /** When the tool_result arrived — the only honest end-time for a spawned agent (its duration). */
@@ -1658,6 +1660,19 @@ export class HubStore {
         const used = tu?.last?.inputTokens ?? tu?.last?.totalTokens
         if (typeof used === 'number') view.contextUsed = used
         if (typeof tu?.modelContextWindow === 'number') view.contextWindow = tu.modelContextWindow
+        break
+      }
+      case 'codex/turn/plan/updated': {
+        // Codex 0.145 emits the whole current plan on every notification. Preserve every journaled
+        // snapshot as a board-only item: TaskStrip gets both the latest state and its change history,
+        // while the transcript does not gain a synthetic tool card the vendor never presented there.
+        this.push(view, {
+          kind: 'tool',
+          ts,
+          toolName: 'update_plan',
+          toolInput: payload,
+          taskBoardOnly: true,
+        })
         break
       }
       case 'codex/turn/completed': {

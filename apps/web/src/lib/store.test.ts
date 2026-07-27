@@ -4,6 +4,7 @@ import { store } from './store.svelte'
 import { settings } from './settings.svelte'
 import { loadLastLayout, saveLastLayout } from './uiState'
 import { buildAgentRuns } from './agentTree'
+import { buildTaskBoard } from './taskBoard'
 import type { HubEvent, SessionRecord } from './api'
 
 // The store imports ./api (real network / WebSocket) and ./settings.svelte (localStorage).
@@ -1326,5 +1327,36 @@ describe('codex sub-agent ingest', () => {
     const run = buildAgentRuns(store.sessions[id]!.items, Date.parse('2026-01-01T00:00:06.000Z'))[0]!
     expect(run.status).toBe('done')
     expect(run.result).toBeUndefined()
+  })
+})
+
+describe('codex plan ingest', () => {
+  it('materializes a durable plan snapshot that the task board can replay', () => {
+    const id = 'codex-plan'
+    seed(id, { provider: 'codex', vendorSessionId: 'root-thread' })
+
+    apply(
+      evt({
+        seq: 1,
+        kind: 'codex/turn/plan/updated',
+        sessionId: id,
+        payload: {
+          threadId: 'root-thread',
+          turnId: 'turn-1',
+          explanation: 'Inspect both manifests',
+          plan: [
+            { step: 'Inspect package.json', status: 'completed' },
+            { step: 'Inspect apps/web/package.json', status: 'inProgress' },
+          ],
+        },
+      })
+    )
+
+    const board = buildTaskBoard(store.sessions[id]!.items)
+    expect(board.source).toBe('plan')
+    expect(board.tasks.map((task) => `${task.title}:${task.status}`)).toEqual([
+      'Inspect package.json:completed',
+      'Inspect apps/web/package.json:in_progress',
+    ])
   })
 })
