@@ -6,6 +6,9 @@
     managerEffort?: string
     permissionMode: 'safe' | 'edits' | 'full'
     startingPrompt: string
+    orientationBrief: string
+    operatorTask: string
+    standingInstructions: string
     maxLiveChildren: number
     delegation: Array<'commit' | 'push'>
     allowedTools: string[]
@@ -68,8 +71,11 @@
   let allowedTools = $state<string[]>([])
   let customTool = $state('')
   let agentTypes = $state<ManagerAgentType[]>([])
-  let startingPrompt = $state('')
-  let promptTouched = $state(false)
+  let orientationBrief = $state('')
+  let operatorTask = $state('')
+  let standingInstructions = $state('')
+  let briefTouched = $state(false)
+  let standingTouched = $state(false)
   let busy = $state(false)
   let error = $state('')
   let saved = $state(false)
@@ -114,6 +120,41 @@
     ].join('\n\n')
   }
 
+  function generatedOrientationBrief(): string {
+    const withoutTask = generatedPrompt()
+      .replace(/\n\nOPERATOR TASK\n[\s\S]*$/, '')
+      .replace(
+        'This full starting prompt is your manager brief; OPERATOR TASK at the end is the assignment to execute now.',
+        'The operator task is appended to this orientation when the manager launches.',
+      )
+    return [
+      withoutTask,
+      'DELEGATION DEFAULT\nDelegate all bounded project work by default to real AllMyAgents workers. Keep decomposition, coordination, inspection, and verification yourself; do not perform worker tasks in the native vendor harness.',
+    ].join('\n\n')
+  }
+
+  function defaultStandingInstructions(): string {
+    return [
+      '## Project manager standing rules',
+      '',
+      '- Delegate all bounded project work by default to real AllMyAgents workers through the hub-provided spawn_agent tool; your job is to decompose, coordinate, inspect, and verify.',
+      '- Use the AllMyAgents tool layer, never the vendor harness equivalents. spawn_agent and list_agents exist in both layers; only the AllMyAgents versions create real app chats with isolated worktrees, lifecycle reporting, collision detection, and operator visibility.',
+      '- Your workers are real chats. If the operator cannot see a worker in the sidebar, you did not create it through AllMyAgents.',
+    ].join('\n')
+  }
+
+  function composedStartingPrompt(): string {
+    const readiness = operatorTask.trim()
+      ? 'Acknowledge this manager brief, then call list_agents and child_status from the AllMyAgents tool layer. Briefly report what responded, then proceed with the operator task below.'
+      : 'Acknowledge this manager brief, then call list_agents and child_status from the AllMyAgents tool layer. Report what responded. No task has been assigned: do not invent work. Stop after the tooling report and ask the operator what task to begin.'
+    const task = operatorTask.trim() || 'No task assigned. Halt after the readiness check and ask the operator for a task.'
+    return [
+      orientationBrief.trim(),
+      `READINESS CHECK\n${readiness}`,
+      `OPERATOR TASK\n${task}`,
+    ].filter(Boolean).join('\n\n')
+  }
+
   function resetGrantDefaults(): void {
     const profile = store.profiles.find((candidate) => candidate.id === managerProfileId)
     managerModel = profile ? defaultModelFor(profile.provider)?.slug ?? '' : ''
@@ -124,7 +165,11 @@
     allowedTools = []
     customTool = ''
     agentTypes = []
-    promptTouched = false
+    operatorTask = ''
+    orientationBrief = ''
+    standingInstructions = ''
+    briefTouched = false
+    standingTouched = false
     error = ''
     saved = false
   }
@@ -145,8 +190,11 @@
       ...role,
       profileIds: role.profileIds ? [...role.profileIds] : undefined,
     }))
-    startingPrompt = record.managerStartingPrompt ?? generatedPrompt()
-    promptTouched = Boolean(record.managerStartingPrompt)
+    orientationBrief = record.managerOrientationBrief ?? generatedOrientationBrief()
+    operatorTask = record.managerOperatorTask ?? ''
+    standingInstructions = record.managerStandingInstructions ?? defaultStandingInstructions()
+    briefTouched = Boolean(record.managerOrientationBrief)
+    standingTouched = record.managerStandingInstructions !== undefined
     error = ''
     saved = record.isProjectManager === true
   }
@@ -304,7 +352,10 @@
       managerModel: managerModel || undefined,
       managerEffort: managerEffort || undefined,
       permissionMode,
-      startingPrompt: startingPrompt.trim(),
+      startingPrompt: composedStartingPrompt(),
+      orientationBrief: orientationBrief.trim(),
+      operatorTask: operatorTask.trim(),
+      standingInstructions: standingInstructions.trim(),
       maxLiveChildren,
       delegation: [...delegation],
       allowedTools: [...allowedTools],
@@ -321,7 +372,7 @@
     if (!projectId) return 'Choose the project this manager will oversee.'
     if (!managerProfileId) return 'Choose the account that will run the manager.'
     if (!config.allowedProfiles.length) return 'Choose at least one worker account.'
-    if (!config.startingPrompt) return 'Give the manager a starting prompt so it can begin immediately.'
+    if (!config.orientationBrief) return 'The manager needs an orientation brief.'
     if (!Number.isInteger(maxLiveChildren) || maxLiveChildren < 1 || maxLiveChildren > 16) {
       return 'The live child limit must be from 1 to 16.'
     }
@@ -385,6 +436,9 @@
         allowedTools,
         agentTypes,
         startingPrompt: config.startingPrompt,
+        orientationBrief: config.orientationBrief,
+        operatorTask: config.operatorTask,
+        standingInstructions: config.standingInstructions,
       })
       if ('error' in configured) throw new Error(configured.error)
       if (!wasActive) {
@@ -418,6 +472,9 @@
         allowedTools: [],
         agentTypes: [],
         startingPrompt: '',
+        orientationBrief: '',
+        operatorTask: '',
+        standingInstructions: '',
       })
       if ('error' in configured) throw new Error(configured.error)
       store.upsertSessionRecord(configured)
@@ -453,7 +510,8 @@
     maxLiveChildren
     delegation
     agentTypes
-    if (!promptTouched) startingPrompt = generatedPrompt()
+    if (!briefTouched) orientationBrief = generatedOrientationBrief()
+    if (!standingTouched) standingInstructions = defaultStandingInstructions()
   })
 </script>
 
@@ -564,17 +622,46 @@
       </div>
 
       <label>
-        <span>Starting prompt</span>
+        <span>Operator task <em>optional</em></span>
         <textarea
-          rows="12"
-          value={startingPrompt}
+          rows="4"
+          aria-label="Operator task"
+          value={operatorTask}
           oninput={(event) => {
-            promptTouched = true
-            startingPrompt = (event.target as HTMLTextAreaElement).value
+            operatorTask = (event.target as HTMLTextAreaElement).value
           }}
+          placeholder="What should this manager and its workers accomplish?"
         ></textarea>
-        <small>Pre-filled from this project and brief. Edit it freely; launching sends it immediately.</small>
+        <small>Leave blank to launch a readiness check: the manager verifies its AllMyAgents tools, reports, then stops and asks you for a task.</small>
       </label>
+
+      <details class="brief-editor">
+        <summary>Edit the full brief and standing rules</summary>
+        <p>The orientation is sent at launch. Standing rules are reapplied through the manager's instruction scope on later turns, including after compaction.</p>
+        <label>
+          <span>Manager orientation brief</span>
+          <textarea
+            rows="12"
+            value={orientationBrief}
+            oninput={(event) => {
+              briefTouched = true
+              orientationBrief = (event.target as HTMLTextAreaElement).value
+            }}
+          ></textarea>
+        </label>
+        <label>
+          <span>Standing manager rules</span>
+          <textarea
+            rows="7"
+            value={standingInstructions}
+            oninput={(event) => {
+              standingTouched = true
+              standingInstructions = (event.target as HTMLTextAreaElement).value
+            }}
+          ></textarea>
+          <small>Editable. These rules survive summarisation: delegate through AllMyAgents, never the vendor's same-named harness tools, and create workers the operator can see.</small>
+        </label>
+      </details>
 
       <div class="field agent-types">
         <div class="section-head">
@@ -756,6 +843,11 @@
   select, input, textarea { color: var(--text); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--r-md); padding: .52rem .6rem; }
   select, label > input, textarea { width: 100%; }
   textarea { resize: vertical; line-height: 1.45; font: inherit; font-size: var(--text-xs); }
+  .brief-editor { border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-2); padding: .65rem .75rem; }
+  .brief-editor summary { cursor: pointer; color: var(--text); font-weight: 650; }
+  .brief-editor[open] summary { margin-bottom: .65rem; }
+  .brief-editor > p { margin: 0 0 .75rem; color: var(--muted); font-size: var(--text-xs); line-height: 1.45; }
+  .brief-editor label + label { margin-top: .75rem; }
   small { color: var(--dim); line-height: 1.35; }
   .row { display: grid; gap: .65rem; }
   .row.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }

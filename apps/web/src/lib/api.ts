@@ -117,6 +117,9 @@ export interface SessionRecord {
   managerAllowedTools?: string[]
   managerAgentTypes?: ManagerAgentType[]
   managerStartingPrompt?: string
+  managerOrientationBrief?: string
+  managerOperatorTask?: string
+  managerStandingInstructions?: string
   parentSessionId?: string
   delegatedAuthorities?: Array<'commit' | 'push'>
   delegatedTools?: string[]
@@ -692,6 +695,9 @@ export const api = {
       allowedTools?: string[]
       agentTypes?: ManagerAgentType[]
       startingPrompt?: string
+      orientationBrief?: string
+      operatorTask?: string
+      standingInstructions?: string
     }
   ) => jpost<SessionRecord | ApiError>(`/api/sessions/${id}/project-manager`, config),
   /** "Always allow this tool in this chat" (allow=false revokes). Takes effect on the next tool call. */

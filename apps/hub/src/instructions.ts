@@ -10,7 +10,7 @@ import type Database from 'better-sqlite3'
  * Codex — so every agent reads them as first-class context, no matter which account/project.
  *
  * Scope keys, general → specific:
- *   global | vendor:claude | vendor:codex | project:<projectId> | account:<profileId>
+ *   global | vendor:claude | vendor:codex | project:<projectId> | account:<profileId> | session:<sessionId>
  */
 export interface Instruction {
   scope: string
@@ -43,10 +43,16 @@ export class InstructionStore {
   }
 
   /** The applicable union for a session, general → specific. */
-  materialize(opts: { provider: 'claude' | 'codex'; projectId?: string; profileId: string }): string {
+  materialize(opts: {
+    provider: 'claude' | 'codex'
+    projectId?: string
+    profileId: string
+    sessionId?: string
+  }): string {
     const order = ['global', `vendor:${opts.provider}`]
     if (opts.projectId) order.push(`project:${opts.projectId}`)
     order.push(`account:${opts.profileId}`)
+    if (opts.sessionId) order.push(`session:${opts.sessionId}`)
     const byScope = new Map(this.list().map((r) => [r.scope, r.content]))
     const parts: string[] = []
     for (const scope of order) {

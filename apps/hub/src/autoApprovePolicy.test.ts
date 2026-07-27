@@ -350,6 +350,8 @@ describe('project-manager delegated authority security boundary', () => {
         allowedTools?: string[]
         agentTypes?: ManagerAgentType[]
         startingPrompt?: string
+        operatorTask?: string
+        standingInstructions?: string
       },
       actor: 'operator' | 'agent'
     ): SessionRecord
@@ -536,6 +538,44 @@ describe('project-manager delegated authority security boundary', () => {
       },
       'operator',
     )).toThrow(/outside|invalid.*profile/i)
+  })
+
+  it('keeps editable manager standing rules after the first prompt is gone', () => {
+    const { sessions, seed } = makeSessions()
+    const manager = seed()
+    const standing = [
+      'Delegate bounded work to AllMyAgents workers by default.',
+      'Never use the native spawn_agent or list_agents harness tools.',
+      'A real worker must be visible in the sidebar with its own worktree.',
+    ].join('\n')
+    const configured = controls(sessions).configureProjectManager(
+      's1',
+      {
+        enabled: true,
+        maxLiveChildren: 3,
+        allowedProfiles: ['p1'],
+        startingPrompt: 'First-turn orientation that compaction may summarize away.',
+        operatorTask: '',
+        standingInstructions: standing,
+      },
+      'operator',
+    )
+    expect(configured.managerStandingInstructions).toBe(standing)
+
+    // Simulate the first message no longer being available after compaction. The durable instruction
+    // scope and native instruction file must still carry the manager rules on a later turn.
+    configured.managerStartingPrompt = undefined
+    const internals = sessions as unknown as {
+      instructions: InstructionStore
+    }
+    expect(internals.instructions.materialize({
+      provider: 'claude',
+      profileId: 'p1',
+      sessionId: 's1',
+    })).toContain('Never use the native spawn_agent')
+    expect(fs.readFileSync(path.join(manager.cwd, 'CLAUDE.md'), 'utf8')).toContain(
+      'A real worker must be visible in the sidebar',
+    )
   })
 
   it('resolves a usage-aware agent type to an unblocked profile before spawning', async () => {

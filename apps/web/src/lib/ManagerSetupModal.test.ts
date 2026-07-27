@@ -118,7 +118,17 @@ describe('Manager setup', () => {
     expect(getByRole('button', { name: /let manager choose using usage limits/i })).toBeTruthy()
   })
 
-  it('launches only after persisting scope, with the editable starting prompt and chosen permission mode', async () => {
+  it('shows only the operator task by default and keeps the editable full brief collapsed', () => {
+    store.managerSetupSessionId = null
+    const { getByLabelText, getByText } = render(ManagerSetupModal, { onclose: vi.fn() })
+    expect(getByLabelText(/operator task/i)).toBeTruthy()
+    const details = getByText(/edit the full brief/i).closest('details') as HTMLDetailsElement
+    expect(details.open).toBe(false)
+    expect(getByLabelText(/manager orientation brief/i)).toBeTruthy()
+    expect(getByLabelText(/standing manager rules/i)).toBeTruthy()
+  })
+
+  it('launches only after persisting scope, with the editable task and chosen permission mode', async () => {
     store.managerSetupSessionId = null
     spawn.mockResolvedValue(session('manager', 'Demo project manager').record)
     configureProjectManager.mockImplementation(async (id: string) => ({
@@ -127,22 +137,48 @@ describe('Manager setup', () => {
     }))
     send.mockResolvedValue({ ok: true })
     const { getByRole, getByLabelText } = render(ManagerSetupModal, { onclose: vi.fn() })
-    const prompt = getByLabelText(/starting prompt/i) as HTMLTextAreaElement
-    expect(prompt.value).toMatch(/Demo project/i)
-    await fireEvent.input(prompt, { target: { value: 'Coordinate the release now.' } })
+    const task = getByLabelText(/operator task/i) as HTMLTextAreaElement
+    expect(task.value).toBe('')
+    await fireEvent.input(task, { target: { value: 'Coordinate the release now.' } })
     await fireEvent.change(getByLabelText(/manager permission level/i), { target: { value: 'edits' } })
     await fireEvent.click(getByRole('button', { name: /^create and launch manager$/i }))
 
     expect(spawn).toHaveBeenCalledWith(expect.objectContaining({ permissionMode: 'edits' }))
     await waitFor(() => expect(configureProjectManager).toHaveBeenCalled())
-    expect(send).toHaveBeenCalledWith('manager', 'Coordinate the release now.')
+    expect(configureProjectManager).toHaveBeenCalledWith(
+      'manager',
+      expect.objectContaining({
+        operatorTask: 'Coordinate the release now.',
+        standingInstructions: expect.stringMatching(/delegate.*AllMyAgents workers/is),
+      }),
+    )
+    expect(send).toHaveBeenCalledWith(
+      'manager',
+      expect.stringMatching(/list_agents.*child_status.*Coordinate the release now\./is),
+    )
     expect(configureProjectManager.mock.invocationCallOrder[0]).toBeLessThan(send.mock.invocationCallOrder[0]!)
+  })
+
+  it('launches without a task as a tooling self-test that halts and asks the operator', async () => {
+    store.managerSetupSessionId = null
+    spawn.mockResolvedValue(session('manager', 'Demo project manager').record)
+    configureProjectManager.mockImplementation(async (id: string) => ({
+      ...session(id, 'Demo project manager').record,
+      isProjectManager: true,
+    }))
+    const { getByRole } = render(ManagerSetupModal, { onclose: vi.fn() })
+    await fireEvent.click(getByRole('button', { name: /^create and launch manager$/i }))
+    await waitFor(() => expect(send).toHaveBeenCalled())
+    const sent = send.mock.calls[0]?.[1] as string
+    expect(sent).toMatch(/call list_agents and child_status/i)
+    expect(sent).toMatch(/no task.*stop.*ask the operator/is)
+    expect(sent).toMatch(/do not invent/i)
   })
 
   it('orients a fresh manager to the AllMyAgents layer, its real tools, project, and ceiling', () => {
     store.managerSetupSessionId = null
     const { getByLabelText } = render(ManagerSetupModal, { onclose: vi.fn() })
-    const prompt = (getByLabelText(/starting prompt/i) as HTMLTextAreaElement).value
+    const prompt = (getByLabelText(/manager orientation brief/i) as HTMLTextAreaElement).value
     expect(prompt).toMatch(/project manager in AllMyAgents/i)
     expect(prompt).toContain('Demo project')
     expect(prompt).toContain('C:/repo')
@@ -179,9 +215,12 @@ describe('Manager setup', () => {
         projectId: 'project-1',
         permissionMode: expect.any(String),
         startingPrompt: expect.stringMatching(/Demo project/i),
+        operatorTask: '',
+        standingInstructions: expect.stringMatching(/real chat.*sidebar/is),
         agentTypes: expect.any(Array),
       }),
     )
+    expect(onConfigured.mock.calls[0]?.[0].standingInstructions).toMatch(/worktree/i)
     expect(spawn).not.toHaveBeenCalled()
   })
 })
