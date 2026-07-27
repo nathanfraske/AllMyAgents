@@ -182,33 +182,82 @@ function authHeaders(): Record<string, string> {
   return hubToken ? { authorization: `Bearer ${hubToken}` } : {}
 }
 
+/**
+ * A hub response that is not usable as data: a non-2xx status, a body that will not parse as JSON, or a
+ * network failure. Thrown by `jget`; carried inside `jpost`'s returned error. `status` is the HTTP
+ * status (0 for a network or pre-response failure) so a caller can branch on it.
+ */
+export class HubHttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number
+  ) {
+    super(message)
+    this.name = 'HubHttpError'
+  }
+}
+
+/**
+ * The single place a hub response becomes a typed result. `ok:false` NEVER carries `data`, so an error
+ * body can never be read as if it were `T` — the whole point of this transport. Before it existed, a
+ * token-gated peer's 401 `{error}` was handed back as a `SessionRecord[]` (the store then iterated a
+ * non-array), and a 404 on an approval was JSON-parsed and returned as though the write had succeeded.
+ *
+ * A non-2xx is `ok:false` with the body's `error` field when present, else an HTTP summary. A body that
+ * will not parse as JSON is a failure EVEN on a 2xx: the hub only ever answers its API in JSON, so
+ * text/HTML is a proxy error page or a truncated response, not data.
+ */
+type HttpResult<T> = { ok: true; status: number; data: T } | { ok: false; status: number; error: string }
+
+async function request<T>(method: string, url: string, base: string, body?: unknown): Promise<HttpResult<T>> {
+  const headers: Record<string, string> = { ...authHeaders() }
+  if (method !== 'GET') headers['content-type'] = 'application/json'
+  let res: Response
+  try {
+    res = await fetch(base + url, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined })
+  } catch (e) {
+    return { ok: false, status: 0, error: e instanceof Error ? e.message : 'network error' }
+  }
+  const text = await res.text()
+  let parsed: unknown
+  try {
+    parsed = text ? JSON.parse(text) : undefined
+  } catch {
+    return { ok: false, status: res.status, error: text.slice(0, 200) || `HTTP ${res.status}` }
+  }
+  if (!res.ok) {
+    const bodyError =
+      parsed && typeof parsed === 'object' && typeof (parsed as { error?: unknown }).error === 'string'
+        ? (parsed as { error: string }).error
+        : `HTTP ${res.status}`
+    return { ok: false, status: res.status, error: bodyError }
+  }
+  return { ok: true, status: res.status, data: parsed as T }
+}
+
 // `base` defaults to the single local hub (HUB_HTTP); the fleet merge passes a REMOTE site's mapped
 // loopback base (http://localhost:<localPort>) to pull that machine's read-only roster.
 // TODO(full drive-remote, L): a remote site under `requireToken` needs ITS OWN token here — today we
 // reuse the single local `hubToken` (fine while enforcement is off, the first-cut assumption).
+//
+// THROWS `HubHttpError` on any non-usable response. Every GET call site in the store already wraps this
+// in `.catch(...)` (roster pulls fall back to [], a failed /api/fleet probe to null) — those guards
+// only appeared to work before because an error body was resolved as fake data and the catch never
+// fired, which is why a token-gated peer rendered ONLINE while its 401 roster body was iterated.
 async function jget<T>(url: string, base: string = HUB_HTTP): Promise<T> {
-  const res = await fetch(base + url, { headers: authHeaders() })
-  return res.json() as Promise<T>
+  const r = await request<T>('GET', url, base)
+  if (!r.ok) throw new HubHttpError(r.error, r.status)
+  return r.data
 }
 
+// POST callers are typed `T | { error: string }` and render `error` inline (the composer, the settings
+// panels), so a failure is RETURNED in that shape rather than thrown. `!res.ok` now counts as a failure:
+// a 401/404 body used to be parsed and returned as though the write succeeded, so a denied approval or a
+// rejected settings write looked accepted.
 async function jpost<T>(url: string, body?: unknown): Promise<T> {
-  try {
-    const res = await fetch(HUB_HTTP + url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', ...authHeaders() },
-      body: body ? JSON.stringify(body) : undefined,
-    })
-    const text = await res.text()
-    try {
-      return JSON.parse(text) as T
-    } catch {
-      // Non-JSON response (e.g. a 500 page) — surface a clean error rather than throwing.
-      return { error: text.slice(0, 200) || `HTTP ${res.status}` } as T
-    }
-  } catch (e) {
-    // Network failure (hub unreachable) — return an error the caller renders, never an unhandled reject.
-    return { error: e instanceof Error ? e.message : 'network error' } as T
-  }
+  const r = await request<T>('POST', url, HUB_HTTP, body)
+  if (!r.ok) return { error: r.error } as T
+  return r.data
 }
 
 export interface LoginResult {
@@ -383,8 +432,8 @@ export const api = {
   commands: (profileId: string) => jget<CommandInfo[]>(`/api/profiles/${encodeURIComponent(profileId)}/commands`),
   // Request on-demand context compaction (the `/compact` built-in). See CompactResult.
   compact: (id: string) => jpost<CompactResult>(`/api/sessions/${id}/compact`),
-  interrupt: (id: string) => jpost(`/api/sessions/${id}/interrupt`),
-  stop: (id: string) => jpost(`/api/sessions/${id}/stop`),
+  interrupt: (id: string) => jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/interrupt`),
+  stop: (id: string) => jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/stop`),
   // The inverse of stop(): revive a stopped/errored chat to idle so it's usable again (composer frees,
   // bus-reachable). Fixes stop() being a permanent one-way brick.
   reopen: (id: string) => jpost<{ ok?: boolean; status?: string; error?: string }>(`/api/sessions/${id}/reopen`),
@@ -396,7 +445,9 @@ export const api = {
   /** Persist a per-chat model / thinking effort / service tier immediately (survives reload + restart). */
   setSettings: (id: string, patch: { model?: string; effort?: string; serviceTier?: string }) =>
     jpost<SessionRecord>(`/api/sessions/${id}/settings`, patch),
-  decide: (id: string, approve: boolean) => jpost(`/api/approvals/${id}`, { approve }),
+  // Typed so a caller can tell an accepted decision (200 { ok:true }) from a 404/401/network failure
+  // ({ error }) — the approval UI must NOT clear a pending prompt it never actually resolved.
+  decide: (id: string, approve: boolean) => jpost<{ ok?: boolean; error?: string }>(`/api/approvals/${id}`, { approve }),
   mesh: async (): Promise<MeshStatus> => {
     const m = await jget<MeshStatus>('/api/mesh')
     if (m.token) setHubToken(m.token) // bootstrap: capture the token while the hub still hands it out
