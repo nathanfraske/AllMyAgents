@@ -42,6 +42,7 @@ export class AgentBus {
   private readonly db: Database.Database
   private readonly insertStmt: Database.Statement
   private readonly pendingStmt: Database.Statement
+  private readonly pendingCountsStmt: Database.Statement
   private readonly inboxStmt: Database.Statement
   private readonly getStmt: Database.Statement
 
@@ -55,11 +56,17 @@ export class AgentBus {
         subject TEXT, body TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, readAt TEXT)`
     )
     db.exec('CREATE INDEX IF NOT EXISTS idx_bus_to ON bus_messages (toSession, ts)')
+    // The session list polls constantly. Keep its one grouped count proportional to PENDING mail, not to
+    // every bus row ever written; delivered messages never enter this partial index.
+    db.exec('CREATE INDEX IF NOT EXISTS idx_bus_pending_to ON bus_messages (toSession) WHERE delivered = 0')
     this.insertStmt = db.prepare(
       `INSERT INTO bus_messages (id, groupId, ts, fromSession, fromProfile, fromLabel, project, toKind, toId, toSession, subject, body)
        VALUES (@id, @groupId, @ts, @fromSession, @fromProfile, @fromLabel, @project, @toKind, @toId, @toSession, @subject, @body)`
     )
     this.pendingStmt = db.prepare('SELECT * FROM bus_messages WHERE toSession = ? AND delivered = 0 ORDER BY ts ASC')
+    this.pendingCountsStmt = db.prepare(
+      'SELECT toSession, COUNT(*) AS count FROM bus_messages WHERE delivered = 0 GROUP BY toSession'
+    )
     this.inboxStmt = db.prepare('SELECT * FROM bus_messages WHERE toSession = ? ORDER BY ts DESC LIMIT ?')
     this.getStmt = db.prepare('SELECT * FROM bus_messages WHERE id = ?')
   }
@@ -99,6 +106,13 @@ export class AgentBus {
   /** Undelivered messages queued for a session (delivery injects them into its next turn). */
   pending(sessionId: string): BusMessage[] {
     return (this.pendingStmt.all(sessionId) as Row[]).map(hydrate)
+  }
+
+  /** One query for the whole roster's undelivered counts. Callers join this map in memory; never issue
+   *  pending(sessionId) once per session on a UI polling path. */
+  pendingCounts(): Map<string, number> {
+    const rows = this.pendingCountsStmt.all() as Array<{ toSession: string; count: number }>
+    return new Map(rows.map((row) => [row.toSession, row.count]))
   }
 
   /** Recent messages addressed to a session (for the read_messages tool / UI). */

@@ -75,6 +75,9 @@ export class WorkerExecutor implements Executor {
   // Sessions the worker is currently driving a turn for, tracked from the lifecycle stream (authoritative)
   // plus an optimistic add on runTurn accept (a synchronous bridge until the worker's turnStarted lands).
   private readonly busySessions = new Set<string>()
+  // Monotonic per-session mutation counters let a listLive request reconcile the state it OBSERVED without
+  // clearing a newer optimistic runTurn that began while the request was in flight.
+  private readonly busyVersions = new Map<string, number>()
   // The successor's short-lived served-callId → write-result cache (§8.2). A re-flushed write relay (same
   // stable callId, e.g. the socket dropped between our write and its reply) returns the FIRST result instead
   // of executing a second time, so memory.write / practices.write / bus.send run exactly once across a flip.
@@ -98,8 +101,7 @@ export class WorkerExecutor implements Executor {
     // from the (future) restart_hub tool reaches hubctl through the hub's existing requestRestart.
     this.client.onEvent((m) => this.hub.ingestWorkerEvent(m.sessionId, m.wseq, m.kind, m.payload))
     this.client.onTurnLifecycle((m) => {
-      if (m.t === 'turnStarted') this.busySessions.add(m.sessionId)
-      else this.busySessions.delete(m.sessionId) // turnCompleted / turnError → idle
+      this.setBusy(m.sessionId, m.t === 'turnStarted')
       this.hub.applyLifecycle(m)
     })
     this.client.onRestartRequest((m) => this.hub.requestRestart(m.reason, m.bySession))
@@ -128,6 +130,12 @@ export class WorkerExecutor implements Executor {
     this.client.connect()
   }
 
+  private setBusy(sessionId: string, busy: boolean): void {
+    this.busyVersions.set(sessionId, (this.busyVersions.get(sessionId) ?? 0) + 1)
+    if (busy) this.busySessions.add(sessionId)
+    else this.busySessions.delete(sessionId)
+  }
+
   async startThread(spec: WorkerSessionSpec): Promise<string> {
     const reply = await this.client.call<Extract<WorkerToHub, { t: 'threadStarted' }>>({
       t: 'startThread',
@@ -148,7 +156,7 @@ export class WorkerExecutor implements Executor {
     // Optimistically mark busy on accept so the "a turn is already in progress" guard (SessionManager.send)
     // holds synchronously, before the worker's turnStarted round-trips back. The lifecycle stream remains
     // the source of truth and confirms (turnStarted) or clears (turnCompleted/turnError) it.
-    this.busySessions.add(spec.sessionId)
+    this.setBusy(spec.sessionId, true)
     try {
       await this.callAck({
         t: 'runTurn',
@@ -175,7 +183,7 @@ export class WorkerExecutor implements Executor {
       // Report it through the exact channel a worker-REPORTED failure uses, so every client un-sticks the
       // same way: turnError → applyLifecycle → journal `session/error` + status 'error'. onTurnLifecycle
       // clears busy for turnError, but nothing is listening to our synthesized message, so clear it here.
-      this.busySessions.delete(spec.sessionId)
+      this.setBusy(spec.sessionId, false)
       // Deliberately says "not confirmed", not "not started". The ACK is what failed, and a socket can drop
       // AFTER the worker accepted the turn but BEFORE its ack reaches us — in which case the turn really is
       // running and a later re-attach can legitimately replay its turnStarted. Claiming "not started" would
@@ -202,7 +210,7 @@ export class WorkerExecutor implements Executor {
   }
 
   async stopSession(sessionId: string): Promise<void> {
-    this.busySessions.delete(sessionId)
+    this.setBusy(sessionId, false)
     // Best-effort cleanup: the in-process stopSession is synchronous map deletes that never fail, and
     // SessionManager.delete() depends on it not throwing so it can still remove the persisted snapshot
     // (otherwise a hub restart would resurrect the deleted session). If the worker is unreachable, its
@@ -226,7 +234,24 @@ export class WorkerExecutor implements Executor {
   }
 
   async listLive(): Promise<LiveSession[]> {
+    const versionsAtRequest = new Map(this.busyVersions)
+    const busyAtRequest = new Set(this.busySessions)
     const reply = await this.client.call<Extract<WorkerToHub, { t: 'live' }>>({ t: 'listLive', reqId: nextReqId() })
+    const reported = new Set(reply.sessions.map((session) => session.sessionId))
+    for (const session of reply.sessions) {
+      // A local command/lifecycle mutation after this snapshot request wins; its state is newer than the
+      // worker view we asked for. Otherwise listLive is authoritative and repairs a busy bit left stale by
+      // a socket gap whose terminal lifecycle message has not replayed yet.
+      if ((this.busyVersions.get(session.sessionId) ?? 0) !== (versionsAtRequest.get(session.sessionId) ?? 0)) {
+        continue
+      }
+      this.setBusy(session.sessionId, session.status === 'active')
+    }
+    for (const sessionId of busyAtRequest) {
+      if (reported.has(sessionId)) continue
+      if ((this.busyVersions.get(sessionId) ?? 0) !== (versionsAtRequest.get(sessionId) ?? 0)) continue
+      this.setBusy(sessionId, false)
+    }
     return reply.sessions
   }
 

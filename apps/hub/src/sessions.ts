@@ -58,6 +58,11 @@ export interface TurnOverride {
   serviceTier?: string
 }
 
+export type SessionApiRecord = SessionRecord & {
+  /** Bus rows not yet accepted by this session's executor. This is delivery state, not readAt state. */
+  unreadFromTeammates: number
+}
+
 // Turn-boundary-preferred flip (docs/agent-worker-impl.md §8.4): when a restart is requested mid-turn, hold
 // the signal until the roster goes idle — but no longer than this, after which we flip anyway (the turn
 // survives the flip regardless via re-attach). ~one turn, so an ordinary restart almost always lands cleanly
@@ -103,6 +108,9 @@ export class SessionManager {
   // called again while the executor acknowledgement is in flight; without this fence both deliveries
   // would select the same undelivered rows and inject the same framed messages twice.
   private readonly busSteerInFlight = new Set<string>()
+  // One lightweight "mail is waiting" steer at most per turn when full-message steering is disabled.
+  // The journal carries the cross-hub fence; this Set keeps later messages in the same process query-free.
+  private readonly busNoticeTurns = new Set<string>()
   // Codex profiles whose config.toml `[mcp_servers.allmyagents]` we've already (re)written this boot —
   // so the lazy per-profile materialization (ensureCodexMcpConfig, driven from specOf/readCodexLimits) is
   // written once before the app-server starts, not re-read+rewritten on every turn.
@@ -670,7 +678,8 @@ export class SessionManager {
     // reflects the resume, so a re-attached session is correctly live and skipped. It is read with NO await
     // before the synchronous loop below, so nothing interleaves between the check and the reset: a session
     // absent HERE holds no live era at this instant, and its reset can only precede — never hide — later rows.
-    const liveIds = new Set((await this.executor.listLive()).map((s) => s.sessionId))
+    const refreshedLive = await this.executor.listLive()
+    const liveIds = new Set(refreshedLive.map((s) => s.sessionId))
     for (const record of this.sessions.values()) {
       if (liveIds.has(record.id)) continue // the worker holds it — its era (and its wseq) continue
       // F1: the worker does NOT hold this session, so its NEXT era restarts wseq at 1. Reset BOTH the
@@ -695,6 +704,17 @@ export class SessionManager {
         // respawn that silently flipped the record left the UI showing a live turn that no longer existed.
         this.setStatus(record, 'idle')
       }
+    }
+    // A turn can finish BETWEEN the first listLive snapshot and attach() draining its buffer. Its terminal
+    // marker is replay:true, correctly restoring status without firing side effects; but that means the
+    // ordinary live-idle delivery trigger never occurs. Only after attach has completed AND this fresh
+    // worker snapshot confirms the driver idle is it safe to re-arm queued mail. This is not "replay starts
+    // work": replay remains inert, and the post-attach authoritative state starts it.
+    for (const liveSession of refreshedLive) {
+      const record = this.sessions.get(liveSession.sessionId)
+      if (liveSession.status !== 'idle' || record?.status !== 'idle') continue
+      this.busNoticeTurns.delete(liveSession.sessionId) // the noticed turn is now conclusively over
+      setImmediate(() => this.deliverBus(liveSession.sessionId))
     }
   }
 
@@ -772,6 +792,16 @@ export class SessionManager {
     return [...this.sessions.values()]
   }
 
+  /** API roster enriched with undelivered bus counts. AgentBus does ONE grouped query and this joins it
+   *  in memory; never regress this into pending(id) per row on the UI's hot polling path. */
+  listForApi(): SessionApiRecord[] {
+    const pending = this.bus.pendingCounts()
+    return [...this.sessions.values()].map((record) => ({
+      ...record,
+      unreadFromTeammates: pending.get(record.id) ?? 0,
+    }))
+  }
+
   /** Persist one bounded raw upload beneath this session's cwd. The HTTP layer owns streaming limits. */
   async storeAttachment(sessionId: string, name: string, mime: string, bytes: Buffer): Promise<AttachmentMeta> {
     const record = this.sessions.get(sessionId)
@@ -837,6 +867,7 @@ export class SessionManager {
     if (status !== 'active') {
       this.busTurnSessions.delete(record.id)
       this.operatorTurnSessions.delete(record.id) // turn over → provenance no longer established
+      this.busNoticeTurns.delete(record.id)
     }
     this.persist(record)
     this.journal.append(record.id, 'session/status', { status })
@@ -1575,6 +1606,44 @@ export class SessionManager {
   }
 
   /**
+   * With full bus bodies intentionally deferred, inject only a short availability notice. This reuses the
+   * existing provider steer—there is no third transport—and NEVER marks the real rows delivered.
+   *
+   * Journal the ATTEMPT before crossing the external executor boundary. That ordering is the durable
+   * at-most-once fence: if the hub dies after the provider accepts but before our continuation runs, its
+   * successor still cannot repeat the notice in the same worker-surviving turn. A failed attempt is not
+   * retried per message; the full mail remains pending for the ordinary turn-boundary path.
+   */
+  private async noticePendingBus(sessionId: string): Promise<void> {
+    if (
+      this.busNoticeTurns.has(sessionId) ||
+      this.journal.hasBusPendingNoticeInCurrentTurn(sessionId)
+    ) {
+      this.busNoticeTurns.add(sessionId)
+      return
+    }
+    const pending = this.bus.pending(sessionId)
+    if (!pending.length) return
+    this.busNoticeTurns.add(sessionId)
+    this.journal.append(sessionId, 'bus/pending-notice-attempted', { count: pending.length })
+    const noun = pending.length === 1 ? 'message' : 'messages'
+    try {
+      await this.executor.steer(
+        sessionId,
+        `You have ${pending.length} teammate ${noun} waiting. Call read_messages to read ${
+          pending.length === 1 ? 'it' : 'them'
+        } now; full delivery stays queued until this turn ends.`
+      )
+    } catch (err) {
+      console.warn(
+        `[bus] pending-mail notice for ${sessionId} was not accepted; full delivery remains queued: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      )
+    }
+  }
+
+  /**
    * A live turn gets the unchanged semi-trusted frame through provider steering; this changes WHEN the
    * message arrives, never its trust label or the current turn's provenance. An idle recipient keeps the
    * historical path: a new bus-origin turn with full access clamped unless fullAccessAnyOrigin lifts it.
@@ -1583,7 +1652,13 @@ export class SessionManager {
     const record = this.sessions.get(sessionId)
     if (!record) return
     if (record.status === 'active' || record.status === 'starting') {
-      if (!this.steerMessagesAtToolBoundary() || this.busSteerInFlight.has(sessionId)) return
+      if (!this.steerMessagesAtToolBoundary()) {
+        // If a full-message steer is already crossing the boundary, let its acknowledgement decide which
+        // rows remain. Its finally re-arms delivery; only then can a notice truthfully count the remainder.
+        if (!this.busSteerInFlight.has(sessionId)) void this.noticePendingBus(sessionId)
+        return
+      }
+      if (this.busSteerInFlight.has(sessionId)) return
       const pending = this.bus.pending(sessionId)
       if (!pending.length) return
       // This is input to the EXISTING turn, so do not add busTurnSessions or remove
@@ -1594,6 +1669,10 @@ export class SessionManager {
       return
     }
     if (record.status !== 'idle') return
+    // A worker run is optimistically busy before turnStarted reaches the hub. Normal lifecycle will later
+    // schedule the idle delivery. Across a socket gap, WorkerExecutor.listLive reconciles its stale busy
+    // cache from the authoritative worker snapshot BEFORE SessionManager sets an idle record, so this
+    // return cannot become a permanent no-rearm state.
     if (record.provider === 'claude' && this.executor.isBusy(sessionId)) return
     const pending = this.bus.pending(sessionId)
     if (!pending.length) return

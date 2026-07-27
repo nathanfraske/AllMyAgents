@@ -817,7 +817,7 @@ export function startServer(opts: ServerOptions): http.Server {
         return
       }
       if (method === 'GET' && url.pathname === '/api/sessions') {
-        json(res, sessions.list())
+        json(res, sessions.listForApi())
         return
       }
       if (method === 'GET' && url.pathname === '/api/approvals') {

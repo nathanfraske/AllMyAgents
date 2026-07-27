@@ -82,6 +82,7 @@ export class Journal extends EventEmitter {
   private readonly insertWorkerStmt: Database.Statement
   private readonly lastWseqStmt: Database.Statement
   private readonly sinceStmt: Database.Statement
+  private readonly currentBusNoticeStmt: Database.Statement
   // Lazily built the first time a re-issued approval is reconciled (worker mode only — the in-process
   // executor never supplies a stable id, so this never runs flag-off, keeping the constructor byte-identical).
   private resolvedApprovalStmt: Database.Statement | undefined
@@ -209,6 +210,14 @@ export class Journal extends EventEmitter {
     this.sinceStmt = this.db.prepare(
       'SELECT seq, ts, session, kind, payload FROM events WHERE seq > ? ORDER BY seq ASC LIMIT ?'
     )
+    this.currentBusNoticeStmt = this.db.prepare(`
+      SELECT kind
+      FROM events
+      WHERE session = ?
+        AND kind IN ('session/turn-origin', 'bus/pending-notice-attempted')
+      ORDER BY seq DESC
+      LIMIT 1
+    `)
   }
 
   append(sessionId: string | null, kind: string, payload: unknown): HubEvent {
@@ -1027,6 +1036,17 @@ export class Journal extends EventEmitter {
     } catch {
       return undefined
     }
+  }
+
+  /**
+   * Whether this turn has already attempted the deliberately-small "mail is waiting" steer.
+   *
+   * The latest turn-origin row is the boundary. Keeping this fence in the journal—not only a process-local
+   * Set—preserves "at most once per turn" when the worker keeps the turn alive across a hub restart.
+   */
+  hasBusPendingNoticeInCurrentTurn(sessionId: string): boolean {
+    const row = this.currentBusNoticeStmt.get(sessionId) as { kind: string } | undefined
+    return row?.kind === 'bus/pending-notice-attempted'
   }
 
   lastEventForSession(sessionId: string): { kind: string; ts: string } | undefined {

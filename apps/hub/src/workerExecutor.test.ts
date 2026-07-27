@@ -118,3 +118,83 @@ describe('WorkerExecutor.runTurn — a turn the worker never accepted must not v
     expect(exec.isBusy('s1')).toBe(false)
   })
 })
+
+describe('WorkerExecutor.listLive — reconnect snapshots reconcile the busy cache', () => {
+  it('clears a stale busy bit when the worker authoritatively reports the session idle', async () => {
+    const calls: unknown[] = []
+    const client = {
+      onEvent: () => {},
+      onTurnLifecycle: () => {},
+      onRestartRequest: () => {},
+      onRelay: () => {},
+      onWelcome: () => {},
+      on: () => {},
+      connect: () => {},
+      send: () => {},
+      call: async (msg: { t: string; reqId: string }) => {
+        calls.push(msg)
+        if (msg.t === 'runTurn') return { t: 'ack', reqId: msg.reqId, ok: true }
+        if (msg.t === 'listLive') {
+          return {
+            t: 'live',
+            reqId: msg.reqId,
+            sessions: [{ sessionId: 's1', status: 'idle', lastWseq: 4 }],
+          }
+        }
+        throw new Error(`unexpected command: ${msg.t}`)
+      },
+    } as unknown as WorkerClient
+    const { hub } = recordingHub()
+    const exec = new WorkerExecutor(client, hub)
+
+    // runTurn's optimistic admission bit survives a socket gap when the terminal lifecycle message was
+    // missed. That makes an idle SessionRecord look executor-busy and used to strand queued bus mail.
+    await exec.runTurn(SPEC, 'hello', 'operator')
+    expect(exec.isBusy('s1')).toBe(true)
+
+    await exec.listLive()
+
+    expect(exec.isBusy('s1')).toBe(false)
+    expect(calls.map((call) => (call as { t: string }).t)).toEqual(['runTurn', 'listLive'])
+
+    // The repair must not create the inverse race: a listLive request that began before a NEW runTurn may
+    // return an older idle snapshot afterwards. The newer local mutation wins.
+    let resolveSnapshot:
+      | ((value: {
+          t: 'live'
+          reqId: string
+          sessions: Array<{ sessionId: string; status: 'idle'; lastWseq: number }>
+        }) => void)
+      | undefined
+    const racingClient = {
+      onEvent: () => {},
+      onTurnLifecycle: () => {},
+      onRestartRequest: () => {},
+      onRelay: () => {},
+      onWelcome: () => {},
+      on: () => {},
+      connect: () => {},
+      send: () => {},
+      call: (msg: { t: string; reqId: string }) => {
+        if (msg.t === 'runTurn') return Promise.resolve({ t: 'ack', reqId: msg.reqId, ok: true })
+        if (msg.t === 'listLive') {
+          return new Promise((resolve) => {
+            resolveSnapshot = resolve
+          })
+        }
+        return Promise.reject(new Error(`unexpected command: ${msg.t}`))
+      },
+    } as unknown as WorkerClient
+    const newer = new WorkerExecutor(racingClient, recordingHub().hub)
+    await newer.runTurn(SPEC, 'old turn', 'operator')
+    const staleSnapshot = newer.listLive()
+    await newer.runTurn(SPEC, 'new turn accepted after snapshot request', 'operator')
+    resolveSnapshot?.({
+      t: 'live',
+      reqId: 'stale',
+      sessions: [{ sessionId: 's1', status: 'idle', lastWseq: 4 }],
+    })
+    await staleSnapshot
+    expect(newer.isBusy('s1')).toBe(true)
+  })
+})

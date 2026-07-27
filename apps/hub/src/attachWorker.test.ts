@@ -817,6 +817,35 @@ describe('SessionManager.applyLifecycle — replayed markers do not re-journal o
     await new Promise((r) => setImmediate(r))
     expect(h.runTurnCalls).toEqual([{ sessionId: 's', origin: 'bus' }])
   })
+
+  it('flushes queued mail only after attach finishes and a fresh worker snapshot confirms replay ended idle', async () => {
+    const h = buildHub()
+    ;(h.sessions as unknown as { prefs: { chatNamePool: 'everyone'; steerMessagesAtToolBoundary: boolean } }).prefs = {
+      chatNamePool: 'everyone',
+      steerMessagesAtToolBoundary: false,
+    }
+    seedRecord(h.store, 's', 'active', 'claude', 'proj1')
+    seedRecord(h.store, 't', 'idle', 'claude', 'proj1')
+    h.sessions.loadRecords()
+    expect(h.sessions.busSend('t', { kind: 'session', id: 's' }, 'queued', 'survive the gap')).toEqual({
+      ok: true,
+      delivered: 1,
+    })
+
+    // Snapshot 1 says the turn is active, but it finishes before attach drains the worker buffer. The
+    // terminal is replay:true, so applying it alone must stay inert; only the fresh POST-attach listLive
+    // result is allowed to trigger the queued bus turn.
+    h.setLive([{ sessionId: 's', status: 'active', lastWseq: 6 }])
+    h.setOnAttach(() => {
+      h.sessions.applyLifecycle({ t: 'turnCompleted', sessionId: 's', wseq: 7, replay: true })
+      h.setLive([{ sessionId: 's', status: 'idle', lastWseq: 7 }])
+    })
+
+    await h.sessions.attachWorker()
+    await new Promise((resolve) => setImmediate(resolve))
+
+    expect(h.runTurnCalls).toEqual([{ sessionId: 's', origin: 'bus' }])
+  })
 })
 
 // ================================================================================================

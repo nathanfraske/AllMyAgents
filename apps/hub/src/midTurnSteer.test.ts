@@ -109,7 +109,7 @@ describe('SessionManager mid-turn steering', () => {
   })
 
   it('steers a framed bus message into a live turn without reclassifying that turn as bus-origin', async () => {
-    const { sessions, bus, steer } = build()
+    const { sessions, journal, bus, steer } = build()
     ;(sessions as unknown as { operatorTurnSessions: Set<string> }).operatorTurnSessions.add('s1')
     bus.post({
       from: { sessionId: 's2', profileId: 'p2', provider: 'claude', projectId: 'proj1', label: 'Teammate' },
@@ -128,6 +128,7 @@ describe('SessionManager mid-turn steering', () => {
     expect(steer.mock.calls[0]![1]).toContain('Use the other API')
     expect(steer.mock.calls[0]![1]).toContain('semi-trusted')
     expect(bus.pending('s1')).toHaveLength(0)
+    expect(journal.since(0).filter((event) => event.kind === 'bus/pending-notice-attempted')).toHaveLength(0)
     expect((sessions as unknown as { busTurnSessions: Set<string> }).busTurnSessions.has('s1')).toBe(false)
     expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(true)
   })
@@ -150,5 +151,98 @@ describe('SessionManager mid-turn steering', () => {
     expect(steer).toHaveBeenCalledOnce()
     expect(bus.pending('s1')).toHaveLength(1)
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('left queued'))
+  })
+
+  it('with full-message steering off, injects one durable notice per turn without delivering the mail', async () => {
+    const { sessions, journal, bus, steer } = build({ pref: false })
+    const post = (body: string) =>
+      bus.post({
+        from: { sessionId: 's2', profileId: 'p2', provider: 'claude', projectId: 'proj1', label: 'Teammate' },
+        project: 'proj1',
+        to: { kind: 'session', id: 's1' },
+        body,
+        recipients: ['s1'],
+      })
+
+    post('first message')
+    ;(sessions as unknown as { deliverBus(sessionId: string): void }).deliverBus('s1')
+    await settle()
+
+    expect(steer).toHaveBeenCalledOnce()
+    expect(steer.mock.calls[0]![1]).toMatch(/1 teammate message waiting.*read_messages/i)
+    expect(bus.pending('s1')).toHaveLength(1)
+    expect(journal.since(0).filter((event) => event.kind === 'bus/delivered')).toHaveLength(0)
+    expect(journal.since(0).filter((event) => event.kind === 'bus/pending-notice-attempted')).toHaveLength(1)
+
+    // More mail in the same turn neither repeats the notice nor marks either real message delivered.
+    post('second message')
+    ;(sessions as unknown as { deliverBus(sessionId: string): void }).deliverBus('s1')
+    await settle()
+    expect(steer).toHaveBeenCalledOnce()
+    expect(bus.pending('s1')).toHaveLength(2)
+
+    // The journal row is the cross-hub fence: losing only the process-local set during a restart must not
+    // make a still-running turn receive the same notice again.
+    ;(sessions as unknown as { busNoticeTurns: Set<string> }).busNoticeTurns.clear()
+    ;(sessions as unknown as { deliverBus(sessionId: string): void }).deliverBus('s1')
+    await settle()
+    expect(steer).toHaveBeenCalledOnce()
+
+    // A real turn boundary clears both fences, and the next turn-origin row makes the durable query
+    // distinguish "notice in the prior turn" from "notice in this one."
+    sessions.applyLifecycle({ t: 'turnCompleted', sessionId: 's1', wseq: 1 })
+    await settle()
+    journal.append('s1', 'session/turn-origin', { origin: 'operator' })
+    sessions.applyLifecycle({ t: 'turnStarted', sessionId: 's1', wseq: 2 })
+    post('third message, next turn')
+    ;(sessions as unknown as { deliverBus(sessionId: string): void }).deliverBus('s1')
+    await settle()
+    expect(steer).toHaveBeenCalledTimes(2)
+    expect(steer.mock.calls[1]![1]).toMatch(/3 teammate messages waiting.*read_messages/i)
+  })
+
+  it('builds API pending counts with one grouped query instead of pending() once per session', () => {
+    const { sessions, journal, bus } = build()
+    bus.post({
+      from: { sessionId: 's2', profileId: 'p2', provider: 'claude', projectId: 'proj1', label: 'Teammate' },
+      project: 'proj1',
+      to: { kind: 'session', id: 's1' },
+      body: 'one',
+      recipients: ['s1'],
+    })
+    const second = bus.post({
+      from: { sessionId: 's3', profileId: 'p3', provider: 'codex', projectId: 'proj1', label: 'Other' },
+      project: 'proj1',
+      to: { kind: 'session', id: 's1' },
+      body: 'two',
+      recipients: ['s1'],
+    })
+    const perSession = vi.spyOn(bus, 'pending')
+
+    const rows = (
+      sessions as unknown as {
+        listForApi(): Array<SessionRecord & { unreadFromTeammates: number }>
+      }
+    ).listForApi()
+
+    expect(rows).toEqual([expect.objectContaining({ id: 's1', unreadFromTeammates: 2 })])
+    expect(perSession).not.toHaveBeenCalled()
+    const plan = journal.db
+      .prepare(
+        'EXPLAIN QUERY PLAN SELECT toSession, COUNT(*) FROM bus_messages WHERE delivered = 0 GROUP BY toSession'
+      )
+      .all() as Array<{ detail: string }>
+    expect(plan.some((step) => step.detail.includes('idx_bus_pending_to'))).toBe(true)
+
+    bus.markDelivered(second.map((message) => message.id))
+    expect(
+      (
+        sessions as unknown as {
+          listForApi(): Array<SessionRecord & { unreadFromTeammates: number }>
+        }
+      )
+        .listForApi()
+        .find((row) => row.id === 's1')?.unreadFromTeammates
+    ).toBe(1)
   })
 })
