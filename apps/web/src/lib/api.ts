@@ -1,3 +1,16 @@
+/**
+ * What the hub returns for an uploaded attachment (its upload route responds with exactly these fields
+ * that a client should use). It is NOT the web's `AttachmentMeta` (that adds a client-derived `kind`,
+ * which the hub does not send) — deliberately only what actually comes back. `id` is what send/steer
+ * reference. The composer derives `kind` from `mime` itself (see attachments.ts) when it needs it.
+ */
+export interface AttachmentRef {
+  id: string
+  name: string
+  mime: string
+  size: number
+}
+
 export interface ProfileInfo {
   id: string
   provider: 'claude' | 'codex'
@@ -431,11 +444,59 @@ export const api = {
   approvals: () => jget<ApprovalRecord[]>('/api/approvals'),
   usage: () => jget<UsageSnapshot[]>('/api/usage'),
   refreshUsage: () => jpost<UsageSnapshot[] | ApiError>('/api/usage/refresh'),
+  // NOTE: spawn does NOT take `attachments`. Uploads are session-owned (their id is minted by the upload
+  // route against an existing session), so the hub REFUSES attachments on create (server.ts) — the first
+  // message with attachments is: spawn an empty session (no prompt) → uploadAttachment(id, file) per file
+  // → send(id, prompt, { attachments: ids }).
   spawn: (body: Record<string, unknown>) => jpost<SessionRecord | { error: string }>('/api/sessions', body),
-  send: (id: string, text: string, extra: Record<string, unknown> = {}) =>
+  // `attachments` is an array of attachment IDs (from uploadAttachment), NOT the metadata objects — the
+  // hub resolves ids to the stored files (server.ts stringArray: "must be an array of ids").
+  send: (id: string, text: string, extra: { model?: string; effort?: string; serviceTier?: string; attachments?: string[] } = {}) =>
     jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/input`, { text, ...extra }),
-  steer: (id: string, text: string) =>
-    jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/steer`, { text }),
+  steer: (id: string, text: string, attachments?: string[]) =>
+    jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/steer`, { text, ...(attachments?.length ? { attachments } : {}) }),
+  /**
+   * Upload ONE file's raw bytes to a session and get back its stored {@link AttachmentMeta} (id used to
+   * reference it on the next send/steer), or `{ error }` on failure. Bespoke transport — NOT jpost — the
+   * body is raw bytes, not JSON: content-type carries the mime and `x-filename` the name, matching the hub
+   * upload route. Like jpost it RESOLVES `{ error }` rather than throwing, so the composer must surface a
+   * failed upload AT the composer: a file that silently fails to attach is the same class of bug as one
+   * that silently fails to reach the vendor. The hub enforces the real per-mime size cap while streaming.
+   */
+  async uploadAttachment(sessionId: string, file: File): Promise<AttachmentRef | { error: string }> {
+    const url = `${HUB_HTTP}/api/sessions/${encodeURIComponent(sessionId)}/attachments`
+    let res: Response
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(),
+          'content-type': file.type || 'application/octet-stream',
+          // The hub reads x-filename verbatim as the stored name. HTTP header values are Latin-1, so a
+          // filename with characters fetch cannot put in a header rejects here and surfaces as { error }.
+          'x-filename': file.name,
+        },
+        body: file,
+      })
+    } catch (e) {
+      return { error: e instanceof Error ? e.message : 'network error' }
+    }
+    const text = await res.text()
+    let parsed: unknown
+    try {
+      parsed = text ? JSON.parse(text) : undefined
+    } catch {
+      return { error: text.slice(0, 200) || `HTTP ${res.status}` }
+    }
+    if (!res.ok) {
+      const err =
+        parsed && typeof parsed === 'object' && typeof (parsed as { error?: unknown }).error === 'string'
+          ? (parsed as { error: string }).error
+          : `HTTP ${res.status}`
+      return { error: err }
+    }
+    return parsed as AttachmentRef
+  },
   // A profile's on-disk custom slash commands (for the `/` command picker).
   commands: (profileId: string) => jget<CommandInfo[]>(`/api/profiles/${encodeURIComponent(profileId)}/commands`),
   // Request on-demand context compaction (the `/compact` built-in). See CompactResult.
