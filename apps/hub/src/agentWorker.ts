@@ -134,8 +134,28 @@ export function buildWorkerAgentServices(deps: WorkerAgentServiceDeps): AgentSer
     inbox: (sessionId) => deps.relayRpc('bus.inbox', { sessionId }) as Promise<BusMessage[]>,
     roster: (sessionId) =>
       deps.relayRpc('bus.roster', { sessionId }) as Promise<{ sessionId: string; label: string; provider: string; status: string }[]>,
-    peek: (caller, target) =>
-      deps.relayRpc('bus.peek', { caller, target }) as Promise<{ found: boolean; summary?: string }>,
+    peek: (caller, target, options) =>
+      deps.relayRpc('bus.peek', { caller, target, options }) as Promise<{ found: boolean; summary?: string }>,
+    childStatus: (managerSessionId) =>
+      deps.relayRpc('manager.childStatus', { managerSessionId }) as Promise<{
+        ok: boolean
+        summary?: string
+        error?: string
+      }>,
+    spawnAgent: (managerSessionId, input) =>
+      deps.relayRpc('manager.spawn', { managerSessionId, input }) as Promise<{
+        ok: boolean
+        sessionId?: string
+        label?: string
+        error?: string
+      }>,
+    setChildAuthority: (managerSessionId, childSessionId, authorities, tools) =>
+      deps.relayRpc('manager.setChildAuthority', {
+        managerSessionId,
+        childSessionId,
+        authorities,
+        tools,
+      }) as Promise<{ ok: boolean; error?: string }>,
     memory: {
       write: (input) => deps.relayRpc('memory.write', input) as Promise<Memory>,
       search: (query, opts) => deps.relayRpc('memory.search', { query, opts }) as Promise<Memory[]>,

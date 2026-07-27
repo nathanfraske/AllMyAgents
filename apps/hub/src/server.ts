@@ -1070,6 +1070,65 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, { ok: true })
         return
       }
+      // Operator control-plane only: there is deliberately no corresponding agent tool. The role marker
+      // is the trust boundary that unlocks spawn_agent; models may consume it but can never promote a
+      // session. Every grant/revoke is persisted on the session record and journaled by SessionManager.
+      const managerMatch = /^\/api\/sessions\/([^/]+)\/project-manager$/.exec(url.pathname)
+      if (method === 'POST' && managerMatch) {
+        // This role grant is stronger than ordinary local API writes, so it always requires the owner
+        // device capability even when broad local API token enforcement is disabled.
+        if (!authed) {
+          json(res, { error: 'operator device token required' }, 403)
+          return
+        }
+        const body = await readBody(req)
+        if (typeof body.enabled !== 'boolean') {
+          json(res, { error: 'enabled must be boolean' }, 400)
+          return
+        }
+        const rawDelegation = stringArray(body.delegation, 'delegation')
+        const allowedProfiles = stringArray(body.allowedProfiles, 'allowedProfiles')
+        const rawAllowedModels = body.allowedModels
+        const allowedModels: Record<string, string[]> = {}
+        if (rawAllowedModels !== undefined) {
+          if (!rawAllowedModels || typeof rawAllowedModels !== 'object' || Array.isArray(rawAllowedModels)) {
+            json(res, { error: 'allowedModels must map profile ids to model lists' }, 400)
+            return
+          }
+          for (const [profileId, models] of Object.entries(rawAllowedModels as Record<string, unknown>)) {
+            if (!Array.isArray(models) || models.some((model) => typeof model !== 'string')) {
+              json(res, { error: `allowedModels.${profileId} must be a list of model names` }, 400)
+              return
+            }
+            allowedModels[profileId] = models as string[]
+          }
+        }
+        const allowedTools = stringArray(body.allowedTools, 'allowedTools')
+        if (rawDelegation.some((authority) => authority !== 'commit' && authority !== 'push')) {
+          json(res, { error: 'delegation may contain only commit and push' }, 400)
+          return
+        }
+        const max =
+          body.maxLiveChildren === undefined ? undefined : Number(body.maxLiveChildren)
+        if (max !== undefined && (!Number.isInteger(max) || max < 1 || max > 16)) {
+          json(res, { error: 'maxLiveChildren must be a whole number from 1 to 16' }, 400)
+          return
+        }
+        const record = sessions.configureProjectManager(
+          managerMatch[1] as string,
+          {
+            enabled: body.enabled,
+            maxLiveChildren: max,
+            delegation: rawDelegation as Array<'commit' | 'push'>,
+            allowedProfiles,
+            allowedModels,
+            allowedTools,
+          },
+          'operator'
+        )
+        json(res, record)
+        return
+      }
       // "Always allow <tool> in this chat" / its undo. The approval prompt only ever offered approve-once,
       // so a long task re-prompted for the same tool forever and any missed prompt failed closed. The grant
       // is read by sessions.isAutoApproved via the hub's approval policy, so it applies to the very next

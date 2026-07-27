@@ -5,7 +5,7 @@ import type { BusAddress, BusMessage } from './bus.js'
 import type { Memory } from './memory.js'
 import type { Practice } from './practices.js'
 import { decidePracticeGate, practiceScope } from './practices.js'
-import type { DangerFlags } from './types.js'
+import type { DangerFlags, DelegatedAuthority } from './types.js'
 
 /**
  * A value the tool handlers may receive either synchronously (the in-process executor, which holds the
@@ -52,7 +52,37 @@ export interface AgentServices {
   /** The teammates the caller can message (same project, not itself, not stopped). */
   roster(sessionId: string): Awaitable<{ sessionId: string; label: string; provider: string; status: string }[]>
   /** A read-only one-line snapshot of a teammate's current activity (peek_agent) — no message, no interrupt. */
-  peek(callerSessionId: string, targetSessionId: string): Awaitable<{ found: boolean; summary?: string }>
+  peek(
+    callerSessionId: string,
+    targetSessionId: string,
+    options?: {
+      view?: 'summary' | 'activity' | 'transcript' | 'changes' | 'all'
+      afterSeq?: number
+    }
+  ): Awaitable<{ found: boolean; summary?: string }>
+  /** Exact current direct-child status tally for an operator-marked project manager. */
+  childStatus?(managerSessionId: string): Awaitable<{ ok: boolean; summary?: string; error?: string }>
+  /** Project-manager-only spawn. The hub derives the caller from the bound session identity. */
+  spawnAgent?(
+    managerSessionId: string,
+    input: {
+      profileId: string
+      prompt: string
+      model?: string
+      effort?: string
+      permissionMode?: 'safe' | 'edits' | 'full'
+      useWorktree?: boolean
+      authorities?: DelegatedAuthority[]
+      tools?: string[]
+    }
+  ): Awaitable<{ ok: boolean; sessionId?: string; label?: string; error?: string }>
+  /** Project-manager-only update of one direct child's narrowly scoped authority. */
+  setChildAuthority?(
+    managerSessionId: string,
+    childSessionId: string,
+    authorities: DelegatedAuthority[],
+    tools?: string[]
+  ): Awaitable<{ ok: boolean; error?: string }>
   memory: MemoryServices
   /** Agent-writable practices (durable conventions materialized into future agents). */
   practices: PracticeServices
@@ -169,12 +199,98 @@ const peekAgent = defineTool({
   name: 'peek_agent',
   description:
     'See what a teammate agent is currently doing — their status and last activity — WITHOUT interrupting them or sending a message. Give `to_session` (from list_agents). Use it to check on a teammate before deciding whether to message them.',
-  schema: { to_session: z.string().describe('the teammate session id from list_agents') },
+  schema: {
+    to_session: z.string().describe('the teammate session id from list_agents'),
+    view: z
+      .enum(['summary', 'activity', 'transcript', 'changes', 'all'])
+      .optional()
+      .describe('summary works for teammates; deep views are restricted to a manager’s own direct children'),
+    after_seq: z
+      .number()
+      .int()
+      .nonnegative()
+      .optional()
+      .describe('for transcript paging, return exact journal events after this sequence'),
+  },
   run: async (args, { identity, services }) => {
-    const r = await services.peek(identity.sessionId, args.to_session)
+    const r = await services.peek(identity.sessionId, args.to_session, {
+      view: args.view ?? 'summary',
+      afterSeq: args.after_seq,
+    })
     return r.found && r.summary
       ? r.summary
       : 'No such teammate on your project (check list_agents for a valid session id).'
+  },
+})
+
+const childStatus = defineTool({
+  name: 'child_status',
+  description:
+    'Project managers only: get an exact current tally and per-child status for your direct children. This reads live session records, not old messages.',
+  schema: {},
+  run: async (_args, { identity, services }) => {
+    if (!services.childStatus) return 'Status unavailable: this hub does not support manager child tallies.'
+    const result = await services.childStatus(identity.sessionId)
+    return result.ok && result.summary
+      ? result.summary
+      : `Status unavailable: ${result.error ?? 'unknown error'}`
+  },
+})
+
+const spawnAgent = defineTool({
+  name: 'spawn_agent',
+  description:
+    'Project managers only: create a child AllMyAgents session in your project, isolated in its own git worktree by default. The hub enforces your live child limit and delegation ceiling.',
+  schema: {
+    profile_id: z.string().describe('installed AllMyAgents profile id for the child'),
+    prompt: z.string().min(1).describe('the child agent task'),
+    model: z.string().optional(),
+    effort: z.string().optional(),
+    permission_mode: z.enum(['safe', 'edits', 'full']).optional(),
+    use_worktree: z.boolean().optional().describe('defaults to true'),
+    authorities: z
+      .array(z.enum(['commit', 'push']))
+      .optional()
+      .describe('optional commit/push authority, limited by the operator-granted manager ceiling'),
+    tools: z
+      .array(z.string())
+      .optional()
+      .describe('optional exact tool names, limited by the operator-granted manager tool ceiling'),
+  },
+  run: async (args, { identity, services }) => {
+    if (!services.spawnAgent) return 'Not spawned: this hub does not support manager spawning.'
+    const result = await services.spawnAgent(identity.sessionId, {
+      profileId: args.profile_id,
+      prompt: args.prompt,
+      model: args.model,
+      effort: args.effort,
+      permissionMode: args.permission_mode,
+      useWorktree: args.use_worktree ?? true,
+      authorities: args.authorities,
+      tools: args.tools,
+    })
+    if (!result.ok) return `Not spawned: ${result.error ?? 'unknown error'}`
+    return `Spawned child ${result.label ?? 'agent'} (session ${result.sessionId}).`
+  },
+})
+
+const setChildAuthority = defineTool({
+  name: 'set_child_authority',
+  description:
+    'Project managers only: replace a direct child agent\'s delegated Git authority. Allowed values are commit and push; an empty list revokes all delegated authority immediately.',
+  schema: {
+    child_session: z.string().describe('direct child session id'),
+    authorities: z.array(z.enum(['commit', 'push'])).describe('the complete replacement grant; [] revokes all'),
+    tools: z.array(z.string()).optional().describe('complete replacement tool grant; omit to keep it unchanged'),
+  },
+  run: async (args, { identity, services }) => {
+    if (!services.setChildAuthority) return 'Not changed: this hub does not support manager delegation.'
+    const result = await services.setChildAuthority(identity.sessionId, args.child_session, args.authorities, args.tools)
+    return result.ok
+      ? `Updated ${args.child_session}: ${args.authorities.length ? args.authorities.join(', ') : 'no Git authority'}${
+          args.tools ? `; tools ${args.tools.length ? args.tools.join(', ') : 'none'}` : ''
+        }.`
+      : `Not changed: ${result.error ?? 'unknown error'}`
   },
 })
 
@@ -328,6 +444,9 @@ export const AGENT_TOOLS: readonly AgentToolSpec[] = [
   sendMessage,
   readMessages,
   peekAgent,
+  childStatus,
+  spawnAgent,
+  setChildAuthority,
   memoryWrite,
   memorySearch,
   memoryRead,

@@ -528,6 +528,16 @@
           <label class="opt"><input type="checkbox" checked={danger.enableClaudeConnectors} onchange={(e) => setDanger({ enableClaudeConnectors: (e.target as HTMLInputElement).checked })} /> Enable claude.ai cloud connectors for Claude sessions</label>
           <p class="hint dim warnrow">Off (safe): the hub suppresses claude.ai cloud MCP connectors for managed Claude sessions — no data egress to vendor cloud connectors. On: they load as configured. Applies to managed profiles only, on the next turn.</p>
 
+          <h4>Project managers</h4>
+          <p class="hint dim">A project manager spawns and oversees other agents on your behalf. The manager flow collects its project, worker accounts and models, live-child bound, delegated actions, tools, and own-child visibility in one readable grant.</p>
+          <button
+            class="btn manager-open"
+            onclick={() => {
+              store.settingsOpen = false
+              store.openManagerSetup()
+            }}
+          ><Icon name="flag" size={13} /> Open project managers</button>
+
           <h4>Agent-authored practices</h4>
           <p class="hint dim">Durable conventions agents recorded, materialized into future agents at spawn. Revoking one removes it from future spawns (running sessions are unaffected until respawn).</p>
           {#if practices.length === 0}
@@ -622,6 +632,7 @@
   .danger-body .warnrow { margin: 0 0 var(--space-3) calc(1rem + var(--space-3)); }
   .danger-body h4 { margin: var(--space-3) 0 var(--space-1); font-size: var(--text-xs); }
   .danger-body .empty { margin: 0; }
+  .manager-open { display: inline-flex; align-items: center; gap: var(--space-2); margin-top: var(--space-2); }
   .prac-list { list-style: none; margin: var(--space-1) 0 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-3); }
   .prac { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--space-3) var(--space-4); box-shadow: var(--edge-hi); }
   .prac-head { display: flex; align-items: center; gap: var(--space-3); }

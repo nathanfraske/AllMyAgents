@@ -29,6 +29,7 @@ function makeHarness(opts: {
   isBusTurn?: boolean
   danger?: DangerFlags
   peek?: { found: boolean; summary?: string }
+  childStatus?: { ok: boolean; summary?: string; error?: string }
 } = {}): Harness {
   const memory = new MemoryStore(new Database(':memory:'))
   const practices = new PracticeStore(new Database(':memory:'))
@@ -43,6 +44,7 @@ function makeHarness(opts: {
     inbox: () => (opts.inbox ?? []) as never,
     roster: () => opts.roster ?? [],
     peek: (_caller, _target) => opts.peek ?? { found: false },
+    childStatus: () => opts.childStatus ?? { ok: false, error: 'not a project manager' },
     memory,
     practices,
     requireApproval: async (_id, kind, payload) => {
@@ -57,12 +59,15 @@ function makeHarness(opts: {
 }
 
 describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)', () => {
-  it('exposes exactly the 11 mcp__allmyagents__ tools, each with a description + schema', () => {
+  it('exposes the manager tools alongside the existing provider-agnostic tools', () => {
     expect(AGENT_TOOLS.map((t) => t.name)).toEqual([
       'list_agents',
       'send_message',
       'read_messages',
       'peek_agent',
+      'child_status',
+      'spawn_agent',
+      'set_child_authority',
       'memory_write',
       'memory_search',
       'memory_read',
@@ -76,6 +81,11 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
       expect(typeof t.schema).toBe('object')
       expect(typeof t.run).toBe('function')
     }
+  })
+
+  it('does not expose any tool that can grant or revoke the project-manager role', () => {
+    expect(AGENT_TOOLS.map((t) => t.name)).not.toContain('set_project_manager')
+    expect(AGENT_TOOLS.map((t) => t.name)).not.toContain('configure_project_manager')
   })
 
   it('runAgentTool throws on an unknown tool and reports bad args as a model-readable string', async () => {
@@ -118,10 +128,34 @@ describe('peek_agent (read-only teammate activity)', () => {
     expect(out).toBe('worker (claude) is actively working — last activity 3s ago (claude/assistant)')
   })
 
+  it('passes an explicit deep-view request through to the ownership-checking hub seam', async () => {
+    let seen: unknown
+    const h = makeHarness({ peek: { found: true, summary: 'full child transcript' } })
+    h.services.peek = (_caller, _target, options) => {
+      seen = options
+      return { found: true, summary: 'full child transcript' }
+    }
+    const out = await runAgentTool(
+      'peek_agent',
+      { to_session: 'child99', view: 'transcript', after_seq: 41 },
+      { identity: idA, services: h.services }
+    )
+    expect(out).toBe('full child transcript')
+    expect(seen).toEqual({ view: 'transcript', afterSeq: 41 })
+  })
+
   it('reports a friendly miss when the target is unknown / cross-project (found:false)', async () => {
     const h = makeHarness({ peek: { found: false } })
     const out = await runAgentTool('peek_agent', { to_session: 'nope' }, { identity: idA, services: h.services })
     expect(out).toMatch(/No such teammate/)
+  })
+})
+
+describe('child_status (manager lifecycle tally)', () => {
+  it('renders the hub-built direct-child tally', async () => {
+    const summary = 'Children: 2 running, 1 idle, 1 stopped, 1 errored.'
+    const h = makeHarness({ childStatus: { ok: true, summary } })
+    expect(await runAgentTool('child_status', {}, { identity: idA, services: h.services })).toBe(summary)
   })
 })
 

@@ -642,6 +642,15 @@ export class HubStore {
       v.record.model = rec.model
       v.record.effort = rec.effort
       v.record.serviceTier = rec.serviceTier
+      v.record.isProjectManager = rec.isProjectManager
+      v.record.managerMaxLiveChildren = rec.managerMaxLiveChildren
+      v.record.managerDelegation = rec.managerDelegation
+      v.record.managerAllowedProfiles = rec.managerAllowedProfiles
+      v.record.managerAllowedModels = rec.managerAllowedModels
+      v.record.managerAllowedTools = rec.managerAllowedTools
+      v.record.parentSessionId = rec.parentSessionId
+      v.record.delegatedAuthorities = rec.delegatedAuthorities
+      v.record.delegatedTools = rec.delegatedTools
       if (rec.title) v.record.title = rec.title
     }
   }
@@ -666,6 +675,18 @@ export class HubStore {
   }
 
   lastProfileId = $state<string | null>(null)
+  managerSetupOpen = $state(false)
+  managerSetupSessionId = $state<string | null>(null)
+
+  openManagerSetup(sessionId?: string): void {
+    this.managerSetupSessionId = sessionId ?? null
+    this.managerSetupOpen = true
+  }
+
+  closeManagerSetup(): void {
+    this.managerSetupOpen = false
+    this.managerSetupSessionId = null
+  }
 
   defaultProfileId(): string | undefined {
     if (settings.defaultAccount && this.profiles.some((p) => p.id === settings.defaultAccount)) return settings.defaultAccount
@@ -1271,6 +1292,11 @@ export class HubStore {
     // (context/cost fields populated from result + tokenUsage events)
     this.sessions[record.id] = view
     return view
+  }
+
+  /** Adopt a control-plane-created session immediately; the websocket's canonical create event remains idempotent. */
+  upsertSessionRecord(record: SessionRecord): SessionView {
+    return this.ensure(record)
   }
 
   /**

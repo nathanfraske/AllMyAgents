@@ -3,6 +3,7 @@
   import Sidebar from './lib/Sidebar.svelte'
   import ThreadView from './lib/ThreadView.svelte'
   import SettingsModal from './lib/SettingsModal.svelte'
+  import ManagerSetupModal from './lib/ManagerSetupModal.svelte'
   import ConfirmDialog from './lib/ConfirmDialog.svelte'
   import Dashboard from './lib/Dashboard.svelte'
   import Titlebar from './lib/Titlebar.svelte'
@@ -340,6 +341,9 @@
 </div>
 {#if store.settingsOpen}
   <SettingsModal onclose={() => (store.settingsOpen = false)} />
+{/if}
+{#if store.managerSetupOpen}
+  <ManagerSetupModal onclose={() => store.closeManagerSetup()} />
 {/if}
 {#if store.needsPairing}
   <div class="pairing-overlay">

@@ -337,6 +337,161 @@ describe('SessionManager.isAutoApproved — full access is not a blanket yes', (
   })
 })
 
+describe('project-manager delegated authority security boundary', () => {
+  type ManagerControls = {
+    configureProjectManager(
+      sessionId: string,
+      config: {
+        enabled: boolean
+        maxLiveChildren?: number
+        delegation?: Array<'commit' | 'push'>
+        allowedProfiles?: string[]
+        allowedModels?: Record<string, string[]>
+        allowedTools?: string[]
+      },
+      actor: 'operator' | 'agent'
+    ): SessionRecord
+    setChildDelegation(
+      managerSessionId: string,
+      childSessionId: string,
+      authorities: Array<'commit' | 'push'>,
+      tools?: string[]
+    ): SessionRecord
+    managerSpawn(
+      managerSessionId: string,
+      input: { profileId: string; prompt: string; model?: string }
+    ): Promise<{ ok: boolean; error?: string }>
+  }
+
+  function controls(sessions: SessionManager): ManagerControls {
+    return sessions as unknown as ManagerControls
+  }
+
+  it('an agent cannot mark itself or another session as project manager', () => {
+    const { sessions, seed } = makeSessions()
+    seed()
+    expect(() =>
+      controls(sessions).configureProjectManager(
+        's1',
+        { enabled: true, maxLiveChildren: 2, delegation: [] },
+        'agent'
+      )
+    ).toThrow(/operator/i)
+  })
+
+  it('a manager cannot delegate an authority outside its operator-granted ceiling', () => {
+    const { sessions, seed } = makeSessions()
+    seed({
+      isProjectManager: true,
+      managerMaxLiveChildren: 2,
+      managerDelegation: ['commit'],
+    } as Partial<SessionRecord>)
+    seed({
+      id: 'child',
+      parentSessionId: 's1',
+      permissionMode: 'safe',
+    } as Partial<SessionRecord>)
+
+    expect(() => controls(sessions).setChildDelegation('s1', 'child', ['push'])).toThrow(
+      /outside.*ceiling|cannot delegate.*push/i
+    )
+  })
+
+  it('revoking delegation stops the very next action, not merely the next session', () => {
+    const { sessions, seed } = makeSessions()
+    seed({
+      isProjectManager: true,
+      managerMaxLiveChildren: 2,
+      managerDelegation: ['commit'],
+    } as Partial<SessionRecord>)
+    seed({
+      id: 'child',
+      parentSessionId: 's1',
+      delegatedAuthorities: ['commit'],
+      permissionMode: 'safe',
+    } as Partial<SessionRecord>)
+
+    const commit = {
+      toolName: 'Bash',
+      input: { command: 'git commit -am "manager-approved checkpoint"' },
+    }
+    expect(sessions.isAutoApproved('child', 'claude/tool', commit)).toBe(true)
+
+    controls(sessions).configureProjectManager(
+      's1',
+      { enabled: true, maxLiveChildren: 2, delegation: [] },
+      'operator'
+    )
+    expect(sessions.isAutoApproved('child', 'claude/tool', commit)).toBe(false)
+  })
+
+  it('tool grants narrow the operator ceiling and revoke on the next action too', () => {
+    const { sessions, seed } = makeSessions()
+    seed({
+      isProjectManager: true,
+      managerMaxLiveChildren: 2,
+      managerAllowedTools: ['Bash'],
+    } as Partial<SessionRecord>)
+    seed({
+      id: 'child',
+      parentSessionId: 's1',
+      delegatedTools: ['Bash'],
+      permissionMode: 'safe',
+    } as Partial<SessionRecord>)
+
+    expect(sessions.isAutoApproved('child', 'claude/tool', {
+      toolName: 'Bash',
+      input: { command: 'pnpm test' },
+    })).toBe(true)
+    expect(() => controls(sessions).setChildDelegation('s1', 'child', [], ['WebFetch'])).toThrow(
+      /outside.*ceiling/i
+    )
+    controls(sessions).configureProjectManager(
+      's1',
+      { enabled: true, maxLiveChildren: 2, delegation: [], allowedTools: [] },
+      'operator'
+    )
+    expect(sessions.isAutoApproved('child', 'claude/tool', {
+      toolName: 'Bash',
+      input: { command: 'pnpm test' },
+    })).toBe(false)
+  })
+
+  it('refuses a bounded spawn with a clear live-child-limit error', async () => {
+    const { sessions, seed } = makeSessions()
+    seed({
+      isProjectManager: true,
+      managerMaxLiveChildren: 1,
+      managerAllowedProfiles: ['p1'],
+    } as Partial<SessionRecord>)
+    seed({ id: 'child', parentSessionId: 's1', status: 'idle' } as Partial<SessionRecord>)
+
+    await expect(controls(sessions).managerSpawn('s1', { profileId: 'p1', prompt: 'another task' }))
+      .resolves.toMatchObject({ ok: false, error: expect.stringMatching(/live child limit reached \(1\/1\)/) })
+  })
+
+  it('a manager cannot choose a child model outside the operator-granted profile model scope', async () => {
+    const { sessions, seed } = makeSessions()
+    seed({
+      isProjectManager: true,
+      managerMaxLiveChildren: 2,
+      managerAllowedProfiles: ['p1'],
+      managerAllowedModels: { p1: ['allowed-model'] },
+    } as Partial<SessionRecord>)
+
+    await expect(
+      controls(sessions).managerSpawn('s1', {
+        profileId: 'p1',
+        model: 'ungranted-model',
+        prompt: 'work within the brief',
+      }),
+    ).resolves.toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/model ungranted-model.*outside.*p1/i),
+    })
+  })
+})
+
 /**
  * The Danger Zone opt-out from the origin check above.
  *

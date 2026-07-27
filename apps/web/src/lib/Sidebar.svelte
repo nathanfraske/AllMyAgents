@@ -304,22 +304,85 @@
   type Entry =
     | { key: string; kind: 'folder'; railId: null; railEnd: false; folder: ChatFolder; count: number }
     | { key: string; kind: 'empty'; railId: string; railEnd: true; folder: ChatFolder }
-    | { key: string; kind: 'chat'; railId: string | null; railEnd: boolean; s: SessionView }
+    | {
+        key: string
+        kind: 'chat'
+        railId: string | null
+        railEnd: boolean
+        s: SessionView
+        managerDepth: number
+        managerHasChildren: boolean
+      }
 
   function entriesFor(g: Group): Entry[] {
     const out: Entry[] = []
+    const byId = new Map(g.sessions.map((item) => [item.record.id, item]))
+    const children = new Map<string, SessionView[]>()
+    for (const item of g.sessions) {
+      const parent = item.record.parentSessionId
+      if (!parent || !byId.get(parent)?.record.isProjectManager) continue
+      const list = children.get(parent) ?? []
+      list.push(item)
+      children.set(parent, list)
+    }
+    const linked = new Set([...children.values()].flat().map((item) => item.record.id))
+    const emitted = new Set<string>()
+    const suppressed = new Set<string>()
+    const suppressTree = (item: SessionView): void => {
+      if (suppressed.has(item.record.id)) return
+      suppressed.add(item.record.id)
+      for (const child of children.get(item.record.id) ?? []) suppressTree(child)
+    }
+    const appendTree = (
+      roots: SessionView[],
+      railId: string | null
+    ): void => {
+      const rows: Array<{ s: SessionView; depth: number; hasChildren: boolean }> = []
+      const visit = (item: SessionView, depth: number): void => {
+        if (emitted.has(item.record.id) || suppressed.has(item.record.id)) return
+        emitted.add(item.record.id)
+        const nested = children.get(item.record.id) ?? []
+        rows.push({ s: item, depth, hasChildren: nested.length > 0 })
+        if (collapsed.has(`manager:${item.record.id}`)) {
+          for (const child of nested) suppressTree(child)
+          return
+        }
+        for (const child of nested) visit(child, depth + 1)
+      }
+      for (const root of roots) visit(root, 0)
+      rows.forEach(({ s, depth, hasChildren }, index) => {
+        out.push({
+          key: `c:${s.record.id}`,
+          kind: 'chat',
+          railId,
+          railEnd: railId !== null && index === rows.length - 1,
+          s,
+          managerDepth: depth,
+          managerHasChildren: hasChildren,
+        })
+      })
+    }
+
     for (const b of g.foldered) {
       out.push({ key: `f:${b.folder.id}`, kind: 'folder', railId: null, railEnd: false, folder: b.folder, count: b.items.length })
-      if (collapsed.has(b.folder.id)) continue
+      const roots = b.items.filter((item) => !linked.has(item.record.id))
+      if (collapsed.has(b.folder.id)) {
+        for (const root of roots) suppressTree(root)
+        continue
+      }
       if (b.items.length === 0) {
         out.push({ key: `e:${b.folder.id}`, kind: 'empty', railId: b.folder.id, railEnd: true, folder: b.folder })
         continue
       }
-      b.items.forEach((s, i) => {
-        out.push({ key: `c:${s.record.id}`, kind: 'chat', railId: b.folder.id, railEnd: i === b.items.length - 1, s })
-      })
+      appendTree(roots, b.folder.id)
     }
-    for (const s of g.loose) out.push({ key: `c:${s.record.id}`, kind: 'chat', railId: null, railEnd: false, s })
+    appendTree(g.loose.filter((item) => !linked.has(item.record.id)), null)
+
+    // Broken/cyclic lineage must never make a chat disappear. Children hidden by a deliberate collapsed
+    // ancestor are in `suppressed`; every other unrendered row falls back to the loose root level.
+    for (const item of g.sessions) {
+      if (!emitted.has(item.record.id) && !suppressed.has(item.record.id)) appendTree([item], null)
+    }
     return out
   }
 
@@ -532,6 +595,9 @@
   <div class="sec-head">
     <span>PROJECTS</span>
     <span class="sec-actions">
+      <button class="manager-entry" title="project managers" onclick={() => store.openManagerSetup()}>
+        <Icon name="flag" size={12} /><span>Managers</span>
+      </button>
       <button class="icon" class:on={showCreate} title="new project" onclick={() => (showCreate = !showCreate)}><Icon name="folder-plus" size={15} /></button>
       <button class="icon" title="new chat" onclick={() => store.newSession()}><Icon name="square-pen" size={15} /></button>
     </span>
@@ -668,7 +734,14 @@
               {@const st = store.status(s)}
               {@const pending = store.pendingBySession[s.record.id] ?? 0}
               {@const unread = unreadMailCount(s.record.unreadFromTeammates)}
-              <div class="row" class:sel={store.selectedId === s.record.id} class:dragging={isDragging('chat', s.record.id)} role="button" tabindex="0"
+              <div
+                class="row"
+                class:sel={store.selectedId === s.record.id}
+                class:dragging={isDragging('chat', s.record.id)}
+                class:managedchild={en.managerDepth > 0}
+                style={`--manager-depth:${en.managerDepth}`}
+                role="button"
+                tabindex="0"
                 draggable={editingId !== s.record.id}
                 ondragstart={(e) => startChatDrag(e, g.id, s.record.id, en.railId)}
                 ondragend={endDrag}
@@ -677,8 +750,33 @@
                 onclick={() => store.select(s.record.id)}
                 onkeydown={(e) => { if (e.key === 'Enter') store.select(s.record.id) }}>
                 <span class="grip" aria-hidden="true">{@render gripIcon()}</span>
+                {#if en.managerHasChildren}
+                  <button
+                    class="manager-toggle"
+                    title={collapsed.has(`manager:${s.record.id}`) ? 'expand child agents' : 'collapse child agents'}
+                    onclick={(e) => {
+                      e.stopPropagation()
+                      toggleCollapse(`manager:${s.record.id}`)
+                    }}
+                  >
+                    <Icon name={collapsed.has(`manager:${s.record.id}`) ? 'chevron-right' : 'chevron-down'} size={11} />
+                  </button>
+                {:else if en.managerDepth > 0}
+                  <span class="manager-branch" aria-hidden="true"><Icon name="corner-down-right" size={10} /></span>
+                {/if}
                 <span class="dot {st.key}" title={st.label}></span>
                 <ProviderLogo provider={s.record.provider} size={13} />
+                {#if s.record.isProjectManager}
+                  <button
+                    class="pmtag"
+                    title="project manager · view scope or revoke"
+                    aria-label={`View project manager scope for ${label(s)}`}
+                    onclick={(event) => {
+                      event.stopPropagation()
+                      store.openManagerSetup(s.record.id)
+                    }}
+                  >PM</button>
+                {/if}
                 {#if s.record.imported}<span class="ibadge" title="imported from an existing {s.record.provider} chat"><Icon name="download" size={10} /></span>{/if}
                 {#if editingId === s.record.id}
                   <input class="rename-input" bind:value={draft} use:focusInput
@@ -748,6 +846,10 @@
   .search input { width: 100%; padding-left: 1.9rem; }
   .sec-head { display: flex; align-items: center; justify-content: space-between; padding: var(--space-2) var(--space-5); font-size: var(--text-2xs); letter-spacing: var(--ls-label); text-transform: uppercase; color: var(--dim); }
   .sec-actions { display: flex; gap: 0.15rem; }
+  .manager-entry { display: flex; align-items: center; gap: .28rem; margin-right: .2rem; padding: .22rem .4rem;
+    color: var(--dim); border: 1px solid var(--border); border-radius: var(--r-sm); font-size: .62rem;
+    letter-spacing: .03em; text-transform: none; }
+  .manager-entry:hover { color: var(--text); border-color: var(--border-accent); background: var(--surface-2); }
   .icon { display: grid; place-items: center; color: var(--muted); width: 26px; height: 24px; border-radius: var(--r-sm); transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease); }
   .icon:hover { background: var(--surface-2); color: var(--text); }
   .icon.on { background: var(--surface-3); color: var(--accent); }
@@ -818,6 +920,13 @@
   .fempty.droptarget { border-style: solid; border-color: transparent; color: var(--text); }
 
   .row { position: relative; display: flex; align-items: center; gap: var(--space-3); padding: var(--space-2) var(--space-3) var(--space-2) var(--space-6); border-radius: var(--r-md); cursor: pointer; }
+  .row.managedchild { margin-left: calc(var(--manager-depth) * 0.85rem); width: calc(100% - (var(--manager-depth) * 0.85rem)); }
+  .manager-toggle, .manager-branch { flex: none; display: grid; place-items: center; width: 12px; color: var(--dim); }
+  .manager-toggle:hover { color: var(--text); }
+  .pmtag { flex: none; font-size: 0.58rem; line-height: 1; letter-spacing: 0.04em; padding: 0.18rem 0.25rem;
+    border-radius: var(--r-xs); color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent);
+    font-weight: var(--fw-semibold); border: 0; }
+  .pmtag:hover { background: color-mix(in srgb, var(--accent) 22%, transparent); }
   .row:hover { background: var(--surface-2); }
   .row.sel { background: var(--surface-2); box-shadow: inset 2px 0 0 var(--accent); }
   /* Drag hint: a faint grip rail on the left, revealed on hover, signalling the whole ROW/HEADER is

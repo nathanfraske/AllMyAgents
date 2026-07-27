@@ -16,6 +16,7 @@ export interface Project {
 }
 
 export type SessionStatus = 'starting' | 'active' | 'idle' | 'stopped' | 'error'
+export type DelegatedAuthority = 'commit' | 'push'
 
 export interface SessionRecord {
   id: string
@@ -46,6 +47,24 @@ export interface SessionRecord {
    *  the worker and in-process executors funnel through — so adding one takes effect immediately, mid-turn,
    *  with no worker respawn. Per-chat by design: a blanket global allowlist is a much bigger blast radius. */
   allowedTools?: string[]
+  /** Operator-granted project-manager role. Agents can consume this marker but never set it. */
+  isProjectManager?: boolean
+  /** Bounded direct-child capacity for a manager. Absent is never interpreted as unlimited. */
+  managerMaxLiveChildren?: number
+  /** The operator's ceiling: authorities this manager may grant to its own direct children. */
+  managerDelegation?: DelegatedAuthority[]
+  /** Profiles (agent/account types) this manager may choose for children. Empty/absent means none. */
+  managerAllowedProfiles?: string[]
+  /** Explicit model slugs the manager may request per child profile. Omitted models use that profile's default. */
+  managerAllowedModels?: Record<string, string[]>
+  /** Exact executable tool names this manager may grant to children (for example Bash or WebFetch). */
+  managerAllowedTools?: string[]
+  /** Durable session lineage for sidebar nesting and hub-originated child reports. */
+  parentSessionId?: string
+  /** Authorities this child received from its manager, still subject to the manager's live ceiling. */
+  delegatedAuthorities?: DelegatedAuthority[]
+  /** Exact tool names granted to this child, still subject to the manager's live ceiling. */
+  delegatedTools?: string[]
   // Human-facing name shown in the sidebar. Auto-derived from the first prompt (titleSource:'auto')
   // and overridable by the user (titleSource:'user', which freezes auto-naming). Absent → the UI
   // falls back to the worktree/cwd basename.

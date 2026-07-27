@@ -189,6 +189,10 @@ const executor: Executor = workerSocket
     })
   : new InProcessExecutor({ approvals, usage, danger, memory, practices })
 sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, dataDir, executor, prefs)
+journal.on('event', (event) => {
+  if (event.kind !== 'worktree/risk-detected') return
+  void sessions.reportWorktreeRiskToManagers(event.payload)
+})
 const worktreeCollisions = new WorktreeCollisionDetector({
   sessions: () => sessions.list(),
   enabled: () => danger.disableWorktreeCollisionWarnings !== true,
