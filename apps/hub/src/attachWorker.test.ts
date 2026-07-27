@@ -540,7 +540,7 @@ describe('SessionManager.attachWorker — the exactly-once replay cursor (hub si
 })
 
 describe('SessionManager.attachWorker — the three re-attach outcomes (§6)', () => {
-  it('active→keep active + replay from the durable cursor; idle→setStatus idle; unknown→restored-stale', async () => {
+  it('active→keep active; held sessions replay from durable cursors; idle→setStatus idle; unknown→restored-stale', async () => {
     const h = buildHub()
     seedRecord(h.store, 'active1', 'active') // worker holds it, still busy → kept active + replayed
     seedRecord(h.store, 'idle1', 'active') //   worker holds it, no live turn → flipped to idle
@@ -563,10 +563,12 @@ describe('SessionManager.attachWorker — the three re-attach outcomes (§6)', (
 
     // OUTCOME 1 — active: kept active across the seam; attach called with its DURABLE cursor; NOT restored-stale.
     expect(rec('active1').status).toBe('active')
-    expect(h.attachCalls).toEqual([{ active1: 3 }])
+    expect(h.attachCalls).toEqual([{ active1: 3, idle1: 0 }])
     expect(journaled.some((e) => e.sid === 'active1' && e.kind === 'session/restored-stale')).toBe(false)
 
     // OUTCOME 2 — idle: setStatus(idle) flips + persists the record and journals a session/status.
+    // It is also replayed from its durable cursor so output completed during the
+    // hub gap is not stranded in the worker buffer.
     expect(rec('idle1').status).toBe('idle')
     expect(persisted('idle1').status).toBe('idle')
     expect(journaled).toContainEqual({ sid: 'idle1', kind: 'session/status' })

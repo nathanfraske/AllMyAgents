@@ -585,17 +585,16 @@ export class SessionManager {
    * 'attached' event (via the WorkerExecutor callback), NOT called inline in boot(): the worker connection is
    * async + auto-reconnecting, so this runs whenever a fresh hub — or this hub after a socket flap — attaches.
    *
-   * For each session the worker still holds (executor.listLive()):
-   *   - status 'active' (a live claude turn) → keep the record `active` across the seam and set its replay
-   *     cursor to the DURABLE lastJournaledWseq(sid). THE EXACTLY-ONCE INVARIANT: the hub journals worker
-   *     events via appendWorker(…, wseq), so lastJournaledWseq is the high-water mark of what is durably
-   *     recorded; the worker replays ONLY wseq > since[sid]; therefore no event is journaled twice and none
-   *     is skipped — the same cursor guarantee journal.replay() gives the WS, extended across the worker
-   *     boundary. (ingestWorkerEvent enforces it a second time as defense-in-depth; we seed its high-water
-   *     mark to the same cursor here.)
-   *   - status 'idle' (the worker holds the driver but no live turn) → setStatus(idle), exactly as today.
-   * Then, for every active session, executor.attach(since) makes the worker replay the gap (wseq > cursor,
-   * plus a worker/attach-gap sentinel if its ring wrapped) and resume live emission — the turn finishes here.
+   * For each session the worker still holds (executor.listLive()), set its replay cursor to the DURABLE
+   * lastJournaledWseq(sid), whether the worker reports it active OR idle. A turn can finish entirely while
+   * no hub is attached; that worker now reports idle, but its buffer is the only copy of the completed
+   * output. Excluding idle sessions strands that output forever.
+   *
+   * THE EXACTLY-ONCE INVARIANT: the hub journals worker events via appendWorker(…, wseq), so
+   * lastJournaledWseq is the high-water mark of what is durably recorded; the worker replays ONLY wseq >
+   * since[sid], and ingestWorkerEvent independently drops anything at or below its never-decreasing guard.
+   * Status remains separate: active workers keep the record active; idle workers set it idle. Then
+   * executor.attach(since) drains every held session before live emission resumes.
    *
    * Every active|starting roster record the worker does NOT claim is truly stale (a worker that never heard
    * of it, or was respawned fresh) → the normal Phase-1 restored-stale path. On a COLD start listLive() is
@@ -620,21 +619,23 @@ export class SessionManager {
       // agent stalls on a prompt the operator never expected and may not even see. Read back from the
       // journal so provenance lasts as long as the turn, not as long as the process.
       if (s.status === 'active') this.restoreTurnOrigin(record.id)
+      // Drain EVERY worker-held session, not only live turns. If a turn completed while no hub was
+      // attached, listLive correctly reports idle; its buffered assistant/result events are still newer
+      // than this durable cursor and must be replayed. The cursor is exclusive and never lowered, so a
+      // socket race that also delivers an event live is dropped by ingestWorkerEvent rather than doubled.
+      const cursor = this.lastJournaledWseq(s.sessionId)
+      since[s.sessionId] = cursor
+      // F3: NEVER LOWER the high-water mark. Concurrent attachWorker runs can observe different durable
+      // cursors; seeding to MAX prevents a stale-low run from letting a re-flush re-journal newer events.
+      this.ingestedWseq.set(s.sessionId, Math.max(this.ingestedWseq.get(s.sessionId) ?? cursor, cursor))
       if (s.status === 'active') {
         record.status = 'active' // keep the live turn active across the seam (already persisted active)
-        const cursor = this.lastJournaledWseq(s.sessionId) // the DURABLE exactly-once replay cursor (§7.1)
-        since[s.sessionId] = cursor
-        // F3: NEVER LOWER the high-water mark. On a green flip, reconcileStale()'s `void attachWorker()` and
-        // the WorkerClient 'attached' handler can run attachWorker concurrently; a second run that read a
-        // stale-low cursor must not pull the guard back beneath events already journaled+guarded (which would
-        // let a re-flush re-journal them). Seed to the MAX of the existing guard and this cursor.
-        this.ingestedWseq.set(s.sessionId, Math.max(this.ingestedWseq.get(s.sessionId) ?? cursor, cursor))
       } else {
         this.setStatus(record, 'idle') // driver alive but no live turn
       }
     }
-    // Replay the gap for every active session: the worker re-sends wseq > since[sid] (+ a worker/attach-gap
-    // sentinel if its ring wrapped), then resumes live emission — the turn finishes on this hub.
+    // Replay the gap for every held session: the worker re-sends wseq > since[sid] (+ a worker/attach-gap
+    // sentinel if its ring wrapped), then resumes live emission.
     if (Object.keys(since).length) await this.executor.attach(since)
     // Stale sweep: a roster record still active|starting that the worker does NOT hold is genuinely stale.
     // N1 (TOCTOU) — re-verify staleness against a FRESH listLive() taken HERE, not the top-of-function
