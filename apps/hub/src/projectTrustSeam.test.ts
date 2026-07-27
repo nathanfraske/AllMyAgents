@@ -32,8 +32,14 @@ describe('per-project executable-config trust seam', () => {
     const trusted = projects.create('trusted', tmp)
     const untrustedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-project-untrusted-'))
     const untrusted = projects.create('untrusted', untrustedDir)
-    const isConfigTrusted = vi.fn((projectId: string) => projectId === trusted.id)
-    ;(projects as ProjectStore & { isConfigTrusted(projectId: string): boolean }).isConfigTrusted = isConfigTrusted
+    const isConfigTrusted = vi.fn(
+      (projectId: string, cwd?: string) => projectId === trusted.id && cwd === trusted.path
+    )
+    ;(
+      projects as ProjectStore & {
+        isConfigTrusted(projectId: string, cwd?: string): boolean
+      }
+    ).isConfigTrusted = isConfigTrusted
     const specs: WorkerSessionSpec[] = []
     const executor: Executor = {
       startThread: async () => 'unused',
@@ -84,8 +90,8 @@ describe('per-project executable-config trust seam', () => {
       useWorktree: false,
     })
 
-    expect(isConfigTrusted).toHaveBeenCalledWith(trusted.id)
-    expect(isConfigTrusted).toHaveBeenCalledWith(untrusted.id)
+    expect(isConfigTrusted).toHaveBeenCalledWith(trusted.id, trusted.path)
+    expect(isConfigTrusted).toHaveBeenCalledWith(untrusted.id, untrusted.path)
     expect(specs.map((spec) => spec.trustProjectConfig)).toEqual([true, false])
   })
 })

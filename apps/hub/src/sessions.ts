@@ -398,10 +398,11 @@ export class SessionManager {
     // executable-config gate out of SessionManager prevents this transport flag becoming a second trust
     // authority.
     const projectTrust = this.projects as ProjectStore & {
-      isConfigTrusted?(projectId: string): boolean
+      isConfigTrusted?(projectId: string, cwd?: string): boolean
     }
     const trustProjectConfig =
-      record.projectId !== undefined && projectTrust.isConfigTrusted?.(record.projectId) === true
+      record.projectId !== undefined &&
+      projectTrust.isConfigTrusted?.(record.projectId, record.cwd) === true
     // Before the executor lazily spawns this Codex profile's app-server (which reads config.toml on
     // first use), make sure the `allmyagents` MCP server is registered so Codex gets the same tools as
     // Claude. Guarded to once per profile, and a no-op until setCodexBridge wires the bridge (so tests /
