@@ -15,15 +15,22 @@
   const accessName = $derived(
     permissionMode === 'full' ? 'Full access' : permissionMode === 'edits' ? 'Edits' : 'Safe'
   )
+  const hasWorkingDirectory = $derived(
+    !!workingDirectory
+      && workingDirectory !== 'Working directory not set'
+      && workingDirectory !== 'Assigned when this chat starts'
+  )
 </script>
 
 <section class="guide" aria-labelledby="first-chat-title">
   <div class="eyebrow">YOUR FIRST CHAT</div>
   <h2 id="first-chat-title">You’re about to start a coding agent</h2>
   <p>
-    AllMyAgents will run {providerName} in <strong>{projectName}</strong>. The agent works from
-    <code title={workingDirectory}>{workingDirectory}</code> and can inspect or change files according
-    to the access mode you choose.
+    AllMyAgents will run {providerName} in <strong>{projectName}</strong>.
+    {#if hasWorkingDirectory}
+      The agent will work from <code title={workingDirectory}>{workingDirectory}</code>.
+    {/if}
+    It can inspect or change files according to the access mode you choose.
   </p>
 
   <div class="checks">
@@ -33,8 +40,9 @@
   </div>
 
   <p class="setup">
-    First-launch note: the desktop app installs the local hub’s pinned npm dependencies, including the
-    Claude Code and Codex CLIs. That one-time setup and account sign-in need an internet connection.
+    First use: AllMyAgents prepares Claude Code and Codex so chats can run on this computer. Keep the app
+    open; setup needs an internet connection and can take a few minutes. Sign in to the account you want
+    to use when prompted.
   </p>
 </section>
 
