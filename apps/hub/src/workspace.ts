@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process'
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 
@@ -16,12 +17,14 @@ export type ScratchInspection =
 
 export class WorkspaceManager {
   private readonly scratchRoot: string
+  private readonly namedProjectsRoot: string
 
   constructor(
     private readonly worktreesRoot: string,
     scratchRoot = path.join(path.dirname(worktreesRoot), 'workspaces')
   ) {
     this.scratchRoot = scratchRoot
+    this.namedProjectsRoot = path.join(path.dirname(worktreesRoot), 'projects')
     fs.mkdirSync(worktreesRoot, { recursive: true })
     fs.mkdirSync(scratchRoot, { recursive: true })
   }
@@ -54,6 +57,58 @@ export class WorkspaceManager {
   /** The common app-data root containing both project worktrees and unfiled-chat workspaces. */
   managedRoot(): string {
     return path.dirname(this.worktreesRoot)
+  }
+
+  /**
+   * Materialize a name-only project under the app-data root. This is deliberately separate from
+   * scratch chat workspaces: it is a real project repository and can therefore honor worktree isolation.
+   * The root is lazy so merely opening/cancelling the project wizard writes nothing.
+   */
+  createNamedProject(name: string): string {
+    const cleanName = name.trim()
+    if (!cleanName) throw new Error('project name is required')
+    const slug = cleanName
+      .normalize('NFKD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 48) || 'project'
+    const target = path.join(this.namedProjectsRoot, `${slug}-${crypto.randomUUID().slice(0, 8)}`)
+    fs.mkdirSync(this.namedProjectsRoot, { recursive: true })
+    fs.mkdirSync(target, { recursive: false })
+    try {
+      this.git(target, ['init'])
+      const tree = this.git(target, ['write-tree'])
+      const commit = execFileSync(
+        'git',
+        [
+          '-C',
+          target,
+          '-c',
+          'user.name=AllMyAgents',
+          '-c',
+          'user.email=workspace@allmyagents.invalid',
+          'commit-tree',
+          tree,
+          '-m',
+          'Initialize project',
+        ],
+        { encoding: 'utf8', windowsHide: true }
+      ).trim()
+      this.git(target, ['update-ref', 'HEAD', commit])
+      return target
+    } catch (error) {
+      fs.rmSync(target, { recursive: true, force: true })
+      throw error
+    }
+  }
+
+  removeNamedProject(target: string): void {
+    const root = path.resolve(this.namedProjectsRoot)
+    const resolved = path.resolve(target)
+    if (path.dirname(resolved) !== root) throw new Error(`not an app-managed project path: ${target}`)
+    fs.rmSync(resolved, { recursive: true, force: true })
   }
 
   isRepo(repo: string): boolean {

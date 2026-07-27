@@ -30,6 +30,12 @@ export interface ProjectInfo {
   siteOnline?: boolean
 }
 
+export interface ProjectDraftValidation {
+  valid: true
+  name: string
+  path: string
+}
+
 export type WorktreeChangeKind = 'uncommitted' | 'committed' | 'both'
 
 export interface WorktreeProjectActivity {
@@ -577,8 +583,12 @@ export const api = {
   projects: () => jget<ProjectInfo[]>('/api/projects'),
   projectActivity: (projectId: string) =>
     jget<WorktreeProjectActivity>(`/api/projects/${encodeURIComponent(projectId)}/activity`),
+  validateProject: (name: string, path: string) =>
+    jpost<ProjectDraftValidation | { error: string }>('/api/projects/validate', { name, path }),
   createProject: (name: string, path: string) =>
     jpost<ProjectInfo | { error: string }>('/api/projects', { name, path }),
+  createManagedProject: (name: string) =>
+    jpost<ProjectInfo | { error: string }>('/api/projects/managed', { name }),
   githubCapability: () => jget<GitHubCapability>('/api/github/capability'),
   githubRepositories: () => jget<GitHubRepository[]>('/api/github/repositories'),
   startGitHubClone: (nameWithOwner: string) =>

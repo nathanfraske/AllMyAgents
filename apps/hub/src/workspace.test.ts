@@ -19,6 +19,18 @@ afterEach(() => {
 })
 
 describe('WorkspaceManager', () => {
+  it('creates name-only projects as committed Git repositories outside scratch workspaces', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-workspace-'))
+    roots.push(root)
+    const workspace = new WorkspaceManager(path.join(root, 'worktrees'))
+
+    const created = workspace.createNamedProject('New research tool')
+
+    expect(path.dirname(created)).toBe(path.join(root, 'projects'))
+    expect(workspace.isRepo(created)).toBe(true)
+    expect(git(created, 'rev-parse', '--verify', 'HEAD^{commit}')).toMatch(/^[a-f0-9]{40}$/)
+  })
+
   it('recognises a registered worktree through a filesystem alias', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-workspace-'))
     roots.push(root)

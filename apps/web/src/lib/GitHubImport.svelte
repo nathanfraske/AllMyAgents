@@ -5,10 +5,14 @@
 
   let {
     onImported,
+    onSelected,
     onClose,
+    deferClone = false,
   }: {
-    onImported: (project: ProjectInfo) => void | Promise<void>
+    onImported?: (project: ProjectInfo) => void | Promise<void>
+    onSelected?: (repository: GitHubRepository) => void | Promise<void>
     onClose: () => void
+    deferClone?: boolean
   } = $props()
 
   let checking = $state(true)
@@ -55,6 +59,10 @@
 
   async function clone(repository: GitHubRepository): Promise<void> {
     if (!repository.supported || job) return
+    if (deferClone) {
+      await onSelected?.(repository)
+      return
+    }
     error = ''
     const started = await api.startGitHubClone(repository.nameWithOwner)
     if (!started || 'error' in started) {
@@ -77,7 +85,7 @@
       pollFailures = 0
       job = next
       if (next.status === 'complete' && next.project) {
-        await onImported(next.project)
+        await onImported?.(next.project)
         return
       }
       if (next.status === 'failed' || next.status === 'cancelled') {
@@ -123,7 +131,11 @@
       {#if error}<div class="err">{error}</div>{/if}
     </div>
   {:else}
-    <div class="scope dim">Up to 100 repositories owned by the signed-in account. Organization repositories and SSH sessions are not supported in this version.</div>
+    <div class="scope dim">
+      {deferClone
+        ? 'Choose a repository now. Cloning waits until the final Launch action, so cancelling this draft writes nothing.'
+        : 'Up to 100 repositories owned by the signed-in account. Organization repositories and SSH sessions are not supported in this version.'}
+    </div>
     <input class="filter" type="search" placeholder="Filter repositories" bind:value={query} />
     {#if filtered.length}
       <div class="repos scroll">
@@ -131,7 +143,11 @@
           <button
             class="repo"
             disabled={!repository.supported}
-            title={repository.supported ? `Clone ${repository.nameWithOwner}` : repository.unsupportedReason}
+            title={repository.supported
+              ? deferClone
+                ? `Use ${repository.nameWithOwner}`
+                : `Clone ${repository.nameWithOwner}`
+              : repository.unsupportedReason}
             onclick={() => clone(repository)}
           >
             <span class="repo-top">

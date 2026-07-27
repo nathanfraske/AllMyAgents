@@ -20,7 +20,7 @@
 </script>
 
 <script lang="ts">
-  import { api, type ManagerAgentType, type SessionRecord } from './api'
+  import { api, type ManagerAgentType, type ProjectInfo, type SessionRecord } from './api'
   import { defaultModelFor, findModel, modelsFor } from './catalog'
   import Icon from './Icon.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
@@ -31,6 +31,7 @@
     embedded?: boolean
     deferLaunch?: boolean
     initialProjectId?: string
+    draftProject?: Pick<ProjectInfo, 'name' | 'path'>
     onCreateProject?: () => void
     onConfigured?: (config: ManagerLaunchConfig) => void
   }
@@ -40,6 +41,7 @@
     embedded = false,
     deferLaunch = false,
     initialProjectId = '',
+    draftProject,
     onCreateProject,
     onConfigured,
   }: Props = $props()
@@ -83,7 +85,17 @@
   let saved = $state(false)
 
   const selectedRecord = $derived(selectedId ? store.sessions[selectedId]?.record : undefined)
-  const project = $derived(store.projects.find((item) => item.id === projectId))
+  const project = $derived(
+    store.projects.find((item) => item.id === projectId)
+      ?? (draftProject
+        ? {
+            id: '__draft-project__',
+            name: draftProject.name,
+            path: draftProject.path,
+            createdAt: '',
+          }
+        : undefined),
+  )
   const isActiveManager = $derived(selectedRecord?.isProjectManager === true)
   const managerProfile = $derived(store.profiles.find((profile) => profile.id === managerProfileId))
   const managerModels = $derived(managerProfile ? modelsFor(managerProfile.provider) : [])
@@ -94,7 +106,7 @@
   const scope = $derived(scopeFromAgentTypes())
 
   function generatedPrompt(): string {
-    const selectedProject = store.projects.find((item) => item.id === projectId)
+    const selectedProject = project
     const projectName = selectedProject?.name ?? 'this project'
     const projectPath = selectedProject?.path ?? 'the project directory'
     const existing = Object.values(store.sessions)
@@ -510,11 +522,14 @@
     else {
       chooseMode('create')
       if (initialProjectId) projectId = initialProjectId
+      else if (draftProject) projectId = '__draft-project__'
     }
   })
 
   $effect(() => {
     projectId
+    draftProject?.name
+    draftProject?.path
     maxLiveChildren
     delegation
     agentTypes
@@ -597,7 +612,7 @@
       <div class="field">
         <span class="field-label">Project</span>
         <div class="project-choice">
-          {#if mode === 'promote' || (embedded && initialProjectId)}
+          {#if mode === 'promote' || (embedded && (initialProjectId || draftProject))}
             <div class="fixed-value"><Icon name="folder" size={14} />{project?.name ?? 'No project'}</div>
           {:else}
             <select bind:value={projectId}>
@@ -605,7 +620,9 @@
               {#each store.projects as item (item.id)}<option value={item.id}>{item.name}</option>{/each}
             </select>
           {/if}
-          <button class="secondary" type="button" onclick={() => onCreateProject?.()}>Create a new project</button>
+          {#if !embedded || onCreateProject}
+            <button class="secondary" type="button" onclick={() => onCreateProject?.()}>Create a new project</button>
+          {/if}
         </div>
         <small>The manager and every worker it creates stay attached to this project.</small>
       </div>

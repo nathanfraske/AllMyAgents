@@ -24,6 +24,7 @@ import { asFileWriteDiffDensity } from './types.js'
 import type { DangerFlags, HubEvent, HubPrefs, ManagerAgentType, Profile, Provider } from './types.js'
 import type { Executor } from './executor.js'
 import type { WorktreeProjectActivity } from './worktreeCollisionDetector.js'
+import type { WorkspaceManager } from './workspace.js'
 import type { RestartState } from './restartController.js'
 import { SCHEMA_VERSION } from './restartHandshake.js'
 import { AttachmentInputError, attachmentLimitForMime, isClaudeImageMime } from './attachments.js'
@@ -356,6 +357,7 @@ export interface ServerOptions {
   approvals: ApprovalService
   usage: UsageMonitor
   projects: ProjectStore
+  workspace: WorkspaceManager
   instructions: InstructionStore
   bus: AgentBus
   memory: MemoryStore
@@ -452,7 +454,7 @@ export function persistPrefs(
 }
 
 export function startServer(opts: ServerOptions): http.Server {
-  const { port, defaultCwd, profilesDir, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity } = opts
+  const { port, defaultCwd, profilesDir, journal, sessions, profiles, approvals, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity } = opts
   // Runtime repositories live beside the journal/config under HUB_DATA_DIR, never in the shipped hub
   // payload or profiles tree. GitHubImportService keeps auth entirely inside an existing `gh` session.
   const github = new GitHubImportService(
@@ -648,6 +650,25 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, projects.list())
         return
       }
+      if (method === 'POST' && url.pathname === '/api/projects/validate') {
+        const body = await readBody(req)
+        const name = String(body.name ?? '').trim()
+        const projectPath = String(body.path ?? '').trim()
+        if (!name) {
+          json(res, { error: 'project name is required' }, 400)
+          return
+        }
+        if (!projectPath || !fs.existsSync(projectPath)) {
+          json(res, { error: `path does not exist: ${projectPath || '(empty)'}` }, 400)
+          return
+        }
+        if (!fs.statSync(projectPath).isDirectory()) {
+          json(res, { error: `path is not a directory: ${projectPath}` }, 400)
+          return
+        }
+        json(res, { valid: true, name, path: projectPath })
+        return
+      }
       const activityMatch = /^\/api\/projects\/([^/]+)\/activity$/.exec(url.pathname)
       if (method === 'GET' && activityMatch) {
         const projectId = decodeURIComponent(activityMatch[1] as string)
@@ -703,6 +724,19 @@ export function startServer(opts: ServerOptions): http.Server {
         const body = await readBody(req)
         const project = projects.create(String(body.name ?? ''), String(body.path ?? ''))
         json(res, project)
+        return
+      }
+      if (method === 'POST' && url.pathname === '/api/projects/managed') {
+        const body = await readBody(req)
+        const name = String(body.name ?? '').trim()
+        let projectPath: string | undefined
+        try {
+          projectPath = workspace.createNamedProject(name)
+          json(res, projects.create(name, projectPath))
+        } catch (error) {
+          if (projectPath) workspace.removeNamedProject(projectPath)
+          json(res, { error: error instanceof Error ? error.message : String(error) }, 400)
+        }
         return
       }
       // Project import — PREVIEW: scan a folder for existing Claude/Codex conversations across every

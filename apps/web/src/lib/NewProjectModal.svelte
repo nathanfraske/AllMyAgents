@@ -17,7 +17,12 @@
 
 <script lang="ts">
   import { tick } from 'svelte'
-  import { api, type SessionRecord } from './api'
+  import {
+    api,
+    type GitHubCloneJob,
+    type GitHubRepository,
+    type SessionRecord,
+  } from './api'
   import { defaultModelFor, findModel, modelsFor } from './catalog'
   import { settings } from './settings.svelte'
   import { store } from './store.svelte'
@@ -33,6 +38,10 @@
 
   type Step = 1 | 2 | 3
   type AgentStatus = 'ready' | 'launching' | 'started' | 'failed'
+  type ProjectSource =
+    | { kind: 'local'; name: string; path: string }
+    | { kind: 'github'; name: string; repository: GitHubRepository }
+    | { kind: 'managed'; name: string }
 
   interface StartingAgent {
     id: string
@@ -45,16 +54,20 @@
     useWorktree: boolean
     status: AgentStatus
     sessionId?: string
+    promptSent?: boolean
     error?: string
   }
 
   let step = $state<Step>(1)
   let project = $state<ProjectInfo | null>(null)
+  let projectDraft = $state<ProjectSource | null>(null)
   let projectName = $state('')
   let projectPath = $state('')
+  let githubRepository = $state<GitHubRepository | null>(null)
+  let projectStatus = $state('')
   let gitGuidance = $state('')
   let environmentGuidance = $state('')
-  let showGitHub = $state(false)
+  let projectSource = $state<'local' | 'github' | 'managed'>('local')
   let creating = $state(false)
   let createError = $state('')
   let agents = $state<StartingAgent[]>([])
@@ -62,7 +75,7 @@
   let teamError = $state('')
   let launching = $state(false)
   let launchAttempted = $state(false)
-  let managerEditing = $state(false)
+  let managerEnabled = $state(false)
   let managerConfig = $state<ManagerLaunchConfig | null>(null)
   let managerStatus = $state<AgentStatus>('ready')
   let managerSessionId = $state<string | undefined>()
@@ -155,24 +168,13 @@
     }
   }
 
-  function rememberProject(created: ProjectInfo): void {
-    project = created
-    if (!store.projects.some((item) => item.id === created.id)) {
-      store.projects = [...store.projects, created]
-    }
-    showGitHub = false
-    createError = ''
-    step = 2
-    void reveal('team')
-  }
-
   async function reveal(target: 'team' | 'finalize'): Promise<void> {
     await tick()
     const section = target === 'team' ? teamSection : finalizeSection
     section?.scrollIntoView?.({ block: 'start' })
   }
 
-  async function createLocalProject(): Promise<void> {
+  async function continueLocalDraft(): Promise<void> {
     const name = projectName.trim()
     const path = projectPath.trim()
     createError = ''
@@ -182,23 +184,64 @@
     }
     creating = true
     try {
-      const created = await api.createProject(name, path)
-      if (!created || 'error' in created) {
-        createError = (created as { error?: string } | null)?.error ?? 'Could not create the project.'
+      const validation = await api.validateProject(name, path)
+      if (!validation || 'error' in validation) {
+        createError = (validation as { error?: string } | null)?.error ?? 'Could not validate this directory.'
         return
       }
-      rememberProject(created)
+      projectDraft = { kind: 'local', name: validation.name, path: validation.path }
+      projectName = validation.name
+      projectPath = validation.path
+      githubRepository = null
+      projectSource = 'local'
+      step = 2
+      void reveal('team')
     } catch (cause) {
-      createError = cause instanceof Error ? cause.message : 'Could not create the project.'
+      createError = cause instanceof Error ? cause.message : 'Could not validate this directory.'
     } finally {
       creating = false
     }
   }
 
-  async function githubImported(created: ProjectInfo): Promise<void> {
-    projectName = created.name
-    projectPath = created.path
-    rememberProject(created)
+  function draftPath(): string {
+    if (!projectDraft) return ''
+    if (projectDraft.kind === 'local') return projectDraft.path
+    if (projectDraft.kind === 'github') return `${projectDraft.repository.nameWithOwner} (cloned at launch)`
+    return 'App-managed project repository (created at launch)'
+  }
+
+  function toggleManager(enabled: boolean): void {
+    managerEnabled = enabled
+    if (!enabled) {
+      managerConfig = null
+      managerStatus = 'ready'
+      managerError = undefined
+    }
+  }
+
+  function githubSelected(repository: GitHubRepository): void {
+    githubRepository = repository
+    projectName = repository.name
+    projectPath = ''
+    projectDraft = { kind: 'github', name: repository.name, repository }
+    projectSource = 'github'
+    createError = ''
+    step = 2
+    void reveal('team')
+  }
+
+  function continueManagedDraft(): void {
+    const name = projectName.trim()
+    createError = ''
+    if (!name) {
+      createError = 'Give the project a name.'
+      return
+    }
+    projectPath = ''
+    githubRepository = null
+    projectDraft = { kind: 'managed', name }
+    step = 2
+    void reveal('team')
   }
 
   function review(): void {
@@ -220,7 +263,6 @@
     managerConfig = config
     managerStatus = 'ready'
     managerError = undefined
-    managerEditing = false
   }
 
   function labelFor(agent: StartingAgent): string {
@@ -274,13 +316,64 @@
     }
   }
 
-  async function launchConfiguredManager(config: ManagerLaunchConfig): Promise<{ record?: SessionRecord; error?: string }> {
+  function rememberCreatedProject(created: ProjectInfo): ProjectInfo {
+    project = created
+    if (!store.projects.some((item) => item.id === created.id)) {
+      store.projects = [...store.projects, created]
+    }
+    return created
+  }
+
+  async function materializeProject(): Promise<ProjectInfo> {
+    if (project) return project
+    if (!projectDraft) throw new Error('Finish the project step before launching.')
+    if (projectDraft.kind === 'local') {
+      projectStatus = 'Creating the project…'
+      const created = await api.createProject(projectDraft.name, projectDraft.path)
+      if (!created || 'error' in created) {
+        throw new Error((created as { error?: string } | null)?.error ?? 'The project could not be created.')
+      }
+      return rememberCreatedProject(created)
+    }
+    if (projectDraft.kind === 'managed') {
+      projectStatus = 'Creating the project repository…'
+      const created = await api.createManagedProject(projectDraft.name)
+      if (!created || 'error' in created) {
+        throw new Error((created as { error?: string } | null)?.error ?? 'The project could not be created.')
+      }
+      return rememberCreatedProject(created)
+    }
+
+    projectStatus = `Starting clone for ${projectDraft.repository.nameWithOwner}…`
+    const started = await api.startGitHubClone(projectDraft.repository.nameWithOwner)
+    if (!started || 'error' in started) {
+      throw new Error((started as { error?: string } | null)?.error ?? 'The clone could not be started.')
+    }
+    let job: GitHubCloneJob = started
+    while (job.status !== 'complete') {
+      if (job.status === 'failed' || job.status === 'cancelled') {
+        throw new Error(job.error ?? 'The clone did not complete.')
+      }
+      projectStatus = job.progress.percent == null
+        ? job.progress.message
+        : `${job.progress.message} ${job.progress.percent}%`
+      await new Promise((resolve) => setTimeout(resolve, 500))
+      job = await api.githubClone(job.id)
+    }
+    if (!job.project) throw new Error('The clone completed without creating a project.')
+    return rememberCreatedProject(job.project)
+  }
+
+  async function prepareConfiguredManager(
+    config: ManagerLaunchConfig,
+    createdProject: ProjectInfo,
+  ): Promise<{ record?: SessionRecord; error?: string }> {
     try {
       let record = managerSessionId ? store.sessions[managerSessionId]?.record : undefined
       if (!record) {
         const created = await api.spawn({
           profileId: config.managerProfileId,
-          projectId: project!.id,
+          projectId: createdProject.id,
           useWorktree: false,
           permissionMode: config.permissionMode,
           model: config.managerModel,
@@ -291,7 +384,7 @@
         }
         record = created
         managerSessionId = record.id
-        record.title = `${project!.name} manager`
+        record.title = `${createdProject.name} manager`
         record.titleSource = 'user'
         store.upsertSessionRecord(record)
         const renamed = await api.rename(record.id, record.title)
@@ -321,11 +414,6 @@
       })
       if ('error' in configured) throw new Error(configured.error)
       store.upsertSessionRecord(configured)
-      if (!managerPromptSent) {
-        const sent = await api.send(configured.id, config.startingPrompt)
-        if (sent.error) throw new Error(sent.error)
-        managerPromptSent = true
-      }
       return { record: configured }
     } catch (cause) {
       return {
@@ -335,10 +423,11 @@
   }
 
   async function launch(targets: StartingAgent[], includeManager: boolean): Promise<void> {
-    if (!project || launching) return
+    if (!projectDraft || launching) return
     launchAttempted = true
     launching = true
     teamError = ''
+    projectStatus = ''
     const targetIds = new Set(targets.map((agent) => agent.id))
     agents = agents.map((agent) =>
       targetIds.has(agent.id) ? { ...agent, status: 'launching', error: undefined } : agent
@@ -348,64 +437,136 @@
       managerError = undefined
     }
 
-    const [outcomes, managerOutcome] = await Promise.all([
-      Promise.all(targets.map(async (agent) => {
-        try {
-          const body: Record<string, unknown> = {
-            profileId: agent.profileId,
-            projectId: project!.id,
-            useWorktree: agent.useWorktree,
-            permissionMode: agent.permissionMode,
-            prompt: promptFor(agent),
-          }
-          if (agent.model) body.model = agent.model
-          if (agent.effort) body.effort = agent.effort
-          if (agent.scope.trim()) body.role = agent.scope.trim()
-          const created = await api.spawn(body)
-          if (!created || 'error' in created) {
-            return {
-              id: agent.id,
-              error: (created as { error?: string } | null)?.error ?? 'The agent did not start.',
-            }
-          }
-          return { id: agent.id, record: created as SessionRecord }
-        } catch (cause) {
+    let createdProject: ProjectInfo
+    try {
+      createdProject = await materializeProject()
+    } catch (cause) {
+      teamError = cause instanceof Error ? cause.message : 'The project could not be created.'
+      projectStatus = ''
+      launching = false
+      return
+    }
+
+    projectStatus = includeManager ? 'Configuring the project manager…' : 'Starting independent agents…'
+    const managerOutcome = includeManager && managerConfig
+      ? await prepareConfiguredManager(managerConfig, createdProject)
+      : undefined
+
+    projectStatus = targets.length ? 'Starting independent agents…' : 'Sending starting prompts…'
+    const outcomes = await Promise.all(targets.map(async (agent) => {
+      if (agent.sessionId) {
+        const existing = store.sessions[agent.sessionId]?.record
+        if (existing) return { id: agent.id, record: existing }
+      }
+      try {
+        const body: Record<string, unknown> = {
+          profileId: agent.profileId,
+          projectId: createdProject.id,
+          useWorktree: agent.useWorktree,
+          permissionMode: agent.permissionMode,
+        }
+        if (agent.model) body.model = agent.model
+        if (agent.effort) body.effort = agent.effort
+        if (agent.scope.trim()) body.role = agent.scope.trim()
+        const created = await api.spawn(body)
+        if (!created || 'error' in created) {
           return {
             id: agent.id,
-            error: cause instanceof Error ? cause.message : 'The agent did not start.',
+            error: (created as { error?: string } | null)?.error ?? 'The agent did not start.',
           }
         }
-      })),
-      includeManager && managerConfig
-        ? launchConfiguredManager(managerConfig)
-        : Promise.resolve(undefined),
-    ])
+        return { id: agent.id, record: created as SessionRecord }
+      } catch (cause) {
+        return {
+          id: agent.id,
+          error: cause instanceof Error ? cause.message : 'The agent did not start.',
+        }
+      }
+    }))
 
     for (const outcome of outcomes) {
       if (outcome.record) {
         store.upsertSessionRecord(outcome.record)
         updateAgent(outcome.id, {
-          status: 'started',
+          status: 'launching',
           sessionId: outcome.record.id,
           error: undefined,
         })
       } else {
         updateAgent(outcome.id, {
           status: 'failed',
-          sessionId: undefined,
           error: outcome.error,
         })
       }
     }
     if (managerOutcome) {
       if (managerOutcome.record) {
-        managerStatus = 'started'
+        managerStatus = 'launching'
         managerError = undefined
       } else {
         managerStatus = 'failed'
         managerError = managerOutcome.error
       }
     }
+
+    projectStatus = 'Sending starting prompts…'
+    const promptOutcomes = await Promise.all([
+      ...targets.map(async (target) => {
+        const agent = agents.find((item) => item.id === target.id)
+        if (!agent?.sessionId || agent.status === 'failed') return
+        if (agent.promptSent) return { id: agent.id, ok: true }
+        try {
+          const sent = await api.send(agent.sessionId, promptFor(agent))
+          if (sent.error) throw new Error(sent.error)
+          return { id: agent.id, ok: true }
+        } catch (cause) {
+          return {
+            id: agent.id,
+            error: cause instanceof Error ? cause.message : 'The starting prompt was not sent.',
+          }
+        }
+      }),
+      (managerOutcome?.record && managerConfig && !managerPromptSent)
+        ? (async () => {
+            try {
+              const sent = await api.send(managerOutcome.record!.id, managerConfig!.startingPrompt)
+              if (sent.error) throw new Error(sent.error)
+              return { id: 'project-manager', ok: true }
+            } catch (cause) {
+              return {
+                id: 'project-manager',
+                error: cause instanceof Error ? cause.message : 'The manager starting prompt was not sent.',
+              }
+            }
+          })()
+        : Promise.resolve(managerOutcome?.record ? { id: 'project-manager', ok: true } : undefined),
+    ])
+
+    for (const outcome of promptOutcomes) {
+      if (!outcome) continue
+      if (outcome.id === 'project-manager') {
+        if (outcome.ok) {
+          managerPromptSent = true
+          managerStatus = 'started'
+          managerError = undefined
+        } else {
+          managerStatus = 'failed'
+          managerError = 'error' in outcome ? outcome.error : 'The manager did not start.'
+        }
+      } else if (outcome.ok) {
+        updateAgent(outcome.id, {
+          status: 'started',
+          promptSent: true,
+          error: undefined,
+        })
+      } else {
+        updateAgent(outcome.id, {
+          status: 'failed',
+          error: 'error' in outcome ? outcome.error : 'The agent did not start.',
+        })
+      }
+    }
+    projectStatus = ''
     launching = false
     await onlaunched(launchResult())
   }
@@ -451,15 +612,15 @@
   </nav>
 
   <div class="body scroll">
-    <section class="step project-step" class:complete={Boolean(project)}>
+    <section class="step project-step" class:complete={Boolean(projectDraft)}>
       <div class="step-head">
         <div>
           <span class="step-number">STEP 1</span>
           <h3>Project</h3>
         </div>
-        {#if project}
+        {#if projectDraft}
           <div class="step-status">
-            <span class="ready"><Icon name="check" size={14} /> Project ready</span>
+            <span class="ready"><Icon name="check" size={14} /> Project draft ready</span>
             {#if step !== 1}
               <button class="edit-step" aria-label="Edit project setup" onclick={() => (step = 1)}>Edit</button>
             {/if}
@@ -467,13 +628,22 @@
         {/if}
       </div>
 
-      {#if project}
+      {#if projectDraft}
         <div class="project-summary">
-          <div><b>{project.name}</b><span title={project.path}>{project.path}</span></div>
-          <span class="created-label">Created</span>
+          <div>
+            <b>{projectDraft.name}</b>
+            <span>
+              {projectDraft.kind === 'local'
+                ? projectDraft.path
+                : projectDraft.kind === 'github'
+                  ? `Clone ${projectDraft.repository.nameWithOwner} at launch`
+                  : 'App-managed Git repository created at launch'}
+            </span>
+          </div>
+          <span class="created-label">Not created yet</span>
         </div>
         {#if step === 1}
-          <p class="fixed-note">The project now points at this directory. You can still change the setup notes passed to every starting agent.</p>
+          <p class="fixed-note">This remains a draft. You can change the source or setup notes; nothing is written until Launch.</p>
           <div class="fields two guidance">
             <label>
               <span>Git configuration <em>optional</em></span>
@@ -495,19 +665,23 @@
         {/if}
       {:else}
         <div class="source-actions">
-          <button class="source active" onclick={() => (showGitHub = false)}>
+          <button class="source" class:active={projectSource === 'local'} onclick={() => (projectSource = 'local')}>
             <Icon name="folder" size={17} />
             <span><b>Choose a directory</b><small>Use a folder already on this computer.</small></span>
           </button>
-          <button class="source" class:active={showGitHub} aria-label="Clone a GitHub repository" onclick={() => (showGitHub = true)}>
+          <button class="source" class:active={projectSource === 'github'} aria-label="Clone a GitHub repository" onclick={() => (projectSource = 'github')}>
             <Icon name="git-branch" size={17} />
             <span><b>Clone a GitHub repository</b><small>Use your existing GitHub sign-in.</small></span>
           </button>
+          <button class="source" class:active={projectSource === 'managed'} aria-label="Create from just a name" onclick={() => (projectSource = 'managed')}>
+            <Icon name="plus" size={17} />
+            <span><b>Just a name</b><small>Let the app make a Git-backed project directory.</small></span>
+          </button>
         </div>
 
-        {#if showGitHub}
-          <GitHubImport onImported={githubImported} onClose={() => (showGitHub = false)} />
-        {:else}
+        {#if projectSource === 'github'}
+          <GitHubImport deferClone onSelected={githubSelected} onClose={() => (projectSource = 'local')} />
+        {:else if projectSource === 'local'}
           <div class="fields two">
             <label>
               <span>Project name</span>
@@ -520,6 +694,14 @@
                 <button class="browse" onclick={browse}>Browse</button>
               </div>
             </label>
+          </div>
+        {:else}
+          <div class="managed-source">
+            <label>
+              <span>Project name</span>
+              <input aria-label="Project name" bind:value={projectName} placeholder="New research tool" />
+            </label>
+            <p>The app creates a dedicated project repository alongside its managed workspaces and initializes Git so worktree isolation works from the first agent.</p>
           </div>
         {/if}
 
@@ -537,15 +719,17 @@
         </div>
 
         {#if createError}<div class="error" role="alert">{createError}</div>{/if}
-        {#if !showGitHub}
-          <button class="primary" onclick={createLocalProject} disabled={creating}>
-            {creating ? 'Creating project…' : 'Create project'}
+        {#if projectSource === 'local'}
+          <button class="primary" onclick={continueLocalDraft} disabled={creating}>
+            {creating ? 'Checking directory…' : 'Continue to team'}
           </button>
+        {:else if projectSource === 'managed'}
+          <button class="primary" onclick={continueManagedDraft}>Continue to team</button>
         {/if}
       {/if}
     </section>
 
-    {#if project}
+    {#if projectDraft}
       <section class="step" class:current={step === 2} bind:this={teamSection}>
         <div class="step-head">
           <div>
@@ -577,26 +761,25 @@
               </div>
               <span class="optional">Optional</span>
             </div>
-            <div class="manager">
-              <div>
-                <b>Project manager and child agents</b>
-                <span>{managerConfig ? 'Configured for this launch.' : 'Configure the manager, its starting prompt, and the child roles it may spawn.'}</span>
-              </div>
-              <button onclick={() => (managerEditing = true)} aria-label="Configure a project manager">
-                {managerConfig ? 'Edit manager team' : 'Enable and configure'}
-              </button>
-            </div>
+            <label class="manager-enable">
+              <input
+                type="checkbox"
+                aria-label="Enable a project manager"
+                checked={managerEnabled}
+                onchange={(event) => toggleManager((event.target as HTMLInputElement).checked)}
+              />
+              <span>
+                <b>Enable a project manager</b>
+                <small>{managerConfig ? 'Configured for this launch. The fields remain here and editable.' : 'Configure the manager and the child roles it may spawn.'}</small>
+              </span>
+            </label>
 
-            {#if managerEditing || managerConfig}
-              <div class="manager-setup" hidden={!managerEditing}>
+            {#if managerEnabled}
+              <div class="manager-setup">
                 <ManagerSetupModal
                   embedded
                   deferLaunch
-                  initialProjectId={project.id}
-                  onCreateProject={() => {
-                    managerEditing = false
-                    step = 1
-                  }}
+                  draftProject={{ name: projectDraft.name, path: draftPath() }}
                   onConfigured={configureManager}
                 />
               </div>
@@ -704,7 +887,7 @@
           <div class="review">
             <div class="review-project">
               <Icon name="folder" size={18} />
-              <div><b>{project.name}</b><span>{project.path}</span></div>
+              <div><b>{projectDraft.name}</b><span>{draftPath()}</span></div>
             </div>
             {#if managerConfig}
               <section class="review-group manager-group">
@@ -744,6 +927,13 @@
               <div class="zero">No manager and no independent agents. This will create the project and open its overview.</div>
             {/if}
           </div>
+
+          {#if launching && projectStatus}
+            <div class="launch-progress" role="status">
+              <progress></progress>
+              <span>{projectStatus}</span>
+            </div>
+          {/if}
 
           {#if launchAttempted && !launching}
             <div class="launch-summary" class:has-failures={failedCount > 0}>
@@ -816,12 +1006,14 @@
   .setup-summary { display: flex; flex-direction: column; gap: var(--space-1); margin-top: var(--space-3); color: var(--muted); font-size: var(--text-xs); }
   .setup-summary span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .fixed-note { margin: var(--space-3) 0 0; color: var(--muted); font-size: var(--text-xs); line-height: 1.4; }
-  .source-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-3); margin-bottom: var(--space-4); }
+  .source-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-3); margin-bottom: var(--space-4); }
   .source { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-4); text-align: left; border: 1px solid var(--border);
     border-radius: var(--r-md); background: var(--surface-2); }
   .source.active { border-color: var(--border-accent); color: var(--accent); }
   .source span { display: flex; flex-direction: column; gap: 2px; }
   .source small { color: var(--muted); font-size: var(--text-xs); font-weight: 400; }
+  .managed-source { display: grid; gap: var(--space-3); }
+  .managed-source p { margin: 0; color: var(--muted); font-size: var(--text-xs); line-height: 1.45; }
   .fields { display: grid; gap: var(--space-4); margin-bottom: var(--space-4); }
   .fields.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .fields.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -864,13 +1056,11 @@
   .toggle span { display: flex; flex-direction: column; }
   .add { display: flex; align-items: center; justify-content: center; gap: var(--space-2); width: 100%; min-height: 56px; margin-top: var(--space-3); color: var(--cyan);
     border: 1px dashed var(--border-accent); border-radius: var(--r-md); background: color-mix(in srgb, var(--accent) 5%, transparent); font-weight: var(--fw-medium); }
-  .manager { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); padding: var(--space-3) var(--space-4);
+  .manager-enable { flex-direction: row; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4);
     border: 1px solid var(--border); border-radius: var(--r-md); }
-  .manager div { display: flex; flex-direction: column; gap: 2px; }
-  .manager span { color: var(--muted); font-size: var(--text-xs); }
-  .manager button { flex: none; color: var(--accent); }
+  .manager-enable input { flex: none; width: auto; }
+  .manager-enable span { display: flex; flex-direction: column; gap: 2px; }
   .manager-setup { margin-top: var(--space-4); overflow: hidden; border: 1px solid var(--border-accent); border-radius: var(--r-lg); }
-  .manager-setup[hidden] { display: none; }
   .footer-actions { display: flex; justify-content: flex-end; gap: var(--space-3); margin-top: var(--space-5); padding-top: var(--space-4); border-top: 1px solid var(--border-subtle); }
   .review { display: flex; flex-direction: column; gap: var(--space-4); }
   .review-group { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-3); border: 1px solid var(--border); border-radius: var(--r-md); }
@@ -901,6 +1091,8 @@
   .launch-summary ul { display: flex; flex-direction: column; gap: var(--space-2); padding: 0; list-style: none; }
   .launch-summary li { display: flex; justify-content: space-between; gap: var(--space-4); font-size: var(--text-xs); }
   .launch-summary li strong { font-weight: var(--fw-medium); }
+  .launch-progress { display: flex; align-items: center; gap: var(--space-3); margin-top: var(--space-4); color: var(--muted); font-size: var(--text-sm); }
+  .launch-progress progress { width: 120px; accent-color: var(--accent); }
 
   @media (max-width: 720px) {
     .modal { inset: 8px; }

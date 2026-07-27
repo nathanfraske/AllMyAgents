@@ -5,7 +5,9 @@ import { store } from './store.svelte'
 import type { ProjectInfo, SessionRecord } from './api'
 
 const apiMock = vi.hoisted(() => ({
+  validateProject: vi.fn(),
   createProject: vi.fn(),
+  createManagedProject: vi.fn(),
   pickFolder: vi.fn(),
   spawn: vi.fn(),
   rename: vi.fn(),
@@ -49,10 +51,10 @@ function record(id: string, profileId = 'codex-main'): SessionRecord {
   }
 }
 
-async function createLocalProject(): Promise<void> {
+async function advanceLocalDraft(): Promise<void> {
   await fireEvent.input(screen.getByLabelText('Project name'), { target: { value: project.name } })
   await fireEvent.input(screen.getByLabelText('Working directory'), { target: { value: project.path } })
-  await fireEvent.click(screen.getByRole('button', { name: 'Create project' }))
+  await fireEvent.click(screen.getByRole('button', { name: 'Continue to team' }))
   expect(await screen.findByText('2. The team')).toBeTruthy()
 }
 
@@ -64,6 +66,7 @@ beforeEach(() => {
     { id: 'codex-main', provider: 'codex' },
     { id: 'claude-review', provider: 'claude' },
   ]
+  apiMock.validateProject.mockResolvedValue({ valid: true, name: project.name, path: project.path })
   apiMock.createProject.mockResolvedValue(project)
   apiMock.pickFolder.mockResolvedValue({ path: project.path })
   apiMock.rename.mockResolvedValue({ ok: true })
@@ -75,17 +78,18 @@ beforeEach(() => {
 afterEach(() => cleanup())
 
 describe('New project pipeline', () => {
-  it('creates a local project, keeps its completed summary visible, and advances to the team', async () => {
+  it('validates a local project draft, keeps its completed summary visible, and advances without creating it', async () => {
     render(NewProjectModal, {
       onclose: vi.fn(),
       onlaunched: vi.fn(),
     })
 
-    await createLocalProject()
+    await advanceLocalDraft()
 
-    expect(apiMock.createProject).toHaveBeenCalledWith(project.name, project.path)
+    expect(apiMock.validateProject).toHaveBeenCalledWith(project.name, project.path)
+    expect(apiMock.createProject).not.toHaveBeenCalled()
     expect(screen.getByText(project.path)).toBeTruthy()
-    expect(screen.getByText('Project ready')).toBeTruthy()
+    expect(screen.getByText('Project draft ready')).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Add starting agent' })).toBeTruthy()
     expect(scrollIntoView).toHaveBeenCalled()
   })
@@ -109,7 +113,7 @@ describe('New project pipeline', () => {
 
   it('separates manager-owned children from independently launched agents', async () => {
     render(NewProjectModal, { onclose: vi.fn(), onlaunched: vi.fn() })
-    await createLocalProject()
+    await advanceLocalDraft()
 
     expect(screen.getByRole('heading', { name: 'With a manager' })).toBeTruthy()
     expect(screen.getByText(/children it spawns answer to it/i)).toBeTruthy()
@@ -124,7 +128,7 @@ describe('New project pipeline', () => {
       onclose: vi.fn(),
       onlaunched,
     })
-    await createLocalProject()
+    await advanceLocalDraft()
 
     await fireEvent.click(screen.getByRole('button', { name: 'Add starting agent' }))
     await fireEvent.click(screen.getByRole('button', { name: 'Add starting agent' }))
@@ -151,14 +155,19 @@ describe('New project pipeline', () => {
     expect(apiMock.spawn).toHaveBeenNthCalledWith(1, expect.objectContaining({
       projectId: project.id,
       profileId: 'codex-main',
-      prompt: expect.stringContaining('Scope: Implementation'),
       role: 'Implementation',
     }))
     expect(apiMock.spawn).toHaveBeenNthCalledWith(2, expect.objectContaining({
       projectId: project.id,
       profileId: 'claude-review',
-      prompt: expect.stringContaining('Review the result.'),
     }))
+    expect(apiMock.spawn.mock.calls[0]?.[0]).not.toHaveProperty('prompt')
+    expect(apiMock.spawn.mock.calls[1]?.[0]).not.toHaveProperty('prompt')
+    await vi.waitFor(() =>
+      expect(apiMock.send).toHaveBeenCalledWith(
+        'session-1',
+        expect.stringContaining('Scope: Implementation'),
+      ))
     expect(await screen.findByText(/1 team member started; 1 did not/)).toBeTruthy()
     expect(screen.getByText(/Claude sign-in expired/)).toBeTruthy()
     expect(onlaunched).toHaveBeenCalledWith(expect.objectContaining({
@@ -185,9 +194,9 @@ describe('New project pipeline', () => {
   it('keeps manager setup inside the one project dialog and still allows a project with no agents', async () => {
     const onlaunched = vi.fn()
     render(NewProjectModal, { onclose: vi.fn(), onlaunched })
-    await createLocalProject()
+    await advanceLocalDraft()
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Configure a project manager' }))
+    await fireEvent.click(screen.getByRole('checkbox', { name: 'Enable a project manager' }))
     expect(screen.getAllByRole('dialog')).toHaveLength(1)
     expect(screen.getByRole('dialog', { name: 'New project' }).contains(
       screen.getByLabelText('Manager account'),
@@ -197,15 +206,16 @@ describe('New project pipeline', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Create project without agents' }))
 
     expect(apiMock.spawn).not.toHaveBeenCalled()
-    expect(onlaunched).toHaveBeenCalledWith({ project, started: [], failed: [] })
+    await vi.waitFor(() =>
+      expect(onlaunched).toHaveBeenCalledWith({ project, started: [], failed: [] }))
   })
 
   it('defers the embedded manager until Launch and retries configuration without spawning a duplicate', async () => {
     const onlaunched = vi.fn()
     render(NewProjectModal, { onclose: vi.fn(), onlaunched })
-    await createLocalProject()
+    await advanceLocalDraft()
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Configure a project manager' }))
+    await fireEvent.click(screen.getByRole('checkbox', { name: 'Enable a project manager' }))
     expect(apiMock.spawn).not.toHaveBeenCalled()
     await fireEvent.click(screen.getByRole('button', { name: 'Add to project launch' }))
     await fireEvent.click(screen.getByRole('button', { name: 'Review and finalize' }))
@@ -248,9 +258,9 @@ describe('New project pipeline', () => {
   it('allows a managed team and an independent batch together without parenting the batch to the manager', async () => {
     const onlaunched = vi.fn()
     render(NewProjectModal, { onclose: vi.fn(), onlaunched })
-    await createLocalProject()
+    await advanceLocalDraft()
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Configure a project manager' }))
+    await fireEvent.click(screen.getByRole('checkbox', { name: 'Enable a project manager' }))
     await fireEvent.click(screen.getByRole('button', { name: 'Add to project launch' }))
     await fireEvent.click(screen.getByRole('button', { name: 'Add starting agent' }))
     await fireEvent.input(screen.getByLabelText('Starting prompt 1'), {
@@ -265,24 +275,25 @@ describe('New project pipeline', () => {
     const manager = { ...record('manager-session'), title: `${project.name} manager` }
     const configuredManager = { ...manager, isProjectManager: true }
     apiMock.spawn.mockImplementation((body: Record<string, unknown>) =>
-      Promise.resolve(body.prompt ? independent : manager))
+      Promise.resolve(body.useWorktree === false ? manager : independent))
     apiMock.configureProjectManager.mockResolvedValue(configuredManager)
 
     await fireEvent.click(screen.getByRole('button', { name: 'Launch project with team' }))
 
     await vi.waitFor(() => expect(apiMock.spawn).toHaveBeenCalledTimes(2))
-    const independentCall = apiMock.spawn.mock.calls.find(([body]) => body.prompt)?.[0]
-    const managerCall = apiMock.spawn.mock.calls.find(([body]) => !body.prompt)?.[0]
+    const independentCall = apiMock.spawn.mock.calls.find(([body]) => body.useWorktree !== false)?.[0]
+    const managerCall = apiMock.spawn.mock.calls.find(([body]) => body.useWorktree === false)?.[0]
     expect(independentCall).toEqual(expect.objectContaining({
       projectId: project.id,
-      prompt: 'Run this independent task.',
     }))
+    expect(independentCall).not.toHaveProperty('prompt')
     expect(independentCall).not.toHaveProperty('parentSessionId')
     expect(managerCall).toEqual(expect.objectContaining({
       projectId: project.id,
       useWorktree: false,
     }))
     expect(managerCall).not.toHaveProperty('parentSessionId')
+    expect(apiMock.send).toHaveBeenCalledWith('independent-session', 'Run this independent task.')
     await vi.waitFor(() =>
       expect(onlaunched).toHaveBeenLastCalledWith(expect.objectContaining({
         failed: [],
@@ -295,7 +306,7 @@ describe('New project pipeline', () => {
 
   it('collapses completed steps into editable summaries without losing team input', async () => {
     render(NewProjectModal, { onclose: vi.fn(), onlaunched: vi.fn() })
-    await createLocalProject()
+    await advanceLocalDraft()
 
     await fireEvent.click(screen.getByRole('button', { name: 'Add starting agent' }))
     await fireEvent.input(screen.getByLabelText('Starting prompt 1'), {
@@ -309,5 +320,44 @@ describe('New project pipeline', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Edit team setup' }))
     expect(prompt.closest('.team-content')?.hasAttribute('hidden')).toBe(false)
     expect(prompt.value).toBe('Keep this task when I review the plan.')
+  })
+
+  it.each([
+    ['Step 2', false],
+    ['Step 3', true],
+  ])('cancelling at %s leaves no project, session, or worktree-producing request', async (_label, finalize) => {
+    const onclose = vi.fn()
+    render(NewProjectModal, { onclose, onlaunched: vi.fn() })
+    await advanceLocalDraft()
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Add starting agent' }))
+    await fireEvent.input(screen.getByLabelText('Starting prompt 1'), {
+      target: { value: 'This must remain a draft.' },
+    })
+    if (finalize) {
+      await fireEvent.click(screen.getByRole('button', { name: 'Review and finalize' }))
+    }
+
+    await fireEvent.click(screen.getByRole('button', { name: 'close' }))
+
+    expect(onclose).toHaveBeenCalledOnce()
+    expect(apiMock.createProject).not.toHaveBeenCalled()
+    expect(apiMock.startGitHubClone).not.toHaveBeenCalled()
+    expect(apiMock.spawn).not.toHaveBeenCalled()
+    expect(apiMock.send).not.toHaveBeenCalled()
+    expect(store.projects).toEqual([])
+  })
+
+  it('renders manager configuration as an in-place section of the one project dialog', async () => {
+    render(NewProjectModal, { onclose: vi.fn(), onlaunched: vi.fn() })
+    await advanceLocalDraft()
+
+    await fireEvent.click(screen.getByRole('checkbox', { name: 'Enable a project manager' }))
+
+    const projectDialog = screen.getByRole('dialog', { name: 'New project' })
+    expect(screen.getAllByRole('dialog')).toHaveLength(1)
+    expect(projectDialog.contains(screen.getByLabelText('Manager account'))).toBe(true)
+    expect(screen.queryByRole('heading', { name: 'Delegate a project' })).toBeNull()
+    expect(screen.queryByText(/open setup again/i)).toBeNull()
   })
 })

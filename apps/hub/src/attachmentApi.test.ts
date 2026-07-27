@@ -187,13 +187,14 @@ async function build(provider: 'claude' | 'codex' = 'claude') {
     isBusy: () => false,
   }
   const profile = { id: `${provider}-test`, provider, dir: path.join(tmp, 'profile') }
+  const workspace = new WorkspaceManager(path.join(tmp, 'worktrees'))
   const sessions = new SessionManager(
     journal,
     new SessionStore(journal.db),
     new Map([[profile.id, profile]]),
     approvals,
     usage,
-    new WorkspaceManager(path.join(tmp, 'worktrees')),
+    workspace,
     projects,
     instructions,
     bus,
@@ -215,6 +216,7 @@ async function build(provider: 'claude' | 'codex' = 'claude') {
     approvals,
     usage,
     projects,
+    workspace,
     instructions,
     bus,
     memory,
