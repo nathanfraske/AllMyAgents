@@ -22,6 +22,11 @@ describe('narrow-pane layout contracts', () => {
     expect(panel).toMatch(/@container\s+thread-body\s*\(max-width:/)
   })
 
+  it('does not let the pending-approval card style inflate the approval status chip', () => {
+    expect(thread).toMatch(/class="approval-card"/)
+    expect(thread).not.toMatch(/^\s*\.approval\s*\{/m)
+  })
+
   it('makes each existing pane a labelled drag source without changing the ghost animation path', () => {
     expect(app).toMatch(/class="pane"[^>]*draggable="true"/)
     expect(app).toMatch(/ondragstart=\{\(e\)\s*=>\s*startPaneDrag\(id,\s*e\)\}/)

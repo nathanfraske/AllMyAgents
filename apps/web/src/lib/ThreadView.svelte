@@ -887,7 +887,7 @@
 
     {#each approvals as a (a.id)}
       {@const blurb = approvalBlurb(a.kind, a.payload)}
-      <div class="approval" data-testid="approval-{a.id}">
+      <div class="approval-card" data-testid="approval-{a.id}">
         <div class="atop">
           <span class="alabel">PENDING APPROVAL</span>
           <span class="dim">{blurb.toolName}</span>
@@ -1150,7 +1150,7 @@
   .jumpbtn:hover { border-color: var(--accent); color: var(--text); }
   .jumpcount { font-variant-numeric: tabular-nums; }
   @media (prefers-reduced-motion: no-preference) { .jumpbtn { animation: pop-in var(--dur-fast) var(--ease); } }
-  .approval { background: var(--surface); border: 1px solid var(--warn); border-radius: 10px; padding: 0.5rem 0.7rem; margin-bottom: 0.5rem; }
+  .approval-card { background: var(--surface); border: 1px solid var(--warn); border-radius: 10px; padding: 0.5rem 0.7rem; margin-bottom: 0.5rem; }
   .atop { display: flex; gap: 0.5rem; align-items: center; }
   .alabel { font-size: 0.66rem; letter-spacing: 0.08em; color: var(--warn); }
   .asummary { margin-top: 0.3rem; font-size: var(--text-sm); color: var(--text); font-weight: var(--fw-medium); }
@@ -1188,9 +1188,6 @@
   .ccontrol :global(.wrap) { min-width: 0; max-width: 100%; }
   .c-worktree { overflow: hidden !important; }
   .c-worktree :global(.workmode) { max-width: 100%; }
-  .c-worktree :global(.phase), .c-worktree :global(.desc) {
-    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
   .ccontrol :global(.pill-btn) {
     max-width: 100%; min-width: 0; overflow: hidden; white-space: nowrap;
   }
@@ -1206,7 +1203,6 @@
      chevrons. Every resulting icon button keeps its descriptive title. */
   @container composer-footer (max-width: 520px) {
     .ccontrol { max-width: 9rem; }
-    .c-worktree :global(.desc) { display: none; }
   }
   @container composer-footer (max-width: 360px) {
     .ccontrol { max-width: 6rem; }
@@ -1222,7 +1218,6 @@
     .foot-act .control-label { display: none; }
     .cactions { margin-left: 0; }
     .c-worktree { flex-basis: 3.25rem; width: 3.25rem; max-width: 3.25rem; }
-    .c-worktree :global(.phase), .c-worktree :global(.desc),
     .c-worktree :global(.segment span) { display: none; }
     .c-worktree :global(.segments) { gap: 0; }
     .c-worktree :global(.segment) { padding-inline: 0.25rem; }
