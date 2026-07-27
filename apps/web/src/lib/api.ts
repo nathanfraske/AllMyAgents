@@ -30,6 +30,31 @@ export interface ProjectInfo {
   siteOnline?: boolean
 }
 
+export type WorktreeChangeKind = 'uncommitted' | 'committed' | 'both'
+
+export interface WorktreeProjectActivity {
+  projectId: string
+  observedAt: string | null
+  agents: Array<{
+    sessionId: string
+    label: string
+    branch: string | null
+    worktree: string
+    files: Array<{ file: string; kind: WorktreeChangeKind }>
+    baseCommit: string
+    mainCommit: string
+    commitsBehind: number
+    diverged: boolean
+  }>
+  risks: Array<{
+    risk: 'concurrent-write' | 'stale-base'
+    file: string
+    sessionIds: string[]
+    commitsBehind: number
+    mainAdvance: Array<{ commit: string; subject: string }>
+  }>
+}
+
 export interface GitHubCapability {
   available: boolean
   reason?: string
@@ -93,6 +118,8 @@ export interface SessionRecord {
   delegatedAuthorities?: Array<'commit' | 'push'>
   delegatedTools?: string[]
   title?: string
+  /** Operator-authored team role/description; the generated scientist identity remains in `title`. */
+  role?: string
   titleSource?: string
   // Adopted from an existing vendor transcript via project-import (vs. spawned by the hub).
   imported?: boolean
@@ -512,6 +539,8 @@ export const api = {
     jpost<LoginResult>('/api/accounts/login', { provider, name }),
   pickFolder: () => jpost<{ path: string }>('/api/pick-folder'),
   projects: () => jget<ProjectInfo[]>('/api/projects'),
+  projectActivity: (projectId: string) =>
+    jget<WorktreeProjectActivity>(`/api/projects/${encodeURIComponent(projectId)}/activity`),
   createProject: (name: string, path: string) =>
     jpost<ProjectInfo | { error: string }>('/api/projects', { name, path }),
   githubCapability: () => jget<GitHubCapability>('/api/github/capability'),

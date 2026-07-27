@@ -1,0 +1,441 @@
+<script lang="ts">
+  import { onDestroy } from 'svelte'
+  import { api, type WorktreeProjectActivity } from './api'
+  import { store, type SessionView, type ThreadItem } from './store.svelte'
+  import ProviderLogo from './ProviderLogo.svelte'
+  import TaskStrip from './TaskStrip.svelte'
+  import { agentActivity } from './toolBlurb'
+
+  let { projectId }: { projectId: string } = $props()
+
+  let activity = $state<WorktreeProjectActivity | null>(null)
+  let activityError = $state(false)
+  let activityTimer: ReturnType<typeof setInterval> | null = null
+
+  const project = $derived(store.projects.find((candidate) => candidate.id === projectId))
+  const projectSessions = $derived(
+    store.sessionList.filter((view) => view.record.projectId === projectId),
+  )
+
+  $effect(() => {
+    const id = projectId
+    let current = true
+    const refresh = async (): Promise<void> => {
+      const next = await api.projectActivity(id).catch(() => null)
+      if (!current) return
+      if (next && !('error' in next)) {
+        activity = next
+        activityError = false
+      } else {
+        activityError = true
+      }
+    }
+    void refresh()
+    activityTimer = setInterval(() => void refresh(), 2_500)
+    return () => {
+      current = false
+      if (activityTimer) clearInterval(activityTimer)
+      activityTimer = null
+    }
+  })
+
+  onDestroy(() => {
+    if (activityTimer) clearInterval(activityTimer)
+  })
+
+  type ProjectStatus = 'working' | 'idle' | 'done' | 'failed' | 'blocked'
+  interface AgentRow {
+    view: SessionView
+    depth: number
+  }
+
+  function projectStatus(view: SessionView): ProjectStatus {
+    if (store.approvals.some((approval) => approval.sessionId === view.record.id)) return 'blocked'
+    if (view.record.status === 'active' || view.record.status === 'starting') return 'working'
+    if (view.record.status === 'error' || view.lastTurnOk === false) return 'failed'
+    if (view.record.status === 'stopped' || view.lastTurnOk === true) return 'done'
+    return 'idle'
+  }
+
+  function statusLabel(status: ProjectStatus): string {
+    return status === 'blocked' ? 'blocked on approval' : status
+  }
+
+  function agentName(view: SessionView): string {
+    const resolved = store.sessionLabel(view.record.id).trim()
+    if (view.record.title?.trim()) return resolved || view.record.title.trim()
+    // Legacy/malformed worktree records can fall back to their UUID-shaped checkout directory. That is
+    // technically the sidebar resolver's answer, but not a human identity; keep the fallback useful.
+    if (!resolved || view.record.id.startsWith(resolved) || resolved.startsWith(view.record.id.slice(0, 8))) {
+      return view.record.provider === 'codex' ? 'Codex agent' : 'Claude agent'
+    }
+    return resolved
+  }
+
+  function agentRole(view: SessionView): string | undefined {
+    const role = view.record.role?.trim() || (view.record.isProjectManager ? 'Project manager' : undefined)
+    return role && role.localeCompare(agentName(view), undefined, { sensitivity: 'accent' }) !== 0
+      ? role
+      : undefined
+  }
+
+  const statusCounts = $derived.by(() => {
+    const counts: Record<ProjectStatus, number> = {
+      working: 0,
+      idle: 0,
+      done: 0,
+      failed: 0,
+      blocked: 0,
+    }
+    for (const view of projectSessions) counts[projectStatus(view)]++
+    return counts
+  })
+
+  const agentRows = $derived.by(() => {
+    const rows: AgentRow[] = []
+    const used = new Set<string>()
+    const byParent = new Map<string, SessionView[]>()
+    for (const view of projectSessions) {
+      const parent = view.record.parentSessionId
+      if (!parent) continue
+      const children = byParent.get(parent) ?? []
+      children.push(view)
+      byParent.set(parent, children)
+    }
+    const add = (view: SessionView, depth: number): void => {
+      if (used.has(view.record.id)) return
+      used.add(view.record.id)
+      rows.push({ view, depth })
+      for (const child of byParent.get(view.record.id) ?? []) add(child, depth + 1)
+    }
+    for (const manager of projectSessions.filter((view) => view.record.isProjectManager)) add(manager, 0)
+    for (const view of projectSessions) add(view, 0)
+    return rows
+  })
+
+  const filesBySession = $derived.by(() => {
+    const files = new Map<string, WorktreeProjectActivity['agents'][number]>()
+    for (const agent of activity?.agents ?? []) files.set(agent.sessionId, agent)
+    return files
+  })
+
+  interface CommRow {
+    key: string
+    ts: string
+    source: string
+    target: string
+    subject?: string
+    text?: string
+  }
+
+  function label(view: SessionView | undefined, fallback?: string): string {
+    return view ? agentName(view) : fallback || 'a teammate'
+  }
+
+  function activityInput(item: ThreadItem): Record<string, unknown> | undefined {
+    const raw =
+      item.toolInput && typeof item.toolInput === 'object' && !Array.isArray(item.toolInput)
+        ? (item.toolInput as Record<string, unknown>)
+        : undefined
+    const nested = raw?.arguments
+    return nested && typeof nested === 'object' && !Array.isArray(nested)
+      ? (nested as Record<string, unknown>)
+      : raw
+  }
+
+  const comms = $derived.by(() => {
+    const rows: CommRow[] = []
+    const projectIds = new Set(projectSessions.map((view) => view.record.id))
+    const byId = (id: string | undefined): SessionView | undefined => (id ? store.sessions[id] : undefined)
+    const duplicate = (candidate: CommRow): boolean =>
+      rows.some(
+        (row) =>
+          row.source === candidate.source &&
+          row.target === candidate.target &&
+          row.text === candidate.text &&
+          row.subject === candidate.subject &&
+          Math.abs(Date.parse(row.ts) - Date.parse(candidate.ts)) < 5_000,
+      )
+
+    for (const view of projectSessions) {
+      const sourceName = label(view)
+      const hasCanonicalSentBus = view.items.some(
+        (item) => item.kind === 'bus' && item.busDir === 'sent',
+      )
+      for (const item of view.items) {
+        if (item.kind === 'bus') {
+          const sent = item.busDir === 'sent'
+          const sourceId = sent ? view.record.id : item.busPeerId
+          const targetId = sent ? item.busPeerId : view.record.id
+          // Inbound traffic from a deleted/external teammate is useful. Inbound duplicates of a sent
+          // row collapse below, so one message reads as one project event rather than two journal facts.
+          const row: CommRow = {
+            key: `${view.record.id}:${item.key}`,
+            ts: item.ts,
+            source: sent ? sourceName : label(byId(sourceId), item.busPeer),
+            target: targetId
+              ? label(byId(targetId), item.busPeer)
+              : item.busPeer || (sent ? 'project team' : sourceName),
+            subject: item.busSubject,
+            text: item.text,
+          }
+          if (!duplicate(row)) rows.push(row)
+          continue
+        }
+
+        // Older/imported rows may only carry the vendor tool call. Reuse the same classifier as the
+        // transcript rather than teaching the dashboard another set of bus tool names.
+        if (hasCanonicalSentBus) continue
+        const agent = agentActivity(item, (id) => label(byId(id)))
+        if (!agent || agent.dir !== 'out') continue
+        const input = activityInput(item)
+        const targetId =
+          typeof input?.to_session === 'string' ? input.to_session : agent.counterpartyId
+        if (targetId && !projectIds.has(targetId)) continue
+        const row: CommRow = {
+          key: `${view.record.id}:${item.key}:tool`,
+          ts: item.ts,
+          source: sourceName,
+          target: targetId ? label(byId(targetId)) : 'project team',
+          text: typeof input?.body === 'string' ? input.body : undefined,
+        }
+        if (!duplicate(row)) rows.push(row)
+      }
+    }
+    return rows.sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts)).slice(0, 40)
+  })
+
+  function openChat(id: string): void {
+    store.select(id)
+  }
+
+  function timeOf(ts: string): string {
+    const parsed = new Date(ts)
+    return Number.isNaN(parsed.getTime())
+      ? ''
+      : parsed.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  }
+</script>
+
+<section class="project-view" aria-label={project ? `${project.name} project overview` : 'Project overview'}>
+  {#if !project}
+    <div class="empty hero">
+      <h1>Project unavailable</h1>
+      <p>This project is no longer in the roster.</p>
+    </div>
+  {:else}
+    <header class="project-head">
+      <div>
+        <div class="eyebrow">Project overview</div>
+        <h1>{project.name}</h1>
+        <div class="path" title={project.path}>{project.path}</div>
+      </div>
+      <div class="summary" aria-label="Team status summary">
+        <span><strong>{projectSessions.length}</strong> agents</span>
+        {#if statusCounts.working}<span class="working">{statusCounts.working} working</span>{/if}
+        {#if statusCounts.blocked}<span class="blocked">{statusCounts.blocked} blocked</span>{/if}
+        {#if statusCounts.failed}<span class="failed">{statusCounts.failed} failed</span>{/if}
+      </div>
+    </header>
+
+    {#if activity?.risks.length}
+      <section class="risks" aria-label="Worktree risks">
+        {#each activity.risks as risk (`${risk.risk}:${risk.file}:${risk.sessionIds.join(':')}`)}
+          <article class="risk">
+            <span class="risk-kind">{risk.risk === 'concurrent-write' ? 'Collision' : 'Stale base'}</span>
+            <span class="risk-file">{risk.file}</span>
+            <span class="risk-detail">
+              {#if risk.risk === 'concurrent-write'}
+                {risk.sessionIds.map((id) => label(store.sessions[id], id.slice(0, 8))).join(' and ')} are changing this file
+              {:else}
+                {label(store.sessions[risk.sessionIds[0]], risk.sessionIds[0]?.slice(0, 8))}
+                is {risk.commitsBehind} commit{risk.commitsBehind === 1 ? '' : 's'} behind
+              {/if}
+            </span>
+          </article>
+        {/each}
+      </section>
+    {/if}
+
+    <div class="dashboard-grid">
+      <section class="card team">
+        <div class="section-head">
+          <div>
+            <h2>Team</h2>
+            <p>Live session state and changed files</p>
+          </div>
+          {#if activityError}<span class="monitor-error">file monitor unavailable</span>{/if}
+        </div>
+
+        {#if agentRows.length === 0}
+          <div class="empty">
+            <strong>No agents yet</strong>
+            <span>Launched agents will appear here with their real session status.</span>
+          </div>
+        {:else}
+          <div class="agent-list">
+            {#each agentRows as row (row.view.record.id)}
+              {@const view = row.view}
+              {@const status = projectStatus(view)}
+              {@const fileActivity = filesBySession.get(view.record.id)}
+              <article class="agent" class:child={row.depth > 0} style={`--depth:${row.depth}`}>
+                <button
+                  class="agent-main"
+                  aria-label={`Open ${agentName(view)} chat`}
+                  onclick={() => openChat(view.record.id)}
+                >
+                  <ProviderLogo provider={view.record.provider} size={18} />
+                  <span class="agent-title">
+                    <span class="name">{agentName(view)}</span>
+                    <span class="meta">
+                      {#if agentRole(view)}
+                        <span>{agentRole(view)}</span><span aria-hidden="true">·</span>
+                      {/if}
+                      <span>{view.record.model || view.record.profileId}</span>
+                    </span>
+                  </span>
+                  <span class="state {status}"><span class="dot"></span>{statusLabel(status)}</span>
+                </button>
+
+                <div class="files">
+                  {#if fileActivity?.files.length}
+                    {#each fileActivity.files as changed (changed.file)}
+                      <span class="file" title={`${fileActivity.worktree}\n${changed.kind}`}>
+                        {changed.file}
+                        {#if changed.kind !== 'uncommitted'}<em>{changed.kind}</em>{/if}
+                      </span>
+                    {/each}
+                  {:else if !view.record.worktree}
+                    <span class="file-empty" title={view.record.cwd}>Works directly in the project · file monitoring is unavailable</span>
+                  {:else if !activity}
+                    <span class="file-empty">Checking worktree…</span>
+                  {:else}
+                    <span class="file-empty">No active file changes</span>
+                  {/if}
+                </div>
+
+                <TaskStrip items={view.items} />
+              </article>
+            {/each}
+          </div>
+        {/if}
+      </section>
+
+      <section class="card comms">
+        <div class="section-head">
+          <div>
+            <h2>Comms bus</h2>
+            <p>Project-wide teammate traffic</p>
+          </div>
+        </div>
+
+        {#if comms.length === 0}
+          <div class="empty">
+            <strong>Quiet right now</strong>
+            <span>Messages between teammates will collect here.</span>
+          </div>
+        {:else}
+          <ol class="comms-list">
+            {#each comms as message (message.key)}
+              <li>
+                <div class="comm-top">
+                  <strong>{message.source} → {message.target}</strong>
+                  <time datetime={message.ts}>{timeOf(message.ts)}</time>
+                </div>
+                {#if message.subject}<div class="subject">{message.subject}</div>{/if}
+                {#if message.text}<p>{message.text}</p>{/if}
+              </li>
+            {/each}
+          </ol>
+        {/if}
+      </section>
+    </div>
+  {/if}
+</section>
+
+<style>
+  .project-view { box-sizing: border-box; width: 100%; min-width: 0; height: 100%; overflow: hidden auto;
+    padding: clamp(1rem, 2.5vw, 2rem); background: var(--bg); }
+  .project-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 1rem;
+    max-width: 1400px; margin: 0 auto 1rem; }
+  .eyebrow { color: var(--accent); font-size: var(--text-2xs); font-weight: var(--fw-semibold);
+    letter-spacing: var(--ls-label); text-transform: uppercase; }
+  h1 { margin: .18rem 0; font-size: clamp(1.45rem, 3vw, 2.15rem); line-height: 1.1; }
+  .path { max-width: min(720px, 100%); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: var(--muted); font-family: var(--mono); font-size: var(--text-xs); }
+  .summary { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: .4rem; color: var(--muted);
+    font-size: var(--text-xs); }
+  .summary span { padding: .3rem .55rem; border: 1px solid var(--border); border-radius: var(--r-pill);
+    background: var(--surface); }
+  .summary .blocked, .summary .failed { color: var(--red); border-color: color-mix(in srgb, var(--red) 35%, var(--border)); }
+  .summary .working { color: var(--accent); }
+  .risks { max-width: 1400px; margin: 0 auto 1rem; display: grid; gap: .45rem; }
+  .risk { display: grid; grid-template-columns: auto minmax(100px, auto) 1fr; align-items: center; gap: .65rem;
+    padding: .65rem .8rem; border: 1px solid color-mix(in srgb, var(--red) 44%, var(--border));
+    border-radius: var(--r-lg); background: color-mix(in srgb, var(--red) 7%, var(--surface)); }
+  .risk-kind { color: var(--red); font-size: var(--text-2xs); font-weight: var(--fw-semibold);
+    letter-spacing: var(--ls-label); text-transform: uppercase; }
+  .risk-file { font-family: var(--mono); font-size: var(--text-xs); font-weight: var(--fw-medium); }
+  .risk-detail { color: var(--muted); font-size: var(--text-xs); }
+  .dashboard-grid { max-width: 1400px; margin: 0 auto; display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(300px, .85fr);
+    align-items: start; gap: 1rem; }
+  .card { min-width: 0; border: 1px solid var(--border); border-radius: var(--r-xl); background: var(--surface);
+    box-shadow: var(--edge-hi); overflow: hidden; }
+  .section-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+    padding: .8rem 1rem; border-bottom: 1px solid var(--border-subtle); }
+  h2 { margin: 0; font-size: var(--text-md); }
+  .section-head p { margin: .15rem 0 0; color: var(--muted); font-size: var(--text-xs); }
+  .monitor-error { color: var(--red); font-size: var(--text-2xs); }
+  .agent-list { display: flex; flex-direction: column; }
+  .agent { padding: .65rem .8rem .7rem; border-top: 1px solid var(--border-subtle);
+    margin-left: calc(var(--depth) * 1rem); }
+  .agent:first-child { border-top: 0; }
+  .agent.child { position: relative; }
+  .agent.child::before { content: ''; position: absolute; left: -.45rem; top: 0; bottom: 0;
+    border-left: 1px solid var(--border-strong); }
+  .agent-main { display: flex; align-items: center; gap: .55rem; width: 100%; padding: 0; color: inherit;
+    background: none; border: 0; text-align: left; cursor: pointer; }
+  .agent-main:hover .name { color: var(--accent); }
+  .agent-title { min-width: 0; flex: 1; display: flex; flex-direction: column; }
+  .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-sm);
+    font-weight: var(--fw-semibold); }
+  .meta { display: flex; align-items: center; gap: .35rem; overflow: hidden; color: var(--dim); font-size: var(--text-2xs); }
+  .state { display: inline-flex; align-items: center; gap: .35rem; flex: none; color: var(--muted);
+    font-size: var(--text-2xs); white-space: nowrap; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .state.working { color: var(--accent); }
+  .state.done { color: var(--green, #2e9e63); }
+  .state.failed, .state.blocked { color: var(--red); }
+  .files { display: flex; flex-wrap: wrap; gap: .3rem; margin: .55rem 0 .05rem 1.45rem; }
+  .file { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: .2rem .4rem;
+    border: 1px solid var(--border-subtle); border-radius: var(--r-sm); background: var(--surface-2);
+    font-family: var(--mono); font-size: var(--text-2xs); }
+  .file em { margin-left: .35rem; color: var(--muted); font-family: inherit; font-style: normal; }
+  .file-empty { color: var(--dim); font-size: var(--text-2xs); }
+  .agent :global(.strip) { margin: .55rem 0 0 1.45rem; background: var(--surface-2); }
+  .comms-list { list-style: none; margin: 0; padding: 0; max-height: min(70vh, 760px); overflow: auto; }
+  .comms-list li { padding: .7rem .85rem; border-top: 1px solid var(--border-subtle); }
+  .comms-list li:first-child { border-top: 0; }
+  .comm-top { display: flex; justify-content: space-between; gap: .7rem; font-size: var(--text-xs); }
+  .comm-top strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  time { flex: none; color: var(--dim); font-family: var(--mono); font-size: var(--text-2xs); }
+  .subject { margin-top: .25rem; color: var(--accent); font-size: var(--text-2xs); }
+  .comms-list p { display: -webkit-box; margin: .22rem 0 0; overflow: hidden; color: var(--muted);
+    font-size: var(--text-xs); line-height: 1.4; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; }
+  .empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .25rem;
+    min-height: 125px; padding: 1.5rem; color: var(--muted); text-align: center; font-size: var(--text-xs); }
+  .empty strong { color: var(--text); font-size: var(--text-sm); }
+  .hero { height: 100%; }
+  .hero h1, .hero p { margin: 0; }
+  @media (max-width: 900px) {
+    .dashboard-grid { grid-template-columns: 1fr; }
+    .project-head { align-items: flex-start; flex-direction: column; }
+    .summary { justify-content: flex-start; }
+  }
+  @media (max-width: 560px) {
+    .project-view { padding: .75rem; }
+    .risk { grid-template-columns: 1fr; gap: .2rem; }
+    .risk-detail { margin-top: .2rem; }
+    .state { max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
+  }
+</style>

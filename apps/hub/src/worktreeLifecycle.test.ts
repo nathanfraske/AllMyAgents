@@ -180,6 +180,18 @@ describe('unfiled chat workspace lifecycle', () => {
 })
 
 describe('worktree session lifecycle', () => {
+  it('persists a team role separately from the generated scientist identity', async () => {
+    const hub = buildHub()
+    const record = await hub.sessions.create('claude-test', {
+      projectId: hub.projectId,
+      role: '  Collision writer \n',
+    })
+
+    expect(record.title).toBeTruthy()
+    expect(record.title).not.toBe('Collision writer')
+    expect(record.role).toBe('Collision writer')
+  })
+
   it('records requested isolation separately from the created checkout', async () => {
     const { record, worktree } = await createWorktreeSession()
 

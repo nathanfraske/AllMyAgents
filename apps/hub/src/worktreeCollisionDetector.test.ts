@@ -61,6 +61,7 @@ function fixture(): {
     repo,
     worktree,
     branch,
+    projectId: 'project-1',
     baseCommit,
     baseRef,
     status: 'active',
@@ -76,6 +77,46 @@ function fixture(): {
 }
 
 describe('WorktreeCollisionDetector', () => {
+  it('exposes its existing inspection as a project activity snapshot without a second git scan', async () => {
+    const { knuth, hopper } = fixture()
+    const detector = new WorktreeCollisionDetector({
+      sessions: () => [knuth, hopper],
+      steer: async () => true,
+    })
+
+    fs.writeFileSync(path.join(knuth.worktree!, 'knuth-only.ts'), 'export const knuth = true\n')
+    fs.writeFileSync(path.join(knuth.worktree!, 'shared.ts'), 'export const value = 2\n')
+    fs.writeFileSync(path.join(hopper.worktree!, 'shared.ts'), 'export const value = 3\n')
+
+    await detector.poll()
+
+    expect(detector.projectActivity('project-1')).toEqual(
+      expect.objectContaining({
+        projectId: 'project-1',
+        agents: expect.arrayContaining([
+          expect.objectContaining({
+            sessionId: 'hopper',
+            files: [{ file: 'shared.ts', kind: 'uncommitted' }],
+          }),
+          expect.objectContaining({
+            sessionId: 'knuth',
+            files: expect.arrayContaining([
+              { file: 'knuth-only.ts', kind: 'uncommitted' },
+              { file: 'shared.ts', kind: 'uncommitted' },
+            ]),
+          }),
+        ]),
+        risks: [
+          expect.objectContaining({
+            risk: 'concurrent-write',
+            file: 'shared.ts',
+            sessionIds: ['hopper', 'knuth'],
+          }),
+        ],
+      })
+    )
+  }, 20_000)
+
   it('steers exactly once when the base branch advances across a file this agent modified', async () => {
     const { repo, knuth } = fixture()
     const steer = vi.fn(async (_sessionId: string, _message: string) => true)

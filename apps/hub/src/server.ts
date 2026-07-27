@@ -23,6 +23,7 @@ import { pickableProfiles, setClaudeConnectorPolicy } from './profiles.js'
 import { asFileWriteDiffDensity } from './types.js'
 import type { DangerFlags, HubEvent, HubPrefs, Profile, Provider } from './types.js'
 import type { Executor } from './executor.js'
+import type { WorktreeProjectActivity } from './worktreeCollisionDetector.js'
 import type { RestartState } from './restartController.js'
 import { SCHEMA_VERSION } from './restartHandshake.js'
 import { AttachmentInputError, attachmentLimitForMime, isClaudeImageMime } from './attachments.js'
@@ -384,6 +385,8 @@ export interface ServerOptions {
    *  rather than re-derived, so a persisted Danger Zone toggle lands in the file the hub actually reads
    *  back at boot. Deriving it here is what silently broke persistence in the installed app. */
   configPath: string
+  /** Cached output from the existing worktree detector. Reading this must never start another git scan. */
+  projectActivity?: (projectId: string) => WorktreeProjectActivity
 }
 
 /**
@@ -449,7 +452,7 @@ export function persistPrefs(
 }
 
 export function startServer(opts: ServerOptions): http.Server {
-  const { port, defaultCwd, profilesDir, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath } = opts
+  const { port, defaultCwd, profilesDir, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity } = opts
   // Runtime repositories live beside the journal/config under HUB_DATA_DIR, never in the shipped hub
   // payload or profiles tree. GitHubImportService keeps auth entirely inside an existing `gh` session.
   const github = new GitHubImportService(
@@ -621,6 +624,24 @@ export function startServer(opts: ServerOptions): http.Server {
       }
       if (method === 'GET' && url.pathname === '/api/projects') {
         json(res, projects.list())
+        return
+      }
+      const activityMatch = /^\/api\/projects\/([^/]+)\/activity$/.exec(url.pathname)
+      if (method === 'GET' && activityMatch) {
+        const projectId = decodeURIComponent(activityMatch[1] as string)
+        if (!projects.get(projectId)) {
+          json(res, { error: `unknown project: ${projectId}` }, 404)
+          return
+        }
+        json(
+          res,
+          projectActivity?.(projectId) ?? {
+            projectId,
+            observedAt: null,
+            agents: [],
+            risks: [],
+          }
+        )
         return
       }
       // Optional GitHub import. Capability detection is intentionally lazy: a GitHub-less/offline first
@@ -996,6 +1017,7 @@ export function startServer(opts: ServerOptions): http.Server {
           model: str(body.model),
           effort: str(body.effort),
           serviceTier: str(body.serviceTier),
+          role: str(body.role),
           permissionMode: pm === 'safe' || pm === 'edits' || pm === 'full' ? pm : undefined,
           useWorktree: typeof body.useWorktree === 'boolean' ? body.useWorktree : undefined,
         })

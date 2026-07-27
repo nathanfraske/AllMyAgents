@@ -292,6 +292,8 @@ export class HubStore {
   connected = $state(false)
   needsPairing = $state(false)
   selectedId = $state<string | null>(null)
+  /** The read-first project dashboard. Mutually exclusive with visible chat panes. */
+  projectViewId = $state<string | null>(null)
   settingsOpen = $state(false)
   // Queued messages survive a refresh: you already committed to sending that text, so losing it because
   // the page reloaded is data loss. Restored from localStorage and re-saved on every mutation.
@@ -2342,6 +2344,7 @@ export class HubStore {
 
   select(id: string): void {
     this.restorableLayout = null // opening a chat directly supersedes the pending restore offer
+    this.projectViewId = null
     const prev = this.selectedId
     this.selectedId = id
     void this.ensureHistory(id)
@@ -2385,10 +2388,25 @@ export class HubStore {
     }
     this.selectedId = null
     this.splitPanes = []
+    this.projectViewId = null
+  }
+
+  /**
+   * Open the project-wide read model after a team launch. Keep the prior chat layout available through
+   * Back, but never render it underneath the dashboard or make ProjectView pretend to be another pane.
+   */
+  openProjectView(projectId: string): void {
+    if (this.selectedId || this.splitPanes.length) {
+      this.lastLayout = { selectedId: this.selectedId, splitPanes: this.splitPanes.map((r) => [...r]) }
+    }
+    this.selectedId = null
+    this.splitPanes = []
+    this.projectViewId = projectId
   }
 
   goBack(): void {
     if (!this.lastLayout) return
+    this.projectViewId = null
     this.selectedId = this.lastLayout.selectedId
     this.splitPanes = this.lastLayout.splitPanes.map((r) => [...r])
     this.lastLayout = null

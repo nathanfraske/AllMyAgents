@@ -6,6 +6,7 @@
   import ManagerSetupModal from './lib/ManagerSetupModal.svelte'
   import ConfirmDialog from './lib/ConfirmDialog.svelte'
   import Dashboard from './lib/Dashboard.svelte'
+  import ProjectView from './lib/ProjectView.svelte'
   import Titlebar from './lib/Titlebar.svelte'
   import UpdateBanner from './lib/UpdateBanner.svelte'
   import { cubicOut } from 'svelte/easing'
@@ -290,7 +291,9 @@
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div class="handle" class:active={sidebarDrag} role="separator" aria-label="resize sidebar" tabindex="-1" onmousedown={startSidebarDrag}></div>
   <main class="center" ondragover={onDragOver} ondrop={onDrop} role="presentation">
-    {#if totalPanes === 0}
+    {#if store.projectViewId}
+      <ProjectView projectId={store.projectViewId} />
+    {:else if totalPanes === 0}
       {#if store.dragSession}
         <div class="empty dropping">drop to open this chat</div>
       {:else}

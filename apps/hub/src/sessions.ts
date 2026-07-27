@@ -58,6 +58,8 @@ export interface CreateOptions {
   model?: string
   effort?: string
   serviceTier?: string
+  /** Team role/description, deliberately separate from the generated scientist identity. */
+  role?: string
   permissionMode?: 'safe' | 'edits' | 'full'
   // When spawning into a git project: create an isolated worktree (default), or set false to
   // work directly in the project directory.
@@ -1436,6 +1438,7 @@ export class SessionManager {
       model: opts.model,
       effort: opts.effort,
       serviceTier: opts.serviceTier,
+      role: opts.role ? sanitizeTitle(opts.role) || undefined : undefined,
       permissionMode: opts.permissionMode,
       parentSessionId: opts.parentSessionId,
       delegatedAuthorities: opts.delegatedAuthorities?.length

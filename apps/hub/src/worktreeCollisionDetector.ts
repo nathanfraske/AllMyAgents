@@ -7,7 +7,8 @@ import type { SessionRecord } from './types.js'
 
 export const WORKTREE_COLLISION_POLL_MS = 2_000
 
-type ChangeKind = 'uncommitted' | 'committed' | 'both'
+export type WorktreeChangeKind = 'uncommitted' | 'committed' | 'both'
+type ChangeKind = WorktreeChangeKind
 
 interface ChangedPath {
   display: string
@@ -41,6 +42,37 @@ export interface WorktreeRiskEvent {
   commitsBehind: number
   mainAdvance: WorktreeAdvanceCommit[]
   steeredSessionIds: string[]
+}
+
+/**
+ * Read model for the project dashboard. This is deliberately produced by the detector's normal poll:
+ * consumers never run a second `git status`/`git diff`, and they never scrape transcripts for filenames.
+ */
+export interface WorktreeAgentActivity {
+  sessionId: string
+  label: string
+  branch: string | null
+  worktree: string
+  files: Array<{ file: string; kind: WorktreeChangeKind }>
+  baseCommit: string
+  mainCommit: string
+  commitsBehind: number
+  diverged: boolean
+}
+
+export interface WorktreeRiskSnapshot {
+  risk: WorktreeRiskEvent['risk']
+  file: string
+  sessionIds: string[]
+  commitsBehind: number
+  mainAdvance: WorktreeAdvanceCommit[]
+}
+
+export interface WorktreeProjectActivity {
+  projectId: string
+  observedAt: string | null
+  agents: WorktreeAgentActivity[]
+  risks: WorktreeRiskSnapshot[]
 }
 
 export interface WorktreeStaleFile {
@@ -352,6 +384,7 @@ export class WorktreeCollisionDetector {
   private nextSeen = 1
   private timer: ReturnType<typeof setInterval> | undefined
   private polling = false
+  private activityByProject = new Map<string, WorktreeProjectActivity>()
 
   constructor(private readonly options: WorktreeCollisionDetectorOptions) {}
 
@@ -367,10 +400,40 @@ export class WorktreeCollisionDetector {
     this.timer = undefined
   }
 
+  projectActivity(projectId: string): WorktreeProjectActivity {
+    return (
+      this.activityByProject.get(projectId) ?? {
+        projectId,
+        observedAt: null,
+        agents: [],
+        risks: [],
+      }
+    )
+  }
+
   async poll(): Promise<void> {
-    if (this.polling || this.options.enabled?.() === false) return
+    if (this.polling) return
+    if (this.options.enabled?.() === false) {
+      this.activityByProject = new Map()
+      return
+    }
     this.polling = true
     try {
+      const observedAt = new Date().toISOString()
+      const nextActivity = new Map<string, WorktreeProjectActivity>()
+      const activityFor = (projectId: string): WorktreeProjectActivity => {
+        let activity = nextActivity.get(projectId)
+        if (!activity) {
+          activity = { projectId, observedAt, agents: [], risks: [] }
+          nextActivity.set(projectId, activity)
+        }
+        return activity
+      }
+      const addRisk = (projectIds: Array<string | undefined>, risk: WorktreeRiskSnapshot): void => {
+        for (const projectId of new Set(projectIds.filter((id): id is string => Boolean(id)))) {
+          activityFor(projectId).risks.push(risk)
+        }
+      }
       const groups = new Map<string, SessionRecord[]>()
       for (const record of this.options.sessions()) {
         if (record.status !== 'active' || !record.repo || !record.worktree) continue
@@ -399,9 +462,34 @@ export class WorktreeCollisionDetector {
         const healthy = inspected.filter((item): item is SessionInspection => item !== undefined)
 
         for (const item of healthy) {
+          const projectId = item.record.projectId
+          if (!projectId) continue
+          activityFor(projectId).agents.push({
+            sessionId: item.record.id,
+            label: agentName(item.record),
+            branch: item.record.branch ?? null,
+            worktree: item.record.worktree!,
+            files: [...item.changes.values()]
+              .map((changed) => ({ file: changed.display, kind: changed.kind }))
+              .sort((a, b) => a.file.localeCompare(b.file)),
+            baseCommit: item.baseCommit,
+            mainCommit: item.mainCommit,
+            commitsBehind: item.commitsBehind,
+            diverged: item.diverged,
+          })
+        }
+
+        for (const item of healthy) {
           for (const staleFile of item.staleFiles) {
             const advanceKey = staleFile.commits[0]?.commit ?? item.mainCommit
             const riskKey = `stale-base\0${item.record.id}\0${pathKey(staleFile.file)}\0${advanceKey}`
+            addRisk([item.record.projectId], {
+              risk: 'stale-base',
+              file: staleFile.file,
+              sessionIds: [item.record.id],
+              commitsBehind: item.commitsBehind,
+              mainAdvance: staleFile.commits,
+            })
             if (this.notified.has(riskKey)) continue
             this.notified.add(riskKey)
             const accepted = await this.options.steer(
@@ -452,18 +540,25 @@ export class WorktreeCollisionDetector {
               const b = writers[right]!
               const ids = [a.record.id, b.record.id].sort()
               const collisionKey = `concurrent-write\0${ids[0]}\0${ids[1]}\0${fileKey}`
+              const later = a.firstSeen > b.firstSeen ? a : b
+              const other = later === a ? b : a
+              const laterInspection = healthy.find((item) => item.record.id === later.record.id)!
+              addRisk([a.record.projectId, b.record.projectId], {
+                risk: 'concurrent-write',
+                file: later.path.display,
+                sessionIds: ids,
+                commitsBehind: laterInspection.commitsBehind,
+                mainAdvance: [],
+              })
               if (this.notified.has(collisionKey)) continue
               this.notified.add(collisionKey)
 
-              const later = a.firstSeen > b.firstSeen ? a : b
-              const other = later === a ? b : a
               const name = agentName(other.record)
               const file = later.path.display
               const message =
                 `Heads up: ${name} is also editing ${file} right now. ` +
                 detail(name, other.path.display, other.path.kind)
               const accepted = await this.options.steer(later.record.id, message)
-              const laterInspection = healthy.find((item) => item.record.id === later.record.id)!
               await this.report({
                 version: 1,
                 risk: 'concurrent-write',
@@ -486,6 +581,11 @@ export class WorktreeCollisionDetector {
           }
         }
       }
+      for (const activity of nextActivity.values()) {
+        activity.agents.sort((a, b) => a.label.localeCompare(b.label))
+        activity.risks.sort((a, b) => a.file.localeCompare(b.file) || a.risk.localeCompare(b.risk))
+      }
+      this.activityByProject = nextActivity
     } finally {
       this.polling = false
     }
