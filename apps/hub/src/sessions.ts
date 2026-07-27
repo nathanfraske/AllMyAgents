@@ -194,10 +194,10 @@ export class SessionManager {
       // 'stopped' record was flipped straight back to 'idle' — persisted and journaled. Stop appeared to
       // work and then silently undid itself.
       //
-      // That composes badly in three directions: idle schedules deliverBus, so a queued teammate message
-      // could start a fresh turn on the stopped chat; the web flushes queued messages on idle, so the
-      // operator's own queued prompt could restart it; and stop() has by then REMOVED the worktree, so
-      // whatever restarts runs against a directory that no longer exists.
+      // That used to compose badly in three directions: idle schedules deliverBus, so a queued teammate
+      // message could start a fresh turn on the stopped chat; the web flushes queued messages on idle, so the
+      // operator's own queued prompt could restart it; and the old stop() had by then REMOVED the
+      // worktree, so whatever restarted ran against a directory that no longer existed.
       //
       // Guarded here because this is the one seam both executors' lifecycles pass through. reopen() calls
       // setStatus directly and is therefore unaffected — un-stopping stays an explicit operator action.
@@ -1590,8 +1590,15 @@ export class SessionManager {
     if (!record) return
     await this.interrupt(sessionId).catch(() => undefined)
     if (record.repo && record.worktree) {
-      this.workspace.remove(record.repo, record.worktree)
-      this.journal.append(sessionId, 'session/worktree-removed', { worktree: record.worktree })
+      // Stop means "end the agent", not "delete its files". This used to call
+      // `git worktree remove --force`, which erases tracked modifications and untracked files with no
+      // warning; Reopen then revived a record whose cwd no longer existed. Preserve the checkout
+      // unconditionally so interrupting an agent is always a recoverable operation.
+      this.journal.append(sessionId, 'session/worktree-preserved', {
+        repo: record.repo,
+        worktree: record.worktree,
+        branch: record.branch,
+      })
     }
     this.setStatus(record, 'stopped')
   }
@@ -1603,13 +1610,28 @@ export class SessionManager {
    * back — so the chat was unrecoverable across reloads and hub restarts, the only exit being to delete it.
    * setStatus journals the session/status transition (so every client un-sticks and its composer frees) and
    * persists it (so a subsequent hub restart keeps it idle). Idempotent and safe: a session that is not
-   * stopped/errored is left exactly as-is; an unknown id is a no-op. Does NOT recreate a torn-down worktree
-   * — a stopped worktree chat reopens working directly in its cwd, which is the honest post-stop state.
+   * stopped/errored is left exactly as-is; an unknown id is a no-op. A worktree session is revived only
+   * when its recorded checkout is still registered and usable, so idle never means "cwd is missing".
    */
-  reopen(sessionId: string): { ok: boolean; status?: SessionStatus } {
+  reopen(sessionId: string): { ok: boolean; status?: SessionStatus; error?: string } {
     const record = this.sessions.get(sessionId)
-    if (!record) return { ok: false }
-    if (record.status === 'stopped' || record.status === 'error') this.setStatus(record, 'idle')
+    if (!record) return { ok: false, error: `unknown session: ${sessionId}` }
+    if (record.status === 'stopped' || record.status === 'error') {
+      if (record.repo && record.worktree) {
+        const state = this.workspace.inspect(record.repo, record.worktree)
+        if (!state.ok) {
+          const branch = record.branch ? ` The last recorded branch is ${record.branch}.` : ''
+          return {
+            ok: false,
+            status: record.status,
+            error:
+              `Cannot reopen because its worktree is unavailable at ${record.worktree}.` +
+              `${branch} Repair or restore that Git worktree, then try Reopen again. (${state.error})`,
+          }
+        }
+      }
+      this.setStatus(record, 'idle')
+    }
     return { ok: true, status: record.status }
   }
 
@@ -1620,11 +1642,25 @@ export class SessionManager {
   async delete(sessionId: string): Promise<{ ok: true } | { ok: false; error: string }> {
     const record = this.sessions.get(sessionId)
     if (!record) return { ok: false, error: `unknown session: ${sessionId}` }
-    // 1. End any running turn and tear down the worktree via the existing stop path. Note: an
+    // 1. End any running turn. Stop preserves the worktree; Delete alone may remove it, and only after
+    //    proving there is no live writer and Git reports the checkout clean. Note: an
     //    IMPORTED session (record.imported) carries no repo/worktree and this path never touches
     //    the filesystem — deleting it drops only the hub record, never the source vendor transcript
     //    (the user's own Claude/Codex history, which may live in their real home dir). See §3.4.
     await this.stop(sessionId).catch(() => undefined)
+    if (record.repo && record.worktree) {
+      // Interrupt acknowledgement can precede the turn's terminal event. Never race filesystem removal
+      // against an agent that may still be unwinding and writing; a second Delete after it settles is safe.
+      if (this.executor.isBusy(sessionId)) {
+        return {
+          ok: false,
+          error: `The agent is still shutting down; its worktree was preserved at ${record.worktree}. Try Delete again after the turn settles.`,
+        }
+      }
+      const removed = this.workspace.remove(record.repo, record.worktree)
+      if (!removed.ok) return removed
+      this.journal.append(sessionId, 'session/worktree-removed', { worktree: record.worktree })
+    }
     // 2. Tombstone the session in the append-only journal.
     this.journal.append(sessionId, 'session/deleted', { id: sessionId })
     // 3. Drop it from the roster so list() no longer returns it, and from the executor (its driver /
