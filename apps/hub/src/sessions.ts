@@ -1898,7 +1898,7 @@ export class SessionManager {
     const manager = relation.manager
     const label = child.title ?? identityOf(child).label
     const toolName = delegableToolName(approval.kind, approval.payload)
-    const authority = delegatedGitAuthority(approval.kind, approval.payload)
+    const authority = delegatedGitAuthority(approval.kind, approval.payload, child)
     const requested = authority ?? toolName ?? approval.kind
     const body =
       `${label} is waiting on approval ${approval.id} for ${requested}. ` +
@@ -2518,7 +2518,7 @@ export class SessionManager {
     // Deliberate operator-granted exception for a manager's direct child. Read every part from the live
     // records on every approval: no worker/turn cache may let a revoked grant survive for one more action.
     // The parser below accepts only a single, exact Git commit or push command; unknown shapes fail closed.
-    const delegated = delegatedGitAuthority(kind, payload)
+    const delegated = delegatedGitAuthority(kind, payload, record)
     if (delegated && record.parentSessionId && record.delegatedAuthorities?.includes(delegated)) {
       const manager = this.sessions.get(record.parentSessionId)
       if (manager?.isProjectManager === true && manager.managerDelegation?.includes(delegated)) {
@@ -2818,7 +2818,7 @@ export class SessionManager {
     let authority: DelegatedAuthority | undefined
     let toolName: string | undefined
     if (approve) {
-      authority = delegatedGitAuthority(approval.kind, approval.payload)
+      authority = delegatedGitAuthority(approval.kind, approval.payload, relation.child)
       if (authority) {
         if (!manager.managerDelegation?.includes(authority)) {
           return { ok: false, error: `${authority} is outside the operator-granted manager ceiling` }
@@ -3617,7 +3617,11 @@ function delegableToolName(kind: string, payload: unknown): string | undefined {
  * not a substring check: shell composition, substitutions, redirections, newlines, aliases, unknown
  * approval kinds, and unknown payload shapes all return undefined and therefore ask the operator.
  */
-function delegatedGitAuthority(kind: string, payload: unknown): DelegatedAuthority | undefined {
+function delegatedGitAuthority(
+  kind: string,
+  payload: unknown,
+  record: SessionRecord
+): DelegatedAuthority | undefined {
   const p = payload as {
     toolName?: unknown
     matchedAskRule?: unknown
@@ -3659,6 +3663,7 @@ function delegatedGitAuthority(kind: string, payload: unknown): DelegatedAuthori
       return undefined
     }
     tokens = raw.map((token) => token.trim())
+    if (tokens.some((token) => /[\r\n\0]/.test(token) || SHELL_CONTROL_TOKENS.has(token))) return undefined
   } else if (typeof raw === 'string') {
     const command = raw.trim()
     if (!command || /[\r\n;&|<>`$()]/.test(command)) return undefined
@@ -3677,12 +3682,123 @@ function delegatedGitAuthority(kind: string, payload: unknown): DelegatedAuthori
       ? token.slice(1, -1)
       : token
   if (!/^(?:git|git\.exe)$/i.test(unquote(tokens.shift() ?? ''))) return undefined
-  if (tokens[0] === '-C') {
-    tokens.shift()
-    if (!tokens.shift()) return undefined
-  }
   const operation = unquote(tokens.shift() ?? '')
-  return operation === 'commit' || operation === 'push' ? operation : undefined
+  if (operation !== 'commit' && operation !== 'push') return undefined
+  const args = tokens.map(unquote)
+  if (args.some(isRepositoryOverrideArgument) || args.some(isAbsoluteGitArgument)) return undefined
+  if (operation === 'commit' && !hasNonInteractiveCommitMessage(args)) return undefined
+  if (!isConfinedGitWorktree(record) || hasActiveGitHooks(record.worktree!)) return undefined
+  return operation
+}
+
+const SHELL_CONTROL_TOKENS = new Set(['&&', '||', ';', '|', '&', '>', '>>', '<', '<<'])
+const CLIENT_GIT_HOOKS = [
+  'applypatch-msg',
+  'pre-applypatch',
+  'post-applypatch',
+  'pre-commit',
+  'pre-merge-commit',
+  'prepare-commit-msg',
+  'commit-msg',
+  'post-commit',
+  'pre-rebase',
+  'post-checkout',
+  'post-merge',
+  'pre-push',
+  'post-rewrite',
+  'sendemail-validate',
+  'fsmonitor-watchman',
+  'post-index-change',
+] as const
+
+function canonicalPath(value: string): string | undefined {
+  try {
+    const resolved = fs.realpathSync.native(value)
+    return process.platform === 'win32' ? resolved.toLocaleLowerCase() : resolved
+  } catch {
+    return undefined
+  }
+}
+
+function isConfinedGitWorktree(record: SessionRecord): boolean {
+  if (!record.worktree) return false
+  const cwd = canonicalPath(record.cwd)
+  const worktree = canonicalPath(record.worktree)
+  if (!cwd || !worktree || cwd !== worktree) return false
+  try {
+    const root = execFileSync('git', ['-C', record.worktree, 'rev-parse', '--show-toplevel'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim()
+    return canonicalPath(root) === worktree
+  } catch {
+    return false
+  }
+}
+
+function isRepositoryOverrideArgument(token: string): boolean {
+  return (
+    token === '-C' ||
+    token === '--git-dir' ||
+    token.startsWith('--git-dir=') ||
+    token === '--work-tree' ||
+    token.startsWith('--work-tree=') ||
+    token === '--namespace' ||
+    token.startsWith('--namespace=') ||
+    token === '--repo' ||
+    token.startsWith('--repo=') ||
+    token === '--receive-pack' ||
+    token.startsWith('--receive-pack=') ||
+    token === '--exec' ||
+    token.startsWith('--exec=')
+  )
+}
+
+function isAbsoluteGitArgument(token: string): boolean {
+  if (path.isAbsolute(token) || /^[A-Za-z]:[\\/]/.test(token) || /^\\\\/.test(token)) return true
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(token) || /^file:/i.test(token)) return true
+  if (/^[^/@\s]+@[^:\s]+:/.test(token)) return true
+  const equals = token.indexOf('=')
+  if (equals < 0) return false
+  const value = token.slice(equals + 1)
+  return path.isAbsolute(value) || /^[A-Za-z]:[\\/]/.test(value) || /^\\\\/.test(value)
+}
+
+function hasNonInteractiveCommitMessage(args: string[]): boolean {
+  return args.some(
+    (arg) =>
+      arg === '-m' ||
+      /^-[^-]*m/.test(arg) ||
+      arg === '--message' ||
+      arg.startsWith('--message=') ||
+      arg === '--reuse-message' ||
+      arg.startsWith('--reuse-message=') ||
+      arg === '--no-edit'
+  )
+}
+
+function hasActiveGitHooks(worktree: string): boolean {
+  try {
+    let customHooksPath = ''
+    try {
+      customHooksPath = execFileSync('git', ['-C', worktree, 'config', '--get', 'core.hooksPath'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim()
+    } catch (error) {
+      if ((error as { status?: unknown }).status !== 1) return true
+    }
+    // A repository-controlled custom hook location is executable policy, even when presently empty.
+    if (customHooksPath) return true
+    const rawHooksPath = execFileSync('git', ['-C', worktree, 'rev-parse', '--git-path', 'hooks'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim()
+    const hooksPath = path.isAbsolute(rawHooksPath) ? rawHooksPath : path.resolve(worktree, rawHooksPath)
+    return CLIENT_GIT_HOOKS.some((name) => fs.existsSync(path.join(hooksPath, name)))
+  } catch {
+    return true
+  }
 }
 
 /**
