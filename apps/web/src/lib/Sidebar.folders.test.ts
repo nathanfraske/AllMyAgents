@@ -51,6 +51,7 @@ beforeEach(() => {
   store.projects = [{ id: 'proj-a', name: 'Alpha', path: 'C:/work', createdAt: '2026-01-01T00:00:00.000Z' }]
   store.projectOrder = []
   store.chatOrder = {}
+  store.approvals = []
   store.sessions = {
     s1: seedSession('s1', 'proj-a', 'one'),
     s2: seedSession('s2', 'proj-a', 'two'),
@@ -122,7 +123,9 @@ describe('Sidebar with folder state', () => {
     const projectLabels = [...el.querySelectorAll('.group:first-child .rlabel')].map((node) => node.textContent)
     expect(projectLabels).toEqual(['one', 'two'])
     expect(el.querySelector('.row.managedchild .rlabel')?.textContent).toBe('two')
-    expect(el.querySelector('.pmtag')?.textContent).toBe('PM')
+    expect(el.querySelector('.row.manager .rlabel')?.textContent).toBe('one')
+    expect(el.querySelector('.manager-role')?.textContent).toMatch(/manager.*1 agent/i)
+    expect(el.querySelector('.manager-role svg')).not.toBeNull()
   })
 
   it('restores a collapsed manager subtree from the existing collapsed-state store', () => {
@@ -152,5 +155,55 @@ describe('Sidebar with folder state', () => {
     const railed = [...el.querySelectorAll('.entry.infolder .rlabel')].map((node) => node.textContent)
     expect(railed).toEqual(['one', 'two'])
     expect(el.querySelector('.entry.infolder .row.managedchild .rlabel')?.textContent).toBe('two')
+  })
+
+  it('reveals only children that need attention while their manager is collapsed', () => {
+    store.sessions.s1!.record.isProjectManager = true
+    store.sessions.s2!.record.parentSessionId = 's1'
+    store.sessions.s4 = seedSession('s4', 'proj-a', 'failed child')
+    store.sessions.s4.record.parentSessionId = 's1'
+    store.sessions.s4.record.status = 'error'
+    store.sessions.s5 = seedSession('s5', 'proj-a', 'approval child')
+    store.sessions.s5.record.parentSessionId = 's1'
+    store.approvals = [{
+      id: 'approval-1',
+      sessionId: 's5',
+      kind: 'tool',
+      payload: {},
+      status: 'pending',
+      createdAt: '2026-01-01T00:00:00.000Z',
+    }]
+    localStorage.setItem('allmyagents.ui.collapsedFolders', JSON.stringify(['manager:s1']))
+
+    const { container } = render(Sidebar)
+    const el = container as HTMLElement
+    expect(labels(el)).not.toContain('two')
+    expect(labels(el)).toContain('failed child')
+    expect(labels(el)).toContain('approval child')
+    expect([...el.querySelectorAll('.row.attentionchild .rlabel')].map((node) => node.textContent).sort())
+      .toEqual(['approval child', 'failed child'])
+  })
+
+  it('marks a live child whose manager no longer exists instead of losing its lineage silently', () => {
+    store.sessions.s2!.record.parentSessionId = 'deleted-manager'
+    store.sessions.s2!.record.status = 'active'
+
+    const { container } = render(Sidebar)
+    const el = container as HTMLElement
+    expect(labels(el)).toContain('two')
+    expect(el.querySelector('.row.orphanedchild .rlabel')?.textContent).toBe('two')
+    expect(el.querySelector('.manager-orphan')?.getAttribute('title')).toMatch(/manager.*no longer available/i)
+  })
+
+  it('keeps live children nested under a stopped manager', () => {
+    store.sessions.s1!.record.isProjectManager = true
+    store.sessions.s1!.record.status = 'stopped'
+    store.sessions.s2!.record.parentSessionId = 's1'
+    store.sessions.s2!.record.status = 'active'
+
+    const { container } = render(Sidebar)
+    const el = container as HTMLElement
+    expect(el.querySelector('.row.manager .rlabel')?.textContent).toBe('one')
+    expect(el.querySelector('.row.managedchild .rlabel')?.textContent).toBe('two')
   })
 })

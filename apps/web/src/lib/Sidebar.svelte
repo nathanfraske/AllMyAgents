@@ -312,20 +312,47 @@
         s: SessionView
         managerDepth: number
         managerHasChildren: boolean
+        managerChildCount: number
+        attentionRevealed: boolean
+        orphanedManager: boolean
       }
 
   function entriesFor(g: Group): Entry[] {
     const out: Entry[] = []
     const byId = new Map(g.sessions.map((item) => [item.record.id, item]))
     const children = new Map<string, SessionView[]>()
+    const orphaned = new Set<string>()
     for (const item of g.sessions) {
       const parent = item.record.parentSessionId
-      if (!parent || !byId.get(parent)?.record.isProjectManager) continue
+      if (!parent) continue
+      if (!byId.get(parent)?.record.isProjectManager) {
+        // A child can outlive a deleted manager (or a revoked manager role). It must remain a root row,
+        // but it should not silently lose the context that it was delegated work.
+        orphaned.add(item.record.id)
+        continue
+      }
       const list = children.get(parent) ?? []
       list.push(item)
       children.set(parent, list)
     }
     const linked = new Set([...children.values()].flat().map((item) => item.record.id))
+    const pending = store.pendingBySession
+    const needsAttention = (item: SessionView): boolean => {
+      const status = store.status(item)
+      return (pending[item.record.id] ?? 0) > 0 || warnOf(item, status)
+    }
+    const attentionMemo = new Map<string, boolean>()
+    const subtreeNeedsAttention = (item: SessionView, path = new Set<string>()): boolean => {
+      const known = attentionMemo.get(item.record.id)
+      if (known !== undefined) return known
+      if (path.has(item.record.id)) return false
+      const nextPath = new Set(path)
+      nextPath.add(item.record.id)
+      const result = needsAttention(item)
+        || (children.get(item.record.id) ?? []).some((child) => subtreeNeedsAttention(child, nextPath))
+      attentionMemo.set(item.record.id, result)
+      return result
+    }
     const emitted = new Set<string>()
     const suppressed = new Set<string>()
     const suppressTree = (item: SessionView): void => {
@@ -337,20 +364,30 @@
       roots: SessionView[],
       railId: string | null
     ): void => {
-      const rows: Array<{ s: SessionView; depth: number; hasChildren: boolean }> = []
-      const visit = (item: SessionView, depth: number): void => {
+      const rows: Array<{
+        s: SessionView
+        depth: number
+        nested: SessionView[]
+        attentionRevealed: boolean
+      }> = []
+      const visit = (item: SessionView, depth: number, attentionOnly = false, attentionRevealed = false): void => {
         if (emitted.has(item.record.id) || suppressed.has(item.record.id)) return
         emitted.add(item.record.id)
         const nested = children.get(item.record.id) ?? []
-        rows.push({ s: item, depth, hasChildren: nested.length > 0 })
-        if (collapsed.has(`manager:${item.record.id}`)) {
-          for (const child of nested) suppressTree(child)
+        rows.push({ s: item, depth, nested, attentionRevealed })
+        if (attentionOnly || collapsed.has(`manager:${item.record.id}`)) {
+          // Collapse hides routine work, not work that needs the operator. Preserve the ancestry path
+          // to each approval/error so the urgent row is both findable and still attributable.
+          for (const child of nested) {
+            if (subtreeNeedsAttention(child)) visit(child, depth + 1, true, true)
+            else suppressTree(child)
+          }
           return
         }
         for (const child of nested) visit(child, depth + 1)
       }
       for (const root of roots) visit(root, 0)
-      rows.forEach(({ s, depth, hasChildren }, index) => {
+      rows.forEach(({ s, depth, nested, attentionRevealed }, index) => {
         out.push({
           key: `c:${s.record.id}`,
           kind: 'chat',
@@ -358,7 +395,10 @@
           railEnd: railId !== null && index === rows.length - 1,
           s,
           managerDepth: depth,
-          managerHasChildren: hasChildren,
+          managerHasChildren: nested.length > 0,
+          managerChildCount: nested.length,
+          attentionRevealed,
+          orphanedManager: orphaned.has(s.record.id),
         })
       })
     }
@@ -738,7 +778,10 @@
                 class="row"
                 class:sel={store.selectedId === s.record.id}
                 class:dragging={isDragging('chat', s.record.id)}
+                class:manager={s.record.isProjectManager}
                 class:managedchild={en.managerDepth > 0}
+                class:attentionchild={en.attentionRevealed}
+                class:orphanedchild={en.orphanedManager}
                 style={`--manager-depth:${en.managerDepth}`}
                 role="button"
                 tabindex="0"
@@ -763,20 +806,13 @@
                   </button>
                 {:else if en.managerDepth > 0}
                   <span class="manager-branch" aria-hidden="true"><Icon name="corner-down-right" size={10} /></span>
+                {:else if en.orphanedManager}
+                  <span class="manager-orphan" title="delegated child · manager is no longer available" aria-label="manager is no longer available">
+                    <Icon name="flag" size={11} />
+                  </span>
                 {/if}
                 <span class="dot {st.key}" title={st.label}></span>
                 <ProviderLogo provider={s.record.provider} size={13} />
-                {#if s.record.isProjectManager}
-                  <button
-                    class="pmtag"
-                    title="project manager · view scope or revoke"
-                    aria-label={`View project manager scope for ${label(s)}`}
-                    onclick={(event) => {
-                      event.stopPropagation()
-                      store.openManagerSetup(s.record.id)
-                    }}
-                  >PM</button>
-                {/if}
                 {#if s.record.imported}<span class="ibadge" title="imported from an existing {s.record.provider} chat"><Icon name="download" size={10} /></span>{/if}
                 {#if editingId === s.record.id}
                   <input class="rename-input" bind:value={draft} use:focusInput
@@ -784,6 +820,24 @@
                     onpointerdown={(e) => e.stopPropagation()}
                     onkeydown={(e) => { if (e.key === 'Enter') commitRename(); else if (e.key === 'Escape') editingId = null }}
                     onblur={commitRename} />
+                {:else if s.record.isProjectManager}
+                  <span class="manager-identity">
+                    <!-- The scientist name stays untouched; the role is a subordinate marker, not a rename. -->
+                    <!-- svelte-ignore a11y_no_static_element_interactions -->
+                    <span class="rlabel" class:glitch={glitching.has(s.record.id)} ondblclick={(e) => startRename(e, s)}>{label(s)}</span>
+                    <button
+                      class="manager-role"
+                      title="project manager · runs and oversees this team · view scope"
+                      aria-label={`View project manager scope for ${label(s)}`}
+                      onclick={(event) => {
+                        event.stopPropagation()
+                        store.openManagerSetup(s.record.id)
+                      }}
+                    >
+                      <Icon name="flag" size={9} />
+                      <span>manager · {en.managerChildCount} {en.managerChildCount === 1 ? 'agent' : 'agents'}</span>
+                    </button>
+                  </span>
                 {:else}
                   <!-- svelte-ignore a11y_no_static_element_interactions -->
                   <span class="rlabel" class:glitch={glitching.has(s.record.id)} ondblclick={(e) => startRename(e, s)}>{label(s)}</span>
@@ -920,13 +974,34 @@
   .fempty.droptarget { border-style: solid; border-color: transparent; color: var(--text); }
 
   .row { position: relative; display: flex; align-items: center; gap: var(--space-3); padding: var(--space-2) var(--space-3) var(--space-2) var(--space-6); border-radius: var(--r-md); cursor: pointer; }
+  /* Managers get hierarchy, not another inline badge competing with provider/worktree/mail/approval.
+     The second line spends a little vertical space on the one row that runs the team and preserves
+     horizontal room for the scientist name and genuine attention signals. */
+  .row.manager {
+    background: color-mix(in srgb, var(--accent) 7%, transparent);
+    box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 78%, transparent);
+  }
+  .row.manager:hover { background: color-mix(in srgb, var(--accent) 11%, var(--surface-2)); }
+  .row.manager.sel {
+    background: color-mix(in srgb, var(--accent) 13%, var(--surface-2));
+    box-shadow: inset 3px 0 0 var(--accent), inset 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent);
+  }
   .row.managedchild { margin-left: calc(var(--manager-depth) * 0.85rem); width: calc(100% - (var(--manager-depth) * 0.85rem)); }
   .manager-toggle, .manager-branch { flex: none; display: grid; place-items: center; width: 12px; color: var(--dim); }
+  .manager-toggle { color: var(--accent); }
   .manager-toggle:hover { color: var(--text); }
-  .pmtag { flex: none; font-size: 0.58rem; line-height: 1; letter-spacing: 0.04em; padding: 0.18rem 0.25rem;
-    border-radius: var(--r-xs); color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent);
-    font-weight: var(--fw-semibold); border: 0; }
-  .pmtag:hover { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+  .manager-identity { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 0.12rem; }
+  .manager-identity .rlabel { flex: none; width: 100%; }
+  .manager-role {
+    max-width: 100%; display: inline-flex; align-items: center; gap: 0.22rem; color: var(--accent);
+    font-size: 0.56rem; line-height: 1; font-weight: var(--fw-semibold); letter-spacing: 0.055em;
+    text-transform: uppercase; white-space: nowrap;
+  }
+  .manager-role:hover { color: var(--text); }
+  .manager-orphan { flex: none; display: grid; place-items: center; width: 12px; color: var(--warn); opacity: 0.9; }
+  .row.orphanedchild { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--warn) 55%, transparent); }
+  .row.attentionchild { background: color-mix(in srgb, var(--warn) 6%, transparent); }
+  .row.attentionchild .manager-branch { color: var(--warn); }
   .row:hover { background: var(--surface-2); }
   .row.sel { background: var(--surface-2); box-shadow: inset 2px 0 0 var(--accent); }
   /* Drag hint: a faint grip rail on the left, revealed on hover, signalling the whole ROW/HEADER is
