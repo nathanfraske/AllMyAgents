@@ -51,6 +51,10 @@
   let sending = $state(false)
 
   function stageFiles(files: Iterable<File>): void {
+    // The staging action owns the current attachment feedback. Do not leave an upload/send failure
+    // beside a newly-added item's policy warning; if this batch is invalid, its validation error below
+    // replaces the old one.
+    sendErr = ''
     let next = [...attachments]
     for (const file of files) {
       const error = validateIncoming(file, next.length)
@@ -88,6 +92,7 @@
     }
     attachments = []
     if (attachmentInput) attachmentInput.value = ''
+    sendErr = ''
   }
 
   function onAttachmentPick(e: Event): void {

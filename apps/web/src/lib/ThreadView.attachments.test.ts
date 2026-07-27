@@ -175,6 +175,68 @@ describe('attachment composer front door', () => {
     expect(apiMock.send).not.toHaveBeenCalled()
   })
 
+  it('replaces a stale upload error when staging changes, then clears the current error on remove and successful send', async () => {
+    apiMock.uploadAttachment.mockResolvedValue({ error: 'disk full' })
+    seed('claude')
+    render(ThreadView, { props: { sessionId: 's1' } })
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement
+    const textarea = document.querySelector('.composer textarea') as HTMLTextAreaElement
+
+    await fireEvent.change(input, {
+      target: { files: [new File(['png'], 'kept.png', { type: 'image/png' })] },
+    })
+    await fireEvent.input(textarea, { target: { value: 'retry me' } })
+    await fireEvent.click(screen.getByTitle('send'))
+    expect((await screen.findByRole('alert')).textContent).toContain('disk full')
+
+    // A newly staged unsupported file owns the current error state. The previous upload failure must
+    // disappear instead of rendering beside this item's policy warning.
+    await fireEvent.change(input, {
+      target: { files: [new File(['binary'], 'current.bin', { type: 'application/octet-stream' })] },
+    })
+    expect(screen.queryByText(/disk full/i)).toBeNull()
+    expect(screen.getAllByText(/Unsupported file/i)).toHaveLength(1)
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Remove current.bin' }))
+    expect(screen.queryByText(/Unsupported file/i)).toBeNull()
+    expect(screen.queryByRole('alert')).toBeNull()
+
+    apiMock.uploadAttachment.mockImplementation(async (_sessionId: string, file: File) => ({
+      id: `att-${file.name}`,
+      name: file.name,
+      mime: file.type,
+      size: file.size,
+    }))
+    await fireEvent.click(screen.getByTitle('send'))
+    await waitFor(() => expect(apiMock.send).toHaveBeenCalledTimes(1))
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByText('kept.png')).toBeNull()
+    expect(textarea.value).toBe('')
+  })
+
+  it('clears an attachment error and staged files when switching chats', async () => {
+    apiMock.uploadAttachment.mockResolvedValue({ error: 'disk full' })
+    seed('claude')
+    const second = {
+      ...store.sessions.s1!,
+      record: { ...store.sessions.s1!.record, id: 's2' },
+      items: [],
+    }
+    store.sessions = { ...store.sessions, s2: second }
+    const view = render(ThreadView, { props: { sessionId: 's1' } })
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement
+
+    await fireEvent.change(input, {
+      target: { files: [new File(['png'], 'old-chat.png', { type: 'image/png' })] },
+    })
+    await fireEvent.click(screen.getByTitle('send'))
+    expect((await screen.findByRole('alert')).textContent).toContain('disk full')
+
+    await view.rerender({ sessionId: 's2' })
+    await waitFor(() => expect(screen.queryByText('old-chat.png')).toBeNull())
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
   it('uploads before steering and passes ids to the Codex steer request', async () => {
     seed('codex', 'active')
     render(ThreadView, { props: { sessionId: 's1' } })
