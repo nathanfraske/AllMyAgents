@@ -33,8 +33,12 @@ function git(cwd: string, ...args: string[]): string {
 function buildHub() {
   // macOS exposes os.tmpdir() through /var while git worktree list reports /private/var.
   const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ama-worktree-life-')))
+  const hubRoot = path.join(tmp, 'installed-hub')
+  const dataDir = path.join(tmp, 'app-data')
   const repo = path.join(tmp, 'repo')
   const profileDir = path.join(tmp, 'profile')
+  fs.mkdirSync(hubRoot)
+  fs.mkdirSync(dataDir)
   fs.mkdirSync(repo)
   fs.mkdirSync(profileDir)
   git(repo, 'init')
@@ -64,7 +68,7 @@ function buildHub() {
     new Map(profiles.map((p) => [p.id, p])),
     approvals,
     new UsageMonitor(journal, profiles, {}),
-    new WorkspaceManager(path.join(tmp, 'worktrees')),
+    new WorkspaceManager(path.join(dataDir, 'worktrees')),
     projects,
     new InstructionStore(journal.db),
     new AgentBus(journal.db),
@@ -72,7 +76,7 @@ function buildHub() {
     new PracticeStore(journal.db),
     { busCanUseRiskyTools: false, autoApprovePractices: false },
     false,
-    tmp,
+    hubRoot,
     executor
   )
   const projectId = projects.create('fixture', repo).id
@@ -80,7 +84,7 @@ function buildHub() {
     journal.db.close()
     fs.rmSync(tmp, { recursive: true, force: true })
   })
-  return { repo, sessions, projectId }
+  return { hubRoot, dataDir, repo, sessions, projectId }
 }
 
 async function createWorktreeSession() {
@@ -89,6 +93,71 @@ async function createWorktreeSession() {
   if (!record.worktree) throw new Error('fixture did not create a worktree')
   return { ...hub, record, worktree: record.worktree }
 }
+
+describe('unfiled chat workspace lifecycle', () => {
+  it('gives an unfiled chat its own workspace instead of the hub directory', async () => {
+    const { hubRoot, dataDir, sessions } = buildHub()
+
+    const record = await sessions.create('claude-test', {})
+
+    expect(record.cwd).not.toBe(hubRoot)
+    expect(path.dirname(record.cwd)).toBe(path.join(dataDir, 'workspaces'))
+    expect(path.basename(record.cwd)).toBe(record.id)
+    expect(fs.statSync(record.cwd).isDirectory()).toBe(true)
+    expect(git(record.cwd, 'status', '--porcelain')).toBe('')
+  })
+
+  it('deletes a pristine unfiled workspace with its chat', async () => {
+    const { sessions } = buildHub()
+    const record = await sessions.create('claude-test', {})
+
+    const result = await sessions.delete(record.id)
+
+    expect(result).toEqual({ ok: true })
+    expect(fs.existsSync(record.cwd)).toBe(false)
+    expect(sessions.list().some((candidate) => candidate.id === record.id)).toBe(false)
+  })
+
+  it('refuses to delete an unfiled workspace with uncommitted work and reports its path', async () => {
+    const { sessions } = buildHub()
+    const record = await sessions.create('claude-test', {})
+    fs.writeFileSync(path.join(record.cwd, 'recover-me.txt'), 'operator work\n')
+
+    const result = await sessions.delete(record.id)
+
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('dirty workspace deletion unexpectedly succeeded')
+    expect(result.error).toContain('uncommitted')
+    expect(result.error).toContain(record.cwd)
+    expect(fs.readFileSync(path.join(record.cwd, 'recover-me.txt'), 'utf8')).toBe('operator work\n')
+    expect(sessions.list().find((candidate) => candidate.id === record.id)?.status).toBe('stopped')
+  })
+
+  it('preserves committed work instead of deleting the only copy with the chat', async () => {
+    const { sessions } = buildHub()
+    const record = await sessions.create('claude-test', {})
+    fs.writeFileSync(path.join(record.cwd, 'committed-work.txt'), 'keep me\n')
+    git(record.cwd, 'add', 'committed-work.txt')
+    git(
+      record.cwd,
+      '-c',
+      'user.name=AllMyAgents Test',
+      '-c',
+      'user.email=test@example.invalid',
+      'commit',
+      '-m',
+      'operator work'
+    )
+
+    const result = await sessions.delete(record.id)
+
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('committed workspace deletion unexpectedly succeeded')
+    expect(result.error).toContain('committed work')
+    expect(result.error).toContain(record.cwd)
+    expect(fs.readFileSync(path.join(record.cwd, 'committed-work.txt'), 'utf8')).toBe('keep me\n')
+  })
+})
 
 describe('worktree session lifecycle', () => {
   it('Stop preserves tracked and untracked work, and Reopen resumes the same checkout', async () => {

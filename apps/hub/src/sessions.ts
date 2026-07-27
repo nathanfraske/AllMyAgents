@@ -890,7 +890,8 @@ export class SessionManager {
     // Resolve a project (named folder) into a working directory / repo, if given.
     // An explicit cwd (e.g. a handoff/port reusing an existing worktree) wins over the
     // project path and skips worktree creation, while still tagging the project for grouping.
-    let cwd = opts.cwd ?? this.defaultCwd
+    const isUnfiled = opts.cwd === undefined && opts.projectId === undefined && opts.repo === undefined
+    let cwd = isUnfiled ? this.workspace.createScratch(id) : (opts.cwd ?? this.defaultCwd)
     let repo = opts.repo
     if (opts.projectId && !opts.cwd) {
       const project = this.projects.get(opts.projectId)
@@ -917,6 +918,7 @@ export class SessionManager {
     const instructionText = [agentContract(profile.provider), operatorText].filter((s) => s.trim()).join('\n\n')
     const practiceText = this.practices.materialize({ provider: profile.provider, projectId: opts.projectId, profileId })
     writeManagedInstructions(cwd, profile.provider, instructionText, practiceText)
+    if (isUnfiled) this.workspace.checkpointScratch(id)
     if (instructionText || practiceText) {
       this.journal.append(id, 'session/instructions', { chars: instructionText.length, practiceChars: practiceText.length })
     }
@@ -989,9 +991,9 @@ export class SessionManager {
 
   // ---- Project import (adopt existing vendor transcripts) ----------------------------------------
 
-  /** The hub's worktrees root — imported transcripts whose cwd lives here are hub scratch, not chats. */
-  private worktreesRoot(): string {
-    return path.join(this.defaultCwd, 'data', 'worktrees')
+  /** Hub-owned app data is scratch, not a user project whose vendor transcripts should be imported. */
+  private importExclusionRoot(): string {
+    return this.workspace.managedRoot()
   }
 
   /** Every already-adopted vendor session, keyed profileId::vendorSessionId (import dedupe set). */
@@ -1012,7 +1014,7 @@ export class SessionManager {
       profiles: [...this.profiles.values()],
       path: projectPath,
       importedKeys: this.importedKeys(),
-      worktreesRoot: this.worktreesRoot(),
+      worktreesRoot: this.importExclusionRoot(),
     })
   }
 
@@ -1778,6 +1780,15 @@ export class SessionManager {
               `${branch} Repair or restore that Git worktree, then try Reopen again. (${state.error})`,
           }
         }
+      } else if (this.workspace.isScratch(record.cwd, record.id)) {
+        const state = this.workspace.inspectScratch(record.id)
+        if (!state.ok) {
+          return {
+            ok: false,
+            status: record.status,
+            error: `Cannot reopen because its workspace is unavailable at ${record.cwd}. Repair or restore that workspace, then try Reopen again. (${state.error})`,
+          }
+        }
       }
       this.setStatus(record, 'idle')
     }
@@ -1797,18 +1808,24 @@ export class SessionManager {
     //    the filesystem — deleting it drops only the hub record, never the source vendor transcript
     //    (the user's own Claude/Codex history, which may live in their real home dir). See §3.4.
     await this.stop(sessionId).catch(() => undefined)
-    if (record.repo && record.worktree) {
-      // Interrupt acknowledgement can precede the turn's terminal event. Never race filesystem removal
-      // against an agent that may still be unwinding and writing; a second Delete after it settles is safe.
-      if (this.executor.isBusy(sessionId)) {
-        return {
-          ok: false,
-          error: `The agent is still shutting down; its worktree was preserved at ${record.worktree}. Try Delete again after the turn settles.`,
-        }
+    const scratch = this.workspace.isScratch(record.cwd, record.id)
+    const managedWorkspace = (record.repo && record.worktree) || scratch
+    // Interrupt acknowledgement can precede the turn's terminal event. Never race filesystem removal
+    // against an agent that may still be unwinding and writing; a second Delete after it settles is safe.
+    if (managedWorkspace && this.executor.isBusy(sessionId)) {
+      return {
+        ok: false,
+        error: `The agent is still shutting down; its workspace was preserved at ${record.cwd}. Try Delete again after the turn settles.`,
       }
+    }
+    if (record.repo && record.worktree) {
       const removed = this.workspace.remove(record.repo, record.worktree)
       if (!removed.ok) return removed
       this.journal.append(sessionId, 'session/worktree-removed', { worktree: record.worktree })
+    } else if (scratch) {
+      const removed = this.workspace.removeScratch(record.id)
+      if (!removed.ok) return removed
+      this.journal.append(sessionId, 'session/workspace-removed', { workspace: record.cwd })
     }
     // 2. Tombstone the session in the append-only journal.
     this.journal.append(sessionId, 'session/deleted', { id: sessionId })

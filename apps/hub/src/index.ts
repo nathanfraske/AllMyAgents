@@ -44,7 +44,7 @@ import {
 
 const repoRoot = path.resolve(import.meta.dirname, '..', '..', '..')
 const supervised = process.env.HUB_SUPERVISED === '1' && typeof process.send === 'function'
-// HUB_DATA_DIR relocates the journal/config/worktrees/device-token root off the repo's data/. Profiles keep
+// HUB_DATA_DIR relocates the journal/config/worktrees/unfiled-workspaces/device-token root off the repo's data/. Profiles keep
 // their real repo path so auth still resolves. Unset → repo data/ (byte-identical to today); set only by an
 // isolated harness (e.g. the restart-survival acceptance test) to keep its DB + state off the live hub's.
 const dataDir = process.env.HUB_DATA_DIR ? path.resolve(process.env.HUB_DATA_DIR) : path.join(repoRoot, 'data')
@@ -129,7 +129,7 @@ const profiles = scanProfiles(profilesDir)
 const profileMap = new Map(profiles.map((p) => [p.id, p]))
 const approvals = new ApprovalService(journal)
 const usage = new UsageMonitor(journal, profiles, config)
-const workspace = new WorkspaceManager(path.join(dataDir, 'worktrees'))
+const workspace = new WorkspaceManager(path.join(dataDir, 'worktrees'), path.join(dataDir, 'workspaces'))
 const projects = new ProjectStore(journal.db)
 const instructions = new InstructionStore(journal.db)
 const bus = new AgentBus(journal.db)
@@ -186,7 +186,7 @@ const executor: Executor = workerSocket
       attachWorker: () => sessions.attachWorker(),
     })
   : new InProcessExecutor({ approvals, usage, danger, memory, practices })
-sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, repoRoot, executor, prefs)
+sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, dataDir, executor, prefs)
 usage.setCodexReader((profileId) => sessions.readCodexLimits(profileId))
 // Let full-access chats and "always allow" grants skip the operator prompt. Installed here because the
 // policy reads session records, and ApprovalService is constructed before the SessionManager exists.
@@ -394,7 +394,7 @@ const meshPeerPorts: number[] = Array.isArray(config.mesh?.peerPorts)
   : []
 
 // Listen on the BOOT port (0 → ephemeral for a green); the server reports its actual port back.
-const server = startServer({ port: bootPort, defaultCwd: repoRoot, profilesDir, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath })
+const server = startServer({ port: bootPort, defaultCwd: dataDir, profilesDir, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath })
 
 // Register the mesh advert — factored so a promoted green can (re)register once it owns the port.
 function registerMesh(): void {
