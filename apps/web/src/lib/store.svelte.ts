@@ -650,6 +650,7 @@ export class HubStore {
       v.record.serviceTier = rec.serviceTier
       v.record.isProjectManager = rec.isProjectManager
       v.record.managerMaxLiveChildren = rec.managerMaxLiveChildren
+      v.record.managerMaxChildPermissionMode = rec.managerMaxChildPermissionMode
       v.record.managerDelegation = rec.managerDelegation
       v.record.managerAllowedProfiles = rec.managerAllowedProfiles
       v.record.managerAllowedModels = rec.managerAllowedModels

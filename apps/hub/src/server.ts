@@ -1267,6 +1267,17 @@ export function startServer(opts: ServerOptions): http.Server {
           json(res, { error: 'canApproveChildren must be boolean' }, 400)
           return
         }
+        const maxChildPermissionMode =
+          body.maxChildPermissionMode === undefined ? undefined : str(body.maxChildPermissionMode)
+        if (
+          maxChildPermissionMode !== undefined &&
+          maxChildPermissionMode !== 'safe' &&
+          maxChildPermissionMode !== 'edits' &&
+          maxChildPermissionMode !== 'full'
+        ) {
+          json(res, { error: 'maxChildPermissionMode must be safe, edits, or full' }, 400)
+          return
+        }
         if (rawDelegation.some((authority) => authority !== 'commit' && authority !== 'push')) {
           json(res, { error: 'delegation may contain only commit and push' }, 400)
           return
@@ -1292,6 +1303,7 @@ export function startServer(opts: ServerOptions): http.Server {
             operatorTask: body.operatorTask as string | undefined,
             standingInstructions: body.standingInstructions as string | undefined,
             canApproveChildren: body.canApproveChildren as boolean | undefined,
+            maxChildPermissionMode,
           },
           'operator'
         )

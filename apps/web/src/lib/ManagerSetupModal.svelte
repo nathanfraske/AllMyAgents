@@ -5,6 +5,7 @@
     managerModel?: string
     managerEffort?: string
     permissionMode: 'safe' | 'edits' | 'full'
+    maxChildPermissionMode: 'safe' | 'edits' | 'full'
     startingPrompt: string
     orientationBrief: string
     operatorTask: string
@@ -69,6 +70,7 @@
   let managerModel = $state('')
   let managerEffort = $state('')
   let permissionMode = $state<PermissionMode>('safe')
+  let maxChildPermissionMode = $state<PermissionMode>('safe')
   let maxLiveChildren = $state(4)
   let delegation = $state<Authority[]>([])
   let allowedTools = $state<string[]>([])
@@ -129,7 +131,7 @@
       `YOUR ALLMYAGENTS TOOLS\n- list_agents: see the project teammates you can address.\n- spawn_agent: create a real child chat in this app; it gets an isolated git worktree by default. Use an operator-defined agent_type when one fits.\n- child_status: get the live running / idle / stopped / errored tally without polling.\n- peek_agent: inspect a worker without interrupting it. For your own children you may request activity, full transcript, changes, approvals/blockers, worktree state, or all views.\n- set_child_authority: grant or revoke only the worker Git actions and exact tools inside your grant ceiling; changes apply to that worker’s next tool call.\n- send_message and read_messages: coordinate through the project bus. Prefer a direct message to one session; broadcast only when every project agent must act.\n- practice_write / practice_list / practice_read / practice_edit: manage durable team conventions that future agents should follow.\n- memory_write / memory_search / memory_read: retain and retrieve project facts and decisions.`,
       `CHILD APPROVAL TOOL\n- decide_child_approval: approve or deny one pending request from your own direct child when child approvals are enabled. The hub refuses unrelated children and anything outside your operator-granted ceiling.`,
       `IMPORTANT — TOOL LAYERS\nUse the hub-provided AllMyAgents tools described above. In Codex, choose the fully-qualified mcp__allmyagents__spawn_agent and mcp__allmyagents__list_agents tools (some clients render those names as mcp__allmyagents.spawn_agent and mcp__allmyagents.list_agents). Never call collaboration.spawn_agent, collaboration.list_agents, or another native collabAgentToolCall for project work. The native Codex or Claude harness may expose similar names, but those tools do not create the real app chats and worktrees you are managing. If a worker does not appear in the AllMyAgents sidebar with a session id, parentSessionId, and worktree, treat that as a failed delegation and retry with the mcp__allmyagents tool.`,
-      `GRANTED BRIEF AND LIMITS\n- Grant ceiling means the maximum scope the operator gave you; every child grant must stay inside it.\n- At most ${maxLiveChildren} live direct children. The hub refuses an additional spawn at the bound.\n- Exact worker profile_id values you may pass to spawn_agent: ${workerScope.profiles.length ? workerScope.profiles.join(', ') : 'none'}.\n- Worker Git permissions you may grant: ${delegation.length ? authority : 'none'}.\n- Additional exact worker tools you may grant: ${allowedTools.length ? allowedTools.join(', ') : 'none'}.\n- Child approval decisions: ${canApproveChildren ? 'enabled for your own direct children, within the same grant ceiling' : 'disabled; the operator answers pending approvals'}.\n- Delegation only narrows: a manager cannot grant what it does not hold — including an authority, account, model, or tool.\n- You have full non-interfering visibility into your own children, and only those children.\n${roles.length ? `Worker roles (prefer their exact agent_type id when one fits):\n${roles.join('\n')}` : `No named worker roles are configured; call spawn_agent with profile_id "${workerScope.profiles[0] ?? 'unavailable'}" and its default model.`}`,
+      `GRANTED BRIEF AND LIMITS\n- Grant ceiling means the maximum scope the operator gave you; every child grant must stay inside it.\n- At most ${maxLiveChildren} live direct children. The hub refuses an additional spawn at the bound.\n- Child permission modes may not exceed ${maxChildPermissionMode}.\n- Exact worker profile_id values you may pass to spawn_agent: ${workerScope.profiles.length ? workerScope.profiles.join(', ') : 'none'}.\n- Worker Git permissions you may grant: ${delegation.length ? authority : 'none'}.\n- Additional exact worker tools you may grant: ${allowedTools.length ? allowedTools.join(', ') : 'none'}.\n- Child approval decisions: ${canApproveChildren ? 'enabled for your own direct children, within the same grant ceiling' : 'disabled; the operator answers pending approvals'}.\n- Delegation only narrows: a manager cannot grant what it does not hold — including an authority, account, model, permission mode, or tool.\n- You have full non-interfering visibility into your own children, and only those children.\n${roles.length ? `Worker roles (prefer their exact agent_type id when one fits):\n${roles.join('\n')}` : `No named worker roles are configured; call spawn_agent with profile_id "${workerScope.profiles[0] ?? 'unavailable'}" and its default model.`}`,
       `OPERATING CADENCE\nTurn the operator task into bounded assignments with an expected output and a clear completion check. Spawn only useful parallel work. In each assignment, state the exact granted tools and require the worker to stay inside that envelope. At decision points use child_status; use peek_agent when status alone is insufficient. Verify a child’s transcript and worktree changes before relying on its result. If a child stalls, blocks, errors, exceeds scope, or collides: inspect it and send one direct corrective message. When it asks for an ungranted tool, redirect it to a granted alternative instead of widening authority or waiting; otherwise reassign or re-sequence when possible, and report any decision that needs the operator in this manager chat. Send one useful update per meaningful event rather than narrating every step. Finish with a concise report of each child’s final status, findings, files/commits changed, verification performed, and unresolved decisions.`,
       `OPERATOR TASK\nReplace this line with the task to begin, then start immediately.`,
     ].join('\n\n')
@@ -175,6 +177,7 @@
     managerModel = profile ? defaultModelFor(profile.provider)?.slug ?? '' : ''
     managerEffort = ''
     permissionMode = 'safe'
+    maxChildPermissionMode = 'safe'
     maxLiveChildren = 4
     delegation = []
     allowedTools = []
@@ -199,6 +202,7 @@
     managerModel = record.model ?? defaultModelFor(record.provider)?.slug ?? ''
     managerEffort = record.effort ?? ''
     permissionMode = (record.permissionMode as PermissionMode | undefined) ?? 'safe'
+    maxChildPermissionMode = record.managerMaxChildPermissionMode ?? 'safe'
     maxLiveChildren = record.managerMaxLiveChildren ?? 4
     delegation = [...(record.managerDelegation ?? [])]
     allowedTools = [...(record.managerAllowedTools ?? [])]
@@ -369,6 +373,7 @@
       managerModel: managerModel || undefined,
       managerEffort: managerEffort || undefined,
       permissionMode,
+      maxChildPermissionMode,
       startingPrompt: composedStartingPrompt(),
       orientationBrief: orientationBrief.trim(),
       operatorTask: operatorTask.trim(),
@@ -458,6 +463,7 @@
         operatorTask: config.operatorTask,
         standingInstructions: config.standingInstructions,
         canApproveChildren: config.canApproveChildren,
+        maxChildPermissionMode: config.maxChildPermissionMode,
       })
       if ('error' in configured) throw new Error(configured.error)
       if (!wasActive) {
@@ -495,6 +501,7 @@
         operatorTask: '',
         standingInstructions: '',
         canApproveChildren: false,
+        maxChildPermissionMode: 'safe',
       })
       if ('error' in configured) throw new Error(configured.error)
       store.upsertSessionRecord(configured)
@@ -645,6 +652,16 @@
           <small>The hub refuses another spawn when this bound is reached.</small>
         </label>
       </div>
+
+      <label>
+        <span>Maximum child permission level</span>
+        <select bind:value={maxChildPermissionMode}>
+          <option value="safe">Safe · children ask before edits and commands</option>
+          <option value="edits">Edits · children may edit freely, but ask for commands</option>
+          <option value="full">Full · children may use available tools without asking</option>
+        </select>
+        <small>The manager may choose a lower level for a child, but the hub rejects anything above this operator grant.</small>
+      </label>
 
       <label>
         <span>Operator task <em>optional</em></span>
@@ -828,6 +845,7 @@
           <dd>{#if scope.profiles.length}{scope.profiles.map(profileScope).join(' · ')}{:else}None chosen{/if}</dd>
         </div>
         <div><dt>Bound</dt><dd>{maxLiveChildren} live children</dd></div>
+        <div><dt>Child permission ceiling</dt><dd>{maxChildPermissionMode}</dd></div>
         <div><dt>Worker approvals</dt><dd>{canApproveChildren ? 'manager may decide within this grant ceiling' : 'operator decides'}</dd></div>
         <div><dt>Worker Git grants</dt><dd>{delegationLabel()}</dd></div>
         <div><dt>Other worker grants</dt><dd>{allowedTools.length ? allowedTools.join(', ') : 'none'}</dd></div>

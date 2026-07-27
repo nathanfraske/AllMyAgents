@@ -438,6 +438,7 @@
         operatorTask: config.operatorTask,
         standingInstructions: config.standingInstructions,
         canApproveChildren: config.canApproveChildren,
+        maxChildPermissionMode: config.maxChildPermissionMode,
       })
       if ('error' in configured) throw new Error(configured.error)
       store.upsertSessionRecord(configured)
