@@ -62,25 +62,24 @@ export interface ThreadItem {
   toolInput?: unknown
   toolResult?: string
   toolError?: boolean
-  /** For a `tool` item: the vendor tool_use id. A spawned agent's items point back at it via `agentId`. */
+  /** For a `tool` item: the vendor correlation id. A spawned agent's items point back at it via `agentId`. */
   toolUseId?: string
   /** When the tool_result arrived — the only honest end-time for a spawned agent (its duration). */
   toolResultTs?: string
   /**
-   * Sub-agent attribution, straight off the event envelope (`parent_tool_use_id`). Set when this item was
-   * produced INSIDE an agent spawned by an `Agent`/`Task` tool call; undefined for the main thread. The
-   * hub has always journaled this — it was simply never read — so the agent tree is reconstructable from
-   * existing history with no hub change. See agentTree.ts.
+   * Sub-agent attribution from the vendor lifecycle: Claude supplies `parent_tool_use_id`; Codex supplies
+   * a child thread id which the hub adapter preserves as `agentThreadId`. Set only for work produced inside
+   * a spawned agent; undefined for the main thread. See agentTree.ts.
    */
   agentId?: string
   /** The spawned agent's type + task, also carried on the envelope (e.g. `general-purpose`). */
   subagentType?: string
   taskDescription?: string
   /**
-   * --- Claude sub-agent task lifecycle, merged onto the SPAWN tool item (see applyClaudeSystem). ---
-   * These are the vendor's own `task_started` / `task_progress` / `task_notification` facts, not
-   * anything inferred from the transcript. All optional: a journal recorded before the ingest existed
-   * simply carries none of them, and agentTree.ts degrades to what the tool_result can support.
+   * --- Vendor sub-agent lifecycle, merged onto the SPAWN tool item. ---
+   * Claude uses `task_started` / `task_progress` / `task_notification`; Codex uses child
+   * `turn/started` / `turn/completed`. These are structured lifecycle facts, never inferred from prose.
+   * All optional so older journals degrade to what their rows can honestly support.
    */
   agentTaskId?: string
   agentOutcome?: AgentOutcome
@@ -1689,12 +1688,46 @@ export class HubStore {
         view.turnStartedAt = undefined
         break
       }
+      case 'codex/subagent/thread/started':
+        this.applyCodexSubagentStarted(view, ts, payload)
+        break
+      case 'codex/subagent/thread/status/changed':
+        this.applyCodexSubagentThreadStatus(view, ts, payload)
+        break
+      case 'codex/subagent/turn/started':
+        this.applyCodexSubagentTurnStarted(view, ts, payload)
+        break
+      case 'codex/subagent/turn/completed':
+        this.applyCodexSubagentTurnCompleted(view, ts, payload)
+        break
+      case 'codex/subagent/item/started':
+        // A nested spawn must appear as soon as Codex announces it. Other in-progress child items wait
+        // for item/completed, matching the root transcript's existing non-streaming tool-card behavior.
+        this.applyCodexSpawnItem(view, ts, payload)
+        break
+      case 'codex/subagent/item/completed': {
+        const p = payload as { agentThreadId?: string }
+        this.applyCodexItem(view, ts, payload, p.agentThreadId)
+        break
+      }
+      case 'codex/subagent/item/agentMessage/delta': {
+        const p = payload as { agentThreadId?: string; itemId?: string; delta?: string }
+        if (p.agentThreadId && p.itemId && typeof p.delta === 'string') {
+          this.upsertCodexText(view, ts, p.itemId, p.delta, true, p.agentThreadId)
+        }
+        break
+      }
       case 'session/tokens': {
         const p = payload as { input?: number; output?: number; total?: number }
         const sum = (p.input ?? 0) + (p.output ?? 0)
         view.liveTokens = { input: p.input, output: p.output, total: p.total ?? (sum > 0 ? sum : undefined) }
         break
       }
+      case 'codex/item/started':
+        // A completed collab spawn call only means Codex launched the child. It is never treated as the
+        // child completing; real child lifecycle arrives on codex/subagent/turn/* or agentsStates.
+        this.applyCodexSpawnItem(view, ts, payload)
+        break
       case 'codex/item/completed':
         this.applyCodexItem(view, ts, payload)
         break
@@ -1870,15 +1903,201 @@ export class HubStore {
     if (p.summary) item.agentSummary = p.summary
   }
 
-  private applyCodexItem(view: SessionView, ts: string, payload: unknown): void {
+  /** Create or enrich the synthetic Agent tool item consumed by the vendor-neutral agent tree. Its id is
+   * the Codex CHILD THREAD id, because every item and lifecycle event from that child carries this id. */
+  private upsertCodexSpawn(
+    view: SessionView,
+    ts: string,
+    agentThreadId: string,
+    parentAgentId: string | undefined,
+    description: string | undefined,
+    subagentType: string | undefined
+  ): ThreadItem {
+    const key = `tool:${agentThreadId}`
+    let spawn = view.items.find((item) => item.key === key)
+    const currentInput =
+      spawn?.toolInput && typeof spawn.toolInput === 'object'
+        ? (spawn.toolInput as Record<string, unknown>)
+        : {}
+    const toolInput: Record<string, unknown> = {
+      ...currentInput,
+      // spawnAgent is asynchronous by protocol. This drives only the panel's "background" chip; it is
+      // never used as evidence that the child finished.
+      run_in_background: true,
+    }
+    if (description) toolInput.description = description
+    if (subagentType) toolInput.subagent_type = subagentType
+    if (!spawn) {
+      spawn = this.push(view, {
+        kind: 'tool',
+        ts,
+        toolName: 'Agent',
+        toolInput,
+        toolUseId: agentThreadId,
+        agentId: parentAgentId,
+        subagentType,
+        taskDescription: description,
+        key,
+      })
+    } else {
+      spawn.toolInput = toolInput
+      if (parentAgentId) spawn.agentId = parentAgentId
+      if (description) spawn.taskDescription = description
+      if (subagentType) spawn.subagentType = subagentType
+    }
+    return spawn
+  }
+
+  /** Read a structured collab spawn item. The 0.145 generated bindings say `collabAgentToolCall`; the
+   * bundled README still documents the previous `collabToolCall` spelling, so both meet here. */
+  private applyCodexSpawnItem(view: SessionView, ts: string, payload: unknown): void {
+    const p = payload as { threadId?: string; agentThreadId?: string; item?: Record<string, unknown> }
+    const item = p.item
+    if (!item || (item.type !== 'collabAgentToolCall' && item.type !== 'collabToolCall')) return
+    const tool = item.tool
+    if (tool !== 'spawnAgent' && tool !== 'spawn_agent') {
+      this.applyCodexAgentStates(view, ts, item)
+      return
+    }
+    const receivers = Array.isArray(item.receiverThreadIds)
+      ? item.receiverThreadIds.filter((id): id is string => typeof id === 'string')
+      : [item.newThreadId, item.receiverThreadId].filter((id): id is string => typeof id === 'string')
+    const sender = typeof item.senderThreadId === 'string' ? item.senderThreadId : p.agentThreadId
+    const parentAgentId = sender && sender !== p.threadId ? sender : undefined
+    const description = typeof item.prompt === 'string' && item.prompt.trim() ? item.prompt : undefined
+    for (const receiver of receivers) {
+      this.upsertCodexSpawn(view, ts, receiver, parentAgentId, description, undefined).agentProgressTs = ts
+    }
+    // This is the target agents' structured state, not the spawn call's own status. A spawn call normally
+    // completes while the child state is still running, which is precisely why item.status is ignored.
+    this.applyCodexAgentStates(view, ts, item)
+  }
+
+  private applyCodexAgentStates(view: SessionView, ts: string, item: Record<string, unknown>): void {
+    if (!item.agentsStates || typeof item.agentsStates !== 'object') return
+    for (const [agentThreadId, value] of Object.entries(item.agentsStates as Record<string, unknown>)) {
+      const state =
+        value && typeof value === 'object' && typeof (value as { status?: unknown }).status === 'string'
+          ? (value as { status: string }).status
+          : undefined
+      const spawn = view.items.find((candidate) => candidate.key === `tool:${agentThreadId}`)
+      if (!spawn || !state) continue
+      if (state === 'pendingInit' || state === 'running') {
+        spawn.agentOutcome = undefined
+        spawn.agentOutcomeTs = undefined
+        spawn.agentProgressTs = ts
+      } else if (state === 'completed') {
+        spawn.agentOutcome = 'completed'
+        spawn.agentOutcomeTs = ts
+      } else if (state === 'errored' || state === 'notFound') {
+        spawn.agentOutcome = 'failed'
+        spawn.agentOutcomeTs = ts
+      } else if (state === 'interrupted' || state === 'shutdown') {
+        spawn.agentOutcome = 'stopped'
+        spawn.agentOutcomeTs = ts
+      }
+    }
+  }
+
+  private applyCodexSubagentStarted(view: SessionView, ts: string, payload: unknown): void {
+    const p = payload as {
+      threadId?: string
+      agentThreadId?: string
+      parentThreadId?: string
+      thread?: { preview?: string; agentRole?: string; agentNickname?: string }
+    }
+    if (!p.agentThreadId) return
+    const parentAgentId = p.parentThreadId && p.parentThreadId !== p.threadId ? p.parentThreadId : undefined
+    const role = p.thread?.agentRole ?? p.thread?.agentNickname
+    const spawn = this.upsertCodexSpawn(view, ts, p.agentThreadId, parentAgentId, p.thread?.preview, role)
+    spawn.agentProgressTs = ts
+  }
+
+  private applyCodexSubagentThreadStatus(view: SessionView, ts: string, payload: unknown): void {
+    const p = payload as { agentThreadId?: string; status?: { type?: string } }
+    if (!p.agentThreadId) return
+    const spawn = view.items.find((item) => item.key === `tool:${p.agentThreadId}`)
+    if (!spawn) return
+    if (p.status?.type === 'active') {
+      spawn.agentOutcome = undefined
+      spawn.agentOutcomeTs = undefined
+      spawn.agentProgressTs = ts
+    } else if (p.status?.type === 'systemError') {
+      spawn.agentOutcome = 'failed'
+      spawn.agentOutcomeTs = ts
+    }
+    // `idle` is not success: a child can be idle between sendInput calls. Only a completed turn or a
+    // CollabAgentState supplies a terminal task outcome.
+  }
+
+  private applyCodexSubagentTurnStarted(view: SessionView, ts: string, payload: unknown): void {
+    const p = payload as { threadId?: string; agentThreadId?: string; parentThreadId?: string }
+    if (!p.agentThreadId) return
+    const parentAgentId = p.parentThreadId && p.parentThreadId !== p.threadId ? p.parentThreadId : undefined
+    const spawn = this.upsertCodexSpawn(view, ts, p.agentThreadId, parentAgentId, undefined, undefined)
+    spawn.agentOutcome = undefined
+    spawn.agentOutcomeTs = undefined
+    spawn.agentProgressTs = ts
+  }
+
+  private applyCodexSubagentTurnCompleted(view: SessionView, ts: string, payload: unknown): void {
+    const p = payload as {
+      threadId?: string
+      agentThreadId?: string
+      parentThreadId?: string
+      turn?: { id?: string; status?: string; error?: { message?: string } | null }
+    }
+    if (!p.agentThreadId) return
+    const parentAgentId = p.parentThreadId && p.parentThreadId !== p.threadId ? p.parentThreadId : undefined
+    const spawn = this.upsertCodexSpawn(view, ts, p.agentThreadId, parentAgentId, undefined, undefined)
+    const status = p.turn?.status
+    const outcome: AgentOutcome | undefined =
+      status === 'completed'
+        ? 'completed'
+        : status === 'failed'
+          ? 'failed'
+          : status === 'interrupted'
+            ? 'stopped'
+            : undefined
+    if (!outcome) return
+    spawn.agentOutcome = outcome
+    spawn.agentOutcomeTs = ts
+    // Intentional parity boundary: Claude's task_notification includes a separate terminal `summary`;
+    // Codex 0.145's child turn lifecycle does not. Its report is the ordinary agentMessage item stream
+    // already attributed to this child, so copying a collab result/message here would duplicate output
+    // and recreate the meaningless "returned blob" bug. The panel therefore shows Codex's real activity
+    // and real terminal state, with no synthetic result block.
+    if (outcome === 'failed') {
+      const message = p.turn?.error?.message?.trim()
+      if (message) {
+        this.push(view, {
+          kind: 'error',
+          ts,
+          text: message,
+          agentId: p.agentThreadId,
+          key: `codex:subagent-error:${p.turn?.id ?? p.agentThreadId}`,
+        })
+      }
+    }
+  }
+
+  private applyCodexItem(view: SessionView, ts: string, payload: unknown, agentId?: string): void {
     const item = (payload as { item?: Record<string, unknown> }).item
     if (!item) return
     const type = item.type as string
+    if (type === 'collabAgentToolCall' || type === 'collabToolCall') {
+      this.applyCodexSpawnItem(view, ts, payload)
+      return
+    }
+    if (type === 'subAgentActivity') {
+      this.applyCodexSubagentActivity(view, ts, item, agentId)
+      return
+    }
     if (type === 'agentMessage') {
       // Same item id as the streamed deltas — replace, never duplicate.
-      this.upsertCodexText(view, ts, item.id as string, (item.text as string) ?? '', false)
+      this.upsertCodexText(view, ts, item.id as string, (item.text as string) ?? '', false, agentId)
     } else if (type === 'reasoning') {
-      view.sawReasoning = true
+      if (!agentId) view.sawReasoning = true
       // The reasoning text lives in the item's `summary`/`content` ARRAYS, not a flat `text` — and the
       // app-server only fills them when the turn asked for a reasoning summary (see the adapter note in
       // codexGroup.ts / the report). extractCodexReasoning returns '' for a genuinely empty row, so the
@@ -1889,31 +2108,91 @@ export class HubStore {
         kind: 'reasoning',
         ts,
         text: extractCodexReasoning(item),
+        agentId,
         key: rid ? `codex:reasoning:${rid}` : undefined,
       })
     } else if (type === 'userMessage') {
       // Ignored — the user's message is rendered from the canonical session/input event; echoing
       // Codex's own userMessage here too would duplicate it.
     } else if (type === 'commandExecution') {
-      this.push(view, { kind: 'tool', ts, toolName: 'command', toolInput: item.command ?? item, toolResult: item.aggregatedOutput as string | undefined })
+      this.push(view, {
+        kind: 'tool',
+        ts,
+        toolName: 'command',
+        toolInput: item.command ?? item,
+        toolResult: item.aggregatedOutput as string | undefined,
+        agentId,
+      })
     } else if (type === 'fileChange') {
-      this.push(view, { kind: 'tool', ts, toolName: 'fileChange', toolInput: item })
+      this.push(view, { kind: 'tool', ts, toolName: 'fileChange', toolInput: item, agentId })
     } else if (type === 'mcpToolCall') {
-      this.push(view, { kind: 'tool', ts, toolName: `mcp:${String(item.tool ?? '')}`, toolInput: item })
+      this.push(view, {
+        kind: 'tool',
+        ts,
+        toolName: `mcp:${String(item.tool ?? '')}`,
+        toolInput: item,
+        agentId,
+      })
+    }
+  }
+
+  /**
+   * Codex 0.145's first parent/child edge is a completed `subAgentActivity` item on the PARENT thread.
+   * It is lifecycle metadata, not transcript output, so merge it onto the synthetic spawn and never
+   * render the item (or its path/id fields) as an agent report.
+   *
+   * The tagged source defines the meanings precisely: `started` follows spawn, `interacted` follows a
+   * successful parent-to-child message/follow-up, and `interrupted` follows the interrupt operation.
+   * There is deliberately no `completed` kind. Successful/failed completion therefore comes only from
+   * the subscribed child's `turn/completed` or a structured CollabAgentState, never from text or timing.
+   */
+  private applyCodexSubagentActivity(
+    view: SessionView,
+    ts: string,
+    item: Record<string, unknown>,
+    parentAgentId: string | undefined
+  ): void {
+    const agentThreadId = typeof item.agentThreadId === 'string' ? item.agentThreadId : undefined
+    if (!agentThreadId) return
+    const path = typeof item.agentPath === 'string' ? item.agentPath : undefined
+    const pathLeaf = path?.split('/').filter(Boolean).at(-1)
+    const description = pathLeaf?.replace(/[_-]+/g, ' ')
+    const spawn = this.upsertCodexSpawn(view, ts, agentThreadId, parentAgentId, description, undefined)
+    const kind = item.kind
+    if (kind === 'started' || kind === 'interacted') {
+      // A follow-up can legitimately restart an interrupted child, so this real communication edge makes
+      // it working again. It is not completion: `interacted` means input was delivered, not work returned.
+      spawn.agentOutcome = undefined
+      spawn.agentOutcomeTs = undefined
+      spawn.agentProgressTs = ts
+    } else if (kind === 'interrupted') {
+      spawn.agentOutcome = 'stopped'
+      spawn.agentOutcomeTs = ts
     }
   }
 
   // Upsert a Codex agent message by its item id: streamed deltas (append) and the final
   // item/completed (replace) target the same item, so the message renders exactly once.
-  private upsertCodexText(view: SessionView, ts: string, itemId: string, text: string, append: boolean): void {
+  private upsertCodexText(
+    view: SessionView,
+    ts: string,
+    itemId: string,
+    text: string,
+    append: boolean,
+    agentId?: string
+  ): void {
     const key = `codex:${itemId}`
     const item = view.items.find((i) => i.key === key)
-    if (item) item.text = append ? (item.text ?? '') + text : text
-    else this.push(view, { kind: 'assistant', ts, text, key })
+    if (item) {
+      item.text = append ? (item.text ?? '') + text : text
+      if (agentId) item.agentId = agentId
+    } else this.push(view, { kind: 'assistant', ts, text, key, agentId })
   }
 
-  private push(view: SessionView, item: Partial<ThreadItem> & { kind: ItemKind; ts: string }): void {
-    view.items.push({ key: item.key ?? `i${view.items.length}:${item.ts}`, ...item } as ThreadItem)
+  private push(view: SessionView, item: Partial<ThreadItem> & { kind: ItemKind; ts: string }): ThreadItem {
+    const complete = { key: item.key ?? `i${view.items.length}:${item.ts}`, ...item } as ThreadItem
+    view.items.push(complete)
+    return complete
   }
 
   // Sessions whose vendor history we've already pulled (or decided not to), so opening a chat repeatedly

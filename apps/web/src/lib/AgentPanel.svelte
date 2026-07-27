@@ -1,5 +1,6 @@
 <script lang="ts">
-  // Popout side panel: the sub-agents this chat has spawned, what each is doing, and how it ended.
+  // Popout side panel: Claude tool-use agents and Codex child-thread agents spawned by this chat, what
+  // each is doing, and how its vendor lifecycle ended.
   // Self-contained — it renders its own edge toggle and overlays the right side of ITS pane (so split
   // view gets one panel per pane). Reads only derived data (agentTree.ts) from the items it is given.
   import { buildAgentRuns, summarizeRuns, latestActivity, type AgentRun } from './agentTree'
@@ -173,12 +174,12 @@
                 {:else}
                   <div class="dim empty">This agent hasn't reported anything yet.</div>
                 {/if}
-                <!-- This block used to print the spawn's raw tool_result. For a background agent that is
-                     the launch ACK — ~1KB of internal metadata the SDK says must never be surfaced — so
-                     the panel showed a wall of "agentId: …, output_file: …, do not report its results"
-                     under a "returned" label, as though the agent had said it. agentTree now refuses the
-                     ack outright, and what lands here is the vendor's own summary of the run: the real
-                     report. Nothing at all is shown while a run is still going. -->
+                <!-- Claude: this block used to print the spawn's raw launch ACK — ~1KB of internal
+                     metadata — as though the agent had said it. agentTree now refuses that ACK and uses
+                     only the vendor's terminal summary. Codex 0.145 has no separate terminal summary:
+                     after the hub subscribes to the child thread, its report stays in the attributed
+                     activity cards above. If that subscription is unavailable there is no report to
+                     invent, so no collab-state/message blob is rendered. -->
                 {#if r.result}
                   <div class="result" class:bad={r.status === 'failed'}>
                     <div class="rlabel dim">{resultLabel(r)}</div>

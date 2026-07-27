@@ -2,15 +2,15 @@
  * Reconstruct the AGENT TREE for a chat: which sub-agents this session spawned, what each one is doing
  * right now, and how it ended.
  *
- * Membership comes from history that was always there — a spawn is an `Agent`/`Task` tool call, and every
- * message produced inside that agent carries the spawning tool_use id on its event envelope
- * (`parent_tool_use_id`, surfaced as `agentId`).
+ * Membership is normalized by the store to an `Agent`/`Task` tool item. Claude correlates child output
+ * with the spawning `tool_use` id; Codex correlates it with the spawned child thread id. Both surface here
+ * as `agentId`, so the tree and panel do not need vendor branches.
  *
- * STATUS, by contrast, is no longer guessed. It comes from the vendor's own task lifecycle
- * (`task_started` / `task_progress` / `task_notification`), which the hub has always journaled as
- * `claude/system` rows and the store now merges onto the spawn item (see `applyClaudeSystem`). Everything
- * below reads those fields first and only falls back to the tool_result for journals that predate the
- * ingest.
+ * STATUS is never guessed from prose. Claude supplies `task_started` / `task_progress` /
+ * `task_notification`; Codex supplies parent `subAgentActivity` edges, subscribed child
+ * `turn/started` / `turn/completed`, and structured `CollabAgentState`. The store merges either lifecycle
+ * onto the spawn item. Everything below reads those fields first and only falls back to a real tool_result
+ * for older Claude journals.
  *
  * Kept as a pure function over a structural item type so it is unit-testable without the store, Svelte,
  * or a live hub.
@@ -31,9 +31,9 @@ export interface AgentTreeItem {
   subagentType?: string
   taskDescription?: string
   // --- Vendor task lifecycle, merged onto the SPAWN item by the store. Absent on older journals. ---
-  /** The SDK's `task_id` for this run — the correlation key for lifecycle rows that omit `tool_use_id`. */
+  /** Claude's `task_id` — the correlation fallback for lifecycle rows that omit `tool_use_id`. */
   agentTaskId?: string
-  /** Terminal outcome from `task_notification` / `task_updated`. Its presence is what makes a run final. */
+  /** Terminal outcome from Claude task or Codex child-turn lifecycle. Its presence makes a run final. */
   agentOutcome?: AgentOutcome
   agentOutcomeTs?: string
   /** The agent's actual report, as the vendor summarized it. */
@@ -71,7 +71,7 @@ export const STALLED_AFTER_MS = 180_000
 /** Generic over the item type so a caller passing full ThreadItems gets ThreadItems back in `activity`
  *  — that is what lets the panel render a sub-agent's output with the same ItemCard the main thread uses. */
 export interface AgentRun<T extends AgentTreeItem = AgentTreeItem> {
-  /** The spawning tool_use id — also the `agentId` its own items carry. */
+  /** Vendor correlation id (Claude tool_use id / Codex child thread id), also carried by its own items. */
   id: string
   /** Claude SDK task id used by Query.stopTask. Codex runs use their child thread id (`id`) instead. */
   taskId?: string
@@ -134,9 +134,11 @@ function isLaunchAck(result: string | undefined): boolean {
 }
 
 /**
- * Build every agent run in this chat, in spawn order. Runs with no matching activity still appear (an
- * agent that has not emitted anything yet is exactly what you want to SEE — it is the "is it stuck?"
- * case), so presence in this list is driven by the spawn call, never by whether output arrived.
+ * Build every agent run in this chat, in spawn order. Claude contributes real Agent/Task tool uses;
+ * Codex contributes synthetic Agent items keyed by the child thread id after its structured
+ * `subAgentActivity` edge. Runs with no matching activity still appear (an agent that has not emitted
+ * anything yet is exactly what you want to SEE — it is the "is it stuck?" case), so presence in this
+ * list is driven by the spawn call, never by whether output arrived.
  *
  * `now` is a parameter, not a `Date.now()` read inside, because `stalled` is a statement about elapsed
  * time and a function that silently consults the clock cannot be tested for the boundary it exists to draw.
@@ -175,8 +177,8 @@ export function buildAgentRuns<T extends AgentTreeItem>(items: readonly T[], now
       parentId: it.agentId,
     }
     if (it.agentOutcome) {
-      // THE REAL SIGNAL. `task_notification` (and `task_updated`) is the vendor telling us the run ended
-      // and how — the only source that separates a completed agent from one that was killed or errored.
+      // THE REAL SIGNAL. The vendor lifecycle is telling us the run ended and how — the only source that
+      // separates a completed agent from one that was killed or errored.
       run.status = it.agentOutcome === 'completed' ? 'done' : 'failed'
       run.endedAt = it.agentOutcomeTs ?? it.toolResultTs
       run.result = str(it.agentSummary) ?? realResult

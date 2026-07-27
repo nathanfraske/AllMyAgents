@@ -266,6 +266,17 @@ export class CodexClient {
   private child: ChildProcess | undefined
   private nextId = 1
   private readonly pending = new Map<number, Pending>()
+  /**
+   * Codex 0.145 models a spawned agent as another app-server thread. Notifications produced by that
+   * thread carry the CHILD thread id, while the hub only knows the root thread id it persisted as the
+   * chat's vendorSessionId. Keep the protocol's explicit parent edges so child events can be routed to
+   * the owning chat without erasing who produced them.
+   */
+  private readonly threadParents = new Map<string, string | null>()
+  /** Child threads are not implicitly subscribed on the connection that owns their parent. Once the
+   * parent emits its structured SubAgentActivity edge, resume the child exactly once to join its live
+   * event stream. This is what makes its own turn/item lifecycle available for attribution. */
+  private readonly subagentSubscriptions = new Set<string>()
   // threadId -> id of the turn currently running on that thread (for steer's expectedTurnId)
   private readonly activeTurns = new Map<string, string>()
   private initPromise: Promise<void> | undefined
@@ -344,9 +355,13 @@ export class CodexClient {
     if (isServerRequest) {
       const id = msg.id as number
       const method = msg.method as string
-      this.onEvent(`codex/request/${method}`, msg.params ?? null)
+      // Approval requests made inside a sub-agent carry its child thread id too. Route the card through
+      // the root chat, but retain `agentThreadId` so the request is still attributable. The response is
+      // keyed by JSON-RPC id, so replacing threadId in this local copy does not alter Codex's decision.
+      const routed = this.routeThreadPayload(msg.params ?? null)
+      this.onEvent(`codex/request/${method}`, routed.payload)
       if (this.onApproval) {
-        void this.onApproval(method, msg.params ?? null)
+        void this.onApproval(method, routed.payload)
           .then((result) => this.send({ id, result }))
           .catch(() => this.send({ id, result: { decision: 'decline' } }))
       } else {
@@ -363,20 +378,132 @@ export class CodexClient {
       const p = msg.params as { threadId?: string } | null
       if (p?.threadId) this.activeTurns.delete(p.threadId)
     }
-    this.onEvent(`codex/${msg.method}`, msg.params ?? null)
+    const method = msg.method as string
+    const routed = this.routeThreadPayload(msg.params ?? null)
+    // Keep root event names byte-for-byte compatible. Child events use an explicit namespace so the
+    // executor does not mistake a child's turn/completed for the ROOT turn completing and mark the whole
+    // chat idle. Claude supplies a parent tool id on each SDK envelope. Codex 0.145 instead emits a
+    // SubAgentActivity item on the parent; after we subscribe to that child thread, its separate stream
+    // must be re-homed here without erasing the child id.
+    this.onEvent(routed.isSubagent ? `codex/subagent/${method}` : `codex/${method}`, routed.payload)
   }
 
   async startThread(cwd: string): Promise<string> {
     await this.ensureStarted()
-    const result = await this.request<{ threadId?: string; thread?: { id?: string } }>('thread/start', { cwd })
+    const result = await this.request<{
+      threadId?: string
+      thread?: { id?: string; parentThreadId?: string | null }
+    }>('thread/start', { cwd })
     const threadId = result.threadId ?? result.thread?.id
     if (!threadId) throw new Error('thread/start returned no thread id')
+    this.threadParents.set(threadId, result.thread?.parentThreadId ?? null)
     return threadId
   }
 
   async resumeThread(threadId: string): Promise<void> {
     await this.ensureStarted()
-    await this.request('thread/resume', { threadId })
+    const result = await this.request<{ thread?: { id?: string; parentThreadId?: string | null } }>(
+      'thread/resume',
+      { threadId }
+    )
+    this.threadParents.set(result.thread?.id ?? threadId, result.thread?.parentThreadId ?? null)
+  }
+
+  /**
+   * Normalize one app-server payload for the hub event stream.
+   *
+   * App-server's authoritative 0.145 schema exposes both:
+   *   - a parent-thread `subAgentActivity` item with `agentThreadId` + `agentPath`; and
+   *   - `thread.parentThreadId` after this client explicitly resumes/subscribes to the child.
+   * Child turn/item notifications then carry the child id in `params.threadId`.
+   *
+   * The hub routes by `payload.threadId`, so a child payload is copied with the ROOT in `threadId` and
+   * the untouched child/immediate-parent ids in `agentThreadId`/`parentThreadId`. No prose, tool output,
+   * or timing guess participates in this attribution.
+   */
+  private routeThreadPayload(payload: unknown): {
+    payload: unknown
+    isSubagent: boolean
+  } {
+    if (!payload || typeof payload !== 'object') return { payload, isSubagent: false }
+    const p = payload as Record<string, unknown>
+    const sourceThreadId = typeof p.threadId === 'string' ? p.threadId : undefined
+    const item =
+      p.item && typeof p.item === 'object' ? (p.item as Record<string, unknown>) : undefined
+    if (sourceThreadId && item?.type === 'subAgentActivity' && typeof item.agentThreadId === 'string') {
+      // This is the first edge emitted in a real 0.145 spawn. `thread/started` for the child is not sent
+      // to the parent's subscriber, so waiting for that event leaves later child approvals unattributed.
+      const childThreadId = item.agentThreadId
+      this.threadParents.set(childThreadId, sourceThreadId)
+      if (item.kind !== 'interrupted') this.subscribeSubagent(childThreadId, sourceThreadId)
+    }
+    const thread =
+      p.thread && typeof p.thread === 'object' ? (p.thread as Record<string, unknown>) : undefined
+    const announcedId = typeof thread?.id === 'string' ? thread.id : undefined
+    if (announcedId) {
+      const parent = typeof thread?.parentThreadId === 'string' ? thread.parentThreadId : null
+      this.threadParents.set(announcedId, parent)
+    }
+
+    const actualThreadId =
+      typeof p.threadId === 'string' ? p.threadId : announcedId
+    if (!actualThreadId) return { payload, isSubagent: false }
+    const parentThreadId = this.threadParents.get(actualThreadId)
+    if (typeof parentThreadId !== 'string') return { payload, isSubagent: false }
+
+    let rootThreadId = parentThreadId
+    const seen = new Set([actualThreadId])
+    while (!seen.has(rootThreadId)) {
+      seen.add(rootThreadId)
+      const parent = this.threadParents.get(rootThreadId)
+      if (typeof parent !== 'string') break
+      rootThreadId = parent
+    }
+    return {
+      payload: {
+        ...p,
+        threadId: rootThreadId,
+        agentThreadId: actualThreadId,
+        parentThreadId,
+      },
+      isSubagent: true,
+    }
+  }
+
+  private subscribeSubagent(childThreadId: string, parentThreadId: string): void {
+    if (this.subagentSubscriptions.has(childThreadId)) return
+    this.subagentSubscriptions.add(childThreadId)
+    // `thread/resume` is also app-server's live-subscription operation. Do not pass `excludeTurns`: that
+    // option is experimental in 0.145 and is rejected because this adapter intentionally initializes with
+    // stable capabilities only. The response stays internal; new child items arrive as live notifications.
+    void this.request<{ thread?: { id?: string; parentThreadId?: string | null } }>('thread/resume', {
+      threadId: childThreadId,
+    })
+      .then((result) => {
+        const id = result.thread?.id ?? childThreadId
+        this.threadParents.set(id, result.thread?.parentThreadId ?? parentThreadId)
+      })
+      .catch((error: unknown) => {
+        this.subagentSubscriptions.delete(childThreadId)
+        this.onEvent('codex/subagent/subscription/error', {
+          threadId: this.rootThreadId(parentThreadId),
+          agentThreadId: childThreadId,
+          parentThreadId,
+          message: error instanceof Error ? error.message : String(error),
+        })
+      })
+  }
+
+  private rootThreadId(threadId: string): string {
+    let root = threadId
+    const seen = new Set<string>()
+    while (!seen.has(root)) {
+      seen.add(root)
+      const parent = this.threadParents.get(root)
+      if (typeof parent !== 'string') break
+      root = parent
+    }
+    return root
   }
 
   async sendTurn(
