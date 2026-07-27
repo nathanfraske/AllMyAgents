@@ -1,4 +1,5 @@
 import type { ThreadItem } from './store.svelte'
+import { toolBlurb } from './toolBlurb'
 
 // --- Codex transcript polish --------------------------------------------------------------------
 //
@@ -108,39 +109,11 @@ export interface CodexGroupSummary {
   current?: string
 }
 
-/** A short one-line label for a Codex tool item — the command line, the edited file, or the tool. */
-export function codexToolLabel(item: ThreadItem): string | undefined {
-  if (item.kind !== 'tool') return undefined
-  if (item.toolName === 'command') return commandText(item.toolInput)
-  if (item.toolName === 'fileChange') return fileChangeLabel(item.toolInput)
-  return item.toolName
-}
-
-function commandText(input: unknown): string | undefined {
-  if (typeof input === 'string') return clip(input)
-  if (Array.isArray(input)) return clip(input.map(String).join(' '))
-  if (input && typeof input === 'object') {
-    const cmd = (input as { command?: unknown }).command
-    if (typeof cmd === 'string') return clip(cmd)
-    if (Array.isArray(cmd)) return clip(cmd.map(String).join(' '))
-  }
-  return undefined
-}
-
-function fileChangeLabel(input: unknown): string | undefined {
-  const path =
-    (input as { path?: unknown } | null)?.path ??
-    (input as { file?: unknown } | null)?.file ??
-    (input as { filename?: unknown } | null)?.filename
-  return typeof path === 'string' ? `edit ${clip(path)}` : 'file change'
-}
-
-function clip(s: string, n = 80): string {
-  const one = s.replace(/\s+/g, ' ').trim()
-  return one.length > n ? one.slice(0, n - 1) + '…' : one
-}
-
-/** Live summary of a group for its collapsed header. `current` is the last tool call's label. */
+/**
+ * Live summary of a group for its collapsed header. `current` is the LAST tool call's subject line,
+ * derived by the same `toolBlurb` the individual rows use — so a collapsed group and its expanded rows
+ * describe a step identically (item 3 composes with this grouping rather than competing with it).
+ */
 export function summarizeCodexGroup(items: ThreadItem[]): CodexGroupSummary {
   let reasoning = 0
   let commands = 0
@@ -149,7 +122,7 @@ export function summarizeCodexGroup(items: ThreadItem[]): CodexGroupSummary {
     if (it.kind === 'reasoning') reasoning++
     else if (it.kind === 'tool') {
       commands++
-      const label = codexToolLabel(it)
+      const label = toolBlurb(it)?.label
       if (label) current = label
     }
   }

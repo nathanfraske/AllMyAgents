@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest'
 import {
-  codexToolLabel,
   extractCodexReasoning,
   groupCodexItems,
   isActivityItem,
@@ -120,24 +119,6 @@ describe('summarizeCodexGroup', () => {
 
   it('has no current label for a reasoning-only run', () => {
     expect(summarizeCodexGroup([reasoning(), reasoning()]).current).toBeUndefined()
-  })
-})
-
-describe('codexToolLabel', () => {
-  it('reads a string command', () => {
-    expect(codexToolLabel(command({ toolInput: 'ls -la' }))).toBe('ls -la')
-  })
-  it('joins an argv-array command', () => {
-    expect(codexToolLabel(command({ toolInput: ['git', 'commit', '-m', 'x'] }))).toBe('git commit -m x')
-  })
-  it('reads a nested { command } object', () => {
-    expect(codexToolLabel(command({ toolInput: { command: 'echo hi' } }))).toBe('echo hi')
-  })
-  it('labels a fileChange by path', () => {
-    expect(codexToolLabel(item('tool', { toolName: 'fileChange', toolInput: { path: 'src/a.ts' } }))).toBe('edit src/a.ts')
-  })
-  it('is undefined for non-tool items', () => {
-    expect(codexToolLabel(reasoning())).toBeUndefined()
   })
 })
 

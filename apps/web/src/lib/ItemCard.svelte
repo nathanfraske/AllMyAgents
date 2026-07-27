@@ -3,6 +3,7 @@
   import Markdown from './Markdown.svelte'
   import DiffView from './DiffView.svelte'
   import { fileDiffsFromItem } from './diff'
+  import { toolBlurb } from './toolBlurb'
 
   let { item }: { item: ThreadItem } = $props()
   let open = $state(false)
@@ -16,6 +17,10 @@
   // syntax-highlighted diffs; null when the item isn't a recognizable file edit, in which case
   // the generic tool rendering below is kept.
   const diffs = $derived(item.kind === 'tool' ? fileDiffsFromItem(item) : null)
+
+  // The tool's SUBJECT (file read, command run, pattern searched) so a row says what it did, not just
+  // which tool. Undefined for tools we don't recognise — the header then shows the plain name.
+  const blurb = $derived(item.kind === 'tool' ? toolBlurb(item) : undefined)
 
   function fmtTime(ts: string): string {
     const d = new Date(ts)
@@ -68,6 +73,7 @@
     <div class="tool" class:reflex={item.reflex}>
       <button class="hd" onclick={() => (open = !open)}>
         {open ? '▾' : '▸'} <span class="tname">{item.toolName}</span>
+        {#if blurb}<span class="tsubject" title={blurb.title ?? blurb.label}>{blurb.label}</span>{/if}
         {#if item.reflex}<span class="reflex-tag" title="tool call with no preceding reasoning">reflex</span>{/if}
         {#if item.toolError}<span class="fail">error</span>{/if}
       </button>
@@ -104,10 +110,15 @@
   .think { border-left: 2px solid var(--border-strong); padding-left: 0.5rem; }
   .reasoned { font-size: 0.72rem; padding: 0.1rem 0; }
   .think-body { font-style: italic; color: var(--muted); font-size: 0.82rem; margin-top: 0.25rem; }
-  .hd { background: none; border: none; color: var(--muted); padding: 0.15rem 0; cursor: pointer; font-size: 0.8rem; }
+  .hd { display: flex; align-items: baseline; gap: 0.4rem; width: 100%; text-align: left; background: none; border: none; color: var(--muted); padding: 0.15rem 0; cursor: pointer; font-size: 0.8rem; }
   .tool { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 0.3rem 0.5rem; }
   .tool.reflex { border-color: var(--warn); }
-  .tname { color: var(--accent); font-family: var(--mono); }
+  .tname { color: var(--accent); font-family: var(--mono); flex: none; }
+  /* The subject line: one line, never wraps, ellipsised if the pane is narrow. The identifying part
+     (basename / command head) is at the front, so an end-ellipsis here still leaves it readable. */
+  .tsubject { flex: 1 1 auto; color: var(--muted); font-family: var(--mono); font-size: 0.72rem; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .reflex-tag, .fail { flex: none; }
   .reflex-tag { color: var(--warn); font-size: 0.68rem; border: 1px solid var(--warn); border-radius: 999px; padding: 0 0.3rem; margin-left: 0.3rem; }
   .fail { color: var(--bad); font-size: 0.7rem; margin-left: 0.3rem; }
   .io { background: var(--bg); border-radius: 6px; padding: 0.4rem 0.5rem; font-size: 0.72rem; overflow-x: auto; margin: 0.3rem 0 0; }
