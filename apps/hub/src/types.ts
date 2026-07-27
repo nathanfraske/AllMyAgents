@@ -83,6 +83,12 @@ export interface SessionRecord {
   managerAgentTypes?: ManagerAgentType[]
   /** Editable launch brief retained with the grant so the operator can reconstruct what was handed over. */
   managerStartingPrompt?: string
+  /** Editable orientation portion of the launch brief, kept separate from the operator's task in the UI. */
+  managerOrientationBrief?: string
+  /** The task the operator assigned at launch. Blank means acknowledge, self-test tooling, and halt. */
+  managerOperatorTask?: string
+  /** Session-scoped operator instructions rematerialized into CLAUDE.md/AGENTS.md for every later turn. */
+  managerStandingInstructions?: string
   /** Durable session lineage for sidebar nesting and hub-originated child reports. */
   parentSessionId?: string
   /** Authorities this child received from its manager, still subject to the manager's live ceiling. */

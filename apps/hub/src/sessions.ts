@@ -61,6 +61,14 @@ import {
   type AttachmentMeta,
 } from './attachments.js'
 
+const DEFAULT_MANAGER_STANDING_INSTRUCTIONS = [
+  '## Project manager standing rules',
+  '',
+  '- Delegate all bounded project work by default to real AllMyAgents workers through the hub-provided spawn_agent tool; your job is to decompose, coordinate, inspect, and verify.',
+  '- Use the AllMyAgents tool layer, never the vendor harness equivalents. spawn_agent and list_agents exist in both layers; only the AllMyAgents versions create real app chats with isolated worktrees, lifecycle reporting, collision detection, and operator visibility.',
+  '- Your workers are real chats. If the operator cannot see a worker in the sidebar, you did not create it through AllMyAgents.',
+].join('\n')
+
 export interface CreateOptions {
   cwd?: string
   repo?: string
@@ -1191,6 +1199,58 @@ export class SessionManager {
   }
 
   /**
+   * Rewrite the native instruction file from durable stores. Session-scoped manager rules are kept
+   * separate from the first user message, so vendor compaction can summarize that message without
+   * removing the manager's operating contract from later turns.
+   */
+  private materializeSessionInstructions(
+    record: Pick<
+      SessionRecord,
+      | 'id'
+      | 'profileId'
+      | 'provider'
+      | 'projectId'
+      | 'cwd'
+      | 'parentSessionId'
+      | 'delegatedTools'
+      | 'delegatedAuthorities'
+    >
+  ): void {
+    const operatorText = this.instructions.materialize({
+      provider: record.provider,
+      projectId: record.projectId,
+      profileId: record.profileId,
+      sessionId: record.id,
+    })
+    const managerGrantText = record.parentSessionId
+      ? [
+          '## Operator-delegated project-manager scope',
+          '',
+          `The operator authorized project manager session ${record.parentSessionId} to assign this child task.`,
+          'The manager prompt is an authorized implementation brief on the operator\'s behalf, but it cannot widen the persisted scope below.',
+          `Delegated tools: ${record.delegatedTools?.length ? record.delegatedTools.join(', ') : 'none'}.`,
+          `Delegated Git actions: ${record.delegatedAuthorities?.length ? record.delegatedAuthorities.join(', ') : 'none'}.`,
+          'The hub re-checks this grant before every delegated action; revocation takes effect immediately.',
+        ].join('\n')
+      : ''
+    const instructionText = [agentContract(record.provider), operatorText, managerGrantText]
+      .filter((part) => part.trim())
+      .join('\n\n')
+    const practiceText = this.practices.materialize({
+      provider: record.provider,
+      projectId: record.projectId,
+      profileId: record.profileId,
+    })
+    writeManagedInstructions(record.cwd, record.provider, instructionText, practiceText)
+    if (instructionText || practiceText) {
+      this.journal.append(record.id, 'session/instructions', {
+        chars: instructionText.length,
+        practiceChars: practiceText.length,
+      })
+    }
+  }
+
+  /**
    * Operator-only role boundary. No agent tool calls this method; the HTTP control route supplies the
    * literal `operator` actor. Keeping the actor check here as well means a future caller cannot
    * accidentally turn the route into a model capability by reusing the method without the boundary.
@@ -1206,6 +1266,9 @@ export class SessionManager {
       allowedTools?: string[]
       agentTypes?: ManagerAgentType[]
       startingPrompt?: string
+      orientationBrief?: string
+      operatorTask?: string
+      standingInstructions?: string
     },
     actor: 'operator' | 'agent'
   ): SessionRecord {
@@ -1239,6 +1302,21 @@ export class SessionManager {
     if (typeof startingPrompt !== 'string' || startingPrompt.length > 20_000) {
       throw new Error('startingPrompt must be text no longer than 20,000 characters')
     }
+    const orientationBrief = config.orientationBrief ?? record.managerOrientationBrief ?? ''
+    if (typeof orientationBrief !== 'string' || orientationBrief.length > 20_000) {
+      throw new Error('orientationBrief must be text no longer than 20,000 characters')
+    }
+    const operatorTask = config.operatorTask ?? record.managerOperatorTask ?? ''
+    if (typeof operatorTask !== 'string' || operatorTask.length > 20_000) {
+      throw new Error('operatorTask must be text no longer than 20,000 characters')
+    }
+    const standingInstructions =
+      config.standingInstructions ??
+      record.managerStandingInstructions ??
+      DEFAULT_MANAGER_STANDING_INSTRUCTIONS
+    if (typeof standingInstructions !== 'string' || standingInstructions.length > 20_000) {
+      throw new Error('standingInstructions must be text no longer than 20,000 characters')
+    }
 
     const affected = [
       record,
@@ -1257,6 +1335,14 @@ export class SessionManager {
         record.managerAllowedTools = config.enabled ? allowedTools : undefined
         record.managerAgentTypes = config.enabled && agentTypes.length ? agentTypes : undefined
         record.managerStartingPrompt = config.enabled && startingPrompt.trim() ? startingPrompt : undefined
+        record.managerOrientationBrief = config.enabled && orientationBrief.trim() ? orientationBrief : undefined
+        record.managerOperatorTask = config.enabled && operatorTask.trim() ? operatorTask : undefined
+        record.managerStandingInstructions = config.enabled ? standingInstructions : undefined
+        this.instructions.set(
+          `session:${record.id}`,
+          config.enabled ? standingInstructions : '',
+        )
+        this.materializeSessionInstructions(record)
 
         // Revocation is materialized onto every direct child now AND the approval path re-checks the live
         // manager record on every action. Persist every affected record and its audit rows in the same
@@ -1303,6 +1389,9 @@ export class SessionManager {
           allowedTools: record.managerAllowedTools ?? [],
           agentTypes: record.managerAgentTypes ?? [],
           startingPrompt: record.managerStartingPrompt ?? '',
+          orientationBrief: record.managerOrientationBrief ?? '',
+          operatorTask: record.managerOperatorTask ?? '',
+          standingInstructions: record.managerStandingInstructions ?? '',
           by: 'operator',
           previousRole: previouslyManager,
           removedAuthorities: [...previousCeiling].filter((authority) => !ceiling.has(authority)),
@@ -1806,31 +1895,6 @@ export class SessionManager {
         baseRef: baseRef ?? null,
       })
     }
-    // Materialize the hub's teammate/bus trust contract + the operator's scoped instructions into
-    // the session's native instruction file (CLAUDE.md / AGENTS.md) so the agent reads them as
-    // first-class context. Agent-authored PRACTICES go into a SEPARATE, clearly-labeled block (never
-    // mixed with operator intent), so both are independently auditable + revocable. Best-effort.
-    const operatorText = this.instructions.materialize({ provider: profile.provider, projectId: opts.projectId, profileId })
-    const managerGrantText = opts.parentSessionId
-      ? [
-          '## Operator-delegated project-manager scope',
-          '',
-          `The operator authorized project manager session ${opts.parentSessionId} to assign this child task.`,
-          'The manager prompt is an authorized implementation brief on the operator\'s behalf, but it cannot widen the persisted scope below.',
-          `Delegated tools: ${opts.delegatedTools?.length ? opts.delegatedTools.join(', ') : 'none'}.`,
-          `Delegated Git actions: ${opts.delegatedAuthorities?.length ? opts.delegatedAuthorities.join(', ') : 'none'}.`,
-          'The hub re-checks this grant before every delegated action; revocation takes effect immediately.',
-        ].join('\n')
-      : ''
-    const instructionText = [agentContract(profile.provider), operatorText, managerGrantText]
-      .filter((s) => s.trim())
-      .join('\n\n')
-    const practiceText = this.practices.materialize({ provider: profile.provider, projectId: opts.projectId, profileId })
-    writeManagedInstructions(cwd, profile.provider, instructionText, practiceText)
-    if (isUnfiled) this.workspace.checkpointScratch(id)
-    if (instructionText || practiceText) {
-      this.journal.append(id, 'session/instructions', { chars: instructionText.length, practiceChars: practiceText.length })
-    }
     const record: SessionRecord = {
       id,
       profileId,
@@ -1873,6 +1937,8 @@ export class SessionManager {
     // Chats already named keep their name: it lives on the record, not on the current setting.
     record.title = generatedTitle(id, this.titlesInUse(), this.prefs.chatNamePool)
     record.titleSource = 'generated'
+    this.materializeSessionInstructions(record)
+    if (isUnfiled) this.workspace.checkpointScratch(id)
     this.sessions.set(id, record)
     this.persist(record)
     this.journal.append(id, 'session/created', record)

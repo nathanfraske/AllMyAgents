@@ -1212,6 +1212,18 @@ export function startServer(opts: ServerOptions): http.Server {
           json(res, { error: 'startingPrompt must be text' }, 400)
           return
         }
+        if (body.orientationBrief !== undefined && typeof body.orientationBrief !== 'string') {
+          json(res, { error: 'orientationBrief must be text' }, 400)
+          return
+        }
+        if (body.operatorTask !== undefined && typeof body.operatorTask !== 'string') {
+          json(res, { error: 'operatorTask must be text' }, 400)
+          return
+        }
+        if (body.standingInstructions !== undefined && typeof body.standingInstructions !== 'string') {
+          json(res, { error: 'standingInstructions must be text' }, 400)
+          return
+        }
         if (rawDelegation.some((authority) => authority !== 'commit' && authority !== 'push')) {
           json(res, { error: 'delegation may contain only commit and push' }, 400)
           return
@@ -1233,6 +1245,9 @@ export function startServer(opts: ServerOptions): http.Server {
             allowedTools,
             agentTypes: rawAgentTypes === undefined ? undefined : agentTypes,
             startingPrompt: body.startingPrompt as string | undefined,
+            orientationBrief: body.orientationBrief as string | undefined,
+            operatorTask: body.operatorTask as string | undefined,
+            standingInstructions: body.standingInstructions as string | undefined,
           },
           'operator'
         )
