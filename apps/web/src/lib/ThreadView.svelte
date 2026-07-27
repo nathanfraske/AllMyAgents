@@ -611,7 +611,7 @@
              one still accumulating, so it is the one whose elapsed clock should tick. -->
         <CodexActivityGroup items={node.items} {now} live={thinking && i === renderNodes.length - 1} />
       {:else}
-        <ItemCard item={node.item} />
+        <ItemCard item={node.item} sessionId={view.record.id} />
       {/if}
     {/each}
     {#if view.items.length === 0 && !thinking}<div class="dim pad">{isDraft ? 'New chat — set the account, model and worktree below, then send your first message to start it.' : 'no activity yet — send a message below'}</div>{/if}
