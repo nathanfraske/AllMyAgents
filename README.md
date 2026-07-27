@@ -1,8 +1,61 @@
 # AllMyAgents
 
-Self-hosted hub + GUI for managing Claude Code and OpenAI Codex agents — many accounts per vendor, Windows + WSL nodes, any agent promotable to orchestrator, shared per-project memory, phone remote over a self-hosted mesh.
+**Run a whole fleet of coding agents from one window — and let them talk to each other.**
 
-**Alpha.** It works and is used daily, but expect rough edges — read the release notes.
+A self-hosted hub and desktop app for [Claude Code](https://claude.com/claude-code) and [OpenAI Codex](https://developers.openai.com/codex). Several accounts per vendor, side by side, on your own machine. Your agents can message each other, look in on each other's work, and share what they learn.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey.svg)](#install)
+[![Release](https://img.shields.io/github/v/release/nathanfraske/AllMyAgents?include_prereleases&label=release)](https://github.com/nathanfraske/AllMyAgents/releases)
+
+> **Alpha.** It works, and it is used daily to build itself. Expect rough edges — read the release notes.
+
+---
+
+## Why this exists
+
+One agent in one terminal is easy. The trouble starts at five: which of them is still working, which quietly failed an hour ago, which two are about to edit the same file, and what did the one you closed yesterday actually learn?
+
+AllMyAgents is the answer to that — a hub that owns the agents, keeps their history, and gives them a way to reach each other.
+
+## What it does
+
+### 🤝 Agents that work together
+
+A real intercom, not a metaphor. Any agent can message any other, and the hub delivers it into their next turn — or steers it into a turn already running, so a correction lands while it can still change the outcome.
+
+- **`send_message`** — direct or broadcast to the fleet
+- **`peek_agent`** — see what a teammate is doing *without* interrupting them
+- **Shared memory** — scoped notes that outlive the chat that wrote them
+- **Practices** — conventions the fleet reads and revises together
+
+Mixed fleets are the point: a Claude agent and a Codex agent talk to each other the same way, and the transcript shows you which is which.
+
+### 🪟 A window built for many agents at once
+
+- **Split any way you like** — drag a chat out and drop it into any row or column layout
+- **Folders, search, and status at a glance** — working, done, needs review, stalled
+- **Live token and context meters**, so you see a chat approaching its limit before it gets there
+- **Auto-named chats** after scientists, so "Bose" and "Ramanujan" beat `session-4f2a`
+
+### 🧷 It does not lose your work
+
+- **Chats in a git project get their own worktree** by default, so parallel agents never fight over your files
+- **Stop preserves everything** — tracked, untracked, and in-flight
+- **A live turn survives a hub restart.** The hub can update itself underneath a running agent and the turn keeps going
+- **A durable journal** of everything that happened, condensed for size without destroying detail
+
+### 📎 Give agents real files
+
+Attach images, PDFs, spreadsheets, Word documents, code and logs — and they reach **both** vendors, whatever each one natively accepts. Paste a huge log and it becomes a tidy attachment instead of burying the chat.
+
+### 🔐 You decide what runs
+
+- **Safe / Edits / Full** permission modes, per chat, changeable mid-conversation
+- **A project's MCP servers and hooks require your approval** before they execute — opening a folder is not consent to run the code inside it. Config the app cannot fully verify stays disabled. *(Claude today; Codex project config is not yet gated.)*
+- **A Danger Zone** with a toggle for every guardrail, because it is your machine
+
+---
 
 ## Install
 
@@ -14,7 +67,7 @@ One command. Paste it into Terminal:
 curl -fsSL https://raw.githubusercontent.com/nathanfraske/AllMyAgents/main/scripts/install-macos.sh | bash
 ```
 
-It picks the right build for your Mac (Apple Silicon or Intel), installs to `/Applications`, and the app then opens normally — no Gatekeeper dialog and no extra steps. It also puts an `allmyagents` command on your PATH, so you can start it from a terminal; if the directory it chose is not already on your PATH it prints the exact line to add and offers to add it for you.
+It picks the right build for your Mac (Apple Silicon or Intel), installs to `/Applications`, and the app then opens normally — no Gatekeeper dialog and no extra steps. It also puts an `allmyagents` command on your PATH; if the directory it chose is not already on your PATH it prints the exact line to add and offers to add it for you.
 
 To remove everything it installed, including the PATH line: `bash install-macos.sh --uninstall`.
 
@@ -73,11 +126,37 @@ Prefer to click things? Download the `.msi` or `-setup.exe` from [Releases](http
 
 Build from source (below). No packaged build yet.
 
-### First launch
+---
 
-Needs an internet connection: the app fetches the hub's dependencies and the vendor CLIs from npm, which takes a couple of minutes. The window says so while it works.
+## Getting started
 
-You then sign in to whichever vendors you use, under **Settings → Accounts**. The app never asks for API keys — it drives the vendors' own CLI logins, and the credentials stay on your machine.
+**1. Launch it.** From your Applications folder or Start menu — or from any terminal:
+
+```bash
+allmyagents
+```
+
+**2. Wait out the first launch.** It fetches the hub's dependencies and the vendor CLIs from npm, which takes a couple of minutes and needs an internet connection. The window tells you what it is doing.
+
+**3. Sign in.** **Settings → Accounts**, then add the vendors you use. You can add the same vendor more than once — that is how you run several accounts side by side.
+
+> AllMyAgents never asks for API keys. It drives the vendors' own CLI logins and the credentials stay on your machine.
+
+**4. Add a project.** Click **+** next to *Projects* and point it at a folder on disk.
+
+**5. Start a chat.** Press the new-chat button, pick an account and model, and send your first message. The chat names itself.
+
+**6. Try the fleet.** Start a second chat on a different account, then ask one agent to `send_message` to the other. Watch it arrive in their transcript.
+
+### From the command line
+
+```bash
+allmyagents              # launch the app
+allmyagents --version    # print the installed version
+allmyagents --help       # usage
+```
+
+---
 
 ## Updating
 
@@ -98,9 +177,18 @@ pnpm desktop
 pnpm --filter desktop exec tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
 ```
 
+Running the tests:
+
+```bash
+pnpm --filter hub test      # hub suite
+pnpm --filter web test      # UI suite
+pnpm --filter hub typecheck
+pnpm --filter web check
+```
+
 ## Documentation
 
-Start with [DESIGN.md](DESIGN.md) — architecture, decisions, and the phased roadmap. Phase 0 spike instructions are in DESIGN.md §8.
+Start with [DESIGN.md](DESIGN.md) — architecture, decisions, and the phased roadmap.
 
 ## License
 
