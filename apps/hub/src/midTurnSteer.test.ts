@@ -95,6 +95,28 @@ async function settle(): Promise<void> {
 }
 
 describe('SessionManager mid-turn steering', () => {
+  it('delivers a worktree collision as a direct live steer with distinct guardrail provenance', async () => {
+    const { sessions, journal, record, steer } = build()
+    record.worktree = record.cwd
+
+    await expect(
+      sessions.steerWorktreeCollision(
+        's1',
+        'Heads up: Knuth is also editing apps/hub/src/sessions.ts right now.'
+      )
+    ).resolves.toBe(true)
+
+    expect(steer).toHaveBeenCalledOnce()
+    expect(steer).toHaveBeenCalledWith(
+      's1',
+      'Heads up: Knuth is also editing apps/hub/src/sessions.ts right now.'
+    )
+    expect(
+      journal.since(0).filter((event) => event.kind === 'session/worktree-collision-steered')
+    ).toHaveLength(1)
+    expect(journal.since(0).filter((event) => event.kind === 'session/turn-origin')).toHaveLength(0)
+  })
+
   it('sends a second operator message into the live turn without changing its operator provenance', async () => {
     const { sessions, journal, steer } = build()
     ;(sessions as unknown as { operatorTurnSessions: Set<string> }).operatorTurnSessions.add('s1')

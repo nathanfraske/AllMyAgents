@@ -20,6 +20,7 @@ import { SessionStore } from './store.js'
 import { startServer } from './server.js'
 import { UsageMonitor } from './usage.js'
 import { WorkspaceManager } from './workspace.js'
+import { WorktreeCollisionDetector } from './worktreeCollisionDetector.js'
 import { MeshSite } from './meshSite.js'
 import { getOrCreateDeviceToken } from './deviceToken.js'
 import { InstructionStore } from './instructions.js'
@@ -141,6 +142,7 @@ const autoMemoryRecall = config.features?.autoMemoryRecall !== false
 // SessionManager (which reads them live when gating tools) and the server (which mutates + persists
 // them on POST /api/config/danger). Same object → a toggle flip takes effect without a restart.
 const danger: DangerFlags = {
+  disableWorktreeCollisionWarnings: config.danger?.disableWorktreeCollisionWarnings === true,
   busCanUseRiskyTools: config.danger?.busCanUseRiskyTools === true,
   autoApprovePractices: config.danger?.autoApprovePractices === true,
   autoApproveRestart: config.danger?.autoApproveRestart === true,
@@ -187,6 +189,12 @@ const executor: Executor = workerSocket
     })
   : new InProcessExecutor({ approvals, usage, danger, memory, practices })
 sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, dataDir, executor, prefs)
+const worktreeCollisions = new WorktreeCollisionDetector({
+  sessions: () => sessions.list(),
+  enabled: () => danger.disableWorktreeCollisionWarnings !== true,
+  steer: (sessionId, message) => sessions.steerWorktreeCollision(sessionId, message),
+})
+process.once('exit', () => worktreeCollisions.stop())
 usage.setCodexReader((profileId) => sessions.readCodexLimits(profileId))
 // Let full-access chats and "always allow" grants skip the operator prompt. Installed here because the
 // policy reads session records, and ApprovalService is constructed before the SessionManager exists.
@@ -433,6 +441,7 @@ server.once('listening', () => {
   if (!isGreen) {
     registerMesh()
     startJournalMaintenance()
+    worktreeCollisions.start()
   }
 })
 
@@ -451,6 +460,7 @@ if (supervised && process.send) {
       usage.startPolling()
       registerMesh()
       startJournalMaintenance()
+      worktreeCollisions.start()
     },
     // §8.4: drain() signals the worker to hold relays before blue's socket drops; abort() un-drains a
     // rolled-back flip. No-op in-process (the in-process executor implements no signalDraining), so the
@@ -484,6 +494,7 @@ function shutdown(signal: string): void {
   if (shuttingDown) return
   shuttingDown = true
   stopJournalMaintenance()
+  worktreeCollisions.stop()
   const done = (): void => process.exit(0)
   // Cap the cleanup so a hung socket or child can't wedge shutdown.
   const guard = setTimeout(done, 2500)

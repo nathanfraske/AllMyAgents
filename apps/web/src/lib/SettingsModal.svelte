@@ -69,7 +69,7 @@
   // Danger Zone — safe-default guardrail toggles + the agent-authored practices review list. Kept
   // collapsed behind an explicit reveal so it's never flipped by accident. Both toggles default OFF.
   let dangerRevealed = $state(false)
-  let danger = $state<DangerFlags>({ busCanUseRiskyTools: false, autoApprovePractices: false, autoApproveRestart: false, enableClaudeConnectors: false, fullAccessAnyOrigin: false })
+  let danger = $state<DangerFlags>({ disableWorktreeCollisionWarnings: false, busCanUseRiskyTools: false, autoApprovePractices: false, autoApproveRestart: false, enableClaudeConnectors: false, fullAccessAnyOrigin: false })
   let practices = $state<Practice[]>([])
   $effect(() => {
     void api.danger().then((d) => (danger = d))
@@ -510,6 +510,9 @@
         <button class="btn danger-reveal" onclick={() => (dangerRevealed = true)}>I understand these reduce safety — show them</button>
       {:else}
         <div class="danger-body">
+          <label class="opt"><input type="checkbox" checked={danger.disableWorktreeCollisionWarnings} onchange={(e) => setDanger({ disableWorktreeCollisionWarnings: (e.target as HTMLInputElement).checked })} /> Disable live worktree collision warnings</label>
+          <p class="hint dim warnrow">Off (safe): if two active agents write the same file, the later writer gets one high-priority steer naming the other agent and file. On: no collision checks or warnings run. Detection never blocks or edits either worktree.</p>
+
           <label class="opt"><input type="checkbox" checked={danger.autoApprovePractices} onchange={(e) => setDanger({ autoApprovePractices: (e.target as HTMLInputElement).checked })} /> Auto-approve agent practices at project / global / fleet scope</label>
           <p class="hint dim warnrow">Off (safe): an agent recording a convention that affects teammates or the whole fleet waits for your approval. On: those writes apply immediately, no prompt. (Your own-account practices are always immediate either way.)</p>
 

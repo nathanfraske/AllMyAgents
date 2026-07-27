@@ -1209,6 +1209,28 @@ export class SessionManager {
   }
 
   /**
+   * Inject one high-priority guardrail warning into an existing live turn. This deliberately bypasses
+   * operator-input and bus provenance: it neither starts a turn nor changes the permissions/origin of the
+   * turn already in flight. The provider's ordinary steer transport supplies Claude priority:'next' and
+   * Codex turn/steer semantics at the next tool boundary.
+   */
+  async steerWorktreeCollision(sessionId: string, text: string): Promise<boolean> {
+    const record = this.sessions.get(sessionId)
+    if (record?.status !== 'active' || !record.worktree) return false
+    try {
+      await this.executor.steer(sessionId, text)
+      this.journal.append(sessionId, 'session/worktree-collision-steered', { text })
+      return true
+    } catch (error) {
+      this.journal.append(sessionId, 'session/worktree-collision-steer-failed', {
+        text,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return false
+    }
+  }
+
+  /**
    * On-demand context compaction (the `/compact` built-in).
    *
    * SPIKE RESULT (2026-07-25): NO driver exposes an on-demand compaction trigger.

@@ -796,6 +796,9 @@ export function startServer(opts: ServerOptions): http.Server {
       }
       if (method === 'POST' && url.pathname === '/api/config/danger') {
         const body = await readBody(req)
+        if (typeof body.disableWorktreeCollisionWarnings === 'boolean') {
+          danger.disableWorktreeCollisionWarnings = body.disableWorktreeCollisionWarnings
+        }
         if (typeof body.busCanUseRiskyTools === 'boolean') danger.busCanUseRiskyTools = body.busCanUseRiskyTools
         if (typeof body.autoApprovePractices === 'boolean') danger.autoApprovePractices = body.autoApprovePractices
         if (typeof body.autoApproveRestart === 'boolean') danger.autoApproveRestart = body.autoApproveRestart
