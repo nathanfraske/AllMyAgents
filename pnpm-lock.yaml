@@ -27,22 +27,22 @@ importers:
   apps/hub:
     dependencies:
       '@anthropic-ai/claude-agent-sdk':
-        specifier: latest
+        specifier: 0.3.218
         version: 0.3.218(@anthropic-ai/sdk@0.114.0(zod@4.4.3))(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(zod@4.4.3)
       '@anthropic-ai/claude-code':
-        specifier: latest
+        specifier: 2.1.218
         version: 2.1.218
       '@openai/codex':
-        specifier: latest
+        specifier: 0.145.0
         version: 0.145.0
       better-sqlite3:
-        specifier: ^12
+        specifier: 12.11.1
         version: 12.11.1
       ws:
-        specifier: ^8
+        specifier: 8.21.1
         version: 8.21.1
       zod:
-        specifier: ^4.0.0
+        specifier: 4.4.3
         version: 4.4.3
     devDependencies:
       '@types/better-sqlite3':

@@ -19,15 +19,18 @@
 //   hub-runtime/
 //     apps/hub/
 //       dist/           index.js, …     (tsc output of apps/hub/src — OUR code)
-//       package.json                    (prod-only, versions pinned)
+//       package.json                    (runtime versions pinned)
+//       package-lock.json               (npm's reproducible transitive graph)
 //     node/
 //       node(.exe)                      (the platform Node runtime — MIT)
 //       node_modules/npm/…              (npm, so first-run install needs nothing)
 //
-// On first launch the app copies apps/hub/{dist,package.json} into a writable
-// data dir and runs `npm install --omit=dev` there, which fetches the native
-// addon + vendor CLIs for the host platform. This script uses only Node
-// built-ins and must run on the platform being packaged.
+// On first launch the app copies apps/hub/{dist,package.json,package-lock.json}
+// into a writable data dir and runs `npm install --omit=dev` there. Plain npm
+// reads package-lock.json beside package.json, so it fetches the locked native
+// addon + vendor CLIs for the host platform instead of resolving a new graph.
+// This script uses only Node built-ins and must run on the platform being
+// packaged.
 //
 // ⚠️ THE LANDMINE (docs/alpha-release-plan.md): the repo's `profiles/` holds the
 // operator's REAL vendor credentials and `data/` holds their live journal. An
@@ -228,6 +231,7 @@ function auditPayload(root, allowed) {
 const ALLOWLIST = [
   /^apps\/hub\/dist\/(?:[^/]+\/)*[^/]+\.js$/,
   /^apps\/hub\/package\.json$/,
+  /^apps\/hub\/package-lock\.json$/,
   new RegExp(`^node/${path.basename(process.execPath).replace('.', '\\.')}$`),
   /^node\/node_modules\/npm\/.+$/,
 ]
@@ -254,6 +258,7 @@ if (process.argv.includes('--self-test')) {
   for (const [rel, body, label] of cases) {
     rmrf(tmp)
     write('apps/hub/package.json', '{}')
+    write('apps/hub/package-lock.json', '{}')
     write('apps/hub/dist/index.js', 'export {}')
     write(rel, body)
     let threw = false
@@ -271,6 +276,7 @@ if (process.argv.includes('--self-test')) {
   // And the clean case must PASS, or the audit is just "always throws".
   rmrf(tmp)
   write('apps/hub/package.json', '{}')
+  write('apps/hub/package-lock.json', '{}')
   write('apps/hub/dist/index.js', 'export {}')
   write(`node/${path.basename(process.execPath)}`, 'binary')
   write('node/node_modules/npm/bin/npm-cli.js', 'x')
@@ -320,29 +326,81 @@ for (const rel of walkFiles(path.join(hubSrc, 'dist'))) {
 }
 log(`dist: ${copied} files copied, ${skipped.length} skipped${skipped.length ? ` (${skipped.slice(0, 6).join(', ')}${skipped.length > 6 ? ', …' : ''})` : ''}`)
 
-// 4. Pin prod-dep versions to whatever the workspace currently resolves, so the
-//    first-run `npm install` reproduces the validated set instead of drifting to
-//    "latest". Read the resolved version from each installed dep.
-const hubPkg = JSON.parse(fs.readFileSync(path.join(hubSrc, 'package.json'), 'utf8'))
-const pinned = {}
-for (const dep of Object.keys(hubPkg.dependencies ?? {})) {
-  const p = path.join(hubSrc, 'node_modules', dep, 'package.json') // follows the pnpm symlink
-  pinned[dep] = JSON.parse(fs.readFileSync(p, 'utf8')).version
-}
-log(`pinned prod deps (installed at runtime): ${Object.entries(pinned).map(([k, v]) => `${k}@${v}`).join(', ')}`)
+// 4. Ship the manifest and npm lock together. npm's plain `install` honors
+//    package-lock.json only when it is beside package.json in the install cwd;
+//    the desktop release path copies this pair from the payload into that cwd.
+//
+//    UPGRADE CONTRACT: at each release, run `npm outdated --omit=dev` from
+//    apps/hub and review each result. To accept an upgrade, put the tested exact
+//    version in package.json and refresh pnpm-lock.yaml with pnpm. Then copy
+//    package.json into an empty temp directory, run
+//    `npm install --package-lock-only --ignore-scripts --workspaces=false` there,
+//    and copy its package-lock.json back before rerunning the hub + bundle checks.
+//    Generating beside pnpm's symlinked node_modules once produced a lock full of
+//    ../../node_modules/.pnpm links that worked only on the build machine. The
+//    gate below rejects that, a missing/stale lock, or a drifting runtime spec;
+//    upgrades never happen just because a user installs on a later day.
+const sourceManifest = path.join(hubSrc, 'package.json')
+const sourceLock = path.join(hubSrc, 'package-lock.json')
+must(sourceLock, 'source npm lock (apps/hub/package-lock.json)')
+fs.copyFileSync(sourceManifest, path.join(outHub, 'package.json'))
+fs.copyFileSync(sourceLock, path.join(outHub, 'package-lock.json'))
 
-// 5. Ship a prod-only, pinned package.json — the manifest the first-run install
-//    consumes. No devDependencies, no scripts.
-const staged = {
-  name: hubPkg.name,
-  version: hubPkg.version,
-  private: true,
-  type: hubPkg.type, // "module" — required for the ESM dist + import.meta.dirname
-  dependencies: pinned,
+// npm accepts exact SemVer releases (including deliberate prereleases), not
+// tags/ranges/protocols that can resolve differently after the release is cut.
+const EXACT_SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/
+const stagedManifest = JSON.parse(fs.readFileSync(path.join(outHub, 'package.json'), 'utf8'))
+const stagedLock = JSON.parse(fs.readFileSync(path.join(outHub, 'package-lock.json'), 'utf8'))
+const lockRootDeps = stagedLock.packages?.['']?.dependencies ?? {}
+const manifestDepNames = Object.keys(stagedManifest.dependencies ?? {}).sort()
+const lockDepNames = Object.keys(lockRootDeps).sort()
+if (JSON.stringify(manifestDepNames) !== JSON.stringify(lockDepNames)) {
+  throw new Error(
+    `[bundle-hub] npm lock root dependencies do not match package.json:\n` +
+      `  package.json: ${manifestDepNames.join(', ')}\n` +
+      `  package-lock.json: ${lockDepNames.join(', ')}`
+  )
 }
-fs.writeFileSync(path.join(outHub, 'package.json'), `${JSON.stringify(staged, null, 2)}\n`)
+for (const [name, spec] of Object.entries(stagedManifest.dependencies ?? {})) {
+  if (!EXACT_SEMVER.test(spec)) {
+    throw new Error(`[bundle-hub] runtime dependency ${name} must use an exact SemVer, got ${JSON.stringify(spec)}`)
+  }
+  if (lockRootDeps[name] !== spec) {
+    throw new Error(
+      `[bundle-hub] stale npm lock for ${name}: package.json has ${spec}, package-lock.json has ${JSON.stringify(lockRootDeps[name])}`
+    )
+  }
+  const workspaceVersion = JSON.parse(
+    fs.readFileSync(path.join(hubSrc, 'node_modules', name, 'package.json'), 'utf8')
+  ).version
+  if (workspaceVersion !== spec) {
+    throw new Error(
+      `[bundle-hub] pnpm workspace/runtime drift for ${name}: package.json has ${spec}, installed pnpm tree has ${workspaceVersion}`
+    )
+  }
+}
+for (const [lockPath, pkg] of Object.entries(stagedLock.packages ?? {})) {
+  if (!lockPath) continue
+  if (
+    lockPath.startsWith('../') ||
+    pkg.link ||
+    typeof pkg.resolved !== 'string' ||
+    !pkg.resolved.startsWith('https://registry.npmjs.org/') ||
+    typeof pkg.integrity !== 'string'
+  ) {
+    throw new Error(
+      `[bundle-hub] npm lock contains a non-portable package entry at ${JSON.stringify(lockPath)} ` +
+        `(resolved: ${JSON.stringify(pkg.resolved)})`
+    )
+  }
+}
+log(
+  `locked runtime deps: ${Object.entries(stagedManifest.dependencies ?? {})
+    .map(([name, version]) => `${name}@${version}`)
+    .join(', ')}`
+)
 
-// 6. Ship the Node runtime (MIT) + npm, so the first-run install has everything
+// 5. Ship the Node runtime (MIT) + npm, so the first-run install has everything
 //    it needs with zero system prerequisites.
 //
 //    WHERE npm LIVES DIFFERS BY PLATFORM, and getting this wrong is a hard build
@@ -391,12 +449,13 @@ fs.cpSync(npmSrc, path.join(outNodeDir, 'node_modules', 'npm'), {
 })
 log(`shipped Node runtime: ${nodeName} (${process.version}, ${process.platform}-${process.arch}) + npm`)
 
-// 7. Validate the shipped payload — our code + the runtime, nothing vendor.
+// 6. Validate the shipped payload — our code + the runtime, nothing vendor.
 must(path.join(outHub, 'dist', 'index.js'), 'hub entry in payload')
 // The agent worker (docs/agent-worker-impl.md §3) ships in the same dist/ tree the whole copy above
 // already carries; assert it made the payload so a hubctl worker spawn can never miss its entry.
 must(path.join(outHub, 'dist', 'agentWorker.js'), 'agent worker entry in payload')
 must(path.join(outHub, 'package.json'), 'hub manifest in payload')
+must(path.join(outHub, 'package-lock.json'), 'npm lock in payload')
 must(path.join(outNodeDir, nodeName), 'node runtime in payload')
 must(path.join(outNodeDir, 'node_modules', 'npm', 'bin', 'npm-cli.js'), 'npm in payload')
 // Assert we did NOT accidentally ship dependencies or vendor binaries.
@@ -411,14 +470,14 @@ for (const forbidden of ['profiles', 'data']) {
   }
 }
 
-// 7b. CREDENTIAL FIREWALL. Everything above is "did we copy what we meant to";
+// 6b. CREDENTIAL FIREWALL. Everything above is "did we copy what we meant to";
 //     this is "prove nothing else got in". It fails the build, by design.
 // ALLOWLIST (defined up top so `--self-test` exercises the exact same rules):
-//   apps/hub/dist/**/*.js  +  apps/hub/package.json  — our compiled hub
+//   apps/hub/dist/**/*.js  +  apps/hub/{package.json,package-lock.json} — our hub
 //   node/<node exe>  +  node/node_modules/npm/**     — the vendored Node runtime (MIT)
 auditPayload(outRoot, ALLOWLIST)
 
-// 8. Report.
+// 7. Report.
 const s = dirStats(outRoot)
 log('----------------------------------------------------------------')
 log(`light payload ready: ${outRoot}`)
