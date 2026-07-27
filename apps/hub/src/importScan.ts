@@ -22,6 +22,7 @@
  * Everything below the parse helpers is bounded file I/O (glob + streamed head reads, capped bytes),
  * never a whole-file `JSON.parse` — real transcripts reach many MB.
  */
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import readline from 'node:readline'
@@ -53,14 +54,30 @@ export interface ImportableChat {
 
 /**
  * Read-only summary of a project folder's adoptable configuration — surfaced so the user can SEE
- * what's there. Deliberately values-free: MCP env/headers are credentials, so only names, transport
- * and a `hasSecrets` flag leave the hub (never the actual values). Wiring these up (Claude MCP
- * trust, Codex config.toml, a hook runner) is a documented follow-up, not done here.
+ * what's there, and specifically WHAT WOULD EXECUTE, before approving it (a project's hooks are
+ * arbitrary code and its MCP servers are processes the agent talks to — importing a repo must not
+ * silently gain the right to run them; see the gate in adapters/claude.ts and the per-project trust in
+ * projects.ts).
+ *
+ * VALUES-FREE ON SECRETS, NOT ON CODE. MCP env/header VALUES are credentials and never leave the hub
+ * (only `hasSecrets`). But the COMMAND a stdio server runs, a remote server's URL, and a hook's command
+ * string ARE the executable surface — "runs `curl x | sh` before every tool call" is the decision, and
+ * a consent screen that hides it is theatre — so those ARE surfaced. The fingerprint
+ * ({@link fingerprintProjectConfig}) is computed over exactly this executable surface, so what the
+ * operator approves is byte-for-byte what they saw.
  */
 export interface ProjectConfig {
-  mcpServers: { name: string; transport: 'stdio' | 'http' | 'sse'; hasSecrets: boolean }[]
+  mcpServers: {
+    name: string
+    transport: 'stdio' | 'http' | 'sse'
+    hasSecrets: boolean
+    /** What actually runs / is contacted: the stdio command+args, or the http/sse URL. Not a secret. */
+    command?: string
+  }[]
   /** Hook event names present in .claude/settings*.json (e.g. ["PreToolUse","PostToolUse"]). */
   hooks: string[]
+  /** The actual hook COMMANDS that would run, per event — the executable surface the operator approves. */
+  hookCommands: { event: string; command: string }[]
   /** Whether .claude/settings*.json defines a permissions allow/deny policy. */
   hasPermissions: boolean
   memoryFiles: { name: string; bytes: number }[]
@@ -524,7 +541,7 @@ export function readProjectConfig(projectPath: string, warnings: string[] = []):
         const env = def.env as Record<string, unknown> | undefined
         const headers = def.headers as Record<string, unknown> | undefined
         const hasSecrets = !!(env && Object.keys(env).length) || !!(headers && Object.keys(headers).length)
-        mcpServers.push({ name, transport, hasSecrets })
+        mcpServers.push({ name, transport, hasSecrets, command: mcpCommandString(def, transport) })
       }
     } else {
       warnings.push('malformed .mcp.json')
@@ -532,6 +549,7 @@ export function readProjectConfig(projectPath: string, warnings: string[] = []):
   }
   // Hooks + permissions live in .claude/settings.json, overridden by settings.local.json.
   const hookEvents = new Set<string>()
+  const hookCommands: ProjectConfig['hookCommands'] = []
   let hasPermissions = false
   for (const rel of ['.claude/settings.json', '.claude/settings.local.json']) {
     const p = path.join(projectPath, rel.replace('/', path.sep))
@@ -545,7 +563,18 @@ export function readProjectConfig(projectPath: string, warnings: string[] = []):
     const hooks = s.hooks as Record<string, unknown> | undefined
     if (hooks && typeof hooks === 'object') {
       for (const [event, entries] of Object.entries(hooks)) {
-        if (Array.isArray(entries) && entries.length) hookEvents.add(event)
+        if (!Array.isArray(entries) || !entries.length) continue
+        hookEvents.add(event)
+        // Shape: hooks[Event] = [{ matcher?, hooks: [{ type:'command', command }] }]. Surface every
+        // command string so the operator sees the actual code, not just "a PreToolUse hook exists".
+        for (const matcher of entries) {
+          const inner = (matcher as { hooks?: unknown })?.hooks
+          if (!Array.isArray(inner)) continue
+          for (const h of inner) {
+            const cmd = (h as { command?: unknown })?.command
+            if (typeof cmd === 'string' && cmd.trim()) hookCommands.push({ event, command: cmd.trim() })
+          }
+        }
       }
     }
     const perms = s.permissions as Record<string, unknown> | undefined
@@ -560,7 +589,41 @@ export function readProjectConfig(projectPath: string, warnings: string[] = []):
       /* absent */
     }
   }
-  return { mcpServers, hooks: [...hookEvents], hasPermissions, memoryFiles, sources }
+  return { mcpServers, hooks: [...hookEvents], hookCommands, hasPermissions, memoryFiles, sources }
+}
+
+/** The human-readable, non-secret "what runs" string for an MCP server def: stdio `command args…`, or
+ *  the http/sse URL. Used for BOTH the consent display and the trust fingerprint. */
+function mcpCommandString(def: Record<string, unknown>, transport: 'stdio' | 'http' | 'sse'): string | undefined {
+  if (transport === 'http' || transport === 'sse') {
+    return typeof def.url === 'string' ? def.url : undefined
+  }
+  const command = typeof def.command === 'string' ? def.command : undefined
+  if (!command) return undefined
+  const args = Array.isArray(def.args) ? def.args.filter((a): a is string => typeof a === 'string') : []
+  return [command, ...args].join(' ')
+}
+
+/**
+ * A stable content fingerprint of a project's EXECUTABLE config — the MCP commands/urls and the hook
+ * commands, nothing else. Trust is keyed on THIS, not on the folder path, which is the whole point:
+ *   - MOVE the same repo to a new directory → identical executable content → same fingerprint → the
+ *     operator's approval survives.
+ *   - SWAP a different repo into the same path (or EDIT .mcp.json / a hook after approval) → different
+ *     content → different fingerprint → approval no longer matches, so the gate re-denies until the
+ *     operator approves what is now there. Approval binds to what was seen, never to a location.
+ * Secret values (env/headers) are deliberately excluded — they are not shown and do not themselves
+ * execute; the command they are handed to is the code, and that IS fingerprinted. `null` when there is
+ * no executable config at all (nothing to gate).
+ */
+export function fingerprintProjectConfig(config: ProjectConfig): string | null {
+  const mcp = config.mcpServers
+    .map((s) => ({ name: s.name, transport: s.transport, command: s.command ?? '' }))
+    .sort((a, b) => a.name.localeCompare(b.name))
+  const hooks = [...config.hookCommands].sort((a, b) => (a.event + a.command).localeCompare(b.event + b.command))
+  if (!mcp.length && !hooks.length) return null // nothing executable → nothing to trust/gate
+  const canonical = JSON.stringify({ mcp, hooks })
+  return crypto.createHash('sha256').update(canonical).digest('hex')
 }
 
 /**

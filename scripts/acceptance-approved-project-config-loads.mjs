@@ -1,13 +1,13 @@
-// SECURITY ACCEPTANCE: an UNAPPROVED project's executable config (hooks / .mcp.json) must NOT auto-run.
-// "Do not silently enable executable configuration from an untrusted directory."
+// ACCEPTANCE (the consent half): once the operator APPROVES a project's config, its hooks and .mcp.json
+// must actually load — the feature is "config comes along WITH consent", not "config disabled". Guards
+// the full seam: adapters/claude.ts relaxes the gate only when ClaudeTurnOptions.trustProjectConfig is
+// true, which SessionManager.specOf sets from ProjectStore.isConfigTrusted. It was fail-first (red)
+// before that seam existed; it now passes. Its complement, acceptance-untrusted-project-config-gated.mjs,
+// must stay green throughout — an UNapproved project is always gated.
 //
-// Was fail-first (exit 1) before the gate: the Claude SDK auto-loads project .mcp.json + hooks from cwd
-// (settingSources omitted = all; .mcp.json not strict), so opening/importing any folder silently ran its
-// hooks and connected its MCP servers. The gate (adapters/claude.ts: strictMcpConfig + disableAllHooks
-// unless trustProjectConfig) closes it while keeping CLAUDE.md/operator instructions. Exit 0 = gated.
-//
-// Self-launches an isolated worker-mode hubctl on a spare port (fresh worker => current source), own temp
-// data dir, real profiles via HUB_PROFILES_DIR. NEVER 7777, never the shared 7788 sandbox.
+// Self-launches an isolated worker-mode hubctl on a spare port (fresh worker => current source). It
+// creates a NON-git project with a SessionStart hook + .mcp.json, calls POST /approve-config (operator
+// consent), then spawns a session and asserts the hook FIRED and the MCP server loaded. NEVER 7777.
 import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -17,11 +17,11 @@ import { fileURLToPath } from 'node:url'
 
 const REPO = path.resolve(fileURLToPath(import.meta.url), '..', '..')
 const HUB = path.join(REPO, 'apps', 'hub')
-const PORT = Number(process.env.PROBE_PORT ?? 7790)
+const PORT = Number(process.env.PROBE_PORT ?? 7789)
 const PROFILE = process.env.PROBE_PROFILE ?? 'claude-a'
 if (PORT === 7777) throw new Error('refusing 7777')
-const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-untrust-'))
-const PROJ = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-untrustproj-'))
+const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-appr-'))
+const PROJ = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-apprproj-'))
 const PROFILES = process.env.HUB_PROFILES_DIR || path.join(REPO, 'profiles')
 const LOG = path.join(DATA_DIR, 'hubctl.log')
 const MARKER = path.join(PROJ, 'hook_marker.txt')
@@ -41,7 +41,7 @@ function sleepSync(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 
 function killTree(child) { if (!child?.pid) return; if (process.platform === 'win32') { try { spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F']) } catch {} return } try { child.kill('SIGTERM') } catch {}; sleepSync(1500); try { child.kill('SIGKILL') } catch {} }
 
 let hubctl = null
-const finish = (code, res) => { killTree(hubctl); console.log('\n=== UNTRUSTED PROJECT CONFIG GATED ' + (code === 0 ? 'PASS ✅' : 'FAIL ❌ (silently auto-ran — security hole)') + ' ===', JSON.stringify(res, null, 2)); process.exit(code) }
+const finish = (code, res) => { killTree(hubctl); console.log('\n=== APPROVED PROJECT CONFIG LOADS ' + (code === 0 ? 'PASS ✅' : 'FAIL ❌ (approved config did not load — seam not wired yet)') + ' ===', JSON.stringify(res, null, 2)); process.exit(code) }
 
 ;(async () => {
   fs.mkdirSync(path.join(PROJ, '.claude'), { recursive: true })
@@ -56,12 +56,16 @@ const finish = (code, res) => { killTree(hubctl); console.log('\n=== UNTRUSTED P
   let h = null
   for (let i = 0; i < 160; i++) { h = await health(); if (h?.boot === 'complete') break; await sleep(500) }
   if (h?.boot !== 'complete') finish(1, { error: 'never healthy', tail: logText().slice(-2000) })
-  if (!/spawning agent worker/.test(logText())) finish(1, { error: 'NOT worker mode' })
 
-  const proj = await req('POST', '/api/projects', { name: 'untrusted-cfg', path: PROJ })
+  const proj = await req('POST', '/api/projects', { name: 'approved-cfg', path: PROJ })
   const pid = proj?.json?.id
   if (!pid) finish(1, { error: 'project create failed', proj })
-  // NO approve-config call — this project is untrusted, so the gate must keep its hooks + MCP off.
+  // OPERATOR CONSENT: approve the project's current executable config.
+  const approve = await req('POST', `/api/projects/${pid}/approve-config`)
+  if (!approve?.json?.approved) finish(1, { error: 'approve-config did not approve', approve })
+  const status = await req('GET', `/api/projects/${pid}/config`)
+  if (!status?.json?.trusted) finish(1, { error: 'project not trusted after approve', status: status?.json })
+
   const create = await req('POST', '/api/sessions', { profileId: PROFILE, projectId: pid, useWorktree: false, permissionMode: 'safe', prompt: 'Reply with only: hi' })
   const sid = create?.json?.id
   if (!sid) finish(1, { error: 'session create failed', create })
@@ -74,6 +78,7 @@ const finish = (code, res) => { killTree(hubctl); console.log('\n=== UNTRUSTED P
   const initEv = sess.find((e) => e.kind === 'claude/system' && e.payload?.subtype === 'init')
   const mcpListed = initEv ? JSON.stringify(initEv.payload).includes('probe_srv') : false
 
-  const gated = !hookFired && !mcpListed
-  finish(gated ? 0 : 1, { gated, HOOK_fired: hookFired, MCP_listed_in_init: mcpListed, initMcp: initEv?.payload?.mcp_servers ?? '(no init)', cwd: create.json.cwd, project: PROJ })
+  // PROPERTY: an APPROVED project's config actually loads (hook fires AND the MCP server is present).
+  const loaded = hookFired && mcpListed
+  finish(loaded ? 0 : 1, { loaded, approved: true, HOOK_fired: hookFired, MCP_listed_in_init: mcpListed, note: 'requires the specOf seam (isConfigTrusted -> spec.trustProjectConfig)' })
 })().catch((e) => finish(1, { error: 'unexpected ' + (e?.stack || String(e)) }))

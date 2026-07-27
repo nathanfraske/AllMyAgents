@@ -17,6 +17,7 @@ import { pickFolder } from './native.js'
 import { computeStats } from './stats.js'
 import { buildFleet, probeHubHealth } from './fleet.js'
 import { startLogin, awaitLogin, credentialsExist } from './loginLauncher.js'
+import { readProjectConfig, fingerprintProjectConfig } from './importScan.js'
 import { setClaudeConnectorPolicy } from './profiles.js'
 import { asFileWriteDiffDensity } from './types.js'
 import type { DangerFlags, HubEvent, HubPrefs, Profile, Provider } from './types.js'
@@ -546,6 +547,62 @@ export function startServer(opts: ServerOptions): http.Server {
           : []
         const result = await sessions.importChats(project.id, project.path, ids)
         json(res, result)
+        return
+      }
+      // A project's EXECUTABLE config (MCP servers + hooks) and whether it is currently approved to run.
+      // Read-only; surfaces the actual commands (not just names) so the operator can decide, and reports
+      // `trusted` by comparing the on-disk fingerprint to the approved one (so an edited/swapped config
+      // reads untrusted even if it was approved before). This is the "show what's being imported" surface.
+      const configMatch = /^\/api\/projects\/([^/]+)\/config$/.exec(url.pathname)
+      if (method === 'GET' && configMatch) {
+        const project = projects.get(configMatch[1] as string)
+        if (!project) {
+          json(res, { error: `unknown project: ${configMatch[1]}` }, 404)
+          return
+        }
+        const config = readProjectConfig(project.path)
+        const fingerprint = fingerprintProjectConfig(config)
+        json(res, {
+          config,
+          fingerprint,
+          hasExecutableConfig: fingerprint !== null,
+          approvedFingerprint: projects.approvedFingerprint(project.id) ?? null,
+          trusted: projects.isConfigTrusted(project.id),
+        })
+        return
+      }
+      // Operator APPROVES a project's current executable config (the authenticated operator action IS the
+      // consent — no gate here, mirroring /api/restart). Pins the approval to the config's content
+      // fingerprint, so it survives a move but breaks on a swap/edit. Journaled for audit with the exact
+      // commands approved. Until this is called, adapters/claude.ts gates the project's MCP + hooks.
+      const approveMatch = /^\/api\/projects\/([^/]+)\/approve-config$/.exec(url.pathname)
+      if (method === 'POST' && approveMatch) {
+        const project = projects.get(approveMatch[1] as string)
+        if (!project) {
+          json(res, { error: `unknown project: ${approveMatch[1]}` }, 404)
+          return
+        }
+        const config = readProjectConfig(project.path)
+        const fingerprint = projects.approveConfig(project.id)
+        journal.append(null, 'project/config-approved', {
+          projectId: project.id,
+          fingerprint,
+          mcpServers: config.mcpServers.map((s) => ({ name: s.name, command: s.command })),
+          hookCommands: config.hookCommands,
+        })
+        json(res, { approved: fingerprint !== null, fingerprint, config })
+        return
+      }
+      const revokeConfigMatch = /^\/api\/projects\/([^/]+)\/revoke-config$/.exec(url.pathname)
+      if (method === 'POST' && revokeConfigMatch) {
+        const project = projects.get(revokeConfigMatch[1] as string)
+        if (!project) {
+          json(res, { error: `unknown project: ${revokeConfigMatch[1]}` }, 404)
+          return
+        }
+        projects.revokeConfig(project.id)
+        journal.append(null, 'project/config-revoked', { projectId: project.id })
+        json(res, { ok: true })
         return
       }
       // Operator profile + scoped instructions, materialized into each agent at spawn.

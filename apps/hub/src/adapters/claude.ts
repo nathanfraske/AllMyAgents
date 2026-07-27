@@ -27,7 +27,12 @@ export interface ClaudeTurnOptions {
   model?: string
   permissionMode?: 'safe' | 'edits' | 'full'
   effort?: string
-  /** True only when the operator approved this project's executable MCP/hook config. */
+  /**
+   * Whether the operator has approved THIS project's own executable config (`.mcp.json` servers +
+   * `.claude/settings.json` hooks). Default/undefined = NOT approved → the safe-default gate below stops
+   * the vendor from loading them. Set true only by the hub, from the per-project trust store
+   * (projects.ts isConfigTrusted), threaded through specOf — see the gate in `send`.
+   */
   trustProjectConfig?: boolean
 }
 
@@ -186,6 +191,25 @@ export class ClaudeDriver {
         this.canUseTool!(toolName, input, context)
     }
     if (this.mcpServers) options.mcpServers = this.mcpServers
+    // SAFE DEFAULT — do not silently execute a project's own configuration. A project's `.mcp.json`
+    // servers and `.claude/settings.json` hooks are executable configuration from a directory we did not
+    // write; the SDK would otherwise load BOTH from cwd by default (settingSources omitted = all sources;
+    // `.mcp.json` not strict), so merely opening or importing a repo would run its hooks (arbitrary code)
+    // and connect its MCP servers with no operator consent. Unless the operator has approved THIS
+    // project's config, keep the vendor from loading either:
+    //   - strictMcpConfig ignores project/user `.mcp.json` (our OWN mcpServers above are explicitly
+    //     passed, not read from disk, so `allmyagents` still loads — the gate never touches it);
+    //   - managedSettings.disableAllHooks stops file-defined hooks from executing.
+    // settingSources is deliberately left at its default so CLAUDE.md — the operator-instruction layer
+    // (instructions.ts) — keeps loading. Approval is per-project and content-pinned (projects.ts), so a
+    // moved repo stays approved and a swapped/edited one re-gates.
+    if (!turnOptions.trustProjectConfig) {
+      options.strictMcpConfig = true
+      // disableAllHooks goes in the BASE `settings` layer, not `managedSettings`: the latter is filtered
+      // "restrictive-only" and silently drops any key not on its allowlist (disableAllHooks is not on it),
+      // so a managedSettings.disableAllHooks is ignored and project hooks still fire — verified.
+      options.settings = { disableAllHooks: true }
+    }
     // A string prompt selects the SDK's one-shot mode, where control requests and additional input are
     // unsupported. Its AsyncIterable form selects streaming I/O. The stream stays open until this turn's
     // result so `steer()` can append a priority:'next' user message at Claude Code's next tool boundary.

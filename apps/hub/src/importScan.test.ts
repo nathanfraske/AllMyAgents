@@ -181,13 +181,17 @@ describe('readProjectConfig (values-free surfacing of MCP / hooks / memory)', ()
     fs.writeFileSync(path.join(dir, 'CLAUDE.md'), 'project memory')
   })
   afterAll(() => fs.rmSync(dir, { recursive: true, force: true }))
-  it('lists MCP servers with transport + hasSecrets (never the values), hooks, permissions, memory', () => {
+  it('surfaces MCP transport + the COMMAND that runs (never the secret values), hooks + hook commands, permissions, memory', () => {
     const cfg = readProjectConfig(dir)
+    // The command/url IS surfaced (it is the executable surface the operator approves — "runs `npx …`"),
+    // but the secret env/header VALUES are NOT, only hasSecrets.
     expect(cfg.mcpServers).toEqual([
-      { name: 'github', transport: 'stdio', hasSecrets: true },
-      { name: 'remote', transport: 'http', hasSecrets: false },
+      { name: 'github', transport: 'stdio', hasSecrets: true, command: 'npx -y server-github' },
+      { name: 'remote', transport: 'http', hasSecrets: false, command: 'https://example.com/mcp' },
     ])
     expect(cfg.hooks).toEqual(['PreToolUse'])
+    // The actual hook command must be shown — "a PreToolUse hook exists" is not a decision anyone can make.
+    expect(cfg.hookCommands).toEqual([{ event: 'PreToolUse', command: 'echo' }])
     expect(cfg.hasPermissions).toBe(true)
     expect(cfg.memoryFiles).toEqual([{ name: 'CLAUDE.md', bytes: fs.statSync(path.join(dir, 'CLAUDE.md')).size }])
     expect(cfg.sources).toContain('.mcp.json')
@@ -199,6 +203,7 @@ describe('readProjectConfig (values-free surfacing of MCP / hooks / memory)', ()
     const cfg = readProjectConfig(bare)
     expect(cfg.mcpServers).toEqual([])
     expect(cfg.hooks).toEqual([])
+    expect(cfg.hookCommands).toEqual([])
     expect(cfg.memoryFiles).toEqual([])
     fs.rmSync(bare, { recursive: true, force: true })
   })

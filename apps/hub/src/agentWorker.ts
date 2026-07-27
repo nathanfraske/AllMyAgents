@@ -353,6 +353,10 @@ export class AgentWorker {
         model: spec.model,
         permissionMode: spec.permissionMode,
         effort: spec.effort,
+        // Per-project config trust (the sessions.ts seam): specOf sets spec.trustProjectConfig from the
+        // ProjectStore. Read defensively so this consumer compiles ahead of the field being added to
+        // WorkerSessionSpec; undefined => untrusted => the driver's safe-default gate engages.
+        trustProjectConfig: (spec as { trustProjectConfig?: boolean }).trustProjectConfig,
       })
       this.emitTurnCompleted(spec.sessionId, driver.sessionId)
     } catch (err) {
