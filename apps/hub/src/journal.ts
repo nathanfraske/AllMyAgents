@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events'
 import fs from 'node:fs'
 import path from 'node:path'
 import Database from 'better-sqlite3'
+import { planCompletedTurnHistory, type JournalHistoryRow } from './journalHistory.js'
 import { redactedJson } from './redact.js'
 import type { ApprovalStatus, HubEvent } from './types.js'
 
@@ -27,18 +28,44 @@ export const JOURNAL_CONDENSE_GRACE_MS = 60 * 60 * 1000
 export const JOURNAL_CONDENSE_INTERVAL_MS = 5 * 60 * 1000
 export const JOURNAL_CONDENSE_MAX_COMMAND_DELTAS = 5_000
 export const JOURNAL_CONDENSE_MAX_DIFF_SNAPSHOTS = 25
+// Full low-level turn detail remains available for a month. Past that point the transcript keeps exact
+// operator/assistant prose, while tool/reasoning machinery becomes one visibly-labelled rollup card.
+export const JOURNAL_HISTORY_GRACE_MS = 30 * 24 * 60 * 60 * 1000
+export const JOURNAL_HISTORY_RETENTION_MS = 5 * 365 * 24 * 60 * 60 * 1000
+// A month-off machine at the measured ~50 completed turns/day catches up in roughly 80 minutes at one
+// 100-turn batch every five minutes, while each turn still commits in its own short writer transaction.
+export const JOURNAL_HISTORY_MAX_TURNS = 100
+export const JOURNAL_HISTORY_MAX_EXPIRED_TURNS = 100
+export const JOURNAL_HISTORY_MAX_SOURCE_ROWS = 10_000
+export const JOURNAL_HISTORY_MAX_SOURCE_BYTES = 128 * 1024 * 1024
+export const JOURNAL_HISTORY_TOOL_TEXT_CHARS = 2_000
+export const JOURNAL_HISTORY_ROLLUP_CHARS = 32_000
 
 export type JournalCondenseOptions = {
   nowMs?: number
   graceMs?: number
   maxCommandOutputDeltas?: number
   maxDiffSnapshots?: number
+  historyGraceMs?: number
+  historyRetentionMs?: number
+  maxHistoryTurns?: number
+  maxExpiredHistoryTurns?: number
+  maxHistorySourceRows?: number
+  maxHistorySourceBytes?: number
+  historyToolTextChars?: number
+  historyRollupChars?: number
 }
 
 export type JournalCondenseResult = {
   commandOutputDeltasDeleted: number
   diffSnapshotsDeleted: number
   cursorCheckpointsWritten: number
+  historyTurnsRolledUp: number
+  historyTurnsDeferred: number
+  historyTurnsExpired: number
+  historyRowsDeleted: number
+  historyPayloadBytesSelected: number
+  historyPayloadBytesWritten: number
 }
 
 export class Journal extends EventEmitter {
@@ -215,7 +242,7 @@ export class Journal extends EventEmitter {
   }
 
   /**
-   * Condense the two measured Codex firehoses after their authoritative terminal records are old enough.
+   * Condense the two measured Codex firehoses, then project old completed turns into bounded history.
    *
    * `commandExecution/outputDelta` is deleted only when the same session/thread/turn/item has an old
    * commandExecution `item/completed`, whose `aggregatedOutput` is the final replacement. Cumulative
@@ -227,21 +254,38 @@ export class Journal extends EventEmitter {
    * multi-second hub stall. Production invokes it in a one-shot child process as a second defense, keeping
    * JSON scans off the hub event loop and bounding the SQLite writer-lock/WAL burst.
    *
-   * This intentionally does NOT VACUUM. SQLite will reuse the freed pages, stopping this firehose from
-   * growing the file, but shrinking an existing DB is a separate operator maintenance action: full VACUUM
-   * takes an exclusive rewrite plus roughly one database of free disk, while changing an existing DB to
-   * auto_vacuum=INCREMENTAL itself requires that same one-time full VACUUM.
+   * This intentionally does NOT VACUUM. SQLite will reuse the pages freed by both stages, stopping retained
+   * history from growing the file after its window reaches steady state, but shrinking an existing DB is a
+   * separate operator maintenance action: full VACUUM takes an exclusive rewrite plus roughly one database
+   * of free disk, while changing an existing DB to auto_vacuum=INCREMENTAL itself requires that same one-time
+   * full VACUUM.
    */
   condenseCompletedCodex(options: JournalCondenseOptions = {}): JournalCondenseResult {
     const nowMs = options.nowMs ?? Date.now()
     const graceMs = options.graceMs ?? JOURNAL_CONDENSE_GRACE_MS
     const maxCommandOutputDeltas = options.maxCommandOutputDeltas ?? JOURNAL_CONDENSE_MAX_COMMAND_DELTAS
     const maxDiffSnapshots = options.maxDiffSnapshots ?? JOURNAL_CONDENSE_MAX_DIFF_SNAPSHOTS
+    const historyGraceMs = options.historyGraceMs ?? JOURNAL_HISTORY_GRACE_MS
+    const historyRetentionMs = options.historyRetentionMs ?? JOURNAL_HISTORY_RETENTION_MS
+    const maxHistoryTurns = options.maxHistoryTurns ?? JOURNAL_HISTORY_MAX_TURNS
+    const maxExpiredHistoryTurns = options.maxExpiredHistoryTurns ?? JOURNAL_HISTORY_MAX_EXPIRED_TURNS
+    const maxHistorySourceRows = options.maxHistorySourceRows ?? JOURNAL_HISTORY_MAX_SOURCE_ROWS
+    const maxHistorySourceBytes = options.maxHistorySourceBytes ?? JOURNAL_HISTORY_MAX_SOURCE_BYTES
+    const historyToolTextChars = options.historyToolTextChars ?? JOURNAL_HISTORY_TOOL_TEXT_CHARS
+    const historyRollupChars = options.historyRollupChars ?? JOURNAL_HISTORY_ROLLUP_CHARS
     for (const [name, value] of [
       ['nowMs', nowMs],
       ['graceMs', graceMs],
       ['maxCommandOutputDeltas', maxCommandOutputDeltas],
       ['maxDiffSnapshots', maxDiffSnapshots],
+      ['historyGraceMs', historyGraceMs],
+      ['historyRetentionMs', historyRetentionMs],
+      ['maxHistoryTurns', maxHistoryTurns],
+      ['maxExpiredHistoryTurns', maxExpiredHistoryTurns],
+      ['maxHistorySourceRows', maxHistorySourceRows],
+      ['maxHistorySourceBytes', maxHistorySourceBytes],
+      ['historyToolTextChars', historyToolTextChars],
+      ['historyRollupChars', historyRollupChars],
     ] as const) {
       if (!Number.isFinite(value) || value < 0) throw new Error(`${name} must be a finite non-negative number`)
     }
@@ -414,44 +458,473 @@ export class Journal extends EventEmitter {
     }
     selectCandidates()
 
-    const applyDeletes = this.db.transaction((): JournalCondenseResult => {
-      // worker_cursors makes the new reader independent of event retention. A rollback can still launch the
-      // old MAX(wseq)-from-events reader, though, so if a selected transient row is the current anchor, first
-      // replace it with a tiny checkpoint carrying the same wseq. The advance trigger atomically points the
-      // table at this new row; both old and new binaries then retain the exact cursor across the DELETE.
-      //
-      // This internal marker is inserted by the maintenance child and intentionally is not EventEmitter-
-      // emitted to live panes. It has no UI state; replay/polling may see and ignore it like any unknown kind.
-      const cursorCheckpointsWritten = this.db
-        .prepare(
-          `INSERT INTO events (ts, session, kind, payload, wseq)
-           SELECT ?, cursor.session, ?, ?, cursor.wseq
-           FROM worker_cursors AS cursor
-           JOIN journal_condense_delete AS selected ON selected.seq = cursor.event_seq
-           JOIN events AS existing ON existing.seq = selected.seq`
-        )
-        .run(
+    const applyDeletes = this.db.transaction(
+      (): Pick<
+        JournalCondenseResult,
+        'commandOutputDeltasDeleted' | 'diffSnapshotsDeleted' | 'cursorCheckpointsWritten'
+      > => {
+        // worker_cursors makes the new reader independent of event retention. A rollback can still launch the
+        // old MAX(wseq)-from-events reader, though, so if a selected transient row is the current anchor, first
+        // replace it with a tiny checkpoint carrying the same wseq. The advance trigger atomically points the
+        // table at this new row; both old and new binaries then retain the exact cursor across the DELETE.
+        //
+        // This internal marker is inserted by the maintenance child and intentionally is not EventEmitter-
+        // emitted to live panes. It has no UI state; replay/polling may see and ignore it like any unknown kind.
+        const cursorCheckpointsWritten = this.db
+          .prepare(
+            `INSERT INTO events (ts, session, kind, payload, wseq)
+             SELECT ?, cursor.session, ?, ?, cursor.wseq
+             FROM worker_cursors AS cursor
+             JOIN journal_condense_delete AS selected ON selected.seq = cursor.event_seq
+             JOIN events AS existing ON existing.seq = selected.seq`
+          )
+          .run(
+            now,
+            WSEQ_CHECKPOINT_KIND,
+            JSON.stringify({ reason: 'journal condensation replaced a transient wseq anchor' })
+          ).changes
+        const commandOutputDeltasDeleted = this.db
+          .prepare(
+            `DELETE FROM events
+             WHERE kind = 'codex/item/commandExecution/outputDelta'
+               AND seq IN (SELECT seq FROM journal_condense_delete)`
+          )
+          .run().changes
+        const diffSnapshotsDeleted = this.db
+          .prepare(
+            `DELETE FROM events
+             WHERE kind = 'codex/turn/diff/updated'
+               AND seq IN (SELECT seq FROM journal_condense_delete)`
+          )
+          .run().changes
+        return { commandOutputDeltasDeleted, diffSnapshotsDeleted, cursorCheckpointsWritten }
+      }
+    )
+    const transient = applyDeletes.immediate()
+    const history = this.rollupCompletedHistory({
+      nowMs,
+      historyGraceMs,
+      historyRetentionMs,
+      maxHistoryTurns: Math.floor(maxHistoryTurns),
+      maxExpiredHistoryTurns: Math.floor(maxExpiredHistoryTurns),
+      maxHistorySourceRows: Math.floor(maxHistorySourceRows),
+      maxHistorySourceBytes: Math.floor(maxHistorySourceBytes),
+      historyToolTextChars: Math.floor(historyToolTextChars),
+      historyRollupChars: Math.floor(historyRollupChars),
+    })
+    return {
+      ...transient,
+      ...history,
+      cursorCheckpointsWritten: transient.cursorCheckpointsWritten + history.cursorCheckpointsWritten,
+    }
+  }
+
+  /**
+   * Roll old, terminal-bounded turns into a durable transcript rather than retaining their protocol
+   * machinery forever.
+   *
+   * This deliberately remains in `events`. Hub-native history is still reconstructed solely by
+   * Journal.replay(), and a previous hub binary may be launched during rollback. Moving canonical history
+   * into a new table today would make it invisible to both readers. Instead the rollup uses event shapes
+   * every shipped client already understands: exact session/input + assistant prose remains in place, and
+   * old tool/reasoning detail is represented by one `codex/item/completed` commandExecution card whose
+   * command says "history rollup; no command executed".
+   *
+   * Candidate parsing happens before the write transaction. The transaction re-checks every updated
+   * payload, writes any required rollback-compatible wseq checkpoint, deletes the selected rows, reuses one
+   * deleted seq for the rollup, and records the terminal as done. A crash exposes either the old turn or the
+   * complete rollup, never half of each.
+   */
+  private rollupCompletedHistory(options: {
+    nowMs: number
+    historyGraceMs: number
+    historyRetentionMs: number
+    maxHistoryTurns: number
+    maxExpiredHistoryTurns: number
+    maxHistorySourceRows: number
+    maxHistorySourceBytes: number
+    historyToolTextChars: number
+    historyRollupChars: number
+  }): Omit<JournalCondenseResult, 'commandOutputDeltasDeleted' | 'diffSnapshotsDeleted'> {
+    const empty = {
+      cursorCheckpointsWritten: 0,
+      historyTurnsRolledUp: 0,
+      historyTurnsDeferred: 0,
+      historyTurnsExpired: 0,
+      historyRowsDeleted: 0,
+      historyPayloadBytesSelected: 0,
+      historyPayloadBytesWritten: 0,
+    }
+    if (options.maxHistoryTurns === 0 && options.maxExpiredHistoryTurns === 0) return empty
+
+    const cutoff = new Date(options.nowMs - options.historyGraceMs).toISOString()
+    const now = new Date(options.nowMs).toISOString()
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS journal_turn_rollups (
+        terminal_seq INTEGER PRIMARY KEY,
+        session TEXT NOT NULL,
+        terminal_ts TEXT NOT NULL,
+        terminal_kind TEXT NOT NULL,
+        rollup_seq INTEGER,
+        rows_deleted INTEGER NOT NULL,
+        payload_bytes_selected INTEGER NOT NULL,
+        payload_bytes_written INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        expired INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_journal_turn_rollups_expiry
+        ON journal_turn_rollups (expired, terminal_ts, terminal_seq);
+      CREATE TABLE IF NOT EXISTS journal_history_boundaries (
+        session TEXT PRIMARY KEY,
+        marker_seq INTEGER NOT NULL UNIQUE,
+        first_ts TEXT NOT NULL,
+        last_ts TEXT NOT NULL,
+        turns INTEGER NOT NULL,
+        rows_deleted INTEGER NOT NULL,
+        payload_bytes_deleted INTEGER NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_events_history_terminals
+        ON events (ts, seq) WHERE kind IN ('claude/result', 'codex/turn/completed');
+      CREATE INDEX IF NOT EXISTS idx_events_history_terminal_session
+        ON events (session, seq) WHERE kind IN ('claude/result', 'codex/turn/completed');
+
+      CREATE TEMP TABLE IF NOT EXISTS journal_history_delete (
+        seq INTEGER PRIMARY KEY
+      );
+    `)
+
+    const terminals = this.db
+      .prepare(
+        `SELECT event.seq, event.ts, event.session, event.kind
+         FROM events AS event
+         LEFT JOIN journal_turn_rollups AS done ON done.terminal_seq = event.seq
+         WHERE event.session IS NOT NULL
+           AND event.kind IN ('claude/result', 'codex/turn/completed')
+           AND event.ts <= ?
+           AND done.terminal_seq IS NULL
+         ORDER BY event.seq
+         LIMIT ?`
+      )
+      .all(cutoff, options.maxHistoryTurns) as Array<{
+      seq: number
+      ts: string
+      session: string
+      kind: string
+    }>
+
+    const result = { ...empty }
+    const previousTerminalStmt = this.db.prepare(
+      `SELECT MAX(seq) AS seq
+       FROM events
+       WHERE session = ? AND seq < ? AND kind IN ('claude/result', 'codex/turn/completed')`
+    )
+    const turnRowsStmt = this.db.prepare(
+      `SELECT seq, ts, session, kind, payload, wseq
+       FROM events
+       WHERE session = ? AND seq > ? AND seq <= ?
+       ORDER BY seq`
+    )
+    const turnSizeStmt = this.db.prepare(
+      `SELECT COUNT(*) AS rows, COALESCE(SUM(length(CAST(payload AS BLOB))), 0) AS bytes
+       FROM events
+       WHERE session = ? AND seq > ? AND seq <= ?`
+    )
+    const currentStateRowsStmt = this.db.prepare(
+      `SELECT MAX(seq) AS seq
+       FROM events
+       WHERE session = ? AND kind IN ('codex/thread/tokenUsage/updated', 'session/tokens')
+       GROUP BY kind`
+    )
+    const clearDeleteStmt = this.db.prepare('DELETE FROM journal_history_delete')
+    const selectDeleteStmt = this.db.prepare('INSERT OR IGNORE INTO journal_history_delete (seq) VALUES (?)')
+    const updatePayloadStmt = this.db.prepare('UPDATE events SET payload = ? WHERE seq = ? AND payload = ?')
+    const deleteRowsStmt = this.db.prepare(
+      'DELETE FROM events WHERE seq IN (SELECT seq FROM journal_history_delete)'
+    )
+    const insertRollupStmt = this.db.prepare(
+      'INSERT INTO events (seq, ts, session, kind, payload, wseq) VALUES (?, ?, ?, ?, ?, NULL)'
+    )
+    const recordRollupStmt = this.db.prepare(
+      `INSERT INTO journal_turn_rollups (
+         terminal_seq, session, terminal_ts, terminal_kind, rollup_seq, rows_deleted,
+         payload_bytes_selected, payload_bytes_written, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    const checkpointStmt = this.db.prepare(
+      `INSERT INTO events (ts, session, kind, payload, wseq)
+       SELECT ?, cursor.session, ?, ?, cursor.wseq
+       FROM worker_cursors AS cursor
+       JOIN journal_history_delete AS selected ON selected.seq = cursor.event_seq
+       JOIN events AS existing ON existing.seq = selected.seq`
+    )
+
+    const applyPlan = this.db.transaction(
+      (
+        terminal: { seq: number; ts: string; session: string; kind: string },
+        plan: ReturnType<typeof planCompletedTurnHistory>
+      ) => {
+        clearDeleteStmt.run()
+        for (const seq of plan.deleteSeqs) selectDeleteStmt.run(seq)
+
+        const cursorCheckpointsWritten = checkpointStmt.run(
           now,
           WSEQ_CHECKPOINT_KIND,
-          JSON.stringify({ reason: 'journal condensation replaced a transient wseq anchor' })
+          JSON.stringify({ reason: 'journal history rollup replaced a current transient wseq anchor' })
         ).changes
-      const commandOutputDeltasDeleted = this.db
-        .prepare(
-          `DELETE FROM events
-           WHERE kind = 'codex/item/commandExecution/outputDelta'
-             AND seq IN (SELECT seq FROM journal_condense_delete)`
+
+        // An event payload is immutable outside maintenance. Checking the old bytes turns an unexpected
+        // second writer/schema migration into a full transaction rollback rather than overwriting it.
+        for (const update of plan.updates) {
+          const changed = updatePayloadStmt.run(update.payload, update.seq, update.expectedPayload).changes
+          if (changed !== 1) throw new Error(`journal history row ${update.seq} changed while planning rollup`)
+        }
+
+        const rowsDeleted = deleteRowsStmt.run().changes
+        if (rowsDeleted !== plan.deleteSeqs.length) {
+          throw new Error(
+            `journal history rollup selected ${plan.deleteSeqs.length} row(s) but deleted ${rowsDeleted}`
+          )
+        }
+        if (plan.rollup) {
+          insertRollupStmt.run(
+            plan.rollup.seq,
+            plan.rollup.ts,
+            terminal.session,
+            'codex/item/completed',
+            plan.rollup.payload
+          )
+        }
+        recordRollupStmt.run(
+          terminal.seq,
+          terminal.session,
+          terminal.ts,
+          terminal.kind,
+          plan.rollup?.seq ?? null,
+          rowsDeleted,
+          plan.payloadBytesSelected,
+          plan.payloadBytesWritten,
+          now
         )
-        .run().changes
-      const diffSnapshotsDeleted = this.db
-        .prepare(
-          `DELETE FROM events
-           WHERE kind = 'codex/turn/diff/updated'
-             AND seq IN (SELECT seq FROM journal_condense_delete)`
-        )
-        .run().changes
-      return { commandOutputDeltasDeleted, diffSnapshotsDeleted, cursorCheckpointsWritten }
-    })
-    return applyDeletes.immediate()
+        return { cursorCheckpointsWritten, rowsDeleted }
+      }
+    )
+
+    for (const terminal of terminals) {
+      const previous = previousTerminalStmt.get(terminal.session, terminal.seq) as { seq: number | null }
+      const size = turnSizeStmt.get(terminal.session, previous.seq ?? 0, terminal.seq) as {
+        rows: number
+        bytes: number
+      }
+      // A machine can return after maintenance was absent for months. Do not let the first child turn one
+      // enormous, delta-heavy turn into an unbounded synchronous parse + DELETE: the earlier capped
+      // transient sweep chips away at it first, and a later interval rolls it once it fits this envelope.
+      if (size.rows > options.maxHistorySourceRows || size.bytes > options.maxHistorySourceBytes) {
+        result.historyTurnsDeferred += 1
+        continue
+      }
+      const rows = turnRowsStmt.all(terminal.session, previous.seq ?? 0, terminal.seq) as JournalHistoryRow[]
+      const protectedSeqs = new Set(
+        (currentStateRowsStmt.all(terminal.session) as Array<{ seq: number }>).map((row) => row.seq)
+      )
+      const plan = planCompletedTurnHistory(rows, terminal.seq, terminal.kind, {
+        maxToolTextChars: options.historyToolTextChars,
+        maxRollupChars: options.historyRollupChars,
+        protectedSeqs,
+      })
+      const applied = applyPlan.immediate(terminal, plan)
+      result.historyTurnsRolledUp += 1
+      result.historyRowsDeleted += applied.rowsDeleted
+      result.cursorCheckpointsWritten += applied.cursorCheckpointsWritten
+      result.historyPayloadBytesSelected += plan.payloadBytesSelected
+      result.historyPayloadBytesWritten += plan.payloadBytesWritten
+    }
+
+    if (options.maxExpiredHistoryTurns === 0) return result
+
+    // Exact prose has a multi-year horizon, not an infinite one. Once that horizon passes, consolidate
+    // every expired turn for a session into ONE boundary card. The marker is deliberately another
+    // commandExecution shape, because every shipped client renders it as a tool card without changing
+    // session status or pretending the operator/assistant authored it. Its command and body both say that
+    // no command ran and exact detail is unavailable.
+    const expiryCutoff = new Date(options.nowMs - options.historyRetentionMs).toISOString()
+    const expiryCandidates = this.db
+      .prepare(
+        `SELECT terminal_seq, session, terminal_ts, terminal_kind
+         FROM journal_turn_rollups
+         WHERE expired = 0 AND terminal_ts <= ?
+         ORDER BY terminal_seq
+         LIMIT ?`
+      )
+      .all(expiryCutoff, options.maxExpiredHistoryTurns) as Array<{
+      terminal_seq: number
+      session: string
+      terminal_ts: string
+      terminal_kind: string
+    }>
+    const expiryRowsStmt = this.db.prepare(
+      `SELECT seq, ts, session, kind, payload, wseq
+         FROM events
+         WHERE session = ?
+           AND seq > ?
+           AND seq < ?
+           AND json_valid(payload)
+           AND kind IN (
+             'session/input',
+             'bus/sent',
+             'bus/delivered',
+             'memory/recalled',
+             'practice/wrote',
+             'practice/edited',
+             'claude/assistant',
+           'claude/user',
+           'claude/system',
+           'codex/item/completed',
+           'codex/item/agentMessage/delta'
+         )
+       ORDER BY seq`
+    )
+    const getBoundaryStmt = this.db.prepare(
+      `SELECT marker_seq, first_ts, last_ts, turns, rows_deleted, payload_bytes_deleted
+       FROM journal_history_boundaries
+       WHERE session = ?`
+    )
+    const getEventBySeqStmt = this.db.prepare(
+      'SELECT seq, ts, session, kind, payload, wseq FROM events WHERE seq = ?'
+    )
+    const upsertBoundaryStmt = this.db.prepare(
+      `INSERT INTO journal_history_boundaries (
+         session, marker_seq, first_ts, last_ts, turns, rows_deleted,
+         payload_bytes_deleted, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(session) DO UPDATE SET
+         marker_seq = excluded.marker_seq,
+         first_ts = excluded.first_ts,
+         last_ts = excluded.last_ts,
+         turns = excluded.turns,
+         rows_deleted = excluded.rows_deleted,
+         payload_bytes_deleted = excluded.payload_bytes_deleted,
+         updated_at = excluded.updated_at`
+    )
+    const markExpiredStmt = this.db.prepare(
+      'UPDATE journal_turn_rollups SET expired = 1 WHERE terminal_seq = ? AND expired = 0'
+    )
+
+    const expireTurn = this.db.transaction(
+      (
+        candidate: {
+          terminal_seq: number
+          session: string
+          terminal_ts: string
+          terminal_kind: string
+        },
+        rows: JournalHistoryRow[]
+      ) => {
+        const existing = getBoundaryStmt.get(candidate.session) as
+          | {
+              marker_seq: number
+              first_ts: string
+              last_ts: string
+              turns: number
+              rows_deleted: number
+              payload_bytes_deleted: number
+            }
+          | undefined
+        const existingMarker = existing
+          ? (getEventBySeqStmt.get(existing.marker_seq) as JournalHistoryRow | undefined)
+          : undefined
+        if (existing && !existingMarker) {
+          // The metadata and visible marker are one invariant. Do not silently advance/degrade if a manual
+          // DB repair removed only half; surface a maintenance error and leave the turn exact.
+          throw new Error(
+            `journal history boundary metadata for ${candidate.session} points to missing seq ${existing.marker_seq}`
+          )
+        }
+
+        clearDeleteStmt.run()
+        for (const row of rows) selectDeleteStmt.run(row.seq)
+        if (existingMarker) selectDeleteStmt.run(existingMarker.seq)
+
+        const markerSeq = rows[0]?.seq ?? existingMarker?.seq
+        const currentRowsDeleted = rows.length
+        const currentBytesDeleted = rows.reduce((sum, row) => sum + Buffer.byteLength(row.payload), 0)
+        const firstTs = existing?.first_ts ?? rows[0]?.ts ?? candidate.terminal_ts
+        const lastTs = candidate.terminal_ts
+        const turns = (existing?.turns ?? 0) + 1
+        const cumulativeRows = (existing?.rows_deleted ?? 0) + currentRowsDeleted
+        const cumulativeBytes = (existing?.payload_bytes_deleted ?? 0) + currentBytesDeleted
+        const boundaryPayload =
+          markerSeq == null
+            ? undefined
+            : makeHistoryBoundaryPayload({
+                session: candidate.session,
+                firstTs,
+                lastTs,
+                turns,
+                rowsDeleted: cumulativeRows,
+                payloadBytesDeleted: cumulativeBytes,
+              })
+
+        const cursorCheckpointsWritten = checkpointStmt.run(
+          now,
+          WSEQ_CHECKPOINT_KIND,
+          JSON.stringify({ reason: 'journal history retention replaced a current transcript wseq anchor' })
+        ).changes
+        const rowsDeleted = deleteRowsStmt.run().changes
+        const expectedDeletes = rows.length + (existingMarker ? 1 : 0)
+        if (rowsDeleted !== expectedDeletes) {
+          throw new Error(
+            `journal history expiry selected ${expectedDeletes} row(s) but deleted ${rowsDeleted}`
+          )
+        }
+        if (markerSeq != null && boundaryPayload) {
+          insertRollupStmt.run(
+            markerSeq,
+            rows[0]?.ts ?? existingMarker?.ts ?? candidate.terminal_ts,
+            candidate.session,
+            'codex/item/completed',
+            boundaryPayload
+          )
+          upsertBoundaryStmt.run(
+            candidate.session,
+            markerSeq,
+            firstTs,
+            lastTs,
+            turns,
+            cumulativeRows,
+            cumulativeBytes,
+            now
+          )
+        }
+        if (markExpiredStmt.run(candidate.terminal_seq).changes !== 1) {
+          throw new Error(`journal history terminal ${candidate.terminal_seq} changed while expiring`)
+        }
+        return {
+          cursorCheckpointsWritten,
+          rowsDeleted,
+          selectedBytes: currentBytesDeleted + (existingMarker ? Buffer.byteLength(existingMarker.payload) : 0),
+          writtenBytes: boundaryPayload ? Buffer.byteLength(boundaryPayload) : 0,
+        }
+      }
+    )
+
+    for (const candidate of expiryCandidates) {
+      const previous = previousTerminalStmt.get(candidate.session, candidate.terminal_seq) as {
+        seq: number | null
+      }
+      const rows = expiryRowsStmt.all(
+        candidate.session,
+        previous.seq ?? 0,
+        candidate.terminal_seq
+      ) as JournalHistoryRow[]
+      const applied = expireTurn.immediate(candidate, rows)
+      result.historyTurnsExpired += 1
+      result.historyRowsDeleted += applied.rowsDeleted
+      result.cursorCheckpointsWritten += applied.cursorCheckpointsWritten
+      result.historyPayloadBytesSelected += applied.selectedBytes
+      result.historyPayloadBytesWritten += applied.writtenBytes
+    }
+    return result
   }
 
   /**
@@ -546,19 +1019,31 @@ export class Journal extends EventEmitter {
    * single result set. `since()` alone caps at `pageSize` rows — a lone call silently drops the
    * tail; this drains until a short page proves the end is reached (H1).
    *
-   * This is a *synchronous* generator (better-sqlite3 reads are synchronous), so a caller can
-   * drain it and attach a live listener in the same tick with no intervening `await`. That is what
-   * lets the WS handler join replay→live with no gap and no duplicate: single-threaded JS means no
-   * `append()` can interleave between the final page read and `on('event', …)`.
+   * The pages share one SQLite read transaction. That was not needed while the journal was append-only,
+   * but history maintenance runs in ANOTHER process and can replace old rows between two page SELECTs.
+   * Without a snapshot one reconnect could get a hybrid: raw tool call on page N, its result deleted before
+   * page N+1, and only half the rollup. WAL lets the maintenance writer commit while this reader keeps its
+   * pre-commit snapshot.
+   *
+   * This is a *synchronous* generator (better-sqlite3 reads are synchronous), so a caller can drain it and
+   * attach a live listener in the same tick with no intervening `await`. That is what lets the WS handler
+   * join replay→live with no gap and no duplicate: single-threaded JS means no local `append()` can
+   * interleave between the final page read and `on('event', …)`.
    */
   *replay(seq: number, pageSize = 2000): Generator<HubEvent> {
-    let cursor = seq
-    for (;;) {
-      const batch = this.since(cursor, pageSize)
-      for (const event of batch) yield event
-      const last = batch[batch.length - 1]
-      if (batch.length < pageSize || !last) return
-      cursor = last.seq
+    const ownsSnapshot = !this.db.inTransaction
+    if (ownsSnapshot) this.db.exec('BEGIN DEFERRED')
+    try {
+      let cursor = seq
+      for (;;) {
+        const batch = this.since(cursor, pageSize)
+        for (const event of batch) yield event
+        const last = batch[batch.length - 1]
+        if (batch.length < pageSize || !last) return
+        cursor = last.seq
+      }
+    } finally {
+      if (ownsSnapshot && this.db.inTransaction) this.db.exec('COMMIT')
     }
   }
 }
@@ -576,4 +1061,35 @@ function parsePayload(raw: string, seq: number): unknown {
   } catch (err) {
     return { __unreadable: true, seq, reason: err instanceof Error ? err.message : String(err) }
   }
+}
+
+function makeHistoryBoundaryPayload(input: {
+  session: string
+  firstTs: string
+  lastTs: string
+  turns: number
+  rowsDeleted: number
+  payloadBytesDeleted: number
+}): string {
+  const bytes = new Intl.NumberFormat('en-US').format(input.payloadBytesDeleted)
+  const rows = new Intl.NumberFormat('en-US').format(input.rowsDeleted)
+  const turns = new Intl.NumberFormat('en-US').format(input.turns)
+  return JSON.stringify({
+    threadId: 'allmyagents-history',
+    turnId: `history-boundary:${input.session}`,
+    item: {
+      id: `history-boundary:${input.session}`,
+      type: 'commandExecution',
+      command: `AllMyAgents history boundary (${turns} completed turns; no command executed)`,
+      aggregatedOutput:
+        `AllMyAgents retained this visible boundary after the configured history horizon.\n` +
+        `The exact transcript detail is no longer available for ${turns} completed turns from ` +
+        `${input.firstTs} through ${input.lastTs}.\n` +
+        `${rows} old transcript rows (${bytes} payload bytes) were consolidated. ` +
+        `Session lifecycle, approval decisions, turn terminals, worker cursors, and reset markers remain durable.`,
+      status: 'completed',
+      exitCode: 0,
+    },
+    __allmyagentsHistoryBoundary: true,
+  })
 }

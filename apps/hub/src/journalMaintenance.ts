@@ -5,7 +5,9 @@
  * better-sqlite3 and JSON1 are synchronous, and the measured historical scan crosses hundreds of megabytes.
  * A periodic callback in index.ts would freeze HTTP/WS/worker ingestion while it scans. SQLite still has one
  * writer, so the Journal method also bounds each delete batch; this child keeps the longer read/JSON work off
- * the hub's JavaScript event loop.
+ * the hub's JavaScript event loop. The same pass now rolls old terminal-bounded turns into old-client-readable
+ * history cards. Keeping both stages here is important: after a month offline, the capped transient sweep gets
+ * first refusal and an oversized turn is deferred instead of the history stage issuing one giant DELETE.
  */
 import { Journal } from './journal.js'
 
