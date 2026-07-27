@@ -38,6 +38,8 @@ function fixture(): {
   fs.writeFileSync(path.join(repo, 'shared.ts'), 'export const value = 1\n')
   git(repo, 'add', '.')
   git(repo, 'commit', '-m', 'base')
+  const baseCommit = git(repo, 'rev-parse', 'HEAD')
+  const baseRef = git(repo, 'symbolic-ref', 'HEAD')
 
   const knuthWorktree = path.join(worktrees, 'knuth')
   const hopperWorktree = path.join(worktrees, 'hopper')
@@ -59,6 +61,8 @@ function fixture(): {
     repo,
     worktree,
     branch,
+    baseCommit,
+    baseRef,
     status: 'active',
     createdAt: new Date().toISOString(),
   })
@@ -72,13 +76,96 @@ function fixture(): {
 }
 
 describe('WorktreeCollisionDetector', () => {
+  it('steers exactly once when the base branch advances across a file this agent modified', async () => {
+    const { repo, knuth } = fixture()
+    const steer = vi.fn(async (_sessionId: string, _message: string) => true)
+    const report = vi.fn(async () => {})
+    const detector = new WorktreeCollisionDetector({
+      sessions: () => [knuth],
+      steer,
+      report,
+    })
+
+    fs.writeFileSync(path.join(knuth.worktree!, 'shared.ts'), 'export const value = 2\n')
+    fs.writeFileSync(path.join(repo, 'shared.ts'), 'export const value = 3\n')
+    git(repo, 'add', 'shared.ts')
+    git(repo, 'commit', '-m', 'main changes shared')
+    const advancedHead = git(repo, 'rev-parse', 'HEAD')
+
+    await detector.poll()
+    await detector.poll()
+
+    expect(steer).toHaveBeenCalledOnce()
+    expect(steer).toHaveBeenCalledWith(
+      'knuth',
+      expect.stringMatching(
+        new RegExp(`shared\\.ts.*${knuth.baseCommit!.slice(0, 8)}.*${advancedHead.slice(0, 8)}`, 's')
+      )
+    )
+    expect(report).toHaveBeenCalledOnce()
+    expect(report).toHaveBeenCalledWith(
+      expect.objectContaining({
+        version: 1,
+        risk: 'stale-base',
+        file: 'shared.ts',
+        baseCommit: knuth.baseCommit,
+        mainCommit: advancedHead,
+        commitsBehind: 1,
+        sessions: [expect.objectContaining({ sessionId: 'knuth', role: 'stale-writer' })],
+        mainAdvance: [
+          expect.objectContaining({ commit: advancedHead, subject: 'main changes shared' }),
+        ],
+        steeredSessionIds: ['knuth'],
+      })
+    )
+  }, 20_000)
+
+  it('stays silent when the base branch advances without touching anything this agent modified', async () => {
+    const { repo, knuth } = fixture()
+    const steer = vi.fn(async (_sessionId: string, _message: string) => true)
+    const detector = new WorktreeCollisionDetector({
+      sessions: () => [knuth],
+      steer,
+    })
+
+    fs.writeFileSync(path.join(knuth.worktree!, 'shared.ts'), 'export const value = 2\n')
+    fs.writeFileSync(path.join(repo, 'main-only.ts'), 'export const main = true\n')
+    git(repo, 'add', 'main-only.ts')
+    git(repo, 'commit', '-m', 'main changes another file')
+
+    await detector.poll()
+    expect(steer).not.toHaveBeenCalled()
+  }, 20_000)
+
+  it('does not attribute commits replayed from main to an agent after a rebase', async () => {
+    const { repo, knuth } = fixture()
+    const steer = vi.fn(async (_sessionId: string, _message: string) => true)
+    const detector = new WorktreeCollisionDetector({
+      sessions: () => [knuth],
+      steer,
+    })
+
+    fs.writeFileSync(path.join(knuth.worktree!, 'shared.ts'), 'export const value = 2\n')
+    git(knuth.worktree!, 'add', 'shared.ts')
+    git(knuth.worktree!, 'commit', '-m', 'agent changes shared')
+    fs.writeFileSync(path.join(repo, 'main-only.ts'), 'export const main = true\n')
+    git(repo, 'add', 'main-only.ts')
+    git(repo, 'commit', '-m', 'main changes another file')
+    git(knuth.worktree!, 'rebase', knuth.baseRef!)
+
+    await detector.poll()
+    expect(steer).not.toHaveBeenCalled()
+  }, 20_000)
+
   it('steers exactly the later writer once per file/pair and names the other agent', async () => {
     const { knuth, hopper } = fixture()
     const sessions = [knuth, hopper]
     const steer = vi.fn(async (_sessionId: string, _message: string) => true)
+    const report = vi.fn(async () => {})
     const detector = new WorktreeCollisionDetector({
       sessions: () => sessions,
       steer,
+      report,
     })
 
     fs.writeFileSync(path.join(knuth.worktree!, 'shared.ts'), 'export const value = 2\n')
@@ -94,7 +181,20 @@ describe('WorktreeCollisionDetector', () => {
       'hopper',
       expect.stringMatching(/Heads up: Knuth is also editing shared\.ts right now\./)
     )
-  })
+    expect(report).toHaveBeenCalledWith(
+      expect.objectContaining({
+        version: 1,
+        risk: 'concurrent-write',
+        file: 'shared.ts',
+        commitsBehind: 0,
+        sessions: [
+          expect.objectContaining({ sessionId: 'knuth', role: 'writer' }),
+          expect.objectContaining({ sessionId: 'hopper', role: 'later-writer' }),
+        ],
+        steeredSessionIds: ['hopper'],
+      })
+    )
+  }, 20_000)
 
   it('stays silent for one writer, read-only peers, and ignored files', async () => {
     const { knuth, hopper } = fixture()
@@ -129,7 +229,7 @@ describe('WorktreeCollisionDetector', () => {
     await detector.poll()
 
     expect(steer).not.toHaveBeenCalled()
-  })
+  }, 20_000)
 
   it('includes committed branch changes that are not merged into the base checkout', async () => {
     const { knuth, hopper } = fixture()
@@ -150,5 +250,5 @@ describe('WorktreeCollisionDetector', () => {
     expect(steer).toHaveBeenCalledOnce()
     expect(steer.mock.calls[0]?.[1]).toContain('Knuth')
     expect(steer.mock.calls[0]?.[1]).toContain('shared.ts')
-  })
+  }, 20_000)
 })

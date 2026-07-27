@@ -267,7 +267,13 @@ export class HubHttpError extends Error {
  */
 type HttpResult<T> = { ok: true; status: number; data: T } | { ok: false; status: number; error: string }
 
-async function request<T>(method: string, url: string, base: string, body?: unknown): Promise<HttpResult<T>> {
+async function request<T>(
+  method: string,
+  url: string,
+  base: string,
+  body?: unknown,
+  expectedStatuses: readonly number[] = []
+): Promise<HttpResult<T>> {
   const headers: Record<string, string> = { ...authHeaders() }
   if (method !== 'GET') headers['content-type'] = 'application/json'
   let res: Response
@@ -283,7 +289,7 @@ async function request<T>(method: string, url: string, base: string, body?: unkn
   } catch {
     return { ok: false, status: res.status, error: text.slice(0, 200) || `HTTP ${res.status}` }
   }
-  if (!res.ok) {
+  if (!res.ok && !expectedStatuses.includes(res.status)) {
     const bodyError =
       parsed && typeof parsed === 'object' && typeof (parsed as { error?: unknown }).error === 'string'
         ? (parsed as { error: string }).error
@@ -314,6 +320,18 @@ async function jget<T>(url: string, base: string = HUB_HTTP): Promise<T> {
 // rejected settings write looked accepted.
 async function jpost<T>(url: string, body?: unknown): Promise<T> {
   const r = await request<T>('POST', url, HUB_HTTP, body)
+  if (!r.ok) return { error: r.error } as T
+  return r.data
+}
+
+// Some POSTs use a non-2xx status as a deliberate, typed outcome rather than a transport failure. Keep
+// that exception explicit at the call site so ordinary 401/404/409 responses still collapse to {error}.
+async function jpostExpected<T>(
+  url: string,
+  body: unknown,
+  expectedStatuses: readonly number[]
+): Promise<T> {
+  const r = await request<T>('POST', url, HUB_HTTP, body, expectedStatuses)
   if (!r.ok) return { error: r.error } as T
   return r.data
 }
@@ -428,6 +446,21 @@ export interface DangerFlags {
   autoApproveRestart?: boolean
   enableClaudeConnectors?: boolean
   fullAccessAnyOrigin?: boolean
+}
+
+export interface WorktreeIntegrationCheck {
+  ok: boolean
+  disabled: boolean
+  baseCommit?: string
+  mainCommit?: string
+  baseRef?: string | null
+  commitsBehind?: number
+  diverged?: boolean
+  staleFiles?: Array<{
+    file: string
+    kind: 'uncommitted' | 'committed' | 'both'
+    commits: Array<{ commit: string; subject: string }>
+  }>
 }
 
 export interface BusMessage {
@@ -568,6 +601,13 @@ export const api = {
   /** Persist a per-chat model / thinking effort / service tier immediately (survives reload + restart). */
   setSettings: (id: string, patch: { model?: string; effort?: string; serviceTier?: string }) =>
     jpost<SessionRecord | ApiError>(`/api/sessions/${id}/settings`, patch),
+  /** Mandatory pre-push/pre-merge check; `ok:false` means main touched files this branch changes. */
+  checkIntegration: (id: string) =>
+    jpostExpected<WorktreeIntegrationCheck | ApiError>(
+      `/api/sessions/${id}/integration-check`,
+      {},
+      [409]
+    ),
   // Typed so a caller can tell an accepted decision (200 { ok:true }) from a 404/401/network failure
   // ({ error }) — the approval UI must NOT clear a pending prompt it never actually resolved.
   decide: (id: string, approve: boolean) => jpost<{ ok?: boolean; error?: string }>(`/api/approvals/${id}`, { approve }),

@@ -117,6 +117,31 @@ describe('transport (res.ok respected; errors are not data)', () => {
     const res = (await api.spawn({ profileId: 'p1' })) as { id?: string }
     expect(res.id).toBe('s1')
   })
+
+  it('integration check preserves the typed 409 gate result, including exact stale files and commits', async () => {
+    stubFetch(409, {
+      ok: false,
+      disabled: false,
+      baseCommit: 'base',
+      mainCommit: 'main',
+      baseRef: 'refs/heads/main',
+      commitsBehind: 2,
+      diverged: false,
+      staleFiles: [
+        {
+          file: 'apps/hub/src/sessions.ts',
+          kind: 'uncommitted',
+          commits: [{ commit: 'main', subject: 'change session lifecycle' }],
+        },
+      ],
+    })
+    const { api } = await loadApi()
+    await expect(api.checkIntegration('s1')).resolves.toMatchObject({
+      ok: false,
+      commitsBehind: 2,
+      staleFiles: [{ file: 'apps/hub/src/sessions.ts' }],
+    })
+  })
 })
 
 // The attachment upload contract (raw bytes, not JSON). A failed upload must SURFACE as { error } at the

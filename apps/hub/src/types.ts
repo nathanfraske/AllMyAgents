@@ -31,6 +31,10 @@ export interface SessionRecord {
   worktreeRequested?: boolean
   /** Human-readable reason a requested worktree was not created. Absent when intent and outcome agree. */
   worktreeFallbackReason?: string
+  /** Exact commit the isolated worktree branched from. Persisted so stale-base checks never have to guess. */
+  baseCommit?: string
+  /** Fully-qualified branch ref the base commit came from (for example refs/heads/main). */
+  baseRef?: string
   status: SessionStatus
   vendorSessionId?: string
   model?: string

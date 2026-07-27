@@ -1102,6 +1102,15 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, sessions.setSettings(settingsMatch[1] as string, patch))
         return
       }
+      // Mandatory synchronous gate for a Project Manager (or future push UI): do not begin an
+      // integration operation until this returns 200. A 409 names the exact stale files/commits; the
+      // check itself never rebases, merges, pushes, pauses, or otherwise touches the agent worktree.
+      const integrationCheckMatch = /^\/api\/sessions\/([^/]+)\/integration-check$/.exec(url.pathname)
+      if (method === 'POST' && integrationCheckMatch) {
+        const result = await sessions.checkWorktreeIntegration(integrationCheckMatch[1] as string)
+        json(res, result, result.ok ? 200 : 409)
+        return
+      }
       const steerMatch = /^\/api\/sessions\/([^/]+)\/steer$/.exec(url.pathname)
       if (method === 'POST' && steerMatch) {
         const body = await readBody(req)
