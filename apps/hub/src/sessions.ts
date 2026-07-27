@@ -14,6 +14,7 @@ import type { UsageMonitor } from './usage.js'
 import type { WorkspaceManager } from './workspace.js'
 import type {
   ClaudeLimitInfo,
+  ApprovalRecord,
   DelegatedAuthority,
   ManagerAgentType,
   Profile,
@@ -211,6 +212,7 @@ export class SessionManager {
     // Worker mode ⟺ NOT the in-process executor (the default/injected InProcessExecutor is flag-off; an
     // injected WorkerExecutor is worker mode). Used only to gate the re-attach path, never on a hot path.
     this.workerMode = !(this.executor instanceof InProcessExecutor)
+    this.approvals.setPendingListener((approval) => this.reportChildApproval(approval))
   }
 
   /**
@@ -241,6 +243,8 @@ export class SessionManager {
       managerSpawn: (managerSessionId, input) => this.managerSpawn(managerSessionId, input),
       managerSetChildAuthority: (managerSessionId, childSessionId, authorities, tools) =>
         this.managerSetChildAuthority(managerSessionId, childSessionId, authorities, tools),
+      managerDecideChildApproval: (managerSessionId, approvalId, approve) =>
+        this.decideChildApproval(managerSessionId, approvalId, approve),
       browser: (sessionId, operation, args) => this.browserExecute(sessionId, operation, args),
     }
   }
@@ -453,6 +457,10 @@ export class SessionManager {
         }
         return this.managerSetChildAuthority(a.managerSessionId, a.childSessionId, a.authorities, a.tools)
       }
+      case 'manager.decideChildApproval': {
+        const a = args as { managerSessionId: string; approvalId: string; approve: boolean }
+        return this.decideChildApproval(a.managerSessionId, a.approvalId, a.approve)
+      }
       case 'memory.write':
         return this.memory.write(args as Parameters<MemoryStore['write']>[0])
       case 'memory.search': {
@@ -614,6 +622,8 @@ export class SessionManager {
       spawnAgent: (managerSessionId, input) => this.managerSpawn(managerSessionId, input),
       setChildAuthority: (managerSessionId, childSessionId, authorities, tools) =>
         this.managerSetChildAuthority(managerSessionId, childSessionId, authorities, tools),
+      decideChildApproval: (managerSessionId, approvalId, approve) =>
+        this.decideChildApproval(managerSessionId, approvalId, approve),
       browser: (sessionId, operation, args) => this.browserExecute(sessionId, operation, args),
       memory: this.memory,
       practices: this.practices,
@@ -1269,6 +1279,7 @@ export class SessionManager {
       orientationBrief?: string
       operatorTask?: string
       standingInstructions?: string
+      canApproveChildren?: boolean
     },
     actor: 'operator' | 'agent'
   ): SessionRecord {
@@ -1338,6 +1349,9 @@ export class SessionManager {
         record.managerOrientationBrief = config.enabled && orientationBrief.trim() ? orientationBrief : undefined
         record.managerOperatorTask = config.enabled && operatorTask.trim() ? operatorTask : undefined
         record.managerStandingInstructions = config.enabled ? standingInstructions : undefined
+        record.managerCanApproveChildren = config.enabled
+          ? (config.canApproveChildren ?? record.managerCanApproveChildren ?? true)
+          : undefined
         this.instructions.set(
           `session:${record.id}`,
           config.enabled ? standingInstructions : '',
@@ -1392,6 +1406,7 @@ export class SessionManager {
           orientationBrief: record.managerOrientationBrief ?? '',
           operatorTask: record.managerOperatorTask ?? '',
           standingInstructions: record.managerStandingInstructions ?? '',
+          canApproveChildren: record.managerCanApproveChildren ?? false,
           by: 'operator',
           previousRole: previouslyManager,
           removedAuthorities: [...previousCeiling].filter((authority) => !ceiling.has(authority)),
@@ -1835,6 +1850,58 @@ export class SessionManager {
       return
     }
     this.deliverBus(manager.id)
+  }
+
+  private reportChildApproval(approval: ApprovalRecord): void {
+    const child = this.sessions.get(approval.sessionId)
+    if (!child?.parentSessionId) return
+    const relation = this.managerDirectChild(child.parentSessionId, child.id)
+    if (!relation || relation.manager.managerCanApproveChildren !== true) return
+    const manager = relation.manager
+    const label = child.title ?? identityOf(child).label
+    const toolName = delegableToolName(approval.kind, approval.payload)
+    const authority = delegatedGitAuthority(approval.kind, approval.payload)
+    const requested = authority ?? toolName ?? approval.kind
+    const body =
+      `${label} is waiting on approval ${approval.id} for ${requested}. ` +
+      'Inspect the request if needed, then call decide_child_approval. The hub will enforce your direct-child scope and grant ceiling.'
+    const messages = this.bus.post({
+      from: identityOf(child),
+      project: child.projectId ?? null,
+      to: { kind: 'session', id: manager.id },
+      subject: 'child approval pending',
+      body,
+      recipients: [manager.id],
+    })
+    this.journal.append(child.id, 'manager/child-approval-reported', {
+      managerSessionId: manager.id,
+      childSessionId: child.id,
+      approvalId: approval.id,
+      kind: approval.kind,
+      requested,
+    })
+    if (manager.status === 'active' || manager.status === 'starting') {
+      void this.executor
+        .steer(manager.id, body)
+        .then(() => {
+          this.markBusDelivered(manager.id, messages)
+          this.journal.append(child.id, 'manager/child-approval-steered', {
+            managerSessionId: manager.id,
+            childSessionId: child.id,
+            approvalId: approval.id,
+          })
+        })
+        .catch((error: unknown) => {
+          this.journal.append(child.id, 'manager/child-approval-steer-failed', {
+            managerSessionId: manager.id,
+            childSessionId: child.id,
+            approvalId: approval.id,
+            error: error instanceof Error ? error.message : String(error),
+          })
+        })
+      return
+    }
+    if (manager.status === 'idle') this.deliverBus(manager.id)
   }
 
   private profileOf(record: SessionRecord): Profile {
@@ -2675,6 +2742,65 @@ export class SessionManager {
    * for an unknown / self / stopped / cross-project target (fails closed, same scope as the bus).
    */
   /** Exact live state for direct children. Starting and active both count as running. */
+  private managerDirectChild(
+    managerSessionId: string,
+    childSessionId: string
+  ): { manager: SessionRecord; child: SessionRecord } | undefined {
+    const manager = this.sessions.get(managerSessionId)
+    if (!manager?.isProjectManager) return undefined
+    const child = this.sessions.get(childSessionId)
+    return child?.parentSessionId === manager.id ? { manager, child } : undefined
+  }
+
+  decideChildApproval(
+    managerSessionId: string,
+    approvalId: string,
+    approve: boolean
+  ): { ok: boolean; error?: string } {
+    const manager = this.sessions.get(managerSessionId)
+    if (!manager?.isProjectManager) {
+      return { ok: false, error: 'caller is not an operator-marked project manager' }
+    }
+    if (manager.managerCanApproveChildren !== true) {
+      return { ok: false, error: 'the operator disabled manager approval decisions' }
+    }
+    const approval = this.approvals.pending().find((candidate) => candidate.id === approvalId)
+    if (!approval) return { ok: false, error: 'approval is not pending' }
+    const relation = this.managerDirectChild(manager.id, approval.sessionId)
+    if (!relation) return { ok: false, error: 'approval does not belong to this manager’s direct child' }
+
+    let authority: DelegatedAuthority | undefined
+    let toolName: string | undefined
+    if (approve) {
+      authority = delegatedGitAuthority(approval.kind, approval.payload)
+      if (authority) {
+        if (!manager.managerDelegation?.includes(authority)) {
+          return { ok: false, error: `${authority} is outside the operator-granted manager ceiling` }
+        }
+      } else {
+        toolName = delegableToolName(approval.kind, approval.payload)
+        if (!toolName || !manager.managerAllowedTools?.includes(toolName)) {
+          return { ok: false, error: 'approval is outside the operator-granted manager tool ceiling' }
+        }
+      }
+    }
+
+    if (!this.approvals.resolve(approval.id, approve)) {
+      return { ok: false, error: 'approval is no longer pending' }
+    }
+    this.journal.append(manager.id, 'manager/child-approval-decided', {
+      managerSessionId: manager.id,
+      childSessionId: relation.child.id,
+      approvalId: approval.id,
+      decision: approve ? 'approved' : 'denied',
+      kind: approval.kind,
+      authority: authority ?? null,
+      toolName: toolName ?? null,
+      decidedAt: new Date().toISOString(),
+    })
+    return { ok: true }
+  }
+
   managerChildStatus(managerSessionId: string): { ok: boolean; summary?: string; error?: string } {
     const manager = this.sessions.get(managerSessionId)
     if (!manager?.isProjectManager) return { ok: false, error: 'caller is not an operator-marked project manager' }
@@ -2714,7 +2840,7 @@ export class SessionManager {
     }
     const view = options.view ?? 'summary'
     if (view !== 'summary') {
-      if (!caller.isProjectManager || t.parentSessionId !== caller.id) return { found: false }
+      if (!this.managerDirectChild(caller.id, t.id)) return { found: false }
       const activity = (): string => this.managerChildActivity(t)
       const transcript = (): string => {
         const page = this.journal.eventsForSession(t.id, options.afterSeq ?? 0)
@@ -3452,6 +3578,7 @@ function delegatedGitAuthority(kind: string, payload: unknown): DelegatedAuthori
     input?: { command?: unknown } | null
     command?: unknown
     cmd?: unknown
+    commandActions?: unknown
   } | null
   if (!p || p.matchedAskRule) return undefined
   if (kind === 'claude/tool') {
@@ -3463,7 +3590,15 @@ function delegatedGitAuthority(kind: string, payload: unknown): DelegatedAuthori
     return undefined
   }
 
-  const raw = p.input?.command ?? p.command ?? p.cmd
+  const actions = Array.isArray(p.commandActions) ? p.commandActions : undefined
+  const actionCommand =
+    actions?.length === 1 &&
+    actions[0] &&
+    typeof actions[0] === 'object' &&
+    typeof (actions[0] as { command?: unknown }).command === 'string'
+      ? (actions[0] as { command: string }).command
+      : undefined
+  const raw = actionCommand ?? p.input?.command ?? p.command ?? p.cmd
   let tokens: string[]
   if (Array.isArray(raw)) {
     if (!raw.length || raw.some((token) => typeof token !== 'string' || !token.trim())) return undefined

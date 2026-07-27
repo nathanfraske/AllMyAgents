@@ -99,6 +99,7 @@ export type RelayMethod =
   | 'manager.childStatus'
   | 'manager.spawn'
   | 'manager.setChildAuthority'
+  | 'manager.decideChildApproval'
   | 'memory.write'
   | 'memory.search'
   | 'memory.get'

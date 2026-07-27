@@ -69,6 +69,7 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
       'child_status',
       'spawn_agent',
       'set_child_authority',
+      'decide_child_approval',
       'memory_write',
       'memory_search',
       'memory_read',

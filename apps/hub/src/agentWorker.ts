@@ -152,6 +152,12 @@ export function buildWorkerAgentServices(deps: WorkerAgentServiceDeps): AgentSer
         authorities,
         tools,
       }) as Promise<{ ok: boolean; error?: string }>,
+    decideChildApproval: (managerSessionId, approvalId, approve) =>
+      deps.relayRpc('manager.decideChildApproval', {
+        managerSessionId,
+        approvalId,
+        approve,
+      }) as Promise<{ ok: boolean; error?: string }>,
     browser: (sessionId, operation, args) =>
       deps.relayRpc('browser.execute', { sessionId, operation, args }) as ReturnType<AgentServices['browser']>,
     memory: {

@@ -89,6 +89,8 @@ export interface SessionRecord {
   managerOperatorTask?: string
   /** Session-scoped operator instructions rematerialized into CLAUDE.md/AGENTS.md for every later turn. */
   managerStandingInstructions?: string
+  /** Operator grant allowing this manager to decide pending approvals for its own direct children. */
+  managerCanApproveChildren?: boolean
   /** Durable session lineage for sidebar nesting and hub-originated child reports. */
   parentSessionId?: string
   /** Authorities this child received from its manager, still subject to the manager's live ceiling. */
