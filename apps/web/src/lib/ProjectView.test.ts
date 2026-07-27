@@ -6,6 +6,7 @@ import type { ProjectInfo, SessionRecord, WorktreeProjectActivity } from './api'
 
 const apiMock = vi.hoisted(() => ({
   projectActivity: vi.fn(),
+  send: vi.fn(),
 }))
 
 vi.mock('./api', async (original) => {
@@ -41,6 +42,7 @@ function session(
     provider: id === 'reviewer' ? 'codex' : 'claude',
     projectId: project.id,
     cwd: `C:/worktrees/${id}`,
+    worktree: `C:/worktrees/${id}`,
     status,
     createdAt: now,
     ...extra,
@@ -95,6 +97,7 @@ const activity: WorktreeProjectActivity = {
 beforeEach(() => {
   localStorage.clear()
   apiMock.projectActivity.mockReset().mockResolvedValue(activity)
+  apiMock.send.mockReset().mockResolvedValue({ ok: true })
   const plan: ThreadItem = {
     key: 'plan',
     kind: 'tool',
@@ -128,10 +131,34 @@ beforeEach(() => {
       body: 'Please review the patch.',
     },
   }
+  const managerReply: ThreadItem = {
+    key: 'manager-reply',
+    kind: 'assistant',
+    ts: now,
+    text: 'I am coordinating the launch.',
+  }
+  const earlyManagerReply: ThreadItem = {
+    key: 'manager-early',
+    kind: 'assistant',
+    ts: now,
+    text: 'This is older manager history.',
+  }
+  const middleManagerReplies: ThreadItem[] = ['one', 'two'].map((suffix) => ({
+    key: `manager-middle-${suffix}`,
+    kind: 'assistant',
+    ts: now,
+    text: `Manager checkpoint ${suffix}.`,
+  }))
   store.projects = [project]
   const nameless = session('nameless', '', 'idle')
   store.sessions = {
-    manager: session('manager', 'Project manager', 'active', { isProjectManager: true }, [plan]),
+    manager: session(
+      'manager',
+      'Noether',
+      'active',
+      { isProjectManager: true, role: 'Project manager' },
+      [earlyManagerReply, ...middleManagerReplies, plan, managerReply],
+    ),
     worker: session('worker', 'Bose', 'idle', { parentSessionId: 'manager', role: 'Collision writer', lastTurnOk: true }, [sentTool, sent]),
     reviewer: session('reviewer', 'Reviewer', 'error', { lastTurnOk: false }),
     blocked: session('blocked', 'Blocked', 'idle'),
@@ -150,7 +177,7 @@ describe('ProjectView', () => {
     render(ProjectView, { props: { projectId: project.id } })
 
     expect(screen.getByRole('heading', { name: 'Alpha' })).toBeTruthy()
-    expect(screen.getByText('working')).toBeTruthy()
+    expect(screen.getAllByText('working').length).toBeGreaterThan(0)
     expect(screen.getByText('done')).toBeTruthy()
     expect(screen.getByText('failed')).toBeTruthy()
     expect(screen.getByText('blocked on approval')).toBeTruthy()
@@ -174,5 +201,109 @@ describe('ProjectView', () => {
 
     expect(store.selectedId).toBe('worker')
     expect(store.projectViewId).toBeNull()
+  })
+
+  it('switches between overview and the full manager conversation and remembers the choice', async () => {
+    const view = render(ProjectView, { props: { projectId: project.id } })
+
+    expect(screen.getByRole('button', { name: 'Overview' }).getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByText('I am coordinating the launch.')).toBeTruthy()
+    expect(screen.queryByText('This is older manager history.')).toBeNull()
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Manager' }))
+
+    expect(screen.getByRole('button', { name: 'Manager' }).getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByText('I am coordinating the launch.')).toBeTruthy()
+    expect(screen.getByText('This is older manager history.')).toBeTruthy()
+    expect(screen.queryByRole('heading', { name: 'Team' })).toBeNull()
+
+    view.unmount()
+    render(ProjectView, { props: { projectId: project.id } })
+    expect(screen.getByRole('button', { name: 'Manager' }).getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByText('I am coordinating the launch.')).toBeTruthy()
+  })
+
+  it('shows a live bounded manager transcript peek and remembers when it is collapsed', async () => {
+    const view = render(ProjectView, { props: { projectId: project.id } })
+
+    const hide = screen.getByRole('button', { name: 'Hide recent manager activity' })
+    expect(hide.getAttribute('aria-expanded')).toBe('true')
+    expect(screen.getByText('I am coordinating the launch.')).toBeTruthy()
+    expect(screen.queryByText('This is older manager history.')).toBeNull()
+
+    const next: ThreadItem = {
+      key: 'manager-live',
+      kind: 'assistant',
+      ts: '2026-07-27T12:01:00.000Z',
+      text: 'A live manager update arrived.',
+    }
+    store.sessions = {
+      ...store.sessions,
+      manager: {
+        ...store.sessions.manager!,
+        items: [...store.sessions.manager!.items, next],
+      },
+    }
+    await waitFor(() => expect(screen.getByText('A live manager update arrived.')).toBeTruthy())
+
+    await fireEvent.click(hide)
+    expect(screen.queryByText('A live manager update arrived.')).toBeNull()
+    expect(screen.getByRole('textbox', { name: 'Message Noether' })).toBeTruthy()
+
+    view.unmount()
+    render(ProjectView, { props: { projectId: project.id } })
+    const show = screen.getByRole('button', { name: 'Show recent manager activity' })
+    expect(show.getAttribute('aria-expanded')).toBe('false')
+    expect(screen.queryByText('A live manager update arrived.')).toBeNull()
+  })
+
+  it('steers the named manager from the overview through the shared composer', async () => {
+    render(ProjectView, { props: { projectId: project.id } })
+
+    const composer = screen.getByRole('textbox', { name: 'Message Noether' })
+    await fireEvent.input(composer, { target: { value: 'Check the release risk now.' } })
+    await fireEvent.keyDown(composer, { key: 'Enter' })
+
+    await waitFor(() =>
+      expect(apiMock.send).toHaveBeenCalledWith(
+        'manager',
+        'Check the release risk now.',
+        expect.objectContaining({ attachments: undefined }),
+      ),
+    )
+  })
+
+  it('does not show a manager view or overview composer for an independent team', () => {
+    store.sessions = Object.fromEntries(
+      Object.entries(store.sessions).filter(([id]) => id !== 'manager'),
+    )
+
+    render(ProjectView, { props: { projectId: project.id } })
+
+    expect(screen.queryByRole('button', { name: 'Manager' })).toBeNull()
+    expect(screen.queryByRole('textbox', { name: /Message/ })).toBeNull()
+  })
+
+  it('explains the worktree-only monitor once without calling direct-project work unavailable', async () => {
+    store.sessions.manager = {
+      ...store.sessions.manager!,
+      record: {
+        ...store.sessions.manager!.record,
+        cwd: project.path,
+        worktree: undefined,
+      },
+    }
+    apiMock.projectActivity.mockResolvedValue({
+      ...activity,
+      agents: activity.agents.filter((agent) => agent.sessionId !== 'manager'),
+    })
+
+    render(ProjectView, { props: { projectId: project.id } })
+
+    await waitFor(() => expect(apiMock.projectActivity).toHaveBeenCalled())
+    expect(screen.getAllByText(/direct-project agents are not tracked/i)).toHaveLength(1)
+    expect(screen.getByText('Works directly in the project')).toBeTruthy()
+    expect(screen.queryByText(/file monitor unavailable/i)).toBeNull()
+    expect(screen.queryByText(/file monitoring is unavailable/i)).toBeNull()
   })
 })

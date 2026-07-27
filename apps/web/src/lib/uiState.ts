@@ -32,6 +32,10 @@ const LAYOUT_KEY = 'allmyagents.ui.lastLayout'
 const FOLDERS_KEY = 'allmyagents.ui.collapsedFolders'
 /** Chats whose agent side panel is popped out — so it is still open after a reload or a hub restart. */
 const AGENT_PANELS_KEY = 'allmyagents.ui.openAgentPanels'
+const PROJECT_VIEW_MODES_KEY = 'allmyagents.ui.projectViewModes'
+const PROJECT_PEEK_KEY = 'allmyagents.ui.projectTranscriptPeek'
+
+export type ProjectViewMode = 'overview' | 'manager'
 
 function isStringMatrix(v: unknown): v is string[][] {
   return Array.isArray(v) && v.every((row) => Array.isArray(row) && row.every((x) => typeof x === 'string'))
@@ -94,6 +98,70 @@ export function saveCollapsedFolders(ids: string[]): void {
     localStorage.setItem(FOLDERS_KEY, JSON.stringify(ids))
   } catch {
     /* ignore */
+  }
+}
+
+// The project screen is a repeated working loop, not navigation history: remember whether each project
+// was last left on the operational overview or the manager conversation.
+export function loadProjectViewMode(projectId: string): ProjectViewMode {
+  try {
+    const raw = localStorage.getItem(PROJECT_VIEW_MODES_KEY)
+    if (!raw) return 'overview'
+    const value = JSON.parse(raw) as unknown
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return 'overview'
+    return (value as Record<string, unknown>)[projectId] === 'manager' ? 'manager' : 'overview'
+  } catch {
+    return 'overview'
+  }
+}
+
+export function saveProjectViewMode(projectId: string, mode: ProjectViewMode): void {
+  try {
+    const raw = localStorage.getItem(PROJECT_VIEW_MODES_KEY)
+    const parsed = raw ? (JSON.parse(raw) as unknown) : {}
+    const modes =
+      parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : {}
+    localStorage.setItem(PROJECT_VIEW_MODES_KEY, JSON.stringify({ ...modes, [projectId]: mode }))
+  } catch {
+    // A malformed old value must not prevent replacing it with valid state.
+    try {
+      localStorage.setItem(PROJECT_VIEW_MODES_KEY, JSON.stringify({ [projectId]: mode }))
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+export function loadProjectTranscriptPeek(projectId: string): boolean {
+  try {
+    const raw = localStorage.getItem(PROJECT_PEEK_KEY)
+    if (!raw) return true
+    const value = JSON.parse(raw) as unknown
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return true
+    // Open is the default. Only a deliberate persisted false collapses it.
+    return (value as Record<string, unknown>)[projectId] !== false
+  } catch {
+    return true
+  }
+}
+
+export function saveProjectTranscriptPeek(projectId: string, open: boolean): void {
+  try {
+    const raw = localStorage.getItem(PROJECT_PEEK_KEY)
+    const parsed = raw ? (JSON.parse(raw) as unknown) : {}
+    const states =
+      parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : {}
+    localStorage.setItem(PROJECT_PEEK_KEY, JSON.stringify({ ...states, [projectId]: open }))
+  } catch {
+    try {
+      localStorage.setItem(PROJECT_PEEK_KEY, JSON.stringify({ [projectId]: open }))
+    } catch {
+      /* ignore */
+    }
   }
 }
 
