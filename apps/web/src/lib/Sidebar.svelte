@@ -8,6 +8,7 @@
   import Usage from './Usage.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
   import Icon from './Icon.svelte'
+  import { unreadMailCount, unreadMailTitle } from './unreadMail'
   import ImportChats from './ImportChats.svelte'
   import { flip } from 'svelte/animate'
   import { cubicOut } from 'svelte/easing'
@@ -645,6 +646,7 @@
               {@const s = en.s}
               {@const st = store.status(s)}
               {@const pending = store.pendingBySession[s.record.id] ?? 0}
+              {@const unread = unreadMailCount(s.record.unreadFromTeammates)}
               <div class="row" class:sel={store.selectedId === s.record.id} class:dragging={isDragging('chat', s.record.id)} role="button" tabindex="0"
                 draggable={editingId !== s.record.id}
                 ondragstart={(e) => startChatDrag(e, g.id, s.record.id, en.railId)}
@@ -668,6 +670,7 @@
                   <span class="rlabel" class:glitch={glitching.has(s.record.id)} ondblclick={(e) => startRename(e, s)}>{label(s)}</span>
                 {/if}
                 {#if s.record.siteLabel}<span class="rbadge" title="on {s.record.siteLabel} (remote fleet machine)"><Icon name="server" size={9} /></span>{/if}
+                {#if unread > 0}<span class="mbadge" title={unreadMailTitle(unread)} aria-label={unreadMailTitle(unread)}><Icon name="mail" size={10} /><span class="tnum">{unread}</span></span>{/if}
                 {#if pending > 0}<span class="pbadge tnum">{pending}</span>{/if}
                 {#if warnOf(s, st)}
                   <span class="rwarn" title={warnTitle(st)} aria-label={warnTitle(st)}><Icon name="alert-triangle" size={12} /></span>
@@ -854,6 +857,10 @@
   .rdots i { width: 3px; height: 3px; border-radius: 50%; background: var(--accent); opacity: 0.4; }
   .rwarn { flex: none; display: inline-grid; place-items: center; color: var(--bad-text, #e5484d); }
   .pbadge { background: var(--warn); color: #111; border-radius: var(--r-pill); padding: 0 0.35rem; font-size: var(--text-2xs); font-weight: var(--fw-semibold); }
+  /* Unread teammate mail. Same pill family as .pbadge, but the envelope glyph (not colour) carries the
+     meaning — so it stays legible for anyone who can't distinguish the accent hue, and reads distinctly
+     from the warn approvals pill. Absent at zero (rendered only when unread > 0). */
+  .mbadge { flex: none; display: inline-flex; align-items: center; gap: 0.15rem; background: var(--accent); color: #fff; border-radius: var(--r-pill); padding: 0 0.3rem; font-size: var(--text-2xs); font-weight: var(--fw-semibold); }
   .ractions { display: none; gap: 0.15rem; }
   .row:hover .ractions { display: flex; }
   .row:hover .rtime, .row:hover .rdots, .row:hover .rwarn { display: none; }

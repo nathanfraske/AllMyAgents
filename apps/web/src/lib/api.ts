@@ -54,6 +54,15 @@ export interface SessionRecord {
   // Real last-turn time of an imported transcript — the sidebar shows/sorts by this, not import time.
   lastActivity?: string
   createdAt: string
+  /**
+   * Unread teammate (bus) messages queued for this session — undelivered mail the operator can't
+   * otherwise see. Set by the hub sessions API (Bose). OPTIONAL: an older hub (or before that change
+   * deploys) omits it, in which case the sidebar renders NO badge — never a zero/NaN. It reflects the
+   * hub's pending count, so it updates live as mail is delivered and does not guess delivery timing.
+   * NOTE: field name to be confirmed against Bose's exact shape; read via unreadMail.ts so a rename is
+   * a one-line change and a missing/misnamed field degrades to "no badge", not a crash.
+   */
+  unreadFromTeammates?: number
   // Fleet origin (CLIENT-INJECTED by the store's fleet merge — the hub never sends these). Set only
   // for a session pulled from a REMOTE fleet site; both `id` and `projectId` are namespaced
   // `${siteId}:${realId}`. Absent → this hub's own (local) session, shown unbadged as before.
