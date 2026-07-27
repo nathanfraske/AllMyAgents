@@ -1,10 +1,18 @@
 import crypto from 'node:crypto'
+import { fork, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
 import { ApprovalService } from './approvals.js'
-import { Journal } from './journal.js'
+import {
+  JOURNAL_CONDENSE_GRACE_MS,
+  JOURNAL_CONDENSE_INTERVAL_MS,
+  JOURNAL_CONDENSE_MAX_COMMAND_DELTAS,
+  JOURNAL_CONDENSE_MAX_DIFF_SNAPSHOTS,
+  Journal,
+  type JournalCondenseResult,
+} from './journal.js'
 import { ProjectStore } from './projects.js'
 import { scanProfiles, setClaudeConnectorPolicy } from './profiles.js'
 import { SessionManager } from './sessions.js'
@@ -46,7 +54,8 @@ try {
   /* no config yet — defaults apply (overage: block) */
 }
 
-const journal = new Journal(path.join(dataDir, 'hub.db'))
+const journalPath = path.join(dataDir, 'hub.db')
+const journal = new Journal(journalPath)
 // Each live WebSocket (pane / device / reconnect) attaches a journal 'event' listener, removed on
 // close — legitimately more than the EventEmitter default of 10 for a multi-pane/fleet hub. Raise
 // the cap so a healthy number of connections doesn't emit a spurious MaxListeners leak warning.
@@ -126,6 +135,101 @@ const bootPort = Number(process.env.HUB_PORT ?? 7777)
 // hubctl's override so an isolated harness promotes to its own port, not 7777. Unset → 7777 as before.
 const publicPort = supervised ? Number(process.env.HUB_FIXED_PORT ?? 7777) : bootPort
 const isGreen = supervised && bootPort === 0
+
+// --- Journal condensation ----------------------------------------------------------------------
+// The measured journal grew to 390 MB / 375k events in three days, mostly two superseded Codex streams.
+// Run maintenance only after this process owns the public role, and in a ONE-SHOT CHILD: better-sqlite3's
+// JSON scan is synchronous, so setInterval(() => journal.condense...) would freeze this hub's HTTP/WS and
+// worker ingestion. The Journal method bounds deletes as well, limiting the cross-process SQLite write lock
+// and WAL burst. A failure is logged and retried next interval; maintenance must never become a boot cause.
+type JournalMaintenanceMessage =
+  | { type: 'journal-condensed'; result: JournalCondenseResult }
+  | { type: 'journal-condense-error'; error: string }
+
+let journalMaintenanceTimer: NodeJS.Timeout | undefined
+let journalMaintenanceChild: ChildProcess | undefined
+
+function runJournalMaintenance(): void {
+  if (journalMaintenanceChild) return // a slow disk gets one job, never an accumulating process queue
+  try {
+    const sourceMode = import.meta.url.endsWith('.ts')
+    const entry = path.join(import.meta.dirname, sourceMode ? 'journalMaintenance.ts' : 'journalMaintenance.js')
+    // Source mode needs tsx. Resolve it against this package and pass an absolute URL: a bare `tsx/esm`
+    // depends on the desktop/process cwd, the same launch-path mistake that previously broke the MCP bridge.
+    const execArgv = sourceMode
+      ? ['--import', pathToFileURL(createRequire(import.meta.url).resolve('tsx/esm')).href]
+      : []
+    const child = fork(
+      entry,
+      [
+        journalPath,
+        String(JOURNAL_CONDENSE_GRACE_MS),
+        String(JOURNAL_CONDENSE_MAX_COMMAND_DELTAS),
+        String(JOURNAL_CONDENSE_MAX_DIFF_SNAPSHOTS),
+      ],
+      {
+        execArgv,
+        stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+      }
+    )
+    journalMaintenanceChild = child
+    let reportedFailure = false
+    const guard = setTimeout(() => {
+      reportedFailure = true
+      console.error('[journal] condensation exceeded one interval; terminating it so maintenance can retry')
+      child.kill()
+    }, JOURNAL_CONDENSE_INTERVAL_MS - 10_000)
+    guard.unref?.()
+    child.on('message', (raw: unknown) => {
+      const msg = raw as JournalMaintenanceMessage
+      if (msg?.type === 'journal-condense-error') {
+        reportedFailure = true
+        console.error(`[journal] condensation failed: ${msg.error}`)
+        return
+      }
+      if (msg?.type !== 'journal-condensed') return
+      const { commandOutputDeltasDeleted, diffSnapshotsDeleted, cursorCheckpointsWritten } = msg.result
+      if (commandOutputDeltasDeleted || diffSnapshotsDeleted || cursorCheckpointsWritten) {
+        console.log(
+          `[journal] condensed ${commandOutputDeltasDeleted} command deltas + ${diffSnapshotsDeleted} diff snapshots` +
+            (cursorCheckpointsWritten ? `; wrote ${cursorCheckpointsWritten} wseq checkpoint(s)` : '')
+        )
+      }
+    })
+    child.once('error', (error) => {
+      clearTimeout(guard)
+      reportedFailure = true
+      if (journalMaintenanceChild === child) journalMaintenanceChild = undefined
+      console.error(`[journal] could not launch condensation: ${error.message}`)
+    })
+    child.once('exit', (code, signal) => {
+      clearTimeout(guard)
+      if (journalMaintenanceChild === child) journalMaintenanceChild = undefined
+      if (code !== 0 && !reportedFailure) {
+        console.error(`[journal] condensation child exited ${signal ? `on ${signal}` : `with code ${String(code)}`}`)
+      }
+    })
+  } catch (error) {
+    console.error(`[journal] could not launch condensation: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+function startJournalMaintenance(): void {
+  if (journalMaintenanceTimer) return
+  journalMaintenanceTimer = setInterval(runJournalMaintenance, JOURNAL_CONDENSE_INTERVAL_MS)
+  journalMaintenanceTimer.unref?.()
+}
+
+function stopJournalMaintenance(): void {
+  if (journalMaintenanceTimer) clearInterval(journalMaintenanceTimer)
+  journalMaintenanceTimer = undefined
+  // Killing a one-shot child mid-transaction is safe: SQLite rolls it back. Do not leave an unsupervised
+  // maintenance process holding the DB after its parent has been asked to exit.
+  journalMaintenanceChild?.kill()
+  journalMaintenanceChild = undefined
+}
+// RestartController.retire() exits directly rather than going through shutdown(); cover that path too.
+process.once('exit', stopJournalMaintenance)
 
 // --- Codex agent-tool bridge (cross-vendor parity: give Codex the mcp__allmyagents__* tools) --------
 // The hub writes an `allmyagents` MCP server into each Codex profile's config.toml pointing at this
@@ -244,7 +348,10 @@ server.once('listening', () => {
     process.send({ type: 'ready', port: actualPort, restored: sessions.list().length, schemaVersion: SCHEMA_VERSION })
   }
   // Blue / standalone own the port at boot → advertise now. Green defers mesh to promote.
-  if (!isGreen) registerMesh()
+  if (!isGreen) {
+    registerMesh()
+    startJournalMaintenance()
+  }
 })
 
 // Under supervision, wire the restart handshake: the hub asks hubctl to flip; hubctl drives
@@ -261,6 +368,7 @@ if (supervised && process.send) {
     onPromoted: () => {
       usage.startPolling()
       registerMesh()
+      startJournalMaintenance()
     },
     // §8.4: drain() signals the worker to hold relays before blue's socket drops; abort() un-drains a
     // rolled-back flip. No-op in-process (the in-process executor implements no signalDraining), so the
@@ -293,6 +401,7 @@ let shuttingDown = false
 function shutdown(signal: string): void {
   if (shuttingDown) return
   shuttingDown = true
+  stopJournalMaintenance()
   const done = (): void => process.exit(0)
   // Cap the cleanup so a hung socket or child can't wedge shutdown.
   const guard = setTimeout(done, 2500)

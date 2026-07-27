@@ -85,6 +85,34 @@ jobs:
       - name: Bundle — stage the real hub payload (runs the audit for real)
         run: pnpm run hub:bundle
 
+      # 3. Prove the graph a USER actually gets works — not the one this repo develops against.
+      #
+      # The repo resolves dependencies with pnpm; the installed app runs plain `npm install` against the
+      # staged package.json + package-lock.json. Those two resolvers legitimately choose different
+      # transitive peers (observed: Anthropic SDK 0.115.0 under npm vs 0.114.0 under pnpm), so every test
+      # above can pass on a graph no user will ever run. That is the same shape as the bug this pinning
+      # work exists to fix — an untested dependency set reaching users — just one level down.
+      #
+      # So: install from the PAYLOAD exactly as first-run does, then import the two modules that are
+      # loaded EAGERLY at hub startup. Both fail during module linking, before the hub can report
+      # anything, which is why a broken one presents to a user as "the app just doesn't work".
+      - name: Bundle — the shipped npm graph installs and imports
+        shell: bash
+        run: |
+          set -euo pipefail
+          PAYLOAD="apps/desktop/src-tauri/hub-runtime/apps/hub"
+          test -f "$PAYLOAD/package-lock.json" || { echo "::error::no package-lock.json in the payload — the pin is cosmetic without it"; exit 1; }
+          WORK="$(mktemp -d)"
+          cp "$PAYLOAD/package.json" "$PAYLOAD/package-lock.json" "$WORK/"
+          ( cd "$WORK" && npm install --omit=dev --no-audit --no-fund --loglevel=error )
+          cd "$WORK" && node --input-type=module -e "
+            const sqlite = (await import('better-sqlite3')).default
+            const db = new sqlite(':memory:'); db.prepare('select 1 as x').get(); db.close()
+            const sdk = await import('@anthropic-ai/claude-agent-sdk')
+            if (typeof sdk.query !== 'function') throw new Error('claude-agent-sdk exports no query()')
+            console.log('shipped graph OK — native sqlite loaded, SDK imported')
+          "
+
   # ---------------------------------------------------------------------------------------------
   # Rust gate — the Tauri shell. Only on the two RELEASE targets: those are the platforms whose
   # binaries we ship, and the shell's platform branches (taskkill vs. POSIX process groups) only exist

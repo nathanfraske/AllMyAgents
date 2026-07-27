@@ -15,6 +15,32 @@ import type { ApprovalStatus, HubEvent } from './types.js'
  */
 export const WSEQ_RESET_KIND = 'session/wseq-reset'
 
+/**
+ * A tiny rollback-compatible replacement for a transient event that happened to carry the current worker
+ * cursor. New hubs read `worker_cursors`; an older binary still runs the historical reset-aware MAX(wseq)
+ * query, so condensation must leave one compact event-row anchor too. These markers are durable cursor
+ * metadata, not transcript, and are deliberately outside the two-kind condensation allowlist.
+ */
+export const WSEQ_CHECKPOINT_KIND = 'session/wseq-checkpoint'
+
+export const JOURNAL_CONDENSE_GRACE_MS = 60 * 60 * 1000
+export const JOURNAL_CONDENSE_INTERVAL_MS = 5 * 60 * 1000
+export const JOURNAL_CONDENSE_MAX_COMMAND_DELTAS = 5_000
+export const JOURNAL_CONDENSE_MAX_DIFF_SNAPSHOTS = 25
+
+export type JournalCondenseOptions = {
+  nowMs?: number
+  graceMs?: number
+  maxCommandOutputDeltas?: number
+  maxDiffSnapshots?: number
+}
+
+export type JournalCondenseResult = {
+  commandOutputDeltasDeleted: number
+  diffSnapshotsDeleted: number
+  cursorCheckpointsWritten: number
+}
+
 export class Journal extends EventEmitter {
   readonly db: Database.Database
   private readonly insertStmt: Database.Statement
@@ -50,18 +76,101 @@ export class Journal extends EventEmitter {
         if (!/duplicate column/i.test(e instanceof Error ? e.message : String(e))) throw e
       }
     }
+    // `MAX(wseq)` was originally derived from the event rows themselves. That made otherwise-safe
+    // condensation capable of moving the durable re-attach cursor BACKWARDS: delete the row carrying the
+    // maximum and a restarted hub asks the worker to replay it, duplicating already-journaled output.
+    //
+    // Keep the high-water mark in a separate durable table, maintained by DATABASE triggers rather than by
+    // appendWorker convention. The trigger matters during a blue-green flip: once the green creates it, an
+    // older blue sharing this DB also advances the cursor even though its JavaScript knows nothing about the
+    // table. A reset marker atomically rebases the row to zero. Condensation never deletes this table.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS worker_cursors (
+        session TEXT PRIMARY KEY,
+        wseq INTEGER NOT NULL,
+        event_seq INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS journal_migrations (
+        name TEXT PRIMARY KEY
+      );
+
+      CREATE TRIGGER IF NOT EXISTS events_worker_cursor_advance
+      AFTER INSERT ON events
+      WHEN NEW.session IS NOT NULL AND NEW.wseq IS NOT NULL
+      BEGIN
+        INSERT INTO worker_cursors (session, wseq, event_seq)
+        VALUES (NEW.session, NEW.wseq, NEW.seq)
+        ON CONFLICT(session) DO UPDATE SET
+          wseq = excluded.wseq,
+          event_seq = excluded.event_seq
+        WHERE excluded.wseq >= worker_cursors.wseq;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS events_worker_cursor_reset
+      AFTER INSERT ON events
+      WHEN NEW.session IS NOT NULL AND NEW.kind = '${WSEQ_RESET_KIND}'
+      BEGIN
+        INSERT INTO worker_cursors (session, wseq, event_seq)
+        VALUES (NEW.session, 0, NEW.seq)
+        ON CONFLICT(session) DO UPDATE SET
+          wseq = 0,
+          event_seq = excluded.event_seq;
+      END;
+    `)
+    // Additive migration for journals written before worker_cursors existed. Create the INSERT triggers
+    // first, then backfill with INSERT/UPSERT: if the briefly-concurrent blue writes while green migrates,
+    // its trigger-created row wins when newer and the backfill can only raise (never lower) that high-water.
+    // The latest reset bounds the window exactly as the old query did.
+    const backfillWorkerCursors = this.db.transaction(() => {
+      const done = this.db
+        .prepare("SELECT 1 FROM journal_migrations WHERE name = 'worker-cursors-v1'")
+        .get() as unknown
+      if (done) return
+      this.db.exec(`
+        INSERT INTO worker_cursors (session, wseq, event_seq)
+        SELECT session, wseq, seq
+        FROM (
+          WITH latest_reset AS (
+            SELECT session, MAX(seq) AS reset_seq
+            FROM events
+            WHERE session IS NOT NULL AND kind = '${WSEQ_RESET_KIND}'
+            GROUP BY session
+          )
+          SELECT
+            e.session,
+            e.wseq,
+            e.seq,
+            ROW_NUMBER() OVER (
+              PARTITION BY e.session
+              ORDER BY e.wseq DESC, e.seq DESC
+            ) AS rank
+          FROM events AS e
+          LEFT JOIN latest_reset AS reset ON reset.session = e.session
+          WHERE e.session IS NOT NULL
+            AND e.wseq IS NOT NULL
+            AND e.seq > COALESCE(reset.reset_seq, 0)
+        )
+        WHERE rank = 1
+        ON CONFLICT(session) DO UPDATE SET
+          wseq = excluded.wseq,
+          event_seq = excluded.event_seq
+        WHERE excluded.wseq > worker_cursors.wseq;
+
+        INSERT OR IGNORE INTO worker_cursors (session, wseq, event_seq)
+        SELECT session, 0, MAX(seq)
+        FROM events
+        WHERE session IS NOT NULL AND kind = '${WSEQ_RESET_KIND}'
+        GROUP BY session;
+
+        INSERT INTO journal_migrations (name) VALUES ('worker-cursors-v1');
+      `)
+    })
+    backfillWorkerCursors.immediate()
     this.insertStmt = this.db.prepare('INSERT INTO events (ts, session, kind, payload) VALUES (?, ?, ?, ?)')
     this.insertWorkerStmt = this.db.prepare('INSERT INTO events (ts, session, kind, payload, wseq) VALUES (?, ?, ?, ?, ?)')
-    // RESET-AWARE (docs/agent-worker-impl.md §7.1 — F1): the durable re-attach cursor is the highest wseq
-    // journaled for this session SINCE its latest WSEQ_RESET_KIND marker (COALESCE → 0 when there is none, so
-    // an unmarked/legacy DB counts every row exactly as before). A worker respawn restarts the session's wseq
-    // at 1; journaling a reset marker on the stale-sweep rebases this query so the old era's high wseq can no
-    // longer contaminate the successor's cursor and drop the fresh turn's events.
-    this.lastWseqStmt = this.db.prepare(
-      `SELECT MAX(wseq) AS m FROM events
-         WHERE session = ? AND wseq IS NOT NULL
-           AND seq > COALESCE((SELECT MAX(seq) FROM events WHERE session = ? AND kind = ?), 0)`
-    )
+    // This lookup is independent of condensable rows. The reset-aware legacy event query remains valid too
+    // because the sweep writes WSEQ_CHECKPOINT_KIND before removing its current event-row anchor.
+    this.lastWseqStmt = this.db.prepare('SELECT wseq AS m FROM worker_cursors WHERE session = ?')
     this.sinceStmt = this.db.prepare(
       'SELECT seq, ts, session, kind, payload FROM events WHERE seq > ? ORDER BY seq ASC LIMIT ?'
     )
@@ -101,8 +210,248 @@ export class Journal extends EventEmitter {
    *  (docs/agent-worker-impl.md §7.1). Reset-aware so a worker respawn (wseq restarts at 1) does not seed a
    *  stale, too-high cursor from the previous era's rows. */
   lastJournaledWseq(sessionId: string): number {
-    const row = this.lastWseqStmt.get(sessionId, sessionId, WSEQ_RESET_KIND) as { m: number | null } | undefined
+    const row = this.lastWseqStmt.get(sessionId) as { m: number | null } | undefined
     return row?.m ?? 0
+  }
+
+  /**
+   * Condense the two measured Codex firehoses after their authoritative terminal records are old enough.
+   *
+   * `commandExecution/outputDelta` is deleted only when the same session/thread/turn/item has an old
+   * commandExecution `item/completed`, whose `aggregatedOutput` is the final replacement. Cumulative
+   * `turn/diff/updated` snapshots wait for `turn/completed`; the newest snapshot remains because the
+   * terminal event does NOT contain the diff. Invalid JSON and incomplete correlations fail closed.
+   *
+   * The selected deletes are capped. better-sqlite3 is synchronous, and this method is also useful from
+   * tests/manual maintenance; an unbounded 300k-row DELETE would trade turn-completion latency for a random
+   * multi-second hub stall. Production invokes it in a one-shot child process as a second defense, keeping
+   * JSON scans off the hub event loop and bounding the SQLite writer-lock/WAL burst.
+   *
+   * This intentionally does NOT VACUUM. SQLite will reuse the freed pages, stopping this firehose from
+   * growing the file, but shrinking an existing DB is a separate operator maintenance action: full VACUUM
+   * takes an exclusive rewrite plus roughly one database of free disk, while changing an existing DB to
+   * auto_vacuum=INCREMENTAL itself requires that same one-time full VACUUM.
+   */
+  condenseCompletedCodex(options: JournalCondenseOptions = {}): JournalCondenseResult {
+    const nowMs = options.nowMs ?? Date.now()
+    const graceMs = options.graceMs ?? JOURNAL_CONDENSE_GRACE_MS
+    const maxCommandOutputDeltas = options.maxCommandOutputDeltas ?? JOURNAL_CONDENSE_MAX_COMMAND_DELTAS
+    const maxDiffSnapshots = options.maxDiffSnapshots ?? JOURNAL_CONDENSE_MAX_DIFF_SNAPSHOTS
+    for (const [name, value] of [
+      ['nowMs', nowMs],
+      ['graceMs', graceMs],
+      ['maxCommandOutputDeltas', maxCommandOutputDeltas],
+      ['maxDiffSnapshots', maxDiffSnapshots],
+    ] as const) {
+      if (!Number.isFinite(value) || value < 0) throw new Error(`${name} must be a finite non-negative number`)
+    }
+    const commandLimit = Math.floor(maxCommandOutputDeltas)
+    const diffLimit = Math.floor(maxDiffSnapshots)
+    const now = new Date(nowMs).toISOString()
+    const cutoff = new Date(nowMs - graceMs).toISOString()
+
+    // Built lazily by the maintenance child, after the hub is healthy. Creating an index over the operator's
+    // existing 375k-row journal at boot would turn a recoverability feature into a new deterministic boot
+    // dependency. The partial indexes cover only the four maintenance kinds; ordinary durable events pay no
+    // index write cost.
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_events_condense_command_completed
+        ON events (ts, seq) WHERE kind = 'codex/item/completed';
+      CREATE INDEX IF NOT EXISTS idx_events_condense_turn_completed
+        ON events (ts, seq) WHERE kind = 'codex/turn/completed';
+      CREATE INDEX IF NOT EXISTS idx_events_condense_command_delta
+        ON events (seq) WHERE kind = 'codex/item/commandExecution/outputDelta';
+      CREATE INDEX IF NOT EXISTS idx_events_condense_diff
+        ON events (seq) WHERE kind = 'codex/turn/diff/updated';
+
+      CREATE TEMP TABLE IF NOT EXISTS journal_condense_commands (
+        session TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        PRIMARY KEY (session, thread_id, turn_id, item_id)
+      ) WITHOUT ROWID;
+      CREATE TEMP TABLE IF NOT EXISTS journal_condense_turns (
+        session TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        PRIMARY KEY (session, thread_id, turn_id)
+      ) WITHOUT ROWID;
+      CREATE TEMP TABLE IF NOT EXISTS journal_condense_diff_keep (
+        seq INTEGER PRIMARY KEY
+      );
+      CREATE TEMP TABLE IF NOT EXISTS journal_condense_delete (
+        seq INTEGER PRIMARY KEY
+      );
+    `)
+
+    // Candidate discovery writes TEMP only and reads the main DB. Keep it outside the main write transaction
+    // so the expensive JSON validation/extraction does not hold SQLite's single WAL writer lock against live
+    // worker events. Event rows are append-only, so a selected seq remains safe to re-check/delete moments
+    // later; a concurrent cursor advance/reset is re-read inside the write transaction below.
+    const selectCandidates = (): void => {
+      this.db.exec(`
+        DELETE FROM journal_condense_commands;
+        DELETE FROM journal_condense_turns;
+        DELETE FROM journal_condense_diff_keep;
+        DELETE FROM journal_condense_delete;
+      `)
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO journal_condense_commands (session, thread_id, turn_id, item_id)
+           SELECT session, thread_id, turn_id, item_id
+           FROM (
+             SELECT
+               session,
+               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.threadId') END AS thread_id,
+               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.turnId') END AS turn_id,
+               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.item.id') END AS item_id,
+               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.item.type') END AS item_type,
+               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.item.aggregatedOutput') END AS final_output
+             FROM events
+             WHERE kind = 'codex/item/completed' AND ts <= ? AND session IS NOT NULL
+           )
+           WHERE typeof(thread_id) = 'text'
+             AND typeof(turn_id) = 'text'
+             AND typeof(item_id) = 'text'
+             AND item_type = 'commandExecution'
+             AND typeof(final_output) = 'text'`
+        )
+        .run(cutoff)
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO journal_condense_turns (session, thread_id, turn_id)
+           SELECT session, thread_id, turn_id
+           FROM (
+             SELECT
+               session,
+               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.threadId') END AS thread_id,
+               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.turn.id') END AS turn_id
+             FROM events
+             WHERE kind = 'codex/turn/completed' AND ts <= ? AND session IS NOT NULL
+           )
+           WHERE typeof(thread_id) = 'text' AND typeof(turn_id) = 'text'`
+        )
+        .run(cutoff)
+
+      // The final diff is itself authoritative: turn/completed carries status/items but no patch. Compute the
+      // newest valid snapshot across the whole matched turn (not merely before cutoff), then exclude it.
+      this.db.exec(`
+        INSERT OR IGNORE INTO journal_condense_diff_keep (seq)
+        SELECT MAX(candidate.seq)
+        FROM (
+          SELECT
+            seq,
+            session,
+            CASE WHEN json_valid(payload) THEN json_extract(payload, '$.threadId') END AS thread_id,
+            CASE WHEN json_valid(payload) THEN json_extract(payload, '$.turnId') END AS turn_id
+          FROM events
+          WHERE kind = 'codex/turn/diff/updated' AND session IS NOT NULL
+        ) AS candidate
+        JOIN journal_condense_turns AS terminal
+          ON terminal.session = candidate.session
+         AND terminal.thread_id = candidate.thread_id
+         AND terminal.turn_id = candidate.turn_id
+        WHERE typeof(candidate.thread_id) = 'text' AND typeof(candidate.turn_id) = 'text'
+        GROUP BY candidate.session, candidate.thread_id, candidate.turn_id;
+      `)
+
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO journal_condense_delete (seq)
+           SELECT candidate.seq
+           FROM (
+             SELECT
+               seq,
+               ts,
+               session,
+               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.threadId') END AS thread_id,
+               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.turnId') END AS turn_id,
+               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.itemId') END AS item_id
+             FROM events
+             WHERE kind = 'codex/item/commandExecution/outputDelta' AND session IS NOT NULL
+           ) AS candidate
+           JOIN journal_condense_commands AS terminal
+             ON terminal.session = candidate.session
+            AND terminal.thread_id = candidate.thread_id
+            AND terminal.turn_id = candidate.turn_id
+            AND terminal.item_id = candidate.item_id
+           WHERE candidate.ts <= ?
+             AND typeof(candidate.thread_id) = 'text'
+             AND typeof(candidate.turn_id) = 'text'
+             AND typeof(candidate.item_id) = 'text'
+           ORDER BY candidate.seq
+           LIMIT ?`
+        )
+        .run(cutoff, commandLimit)
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO journal_condense_delete (seq)
+           SELECT candidate.seq
+           FROM (
+             SELECT
+               seq,
+               ts,
+               session,
+               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.threadId') END AS thread_id,
+               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.turnId') END AS turn_id
+             FROM events
+             WHERE kind = 'codex/turn/diff/updated' AND session IS NOT NULL
+           ) AS candidate
+           JOIN journal_condense_turns AS terminal
+             ON terminal.session = candidate.session
+            AND terminal.thread_id = candidate.thread_id
+            AND terminal.turn_id = candidate.turn_id
+           LEFT JOIN journal_condense_diff_keep AS keep ON keep.seq = candidate.seq
+           WHERE candidate.ts <= ?
+             AND keep.seq IS NULL
+             AND typeof(candidate.thread_id) = 'text'
+             AND typeof(candidate.turn_id) = 'text'
+           ORDER BY candidate.seq
+           LIMIT ?`
+        )
+        .run(cutoff, diffLimit)
+    }
+    selectCandidates()
+
+    const applyDeletes = this.db.transaction((): JournalCondenseResult => {
+      // worker_cursors makes the new reader independent of event retention. A rollback can still launch the
+      // old MAX(wseq)-from-events reader, though, so if a selected transient row is the current anchor, first
+      // replace it with a tiny checkpoint carrying the same wseq. The advance trigger atomically points the
+      // table at this new row; both old and new binaries then retain the exact cursor across the DELETE.
+      //
+      // This internal marker is inserted by the maintenance child and intentionally is not EventEmitter-
+      // emitted to live panes. It has no UI state; replay/polling may see and ignore it like any unknown kind.
+      const cursorCheckpointsWritten = this.db
+        .prepare(
+          `INSERT INTO events (ts, session, kind, payload, wseq)
+           SELECT ?, cursor.session, ?, ?, cursor.wseq
+           FROM worker_cursors AS cursor
+           JOIN journal_condense_delete AS selected ON selected.seq = cursor.event_seq
+           JOIN events AS existing ON existing.seq = selected.seq`
+        )
+        .run(
+          now,
+          WSEQ_CHECKPOINT_KIND,
+          JSON.stringify({ reason: 'journal condensation replaced a transient wseq anchor' })
+        ).changes
+      const commandOutputDeltasDeleted = this.db
+        .prepare(
+          `DELETE FROM events
+           WHERE kind = 'codex/item/commandExecution/outputDelta'
+             AND seq IN (SELECT seq FROM journal_condense_delete)`
+        )
+        .run().changes
+      const diffSnapshotsDeleted = this.db
+        .prepare(
+          `DELETE FROM events
+           WHERE kind = 'codex/turn/diff/updated'
+             AND seq IN (SELECT seq FROM journal_condense_delete)`
+        )
+        .run().changes
+      return { commandOutputDeltasDeleted, diffSnapshotsDeleted, cursorCheckpointsWritten }
+    })
+    return applyDeletes.immediate()
   }
 
   /**
@@ -217,9 +566,9 @@ export class Journal extends EventEmitter {
 /**
  * Parse a stored payload, degrading to a visible marker rather than throwing.
  *
- * Keeps replay TOTAL: the client still receives the event, so sequence numbers stay contiguous and
- * nothing downstream silently skips a row, and the operator sees that something was unreadable instead
- * of the hub simply dying.
+ * Keeps replay TOTAL for stored rows: the client receives this event and advances to its real seq, while
+ * the operator sees that something was unreadable instead of the hub silently skipping it or dying.
+ * Sequence values need not be contiguous after intentional journal condensation; cursors are `seq > ?`.
  */
 function parsePayload(raw: string, seq: number): unknown {
   try {
