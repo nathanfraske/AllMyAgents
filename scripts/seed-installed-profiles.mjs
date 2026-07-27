@@ -36,7 +36,7 @@ import { fileURLToPath } from 'node:url'
 
 const APPLY = process.argv.includes('--apply')
 const FORCE = process.argv.includes('--force')
-const IDENTIFIER = 'direct.cec.allmyagents'
+const PRODUCT = 'AllMyAgents'
 
 // The files that mean "signed in", per vendor. Anything not listed is state, not auth, and stays behind.
 const AUTH_FILES = {
@@ -46,17 +46,32 @@ const AUTH_FILES = {
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
-/** Where the installed desktop app keeps its hub profiles, per platform. */
+/**
+ * Where the installed desktop app keeps its hub profiles, per platform.
+ *
+ * This MUST track `app_data_root()` in apps/desktop/src-tauri/src/lib.rs, which is Tauri's
+ * `path().data_dir()` joined with the PRODUCT name — %APPDATA%\AllMyAgents on Windows (Roaming, not
+ * Local), ~/Library/Application Support/AllMyAgents on macOS. The hub then receives that as
+ * HUB_PROFILES_DIR (apps/hub/src/index.ts:97).
+ *
+ * The first version of this script guessed the IDENTIFIER-scoped path under %LOCALAPPDATA%
+ * (direct.cec.allmyagents\hub\profiles). That is where an older build kept things, and it still exists on
+ * a machine that ran one — so the copy SUCCEEDED, reported four files copied, and seeded a directory the
+ * current hub never reads. The app came up signed into nothing while the script said it had worked. A
+ * seeding tool that cannot fail loudly is worse than none, so the caller verifies against the running
+ * hub's /api/profiles rather than trusting this path.
+ */
 function installedProfilesDir() {
+  if (process.env.AMA_PROFILES_DIR) return path.resolve(process.env.AMA_PROFILES_DIR)
   if (process.platform === 'win32') {
-    const base = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local')
-    return path.join(base, IDENTIFIER, 'hub', 'profiles')
+    const base = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming')
+    return path.join(base, PRODUCT, 'profiles')
   }
   if (process.platform === 'darwin') {
-    return path.join(os.homedir(), 'Library', 'Application Support', IDENTIFIER, 'hub', 'profiles')
+    return path.join(os.homedir(), 'Library', 'Application Support', PRODUCT, 'profiles')
   }
   const base = process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share')
-  return path.join(base, IDENTIFIER, 'hub', 'profiles')
+  return path.join(base, PRODUCT, 'profiles')
 }
 
 /** Which vendor a profile belongs to, from its directory name. */
