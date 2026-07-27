@@ -6,6 +6,8 @@
   import { groupCodexItems, type CodexRenderNode } from './codexGroup'
   import { classifyDecideOutcome } from './approvals'
   import { distanceFromBottom, shouldShowJumpToBottom, newItemsBelow } from './transcriptScroll'
+  import PastedTextChip from './PastedTextChip.svelte'
+  import { shouldPromotePaste, composeWithPastes, type PastedText } from './pastePromote'
   import ContextMeter from './ContextMeter.svelte'
   import ModelPicker from './ModelPicker.svelte'
   import TraitsControl from './TraitsControl.svelte'
@@ -26,6 +28,30 @@
     $props()
 
   let text = $state('')
+  // Large pastes promoted to chips (see pastePromote.ts). Content is held here and inlined into the
+  // prompt on send — it is TEXT, so it reaches both vendors via the normal text path, never the
+  // image/file attachment path (which would silently drop it on Codex).
+  let pastes = $state<PastedText[]>([])
+  function onPaste(e: ClipboardEvent): void {
+    const t = e.clipboardData?.getData('text/plain') ?? ''
+    if (!shouldPromotePaste(t, settings.pasteAsTextThreshold)) return // small pastes behave normally
+    e.preventDefault()
+    const id = `paste:${crypto.randomUUID?.() ?? `${Date.now()}-${pastes.length}`}`
+    pastes = [...pastes, { id, name: `pasted-${pastes.length + 1}.txt`, content: t }]
+  }
+  function removePaste(id: string): void {
+    pastes = pastes.filter((p) => p.id !== id)
+  }
+  // "as text" — the user actually wanted it inline; drop it back into the box and un-chip it.
+  function inlinePaste(id: string): void {
+    const p = pastes.find((x) => x.id === id)
+    if (!p) return
+    text = text.trim() ? `${text}\n\n${p.content}` : p.content
+    pastes = pastes.filter((x) => x.id !== id)
+    queueMicrotask(() => taRef?.focus())
+  }
+  // A message is sendable when there is typed text OR at least one promoted paste.
+  const canSend = $derived(!!text.trim() || pastes.length > 0)
   // Unsent composer text lives with the CHAT, not this component: switching panes, tabbing away, or
   // reloading keeps whatever you were mid-way through writing. `drafts` is a plain cache (never $state)
   // so writing it from an effect cannot feed back into reactivity.
@@ -265,6 +291,7 @@
     jumpAway = false
     anchorKey = null
     stick = true
+    pastes = [] // promoted pastes belong to the chat they were pasted into
   })
 
   // Model / thinking-effort / tier picks WRITE THROUGH to the hub immediately for a real session, so the
@@ -402,15 +429,22 @@
   }
 
   async function send(): Promise<void> {
-    if (!view || !text.trim()) return
+    if (!view || !canSend) return
     const sid0 = view.record.id
-    const body = text
+    // Inline any promoted pastes into the prompt (full content, delimited) — the delivery decision that
+    // keeps vendor parity. `typed`/`promoted` are captured so a failed send restores both WITHOUT
+    // re-thrashing the box (the blob goes back to its chip, not into the textarea).
+    const typed = text
+    const promoted = pastes
+    const body = composeWithPastes(typed, promoted)
     text = ''
+    pastes = []
     sendErr = ''
     // Slash-command interception. A leading "/" may map to a hub feature (built-in) — run that action
     // instead of sending text. CUSTOM commands (commands/*.md) resolve to `passthrough` and continue
     // down the normal send path, where the driver expands them.
-    if (body.trim().startsWith('/')) {
+    // A message carrying a promoted paste is never a slash command — don't let a stray leading "/" eat it.
+    if (promoted.length === 0 && body.trim().startsWith('/')) {
       const res = resolveSlash(body.trim(), view.record.provider)
       if (res.kind !== 'passthrough') {
         await runSlash(res, sid0)
@@ -423,7 +457,8 @@
       stick = true
       const out = await store.materializeDraft(sid0, body)
       if (out.error) {
-        text = body // spawn failed — hand the prompt back and keep the draft as it was
+        text = typed // spawn failed — hand back typed text + the paste chips, no thrash
+        pastes = promoted
         sendErr = out.error
       }
       return
@@ -433,7 +468,8 @@
       if (view.record.provider === 'codex') {
         const out = await api.steer(sid0, body)
         if (out.error) {
-          text = body // steer failed — give the draft back
+          text = typed // steer failed — restore typed text + paste chips
+          pastes = promoted
           sendErr = out.error
         }
       } else {
@@ -451,7 +487,8 @@
     })
     if (out.error) {
       store.removeItem(sid0, key) // roll back the optimistic bubble
-      text = body // and restore the draft so nothing is lost
+      text = typed // restore typed text + paste chips so nothing is lost
+      pastes = promoted
       sendErr = out.error
     }
   }
@@ -698,8 +735,11 @@
           {/each}
         </div>
       {/if}
+      {#each pastes as p (p.id)}
+        <PastedTextChip paste={p} onremove={removePaste} oninline={inlinePaste} />
+      {/each}
       <textarea rows="2" placeholder={isDraft ? 'Describe the first task… (Enter to start the chat, Shift+Enter for newline)' : steerable ? 'Steer the running turn… (appended to what Codex is doing now)' : active ? 'Queue a message… (sends when the current turn finishes)' : 'Ask for follow-up changes…  (Enter to send, Shift+Enter for newline)'}
-        bind:this={taRef} bind:value={text} onkeydown={onKey}></textarea>
+        bind:this={taRef} bind:value={text} onkeydown={onKey} onpaste={onPaste}></textarea>
       <div class="cfoot">
         <AccountPicker {view} />
         <ModelPicker provider={view.record.provider} {model} onselect={setModel} />
@@ -743,7 +783,7 @@
             <button class="foot-act" onclick={stopSession} title="stop session">stop</button>
           {/if}
         {/if}
-        <button class="send-btn" class:queue={active} title={isDraft ? 'start this chat' : steerable ? 'steer into the running turn' : active ? 'queue message' : 'send'} onclick={send} disabled={!text.trim()}><Icon name={steerable ? 'corner-down-right' : active ? 'timer' : 'arrow-up'} size={16} /></button>
+        <button class="send-btn" class:queue={active} title={isDraft ? 'start this chat' : steerable ? 'steer into the running turn' : active ? 'queue message' : 'send'} onclick={send} disabled={!canSend}><Icon name={steerable ? 'corner-down-right' : active ? 'timer' : 'arrow-up'} size={16} /></button>
       </div>
       <!-- Action failures sit under their own control cluster: settings under the pills (left), session
            lifecycle under the interrupt/stop/reopen buttons (right) — never a global toast. -->

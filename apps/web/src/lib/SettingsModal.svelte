@@ -369,6 +369,17 @@
       <h3>Composer</h3>
       <label class="opt"><input type="checkbox" checked={settings.showTokenEstimate} onchange={() => settings.toggleTokenEstimate()} /> Show next-call token estimate under the chatbox</label>
       <label class="opt"><input type="checkbox" checked={settings.combineQueued} onchange={() => settings.toggleCombineQueued()} /> Auto-combine queued messages (before the model reads them)</label>
+      <label class="opt">
+        <input
+          type="number"
+          min="0"
+          step="1000"
+          style="width: 6rem"
+          value={settings.pasteAsTextThreshold}
+          onchange={(e) => settings.set('pasteAsTextThreshold', Math.max(0, Math.round(Number((e.target as HTMLInputElement).value) || 0)))}
+        />
+        Turn a paste this many characters or larger into a "pasted text" chip instead of a wall (0 = off). Its full content still reaches the agent.
+      </label>
     </section>
 
     <section class:tab-hidden={!settingsTabHasSection(activeTab, 'File-write display')}>
