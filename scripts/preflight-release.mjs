@@ -41,6 +41,22 @@ function run(cmd, opts = {}) {
   return execSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, ...opts })
 }
 
+/** Cargo commands run in the crate, not the repo root, and write EVERY diagnostic — lints, errors, and
+ *  even the "Finished" line — to stderr. `run` captures stdout only, so without the redirect below these
+ *  checks would assert against an empty string and pass no matter what clippy found. That is precisely the
+ *  false-green this script exists to prevent, so the redirect is not incidental.
+ *
+ *  A non-zero exit returns its output rather than throwing, because with `-D warnings` the lint text IS
+ *  the evidence the check needs to report. */
+function runNative(cmd) {
+  const opts = { cwd: 'apps/desktop/src-tauri' }
+  try {
+    return run(`${cmd} 2>&1`, opts)
+  } catch (err) {
+    return `${err.stdout ?? ''}${err.stderr ?? ''}`
+  }
+}
+
 // Vitest colours its summary, so the line is really:
 //   "Tests \x1b[22m \x1b[1m\x1b[32m462 passed\x1b[39m"
 // Matching that with a pattern written against the plain text silently fails and reports a passing suite as
@@ -187,6 +203,43 @@ check('credential firewall self-test', () => {
 check('real payload stages and passes the audit', () => {
   const m = expectOutput('pnpm run hub:bundle 2>&1', /credential audit passed: (\d+) payload files/, 'hub bundle')
   return `${m[1]} files audited`
+})
+
+// The 0.1.6 cut tagged a commit whose Rust shell did not lint. Every JS gate above was green, so the
+// preflight said "safe to tag" — it had simply never compiled the native crate. `cargo clippy -D warnings`
+// then failed on macOS AND Windows over four lints in one file (the agent-browser bridge, which had landed
+// without anyone running a Rust gate locally). The release artifacts built fine, because clippy is a lint
+// gate and `tauri build` does not run it, so main went red while the installers were valid — an especially
+// confusing failure to read under time pressure.
+//
+// Order and working directory mirror the ci.yml `tauri shell` job deliberately. tauri-build validates
+// tauri.conf.json at build.rs time, and that config points `frontendDist` at apps/web/dist and declares
+// hub-runtime as a resource, so BOTH must be staged before cargo touches the crate or this fails on config
+// validation rather than on the code. hub:bundle already ran in Packaging above; the web build has not.
+console.log('\nNative shell (mirrors the ci.yml tauri job)')
+check('web dist staged for tauri-build', () => {
+  run('pnpm --filter web build 2>&1')
+  if (!fs.existsSync('apps/web/dist/index.html')) throw new Error('apps/web/dist/index.html absent after build')
+  return 'apps/web/dist present'
+})
+
+check('cargo check --all-targets', () => {
+  const out = stripAnsi(runNative('cargo check --all-targets'))
+  if (/^error(\[E\d+\])?:/m.test(out)) throw new Error(out.slice(-900))
+  if (!/Finished|Checking|Compiling/.test(out)) throw new Error(`no evidence cargo ran:\n${out.slice(-500)}`)
+  return 'compiles'
+})
+
+check('cargo clippy --all-targets -- -D warnings', () => {
+  // Asserting on absence-of-error as well as the Finished line: with `-D warnings` a lint IS an error, and
+  // this is the exact gate that main went red on.
+  const out = stripAnsi(runNative('cargo clippy --all-targets -- -D warnings'))
+  if (/^error(\[E\d+\])?:/m.test(out) || /could not compile/.test(out)) {
+    const first = out.split('\n').filter((l) => /^error/.test(l)).slice(0, 4).join('\n')
+    throw new Error(`${first}\n(full tail)\n${out.slice(-500)}`)
+  }
+  if (!/Finished|Checking/.test(out)) throw new Error(`no evidence clippy ran:\n${out.slice(-500)}`)
+  return 'no lints'
 })
 
 console.log('')
