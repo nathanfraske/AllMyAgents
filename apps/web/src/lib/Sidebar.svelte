@@ -500,13 +500,16 @@
 </script>
 
 <div class="sidebar">
-  <div class="brand">
-    <button class="brandbtn" title="home / dashboard" onclick={() => store.goHome()}>
-      <img class="logo" src="/logo.png" alt="" />
-      <span class="name">AllMyAgents</span>
-    </button>
-    <span class="tag">fleet</span>
-    <span class="conn" class:on={store.connected} title={store.connected ? 'connected' : 'reconnecting'}></span>
+  <!-- Connectivity strip (its own row, below the title bar, above search). The title bar owns the ONE
+       brand/wordmark now, so this no longer repeats it; it carries the home control (kept as a one-click
+       button — deleting the old brand button would have removed the way back to the dashboard) and reads
+       out the hub connection in WORDS, not just a colour, from store.connected + store.hubDownSeconds. -->
+  <div class="connbar">
+    <button class="homebtn" title="home / dashboard" aria-label="home / dashboard" onclick={() => store.goHome()}><Icon name="home" size={15} /></button>
+    <span class="conn-label" class:down={!store.connected}>
+      {store.connected ? 'Connected' : store.hubDownSeconds > 0 ? `Reconnecting… ${store.hubDownSeconds}s` : 'Reconnecting…'}
+    </span>
+    <span class="conn-dot" class:on={store.connected}></span>
   </div>
 
   <div class="search"><span class="sicon"><Icon name="search" size={13} /></span><input placeholder="Search sessions" bind:value={filter} /></div>
@@ -703,14 +706,13 @@
 
 <style>
   .sidebar { display: flex; flex-direction: column; height: 100%; min-height: 0; background: var(--sidebar); border-right: 1px solid var(--border); }
-  .brand { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-3); }
-  .brandbtn { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-1) var(--space-2); border-radius: var(--r-sm); }
-  .brandbtn:hover { background: var(--surface); }
-  .logo { width: 18px; height: 18px; object-fit: contain; }
-  .name { font-weight: var(--fw-semibold); }
-  .tag { font-size: var(--text-2xs); text-transform: uppercase; letter-spacing: var(--ls-label); color: var(--dim); border: 1px solid var(--border-strong); border-radius: var(--r-xs); padding: 0 0.3rem; }
-  .conn { margin-left: auto; width: 8px; height: 8px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08); }
-  .conn.on { background: var(--ok); }
+  .connbar { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); border-bottom: 1px solid var(--border-subtle); }
+  .homebtn { display: grid; place-items: center; width: 26px; height: 26px; border-radius: var(--r-sm); color: var(--muted); flex: none; }
+  .homebtn:hover { background: var(--surface); color: var(--text); }
+  .conn-label { flex: 1; min-width: 0; font-size: var(--text-xs); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .conn-label.down { color: var(--warn, #d08700); }
+  .conn-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08); }
+  .conn-dot.on { background: var(--ok); }
   .search { position: relative; padding: 0 var(--space-4) var(--space-3); }
   .sicon { position: absolute; left: 1.15rem; top: calc(50% - 0.25rem); transform: translateY(-50%); color: var(--dim); display: grid; }
   .search input { width: 100%; padding-left: 1.9rem; }
@@ -728,7 +730,9 @@
   .mkbtn { background: var(--accent); color: #fff; border-radius: var(--r-md); padding: var(--space-2); font-weight: var(--fw-medium); box-shadow: var(--edge-hi), var(--shadow-1); }
   .mkbtn:hover { filter: brightness(1.08); }
   .err { color: var(--bad-text); font-size: var(--text-xs); }
-  .list { flex: 1; padding: 0 var(--space-2); }
+  /* min-height:0 lets flex:1 bound the list below its content so its own `.scroll` overflow engages,
+     instead of the list growing to fit every chat and pushing the sidebar (and the window) taller. */
+  .list { flex: 1; min-height: 0; padding: 0 var(--space-2); }
   .group { margin-bottom: var(--space-2); }
   .group-head { position: relative; display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3) var(--space-2) var(--space-6); font-size: var(--text-sm); color: var(--muted); }
   .folder { display: grid; place-items: center; color: var(--dim); width: 16px; height: 16px; }
