@@ -3,6 +3,7 @@ import { settings } from './settings.svelte'
 import { alertDialog } from './dialog.svelte'
 import { loadLastLayout, saveLastLayout, loadQueues, saveQueues, type PersistedLayout } from './uiState'
 import { rowFate } from './fleetMerge'
+import { isChatBusy, nextOrderKey, orderChats, type ChatOrderFacts } from './chatOrder'
 import type { AgentOutcome } from './agentTree'
 import type { ApprovalRecord, FleetSite, HistoryItem, HistoryPage, HubEvent, ProfileInfo, ProjectInfo, ScanResult, SessionRecord, UsageSnapshot } from './api'
 
@@ -94,7 +95,15 @@ export interface ThreadItem {
 export interface SessionView {
   record: SessionRecord
   items: ThreadItem[]
+  /** Live recency: the timestamp of the most recent event, whatever it was. Drives the row's clock. */
   lastActivity: string
+  /**
+   * Recency as of the last time this chat SETTLED — what the sidebar sorts on, and the reason a
+   * streaming chat holds its place. It is `lastActivity` frozen for the duration of a turn; see
+   * chatOrder.ts for why the two must not be the same field. Optional so a view built by an older
+   * code path (or a test fixture) still orders sensibly by falling back to `lastActivity`.
+   */
+  orderKey?: string
   sawReasoning: boolean
   lastTurnOk?: boolean
   contextUsed?: number
@@ -210,6 +219,16 @@ function applyOrder<T>(items: T[], order: string[], idOf: (x: T) => string): T[]
       return pa === pb ? a.i - b.i : pa - pb
     })
     .map((x) => x.item)
+}
+
+/** Project a session view down to the handful of facts ordering is allowed to depend on. */
+function orderFacts(v: SessionView): ChatOrderFacts {
+  return { id: v.record.id, createdAt: v.record.createdAt, lastActivity: v.lastActivity, orderKey: v.orderKey }
+}
+
+/** Is this chat mid-turn? (Its sort key is frozen while it is — see chatOrder.ts.) */
+function viewIsBusy(v: SessionView): boolean {
+  return isChatBusy({ turnStartedAt: v.turnStartedAt, status: v.record.status })
 }
 
 // Move `fromId` to sit where `toId` currently is. Inserting at toId's original index lands the item
@@ -393,9 +412,13 @@ export class HubStore {
 
   get sessionList(): SessionView[] {
     // Drafts are local-only until they materialize — keep them out of the sidebar + dashboard.
-    return Object.values(this.sessions)
-      .filter((v) => !v.draft)
-      .sort((a, b) => b.lastActivity.localeCompare(a.lastActivity))
+    //
+    // Ordered, not merely filtered, and by the SAME comparator the sidebar's per-group pass uses. Every
+    // consumer downstream (the sidebar's bucketing, the dashboard, the pane picker, and the membership
+    // snapshot a drag records in `groupSessionIds`) then agrees on one arrangement, so a chat cannot
+    // sit in one place on screen and be recorded in another. No manual order at this level: that is
+    // per group, and this list spans all of them.
+    return orderChats(Object.values(this.sessions).filter((v) => !v.draft), [], orderFacts)
   }
 
   get selected(): SessionView | null {
@@ -425,14 +448,17 @@ export class HubStore {
     return applyOrder(this.projects, this.projectOrder, (p) => p.id)
   }
 
-  // Sort a group's already-bucketed sessions by the saved chat order for that group id. New/unknown
-  // chats keep their incoming (recency) order after the saved ones. Called per group by the sidebar.
+  // Sort a group's already-bucketed sessions: the saved chat order for that group id first, then
+  // settled recency for everything the operator never arranged. Called per group by the sidebar.
+  // Streaming activity cannot move a row here — see chatOrder.ts.
   orderedChats(groupId: string, sessions: SessionView[]): SessionView[] {
-    return applyOrder(sessions, this.chatOrder[groupId] ?? [], (s) => s.record.id)
+    return orderChats(sessions, this.chatOrder[groupId] ?? [], orderFacts)
   }
 
-  // Full membership of a group (projectId, or '__none__' for unfiled) in recency order — reorder
-  // operates on this, independent of any active sidebar search filter.
+  // Full membership of a group (projectId, or '__none__' for unfiled) in the order the sidebar shows
+  // it — reorder operates on this, independent of any active sidebar search filter. It must be the
+  // rendered order and not raw recency: a drag records the WHOLE group, so a baseline that disagreed
+  // with the screen would silently rearrange every row the operator did not touch.
   private groupSessionIds(groupId: string): string[] {
     return this.sessionList.filter((s) => (s.record.projectId ?? '__none__') === groupId).map((s) => s.record.id)
   }
@@ -865,6 +891,10 @@ export class HubStore {
         const v = this.ensure(rec)
         v.record.siteOnline = true
         v.lastActivity = rec.lastActivity ?? rec.createdAt
+        // The sort key follows only while that chat is NOT mid-turn. A remote row has no local turn
+        // clock, so without this the poll would step its key every few seconds for as long as it ran —
+        // the same thrash as the local case, just at the polling cadence instead of the token cadence.
+        if (!viewIsBusy(v)) v.orderKey = v.lastActivity
       }
     }
     // Rows from a machine we could NOT reach are kept exactly as last seen and flagged unreachable —
@@ -1105,13 +1135,21 @@ export class HubStore {
       existing.record = record
       return existing
     }
-    const view: SessionView = { record, items: [], lastActivity: record.lastActivity ?? record.createdAt, sawReasoning: false }
+    const at = record.lastActivity ?? record.createdAt
+    const view: SessionView = { record, items: [], lastActivity: at, orderKey: at, sawReasoning: false }
     // (context/cost fields populated from result + tokenUsage events)
     this.sessions[record.id] = view
     return view
   }
 
+  /**
+   * Record activity. `lastActivity` always advances (it is the row's clock); the SORT key only does so
+   * when the chat is not mid-turn, which is what keeps the sidebar still while agents stream. Reading
+   * `view.lastActivity` before overwriting it means a view that predates `orderKey` freezes at its
+   * pre-turn recency rather than at the first event of the turn.
+   */
   private touch(view: SessionView, ts: string): void {
+    view.orderKey = nextOrderKey(view.orderKey ?? view.lastActivity, ts, viewIsBusy(view))
     view.lastActivity = ts
   }
 
@@ -1327,6 +1365,10 @@ export class HubStore {
         if (p.lastActivity) {
           view.record.lastActivity = p.lastActivity
           view.lastActivity = p.lastActivity
+          // Assigned, not passed through nextOrderKey: this is a CORRECTION of history and the true
+          // last-turn time is EARLIER than the import time it replaces, so the monotonic rule there
+          // would reject exactly the value that makes an imported chat sort where it belongs.
+          view.orderKey = p.lastActivity
         }
         break
       }
@@ -1773,7 +1815,10 @@ export class HubStore {
     // fixes an imported chat that showed/sorted by its import time. For an existing import (no stored
     // lastActivity) override outright, since the real last-turn time is EARLIER than the import time.
     const newestTs = hist[hist.length - 1]?.ts
-    if (newestTs && (!view.record.lastActivity || newestTs > view.lastActivity)) view.lastActivity = newestTs
+    if (newestTs && (!view.record.lastActivity || newestTs > view.lastActivity)) {
+      view.lastActivity = newestTs
+      view.orderKey = newestTs // same correction-of-history case as session/activity above
+    }
   }
 
   // Page OLDER history above what's shown (the "load older" affordance for long imported chats).

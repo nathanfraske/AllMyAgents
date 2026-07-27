@@ -235,6 +235,11 @@
   const multiSite = $derived(shouldBadgeNodes(store.fleetSites.length))
   const localLabel = $derived(store.fleetSites.find((s) => s.local)?.label ?? 'this machine')
 
+  // Bucket the roster into project groups. The ORDER inside a group is `store.orderedChats`, never a
+  // sort here: it is a total order over settled recency that deliberately ignores streaming activity,
+  // so a running agent cannot drag its row up the list under the cursor (see chatOrder.ts). This
+  // derived still re-runs on every event — it just returns the same arrangement, which the keyed
+  // {#each} below turns into no DOM movement at all.
   const groups = $derived.by(() => {
     const q = filter.toLowerCase()
     const match = (s: SessionView): boolean =>
