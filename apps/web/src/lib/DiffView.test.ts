@@ -39,8 +39,11 @@ describe('live file-write diff density', () => {
 
     setDensity('minimal')
     await tick()
+    expect(container.querySelector('.dbody')).toBeNull()
     expect(container.querySelectorAll('.line.context')).toHaveLength(0)
-    expect(container.querySelectorAll('.line.add')).toHaveLength(6)
+    expect(container.querySelectorAll('.line.add')).toHaveLength(0)
+    expect(screen.getByText('Edited')).toBeTruthy()
+    expect(screen.getByText('already-rendered.ts')).toBeTruthy()
 
     setDensity('verbose')
     await tick()

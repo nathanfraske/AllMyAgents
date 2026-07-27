@@ -267,6 +267,21 @@ export class HubStore {
   profiles = $state<ProfileInfo[]>([])
   projects = $state<ProjectInfo[]>([])
   sessions = $state<Record<string, SessionView>>({})
+  // Agent tools and bus frames use the short, human-facing session id while the roster is keyed by
+  // the full UUID. Build every prefix once per roster change so transcript cards do O(1) resolution
+  // rather than scanning the whole roster on every render. `null` is an intentional collision marker:
+  // an ambiguous prefix must never inherit either teammate's name or vendor.
+  private sessionPrefixIndex = $derived.by(() => {
+    const prefixes = new Map<string, SessionView | null>()
+    for (const [id, view] of Object.entries(this.sessions)) {
+      for (let length = 1; length < id.length; length++) {
+        const prefix = id.slice(0, length)
+        if (!prefixes.has(prefix)) prefixes.set(prefix, view)
+        else if (prefixes.get(prefix) !== view) prefixes.set(prefix, null)
+      }
+    }
+    return prefixes
+  })
   approvals = $state<ApprovalRecord[]>([])
   usage = $state<UsageSnapshot[]>([])
   // Hub-owned ordinary preferences. Shared here so the composer and Settings read the same live value;
@@ -454,15 +469,26 @@ export class HubStore {
     return this.selectedId ? (this.sessions[this.selectedId] ?? null) : null
   }
 
+  // Resolve either a full session id or an unambiguous prefix. This is the single identity lookup for
+  // transcript names and vendor marks: unknown and ambiguous prefixes both deliberately return nothing.
+  resolveSession(id: string): SessionView | undefined {
+    return this.sessions[id] ?? this.sessionPrefixIndex.get(id) ?? undefined
+  }
+
   // Human label for a session id — its title, else the last path segment of its worktree/repo/cwd
-  // (same rule the sidebar renders by). '' when the id is unknown. Used by the persisted-layout
-  // snapshot and the restore offer so they can name a session without duplicating the logic.
+  // (same rule the sidebar renders by). '' when the id is unknown or ambiguous. Used by persisted
+  // layout snapshots and transcript activity cards so they do not duplicate naming rules.
   sessionLabel(id: string): string {
-    const v = this.sessions[id]
+    const v = this.resolveSession(id)
     if (!v) return ''
     if (v.record.title) return v.record.title
     const p = v.record.worktree ?? v.record.repo ?? v.record.cwd
     return p.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || p
+  }
+
+  sessionProvider(id: string): 'claude' | 'codex' | undefined {
+    const provider = this.resolveSession(id)?.record.provider
+    return provider === 'claude' || provider === 'codex' ? provider : undefined
   }
 
   get pendingBySession(): Record<string, number> {

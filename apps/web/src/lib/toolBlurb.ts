@@ -202,7 +202,10 @@ export function agentActivity(
   if (item.kind !== 'tool') return undefined
   const tool = agentToolName(item.toolName)
   if (!tool) return undefined
-  const obj = objOf(item.toolInput)
+  const raw = objOf(item.toolInput)
+  // Claude supplies the MCP arguments as the tool input itself. Codex's real `mcpToolCall` item wraps
+  // them in `arguments`; unwrap that envelope so direct send/peek rows reach the same name resolver.
+  const obj = objOf(raw?.arguments ?? raw)
   const nameOf = (id: string | undefined): string => (id ? resolveName?.(id) || shortId(id) : 'a teammate')
   switch (tool) {
     case 'send_message': {
