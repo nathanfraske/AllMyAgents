@@ -3,6 +3,7 @@ import { api } from './api'
 import { store } from './store.svelte'
 import { settings } from './settings.svelte'
 import { loadLastLayout, saveLastLayout } from './uiState'
+import { buildAgentRuns } from './agentTree'
 import type { HubEvent, SessionRecord } from './api'
 
 // The store imports ./api (real network / WebSocket) and ./settings.svelte (localStorage).
@@ -1052,5 +1053,278 @@ describe('claude/system — sub-agent task lifecycle ingest', () => {
     system('a', 5, { type: 'system', subtype: 'task_notification', task_id: 'bjka37p48', tool_use_id: 'toolu_someBashCall', status: 'completed' })
     expect(spawnItem('a').agentOutcome).toBeUndefined()
     expect(spawnItem('a').agentTaskId).toBeUndefined()
+  })
+})
+
+describe('codex sub-agent ingest', () => {
+  const id = 'codex-subagents'
+  const root = 'root-thread'
+  let codexSeq = 1
+  const started = (agentThreadId: string, parentThreadId: string = root, over: Record<string, unknown> = {}): void => {
+    apply(
+      evt({
+        seq: codexSeq++,
+        kind: 'codex/subagent/thread/started',
+        sessionId: id,
+        payload: {
+          threadId: root,
+          agentThreadId,
+          parentThreadId,
+          thread: {
+            id: agentThreadId,
+            parentThreadId,
+            preview: 'Trace the event path',
+            status: { type: 'active', activeFlags: [] },
+            agentRole: 'explorer',
+            ...over,
+          },
+        },
+      })
+    )
+  }
+
+  beforeEach(() => {
+    codexSeq = 1
+    seed(id, { provider: 'codex', vendorSessionId: root })
+  })
+
+  it('creates a running agent from the real child-thread start, without a completion blob', () => {
+    started('child')
+
+    const runs = buildAgentRuns(store.sessions[id]!.items, Date.parse('2026-01-01T00:00:06.000Z'))
+    expect(runs).toHaveLength(1)
+    expect(runs[0]).toMatchObject({
+      id: 'child',
+      description: 'Trace the event path',
+      subagentType: 'explorer',
+      status: 'running',
+    })
+    expect(runs[0]!.result).toBeUndefined()
+  })
+
+  it('creates the run from Codex 0.145 subAgentActivity and does not mistake interaction for completion', () => {
+    apply(
+      evt({
+        seq: codexSeq++,
+        kind: 'codex/item/completed',
+        sessionId: id,
+        payload: {
+          threadId: root,
+          turnId: 'root-turn',
+          item: {
+            type: 'subAgentActivity',
+            id: 'spawn-call',
+            kind: 'started',
+            agentThreadId: 'child',
+            agentPath: '/root/inspect_package',
+          },
+        },
+      })
+    )
+    apply(
+      evt({
+        seq: codexSeq++,
+        kind: 'codex/item/completed',
+        sessionId: id,
+        payload: {
+          threadId: root,
+          turnId: 'root-turn',
+          item: {
+            type: 'subAgentActivity',
+            id: 'message-call',
+            kind: 'interacted',
+            agentThreadId: 'child',
+            agentPath: '/root/inspect_package',
+          },
+        },
+      })
+    )
+
+    const run = buildAgentRuns(store.sessions[id]!.items, Date.parse('2026-01-01T00:00:06.000Z'))[0]!
+    expect(run).toMatchObject({
+      id: 'child',
+      description: 'inspect package',
+      status: 'running',
+    })
+    expect(run.result).toBeUndefined()
+  })
+
+  it('uses the structured subAgentActivity interrupted edge as a stopped terminal state', () => {
+    for (const [seq, kind] of [
+      [codexSeq++, 'started'],
+      [codexSeq++, 'interrupted'],
+    ] as const) {
+      apply(
+        evt({
+          seq,
+          kind: 'codex/item/completed',
+          sessionId: id,
+          payload: {
+            threadId: root,
+            turnId: 'root-turn',
+            item: {
+              type: 'subAgentActivity',
+              id: `${kind}-call`,
+              kind,
+              agentThreadId: 'child',
+              agentPath: '/root/worker',
+            },
+          },
+        })
+      )
+    }
+
+    expect(buildAgentRuns(store.sessions[id]!.items)[0]).toMatchObject({
+      id: 'child',
+      status: 'failed',
+      outcome: 'stopped',
+    })
+  })
+
+  it('attributes the child item stream to the child and completes only on turn/completed', () => {
+    started('child')
+    apply(
+      evt({
+        seq: codexSeq++,
+        kind: 'codex/subagent/item/completed',
+        sessionId: id,
+        payload: {
+          threadId: root,
+          agentThreadId: 'child',
+          parentThreadId: root,
+          turnId: 'child-turn',
+          item: { type: 'agentMessage', id: 'answer', text: 'I traced it.' },
+        },
+      })
+    )
+
+    let run = buildAgentRuns(store.sessions[id]!.items, Date.parse('2026-01-01T00:00:06.000Z'))[0]!
+    expect(run.status).toBe('running')
+    expect(run.activity).toHaveLength(1)
+    expect(run.activity[0]).toMatchObject({ kind: 'assistant', text: 'I traced it.', agentId: 'child' })
+
+    apply(
+      evt({
+        seq: codexSeq++,
+        kind: 'codex/subagent/turn/completed',
+        sessionId: id,
+        payload: {
+          threadId: root,
+          agentThreadId: 'child',
+          parentThreadId: root,
+          turn: { id: 'child-turn', status: 'completed', error: null },
+        },
+      })
+    )
+    run = buildAgentRuns(store.sessions[id]!.items, Date.parse('2026-01-01T00:00:06.000Z'))[0]!
+    expect(run.status).toBe('done')
+    expect(run.endedAt).toBe('2026-01-01T00:00:05.000Z')
+    expect(run.result).toBeUndefined()
+  })
+
+  it('uses failed and interrupted terminal statuses verbatim instead of prose inference', () => {
+    started('failed-child')
+    apply(
+      evt({
+        seq: codexSeq++,
+        kind: 'codex/subagent/turn/completed',
+        sessionId: id,
+        payload: {
+          threadId: root,
+          agentThreadId: 'failed-child',
+          parentThreadId: root,
+          turn: { id: 'failed-turn', status: 'failed', error: { message: 'model failed' } },
+        },
+      })
+    )
+    started('stopped-child')
+    apply(
+      evt({
+        seq: codexSeq++,
+        kind: 'codex/subagent/turn/completed',
+        sessionId: id,
+        payload: {
+          threadId: root,
+          agentThreadId: 'stopped-child',
+          parentThreadId: root,
+          turn: { id: 'stopped-turn', status: 'interrupted', error: null },
+        },
+      })
+    )
+
+    const runs = buildAgentRuns(store.sessions[id]!.items, Date.parse('2026-01-01T00:00:06.000Z'))
+    expect(runs.find((run) => run.id === 'failed-child')).toMatchObject({ status: 'failed', outcome: 'failed' })
+    expect(runs.find((run) => run.id === 'stopped-child')).toMatchObject({ status: 'failed', outcome: 'stopped' })
+  })
+
+  it('nests a child spawned by another child thread', () => {
+    started('outer')
+    started('inner', 'outer', { preview: 'Nested task' })
+
+    const inner = buildAgentRuns(store.sessions[id]!.items, Date.parse('2026-01-01T00:00:06.000Z')).find(
+      (run) => run.id === 'inner'
+    )
+    expect(inner?.parentId).toBe('outer')
+  })
+
+  it('does not treat a completed spawn tool call as completed agent work', () => {
+    apply(
+      evt({
+        seq: codexSeq++,
+        kind: 'codex/item/completed',
+        sessionId: id,
+        payload: {
+          threadId: root,
+          turnId: 'root-turn',
+          item: {
+            type: 'collabAgentToolCall',
+            id: 'spawn-call',
+            tool: 'spawnAgent',
+            status: 'completed',
+            senderThreadId: root,
+            receiverThreadIds: ['child'],
+            prompt: 'Investigate',
+            model: null,
+            reasoningEffort: null,
+            agentsStates: { child: { status: 'running', message: null } },
+          },
+        },
+      })
+    )
+
+    const run = buildAgentRuns(store.sessions[id]!.items, Date.parse('2026-01-01T00:00:06.000Z'))[0]!
+    expect(run.status).toBe('running')
+    expect(run.result).toBeUndefined()
+  })
+
+  it('uses structured agent state but never renders its message field as a returned blob', () => {
+    started('child')
+    apply(
+      evt({
+        seq: codexSeq++,
+        kind: 'codex/item/completed',
+        sessionId: id,
+        payload: {
+          threadId: root,
+          turnId: 'root-turn',
+          item: {
+            type: 'collabAgentToolCall',
+            id: 'wait-call',
+            tool: 'wait',
+            status: 'completed',
+            senderThreadId: root,
+            receiverThreadIds: ['child'],
+            prompt: null,
+            agentsStates: {
+              child: { status: 'completed', message: 'agentId/output-file/internal coordination blob' },
+            },
+          },
+        },
+      })
+    )
+
+    const run = buildAgentRuns(store.sessions[id]!.items, Date.parse('2026-01-01T00:00:06.000Z'))[0]!
+    expect(run.status).toBe('done')
+    expect(run.result).toBeUndefined()
   })
 })
