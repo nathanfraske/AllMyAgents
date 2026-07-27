@@ -69,6 +69,67 @@ describe('long-run journal history rollup', () => {
   afterEach(() => vi.useRealTimers())
   afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }))
 
+  it('ships with unique history rewriting off while still removing superseded stream rows', () => {
+    vi.useFakeTimers()
+    const journal = new Journal(path.join(tmp, 'default-is-nondestructive.db'))
+    try {
+      let reasoningSeq = 0
+      at(OLD, () => {
+        journal.append('s-default', 'session/input', { text: 'Keep the exact audit record.' })
+        journal.append('s-default', 'codex/turn/started', {
+          threadId: 'thread-1',
+          turn: { id: 'turn-default' },
+        })
+        journal.append('s-default', 'codex/item/commandExecution/outputDelta', {
+          threadId: 'thread-1',
+          turnId: 'turn-default',
+          itemId: 'cmd-default',
+          delta: 'superseded stream fragment',
+        })
+        journal.append(
+          's-default',
+          'codex/item/completed',
+          codexCompleted('turn-default', {
+            id: 'cmd-default',
+            type: 'commandExecution',
+            command: 'inspect',
+            aggregatedOutput: 'complete command output',
+            status: 'completed',
+          })
+        )
+        reasoningSeq = journal.append(
+          's-default',
+          'codex/item/completed',
+          codexCompleted('turn-default', {
+            id: 'reason-default',
+            type: 'reasoning',
+            text: 'unique reasoning detail with no second durable copy',
+          })
+        ).seq
+        journal.append('s-default', 'codex/turn/completed', {
+          threadId: 'thread-1',
+          turn: { id: 'turn-default', status: 'completed', items: [] },
+        })
+      })
+
+      // Deliberately use the shipped defaults for both history limits. This is the regression: changing
+      // either default back above zero silently makes a 30-day-old chat lose unique audit detail.
+      const result = journal.condenseCompletedCodex({ nowMs: NOW, graceMs: 60 * 60 * 1000 })
+      expect(result.commandOutputDeltasDeleted).toBe(1)
+      expect(result.historyTurnsRolledUp).toBe(0)
+      expect(result.historyTurnsExpired).toBe(0)
+      expect(journal.since(0).find((event) => event.seq === reasoningSeq)?.payload).toEqual(
+        codexCompleted('turn-default', {
+          id: 'reason-default',
+          type: 'reasoning',
+          text: 'unique reasoning detail with no second durable copy',
+        })
+      )
+    } finally {
+      journal.db.close()
+    }
+  })
+
   it('collapses an old completed Codex turn to prose plus one explicit tool rollup', () => {
     vi.useFakeTimers()
     const journal = new Journal(path.join(tmp, 'codex.db'))

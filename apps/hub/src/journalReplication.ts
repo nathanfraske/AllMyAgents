@@ -741,6 +741,11 @@ function computePruneGate(db: Database.Database, reserve: boolean): ReplicationP
     throw new Error(`unknown journal replication disk policy: ${policy.diskPressurePolicy}`)
   }
   assertPositiveInteger(policy.requiredReplicas, 'required replica count')
+  // An ACK proves that this exact artifact passed verification AT ACK TIME; this synchronous maintenance
+  // process cannot prove a remote disk still exists now. That is acceptable while replication is an explicit
+  // CLI operation, but an automatic fleet scheduler MUST re-verify assigned artifacts before each pruning
+  // authorization (and remove/revoke stale ACKs on loss). A timestamp TTL would only measure age, not
+  // existence, and would turn mostly-offline personal machines into false failures without fixing the race.
   const rows = db
     .prepare(
       `SELECT ack.peer_node_id AS peerNodeId, generation.generation_id AS generationId,
@@ -1036,7 +1041,24 @@ export function restoreJournalSnapshot(options: {
     ) {
       throw new Error('scratch restore journal does not match its verified manifest')
     }
-    fs.renameSync(temporary, destination)
+    try {
+      // `rename(temp, hub.db)` is atomic but NOT no-replace on POSIX: a hub that creates hub.db during the
+      // long copy/verification window would have its live database silently unlinked, keep writing the old
+      // inode, and then reveal this snapshot on restart. A same-directory hard link publishes the already
+      // verified inode atomically and fails with EEXIST if any competing hub won the destination name.
+      fs.linkSync(temporary, destination)
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'EEXIST') {
+        throw new Error(`refusing to overwrite a journal created during restore at ${destination}`)
+      }
+      throw error
+    }
+    try {
+      fs.rmSync(temporary, { force: true })
+    } catch {
+      // Both names point to the same fully verified inode. A leftover .partial hard link wastes space but
+      // cannot make the installed hub.db unsafe or justify reporting an unretryable restore failure.
+    }
     try {
       writeJsonAtomic(path.join(destinationDataDir, REPLICATION_ROOT, 'restore-receipt.json'), {
         format: REPLICATION_FORMAT,

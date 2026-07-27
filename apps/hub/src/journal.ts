@@ -32,14 +32,16 @@ export const JOURNAL_CONDENSE_GRACE_MS = 60 * 60 * 1000
 export const JOURNAL_CONDENSE_INTERVAL_MS = 5 * 60 * 1000
 export const JOURNAL_CONDENSE_MAX_COMMAND_DELTAS = 5_000
 export const JOURNAL_CONDENSE_MAX_DIFF_SNAPSHOTS = 25
-// Full low-level turn detail remains available for a month. Past that point the transcript keeps exact
-// operator/assistant prose, while tool/reasoning machinery becomes one visibly-labelled rollup card.
+// These horizons describe a possible opt-in history policy, but both lossy batch limits stay ZERO until a
+// future explicit operator control enables it. The distinction is load-bearing: the one-hour condensation
+// above removes only SUPERSEDED rows (an intermediate diff, or a delta whose completed item durably contains
+// the aggregate). History rollup removes rows that are the ONLY copy of exact command inputs/results,
+// reasoning, and diffs. Silently starting that irreversible act merely because a chat turned 30 days old is
+// indefensible without advance warning and a known-good recovery path.
 export const JOURNAL_HISTORY_GRACE_MS = 30 * 24 * 60 * 60 * 1000
 export const JOURNAL_HISTORY_RETENTION_MS = 5 * 365 * 24 * 60 * 60 * 1000
-// A month-off machine at the measured ~50 completed turns/day catches up in roughly 80 minutes at one
-// 100-turn batch every five minutes, while each turn still commits in its own short writer transaction.
-export const JOURNAL_HISTORY_MAX_TURNS = 100
-export const JOURNAL_HISTORY_MAX_EXPIRED_TURNS = 100
+export const JOURNAL_HISTORY_MAX_TURNS = 0
+export const JOURNAL_HISTORY_MAX_EXPIRED_TURNS = 0
 export const JOURNAL_HISTORY_MAX_SOURCE_ROWS = 10_000
 export const JOURNAL_HISTORY_MAX_SOURCE_BYTES = 128 * 1024 * 1024
 export const JOURNAL_HISTORY_TOOL_TEXT_CHARS = 2_000

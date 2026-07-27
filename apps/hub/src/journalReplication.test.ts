@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
-import { afterEach, describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import { Journal } from './journal.js'
 import {
   chooseReplicaAssignments,
@@ -239,6 +239,42 @@ describe('journal snapshot replication', () => {
     ])
     expect(restored.lastJournaledWseq('source-session')).toBe(7)
     close(restored)
+  })
+
+  test('never replaces a hub.db created concurrently while a restore copy is being verified', async () => {
+    const sourceDir = root()
+    const peerDir = root()
+    const destinationDir = root()
+    const source = open(sourceDir)
+    source.append('source-session', 'session/input', { text: 'verified snapshot' })
+    const snapshot = await createJournalSnapshot({ sourceDataDir: sourceDir, chunkBytes: 16 * 1024 })
+    const transfer = await transferJournalSnapshot({
+      sourceGenerationDir: snapshot.generationDir,
+      targetDataDir: peerDir,
+    })
+    close(source)
+
+    const destination = path.join(destinationDir, 'hub.db')
+    const concurrentBytes = 'a concurrently started hub owns this path'
+    const realLink = fs.linkSync
+    const link = vi.spyOn(fs, 'linkSync').mockImplementation((existingPath, newPath) => {
+      // Deterministically put the competing hub creation in the exact check-to-install window. The atomic
+      // no-replace link must now fail; a POSIX rename would silently replace these bytes.
+      fs.writeFileSync(newPath, concurrentBytes)
+      return realLink(existingPath, newPath)
+    })
+    try {
+      expect(() =>
+        restoreJournalSnapshot({
+          replicaGenerationDir: transfer.generationDir,
+          destinationDataDir: destinationDir,
+          maxSchemaVersion: SCHEMA_VERSION,
+        })
+      ).toThrow(/exist|overwrite|race/i)
+      expect(fs.readFileSync(destination, 'utf8')).toBe(concurrentBytes)
+    } finally {
+      link.mockRestore()
+    }
   })
 
   test('grows instead of pruning when assigned peers have no verified coverage, then prunes only through an ack', async () => {
