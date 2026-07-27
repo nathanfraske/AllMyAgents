@@ -4,6 +4,8 @@ import {
   saveLastLayout,
   loadCollapsedFolders,
   saveCollapsedFolders,
+  loadQueues,
+  saveQueues,
   type PersistedLayout,
 } from './uiState'
 
@@ -84,5 +86,22 @@ describe('collapsed-folder persistence', () => {
   it('falls back to [] when the stored value is not an array', () => {
     localStorage.setItem(FOLDERS_KEY, JSON.stringify({ collapsed: true }))
     expect(loadCollapsedFolders()).toEqual([])
+  })
+})
+
+describe('queued-message persistence', () => {
+  it('round-trips attachment metadata while retaining legacy string entries', () => {
+    const attachment = {
+      id: 'att-1',
+      name: 'queued.png',
+      mime: 'image/png',
+      size: 123,
+      kind: 'image' as const,
+    }
+    saveQueues({ s1: ['plain', { text: 'with file', attachments: [attachment] }] })
+
+    expect(loadQueues()).toEqual({
+      s1: ['plain', { text: 'with file', attachments: [attachment] }],
+    })
   })
 })

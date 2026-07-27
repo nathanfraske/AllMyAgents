@@ -8,6 +8,13 @@
   import { distanceFromBottom, shouldShowJumpToBottom, newItemsBelow } from './transcriptScroll'
   import PastedTextChip from './PastedTextChip.svelte'
   import { shouldPromotePaste, composeWithPastes, type PastedText } from './pastePromote'
+  import AttachmentPreview from './AttachmentPreview.svelte'
+  import {
+    classifyKind,
+    validateIncoming,
+    vendorSupport,
+    type AttachmentMeta,
+  } from './attachments'
   import ContextMeter from './ContextMeter.svelte'
   import ModelPicker from './ModelPicker.svelte'
   import TraitsControl from './TraitsControl.svelte'
@@ -24,22 +31,110 @@
   import { loadComposerDrafts, saveComposerDrafts } from './uiState'
   import { resolveSlash, builtinsForProvider, builtinNeedsArg, loadProfileCommands, type SlashResult } from './commands'
   import { resolveWorkingContext, truncatePathTail } from './workingContext'
-  import type { CommandInfo } from './api'
+  import type { AttachmentRef, CommandInfo } from './api'
 
   let { sessionId, paneIndex = 0, multiPane = false }: { sessionId?: string; paneIndex?: number; multiPane?: boolean } =
     $props()
 
   let text = $state('')
+  type ComposerAttachment = AttachmentMeta & {
+    file: File
+    previewUrl?: string
+    uploaded?: AttachmentRef
+    uploadedFor?: string
+  }
+  let attachments = $state<ComposerAttachment[]>([])
+  let attachmentInput = $state<HTMLInputElement | null>(null)
+  let draggingFiles = $state(false)
+  let sending = $state(false)
+
+  function stageFiles(files: Iterable<File>): void {
+    let next = [...attachments]
+    for (const file of files) {
+      const error = validateIncoming(file, next.length)
+      if (error) {
+        sendErr = error
+        continue
+      }
+      const previewUrl =
+        classifyKind(file.type) === 'image' && typeof URL.createObjectURL === 'function'
+          ? URL.createObjectURL(file)
+          : undefined
+      next.push({
+        id: `staged:${crypto.randomUUID?.() ?? `${Date.now()}-${next.length}`}`,
+        name: file.name,
+        mime: file.type,
+        size: file.size,
+        kind: classifyKind(file.type),
+        file,
+        previewUrl,
+      })
+    }
+    attachments = next
+  }
+
+  function removeAttachment(id: string): void {
+    const item = attachments.find((a) => a.id === id)
+    if (item?.previewUrl) URL.revokeObjectURL(item.previewUrl)
+    attachments = attachments.filter((a) => a.id !== id)
+    sendErr = ''
+  }
+
+  function clearAttachments(): void {
+    for (const item of attachments) {
+      if (item.previewUrl) URL.revokeObjectURL(item.previewUrl)
+    }
+    attachments = []
+    if (attachmentInput) attachmentInput.value = ''
+  }
+
+  function onAttachmentPick(e: Event): void {
+    const input = e.currentTarget as HTMLInputElement
+    if (input.files) stageFiles(input.files)
+    // Selecting the same file after removing it must still fire `change`.
+    input.value = ''
+  }
+
+  function hasDraggedFiles(e: DragEvent): boolean {
+    return Array.from(e.dataTransfer?.types ?? []).includes('Files')
+  }
+
+  function onComposerDragOver(e: DragEvent): void {
+    if (!hasDraggedFiles(e)) return
+    e.preventDefault()
+    e.stopPropagation()
+    draggingFiles = true
+  }
+
+  function onComposerDragLeave(e: DragEvent): void {
+    if (e.currentTarget === e.target) draggingFiles = false
+  }
+
+  function onComposerDrop(e: DragEvent): void {
+    if (!hasDraggedFiles(e)) return
+    e.preventDefault()
+    e.stopPropagation()
+    draggingFiles = false
+    if (e.dataTransfer?.files) stageFiles(e.dataTransfer.files)
+  }
+
   // Large pastes promoted to chips (see pastePromote.ts). Content is held here and inlined into the
   // prompt on send — it is TEXT, so it reaches both vendors via the normal text path, never the
   // image/file attachment path (which would silently drop it on Codex).
   let pastes = $state<PastedText[]>([])
   function onPaste(e: ClipboardEvent): void {
+    const pastedImages = Array.from(e.clipboardData?.files ?? []).filter((f) => f.type.startsWith('image/'))
+    if (pastedImages.length) stageFiles(pastedImages)
     const t = e.clipboardData?.getData('text/plain') ?? ''
-    if (!shouldPromotePaste(t, settings.pasteAsTextThreshold)) return // small pastes behave normally
-    e.preventDefault()
-    const id = `paste:${crypto.randomUUID?.() ?? `${Date.now()}-${pastes.length}`}`
-    pastes = [...pastes, { id, name: `pasted-${pastes.length + 1}.txt`, content: t }]
+    if (shouldPromotePaste(t, settings.pasteAsTextThreshold)) {
+      e.preventDefault()
+      const id = `paste:${crypto.randomUUID?.() ?? `${Date.now()}-${pastes.length}`}`
+      pastes = [...pastes, { id, name: `pasted-${pastes.length + 1}.txt`, content: t }]
+    } else if (pastedImages.length && !t) {
+      // A screenshot clipboard has no useful textarea default. Prevent the browser from trying to insert
+      // an image object, while preserving normal small-text paste when the clipboard contains both.
+      e.preventDefault()
+    }
   }
   function removePaste(id: string): void {
     pastes = pastes.filter((p) => p.id !== id)
@@ -52,8 +147,9 @@
     pastes = pastes.filter((x) => x.id !== id)
     queueMicrotask(() => taRef?.focus())
   }
-  // A message is sendable when there is typed text OR at least one promoted paste.
-  const canSend = $derived(!!text.trim() || pastes.length > 0)
+  // A message may consist solely of attachments. `sending` closes the double-click/Enter race while the
+  // files upload; a second send must never mint duplicate attachment records.
+  const canSend = $derived(!sending && (!!text.trim() || pastes.length > 0 || attachments.length > 0))
   // Unsent composer text lives with the CHAT, not this component: switching panes, tabbing away, or
   // reloading keeps whatever you were mid-way through writing. `drafts` is a plain cache (never $state)
   // so writing it from an effect cannot feed back into reactivity.
@@ -309,6 +405,8 @@
     anchorKey = null
     stick = true
     pastes = [] // promoted pastes belong to the chat they were pasted into
+    untrack(clearAttachments) // staged files belong to the chat they were attached to
+    return () => untrack(clearAttachments)
   })
 
   // Model / thinking-effort / tier picks WRITE THROUGH to the hub immediately for a real session, so the
@@ -445,68 +543,125 @@
     }
   }
 
+  async function uploadStaged(
+    sessionId: string,
+    staged: ComposerAttachment[],
+  ): Promise<{ ids: string[]; meta: AttachmentMeta[] } | { error: string }> {
+    const uploaded: AttachmentRef[] = []
+    for (const item of staged) {
+      let ref = item.uploadedFor === sessionId ? item.uploaded : undefined
+      if (!ref) {
+        const out = await api.uploadAttachment(sessionId, item.file)
+        if ('error' in out) return { error: `Couldn’t attach “${item.name}”: ${out.error}` }
+        ref = out
+        // A failed send keeps its successful uploads on the chips, so retrying reuses the same ids.
+        attachments = attachments.map((a) =>
+          a.id === item.id ? { ...a, uploaded: ref, uploadedFor: sessionId } : a
+        )
+      }
+      uploaded.push(ref)
+    }
+    return {
+      ids: uploaded.map((a) => a.id),
+      meta: uploaded.map((a) => ({ ...a, kind: classifyKind(a.mime) })),
+    }
+  }
+
+  function clearComposerAfterSend(): void {
+    text = ''
+    pastes = []
+    clearAttachments()
+    sendErr = ''
+  }
+
   async function send(): Promise<void> {
     if (!view || !canSend) return
     const sid0 = view.record.id
-    // Inline any promoted pastes into the prompt (full content, delimited) — the delivery decision that
-    // keeps vendor parity. `typed`/`promoted` are captured so a failed send restores both WITHOUT
-    // re-thrashing the box (the blob goes back to its chip, not into the textarea).
-    const typed = text
     const promoted = pastes
-    const body = composeWithPastes(typed, promoted)
-    text = ''
-    pastes = []
+    const staged = [...attachments]
+    const body = composeWithPastes(text, promoted)
+    const unsupported = staged.find((a) => !vendorSupport(a, view.record.provider).ok)
+    if (unsupported) {
+      sendErr =
+        vendorSupport(unsupported, view.record.provider).reason ??
+        `“${unsupported.name}” is not supported here`
+      return
+    }
+    sending = true
     sendErr = ''
-    // Slash-command interception. A leading "/" may map to a hub feature (built-in) — run that action
-    // instead of sending text. CUSTOM commands (commands/*.md) resolve to `passthrough` and continue
-    // down the normal send path, where the driver expands them.
-    // A message carrying a promoted paste is never a slash command — don't let a stray leading "/" eat it.
-    if (promoted.length === 0 && body.trim().startsWith('/')) {
-      const res = resolveSlash(body.trim(), view.record.provider)
-      if (res.kind !== 'passthrough') {
-        await runSlash(res, sid0)
+    try {
+      // A message carrying a paste chip or real file is never intercepted as a slash command.
+      if (promoted.length === 0 && staged.length === 0 && body.trim().startsWith('/')) {
+        const res = resolveSlash(body.trim(), view.record.provider)
+        if (res.kind !== 'passthrough') {
+          await runSlash(res, sid0)
+          clearComposerAfterSend()
+          return
+        }
+      }
+
+      // Preserve the existing single-request first-turn path when there are no files.
+      if (view.draft && staged.length === 0) {
+        stick = true
+        const out = await store.materializeDraft(sid0, body)
+        if (out.error) sendErr = out.error
+        else clearComposerAfterSend()
         return
       }
-    }
-    // A DRAFT has no hub session: the first send spawns the real session with this prompt, then the
-    // store swaps this pane over to it. No steering/queueing (there is no running turn to steer).
-    if (view.draft) {
-      stick = true
-      const out = await store.materializeDraft(sid0, body)
-      if (out.error) {
-        text = typed // spawn failed — hand back typed text + the paste chips, no thrash
-        pastes = promoted
-        sendErr = out.error
+      if (view.draft) {
+        stick = true
+        // Upload ids can only be minted after a session exists. The store keeps the draft visible while
+        // this spawn-empty → upload → send transaction runs, and rolls the empty session back on failure.
+        const out = await store.materializeDraft(sid0, '', async (realId) => {
+          const upload = await uploadStaged(realId, staged)
+          if ('error' in upload) return upload
+          const sent = await api.send(realId, body, {
+            model: model || undefined,
+            effort: options.effort ?? undefined,
+            serviceTier: options.serviceTier ?? undefined,
+            attachments: upload.ids,
+          })
+          return sent.error ? { error: sent.error } : { ok: true }
+        })
+        if (out.error) sendErr = out.error
+        else clearComposerAfterSend()
+        return
       }
-      return
-    }
-    // Busy? Codex steers the running turn; Claude queues (combined/sent on turn end).
-    if (active) {
-      if (view.record.provider === 'codex') {
-        const out = await api.steer(sid0, body)
-        if (out.error) {
-          text = typed // steer failed — restore typed text + paste chips
-          pastes = promoted
-          sendErr = out.error
+
+      const upload = await uploadStaged(sid0, staged)
+      if ('error' in upload) {
+        sendErr = upload.error
+        return
+      }
+      // Busy? Codex steers the running turn; Claude queues, retaining uploaded ids for the later flush.
+      if (active) {
+        if (view.record.provider === 'codex') {
+          const out = await api.steer(sid0, body, upload.ids)
+          if (out.error) sendErr = out.error
+          else clearComposerAfterSend()
+        } else {
+          store.enqueue(sid0, body, upload.meta)
+          clearComposerAfterSend()
         }
-      } else {
-        store.enqueue(sid0, body)
+        return
       }
-      return
-    }
-    stick = true
-    store.noteSent(sid0) // immediate "received / thinking" feedback
-    const key = store.pushUserEcho(sid0, body) // echo the message immediately
-    const out = await api.send(sid0, body, {
-      model: model || undefined,
-      effort: options.effort ?? undefined,
-      serviceTier: options.serviceTier ?? undefined,
-    })
-    if (out.error) {
-      store.removeItem(sid0, key) // roll back the optimistic bubble
-      text = typed // restore typed text + paste chips so nothing is lost
-      pastes = promoted
-      sendErr = out.error
+      stick = true
+      store.noteSent(sid0)
+      const key = store.pushUserEcho(sid0, body, upload.meta)
+      const out = await api.send(sid0, body, {
+        model: model || undefined,
+        effort: options.effort ?? undefined,
+        serviceTier: options.serviceTier ?? undefined,
+        attachments: upload.ids.length ? upload.ids : undefined,
+      })
+      if (out.error) {
+        store.removeItem(sid0, key)
+        sendErr = out.error
+      } else {
+        clearComposerAfterSend()
+      }
+    } finally {
+      sending = false
     }
   }
 
@@ -762,7 +917,14 @@
     {/if}
 
     {#if sendErr}<div class="senderr" role="alert">⚠ {sendErr} — your message was kept in the box.</div>{/if}
-    <div class="composer">
+    <div
+      class="composer"
+      class:dragging-files={draggingFiles}
+      ondragover={onComposerDragOver}
+      ondragleave={onComposerDragLeave}
+      ondrop={onComposerDrop}
+      role="presentation"
+    >
       {#if cmdOpen}
         <div class="cmdmenu">
           <div class="cmdhint dim">Commands · type to filter · Enter runs or completes · Tab completes · Esc dismisses</div>
@@ -778,9 +940,28 @@
       {#each pastes as p (p.id)}
         <PastedTextChip paste={p} onremove={removePaste} oninline={inlinePaste} />
       {/each}
+      <AttachmentPreview
+        {attachments}
+        vendor={view.record.provider}
+        onremove={removeAttachment}
+      />
       <textarea rows="2" placeholder={isDraft ? 'Describe the first task… (Enter to start the chat, Shift+Enter for newline)' : steerable ? 'Steer the running turn… (appended to what Codex is doing now)' : active ? 'Queue a message… (sends when the current turn finishes)' : 'Ask for follow-up changes…  (Enter to send, Shift+Enter for newline)'}
         bind:this={taRef} bind:value={text} onkeydown={onKey} onpaste={onPaste}></textarea>
       <div class="cfoot">
+        <input
+          class="attachment-input"
+          type="file"
+          multiple
+          bind:this={attachmentInput}
+          onchange={onAttachmentPick}
+          aria-label="Choose files to attach"
+        />
+        <button
+          class="attach-btn"
+          title="Attach files"
+          aria-label="Attach files"
+          onclick={() => attachmentInput?.click()}
+        ><Icon name="paperclip" size={15} /></button>
         <AccountPicker {view} />
         <ModelPicker provider={view.record.provider} {model} onselect={setModel} />
         {#if modelDef}<TraitsControl descriptors={modelDef.descriptors} values={options} onchange={setOption} />{/if}
@@ -823,7 +1004,7 @@
             <button class="foot-act" onclick={stopSession} title="stop session">stop</button>
           {/if}
         {/if}
-        <button class="send-btn" class:queue={active} title={isDraft ? 'start this chat' : steerable ? 'steer into the running turn' : active ? 'queue message' : 'send'} onclick={send} disabled={!canSend}><Icon name={steerable ? 'corner-down-right' : active ? 'timer' : 'arrow-up'} size={16} /></button>
+        <button class="send-btn" class:queue={active} title={isDraft ? 'start this chat' : steerable ? 'steer into the running turn' : active ? 'queue message' : 'send'} onclick={send} disabled={!canSend}><Icon name={sending ? 'timer' : steerable ? 'corner-down-right' : active ? 'timer' : 'arrow-up'} size={16} /></button>
       </div>
       <!-- Action failures sit under their own control cluster: settings under the pills (left), session
            lifecycle under the interrupt/stop/reopen buttons (right) — never a global toast. -->
@@ -941,9 +1122,13 @@
   .tmeta, .est { font-variant-numeric: tabular-nums; }
   .composer { position: relative; background: var(--surface); border: 1px solid var(--border-strong); border-radius: 14px; padding: 0.6rem 0.7rem 0.5rem; }
   .composer:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent); }
+  .composer.dragging-files { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 7%, var(--surface)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent); }
   @media (prefers-reduced-motion: no-preference) { .composer { transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease); } }
   .composer textarea { width: 100%; background: none; border: none; resize: none; padding: 0.1rem 0.2rem; }
   .cfoot { display: flex; align-items: center; gap: 0.4rem; margin-top: 0.35rem; }
+  .attachment-input { display: none; }
+  .attach-btn { display: inline-grid; place-items: center; width: 28px; height: 26px; flex: none; border: 1px solid var(--border); border-radius: 7px; color: var(--muted); }
+  .attach-btn:hover { border-color: var(--border-strong); color: var(--text); background: var(--surface-2); }
 
   /* `/` command picker — floats above the composer, type-ahead filtered. */
   .cmdmenu { position: absolute; bottom: calc(100% + 6px); left: 0; right: 0; z-index: 11; max-height: 320px; overflow-y: auto;

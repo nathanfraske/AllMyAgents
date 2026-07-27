@@ -1,7 +1,14 @@
 import { api, HUB_WS, getHubToken, setHubToken } from './api'
 import { settings } from './settings.svelte'
 import { alertDialog } from './dialog.svelte'
-import { loadLastLayout, saveLastLayout, loadQueues, saveQueues, type PersistedLayout } from './uiState'
+import {
+  loadLastLayout,
+  saveLastLayout,
+  loadQueues,
+  saveQueues,
+  type PersistedLayout,
+  type QueuedEntry,
+} from './uiState'
 import { rowFate } from './fleetMerge'
 import { isChatBusy, nextOrderKey, orderChats, type ChatOrderFacts } from './chatOrder'
 import { extractCodexReasoning } from './codexGroup'
@@ -272,7 +279,7 @@ export class HubStore {
   settingsOpen = $state(false)
   // Queued messages survive a refresh: you already committed to sending that text, so losing it because
   // the page reloaded is data loss. Restored from localStorage and re-saved on every mutation.
-  queues = $state<Record<string, string[]>>(loadQueues())
+  queues = $state<Record<string, QueuedEntry[]>>(loadQueues())
   // Persisted sidebar arrangement: ordered project ids, and ordered chat ids keyed by group id
   // ('__none__' for the Unfiled group). Reorder methods update these + localStorage; the sidebar
   // reads `orderedProjects` / `orderedChats` to apply them.
@@ -303,11 +310,12 @@ export class HubStore {
   private importChecked = new Set<string>()
 
   queueFor(sessionId: string): string[] {
-    return this.queues[sessionId] ?? []
+    return (this.queues[sessionId] ?? []).map((q) => (typeof q === 'string' ? q : q.text))
   }
 
-  enqueue(sessionId: string, text: string): void {
-    const q = [...(this.queues[sessionId] ?? []), text]
+  enqueue(sessionId: string, text: string, attachments: AttachmentMeta[] = []): void {
+    const entry: QueuedEntry = attachments.length ? { text, attachments } : text
+    const q = [...(this.queues[sessionId] ?? []), entry]
     this.queues = { ...this.queues, [sessionId]: q }
     saveQueues(this.queues)
   }
@@ -315,7 +323,8 @@ export class HubStore {
   editQueued(sessionId: string, index: number, text: string): void {
     const q = [...(this.queues[sessionId] ?? [])]
     if (index < 0 || index >= q.length) return
-    q[index] = text
+    const current = q[index]
+    q[index] = typeof current === 'string' ? text : { ...current, text }
     this.queues = { ...this.queues, [sessionId]: q }
     saveQueues(this.queues)
   }
@@ -392,24 +401,31 @@ export class HubStore {
   private async flushQueue(sessionId: string): Promise<void> {
     const q = this.queues[sessionId]
     if (!q || q.length === 0) return
-    let toSend: string
-    let rest: string[]
+    let chosen: QueuedEntry[]
+    let rest: QueuedEntry[]
     if (settings.combineQueued) {
-      toSend = q.join('\n\n')
+      chosen = q
       rest = []
     } else {
-      toSend = q[0] as string
+      chosen = [q[0] as QueuedEntry]
       rest = q.slice(1)
     }
+    const toSend = chosen.map((entry) => (typeof entry === 'string' ? entry : entry.text)).join('\n\n')
+    const attachments = chosen.flatMap((entry) =>
+      typeof entry === 'string' ? [] : (entry.attachments ?? [])
+    )
     this.queues = { ...this.queues, [sessionId]: rest }
     saveQueues(this.queues)
-    const key = this.pushUserEcho(sessionId, toSend) // show the flushed queued message in the transcript
-    const res = (await api.send(sessionId, toSend)) as { error?: string } | undefined
+    const key = this.pushUserEcho(sessionId, toSend, attachments)
+    const res = (await (attachments.length
+      ? api.send(sessionId, toSend, { attachments: attachments.map((a) => a.id) })
+      : api.send(sessionId, toSend))) as { error?: string } | undefined
     if (!res?.error) return
     // Put it back at the HEAD so ordering survives, withdraw the echo (which also clears the suppress
     // flag and the thinking spinner), and say so — a queued message must never disappear silently.
     const current = this.queues[sessionId] ?? []
-    this.queues = { ...this.queues, [sessionId]: [toSend, ...current] }
+    const restored: QueuedEntry = attachments.length ? { text: toSend, attachments } : toSend
+    this.queues = { ...this.queues, [sessionId]: [restored, ...current] }
     saveQueues(this.queues)
     this.removeItem(sessionId, key)
     const view = this.sessions[sessionId]
@@ -686,7 +702,11 @@ export class HubStore {
   // (same pattern as a failed `api.send`). The first user message is rendered exactly once from the
   // hub's canonical `session/input` echo — `session/created` precedes it, so the view always exists
   // by the time it lands (no optimistic echo needed, no duplicate).
-  async materializeDraft(draftId: string, text: string): Promise<{ ok?: boolean; error?: string }> {
+  async materializeDraft(
+    draftId: string,
+    text: string,
+    deliverAfterSpawn?: (sessionId: string) => Promise<{ ok?: boolean; error?: string }>,
+  ): Promise<{ ok?: boolean; error?: string; sessionId?: string }> {
     const draft = this.sessions[draftId]
     if (!draft || !draft.draft) return { error: 'draft is gone' }
     const r = draft.record
@@ -694,8 +714,8 @@ export class HubStore {
       profileId: r.profileId,
       permissionMode: r.permissionMode ?? settings.defaultPermissionMode,
       useWorktree: draft.draftUseWorktree ?? settings.defaultUseWorktree,
-      prompt: text,
     }
+    if (!deliverAfterSpawn) body.prompt = text
     if (r.projectId) body.projectId = r.projectId
     if (r.model) body.model = r.model
     if (r.effort) body.effort = r.effort
@@ -705,21 +725,49 @@ export class HubStore {
       return { error: (out as { error?: string } | null)?.error ?? 'failed to start the session' }
     }
     const rec = out as SessionRecord
+    if (deliverAfterSpawn) {
+      let delivered: { ok?: boolean; error?: string }
+      try {
+        delivered = await deliverAfterSpawn(rec.id)
+      } catch (error) {
+        delivered = { error: error instanceof Error ? error.message : 'failed to send attachments' }
+      }
+      if (delivered.error) {
+        // The attachment first-turn transaction created this empty session solely to mint upload ids.
+        // Roll it back when upload/send fails so the visible draft remains the one honest retry point.
+        await api.deleteSession(rec.id).catch(() => undefined)
+        if (this.sessions[rec.id] && !this.basePanes().flat().includes(rec.id)) {
+          const { [rec.id]: _failed, ...withoutFailed } = this.sessions
+          this.sessions = withoutFailed
+        }
+        return { error: delivered.error }
+      }
+    }
     // Swap draft id → real id everywhere it is referenced, then drop the draft.
     const { [draftId]: _drop, ...rest } = this.sessions
     this.sessions = rest
     this.ensure(rec)
-    // Auto-switch the active pane to the freshly-spawned chat (Setting, default on) so the first send lands
-    // you ON the new chat — including when you sent from a split/background pane that wasn't the selected
-    // one. Off keeps the old behavior: only follow the new chat if you were already viewing the draft.
-    if (settings.autoSwitchToNewChat || this.selectedId === draftId) this.selectedId = rec.id
+    const shouldActivate = settings.autoSwitchToNewChat || this.selectedId === draftId
     if (this.splitPanes.length) {
-      this.splitPanes = this.splitPanes.map((row) => row.map((x) => (x === draftId ? rec.id : x)))
+      const rows = this.splitPanes.map((row) => row.map((x) => (x === draftId ? rec.id : x)))
+      if (shouldActivate && rows[0]?.[0] !== rec.id) {
+        // App renders splitPanes, not selectedId. Move the new chat into the primary displayed pane and
+        // swap the previous primary into the draft's old slot, preserving every open pane without dupes.
+        const targetRow = rows.findIndex((row) => row.includes(rec.id))
+        const targetCol = targetRow >= 0 ? rows[targetRow]!.indexOf(rec.id) : -1
+        if (targetRow >= 0 && targetCol >= 0 && rows[0]?.length) {
+          const previousPrimary = rows[0][0]!
+          rows[0][0] = rec.id
+          rows[targetRow]![targetCol] = previousPrimary
+        }
+      }
+      this.splitPanes = rows
     }
+    if (shouldActivate) this.selectedId = rec.id
     this.lastProfileId = rec.profileId
     this.noteSent(rec.id) // immediate "received / thinking" feedback while the first turn spins up
     this.markGlitch(rec.id) // glitch the sidebar label as the chat materializes into its project
-    return { ok: true }
+    return { ok: true, sessionId: rec.id }
   }
 
   // Flag a chat id as just-materialized/renamed so the sidebar can play a one-shot glitch on it.
@@ -1080,12 +1128,12 @@ export class HubStore {
   // text back as an event (only tool results), so without this the transcript jumps straight to
   // the reply. For Codex we set a one-shot suppress flag so its own userMessage event doesn't
   // double the bubble. Returns the item key so a failed send can roll it back.
-  pushUserEcho(sessionId: string, text: string): string {
+  pushUserEcho(sessionId: string, text: string, attachments: AttachmentMeta[] = []): string {
     const v = this.sessions[sessionId]
     if (!v) return ''
     const ts = new Date().toISOString()
     const key = `user:sent:${v.items.length}:${ts}`
-    this.push(v, { kind: 'user', ts, text, key })
+    this.push(v, { kind: 'user', ts, text, key, ...(attachments.length ? { attachments } : {}) })
     this.touch(v, ts)
     // Suppress the canonical session/input event (and Codex's own userMessage) that the hub will
     // echo back over the WS, so the optimistic bubble isn't duplicated.

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from './api'
 import { store } from './store.svelte'
+import { settings } from './settings.svelte'
 import { loadLastLayout, saveLastLayout } from './uiState'
 import type { HubEvent, SessionRecord } from './api'
 
@@ -103,6 +104,7 @@ beforeEach(() => {
   store.connected = false
   store.settingsOpen = false
   store.lastProfileId = null
+  settings.autoSwitchToNewChat = true
   vi.stubGlobal('alert', vi.fn())
   seedN = 0
 })
@@ -342,6 +344,39 @@ describe('newSession (draft) + materializeDraft', () => {
     expect(store.sessions[draftId]).toBeUndefined() // draft consumed
     expect(store.sessions.spawned).toBeDefined() // real session ensured
     expect(store.selectedId).toBe('spawned') // pane swapped onto the real id
+  })
+
+  it('auto-switch makes a materialized background draft the primary displayed split pane', async () => {
+    seed('old')
+    store.profiles = [{ id: 'p1', provider: 'claude' }]
+    await store.newSession('p1')
+    const draftId = store.selectedId!
+    // Reproduce the actual failure: selectedId changes, but App renders splitPanes. The draft is in a
+    // background pane, so merely assigning selectedId cannot make the newly-created chat primary.
+    store.splitPanes = [['old', draftId]]
+    store.selectedId = 'old'
+    settings.autoSwitchToNewChat = true
+
+    const out = await store.materializeDraft(draftId, 'from the background')
+
+    expect(out.error).toBeUndefined()
+    expect(store.selectedId).toBe('spawned')
+    expect(panes()).toEqual([['spawned', 'old']])
+  })
+
+  it('leaves a materialized background draft in its pane when auto-switch is off', async () => {
+    seed('old')
+    store.profiles = [{ id: 'p1', provider: 'claude' }]
+    await store.newSession('p1')
+    const draftId = store.selectedId!
+    store.splitPanes = [['old', draftId]]
+    store.selectedId = 'old'
+    settings.autoSwitchToNewChat = false
+
+    await store.materializeDraft(draftId, 'stay put')
+
+    expect(store.selectedId).toBe('old')
+    expect(panes()).toEqual([['old', 'spawned']])
   })
 
   it('opens settings instead of drafting when there is no profile at all', async () => {
@@ -689,6 +724,23 @@ describe('queued messages — replay must not send, and a failed send must not l
     await tick()
     expect(api.send).toHaveBeenCalledTimes(1)
     expect(api.send).toHaveBeenCalledWith('a', 'go')
+  })
+
+  it('keeps uploaded attachment ids on a queued message through the later flush', async () => {
+    seed('a')
+    const attachment = {
+      id: 'att-1',
+      name: 'queued.png',
+      mime: 'image/png',
+      size: 123,
+      kind: 'image' as const,
+    }
+    store.enqueue('a', 'see this', [attachment])
+    completeTurn('a', 1)
+    await tick()
+
+    expect(api.send).toHaveBeenCalledWith('a', 'see this', { attachments: ['att-1'] })
+    expect(store.sessions.a?.items.find((item) => item.kind === 'user')?.attachments).toEqual([attachment])
   })
 
   /**
