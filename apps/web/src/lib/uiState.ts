@@ -1,3 +1,5 @@
+import type { AttachmentMeta } from './attachments'
+
 // Cross-restart UI-state persistence (per-device webview localStorage — survives Tauri app
 // restarts). Mirrors the order/settings persistence already in the app: namespaced `allmyagents.*`
 // keys, JSON values, and every read wrapped in try/catch → defaults so a malformed or absent value
@@ -111,21 +113,48 @@ export function loadOpenAgentPanels(): string[] {
   return []
 }
 
-// Messages you typed while a turn was running, per session. They live client-side until the turn ends,
-// so a refresh used to silently throw away text you had already committed to sending — persist them.
+// Messages you typed while a turn was running, per session. Attachment-bearing entries also persist the
+// already-uploaded hub metadata/ids, so a reload before the queue flushes cannot silently strip the files.
 const QUEUES_KEY = 'allmyagents.ui.queuedMessages'
 
-export function loadQueues(): Record<string, string[]> {
+export interface QueuedMessage {
+  text: string
+  attachments?: AttachmentMeta[]
+}
+export type QueuedEntry = string | QueuedMessage
+
+function queuedEntry(value: unknown): QueuedEntry | null {
+  if (typeof value === 'string') return value
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const raw = value as { text?: unknown; attachments?: unknown }
+  if (typeof raw.text !== 'string') return null
+  const attachments = Array.isArray(raw.attachments)
+    ? raw.attachments.filter((a): a is AttachmentMeta => {
+        if (!a || typeof a !== 'object') return false
+        const item = a as Partial<AttachmentMeta>
+        return (
+          typeof item.id === 'string' &&
+          typeof item.name === 'string' &&
+          typeof item.mime === 'string' &&
+          typeof item.size === 'number' &&
+          (item.kind === 'image' || item.kind === 'file')
+        )
+      })
+    : undefined
+  return { text: raw.text, ...(attachments?.length ? { attachments } : {}) }
+}
+
+export function loadQueues(): Record<string, QueuedEntry[]> {
   try {
     const raw = localStorage.getItem(QUEUES_KEY)
     if (raw) {
       const v = JSON.parse(raw) as unknown
       if (v && typeof v === 'object' && !Array.isArray(v)) {
-        const out: Record<string, string[]> = {}
+        const out: Record<string, QueuedEntry[]> = {}
         for (const [k, list] of Object.entries(v as Record<string, unknown>)) {
           if (Array.isArray(list)) {
-            const texts = list.filter((x): x is string => typeof x === 'string')
-            if (texts.length) out[k] = texts
+            const entries = list.map(queuedEntry).filter((x): x is QueuedEntry => x !== null)
+            if (entries.length) out[k] = entries
           }
         }
         return out
@@ -137,7 +166,7 @@ export function loadQueues(): Record<string, string[]> {
   return {}
 }
 
-export function saveQueues(queues: Record<string, string[]>): void {
+export function saveQueues(queues: Record<string, QueuedEntry[]>): void {
   try {
     // Drop empty lists so the entry does not grow forever as chats come and go.
     const trimmed = Object.fromEntries(Object.entries(queues).filter(([, v]) => v.length > 0))
