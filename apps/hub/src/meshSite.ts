@@ -42,6 +42,21 @@ export interface FleetMember {
   role?: string
 }
 
+/** One site a peer advertises in its presence profile (`NodeProfile.sites`). */
+export interface PeerSiteAdvert {
+  id: string
+  label: string
+  port: number
+  scheme?: string
+  loopback?: boolean
+}
+
+/** The advertised site allow-list cached for one peer by the local node. */
+export interface PeerSites {
+  device: string
+  sites: PeerSiteAdvert[]
+}
+
 export interface MeshStatus {
   /** Runtime toggle — whether we're trying to expose at all. */
   enabled: boolean
@@ -151,6 +166,8 @@ export class MeshSite {
   private readonly socketPath: string
   private last: MeshStatus
   private autoTimer: ReturnType<typeof setInterval> | undefined
+  /** Last presence-derived sites per canonical device, retained across a peer's transient absence. */
+  private readonly peerSitesCache = new Map<string, PeerSites>()
 
   constructor(opts: { port: number; label?: string; enable?: boolean; socketPath?: string }) {
     this.port = opts.port
@@ -177,6 +194,16 @@ export class MeshSite {
     return `tcp:${this.port}`
   }
 
+  /**
+   * Keep the protocol-visible advert machine-identifiable even when the operator gives this hub a
+   * custom display label. Existing/default labels remain byte-for-byte unchanged.
+   */
+  private advertisedLabel(): string {
+    const label = this.label.trim()
+    if (/^allmyagents(?:\b|$)/i.test(label)) return label
+    return label ? `AllMyAgents — ${label}` : 'AllMyAgents'
+  }
+
   private update(patch: Partial<MeshStatus>): MeshStatus {
     this.last = { ...this.last, ...patch, enabled: this.enabled, checkedAt: new Date().toISOString() }
     return this.last
@@ -201,7 +228,7 @@ export class MeshSite {
           break // the node answered but refused — retrying won't help
         }
         const exposed: Record<string, string> = { ...((cur.result as Record<string, string>) ?? {}) }
-        exposed[this.siteId()] = this.label
+        exposed[this.siteId()] = this.advertisedLabel()
         const set = await roundTrip(this.socketPath, 'site_set_exposed', { exposed }, 10000)
         if (!set.ok) {
           lastErr = set.error ?? 'site_set_exposed failed'
@@ -332,18 +359,73 @@ export class MeshSite {
   }
 
   /**
+   * Read the peer profiles the node already learned through normal presence.
+   *
+   * `NodeProfile.sites` is the peer's exhaustive advertised allow-list (protocol/app.rs:300-308);
+   * `session_snapshot` returns those profiles synchronously in `result.peers` (mesh.rs:7828-7855,
+   * node_control.rs:1646). This is the exact, quiet discovery API: unlike `site_remote_list`, it
+   * neither scans the remote machine nor waits for a separately streamed event.
+   *
+   * Profiles that arrive update the cache even when their site list becomes empty (a deliberate
+   * unexpose). Profiles absent from one snapshot remain cached so a known hub stays attributable
+   * while its machine sleeps; `owned_roster` remains the authority for whether it is still paired.
+   */
+  async peerSites(timeoutMs = 4000): Promise<PeerSites[]> {
+    try {
+      const r = await roundTrip(this.socketPath, 'session_snapshot', {}, timeoutMs)
+      if (!r.ok) return [...this.peerSitesCache.values()]
+      const peers = (r.result as { peers?: unknown } | undefined)?.peers
+      if (!Array.isArray(peers)) return [...this.peerSitesCache.values()]
+      for (const raw of peers) {
+        const profile = raw as { node?: unknown; sites?: unknown }
+        if (typeof profile.node !== 'string' || profile.node.length === 0) continue
+        const sites: PeerSiteAdvert[] = []
+        if (Array.isArray(profile.sites)) {
+          for (const candidate of profile.sites) {
+            const site = candidate as {
+              id?: unknown
+              label?: unknown
+              port?: unknown
+              scheme?: unknown
+              loopback?: unknown
+            }
+            if (
+              typeof site.id !== 'string' ||
+              typeof site.label !== 'string' ||
+              typeof site.port !== 'number' ||
+              !Number.isInteger(site.port) ||
+              site.port <= 0 ||
+              site.port > 65_535
+            ) {
+              continue
+            }
+            sites.push({
+              id: site.id,
+              label: site.label,
+              port: site.port,
+              scheme: typeof site.scheme === 'string' ? site.scheme : undefined,
+              loopback: typeof site.loopback === 'boolean' ? site.loopback : undefined,
+            })
+          }
+        }
+        const canonical = profile.node.split('-', 1)[0]!.toLowerCase()
+        this.peerSitesCache.set(canonical, { device: profile.node, sites })
+      }
+    } catch {
+      // A node restart or temporary socket loss must not make a known sleeping hub vanish.
+    }
+    return [...this.peerSitesCache.values()]
+  }
+
+  /**
    * Bind (idempotently) a local loopback port that tunnels to `node`'s hub on `port` — so
    * `http://localhost:<localPort>` is that peer's hub (node_control.rs:1612 → mesh.rs `site_map`
    * :14618; success reply `{ localPort }`). Returns null when the node refuses (its own device →
    * "that's this device", so self is naturally excluded), the peer is offline/unreachable, or no
    * node is running here. Default `port` is the well-known hub port 7777.
    *
-   * NOTE (first cut): we do NOT use `site_remote_list` to pre-filter which peers actually expose a
-   * hub — its answer arrives as an async `allmystuff://node-sites` EVENT (mesh.rs:14526/14592), and
-   * this hub's `roundTrip` only returns the first JSON reply frame (it skips event frames), so it
-   * can't capture that reply. The pragmatic MVP (docs/mesh-unified-fleet.md §5.5) is to map each
-   * member then probe `/api/health` — a machine not running a hub simply fails the probe. Capturing
-   * the event to know exposure BEFORE mapping is part of the full drive-remote (L) work.
+   * Discovery gets the actual port from `peerSites()` before calling this. The health probe remains
+   * necessary because a local mapping can bind while its peer is offline.
    */
   async siteMap(node: string, port = 7777, timeoutMs = 4000): Promise<number | null> {
     try {

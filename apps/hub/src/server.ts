@@ -877,12 +877,10 @@ export function startServer(opts: ServerOptions): http.Server {
         return
       }
       // Unified-across-mesh fleet roster (read-only, first cut — docs/mesh-unified-fleet.md). Always
-      // returns THIS hub as the local entry; when an AllMyStuff node is present it adds every
-      // co-owned peer whose hub the node can map a loopback port to, probing /api/health for `online`.
-      // Fail-soft + fast with no node/no peers: mesh.ownedRoster() returns [] immediately, so this is
-      // just the single local entry (the single-machine case). Gated by requireToken like any /api/*.
-      // TODO(full drive-remote, L): rehydrate from `site_mappings` + capture the `allmystuff://
-      //   node-sites` event to know hub exposure before mapping, instead of map-then-probe each poll.
+      // returns THIS hub as the local entry. Peer ports come from presence-advertised sites in the
+      // node's session snapshot, so non-default ports are exact and no-hub machines get no map/probe.
+      // `/api/health` distinguishes an online hub from a cached advert for a sleeping machine.
+      // Fail-soft + fast with no node/no peers; gated by requireToken like every /api/* route.
       if (method === 'GET' && url.pathname === '/api/fleet') {
         const m = mesh.status()
         const sites = await buildFleet({
@@ -890,6 +888,7 @@ export function startServer(opts: ServerOptions): http.Server {
           localLabel: m.label,
           localBaseUrl: `http://127.0.0.1:${m.port}`,
           roster: () => mesh.ownedRoster(),
+          peerSites: () => mesh.peerSites(),
           siteMap: (node, p) => mesh.siteMap(node, p),
           probeHealth: (baseUrl) => probeHubHealth(baseUrl, 1500),
           extraPorts: meshPeerPorts,

@@ -1,15 +1,15 @@
 import http from 'node:http'
-import type { FleetMember } from './meshSite.js'
+import type { FleetMember, PeerSites } from './meshSite.js'
 
 /**
  * Unified-across-mesh fleet view — FIRST CUT (read-only roster, badged by machine).
  * See docs/mesh-unified-fleet.md "First-cut path (S–M)".
  *
- * `buildFleet` turns the node's fleet directory into the list `GET /api/fleet` returns: always THIS
- * hub as a `local:true` entry, plus each co-owned peer whose hub the node can map, with `online` set
- * by a `/api/health` probe. It's a pure function over injected deps (roster/siteMap/probeHealth) so
- * the discovery logic is unit-tested without a node or the network (see fleet.test.ts). The concrete
- * node calls live on MeshSite (`ownedRoster`/`siteMap`); the concrete probe is `probeHubHealth`.
+ * `buildFleet` turns the node's fleet directory + cached presence adverts into the list
+ * `GET /api/fleet` returns: always THIS hub as a `local:true` entry, plus each co-owned peer that
+ * advertises an AllMyAgents site. Presence carries the peer's actual port, so a hub displaced from
+ * 7777 is found without a sweep. It's pure over injected deps so discovery is unit-tested without a
+ * node or network (see fleet.test.ts).
  */
 
 export interface FleetSite {
@@ -38,33 +38,42 @@ export interface BuildFleetDeps {
   localBaseUrl: string
   /** `owned_roster` members (node id + label); [] when there's no node here / not in a fleet. */
   roster: () => Promise<FleetMember[]>
+  /**
+   * Peer profiles from the node's synchronous `session_snapshot`. Each profile's `sites` is the
+   * exhaustive exposed allow-list it advertised through presence.
+   */
+  peerSites: () => Promise<PeerSites[]>
   /** `site_map(node, port)` → local loopback port, or null when the node won't map it (incl. self / offline peer). */
   siteMap: (node: string, port: number) => Promise<number | null>
   /** `GET <baseUrl>/api/health` → true when a hub answered. */
   probeHealth: (baseUrl: string) => Promise<boolean>
-  /** Well-known peer hub port (default 7777). */
+  /** Explicit legacy candidate, when a caller has one. Omitted by the automatic path. */
   hubPort?: number
   /**
-   * EXTRA remote ports to try when the well-known one finds nothing.
-   *
-   * 7777 being "the" hub port is an assumption that breaks the moment a machine already has something
-   * on it — including a second AllMyAgents — because that hub binds a different port and then no amount
-   * of correctly exposing its site makes it discoverable here. Observed directly: a peer with a live hub
-   * and a correctly exposed site stayed invisible because discovery only ever asked for 7777.
-   *
-   * We cannot enumerate a peer's exposed sites to find out: `site_remote_list` answers with an async
-   * `allmystuff://node-sites` EVENT rather than a reply frame, and the control socket's round-trip only
-   * returns the first reply (see meshSite.siteMap's note). Until that event can be captured, the honest
-   * fallback is to let the operator name the ports their other machines actually use.
+   * Operator-configured fallback ports. These remain useful for an old/mislabelled peer that does not
+   * advertise an identifiable AllMyAgents site. Unlike the default path, explicit overrides are tried
+   * across roster members because the operator deliberately named them.
    */
   extraPorts?: readonly number[]
 }
 
+function canonicalDevice(id: string): string {
+  return id.split('-', 1)[0]!.toLowerCase()
+}
+
+function isHubLabel(label: string): boolean {
+  return /^allmyagents(?:\b|$)/i.test(label.trim())
+}
+
+function validPort(port: number): boolean {
+  return Number.isInteger(port) && port > 0 && port <= 65_535
+}
+
 /**
  * Build the fleet roster. Always returns at least the local entry; remote entries are the co-owned
- * members the node could map a loopback port to (self is dropped because `site_map` returns null for
- * "that's this device"), each with `online` from the health probe. Members are mapped + probed
- * concurrently so the endpoint stays fast; every step is failure-isolated per member.
+ * members that advertise an AllMyAgents hub (plus explicitly configured fallback ports), each with
+ * `online` from the health probe. Machines with no hub advert receive zero maps and zero HTTP probes.
+ * Members are resolved concurrently; every step is failure-isolated per member.
  *
  * The no-peer / no-node case returns exactly `[local]` — nothing to merge, so the single-machine UI
  * is unchanged.
@@ -85,11 +94,28 @@ export async function buildFleet(deps: BuildFleetDeps): Promise<FleetSite[]> {
   }
   if (members.length === 0) return [local]
 
-  // Try the well-known port first, then any operator-configured extras. Deduped and ordered so the
-  // common single-port case does exactly one map + probe, exactly as before.
-  const ports = [...new Set([deps.hubPort ?? 7777, ...(deps.extraPorts ?? [])])]
+  let advertised: PeerSites[] = []
+  try {
+    advertised = await deps.peerSites()
+  } catch {
+    advertised = []
+  }
+  const discovered = new Map<string, number[]>()
+  for (const peer of advertised) {
+    const ports = peer.sites.filter((site) => isHubLabel(site.label) && validPort(site.port)).map((site) => site.port)
+    discovered.set(canonicalDevice(peer.device), [...new Set(ports)])
+  }
+  const overridePorts = [
+    ...(deps.hubPort == null ? [] : [deps.hubPort]),
+    ...(deps.extraPorts ?? []),
+  ].filter(validPort)
+
   const remotes = await Promise.all(
     members.map(async (m): Promise<FleetSite | null> => {
+      // Presence is exact and quiet: only a peer that explicitly advertises an AllMyAgents-labelled
+      // allow-list entry gets mapped. Explicit peerPorts remain the opt-in escape hatch for old peers.
+      const ports = [...new Set([...(discovered.get(canonicalDevice(m.device)) ?? []), ...overridePorts])]
+      if (ports.length === 0) return null
       let firstMapped: string | null = null
       for (const port of ports) {
         const localPort = await deps.siteMap(m.device, port).catch(() => null)

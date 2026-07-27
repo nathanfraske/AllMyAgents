@@ -386,11 +386,9 @@ const meshEnable = !(
   config.mesh?.enable === false
 )
 const mesh = new MeshSite({ port: publicPort, label: config.mesh?.label, enable: meshEnable })
-// Extra remote ports to try when discovering peer hubs. 7777 is the well-known one, but a machine that
-// already had something on 7777 — including another AllMyAgents — runs its hub elsewhere, and no amount of
-// correctly exposing its site makes it findable if discovery only ever asks for 7777. We cannot enumerate a
-// peer's sites to learn the right port (site_remote_list answers via an async event the control socket
-// cannot capture), so the operator names them: config.mesh.peerPorts = [7778, 7900, …].
+// Explicit fallback ports for old/mislabelled peers. Normal discovery needs no configuration: the node's
+// session snapshot already carries each peer's presence-advertised sites and therefore its actual hub port.
+// Keep config.mesh.peerPorts = [7778, 7900, …] as an operator override for compatibility.
 const meshPeerPorts: number[] = Array.isArray(config.mesh?.peerPorts)
   ? config.mesh.peerPorts.filter((p): p is number => Number.isInteger(p) && p > 0 && p < 65536)
   : []

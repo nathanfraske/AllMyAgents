@@ -37,24 +37,40 @@ holds/relays remote tokens). That fork drives most of the full-thing architectur
 
 ## 1. What the mesh already gives us — CONFIRMED-FROM-SOURCE
 
-`apps/hub/src/meshSite.ts` today does exactly two things: reads this node's own exposed map (`site_exposed`)
-and merges its own hub port into it (`site_set_exposed`) — `meshSite.ts:184`, `meshSite.ts:191`. Registration
-makes `tcp:<port>` → label `"AllMyAgents"` visible to the fleet (`meshSite.ts:143`, `:152`, `:190`). Its
-generic frame client `roundTrip(socketPath, cmd, args, timeoutMs)` (`meshSite.ts:64`) can call **any** node
-command with the same framing — it just isn't pointed at the discovery commands yet. (`roundTrip` is
-module-private; `MeshSite` is the export — a fleet module would add methods to `MeshSite` or re-use the ~40-line
-client.)
+`apps/hub/src/meshSite.ts` registers this hub by reading the node's own exposed map (`site_exposed`) and
+merging its actual listening port into it (`site_set_exposed`). Registration makes `tcp:<actualPort>` visible
+to the fleet under an `AllMyAgents`-prefixed label. It also reads the node's synchronous `session_snapshot`
+for the site allow-lists peers already advertised through normal presence.
 
-**The node control socket already offers a full directory + routing API.** Read from the in-repo AllMyStuff
-checkout at `data/worktrees/2506afc9/node/src/` (a co-owned repo the user develops; point-in-time snapshot):
+**The node control socket already offers a full directory + routing API.** Re-verified against the local
+AllMyStuff checkout at commit `e031b7d`:
 
 | Command | file:line | Returns | Use for unified view |
 |---|---|---|---|
-| `owned_roster` | `node_control.rs:1668` → `mesh.rs:9667` | `{ in_fleet, members:[{device:NodeId, label, role}], … }` | **The fleet directory.** Every fleet machine with its node id + human label. |
-| `site_remote_list {node}` | `node_control.rs:1635` → `mesh.rs:14526` | async event `allmystuff://node-sites`: `{from, services:[{id,name,port,scheme,loopback,process,title}], exposed:{"tcp:7777":"AllMyAgents"}}` | Discover **which** machines expose an AllMyAgents hub (look for `tcp:7777` in `exposed`). Reply is event-driven (fire-and-forget), gated owner/fleet. |
-| `site_map {node, port}` | `node_control.rs:1612` → `mesh.rs:14618` | `{ localPort }` | **The routing primitive.** Binds a local loopback port that tunnels to that peer's hub; idempotent. `site_map(nodeX, 7777)` → `http://localhost:<localPort>` **is** machine X's hub. |
-| `site_mappings` | `node_control.rs:1625` → `mesh.rs:14517` | `[{node, port, localPort}]` | List/rehydrate active remote-hub mappings. |
+| `owned_roster` | `node_control.rs:1668` → `mesh.rs:fleet_roster_value` | `{ in_fleet, members:[{device:NodeId, label, role}], … }` | **The fleet directory.** Every paired machine, including offline ones. |
+| `session_snapshot` | `node_control.rs:1646` → `mesh.rs:7828-7855` | `{ready, me, peers:[NodeProfile], …}` | **Default hub discovery.** Each live/last-known peer profile carries its exhaustive `sites` allow-list, including the actual port and custom advertised label. Synchronous and local-only. |
+| `site_remote_list {node}` | `node_control.rs:1635-1637` → `mesh.rs:14991-15060` | immediate `null` ack; later `allmystuff://node-sites` event | Rich remote-management query: asks the peer to scan every listener and return both services and its exposed map. Not needed for discovery. |
+| `site_map {node, port}` | `node_control.rs:1612-1617` → `mesh.rs:15083+` | `{ localPort }` | **The routing primitive.** Binds a local loopback port tunnelling to that exact advertised peer port; idempotent. |
+| `site_mappings` | `node_control.rs:1625-1633` | `[{node, port, localPort}]` | List/rehydrate active remote-hub mappings. |
 | `site_unmap {node, port}` | `node_control.rs:1620` | ok | Tear a mapping down. |
+
+### The `node-sites` event channel, exactly
+
+Ordinary commands use short-lived connections. Events do **not** return on the `site_remote_list` command
+connection. A client opens a second, long-lived connection to the same node socket:
+
+1. Send a tag-0 frame whose JSON body is `{"cmd":"__subscribe_events","args":null}`.
+2. Receive a tag-0 ack: `{"ok":true,"result":null,"error":null}`.
+3. Keep the connection open. Engine events arrive as tag-2 frames. A site-list reply is:
+   `{"kind":"emit","event":"allmystuff://node-sites","payload":{"from":"<node>","services":[...],"exposed":{...}}}`.
+4. Tag 3 with an empty payload means the node is restarting.
+
+The server recognizes the sentinel and switches that connection to its event writer
+(`node_control.rs:942-944,1097-1126`). `SocketSink` queues every `UiSink` event and `fan_out` broadcasts it to
+all current subscribers (`:733-815`). The GUI's `run_event_pump` calls `subscribe_events`, then re-emits each
+`NodeEvent::Emit` onto Tauri's event bus (`gui/src-tauri/src/main.rs:2373-2465`). The Svelte layer listens for
+`allmystuff://node-sites` (`gui/src/tauri.ts:2223-2231`) and stores it by canonical sender
+(`gui/src/store.svelte.ts:5163-5179`).
 
 Supporting facts:
 - **The tunnel carries WebSocket end-to-end.** `sites.rs:24-30` — "a **transparent layer-4 tunnel** — raw
@@ -65,9 +81,27 @@ Supporting facts:
   `/api/health` after `site_map` is the reliable "is there a hub here" signal. — INFERENCE (from the two halves).
 - **Same-owner devices need no grant** (DESIGN.md D13.1, `:81`); the exposed set *is* the port allow-list.
 
-**Bottom line for Q1:** the node offers a directory (`owned_roster`) AND per-peer hub discovery
-(`site_remote_list`) AND the loopback-mapping routing primitive (`site_map`). **No node-side change is
-required.** The hub simply needs to start *calling* these commands (it already holds the socket connection).
+**Bottom line for Q1:** the node already learns exposed sites through presence; `session_snapshot` makes that
+knowledge available synchronously. `site_remote_list` is the richer on-demand management scan, not the
+discovery primitive. No node-side change is required for automatic hub discovery.
+
+### Automatic-discovery coverage
+
+| Scenario | Behavior |
+|---|---|
+| Hub before node / node before hub | `startAutoRegister` retries registration every 30 seconds; an already-running node is registered immediately. |
+| Hub restart / node restart | Hub startup re-registers idempotently; the upkeep loop notices a lost node map and restores the advert after the node returns. |
+| Same host port on several machines | Each `(device, hostPort)` gets its own mapping; AllMyStuff chooses a free local port, so remote `:7777` sites do not conflict. |
+| Hub displaced from 7777 | Presence advertises the actual `tcp:<port>` and discovery maps that exact port. |
+| Offline paired hub | A previously seen advert remains cached and its health probe reports `online:false`; if never seen in this hub process, it is discovered when presence arrives after the peer returns. |
+| More than two machines | Roster members are matched to adverts by canonical device id and resolved independently/concurrently. |
+| Fleet machine with no hub | No AllMyAgents-labelled site means no mapping and no HTTP probe. |
+| Old/mislabelled peer | `config.mesh.peerPorts` remains an explicit fallback. New custom labels are advertised with an `AllMyAgents` prefix so upgraded hubs stay self-identifying. |
+
+The discovery/routing layer does not solve cross-hub HTTP credentials. With `security.requireToken` enabled,
+each hub still has its own token and the current client reuses only the local token (see §5.1). Automatic
+credential exchange would need a separate authenticated protocol; it must not be inferred from a mapped
+localhost connection.
 
 ---
 
@@ -190,13 +224,12 @@ one decision that reshapes the whole full-thing architecture, and the only piece
 
 ## Appendix — key citations
 
-- Hub mesh client (own registration only today): `apps/hub/src/meshSite.ts:64` (`roundTrip`), `:175`
-  (`register`), `:184`/`:191` (`site_exposed`/`site_set_exposed`), `:143`/`:152` (label + `tcp:<port>` siteId).
+- Hub mesh client: `apps/hub/src/meshSite.ts` (`roundTrip`, `register`, `peerSites`, `siteMap`).
 - Mesh wiring / auto-expose: `apps/hub/src/index.ts:108-144`.
-- Node directory + routing API (in-repo AllMyStuff checkout): `data/worktrees/2506afc9/node/src/node_control.rs`
-  — `owned_roster` `:1668`, `site_remote_list` `:1635`, `site_map` `:1612`, `site_mappings` `:1625`,
-  `site_unmap` `:1620`; impls in `.../node/src/mesh.rs` — `fleet_roster_value` `:9667`, `site_map` `:14618`,
-  `site_remote_list` `:14526`, `handle_site_control` `:14549`; tunnel transport doc `.../node/src/sites.rs:24-30`.
+- Node directory + routing API (AllMyStuff `e031b7d`): `node/src/node_control.rs` — `session_snapshot`
+  `:1646`, `site_remote_list` `:1635`, `site_map` `:1612`, `site_mappings` `:1625`, `site_unmap` `:1620`;
+  impls in `node/src/mesh.rs` — `snapshot` `:7828`, `site_remote_list` `:14991`,
+  `handle_site_control` `:15014`, `site_map` `:15083`; tunnel transport `node/src/sites.rs:1-30`.
 - Single-hub client: `apps/web/src/lib/api.ts:147-167`; `apps/web/src/lib/store.svelte.ts:197-201`, `:776`, `:827`.
 - Hub API surface a peer consumes: `apps/hub/src/server.ts:389/521/525/529/540/563/587/593/605/613/646/684`.
 - Machine tag surface: `apps/hub/src/types.ts:9`; `apps/hub/src/projects.ts:14/33/37`.
