@@ -395,8 +395,16 @@ function registerMesh(): void {
   void mesh.register().then((s) => {
     if (s.exposed) console.log(`[mesh] exposed as site "${s.label}" (${s.siteId}) — fleet peers open ${s.peerUrl}`)
     else if (s.enabled && s.nodePresent) console.log(`[mesh] node present but not exposed — ${s.error ?? 'unknown'}`)
-    else if (s.enabled) console.log('[mesh] no AllMyStuff node on this machine — hub stays local-only')
+    else if (s.enabled) console.log('[mesh] no AllMyStuff node on this machine — will keep checking')
     journal.append(null, 'mesh/site', s)
+    // Keep trying after the first attempt. A hub that starts before the AllMyStuff node — the normal
+    // order when both start at login — used to conclude "no mesh" once and stay invisible to the fleet
+    // until it was restarted, with nothing on screen hinting that a restart was the cure.
+    mesh.startAutoRegister(30_000, (now) => {
+      if (now.exposed) console.log(`[mesh] attached late — exposed as site "${now.label}" (${now.siteId})`)
+      else console.log(`[mesh] no longer exposed — ${now.error ?? 'dropped from the node map'}; retrying`)
+      journal.append(null, 'mesh/site', now)
+    })
   })
 }
 
@@ -478,6 +486,7 @@ function shutdown(signal: string): void {
   // standalone hub stop doesn't orphan them, and pull our mesh advert. Both are best-effort and
   // race the guard above; sessions.shutdown() dispatches the codex kills synchronously so they
   // land even if the guard fires first.
+  mesh.stopAutoRegister()
   void Promise.allSettled([mesh.deregister(), sessions.shutdown()]).finally(() => {
     clearTimeout(guard)
     console.log(`[hub] ${signal} — stopped`)

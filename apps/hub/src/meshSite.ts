@@ -150,6 +150,7 @@ export class MeshSite {
   private enabled: boolean
   private readonly socketPath: string
   private last: MeshStatus
+  private autoTimer: ReturnType<typeof setInterval> | undefined
 
   constructor(opts: { port: number; label?: string; enable?: boolean; socketPath?: string }) {
     this.port = opts.port
@@ -241,6 +242,57 @@ export class MeshSite {
     if (on) return this.register()
     await this.deregister()
     return this.update({ exposed: false, error: undefined })
+  }
+
+  /**
+   * KEEP TRYING TO ATTACH, instead of deciding once at boot that there is no mesh.
+   *
+   * `register()` runs at startup and returns immediately on ENOENT/ECONNREFUSED — correct for that call
+   * ("no node here, don't retry or spawn one") and wrong as the whole policy, because it was the only
+   * call. A hub that starts before the AllMyStuff node — the normal order when both launch at login, and
+   * the certain order when the node is started by hand afterwards — decides there is no mesh and never
+   * looks again. The hub is then invisible to the fleet until someone restarts it, with nothing in the UI
+   * suggesting a restart would help.
+   *
+   * That is the same shape as the supervisor bug we fixed earlier tonight: a one-shot attempt at something
+   * that becomes possible later, with giving-up as the permanent outcome.
+   *
+   * Cheap to poll: when no node is present the connect fails with ENOENT in microseconds, and when we are
+   * already exposed this does nothing at all. Only transitions are reported, so a machine that never runs
+   * a node stays silent forever rather than logging every interval.
+   */
+  startAutoRegister(intervalMs = 30_000, onChange?: (s: MeshStatus) => void): void {
+    if (this.autoTimer) return
+    let wasExposed = this.last.exposed
+    const tick = async (): Promise<void> => {
+      if (!this.enabled) return
+      // Already advertised — nothing to do. This is the steady state, and it costs one field read.
+      if (this.last.exposed) {
+        // Confirm periodically that we are still in the node's map: a node restart, or another app
+        // calling site_set_exposed with a stale map, drops us silently. Re-registering is idempotent.
+        const cur = await this.register()
+        if (!cur.exposed && wasExposed) {
+          wasExposed = false
+          onChange?.(cur)
+        }
+        return
+      }
+      const s = await this.register()
+      if (s.exposed && !wasExposed) {
+        wasExposed = true
+        onChange?.(s)
+      }
+    }
+    this.autoTimer = setInterval(() => void tick().catch(() => undefined), intervalMs)
+    // Never hold the process open for this — it is background upkeep, not work.
+    this.autoTimer.unref?.()
+  }
+
+  /** Stop the auto-attach loop (shutdown, or when the site is disabled for good). */
+  stopAutoRegister(): void {
+    if (!this.autoTimer) return
+    clearInterval(this.autoTimer)
+    this.autoTimer = undefined
   }
 
   // --- Fleet discovery + routing (unified-across-mesh view, first cut) --------------------------
