@@ -37,18 +37,38 @@ describe('claudeImageMediaType', () => {
   })
 })
 
-describe('vendorSupport — the asymmetry that must never be silent', () => {
-  it('Claude: png image ok, svg image not ok, pdf file ok', () => {
-    expect(vendorSupport({ kind: 'image', mime: 'image/png' }, 'claude').ok).toBe(true)
-    expect(vendorSupport({ kind: 'image', mime: 'image/svg+xml' }, 'claude').ok).toBe(false)
-    expect(vendorSupport({ kind: 'file', mime: 'application/pdf' }, 'claude').ok).toBe(true)
+describe('vendorSupport — mirrors the hub, vendor-neutral', () => {
+  const ok = (name: string, mime: string, vendor: 'claude' | 'codex') => vendorSupport({ name, mime }, vendor).ok
+
+  it('DOCUMENTS ARE ACCEPTED FOR CODEX — a PDF and an .xlsx (the regression this fixes)', () => {
+    // Ramanujan's hub document support means Codex takes these now; the stale client refused them.
+    expect(ok('report.pdf', 'application/pdf', 'codex')).toBe(true)
+    expect(ok('budget.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'codex')).toBe(true)
+    expect(ok('notes.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'codex')).toBe(true)
+    expect(ok('server.log', 'text/plain', 'codex')).toBe(true)
+    expect(ok('main.rs', '', 'codex')).toBe(true) // source file by extension, no mime
   })
-  it('Codex: any image ok, ANY file not ok (images-only app-server)', () => {
-    expect(vendorSupport({ kind: 'image', mime: 'image/png' }, 'codex').ok).toBe(true)
-    expect(vendorSupport({ kind: 'image', mime: 'image/svg+xml' }, 'codex').ok).toBe(true) // path, not base64
-    const pdf = vendorSupport({ kind: 'file', mime: 'application/pdf' }, 'codex')
-    expect(pdf.ok).toBe(false)
-    expect(pdf.reason).toMatch(/images only/i)
+
+  it('accepts the same set for Claude — the hub is vendor-neutral at attach time', () => {
+    for (const v of ['claude', 'codex'] as const) {
+      expect(ok('shot.png', 'image/png', v)).toBe(true)
+      expect(ok('paper.pdf', 'application/pdf', v)).toBe(true)
+      expect(ok('data.csv', 'text/csv', v)).toBe(true)
+    }
+  })
+
+  it('still REJECTS genuinely unsupported types at attach time (honest failure, not silent drop)', () => {
+    const zip = vendorSupport({ name: 'bundle.zip', mime: 'application/zip' }, 'codex')
+    expect(zip.ok).toBe(false)
+    expect(zip.reason).toBeTruthy()
+    // svg is an image mime but not a valid base64 image block and not text-by-extension → rejected on both
+    expect(ok('logo.svg', 'image/svg+xml', 'claude')).toBe(false)
+    expect(ok('a.out', 'application/octet-stream', 'codex')).toBe(false)
+  })
+
+  it('detects documents by extension even when the mime is missing/generic', () => {
+    expect(ok('q3.xlsx', 'application/octet-stream', 'codex')).toBe(true)
+    expect(ok('spec.pdf', '', 'codex')).toBe(true)
   })
 })
 

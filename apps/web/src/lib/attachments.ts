@@ -50,27 +50,78 @@ export function claudeImageMediaType(mime: string): string | null {
   return (CLAUDE_IMAGE_MIME as readonly string[]).includes(mime) ? mime : null
 }
 
+// --- Vendor acceptance, MIRRORED from the hub -----------------------------------------------------
+//
+// AUTHORITY: apps/hub/src/attachments.ts `prepareAttachment` (+ the codex.ts / claude.ts adapters). The
+// hub decides what actually reaches a vendor; this is a client-side COPY so the composer can flag an
+// unsupported file AT ATTACH TIME instead of letting it fail on send. A duplicated table goes stale — the
+// last time it did, the client refused documents the hub had started accepting. KEEP THESE TWO IN SYNC;
+// the honest fix (a hub-reported capability set) is deferred as too big for this cut.
+//
+// Acceptance is currently VENDOR-NEUTRAL: the hub accepts the same set for Claude and Codex (images
+// png/jpeg/gif/webp, PDF, DOCX, XLSX, UTF-8 text/source). The only per-vendor difference is a RUNTIME one
+// the client can't predict at attach time (a scanned/text-less PDF is rejected for Codex during
+// extraction, accepted for Claude) — that surfaces as an honest send-time error, not a type gate here.
+const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+const TEXT_APPLICATION_MIMES = new Set([
+  'application/json', 'application/jsonl', 'application/ld+json', 'application/xml',
+  'application/yaml', 'application/x-yaml', 'application/javascript', 'application/typescript', 'application/sql',
+])
+const SPECIAL_TEXT_FILENAMES = new Set(['dockerfile', 'makefile', 'gemfile', 'rakefile', 'justfile'])
+const TEXT_DOCUMENT_EXTENSIONS = new Set([
+  '.txt', '.md', '.markdown', '.csv', '.tsv', '.json', '.jsonl', '.log', '.yaml', '.yml', '.xml', '.toml',
+  '.ini', '.cfg', '.conf', '.env', '.properties', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py',
+  '.rs', '.go', '.java', '.kt', '.kts', '.c', '.h', '.cc', '.cpp', '.hpp', '.cs', '.rb', '.php', '.swift',
+  '.sh', '.bash', '.zsh', '.fish', '.ps1', '.sql', '.css', '.scss', '.sass', '.less', '.html', '.htm',
+  '.vue', '.svelte',
+])
+
+function extOf(name: string): string {
+  const i = name.lastIndexOf('.')
+  return i >= 0 ? name.slice(i).toLowerCase() : ''
+}
+
+function isPdf(a: Pick<AttachmentMeta, 'name' | 'mime'>): boolean {
+  return a.mime === 'application/pdf' || extOf(a.name) === '.pdf'
+}
+function officeKind(a: Pick<AttachmentMeta, 'name' | 'mime'>): 'docx' | 'xlsx' | undefined {
+  const e = extOf(a.name)
+  if (e === '.docx' || a.mime === DOCX_MIME) return 'docx'
+  if (e === '.xlsx' || a.mime === XLSX_MIME) return 'xlsx'
+  return undefined
+}
+function isTextLike(a: Pick<AttachmentMeta, 'name' | 'mime'>): boolean {
+  const lower = a.name.toLowerCase()
+  return (
+    a.mime.startsWith('text/') ||
+    TEXT_APPLICATION_MIMES.has(a.mime) ||
+    TEXT_DOCUMENT_EXTENSIONS.has(extOf(lower)) ||
+    SPECIAL_TEXT_FILENAMES.has(lower)
+  )
+}
+
 export interface Support {
   ok: boolean
   reason?: string
 }
 
 /**
- * Whether `vendor` can actually receive this attachment. Drives the per-attachment "not supported here"
- * badge and the decision to drop an attachment from the send rather than let it silently fail — silently
- * dropping a file the user deliberately attached is the worst option; they assume the agent saw it.
+ * Whether this attachment is a type the hub will deliver — mirrors `prepareAttachment` (see the AUTHORITY
+ * note above). Drives the composer's "not supported here" badge and the decision to drop an attachment
+ * rather than let it fail silently — silently dropping a file the user deliberately attached is the worst
+ * option; they assume the agent saw it.
+ *
+ * `vendor` is accepted for call-site stability but not consulted: acceptance is vendor-neutral (the hub
+ * treats both the same at attach time). If a genuine per-vendor TYPE gate ever returns, branch here and
+ * keep it aligned with the hub.
  */
-export function vendorSupport(a: Pick<AttachmentMeta, 'kind' | 'mime'>, vendor: Vendor): Support {
-  if (vendor === 'claude') {
-    if (a.kind === 'image') {
-      return claudeImageMediaType(a.mime)
-        ? { ok: true }
-        : { ok: false, reason: `Claude accepts PNG, JPEG, GIF or WebP images — not ${a.mime || 'this type'}` }
-    }
-    return { ok: true } // documents (PDF / plaintext) supported as document blocks
+export function vendorSupport(a: Pick<AttachmentMeta, 'name' | 'mime'>, _vendor?: Vendor): Support {
+  if (claudeImageMediaType(a.mime) || isPdf(a) || officeKind(a) || isTextLike(a)) return { ok: true }
+  return {
+    ok: false,
+    reason: 'Unsupported file — use PNG, JPEG, GIF, WebP, PDF, DOCX, XLSX, or a UTF-8 text/source file',
   }
-  // codex: images only, via a local path — any image/* the OS produced is fine; non-images are not.
-  return a.kind === 'image' ? { ok: true } : { ok: false, reason: 'Codex can attach images only, not files' }
 }
 
 /** Human-readable byte size: 1023 B, 4.0 KB, 2.4 MB. */
