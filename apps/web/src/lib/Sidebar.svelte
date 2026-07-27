@@ -1,6 +1,6 @@
 <script lang="ts">
   import { untrack } from 'svelte'
-  import { api, type ProjectInfo } from './api'
+  import { api } from './api'
   import { store, type SessionView } from './store.svelte'
   import { alertDialog, confirmDialog } from './dialog.svelte'
   import { relativeTime } from './time'
@@ -10,7 +10,6 @@
   import Icon from './Icon.svelte'
   import { unreadMailCount, unreadMailTitle } from './unreadMail'
   import ImportChats from './ImportChats.svelte'
-  import GitHubImport from './GitHubImport.svelte'
   import { flip } from 'svelte/animate'
   import { cubicOut } from 'svelte/easing'
   import { loadCollapsedFolders, saveCollapsedFolders } from './uiState'
@@ -28,11 +27,6 @@
   } from './folders'
 
   let filter = $state('')
-  let showCreate = $state(false)
-  let newName = $state('')
-  let newPath = $state('')
-  let createErr = $state('')
-  let showGitHub = $state(false)
 
   function pathFor(id: string): string {
     return store.projects.find((p) => p.id === id)?.path ?? ''
@@ -197,15 +191,6 @@
       else if (k === 'working' || k === 'starting') working++
     }
     return { providers: [...providers], done, review, stalled, working }
-  }
-
-  async function browse(): Promise<void> {
-    const { path } = await api.pickFolder()
-    if (path) {
-      newPath = path
-      // inherit the project name from the chosen folder
-      newName = path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? ''
-    }
   }
 
   function label(s: SessionView): string {
@@ -573,30 +558,6 @@
   }
 
 
-  async function createProject(): Promise<void> {
-    createErr = ''
-    const out = await api.createProject(newName, newPath)
-    if ('error' in out) {
-      createErr = out.error
-      return
-    }
-    newName = ''
-    newPath = ''
-    showCreate = false
-    await store.refreshProjects()
-    // Offer to adopt any existing Claude/Codex chats that already live for this folder.
-    store.openImportPanel(out.id, out.path)
-  }
-
-  async function githubImported(project: ProjectInfo): Promise<void> {
-    await store.refreshProjects()
-    showGitHub = false
-    showCreate = false
-    // A selected project draft is the app's normal "new agent" state: no vendor process is started just
-    // for opening it, and the first message materializes the agent with this project as its destination.
-    await store.newSession(undefined, project.id)
-  }
-
   async function act(e: MouseEvent, id: string, verb: 'interrupt' | 'stop'): Promise<void> {
     e.stopPropagation()
     const out = verb === 'interrupt' ? await api.interrupt(id) : await api.stop(id)
@@ -651,33 +612,10 @@
 
   <div class="sec-head">
     <span>PROJECTS</span>
-    <span class="sec-actions">
-      <button class="manager-entry" title="project managers" onclick={() => store.openManagerSetup()}>
-        <Icon name="flag" size={12} /><span>Managers</span>
-      </button>
-      <button class="icon" class:on={showCreate} title="new project" onclick={() => (showCreate = !showCreate)}><Icon name="folder-plus" size={15} /></button>
-      <button class="icon" title="new chat" onclick={() => store.newSession()}><Icon name="square-pen" size={15} /></button>
-    </span>
+    <button class="manager-entry" title="project managers" onclick={() => store.openManagerSetup()}>
+      <Icon name="flag" size={12} /><span>Managers</span>
+    </button>
   </div>
-
-  {#if showCreate}
-    <div class="panel">
-      <input placeholder="project name" bind:value={newName} />
-      <div class="path-row">
-        <input placeholder="folder path" bind:value={newPath} />
-        <button class="browse" title="browse folders" onclick={browse}><Icon name="folder" size={14} /></button>
-      </div>
-      <button class="mkbtn" onclick={createProject}>create project</button>
-      {#if createErr}<div class="err">{createErr}</div>{/if}
-      <button class="ghbtn" class:on={showGitHub} onclick={() => (showGitHub = !showGitHub)}>
-        <Icon name="git-branch" size={13} />
-        Clone from GitHub
-      </button>
-      {#if showGitHub}
-        <GitHubImport onImported={githubImported} onClose={() => (showGitHub = false)} />
-      {/if}
-    </div>
-  {/if}
 
   {#snippet gripIcon()}
     <svg class="gripicon" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
@@ -916,25 +854,10 @@
   .sicon { position: absolute; left: 1.15rem; top: calc(50% - 0.25rem); transform: translateY(-50%); color: var(--dim); display: grid; }
   .search input { width: 100%; padding-left: 1.9rem; }
   .sec-head { display: flex; align-items: center; justify-content: space-between; padding: var(--space-2) var(--space-5); font-size: var(--text-2xs); letter-spacing: var(--ls-label); text-transform: uppercase; color: var(--dim); }
-  .sec-actions { display: flex; gap: 0.15rem; }
-  .manager-entry { display: flex; align-items: center; gap: .28rem; margin-right: .2rem; padding: .22rem .4rem;
+  .manager-entry { display: flex; align-items: center; gap: .28rem; padding: .22rem .4rem;
     color: var(--dim); border: 1px solid var(--border); border-radius: var(--r-sm); font-size: .62rem;
     letter-spacing: .03em; text-transform: none; }
   .manager-entry:hover { color: var(--text); border-color: var(--border-accent); background: var(--surface-2); }
-  .icon { display: grid; place-items: center; color: var(--muted); width: 26px; height: 24px; border-radius: var(--r-sm); transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease); }
-  .icon:hover { background: var(--surface-2); color: var(--text); }
-  .icon.on { background: var(--surface-3); color: var(--accent); }
-  .panel { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-2) var(--space-4) var(--space-3); }
-  .panel input { width: 100%; }
-  .path-row { display: flex; gap: var(--space-2); }
-  .path-row input { flex: 1; }
-  .browse { flex: none; display: grid; place-items: center; border: 1px solid var(--border-strong); border-radius: var(--r-md); padding: 0 0.5rem; color: var(--muted); }
-  .browse:hover { border-color: var(--border-accent); color: var(--text); }
-  .mkbtn { background: var(--accent); color: #fff; border-radius: var(--r-md); padding: var(--space-2); font-weight: var(--fw-medium); box-shadow: var(--edge-hi), var(--shadow-1); }
-  .mkbtn:hover { filter: brightness(1.08); }
-  .ghbtn { display: flex; align-items: center; justify-content: center; gap: var(--space-2); border: 1px solid var(--border-strong); border-radius: var(--r-md); padding: var(--space-2); color: var(--muted); font-size: var(--text-sm); }
-  .ghbtn:hover, .ghbtn.on { border-color: var(--border-accent); color: var(--text); background: var(--surface-2); }
-  .err { color: var(--bad-text); font-size: var(--text-xs); }
   /* min-height:0 lets flex:1 bound the list below its content so its own `.scroll` overflow engages,
      instead of the list growing to fit every chat and pushing the sidebar (and the window) taller. */
   .list { flex: 1; min-height: 0; padding: 0 var(--space-2); }

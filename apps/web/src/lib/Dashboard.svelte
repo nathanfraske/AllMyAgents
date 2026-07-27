@@ -7,6 +7,8 @@
   import ProviderLogo from './ProviderLogo.svelte'
   import Icon from './Icon.svelte'
 
+  let { onnewproject }: { onnewproject: () => void } = $props()
+
   let nameInput = $state('')
   let stats = $state<StatsResult | null>(null)
   let hovered = $state<DayStat | null>(null)
@@ -237,6 +239,13 @@
             </div>
           {/if}
           <p class="dim">Drag a chat from the sidebar into this space to open it — drop it beside another to split, or above/below to stack.</p>
+          <div class="hero-action">
+            <button class="new-project" onclick={onnewproject}>
+              <Icon name="plus" size={16} />
+              New Project
+            </button>
+            <span>Choose the repository, assemble a starting team, and launch it in one flow.</span>
+          </div>
         </div>
       </div>
 
@@ -297,7 +306,7 @@
       <section class="card">
         <h3>Projects by usage</h3>
         {#if projectRows.length === 0}
-          <div class="dim empty2">no projects yet — create one from the sidebar</div>
+          <div class="dim empty2">No projects yet — use New Project above to create one and launch its team.</div>
         {:else}
           <div class="projs">
             {#each projectRows as r (r.id)}
@@ -396,6 +405,13 @@
   .nameask { display: flex; gap: var(--space-3); margin: var(--space-4) 0; }
   .nameask input { flex: 1; max-width: 320px; }
   .hero p { font-size: var(--text-sm); margin: var(--space-3) 0 0; }
+  .hero-action { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-3); margin-top: var(--space-5); }
+  .hero-action span { color: var(--dim); font-size: var(--text-xs); }
+  .new-project { display: inline-flex; align-items: center; gap: var(--space-2); padding: var(--space-3) var(--space-5);
+    color: #fff; background: linear-gradient(135deg, var(--accent), var(--cyan)); border: 1px solid color-mix(in srgb, var(--accent) 72%, white);
+    border-radius: var(--r-md); box-shadow: 0 8px 26px color-mix(in srgb, var(--accent) 22%, transparent), var(--edge-hi);
+    font-size: var(--text-sm); font-weight: var(--fw-semibold); }
+  .new-project:hover { filter: brightness(1.08); transform: translateY(-1px); }
   .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: var(--space-4); }
 
   /* Modern surface treatment shared by every card-like panel: a soft low-contrast border,
