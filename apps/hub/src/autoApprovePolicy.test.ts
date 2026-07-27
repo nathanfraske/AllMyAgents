@@ -435,6 +435,30 @@ describe('project-manager delegated authority security boundary', () => {
     expect(sessions.isAutoApproved('child', 'claude/tool', commit)).toBe(false)
   })
 
+  it('rejects array-form shell composition instead of approving only its git prefix', () => {
+    const { sessions, seed } = makeSessions()
+    seed({
+      isProjectManager: true,
+      managerMaxLiveChildren: 2,
+      managerDelegation: ['commit'],
+    } as Partial<SessionRecord>)
+    seed({
+      id: 'child',
+      parentSessionId: 's1',
+      delegatedAuthorities: ['commit'],
+      permissionMode: 'safe',
+    } as Partial<SessionRecord>)
+
+    expect(sessions.isAutoApproved('child', 'claude/tool', {
+      toolName: 'Bash',
+      input: { command: ['git', 'commit', '&&', 'git', 'push'] },
+    })).toBe(false)
+    expect(sessions.isAutoApproved('child', 'claude/tool', {
+      toolName: 'Bash',
+      input: { command: ['git', 'commit', '-am', 'safe checkpoint'] },
+    })).toBe(true)
+  })
+
   it('tool grants narrow the operator ceiling and revoke on the next action too', () => {
     const { sessions, seed } = makeSessions()
     seed({

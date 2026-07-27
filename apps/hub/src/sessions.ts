@@ -3601,7 +3601,17 @@ function delegatedGitAuthority(kind: string, payload: unknown): DelegatedAuthori
   const raw = actionCommand ?? p.input?.command ?? p.command ?? p.cmd
   let tokens: string[]
   if (Array.isArray(raw)) {
-    if (!raw.length || raw.some((token) => typeof token !== 'string' || !token.trim())) return undefined
+    if (
+      !raw.length ||
+      raw.some(
+        (token) =>
+          typeof token !== 'string' ||
+          !token.trim() ||
+          /[\r\n;&|<>`$()]/.test(token)
+      )
+    ) {
+      return undefined
+    }
     tokens = raw.map((token) => token.trim())
   } else if (typeof raw === 'string') {
     const command = raw.trim()
