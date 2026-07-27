@@ -728,8 +728,12 @@ describe('SessionManager — an operator Stop survives the interrupted turn\'s o
    * {ok:true}, and then had its rejection caught internally — clearing busy and marking the FIRST,
    * still-running turn as errored. The record's own status is the vendor-independent fact.
    */
-  it('rejects a send while a turn is in progress, before journaling anything', async () => {
+  it('rejects a send while a turn is in progress when mid-turn steering is off, before journaling anything', async () => {
     const h = buildHub()
+    ;(h.sessions as unknown as { prefs: { chatNamePool: 'everyone'; steerMessagesAtToolBoundary: boolean } }).prefs = {
+      chatNamePool: 'everyone',
+      steerMessagesAtToolBoundary: false,
+    }
     seedRecord(h.store, 'busy-one', 'active')
     h.sessions.loadRecords()
     const before = h.journal.since(0).length
@@ -785,6 +789,12 @@ describe('SessionManager.applyLifecycle — replayed markers do not re-journal o
 
   it('a replayed idle does NOT start a bus turn; a LIVE idle still flushes the queue', async () => {
     const h = buildHub()
+    // This regression is specifically about the historical idle-only delivery lane. Keep steering off so
+    // the active busSend remains queued and the replay-vs-live idle distinction stays observable.
+    ;(h.sessions as unknown as { prefs: { chatNamePool: 'everyone'; steerMessagesAtToolBoundary: boolean } }).prefs = {
+      chatNamePool: 'everyone',
+      steerMessagesAtToolBoundary: false,
+    }
     seedRecord(h.store, 's', 'active', 'claude', 'proj1') // recipient, mid-turn → a bus message queues
     seedRecord(h.store, 't', 'idle', 'claude', 'proj1') //   a same-project teammate to send from
     h.sessions.loadRecords()

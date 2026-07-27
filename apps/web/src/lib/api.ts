@@ -352,6 +352,7 @@ export type ChatNamePool = 'women' | 'everyone'
  */
 export interface HubPrefs {
   chatNamePool: ChatNamePool
+  steerMessagesAtToolBoundary: boolean
 }
 
 // Danger Zone toggles — safe-default guardrail switches (all default false / OFF).
@@ -468,7 +469,7 @@ export const api = {
   revokePractice: (id: string) => jpost<{ ok?: boolean; error?: string }>(`/api/practices/${id}/revoke`),
   // Owner preferences (hub-side settings that are not safety switches).
   prefs: () => jget<HubPrefs>('/api/config/prefs'),
-  setPrefs: (patch: Partial<HubPrefs>) => jpost<HubPrefs>('/api/config/prefs', patch),
+  setPrefs: (patch: Partial<HubPrefs>) => jpost<HubPrefs | { error: string }>('/api/config/prefs', patch),
   // Danger Zone toggles.
   danger: () => jget<DangerFlags>('/api/config/danger'),
   setDanger: (patch: Partial<DangerFlags>) => jpost<DangerFlags>('/api/config/danger', patch),

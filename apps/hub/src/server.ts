@@ -593,6 +593,9 @@ export function startServer(opts: ServerOptions): http.Server {
         // understand is IGNORED, not coerced. Coercing would let a malformed or version-skewed request
         // quietly reset a pool the owner did choose, back through the default, to 'everyone'.
         if (body.chatNamePool === 'women' || body.chatNamePool === 'everyone') prefs.chatNamePool = body.chatNamePool
+        if (typeof body.steerMessagesAtToolBoundary === 'boolean') {
+          prefs.steerMessagesAtToolBoundary = body.steerMessagesAtToolBoundary
+        }
         persistPrefs(configPath, prefs, journal)
         journal.append(null, 'config/prefs', { ...prefs })
         json(res, { ...prefs })

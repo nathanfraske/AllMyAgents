@@ -1,4 +1,4 @@
-import { query } from '@anthropic-ai/claude-agent-sdk'
+import { query, type Query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk'
 
 type EventSink = (kind: string, payload: unknown) => void
 
@@ -40,9 +40,89 @@ function numField(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
 
+function userMessage(text: string, priority?: 'next'): SDKUserMessage {
+  return {
+    type: 'user',
+    message: { role: 'user', content: [{ type: 'text', text }] },
+    parent_tool_use_id: null,
+    ...(priority ? { priority } : {}),
+  }
+}
+
+/**
+ * The SDK's streaming-input contract owns stdin for the lifetime of the iterable: when the iterable
+ * finishes, Query.streamInput closes the CLI's input. A fresh one-message iterable per steer would
+ * therefore close stdin after the first correction. Keep one stream open for the whole turn instead.
+ */
+class ClaudeInputStream implements AsyncIterable<SDKUserMessage> {
+  private readonly queued: Array<{
+    message: SDKUserMessage
+    accepted?: { resolve(): void; reject(error: Error): void }
+  }> = []
+  private readonly waiting: Array<(result: IteratorResult<SDKUserMessage>) => void> = []
+  private inFlight: { resolve(): void; reject(error: Error): void } | undefined
+  private closed = false
+
+  constructor(initial: SDKUserMessage) {
+    this.queued.push({ message: initial })
+  }
+
+  push(message: SDKUserMessage): Promise<void> {
+    if (this.closed) return Promise.reject(new Error('Claude input stream is closed'))
+    return new Promise<void>((resolve, reject) => {
+      const accepted = { resolve, reject }
+      const waiter = this.waiting.shift()
+      if (waiter) {
+        this.inFlight = accepted
+        waiter({ value: message, done: false })
+      } else {
+        this.queued.push({ message, accepted })
+      }
+    })
+  }
+
+  close(): void {
+    if (this.closed) return
+    this.closed = true
+    const error = new Error('Claude turn ended before queued input was accepted')
+    this.inFlight?.reject(error)
+    this.inFlight = undefined
+    for (const item of this.queued.splice(0)) item.accepted?.reject(error)
+    for (const waiter of this.waiting.splice(0)) waiter({ value: undefined, done: true })
+  }
+
+  abort(error: Error): void {
+    if (this.closed) return
+    this.closed = true
+    this.inFlight?.reject(error)
+    this.inFlight = undefined
+    for (const item of this.queued.splice(0)) item.accepted?.reject(error)
+    for (const waiter of this.waiting.splice(0)) waiter({ value: undefined, done: true })
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<SDKUserMessage> {
+    return {
+      next: () => {
+        // Query.streamInput awaits transport.write before requesting the next item. Resolving the prior
+        // item's acknowledgement here therefore proves the SDK wrote it, rather than merely that the hub
+        // enqueued it. That distinction keeps a process-exit race from marking a bus row delivered.
+        this.inFlight?.resolve()
+        this.inFlight = undefined
+        const item = this.queued.shift()
+        if (item) {
+          this.inFlight = item.accepted
+          return Promise.resolve({ value: item.message, done: false })
+        }
+        if (this.closed) return Promise.resolve({ value: undefined, done: true })
+        return new Promise<IteratorResult<SDKUserMessage>>((resolve) => this.waiting.push(resolve))
+      },
+    }
+  }
+}
+
 export class ClaudeDriver {
   private vendorSessionId: string | undefined
-  private active: { interrupt(): Promise<void> } | undefined
+  private active: { query: Query; input: ClaudeInputStream } | undefined
 
   constructor(
     private readonly profileDir: string,
@@ -104,8 +184,13 @@ export class ClaudeDriver {
         this.canUseTool!(toolName, input, context)
     }
     if (this.mcpServers) options.mcpServers = this.mcpServers
-    const q = query({ prompt: finalPrompt, options: options as never })
-    this.active = q as unknown as { interrupt(): Promise<void> }
+    // A string prompt selects the SDK's one-shot mode, where control requests and additional input are
+    // unsupported. Its AsyncIterable form selects streaming I/O. The stream stays open until this turn's
+    // result so `steer()` can append a priority:'next' user message at Claude Code's next tool boundary.
+    const input = new ClaudeInputStream(userMessage(finalPrompt))
+    const q = query({ prompt: input, options: options as never })
+    this.active = { query: q, input }
+    let receivedResult = false
     try {
       for await (const message of q) {
         const m = message as {
@@ -120,10 +205,28 @@ export class ClaudeDriver {
         // carry usage under `.message.usage` (the Anthropic API message); the final `result`
         // message carries it at the top level. The SDK gives no total, so we derive it.
         if (m.type === 'assistant') this.emitTokens(m.message?.usage)
-        else if (m.type === 'result') this.emitTokens(m.usage)
+        else if (m.type === 'result') {
+          receivedResult = true
+          this.emitTokens(m.usage)
+          // End the iterable with the turn. Any steer not yet acknowledged by Query.streamInput is rejected,
+          // so its caller can retain/retry it instead of marking input delivered on a result-vs-steer race.
+          input.close()
+        }
       }
     } finally {
+      if (receivedResult) input.close()
+      else input.abort(new Error('Claude turn ended before queued input was accepted'))
       this.active = undefined
+    }
+  }
+
+  async steer(text: string): Promise<void> {
+    const active = this.active
+    if (!active) throw new Error('no active Claude turn to steer')
+    try {
+      await active.input.push(userMessage(text, 'next'))
+    } catch {
+      throw new Error('no active Claude turn to steer')
     }
   }
 
@@ -155,6 +258,6 @@ export class ClaudeDriver {
   }
 
   async interrupt(): Promise<void> {
-    if (this.active) await this.active.interrupt()
+    if (this.active) await this.active.query.interrupt()
   }
 }

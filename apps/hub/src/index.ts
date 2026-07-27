@@ -150,7 +150,11 @@ const danger: DangerFlags = {
 // SessionManager and the server for the same reason: POST /api/config/prefs mutates this object, so the
 // next chat is named from the newly chosen pool without a restart. asChatNamePool tolerates a hand-edited
 // config.json holding nonsense (or the removed men-only value) by falling back to the default.
-const prefs: HubPrefs = { chatNamePool: asChatNamePool(config.prefs?.chatNamePool) }
+const prefs: HubPrefs = {
+  chatNamePool: asChatNamePool(config.prefs?.chatNamePool),
+  // Opt-out so configs written before the preference existed get the operator-requested default ON.
+  steerMessagesAtToolBoundary: config.prefs?.steerMessagesAtToolBoundary !== false,
+}
 // Apply the connector policy to managed claude profiles at boot (safe default OFF → connectors suppressed).
 // The SDK reads disableClaudeAiConnectors from each profile's settings.json, so this makes the flag
 // authoritative on startup; the Danger-Zone toggle re-applies it on a flip (server.ts). Never touches ~/.claude.

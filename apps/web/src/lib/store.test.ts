@@ -16,6 +16,12 @@ vi.mock('./api', () => {
     api: {
       profiles: vi.fn(async () => []),
       projects: vi.fn(async () => []),
+      prefs: vi.fn(async () => ({ chatNamePool: 'everyone', steerMessagesAtToolBoundary: true })),
+      setPrefs: vi.fn(async (patch: Record<string, unknown>) => ({
+        chatNamePool: 'everyone',
+        steerMessagesAtToolBoundary: true,
+        ...patch,
+      })),
       approvals: vi.fn(async () => []),
       usage: vi.fn(async () => []),
       sessions: vi.fn(async () => []),
@@ -25,6 +31,17 @@ vi.mock('./api', () => {
       deleteSession: vi.fn(ok),
     },
   }
+})
+
+describe('owner preferences', () => {
+  it('defaults mid-turn steering on and applies a live preference update without restarting', async () => {
+    expect(store.prefs.steerMessagesAtToolBoundary).toBe(true)
+
+    await store.setPrefs({ steerMessagesAtToolBoundary: false })
+
+    expect(store.prefs.steerMessagesAtToolBoundary).toBe(false)
+    expect(api.setPrefs).toHaveBeenCalledWith({ steerMessagesAtToolBoundary: false })
+  })
 })
 
 // --- helpers -------------------------------------------------------------------------------
@@ -80,6 +97,7 @@ beforeEach(() => {
   store.projects = []
   store.approvals = []
   store.usage = []
+  store.prefs = { chatNamePool: 'everyone', steerMessagesAtToolBoundary: true }
   store.dragSession = null
   store.dropZone = null
   store.connected = false

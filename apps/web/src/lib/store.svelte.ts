@@ -6,7 +6,7 @@ import { rowFate } from './fleetMerge'
 import { isChatBusy, nextOrderKey, orderChats, type ChatOrderFacts } from './chatOrder'
 import { extractCodexReasoning } from './codexGroup'
 import type { AgentOutcome } from './agentTree'
-import type { ApprovalRecord, FleetSite, HistoryItem, HistoryPage, HubEvent, ProfileInfo, ProjectInfo, ScanResult, SessionRecord, UsageSnapshot } from './api'
+import type { ApprovalRecord, FleetSite, HistoryItem, HistoryPage, HubEvent, HubPrefs, ProfileInfo, ProjectInfo, ScanResult, SessionRecord, UsageSnapshot } from './api'
 
 // Verbose client tracing — on in dev, compiled out of prod builds. Toggle off in dev by setting
 // localStorage['ama:verbose'] = '0'. Surfaces the load/connect/replay/scan milestones so a stall is
@@ -253,6 +253,9 @@ export class HubStore {
   sessions = $state<Record<string, SessionView>>({})
   approvals = $state<ApprovalRecord[]>([])
   usage = $state<UsageSnapshot[]>([])
+  // Hub-owned ordinary preferences. Shared here so the composer and Settings read the same live value;
+  // absent/failed bootstrap keeps the server's default-on behavior rather than disabling steering.
+  prefs = $state<HubPrefs>({ chatNamePool: 'everyone', steerMessagesAtToolBoundary: true })
   connected = $state(false)
   needsPairing = $state(false)
   selectedId = $state<string | null>(null)
@@ -498,6 +501,9 @@ export class HubStore {
     const projects = await api.projects().catch(() => null)
     if (projects) this.projects = projects
     else failed = true
+    const prefs = await api.prefs().catch(() => null)
+    if (prefs) this.prefs = prefs
+    else failed = true
     await this.refreshSideData().catch(() => {
       failed = true
     })
@@ -526,7 +532,7 @@ export class HubStore {
     await api.mesh().catch(() => undefined) // bootstrap: capture the token while the hub hands it out
     // OPTIONAL SIDE DATA MUST NEVER STOP THE SOCKET FROM BEING CREATED.
     //
-    // These three awaits used to be uncaught, and connect() — the ONLY place the WebSocket is ever
+    // These bootstrap awaits used to be uncaught, and connect() — the ONLY place the WebSocket is ever
     // built — runs after them. App.svelte calls `void store.init()`, so a single transient rejection
     // threw out of init, was swallowed, and left the app with no socket and no retry: permanently blank
     // until a manual reload. On a cold/first launch the hub is still starting while the UI mounts, so
@@ -1015,6 +1021,13 @@ export class HubStore {
   async refreshSideData(): Promise<void> {
     this.approvals = await api.approvals()
     this.usage = await api.usage()
+  }
+
+  async setPrefs(patch: Partial<HubPrefs>): Promise<{ error?: string }> {
+    const result = await api.setPrefs(patch)
+    if ('error' in result) return result
+    this.prefs = result
+    return {}
   }
 
   // Trailing debounce for refreshSideData — collapses a burst of usage/approval events (esp. the

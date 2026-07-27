@@ -88,6 +88,10 @@ export class SessionManager {
   // clamped spec lives only in the surviving worker would otherwise be judged by the STORED session mode
   // on the successor hub and silently bypass the clamp again. Cleared in setStatus alongside the bus tag.
   private readonly operatorTurnSessions = new Set<string>()
+  // At most one database batch may be crossing the live-steer boundary per recipient. busSend can be
+  // called again while the executor acknowledgement is in flight; without this fence both deliveries
+  // would select the same undelivered rows and inject the same framed messages twice.
+  private readonly busSteerInFlight = new Set<string>()
   // Codex profiles whose config.toml `[mcp_servers.allmyagents]` we've already (re)written this boot —
   // so the lazy per-profile materialization (ensureCodexMcpConfig, driven from specOf/readCodexLimits) is
   // written once before the app-server starts, not re-read+rewritten on every turn.
@@ -123,7 +127,10 @@ export class SessionManager {
     // mutates it in place, so the next chat is named from the newly chosen pool without a restart).
     // Trailing + optional so the existing positional call sites keep compiling; index.ts injects the
     // shared object, and the default here is the same one the generator would have used anyway.
-    private readonly prefs: HubPrefs = { chatNamePool: DEFAULT_CHAT_NAME_POOL }
+    private readonly prefs: HubPrefs = {
+      chatNamePool: DEFAULT_CHAT_NAME_POOL,
+      steerMessagesAtToolBoundary: true,
+    }
   ) {
     this.executor =
       executor ??
@@ -1054,7 +1061,18 @@ export class SessionManager {
     // still-running turn carried on. One accepted turn, reported as failed, with a phantom prompt in the
     // transcript. The record's own status is the vendor-independent fact, so it leads.
     if (record.status === 'active' || record.status === 'starting' || this.executor.isBusy(sessionId)) {
-      throw new Error('a turn is already in progress')
+      if (!this.steerMessagesAtToolBoundary()) throw new Error('a turn is already in progress')
+      // Acceptance comes BEFORE transcript side effects for the same reason as a fresh send below: if the
+      // turn ended in the race to the executor, the web queue receives a rejection and can keep/retry the
+      // message. A phantom session/input would falsely claim the model saw text that never crossed.
+      await this.executor.steer(sessionId, text)
+      this.journal.append(sessionId, 'session/input', { text })
+      this.journal.append(sessionId, 'session/steered', { text, source: 'operator' })
+      this.autoTitle(record, text)
+      // This is additional input to the CURRENT turn, not a new turn. In particular, do not touch either
+      // provenance set or journal a new session/turn-origin: doing so could relabel a bus turn as operator
+      // (widening approval) or an operator turn as bus (unexpectedly revoking it) halfway through.
+      return
     }
     if (override.model) record.model = override.model
     if (override.effort !== undefined) record.effort = override.effort
@@ -1083,7 +1101,6 @@ export class SessionManager {
   async steer(sessionId: string, text: string): Promise<void> {
     const record = this.sessions.get(sessionId)
     if (!record) throw new Error(`unknown session: ${sessionId}`)
-    if (record.provider !== 'codex') throw new Error('steering is only supported for Codex sessions')
     await this.executor.steer(sessionId, text)
     this.journal.append(sessionId, 'session/steered', { text })
   }
@@ -1441,28 +1458,76 @@ export class SessionManager {
     return { found: true, summary: `${identityOf(t).label} (${t.provider}) is ${doing}${tail}` }
   }
 
+  private steerMessagesAtToolBoundary(): boolean {
+    // Optional in the persisted/API shape for forward/backward compatibility; absence means ON. Keeping
+    // the default here makes a healthy hub steer even when an older config.json has never named the flag.
+    return this.prefs.steerMessagesAtToolBoundary !== false
+  }
+
+  private markBusDelivered(sessionId: string, messages: BusMessage[]): void {
+    this.bus.markDelivered(messages.map((message) => message.id))
+    for (const message of messages) {
+      this.journal.append(sessionId, 'bus/delivered', {
+        id: message.id,
+        fromSession: message.fromSession,
+        fromLabel: message.fromLabel,
+        subject: message.subject,
+        body: message.body,
+      })
+    }
+  }
+
+  private async steerBus(sessionId: string, messages: BusMessage[], framed: string): Promise<void> {
+    this.busSteerInFlight.add(sessionId)
+    let accepted = false
+    try {
+      await this.executor.steer(sessionId, framed)
+      // Mark durable delivery only AFTER the provider/worker accepted the steer. If the turn ended first,
+      // these rows remain pending and the ordinary idle delivery path can start them as their own turn.
+      this.markBusDelivered(sessionId, messages)
+      accepted = true
+    } catch (err) {
+      console.warn(
+        `[bus] mid-turn steer for ${sessionId} failed; ${messages.length} message(s) left queued: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      )
+    } finally {
+      this.busSteerInFlight.delete(sessionId)
+      const record = this.sessions.get(sessionId)
+      // An idle transition can race the rejected acknowledgement while the in-flight fence suppresses its
+      // scheduled delivery. Re-arm exactly that case. Do not hot-loop a rejection while the record remains
+      // active; the next lifecycle transition or bus post will make another honest attempt.
+      if ((!accepted && record?.status === 'idle') || (accepted && this.bus.pending(sessionId).length > 0)) {
+        setImmediate(() => this.deliverBus(sessionId))
+      }
+    }
+  }
+
   /**
-   * Deliver a session's queued teammate messages by injecting them as ONE turn wrapped in the hub's
-   * trust frame, with permissions CLAMPED (a bus-triggered turn never inherits full/bypass, so the
-   * human approval gate stays live). No-op unless the session is idle — otherwise the messages stay
-   * queued and flush when it next goes idle (see setStatus).
+   * A live turn gets the unchanged semi-trusted frame through provider steering; this changes WHEN the
+   * message arrives, never its trust label or the current turn's provenance. An idle recipient keeps the
+   * historical path: a new bus-origin turn with full access clamped unless fullAccessAnyOrigin lifts it.
    */
   private deliverBus(sessionId: string): void {
     const record = this.sessions.get(sessionId)
-    if (!record || record.status !== 'idle') return
+    if (!record) return
+    if (record.status === 'active' || record.status === 'starting') {
+      if (!this.steerMessagesAtToolBoundary() || this.busSteerInFlight.has(sessionId)) return
+      const pending = this.bus.pending(sessionId)
+      if (!pending.length) return
+      // This is input to the EXISTING turn, so do not add busTurnSessions or remove
+      // operatorTurnSessions. Reclassifying an operator turn here would silently revoke its current
+      // auto-approval policy mid-flight; leaving the sets untouched also means fullAccessAnyOrigin keeps
+      // composing exactly where it already does, inside isAutoApproved, for either current origin.
+      void this.steerBus(sessionId, pending, frameBusMessages(pending))
+      return
+    }
+    if (record.status !== 'idle') return
     if (record.provider === 'claude' && this.executor.isBusy(sessionId)) return
     const pending = this.bus.pending(sessionId)
     if (!pending.length) return
-    this.bus.markDelivered(pending.map((m) => m.id))
-    for (const m of pending) {
-      this.journal.append(sessionId, 'bus/delivered', {
-        id: m.id,
-        fromSession: m.fromSession,
-        fromLabel: m.fromLabel,
-        subject: m.subject,
-        body: m.body,
-      })
-    }
+    this.markBusDelivered(sessionId, pending)
     const framed = frameBusMessages(pending)
     // origin: 'bus' tags the turn so risky in-process tools self-gate (hard-deny) — a teammate
     // message is semi-trusted and must never drive a practice/hook write on its own. The clamped

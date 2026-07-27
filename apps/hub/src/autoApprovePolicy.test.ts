@@ -249,6 +249,10 @@ describe('SessionManager.isAutoApproved — full access is not a blanket yes', (
    */
   it('a send rejected as busy does not grant operator provenance to a running bus turn', async () => {
     const { sessions, seed } = makeSessions()
+    ;(sessions as unknown as { prefs: { chatNamePool: 'everyone'; steerMessagesAtToolBoundary: boolean } }).prefs = {
+      chatNamePool: 'everyone',
+      steerMessagesAtToolBoundary: false,
+    }
     seed({ permissionMode: 'full' })
     markBusTurn(sessions, 's1')
     // The executor reports a turn already in flight, exactly as during a live bus turn.

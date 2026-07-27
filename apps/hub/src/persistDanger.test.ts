@@ -155,9 +155,9 @@ describe('persistPrefs', () => {
   it('writes to the config path it is given, under its own key', () => {
     const dir = tmp()
     const configPath = path.join(dir, 'elsewhere', 'config.json')
-    persistPrefs(configPath, { chatNamePool: 'women' }, journalIn(dir))
+    persistPrefs(configPath, { chatNamePool: 'women', steerMessagesAtToolBoundary: true }, journalIn(dir))
     const cfg = JSON.parse(fs.readFileSync(configPath, 'utf8')) as { prefs?: Record<string, unknown> }
-    expect(cfg.prefs).toEqual({ chatNamePool: 'women' }) // how index.ts reads it back at boot
+    expect(cfg.prefs).toEqual({ chatNamePool: 'women', steerMessagesAtToolBoundary: true }) // how index.ts reads it back at boot
     expect(fs.existsSync(path.join(dir, 'data', 'config.json'))).toBe(false)
   })
 
@@ -165,10 +165,10 @@ describe('persistPrefs', () => {
     const dir = tmp()
     const configPath = path.join(dir, 'config.json')
     persistDanger(configPath, ALL_ON, journalIn(dir))
-    persistPrefs(configPath, { chatNamePool: 'women' }, journalIn(dir))
+    persistPrefs(configPath, { chatNamePool: 'women', steerMessagesAtToolBoundary: false }, journalIn(dir))
     persistDanger(configPath, ALL_ON, journalIn(dir))
     const cfg = JSON.parse(fs.readFileSync(configPath, 'utf8')) as Record<string, unknown>
-    expect(cfg.prefs).toEqual({ chatNamePool: 'women' })
+    expect(cfg.prefs).toEqual({ chatNamePool: 'women', steerMessagesAtToolBoundary: false })
     expect(cfg.danger).toEqual(ALL_ON)
   })
 })

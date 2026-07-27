@@ -33,7 +33,7 @@ export interface Executor {
   startThread(spec: WorkerSessionSpec): Promise<string>
   /** Run one turn. Resolves on ACCEPT (turn/start ack / turn kicked off), NOT on turn completion. */
   runTurn(spec: WorkerSessionSpec, prompt: string, origin: 'operator' | 'bus'): Promise<void>
-  /** Codex only: append input to the live turn on this session's thread. */
+  /** Append input to the provider's live turn; rejects if the turn ended before accepting it. */
   steer(sessionId: string, text: string): Promise<void>
   /** Interrupt the in-flight turn (claude query / codex turn). No-op if none is running. */
   interrupt(sessionId: string): Promise<void>
@@ -404,10 +404,14 @@ export class InProcessExecutor implements Executor {
   }
 
   async steer(sessionId: string, text: string): Promise<void> {
+    const driver = this.claudeDrivers.get(sessionId)
+    if (driver) {
+      await driver.steer(text)
+      return
+    }
     const client = this.codexSessionClients.get(sessionId)
     const threadId = this.codexThreads.get(sessionId)
-    // Steering only applies to a codex session with a LIVE turn; CodexClient.steer enforces the
-    // active-turn requirement (expectedTurnId), throwing if there is none.
+    // CodexClient.steer enforces the LIVE-turn requirement through expectedTurnId, throwing if none.
     // AUDIT/F1 (intentional narrowing, 2026-07-24): the pre-seam steer routed through ensureCodexThread,
     // which would RESUME a persisted-but-not-live thread (journaling session/thread-resumed + warming the
     // cache) *before* throwing 'no active Codex turn to steer'. We no longer do that pointless

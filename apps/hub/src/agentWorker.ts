@@ -408,10 +408,14 @@ export class AgentWorker {
   }
 
   private async steer(sessionId: string, text: string): Promise<void> {
+    const driver = this.claudeDrivers.get(sessionId)
+    if (driver) {
+      await driver.steer(text)
+      return
+    }
     const client = this.codexSessionClients.get(sessionId)
     const threadId = this.codexThreads.get(sessionId)
-    // Steering only applies to a codex session with a LIVE turn; CodexClient.steer enforces the
-    // active-turn requirement (expectedTurnId), throwing if there is none (mirrors in-process).
+    // CodexClient.steer enforces the LIVE-turn requirement through expectedTurnId (mirrors in-process).
     if (!client || !threadId) throw new Error('no active Codex turn to steer')
     await client.steer(threadId, text)
   }

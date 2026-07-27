@@ -160,11 +160,14 @@ export interface FeaturesConfig {
 export interface PrefsConfig {
   /** Which pool a new chat's name is drawn from. Absent → DEFAULT_CHAT_NAME_POOL. See title.ts. */
   chatNamePool?: ChatNamePool
+  /** Deliver new operator/bus input into a running turn at its next tool boundary. Absent means ON. */
+  steerMessagesAtToolBoundary?: boolean
 }
 
 /** Resolved owner preferences (always present; index.ts fills defaults from PrefsConfig). */
 export interface HubPrefs {
   chatNamePool: ChatNamePool
+  steerMessagesAtToolBoundary: boolean
 }
 
 /**
