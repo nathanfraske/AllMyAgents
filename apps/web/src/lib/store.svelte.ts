@@ -816,7 +816,10 @@ export class HubStore {
   async refreshProjects(): Promise<void> {
     // Preserve any merged REMOTE fleet projects (tagged with siteId) — a local refresh must not drop
     // the other machines' rows. Local projects (no siteId) come fresh from this hub.
-    const local = await api.projects()
+    // jget THROWS now (api.ts): a hub hiccup here used to assign an {error} object and limp on; it would
+    // now reject an unguarded load. Keeping the previous list beats blanking the sidebar over one 500.
+    const local = await api.projects().catch(() => null)
+    if (!local) return
     const remote = this.projects.filter((p) => p.siteId)
     this.projects = [...local, ...remote]
   }
@@ -945,7 +948,9 @@ export class HubStore {
       this.markGlitch(rec.id)
     }
     await this.refreshProjects()
-    this.profiles = await api.profiles() // surface any newly-registered default-home account
+    // Same: a failed refresh must leave the accounts we already have, not erase them.
+    const refreshed = await api.profiles().catch(() => null) // surface any newly-registered default-home account
+    if (refreshed) this.profiles = refreshed
     return { imported: out.imported.length, skipped: out.skipped }
   }
 
@@ -1019,8 +1024,14 @@ export class HubStore {
   }
 
   async refreshSideData(): Promise<void> {
-    this.approvals = await api.approvals()
-    this.usage = await api.usage()
+    // Side data is refreshed on a debounce from the event stream, so a transient failure simply means
+    // the next event refreshes it. Throwing out of here would take the whole ingest path down.
+    const [approvals, usage] = await Promise.all([
+      api.approvals().catch(() => null),
+      api.usage().catch(() => null),
+    ])
+    if (approvals) this.approvals = approvals
+    if (usage) this.usage = usage
   }
 
   async setPrefs(patch: Partial<HubPrefs>): Promise<{ error?: string }> {

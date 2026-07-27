@@ -51,14 +51,16 @@
     void api.danger().then((d) => (danger = d))
   })
   $effect(() => {
-    void api.practices().then((p) => (practices = p))
+    void api.practices().then((p) => (practices = p)).catch(() => (practices = []))
   })
   async function setDanger(patch: Partial<DangerFlags>): Promise<void> {
     danger = await api.setDanger(patch)
   }
   async function revokePractice(id: string): Promise<void> {
     await api.revokePractice(id)
-    practices = await api.practices()
+    // jget throws on a hub error now, and this runs after a revoke — a failed refresh must not take the
+    // whole Settings modal down with it; the list simply stays as it was.
+    practices = await api.practices().catch(() => practices)
   }
   function practiceProvenance(p: Practice): string {
     const bits: string[] = []
