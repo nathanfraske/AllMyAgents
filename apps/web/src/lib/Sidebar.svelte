@@ -613,7 +613,24 @@
       danger: true,
     })
     if (!ok) return
-    await store.deleteSession(id)
+    let deleteBrowserData = false
+    try {
+      const browser = await api.browserStatus(id)
+      if (browser.retainedProfile) {
+        deleteBrowserData = await confirmDialog(
+          `"${name}" has retained cookies, site data, or logins in its isolated browser. Delete that browser data too?`,
+          {
+            confirmLabel: 'Delete browser data too',
+            cancelLabel: 'Keep browser data',
+            danger: true,
+          },
+        )
+      }
+    } catch {
+      // The ordinary delete remains available if an older/headless hub has no
+      // browser status endpoint. It cannot have created this profile.
+    }
+    await store.deleteSession(id, deleteBrowserData)
   }
 </script>
 

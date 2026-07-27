@@ -532,8 +532,8 @@ export function startServer(opts: ServerOptions): http.Server {
           json(res, { error: 'missing profileId, cwd, or tool' }, 400)
           return
         }
-        const text = await sessions.execAgentTool(profileId, cwd, toolName, body.args)
-        json(res, { text })
+        const result = await sessions.execAgentTool(profileId, cwd, toolName, body.args)
+        json(res, typeof result === 'string' ? { text: result } : { result })
         return
       }
       // Device-token gate (opt-in). When on, every /api call must present a valid token.
@@ -1114,6 +1114,56 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, { ok: true })
         return
       }
+      const browserMatch = /^\/api\/sessions\/([^/]+)\/browser$/.exec(url.pathname)
+      if (method === 'GET' && browserMatch) {
+        json(res, sessions.browserStatus(browserMatch[1] as string))
+        return
+      }
+      if (method === 'POST' && browserMatch) {
+        const body = await readBody(req)
+        if (typeof body.enabled !== 'boolean') {
+          json(res, { error: 'enabled must be boolean' }, 400)
+          return
+        }
+        await sessions.setBrowserEnabled(browserMatch[1] as string, body.enabled)
+        json(res, sessions.browserStatus(browserMatch[1] as string))
+        return
+      }
+      const browserShowMatch = /^\/api\/sessions\/([^/]+)\/browser\/show$/.exec(url.pathname)
+      if (method === 'POST' && browserShowMatch) {
+        await sessions.showBrowser(browserShowMatch[1] as string)
+        json(res, { ok: true })
+        return
+      }
+      const browserLocalMatch = /^\/api\/sessions\/([^/]+)\/browser\/local-network$/.exec(url.pathname)
+      if (method === 'POST' && browserLocalMatch) {
+        const body = await readBody(req)
+        if (typeof body.enabled !== 'boolean') {
+          json(res, { error: 'enabled must be boolean' }, 400)
+          return
+        }
+        await sessions.setBrowserLocalNetwork(browserLocalMatch[1] as string, body.enabled)
+        json(res, sessions.browserStatus(browserLocalMatch[1] as string))
+        return
+      }
+      const browserOriginMatch = /^\/api\/sessions\/([^/]+)\/browser\/origins\/revoke$/.exec(url.pathname)
+      if (method === 'POST' && browserOriginMatch) {
+        const body = await readBody(req)
+        const originValue = str(body.origin)
+        if (!originValue) {
+          json(res, { error: 'origin is required' }, 400)
+          return
+        }
+        await sessions.revokeBrowserOrigin(browserOriginMatch[1] as string, originValue)
+        json(res, sessions.browserStatus(browserOriginMatch[1] as string))
+        return
+      }
+      const browserClearMatch = /^\/api\/sessions\/([^/]+)\/browser\/clear$/.exec(url.pathname)
+      if (method === 'POST' && browserClearMatch) {
+        await sessions.clearBrowserData(browserClearMatch[1] as string)
+        json(res, { ok: true })
+        return
+      }
       // Operator control-plane only: there is deliberately no corresponding agent tool. The role marker
       // is the trust boundary that unlocks spawn_agent; models may consume it but can never promote a
       // session. Every grant/revoke is persisted on the session record and journaled by SessionManager.
@@ -1281,7 +1331,10 @@ export function startServer(opts: ServerOptions): http.Server {
       }
       const deleteMatch = /^\/api\/sessions\/([^/]+)\/delete$/.exec(url.pathname)
       if (method === 'POST' && deleteMatch) {
-        const result = await sessions.delete(deleteMatch[1] as string)
+        const body = await readBody(req)
+        const result = await sessions.delete(deleteMatch[1] as string, {
+          deleteBrowserData: body.deleteBrowserData === true,
+        })
         json(res, result, result.ok ? 200 : 404)
         return
       }

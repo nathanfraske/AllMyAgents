@@ -108,6 +108,7 @@ export interface SessionRecord {
   permissionMode?: string
   /** Tools the operator chose "always allow" for in this chat. Shown (and revocable) in the permission menu. */
   allowedTools?: string[]
+  browserEnabled?: boolean
   isProjectManager?: boolean
   managerMaxLiveChildren?: number
   managerDelegation?: Array<'commit' | 'push'>
@@ -551,6 +552,15 @@ export interface CompactResult {
   error?: string
 }
 
+export interface BrowserStatus {
+  enabled: boolean
+  available: boolean
+  reason?: string
+  retainedProfile: boolean
+  publicOriginGrants: string[]
+  localNetworkEnabled: boolean
+}
+
 export const api = {
   profiles: () => jget<ProfileInfo[]>('/api/profiles'),
   stats: () => jget<StatsResult>('/api/stats'),
@@ -652,9 +662,25 @@ export const api = {
   // The inverse of stop(): revive a stopped/errored chat to idle so it's usable again (composer frees,
   // bus-reachable). Fixes stop() being a permanent one-way brick.
   reopen: (id: string) => jpost<{ ok?: boolean; status?: string; error?: string }>(`/api/sessions/${id}/reopen`),
-  deleteSession: (id: string) => jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/delete`),
+  deleteSession: (id: string, deleteBrowserData = false) =>
+    jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/delete`, { deleteBrowserData }),
   setMode: (id: string, permissionMode: string) =>
     jpost<{ ok: boolean } | ApiError>(`/api/sessions/${id}/mode`, { permissionMode }),
+  browserStatus: (id: string) =>
+    jget<BrowserStatus>(`/api/sessions/${id}/browser`),
+  setBrowserEnabled: (id: string, enabled: boolean) =>
+    jpost<BrowserStatus | ApiError>(
+      `/api/sessions/${id}/browser`,
+      { enabled },
+    ),
+  setBrowserLocalNetwork: (id: string, enabled: boolean) =>
+    jpost<BrowserStatus | ApiError>(`/api/sessions/${id}/browser/local-network`, { enabled }),
+  revokeBrowserOrigin: (id: string, origin: string) =>
+    jpost<BrowserStatus | ApiError>(`/api/sessions/${id}/browser/origins/revoke`, { origin }),
+  showBrowser: (id: string) =>
+    jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/browser/show`),
+  clearBrowser: (id: string) =>
+    jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/browser/clear`),
   configureProjectManager: (
     id: string,
     config: {

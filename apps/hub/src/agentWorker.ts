@@ -156,6 +156,8 @@ export function buildWorkerAgentServices(deps: WorkerAgentServiceDeps): AgentSer
         authorities,
         tools,
       }) as Promise<{ ok: boolean; error?: string }>,
+    browser: (sessionId, operation, args) =>
+      deps.relayRpc('browser.execute', { sessionId, operation, args }) as ReturnType<AgentServices['browser']>,
     memory: {
       write: (input) => deps.relayRpc('memory.write', input) as Promise<Memory>,
       search: (query, opts) => deps.relayRpc('memory.search', { query, opts }) as Promise<Memory[]>,

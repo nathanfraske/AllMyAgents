@@ -46,11 +46,15 @@ export function makeHubExecutor(cfg: BridgeEnv, fetchImpl: typeof fetch = fetch)
         headers: { 'content-type': 'application/json', authorization: `Bearer ${cfg.secret}` },
         body: JSON.stringify({ profileId: cfg.profileId, cwd: cfg.cwd, tool: name, args: args ?? {} }),
       })
-      const data = (await res.json().catch(() => ({}))) as { text?: string; error?: string }
+      const data = (await res.json().catch(() => ({}))) as {
+        text?: string
+        result?: Awaited<ReturnType<AgentToolExecutor>>
+        error?: string
+      }
       if (!res.ok || data.error) {
         return `Tool error: ${data.error ?? `hub returned ${res.status}`}`
       }
-      return data.text ?? ''
+      return data.result ?? data.text ?? ''
     } catch (err) {
       return `Tool error: could not reach the hub (${err instanceof Error ? err.message : String(err)}).`
     }

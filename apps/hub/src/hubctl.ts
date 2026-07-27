@@ -170,6 +170,12 @@ function workerLaunchCommand(): { cmd: string; args: string[] } {
 function spawnWorker(): void {
   if (!workerSocket) return
   const { cmd, args } = workerLaunchCommand()
+  // The worker relays browser calls back to the hub and never talks to the
+  // desktop bridge itself. Do not let the bridge secret flow through the
+  // worker into Claude/Codex subprocess environments.
+  const workerEnv: NodeJS.ProcessEnv = { ...process.env, HUB_WORKER_SOCKET: workerSocket }
+  delete workerEnv.AMA_DESKTOP_BROWSER_SECRET
+  delete workerEnv.AMA_DESKTOP_BROWSER_ADDR
   const child = spawn(cmd, args, {
     stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
     // Same POSIX process-group reasoning as spawnHub: the worker owns the agent SDK subprocesses, so
@@ -180,7 +186,7 @@ function spawnWorker(): void {
     // vendor CLIs beneath them — otherwise gets its own black window sitting in front of the app.
     // Inherited stdio still flows to whatever the supervisor was started with.
     windowsHide: true,
-    env: { ...process.env, HUB_WORKER_SOCKET: workerSocket },
+    env: workerEnv,
   })
   workerHandle = child
   children.add(child)

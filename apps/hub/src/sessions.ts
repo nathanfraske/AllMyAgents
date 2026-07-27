@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
+import { lookup } from 'node:dns/promises'
 import { defaultHomeProfiles, isManagedProfile } from './profiles.js'
 import { mapCodexTokenUsage } from './adapters/codex.js'
 import { readHistoryPage, locateTranscript, type HistoryPage } from './transcript.js'
@@ -30,6 +31,15 @@ import type { MemoryStore } from './memory.js'
 import type { PracticeStore } from './practices.js'
 import type { DangerFlags, HubPrefs } from './types.js'
 import { InProcessExecutor, type Executor, type InProcessExecutorHubHooks } from './executor.js'
+import type { BrowserBroker } from './browserBroker.js'
+import {
+  decideBrowserGate,
+  isLiteralLocalAddress,
+  parseBrowserUrl,
+  safeJournalUrl,
+} from './browserPolicy.js'
+import type { BrowserOperation, BrowserResultContent } from './browserProtocol.js'
+import type { AgentToolOutput } from './agentToolCore.js'
 import type { RelayMethod, WorkerSessionSpec, WorkerToHub } from './workerProtocol.js'
 import { deriveTitle, sanitizeTitle, generatedTitle, DEFAULT_CHAT_NAME_POOL } from './title.js'
 import { discoverImportableChats, importKey, type ImportableChat, type ScanResult } from './importScan.js'
@@ -175,7 +185,8 @@ export class SessionManager {
     private readonly prefs: HubPrefs = {
       chatNamePool: DEFAULT_CHAT_NAME_POOL,
       steerMessagesAtToolBoundary: true,
-    }
+    },
+    private readonly browserBroker?: BrowserBroker
   ) {
     this.executor =
       executor ??
@@ -222,6 +233,7 @@ export class SessionManager {
       managerSpawn: (managerSessionId, input) => this.managerSpawn(managerSessionId, input),
       managerSetChildAuthority: (managerSessionId, childSessionId, authorities, tools) =>
         this.managerSetChildAuthority(managerSessionId, childSessionId, authorities, tools),
+      browser: (sessionId, operation, args) => this.browserExecute(sessionId, operation, args),
     }
   }
 
@@ -455,6 +467,14 @@ export class SessionManager {
       }
       case 'practices.list':
         return this.practices.list((args ?? {}) as { scopes?: string[]; limit?: number })
+      case 'browser.execute': {
+        const a = args as {
+          sessionId: string
+          operation: 'navigate' | 'read' | 'screenshot' | 'status'
+          args: Record<string, unknown>
+        }
+        return this.browserExecute(a.sessionId, a.operation, a.args)
+      }
       default: {
         const unreachable: never = method
         throw new Error(`unknown relay method: ${String(unreachable)}`)
@@ -586,6 +606,7 @@ export class SessionManager {
       spawnAgent: (managerSessionId, input) => this.managerSpawn(managerSessionId, input),
       setChildAuthority: (managerSessionId, childSessionId, authorities, tools) =>
         this.managerSetChildAuthority(managerSessionId, childSessionId, authorities, tools),
+      browser: (sessionId, operation, args) => this.browserExecute(sessionId, operation, args),
       memory: this.memory,
       practices: this.practices,
       requireApproval: (id, kind, payload) => this.approvals.request(id.sessionId, kind, payload),
@@ -603,7 +624,7 @@ export class SessionManager {
    * hard-deny, since the body reads isBusTurn) are enforced identically. Never throws: attribution
    * failures + tool errors come back as a model-readable string.
    */
-  async execAgentTool(profileId: string, cwd: string, tool: string, args: unknown): Promise<string> {
+  async execAgentTool(profileId: string, cwd: string, tool: string, args: unknown): Promise<AgentToolOutput> {
     const identity = this.resolveCodexIdentity(profileId, cwd)
     if (!identity) {
       this.journal.append(null, 'codex/agent-tool-unattributed', { profileId, cwd, tool })
@@ -614,6 +635,303 @@ export class SessionManager {
     } catch (err) {
       return `Tool error: ${err instanceof Error ? err.message : String(err)}`
     }
+  }
+
+  async browserExecute(
+    sessionId: string,
+    operation: Extract<BrowserOperation, 'navigate' | 'read' | 'screenshot'> | 'status',
+    args: Record<string, unknown>
+  ): Promise<BrowserResultContent[]> {
+    const record = this.sessions.get(sessionId)
+    if (!record) return [{ type: 'text', text: `Browser unavailable: unknown session ${sessionId}.` }]
+    const gate = decideBrowserGate({
+      enabled: record.browserEnabled === true,
+      isOperatorTurn: this.operatorTurnSessions.has(sessionId),
+      isTeammateMessageTurn: this.busTurnSessions.has(sessionId),
+    })
+    if (!gate.ok) {
+      this.journal.append(sessionId, 'browser/denied', { operation, code: gate.code })
+      return [{ type: 'text', text: gate.message }]
+    }
+    if (operation === 'status') {
+      const state = this.browserStatus(sessionId)
+      return [{
+        type: 'text',
+        text: JSON.stringify({
+          enabled: state.enabled,
+          desktopHost: state.available ? 'connected' : 'unavailable',
+          reason: state.reason,
+          retainedIsolatedProfile: state.retainedProfile,
+          publicOriginGrants: state.publicOriginGrants,
+          localNetworkAndDevServers: state.localNetworkEnabled,
+        }, null, 2),
+      }]
+    }
+    if (!this.browserBroker) {
+      return [{
+        type: 'text',
+        text: 'Browser unavailable: this hub was started without an authenticated desktop browser broker.',
+      }]
+    }
+    await this.browserBroker.refresh()
+    const host = this.browserBroker.status()
+    if (!host.available) {
+      return [{
+        type: 'text',
+        text: host.reason ?? 'Browser unavailable: the desktop browser host is not connected.',
+      }]
+    }
+    let safeRequested: ReturnType<typeof safeJournalUrl> | undefined
+    if (operation === 'navigate') {
+      const raw = typeof args.url === 'string' ? args.url : ''
+      try {
+        const url = parseBrowserUrl(raw)
+        safeRequested = safeJournalUrl(url)
+        let isLocal = isLiteralLocalAddress(url.hostname)
+        if (!isLocal) {
+          try {
+            const addresses = await lookup(url.hostname, { all: true, verbatim: true })
+            const classifications = addresses.map(({ address }) => isLiteralLocalAddress(address))
+            if (
+              classifications.length === 0 ||
+              (classifications.some(Boolean) && !classifications.every(Boolean))
+            ) {
+              return [{
+                type: 'text',
+                text: `Navigation refused: ${url.hostname} resolved to an ambiguous mix of public and local addresses.`,
+              }]
+            }
+            isLocal = classifications.every(Boolean)
+          } catch {
+            return [{
+              type: 'text',
+              text: `Navigation refused: ${url.hostname} could not be resolved safely.`,
+            }]
+          }
+        }
+        if (isLocal && record.browserLocalNetworkEnabled !== true) {
+          this.journal.append(sessionId, 'browser/denied', { operation, code: 'local_network_off', requested: safeRequested })
+          return [{
+            type: 'text',
+            text: 'Navigation refused: Local network & dev servers is off for this chat. The operator must enable that separate grant.',
+          }]
+        }
+        if (!isLocal && !(record.browserOriginGrants ?? []).includes(url.origin)) {
+          const approved = await this.approvals.request(sessionId, 'browser/origin', {
+            origin: url.origin,
+            requested: safeRequested,
+          })
+          if (!approved) {
+            this.journal.append(sessionId, 'browser/denied', { operation, code: 'origin_not_granted', requested: safeRequested })
+            return [{ type: 'text', text: `Navigation refused: the operator did not grant ${url.origin} for this chat.` }]
+          }
+          const stillAllowed = decideBrowserGate({
+            enabled: record.browserEnabled === true,
+            isOperatorTurn: this.operatorTurnSessions.has(sessionId),
+            isTeammateMessageTurn: this.busTurnSessions.has(sessionId),
+          })
+          if (!stillAllowed.ok) {
+            this.journal.append(sessionId, 'browser/denied', {
+              operation,
+              code: stillAllowed.code,
+              requested: safeRequested,
+            })
+            return [{ type: 'text', text: stillAllowed.message }]
+          }
+          record.browserOriginGrants = [...new Set([...(record.browserOriginGrants ?? []), url.origin])].sort()
+          this.persist(record)
+          this.journal.append(sessionId, 'browser/origin-granted', { origin: url.origin })
+        }
+        args = {
+          url: url.href,
+          allowedOrigins: record.browserOriginGrants ?? [],
+          localNetwork: record.browserLocalNetworkEnabled === true,
+          agentLabel: record.title || record.profileId,
+        }
+      } catch (err) {
+        return [{ type: 'text', text: err instanceof Error ? err.message : String(err) }]
+      }
+    }
+    const stillAllowed = decideBrowserGate({
+      enabled: record.browserEnabled === true,
+      isOperatorTurn: this.operatorTurnSessions.has(sessionId),
+      isTeammateMessageTurn: this.busTurnSessions.has(sessionId),
+    })
+    if (!stillAllowed.ok) {
+      this.journal.append(sessionId, 'browser/denied', { operation, code: stillAllowed.code })
+      return [{ type: 'text', text: stillAllowed.message }]
+    }
+    this.journal.append(
+      sessionId,
+      operation === 'navigate' ? 'browser/navigation-requested' : `browser/${operation}`,
+      operation === 'navigate' ? { actor: 'agent', requested: safeRequested } : {},
+    )
+    try {
+      const content = await this.browserBroker.execute({ sessionId, operation, arguments: args })
+      if (operation === 'screenshot') {
+        for (const item of content) {
+          if (item.type === 'image' && (item.mimeType !== 'image/png' || item.data.length > 12_000_000)) {
+            throw new Error('Browser screenshot refused: the desktop returned an invalid or oversized PNG.')
+          }
+        }
+      }
+      if (operation === 'navigate' && record.browserProfileRetained !== true) {
+        record.browserProfileRetained = true
+        this.persist(record)
+      }
+      return content
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      this.journal.append(
+        sessionId,
+        operation === 'navigate' ? 'browser/navigation-failed' : `browser/${operation}-failed`,
+        { requested: safeRequested, errorCode: 'desktop_error' },
+      )
+      return [{ type: 'text', text: message }]
+    }
+  }
+
+  async setBrowserEnabled(sessionId: string, enabled: boolean): Promise<SessionRecord> {
+    const record = this.sessions.get(sessionId)
+    if (!record) throw new Error(`unknown session: ${sessionId}`)
+    record.browserEnabled = enabled
+    this.persist(record)
+    this.journal.append(sessionId, enabled ? 'browser/capability-enabled' : 'browser/capability-disabled', {
+      retainedProfile: record.browserProfileRetained === true,
+    })
+    if (!enabled && this.browserBroker) {
+      this.browserBroker.cancelSession(sessionId)
+      if (this.browserBroker.status().available) {
+        await this.browserBroker.executeAfterCurrent({ sessionId, operation: 'close', arguments: {} }).catch((err) => {
+          this.journal.append(sessionId, 'browser/close-failed', {
+            message: err instanceof Error ? err.message : String(err),
+          })
+        })
+      }
+    }
+    return record
+  }
+
+  browserStatus(sessionId: string): {
+    enabled: boolean
+    available: boolean
+    reason?: string
+    retainedProfile: boolean
+    publicOriginGrants: string[]
+    localNetworkEnabled: boolean
+  } {
+    const record = this.sessions.get(sessionId)
+    if (!record) throw new Error(`unknown session: ${sessionId}`)
+    const status = this.browserBroker?.status() ?? {
+      available: false,
+      reason: 'Browser unavailable: this hub was started without an authenticated desktop browser broker.',
+    }
+    return {
+      enabled: record.browserEnabled === true,
+      retainedProfile: record.browserProfileRetained === true,
+      publicOriginGrants: record.browserOriginGrants ?? [],
+      localNetworkEnabled: record.browserLocalNetworkEnabled === true,
+      ...status,
+    }
+  }
+
+  async showBrowser(sessionId: string): Promise<void> {
+    const record = this.sessions.get(sessionId)
+    if (!record) throw new Error(`unknown session: ${sessionId}`)
+    if (!record.browserEnabled) throw new Error('Browser access is off for this chat.')
+    if (!this.browserBroker) {
+      throw new Error('Browser unavailable: this hub was started without an authenticated desktop browser broker.')
+    }
+    await this.browserBroker.execute({
+      sessionId,
+      operation: 'show',
+      arguments: {
+        allowedOrigins: record.browserOriginGrants ?? [],
+        localNetwork: record.browserLocalNetworkEnabled === true,
+        agentLabel: record.title || record.profileId,
+      },
+    })
+    if (record.browserProfileRetained !== true) {
+      record.browserProfileRetained = true
+      this.persist(record)
+    }
+  }
+
+  async clearBrowserData(sessionId: string): Promise<void> {
+    const record = this.sessions.get(sessionId)
+    if (!record) throw new Error(`unknown session: ${sessionId}`)
+    if (!this.browserBroker) {
+      throw new Error('Browser unavailable: this hub was started without an authenticated desktop browser broker.')
+    }
+    this.browserBroker.cancelSession(sessionId)
+    await this.browserBroker.executeAfterCurrent({ sessionId, operation: 'clear', arguments: {} })
+    record.browserProfileRetained = false
+    this.persist(record)
+    this.journal.append(sessionId, 'browser/profile-cleared', {})
+  }
+
+  noteBrowserNavigation(
+    sessionId: string,
+    rawUrl: string,
+    _title?: string,
+    actor: 'agent' | 'operator' = 'operator',
+    ok = true,
+    errorCode?: string,
+  ): void {
+    if (!this.sessions.has(sessionId)) return
+    try {
+      const final = safeJournalUrl(parseBrowserUrl(rawUrl))
+      if (!ok) {
+        this.journal.append(sessionId, 'browser/navigation-failed', {
+          actor,
+          requested: final,
+          errorCode: errorCode ?? 'desktop_navigation_denied',
+        })
+        return
+      }
+      this.journal.append(sessionId, 'browser/navigation-finished', {
+        actor,
+        final,
+        ok: true,
+      })
+    } catch {
+      this.journal.append(sessionId, 'browser/navigation-failed', {
+        actor,
+        errorCode: 'forbidden_final_url',
+      })
+    }
+  }
+
+  async setBrowserLocalNetwork(sessionId: string, enabled: boolean): Promise<SessionRecord> {
+    const record = this.sessions.get(sessionId)
+    if (!record) throw new Error(`unknown session: ${sessionId}`)
+    record.browserLocalNetworkEnabled = enabled
+    this.persist(record)
+    this.journal.append(sessionId, enabled ? 'browser/local-network-granted' : 'browser/local-network-revoked', {})
+    if (!enabled && this.browserBroker) {
+      this.browserBroker.cancelSession(sessionId)
+      if (this.browserBroker.status().available) {
+        await this.browserBroker.executeAfterCurrent({ sessionId, operation: 'close', arguments: {} }).catch(() => {})
+      }
+    }
+    return record
+  }
+
+  async revokeBrowserOrigin(sessionId: string, origin: string): Promise<SessionRecord> {
+    const record = this.sessions.get(sessionId)
+    if (!record) throw new Error(`unknown session: ${sessionId}`)
+    const canonicalOrigin = parseBrowserUrl(origin).origin
+    if (origin !== canonicalOrigin) throw new Error('origin must be a canonical http(s) origin')
+    record.browserOriginGrants = (record.browserOriginGrants ?? []).filter((value) => value !== canonicalOrigin)
+    this.persist(record)
+    this.journal.append(sessionId, 'browser/origin-revoked', { origin: canonicalOrigin })
+    if (this.browserBroker) {
+      this.browserBroker.cancelSession(sessionId)
+      if (this.browserBroker.status().available) {
+        await this.browserBroker.executeAfterCurrent({ sessionId, operation: 'close', arguments: {} }).catch(() => {})
+      }
+    }
+    return record
   }
 
   boot(opts?: { reconcile?: boolean }): void {
@@ -2691,9 +3009,24 @@ export class SessionManager {
   // never throws. The journal is append-only, so the delete is recorded as a `session/deleted`
   // tombstone rather than by removing rows; SessionStore.remove drops the persisted snapshot that
   // boot() restores from, so a hub restart won't resurrect it.
-  async delete(sessionId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  async delete(
+    sessionId: string,
+    options: { deleteBrowserData?: boolean } = {},
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
     const record = this.sessions.get(sessionId)
     if (!record) return { ok: false, error: `unknown session: ${sessionId}` }
+    if (options.deleteBrowserData && record.browserProfileRetained) {
+      try {
+        await this.clearBrowserData(sessionId)
+      } catch (err) {
+        return {
+          ok: false,
+          error: `The chat was preserved because its isolated browser data could not be cleared: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        }
+      }
+    }
     const liveChildren = [...this.sessions.values()].filter(
       (child) =>
         child.parentSessionId === record.id &&

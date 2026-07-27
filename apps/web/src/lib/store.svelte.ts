@@ -1215,9 +1215,14 @@ export class HubStore {
    * responses as `{ error }`, so a catch alone is not a success check. Keeping this seam shared with
    * attachment-transaction cleanup prevents either delete path from orphaning a hub session locally.
    */
-  private async requestSessionDelete(id: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  private async requestSessionDelete(
+    id: string,
+    deleteBrowserData = false,
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
     try {
-      const out = await api.deleteSession(id)
+      const out = deleteBrowserData
+        ? await api.deleteSession(id, true)
+        : await api.deleteSession(id)
       if (out?.ok === true) return { ok: true }
       return { ok: false, error: out?.error?.trim() || 'the hub did not confirm deletion' }
     } catch (error) {
@@ -1230,8 +1235,11 @@ export class HubStore {
 
   // Delete a chat only after the hub confirms its tombstone. A refusal deliberately leaves every local
   // reference intact and explains where the protected work remains (the hub's reason includes that path).
-  async deleteSession(id: string): Promise<{ ok: true } | { ok: false; error: string }> {
-    const out = await this.requestSessionDelete(id)
+  async deleteSession(
+    id: string,
+    deleteBrowserData = false,
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    const out = await this.requestSessionDelete(id, deleteBrowserData)
     if (!out.ok) {
       await alertDialog(`Chat was not deleted. Its workspace and chat remain available.\n\n${out.error}`)
       return out
@@ -1604,6 +1612,52 @@ export class HubStore {
         const pm = (payload as { permissionMode?: string }).permissionMode
         if (pm === 'safe' || pm === 'edits' || pm === 'full') view.record.permissionMode = pm
         this.push(view, { kind: 'note', ts, text: `permission mode → ${pm}` })
+        break
+      }
+      case 'browser/capability-enabled':
+      case 'browser/capability-disabled': {
+        view.record.browserEnabled = kind === 'browser/capability-enabled'
+        this.push(view, {
+          kind: 'note',
+          ts,
+          text: kind === 'browser/capability-enabled' ? 'isolated browser enabled' : 'isolated browser disabled',
+        })
+        break
+      }
+      case 'browser/navigation-finished': {
+        const p = payload as {
+          actor?: 'agent' | 'operator'
+          final?: { scheme?: string; host?: string; port?: number; path?: string; queryKeys?: string[] }
+          ok?: boolean
+        }
+        const url = p.final
+          ? `${p.final.scheme ?? 'https'}://${p.final.host ?? 'unknown'}${p.final.port ? `:${p.final.port}` : ''}${p.final.path ?? '/'}${
+              p.final.queryKeys?.length ? `?${p.final.queryKeys.map((key) => `${key}=…`).join('&')}` : ''
+            }`
+          : 'an unknown page'
+        this.push(view, {
+          kind: 'note',
+          ts,
+          text: `browser ${p.actor === 'operator' ? 'operator opened' : 'opened'} ${url}`,
+        })
+        break
+      }
+      case 'browser/navigation-failed': {
+        const p = payload as {
+          actor?: 'agent' | 'operator'
+          requested?: { scheme?: string; host?: string; port?: number; path?: string; queryKeys?: string[] }
+          errorCode?: string
+        }
+        const url = p.requested
+          ? `${p.requested.scheme ?? 'https'}://${p.requested.host ?? 'unknown'}${p.requested.port ? `:${p.requested.port}` : ''}${p.requested.path ?? '/'}${
+              p.requested.queryKeys?.length ? `?${p.requested.queryKeys.map((key) => `${key}=…`).join('&')}` : ''
+            }`
+          : 'an unknown page'
+        this.push(view, {
+          kind: 'note',
+          ts,
+          text: `browser ${p.actor === 'operator' ? 'operator navigation' : 'navigation'} blocked for ${url}`,
+        })
         break
       }
       // The hub confirming an "always allow" grant or its revoke. Without this the permission menu only

@@ -59,6 +59,14 @@ export interface SessionRecord {
    *  the worker and in-process executors funnel through — so adding one takes effect immediately, mid-turn,
    *  with no worker respawn. Per-chat by design: a blanket global allowlist is a much bigger blast radius. */
   allowedTools?: string[]
+  /** App-owned browser capability. Safe default is OFF when absent. The profile remains session-keyed. */
+  browserEnabled?: boolean
+  /** Public http(s) origins approved for this exact session. Values are canonical URL origins. */
+  browserOriginGrants?: string[]
+  /** Separate owner grant for loopback/private/link-local web origins. Safe default is OFF. */
+  browserLocalNetworkEnabled?: boolean
+  /** Whether this session has created a persistent isolated profile directory. */
+  browserProfileRetained?: boolean
   /** Operator-granted project-manager role. Agents can consume this marker but never set it. */
   isProjectManager?: boolean
   /** Bounded direct-child capacity for a manager. Absent is never interpreted as unlimited. */

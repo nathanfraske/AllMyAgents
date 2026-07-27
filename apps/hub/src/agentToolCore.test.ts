@@ -45,6 +45,7 @@ function makeHarness(opts: {
     roster: () => opts.roster ?? [],
     peek: (_caller, _target) => opts.peek ?? { found: false },
     childStatus: () => opts.childStatus ?? { ok: false, error: 'not a project manager' },
+    browser: async () => [{ type: 'text', text: 'browser unavailable in test' }],
     memory,
     practices,
     requireApproval: async (_id, kind, payload) => {
@@ -75,6 +76,10 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
       'practice_edit',
       'practice_read',
       'practice_list',
+      'browser_navigate',
+      'browser_read_page',
+      'browser_screenshot',
+      'browser_status',
     ])
     for (const t of AGENT_TOOLS) {
       expect(t.description.length).toBeGreaterThan(10)

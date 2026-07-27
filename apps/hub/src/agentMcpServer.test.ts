@@ -60,6 +60,21 @@ describe('AgentMcpServer (the real stdio MCP server codex loads for the Codex pa
     expect(r.result.content[0]!.text).toBe('ran list_agents with {}')
   })
 
+  it('preserves a browser PNG as an MCP image block for Codex', async () => {
+    const { server, out } = driver(async () => [
+      { type: 'text', text: 'https://example.com/' },
+      { type: 'image', mimeType: 'image/png', data: 'iVBORw0KGgo=' },
+    ])
+    await server.handleLine(
+      JSON.stringify({ jsonrpc: '2.0', id: 22, method: 'tools/call', params: { name: 'browser_screenshot', arguments: {} } })
+    )
+    const result = (out[0]! as { result: { content: unknown[] } }).result
+    expect(result.content).toEqual([
+      { type: 'text', text: 'https://example.com/' },
+      { type: 'image', mimeType: 'image/png', data: 'iVBORw0KGgo=' },
+    ])
+  })
+
   it('an unknown tool name comes back as an isError result (not a transport error)', async () => {
     const { server, out } = driver(okExecutor)
     await server.handleLine(JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'nope', arguments: {} } }))

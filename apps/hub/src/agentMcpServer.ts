@@ -1,6 +1,6 @@
 import readline from 'node:readline'
 import { z } from 'zod'
-import { AGENT_TOOLS, AGENT_TOOLS_INSTRUCTIONS, type AgentToolSpec } from './agentToolCore.js'
+import { AGENT_TOOLS, AGENT_TOOLS_INSTRUCTIONS, type AgentToolOutput, type AgentToolSpec } from './agentToolCore.js'
 
 /**
  * A minimal, dependency-free MCP server (JSON-RPC 2.0 over line-delimited stdio) exposing the shared
@@ -16,7 +16,7 @@ import { AGENT_TOOLS, AGENT_TOOLS_INSTRUCTIONS, type AgentToolSpec } from './age
  * call (with the calling child's cwd) to the hub, which resolves the Codex SESSION and runs the body
  * under that identity + the same ACL/gating as Claude (see agentBridge.ts / SessionManager).
  */
-export type AgentToolExecutor = (name: string, args: unknown) => Promise<string>
+export type AgentToolExecutor = (name: string, args: unknown) => Promise<AgentToolOutput>
 
 export interface AgentMcpServerOptions {
   execute: AgentToolExecutor
@@ -116,8 +116,12 @@ export class AgentMcpServer {
           return
         }
         try {
-          const text = await this.opts.execute(name, params.arguments ?? {})
-          this.reply(id, { content: [{ type: 'text', text }] })
+          const output = await this.opts.execute(name, params.arguments ?? {})
+          this.reply(id, {
+            content: typeof output === 'string'
+              ? [{ type: 'text', text: output }]
+              : output,
+          })
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err)
           this.reply(id, { content: [{ type: 'text', text: `Tool error: ${message}` }], isError: true })
