@@ -21,6 +21,10 @@ interface Settings {
   // Check the GitHub release endpoint for a newer signed build on launch. Never installs anything on
   // its own — an available update only raises a banner the operator has to accept. Default on.
   autoCheckUpdates: boolean
+  // A paste of at least this many characters is promoted to a "pasted text" chip in the composer instead
+  // of dumping a wall into the box (and then the transcript). 0 disables promotion. Default is well above
+  // an ordinary message/snippet so normal pasting is unaffected; lower it to catch smaller dumps.
+  pasteAsTextThreshold: number
 }
 
 const KEY = 'allmyagents.settings'
@@ -41,6 +45,7 @@ const DEFAULTS: Settings = {
   autoSwitchToNewChat: true,
   autoReopenLastChats: false,
   autoCheckUpdates: true,
+  pasteAsTextThreshold: 10000,
 }
 
 /**
@@ -92,6 +97,7 @@ class SettingsStore {
   autoSwitchToNewChat = $state(true)
   autoReopenLastChats = $state(false)
   autoCheckUpdates = $state(true)
+  pasteAsTextThreshold = $state(10000)
 
   constructor() {
     const s = load()
@@ -110,6 +116,7 @@ class SettingsStore {
     this.autoSwitchToNewChat = s.autoSwitchToNewChat
     this.autoReopenLastChats = s.autoReopenLastChats
     this.autoCheckUpdates = s.autoCheckUpdates
+    this.pasteAsTextThreshold = s.pasteAsTextThreshold
   }
 
   save(): void {
@@ -133,6 +140,7 @@ class SettingsStore {
           autoReopenLastChats: this.autoReopenLastChats,
           _v: SETTINGS_VERSION, // so a future default change can migrate this install (see load)
           autoCheckUpdates: this.autoCheckUpdates,
+          pasteAsTextThreshold: this.pasteAsTextThreshold,
         })
       )
     } catch {
