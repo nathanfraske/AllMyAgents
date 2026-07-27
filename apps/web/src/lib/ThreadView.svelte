@@ -220,7 +220,7 @@
   // of truth means the pills always show what the next turn will actually use, for either vendor.
   const isDraft = $derived(!!view?.draft)
   // The main transcript shows only the MAIN thread; sub-agent output lives in the agent panel.
-  const mainItems = $derived((view?.items ?? []).filter((i) => !i.agentId))
+  const mainItems = $derived((view?.items ?? []).filter((i) => !i.agentId && !i.taskBoardOnly))
   // Codex turns emit long reasoning→command→reasoning churn before they say anything; fold consecutive
   // activity into a single live group the way the Codex app does (see codexGroup.ts). Claude renders its
   // own way (tool cards, sub-agent panel), so its transcript stays item-per-item, untouched.

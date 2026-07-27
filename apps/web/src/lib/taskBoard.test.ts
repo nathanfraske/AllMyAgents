@@ -77,12 +77,60 @@ describe('buildTaskBoard — TodoWrite (snapshot)', () => {
     expect(board.changes.map((c) => c.kind)).toEqual(['snapshot', 'snapshot'])
   })
 
-  it('ignores an empty snapshot rather than blanking the board', () => {
+  it('lets an empty snapshot clear the board', () => {
     const board = buildTaskBoard([
       tool('TodoWrite', { todos: [{ content: 'keep me', status: 'pending' }] }),
       tool('TodoWrite', { todos: [] }),
     ])
-    expect(board.tasks.map((t) => t.title)).toEqual(['keep me'])
+    expect(board.source).toBe('todo')
+    expect(board.tasks).toEqual([])
+    expect(board.changes.map((c) => c.kind)).toEqual(['snapshot', 'snapshot'])
+  })
+
+  it('accepts the JSON-encoded todos snapshot emitted by the live Claude SDK', () => {
+    const board = buildTaskBoard([
+      tool('TodoWrite', {
+        todos:
+          '[{"content":"State alpha","status":"completed","activeForm":"Stating alpha"},' +
+          '{"content":"State beta","status":"in_progress","activeForm":"Stating beta"}]',
+      }),
+    ])
+
+    expect(board.source).toBe('todo')
+    expect(board.tasks.map((t) => `${t.title}:${t.status}`)).toEqual([
+      'State alpha:completed',
+      'State beta:in_progress',
+    ])
+  })
+})
+
+describe('buildTaskBoard — Codex update_plan (snapshot)', () => {
+  it('replaces the whole board and normalizes Codex statuses', () => {
+    const board = buildTaskBoard([
+      tool('update_plan', {
+        explanation: 'Start the audit',
+        plan: [
+          { step: 'Inspect package.json', status: 'inProgress' },
+          { step: 'Inspect the web package', status: 'pending' },
+        ],
+      }),
+      tool('update_plan', {
+        explanation: 'First step finished',
+        plan: [
+          { step: 'Inspect package.json', status: 'completed' },
+          { step: 'Inspect the web package', status: 'inProgress' },
+          { step: 'Summarize both findings', status: 'pending' },
+        ],
+      }),
+    ])
+
+    expect(board.source).toBe('plan')
+    expect(board.tasks.map((t) => `${t.title}:${t.status}`)).toEqual([
+      'Inspect package.json:completed',
+      'Inspect the web package:in_progress',
+      'Summarize both findings:pending',
+    ])
+    expect(board.changes.map((c) => c.kind)).toEqual(['snapshot', 'snapshot'])
   })
 })
 
