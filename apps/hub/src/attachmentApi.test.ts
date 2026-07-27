@@ -18,9 +18,10 @@ import { SessionStore } from './store.js'
 import { ApprovalService } from './approvals.js'
 import { UsageMonitor } from './usage.js'
 import { WorkspaceManager } from './workspace.js'
-import { MAX_IMAGE_BYTES } from './attachments.js'
+import { MAX_IMAGE_BYTES, saveAttachment } from './attachments.js'
 import type { AttachmentMeta } from './attachments.js'
 import { CodexClient } from './adapters/codex.js'
+import { extractXlsxText } from './officeDocuments.js'
 import { strToU8, zipSync } from 'fflate'
 
 const cleanups: Array<() => void | Promise<void>> = []
@@ -104,6 +105,30 @@ function twoSheetXlsx(): Buffer {
     ),
   }
   return Buffer.from(zipSync(files, { level: 6 }))
+}
+
+function dimensionXlsx(dimension = 'A1:ZZZZ1', cell = 'ZZZZ1'): Buffer {
+  return Buffer.from(
+    zipSync(
+      {
+        'xl/workbook.xml': strToU8(
+          '<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ' +
+          'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>' +
+          '<sheet name="Hostile" sheetId="1" r:id="rId1"/></sheets></workbook>'
+        ),
+        'xl/_rels/workbook.xml.rels': strToU8(
+          '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+          '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>' +
+          '</Relationships>'
+        ),
+        'xl/worksheets/sheet1.xml': strToU8(
+          '<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+          `<dimension ref="${dimension}"/><sheetData><row r="1"><c r="${cell}"><v>1</v></c></row></sheetData></worksheet>`
+        ),
+      },
+      { level: 6 }
+    )
+  )
 }
 
 function orderedDocx(): Buffer {
@@ -297,7 +322,58 @@ describe('session attachment API', () => {
     const downloaded = await fetch(`${base}/api/sessions/${record.id}/attachments/${meta.id}`)
     expect(downloaded.status).toBe(200)
     expect(downloaded.headers.get('content-type')).toBe('image/png')
+    expect(downloaded.headers.get('content-disposition')).toBe('inline')
+    expect(downloaded.headers.get('content-security-policy')).toBe("default-src 'none'; sandbox")
     expect(Buffer.from(await downloaded.arrayBuffer())).toEqual(bytes)
+  })
+
+  it('never serves HTML or SVG as inline active content on the hub origin', async () => {
+    const { base, record } = await build()
+    const htmlUpload = await fetch(`${base}/api/sessions/${record.id}/attachments`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'text/html',
+        'x-filename': 'report.html',
+      },
+      body: '<script>globalThis.compromised = true</script>',
+    })
+    expect(htmlUpload.status).toBe(200)
+    const html = (await htmlUpload.json()) as AttachmentMeta
+    // SVG is rejected by the upload admission boundary today. Persist one through the lower storage
+    // primitive so this response-boundary regression also protects legacy rows and future admission changes.
+    const svg = saveAttachment(
+      record.id,
+      record.cwd,
+      'diagram.svg',
+      'image/svg+xml',
+      Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>')
+    )
+
+    for (const attachment of [html, svg]) {
+      const response = await fetch(
+        `${base}/api/sessions/${record.id}/attachments/${attachment.id}`
+      )
+      expect(response.status).toBe(200)
+      expect(response.headers.get('content-disposition')).toMatch(/^attachment;/)
+      expect(response.headers.get('content-security-policy')).toBe("default-src 'none'; sandbox")
+      expect(response.headers.get('x-content-type-options')).toBe('nosniff')
+    }
+  })
+
+  it('quotes a download filename without allowing quote or newline header injection', async () => {
+    const { base, record } = await build()
+    const attachment = saveAttachment(
+      record.id,
+      record.cwd,
+      'bad"\r\nx-injected: yes.html',
+      'text/html',
+      Buffer.from('<p>download only</p>')
+    )
+
+    const response = await fetch(`${base}/api/sessions/${record.id}/attachments/${attachment.id}`)
+    const disposition = response.headers.get('content-disposition')
+    expect(disposition).toContain('attachment; filename="bad___x-injected_ yes.html"')
+    expect(disposition).not.toMatch(/[\r\n]/)
   })
 
   it('resolves ids into worker metadata and journals metadata without file bytes', async () => {
@@ -454,6 +530,37 @@ describe('session attachment API', () => {
     await expect(upload.json()).resolves.toEqual({
       error: expect.stringMatching(/Office XML expands beyond the .* safety limit/i),
     })
+  })
+
+  it('rejects an XLSX with an absurd declared dimension before allocating its claimed width', () => {
+    const started = performance.now()
+    expect(() => extractXlsxText(dimensionXlsx())).toThrow(/dimension|column|limit/i)
+    expect(performance.now() - started).toBeLessThan(500)
+  })
+
+  it('validates but never allocates from a maximum legal XLSX dimension claim', () => {
+    const started = performance.now()
+    expect(extractXlsxText(dimensionXlsx('A1:XFD1048576', 'A1'))).toBe('# Sheet: Hostile\n1')
+    expect(performance.now() - started).toBeLessThan(500)
+  })
+
+  it('rejects an Office archive with an excessive entry count', () => {
+    const files: Record<string, Uint8Array> = {
+      'xl/workbook.xml': strToU8(
+        '<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>' +
+        '<sheet name="One" r:id="rId1"/></sheets></workbook>'
+      ),
+      'xl/_rels/workbook.xml.rels': strToU8(
+        '<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>'
+      ),
+      'xl/worksheets/sheet1.xml': strToU8('<worksheet><sheetData/></worksheet>'),
+    }
+    for (let index = 0; index < 1_100; index += 1) {
+      files[`unused/entry-${index}.xml`] = strToU8('<x/>')
+    }
+    const archive = Buffer.from(zipSync(files, { level: 6 }))
+
+    expect(() => extractXlsxText(archive)).toThrow(/entr(?:y|ies).*limit/i)
   })
 
   it('does not let another session or a tampered sidecar escape the download root', async () => {

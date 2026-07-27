@@ -25,7 +25,7 @@ import type { DangerFlags, HubEvent, HubPrefs, Profile, Provider } from './types
 import type { Executor } from './executor.js'
 import type { RestartState } from './restartController.js'
 import { SCHEMA_VERSION } from './restartHandshake.js'
-import { AttachmentInputError, attachmentLimitForMime } from './attachments.js'
+import { AttachmentInputError, attachmentLimitForMime, isClaudeImageMime } from './attachments.js'
 
 const PAGE = `<!doctype html>
 <html>
@@ -323,6 +323,23 @@ function bearerToken(req: http.IncomingMessage): string | undefined {
   if (auth && auth.startsWith('Bearer ')) return auth.slice(7).trim()
   const x = req.headers['x-hub-token']
   return typeof x === 'string' ? x : undefined
+}
+
+function attachmentDisposition(name: string): string {
+  let unicode = ''
+  let fallback = ''
+  for (const char of name) {
+    const point = char.codePointAt(0)!
+    const scalar = point >= 0xd800 && point <= 0xdfff ? '\ufffd' : char
+    unicode += scalar
+    if (point < 0x20 || point > 0x7e || point === 0x7f) fallback += '_'
+    else if (char === '"' || char === '\\') fallback += `\\${char}`
+    else fallback += char
+  }
+  const encoded = encodeURIComponent(unicode).replace(/['()*]/g, (char) =>
+    `%${char.charCodeAt(0).toString(16).toUpperCase()}`
+  )
+  return `attachment; filename="${fallback || 'attachment'}"; filename*=UTF-8''${encoded}`
 }
 
 export interface ServerOptions {
@@ -968,9 +985,15 @@ export function startServer(opts: ServerOptions): http.Server {
           json(res, { error: 'attachment not found' }, 404)
           return
         }
+        // Only inert raster formats render inside the privileged hub origin. SVG stays a download even
+        // though it is `image/*`: it can execute script, so adding it to this allowlist would hand an upload
+        // the same-origin authority to spawn agents, read journals, and change settings.
+        const inline = isClaudeImageMime(attachment.mime)
         res.writeHead(200, {
           'content-type': attachment.mime,
           'content-length': attachment.size,
+          'content-disposition': inline ? 'inline' : attachmentDisposition(attachment.name),
+          'content-security-policy': "default-src 'none'; sandbox",
           'x-content-type-options': 'nosniff',
         })
         try {
