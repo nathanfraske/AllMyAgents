@@ -27,6 +27,8 @@ export interface ClaudeTurnOptions {
   model?: string
   permissionMode?: 'safe' | 'edits' | 'full'
   effort?: string
+  /** True only when the operator approved this project's executable MCP/hook config. */
+  trustProjectConfig?: boolean
 }
 
 // Claude Code recognizes thinking-budget keywords in the prompt text.

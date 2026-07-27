@@ -22,6 +22,8 @@ export interface WorkerSessionSpec {
   effort?: string
   serviceTier?: string
   permissionMode?: 'safe' | 'edits' | 'full'
+  /** True only when the operator approved this project's executable MCP/hook config. */
+  trustProjectConfig?: boolean
   vendorSessionId?: string // claude --resume id / codex threadId to resume
 }
 

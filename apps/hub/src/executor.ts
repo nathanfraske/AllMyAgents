@@ -373,6 +373,7 @@ export class InProcessExecutor implements Executor {
         model: spec.model,
         permissionMode: spec.permissionMode,
         effort: spec.effort,
+        trustProjectConfig: spec.trustProjectConfig,
       })
       if (driver.sessionId) this.h.persistVendorSessionId(spec.sessionId, driver.sessionId)
       this.h.setStatus(spec.sessionId, 'idle')

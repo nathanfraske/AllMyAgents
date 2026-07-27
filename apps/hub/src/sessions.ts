@@ -382,6 +382,15 @@ export class SessionManager {
    *  same SessionIdentity for MCP attribution. */
   private specOf(record: SessionRecord): WorkerSessionSpec {
     const profile = this.profileOf(record)
+    // ProjectStore owns consent and content-fingerprint validation. This seam carries only its current
+    // boolean decision; undefined/missing support and projectless sessions fail closed. Keeping the
+    // executable-config gate out of SessionManager prevents this transport flag becoming a second trust
+    // authority.
+    const projectTrust = this.projects as ProjectStore & {
+      isConfigTrusted?(projectId: string): boolean
+    }
+    const trustProjectConfig =
+      record.projectId !== undefined && projectTrust.isConfigTrusted?.(record.projectId) === true
     // Before the executor lazily spawns this Codex profile's app-server (which reads config.toml on
     // first use), make sure the `allmyagents` MCP server is registered so Codex gets the same tools as
     // Claude. Guarded to once per profile, and a no-op until setCodexBridge wires the bridge (so tests /
@@ -401,6 +410,7 @@ export class SessionManager {
       effort: record.effort,
       serviceTier: record.serviceTier,
       permissionMode: record.permissionMode,
+      trustProjectConfig,
       vendorSessionId: record.vendorSessionId,
     }
   }
