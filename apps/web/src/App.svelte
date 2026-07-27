@@ -127,6 +127,7 @@
   // reassign dropZone when the target cell actually changes.
   interface RowGeom { bottom: number; panes: { left: number; right: number; top: number; bottom: number }[] }
   let dragGeom: RowGeom[] | null = null
+  let paneDragId = $state<string | null>(null)
 
   function captureGeom(): RowGeom[] {
     const rows = panesEl ? [...panesEl.querySelectorAll<HTMLElement>('.prow')] : []
@@ -147,6 +148,35 @@
   }
   function setZone(zone: DropZone): void {
     if (!sameZone(zone, store.dropZone)) store.dropZone = zone
+  }
+
+  // Existing panes use the SAME drag session, frozen geometry, zones and ghost as sidebar chats. The
+  // pane remains in place until drop (so geometry is stable and the session never remounts mid-drag);
+  // store.dropAt performs the single move commit at the end. Only the non-interactive part of the pane
+  // header is a grip, so selecting transcript text and using composer/header controls stays normal.
+  function startPaneDrag(id: string, e: DragEvent): void {
+    const target = e.target
+    if (
+      target instanceof Element &&
+      (target.closest('button, select, input, textarea, a') || (target !== e.currentTarget && !target.closest('.head')))
+    ) {
+      e.preventDefault()
+      return
+    }
+    paneDragId = id
+    store.dragSession = id
+    store.dropZone = null
+    dragGeom = captureGeom()
+    if (e.dataTransfer) {
+      e.dataTransfer.effectAllowed = 'move'
+      e.dataTransfer.setData('text/plain', id)
+    }
+  }
+
+  function endPaneDrag(): void {
+    paneDragId = null
+    dragGeom = null
+    store.endDragSession()
   }
 
   // Drop the frozen snapshot whenever a drag ends, from any source.
@@ -187,6 +217,7 @@
     if (!id) return
     e.preventDefault()
     if (store.dropZone) store.dropAt(store.dropZone, id)
+    paneDragId = null
     dragGeom = null
     store.endDragSession()
   }
@@ -275,7 +306,7 @@
             <div class="row-handle" class:active={rowDrag?.top === r - 1} role="separator" aria-label="resize row" tabindex="-1" onmousedown={(e) => startRowDrag(r - 1, e)}></div>
           {/if}
           <div class="prow" style="flex: {rowFlex[r] ?? 1} 1 0">
-            {#each row as id, c (id + ':' + r + ':' + c)}
+            {#each row as id, c (id)}
               {#if store.dragSession && store.dropZone?.kind === 'col' && store.dropZone.row === r && store.dropZone.col === c}
                 <div class="ghost-pane" transition:ghostReveal><span>drop here</span></div>
               {/if}
@@ -283,7 +314,16 @@
                 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
                 <div class="pane-handle" class:active={colDrag?.row === r && colDrag?.left === c - 1} role="separator" aria-label="resize pane" tabindex="-1" onmousedown={(e) => startColDrag(r, c - 1, e)}></div>
               {/if}
-              <div class="pane" style="flex: {colFlex[r]?.[c] ?? 1} 1 0"><ThreadView sessionId={id} paneIndex={(rowOffsets[r] ?? 0) + c} multiPane={totalPanes > 1} /></div>
+              <div
+                class="pane"
+                class:panedrag={paneDragId === id}
+                style="flex: {colFlex[r]?.[c] ?? 1} 1 0"
+                draggable="true"
+                role="group"
+                aria-label={`Chat pane ${(rowOffsets[r] ?? 0) + c + 1}; drag its header to rearrange`}
+                ondragstart={(e) => startPaneDrag(id, e)}
+                ondragend={endPaneDrag}
+              ><ThreadView sessionId={id} paneIndex={(rowOffsets[r] ?? 0) + c} multiPane={totalPanes > 1} /></div>
             {/each}
             {#if store.dragSession && store.dropZone?.kind === 'col' && store.dropZone.row === r && store.dropZone.col === row.length}
               <div class="ghost-pane" transition:ghostReveal><span>drop here</span></div>
@@ -352,9 +392,10 @@
   .empty { display: grid; place-items: center; height: 100%; }
   .panes { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
   .prow { display: flex; flex: 1 1 0; min-width: 0; min-height: 0; }
-  /* `position: relative` makes each pane the containing block for its own overlays (the agent popout
-     panel), so in split view every pane gets its own instead of one floating over the whole app. */
+  /* `position: relative` anchors pane-local edge affordances such as the CLOSED agent-panel tab. The
+     open panel itself is in flow inside ThreadView. */
   .pane { flex: 1 1 0; min-width: 0; min-height: 0; display: flex; flex-direction: column; position: relative; }
+  .pane.panedrag { opacity: 0.72; }
   .ghost-pane { flex: 0.7 1 0; min-width: 60px; margin: 0.5rem; border: 2px dashed var(--accent); border-radius: 12px;
     background: color-mix(in srgb, var(--accent) 12%, transparent); display: grid; place-items: center; }
   .ghost-row { flex: 0.5 1 0; min-height: 48px; margin: 0.5rem; border: 2px dashed var(--accent); border-radius: 12px;
@@ -379,7 +420,7 @@
     .empty.dropping { transition: outline-color var(--dur) var(--ease), color var(--dur) var(--ease); }
     /* Animate programmatic flex changes (pane insertion/removal, re-balance) but not while the
        user is actively dragging a divider — that must track the cursor 1:1. */
-    .prow, .pane { transition: flex-grow var(--dur-slow) var(--ease); }
+    .prow, .pane { transition: flex-grow var(--dur-slow) var(--ease), opacity var(--dur-fast) var(--ease); }
     .shell.dragging .prow, .shell.dragging .pane,
     .shell.rowdragging .prow, .shell.rowdragging .pane { transition: none; }
     .pane { animation: pane-in var(--dur-slow) var(--ease); }

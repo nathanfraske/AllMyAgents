@@ -2419,25 +2419,58 @@ export class HubStore {
   dropAt(zone: DropZone, id: string): void {
     this.restorableLayout = null // opening/splitting a chat supersedes the pending restore offer
     const base = this.basePanes()
-    // Already open in a pane → don't spawn a duplicate view of the same chat (dragging an
-    // already-open chat back into the panes was creating a second identical pane).
-    if (base.some((row) => row.includes(id))) return
     if (base.length === 0) {
       // From the dashboard there is nothing to split — just open the chat.
       this.selectedId = id
       this.splitPanes = []
       return
     }
+
+    // An ID already present in the grid is a MOVE, never a copy. Drop zones are measured against the
+    // frozen PRE-MOVE geometry, so remove the source first and compensate indexes for any row / column
+    // that disappeared. New IDs still follow the same insertion path below.
+    let source: { r: number; c: number } | null = null
+    for (let r = 0; r < base.length && !source; r++) {
+      const c = base[r]!.indexOf(id)
+      if (c >= 0) source = { r, c }
+    }
+
     const rows = base.map((r) => [...r])
+    if (source) {
+      // A one-pane row dropped into its own column can only describe its current position.
+      if (zone.kind === 'col' && zone.row === source.r && rows[source.r]!.length === 1) return
+      rows[source.r]!.splice(source.c, 1)
+    }
+
     if (zone.kind === 'row') {
-      const at = Math.max(0, Math.min(zone.row, rows.length))
+      let at = Math.max(0, Math.min(zone.row, base.length))
+      if (source && rows[source.r]!.length === 0) {
+        rows.splice(source.r, 1)
+        if (source.r < at) at--
+      }
+      at = Math.max(0, Math.min(at, rows.length))
       rows.splice(at, 0, [id])
     } else {
-      const r = Math.max(0, Math.min(zone.row, rows.length - 1))
+      let r = Math.max(0, Math.min(zone.row, base.length - 1))
+      let at = zone.col
+      if (source?.r === r && at > source.c) at--
+      if (source && rows[source.r]!.length === 0) {
+        rows.splice(source.r, 1)
+        if (source.r < r) r--
+      }
+      r = Math.max(0, Math.min(r, rows.length - 1))
       const row = rows[r]!
-      const at = Math.max(0, Math.min(zone.col, row.length))
+      at = Math.max(0, Math.min(at, row.length))
       row.splice(at, 0, id)
     }
+
+    // Retain the exact array identity for a self-drop: no pane remount, transition flicker or redundant
+    // persistence write when the normalised destination is the position the pane already occupies.
+    if (
+      source &&
+      rows.length === base.length &&
+      rows.every((row, r) => row.length === base[r]!.length && row.every((pane, c) => pane === base[r]![c]))
+    ) return
     this.commit(rows)
   }
 
