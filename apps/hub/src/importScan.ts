@@ -59,12 +59,18 @@ export interface ImportableChat {
  * silently gain the right to run them; see the gate in adapters/claude.ts and the per-project trust in
  * projects.ts).
  *
- * VALUES-FREE ON SECRETS, NOT ON CODE. MCP env/header VALUES are credentials and never leave the hub
- * (only `hasSecrets`). But the COMMAND a stdio server runs, a remote server's URL, and a hook's command
- * string ARE the executable surface — "runs `curl x | sh` before every tool call" is the decision, and
- * a consent screen that hides it is theatre — so those ARE surfaced. The fingerprint
- * ({@link fingerprintProjectConfig}) is computed over exactly this executable surface, so what the
- * operator approves is byte-for-byte what they saw.
+ * VALUES-FREE ON SECRETS, NOT ON CODE. MCP env/header VALUES are credentials and never SURFACE (only
+ * `hasSecrets`). But the COMMAND a stdio server runs, a remote server's URL, and a hook's command string
+ * ARE the executable surface — "runs `curl x | sh` before every tool call" is the decision, and a consent
+ * screen that hides it is theatre — so those ARE surfaced.
+ *
+ * FAIL CLOSED. This scanner produces a trust verdict, and a scanner that only reports what it UNDERSTANDS
+ * would fail open the instant it met a config shape it did not — the default-deny gate would silently
+ * relax. So anything present that this version cannot fully model+fingerprint is recorded in `unmodeled`,
+ * and a non-empty `unmodeled` means the project must stay GATED regardless of approval (projects.ts).
+ * `fingerprint` covers only the FULLY MODELED surface (incl. env/header values + hook args, so a change to
+ * any of them re-gates), and is `null` only when there is genuinely nothing executable. What we cannot
+ * fingerprint we do not pretend to; we gate it.
  */
 export interface ProjectConfig {
   mcpServers: {
@@ -83,6 +89,16 @@ export interface ProjectConfig {
   memoryFiles: { name: string; bytes: number }[]
   /** Config files actually found at the project root (relative names). */
   sources: string[]
+  /**
+   * Executable surfaces PRESENT that this version cannot fully model + fingerprint (a config file it could
+   * not parse, an MCP entry with no command/url, a non-command or malformed hook, a statusLine, plugins,
+   * or a `.claude/plugins`/`.claude/skills` dir). NON-EMPTY ⇒ the project MUST stay gated: we cannot
+   * honestly claim "what you approve is what will run". Human-readable reasons, safe to surface (no secrets).
+   */
+  unmodeled: string[]
+  /** sha256 of the FULLY MODELED executable surface (or `null` when there is none). NOT trustworthy on
+   *  its own — a project is trusted only when `unmodeled` is empty AND this equals the approved value. */
+  fingerprint: string | null
 }
 
 export interface ScanResult {
@@ -529,22 +545,38 @@ function readJsonFile(file: string): Record<string, unknown> | undefined {
 export function readProjectConfig(projectPath: string, warnings: string[] = []): ProjectConfig {
   const sources: string[] = []
   const mcpServers: ProjectConfig['mcpServers'] = []
+  const unmodeled: string[] = []
+  // The fingerprint INPUT — the FULL modeled executable surface, including secret env/header VALUES and
+  // hook args/matchers (so any change to them re-gates). Kept separate from the values-free SURFACE
+  // (`mcpServers`/`hookCommands`) that the operator is shown.
+  const fpMcp: unknown[] = []
+  const fpHooks: unknown[] = []
+
   const mcpPath = path.join(projectPath, '.mcp.json')
   if (fs.existsSync(mcpPath)) {
     const mcp = readJsonFile(mcpPath)
-    if (mcp) {
+    if (!mcp) {
+      // FAIL CLOSED. A config file we cannot parse is NOT "no config" — we cannot know what it will run,
+      // so it must gate, never fall through as trusted. (This is the audit's finding #1, inverted.)
+      unmodeled.push('.mcp.json is present but could not be parsed')
+      warnings.push('unreadable .mcp.json')
+    } else {
       sources.push('.mcp.json')
       const servers = (mcp.mcpServers ?? {}) as Record<string, Record<string, unknown>>
       for (const [name, def] of Object.entries(servers)) {
         const type = typeof def.type === 'string' ? (def.type as string) : undefined
         const transport = type === 'http' || type === 'sse' ? type : 'stdio'
-        const env = def.env as Record<string, unknown> | undefined
-        const headers = def.headers as Record<string, unknown> | undefined
+        const env = def.env && typeof def.env === 'object' ? (def.env as Record<string, unknown>) : undefined
+        const headers = def.headers && typeof def.headers === 'object' ? (def.headers as Record<string, unknown>) : undefined
         const hasSecrets = !!(env && Object.keys(env).length) || !!(headers && Object.keys(headers).length)
-        mcpServers.push({ name, transport, hasSecrets, command: mcpCommandString(def, transport) })
+        const command = mcpCommandString(def, transport)
+        if (!command) {
+          unmodeled.push(`mcp server "${name}" declares neither a command nor a url`)
+          continue
+        }
+        mcpServers.push({ name, transport, hasSecrets, command })
+        fpMcp.push({ name, transport, command, env: fpPairs(env), headers: fpPairs(headers) })
       }
-    } else {
-      warnings.push('malformed .mcp.json')
     }
   }
   // Hooks + permissions live in .claude/settings.json, overridden by settings.local.json.
@@ -556,29 +588,59 @@ export function readProjectConfig(projectPath: string, warnings: string[] = []):
     if (!fs.existsSync(p)) continue
     const s = readJsonFile(p)
     if (!s) {
-      warnings.push(`malformed ${rel}`)
+      unmodeled.push(`${rel} is present but could not be parsed`)
+      warnings.push(`unreadable ${rel}`)
       continue
     }
     sources.push(rel)
+    // Executable settings surfaces this version does NOT model → keep the project gated (fail closed)
+    // rather than approve a config whose statusLine/plugins would still run unseen.
+    if (s.statusLine) unmodeled.push(`${rel} defines a statusLine command (not modeled)`)
+    if (s.plugins || s.enabledPlugins) unmodeled.push(`${rel} configures plugins (not modeled)`)
     const hooks = s.hooks as Record<string, unknown> | undefined
     if (hooks && typeof hooks === 'object') {
       for (const [event, entries] of Object.entries(hooks)) {
         if (!Array.isArray(entries) || !entries.length) continue
         hookEvents.add(event)
-        // Shape: hooks[Event] = [{ matcher?, hooks: [{ type:'command', command }] }]. Surface every
-        // command string so the operator sees the actual code, not just "a PreToolUse hook exists".
+        // Shape: hooks[Event] = [{ matcher?, hooks: [{ type:'command', command, args? }] }]. We model
+        // command hooks fully (command + args + matcher). Anything else gates.
         for (const matcher of entries) {
+          const matcherStr = typeof (matcher as { matcher?: unknown })?.matcher === 'string' ? (matcher as { matcher: string }).matcher : ''
           const inner = (matcher as { hooks?: unknown })?.hooks
-          if (!Array.isArray(inner)) continue
+          if (!Array.isArray(inner)) {
+            unmodeled.push(`hook "${event}" has an unrecognized shape`)
+            continue
+          }
           for (const h of inner) {
+            const type = (h as { type?: unknown })?.type
             const cmd = (h as { command?: unknown })?.command
-            if (typeof cmd === 'string' && cmd.trim()) hookCommands.push({ event, command: cmd.trim() })
+            if (type !== undefined && type !== 'command') {
+              unmodeled.push(`hook "${event}" uses an unmodeled type "${String(type)}"`)
+              continue
+            }
+            if (typeof cmd !== 'string' || !cmd.trim()) {
+              unmodeled.push(`hook "${event}" is a command hook without a command`)
+              continue
+            }
+            const args = Array.isArray((h as { args?: unknown }).args)
+              ? (h as { args: unknown[] }).args.filter((a): a is string => typeof a === 'string')
+              : []
+            hookCommands.push({ event, command: cmd.trim() })
+            fpHooks.push({ event, matcher: matcherStr, command: cmd.trim(), args })
           }
         }
       }
     }
     const perms = s.permissions as Record<string, unknown> | undefined
     if (perms && (Array.isArray(perms.allow) || Array.isArray(perms.deny))) hasPermissions = true
+  }
+  // Executable-content directories we do not fingerprint → gate if present.
+  for (const dir of ['.claude/plugins', '.claude/skills']) {
+    try {
+      if (fs.statSync(path.join(projectPath, dir.replace('/', path.sep))).isDirectory()) unmodeled.push(`${dir}/ directory present (not modeled)`)
+    } catch {
+      /* absent */
+    }
   }
   const memoryFiles: ProjectConfig['memoryFiles'] = []
   for (const name of ['CLAUDE.md', 'AGENTS.md']) {
@@ -589,11 +651,21 @@ export function readProjectConfig(projectPath: string, warnings: string[] = []):
       /* absent */
     }
   }
-  return { mcpServers, hooks: [...hookEvents], hookCommands, hasPermissions, memoryFiles, sources }
+  const fingerprint = fingerprintFromInput(fpMcp, fpHooks)
+  return { mcpServers, hooks: [...hookEvents], hookCommands, hasPermissions, memoryFiles, sources, unmodeled, fingerprint }
+}
+
+/** Sorted [key, value] pairs of an env/headers object for the fingerprint. Includes VALUES (they are
+ *  part of what an approved server runs with) — the fingerprint is a hash, so values never surface. */
+function fpPairs(obj: Record<string, unknown> | undefined): [string, string][] {
+  if (!obj) return []
+  return Object.entries(obj)
+    .map(([k, v]): [string, string] => [k, String(v)])
+    .sort((a, b) => a[0].localeCompare(b[0]))
 }
 
 /** The human-readable, non-secret "what runs" string for an MCP server def: stdio `command args…`, or
- *  the http/sse URL. Used for BOTH the consent display and the trust fingerprint. */
+ *  the http/sse URL. Used for the consent display; the fingerprint uses the richer fpMcp input. */
 function mcpCommandString(def: Record<string, unknown>, transport: 'stdio' | 'http' | 'sse'): string | undefined {
   if (transport === 'http' || transport === 'sse') {
     return typeof def.url === 'string' ? def.url : undefined
@@ -604,26 +676,22 @@ function mcpCommandString(def: Record<string, unknown>, transport: 'stdio' | 'ht
   return [command, ...args].join(' ')
 }
 
+function fingerprintFromInput(fpMcp: unknown[], fpHooks: unknown[]): string | null {
+  if (!fpMcp.length && !fpHooks.length) return null // genuinely nothing executable → nothing to gate
+  const mcp = [...fpMcp].sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
+  const hooks = [...fpHooks].sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
+  return crypto.createHash('sha256').update(JSON.stringify({ mcp, hooks })).digest('hex')
+}
+
 /**
- * A stable content fingerprint of a project's EXECUTABLE config — the MCP commands/urls and the hook
- * commands, nothing else. Trust is keyed on THIS, not on the folder path, which is the whole point:
- *   - MOVE the same repo to a new directory → identical executable content → same fingerprint → the
- *     operator's approval survives.
- *   - SWAP a different repo into the same path (or EDIT .mcp.json / a hook after approval) → different
- *     content → different fingerprint → approval no longer matches, so the gate re-denies until the
- *     operator approves what is now there. Approval binds to what was seen, never to a location.
- * Secret values (env/headers) are deliberately excluded — they are not shown and do not themselves
- * execute; the command they are handed to is the code, and that IS fingerprinted. `null` when there is
- * no executable config at all (nothing to gate).
+ * The project's executable-config fingerprint (or `null` when there is none). Keyed on CONTENT, not the
+ * folder path, so a MOVE keeps the operator's approval and a SWAP/EDIT breaks it. This is only a
+ * component of the trust decision — {@link ProjectStore.isConfigTrusted} additionally requires
+ * `config.unmodeled` to be EMPTY, because a fingerprint over a partially-understood config cannot
+ * honestly mean "this is what you saw and what will run".
  */
 export function fingerprintProjectConfig(config: ProjectConfig): string | null {
-  const mcp = config.mcpServers
-    .map((s) => ({ name: s.name, transport: s.transport, command: s.command ?? '' }))
-    .sort((a, b) => a.name.localeCompare(b.name))
-  const hooks = [...config.hookCommands].sort((a, b) => (a.event + a.command).localeCompare(b.event + b.command))
-  if (!mcp.length && !hooks.length) return null // nothing executable → nothing to trust/gate
-  const canonical = JSON.stringify({ mcp, hooks })
-  return crypto.createHash('sha256').update(canonical).digest('hex')
+  return config.fingerprint
 }
 
 /**

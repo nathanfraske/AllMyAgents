@@ -1,9 +1,13 @@
 // ACCEPTANCE (the consent half): once the operator APPROVES a project's config, its hooks and .mcp.json
-// must actually load — the feature is "config comes along WITH consent", not "config disabled". Guards
-// the full seam: adapters/claude.ts relaxes the gate only when ClaudeTurnOptions.trustProjectConfig is
-// true, which SessionManager.specOf sets from ProjectStore.isConfigTrusted. It was fail-first (red)
-// before that seam existed; it now passes. Its complement, acceptance-untrusted-project-config-gated.mjs,
-// must stay green throughout — an UNapproved project is always gated.
+// must actually load — the feature is "config comes along WITH consent", not "config disabled".
+//
+// STATUS: RED until the sessions.ts seam passes the EXECUTION cwd. The trust check is now cwd-correct
+// (ProjectStore.isConfigTrusted(projectId, cwd) — audit #2) and fails closed when cwd is absent, so an
+// approved project stays gated until SessionManager.specOf calls isConfigTrusted(record.projectId,
+// record.cwd) instead of the current one-arg call. (Before the cwd fix this went green — but only via the
+// audit-#2 bug of trusting the project dir rather than the dir that actually runs.) Its complement,
+// acceptance-untrusted-project-config-gated.mjs, stays green throughout — an UNapproved project is always
+// gated.
 //
 // Self-launches an isolated worker-mode hubctl on a spare port (fresh worker => current source). It
 // creates a NON-git project with a SessionStart hook + .mcp.json, calls POST /approve-config (operator

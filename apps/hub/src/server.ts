@@ -18,7 +18,7 @@ import { pickFolder } from './native.js'
 import { computeStats } from './stats.js'
 import { buildFleet, probeHubHealth } from './fleet.js'
 import { startLogin, awaitLogin, credentialsExist } from './loginLauncher.js'
-import { readProjectConfig, fingerprintProjectConfig } from './importScan.js'
+import { readProjectConfig } from './importScan.js'
 import { setClaudeConnectorPolicy } from './profiles.js'
 import { asFileWriteDiffDensity } from './types.js'
 import type { DangerFlags, HubEvent, HubPrefs, Profile, Provider } from './types.js'
@@ -628,20 +628,24 @@ export function startServer(opts: ServerOptions): http.Server {
           return
         }
         const config = readProjectConfig(project.path)
-        const fingerprint = fingerprintProjectConfig(config)
         json(res, {
-          config,
-          fingerprint,
-          hasExecutableConfig: fingerprint !== null,
+          config, // includes config.unmodeled (why it can't be approved) + config.fingerprint
+          fingerprint: config.fingerprint,
+          hasExecutableConfig: config.fingerprint !== null,
+          // Cannot be approved while non-empty: the config has surfaces we can't fully verify (fail closed).
+          unverifiable: config.unmodeled,
           approvedFingerprint: projects.approvedFingerprint(project.id) ?? null,
-          trusted: projects.isConfigTrusted(project.id),
+          // Assessed against the project dir here (a view). The AUTHORITATIVE per-turn check runs against
+          // the session's real cwd (isConfigTrusted(id, record.cwd)) in specOf.
+          trusted: projects.isConfigTrusted(project.id, project.path),
         })
         return
       }
       // Operator APPROVES a project's current executable config (the authenticated operator action IS the
       // consent — no gate here, mirroring /api/restart). Pins the approval to the config's content
-      // fingerprint, so it survives a move but breaks on a swap/edit. Journaled for audit with the exact
-      // commands approved. Until this is called, adapters/claude.ts gates the project's MCP + hooks.
+      // fingerprint, so it survives a move but breaks on a swap/edit. REFUSED when the config has surfaces
+      // we cannot fully verify (config.unmodeled) — approving those would falsely assure the operator that
+      // what they saw is what runs. Until an approval exists, adapters/claude.ts gates the project's MCP + hooks.
       const approveMatch = /^\/api\/projects\/([^/]+)\/approve-config$/.exec(url.pathname)
       if (method === 'POST' && approveMatch) {
         const project = projects.get(approveMatch[1] as string)
@@ -650,14 +654,23 @@ export function startServer(opts: ServerOptions): http.Server {
           return
         }
         const config = readProjectConfig(project.path)
-        const fingerprint = projects.approveConfig(project.id)
+        const result = projects.approveConfig(project.id)
+        if (result.unverifiable.length > 0) {
+          journal.append(null, 'project/config-approve-refused', { projectId: project.id, unverifiable: result.unverifiable })
+          json(
+            res,
+            { approved: false, error: 'cannot approve: this project has configuration this version cannot fully verify', unverifiable: result.unverifiable },
+            409
+          )
+          return
+        }
         journal.append(null, 'project/config-approved', {
           projectId: project.id,
-          fingerprint,
+          fingerprint: result.fingerprint,
           mcpServers: config.mcpServers.map((s) => ({ name: s.name, command: s.command })),
           hookCommands: config.hookCommands,
         })
-        json(res, { approved: fingerprint !== null, fingerprint, config })
+        json(res, { approved: result.approved, fingerprint: result.fingerprint, config })
         return
       }
       const revokeConfigMatch = /^\/api\/projects\/([^/]+)\/revoke-config$/.exec(url.pathname)

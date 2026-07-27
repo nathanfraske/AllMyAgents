@@ -1,7 +1,7 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import type Database from 'better-sqlite3'
-import { fingerprintProjectConfig, readProjectConfig } from './importScan.js'
+import { readProjectConfig } from './importScan.js'
 import type { Project } from './types.js'
 
 export class ProjectStore {
@@ -65,22 +65,29 @@ export class ProjectStore {
   }
 
   /**
-   * Approve a project's CURRENT executable config so its MCP servers + hooks may run. Recomputes the
-   * fingerprint from disk at approval time and stores THAT — so the approval is of exactly what is there
-   * now (and what the operator was shown). Returns the stored fingerprint, or null when there is nothing
-   * executable to approve (no MCP, no hooks). The caller (server.ts) is the operator's authenticated
-   * action, so approval itself is the consent — no second gate here.
+   * Approve a project's CURRENT executable config so its MCP servers + hooks may run. Recomputes from
+   * disk at approval time and stores the fingerprint of exactly what is there now.
+   *
+   * REFUSES an unverifiable config. If the project has any surface this version cannot fully model
+   * (`config.unmodeled`), approval is DENIED (nothing stored) and the reasons are returned — approving
+   * would falsely assure the operator that "what you saw is what will run" when part of it was never
+   * modeled. `unverifiable` non-empty ⇒ not approved. `fingerprint === null` ⇒ nothing executable to
+   * approve. The authenticated operator action is the consent; there is no second gate here.
    */
-  approveConfig(projectId: string): string | null {
+  approveConfig(projectId: string): { approved: boolean; fingerprint: string | null; unverifiable: string[] } {
     const project = this.get(projectId)
     if (!project) throw new Error(`unknown project: ${projectId}`)
-    const fingerprint = fingerprintProjectConfig(readProjectConfig(project.path))
-    if (fingerprint === null) {
-      this.trustDelStmt.run(projectId) // nothing executable → drop any stale approval, stay clean
-      return null
+    const config = readProjectConfig(project.path)
+    if (config.unmodeled.length > 0) {
+      this.trustDelStmt.run(projectId) // never leave a stale approval over a now-unverifiable config
+      return { approved: false, fingerprint: null, unverifiable: config.unmodeled }
     }
-    this.trustUpsertStmt.run(projectId, fingerprint, new Date().toISOString())
-    return fingerprint
+    if (config.fingerprint === null) {
+      this.trustDelStmt.run(projectId) // nothing executable → drop any stale approval, stay clean
+      return { approved: false, fingerprint: null, unverifiable: [] }
+    }
+    this.trustUpsertStmt.run(projectId, config.fingerprint, new Date().toISOString())
+    return { approved: true, fingerprint: config.fingerprint, unverifiable: [] }
   }
 
   /** Revoke a project's config approval — the next spawn re-gates it. */
@@ -95,17 +102,30 @@ export class ProjectStore {
   }
 
   /**
-   * Whether this project's config is trusted RIGHT NOW: recompute the on-disk fingerprint and require it
-   * to equal the approved one. A project with no executable config (fingerprint null) is trivially
-   * trusted — there is nothing to run, so nothing to gate. Anything else (never approved, or the config
-   * changed / a different repo now sits at the path) is untrusted. This is what specOf reads to set
-   * ClaudeTurnOptions.trustProjectConfig (the sessions.ts seam).
+   * Whether this project's executable config is trusted for a turn about to run in `cwd`.
+   *
+   * FAILS CLOSED, and against the ACTUAL execution directory (audit findings #1 + #2):
+   *   - no `cwd` → false. Trust is a statement about what will run; with no execution dir we cannot make
+   *     it, so we deny. (The sessions.ts seam must pass the session's real cwd — a worktree or an imported
+   *     chat's original path can differ from project.path, so computing against project.path would approve
+   *     one directory while another runs.)
+   *   - the config at `cwd` has anything `unmodeled` → false. We will not relax the gate for a config we
+   *     could not fully understand — an unparsed or unmodeled surface must stay gated, never fall through.
+   *   - no executable config at `cwd` (fingerprint null) → true. Nothing runs, nothing to gate.
+   *   - otherwise trusted iff the CONTENT fingerprint at `cwd` equals the operator-approved one (so a MOVE
+   *     of the same content stays trusted and a SWAP/EDIT re-gates).
    */
-  isConfigTrusted(projectId: string): boolean {
-    const project = this.get(projectId)
-    if (!project) return false
-    const current = fingerprintProjectConfig(readProjectConfig(project.path))
-    if (current === null) return true // no MCP / no hooks → nothing executable to gate
-    return current === this.approvedFingerprint(projectId)
+  isConfigTrusted(projectId: string, cwd?: string): boolean {
+    if (!cwd) return false
+    if (!this.get(projectId)) return false
+    let config: ReturnType<typeof readProjectConfig>
+    try {
+      config = readProjectConfig(cwd)
+    } catch {
+      return false // an unreadable execution dir cannot be verified → gate
+    }
+    if (config.unmodeled.length > 0) return false
+    if (config.fingerprint === null) return true
+    return config.fingerprint === this.approvedFingerprint(projectId)
   }
 }
