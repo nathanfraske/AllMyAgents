@@ -18,8 +18,8 @@ const ENV_VAR: Record<Provider, string> = {
 }
 
 // Absolute path to the bundled CLI shims (claude.CMD / codex.CMD). The hub is normally
-// launched via pnpm/tsx, so this dir is already on PATH — but a freshly spawned console
-// window is more reliable if we prepend it explicitly rather than trusting inheritance.
+// launched via pnpm/tsx, so this dir is already on PATH — but login is also used by the
+// installed desktop app, where resolving our pinned CLIs must not depend on global PATH.
 function binDir(): string {
   return path.resolve(import.meta.dirname, '..', 'node_modules', '.bin')
 }
@@ -41,64 +41,17 @@ export function credentialsExist(provider: Provider, profileDir: string): boolea
   }
 }
 
-// Generates the batch script the visible console window runs. Mirrors native.ts's
-// "generated script + window" pattern. Written as CRLF, ASCII-only, to avoid codepage
-// surprises. We `call` the CLI so control returns for the trailing pause (a bare .cmd
-// call inside a batch would otherwise transfer control and never return).
-function buildBatch(provider: Provider, profileDir: string): string {
-  const loginCmd = provider === 'claude' ? 'claude' : 'codex login'
-  const guide =
-    provider === 'claude'
-      ? [
-          'echo  A Claude Code session will open below.',
-          'echo  Type   /login   and complete the browser sign-in,',
-          'echo  then type   /exit   once the account is connected.',
-        ]
-      : [
-          'echo  Your web browser will open for Codex sign-in.',
-          'echo  Complete it there; this window finishes on its own.',
-        ]
-  return (
-    [
-      '@echo off',
-      `title AiAgentApp login - ${provider}`,
-      `set "PATH=${binDir()};%PATH%"`,
-      `set "${ENV_VAR[provider]}=${profileDir}"`,
-      'echo ============================================================',
-      `echo  Adding a ${provider} account`,
-      `echo  Profile dir: ${profileDir}`,
-      'echo ============================================================',
-      ...guide,
-      'echo.',
-      `call ${loginCmd}`,
-      'echo.',
-      'echo  ------------------------------------------------------------',
-      'echo  Sign-in step finished. You can close this window.',
-      'echo  (The app detects the new account automatically.)',
-      'pause',
-      '',
-    ].join('\r\n')
-  )
-}
-
-// macOS counterpart to buildBatch: an executable `.command` script, which Terminal.app runs in a new
-// window when `open`ed. Same shape as the batch — put the vendor `.bin` dir on PATH, point the
-// config-dir env var at profileDir, then run the CLI. Single-quoting is avoided in favour of double
-// quotes so the interpolated absolute paths survive spaces; profileDir is server-validated to
-// ^[a-zA-Z0-9_-]+$ under profilesDir, so it carries no quote characters.
+// macOS fallback: an executable `.command` script, which Terminal.app runs in a new window when
+// `open`ed. Put the vendor `.bin` dir on PATH, point the config-dir env var at profileDir, then run the
+// dedicated login command. Single-quoting is avoided in favour of double quotes so the interpolated
+// absolute paths survive spaces; profileDir is server-validated to ^[a-zA-Z0-9_-]+$ under profilesDir,
+// so it carries no quote characters.
 function buildShellScript(provider: Provider, profileDir: string): string {
-  const loginCmd = provider === 'claude' ? 'claude' : 'codex login'
-  const guide =
-    provider === 'claude'
-      ? [
-          'echo "  A Claude Code session will open below."',
-          'echo "  Type   /login   and complete the browser sign-in,"',
-          'echo "  then type   /exit   once the account is connected."',
-        ]
-      : [
-          'echo "  Your web browser will open for Codex sign-in."',
-          'echo "  Complete it there; this window finishes on its own."',
-        ]
+  const loginCmd = provider === 'claude' ? 'claude auth login' : 'codex login'
+  const guide = [
+    'echo "  Your web browser will open for sign-in."',
+    'echo "  Complete it there; this window finishes on its own."',
+  ]
   return [
     '#!/bin/sh',
     `cd "${repoRoot()}" || exit 1`,
@@ -119,31 +72,39 @@ function buildShellScript(provider: Provider, profileDir: string): string {
   ].join('\n')
 }
 
-// Opens a NEW VISIBLE terminal window that runs the vendor login with the right config-dir env var
-// pointed at profileDir, so the browser OAuth flow can open for the user. The hub runs headless, so
-// popping a real console needs a platform-specific trick:
-//   - Windows: cmd's `start` builtin (CREATE_NEW_CONSOLE) on a generated `.cmd`.
-//   - macOS:   an executable `.command` script handed to `open`, which Terminal.app claims.
+// Starts the vendor login with the right config-dir env var pointed at profileDir, so browser OAuth
+// writes credentials into the managed account rather than the user's global CLI config.
+//
+// Windows is deliberately terminal-free. Both pinned vendors expose dedicated login commands, and
+// CREATE_NO_WINDOW (`windowsHide`) keeps the unavoidable .cmd host invisible while the vendor opens
+// the browser. Claude used to launch its entire interactive TUI here, forcing a brand-new user to type
+// `/login`, copy/finish a URL, then `/exit` in a surprise console — the worst possible first-run seam.
+//
+// macOS retains its visible Terminal fallback for now; unlike Windows there is no bundled, uniform
+// browser-launch host we can prove across supported versions. It now uses Claude's dedicated auth
+// command, so no slash commands are required there either.
 // Fire-and-forget — awaitLogin() observes the result by polling for the credentials file.
 //
-// Returns TRUE if a terminal was launched, FALSE on a platform with no reliable way to do so
-// (Linux/other, where the desktop varies too much to guess), so the caller can hand the operator the
-// manual command instead. Callers must check the return value.
+// Returns TRUE if a sign-in process was launched, FALSE on a platform with no reliable way to surface
+// one (Linux/other, where the desktop varies too much to guess), so the caller can hand the operator
+// the manual command instead. Callers must check the return value.
 export function startLogin(provider: Provider, profileDir: string): boolean {
   fs.mkdirSync(profileDir, { recursive: true })
 
   if (process.platform === 'win32') {
-    const scriptPath = path.join(os.tmpdir(), `aiagentapp-login-${provider}-${Date.now()}.cmd`)
-    fs.writeFileSync(scriptPath, buildBatch(provider, profileDir), 'utf8')
-
-    // start "<title>" /d "<cwd>" "<script>"  — the first quoted token is the window title,
-    // so an explicit title is required before the script path (which is also quoted).
-    const cmdLine = `start "AiAgentApp login - ${provider}" /d "${repoRoot()}" "${scriptPath}"`
-    const child = spawn(cmdLine, {
+    const shim = path.join(binDir(), `${provider}.cmd`)
+    const args = provider === 'claude' ? ['auth', 'login'] : ['login']
+    const child = spawn(shim, args, {
       shell: true,
       detached: true,
       stdio: 'ignore',
-      windowsHide: false,
+      windowsHide: true,
+      cwd: repoRoot(),
+      env: {
+        ...process.env,
+        PATH: `${binDir()}${path.delimiter}${process.env.PATH ?? ''}`,
+        [ENV_VAR[provider]]: profileDir,
+      },
     })
     child.on('error', () => {
       /* ignore — awaitLogin()'s timeout surfaces a failed launch to the caller */
