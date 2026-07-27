@@ -23,11 +23,13 @@ import path from 'node:path'
 // Control-socket frame tags (node/src/node_control.rs).
 const TAG_JSON = 0
 
-interface WireResponse {
+export interface WireResponse {
   ok: boolean
   result?: unknown
   error?: string
 }
+
+export type MeshControlRequest = (cmd: string, args: unknown, timeoutMs: number) => Promise<WireResponse>
 
 /**
  * One co-owned machine in the owner's fleet, as the node's `owned_roster` reports it
@@ -173,16 +175,25 @@ export class MeshSite {
   private readonly label: string
   private enabled: boolean
   private readonly socketPath: string
+  private readonly request: MeshControlRequest
   private last: MeshStatus
   private autoTimer: ReturnType<typeof setInterval> | undefined
   /** Last presence-derived sites per canonical device, retained across a peer's transient absence. */
   private readonly peerSitesCache = new Map<string, PeerSites>()
 
-  constructor(opts: { port: number; label?: string; enable?: boolean; socketPath?: string }) {
+  constructor(opts: {
+    port: number
+    label?: string
+    enable?: boolean
+    socketPath?: string
+    /** Test seam for the local node protocol; production always uses the framed socket client. */
+    controlRequest?: MeshControlRequest
+  }) {
     this.port = opts.port
     this.label = opts.label ?? 'AllMyAgents'
     this.enabled = opts.enable ?? false
     this.socketPath = opts.socketPath ?? defaultSocketPath()
+    this.request = opts.controlRequest ?? ((cmd, args, timeoutMs) => roundTrip(this.socketPath, cmd, args, timeoutMs))
     this.last = {
       enabled: this.enabled,
       nodePresent: false,
@@ -231,14 +242,14 @@ export class MeshSite {
     let lastErr = 'unknown'
     for (let attempt = 1; attempt <= 4; attempt++) {
       try {
-        const cur = await roundTrip(this.socketPath, 'site_exposed', {}, 10000)
+        const cur = await this.request('site_exposed', {}, 10000)
         if (!cur.ok) {
           lastErr = cur.error ?? 'site_exposed failed'
           break // the node answered but refused — retrying won't help
         }
         const exposed: Record<string, string> = { ...((cur.result as Record<string, string>) ?? {}) }
         exposed[this.siteId()] = this.advertisedLabel()
-        const set = await roundTrip(this.socketPath, 'site_set_exposed', { exposed }, 10000)
+        const set = await this.request('site_set_exposed', { exposed }, 10000)
         if (!set.ok) {
           lastErr = set.error ?? 'site_set_exposed failed'
           break
@@ -252,6 +263,19 @@ export class MeshSite {
         if (code === 'ENOENT' || code === 'ECONNREFUSED') {
           return this.update({ nodePresent: false, exposed: false, error: lastErr })
         }
+        // `site_set_exposed` updates the persisted allow-list before it awaits the blocking inventory
+        // scan + presence restamp. That tail can outlive our response deadline even though the write
+        // succeeded. Confirm authoritative state before retrying: otherwise one slow restamp causes
+        // four identical writes, ~40 seconds of delay, and a false "node absent" status.
+        try {
+          const confirm = await this.request('site_exposed', {}, 2000)
+          const confirmed = (confirm.result as Record<string, string> | undefined) ?? {}
+          if (confirm.ok && confirmed[this.siteId()] === this.advertisedLabel()) {
+            return this.update({ nodePresent: true, exposed: true, error: undefined })
+          }
+        } catch {
+          // The original error remains the useful diagnostic; continue the bounded retry policy.
+        }
         if (attempt < 4) await new Promise((r) => setTimeout(r, 750 * attempt))
       }
     }
@@ -261,12 +285,12 @@ export class MeshSite {
   /** Best-effort removal of our port from the exposed map (on shutdown or disable). */
   async deregister(): Promise<void> {
     try {
-      const cur = await roundTrip(this.socketPath, 'site_exposed', {}, 2000)
+      const cur = await this.request('site_exposed', {}, 2000)
       if (!cur.ok) return
       const exposed: Record<string, string> = { ...((cur.result as Record<string, string>) ?? {}) }
       if (!(this.siteId() in exposed)) return
       delete exposed[this.siteId()]
-      await roundTrip(this.socketPath, 'site_set_exposed', { exposed }, 2000)
+      await this.request('site_set_exposed', { exposed }, 2000)
     } catch {
       /* node already gone — nothing to clean up */
     }
@@ -347,7 +371,7 @@ export class MeshSite {
    */
   async ownedRoster(timeoutMs = 4000): Promise<FleetMember[]> {
     try {
-      const r = await roundTrip(this.socketPath, 'owned_roster', {}, timeoutMs)
+      const r = await this.request('owned_roster', {}, timeoutMs)
       if (!r.ok) return []
       const members = (r.result as { members?: unknown } | undefined)?.members
       if (!Array.isArray(members)) return []
@@ -381,7 +405,7 @@ export class MeshSite {
    */
   async peerSites(timeoutMs = 4000): Promise<PeerSites[]> {
     try {
-      const r = await roundTrip(this.socketPath, 'session_snapshot', {}, timeoutMs)
+      const r = await this.request('session_snapshot', {}, timeoutMs)
       if (!r.ok) return [...this.peerSitesCache.values()]
       const peers = (r.result as { peers?: unknown } | undefined)?.peers
       if (!Array.isArray(peers)) return [...this.peerSitesCache.values()]
@@ -438,7 +462,7 @@ export class MeshSite {
    */
   async siteMap(node: string, port = 7777, timeoutMs = 4000): Promise<number | null> {
     try {
-      const r = await roundTrip(this.socketPath, 'site_map', { node, port }, timeoutMs)
+      const r = await this.request('site_map', { node, port }, timeoutMs)
       if (!r.ok) return null
       const lp = (r.result as { localPort?: unknown } | undefined)?.localPort
       return typeof lp === 'number' ? lp : null
