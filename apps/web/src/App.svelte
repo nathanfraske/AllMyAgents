@@ -10,7 +10,6 @@
   import NewProjectModal, { type ProjectLaunchResult } from './lib/NewProjectModal.svelte'
   import Titlebar from './lib/Titlebar.svelte'
   import UpdateBanner from './lib/UpdateBanner.svelte'
-  import type { ProjectInfo } from './lib/api'
   import { cubicOut } from 'svelte/easing'
   import type { TransitionConfig } from 'svelte/transition'
 
@@ -25,11 +24,9 @@
     if (result.failed.length === 0) newProjectOpen = false
   }
 
-  function configureProjectManager(project: ProjectInfo): void {
-    // ManagerSetupModal is a separate, higher-z modal. Put the just-created project first so its current
-    // create-manager flow preselects the hand-off target, then return to this still-mounted pipeline.
-    store.projects = [project, ...store.projects.filter((item) => item.id !== project.id)]
-    store.openManagerSetup()
+  function startProjectFromManager(): void {
+    store.closeManagerSetup()
+    newProjectOpen = true
   }
 
   // Mirror the open layout (selected chat + split panes) to localStorage on every change, so the
@@ -364,14 +361,15 @@
   <SettingsModal onclose={() => (store.settingsOpen = false)} />
 {/if}
 {#if store.managerSetupOpen}
-  <ManagerSetupModal onclose={() => store.closeManagerSetup()} />
+  <ManagerSetupModal
+    onclose={() => store.closeManagerSetup()}
+    onCreateProject={startProjectFromManager}
+  />
 {/if}
 {#if newProjectOpen}
   <NewProjectModal
     onclose={() => (newProjectOpen = false)}
     onlaunched={projectLaunchSettled}
-    onconfiguremanager={configureProjectManager}
-    suspended={store.managerSetupOpen}
   />
 {/if}
 {#if store.needsPairing}

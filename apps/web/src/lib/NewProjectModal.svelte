@@ -23,18 +23,12 @@
   import { store } from './store.svelte'
   import GitHubImport from './GitHubImport.svelte'
   import Icon from './Icon.svelte'
+  import ManagerSetupModal, { type ManagerLaunchConfig } from './ManagerSetupModal.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
 
-  let {
-    onclose,
-    onlaunched,
-    onconfiguremanager,
-    suspended = false,
-  }: {
+  let { onclose, onlaunched }: {
     onclose: () => void
     onlaunched: (result: ProjectLaunchResult) => void | Promise<void>
-    onconfiguremanager: (project: ProjectInfo) => void | Promise<void>
-    suspended?: boolean
   } = $props()
 
   type Step = 1 | 2 | 3
@@ -68,12 +62,19 @@
   let teamError = $state('')
   let launching = $state(false)
   let launchAttempted = $state(false)
-  let managerSetupOpened = $state(false)
+  let managerEditing = $state(false)
+  let managerConfig = $state<ManagerLaunchConfig | null>(null)
+  let managerStatus = $state<AgentStatus>('ready')
+  let managerSessionId = $state<string | undefined>()
+  let managerPromptSent = $state(false)
+  let managerError = $state<string | undefined>()
   let teamSection = $state<HTMLElement | null>(null)
   let finalizeSection = $state<HTMLElement | null>(null)
 
   const failed = $derived(agents.filter((agent) => agent.status === 'failed'))
   const started = $derived(agents.filter((agent) => agent.status === 'started'))
+  const failedCount = $derived(failed.length + (managerStatus === 'failed' ? 1 : 0))
+  const startedCount = $derived(started.length + (managerStatus === 'started' ? 1 : 0))
   const readyToReview = $derived(
     agents.every((agent) => Boolean(agent.profileId && agent.prompt.trim())),
   )
@@ -210,6 +211,18 @@
     void reveal('finalize')
   }
 
+  function editTeam(): void {
+    step = 2
+    void reveal('team')
+  }
+
+  function configureManager(config: ManagerLaunchConfig): void {
+    managerConfig = config
+    managerStatus = 'ready'
+    managerError = undefined
+    managerEditing = false
+  }
+
   function labelFor(agent: StartingAgent): string {
     return `Agent ${agents.findIndex((item) => item.id === agent.id) + 1} · ${agent.profileId}`
   }
@@ -225,26 +238,99 @@
   }
 
   function launchResult(): ProjectLaunchResult {
+    const managerLabel = managerConfig
+      ? `Project manager · ${managerConfig.managerProfileId}`
+      : 'Project manager'
     return {
       project: project!,
-      started: agents
+      started: [
+        ...agents
         .filter((agent) => agent.status === 'started')
         .map((agent) => ({
           agentId: agent.id,
           label: labelFor(agent),
           sessionId: agent.sessionId,
         })),
-      failed: agents
+        ...(managerStatus === 'started'
+          ? [{ agentId: 'project-manager', label: managerLabel, sessionId: managerSessionId }]
+          : []),
+      ],
+      failed: [
+        ...agents
         .filter((agent) => agent.status === 'failed')
         .map((agent) => ({
           agentId: agent.id,
           label: labelFor(agent),
           error: agent.error ?? 'The agent did not start.',
         })),
+        ...(managerStatus === 'failed'
+          ? [{
+              agentId: 'project-manager',
+              label: managerLabel,
+              error: managerError ?? 'The project manager did not start.',
+            }]
+          : []),
+      ],
     }
   }
 
-  async function launch(targets: StartingAgent[]): Promise<void> {
+  async function launchConfiguredManager(config: ManagerLaunchConfig): Promise<{ record?: SessionRecord; error?: string }> {
+    try {
+      let record = managerSessionId ? store.sessions[managerSessionId]?.record : undefined
+      if (!record) {
+        const created = await api.spawn({
+          profileId: config.managerProfileId,
+          projectId: project!.id,
+          useWorktree: false,
+          permissionMode: config.permissionMode,
+          model: config.managerModel,
+          effort: config.managerEffort,
+        })
+        if (!created || 'error' in created) {
+          throw new Error((created as { error?: string } | null)?.error ?? 'The project manager did not start.')
+        }
+        record = created
+        managerSessionId = record.id
+        record.title = `${project!.name} manager`
+        record.titleSource = 'user'
+        store.upsertSessionRecord(record)
+        const renamed = await api.rename(record.id, record.title)
+        if (renamed.error) throw new Error(renamed.error)
+      }
+
+      const modeResult = await api.setMode(record.id, config.permissionMode)
+      if (modeResult && 'error' in modeResult) throw new Error(modeResult.error)
+      const settingsResult = await api.setSettings(record.id, {
+        model: config.managerModel,
+        effort: config.managerEffort,
+      })
+      if (settingsResult && 'error' in settingsResult) throw new Error(settingsResult.error)
+      const configured = await api.configureProjectManager(record.id, {
+        enabled: true,
+        maxLiveChildren: config.maxLiveChildren,
+        delegation: config.delegation,
+        allowedProfiles: config.allowedProfiles,
+        allowedModels: config.allowedModels,
+        allowedTools: config.allowedTools,
+        agentTypes: config.agentTypes,
+        startingPrompt: config.startingPrompt,
+      })
+      if ('error' in configured) throw new Error(configured.error)
+      store.upsertSessionRecord(configured)
+      if (!managerPromptSent) {
+        const sent = await api.send(configured.id, config.startingPrompt)
+        if (sent.error) throw new Error(sent.error)
+        managerPromptSent = true
+      }
+      return { record: configured }
+    } catch (cause) {
+      return {
+        error: cause instanceof Error ? cause.message : 'The project manager did not start.',
+      }
+    }
+  }
+
+  async function launch(targets: StartingAgent[], includeManager: boolean): Promise<void> {
     if (!project || launching) return
     launchAttempted = true
     launching = true
@@ -253,9 +339,13 @@
     agents = agents.map((agent) =>
       targetIds.has(agent.id) ? { ...agent, status: 'launching', error: undefined } : agent
     )
+    if (includeManager) {
+      managerStatus = 'launching'
+      managerError = undefined
+    }
 
-    const outcomes = await Promise.all(
-      targets.map(async (agent) => {
+    const [outcomes, managerOutcome] = await Promise.all([
+      Promise.all(targets.map(async (agent) => {
         try {
           const body: Record<string, unknown> = {
             profileId: agent.profileId,
@@ -281,8 +371,11 @@
             error: cause instanceof Error ? cause.message : 'The agent did not start.',
           }
         }
-      }),
-    )
+      })),
+      includeManager && managerConfig
+        ? launchConfiguredManager(managerConfig)
+        : Promise.resolve(undefined),
+    ])
 
     for (const outcome of outcomes) {
       if (outcome.record) {
@@ -300,33 +393,42 @@
         })
       }
     }
+    if (managerOutcome) {
+      if (managerOutcome.record) {
+        managerStatus = 'started'
+        managerError = undefined
+      } else {
+        managerStatus = 'failed'
+        managerError = managerOutcome.error
+      }
+    }
     launching = false
     await onlaunched(launchResult())
   }
 
   function launchAll(): Promise<void> {
-    return launch(agents.filter((agent) => agent.status !== 'started'))
+    return launch(
+      agents.filter((agent) => agent.status !== 'started'),
+      Boolean(managerConfig && managerStatus !== 'started'),
+    )
   }
 
   function retryFailed(): Promise<void> {
-    return launch(agents.filter((agent) => agent.status === 'failed'))
-  }
-
-  async function openManagerSetup(): Promise<void> {
-    if (!project) return
-    managerSetupOpened = true
-    await onconfiguremanager(project)
+    return launch(
+      agents.filter((agent) => agent.status === 'failed'),
+      managerStatus === 'failed',
+    )
   }
 
   function onKey(event: KeyboardEvent): void {
-    if (event.key === 'Escape' && !suspended && !creating && !launching) onclose()
+    if (event.key === 'Escape' && !creating && !launching) onclose()
   }
 </script>
 
 <svelte:window onkeydown={onKey} />
 
-<div class="backdrop" class:suspended role="button" tabindex="-1" onclick={onclose} onkeydown={() => {}}></div>
-<div class="modal" class:suspended role="dialog" aria-modal={!suspended} aria-hidden={suspended} aria-label="New project">
+<div class="backdrop" role="button" tabindex="-1" onclick={onclose} onkeydown={() => {}}></div>
+<div class="modal" role="dialog" aria-modal="true" aria-label="New project">
   <header>
     <div>
       <span class="eyebrow">NEW PROJECT</span>
@@ -351,15 +453,37 @@
           <span class="step-number">STEP 1</span>
           <h3>Project</h3>
         </div>
-        {#if project}<span class="ready"><Icon name="check" size={14} /> Project ready</span>{/if}
+        {#if project}
+          <div class="step-status">
+            <span class="ready"><Icon name="check" size={14} /> Project ready</span>
+            {#if step !== 1}
+              <button class="edit-step" aria-label="Edit project setup" onclick={() => (step = 1)}>Edit</button>
+            {/if}
+          </div>
+        {/if}
       </div>
 
       {#if project}
         <div class="project-summary">
-          <div><b>{project.name}</b><span>{project.path}</span></div>
+          <div><b>{project.name}</b><span title={project.path}>{project.path}</span></div>
           <span class="created-label">Created</span>
         </div>
-        {#if gitGuidance || environmentGuidance}
+        {#if step === 1}
+          <p class="fixed-note">The project now points at this directory. You can still change the setup notes passed to every starting agent.</p>
+          <div class="fields two guidance">
+            <label>
+              <span>Git configuration <em>optional</em></span>
+              <textarea bind:value={gitGuidance} placeholder="Branch, identity, remote, or commit conventions for the agents"></textarea>
+            </label>
+            <label>
+              <span>Environment setup <em>optional</em></span>
+              <textarea bind:value={environmentGuidance} placeholder="Setup commands and variable names — do not paste secrets"></textarea>
+            </label>
+          </div>
+          <div class="footer-actions">
+            <button class="primary" onclick={editTeam}>Continue to team</button>
+          </div>
+        {:else if gitGuidance || environmentGuidance}
           <div class="setup-summary">
             {#if gitGuidance}<span><b>Git:</b> {gitGuidance}</span>{/if}
             {#if environmentGuidance}<span><b>Environment:</b> {environmentGuidance}</span>{/if}
@@ -424,11 +548,66 @@
             <span class="step-number">STEP 2</span>
             <h3>The team</h3>
           </div>
-          <span class="count">{agents.length} starting agent{agents.length === 1 ? '' : 's'}</span>
+          <div class="step-status">
+            <span class="count">
+              {managerConfig ? 'Manager configured' : 'No manager'} ·
+              {agents.length} independent agent{agents.length === 1 ? '' : 's'}
+            </span>
+            {#if step !== 2}
+              <button class="edit-step" aria-label="Edit team setup" onclick={editTeam}>Edit</button>
+            {/if}
+          </div>
         </div>
 
-        {#if step === 2}
-          <p class="intro">Add as many starting agents as you need. Zero is fine if you only want the project.</p>
+        <div class="team-content" hidden={step !== 2}>
+          <p class="intro">
+            Use either category, both, or neither. Zero is fine if you only want the project.
+          </p>
+
+          <section class="team-category manager-category" aria-labelledby="manager-category-title">
+            <div class="category-head">
+              <div>
+                <span class="category-label">DELEGATE THE WORK</span>
+                <h4 id="manager-category-title">With a manager</h4>
+                <p>Enable one manager and define its child-agent roles here. Children it spawns answer to it, nest beneath it, and are covered by its lifecycle and collision oversight.</p>
+              </div>
+              <span class="optional">Optional</span>
+            </div>
+            <div class="manager">
+              <div>
+                <b>Project manager and child agents</b>
+                <span>{managerConfig ? 'Configured for this launch.' : 'Configure the manager, its starting prompt, and the child roles it may spawn.'}</span>
+              </div>
+              <button onclick={() => (managerEditing = true)} aria-label="Configure a project manager">
+                {managerConfig ? 'Edit manager team' : 'Enable and configure'}
+              </button>
+            </div>
+
+            {#if managerEditing || managerConfig}
+              <div class="manager-setup" hidden={!managerEditing}>
+                <ManagerSetupModal
+                  embedded
+                  deferLaunch
+                  initialProjectId={project.id}
+                  onCreateProject={() => {
+                    managerEditing = false
+                    step = 1
+                  }}
+                  onConfigured={configureManager}
+                />
+              </div>
+            {/if}
+          </section>
+
+          <section class="team-category independent-category" aria-labelledby="independent-category-title">
+            <div class="category-head">
+              <div>
+                <span class="category-label">FIRE AND FORGET</span>
+                <h4 id="independent-category-title">Independent agents</h4>
+                <p>These agents launch together as standalone project chats. They do not answer to the manager, do not nest beneath it, and keep their own scope and permissions.</p>
+              </div>
+              <span class="optional">Optional</span>
+            </div>
           <div class="agents">
             {#each agents as agent, index (agent.id)}
               {@const effort = findModel(agent.model)?.descriptors.find((item) => item.id === 'effort')}
@@ -498,25 +677,15 @@
             {/each}
           </div>
 
-          <div class="team-actions">
             <button class="add" aria-label="Add starting agent" onclick={addAgent}><Icon name="plus" size={14} /> Starting agent</button>
-            <div class="manager">
-              <div>
-                <b>Project manager</b>
-                <span>{managerSetupOpened ? 'Manager setup opened for this project.' : 'Optional · configure the manager’s own role and worker policy.'}</span>
-              </div>
-              <button onclick={openManagerSetup} aria-label="Configure a project manager">
-                {managerSetupOpened ? 'Open setup again' : 'Configure'}
-              </button>
-            </div>
-          </div>
+          </section>
 
           {#if teamError}<div class="error" role="alert">{teamError}</div>{/if}
           <div class="footer-actions">
             <button class="secondary" onclick={() => (step = 1)}>Back</button>
             <button class="primary" onclick={review}>Review and finalize</button>
           </div>
-        {/if}
+        </div>
       </section>
 
       {#if step === 3}
@@ -533,42 +702,61 @@
               <Icon name="folder" size={18} />
               <div><b>{project.name}</b><span>{project.path}</span></div>
             </div>
-            {#if agents.length}
-              <div class="review-agents">
-                {#each agents as agent, index (agent.id)}
-                  <div class="review-agent">
-                    <ProviderLogo provider={store.profiles.find((item) => item.id === agent.profileId)?.provider ?? 'claude'} size={15} />
-                    <span><b>{index + 1}. {agent.profileId}</b><small>{agent.scope || agent.prompt}</small></span>
-                    <em class:ok={agent.status === 'started'} class:bad={agent.status === 'failed'}>
-                      {agent.status === 'launching' ? 'Starting…' : agent.status === 'started' ? 'Started' : agent.status === 'failed' ? 'Did not start' : 'Ready'}
-                    </em>
-                  </div>
-                {/each}
-              </div>
-            {:else}
-              <div class="zero">No starting agents. This will create the project and open its overview.</div>
+            {#if managerConfig}
+              <section class="review-group manager-group">
+                <span class="category-label">WITH A MANAGER · DELEGATED TEAM</span>
+                <div class="manager-review">
+                  <Icon name="flag" size={16} />
+                  <span>
+                    <b>Project manager · {managerConfig.managerProfileId}</b>
+                    <small>
+                      {managerConfig.agentTypes.length} child role{managerConfig.agentTypes.length === 1 ? '' : 's'} defined ·
+                      {managerConfig.maxLiveChildren} live children · {managerConfig.permissionMode} permission
+                    </small>
+                  </span>
+                  <em class:ok={managerStatus === 'started'} class:bad={managerStatus === 'failed'}>
+                    {managerStatus === 'launching' ? 'Starting…' : managerStatus === 'started' ? 'Started' : managerStatus === 'failed' ? 'Did not start' : 'Ready'}
+                  </em>
+                </div>
+              </section>
             {/if}
-            {#if managerSetupOpened}
-              <div class="manager-review">
-                <Icon name="flag" size={16} />
-                <span><b>Project manager setup opened</b><small>Any manager saved there is already attached to this project and will appear in its overview.</small></span>
-              </div>
+            {#if agents.length}
+              <section class="review-group independent-group">
+                <span class="category-label">INDEPENDENT AGENTS · NO MANAGER</span>
+                <div class="review-agents">
+                  {#each agents as agent, index (agent.id)}
+                    <div class="review-agent">
+                      <ProviderLogo provider={store.profiles.find((item) => item.id === agent.profileId)?.provider ?? 'claude'} size={15} />
+                      <span><b>{index + 1}. {agent.profileId}</b><small>{agent.scope || agent.prompt}</small></span>
+                      <em class:ok={agent.status === 'started'} class:bad={agent.status === 'failed'}>
+                        {agent.status === 'launching' ? 'Starting…' : agent.status === 'started' ? 'Started' : agent.status === 'failed' ? 'Did not start' : 'Ready'}
+                      </em>
+                    </div>
+                  {/each}
+                </div>
+              </section>
+            {/if}
+            {#if !managerConfig && agents.length === 0}
+              <div class="zero">No manager and no independent agents. This will create the project and open its overview.</div>
             {/if}
           </div>
 
           {#if launchAttempted && !launching}
-            <div class="launch-summary" class:has-failures={failed.length > 0}>
-              {#if failed.length}
-                <b>{started.length} agent{started.length === 1 ? '' : 's'} started; {failed.length} did not.</b>
+            <div class="launch-summary" class:has-failures={failedCount > 0}>
+              {#if failedCount}
+                <b>{startedCount} team member{startedCount === 1 ? '' : 's'} started; {failedCount} did not.</b>
                 <p>The project is open with the agents that started. Fix the problem below, then retry only the failures.</p>
                 <ul>
                   {#each failed as agent (agent.id)}
                     <li><span>{labelFor(agent)}</span><strong>{agent.error}</strong></li>
                   {/each}
+                  {#if managerStatus === 'failed'}
+                    <li><span>Project manager · {managerConfig?.managerProfileId}</span><strong>{managerError}</strong></li>
+                  {/if}
                 </ul>
-                <button class="primary" onclick={retryFailed}>Retry failed agent{failed.length === 1 ? '' : 's'}</button>
-              {:else if agents.length}
-                <b>All {started.length} agents started.</b>
+                <button class="primary" onclick={retryFailed}>Retry failed team member{failedCount === 1 ? '' : 's'}</button>
+              {:else if agents.length || managerConfig}
+                <b>All {startedCount} team member{startedCount === 1 ? '' : 's'} started.</b>
                 <p>The project overview is open.</p>
               {:else}
                 <b>Project ready.</b>
@@ -581,7 +769,7 @@
             <div class="footer-actions">
               <button class="secondary" onclick={() => { step = 2; void reveal('team') }}>Back to team</button>
               <button class="launch" onclick={launchAll} disabled={launching}>
-                {agents.length ? 'Launch project with team' : 'Create project without agents'}
+                {agents.length || managerConfig ? 'Launch project with team' : 'Create project without agents'}
               </button>
             </div>
           {/if}
@@ -593,7 +781,6 @@
 
 <style>
   .backdrop { position: fixed; inset: 0; z-index: 70; background: rgba(0, 0, 0, 0.72); backdrop-filter: blur(4px); }
-  .backdrop.suspended, .modal.suspended { visibility: hidden; }
   .modal { position: fixed; z-index: 71; inset: max(24px, 5vh) max(24px, 6vw); max-width: 1060px; margin: auto;
     display: flex; flex-direction: column; overflow: hidden; color: var(--text); background: var(--bg);
     border: 1px solid var(--border-strong); border-radius: var(--r-xl); box-shadow: var(--shadow-4); }
@@ -614,6 +801,8 @@
   .step.complete:not(.current) { padding-block: var(--space-4); }
   .step-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); margin-bottom: var(--space-4); }
   .step-head h3 { margin: 2px 0 0; font-size: var(--text-lg); }
+  .step-status { display: flex; align-items: center; justify-content: flex-end; gap: var(--space-3); min-width: 0; }
+  .edit-step { flex: none; color: var(--accent); font-size: var(--text-xs); font-weight: var(--fw-medium); }
   .ready { display: inline-flex; align-items: center; gap: var(--space-1); color: var(--ok); font-size: var(--text-xs); font-weight: var(--fw-medium); }
   .count { color: var(--muted); font-size: var(--text-xs); }
   .project-summary, .review-project { display: flex; align-items: center; gap: var(--space-3); min-width: 0; }
@@ -622,6 +811,7 @@
   .created-label { flex: none; color: var(--ok) !important; font-family: inherit !important; }
   .setup-summary { display: flex; flex-direction: column; gap: var(--space-1); margin-top: var(--space-3); color: var(--muted); font-size: var(--text-xs); }
   .setup-summary span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fixed-note { margin: var(--space-3) 0 0; color: var(--muted); font-size: var(--text-xs); line-height: 1.4; }
   .source-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-3); margin-bottom: var(--space-4); }
   .source { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-4); text-align: left; border: 1px solid var(--border);
     border-radius: var(--r-md); background: var(--surface-2); }
@@ -645,7 +835,18 @@
   .primary:disabled, .launch:disabled { opacity: 0.55; cursor: default; }
   .error { margin: var(--space-3) 0; padding: var(--space-3); color: var(--bad-text); background: color-mix(in srgb, var(--bad) 10%, transparent);
     border: 1px solid var(--bad); border-radius: var(--r-md); font-size: var(--text-sm); }
-  .agents { display: flex; flex-direction: column; gap: var(--space-3); margin-top: var(--space-4); }
+  .team-content[hidden] { display: none; }
+  .team-category { padding: var(--space-4); margin-top: var(--space-4); border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--surface-2); }
+  .manager-category { border-color: color-mix(in srgb, var(--accent) 42%, var(--border)); }
+  .independent-category { border-color: color-mix(in srgb, var(--cyan) 35%, var(--border)); }
+  .category-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-4); margin-bottom: var(--space-4); }
+  .category-head > div { min-width: 0; }
+  .category-label { display: block; color: var(--accent); font-size: var(--text-2xs); font-weight: var(--fw-semibold); letter-spacing: var(--ls-label); }
+  .independent-category .category-label, .independent-group .category-label { color: var(--cyan); }
+  .category-head h4 { margin: var(--space-1) 0 var(--space-2); font-size: var(--text-md); }
+  .category-head p { margin: 0; color: var(--muted); font-size: var(--text-xs); line-height: 1.5; }
+  .optional { flex: none; padding: 2px var(--space-2); color: var(--dim); border: 1px solid var(--border); border-radius: var(--r-pill); font-size: var(--text-2xs); }
+  .agents { display: flex; flex-direction: column; gap: var(--space-3); }
   .agent { padding: var(--space-4); border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-2); }
   .agent-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-4); }
   .agent-head > div { display: flex; align-items: center; gap: var(--space-2); }
@@ -657,16 +858,20 @@
   .toggle { flex-direction: row; align-items: center; padding: var(--space-3); border: 1px solid var(--border-subtle); border-radius: var(--r-md); }
   .toggle input { width: auto; }
   .toggle span { display: flex; flex-direction: column; }
-  .team-actions { display: grid; grid-template-columns: minmax(180px, 0.45fr) minmax(260px, 1fr); gap: var(--space-3); margin-top: var(--space-4); }
-  .add { display: flex; align-items: center; justify-content: center; gap: var(--space-2); min-height: 64px; color: var(--accent);
+  .add { display: flex; align-items: center; justify-content: center; gap: var(--space-2); width: 100%; min-height: 56px; margin-top: var(--space-3); color: var(--cyan);
     border: 1px dashed var(--border-accent); border-radius: var(--r-md); background: color-mix(in srgb, var(--accent) 5%, transparent); font-weight: var(--fw-medium); }
   .manager { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); padding: var(--space-3) var(--space-4);
     border: 1px solid var(--border); border-radius: var(--r-md); }
   .manager div { display: flex; flex-direction: column; gap: 2px; }
   .manager span { color: var(--muted); font-size: var(--text-xs); }
   .manager button { flex: none; color: var(--accent); }
+  .manager-setup { margin-top: var(--space-4); overflow: hidden; border: 1px solid var(--border-accent); border-radius: var(--r-lg); }
+  .manager-setup[hidden] { display: none; }
   .footer-actions { display: flex; justify-content: flex-end; gap: var(--space-3); margin-top: var(--space-5); padding-top: var(--space-4); border-top: 1px solid var(--border-subtle); }
   .review { display: flex; flex-direction: column; gap: var(--space-4); }
+  .review-group { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-3); border: 1px solid var(--border); border-radius: var(--r-md); }
+  .manager-group { border-color: color-mix(in srgb, var(--accent) 42%, var(--border)); }
+  .independent-group { border-color: color-mix(in srgb, var(--cyan) 35%, var(--border)); }
   .review-project { padding: var(--space-4); border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-2); }
   .review-agents { display: flex; flex-direction: column; gap: var(--space-2); }
   .review-agent { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: var(--space-3);
@@ -676,10 +881,13 @@
   .review-agent em { color: var(--muted); font-size: var(--text-xs); font-style: normal; }
   .review-agent em.ok { color: var(--ok); }
   .review-agent em.bad { color: var(--bad-text); }
-  .manager-review { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4);
+  .manager-review { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4);
     color: var(--muted); border: 1px solid var(--border); border-radius: var(--r-md); }
   .manager-review span { display: flex; flex-direction: column; gap: 2px; }
   .manager-review small { color: var(--dim); }
+  .manager-review em { font-size: var(--text-xs); font-style: normal; }
+  .manager-review em.ok { color: var(--ok); }
+  .manager-review em.bad { color: var(--bad-text); }
   .zero { padding: var(--space-5); color: var(--muted); text-align: center; border: 1px dashed var(--border); border-radius: var(--r-md); }
   .launch { background: linear-gradient(135deg, var(--accent), var(--cyan)); box-shadow: 0 8px 24px color-mix(in srgb, var(--accent) 20%, transparent); }
   .launch-summary { padding: var(--space-4); margin-top: var(--space-4); color: var(--ok);
@@ -693,7 +901,8 @@
   @media (max-width: 720px) {
     .modal { inset: 8px; }
     header, .body { padding-inline: var(--space-4); }
-    .source-actions, .fields.two, .fields.three, .agent-controls, .team-actions { grid-template-columns: minmax(0, 1fr); }
+    .source-actions, .fields.two, .fields.three, .agent-controls { grid-template-columns: minmax(0, 1fr); }
+    .category-head { flex-direction: column; gap: var(--space-2); }
     nav span { padding-inline: var(--space-2); }
   }
 </style>
