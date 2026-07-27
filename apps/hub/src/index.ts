@@ -33,13 +33,63 @@ import { asChatNamePool } from './title.js'
 import type { DangerFlags, HubConfig, HubPrefs } from './types.js'
 import { RestartController, type RestartState } from './restartController.js'
 import { SCHEMA_VERSION, type SupervisorMsg } from './restartHandshake.js'
+import {
+  PREFLIGHT_EXIT_CODE,
+  recordExistingSchemaVersion,
+  recordSchemaVersion,
+  runHubPreflight,
+  type PreflightFailure,
+} from './preflight.js'
 
 const repoRoot = path.resolve(import.meta.dirname, '..', '..', '..')
+const supervised = process.env.HUB_SUPERVISED === '1' && typeof process.send === 'function'
 // HUB_DATA_DIR relocates the journal/config/worktrees/device-token root off the repo's data/. Profiles keep
 // their real repo path so auth still resolves. Unset → repo data/ (byte-identical to today); set only by an
 // isolated harness (e.g. the restart-survival acceptance test) to keep its DB + state off the live hub's.
 const dataDir = process.env.HUB_DATA_DIR ? path.resolve(process.env.HUB_DATA_DIR) : path.join(repoRoot, 'data')
-if (process.env.HUB_DATA_DIR) fs.mkdirSync(dataDir, { recursive: true })
+const journalPath = path.join(dataDir, 'hub.db')
+
+async function reportPreflightFailure(failure: PreflightFailure): Promise<never> {
+  const message = { type: 'preflight-failed' as const, ...failure }
+  console.error(`[hub-preflight] ${JSON.stringify(message)}`)
+  if (supervised && process.send) {
+    await new Promise<void>((resolve) => {
+      let done = false
+      const finish = (): void => {
+        if (done) return
+        done = true
+        clearTimeout(timer)
+        resolve()
+      }
+      const timer = setTimeout(finish, 250)
+      try {
+        process.send?.(message, finish)
+      } catch {
+        finish()
+      }
+    })
+  }
+  process.exit(PREFLIGHT_EXIT_CODE)
+}
+
+const preflight = runHubPreflight({ dataDir, journalPath, schemaVersion: SCHEMA_VERSION })
+for (const check of preflight.checks) {
+  const line = `[hub-preflight] ${check.name}: ${check.status} (${check.durationMs}ms) — ${check.detail}`
+  if (check.status === 'skipped') console.warn(line)
+  else console.log(line)
+}
+if (!preflight.ok) await reportPreflightFailure(preflight.failure)
+if (fs.existsSync(journalPath)) {
+  try {
+    recordExistingSchemaVersion(journalPath, SCHEMA_VERSION)
+  } catch (error) {
+    await reportPreflightFailure({
+      code: 'schema-version-unrecordable',
+      message: `The journal passed read-only checks, but its schema version could not be recorded: ${error instanceof Error ? error.message : String(error)}`,
+      recovery: 'Check free disk space and write permission for hub.db, then restart AllMyAgents.',
+    })
+  }
+}
 // HUB_PROFILES_DIR relocates the managed-profiles root (auth creds + settings) off the repo's profiles/ —
 // the alpha step toward keeping credentials out of the repo/bundle path (%APPDATA%/AllMyAgents/profiles on a
 // real install). Unset → repo profiles/ (byte-identical to today). The scan, login, and rescan all use it.
@@ -54,8 +104,21 @@ try {
   /* no config yet — defaults apply (overage: block) */
 }
 
-const journalPath = path.join(dataDir, 'hub.db')
 const journal = new Journal(journalPath)
+try {
+  recordSchemaVersion(journal.db, SCHEMA_VERSION)
+} catch (error) {
+  try {
+    journal.db.close()
+  } catch {
+    /* preserve the schema-recording failure as the actionable error */
+  }
+  await reportPreflightFailure({
+    code: 'schema-version-unrecordable',
+    message: `The journal opened, but its schema version could not be recorded: ${error instanceof Error ? error.message : String(error)}`,
+    recovery: 'Check free disk space and write permission for hub.db, then restart AllMyAgents.',
+  })
+}
 // Each live WebSocket (pane / device / reconnect) attaches a journal 'event' listener, removed on
 // close — legitimately more than the EventEmitter default of 10 for a multi-pane/fleet hub. Raise
 // the cap so a healthy number of connections doesn't emit a spurious MaxListeners leak warning.
@@ -129,7 +192,6 @@ approvals.setAutoApprove((sessionId, kind, payload) => sessions.isAutoApproved(s
 // hubctl launches us with HUB_SUPERVISED=1 + an IPC channel. A booting "green" gets HUB_PORT=0
 // (ephemeral) and promotes to the fixed public port 7777 only after passing the supervisor's
 // health-check; an unsupervised standalone hub behaves exactly as before.
-const supervised = process.env.HUB_SUPERVISED === '1' && typeof process.send === 'function'
 const bootPort = Number(process.env.HUB_PORT ?? 7777)
 // The fixed public port a green promotes to / a rollback re-claims — HUB_FIXED_PORT keeps it in lockstep with
 // hubctl's override so an isolated harness promotes to its own port, not 7777. Unset → 7777 as before.
