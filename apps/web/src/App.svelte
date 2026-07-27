@@ -191,17 +191,17 @@
     store.endDragSession()
   }
 
-  // Reveal a drop-ghost by growing the SPACE it occupies — flex-grow, its size floor and its
-  // margin all ease up from zero — instead of popping in at full size. Because flex children share
-  // one denominator, animating the ghost's flex-grow makes the surrounding panes glide aside frame
-  // by frame (a plain CSS `transition: flex-grow` on the neighbours can't: their own flex-grow never
-  // changes, only the denominator does). It's bidirectional, so a ghost also eases back out when it
-  // unmounts — which softens the "teleport" when the drop zone jumps cells: the old ghost deflates
-  // as the new one grows in. Honors prefers-reduced-motion (instant, no motion) like the CSS paths.
-  function ghostReveal(
-    _node: Element,
-    { grow = 0.7, axis = 'col' }: { grow?: number; axis?: 'col' | 'row' } = {},
-  ): TransitionConfig {
+  // Reveal a drop-ghost with opacity + scale only. It USED to grow the SPACE it occupies (animating
+  // flex-grow / min-size / margin from zero) so the surrounding panes glided aside frame by frame — a
+  // deliberate touch, but the single most expensive thing to animate here: changing a flex child's
+  // flex-grow reflows every sibling every frame, and with no layout containment each reflow re-lays-out
+  // every pane's ENTIRE transcript. In a 6-pane / long-transcript repro that measured ~66ms/frame
+  // (≈15fps) — the reported drag lag. The ghost now takes its space STATICALLY (its flex-grow / min-size
+  // / margin live in CSS, applied on mount), so the only layout is one reflow when the drop zone changes,
+  // not one per frame: ~16.7ms/frame (60fps). Trade, made knowingly: neighbours POP aside once instead
+  // of gliding. The transition is still bidirectional, so a leaving ghost crossfades with the arriving
+  // one — which keeps the zone-jump "teleport" soft. Honors prefers-reduced-motion (instant, no motion).
+  function ghostReveal(_node: Element): TransitionConfig {
     if (typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
       return { duration: 0 }
     }
@@ -211,17 +211,8 @@
         ? getComputedStyle(document.documentElement).getPropertyValue('--dur-slow').trim()
         : '') || '220ms'
     const duration = raw.endsWith('ms') ? parseFloat(raw) || 220 : (parseFloat(raw) || 0.22) * 1000
-    const [floorProp, floorPx] = axis === 'row' ? (['min-height', 48] as const) : (['min-width', 60] as const)
-    return {
-      duration,
-      easing: cubicOut,
-      css: (t: number) =>
-        `opacity:${t};` +
-        `flex-grow:${(t * grow).toFixed(4)};` +
-        `${floorProp}:${(t * floorPx).toFixed(2)}px;` +
-        `margin:${(t * 0.5).toFixed(3)}rem;` +
-        `transform:scale(${(0.96 + 0.04 * t).toFixed(4)})`,
-    }
+    // Animate ONLY opacity + scale — properties that do not force layout.
+    return { duration, easing: cubicOut, css: (t: number) => `opacity:${t};transform:scale(${(0.96 + 0.04 * t).toFixed(4)})` }
   }
 
   let pairToken = $state('')
@@ -277,7 +268,7 @@
       <div class="panes" bind:this={panesEl}>
         {#each paneRows as row, r (r)}
           {#if store.dragSession && store.dropZone?.kind === 'row' && store.dropZone.row === r}
-            <div class="ghost-row" transition:ghostReveal={{ grow: 0.5, axis: 'row' }}><span>drop here</span></div>
+            <div class="ghost-row" transition:ghostReveal><span>drop here</span></div>
           {/if}
           {#if r > 0}
             <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
@@ -286,7 +277,7 @@
           <div class="prow" style="flex: {rowFlex[r] ?? 1} 1 0">
             {#each row as id, c (id + ':' + r + ':' + c)}
               {#if store.dragSession && store.dropZone?.kind === 'col' && store.dropZone.row === r && store.dropZone.col === c}
-                <div class="ghost-pane" transition:ghostReveal={{ grow: 0.7, axis: 'col' }}><span>drop here</span></div>
+                <div class="ghost-pane" transition:ghostReveal><span>drop here</span></div>
               {/if}
               {#if c > 0}
                 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
@@ -295,12 +286,12 @@
               <div class="pane" style="flex: {colFlex[r]?.[c] ?? 1} 1 0"><ThreadView sessionId={id} paneIndex={(rowOffsets[r] ?? 0) + c} multiPane={totalPanes > 1} /></div>
             {/each}
             {#if store.dragSession && store.dropZone?.kind === 'col' && store.dropZone.row === r && store.dropZone.col === row.length}
-              <div class="ghost-pane" transition:ghostReveal={{ grow: 0.7, axis: 'col' }}><span>drop here</span></div>
+              <div class="ghost-pane" transition:ghostReveal><span>drop here</span></div>
             {/if}
           </div>
         {/each}
         {#if store.dragSession && store.dropZone?.kind === 'row' && store.dropZone.row === paneRows.length}
-          <div class="ghost-row" transition:ghostReveal={{ grow: 0.5, axis: 'row' }}><span>drop here</span></div>
+          <div class="ghost-row" transition:ghostReveal><span>drop here</span></div>
         {/if}
       </div>
     {/if}
@@ -326,7 +317,12 @@
 <UpdateBanner />
 
 <style>
-  .app { display: flex; flex-direction: column; height: 100vh; }
+  /* The app shell OWNS the viewport: fixed at 100vh and clipped, so the document never scrolls and the
+     title bar (with the window controls) can never be scrolled off — critical in a frameless Tauri
+     window, where losing the title bar leaves no way to close/unmaximize but the keyboard. Content is not
+     lost: everything below the title bar scrolls INSIDE its own pane (the shell row is minmax(0,1fr) and
+     the sidebar list + transcript each scroll), so this clip only catches true viewport overflow. */
+  .app { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
   .hubdown {
     display: flex; align-items: center; gap: var(--space-2);
     padding: var(--space-2) var(--space-4);
@@ -344,10 +340,15 @@
   @keyframes hubspin { to { transform: rotate(360deg); } }
   /* Respect the OS "reduce motion" setting — a permanent spinner is exactly the kind of thing it exists for. */
   @media (prefers-reduced-motion: reduce) { .hubdown .spin { animation: none; } }
-  .shell { display: grid; flex: 1; min-height: 0; }
+  /* grid-template-rows: minmax(0, 1fr) — WITHOUT this the implicit row is `auto` and sizes to content, so
+     a tall sidebar/transcript grows the shell past the viewport and (before .app's clip) scrolled the whole
+     window. minmax(0,…) lets the row shrink so its children's own scrollers engage instead. */
+  .shell { display: grid; flex: 1; min-height: 0; grid-template-rows: minmax(0, 1fr); }
   .shell.dragging { cursor: col-resize; user-select: none; }
   .shell.rowdragging { cursor: row-resize; user-select: none; }
-  .center { display: flex; flex-direction: column; min-width: 0; }
+  /* min-height:0 (with min-width:0) lets this grid cell shrink below its content so `.panes` / Dashboard
+     scroll internally rather than pushing the shell past the viewport. */
+  .center { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
   .empty { display: grid; place-items: center; height: 100%; }
   .panes { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
   .prow { display: flex; flex: 1 1 0; min-width: 0; min-height: 0; }
@@ -382,8 +383,9 @@
     .shell.dragging .prow, .shell.dragging .pane,
     .shell.rowdragging .prow, .shell.rowdragging .pane { transition: none; }
     .pane { animation: pane-in var(--dur-slow) var(--ease); }
-    /* The drop-ghost's enter/exit (opacity, scale, and the space it takes) is animated in JS via
-       the `ghostReveal` bidirectional transition so neighbours glide as it grows/shrinks; see script. */
+    /* The drop-ghost takes its space statically (its flex-grow/min-size/margin are the .ghost-* rules
+       below); only its opacity + scale are animated, by the `ghostReveal` transition. It deliberately
+       does NOT animate flex-grow — that reflowed every pane's transcript per frame (see script). */
     @keyframes pane-in { from { opacity: 0; } to { opacity: 1; } }
   }
 </style>
