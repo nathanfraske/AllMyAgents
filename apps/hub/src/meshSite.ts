@@ -156,6 +156,15 @@ function roundTrip(socketPath: string, cmd: string, args: unknown, timeoutMs: nu
 function describe(e: unknown): string {
   const code = (e as NodeJS.ErrnoException | undefined)?.code
   if (code === 'ENOENT' || code === 'ECONNREFUSED') return 'no AllMyStuff node running here (hub is local-only)'
+  // EPERM/EACCES is NOT "no node" — the pipe is right there and refusing us. On Windows a named pipe
+  // carries an ACL, so this almost always means the node and this hub are running at different privilege
+  // levels (typically the node elevated or as a service, the hub as the ordinary user). The raw
+  // "connect EPERM \\.\pipe\allmystuff-node" is technically accurate and tells an operator nothing about
+  // what to change, and it cost a long diagnosis once — the hub looked simply un-exposed, and the actual
+  // cause was one word in an error string nobody surfaced.
+  if (code === 'EPERM' || code === 'EACCES') {
+    return 'the AllMyStuff node refused this hub permission to connect (EPERM). On Windows the node control pipe is ACL-protected — this usually means the node and AllMyAgents are running at different privilege levels. Run both elevated, or both as your normal user.'
+  }
   return e instanceof Error ? e.message : String(e)
 }
 
