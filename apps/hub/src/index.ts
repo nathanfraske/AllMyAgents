@@ -386,9 +386,17 @@ const meshEnable = !(
   config.mesh?.enable === false
 )
 const mesh = new MeshSite({ port: publicPort, label: config.mesh?.label, enable: meshEnable })
+// Extra remote ports to try when discovering peer hubs. 7777 is the well-known one, but a machine that
+// already had something on 7777 — including another AllMyAgents — runs its hub elsewhere, and no amount of
+// correctly exposing its site makes it findable if discovery only ever asks for 7777. We cannot enumerate a
+// peer's sites to learn the right port (site_remote_list answers via an async event the control socket
+// cannot capture), so the operator names them: config.mesh.peerPorts = [7778, 7900, …].
+const meshPeerPorts: number[] = Array.isArray(config.mesh?.peerPorts)
+  ? config.mesh.peerPorts.filter((p): p is number => Number.isInteger(p) && p > 0 && p < 65536)
+  : []
 
 // Listen on the BOOT port (0 → ephemeral for a green); the server reports its actual port back.
-const server = startServer({ port: bootPort, defaultCwd: repoRoot, profilesDir, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, agentToolSecret, restartState, executor, configPath })
+const server = startServer({ port: bootPort, defaultCwd: repoRoot, profilesDir, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath })
 
 // Register the mesh advert — factored so a promoted green can (re)register once it owns the port.
 function registerMesh(): void {

@@ -129,6 +129,18 @@ export interface MeshConfig {
   enable?: boolean
   /** Display label fleet peers see for this site (e.g. in their AllMyStuff Sites tab). */
   label?: string
+  /**
+   * Extra REMOTE ports to try when discovering peer hubs, beyond the well-known 7777.
+   *
+   * A machine that already has something on 7777 — very much including a second AllMyAgents — runs its
+   * hub on another port, and then exposing its site correctly is not enough: discovery only ever asks
+   * peers for 7777, so the hub stays invisible. The peer's real port cannot be read from here
+   * (`site_remote_list` replies with an async `allmystuff://node-sites` event the control socket cannot
+   * capture), so the operator names the ports their other machines use.
+   *
+   * e.g. `"mesh": { "peerPorts": [7778, 7900] }`. Ignored values: anything not a whole port number.
+   */
+  peerPorts?: number[]
 }
 
 export interface SecurityConfig {

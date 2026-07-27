@@ -44,6 +44,20 @@ export interface BuildFleetDeps {
   probeHealth: (baseUrl: string) => Promise<boolean>
   /** Well-known peer hub port (default 7777). */
   hubPort?: number
+  /**
+   * EXTRA remote ports to try when the well-known one finds nothing.
+   *
+   * 7777 being "the" hub port is an assumption that breaks the moment a machine already has something
+   * on it — including a second AllMyAgents — because that hub binds a different port and then no amount
+   * of correctly exposing its site makes it discoverable here. Observed directly: a peer with a live hub
+   * and a correctly exposed site stayed invisible because discovery only ever asked for 7777.
+   *
+   * We cannot enumerate a peer's exposed sites to find out: `site_remote_list` answers with an async
+   * `allmystuff://node-sites` EVENT rather than a reply frame, and the control socket's round-trip only
+   * returns the first reply (see meshSite.siteMap's note). Until that event can be captured, the honest
+   * fallback is to let the operator name the ports their other machines actually use.
+   */
+  extraPorts?: readonly number[]
 }
 
 /**
@@ -71,16 +85,31 @@ export async function buildFleet(deps: BuildFleetDeps): Promise<FleetSite[]> {
   }
   if (members.length === 0) return [local]
 
-  const port = deps.hubPort ?? 7777
+  // Try the well-known port first, then any operator-configured extras. Deduped and ordered so the
+  // common single-port case does exactly one map + probe, exactly as before.
+  const ports = [...new Set([deps.hubPort ?? 7777, ...(deps.extraPorts ?? [])])]
   const remotes = await Promise.all(
     members.map(async (m): Promise<FleetSite | null> => {
-      const localPort = await deps.siteMap(m.device, port).catch(() => null)
-      // No map = the node refused (this very device), the peer is offline, or there's no node.
-      // Either way it isn't a reachable remote hub — drop it.
-      if (localPort == null) return null
-      const baseUrl = `http://localhost:${localPort}`
-      const online = await deps.probeHealth(baseUrl).catch(() => false)
-      return { siteId: m.device, label: m.label || m.device.slice(0, 8), local: false, baseUrl, online }
+      let firstMapped: string | null = null
+      for (const port of ports) {
+        const localPort = await deps.siteMap(m.device, port).catch(() => null)
+        // No map = the node refused (this very device), the peer is offline, or there's no node.
+        if (localPort == null) continue
+        const baseUrl = `http://localhost:${localPort}`
+        if (firstMapped === null) firstMapped = baseUrl
+        const online = await deps.probeHealth(baseUrl).catch(() => false)
+        // A HUB ANSWERED — stop here. Keep probing on failure, because a mapped-but-silent port proves
+        // nothing: the tunnel binds locally whether or not anything serves on the far side.
+        if (online) {
+          return { siteId: m.device, label: m.label || m.device.slice(0, 8), local: false, baseUrl, online: true }
+        }
+      }
+      // Nothing answered on any candidate. Still list the peer when at least one port mapped: it IS a
+      // co-owned machine the node can reach, just without a hub we could find — and a peer that silently
+      // vanishes from the roster is indistinguishable from one that was never paired, which is the more
+      // confusing failure. Dropping only the unmappable ones preserves the previous behaviour for those.
+      if (firstMapped === null) return null
+      return { siteId: m.device, label: m.label || m.device.slice(0, 8), local: false, baseUrl: firstMapped, online: false }
     })
   )
   return [local, ...remotes.filter((s): s is FleetSite => s !== null)]

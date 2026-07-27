@@ -367,6 +367,8 @@ export interface ServerOptions {
   mesh: MeshSite
   deviceToken: string
   requireToken: boolean
+  /** Extra remote ports to try when discovering peer hubs (config.mesh.peerPorts). See BuildFleetDeps. */
+  meshPeerPorts?: readonly number[]
   /** Shared secret authenticating the Codex agent-tool bridge → hub calls (POST /internal/agent-tool).
    *  Undefined disables the route (no Codex bridge configured). Distinct from the device token. */
   agentToolSecret?: string
@@ -446,7 +448,7 @@ export function persistPrefs(
 }
 
 export function startServer(opts: ServerOptions): http.Server {
-  const { port, defaultCwd, profilesDir, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, agentToolSecret, restartState, executor, configPath } = opts
+  const { port, defaultCwd, profilesDir, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath } = opts
 
   const server = http.createServer((req, res) => {
     void handle(req, res)
@@ -890,6 +892,7 @@ export function startServer(opts: ServerOptions): http.Server {
           roster: () => mesh.ownedRoster(),
           siteMap: (node, p) => mesh.siteMap(node, p),
           probeHealth: (baseUrl) => probeHubHealth(baseUrl, 1500),
+          extraPorts: meshPeerPorts,
         })
         json(res, sites)
         return
