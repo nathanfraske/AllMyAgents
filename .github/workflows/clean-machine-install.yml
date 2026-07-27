@@ -59,7 +59,7 @@ jobs:
           # CI shares runner IPs and re-runs often, so the unauthenticated 60/hour GitHub limit is hit
           # quickly — a 403 that has nothing to do with the app. Real users get the anonymous path.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: bash scripts/install-macos.sh
+        run: /bin/bash scripts/install-macos.sh   # /bin/bash = 3.2 on a real Mac; `bash` finds Homebrew 5 and hides 3.2-only bugs
 
       # Everything above may use the runner's tools. Everything below must not.
       - name: Launch with a GUI-equivalent environment

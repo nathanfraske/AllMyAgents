@@ -70,13 +70,57 @@ async function resolve(prefix) {
 }
 
 /**
- * Every event for one session, read over HTTP so this works against any hub without knowing where its
- * SQLite file lives. `/api/events` pages the whole journal gap-free, which is more than we need but is
- * the only endpoint that exposes the transcript without a WebSocket.
+ * The recent events for one session.
+ *
+ * READS THE JOURNAL DIRECTLY, and the HTTP path is only a fallback, because `/api/events?since=0`
+ * materialises the ENTIRE journal into one response — every row the hub has ever written. That is
+ * survivable on a fresh hub and fatal on a real one: against the operator's live hub (375k rows, 318MB
+ * of payload) it reset the connection mid-transfer and took this tool down with ECONNRESET. A
+ * coordination channel that stops working precisely as a hub gets busy is worse than no channel, because
+ * it fails at the moment you are relying on it.
+ *
+ * A bounded `ORDER BY seq DESC LIMIT n` returns in milliseconds regardless of journal size. The HTTP
+ * fallback stays for a hub whose DB we cannot locate, with a `since` floor so it can never ask for
+ * everything again.
  */
-async function eventsFor(sessionId) {
+function dbPathFor(port) {
+  if (process.env.AMA_DB) return process.env.AMA_DB
+  return port === '7788' ? '.sandbox/data/hub.db' : 'data/hub.db'
+}
+
+async function eventsFor(sessionId, limit = 400) {
+  const dbPath = dbPathFor(PORT)
+  if (fs.existsSync(dbPath)) {
+    try {
+      const { createRequire } = await import('node:module')
+      const require = createRequire(new URL('../apps/hub/package.json', import.meta.url))
+      const Database = require('better-sqlite3')
+      const db = new Database(dbPath, { readonly: true })
+      try {
+        const rows = db
+          .prepare('SELECT seq, ts, session, kind, payload FROM events WHERE session = ? ORDER BY seq DESC LIMIT ?')
+          .all(sessionId, limit)
+        return rows
+          .reverse()
+          .map((r) => ({ seq: r.seq, ts: r.ts, sessionId: r.session, kind: r.kind, payload: safeParse(r.payload) }))
+      } finally {
+        db.close()
+      }
+    } catch {
+      // fall through to HTTP
+    }
+  }
+  // Fallback: ask for a recent window only. Never `since=0` — see above.
   const all = await api('GET', '/api/events?since=0')
   return Array.isArray(all) ? all.filter((e) => e.sessionId === sessionId) : []
+}
+
+function safeParse(raw) {
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return null
+  }
 }
 
 /**
@@ -156,12 +200,25 @@ const CMDS = {
     const before = messages(await eventsFor(s.id))
     const mark = before.length ? before[before.length - 1].seq : 0
 
-    // A busy agent would silently queue this; better to say so than to appear hung.
+    // THE HUB DOES NOT QUEUE. `sessions.send` REJECTS while a turn is in flight — the queue lives in the
+    // web client, not the API. An earlier version of this script assumed otherwise, printed "the hub will
+    // deliver this after", and dropped the message on the floor when the POST came back
+    // "a turn is already in progress". Reporting a send that did not happen is worse than failing, because
+    // the caller then waits for a reply to a question nobody was ever asked.
+    //
+    // So wait for the agent to actually be free, then send.
     if (s.status === 'active' || s.status === 'starting') {
-      process.stderr.write(`  (${s.title ?? s.id.slice(0, 8)} is mid-turn; the hub will deliver this after)\n`)
+      process.stderr.write(`  ${s.title ?? s.id.slice(0, 8)} is mid-turn — waiting for it to finish before sending…\n`)
+      await waitIdle(s.id, { quiet: true })
     }
 
-    const res = await api('POST', `/api/sessions/${s.id}/input`, { text: body })
+    let res = await api('POST', `/api/sessions/${s.id}/input`, { text: body })
+    // Lost the race: it started another turn between our idle check and our POST. Wait it out and retry
+    // rather than failing, since the whole point of this path is an unattended hand-off.
+    for (let attempt = 0; attempt < 20 && /turn is already in progress/i.test(res?.error ?? ''); attempt++) {
+      await waitIdle(s.id, { quiet: true })
+      res = await api('POST', `/api/sessions/${s.id}/input`, { text: body })
+    }
     if (res?.error) die(`hub refused the message: ${res.error}`)
     process.stderr.write(`  sent to ${s.title ?? s.id.slice(0, 8)}; waiting for the reply…\n`)
 

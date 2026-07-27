@@ -371,7 +371,7 @@ jobs:
           AMA_TAG: ${{ github.event.inputs.tag || github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          bash scripts/install-macos.sh
+          /bin/bash scripts/install-macos.sh   # see clean-machine-install.yml: `bash` finds Homebrew 5 and hides 3.2-only bugs
 
       - name: GATE — the installed app is NOT quarantined
         run: |
