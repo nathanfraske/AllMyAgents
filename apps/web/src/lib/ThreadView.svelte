@@ -14,6 +14,7 @@
   import PermissionPicker from './PermissionPicker.svelte'
   import AccountPicker from './AccountPicker.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
+  import FirstChatGuide from './FirstChatGuide.svelte'
   import Icon from './Icon.svelte'
   import AgentPanel from './AgentPanel.svelte'
   import TaskStrip from './TaskStrip.svelte'
@@ -22,6 +23,7 @@
   import { untrack } from 'svelte'
   import { loadComposerDrafts, saveComposerDrafts } from './uiState'
   import { resolveSlash, builtinsForProvider, builtinNeedsArg, loadProfileCommands, type SlashResult } from './commands'
+  import { resolveWorkingContext, truncatePathTail } from './workingContext'
   import type { CommandInfo } from './api'
 
   let { sessionId, paneIndex = 0, multiPane = false }: { sessionId?: string; paneIndex?: number; multiPane?: boolean } =
@@ -147,6 +149,16 @@
   const st = $derived(view ? store.status(view) : { key: 'idle', label: '' })
   const approvals = $derived(view ? store.approvals.filter((a) => a.sessionId === view.record.id) : [])
   const queue = $derived(sid ? store.queueFor(sid) : [])
+  const workingContext = $derived(
+    view
+      ? resolveWorkingContext(view.record, store.projects)
+      : { projectName: 'Unfiled', workingDirectory: 'Working directory not set' }
+  )
+  // Keep the identifying end before CSS has to squeeze it further. Split panes get a tighter character
+  // budget; the path span also uses start-side ellipsis as a final guard for exceptionally narrow panes.
+  const shownWorkingDirectory = $derived(
+    truncatePathTail(workingContext.workingDirectory, multiPane ? 32 : 58)
+  )
 
   // --- `/` command picker ------------------------------------------------------------------------
   type PickItem = { name: string; description: string; kind: 'builtin' | 'custom'; argHint?: string }
@@ -246,7 +258,12 @@
   $effect(() => {
     view?.items.length
     void thinking // also keep pinned to bottom when the thinking row appears
-    if (stick && scroller) scroller.scrollTop = scroller.scrollHeight
+    if (stick && scroller) {
+      // A fresh draft contains the first-chat guide, whose beginning is the useful part. The normal
+      // transcript rule (open at the live end) would mount this taller-than-a-short-pane guide halfway
+      // down and hide its explanation above the viewport.
+      scroller.scrollTop = isDraft && view?.items.length === 0 ? 0 : scroller.scrollHeight
+    }
   })
 
   function onScroll(): void {
@@ -613,27 +630,39 @@
 {:else}
   <div class="head">
     <ProviderLogo provider={view.record.provider} size={16} />
-    {#if isDraft}
-      <span class="title draftpill" title="new chat — not on the hub until you send the first message">New chat <span class="draftbadge">draft</span></span>
-    {:else if multiPane}
-      <select class="paneselect" value={view.record.id} onchange={(e) => store.setPaneSession(paneIndex, (e.target as HTMLSelectElement).value)}>
-        {#each store.sessionList as s (s.record.id)}
-          <option value={s.record.id}>{s.record.title ?? `${s.record.profileId} · ${(s.record.worktree ?? s.record.cwd).split(/[\\/]/).pop()}`}</option>
-        {/each}
-      </select>
-    {:else}
-      <span class="title">{view.record.title ?? view.record.profileId}</span>
-    {/if}
-    <span class="statuschip {st.key}"><span class="dot {st.key}"></span>{st.label}</span>
-    <span class="sub dim">{view.record.model ?? view.record.provider}</span>
-    <span class="spacer"></span>
-    {#if !isDraft && view.record.worktree}
-      <span class="wt" title="isolated git worktree at {view.record.worktree}"><Icon name="git-branch" size={12} /> {view.record.branch ?? view.record.worktree.split(/[\\/]/).pop()}</span>
-    {:else if isDraft && view.record.projectId}
-      <span class="wt dim" title={worktreeOn ? 'will spawn in an isolated git worktree' : 'will work directly in the project directory'}><Icon name={worktreeOn ? 'git-branch' : 'folder'} size={12} /> {worktreeOn ? 'new worktree' : 'in project'}</span>
-    {:else if view.record.projectId}
-      <span class="wt dim" title="working directly in the project directory ({view.record.cwd})"><Icon name="folder" size={12} /> in project</span>
-    {/if}
+    <div class="headmain">
+      <div class="headtop">
+        {#if isDraft}
+          <span class="title draftpill" title="new chat — not on the hub until you send the first message">New chat <span class="draftbadge">draft</span></span>
+        {:else if multiPane}
+          <select class="paneselect" value={view.record.id} onchange={(e) => store.setPaneSession(paneIndex, (e.target as HTMLSelectElement).value)}>
+            {#each store.sessionList as s (s.record.id)}
+              <option value={s.record.id}>{s.record.title ?? `${s.record.profileId} · ${(s.record.worktree ?? s.record.cwd).split(/[\\/]/).pop()}`}</option>
+            {/each}
+          </select>
+        {:else}
+          <span class="title">{view.record.title ?? view.record.profileId}</span>
+        {/if}
+        <span class="statuschip {st.key}" title={st.label}>
+          <span class="dot {st.key}"></span><span class="statuslabel">{st.label}</span>
+        </span>
+        <span class="sub model dim">{view.record.model ?? view.record.provider}</span>
+      </div>
+      <div
+        class="where dim"
+        title="{isDraft ? `Will go to ${workingContext.projectName} / No folder` : workingContext.projectName} — working directory: {workingContext.workingDirectory}"
+      >
+        {#if isDraft}<span class="prospective">Will go to</span>{/if}
+        <span class="project">{workingContext.projectName}</span>
+        {#if isDraft}
+          <span class="folder-sep" aria-hidden="true">/</span>
+          <span class="folder">No folder</span>
+        {/if}
+        <span class="where-sep" aria-hidden="true">·</span>
+        <span class="where-icon" aria-hidden="true"><Icon name={worktreeOn ? 'git-branch' : 'folder'} size={11} /></span>
+        <span class="path">{shownWorkingDirectory}</span>
+      </div>
+    </div>
     <button class="hicon" title="split view" onclick={() => store.startSplit()}><Icon name="columns" size={15} /></button>
     <button class="hicon" title="close (keeps the chat)" onclick={() => store.closePane(paneIndex)}><Icon name="x" size={15} /></button>
   </div>
@@ -651,7 +680,18 @@
         <ItemCard item={node.item} sessionId={view.record.id} />
       {/if}
     {/each}
-    {#if view.items.length === 0 && !thinking}<div class="dim pad">{isDraft ? 'New chat — set the account, model and worktree below, then send your first message to start it.' : 'no activity yet — send a message below'}</div>{/if}
+    {#if view.items.length === 0 && !thinking}
+      {#if isDraft}
+        <FirstChatGuide
+          provider={view.record.provider}
+          projectName={workingContext.projectName}
+          workingDirectory={workingContext.workingDirectory}
+          permissionMode={draftMode}
+        />
+      {:else}
+        <div class="dim pad">no activity yet — send a message below</div>
+      {/if}
+    {/if}
     {#if thinking}
       <div class="thinking">
         <span class="dots"><i></i><i></i><i></i></span>
@@ -808,24 +848,51 @@
 
 <style>
   .empty { display: grid; place-items: center; height: 100%; }
-  .head { display: flex; align-items: center; gap: 0.5rem; padding: 0.6rem 1rem; border-bottom: 1px solid var(--border); }
-  .title { font-weight: 600; }
-  .paneselect { max-width: 15rem; font-size: 0.82rem; padding: 0.2rem 0.4rem; }
+  .head {
+    display: flex; align-items: center; gap: 0.5rem; min-width: 0; padding: 0.45rem 0.75rem;
+    border-bottom: 1px solid var(--border); container: thread-head / inline-size;
+  }
+  .headmain { display: flex; flex: 1 1 auto; flex-direction: column; min-width: 0; gap: 0.12rem; }
+  .headtop { display: flex; align-items: center; gap: 0.45rem; min-width: 0; height: 1.45rem; }
+  .title { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+  .paneselect { flex: 0 1 15rem; min-width: 0; max-width: 15rem; font-size: 0.82rem; padding: 0.2rem 0.4rem; }
+  .where { display: flex; align-items: center; min-width: 0; gap: 0.28rem; font-size: 0.7rem; line-height: 1rem; }
+  .prospective { flex: none; color: var(--accent); font-weight: 600; }
+  .project { flex: 0 1 auto; max-width: 42%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+  .folder { flex: none; color: var(--text); }
+  .folder-sep, .where-sep, .where-icon { flex: none; }
+  /* RTL makes text-overflow place its fallback ellipsis at the START, so the working directory's
+     identifying tail survives even below the pure helper's compact split-pane budget. */
+  .path {
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl;
+    text-align: left; font-family: var(--mono);
+  }
   .hicon { display: grid; place-items: center; color: var(--muted); width: 26px; height: 24px; border-radius: 6px; }
   .hicon:hover { background: var(--surface-2); color: var(--text); }
-  .statuschip { display: inline-flex; align-items: center; gap: 0.3rem; font-size: 0.72rem; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 0.05rem 0.45rem; }
+  .statuschip { display: inline-flex; flex: none; align-items: center; gap: 0.3rem; font-size: 0.72rem; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 0.05rem 0.45rem; }
   .statuschip.working { color: var(--working); border-color: var(--working); }
   .statuschip.completed { color: var(--ok); border-color: var(--ok); }
   .statuschip.approval { color: var(--warn); border-color: var(--warn); }
   .statuschip.question { color: var(--secondary); border-color: var(--secondary); }
   .statuschip.error { color: var(--bad-text); border-color: var(--bad); }
-  .sub { font-size: 0.78rem; }
+  .sub { flex: none; font-size: 0.78rem; }
   .spacer { flex: 1; }
-  .wt { font-size: 0.75rem; font-family: var(--mono); color: var(--muted); display: inline-flex; align-items: center; gap: 0.25rem; }
+  @container thread-head (max-width: 440px) {
+    .model { display: none; }
+  }
+  @container thread-head (max-width: 310px) {
+    .statuschip { gap: 0; padding-inline: 0.28rem; }
+    .statuslabel { display: none; }
+    .prospective { font-size: 0; }
+    .prospective::after { content: '→'; font-size: 0.7rem; }
+    .project { max-width: 35%; }
+    .folder { font-size: 0; }
+    .folder::after { content: 'none'; font-size: 0.7rem; }
+  }
   .hbtn { font-size: 0.76rem; color: var(--muted); border: 1px solid var(--border); border-radius: 7px; padding: 0.22rem 0.5rem; }
   .hbtn:hover:not(:disabled) { border-color: var(--border-strong); color: var(--text); }
   .hbtn:disabled { opacity: 0.4; cursor: default; }
-  .stream { flex: 1; display: flex; flex-direction: column; gap: 0.55rem; padding: 1rem 1.1rem; max-width: 900px; width: 100%; margin: 0 auto; }
+  .stream { flex: 1; display: flex; flex-direction: column; gap: 0.55rem; padding: 1rem 1.1rem; max-width: 900px; width: 100%; margin: 0 auto; container-type: inline-size; }
   @media (prefers-reduced-motion: no-preference) { .stream > :global(*) { animation: fade-in 0.22s var(--ease); } }
   .pad { padding: 1rem 0; }
   .thinking { display: flex; align-items: center; gap: 0.5rem; padding: 0.2rem 0.15rem; }
