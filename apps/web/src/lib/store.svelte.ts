@@ -4,6 +4,7 @@ import { alertDialog } from './dialog.svelte'
 import { loadLastLayout, saveLastLayout, loadQueues, saveQueues, type PersistedLayout } from './uiState'
 import { rowFate } from './fleetMerge'
 import { isChatBusy, nextOrderKey, orderChats, type ChatOrderFacts } from './chatOrder'
+import { extractCodexReasoning } from './codexGroup'
 import type { AgentOutcome } from './agentTree'
 import type { ApprovalRecord, FleetSite, HistoryItem, HistoryPage, HubEvent, ProfileInfo, ProjectInfo, ScanResult, SessionRecord, UsageSnapshot } from './api'
 
@@ -1779,7 +1780,18 @@ export class HubStore {
       this.upsertCodexText(view, ts, item.id as string, (item.text as string) ?? '', false)
     } else if (type === 'reasoning') {
       view.sawReasoning = true
-      this.push(view, { kind: 'reasoning', ts, text: (item.text as string) ?? '(reasoning)' })
+      // The reasoning text lives in the item's `summary`/`content` ARRAYS, not a flat `text` — and the
+      // app-server only fills them when the turn asked for a reasoning summary (see the adapter note in
+      // codexGroup.ts / the report). extractCodexReasoning returns '' for a genuinely empty row, so the
+      // UI shows an honest empty state instead of a "(reasoning)" placeholder that never gets content.
+      // Keyed by the item id so a later item/started/completed for the same reasoning replaces, not dups.
+      const rid = item.id as string | undefined
+      this.push(view, {
+        kind: 'reasoning',
+        ts,
+        text: extractCodexReasoning(item),
+        key: rid ? `codex:reasoning:${rid}` : undefined,
+      })
     } else if (type === 'userMessage') {
       // Ignored — the user's message is rendered from the canonical session/input event; echoing
       // Codex's own userMessage here too would duplicate it.

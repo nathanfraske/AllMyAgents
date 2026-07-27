@@ -2,6 +2,8 @@
   import { api } from './api'
   import { store } from './store.svelte'
   import ItemCard from './ItemCard.svelte'
+  import CodexActivityGroup from './CodexActivityGroup.svelte'
+  import { groupCodexItems, type CodexRenderNode } from './codexGroup'
   import ContextMeter from './ContextMeter.svelte'
   import ModelPicker from './ModelPicker.svelte'
   import TraitsControl from './TraitsControl.svelte'
@@ -73,6 +75,14 @@
   const isDraft = $derived(!!view?.draft)
   // The main transcript shows only the MAIN thread; sub-agent output lives in the agent panel.
   const mainItems = $derived((view?.items ?? []).filter((i) => !i.agentId))
+  // Codex turns emit long reasoning→command→reasoning churn before they say anything; fold consecutive
+  // activity into a single live group the way the Codex app does (see codexGroup.ts). Claude renders its
+  // own way (tool cards, sub-agent panel), so its transcript stays item-per-item, untouched.
+  const renderNodes = $derived<CodexRenderNode[]>(
+    view?.record.provider === 'codex'
+      ? groupCodexItems(mainItems)
+      : mainItems.map((item) => ({ type: 'item', id: item.key, item }))
+  )
   const model = $derived(view?.record.model ?? '')
   const options = $derived<Record<string, string>>({
     ...(view?.record.effort ? { effort: view.record.effort } : {}),
@@ -491,8 +501,14 @@
     <!-- Items produced INSIDE a spawned sub-agent are excluded here and rendered in the agent panel
          instead: a background agent's tool spam would otherwise bury the conversation you are actually
          having. `agentId` is set only for sub-agent output, so the main thread is unaffected. -->
-    {#each mainItems as item (item.key)}
-      <ItemCard {item} />
+    {#each renderNodes as node, i (node.id)}
+      {#if node.type === 'group'}
+        <!-- Only the LAST group of the trailing run is "live" while the turn is in flight — that is the
+             one still accumulating, so it is the one whose elapsed clock should tick. -->
+        <CodexActivityGroup items={node.items} {now} live={thinking && i === renderNodes.length - 1} />
+      {:else}
+        <ItemCard item={node.item} />
+      {/if}
     {/each}
     {#if view.items.length === 0 && !thinking}<div class="dim pad">{isDraft ? 'New chat — set the account, model and worktree below, then send your first message to start it.' : 'no activity yet — send a message below'}</div>{/if}
     {#if thinking}
