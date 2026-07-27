@@ -322,6 +322,38 @@ describe('New project pipeline', () => {
     expect(prompt.value).toBe('Keep this task when I review the plan.')
   })
 
+  it('lets the operator revise the completed project step without losing the configured team', async () => {
+    render(NewProjectModal, { onclose: vi.fn(), onlaunched: vi.fn() })
+    await advanceLocalDraft()
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Add starting agent' }))
+    await fireEvent.input(screen.getByLabelText('Starting prompt 1'), {
+      target: { value: 'Keep this agent while I change the project.' },
+    })
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Edit project setup' }))
+    expect(screen.getByRole('button', { name: 'Change project source' })).toBeTruthy()
+    await fireEvent.click(screen.getByRole('button', { name: 'Change project source' }))
+
+    expect((screen.getByLabelText('Project name') as HTMLInputElement).value).toBe(project.name)
+    expect((screen.getByLabelText('Working directory') as HTMLInputElement).value).toBe(project.path)
+
+    await fireEvent.input(screen.getByLabelText('Project name'), {
+      target: { value: 'Renamed control room' },
+    })
+    apiMock.validateProject.mockResolvedValueOnce({
+      valid: true,
+      name: 'Renamed control room',
+      path: project.path,
+    })
+    await fireEvent.click(screen.getByRole('button', { name: 'Continue to team' }))
+
+    expect((screen.getByLabelText('Starting prompt 1') as HTMLTextAreaElement).value).toBe(
+      'Keep this agent while I change the project.',
+    )
+    expect(screen.getByText('Renamed control room')).toBeTruthy()
+  })
+
   it.each([
     ['Step 2', false],
     ['Step 3', true],

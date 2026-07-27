@@ -68,6 +68,7 @@
   let gitGuidance = $state('')
   let environmentGuidance = $state('')
   let projectSource = $state<'local' | 'github' | 'managed'>('local')
+  let editingProjectSource = $state(false)
   let creating = $state(false)
   let createError = $state('')
   let agents = $state<StartingAgent[]>([])
@@ -81,6 +82,7 @@
   let managerSessionId = $state<string | undefined>()
   let managerPromptSent = $state(false)
   let managerError = $state<string | undefined>()
+  let projectSection = $state<HTMLElement | null>(null)
   let teamSection = $state<HTMLElement | null>(null)
   let finalizeSection = $state<HTMLElement | null>(null)
 
@@ -168,9 +170,14 @@
     }
   }
 
-  async function reveal(target: 'team' | 'finalize'): Promise<void> {
+  async function reveal(target: 'project' | 'team' | 'finalize'): Promise<void> {
     await tick()
-    const section = target === 'team' ? teamSection : finalizeSection
+    const section =
+      target === 'project'
+        ? projectSection
+        : target === 'team'
+          ? teamSection
+          : finalizeSection
     section?.scrollIntoView?.({ block: 'start' })
   }
 
@@ -194,6 +201,7 @@
       projectPath = validation.path
       githubRepository = null
       projectSource = 'local'
+      editingProjectSource = false
       step = 2
       void reveal('team')
     } catch (cause) {
@@ -225,6 +233,7 @@
     projectPath = ''
     projectDraft = { kind: 'github', name: repository.name, repository }
     projectSource = 'github'
+    editingProjectSource = false
     createError = ''
     step = 2
     void reveal('team')
@@ -240,8 +249,26 @@
     projectPath = ''
     githubRepository = null
     projectDraft = { kind: 'managed', name }
+    editingProjectSource = false
     step = 2
     void reveal('team')
+  }
+
+  function editProject(): void {
+    step = 1
+    void reveal('project')
+  }
+
+  function changeProjectSource(): void {
+    if (projectDraft) {
+      projectSource = projectDraft.kind
+      projectName = projectDraft.name
+      projectPath = projectDraft.kind === 'local' ? projectDraft.path : ''
+      githubRepository = projectDraft.kind === 'github' ? projectDraft.repository : null
+    }
+    editingProjectSource = true
+    createError = ''
+    void reveal('project')
   }
 
   function review(): void {
@@ -612,7 +639,7 @@
   </nav>
 
   <div class="body scroll">
-    <section class="step project-step" class:complete={Boolean(projectDraft)}>
+    <section class="step project-step" class:complete={Boolean(projectDraft)} bind:this={projectSection}>
       <div class="step-head">
         <div>
           <span class="step-number">STEP 1</span>
@@ -622,13 +649,13 @@
           <div class="step-status">
             <span class="ready"><Icon name="check" size={14} /> Project draft ready</span>
             {#if step !== 1}
-              <button class="edit-step" aria-label="Edit project setup" onclick={() => (step = 1)}>Edit</button>
+              <button class="edit-step" aria-label="Edit project setup" onclick={editProject}>Edit</button>
             {/if}
           </div>
         {/if}
       </div>
 
-      {#if projectDraft}
+      {#if projectDraft && !editingProjectSource}
         <div class="project-summary">
           <div>
             <b>{projectDraft.name}</b>
@@ -655,6 +682,7 @@
             </label>
           </div>
           <div class="footer-actions">
+            <button class="secondary" aria-label="Change project source" onclick={changeProjectSource}>Change source</button>
             <button class="primary" onclick={editTeam}>Continue to team</button>
           </div>
         {:else if gitGuidance || environmentGuidance}
@@ -719,12 +747,19 @@
         </div>
 
         {#if createError}<div class="error" role="alert">{createError}</div>{/if}
-        {#if projectSource === 'local'}
-          <button class="primary" onclick={continueLocalDraft} disabled={creating}>
-            {creating ? 'Checking directory…' : 'Continue to team'}
-          </button>
-        {:else if projectSource === 'managed'}
-          <button class="primary" onclick={continueManagedDraft}>Continue to team</button>
+        {#if projectDraft || projectSource !== 'github'}
+          <div class="footer-actions">
+            {#if projectDraft}
+              <button class="secondary" onclick={() => (editingProjectSource = false)}>Keep current project</button>
+            {/if}
+            {#if projectSource === 'local'}
+              <button class="primary" onclick={continueLocalDraft} disabled={creating}>
+                {creating ? 'Checking directory…' : 'Continue to team'}
+              </button>
+            {:else if projectSource === 'managed'}
+              <button class="primary" onclick={continueManagedDraft}>Continue to team</button>
+            {/if}
+          </div>
         {/if}
       {/if}
     </section>
@@ -869,7 +904,7 @@
 
           {#if teamError}<div class="error" role="alert">{teamError}</div>{/if}
           <div class="footer-actions">
-            <button class="secondary" onclick={() => (step = 1)}>Back</button>
+            <button class="secondary" onclick={editProject}>Back</button>
             <button class="primary" onclick={review}>Review and finalize</button>
           </div>
         </div>
