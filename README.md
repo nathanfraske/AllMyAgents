@@ -69,7 +69,25 @@ curl -fsSL https://raw.githubusercontent.com/nathanfraske/AllMyAgents/main/scrip
 
 It picks the right build for your Mac (Apple Silicon or Intel), installs to `/Applications`, and the app then opens normally — no Gatekeeper dialog and no extra steps. It also puts an `allmyagents` command on your PATH; if the directory it chose is not already on your PATH it prints the exact line to add and offers to add it for you.
 
-To remove everything it installed, including the PATH line: `bash install-macos.sh --uninstall`.
+### Uninstalling
+
+Dragging **AllMyAgents** from Applications to the Trash removes the app, which is what most Mac apps mean by uninstalling. It leaves three things behind, because they are yours rather than the app's:
+
+```bash
+rm -rf ~/Library/Application\ Support/AllMyAgents              # chats, config, worktrees, and your vendor logins
+rm -rf ~/Library/Application\ Support/direct.cec.allmyagents   # the hub's own code and logs (regenerable)
+rm -f  /usr/local/bin/allmyagents ~/.local/bin/allmyagents     # the `allmyagents` command, if it was installed
+```
+
+The first path is the one that matters: it holds `profiles/`, and that is where your Claude and Codex logins live. Deleting the app alone leaves them on disk.
+
+To have the installer do all of it — including removing the PATH line it added — run it the same way you installed it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nathanfraske/AllMyAgents/main/scripts/install-macos.sh | bash -s -- --uninstall
+```
+
+`bash -s --` is what forwards the flag to a script arriving on a pipe. The install command above leaves no file on your disk, so there is no local `install-macos.sh` to invoke — earlier versions of this README told you to run one, which never worked for anyone who installed the documented way.
 
 <details>
 <summary>Why a command instead of just the .dmg</summary>
