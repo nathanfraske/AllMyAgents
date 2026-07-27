@@ -53,7 +53,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Same reason the Windows job can build: otherwise this can only ever test the LAST RELEASE, so a
+      # fix cannot be verified before it ships and the loop becomes cut-a-release-and-ask-a-tester. That
+      # is how a Windows-only spawn bug survived a release, and macOS deserves the same gate.
+      - name: Install toolchain (source build)
+        if: github.event.inputs.source == 'true'
+        uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        if: github.event.inputs.source == 'true'
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        if: github.event.inputs.source == 'true'
+      - uses: swatinem/rust-cache@v2
+        if: github.event.inputs.source == 'true'
+        with:
+          workspaces: 'apps/desktop/src-tauri -> target'
+
+      - name: Build and install from THIS commit
+        if: github.event.inputs.source == 'true'
+        env:
+          # Reproduces what release.yml does with no Developer ID secret, so the bundle is sealed the
+          # same way a shipped one is.
+          APPLE_SIGNING_IDENTITY: '-'
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm --filter desktop exec tauri build --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          APP="$(ls -d apps/desktop/src-tauri/target/release/bundle/macos/*.app | head -n1)"
+          rm -rf /Applications/AllMyAgents.app
+          cp -R "$APP" /Applications/
+          # A locally built bundle carries no quarantine, which is the same state the curl installer
+          # produces — so this tests the real post-install condition rather than a friendlier one.
+          xattr -dr com.apple.quarantine /Applications/AllMyAgents.app 2>/dev/null || true
+
       - name: Install from the release, exactly as a user would
+        if: github.event.inputs.source != 'true'
         env:
           AMA_TAG: ${{ github.event.inputs.tag }}
           # CI shares runner IPs and re-runs often, so the unauthenticated 60/hour GitHub limit is hit
