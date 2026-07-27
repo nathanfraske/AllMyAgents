@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { extractText, getDocumentProxy } from 'unpdf'
 import type { Provider } from './types.js'
+import { extractDocxText, extractXlsxText, OfficeExtractionError } from './officeDocuments.js'
 
 export interface AttachmentMeta {
   id: string
@@ -21,7 +22,8 @@ const MAX_PDF_PAGES = 500
 const MAX_PDF_IMAGE_PIXELS = 16_777_216
 
 const ATTACHMENT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-const OFFICE_DOCUMENT_EXTENSIONS = new Set(['.docx', '.xlsx'])
+const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 const TEXT_DOCUMENT_EXTENSIONS = new Set([
   '.txt',
   '.md',
@@ -148,28 +150,28 @@ export function saveAttachment(
   rawName: string,
   mime: string,
   bytes: Buffer,
-  extractedPdfText?: string
+  extractedText?: string
 ): AttachmentMeta {
   const root = secureUploadRoot(cwd, true)!
   const name = safeAttachmentName(rawName)
   const id = crypto.randomUUID()
   const file = path.resolve(root, `${id}-${name}`)
   const sidecar = path.resolve(root, `${id}.json`)
-  const pdfTextFile = path.resolve(root, `${id}.pdf.txt`)
+  const extractedTextFile = path.resolve(root, `${id}.extracted.txt`)
   // The sanitized basename is NOT trusted. Resolve both paths and prove containment immediately before
   // writing so a future sanitizer regression cannot turn an upload into an arbitrary filesystem write.
-  if (!isInside(root, file) || !isInside(root, sidecar) || !isInside(root, pdfTextFile)) {
+  if (!isInside(root, file) || !isInside(root, sidecar) || !isInside(root, extractedTextFile)) {
     throw new Error('attachment path escaped upload root')
   }
   const meta: AttachmentMeta = { id, name, mime, size: bytes.length, path: file }
   fs.writeFileSync(file, bytes, { flag: 'wx' })
   try {
-    if (extractedPdfText !== undefined) fs.writeFileSync(pdfTextFile, extractedPdfText, { flag: 'wx' })
+    if (extractedText !== undefined) fs.writeFileSync(extractedTextFile, extractedText, { flag: 'wx' })
     fs.writeFileSync(sidecar, JSON.stringify({ ...meta, sessionId }), { flag: 'wx' })
   } catch (err) {
     // The payload was created by this call and has no reachable id without its sidecar.
     fs.rmSync(file, { force: true })
-    fs.rmSync(pdfTextFile, { force: true })
+    fs.rmSync(extractedTextFile, { force: true })
     throw err
   }
   return meta
@@ -181,6 +183,15 @@ function attachmentExtension(name: string): string {
 
 export function isPdfAttachment(attachment: Pick<AttachmentMeta, 'name' | 'mime'>): boolean {
   return attachment.mime === 'application/pdf' || attachmentExtension(attachment.name) === '.pdf'
+}
+
+export function officeAttachmentKind(
+  attachment: Pick<AttachmentMeta, 'name' | 'mime'>
+): 'docx' | 'xlsx' | undefined {
+  const extension = attachmentExtension(attachment.name)
+  if (extension === '.docx' || attachment.mime === DOCX_MIME) return 'docx'
+  if (extension === '.xlsx' || attachment.mime === XLSX_MIME) return 'xlsx'
+  return undefined
 }
 
 export function isTextAttachment(attachment: Pick<AttachmentMeta, 'name' | 'mime'>): boolean {
@@ -225,9 +236,9 @@ async function extractPdfText(bytes: Buffer, name: string): Promise<string> {
 }
 
 /**
- * Validate vendor delivery before an upload becomes reachable. `.docx`/`.xlsx` extraction and
- * rasterising scanned PDF pages are deliberately deferred: accepting either without deliverable content
- * would recreate the silent vendor asymmetry this boundary exists to prevent.
+ * Validate vendor delivery before an upload becomes reachable. Rasterising scanned PDF pages remains
+ * deliberately deferred: accepting one without deliverable content would recreate the silent vendor
+ * asymmetry this boundary exists to prevent.
  */
 export async function prepareAttachment(
   provider: Provider,
@@ -238,13 +249,19 @@ export async function prepareAttachment(
   bytes: Buffer
 ): Promise<AttachmentMeta> {
   const name = safeAttachmentName(rawName)
-  const extension = attachmentExtension(name)
-  if (OFFICE_DOCUMENT_EXTENSIONS.has(extension)) {
-    throw new AttachmentInputError(`${extension.slice(1).toUpperCase()} extraction is not supported in this release`)
-  }
   if (isPdfAttachment({ name, mime })) {
     const text = provider === 'codex' ? await extractPdfText(bytes, name) : undefined
     return saveAttachment(sessionId, cwd, name, mime, bytes, text)
+  }
+  const officeKind = officeAttachmentKind({ name, mime })
+  if (officeKind) {
+    try {
+      const text = officeKind === 'docx' ? extractDocxText(bytes) : extractXlsxText(bytes)
+      return saveAttachment(sessionId, cwd, name, mime, bytes, text)
+    } catch (err) {
+      if (!(err instanceof OfficeExtractionError)) throw err
+      throw new AttachmentInputError(`Could not extract ${officeKind.toUpperCase()} ${name}: ${err.message}`)
+    }
   }
   if (isClaudeImageMime(mime)) return saveAttachment(sessionId, cwd, name, mime, bytes)
   if (isTextAttachment({ name, mime })) {
@@ -252,7 +269,7 @@ export async function prepareAttachment(
     return saveAttachment(sessionId, cwd, name, mime, bytes)
   }
   throw new AttachmentInputError(
-    `Unsupported attachment type for ${name}; use PNG, JPEG, GIF, WebP, PDF, or a UTF-8 text/source file`
+    `Unsupported attachment type for ${name}; use PNG, JPEG, GIF, WebP, PDF, DOCX, XLSX, or a UTF-8 text/source file`
   )
 }
 
@@ -274,14 +291,14 @@ function verifiedSiblingFile(attachment: AttachmentMeta, suffix: string): string
  * Convert a text-family upload into one vendor-neutral prompt block. Large documents stay on disk so
  * both agents can inspect them with file tools without consuming an entire model context window.
  */
-export function documentTextBlock(attachment: AttachmentMeta, pdfText = false): string {
-  const file = pdfText ? verifiedSiblingFile(attachment, '.pdf.txt') : attachment.path
+export function documentTextBlock(attachment: AttachmentMeta, extractedText = false): string {
+  const file = extractedText ? verifiedSiblingFile(attachment, '.extracted.txt') : attachment.path
   const size = fs.statSync(file).size
   if (size > MAX_INLINE_DOCUMENT_BYTES) {
     return `Attached document ${JSON.stringify(attachment.name)} is available at ${file}. Read that file before answering.`
   }
   const text = fs.readFileSync(file, 'utf8')
-  const label = pdfText ? 'Extracted PDF text' : 'Attached document'
+  const label = extractedText ? 'Extracted document text' : 'Attached document'
   return `[${label}: ${JSON.stringify(attachment.name)}]\n${text}\n[End ${label.toLowerCase()}]`
 }
 

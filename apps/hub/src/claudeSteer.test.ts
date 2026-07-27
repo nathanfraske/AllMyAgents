@@ -112,6 +112,47 @@ describe('ClaudeDriver mid-turn steering', () => {
     fs.rmSync(tmp, { recursive: true, force: true })
   })
 
+  it('delivers extracted DOCX and XLSX content as text instead of dropping either format', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-claude-office-attachments-'))
+    const fixtures = [
+      {
+        id: '00000000-0000-4000-8000-000000000001',
+        name: 'brief.docx',
+        mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        text: 'CLAUDE_DOCX_ATTACHMENT',
+      },
+      {
+        id: '00000000-0000-4000-8000-000000000002',
+        name: 'workbook.xlsx',
+        mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        text: '# Sheet: Data\nName,Value\nCLAUDE_XLSX_ATTACHMENT,42',
+      },
+    ]
+    const attachments: AttachmentMeta[] = fixtures.map((fixture) => {
+      const original = path.join(tmp, `${fixture.id}-${fixture.name}`)
+      fs.writeFileSync(original, 'office zip bytes')
+      fs.writeFileSync(path.join(tmp, `${fixture.id}.extracted.txt`), fixture.text)
+      return { id: fixture.id, name: fixture.name, mime: fixture.mime, size: 16, path: original }
+    })
+    const driver = new ClaudeDriver('/tmp/profile', '/tmp/cwd', () => {})
+    const turn = (
+      driver as unknown as {
+        send(text: string, options: object, attachments: AttachmentMeta[]): Promise<void>
+      }
+    ).send('Use the Office documents', {}, attachments)
+    const iterator = (capturedPrompt as CapturedPrompt)[Symbol.asyncIterator]()
+    const first = await iterator.next()
+    const content = JSON.stringify(first.value?.message.content)
+
+    expect(content).toContain('CLAUDE_DOCX_ATTACHMENT')
+    expect(content).toContain('CLAUDE_XLSX_ATTACHMENT')
+    expect(content).not.toContain('base64')
+
+    finishTurn?.()
+    await turn
+    fs.rmSync(tmp, { recursive: true, force: true })
+  })
+
   it('opens the SDK query with a streaming prompt and sends steering input at the next tool boundary', async () => {
     const driver = new ClaudeDriver('/tmp/profile', '/tmp/cwd', () => {})
     const turn = driver.send('initial task')

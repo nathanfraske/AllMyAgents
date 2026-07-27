@@ -32,6 +32,7 @@ import {
   isTextAttachment,
   isClaudeImageMime,
   loadAttachment,
+  officeAttachmentKind,
   prepareAttachment,
   resolveAttachments,
   type AttachmentMeta,
@@ -789,10 +790,14 @@ export class SessionManager {
   private attachmentsFor(record: SessionRecord, ids: readonly string[] = []): AttachmentMeta[] {
     const attachments = resolveAttachments(record.id, record.cwd, ids)
     for (const attachment of attachments) {
-      const common = isClaudeImageMime(attachment.mime) || isPdfAttachment(attachment) || isTextAttachment(attachment)
+      const common =
+        isClaudeImageMime(attachment.mime) ||
+        isPdfAttachment(attachment) ||
+        isTextAttachment(attachment) ||
+        officeAttachmentKind(attachment)
       if (!common) {
         throw new AttachmentInputError(
-          `Unsupported attachment type for ${attachment.name}; use PNG, JPEG, GIF, WebP, PDF, or a UTF-8 text/source file`
+          `Unsupported attachment type for ${attachment.name}; use PNG, JPEG, GIF, WebP, PDF, DOCX, XLSX, or a UTF-8 text/source file`
         )
       }
     }

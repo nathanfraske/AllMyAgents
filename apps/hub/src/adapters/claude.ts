@@ -5,6 +5,7 @@ import {
   isClaudeImageMime,
   isPdfAttachment,
   isTextAttachment,
+  officeAttachmentKind,
   type AttachmentMeta,
 } from '../attachments.js'
 
@@ -77,6 +78,8 @@ function userMessage(text: string, attachments: readonly AttachmentMeta[] = [], 
           data: fs.readFileSync(attachment.path).toString('base64'),
         },
       })
+    } else if (officeAttachmentKind(attachment)) {
+      content.push({ type: 'text', text: documentTextBlock(attachment, true) })
     } else if (isTextAttachment(attachment)) {
       content.push({ type: 'text', text: documentTextBlock(attachment) })
     } else {

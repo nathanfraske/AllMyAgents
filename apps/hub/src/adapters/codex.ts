@@ -8,6 +8,7 @@ import {
   documentTextBlock,
   isPdfAttachment,
   isTextAttachment,
+  officeAttachmentKind,
   type AttachmentMeta,
 } from '../attachments.js'
 
@@ -154,6 +155,8 @@ function turnInput(text: string, attachments: readonly AttachmentMeta[]): Array<
       input.push({ type: 'text', text: documentTextBlock(attachment, true) })
     } else if (attachment.mime.startsWith('image/')) {
       input.push({ type: 'localImage', path: attachment.path })
+    } else if (officeAttachmentKind(attachment)) {
+      input.push({ type: 'text', text: documentTextBlock(attachment, true) })
     } else if (isTextAttachment(attachment)) {
       input.push({ type: 'text', text: documentTextBlock(attachment) })
     } else {

@@ -21,6 +21,7 @@ import { WorkspaceManager } from './workspace.js'
 import { MAX_IMAGE_BYTES } from './attachments.js'
 import type { AttachmentMeta } from './attachments.js'
 import { CodexClient } from './adapters/codex.js'
+import { strToU8, zipSync } from 'fflate'
 
 const cleanups: Array<() => void | Promise<void>> = []
 
@@ -47,6 +48,90 @@ function textPdf(text: string): Buffer {
   pdf += offsets.slice(1).map((offset) => `${String(offset).padStart(10, '0')} 00000 n \n`).join('')
   pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`
   return Buffer.from(pdf)
+}
+
+function twoSheetXlsx(): Buffer {
+  const files: Record<string, Uint8Array> = {
+    '[Content_Types].xml': strToU8(
+      '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+      '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+      '<Default Extension="xml" ContentType="application/xml"/>' +
+      '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
+      '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' +
+      '<Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' +
+      '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>' +
+      '</Types>'
+    ),
+    '_rels/.rels': strToU8(
+      '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+      '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>' +
+      '</Relationships>'
+    ),
+    'xl/workbook.xml': strToU8(
+      '<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ' +
+      'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>' +
+      '<sheet name="Inventory" sheetId="1" r:id="rId1"/>' +
+      '<sheet name="Forecast" sheetId="2" r:id="rId2"/>' +
+      '</sheets></workbook>'
+    ),
+    'xl/_rels/workbook.xml.rels': strToU8(
+      '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+      '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>' +
+      '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>' +
+      '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>' +
+      '</Relationships>'
+    ),
+    'xl/sharedStrings.xml': strToU8(
+      '<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+      '<si><t>Product</t></si><si><t>Qty</t></si><si><t>Widget</t></si><si><t>Comma, item</t></si>' +
+      '<si><t>Month</t></si><si><t>Revenue</t></si><si><t>Jan</t></si><si><t>Feb</t></si>' +
+      '<si><r><t>Rich</t></r><r><t> Text</t></r></si></sst>'
+    ),
+    'xl/worksheets/sheet1.xml': strToU8(
+      '<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' +
+      '<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row>' +
+      '<row r="2"><c r="A2" t="s"><v>2</v></c><c r="B2"><v>12</v></c></row>' +
+      '<row r="3"><c r="A3" t="s"><v>3</v></c><c r="B3"><v>5</v></c></row>' +
+      '</sheetData></worksheet>'
+    ),
+    'xl/worksheets/sheet2.xml': strToU8(
+      '<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' +
+      '<row r="1"><c r="A1" t="s"><v>4</v></c><c r="B1" t="s"><v>5</v></c></row>' +
+      '<row r="2"><c r="A2" t="s"><v>6</v></c><c r="B2"><v>1000</v></c></row>' +
+      '<row r="3"><c r="A3" t="s"><v>7</v></c><c r="B3"><v>1250</v></c></row>' +
+      '<row r="4"><c r="C4" t="s"><v>8</v></c></row>' +
+      '</sheetData></worksheet>'
+    ),
+  }
+  return Buffer.from(zipSync(files, { level: 6 }))
+}
+
+function orderedDocx(): Buffer {
+  return Buffer.from(
+    zipSync(
+      {
+        '[Content_Types].xml': strToU8(
+          '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+          '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+          '<Default Extension="xml" ContentType="application/xml"/>' +
+          '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>' +
+          '</Types>'
+        ),
+        '_rels/.rels': strToU8(
+          '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+          '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>' +
+          '</Relationships>'
+        ),
+        'word/document.xml': strToU8(
+          '<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>' +
+          '<w:p><w:r><w:t>DOCX_FIRST_RUN</w:t></w:r><w:r><w:tab/></w:r><w:r><w:t>SECOND_RUN</w:t></w:r></w:p>' +
+          '<w:p><w:r><w:t>DOCX_SECOND_PARAGRAPH</w:t></w:r></w:p>' +
+          '</w:body></w:document>'
+        ),
+      },
+      { level: 6 }
+    )
+  )
 }
 
 async function build(provider: 'claude' | 'codex' = 'claude') {
@@ -244,10 +329,11 @@ describe('session attachment API', () => {
     expect(JSON.stringify(input?.payload)).not.toContain(Buffer.from([1, 2, 3]).toString('base64'))
   })
 
-  it('delivers attached Markdown and PDF text to a Codex vendor payload', async () => {
+  it('delivers Markdown, PDF, DOCX, and multi-sheet XLSX content to a Codex vendor payload', async () => {
     const { base, record, runTurn } = await build('codex')
     const markdownText = 'CODEX_MARKDOWN_ATTACHMENT'
     const pdfText = 'CODEX_PDF_ATTACHMENT'
+    const workbookName = 'CODEX_WORKBOOK_ATTACHMENT.xlsx'
     const markdownUpload = await fetch(`${base}/api/sessions/${record.id}/attachments`, {
       method: 'POST',
       headers: { 'content-type': 'text/markdown', 'x-filename': 'notes.md' },
@@ -258,26 +344,61 @@ describe('session attachment API', () => {
       headers: { 'content-type': 'application/pdf', 'x-filename': 'spec.pdf' },
       body: new Uint8Array(textPdf(pdfText)),
     })
+    const xlsxUpload = await fetch(`${base}/api/sessions/${record.id}/attachments`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'x-filename': workbookName,
+      },
+      body: new Uint8Array(twoSheetXlsx()),
+    })
+    const docxUpload = await fetch(`${base}/api/sessions/${record.id}/attachments`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'x-filename': 'brief.docx',
+      },
+      body: new Uint8Array(orderedDocx()),
+    })
 
     expect(markdownUpload.status).toBe(200)
     expect(pdfUpload.status).toBe(200)
+    expect(xlsxUpload.status).toBe(200)
+    expect(docxUpload.status).toBe(200)
     const markdown = (await markdownUpload.json()) as AttachmentMeta
     const pdf = (await pdfUpload.json()) as AttachmentMeta
+    const xlsx = (await xlsxUpload.json()) as AttachmentMeta
+    const docx = (await docxUpload.json()) as AttachmentMeta
     const sent = await fetch(`${base}/api/sessions/${record.id}/input`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text: 'Use both documents', attachments: [markdown.id, pdf.id] }),
+      body: JSON.stringify({
+        text: 'Use all documents',
+        attachments: [markdown.id, pdf.id, xlsx.id, docx.id],
+      }),
     })
 
     expect(sent.status).toBe(200)
     const attachments = runTurn.mock.calls.at(-1)?.[3]
-    expect(attachments).toEqual([markdown, pdf])
+    expect(attachments).toEqual([markdown, pdf, xlsx, docx])
     const client = new CodexClient('unused', vi.fn())
     const request = vi.spyOn(client, 'request').mockResolvedValue(undefined)
-    await client.sendTurn('thread-1', 'Use both documents', {}, attachments)
+    await client.sendTurn('thread-1', 'Use all documents', {}, attachments)
     const payload = request.mock.calls.at(-1)?.[1]
-    expect(JSON.stringify(payload)).toContain(markdownText)
-    expect(JSON.stringify(payload)).toContain(pdfText)
+    const vendorText = (payload as { input: Array<{ text?: string }> }).input
+      .map((item) => item.text ?? '')
+      .join('\n')
+    expect(vendorText).toContain(markdownText)
+    expect(vendorText).toContain(pdfText)
+    expect(vendorText).toContain('# Sheet: Inventory')
+    expect(vendorText).toContain('Product,Qty')
+    expect(vendorText).toContain('"Comma, item",5')
+    expect(vendorText).toContain('# Sheet: Forecast')
+    expect(vendorText).toContain('Month,Revenue')
+    expect(vendorText).toContain('Feb,1250')
+    expect(vendorText).toContain(',,Rich Text')
+    expect(vendorText).toContain('DOCX_FIRST_RUN\tSECOND_RUN')
+    expect(vendorText).toContain('DOCX_SECOND_PARAGRAPH')
   })
 
   it('rejects a Codex PDF with no text layer at upload time', async () => {
@@ -294,7 +415,7 @@ describe('session attachment API', () => {
     })
   })
 
-  it('declines Office documents explicitly instead of accepting an undeliverable attachment', async () => {
+  it('rejects a malformed Office archive instead of accepting an undeliverable attachment', async () => {
     const { base, record } = await build('codex')
     const upload = await fetch(`${base}/api/sessions/${record.id}/attachments`, {
       method: 'POST',
@@ -307,7 +428,31 @@ describe('session attachment API', () => {
 
     expect(upload.status).toBe(400)
     await expect(upload.json()).resolves.toEqual({
-      error: expect.stringMatching(/DOCX extraction is not supported in this release/i),
+      error: expect.stringMatching(/Could not extract DOCX.*invalid or unsupported Office ZIP archive/i),
+    })
+  })
+
+  it('rejects an Office ZIP whose selected XML expands beyond the independent safety cap', async () => {
+    const { base, record } = await build('codex')
+    const archive = Buffer.from(
+      zipSync(
+        { 'word/document.xml': new Uint8Array(25 * 1024 * 1024 + 1).fill(65) },
+        { level: 9 }
+      )
+    )
+    expect(archive.length).toBeLessThan(10 * 1024 * 1024)
+    const upload = await fetch(`${base}/api/sessions/${record.id}/attachments`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'x-filename': 'zip-bomb.docx',
+      },
+      body: new Uint8Array(archive),
+    })
+
+    expect(upload.status).toBe(400)
+    await expect(upload.json()).resolves.toEqual({
+      error: expect.stringMatching(/Office XML expands beyond the .* safety limit/i),
     })
   })
 
