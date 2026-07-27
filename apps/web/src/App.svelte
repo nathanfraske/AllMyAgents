@@ -7,12 +7,30 @@
   import ConfirmDialog from './lib/ConfirmDialog.svelte'
   import Dashboard from './lib/Dashboard.svelte'
   import ProjectView from './lib/ProjectView.svelte'
+  import NewProjectModal, { type ProjectLaunchResult } from './lib/NewProjectModal.svelte'
   import Titlebar from './lib/Titlebar.svelte'
   import UpdateBanner from './lib/UpdateBanner.svelte'
+  import type { ProjectInfo } from './lib/api'
   import { cubicOut } from 'svelte/easing'
   import type { TransitionConfig } from 'svelte/transition'
 
   void store.init()
+
+  let newProjectOpen = $state(false)
+
+  function projectLaunchSettled(result: ProjectLaunchResult): void {
+    // Keep this modal mounted over the Project View only when failures remain, because this is also
+    // where retry lives. A complete or zero-agent launch lands directly on the overview.
+    store.openProjectView(result.project.id)
+    if (result.failed.length === 0) newProjectOpen = false
+  }
+
+  function configureProjectManager(project: ProjectInfo): void {
+    // ManagerSetupModal is a separate, higher-z modal. Put the just-created project first so its current
+    // create-manager flow preselects the hand-off target, then return to this still-mounted pipeline.
+    store.projects = [project, ...store.projects.filter((item) => item.id !== project.id)]
+    store.openManagerSetup()
+  }
 
   // Mirror the open layout (selected chat + split panes) to localStorage on every change, so the
   // next launch can OFFER to reopen it. Reading both here makes the effect reactive; the store only
@@ -297,7 +315,7 @@
       {#if store.dragSession}
         <div class="empty dropping">drop to open this chat</div>
       {:else}
-        <Dashboard />
+        <Dashboard onnewproject={() => (newProjectOpen = true)} />
       {/if}
     {:else}
       <div class="panes" bind:this={panesEl}>
@@ -347,6 +365,14 @@
 {/if}
 {#if store.managerSetupOpen}
   <ManagerSetupModal onclose={() => store.closeManagerSetup()} />
+{/if}
+{#if newProjectOpen}
+  <NewProjectModal
+    onclose={() => (newProjectOpen = false)}
+    onlaunched={projectLaunchSettled}
+    onconfiguremanager={configureProjectManager}
+    suspended={store.managerSetupOpen}
+  />
 {/if}
 {#if store.needsPairing}
   <div class="pairing-overlay">
