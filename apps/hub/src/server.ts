@@ -169,6 +169,24 @@ setInterval(refreshUsage, 30000)
 </html>`
 
 function json(res: http.ServerResponse, value: unknown, status = 200): void {
+  // A SECOND RESPONSE FOR ONE REQUEST MUST NOT KILL THE HUB.
+  //
+  // writeHead on a response that already sent headers throws ERR_HTTP_HEADERS_SENT. Thrown from inside a
+  // request handler that is not awaited by anything, Node treats it as an uncaught exception and ends the
+  // process — so one malformed exchange took down the whole hub, and with it every agent in the fleet.
+  //
+  // That is not hypothetical. It happened on the operator's machine: a handler streamed a response and the
+  // catch-all then tried to write a JSON error over it, the hub exited code 1, and because that build
+  // predated hubctl's reviveLiveHub the supervisor exited too. The app sat there with no hub, no error and
+  // no recovery. Today's supervisor would respawn it — but a hub that survives is better than a hub that
+  // is resurrected, because the resurrection still drops every in-flight turn.
+  //
+  // Double-responding is a bug wherever it happens, and this guard does not hide it: the request is
+  // already answered, so the caller has its result, and the stray second write is what gets dropped.
+  if (res.headersSent) {
+    res.destroy()
+    return
+  }
   res.writeHead(status, { 'content-type': 'application/json' })
   res.end(JSON.stringify(value))
 }
