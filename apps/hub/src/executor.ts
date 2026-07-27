@@ -89,6 +89,10 @@ export const AUTO_ALLOW_TOOLS = new Set([
   'mcp__allmyagents__list_agents',
   'mcp__allmyagents__send_message',
   'mcp__allmyagents__read_messages',
+  'mcp__allmyagents__peek_agent',
+  'mcp__allmyagents__child_status',
+  'mcp__allmyagents__spawn_agent',
+  'mcp__allmyagents__set_child_authority',
   'mcp__allmyagents__memory_write',
   'mcp__allmyagents__memory_search',
   'mcp__allmyagents__memory_read',
@@ -133,7 +137,34 @@ export interface InProcessExecutorHubHooks {
   busSend(fromSessionId: string, to: BusAddress, subject: string | undefined, body: string): { ok: boolean; delivered: number; error?: string }
   busInbox(sessionId: string): BusMessage[]
   busRoster(sessionId: string): { sessionId: string; label: string; provider: string; status: string }[]
-  busPeek(callerSessionId: string, targetSessionId: string): { found: boolean; summary?: string }
+  busPeek(
+    callerSessionId: string,
+    targetSessionId: string,
+    options?: {
+      view?: 'summary' | 'activity' | 'transcript' | 'changes' | 'all'
+      afterSeq?: number
+    }
+  ): { found: boolean; summary?: string }
+  managerChildStatus(managerSessionId: string): { ok: boolean; summary?: string; error?: string }
+  managerSpawn(
+    managerSessionId: string,
+    input: {
+      profileId: string
+      prompt: string
+      model?: string
+      effort?: string
+      permissionMode?: 'safe' | 'edits' | 'full'
+      useWorktree?: boolean
+      authorities?: Array<'commit' | 'push'>
+      tools?: string[]
+    }
+  ): Promise<{ ok: boolean; sessionId?: string; label?: string; error?: string }>
+  managerSetChildAuthority(
+    managerSessionId: string,
+    childSessionId: string,
+    authorities: Array<'commit' | 'push'>,
+    tools?: string[]
+  ): { ok: boolean; error?: string }
 }
 
 /**
@@ -177,7 +208,11 @@ export class InProcessExecutor implements Executor {
       send: (from, to, subject, body) => this.h.busSend(from.sessionId, to, subject, body),
       inbox: (sessionId) => this.h.busInbox(sessionId),
       roster: (sessionId) => this.h.busRoster(sessionId),
-      peek: (caller, target) => this.h.busPeek(caller, target),
+      peek: (caller, target, options) => this.h.busPeek(caller, target, options),
+      childStatus: (managerSessionId) => this.h.managerChildStatus(managerSessionId),
+      spawnAgent: (managerSessionId, input) => this.h.managerSpawn(managerSessionId, input),
+      setChildAuthority: (managerSessionId, childSessionId, authorities, tools) =>
+        this.h.managerSetChildAuthority(managerSessionId, childSessionId, authorities, tools),
       memory: this.services.memory,
       practices: this.services.practices,
       requireApproval: (id, kind, payload) => this.services.approvals.request(id.sessionId, kind, payload),

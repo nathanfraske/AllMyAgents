@@ -1057,6 +1057,42 @@ export class Journal extends EventEmitter {
   }
 
   /**
+   * Exact per-session event page for manager-owned worker inspection. Unlike `since()`, this is scoped in
+   * SQL before materialization, so inspecting one child never reads or exposes unrelated transcripts.
+   */
+  eventsForSession(
+    sessionId: string,
+    afterSeq = 0,
+    limit = 200
+  ): { events: HubEvent[]; nextAfterSeq: number | null } {
+    const bounded = Math.max(1, Math.min(500, Math.floor(limit)))
+    const rows = this.db
+      .prepare(
+        'SELECT seq, ts, session, kind, payload FROM events WHERE session = ? AND seq > ? ORDER BY seq ASC LIMIT ?'
+      )
+      .all(sessionId, Math.max(0, Math.floor(afterSeq)), bounded + 1) as Array<{
+        seq: number
+        ts: string
+        session: string | null
+        kind: string
+        payload: string
+      }>
+    const hasMore = rows.length > bounded
+    const page = hasMore ? rows.slice(0, bounded) : rows
+    const events = page.map((row) => ({
+      seq: row.seq,
+      ts: row.ts,
+      sessionId: row.session,
+      kind: row.kind,
+      payload: parsePayload(row.payload, row.seq),
+    }))
+    return {
+      events,
+      nextAfterSeq: hasMore ? (events.at(-1)?.seq ?? null) : null,
+    }
+  }
+
+  /**
    * Replay EVERY event with seq > `seq`, in ascending order, exactly once, paging through the DB
    * in bounded chunks (`pageSize`) so an arbitrarily large journal is never materialized as a
    * single result set. `since()` alone caps at `pageSize` rows — a lone call silently drops the

@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { defaultHomeProfiles, isManagedProfile } from './profiles.js'
@@ -10,7 +11,14 @@ import type { ProjectStore } from './projects.js'
 import type { SessionStore } from './store.js'
 import type { UsageMonitor } from './usage.js'
 import type { WorkspaceManager } from './workspace.js'
-import type { ClaudeLimitInfo, Profile, Provider, SessionRecord, SessionStatus } from './types.js'
+import type {
+  ClaudeLimitInfo,
+  DelegatedAuthority,
+  Profile,
+  Provider,
+  SessionRecord,
+  SessionStatus,
+} from './types.js'
 import { writeManagedInstructions, agentContract } from './instructions.js'
 import type { InstructionStore } from './instructions.js'
 import { identityOf, readableScopes, type SessionIdentity } from './identity.js'
@@ -50,6 +58,10 @@ export interface CreateOptions {
   // When spawning into a git project: create an isolated worktree (default), or set false to
   // work directly in the project directory.
   useWorktree?: boolean
+  /** Hub-internal lineage. The public create route never accepts these fields. */
+  parentSessionId?: string
+  delegatedAuthorities?: DelegatedAuthority[]
+  delegatedTools?: string[]
 }
 
 export interface TurnOverride {
@@ -69,6 +81,7 @@ export type SessionApiRecord = SessionRecord & {
 // between turns without stalling a genuinely long turn indefinitely. HUB_RESTART_MAX_DEFER_MS overrides it —
 // the restart-survival acceptance test shrinks it to force a squarely-mid-turn flip; unset → 120s as before.
 export const RESTART_MAX_DEFER_MS = Number(process.env.HUB_RESTART_MAX_DEFER_MS ?? 120_000)
+export const MANAGER_STALL_MS = 5 * 60 * 1000
 
 export class SessionManager {
   private readonly sessions = new Map<string, SessionRecord>()
@@ -111,6 +124,8 @@ export class SessionManager {
   // One lightweight "mail is waiting" steer at most per turn when full-message steering is disabled.
   // The journal carries the cross-hub fence; this Set keeps later messages in the same process query-free.
   private readonly busNoticeTurns = new Set<string>()
+  /** One silence watchdog per active managed child; timers are unref'd and emit at most one stall report. */
+  private readonly managerStallTimers = new Map<string, NodeJS.Timeout>()
   // Codex profiles whose config.toml `[mcp_servers.allmyagents]` we've already (re)written this boot —
   // so the lazy per-profile materialization (ensureCodexMcpConfig, driven from specOf/readCodexLimits) is
   // written once before the app-server starts, not re-read+rewritten on every turn.
@@ -190,7 +205,12 @@ export class SessionManager {
       busSend: (fromSessionId, to, subject, body) => this.busSend(fromSessionId, to, subject, body),
       busInbox: (sessionId) => this.busInbox(sessionId),
       busRoster: (sessionId) => this.busRoster(sessionId),
-      busPeek: (callerSessionId, targetSessionId) => this.busPeek(callerSessionId, targetSessionId),
+      busPeek: (callerSessionId, targetSessionId, options) =>
+        this.busPeek(callerSessionId, targetSessionId, options),
+      managerChildStatus: (managerSessionId) => this.managerChildStatus(managerSessionId),
+      managerSpawn: (managerSessionId, input) => this.managerSpawn(managerSessionId, input),
+      managerSetChildAuthority: (managerSessionId, childSessionId, authorities, tools) =>
+        this.managerSetChildAuthority(managerSessionId, childSessionId, authorities, tools),
     }
   }
 
@@ -364,8 +384,42 @@ export class SessionManager {
       case 'bus.roster':
         return this.busRoster((args as { sessionId: string }).sessionId)
       case 'bus.peek': {
-        const a = args as { caller: string; target: string }
-        return this.busPeek(a.caller, a.target)
+        const a = args as {
+          caller: string
+          target: string
+          options?: {
+            view?: 'summary' | 'activity' | 'transcript' | 'changes' | 'all'
+            afterSeq?: number
+          }
+        }
+        return this.busPeek(a.caller, a.target, a.options)
+      }
+      case 'manager.childStatus':
+        return this.managerChildStatus((args as { managerSessionId: string }).managerSessionId)
+      case 'manager.spawn': {
+        const a = args as {
+          managerSessionId: string
+          input: {
+            profileId: string
+            prompt: string
+            model?: string
+            effort?: string
+            permissionMode?: 'safe' | 'edits' | 'full'
+            useWorktree?: boolean
+            authorities?: DelegatedAuthority[]
+            tools?: string[]
+          }
+        }
+        return this.managerSpawn(a.managerSessionId, a.input)
+      }
+      case 'manager.setChildAuthority': {
+        const a = args as {
+          managerSessionId: string
+          childSessionId: string
+          authorities: DelegatedAuthority[]
+          tools?: string[]
+        }
+        return this.managerSetChildAuthority(a.managerSessionId, a.childSessionId, a.authorities, a.tools)
       }
       case 'memory.write':
         return this.memory.write(args as Parameters<MemoryStore['write']>[0])
@@ -515,7 +569,11 @@ export class SessionManager {
       send: (from, to, subject, body) => this.busSend(from.sessionId, to, subject, body),
       inbox: (sessionId) => this.busInbox(sessionId),
       roster: (sessionId) => this.busRoster(sessionId),
-      peek: (caller, target) => this.busPeek(caller, target),
+      peek: (caller, target, options) => this.busPeek(caller, target, options),
+      childStatus: (managerSessionId) => this.managerChildStatus(managerSessionId),
+      spawnAgent: (managerSessionId, input) => this.managerSpawn(managerSessionId, input),
+      setChildAuthority: (managerSessionId, childSessionId, authorities, tools) =>
+        this.managerSetChildAuthority(managerSessionId, childSessionId, authorities, tools),
       memory: this.memory,
       practices: this.practices,
       requireApproval: (id, kind, payload) => this.approvals.request(id.sessionId, kind, payload),
@@ -802,6 +860,293 @@ export class SessionManager {
     }))
   }
 
+  /**
+   * Operator-only role boundary. No agent tool calls this method; the HTTP control route supplies the
+   * literal `operator` actor. Keeping the actor check here as well means a future caller cannot
+   * accidentally turn the route into a model capability by reusing the method without the boundary.
+   */
+  configureProjectManager(
+    sessionId: string,
+    config: {
+      enabled: boolean
+      maxLiveChildren?: number
+      delegation?: DelegatedAuthority[]
+      allowedProfiles?: string[]
+      allowedModels?: Record<string, string[]>
+      allowedTools?: string[]
+    },
+    actor: 'operator' | 'agent'
+  ): SessionRecord {
+    if (actor !== 'operator') throw new Error('only the operator can grant or revoke the project-manager role')
+    const record = this.sessions.get(sessionId)
+    if (!record) throw new Error(`unknown session: ${sessionId}`)
+
+    const requested = normalizeAuthorities(config.delegation)
+    if (config.delegation && requested.length !== new Set(config.delegation).size) {
+      throw new Error('delegation contains an unknown authority')
+    }
+    const max = config.maxLiveChildren ?? record.managerMaxLiveChildren ?? 4
+    if (!Number.isInteger(max) || max < 1 || max > 16) {
+      throw new Error('maxLiveChildren must be a whole number from 1 to 16')
+    }
+    const allowedProfiles = normalizeNames(
+      config.allowedProfiles ?? record.managerAllowedProfiles ?? [record.profileId]
+    )
+    const allowedModels = Object.fromEntries(
+      Object.entries(config.allowedModels ?? record.managerAllowedModels ?? {})
+        .filter(([profileId]) => allowedProfiles.includes(profileId))
+        .map(([profileId, models]) => [profileId, normalizeNames(models)])
+    )
+    const allowedTools = normalizeNames(config.allowedTools ?? record.managerAllowedTools ?? [])
+
+    const previouslyManager = record.isProjectManager === true
+    const previousCeiling = new Set(record.managerDelegation ?? [])
+    record.isProjectManager = config.enabled
+    record.managerMaxLiveChildren = config.enabled ? max : undefined
+    record.managerDelegation = config.enabled && requested.length ? requested : undefined
+    record.managerAllowedProfiles = config.enabled ? allowedProfiles : undefined
+    record.managerAllowedModels = config.enabled ? allowedModels : undefined
+    record.managerAllowedTools = config.enabled ? allowedTools : undefined
+
+    // Revocation is materialized onto every direct child now AND the approval path re-checks the live
+    // manager record on every action. Either half alone is insufficient: the first makes state legible;
+    // the second closes the mid-turn/cached-record race.
+    const ceiling = new Set(record.managerDelegation ?? [])
+    const toolCeiling = new Set(record.managerAllowedTools ?? [])
+    for (const child of this.sessions.values()) {
+      if (child.parentSessionId !== record.id) continue
+      if (child.delegatedAuthorities?.length) {
+        const next = child.delegatedAuthorities.filter((authority) => ceiling.has(authority))
+        const revoked = child.delegatedAuthorities.filter((authority) => !ceiling.has(authority))
+        if (revoked.length) {
+          child.delegatedAuthorities = next.length ? next : undefined
+          this.persist(child)
+          this.journal.append(record.id, 'manager/delegation-revoked', {
+            managerSessionId: record.id,
+            childSessionId: child.id,
+            authorities: revoked,
+            by: 'operator',
+          })
+        }
+      }
+      if (child.delegatedTools?.length) {
+        const next = child.delegatedTools.filter((tool) => toolCeiling.has(tool))
+        const revoked = child.delegatedTools.filter((tool) => !toolCeiling.has(tool))
+        if (revoked.length) {
+          child.delegatedTools = next.length ? next : undefined
+          this.persist(child)
+          this.journal.append(record.id, 'manager/tool-delegation-revoked', {
+            managerSessionId: record.id,
+            childSessionId: child.id,
+            tools: revoked,
+            by: 'operator',
+          })
+        }
+      }
+    }
+    this.persist(record)
+    this.journal.append(record.id, config.enabled ? 'manager/granted' : 'manager/revoked', {
+      managerSessionId: record.id,
+      maxLiveChildren: record.managerMaxLiveChildren ?? null,
+      delegation: record.managerDelegation ?? [],
+      allowedProfiles: record.managerAllowedProfiles ?? [],
+      allowedModels: record.managerAllowedModels ?? {},
+      allowedTools: record.managerAllowedTools ?? [],
+      by: 'operator',
+      previousRole: previouslyManager,
+      removedAuthorities: [...previousCeiling].filter((authority) => !ceiling.has(authority)),
+    })
+    return record
+  }
+
+  setChildDelegation(
+    managerSessionId: string,
+    childSessionId: string,
+    authorities: DelegatedAuthority[],
+    tools?: string[]
+  ): SessionRecord {
+    const manager = this.sessions.get(managerSessionId)
+    if (!manager?.isProjectManager) throw new Error('caller is not an operator-marked project manager')
+    const child = this.sessions.get(childSessionId)
+    if (!child || child.parentSessionId !== managerSessionId) {
+      throw new Error('authority can only be delegated to a direct child')
+    }
+    const normalized = normalizeAuthorities(authorities)
+    if (normalized.length !== new Set(authorities).size) throw new Error('delegation contains an unknown authority')
+    const ceiling = new Set(manager.managerDelegation ?? [])
+    const outside = normalized.filter((authority) => !ceiling.has(authority))
+    if (outside.length) throw new Error(`cannot delegate ${outside.join(', ')} outside the operator-granted ceiling`)
+    const normalizedTools = tools === undefined ? undefined : normalizeNames(tools)
+    if (tools !== undefined && normalizedTools!.length !== new Set(tools).size) {
+      throw new Error('tool delegation contains an invalid name')
+    }
+    const toolCeiling = new Set(manager.managerAllowedTools ?? [])
+    const outsideTools = (normalizedTools ?? []).filter((tool) => !toolCeiling.has(tool))
+    if (outsideTools.length) {
+      throw new Error(`cannot delegate tools outside the operator-granted ceiling: ${outsideTools.join(', ')}`)
+    }
+
+    const before = new Set(child.delegatedAuthorities ?? [])
+    child.delegatedAuthorities = normalized.length ? normalized : undefined
+    this.persist(child)
+    const granted = normalized.filter((authority) => !before.has(authority))
+    const revoked = [...before].filter((authority) => !normalized.includes(authority))
+    if (granted.length) {
+      this.journal.append(manager.id, 'manager/delegation-granted', {
+        managerSessionId: manager.id,
+        childSessionId: child.id,
+        authorities: granted,
+        by: manager.id,
+      })
+    }
+    if (revoked.length) {
+      this.journal.append(manager.id, 'manager/delegation-revoked', {
+        managerSessionId: manager.id,
+        childSessionId: child.id,
+        authorities: revoked,
+        by: manager.id,
+      })
+    }
+    if (tools !== undefined) {
+      const beforeTools = new Set(child.delegatedTools ?? [])
+      child.delegatedTools = normalizedTools!.length ? normalizedTools : undefined
+      this.persist(child)
+      const grantedTools = normalizedTools!.filter((tool) => !beforeTools.has(tool))
+      const revokedTools = [...beforeTools].filter((tool) => !normalizedTools!.includes(tool))
+      if (grantedTools.length) {
+        this.journal.append(manager.id, 'manager/tool-delegation-granted', {
+          managerSessionId: manager.id,
+          childSessionId: child.id,
+          tools: grantedTools,
+          by: manager.id,
+        })
+      }
+      if (revokedTools.length) {
+        this.journal.append(manager.id, 'manager/tool-delegation-revoked', {
+          managerSessionId: manager.id,
+          childSessionId: child.id,
+          tools: revokedTools,
+          by: manager.id,
+        })
+      }
+    }
+    return child
+  }
+
+  private managerSetChildAuthority(
+    managerSessionId: string,
+    childSessionId: string,
+    authorities: DelegatedAuthority[],
+    tools?: string[]
+  ): { ok: boolean; error?: string } {
+    try {
+      this.setChildDelegation(managerSessionId, childSessionId, authorities, tools)
+      return { ok: true }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  }
+
+  private async managerSpawn(
+    managerSessionId: string,
+    input: {
+      profileId: string
+      prompt: string
+      model?: string
+      effort?: string
+      permissionMode?: 'safe' | 'edits' | 'full'
+      useWorktree?: boolean
+      authorities?: DelegatedAuthority[]
+      tools?: string[]
+    }
+  ): Promise<{ ok: boolean; sessionId?: string; label?: string; error?: string }> {
+    const manager = this.sessions.get(managerSessionId)
+    if (!manager?.isProjectManager) return { ok: false, error: 'caller is not an operator-marked project manager' }
+    const max = manager.managerMaxLiveChildren
+    if (!Number.isInteger(max) || (max ?? 0) < 1) return { ok: false, error: 'manager has no valid live-child limit' }
+    const live = [...this.sessions.values()].filter(
+      (record) =>
+        record.parentSessionId === manager.id &&
+        (record.status === 'starting' || record.status === 'active' || record.status === 'idle')
+    ).length
+    if (live >= (max as number)) {
+      return { ok: false, error: `live child limit reached (${live}/${max}); stop a child or ask the operator to raise the limit` }
+    }
+    const authorities = normalizeAuthorities(input.authorities)
+    if (input.authorities && authorities.length !== new Set(input.authorities).size) {
+      return { ok: false, error: 'delegation contains an unknown authority' }
+    }
+    const ceiling = new Set(manager.managerDelegation ?? [])
+    const outside = authorities.filter((authority) => !ceiling.has(authority))
+    if (outside.length) {
+      return { ok: false, error: `cannot delegate ${outside.join(', ')} outside the operator-granted ceiling` }
+    }
+    if (!input.prompt.trim()) return { ok: false, error: 'prompt is required' }
+    if (!(manager.managerAllowedProfiles ?? []).includes(input.profileId)) {
+      return { ok: false, error: `profile ${input.profileId} is outside the operator-granted agent types` }
+    }
+    if (
+      input.model &&
+      !(manager.managerAllowedModels?.[input.profileId] ?? []).includes(input.model)
+    ) {
+      return {
+        ok: false,
+        error: `model ${input.model} is outside the operator-granted models for ${input.profileId}`,
+      }
+    }
+    const tools = normalizeNames(input.tools ?? [])
+    if (tools.length !== new Set(input.tools ?? []).size) {
+      return { ok: false, error: 'tool delegation contains an invalid name' }
+    }
+    const allowedTools = new Set(manager.managerAllowedTools ?? [])
+    const outsideTools = tools.filter((tool) => !allowedTools.has(tool))
+    if (outsideTools.length) {
+      return { ok: false, error: `cannot delegate tools outside the operator-granted ceiling: ${outsideTools.join(', ')}` }
+    }
+
+    try {
+      const child = await this.create(input.profileId, {
+        projectId: manager.projectId,
+        cwd: manager.projectId ? undefined : manager.cwd,
+        repo: manager.projectId ? undefined : manager.repo,
+        prompt: input.prompt,
+        model: input.model,
+        effort: input.effort,
+        permissionMode: input.permissionMode ?? 'safe',
+        useWorktree: input.useWorktree !== false,
+        parentSessionId: manager.id,
+        delegatedAuthorities: authorities,
+        delegatedTools: tools,
+      })
+      this.journal.append(manager.id, 'manager/child-spawned', {
+        managerSessionId: manager.id,
+        childSessionId: child.id,
+        profileId: child.profileId,
+        projectId: child.projectId ?? null,
+        worktree: child.worktree ?? null,
+      })
+      if (authorities.length) {
+        this.journal.append(manager.id, 'manager/delegation-granted', {
+          managerSessionId: manager.id,
+          childSessionId: child.id,
+          authorities,
+          by: manager.id,
+        })
+      }
+      if (tools.length) {
+        this.journal.append(manager.id, 'manager/tool-delegation-granted', {
+          managerSessionId: manager.id,
+          childSessionId: child.id,
+          tools,
+          by: manager.id,
+        })
+      }
+      return { ok: true, sessionId: child.id, label: child.title ?? identityOf(child).label }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  }
+
   /** Persist one bounded raw upload beneath this session's cwd. The HTTP layer owns streaming limits. */
   async storeAttachment(sessionId: string, name: string, mime: string, bytes: Buffer): Promise<AttachmentMeta> {
     const record = this.sessions.get(sessionId)
@@ -861,6 +1206,7 @@ export class SessionManager {
   }
 
   private setStatus(record: SessionRecord, status: SessionStatus): void {
+    const previous = record.status
     record.status = status
     // A bus-caused turn's provenance (read by the Codex agent-tool self-gate — execAgentTool's isBusTurn)
     // spans the whole turn; clear it whenever the session leaves the active state (turn done/failed/stopped).
@@ -871,9 +1217,115 @@ export class SessionManager {
     }
     this.persist(record)
     this.journal.append(record.id, 'session/status', { status })
+    if (status === 'active' && record.parentSessionId) this.scheduleManagerStallCheck(record.id)
+    else this.clearManagerStallCheck(record.id)
+    if (record.parentSessionId && previous !== status) {
+      if (status === 'active') this.reportChildEvent(record, 'started')
+      // `starting → idle` is driver initialization, not completed work. Reporting it made every spawn
+      // tell the manager “ready for review” immediately before “started working”, burning two messages
+      // and briefly lying about the child. The first meaningful lifecycle event is active (or error).
+      else if (status === 'idle' && previous !== 'starting') this.reportChildEvent(record, 'idle')
+      else if (status === 'error') this.reportChildEvent(record, 'errored')
+      else if (status === 'stopped') this.reportChildEvent(record, 'stopped')
+    }
     // A session that just went idle can now receive any queued teammate messages. Deferred to a
     // later tick so the idle transition fully settles before delivery starts a fresh (clamped) turn.
     if (status === 'idle') setImmediate(() => this.deliverBus(record.id))
+  }
+
+  private clearManagerStallCheck(sessionId: string): void {
+    const timer = this.managerStallTimers.get(sessionId)
+    if (timer) clearTimeout(timer)
+    this.managerStallTimers.delete(sessionId)
+  }
+
+  private scheduleManagerStallCheck(sessionId: string): void {
+    this.clearManagerStallCheck(sessionId)
+    const check = (): void => {
+      const child = this.sessions.get(sessionId)
+      if (!child || child.status !== 'active' || !child.parentSessionId) {
+        this.managerStallTimers.delete(sessionId)
+        return
+      }
+      const last = this.journal.lastEventForSession(sessionId)
+      const silence = last ? Date.now() - Date.parse(last.ts) : Number.POSITIVE_INFINITY
+      if (Number.isFinite(silence) && silence < MANAGER_STALL_MS) {
+        const timer = setTimeout(check, MANAGER_STALL_MS - silence)
+        timer.unref()
+        this.managerStallTimers.set(sessionId, timer)
+        return
+      }
+      this.managerStallTimers.delete(sessionId)
+      this.reportChildEvent(child, 'stalled')
+    }
+    const timer = setTimeout(check, MANAGER_STALL_MS)
+    timer.unref()
+    this.managerStallTimers.set(sessionId, timer)
+  }
+
+  private reportChildEvent(
+    child: SessionRecord,
+    outcome: 'started' | 'idle' | 'errored' | 'stopped' | 'stalled'
+  ): void {
+    const managerId = child.parentSessionId
+    if (!managerId) return
+    const manager = this.sessions.get(managerId)
+    if (!manager) {
+      this.journal.append(child.id, 'manager/child-report-orphaned', {
+        managerSessionId: managerId,
+        childSessionId: child.id,
+        outcome,
+      })
+      return
+    }
+    const childLabel = child.title ?? identityOf(child).label
+    const body =
+      outcome === 'started'
+        ? `${childLabel} started working.`
+        : outcome === 'idle'
+          ? `${childLabel} is idle and ready for review or another task.`
+          : outcome === 'errored'
+            ? `${childLabel} entered an error state and needs attention.`
+          : outcome === 'stalled'
+            ? `${childLabel} appears stalled: no journal activity for five minutes.`
+            : `${childLabel} was stopped.`
+    const messages = this.bus.post({
+      from: identityOf(child),
+      project: child.projectId ?? null,
+      to: { kind: 'session', id: manager.id },
+      subject: `child ${outcome}`,
+      body,
+      recipients: [manager.id],
+    })
+    this.journal.append(child.id, 'manager/child-reported', {
+      managerSessionId: manager.id,
+      childSessionId: child.id,
+      outcome,
+    })
+    if (manager.status === 'active' || manager.status === 'starting') {
+      // Lifecycle facts use the same unconditional high-priority steer primitive as worktree risks.
+      // Keep the bus row pending until the executor accepts it, so a turn-boundary race loses nothing.
+      void this.executor
+        .steer(manager.id, body)
+        .then(() => {
+          this.markBusDelivered(manager.id, messages)
+          this.journal.append(child.id, 'manager/child-report-steered', {
+            managerSessionId: manager.id,
+            childSessionId: child.id,
+            outcome,
+          })
+        })
+        .catch((error: unknown) => {
+          this.journal.append(child.id, 'manager/child-report-steer-failed', {
+            managerSessionId: manager.id,
+            childSessionId: child.id,
+            outcome,
+            error: error instanceof Error ? error.message : String(error),
+          })
+        })
+      return
+    }
+    this.deliverBus(manager.id)
   }
 
   private profileOf(record: SessionRecord): Profile {
@@ -929,7 +1381,20 @@ export class SessionManager {
     // first-class context. Agent-authored PRACTICES go into a SEPARATE, clearly-labeled block (never
     // mixed with operator intent), so both are independently auditable + revocable. Best-effort.
     const operatorText = this.instructions.materialize({ provider: profile.provider, projectId: opts.projectId, profileId })
-    const instructionText = [agentContract(profile.provider), operatorText].filter((s) => s.trim()).join('\n\n')
+    const managerGrantText = opts.parentSessionId
+      ? [
+          '## Operator-delegated project-manager scope',
+          '',
+          `The operator authorized project manager session ${opts.parentSessionId} to assign this child task.`,
+          'The manager prompt is an authorized implementation brief on the operator\'s behalf, but it cannot widen the persisted scope below.',
+          `Delegated tools: ${opts.delegatedTools?.length ? opts.delegatedTools.join(', ') : 'none'}.`,
+          `Delegated Git actions: ${opts.delegatedAuthorities?.length ? opts.delegatedAuthorities.join(', ') : 'none'}.`,
+          'The hub re-checks this grant before every delegated action; revocation takes effect immediately.',
+        ].join('\n')
+      : ''
+    const instructionText = [agentContract(profile.provider), operatorText, managerGrantText]
+      .filter((s) => s.trim())
+      .join('\n\n')
     const practiceText = this.practices.materialize({ provider: profile.provider, projectId: opts.projectId, profileId })
     writeManagedInstructions(cwd, profile.provider, instructionText, practiceText)
     if (isUnfiled) this.workspace.checkpointScratch(id)
@@ -952,6 +1417,11 @@ export class SessionManager {
       effort: opts.effort,
       serviceTier: opts.serviceTier,
       permissionMode: opts.permissionMode,
+      parentSessionId: opts.parentSessionId,
+      delegatedAuthorities: opts.delegatedAuthorities?.length
+        ? [...new Set(opts.delegatedAuthorities)]
+        : undefined,
+      delegatedTools: opts.delegatedTools?.length ? normalizeNames(opts.delegatedTools) : undefined,
       createdAt: new Date().toISOString(),
     }
     // Name it now, from its own id, so the chat has a stable handle from the moment it exists. Assigned
@@ -987,8 +1457,11 @@ export class SessionManager {
       // The executor builds the driver lazily on this first runTurn (driver construction has no
       // observable side effect, so lazy-vs-eager is invisible). Fire-and-forget, as before.
       if (opts.prompt) {
-        this.operatorTurnSessions.add(id)
-        this.journal.append(id, 'session/turn-origin', { origin: 'operator' })
+        if (!opts.parentSessionId) this.operatorTurnSessions.add(id)
+        this.journal.append(id, 'session/turn-origin', {
+          origin: opts.parentSessionId ? 'manager' : 'operator',
+          managerSessionId: opts.parentSessionId ?? null,
+        })
         void this.executor.runTurn(this.specOf(record), opts.prompt, 'operator')
       }
     } else {
@@ -997,8 +1470,11 @@ export class SessionManager {
       this.persist(record)
       this.setStatus(record, 'idle')
       if (opts.prompt) {
-        this.operatorTurnSessions.add(id)
-        this.journal.append(id, 'session/turn-origin', { origin: 'operator' })
+        if (!opts.parentSessionId) this.operatorTurnSessions.add(id)
+        this.journal.append(id, 'session/turn-origin', {
+          origin: opts.parentSessionId ? 'manager' : 'operator',
+          managerSessionId: opts.parentSessionId ?? null,
+        })
         await this.executor.runTurn(this.specOf(record), opts.prompt, 'operator')
       }
     }
@@ -1246,6 +1722,79 @@ export class SessionManager {
     }
   }
 
+  async reportWorktreeRiskToManagers(raw: unknown): Promise<void> {
+    const risk = parseWorktreeRisk(raw)
+    if (!risk) {
+      this.journal.append(null, 'manager/worktree-risk-rejected', { reason: 'unknown or unparsed payload' })
+      return
+    }
+    const participantSessionIds = risk.sessions.map((session) => session.sessionId)
+    const participants = participantSessionIds
+      .map((id) => this.sessions.get(id))
+      .filter((record): record is SessionRecord => !!record)
+    const managers = new Set(
+      participants.map((record) => record.parentSessionId).filter((id): id is string => !!id)
+    )
+    const names = risk.sessions.map((session) => session.label).join(', ')
+    const advance =
+      risk.mainAdvance.length > 0
+        ? ` Main advanced through ${risk.mainAdvance.map((commit) => `${commit.commit.slice(0, 8)} ${commit.subject}`).join('; ')}.`
+        : ''
+    const text =
+      risk.risk === 'concurrent-write'
+        ? `${names} are concurrently changing ${risk.file}.`
+        : `${names} is changing ${risk.file} from a stale base.${advance}`
+    const framed = `High-priority child worktree risk detected by the hub.\n\n${text}`
+
+    for (const participant of participants) {
+      if (participant.parentSessionId && !this.sessions.has(participant.parentSessionId)) {
+        this.journal.append(participant.id, 'manager/worktree-risk-orphaned', {
+          managerSessionId: participant.parentSessionId,
+          key: risk.key,
+          risk: risk.risk,
+        })
+      }
+    }
+    for (const managerId of managers) {
+      const manager = this.sessions.get(managerId)
+      if (!manager?.isProjectManager) continue
+      const source = participants.find((record) => record.parentSessionId === manager.id)
+      if (!source) continue
+      if (manager.status === 'active' || manager.status === 'starting') {
+        try {
+          await this.executor.steer(manager.id, framed)
+          this.journal.append(manager.id, 'manager/worktree-risk-steered', {
+            participantSessionIds,
+            key: risk.key,
+            risk: risk.risk,
+          })
+          continue
+        } catch (error) {
+          this.journal.append(manager.id, 'manager/worktree-risk-steer-failed', {
+            participantSessionIds,
+            key: risk.key,
+            risk: risk.risk,
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
+      }
+      this.bus.post({
+        from: identityOf(source),
+        project: source.projectId ?? null,
+        to: { kind: 'session', id: manager.id },
+        subject: `worktree ${risk.risk}`,
+        body: framed,
+        recipients: [manager.id],
+      })
+      this.journal.append(manager.id, 'manager/worktree-risk-queued', {
+        participantSessionIds,
+        key: risk.key,
+        risk: risk.risk,
+      })
+      this.deliverBus(manager.id)
+    }
+  }
+
   /**
    * On-demand context compaction (the `/compact` built-in).
    *
@@ -1335,6 +1884,36 @@ export class SessionManager {
   isAutoApproved(sessionId: string, kind: string, payload: unknown): boolean {
     const record = this.sessions.get(sessionId)
     if (!record) return false
+
+    // Deliberate operator-granted exception for a manager's direct child. Read every part from the live
+    // records on every approval: no worker/turn cache may let a revoked grant survive for one more action.
+    // The parser below accepts only a single, exact Git commit or push command; unknown shapes fail closed.
+    const delegated = delegatedGitAuthority(kind, payload)
+    if (delegated && record.parentSessionId && record.delegatedAuthorities?.includes(delegated)) {
+      const manager = this.sessions.get(record.parentSessionId)
+      if (manager?.isProjectManager === true && manager.managerDelegation?.includes(delegated)) {
+        this.journal.append(record.id, 'manager/delegation-used', {
+          managerSessionId: manager.id,
+          childSessionId: record.id,
+          authority: delegated,
+          kind,
+        })
+        return true
+      }
+    }
+    const delegatedTool = delegableToolName(kind, payload)
+    if (delegatedTool && record.parentSessionId && record.delegatedTools?.includes(delegatedTool)) {
+      const manager = this.sessions.get(record.parentSessionId)
+      if (manager?.isProjectManager === true && manager.managerAllowedTools?.includes(delegatedTool)) {
+        this.journal.append(record.id, 'manager/tool-delegation-used', {
+          managerSessionId: manager.id,
+          childSessionId: record.id,
+          toolName: delegatedTool,
+          kind,
+        })
+        return true
+      }
+    }
 
     // (1) ONLY A TURN THIS HUB STARTED FOR THE OPERATOR MAY SKIP THE PROMPT — a POSITIVE test, not
     // "isn't a bus turn". deliverBus builds its spec with clampMode(record.permissionMode) so a
@@ -1577,13 +2156,69 @@ export class SessionManager {
    * busRoster), never sends a message or interrupts the target. Returns a one-line summary, or found:false
    * for an unknown / self / stopped / cross-project target (fails closed, same scope as the bus).
    */
-  busPeek(callerSessionId: string, targetSessionId: string): { found: boolean; summary?: string } {
+  /** Exact live state for direct children. Starting and active both count as running. */
+  managerChildStatus(managerSessionId: string): { ok: boolean; summary?: string; error?: string } {
+    const manager = this.sessions.get(managerSessionId)
+    if (!manager?.isProjectManager) return { ok: false, error: 'caller is not an operator-marked project manager' }
+    const children = [...this.sessions.values()].filter((record) => record.parentSessionId === manager.id)
+    const counts = { running: 0, idle: 0, stopped: 0, errored: 0 }
+    for (const child of children) {
+      if (child.status === 'starting' || child.status === 'active') counts.running += 1
+      else if (child.status === 'idle') counts.idle += 1
+      else if (child.status === 'stopped') counts.stopped += 1
+      else counts.errored += 1
+    }
+    const rows = children
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+      .map((child) => `- ${child.title ?? identityOf(child).label} (${child.id}): ${child.status}`)
+    return {
+      ok: true,
+      summary: [
+        `Children: ${counts.running} running, ${counts.idle} idle, ${counts.stopped} stopped, ${counts.errored} errored.`,
+        ...(rows.length ? rows : ['No direct children.']),
+      ].join('\n'),
+    }
+  }
+
+  busPeek(
+    callerSessionId: string,
+    targetSessionId: string,
+    options: {
+      view?: 'summary' | 'activity' | 'transcript' | 'changes' | 'all'
+      afterSeq?: number
+    } = {}
+  ): { found: boolean; summary?: string } {
     const caller = this.sessions.get(callerSessionId)
     if (!caller) return { found: false }
     const t = this.sessions.get(targetSessionId)
-    if (!t || t.id === callerSessionId || t.status === 'stopped' || (t.projectId ?? null) !== (caller.projectId ?? null)) {
+    if (!t || t.id === callerSessionId || (t.projectId ?? null) !== (caller.projectId ?? null)) {
       return { found: false }
     }
+    const view = options.view ?? 'summary'
+    if (view !== 'summary') {
+      if (!caller.isProjectManager || t.parentSessionId !== caller.id) return { found: false }
+      const activity = (): string => this.managerChildActivity(t)
+      const transcript = (): string => {
+        const page = this.journal.eventsForSession(t.id, options.afterSeq ?? 0)
+        return `Transcript page (exact journal events):\n${JSON.stringify(page, null, 2)}`
+      }
+      const changes = (): string => this.managerChildChanges(t)
+      const summary =
+        view === 'activity'
+          ? activity()
+          : view === 'transcript'
+            ? transcript()
+            : view === 'changes'
+              ? changes()
+              : [activity(), transcript(), changes()].join('\n\n')
+      this.journal.append(caller.id, 'manager/child-inspected', {
+        childSessionId: t.id,
+        view,
+        afterSeq: options.afterSeq ?? null,
+      })
+      return { found: true, summary }
+    }
+    if (t.status === 'stopped') return { found: false }
     const doing = t.status === 'active' ? 'actively working' : t.status === 'idle' ? 'idle (waiting)' : t.status
     const ago = (ms: number): string => {
       if (!Number.isFinite(ms) || ms < 0) return 'just now'
@@ -1597,6 +2232,96 @@ export class SessionManager {
     const last = this.journal.lastEventForSession(t.id)
     const tail = last ? ` — last activity ${ago(Date.now() - Date.parse(last.ts))} (${last.kind})` : ''
     return { found: true, summary: `${identityOf(t).label} (${t.provider}) is ${doing}${tail}` }
+  }
+
+  private managerChildActivity(child: SessionRecord): string {
+    const last = this.journal.lastEventForSession(child.id)
+    const pending = this.approvals.pending().filter((approval) => approval.sessionId === child.id)
+    const blocked =
+      pending.length > 0
+        ? `pending approval (${pending.length}): ${JSON.stringify(
+            pending.map((approval) => ({
+              id: approval.id,
+              kind: approval.kind,
+              payload: approval.payload,
+              createdAt: approval.createdAt,
+            }))
+          )}`
+        : 'no pending approval'
+    return [
+      `Child ${child.title ?? identityOf(child).label} (${child.id})`,
+      `status: ${child.status}`,
+      `provider/profile: ${child.provider}/${child.profileId}`,
+      `model: ${child.model ?? 'provider default'}`,
+      `permission mode: ${child.permissionMode ?? 'safe'}`,
+      `worktree: ${child.worktree ?? child.cwd}`,
+      `branch: ${child.branch ?? '(none)'}`,
+      `last activity: ${last ? `${last.ts} ${last.kind}` : 'none'}`,
+      `blocked on: ${blocked}`,
+    ].join('\n')
+  }
+
+  private managerChildChanges(child: SessionRecord): string {
+    const cwd = child.worktree ?? child.cwd
+    const readGit = (...args: string[]): string =>
+      execFileSync('git', ['-C', cwd, ...args], {
+        encoding: 'utf8',
+        windowsHide: true,
+        maxBuffer: 32 * 1024 * 1024,
+      }).trimEnd()
+    try {
+      const status = readGit('status', '--porcelain=v1', '--untracked-files=all')
+      const workingDiff = readGit('diff', '--no-ext-diff', 'HEAD', '--')
+      let mainExists = false
+      try {
+        readGit('rev-parse', '--verify', 'refs/heads/main')
+        mainExists = true
+      } catch {
+        // Scratch repositories and legacy checkouts may not have a local main ref.
+      }
+      let committedDiff = ''
+      let commits = ''
+      let stale = 'unknown (no local main ref)'
+      if (mainExists) {
+        committedDiff = readGit('diff', '--no-ext-diff', 'main...HEAD', '--')
+        commits = readGit('log', '--format=%H%x09%s', 'main..HEAD')
+        const behind = Number(readGit('rev-list', '--count', 'HEAD..main') || '0')
+        stale = behind > 0 ? `yes (${behind} main commit${behind === 1 ? '' : 's'} ahead)` : 'no'
+      }
+      const untracked: string[] = []
+      for (const line of status.split(/\r?\n/)) {
+        if (!line.startsWith('?? ')) continue
+        const relative = line.slice(3)
+        const absolute = path.resolve(cwd, relative)
+        const root = path.resolve(cwd)
+        const inside = absolute === root || absolute.startsWith(`${root}${path.sep}`)
+        if (!inside) continue
+        try {
+          if (fs.statSync(absolute).isFile()) {
+            untracked.push(`--- /dev/null\n+++ b/${relative}\n${fs.readFileSync(absolute, 'utf8')}`)
+          }
+        } catch {
+          untracked.push(`[unreadable untracked file: ${relative}]`)
+        }
+      }
+      const branch = child.branch ?? (readGit('branch', '--show-current') || '(detached)')
+      return [
+        `worktree: ${cwd}`,
+        `branch: ${branch}`,
+        `stale: ${stale}`,
+        `files/status:\n${status || '(clean)'}`,
+        `commits made:\n${commits || '(none relative to main)'}`,
+        `committed diff:\n${committedDiff || '(none relative to main)'}`,
+        `working tree diff:\n${[workingDiff, ...untracked].filter(Boolean).join('\n') || '(clean)'}`,
+      ].join('\n')
+    } catch (error) {
+      return [
+        `worktree: ${cwd}`,
+        `branch: ${child.branch ?? '(unknown)'}`,
+        'stale: unknown',
+        `inspection error: ${error instanceof Error ? error.message : String(error)}`,
+      ].join('\n')
+    }
   }
 
   private steerMessagesAtToolBoundary(): boolean {
@@ -1856,6 +2581,23 @@ export class SessionManager {
   async delete(sessionId: string): Promise<{ ok: true } | { ok: false; error: string }> {
     const record = this.sessions.get(sessionId)
     if (!record) return { ok: false, error: `unknown session: ${sessionId}` }
+    const liveChildren = [...this.sessions.values()].filter(
+      (child) =>
+        child.parentSessionId === record.id &&
+        (child.status === 'starting' || child.status === 'active' || child.status === 'idle')
+    )
+    if (liveChildren.length) {
+      this.journal.append(record.id, 'manager/deleted-with-live-children', {
+        managerSessionId: record.id,
+        childSessionIds: liveChildren.map((child) => child.id),
+      })
+      for (const child of liveChildren) {
+        this.journal.append(child.id, 'manager/child-orphaned', {
+          managerSessionId: record.id,
+          childSessionId: child.id,
+        })
+      }
+    }
     // 1. End any running turn. Stop preserves the worktree; Delete alone may remove it, and only after
     //    proving there is no live writer and Git reports the checkout clean. Note: an
     //    IMPORTED session (record.imported) carries no repo/worktree and this path never touches
@@ -1887,6 +2629,7 @@ export class SessionManager {
     //    codex thread). The executor's codexClients map is keyed by profile + shared across sessions,
     //    so it is deliberately left intact — only this session's driver/thread is dropped.
     this.sessions.delete(sessionId)
+    this.clearManagerStallCheck(sessionId)
     this.ingestedWseq.delete(sessionId) // drop the exactly-once cursor — the worker forgets its wseq buffer too (a no-op in-process)
     await this.executor.stopSession(sessionId)
     // 4. Remove it from the persisted snapshot so a hub restart doesn't resurrect it.
@@ -1982,6 +2725,180 @@ const AUTO_APPROVABLE_KINDS = new Set([
   // request to WIDEN what the agent may do, because the operator said "don't ask me about tool calls", is
   // the same category error as the full-access-means-everything bug this whole list exists to prevent.
 ])
+
+interface WorktreeRiskEvent {
+  version: 1
+  risk: 'concurrent-write' | 'stale-base'
+  repo: string
+  projectId: string | null
+  file: string
+  detectedAt: string
+  key: string
+  sessions: Array<{
+    sessionId: string
+    label: string
+    branch: string
+    worktree: string
+    role: 'writer' | 'later-writer' | 'stale-writer'
+  }>
+  baseCommit: string | null
+  mainCommit: string
+  commitsBehind: number
+  mainAdvance: Array<{ commit: string; subject: string }>
+  steeredSessionIds: string[]
+}
+
+/** Validate Lane H's versioned global journal contract in full. Any ambiguity rejects the whole event. */
+function parseWorktreeRisk(value: unknown): WorktreeRiskEvent | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const row = value as Record<string, unknown>
+  if (row.version !== 1 || (row.risk !== 'concurrent-write' && row.risk !== 'stale-base')) return undefined
+  if (
+    typeof row.repo !== 'string' ||
+    (row.projectId !== null && typeof row.projectId !== 'string') ||
+    typeof row.file !== 'string' ||
+    typeof row.detectedAt !== 'string' ||
+    !Number.isFinite(Date.parse(row.detectedAt)) ||
+    typeof row.key !== 'string' ||
+    !row.key
+  ) {
+    return undefined
+  }
+  if (
+    (row.baseCommit !== null && typeof row.baseCommit !== 'string') ||
+    typeof row.mainCommit !== 'string' ||
+    !Number.isInteger(row.commitsBehind) ||
+    (row.commitsBehind as number) < 0
+  ) {
+    return undefined
+  }
+  if (!Array.isArray(row.sessions) || row.sessions.length === 0) return undefined
+  const sessions: WorktreeRiskEvent['sessions'] = []
+  for (const candidate of row.sessions) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return undefined
+    const session = candidate as Record<string, unknown>
+    if (
+      typeof session.sessionId !== 'string' ||
+      typeof session.label !== 'string' ||
+      typeof session.branch !== 'string' ||
+      typeof session.worktree !== 'string' ||
+      (session.role !== 'writer' && session.role !== 'later-writer' && session.role !== 'stale-writer')
+    ) {
+      return undefined
+    }
+    sessions.push(session as WorktreeRiskEvent['sessions'][number])
+  }
+  if (!Array.isArray(row.mainAdvance)) return undefined
+  const mainAdvance: WorktreeRiskEvent['mainAdvance'] = []
+  for (const candidate of row.mainAdvance) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return undefined
+    const commit = candidate as Record<string, unknown>
+    if (typeof commit.commit !== 'string' || typeof commit.subject !== 'string') return undefined
+    mainAdvance.push(commit as WorktreeRiskEvent['mainAdvance'][number])
+  }
+  if (!Array.isArray(row.steeredSessionIds) || row.steeredSessionIds.some((id) => typeof id !== 'string')) {
+    return undefined
+  }
+  if (row.risk === 'concurrent-write' && (sessions.length !== 2 || mainAdvance.length !== 0)) return undefined
+  if (row.risk === 'stale-base' && (sessions.length !== 1 || sessions[0]?.role !== 'stale-writer')) return undefined
+  return {
+    version: 1,
+    risk: row.risk,
+    repo: row.repo,
+    projectId: row.projectId,
+    file: row.file,
+    detectedAt: row.detectedAt,
+    key: row.key,
+    sessions,
+    baseCommit: row.baseCommit,
+    mainCommit: row.mainCommit,
+    commitsBehind: row.commitsBehind as number,
+    mainAdvance,
+    steeredSessionIds: [...row.steeredSessionIds] as string[],
+  }
+}
+
+function normalizeAuthorities(value: readonly unknown[] | undefined): DelegatedAuthority[] {
+  if (!value) return []
+  const out: DelegatedAuthority[] = []
+  for (const authority of value) {
+    if ((authority === 'commit' || authority === 'push') && !out.includes(authority)) out.push(authority)
+  }
+  return out
+}
+
+function normalizeNames(value: readonly unknown[]): string[] {
+  const out: string[] = []
+  for (const item of value) {
+    if (typeof item !== 'string') continue
+    const name = item.trim()
+    if (name && name.length <= 120 && !out.includes(name)) out.push(name)
+  }
+  return out
+}
+
+function delegableToolName(kind: string, payload: unknown): string | undefined {
+  if (!AUTO_APPROVABLE_KINDS.has(kind)) return undefined
+  const p = payload as { toolName?: unknown; matchedAskRule?: unknown } | null
+  if (!p || p.matchedAskRule || typeof p.toolName !== 'string') return undefined
+  const toolName = p.toolName.trim()
+  if (!toolName || NEVER_AUTO_APPROVED_TOOLS.has(toolName)) return undefined
+  return toolName
+}
+
+/**
+ * Recognize exactly one Git operation from an approval payload. This is deliberately a small parser,
+ * not a substring check: shell composition, substitutions, redirections, newlines, aliases, unknown
+ * approval kinds, and unknown payload shapes all return undefined and therefore ask the operator.
+ */
+function delegatedGitAuthority(kind: string, payload: unknown): DelegatedAuthority | undefined {
+  const p = payload as {
+    toolName?: unknown
+    matchedAskRule?: unknown
+    input?: { command?: unknown } | null
+    command?: unknown
+    cmd?: unknown
+  } | null
+  if (!p || p.matchedAskRule) return undefined
+  if (kind === 'claude/tool') {
+    if (p.toolName !== 'Bash') return undefined
+  } else if (
+    kind !== 'codex/item/commandExecution/requestApproval' &&
+    kind !== 'codex/execCommandApproval'
+  ) {
+    return undefined
+  }
+
+  const raw = p.input?.command ?? p.command ?? p.cmd
+  let tokens: string[]
+  if (Array.isArray(raw)) {
+    if (!raw.length || raw.some((token) => typeof token !== 'string' || !token.trim())) return undefined
+    tokens = raw.map((token) => token.trim())
+  } else if (typeof raw === 'string') {
+    const command = raw.trim()
+    if (!command || /[\r\n;&|<>`$()]/.test(command)) return undefined
+    const matches = command.match(/"[^"]*"|'[^']*'|[^\s]+/g)
+    if (!matches || matches.join(' ').replace(/\s+/g, ' ') !== command.replace(/\s+/g, ' ')) {
+      return undefined
+    }
+    tokens = matches
+  } else {
+    return undefined
+  }
+
+  const unquote = (token: string): string =>
+    token.length >= 2 &&
+    ((token.startsWith('"') && token.endsWith('"')) || (token.startsWith("'") && token.endsWith("'")))
+      ? token.slice(1, -1)
+      : token
+  if (!/^(?:git|git\.exe)$/i.test(unquote(tokens.shift() ?? ''))) return undefined
+  if (tokens[0] === '-C') {
+    tokens.shift()
+    if (!tokens.shift()) return undefined
+  }
+  const operation = unquote(tokens.shift() ?? '')
+  return operation === 'commit' || operation === 'push' ? operation : undefined
+}
 
 /**
  * The permission mode a BUS-caused turn runs at.

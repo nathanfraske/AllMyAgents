@@ -113,4 +113,44 @@ describe('Sidebar with folder state', () => {
     const { container } = render(Sidebar)
     expect(labels(container as HTMLElement).sort()).toEqual(['one', 'three', 'two'])
   })
+
+  it('nests a child session directly beneath its operator-marked manager', () => {
+    store.sessions.s1!.record.isProjectManager = true
+    store.sessions.s2!.record.parentSessionId = 's1'
+    const { container } = render(Sidebar)
+    const el = container as HTMLElement
+    const projectLabels = [...el.querySelectorAll('.group:first-child .rlabel')].map((node) => node.textContent)
+    expect(projectLabels).toEqual(['one', 'two'])
+    expect(el.querySelector('.row.managedchild .rlabel')?.textContent).toBe('two')
+    expect(el.querySelector('.pmtag')?.textContent).toBe('PM')
+  })
+
+  it('restores a collapsed manager subtree from the existing collapsed-state store', () => {
+    store.sessions.s1!.record.isProjectManager = true
+    store.sessions.s2!.record.parentSessionId = 's1'
+    localStorage.setItem('allmyagents.ui.collapsedFolders', JSON.stringify(['manager:s1']))
+    const { container } = render(Sidebar)
+    const el = container as HTMLElement
+    expect(labels(el)).toContain('one')
+    expect(labels(el)).not.toContain('two')
+    expect(el.querySelector('.manager-toggle')).not.toBeNull()
+  })
+
+  it('keeps children beneath their manager even when the manager is filed in a folder', () => {
+    store.sessions.s1!.record.isProjectManager = true
+    store.sessions.s2!.record.parentSessionId = 's1'
+    localStorage.setItem(
+      'allmyagents.ui.chatFolders',
+      JSON.stringify({
+        folders: [{ id: 'folder:a', groupId: 'proj-a', name: 'Managed' }],
+        assignments: { s1: 'folder:a' },
+      })
+    )
+
+    const { container } = render(Sidebar)
+    const el = container as HTMLElement
+    const railed = [...el.querySelectorAll('.entry.infolder .rlabel')].map((node) => node.textContent)
+    expect(railed).toEqual(['one', 'two'])
+    expect(el.querySelector('.entry.infolder .row.managedchild .rlabel')?.textContent).toBe('two')
+  })
 })

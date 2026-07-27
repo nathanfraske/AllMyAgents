@@ -83,6 +83,15 @@ export interface SessionRecord {
   permissionMode?: string
   /** Tools the operator chose "always allow" for in this chat. Shown (and revocable) in the permission menu. */
   allowedTools?: string[]
+  isProjectManager?: boolean
+  managerMaxLiveChildren?: number
+  managerDelegation?: Array<'commit' | 'push'>
+  managerAllowedProfiles?: string[]
+  managerAllowedModels?: Record<string, string[]>
+  managerAllowedTools?: string[]
+  parentSessionId?: string
+  delegatedAuthorities?: Array<'commit' | 'push'>
+  delegatedTools?: string[]
   title?: string
   titleSource?: string
   // Adopted from an existing vendor transcript via project-import (vs. spawned by the hub).
@@ -562,6 +571,17 @@ export const api = {
   deleteSession: (id: string) => jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/delete`),
   setMode: (id: string, permissionMode: string) =>
     jpost<{ ok: boolean } | ApiError>(`/api/sessions/${id}/mode`, { permissionMode }),
+  configureProjectManager: (
+    id: string,
+    config: {
+      enabled: boolean
+      maxLiveChildren?: number
+      delegation?: Array<'commit' | 'push'>
+      allowedProfiles?: string[]
+      allowedModels?: Record<string, string[]>
+      allowedTools?: string[]
+    }
+  ) => jpost<SessionRecord | ApiError>(`/api/sessions/${id}/project-manager`, config),
   /** "Always allow this tool in this chat" (allow=false revokes). Takes effect on the next tool call. */
   allowTool: (id: string, toolName: string, allow = true) =>
     jpost<SessionRecord | ApiError>(`/api/sessions/${id}/allow-tool`, { toolName, allow }),
