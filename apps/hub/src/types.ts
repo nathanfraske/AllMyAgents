@@ -26,6 +26,11 @@ export interface SessionRecord {
   repo?: string
   worktree?: string
   branch?: string
+  /** What the caller asked for when creating a project chat. Kept separately from `worktree`, which is
+   * the outcome, so the UI can report an override/fallback instead of pretending Project was chosen. */
+  worktreeRequested?: boolean
+  /** Human-readable reason a requested worktree was not created. Absent when intent and outcome agree. */
+  worktreeFallbackReason?: string
   status: SessionStatus
   vendorSessionId?: string
   model?: string

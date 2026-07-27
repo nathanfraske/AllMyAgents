@@ -687,6 +687,12 @@
                   <!-- svelte-ignore a11y_no_static_element_interactions -->
                   <span class="rlabel" class:glitch={glitching.has(s.record.id)} ondblclick={(e) => startRename(e, s)}>{label(s)}</span>
                 {/if}
+                {#if s.record.worktree}
+                  <span class="wtbadge" title={s.record.worktree} aria-label={`Worktree branch ${s.record.branch ?? s.record.worktree.split(/[\\/]/).pop()}`}>
+                    <Icon name="git-branch" size={9} />
+                    <span>{s.record.branch ?? s.record.worktree.split(/[\\/]/).pop()}</span>
+                  </span>
+                {/if}
                 {#if s.record.siteLabel}<span class="rbadge" title="on {s.record.siteLabel} (remote fleet machine)"><Icon name="server" size={9} /></span>{/if}
                 {#if unread > 0}<span class="mbadge" title={unreadMailTitle(unread)} aria-label={unreadMailTitle(unread)}><Icon name="mail" size={10} /><span class="tnum">{unread}</span></span>{/if}
                 {#if pending > 0}<span class="pbadge tnum">{pending}</span>{/if}
@@ -831,6 +837,10 @@
   .group.dragging .group-head { background: var(--surface-3); border-radius: var(--r-md); box-shadow: var(--shadow-1); }
   .list.reordering { user-select: none; cursor: grabbing; }
   .ibadge { flex: none; display: inline-grid; place-items: center; color: var(--dim); }
+  .wtbadge { flex: none; display: inline-flex; align-items: center; gap: 0.15rem;
+    padding: 0.05rem 0.25rem; border: 1px solid var(--border); border-radius: var(--r-sm);
+    color: var(--muted); font-family: var(--mono); font-size: var(--text-2xs); }
+  .wtbadge span { white-space: nowrap; }
   /* Fleet machine/site tags: a labelled pill on a remote project header, and a compact icon marker on
      a remote chat row (its label rides in the tooltip). Only rendered for REMOTE sites, so the
      single-machine view shows neither. */

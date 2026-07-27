@@ -784,27 +784,12 @@ export class HubStore {
     this.sessions = rest
   }
 
-  // Only a fresh project chat (no real turns yet) can switch worktree mode — the worktree is
-  // created at spawn, so changing it means re-spawning.
-  canToggleWorktree(view: SessionView): boolean {
-    if (!view.record.projectId) return false
-    return !view.items.some((i) => i.kind === 'user' || i.kind === 'assistant')
-  }
-
-  // Flip worktree ⇄ direct before the first message. For a DRAFT this is just a local intent flip
-  // (the worktree is created at spawn). For a real empty chat it re-creates it (legacy path; real
-  // sessions always carry the first prompt now, so `canToggleWorktree` is effectively draft-only).
-  async toggleWorktree(): Promise<void> {
-    const cur = this.selectedId ? this.sessions[this.selectedId] : null
-    if (!cur || !this.canToggleWorktree(cur)) return
-    if (cur.draft) {
-      cur.draftUseWorktree = !cur.draftUseWorktree
-      return
-    }
-    const next = !cur.record.worktree
-    await api.stop(cur.record.id).catch(() => undefined)
-    this.removeSessionLocal(cur.record.id)
-    await this.newSession(cur.record.profileId, cur.record.projectId, next)
+  // This is spawn-time intent, never a live-session mutation. Once materialized, the returned record
+  // reports the actual checkout and the segmented control is read-only.
+  setDraftWorktree(id: string, useWorktree: boolean): void {
+    const cur = this.sessions[id]
+    if (!cur?.draft || !cur.record.projectId) return
+    cur.draftUseWorktree = useWorktree
   }
 
   // Swap the account "at will". Empty chat → seamless re-create under the new account.

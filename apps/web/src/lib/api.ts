@@ -71,6 +71,10 @@ export interface SessionRecord {
   repo?: string
   worktree?: string
   branch?: string
+  /** Spawn intent, distinct from the actual `worktree` outcome. */
+  worktreeRequested?: boolean
+  /** Why a requested worktree was not created; absent when intent and outcome agree. */
+  worktreeFallbackReason?: string
   status: string
   vendorSessionId?: string
   model?: string

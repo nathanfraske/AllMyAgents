@@ -187,6 +187,9 @@ export class WorkspaceManager {
   inspect(repo: string, worktree: string): WorktreeInspection {
     if (!fs.existsSync(worktree)) return { ok: false, error: `worktree is missing: ${worktree}` }
     try {
+      // Git reports the physical path while records may legitimately contain a symlink/junction alias
+      // (notably Windows' Roaming → Packages LocalCache projection). Compare filesystem identities so a
+      // valid checkout is not rejected on Reopen merely because those spellings differ.
       const expected = path.resolve(worktree)
       const registered = this.git(repo, ['worktree', 'list', '--porcelain'])
         .split(/\r?\n/)

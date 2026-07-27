@@ -84,7 +84,7 @@ function buildHub() {
     journal.db.close()
     fs.rmSync(tmp, { recursive: true, force: true })
   })
-  return { hubRoot, dataDir, repo, sessions, projectId }
+  return { hubRoot, dataDir, repo, sessions, projects, projectId }
 }
 
 async function createWorktreeSession() {
@@ -180,6 +180,60 @@ describe('unfiled chat workspace lifecycle', () => {
 })
 
 describe('worktree session lifecycle', () => {
+  it('records requested isolation separately from the created checkout', async () => {
+    const { record, worktree } = await createWorktreeSession()
+
+    expect(record.worktreeRequested).toBe(true)
+    expect(record.worktree).toBe(worktree)
+    expect(record.worktreeFallbackReason).toBeUndefined()
+    expect(git(worktree, 'branch', '--show-current')).toBe(record.branch)
+  })
+
+  it('records an explicit Project choice without claiming a worktree failure', async () => {
+    const hub = buildHub()
+    const record = await hub.sessions.create('claude-test', {
+      projectId: hub.projectId,
+      useWorktree: false,
+    })
+
+    expect(record.worktreeRequested).toBe(false)
+    expect(record.worktree).toBeUndefined()
+    expect(record.cwd).toBe(hub.repo)
+    expect(record.worktreeFallbackReason).toBeUndefined()
+  })
+
+  it('records why an explicit cwd overrode a requested project worktree', async () => {
+    const hub = buildHub()
+    const record = await hub.sessions.create('claude-test', {
+      projectId: hub.projectId,
+      cwd: hub.repo,
+      useWorktree: true,
+    })
+
+    expect(record.worktreeRequested).toBe(true)
+    expect(record.worktree).toBeUndefined()
+    expect(record.cwd).toBe(hub.repo)
+    expect(record.worktreeFallbackReason).toContain('explicit working directory')
+    expect(record.worktreeFallbackReason).toContain(hub.repo)
+  })
+
+  it('records why a non-Git project could not satisfy requested isolation', async () => {
+    const hub = buildHub()
+    const plain = path.join(path.dirname(hub.repo), 'plain-folder')
+    fs.mkdirSync(plain)
+    const projectId = hub.projects.create('plain', plain).id
+    const record = await hub.sessions.create('claude-test', {
+      projectId,
+      useWorktree: true,
+    })
+
+    expect(record.worktreeRequested).toBe(true)
+    expect(record.worktree).toBeUndefined()
+    expect(record.cwd).toBe(plain)
+    expect(record.worktreeFallbackReason).toContain('not a Git repository')
+    expect(record.worktreeFallbackReason).toContain(plain)
+  })
+
   it('Stop preserves tracked and untracked work, and Reopen resumes the same checkout', async () => {
     const { sessions, record, worktree } = await createWorktreeSession()
     fs.writeFileSync(path.join(worktree, 'tracked.txt'), 'operator work\n')
@@ -187,11 +241,17 @@ describe('worktree session lifecycle', () => {
 
     await sessions.stop(record.id)
 
-    expect(sessions.list().find((r) => r.id === record.id)?.status).toBe('stopped')
+    const stopped = sessions.list().find((r) => r.id === record.id)
+    expect(stopped?.status).toBe('stopped')
+    expect(stopped?.worktree).toBe(worktree)
+    expect(stopped?.branch).toBe(record.branch)
     expect(fs.readFileSync(path.join(worktree, 'tracked.txt'), 'utf8')).toBe('operator work\n')
     expect(fs.readFileSync(path.join(worktree, 'untracked.txt'), 'utf8')).toBe('new work\n')
     expect(sessions.reopen(record.id)).toEqual({ ok: true, status: 'idle' })
-    expect(sessions.list().find((r) => r.id === record.id)?.cwd).toBe(worktree)
+    const reopened = sessions.list().find((r) => r.id === record.id)
+    expect(reopened?.cwd).toBe(worktree)
+    expect(reopened?.worktree).toBe(worktree)
+    expect(reopened?.branch).toBe(record.branch)
   })
 
   it('Reopen refuses a legacy stopped session whose recorded worktree is gone', async () => {
