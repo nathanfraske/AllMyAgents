@@ -187,7 +187,8 @@ describe('session attachment API', () => {
       size: number
       path: string
     }
-    const uploadRoot = path.resolve(record.cwd, '.allmyagents', 'uploads')
+    // macOS exposes os.tmpdir() through /var while realpath/git report /private/var.
+    const uploadRoot = fs.realpathSync(path.resolve(record.cwd, '.allmyagents', 'uploads'))
     const relative = path.relative(uploadRoot, path.resolve(meta.path))
     expect(relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)).toBe(false)
     expect(meta.name).toBe('outside.png')
