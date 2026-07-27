@@ -155,6 +155,7 @@ describe('Manager setup', () => {
     expect(prompt).toMatch(/profile_id.*codex-a/i)
     expect(prompt).toMatch(/stalls.*blocks.*errors/is)
     expect(prompt).toMatch(/verify.*transcript.*worktree/is)
+    expect(prompt).toMatch(/state.*exact granted tools.*redirect.*granted alternative/is)
     expect(prompt).toMatch(/final status.*files.*commits/is)
   })
 
