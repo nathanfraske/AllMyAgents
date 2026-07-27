@@ -27,6 +27,10 @@ import { discoverImportableChats, importKey, type ImportableChat, type ScanResul
 import { readProfileCommands, type CommandInfo } from './commands.js'
 import { EDIT_TOOLS } from './writeScope.js'
 import {
+  checkWorktreeStaleness,
+  type WorktreeStalenessCheck,
+} from './worktreeCollisionDetector.js'
+import {
   AttachmentInputError,
   isPdfAttachment,
   isTextAttachment,
@@ -62,6 +66,10 @@ export type SessionApiRecord = SessionRecord & {
   /** Bus rows not yet accepted by this session's executor. This is delivery state, not readAt state. */
   unreadFromTeammates: number
 }
+
+export type WorktreeIntegrationCheck =
+  | { ok: true; disabled: true }
+  | (WorktreeStalenessCheck & { disabled: false })
 
 // Turn-boundary-preferred flip (docs/agent-worker-impl.md §8.4): when a restart is requested mid-turn, hold
 // the signal until the roster goes idle — but no longer than this, after which we flip anyway (the turn
@@ -917,12 +925,22 @@ export class SessionManager {
     }
     let worktree: string | undefined
     let branch: string | undefined
+    let baseCommit: string | undefined
+    let baseRef: string | undefined
     if (repo) {
       const wt = this.workspace.create(repo, id)
       worktree = wt.worktree
       branch = wt.branch
+      baseCommit = wt.baseCommit
+      baseRef = wt.baseRef
       cwd = worktree
-      this.journal.append(id, 'session/worktree-created', { repo, worktree, branch })
+      this.journal.append(id, 'session/worktree-created', {
+        repo,
+        worktree,
+        branch,
+        baseCommit,
+        baseRef: baseRef ?? null,
+      })
     }
     // Materialize the hub's teammate/bus trust contract + the operator's scoped instructions into
     // the session's native instruction file (CLAUDE.md / AGENTS.md) so the agent reads them as
@@ -947,6 +965,8 @@ export class SessionManager {
       branch,
       worktreeRequested,
       worktreeFallbackReason,
+      baseCommit,
+      baseRef,
       status: 'starting',
       model: opts.model,
       effort: opts.effort,
@@ -1244,6 +1264,25 @@ export class SessionManager {
       })
       return false
     }
+  }
+
+  /**
+   * Mandatory pre-push/pre-merge check for integration workflows. Unlike the ambient steer, the caller
+   * waits for this answer and receives `ok:false` when main touched any file this branch is changing.
+   * It detects/informs only: the hub never rebases, merges, or edits the worktree on the caller's behalf.
+   */
+  async checkWorktreeIntegration(sessionId: string): Promise<WorktreeIntegrationCheck> {
+    const record = this.sessions.get(sessionId)
+    if (!record) throw new Error(`unknown session: ${sessionId}`)
+    if (this.danger.disableWorktreeCollisionWarnings === true) {
+      const disabled = { ok: true as const, disabled: true as const }
+      this.journal.append(sessionId, 'worktree/integration-check', disabled)
+      return disabled
+    }
+    const result = await checkWorktreeStaleness(record)
+    const checked = { ...result, disabled: false as const }
+    this.journal.append(sessionId, 'worktree/integration-check', checked)
+    return checked
   }
 
   /**

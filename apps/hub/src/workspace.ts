@@ -64,13 +64,26 @@ export class WorkspaceManager {
     }
   }
 
-  create(repo: string, sessionId: string): { worktree: string; branch: string } {
+  create(repo: string, sessionId: string): {
+    worktree: string
+    branch: string
+    baseCommit: string
+    baseRef?: string
+  } {
     if (!this.isRepo(repo)) throw new Error(`not a git repository: ${repo}`)
+    const baseCommit = this.git(repo, ['rev-parse', '--verify', 'HEAD^{commit}'])
+    let baseRef: string | undefined
+    try {
+      baseRef = this.git(repo, ['symbolic-ref', 'HEAD'])
+    } catch {
+      // Detached bases are valid. The immutable baseCommit remains authoritative; staleness monitoring
+      // falls back to the primary checkout's HEAD when there is no branch ref to follow.
+    }
     const short = sessionId.slice(0, 8)
     const target = path.join(this.worktreesRoot, short)
     const branch = `agent/${short}`
     this.git(repo, ['worktree', 'add', '-b', branch, target])
-    return { worktree: target, branch }
+    return { worktree: target, branch, baseCommit, baseRef }
   }
 
   /**

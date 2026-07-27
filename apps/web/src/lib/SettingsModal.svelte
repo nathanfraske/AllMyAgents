@@ -510,8 +510,8 @@
         <button class="btn danger-reveal" onclick={() => (dangerRevealed = true)}>I understand these reduce safety — show them</button>
       {:else}
         <div class="danger-body">
-          <label class="opt"><input type="checkbox" checked={danger.disableWorktreeCollisionWarnings} onchange={(e) => setDanger({ disableWorktreeCollisionWarnings: (e.target as HTMLInputElement).checked })} /> Disable live worktree collision warnings</label>
-          <p class="hint dim warnrow">Off (safe): if two active agents write the same file, the later writer gets one high-priority steer naming the other agent and file. On: no collision checks or warnings run. Detection never blocks or edits either worktree.</p>
+          <label class="opt"><input type="checkbox" checked={danger.disableWorktreeCollisionWarnings} onchange={(e) => setDanger({ disableWorktreeCollisionWarnings: (e.target as HTMLInputElement).checked })} /> Disable live worktree collision and staleness warnings</label>
+          <p class="hint dim warnrow">Off (safe): agents get one high-priority steer when another active agent writes the same file, or when their base branch advances through a file they are changing. On: no collision/staleness checks or integration warnings run. Detection never rebases, pauses, or edits either worktree.</p>
 
           <label class="opt"><input type="checkbox" checked={danger.autoApprovePractices} onchange={(e) => setDanger({ autoApprovePractices: (e.target as HTMLInputElement).checked })} /> Auto-approve agent practices at project / global / fleet scope</label>
           <p class="hint dim warnrow">Off (safe): an agent recording a convention that affects teammates or the whole fleet waits for your approval. On: those writes apply immediately, no prompt. (Your own-account practices are always immediate either way.)</p>

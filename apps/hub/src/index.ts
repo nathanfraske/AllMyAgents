@@ -193,6 +193,12 @@ const worktreeCollisions = new WorktreeCollisionDetector({
   sessions: () => sessions.list(),
   enabled: () => danger.disableWorktreeCollisionWarnings !== true,
   steer: (sessionId, message) => sessions.steerWorktreeCollision(sessionId, message),
+  // Global, typed risk events let a Project Manager consume the same fact without scraping agent prose.
+  // sessionId stays null because collision events concern a pair and stale-base events concern a branch;
+  // the exact involved session ids live in the stable payload contract.
+  report: (event) => {
+    journal.append(null, 'worktree/risk-detected', event)
+  },
 })
 process.once('exit', () => worktreeCollisions.stop())
 usage.setCodexReader((profileId) => sessions.readCodexLimits(profileId))

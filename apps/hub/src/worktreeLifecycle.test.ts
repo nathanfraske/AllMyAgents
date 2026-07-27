@@ -234,6 +234,41 @@ describe('worktree session lifecycle', () => {
     expect(record.worktreeFallbackReason).toContain(plain)
   })
 
+  it('persists the exact branch point and synchronously rejects a stale touched file at integration time', async () => {
+    const { repo, sessions, record, worktree } = await createWorktreeSession()
+    const initial = git(repo, 'rev-parse', 'HEAD')
+    expect(record.baseCommit).toBe(initial)
+    expect(record.baseRef).toMatch(/^refs\/heads\//)
+
+    fs.writeFileSync(path.join(worktree, 'tracked.txt'), 'agent work\n')
+    fs.writeFileSync(path.join(repo, 'tracked.txt'), 'main work\n')
+    git(repo, 'add', 'tracked.txt')
+    git(
+      repo,
+      '-c',
+      'user.name=AllMyAgents Test',
+      '-c',
+      'user.email=test@example.invalid',
+      'commit',
+      '-m',
+      'main changes tracked'
+    )
+
+    const result = await sessions.checkWorktreeIntegration(record.id)
+
+    expect(result.disabled).toBe(false)
+    expect(result.ok).toBe(false)
+    if (result.disabled) throw new Error('integration check unexpectedly disabled')
+    expect(result.baseCommit).toBe(initial)
+    expect(result.mainCommit).toBe(git(repo, 'rev-parse', 'HEAD'))
+    expect(result.staleFiles).toEqual([
+      expect.objectContaining({
+        file: 'tracked.txt',
+        commits: [expect.objectContaining({ subject: 'main changes tracked' })],
+      }),
+    ])
+  }, 20_000)
+
   it('Stop preserves tracked and untracked work, and Reopen resumes the same checkout', async () => {
     const { sessions, record, worktree } = await createWorktreeSession()
     fs.writeFileSync(path.join(worktree, 'tracked.txt'), 'operator work\n')
