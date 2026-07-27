@@ -13,7 +13,7 @@ import { InstructionStore } from './instructions.js'
 import { AgentBus } from './bus.js'
 import { MemoryStore } from './memory.js'
 import { PracticeStore } from './practices.js'
-import type { DangerFlags, SessionRecord } from './types.js'
+import type { DangerFlags, ManagerAgentType, SessionRecord } from './types.js'
 
 /**
  * SECURITY REGRESSION — the hub-side auto-approve policy must not become a blanket "full ⇒ yes".
@@ -348,6 +348,8 @@ describe('project-manager delegated authority security boundary', () => {
         allowedProfiles?: string[]
         allowedModels?: Record<string, string[]>
         allowedTools?: string[]
+        agentTypes?: ManagerAgentType[]
+        startingPrompt?: string
       },
       actor: 'operator' | 'agent'
     ): SessionRecord
@@ -359,8 +361,8 @@ describe('project-manager delegated authority security boundary', () => {
     ): SessionRecord
     managerSpawn(
       managerSessionId: string,
-      input: { profileId: string; prompt: string; model?: string }
-    ): Promise<{ ok: boolean; error?: string }>
+      input: { profileId?: string; agentType?: string; prompt: string; model?: string }
+    ): Promise<{ ok: boolean; sessionId?: string; error?: string }>
   }
 
   function controls(sessions: SessionManager): ManagerControls {
@@ -489,6 +491,86 @@ describe('project-manager delegated authority security boundary', () => {
       ok: false,
       error: expect.stringMatching(/model ungranted-model.*outside.*p1/i),
     })
+  })
+
+  it('persists named worker roles and fails closed when a role exceeds the operator-granted scope', () => {
+    const { sessions, seed } = makeSessions()
+    seed()
+    const configured = controls(sessions).configureProjectManager(
+      's1',
+      {
+        enabled: true,
+        maxLiveChildren: 3,
+        allowedProfiles: ['p1'],
+        allowedModels: { p1: ['review-model'] },
+        agentTypes: [{
+          id: 'reviewer',
+          name: 'Reviewer',
+          purpose: 'Review changes before integration',
+          selection: 'fixed',
+          profileId: 'p1',
+          model: 'review-model',
+          effort: 'high',
+        }],
+        startingPrompt: 'Coordinate the release.',
+      },
+      'operator',
+    )
+    expect(configured.managerAgentTypes).toEqual([
+      expect.objectContaining({ id: 'reviewer', profileId: 'p1', model: 'review-model', effort: 'high' }),
+    ])
+    expect(configured.managerStartingPrompt).toBe('Coordinate the release.')
+
+    expect(() => controls(sessions).configureProjectManager(
+      's1',
+      {
+        enabled: true,
+        allowedProfiles: ['p1'],
+        agentTypes: [{
+          id: 'outside',
+          name: 'Outside',
+          purpose: 'Must be rejected',
+          selection: 'usage-aware',
+          profileIds: ['p2'],
+        }],
+      },
+      'operator',
+    )).toThrow(/outside|invalid.*profile/i)
+  })
+
+  it('resolves a usage-aware agent type to an unblocked profile before spawning', async () => {
+    const { sessions, seed } = makeSessions()
+    seed({
+      isProjectManager: true,
+      managerMaxLiveChildren: 2,
+      managerAllowedProfiles: ['p1', 'p2'],
+      managerAgentTypes: [{
+        id: 'general',
+        name: 'General worker',
+        purpose: 'Implement scoped tasks',
+        selection: 'usage-aware',
+        profileIds: ['p1', 'p2'],
+      }],
+    })
+    const internals = sessions as unknown as {
+      usage: { list(): unknown[] }
+      create(profileId: string, options: unknown): Promise<SessionRecord>
+    }
+    internals.usage.list = () => [
+      { profileId: 'p1', blocked: true, blockedReason: 'limit reached' },
+      { profileId: 'p2', blocked: false, codex: { usedPercent: 70 } },
+    ]
+    let chosenProfile = ''
+    internals.create = async (profileId) => {
+      chosenProfile = profileId
+      return seed({ id: 'child', profileId, parentSessionId: 's1', status: 'starting' })
+    }
+
+    await expect(controls(sessions).managerSpawn('s1', {
+      agentType: 'general',
+      prompt: 'Implement the scoped task',
+    })).resolves.toMatchObject({ ok: true, sessionId: 'child' })
+    expect(chosenProfile).toBe('p2')
   })
 })
 

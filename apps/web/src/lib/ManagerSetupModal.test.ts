@@ -1,12 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { fireEvent, render } from '@testing-library/svelte'
+import { fireEvent, render, waitFor } from '@testing-library/svelte'
 import ManagerSetupModal from './ManagerSetupModal.svelte'
 import { store, type SessionView } from './store.svelte'
 import type { SessionRecord } from './api'
 
-const { configureProjectManager, spawn } = vi.hoisted(() => ({
+const { configureProjectManager, spawn, send, setMode, setSettings } = vi.hoisted(() => ({
   configureProjectManager: vi.fn(),
   spawn: vi.fn(),
+  send: vi.fn(),
+  setMode: vi.fn(),
+  setSettings: vi.fn(),
 }))
 
 vi.mock('./api', async (orig) => {
@@ -17,6 +20,9 @@ vi.mock('./api', async (orig) => {
       ...actual.api,
       configureProjectManager,
       spawn,
+      send,
+      setMode,
+      setSettings,
       rename: vi.fn(async () => ({ ok: true })),
     },
   }
@@ -38,6 +44,9 @@ function session(id: string, title: string, projectId = 'project-1'): SessionVie
 
 beforeEach(() => {
   vi.clearAllMocks()
+  setMode.mockResolvedValue({ ok: true })
+  setSettings.mockResolvedValue(session('settings', 'Settings').record)
+  send.mockResolvedValue({ ok: true })
   store.projects = [{ id: 'project-1', name: 'Demo project', path: 'C:/repo', createdAt: '2026-07-27T00:00:00.000Z' }]
   store.profiles = [
     { id: 'codex-a', provider: 'codex' },
@@ -86,5 +95,92 @@ describe('Manager setup', () => {
       'existing',
       expect.objectContaining({ enabled: false }),
     )
+  })
+
+  it('makes worker Git delegation and optional exact tool grants unambiguous', () => {
+    const { getByText, getAllByText, getByLabelText } = render(ManagerSetupModal, { onclose: vi.fn() })
+    expect(getByText('What the manager may grant to workers')).toBeTruthy()
+    expect(getByText(/no worker can be granted commit or push/i)).toBeTruthy()
+    expect(getByText(/optional.*workers request approval/i)).toBeTruthy()
+    expect(getByText(/choose common tools below/i)).toBeTruthy()
+    expect(getAllByText('Read').length).toBeGreaterThan(0)
+    expect(getByLabelText(/custom exact tool name/i)).toBeTruthy()
+  })
+
+  it('configures named agent types with purpose, fixed model and effort, or usage-aware selection', async () => {
+    const { getByRole, getByLabelText, getByText } = render(ManagerSetupModal, { onclose: vi.fn() })
+    expect(getByText('Agent types')).toBeTruthy()
+    await fireEvent.click(getByRole('button', { name: /add agent type/i }))
+    expect(getByLabelText(/agent type name/i)).toBeTruthy()
+    expect(getByLabelText(/what is this agent for/i)).toBeTruthy()
+    expect(getByLabelText(/worker model/i)).toBeTruthy()
+    expect(getByLabelText(/reasoning.*effort/i)).toBeTruthy()
+    expect(getByRole('button', { name: /let manager choose using usage limits/i })).toBeTruthy()
+  })
+
+  it('launches only after persisting scope, with the editable starting prompt and chosen permission mode', async () => {
+    store.managerSetupSessionId = null
+    spawn.mockResolvedValue(session('manager', 'Demo project manager').record)
+    configureProjectManager.mockImplementation(async (id: string) => ({
+      ...session(id, 'Demo project manager').record,
+      isProjectManager: true,
+    }))
+    send.mockResolvedValue({ ok: true })
+    const { getByRole, getByLabelText } = render(ManagerSetupModal, { onclose: vi.fn() })
+    const prompt = getByLabelText(/starting prompt/i) as HTMLTextAreaElement
+    expect(prompt.value).toMatch(/Demo project/i)
+    await fireEvent.input(prompt, { target: { value: 'Coordinate the release now.' } })
+    await fireEvent.change(getByLabelText(/manager permission level/i), { target: { value: 'edits' } })
+    await fireEvent.click(getByRole('button', { name: /^create and launch manager$/i }))
+
+    expect(spawn).toHaveBeenCalledWith(expect.objectContaining({ permissionMode: 'edits' }))
+    await waitFor(() => expect(configureProjectManager).toHaveBeenCalled())
+    expect(send).toHaveBeenCalledWith('manager', 'Coordinate the release now.')
+    expect(configureProjectManager.mock.invocationCallOrder[0]).toBeLessThan(send.mock.invocationCallOrder[0]!)
+  })
+
+  it('orients a fresh manager to the AllMyAgents layer, its real tools, project, and ceiling', () => {
+    store.managerSetupSessionId = null
+    const { getByLabelText } = render(ManagerSetupModal, { onclose: vi.fn() })
+    const prompt = (getByLabelText(/starting prompt/i) as HTMLTextAreaElement).value
+    expect(prompt).toMatch(/project manager in AllMyAgents/i)
+    expect(prompt).toContain('Demo project')
+    expect(prompt).toContain('C:/repo')
+    expect(prompt).toMatch(/spawn_agent.*isolated.*worktree/is)
+    expect(prompt).toMatch(/child_status.*peek_agent.*set_child_authority/is)
+    expect(prompt).toMatch(/send_message.*direct.*broadcast/is)
+    expect(prompt).toMatch(/practice.*memory/is)
+    expect(prompt).toMatch(/native.*spawn_agent.*not.*AllMyAgents/is)
+    expect(prompt).toMatch(/cannot grant.*does not hold/i)
+    expect(prompt).toMatch(/profile_id.*codex-a/i)
+    expect(prompt).toMatch(/stalls.*blocks.*errors/is)
+    expect(prompt).toMatch(/verify.*transcript.*worktree/is)
+    expect(prompt).toMatch(/final status.*files.*commits/is)
+  })
+
+  it('offers Lane O project creation inline and returns a deferred embedded launch config', async () => {
+    store.managerSetupSessionId = null
+    const onCreateProject = vi.fn()
+    const onConfigured = vi.fn()
+    const { getByRole } = render(ManagerSetupModal, {
+      onclose: vi.fn(),
+      embedded: true,
+      deferLaunch: true,
+      initialProjectId: 'project-1',
+      onCreateProject,
+      onConfigured,
+    })
+    await fireEvent.click(getByRole('button', { name: /create a new project/i }))
+    expect(onCreateProject).toHaveBeenCalledOnce()
+    await fireEvent.click(getByRole('button', { name: /add to project launch/i }))
+    expect(onConfigured).toHaveBeenCalledWith(
+      expect.objectContaining({
+        projectId: 'project-1',
+        permissionMode: expect.any(String),
+        startingPrompt: expect.stringMatching(/Demo project/i),
+        agentTypes: expect.any(Array),
+      }),
+    )
+    expect(spawn).not.toHaveBeenCalled()
   })
 })

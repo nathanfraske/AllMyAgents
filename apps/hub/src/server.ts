@@ -21,7 +21,7 @@ import { startLogin, awaitLogin, credentialsExist } from './loginLauncher.js'
 import { readProjectConfig } from './importScan.js'
 import { pickableProfiles, setClaudeConnectorPolicy } from './profiles.js'
 import { asFileWriteDiffDensity } from './types.js'
-import type { DangerFlags, HubEvent, HubPrefs, Profile, Provider } from './types.js'
+import type { DangerFlags, HubEvent, HubPrefs, ManagerAgentType, Profile, Provider } from './types.js'
 import type { Executor } from './executor.js'
 import type { WorktreeProjectActivity } from './worktreeCollisionDetector.js'
 import type { RestartState } from './restartController.js'
@@ -1126,6 +1126,20 @@ export function startServer(opts: ServerOptions): http.Server {
           }
         }
         const allowedTools = stringArray(body.allowedTools, 'allowedTools')
+        const rawAgentTypes = body.agentTypes
+        if (rawAgentTypes !== undefined && !Array.isArray(rawAgentTypes)) {
+          json(res, { error: 'agentTypes must be a list' }, 400)
+          return
+        }
+        const agentTypes = (rawAgentTypes ?? []) as ManagerAgentType[]
+        if (agentTypes.some((role) => !role || typeof role !== 'object' || Array.isArray(role))) {
+          json(res, { error: 'each agent type must be an object' }, 400)
+          return
+        }
+        if (body.startingPrompt !== undefined && typeof body.startingPrompt !== 'string') {
+          json(res, { error: 'startingPrompt must be text' }, 400)
+          return
+        }
         if (rawDelegation.some((authority) => authority !== 'commit' && authority !== 'push')) {
           json(res, { error: 'delegation may contain only commit and push' }, 400)
           return
@@ -1145,6 +1159,8 @@ export function startServer(opts: ServerOptions): http.Server {
             allowedProfiles,
             allowedModels,
             allowedTools,
+            agentTypes: rawAgentTypes === undefined ? undefined : agentTypes,
+            startingPrompt: body.startingPrompt as string | undefined,
           },
           'operator'
         )

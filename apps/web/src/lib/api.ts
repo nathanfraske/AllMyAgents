@@ -114,6 +114,8 @@ export interface SessionRecord {
   managerAllowedProfiles?: string[]
   managerAllowedModels?: Record<string, string[]>
   managerAllowedTools?: string[]
+  managerAgentTypes?: ManagerAgentType[]
+  managerStartingPrompt?: string
   parentSessionId?: string
   delegatedAuthorities?: Array<'commit' | 'push'>
   delegatedTools?: string[]
@@ -142,6 +144,17 @@ export interface SessionRecord {
   siteLabel?: string
   /** Whether that machine answered the last roster probe. False = last-known row, machine unreachable. */
   siteOnline?: boolean
+}
+
+export interface ManagerAgentType {
+  id: string
+  name: string
+  purpose: string
+  selection: 'fixed' | 'usage-aware'
+  profileId?: string
+  profileIds?: string[]
+  model?: string
+  effort?: string
 }
 
 // One existing Claude/Codex conversation found on disk that can be adopted under a project.
@@ -642,6 +655,8 @@ export const api = {
       allowedProfiles?: string[]
       allowedModels?: Record<string, string[]>
       allowedTools?: string[]
+      agentTypes?: ManagerAgentType[]
+      startingPrompt?: string
     }
   ) => jpost<SessionRecord | ApiError>(`/api/sessions/${id}/project-manager`, config),
   /** "Always allow this tool in this chat" (allow=false revokes). Takes effect on the next tool call. */

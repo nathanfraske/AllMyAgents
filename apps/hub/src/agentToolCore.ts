@@ -66,7 +66,8 @@ export interface AgentServices {
   spawnAgent?(
     managerSessionId: string,
     input: {
-      profileId: string
+      profileId?: string
+      agentType?: string
       prompt: string
       model?: string
       effort?: string
@@ -240,9 +241,10 @@ const childStatus = defineTool({
 const spawnAgent = defineTool({
   name: 'spawn_agent',
   description:
-    'Project managers only: create a child AllMyAgents session in your project, isolated in its own git worktree by default. The hub enforces your live child limit and delegation ceiling.',
+    'Project managers only: create a child AllMyAgents session in your project, isolated in its own git worktree by default. Use agent_type for an operator-defined worker role (including usage-aware selection), or profile_id for an explicitly granted account. The hub enforces your live child limit and delegation ceiling.',
   schema: {
-    profile_id: z.string().describe('installed AllMyAgents profile id for the child'),
+    profile_id: z.string().optional().describe('installed AllMyAgents profile id; omit when using agent_type'),
+    agent_type: z.string().optional().describe('operator-defined agent type id or name from the manager brief'),
     prompt: z.string().min(1).describe('the child agent task'),
     model: z.string().optional(),
     effort: z.string().optional(),
@@ -261,6 +263,7 @@ const spawnAgent = defineTool({
     if (!services.spawnAgent) return 'Not spawned: this hub does not support manager spawning.'
     const result = await services.spawnAgent(identity.sessionId, {
       profileId: args.profile_id,
+      agentType: args.agent_type,
       prompt: args.prompt,
       model: args.model,
       effort: args.effort,

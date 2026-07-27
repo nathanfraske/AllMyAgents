@@ -18,6 +18,18 @@ export interface Project {
 export type SessionStatus = 'starting' | 'active' | 'idle' | 'stopped' | 'error'
 export type DelegatedAuthority = 'commit' | 'push'
 
+export interface ManagerAgentType {
+  id: string
+  name: string
+  purpose: string
+  selection: 'fixed' | 'usage-aware'
+  /** Fixed roles use one profile; usage-aware roles let the hub choose among this operator-granted set. */
+  profileId?: string
+  profileIds?: string[]
+  model?: string
+  effort?: string
+}
+
 export interface SessionRecord {
   id: string
   profileId: string
@@ -59,6 +71,10 @@ export interface SessionRecord {
   managerAllowedModels?: Record<string, string[]>
   /** Exact executable tool names this manager may grant to children (for example Bash or WebFetch). */
   managerAllowedTools?: string[]
+  /** Operator-defined worker briefs the manager may request by name. */
+  managerAgentTypes?: ManagerAgentType[]
+  /** Editable launch brief retained with the grant so the operator can reconstruct what was handed over. */
+  managerStartingPrompt?: string
   /** Durable session lineage for sidebar nesting and hub-originated child reports. */
   parentSessionId?: string
   /** Authorities this child received from its manager, still subject to the manager's live ceiling. */

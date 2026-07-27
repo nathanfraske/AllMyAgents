@@ -149,7 +149,8 @@ export interface InProcessExecutorHubHooks {
   managerSpawn(
     managerSessionId: string,
     input: {
-      profileId: string
+      profileId?: string
+      agentType?: string
       prompt: string
       model?: string
       effort?: string

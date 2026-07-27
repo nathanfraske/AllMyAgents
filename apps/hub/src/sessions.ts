@@ -14,6 +14,7 @@ import type { WorkspaceManager } from './workspace.js'
 import type {
   ClaudeLimitInfo,
   DelegatedAuthority,
+  ManagerAgentType,
   Profile,
   Provider,
   SessionRecord,
@@ -410,7 +411,8 @@ export class SessionManager {
         const a = args as {
           managerSessionId: string
           input: {
-            profileId: string
+            profileId?: string
+            agentType?: string
             prompt: string
             model?: string
             effort?: string
@@ -884,6 +886,8 @@ export class SessionManager {
       allowedProfiles?: string[]
       allowedModels?: Record<string, string[]>
       allowedTools?: string[]
+      agentTypes?: ManagerAgentType[]
+      startingPrompt?: string
     },
     actor: 'operator' | 'agent'
   ): SessionRecord {
@@ -908,6 +912,15 @@ export class SessionManager {
         .map(([profileId, models]) => [profileId, normalizeNames(models)])
     )
     const allowedTools = normalizeNames(config.allowedTools ?? record.managerAllowedTools ?? [])
+    const agentTypes = normalizeManagerAgentTypes(
+      config.agentTypes ?? record.managerAgentTypes ?? [],
+      allowedProfiles,
+      allowedModels
+    )
+    const startingPrompt = config.startingPrompt ?? record.managerStartingPrompt ?? ''
+    if (typeof startingPrompt !== 'string' || startingPrompt.length > 20_000) {
+      throw new Error('startingPrompt must be text no longer than 20,000 characters')
+    }
 
     const previouslyManager = record.isProjectManager === true
     const previousCeiling = new Set(record.managerDelegation ?? [])
@@ -917,6 +930,8 @@ export class SessionManager {
     record.managerAllowedProfiles = config.enabled ? allowedProfiles : undefined
     record.managerAllowedModels = config.enabled ? allowedModels : undefined
     record.managerAllowedTools = config.enabled ? allowedTools : undefined
+    record.managerAgentTypes = config.enabled && agentTypes.length ? agentTypes : undefined
+    record.managerStartingPrompt = config.enabled && startingPrompt.trim() ? startingPrompt : undefined
 
     // Revocation is materialized onto every direct child now AND the approval path re-checks the live
     // manager record on every action. Either half alone is insufficient: the first makes state legible;
@@ -962,6 +977,8 @@ export class SessionManager {
       allowedProfiles: record.managerAllowedProfiles ?? [],
       allowedModels: record.managerAllowedModels ?? {},
       allowedTools: record.managerAllowedTools ?? [],
+      agentTypes: record.managerAgentTypes ?? [],
+      startingPrompt: record.managerStartingPrompt ?? '',
       by: 'operator',
       previousRole: previouslyManager,
       removedAuthorities: [...previousCeiling].filter((authority) => !ceiling.has(authority)),
@@ -1060,7 +1077,8 @@ export class SessionManager {
   private async managerSpawn(
     managerSessionId: string,
     input: {
-      profileId: string
+      profileId?: string
+      agentType?: string
       prompt: string
       model?: string
       effort?: string
@@ -1092,16 +1110,69 @@ export class SessionManager {
       return { ok: false, error: `cannot delegate ${outside.join(', ')} outside the operator-granted ceiling` }
     }
     if (!input.prompt.trim()) return { ok: false, error: 'prompt is required' }
-    if (!(manager.managerAllowedProfiles ?? []).includes(input.profileId)) {
-      return { ok: false, error: `profile ${input.profileId} is outside the operator-granted agent types` }
+    let profileId = input.profileId
+    let model = input.model
+    let effort = input.effort
+    if (input.agentType) {
+      const requested = input.agentType.trim().toLocaleLowerCase()
+      const role = (manager.managerAgentTypes ?? []).find(
+        (candidate) => candidate.id.toLocaleLowerCase() === requested || candidate.name.toLocaleLowerCase() === requested
+      )
+      if (!role) return { ok: false, error: `agent type ${input.agentType} is not in the operator-granted manager brief` }
+      if (role.selection === 'fixed') {
+        if (!role.profileId) return { ok: false, error: `agent type ${role.name} has no valid fixed profile` }
+        if (profileId && profileId !== role.profileId) {
+          return { ok: false, error: `agent type ${role.name} fixes profile ${role.profileId}; it cannot be overridden` }
+        }
+        if (model && role.model && model !== role.model) {
+          return { ok: false, error: `agent type ${role.name} fixes model ${role.model}; it cannot be overridden` }
+        }
+        profileId = role.profileId
+        model = role.model
+        effort = role.effort
+      } else {
+        const candidates = role.profileIds ?? []
+        const snapshots = new Map(this.usage.list().map((snapshot) => [snapshot.profileId, snapshot]))
+        const available = candidates
+          .map((candidate) => ({ profileId: candidate, snapshot: snapshots.get(candidate) }))
+          .filter(({ snapshot }) => snapshot?.blocked !== true)
+          .sort((left, right) => usagePressure(left.snapshot) - usagePressure(right.snapshot))
+        if (!available.length) {
+          const reasons = candidates
+            .map((candidate) => snapshots.get(candidate)?.blockedReason)
+            .filter(Boolean)
+            .join('; ')
+          return {
+            ok: false,
+            error: `all profiles for agent type ${role.name} are blocked by usage limits${reasons ? `: ${reasons}` : ''}`,
+          }
+        }
+        profileId = available[0]!.profileId
+        model = undefined
+        effort = role.effort
+        this.journal.append(manager.id, 'manager/agent-type-resolved', {
+          managerSessionId: manager.id,
+          agentTypeId: role.id,
+          agentTypeName: role.name,
+          profileId,
+          by: manager.id,
+          reason: 'lowest current unblocked usage',
+        })
+      }
+    }
+    if (!profileId) {
+      return { ok: false, error: 'profile_id is required unless an operator-defined agent_type is used' }
+    }
+    if (!(manager.managerAllowedProfiles ?? []).includes(profileId)) {
+      return { ok: false, error: `profile ${profileId} is outside the operator-granted agent types` }
     }
     if (
-      input.model &&
-      !(manager.managerAllowedModels?.[input.profileId] ?? []).includes(input.model)
+      model &&
+      !(manager.managerAllowedModels?.[profileId] ?? []).includes(model)
     ) {
       return {
         ok: false,
-        error: `model ${input.model} is outside the operator-granted models for ${input.profileId}`,
+        error: `model ${model} is outside the operator-granted models for ${profileId}`,
       }
     }
     const tools = normalizeNames(input.tools ?? [])
@@ -1115,13 +1186,13 @@ export class SessionManager {
     }
 
     try {
-      const child = await this.create(input.profileId, {
+      const child = await this.create(profileId, {
         projectId: manager.projectId,
         cwd: manager.projectId ? undefined : manager.cwd,
         repo: manager.projectId ? undefined : manager.repo,
         prompt: input.prompt,
-        model: input.model,
-        effort: input.effort,
+        model,
+        effort,
         permissionMode: input.permissionMode ?? 'safe',
         useWorktree: input.useWorktree !== false,
         parentSessionId: manager.id,
@@ -2877,6 +2948,67 @@ function normalizeNames(value: readonly unknown[]): string[] {
     if (name && name.length <= 120 && !out.includes(name)) out.push(name)
   }
   return out
+}
+
+function normalizeManagerAgentTypes(
+  value: readonly ManagerAgentType[],
+  allowedProfiles: string[],
+  allowedModels: Record<string, string[]>
+): ManagerAgentType[] {
+  if (value.length > 16) throw new Error('agentTypes may contain at most 16 roles')
+  const out: ManagerAgentType[] = []
+  for (const candidate of value) {
+    if (!candidate || typeof candidate !== 'object') throw new Error('each agent type must be an object')
+    const id = typeof candidate.id === 'string' ? candidate.id.trim() : ''
+    const name = typeof candidate.name === 'string' ? candidate.name.trim() : ''
+    const purpose = typeof candidate.purpose === 'string' ? candidate.purpose.trim() : ''
+    if (!id || id.length > 80 || !name || name.length > 80 || !purpose || purpose.length > 500) {
+      throw new Error('each agent type needs a valid id, name, and purpose')
+    }
+    if (out.some((role) => role.id.toLocaleLowerCase() === id.toLocaleLowerCase())) {
+      throw new Error(`duplicate agent type id: ${id}`)
+    }
+    if (candidate.selection === 'fixed') {
+      const profileId = typeof candidate.profileId === 'string' ? candidate.profileId.trim() : ''
+      if (!profileId || !allowedProfiles.includes(profileId)) {
+        throw new Error(`agent type ${name} uses a profile outside the operator-granted scope`)
+      }
+      const model = typeof candidate.model === 'string' && candidate.model.trim()
+        ? candidate.model.trim()
+        : undefined
+      if (model && !(allowedModels[profileId] ?? []).includes(model)) {
+        throw new Error(`agent type ${name} uses a model outside the operator-granted scope`)
+      }
+      const effort = typeof candidate.effort === 'string' && candidate.effort.trim()
+        ? candidate.effort.trim()
+        : undefined
+      out.push({ id, name, purpose, selection: 'fixed', profileId, model, effort })
+      continue
+    }
+    if (candidate.selection !== 'usage-aware') {
+      throw new Error(`agent type ${name} has an unknown selection mode`)
+    }
+    const profileIds = normalizeNames(candidate.profileIds ?? [])
+    if (!profileIds.length || profileIds.some((profileId) => !allowedProfiles.includes(profileId))) {
+      throw new Error(`agent type ${name} has invalid usage-aware profile candidates`)
+    }
+    const effort = typeof candidate.effort === 'string' && candidate.effort.trim()
+      ? candidate.effort.trim()
+      : undefined
+    out.push({ id, name, purpose, selection: 'usage-aware', profileIds, effort })
+  }
+  return out
+}
+
+function usagePressure(snapshot: {
+  blocked: boolean
+  codex?: { usedPercent?: number }
+  claudeUsage?: Array<{ percent: number }>
+} | undefined): number {
+  if (snapshot?.blocked) return Number.POSITIVE_INFINITY
+  if (typeof snapshot?.codex?.usedPercent === 'number') return snapshot.codex.usedPercent
+  if (snapshot?.claudeUsage?.length) return Math.max(...snapshot.claudeUsage.map((line) => line.percent))
+  return 0
 }
 
 function delegableToolName(kind: string, payload: unknown): string | undefined {
