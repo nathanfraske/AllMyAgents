@@ -734,10 +734,19 @@ export class HubStore {
       if (delivered.error) {
         // The attachment first-turn transaction created this empty session solely to mint upload ids.
         // Roll it back when upload/send fails so the visible draft remains the one honest retry point.
-        await api.deleteSession(rec.id).catch(() => undefined)
-        if (this.sessions[rec.id] && !this.basePanes().flat().includes(rec.id)) {
+        // Deletion can be REFUSED when an uploaded file is now recoverable workspace data. In that case
+        // keep the spawned chat visible too: hiding it locally would orphan the only route back to the
+        // preserved files while the hub correctly keeps the session alive.
+        const cleanup = await this.requestSessionDelete(rec.id)
+        if (cleanup.ok && this.sessions[rec.id] && !this.basePanes().flat().includes(rec.id)) {
           const { [rec.id]: _failed, ...withoutFailed } = this.sessions
           this.sessions = withoutFailed
+        }
+        if (!cleanup.ok) {
+          this.ensure(rec)
+          await alertDialog(
+            `The first message failed, and the partially created chat could not be removed. It remains visible because the hub preserved recoverable work.\n\n${cleanup.error}`
+          )
         }
         return { error: delivered.error }
       }
@@ -1150,10 +1159,34 @@ export class HubStore {
     v.liveTokens = undefined
   }
 
-  // Delete a chat: tell the hub (which stops it + writes a tombstone), then drop it locally.
-  async deleteSession(id: string): Promise<void> {
-    await api.deleteSession(id).catch(() => undefined)
+  /**
+   * Ask the hub to delete a session and preserve its structured refusal. `jpost` resolves non-2xx
+   * responses as `{ error }`, so a catch alone is not a success check. Keeping this seam shared with
+   * attachment-transaction cleanup prevents either delete path from orphaning a hub session locally.
+   */
+  private async requestSessionDelete(id: string): Promise<{ ok: true } | { ok: false; error: string }> {
+    try {
+      const out = await api.deleteSession(id)
+      if (out?.ok === true) return { ok: true }
+      return { ok: false, error: out?.error?.trim() || 'the hub did not confirm deletion' }
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : 'the hub could not be reached',
+      }
+    }
+  }
+
+  // Delete a chat only after the hub confirms its tombstone. A refusal deliberately leaves every local
+  // reference intact and explains where the protected work remains (the hub's reason includes that path).
+  async deleteSession(id: string): Promise<{ ok: true } | { ok: false; error: string }> {
+    const out = await this.requestSessionDelete(id)
+    if (!out.ok) {
+      await alertDialog(`Chat was not deleted. Its workspace and chat remain available.\n\n${out.error}`)
+      return out
+    }
     this.removeSessionLocal(id)
+    return out
   }
 
   // Rename a chat optimistically (freezes auto-naming). The canonical session/titled echo re-applies

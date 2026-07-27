@@ -2,7 +2,7 @@
   import { untrack } from 'svelte'
   import { api, type ProjectInfo } from './api'
   import { store, type SessionView } from './store.svelte'
-  import { confirmDialog } from './dialog.svelte'
+  import { alertDialog, confirmDialog } from './dialog.svelte'
   import { relativeTime } from './time'
   import { shouldBadgeNodes } from './fleetMerge'
   import Usage from './Usage.svelte'
@@ -496,8 +496,11 @@
 
   async function act(e: MouseEvent, id: string, verb: 'interrupt' | 'stop'): Promise<void> {
     e.stopPropagation()
-    if (verb === 'interrupt') await api.interrupt(id)
-    else await api.stop(id)
+    const out = verb === 'interrupt' ? await api.interrupt(id) : await api.stop(id)
+    // These compact controls sit outside ThreadView's inline action-error footer. Preserve the same
+    // contract here with an in-app alert: jpost resolves a refusal as `{ error }`, so awaiting it without
+    // inspecting the value makes a rejected Stop/Interrupt look successful.
+    if (out.error) await alertDialog(`${verb} failed: ${out.error}`)
   }
 
   async function del(e: MouseEvent, id: string, name: string): Promise<void> {

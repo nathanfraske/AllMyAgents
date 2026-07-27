@@ -4,6 +4,7 @@ import { store } from './store.svelte'
 import { settings } from './settings.svelte'
 import { loadLastLayout, saveLastLayout } from './uiState'
 import { buildAgentRuns } from './agentTree'
+import { alertDialog } from './dialog.svelte'
 import type { HubEvent, SessionRecord } from './api'
 
 // The store imports ./api (real network / WebSocket) and ./settings.svelte (localStorage).
@@ -34,6 +35,10 @@ vi.mock('./api', () => {
     },
   }
 })
+
+vi.mock('./dialog.svelte', () => ({
+  alertDialog: vi.fn(async () => {}),
+}))
 
 describe('owner preferences', () => {
   it('defaults mid-turn steering on and applies a live preference update without restarting', async () => {
@@ -338,6 +343,23 @@ describe('deleteSession / removeSessionLocal', () => {
     expect(store.selectedId).toBeNull()
     expect(panes()).toEqual([])
   })
+
+  it('keeps the chat visible and surfaces the workspace path when the hub refuses deletion', async () => {
+    const workspace = 'C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\workspaces\\protected'
+    const reason = `workspace has recoverable uncommitted work at ${workspace}`
+    seed('protected', { cwd: workspace })
+    store.selectedId = 'protected'
+    ;(api.deleteSession as unknown as { mockResolvedValueOnce(v: unknown): void }).mockResolvedValueOnce({
+      error: reason,
+    })
+
+    await store.deleteSession('protected')
+
+    expect(store.sessions.protected).toBeDefined()
+    expect(store.selectedId).toBe('protected')
+    expect(panes()).toEqual([['protected']])
+    expect(alertDialog).toHaveBeenCalledWith(expect.stringContaining(reason))
+  })
 })
 
 // --- newSession (local draft) + materializeDraft --------------------------------------------
@@ -399,6 +421,28 @@ describe('newSession (draft) + materializeDraft', () => {
 
     expect(store.selectedId).toBe('old')
     expect(panes()).toEqual([['old', 'spawned']])
+  })
+
+  it('keeps a partially created chat visible when cleanup deletion is refused', async () => {
+    const workspace = 'C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\workspaces\\spawned'
+    store.profiles = [{ id: 'p1', provider: 'claude' }]
+    ;(api.spawn as unknown as { mockResolvedValueOnce(v: unknown): void }).mockResolvedValueOnce(
+      rec('spawned', { cwd: workspace })
+    )
+    ;(api.deleteSession as unknown as { mockResolvedValueOnce(v: unknown): void }).mockResolvedValueOnce({
+      error: `workspace has recoverable uncommitted work at ${workspace}`,
+    })
+    await store.newSession('p1')
+    const draftId = store.selectedId!
+
+    const out = await store.materializeDraft(draftId, 'with attachment', async () => ({
+      error: 'attachment upload failed',
+    }))
+
+    expect(out.error).toBe('attachment upload failed')
+    expect(store.sessions[draftId]).toBeDefined()
+    expect(store.sessions.spawned).toBeDefined()
+    expect(alertDialog).toHaveBeenCalledWith(expect.stringContaining(workspace))
   })
 
   it('opens settings instead of drafting when there is no profile at all', async () => {
