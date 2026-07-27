@@ -5,10 +5,15 @@
   import { buildAgentRuns, summarizeRuns, latestActivity, type AgentRun } from './agentTree'
   import { loadOpenAgentPanels, saveOpenAgentPanels } from './uiState'
   import type { ThreadItem } from './store.svelte'
+  import { api } from './api'
   import ItemCard from './ItemCard.svelte'
   import Icon from './Icon.svelte'
 
-  let { items, sessionId }: { items: ThreadItem[]; sessionId: string } = $props()
+  let {
+    items,
+    sessionId,
+    provider,
+  }: { items: ThreadItem[]; sessionId: string; provider: 'claude' | 'codex' } = $props()
 
   // Popped-out state is remembered PER CHAT, so the panel is still open when you come back to this chat
   // after a reload or a hub restart (the runs themselves rebuild from journal history).
@@ -25,6 +30,8 @@
     saveOpenAgentPanels([...next])
   }
   let expanded = $state<string | null>(null)
+  let stopping = $state(new Set<string>())
+  let stopError = $state<Record<string, string>>({})
   let now = $state(Date.now())
 
   // `now` is threaded in rather than read inside, because staleness is a function of elapsed time: with a
@@ -66,6 +73,24 @@
   /** How long since we last heard anything — the number that actually explains a stalled run. */
   function silentFor(r: AgentRun<ThreadItem>): string {
     return elapsed(now - r.lastSignalAt)
+  }
+
+  function stopTarget(r: AgentRun<ThreadItem>): string | undefined {
+    return provider === 'claude' ? r.taskId : r.id
+  }
+
+  async function stopAgent(r: AgentRun<ThreadItem>): Promise<void> {
+    const target = stopTarget(r)
+    if (!target) return
+    stopping = new Set(stopping).add(r.id)
+    stopError = { ...stopError, [r.id]: '' }
+    const out = await api.interruptAgent(sessionId, target, r.description)
+    if (out.error) {
+      const next = new Set(stopping)
+      next.delete(r.id)
+      stopping = next
+      stopError = { ...stopError, [r.id]: `stop failed: ${out.error}` }
+    }
   }
 
   /** One line describing the agent's most recent signal — the "what is it doing right now" answer. */
@@ -121,7 +146,18 @@
               {#if r.background}<span class="chip">background</span>{/if}
               {#if tools}<span class="chip">{tools} tool{tools === 1 ? '' : 's'}</span>{/if}
               <span class="doing">{nowDoing(r)}</span>
+              {#if (r.status === 'running' || r.status === 'stalled') && stopTarget(r)}
+                <button
+                  class="stop-agent"
+                  title={`Stop ${r.description}`}
+                  disabled={stopping.has(r.id)}
+                  onclick={() => stopAgent(r)}
+                >
+                  {stopping.has(r.id) ? 'stopping…' : 'stop'}
+                </button>
+              {/if}
             </div>
+            {#if stopError[r.id]}<div class="stoperr" role="alert">{stopError[r.id]}</div>{/if}
 
             {#if expanded === r.id}
               <div class="detail">
@@ -193,6 +229,13 @@
   .rsub { display: flex; align-items: center; gap: 0.3rem; margin-top: 0.25rem; font-size: 0.7rem; overflow: hidden; }
   .chip { border: 1px solid var(--border); border-radius: 999px; padding: 0 0.35rem; flex: none; }
   .doing { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .stop-agent {
+    flex: none; border: 1px solid var(--border-strong); border-radius: 999px; padding: 0 0.38rem;
+    background: transparent; color: inherit; font-size: 0.66rem; cursor: pointer;
+  }
+  .stop-agent:hover:not(:disabled) { border-color: var(--bad, #e06c6c); color: var(--bad, #e06c6c); }
+  .stop-agent:disabled { cursor: wait; opacity: 0.6; }
+  .stoperr { margin-top: 0.25rem; color: var(--bad, #e06c6c); font-size: 0.68rem; }
   .detail { margin-top: 0.45rem; border-top: 1px dashed var(--border); padding-top: 0.4rem; }
   .acts { display: flex; flex-direction: column; gap: 0.2rem; max-height: 40vh; overflow-y: auto; }
   .empty { font-size: 0.72rem; padding: 0.2rem 0; }

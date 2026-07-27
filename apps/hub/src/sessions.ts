@@ -1758,6 +1758,22 @@ export class SessionManager {
     this.journal.append(sessionId, 'session/interrupted', {})
   }
 
+  /**
+   * Stop ONE vendor sub-agent. This is deliberately not stop(): no record status changes, no executor
+   * maps are dropped, and no worktree cleanup runs, so the parent, siblings, and every partial edit survive.
+   */
+  async interruptAgent(sessionId: string, targetId: string, label?: string): Promise<void> {
+    const record = this.sessions.get(sessionId)
+    if (!record) throw new Error(`unknown session: ${sessionId}`)
+    if (!targetId.trim()) throw new Error('sub-agent target is required')
+    if (!this.executor.interruptAgent) throw new Error('this executor cannot stop one sub-agent independently')
+    await this.executor.interruptAgent(sessionId, targetId)
+    this.journal.append(sessionId, 'session/agent-stop-requested', {
+      targetId,
+      ...(label?.trim() ? { label: label.trim().slice(0, 160) } : {}),
+    })
+  }
+
   async stop(sessionId: string): Promise<void> {
     const record = this.sessions.get(sessionId)
     if (!record) return

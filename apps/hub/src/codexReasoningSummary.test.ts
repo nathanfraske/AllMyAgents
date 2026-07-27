@@ -38,3 +38,23 @@ describe('Codex reasoning summaries', () => {
     )
   })
 })
+
+describe('Codex interrupts', () => {
+  it('targets the active turn, not just its thread', async () => {
+    const client = new CodexClient('unused', vi.fn())
+    const request = vi.spyOn(client, 'request').mockResolvedValue(undefined)
+
+    ;(client as unknown as { onLine(line: string): void }).onLine(
+      JSON.stringify({
+        method: 'turn/started',
+        params: { threadId: 'thread-1', turn: { id: 'turn-1' } },
+      })
+    )
+    await client.interrupt('thread-1')
+
+    expect(request).toHaveBeenCalledWith('turn/interrupt', {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+    })
+  })
+})

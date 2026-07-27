@@ -549,6 +549,8 @@ export const api = {
   // Request on-demand context compaction (the `/compact` built-in). See CompactResult.
   compact: (id: string) => jpost<CompactResult>(`/api/sessions/${id}/compact`),
   interrupt: (id: string) => jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/interrupt`),
+  interruptAgent: (id: string, targetId: string, label?: string) =>
+    jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/agents/interrupt`, { targetId, label }),
   stop: (id: string) => jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/stop`),
   // The inverse of stop(): revive a stopped/errored chat to idle so it's usable again (composer frees,
   // bus-reachable). Fixes stop() being a permanent one-way brick.

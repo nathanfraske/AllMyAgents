@@ -1521,6 +1521,12 @@ export class HubStore {
         if (status === 'idle') this.scheduleQueueFlush(sessionId)
         break
       }
+      case 'session/agent-stop-requested': {
+        const p = payload as { targetId?: string; label?: string }
+        const who = p.label?.trim() || (p.targetId ? `sub-agent ${p.targetId.slice(0, 8)}` : 'sub-agent')
+        this.push(view, { kind: 'note', ts, text: `stop requested for ${who} — work preserved` })
+        break
+      }
       case 'session/mode': {
         const pm = (payload as { permissionMode?: string }).permissionMode
         if (pm === 'safe' || pm === 'edits' || pm === 'full') view.record.permissionMode = pm
