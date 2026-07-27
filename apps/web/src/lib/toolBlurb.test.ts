@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { basename, toolBlurb, truncateMiddle } from './toolBlurb'
+import { basename, stripShellWrapper, toolBlurb, truncateMiddle } from './toolBlurb'
 import type { ThreadItem } from './store.svelte'
 
 // New module → "passes against old code too" is hollow (there is no old code). Each assertion below was
@@ -77,11 +77,41 @@ describe('toolBlurb — Claude tools', () => {
   })
 })
 
+describe('stripShellWrapper', () => {
+  it('unwraps the real Windows powershell form Codex actually emits', () => {
+    // Exactly what the sandbox showed: the launcher path buried the real command.
+    expect(
+      stripShellWrapper('"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command ls')
+    ).toBe('ls')
+    expect(
+      stripShellWrapper(`"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command 'cat package.json'`)
+    ).toBe('cat package.json')
+  })
+  it('unwraps cmd /c and sh/bash -c', () => {
+    expect(stripShellWrapper('cmd.exe /c dir')).toBe('dir')
+    expect(stripShellWrapper('/bin/bash -lc "echo hi"')).toBe('echo hi')
+    expect(stripShellWrapper('sh -c ls')).toBe('ls')
+  })
+  it('leaves a bare command untouched', () => {
+    expect(stripShellWrapper('npm run build')).toBe('npm run build')
+    expect(stripShellWrapper('git commit -m "powershell is fine mid-string"')).toBe(
+      'git commit -m "powershell is fine mid-string"'
+    )
+  })
+})
+
 describe('toolBlurb — Codex tools', () => {
   it('reads a Codex command from a string, an argv array, or a { command } object', () => {
     expect(toolBlurb(tool('command', 'npm run build'))?.label).toBe('npm run build')
     expect(toolBlurb(tool('command', ['git', 'status']))?.label).toBe('git status')
     expect(toolBlurb(tool('command', { command: 'ls -la' }))?.label).toBe('ls -la')
+  })
+
+  it('unwraps the powershell launcher for the label but keeps the full command on hover', () => {
+    const raw = '"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command ls'
+    const b = toolBlurb(tool('command', raw))
+    expect(b?.label).toBe('ls')
+    expect(b?.title).toBe(raw)
   })
 
   it('labels a Codex fileChange by basename', () => {

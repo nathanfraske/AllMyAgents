@@ -58,6 +58,32 @@ function commandText(input: unknown): string | undefined {
   return undefined
 }
 
+function unquote(s: string): string {
+  const m = /^(['"])([\s\S]*)\1$/.exec(s.trim())
+  return m ? (m[2] as string) : s
+}
+
+/**
+ * Strip a leading shell-runner wrapper so the blurb shows the ACTUAL command, not the launcher.
+ *
+ * Codex on Windows runs every command as `"C:\…\powershell.exe" -Command <cmd>`, so an un-stripped
+ * blurb is 60 characters of powershell path with the real command (`ls`, `cat package.json`) truncated
+ * off the end — the launcher, not the thing it ran. Also handles cmd.exe /c and sh/bash -c. The full
+ * wrapped command is still available on hover (the caller keeps it as the title).
+ */
+export function stripShellWrapper(cmd: string): string {
+  const patterns = [
+    /^\s*"?[^"]*\b(?:powershell|pwsh)(?:\.exe)?"?\s+(?:-\w+(?:\s+\S+)?\s+)*-Command\s+([\s\S]+)$/i,
+    /^\s*"?[^"]*\bcmd(?:\.exe)?"?\s+\/[cC]\s+([\s\S]+)$/i,
+    /^\s*"?[^"]*\b(?:ba)?sh"?\s+-[a-z]*c\s+([\s\S]+)$/i,
+  ]
+  for (const re of patterns) {
+    const m = re.exec(cmd)
+    if (m) return unquote((m[1] as string).trim())
+  }
+  return cmd
+}
+
 function firstString(obj: Record<string, unknown> | undefined, keys: string[]): string | undefined {
   if (!obj) return undefined
   for (const k of keys) {
@@ -79,8 +105,9 @@ export function toolBlurb(item: ThreadItem): ToolBlurb | undefined {
 
   // --- Codex items (store sets toolInput to the command value / the file-change item) ---
   if (name === 'command') {
-    const c = commandText(input)
-    return c ? { label: clipEnd(c), title: c } : undefined
+    const raw = commandText(input)
+    if (!raw) return undefined
+    return { label: clipEnd(stripShellWrapper(raw)), title: raw } // clean label, full command on hover
   }
   if (name === 'fileChange') {
     const p = firstString(objOf(input), ['path', 'file', 'filename'])
