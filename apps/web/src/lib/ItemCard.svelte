@@ -3,12 +3,39 @@
   import Markdown from './Markdown.svelte'
   import DiffView from './DiffView.svelte'
   import { fileDiffsFromItem } from './diff'
-  import { toolBlurb } from './toolBlurb'
+  import { toolBlurb, agentActivity, parseBusFrame, type AgentDir } from './toolBlurb'
   import MessageAttachments from './MessageAttachments.svelte'
+  import { store } from './store.svelte'
+  import { initialDiffExpanded } from './diffDisplay'
 
   let { item, sessionId = '' }: { item: ThreadItem; sessionId?: string } = $props()
   let open = $state(false)
   let showFull = $state(false)
+
+  // Hub agent-tool activity (bus messages, peeks, memory/practice) rendered as a colour-distinct blurb
+  // with a direction arrow. Teammate ids resolve to display names via the roster; the arrow carries the
+  // direction WITHOUT relying on colour. See toolBlurb.agentActivity.
+  const resolveName = (id: string): string | undefined => store.sessionLabel(id) || undefined
+  const agentAct = $derived(item.kind === 'tool' ? agentActivity(item, resolveName) : undefined)
+  // A user turn that IS a delivered-message frame (defensive: the hub currently delivers via bus/delivered,
+  // but if a frame ever lands as prompt text we collapse the wall to an inbound blurb rather than dump it).
+  const busFrame = $derived(item.kind === 'user' ? parseBusFrame(item.text) : null)
+  // Reuse the ONE density setting: agent-activity detail starts collapsed except under 'verbose'.
+  const density = $derived(store.prefs?.fileWriteDiffDensity ?? 'minimal')
+  let detailOpen = $state(false)
+  let detailInit = false
+  $effect(() => {
+    if (!detailInit) {
+      detailOpen = initialDiffExpanded(density)
+      detailInit = true
+    }
+  })
+  const ARROW: Record<AgentDir, string> = { out: '↑', in: '↓', none: '✦' }
+  function sendersLabel(senders: string[]): string {
+    if (senders.length === 0) return 'a teammate'
+    if (senders.length <= 2) return senders.join(' & ')
+    return `${senders[0]} +${senders.length - 1}`
+  }
 
   const longUser = $derived(
     item.kind === 'user' && !!item.text && (item.text.length > 600 || item.text.split('\n').length > 8)
@@ -43,6 +70,15 @@
   <div class="note dim">{item.text}</div>
 {:else if item.kind === 'error'}
   <div class="err">{item.text}</div>
+{:else if busFrame}
+  <div class="agentact in">
+    <button class="ahd" onclick={() => (detailOpen = !detailOpen)} title="teammate messages delivered by the hub">
+      <span class="aarrow" aria-hidden="true">↓</span>
+      <span class="alabel">{busFrame.count} message{busFrame.count === 1 ? '' : 's'} from {sendersLabel(busFrame.senders)}</span>
+      {#if fmtTime(item.ts)}<span class="ts" title={new Date(item.ts).toLocaleString()}>{fmtTime(item.ts)}</span>{/if}
+    </button>
+    {#if detailOpen}<pre class="araw">{item.text}</pre>{/if}
+  </div>
 {:else if item.kind === 'assistant' || item.kind === 'user'}
   <div class="msg {item.kind}">
     <div class="who">{item.kind}{#if fmtTime(item.ts)}<span class="ts" title={new Date(item.ts).toLocaleString()}>{fmtTime(item.ts)}</span>{/if}</div>
@@ -73,6 +109,19 @@
         <div class="diff-err">{item.toolName} failed{#if item.toolResult} — {item.toolResult.slice(0, 300)}{/if}</div>
       {/if}
     </div>
+  {:else if agentAct}
+    <div class="agentact {agentAct.dir}">
+      <button class="ahd" onclick={() => (detailOpen = !detailOpen)}>
+        <span class="aarrow" aria-hidden="true">{ARROW[agentAct.dir]}</span>
+        <span class="alabel">{agentAct.label}</span>
+        {#if item.toolError}<span class="fail">error</span>{/if}
+        {#if fmtTime(item.ts)}<span class="ts" title={new Date(item.ts).toLocaleString()}>{fmtTime(item.ts)}</span>{/if}
+      </button>
+      {#if detailOpen}
+        <pre class="araw">{JSON.stringify(item.toolInput, null, 2)}</pre>
+        {#if item.toolResult}<pre class="araw out" class:fail={item.toolError}>{item.toolResult.slice(0, 2000)}</pre>{/if}
+      {/if}
+    </div>
   {:else}
     <div class="tool" class:reflex={item.reflex}>
       <button class="hd" onclick={() => (open = !open)}>
@@ -88,15 +137,19 @@
     </div>
   {/if}
 {:else if item.kind === 'bus'}
-  <div class="bus {item.busDir ?? 'received'}">
-    <div class="bus-hd">
-      <span class="bus-dir">{item.busDir === 'sent' ? '→ sent to' : '← from'}</span>
-      <span class="bus-peer">{item.busPeer}</span>
-      {#if item.busSubject}<span class="bus-subj">{item.busSubject}</span>{/if}
-      {#if fmtTime(item.ts)}<span class="ts" title={new Date(item.ts).toLocaleString()}>{fmtTime(item.ts)}</span>{/if}
+  <!-- A SENT bus event is already represented by the send_message agent-activity blurb above, so we
+       don't render a second card for it. A RECEIVED (hub-pushed) message renders as the inbound blurb. -->
+  {#if item.busDir !== 'sent'}
+    <div class="agentact in">
+      <button class="ahd" onclick={() => (detailOpen = !detailOpen)}>
+        <span class="aarrow" aria-hidden="true">↓</span>
+        <span class="alabel">message received from {item.busPeer}</span>
+        {#if item.busSubject}<span class="asubj">{item.busSubject}</span>{/if}
+        {#if fmtTime(item.ts)}<span class="ts" title={new Date(item.ts).toLocaleString()}>{fmtTime(item.ts)}</span>{/if}
+      </button>
+      {#if detailOpen && item.text}<div class="abody"><Markdown text={item.text} /></div>{/if}
     </div>
-    <div class="bus-body"><Markdown text={item.text ?? ''} /></div>
-  </div>
+  {/if}
 {/if}
 
 <style>
@@ -130,4 +183,17 @@
   .io.fail { color: var(--bad); }
   .diffs { display: flex; flex-direction: column; gap: 0.4rem; }
   .diff-err { color: var(--bad-text); background: color-mix(in srgb, var(--bad) 12%, transparent); border: 1px solid var(--bad); border-radius: 6px; padding: 0.3rem 0.5rem; font-size: 0.74rem; font-family: var(--mono); word-break: break-word; }
+
+  /* Hub agent-tool activity (bus messages, peeks, memory/practice) — colour-distinct from ordinary tool
+     calls via the theme-safe --secondary token, with a direction arrow (↑ sent, ↓ received, ✦ query) that
+     reads WITHOUT colour so it still parses for anyone who can't distinguish the hue. */
+  .agentact { border-left: 2px solid var(--secondary); padding: 0.05rem 0 0.05rem 0.5rem; }
+  .ahd { display: flex; align-items: baseline; gap: 0.4rem; width: 100%; text-align: left; background: none; border: none; cursor: pointer; font-size: 0.8rem; color: var(--secondary); }
+  .ahd:hover .alabel { color: var(--text); }
+  .aarrow { flex: none; font-weight: 700; }
+  .alabel { color: var(--secondary); }
+  .asubj { color: var(--muted); font-size: 0.74rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .abody { margin-top: 0.3rem; }
+  .araw { background: var(--bg); border-radius: 6px; padding: 0.4rem 0.5rem; font-size: 0.72rem; margin: 0.3rem 0 0; overflow-x: auto; white-space: pre-wrap; word-break: break-word; color: var(--muted); }
+  .araw.fail { color: var(--bad); }
 </style>

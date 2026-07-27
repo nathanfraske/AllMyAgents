@@ -153,3 +153,113 @@ export function toolBlurb(item: ThreadItem): ToolBlurb | undefined {
 function objOf(input: unknown): Record<string, unknown> | undefined {
   return input && typeof input === 'object' && !Array.isArray(input) ? (input as Record<string, unknown>) : undefined
 }
+
+// --- Hub agent-tool activity (bus messages, peeks, memory/practice) ------------------------------
+//
+// The hub-provided MCP tools are teammate/agent activity, not ordinary file/shell tools — the operator
+// wants them legible and colour-distinct, with a direction arrow (↑ sent, ↓ received) that reads WITHOUT
+// colour. Claude names them `mcp__allmyagents__<tool>`; Codex surfaces them as `mcp:<tool>` — handle both.
+
+export type AgentDir = 'out' | 'in' | 'none'
+export interface AgentActivity {
+  label: string
+  dir: AgentDir
+}
+
+const AGENT_TOOL_PREFIXES = ['mcp__allmyagents__', 'mcp:']
+
+/** The bare hub tool name (e.g. 'send_message') if this is a hub agent tool, else null. */
+export function agentToolName(toolName: string | undefined): string | null {
+  if (!toolName) return null
+  for (const p of AGENT_TOOL_PREFIXES) if (toolName.startsWith(p)) return toolName.slice(p.length)
+  return null
+}
+
+function shortId(id: string | undefined): string {
+  return id ? id.slice(0, 8) : 'unknown'
+}
+
+/** How many messages a read_messages result returned. Empty inbox is 'No messages.' (hub), so a poll
+ *  that got nothing yields 0 — and MUST NOT render as an inbound message (a poll is not a receipt). */
+export function readMessagesCount(result: string | undefined): number {
+  if (!result) return 0
+  const matches = result.match(/^\[\d+\] from /gm)
+  return matches ? matches.length : 0
+}
+
+/**
+ * Classify a hub agent-tool call. `resolveName` maps a teammate session id to a display name (its
+ * scientist name, or the operator's rename); a short id is the rare fallback. Returns undefined for a hub
+ * tool with no nice phrasing (falls back to the generic tool card) — never invents awkward text.
+ */
+export function agentActivity(
+  item: ThreadItem,
+  resolveName?: (id: string) => string | undefined
+): AgentActivity | undefined {
+  if (item.kind !== 'tool') return undefined
+  const tool = agentToolName(item.toolName)
+  if (!tool) return undefined
+  const obj = objOf(item.toolInput)
+  const nameOf = (id: string | undefined): string => (id ? resolveName?.(id) || shortId(id) : 'a teammate')
+  switch (tool) {
+    case 'send_message': {
+      const to = firstString(obj, ['to_session'])
+      return to
+        ? { label: `message sent to ${nameOf(to)}`, dir: 'out' }
+        : { label: 'broadcast to your project', dir: 'out' }
+    }
+    case 'read_messages': {
+      const n = readMessagesCount(item.toolResult)
+      // A poll that got nothing is not a receipt — no inbound arrow (dir 'none').
+      return n > 0
+        ? { label: `${n} message${n === 1 ? '' : 's'} received`, dir: 'in' }
+        : { label: 'checked for messages', dir: 'none' }
+    }
+    case 'peek_agent':
+      return { label: `peeked at ${nameOf(firstString(obj, ['to_session']))}`, dir: 'none' }
+    case 'list_agents':
+      return { label: 'listed teammates', dir: 'none' }
+    case 'memory_write':
+      return { label: 'wrote a memory', dir: 'none' }
+    case 'memory_search':
+      return { label: 'searched memory', dir: 'none' }
+    case 'memory_read':
+      return { label: 'read a memory', dir: 'none' }
+    case 'practice_write':
+    case 'practice_edit':
+      return { label: 'wrote a practice', dir: 'none' }
+    case 'practice_read':
+      return { label: 'read a practice', dir: 'none' }
+    case 'practice_list':
+      return { label: 'listed practices', dir: 'none' }
+    default:
+      return undefined // unknown hub tool → generic card, not awkward phrasing
+  }
+}
+
+// --- Inbound bus frame (teammate messages the hub pushes into a turn as prompt text) -------------
+export interface BusFrame {
+  count: number
+  senders: string[]
+}
+
+/**
+ * Detect + parse the hub's teammate-message frame if `text` IS one (see sessions.ts frameBusMessages):
+ *   <<ALLMYAGENTS-BUS — N message(s) from teammate agents, delivered by the hub>>
+ *   [1] from <label> (agent <id>) — <subject>
+ *   …
+ *   <<END ALLMYAGENTS-BUS>>
+ *   <trust paragraph>
+ * Returns the count + sender display names so it renders as an inbound blurb with the wall collapsed; null
+ * for an ordinary message (so normal user turns are byte-for-byte untouched).
+ */
+export function parseBusFrame(text: string | undefined): BusFrame | null {
+  if (!text) return null
+  const head = /<<ALLMYAGENTS-BUS — (\d+) message\(s\)/.exec(text)
+  if (!head || !text.includes('<<END ALLMYAGENTS-BUS>>')) return null
+  const senders: string[] = []
+  const re = /^\[\d+\] from (.+?) \(agent [0-9a-f]+\)/gm
+  let m: RegExpExecArray | null
+  while ((m = re.exec(text)) !== null) senders.push((m[1] as string).trim())
+  return { count: Number(head[1]) || 0, senders }
+}
