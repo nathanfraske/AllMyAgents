@@ -17,6 +17,17 @@ import type { BrowserOperation, BrowserResultContent } from './browserProtocol.j
  */
 export type Awaitable<T> = T | Promise<T>
 
+export interface ManagerSpawnResult {
+  ok: boolean
+  sessionId?: string
+  label?: string
+  error?: string
+  worktree?: string | null
+  cwd?: string
+  worktreeRequested?: boolean
+  worktreeFallbackReason?: string
+}
+
 /** The subset of `MemoryStore` the agent tools call, widened to `Awaitable` so a worker RPC proxy can
  *  satisfy it. `MemoryStore` itself still satisfies it — a synchronous return is assignable to `Awaitable`. */
 export interface MemoryServices {
@@ -77,7 +88,7 @@ export interface AgentServices {
       authorities?: DelegatedAuthority[]
       tools?: string[]
     }
-  ): Awaitable<{ ok: boolean; sessionId?: string; label?: string; error?: string }>
+  ): Awaitable<ManagerSpawnResult>
   /** Project-manager-only update of one direct child's narrowly scoped authority. */
   setChildAuthority?(
     managerSessionId: string,
@@ -282,7 +293,15 @@ const spawnAgent = defineTool({
       tools: args.tools,
     })
     if (!result.ok) return `Not spawned: ${result.error ?? 'unknown error'}`
-    return `Spawned child ${result.label ?? 'agent'} (session ${result.sessionId}).`
+    const spawned = `Spawned child ${result.label ?? 'agent'} (session ${result.sessionId}).`
+    if (result.worktreeRequested === true && !result.worktree) {
+      return (
+        `${spawned} WARNING: spawned WITHOUT requested worktree isolation: ` +
+        `${result.worktreeFallbackReason ?? 'the hub did not create a worktree'}. ` +
+        `Child cwd: ${result.cwd ?? 'unknown'}.`
+      )
+    }
+    return `${spawned}${result.worktree ? ` Worktree: ${result.worktree}.` : ''}`
   },
 })
 
