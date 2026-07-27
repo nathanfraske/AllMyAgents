@@ -230,10 +230,20 @@ async function app() {
   }
   const webPort = Number(process.env.SANDBOX_WEB_PORT ?? 5274) // 5273 is the normal dev server
   console.log(`sandbox app  http://127.0.0.1:${webPort}  →  hub 127.0.0.1:${PORT}`)
+  // `shell: true` is REQUIRED on Windows, not cosmetic. Node 20+ refuses to spawn a .cmd/.bat directly
+  // (CVE-2024-27980 hardening) and throws EINVAL before the app ever opens. Three auditors hit exactly
+  // that here and had to launch the frontend by hand — which is worse than a broken script, because it
+  // quietly turns "test it in the real app" into "test it however you can".
+  // Every argument below is a fixed literal or a number, so there is nothing for the shell to re-split.
   const child = spawn(
     process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm',
     ['--filter', 'web', 'dev', '--port', String(webPort), '--strictPort'],
-    { cwd: REPO, stdio: 'inherit', env: { ...process.env, HUB_URL: `http://127.0.0.1:${PORT}` } }
+    {
+      cwd: REPO,
+      stdio: 'inherit',
+      shell: process.platform === 'win32',
+      env: { ...process.env, HUB_URL: `http://127.0.0.1:${PORT}` },
+    }
   )
   await new Promise((resolve) => child.on('exit', resolve))
 }
