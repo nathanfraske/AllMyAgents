@@ -95,6 +95,26 @@ async function createWorktreeSession() {
 }
 
 describe('unfiled chat workspace lifecycle', () => {
+  it('recognizes Git canonicalizing a filesystem alias before removing a pristine workspace', () => {
+    const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ama-workspace-alias-')))
+    const realData = path.join(tmp, 'real-data')
+    const aliasedData = path.join(tmp, 'aliased-data')
+    fs.mkdirSync(realData)
+    fs.symlinkSync(realData, aliasedData, process.platform === 'win32' ? 'junction' : 'dir')
+    const workspace = new WorkspaceManager(
+      path.join(aliasedData, 'worktrees'),
+      path.join(aliasedData, 'workspaces')
+    )
+    const sessionId = 'canonical-path-fixture'
+    const cwd = workspace.createScratch(sessionId)
+    workspace.checkpointScratch(sessionId)
+    cleanups.push(() => fs.rmSync(tmp, { recursive: true, force: true }))
+
+    expect(fs.realpathSync.native(cwd)).not.toBe(path.resolve(cwd))
+    expect(workspace.removeScratch(sessionId)).toEqual({ ok: true })
+    expect(fs.existsSync(cwd)).toBe(false)
+  })
+
   it('gives an unfiled chat its own workspace instead of the hub directory', async () => {
     const { hubRoot, dataDir, sessions } = buildHub()
 

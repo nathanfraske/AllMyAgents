@@ -31,8 +31,16 @@ export class WorkspaceManager {
   }
 
   private samePath(left: string, right: string): boolean {
-    const a = path.resolve(left)
-    const b = path.resolve(right)
+    const canonical = (value: string): string => {
+      const resolved = path.resolve(value)
+      try {
+        return fs.realpathSync.native(resolved)
+      } catch {
+        return resolved
+      }
+    }
+    const a = canonical(left)
+    const b = canonical(right)
     return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b
   }
 
