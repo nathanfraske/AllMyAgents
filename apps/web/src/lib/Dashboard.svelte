@@ -1,11 +1,15 @@
 <script lang="ts">
   import { untrack } from 'svelte'
-  import { store } from './store.svelte'
+  import { store, type SessionView } from './store.svelte'
   import { settings } from './settings.svelte'
   import { relativeTime } from './time'
-  import { api, type StatsResult, type DayStat } from './api'
+  import { api, type StatsResult, type DayStat, type WorktreeProjectActivity } from './api'
   import ProviderLogo from './ProviderLogo.svelte'
   import Icon from './Icon.svelte'
+
+  // Lane O owns the modal behind this callback. Dashboard only provides its front door.
+  // Optional until that lane is present so the home view remains independently renderable in tests.
+  let { onnewproject = () => {} }: { onnewproject?: () => void } = $props()
 
   let nameInput = $state('')
   let stats = $state<StatsResult | null>(null)
@@ -96,20 +100,87 @@
     })
   }
 
-  interface ProjRow { id: string; name: string; count: number; last: string }
-  const projectRows = $derived.by(() => {
-    const map = new Map<string, ProjRow>()
-    for (const s of sessions) {
-      const key = s.record.projectId ?? '__none__'
-      const nm = key === '__none__' ? 'Unfiled' : (store.projects.find((p) => p.id === key)?.name ?? key)
-      const row = map.get(key) ?? { id: key, name: nm, count: 0, last: '' }
-      row.count++
-      if (!row.last || s.lastActivity > row.last) row.last = s.lastActivity
-      map.set(key, row)
+  // ProjectView reads the same two cheap sources: the live roster for team state and the collision
+  // detector's already-computed project snapshot for file risks. Home takes ONE snapshot per project
+  // while mounted; unlike ProjectView it does not poll, and it never opens a session transcript.
+  let projectActivity = $state<Record<string, WorktreeProjectActivity | null | undefined>>({})
+  const projectIdsKey = $derived(store.projects.map((project) => project.id).sort().join('\u0000'))
+  $effect(() => {
+    const ids = projectIdsKey ? projectIdsKey.split('\u0000') : []
+    const missing = ids.filter((id) => projectActivity[id] === undefined)
+    if (missing.length === 0) return
+    let current = true
+    void Promise.all(
+      missing.map(async (id) => {
+        const result = await api.projectActivity(id).catch(() => null)
+        return [id, result && !('error' in result) ? result : null] as const
+      }),
+    ).then((entries) => {
+      if (current) projectActivity = { ...projectActivity, ...Object.fromEntries(entries) }
+    })
+    return () => {
+      current = false
     }
-    return [...map.values()].sort((a, b) => b.count - a.count)
   })
-  const maxProjCount = $derived(Math.max(1, ...projectRows.map((r) => r.count)))
+
+  interface ProjRow {
+    id: string
+    name: string
+    siteLabel?: string
+    agents: number
+    working: number
+    approvals: number
+    failed: number
+    risks: number
+    attention: number
+    last: string
+  }
+  const projectRows = $derived.by(() => {
+    const byProject = new Map<string, SessionView[]>()
+    for (const s of sessions) {
+      if (!s.record.projectId) continue
+      const projectSessions = byProject.get(s.record.projectId) ?? []
+      projectSessions.push(s)
+      byProject.set(s.record.projectId, projectSessions)
+    }
+    return store.projects
+      .map((project): ProjRow => {
+        const projectSessions = byProject.get(project.id) ?? []
+        const sessionIds = new Set(projectSessions.map((session) => session.record.id))
+        const approvals = store.approvals.filter((approval) => approval.sessionId && sessionIds.has(approval.sessionId)).length
+        const working = projectSessions.filter(
+          (session) => session.record.status === 'active' || session.record.status === 'starting',
+        ).length
+        const failed = projectSessions.filter(
+          (session) => session.record.status === 'error' || session.lastTurnOk === false,
+        ).length
+        const risks = projectActivity[project.id]?.risks.length ?? 0
+        const last =
+          projectSessions.reduce(
+            (latest, session) => (!latest || session.lastActivity > latest ? session.lastActivity : latest),
+            '',
+          )
+        return {
+          id: project.id,
+          name: project.name,
+          siteLabel: project.siteLabel,
+          agents: projectSessions.length,
+          working,
+          approvals,
+          failed,
+          risks,
+          attention: approvals + failed + risks,
+          last,
+        }
+      })
+      .sort(
+        (a, b) =>
+          b.attention - a.attention ||
+          b.working - a.working ||
+          Date.parse(b.last || '0') - Date.parse(a.last || '0') ||
+          a.name.localeCompare(b.name),
+      )
+  })
 
   const greeting = $derived.by(() => {
     const name = settings.ownerName || 'operator'
@@ -197,6 +268,17 @@
     const n = nameInput.trim()
     if (n) settings.set('ownerName', n)
   }
+  function startScratchpad(): void {
+    const before = new Set(Object.keys(store.sessions))
+    // `newSession` creates its draft synchronously. This explicit action promises NO project even when
+    // the operator configured a default destination for other detached chats, so clear the destination
+    // on exactly the draft this click created before Svelte paints it.
+    void store.newSession()
+    const id = store.selectedId
+    if (id && !before.has(id) && store.sessions[id]?.draft) {
+      store.updateDraft(id, { projectId: undefined })
+    }
+  }
   function onEnter(d: DayStat, e: MouseEvent): void {
     hovered = d
     tipX = e.clientX
@@ -237,6 +319,32 @@
             </div>
           {/if}
           <p class="dim">Drag a chat from the sidebar into this space to open it — drop it beside another to split, or above/below to stack.</p>
+          <div class="launch-actions" aria-label="Start something">
+            <button
+              class="launch-action project-action new-project"
+              aria-label="New Project"
+              title="Set up a project and a team"
+              onclick={onnewproject}
+            >
+              <span class="launch-icon"><Icon name="folder-plus" size={18} /></span>
+              <span class="launch-copy">
+                <span class="launch-title">+ New Project</span>
+                <span class="launch-sub">Set up a project and a team</span>
+              </span>
+            </button>
+            <button
+              class="launch-action scratch-action"
+              aria-label="New Scratchpad — no project, isolated workspace, start typing"
+              title="No project · its own isolated scratch workspace · start typing now"
+              onclick={startScratchpad}
+            >
+              <span class="launch-icon"><Icon name="square-pen" size={18} /></span>
+              <span class="launch-copy">
+                <span class="launch-title">New Scratchpad</span>
+                <span class="launch-sub">No project · own space · type now</span>
+              </span>
+            </button>
+          </div>
         </div>
       </div>
 
@@ -294,17 +402,48 @@
         {/if}
       </section>
 
-      <section class="card">
-        <h3>Projects by usage</h3>
+      <section class="card project-card">
+        <div class="project-card-head">
+          <div>
+            <h3>Projects</h3>
+            <p>Open a project for its full team overview.</p>
+          </div>
+        </div>
         {#if projectRows.length === 0}
-          <div class="dim empty2">no projects yet — create one from the sidebar</div>
+          <div class="project-empty">
+            <span class="empty-icon"><Icon name="folder-plus" size={21} /></span>
+            <div>
+              <h4>Create your first project</h4>
+              <p>Use New Project above to choose its repository and launch a team.</p>
+            </div>
+          </div>
         {:else}
-          <div class="projs">
+          <div class="project-list">
             {#each projectRows as r (r.id)}
-              <div class="proj">
-                <div class="ptop"><span class="pname">{r.name}</span><span class="dim pmeta">{r.count} · {r.last ? relativeTime(r.last) : '—'}</span></div>
-                <div class="pbar"><div class="pfill" style="width: {Math.round((r.count / maxProjCount) * 100)}%"></div></div>
-              </div>
+              <button
+                class="project-launch"
+                class:attention={r.attention > 0}
+                aria-label={`Open ${r.name} project`}
+                onclick={() => store.openProjectView(r.id)}
+              >
+                <span class="project-main">
+                  <span class="project-title">
+                    <h4>{r.name}</h4>
+                    {#if r.siteLabel}<span class="site-label">{r.siteLabel}</span>{/if}
+                  </span>
+                  <span class="project-signals">
+                    <span>{r.agents} {r.agents === 1 ? 'agent' : 'agents'}</span>
+                    {#if r.working}<span class="working">{r.working} working</span>{/if}
+                    {#if r.approvals}<span class="needs">{r.approvals} {r.approvals === 1 ? 'needs' : 'need'} approval</span>{/if}
+                    {#if r.failed}<span class="failed">{r.failed} failed</span>{/if}
+                    {#if r.risks}<span class="needs">{r.risks} worktree {r.risks === 1 ? 'risk' : 'risks'}</span>{/if}
+                  </span>
+                </span>
+                <span class="project-last">
+                  <span>{r.last ? relativeTime(r.last) : 'No activity yet'}</span>
+                  <Icon name="chevron-right" size={16} />
+                </span>
+              </button>
             {/each}
           </div>
         {/if}
@@ -355,7 +494,7 @@
 {/if}
 
 <style>
-  .dashwrap { position: relative; height: 100%; overflow-y: auto; container-type: inline-size; }
+  .dashwrap { position: relative; height: 100%; overflow-y: auto; overflow-x: hidden; container-type: inline-size; }
   /* One soft radial accent glow behind the hero so the landing reads as depth, not a flat void. */
   .dashwrap::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 440px; z-index: 0; pointer-events: none;
     background: radial-gradient(60% 40% at 20% 0%, color-mix(in srgb, var(--accent) 10%, transparent), transparent 72%); }
@@ -396,6 +535,22 @@
   .nameask { display: flex; gap: var(--space-3); margin: var(--space-4) 0; }
   .nameask input { flex: 1; max-width: 320px; }
   .hero p { font-size: var(--text-sm); margin: var(--space-3) 0 0; }
+  .launch-actions { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: var(--space-3); max-width: 660px; margin-top: var(--space-5); }
+  .launch-action { min-width: 0; display: flex; align-items: center; gap: var(--space-3);
+    padding: var(--space-3) var(--space-4); border: 1px solid var(--border); border-radius: var(--r-md);
+    text-align: left; box-shadow: var(--edge-hi), var(--shadow-1); }
+  .project-action { color: #fff; background: linear-gradient(135deg, var(--accent), var(--cyan));
+    border-color: color-mix(in srgb, var(--accent) 72%, white);
+    box-shadow: 0 8px 26px color-mix(in srgb, var(--accent) 22%, transparent), var(--edge-hi); }
+  .scratch-action { color: var(--text); background: var(--surface); }
+  .project-action:hover { filter: brightness(1.08); }
+  .scratch-action:hover { border-color: var(--border-accent); background: var(--surface-2); }
+  .launch-icon { flex: none; display: grid; place-items: center; }
+  .scratch-action .launch-icon { color: var(--accent); }
+  .launch-copy { min-width: 0; display: flex; flex-direction: column; gap: var(--space-1); }
+  .launch-title { font-size: var(--text-sm); line-height: 1.15; font-weight: var(--fw-semibold); }
+  .launch-sub { color: color-mix(in srgb, currentColor 74%, transparent); font-size: var(--text-xs); line-height: 1.25; }
   .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: var(--space-4); }
 
   /* Modern surface treatment shared by every card-like panel: a soft low-contrast border,
@@ -445,13 +600,40 @@
   .cell.selected, .cell.selected:hover { box-shadow: inset 0 0 0 2px var(--accent); }
   .legend { display: flex; align-items: center; gap: 4px; font-size: var(--text-2xs); margin-top: var(--space-4); }
   .legend .k { width: 12px; height: 12px; border-radius: var(--r-xs); display: inline-block; box-shadow: inset 0 0 0 1px var(--border); }
-  .projs { display: flex; flex-direction: column; gap: var(--space-4); }
-  .ptop { display: flex; justify-content: space-between; font-size: var(--text-sm); margin-bottom: var(--space-1); }
-  .pname { font-weight: var(--fw-medium); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .pmeta { font-size: var(--text-xs); font-family: var(--mono); font-variant-numeric: tabular-nums; flex: none; }
-  .pbar { height: 6px; background: var(--surface-3); border-radius: var(--r-pill); overflow: hidden; }
-  .pfill { height: 100%; border-radius: var(--r-pill); background: linear-gradient(90deg, var(--cyan), var(--accent));
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25); }
+  .project-card-head { display: flex; align-items: start; justify-content: space-between; gap: var(--space-4); margin-bottom: var(--space-4); }
+  .project-card-head h3 { margin-bottom: var(--space-1); }
+  .project-card-head p { margin: 0; color: var(--dim); font-size: var(--text-xs); }
+  .project-list { display: flex; flex-direction: column; gap: var(--space-2); }
+  .project-launch {
+    width: 100%; min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center; gap: var(--space-4); padding: var(--space-3) var(--space-4);
+    border: 1px solid var(--border-subtle); border-radius: var(--r-md); background: var(--surface-2);
+    text-align: left; color: var(--text);
+  }
+  .project-launch:hover { border-color: var(--border-accent); background: var(--surface-3); }
+  .project-launch.attention {
+    border-color: color-mix(in srgb, var(--warn) 48%, var(--border));
+    background: color-mix(in srgb, var(--warn) 6%, var(--surface-2));
+  }
+  .project-main { min-width: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+  .project-title { min-width: 0; display: flex; align-items: center; gap: var(--space-2); }
+  .project-title h4 { min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-size: var(--text-sm); font-weight: var(--fw-semibold); }
+  .site-label { flex: none; max-width: 10rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: var(--dim); font-size: var(--text-2xs); }
+  .project-signals { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); color: var(--muted); font-size: var(--text-xs); }
+  .project-signals span { white-space: nowrap; }
+  .project-signals .working { color: var(--working); }
+  .project-signals .needs { color: var(--warn); }
+  .project-signals .failed { color: var(--bad-text); }
+  .project-last { flex: none; display: inline-flex; align-items: center; gap: var(--space-2); color: var(--dim);
+    font-family: var(--mono); font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
+  .project-empty { display: flex; align-items: center; gap: var(--space-4); padding: var(--space-4);
+    border: 1px dashed var(--border-strong); border-radius: var(--r-md); background: var(--surface-2); }
+  .empty-icon { flex: none; display: grid; place-items: center; width: 40px; height: 40px; border-radius: var(--r-md);
+    color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .project-empty h4 { margin: 0 0 var(--space-1); font-size: var(--text-sm); }
+  .project-empty p { margin: 0; color: var(--dim); font-size: var(--text-xs); }
   .empty2 { font-size: var(--text-sm); padding: var(--space-3) 0; }
 
   /* Day-detail panel — stretches to the full height of the calendar/projects stack and
@@ -482,7 +664,8 @@
     .tile:hover { transform: translateY(-2px); border-color: var(--border-strong);
       box-shadow: var(--edge-hi), var(--shadow-3); }
     .cell { transition: box-shadow var(--dur) var(--ease), background var(--dur-slow) var(--ease); }
-    .pfill { transition: width var(--dur-slow) var(--ease); }
+    .project-launch { transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease), transform var(--dur-fast) var(--ease); }
+    .project-launch:hover { transform: translateX(2px); }
     .tip { animation: pop-in var(--dur-fast) var(--ease); }
 
     /* Matrix-decode entrance: the stat tiles, both left cards and the detail panel stay hidden
@@ -508,5 +691,23 @@
   @keyframes reveal-up {
     from { opacity: 0; transform: translateY(10px); }
     to { opacity: 1; transform: translateY(0); }
+  }
+  @container (max-width: 540px) {
+    .launch-actions { grid-template-columns: minmax(0, 1fr); }
+    .project-launch { grid-template-columns: minmax(0, 1fr); }
+    .project-last { justify-content: space-between; }
+  }
+  /* A 480px app with its minimum sidebar leaves about 210px for Home. Keep that genuinely usable:
+     the identity form wraps instead of imposing its desktop min-content width, padding yields to the
+     content, and stat cards can form two narrow columns without creating a page-level x scroller. */
+  @container (max-width: 420px) {
+    .dash { padding: var(--space-5) var(--space-4); gap: var(--space-4); }
+    .hero { gap: var(--space-4); margin-bottom: var(--space-5); }
+    .hero .logo { width: 46px; height: 46px; }
+    .nameask { flex-wrap: wrap; }
+    .nameask input { flex: 1 1 8rem; min-width: 0; }
+    .tiles { grid-template-columns: repeat(auto-fit, minmax(88px, 1fr)); gap: var(--space-3); }
+    .tile, .card, .detail { padding: var(--space-4); }
+    .project-empty { align-items: flex-start; padding: var(--space-3); }
   }
 </style>

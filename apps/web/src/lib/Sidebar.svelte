@@ -623,7 +623,13 @@
        button — deleting the old brand button would have removed the way back to the dashboard) and reads
        out the hub connection in WORDS, not just a colour, from store.connected + store.hubDownSeconds. -->
   <div class="connbar">
-    <button class="homebtn" title="home / dashboard" aria-label="home / dashboard" onclick={() => store.goHome()}><Icon name="home" size={15} /></button>
+    <button
+      class="homebtn"
+      class:current={!store.selectedId && store.splitPanes.length === 0 && !store.projectViewId}
+      title="Home — projects and launchpad"
+      aria-label="Home"
+      onclick={() => store.goHome()}
+    ><Icon name="home" size={17} /><span>Home</span></button>
     <span class="conn-label" class:down={!store.connected}>
       {store.connected ? 'Connected' : store.hubDownSeconds > 0 ? `Reconnecting… ${store.hubDownSeconds}s` : 'Reconnecting…'}
     </span>
@@ -889,8 +895,13 @@
 <style>
   .sidebar { display: flex; flex-direction: column; height: 100%; min-height: 0; background: var(--sidebar); border-right: 1px solid var(--border); }
   .connbar { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); border-bottom: 1px solid var(--border-subtle); }
-  .homebtn { display: grid; place-items: center; width: 26px; height: 26px; border-radius: var(--r-sm); color: var(--muted); flex: none; }
-  .homebtn:hover { background: var(--surface); color: var(--text); }
+  .homebtn { display: inline-flex; align-items: center; justify-content: center; gap: var(--space-2);
+    height: 38px; padding: 0 var(--space-3); border: 1px solid var(--border); border-radius: var(--r-md);
+    background: var(--surface); color: var(--text); font-size: var(--text-sm); font-weight: var(--fw-semibold);
+    box-shadow: var(--edge-hi), var(--shadow-1); flex: none; }
+  .homebtn:hover { border-color: var(--border-accent); background: var(--surface-2); color: var(--text); }
+  .homebtn.current { border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+    background: color-mix(in srgb, var(--accent) 10%, var(--surface)); color: var(--accent); }
   .conn-label { flex: 1; min-width: 0; font-size: var(--text-xs); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
   .conn-label.down { color: var(--warn, #d08700); }
   .conn-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08); }
