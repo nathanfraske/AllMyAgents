@@ -119,9 +119,21 @@ const listAgents = defineTool({
 const sendMessage = defineTool({
   name: 'send_message',
   description:
-    'Send a message to a teammate agent. Give `to_session` (from list_agents) to reach one agent, or omit it to broadcast to every agent on your project. The hub delivers it into their next turn.',
+    'Send a message to a teammate agent. Give `to_session` (from list_agents) to reach one agent — the hub delivers it into their next turn. ' +
+    'PREFER ADDRESSING SPECIFIC AGENTS. Omitting `to_session` broadcasts to EVERY agent on your project, which wakes all of them: ' +
+    'each then spends a turn working out whether the message was meant for it, and the ones it was not meant for still have to read, ' +
+    'reason about and dismiss it. Two direct messages are almost always better than one broadcast. ' +
+    'Broadcast only when every agent genuinely needs to act — a change to shared conventions, a stop-work notice, ' +
+    'a fact that invalidates work in progress. If you find yourself broadcasting so the right agent sees it, you do not need a ' +
+    'broadcast; you need list_agents and one or two direct messages.',
   schema: {
-    to_session: z.string().optional().describe('recipient agent session id from list_agents; omit to broadcast to your project'),
+    to_session: z
+      .string()
+      .optional()
+      .describe(
+        'recipient agent session id from list_agents. Strongly preferred: address specific agents. ' +
+          'Omit ONLY to broadcast to the whole project, which interrupts every agent and should be rare.'
+      ),
     subject: z.string().optional().describe('short subject line'),
     body: z.string().describe('the message body'),
   },
