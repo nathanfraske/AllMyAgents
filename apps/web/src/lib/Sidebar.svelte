@@ -796,7 +796,8 @@
                       }}
                     >
                       <Icon name="flag" size={9} />
-                      <span>manager · {en.managerChildCount} {en.managerChildCount === 1 ? 'agent' : 'agents'}</span>
+                      <span class="manager-role-full">manager · {en.managerChildCount} {en.managerChildCount === 1 ? 'agent' : 'agents'}</span>
+                      <span class="manager-role-compact" aria-hidden="true">{en.managerChildCount}</span>
                     </button>
                   </span>
                 {:else}
@@ -806,7 +807,7 @@
                 {#if s.record.worktree}
                   <span class="wtbadge" title={s.record.worktree} aria-label={`Worktree branch ${s.record.branch ?? s.record.worktree.split(/[\\/]/).pop()}`}>
                     <Icon name="git-branch" size={9} />
-                    <span>{s.record.branch ?? s.record.worktree.split(/[\\/]/).pop()}</span>
+                    <span class="wtbadge-label">{s.record.branch ?? s.record.worktree.split(/[\\/]/).pop()}</span>
                   </span>
                 {/if}
                 {#if s.record.siteLabel}<span class="rbadge" title="on {s.record.siteLabel} (remote fleet machine)"><Icon name="server" size={9} /></span>{/if}
@@ -924,7 +925,10 @@
     box-shadow: inset 0 0 0 1px var(--border-accent); border-radius: var(--r-sm); }
   .fempty.droptarget { border-style: solid; border-color: transparent; color: var(--text); }
 
-  .row { position: relative; display: flex; align-items: center; gap: var(--space-3); padding: var(--space-2) var(--space-3) var(--space-2) var(--space-6); border-radius: var(--r-md); cursor: pointer; }
+  .row { position: relative; display: flex; align-items: center; gap: var(--space-3); padding: var(--space-2) var(--space-3) var(--space-2) var(--space-6); border-radius: var(--r-md); cursor: pointer;
+    /* The row is its own responsive unit: sidebar width is user-resizable, and pane/window width is
+       irrelevant to what can fit here. Descendant container rules below encode the degradation order. */
+    container-type: inline-size; }
   /* Managers get hierarchy, not another inline badge competing with provider/worktree/mail/approval.
      The second line spends a little vertical space on the one row that runs the team and preserves
      horizontal room for the scientist name and genuine attention signals. */
@@ -948,6 +952,7 @@
     font-size: 0.56rem; line-height: 1; font-weight: var(--fw-semibold); letter-spacing: 0.055em;
     text-transform: uppercase; white-space: nowrap;
   }
+  .manager-role-compact { display: none; font-variant-numeric: tabular-nums; }
   .manager-role:hover { color: var(--text); }
   .manager-orphan { flex: none; display: grid; place-items: center; width: 12px; color: var(--warn); opacity: 0.9; }
   .row.orphanedchild { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--warn) 55%, transparent); }
@@ -978,7 +983,24 @@
   .wtbadge { flex: none; display: inline-flex; align-items: center; gap: 0.15rem;
     padding: 0.05rem 0.25rem; border: 1px solid var(--border); border-radius: var(--r-sm);
     color: var(--muted); font-family: var(--mono); font-size: var(--text-2xs); }
-  .wtbadge span { white-space: nowrap; }
+  .wtbadge-label { white-space: nowrap; }
+  /* Priority order for a shrinking session row:
+     1. Branch COPY yields first; the branch icon + full tooltip preserve the isolation signal.
+     2. The manager subtitle switches atomically to flag + count, never half-clipped text.
+     3. Relative time yields next (status already has its dot/attention icon).
+     4. Only then is the session name allowed to spend the remaining flexible width and ellipsize.
+     Unread mail, approvals and failure warnings never disappear. */
+  @container (max-width: 400px) {
+    .wtbadge { width: 1.25rem; padding-inline: 0; justify-content: center; }
+    .wtbadge-label { display: none; }
+  }
+  @container (max-width: 280px) {
+    .manager-role-full { display: none; }
+    .manager-role-compact { display: inline; }
+  }
+  @container (max-width: 225px) {
+    .rtime, .rdots { display: none; }
+  }
   /* Fleet machine/site tags: a labelled pill on a remote project header, and a compact icon marker on
      a remote chat row (its label rides in the tooltip). Only rendered for REMOTE sites, so the
      single-machine view shows neither. */

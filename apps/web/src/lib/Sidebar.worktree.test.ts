@@ -68,4 +68,29 @@ describe('sidebar worktree marker', () => {
     expect(marker?.title).toBe('C:/data/worktrees/37fa1798')
     expect(direct?.querySelector('.wtbadge')).toBeNull()
   })
+
+  it('provides atomic compact labels for the combined narrow manager and worktree row', () => {
+    const manager = session(
+      'manager',
+      'Project coordination manager with a deliberately long identity',
+      'C:/data/worktrees/d7af8a04',
+      'agent/d7af8a04-with-a-deliberately-long-branch',
+    )
+    manager.record.isProjectManager = true
+    const child = session('child', 'delegated child')
+    child.record.parentSessionId = 'manager'
+    store.sessions = { manager, child }
+
+    const { container } = render(Sidebar)
+    const row = container.querySelector<HTMLElement>('.row.manager')
+    expect(row?.querySelector('.rlabel')?.textContent).toBe(manager.record.title)
+
+    const marker = row?.querySelector<HTMLElement>('.wtbadge')
+    expect(marker?.querySelector('.wtbadge-label')?.textContent).toBe(manager.record.branch)
+    expect(marker?.title).toBe(manager.record.worktree)
+
+    expect(row?.querySelector('.manager-role-full')?.textContent).toMatch(/manager.*1 agent/i)
+    expect(row?.querySelector('.manager-role-compact')?.textContent?.trim()).toBe('1')
+    expect(row?.querySelector('.manager-role-compact')?.getAttribute('aria-hidden')).toBe('true')
+  })
 })
