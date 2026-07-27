@@ -5,6 +5,7 @@
   import CodexActivityGroup from './CodexActivityGroup.svelte'
   import { groupCodexItems, type CodexRenderNode } from './codexGroup'
   import { classifyDecideOutcome } from './approvals'
+  import { approvalBlurb } from './approvalBlurb'
   import { distanceFromBottom, shouldShowJumpToBottom, newItemsBelow } from './transcriptScroll'
   import PastedTextChip from './PastedTextChip.svelte'
   import { shouldPromotePaste, composeWithPastes, type PastedText } from './pastePromote'
@@ -12,6 +13,7 @@
   import ModelPicker from './ModelPicker.svelte'
   import TraitsControl from './TraitsControl.svelte'
   import PermissionPicker from './PermissionPicker.svelte'
+  import WorktreePicker from './WorktreePicker.svelte'
   import AccountPicker from './AccountPicker.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
   import FirstChatGuide from './FirstChatGuide.svelte'
@@ -132,8 +134,17 @@
   // off the hub's 'stopped' guard forever. Surface a Reopen affordance instead of interrupt/stop so the
   // operator can revive it in one click (api.reopen → hub setStatus idle → journaled status un-sticks it).
   const stopped = $derived(view?.record.status === 'stopped')
-  // Worktree intent: for a draft there is no real worktree path yet, so read the pre-spawn flag.
-  const worktreeOn = $derived(view?.draft ? !!view.draftUseWorktree : !!view?.record.worktree)
+  // Intent and outcome are deliberately separate. A draft says what WILL happen; a spawned chat reports
+  // what IS true from the returned record. A persisted reason makes disagreement visible, never a guess.
+  const draftWorkMode = $derived(view?.draftUseWorktree ? 'worktree' : 'project')
+  const actualWorkMode = $derived(view?.record.worktree ? 'worktree' : 'project')
+  const projectPath = $derived(
+    store.projects.find((project) => project.id === view?.record.projectId)?.path
+      ?? (!view?.record.worktree ? view?.record.cwd : undefined)
+  )
+  const worktreeMismatch = $derived(
+    !isDraft && view?.record.worktreeRequested === true && !view?.record.worktree
+  )
   // Draft-only inline permission picker (the real PermissionPicker posts to the hub, which a draft
   // has no session for). Mirrors the real picker's modes; writes the choice into the draft record.
   const PERM_MODES = [
@@ -564,7 +575,7 @@
     await decide(id, true)
   }
 
-  /** The tool a pending approval is about, when it is a tool approval at all (kind 'claude/tool'). */
+  /** The normalized tool a pending Claude/Codex approval is about (agent-tool gates have no grant). */
   function approvalTool(payload: unknown): string | null {
     const name = (payload as { toolName?: unknown } | null)?.toolName
     return typeof name === 'string' && name ? name : null
@@ -606,23 +617,6 @@
     }
   }
 
-  /**
-   * Render what is actually being asked. This used to be `toolName + JSON.stringify(input).slice(0, 200)`
-   * on ONE line, which was unreadable for anything structured — a tool whose input carries a question and
-   * a list of options got truncated mid-JSON, so the operator could not even see what they were approving,
-   * let alone answer it. Pretty-print, and give it enough room to be legible (the box scrolls).
-   */
-  function summarizeApproval(payload: unknown): string {
-    const p = payload as { toolName?: string; input?: unknown }
-    const body = p?.toolName ? p.input : payload
-    let text: string
-    try {
-      text = typeof body === 'string' ? body : JSON.stringify(body ?? {}, null, 2)
-    } catch {
-      text = String(body)
-    }
-    return text.length > 4000 ? `${text.slice(0, 4000)}\n… (truncated)` : text
-  }
 </script>
 
 {#if !view}
@@ -659,13 +653,21 @@
           <span class="folder">No folder</span>
         {/if}
         <span class="where-sep" aria-hidden="true">·</span>
-        <span class="where-icon" aria-hidden="true"><Icon name={worktreeOn ? 'git-branch' : 'folder'} size={11} /></span>
+        <span class="where-icon" aria-hidden="true"><Icon name={(isDraft ? draftWorkMode : actualWorkMode) === 'worktree' ? 'git-branch' : 'folder'} size={11} /></span>
         <span class="path">{shownWorkingDirectory}</span>
       </div>
     </div>
     <button class="hicon" title="split view" onclick={() => store.startSplit()}><Icon name="columns" size={15} /></button>
     <button class="hicon" title="close (keeps the chat)" onclick={() => store.closePane(paneIndex)}><Icon name="x" size={15} /></button>
   </div>
+
+  {#if worktreeMismatch}
+    <div class="wtwarning" role="alert">
+      <Icon name="alert-triangle" size={14} />
+      <span><strong>Worktree was requested, but this chat is working directly in the project folder.</strong>
+        {view.record.worktreeFallbackReason ?? 'The hub did not report why the isolated checkout was not created.'}</span>
+    </div>
+  {/if}
 
   <div class="stream scroll" bind:this={scroller} onscroll={onScroll}>
     <!-- Items produced INSIDE a spawned sub-agent are excluded here and rendered in the agent panel
@@ -723,12 +725,14 @@
     <TaskStrip items={view.items} />
 
     {#each approvals as a (a.id)}
-      <div class="approval">
+      {@const blurb = approvalBlurb(a.kind, a.payload)}
+      <div class="approval" data-testid="approval-{a.id}">
         <div class="atop">
           <span class="alabel">PENDING APPROVAL</span>
-          <span class="dim">{approvalTool(a.payload) ?? a.kind}</span>
+          <span class="dim">{blurb.toolName}</span>
         </div>
-        <pre class="abody">{summarizeApproval(a.payload)}</pre>
+        <div class="asummary" title={blurb.title ?? blurb.label}>{blurb.label}</div>
+        {#if blurb.detail}<pre class="abody">{blurb.detail}</pre>{/if}
         <div class="aacts">
           <button class="abtn ok" onclick={() => decide(a.id, true)}>Approve once</button>
           {#if approvalTool(a.payload)}
@@ -809,10 +813,14 @@
             allowedTools={view.record.allowedTools ?? []}
           />
         {/if}
-        {#if store.canToggleWorktree(view)}
-          <button class="pill-btn" title="Isolated git worktree vs. work directly in the project — switch before your first message" onclick={() => store.toggleWorktree()}>
-            <Icon name={worktreeOn ? 'git-branch' : 'folder'} size={13} /> {worktreeOn ? 'worktree' : 'in project'}
-          </button>
+        {#if view.record.projectId}
+          <WorktreePicker
+            draft={isDraft}
+            selected={isDraft ? draftWorkMode : actualWorkMode}
+            worktreePath={view.record.worktree}
+            {projectPath}
+            onselect={(mode) => store.setDraftWorktree(view.record.id, mode === 'worktree')}
+          />
         {/if}
         <span class="spacer"></span>
         {#if !isDraft}
@@ -841,7 +849,7 @@
         <span class="est" title="rough estimate of the next call's input tokens (re-read context + your draft), ≈ chars/4">~{fmtTokens(estTokens)} tokens next call</span>
       {/if}
       <span class="spacer"></span>
-      <span>{#if isDraft}draft · not started yet{:else}{view.record.repo ? '▣ worktree' : '▣ local'} · {view.record.id.slice(0, 8)}{/if}</span>
+      <span>{#if isDraft}draft · not started yet{:else}{view.record.worktree ? '▣ worktree' : '▣ project'} · {view.record.id.slice(0, 8)}{/if}</span>
     </div>
   </div>
 {/if}
@@ -867,6 +875,10 @@
     min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl;
     text-align: left; font-family: var(--mono);
   }
+  .wtwarning { display: flex; align-items: flex-start; gap: var(--space-2); padding: var(--space-2) 1rem;
+    color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, var(--surface));
+    border-bottom: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border)); font-size: var(--text-sm); }
+  .wtwarning strong { color: var(--text); margin-right: var(--space-1); }
   .hicon { display: grid; place-items: center; color: var(--muted); width: 26px; height: 24px; border-radius: 6px; }
   .hicon:hover { background: var(--surface-2); color: var(--text); }
   .statuschip { display: inline-flex; flex: none; align-items: center; gap: 0.3rem; font-size: 0.72rem; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 0.05rem 0.45rem; }
@@ -919,8 +931,9 @@
   .approval { background: var(--surface); border: 1px solid var(--warn); border-radius: 10px; padding: 0.5rem 0.7rem; margin-bottom: 0.5rem; }
   .atop { display: flex; gap: 0.5rem; align-items: center; }
   .alabel { font-size: 0.66rem; letter-spacing: 0.08em; color: var(--warn); }
-  /* Taller + break-word (not break-all): the body is now pretty-printed, so it must stay readable rather
-     than shattering identifiers mid-token. Still capped and scrollable so it can't push out the composer. */
+  .asummary { margin-top: 0.3rem; font-size: var(--text-sm); color: var(--text); font-weight: var(--fw-medium); }
+  /* Human field lines and full commands/paths stay readable without shattering identifiers mid-token.
+     Still capped and scrollable so a large question cannot push out the composer. */
   .abody { margin: 0.35rem 0; font-size: 0.74rem; color: var(--muted); max-height: 14rem; overflow: auto; white-space: pre-wrap; word-break: break-word; font-family: var(--mono); }
   .aacts { display: flex; gap: 0.4rem; flex-wrap: wrap; }
   .aerr { margin-top: 0.35rem; font-size: 0.74rem; color: var(--bad-text); }

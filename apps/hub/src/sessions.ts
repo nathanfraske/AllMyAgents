@@ -893,13 +893,27 @@ export class SessionManager {
     const isUnfiled = opts.cwd === undefined && opts.projectId === undefined && opts.repo === undefined
     let cwd = isUnfiled ? this.workspace.createScratch(id) : (opts.cwd ?? this.defaultCwd)
     let repo = opts.repo
+    // Intent and outcome are separate facts. In particular, an explicit cwd can override a caller that
+    // explicitly requested isolation, and a non-Git project cannot produce a Git worktree. Persist both
+    // so clients never infer "Project was chosen" merely from a missing `worktree`.
+    const worktreeRequested = opts.projectId
+      ? (opts.cwd ? opts.useWorktree === true : opts.useWorktree !== false)
+      : undefined
+    let worktreeFallbackReason: string | undefined
     if (opts.projectId && !opts.cwd) {
       const project = this.projects.get(opts.projectId)
       if (!project) throw new Error(`unknown project: ${opts.projectId}`)
       cwd = project.path
       // Worktree by default when the project is a git repo; `useWorktree: false` works directly
       // in the project directory (no isolation).
-      if (this.workspace.isRepo(project.path) && opts.useWorktree !== false) repo = project.path
+      if (this.workspace.isRepo(project.path) && worktreeRequested) repo = project.path
+      else if (worktreeRequested) {
+        worktreeFallbackReason =
+          `The project folder (${project.path}) is not a Git repository, so no isolated worktree could be created.`
+      }
+    } else if (opts.projectId && opts.cwd && worktreeRequested && !repo) {
+      worktreeFallbackReason =
+        `An explicit working directory (${opts.cwd}) overrode the project path, so no isolated worktree was created.`
     }
     let worktree: string | undefined
     let branch: string | undefined
@@ -931,6 +945,8 @@ export class SessionManager {
       repo,
       worktree,
       branch,
+      worktreeRequested,
+      worktreeFallbackReason,
       status: 'starting',
       model: opts.model,
       effort: opts.effort,
