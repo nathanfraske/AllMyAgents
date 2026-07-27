@@ -162,12 +162,23 @@ export interface PrefsConfig {
   chatNamePool?: ChatNamePool
   /** Deliver new operator/bus input into a running turn at its next tool boundary. Absent means ON. */
   steerMessagesAtToolBoundary?: boolean
+  /** Default presentation for file writes and diffs. Absent or invalid means minimal. */
+  fileWriteDiffDensity?: FileWriteDiffDensity
+}
+
+export type FileWriteDiffDensity = 'minimal' | 'summary' | 'verbose'
+
+export function asFileWriteDiffDensity(value: unknown): FileWriteDiffDensity {
+  return value === 'summary' || value === 'verbose' ? value : 'minimal'
 }
 
 /** Resolved owner preferences (always present; index.ts fills defaults from PrefsConfig). */
 export interface HubPrefs {
   chatNamePool: ChatNamePool
   steerMessagesAtToolBoundary: boolean
+  // index.ts always resolves this; optional only so SessionManager's untouched legacy fallback literal
+  // remains source-compatible when constructed directly by tests or embedders.
+  fileWriteDiffDensity?: FileWriteDiffDensity
 }
 
 /**

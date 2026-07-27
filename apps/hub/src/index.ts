@@ -30,6 +30,7 @@ import { InProcessExecutor, type Executor } from './executor.js'
 import { WorkerExecutor } from './workerExecutor.js'
 import { WorkerClient } from './workerTransport.js'
 import { asChatNamePool } from './title.js'
+import { asFileWriteDiffDensity } from './types.js'
 import type { DangerFlags, HubConfig, HubPrefs } from './types.js'
 import { RestartController, type RestartState } from './restartController.js'
 import { SCHEMA_VERSION, type SupervisorMsg } from './restartHandshake.js'
@@ -154,6 +155,7 @@ const prefs: HubPrefs = {
   chatNamePool: asChatNamePool(config.prefs?.chatNamePool),
   // Opt-out so configs written before the preference existed get the operator-requested default ON.
   steerMessagesAtToolBoundary: config.prefs?.steerMessagesAtToolBoundary !== false,
+  fileWriteDiffDensity: asFileWriteDiffDensity(config.prefs?.fileWriteDiffDensity),
 }
 // Apply the connector policy to managed claude profiles at boot (safe default OFF → connectors suppressed).
 // The SDK reads disableClaudeAiConnectors from each profile's settings.json, so this makes the flag

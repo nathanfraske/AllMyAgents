@@ -8,33 +8,32 @@
   // already escaped-or-highlighted and run through DOMPurify (span/class allowlist). Everything
   // else here is plain Svelte text.
   import { highlightDiffLine } from './diff'
-  import type { FileDiff, DiffLine } from './diff'
+  import type { FileDiff } from './diff'
+  import { store } from './store.svelte'
+  import { diffDisplay, initialDiffExpanded } from './diffDisplay'
 
   let { diff }: { diff: FileDiff } = $props()
 
-  let expanded = $state(false)
+  // null follows the live preference; once clicked, this individual diff keeps the user's override.
+  let expandedOverride = $state<boolean | null>(null)
   let copied = $state(false)
   let timer: ReturnType<typeof setTimeout> | undefined
 
-  // Below this many display rows a diff renders in full; larger diffs collapse to a preview.
-  const PREVIEW = 14
-
-  type Flat = { kind: 'hunk'; text: string } | { kind: 'line'; line: DiffLine }
-
-  // Flatten hunks into a single display list, inserting a separator between hunks.
-  const flat = $derived.by<Flat[]>(() => {
-    const out: Flat[] = []
-    diff.hunks.forEach((h, i) => {
-      if (h.header) out.push({ kind: 'hunk', text: h.header })
-      else if (i > 0) out.push({ kind: 'hunk', text: '⋯' })
-      for (const line of h.lines) out.push({ kind: 'line', line })
-    })
-    return out
+  const density = $derived(store.prefs.fileWriteDiffDensity ?? 'minimal')
+  const expanded = $derived(expandedOverride ?? initialDiffExpanded(density))
+  const display = $derived(diffDisplay(diff, density, expanded))
+  const shown = $derived(display.rows)
+  const collapsible = $derived(display.canToggle)
+  const hiddenLabel = $derived.by(() => {
+    const details: string[] = []
+    if (display.hidden.changed) details.push(`${display.hidden.changed} changed`)
+    if (display.hidden.context) details.push(`${display.hidden.context} context`)
+    return `${display.hidden.total} more row${display.hidden.total === 1 ? '' : 's'}${details.length ? ` (${details.join(', ')})` : ''}`
   })
 
-  const collapsible = $derived(flat.length > PREVIEW)
-  const shown = $derived(collapsible && !expanded ? flat.slice(0, PREVIEW) : flat)
-  const hiddenCount = $derived(flat.length - shown.length)
+  function toggleExpanded(): void {
+    expandedOverride = !expanded
+  }
 
   // Precompute per-row render data (incl. the sanitized, highlighted HTML) for the visible rows
   // only — so a collapsed large diff never pays to highlight the hidden lines.
@@ -112,7 +111,7 @@
   <div class="dhead">
     <button
       class="toggle"
-      onclick={() => (expanded = !expanded)}
+      onclick={toggleExpanded}
       disabled={!collapsible}
       aria-expanded={expanded || !collapsible}
       title={collapsible ? (expanded ? 'Collapse diff' : 'Expand full diff') : ''}
@@ -165,8 +164,8 @@
     </div>
 
     {#if collapsible}
-      <button class="more" onclick={() => (expanded = !expanded)}>
-        {expanded ? 'Show less' : `Show full diff · ${hiddenCount} more line${hiddenCount === 1 ? '' : 's'}`}
+      <button class="more" onclick={toggleExpanded}>
+        {expanded ? 'Show less' : `Show full diff · ${hiddenLabel}`}
       </button>
     {/if}
   {/if}

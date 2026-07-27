@@ -18,6 +18,7 @@ import { computeStats } from './stats.js'
 import { buildFleet, probeHubHealth } from './fleet.js'
 import { startLogin, awaitLogin, credentialsExist } from './loginLauncher.js'
 import { setClaudeConnectorPolicy } from './profiles.js'
+import { asFileWriteDiffDensity } from './types.js'
 import type { DangerFlags, HubEvent, HubPrefs, Profile, Provider } from './types.js'
 import type { Executor } from './executor.js'
 import type { RestartState } from './restartController.js'
@@ -332,7 +333,11 @@ export function persistDanger(configPath: string, danger: DangerFlags, journal: 
 }
 
 /** Persist the owner preferences. Same path, same best-effort contract, its own journal kind. */
-export function persistPrefs(configPath: string, prefs: HubPrefs, journal: Journal): void {
+export function persistPrefs(
+  configPath: string,
+  prefs: Pick<HubPrefs, 'chatNamePool' | 'steerMessagesAtToolBoundary'> & Partial<Pick<HubPrefs, 'fileWriteDiffDensity'>>,
+  journal: Journal
+): void {
   const err = patchConfig(configPath, 'prefs', { ...prefs })
   if (err) journal.append(null, 'config/prefs-persist-failed', { path: configPath, message: err })
 }
@@ -578,8 +583,8 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, { ok: !!existing }, existing ? 200 : 404)
         return
       }
-      // Owner preferences — ordinary settings with no safety dimension (currently just which pool new
-      // chats are named from), so they get their own route rather than riding on /api/config/danger:
+      // Owner preferences — ordinary settings with no safety dimension, so they get their own route
+      // rather than riding on /api/config/danger:
       // putting a cosmetic choice behind the Danger Zone's deliberate reveal would misrepresent both.
       // Same shape as the danger routes otherwise — POST mutates the shared object in place, so the next
       // chat is named from the new pool without a restart, then persists it to the hub's real config.
@@ -595,6 +600,13 @@ export function startServer(opts: ServerOptions): http.Server {
         if (body.chatNamePool === 'women' || body.chatNamePool === 'everyone') prefs.chatNamePool = body.chatNamePool
         if (typeof body.steerMessagesAtToolBoundary === 'boolean') {
           prefs.steerMessagesAtToolBoundary = body.steerMessagesAtToolBoundary
+        }
+        if (
+          body.fileWriteDiffDensity === 'minimal'
+          || body.fileWriteDiffDensity === 'summary'
+          || body.fileWriteDiffDensity === 'verbose'
+        ) {
+          prefs.fileWriteDiffDensity = asFileWriteDiffDensity(body.fileWriteDiffDensity)
         }
         persistPrefs(configPath, prefs, journal)
         journal.append(null, 'config/prefs', { ...prefs })

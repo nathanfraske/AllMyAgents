@@ -342,6 +342,7 @@ export interface Practice {
 
 /** Which pool new chats are named from. Two choices by design — there is no men-only option. */
 export type ChatNamePool = 'women' | 'everyone'
+export type FileWriteDiffDensity = 'minimal' | 'summary' | 'verbose'
 
 /**
  * Owner preferences — plain settings with no safety dimension, so they live outside the Danger Zone.
@@ -353,6 +354,8 @@ export type ChatNamePool = 'women' | 'everyone'
 export interface HubPrefs {
   chatNamePool: ChatNamePool
   steerMessagesAtToolBoundary: boolean
+  /** Optional while bootstrap is using its pre-fetch fallback; the hub always returns a resolved value. */
+  fileWriteDiffDensity?: FileWriteDiffDensity
 }
 
 export interface ApiError {

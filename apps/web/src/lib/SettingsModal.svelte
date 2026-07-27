@@ -6,9 +6,22 @@
   import Icon from './Icon.svelte'
   import { modelsFor } from './catalog'
   import { updater, updatesSupported } from './updater.svelte'
+  import {
+    loadSettingsTab,
+    saveSettingsTab,
+    settingsTabHasSection,
+    SETTINGS_TABS,
+    type SettingsTabId,
+  } from './settingsSections'
 
   let { onclose }: { onclose: () => void } = $props()
   let writeError = $state('')
+  let activeTab = $state<SettingsTabId>(loadSettingsTab())
+
+  function selectTab(tabId: SettingsTabId): void {
+    activeTab = tabId
+    saveSettingsTab(tabId)
+  }
 
   // Mesh remote-access status (loaded once; refreshed after a toggle).
   let mesh = $state<MeshStatus | null>(null)
@@ -247,9 +260,23 @@
     <button class="btn-icon" onclick={onclose} aria-label="close"><Icon name="x" size={17} /></button>
   </div>
 
-  <div class="body">
+  <div class="settings-layout">
+    <div class="tabs" role="tablist" aria-label="Settings areas" aria-orientation="vertical">
+      {#each SETTINGS_TABS as tab (tab.id)}
+        <button
+          class="tab"
+          class:active={activeTab === tab.id}
+          role="tab"
+          aria-selected={activeTab === tab.id}
+          aria-controls="settings-pane"
+          onclick={() => selectTab(tab.id)}
+        >{tab.label}</button>
+      {/each}
+    </div>
+
+    <div class="body" id="settings-pane" role="tabpanel">
     {#if writeError}<p class="status error write-error">{writeError}</p>{/if}
-    <section>
+    <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Accounts')}>
       <h3>Accounts</h3>
       <div class="accounts">
         {#each store.profiles as p (p.id)}
@@ -280,7 +307,7 @@
       </div>
     </section>
 
-    <section>
+    <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Defaults for new chats')}>
       <h3>Defaults for new chats</h3>
       <label class="opt row2">Account
         <select value={settings.defaultAccount} onchange={(e) => settings.set('defaultAccount', (e.target as HTMLSelectElement).value)}>
@@ -320,7 +347,7 @@
       <label class="opt"><input type="checkbox" checked={settings.autoReopenLastChats} onchange={(e) => settings.set('autoReopenLastChats', (e.target as HTMLInputElement).checked)} /> Reopen the chats I had open when the app starts (off = show the home screen with a Reopen button)</label>
     </section>
 
-    <section>
+    <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Unfiled / detached chats')}>
       <h3>Unfiled / detached chats</h3>
       <label class="opt row2">Default destination
         <select value={settings.detachedDefaultProjectId ?? ''} onchange={(e) => settings.set('detachedDefaultProjectId', (e.target as HTMLSelectElement).value || null)}>
@@ -338,13 +365,25 @@
       <p class="hint dim">Applies to chats started outside any project — they land in "Unfiled" unless you pick a default destination above. Both settings are just defaults and can be overridden per chat; "Full access" un-restricts detached chats (no approvals).</p>
     </section>
 
-    <section>
+    <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Composer')}>
       <h3>Composer</h3>
       <label class="opt"><input type="checkbox" checked={settings.showTokenEstimate} onchange={() => settings.toggleTokenEstimate()} /> Show next-call token estimate under the chatbox</label>
       <label class="opt"><input type="checkbox" checked={settings.combineQueued} onchange={() => settings.toggleCombineQueued()} /> Auto-combine queued messages (before the model reads them)</label>
     </section>
 
-    <section>
+    <section class:tab-hidden={!settingsTabHasSection(activeTab, 'File-write display')}>
+      <h3>File-write display</h3>
+      <label class="opt row2">Default diff density
+        <select value={store.prefs.fileWriteDiffDensity ?? 'minimal'} onchange={(e) => void setPrefs({ fileWriteDiffDensity: (e.target as HTMLSelectElement).value as HubPrefs['fileWriteDiffDensity'] })}>
+          <option value="minimal">Minimal</option>
+          <option value="summary">Summary</option>
+          <option value="verbose">Verbose</option>
+        </select>
+      </label>
+      <p class="hint dim">Minimal shows changed lines only (up to six); Summary shows the first 14 diff rows with context; Verbose starts fully expanded. Every diff can still be expanded or collapsed in place.</p>
+    </section>
+
+    <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Usage')}>
       <h3>Usage</h3>
       <label class="opt"><input type="checkbox" checked={settings.showSpend} onchange={() => settings.toggleSpend()} /> Show accumulated spend</label>
       <label class="opt budget">Plan budget ($/month)
@@ -366,7 +405,7 @@
       <p class="hint dim">Spend shows as a percent of the plan budget when set. Claude usage (session / week / model) is polled from the free <code>/usage</code> command — Claude has no dollar tier in the data, so those accounts fall back to the entry tier.</p>
     </section>
 
-    <section>
+    <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Remote access')}>
       <h3>Remote access (mesh)</h3>
       {#if mesh}
         <label class="opt"><input type="checkbox" checked={mesh.enabled} disabled={meshBusy} onchange={(e) => toggleMesh((e.target as HTMLInputElement).checked)} /> Expose this hub to my AllMyStuff fleet</label>
@@ -403,7 +442,7 @@
       {/if}
     </section>
 
-    <section>
+    <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Operator profile & instructions')}>
       <h3>Operator profile &amp; instructions</h3>
       <p class="hint dim">House rules loaded into every agent at spawn, through the vendor's own CLAUDE.md / AGENTS.md. Scopes stack general → specific (global → vendor → project → account). Existing chats pick up changes on their next spawn.</p>
       <label class="opt row2">Scope
@@ -420,7 +459,7 @@
     </section>
 
     {#if updatesSupported}
-      <section>
+      <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Updates')}>
         <h3>Updates</h3>
         <p class="hint dim">Updates are pulled from this project's GitHub releases and their signature is verified before anything is installed. An available update is only ever offered — it is never installed without you clicking Update now.</p>
         <label class="opt"><input type="checkbox" checked={settings.autoCheckUpdates} onchange={(e) => settings.set('autoCheckUpdates', (e.target as HTMLInputElement).checked)} /> Check for updates on launch</label>
@@ -440,7 +479,20 @@
       </section>
     {/if}
 
-    <section class="danger">
+    <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Maintenance')}>
+      <h3>Maintenance</h3>
+      <div class="restart-row">
+        <button class="btn" onclick={restartHub} disabled={restartState === 'restarting'}>
+          {restartState === 'restarting' ? 'restarting…' : 'Restart hub'}
+        </button>
+        {#if restartState !== 'idle'}
+          <span class="restart-msg {restartState}">{restartMsg}</span>
+        {/if}
+      </div>
+      <p class="hint dim">Cleanly recycles the hub under the supervisor (blue-green flip — sub-second, running sessions restored). No approval needed; a plain hub with no supervisor can't self-restart.</p>
+    </section>
+
+    <section class="danger" class:tab-hidden={!settingsTabHasSection(activeTab, 'Danger Zone')}>
       <h3>Danger Zone</h3>
       {#if !dangerRevealed}
         <p class="hint dim">Guardrails are safe defaults you can loosen — this is your own self-hosted tool. Review agent-authored practices and relax the gates here.</p>
@@ -457,7 +509,7 @@
           <p class="hint dim warnrow">Off (safe): a turn started by a teammate's message runs at most "Edits" and still asks, even in a Full Access chat. On: the mode you picked applies to every turn in that chat — a teammate messaging it, a monitor firing — so it won't stall on a prompt while you're away. That also means a teammate agent that's mistaken or has been fed a malicious instruction gets the same free rein you granted yourself. Practice writes and permission-widening requests are gated separately and are unaffected by this.</p>
 
           <label class="opt"><input type="checkbox" checked={danger.autoApproveRestart} onchange={(e) => setDanger({ autoApproveRestart: (e.target as HTMLInputElement).checked })} /> Auto-approve agent hub restarts</label>
-          <p class="hint dim warnrow">Default off — an agent's restart_hub tool waits on your approval; the operator restart below never needs it.</p>
+          <p class="hint dim warnrow">Default off — an agent's restart_hub tool waits on your approval; the operator action in System never needs it.</p>
 
           <label class="opt"><input type="checkbox" checked={danger.enableClaudeConnectors} onchange={(e) => setDanger({ enableClaudeConnectors: (e.target as HTMLInputElement).checked })} /> Enable claude.ai cloud connectors for Claude sessions</label>
           <p class="hint dim warnrow">Off (safe): the hub suppresses claude.ai cloud MCP connectors for managed Claude sessions — no data egress to vendor cloud connectors. On: they load as configured. Applies to managed profiles only, on the next turn.</p>
@@ -482,26 +534,17 @@
             </ul>
           {/if}
 
-          <h4>Maintenance</h4>
-          <div class="restart-row">
-            <button class="btn" onclick={restartHub} disabled={restartState === 'restarting'}>
-              {restartState === 'restarting' ? 'restarting…' : 'Restart hub'}
-            </button>
-            {#if restartState !== 'idle'}
-              <span class="restart-msg {restartState}">{restartMsg}</span>
-            {/if}
-          </div>
-          <p class="hint dim">Cleanly recycles the hub under the supervisor (blue-green flip — sub-second, running sessions restored). No approval needed; a plain hub with no supervisor can't self-restart.</p>
         </div>
       {/if}
     </section>
+    </div>
   </div>
 </div>
 
 <style>
-  .backdrop { position: fixed; inset: 0; background: rgba(7,7,17,0.55); backdrop-filter: blur(6px); z-index: 40; }
+  .backdrop { position: fixed; inset: 0; background: color-mix(in srgb, var(--bg) 72%, transparent); backdrop-filter: blur(var(--space-2)); z-index: 40; }
   .modal { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 41;
-    width: min(560px, 92vw); max-height: 84vh; overflow-y: auto;
+    display: flex; flex-direction: column; width: min(64rem, 92vw); height: min(48rem, 84vh); overflow: hidden;
     background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--r-xl);
     box-shadow: var(--shadow-4), var(--edge-hi); }
   @keyframes modal-in { from { opacity: 0; } to { opacity: 1; } }
@@ -511,7 +554,13 @@
   }
   .head { display: flex; align-items: center; justify-content: space-between; padding: var(--space-4) var(--space-5); border-bottom: 1px solid var(--border); }
   h2 { margin: 0; font-size: var(--text-lg); }
-  .body { padding: var(--space-5) var(--space-5) var(--space-6); display: flex; flex-direction: column; gap: var(--space-7); }
+  .settings-layout { min-height: 0; flex: 1; display: grid; grid-template-columns: calc(var(--space-8) + var(--space-8) + var(--space-8) + var(--space-8) + var(--space-8)) minmax(0, 1fr); }
+  .tabs { display: flex; flex-direction: column; gap: var(--space-1); padding: var(--space-4) var(--space-3); background: var(--surface-2); border-right: 1px solid var(--border); }
+  .tab { width: 100%; padding: var(--space-3) var(--space-4); border: 0; border-left: var(--space-1) solid transparent; border-radius: var(--r-md); background: transparent; color: var(--muted); font-size: var(--text-sm); text-align: left; }
+  .tab:hover { background: var(--surface-3); color: var(--text); }
+  .tab.active { border-left-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--surface-3)); color: var(--text); }
+  .body { min-width: 0; overflow-y: auto; padding: var(--space-5) var(--space-5) var(--space-6); display: flex; flex-direction: column; gap: var(--space-7); }
+  .tab-hidden { display: none; }
   section h3 { margin: 0 0 var(--space-3); font-size: var(--text-2xs); text-transform: uppercase; letter-spacing: var(--ls-label); color: var(--dim); }
   .accounts { display: flex; flex-direction: column; gap: var(--space-2); margin-bottom: var(--space-4); }
   .acct { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-2) var(--space-3); background: var(--surface-2); border-radius: var(--r-md); box-shadow: var(--edge-hi); }
