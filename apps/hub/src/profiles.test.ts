@@ -2,7 +2,13 @@ import { describe, it, expect } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { setClaudeConnectorPolicy, isManagedProfile, CLAUDE_DEFAULT_ID, CODEX_DEFAULT_ID } from './profiles.js'
+import {
+  setClaudeConnectorPolicy,
+  isManagedProfile,
+  pickableProfiles,
+  CLAUDE_DEFAULT_ID,
+  CODEX_DEFAULT_ID,
+} from './profiles.js'
 import type { Profile } from './types.js'
 
 function tmpProfile(id: string, provider: 'claude' | 'codex', settings?: Record<string, unknown>): Profile {
@@ -24,6 +30,17 @@ describe('isManagedProfile', () => {
   it('is true for AllMyAgents-managed profiles', () => {
     expect(isManagedProfile('claude-a')).toBe(true)
     expect(isManagedProfile('codex-a')).toBe(true)
+  })
+})
+
+describe('pickableProfiles', () => {
+  it('does not expose vendor homes as accounts on a fresh install', () => {
+    const freshProfiles: Profile[] = [
+      { id: CLAUDE_DEFAULT_ID, provider: 'claude', dir: '/home/operator/.claude' },
+      { id: CODEX_DEFAULT_ID, provider: 'codex', dir: '/home/operator/.codex' },
+    ]
+
+    expect(pickableProfiles(freshProfiles)).toEqual([])
   })
 })
 

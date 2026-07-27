@@ -19,7 +19,7 @@ import { computeStats } from './stats.js'
 import { buildFleet, probeHubHealth } from './fleet.js'
 import { startLogin, awaitLogin, credentialsExist } from './loginLauncher.js'
 import { readProjectConfig } from './importScan.js'
-import { setClaudeConnectorPolicy } from './profiles.js'
+import { pickableProfiles, setClaudeConnectorPolicy } from './profiles.js'
 import { asFileWriteDiffDensity } from './types.js'
 import type { DangerFlags, HubEvent, HubPrefs, Profile, Provider } from './types.js'
 import type { Executor } from './executor.js'
@@ -536,14 +536,14 @@ export function startServer(opts: ServerOptions): http.Server {
         return
       }
       if (method === 'GET' && url.pathname === '/api/profiles') {
-        // The manager's view = managed profiles/* PLUS the registered default vendor homes, so the
-        // user's main ~/.claude / ~/.codex accounts (which imported chats bind to) show in the picker.
-        json(res, sessions.listProfiles())
+        // The manager also carries ~/.claude + ~/.codex as INTERNAL bindings so imported chats can
+        // resume against their real vendor homes. They are not AllMyAgents accounts or spawn targets.
+        json(res, pickableProfiles(sessions.listProfiles()))
         return
       }
       if (method === 'POST' && url.pathname === '/api/profiles/rescan') {
         rescanProfiles() // pick up any newly-added managed logins under profiles/*
-        json(res, sessions.listProfiles())
+        json(res, pickableProfiles(sessions.listProfiles()))
         return
       }
       // A profile's custom slash commands (<configDir>/commands/*.md) — the SAME files the Claude

@@ -63,6 +63,16 @@ export function isManagedProfile(profileId: string): boolean {
 }
 
 /**
+ * Profiles that are real AllMyAgents accounts and may be offered as session targets.
+ *
+ * The session manager also registers the user's vendor homes so import can discover and resume chats
+ * stored there. Those registrations are internal import bindings, not accounts the operator created.
+ */
+export function pickableProfiles<T extends { id: string }>(profiles: readonly T[]): T[] {
+  return profiles.filter((profile) => isManagedProfile(profile.id))
+}
+
+/**
  * Apply the claude.ai-connector policy to every MANAGED claude profile's settings.json (merge-preserving):
  * sets `disableClaudeAiConnectors = !enable` so the Claude SDK suppresses (default, safe) or allows cloud
  * MCP connectors for hub-managed sessions. Only touches AllMyAgents-managed `profiles/*` — never the user's
