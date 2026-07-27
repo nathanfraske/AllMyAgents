@@ -201,7 +201,7 @@
 {/if}
 
 <style>
-  /* Anchored to the pane (App.svelte gives .pane a containing block), so split view gets one per pane. */
+  /* The closed edge tab is still an affordance over the pane edge; the OPEN panel below is in flow. */
   .tab {
     position: absolute; top: 3.1rem; right: 0; z-index: 5;
     display: flex; align-items: center; gap: 0.4rem;
@@ -211,10 +211,17 @@
   }
   .tab:hover { border-color: var(--accent); }
   .panel {
-    position: absolute; top: 2.9rem; right: 0; bottom: 0; z-index: 6;
-    width: min(360px, 62%); display: flex; flex-direction: column;
+    position: relative; flex: 0 0 clamp(240px, 38%, 360px); width: clamp(240px, 38%, 360px);
+    min-width: 0; min-height: 0; display: flex; flex-direction: column;
     background: var(--surface); border-left: 1px solid var(--border-strong);
-    box-shadow: -12px 0 28px -22px rgba(0, 0, 0, 0.8);
+  }
+  /* ThreadView stacks the row at the same threshold. This keeps full transcript width and gives the
+     agent list a bounded lower drawer instead of reverting to an overlay in tiny split panes. */
+  @container thread-body (max-width: 620px) {
+    .panel {
+      flex: 0 0 clamp(160px, 38%, 300px); width: 100%; min-width: 0; height: auto;
+      border-left: none; border-top: 1px solid var(--border-strong);
+    }
   }
   .phead { display: flex; align-items: center; gap: 0.5rem; padding: 0.5rem 0.65rem; border-bottom: 1px solid var(--border); }
   .ptitle { font-weight: 600; font-size: 0.82rem; }

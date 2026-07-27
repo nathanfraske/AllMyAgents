@@ -32,8 +32,8 @@
 </script>
 
 <div class="wrap">
-  <button class="pill-btn" class:open class:full={current.id === 'full'} onclick={() => (open = !open)}>
-    <span class="lead"><Icon name={current.icon} size={13} /></span> {current.label} <span class="chev"><Icon name="chevron-down" size={12} /></span>
+  <button class="pill-btn" class:open class:full={current.id === 'full'} onclick={() => (open = !open)} title={`Permission mode: ${current.label}`}>
+    <span class="lead"><Icon name={current.icon} size={13} /></span><span class="pill-label">{current.label}</span><span class="chev"><Icon name="chevron-down" size={12} /></span>
   </button>
   {#if open}
     <button class="scrim" onclick={() => (open = false)} aria-label="close"></button>
@@ -61,7 +61,8 @@
 </div>
 
 <style>
-  .wrap { position: relative; }
+  .wrap { position: relative; min-width: 0; }
+  .pill-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .pill-btn.full { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, transparent); }
   .pill-btn.full .lead { color: var(--warn); }
   .lead { display: inline-grid; color: var(--muted); }

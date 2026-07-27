@@ -186,6 +186,27 @@ describe('dropAt', () => {
     store.dropAt({ kind: 'row', row: 99 }, 'b')
     expect(panes()).toEqual([['a'], ['b']])
   })
+
+  it('moves an existing pane between columns without duplicating its session', () => {
+    store.splitPanes = [['a', 'b', 'c']]
+    store.dropAt({ kind: 'col', row: 0, col: 3 }, 'a')
+    expect(panes()).toEqual([['b', 'c', 'a']])
+    expect(panes().flat().filter((id) => id === 'a')).toHaveLength(1)
+  })
+
+  it('moves an existing pane into a new row and removes its emptied source row', () => {
+    store.splitPanes = [['a'], ['b', 'c']]
+    store.dropAt({ kind: 'row', row: 2 }, 'a')
+    expect(panes()).toEqual([['b', 'c'], ['a']])
+  })
+
+  it('treats a drop back onto the pane own slot as an exact no-op', () => {
+    store.splitPanes = [['a', 'b'], ['c']]
+    const before = store.splitPanes
+    store.dropAt({ kind: 'col', row: 0, col: 1 }, 'b')
+    expect(store.splitPanes).toBe(before)
+    expect(panes()).toEqual([['a', 'b'], ['c']])
+  })
 })
 
 describe('commit (via dropAt / closePane)', () => {

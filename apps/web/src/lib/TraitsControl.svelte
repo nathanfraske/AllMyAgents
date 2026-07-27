@@ -23,7 +23,7 @@
 
 {#if descriptors.length > 0}
   <div class="wrap">
-    <button class="pill-btn" class:open onclick={() => (open = !open)}><span class="lead"><Icon name="zap" size={13} /></span> {label} <span class="chev"><Icon name="chevron-down" size={12} /></span></button>
+    <button class="pill-btn" class:open onclick={() => (open = !open)} title={`Model options: ${label}`}><span class="lead"><Icon name="zap" size={13} /></span><span class="pill-label">{label}</span><span class="chev"><Icon name="chevron-down" size={12} /></span></button>
     {#if open}
       <button class="scrim" onclick={() => (open = false)} aria-label="close"></button>
       <div class="menu">
@@ -49,7 +49,8 @@
 {/if}
 
 <style>
-  .wrap { position: relative; }
+  .wrap { position: relative; min-width: 0; }
+  .pill-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .lead { display: inline-grid; color: var(--accent); }
   .chev { display: inline-grid; opacity: 0.6; }
   .scrim { position: fixed; inset: 0; background: transparent; border: none; z-index: 10; }

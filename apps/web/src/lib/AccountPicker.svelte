@@ -32,9 +32,9 @@
 </script>
 
 <div class="wrap">
-  <button class="pill-btn" class:open onclick={() => (open = !open)} title="account (swap opens a fresh chat once this one has history)">
+  <button class="pill-btn" class:open onclick={() => (open = !open)} title={`Account: ${buttonLabel} (swap opens a fresh chat once this one has history)`}>
     {#if current}<ProviderLogo provider={current.provider} size={12} />{/if}
-    {buttonLabel}
+    <span class="pill-label">{buttonLabel}</span>
     <span class="chev"><Icon name="chevron-down" size={12} /></span>
   </button>
   {#if open}
@@ -65,7 +65,8 @@
 </div>
 
 <style>
-  .wrap { position: relative; }
+  .wrap { position: relative; min-width: 0; }
+  .pill-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .chev { display: inline-grid; opacity: 0.6; }
   .scrim { position: fixed; inset: 0; background: transparent; border: none; z-index: 10; }
   .menu { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 11; min-width: 200px; background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: var(--r-lg); padding: var(--space-1); box-shadow: var(--shadow-3), var(--edge-hi); }

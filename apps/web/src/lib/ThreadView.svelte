@@ -29,7 +29,7 @@
   import TaskStrip from './TaskStrip.svelte'
   import { findModel, defaultModelFor } from './catalog'
   import { settings } from './settings.svelte'
-  import { untrack } from 'svelte'
+  import { onDestroy, untrack } from 'svelte'
   import { loadComposerDrafts, saveComposerDrafts } from './uiState'
   import { resolveSlash, builtinsForProvider, builtinNeedsArg, loadProfileCommands, type SlashResult } from './commands'
   import { resolveWorkingContext, truncatePathTail } from './workingContext'
@@ -183,6 +183,13 @@
       saveComposerDrafts(drafts)
     }, 300)
     return () => clearTimeout(timer)
+  })
+  // Pane moves can remount ThreadView when crossing rows. Flush the live textarea value synchronously
+  // so even text typed inside the 300ms debounce window follows the session to its new pane.
+  onDestroy(() => {
+    if (!draftFor) return
+    drafts = { ...drafts, [draftFor]: text }
+    saveComposerDrafts(drafts)
   })
   let sendErr = $state('')
   let scroller = $state<HTMLDivElement | null>(null)
@@ -777,7 +784,7 @@
 {#if !view}
   <div class="empty dim">select a session, or press + to spawn one</div>
 {:else}
-  <div class="head">
+  <div class="head" class:reorderable={multiPane} title={multiPane ? 'Drag this header to rearrange the pane' : undefined}>
     <ProviderLogo provider={view.record.provider} size={16} />
     <div class="headmain">
       <div class="headtop">
@@ -824,6 +831,9 @@
     </div>
   {/if}
 
+  <div class="thread-container">
+    <div class="thread-body">
+      <div class="conversation">
   <div class="stream scroll" bind:this={scroller} onscroll={onScroll}>
     <!-- Items produced INSIDE a spawned sub-agent are excluded here and rendered in the agent panel
          instead: a background agent's tool spam would otherwise bury the conversation you are actually
@@ -858,10 +868,6 @@
     {/if}
   </div>
 
-  <!-- Sub-agents this chat spawned. Self-contained popout anchored to THIS pane, so split view gets one
-       panel per pane; renders nothing until an agent is actually spawned. -->
-  <AgentPanel items={view.items} sessionId={view.record.id} provider={view.record.provider} />
-
   <div class="composer-wrap">
     <!-- Jump-to-bottom: floats just above the composer (never over it or the action-error slot). Shows
          "N new" when a turn has streamed content below while you read history; a plain arrow otherwise. -->
@@ -881,7 +887,7 @@
 
     {#each approvals as a (a.id)}
       {@const blurb = approvalBlurb(a.kind, a.payload)}
-      <div class="approval" data-testid="approval-{a.id}">
+      <div class="approval-card" data-testid="approval-{a.id}">
         <div class="atop">
           <span class="alabel">PENDING APPROVAL</span>
           <span class="dim">{blurb.toolName}</span>
@@ -966,13 +972,13 @@
           aria-label="Attach files"
           onclick={() => attachmentInput?.click()}
         ><Icon name="paperclip" size={15} /></button>
-        <AccountPicker {view} />
-        <ModelPicker provider={view.record.provider} {model} onselect={setModel} />
-        {#if modelDef}<TraitsControl descriptors={modelDef.descriptors} values={options} onchange={setOption} />{/if}
+        <div class="ccontrol c-account" title={`Account: ${view.record.profileId}`}><AccountPicker {view} /></div>
+        <div class="ccontrol c-model" title={`Model: ${modelDef?.name ?? model ?? view.record.provider}`}><ModelPicker provider={view.record.provider} {model} onselect={setModel} /></div>
+        {#if modelDef}<div class="ccontrol c-traits" title="Model effort and options"><TraitsControl descriptors={modelDef.descriptors} values={options} onchange={setOption} /></div>{/if}
         {#if isDraft}
-          <div class="dperm">
+          <div class="dperm ccontrol" title={`Permission mode: ${draftModeDef.label}`}>
             <button class="pill-btn" class:full={draftMode === 'full'} class:open={permOpen} title="permission mode for this chat" onclick={() => (permOpen = !permOpen)}>
-              <span class="dlead"><Icon name={draftModeDef.icon} size={13} /></span> {draftModeDef.label} <span class="dchev"><Icon name="chevron-down" size={12} /></span>
+              <span class="dlead"><Icon name={draftModeDef.icon} size={13} /></span><span class="control-label">{draftModeDef.label}</span><span class="dchev"><Icon name="chevron-down" size={12} /></span>
             </button>
             {#if permOpen}
               <button class="dscrim" onclick={() => (permOpen = false)} aria-label="close"></button>
@@ -988,33 +994,38 @@
             {/if}
           </div>
         {:else}
-          <PermissionPicker
-            sessionId={view.record.id}
-            mode={view.record.permissionMode ?? 'safe'}
-            allowedTools={view.record.allowedTools ?? []}
-          />
+          <div class="ccontrol c-permission" title={`Permission mode: ${view.record.permissionMode ?? 'safe'}`}>
+            <PermissionPicker
+              sessionId={view.record.id}
+              mode={view.record.permissionMode ?? 'safe'}
+              allowedTools={view.record.allowedTools ?? []}
+            />
+          </div>
         {/if}
         {#if view.record.projectId}
-          <WorktreePicker
-            draft={isDraft}
-            selected={isDraft ? draftWorkMode : actualWorkMode}
-            worktreePath={view.record.worktree}
-            {projectPath}
-            onselect={(mode) => store.setDraftWorktree(view.record.id, mode === 'worktree')}
-          />
+          <div class="ccontrol c-worktree" title="Working location">
+            <WorktreePicker
+              draft={isDraft}
+              selected={isDraft ? draftWorkMode : actualWorkMode}
+              worktreePath={view.record.worktree}
+              {projectPath}
+              onselect={(mode) => store.setDraftWorktree(view.record.id, mode === 'worktree')}
+            />
+          </div>
         {/if}
-        <span class="spacer"></span>
-        {#if !isDraft}
-          {#if stopped}
-            <button class="foot-act" onclick={reopenSession} title="reopen this stopped chat so you can use it again">reopen</button>
-          {:else}
-            <!-- Status is display state, not proof that the executor has no live turn. An idle/error row can
-                 be stale while a vendor command is still running, so it must not remove the emergency brake. -->
-            <button class="foot-act" onclick={interruptTurn} title="interrupt current turn">interrupt</button>
-            <button class="foot-act" onclick={stopSession} title="stop session">stop</button>
+        <div class="cactions">
+          {#if !isDraft}
+            {#if stopped}
+              <button class="foot-act" onclick={reopenSession} title="reopen this stopped chat so you can use it again"><Icon name="rotate-ccw" size={13} /><span class="control-label">reopen</span></button>
+            {:else}
+              <!-- Status is display state, not proof that the executor has no live turn. An idle/error row can
+                   be stale while a vendor command is still running, so it must not remove the emergency brake. -->
+              <button class="foot-act" onclick={interruptTurn} title="interrupt current turn"><Icon name="square" size={12} /><span class="control-label">interrupt</span></button>
+              <button class="foot-act" onclick={stopSession} title="stop session"><Icon name="x" size={13} /><span class="control-label">stop</span></button>
+            {/if}
           {/if}
-        {/if}
-        <button class="send-btn" class:queue={active} title={isDraft ? 'start this chat' : steerable ? 'steer into the running turn' : active ? 'queue message' : 'send'} onclick={send} disabled={!canSend}><Icon name={sending ? 'timer' : steerable ? 'corner-down-right' : active ? 'timer' : 'arrow-up'} size={16} /></button>
+          <button class="send-btn" class:queue={active} title={isDraft ? 'start this chat' : steerable ? 'steer into the running turn' : active ? 'queue message' : 'send'} onclick={send} disabled={!canSend}><Icon name={sending ? 'timer' : steerable ? 'corner-down-right' : active ? 'timer' : 'arrow-up'} size={16} /></button>
+        </div>
       </div>
       <!-- Action failures sit under their own control cluster: settings under the pills (left), session
            lifecycle under the interrupt/stop/reopen buttons (right) — never a global toast. -->
@@ -1035,6 +1046,12 @@
       <span>{#if isDraft}draft · not started yet{:else}{view.record.worktree ? '▣ worktree' : '▣ project'} · {view.record.id.slice(0, 8)}{/if}</span>
     </div>
   </div>
+      </div>
+      <!-- Open panels are an in-flow sibling: they consume layout space instead of covering the
+           transcript. The narrow-pane container query stacks the panel below this conversation. -->
+       <AgentPanel items={view.items} sessionId={view.record.id} provider={view.record.provider} />
+    </div>
+  </div>
 {/if}
 
 <style>
@@ -1043,6 +1060,8 @@
     display: flex; align-items: center; gap: 0.5rem; min-width: 0; padding: 0.45rem 0.75rem;
     border-bottom: 1px solid var(--border); container: thread-head / inline-size;
   }
+  .head.reorderable { cursor: grab; }
+  .head.reorderable:active { cursor: grabbing; }
   .headmain { display: flex; flex: 1 1 auto; flex-direction: column; min-width: 0; gap: 0.12rem; }
   .headtop { display: flex; align-items: center; gap: 0.45rem; min-width: 0; height: 1.45rem; }
   .title { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
@@ -1062,6 +1081,26 @@
     color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, var(--surface));
     border-bottom: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border)); font-size: var(--text-sm); }
   .wtwarning strong { color: var(--text); margin-right: var(--space-1); }
+  .thread-container {
+    flex: 1; min-width: 0; min-height: 0;
+    container-type: inline-size; container-name: thread-body;
+  }
+  .thread-body { display: flex; width: 100%; height: 100%; min-width: 0; min-height: 0; }
+  .conversation { flex: 1 1 0; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  /* Beside the transcript above this width, below it beneath: a 240px useful panel plus a 380px useful
+     transcript is the smallest honest side-by-side split. It never overlays the conversation. */
+  @container thread-body (max-width: 620px) {
+    .thread-body { flex-direction: column; overflow-x: hidden; overflow-y: auto; }
+    /* At short phone/split heights the composer alone can be ~230px. Refuse to crush the conversation
+       below a usable 270px; the body scrolls internally to the in-flow drawer instead of either surface
+       painting over the other. */
+    .conversation { flex: 1 0 270px; min-height: 270px; }
+  }
+  @container thread-body (max-width: 360px) {
+    .thread-body .composer-wrap { padding-inline: 0.25rem; }
+    .thread-body .composer { padding-inline: 0.4rem; }
+    .thread-body .checkout { padding-inline: 0; }
+  }
   .hicon { display: grid; place-items: center; color: var(--muted); width: 26px; height: 24px; border-radius: 6px; }
   .hicon:hover { background: var(--surface-2); color: var(--text); }
   .statuschip { display: inline-flex; flex: none; align-items: center; gap: 0.3rem; font-size: 0.72rem; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 0.05rem 0.45rem; }
@@ -1111,7 +1150,7 @@
   .jumpbtn:hover { border-color: var(--accent); color: var(--text); }
   .jumpcount { font-variant-numeric: tabular-nums; }
   @media (prefers-reduced-motion: no-preference) { .jumpbtn { animation: pop-in var(--dur-fast) var(--ease); } }
-  .approval { background: var(--surface); border: 1px solid var(--warn); border-radius: 10px; padding: 0.5rem 0.7rem; margin-bottom: 0.5rem; }
+  .approval-card { background: var(--surface); border: 1px solid var(--warn); border-radius: 10px; padding: 0.5rem 0.7rem; margin-bottom: 0.5rem; }
   .atop { display: flex; gap: 0.5rem; align-items: center; }
   .alabel { font-size: 0.66rem; letter-spacing: 0.08em; color: var(--warn); }
   .asummary { margin-top: 0.3rem; font-size: var(--text-sm); color: var(--text); font-weight: var(--fw-medium); }
@@ -1140,7 +1179,49 @@
   .composer.dragging-files { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 7%, var(--surface)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent); }
   @media (prefers-reduced-motion: no-preference) { .composer { transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease); } }
   .composer textarea { width: 100%; background: none; border: none; resize: none; padding: 0.1rem 0.2rem; }
-  .cfoot { display: flex; align-items: center; gap: 0.4rem; margin-top: 0.35rem; }
+  .cfoot {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem 0.4rem; margin-top: 0.35rem;
+    min-width: 0; container-type: inline-size; container-name: composer-footer;
+  }
+  .ccontrol { flex: 0 1 auto; min-width: 1.9rem; max-width: 100%; }
+  .ccontrol:not(button) { overflow: visible; }
+  .ccontrol :global(.wrap) { min-width: 0; max-width: 100%; }
+  .c-worktree { overflow: hidden !important; }
+  .c-worktree :global(.workmode) { max-width: 100%; }
+  .ccontrol :global(.pill-btn) {
+    max-width: 100%; min-width: 0; overflow: hidden; white-space: nowrap;
+  }
+  .control-label, .ccontrol :global(.pill-label) {
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .cactions {
+    margin-left: auto; display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem;
+    flex: 0 1 auto; min-width: 0; max-width: 100%;
+  }
+
+  /* First cap long labels so they ellipsize; only at genuinely icon-sized pane widths hide labels and
+     chevrons. Every resulting icon button keeps its descriptive title. */
+  @container composer-footer (max-width: 520px) {
+    .ccontrol { max-width: 9rem; }
+  }
+  @container composer-footer (max-width: 360px) {
+    .ccontrol { max-width: 6rem; }
+  }
+  @container composer-footer (max-width: 260px) {
+    .ccontrol { flex: 0 0 1.9rem; width: 1.9rem; max-width: 1.9rem; }
+    .ccontrol :global(.pill-btn) {
+      width: 1.9rem; padding-inline: 0.4rem; gap: 0; justify-content: flex-start;
+    }
+    .control-label, .ccontrol :global(.pill-label),
+    .ccontrol :global(.chev), .dchev { display: none; }
+    .foot-act { width: 1.9rem; padding-inline: 0; justify-content: center; }
+    .foot-act .control-label { display: none; }
+    .cactions { margin-left: 0; }
+    .c-worktree { flex-basis: 3.25rem; width: 3.25rem; max-width: 3.25rem; }
+    .c-worktree :global(.segment span) { display: none; }
+    .c-worktree :global(.segments) { gap: 0; }
+    .c-worktree :global(.segment) { padding-inline: 0.25rem; }
+  }
   .attachment-input { display: none; }
   .attach-btn { display: inline-grid; place-items: center; width: 28px; height: 26px; flex: none; border: 1px solid var(--border); border-radius: 7px; color: var(--muted); }
   .attach-btn:hover { border-color: var(--border-strong); color: var(--text); background: var(--surface-2); }
@@ -1159,7 +1240,7 @@
   .cmdtag { flex: none; font-size: 0.58rem; letter-spacing: 0.05em; text-transform: uppercase; border-radius: var(--r-xs);
     padding: 0 0.32rem; border: 1px solid var(--border-strong); color: var(--muted); }
   .cmdtag.builtin { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
-  .foot-act { font-size: 0.75rem; color: var(--muted); border: 1px solid var(--border); border-radius: 7px; padding: 0.22rem 0.5rem; }
+  .foot-act { display: inline-flex; align-items: center; gap: 0.3rem; font-size: 0.75rem; color: var(--muted); border: 1px solid var(--border); border-radius: 7px; padding: 0.22rem 0.5rem; }
   .foot-act:hover:not(:disabled) { border-color: var(--border-strong); color: var(--text); }
   .foot-act:disabled { opacity: 0.35; cursor: default; }
   .mode { cursor: default; }

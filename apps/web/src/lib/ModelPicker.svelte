@@ -21,9 +21,9 @@
 </script>
 
 <div class="wrap">
-  <button class="pill-btn" class:open onclick={() => (open = !open)}>
+  <button class="pill-btn" class:open onclick={() => (open = !open)} title={`Model: ${current?.name ?? 'model'}`}>
     <span class="glyph" class:codex={provider === 'codex'}></span>
-    {current?.shortName ?? current?.name ?? 'model'}
+    <span class="pill-label">{current?.shortName ?? current?.name ?? 'model'}</span>
     <span class="chev"><Icon name="chevron-down" size={12} /></span>
   </button>
   {#if open}
@@ -45,7 +45,8 @@
 </div>
 
 <style>
-  .wrap { position: relative; }
+  .wrap { position: relative; min-width: 0; }
+  .pill-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .glyph { width: 9px; height: 9px; border-radius: var(--r-xs); background: var(--secondary); }
   .glyph.codex { background: var(--ok); }
   .chev { display: inline-grid; opacity: 0.6; }
