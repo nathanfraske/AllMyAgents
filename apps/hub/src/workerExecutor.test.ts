@@ -3,6 +3,7 @@ import { WorkerExecutor, type WorkerExecutorHubCallbacks } from './workerExecuto
 import { HubUnavailableError } from './workerProtocol.js'
 import type { WorkerClient } from './workerTransport.js'
 import type { WorkerSessionSpec, WorkerToHub } from './workerProtocol.js'
+import type { AttachmentMeta } from './attachments.js'
 
 /**
  * A WorkerClient whose `call()` always rejects the way the real one does when the worker is not
@@ -69,6 +70,27 @@ const SPEC: WorkerSessionSpec = {
  * applyLifecycle → journal `session/error` + status 'error'), so every client un-sticks identically.
  */
 describe('WorkerExecutor.runTurn — a turn the worker never accepted must not vanish', () => {
+  it('carries attachment metadata through both worker commands', async () => {
+    const { client, calls } = unattachedClient()
+    const { hub } = recordingHub()
+    const exec = new WorkerExecutor(client, hub)
+    const attachment: AttachmentMeta = {
+      id: 'a1',
+      name: 'shot.png',
+      mime: 'image/png',
+      size: 3,
+      path: '/tmp/shot.png',
+    }
+
+    await exec.runTurn(SPEC, 'look', 'operator', [attachment])
+    await expect(exec.steer('s1', 'again', [attachment])).rejects.toBeInstanceOf(HubUnavailableError)
+
+    expect(calls).toEqual([
+      expect.objectContaining({ t: 'runTurn', attachments: [attachment] }),
+      expect.objectContaining({ t: 'steer', attachments: [attachment] }),
+    ])
+  })
+
   it('reports turnError to the hub when the worker is unattached, instead of swallowing', async () => {
     const { client } = unattachedClient()
     const { hub, lifecycle } = recordingHub()

@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
+import { pipeline } from 'node:stream/promises'
 import { WebSocketServer, WebSocket } from 'ws'
 import type { ApprovalService } from './approvals.js'
 import type { Journal } from './journal.js'
@@ -24,6 +25,7 @@ import type { DangerFlags, HubEvent, HubPrefs, Profile, Provider } from './types
 import type { Executor } from './executor.js'
 import type { RestartState } from './restartController.js'
 import { SCHEMA_VERSION } from './restartHandshake.js'
+import { AttachmentInputError, attachmentLimitForMime } from './attachments.js'
 
 const PAGE = `<!doctype html>
 <html>
@@ -203,8 +205,73 @@ async function readBody(req: http.IncomingMessage): Promise<Record<string, unkno
   return parsed as Record<string, unknown>
 }
 
+export class PayloadTooLargeError extends Error {}
+
+/**
+ * Read a raw upload with a real streaming limit. Content-Length is only an early rejection hint: a client
+ * can omit or understate it, so every received chunk advances the authoritative byte count and buffering
+ * stops immediately once that count crosses the cap.
+ */
+export function readRawBody(req: http.IncomingMessage, limit: number): Promise<Buffer> {
+  const declared = req.headers['content-length']
+  if (typeof declared === 'string' && /^\d+$/.test(declared) && Number(declared) > limit) {
+    req.resume()
+    return Promise.reject(new PayloadTooLargeError(`attachment exceeds the ${limit}-byte limit`))
+  }
+  return new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = []
+    let total = 0
+    let settled = false
+    const cleanup = (): void => {
+      req.off('data', onData)
+      req.off('end', onEnd)
+      req.off('aborted', onAborted)
+      req.off('error', onError)
+    }
+    const fail = (err: Error, drain = false): void => {
+      if (settled) return
+      settled = true
+      cleanup()
+      if (drain) {
+        req.on('error', () => {})
+        req.resume()
+      }
+      reject(err)
+    }
+    const onData = (chunk: Buffer | string): void => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      total += bytes.length
+      if (total > limit) {
+        fail(new PayloadTooLargeError(`attachment exceeds the ${limit}-byte limit`), true)
+        return
+      }
+      chunks.push(bytes)
+    }
+    const onEnd = (): void => {
+      if (settled) return
+      settled = true
+      cleanup()
+      resolve(Buffer.concat(chunks, total))
+    }
+    const onAborted = (): void => fail(new BadRequestError('upload was aborted'))
+    const onError = (err: Error): void => fail(err)
+    req.on('data', onData)
+    req.on('end', onEnd)
+    req.on('aborted', onAborted)
+    req.on('error', onError)
+  })
+}
+
 function str(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+function stringArray(value: unknown, field: string): string[] {
+  if (value === undefined) return []
+  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
+    throw new BadRequestError(`${field} must be an array of ids`)
+  }
+  return value
 }
 
 // The hub has full control and (for now) no auth, so a browser request from an unknown web
@@ -369,7 +436,7 @@ export function startServer(opts: ServerOptions): http.Server {
       if (origin) {
         res.setHeader('Access-Control-Allow-Origin', origin)
         res.setHeader('Vary', 'Origin')
-        res.setHeader('Access-Control-Allow-Headers', 'content-type, authorization')
+        res.setHeader('Access-Control-Allow-Headers', 'content-type, x-filename, authorization, x-hub-token')
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
       }
       if (method === 'OPTIONS') {
@@ -806,6 +873,13 @@ export function startServer(opts: ServerOptions): http.Server {
           return
         }
         const body = await readBody(req)
+        const initialAttachments = stringArray(body.attachments, 'attachments')
+        if (initialAttachments.length) {
+          // Uploads are session-owned and the upload route therefore needs the server-generated id.
+          // Refuse instead of pretending create-with-prompt consumed ids that cannot yet belong to it;
+          // clients create the empty session, upload to its id, then POST /input as the first prompt.
+          throw new BadRequestError('create the session before uploading attachments, then send the first prompt via /input')
+        }
         const pm = str(body.permissionMode)
         // Validate the profile HERE rather than letting sessions.create throw into the catch-all. An
         // unknown profile id is a bad request — the caller named an account that does not exist — and
@@ -833,6 +907,49 @@ export function startServer(opts: ServerOptions): http.Server {
           useWorktree: typeof body.useWorktree === 'boolean' ? body.useWorktree : undefined,
         })
         json(res, record)
+        return
+      }
+      const attachmentUploadMatch = /^\/api\/sessions\/([^/]+)\/attachments$/.exec(url.pathname)
+      if (method === 'POST' && attachmentUploadMatch) {
+        const sessionId = attachmentUploadMatch[1] as string
+        if (!sessions.list().some((record) => record.id === sessionId)) {
+          json(res, { error: `unknown session: ${sessionId}` }, 404)
+          return
+        }
+        const rawName = req.headers['x-filename']
+        if (typeof rawName !== 'string' || !rawName.trim()) throw new BadRequestError('x-filename is required')
+        const mime = String(req.headers['content-type'] ?? 'application/octet-stream')
+          .split(';', 1)[0]!
+          .trim()
+          .toLowerCase() || 'application/octet-stream'
+        if (!/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/.test(mime) || mime.length > 255) {
+          throw new BadRequestError('content-type must be a valid media type')
+        }
+        const bytes = await readRawBody(req, attachmentLimitForMime(mime))
+        if (bytes.length === 0) throw new BadRequestError('attachment is empty')
+        json(res, sessions.storeAttachment(sessionId, rawName, mime, bytes))
+        return
+      }
+      const attachmentGetMatch = /^\/api\/sessions\/([^/]+)\/attachments\/([^/]+)$/.exec(url.pathname)
+      if (method === 'GET' && attachmentGetMatch) {
+        const attachment = sessions.attachment(attachmentGetMatch[1] as string, attachmentGetMatch[2] as string)
+        if (!attachment) {
+          json(res, { error: 'attachment not found' }, 404)
+          return
+        }
+        res.writeHead(200, {
+          'content-type': attachment.mime,
+          'content-length': attachment.size,
+          'x-content-type-options': 'nosniff',
+        })
+        try {
+          await pipeline(fs.createReadStream(attachment.path), res)
+        } catch (err) {
+          // A client can cancel a large image after headers are sent. Do not let the catch-all attempt a
+          // second JSON response (ERR_HTTP_HEADERS_SENT); close this response and keep the hub healthy.
+          if (!res.headersSent) throw err
+          res.destroy()
+        }
         return
       }
       const approvalMatch = /^\/api\/approvals\/([^/]+)$/.exec(url.pathname)
@@ -889,7 +1006,11 @@ export function startServer(opts: ServerOptions): http.Server {
       const steerMatch = /^\/api\/sessions\/([^/]+)\/steer$/.exec(url.pathname)
       if (method === 'POST' && steerMatch) {
         const body = await readBody(req)
-        await sessions.steer(steerMatch[1] as string, String(body.text ?? ''))
+        await sessions.steer(
+          steerMatch[1] as string,
+          String(body.text ?? ''),
+          stringArray(body.attachments, 'attachments')
+        )
         json(res, { ok: true })
         return
       }
@@ -943,11 +1064,16 @@ export function startServer(opts: ServerOptions): http.Server {
         const verb = sessionAction[2] as string
         if (verb === 'input') {
           const body = await readBody(req)
-          await sessions.send(id, String(body.text ?? ''), {
-            model: str(body.model),
-            effort: body.effort === undefined ? undefined : String(body.effort),
-            serviceTier: body.serviceTier === undefined ? undefined : String(body.serviceTier),
-          })
+          await sessions.send(
+            id,
+            String(body.text ?? ''),
+            {
+              model: str(body.model),
+              effort: body.effort === undefined ? undefined : String(body.effort),
+              serviceTier: body.serviceTier === undefined ? undefined : String(body.serviceTier),
+            },
+            stringArray(body.attachments, 'attachments')
+          )
         } else if (verb === 'interrupt') {
           await sessions.interrupt(id)
         } else if (verb === 'reopen') {
@@ -968,6 +1094,14 @@ export function startServer(opts: ServerOptions): http.Server {
       // hub is broken". Reserving 500 for genuine server faults also keeps it meaningful as a signal —
       // a 500 in the log should be worth investigating, not routine noise from a fuzzed route.
       if (err instanceof BadRequestError) {
+        json(res, { error: err.message }, 400)
+        return
+      }
+      if (err instanceof PayloadTooLargeError) {
+        json(res, { error: err.message }, 413)
+        return
+      }
+      if (err instanceof AttachmentInputError) {
         json(res, { error: err.message }, 400)
         return
       }

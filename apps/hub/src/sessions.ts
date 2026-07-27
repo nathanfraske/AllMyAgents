@@ -26,6 +26,14 @@ import { deriveTitle, sanitizeTitle, generatedTitle, DEFAULT_CHAT_NAME_POOL } fr
 import { discoverImportableChats, importKey, type ImportableChat, type ScanResult } from './importScan.js'
 import { readProfileCommands, type CommandInfo } from './commands.js'
 import { EDIT_TOOLS } from './writeScope.js'
+import {
+  AttachmentInputError,
+  isClaudeImageMime,
+  loadAttachment,
+  resolveAttachments,
+  saveAttachment,
+  type AttachmentMeta,
+} from './attachments.js'
 
 export interface CreateOptions {
   cwd?: string
@@ -760,6 +768,41 @@ export class SessionManager {
     return [...this.sessions.values()]
   }
 
+  /** Persist one bounded raw upload beneath this session's cwd. The HTTP layer owns streaming limits. */
+  storeAttachment(sessionId: string, name: string, mime: string, bytes: Buffer): AttachmentMeta {
+    const record = this.sessions.get(sessionId)
+    if (!record) throw new Error(`unknown session: ${sessionId}`)
+    if (!fs.existsSync(record.cwd) || !fs.statSync(record.cwd).isDirectory()) {
+      throw new Error(`session workspace is unavailable: ${record.cwd}`)
+    }
+    return saveAttachment(sessionId, record.cwd, name, mime, bytes)
+  }
+
+  /** Resolve one download id only within its owning session's cwd. */
+  attachment(sessionId: string, attachmentId: string): AttachmentMeta | undefined {
+    const record = this.sessions.get(sessionId)
+    return record ? loadAttachment(sessionId, record.cwd, attachmentId) : undefined
+  }
+
+  private attachmentsFor(record: SessionRecord, ids: readonly string[] = []): AttachmentMeta[] {
+    const attachments = resolveAttachments(record.id, record.cwd, ids)
+    for (const attachment of attachments) {
+      if (record.provider === 'codex' && !attachment.mime.startsWith('image/')) {
+        throw new AttachmentInputError(`Codex accepts image attachments only: ${attachment.name}`)
+      }
+      if (
+        record.provider === 'claude' &&
+        attachment.mime !== 'application/pdf' &&
+        !isClaudeImageMime(attachment.mime)
+      ) {
+        throw new AttachmentInputError(
+          `Claude accepts PNG, JPEG, GIF, WebP, or PDF attachments: ${attachment.name}`
+        )
+      }
+    }
+    return attachments
+  }
+
   /** All profiles the manager can bind to — managed profiles/* PLUS registered default homes. */
   listProfiles(): { id: string; provider: Provider }[] {
     return [...this.profiles.values()].map((p) => ({ id: p.id, provider: p.provider }))
@@ -880,7 +923,7 @@ export class SessionManager {
     this.persist(record)
     this.journal.append(id, 'session/created', record)
     if (opts.prompt) {
-      this.journal.append(id, 'session/input', { text: opts.prompt })
+      this.journal.append(id, 'session/input', { text: opts.prompt, attachments: [] })
       this.autoTitle(record, opts.prompt)
     }
 
@@ -1055,7 +1098,12 @@ export class SessionManager {
     return `<<RECALLED FROM MEMORY — relevant notes you or a teammate saved earlier; use if helpful>>\n${block}\n<<END RECALLED>>\n\n${prompt}`
   }
 
-  async send(sessionId: string, text: string, override: TurnOverride = {}): Promise<void> {
+  async send(
+    sessionId: string,
+    text: string,
+    override: TurnOverride = {},
+    attachmentIds: readonly string[] = []
+  ): Promise<void> {
     const record = this.sessions.get(sessionId)
     if (!record) throw new Error(`unknown session: ${sessionId}`)
     if (record.status === 'stopped') throw new Error('session is stopped')
@@ -1073,25 +1121,30 @@ export class SessionManager {
     // transcript. The record's own status is the vendor-independent fact, so it leads.
     if (record.status === 'active' || record.status === 'starting' || this.executor.isBusy(sessionId)) {
       if (!this.steerMessagesAtToolBoundary()) throw new Error('a turn is already in progress')
+      const attachments = this.attachmentsFor(record, attachmentIds)
       // Acceptance comes BEFORE transcript side effects for the same reason as a fresh send below: if the
       // turn ended in the race to the executor, the web queue receives a rejection and can keep/retry the
       // message. A phantom session/input would falsely claim the model saw text that never crossed.
-      await this.executor.steer(sessionId, text)
-      this.journal.append(sessionId, 'session/input', { text })
-      this.journal.append(sessionId, 'session/steered', { text, source: 'operator' })
+      if (attachments.length) await this.executor.steer(sessionId, text, attachments)
+      else await this.executor.steer(sessionId, text)
+      this.journal.append(sessionId, 'session/input', { text, attachments })
+      this.journal.append(sessionId, 'session/steered', { text, attachments, source: 'operator' })
       this.autoTitle(record, text)
       // This is additional input to the CURRENT turn, not a new turn. In particular, do not touch either
       // provenance set or journal a new session/turn-origin: doing so could relabel a bus turn as operator
       // (widening approval) or an operator turn as bus (unexpectedly revoking it) halfway through.
       return
     }
+    // Resolve/validate every id before persisting overrides, journaling input, or changing provenance.
+    // A missing or vendor-unsupported attachment is an admission failure, not a partial turn.
+    const attachments = this.attachmentsFor(record, attachmentIds)
     if (override.model) record.model = override.model
     if (override.effort !== undefined) record.effort = override.effort
     if (override.serviceTier !== undefined) record.serviceTier = override.serviceTier
     if (override.model || override.effort !== undefined || override.serviceTier !== undefined) this.persist(record)
     // Journal the user's message so it's part of the replayable transcript (Claude never echoes
     // user text back as an event; without this the user's turns vanish on reload). Timestamped.
-    this.journal.append(sessionId, 'session/input', { text })
+    this.journal.append(sessionId, 'session/input', { text, attachments })
     this.autoTitle(record, text)
     // Operator provenance is established ONLY immediately before an ACCEPTED runTurn (see
     // operatorTurnSessions). Tagging earlier — e.g. above the busy check — would let a rejected send
@@ -1103,17 +1156,21 @@ export class SessionManager {
     this.operatorTurnSessions.add(sessionId)
     this.journal.append(sessionId, 'session/turn-origin', { origin: 'operator' })
     if (record.provider === 'claude') {
-      void this.executor.runTurn(this.specOf(record), text, 'operator')
+      if (attachments.length) void this.executor.runTurn(this.specOf(record), text, 'operator', attachments)
+      else void this.executor.runTurn(this.specOf(record), text, 'operator')
     } else {
-      await this.executor.runTurn(this.specOf(record), text, 'operator')
+      if (attachments.length) await this.executor.runTurn(this.specOf(record), text, 'operator', attachments)
+      else await this.executor.runTurn(this.specOf(record), text, 'operator')
     }
   }
 
-  async steer(sessionId: string, text: string): Promise<void> {
+  async steer(sessionId: string, text: string, attachmentIds: readonly string[] = []): Promise<void> {
     const record = this.sessions.get(sessionId)
     if (!record) throw new Error(`unknown session: ${sessionId}`)
-    await this.executor.steer(sessionId, text)
-    this.journal.append(sessionId, 'session/steered', { text })
+    const attachments = this.attachmentsFor(record, attachmentIds)
+    if (attachments.length) await this.executor.steer(sessionId, text, attachments)
+    else await this.executor.steer(sessionId, text)
+    this.journal.append(sessionId, 'session/steered', { text, attachments })
   }
 
   /**

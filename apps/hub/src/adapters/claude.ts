@@ -1,4 +1,6 @@
 import { query, type Query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk'
+import fs from 'node:fs'
+import { isClaudeImageMime, type AttachmentMeta } from '../attachments.js'
 
 type EventSink = (kind: string, payload: unknown) => void
 
@@ -47,10 +49,36 @@ function numField(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
 
-function userMessage(text: string, priority?: 'next'): SDKUserMessage {
+function userMessage(text: string, attachments: readonly AttachmentMeta[] = [], priority?: 'next'): SDKUserMessage {
+  const content: Exclude<SDKUserMessage['message']['content'], string> = []
+  if (text || attachments.length === 0) content.push({ type: 'text', text })
+  for (const attachment of attachments) {
+    if (isClaudeImageMime(attachment.mime)) {
+      content.push({
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: attachment.mime,
+          data: fs.readFileSync(attachment.path).toString('base64'),
+        },
+      })
+    } else if (attachment.mime === 'application/pdf') {
+      content.push({
+        type: 'document',
+        source: {
+          type: 'base64',
+          media_type: 'application/pdf',
+          data: fs.readFileSync(attachment.path).toString('base64'),
+        },
+      })
+    }
+    // Every other type is intentionally absent. The hub validates provider support before journaling,
+    // but this adapter remains the final invariant if a future caller bypasses SessionManager.
+  }
+  if (content.length === 0) content.push({ type: 'text', text })
   return {
     type: 'user',
-    message: { role: 'user', content: [{ type: 'text', text }] },
+    message: { role: 'user', content },
     parent_tool_use_id: null,
     ...(priority ? { priority } : {}),
   }
@@ -153,7 +181,11 @@ export class ClaudeDriver {
     return this.active !== undefined
   }
 
-  async send(prompt: string, turnOptions: ClaudeTurnOptions = {}): Promise<void> {
+  async send(
+    prompt: string,
+    turnOptions: ClaudeTurnOptions = {},
+    attachments: readonly AttachmentMeta[] = []
+  ): Promise<void> {
     if (this.active) throw new Error('claude session is already running a turn')
     const env = { ...process.env, CLAUDE_CONFIG_DIR: this.profileDir } as Record<string, string>
     const keyword = turnOptions.effort ? THINKING_KEYWORD[turnOptions.effort] : undefined
@@ -213,7 +245,7 @@ export class ClaudeDriver {
     // A string prompt selects the SDK's one-shot mode, where control requests and additional input are
     // unsupported. Its AsyncIterable form selects streaming I/O. The stream stays open until this turn's
     // result so `steer()` can append a priority:'next' user message at Claude Code's next tool boundary.
-    const input = new ClaudeInputStream(userMessage(finalPrompt))
+    const input = new ClaudeInputStream(userMessage(finalPrompt, attachments))
     const q = query({ prompt: input, options: options as never })
     this.active = { query: q, input }
     let receivedResult = false
@@ -246,11 +278,11 @@ export class ClaudeDriver {
     }
   }
 
-  async steer(text: string): Promise<void> {
+  async steer(text: string, attachments: readonly AttachmentMeta[] = []): Promise<void> {
     const active = this.active
     if (!active) throw new Error('no active Claude turn to steer')
     try {
-      await active.input.push(userMessage(text, 'next'))
+      await active.input.push(userMessage(text, attachments, 'next'))
     } catch {
       throw new Error('no active Claude turn to steer')
     }

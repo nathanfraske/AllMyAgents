@@ -7,6 +7,7 @@
  */
 import crypto from 'node:crypto'
 import type { DangerFlags } from './types.js'
+import type { AttachmentMeta } from './attachments.js'
 
 /** The subset of a SessionRecord the worker's driver needs — the worker holds no record + never opens the store. */
 export interface WorkerSessionSpec {
@@ -31,8 +32,15 @@ export interface WorkerSessionSpec {
 export type HubToWorker =
   | { t: 'hello'; attachEpoch: number; danger: DangerFlags } // first frame on every (re)connect; establishes the live channel
   | { t: 'startThread'; reqId: string; spec: WorkerSessionSpec }
-  | { t: 'runTurn'; reqId: string; spec: WorkerSessionSpec; prompt: string; origin: 'operator' | 'bus' }
-  | { t: 'steer'; reqId: string; sessionId: string; text: string }
+  | {
+      t: 'runTurn'
+      reqId: string
+      spec: WorkerSessionSpec
+      prompt: string
+      origin: 'operator' | 'bus'
+      attachments?: AttachmentMeta[]
+    }
+  | { t: 'steer'; reqId: string; sessionId: string; text: string; attachments?: AttachmentMeta[] }
   | { t: 'interrupt'; reqId: string; sessionId: string }
   | { t: 'stopSession'; reqId: string; sessionId: string }
   | { t: 'listLive'; reqId: string }

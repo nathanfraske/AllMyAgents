@@ -2,6 +2,7 @@ import type { Executor } from './executor.js'
 import type { WorkerClient } from './workerTransport.js'
 import type { DangerFlags } from './types.js'
 import { nextReqId, type HubToWorker, type LiveSession, type RelayMethod, type WorkerSessionSpec, type WorkerToHub } from './workerProtocol.js'
+import type { AttachmentMeta } from './attachments.js'
 
 function errText(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
@@ -136,7 +137,12 @@ export class WorkerExecutor implements Executor {
     return reply.threadId
   }
 
-  async runTurn(spec: WorkerSessionSpec, prompt: string, origin: 'operator' | 'bus'): Promise<void> {
+  async runTurn(
+    spec: WorkerSessionSpec,
+    prompt: string,
+    origin: 'operator' | 'bus',
+    attachments: readonly AttachmentMeta[] = []
+  ): Promise<void> {
     // Recall stays hub-side (§4.2): augment the prompt in the hub process before it crosses to the worker.
     const augmented = this.hub.recall(spec.sessionId, prompt)
     // Optimistically mark busy on accept so the "a turn is already in progress" guard (SessionManager.send)
@@ -144,7 +150,14 @@ export class WorkerExecutor implements Executor {
     // the source of truth and confirms (turnStarted) or clears (turnCompleted/turnError) it.
     this.busySessions.add(spec.sessionId)
     try {
-      await this.callAck({ t: 'runTurn', reqId: nextReqId(), spec, prompt: augmented, origin })
+      await this.callAck({
+        t: 'runTurn',
+        reqId: nextReqId(),
+        spec,
+        prompt: augmented,
+        origin,
+        ...(attachments.length ? { attachments: [...attachments] } : {}),
+      })
     } catch (err) {
       // The worker never took the turn (unreachable / dropped accept). Like the in-process executor,
       // runTurn NEVER rejects — its callers `void` it (claude / bus) or await it as fire-on-accept (codex),
@@ -174,8 +187,14 @@ export class WorkerExecutor implements Executor {
     }
   }
 
-  async steer(sessionId: string, text: string): Promise<void> {
-    await this.callAck({ t: 'steer', reqId: nextReqId(), sessionId, text })
+  async steer(sessionId: string, text: string, attachments: readonly AttachmentMeta[] = []): Promise<void> {
+    await this.callAck({
+      t: 'steer',
+      reqId: nextReqId(),
+      sessionId,
+      text,
+      ...(attachments.length ? { attachments: [...attachments] } : {}),
+    })
   }
 
   async interrupt(sessionId: string): Promise<void> {

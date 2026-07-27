@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { createRequire } from 'node:module'
 import { AGENT_MCP_SERVER_NAME } from '../codexMcpConfig.js'
+import type { AttachmentMeta } from '../attachments.js'
 
 /**
  * Absolute path to the codex CLI entry, or null if we cannot find it.
@@ -353,13 +354,28 @@ export class CodexClient {
     await this.request('thread/resume', { threadId })
   }
 
-  async sendTurn(threadId: string, text: string, opts: CodexTurnOptions = {}): Promise<void> {
+  async sendTurn(
+    threadId: string,
+    text: string,
+    opts: CodexTurnOptions = {},
+    attachments: readonly AttachmentMeta[] = []
+  ): Promise<void> {
     // Codex may otherwise complete reasoning items with empty summary/content arrays, leaving the
     // operator no explanation for a long reasoning phase. `summary` is the app-server's sticky
     // turn/start override (ReasoningSummary = auto|concise|detailed|none).
+    const input: Array<Record<string, string>> = []
+    if (text || !attachments.some((attachment) => attachment.mime.startsWith('image/'))) {
+      input.push({ type: 'text', text })
+    }
+    // The installed app-server's UserInput enum has localImage but no generic document/file item.
+    // Keep the guard here even though the UI and SessionManager filter: protocol invariants belong at
+    // the adapter boundary, and a non-image path must never be mislabeled as an image.
+    for (const attachment of attachments) {
+      if (attachment.mime.startsWith('image/')) input.push({ type: 'localImage', path: attachment.path })
+    }
     const params: Record<string, unknown> = {
       threadId,
-      input: [{ type: 'text', text }],
+      input,
       summary: 'auto',
     }
     if (opts.model) params.model = opts.model
@@ -376,12 +392,19 @@ export class CodexClient {
 
   // Append user input to the turn currently running on this thread. The app-server requires
   // expectedTurnId to match the live turn (else -32600), so we send the tracked active turn id.
-  async steer(threadId: string, text: string): Promise<void> {
+  async steer(threadId: string, text: string, attachments: readonly AttachmentMeta[] = []): Promise<void> {
     const expectedTurnId = this.activeTurns.get(threadId)
     if (!expectedTurnId) throw new Error('no active Codex turn to steer')
+    const input: Array<Record<string, string>> = []
+    if (text || !attachments.some((attachment) => attachment.mime.startsWith('image/'))) {
+      input.push({ type: 'text', text })
+    }
+    for (const attachment of attachments) {
+      if (attachment.mime.startsWith('image/')) input.push({ type: 'localImage', path: attachment.path })
+    }
     await this.request('turn/steer', {
       threadId,
-      input: [{ type: 'text', text }],
+      input,
       expectedTurnId,
     })
   }

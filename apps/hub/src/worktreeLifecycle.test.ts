@@ -130,4 +130,24 @@ describe('worktree session lifecycle', () => {
     expect(fs.readFileSync(path.join(worktree, 'uncommitted.txt'), 'utf8')).toBe('recover me\n')
     expect(sessions.list().find((r) => r.id === record.id)?.status).toBe('stopped')
   })
+
+  it('Stop preserves worktree attachments and Delete treats them as recoverable uncommitted data', async () => {
+    const { sessions, record, worktree } = await createWorktreeSession()
+    const attachment = sessions.storeAttachment(
+      record.id,
+      'evidence.png',
+      'image/png',
+      Buffer.from('recoverable attachment')
+    )
+
+    await sessions.stop(record.id)
+    expect(fs.readFileSync(attachment.path, 'utf8')).toBe('recoverable attachment')
+
+    const deleted = await sessions.delete(record.id)
+    expect(deleted.ok).toBe(false)
+    if (deleted.ok) throw new Error('attachment-bearing worktree deletion unexpectedly succeeded')
+    expect(deleted.error).toContain('uncommitted')
+    expect(fs.readFileSync(attachment.path, 'utf8')).toBe('recoverable attachment')
+    expect(fs.existsSync(worktree)).toBe(true)
+  })
 })

@@ -44,6 +44,7 @@ import { AUTO_ALLOW_TOOLS, SELF_GATING_TOOLS } from './executor.js'
 import { WseqBuffer, type BufferedEvent } from './wseqBuffer.js'
 import { WorkerServer } from './workerTransport.js'
 import { checkWriteScope } from './writeScope.js'
+import type { AttachmentMeta } from './attachments.js'
 import type { BusMessage } from './bus.js'
 import type { Memory } from './memory.js'
 import type { Practice } from './practices.js'
@@ -277,7 +278,7 @@ export class AgentWorker {
         this.handleRunTurn(msg)
         return
       case 'steer':
-        this.steer(msg.sessionId, msg.text)
+        this.steer(msg.sessionId, msg.text, msg.attachments)
           .then(() => this.ack(msg.reqId, true))
           .catch((err) => this.ack(msg.reqId, false, errMessage(err)))
         return
@@ -320,17 +321,17 @@ export class AgentWorker {
   }
 
   private handleRunTurn(msg: Extract<HubToWorker, { t: 'runTurn' }>): void {
-    const { spec, prompt, origin } = msg
+    const { spec, prompt, origin, attachments = [] } = msg
     if (spec.provider === 'claude') {
       // Fire-and-progress: a claude turn runs to completion in the background (matches the in-process
       // `void runClaudeTurn`), so the accept is immediate.
-      void this.runClaudeTurn(spec, prompt, origin)
+      void this.runClaudeTurn(spec, prompt, origin, attachments)
       this.ack(msg.reqId, true)
     } else {
       // A codex turn awaits through the turn/start ack, then streams. runCodexTurn catches its own errors
       // (reporting them via turnError), so the accept resolves either way — the ack mirrors the in-process
       // `await runCodexTurn` returning on accept.
-      this.runCodexTurn(spec, prompt, origin)
+      this.runCodexTurn(spec, prompt, origin, attachments)
         .then(() => this.ack(msg.reqId, true))
         .catch((err) => this.ack(msg.reqId, false, errMessage(err)))
     }
@@ -342,22 +343,28 @@ export class AgentWorker {
 
   // ---- Turn loops (the driver half of InProcessExecutor.runClaudeTurn / runCodexTurn) -----------
 
-  private async runClaudeTurn(spec: WorkerSessionSpec, prompt: string, origin: 'operator' | 'bus'): Promise<void> {
+  private async runClaudeTurn(
+    spec: WorkerSessionSpec,
+    prompt: string,
+    origin: 'operator' | 'bus',
+    attachments: readonly AttachmentMeta[]
+  ): Promise<void> {
     const driver = this.claudeDriverFor(spec)
     this.emitTurnStarted(spec.sessionId)
     if (origin === 'bus') this.busTurnSessions.add(spec.sessionId)
     try {
       // The prompt is ALREADY recall-augmented by the hub (withRecall stays hub-side, §4.2) — the worker
       // holds no MemoryStore, so it must not re-recall here.
-      await driver.send(prompt, {
-        model: spec.model,
-        permissionMode: spec.permissionMode,
-        effort: spec.effort,
-        // Per-project config trust (the sessions.ts seam): specOf sets spec.trustProjectConfig from the
-        // ProjectStore. Read defensively so this consumer compiles ahead of the field being added to
-        // WorkerSessionSpec; undefined => untrusted => the driver's safe-default gate engages.
-        trustProjectConfig: (spec as { trustProjectConfig?: boolean }).trustProjectConfig,
-      })
+      await driver.send(
+        prompt,
+        {
+          model: spec.model,
+          permissionMode: spec.permissionMode,
+          effort: spec.effort,
+          trustProjectConfig: spec.trustProjectConfig,
+        },
+        attachments
+      )
       this.emitTurnCompleted(spec.sessionId, driver.sessionId)
     } catch (err) {
       this.emitTurnError(spec.sessionId, errMessage(err))
@@ -366,19 +373,29 @@ export class AgentWorker {
     }
   }
 
-  private async runCodexTurn(spec: WorkerSessionSpec, prompt: string, origin: 'operator' | 'bus'): Promise<void> {
+  private async runCodexTurn(
+    spec: WorkerSessionSpec,
+    prompt: string,
+    origin: 'operator' | 'bus',
+    attachments: readonly AttachmentMeta[]
+  ): Promise<void> {
     this.emitTurnStarted(spec.sessionId)
     if (origin === 'bus') this.busTurnSessions.add(spec.sessionId)
     try {
       const { client, threadId } = await this.ensureCodexThread(spec)
       // Only the ACCEPT (turn/start ack) is awaited here, matching in-process. turnCompleted is emitted
       // later, when the app-server's `codex/turn/completed` notification fires in the client callback.
-      await client.sendTurn(threadId, prompt, {
-        model: spec.model,
-        effort: spec.effort,
-        serviceTier: spec.serviceTier,
-        ...codexTurnPolicy(spec), // approval + sandbox together; see the note on codexTurnPolicy
-      })
+      await client.sendTurn(
+        threadId,
+        prompt,
+        {
+          model: spec.model,
+          effort: spec.effort,
+          serviceTier: spec.serviceTier,
+          ...codexTurnPolicy(spec), // approval + sandbox together; see the note on codexTurnPolicy
+        },
+        attachments
+      )
     } catch (err) {
       this.emitTurnError(spec.sessionId, errMessage(err))
     } finally {
@@ -411,17 +428,17 @@ export class AgentWorker {
     return { client, threadId }
   }
 
-  private async steer(sessionId: string, text: string): Promise<void> {
+  private async steer(sessionId: string, text: string, attachments: readonly AttachmentMeta[] = []): Promise<void> {
     const driver = this.claudeDrivers.get(sessionId)
     if (driver) {
-      await driver.steer(text)
+      await driver.steer(text, attachments)
       return
     }
     const client = this.codexSessionClients.get(sessionId)
     const threadId = this.codexThreads.get(sessionId)
     // CodexClient.steer enforces the LIVE-turn requirement through expectedTurnId (mirrors in-process).
     if (!client || !threadId) throw new Error('no active Codex turn to steer')
-    await client.steer(threadId, text)
+    await client.steer(threadId, text, attachments)
   }
 
   private async interrupt(sessionId: string): Promise<void> {

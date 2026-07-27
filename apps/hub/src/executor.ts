@@ -19,6 +19,7 @@ import type { BusAddress, BusMessage } from './bus.js'
 import type { ClaudeLimitInfo, DangerFlags, SessionStatus } from './types.js'
 import type { LiveSession, WorkerSessionSpec } from './workerProtocol.js'
 import { checkWriteScope } from './writeScope.js'
+import type { AttachmentMeta } from './attachments.js'
 
 /**
  * The Executor seam (docs/agent-worker-impl.md §4.1). Agent execution — the ClaudeDriver / CodexClient
@@ -32,9 +33,14 @@ export interface Executor {
   /** Codex only: start a fresh app-server thread; returns the threadId the hub persists as vendorSessionId. */
   startThread(spec: WorkerSessionSpec): Promise<string>
   /** Run one turn. Resolves on ACCEPT (turn/start ack / turn kicked off), NOT on turn completion. */
-  runTurn(spec: WorkerSessionSpec, prompt: string, origin: 'operator' | 'bus'): Promise<void>
+  runTurn(
+    spec: WorkerSessionSpec,
+    prompt: string,
+    origin: 'operator' | 'bus',
+    attachments?: readonly AttachmentMeta[]
+  ): Promise<void>
   /** Append input to the provider's live turn; rejects if the turn ended before accepting it. */
-  steer(sessionId: string, text: string): Promise<void>
+  steer(sessionId: string, text: string, attachments?: readonly AttachmentMeta[]): Promise<void>
   /** Interrupt the in-flight turn (claude query / codex turn). No-op if none is running. */
   interrupt(sessionId: string): Promise<void>
   /** Drop the driver/thread for a stopped/deleted session from the executor. */
@@ -351,30 +357,44 @@ export class InProcessExecutor implements Executor {
     return { client, threadId }
   }
 
-  async runTurn(spec: WorkerSessionSpec, prompt: string, origin: 'operator' | 'bus'): Promise<void> {
+  async runTurn(
+    spec: WorkerSessionSpec,
+    prompt: string,
+    origin: 'operator' | 'bus',
+    attachments: readonly AttachmentMeta[] = []
+  ): Promise<void> {
     // Resolves on ACCEPT, not completion, matching the pre-seam call sites: a claude turn is
     // fire-and-forget (the turn runs to completion in the background); a codex turn awaits through the
     // turn/start ack. Both turn loops catch their own errors, so neither rejects.
     if (spec.provider === 'claude') {
-      void this.runClaudeTurn(spec, prompt, origin)
+      void this.runClaudeTurn(spec, prompt, origin, attachments)
     } else {
-      await this.runCodexTurn(spec, prompt, origin)
+      await this.runCodexTurn(spec, prompt, origin, attachments)
     }
   }
 
-  private async runClaudeTurn(spec: WorkerSessionSpec, prompt: string, origin: 'operator' | 'bus'): Promise<void> {
+  private async runClaudeTurn(
+    spec: WorkerSessionSpec,
+    prompt: string,
+    origin: 'operator' | 'bus',
+    attachments: readonly AttachmentMeta[]
+  ): Promise<void> {
     const driver = this.claudeDriverFor(spec)
     this.h.setStatus(spec.sessionId, 'active')
     // Tag the in-flight turn's provenance so risky in-process tool handlers can hard-deny on a bus
     // (teammate-message-caused) turn. Cleared in finally, so the flag is scoped to this turn.
     if (origin === 'bus') this.busTurnSessions.add(spec.sessionId)
     try {
-      await driver.send(this.h.recall(spec.sessionId, prompt), {
-        model: spec.model,
-        permissionMode: spec.permissionMode,
-        effort: spec.effort,
-        trustProjectConfig: spec.trustProjectConfig,
-      })
+      await driver.send(
+        this.h.recall(spec.sessionId, prompt),
+        {
+          model: spec.model,
+          permissionMode: spec.permissionMode,
+          effort: spec.effort,
+          trustProjectConfig: spec.trustProjectConfig,
+        },
+        attachments
+      )
       if (driver.sessionId) this.h.persistVendorSessionId(spec.sessionId, driver.sessionId)
       this.h.setStatus(spec.sessionId, 'idle')
     } catch (err) {
@@ -384,19 +404,29 @@ export class InProcessExecutor implements Executor {
     }
   }
 
-  private async runCodexTurn(spec: WorkerSessionSpec, prompt: string, origin: 'operator' | 'bus'): Promise<void> {
+  private async runCodexTurn(
+    spec: WorkerSessionSpec,
+    prompt: string,
+    origin: 'operator' | 'bus',
+    attachments: readonly AttachmentMeta[]
+  ): Promise<void> {
     this.h.setStatus(spec.sessionId, 'active')
     // Same bus-turn provenance tag as runClaudeTurn (Codex has no MCP tools yet, but tagging both
     // paths uniformly keeps the self-gate correct if/when Codex gains risky in-process tools).
     if (origin === 'bus') this.busTurnSessions.add(spec.sessionId)
     try {
       const { client, threadId } = await this.ensureCodexThread(spec)
-      await client.sendTurn(threadId, this.h.recall(spec.sessionId, prompt), {
-        model: spec.model,
-        effort: spec.effort,
-        serviceTier: spec.serviceTier,
-        ...codexTurnPolicy(spec), // approval + sandbox together; see the note on codexTurnPolicy
-      })
+      await client.sendTurn(
+        threadId,
+        this.h.recall(spec.sessionId, prompt),
+        {
+          model: spec.model,
+          effort: spec.effort,
+          serviceTier: spec.serviceTier,
+          ...codexTurnPolicy(spec), // approval + sandbox together; see the note on codexTurnPolicy
+        },
+        attachments
+      )
     } catch (err) {
       this.h.failTurn(spec.sessionId, err instanceof Error ? err.message : String(err))
     } finally {
@@ -404,10 +434,10 @@ export class InProcessExecutor implements Executor {
     }
   }
 
-  async steer(sessionId: string, text: string): Promise<void> {
+  async steer(sessionId: string, text: string, attachments: readonly AttachmentMeta[] = []): Promise<void> {
     const driver = this.claudeDrivers.get(sessionId)
     if (driver) {
-      await driver.steer(text)
+      await driver.steer(text, attachments)
       return
     }
     const client = this.codexSessionClients.get(sessionId)
@@ -421,7 +451,7 @@ export class InProcessExecutor implements Executor {
     // resume+journal via runCodexTurn on their next send. Deliberately NOT restored — preserving it would
     // widen steer()'s interface to carry a WorkerSessionSpec into the already-built worker protocol.
     if (!client || !threadId) throw new Error('no active Codex turn to steer')
-    await client.steer(threadId, text)
+    await client.steer(threadId, text, attachments)
   }
 
   async interrupt(sessionId: string): Promise<void> {
