@@ -45,6 +45,34 @@ describe('HUB base URL derivation (inTauri)', () => {
     expect(HUB_HTTP).toBe('http://127.0.0.1:7777')
     expect(HUB_WS).toBe('ws://127.0.0.1:7777')
   })
+
+  it('desktop obtains the device token through native IPC before authenticated HTTP', async () => {
+    const token = 'desktop-native-device-token-at-least-32-characters'
+    const invoke = vi.fn(async () => token)
+    const setItem = vi.fn()
+    vi.stubGlobal('localStorage', { getItem: () => '', setItem })
+    vi.stubGlobal('window', { __TAURI__: { core: { invoke } } })
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ requireToken: true, authed: true }),
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { api, bootstrapDesktopHubToken, getHubToken } = await loadApi()
+    await expect(bootstrapDesktopHubToken()).resolves.toBe(true)
+    expect(invoke).toHaveBeenCalledWith('hub_device_token')
+    expect(getHubToken()).toBe(token)
+    expect(setItem).toHaveBeenCalledWith('hub.token', token)
+
+    await api.auth()
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:7777/api/auth',
+      expect.objectContaining({
+        headers: { authorization: `Bearer ${token}` },
+      }),
+    )
+  })
 })
 
 // The transport contract: a response that is not usable data must never be handed back AS data. GET

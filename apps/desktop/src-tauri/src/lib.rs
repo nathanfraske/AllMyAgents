@@ -88,9 +88,16 @@ fn logln(msg: &str) {
     }
 }
 
-/// Where the hub listens. Kept in one place so the reachability probe and the
-/// spawn paths agree.
-const HUB_ADDR: &str = "127.0.0.1:7777";
+/// Where the hub listens. Release builds are fixed to the product port. A debug-only override lets the
+/// real desktop shell be exercised against an isolated sandbox without ever touching the operator's hub.
+fn hub_addr() -> String {
+    if cfg!(debug_assertions) {
+        if let Ok(value) = std::env::var("AMA_HUB_ADDR") {
+            return value;
+        }
+    }
+    "127.0.0.1:7777".to_string()
+}
 
 /// Handle to the Node hub. Stored in Tauri's managed state so the run-loop's
 /// exit handler can reach it and shut it down. `None` means we never spawned one
@@ -120,7 +127,7 @@ enum HubProbe {
 ///
 /// A booting green answers 200 with `boot:"booting"`; that is still our hub, so it counts as `Ours`.
 fn probe_hub() -> HubProbe {
-    let Ok(addr) = HUB_ADDR.parse::<SocketAddr>() else { return HubProbe::Vacant };
+    let Ok(addr) = hub_addr().parse::<SocketAddr>() else { return HubProbe::Vacant };
     let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_millis(500)) {
         Ok(s) => s,
         Err(_) => return HubProbe::Vacant, // connection refused / nothing listening
@@ -214,16 +221,17 @@ fn hub_worker_flag() -> String {
 }
 
 fn spawn_hub_dev(browser_secret: &str, browser_address: &str) -> Option<Child> {
+    let hub_addr = hub_addr();
     match probe_hub() {
         HubProbe::Ours => {
-            logln(&format!("[desktop] our hub already answering on {HUB_ADDR} — not spawning a second one"));
+            logln(&format!("[desktop] our hub already answering on {hub_addr} — not spawning a second one"));
             return None;
         }
         HubProbe::Foreign => {
             // Something holds the port but it is not our hub. Spawning would only fail to bind, so
             // don't — say why in the log (a dev has a terminal to read it) and let them free the port.
             logln(&format!(
-                "[desktop] {HUB_ADDR} is occupied by something that is not our hub — not spawning. Stop the other process (or `pnpm hubctl:dev` already running) and retry."
+                "[desktop] {hub_addr} is occupied by something that is not our hub — not spawning. Stop the other process (or `pnpm hubctl:dev` already running) and retry."
             ));
             return None;
         }
@@ -249,6 +257,12 @@ fn spawn_hub_dev(browser_secret: &str, browser_address: &str) -> Option<Child> {
     };
     cmd.current_dir(&repo_root);
     cmd.env("HUB_WORKER", hub_worker_flag()); // live turns survive a hub restart (see hub_worker_flag)
+    if let Some((_, port)) = hub_addr.rsplit_once(':') {
+        cmd.env("HUB_FIXED_PORT", port);
+    }
+    if let Ok(data_dir) = std::env::var("AMA_HUB_DATA_DIR") {
+        cmd.env("HUB_DATA_DIR", data_dir);
+    }
     cmd.env("AMA_DESKTOP_BROWSER_SECRET", browser_secret);
     cmd.env("AMA_DESKTOP_BROWSER_ADDR", browser_address);
     set_own_group(&mut cmd); // POSIX: own process group so kill_hub can group-signal the whole tree
@@ -265,7 +279,7 @@ fn spawn_hub_dev(browser_secret: &str, browser_address: &str) -> Option<Child> {
         }
         Err(e) => {
             logln(&format!(
-                "[desktop] could not spawn hub ({e}); continuing. Run `pnpm hubctl:dev` yourself if the UI can't reach 127.0.0.1:7777."
+                "[desktop] could not spawn hub ({e}); continuing. Run `pnpm hubctl:dev` yourself if the UI can't reach {hub_addr}."
             ));
             None
         }
@@ -392,6 +406,46 @@ fn app_data_root(app: &AppHandle) -> Option<PathBuf> {
         .map(|d| d.join("AllMyAgents"))
         .or_else(|| app.path().app_data_dir().ok())?;
     Some(base)
+}
+
+/// Return the local hub's device capability to this app's own webview.
+///
+/// This IPC command replaces the old unauthenticated `/api/mesh` bootstrap. The webview cannot read
+/// arbitrary files, while the native shell already owns the exact data root it gives the hub. A short
+/// wait covers first launch, where the webview can mount just before the hub creates its token.
+#[cfg(desktop)]
+#[tauri::command]
+fn hub_device_token(app: AppHandle) -> Result<String, String> {
+    let token_path = if cfg!(debug_assertions) && std::env::var_os("AMA_HUB_DATA_DIR").is_some() {
+        PathBuf::from(std::env::var_os("AMA_HUB_DATA_DIR").expect("checked above"))
+            .join("device-token.txt")
+    } else if cfg!(debug_assertions) {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("data")
+            .join("device-token.txt")
+    } else {
+        app_data_root(&app)
+            .ok_or_else(|| "could not resolve the AllMyAgents data directory".to_string())?
+            .join("data")
+            .join("device-token.txt")
+    };
+
+    for _ in 0..100 {
+        if let Ok(token) = fs::read_to_string(&token_path) {
+            let token = token.trim().to_string();
+            if token.len() >= 32 {
+                return Ok(token);
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!(
+        "hub device token was not ready at {}",
+        token_path.display()
+    ))
 }
 
 /// First-run materialization of the app-data layout: create
@@ -556,10 +610,11 @@ fn release_boot(
     browser_secret: String,
     browser_address: String,
 ) {
+    let hub_addr = hub_addr();
     // Reachability guard — prove what is on the port before deciding, and never spawn a second hub.
     match probe_hub() {
         HubProbe::Ours => {
-            logln(&format!("[desktop] our hub already answering on {HUB_ADDR} — not spawning"));
+            logln(&format!("[desktop] our hub already answering on {hub_addr} — not spawning"));
             if let Some(w) = &splash {
                 let _ = w.close();
             }
@@ -574,7 +629,7 @@ fn release_boot(
                 &app,
                 &splash,
                 &format!(
-                    "Another program is using port 7777, which AllMyAgents needs for its hub. Close whatever is using it (or restart your computer), then reopen AllMyAgents. Details are in the log: {}",
+                    "Another program is using {hub_addr}, which AllMyAgents needs for its hub. Close whatever is using it (or restart your computer), then reopen AllMyAgents. Details are in the log: {}",
                     log_path(&app).map(|p| p.display().to_string()).unwrap_or_else(|| "(no log)".into())
                 ),
             );
@@ -912,7 +967,11 @@ pub fn run() {
     #[cfg(desktop)]
     let builder = builder
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![updater_check, updater_install]);
+        .invoke_handler(tauri::generate_handler![
+            updater_check,
+            updater_install,
+            hub_device_token
+        ]);
 
     builder
         .setup(|app| {

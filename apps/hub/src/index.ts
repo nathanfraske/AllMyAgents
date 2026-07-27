@@ -400,14 +400,10 @@ function rescanProfiles(): typeof profiles {
 // journal + config, which is what HUB_DATA_DIR already promised ("journal/config/worktrees/device-token
 // root", line 29). It used to hardcode `repoRoot/data`, so an installed build — the only configuration
 // that sets HUB_DATA_DIR — would have split its token away from the rest of its state. Unset
-// HUB_DATA_DIR resolves to exactly the same path as before, so dev is unchanged. Enforcement is opt-in
-// (HUB_REQUIRE_TOKEN or config.security.requireToken) so local-only use is unaffected; turn it on for
-// fleet/remote exposure.
+// HUB_DATA_DIR resolves to exactly the same path as before, so dev is unchanged. Enforcement is
+// mandatory even on loopback: vendor agents are local callers too.
 const deviceToken = getOrCreateDeviceToken(dataDir)
-const requireToken =
-  process.env.HUB_REQUIRE_TOKEN === '1' ||
-  process.env.HUB_REQUIRE_TOKEN === 'true' ||
-  config.security?.requireToken === true
+const requireToken = true
 // Mesh exposure is AUTOMATIC: on startup we probe the local AllMyStuff node and, if one is
 // running, register the hub as a "site" so any fleet PC can reach it with zero per-machine setup.
 // The hub still binds only 127.0.0.1 — the node dials loopback and tunnels the site; registration

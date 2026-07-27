@@ -21,6 +21,9 @@
 // It talks to the sandbox (7788) and REFUSES the live hub, for the same reason sandbox.mjs does: a driver
 // pointed at 7777 would spawn real agents in the operator's workspace and spend real tokens.
 import http from 'node:http'
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const PORT = Number(process.env.SANDBOX_PORT ?? 7788)
 if (PORT === 7777) {
@@ -30,6 +33,9 @@ if (PORT === 7777) {
 
 const argv = process.argv.slice(2)
 const cmd = argv[0]
+const REPO = path.resolve(fileURLToPath(import.meta.url), '..', '..')
+const SANDBOX_ROOT = process.env.SANDBOX_DIR ?? path.join(REPO, '.sandbox')
+const DEVICE_TOKEN = fs.readFileSync(path.join(SANDBOX_ROOT, 'data', 'device-token.txt'), 'utf8').trim()
 
 // Flags that CONSUME the next token. Filtering on `startsWith('--')` alone drops the flag but leaves its
 // value in the positional list, so `chat --profile claude-a "prompt"` silently sent "claude-a" as the
@@ -55,7 +61,10 @@ function req(method, pathname, body) {
         port: PORT,
         method,
         path: pathname,
-        headers: data ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(data) } : {},
+        headers: {
+          authorization: `Bearer ${DEVICE_TOKEN}`,
+          ...(data ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(data) } : {}),
+        },
       },
       (res) => {
         let b = ''
@@ -89,7 +98,9 @@ async function assertUp() {
 
 /** Stream journal events over the same WebSocket the app uses. Node 22 has a global WebSocket. */
 function openStream(onEvent, since = 0) {
-  const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws?since=${since}`)
+  const ws = new WebSocket(
+    `ws://127.0.0.1:${PORT}/ws?since=${since}&token=${encodeURIComponent(DEVICE_TOKEN)}`
+  )
   ws.addEventListener('message', (m) => {
     for (const line of String(m.data).split('\n')) {
       if (!line.trim()) continue

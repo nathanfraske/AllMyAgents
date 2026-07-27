@@ -25,6 +25,14 @@ import { extractXlsxText } from './officeDocuments.js'
 import { strToU8, zipSync } from 'fflate'
 
 const cleanups: Array<() => void | Promise<void>> = []
+const TEST_DEVICE_TOKEN = 'attachment-test-device-token-at-least-32-characters'
+const nativeFetch = globalThis.fetch
+
+function fetch(input: string | URL | Request, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers)
+  headers.set('authorization', `Bearer ${TEST_DEVICE_TOKEN}`)
+  return nativeFetch(input, { ...init, headers })
+}
 
 afterEach(async () => {
   while (cleanups.length) await cleanups.pop()?.()
@@ -225,7 +233,7 @@ async function build(provider: 'claude' | 'codex' = 'claude') {
     prefs: { chatNamePool: 'everyone', steerMessagesAtToolBoundary: true },
     rescanProfiles: () => [profile],
     mesh: {} as never,
-    deviceToken: 'test-token',
+    deviceToken: TEST_DEVICE_TOKEN,
     requireToken: false,
     restartState: { booted: true, sockets: new Set(), draining: false, promoting: false } as never,
     executor,
@@ -268,7 +276,11 @@ describe('session attachment API', () => {
           port: url.port,
           path: url.pathname,
           method: 'POST',
-          headers: { 'content-type': 'image/png', 'x-filename': 'too-big.png' },
+          headers: {
+            authorization: `Bearer ${TEST_DEVICE_TOKEN}`,
+            'content-type': 'image/png',
+            'x-filename': 'too-big.png',
+          },
         },
         (res) => {
           const chunks: Buffer[] = []

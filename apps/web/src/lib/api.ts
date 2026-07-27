@@ -278,12 +278,14 @@ export interface HubEvent {
 // browser (dev) the base stays empty and Vite's proxy forwards /api and /ws to the hub.
 const inTauri =
   typeof window !== 'undefined' && ('__TAURI_INTERNALS__' in window || '__TAURI__' in window)
-export const HUB_HTTP = inTauri ? 'http://127.0.0.1:7777' : ''
-export const HUB_WS = inTauri ? 'ws://127.0.0.1:7777' : ''
+const desktopHubPort =
+  import.meta.env.DEV && import.meta.env.VITE_HUB_PORT ? import.meta.env.VITE_HUB_PORT : '7777'
+export const HUB_HTTP = inTauri ? `http://127.0.0.1:${desktopHubPort}` : ''
+export const HUB_WS = inTauri ? `ws://127.0.0.1:${desktopHubPort}` : ''
 
 // Device token (localStorage-backed). Sent as a Bearer header on every request and as ?token= on
-// the WebSocket. Empty until the hub hands it over during the pre-enforcement window, or the user
-// pairs a remote device by pasting it.
+// the WebSocket. The desktop obtains it from its OS-owned data directory; remote devices pair by
+// pasting an explicitly revealed token. It is never bootstrapped over unauthenticated HTTP.
 let hubToken = (typeof localStorage !== 'undefined' && localStorage.getItem('hub.token')) || ''
 export function getHubToken(): string {
   return hubToken
@@ -298,6 +300,29 @@ export function setHubToken(t: string): void {
 }
 function authHeaders(): Record<string, string> {
   return hubToken ? { authorization: `Bearer ${hubToken}` } : {}
+}
+
+interface TauriInvokeBridge {
+  invoke?<T>(command: string, args?: Record<string, unknown>): Promise<T>
+}
+
+/** Acquire the local desktop's capability through native IPC. Plain browsers intentionally get none. */
+export async function bootstrapDesktopHubToken(): Promise<boolean> {
+  if (!inTauri) return false
+  const g = (typeof window !== 'undefined' ? window : globalThis) as unknown as {
+    __TAURI__?: { core?: TauriInvokeBridge }
+    __TAURI_INTERNALS__?: TauriInvokeBridge
+  }
+  const invoke = g.__TAURI__?.core?.invoke ?? g.__TAURI_INTERNALS__?.invoke
+  if (!invoke) return false
+  try {
+    const token = String(await invoke<string>('hub_device_token')).trim()
+    if (token.length < 32) return false
+    setHubToken(token)
+    return true
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -439,7 +464,6 @@ export interface MeshStatus {
   error?: string
   checkedAt?: string
   requireToken?: boolean
-  token?: string
 }
 
 // One machine in the unified fleet view (GET /api/fleet). `local:true` is THIS hub. For a remote
@@ -728,11 +752,8 @@ export const api = {
   // Typed so a caller can tell an accepted decision (200 { ok:true }) from a 404/401/network failure
   // ({ error }) — the approval UI must NOT clear a pending prompt it never actually resolved.
   decide: (id: string, approve: boolean) => jpost<{ ok?: boolean; error?: string }>(`/api/approvals/${id}`, { approve }),
-  mesh: async (): Promise<MeshStatus> => {
-    const m = await jget<MeshStatus>('/api/mesh')
-    if (m.token) setHubToken(m.token) // bootstrap: capture the token while the hub still hands it out
-    return m
-  },
+  mesh: () => jget<MeshStatus>('/api/mesh'),
+  revealDeviceToken: () => jpost<{ token?: string; error?: string }>('/api/device-token/reveal'),
   setMesh: (enable: boolean) => jpost<MeshStatus | ApiError>('/api/mesh', { enable }),
   auth: () => jget<{ requireToken: boolean; authed: boolean }>('/api/auth'),
   instructions: () => jget<Instruction[]>('/api/instructions'),
