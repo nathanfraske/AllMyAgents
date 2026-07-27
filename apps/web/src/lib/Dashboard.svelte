@@ -322,6 +322,7 @@
           <div class="launch-actions" aria-label="Start something">
             <button
               class="launch-action project-action new-project"
+              data-tutorial-anchor="new-project"
               aria-label="New Project"
               title="Set up a project and a team"
               onclick={onnewproject}
@@ -334,6 +335,7 @@
             </button>
             <button
               class="launch-action scratch-action"
+              data-tutorial-anchor="new-scratchpad"
               aria-label="New Scratchpad — no project, isolated workspace, start typing"
               title="No project · its own isolated scratch workspace · start typing now"
               onclick={startScratchpad}
@@ -402,7 +404,7 @@
         {/if}
       </section>
 
-      <section class="card project-card">
+      <section class="card project-card" data-tutorial-anchor="project-list">
         <div class="project-card-head">
           <div>
             <h3>Projects</h3>

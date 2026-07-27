@@ -603,6 +603,7 @@
   <div class="connbar">
     <button
       class="homebtn"
+      data-tutorial-anchor="home"
       class:current={!store.selectedId && store.splitPanes.length === 0 && !store.projectViewId}
       title="Home — projects and launchpad"
       aria-label="Home"
@@ -842,7 +843,7 @@
   <div class="footer">
     <div class="foot-bar">
       <button class="foot-head" onclick={() => (showUsage = !showUsage)}><span>USAGE</span><span class="dim fchev"><Icon name={showUsage ? 'chevron-down' : 'chevron-right'} size={13} /></span></button>
-      <button class="gear" title="settings" onclick={() => (store.settingsOpen = true)}><Icon name="settings" size={15} /></button>
+      <button class="gear" data-tutorial-anchor="settings" title="settings" onclick={() => (store.settingsOpen = true)}><Icon name="settings" size={15} /></button>
     </div>
     {#if showUsage}<Usage />{/if}
   </div>
