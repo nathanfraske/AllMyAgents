@@ -3,6 +3,10 @@ import fs from 'node:fs'
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import { planCompletedTurnHistory, type JournalHistoryRow } from './journalHistory.js'
+import {
+  reserveReplicationPruneGate,
+  type ReplicationPruneGate,
+} from './journalReplication.js'
 import { redactedJson } from './redact.js'
 import type { ApprovalStatus, HubEvent } from './types.js'
 
@@ -66,6 +70,7 @@ export type JournalCondenseResult = {
   historyRowsDeleted: number
   historyPayloadBytesSelected: number
   historyPayloadBytesWritten: number
+  replication: ReplicationPruneGate
 }
 
 export class Journal extends EventEmitter {
@@ -293,6 +298,12 @@ export class Journal extends EventEmitter {
     const diffLimit = Math.floor(maxDiffSnapshots)
     const now = new Date(nowMs).toISOString()
     const cutoff = new Date(nowMs - graceMs).toISOString()
+    // Replication is opt-in for existing journals. Once configured, however, it is a hard deletion gate:
+    // reserve the exact verified generations BEFORE selecting anything destructive, then constrain every
+    // DELETE/UPDATE path by the kth replica's durable snapshot seq. An offline fleet therefore grows past
+    // its last verified watermark; it never quietly trades the only archive copy for free disk.
+    const replication = reserveReplicationPruneGate(this.db)
+    const maxPrunableSeq = replication.maxPrunableSeq
 
     // Built lazily by the maintenance child, after the hub is healthy. Creating an index over the operator's
     // existing 375k-row journal at boot would turn a recoverability feature into a new deterministic boot
@@ -331,8 +342,8 @@ export class Journal extends EventEmitter {
 
     // Candidate discovery writes TEMP only and reads the main DB. Keep it outside the main write transaction
     // so the expensive JSON validation/extraction does not hold SQLite's single WAL writer lock against live
-    // worker events. Event rows are append-only, so a selected seq remains safe to re-check/delete moments
-    // later; a concurrent cursor advance/reset is re-read inside the write transaction below.
+    // worker events. The live hub only appends; the single maintenance child owns old-row rewrites, and a
+    // concurrent cursor advance/reset is re-read inside the write transaction below.
     const selectCandidates = (): void => {
       this.db.exec(`
         DELETE FROM journal_condense_commands;
@@ -421,13 +432,14 @@ export class Journal extends EventEmitter {
             AND terminal.turn_id = candidate.turn_id
             AND terminal.item_id = candidate.item_id
            WHERE candidate.ts <= ?
+             AND candidate.seq <= ?
              AND typeof(candidate.thread_id) = 'text'
              AND typeof(candidate.turn_id) = 'text'
              AND typeof(candidate.item_id) = 'text'
            ORDER BY candidate.seq
            LIMIT ?`
         )
-        .run(cutoff, commandLimit)
+        .run(cutoff, maxPrunableSeq, commandLimit)
       this.db
         .prepare(
           `INSERT OR IGNORE INTO journal_condense_delete (seq)
@@ -448,13 +460,14 @@ export class Journal extends EventEmitter {
             AND terminal.turn_id = candidate.turn_id
            LEFT JOIN journal_condense_diff_keep AS keep ON keep.seq = candidate.seq
            WHERE candidate.ts <= ?
+             AND candidate.seq <= ?
              AND keep.seq IS NULL
              AND typeof(candidate.thread_id) = 'text'
              AND typeof(candidate.turn_id) = 'text'
            ORDER BY candidate.seq
            LIMIT ?`
         )
-        .run(cutoff, diffLimit)
+        .run(cutoff, maxPrunableSeq, diffLimit)
     }
     selectCandidates()
 
@@ -511,11 +524,13 @@ export class Journal extends EventEmitter {
       maxHistorySourceBytes: Math.floor(maxHistorySourceBytes),
       historyToolTextChars: Math.floor(historyToolTextChars),
       historyRollupChars: Math.floor(historyRollupChars),
+      maxPrunableSeq,
     })
     return {
       ...transient,
       ...history,
       cursorCheckpointsWritten: transient.cursorCheckpointsWritten + history.cursorCheckpointsWritten,
+      replication,
     }
   }
 
@@ -545,7 +560,11 @@ export class Journal extends EventEmitter {
     maxHistorySourceBytes: number
     historyToolTextChars: number
     historyRollupChars: number
-  }): Omit<JournalCondenseResult, 'commandOutputDeltasDeleted' | 'diffSnapshotsDeleted'> {
+    maxPrunableSeq: number
+  }): Omit<
+    JournalCondenseResult,
+    'commandOutputDeltasDeleted' | 'diffSnapshotsDeleted' | 'replication'
+  > {
     const empty = {
       cursorCheckpointsWritten: 0,
       historyTurnsRolledUp: 0,
@@ -602,11 +621,12 @@ export class Journal extends EventEmitter {
          WHERE event.session IS NOT NULL
            AND event.kind IN ('claude/result', 'codex/turn/completed')
            AND event.ts <= ?
+           AND event.seq <= ?
            AND done.terminal_seq IS NULL
          ORDER BY event.seq
          LIMIT ?`
       )
-      .all(cutoff, options.maxHistoryTurns) as Array<{
+      .all(cutoff, options.maxPrunableSeq, options.maxHistoryTurns) as Array<{
       seq: number
       ts: string
       session: string
@@ -752,11 +772,11 @@ export class Journal extends EventEmitter {
       .prepare(
         `SELECT terminal_seq, session, terminal_ts, terminal_kind
          FROM journal_turn_rollups
-         WHERE expired = 0 AND terminal_ts <= ?
+         WHERE expired = 0 AND terminal_ts <= ? AND terminal_seq <= ?
          ORDER BY terminal_seq
          LIMIT ?`
       )
-      .all(expiryCutoff, options.maxExpiredHistoryTurns) as Array<{
+      .all(expiryCutoff, options.maxPrunableSeq, options.maxExpiredHistoryTurns) as Array<{
       terminal_seq: number
       session: string
       terminal_ts: string
