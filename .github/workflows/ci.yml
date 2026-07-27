@@ -203,3 +203,12 @@ jobs:
       - name: cargo clippy
         working-directory: apps/desktop/src-tauri
         run: cargo clippy --all-targets -- -D warnings
+
+      # `--all-targets` above COMPILES the test targets but never runs them, so the crate's unit tests
+      # (path canonicalisation, browser profile isolation, navigation policy) were dead weight in CI. It
+      # also excludes doctests entirely — which is how a doc comment that could not compile sat on main
+      # unnoticed: an indented block in a `///` comment is Rust code to rustdoc, and the Windows error
+      # message quoted in it parsed as an unterminated character literal.
+      - name: cargo test
+        working-directory: apps/desktop/src-tauri
+        run: cargo test

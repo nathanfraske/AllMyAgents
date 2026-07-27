@@ -302,8 +302,10 @@ fn prepend_path(dirs: &[PathBuf]) -> OsString {
 /// every macOS test passed. Node does NOT handle them: given a `\\?\`-prefixed script path it misparses
 /// the root and dies with
 ///
-///     Error: EISDIR: illegal operation on a directory, lstat 'C:'
-///         at resolveMainPath
+/// ```text
+/// Error: EISDIR: illegal operation on a directory, lstat 'C:'
+///     at resolveMainPath
+/// ```
 ///
 /// which is what a real tester's install produced. It hit BOTH child spawns — the first-run
 /// `npm-cli.js` and the `hubctl.js` that is the hub itself — so on Windows the app could never get a hub
