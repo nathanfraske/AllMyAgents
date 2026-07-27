@@ -149,7 +149,7 @@ describe('agentActivity — hub agent tools', () => {
 
   it('send_message: direct uses the recipient NAME, broadcast when no target', () => {
     expect(agentActivity(t('mcp__allmyagents__send_message', { to_session: 's1', body: 'hi' }), resolve)).toEqual({
-      label: 'message sent to Wilkes', dir: 'out',
+      label: 'message sent to Wilkes', dir: 'out', counterpartyId: 's1',
     })
     expect(agentActivity(t('mcp__allmyagents__send_message', { body: 'all hands' }), resolve)).toEqual({
       label: 'broadcast to your project', dir: 'out',
@@ -174,7 +174,7 @@ describe('agentActivity — hub agent tools', () => {
   })
 
   it('peek uses the name; list_agents is a roster query (not traffic)', () => {
-    expect(agentActivity(t('mcp__allmyagents__peek_agent', { to_session: 's2' }), resolve)).toEqual({ label: 'peeked at Ball', dir: 'none' })
+    expect(agentActivity(t('mcp__allmyagents__peek_agent', { to_session: 's2' }), resolve)).toEqual({ label: 'peeked at Ball', dir: 'none', counterpartyId: 's2' })
     expect(agentActivity(t('mcp__allmyagents__list_agents', {}))).toEqual({ label: 'listed teammates', dir: 'none' })
   })
 
@@ -184,7 +184,7 @@ describe('agentActivity — hub agent tools', () => {
   })
 
   it('handles the Codex mcp: prefix too', () => {
-    expect(agentActivity(t('mcp:send_message', { to_session: 's1', body: 'x' }), resolve)).toEqual({ label: 'message sent to Wilkes', dir: 'out' })
+    expect(agentActivity(t('mcp:send_message', { to_session: 's1', body: 'x' }), resolve)).toEqual({ label: 'message sent to Wilkes', dir: 'out', counterpartyId: 's1' })
   })
 
   it('is undefined for a non-hub tool (falls back to the generic card)', () => {
@@ -215,7 +215,7 @@ describe('parseBusFrame — inbound delivery frame (TRAP 1)', () => {
   ].join('\n')
 
   it('parses the count and sender NAMES from a real frame', () => {
-    expect(parseBusFrame(frame)).toEqual({ count: 2, senders: ['Wilkes', 'Ball'] })
+    expect(parseBusFrame(frame)).toEqual({ count: 2, senders: ['Wilkes', 'Ball'], senderIds: ['ca7e856c', '386803a1'] })
   })
 
   it('returns null for an ordinary message so normal turns are untouched', () => {

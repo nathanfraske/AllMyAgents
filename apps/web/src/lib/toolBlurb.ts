@@ -164,6 +164,9 @@ export type AgentDir = 'out' | 'in' | 'none'
 export interface AgentActivity {
   label: string
   dir: AgentDir
+  /** The SINGLE counterparty's session id, when there is one (direct send, peek) — the caller resolves it
+   *  to a vendor logo. Absent for a broadcast or a bulk poll, which have no one vendor to show. */
+  counterpartyId?: string
 }
 
 const AGENT_TOOL_PREFIXES = ['mcp__allmyagents__', 'mcp:']
@@ -204,19 +207,23 @@ export function agentActivity(
   switch (tool) {
     case 'send_message': {
       const to = firstString(obj, ['to_session'])
+      // Broadcast has no single recipient → no counterpartyId (and so no logo). Direct carries the id.
       return to
-        ? { label: `message sent to ${nameOf(to)}`, dir: 'out' }
+        ? { label: `message sent to ${nameOf(to)}`, dir: 'out', counterpartyId: to }
         : { label: 'broadcast to your project', dir: 'out' }
     }
     case 'read_messages': {
       const n = readMessagesCount(item.toolResult)
-      // A poll that got nothing is not a receipt — no inbound arrow (dir 'none').
+      // A poll that got nothing is not a receipt — no inbound arrow (dir 'none'). A bulk poll has no
+      // single sender, so no counterpartyId either.
       return n > 0
         ? { label: `${n} message${n === 1 ? '' : 's'} received`, dir: 'in' }
         : { label: 'checked for messages', dir: 'none' }
     }
-    case 'peek_agent':
-      return { label: `peeked at ${nameOf(firstString(obj, ['to_session']))}`, dir: 'none' }
+    case 'peek_agent': {
+      const to = firstString(obj, ['to_session'])
+      return { label: `peeked at ${nameOf(to)}`, dir: 'none', counterpartyId: to }
+    }
     case 'list_agents':
       return { label: 'listed teammates', dir: 'none' }
     case 'memory_write':
@@ -241,6 +248,9 @@ export function agentActivity(
 export interface BusFrame {
   count: number
   senders: string[]
+  /** The 8-char sender ids from the frame headers, positionally aligned with `senders`. When there is
+   *  exactly one, the caller can show that sender's vendor logo; with several, no single vendor applies. */
+  senderIds: string[]
 }
 
 /**
@@ -258,8 +268,12 @@ export function parseBusFrame(text: string | undefined): BusFrame | null {
   const head = /<<ALLMYAGENTS-BUS — (\d+) message\(s\)/.exec(text)
   if (!head || !text.includes('<<END ALLMYAGENTS-BUS>>')) return null
   const senders: string[] = []
-  const re = /^\[\d+\] from (.+?) \(agent [0-9a-f]+\)/gm
+  const senderIds: string[] = []
+  const re = /^\[\d+\] from (.+?) \(agent ([0-9a-f]+)\)/gm
   let m: RegExpExecArray | null
-  while ((m = re.exec(text)) !== null) senders.push((m[1] as string).trim())
-  return { count: Number(head[1]) || 0, senders }
+  while ((m = re.exec(text)) !== null) {
+    senders.push((m[1] as string).trim())
+    senderIds.push(m[2] as string)
+  }
+  return { count: Number(head[1]) || 0, senders, senderIds }
 }

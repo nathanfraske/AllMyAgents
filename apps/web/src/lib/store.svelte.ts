@@ -91,6 +91,10 @@ export interface ThreadItem {
   // party's label, and an optional subject. `text` holds the message body.
   busDir?: 'sent' | 'received'
   busPeer?: string
+  // The counterparty's SESSION ID (recipient for sent, sender for received) so the transcript can show
+  // their vendor logo — resolved from the session record at render time (undefined for a broadcast, or a
+  // teammate whose chat no longer exists → the blurb renders with no logo rather than a broken mark).
+  busPeerId?: string
   busSubject?: string
   // Files/images attached to a user message. METADATA ONLY — never bytes: the hub journals
   // `{id,name,mime,size}` (bytes live on disk), and the transcript renders images from a hub URL built
@@ -1417,14 +1421,15 @@ export class HubStore {
         // This session sent a message to a teammate / its project.
         const p = payload as { to?: { kind?: string; id?: string }; subject?: string | null; body?: string; recipients?: number }
         const peer = p.to?.kind === 'project' ? `project · ${p.recipients ?? 0} agent(s)` : `agent ${(p.to?.id ?? '').slice(0, 8)}`
-        this.push(view, { kind: 'bus', ts, busDir: 'sent', busPeer: peer, busSubject: p.subject ?? undefined, text: p.body ?? '' })
+        const sentTo = p.to?.kind === 'session' ? p.to.id : undefined // no single vendor for a broadcast
+        this.push(view, { kind: 'bus', ts, busDir: 'sent', busPeer: peer, busPeerId: sentTo, busSubject: p.subject ?? undefined, text: p.body ?? '' })
         break
       }
       case 'bus/delivered': {
         // A teammate's message the hub delivered into this session (rendered as a distinct card).
         const p = payload as { fromLabel?: string; fromSession?: string; subject?: string | null; body?: string }
         const peer = p.fromLabel || (p.fromSession ?? '').slice(0, 8)
-        this.push(view, { kind: 'bus', ts, busDir: 'received', busPeer: peer, busSubject: p.subject ?? undefined, text: p.body ?? '' })
+        this.push(view, { kind: 'bus', ts, busDir: 'received', busPeer: peer, busPeerId: p.fromSession, busSubject: p.subject ?? undefined, text: p.body ?? '' })
         break
       }
       case 'memory/recalled': {

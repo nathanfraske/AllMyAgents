@@ -7,6 +7,7 @@
   import MessageAttachments from './MessageAttachments.svelte'
   import { store } from './store.svelte'
   import { initialDiffExpanded } from './diffDisplay'
+  import ProviderLogo from './ProviderLogo.svelte'
 
   let { item, sessionId = '' }: { item: ThreadItem; sessionId?: string } = $props()
   let open = $state(false)
@@ -36,6 +37,19 @@
     if (senders.length <= 2) return senders.join(' & ')
     return `${senders[0]} +${senders.length - 1}`
   }
+  // A teammate's vendor, resolved from their session record (the same source as their name). A full id
+  // (send/peek/bus) hits store.sessions directly; a frame header carries only an 8-char prefix, so fall
+  // back to a prefix match. undefined → no logo (a broadcast, or a teammate whose chat is gone).
+  function providerOf(id: string | undefined): 'claude' | 'codex' | undefined {
+    if (!id) return undefined
+    const direct = store.sessions[id]?.record.provider
+    if (direct === 'claude' || direct === 'codex') return direct
+    const hit = Object.values(store.sessions).find((v) => v.record.id.startsWith(id))?.record.provider
+    return hit === 'claude' || hit === 'codex' ? hit : undefined
+  }
+  const agentProvider = $derived(providerOf(agentAct?.counterpartyId))
+  const busProvider = $derived(item.kind === 'bus' ? providerOf(item.busPeerId) : undefined)
+  const frameProvider = $derived(busFrame && busFrame.senderIds.length === 1 ? providerOf(busFrame.senderIds[0]) : undefined)
 
   const longUser = $derived(
     item.kind === 'user' && !!item.text && (item.text.length > 600 || item.text.split('\n').length > 8)
@@ -75,6 +89,7 @@
     <button class="ahd" onclick={() => (detailOpen = !detailOpen)} title="teammate messages delivered by the hub">
       <span class="aarrow" aria-hidden="true">↓</span>
       <span class="alabel">{busFrame.count} message{busFrame.count === 1 ? '' : 's'} from {sendersLabel(busFrame.senders)}</span>
+      {#if frameProvider}<span class="alogo"><ProviderLogo provider={frameProvider} size={14} /></span>{/if}
       {#if fmtTime(item.ts)}<span class="ts" title={new Date(item.ts).toLocaleString()}>{fmtTime(item.ts)}</span>{/if}
     </button>
     {#if detailOpen}<pre class="araw">{item.text}</pre>{/if}
@@ -114,6 +129,7 @@
       <button class="ahd" onclick={() => (detailOpen = !detailOpen)}>
         <span class="aarrow" aria-hidden="true">{ARROW[agentAct.dir]}</span>
         <span class="alabel">{agentAct.label}</span>
+        {#if agentProvider}<span class="alogo"><ProviderLogo provider={agentProvider} size={14} /></span>{/if}
         {#if item.toolError}<span class="fail">error</span>{/if}
         {#if fmtTime(item.ts)}<span class="ts" title={new Date(item.ts).toLocaleString()}>{fmtTime(item.ts)}</span>{/if}
       </button>
@@ -144,6 +160,7 @@
       <button class="ahd" onclick={() => (detailOpen = !detailOpen)}>
         <span class="aarrow" aria-hidden="true">↓</span>
         <span class="alabel">message received from {item.busPeer}</span>
+        {#if busProvider}<span class="alogo"><ProviderLogo provider={busProvider} size={14} /></span>{/if}
         {#if item.busSubject}<span class="asubj">{item.busSubject}</span>{/if}
         {#if fmtTime(item.ts)}<span class="ts" title={new Date(item.ts).toLocaleString()}>{fmtTime(item.ts)}</span>{/if}
       </button>
@@ -192,6 +209,7 @@
   .ahd:hover .alabel { color: var(--text); }
   .aarrow { flex: none; font-weight: 700; }
   .alabel { color: var(--secondary); }
+  .alogo { flex: none; display: inline-flex; align-items: center; }
   .asubj { color: var(--muted); font-size: 0.74rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .abody { margin-top: 0.3rem; }
   .araw { background: var(--bg); border-radius: 6px; padding: 0.4rem 0.5rem; font-size: 0.72rem; margin: 0.3rem 0 0; overflow-x: auto; white-space: pre-wrap; word-break: break-word; color: var(--muted); }
