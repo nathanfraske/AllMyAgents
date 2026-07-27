@@ -27,6 +27,7 @@ import { InstructionStore } from './instructions.js'
 import { AgentBus } from './bus.js'
 import { MemoryStore } from './memory.js'
 import { PracticeStore } from './practices.js'
+import { BrowserBroker } from './browserBroker.js'
 import { InProcessExecutor, type Executor } from './executor.js'
 import { WorkerExecutor } from './workerExecutor.js'
 import { WorkerClient } from './workerTransport.js'
@@ -136,6 +137,17 @@ const instructions = new InstructionStore(journal.db)
 const bus = new AgentBus(journal.db)
 const memory = new MemoryStore(journal.db)
 const practices = new PracticeStore(journal.db)
+const desktopBrowserSecret = process.env.AMA_DESKTOP_BROWSER_SECRET ?? ''
+const desktopBrowserAddress = process.env.AMA_DESKTOP_BROWSER_ADDR ?? ''
+// The desktop grants this process the bridge credential. Capture it once, then
+// remove it from the ambient environment before any vendor/login child can
+// inherit it and expose it to a model shell command.
+delete process.env.AMA_DESKTOP_BROWSER_SECRET
+delete process.env.AMA_DESKTOP_BROWSER_ADDR
+const browserBroker = new BrowserBroker({
+  address: desktopBrowserAddress,
+  secret: desktopBrowserSecret,
+})
 // Automatic hub-side memory recall (memory.ts) — on unless config.features.autoMemoryRecall === false.
 const autoMemoryRecall = config.features?.autoMemoryRecall !== false
 // Danger Zone flags — resolved to safe defaults (OFF) from config, then shared by reference with the
@@ -188,7 +200,12 @@ const executor: Executor = workerSocket
       attachWorker: () => sessions.attachWorker(),
     })
   : new InProcessExecutor({ approvals, usage, danger, memory, practices })
-sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, dataDir, executor, prefs)
+sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, dataDir, executor, prefs, browserBroker)
+browserBroker.onNavigation((event) =>
+  sessions.noteBrowserNavigation(event.sessionId, event.url, event.title, event.actor, event.ok, event.errorCode)
+)
+browserBroker.start()
+process.once('exit', () => browserBroker.stop())
 journal.on('event', (event) => {
   if (event.kind !== 'worktree/risk-detected') return
   void sessions.reportWorktreeRiskToManagers(event.payload)

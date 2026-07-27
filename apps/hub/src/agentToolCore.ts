@@ -6,6 +6,7 @@ import type { Memory } from './memory.js'
 import type { Practice } from './practices.js'
 import { decidePracticeGate, practiceScope } from './practices.js'
 import type { DangerFlags, DelegatedAuthority } from './types.js'
+import type { BrowserOperation, BrowserResultContent } from './browserProtocol.js'
 
 /**
  * A value the tool handlers may receive either synchronously (the in-process executor, which holds the
@@ -83,6 +84,12 @@ export interface AgentServices {
     authorities: DelegatedAuthority[],
     tools?: string[]
   ): Awaitable<{ ok: boolean; error?: string }>
+  /** Operate the app-owned browser bound to this exact AllMyAgents session. */
+  browser(
+    sessionId: string,
+    operation: Extract<BrowserOperation, 'navigate' | 'read' | 'screenshot'> | 'status',
+    args: Record<string, unknown>
+  ): Awaitable<BrowserResultContent[]>
   memory: MemoryServices
   /** Agent-writable practices (durable conventions materialized into future agents). */
   practices: PracticeServices
@@ -113,11 +120,13 @@ export interface AgentToolContext {
  * transports (Claude in-process SDK server; Codex stdio MCP server) each wrap `schema`/`run` into
  * their own tool-registration shape — the body is written once, here.
  */
+export type AgentToolOutput = string | BrowserResultContent[]
+
 export interface AgentToolSpec<Shape extends z.ZodRawShape = z.ZodRawShape> {
   name: string
   description: string
   schema: Shape
-  run(args: z.infer<z.ZodObject<Shape>>, ctx: AgentToolContext): Promise<string>
+  run(args: z.infer<z.ZodObject<Shape>>, ctx: AgentToolContext): Promise<AgentToolOutput>
 }
 
 // Helper so the specs below are declared with full per-tool arg typing while `AGENT_TOOLS` stays a
@@ -434,6 +443,46 @@ const practiceList = defineTool({
   },
 })
 
+const browserNavigate = defineTool({
+  name: 'browser_navigate',
+  description:
+    'Open an http(s) URL in this chat\'s isolated, visible AllMyAgents browser. Browser access must first be enabled by the operator for this chat. This browser starts blank and never inherits the operator\'s normal browser logins.',
+  schema: {
+    url: z.string().url().describe('absolute http or https URL'),
+  },
+  run: async (args, { identity, services }) =>
+    services.browser(identity.sessionId, 'navigate', { url: args.url }),
+})
+
+const browserRead = defineTool({
+  name: 'browser_read_page',
+  description:
+    'Read a compact semantic representation of the current page in this chat\'s isolated AllMyAgents browser: title, URL, headings, landmarks, links, controls, and visible text. It never returns form-field values.',
+  schema: {
+    max_chars: z.number().int().min(1000).max(24000).optional().describe('maximum visible-text characters, default 12000'),
+  },
+  run: async (args, { identity, services }) =>
+    services.browser(identity.sessionId, 'read', { maxChars: args.max_chars ?? 12000 }),
+})
+
+const browserScreenshot = defineTool({
+  name: 'browser_screenshot',
+  description:
+    'Capture the visible viewport of the current page in this chat\'s isolated AllMyAgents browser.',
+  schema: {},
+  run: async (_args, { identity, services }) =>
+    services.browser(identity.sessionId, 'screenshot', {}),
+})
+
+const browserStatus = defineTool({
+  name: 'browser_status',
+  description:
+    'Report whether this chat\'s isolated Agent Browser is enabled and connected, plus its visible public/local-network grants. Returns no cookies, history, credentials, bridge address, or profile path.',
+  schema: {},
+  run: async (_args, { identity, services }) =>
+    services.browser(identity.sessionId, 'status', {}),
+})
+
 /**
  * The provider-agnostic agent tool surface (`mcp__allmyagents__*`): inter-agent bus + shared memory +
  * agent-authored practices. Declared once; wrapped by both the Claude in-process server and the Codex
@@ -454,6 +503,10 @@ export const AGENT_TOOLS: readonly AgentToolSpec[] = [
   practiceEdit,
   practiceRead,
   practiceList,
+  browserNavigate,
+  browserRead,
+  browserScreenshot,
+  browserStatus,
 ]
 
 const BY_NAME = new Map(AGENT_TOOLS.map((t) => [t.name, t]))
@@ -474,7 +527,7 @@ export function getAgentTool(name: string): AgentToolSpec | undefined {
  * the body, so it runs the body directly). Throws on an unknown tool; returns a friendly validation
  * message on bad args (so the model sees the problem rather than a transport error).
  */
-export async function runAgentTool(name: string, rawArgs: unknown, ctx: AgentToolContext): Promise<string> {
+export async function runAgentTool(name: string, rawArgs: unknown, ctx: AgentToolContext): Promise<AgentToolOutput> {
   const spec = BY_NAME.get(name)
   if (!spec) throw new Error(`unknown agent tool: ${name}`)
   const parsed = z.object(spec.schema).safeParse(rawArgs ?? {})

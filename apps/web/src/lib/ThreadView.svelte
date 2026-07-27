@@ -20,6 +20,7 @@
   import ModelPicker from './ModelPicker.svelte'
   import TraitsControl from './TraitsControl.svelte'
   import PermissionPicker from './PermissionPicker.svelte'
+  import BrowserPicker from './BrowserPicker.svelte'
   import WorktreePicker from './WorktreePicker.svelte'
   import AccountPicker from './AccountPicker.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
@@ -1016,6 +1017,13 @@
               sessionId={view.record.id}
               mode={view.record.permissionMode ?? 'safe'}
               allowedTools={view.record.allowedTools ?? []}
+            />
+          </div>
+          <div class="ccontrol c-browser" title="Per-chat isolated browser">
+            <BrowserPicker
+              sessionId={view.record.id}
+              agentLabel={view.record.title || view.record.profileId}
+              initialEnabled={view.record.browserEnabled === true}
             />
           </div>
         {/if}

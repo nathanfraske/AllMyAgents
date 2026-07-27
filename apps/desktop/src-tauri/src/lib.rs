@@ -31,6 +31,8 @@
 //! env var set, so a developer checkout keeps using the repo's `data/` +
 //! `profiles/` byte-identically to before.
 
+mod browser;
+
 use std::ffi::OsString;
 use std::fs;
 use std::net::{SocketAddr, TcpStream};
@@ -211,7 +213,7 @@ fn hub_worker_flag() -> String {
     std::env::var("HUB_WORKER").unwrap_or_else(|_| "1".to_string())
 }
 
-fn spawn_hub_dev() -> Option<Child> {
+fn spawn_hub_dev(browser_secret: &str, browser_address: &str) -> Option<Child> {
     match probe_hub() {
         HubProbe::Ours => {
             logln(&format!("[desktop] our hub already answering on {HUB_ADDR} — not spawning a second one"));
@@ -247,6 +249,8 @@ fn spawn_hub_dev() -> Option<Child> {
     };
     cmd.current_dir(&repo_root);
     cmd.env("HUB_WORKER", hub_worker_flag()); // live turns survive a hub restart (see hub_worker_flag)
+    cmd.env("AMA_DESKTOP_BROWSER_SECRET", browser_secret);
+    cmd.env("AMA_DESKTOP_BROWSER_ADDR", browser_address);
     set_own_group(&mut cmd); // POSIX: own process group so kill_hub can group-signal the whole tree
     hide_console(&mut cmd); // Windows: no stray black console window in front of the app
 
@@ -544,7 +548,12 @@ fn boot_error(app: &AppHandle, splash: &Option<WebviewWindow>, msg: &str) {
 
 /// The release boot sequence, run on a background thread so the UI stays
 /// responsive while `npm install` runs.
-fn release_boot(app: AppHandle, splash: Option<WebviewWindow>) {
+fn release_boot(
+    app: AppHandle,
+    splash: Option<WebviewWindow>,
+    browser_secret: String,
+    browser_address: String,
+) {
     // Reachability guard — prove what is on the port before deciding, and never spawn a second hub.
     match probe_hub() {
         HubProbe::Ours => {
@@ -699,7 +708,9 @@ fn release_boot(app: AppHandle, splash: Option<WebviewWindow>) {
         // hubctl forwards its whole env to every hub it supervises (blue AND green),
         // so setting these here pins the data + profile roots across restarts too.
         .env("HUB_DATA_DIR", &hub_data_dir)
-        .env("HUB_PROFILES_DIR", &hub_profiles_dir);
+        .env("HUB_PROFILES_DIR", &hub_profiles_dir)
+        .env("AMA_DESKTOP_BROWSER_SECRET", &browser_secret)
+        .env("AMA_DESKTOP_BROWSER_ADDR", &browser_address);
     set_own_group(&mut cmd); // POSIX: own process group so kill_hub can group-signal the whole tree
     hide_console(&mut cmd); // Windows: no stray black console window in front of the app
     match cmd.spawn() {
@@ -908,10 +919,23 @@ pub fn run() {
             // no recoverable explanation.
             init_log(&app.handle().clone());
             app.manage(HubProcess(Mutex::new(None)));
+            let browser_bridge = match browser::start(app.handle().clone()) {
+                Ok(bridge) => bridge,
+                Err(error) => {
+                    logln(&format!(
+                        "[browser] unavailable; the desktop app will continue without it: {error}"
+                    ));
+                    browser::BrowserBridge {
+                        address: String::new(),
+                        secret: String::new(),
+                    }
+                }
+            };
 
             if cfg!(debug_assertions) {
                 // Dev: spawn `pnpm hub:dev` synchronously, as before.
-                let child = spawn_hub_dev();
+                let child =
+                    spawn_hub_dev(&browser_bridge.secret, &browser_bridge.address);
                 if let Some(state) = app.try_state::<HubProcess>() {
                     if let Ok(mut g) = state.0.lock() {
                         *g = child;
@@ -927,7 +951,14 @@ pub fn run() {
                 } else {
                     None
                 };
-                thread::spawn(move || release_boot(handle, splash));
+                thread::spawn(move || {
+                    release_boot(
+                        handle,
+                        splash,
+                        browser_bridge.secret,
+                        browser_bridge.address,
+                    )
+                });
             }
             Ok(())
         })

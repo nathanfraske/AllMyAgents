@@ -106,6 +106,7 @@ export type RelayMethod =
   | 'practices.edit'
   | 'practices.get'
   | 'practices.list'
+  | 'browser.execute'
 
 // --- Transient-gap constants + retryable shape (§1.5) — single source of truth for both sides. ---
 

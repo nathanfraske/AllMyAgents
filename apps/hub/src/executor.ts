@@ -165,6 +165,11 @@ export interface InProcessExecutorHubHooks {
     authorities: Array<'commit' | 'push'>,
     tools?: string[]
   ): { ok: boolean; error?: string }
+  browser(
+    sessionId: string,
+    operation: 'navigate' | 'read' | 'screenshot' | 'status',
+    args: Record<string, unknown>
+  ): ReturnType<AgentServices['browser']>
 }
 
 /**
@@ -213,6 +218,7 @@ export class InProcessExecutor implements Executor {
       spawnAgent: (managerSessionId, input) => this.h.managerSpawn(managerSessionId, input),
       setChildAuthority: (managerSessionId, childSessionId, authorities, tools) =>
         this.h.managerSetChildAuthority(managerSessionId, childSessionId, authorities, tools),
+      browser: (sessionId, operation, args) => this.h.browser(sessionId, operation, args),
       memory: this.services.memory,
       practices: this.services.practices,
       requireApproval: (id, kind, payload) => this.services.approvals.request(id.sessionId, kind, payload),
