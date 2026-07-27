@@ -70,13 +70,20 @@ describe('worktree intent and outcome', () => {
     const project = within(picker).getByRole('button', { name: /Project/ })
     expect(worktree.getAttribute('aria-pressed')).toBe('true')
     expect(project.getAttribute('aria-pressed')).toBe('false')
-    expect(picker.textContent).toContain('isolated copy, your project is untouched')
     expect(screen.queryByText('Project folder')).toBeNull()
+
+    // The meaning is carried by the control itself, not by prose beside it. The visible description and
+    // the "Will work in" label were removed deliberately: two labelled, icon'd segments already say which
+    // mode is selected, and the footer is fighting for room in every split pane. What must NOT be lost is
+    // the explanation — so assert it survives where a user or a screen reader can still reach it.
+    expect(picker.textContent).not.toContain('isolated copy')
+    expect(worktree.getAttribute('title')).toContain('isolated copy, your project is untouched')
+    expect(worktree.getAttribute('aria-label')).toContain('isolated copy, your project is untouched')
 
     await fireEvent.click(project)
     expect(store.sessions[view.record.id]?.draftUseWorktree).toBe(false)
     expect(project.getAttribute('aria-pressed')).toBe('true')
-    expect(picker.textContent).toContain('works directly in the project folder')
+    expect(project.getAttribute('title')).toContain('works directly in the project folder')
   })
 
   it('does not misreport Project as the choice when a requested worktree was overridden', () => {
