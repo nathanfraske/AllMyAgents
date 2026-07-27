@@ -4,8 +4,9 @@
   import DiffView from './DiffView.svelte'
   import { fileDiffsFromItem } from './diff'
   import { toolBlurb } from './toolBlurb'
+  import MessageAttachments from './MessageAttachments.svelte'
 
-  let { item }: { item: ThreadItem } = $props()
+  let { item, sessionId = '' }: { item: ThreadItem; sessionId?: string } = $props()
   let open = $state(false)
   let showFull = $state(false)
 
@@ -48,6 +49,9 @@
     <div class="body" class:clamp={longUser && !showFull}><Markdown text={item.text ?? ''} /></div>
     {#if longUser}
       <button class="more" onclick={() => (showFull = !showFull)}>{showFull ? 'Show less' : 'Show full message'}</button>
+    {/if}
+    {#if item.attachments && item.attachments.length && sessionId}
+      <MessageAttachments {sessionId} attachments={item.attachments} />
     {/if}
   </div>
 {:else if item.kind === 'thinking' || item.kind === 'reasoning'}

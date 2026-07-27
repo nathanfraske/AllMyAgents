@@ -5,6 +5,7 @@ import { loadLastLayout, saveLastLayout, loadQueues, saveQueues, type PersistedL
 import { rowFate } from './fleetMerge'
 import { isChatBusy, nextOrderKey, orderChats, type ChatOrderFacts } from './chatOrder'
 import { extractCodexReasoning } from './codexGroup'
+import { attachmentsFromPayload, type AttachmentMeta } from './attachments'
 import type { AgentOutcome } from './agentTree'
 import type { ApprovalRecord, FleetSite, HistoryItem, HistoryPage, HubEvent, HubPrefs, ProfileInfo, ProjectInfo, ScanResult, SessionRecord, UsageSnapshot } from './api'
 
@@ -91,6 +92,11 @@ export interface ThreadItem {
   busDir?: 'sent' | 'received'
   busPeer?: string
   busSubject?: string
+  // Files/images attached to a user message. METADATA ONLY — never bytes: the hub journals
+  // `{id,name,mime,size}` (bytes live on disk), and the transcript renders images from a hub URL built
+  // by attachmentUrl(). This is what lets an attachment from a PRIOR session render after a reload, when
+  // any composer-side object URL is long dead.
+  attachments?: AttachmentMeta[]
 }
 
 export interface SessionView {
@@ -1372,9 +1378,16 @@ export class HubStore {
     switch (kind) {
       case 'session/input': {
         // The canonical user message (journaled by the hub, so it replays + is timestamped).
-        // Skip if we already rendered it optimistically this turn.
+        // Skip if we already rendered it optimistically this turn. Attachments are METADATA the hub
+        // journaled ({id,name,mime,size}); the transcript renders images by hub URL, never from bytes.
         if (this.suppressNextUserMsg[sessionId]) delete this.suppressNextUserMsg[sessionId]
-        else this.push(view, { kind: 'user', ts, text: (payload as { text?: string }).text ?? '' })
+        else
+          this.push(view, {
+            kind: 'user',
+            ts,
+            text: (payload as { text?: string }).text ?? '',
+            attachments: attachmentsFromPayload(payload),
+          })
         break
       }
       case 'session/titled': {
