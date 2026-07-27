@@ -36,8 +36,23 @@
   import { resolveWorkingContext, truncatePathTail } from './workingContext'
   import type { AttachmentRef, CommandInfo } from './api'
 
-  let { sessionId, paneIndex = 0, multiPane = false }: { sessionId?: string; paneIndex?: number; multiPane?: boolean } =
-    $props()
+  let {
+    sessionId,
+    paneIndex = 0,
+    multiPane = false,
+    embedded = false,
+    composerOnly = false,
+    peekItems = 0,
+    composerLabel,
+  }: {
+    sessionId?: string
+    paneIndex?: number
+    multiPane?: boolean
+    embedded?: boolean
+    composerOnly?: boolean
+    peekItems?: number
+    composerLabel?: string
+  } = $props()
 
   let text = $state('')
   type ComposerAttachment = AttachmentMeta & {
@@ -230,6 +245,31 @@
       ? groupCodexItems(mainItems)
       : mainItems.map((item) => ({ type: 'item', id: item.key, item }))
   )
+  function tailRenderNodes(nodes: CodexRenderNode[], limit: number): CodexRenderNode[] {
+    let remaining = Math.max(0, limit)
+    const tail: CodexRenderNode[] = []
+    for (let index = nodes.length - 1; index >= 0 && remaining > 0; index--) {
+      const node = nodes[index] as CodexRenderNode
+      if (node.type === 'item') {
+        tail.unshift(node)
+        remaining--
+        continue
+      }
+      const items = node.items.slice(-remaining)
+      if (items.length) {
+        tail.unshift({
+          type: 'group',
+          id: `${node.id}:peek:${items[0]?.key ?? ''}`,
+          items,
+        })
+        remaining -= items.length
+      }
+    }
+    return tail
+  }
+  const displayedRenderNodes = $derived(
+    composerOnly && peekItems > 0 ? tailRenderNodes(renderNodes, peekItems) : renderNodes,
+  )
   const model = $derived(view?.record.model ?? '')
   const options = $derived<Record<string, string>>({
     ...(view?.record.effort ? { effort: view.record.effort } : {}),
@@ -264,8 +304,10 @@
   let permOpen = $state(false)
   const draftMode = $derived(view?.record.permissionMode ?? 'safe')
   const draftModeDef = $derived(PERM_MODES.find((m) => m.id === draftMode) ?? PERM_MODES[0])
-  // Codex can append input to a running turn (steer); Claude has no steer, so it queues.
-  const steerable = $derived(active && view?.record.provider === 'codex')
+  // The hub's input route handles provider-neutral mid-turn steering at the next tool boundary. Keep
+  // queuing only as the explicit preference fallback; the composer must not silently treat Claude as
+  // less steerable than Codex when the same transport supports both.
+  const steerable = $derived(active && store.prefs.steerMessagesAtToolBoundary)
   const st = $derived(view ? store.status(view) : { key: 'idle', label: '' })
   const approvals = $derived(view ? store.approvals.filter((a) => a.sessionId === view.record.id) : [])
   const queue = $derived(sid ? store.queueFor(sid) : [])
@@ -667,10 +709,13 @@
         sendErr = upload.error
         return
       }
-      // Busy? Codex steers the running turn; Claude queues, retaining uploaded ids for the later flush.
+      // Busy? The normal input route performs provider-neutral steering and journals the operator input.
+      // When the operator disabled mid-turn steering, retain the local queue behavior and uploaded ids.
       if (active) {
-        if (view.record.provider === 'codex') {
-          const out = await api.steer(sid0, body, upload.ids)
+        if (steerable) {
+          const out = await api.send(sid0, body, {
+            attachments: upload.ids.length ? upload.ids : undefined,
+          })
           if (out.error) sendErr = out.error
           else clearComposerAfterSend()
         } else {
@@ -800,6 +845,7 @@
 {#if !view}
   <div class="empty dim">select a session, or press + to spawn one</div>
 {:else}
+  {#if !embedded && !composerOnly}
   <div class="head" class:reorderable={multiPane} title={multiPane ? 'Drag this header to rearrange the pane' : undefined}>
     <ProviderLogo provider={view.record.provider} size={16} />
     <div class="headmain">
@@ -838,8 +884,9 @@
     <button class="hicon" title="split view" onclick={() => store.startSplit()}><Icon name="columns" size={15} /></button>
     <button class="hicon" title="close (keeps the chat)" onclick={() => store.closePane(paneIndex)}><Icon name="x" size={15} /></button>
   </div>
+  {/if}
 
-  {#if worktreeMismatch}
+  {#if worktreeMismatch && !composerOnly}
     <div class="wtwarning" role="alert">
       <Icon name="alert-triangle" size={14} />
       <span><strong>Worktree was requested, but this chat is working directly in the project folder.</strong>
@@ -847,23 +894,24 @@
     </div>
   {/if}
 
-  <div class="thread-container">
+  <div class="thread-container" class:composer-only={composerOnly}>
     <div class="thread-body">
       <div class="conversation">
-  <div class="stream scroll" bind:this={scroller} onscroll={onScroll}>
+  {#if !composerOnly || peekItems > 0}
+  <div class="stream scroll" class:peek-stream={composerOnly} bind:this={scroller} onscroll={onScroll}>
     <!-- Items produced INSIDE a spawned sub-agent are excluded here and rendered in the agent panel
          instead: a background agent's tool spam would otherwise bury the conversation you are actually
          having. `agentId` is set only for sub-agent output, so the main thread is unaffected. -->
-    {#each renderNodes as node, i (node.id)}
+    {#each displayedRenderNodes as node, i (node.id)}
       {#if node.type === 'group'}
         <!-- Only the LAST group of the trailing run is "live" while the turn is in flight — that is the
              one still accumulating, so it is the one whose elapsed clock should tick. -->
-        <CodexActivityGroup items={node.items} {now} live={thinking && i === renderNodes.length - 1} />
+        <CodexActivityGroup items={node.items} {now} live={thinking && i === displayedRenderNodes.length - 1} />
       {:else}
         <ItemCard item={node.item} sessionId={view.record.id} />
       {/if}
     {/each}
-    {#if view.items.length === 0 && !thinking}
+    {#if mainItems.length === 0 && !thinking}
       {#if showFirstChatGuide}
         <FirstChatGuide
           provider={view.record.provider}
@@ -885,11 +933,12 @@
       </div>
     {/if}
   </div>
+  {/if}
 
   <div class="composer-wrap">
     <!-- Jump-to-bottom: floats just above the composer (never over it or the action-error slot). Shows
          "N new" when a turn has streamed content below while you read history; a plain arrow otherwise. -->
-    {#if jumpAway}
+    {#if jumpAway && !composerOnly}
       <button
         class="jumpbtn"
         onclick={jumpToBottom}
@@ -901,7 +950,7 @@
       </button>
     {/if}
     <!-- The agent's task board, directly above the chatbar. -->
-    <TaskStrip items={view.items} />
+    {#if !composerOnly}<TaskStrip items={view.items} />{/if}
 
     {#each approvals as a (a.id)}
       {@const blurb = approvalBlurb(a.kind, a.payload)}
@@ -973,7 +1022,7 @@
         vendor={view.record.provider}
         onremove={removeAttachment}
       />
-      <textarea rows="2" placeholder={isDraft ? 'Describe the first task… (Enter to start the chat, Shift+Enter for newline)' : steerable ? 'Steer the running turn… (appended to what Codex is doing now)' : active ? 'Queue a message… (sends when the current turn finishes)' : 'Ask for follow-up changes…  (Enter to send, Shift+Enter for newline)'}
+      <textarea rows="2" aria-label={composerLabel} placeholder={isDraft ? 'Describe the first task… (Enter to start the chat, Shift+Enter for newline)' : steerable ? 'Steer the running turn… (delivered at the next tool boundary)' : active ? 'Queue a message… (sends when the current turn finishes)' : 'Ask for follow-up changes…  (Enter to send, Shift+Enter for newline)'}
         bind:this={taRef} bind:value={text} onkeydown={onKey} onpaste={onPaste}></textarea>
       <div class="cfoot">
         <input
@@ -1074,7 +1123,7 @@
       </div>
       <!-- Open panels are an in-flow sibling: they consume layout space instead of covering the
            transcript. The narrow-pane container query stacks the panel below this conversation. -->
-       <AgentPanel items={view.items} sessionId={view.record.id} provider={view.record.provider} />
+       {#if !composerOnly}<AgentPanel items={view.items} sessionId={view.record.id} provider={view.record.provider} />{/if}
     </div>
   </div>
 {/if}
@@ -1110,6 +1159,12 @@
     flex: 1; min-width: 0; min-height: 0;
     container-type: inline-size; container-name: thread-body;
   }
+  .thread-container.composer-only { flex: none; min-height: auto; }
+  .composer-only .thread-body, .composer-only .conversation { height: auto; min-height: 0; }
+  .composer-only .composer-wrap { max-width: none; padding: 0; }
+  .composer-only .peek-stream { flex: none; max-width: none; max-height: 15rem; margin: 0;
+    padding: .7rem .8rem; overflow: hidden auto; border-bottom: 1px solid var(--border-subtle);
+    background: var(--surface-2); }
   .thread-body { display: flex; width: 100%; height: 100%; min-width: 0; min-height: 0; }
   .conversation { flex: 1 1 0; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
   /* Beside the transcript above this width, below it beneath: a 240px useful panel plus a 380px useful

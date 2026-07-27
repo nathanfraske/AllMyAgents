@@ -237,7 +237,7 @@ describe('attachment composer front door', () => {
     expect(screen.queryByRole('alert')).toBeNull()
   })
 
-  it('uploads before steering and passes ids to the Codex steer request', async () => {
+  it('uploads before steering and passes ids through the provider-neutral input route', async () => {
     seed('codex', 'active')
     render(ThreadView, { props: { sessionId: 's1' } })
     const input = document.querySelector('input[type="file"]') as HTMLInputElement
@@ -246,7 +246,11 @@ describe('attachment composer front door', () => {
     await fireEvent.input(document.querySelector('.composer textarea')!, { target: { value: 'inspect' } })
     await fireEvent.click(screen.getByTitle('steer into the running turn'))
 
-    expect(apiMock.steer).toHaveBeenCalledWith('s1', 'inspect', ['att-steer.png'])
+    expect(apiMock.send).toHaveBeenCalledWith(
+      's1',
+      'inspect',
+      { attachments: ['att-steer.png'] },
+    )
   })
 
   it('starts an attachment-bearing draft empty, then uploads and sends against the real id', async () => {

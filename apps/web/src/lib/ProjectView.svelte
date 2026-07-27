@@ -4,18 +4,53 @@
   import { store, type SessionView, type ThreadItem } from './store.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
   import TaskStrip from './TaskStrip.svelte'
+  import ThreadView from './ThreadView.svelte'
   import { agentActivity } from './toolBlurb'
+  import {
+    loadProjectViewMode,
+    loadProjectTranscriptPeek,
+    saveProjectTranscriptPeek,
+    saveProjectViewMode,
+    type ProjectViewMode,
+  } from './uiState'
 
   let { projectId }: { projectId: string } = $props()
 
   let activity = $state<WorktreeProjectActivity | null>(null)
   let activityError = $state(false)
   let activityTimer: ReturnType<typeof setInterval> | null = null
+  let selectedMode = $state<ProjectViewMode>('overview')
+  let peekOpen = $state(true)
+  let modeProjectId = $state('')
+
+  $effect.pre(() => {
+    if (modeProjectId === projectId) return
+    modeProjectId = projectId
+    selectedMode = loadProjectViewMode(projectId)
+    peekOpen = loadProjectTranscriptPeek(projectId)
+  })
 
   const project = $derived(store.projects.find((candidate) => candidate.id === projectId))
   const projectSessions = $derived(
     store.sessionList.filter((view) => view.record.projectId === projectId),
   )
+  const manager = $derived(
+    projectSessions.find((view) => view.record.isProjectManager),
+  )
+  const mode = $derived<ProjectViewMode>(manager ? selectedMode : 'overview')
+  const directProjectCount = $derived(
+    projectSessions.filter((view) => !view.record.worktree).length,
+  )
+
+  function selectMode(next: ProjectViewMode): void {
+    selectedMode = next
+    saveProjectViewMode(projectId, next)
+  }
+
+  function toggleTranscriptPeek(): void {
+    peekOpen = !peekOpen
+    saveProjectTranscriptPeek(projectId, peekOpen)
+  }
 
   $effect(() => {
     const id = projectId
@@ -217,7 +252,11 @@
   }
 </script>
 
-<section class="project-view" aria-label={project ? `${project.name} project overview` : 'Project overview'}>
+<section
+  class="project-view"
+  class:manager-mode={mode === 'manager'}
+  aria-label={project ? `${project.name} project ${mode}` : 'Project overview'}
+>
   {#if !project}
     <div class="empty hero">
       <h1>Project unavailable</h1>
@@ -226,18 +265,43 @@
   {:else}
     <header class="project-head">
       <div>
-        <div class="eyebrow">Project overview</div>
+        <div class="eyebrow">{mode === 'manager' ? 'Manager conversation' : 'Project overview'}</div>
         <h1>{project.name}</h1>
         <div class="path" title={project.path}>{project.path}</div>
       </div>
-      <div class="summary" aria-label="Team status summary">
-        <span><strong>{projectSessions.length}</strong> agents</span>
-        {#if statusCounts.working}<span class="working">{statusCounts.working} working</span>{/if}
-        {#if statusCounts.blocked}<span class="blocked">{statusCounts.blocked} blocked</span>{/if}
-        {#if statusCounts.failed}<span class="failed">{statusCounts.failed} failed</span>{/if}
+      <div class="head-actions">
+        {#if manager}
+          <div class="view-toggle" role="group" aria-label="Project view">
+            <button
+              class:active={mode === 'overview'}
+              aria-pressed={mode === 'overview'}
+              onclick={() => selectMode('overview')}
+            >Overview</button>
+            <button
+              class:active={mode === 'manager'}
+              aria-pressed={mode === 'manager'}
+              onclick={() => selectMode('manager')}
+            >Manager</button>
+          </div>
+        {/if}
+        <div class="summary" aria-label="Team status summary">
+          <span><strong>{projectSessions.length}</strong> agents</span>
+          {#if statusCounts.working}<span class="working">{statusCounts.working} working</span>{/if}
+          {#if statusCounts.blocked}<span class="blocked">{statusCounts.blocked} blocked</span>{/if}
+          {#if statusCounts.failed}<span class="failed">{statusCounts.failed} failed</span>{/if}
+        </div>
       </div>
     </header>
 
+    {#if mode === 'manager' && manager}
+      <div class="manager-thread" aria-label={`${agentName(manager)} manager conversation`}>
+        <ThreadView
+          sessionId={manager.record.id}
+          embedded
+          composerLabel={`Message ${agentName(manager)}`}
+        />
+      </div>
+    {:else}
     {#if activity?.risks.length}
       <section class="risks" aria-label="Worktree risks">
         {#each activity.risks as risk (`${risk.risk}:${risk.file}:${risk.sessionIds.join(':')}`)}
@@ -264,7 +328,14 @@
             <h2>Team</h2>
             <p>Live session state and changed files</p>
           </div>
-          {#if activityError}<span class="monitor-error">file monitor unavailable</span>{/if}
+          {#if activityError}
+            <span class="monitor-error">Worktree activity could not be loaded</span>
+          {:else if directProjectCount}
+            <span
+              class="monitor-note"
+              title="The collision detector reads isolated git worktrees; agents working in the shared project folder have no separate checkout to inspect."
+            >Worktree changes only · direct-project agents are not tracked</span>
+          {/if}
         </div>
 
         {#if agentRows.length === 0}
@@ -306,7 +377,7 @@
                       </span>
                     {/each}
                   {:else if !view.record.worktree}
-                    <span class="file-empty" title={view.record.cwd}>Works directly in the project · file monitoring is unavailable</span>
+                    <span class="file-empty" title={view.record.cwd}>Works directly in the project</span>
                   {:else if !activity}
                     <span class="file-empty">Checking worktree…</span>
                   {:else}
@@ -350,14 +421,47 @@
         {/if}
       </section>
     </div>
+
+    {#if manager}
+      <section class="card manager-steer" aria-label={`Message ${agentName(manager)}`}>
+        <div class="section-head">
+          <div>
+            <h2>Steer {agentName(manager)}</h2>
+            <p>Message the project manager here, including while a turn is running</p>
+          </div>
+          <div class="steer-controls">
+            <span class="state {projectStatus(manager)}">
+              <span class="dot"></span>{statusLabel(projectStatus(manager))}
+            </span>
+            <button
+              class="peek-toggle"
+              aria-label={`${peekOpen ? 'Hide' : 'Show'} recent manager activity`}
+              aria-expanded={peekOpen}
+              onclick={toggleTranscriptPeek}
+            >{peekOpen ? 'Hide activity' : 'Show activity'}</button>
+          </div>
+        </div>
+        <div class="manager-composer">
+          <ThreadView
+            sessionId={manager.record.id}
+            composerOnly
+            peekItems={peekOpen ? 4 : 0}
+            composerLabel={`Message ${agentName(manager)}`}
+          />
+        </div>
+      </section>
+    {/if}
+    {/if}
   {/if}
 </section>
 
 <style>
   .project-view { box-sizing: border-box; width: 100%; min-width: 0; height: 100%; overflow: hidden auto;
     padding: clamp(1rem, 2.5vw, 2rem); background: var(--bg); }
+  .project-view.manager-mode { display: flex; flex-direction: column; overflow: hidden; }
   .project-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 1rem;
     max-width: 1400px; margin: 0 auto 1rem; }
+  .manager-mode .project-head { width: 100%; flex: none; }
   .eyebrow { color: var(--accent); font-size: var(--text-2xs); font-weight: var(--fw-semibold);
     letter-spacing: var(--ls-label); text-transform: uppercase; }
   h1 { margin: .18rem 0; font-size: clamp(1.45rem, 3vw, 2.15rem); line-height: 1.1; }
@@ -365,6 +469,14 @@
     color: var(--muted); font-family: var(--mono); font-size: var(--text-xs); }
   .summary { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: .4rem; color: var(--muted);
     font-size: var(--text-xs); }
+  .head-actions { display: flex; flex-direction: column; align-items: flex-end; gap: .55rem; }
+  .view-toggle { display: grid; grid-template-columns: 1fr 1fr; padding: 3px; border: 1px solid var(--border);
+    border-radius: var(--r-lg); background: var(--surface-2); box-shadow: var(--edge-hi); }
+  .view-toggle button { min-width: 7rem; padding: .42rem .75rem; border-radius: calc(var(--r-lg) - 3px);
+    color: var(--muted); font-size: var(--text-xs); font-weight: var(--fw-medium); }
+  .view-toggle button:hover { color: var(--text); }
+  .view-toggle button.active { color: var(--text); background: var(--surface);
+    box-shadow: var(--shadow-1), inset 0 0 0 1px var(--border-strong); }
   .summary span { padding: .3rem .55rem; border: 1px solid var(--border); border-radius: var(--r-pill);
     background: var(--surface); }
   .summary .blocked, .summary .failed { color: var(--red); border-color: color-mix(in srgb, var(--red) 35%, var(--border)); }
@@ -386,6 +498,7 @@
   h2 { margin: 0; font-size: var(--text-md); }
   .section-head p { margin: .15rem 0 0; color: var(--muted); font-size: var(--text-xs); }
   .monitor-error { color: var(--red); font-size: var(--text-2xs); }
+  .monitor-note { max-width: 270px; color: var(--dim); font-size: var(--text-2xs); text-align: right; }
   .agent-list { display: flex; flex-direction: column; }
   .agent { padding: .65rem .8rem .7rem; border-top: 1px solid var(--border-subtle);
     margin-left: calc(var(--depth) * 1rem); }
@@ -422,6 +535,15 @@
   .subject { margin-top: .25rem; color: var(--accent); font-size: var(--text-2xs); }
   .comms-list p { display: -webkit-box; margin: .22rem 0 0; overflow: hidden; color: var(--muted);
     font-size: var(--text-xs); line-height: 1.4; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; }
+  .manager-steer { max-width: 1400px; margin: 1rem auto 0; }
+  .manager-composer { padding: .75rem; }
+  .steer-controls { display: flex; align-items: center; gap: .65rem; }
+  .peek-toggle { padding: .3rem .55rem; border: 1px solid var(--border); border-radius: var(--r-md);
+    color: var(--muted); font-size: var(--text-2xs); white-space: nowrap; }
+  .peek-toggle:hover { color: var(--text); border-color: var(--border-strong); }
+  .manager-thread { flex: 1; width: 100%; min-height: 0; max-width: 1400px; margin: 0 auto;
+    border: 1px solid var(--border); border-radius: var(--r-xl); background: var(--surface);
+    box-shadow: var(--edge-hi); overflow: hidden; display: flex; flex-direction: column; }
   .empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .25rem;
     min-height: 125px; padding: 1.5rem; color: var(--muted); text-align: center; font-size: var(--text-xs); }
   .empty strong { color: var(--text); font-size: var(--text-sm); }
@@ -430,6 +552,7 @@
   @media (max-width: 900px) {
     .dashboard-grid { grid-template-columns: 1fr; }
     .project-head { align-items: flex-start; flex-direction: column; }
+    .head-actions { align-items: flex-start; }
     .summary { justify-content: flex-start; }
   }
   @media (max-width: 560px) {
@@ -437,5 +560,8 @@
     .risk { grid-template-columns: 1fr; gap: .2rem; }
     .risk-detail { margin-top: .2rem; }
     .state { max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
+    .view-toggle { width: 100%; }
+    .view-toggle button { min-width: 0; }
+    .monitor-note { max-width: 180px; }
   }
 </style>
