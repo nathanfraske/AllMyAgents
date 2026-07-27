@@ -116,10 +116,27 @@
     editingFolderId = null
   }
 
-  // A turn stuck 'active' with no completion for this long reads as stalled — worth a warning glance.
-  const STALL_MS = 3 * 60 * 1000
+  // SILENCE is what stalled means — not duration.
+  //
+  // This measured from turnStartedAt, so ANY turn running longer than three minutes was flagged, however
+  // healthily it was streaming. That is fine for a chat that answers in seconds and wrong for the thing
+  // this app exists to run: a max-effort agent doing real work takes tens of minutes, and every one of
+  // them sat permanently marked. The operator read the warning treatment as "errored" — reasonably, since
+  // a warning that is always on carries no information and the tooltip only says otherwise on hover.
+  //
+  // `lastActivity` already advances on essentially every event of a live turn, so the honest signal was
+  // sitting right there: a turn producing output is not stalled by definition, at any duration, and one
+  // producing nothing for minutes is suspect at any age.
+  //
+  // Five minutes of TOTAL SILENCE. Measured gaps within a healthy turn run seconds — the sub-agent work
+  // clocked a median of 4-13s and a worst observed 102s — so this is roughly 3x the worst normal gap and
+  // still catches a genuinely wedged turn well before an operator would.
+  const STALL_MS = 5 * 60 * 1000
   function isStalled(s: SessionView): boolean {
-    return s.record.status === 'active' && !!s.turnStartedAt && Date.now() - s.turnStartedAt > STALL_MS
+    if (s.record.status !== 'active') return false
+    const last = Date.parse(s.lastActivity)
+    if (!Number.isFinite(last)) return false // no usable timestamp — never guess "stalled"
+    return Date.now() - last > STALL_MS
   }
   function warnOf(s: SessionView, st: { key: string }): boolean {
     return st.key === 'error' || isStalled(s)
