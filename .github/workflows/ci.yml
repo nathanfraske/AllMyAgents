@@ -35,6 +35,32 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # UNRESOLVED MERGE MARKERS MUST NEVER REACH A BUILD.
+      #
+      # This is not hypothetical here. `apps/hub/src/adapters/claude.ts` was committed carrying
+      # `<<<<<<< Updated upstream` / `>>>>>>> Stashed changes` while several agents were rebasing over each
+      # other in one working tree. It was removed only by accident — swept into an unrelated commit, which
+      # was itself then dropped in another rebase. Two coincidences separated that file from a release.
+      #
+      # The consequence is severe and specific: conflict markers in claude.ts are a syntax error, the hub
+      # fails to load, and the app installs and then does nothing — the exact "hub never spawns" failure
+      # that blocked an earlier cut and is miserable to diagnose from the outside, because the installer,
+      # the update manifest and the signatures are all perfectly valid.
+      #
+      # Runs before any setup: it needs nothing but a checkout, and there is no reason to spend a
+      # toolchain install discovering the tree was never buildable.
+      - name: Reject unresolved merge markers
+        shell: bash
+        run: |
+          # Anchored to line start so ordinary content (a bash heredoc, a diff in a doc, ===== in a table)
+          # cannot trip it. Real markers are always at column 0.
+          if git grep -nE '^(<{7} |={7}$|>{7} )' -- \
+               '*.ts' '*.tsx' '*.svelte' '*.js' '*.mjs' '*.cjs' '*.rs' '*.json' '*.yml' '*.yaml' '*.toml'; then
+            echo "::error title=Unresolved merge markers::A tracked source file contains conflict markers. This would ship a build that cannot parse."
+            exit 1
+          fi
+          echo "no unresolved merge markers in tracked source"
+
       # pnpm is the repo's package manager (pnpm-lock.yaml, packageManager field). action-setup reads
       # the exact version from package.json's `packageManager`, so there is one source of truth.
       - name: Install pnpm
