@@ -4,6 +4,7 @@
   import ItemCard from './ItemCard.svelte'
   import CodexActivityGroup from './CodexActivityGroup.svelte'
   import { groupCodexItems, type CodexRenderNode } from './codexGroup'
+  import { classifyDecideOutcome } from './approvals'
   import ContextMeter from './ContextMeter.svelte'
   import ModelPicker from './ModelPicker.svelte'
   import TraitsControl from './TraitsControl.svelte'
@@ -384,9 +385,26 @@
     if (view) await api.interrupt(view.record.id)
   }
 
+  // Per-approval decision error (keyed by approval id so it renders on the right card). Cleared on the
+  // next attempt. See classifyDecideOutcome for why we consult the refreshed roster instead of the status.
+  let decideError = $state<{ id: string; msg: string } | null>(null)
   async function decide(id: string, approve: boolean): Promise<void> {
-    await api.decide(id, approve)
-    await store.refreshSideData()
+    decideError = null
+    // jpost RESOLVES with {error} on a non-2xx rather than throwing, so the OLD code — which ignored the
+    // result and always cleared the prompt — treated a 404 (already resolved / timed out) or a 401
+    // (unauthorized) as an accepted decision. Read the result, then re-read the authoritative roster.
+    const res = (await api.decide(id, approve)) as { ok?: boolean; error?: string }
+    await store.refreshSideData().catch(() => {}) // authoritative on success AND the honest test on failure
+    const outcome = classifyDecideOutcome(res, store.approvals.some((a) => a.id === id))
+    if (outcome.kind === 'failed') {
+      // Still pending → the click did not take. Keep the prompt up so the operator can decide again.
+      decideError = { id, msg: `decision didn't go through (${outcome.error}) — the request is still pending; decide again.` }
+    } else if (outcome.kind === 'gone') {
+      // No longer pending → resolved elsewhere or timed out. The prompt is already gone; don't pretend the
+      // click decided it (it may have been auto-resolved the other way), but don't tell them to retry either.
+      store.pushLocalNote(view?.record.id ?? '', '⚠ that approval was already resolved or timed out — your response did not decide it')
+    }
+    // resolved → the refresh has already dropped the prompt; nothing to surface.
   }
 
   /** "Always allow" — grant the tool for this chat FIRST, then approve the request that prompted it, so
@@ -551,6 +569,7 @@
           <button class="abtn" onclick={() => decide(a.id, false)}>Decline</button>
         </div>
         {#if grantError}<div class="aerr">{grantError}</div>{/if}
+        {#if decideError?.id === a.id}<div class="aerr" role="alert">{decideError.msg}</div>{/if}
       </div>
     {/each}
 
