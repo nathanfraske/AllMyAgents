@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen } from '@testing-library/svelte'
+import { cleanup, render, screen } from '@testing-library/svelte'
 import Sidebar from './Sidebar.svelte'
-import { settings } from './settings.svelte'
 import { store } from './store.svelte'
 
 vi.mock('./api', async (original) => {
@@ -34,7 +33,6 @@ const project = {
 
 beforeEach(() => {
   localStorage.clear()
-  settings.detachedDefaultProjectId = null
   store.sessions = {}
   store.projects = [project]
   store.profiles = [{ id: 'claude-main', provider: 'claude' }]
@@ -44,35 +42,20 @@ beforeEach(() => {
   store.lastProfileId = null
 })
 
-afterEach(() => {
-  cleanup()
-  settings.detachedDefaultProjectId = null
-})
+afterEach(() => cleanup())
 
-describe('sidebar creation entry points', () => {
-  it('opens the one New Project flow and removes the obsolete global creation controls', async () => {
-    const onnewproject = vi.fn()
-    render(Sidebar, { props: { onnewproject } })
+describe('sidebar launch controls', () => {
+  it('keeps the sidebar navigation-only without leaving an empty launch-action wrapper', () => {
+    const { container } = render(Sidebar)
 
-    await fireEvent.click(screen.getByRole('button', { name: 'New Project — set up a project and team' }))
-
-    expect(onnewproject).toHaveBeenCalledOnce()
-    expect(screen.getByRole('button', { name: 'New Scratchpad — no project, isolated workspace, start typing' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /New Project/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: /New Scratchpad/ })).toBeNull()
     expect(screen.queryByTitle('new project')).toBeNull()
     expect(screen.queryByTitle('new chat')).toBeNull()
     expect(screen.queryByPlaceholderText('project name')).toBeNull()
+    expect(container.querySelector('.creation-entrypoints')).toBeNull()
+    expect(container.querySelector('.sec-head')?.nextElementSibling?.classList.contains('list')).toBe(true)
     expect(screen.getByTitle('new chat here')).toBeTruthy()
     expect(screen.getByTitle('project managers')).toBeTruthy()
-  })
-
-  it('always starts an unfiled scratch draft even when detached chats have a default project', async () => {
-    settings.detachedDefaultProjectId = project.id
-    render(Sidebar, { props: { onnewproject: vi.fn() } })
-
-    await fireEvent.click(screen.getByRole('button', { name: 'New Scratchpad — no project, isolated workspace, start typing' }))
-
-    expect(store.selectedId).toMatch(/^draft:/)
-    expect(store.sessions[store.selectedId!]?.draft).toBe(true)
-    expect(store.sessions[store.selectedId!]?.record.projectId).toBeUndefined()
   })
 })

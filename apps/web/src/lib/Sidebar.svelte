@@ -26,8 +26,6 @@
     type FolderBucket,
   } from './folders'
 
-  let { onnewproject = () => {} }: { onnewproject?: () => void } = $props()
-
   let filter = $state('')
 
   function pathFor(id: string): string {
@@ -560,18 +558,6 @@
   }
 
 
-  function startScratchpad(): void {
-    const before = new Set(Object.keys(store.sessions))
-    // `newSession` builds its draft synchronously. It normally honors the operator's default detached
-    // destination, but this button is an explicit promise of NO project, so clear only the newly-created
-    // draft's destination before Svelte can paint it. Its detached safety/worktree defaults still apply.
-    void store.newSession()
-    const id = store.selectedId
-    if (id && !before.has(id) && store.sessions[id]?.draft) {
-      store.updateDraft(id, { projectId: undefined })
-    }
-  }
-
   async function act(e: MouseEvent, id: string, verb: 'interrupt' | 'stop'): Promise<void> {
     e.stopPropagation()
     const out = verb === 'interrupt' ? await api.interrupt(id) : await api.stop(id)
@@ -607,40 +593,11 @@
 
   <div class="search"><span class="sicon"><Icon name="search" size={13} /></span><input placeholder="Search sessions" bind:value={filter} /></div>
 
-  <div class="creation-entrypoints" aria-label="Start something">
-    <button
-      class="creation-entry project-entry"
-      aria-label="New Project — set up a project and team"
-      title="Set up a project and a team"
-      onclick={onnewproject}
-    >
-      <span class="creation-icon"><Icon name="folder-plus" size={15} /></span>
-      <span class="creation-copy">
-        <span class="creation-title">+ New Project</span>
-        <span class="creation-sub">Project + team</span>
-      </span>
-    </button>
-    <button
-      class="creation-entry scratch-entry"
-      aria-label="New Scratchpad — no project, isolated workspace, start typing"
-      title="No project · its own isolated scratch workspace · start typing now"
-      onclick={startScratchpad}
-    >
-      <span class="creation-icon"><Icon name="square-pen" size={15} /></span>
-      <span class="creation-copy">
-        <span class="creation-title">New Scratchpad</span>
-        <span class="creation-sub">No project · own space · type now</span>
-      </span>
-    </button>
-  </div>
-
   <div class="sec-head">
     <span>PROJECTS</span>
-    <span class="sec-actions">
-      <button class="manager-entry" title="project managers" onclick={() => store.openManagerSetup()}>
-        <Icon name="flag" size={12} /><span>Managers</span>
-      </button>
-    </span>
+    <button class="manager-entry" title="project managers" onclick={() => store.openManagerSetup()}>
+      <Icon name="flag" size={12} /><span>Managers</span>
+    </button>
   </div>
 
   {#snippet gripIcon()}
@@ -879,25 +836,8 @@
   .search { position: relative; padding: 0 var(--space-4) var(--space-3); }
   .sicon { position: absolute; left: 1.15rem; top: calc(50% - 0.25rem); transform: translateY(-50%); color: var(--dim); display: grid; }
   .search input { width: 100%; padding-left: 1.9rem; }
-  .creation-entrypoints { display: grid; grid-template-columns: minmax(0, .95fr) minmax(0, 1.05fr);
-    gap: var(--space-2); padding: 0 var(--space-4) var(--space-3); }
-  .creation-entry { min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: .3rem; padding: .5rem;
-    border: 1px solid var(--border); border-radius: var(--r-md); text-align: left;
-    transition: border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease); }
-  .creation-entry:hover { border-color: var(--border-accent); }
-  .project-entry { color: var(--text); border-color: color-mix(in srgb, var(--accent) 52%, var(--border));
-    background: color-mix(in srgb, var(--accent) 16%, var(--surface)); box-shadow: var(--edge-hi), var(--shadow-1); }
-  .project-entry:hover { background: color-mix(in srgb, var(--accent) 22%, var(--surface)); }
-  .scratch-entry { color: var(--muted); background: var(--surface); }
-  .scratch-entry:hover { color: var(--text); background: var(--surface-2); }
-  .creation-icon { flex: none; display: grid; place-items: center; margin-top: .05rem; color: var(--accent); }
-  .scratch-entry .creation-icon { color: var(--muted); }
-  .creation-copy { min-width: 0; display: flex; flex-direction: column; gap: .14rem; }
-  .creation-title { font-size: .71rem; line-height: 1.15; font-weight: var(--fw-semibold); }
-  .creation-sub { font-size: .58rem; line-height: 1.25; color: var(--dim); }
   .sec-head { display: flex; align-items: center; justify-content: space-between; padding: var(--space-2) var(--space-5); font-size: var(--text-2xs); letter-spacing: var(--ls-label); text-transform: uppercase; color: var(--dim); }
-  .sec-actions { display: flex; gap: 0.15rem; }
-  .manager-entry { display: flex; align-items: center; gap: .28rem; margin-right: .2rem; padding: .22rem .4rem;
+  .manager-entry { display: flex; align-items: center; gap: .28rem; padding: .22rem .4rem;
     color: var(--dim); border: 1px solid var(--border); border-radius: var(--r-sm); font-size: .62rem;
     letter-spacing: .03em; text-transform: none; }
   .manager-entry:hover { color: var(--text); border-color: var(--border-accent); background: var(--surface-2); }
