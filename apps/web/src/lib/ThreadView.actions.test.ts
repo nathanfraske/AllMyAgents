@@ -68,6 +68,20 @@ beforeEach(() => {
 afterEach(() => cleanup())
 
 describe('session lifecycle buttons surface a failed write at the footer', () => {
+  it.each(['starting', 'active', 'idle', 'error'] as const)(
+    'keeps interrupt reachable while status is %s',
+    async (status) => {
+      apiMock.interrupt.mockResolvedValue({ ok: true })
+      seed({ status })
+      render(ThreadView, { props: { sessionId: 's1' } })
+
+      const button = screen.getByTitle('interrupt current turn') as HTMLButtonElement
+      expect(button.disabled).toBe(false)
+      await fireEvent.click(button)
+      expect(apiMock.interrupt).toHaveBeenCalledWith('s1')
+    }
+  )
+
   it('shows the error when stop does not take', async () => {
     apiMock.stop.mockResolvedValue({ error: 'worker gone' })
     seed({ status: 'active' })

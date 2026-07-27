@@ -42,6 +42,7 @@ export type HubToWorker =
     }
   | { t: 'steer'; reqId: string; sessionId: string; text: string; attachments?: AttachmentMeta[] }
   | { t: 'interrupt'; reqId: string; sessionId: string }
+  | { t: 'interruptAgent'; reqId: string; sessionId: string; targetId: string }
   | { t: 'stopSession'; reqId: string; sessionId: string }
   | { t: 'listLive'; reqId: string }
   | { t: 'attach'; reqId: string; since: Record<string, number> }

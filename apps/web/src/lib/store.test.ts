@@ -882,6 +882,24 @@ describe('turn outcome — only real failures may look like failures', () => {
  * Payload shapes below are verbatim from real journal rows.
  */
 describe('claude/system — sub-agent task lifecycle ingest', () => {
+  it('shows a durable parent-transcript note when an operator requests one sub-agent stop', () => {
+    seed('a')
+    apply(
+      evt({
+        seq: 1,
+        kind: 'session/agent-stop-requested',
+        sessionId: 'a',
+        payload: { targetId: 'task-1', label: 'slow audit' },
+      })
+    )
+
+    expect(
+      store.sessions['a']!.items.some(
+        (i) => i.kind === 'note' && i.text === 'stop requested for slow audit — work preserved'
+      )
+    ).toBe(true)
+  })
+
   const spawnItem = (id: string) => store.sessions[id]!.items.find((i) => i.toolName === 'Agent')!
 
   // The assistant message carrying the Agent tool_use block always precedes the lifecycle rows

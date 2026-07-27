@@ -287,6 +287,11 @@ export class AgentWorker {
           .then(() => this.ack(msg.reqId, true))
           .catch((err) => this.ack(msg.reqId, false, errMessage(err)))
         return
+      case 'interruptAgent':
+        this.interruptAgent(msg.sessionId, msg.targetId)
+          .then(() => this.ack(msg.reqId, true))
+          .catch((err) => this.ack(msg.reqId, false, errMessage(err)))
+        return
       case 'stopSession':
         try {
           this.stopSession(msg.sessionId)
@@ -453,6 +458,20 @@ export class AgentWorker {
       const client = this.codexSessionClients.get(sessionId)
       if (client) await client.interrupt(threadId)
     }
+  }
+
+  private async interruptAgent(sessionId: string, targetId: string): Promise<void> {
+    const driver = this.claudeDrivers.get(sessionId)
+    if (driver) {
+      await driver.stopTask(targetId)
+      return
+    }
+    const client = this.codexSessionClients.get(sessionId)
+    if (client) {
+      await client.interrupt(targetId)
+      return
+    }
+    throw new Error('this session has no independently stoppable sub-agent')
   }
 
   private stopSession(sessionId: string): void {

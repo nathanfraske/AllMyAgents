@@ -198,3 +198,34 @@ describe('WorkerExecutor.listLive — reconnect snapshots reconcile the busy cac
     expect(newer.isBusy('s1')).toBe(true)
   })
 })
+
+describe('WorkerExecutor targeted sub-agent interrupt', () => {
+  it('sends the selected target through the worker RPC without stopping its parent session', async () => {
+    const calls: Array<{ t: string; reqId: string; sessionId?: string; targetId?: string }> = []
+    const client = {
+      onEvent: () => {},
+      onTurnLifecycle: () => {},
+      onRestartRequest: () => {},
+      onRelay: () => {},
+      onWelcome: () => {},
+      on: () => {},
+      connect: () => {},
+      send: () => {},
+      call: async (msg: { t: string; reqId: string; sessionId?: string; targetId?: string }) => {
+        calls.push(msg)
+        return { t: 'ack', reqId: msg.reqId, ok: true }
+      },
+    } as unknown as WorkerClient
+    const exec = new WorkerExecutor(client, recordingHub().hub)
+
+    await exec.interruptAgent('parent-1', 'task-1')
+
+    expect(calls).toEqual([
+      expect.objectContaining({
+        t: 'interruptAgent',
+        sessionId: 'parent-1',
+        targetId: 'task-1',
+      }),
+    ])
+  })
+})

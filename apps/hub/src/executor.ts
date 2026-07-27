@@ -41,8 +41,10 @@ export interface Executor {
   ): Promise<void>
   /** Append input to the provider's live turn; rejects if the turn ended before accepting it. */
   steer(sessionId: string, text: string, attachments?: readonly AttachmentMeta[]): Promise<void>
-  /** Interrupt the in-flight turn (claude query / codex turn). No-op if none is running. */
+  /** Interrupt the in-flight parent turn (claude query / codex turn). */
   interrupt(sessionId: string): Promise<void>
+  /** Interrupt one vendor sub-agent, preserving the parent turn, sibling agents, and all files on disk. */
+  interruptAgent?(sessionId: string, targetId: string): Promise<void>
   /** Drop the driver/thread for a stopped/deleted session from the executor. */
   stopSession(sessionId: string): Promise<void>
   readCodexLimits(profileId: string, profileDir: string): Promise<unknown>
@@ -467,6 +469,22 @@ export class InProcessExecutor implements Executor {
       const client = this.codexSessionClients.get(sessionId)
       if (client) await client.interrupt(threadId)
     }
+  }
+
+  async interruptAgent(sessionId: string, targetId: string): Promise<void> {
+    const driver = this.claudeDrivers.get(sessionId)
+    if (driver) {
+      await driver.stopTask(targetId)
+      return
+    }
+    const client = this.codexSessionClients.get(sessionId)
+    if (client) {
+      // For Codex a sub-agent is a child thread. CodexClient resolves that child's active turn id and
+      // sends turn/interrupt with both required identifiers.
+      await client.interrupt(targetId)
+      return
+    }
+    throw new Error('this session has no independently stoppable sub-agent')
   }
 
   async stopSession(sessionId: string): Promise<void> {

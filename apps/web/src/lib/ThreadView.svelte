@@ -512,7 +512,7 @@
 
   // The three session-lifecycle buttons. Each reports a failure at the footer ('session' slot) instead of
   // doing nothing silently — a button that appears dead is how an operator learns to distrust the controls.
-  async function stop(): Promise<void> {
+  async function interruptTurn(): Promise<void> {
     const id = view?.record.id
     if (id) await runAction('session', 'interrupt', () => api.interrupt(id))
   }
@@ -703,7 +703,7 @@
 
   <!-- Sub-agents this chat spawned. Self-contained popout anchored to THIS pane, so split view gets one
        panel per pane; renders nothing until an agent is actually spawned. -->
-  <AgentPanel items={view.items} sessionId={view.record.id} />
+  <AgentPanel items={view.items} sessionId={view.record.id} provider={view.record.provider} />
 
   <div class="composer-wrap">
     <!-- Jump-to-bottom: floats just above the composer (never over it or the action-error slot). Shows
@@ -819,7 +819,9 @@
           {#if stopped}
             <button class="foot-act" onclick={reopenSession} title="reopen this stopped chat so you can use it again">reopen</button>
           {:else}
-            <button class="foot-act" onclick={stop} disabled={!active} title="interrupt current turn">interrupt</button>
+            <!-- Status is display state, not proof that the executor has no live turn. An idle/error row can
+                 be stale while a vendor command is still running, so it must not remove the emergency brake. -->
+            <button class="foot-act" onclick={interruptTurn} title="interrupt current turn">interrupt</button>
             <button class="foot-act" onclick={stopSession} title="stop session">stop</button>
           {/if}
         {/if}

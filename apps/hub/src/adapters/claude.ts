@@ -329,4 +329,11 @@ export class ClaudeDriver {
   async interrupt(): Promise<void> {
     if (this.active) await this.active.query.interrupt()
   }
+
+  /** Stop one SDK task/sub-agent while leaving the parent query and its sibling tasks running. */
+  async stopTask(taskId: string): Promise<void> {
+    const active = this.active
+    if (!active) throw new Error('no active Claude turn containing that task')
+    await active.query.stopTask(taskId)
+  }
 }

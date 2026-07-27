@@ -73,6 +73,8 @@ export const STALLED_AFTER_MS = 180_000
 export interface AgentRun<T extends AgentTreeItem = AgentTreeItem> {
   /** The spawning tool_use id — also the `agentId` its own items carry. */
   id: string
+  /** Claude SDK task id used by Query.stopTask. Codex runs use their child thread id (`id`) instead. */
+  taskId?: string
   /** Human label for the run (the spawn's `description`, else its task description). */
   description: string
   subagentType?: string
@@ -155,6 +157,7 @@ export function buildAgentRuns<T extends AgentTreeItem>(items: readonly T[], now
     const realResult = isLaunchAck(it.toolResult) ? undefined : it.toolResult
     const run: AgentRun<T> = {
       id: it.toolUseId,
+      taskId: it.agentTaskId,
       description: str(input.description) ?? str(it.taskDescription) ?? 'agent',
       subagentType: str(input.subagent_type) ?? str(it.subagentType),
       background,

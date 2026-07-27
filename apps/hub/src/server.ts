@@ -1117,6 +1117,15 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, result, result.ok ? 200 : 404)
         return
       }
+      const agentInterrupt = /^\/api\/sessions\/([^/]+)\/agents\/interrupt$/.exec(url.pathname)
+      if (method === 'POST' && agentInterrupt) {
+        const body = await readBody(req)
+        const targetId = str(body.targetId)
+        if (!targetId) throw new BadRequestError('sub-agent targetId is required')
+        await sessions.interruptAgent(agentInterrupt[1] as string, targetId, str(body.label))
+        json(res, { ok: true })
+        return
+      }
       const sessionAction = /^\/api\/sessions\/([^/]+)\/(input|interrupt|stop|reopen)$/.exec(url.pathname)
       if (method === 'POST' && sessionAction) {
         const id = sessionAction[1] as string

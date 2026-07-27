@@ -406,7 +406,12 @@ export class CodexClient {
   }
 
   async interrupt(threadId: string): Promise<void> {
-    await this.request('turn/interrupt', { threadId })
+    // Codex 0.145 requires BOTH identifiers. Sending only threadId is accepted by our JSON-RPC transport
+    // but rejected by app-server, which made the HTTP interrupt route return 500 while the command kept
+    // running. Child agents are threads too, so this same method is the truthful targeted-stop primitive.
+    const turnId = this.activeTurns.get(threadId)
+    if (!turnId) throw new Error('no active Codex turn to interrupt')
+    await this.request('turn/interrupt', { threadId, turnId })
   }
 
   // Append user input to the turn currently running on this thread. The app-server requires
