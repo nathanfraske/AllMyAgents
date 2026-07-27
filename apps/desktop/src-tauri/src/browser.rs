@@ -161,28 +161,22 @@ pub fn start(app: AppHandle) -> Result<BrowserBridge, String> {
         };
         let (event_tx, event_rx) = mpsc::channel::<NavigationEvent>();
         let event_rx = Arc::new(Mutex::new(event_rx));
-        let command_locks = Arc::new(Mutex::new(HashMap::<String, Arc<Mutex<()>>>::new()));
+        let command_locks: CommandLocks = Arc::new(Mutex::new(HashMap::new()));
+        let ctx = BridgeContext {
+            root: root.clone(),
+            secret: secret.clone(),
+            instance_id: instance_id.clone(),
+            event_tx,
+            event_rx,
+            command_locks,
+        };
         super::logln(&format!("[browser] private bridge listening at {address}"));
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let app = app.clone();
-            let root = root.clone();
-            let secret = secret.clone();
-            let instance_id = instance_id.clone();
-            let event_tx = event_tx.clone();
-            let event_rx = event_rx.clone();
-            let command_locks = command_locks.clone();
+            let ctx = ctx.clone();
             thread::spawn(move || {
-                if let Err(error) = handle_connection(
-                    stream,
-                    &app,
-                    &root,
-                    &secret,
-                    &instance_id,
-                    &event_tx,
-                    &event_rx,
-                    &command_locks,
-                ) {
+                if let Err(error) = handle_connection(stream, &app, &ctx) {
                     super::logln(&format!("[browser] private bridge request failed: {error}"));
                 }
             });
@@ -420,7 +414,7 @@ fn navigation_allowed(url: &tauri::Url, policy: &Arc<Mutex<NavigationPolicy>>) -
         (host, url.port_or_known_default().unwrap_or(80))
             .to_socket_addrs()
             .ok()
-            .map(|addresses| {
+            .and_then(|addresses| {
                 let classifications = addresses
                     .map(|address| is_local_ip(address.ip()))
                     .collect::<Vec<_>>();
@@ -432,7 +426,6 @@ fn navigation_allowed(url: &tauri::Url, policy: &Arc<Mutex<NavigationPolicy>>) -
                 }
                 Some(classifications.iter().all(|local| *local))
             })
-            .flatten()
     };
     let allowed = match local_destination {
         Some(true) => policy.local_network,
@@ -475,7 +468,12 @@ fn is_local_ip(ip: std::net::IpAddr) -> bool {
                 || (ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1]))
         }
         std::net::IpAddr::V6(ip) => {
-            ip.is_loopback() || ip.is_unicast_link_local() || (ip.segments()[0] & 0xfe00) == 0xfc00
+            // fe80::/10 (unicast link-local) spelled out rather than via Ipv6Addr::is_unicast_link_local,
+            // which is only stable from 1.84 and would push the crate's MSRV past 1.77 for one predicate.
+            // fc00::/7 below is unique-local.
+            ip.is_loopback()
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
+                || (ip.segments()[0] & 0xfe00) == 0xfc00
         }
     }
 }
@@ -894,15 +892,26 @@ fn screenshot(_window: &WebviewWindow) -> Result<Vec<u8>, String> {
     Err("Browser screenshots are unavailable in this desktop build.".to_string())
 }
 
+/// One mutex per browser instance id, so commands against the SAME instance serialise while commands
+/// against different instances stay concurrent. Named because the bare type is unreadable inline.
+type CommandLocks = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
+
+/// Everything a bridge connection needs besides its socket and the app handle. These six values are
+/// created once per bridge and cloned together for every connection, so they travel as one thing.
+#[derive(Clone)]
+struct BridgeContext {
+    root: PathBuf,
+    secret: String,
+    instance_id: String,
+    event_tx: mpsc::Sender<NavigationEvent>,
+    event_rx: Arc<Mutex<mpsc::Receiver<NavigationEvent>>>,
+    command_locks: CommandLocks,
+}
+
 fn handle_connection(
     mut stream: TcpStream,
     app: &AppHandle,
-    root: &Path,
-    secret: &str,
-    instance_id: &str,
-    event_tx: &mpsc::Sender<NavigationEvent>,
-    event_rx: &Arc<Mutex<mpsc::Receiver<NavigationEvent>>>,
-    command_locks: &Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    ctx: &BridgeContext,
 ) -> Result<(), String> {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -950,7 +959,7 @@ fn handle_connection(
                 .map_err(|_| "invalid browser bridge content length".to_string())?;
         } else if name.eq_ignore_ascii_case("authorization") {
             let supplied = value.trim().strip_prefix("Bearer ").unwrap_or("");
-            authorized = constant_time_equal(supplied.as_bytes(), secret.as_bytes());
+            authorized = constant_time_equal(supplied.as_bytes(), ctx.secret.as_bytes());
         }
     }
     if !authorized {
@@ -976,7 +985,7 @@ fn handle_connection(
 
     let hello = || HostHello {
         protocol_version: PROTOCOL_VERSION,
-        desktop_instance_id: instance_id.to_string(),
+        desktop_instance_id: ctx.instance_id.to_string(),
         available: cfg!(windows),
         reason: if cfg!(windows) {
             None
@@ -987,7 +996,8 @@ fn handle_connection(
     match (method.as_str(), path.as_str()) {
         ("GET", "/hello") => write_json(&mut stream, 200, &hello()),
         ("GET", "/events/next") => {
-            let event = event_rx
+            let event = ctx
+                .event_rx
                 .lock()
                 .map_err(|_| "browser navigation event queue lock was poisoned".to_string())?
                 .recv_timeout(Duration::from_secs(15))
@@ -1003,7 +1013,8 @@ fn handle_connection(
                 serde_json::from_slice(&request[header_end..header_end + content_length])
                     .map_err(|e| format!("invalid browser command: {e}"))?;
             let session_lock = {
-                let mut locks = command_locks
+                let mut locks = ctx
+                    .command_locks
                     .lock()
                     .map_err(|_| "browser session command lock map was poisoned".to_string())?;
                 locks
@@ -1014,7 +1025,7 @@ fn handle_connection(
             let _session_guard = session_lock
                 .lock()
                 .map_err(|_| "browser session command lock was poisoned".to_string())?;
-            let result = execute(app, root, instance_id, event_tx, command);
+            let result = execute(app, &ctx.root, &ctx.instance_id, &ctx.event_tx, command);
             write_json(
                 &mut stream,
                 200,
