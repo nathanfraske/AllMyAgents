@@ -32,7 +32,7 @@ function git(cwd: string, ...args: string[]): string {
 
 function buildHub() {
   // macOS exposes os.tmpdir() through /var while git worktree list reports /private/var.
-  const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ama-worktree-life-')))
+  const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ama-worktree-life-')))
   const repo = path.join(tmp, 'repo')
   const profileDir = path.join(tmp, 'profile')
   fs.mkdirSync(repo)

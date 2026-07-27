@@ -145,6 +145,11 @@ describe('session attachment API', () => {
     const { base, record } = await build()
     const url = new URL(`${base}/api/sessions/${record.id}/attachments`)
     const result = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+      let response: { status: number; body: string } | undefined
+      let requestFinished = false
+      const done = (): void => {
+        if (response && requestFinished) resolve(response)
+      }
       const req = http.request(
         {
           hostname: url.hostname,
@@ -156,10 +161,18 @@ describe('session attachment API', () => {
         (res) => {
           const chunks: Buffer[] = []
           res.on('data', (chunk: Buffer) => chunks.push(chunk))
-          res.on('end', () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') }))
+          res.on('error', reject)
+          res.on('end', () => {
+            response = { status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') }
+            done()
+          })
         }
       )
       req.on('error', reject)
+      req.on('finish', () => {
+        requestFinished = true
+        done()
+      })
       req.end(Buffer.alloc(MAX_IMAGE_BYTES + 1))
     })
 
@@ -188,7 +201,7 @@ describe('session attachment API', () => {
       path: string
     }
     // macOS exposes os.tmpdir() through /var while realpath/git report /private/var.
-    const uploadRoot = fs.realpathSync(path.resolve(record.cwd, '.allmyagents', 'uploads'))
+    const uploadRoot = fs.realpathSync.native(path.resolve(record.cwd, '.allmyagents', 'uploads'))
     const relative = path.relative(uploadRoot, path.resolve(meta.path))
     expect(relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)).toBe(false)
     expect(meta.name).toBe('outside.png')
