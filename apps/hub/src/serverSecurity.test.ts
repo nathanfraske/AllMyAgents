@@ -34,6 +34,10 @@ async function build() {
   const practices = new PracticeStore(journal.db)
   const approvals = new ApprovalService(journal)
   const usage = new UsageMonitor(journal, [], {})
+  // Shared between the SessionManager and startServer deliberately: they must agree on where worktrees
+  // live, and passing two different managers would let the server answer about checkouts the sessions
+  // never made.
+  const workspace = new WorkspaceManager(path.join(root, 'worktrees'))
   const executor: Executor = {
     startThread: async () => 'unused',
     runTurn: async () => {},
@@ -57,7 +61,7 @@ async function build() {
     new Map([[profile.id, profile]]),
     approvals,
     usage,
-    new WorkspaceManager(path.join(root, 'worktrees')),
+    workspace,
     projects,
     instructions,
     bus,
@@ -106,6 +110,7 @@ async function build() {
     agentToolSecret: 'test-agent-bridge-secret-at-least-32-characters',
     restartState: { booted: true, sockets: new Set(), draining: false, promoting: false } as never,
     executor,
+    workspace,
     configPath: path.join(root, 'config.json'),
   } satisfies ServerOptions)
   if (!server.listening) await once(server, 'listening')
