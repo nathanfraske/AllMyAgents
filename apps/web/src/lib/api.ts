@@ -386,6 +386,7 @@ export interface ApiError {
 
 // Danger Zone toggles — safe-default guardrail switches (all default false / OFF).
 export interface DangerFlags {
+  disableWorktreeCollisionWarnings?: boolean
   busCanUseRiskyTools: boolean
   autoApprovePractices: boolean
   autoApproveRestart?: boolean

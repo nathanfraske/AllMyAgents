@@ -46,6 +46,7 @@ function journalIn(dir: string): Journal {
 }
 
 const ALL_ON: DangerFlags = {
+  disableWorktreeCollisionWarnings: true,
   busCanUseRiskyTools: true,
   autoApprovePractices: true,
   autoApproveRestart: true,
@@ -81,6 +82,7 @@ describe('persistDanger', () => {
     const dir = tmp()
     const configPath = path.join(dir, 'config.json')
     const allOff: DangerFlags = {
+      disableWorktreeCollisionWarnings: false,
       busCanUseRiskyTools: false,
       autoApprovePractices: false,
       autoApproveRestart: false,

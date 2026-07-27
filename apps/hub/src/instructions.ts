@@ -105,6 +105,17 @@ function stripRegion(text: string, begin: string, end: string): string {
   return text.replace(new RegExp(`${escapeRegExp(begin)}[\\s\\S]*?${escapeRegExp(end)}\\n*`), '')
 }
 
+/**
+ * True only when an instruction file consists entirely of blocks materialized by this hub. Collision
+ * detection uses this to avoid attributing the hub's own identical CLAUDE.md/AGENTS.md writes to agents.
+ * A repository instruction file with any preserved user content returns false and remains detectable.
+ */
+export function isSolelyHubManagedInstructions(text: string): boolean {
+  const hasManagedRegion = text.includes(OP_BEGIN) || text.includes(PRACTICE_BEGIN)
+  if (!hasManagedRegion) return false
+  return stripRegion(stripRegion(text, OP_BEGIN, OP_END), PRACTICE_BEGIN, PRACTICE_END).trim() === ''
+}
+
 function fileFor(provider: 'claude' | 'codex'): string {
   return provider === 'claude' ? 'CLAUDE.md' : 'AGENTS.md'
 }

@@ -204,6 +204,11 @@ export interface HubPrefs {
  */
 export interface DangerConfig {
   /**
+   * Opt out of live worktree collision warnings. Default OFF (safe): when two active agents write the
+   * same file, the later writer gets one direct steer naming the other agent and path.
+   */
+  disableWorktreeCollisionWarnings?: boolean
+  /**
    * Allow risky in-process tools (agent practice writes above account scope — and, in a later slice,
    * hook proposals) to run on BUS turns (turns caused by a semi-trusted teammate message). Default
    * OFF: a teammate's message can never drive a persistence-class write.
@@ -240,6 +245,8 @@ export interface DangerConfig {
 
 /** Resolved Danger Zone flags (both always present; index.ts fills defaults from DangerConfig). */
 export interface DangerFlags {
+  // default OFF (absent means false) keeps collision warnings enabled.
+  disableWorktreeCollisionWarnings?: boolean
   busCanUseRiskyTools: boolean
   autoApprovePractices: boolean
   // default OFF → restart_hub waits on operator approval
