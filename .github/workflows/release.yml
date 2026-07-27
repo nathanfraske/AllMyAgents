@@ -168,6 +168,73 @@ jobs:
             echo "::warning title=No updater signing key::TAURI_SIGNING_PRIVATE_KEY is not set. This release will ship installers with NO signed updater artifacts and NO latest.json, so no installed build can auto-update from it. See the OPERATOR SETUP #1 header in .github/workflows/release.yml."
           fi
 
+      # REFUSE TO PUBLISH A RELEASE NOBODY CAN RECEIVE.
+      #
+      # The Tauri updater compares the `version` field in latest.json against the INSTALLED app version.
+      # It does not look at the git tag. So cutting `v0.1.4-alpha.6` while tauri.conf.json still says
+      # "0.1.4" produces a release that every installed 0.1.4 client evaluates as "same version, nothing
+      # to do" — and is offered nothing, forever. Nothing errors. The release page looks perfect. The
+      # fleet simply never moves, and you find out weeks later when a fix you shipped is missing.
+      #
+      # This already nearly happened: alpha.5 published 0.1.4, and the next cut would have published
+      # 0.1.4 again. The release body has said "provided the app version increases" since day one, which
+      # documents the requirement without enforcing it — and a documented invariant with no guard is a
+      # convention, not an invariant.
+      #
+      # Fatal rather than a warning, unlike the signing-key check above. An unsigned smoke build is a
+      # thing an operator may genuinely want; a release the fleet cannot see is never the goal. Set the
+      # repo variable ALLOW_NON_INCREASING_VERSION=1 to override — the guard is escapable, not absolute.
+      - name: Refuse a non-increasing app version
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          ALLOW: ${{ vars.ALLOW_NON_INCREASING_VERSION }}
+        run: |
+          NEW=$(node -p "require('./apps/desktop/src-tauri/tauri.conf.json').version")
+          CARGO=$(node -e "const fs=require('fs');const m=fs.readFileSync('apps/desktop/src-tauri/Cargo.toml','utf8').match(/^version = \"([^\"]+)\"/m);console.log(m?m[1]:'')")
+          echo "tauri.conf.json : $NEW"
+          echo "Cargo.toml      : $CARGO"
+          echo "tag             : $TAG"
+
+          # A split version is its own silent failure: the bundle takes one and the binary reports the other.
+          if [ "$NEW" != "$CARGO" ]; then
+            echo "::error title=Version mismatch::tauri.conf.json says '$NEW' but Cargo.toml says '$CARGO'. They must match."
+            exit 1
+          fi
+
+          # The tag is what humans read; the version is what the updater obeys. If they disagree, whoever
+          # cut the release believes something false about what it will do.
+          case "$TAG" in
+            v"$NEW"|v"$NEW"-*) ;;
+            *)
+              echo "::error title=Tag does not match version::Tag '$TAG' does not correspond to app version '$NEW'. Expected v$NEW or v$NEW-<suffix>."
+              exit 1 ;;
+          esac
+
+          PUB=$(curl -sSfL --max-time 30 "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/latest.json" 2>/dev/null \
+                | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).version||'')}catch{console.log('')}})" || true)
+
+          if [ -z "$PUB" ]; then
+            echo "No published latest.json yet — first signed release, nothing to compare against."
+            exit 0
+          fi
+          echo "currently published: $PUB"
+
+          # Strict greater-than. Equal is the exact failure this guard exists for, so equal must fail.
+          if node -e "
+            const cmp=(a,b)=>{const p=s=>s.split('-')[0].split('.').map(Number);const[x,y]=[p(a),p(b)];
+            for(let i=0;i<3;i++){if((x[i]||0)!==(y[i]||0))return (x[i]||0)>(y[i]||0)?1:-1}return 0};
+            process.exit(cmp(process.argv[1],process.argv[2])>0?0:1)" "$NEW" "$PUB"; then
+            echo "OK: $NEW > $PUB — installed clients will be offered this update."
+          else
+            if [ "$ALLOW" = "1" ]; then
+              echo "::warning title=Non-increasing version allowed::$NEW is not greater than published $PUB, but ALLOW_NON_INCREASING_VERSION=1. Installed clients will NOT auto-update to this release."
+            else
+              echo "::error title=Version would not reach the fleet::App version '$NEW' is not greater than the currently published '$PUB'. The Tauri updater compares this field, NOT the git tag, so every installed client would see no update and stay where it is. Bump the version in apps/desktop/src-tauri/tauri.conf.json AND Cargo.toml, then re-tag. To publish anyway, set repo variable ALLOW_NON_INCREASING_VERSION=1."
+              exit 1
+            fi
+          fi
+
       # Forward ONLY the signing secrets that actually exist.
       #
       # This step is here because of a real failure. The signing vars used to be listed directly in the
