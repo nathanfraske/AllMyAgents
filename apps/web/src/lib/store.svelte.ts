@@ -1,4 +1,4 @@
-import { api, HUB_WS, getHubToken, setHubToken } from './api'
+import { api, bootstrapDesktopHubToken, HUB_WS, getHubToken, setHubToken } from './api'
 import { settings } from './settings.svelte'
 import { alertDialog } from './dialog.svelte'
 import {
@@ -578,13 +578,17 @@ export class HubStore {
     // This is deliberately the very first statement for that reason.
     this.autoRestorePending = settings.autoReopenLastChats
     // If the hub enforces a device token and we don't hold a valid one, gate on pairing first.
-    const auth = await api.auth().catch(() => ({ requireToken: false, authed: true }))
-    if (auth.requireToken && !auth.authed && !getHubToken()) {
+    await bootstrapDesktopHubToken()
+    const auth = await api.auth().catch(() => null)
+    if (!auth) {
+      setTimeout(() => void this.init(), 1000)
+      return
+    }
+    if (!auth.authed) {
       vlog('init: needs pairing — stop')
       this.needsPairing = true
       return
     }
-    await api.mesh().catch(() => undefined) // bootstrap: capture the token while the hub hands it out
     // OPTIONAL SIDE DATA MUST NEVER STOP THE SOCKET FROM BEING CREATED.
     //
     // These bootstrap awaits used to be uncaught, and connect() — the ONLY place the WebSocket is ever

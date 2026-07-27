@@ -129,7 +129,27 @@
   }
 
   let revealToken = $state(false)
+  let revealedToken = $state('')
   let copied = $state(false)
+  async function loadDeviceToken(): Promise<string> {
+    if (revealedToken) return revealedToken
+    const result = await api.revealDeviceToken()
+    if ('error' in result || !result.token) {
+      writeError =
+        ('error' in result && result.error) || 'Could not reveal device token'
+      return ''
+    }
+    revealedToken = result.token
+    writeError = ''
+    return revealedToken
+  }
+  async function toggleTokenReveal(): Promise<void> {
+    if (revealToken) {
+      revealToken = false
+      return
+    }
+    revealToken = Boolean(await loadDeviceToken())
+  }
   async function copyToken(t: string | undefined): Promise<void> {
     if (!t) return
     try {
@@ -507,20 +527,14 @@
           {/if}
         </div>
         <p class="hint dim">Rides your AllMyStuff mesh as a "site" (no Tailscale). The hub always stays on loopback — the local node tunnels it to your own devices, which need no grant.</p>
-        {#if mesh.token}
-          <div class="token-row">
+        <div class="token-row">
             <span class="tlabel dim">Device token</span>
-            <code class="cmd token">{revealToken ? mesh.token : '•'.repeat(28)}</code>
-            <button class="btn" onclick={() => (revealToken = !revealToken)}>{revealToken ? 'hide' : 'show'}</button>
-            <button class="btn" onclick={() => copyToken(mesh?.token)}>{copied ? 'copied' : 'copy'}</button>
-          </div>
-        {/if}
+            <code class="cmd token">{revealToken ? revealedToken : '•'.repeat(28)}</code>
+            <button class="btn" onclick={toggleTokenReveal}>{revealToken ? 'hide' : 'show'}</button>
+            <button class="btn" onclick={async () => copyToken(await loadDeviceToken())}>{copied ? 'copied' : 'copy'}</button>
+        </div>
         <p class="hint dim">
-          {#if mesh.requireToken}
-            Token <b>required</b> for every request. Pair a phone or another PC by entering this token there once.
-          {:else}
-            Token enforcement is <b>off</b> — devices reach the hub freely on your fleet. Turn it on (set <code>security.requireToken</code> in <code>data/config.json</code> or run with <code>HUB_REQUIRE_TOKEN=1</code>, then restart the hub) before exposing to anything you don't fully trust; devices already connected keep working.
-          {/if}
+          Token <b>required</b> for every request. Pair a phone or another PC by entering this token there once.
         </p>
       {:else}
         <p class="dim">Checking mesh…</p>

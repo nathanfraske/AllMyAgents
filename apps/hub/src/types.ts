@@ -207,9 +207,8 @@ export interface MeshConfig {
 
 export interface SecurityConfig {
   /**
-   * Require a device token on every /api + /ws request. Off by default (pure-loopback local use
-   * is fine behind the origin guard); turn it on for fleet/remote exposure — a genuinely remote
-   * device must then present the token to reach the hub. See deviceToken.ts.
+   * Legacy key retained for config-file compatibility. Authentication is now always required;
+   * `false` no longer disables the operator control-plane boundary.
    */
   requireToken?: boolean
 }

@@ -23,6 +23,7 @@
 // endpoint would let an outside agent use the real bus tools instead of poll-and-diff over HTTP.
 
 import fs from 'node:fs'
+import path from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 
 const argv = process.argv.slice(2)
@@ -38,6 +39,15 @@ const positional = argv.filter((a, i) => {
 })
 const BASE = `http://127.0.0.1:${PORT}`
 
+function tokenPathFor(port) {
+  if (process.env.HUB_DEVICE_TOKEN_FILE) return process.env.HUB_DEVICE_TOKEN_FILE
+  if (process.env.HUB_DATA_DIR) return path.join(process.env.HUB_DATA_DIR, 'device-token.txt')
+  if (process.env.SANDBOX_DIR) return path.join(process.env.SANDBOX_DIR, 'data', 'device-token.txt')
+  return port === '7777' ? 'data/device-token.txt' : '.sandbox/data/device-token.txt'
+}
+const DEVICE_TOKEN =
+  process.env.HUB_DEVICE_TOKEN ?? fs.readFileSync(tokenPathFor(PORT), 'utf8').trim()
+
 const die = (m) => {
   console.error(`error: ${m}`)
   process.exit(1)
@@ -46,7 +56,10 @@ const die = (m) => {
 async function api(method, path, body) {
   const res = await fetch(`${BASE}${path}`, {
     method,
-    headers: body === undefined ? {} : { 'content-type': 'application/json' },
+    headers: {
+      authorization: `Bearer ${DEVICE_TOKEN}`,
+      ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+    },
     body: body === undefined ? undefined : JSON.stringify(body),
   })
   const text = await res.text()

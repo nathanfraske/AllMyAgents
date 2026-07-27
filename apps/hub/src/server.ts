@@ -495,7 +495,7 @@ export function startServer(opts: ServerOptions): http.Server {
       const authed = tokenMatches(deviceToken, bearerToken(req))
       // Public probe so an unpaired client can learn whether pairing is required (never gated).
       if (method === 'GET' && url.pathname === '/api/auth') {
-        json(res, { requireToken, authed })
+        json(res, { requireToken: true, authed })
         return
       }
       // Public health probe — the supervisor health-checks a booting green hub with this before any
@@ -536,8 +536,10 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, typeof result === 'string' ? { text: result } : { result })
         return
       }
-      // Device-token gate (opt-in). When on, every /api call must present a valid token.
-      if (requireToken && !authed && url.pathname.startsWith('/api/')) {
+      // The hub API is an operator control plane, even on loopback: local vendor agents are untrusted
+      // callers. Every API read and mutation therefore requires the device capability. `/api/auth`,
+      // `/api/health`, and the independently-authenticated internal bridge are handled above.
+      if (!authed && url.pathname.startsWith('/api/')) {
         json(res, { error: 'device token required', requireToken: true }, 401)
         return
       }
@@ -955,11 +957,14 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, computeStats(journal.db, projects))
         return
       }
-      // Mesh site status — lets the UI show the address other fleet PCs use to reach this hub.
-      // Includes the device token when the caller is local/authed, so it can be copied to pair
-      // another device (withheld from unauthenticated callers once enforcement is on).
+      // Mesh status never carries the device capability. Pairing disclosure is a separate,
+      // authenticated POST initiated by an operator click in Settings.
       if (method === 'GET' && url.pathname === '/api/mesh') {
-        json(res, { ...mesh.status(), requireToken, token: !requireToken || authed ? deviceToken : undefined })
+        json(res, { ...mesh.status(), requireToken: true })
+        return
+      }
+      if (method === 'POST' && url.pathname === '/api/device-token/reveal') {
+        json(res, { token: deviceToken })
         return
       }
       // Unified-across-mesh fleet roster (read-only, first cut — docs/mesh-unified-fleet.md). Always
@@ -1426,9 +1431,8 @@ export function startServer(opts: ServerOptions): http.Server {
     verifyClient: (info: { origin?: string; req: http.IncomingMessage }) => {
       if (!originAllowed(info.origin)) return false
       if (!hostAllowed(info.req.headers.host)) return false
-      if (!requireToken) return true
       const wsUrl = new URL(info.req.url ?? '/ws', 'http://localhost')
-      return tokenMatches(deviceToken, wsUrl.searchParams.get('token') ?? undefined)
+      return tokenMatches(deviceToken, wsUrl.searchParams.get('token') ?? bearerToken(info.req))
     },
   })
   wss.on('connection', (ws, req) => {

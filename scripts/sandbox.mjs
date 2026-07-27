@@ -29,7 +29,9 @@ import { fileURLToPath } from 'node:url'
 
 const REPO = path.resolve(fileURLToPath(import.meta.url), '..', '..')
 const HUB = path.join(REPO, 'apps', 'hub')
-const ROOT = process.env.SANDBOX_DIR ?? path.join(REPO, '.sandbox')
+// Resolve before handing this path to hubctl: the launcher runs from REPO while the supervised hub runs
+// from apps/hub. A relative override otherwise splits pid/log state from the hub's token/database.
+const ROOT = path.resolve(process.env.SANDBOX_DIR ?? path.join(REPO, '.sandbox'))
 const DATA = path.join(ROOT, 'data')
 const PROFILES = path.join(ROOT, 'profiles')
 const PIDFILE = path.join(ROOT, 'hubctl.pid')
@@ -242,7 +244,12 @@ async function app() {
       cwd: REPO,
       stdio: 'inherit',
       shell: process.platform === 'win32',
-      env: { ...process.env, HUB_URL: `http://127.0.0.1:${PORT}` },
+      env: {
+        ...process.env,
+        HUB_URL: `http://127.0.0.1:${PORT}`,
+        HUB_DATA_DIR: DATA,
+        HUB_DEVICE_TOKEN: fs.readFileSync(path.join(DATA, 'device-token.txt'), 'utf8').trim(),
+      },
     }
   )
   await new Promise((resolve) => child.on('exit', resolve))
