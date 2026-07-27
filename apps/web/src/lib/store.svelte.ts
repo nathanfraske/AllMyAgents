@@ -605,8 +605,11 @@ export class HubStore {
     }
   }
 
-  async rescanProfiles(): Promise<void> {
-    this.profiles = await api.rescanProfiles()
+  async rescanProfiles(): Promise<{ error?: string }> {
+    const result = await api.rescanProfiles()
+    if ('error' in result) return result
+    this.profiles = result
+    return {}
   }
 
   lastProfileId = $state<string | null>(null)

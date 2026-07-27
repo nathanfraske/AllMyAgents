@@ -8,6 +8,7 @@
   import { updater, updatesSupported } from './updater.svelte'
 
   let { onclose }: { onclose: () => void } = $props()
+  let writeError = $state('')
 
   // Mesh remote-access status (loaded once; refreshed after a toggle).
   let mesh = $state<MeshStatus | null>(null)
@@ -18,7 +19,11 @@
   async function toggleMesh(on: boolean): Promise<void> {
     meshBusy = true
     try {
-      mesh = await api.setMesh(on)
+      const result = await api.setMesh(on)
+      if ('enabled' in result) {
+        mesh = result
+        writeError = ''
+      } else writeError = result.error
     } finally {
       meshBusy = false
     }
@@ -37,7 +42,13 @@
     instrContent = instructions.find((i) => i.scope === scope)?.content ?? ''
   })
   async function saveInstructions(): Promise<void> {
-    instructions = await api.setInstructions(instrScope, instrContent)
+    const result = await api.setInstructions(instrScope, instrContent)
+    if ('error' in result) {
+      writeError = result.error
+      return
+    }
+    instructions = result
+    writeError = ''
     instrSaved = true
     setTimeout(() => (instrSaved = false), 1400)
   }
@@ -54,7 +65,12 @@
     void api.practices().then((p) => (practices = p)).catch(() => (practices = []))
   })
   async function setDanger(patch: Partial<DangerFlags>): Promise<void> {
-    danger = await api.setDanger(patch)
+    const result = await api.setDanger(patch)
+    if ('error' in result) writeError = result.error
+    else {
+      danger = result
+      writeError = ''
+    }
   }
   async function revokePractice(id: string): Promise<void> {
     await api.revokePractice(id)
@@ -79,7 +95,7 @@
     restartState = 'restarting'
     restartMsg = 'restarting… (the app reconnects automatically)'
     const r = await api.restartHub()
-    if (r.error) {
+    if ('error' in r) {
       restartState = 'error'
       restartMsg = r.error
     } else {
@@ -119,8 +135,19 @@
 
   async function rescan(): Promise<void> {
     rescanning = true
-    await store.rescanProfiles()
+    const result = await store.rescanProfiles()
+    if (result.error) {
+      loginState = 'error'
+      loginMsg = result.error
+    } else {
+      writeError = ''
+    }
     rescanning = false
+  }
+
+  async function setPrefs(patch: Partial<HubPrefs>): Promise<void> {
+    const result = await store.setPrefs(patch)
+    writeError = result.error ?? ''
   }
 
   // One-click login: opens a terminal/browser on the hub, then waits for the account to
@@ -140,9 +167,10 @@
     try {
       const r = await api.login(addProvider, name)
       if (r.ok) {
+        const scan = await store.rescanProfiles()
+        if (scan.error) throw new Error(scan.error)
         loginState = 'done'
         loginMsg = `Added ${r.added ?? name}. It now appears in your accounts.`
-        await store.rescanProfiles()
         addName = ''
       } else {
         loginState = 'error'
@@ -220,6 +248,7 @@
   </div>
 
   <div class="body">
+    {#if writeError}<p class="status error write-error">{writeError}</p>{/if}
     <section>
       <h3>Accounts</h3>
       <div class="accounts">
@@ -279,13 +308,13 @@
         </select>
       </label>
       <label class="opt row2">Name new chats after
-        <select value={store.prefs.chatNamePool} onchange={(e) => void store.setPrefs({ chatNamePool: (e.target as HTMLSelectElement).value as HubPrefs['chatNamePool'] })}>
+        <select value={store.prefs.chatNamePool} onchange={(e) => void setPrefs({ chatNamePool: (e.target as HTMLSelectElement).value as HubPrefs['chatNamePool'] })}>
           <option value="women">Women in computing and science</option>
           <option value="everyone">Everyone</option>
         </select>
       </label>
       <p class="hint dim">New chats get a scientist's surname (Hopper, Curie, Turing) drawn from the pool you pick here. Chats already named keep their names.</p>
-      <label class="opt"><input type="checkbox" checked={store.prefs.steerMessagesAtToolBoundary} onchange={(e) => void store.setPrefs({ steerMessagesAtToolBoundary: (e.target as HTMLInputElement).checked })} /> Send new messages into a running turn at its next tool call</label>
+      <label class="opt"><input type="checkbox" checked={store.prefs.steerMessagesAtToolBoundary} onchange={(e) => void setPrefs({ steerMessagesAtToolBoundary: (e.target as HTMLInputElement).checked })} /> Send new messages into a running turn at its next tool call</label>
       <label class="opt"><input type="checkbox" checked={settings.defaultUseWorktree} onchange={(e) => settings.set('defaultUseWorktree', (e.target as HTMLInputElement).checked)} /> New chats in a project use an isolated git worktree (off = work directly in the project folder)</label>
       <label class="opt"><input type="checkbox" checked={settings.autoSwitchToNewChat} onchange={(e) => settings.set('autoSwitchToNewChat', (e.target as HTMLInputElement).checked)} /> Switch to the new chat when you send its first message (off = stay on the chat you were viewing)</label>
       <label class="opt"><input type="checkbox" checked={settings.autoReopenLastChats} onchange={(e) => settings.set('autoReopenLastChats', (e.target as HTMLInputElement).checked)} /> Reopen the chats I had open when the app starts (off = show the home screen with a Reopen button)</label>
@@ -499,6 +528,7 @@
   .status.waiting { color: var(--warn); }
   .status.done { color: var(--ok); }
   .status.error { color: var(--bad-text); }
+  .write-error { margin: 0; }
   .opt { display: flex; align-items: center; gap: var(--space-3); margin-bottom: var(--space-3); }
   .opt.budget { flex-wrap: wrap; }
   .opt.budget input { width: 6rem; margin-left: auto; }

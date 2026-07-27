@@ -354,7 +354,14 @@ export class CodexClient {
   }
 
   async sendTurn(threadId: string, text: string, opts: CodexTurnOptions = {}): Promise<void> {
-    const params: Record<string, unknown> = { threadId, input: [{ type: 'text', text }] }
+    // Codex may otherwise complete reasoning items with empty summary/content arrays, leaving the
+    // operator no explanation for a long reasoning phase. `summary` is the app-server's sticky
+    // turn/start override (ReasoningSummary = auto|concise|detailed|none).
+    const params: Record<string, unknown> = {
+      threadId,
+      input: [{ type: 'text', text }],
+      summary: 'auto',
+    }
     if (opts.model) params.model = opts.model
     if (opts.effort) params.effort = opts.effort
     if (opts.serviceTier) params.serviceTier = opts.serviceTier

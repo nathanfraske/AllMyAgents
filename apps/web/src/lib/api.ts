@@ -355,6 +355,10 @@ export interface HubPrefs {
   steerMessagesAtToolBoundary: boolean
 }
 
+export interface ApiError {
+  error: string
+}
+
 // Danger Zone toggles — safe-default guardrail switches (all default false / OFF).
 export interface DangerFlags {
   busCanUseRiskyTools: boolean
@@ -399,7 +403,7 @@ export interface CompactResult {
 export const api = {
   profiles: () => jget<ProfileInfo[]>('/api/profiles'),
   stats: () => jget<StatsResult>('/api/stats'),
-  rescanProfiles: () => jpost<ProfileInfo[]>('/api/profiles/rescan'),
+  rescanProfiles: () => jpost<ProfileInfo[] | ApiError>('/api/profiles/rescan'),
   login: (provider: 'claude' | 'codex', name: string) =>
     jpost<LoginResult>('/api/accounts/login', { provider, name }),
   pickFolder: () => jpost<{ path: string }>('/api/pick-folder'),
@@ -423,7 +427,7 @@ export const api = {
     jget<HistoryPage>(`/api/sessions/${id}/history${before != null ? `?before=${before}` : ''}`),
   approvals: () => jget<ApprovalRecord[]>('/api/approvals'),
   usage: () => jget<UsageSnapshot[]>('/api/usage'),
-  refreshUsage: () => jpost<UsageSnapshot[]>('/api/usage/refresh'),
+  refreshUsage: () => jpost<UsageSnapshot[] | ApiError>('/api/usage/refresh'),
   spawn: (body: Record<string, unknown>) => jpost<SessionRecord | { error: string }>('/api/sessions', body),
   send: (id: string, text: string, extra: Record<string, unknown> = {}) =>
     jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/input`, { text, ...extra }),
@@ -439,13 +443,14 @@ export const api = {
   // bus-reachable). Fixes stop() being a permanent one-way brick.
   reopen: (id: string) => jpost<{ ok?: boolean; status?: string; error?: string }>(`/api/sessions/${id}/reopen`),
   deleteSession: (id: string) => jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/delete`),
-  setMode: (id: string, permissionMode: string) => jpost(`/api/sessions/${id}/mode`, { permissionMode }),
+  setMode: (id: string, permissionMode: string) =>
+    jpost<{ ok: boolean } | ApiError>(`/api/sessions/${id}/mode`, { permissionMode }),
   /** "Always allow this tool in this chat" (allow=false revokes). Takes effect on the next tool call. */
   allowTool: (id: string, toolName: string, allow = true) =>
-    jpost<SessionRecord>(`/api/sessions/${id}/allow-tool`, { toolName, allow }),
+    jpost<SessionRecord | ApiError>(`/api/sessions/${id}/allow-tool`, { toolName, allow }),
   /** Persist a per-chat model / thinking effort / service tier immediately (survives reload + restart). */
   setSettings: (id: string, patch: { model?: string; effort?: string; serviceTier?: string }) =>
-    jpost<SessionRecord>(`/api/sessions/${id}/settings`, patch),
+    jpost<SessionRecord | ApiError>(`/api/sessions/${id}/settings`, patch),
   // Typed so a caller can tell an accepted decision (200 { ok:true }) from a 404/401/network failure
   // ({ error }) — the approval UI must NOT clear a pending prompt it never actually resolved.
   decide: (id: string, approve: boolean) => jpost<{ ok?: boolean; error?: string }>(`/api/approvals/${id}`, { approve }),
@@ -454,10 +459,11 @@ export const api = {
     if (m.token) setHubToken(m.token) // bootstrap: capture the token while the hub still hands it out
     return m
   },
-  setMesh: (enable: boolean) => jpost<MeshStatus>('/api/mesh', { enable }),
+  setMesh: (enable: boolean) => jpost<MeshStatus | ApiError>('/api/mesh', { enable }),
   auth: () => jget<{ requireToken: boolean; authed: boolean }>('/api/auth'),
   instructions: () => jget<Instruction[]>('/api/instructions'),
-  setInstructions: (scope: string, content: string) => jpost<Instruction[]>('/api/instructions', { scope, content }),
+  setInstructions: (scope: string, content: string) =>
+    jpost<Instruction[] | ApiError>('/api/instructions', { scope, content }),
   rename: (id: string, title: string) => jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/title`, { title }),
   memory: (scope?: string) => jget<Memory[]>(`/api/memory${scope ? `?scope=${encodeURIComponent(scope)}` : ''}`),
   searchMemory: (q: string, scope?: string) =>
@@ -469,12 +475,12 @@ export const api = {
   revokePractice: (id: string) => jpost<{ ok?: boolean; error?: string }>(`/api/practices/${id}/revoke`),
   // Owner preferences (hub-side settings that are not safety switches).
   prefs: () => jget<HubPrefs>('/api/config/prefs'),
-  setPrefs: (patch: Partial<HubPrefs>) => jpost<HubPrefs | { error: string }>('/api/config/prefs', patch),
+  setPrefs: (patch: Partial<HubPrefs>) => jpost<HubPrefs | ApiError>('/api/config/prefs', patch),
   // Danger Zone toggles.
   danger: () => jget<DangerFlags>('/api/config/danger'),
-  setDanger: (patch: Partial<DangerFlags>) => jpost<DangerFlags>('/api/config/danger', patch),
+  setDanger: (patch: Partial<DangerFlags>) => jpost<DangerFlags | ApiError>('/api/config/danger', patch),
   // Operator "Restart hub" — forwards to the supervisor (202 accepted); 503 {error} when unsupervised.
-  restartHub: () => jpost<{ accepted?: boolean; error?: string }>('/api/restart', { reason: 'operator' }),
+  restartHub: () => jpost<{ accepted?: boolean } | ApiError>('/api/restart', { reason: 'operator' }),
   bus: (opts: { project?: string; session?: string } = {}) => {
     const p = new URLSearchParams()
     if (opts.project) p.set('project', opts.project)
