@@ -9,6 +9,7 @@
     orientationBrief: string
     operatorTask: string
     standingInstructions: string
+    canApproveChildren: boolean
     maxLiveChildren: number
     delegation: Array<'commit' | 'push'>
     allowedTools: string[]
@@ -74,6 +75,7 @@
   let orientationBrief = $state('')
   let operatorTask = $state('')
   let standingInstructions = $state('')
+  let canApproveChildren = $state(true)
   let briefTouched = $state(false)
   let standingTouched = $state(false)
   let busy = $state(false)
@@ -113,8 +115,9 @@
       `ROLE\nYou are a project manager in AllMyAgents. You run a team of real AllMyAgents chats on the operator’s behalf: decompose the task, delegate bounded work, watch progress and collisions, and act on what you learn. This full starting prompt is your manager brief; OPERATOR TASK at the end is the assignment to execute now.`,
       `PROJECT\nManage ${projectName} at ${projectPath}.\nWhat is already here: ${existing.length ? existing.join('; ') : 'no other project chats are running yet'}.`,
       `YOUR ALLMYAGENTS TOOLS\n- list_agents: see the project teammates you can address.\n- spawn_agent: create a real child chat in this app; it gets an isolated git worktree by default. Use an operator-defined agent_type when one fits.\n- child_status: get the live running / idle / stopped / errored tally without polling.\n- peek_agent: inspect a worker without interrupting it. For your own children you may request activity, full transcript, changes, approvals/blockers, worktree state, or all views.\n- set_child_authority: grant or revoke only the worker Git actions and exact tools inside your grant ceiling; changes apply to that worker’s next tool call.\n- send_message and read_messages: coordinate through the project bus. Prefer a direct message to one session; broadcast only when every project agent must act.\n- practice_write / practice_list / practice_read / practice_edit: manage durable team conventions that future agents should follow.\n- memory_write / memory_search / memory_read: retain and retrieve project facts and decisions.`,
+      `CHILD APPROVAL TOOL\n- decide_child_approval: approve or deny one pending request from your own direct child when child approvals are enabled. The hub refuses unrelated children and anything outside your operator-granted ceiling.`,
       `IMPORTANT — TOOL LAYERS\nUse the hub-provided AllMyAgents tools described above. The native Codex or Claude harness may also expose names such as spawn_agent and list_agents, but those native tools are not the AllMyAgents project layer and do not create the real app chats and worktrees you are managing. If names collide, choose the AllMyAgents hub tool.`,
-      `GRANTED BRIEF AND LIMITS\n- Grant ceiling means the maximum scope the operator gave you; every child grant must stay inside it.\n- At most ${maxLiveChildren} live direct children. The hub refuses an additional spawn at the bound.\n- Exact worker profile_id values you may pass to spawn_agent: ${workerScope.profiles.length ? workerScope.profiles.join(', ') : 'none'}.\n- Worker Git permissions you may grant: ${delegation.length ? authority : 'none'}.\n- Additional exact worker tools you may grant: ${allowedTools.length ? allowedTools.join(', ') : 'none'}.\n- Delegation only narrows: a manager cannot grant what it does not hold — including an authority, account, model, or tool.\n- You have full non-interfering visibility into your own children, and only those children.\n${roles.length ? `Worker roles (prefer their exact agent_type id when one fits):\n${roles.join('\n')}` : `No named worker roles are configured; call spawn_agent with profile_id "${workerScope.profiles[0] ?? 'unavailable'}" and its default model.`}`,
+      `GRANTED BRIEF AND LIMITS\n- Grant ceiling means the maximum scope the operator gave you; every child grant must stay inside it.\n- At most ${maxLiveChildren} live direct children. The hub refuses an additional spawn at the bound.\n- Exact worker profile_id values you may pass to spawn_agent: ${workerScope.profiles.length ? workerScope.profiles.join(', ') : 'none'}.\n- Worker Git permissions you may grant: ${delegation.length ? authority : 'none'}.\n- Additional exact worker tools you may grant: ${allowedTools.length ? allowedTools.join(', ') : 'none'}.\n- Child approval decisions: ${canApproveChildren ? 'enabled for your own direct children, within the same grant ceiling' : 'disabled; the operator answers pending approvals'}.\n- Delegation only narrows: a manager cannot grant what it does not hold — including an authority, account, model, or tool.\n- You have full non-interfering visibility into your own children, and only those children.\n${roles.length ? `Worker roles (prefer their exact agent_type id when one fits):\n${roles.join('\n')}` : `No named worker roles are configured; call spawn_agent with profile_id "${workerScope.profiles[0] ?? 'unavailable'}" and its default model.`}`,
       `OPERATING CADENCE\nTurn the operator task into bounded assignments with an expected output and a clear completion check. Spawn only useful parallel work. In each assignment, state the exact granted tools and require the worker to stay inside that envelope. At decision points use child_status; use peek_agent when status alone is insufficient. Verify a child’s transcript and worktree changes before relying on its result. If a child stalls, blocks, errors, exceeds scope, or collides: inspect it and send one direct corrective message. When it asks for an ungranted tool, redirect it to a granted alternative instead of widening authority or waiting; otherwise reassign or re-sequence when possible, and report any decision that needs the operator in this manager chat. Send one useful update per meaningful event rather than narrating every step. Finish with a concise report of each child’s final status, findings, files/commits changed, verification performed, and unresolved decisions.`,
       `OPERATOR TASK\nReplace this line with the task to begin, then start immediately.`,
     ].join('\n\n')
@@ -168,6 +171,7 @@
     operatorTask = ''
     orientationBrief = ''
     standingInstructions = ''
+    canApproveChildren = true
     briefTouched = false
     standingTouched = false
     error = ''
@@ -193,6 +197,7 @@
     orientationBrief = record.managerOrientationBrief ?? generatedOrientationBrief()
     operatorTask = record.managerOperatorTask ?? ''
     standingInstructions = record.managerStandingInstructions ?? defaultStandingInstructions()
+    canApproveChildren = record.managerCanApproveChildren ?? true
     briefTouched = Boolean(record.managerOrientationBrief)
     standingTouched = record.managerStandingInstructions !== undefined
     error = ''
@@ -356,6 +361,7 @@
       orientationBrief: orientationBrief.trim(),
       operatorTask: operatorTask.trim(),
       standingInstructions: standingInstructions.trim(),
+      canApproveChildren,
       maxLiveChildren,
       delegation: [...delegation],
       allowedTools: [...allowedTools],
@@ -439,6 +445,7 @@
         orientationBrief: config.orientationBrief,
         operatorTask: config.operatorTask,
         standingInstructions: config.standingInstructions,
+        canApproveChildren: config.canApproveChildren,
       })
       if ('error' in configured) throw new Error(configured.error)
       if (!wasActive) {
@@ -475,6 +482,7 @@
         orientationBrief: '',
         operatorTask: '',
         standingInstructions: '',
+        canApproveChildren: false,
       })
       if ('error' in configured) throw new Error(configured.error)
       store.upsertSessionRecord(configured)
@@ -744,6 +752,17 @@
       </div>
 
       <fieldset>
+        <legend>Worker approval decisions</legend>
+        <label class="approval-toggle">
+          <input type="checkbox" bind:checked={canApproveChildren} />
+          <span>
+            <b>Manager may answer its workers’ approvals</b>
+            <small>Direct children only, and only for actions inside the grant ceiling below. Every decision is journaled. Turn this off to keep approvals with the operator.</small>
+          </span>
+        </label>
+      </fieldset>
+
+      <fieldset>
         <legend>What the manager may grant to workers</legend>
         <div class="grant-state" class:on={delegation.length > 0}>
           <b>Worker Git grants: {delegation.length ? 'On' : 'Off'}</b>
@@ -792,6 +811,7 @@
           <dd>{#if scope.profiles.length}{scope.profiles.map(profileScope).join(' · ')}{:else}None chosen{/if}</dd>
         </div>
         <div><dt>Bound</dt><dd>{maxLiveChildren} live children</dd></div>
+        <div><dt>Worker approvals</dt><dd>{canApproveChildren ? 'manager may decide within this grant ceiling' : 'operator decides'}</dd></div>
         <div><dt>Worker Git grants</dt><dd>{delegationLabel()}</dd></div>
         <div><dt>Other worker grants</dt><dd>{allowedTools.length ? allowedTools.join(', ') : 'none'}</dd></div>
         <div>

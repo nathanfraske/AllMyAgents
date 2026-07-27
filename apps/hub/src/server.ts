@@ -1224,6 +1224,10 @@ export function startServer(opts: ServerOptions): http.Server {
           json(res, { error: 'standingInstructions must be text' }, 400)
           return
         }
+        if (body.canApproveChildren !== undefined && typeof body.canApproveChildren !== 'boolean') {
+          json(res, { error: 'canApproveChildren must be boolean' }, 400)
+          return
+        }
         if (rawDelegation.some((authority) => authority !== 'commit' && authority !== 'push')) {
           json(res, { error: 'delegation may contain only commit and push' }, 400)
           return
@@ -1248,6 +1252,7 @@ export function startServer(opts: ServerOptions): http.Server {
             orientationBrief: body.orientationBrief as string | undefined,
             operatorTask: body.operatorTask as string | undefined,
             standingInstructions: body.standingInstructions as string | undefined,
+            canApproveChildren: body.canApproveChildren as boolean | undefined,
           },
           'operator'
         )

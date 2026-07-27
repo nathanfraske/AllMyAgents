@@ -29,6 +29,7 @@ export type AutoApprovePolicy = (sessionId: string, kind: string, payload: unkno
 export class ApprovalService {
   private readonly pendingMap = new Map<string, PendingEntry>()
   private autoApprove: AutoApprovePolicy | undefined
+  private pendingListener: ((record: ApprovalRecord) => void) | undefined
   /** When this hub process started, bounding the resolved-before-crash recovery (see {@link request}). */
   private readonly bootAt = Date.now()
   /** Ids already served from a durable decision, so one recovery never becomes a standing grant. */
@@ -50,6 +51,10 @@ export class ApprovalService {
    */
   setAutoApprove(policy: AutoApprovePolicy): void {
     this.autoApprove = policy
+  }
+
+  setPendingListener(listener: (record: ApprovalRecord) => void): void {
+    this.pendingListener = listener
   }
 
   pending(): ApprovalRecord[] {
@@ -133,6 +138,14 @@ export class ApprovalService {
       this.finish(record.id, false, 'timeout')
     }, APPROVAL_TIMEOUT_MS)
     this.pendingMap.set(record.id, { record, resolve, timer, promise })
+    try {
+      this.pendingListener?.(record)
+    } catch (error) {
+      this.journal.append(record.sessionId, 'approval/pending-listener-error', {
+        id: record.id,
+        message: error instanceof Error ? error.message : String(error),
+      })
+    }
     return promise
   }
 

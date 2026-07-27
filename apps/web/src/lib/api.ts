@@ -120,6 +120,7 @@ export interface SessionRecord {
   managerOrientationBrief?: string
   managerOperatorTask?: string
   managerStandingInstructions?: string
+  managerCanApproveChildren?: boolean
   parentSessionId?: string
   delegatedAuthorities?: Array<'commit' | 'push'>
   delegatedTools?: string[]
@@ -698,6 +699,7 @@ export const api = {
       orientationBrief?: string
       operatorTask?: string
       standingInstructions?: string
+      canApproveChildren?: boolean
     }
   ) => jpost<SessionRecord | ApiError>(`/api/sessions/${id}/project-manager`, config),
   /** "Always allow this tool in this chat" (allow=false revokes). Takes effect on the next tool call. */

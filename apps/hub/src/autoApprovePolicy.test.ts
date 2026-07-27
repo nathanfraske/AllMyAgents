@@ -352,6 +352,7 @@ describe('project-manager delegated authority security boundary', () => {
         startingPrompt?: string
         operatorTask?: string
         standingInstructions?: string
+        canApproveChildren?: boolean
       },
       actor: 'operator' | 'agent'
     ): SessionRecord
@@ -365,6 +366,11 @@ describe('project-manager delegated authority security boundary', () => {
       managerSessionId: string,
       input: { profileId?: string; agentType?: string; prompt: string; model?: string }
     ): Promise<{ ok: boolean; sessionId?: string; error?: string }>
+    decideChildApproval(
+      managerSessionId: string,
+      approvalId: string,
+      approve: boolean
+    ): { ok: boolean; error?: string }
   }
 
   function controls(sessions: SessionManager): ManagerControls {
@@ -461,6 +467,112 @@ describe('project-manager delegated authority security boundary', () => {
     })).toBe(false)
   })
 
+  it('a manager cannot approve for a chat that is not its direct child', async () => {
+    const { sessions, seed } = makeSessions()
+    seed({
+      isProjectManager: true,
+      status: 'stopped',
+      managerCanApproveChildren: true,
+      managerAllowedTools: ['Bash'],
+    } as Partial<SessionRecord>)
+    seed({ id: 'unrelated', permissionMode: 'safe' } as Partial<SessionRecord>)
+    const approvals = (sessions as unknown as { approvals: ApprovalService }).approvals
+    const pending = approvals.request('unrelated', 'claude/tool', {
+      toolName: 'Bash',
+      input: { command: 'pnpm test' },
+    })
+    const approvalId = approvals.pending()[0]!.id
+
+    expect(controls(sessions).decideChildApproval('s1', approvalId, true)).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/direct child/i),
+    })
+    expect(approvals.pending()).toHaveLength(1)
+    approvals.resolve(approvalId, false)
+    await expect(pending).resolves.toBe(false)
+  })
+
+  it('a manager approval cannot exceed its operator-granted tool ceiling', async () => {
+    const { sessions, seed } = makeSessions()
+    seed({
+      isProjectManager: true,
+      status: 'stopped',
+      managerCanApproveChildren: true,
+      managerAllowedTools: ['Read'],
+    } as Partial<SessionRecord>)
+    seed({ id: 'child', parentSessionId: 's1', permissionMode: 'safe' } as Partial<SessionRecord>)
+    const approvals = (sessions as unknown as { approvals: ApprovalService }).approvals
+    const pending = approvals.request('child', 'claude/tool', {
+      toolName: 'Bash',
+      input: { command: 'pnpm test' },
+    })
+    const approvalId = approvals.pending()[0]!.id
+
+    expect(controls(sessions).decideChildApproval('s1', approvalId, true)).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/ceiling/i),
+    })
+    expect(approvals.pending()).toHaveLength(1)
+    approvals.resolve(approvalId, false)
+    await expect(pending).resolves.toBe(false)
+  })
+
+  it('a manager may approve once for its direct child inside the ceiling and the decision is audited', async () => {
+    const { sessions, seed } = makeSessions()
+    seed({
+      isProjectManager: true,
+      status: 'stopped',
+      managerCanApproveChildren: true,
+      managerAllowedTools: ['Bash'],
+    } as Partial<SessionRecord>)
+    seed({ id: 'child', parentSessionId: 's1', permissionMode: 'safe' } as Partial<SessionRecord>)
+    const internals = sessions as unknown as { approvals: ApprovalService; journal: Journal }
+    const pending = internals.approvals.request('child', 'claude/tool', {
+      toolName: 'Bash',
+      input: { command: 'pnpm test' },
+    })
+    const approvalId = internals.approvals.pending()[0]!.id
+
+    expect(controls(sessions).decideChildApproval('s1', approvalId, true)).toEqual({ ok: true })
+    await expect(pending).resolves.toBe(true)
+    expect(internals.journal.replay(0)).toContainEqual(expect.objectContaining({
+      sessionId: 's1',
+      kind: 'manager/child-approval-decided',
+      payload: expect.objectContaining({
+        childSessionId: 'child',
+        approvalId,
+        decision: 'approved',
+        toolName: 'Bash',
+      }),
+    }))
+  })
+
+  it('recognizes the exact inner Git command from a Codex PowerShell approval envelope', async () => {
+    const { sessions, seed } = makeSessions()
+    seed({
+      isProjectManager: true,
+      status: 'stopped',
+      managerCanApproveChildren: true,
+      managerDelegation: ['commit'],
+    } as Partial<SessionRecord>)
+    seed({
+      id: 'child',
+      provider: 'codex',
+      parentSessionId: 's1',
+      permissionMode: 'safe',
+    } as Partial<SessionRecord>)
+    const approvals = (sessions as unknown as { approvals: ApprovalService }).approvals
+    const pending = approvals.request('child', 'codex/item/commandExecution/requestApproval', {
+      command: '"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command \'git commit --allow-empty -m approval-demo\'',
+      commandActions: [{ type: 'unknown', command: 'git commit --allow-empty -m approval-demo' }],
+      toolName: 'commandExecution',
+    })
+    const approvalId = approvals.pending()[0]!.id
+
+    expect(controls(sessions).decideChildApproval('s1', approvalId, true)).toEqual({ ok: true })
+    await expect(pending).resolves.toBe(true)
+  })
+
   it('refuses a bounded spawn with a clear live-child-limit error', async () => {
     const { sessions, seed } = makeSessions()
     seed({
@@ -522,6 +634,7 @@ describe('project-manager delegated authority security boundary', () => {
       expect.objectContaining({ id: 'reviewer', profileId: 'p1', model: 'review-model', effort: 'high' }),
     ])
     expect(configured.managerStartingPrompt).toBe('Coordinate the release.')
+    expect(configured.managerCanApproveChildren).toBe(true)
 
     expect(() => controls(sessions).configureProjectManager(
       's1',

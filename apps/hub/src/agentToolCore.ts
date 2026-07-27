@@ -96,6 +96,12 @@ export interface AgentServices {
     authorities: DelegatedAuthority[],
     tools?: string[]
   ): Awaitable<{ ok: boolean; error?: string }>
+  /** Decide one currently-pending approval for the manager's own direct child, within its live ceiling. */
+  decideChildApproval?(
+    managerSessionId: string,
+    approvalId: string,
+    approve: boolean
+  ): Awaitable<{ ok: boolean; error?: string }>
   /** Operate the app-owned browser bound to this exact AllMyAgents session. */
   browser(
     sessionId: string,
@@ -325,6 +331,23 @@ const setChildAuthority = defineTool({
   },
 })
 
+const decideChildApproval = defineTool({
+  name: 'decide_child_approval',
+  description:
+    'Project managers only: approve or deny one pending approval for your own direct child. The hub enforces the operator toggle, exact direct parentage, and your live Git/tool ceiling; every decision is journaled.',
+  schema: {
+    approval_id: z.string().describe('pending approval id shown by a child report or peek_agent'),
+    approve: z.boolean().describe('true to approve once; false to deny'),
+  },
+  run: async (args, { identity, services }) => {
+    if (!services.decideChildApproval) return 'Not decided: this hub does not support manager approval decisions.'
+    const result = await services.decideChildApproval(identity.sessionId, args.approval_id, args.approve)
+    return result.ok
+      ? `${args.approve ? 'Approved' : 'Denied'} child approval ${args.approval_id}.`
+      : `Not decided: ${result.error ?? 'unknown error'}`
+  },
+})
+
 const memoryWrite = defineTool({
   name: 'memory_write',
   description:
@@ -518,6 +541,7 @@ export const AGENT_TOOLS: readonly AgentToolSpec[] = [
   childStatus,
   spawnAgent,
   setChildAuthority,
+  decideChildApproval,
   memoryWrite,
   memorySearch,
   memoryRead,

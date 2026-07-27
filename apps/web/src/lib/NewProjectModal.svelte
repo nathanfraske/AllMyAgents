@@ -314,6 +314,10 @@
         allowedTools: config.allowedTools,
         agentTypes: config.agentTypes,
         startingPrompt: config.startingPrompt,
+        orientationBrief: config.orientationBrief,
+        operatorTask: config.operatorTask,
+        standingInstructions: config.standingInstructions,
+        canApproveChildren: config.canApproveChildren,
       })
       if ('error' in configured) throw new Error(configured.error)
       store.upsertSessionRecord(configured)

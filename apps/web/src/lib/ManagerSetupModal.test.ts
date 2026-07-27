@@ -183,7 +183,7 @@ describe('Manager setup', () => {
     expect(prompt).toContain('Demo project')
     expect(prompt).toContain('C:/repo')
     expect(prompt).toMatch(/spawn_agent.*isolated.*worktree/is)
-    expect(prompt).toMatch(/child_status.*peek_agent.*set_child_authority/is)
+    expect(prompt).toMatch(/child_status.*peek_agent.*set_child_authority.*decide_child_approval/is)
     expect(prompt).toMatch(/send_message.*direct.*broadcast/is)
     expect(prompt).toMatch(/practice.*memory/is)
     expect(prompt).toMatch(/native.*spawn_agent.*not.*AllMyAgents/is)
@@ -199,7 +199,7 @@ describe('Manager setup', () => {
     store.managerSetupSessionId = null
     const onCreateProject = vi.fn()
     const onConfigured = vi.fn()
-    const { getByRole } = render(ManagerSetupModal, {
+    const { getByRole, getByLabelText } = render(ManagerSetupModal, {
       onclose: vi.fn(),
       embedded: true,
       deferLaunch: true,
@@ -207,6 +207,7 @@ describe('Manager setup', () => {
       onCreateProject,
       onConfigured,
     })
+    expect((getByLabelText(/manager may answer its workers’ approvals/i) as HTMLInputElement).checked).toBe(true)
     await fireEvent.click(getByRole('button', { name: /create a new project/i }))
     expect(onCreateProject).toHaveBeenCalledOnce()
     await fireEvent.click(getByRole('button', { name: /add to project launch/i }))
@@ -217,6 +218,7 @@ describe('Manager setup', () => {
         startingPrompt: expect.stringMatching(/Demo project/i),
         operatorTask: '',
         standingInstructions: expect.stringMatching(/real chat.*sidebar/is),
+        canApproveChildren: true,
         agentTypes: expect.any(Array),
       }),
     )

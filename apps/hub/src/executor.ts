@@ -94,6 +94,7 @@ export const AUTO_ALLOW_TOOLS = new Set([
   'mcp__allmyagents__child_status',
   'mcp__allmyagents__spawn_agent',
   'mcp__allmyagents__set_child_authority',
+  'mcp__allmyagents__decide_child_approval',
   'mcp__allmyagents__memory_write',
   'mcp__allmyagents__memory_search',
   'mcp__allmyagents__memory_read',
@@ -167,6 +168,11 @@ export interface InProcessExecutorHubHooks {
     authorities: Array<'commit' | 'push'>,
     tools?: string[]
   ): { ok: boolean; error?: string }
+  managerDecideChildApproval(
+    managerSessionId: string,
+    approvalId: string,
+    approve: boolean
+  ): { ok: boolean; error?: string }
   browser(
     sessionId: string,
     operation: 'navigate' | 'read' | 'screenshot' | 'status',
@@ -220,6 +226,8 @@ export class InProcessExecutor implements Executor {
       spawnAgent: (managerSessionId, input) => this.h.managerSpawn(managerSessionId, input),
       setChildAuthority: (managerSessionId, childSessionId, authorities, tools) =>
         this.h.managerSetChildAuthority(managerSessionId, childSessionId, authorities, tools),
+      decideChildApproval: (managerSessionId, approvalId, approve) =>
+        this.h.managerDecideChildApproval(managerSessionId, approvalId, approve),
       browser: (sessionId, operation, args) => this.h.browser(sessionId, operation, args),
       memory: this.services.memory,
       practices: this.services.practices,
