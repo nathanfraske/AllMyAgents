@@ -5,6 +5,7 @@
   import CodexActivityGroup from './CodexActivityGroup.svelte'
   import { groupCodexItems, type CodexRenderNode } from './codexGroup'
   import { classifyDecideOutcome } from './approvals'
+  import { distanceFromBottom, shouldShowJumpToBottom, newItemsBelow } from './transcriptScroll'
   import ContextMeter from './ContextMeter.svelte'
   import ModelPicker from './ModelPicker.svelte'
   import TraitsControl from './TraitsControl.svelte'
@@ -60,6 +61,12 @@
   let sendErr = $state('')
   let scroller = $state<HTMLDivElement | null>(null)
   let stick = $state(true)
+  // Jump-to-bottom affordance: `jumpAway` is whether the reader has scrolled meaningfully off the live
+  // end (a larger gate than `stick` — see transcriptScroll.ts); `anchorKey` is the last item present at
+  // the moment they scrolled away, so "N new" counts only what arrived below since (and survives older-
+  // history prepends and rollbacks). Both reset when the pane switches chats.
+  let jumpAway = $state(false)
+  let anchorKey = $state<string | null>(null)
   // `/` command picker: the textarea (for refocus after completion), the profile's on-disk custom
   // commands, the highlighted row, and an Escape-dismissal latch.
   let taRef = $state<HTMLTextAreaElement | null>(null)
@@ -218,7 +225,22 @@
 
   function onScroll(): void {
     if (!scroller) return
-    stick = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 60
+    const m = { scrollTop: scroller.scrollTop, scrollHeight: scroller.scrollHeight, clientHeight: scroller.clientHeight }
+    stick = distanceFromBottom(m) < 60 // unchanged 60px autoscroll gate
+    const away = shouldShowJumpToBottom(m)
+    jumpAway = away
+    // Anchor the "new" count to the last item the moment you scroll away; clear it once you're back down.
+    if (!away) anchorKey = null
+    else if (anchorKey === null) anchorKey = mainItems[mainItems.length - 1]?.key ?? null
+  }
+  const newBelow = $derived(newItemsBelow(mainItems.map((i) => i.key), anchorKey))
+  function jumpToBottom(): void {
+    if (!scroller) return
+    const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false
+    scroller.scrollTo({ top: scroller.scrollHeight, behavior: reduce ? 'auto' : 'smooth' })
+    stick = true
+    jumpAway = false
+    anchorKey = null
   }
 
   // --- Per-control action errors ----------------------------------------------------------------
@@ -234,10 +256,15 @@
     actionErr = { ...actionErr, [key]: out?.error ? `${label} failed: ${out.error}` : '' }
     return !out?.error
   }
-  // Stale errors belong to the chat that produced them — drop them when the pane points elsewhere.
+  // Switching the pane to another chat resets per-chat scroll/error UI: drop stale action errors, hide
+  // the jump affordance, and re-pin to the bottom so the incoming chat opens at its live end rather than
+  // inheriting the previous chat's scroll position.
   $effect(() => {
     sid // track
     actionErr = {}
+    jumpAway = false
+    anchorKey = null
+    stick = true
   })
 
   // Model / thinking-effort / tier picks WRITE THROUGH to the hub immediately for a real session, so the
@@ -602,6 +629,19 @@
   <AgentPanel items={view.items} sessionId={view.record.id} />
 
   <div class="composer-wrap">
+    <!-- Jump-to-bottom: floats just above the composer (never over it or the action-error slot). Shows
+         "N new" when a turn has streamed content below while you read history; a plain arrow otherwise. -->
+    {#if jumpAway}
+      <button
+        class="jumpbtn"
+        onclick={jumpToBottom}
+        title="Jump to the latest messages"
+        aria-label={newBelow > 0 ? `Jump to latest — ${newBelow} new below` : 'Jump to latest'}
+      >
+        <Icon name="chevron-down" size={14} />
+        {#if newBelow > 0}<span class="jumpcount">{newBelow > 99 ? '99+' : newBelow} new</span>{/if}
+      </button>
+    {/if}
     <!-- The agent's task board, directly above the chatbar. -->
     <TaskStrip items={view.items} />
 
@@ -759,7 +799,16 @@
     .thinking .dots i:nth-child(3) { animation-delay: 0.3s; }
     @keyframes tbounce { 0%, 60%, 100% { opacity: 0.35; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-3px); } }
   }
-  .composer-wrap { padding: 0.5rem 1rem 0.7rem; max-width: 900px; width: 100%; margin: 0 auto; }
+  .composer-wrap { position: relative; padding: 0.5rem 1rem 0.7rem; max-width: 900px; width: 100%; margin: 0 auto; }
+  /* Floats just above the composer-wrap's top edge (= the transcript's lower edge), centered — clear of
+     the composer and the action-error slot, both of which live lower inside this wrap. */
+  .jumpbtn { position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%); margin-bottom: 8px; z-index: 12;
+    display: inline-flex; align-items: center; gap: 0.3rem; padding: 0.28rem 0.6rem; border-radius: 999px;
+    background: var(--surface-2); border: 1px solid var(--border-strong); color: var(--text);
+    box-shadow: var(--shadow-3), var(--edge-hi); font-size: 0.74rem; }
+  .jumpbtn:hover { border-color: var(--accent); color: var(--text); }
+  .jumpcount { font-variant-numeric: tabular-nums; }
+  @media (prefers-reduced-motion: no-preference) { .jumpbtn { animation: pop-in var(--dur-fast) var(--ease); } }
   .approval { background: var(--surface); border: 1px solid var(--warn); border-radius: 10px; padding: 0.5rem 0.7rem; margin-bottom: 0.5rem; }
   .atop { display: flex; gap: 0.5rem; align-items: center; }
   .alabel { font-size: 0.66rem; letter-spacing: 0.08em; color: var(--warn); }
