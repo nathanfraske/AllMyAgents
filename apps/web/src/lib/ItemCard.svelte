@@ -37,18 +37,18 @@
     if (senders.length <= 2) return senders.join(' & ')
     return `${senders[0]} +${senders.length - 1}`
   }
-  // A teammate's vendor, resolved from their session record (the same source as their name). A full id
-  // (send/peek/bus) hits store.sessions directly; a frame header carries only an 8-char prefix, so fall
-  // back to a prefix match. undefined → no logo (a broadcast, or a teammate whose chat is gone).
-  function providerOf(id: string | undefined): 'claude' | 'codex' | undefined {
-    if (!id) return undefined
-    const direct = store.sessions[id]?.record.provider
-    if (direct === 'claude' || direct === 'codex') return direct
-    const hit = Object.values(store.sessions).find((v) => v.record.id.startsWith(id))?.record.provider
-    return hit === 'claude' || hit === 'codex' ? hit : undefined
-  }
+  // Names and vendor marks share the store's indexed full-id/prefix resolver. Ambiguous prefixes resolve
+  // to neither, so a collision can never put the wrong agent's name beside the wrong vendor logo.
+  const providerOf = (id: string | undefined) => id ? store.sessionProvider(id) : undefined
   const agentProvider = $derived(providerOf(agentAct?.counterpartyId))
   const busProvider = $derived(item.kind === 'bus' ? providerOf(item.busPeerId) : undefined)
+  const busPeerLabel = $derived(
+    item.kind === 'bus' && item.busPeerId
+      ? resolveName(item.busPeerId) ?? item.busPeer
+      : item.kind === 'bus'
+        ? item.busPeer
+        : undefined
+  )
   const frameProvider = $derived(busFrame && busFrame.senderIds.length === 1 ? providerOf(busFrame.senderIds[0]) : undefined)
 
   const longUser = $derived(
@@ -159,7 +159,7 @@
     <div class="agentact in">
       <button class="ahd" onclick={() => (detailOpen = !detailOpen)}>
         <span class="aarrow" aria-hidden="true">↓</span>
-        <span class="alabel">message received from {item.busPeer}</span>
+        <span class="alabel">message received from {busPeerLabel}</span>
         {#if busProvider}<span class="alogo"><ProviderLogo provider={busProvider} size={14} /></span>{/if}
         {#if item.busSubject}<span class="asubj">{item.busSubject}</span>{/if}
         {#if fmtTime(item.ts)}<span class="ts" title={new Date(item.ts).toLocaleString()}>{fmtTime(item.ts)}</span>{/if}

@@ -21,6 +21,7 @@
 
   const density = $derived(store.prefs.fileWriteDiffDensity ?? 'minimal')
   const expanded = $derived(expandedOverride ?? initialDiffExpanded(density))
+  const compact = $derived(density === 'minimal' && !expanded)
   const display = $derived(diffDisplay(diff, density, expanded))
   const shown = $derived(display.rows)
   const collapsible = $derived(display.canToggle)
@@ -70,6 +71,15 @@
           ? 'renamed'
           : ''
   )
+  const editVerb = $derived(
+    diff.status === 'added'
+      ? 'Created'
+      : diff.status === 'deleted'
+        ? 'Deleted'
+        : diff.status === 'renamed'
+          ? 'Renamed'
+          : 'Edited'
+  )
 
   // Clipboard write with a legacy execCommand fallback (mirrors CodeBlock.svelte).
   function execCopy(text: string): boolean {
@@ -108,22 +118,26 @@
 </script>
 
 <div class="diffview">
-  <div class="dhead">
-    <button
-      class="toggle"
-      onclick={toggleExpanded}
-      disabled={!collapsible}
-      aria-expanded={expanded || !collapsible}
-      title={collapsible ? (expanded ? 'Collapse diff' : 'Expand full diff') : ''}
-    >
-      <span class="chev" class:invisible={!collapsible}>{expanded ? '▾' : '▸'}</span>
-    </button>
+  <div class="dhead" class:compact>
+    {#if !compact}
+      <button
+        class="toggle"
+        onclick={toggleExpanded}
+        disabled={!collapsible}
+        aria-expanded={expanded || !collapsible}
+        title={collapsible ? (expanded ? 'Collapse diff' : 'Expand full diff') : ''}
+      >
+        <span class="chev" class:invisible={!collapsible}>{expanded ? '▾' : '▸'}</span>
+      </button>
+    {:else}
+      <span class="verb"><span aria-hidden="true">✎</span> {editVerb}</span>
+    {/if}
 
     <span class="path" title={diff.path ?? ''}>
-      {#if nameParts.dir}<span class="dir">{nameParts.dir}</span>{/if}<span class="base">{nameParts.base}</span>
+      {#if !compact && nameParts.dir}<span class="dir">{nameParts.dir}</span>{/if}<span class="base">{nameParts.base}</span>
     </span>
 
-    {#if badge}<span class="badge {diff.status}">{badge}</span>{/if}
+    {#if !compact && badge}<span class="badge {diff.status}">{badge}</span>{/if}
 
     <span class="counts">
       {#if diff.additions}<span class="add">+{diff.additions}</span>{/if}
@@ -133,7 +147,7 @@
 
     <span class="spacer"></span>
 
-    {#if diff.addedText}
+    {#if diff.addedText && !compact}
       <button class="copy" class:copied onclick={copy} title="Copy new content" aria-label="Copy new content">
         {#if copied}
           <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg>
@@ -142,6 +156,19 @@
           <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" /><path d="M5 15V5a2 2 0 0 1 2-2h10" /></svg>
           copy
         {/if}
+      </button>
+    {/if}
+
+    {#if compact}
+      <button
+        class="toggle"
+        onclick={toggleExpanded}
+        disabled={!collapsible}
+        aria-expanded={false}
+        aria-label="Show full diff"
+        title={collapsible ? 'Expand full diff' : ''}
+      >
+        <span class="chev" class:invisible={!collapsible}>▸</span>
       </button>
     {/if}
   </div>
@@ -186,6 +213,15 @@
     padding: 0.28rem 0.4rem 0.28rem 0.25rem;
     background: var(--surface-2);
     border-bottom: 1px solid var(--border);
+  }
+  .dhead.compact { border-bottom: 0; }
+  .verb {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.28rem;
+    flex: none;
+    color: var(--muted);
+    font-size: 0.74rem;
   }
   .toggle {
     display: grid;

@@ -391,7 +391,7 @@
           <option value="verbose">Verbose</option>
         </select>
       </label>
-      <p class="hint dim">Minimal shows changed lines only (up to six); Summary shows the first 14 diff rows with context; Verbose starts fully expanded. Every diff can still be expanded or collapsed in place.</p>
+      <p class="hint dim">Minimal shows a one-line file summary; Summary shows the first 14 diff rows with context; Verbose starts fully expanded. Every diff can still be expanded or collapsed in place.</p>
     </section>
 
     <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Usage')}>

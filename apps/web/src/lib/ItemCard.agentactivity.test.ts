@@ -43,10 +43,10 @@ describe('bus frame in a user turn renders as an inbound blurb, not raw text', (
 })
 
 describe("teammate vendor logo in the blurb", () => {
-  function seatTeammate(id: string, provider: 'claude' | 'codex'): void {
+  function seatTeammate(id: string, provider: 'claude' | 'codex', title?: string): void {
     store.sessions = {
       ...store.sessions,
-      [id]: { record: { id, provider, cwd: '', status: 'idle', createdAt: '' } as SessionRecord, items: [], lastActivity: '', sawReasoning: false },
+      [id]: { record: { id, provider, title, cwd: '', status: 'idle', createdAt: '' } as SessionRecord, items: [], lastActivity: '', sawReasoning: false },
     }
   }
   const sendTool = (toInput: Record<string, unknown>): ThreadItem => ({
@@ -79,6 +79,67 @@ describe("teammate vendor logo in the blurb", () => {
   it('a deleted teammate (unknown session) renders no logo, not a broken mark', () => {
     render(ItemCard, { props: { item: sendTool({ to_session: 'gone-1234', body: 'hi' }), sessionId: 's1' } })
     expect(screen.getByText(/message sent to/)).toBeTruthy()
+    expect(screen.queryByRole('img', { name: /Codex|Claude/ })).toBeNull()
+  })
+
+  it("resolves an unambiguous short session id to the teammate's name", () => {
+    seatTeammate('02575b81-3f9c-4c1c-9a2b-123456789abc', 'codex', 'Iverson')
+
+    render(ItemCard, {
+      props: { item: sendTool({ to_session: '02575b81', body: 'hi' }), sessionId: 's1' },
+    })
+
+    expect(screen.getByText('message sent to Iverson')).toBeTruthy()
+    expect(screen.getByRole('img', { name: 'Codex (OpenAI)' })).toBeTruthy()
+  })
+
+  it("resolves an inbound bus card's short sender id to the teammate's name", () => {
+    seatTeammate('02575b81-3f9c-4c1c-9a2b-123456789abc', 'codex', 'Iverson')
+    const busItem: ThreadItem = {
+      key: 'b-short',
+      kind: 'bus',
+      ts: '',
+      busDir: 'received',
+      busPeer: '02575b81',
+      busPeerId: '02575b81',
+      text: 'hello',
+    }
+
+    render(ItemCard, { props: { item: busItem, sessionId: 's1' } })
+
+    expect(screen.getByText('message received from Iverson')).toBeTruthy()
+    expect(screen.getByRole('img', { name: 'Codex (OpenAI)' })).toBeTruthy()
+  })
+
+  it("resolves a real Codex mcpToolCall's nested short recipient id", () => {
+    seatTeammate('02575b81-3f9c-4c1c-9a2b-123456789abc', 'codex', 'Iverson')
+    const item: ThreadItem = {
+      key: 'codex-mcp',
+      kind: 'tool',
+      ts: '',
+      toolName: 'mcp:send_message',
+      toolInput: {
+        type: 'mcpToolCall',
+        tool: 'send_message',
+        arguments: { to_session: '02575b81', body: 'hi' },
+      },
+    }
+
+    render(ItemCard, { props: { item, sessionId: 's1' } })
+
+    expect(screen.getByText('message sent to Iverson')).toBeTruthy()
+    expect(screen.getByRole('img', { name: 'Codex (OpenAI)' })).toBeTruthy()
+  })
+
+  it('does not guess a name or vendor for an ambiguous short session id', () => {
+    seatTeammate('02575b81-1111-4111-8111-111111111111', 'claude', 'Iverson')
+    seatTeammate('02575b81-2222-4222-8222-222222222222', 'codex', 'Noether')
+
+    render(ItemCard, {
+      props: { item: sendTool({ to_session: '02575b81', body: 'hi' }), sessionId: 's1' },
+    })
+
+    expect(screen.getByText('message sent to 02575b81')).toBeTruthy()
     expect(screen.queryByRole('img', { name: /Codex|Claude/ })).toBeNull()
   })
 })

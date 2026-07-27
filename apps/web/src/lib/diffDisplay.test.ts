@@ -23,23 +23,19 @@ function makeDiff(types: Array<'add' | 'del' | 'context'>, withHeader = true): F
 }
 
 describe('file-write diff density', () => {
-  it('minimal keeps hunk markers and changed lines while making hidden context explicit', () => {
+  it('minimal renders no diff rows until expanded', () => {
     const display = diffDisplay(makeDiff(['context', 'del', 'add', 'context']), 'minimal', false)
 
-    expect(display.rows.map((row) => row.kind === 'hunk' ? 'hunk' : row.line.type)).toEqual([
-      'hunk',
-      'del',
-      'add',
-    ])
-    expect(display.hidden).toEqual({ changed: 0, context: 2, total: 2 })
+    expect(display.rows).toEqual([])
+    expect(display.hidden).toEqual({ changed: 2, context: 2, total: 5 })
     expect(display.canToggle).toBe(true)
   })
 
-  it('minimal caps a new-file body at six changed lines and reports the rest', () => {
+  it('minimal hides an entire new-file body and reports it', () => {
     const display = diffDisplay(makeDiff(Array(9).fill('add'), false), 'minimal', false)
 
-    expect(display.rows).toHaveLength(6)
-    expect(display.hidden).toEqual({ changed: 3, context: 0, total: 3 })
+    expect(display.rows).toHaveLength(0)
+    expect(display.hidden).toEqual({ changed: 9, context: 0, total: 9 })
   })
 
   it('summary is the existing first-14-row preview, including context and hunk markers', () => {

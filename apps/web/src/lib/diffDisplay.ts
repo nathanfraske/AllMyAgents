@@ -15,7 +15,6 @@ export interface DiffDisplay {
   canToggle: boolean
 }
 
-const MINIMAL_CHANGED_ROWS = 6
 const SUMMARY_ROWS = 14
 
 function flatten(diff: FileDiff): FlatDiffRow[] {
@@ -26,27 +25,6 @@ function flatten(diff: FileDiff): FlatDiffRow[] {
     for (const line of hunk.lines) rows.push({ kind: 'line', line })
   })
   return rows
-}
-
-function minimalRows(rows: FlatDiffRow[]): FlatDiffRow[] {
-  const visible: FlatDiffRow[] = []
-  let changed = 0
-  let pendingHunk: FlatDiffRow | undefined
-
-  for (const row of rows) {
-    if (row.kind === 'hunk') {
-      pendingHunk = row
-      continue
-    }
-    if (row.line.type === 'context' || changed >= MINIMAL_CHANGED_ROWS) continue
-    if (pendingHunk) {
-      visible.push(pendingHunk)
-      pendingHunk = undefined
-    }
-    visible.push(row)
-    changed++
-  }
-  return visible
 }
 
 function hiddenCounts(all: FlatDiffRow[], visible: FlatDiffRow[]): DiffDisplay['hidden'] {
@@ -75,7 +53,9 @@ export function diffDisplay(
   expanded: boolean
 ): DiffDisplay {
   const all = flatten(diff)
-  const collapsed = density === 'minimal' ? minimalRows(all) : all.slice(0, SUMMARY_ROWS)
+  // Minimal is a true one-line summary: the header is the whole collapsed representation. Summary is
+  // the bounded excerpt, while verbose starts with every row visible.
+  const collapsed = density === 'minimal' ? [] : all.slice(0, SUMMARY_ROWS)
   const rows = expanded ? all : collapsed
   const hidden = hiddenCounts(all, rows)
   const collapsedHidden = hiddenCounts(all, collapsed)
