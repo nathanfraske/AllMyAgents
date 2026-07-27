@@ -75,6 +75,43 @@ describe('ClaudeDriver mid-turn steering', () => {
     fs.rmSync(tmp, { recursive: true, force: true })
   })
 
+  it('delivers UTF-8 text-family attachments as text content', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-claude-text-attachments-'))
+    const documentPath = path.join(tmp, 'notes.md')
+    fs.writeFileSync(documentPath, 'CLAUDE_MARKDOWN_ATTACHMENT')
+    const attachments: AttachmentMeta[] = [
+      {
+        id: 'document',
+        name: 'notes.md',
+        mime: 'text/markdown',
+        size: fs.statSync(documentPath).size,
+        path: documentPath,
+      },
+    ]
+    const driver = new ClaudeDriver('/tmp/profile', '/tmp/cwd', () => {})
+    const turn = (
+      driver as unknown as {
+        send(text: string, options: object, attachments: AttachmentMeta[]): Promise<void>
+      }
+    ).send('Use the document', {}, attachments)
+    const iterator = (capturedPrompt as CapturedPrompt)[Symbol.asyncIterator]()
+
+    await expect(iterator.next()).resolves.toMatchObject({
+      value: {
+        message: {
+          content: [
+            { type: 'text', text: 'Use the document' },
+            { type: 'text', text: expect.stringContaining('CLAUDE_MARKDOWN_ATTACHMENT') },
+          ],
+        },
+      },
+    })
+
+    finishTurn?.()
+    await turn
+    fs.rmSync(tmp, { recursive: true, force: true })
+  })
+
   it('opens the SDK query with a streaming prompt and sends steering input at the next tool boundary', async () => {
     const driver = new ClaudeDriver('/tmp/profile', '/tmp/cwd', () => {})
     const turn = driver.send('initial task')

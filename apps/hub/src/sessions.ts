@@ -28,10 +28,12 @@ import { readProfileCommands, type CommandInfo } from './commands.js'
 import { EDIT_TOOLS } from './writeScope.js'
 import {
   AttachmentInputError,
+  isPdfAttachment,
+  isTextAttachment,
   isClaudeImageMime,
   loadAttachment,
+  prepareAttachment,
   resolveAttachments,
-  saveAttachment,
   type AttachmentMeta,
 } from './attachments.js'
 
@@ -769,13 +771,13 @@ export class SessionManager {
   }
 
   /** Persist one bounded raw upload beneath this session's cwd. The HTTP layer owns streaming limits. */
-  storeAttachment(sessionId: string, name: string, mime: string, bytes: Buffer): AttachmentMeta {
+  async storeAttachment(sessionId: string, name: string, mime: string, bytes: Buffer): Promise<AttachmentMeta> {
     const record = this.sessions.get(sessionId)
     if (!record) throw new Error(`unknown session: ${sessionId}`)
     if (!fs.existsSync(record.cwd) || !fs.statSync(record.cwd).isDirectory()) {
       throw new Error(`session workspace is unavailable: ${record.cwd}`)
     }
-    return saveAttachment(sessionId, record.cwd, name, mime, bytes)
+    return prepareAttachment(record.provider, sessionId, record.cwd, name, mime, bytes)
   }
 
   /** Resolve one download id only within its owning session's cwd. */
@@ -787,16 +789,10 @@ export class SessionManager {
   private attachmentsFor(record: SessionRecord, ids: readonly string[] = []): AttachmentMeta[] {
     const attachments = resolveAttachments(record.id, record.cwd, ids)
     for (const attachment of attachments) {
-      if (record.provider === 'codex' && !attachment.mime.startsWith('image/')) {
-        throw new AttachmentInputError(`Codex accepts image attachments only: ${attachment.name}`)
-      }
-      if (
-        record.provider === 'claude' &&
-        attachment.mime !== 'application/pdf' &&
-        !isClaudeImageMime(attachment.mime)
-      ) {
+      const common = isClaudeImageMime(attachment.mime) || isPdfAttachment(attachment) || isTextAttachment(attachment)
+      if (!common) {
         throw new AttachmentInputError(
-          `Claude accepts PNG, JPEG, GIF, WebP, or PDF attachments: ${attachment.name}`
+          `Unsupported attachment type for ${attachment.name}; use PNG, JPEG, GIF, WebP, PDF, or a UTF-8 text/source file`
         )
       }
     }

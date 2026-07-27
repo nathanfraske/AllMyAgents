@@ -20,6 +20,7 @@ import { UsageMonitor } from './usage.js'
 import { WorkspaceManager } from './workspace.js'
 import { MAX_IMAGE_BYTES } from './attachments.js'
 import type { AttachmentMeta } from './attachments.js'
+import { CodexClient } from './adapters/codex.js'
 
 const cleanups: Array<() => void | Promise<void>> = []
 
@@ -27,7 +28,28 @@ afterEach(async () => {
   while (cleanups.length) await cleanups.pop()?.()
 })
 
-async function build() {
+function textPdf(text: string): Buffer {
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>',
+    `<< /Length ${text.length + 33} >>\nstream\nBT /F1 12 Tf 72 720 Td (${text}) Tj ET\nendstream`,
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+  ]
+  let pdf = '%PDF-1.4\n'
+  const offsets = [0]
+  for (const [index, object] of objects.entries()) {
+    offsets.push(Buffer.byteLength(pdf))
+    pdf += `${index + 1} 0 obj\n${object}\nendobj\n`
+  }
+  const xref = Buffer.byteLength(pdf)
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`
+  pdf += offsets.slice(1).map((offset) => `${String(offset).padStart(10, '0')} 00000 n \n`).join('')
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`
+  return Buffer.from(pdf)
+}
+
+async function build(provider: 'claude' | 'codex' = 'claude') {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-attachment-api-'))
   const journal = new Journal(path.join(tmp, 'hub.db'))
   const projects = new ProjectStore(journal.db)
@@ -54,7 +76,7 @@ async function build() {
     attach: async () => {},
     isBusy: () => false,
   }
-  const profile = { id: 'claude-test', provider: 'claude' as const, dir: path.join(tmp, 'profile') }
+  const profile = { id: `${provider}-test`, provider, dir: path.join(tmp, 'profile') }
   const sessions = new SessionManager(
     journal,
     new SessionStore(journal.db),
@@ -206,6 +228,73 @@ describe('session attachment API', () => {
     )
     expect(input?.payload).toEqual({ text: 'inspect this', attachments: [meta] })
     expect(JSON.stringify(input?.payload)).not.toContain(Buffer.from([1, 2, 3]).toString('base64'))
+  })
+
+  it('delivers attached Markdown and PDF text to a Codex vendor payload', async () => {
+    const { base, record, runTurn } = await build('codex')
+    const markdownText = 'CODEX_MARKDOWN_ATTACHMENT'
+    const pdfText = 'CODEX_PDF_ATTACHMENT'
+    const markdownUpload = await fetch(`${base}/api/sessions/${record.id}/attachments`, {
+      method: 'POST',
+      headers: { 'content-type': 'text/markdown', 'x-filename': 'notes.md' },
+      body: markdownText,
+    })
+    const pdfUpload = await fetch(`${base}/api/sessions/${record.id}/attachments`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/pdf', 'x-filename': 'spec.pdf' },
+      body: new Uint8Array(textPdf(pdfText)),
+    })
+
+    expect(markdownUpload.status).toBe(200)
+    expect(pdfUpload.status).toBe(200)
+    const markdown = (await markdownUpload.json()) as AttachmentMeta
+    const pdf = (await pdfUpload.json()) as AttachmentMeta
+    const sent = await fetch(`${base}/api/sessions/${record.id}/input`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: 'Use both documents', attachments: [markdown.id, pdf.id] }),
+    })
+
+    expect(sent.status).toBe(200)
+    const attachments = runTurn.mock.calls.at(-1)?.[3]
+    expect(attachments).toEqual([markdown, pdf])
+    const client = new CodexClient('unused', vi.fn())
+    const request = vi.spyOn(client, 'request').mockResolvedValue(undefined)
+    await client.sendTurn('thread-1', 'Use both documents', {}, attachments)
+    const payload = request.mock.calls.at(-1)?.[1]
+    expect(JSON.stringify(payload)).toContain(markdownText)
+    expect(JSON.stringify(payload)).toContain(pdfText)
+  })
+
+  it('rejects a Codex PDF with no text layer at upload time', async () => {
+    const { base, record } = await build('codex')
+    const upload = await fetch(`${base}/api/sessions/${record.id}/attachments`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/pdf', 'x-filename': 'scan.pdf' },
+      body: new Uint8Array(textPdf('')),
+    })
+
+    expect(upload.status).toBe(400)
+    await expect(upload.json()).resolves.toEqual({
+      error: expect.stringMatching(/appears to be scanned; no text could be extracted/i),
+    })
+  })
+
+  it('declines Office documents explicitly instead of accepting an undeliverable attachment', async () => {
+    const { base, record } = await build('codex')
+    const upload = await fetch(`${base}/api/sessions/${record.id}/attachments`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'x-filename': 'brief.docx',
+      },
+      body: new Uint8Array([0x50, 0x4b, 0x03, 0x04]),
+    })
+
+    expect(upload.status).toBe(400)
+    await expect(upload.json()).resolves.toEqual({
+      error: expect.stringMatching(/DOCX extraction is not supported in this release/i),
+    })
   })
 
   it('does not let another session or a tampered sidecar escape the download root', async () => {

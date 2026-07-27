@@ -927,7 +927,7 @@ export function startServer(opts: ServerOptions): http.Server {
         }
         const bytes = await readRawBody(req, attachmentLimitForMime(mime))
         if (bytes.length === 0) throw new BadRequestError('attachment is empty')
-        json(res, sessions.storeAttachment(sessionId, rawName, mime, bytes))
+        json(res, await sessions.storeAttachment(sessionId, rawName, mime, bytes))
         return
       }
       const attachmentGetMatch = /^\/api\/sessions\/([^/]+)\/attachments\/([^/]+)$/.exec(url.pathname)

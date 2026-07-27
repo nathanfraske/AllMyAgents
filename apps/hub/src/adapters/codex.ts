@@ -4,7 +4,12 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { createRequire } from 'node:module'
 import { AGENT_MCP_SERVER_NAME } from '../codexMcpConfig.js'
-import type { AttachmentMeta } from '../attachments.js'
+import {
+  documentTextBlock,
+  isPdfAttachment,
+  isTextAttachment,
+  type AttachmentMeta,
+} from '../attachments.js'
 
 /**
  * Absolute path to the codex CLI entry, or null if we cannot find it.
@@ -139,6 +144,23 @@ export interface CodexTurnOptions {
   approvalPolicy?: string
   /** `{ mode, writableRoots }` — what the agent is allowed to touch. See {@link codexTurnPolicy}. */
   sandboxPolicy?: { type: string; writableRoots?: string[] }
+}
+
+function turnInput(text: string, attachments: readonly AttachmentMeta[]): Array<Record<string, string>> {
+  const input: Array<Record<string, string>> = []
+  if (text || attachments.length === 0) input.push({ type: 'text', text })
+  for (const attachment of attachments) {
+    if (isPdfAttachment(attachment)) {
+      input.push({ type: 'text', text: documentTextBlock(attachment, true) })
+    } else if (attachment.mime.startsWith('image/')) {
+      input.push({ type: 'localImage', path: attachment.path })
+    } else if (isTextAttachment(attachment)) {
+      input.push({ type: 'text', text: documentTextBlock(attachment) })
+    } else {
+      throw new Error(`unsupported Codex attachment reached adapter: ${attachment.name}`)
+    }
+  }
+  return input
 }
 
 /**
@@ -363,16 +385,10 @@ export class CodexClient {
     // Codex may otherwise complete reasoning items with empty summary/content arrays, leaving the
     // operator no explanation for a long reasoning phase. `summary` is the app-server's sticky
     // turn/start override (ReasoningSummary = auto|concise|detailed|none).
-    const input: Array<Record<string, string>> = []
-    if (text || !attachments.some((attachment) => attachment.mime.startsWith('image/'))) {
-      input.push({ type: 'text', text })
-    }
     // The installed app-server's UserInput enum has localImage but no generic document/file item.
-    // Keep the guard here even though the UI and SessionManager filter: protocol invariants belong at
-    // the adapter boundary, and a non-image path must never be mislabeled as an image.
-    for (const attachment of attachments) {
-      if (attachment.mime.startsWith('image/')) input.push({ type: 'localImage', path: attachment.path })
-    }
+    // Documents therefore become text inputs (or a path instruction when large); only actual images may
+    // cross the protocol as localImage.
+    const input = turnInput(text, attachments)
     const params: Record<string, unknown> = {
       threadId,
       input,
@@ -395,13 +411,7 @@ export class CodexClient {
   async steer(threadId: string, text: string, attachments: readonly AttachmentMeta[] = []): Promise<void> {
     const expectedTurnId = this.activeTurns.get(threadId)
     if (!expectedTurnId) throw new Error('no active Codex turn to steer')
-    const input: Array<Record<string, string>> = []
-    if (text || !attachments.some((attachment) => attachment.mime.startsWith('image/'))) {
-      input.push({ type: 'text', text })
-    }
-    for (const attachment of attachments) {
-      if (attachment.mime.startsWith('image/')) input.push({ type: 'localImage', path: attachment.path })
-    }
+    const input = turnInput(text, attachments)
     await this.request('turn/steer', {
       threadId,
       input,

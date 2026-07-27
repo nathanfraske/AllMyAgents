@@ -1,6 +1,12 @@
 import { query, type Query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk'
 import fs from 'node:fs'
-import { isClaudeImageMime, type AttachmentMeta } from '../attachments.js'
+import {
+  documentTextBlock,
+  isClaudeImageMime,
+  isPdfAttachment,
+  isTextAttachment,
+  type AttachmentMeta,
+} from '../attachments.js'
 
 type EventSink = (kind: string, payload: unknown) => void
 
@@ -53,16 +59,7 @@ function userMessage(text: string, attachments: readonly AttachmentMeta[] = [], 
   const content: Exclude<SDKUserMessage['message']['content'], string> = []
   if (text || attachments.length === 0) content.push({ type: 'text', text })
   for (const attachment of attachments) {
-    if (isClaudeImageMime(attachment.mime)) {
-      content.push({
-        type: 'image',
-        source: {
-          type: 'base64',
-          media_type: attachment.mime,
-          data: fs.readFileSync(attachment.path).toString('base64'),
-        },
-      })
-    } else if (attachment.mime === 'application/pdf') {
+    if (isPdfAttachment(attachment)) {
       content.push({
         type: 'document',
         source: {
@@ -71,9 +68,20 @@ function userMessage(text: string, attachments: readonly AttachmentMeta[] = [], 
           data: fs.readFileSync(attachment.path).toString('base64'),
         },
       })
+    } else if (isClaudeImageMime(attachment.mime)) {
+      content.push({
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: attachment.mime,
+          data: fs.readFileSync(attachment.path).toString('base64'),
+        },
+      })
+    } else if (isTextAttachment(attachment)) {
+      content.push({ type: 'text', text: documentTextBlock(attachment) })
+    } else {
+      throw new Error(`unsupported Claude attachment reached adapter: ${attachment.name}`)
     }
-    // Every other type is intentionally absent. The hub validates provider support before journaling,
-    // but this adapter remains the final invariant if a future caller bypasses SessionManager.
   }
   if (content.length === 0) content.push({ type: 'text', text })
   return {

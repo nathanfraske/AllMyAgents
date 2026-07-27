@@ -1,6 +1,8 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import { extractText, getDocumentProxy } from 'unpdf'
+import type { Provider } from './types.js'
 
 export interface AttachmentMeta {
   id: string
@@ -14,8 +16,84 @@ export interface AttachmentMeta {
 export const MAX_ATTACHMENTS_PER_MESSAGE = 5
 export const MAX_IMAGE_BYTES = 5 * 1024 * 1024
 export const MAX_DOCUMENT_BYTES = 10 * 1024 * 1024
+export const MAX_INLINE_DOCUMENT_BYTES = 256 * 1024
+const MAX_PDF_PAGES = 500
+const MAX_PDF_IMAGE_PIXELS = 16_777_216
 
 const ATTACHMENT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const OFFICE_DOCUMENT_EXTENSIONS = new Set(['.docx', '.xlsx'])
+const TEXT_DOCUMENT_EXTENSIONS = new Set([
+  '.txt',
+  '.md',
+  '.markdown',
+  '.csv',
+  '.tsv',
+  '.json',
+  '.jsonl',
+  '.log',
+  '.yaml',
+  '.yml',
+  '.xml',
+  '.toml',
+  '.ini',
+  '.cfg',
+  '.conf',
+  '.env',
+  '.properties',
+  '.ts',
+  '.tsx',
+  '.js',
+  '.jsx',
+  '.mjs',
+  '.cjs',
+  '.py',
+  '.rs',
+  '.go',
+  '.java',
+  '.kt',
+  '.kts',
+  '.c',
+  '.h',
+  '.cc',
+  '.cpp',
+  '.hpp',
+  '.cs',
+  '.rb',
+  '.php',
+  '.swift',
+  '.sh',
+  '.bash',
+  '.zsh',
+  '.fish',
+  '.ps1',
+  '.sql',
+  '.css',
+  '.scss',
+  '.sass',
+  '.less',
+  '.html',
+  '.htm',
+  '.vue',
+  '.svelte',
+])
+const TEXT_APPLICATION_MIMES = new Set([
+  'application/json',
+  'application/jsonl',
+  'application/ld+json',
+  'application/xml',
+  'application/yaml',
+  'application/x-yaml',
+  'application/javascript',
+  'application/typescript',
+  'application/sql',
+])
+const SPECIAL_TEXT_FILENAMES = new Set([
+  'dockerfile',
+  'makefile',
+  'gemfile',
+  'rakefile',
+  'justfile',
+])
 
 export class AttachmentInputError extends Error {}
 
@@ -69,26 +147,142 @@ export function saveAttachment(
   cwd: string,
   rawName: string,
   mime: string,
-  bytes: Buffer
+  bytes: Buffer,
+  extractedPdfText?: string
 ): AttachmentMeta {
   const root = secureUploadRoot(cwd, true)!
   const name = safeAttachmentName(rawName)
   const id = crypto.randomUUID()
   const file = path.resolve(root, `${id}-${name}`)
   const sidecar = path.resolve(root, `${id}.json`)
+  const pdfTextFile = path.resolve(root, `${id}.pdf.txt`)
   // The sanitized basename is NOT trusted. Resolve both paths and prove containment immediately before
   // writing so a future sanitizer regression cannot turn an upload into an arbitrary filesystem write.
-  if (!isInside(root, file) || !isInside(root, sidecar)) throw new Error('attachment path escaped upload root')
+  if (!isInside(root, file) || !isInside(root, sidecar) || !isInside(root, pdfTextFile)) {
+    throw new Error('attachment path escaped upload root')
+  }
   const meta: AttachmentMeta = { id, name, mime, size: bytes.length, path: file }
   fs.writeFileSync(file, bytes, { flag: 'wx' })
   try {
+    if (extractedPdfText !== undefined) fs.writeFileSync(pdfTextFile, extractedPdfText, { flag: 'wx' })
     fs.writeFileSync(sidecar, JSON.stringify({ ...meta, sessionId }), { flag: 'wx' })
   } catch (err) {
     // The payload was created by this call and has no reachable id without its sidecar.
     fs.rmSync(file, { force: true })
+    fs.rmSync(pdfTextFile, { force: true })
     throw err
   }
   return meta
+}
+
+function attachmentExtension(name: string): string {
+  return path.extname(name).toLowerCase()
+}
+
+export function isPdfAttachment(attachment: Pick<AttachmentMeta, 'name' | 'mime'>): boolean {
+  return attachment.mime === 'application/pdf' || attachmentExtension(attachment.name) === '.pdf'
+}
+
+export function isTextAttachment(attachment: Pick<AttachmentMeta, 'name' | 'mime'>): boolean {
+  const lowerName = attachment.name.toLowerCase()
+  const extension = attachmentExtension(lowerName)
+  return (
+    attachment.mime.startsWith('text/') ||
+    TEXT_APPLICATION_MIMES.has(attachment.mime) ||
+    TEXT_DOCUMENT_EXTENSIONS.has(extension) ||
+    SPECIAL_TEXT_FILENAMES.has(lowerName)
+  )
+}
+
+function validateUtf8(bytes: Buffer, name: string): void {
+  try {
+    new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+  } catch {
+    throw new AttachmentInputError(`${name} is not valid UTF-8 text`)
+  }
+}
+
+async function extractPdfText(bytes: Buffer, name: string): Promise<string> {
+  let pdf: Awaited<ReturnType<typeof getDocumentProxy>> | undefined
+  try {
+    pdf = await getDocumentProxy(new Uint8Array(bytes), { maxImageSize: MAX_PDF_IMAGE_PIXELS })
+    if (pdf.numPages > MAX_PDF_PAGES) {
+      throw new AttachmentInputError(`${name} has ${pdf.numPages} pages; the limit is ${MAX_PDF_PAGES}`)
+    }
+    const result = await extractText(pdf, { mergePages: true })
+    const text = result.text.trim()
+    if (!text) {
+      throw new AttachmentInputError(`This PDF appears to be scanned; no text could be extracted: ${name}`)
+    }
+    return text
+  } catch (err) {
+    if (err instanceof AttachmentInputError) throw err
+    const detail = err instanceof Error ? err.message : String(err)
+    throw new AttachmentInputError(`Could not extract text from PDF ${name}: ${detail}`)
+  } finally {
+    await pdf?.destroy().catch(() => {})
+  }
+}
+
+/**
+ * Validate vendor delivery before an upload becomes reachable. `.docx`/`.xlsx` extraction and
+ * rasterising scanned PDF pages are deliberately deferred: accepting either without deliverable content
+ * would recreate the silent vendor asymmetry this boundary exists to prevent.
+ */
+export async function prepareAttachment(
+  provider: Provider,
+  sessionId: string,
+  cwd: string,
+  rawName: string,
+  mime: string,
+  bytes: Buffer
+): Promise<AttachmentMeta> {
+  const name = safeAttachmentName(rawName)
+  const extension = attachmentExtension(name)
+  if (OFFICE_DOCUMENT_EXTENSIONS.has(extension)) {
+    throw new AttachmentInputError(`${extension.slice(1).toUpperCase()} extraction is not supported in this release`)
+  }
+  if (isPdfAttachment({ name, mime })) {
+    const text = provider === 'codex' ? await extractPdfText(bytes, name) : undefined
+    return saveAttachment(sessionId, cwd, name, mime, bytes, text)
+  }
+  if (isClaudeImageMime(mime)) return saveAttachment(sessionId, cwd, name, mime, bytes)
+  if (isTextAttachment({ name, mime })) {
+    validateUtf8(bytes, name)
+    return saveAttachment(sessionId, cwd, name, mime, bytes)
+  }
+  throw new AttachmentInputError(
+    `Unsupported attachment type for ${name}; use PNG, JPEG, GIF, WebP, PDF, or a UTF-8 text/source file`
+  )
+}
+
+function verifiedSiblingFile(attachment: AttachmentMeta, suffix: string): string {
+  if (!ATTACHMENT_ID.test(attachment.id)) throw new Error(`invalid attachment id: ${attachment.id}`)
+  const root = path.resolve(path.dirname(attachment.path))
+  const candidate = path.resolve(root, `${attachment.id}${suffix}`)
+  if (!isInside(root, candidate) || !fs.existsSync(candidate)) {
+    throw new Error(`attachment delivery file is unavailable: ${attachment.name}`)
+  }
+  const real = fs.realpathSync(candidate)
+  if (!isInside(root, real) || !fs.statSync(real).isFile()) {
+    throw new Error(`attachment delivery file escaped its upload root: ${attachment.name}`)
+  }
+  return real
+}
+
+/**
+ * Convert a text-family upload into one vendor-neutral prompt block. Large documents stay on disk so
+ * both agents can inspect them with file tools without consuming an entire model context window.
+ */
+export function documentTextBlock(attachment: AttachmentMeta, pdfText = false): string {
+  const file = pdfText ? verifiedSiblingFile(attachment, '.pdf.txt') : attachment.path
+  const size = fs.statSync(file).size
+  if (size > MAX_INLINE_DOCUMENT_BYTES) {
+    return `Attached document ${JSON.stringify(attachment.name)} is available at ${file}. Read that file before answering.`
+  }
+  const text = fs.readFileSync(file, 'utf8')
+  const label = pdfText ? 'Extracted PDF text' : 'Attached document'
+  return `[${label}: ${JSON.stringify(attachment.name)}]\n${text}\n[End ${label.toLowerCase()}]`
 }
 
 /**

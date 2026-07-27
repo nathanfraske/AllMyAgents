@@ -133,7 +133,7 @@ describe('worktree session lifecycle', () => {
 
   it('Stop preserves worktree attachments and Delete treats them as recoverable uncommitted data', async () => {
     const { sessions, record, worktree } = await createWorktreeSession()
-    const attachment = sessions.storeAttachment(
+    const attachment = await sessions.storeAttachment(
       record.id,
       'evidence.png',
       'image/png',
