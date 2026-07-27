@@ -1140,6 +1140,18 @@ export class SessionManager {
     // An operator Stop is terminal intent. The interrupted turn's own failure is not news, and painting it
     // red is actively misleading — the operator asked for it to end.
     if (this.sessions.get(sessionId)?.status === 'stopped') return
+    // Same reasoning for a plain INTERRUPT, which the Stop fence above did not cover because interrupt
+    // sets no status of its own. The vendor has no way to report "the user aborted this" — the SDK returns
+    // is_error with whatever stop_reason it was on — so without this the chat goes red, keeps a durable
+    // error card, and reads as a crash. Observed exactly that: an interrupt journaled session/interrupted
+    // and then, one millisecond later, session/error + status error.
+    //
+    // The turn still ENDS; it just ends as idle rather than failed, which is what actually happened.
+    if (this.wasJustInterrupted(sessionId)) {
+      this.interruptedAt.delete(sessionId)
+      this.setStatusById(sessionId, 'idle')
+      return
+    }
     this.journal.append(sessionId, 'session/error', { message })
     this.setStatusById(sessionId, 'error')
   }
@@ -1469,9 +1481,41 @@ export class SessionManager {
     void this.executor.runTurn(spec, framed, 'bus')
   }
 
+  /**
+   * Interrupts recently requested by the operator, and the moment each was asked for.
+   *
+   * An interrupt is DELIBERATE, but the vendor cannot report it as anything other than a failed turn:
+   * the SDK aborts and returns `is_error: true` with whatever stop_reason it was on. The hub then mapped
+   * that faithfully to session/error and a red status — so pressing Stop painted the chat as broken and
+   * left a durable error card that replays forever. The operator hit exactly this and reasonably read it
+   * as a crash.
+   *
+   * The Stop path already had a fence (failTurn early-returns on a 'stopped' record), but interrupt sets
+   * no status of its own, so nothing downstream could tell "the user asked for this" from "it fell over".
+   * This is that missing signal. Timestamped and short-lived rather than a boolean, because a genuine
+   * failure arriving minutes later must still be reported honestly — the grace only covers the abort we
+   * caused.
+   */
+  private readonly interruptedAt = new Map<string, number>()
+  private static readonly INTERRUPT_GRACE_MS = 30_000
+
+  /** Did the operator ask for this turn to end, recently enough that its failure is expected? */
+  private wasJustInterrupted(sessionId: string): boolean {
+    const at = this.interruptedAt.get(sessionId)
+    if (at === undefined) return false
+    if (Date.now() - at > SessionManager.INTERRUPT_GRACE_MS) {
+      this.interruptedAt.delete(sessionId)
+      return false
+    }
+    return true
+  }
+
   async interrupt(sessionId: string): Promise<void> {
     const record = this.sessions.get(sessionId)
     if (!record) throw new Error(`unknown session: ${sessionId}`)
+    // Marked BEFORE the abort, not after: the vendor's error result can arrive before this method's
+    // await resolves, and a fence set afterwards would miss the very event it exists to catch.
+    this.interruptedAt.set(sessionId, Date.now())
     await this.executor.interrupt(sessionId)
     this.journal.append(sessionId, 'session/interrupted', {})
   }
