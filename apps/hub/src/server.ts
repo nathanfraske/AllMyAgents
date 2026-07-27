@@ -26,6 +26,7 @@ import type { Executor } from './executor.js'
 import type { RestartState } from './restartController.js'
 import { SCHEMA_VERSION } from './restartHandshake.js'
 import { AttachmentInputError, attachmentLimitForMime, isClaudeImageMime } from './attachments.js'
+import { GitHubImportService } from './githubImport.js'
 
 const PAGE = `<!doctype html>
 <html>
@@ -449,6 +450,12 @@ export function persistPrefs(
 
 export function startServer(opts: ServerOptions): http.Server {
   const { port, defaultCwd, profilesDir, journal, sessions, profiles, approvals, usage, projects, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath } = opts
+  // Runtime repositories live beside the journal/config under HUB_DATA_DIR, never in the shipped hub
+  // payload or profiles tree. GitHubImportService keeps auth entirely inside an existing `gh` session.
+  const github = new GitHubImportService(
+    path.join(path.dirname(configPath), 'repositories'),
+    (name, projectPath) => projects.create(name, projectPath)
+  )
 
   const server = http.createServer((req, res) => {
     void handle(req, res)
@@ -614,6 +621,39 @@ export function startServer(opts: ServerOptions): http.Server {
       }
       if (method === 'GET' && url.pathname === '/api/projects') {
         json(res, projects.list())
+        return
+      }
+      // Optional GitHub import. Capability detection is intentionally lazy: a GitHub-less/offline first
+      // run never invokes `gh`, makes a network request, or waits on this feature.
+      if (method === 'GET' && url.pathname === '/api/github/capability') {
+        json(res, await github.capability())
+        return
+      }
+      if (method === 'GET' && url.pathname === '/api/github/repositories') {
+        try {
+          json(res, await github.repositories())
+        } catch (error) {
+          json(res, { error: error instanceof Error ? error.message : String(error) }, 503)
+        }
+        return
+      }
+      if (method === 'POST' && url.pathname === '/api/github/clones') {
+        const body = await readBody(req)
+        try {
+          json(res, github.start(String(body.nameWithOwner ?? '')), 202)
+        } catch (error) {
+          json(res, { error: error instanceof Error ? error.message : String(error) }, 400)
+        }
+        return
+      }
+      const githubCloneMatch = /^\/api\/github\/clones\/([^/]+)$/.exec(url.pathname)
+      if (method === 'GET' && githubCloneMatch) {
+        const job = github.job(githubCloneMatch[1] as string)
+        if (!job) {
+          json(res, { error: 'GitHub clone job not found.' }, 404)
+          return
+        }
+        json(res, job)
         return
       }
       if (method === 'POST' && url.pathname === '/api/projects') {

@@ -30,6 +30,38 @@ export interface ProjectInfo {
   siteOnline?: boolean
 }
 
+export interface GitHubCapability {
+  available: boolean
+  reason?: string
+}
+
+export interface GitHubRepository {
+  nameWithOwner: string
+  name: string
+  description: string
+  private: boolean
+  archived: boolean
+  defaultBranch: string | null
+  updatedAt: string
+  supported: boolean
+  unsupportedReason?: string
+}
+
+export interface GitHubCloneJob {
+  id: string
+  repository: Pick<GitHubRepository, 'nameWithOwner' | 'name' | 'private'>
+  status: 'queued' | 'cloning' | 'validating' | 'complete' | 'failed' | 'cancelled'
+  progress: {
+    stage: 'queued' | 'cloning' | 'validating' | 'complete'
+    percent?: number
+    message: string
+  }
+  createdAt: string
+  updatedAt: string
+  project?: ProjectInfo
+  error?: string
+}
+
 export interface SessionRecord {
   id: string
   profileId: string
@@ -436,6 +468,11 @@ export const api = {
   projects: () => jget<ProjectInfo[]>('/api/projects'),
   createProject: (name: string, path: string) =>
     jpost<ProjectInfo | { error: string }>('/api/projects', { name, path }),
+  githubCapability: () => jget<GitHubCapability>('/api/github/capability'),
+  githubRepositories: () => jget<GitHubRepository[]>('/api/github/repositories'),
+  startGitHubClone: (nameWithOwner: string) =>
+    jpost<GitHubCloneJob | { error: string }>('/api/github/clones', { nameWithOwner }),
+  githubClone: (id: string) => jget<GitHubCloneJob>(`/api/github/clones/${encodeURIComponent(id)}`),
   // --- Unified fleet view (first cut, read-only) ---
   // The fleet roster: this hub + every reachable co-owned peer's hub, badged by machine.
   fleet: () => jget<FleetSite[]>('/api/fleet'),
