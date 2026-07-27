@@ -8,6 +8,9 @@
   import Dashboard from './lib/Dashboard.svelte'
   import ProjectView from './lib/ProjectView.svelte'
   import NewProjectModal, { type ProjectLaunchResult } from './lib/NewProjectModal.svelte'
+  import TutorialOverlay from './lib/TutorialOverlay.svelte'
+  import { api } from './lib/api'
+  import { tutorials, type AccountLoginView } from './lib/tutorialState.svelte'
   import Titlebar from './lib/Titlebar.svelte'
   import UpdateBanner from './lib/UpdateBanner.svelte'
   import { cubicOut } from 'svelte/easing'
@@ -17,10 +20,75 @@
 
   let newProjectOpen = $state(false)
 
+  const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+  async function initializeTutorials(): Promise<void> {
+    while (!tutorials.initialized) {
+      const loaded = await tutorials.initialize(async () => {
+        const [profiles, sessions] = await Promise.all([api.profiles(), api.sessions()])
+        return { profiles, sessions }
+      })
+      if (loaded) {
+        if (tutorials.firstRunOpen && tutorials.firstRunPhase === 'accounts') {
+          store.settingsOpen = true
+        } else if (tutorials.firstRunOpen) {
+          store.goHome()
+        }
+        return
+      }
+      await delay(1_000)
+    }
+  }
+
+  void initializeTutorials()
+
+  $effect(() => {
+    if (
+      tutorials.firstRunOpen &&
+      tutorials.firstRunPhase === 'accounts' &&
+      store.profiles.length > 0
+    ) {
+      tutorials.accountAdded()
+      store.settingsOpen = false
+      store.goHome()
+    }
+  })
+
+  function openNewProject(): void {
+    if (newProjectOpen) return
+    newProjectOpen = true
+    tutorials.startNewProjectTutorial(false)
+  }
+
+  function closeNewProject(): void {
+    newProjectOpen = false
+    if (tutorials.newProjectOpen) tutorials.closeNewProjectTutorial()
+  }
+
+  function replayFirstRun(): void {
+    tutorials.replayFirstRun(store.profiles.length > 0)
+    if (tutorials.firstRunPhase === 'accounts') store.settingsOpen = true
+    else {
+      store.settingsOpen = false
+      store.goHome()
+    }
+  }
+
+  function replayNewProject(): void {
+    store.settingsOpen = false
+    if (!newProjectOpen) newProjectOpen = true
+    tutorials.replayNewProject()
+  }
+
+  function loginStateChanged(view: AccountLoginView): void {
+    tutorials.setLogin(view)
+  }
+
   function projectLaunchSettled(result: ProjectLaunchResult): void {
     // Keep this modal mounted over the Project View only when failures remain, because this is also
     // where retry lives. A complete or zero-agent launch lands directly on the overview.
     store.openProjectView(result.project.id)
+    if (tutorials.newProjectOpen) tutorials.finishNewProject()
     if (result.failed.length === 0) newProjectOpen = false
   }
 
@@ -312,7 +380,7 @@
       {#if store.dragSession}
         <div class="empty dropping">drop to open this chat</div>
       {:else}
-        <Dashboard onnewproject={() => (newProjectOpen = true)} />
+        <Dashboard onnewproject={openNewProject} />
       {/if}
     {:else}
       <div class="panes" bind:this={panesEl}>
@@ -358,7 +426,13 @@
 </div>
 </div>
 {#if store.settingsOpen}
-  <SettingsModal onclose={() => (store.settingsOpen = false)} />
+  <SettingsModal
+    onclose={() => (store.settingsOpen = false)}
+    initialTab={tutorials.firstRunOpen && tutorials.firstRunPhase === 'accounts' ? 'accounts' : undefined}
+    onloginstate={loginStateChanged}
+    onreplayfirst={replayFirstRun}
+    onreplayproject={replayNewProject}
+  />
 {/if}
 {#if store.managerSetupOpen}
   <ManagerSetupModal
@@ -368,9 +442,14 @@
 {/if}
 {#if newProjectOpen}
   <NewProjectModal
-    onclose={() => (newProjectOpen = false)}
+    onclose={closeNewProject}
     onlaunched={projectLaunchSettled}
   />
+{/if}
+{#if tutorials.firstRunOpen}
+  <TutorialOverlay kind="first-run" />
+{:else if tutorials.newProjectOpen}
+  <TutorialOverlay kind="new-project" />
 {/if}
 {#if store.needsPairing}
   <div class="pairing-overlay">

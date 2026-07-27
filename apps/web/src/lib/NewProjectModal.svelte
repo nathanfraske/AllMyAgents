@@ -593,7 +593,7 @@
 <svelte:window onkeydown={onKey} />
 
 <div class="backdrop" role="button" tabindex="-1" onclick={onclose} onkeydown={() => {}}></div>
-<div class="modal" role="dialog" aria-modal="true" aria-label="New project">
+<div class="modal" role="dialog" aria-modal="true" aria-label="New project" data-tutorial-anchor="new-project-flow">
   <header>
     <div>
       <span class="eyebrow">NEW PROJECT</span>
@@ -664,7 +664,7 @@
           </div>
         {/if}
       {:else}
-        <div class="source-actions">
+        <div class="source-actions" data-tutorial-anchor="project-source">
           <button class="source" class:active={projectSource === 'local'} onclick={() => (projectSource = 'local')}>
             <Icon name="folder" size={17} />
             <span><b>Choose a directory</b><small>Use a folder already on this computer.</small></span>
@@ -775,7 +775,7 @@
             </label>
 
             {#if managerEnabled}
-              <div class="manager-setup">
+              <div class="manager-setup" data-tutorial-anchor="project-manager-setup">
                 <ManagerSetupModal
                   embedded
                   deferLaunch

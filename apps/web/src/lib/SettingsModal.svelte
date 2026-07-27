@@ -12,6 +12,7 @@
     prepareExternalTarget,
   } from './externalUrl'
   import { inTauri } from './window'
+  import type { AccountLoginView } from './tutorialState.svelte'
   import {
     loadSettingsTab,
     saveSettingsTab,
@@ -20,9 +21,25 @@
     type SettingsTabId,
   } from './settingsSections'
 
-  let { onclose }: { onclose: () => void } = $props()
+  let {
+    onclose,
+    initialTab,
+    onloginstate = () => {},
+    onreplayfirst = () => {},
+    onreplayproject = () => {},
+  }: {
+    onclose: () => void
+    initialTab?: SettingsTabId
+    onloginstate?: (view: AccountLoginView) => void
+    onreplayfirst?: () => void
+    onreplayproject?: () => void
+  } = $props()
   let writeError = $state('')
   let activeTab = $state<SettingsTabId>(loadSettingsTab())
+
+  $effect(() => {
+    if (initialTab) activeTab = initialTab
+  })
 
   function selectTab(tabId: SettingsTabId): void {
     activeTab = tabId
@@ -150,6 +167,17 @@
   let loginId = $state('')
   let loginUrl = $state('')
   let loginCode = $state('')
+  let loginStartedAt = $state<number | undefined>()
+  let loginRequestCancelled = false
+
+  $effect(() => {
+    onloginstate({
+      status: loginState,
+      provider: addProvider,
+      startedAt: loginStartedAt,
+      message: loginMsg,
+    })
+  })
 
   const loginCmd = $derived(
     `pnpm login:${addProvider} profiles/${addName.trim() || (addProvider + '-b')}`
@@ -208,13 +236,20 @@
       return
     }
     const target = prepareExternalTarget()
+    loginRequestCancelled = false
     loginState = 'waiting'
+    loginStartedAt = Date.now()
     loginMsg = `Starting ${addProvider === 'claude' ? 'Claude' : 'Codex'} sign-in…`
     loginId = ''
     loginUrl = ''
     loginCode = ''
     try {
       const r = await api.login(addProvider, name)
+      if (loginRequestCancelled || loginState !== 'waiting') {
+        closePreparedTarget(target)
+        if (r.loginId) void api.cancelLogin(r.loginId)
+        return
+      }
       if (!r.ok || !r.loginId || !r.url) {
         closePreparedTarget(target)
         loginState = 'error'
@@ -236,6 +271,7 @@
       await finishLogin(r.loginId, name)
     } catch (e) {
       closePreparedTarget(target)
+      if (loginRequestCancelled) return
       if (loginId) void api.cancelLogin(loginId)
       loginState = 'error'
       loginMsg = e instanceof Error ? e.message : 'Login request failed.'
@@ -244,9 +280,11 @@
   }
 
   async function cancelActiveLogin(): Promise<void> {
+    loginRequestCancelled = true
     const id = loginId
     loginId = ''
     loginState = 'cancelled'
+    loginStartedAt = undefined
     loginMsg = 'Sign-in cancelled. No account was added.'
     loginUrl = ''
     loginCode = ''
@@ -254,6 +292,7 @@
   }
 
   function closeModal(): void {
+    loginRequestCancelled = true
     if (loginId) void api.cancelLogin(loginId)
     onclose()
   }
@@ -350,7 +389,7 @@
           </div>
         {/each}
       </div>
-      <div class="add">
+      <div class="add" data-tutorial-anchor="account-sign-in">
         <div class="add-row">
           <select bind:value={addProvider} disabled={loginState === 'waiting'}>
             <option value="claude">Claude</option>
@@ -368,13 +407,13 @@
           <div class="login-actions">
             <a class="btn" href={loginUrl} target="_blank" rel="noopener noreferrer">Open sign-in page</a>
             {#if loginCode}<code class="login-code">{loginCode}</code>{/if}
-            {#if loginState === 'waiting'}
-              <button class="btn" onclick={cancelActiveLogin}>Cancel</button>
-            {/if}
           </div>
         {:else if loginState === 'error'}
           <p class="hint dim">If browser sign-in is unavailable, run this fallback and then Rescan:</p>
           <code class="cmd">{loginCmd}</code>
+        {/if}
+        {#if loginState === 'waiting'}
+          <button class="btn" onclick={cancelActiveLogin}>Cancel</button>
         {/if}
         <p class="hint dim">Sign-in runs inside the app with no terminal window. Keep this panel open while you finish in the browser.</p>
         <button class="btn" onclick={rescan} disabled={rescanning}>{rescanning ? 'rescanning…' : 'Rescan accounts'}</button>
@@ -564,6 +603,15 @@
       </section>
     {/if}
 
+    <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Getting started')}>
+      <h3>Getting started</h3>
+      <p class="hint dim">Replay either guide whenever you want. Replaying does not make it appear automatically again.</p>
+      <div class="tutorial-actions">
+        <button class="btn" onclick={onreplayfirst}>Show getting started tutorial</button>
+        <button class="btn" onclick={onreplayproject}>Explain New Project</button>
+      </div>
+    </section>
+
     <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Maintenance')}>
       <h3>Maintenance</h3>
       <div class="restart-row">
@@ -719,6 +767,7 @@
   .prac-revoke { margin-left: auto; padding: 0.15rem 0.5rem; font-size: var(--text-2xs); }
   .prac-body { font-size: var(--text-xs); line-height: 1.5; margin-top: var(--space-2); white-space: pre-wrap; }
   .prac-prov { font-size: var(--text-2xs); font-family: var(--mono); margin-top: var(--space-2); }
+  .tutorial-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
   .restart-row { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }
   .restart-msg { font-size: var(--text-xs); line-height: 1.45; }
   .restart-msg.restarting { color: var(--warn); }
