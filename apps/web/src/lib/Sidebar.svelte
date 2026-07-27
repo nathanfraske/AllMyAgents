@@ -1,6 +1,6 @@
 <script lang="ts">
   import { untrack } from 'svelte'
-  import { api } from './api'
+  import { api, type ProjectInfo } from './api'
   import { store, type SessionView } from './store.svelte'
   import { confirmDialog } from './dialog.svelte'
   import { relativeTime } from './time'
@@ -10,6 +10,7 @@
   import Icon from './Icon.svelte'
   import { unreadMailCount, unreadMailTitle } from './unreadMail'
   import ImportChats from './ImportChats.svelte'
+  import GitHubImport from './GitHubImport.svelte'
   import { flip } from 'svelte/animate'
   import { cubicOut } from 'svelte/easing'
   import { loadCollapsedFolders, saveCollapsedFolders } from './uiState'
@@ -31,6 +32,7 @@
   let newName = $state('')
   let newPath = $state('')
   let createErr = $state('')
+  let showGitHub = $state(false)
 
   function pathFor(id: string): string {
     return store.projects.find((p) => p.id === id)?.path ?? ''
@@ -483,6 +485,15 @@
     store.openImportPanel(out.id, out.path)
   }
 
+  async function githubImported(project: ProjectInfo): Promise<void> {
+    await store.refreshProjects()
+    showGitHub = false
+    showCreate = false
+    // A selected project draft is the app's normal "new agent" state: no vendor process is started just
+    // for opening it, and the first message materializes the agent with this project as its destination.
+    await store.newSession(undefined, project.id)
+  }
+
   async function act(e: MouseEvent, id: string, verb: 'interrupt' | 'stop'): Promise<void> {
     e.stopPropagation()
     if (verb === 'interrupt') await api.interrupt(id)
@@ -532,6 +543,13 @@
       </div>
       <button class="mkbtn" onclick={createProject}>create project</button>
       {#if createErr}<div class="err">{createErr}</div>{/if}
+      <button class="ghbtn" class:on={showGitHub} onclick={() => (showGitHub = !showGitHub)}>
+        <Icon name="git-branch" size={13} />
+        Clone from GitHub
+      </button>
+      {#if showGitHub}
+        <GitHubImport onImported={githubImported} onClose={() => (showGitHub = false)} />
+      {/if}
     </div>
   {/if}
 
@@ -732,6 +750,8 @@
   .browse:hover { border-color: var(--border-accent); color: var(--text); }
   .mkbtn { background: var(--accent); color: #fff; border-radius: var(--r-md); padding: var(--space-2); font-weight: var(--fw-medium); box-shadow: var(--edge-hi), var(--shadow-1); }
   .mkbtn:hover { filter: brightness(1.08); }
+  .ghbtn { display: flex; align-items: center; justify-content: center; gap: var(--space-2); border: 1px solid var(--border-strong); border-radius: var(--r-md); padding: var(--space-2); color: var(--muted); font-size: var(--text-sm); }
+  .ghbtn:hover, .ghbtn.on { border-color: var(--border-accent); color: var(--text); background: var(--surface-2); }
   .err { color: var(--bad-text); font-size: var(--text-xs); }
   /* min-height:0 lets flex:1 bound the list below its content so its own `.scroll` overflow engages,
      instead of the list growing to fit every chat and pushing the sidebar (and the window) taller. */
