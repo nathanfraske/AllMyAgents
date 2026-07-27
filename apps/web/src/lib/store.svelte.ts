@@ -1512,6 +1512,7 @@ export class HubStore {
           result?: string
           errors?: string[]
           terminal_reason?: string
+          model?: string
           total_cost_usd?: number
           modelUsage?: Record<string, { inputTokens?: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number; contextWindow?: number }>
         }
@@ -1550,15 +1551,21 @@ export class HubStore {
         view.turnStartedAt = undefined
         if (typeof p.total_cost_usd === 'number') view.costUsd = (view.costUsd ?? 0) + p.total_cost_usd
         if (p.modelUsage) {
-          let best: { used: number; window: number } | null = null
-          for (const m of Object.values(p.modelUsage)) {
-            const used = (m.inputTokens ?? 0) + (m.cacheReadInputTokens ?? 0) + (m.cacheCreationInputTokens ?? 0)
-            if (m.contextWindow && (!best || used > best.used)) best = { used, window: m.contextWindow }
-          }
-          if (best) {
-            view.contextUsed = best.used
-            view.contextWindow = best.window
-          }
+          // WINDOW ONLY. `modelUsage` is a per-turn AGGREGATE across every round-trip in the turn, so
+          // using it as "context in use" summed each tool call's prompt on top of the last: a real
+          // session displayed 4,333.7K against a 1M window — four times the entire context — and the
+          // earlier 1562k/1000k was the same thing, smaller. It cannot even fall after a compaction,
+          // because it is only written at end-of-turn and is a total rather than an occupancy.
+          //
+          // Actual occupancy comes from the LATEST assistant message's own usage (applyClaudeAssistant),
+          // which is per-request and therefore bounded by the window by construction.
+          //
+          // Pick the MAIN CONVERSATION model, not max-used. A turn can involve a side model (haiku at
+          // 200k alongside opus at 1M); max-picking happened to choose opus here, but a side model with
+          // a larger aggregate would have selected the wrong window and quietly rescaled the meter.
+          const main = p.model && p.modelUsage[p.model] ? p.modelUsage[p.model] : undefined
+          const window = main?.contextWindow ?? Object.values(p.modelUsage).find((m) => m.contextWindow)?.contextWindow
+          if (window) view.contextWindow = window
         }
         break
       }
@@ -1607,10 +1614,33 @@ export class HubStore {
 
   private applyClaudeAssistant(view: SessionView, ts: string, payload: unknown): void {
     const p = payload as {
-      message?: { content?: ClaudeBlock[] }
+      message?: {
+        content?: ClaudeBlock[]
+        usage?: {
+          input_tokens?: number
+          cache_read_input_tokens?: number
+          cache_creation_input_tokens?: number
+        }
+      }
       parent_tool_use_id?: string | null
       subagent_type?: string
       task_description?: string
+    }
+    // THE CONTEXT METER'S REAL SOURCE. Each assistant message carries the usage of the request that
+    // produced it, so input + cache-read + cache-creation IS the prompt that was actually sent — current
+    // occupancy, bounded by the window by construction. Taking the latest one means the meter tracks
+    // reality, including falling after a compaction, which the previous end-of-turn aggregate could not
+    // do at all (it only ever grew, and reached 4x the window on a real session).
+    //
+    // Cache-read is the bulk of it under prompt caching and is genuinely IN the context, so it must be
+    // counted — the mirror-image mistake to the live counter below it, which drops those same fields and
+    // therefore reads single digits.
+    //
+    // Only the MAIN thread: a sub-agent's usage is its own context, not this conversation's.
+    const u = p.message?.usage
+    if (u && p.parent_tool_use_id == null) {
+      const used = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0)
+      if (used > 0) view.contextUsed = used
     }
     const content = p.message?.content
     if (!Array.isArray(content)) return

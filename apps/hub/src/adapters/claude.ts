@@ -127,19 +127,30 @@ export class ClaudeDriver {
     }
   }
 
-  // Best-effort: emit a `session/tokens` event from an Anthropic usage object. Fields are
-  // input_tokens/output_tokens (there is no total_tokens on Anthropic usage), so total is the
-  // sum of whichever of the two is present. No-op when the usage object carries neither.
+  // Best-effort: emit a `session/tokens` event from an Anthropic usage object.
+  //
+  // CACHE FIELDS ARE PART OF THE INPUT, and dropping them made this counter meaningless. Anthropic
+  // reports a cached prompt as `cache_read_input_tokens`, leaving `input_tokens` as only the handful of
+  // NEW tokens — typically 1 or 2. So a live turn carrying ~170k of real context streamed
+  // `{"input":1,"output":3,"total":4}` and the UI dutifully displayed "4 tokens". Not a formatting
+  // problem: the number was right for what it measured and measuring the wrong thing.
+  //
+  // Kept as separate fields as well as the total, so a reader can still distinguish fresh input from
+  // cache reads — that distinction is the whole reason prompt caching is worth having.
   private emitTokens(usage: unknown): void {
     if (!usage || typeof usage !== 'object') return
     const u = usage as Record<string, unknown>
     const input = numField(u.input_tokens)
+    const cacheRead = numField(u.cache_read_input_tokens)
+    const cacheWrite = numField(u.cache_creation_input_tokens)
     const output = numField(u.output_tokens)
-    if (input === undefined && output === undefined) return
-    const out: { input?: number; output?: number; total?: number } = {}
+    if (input === undefined && output === undefined && cacheRead === undefined && cacheWrite === undefined) return
+    const out: { input?: number; cacheRead?: number; cacheWrite?: number; output?: number; total?: number } = {}
     if (input !== undefined) out.input = input
+    if (cacheRead !== undefined) out.cacheRead = cacheRead
+    if (cacheWrite !== undefined) out.cacheWrite = cacheWrite
     if (output !== undefined) out.output = output
-    out.total = (input ?? 0) + (output ?? 0)
+    out.total = (input ?? 0) + (cacheRead ?? 0) + (cacheWrite ?? 0) + (output ?? 0)
     this.onEvent('session/tokens', out)
   }
 
