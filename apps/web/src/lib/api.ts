@@ -373,6 +373,12 @@ async function jpost<T>(url: string, body?: unknown): Promise<T> {
   return r.data
 }
 
+async function jdelete<T>(url: string): Promise<T> {
+  const r = await request<T>('DELETE', url, HUB_HTTP)
+  if (!r.ok) return { error: r.error } as T
+  return r.data
+}
+
 // Some POSTs use a non-2xx status as a deliberate, typed outcome rather than a transport failure. Keep
 // that exception explicit at the call site so ordinary 401/404/409 responses still collapse to {error}.
 async function jpostExpected<T>(
@@ -387,11 +393,12 @@ async function jpostExpected<T>(
 
 export interface LoginResult {
   ok: boolean
+  loginId?: string
   added?: string
   provider?: string
-  launched?: boolean
-  timedOut?: boolean
-  platform?: string
+  status?: 'capturing' | 'waiting' | 'complete' | 'failed' | 'cancelled' | 'timed-out'
+  url?: string
+  code?: string
   manual?: string
   error?: string
 }
@@ -550,6 +557,8 @@ export const api = {
   rescanProfiles: () => jpost<ProfileInfo[] | ApiError>('/api/profiles/rescan'),
   login: (provider: 'claude' | 'codex', name: string) =>
     jpost<LoginResult>('/api/accounts/login', { provider, name }),
+  loginStatus: (id: string) => jget<LoginResult>(`/api/accounts/login/${encodeURIComponent(id)}`),
+  cancelLogin: (id: string) => jdelete<LoginResult>(`/api/accounts/login/${encodeURIComponent(id)}`),
   pickFolder: () => jpost<{ path: string }>('/api/pick-folder'),
   projects: () => jget<ProjectInfo[]>('/api/projects'),
   projectActivity: (projectId: string) =>

@@ -7,6 +7,12 @@
   import { modelsFor } from './catalog'
   import { updater, updatesSupported } from './updater.svelte'
   import {
+    closePreparedTarget,
+    openExternalUrl,
+    prepareExternalTarget,
+  } from './externalUrl'
+  import { inTauri } from './window'
+  import {
     loadSettingsTab,
     saveSettingsTab,
     settingsTabHasSection,
@@ -139,8 +145,11 @@
   let addName = $state('')
   let rescanning = $state(false)
 
-  let loginState = $state<'idle' | 'waiting' | 'done' | 'error'>('idle')
+  let loginState = $state<'idle' | 'waiting' | 'done' | 'error' | 'cancelled'>('idle')
   let loginMsg = $state('')
+  let loginId = $state('')
+  let loginUrl = $state('')
+  let loginCode = $state('')
 
   const loginCmd = $derived(
     `pnpm login:${addProvider} profiles/${addName.trim() || (addProvider + '-b')}`
@@ -163,8 +172,34 @@
     writeError = result.error ?? ''
   }
 
-  // One-click login: opens a terminal/browser on the hub, then waits for the account to
-  // register. Local component state only — no store state for the in-flight login.
+  const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+  async function finishLogin(id: string, name: string): Promise<void> {
+    while (loginState === 'waiting' && loginId === id) {
+      await delay(1_000)
+      const result = await api.loginStatus(id)
+      if (loginId !== id || loginState !== 'waiting') return
+      if (result.status === 'waiting' || result.status === 'capturing') continue
+      if (result.status === 'complete' && result.ok) {
+        const scan = await store.rescanProfiles()
+        if (scan.error) throw new Error(scan.error)
+        loginState = 'done'
+        loginMsg = `Added ${result.added ?? name}. It now appears in your accounts.`
+        loginId = ''
+        loginUrl = ''
+        loginCode = ''
+        addName = ''
+        return
+      }
+      loginState = result.status === 'cancelled' ? 'cancelled' : 'error'
+      loginMsg = result.error ?? 'Sign-in ended before the account was added. Retry or use Rescan accounts.'
+      loginId = ''
+      return
+    }
+  }
+
+  // The hub captures OAuth while the desktop shell owns opening the browser. A plain browser reserves
+  // a tab synchronously so popup blocking cannot turn the delayed URL handoff into a silent no-op.
   async function login(): Promise<void> {
     const name = addName.trim()
     if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
@@ -172,31 +207,59 @@
       loginMsg = 'Enter a profile name first (letters, numbers, dashes or underscores).'
       return
     }
+    const target = prepareExternalTarget()
     loginState = 'waiting'
-    loginMsg =
-      addProvider === 'claude'
-        ? 'A terminal will open with Claude — type /login there and finish the browser sign-in…'
-        : 'A terminal and browser will open for Codex sign-in — complete it there…'
+    loginMsg = `Starting ${addProvider === 'claude' ? 'Claude' : 'Codex'} sign-in…`
+    loginId = ''
+    loginUrl = ''
+    loginCode = ''
     try {
       const r = await api.login(addProvider, name)
-      if (r.ok) {
-        const scan = await store.rescanProfiles()
-        if (scan.error) throw new Error(scan.error)
-        loginState = 'done'
-        loginMsg = `Added ${r.added ?? name}. It now appears in your accounts.`
-        addName = ''
-      } else {
+      if (!r.ok || !r.loginId || !r.url) {
+        closePreparedTarget(target)
         loginState = 'error'
-        loginMsg = r.error ?? 'Login did not complete. Finish the sign-in, then Rescan.'
+        loginMsg = r.error ?? 'The login command did not provide a browser sign-in URL.'
+        return
       }
+      loginId = r.loginId
+      loginUrl = r.url
+      loginCode = r.code ?? ''
+      // Claude 2.1.218 has no no-browser flag and opens the captured URL itself. In the local desktop
+      // shell, opening it again would create two tabs; remote/plain-browser clients still use the app
+      // opener because the hub-side browser may not exist or may be on another machine.
+      const opened = addProvider === 'claude' && inTauri
+        ? true
+        : await openExternalUrl(r.url, target)
+      loginMsg = opened
+        ? 'Waiting for you to finish in the browser…'
+        : 'The browser could not be opened automatically. Use “Open sign-in page” below, then finish there.'
+      await finishLogin(r.loginId, name)
     } catch (e) {
+      closePreparedTarget(target)
+      if (loginId) void api.cancelLogin(loginId)
       loginState = 'error'
       loginMsg = e instanceof Error ? e.message : 'Login request failed.'
+      loginId = ''
     }
   }
 
+  async function cancelActiveLogin(): Promise<void> {
+    const id = loginId
+    loginId = ''
+    loginState = 'cancelled'
+    loginMsg = 'Sign-in cancelled. No account was added.'
+    loginUrl = ''
+    loginCode = ''
+    if (id) await api.cancelLogin(id)
+  }
+
+  function closeModal(): void {
+    if (loginId) void api.cancelLogin(loginId)
+    onclose()
+  }
+
   function onKey(e: KeyboardEvent): void {
-    if (e.key === 'Escape') onclose()
+    if (e.key === 'Escape') closeModal()
   }
 
   // --- Auto monthly budget from subscription level -------------------------------------
@@ -253,11 +316,11 @@
 
 <svelte:window onkeydown={onKey} />
 
-<div class="backdrop" role="button" tabindex="-1" onclick={onclose} onkeydown={() => {}}></div>
+<div class="backdrop" role="button" tabindex="-1" onclick={closeModal} onkeydown={() => {}}></div>
 <div class="modal" role="dialog" aria-modal="true" aria-label="Settings">
   <div class="head">
     <h2>Settings</h2>
-    <button class="btn-icon" onclick={onclose} aria-label="close"><Icon name="x" size={17} /></button>
+    <button class="btn-icon" onclick={closeModal} aria-label="close"><Icon name="x" size={17} /></button>
   </div>
 
   <div class="settings-layout">
@@ -301,8 +364,19 @@
         {#if loginState !== 'idle'}
           <p class="status {loginState}">{loginMsg}</p>
         {/if}
-        <p class="hint dim">One click opens a terminal + browser to sign in (Windows and macOS). On other platforms, run this manually then Rescan:</p>
-        <code class="cmd">{loginCmd}</code>
+        {#if loginUrl}
+          <div class="login-actions">
+            <a class="btn" href={loginUrl} target="_blank" rel="noopener noreferrer">Open sign-in page</a>
+            {#if loginCode}<code class="login-code">{loginCode}</code>{/if}
+            {#if loginState === 'waiting'}
+              <button class="btn" onclick={cancelActiveLogin}>Cancel</button>
+            {/if}
+          </div>
+        {:else if loginState === 'error'}
+          <p class="hint dim">If browser sign-in is unavailable, run this fallback and then Rescan:</p>
+          <code class="cmd">{loginCmd}</code>
+        {/if}
+        <p class="hint dim">Sign-in runs inside the app with no terminal window. Keep this panel open while you finish in the browser.</p>
         <button class="btn" onclick={rescan} disabled={rescanning}>{rescanning ? 'rescanning…' : 'Rescan accounts'}</button>
       </div>
     </section>
@@ -596,10 +670,14 @@
   .add-row select { flex: none; }
   .add-row input { flex: 1; }
   .add-row .btn { flex: none; align-self: stretch; }
+  .login-actions { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
+  .login-actions a { text-decoration: none; }
+  .login-code { font-size: var(--text-sm); letter-spacing: 0.08em; user-select: all; }
   .cmd { display: block; background: var(--bg); border: 1px solid var(--border-subtle); border-radius: var(--r-md); padding: var(--space-3) var(--space-4); font-size: var(--text-xs); color: var(--cyan); }
   .status { font-size: var(--text-xs); line-height: 1.45; margin: 0.1rem 0 0.15rem; }
   .status.waiting { color: var(--warn); }
   .status.done { color: var(--ok); }
+  .status.cancelled { color: var(--muted); }
   .status.error { color: var(--bad-text); }
   .write-error { margin: 0; }
   .opt { display: flex; align-items: center; gap: var(--space-3); margin-bottom: var(--space-3); }
