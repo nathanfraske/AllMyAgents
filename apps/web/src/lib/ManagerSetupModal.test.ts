@@ -141,6 +141,7 @@ describe('Manager setup', () => {
     expect(task.value).toBe('')
     await fireEvent.input(task, { target: { value: 'Coordinate the release now.' } })
     await fireEvent.change(getByLabelText(/manager permission level/i), { target: { value: 'edits' } })
+    await fireEvent.change(getByLabelText(/maximum child permission level/i), { target: { value: 'full' } })
     await fireEvent.click(getByRole('button', { name: /^create and launch manager$/i }))
 
     expect(spawn).toHaveBeenCalledWith(expect.objectContaining({ permissionMode: 'edits' }))
@@ -149,6 +150,7 @@ describe('Manager setup', () => {
       'manager',
       expect.objectContaining({
         operatorTask: 'Coordinate the release now.',
+        maxChildPermissionMode: 'full',
         standingInstructions: expect.stringMatching(/delegate.*AllMyAgents workers/is),
       }),
     )

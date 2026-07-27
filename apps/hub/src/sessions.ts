@@ -501,6 +501,15 @@ export class SessionManager {
   /** The subset of a record the executor's driver needs (docs/agent-worker-impl.md §1.1). Built from the
    *  record + resolved profile; label matches identityOf(record) so the worker/executor reconstructs the
    *  same SessionIdentity for MCP attribution. */
+  private effectivePermissionMode(record: SessionRecord): 'safe' | 'edits' | 'full' {
+    const requested = record.permissionMode ?? 'safe'
+    if (!record.parentSessionId) return requested
+    const manager = this.sessions.get(record.parentSessionId)
+    if (manager?.isProjectManager !== true) return 'safe'
+    const ceiling = manager.managerMaxChildPermissionMode ?? 'safe'
+    return permissionModeRank(requested) <= permissionModeRank(ceiling) ? requested : ceiling
+  }
+
   private specOf(record: SessionRecord): WorkerSessionSpec {
     const profile = this.profileOf(record)
     // ProjectStore owns consent and content-fingerprint validation. This seam carries only its current
@@ -531,7 +540,7 @@ export class SessionManager {
       model: record.model,
       effort: record.effort,
       serviceTier: record.serviceTier,
-      permissionMode: record.permissionMode,
+      permissionMode: this.effectivePermissionMode(record),
       trustProjectConfig,
       vendorSessionId: record.vendorSessionId,
     }
@@ -1280,6 +1289,7 @@ export class SessionManager {
       operatorTask?: string
       standingInstructions?: string
       canApproveChildren?: boolean
+      maxChildPermissionMode?: 'safe' | 'edits' | 'full'
     },
     actor: 'operator' | 'agent'
   ): SessionRecord {
@@ -1328,6 +1338,11 @@ export class SessionManager {
     if (typeof standingInstructions !== 'string' || standingInstructions.length > 20_000) {
       throw new Error('standingInstructions must be text no longer than 20,000 characters')
     }
+    const maxChildPermissionMode =
+      config.maxChildPermissionMode ?? record.managerMaxChildPermissionMode ?? 'safe'
+    if (!isPermissionMode(maxChildPermissionMode)) {
+      throw new Error('maxChildPermissionMode must be safe, edits, or full')
+    }
 
     const affected = [
       record,
@@ -1352,6 +1367,7 @@ export class SessionManager {
         record.managerCanApproveChildren = config.enabled
           ? (config.canApproveChildren ?? record.managerCanApproveChildren ?? true)
           : undefined
+        record.managerMaxChildPermissionMode = config.enabled ? maxChildPermissionMode : undefined
         this.instructions.set(
           `session:${record.id}`,
           config.enabled ? standingInstructions : '',
@@ -1364,6 +1380,19 @@ export class SessionManager {
         const ceiling = new Set(record.managerDelegation ?? [])
         const toolCeiling = new Set(record.managerAllowedTools ?? [])
         for (const child of affected.slice(1)) {
+          const childMode = child.permissionMode ?? 'safe'
+          const permissionCeiling = record.managerMaxChildPermissionMode ?? 'safe'
+          if (permissionModeRank(childMode) > permissionModeRank(permissionCeiling)) {
+            child.permissionMode = permissionCeiling
+            this.persist(child)
+            this.journal.append(record.id, 'manager/permission-mode-narrowed', {
+              managerSessionId: record.id,
+              childSessionId: child.id,
+              from: childMode,
+              to: permissionCeiling,
+              by: 'operator',
+            })
+          }
           if (child.delegatedAuthorities?.length) {
             const next = child.delegatedAuthorities.filter((authority) => ceiling.has(authority))
             const revoked = child.delegatedAuthorities.filter((authority) => !ceiling.has(authority))
@@ -1407,6 +1436,7 @@ export class SessionManager {
           operatorTask: record.managerOperatorTask ?? '',
           standingInstructions: record.managerStandingInstructions ?? '',
           canApproveChildren: record.managerCanApproveChildren ?? false,
+          maxChildPermissionMode: record.managerMaxChildPermissionMode ?? 'safe',
           by: 'operator',
           previousRole: previouslyManager,
           removedAuthorities: [...previousCeiling].filter((authority) => !ceiling.has(authority)),
@@ -1630,6 +1660,14 @@ export class SessionManager {
     if (outsideTools.length) {
       return { ok: false, error: `cannot delegate tools outside the operator-granted ceiling: ${outsideTools.join(', ')}` }
     }
+    const requestedPermissionMode = input.permissionMode ?? 'safe'
+    const permissionCeiling = manager.managerMaxChildPermissionMode ?? 'safe'
+    if (permissionModeRank(requestedPermissionMode) > permissionModeRank(permissionCeiling)) {
+      return {
+        ok: false,
+        error: `child permission mode ${requestedPermissionMode} exceeds the operator-granted ${permissionCeiling} ceiling`,
+      }
+    }
 
     try {
       const child = await this.create(profileId, {
@@ -1639,7 +1677,7 @@ export class SessionManager {
         prompt: input.prompt,
         model,
         effort,
-        permissionMode: input.permissionMode ?? 'safe',
+        permissionMode: requestedPermissionMode,
         useWorktree: input.useWorktree !== false,
         parentSessionId: manager.id,
         // Persist the child safely NARROW first. The intended grants are applied below with their audit
@@ -2410,6 +2448,13 @@ export class SessionManager {
   setMode(sessionId: string, mode: 'safe' | 'edits' | 'full'): void {
     const record = this.sessions.get(sessionId)
     if (!record) throw new Error(`unknown session: ${sessionId}`)
+    const manager = record.parentSessionId ? this.sessions.get(record.parentSessionId) : undefined
+    if (
+      manager?.isProjectManager === true &&
+      permissionModeRank(mode) > permissionModeRank(manager.managerMaxChildPermissionMode ?? 'safe')
+    ) {
+      throw new Error(`permission mode ${mode} exceeds the parent manager's operator-granted ceiling`)
+    }
     record.permissionMode = mode
     this.persist(record)
     this.journal.append(sessionId, 'session/mode', { permissionMode: mode })
@@ -2551,7 +2596,8 @@ export class SessionManager {
     const toolName = (payload as { toolName?: unknown } | null)?.toolName
     if (typeof toolName === 'string' && NEVER_AUTO_APPROVED_TOOLS.has(toolName)) return false
 
-    if (record.permissionMode === 'full') return true
+    const effectivePermissionMode = this.effectivePermissionMode(record)
+    if (effectivePermissionMode === 'full') return true
 
     // "Edits" mode has to actually free edits. The picker offers it as "auto-approve file edits", but
     // nothing implemented that: `acceptEdits` was passed to the SDK, which then consulted our own
@@ -2561,7 +2607,7 @@ export class SessionManager {
     //
     // Containment still applies first: checkWriteScope denies an out-of-worktree write in canUseTool,
     // before any approval is requested, so freeing edits never widens WHERE they may land.
-    if (record.permissionMode === 'edits') {
+    if (effectivePermissionMode === 'edits') {
       // Claude only. The Claude path is safe to free because checkWriteScope has ALREADY denied any write
       // outside the worktree, inside canUseTool, before this policy is ever consulted.
       //
@@ -3094,7 +3140,7 @@ export class SessionManager {
     // turn in the chat; the self-gates above are separate and keep their own busCanUseRiskyTools switch.
     const spec = {
       ...this.specOf(record),
-      permissionMode: clampMode(record.permissionMode, this.danger.fullAccessAnyOrigin === true),
+      permissionMode: clampMode(this.effectivePermissionMode(record), this.danger.fullAccessAnyOrigin === true),
     }
     // Tag this bus-caused turn so a Codex agent tool call (bridge → execAgentTool) sees isBusTurn and
     // hard-denies practice writes — the same self-gate provenance the executor tags for the Claude path.
@@ -3650,6 +3696,14 @@ function delegatedGitAuthority(kind: string, payload: unknown): DelegatedAuthori
  * and an unattended agent stalls on a prompt you are not there to answer. The argument against it is
  * equally real and is why this is OFF by default and lives in the Danger Zone.
  */
+function isPermissionMode(mode: unknown): mode is 'safe' | 'edits' | 'full' {
+  return mode === 'safe' || mode === 'edits' || mode === 'full'
+}
+
+function permissionModeRank(mode: 'safe' | 'edits' | 'full'): number {
+  return mode === 'safe' ? 0 : mode === 'edits' ? 1 : 2
+}
+
 function clampMode(mode: SessionRecord['permissionMode'], anyOrigin = false): 'safe' | 'edits' | 'full' {
   const m = mode ?? 'safe'
   if (anyOrigin) return m

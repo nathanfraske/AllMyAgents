@@ -353,6 +353,7 @@ describe('project-manager delegated authority security boundary', () => {
         operatorTask?: string
         standingInstructions?: string
         canApproveChildren?: boolean
+        maxChildPermissionMode?: 'safe' | 'edits' | 'full'
       },
       actor: 'operator' | 'agent'
     ): SessionRecord
@@ -364,7 +365,13 @@ describe('project-manager delegated authority security boundary', () => {
     ): SessionRecord
     managerSpawn(
       managerSessionId: string,
-      input: { profileId?: string; agentType?: string; prompt: string; model?: string }
+      input: {
+        profileId?: string
+        agentType?: string
+        prompt: string
+        model?: string
+        permissionMode?: 'safe' | 'edits' | 'full'
+      }
     ): Promise<{ ok: boolean; sessionId?: string; error?: string }>
     decideChildApproval(
       managerSessionId: string,
@@ -608,6 +615,93 @@ describe('project-manager delegated authority security boundary', () => {
 
     await expect(controls(sessions).managerSpawn('s1', { profileId: 'p1', prompt: 'another task' }))
       .resolves.toMatchObject({ ok: false, error: expect.stringMatching(/live child limit reached \(1\/1\)/) })
+  })
+
+  it('a manager cannot spawn a child above the operator-granted permission-mode ceiling', async () => {
+    const { sessions, seed } = makeSessions()
+    seed({
+      isProjectManager: true,
+      managerMaxLiveChildren: 2,
+      managerAllowedProfiles: ['p1'],
+      managerDelegation: ['commit'],
+      managerMaxChildPermissionMode: 'safe',
+    } as Partial<SessionRecord> & { managerMaxChildPermissionMode: 'safe' })
+    const internals = sessions as unknown as {
+      create(profileId: string, options: unknown): Promise<SessionRecord>
+    }
+    let createCalled = false
+    internals.create = async () => {
+      createCalled = true
+      return seed({ id: 'child', parentSessionId: 's1', permissionMode: 'full' })
+    }
+
+    await expect(controls(sessions).managerSpawn('s1', {
+      profileId: 'p1',
+      prompt: 'escape the delegated scope',
+      permissionMode: 'full',
+    })).resolves.toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/permission.*ceiling/i),
+    })
+    expect(createCalled).toBe(false)
+  })
+
+  it('lowering the permission-mode ceiling immediately narrows existing direct children and journals it', () => {
+    const { sessions, seed } = makeSessions()
+    seed({
+      isProjectManager: true,
+      managerMaxLiveChildren: 2,
+      managerAllowedProfiles: ['p1'],
+      managerMaxChildPermissionMode: 'full',
+    })
+    const child = seed({
+      id: 'child',
+      parentSessionId: 's1',
+      permissionMode: 'full',
+    })
+    const journal = (sessions as unknown as { journal: Journal }).journal
+
+    controls(sessions).configureProjectManager(
+      's1',
+      {
+        enabled: true,
+        maxLiveChildren: 2,
+        allowedProfiles: ['p1'],
+        maxChildPermissionMode: 'edits',
+      },
+      'operator',
+    )
+
+    expect(child.permissionMode).toBe('edits')
+    expect(journal.replay(0)).toContainEqual(expect.objectContaining({
+      sessionId: 's1',
+      kind: 'manager/permission-mode-narrowed',
+      payload: expect.objectContaining({
+        childSessionId: 'child',
+        from: 'full',
+        to: 'edits',
+      }),
+    }))
+  })
+
+  it('a legacy child grant with no permission ceiling fails closed on the next action', () => {
+    const { sessions, seed } = makeSessions()
+    seed({
+      isProjectManager: true,
+      managerMaxLiveChildren: 2,
+      managerAllowedProfiles: ['p1'],
+    })
+    seed({
+      id: 'child',
+      parentSessionId: 's1',
+      permissionMode: 'full',
+    })
+    markOperatorTurn(sessions, 'child')
+
+    expect(sessions.isAutoApproved('child', 'claude/tool', {
+      toolName: 'Bash',
+      input: { command: 'pnpm test' },
+    })).toBe(false)
   })
 
   it('a manager cannot choose a child model outside the operator-granted profile model scope', async () => {

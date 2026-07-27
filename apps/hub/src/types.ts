@@ -91,6 +91,8 @@ export interface SessionRecord {
   managerStandingInstructions?: string
   /** Operator grant allowing this manager to decide pending approvals for its own direct children. */
   managerCanApproveChildren?: boolean
+  /** Maximum permission mode a manager may assign to direct children. Missing legacy grants fail closed to safe. */
+  managerMaxChildPermissionMode?: 'safe' | 'edits' | 'full'
   /** Durable session lineage for sidebar nesting and hub-originated child reports. */
   parentSessionId?: string
   /** Authorities this child received from its manager, still subject to the manager's live ceiling. */
