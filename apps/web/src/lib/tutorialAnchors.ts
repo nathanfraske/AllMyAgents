@@ -7,6 +7,10 @@ export const TUTORIAL_ANCHORS = {
   newScratchpad: 'new-scratchpad',
   newProjectFlow: 'new-project-flow',
   projectSource: 'project-source',
+  projectIndependentAgents: 'project-independent-agents',
+  projectWorktree: 'project-worktree',
+  projectManager: 'project-manager',
+  projectFinalize: 'project-finalize',
   projectView: 'project-view',
   projectManagerSetup: 'project-manager-setup',
 } as const

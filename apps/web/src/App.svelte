@@ -444,6 +444,7 @@
   <NewProjectModal
     onclose={closeNewProject}
     onlaunched={projectLaunchSettled}
+    tutorialStep={tutorials.newProjectOpen ? tutorials.newProjectStep : undefined}
   />
 {/if}
 {#if tutorials.firstRunOpen}
