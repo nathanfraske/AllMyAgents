@@ -31,7 +31,10 @@ import { writeManagedInstructions, agentContract } from './instructions.js'
 import type { InstructionStore } from './instructions.js'
 import { identityOf, readableScopes, type SessionIdentity } from './identity.js'
 import { runAgentTool, type AgentServices, type ManagerSpawnResult } from './agentToolCore.js'
-import { writeCodexAgentMcpConfig } from './codexMcpConfig.js'
+import {
+  stripCodexAgentMcpBlock,
+  writeCodexAgentMcpConfig,
+} from './codexMcpConfig.js'
 import type { AgentBus, BusAddress, BusMessage } from './bus.js'
 import type { MemoryStore } from './memory.js'
 import type { PracticeStore } from './practices.js'
@@ -61,6 +64,8 @@ import {
   checkWorktreeStaleness,
   type WorktreeStalenessCheck,
 } from './worktreeCollisionDetector.js'
+import { windowsPathToWsl } from './workspaceLocation.js'
+import { nativeWslExecutable } from './wslProcess.js'
 import {
   inspectProjectDeletion,
   type ProjectDeletionInspection,
@@ -576,12 +581,17 @@ export class SessionManager {
     // Claude. Guarded to once per profile, and a no-op until setCodexBridge wires the bridge (so tests /
     // dev-from-.ts runs write nothing). Replaces the branch's codexClientFor hook, which moved into the
     // executor — specOf is the hub-side chokepoint every codex turn/thread flows through.
-    if (record.provider === 'codex') this.ensureCodexMcpConfig(profile)
+    let executionProfileDir = profile.dir
+    if (record.provider === 'codex') {
+      executionProfileDir = record.wslDistro
+        ? this.ensureCodexWslProfile(profile, record.wslDistro)
+        : (this.ensureCodexMcpConfig(profile), profile.dir)
+    }
     return {
       sessionId: record.id,
       provider: record.provider,
       profileId: record.profileId,
-      profileDir: profile.dir,
+      profileDir: executionProfileDir,
       cwd: record.executionCwd ?? record.cwd,
       worktree: record.executionCwd && record.worktree ? record.executionCwd : record.worktree,
       ...(record.wslDistro ? { wsl: { distro: record.wslDistro } } : {}),
@@ -635,6 +645,50 @@ export class SessionManager {
         message: err instanceof Error ? err.message : String(err),
       })
     }
+  }
+
+  /**
+   * Codex config contains executable MCP paths, so one config.toml cannot be correct for a Windows
+   * app-server and a native Linux app-server concurrently. Give each distro a durable managed home,
+   * mirror only the managed profile's auth/bootstrap files, and write Linux-native bridge paths there.
+   */
+  private ensureCodexWslProfile(profile: Profile, distro: string): string {
+    if (!this.codexBridge || !isManagedProfile(profile.id)) return profile.dir
+    const slug = Buffer.from(distro, 'utf8').toString('base64url')
+    const target = path.join(profile.dir, '.allmyagents-wsl', slug)
+    fs.mkdirSync(target, { recursive: true })
+    for (const name of ['auth.json', 'models_cache.json', 'installation_id']) {
+      const source = path.join(profile.dir, name)
+      if (fs.existsSync(source)) fs.copyFileSync(source, path.join(target, name))
+    }
+    const configKey = `${profile.id}\0wsl:${distro.toLowerCase()}`
+    if (this.codexConfigWritten.has(configKey)) return target
+
+    const sourceConfig = path.join(profile.dir, 'config.toml')
+    let base = ''
+    try {
+      base = stripCodexAgentMcpBlock(fs.readFileSync(sourceConfig, 'utf8'))
+    } catch {
+      // A managed profile may legitimately have no config yet.
+    }
+    fs.writeFileSync(path.join(target, 'config.toml'), base)
+    const nodePath = nativeWslExecutable(distro, 'node')
+    const fileUrl = (value: string): string => windowsPathToWsl(value)
+    const file = writeCodexAgentMcpConfig(target, {
+      bridgePath: fileUrl(this.codexBridge.bridgePath),
+      hubUrl: this.codexBridge.hubUrl,
+      secret: this.codexBridge.secret,
+      profileId: profile.id,
+      nodePath,
+      nodeArgs: this.codexBridge.nodeArgs?.map(fileUrl),
+    })
+    this.codexConfigWritten.add(configKey)
+    this.journal.append(null, 'codex/mcp-config-written', {
+      profileId: profile.id,
+      distro,
+      file,
+    })
+    return target
   }
 
   /**
@@ -1315,7 +1369,20 @@ export class SessionManager {
           project.path,
           projectSessions
             .filter((record): record is SessionRecord & { worktree: string } => Boolean(record.worktree))
-            .map((record) => ({ repo: record.repo, worktree: record.worktree })),
+            .map((record) => ({
+              repo: record.repo,
+              worktree: record.worktree,
+              ...(record.wslDistro && record.executionRepo && record.executionCwd
+                ? {
+                    execution: {
+                      distro: record.wslDistro,
+                      repoPath: record.executionRepo,
+                      worktreePath: record.executionCwd,
+                    },
+                  }
+                : {}),
+            })),
+          project.location,
         )
       } catch (error) {
         return {
@@ -2052,7 +2119,20 @@ export class SessionManager {
   }
 
   private attachmentsFor(record: SessionRecord, ids: readonly string[] = []): AttachmentMeta[] {
-    const attachments = resolveAttachments(record.id, record.cwd, ids)
+    const attachments = resolveAttachments(record.id, record.cwd, ids).map((attachment) => {
+      if (!record.executionCwd) return attachment
+      const relative = path.relative(record.cwd, attachment.path)
+      if (path.isAbsolute(relative) || relative === '..' || relative.startsWith(`..${path.sep}`)) {
+        throw new AttachmentInputError('attachment path is outside the WSL session workspace')
+      }
+      return {
+        ...attachment,
+        executionPath: path.posix.join(
+          record.executionCwd,
+          ...relative.split(/[\\/]+/).filter(Boolean),
+        ),
+      }
+    })
     for (const attachment of attachments) {
       const common =
         isClaudeImageMime(attachment.mime) ||
@@ -2324,6 +2404,11 @@ export class SessionManager {
       if (project.location) {
         wslDistro = project.location.distro
         executionCwd = project.location.linuxPath
+        nativeWslExecutable(project.location.distro, profile.provider)
+        if (profile.provider === 'codex') {
+          // Codex's hub-tool bridge is JavaScript and runs beside the Linux app-server.
+          nativeWslExecutable(project.location.distro, 'node')
+        }
       }
       // Worktree by default when the project is a git repo; `useWorktree: false` works directly
       // in the project directory (no isolation).

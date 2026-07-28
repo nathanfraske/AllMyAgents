@@ -248,6 +248,8 @@
     siteOnline?: boolean
     /** Concrete WSL filesystem identity. Unlike a remote-site badge this stays visible on one machine. */
     wslDistro?: string
+    wslAvailable?: boolean
+    wslUnavailableReason?: string
   }
 
   // Node badges only matter once the fleet has more than one machine; on a single-machine install they
@@ -292,6 +294,8 @@
             siteLabel: p.siteLabel,
             siteOnline: p.siteOnline,
             wslDistro: p.location?.distro,
+            wslAvailable: p.locationAvailable,
+            wslUnavailableReason: p.locationUnavailableReason,
           }),
         )
       }
@@ -677,7 +681,10 @@
           {#if g.wslDistro}
             <span
               class="wslbadge"
-              title={`This project runs inside the ${g.wslDistro} WSL distro`}
+              class:unavailable={g.wslAvailable === false}
+              title={g.wslAvailable === false
+                ? g.wslUnavailableReason
+                : `This project runs inside the ${g.wslDistro} WSL distro`}
               aria-label={`WSL distro ${g.wslDistro}`}
             >WSL · {g.wslDistro}</span>
           {/if}
@@ -919,6 +926,7 @@
   .wslbadge { flex: none; max-width: 7.5rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent);
     border-radius: var(--r-pill); padding: 0.08rem 0.35rem; font-size: var(--text-2xs); font-weight: var(--fw-medium); }
+  .wslbadge.unavailable { color: #d08b3a; background: color-mix(in srgb, #d08b3a 14%, transparent); }
   .gcount { margin-left: auto; font-size: var(--text-xs); }
   .gadd { display: grid; place-items: center; color: var(--dim); width: 20px; height: 20px; border-radius: var(--r-xs); opacity: 0; transition: opacity var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease); }
   .group-head:hover .gadd { opacity: 1; }

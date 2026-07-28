@@ -136,14 +136,40 @@ function compareRiskSeverity(a: WorktreeRiskSnapshot, b: WorktreeRiskSnapshot): 
   return a.file.localeCompare(b.file)
 }
 
-function repoKey(value: string): string {
-  return pathKey(path.resolve(value))
+export function worktreeRepoKey(record: SessionRecord): string {
+  if (record.wslDistro && record.executionRepo) {
+    return `wsl:${record.wslDistro.toLowerCase()}:${path.posix.normalize(record.executionRepo)}`
+  }
+  return `local:${pathKey(path.resolve(record.repo!))}`
 }
 
 const execFileAsync = promisify(execFile)
 
-async function git(cwd: string, args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync('git', ['-C', cwd, ...args], {
+async function git(
+  cwd: string,
+  args: string[],
+  record?: SessionRecord,
+): Promise<string> {
+  const wslCwd = record?.wslDistro
+    ? cwd === record.repo
+      ? record.executionRepo
+      : record.executionCwd
+    : undefined
+  const program = wslCwd ? 'wsl.exe' : 'git'
+  const commandArgs = wslCwd
+    ? [
+        '--distribution',
+        record!.wslDistro!,
+        '--cd',
+        wslCwd,
+        '--exec',
+        'git',
+        '-C',
+        wslCwd,
+        ...args,
+      ]
+    : ['-C', cwd, ...args]
+  const { stdout } = await execFileAsync(program, commandArgs, {
     encoding: 'utf8',
     windowsHide: true,
   })
@@ -166,9 +192,13 @@ function addChanged(
 }
 
 /** Paths Git reports as staged, unstaged, deleted, renamed, or untracked. Ignored files are excluded. */
-async function uncommittedPaths(worktree: string): Promise<Map<string, ChangedPath>> {
+async function uncommittedPaths(record: SessionRecord): Promise<Map<string, ChangedPath>> {
   const changed = new Map<string, ChangedPath>()
-  const output = await git(worktree, ['status', '--porcelain=v1', '-z', '--untracked-files=all'])
+  const output = await git(
+    record.worktree!,
+    ['status', '--porcelain=v1', '-z', '--untracked-files=all'],
+    record,
+  )
   const entries = output.split('\0')
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i]
@@ -201,7 +231,7 @@ async function committedPaths(
     '-z',
     '--no-renames',
     `${baseHead}...HEAD`,
-  ])
+  ], record)
   for (const file of output.split('\0')) addChanged(changed, file, 'committed')
   return changed
 }
@@ -210,7 +240,7 @@ async function changesFor(record: SessionRecord, baseHead: string): Promise<Map<
   const changed = new Map<string, ChangedPath>()
   if (!record.worktree) return changed
   const [uncommitted, committed] = await Promise.all([
-    uncommittedPaths(record.worktree),
+    uncommittedPaths(record),
     committedPaths(record, baseHead),
   ])
   for (const value of uncommitted.values()) addChanged(changed, value.display, 'uncommitted')
@@ -227,21 +257,25 @@ async function changesFor(record: SessionRecord, baseHead: string): Promise<Map<
   return changed
 }
 
-async function resolvesToCommit(repo: string, ref: string): Promise<string> {
-  return (await git(repo, ['rev-parse', '--verify', `${ref}^{commit}`])).trim()
+async function resolvesToCommit(
+  repo: string,
+  ref: string,
+  record: SessionRecord,
+): Promise<string> {
+  return (await git(repo, ['rev-parse', '--verify', `${ref}^{commit}`], record)).trim()
 }
 
 async function mainCommitFor(record: SessionRecord): Promise<string> {
   if (!record.repo) throw new Error(`session ${record.id} has no repository`)
   if (record.baseRef) {
     try {
-      return await resolvesToCommit(record.repo, record.baseRef)
+      return await resolvesToCommit(record.repo, record.baseRef, record)
     } catch {
       // A renamed/deleted base branch should not make monitoring disappear. The primary checkout's HEAD
       // is the best honest fallback for legacy repositories whose branch topology changed after spawn.
     }
   }
-  return resolvesToCommit(record.repo, 'HEAD')
+  return resolvesToCommit(record.repo, 'HEAD', record)
 }
 
 async function baseCommitFor(record: SessionRecord, mainCommit: string): Promise<string> {
@@ -250,12 +284,17 @@ async function baseCommitFor(record: SessionRecord, mainCommit: string): Promise
   if (record.baseCommit) return record.baseCommit
   // Legacy sessions predate persisted branch-point metadata. A merge-base is the narrowest honest
   // reconstruction; new sessions never take this path because WorkspaceManager records the exact commit.
-  return (await git(record.worktree!, ['merge-base', 'HEAD', mainCommit])).trim()
+  return (await git(record.worktree!, ['merge-base', 'HEAD', mainCommit], record)).trim()
 }
 
-async function isAncestor(repo: string, ancestor: string, descendant: string): Promise<boolean> {
+async function isAncestor(
+  repo: string,
+  ancestor: string,
+  descendant: string,
+  record: SessionRecord,
+): Promise<boolean> {
   try {
-    await git(repo, ['merge-base', '--is-ancestor', ancestor, descendant])
+    await git(repo, ['merge-base', '--is-ancestor', ancestor, descendant], record)
     return true
   } catch {
     return false
@@ -266,7 +305,8 @@ async function advanceCommitsForFile(
   repo: string,
   baseCommit: string,
   mainCommit: string,
-  file: string
+  file: string,
+  record: SessionRecord,
 ): Promise<WorktreeAdvanceCommit[]> {
   const output = await git(repo, [
     'log',
@@ -274,7 +314,7 @@ async function advanceCommitsForFile(
     `${baseCommit}..${mainCommit}`,
     '--',
     file,
-  ])
+  ], record)
   return output
     .split(/\r?\n/)
     .filter(Boolean)
@@ -301,11 +341,21 @@ async function inspectSession(record: SessionRecord): Promise<SessionInspection>
   const baseCommit = await baseCommitFor(record, mainCommit)
   const changes = await changesFor(record, mainCommit)
   const diverged =
-    baseCommit === mainCommit ? false : !(await isAncestor(record.repo!, baseCommit, mainCommit))
+    baseCommit === mainCommit
+      ? false
+      : !(await isAncestor(record.repo!, baseCommit, mainCommit, record))
   const commitsBehind =
     baseCommit === mainCommit
       ? 0
-      : Number((await git(record.repo!, ['rev-list', '--count', `${baseCommit}..${mainCommit}`])).trim())
+      : Number(
+          (
+            await git(
+              record.repo!,
+              ['rev-list', '--count', `${baseCommit}..${mainCommit}`],
+              record,
+            )
+          ).trim(),
+        )
   const staleFiles: WorktreeStaleFile[] = []
   if (baseCommit !== mainCommit) {
     const advancedPaths = new Set<string>()
@@ -316,14 +366,20 @@ async function inspectSession(record: SessionRecord): Promise<SessionInspection>
       '--no-renames',
       baseCommit,
       mainCommit,
-    ])
+    ], record)
     for (const file of output.split('\0')) if (file) advancedPaths.add(pathKey(file))
     for (const [key, changed] of changes) {
       if (!advancedPaths.has(key)) continue
       staleFiles.push({
         file: changed.display,
         kind: changed.kind,
-        commits: await advanceCommitsForFile(record.repo!, baseCommit, mainCommit, changed.display),
+        commits: await advanceCommitsForFile(
+          record.repo!,
+          baseCommit,
+          mainCommit,
+          changed.display,
+          record,
+        ),
       })
     }
   }
@@ -477,7 +533,7 @@ export class WorktreeCollisionDetector {
       const groups = new Map<string, SessionRecord[]>()
       for (const record of this.options.sessions()) {
         if (record.status !== 'active' || !record.repo || !record.worktree) continue
-        const key = repoKey(record.repo)
+        const key = worktreeRepoKey(record)
         const group = groups.get(key) ?? []
         group.push(record)
         groups.set(key, group)

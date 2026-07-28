@@ -133,11 +133,63 @@ export class WorkspaceManager {
     }
   }
 
+  createNamedWslProject(
+    name: string,
+    distro: string,
+  ): { hostPath: string; location: WslProjectLocation } {
+    const cleanName = name.trim()
+    if (!cleanName) throw new Error('project name is required')
+    const slug = cleanName
+      .normalize('NFKD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 48) || 'project'
+    const home = this.wslExec(distro, '/', 'sh', ['-lc', 'printf %s "$HOME"'])
+    if (!home.startsWith('/')) throw new Error(`could not resolve the home directory inside ${distro}`)
+    const linuxRoot = path.posix.join(home, '.local', 'share', 'allmyagents', 'projects')
+    const linuxPath = path.posix.join(linuxRoot, `${slug}-${crypto.randomUUID().slice(0, 8)}`)
+    this.wslExec(distro, '/', 'mkdir', ['-p', linuxRoot])
+    this.wslExec(distro, '/', 'mkdir', [linuxPath])
+    const location: WslProjectLocation = { kind: 'wsl', distro, linuxPath }
+    const hostPath = wslHostPath(distro, linuxPath)
+    try {
+      this.projectGit(hostPath, ['init'], location)
+      const tree = this.projectGit(hostPath, ['write-tree'], location)
+      const commit = this.wslExec(distro, linuxPath, 'git', [
+        '-C',
+        linuxPath,
+        '-c',
+        'user.name=AllMyAgents',
+        '-c',
+        'user.email=workspace@allmyagents.invalid',
+        'commit-tree',
+        tree,
+        '-m',
+        'Initialize project',
+      ])
+      this.projectGit(hostPath, ['update-ref', 'HEAD', commit], location)
+      return { hostPath, location }
+    } catch (error) {
+      this.wslExec(distro, '/', 'rm', ['-rf', linuxPath])
+      throw error
+    }
+  }
+
   removeNamedProject(target: string): void {
     const root = path.resolve(this.namedProjectsRoot)
     const resolved = path.resolve(target)
     if (path.dirname(resolved) !== root) throw new Error(`not an app-managed project path: ${target}`)
     fs.rmSync(resolved, { recursive: true, force: true })
+  }
+
+  removeNamedWslProject(location: WslProjectLocation): void {
+    const expectedSegment = '/.local/share/allmyagents/projects/'
+    if (!location.linuxPath.includes(expectedSegment)) {
+      throw new Error(`not an app-managed WSL project path: ${location.linuxPath}`)
+    }
+    this.wslExec(location.distro, '/', 'rm', ['-rf', location.linuxPath])
   }
 
   /**
@@ -147,8 +199,48 @@ export class WorkspaceManager {
    */
   removeProjectFiles(
     projectPath: string,
-    projectWorktrees: ReadonlyArray<{ repo?: string; worktree: string }>,
+    projectWorktrees: ReadonlyArray<{
+      repo?: string
+      worktree: string
+      execution?: WslWorktreeExecution
+    }>,
+    projectLocation?: WslProjectLocation,
   ): void {
+    if (projectLocation) {
+      const home = this.wslExec(projectLocation.distro, '/', 'sh', [
+        '-lc',
+        'printf %s "$HOME"',
+      ])
+      const resolvedProject = path.posix.normalize(projectLocation.linuxPath)
+      if (resolvedProject === '/' || resolvedProject === home) {
+        throw new Error(`refusing to delete a broad WSL filesystem root: ${resolvedProject}`)
+      }
+      for (const item of projectWorktrees) {
+        const execution = item.execution
+        if (!execution || execution.distro.toLowerCase() !== projectLocation.distro.toLowerCase()) {
+          throw new Error(`missing or mismatched WSL worktree identity for ${item.worktree}`)
+        }
+        if (path.posix.basename(path.posix.dirname(execution.worktreePath)) !== '.allmyagents-worktrees') {
+          throw new Error(
+            `refusing to delete a WSL worktree outside its managed root: ${execution.worktreePath}`,
+          )
+        }
+        try {
+          this.wslExec(execution.distro, execution.repoPath, 'git', [
+            '-C',
+            execution.repoPath,
+            'worktree',
+            'remove',
+            '--force',
+            execution.worktreePath,
+          ])
+        } catch {
+          this.wslExec(execution.distro, '/', 'rm', ['-rf', execution.worktreePath])
+        }
+      }
+      this.wslExec(projectLocation.distro, '/', 'rm', ['-rf', resolvedProject])
+      return
+    }
     const resolvedProject = path.resolve(projectPath)
     const filesystemRoot = path.parse(resolvedProject).root
     const forbidden = [

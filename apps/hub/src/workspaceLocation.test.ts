@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   classifyWorkspacePath,
   sameWorkspacePath,
+  windowsPathToWsl,
   type WslDistro,
 } from './workspaceLocation.js'
 
@@ -156,5 +157,13 @@ describe('workspace path classification', () => {
       kind: 'local',
       key: 'local:darwin:/Users/me/api',
     })
+  })
+
+  it('translates Windows drive paths and file URLs for native WSL processes', () => {
+    expect(windowsPathToWsl('C:\\Users\\Me\\profile')).toBe('/mnt/c/Users/Me/profile')
+    expect(windowsPathToWsl('file:///C:/work/loader.mjs')).toBe(
+      'file:///mnt/c/work/loader.mjs',
+    )
+    expect(windowsPathToWsl('/already/linux')).toBe('/already/linux')
   })
 })

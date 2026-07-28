@@ -183,3 +183,13 @@ export function classifyWorkspacePath(
 export function sameWorkspacePath(left: WorkspacePath, right: WorkspacePath): boolean {
   return left.kind !== 'unavailable' && right.kind !== 'unavailable' && left.key === right.key
 }
+
+/** Translate an absolute Windows drive path (or file URL containing one) for a native WSL process. */
+export function windowsPathToWsl(value: string): string {
+  const filePrefix = value.startsWith('file:///') ? 'file://' : ''
+  const candidate = filePrefix ? value.slice('file:///'.length) : value
+  const match = /^([A-Za-z]):[\\/](.*)$/.exec(candidate)
+  if (!match) return value
+  const translated = `/mnt/${match[1]!.toLowerCase()}/${match[2]!.replaceAll('\\', '/')}`
+  return `${filePrefix}${translated}`
+}

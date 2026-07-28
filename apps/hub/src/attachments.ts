@@ -12,6 +12,8 @@ export interface AttachmentMeta {
   size: number
   /** Absolute worker-readable path. Journal/API metadata only; never file bytes. */
   path: string
+  /** Distro-native path for a WSL agent. Host-side validation and reads continue to use `path`. */
+  executionPath?: string
 }
 
 export const MAX_ATTACHMENTS_PER_MESSAGE = 5
@@ -297,7 +299,13 @@ export function documentTextBlock(attachment: AttachmentMeta, extractedText = fa
   const file = extractedText ? verifiedSiblingFile(attachment, '.extracted.txt') : attachment.path
   const size = fs.statSync(file).size
   if (size > MAX_INLINE_DOCUMENT_BYTES) {
-    return `Attached document ${JSON.stringify(attachment.name)} is available at ${file}. Read that file before answering.`
+    const executionFile = extractedText && attachment.executionPath
+      ? path.posix.join(
+          path.posix.dirname(attachment.executionPath),
+          `${attachment.id}.extracted.txt`,
+        )
+      : attachment.executionPath ?? file
+    return `Attached document ${JSON.stringify(attachment.name)} is available at ${executionFile}. Read that file before answering.`
   }
   const text = fs.readFileSync(file, 'utf8')
   const label = extractedText ? 'Extracted document text' : 'Attached document'

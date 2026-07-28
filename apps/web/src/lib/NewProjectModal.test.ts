@@ -9,6 +9,7 @@ const apiMock = vi.hoisted(() => ({
   createProject: vi.fn(),
   createManagedProject: vi.fn(),
   pickFolder: vi.fn(),
+  wslCapability: vi.fn(),
   spawn: vi.fn(),
   rename: vi.fn(),
   setMode: vi.fn(),
@@ -69,6 +70,14 @@ beforeEach(() => {
   apiMock.validateProject.mockResolvedValue({ valid: true, name: project.name, path: project.path })
   apiMock.createProject.mockResolvedValue(project)
   apiMock.pickFolder.mockResolvedValue({ path: project.path })
+  apiMock.wslCapability.mockResolvedValue({
+    supported: true,
+    distros: [
+      { name: 'Ubuntu-24.04', version: 2, state: 'running', isDefault: true },
+      { name: 'Debian', version: 2, state: 'stopped', isDefault: false },
+    ],
+    docker: { available: false, reason: 'Docker Desktop is not running.' },
+  })
   apiMock.rename.mockResolvedValue({ ok: true })
   apiMock.setMode.mockResolvedValue({ ok: true })
   apiMock.setSettings.mockResolvedValue(record('manager-session'))
@@ -78,6 +87,61 @@ beforeEach(() => {
 afterEach(() => cleanup())
 
 describe('New project pipeline', () => {
+  it('selects a concrete WSL distro, validates its Linux path, and preserves that identity at creation', async () => {
+    const wslProject: ProjectInfo = {
+      ...project,
+      path: '\\\\wsl.localhost\\Ubuntu-24.04\\home\\me\\control-room',
+      location: {
+        kind: 'wsl',
+        distro: 'Ubuntu-24.04',
+        linuxPath: '/home/me/control-room',
+      },
+    }
+    apiMock.validateProject.mockResolvedValueOnce({
+      valid: true,
+      name: project.name,
+      path: wslProject.path,
+      location: wslProject.location,
+    })
+    apiMock.createProject.mockResolvedValueOnce(wslProject)
+    const onlaunched = vi.fn()
+    render(NewProjectModal, { onclose: vi.fn(), onlaunched })
+
+    const filesystem = screen.getByLabelText('Project filesystem')
+    await fireEvent.focus(filesystem)
+    await vi.waitFor(() => expect(apiMock.wslCapability).toHaveBeenCalledOnce())
+    await fireEvent.change(filesystem, { target: { value: 'Ubuntu-24.04' } })
+    await fireEvent.input(screen.getByLabelText('Project name'), {
+      target: { value: project.name },
+    })
+    await fireEvent.input(screen.getByLabelText('Working directory'), {
+      target: { value: '/home/me/control-room' },
+    })
+    await fireEvent.click(screen.getByRole('button', { name: 'Continue to team' }))
+
+    expect(apiMock.validateProject).toHaveBeenCalledWith(
+      project.name,
+      '/home/me/control-room',
+      'Ubuntu-24.04',
+    )
+    expect(await screen.findByText(/Ubuntu-24.04 · \\\\wsl.localhost/)).toBeTruthy()
+    await fireEvent.click(screen.getByRole('button', { name: 'Review and finalize' }))
+    await fireEvent.click(screen.getByRole('button', { name: 'Create project without agents' }))
+
+    await vi.waitFor(() =>
+      expect(apiMock.createProject).toHaveBeenCalledWith(
+        project.name,
+        '/home/me/control-room',
+        'Ubuntu-24.04',
+      ))
+    await vi.waitFor(() =>
+      expect(onlaunched).toHaveBeenCalledWith({
+        project: wslProject,
+        started: [],
+        failed: [],
+      }))
+  })
+
   it('validates a local project draft, keeps its completed summary visible, and advances without creating it', async () => {
     render(NewProjectModal, {
       onclose: vi.fn(),

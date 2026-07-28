@@ -468,7 +468,7 @@ export function startServer(opts: ServerOptions): http.Server {
   // payload or profiles tree. GitHubImportService keeps auth entirely inside an existing `gh` session.
   const github = new GitHubImportService(
     path.join(path.dirname(configPath), 'repositories'),
-    (name, projectPath) => projects.create(name, projectPath)
+    (name, projectPath, location) => projects.create(name, projectPath, location)
   )
   const wsl = new WslService()
   const loginNames = new Map<string, string>()
@@ -721,7 +721,37 @@ export function startServer(opts: ServerOptions): http.Server {
         return
       }
       if (method === 'GET' && url.pathname === '/api/projects') {
-        json(res, projects.list())
+        const listed = projects.list()
+        if (!listed.some((project) => project.location?.kind === 'wsl')) {
+          json(res, listed)
+          return
+        }
+        const capability = await wsl.capability()
+        json(
+          res,
+          listed.map((project) => {
+            if (!project.location) return project
+            if (!capability.supported) {
+              return {
+                ...project,
+                locationAvailable: false,
+                locationUnavailableReason:
+                  capability.reason ?? 'WSL is unavailable on this machine.',
+              }
+            }
+            const classified = classifyWorkspacePath(project.location.linuxPath, {
+              distro: project.location.distro,
+              distros: capability.distros,
+            })
+            return classified.kind === 'unavailable'
+              ? {
+                  ...project,
+                  locationAvailable: false,
+                  locationUnavailableReason: classified.reason,
+                }
+              : { ...project, locationAvailable: true }
+          }),
+        )
         return
       }
       if (method === 'POST' && url.pathname === '/api/projects/validate') {
@@ -817,7 +847,15 @@ export function startServer(opts: ServerOptions): http.Server {
       if (method === 'POST' && url.pathname === '/api/github/clones') {
         const body = await readBody(req)
         try {
-          json(res, github.start(String(body.nameWithOwner ?? '')), 202)
+          const distro = str(body.distro)
+          json(
+            res,
+            github.start(
+              String(body.nameWithOwner ?? ''),
+              distro ? { kind: 'wsl', distro } : { kind: 'local' },
+            ),
+            202,
+          )
         } catch (error) {
           json(res, { error: error instanceof Error ? error.message : String(error) }, 400)
         }
@@ -858,11 +896,32 @@ export function startServer(opts: ServerOptions): http.Server {
         const body = await readBody(req)
         const name = String(body.name ?? '').trim()
         let projectPath: string | undefined
+        let wslLocation: NonNullable<import('./types.js').Project['location']> | undefined
         try {
-          projectPath = workspace.createNamedProject(name)
-          json(res, projects.create(name, projectPath))
+          const distro = str(body.distro)
+          if (distro) {
+            const capability = await wsl.capability()
+            const known = capability.distros.find(
+              (candidate) => candidate.name.toLowerCase() === distro.toLowerCase(),
+            )
+            if (!known) throw new Error(`The ${distro} WSL distro is not installed.`)
+            if (known.version !== 2) {
+              throw new Error(`${known.name} uses WSL 1. AllMyAgents requires WSL 2.`)
+            }
+            if (known.state === 'stopped') {
+              const started = await wsl.ensureRunning(known.name)
+              if (!started.ok) throw new Error(started.reason)
+            }
+            const created = workspace.createNamedWslProject(name, known.name)
+            projectPath = created.hostPath
+            wslLocation = created.location
+          } else {
+            projectPath = workspace.createNamedProject(name)
+          }
+          json(res, projects.create(name, projectPath, wslLocation))
         } catch (error) {
-          if (projectPath) workspace.removeNamedProject(projectPath)
+          if (wslLocation) workspace.removeNamedWslProject(wslLocation)
+          else if (projectPath) workspace.removeNamedProject(projectPath)
           json(res, { error: error instanceof Error ? error.message : String(error) }, 400)
         }
         return

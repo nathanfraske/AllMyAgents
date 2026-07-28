@@ -3,7 +3,10 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { WorktreeCollisionDetector } from './worktreeCollisionDetector.js'
+import {
+  WorktreeCollisionDetector,
+  worktreeRepoKey,
+} from './worktreeCollisionDetector.js'
 import type { SessionRecord } from './types.js'
 
 const roots: string[] = []
@@ -77,6 +80,25 @@ function fixture(): {
 }
 
 describe('WorktreeCollisionDetector', () => {
+  it('never groups identical Linux path tails from different distros', () => {
+    const { knuth } = fixture()
+    const ubuntu: SessionRecord = {
+      ...knuth,
+      repo: '\\\\wsl.localhost\\Ubuntu\\home\\me\\api',
+      wslDistro: 'Ubuntu',
+      executionRepo: '/home/me/api',
+    }
+    const debian: SessionRecord = {
+      ...knuth,
+      id: 'debian-agent',
+      repo: '\\\\wsl.localhost\\Debian\\home\\me\\api',
+      wslDistro: 'Debian',
+      executionRepo: '/home/me/api',
+    }
+
+    expect(worktreeRepoKey(ubuntu)).not.toBe(worktreeRepoKey(debian))
+  })
+
   it('exposes its existing inspection as a project activity snapshot without a second git scan', async () => {
     const { knuth, hopper } = fixture()
     const detector = new WorktreeCollisionDetector({

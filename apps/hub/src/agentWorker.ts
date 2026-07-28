@@ -221,7 +221,7 @@ export function wrapRetryableHubErrors(server: ReturnType<typeof buildAgentMcpSe
  */
 export class AgentWorker {
   private readonly claudeDrivers = new Map<string, ClaudeDriver>() //        sessionId → driver
-  private readonly codexClients = new Map<string, CodexClient>() //          profileId → app-server client (shared per profile)
+  private readonly codexClients = new Map<string, CodexClient>() //          profile + filesystem → app-server client
   private readonly codexThreads = new Map<string, string>() //               sessionId → threadId
   private readonly codexSessionClients = new Map<string, CodexClient>() //   sessionId → its (shared) client, for id-only ops
   // Sessions whose CURRENT in-flight turn was caused by a (semi-trusted) teammate bus message — the
@@ -440,7 +440,7 @@ export class AgentWorker {
   }
 
   private async startThread(spec: WorkerSessionSpec): Promise<string> {
-    const client = this.codexClientFor(spec.profileId, spec.profileDir)
+    const client = this.codexClientFor(spec.profileId, spec.profileDir, spec.wsl)
     const threadId = await client.startThread(spec.cwd)
     this.codexThreads.set(spec.sessionId, threadId)
     this.codexSessionClients.set(spec.sessionId, client)
@@ -448,7 +448,7 @@ export class AgentWorker {
   }
 
   private async ensureCodexThread(spec: WorkerSessionSpec): Promise<{ client: CodexClient; threadId: string }> {
-    const client = this.codexClientFor(spec.profileId, spec.profileDir)
+    const client = this.codexClientFor(spec.profileId, spec.profileDir, spec.wsl)
     this.codexSessionClients.set(spec.sessionId, client)
     let threadId = this.codexThreads.get(spec.sessionId)
     if (!threadId) {
@@ -620,7 +620,8 @@ export class AgentWorker {
         // event just gets a wseq and is streamed to the hub, which re-homes the side effects (§3.2).
         (kind, payload) => this.emitEvent(spec.sessionId, kind, payload),
         (toolName, input, context) => this.canUseTool(spec, toolName, input, context),
-        { allmyagents: mcp }
+        { allmyagents: mcp },
+        spec.wsl,
       )
       if (spec.vendorSessionId) driver.restore(spec.vendorSessionId)
       this.claudeDrivers.set(spec.sessionId, driver)
@@ -628,8 +629,13 @@ export class AgentWorker {
     return driver
   }
 
-  private codexClientFor(profileId: string, profileDir: string): CodexClient {
-    let client = this.codexClients.get(profileId)
+  private codexClientFor(
+    profileId: string,
+    profileDir: string,
+    wsl?: { distro: string },
+  ): CodexClient {
+    const clientKey = wsl ? `${profileId}\0wsl:${wsl.distro.toLowerCase()}` : `${profileId}\0local`
+    let client = this.codexClients.get(clientKey)
     if (!client) {
       const created = new CodexClient(
         profileDir,
@@ -638,10 +644,11 @@ export class AgentWorker {
         // fail-closed decline. Mirrors InProcessExecutor's codex approval (executor.ts): attribute by
         // threadId→sessionId, request `codex/<method>`, accept/decline on the operator's decision. Under
         // `full` (approvalPolicy 'never') the app-server won't ask, so this only fires under safe/edits.
-        (method, params) => this.codexApproval(method, params)
+        (method, params) => this.codexApproval(method, params),
+        wsl,
       )
       client = created
-      this.codexClients.set(profileId, client)
+      this.codexClients.set(clientKey, client)
     }
     return client
   }

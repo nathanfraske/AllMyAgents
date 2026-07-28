@@ -199,7 +199,7 @@ export interface InProcessExecutorHubHooks {
  */
 export class InProcessExecutor implements Executor {
   private readonly claudeDrivers = new Map<string, ClaudeDriver>()
-  private readonly codexClients = new Map<string, CodexClient>() //         profileId → app-server client (shared per profile)
+  private readonly codexClients = new Map<string, CodexClient>() //         profile + filesystem → app-server client
   private readonly codexThreads = new Map<string, string>() //              sessionId → threadId
   private readonly codexSessionClients = new Map<string, CodexClient>() //  sessionId → its (shared) client, for id-only ops
   // Sessions whose CURRENT in-flight turn was caused by a (semi-trusted) teammate bus message. A turn
@@ -274,8 +274,13 @@ export class InProcessExecutor implements Executor {
     return undefined
   }
 
-  private codexClientFor(profileId: string, profileDir: string): CodexClient {
-    let client = this.codexClients.get(profileId)
+  private codexClientFor(
+    profileId: string,
+    profileDir: string,
+    wsl?: { distro: string },
+  ): CodexClient {
+    const clientKey = wsl ? `${profileId}\0wsl:${wsl.distro.toLowerCase()}` : `${profileId}\0local`
+    let client = this.codexClients.get(clientKey)
     if (!client) {
       client = new CodexClient(
         profileDir,
@@ -329,9 +334,10 @@ export class InProcessExecutor implements Executor {
           const approvalPayload = { ...(params as Record<string, unknown> | null), toolName: codexGrantKey(method) }
           const approved = await this.services.approvals.request(sessionId ?? 'unattributed', `codex/${method}`, approvalPayload)
           return codexRequestResult(method, approved)
-        }
+        },
+        wsl,
       )
-      this.codexClients.set(profileId, client)
+      this.codexClients.set(clientKey, client)
     }
     return client
   }
@@ -391,7 +397,8 @@ export class InProcessExecutor implements Executor {
         },
         // Per-session in-process MCP server: the inter-agent bus + shared-memory tools, bound to this
         // session's identity so every call is attributed to the real caller.
-        { allmyagents: buildAgentMcpServer(this.identityFromSpec(spec), this.agentServices()) }
+        { allmyagents: buildAgentMcpServer(this.identityFromSpec(spec), this.agentServices()) },
+        spec.wsl,
       )
       if (spec.vendorSessionId) driver.restore(spec.vendorSessionId)
       this.claudeDrivers.set(spec.sessionId, driver)
@@ -400,7 +407,7 @@ export class InProcessExecutor implements Executor {
   }
 
   async startThread(spec: WorkerSessionSpec): Promise<string> {
-    const client = this.codexClientFor(spec.profileId, spec.profileDir)
+    const client = this.codexClientFor(spec.profileId, spec.profileDir, spec.wsl)
     const threadId = await client.startThread(spec.cwd)
     this.codexThreads.set(spec.sessionId, threadId)
     this.codexSessionClients.set(spec.sessionId, client)
@@ -408,7 +415,7 @@ export class InProcessExecutor implements Executor {
   }
 
   private async ensureCodexThread(spec: WorkerSessionSpec): Promise<{ client: CodexClient; threadId: string }> {
-    const client = this.codexClientFor(spec.profileId, spec.profileDir)
+    const client = this.codexClientFor(spec.profileId, spec.profileDir, spec.wsl)
     this.codexSessionClients.set(spec.sessionId, client)
     let threadId = this.codexThreads.get(spec.sessionId)
     if (!threadId) {

@@ -317,6 +317,14 @@
         <div class="eyebrow">{mode === 'manager' ? 'Manager conversation' : 'Project overview'}</div>
         <h1>{project.name}</h1>
         <div class="path" title={project.path}>{project.path}</div>
+        {#if project.location}
+          <div class="wsl-location" class:unavailable={project.locationAvailable === false}>
+            <span>WSL · {project.location.distro}</span>
+            {#if project.locationAvailable === false}
+              <strong>{project.locationUnavailableReason}</strong>
+            {/if}
+          </div>
+        {/if}
       </div>
       <div class="head-actions">
         {#if manager}
@@ -556,6 +564,10 @@
   h1 { margin: .18rem 0; font-size: clamp(1.45rem, 3vw, 2.15rem); line-height: 1.1; }
   .path { max-width: min(720px, 100%); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     color: var(--muted); font-family: var(--mono); font-size: var(--text-xs); }
+  .wsl-location { display: flex; flex-wrap: wrap; gap: .45rem; align-items: center; margin-top: .35rem;
+    color: var(--accent); font-size: var(--text-xs); }
+  .wsl-location.unavailable { color: #d08b3a; }
+  .wsl-location strong { font-weight: var(--fw-medium); }
   .summary { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: .4rem; color: var(--muted);
     font-size: var(--text-xs); }
   .head-actions { display: flex; flex-direction: column; align-items: flex-end; gap: .55rem; }

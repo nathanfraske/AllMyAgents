@@ -42,8 +42,8 @@
   type AgentStatus = 'ready' | 'launching' | 'started' | 'failed'
   type ProjectSource =
     | { kind: 'local'; name: string; path: string; location?: ProjectInfo['location'] }
-    | { kind: 'github'; name: string; repository: GitHubRepository }
-    | { kind: 'managed'; name: string }
+    | { kind: 'github'; name: string; repository: GitHubRepository; distro?: string }
+    | { kind: 'managed'; name: string; distro?: string }
 
   interface StartingAgent {
     id: string
@@ -375,7 +375,12 @@
     githubRepository = repository
     projectName = repository.name
     projectPath = ''
-    projectDraft = { kind: 'github', name: repository.name, repository }
+    projectDraft = {
+      kind: 'github',
+      name: repository.name,
+      repository,
+      ...(projectDistro ? { distro: projectDistro } : {}),
+    }
     projectSource = 'github'
     editingProjectSource = false
     createError = ''
@@ -392,7 +397,11 @@
     }
     projectPath = ''
     githubRepository = null
-    projectDraft = { kind: 'managed', name }
+    projectDraft = {
+      kind: 'managed',
+      name,
+      ...(projectDistro ? { distro: projectDistro } : {}),
+    }
     editingProjectSource = false
     step = 2
     void reveal('team')
@@ -411,6 +420,8 @@
       projectDistro =
         projectDraft.kind === 'local' ? (projectDraft.location?.distro ?? '') : projectDistro
       githubRepository = projectDraft.kind === 'github' ? projectDraft.repository : null
+      if (projectDraft.kind === 'github') projectDistro = projectDraft.distro ?? ''
+      if (projectDraft.kind === 'managed') projectDistro = projectDraft.distro ?? ''
     }
     editingProjectSource = true
     createError = ''
@@ -520,7 +531,9 @@
     }
     if (projectDraft.kind === 'managed') {
       projectStatus = 'Creating the project repository…'
-      const created = await api.createManagedProject(projectDraft.name)
+      const created = projectDraft.distro
+        ? await api.createManagedProject(projectDraft.name, projectDraft.distro)
+        : await api.createManagedProject(projectDraft.name)
       if (!created || 'error' in created) {
         throw new Error((created as { error?: string } | null)?.error ?? 'The project could not be created.')
       }
@@ -528,7 +541,9 @@
     }
 
     projectStatus = `Starting clone for ${projectDraft.repository.nameWithOwner}…`
-    const started = await api.startGitHubClone(projectDraft.repository.nameWithOwner)
+    const started = projectDraft.distro
+      ? await api.startGitHubClone(projectDraft.repository.nameWithOwner, projectDraft.distro)
+      : await api.startGitHubClone(projectDraft.repository.nameWithOwner)
     if (!started || 'error' in started) {
       throw new Error((started as { error?: string } | null)?.error ?? 'The clone could not be started.')
     }
@@ -820,8 +835,8 @@
               {projectDraft.kind === 'local'
                 ? `${projectDraft.location ? `${projectDraft.location.distro} · ` : ''}${projectDraft.path}`
                 : projectDraft.kind === 'github'
-                  ? `Clone ${projectDraft.repository.nameWithOwner} at launch`
-                  : 'App-managed Git repository created at launch'}
+                  ? `Clone ${projectDraft.repository.nameWithOwner} at launch${projectDraft.distro ? ` in ${projectDraft.distro}` : ''}`
+                  : `App-managed Git repository created at launch${projectDraft.distro ? ` in ${projectDraft.distro}` : ''}`}
             </span>
           </div>
           <span class="created-label">Not created yet</span>
@@ -865,6 +880,35 @@
         </div>
 
         {#if projectSource === 'github'}
+          <div class="fields two">
+            <label>
+              <span>Clone destination</span>
+              <select
+                aria-label="Clone destination"
+                bind:value={projectDistro}
+                onfocus={loadWslCapability}
+                onclick={loadWslCapability}
+              >
+                <option value="">This machine (Windows)</option>
+                {#each wslCapability?.distros ?? [] as distro (distro.name)}
+                  <option value={distro.name} disabled={distro.version !== 2}>
+                    WSL · {distro.name}{distro.isDefault ? ' (default)' : ''}{distro.version !== 2
+                      ? ' — WSL 1 unsupported'
+                      : distro.state !== 'running'
+                        ? ' — starts when used'
+                        : ''}
+                  </option>
+                {/each}
+                <option value="__docker_deferred__" disabled>
+                  Docker/WSL container — not supported in this release
+                </option>
+              </select>
+              <small>
+                WSL clones require native GitHub CLI and Git signed in inside that distro. Docker
+                container targets are explicitly deferred.
+              </small>
+            </label>
+          </div>
           <GitHubImport deferClone onSelected={githubSelected} onClose={() => (projectSource = 'local')} />
         {:else if projectSource === 'local'}
           <div class="fields two">
@@ -922,6 +966,26 @@
           </div>
         {:else}
           <div class="managed-source">
+            <label>
+              <span>Filesystem</span>
+              <select
+                aria-label="Managed project filesystem"
+                bind:value={projectDistro}
+                onfocus={loadWslCapability}
+                onclick={loadWslCapability}
+              >
+                <option value="">This machine (Windows)</option>
+                {#each wslCapability?.distros ?? [] as distro (distro.name)}
+                  <option value={distro.name} disabled={distro.version !== 2}>
+                    WSL · {distro.name}{distro.isDefault ? ' (default)' : ''}{distro.version !== 2
+                      ? ' — WSL 1 unsupported'
+                      : distro.state !== 'running'
+                        ? ' — starts when used'
+                        : ''}
+                  </option>
+                {/each}
+              </select>
+            </label>
             <label>
               <span>Project name</span>
               <input aria-label="Project name" bind:value={projectName} placeholder="New research tool" />

@@ -31,6 +31,8 @@ export interface ProjectInfo {
     distro: string
     linuxPath: string
   }
+  locationAvailable?: boolean
+  locationUnavailableReason?: string
   // Fleet origin (CLIENT-INJECTED by the store's fleet merge — the hub never sends these). Set only
   // for a project pulled from a REMOTE fleet site; its `id` is namespaced `${siteId}:${realId}`.
   // Absent → this hub's own (local) project, shown unbadged exactly as before.
@@ -157,6 +159,7 @@ export interface GitHubCloneJob {
   updatedAt: string
   project?: ProjectInfo
   error?: string
+  destination?: { kind: 'local' } | { kind: 'wsl'; distro: string }
 }
 
 export interface SessionRecord {
@@ -708,12 +711,18 @@ export const api = {
       path,
       ...(distro ? { distro } : {}),
     }),
-  createManagedProject: (name: string) =>
-    jpost<ProjectInfo | { error: string }>('/api/projects/managed', { name }),
+  createManagedProject: (name: string, distro?: string) =>
+    jpost<ProjectInfo | { error: string }>('/api/projects/managed', {
+      name,
+      ...(distro ? { distro } : {}),
+    }),
   githubCapability: () => jget<GitHubCapability>('/api/github/capability'),
   githubRepositories: () => jget<GitHubRepository[]>('/api/github/repositories'),
-  startGitHubClone: (nameWithOwner: string) =>
-    jpost<GitHubCloneJob | { error: string }>('/api/github/clones', { nameWithOwner }),
+  startGitHubClone: (nameWithOwner: string, distro?: string) =>
+    jpost<GitHubCloneJob | { error: string }>('/api/github/clones', {
+      nameWithOwner,
+      ...(distro ? { distro } : {}),
+    }),
   githubClone: (id: string) => jget<GitHubCloneJob>(`/api/github/clones/${encodeURIComponent(id)}`),
   // --- Unified fleet view (first cut, read-only) ---
   // The fleet roster: this hub + every reachable co-owned peer's hub, badged by machine.

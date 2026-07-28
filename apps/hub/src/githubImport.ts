@@ -1,8 +1,10 @@
 import crypto from 'node:crypto'
-import { spawn, type ChildProcess } from 'node:child_process'
+import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import type { Project } from './types.js'
+import { wslHostPath } from './workspaceLocation.js'
+import { nativeWslExecutable, spawnInWsl } from './wslProcess.js'
 
 export interface GitHubCapability {
   available: boolean
@@ -36,7 +38,12 @@ export interface GitHubCloneJob {
   updatedAt: string
   project?: Project
   error?: string
+  destination?: GitHubCloneDestination
 }
+
+export type GitHubCloneDestination =
+  | { kind: 'local' }
+  | { kind: 'wsl'; distro: string }
 
 export interface CommandResult {
   exitCode: number
@@ -58,7 +65,11 @@ export interface GitHubCommands {
   ): GitHubCloneHandle
 }
 
-type CreateProject = (name: string, projectPath: string) => Project
+type CreateProject = (
+  name: string,
+  projectPath: string,
+  location?: NonNullable<Project['location']>,
+) => Project
 
 const MAX_COMMAND_OUTPUT = 2 * 1024 * 1024
 const MAX_ERROR_LENGTH = 500
@@ -289,11 +300,18 @@ export class GitHubImportService {
     return repositories
   }
 
-  start(nameWithOwner: string): GitHubCloneJob {
+  start(
+    nameWithOwner: string,
+    destination: GitHubCloneDestination = { kind: 'local' },
+  ): GitHubCloneJob {
     const repository = this.knownRepositories.get(nameWithOwner)
     if (!repository) throw new Error('Refresh the GitHub repository list before cloning.')
     if (!repository.supported) throw new Error(repository.unsupportedReason ?? 'This repository is not supported.')
-    const finalPath = this.finalPath(repository)
+    const wslDestination =
+      destination.kind === 'wsl'
+        ? this.resolveWslDestination(destination.distro, repository)
+        : undefined
+    const finalPath = wslDestination?.hostPath ?? this.finalPath(repository)
     if (fs.existsSync(finalPath)) {
       throw new Error(`A repository folder already exists for ${repository.nameWithOwner}. Add that local folder instead.`)
     }
@@ -309,10 +327,13 @@ export class GitHubImportService {
       progress: { stage: 'queued', percent: 0, message: 'Waiting to clone…' },
       createdAt: now,
       updatedAt: now,
+      destination,
     }
     this.jobs.set(job.id, job)
     this.pruneJobs()
-    void this.performClone(job, repository, finalPath)
+    void (wslDestination
+      ? this.performWslClone(job, repository, wslDestination)
+      : this.performClone(job, repository, finalPath))
     return { ...job, progress: { ...job.progress } }
   }
 
@@ -324,6 +345,38 @@ export class GitHubImportService {
   private finalPath(repository: GitHubRepository): string {
     const [owner] = repository.nameWithOwner.split('/')
     return path.join(this.repositoriesRoot, owner!, repository.name)
+  }
+
+  private resolveWslDestination(
+    distro: string,
+    repository: GitHubRepository,
+  ): { distro: string; linuxPath: string; hostPath: string; gh: string; git: string } {
+    const gh = nativeWslExecutable(distro, 'gh')
+    const git = nativeWslExecutable(distro, 'git')
+    const home = execFileSync(
+      'wsl.exe',
+      [
+        '--distribution',
+        distro,
+        '--exec',
+        'sh',
+        '-lc',
+        'printf %s "$HOME"',
+      ],
+      { encoding: 'utf8', windowsHide: true },
+    ).trim()
+    if (!home.startsWith('/')) throw new Error(`Could not resolve the home directory inside ${distro}.`)
+    const [owner] = repository.nameWithOwner.split('/')
+    const linuxPath = path.posix.join(
+      home,
+      '.local',
+      'share',
+      'allmyagents',
+      'repositories',
+      owner!,
+      repository.name,
+    )
+    return { distro, linuxPath, hostPath: wslHostPath(distro, linuxPath), gh, git }
   }
 
   private setProgress(job: GitHubCloneJob, progress: GitHubCloneProgress): void {
@@ -381,6 +434,119 @@ export class GitHubImportService {
       job.updatedAt = new Date().toISOString()
     } finally {
       fs.rmSync(partialPath, { recursive: true, force: true })
+    }
+  }
+
+  private wslRun(
+    distro: string,
+    cwd: string,
+    program: string,
+    args: readonly string[],
+  ): Promise<CommandResult> {
+    return new Promise((resolve) => {
+      execFile(
+        'wsl.exe',
+        ['--distribution', distro, '--cd', cwd, '--exec', program, ...args],
+        { encoding: 'utf8', windowsHide: true },
+        (error, stdout, stderr) =>
+          resolve({
+            exitCode: typeof (error as NodeJS.ErrnoException | null)?.code === 'number'
+              ? Number((error as NodeJS.ErrnoException).code)
+              : error
+                ? 1
+                : 0,
+            stdout: stdout ?? '',
+            stderr: stderr ?? '',
+          }),
+      )
+    })
+  }
+
+  private async performWslClone(
+    job: GitHubCloneJob,
+    repository: GitHubRepository,
+    destination: { distro: string; linuxPath: string; hostPath: string; gh: string; git: string },
+  ): Promise<void> {
+    const partialPath = path.posix.join(
+      path.posix.dirname(destination.linuxPath),
+      '.ama-partials',
+      job.id,
+    )
+    const partialParent = path.posix.dirname(partialPath)
+    job.status = 'cloning'
+    this.setProgress(job, { stage: 'cloning', percent: 0, message: `Starting clone in ${destination.distro}…` })
+    try {
+      const made = await this.wslRun(destination.distro, '/', 'mkdir', ['-p', partialParent])
+      if (made.exitCode !== 0) throw new Error(safeMessage(made.stderr, 'Could not create the WSL clone staging directory.'))
+      const result = await new Promise<{ exitCode: number; error?: string }>((resolve) => {
+        const running = spawnInWsl(
+          destination.distro,
+          '/',
+          destination.gh,
+          ['repo', 'clone', repository.nameWithOwner, partialPath, '--', '--progress'],
+          {},
+        )
+        let settled = false
+        let errorTail = ''
+        const finish = (exitCode: number, error?: string): void => {
+          if (settled) return
+          settled = true
+          resolve({ exitCode, error })
+        }
+        running.stderr?.setEncoding('utf8')
+        running.stderr?.on('data', (chunk: string) => {
+          errorTail = (errorTail + chunk).slice(-MAX_ERROR_LENGTH)
+          for (const line of chunk.split(/[\r\n]+/)) {
+            const progress = progressFrom(line)
+            if (progress) this.setProgress(job, progress)
+          }
+        })
+        running.stdout?.resume()
+        running.once('error', (error) => finish(127, error.message))
+        running.once('close', (code) =>
+          finish(code ?? 1, code === 0 ? undefined : safeMessage(errorTail, 'GitHub clone failed.')),
+        )
+      })
+      if (result.exitCode !== 0) throw new Error(safeMessage(result.error ?? '', 'GitHub clone failed.'))
+
+      job.status = 'validating'
+      this.setProgress(job, { stage: 'validating', percent: 99, message: 'Validating repository inside WSL…' })
+      const workTree = await this.wslRun(destination.distro, partialPath, destination.git, [
+        '-C',
+        partialPath,
+        'rev-parse',
+        '--is-inside-work-tree',
+      ])
+      const head = await this.wslRun(destination.distro, partialPath, destination.git, [
+        '-C',
+        partialPath,
+        'rev-parse',
+        '--verify',
+        'HEAD',
+      ])
+      if (workTree.exitCode !== 0 || workTree.stdout.trim() !== 'true' || head.exitCode !== 0) {
+        throw new Error('Clone finished without a checked-out default branch; no project was created.')
+      }
+      const finalParent = path.posix.dirname(destination.linuxPath)
+      const madeFinal = await this.wslRun(destination.distro, '/', 'mkdir', ['-p', finalParent])
+      if (madeFinal.exitCode !== 0) throw new Error('Could not create the final WSL repository directory.')
+      const moved = await this.wslRun(destination.distro, '/', 'mv', [partialPath, destination.linuxPath])
+      if (moved.exitCode !== 0) {
+        throw new Error(safeMessage(moved.stderr, 'Could not move the WSL clone into its final directory.'))
+      }
+      job.project = this.createProject(repository.name, destination.hostPath, {
+        kind: 'wsl',
+        distro: destination.distro,
+        linuxPath: destination.linuxPath,
+      })
+      job.status = 'complete'
+      this.setProgress(job, { stage: 'complete', percent: 100, message: 'Repository ready in WSL.' })
+    } catch (error) {
+      job.status = 'failed'
+      job.error = safeMessage(error instanceof Error ? error.message : String(error), 'GitHub clone failed.')
+      job.updatedAt = new Date().toISOString()
+    } finally {
+      await this.wslRun(destination.distro, '/', 'rm', ['-rf', partialPath]).catch(() => undefined)
     }
   }
 

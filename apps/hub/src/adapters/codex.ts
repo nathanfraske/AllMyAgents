@@ -4,6 +4,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { createRequire } from 'node:module'
 import { AGENT_MCP_SERVER_NAME } from '../codexMcpConfig.js'
+import { windowsPathToWsl } from '../workspaceLocation.js'
+import { nativeWslExecutable, spawnInWsl } from '../wslProcess.js'
 import {
   documentTextBlock,
   isPdfAttachment,
@@ -154,7 +156,7 @@ function turnInput(text: string, attachments: readonly AttachmentMeta[]): Array<
     if (isPdfAttachment(attachment)) {
       input.push({ type: 'text', text: documentTextBlock(attachment, true) })
     } else if (attachment.mime.startsWith('image/')) {
-      input.push({ type: 'localImage', path: attachment.path })
+      input.push({ type: 'localImage', path: attachment.executionPath ?? attachment.path })
     } else if (officeAttachmentKind(attachment)) {
       input.push({ type: 'text', text: documentTextBlock(attachment, true) })
     } else if (isTextAttachment(attachment)) {
@@ -284,7 +286,8 @@ export class CodexClient {
   constructor(
     private readonly profileDir: string,
     private readonly onEvent: EventSink,
-    private readonly onApproval?: CodexApprovalHandler
+    private readonly onApproval?: CodexApprovalHandler,
+    private readonly wsl?: { distro: string },
   ) {}
 
   private send(msg: Record<string, unknown>): void {
@@ -305,14 +308,29 @@ export class CodexClient {
   }
 
   private async startInner(): Promise<void> {
-    const env = { ...process.env, CODEX_HOME: this.profileDir }
-    const entry = codexEntry()
+    const env = {
+      ...process.env,
+      CODEX_HOME: this.wsl ? windowsPathToWsl(this.profileDir) : this.profileDir,
+    }
+    const entry = this.wsl ? null : codexEntry()
     // Preferred: our own node running the resolved entry — no shell, no PATH dependency (see codexEntry).
     // Fallback keeps the historical PATH lookup so an unusual layout we cannot resolve still works.
-    const child = entry
-      ? spawn(process.execPath, [entry, 'app-server'], { env })
-      : spawn('codex app-server', { shell: true, env })
-    if (!entry) this.onEvent('codex/spawn-fallback', { reason: 'could not resolve @openai/codex; using PATH lookup' })
+    const child = this.wsl
+      ? spawnInWsl(
+          this.wsl.distro,
+          '/',
+          nativeWslExecutable(this.wsl.distro, 'codex'),
+          ['app-server'],
+          env,
+        )
+      : entry
+        ? spawn(process.execPath, [entry, 'app-server'], { env })
+        : spawn('codex app-server', { shell: true, env })
+    if (!this.wsl && !entry) {
+      this.onEvent('codex/spawn-fallback', {
+        reason: 'could not resolve @openai/codex; using PATH lookup',
+      })
+    }
     this.child = child
     if (child.stdout) {
       const rl = readline.createInterface({ input: child.stdout })

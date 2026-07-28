@@ -8,6 +8,8 @@ import {
   officeAttachmentKind,
   type AttachmentMeta,
 } from '../attachments.js'
+import { windowsPathToWsl } from '../workspaceLocation.js'
+import { nativeWslExecutable, spawnInWsl } from '../wslProcess.js'
 
 type EventSink = (kind: string, payload: unknown) => void
 
@@ -177,7 +179,8 @@ export class ClaudeDriver {
     private readonly canUseTool?: ClaudePermissionHandler,
     // In-process MCP servers (hub-provided agent tools: inter-agent bus + shared memory). Keyed by
     // server name; the SDK exposes their tools to the agent as `mcp__<name>__<tool>`.
-    private readonly mcpServers?: Record<string, unknown>
+    private readonly mcpServers?: Record<string, unknown>,
+    private readonly wsl?: { distro: string },
   ) {}
 
   get sessionId(): string | undefined {
@@ -198,12 +201,32 @@ export class ClaudeDriver {
     attachments: readonly AttachmentMeta[] = []
   ): Promise<void> {
     if (this.active) throw new Error('claude session is already running a turn')
-    const env = { ...process.env, CLAUDE_CONFIG_DIR: this.profileDir } as Record<string, string>
+    const env = {
+      ...process.env,
+      CLAUDE_CONFIG_DIR: this.wsl ? windowsPathToWsl(this.profileDir) : this.profileDir,
+    } as Record<string, string>
     const keyword = turnOptions.effort ? THINKING_KEYWORD[turnOptions.effort] : undefined
     const finalPrompt = keyword ? `${keyword}\n\n${prompt}` : prompt
     const options: Record<string, unknown> = {
       env,
       cwd: this.cwd,
+    }
+    if (this.wsl) {
+      const executable = nativeWslExecutable(this.wsl.distro, 'claude')
+      options.pathToClaudeCodeExecutable = executable
+      options.spawnClaudeCodeProcess = (spawnOptions: {
+        args: string[]
+        env: NodeJS.ProcessEnv
+        signal: AbortSignal
+      }) =>
+        spawnInWsl(
+          this.wsl!.distro,
+          this.cwd,
+          executable,
+          spawnOptions.args,
+          spawnOptions.env,
+          spawnOptions.signal,
+        )
     }
     if (this.vendorSessionId) options.resume = this.vendorSessionId
     if (turnOptions.model) options.model = turnOptions.model
