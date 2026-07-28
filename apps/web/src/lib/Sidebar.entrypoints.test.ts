@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render, screen } from '@testing-library/svelte'
+import { cleanup, fireEvent, render, screen } from '@testing-library/svelte'
 import Sidebar from './Sidebar.svelte'
 import { store } from './store.svelte'
 
@@ -57,5 +57,38 @@ describe('sidebar launch controls', () => {
     expect(container.querySelector('.sec-head')?.nextElementSibling?.classList.contains('list')).toBe(true)
     expect(screen.getByTitle('new chat here')).toBeTruthy()
     expect(screen.getByTitle('project managers')).toBeTruthy()
+  })
+
+  it('opens a manager row as the doorway to its project overview', async () => {
+    store.sessions = {
+      manager: {
+        record: {
+          id: 'manager',
+          profileId: 'claude-main',
+          provider: 'claude',
+          projectId: project.id,
+          cwd: project.path,
+          status: 'idle',
+          title: 'Noether',
+          isProjectManager: true,
+          createdAt: project.createdAt,
+        },
+        items: [],
+        lastActivity: project.createdAt,
+        sawReasoning: false,
+      },
+    }
+    store.selectedId = 'some-other-chat'
+    store.splitPanes = [['some-other-chat']]
+
+    render(Sidebar)
+
+    const manager = screen.getByRole('button', { name: 'Open Product project overview' })
+    expect(manager.textContent).toMatch(/open project overview/i)
+    await fireEvent.click(manager)
+
+    expect(store.projectViewId).toBe(project.id)
+    expect(store.selectedId).toBeNull()
+    expect(store.splitPanes).toEqual([])
   })
 })

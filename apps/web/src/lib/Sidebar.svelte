@@ -199,6 +199,20 @@
     return p.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || p
   }
 
+  function managerProjectName(s: SessionView): string {
+    return store.projects.find((project) => project.id === s.record.projectId)?.name ?? 'Project'
+  }
+
+  function openSessionRow(s: SessionView): void {
+    // A manager represents the whole team in the sidebar. Its primary destination is therefore the
+    // project workspace, not an ordinary chat pane; Manager setup remains available from Managers.
+    if (s.record.isProjectManager && s.record.projectId) {
+      store.openProjectView(s.record.projectId)
+      return
+    }
+    store.select(s.record.id)
+  }
+
   // Inline rename: double-click the label (or the rename action). Enter commits, Esc cancels.
   let editingId = $state<string | null>(null)
   let draft = $state('')
@@ -745,6 +759,12 @@
                 class:attentionchild={en.attentionRevealed}
                 class:orphanedchild={en.orphanedManager}
                 style={`--manager-depth:${en.managerDepth}`}
+                title={s.record.isProjectManager && s.record.projectId
+                  ? `Open ${managerProjectName(s)} project overview`
+                  : undefined}
+                aria-label={s.record.isProjectManager && s.record.projectId
+                  ? `Open ${managerProjectName(s)} project overview`
+                  : undefined}
                 role="button"
                 tabindex="0"
                 draggable={editingId !== s.record.id}
@@ -752,8 +772,8 @@
                 ondragend={endDrag}
                 ondragover={(e) => dragOverTarget(e, g.id, s.record.id, en.railId)}
                 ondragenter={preventIfDragging}
-                onclick={() => store.select(s.record.id)}
-                onkeydown={(e) => { if (e.key === 'Enter') store.select(s.record.id) }}>
+                onclick={() => openSessionRow(s)}
+                onkeydown={(e) => { if (e.key === 'Enter') openSessionRow(s) }}>
                 <span class="grip" aria-hidden="true">{@render gripIcon()}</span>
                 {#if en.managerHasChildren}
                   <button
@@ -787,19 +807,11 @@
                     <!-- The scientist name stays untouched; the role is a subordinate marker, not a rename. -->
                     <!-- svelte-ignore a11y_no_static_element_interactions -->
                     <span class="rlabel" class:glitch={glitching.has(s.record.id)} ondblclick={(e) => startRename(e, s)}>{label(s)}</span>
-                    <button
-                      class="manager-role"
-                      title="project manager · runs and oversees this team · view scope"
-                      aria-label={`View project manager scope for ${label(s)}`}
-                      onclick={(event) => {
-                        event.stopPropagation()
-                        store.openManagerSetup(s.record.id)
-                      }}
-                    >
+                    <span class="manager-role" aria-hidden="true">
                       <Icon name="flag" size={9} />
-                      <span class="manager-role-full">manager · {en.managerChildCount} {en.managerChildCount === 1 ? 'agent' : 'agents'}</span>
+                      <span class="manager-role-full">open project overview · {en.managerChildCount} {en.managerChildCount === 1 ? 'agent' : 'agents'}</span>
                       <span class="manager-role-compact" aria-hidden="true">{en.managerChildCount}</span>
-                    </button>
+                    </span>
                   </span>
                 {:else}
                   <!-- svelte-ignore a11y_no_static_element_interactions -->

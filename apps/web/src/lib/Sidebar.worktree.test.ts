@@ -89,7 +89,7 @@ describe('sidebar worktree marker', () => {
     expect(marker?.querySelector('.wtbadge-label')?.textContent).toBe(manager.record.branch)
     expect(marker?.title).toBe(manager.record.worktree)
 
-    expect(row?.querySelector('.manager-role-full')?.textContent).toMatch(/manager.*1 agent/i)
+    expect(row?.querySelector('.manager-role-full')?.textContent).toMatch(/open project overview.*1 agent/i)
     expect(row?.querySelector('.manager-role-compact')?.textContent?.trim()).toBe('1')
     expect(row?.querySelector('.manager-role-compact')?.getAttribute('aria-hidden')).toBe('true')
   })

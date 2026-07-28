@@ -124,7 +124,7 @@ describe('Sidebar with folder state', () => {
     expect(projectLabels).toEqual(['one', 'two'])
     expect(el.querySelector('.row.managedchild .rlabel')?.textContent).toBe('two')
     expect(el.querySelector('.row.manager .rlabel')?.textContent).toBe('one')
-    expect(el.querySelector('.manager-role')?.textContent).toMatch(/manager.*1 agent/i)
+    expect(el.querySelector('.manager-role')?.textContent).toMatch(/open project overview.*1 agent/i)
     expect(el.querySelector('.manager-role svg')).not.toBeNull()
   })
 
