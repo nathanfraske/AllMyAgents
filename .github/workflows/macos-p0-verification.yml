@@ -24,6 +24,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run the real CLI installer and require its health verdict
+        # GITHUB_TOKEN is not optional here even though it is optional for a human. GitHub's anonymous API
+        # limit is per IP, and hosted runners share egress addresses with every other job on the fleet — so
+        # the release lookup gets a 403 on a perfectly healthy machine. That is exactly what happened on
+        # the arm64 runner while the Intel one passed minutes earlier, which reads as an arch-specific
+        # product bug and is nothing of the sort. The installer already supports this variable and already
+        # reported the 403 honestly as rate limiting rather than blaming the network; it just needs the
+        # token. A flaky gate gets ignored, so removing the flake is part of making the gate real.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           /bin/bash scripts/install-macos.sh --no-path 2>&1 | tee /tmp/cli-install.log
