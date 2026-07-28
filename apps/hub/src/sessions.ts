@@ -16,6 +16,7 @@ import type {
   ClaudeLimitInfo,
   ApprovalRecord,
   DelegatedAuthority,
+  HubEvent,
   ManagerAgentType,
   Profile,
   Provider,
@@ -45,6 +46,12 @@ import {
 } from './browserPolicy.js'
 import type { BrowserOperation, BrowserResultContent } from './browserProtocol.js'
 import type { AgentToolOutput } from './agentToolCore.js'
+import {
+  buildTaskBoard,
+  summarizeBoard,
+  taskBoardItemsFromEvents,
+  type TaskBoard,
+} from './taskBoard.js'
 import type { RelayMethod, WorkerSessionSpec, WorkerToHub } from './workerProtocol.js'
 import { deriveTitle, sanitizeTitle, generatedTitle, DEFAULT_CHAT_NAME_POOL } from './title.js'
 import { discoverImportableChats, importKey, type ImportableChat, type ScanResult } from './importScan.js'
@@ -72,6 +79,7 @@ const DEFAULT_MANAGER_STANDING_INSTRUCTIONS = [
   '- Delegate all bounded project work by default to real AllMyAgents workers through the hub-provided spawn_agent tool; your job is to decompose, coordinate, inspect, and verify.',
   '- Use the AllMyAgents tool layer, never the vendor harness equivalents. spawn_agent and list_agents exist in both layers; only the AllMyAgents versions create real app chats with isolated worktrees, lifecycle reporting, collision detection, and operator visibility.',
   '- Your workers are real chats. If the operator cannot see a worker in the sidebar, you did not create it through AllMyAgents.',
+  '- Keep your task board current, inspect direct children with peek_agent view "tasks", and use assign_child_task so the operator-visible board records what you delegated.',
 ].join('\n')
 
 export interface CreateOptions {
@@ -84,6 +92,9 @@ export interface CreateOptions {
   serviceTier?: string
   /** Team role/description, deliberately separate from the generated scientist identity. */
   role?: string
+  /** Manager-selected worker type, persisted for durable live-roster reconstruction. */
+  agentTypeId?: string
+  agentTypeName?: string
   permissionMode?: 'safe' | 'edits' | 'full'
   // When spawning into a git project: create an isolated worktree (default), or set false to
   // work directly in the project directory.
@@ -116,6 +127,9 @@ export type WorktreeIntegrationCheck =
 // the restart-survival acceptance test shrinks it to force a squarely-mid-turn flip; unset → 120s as before.
 export const RESTART_MAX_DEFER_MS = Number(process.env.HUB_RESTART_MAX_DEFER_MS ?? 120_000)
 export const MANAGER_STALL_MS = 5 * 60 * 1000
+const MANAGER_ROSTER_DETAIL_LIMIT = 8
+const MANAGER_ROSTER_PATH_LIMIT = 12
+const MANAGER_ROSTER_MAX_CHARS = 8_000
 
 export class SessionManager {
   private readonly sessions = new Map<string, SessionRecord>()
@@ -249,6 +263,8 @@ export class SessionManager {
         this.managerSetChildAuthority(managerSessionId, childSessionId, authorities, tools),
       managerDecideChildApproval: (managerSessionId, approvalId, approve) =>
         this.decideChildApproval(managerSessionId, approvalId, approve),
+      managerAssignChildTask: (managerSessionId, childSessionId, input) =>
+        this.managerAssignChildTask(managerSessionId, childSessionId, input),
       browser: (sessionId, operation, args) => this.browserExecute(sessionId, operation, args),
     }
   }
@@ -427,7 +443,7 @@ export class SessionManager {
           caller: string
           target: string
           options?: {
-            view?: 'summary' | 'activity' | 'transcript' | 'changes' | 'all'
+            view?: 'summary' | 'activity' | 'transcript' | 'changes' | 'tasks' | 'all'
             afterSeq?: number
           }
         }
@@ -464,6 +480,18 @@ export class SessionManager {
       case 'manager.decideChildApproval': {
         const a = args as { managerSessionId: string; approvalId: string; approve: boolean }
         return this.decideChildApproval(a.managerSessionId, a.approvalId, a.approve)
+      }
+      case 'manager.assignChildTask': {
+        const a = args as {
+          managerSessionId: string
+          childSessionId: string
+          input: {
+            taskId?: string
+            title: string
+            status?: 'pending' | 'in_progress' | 'completed' | 'abandoned'
+          }
+        }
+        return this.managerAssignChildTask(a.managerSessionId, a.childSessionId, a.input)
       }
       case 'memory.write':
         return this.memory.write(args as Parameters<MemoryStore['write']>[0])
@@ -637,6 +665,8 @@ export class SessionManager {
         this.managerSetChildAuthority(managerSessionId, childSessionId, authorities, tools),
       decideChildApproval: (managerSessionId, approvalId, approve) =>
         this.decideChildApproval(managerSessionId, approvalId, approve),
+      assignChildTask: (managerSessionId, childSessionId, input) =>
+        this.managerAssignChildTask(managerSessionId, childSessionId, input),
       browser: (sessionId, operation, args) => this.browserExecute(sessionId, operation, args),
       memory: this.memory,
       practices: this.practices,
@@ -1234,6 +1264,7 @@ export class SessionManager {
       | 'provider'
       | 'projectId'
       | 'cwd'
+      | 'isProjectManager'
       | 'parentSessionId'
       | 'delegatedTools'
       | 'delegatedAuthorities'
@@ -1245,6 +1276,9 @@ export class SessionManager {
       profileId: record.profileId,
       sessionId: record.id,
     })
+    const managerRosterText = record.isProjectManager
+      ? this.managerRosterInstructions(record.id)
+      : ''
     const managerGrantText = record.parentSessionId
       ? [
           '## Operator-delegated project-manager scope',
@@ -1256,7 +1290,24 @@ export class SessionManager {
           'The hub re-checks this grant before every delegated action; revocation takes effect immediately.',
         ].join('\n')
       : ''
-    const instructionText = [agentContract(record.provider), operatorText, managerGrantText]
+    const taskBoardHabitText =
+      record.isProjectManager || record.parentSessionId
+        ? [
+            '## Durable task-board habit',
+            '',
+            record.isProjectManager
+              ? 'Keep your own task board current and inspect each direct child with peek_agent view "tasks"; assign explicit child tasks instead of relying only on prose. Keep every returned task id, then use assign_child_task to mark that assignment in_progress, completed, or abandoned when the real child transition occurs.'
+              : 'Keep your task board current with your native task tool whenever work starts, finishes, or is abandoned. A blank board means "no tasks reported", not "no work".',
+            'Update status at real transitions; never mark unfinished work complete.',
+          ].join('\n')
+        : ''
+    const instructionText = [
+      agentContract(record.provider),
+      operatorText,
+      managerRosterText,
+      managerGrantText,
+      taskBoardHabitText,
+    ]
       .filter((part) => part.trim())
       .join('\n\n')
     const practiceText = this.practices.materialize({
@@ -1269,7 +1320,140 @@ export class SessionManager {
       this.journal.append(record.id, 'session/instructions', {
         chars: instructionText.length,
         practiceChars: practiceText.length,
+        managerRosterChars: managerRosterText.length,
       })
+    }
+  }
+
+  private taskBoardForSession(sessionId: string): TaskBoard {
+    const events: HubEvent[] = []
+    let afterSeq = 0
+    for (let pageNumber = 0; pageNumber < 20; pageNumber += 1) {
+      const page = this.journal.eventsForSession(sessionId, afterSeq, 500)
+      events.push(...page.events)
+      if (page.nextAfterSeq === null) break
+      afterSeq = page.nextAfterSeq
+    }
+    return buildTaskBoard(taskBoardItemsFromEvents(events))
+  }
+
+  private managerRosterInstructions(managerSessionId: string): string {
+    const children = [...this.sessions.values()]
+      .filter((record) => record.parentSessionId === managerSessionId)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+    const counts = { running: 0, idle: 0, stopped: 0, errored: 0 }
+    for (const child of children) {
+      if (child.status === 'starting' || child.status === 'active') counts.running += 1
+      else if (child.status === 'idle') counts.idle += 1
+      else if (child.status === 'stopped') counts.stopped += 1
+      else counts.errored += 1
+    }
+    const lines = [
+      '## LIVE DIRECT-CHILD ROSTER (hub-generated for this turn)',
+      '',
+      'This is a fresh hub snapshot, not conversation memory. Unknown means unknown; do not infer idle from silence.',
+      `Tally: ${counts.running} running, ${counts.idle} idle, ${counts.stopped} stopped, ${counts.errored} errored.`,
+    ]
+    if (!children.length) lines.push('- No direct children.')
+    for (const child of children.slice(0, MANAGER_ROSTER_DETAIL_LIMIT)) {
+      const board = this.taskBoardForSession(child.id)
+      const summary = summarizeBoard(board)
+      const tasks =
+        board.tasks.length > 0
+          ? board.tasks
+              .slice(0, 6)
+              .map((task) => `${task.title} [${task.status}; ${task.origin}]`)
+              .join('; ')
+          : 'no tasks reported'
+      lines.push(
+        '',
+        `### ${this.rosterLine(child.title ?? identityOf(child).label)} (${child.id})`,
+        `- status: ${child.status}`,
+        `- agent type: ${this.rosterLine(child.agentTypeName ?? child.role ?? 'unknown / not recorded')}`,
+        `- profile / model: ${child.profileId} / ${this.rosterLine(child.model ?? 'provider default')}`,
+        `- worktree: ${this.rosterLine(child.worktree ?? 'none / shared project checkout')}`,
+        `- branch: ${this.rosterLine(child.branch ?? 'unknown / not recorded')}`,
+        `- working directory: ${this.rosterLine(child.cwd)}`,
+        `- currently doing: ${this.managerRosterActivity(child)}`,
+        `- paths owned/touched: ${this.managerRosterPaths(child)}`,
+        `- task board (${summary.total} reported): ${this.rosterLine(tasks, 900)}`,
+      )
+    }
+    if (children.length > MANAGER_ROSTER_DETAIL_LIMIT) {
+      lines.push(
+        '',
+        `Additional direct children (${children.length - MANAGER_ROSTER_DETAIL_LIMIT}; use child_status/peek_agent for detail):`,
+        ...children
+          .slice(MANAGER_ROSTER_DETAIL_LIMIT)
+          .map((child) => `- ${this.rosterLine(child.title ?? identityOf(child).label)} (${child.id}): ${child.status}`),
+      )
+    }
+    return lines.join('\n').slice(0, MANAGER_ROSTER_MAX_CHARS)
+  }
+
+  private rosterLine(value: string, max = 500): string {
+    const oneLine = value.replace(/\s+/g, ' ').trim()
+    return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine
+  }
+
+  private managerRosterActivity(child: SessionRecord): string {
+    const pending = this.approvals.pending().filter((approval) => approval.sessionId === child.id)
+    if (pending.length) return `blocked on ${pending.length} pending approval${pending.length === 1 ? '' : 's'}`
+    if (child.status === 'stopped') return 'stopped'
+    if (child.status === 'error') return 'errored'
+    if (child.status === 'idle') return 'idle (hub status)'
+    const events = this.journal.recentEventsForSession(child.id, 40)
+    for (const event of events) {
+      const payload = (event.payload ?? {}) as Record<string, unknown>
+      if (event.kind === 'codex/item/started') {
+        const item = payload.item as { type?: string; command?: string; name?: string } | undefined
+        if (item?.type === 'commandExecution' && item.command) return `running command: ${this.rosterLine(item.command)}`
+        if (item?.type === 'mcpToolCall') return `using tool: ${this.rosterLine(item.name ?? 'unknown')}`
+      }
+      if (event.kind === 'claude/assistant') {
+        const message = payload.message as { content?: unknown[] } | undefined
+        const block = message?.content?.find(
+          (candidate) => (candidate as { type?: string }).type === 'tool_use',
+        ) as { name?: string; input?: unknown } | undefined
+        if (block?.name) return `using tool: ${this.rosterLine(block.name)}`
+      }
+    }
+    const last = events[0]
+    if (!last) return 'unknown (no activity reported)'
+    const silence = Date.now() - Date.parse(last.ts)
+    if (child.status === 'active' && Number.isFinite(silence) && silence >= MANAGER_STALL_MS) {
+      return `stalled or unknown (no structured activity since ${last.ts})`
+    }
+    return `unknown (last hub event ${last.kind} at ${last.ts})`
+  }
+
+  private managerRosterPaths(child: SessionRecord): string {
+    const cwd = child.worktree ?? child.cwd
+    try {
+      const status = execFileSync('git', ['-C', cwd, 'status', '--porcelain=v1', '--untracked-files=all'], {
+        encoding: 'utf8',
+        windowsHide: true,
+      })
+      const paths = new Set<string>()
+      for (const line of status.split(/\r?\n/)) {
+        if (line.length >= 4) paths.add(line.slice(3).replace(/^"|"$/g, ''))
+      }
+      const base = child.baseCommit
+      if (base) {
+        const committed = execFileSync('git', ['-C', cwd, 'diff', '--name-only', `${base}...HEAD`, '--'], {
+          encoding: 'utf8',
+          windowsHide: true,
+        })
+        for (const file of committed.split(/\r?\n/).filter(Boolean)) paths.add(file)
+      }
+      const all = [...paths]
+      if (!all.length) return 'none reported by git'
+      const shown = all.slice(0, MANAGER_ROSTER_PATH_LIMIT)
+      return `${shown.map((file) => this.rosterLine(file, 180)).join(', ')}${
+        all.length > shown.length ? ` (+${all.length - shown.length} more)` : ''
+      }`
+    } catch {
+      return 'unknown (worktree inspection failed)'
     }
   }
 
@@ -1593,12 +1777,14 @@ export class SessionManager {
     let profileId = input.profileId
     let model = input.model
     let effort = input.effort
+    let resolvedAgentType: ManagerAgentType | undefined
     if (input.agentType) {
       const requested = input.agentType.trim().toLocaleLowerCase()
       const role = (manager.managerAgentTypes ?? []).find(
         (candidate) => candidate.id.toLocaleLowerCase() === requested || candidate.name.toLocaleLowerCase() === requested
       )
       if (!role) return { ok: false, error: `agent type ${input.agentType} is not in the operator-granted manager brief` }
+      resolvedAgentType = role
       if (role.selection === 'fixed') {
         if (!role.profileId) return { ok: false, error: `agent type ${role.name} has no valid fixed profile` }
         if (profileId && profileId !== role.profileId) {
@@ -1684,6 +1870,9 @@ export class SessionManager {
         permissionMode: requestedPermissionMode,
         useWorktree: input.useWorktree !== false,
         parentSessionId: manager.id,
+        role: resolvedAgentType?.purpose,
+        agentTypeId: resolvedAgentType?.id,
+        agentTypeName: resolvedAgentType?.name,
         // Persist the child safely NARROW first. The intended grants are applied below with their audit
         // rows in one transaction; a crash between create and that transaction leaves less authority.
       })
@@ -1694,6 +1883,8 @@ export class SessionManager {
           profileId: child.profileId,
           projectId: child.projectId ?? null,
           worktree: child.worktree ?? null,
+          agentTypeId: child.agentTypeId ?? null,
+          agentTypeName: child.agentTypeName ?? null,
         })
         if (authorities.length || tools.length) {
           this.setChildDelegation(manager.id, child.id, authorities, tools)
@@ -2026,6 +2217,8 @@ export class SessionManager {
       effort: opts.effort,
       serviceTier: opts.serviceTier,
       role: opts.role ? sanitizeTitle(opts.role) || undefined : undefined,
+      agentTypeId: opts.agentTypeId,
+      agentTypeName: opts.agentTypeName ? sanitizeTitle(opts.agentTypeName) || undefined : undefined,
       permissionMode: opts.permissionMode,
       parentSessionId: opts.parentSessionId,
       delegatedAuthorities: opts.delegatedAuthorities?.length
@@ -2294,6 +2487,9 @@ export class SessionManager {
     // (admission already happened above, before any journal/title/override side effect)
     this.operatorTurnSessions.add(sessionId)
     this.journal.append(sessionId, 'session/turn-origin', { origin: 'operator' })
+    // Dynamic manager roster/task state is regenerated at the actual turn boundary. A compacted
+    // conversation therefore receives current children without relying on the model to remember a tool.
+    this.materializeSessionInstructions(record)
     if (record.provider === 'claude') {
       if (attachments.length) void this.executor.runTurn(this.specOf(record), text, 'operator', attachments)
       else void this.executor.runTurn(this.specOf(record), text, 'operator')
@@ -2888,11 +3084,57 @@ export class SessionManager {
     }
   }
 
+  managerAssignChildTask(
+    managerSessionId: string,
+    childSessionId: string,
+    input: {
+      taskId?: string
+      title: string
+      status?: 'pending' | 'in_progress' | 'completed' | 'abandoned'
+    },
+  ): { ok: boolean; taskId?: string; error?: string } {
+    const relation = this.managerDirectChild(managerSessionId, childSessionId)
+    if (!relation) return { ok: false, error: 'target is not this manager’s direct child' }
+    const title = input.title.trim()
+    if (!title || title.length > 500) return { ok: false, error: 'title must be 1–500 characters' }
+    const status = input.status ?? 'pending'
+    const board = this.taskBoardForSession(childSessionId)
+    let taskId = input.taskId
+    if (taskId) {
+      const existing = board.tasks.find((task) => task.id === taskId)
+      if (
+        !existing ||
+        existing.origin !== 'manager' ||
+        existing.assignedBySessionId !== managerSessionId
+      ) {
+        return { ok: false, error: 'task is not an assignment owned by this manager' }
+      }
+    } else {
+      taskId = `manager:${crypto.randomUUID()}`
+    }
+    const assignedAt = new Date().toISOString()
+    const payload = {
+      version: 1,
+      id: taskId,
+      title,
+      status,
+      managerSessionId,
+      managerLabel: relation.manager.title ?? identityOf(relation.manager).label,
+      childSessionId,
+      assignedAt,
+    }
+    this.journal.atomic(() => {
+      this.journal.append(childSessionId, 'manager/task-assigned', payload)
+      this.journal.append(managerSessionId, 'manager/child-task-assigned', payload)
+    })
+    return { ok: true, taskId }
+  }
+
   busPeek(
     callerSessionId: string,
     targetSessionId: string,
     options: {
-      view?: 'summary' | 'activity' | 'transcript' | 'changes' | 'all'
+      view?: 'summary' | 'activity' | 'transcript' | 'changes' | 'tasks' | 'all'
       afterSeq?: number
     } = {}
   ): { found: boolean; summary?: string } {
@@ -2911,6 +3153,7 @@ export class SessionManager {
         return `Transcript page (exact journal events):\n${JSON.stringify(page, null, 2)}`
       }
       const changes = (): string => this.managerChildChanges(t)
+      const tasks = (): string => this.managerChildTasks(t)
       const summary =
         view === 'activity'
           ? activity()
@@ -2918,7 +3161,9 @@ export class SessionManager {
             ? transcript()
             : view === 'changes'
               ? changes()
-              : [activity(), transcript(), changes()].join('\n\n')
+              : view === 'tasks'
+                ? tasks()
+                : [activity(), transcript(), changes(), tasks()].join('\n\n')
       this.journal.append(caller.id, 'manager/child-inspected', {
         childSessionId: t.id,
         view,
@@ -3030,6 +3275,22 @@ export class SessionManager {
         `inspection error: ${error instanceof Error ? error.message : String(error)}`,
       ].join('\n')
     }
+  }
+
+  private managerChildTasks(child: SessionRecord): string {
+    const board = this.taskBoardForSession(child.id)
+    if (!board.tasks.length) return 'No tasks reported. This does not mean the child has no work.'
+    const counts = summarizeBoard(board)
+    return [
+      `Task board: ${counts.total} reported; ${counts.active} in progress, ${counts.pending} pending, ${counts.done} done.`,
+      ...board.tasks.map((task) => {
+        const origin =
+          task.origin === 'manager'
+            ? `manager assigned by ${task.assignedByLabel ?? task.assignedBySessionId ?? 'unknown manager'}`
+            : 'agent reported'
+        return `- [${task.status}] ${task.title} (${task.id}; ${origin})`
+      }),
+    ].join('\n')
   }
 
   private steerMessagesAtToolBoundary(): boolean {
@@ -3149,6 +3410,7 @@ export class SessionManager {
     if (record.provider === 'claude' && this.executor.isBusy(sessionId)) return
     const pending = this.bus.pending(sessionId)
     if (!pending.length) return
+    this.materializeSessionInstructions(record)
     this.markBusDelivered(sessionId, pending)
     const framed = frameBusMessages(pending)
     // origin: 'bus' tags the turn so risky in-process tools self-gate (hard-deny) — a teammate

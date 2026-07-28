@@ -152,6 +152,73 @@ describe('project manager lifecycle awareness', () => {
   })
 })
 
+describe('project manager durable live roster', () => {
+  it('rebuilds the direct-child roster for the first turn after compaction without a tool call', async () => {
+    const { sessions, journal, seed, repo } = buildHub()
+    seed({ id: 'manager', projectId: 'project' })
+    sessions.configureProjectManager(
+      'manager',
+      {
+        enabled: true,
+        maxLiveChildren: 4,
+        allowedProfiles: ['p1'],
+        standingInstructions: 'Your sole purpose is to coordinate the operator-granted project team.',
+      },
+      'operator',
+    )
+    const child = seed({
+      id: 'reviewer-child',
+      title: 'Hopper',
+      parentSessionId: 'manager',
+      projectId: 'project',
+      status: 'active',
+      role: 'Reviewer',
+      model: 'claude-sonnet',
+      worktree: repo,
+      branch: 'agent/reviewer',
+    })
+    fs.writeFileSync(path.join(repo, 'owned-parser.ts'), 'export const owned = true\n')
+    journal.append(child.id, 'codex/item/started', {
+      item: {
+        type: 'commandExecution',
+        command: 'pnpm --filter hub test',
+        status: 'inProgress',
+      },
+    })
+    // The opening manager prompt is gone. The next operator message must rebuild live state from hub
+    // records and real activity rather than relying on the manager to remember to call child_status.
+    journal.append('manager', 'claude/system', { subtype: 'compact_boundary' })
+
+    await sessions.send('manager', 'What is the team doing now?')
+
+    const instructions = fs.readFileSync(path.join(repo, 'CLAUDE.md'), 'utf8')
+    expect(instructions).toContain('Your sole purpose is to coordinate')
+    expect(instructions).toContain('LIVE DIRECT-CHILD ROSTER')
+    expect(instructions).toContain('Hopper')
+    expect(instructions).toContain('reviewer-child')
+    expect(instructions).toContain('agent type: Reviewer')
+    expect(instructions).toContain('p1 / claude-sonnet')
+    expect(instructions).toContain(repo)
+    expect(instructions).toContain('agent/reviewer')
+    expect(instructions).toContain('owned-parser.ts')
+    expect(instructions).toContain('pnpm --filter hub test')
+    expect(instructions).toContain('use assign_child_task to mark that assignment')
+  })
+
+  it('does not add a manager roster to an ordinary chat turn', async () => {
+    const { sessions, seed, repo } = buildHub()
+    seed({ id: 'ordinary', projectId: 'project' })
+    seed({ id: 'manager', projectId: 'project', isProjectManager: true })
+    seed({ id: 'child', projectId: 'project', parentSessionId: 'manager', status: 'active' })
+
+    await sessions.send('ordinary', 'Continue the ordinary chat.')
+
+    expect(fs.readFileSync(path.join(repo, 'CLAUDE.md'), 'utf8')).not.toContain(
+      'LIVE DIRECT-CHILD ROSTER',
+    )
+  })
+})
+
 describe('project manager visibility into its own workers', () => {
   it('fails closed when a manager requests deep data for another manager’s child', () => {
     const { sessions, seed } = buildHub()
@@ -199,6 +266,70 @@ describe('project manager visibility into its own workers', () => {
     expect(changes.summary).toContain('changed.txt')
     expect(changes.summary).toContain('manager-visible')
     expect(changes.summary).toMatch(/stale/i)
+  })
+
+  it('derives one child board across both vendors and exposes it only to the direct manager', () => {
+    const { sessions, journal, seed } = buildHub()
+    seed({ id: 'manager', isProjectManager: true, projectId: 'project' })
+    seed({ id: 'other-manager', isProjectManager: true, projectId: 'project' })
+    const child = seed({ id: 'child', parentSessionId: 'manager', projectId: 'project' })
+    journal.append(child.id, 'claude/assistant', {
+      message: {
+        content: [
+          { type: 'tool_use', id: 'task-1', name: 'TaskCreate', input: { subject: 'Parse the grammar' } },
+        ],
+      },
+    })
+    journal.append(child.id, 'claude/user', {
+      message: { content: [{ type: 'tool_result', tool_use_id: 'task-1', content: 'Created task #1' }] },
+    })
+    journal.append(child.id, 'codex/turn/plan/updated', {
+      plan: [{ step: 'Verify parser fixtures', status: 'inProgress' }],
+    })
+
+    const own = sessions.busPeek('manager', 'child', { view: 'tasks' })
+    expect(own.found).toBe(true)
+    expect(own.summary).toContain('Verify parser fixtures')
+    expect(own.summary).toContain('agent reported')
+    expect(sessions.busPeek('other-manager', 'child', { view: 'tasks' })).toEqual({ found: false })
+  })
+
+  it('journals manager-assigned tasks onto the same board and rejects a non-child', () => {
+    const { sessions, journal, seed } = buildHub()
+    seed({ id: 'manager', isProjectManager: true, projectId: 'project', title: 'Curie' })
+    seed({ id: 'child', parentSessionId: 'manager', projectId: 'project' })
+    seed({ id: 'unrelated', projectId: 'project' })
+
+    const assigned = sessions.managerAssignChildTask('manager', 'child', {
+      title: 'Own the parser files',
+      status: 'in_progress',
+    })
+    expect(assigned.ok).toBe(true)
+    expect(assigned.taskId).toMatch(/^manager:/)
+    expect(
+      sessions.managerAssignChildTask('manager', 'unrelated', { title: 'This must fail' }),
+    ).toEqual({ ok: false, error: 'target is not this manager’s direct child' })
+
+    const tasks = sessions.busPeek('manager', 'child', { view: 'tasks' })
+    expect(tasks.summary).toContain('Own the parser files')
+    expect(tasks.summary).toContain('manager assigned by Curie')
+    expect(journal.recentEventsForSession('child')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'manager/task-assigned',
+          payload: expect.objectContaining({ managerSessionId: 'manager', title: 'Own the parser files' }),
+        }),
+      ]),
+    )
+  })
+
+  it('reports an empty child board honestly', () => {
+    const { sessions, seed } = buildHub()
+    seed({ id: 'manager', isProjectManager: true, projectId: 'project' })
+    seed({ id: 'child', parentSessionId: 'manager', projectId: 'project' })
+    expect(sessions.busPeek('manager', 'child', { view: 'tasks' }).summary).toContain(
+      'No tasks reported',
+    )
   })
 })
 

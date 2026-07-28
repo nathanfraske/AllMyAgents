@@ -139,6 +139,8 @@ export interface SessionRecord {
   title?: string
   /** Operator-authored team role/description; the generated scientist identity remains in `title`. */
   role?: string
+  agentTypeId?: string
+  agentTypeName?: string
   titleSource?: string
   // Adopted from an existing vendor transcript via project-import (vs. spawned by the hub).
   imported?: boolean

@@ -140,6 +140,31 @@ describe('non-task tools + summary', () => {
     expect(board).toEqual({ tasks: [], changes: [], source: 'none' })
   })
 
+  it('keeps manager assignments on the same board without letting agent snapshots erase them', () => {
+    const board = buildTaskBoard([
+      tool('ManagerTask', {
+        id: 'manager:1',
+        title: 'Own parser.ts',
+        status: 'in_progress',
+        managerSessionId: 'manager',
+        managerLabel: 'Curie',
+      }),
+      tool('update_plan', {
+        plan: [{ step: 'Run parser tests', status: 'pending' }],
+      }),
+    ])
+    expect(board.source).toBe('mixed')
+    expect(board.tasks).toEqual([
+      expect.objectContaining({
+        id: 'manager:1',
+        title: 'Own parser.ts',
+        origin: 'manager',
+        assignedByLabel: 'Curie',
+      }),
+      expect.objectContaining({ title: 'Run parser tests', origin: 'agent' }),
+    ])
+  })
+
   it('summarizes for the collapsed strip', () => {
     const board = buildTaskBoard([
       tool('TodoWrite', {

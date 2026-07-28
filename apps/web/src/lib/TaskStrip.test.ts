@@ -13,6 +13,33 @@ const item = (toolName: string, toolInput: unknown, ts = '2026-07-27T12:00:00.00
 })
 
 describe('TaskStrip vendor plans', () => {
+  it('states that an empty board means no tasks were reported', async () => {
+    render(TaskStrip, { props: { items: [] } })
+    expect(screen.getByText('No tasks reported')).toBeTruthy()
+    await fireEvent.click(screen.getByRole('button', { name: /Tasks/ }))
+    expect(screen.getByText(/does not mean the agent has no work/)).toBeTruthy()
+  })
+
+  it('labels manager assignments separately from agent-reported work', async () => {
+    render(TaskStrip, {
+      props: {
+        items: [
+          item('ManagerTask', {
+            id: 'manager:1',
+            title: 'Own parser.ts',
+            status: 'pending',
+            managerSessionId: 'manager',
+            managerLabel: 'Curie',
+          }),
+          item('TaskCreate', { subject: 'Run tests' }),
+        ],
+      },
+    })
+    await fireEvent.click(screen.getByRole('button', { name: /Tasks/ }))
+    expect(screen.getByText('manager assigned')).toBeTruthy()
+    expect(screen.getByText('agent reported')).toBeTruthy()
+  })
+
   it('updates from Codex snapshots and reconstructs the latest board after a fresh render', async () => {
     const first = item('update_plan', {
       plan: [
