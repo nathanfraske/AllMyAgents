@@ -176,7 +176,7 @@ describe('readProjectConfig (values-free surfacing of MCP / hooks / memory)', ()
     fs.mkdirSync(path.join(dir, '.claude'))
     fs.writeFileSync(
       path.join(dir, '.claude', 'settings.json'),
-      JSON.stringify({ hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo' }] }] }, permissions: { allow: ['Bash'], deny: [] } })
+      JSON.stringify({ hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'node', args: ['audit hook.js'], shell: 'bash' }] }] }, permissions: { allow: ['Bash'], deny: [] } })
     )
     fs.writeFileSync(path.join(dir, 'CLAUDE.md'), 'project memory')
   })
@@ -191,7 +191,14 @@ describe('readProjectConfig (values-free surfacing of MCP / hooks / memory)', ()
     ])
     expect(cfg.hooks).toEqual(['PreToolUse'])
     // The actual hook command must be shown — "a PreToolUse hook exists" is not a decision anyone can make.
-    expect(cfg.hookCommands).toEqual([{ event: 'PreToolUse', command: 'echo' }])
+    expect(cfg.hookCommands).toEqual([
+      {
+        event: 'PreToolUse',
+        command: 'node',
+        args: ['audit hook.js'],
+        shell: 'bash',
+      },
+    ])
     expect(cfg.hasPermissions).toBe(true)
     expect(cfg.memoryFiles).toEqual([{ name: 'CLAUDE.md', bytes: fs.statSync(path.join(dir, 'CLAUDE.md')).size }])
     expect(cfg.sources).toContain('.mcp.json')

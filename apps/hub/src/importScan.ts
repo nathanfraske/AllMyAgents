@@ -82,8 +82,17 @@ export interface ProjectConfig {
   }[]
   /** Hook event names present in .claude/settings*.json (e.g. ["PreToolUse","PostToolUse"]). */
   hooks: string[]
-  /** The actual hook COMMANDS that would run, per event — the executable surface the operator approves. */
-  hookCommands: { event: string; command: string }[]
+  /** The actual command-hook execution surface the operator approves. Secret-free, but not detail-free. */
+  hookCommands: {
+    event: string
+    command: string
+    /** Presence matters: even `[]` selects exec form; omission selects shell form. */
+    args?: string[]
+    shell?: 'bash' | 'powershell'
+    condition?: string
+    timeout?: number
+    background?: boolean
+  }[]
   /** Whether .claude/settings*.json defines a permissions allow/deny policy. */
   hasPermissions: boolean
   memoryFiles: { name: string; bytes: number }[]
@@ -612,8 +621,13 @@ export function readProjectConfig(projectPath: string, warnings: string[] = []):
             continue
           }
           for (const h of inner) {
-            const type = (h as { type?: unknown })?.type
-            const cmd = (h as { command?: unknown })?.command
+            if (!h || typeof h !== 'object' || Array.isArray(h)) {
+              unmodeled.push(`hook "${event}" has an unrecognized handler`)
+              continue
+            }
+            const definition = h as Record<string, unknown>
+            const type = definition.type
+            const cmd = definition.command
             if (type !== undefined && type !== 'command') {
               unmodeled.push(`hook "${event}" uses an unmodeled type "${String(type)}"`)
               continue
@@ -622,11 +636,84 @@ export function readProjectConfig(projectPath: string, warnings: string[] = []):
               unmodeled.push(`hook "${event}" is a command hook without a command`)
               continue
             }
-            const args = Array.isArray((h as { args?: unknown }).args)
-              ? (h as { args: unknown[] }).args.filter((a): a is string => typeof a === 'string')
-              : []
-            hookCommands.push({ event, command: cmd.trim() })
-            fpHooks.push({ event, matcher: matcherStr, command: cmd.trim(), args })
+
+            // Complete command-hook schema understood by this scanner. A new or misspelled field may
+            // change execution on one platform, so fail closed instead of preserving an old approval.
+            const knownFields = new Set([
+              'type',
+              'if',
+              'timeout',
+              'statusMessage',
+              'once',
+              'command',
+              'args',
+              'async',
+              'asyncRewake',
+              'shell',
+            ])
+            for (const field of Object.keys(definition)) {
+              if (!knownFields.has(field)) unmodeled.push(`hook "${event}" defines an unmodeled field "${field}"`)
+            }
+
+            const rawArgs = definition.args
+            if (rawArgs !== undefined && (!Array.isArray(rawArgs) || rawArgs.some((arg) => typeof arg !== 'string'))) {
+              unmodeled.push(`hook "${event}" has malformed args`)
+              continue
+            }
+            // Do not coalesce omitted args to []: omission selects shell form; even [] selects exec form.
+            const args = rawArgs as string[] | undefined
+
+            const condition = definition.if
+            if (condition !== undefined && typeof condition !== 'string') {
+              unmodeled.push(`hook "${event}" has a malformed if condition`)
+              continue
+            }
+            const timeout = definition.timeout
+            if (timeout !== undefined && (typeof timeout !== 'number' || !Number.isFinite(timeout) || timeout < 0)) {
+              unmodeled.push(`hook "${event}" has a malformed timeout`)
+              continue
+            }
+            const shell = definition.shell
+            if (shell !== undefined && shell !== 'bash' && shell !== 'powershell') {
+              unmodeled.push(`hook "${event}" names an unsupported shell "${String(shell)}"`)
+              continue
+            }
+            let malformedBoolean = false
+            for (const field of ['async', 'asyncRewake', 'once'] as const) {
+              if (definition[field] !== undefined && typeof definition[field] !== 'boolean') {
+                unmodeled.push(`hook "${event}" has a malformed ${field} value`)
+                malformedBoolean = true
+              }
+            }
+            if (malformedBoolean) continue
+            if (definition.statusMessage !== undefined && typeof definition.statusMessage !== 'string') {
+              unmodeled.push(`hook "${event}" has a malformed statusMessage`)
+              continue
+            }
+
+            const background = definition.async === true || definition.asyncRewake === true
+            hookCommands.push({
+              event,
+              command: cmd.trim(),
+              ...(args !== undefined ? { args } : {}),
+              ...(shell !== undefined ? { shell } : {}),
+              ...(condition !== undefined ? { condition } : {}),
+              ...(timeout !== undefined ? { timeout } : {}),
+              ...(background ? { background: true } : {}),
+            })
+            fpHooks.push({
+              event,
+              matcher: matcherStr,
+              command: cmd.trim(),
+              args,
+              shell,
+              condition,
+              timeout,
+              async: definition.async,
+              asyncRewake: definition.asyncRewake,
+              once: definition.once,
+              statusMessage: definition.statusMessage,
+            })
           }
         }
       }
