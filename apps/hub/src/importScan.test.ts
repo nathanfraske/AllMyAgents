@@ -29,30 +29,36 @@ describe('encodeClaudeCwd (lossy forward encoding, verified against real dirs)',
 })
 
 describe('cwdMatches / normPath (the ground-truth confirmation)', () => {
-  it('normalizes separators, trailing slash and case', () => {
-    expect(normPath('C:\\Users\\Admin\\AiAgentApp\\')).toBe('c:/users/admin/aiagentapp')
+  it('normalizes separators, trailing slash and case on Windows', () => {
+    expect(normPath('C:\\Users\\Admin\\AiAgentApp\\', 'win32')).toBe('c:/users/admin/aiagentapp')
   })
   it('matches the folder itself', () => {
-    expect(cwdMatches('C:\\Users\\Admin\\AiAgentApp', 'C:/Users/Admin/AiAgentApp')).toBe(true)
+    expect(cwdMatches('C:\\Users\\Admin\\AiAgentApp', 'C:/Users/Admin/AiAgentApp', 'win32')).toBe(true)
   })
   it('matches a nested cwd (inside the folder)', () => {
-    expect(cwdMatches('C:\\Users\\Admin\\AiAgentApp\\apps\\hub', 'C:\\Users\\Admin\\AiAgentApp')).toBe(true)
+    expect(cwdMatches('C:\\Users\\Admin\\AiAgentApp\\apps\\hub', 'C:\\Users\\Admin\\AiAgentApp', 'win32')).toBe(true)
   })
   it('rejects a sibling that merely shares a prefix', () => {
-    expect(cwdMatches('C:\\Users\\Admin\\AiAgentApp2', 'C:\\Users\\Admin\\AiAgentApp')).toBe(false)
+    expect(cwdMatches('C:\\Users\\Admin\\AiAgentApp2', 'C:\\Users\\Admin\\AiAgentApp', 'win32')).toBe(false)
   })
   it('rejects an unrelated folder', () => {
-    expect(cwdMatches('C:\\Users\\Admin\\Other', 'C:\\Users\\Admin\\AiAgentApp')).toBe(false)
+    expect(cwdMatches('C:\\Users\\Admin\\Other', 'C:\\Users\\Admin\\AiAgentApp', 'win32')).toBe(false)
+  })
+  it('FAIL FIRST: preserves case on Linux and case-sensitive macOS filesystems', () => {
+    expect(normPath('/Users/Repo/', 'linux')).toBe('/Users/Repo')
+    expect(normPath('/Users/Repo/', 'darwin')).toBe('/Users/Repo')
+    expect(cwdMatches('/Users/Repo/chat', '/Users/repo', 'linux')).toBe(false)
+    expect(cwdMatches('/Users/Repo/chat', '/Users/repo', 'darwin')).toBe(false)
   })
 })
 
 describe('isUnderWorktrees (hub scratch exclusion)', () => {
   const root = 'C:\\Users\\Admin\\AiAgentApp\\data\\worktrees'
   it('flags a cwd inside the worktrees root', () => {
-    expect(isUnderWorktrees('C:\\Users\\Admin\\AiAgentApp\\data\\worktrees\\24605d07', root)).toBe(true)
+    expect(isUnderWorktrees('C:\\Users\\Admin\\AiAgentApp\\data\\worktrees\\24605d07', root, 'win32')).toBe(true)
   })
   it('leaves a normal project cwd alone', () => {
-    expect(isUnderWorktrees('C:\\Users\\Admin\\AiAgentApp', root)).toBe(false)
+    expect(isUnderWorktrees('C:\\Users\\Admin\\AiAgentApp', root, 'win32')).toBe(false)
   })
 })
 
