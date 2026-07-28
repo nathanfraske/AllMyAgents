@@ -23,6 +23,8 @@
 // endpoint would let an outside agent use the real bus tools instead of poll-and-diff over HTTP.
 
 import fs from 'node:fs'
+import os from 'node:os'
+import { EOL } from 'node:os'
 import path from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 
@@ -39,14 +41,62 @@ const positional = argv.filter((a, i) => {
 })
 const BASE = `http://127.0.0.1:${PORT}`
 
-function tokenPathFor(port) {
-  if (process.env.HUB_DEVICE_TOKEN_FILE) return process.env.HUB_DEVICE_TOKEN_FILE
-  if (process.env.HUB_DATA_DIR) return path.join(process.env.HUB_DATA_DIR, 'device-token.txt')
-  if (process.env.SANDBOX_DIR) return path.join(process.env.SANDBOX_DIR, 'data', 'device-token.txt')
-  return port === '7777' ? 'data/device-token.txt' : '.sandbox/data/device-token.txt'
+/** Where an INSTALLED build keeps its data — mirrors app_data_root() in the desktop shell. */
+function installedDataDir() {
+  if (process.platform === 'win32') {
+    const appData = process.env.APPDATA
+    return appData ? path.join(appData, 'AllMyAgents', 'data') : null
+  }
+  if (process.platform === 'darwin') {
+    return path.join(os.homedir(), 'Library', 'Application Support', 'AllMyAgents', 'data')
+  }
+  return path.join(os.homedir(), '.local', 'share', 'AllMyAgents', 'data')
 }
-const DEVICE_TOKEN =
-  process.env.HUB_DEVICE_TOKEN ?? fs.readFileSync(tokenPathFor(PORT), 'utf8').trim()
+
+/**
+ * Candidate token files, most specific first.
+ *
+ * Port 7777 used to resolve to the REPO's data/device-token.txt on the assumption that a hub on the
+ * default port is a developer's `pnpm hubctl:dev`. For anyone running the shipped app that is wrong: the
+ * installed build keeps its token under the per-user app-data root, and the repo path either does not
+ * exist or holds a token for a different hub entirely. Once the control plane started requiring the device
+ * capability, that guess stopped being harmless and started sending a bad token to a live hub — every
+ * call 401'd, and this script died on `all.filter is not a function` while trying to use the error object
+ * as a session list. Try both rather than guessing which kind of hub is listening.
+ */
+function tokenCandidates(port) {
+  if (process.env.HUB_DEVICE_TOKEN_FILE) return [process.env.HUB_DEVICE_TOKEN_FILE]
+  if (process.env.HUB_DATA_DIR) return [path.join(process.env.HUB_DATA_DIR, 'device-token.txt')]
+  if (process.env.SANDBOX_DIR) return [path.join(process.env.SANDBOX_DIR, 'data', 'device-token.txt')]
+  const installed = installedDataDir()
+  return port === '7777'
+    ? [installed, 'data/device-token.txt'].filter(Boolean).map((d) => (d.endsWith('.txt') ? d : path.join(d, 'device-token.txt')))
+    : ['.sandbox/data/device-token.txt']
+}
+
+function readDeviceToken(port) {
+  if (process.env.HUB_DEVICE_TOKEN) return process.env.HUB_DEVICE_TOKEN
+  const tried = []
+  for (const file of tokenCandidates(port)) {
+    tried.push(file)
+    try {
+      const value = fs.readFileSync(file, 'utf8').trim()
+      if (value.length >= 32) return value
+    } catch {
+      // Try the next candidate; a missing file here is expected, not exceptional.
+    }
+  }
+  console.error(
+    [
+      `error: no device token found for the hub on port ${port}. Looked in:`,
+      ...tried.map((file) => `  ${file}`),
+      'Set HUB_DEVICE_TOKEN or HUB_DEVICE_TOKEN_FILE if the hub keeps its token elsewhere.',
+    ].join(EOL)
+  )
+  process.exit(1)
+}
+
+const DEVICE_TOKEN = readDeviceToken(PORT)
 
 const die = (m) => {
   console.error(`error: ${m}`)
@@ -76,6 +126,16 @@ const sessions = () => api('GET', '/api/sessions')
 async function resolve(prefix) {
   if (!prefix) die('need a session id (or a unique prefix of one) — try: confer.mjs who')
   const all = await sessions()
+  // The hub answers errors as objects, so a rejected request arrives here as {error} rather than a list.
+  // Say WHICH failure it was: "all.filter is not a function" sent me hunting a parsing bug when the hub
+  // had simply refused the request.
+  if (!Array.isArray(all)) {
+    die(
+      `could not list sessions from ${BASE}: ${all && all.error ? all.error : JSON.stringify(all).slice(0, 200)}
+` +
+        'If this says the device token is required, this script is reading the wrong token file for that hub.'
+    )
+  }
   const hits = all.filter((s) => s.id.startsWith(prefix) || (s.title ?? '').toLowerCase() === prefix.toLowerCase())
   if (hits.length === 0) die(`no session matches '${prefix}'`)
   if (hits.length > 1) die(`'${prefix}' is ambiguous: ${hits.map((s) => s.id.slice(0, 8)).join(', ')}`)
