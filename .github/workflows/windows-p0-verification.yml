@@ -225,3 +225,346 @@ jobs:
             Get-Process -Name $processName -ErrorAction SilentlyContinue |
               ForEach-Object { & taskkill.exe /PID $_.Id /T /F | Out-Host }
           }
+
+  # The updater used to launch msiexec while its managed hub (and detached workers) still had the
+  # installed hub-runtime\node\node.exe mapped. Windows correctly refused to replace that running file,
+  # after the user had already downloaded and approved the update. A clean launch cannot catch this.
+  #
+  # Build the current commit twice: a lower-version SOURCE app and the signed CANDIDATE updater MSI.
+  # Launch the installed source through its Start Menu shortcut, deliberately keep extra processes from
+  # its exact bundled node.exe alive (the field failure had 65), then invoke the real updater command
+  # through the installed WebView2. The candidate version, all old PIDs gone, and a new healthy hub are
+  # release requirements. This job is dispatch-only because signing secrets are intentionally unavailable
+  # to untrusted pull requests; release.yml dispatches this workflow at the exact tag before publishing.
+  live-updater-lock:
+    name: live updater drains bundled Node locks
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 55
+    env:
+      AMA_UPDATE_PORT: '49152'
+      AMA_CDP_PORT: '49333'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'apps/desktop/src-tauri -> target'
+      - run: pnpm install --frozen-lockfile
+
+      - name: Require the updater signing key
+        shell: pwsh
+        env:
+          HAS_UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+        run: |
+          if ($env:HAS_UPDATER_KEY -ne 'true') {
+            throw 'TAURI_SIGNING_PRIVATE_KEY is required to verify the real signed Windows update path'
+          }
+
+      - name: Build a signed candidate and a lower-version source MSI
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $fixture = Join-Path $env:RUNNER_TEMP 'ama-live-updater'
+          New-Item -ItemType Directory -Force $fixture | Out-Null
+
+          $baseConfig = Get-Content apps\desktop\src-tauri\tauri.conf.json -Raw |
+            ConvertFrom-Json
+          $candidateVersion = [string]$baseConfig.version
+          if (-not $candidateVersion) { throw 'tauri.conf.json has no candidate version' }
+
+          $updaterConfig = @{
+            bundle = @{ createUpdaterArtifacts = $true }
+            plugins = @{
+              updater = @{
+                endpoints = @("http://127.0.0.1:$env:AMA_UPDATE_PORT/latest.json")
+                dangerousInsecureTransportProtocol = $true
+                windows = @{
+                  installMode = 'passive'
+                  installerArgs = @('/l*v', 'C:\Windows\Temp\ama-live-updater-msi.log')
+                }
+              }
+            }
+          }
+          $candidateConfig = Join-Path $fixture 'candidate-config.json'
+          $updaterConfig | ConvertTo-Json -Depth 8 |
+            Set-Content $candidateConfig -Encoding utf8
+
+          pnpm --filter desktop exec tauri build --bundles msi --config $candidateConfig
+          if ($LASTEXITCODE -ne 0) { throw "candidate build failed with exit $LASTEXITCODE" }
+          $candidate = Get-ChildItem apps\desktop\src-tauri\target\release\bundle\msi\*.msi |
+            Where-Object Name -Like "*$candidateVersion*" |
+            Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+          if (-not $candidate) { throw "candidate build produced no $candidateVersion MSI" }
+          $candidateSignature = Get-Item "$($candidate.FullName).sig" -ErrorAction SilentlyContinue
+          if (-not $candidateSignature) {
+            throw "candidate updater artifact has no signature beside $($candidate.FullName)"
+          }
+          Copy-Item $candidate.FullName (Join-Path $fixture 'candidate.msi')
+          Copy-Item $candidateSignature.FullName (Join-Path $fixture 'candidate.msi.sig')
+
+          # Same product code and shutdown logic, deliberately older version. It is the app performing
+          # the update, so this proves the candidate code's updater path rather than an old release's.
+          #
+          # Give the source package a tiny Node-forwarder at the SAME installed node.exe path. It waits
+          # for the system Node it launches, so Windows keeps this executable mapped for the full hub
+          # lifetime. The candidate contains the real, versioned Node executable and MSI must replace it;
+          # this prevents a false green where Windows Installer notices byte-identical source/candidate
+          # Node files and optimizes the locked file out of the update.
+          $nodeForwarderSource = Join-Path $fixture 'node-forwarder.rs'
+          @'
+          use std::process::{Command, exit};
+          fn main() {
+              let status = Command::new("node")
+                  .args(std::env::args_os().skip(1))
+                  .status()
+                  .expect("could not launch the workflow runner Node");
+              exit(status.code().unwrap_or(1));
+          }
+          '@ | Set-Content $nodeForwarderSource -Encoding utf8
+          rustc -O $nodeForwarderSource `
+            -o apps\desktop\src-tauri\hub-runtime\node\node.exe
+          if ($LASTEXITCODE -ne 0) { throw "Node forwarder build failed with exit $LASTEXITCODE" }
+
+          $sourceConfigObject = $updaterConfig.Clone()
+          $sourceConfigObject['version'] = '0.0.0'
+          $sourceConfigObject['bundle'] = @{ createUpdaterArtifacts = $false }
+          # Candidate build already staged the web UI and hub payload. Do not let the source build's
+          # normal pre-build bundler overwrite the deliberate Node forwarder.
+          $sourceConfigObject['build'] = @{ beforeBuildCommand = '' }
+          $sourceConfig = Join-Path $fixture 'source-config.json'
+          $sourceConfigObject | ConvertTo-Json -Depth 8 |
+            Set-Content $sourceConfig -Encoding utf8
+
+          # The source needs no updater artifact of its own. Do not accidentally sign or publish it.
+          Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue
+          Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
+          pnpm --filter desktop exec tauri build --bundles msi --config $sourceConfig
+          if ($LASTEXITCODE -ne 0) { throw "source build failed with exit $LASTEXITCODE" }
+          $source = Get-ChildItem apps\desktop\src-tauri\target\release\bundle\msi\*.msi |
+            Where-Object Name -Like '*0.0.0*' |
+            Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+          if (-not $source) { throw 'lower-version source build produced no 0.0.0 MSI' }
+          Copy-Item $source.FullName (Join-Path $fixture 'source.msi')
+
+          $signature = (Get-Content (Join-Path $fixture 'candidate.msi.sig') -Raw).Trim()
+          @{
+            version = $candidateVersion
+            notes = 'Windows live-updater process-lock verification'
+            pub_date = [DateTime]::UtcNow.ToString('o')
+            platforms = @{
+              'windows-x86_64' = @{
+                signature = $signature
+                url = "http://127.0.0.1:$env:AMA_UPDATE_PORT/candidate.msi"
+              }
+            }
+          } | ConvertTo-Json -Depth 8 |
+            Set-Content (Join-Path $fixture 'latest.json') -Encoding utf8
+          "AMA_UPDATE_FIXTURE=$fixture" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "AMA_CANDIDATE_VERSION=$candidateVersion" |
+            Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install the lower-version source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = Join-Path $env:AMA_UPDATE_FIXTURE 'source.msi'
+          $install = Start-Process msiexec.exe `
+            -ArgumentList @('/i', "`"$source`"", '/qn', '/l*v', "$env:RUNNER_TEMP\source-msi.log") `
+            -Wait -PassThru
+          if ($install.ExitCode -ne 0) {
+            Get-Content "$env:RUNNER_TEMP\source-msi.log" -Tail 100
+            throw "source MSI failed with $($install.ExitCode)"
+          }
+
+          $roots = @("$env:LOCALAPPDATA\Programs", "$env:ProgramFiles", "${env:ProgramFiles(x86)}") |
+            Where-Object { $_ -and (Test-Path $_) }
+          $exe = Get-ChildItem -Path $roots -Include 'allmyagents-desktop.exe','AllMyAgents.exe' `
+            -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { throw 'source MSI installed no AllMyAgents executable' }
+          $shortcutRoots = @(
+            "$env:APPDATA\Microsoft\Windows\Start Menu\Programs",
+            "$env:ProgramData\Microsoft\Windows\Start Menu\Programs"
+          )
+          $shortcut = Get-ChildItem -Path $shortcutRoots -Filter '*AllMyAgents*.lnk' `
+            -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $shortcut) { throw 'source MSI installed no Start Menu shortcut' }
+
+          "AMA_UPDATE_EXE=$($exe.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "AMA_UPDATE_SHORTCUT=$($shortcut.FullName)" |
+            Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Launch source, hold its bundled Node open, and serve the signed candidate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-port=$env:AMA_CDP_PORT"
+          Start-Process -FilePath $env:AMA_UPDATE_SHORTCUT
+
+          $firstHealth = $null
+          foreach ($attempt in 1..180) {
+            try {
+              $firstHealth = Invoke-RestMethod http://127.0.0.1:7777/api/health -TimeoutSec 2
+              break
+            } catch {
+              Start-Sleep -Seconds 2
+            }
+          }
+          if (-not $firstHealth) { throw 'lower-version source never produced a healthy hub' }
+          $firstHealth | ConvertTo-Json -Compress |
+            Set-Content "$env:RUNNER_TEMP\update-health-first.json" -Encoding utf8
+          "AMA_UPDATE_FIRST_HUB_PID=$($firstHealth.pid)" |
+            Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+          $installRoot = Split-Path $env:AMA_UPDATE_EXE -Parent
+          $bundledNode = Join-Path $installRoot 'hub-runtime\node\node.exe'
+          if (-not (Test-Path $bundledNode)) {
+            throw "installed source has no bundled Node at $bundledNode"
+          }
+          "setInterval(() => {}, 1000)" |
+            Set-Content (Join-Path $env:AMA_UPDATE_FIXTURE 'hold-node.js') -Encoding utf8
+          $lockPids = @()
+          foreach ($index in 1..3) {
+            $holder = Start-Process -FilePath $bundledNode `
+              -ArgumentList (Join-Path $env:AMA_UPDATE_FIXTURE 'hold-node.js') `
+              -WindowStyle Hidden -PassThru
+            $lockPids += $holder.Id
+          }
+          $lockPids | ConvertTo-Json |
+            Set-Content "$env:RUNNER_TEMP\old-bundled-node-pids.json" -Encoding utf8
+
+          Start-Sleep -Seconds 1
+          try {
+            $stream = [IO.File]::Open(
+              $bundledNode,
+              [IO.FileMode]::Open,
+              [IO.FileAccess]::ReadWrite,
+              [IO.FileShare]::None
+            )
+            $stream.Dispose()
+            throw 'bundled node.exe was replaceable while the deliberate lock holders were alive'
+          } catch [IO.IOException] {
+            Write-Host "reproduced Windows executable lock at $bundledNode"
+          }
+
+          $server = Start-Process python `
+            -ArgumentList @('-m', 'http.server', $env:AMA_UPDATE_PORT, '--bind', '127.0.0.1') `
+            -WorkingDirectory $env:AMA_UPDATE_FIXTURE -WindowStyle Hidden -PassThru
+          "AMA_UPDATE_SERVER_PID=$($server.Id)" |
+            Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          foreach ($attempt in 1..30) {
+            try {
+              Invoke-WebRequest "http://127.0.0.1:$env:AMA_UPDATE_PORT/latest.json" `
+                -UseBasicParsing -TimeoutSec 2 | Out-Null
+              exit 0
+            } catch {
+              Start-Sleep -Milliseconds 500
+            }
+          }
+          throw 'local signed-update endpoint never became reachable'
+
+      - name: Invoke the real updater and require replacement, relaunch, and health
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node scripts/windows-updater-drive.mjs $env:AMA_CDP_PORT
+          if ($LASTEXITCODE -ne 0) { throw "updater driver failed with exit $LASTEXITCODE" }
+
+          $oldPids = @(Get-Content "$env:RUNNER_TEMP\old-bundled-node-pids.json" -Raw |
+            ConvertFrom-Json)
+          $updated = $false
+          $newHealth = $null
+          foreach ($attempt in 1..180) {
+            $oldProcessesGone = @(
+              $oldPids | Where-Object {
+                Get-Process -Id $_ -ErrorAction SilentlyContinue
+              }
+            ).Count -eq 0
+            $installedVersion = (
+              [Diagnostics.FileVersionInfo]::GetVersionInfo($env:AMA_UPDATE_EXE)
+            ).ProductVersion
+            try {
+              $newHealth = Invoke-RestMethod http://127.0.0.1:7777/api/health -TimeoutSec 2
+            } catch {
+              $newHealth = $null
+            }
+            if (
+              $oldProcessesGone -and
+              $installedVersion -like "$env:AMA_CANDIDATE_VERSION*" -and
+              $newHealth -and
+              "$($newHealth.pid)" -ne "$env:AMA_UPDATE_FIRST_HUB_PID"
+            ) {
+              $updated = $true
+              break
+            }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $updated) {
+            $remaining = @(
+              $oldPids | Where-Object {
+                Get-Process -Id $_ -ErrorAction SilentlyContinue
+              }
+            )
+            $version = (
+              [Diagnostics.FileVersionInfo]::GetVersionInfo($env:AMA_UPDATE_EXE)
+            ).ProductVersion
+            if (Test-Path 'C:\Windows\Temp\ama-live-updater-msi.log') {
+              Get-Content 'C:\Windows\Temp\ama-live-updater-msi.log' -Tail 120
+            }
+            throw "live update did not complete: version=$version oldPids=$remaining health=$($newHealth | ConvertTo-Json -Compress)"
+          }
+
+          $newHealth | ConvertTo-Json -Compress |
+            Set-Content "$env:RUNNER_TEMP\update-health-repaired.json" -Encoding utf8
+          $desktopLog = Join-Path $env:LOCALAPPDATA 'direct.cec.allmyagents\logs\desktop.log'
+          if (-not (Test-Path $desktopLog)) { throw "updated app wrote no log at $desktopLog" }
+          $logText = Get-Content $desktopLog -Raw
+          if (-not $logText.Contains("AllMyAgents $env:AMA_CANDIDATE_VERSION starting")) {
+            throw 'desktop log does not prove the candidate app relaunched'
+          }
+          Copy-Item $desktopLog "$env:RUNNER_TEMP\desktop-after-live-update.log"
+          Write-Host "live update succeeded: source hub $env:AMA_UPDATE_FIRST_HUB_PID -> candidate hub $($newHealth.pid)"
+
+      - name: Upload live-updater evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-live-updater
+          path: |
+            ${{ runner.temp }}\source-msi.log
+            C:\Windows\Temp\ama-live-updater-msi.log
+            ${{ runner.temp }}\desktop-after-live-update.log
+            ${{ runner.temp }}\update-health-first.json
+            ${{ runner.temp }}\update-health-repaired.json
+            ${{ runner.temp }}\old-bundled-node-pids.json
+          if-no-files-found: warn
+
+      - name: Cleanup live-updater fixture
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:AMA_UPDATE_SERVER_PID) {
+            Stop-Process -Id $env:AMA_UPDATE_SERVER_PID -Force -ErrorAction SilentlyContinue
+          }
+          if ($env:AMA_UPDATE_EXE) {
+            $installRoot = Split-Path $env:AMA_UPDATE_EXE -Parent
+            Get-CimInstance Win32_Process |
+              Where-Object {
+                $_.ExecutablePath -and $_.ExecutablePath.StartsWith(
+                  $installRoot,
+                  [StringComparison]::OrdinalIgnoreCase
+                )
+              } |
+              ForEach-Object {
+                Invoke-CimMethod -InputObject $_ -MethodName Terminate -ErrorAction SilentlyContinue |
+                  Out-Null
+              }
+          }
