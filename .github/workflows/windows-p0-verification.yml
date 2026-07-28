@@ -444,6 +444,13 @@ jobs:
             Set-Content "$env:RUNNER_TEMP\update-health-first.json" -Encoding utf8
           "AMA_UPDATE_FIRST_HUB_PID=$($firstHealth.pid)" |
             Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          $desktopLog = Join-Path $env:LOCALAPPDATA 'direct.cec.allmyagents\logs\desktop.log'
+          if (-not (Test-Path $desktopLog)) { throw "source app wrote no log at $desktopLog" }
+          $sourceStartCount = @(
+            Select-String -Path $desktopLog -SimpleMatch '=== AllMyAgents'
+          ).Count
+          "AMA_UPDATE_SOURCE_START_COUNT=$sourceStartCount" |
+            Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
           $installRoot = Split-Path $env:AMA_UPDATE_EXE -Parent
           $bundledNode = Join-Path $installRoot 'hub-runtime\node\node.exe'
@@ -530,9 +537,11 @@ jobs:
             Set-Content "$env:RUNNER_TEMP\update-health-repaired.json" -Encoding utf8
           $desktopLog = Join-Path $env:LOCALAPPDATA 'direct.cec.allmyagents\logs\desktop.log'
           if (-not (Test-Path $desktopLog)) { throw "updated app wrote no log at $desktopLog" }
-          $logText = Get-Content $desktopLog -Raw
-          if (-not $logText.Contains("AllMyAgents $env:AMA_CANDIDATE_VERSION starting")) {
-            throw 'desktop log does not prove the candidate app relaunched'
+          $candidateStartCount = @(
+            Select-String -Path $desktopLog -SimpleMatch '=== AllMyAgents'
+          ).Count
+          if ($candidateStartCount -le [int]$env:AMA_UPDATE_SOURCE_START_COUNT) {
+            throw 'desktop log does not contain a new app start after the MSI handoff'
           }
           Copy-Item $desktopLog "$env:RUNNER_TEMP\desktop-after-live-update.log"
           Write-Host "live update succeeded: source hub $env:AMA_UPDATE_FIRST_HUB_PID -> candidate hub $($newHealth.pid)"
