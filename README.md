@@ -67,7 +67,13 @@ One command. Paste it into Terminal:
 curl -fsSL https://raw.githubusercontent.com/nathanfraske/AllMyAgents/main/scripts/install-macos.sh | bash
 ```
 
-It picks the right build for your Mac (Apple Silicon or Intel), installs to `/Applications`, and the app then opens normally — no Gatekeeper dialog and no extra steps. It also puts an `allmyagents` command on your PATH; if the directory it chose is not already on your PATH it prints the exact line to add and offers to add it for you.
+It picks the right build for your Mac (Apple Silicon or Intel), installs to `/Applications`, opens it through macOS LaunchServices, and waits until the hub answers its health check — no Gatekeeper dialog and no extra steps. First launch can take several minutes while dependencies and vendor CLIs install, and the installer prints progress while it waits. A timeout keeps the installed app and prints the desktop log path rather than rolling the install back. It also puts an `allmyagents` command on your PATH; if the directory it chose is not already on your PATH it prints the exact line to add and offers to add it for you.
+
+For an offline or metered install that should only place the files, append `--no-verify`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nathanfraske/AllMyAgents/main/scripts/install-macos.sh | bash -s -- --no-verify
+```
 
 ### Uninstalling
 
