@@ -8,6 +8,16 @@ export interface ProfileOwner {
   pid: number
   port: number
   startedAt: string
+  /**
+   * A DISPOSABLE hub — a sandbox — rather than the operator's own app.
+   *
+   * Ownership without this distinction treats the two as equals, so whichever started first wins. That is
+   * backwards, and it happened: an agent's throwaway sandbox claimed ALL FOUR of the operator's accounts
+   * and held them while idle. Their own app could not have taken a single one back without the sandbox
+   * exiting. A sandbox is by definition expendable and the operator's app is not, so the tie is broken by
+   * role rather than by timing.
+   */
+  transient?: boolean
 }
 
 export interface ClaimResult {
@@ -59,6 +69,11 @@ export class ProfileOwnership {
     this.self = { ...self, startedAt: self.startedAt ?? new Date().toISOString() }
   }
 
+  /** True when this hub is disposable (a sandbox), so callers can explain themselves to the operator. */
+  get transient(): boolean {
+    return this.self.transient === true
+  }
+
   claim(profileId: string, profileDir: string): ClaimResult {
     fs.mkdirSync(profileDir, { recursive: true })
     const file = path.join(profileDir, PROFILE_OWNER_FILE)
@@ -81,10 +96,15 @@ export class ProfileOwnership {
         this.held.set(profileId, file)
         return { owned: true, owner }
       }
-      if (owner && live(owner.pid)) return { owned: false, owner }
+      // A LIVE claim normally stands — except when a disposable hub is sitting on the operator's account
+      // and the operator's own app wants it. Then the sandbox yields, because it is the expendable one.
+      // The reverse never happens: a sandbox may not evict the real hub, so a running app cannot have its
+      // credentials pulled out from under it by a test harness.
+      const preemptable = owner?.transient === true && this.self.transient !== true
+      if (owner && live(owner.pid) && !preemptable) return { owned: false, owner }
 
-      // Dead/malformed claims are renamed first. That preserves evidence and makes competing reclaimers
-      // race on the next atomic `wx`; only one can become owner.
+      // Dead, malformed, or preempted claims are renamed first. That preserves evidence and makes
+      // competing reclaimers race on the next atomic `wx`; only one can become owner.
       try {
         fs.renameSync(file, `${file}.stale-${Date.now()}-${process.pid}`)
       } catch {

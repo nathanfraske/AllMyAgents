@@ -146,6 +146,10 @@ const profileOwnership = new ProfileOwnership({
   ownerId: process.env.HUB_PROFILE_OWNER_ID ?? crypto.randomUUID(),
   pid: Number(process.env.HUB_PROFILE_OWNER_PID ?? process.pid),
   port: Number(process.env.HUB_PROFILE_OWNER_PORT ?? process.env.HUB_PORT ?? 7777),
+  // Set by scripts/sandbox.mjs. It marks this hub as expendable, which is what lets the operator's own
+  // app take an account back from a sandbox that is squatting on it. Absent for a real install, so the
+  // installed app is never the one that yields.
+  transient: process.env.HUB_TRANSIENT === '1',
 })
 for (const profile of profiles) {
   const claim = profileOwnership.claim(profile.id, profile.dir)

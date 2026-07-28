@@ -135,6 +135,11 @@ async function up() {
     // Also suppress registration of ~/.claude and ~/.codex as resumable homes. Empty managed profiles
     // are not isolation if a restored/imported session can still launch against the operator's CLI home.
     HUB_ISOLATED_PROFILES: isolatedProfiles ? '1' : '0',
+    // This hub is DISPOSABLE, and saying so is load-bearing. Profile ownership breaks ties by role rather
+    // than by whoever booted first, so the operator's installed app can always reclaim an account from a
+    // sandbox — but never the reverse. Without this flag an idle sandbox can sit on every account the
+    // operator has, which is exactly what happened before it existed.
+    HUB_TRANSIENT: '1',
     // Never advertise a sandbox on the mesh: a disposable hub must not appear in the operator's fleet
     // roster, and certainly must not be reachable from another machine.
     MESH_EXPOSE: '0',

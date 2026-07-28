@@ -27,6 +27,44 @@ describe('profile single-writer ownership', () => {
     })
   })
 
+  // THE OPERATOR'S APP OUTRANKS A SANDBOX. An agent's throwaway hub claimed all four of the operator's
+  // accounts and held them while idle; nothing could take them back short of killing the process. Ties are
+  // now broken by role, not by who booted first.
+  it('lets the operator app reclaim an account a live sandbox is sitting on', () => {
+    const dir = tmp()
+    const sandbox = new ProfileOwnership({ ownerId: 'sandbox', pid: process.pid, port: 7788, transient: true })
+    const app = new ProfileOwnership({ ownerId: 'installed-app', pid: process.pid, port: 7777 })
+
+    expect(sandbox.claim('claude-a', dir).owned).toBe(true)
+    // process.pid is this very process, so the sandbox's claim is unambiguously LIVE — this is a
+    // preemption, not stale-claim reclamation.
+    const taken = app.claim('claude-a', dir)
+    expect(taken.owned).toBe(true)
+    expect(taken.reclaimed).toBe(true)
+  })
+
+  it('never lets a sandbox evict the operator app', () => {
+    const dir = tmp()
+    const app = new ProfileOwnership({ ownerId: 'installed-app', pid: process.pid, port: 7777 })
+    const sandbox = new ProfileOwnership({ ownerId: 'sandbox', pid: process.pid, port: 7788, transient: true })
+
+    expect(app.claim('claude-a', dir).owned).toBe(true)
+    expect(sandbox.claim('claude-a', dir)).toMatchObject({
+      owned: false,
+      owner: { ownerId: 'installed-app', port: 7777 },
+    })
+    // And the refresh-capable path stays closed, so a sandbox cannot rotate a token out from under the app.
+    expect(() => sandbox.assertOwned('claude-a', dir, 'replace credentials')).toThrow(ProfileOwnershipError)
+  })
+
+  it('does not let one sandbox evict another', () => {
+    const dir = tmp()
+    const first = new ProfileOwnership({ ownerId: 's1', pid: process.pid, port: 7801, transient: true })
+    const second = new ProfileOwnership({ ownerId: 's2', pid: process.pid, port: 7802, transient: true })
+    expect(first.claim('codex-a', dir).owned).toBe(true)
+    expect(second.claim('codex-a', dir).owned).toBe(false)
+  })
+
   it('reclaims a stale claim whose pid is dead', () => {
     const dir = tmp()
     fs.writeFileSync(
