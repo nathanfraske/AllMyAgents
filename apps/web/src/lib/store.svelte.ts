@@ -1485,6 +1485,14 @@ export class HubStore {
       this.scheduleSideRefresh()
     }
 
+    if (kind === 'profile/auth') {
+      const auth = payload as { profileId?: string; status?: 'signed_in' | 'signed_out'; message?: string }
+      const profile = this.profiles.find((candidate) => candidate.id === auth.profileId)
+      if (profile && auth.status) {
+        profile.authStatus = auth.status
+        profile.authError = auth.message
+      }
+    }
     if (!sessionId) return
 
     if (kind === 'session/created') {

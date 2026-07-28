@@ -16,6 +16,7 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
+import crypto from 'node:crypto'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { sendToHub, waitForHubMsg, healthCheck, type HubMsg } from './restartHandshake.js'
 import { defaultWorkerSocket } from './workerTransport.js'
@@ -24,6 +25,12 @@ import { defaultWorkerSocket } from './workerTransport.js'
  *  HUB_FIXED_PORT overrides it for an isolated harness (e.g. the restart-survival acceptance test) so a
  *  second supervisor can run beside the live hub without fighting for 7777; unset → 7777 exactly as before. */
 const FIXED_PORT = Number(process.env.HUB_FIXED_PORT ?? 7777)
+const profileOwnerId = process.env.HUB_PROFILE_OWNER_ID ?? crypto.randomUUID()
+const profileOwnerEnv = {
+  HUB_PROFILE_OWNER_ID: profileOwnerId,
+  HUB_PROFILE_OWNER_PID: String(process.pid),
+  HUB_PROFILE_OWNER_PORT: String(FIXED_PORT),
+}
 
 /**
  * Worker mode (docs/agent-worker-impl.md §5) is OPT-IN — the hard requirement is that flag-off is
@@ -118,7 +125,7 @@ function spawnHub(port: number, color: HubColor): HubHandle {
     windowsHide: true,
     // Worker mode (opt-in) injects HUB_WORKER_SOCKET so blue AND green connect to the same worker; when
     // disabled the spread adds nothing, so the env is byte-identical to today (docs/agent-worker-impl.md §5.1).
-    env: { ...process.env, HUB_PORT: String(port), HUB_SUPERVISED: '1', ...(workerSocket ? { HUB_WORKER_SOCKET: workerSocket } : {}) },
+    env: { ...process.env, ...profileOwnerEnv, HUB_PORT: String(port), HUB_SUPERVISED: '1', ...(workerSocket ? { HUB_WORKER_SOCKET: workerSocket } : {}) },
   })
   const handle: HubHandle = { child, color, port, restored: 0, state: 'booting' }
   children.add(child)
@@ -173,7 +180,7 @@ function spawnWorker(): void {
   // The worker relays browser calls back to the hub and never talks to the
   // desktop bridge itself. Do not let the bridge secret flow through the
   // worker into Claude/Codex subprocess environments.
-  const workerEnv: NodeJS.ProcessEnv = { ...process.env, HUB_WORKER_SOCKET: workerSocket }
+  const workerEnv: NodeJS.ProcessEnv = { ...process.env, ...profileOwnerEnv, HUB_WORKER_SOCKET: workerSocket }
   delete workerEnv.AMA_DESKTOP_BROWSER_SECRET
   delete workerEnv.AMA_DESKTOP_BROWSER_ADDR
   const child = spawn(cmd, args, {

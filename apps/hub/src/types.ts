@@ -6,6 +6,11 @@ export interface Profile {
   id: string
   provider: Provider
   dir: string
+  available?: boolean
+  unavailableReason?: string
+  ownerPort?: number
+  authStatus?: 'signed_in' | 'signed_out'
+  authError?: string
 }
 
 export interface Project {

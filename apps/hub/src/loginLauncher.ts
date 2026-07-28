@@ -55,6 +55,15 @@ interface StartLoginOptions {
 
 const attempts = new Map<string, LoginAttemptInternal>()
 
+/** Remove a known-bad credential from the vendor's success probe while retaining it for diagnosis. */
+export function archiveCredentialForReauth(provider: Provider, profileDir: string): string | undefined {
+  const credential = path.join(profileDir, CRED_FILE[provider])
+  if (!fs.existsSync(credential)) return undefined
+  const archived = `${credential}.signed-out-${Date.now()}`
+  fs.renameSync(credential, archived)
+  return archived
+}
+
 function binDir(): string {
   return path.resolve(import.meta.dirname, '..', 'node_modules', '.bin')
 }
