@@ -141,6 +141,11 @@ jobs:
             if (typeof sdk.query !== 'function') throw new Error('claude-agent-sdk exports no query()')
             console.log('shipped graph OK — native sqlite loaded, SDK imported')
           "
+          # Importing the SDK does not prove the installed vendor launchers work. Exercise npm's real
+          # per-platform shims too: POSIX relies on symlinks/shebang + executable bits; Windows resolves
+          # the generated shell shim to claude.exe / the Codex Node entry point.
+          cd "$WORK" && ./node_modules/.bin/claude --version
+          cd "$WORK" && ./node_modules/.bin/codex --version
 
   # ---------------------------------------------------------------------------------------------
   # Rust gate — the Tauri shell. Only on the two RELEASE targets: those are the platforms whose
