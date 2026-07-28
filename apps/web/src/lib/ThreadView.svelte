@@ -898,7 +898,13 @@
     <div class="thread-body">
       <div class="conversation">
   {#if !composerOnly || peekItems > 0}
-  <div class="stream scroll" class:peek-stream={composerOnly} bind:this={scroller} onscroll={onScroll}>
+  <div
+    class="stream scroll"
+    class:peek-stream={composerOnly}
+    class:replay-rebuild={store.replayPresentationActive}
+    bind:this={scroller}
+    onscroll={onScroll}
+  >
     <!-- Items produced INSIDE a spawned sub-agent are excluded here and rendered in the agent panel
          instead: a background agent's tool spam would otherwise bury the conversation you are actually
          having. `agentId` is set only for sub-agent output, so the main thread is unaffected. -->
@@ -906,9 +912,13 @@
       {#if node.type === 'group'}
         <!-- Only the LAST group of the trailing run is "live" while the turn is in flight — that is the
              one still accumulating, so it is the one whose elapsed clock should tick. -->
-        <CodexActivityGroup items={node.items} {now} live={thinking && i === displayedRenderNodes.length - 1} />
+        <div class="stream-node" class:animate-in={node.items.some((item) => !item.replayed)}>
+          <CodexActivityGroup items={node.items} {now} live={thinking && i === displayedRenderNodes.length - 1} />
+        </div>
       {:else}
-        <ItemCard item={node.item} sessionId={view.record.id} />
+        <div class="stream-node" class:animate-in={!node.item.replayed}>
+          <ItemCard item={node.item} sessionId={view.record.id} />
+        </div>
       {/if}
     {/each}
     {#if mainItems.length === 0 && !thinking}
@@ -1207,7 +1217,11 @@
   .hbtn:hover:not(:disabled) { border-color: var(--border-strong); color: var(--text); }
   .hbtn:disabled { opacity: 0.4; cursor: default; }
   .stream { flex: 1; display: flex; flex-direction: column; gap: 0.55rem; padding: 1rem 1.1rem; max-width: 900px; width: 100%; margin: 0 auto; container-type: inline-size; }
-  @media (prefers-reduced-motion: no-preference) { .stream > :global(*) { animation: fade-in 0.22s var(--ease); } }
+  .stream.replay-rebuild { visibility: hidden; }
+  .stream-node { min-width: 0; }
+  @media (prefers-reduced-motion: no-preference) {
+    .stream > :global(*:not(.stream-node)), .stream > .stream-node.animate-in { animation: fade-in 0.22s var(--ease); }
+  }
   .pad { padding: 1rem 0; }
   .thinking { display: flex; align-items: center; gap: 0.5rem; padding: 0.2rem 0.15rem; }
   .thinking .dots { display: inline-flex; gap: 3px; }

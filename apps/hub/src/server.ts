@@ -22,7 +22,7 @@ import { readProjectConfig } from './importScan.js'
 import { pickableProfiles, setClaudeConnectorPolicy } from './profiles.js'
 import { ProfileOwnership } from './profileOwnership.js'
 import { asFileWriteDiffDensity } from './types.js'
-import type { DangerFlags, HubEvent, HubPrefs, ManagerAgentType, Profile, Provider } from './types.js'
+import type { DangerFlags, HubEvent, HubPrefs, ManagerAgentType, Profile, Provider, ReplayComplete, ReplayStart } from './types.js'
 import type { Executor } from './executor.js'
 import type { WorktreeProjectActivity } from './worktreeCollisionDetector.js'
 import type { WorkspaceManager } from './workspace.js'
@@ -1504,13 +1504,22 @@ export function startServer(opts: ServerOptions): http.Server {
   })
   wss.on('connection', (ws, req) => {
     const url = new URL(req.url ?? '/ws', 'http://localhost')
+    const since = Number(url.searchParams.get('since') ?? 0)
+    let replayedThrough = since
+    const replayStart: ReplayStart = { type: 'replay-start' }
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(replayStart))
     // Replay the ENTIRE backlog from `since` (paged inside replay() so a huge journal isn't loaded
     // at once), then attach the live listener — all synchronously, with no `await` between the last
     // replayed event and journal.on(), so no live event can slip into the gap or be sent twice. The
-    // client additionally dedups on seq <= lastSeq, covering any reconnect overlap.
-    for (const event of journal.replay(Number(url.searchParams.get('since') ?? 0))) {
+    // non-journal boundary is queued in that same gap-free window; it reports stream position only and
+    // lets the client distinguish rebuilt history from the live events that follow. The client also
+    // dedups on seq <= lastSeq, covering any reconnect overlap.
+    for (const event of journal.replay(since)) {
+      replayedThrough = event.seq
       if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event))
     }
+    const boundary: ReplayComplete = { type: 'replay-complete', lastSeq: replayedThrough }
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(boundary))
     const listener = (event: HubEvent): void => {
       if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event))
     }

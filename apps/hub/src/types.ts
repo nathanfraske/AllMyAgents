@@ -141,6 +141,16 @@ export interface HubEvent {
   payload: unknown
 }
 
+/** Non-journal WebSocket control envelope separating replayed state from subsequent live events. */
+export interface ReplayStart {
+  type: 'replay-start'
+}
+
+export interface ReplayComplete {
+  type: 'replay-complete'
+  lastSeq: number
+}
+
 export type ApprovalStatus = 'pending' | 'approved' | 'denied' | 'timeout'
 
 export interface ApprovalRecord {

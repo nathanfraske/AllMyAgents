@@ -281,6 +281,18 @@ export interface HubEvent {
   payload: unknown
 }
 
+/** Non-journal WebSocket control envelope separating replayed state from subsequent live events. */
+export interface ReplayStart {
+  type: 'replay-start'
+}
+
+export interface ReplayComplete {
+  type: 'replay-complete'
+  lastSeq: number
+}
+
+export type HubStreamMessage = HubEvent | ReplayStart | ReplayComplete
+
 // In the packaged desktop app the frontend is served from tauri.localhost, so relative URLs
 // never reach the hub. Detect the Tauri webview and target the loopback hub directly. In the
 // browser (dev) the base stays empty and Vite's proxy forwards /api and /ws to the hub.

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from './api'
-import { store } from './store.svelte'
+import { HubStore, store } from './store.svelte'
 import { settings } from './settings.svelte'
 import { loadLastLayout, saveLastLayout } from './uiState'
 import { buildAgentRuns } from './agentTree'
@@ -689,6 +689,88 @@ describe('event batching (replay does not render frame-by-frame)', () => {
 
     const texts = (store.sessions.s1?.items ?? []).filter((i) => i.kind === 'user').map((i) => i.text)
     expect(texts).toContain('survivor')
+  })
+})
+
+describe('replay boundary presentation', () => {
+  type ReplayControl = { type: 'replay-start' } | { type: 'replay-complete'; lastSeq: number }
+  type ReplayStore = {
+    beginReplayPresentation(): void
+    ingest(message: HubEvent | ReplayControl): void
+    flushEvents(): void
+  }
+
+  function harness(): { replayStore: HubStore; transport: ReplayStore } {
+    const replayStore = new HubStore()
+    return { replayStore, transport: replayStore as unknown as ReplayStore }
+  }
+
+  it('marks the backlog silent and only animates transcript items after the boundary', () => {
+    const { replayStore, transport } = harness()
+    transport.beginReplayPresentation()
+    transport.ingest({ type: 'replay-start' })
+    transport.ingest(evt({ seq: 1, kind: 'session/created', sessionId: 's1', payload: rec('s1') }))
+    transport.ingest(evt({ seq: 2, kind: 'session/input', sessionId: 's1', payload: { text: 'history' } }))
+    transport.flushEvents()
+    expect(replayStore.replayPresentationActive).toBe(true)
+    expect(replayStore.sessions.s1?.items.map((item) => item.text)).toEqual(['history'])
+
+    transport.ingest({ type: 'replay-complete', lastSeq: 2 })
+    transport.ingest(evt({ seq: 3, kind: 'session/input', sessionId: 's1', payload: { text: 'live' } }))
+
+    transport.flushEvents()
+    expect(replayStore.replayPresentationActive).toBe(false)
+
+    const messages = replayStore.sessions.s1?.items.filter((item) => item.kind === 'user') ?? []
+    expect(messages.map((item) => [item.text, item.replayed])).toEqual([
+      ['history', true],
+      ['live', false],
+    ])
+  })
+
+  it('applies every replayed event to transcript state rather than dropping or deferring it', () => {
+    const { replayStore, transport } = harness()
+    transport.beginReplayPresentation()
+    transport.ingest({ type: 'replay-start' })
+    transport.ingest(evt({ seq: 1, kind: 'session/created', sessionId: 's1', payload: rec('s1') }))
+    for (let seq = 2; seq <= 12; seq++) {
+      transport.ingest(
+        evt({ seq, kind: 'session/input', sessionId: 's1', payload: { text: `replayed-${seq}` } })
+      )
+    }
+    transport.ingest({ type: 'replay-complete', lastSeq: 12 })
+
+    transport.flushEvents()
+
+    expect(
+      replayStore.sessions.s1?.items.filter((item) => item.kind === 'user').map((item) => item.text)
+    ).toEqual(Array.from({ length: 11 }, (_, index) => `replayed-${index + 2}`))
+    expect(replayStore.lastSeq).toBe(12)
+  })
+
+  it('falls back to normal live presentation when an older hub never sends a boundary', () => {
+    vi.useFakeTimers()
+    try {
+      const { replayStore, transport } = harness()
+      transport.beginReplayPresentation()
+      transport.ingest(evt({ seq: 1, kind: 'session/created', sessionId: 's1', payload: rec('s1') }))
+      transport.ingest(evt({ seq: 2, kind: 'session/input', sessionId: 's1', payload: { text: 'legacy replay' } }))
+      transport.flushEvents()
+      expect(replayStore.replayPresentationActive).toBe(true)
+
+      vi.runAllTimers()
+      expect(replayStore.replayPresentationActive).toBe(false)
+      transport.ingest(evt({ seq: 3, kind: 'session/input', sessionId: 's1', payload: { text: 'legacy live' } }))
+      transport.flushEvents()
+
+      const messages = replayStore.sessions.s1?.items.filter((item) => item.kind === 'user') ?? []
+      expect(messages.map((item) => [item.text, item.replayed])).toEqual([
+        ['legacy replay', true],
+        ['legacy live', false],
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 
