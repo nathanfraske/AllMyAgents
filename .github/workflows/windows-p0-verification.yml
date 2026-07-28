@@ -412,7 +412,10 @@ jobs:
           # to resolve the bare name "node" from inside node.exe finds the forwarder itself first.
           $env:AMA_CI_SYSTEM_NODE = (Get-Command node -ErrorAction Stop).Source
           $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-port=$env:AMA_CDP_PORT"
-          Start-Process -FilePath $env:AMA_UPDATE_SHORTCUT
+          # This instrumented launch uses the installed executable directly so WebView2 inherits the
+          # loopback debugging switch. The sibling launch-and-repair job independently proves that the
+          # Start Menu shortcut works without setup-node's shell environment.
+          Start-Process -FilePath $env:AMA_UPDATE_EXE
 
           $firstHealth = $null
           foreach ($attempt in 1..180) {
@@ -538,6 +541,15 @@ jobs:
           Copy-Item $desktopLog "$env:RUNNER_TEMP\desktop-after-live-update.log"
           Write-Host "live update succeeded: source hub $env:AMA_UPDATE_FIRST_HUB_PID -> candidate hub $($newHealth.pid)"
 
+      - name: Collect live-updater evidence
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path 'C:\Windows\Temp\ama-live-updater-msi.log') {
+            Copy-Item 'C:\Windows\Temp\ama-live-updater-msi.log' `
+              "$env:RUNNER_TEMP\live-updater-msi.log"
+          }
+
       - name: Upload live-updater evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -545,7 +557,7 @@ jobs:
           name: windows-live-updater
           path: |
             ${{ runner.temp }}\source-msi.log
-            C:\Windows\Temp\ama-live-updater-msi.log
+            ${{ runner.temp }}\live-updater-msi.log
             ${{ runner.temp }}\desktop-after-live-update.log
             ${{ runner.temp }}\update-health-first.json
             ${{ runner.temp }}\update-health-repaired.json
