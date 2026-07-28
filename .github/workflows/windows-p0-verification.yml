@@ -243,7 +243,6 @@ jobs:
     timeout-minutes: 55
     env:
       AMA_UPDATE_PORT: '49152'
-      AMA_CDP_PORT: '49333'
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -411,10 +410,24 @@ jobs:
           # The source MSI's deliberate node.exe forwarder must use this absolute path. Asking Windows
           # to resolve the bare name "node" from inside node.exe finds the forwarder itself first.
           $env:AMA_CI_SYSTEM_NODE = (Get-Command node -ErrorAction Stop).Source
-          $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-port=$env:AMA_CDP_PORT"
-          # This instrumented launch uses the installed executable directly so WebView2 inherits the
-          # loopback debugging switch. The sibling launch-and-repair job independently proves that the
-          # Start Menu shortcut works without setup-node's shell environment.
+
+          # The update check runs when the webview mounts, so its endpoint must already be listening.
+          $server = Start-Process python `
+            -ArgumentList @('-m', 'http.server', $env:AMA_UPDATE_PORT, '--bind', '127.0.0.1') `
+            -WorkingDirectory $env:AMA_UPDATE_FIXTURE -WindowStyle Hidden -PassThru
+          "AMA_UPDATE_SERVER_PID=$($server.Id)" |
+            Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          foreach ($attempt in 1..30) {
+            try {
+              Invoke-WebRequest "http://127.0.0.1:$env:AMA_UPDATE_PORT/latest.json" `
+                -UseBasicParsing -TimeoutSec 2 | Out-Null
+              break
+            } catch {
+              if ($attempt -eq 30) { throw 'local signed-update endpoint never became reachable' }
+              Start-Sleep -Milliseconds 500
+            }
+          }
+
           Start-Process -FilePath $env:AMA_UPDATE_EXE
 
           $firstHealth = $null
@@ -463,28 +476,11 @@ jobs:
             Write-Host "reproduced Windows executable lock at $bundledNode"
           }
 
-          $server = Start-Process python `
-            -ArgumentList @('-m', 'http.server', $env:AMA_UPDATE_PORT, '--bind', '127.0.0.1') `
-            -WorkingDirectory $env:AMA_UPDATE_FIXTURE -WindowStyle Hidden -PassThru
-          "AMA_UPDATE_SERVER_PID=$($server.Id)" |
-            Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          foreach ($attempt in 1..30) {
-            try {
-              Invoke-WebRequest "http://127.0.0.1:$env:AMA_UPDATE_PORT/latest.json" `
-                -UseBasicParsing -TimeoutSec 2 | Out-Null
-              exit 0
-            } catch {
-              Start-Sleep -Milliseconds 500
-            }
-          }
-          throw 'local signed-update endpoint never became reachable'
-
       - name: Invoke the real updater and require replacement, relaunch, and health
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          node scripts/windows-updater-drive.mjs $env:AMA_CDP_PORT
-          if ($LASTEXITCODE -ne 0) { throw "updater driver failed with exit $LASTEXITCODE" }
+          & scripts\windows-updater-drive.ps1
 
           $oldPids = @(Get-Content "$env:RUNNER_TEMP\old-bundled-node-pids.json" -Raw |
             ConvertFrom-Json)
