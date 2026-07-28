@@ -6,6 +6,7 @@
   // and when there's nothing to install.
   import { updater } from './updater.svelte'
   import { store } from './store.svelte'
+  import { countLiveUpdateTurns } from './updateSafety'
 
   void updater.checkOnLaunch()
 
@@ -15,9 +16,7 @@
    * so an update accepted during a live turn is simply work thrown away. The banner used to offer one
    * button and no hint that anything was running.
    */
-  const liveTurns = $derived(
-    Object.values(store.sessions).filter((s) => s.record.status === 'active' || s.record.status === 'starting').length
-  )
+  const liveTurns = $derived(countLiveUpdateTurns(store.sessions))
 
   /** Armed by "Update when idle": install as soon as the last live turn finishes, rather than making
    *  the operator sit and watch for it. */
@@ -54,7 +53,7 @@
       {:else}
         <button class="btn btn-ghost" onclick={() => updater.dismiss()} disabled={updater.busy}>Later</button>
         {#if liveTurns > 0}
-          <button class="btn btn-ghost" onclick={() => updater.install()} disabled={updater.busy}>
+          <button class="btn btn-ghost" onclick={() => updater.install({ allowLiveTurns: true })} disabled={updater.busy}>
             {updater.busy ? 'Updating…' : 'Update anyway'}
           </button>
           <button class="btn btn-primary" onclick={() => (waitForIdle = true)} disabled={updater.busy}>

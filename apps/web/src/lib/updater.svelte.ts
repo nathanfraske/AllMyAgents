@@ -19,6 +19,8 @@
 
 import { inTauri } from './window'
 import { settings } from './settings.svelte'
+import { store } from './store.svelte'
+import { countLiveUpdateTurns, updateInstallBlock } from './updateSafety'
 
 export interface UpdateInfo {
   available: boolean
@@ -144,8 +146,16 @@ class UpdaterStore {
    * CONSENT PATH. Download, verify the signature, install, relaunch. On success
    * this never returns — the shell restarts the app.
    */
-  async install(): Promise<void> {
+  async install(options: { allowLiveTurns?: boolean } = {}): Promise<void> {
     if (!updatesSupported || this.busy) return
+    const block = updateInstallBlock(
+      countLiveUpdateTurns(store.sessions),
+      options.allowLiveTurns === true
+    )
+    if (block) {
+      this.error = block
+      return
+    }
     this.busy = true
     this.error = null
     try {
