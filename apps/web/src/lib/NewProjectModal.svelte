@@ -16,7 +16,7 @@
 </script>
 
 <script lang="ts">
-  import { tick } from 'svelte'
+  import { tick, untrack } from 'svelte'
   import {
     api,
     type GitHubCloneJob,
@@ -31,9 +31,10 @@
   import ManagerSetupModal, { type ManagerLaunchConfig } from './ManagerSetupModal.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
 
-  let { onclose, onlaunched }: {
+  let { onclose, onlaunched, tutorialStep }: {
     onclose: () => void
     onlaunched: (result: ProjectLaunchResult) => void | Promise<void>
+    tutorialStep?: number
   } = $props()
 
   type Step = 1 | 2 | 3
@@ -85,6 +86,7 @@
   let projectSection = $state<HTMLElement | null>(null)
   let teamSection = $state<HTMLElement | null>(null)
   let finalizeSection = $state<HTMLElement | null>(null)
+  let tutorialWasActive = false
 
   const failed = $derived(agents.filter((agent) => agent.status === 'failed'))
   const started = $derived(agents.filter((agent) => agent.status === 'started'))
@@ -93,6 +95,7 @@
   const readyToReview = $derived(
     agents.every((agent) => Boolean(agent.profileId && agent.prompt.trim())),
   )
+  const tutorialMode = $derived(tutorialStep !== undefined)
 
   function defaultProfileId(): string {
     return store.defaultProfileId() ?? store.profiles[0]?.id ?? ''
@@ -111,6 +114,117 @@
       effort: effortDescriptor?.options?.find((item) => item.isDefault)?.value ?? '',
     }
   }
+
+  function resetProjectForm(): void {
+    step = 1
+    project = null
+    projectDraft = null
+    projectName = ''
+    projectPath = ''
+    githubRepository = null
+    projectStatus = ''
+    gitGuidance = ''
+    environmentGuidance = ''
+    projectSource = 'local'
+    editingProjectSource = false
+    creating = false
+    createError = ''
+    agents = []
+    nextAgentNumber = 1
+    teamError = ''
+    launching = false
+    launchAttempted = false
+    managerEnabled = false
+    managerConfig = null
+    managerStatus = 'ready'
+    managerSessionId = undefined
+    managerPromptSent = false
+    managerError = undefined
+  }
+
+  function tutorialAgent(profileId: string): StartingAgent {
+    return {
+      id: 'tutorial-starting-agent',
+      profileId,
+      ...defaultsFor(profileId),
+      permissionMode: 'safe',
+      prompt: 'Investigate the first task and report what you find.',
+      scope: 'A focused part of the project',
+      useWorktree: true,
+      status: 'ready',
+    }
+  }
+
+  function tutorialManager(profileId: string): ManagerLaunchConfig {
+    const defaults = defaultsFor(profileId)
+    return {
+      projectId: '__tutorial-project__',
+      managerProfileId: profileId,
+      managerModel: defaults.model,
+      managerEffort: defaults.effort,
+      permissionMode: 'safe',
+      maxChildPermissionMode: 'safe',
+      startingPrompt: '',
+      orientationBrief: '',
+      operatorTask: 'Coordinate the sample project and verify the team’s work.',
+      standingInstructions: '',
+      canApproveChildren: true,
+      maxLiveChildren: 4,
+      delegation: [],
+      allowedTools: [],
+      allowedProfiles: profileId ? [profileId] : [],
+      allowedModels: profileId && defaults.model ? { [profileId]: [defaults.model] } : {},
+      agentTypes: [{
+        id: 'tutorial-worker-role',
+        name: 'Focused worker',
+        purpose: 'Handle one bounded part of the project',
+        selection: 'fixed',
+        profileId,
+        model: defaults.model,
+        effort: defaults.effort,
+      }],
+    }
+  }
+
+  function showTutorialStep(stage: number): void {
+    if (stage < 2) {
+      resetProjectForm()
+      return
+    }
+
+    const profileId = defaultProfileId()
+    project = null
+    projectDraft = { kind: 'managed', name: 'Tutorial project (dry run)' }
+    projectName = 'Tutorial project (dry run)'
+    projectPath = ''
+    githubRepository = null
+    projectSource = 'managed'
+    editingProjectSource = false
+    createError = ''
+    agents = [tutorialAgent(profileId)]
+    nextAgentNumber = 2
+    teamError = ''
+    launchAttempted = false
+    managerEnabled = stage >= 4
+    managerConfig = stage >= 5 ? tutorialManager(profileId) : null
+    managerStatus = 'ready'
+    managerError = undefined
+    step = stage >= 5 ? 3 : 2
+    void reveal(stage >= 5 ? 'finalize' : 'team')
+  }
+
+  $effect(() => {
+    const stage = tutorialStep
+    untrack(() => {
+      if (stage === undefined) {
+        if (tutorialWasActive) resetProjectForm()
+        tutorialWasActive = false
+        return
+      }
+      tutorialWasActive = true
+      showTutorialStep(stage)
+    })
+  })
 
   function addAgent(): void {
     const profileId = defaultProfileId()
@@ -603,6 +717,7 @@
   }
 
   function launchAll(): Promise<void> {
+    if (tutorialMode) return Promise.resolve()
     return launch(
       agents.filter((agent) => agent.status !== 'started'),
       Boolean(managerConfig && managerStatus !== 'started'),
@@ -791,7 +906,7 @@
             Use either category, both, or neither. Zero is fine if you only want the project.
           </p>
 
-          <section class="team-category manager-category" aria-labelledby="manager-category-title">
+          <section class="team-category manager-category" aria-labelledby="manager-category-title" data-tutorial-anchor="project-manager">
             <div class="category-head">
               <div>
                 <span class="category-label">DELEGATE THE WORK</span>
@@ -825,7 +940,7 @@
             {/if}
           </section>
 
-          <section class="team-category independent-category" aria-labelledby="independent-category-title">
+          <section class="team-category independent-category" aria-labelledby="independent-category-title" data-tutorial-anchor="project-independent-agents">
             <div class="category-head">
               <div>
                 <span class="category-label">FIRE AND FORGET</span>
@@ -885,7 +1000,7 @@
                   </label>
                 </div>
 
-                <div class="agent-controls">
+                <div class="agent-controls" data-tutorial-anchor="project-worktree">
                   <label>
                     <span>Permission</span>
                     <select value={agent.permissionMode} onchange={(event) => updateAgent(agent.id, { permissionMode: (event.target as HTMLSelectElement).value as StartingAgent['permissionMode'] })}>
@@ -915,7 +1030,7 @@
       </section>
 
       {#if step === 3}
-        <section class="step current" bind:this={finalizeSection}>
+        <section class="step current" bind:this={finalizeSection} data-tutorial-anchor="project-finalize">
           <div class="step-head">
             <div>
               <span class="step-number">STEP 3</span>
@@ -999,10 +1114,17 @@
           {/if}
 
           {#if !launchAttempted}
+            {#if tutorialMode}
+              <p class="fixed-note">Dry run only. Finish the tutorial to clear this sample and return to a blank project setup.</p>
+            {/if}
             <div class="footer-actions">
               <button class="secondary" onclick={() => { step = 2; void reveal('team') }}>Back to team</button>
-              <button class="launch" onclick={launchAll} disabled={launching}>
-                {agents.length || managerConfig ? 'Launch project with team' : 'Create project without agents'}
+              <button class="launch" onclick={launchAll} disabled={launching || tutorialMode}>
+                {tutorialMode
+                  ? 'Dry run complete — nothing created'
+                  : agents.length || managerConfig
+                    ? 'Launch project with team'
+                    : 'Create project without agents'}
               </button>
             </div>
           {/if}

@@ -50,15 +50,21 @@ describe('first New Project tutorial overlay', () => {
     expect(screen.getByText(/existing directory, choose a GitHub repository/i)).toBeTruthy()
 
     await fireEvent.click(screen.getByRole('button', { name: 'Next' }))
+    expect(screen.getByText(/choose its account and model/i)).toBeTruthy()
+    expect(screen.getByText(/permission level/i)).toBeTruthy()
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Next' }))
     expect(screen.getByText(/isolated branch and folder/i)).toBeTruthy()
+    expect(screen.getByText(/every starting agent/i)).toBeTruthy()
 
     await fireEvent.click(screen.getByRole('button', { name: 'Next' }))
-    expect(screen.getByText(/manager-led team/i)).toBeTruthy()
-    expect(screen.getByText(/Either choice is optional/i)).toBeTruthy()
+    expect(screen.getByText(/break work into child-agent roles/i)).toBeTruthy()
+    expect(screen.getByText(/both optional/i)).toBeTruthy()
 
     await fireEvent.click(screen.getByRole('button', { name: 'Next' }))
-    expect(screen.getByText(/Nothing is created until Finalize/i)).toBeTruthy()
-    expect(screen.getByText(/only when you finalize the launch/i)).toBeTruthy()
+    expect(screen.getByText(/real Finalize step/i)).toBeTruthy()
+    expect(screen.getByText(/launch action is disabled/i)).toBeTruthy()
+    expect(screen.getByText(/no project, clone, worktree, manager, or agent is created/i)).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Finish' })).toBeTruthy()
   })
 })
