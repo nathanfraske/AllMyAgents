@@ -77,10 +77,18 @@ function clipboardPaste(el: Element, files: File[], text = ''): void {
   el.dispatchEvent(event)
 }
 
-function dropFiles(el: Element, files: File[]): void {
+function dropFiles(el: Element, files: File[], types = ['Files']): Event {
   const event = new Event('drop', { bubbles: true, cancelable: true }) as Event & { dataTransfer: unknown }
+  Object.defineProperty(event, 'dataTransfer', { value: { files, types } })
+  el.dispatchEvent(event)
+  return event
+}
+
+function dragFilesOver(el: Element, files: File[]): Event {
+  const event = new Event('dragenter', { bubbles: true, cancelable: true }) as Event & { dataTransfer: unknown }
   Object.defineProperty(event, 'dataTransfer', { value: { files, types: ['Files'] } })
   el.dispatchEvent(event)
+  return event
 }
 
 beforeEach(() => {
@@ -143,18 +151,90 @@ describe('attachment composer front door', () => {
     )
   })
 
-  it('stages files dropped on the composer and images pasted into the textarea', async () => {
+  it('stages a file dropped on the transcript and prevents the webview default', async () => {
+    seed('codex')
+    render(ThreadView, { props: { sessionId: 's1' } })
+    const transcript = document.querySelector('.stream')!
+    const dropped = new File(['png'], 'transcript.png', { type: 'image/png' })
+
+    const event = dropFiles(transcript, [dropped])
+    await Promise.resolve()
+
+    expect(event.defaultPrevented).toBe(true)
+    expect(screen.getByText('transcript.png')).toBeTruthy()
+  })
+
+  it('shows pane-wide feedback while a file is dragged over the transcript', async () => {
+    seed('claude')
+    render(ThreadView, { props: { sessionId: 's1' } })
+    const transcript = document.querySelector('.stream')!
+
+    const event = dragFilesOver(transcript, [new File(['png'], 'hover.png', { type: 'image/png' })])
+    await Promise.resolve()
+
+    expect(event.defaultPrevented).toBe(true)
+    expect(screen.getByRole('status').textContent).toContain('Drop files to attach')
+    expect(document.querySelector('.chat-drop-target')?.classList.contains('dragging-files')).toBe(true)
+  })
+
+  it('stages a composer drop exactly once and still stages pasted images', async () => {
     seed('codex')
     render(ThreadView, { props: { sessionId: 's1' } })
     const composer = document.querySelector('.composer')!
     const textarea = document.querySelector('.composer textarea')!
 
-    dropFiles(composer, [new File(['pdf'], 'drop.pdf', { type: 'application/pdf' })])
+    const event = dropFiles(composer, [new File(['pdf'], 'drop.pdf', { type: 'application/pdf' })])
     clipboardPaste(textarea, [new File(['png'], 'paste.png', { type: 'image/png' })])
     await Promise.resolve()
 
-    expect(screen.getByText('drop.pdf')).toBeTruthy()
+    expect(event.defaultPrevented).toBe(true)
+    expect(screen.getAllByText('drop.pdf')).toHaveLength(1)
     expect(screen.getByText('paste.png')).toBeTruthy()
+  })
+
+  it('prevents an otherwise unhandled pane drop from navigating the webview', async () => {
+    seed('claude')
+    render(ThreadView, { props: { sessionId: 's1' } })
+    const header = document.querySelector('.head')!
+
+    const event = dropFiles(header, [], [])
+
+    expect(event.defaultPrevented).toBe(true)
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('stages multiple dropped files through the same single-error path as the picker', async () => {
+    seed('claude')
+    render(ThreadView, { props: { sessionId: 's1' } })
+    const transcript = document.querySelector('.stream')!
+
+    dropFiles(transcript, [
+      new File(['png'], 'one.png', { type: 'image/png' }),
+      new File(['binary'], 'unsupported.bin', { type: 'application/octet-stream' }),
+      new File(['pdf'], 'two.pdf', { type: 'application/pdf' }),
+    ])
+    await Promise.resolve()
+
+    expect(screen.getByText('one.png')).toBeTruthy()
+    expect(screen.getByText('unsupported.bin')).toBeTruthy()
+    expect(screen.getByText('two.pdf')).toBeTruthy()
+    expect(screen.getAllByText(/Unsupported file/)).toHaveLength(1)
+  })
+
+  it('delivers a dropped markdown file as visible staged text, not a vendor attachment', async () => {
+    seed('codex')
+    render(ThreadView, { props: { sessionId: 's1' } })
+    const transcript = document.querySelector('.stream')!
+    const markdown = new File(['# plan\nfull details'], 'plan.md', { type: 'text/markdown' })
+    Object.defineProperty(markdown, 'text', { value: async () => '# plan\nfull details' })
+
+    dropFiles(transcript, [markdown])
+    expect(await screen.findByText(/Pasted text/)).toBeTruthy()
+    await fireEvent.click(screen.getByTitle('send'))
+
+    expect(apiMock.uploadAttachment).not.toHaveBeenCalled()
+    expect(apiMock.send).toHaveBeenCalledTimes(1)
+    expect(apiMock.send.mock.calls[0][1]).toContain('# plan\nfull details')
   })
 
   it('surfaces a resolved upload error at the composer and keeps the message and file staged', async () => {
