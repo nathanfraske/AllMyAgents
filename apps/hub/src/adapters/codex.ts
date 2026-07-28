@@ -592,7 +592,10 @@ export class CodexClient {
     // that sweep — the leak on quit is far worse than the one on session close.
     if (process.platform === 'win32' && child.pid !== undefined) {
       try {
-        spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'])
+        spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
+          windowsHide: true,
+          stdio: 'ignore',
+        })
       } catch {
         child.kill()
       }
