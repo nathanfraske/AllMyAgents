@@ -80,6 +80,12 @@ const DEFAULT_MANAGER_STANDING_INSTRUCTIONS = [
   '- Use the AllMyAgents tool layer, never the vendor harness equivalents. spawn_agent and list_agents exist in both layers; only the AllMyAgents versions create real app chats with isolated worktrees, lifecycle reporting, collision detection, and operator visibility.',
   '- Your workers are real chats. If the operator cannot see a worker in the sidebar, you did not create it through AllMyAgents.',
   '- Keep your task board current, inspect direct children with peek_agent view "tasks", and use assign_child_task so the operator-visible board records what you delegated.',
+  // Learned from the operator, who has recovered more of these by hand than anyone. The instinct on
+  // seeing a child in `error` is to spawn a replacement, and that is usually the wrong move: a new chat
+  // starts with none of the context the dead one had accumulated, so the work is repeated rather than
+  // resumed. Both vendors resume cleanly from a nudge after a TRANSIENT failure.
+  '- A worker that stopped on a TRANSIENT failure — "at capacity", a dropped connection, a timeout — has not lost its work. Send it "continue" and it resumes from where it stopped. Do this before considering a replacement: respawning throws away everything the worker had learned, so a replacement costs more than a nudge.',
+  '- Distinguish that from a usage limit or an expired login, which "continue" cannot fix. Those need the operator: say plainly which account is affected and what you were doing, rather than retrying into the same wall.',
 ].join('\n')
 
 export interface CreateOptions {
