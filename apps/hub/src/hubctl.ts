@@ -339,7 +339,10 @@ function killTree(child: ChildProcess): void {
     // app-server grandchildren, in-flight node). `taskkill /T /F` terminates the whole PID tree — the
     // same approach as the codex adapter (`sessions.ts`/`adapters/codex.ts`) and the desktop shell.
     try {
-      spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'])
+      spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], {
+        windowsHide: true,
+        stdio: 'ignore',
+      })
     } catch {
       try {
         child.kill()
