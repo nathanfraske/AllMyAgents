@@ -255,23 +255,36 @@ async function app() {
   }
   const webPort = Number(process.env.SANDBOX_WEB_PORT ?? 5274) // 5273 is the normal dev server
   console.log(`sandbox app  http://127.0.0.1:${webPort}  →  hub 127.0.0.1:${PORT}`)
-  // `shell: true` is REQUIRED on Windows, not cosmetic. Node 20+ refuses to spawn a .cmd/.bat directly
-  // (CVE-2024-27980 hardening) and throws EINVAL before the app ever opens. Three auditors hit exactly
-  // that here and had to launch the frontend by hand — which is worse than a broken script, because it
-  // quietly turns "test it in the real app" into "test it however you can".
-  // Every argument below is a fixed literal or a number, so there is nothing for the shell to re-split.
+  // NO SHELL. This used to run pnpm through cmd.exe because Node 20+ refuses to spawn a .cmd directly
+  // (CVE-2024-27980), and that shell is what put a black console window on the operator's desktop — one
+  // per sandbox app, from their own runs and from every agent that started one, indistinguishable at a
+  // glance from something malicious. `windowsHide` suppresses the window but still routes through cmd,
+  // and a stale copy of this file in any of seventeen agent worktrees brought the windows straight back.
+  //
+  // So do not hide the console: do not create one. pnpm ships a plain JS entry point, and running it with
+  // the Node we are already inside needs no shell on any platform, which removes both the EINVAL that
+  // forced the shell originally and the window it dragged in. Fall back to the shim only if that entry
+  // cannot be found, so a partial install degrades to the old behaviour rather than to nothing.
+  const pnpmJs = (() => {
+    for (const candidate of [
+      process.env.PNPM_JS,
+      path.join(REPO, 'node_modules', 'pnpm', 'bin', 'pnpm.cjs'),
+      process.env.APPDATA && path.join(process.env.APPDATA, 'npm', 'node_modules', 'pnpm', 'bin', 'pnpm.cjs'),
+    ].filter(Boolean)) {
+      if (fs.existsSync(candidate)) return candidate
+    }
+    return null
+  })()
+  const program = pnpmJs ? process.execPath : process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm'
+  const leading = pnpmJs ? [pnpmJs] : []
   const child = spawn(
-    process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm',
-    ['--filter', 'web', 'dev', '--port', String(webPort), '--strictPort'],
+    program,
+    [...leading, '--filter', 'web', 'dev', '--port', String(webPort), '--strictPort'],
     {
       cwd: REPO,
       stdio: 'inherit',
-      shell: process.platform === 'win32',
-      // `shell: true` on Windows runs the command through cmd.exe, and cmd.exe brings a CONSOLE WINDOW
-      // with it unless told otherwise. The operator watched black windows appear at random for hours —
-      // one per sandbox app, from their own runs and from every agent that started one — with no way to
-      // tell them apart from something malicious. That is a poor thing to inflict on someone's desktop.
-      // Output still reaches this process through stdio: 'inherit'; only the stray window goes away.
+      // Only needed on the fallback path; harmless otherwise.
+      shell: !pnpmJs && process.platform === 'win32',
       windowsHide: true,
       env: {
         ...process.env,
