@@ -14,7 +14,7 @@ import {
   type JournalCondenseResult,
 } from './journal.js'
 import { ProjectStore } from './projects.js'
-import { scanProfiles, setClaudeConnectorPolicy } from './profiles.js'
+import { profileAuthEvidence, scanProfiles, setClaudeConnectorPolicy } from './profiles.js'
 import { ProfileOwnership } from './profileOwnership.js'
 import { SessionManager } from './sessions.js'
 import { SessionStore } from './store.js'
@@ -153,7 +153,7 @@ const profileOwnership = new ProfileOwnership({
 })
 for (const profile of profiles) {
   const claim = profileOwnership.claim(profile.id, profile.dir)
-  profile.authStatus = 'signed_in'
+  refreshProfileAuth(profile)
   if (!claim.owned) {
     profile.available = false
     profile.ownerPort = claim.owner.port
@@ -423,21 +423,30 @@ restartState.booted = true
 
 function rescanProfiles(): typeof profiles {
   for (const p of scanProfiles(profilesDir)) {
-    if (!profileMap.has(p.id)) {
-      const claim = profileOwnership.claim(p.id, p.dir)
-      p.available = claim.owned
-      p.authStatus = 'signed_in'
-      if (!claim.owned) {
-        p.ownerPort = claim.owner.port
-        p.unavailableReason = `Another AllMyAgents hub (port ${claim.owner.port}) is using ${p.id}. This hub will not refresh its credentials.`
-        console.error(`[profiles] ${p.unavailableReason}`)
-      }
-      profileMap.set(p.id, p)
-      usage.addProfile(p) // pushes into the shared `profiles` array (same reference)
-      journal.append(null, 'profiles/added', { id: p.id, provider: p.provider })
+    const existing = profileMap.get(p.id)
+    if (existing) {
+      refreshProfileAuth(existing)
+      continue
     }
+    const claim = profileOwnership.claim(p.id, p.dir)
+    p.available = claim.owned
+    refreshProfileAuth(p)
+    if (!claim.owned) {
+      p.ownerPort = claim.owner.port
+      p.unavailableReason = `Another AllMyAgents hub (port ${claim.owner.port}) is using ${p.id}. This hub will not refresh its credentials.`
+      console.error(`[profiles] ${p.unavailableReason}`)
+    }
+    profileMap.set(p.id, p)
+    usage.addProfile(p) // pushes into the shared `profiles` array (same reference)
+    journal.append(null, 'profiles/added', { id: p.id, provider: p.provider })
   }
   return profiles
+}
+
+function refreshProfileAuth(profile: (typeof profiles)[number]): void {
+  const evidence = profileAuthEvidence(profile)
+  profile.authStatus = evidence.authStatus
+  profile.authError = evidence.authError
 }
 
 // Device token — proof of an authorized device. Generated + persisted under `dataDir` alongside the

@@ -8,6 +8,7 @@ import {
   pickableProfiles,
   CLAUDE_DEFAULT_ID,
   CODEX_DEFAULT_ID,
+  profileAuthEvidence,
 } from './profiles.js'
 import type { Profile } from './types.js'
 
@@ -41,6 +42,41 @@ describe('pickableProfiles', () => {
     ]
 
     expect(pickableProfiles(freshProfiles)).toEqual([])
+  })
+})
+
+describe('profileAuthEvidence', () => {
+  const jwt = (expiresAtSeconds: number): string => {
+    const encoded = Buffer.from(JSON.stringify({ exp: expiresAtSeconds })).toString('base64url')
+    return `header.${encoded}.signature`
+  }
+
+  it.each([
+    {
+      provider: 'claude' as const,
+      file: '.credentials.json',
+      valid: { claudeAiOauth: { accessToken: 'valid', expiresAt: 2_000_000 } },
+      expired: { claudeAiOauth: { accessToken: 'expired', expiresAt: 999_000 } },
+    },
+    {
+      provider: 'codex' as const,
+      file: 'auth.json',
+      valid: { tokens: { access_token: jwt(2_000) } },
+      expired: { tokens: { access_token: jwt(999) } },
+    },
+  ])('distinguishes a valid $provider credential from an expired one', ({ provider, file, valid, expired }) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), `ama-auth-${provider}-`))
+    fs.writeFileSync(path.join(dir, file), JSON.stringify(valid))
+    expect(profileAuthEvidence({ id: `${provider}-a`, provider, dir }, 1_000_000)).toMatchObject({
+      authStatus: 'signed_in',
+    })
+
+    fs.writeFileSync(path.join(dir, file), JSON.stringify(expired))
+    expect(profileAuthEvidence({ id: `${provider}-a`, provider, dir }, 1_000_000)).toMatchObject({
+      authStatus: 'signed_out',
+      authError: expect.stringMatching(/expired/i),
+    })
+    fs.rmSync(dir, { recursive: true, force: true })
   })
 })
 
