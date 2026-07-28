@@ -430,12 +430,19 @@
             <span class="aprov dim">{p.provider}</span>
             {#if p.authStatus === 'signed_out'}
               <span class="status error" title={p.authError}>Signed out</span>
-              <button class="btn btn-primary" onclick={() => reauthenticate(p)}>Sign in again</button>
-            {:else if p.available === false}
+            {/if}
+            {#if p.available === false}
               <span class="status error" title={p.unavailableReason}>
                 In use by another hub{p.ownerPort ? ` (port ${p.ownerPort})` : ''}
               </span>
             {/if}
+            <button
+              class="btn"
+              class:btn-primary={p.authStatus === 'signed_out'}
+              aria-label={p.authStatus === 'signed_out' ? 'Sign in again' : `Re-authenticate ${p.id}`}
+              onclick={() => reauthenticate(p)}
+              disabled={loginState === 'waiting'}
+            >{p.authStatus === 'signed_out' ? 'Sign in again' : 'Re-authenticate'}</button>
           </div>
         {/each}
       </div>

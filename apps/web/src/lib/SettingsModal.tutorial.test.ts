@@ -1,6 +1,9 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/svelte'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import SettingsModal from './SettingsModal.svelte'
+import { store } from './store.svelte'
+
+const login = vi.hoisted(() => vi.fn(() => new Promise(() => {})))
 
 vi.mock('./externalUrl', () => ({
   prepareExternalTarget: () => null,
@@ -15,7 +18,7 @@ vi.mock('./api', async (original) => {
     ...actual,
     api: new Proxy({} as typeof actual.api, {
       get: (_target, property) => {
-        if (property === 'login') return () => new Promise(() => {})
+        if (property === 'login') return login
         if (property === 'cancelLogin') return () => Promise.resolve({ ok: true })
         if (property === 'mesh') {
           return () => Promise.resolve({
@@ -42,9 +45,33 @@ vi.mock('./api', async (original) => {
   }
 })
 
-afterEach(() => cleanup())
+afterEach(() => {
+  cleanup()
+  store.profiles = []
+  login.mockClear()
+})
 
 describe('tutorial account waiting integration', () => {
+  it('offers a clickable re-authentication action before failure for every account', async () => {
+    store.profiles = [
+      { id: 'claude-signed-out', provider: 'claude', available: true, authStatus: 'signed_out' },
+      { id: 'codex-healthy', provider: 'codex', available: true, authStatus: 'signed_in' },
+    ]
+    render(SettingsModal, {
+      props: {
+        onclose: () => {},
+        initialTab: 'accounts',
+      },
+    })
+
+    const signedOut = screen.getByRole('button', { name: 'Sign in again' })
+    expect(signedOut).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Re-authenticate codex-healthy' })).toBeTruthy()
+
+    await fireEvent.click(signedOut)
+    expect(login).toHaveBeenCalledWith('claude', 'claude-signed-out', true)
+  })
+
   it('offers Cancel before the hub has returned a browser URL', async () => {
     render(SettingsModal, {
       props: {

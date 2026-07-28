@@ -3,6 +3,93 @@ import os from 'node:os'
 import path from 'node:path'
 import type { Profile } from './types.js'
 
+export interface ProfileAuthEvidence {
+  authStatus?: 'signed_in' | 'signed_out'
+  authError?: string
+}
+
+/**
+ * Infer only what the credential on disk can honestly prove at boot. A recognized token with a
+ * future expiry (or a non-expiring API key) is locally signed in; a missing, malformed, or expired
+ * credential is signed out. Tokens without an inspectable expiry remain unknown until a real login
+ * or vendor request succeeds. File presence alone must never be reported as a healthy account.
+ */
+export function profileAuthEvidence(
+  profile: Pick<Profile, 'id' | 'provider' | 'dir'>,
+  nowMs = Date.now(),
+): ProfileAuthEvidence {
+  const file = path.join(profile.dir, profile.provider === 'claude' ? '.credentials.json' : 'auth.json')
+  let credential: Record<string, unknown>
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return signedOut('Credential file is malformed. Sign in again.')
+    }
+    credential = parsed as Record<string, unknown>
+  } catch {
+    return signedOut('Credential is missing or unreadable. Sign in again.')
+  }
+
+  if (profile.provider === 'claude') {
+    const oauth = asRecord(credential.claudeAiOauth)
+    const token = stringValue(oauth?.accessToken) ?? stringValue(oauth?.access_token)
+    if (!token) return signedOut('Claude credential has no access token. Sign in again.')
+
+    const expiry = claudeExpiryMs(oauth?.expiresAt ?? oauth?.expires_at)
+    if (expiry === undefined) return {}
+    if (expiry <= nowMs) return signedOut('Claude credential has expired. Sign in again.')
+    return { authStatus: 'signed_in' }
+  }
+
+  if (stringValue(credential.OPENAI_API_KEY)) return { authStatus: 'signed_in' }
+  const tokens = asRecord(credential.tokens)
+  const token = stringValue(tokens?.access_token) ?? stringValue(tokens?.accessToken)
+  if (!token) return signedOut('Codex credential has no access token. Sign in again.')
+
+  const expiry = jwtExpiryMs(token)
+  if (expiry === undefined) return {}
+  if (expiry <= nowMs) return signedOut('Codex credential has expired. Sign in again.')
+  return { authStatus: 'signed_in' }
+}
+
+function signedOut(authError: string): ProfileAuthEvidence {
+  return { authStatus: 'signed_out', authError }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined
+}
+
+function claudeExpiryMs(value: unknown): number | undefined {
+  if (typeof value === 'string' && value.trim()) {
+    const numeric = Number(value)
+    if (Number.isFinite(numeric)) return numeric
+    const parsed = Date.parse(value)
+    return Number.isFinite(parsed) ? parsed : undefined
+  }
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined
+  return value
+}
+
+function jwtExpiryMs(token: string): number | undefined {
+  const payload = token.split('.')[1]
+  if (!payload) return undefined
+  try {
+    const decoded = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as unknown
+    const exp = asRecord(decoded)?.exp
+    const seconds = typeof exp === 'string' ? Number(exp) : exp
+    return typeof seconds === 'number' && Number.isFinite(seconds) ? seconds * 1000 : undefined
+  } catch {
+    return undefined
+  }
+}
+
 export function scanProfiles(profilesDir: string): Profile[] {
   if (!fs.existsSync(profilesDir)) return []
   const out: Profile[] = []

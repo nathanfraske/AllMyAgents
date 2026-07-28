@@ -1944,8 +1944,24 @@ export class SessionManager {
   }
 
   /** All profiles the manager can bind to — managed profiles/* PLUS registered default homes. */
-  listProfiles(): { id: string; provider: Provider }[] {
-    return [...this.profiles.values()].map((p) => ({ id: p.id, provider: p.provider }))
+  listProfiles(): Array<{
+    id: string
+    provider: Provider
+    available: boolean
+    unavailableReason?: string
+    ownerPort?: number
+    authStatus: 'signed_in' | 'signed_out' | 'unknown'
+    authError?: string
+  }> {
+    return [...this.profiles.values()].map((p) => ({
+      id: p.id,
+      provider: p.provider,
+      available: p.available !== false,
+      ...(p.unavailableReason ? { unavailableReason: p.unavailableReason } : {}),
+      ...(p.ownerPort !== undefined ? { ownerPort: p.ownerPort } : {}),
+      authStatus: p.authStatus ?? 'unknown',
+      ...(p.authError ? { authError: p.authError } : {}),
+    }))
   }
 
   /**
