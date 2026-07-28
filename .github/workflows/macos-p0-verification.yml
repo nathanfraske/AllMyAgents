@@ -106,7 +106,16 @@ jobs:
           ROOT="$RUNNER_TEMP/uninstall-prompt"
           mkdir -p "$ROOT/home/Library/Application Support/direct.cec.allmyagents" "$ROOT/apps"
           touch "$ROOT/home/Library/Application Support/direct.cec.allmyagents/probe"
-          printf 'y\n' | script -q /dev/null /bin/bash -c "HOME='$ROOT/home' AMA_DEST='$ROOT/apps' cat '$GITHUB_WORKSPACE/scripts/install-macos.sh' | HOME='$ROOT/home' AMA_DEST='$ROOT/apps' /bin/bash -s -- --uninstall"
+          export ROOT GITHUB_WORKSPACE
+          /usr/bin/expect <<'EXPECT'
+          set timeout 15
+          spawn env HOME=$env(ROOT)/home AMA_DEST=$env(ROOT)/apps /bin/bash -c "cat \"$env(GITHUB_WORKSPACE)/scripts/install-macos.sh\" | /bin/bash -s -- --uninstall"
+          expect "Continue? \[y/N\]"
+          send "y\r"
+          expect eof
+          catch wait result
+          exit [lindex $result 3]
+          EXPECT
           test ! -e "$ROOT/home/Library/Application Support/direct.cec.allmyagents"
 
           ROOT="$RUNNER_TEMP/uninstall-yes"
