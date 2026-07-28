@@ -1288,6 +1288,17 @@ export function startServer(opts: ServerOptions): http.Server {
           json(res, { error: 'canApproveChildren must be boolean' }, 400)
           return
         }
+        const managerPermissionMode =
+          body.permissionMode === undefined ? undefined : str(body.permissionMode)
+        if (
+          managerPermissionMode !== undefined &&
+          managerPermissionMode !== 'safe' &&
+          managerPermissionMode !== 'edits' &&
+          managerPermissionMode !== 'full'
+        ) {
+          json(res, { error: 'permissionMode must be safe, edits, or full' }, 400)
+          return
+        }
         const maxChildPermissionMode =
           body.maxChildPermissionMode === undefined ? undefined : str(body.maxChildPermissionMode)
         if (
@@ -1324,6 +1335,7 @@ export function startServer(opts: ServerOptions): http.Server {
             operatorTask: body.operatorTask as string | undefined,
             standingInstructions: body.standingInstructions as string | undefined,
             canApproveChildren: body.canApproveChildren as boolean | undefined,
+            permissionMode: managerPermissionMode,
             maxChildPermissionMode,
           },
           'operator'

@@ -418,8 +418,6 @@
         if (renamed.error) throw new Error(renamed.error)
       }
 
-      const modeResult = await api.setMode(record.id, config.permissionMode)
-      if (modeResult && 'error' in modeResult) throw new Error(modeResult.error)
       const settingsResult = await api.setSettings(record.id, {
         model: config.managerModel,
         effort: config.managerEffort,
@@ -438,6 +436,7 @@
         operatorTask: config.operatorTask,
         standingInstructions: config.standingInstructions,
         canApproveChildren: config.canApproveChildren,
+        permissionMode: config.permissionMode,
         maxChildPermissionMode: config.maxChildPermissionMode,
       })
       if ('error' in configured) throw new Error(configured.error)
