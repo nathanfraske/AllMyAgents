@@ -260,11 +260,22 @@ export interface ImportableChat {
 }
 
 export interface ProjectConfig {
-  mcpServers: { name: string; transport: 'stdio' | 'http' | 'sse'; hasSecrets: boolean }[]
+  mcpServers: { name: string; transport: 'stdio' | 'http' | 'sse'; hasSecrets: boolean; command?: string }[]
   hooks: string[]
+  hookCommands: {
+    event: string
+    command: string
+    args?: string[]
+    shell?: 'bash' | 'powershell'
+    condition?: string
+    timeout?: number
+    background?: boolean
+  }[]
   hasPermissions: boolean
   memoryFiles: { name: string; bytes: number }[]
   sources: string[]
+  unmodeled: string[]
+  fingerprint: string | null
 }
 
 export interface ScanResult {
