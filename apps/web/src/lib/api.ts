@@ -26,6 +26,11 @@ export interface ProjectInfo {
   name: string
   path: string
   createdAt: string
+  location?: {
+    kind: 'wsl'
+    distro: string
+    linuxPath: string
+  }
   // Fleet origin (CLIENT-INJECTED by the store's fleet merge — the hub never sends these). Set only
   // for a project pulled from a REMOTE fleet site; its `id` is namespaced `${siteId}:${realId}`.
   // Absent → this hub's own (local) project, shown unbadged exactly as before.
@@ -39,6 +44,24 @@ export interface ProjectDraftValidation {
   valid: true
   name: string
   path: string
+  location?: ProjectInfo['location']
+}
+
+export interface WslDistroInfo {
+  name: string
+  version: 1 | 2
+  state: 'running' | 'stopped'
+  isDefault: boolean
+}
+
+export interface WslCapability {
+  supported: boolean
+  reason?: string
+  distros: WslDistroInfo[]
+  docker: {
+    available: boolean
+    reason?: string
+  }
 }
 
 export interface ProjectDeletionInspection {
@@ -663,6 +686,7 @@ export const api = {
   loginStatus: (id: string) => jget<LoginResult>(`/api/accounts/login/${encodeURIComponent(id)}`),
   cancelLogin: (id: string) => jdelete<LoginResult>(`/api/accounts/login/${encodeURIComponent(id)}`),
   pickFolder: () => jpost<{ path: string }>('/api/pick-folder'),
+  wslCapability: () => jget<WslCapability>('/api/wsl/capability'),
   projects: () => jget<ProjectInfo[]>('/api/projects'),
   projectActivity: (projectId: string) =>
     jget<WorktreeProjectActivity>(`/api/projects/${encodeURIComponent(projectId)}/activity`),
@@ -672,10 +696,18 @@ export const api = {
     jdelete<ProjectDeletionResult>(
       `/api/projects/${encodeURIComponent(projectId)}${deleteFiles ? '?deleteFiles=true' : ''}`,
     ),
-  validateProject: (name: string, path: string) =>
-    jpost<ProjectDraftValidation | { error: string }>('/api/projects/validate', { name, path }),
-  createProject: (name: string, path: string) =>
-    jpost<ProjectInfo | { error: string }>('/api/projects', { name, path }),
+  validateProject: (name: string, path: string, distro?: string) =>
+    jpost<ProjectDraftValidation | { error: string }>('/api/projects/validate', {
+      name,
+      path,
+      ...(distro ? { distro } : {}),
+    }),
+  createProject: (name: string, path: string, distro?: string) =>
+    jpost<ProjectInfo | { error: string }>('/api/projects', {
+      name,
+      path,
+      ...(distro ? { distro } : {}),
+    }),
   createManagedProject: (name: string) =>
     jpost<ProjectInfo | { error: string }>('/api/projects/managed', { name }),
   githubCapability: () => jget<GitHubCapability>('/api/github/capability'),

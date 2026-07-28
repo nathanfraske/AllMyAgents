@@ -582,8 +582,9 @@ export class SessionManager {
       provider: record.provider,
       profileId: record.profileId,
       profileDir: profile.dir,
-      cwd: record.cwd,
-      worktree: record.worktree,
+      cwd: record.executionCwd ?? record.cwd,
+      worktree: record.executionCwd && record.worktree ? record.executionCwd : record.worktree,
+      ...(record.wslDistro ? { wsl: { distro: record.wslDistro } } : {}),
       projectId: record.projectId,
       label: identityOf(record).label,
       model: record.model,
@@ -648,13 +649,18 @@ export class SessionManager {
    * (a tool call happens mid-turn), else refuse.
    */
   private resolveCodexIdentity(profileId: string, cwd: string): SessionIdentity | undefined {
-    const target = path.resolve(cwd).toLowerCase()
+    const localKey = (value: string): string => {
+      const resolved = path.resolve(value)
+      return process.platform === 'win32' ? resolved.toLowerCase() : resolved
+    }
     const matches = [...this.sessions.values()].filter(
       (r) =>
         r.provider === 'codex' &&
         r.profileId === profileId &&
         r.status !== 'stopped' &&
-        path.resolve(r.cwd).toLowerCase() === target
+        (r.executionCwd
+          ? path.posix.normalize(r.executionCwd) === path.posix.normalize(cwd)
+          : localKey(r.cwd) === localKey(cwd))
     )
     if (matches.length === 1) return identityOf(matches[0])
     if (matches.length === 0) return undefined
@@ -2299,6 +2305,10 @@ export class SessionManager {
     const isUnfiled = opts.cwd === undefined && opts.projectId === undefined && opts.repo === undefined
     let cwd = isUnfiled ? this.workspace.createScratch(id) : (opts.cwd ?? this.defaultCwd)
     let repo = opts.repo
+    let wslDistro: string | undefined
+    let executionCwd: string | undefined
+    let executionRepo: string | undefined
+    let projectLocation: NonNullable<ReturnType<ProjectStore['get']>>['location']
     // Intent and outcome are separate facts. In particular, an explicit cwd can override a caller that
     // explicitly requested isolation, and a non-Git project cannot produce a Git worktree. Persist both
     // so clients never infer "Project was chosen" merely from a missing `worktree`.
@@ -2310,9 +2320,17 @@ export class SessionManager {
       const project = this.projects.get(opts.projectId)
       if (!project) throw new Error(`unknown project: ${opts.projectId}`)
       cwd = project.path
+      projectLocation = project.location
+      if (project.location) {
+        wslDistro = project.location.distro
+        executionCwd = project.location.linuxPath
+      }
       // Worktree by default when the project is a git repo; `useWorktree: false` works directly
       // in the project directory (no isolation).
-      if (this.workspace.isRepo(project.path) && worktreeRequested) repo = project.path
+      if (this.workspace.isRepo(project.path, project.location) && worktreeRequested) {
+        repo = project.path
+        executionRepo = project.location?.linuxPath
+      }
       else if (worktreeRequested) {
         worktreeFallbackReason =
           `The project folder (${project.path}) is not a Git repository, so no isolated worktree could be created.`
@@ -2326,12 +2344,17 @@ export class SessionManager {
     let baseCommit: string | undefined
     let baseRef: string | undefined
     if (repo) {
-      const wt = this.workspace.create(repo, id)
+      const wt = this.workspace.create(repo, id, projectLocation)
       worktree = wt.worktree
       branch = wt.branch
       baseCommit = wt.baseCommit
       baseRef = wt.baseRef
       cwd = worktree
+      if (wt.executionPath) {
+        wslDistro = wt.distro
+        executionCwd = wt.executionPath
+        executionRepo = projectLocation?.linuxPath
+      }
       this.journal.append(id, 'session/worktree-created', {
         repo,
         worktree,
@@ -2348,6 +2371,9 @@ export class SessionManager {
       cwd,
       repo,
       worktree,
+      wslDistro,
+      executionCwd,
+      executionRepo,
       branch,
       worktreeRequested,
       worktreeFallbackReason,
@@ -3665,7 +3691,17 @@ export class SessionManager {
     if (!record) return { ok: false, error: `unknown session: ${sessionId}` }
     if (record.status === 'stopped' || record.status === 'error') {
       if (record.repo && record.worktree) {
-        const state = this.workspace.inspect(record.repo, record.worktree)
+        const state = this.workspace.inspect(
+          record.repo,
+          record.worktree,
+          record.wslDistro && record.executionRepo && record.executionCwd
+            ? {
+                distro: record.wslDistro,
+                repoPath: record.executionRepo,
+                worktreePath: record.executionCwd,
+              }
+            : undefined,
+        )
         if (!state.ok) {
           const branch = record.branch ? ` The last recorded branch is ${record.branch}.` : ''
           return {
@@ -3757,7 +3793,17 @@ export class SessionManager {
       }
     }
     if (record.repo && record.worktree) {
-      const removed = this.workspace.remove(record.repo, record.worktree)
+      const removed = this.workspace.remove(
+        record.repo,
+        record.worktree,
+        record.wslDistro && record.executionRepo && record.executionCwd
+          ? {
+              distro: record.wslDistro,
+              repoPath: record.executionRepo,
+              worktreePath: record.executionCwd,
+            }
+          : undefined,
+      )
       if (!removed.ok) return removed
       this.journal.append(sessionId, 'session/worktree-removed', { worktree: record.worktree })
     } else if (scratch) {

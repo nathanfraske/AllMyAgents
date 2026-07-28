@@ -22,6 +22,7 @@
     type GitHubCloneJob,
     type GitHubRepository,
     type SessionRecord,
+    type WslCapability,
   } from './api'
   import { defaultModelFor, findModel, modelsFor } from './catalog'
   import { settings } from './settings.svelte'
@@ -40,7 +41,7 @@
   type Step = 1 | 2 | 3
   type AgentStatus = 'ready' | 'launching' | 'started' | 'failed'
   type ProjectSource =
-    | { kind: 'local'; name: string; path: string }
+    | { kind: 'local'; name: string; path: string; location?: ProjectInfo['location'] }
     | { kind: 'github'; name: string; repository: GitHubRepository }
     | { kind: 'managed'; name: string }
 
@@ -64,6 +65,9 @@
   let projectDraft = $state<ProjectSource | null>(null)
   let projectName = $state('')
   let projectPath = $state('')
+  let projectDistro = $state('')
+  let wslCapability = $state<WslCapability | null>(null)
+  let wslLoading = $state(false)
   let githubRepository = $state<GitHubRepository | null>(null)
   let projectStatus = $state('')
   let gitGuidance = $state('')
@@ -121,6 +125,7 @@
     projectDraft = null
     projectName = ''
     projectPath = ''
+    projectDistro = ''
     githubRepository = null
     projectStatus = ''
     gitGuidance = ''
@@ -284,6 +289,23 @@
     }
   }
 
+  async function loadWslCapability(): Promise<void> {
+    if (wslCapability || wslLoading) return
+    wslLoading = true
+    try {
+      wslCapability = await api.wslCapability()
+    } catch (cause) {
+      wslCapability = {
+        supported: false,
+        reason: cause instanceof Error ? cause.message : 'WSL could not be detected.',
+        distros: [],
+        docker: { available: false, reason: 'Docker/WSL capability is unknown.' },
+      }
+    } finally {
+      wslLoading = false
+    }
+  }
+
   async function reveal(target: 'project' | 'team' | 'finalize'): Promise<void> {
     await tick()
     const section =
@@ -305,14 +327,22 @@
     }
     creating = true
     try {
-      const validation = await api.validateProject(name, path)
+      const validation = projectDistro
+        ? await api.validateProject(name, path, projectDistro)
+        : await api.validateProject(name, path)
       if (!validation || 'error' in validation) {
         createError = (validation as { error?: string } | null)?.error ?? 'Could not validate this directory.'
         return
       }
-      projectDraft = { kind: 'local', name: validation.name, path: validation.path }
+      projectDraft = {
+        kind: 'local',
+        name: validation.name,
+        path: validation.path,
+        location: validation.location,
+      }
       projectName = validation.name
       projectPath = validation.path
+      projectDistro = validation.location?.distro ?? ''
       githubRepository = null
       projectSource = 'local'
       editingProjectSource = false
@@ -378,6 +408,8 @@
       projectSource = projectDraft.kind
       projectName = projectDraft.name
       projectPath = projectDraft.kind === 'local' ? projectDraft.path : ''
+      projectDistro =
+        projectDraft.kind === 'local' ? (projectDraft.location?.distro ?? '') : projectDistro
       githubRepository = projectDraft.kind === 'github' ? projectDraft.repository : null
     }
     editingProjectSource = true
@@ -474,7 +506,13 @@
     if (!projectDraft) throw new Error('Finish the project step before launching.')
     if (projectDraft.kind === 'local') {
       projectStatus = 'Creating the project…'
-      const created = await api.createProject(projectDraft.name, projectDraft.path)
+      const created = projectDraft.location?.distro
+        ? await api.createProject(
+            projectDraft.name,
+            projectDraft.location.linuxPath,
+            projectDraft.location.distro,
+          )
+        : await api.createProject(projectDraft.name, projectDraft.path)
       if (!created || 'error' in created) {
         throw new Error((created as { error?: string } | null)?.error ?? 'The project could not be created.')
       }
@@ -780,7 +818,7 @@
             <b>{projectDraft.name}</b>
             <span>
               {projectDraft.kind === 'local'
-                ? projectDraft.path
+                ? `${projectDraft.location ? `${projectDraft.location.distro} · ` : ''}${projectDraft.path}`
                 : projectDraft.kind === 'github'
                   ? `Clone ${projectDraft.repository.nameWithOwner} at launch`
                   : 'App-managed Git repository created at launch'}
@@ -831,13 +869,53 @@
         {:else if projectSource === 'local'}
           <div class="fields two">
             <label>
+              <span>Filesystem</span>
+              <select
+                aria-label="Project filesystem"
+                bind:value={projectDistro}
+                onfocus={loadWslCapability}
+                onclick={loadWslCapability}
+              >
+                <option value="">This machine (Windows)</option>
+                {#each wslCapability?.distros ?? [] as distro (distro.name)}
+                  <option
+                    value={distro.name}
+                    disabled={distro.version !== 2}
+                  >
+                    WSL · {distro.name}{distro.isDefault ? ' (default)' : ''}{distro.version !== 2
+                      ? ' — WSL 1 unsupported'
+                      : distro.state !== 'running'
+                        ? ' — starts when used'
+                        : ''}
+                  </option>
+                {/each}
+              </select>
+              <small>
+                {#if wslLoading}
+                  Detecting installed distros…
+                {:else if wslCapability && !wslCapability.supported}
+                  {wslCapability.reason}
+                {:else if wslCapability?.supported && !wslCapability.distros.length}
+                  No user WSL distros are installed.
+                {:else}
+                  WSL projects run Git and agents inside the selected distro.
+                {/if}
+              </small>
+            </label>
+          </div>
+          <div class="fields two">
+            <label>
               <span>Project name</span>
               <input aria-label="Project name" bind:value={projectName} placeholder="Control room" />
             </label>
             <label>
               <span>Working directory</span>
               <div class="path-input">
-                <input aria-label="Working directory" bind:value={projectPath} placeholder="C:\work\control-room" />
+                <input
+                  aria-label="Working directory"
+                  bind:value={projectPath}
+                  placeholder={projectDistro ? '/home/me/control-room' : 'C:\\work\\control-room'}
+                />
                 <button class="browse" onclick={browse}>Browse</button>
               </div>
             </label>

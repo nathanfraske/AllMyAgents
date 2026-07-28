@@ -17,6 +17,15 @@ export interface Project {
   id: string
   name: string
   path: string
+  /**
+   * Absent means the hub's own OS filesystem (legacy rows stay byte-for-byte compatible).
+   * WSL rows persist the concrete distro name and distro-native path; "default distro" is never stored.
+   */
+  location?: {
+    kind: 'wsl'
+    distro: string
+    linuxPath: string
+  }
   createdAt: string
 }
 
@@ -43,6 +52,10 @@ export interface SessionRecord {
   cwd: string
   repo?: string
   worktree?: string
+  /** Concrete WSL filesystem plus distro-native paths. Host-facing fields above remain UNC projections. */
+  wslDistro?: string
+  executionCwd?: string
+  executionRepo?: string
   branch?: string
   /** What the caller asked for when creating a project chat. Kept separately from `worktree`, which is
    * the outcome, so the UI can report an override/fallback instead of pretending Project was chosen. */

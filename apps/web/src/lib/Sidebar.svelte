@@ -246,6 +246,8 @@
     // False when that machine did not answer the last roster probe: the rows are the last known state,
     // shown dimmed rather than deleted, so "the box is off" never looks like "my work disappeared".
     siteOnline?: boolean
+    /** Concrete WSL filesystem identity. Unlike a remote-site badge this stays visible on one machine. */
+    wslDistro?: string
   }
 
   // Node badges only matter once the fleet has more than one machine; on a single-machine install they
@@ -284,7 +286,15 @@
     const out: Group[] = []
     for (const p of store.orderedProjects) {
       const ss = byProject.get(p.id) ?? []
-      if (ss.length || !filter) out.push(build(p.id, p.name, store.orderedChats(p.id, ss), { siteLabel: p.siteLabel, siteOnline: p.siteOnline }))
+      if (ss.length || !filter) {
+        out.push(
+          build(p.id, p.name, store.orderedChats(p.id, ss), {
+            siteLabel: p.siteLabel,
+            siteOnline: p.siteOnline,
+            wslDistro: p.location?.distro,
+          }),
+        )
+      }
     }
     const none = byProject.get('__none__')
     if (none?.length) out.push(build('__none__', 'Unfiled', store.orderedChats('__none__', none)))
@@ -664,6 +674,13 @@
           {/if}
           <button class="folder" title={isCollapsed ? 'expand' : 'collapse'} onclick={() => toggleCollapse(g.id)}><Icon name={isCollapsed ? 'chevron-right' : 'chevron-down'} size={12} /></button>
           <span class="gname">{g.name}</span>
+          {#if g.wslDistro}
+            <span
+              class="wslbadge"
+              title={`This project runs inside the ${g.wslDistro} WSL distro`}
+              aria-label={`WSL distro ${g.wslDistro}`}
+            >WSL · {g.wslDistro}</span>
+          {/if}
           {#if multiSite}
             <!--
               WHERE this project lives, and whether we can reach it — as an icon, not a word.
@@ -899,6 +916,9 @@
   .sc.done { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
   .sc.stalled { color: var(--bad-text); background: color-mix(in srgb, var(--bad-text) 14%, transparent); }
   .gname { font-weight: var(--fw-medium); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wslbadge { flex: none; max-width: 7.5rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent);
+    border-radius: var(--r-pill); padding: 0.08rem 0.35rem; font-size: var(--text-2xs); font-weight: var(--fw-medium); }
   .gcount { margin-left: auto; font-size: var(--text-xs); }
   .gadd { display: grid; place-items: center; color: var(--dim); width: 20px; height: 20px; border-radius: var(--r-xs); opacity: 0; transition: opacity var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease); }
   .group-head:hover .gadd { opacity: 1; }

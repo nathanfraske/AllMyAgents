@@ -3,6 +3,16 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import type { Project } from './types.js'
+import { wslHostPath } from './workspaceLocation.js'
+
+type WslProjectLocation = NonNullable<Project['location']>
+
+export interface WslWorktreeExecution {
+  distro: string
+  repoPath: string
+  worktreePath: string
+}
 
 export type WorktreeInspection =
   | { ok: true; dirty: boolean }
@@ -32,6 +42,24 @@ export class WorkspaceManager {
 
   private git(repo: string, args: string[]): string {
     return execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8', windowsHide: true }).trim()
+  }
+
+  private wslExec(distro: string, cwd: string, program: string, args: string[]): string {
+    return execFileSync(
+      'wsl.exe',
+      ['--distribution', distro, '--cd', cwd, '--exec', program, ...args],
+      { encoding: 'utf8', windowsHide: true },
+    ).trim()
+  }
+
+  private projectGit(
+    repo: string,
+    args: string[],
+    location?: WslProjectLocation,
+  ): string {
+    return location
+      ? this.wslExec(location.distro, location.linuxPath, 'git', ['-C', location.linuxPath, ...args])
+      : this.git(repo, args)
   }
 
   private samePath(left: string, right: string): boolean {
@@ -155,32 +183,62 @@ export class WorkspaceManager {
     fs.rmSync(resolvedProject, { recursive: true, force: true })
   }
 
-  isRepo(repo: string): boolean {
+  isRepo(repo: string, location?: WslProjectLocation): boolean {
     try {
-      return this.git(repo, ['rev-parse', '--is-inside-work-tree']) === 'true'
+      return this.projectGit(repo, ['rev-parse', '--is-inside-work-tree'], location) === 'true'
     } catch {
       return false
     }
   }
 
-  create(repo: string, sessionId: string): {
+  create(repo: string, sessionId: string, location?: WslProjectLocation): {
     worktree: string
+    executionPath?: string
+    distro?: string
     branch: string
     baseCommit: string
     baseRef?: string
   } {
-    if (!this.isRepo(repo)) throw new Error(`not a git repository: ${repo}`)
-    const baseCommit = this.git(repo, ['rev-parse', '--verify', 'HEAD^{commit}'])
+    if (!this.isRepo(repo, location)) throw new Error(`not a git repository: ${repo}`)
+    const baseCommit = this.projectGit(
+      repo,
+      ['rev-parse', '--verify', 'HEAD^{commit}'],
+      location,
+    )
     let baseRef: string | undefined
     try {
-      baseRef = this.git(repo, ['symbolic-ref', 'HEAD'])
+      baseRef = this.projectGit(repo, ['symbolic-ref', 'HEAD'], location)
     } catch {
       // Detached bases are valid. The immutable baseCommit remains authoritative; staleness monitoring
       // falls back to the primary checkout's HEAD when there is no branch ref to follow.
     }
     const short = sessionId.slice(0, 8)
-    const target = path.join(this.worktreesRoot, short)
     const branch = `agent/${short}`
+    if (location) {
+      // The checkout belongs to the same Linux filesystem as its repository. Keeping it beside the
+      // primary checkout's parent avoids the severe Windows↔\\wsl$ traversal penalty and guarantees Git
+      // and every agent tool see the same case-sensitive paths.
+      const linuxRoot = path.posix.join(
+        path.posix.dirname(location.linuxPath),
+        '.allmyagents-worktrees',
+      )
+      const linuxTarget = path.posix.join(linuxRoot, short)
+      this.wslExec(location.distro, location.linuxPath, 'mkdir', ['-p', linuxRoot])
+      this.projectGit(
+        repo,
+        ['worktree', 'add', '-b', branch, linuxTarget],
+        location,
+      )
+      return {
+        worktree: wslHostPath(location.distro, linuxTarget),
+        executionPath: linuxTarget,
+        distro: location.distro,
+        branch,
+        baseCommit,
+        baseRef,
+      }
+    }
+    const target = path.join(this.worktreesRoot, short)
     this.git(repo, ['worktree', 'add', '-b', branch, target])
     return { worktree: target, branch, baseCommit, baseRef }
   }
@@ -296,9 +354,41 @@ export class WorkspaceManager {
    * Verify that a recorded checkout still exists and belongs to this repository. Dirty is reported,
    * not rejected: reopening a stopped session with uncommitted work is the primary recovery path.
    */
-  inspect(repo: string, worktree: string): WorktreeInspection {
+  inspect(
+    repo: string,
+    worktree: string,
+    execution?: WslWorktreeExecution,
+  ): WorktreeInspection {
     if (!fs.existsSync(worktree)) return { ok: false, error: `worktree is missing: ${worktree}` }
     try {
+      if (execution) {
+        const expected = path.posix.normalize(execution.worktreePath)
+        const registered = this.wslExec(
+          execution.distro,
+          execution.repoPath,
+          'git',
+          ['-C', execution.repoPath, 'worktree', 'list', '--porcelain'],
+        )
+          .split(/\r?\n/)
+          .filter((line) => line.startsWith('worktree '))
+          .map((line) => path.posix.normalize(line.slice('worktree '.length)))
+          .some((candidate) => candidate === expected)
+        if (!registered) {
+          return {
+            ok: false,
+            error: `path is not a registered worktree for ${execution.distro}:${execution.repoPath}: ${execution.worktreePath}`,
+          }
+        }
+        const dirty =
+          this.wslExec(execution.distro, execution.worktreePath, 'git', [
+            '-C',
+            execution.worktreePath,
+            'status',
+            '--porcelain',
+            '--untracked-files=all',
+          ]).length > 0
+        return { ok: true, dirty }
+      }
       // Git reports the physical path while records may legitimately contain a symlink/junction alias
       // (notably Windows' Roaming → Packages LocalCache projection). Compare filesystem identities so a
       // valid checkout is not rejected on Reopen merely because those spellings differ.
@@ -323,8 +413,12 @@ export class WorkspaceManager {
    * Remove only a clean, registered worktree. Git's own non-force removal is the final race-safe guard:
    * if a file changes after inspect(), Git refuses instead of erasing it.
    */
-  remove(repo: string, worktree: string): WorktreeRemoval {
-    const state = this.inspect(repo, worktree)
+  remove(
+    repo: string,
+    worktree: string,
+    execution?: WslWorktreeExecution,
+  ): WorktreeRemoval {
+    const state = this.inspect(repo, worktree, execution)
     if (!state.ok) return state
     if (state.dirty) {
       return {
@@ -333,7 +427,17 @@ export class WorkspaceManager {
       }
     }
     try {
-      this.git(repo, ['worktree', 'remove', worktree])
+      if (execution) {
+        this.wslExec(execution.distro, execution.repoPath, 'git', [
+          '-C',
+          execution.repoPath,
+          'worktree',
+          'remove',
+          execution.worktreePath,
+        ])
+      } else {
+        this.git(repo, ['worktree', 'remove', worktree])
+      }
       return { ok: true }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)

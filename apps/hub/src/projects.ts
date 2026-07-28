@@ -1,8 +1,47 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import pathModule from 'node:path'
 import type Database from 'better-sqlite3'
 import { readProjectConfig } from './importScan.js'
 import type { Project } from './types.js'
+
+type ProjectLocation = NonNullable<Project['location']>
+
+interface ProjectRow {
+  id: string
+  name: string
+  path: string
+  wslDistro: string | null
+  linuxPath: string | null
+  createdAt: string
+}
+
+function fromRow(row: ProjectRow | undefined): Project | undefined {
+  if (!row) return undefined
+  return {
+    id: row.id,
+    name: row.name,
+    path: row.path,
+    ...(row.wslDistro && row.linuxPath
+      ? {
+          location: {
+            kind: 'wsl' as const,
+            distro: row.wslDistro,
+            linuxPath: row.linuxPath,
+          },
+        }
+      : {}),
+    createdAt: row.createdAt,
+  }
+}
+
+function projectFilesystemKey(project: Pick<Project, 'path' | 'location'>): string {
+  if (project.location?.kind === 'wsl') {
+    return `wsl:${project.location.distro.toLowerCase()}:${pathModule.posix.normalize(project.location.linuxPath)}`
+  }
+  const resolved = pathModule.resolve(project.path)
+  return `local:${process.platform === 'win32' ? resolved.toLowerCase() : resolved}`
+}
 
 export class ProjectStore {
   private readonly insertStmt: Database.Statement
@@ -17,6 +56,17 @@ export class ProjectStore {
     db.exec(
       'CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL, createdAt TEXT NOT NULL)'
     )
+    const projectColumns = new Set(
+      (db.prepare('PRAGMA table_info(projects)').all() as Array<{ name: string }>).map(
+        (column) => column.name,
+      ),
+    )
+    if (!projectColumns.has('wslDistro')) {
+      db.exec('ALTER TABLE projects ADD COLUMN wslDistro TEXT')
+    }
+    if (!projectColumns.has('linuxPath')) {
+      db.exec('ALTER TABLE projects ADD COLUMN linuxPath TEXT')
+    }
     // Per-project consent to run the project's EXECUTABLE config (MCP servers + hooks). Keyed by the
     // config's content FINGERPRINT, not its path: a moved repo keeps approval (same content), a swapped
     // or edited repo loses it (different content). See fingerprintProjectConfig. A project with no row —
@@ -25,9 +75,15 @@ export class ProjectStore {
     db.exec(
       'CREATE TABLE IF NOT EXISTS project_config_trust (projectId TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, approvedAt TEXT NOT NULL)'
     )
-    this.insertStmt = db.prepare('INSERT INTO projects (id, name, path, createdAt) VALUES (?, ?, ?, ?)')
-    this.allStmt = db.prepare('SELECT id, name, path, createdAt FROM projects ORDER BY createdAt ASC')
-    this.getStmt = db.prepare('SELECT id, name, path, createdAt FROM projects WHERE id = ?')
+    this.insertStmt = db.prepare(
+      'INSERT INTO projects (id, name, path, wslDistro, linuxPath, createdAt) VALUES (?, ?, ?, ?, ?, ?)',
+    )
+    this.allStmt = db.prepare(
+      'SELECT id, name, path, wslDistro, linuxPath, createdAt FROM projects ORDER BY createdAt ASC',
+    )
+    this.getStmt = db.prepare(
+      'SELECT id, name, path, wslDistro, linuxPath, createdAt FROM projects WHERE id = ?',
+    )
     this.delStmt = db.prepare('DELETE FROM projects WHERE id = ?')
     this.trustGetStmt = db.prepare('SELECT fingerprint FROM project_config_trust WHERE projectId = ?')
     this.trustUpsertStmt = db.prepare(
@@ -37,14 +93,14 @@ export class ProjectStore {
   }
 
   list(): Project[] {
-    return this.allStmt.all() as Project[]
+    return (this.allStmt.all() as ProjectRow[]).map((row) => fromRow(row)!)
   }
 
   get(id: string): Project | undefined {
-    return this.getStmt.get(id) as Project | undefined
+    return fromRow(this.getStmt.get(id) as ProjectRow | undefined)
   }
 
-  create(name: string, rawPath: string): Project {
+  create(name: string, rawPath: string, location?: ProjectLocation): Project {
     const path = rawPath.trim()
     if (!path) throw new Error('project path is required')
     if (!fs.existsSync(path)) throw new Error(`path does not exist: ${path}`)
@@ -53,9 +109,21 @@ export class ProjectStore {
       id: crypto.randomUUID(),
       name: name.trim() || path.split(/[\\/]/).filter(Boolean).pop() || path,
       path,
+      ...(location ? { location } : {}),
       createdAt: new Date().toISOString(),
     }
-    this.insertStmt.run(project.id, project.name, project.path, project.createdAt)
+    const filesystemKey = projectFilesystemKey(project)
+    if (this.list().some((existing) => projectFilesystemKey(existing) === filesystemKey)) {
+      throw new Error(`This project directory is already added: ${project.path}`)
+    }
+    this.insertStmt.run(
+      project.id,
+      project.name,
+      project.path,
+      project.location?.distro ?? null,
+      project.location?.linuxPath ?? null,
+      project.createdAt,
+    )
     return project
   }
 

@@ -30,6 +30,8 @@ import type { RestartState } from './restartController.js'
 import { SCHEMA_VERSION } from './restartHandshake.js'
 import { AttachmentInputError, attachmentLimitForMime, isClaudeImageMime } from './attachments.js'
 import { GitHubImportService } from './githubImport.js'
+import { classifyWorkspacePath, type WorkspacePath } from './workspaceLocation.js'
+import { WslService } from './wsl.js'
 
 const PAGE = `<!doctype html>
 <html>
@@ -468,7 +470,52 @@ export function startServer(opts: ServerOptions): http.Server {
     path.join(path.dirname(configPath), 'repositories'),
     (name, projectPath) => projects.create(name, projectPath)
   )
+  const wsl = new WslService()
   const loginNames = new Map<string, string>()
+
+  async function resolveProjectPath(rawPath: string, distro?: string): Promise<WorkspacePath> {
+    const syntax = classifyWorkspacePath(rawPath, { distro })
+    if (syntax.kind === 'local' || process.platform !== 'win32') return syntax
+    // A Linux path without a chosen distro is intentionally unavailable before any probe. UNC paths
+    // carry the concrete distro in-band and reach the live inventory check below.
+    if (syntax.kind === 'unavailable' && !syntax.distro) return syntax
+    const capability = await wsl.capability()
+    if (!capability.supported) {
+      return {
+        kind: 'unavailable',
+        input: rawPath,
+        distro: syntax.distro,
+        reason: capability.reason ?? 'WSL is unavailable on this machine.',
+      }
+    }
+    const requestedDistro =
+      syntax.kind === 'wsl' ? syntax.distro : syntax.distro ?? distro
+    const inventoryDistro = requestedDistro
+      ? capability.distros.find(
+          (candidate) => candidate.name.toLowerCase() === requestedDistro.toLowerCase(),
+        )
+      : undefined
+    if (inventoryDistro?.state === 'stopped') {
+      const started = await wsl.ensureRunning(inventoryDistro.name)
+      if (!started.ok) {
+        return {
+          kind: 'unavailable',
+          input: rawPath,
+          distro: inventoryDistro.name,
+          reason: started.reason,
+        }
+      }
+      return classifyWorkspacePath(rawPath, {
+        distro,
+        distros: capability.distros.map((candidate) =>
+          candidate.name === inventoryDistro.name
+            ? { ...candidate, state: 'running' as const }
+            : candidate,
+        ),
+      })
+    }
+    return classifyWorkspacePath(rawPath, { distro, distros: capability.distros })
+  }
 
   const server = http.createServer((req, res) => {
     void handle(req, res)
@@ -669,6 +716,10 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, { path: picked })
         return
       }
+      if (method === 'GET' && url.pathname === '/api/wsl/capability') {
+        json(res, await wsl.capability())
+        return
+      }
       if (method === 'GET' && url.pathname === '/api/projects') {
         json(res, projects.list())
         return
@@ -677,19 +728,38 @@ export function startServer(opts: ServerOptions): http.Server {
         const body = await readBody(req)
         const name = String(body.name ?? '').trim()
         const projectPath = String(body.path ?? '').trim()
+        const distro = str(body.distro)
         if (!name) {
           json(res, { error: 'project name is required' }, 400)
           return
         }
-        if (!projectPath || !fs.existsSync(projectPath)) {
-          json(res, { error: `path does not exist: ${projectPath || '(empty)'}` }, 400)
+        const location = await resolveProjectPath(projectPath, distro)
+        if (location.kind === 'unavailable') {
+          json(res, { error: location.reason }, 400)
           return
         }
-        if (!fs.statSync(projectPath).isDirectory()) {
-          json(res, { error: `path is not a directory: ${projectPath}` }, 400)
+        if (!location.hostPath || !fs.existsSync(location.hostPath)) {
+          json(res, { error: `path does not exist: ${location.hostPath || '(empty)'}` }, 400)
           return
         }
-        json(res, { valid: true, name, path: projectPath })
+        if (!fs.statSync(location.hostPath).isDirectory()) {
+          json(res, { error: `path is not a directory: ${location.hostPath}` }, 400)
+          return
+        }
+        json(res, {
+          valid: true,
+          name,
+          path: location.hostPath,
+          ...(location.kind === 'wsl'
+            ? {
+                location: {
+                  kind: 'wsl',
+                  distro: location.distro,
+                  linuxPath: location.linuxPath,
+                },
+              }
+            : {}),
+        })
         return
       }
       const deletionMatch = /^\/api\/projects\/([^/]+)\/deletion$/.exec(url.pathname)
@@ -765,7 +835,22 @@ export function startServer(opts: ServerOptions): http.Server {
       }
       if (method === 'POST' && url.pathname === '/api/projects') {
         const body = await readBody(req)
-        const project = projects.create(String(body.name ?? ''), String(body.path ?? ''))
+        const location = await resolveProjectPath(String(body.path ?? ''), str(body.distro))
+        if (location.kind === 'unavailable') {
+          json(res, { error: location.reason }, 400)
+          return
+        }
+        const project = projects.create(
+          String(body.name ?? ''),
+          location.hostPath,
+          location.kind === 'wsl'
+            ? {
+                kind: 'wsl',
+                distro: location.distro,
+                linuxPath: location.linuxPath,
+              }
+            : undefined,
+        )
         json(res, project)
         return
       }

@@ -17,6 +17,8 @@ export interface WorkerSessionSpec {
   profileDir: string // → CLAUDE_CONFIG_DIR / CODEX_HOME
   cwd: string
   worktree?: string
+  /** Present only when cwd/worktree are distro-native Linux paths and the vendor must launch in WSL. */
+  wsl?: { distro: string }
   projectId?: string
   label: string
   model?: string

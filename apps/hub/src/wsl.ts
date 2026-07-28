@@ -132,4 +132,27 @@ export class WslService {
 
     return { supported: true, distros, docker }
   }
+
+  /**
+   * Start a known distro as an explicit project-creation/reopen action. WSL distros normally stop when
+   * idle, so a stopped inventory row is informative rather than terminal; passive status surfaces must
+   * not hide that state, while an operator action may deliberately wake it.
+   */
+  async ensureRunning(distro: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+    if (this.platform !== 'win32') {
+      return { ok: false, reason: 'WSL is available only on Windows.' }
+    }
+    const result = await this.run('wsl.exe', [
+      '--distribution',
+      distro,
+      '--exec',
+      'true',
+    ])
+    if (result.exitCode === 0) return { ok: true }
+    const detail = decodeWindowsOutput(result.stderr).trim()
+    return {
+      ok: false,
+      reason: `The ${distro} WSL distro could not be started${detail ? `: ${detail}` : '.'}`,
+    }
+  }
 }
