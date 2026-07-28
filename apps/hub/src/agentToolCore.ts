@@ -68,7 +68,7 @@ export interface AgentServices {
     callerSessionId: string,
     targetSessionId: string,
     options?: {
-      view?: 'summary' | 'activity' | 'transcript' | 'changes' | 'all'
+      view?: 'summary' | 'activity' | 'transcript' | 'changes' | 'tasks' | 'all'
       afterSeq?: number
     }
   ): Awaitable<{ found: boolean; summary?: string }>
@@ -102,6 +102,16 @@ export interface AgentServices {
     approvalId: string,
     approve: boolean
   ): Awaitable<{ ok: boolean; error?: string }>
+  /** Create or update one audited task on a direct child's shared task board. */
+  assignChildTask?(
+    managerSessionId: string,
+    childSessionId: string,
+    input: {
+      taskId?: string
+      title: string
+      status?: 'pending' | 'in_progress' | 'completed' | 'abandoned'
+    },
+  ): Awaitable<{ ok: boolean; taskId?: string; error?: string }>
   /** Operate the app-owned browser bound to this exact AllMyAgents session. */
   browser(
     sessionId: string,
@@ -229,7 +239,7 @@ const peekAgent = defineTool({
   schema: {
     to_session: z.string().describe('the teammate session id from list_agents'),
     view: z
-      .enum(['summary', 'activity', 'transcript', 'changes', 'all'])
+      .enum(['summary', 'activity', 'transcript', 'changes', 'tasks', 'all'])
       .optional()
       .describe('summary works for teammates; deep views are restricted to a manager’s own direct children'),
     after_seq: z
@@ -345,6 +355,29 @@ const decideChildApproval = defineTool({
     return result.ok
       ? `${args.approve ? 'Approved' : 'Denied'} child approval ${args.approval_id}.`
       : `Not decided: ${result.error ?? 'unknown error'}`
+  },
+})
+
+const assignChildTask = defineTool({
+  name: 'assign_child_task',
+  description:
+    'Project managers only: create or update an audited task on your own direct child’s shared board. The operator sees the same board through the UI; use task_id from peek_agent view "tasks" to update an existing manager assignment.',
+  schema: {
+    child_session: z.string().describe('direct child session id'),
+    title: z.string().min(1).max(500).describe('clear outcome the child owns'),
+    task_id: z.string().optional().describe('existing manager-assigned task id; omit to create'),
+    status: z.enum(['pending', 'in_progress', 'completed', 'abandoned']).optional(),
+  },
+  run: async (args, { identity, services }) => {
+    if (!services.assignChildTask) return 'Not assigned: this hub does not support manager task assignment.'
+    const result = await services.assignChildTask(identity.sessionId, args.child_session, {
+      taskId: args.task_id,
+      title: args.title,
+      status: args.status,
+    })
+    return result.ok
+      ? `${args.task_id ? 'Updated' : 'Assigned'} child task ${result.taskId}.`
+      : `Not assigned: ${result.error ?? 'unknown error'}`
   },
 })
 
@@ -542,6 +575,7 @@ export const AGENT_TOOLS: readonly AgentToolSpec[] = [
   spawnAgent,
   setChildAuthority,
   decideChildApproval,
+  assignChildTask,
   memoryWrite,
   memorySearch,
   memoryRead,

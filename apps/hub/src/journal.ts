@@ -1099,6 +1099,33 @@ export class Journal extends EventEmitter {
   }
 
   /**
+   * Newest exact events for one session, scoped in SQL before payload materialization. Manager roster
+   * composition uses this small reverse-chronological window to describe real tool/activity state without
+   * reading a child's full transcript or trusting prose the child wrote about itself.
+   */
+  recentEventsForSession(sessionId: string, limit = 40): HubEvent[] {
+    const bounded = Math.max(1, Math.min(100, Math.floor(limit)))
+    const rows = this.db
+      .prepare(
+        'SELECT seq, ts, session, kind, payload FROM events WHERE session = ? ORDER BY seq DESC LIMIT ?'
+      )
+      .all(sessionId, bounded) as Array<{
+        seq: number
+        ts: string
+        session: string | null
+        kind: string
+        payload: string
+      }>
+    return rows.map((row) => ({
+      seq: row.seq,
+      ts: row.ts,
+      sessionId: row.session,
+      kind: row.kind,
+      payload: parsePayload(row.payload, row.seq),
+    }))
+  }
+
+  /**
    * Exact per-session event page for manager-owned worker inspection. Unlike `since()`, this is scoped in
    * SQL before materialization, so inspecting one child never reads or exposes unrelated transcripts.
    */

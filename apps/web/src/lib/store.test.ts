@@ -1424,4 +1424,30 @@ describe('codex plan ingest', () => {
       'Inspect apps/web/package.json:in_progress',
     ])
   })
+
+  it('materializes a manager assignment on the child’s operator-visible board', () => {
+    const id = 'managed-child'
+    seed(id)
+    apply(
+      evt({
+        seq: 2,
+        kind: 'manager/task-assigned',
+        sessionId: id,
+        payload: {
+          id: 'manager:1',
+          title: 'Own parser.ts',
+          status: 'in_progress',
+          managerSessionId: 'manager',
+          managerLabel: 'Curie',
+        },
+      }),
+    )
+    expect(buildTaskBoard(store.sessions[id]!.items).tasks).toEqual([
+      expect.objectContaining({
+        title: 'Own parser.ts',
+        origin: 'manager',
+        assignedByLabel: 'Curie',
+      }),
+    ])
+  })
 })

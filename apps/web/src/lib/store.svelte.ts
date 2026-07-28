@@ -1829,6 +1829,18 @@ export class HubStore {
         })
         break
       }
+      case 'manager/task-assigned': {
+        // Manager assignments are durable hub events on the child. Normalize them to the same pure
+        // board reducer input as vendor task tools; taskBoardOnly keeps audit metadata out of chat prose.
+        this.push(view, {
+          kind: 'tool',
+          ts,
+          toolName: 'ManagerTask',
+          toolInput: payload,
+          taskBoardOnly: true,
+        })
+        break
+      }
       case 'codex/turn/completed': {
         // Every codex turn ends here; turn.status distinguishes completed | interrupted | failed.
         //

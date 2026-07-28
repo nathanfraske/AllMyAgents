@@ -100,6 +100,7 @@ export type RelayMethod =
   | 'manager.spawn'
   | 'manager.setChildAuthority'
   | 'manager.decideChildApproval'
+  | 'manager.assignChildTask'
   | 'memory.write'
   | 'memory.search'
   | 'memory.get'

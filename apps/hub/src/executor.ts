@@ -143,7 +143,7 @@ export interface InProcessExecutorHubHooks {
     callerSessionId: string,
     targetSessionId: string,
     options?: {
-      view?: 'summary' | 'activity' | 'transcript' | 'changes' | 'all'
+      view?: 'summary' | 'activity' | 'transcript' | 'changes' | 'tasks' | 'all'
       afterSeq?: number
     }
   ): { found: boolean; summary?: string }
@@ -173,6 +173,15 @@ export interface InProcessExecutorHubHooks {
     approvalId: string,
     approve: boolean
   ): { ok: boolean; error?: string }
+  managerAssignChildTask(
+    managerSessionId: string,
+    childSessionId: string,
+    input: {
+      taskId?: string
+      title: string
+      status?: 'pending' | 'in_progress' | 'completed' | 'abandoned'
+    },
+  ): { ok: boolean; taskId?: string; error?: string }
   browser(
     sessionId: string,
     operation: 'navigate' | 'read' | 'screenshot' | 'status',
@@ -228,6 +237,8 @@ export class InProcessExecutor implements Executor {
         this.h.managerSetChildAuthority(managerSessionId, childSessionId, authorities, tools),
       decideChildApproval: (managerSessionId, approvalId, approve) =>
         this.h.managerDecideChildApproval(managerSessionId, approvalId, approve),
+      assignChildTask: (managerSessionId, childSessionId, input) =>
+        this.h.managerAssignChildTask(managerSessionId, childSessionId, input),
       browser: (sessionId, operation, args) => this.h.browser(sessionId, operation, args),
       memory: this.services.memory,
       practices: this.services.practices,

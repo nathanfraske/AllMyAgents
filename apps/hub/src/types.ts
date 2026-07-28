@@ -110,6 +110,10 @@ export interface SessionRecord {
   title?: string
   /** Operator-authored team role/description. Identity stays in `title`; this is quieter context. */
   role?: string
+  /** Exact operator-defined manager agent type selected for this child. Kept separately from `role`
+   *  because the live manager roster must reconstruct the actual type rather than infer from prose. */
+  agentTypeId?: string
+  agentTypeName?: string
   /** 'generated' → a scientist surname assigned at creation; kept until the operator renames it, so a
    *  chat's name never changes under them. 'auto' → derived from the first prompt (legacy path, still
    *  used for imported/untitled records). 'user' → an explicit rename, which freezes naming entirely. */

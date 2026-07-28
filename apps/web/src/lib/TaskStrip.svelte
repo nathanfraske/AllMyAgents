@@ -11,7 +11,6 @@
 
   const board = $derived(buildTaskBoard(items))
   const sum = $derived(summarizeBoard(board))
-  const hasBoard = $derived(board.tasks.length > 0 || board.changes.length > 0)
 
   function cls(status: string): string {
     if (status === 'completed' || status === 'done') return 'done'
@@ -24,13 +23,12 @@
   }
 </script>
 
-{#if hasBoard}
-  <div class="strip" class:open>
+<div class="strip" class:open>
     <button class="shead" onclick={() => (open = !open)} title="The task board this agent is working from">
       <span class="caret">{open ? '▾' : '▸'}</span>
       <span class="label">Tasks</span>
       <span class="counts dim">
-        {sum.done}/{sum.total} done{#if sum.active} · {sum.active} in progress{/if}
+        {#if sum.total}{sum.done}/{sum.total} done{#if sum.active} · {sum.active} in progress{/if}{:else}No tasks reported{/if}
       </span>
       {#if sum.total}
         <span class="bar" aria-hidden="true"><span class="fill" style="width: {Math.round((sum.done / sum.total) * 100)}%"></span></span>
@@ -45,12 +43,15 @@
               <li class="task {cls(t.status)}">
                 <span class="mark" aria-hidden="true"></span>
                 <span class="title">{t.title}</span>
+                <span class="origin" class:manager={t.origin === 'manager'}>
+                  {t.origin === 'manager' ? 'manager assigned' : 'agent reported'}
+                </span>
                 <span class="status dim">{t.status.replace('_', ' ')}</span>
               </li>
             {/each}
           </ul>
         {:else}
-          <div class="dim none">No tasks on the board — only history below.</div>
+          <div class="dim none">No tasks reported. This does not mean the agent has no work.</div>
         {/if}
 
         {#if board.changes.length}
@@ -73,8 +74,7 @@
         {/if}
       </div>
     {/if}
-  </div>
-{/if}
+</div>
 
 <style>
   .strip { border: 1px solid var(--border); border-radius: 10px; background: var(--surface); margin-bottom: 0.5rem; overflow: hidden; }
@@ -94,6 +94,8 @@
   .task.done .title { opacity: 0.6; text-decoration: line-through; }
   .title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .status { font-size: 0.68rem; flex: none; }
+  .origin { font-size: 0.62rem; flex: none; border: 1px solid var(--border); border-radius: 999px; padding: 0.05rem 0.28rem; opacity: 0.72; }
+  .origin.manager { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); opacity: 1; }
   .none { font-size: 0.74rem; padding: 0.3rem 0; }
   .hlink { background: none; border: none; color: inherit; cursor: pointer; font-size: 0.7rem; padding: 0.35rem 0 0; text-decoration: underline; }
   .hist { list-style: none; margin: 0.25rem 0 0; padding: 0; display: flex; flex-direction: column; gap: 0.1rem; max-height: 26vh; overflow-y: auto; font-size: 0.72rem; }
