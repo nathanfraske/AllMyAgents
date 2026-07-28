@@ -59,8 +59,8 @@ Options:
   --add-to-path   Add the launcher's directory to your shell rc without asking.
   --no-path       Install the app only. No launcher, no PATH changes.
   --uninstall     Remove the app, the launcher, and the PATH line this installer added.
-  -y, --yes       Answer yes to prompts. Required for --uninstall when piping from curl,
-                  because a pipeline has no terminal to ask at.
+  --purge-data    With --uninstall, also permanently remove chats, settings, and vendor logins.
+  -y, --yes       Answer yes to prompts. Useful for non-interactive automation.
   -h, --help      This text.
 
 Environment:
@@ -76,11 +76,13 @@ USAGE
 }
 
 DO_UNINSTALL=0
+PURGE_DATA=0
 PATH_MODE="ask"
 ASSUME_YES=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --uninstall) DO_UNINSTALL=1 ;;
+    --purge-data) PURGE_DATA=1 ;;
     --add-to-path) PATH_MODE="yes" ;;
     --no-path) PATH_MODE="no" ;;
     -y|--yes) ASSUME_YES=1 ;;
@@ -89,6 +91,7 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+[ "$PURGE_DATA" = 0 ] || [ "$DO_UNINSTALL" = 1 ] || die "--purge-data must be used with --uninstall"
 
 [ "$(uname -s)" = "Darwin" ] || die "this installer is for macOS. On Windows use scripts/install-windows.ps1, on Linux build from source."
 
@@ -283,9 +286,13 @@ do_uninstall() {
   echo "  the 'allmyagents' launcher, if this installer wrote it"
   echo "  the PATH line this installer added to your shell config"
   echo
-  echo "It will NOT remove your agents, chat journals or settings."
+  if [ "$PURGE_DATA" = 1 ]; then
+    echo "It WILL permanently remove chats, settings, worktrees, and saved Claude/Codex logins."
+  else
+    echo "It will KEEP your chats, settings, worktrees, and saved Claude/Codex logins."
+  fi
   if ! confirm "Continue?"; then
-    die "cancelled, nothing was removed. Pass --yes to skip this question (needed when piping from curl)."
+    die "cancelled, nothing was removed. Pass --yes to skip this question."
   fi
 
   # Only ever delete a launcher we generated. A file called `allmyagents` that we did not write
@@ -309,10 +316,26 @@ do_uninstall() {
     say "Removed $DEST_DIR/$APP"
   fi
 
+  HUB_HOME="$HOME/Library/Application Support/direct.cec.allmyagents"
+  if [ -e "$HUB_HOME" ]; then
+    rm -rf "$HUB_HOME" || die "could not remove the regenerable hub files at $HUB_HOME"
+    say "Removed regenerable hub files at $HUB_HOME"
+  fi
+
+  USER_DATA="$HOME/Library/Application Support/AllMyAgents"
+  if [ "$PURGE_DATA" = 1 ] && [ -e "$USER_DATA" ]; then
+    rm -rf "$USER_DATA" || die "could not remove operator data at $USER_DATA"
+    say "Removed chats, settings, worktrees, and saved vendor logins at $USER_DATA"
+  fi
+
   printf '\n\033[32mOK\033[0m AllMyAgents removed.\n\n'
-  echo "Your agents, journals and settings are still on disk, deliberately. Delete them yourself if"
-  echo "you actually want them gone:"
-  echo "    rm -rf ~/Library/Application\\ Support/direct.cec.allmyagents"
+  if [ "$PURGE_DATA" = 1 ]; then
+    echo "The app, regenerable hub, chats, settings, and saved vendor credentials were removed."
+  else
+    echo "Your chats, settings, worktrees, and saved Claude/Codex logins are still on disk, deliberately:"
+    echo "    ~/Library/Application Support/AllMyAgents"
+    echo "To delete them too, rerun with: --uninstall --purge-data"
+  fi
   exit 0
 }
 
@@ -429,9 +452,8 @@ fi
 # The embedded Node runtime is what the hub actually runs on. If it cannot execute, the app launches
 # to a window that never connects — which is a much more confusing failure than not installing at all.
 NODE="$DEST_DIR/$APP/Contents/Resources/hub-runtime/node/node"
-if [ -x "$NODE" ]; then
-  "$NODE" --version >/dev/null 2>&1 || die "the bundled Node runtime will not execute -- the app would start but never connect"
-fi
+[ -x "$NODE" ] || die "the bundled Node runtime is missing or not executable at $NODE -- refusing to leave a dead-window install"
+"$NODE" --version >/dev/null 2>&1 || die "the bundled Node runtime will not execute -- refusing to leave a dead-window install"
 
 printf '\n\033[32mOK\033[0m Installed %s to %s\n\n' "${VERSION:-AllMyAgents}" "$DEST_DIR/$APP"
 
@@ -449,4 +471,5 @@ echo
 echo "First launch needs an internet connection -- it fetches the hub's dependencies and the vendor"
 echo "CLIs from npm, which takes a couple of minutes. The window says so while it works."
 echo
-echo "To remove it all later:  bash install-macos.sh --uninstall"
+echo "To uninstall later (keeping chats and logins):"
+echo "  curl -fsSL https://raw.githubusercontent.com/nathanfraske/AllMyAgents/main/scripts/install-macos.sh | bash -s -- --uninstall"
