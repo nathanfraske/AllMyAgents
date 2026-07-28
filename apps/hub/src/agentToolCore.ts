@@ -192,7 +192,16 @@ const sendMessage = defineTool({
     'reason about and dismiss it. Two direct messages are almost always better than one broadcast. ' +
     'Broadcast only when every agent genuinely needs to act — a change to shared conventions, a stop-work notice, ' +
     'a fact that invalidates work in progress. If you find yourself broadcasting so the right agent sees it, you do not need a ' +
-    'broadcast; you need list_agents and one or two direct messages.',
+    'broadcast; you need list_agents and one or two direct messages. ' +
+    // Measured, not theorised: 183 project broadcasts against 80 direct messages in ninety minutes on a
+    // seventeen-agent project. The single worst was one agent coordinating with ONE named teammate by
+    // broadcasting to all seventeen — subject line "<name> coordination" — after which sixteen agents each
+    // burned a turn replying that they were not that name. The guidance above was already present and was
+    // not enough, because "coordinate with X" reads as a reason to announce rather than to address.
+    'NAMING SOMEONE IN THE SUBJECT IS NOT ADDRESSING THEM. A broadcast titled "Alice coordination" still ' +
+    'interrupts everyone, and every agent who is not Alice must spend a turn establishing that. If you know ' +
+    'whose attention you want, look them up and send it to them; if you do not know, that is what list_agents ' +
+    'and peek_agent are for. Coordinating with one teammate is never a reason to broadcast.',
   schema: {
     to_session: z
       .string()
