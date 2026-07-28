@@ -514,21 +514,30 @@ jobs:
             } catch {
               $newHealth = $null
             }
-            if ($attempt % 5 -eq 0) {
-              $texts = [Windows.Automation.AutomationElement]::RootElement.FindAll(
-                [Windows.Automation.TreeScope]::Descendants,
-                [Windows.Automation.PropertyCondition]::new(
-                  [Windows.Automation.AutomationElement]::ControlTypeProperty,
-                  [Windows.Automation.ControlType]::Text
-                )
-              )
-              $lockedFileError = $texts |
-                Where-Object { $_.Current.Name -like '*Error opening file for writing*' } |
-                Select-Object -First 1
-              if ($lockedFileError) {
-                throw "NSIS updater reproduced the live locked-file failure: $($lockedFileError.Current.Name)"
+              if ($attempt % 5 -eq 0) {
+                try {
+                  $texts = [Windows.Automation.AutomationElement]::RootElement.FindAll(
+                    [Windows.Automation.TreeScope]::Descendants,
+                    [Windows.Automation.PropertyCondition]::new(
+                      [Windows.Automation.AutomationElement]::ControlTypeProperty,
+                      [Windows.Automation.ControlType]::Text
+                    )
+                  )
+                  $lockedFileError = $texts |
+                    Where-Object { $_.Current.Name -like '*Error opening file for writing*' } |
+                    Select-Object -First 1
+                  if ($lockedFileError) {
+                    throw "NSIS updater reproduced the live locked-file failure: $($lockedFileError.Current.Name)"
+                  }
+                } catch {
+                  # A successful updater closes and replaces the app while UI Automation is walking its
+                  # accessibility tree. That normal window transition can invalidate an element mid-query;
+                  # the version/PID/health assertions below remain the authoritative result.
+                  if ($_.Exception.Message -notlike '*UI that is no longer available*') {
+                    throw
+                  }
+                }
               }
-            }
             if (
               $oldProcessesGone -and
               $installedVersion -like "$env:AMA_CANDIDATE_VERSION*" -and
