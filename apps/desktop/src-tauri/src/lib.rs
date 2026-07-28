@@ -1009,10 +1009,13 @@ async fn updater_install(app: AppHandle) -> Result<(), String> {
 #[cfg(desktop)]
 #[tauri::command]
 fn uninstall_macos(app: AppHandle, remove_user_data: bool) -> Result<(), String> {
+    // No `return` here: with the macOS arm below cfg'd out, this block IS the tail expression on every
+    // other platform, and an explicit return trips clippy::needless_return — which is a hard error under
+    // the `-D warnings` gate that CI runs on Windows.
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (app, remove_user_data);
-        return Err("In-app uninstall is currently available on macOS only.".to_string());
+        Err("In-app uninstall is currently available on macOS only.".to_string())
     }
     #[cfg(target_os = "macos")]
     {
