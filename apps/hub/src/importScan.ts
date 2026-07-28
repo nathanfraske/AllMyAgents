@@ -145,23 +145,24 @@ export function encodeClaudeCwd(cwd: string): string {
   return cwd.replace(/[^a-zA-Z0-9]/g, '-')
 }
 
-/** Normalize a path for comparison: unify separators, drop trailing slash, lowercase (Windows). */
-export function normPath(p: string): string {
-  return p.replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase()
+/** Normalize a path for comparison: unify separators, drop trailing slash, and case-fold on Windows. */
+export function normPath(p: string, platform: NodeJS.Platform = process.platform): string {
+  const normalized = p.replace(/[\\/]+/g, '/').replace(/\/+$/, '')
+  return platform === 'win32' ? normalized.toLowerCase() : normalized
 }
 
 /** True when `recordCwd` is the target folder itself or nested inside it. */
-export function cwdMatches(recordCwd: string, target: string): boolean {
-  const a = normPath(recordCwd)
-  const b = normPath(target)
+export function cwdMatches(recordCwd: string, target: string, platform: NodeJS.Platform = process.platform): boolean {
+  const a = normPath(recordCwd, platform)
+  const b = normPath(target, platform)
   return a === b || a.startsWith(b + '/')
 }
 
 /** True when `cwd` is the hub's worktrees root or inside it (hub scratch — excluded from import). */
-export function isUnderWorktrees(cwd: string, worktreesRoot?: string): boolean {
+export function isUnderWorktrees(cwd: string, worktreesRoot?: string, platform: NodeJS.Platform = process.platform): boolean {
   if (!worktreesRoot) return false
-  const a = normPath(cwd)
-  const w = normPath(worktreesRoot)
+  const a = normPath(cwd, platform)
+  const w = normPath(worktreesRoot, platform)
   return a === w || a.startsWith(w + '/')
 }
 
