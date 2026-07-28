@@ -223,6 +223,35 @@ describe('ProjectView', () => {
     expect(screen.getByText('I am coordinating the launch.')).toBeTruthy()
   })
 
+  it("renders the manager record's account, model, effort, and permission instead of profile defaults", async () => {
+    store.profiles = [
+      { id: 'default-claude', provider: 'claude' },
+      { id: 'codex-manager-record', provider: 'codex' },
+    ]
+    store.lastProfileId = 'default-claude'
+    store.sessions.manager = {
+      ...store.sessions.manager!,
+      record: {
+        ...store.sessions.manager!.record,
+        profileId: 'codex-manager-record',
+        provider: 'codex',
+        model: 'gpt-5.6-terra',
+        effort: 'ultra',
+        serviceTier: 'priority',
+        permissionMode: 'edits',
+      },
+    }
+
+    render(ProjectView, { props: { projectId: project.id } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Manager' }))
+
+    expect(screen.getByTitle('Account: codex-manager-record')).toBeTruthy()
+    expect(screen.getAllByTitle('Model: GPT-5.6 Terra')).toHaveLength(2)
+    expect(screen.getByTitle('Model options: Ultra · Fast')).toBeTruthy()
+    expect(screen.getByTitle('Permission mode: edits')).toBeTruthy()
+    expect(screen.queryByTitle('Account: default-claude')).toBeNull()
+  })
+
   it('shows a live bounded manager transcript peek and remembers when it is collapsed', async () => {
     const view = render(ProjectView, { props: { projectId: project.id } })
 
