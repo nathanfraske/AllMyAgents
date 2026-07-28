@@ -14,6 +14,29 @@ permissions:
   contents: read
 
 jobs:
+  cli-installer-health:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-latest, macos-15-intel]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the real CLI installer and require its health verdict
+        run: |
+          set -euo pipefail
+          /bin/bash scripts/install-macos.sh --no-path 2>&1 | tee /tmp/cli-install.log
+          grep -F "Launching through macOS LaunchServices" /tmp/cli-install.log
+          grep -F "Verified: the installed app launched through LaunchServices and its hub answers /api/health." /tmp/cli-install.log
+          curl -fsS --max-time 3 http://127.0.0.1:7777/api/health
+      - name: Cleanup
+        if: always()
+        run: |
+          pkill -x allmyagents-desktop 2>/dev/null || true
+          pkill -f hubctl 2>/dev/null || true
+          rm -rf /Applications/AllMyAgents.app
+
   launch-and-repair:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
