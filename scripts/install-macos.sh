@@ -58,6 +58,7 @@ Install AllMyAgents on macOS and put an `allmyagents` command on your PATH.
 Options:
   --add-to-path   Add the launcher's directory to your shell rc without asking.
   --no-path       Install the app only. No launcher, no PATH changes.
+  --no-verify     Install without launching the app and waiting for its hub health check.
   --uninstall     Remove the app, the launcher, and the PATH line this installer added.
   --purge-data    With --uninstall, also permanently remove chats, settings, and vendor logins.
   -y, --yes       Answer yes to prompts. Useful for non-interactive automation.
@@ -77,6 +78,7 @@ USAGE
 
 DO_UNINSTALL=0
 PURGE_DATA=0
+VERIFY_LAUNCH=1
 PATH_MODE="ask"
 ASSUME_YES=0
 while [ $# -gt 0 ]; do
@@ -85,6 +87,7 @@ while [ $# -gt 0 ]; do
     --purge-data) PURGE_DATA=1 ;;
     --add-to-path) PATH_MODE="yes" ;;
     --no-path) PATH_MODE="no" ;;
+    --no-verify) VERIFY_LAUNCH=0 ;;
     -y|--yes) ASSUME_YES=1 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "unknown option '$1'" ;;
@@ -473,3 +476,62 @@ echo "CLIs from npm, which takes a couple of minutes. The window says so while i
 echo
 echo "To uninstall later (keeping chats and logins):"
 echo "  curl -fsSL https://raw.githubusercontent.com/nathanfraske/AllMyAgents/main/scripts/install-macos.sh | bash -s -- --uninstall"
+
+if [ "$VERIFY_LAUNCH" = 0 ]; then
+  echo
+  say "Skipped launch verification (--no-verify). The app is installed but its hub was not tested."
+  exit 0
+fi
+
+HEALTH_URL="http://127.0.0.1:7777/api/health"
+HEALTH_JSON="$TMP/health.json"
+LOG_PATH="$HOME/Library/Application Support/direct.cec.allmyagents/logs/desktop.log"
+
+if curl -fsS --max-time 2 "$HEALTH_URL" -o "$HEALTH_JSON" 2>/dev/null; then
+  echo
+  say "A hub was already answering before this launch. Activating the installed app, but this run cannot prove the new bundle started it."
+  open -a "$DEST_DIR/$APP" || say "The app is installed, but LaunchServices could not activate it."
+  exit 0
+fi
+
+echo
+say "Launching through macOS LaunchServices, the same path used by Finder..."
+open -a "$DEST_DIR/$APP" || {
+  say "The app is installed, but LaunchServices could not open it."
+  echo "Desktop log: $LOG_PATH"
+  echo "Inspect it with: tail -n 80 \"$LOG_PATH\""
+  exit 0
+}
+
+say "Waiting for the hub. First launch installs dependencies and vendor CLIs; on a slow connection this can take several minutes."
+HEALTHY=0
+I=0
+while [ "$I" -lt 150 ]; do
+  if curl -fsS --max-time 2 "$HEALTH_URL" -o "$HEALTH_JSON" 2>/dev/null; then
+    HEALTHY=1
+    break
+  fi
+  I=$((I + 1))
+  if [ $((I % 8)) -eq 0 ]; then
+    say "Still setting up... waited $((I * 2)) seconds (up to 300 seconds is allowed)."
+  fi
+  sleep 2
+done
+
+if [ "$HEALTHY" = 1 ]; then
+  say "Verified: the installed app launched through LaunchServices and its hub answers /api/health."
+  echo "AllMyAgents is running and ready to use."
+  exit 0
+fi
+
+# The bundle is already installed, so a health timeout is a diagnostic failure, not an installation
+# rollback. Stop only the app this script launched so an invisible half-start does not linger.
+osascript -e 'tell application "AllMyAgents" to quit' >/dev/null 2>&1 || true
+sleep 2
+pkill -TERM -x allmyagents-desktop >/dev/null 2>&1 || true
+echo
+printf '\033[33mwarning:\033[0m AllMyAgents is installed at %s, but its hub did not answer within 300 seconds.\n' "$DEST_DIR/$APP" >&2
+echo "The verification-launched app was stopped. Your installed files and user data were kept." >&2
+echo "Desktop log: $LOG_PATH" >&2
+echo "Inspect it with: tail -n 80 \"$LOG_PATH\"" >&2
+exit 0
