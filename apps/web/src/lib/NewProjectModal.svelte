@@ -273,6 +273,10 @@
 
   function review(): void {
     teamError = ''
+    if (managerEnabled && !managerConfig) {
+      teamError = 'Finish the required project manager fields, or turn the manager off.'
+      return
+    }
     if (!readyToReview) {
       teamError = 'Every starting agent needs an account and a starting prompt.'
       return
@@ -286,7 +290,7 @@
     void reveal('team')
   }
 
-  function configureManager(config: ManagerLaunchConfig): void {
+  function configureManager(config: ManagerLaunchConfig | null): void {
     managerConfig = config
     managerStatus = 'ready'
     managerError = undefined

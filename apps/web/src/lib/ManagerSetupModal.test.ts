@@ -209,7 +209,7 @@ describe('Manager setup', () => {
     store.managerSetupSessionId = null
     const onCreateProject = vi.fn()
     const onConfigured = vi.fn()
-    const { getByRole, getByLabelText } = render(ManagerSetupModal, {
+    const { getByRole, getByLabelText, queryByRole } = render(ManagerSetupModal, {
       onclose: vi.fn(),
       embedded: true,
       deferLaunch: true,
@@ -220,8 +220,7 @@ describe('Manager setup', () => {
     expect((getByLabelText(/manager may answer its workers’ approvals/i) as HTMLInputElement).checked).toBe(true)
     await fireEvent.click(getByRole('button', { name: /create a new project/i }))
     expect(onCreateProject).toHaveBeenCalledOnce()
-    await fireEvent.click(getByRole('button', { name: /add to project launch/i }))
-    expect(onConfigured).toHaveBeenCalledWith(
+    await waitFor(() => expect(onConfigured).toHaveBeenCalledWith(
       expect.objectContaining({
         projectId: 'project-1',
         permissionMode: expect.any(String),
@@ -231,7 +230,8 @@ describe('Manager setup', () => {
         canApproveChildren: true,
         agentTypes: expect.any(Array),
       }),
-    )
+    ))
+    expect(queryByRole('button', { name: /add to project launch/i })).toBeNull()
     expect(onConfigured.mock.calls[0]?.[0].standingInstructions).toMatch(/worktree/i)
     expect(spawn).not.toHaveBeenCalled()
   })
