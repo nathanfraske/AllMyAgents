@@ -226,11 +226,13 @@ jobs:
               ForEach-Object { & taskkill.exe /PID $_.Id /T /F | Out-Host }
           }
 
-  # The updater used to launch msiexec while its managed hub (and detached workers) still had the
+  # The updater used to launch its installer while its managed hub (and detached workers) still had the
   # installed hub-runtime\node\node.exe mapped. Windows correctly refused to replace that running file,
   # after the user had already downloaded and approved the update. A clean launch cannot catch this.
   #
-  # Build the current commit twice: a lower-version SOURCE app and the signed CANDIDATE updater MSI.
+  # Build the current commit twice: a lower-version SOURCE app and the signed CANDIDATE NSIS updater.
+  # This MUST be NSIS: MSI's Restart Manager automatically closes ordinary file holders, while the
+  # operator's real failure ("Error opening file for writing ... node.exe") came from the NSIS path.
   # Launch the installed source through its Start Menu shortcut, deliberately keep extra processes from
   # its exact bundled node.exe alive (the field failure had 65), then invoke the real updater command
   # through the installed WebView2. The candidate version, all old PIDs gone, and a new healthy hub are
@@ -265,7 +267,7 @@ jobs:
             throw 'TAURI_SIGNING_PRIVATE_KEY is required to verify the real signed Windows update path'
           }
 
-      - name: Build a signed candidate and a lower-version source MSI
+      - name: Build a signed candidate and a lower-version source NSIS installer
         shell: pwsh
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -288,7 +290,6 @@ jobs:
                 dangerousInsecureTransportProtocol = $true
                 windows = @{
                   installMode = 'passive'
-                  installerArgs = @('/l*v', 'C:\Windows\Temp\ama-live-updater-msi.log')
                 }
               }
             }
@@ -297,27 +298,27 @@ jobs:
           $updaterConfig | ConvertTo-Json -Depth 8 |
             Set-Content $candidateConfig -Encoding utf8
 
-          pnpm --filter desktop exec tauri build --bundles msi --config $candidateConfig
+          pnpm --filter desktop exec tauri build --bundles nsis --config $candidateConfig
           if ($LASTEXITCODE -ne 0) { throw "candidate build failed with exit $LASTEXITCODE" }
-          $candidate = Get-ChildItem apps\desktop\src-tauri\target\release\bundle\msi\*.msi |
+          $candidate = Get-ChildItem apps\desktop\src-tauri\target\release\bundle\nsis\*-setup.exe |
             Where-Object Name -Like "*$candidateVersion*" |
             Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
-          if (-not $candidate) { throw "candidate build produced no $candidateVersion MSI" }
+          if (-not $candidate) { throw "candidate build produced no $candidateVersion NSIS installer" }
           $candidateSignature = Get-Item "$($candidate.FullName).sig" -ErrorAction SilentlyContinue
           if (-not $candidateSignature) {
             throw "candidate updater artifact has no signature beside $($candidate.FullName)"
           }
-          Copy-Item $candidate.FullName (Join-Path $fixture 'candidate.msi')
-          Copy-Item $candidateSignature.FullName (Join-Path $fixture 'candidate.msi.sig')
+          Copy-Item $candidate.FullName (Join-Path $fixture 'candidate.exe')
+          Copy-Item $candidateSignature.FullName (Join-Path $fixture 'candidate.exe.sig')
 
           # Same product code and shutdown logic, deliberately older version. It is the app performing
           # the update, so this proves the candidate code's updater path rather than an old release's.
           #
           # Give the source package a tiny Node-forwarder at the SAME installed node.exe path. It waits
           # for the system Node it launches, so Windows keeps this executable mapped for the full hub
-          # lifetime. The candidate contains the real, versioned Node executable and MSI must replace it;
-          # this prevents a false green where Windows Installer notices byte-identical source/candidate
-          # Node files and optimizes the locked file out of the update.
+          # lifetime. The candidate contains the real, versioned Node executable and must replace it;
+          # this prevents a false green where the installer notices byte-identical source/candidate Node
+          # files and optimizes the locked file out of the update.
           $nodeForwarderSource = Join-Path $fixture 'node-forwarder.rs'
           @'
           use std::process::{Command, exit};
@@ -348,24 +349,26 @@ jobs:
           # The source needs no updater artifact of its own. Do not accidentally sign or publish it.
           Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue
           Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
-          pnpm --filter desktop exec tauri build --bundles msi --config $sourceConfig
+          pnpm --filter desktop exec tauri build --bundles nsis --config $sourceConfig
           if ($LASTEXITCODE -ne 0) { throw "source build failed with exit $LASTEXITCODE" }
-          $source = Get-ChildItem apps\desktop\src-tauri\target\release\bundle\msi\*.msi |
+          $source = Get-ChildItem apps\desktop\src-tauri\target\release\bundle\nsis\*-setup.exe |
             Where-Object Name -Like '*0.0.0*' |
             Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
-          if (-not $source) { throw 'lower-version source build produced no 0.0.0 MSI' }
-          Copy-Item $source.FullName (Join-Path $fixture 'source.msi')
+          if (-not $source) { throw 'lower-version source build produced no 0.0.0 NSIS installer' }
+          Copy-Item $source.FullName (Join-Path $fixture 'source.exe')
 
-          $signature = (Get-Content (Join-Path $fixture 'candidate.msi.sig') -Raw).Trim()
+          $signature = (Get-Content (Join-Path $fixture 'candidate.exe.sig') -Raw).Trim()
+          $platform = @{
+            signature = $signature
+            url = "http://127.0.0.1:$env:AMA_UPDATE_PORT/candidate.exe"
+          }
           @{
             version = $candidateVersion
             notes = 'Windows live-updater process-lock verification'
             pub_date = [DateTime]::UtcNow.ToString('o')
             platforms = @{
-              'windows-x86_64' = @{
-                signature = $signature
-                url = "http://127.0.0.1:$env:AMA_UPDATE_PORT/candidate.msi"
-              }
+              'windows-x86_64' = $platform
+              'windows-x86_64-nsis' = $platform
             }
           } | ConvertTo-Json -Depth 8 |
             Set-Content (Join-Path $fixture 'latest.json') -Encoding utf8
@@ -373,31 +376,27 @@ jobs:
           "AMA_CANDIDATE_VERSION=$candidateVersion" |
             Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Install the lower-version source
+      - name: Install the lower-version NSIS source
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $source = Join-Path $env:AMA_UPDATE_FIXTURE 'source.msi'
-          $install = Start-Process msiexec.exe `
-            -ArgumentList @('/i', "`"$source`"", '/qn', '/l*v', "$env:RUNNER_TEMP\source-msi.log") `
-            -Wait -PassThru
+          $source = Join-Path $env:AMA_UPDATE_FIXTURE 'source.exe'
+          $install = Start-Process $source -ArgumentList '/S' -Wait -PassThru
           if ($install.ExitCode -ne 0) {
-            Get-Content "$env:RUNNER_TEMP\source-msi.log" -Tail 100
-            throw "source MSI failed with $($install.ExitCode)"
+            throw "source NSIS installer failed with $($install.ExitCode)"
           }
 
-          $roots = @("$env:LOCALAPPDATA\Programs", "$env:ProgramFiles", "${env:ProgramFiles(x86)}") |
-            Where-Object { $_ -and (Test-Path $_) }
-          $exe = Get-ChildItem -Path $roots -Include 'allmyagents-desktop.exe','AllMyAgents.exe' `
-            -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $exe) { throw 'source MSI installed no AllMyAgents executable' }
           $shortcutRoots = @(
             "$env:APPDATA\Microsoft\Windows\Start Menu\Programs",
             "$env:ProgramData\Microsoft\Windows\Start Menu\Programs"
           )
           $shortcut = Get-ChildItem -Path $shortcutRoots -Filter '*AllMyAgents*.lnk' `
             -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $shortcut) { throw 'source MSI installed no Start Menu shortcut' }
+          if (-not $shortcut) { throw 'source NSIS installer created no Start Menu shortcut' }
+          $shell = New-Object -ComObject WScript.Shell
+          $target = $shell.CreateShortcut($shortcut.FullName).TargetPath
+          $exe = Get-Item $target -ErrorAction SilentlyContinue
+          if (-not $exe) { throw "source NSIS shortcut target does not exist: $target" }
 
           "AMA_UPDATE_EXE=$($exe.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "AMA_UPDATE_SHORTCUT=$($shortcut.FullName)" |
@@ -407,7 +406,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # The source MSI's deliberate node.exe forwarder must use this absolute path. Asking Windows
+          # The source NSIS package's deliberate node.exe forwarder must use this absolute path. Asking Windows
           # to resolve the bare name "node" from inside node.exe finds the forwarder itself first.
           $env:AMA_CI_SYSTEM_NODE = (Get-Command node -ErrorAction Stop).Source
 
@@ -506,7 +505,7 @@ jobs:
                   [Diagnostics.FileVersionInfo]::GetVersionInfo($env:AMA_UPDATE_EXE)
                 ).ProductVersion
               } catch {
-                # MSI has a normal remove/replace window. Keep polling instead of turning that transient
+                # The installer has a normal remove/replace window. Keep polling instead of turning that transient
                 # absence into a false failure before the locked-file result is known.
               }
             }
@@ -514,6 +513,21 @@ jobs:
               $newHealth = Invoke-RestMethod http://127.0.0.1:7777/api/health -TimeoutSec 2
             } catch {
               $newHealth = $null
+            }
+            if ($attempt % 5 -eq 0) {
+              $texts = [Windows.Automation.AutomationElement]::RootElement.FindAll(
+                [Windows.Automation.TreeScope]::Descendants,
+                [Windows.Automation.PropertyCondition]::new(
+                  [Windows.Automation.AutomationElement]::ControlTypeProperty,
+                  [Windows.Automation.ControlType]::Text
+                )
+              )
+              $lockedFileError = $texts |
+                Where-Object { $_.Current.Name -like '*Error opening file for writing*' } |
+                Select-Object -First 1
+              if ($lockedFileError) {
+                throw "NSIS updater reproduced the live locked-file failure: $($lockedFileError.Current.Name)"
+              }
             }
             if (
               $oldProcessesGone -and
@@ -541,9 +555,6 @@ jobs:
             } else {
               '(missing)'
             }
-            if (Test-Path 'C:\Windows\Temp\ama-live-updater-msi.log') {
-              Get-Content 'C:\Windows\Temp\ama-live-updater-msi.log' -Tail 120
-            }
             throw "live update did not complete: version=$version oldPids=$remaining health=$($newHealth | ConvertTo-Json -Compress)"
           }
 
@@ -555,7 +566,7 @@ jobs:
             Select-String -Path $desktopLog -SimpleMatch '=== AllMyAgents'
           ).Count
           if ($candidateStartCount -le [int]$env:AMA_UPDATE_SOURCE_START_COUNT) {
-            throw 'desktop log does not contain a new app start after the MSI handoff'
+            throw 'desktop log does not contain a new app start after the installer handoff'
           }
           Copy-Item $desktopLog "$env:RUNNER_TEMP\desktop-after-live-update.log"
           Write-Host "live update succeeded: source hub $env:AMA_UPDATE_FIRST_HUB_PID -> candidate hub $($newHealth.pid)"
@@ -564,10 +575,14 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          if (Test-Path 'C:\Windows\Temp\ama-live-updater-msi.log') {
-            Copy-Item 'C:\Windows\Temp\ama-live-updater-msi.log' `
-              "$env:RUNNER_TEMP\live-updater-msi.log"
+          $desktopLog = Join-Path $env:LOCALAPPDATA 'direct.cec.allmyagents\logs\desktop.log'
+          if (Test-Path $desktopLog) {
+            Copy-Item $desktopLog "$env:RUNNER_TEMP\desktop-live-updater-final.log"
           }
+          Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
+            Select-Object ProcessId, ParentProcessId, ExecutablePath, CommandLine |
+            ConvertTo-Json -Depth 4 |
+            Set-Content "$env:RUNNER_TEMP\node-processes-final.json" -Encoding utf8
 
       - name: Upload live-updater evidence
         if: always()
@@ -575,9 +590,9 @@ jobs:
         with:
           name: windows-live-updater
           path: |
-            ${{ runner.temp }}\source-msi.log
-            ${{ runner.temp }}\live-updater-msi.log
             ${{ runner.temp }}\desktop-after-live-update.log
+            ${{ runner.temp }}\desktop-live-updater-final.log
+            ${{ runner.temp }}\node-processes-final.json
             ${{ runner.temp }}\update-health-first.json
             ${{ runner.temp }}\update-health-repaired.json
             ${{ runner.temp }}\old-bundled-node-pids.json
@@ -589,6 +604,21 @@ jobs:
         run: |
           if ($env:AMA_UPDATE_SERVER_PID) {
             Stop-Process -Id $env:AMA_UPDATE_SERVER_PID -Force -ErrorAction SilentlyContinue
+          }
+          if ($env:AMA_UPDATE_FIXTURE) {
+            $candidateInstaller = Join-Path $env:AMA_UPDATE_FIXTURE 'candidate.exe'
+            Get-CimInstance Win32_Process |
+              Where-Object {
+                $_.ExecutablePath -and
+                $_.ExecutablePath.Equals(
+                  $candidateInstaller,
+                  [StringComparison]::OrdinalIgnoreCase
+                )
+              } |
+              ForEach-Object {
+                Invoke-CimMethod -InputObject $_ -MethodName Terminate -ErrorAction SilentlyContinue |
+                  Out-Null
+              }
           }
           if ($env:AMA_UPDATE_EXE) {
             $installRoot = Split-Path $env:AMA_UPDATE_EXE -Parent
