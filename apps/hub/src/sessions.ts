@@ -1490,6 +1490,7 @@ export class SessionManager {
       operatorTask?: string
       standingInstructions?: string
       canApproveChildren?: boolean
+      permissionMode?: 'safe' | 'edits' | 'full'
       maxChildPermissionMode?: 'safe' | 'edits' | 'full'
     },
     actor: 'operator' | 'agent'
@@ -1539,6 +1540,11 @@ export class SessionManager {
     if (typeof standingInstructions !== 'string' || standingInstructions.length > 20_000) {
       throw new Error('standingInstructions must be text no longer than 20,000 characters')
     }
+    const managerPermissionMode =
+      config.permissionMode ?? record.managerPermissionModeCeiling ?? record.permissionMode ?? 'safe'
+    if (!isPermissionMode(managerPermissionMode)) {
+      throw new Error('permissionMode must be safe, edits, or full')
+    }
     const maxChildPermissionMode =
       config.maxChildPermissionMode ?? record.managerMaxChildPermissionMode ?? 'safe'
     if (!isPermissionMode(maxChildPermissionMode)) {
@@ -1554,6 +1560,7 @@ export class SessionManager {
       return this.journal.atomic(() => {
         const previouslyManager = record.isProjectManager === true
         const previousCeiling = new Set(record.managerDelegation ?? [])
+        const previousManagerPermissionMode = record.permissionMode ?? 'safe'
         record.isProjectManager = config.enabled
         record.managerMaxLiveChildren = config.enabled ? max : undefined
         record.managerDelegation = config.enabled && requested.length ? requested : undefined
@@ -1568,6 +1575,10 @@ export class SessionManager {
         record.managerCanApproveChildren = config.enabled
           ? (config.canApproveChildren ?? record.managerCanApproveChildren ?? true)
           : undefined
+        record.managerPermissionModeCeiling = config.enabled ? managerPermissionMode : undefined
+        // Manager promotion and its permission scope are one operator grant. Applying the chosen mode
+        // here prevents a separate launch-side /mode write or stale default from winning the race.
+        if (config.enabled) record.permissionMode = managerPermissionMode
         record.managerMaxChildPermissionMode = config.enabled ? maxChildPermissionMode : undefined
         this.instructions.set(
           `session:${record.id}`,
@@ -1637,11 +1648,19 @@ export class SessionManager {
           operatorTask: record.managerOperatorTask ?? '',
           standingInstructions: record.managerStandingInstructions ?? '',
           canApproveChildren: record.managerCanApproveChildren ?? false,
+          permissionMode: record.permissionMode ?? 'safe',
+          permissionModeCeiling: record.managerPermissionModeCeiling ?? 'safe',
           maxChildPermissionMode: record.managerMaxChildPermissionMode ?? 'safe',
           by: 'operator',
           previousRole: previouslyManager,
           removedAuthorities: [...previousCeiling].filter((authority) => !ceiling.has(authority)),
         })
+        if (config.enabled && previousManagerPermissionMode !== record.permissionMode) {
+          this.journal.append(record.id, 'session/mode', {
+            permissionMode: record.permissionMode,
+            source: 'manager/grant',
+          })
+        }
         return record
       })
     } catch (error) {
@@ -2665,6 +2684,12 @@ export class SessionManager {
   setMode(sessionId: string, mode: 'safe' | 'edits' | 'full'): void {
     const record = this.sessions.get(sessionId)
     if (!record) throw new Error(`unknown session: ${sessionId}`)
+    if (
+      record.isProjectManager === true &&
+      permissionModeRank(mode) > permissionModeRank(record.managerPermissionModeCeiling ?? 'safe')
+    ) {
+      throw new Error(`permission mode ${mode} exceeds this manager's operator-granted ceiling`)
+    }
     const manager = record.parentSessionId ? this.sessions.get(record.parentSessionId) : undefined
     if (
       manager?.isProjectManager === true &&

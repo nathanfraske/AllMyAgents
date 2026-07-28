@@ -132,6 +132,7 @@ export interface SessionRecord {
   managerOperatorTask?: string
   managerStandingInstructions?: string
   managerCanApproveChildren?: boolean
+  managerPermissionModeCeiling?: 'safe' | 'edits' | 'full'
   managerMaxChildPermissionMode?: 'safe' | 'edits' | 'full'
   parentSessionId?: string
   delegatedAuthorities?: Array<'commit' | 'push'>
@@ -742,6 +743,7 @@ export const api = {
       operatorTask?: string
       standingInstructions?: string
       canApproveChildren?: boolean
+      permissionMode?: 'safe' | 'edits' | 'full'
       maxChildPermissionMode?: 'safe' | 'edits' | 'full'
     }
   ) => jpost<SessionRecord | ApiError>(`/api/sessions/${id}/project-manager`, config),

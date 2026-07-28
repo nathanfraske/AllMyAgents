@@ -444,8 +444,6 @@
         await api.rename(record.id, name)
       }
       if (!record) throw new Error('Choose the chat to promote.')
-      const modeResult = await api.setMode(record.id, permissionMode)
-      if (modeResult && 'error' in modeResult) throw new Error(modeResult.error)
       const settingsResult = await api.setSettings(record.id, {
         model: managerModel || undefined,
         effort: managerEffort || undefined,
@@ -464,6 +462,7 @@
         operatorTask: config.operatorTask,
         standingInstructions: config.standingInstructions,
         canApproveChildren: config.canApproveChildren,
+        permissionMode: config.permissionMode,
         maxChildPermissionMode: config.maxChildPermissionMode,
       })
       if ('error' in configured) throw new Error(configured.error)
