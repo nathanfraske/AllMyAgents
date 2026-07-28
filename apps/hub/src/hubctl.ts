@@ -14,10 +14,16 @@
  * The typed supervisor<->hub IPC contract + the `waitForHubMsg`/`healthCheck` helpers live in
  * `restartHandshake.ts` and are shared with the hub side (`index.ts`/`restartController.ts`).
  */
-import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
+import { createConnection } from 'node:net'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
+import {
+  MAX_REVIVE_FAILURES,
+  ReviveFailureGuard,
+  revivePreflightIssue,
+  supervisorRuntimeIssue,
+} from './hubctlPolicy.js'
 import { sendToHub, waitForHubMsg, healthCheck, type HubMsg } from './restartHandshake.js'
 import { defaultWorkerSocket } from './workerTransport.js'
 
@@ -77,9 +83,18 @@ let restartListener: ((m: unknown) => void) | null = null
 let workerHandle: ChildProcess | null = null
 /** Set while a signal/fatal teardown is killing the tree, so the worker's exit handler doesn't respawn. */
 let tearingDown = false
+const supervisorWorkingDirectory = process.cwd()
 
 function log(msg: string): void {
   console.log(`[hubctl] ${msg}`)
+}
+
+function terminateSupervisor(reason: string): never {
+  tearingDown = true
+  log(`TERMINAL supervisor failure — ${reason}`)
+  log('stopping instead of retrying forever; run `pnpm supervisors:status` to find other supervisors')
+  for (const child of children) killTree(child)
+  process.exit(1)
 }
 
 /**
@@ -88,18 +103,29 @@ function log(msg: string): void {
  * (`node --import tsx/esm index.ts`), NEVER via `npx tsx` or the `tsx` binary. The IPC channel (the
  * 4th `ipc` stdio slot) is owned by the FIRST node in the chain, and Node strips `NODE_CHANNEL_FD`
  * before spawning grandchildren; any wrapper that re-spawns node would swallow the channel and the hub
- * would never get `process.send`, breaking the whole handshake. Dev is detected by the absence of a
- * built `dist/index.js` (no new dependency) or an explicit `HUBCTL_DEV=1`. Entries resolve relative to
- * this file, so `src/hubctl.ts` finds `src/index.ts` and `dist/hubctl.js` finds `dist/index.js`.
+ * would never get `process.send`, breaking the whole handshake. Dev is explicit (`HUBCTL_DEV=1`) or
+ * follows a supervisor that is itself running from TypeScript. A missing production entry must NOT be
+ * reinterpreted as dev mode: that is the deleted-worktree failure this supervisor must stop on.
  */
 function hubLaunchCommand(): { cmd: string; args: string[] } {
   const dir = import.meta.dirname
   const prodEntry = path.join(dir, 'index.js')
   const devEntry = path.join(dir, 'index.ts')
-  const dev = process.env.HUBCTL_DEV === '1' || !fs.existsSync(prodEntry)
+  const dev = process.env.HUBCTL_DEV === '1' || import.meta.filename.endsWith('.ts')
   return dev
     ? { cmd: process.execPath, args: ['--import', 'tsx/esm', devEntry] }
     : { cmd: process.execPath, args: [prodEntry] }
+}
+
+function currentRuntimeIssue(): string | null {
+  const command = hubLaunchCommand()
+  const hubEntry = command.args.at(-1)
+  if (!hubEntry) return 'hub launch command has no entry path'
+  return supervisorRuntimeIssue({
+    supervisorEntry: import.meta.filename,
+    hubEntry,
+    workingDirectory: supervisorWorkingDirectory,
+  })
 }
 
 /**
@@ -145,8 +171,9 @@ function spawnHub(port: number, color: HubColor): HubHandle {
     //
     // A supervisor that exits when its child dies is not supervising. Respawn with backoff instead, the
     // same shape the agent worker above already uses.
-    if (!expected && live === handle && !flipInFlight) {
+    if (!tearingDown && !expected && live === handle && !flipInFlight) {
       live = null
+      recordReviveFailure(`live hub exited (code=${code ?? 'null'} signal=${signal ?? 'null'})`)
       void reviveLiveHub()
     }
   })
@@ -155,12 +182,12 @@ function spawnHub(port: number, color: HubColor): HubHandle {
 
 /**
  * How to launch the agent worker — the same prod-JS/dev-TS resolution as {@link hubLaunchCommand}, but
- * resolving `agentWorker.js`/`agentWorker.ts` next to this file. Dev is the absence of a built
- * `dist/index.js` (the identical signal hubLaunchCommand uses) or an explicit HUBCTL_DEV=1.
+ * resolving `agentWorker.js`/`agentWorker.ts` next to this file. Dev follows the running supervisor
+ * itself; a deleted production entry is terminal rather than an implicit switch to TypeScript.
  */
 function workerLaunchCommand(): { cmd: string; args: string[] } {
   const dir = import.meta.dirname
-  const dev = process.env.HUBCTL_DEV === '1' || !fs.existsSync(path.join(dir, 'index.js'))
+  const dev = process.env.HUBCTL_DEV === '1' || import.meta.filename.endsWith('.ts')
   return dev
     ? { cmd: process.execPath, args: ['--import', 'tsx/esm', path.join(dir, 'agentWorker.ts')] }
     : { cmd: process.execPath, args: [path.join(dir, 'agentWorker.js')] }
@@ -176,6 +203,8 @@ function workerLaunchCommand(): { cmd: string; args: string[] } {
  */
 function spawnWorker(): void {
   if (!workerSocket) return
+  const runtimeIssue = currentRuntimeIssue()
+  if (runtimeIssue) terminateSupervisor(runtimeIssue)
   const { cmd, args } = workerLaunchCommand()
   // The worker relays browser calls back to the hub and never talks to the
   // desktop bridge itself. Do not let the bridge secret flow through the
@@ -202,31 +231,75 @@ function spawnWorker(): void {
     children.delete(child)
     const wasCurrent = workerHandle === child
     if (wasCurrent) workerHandle = null
-    log(`worker exited (code=${code ?? 'null'} signal=${signal ?? 'null'})${tearingDown ? '' : ' — respawning'}`)
-    if (!tearingDown && wasCurrent) spawnWorker()
+    log(`worker exited (code=${code ?? 'null'} signal=${signal ?? 'null'})${tearingDown ? '' : ' — recovery required'}`)
+    if (!tearingDown && wasCurrent) {
+      const issue = currentRuntimeIssue()
+      if (issue) terminateSupervisor(issue)
+      const cause = `agent worker exited (code=${code ?? 'null'} signal=${signal ?? 'null'})`
+      const state = workerFailures.record(cause)
+      if (state.exhausted) {
+        terminateSupervisor(
+          `agent worker failed ${state.attempts} time(s); last cause repeated ${state.repeated} time(s): ${cause}`
+        )
+      }
+      const wait = BACKOFF_MS[Math.min(state.attempts - 1, BACKOFF_MS.length - 1)] as number
+      log(`agent worker recovery attempt ${state.attempts + 1}/${MAX_REVIVE_FAILURES} in ${wait}ms`)
+      setTimeout(() => {
+        if (!tearingDown && !workerHandle) spawnWorker()
+      }, wait).unref?.()
+    }
   })
+  setTimeout(() => {
+    if (workerHandle === child && child.exitCode === null && child.signalCode === null) {
+      workerFailures.reset()
+    }
+  }, STABLE_MS).unref?.()
 }
 
 /**
- * Bring the live hub back after a crash, retrying until it sticks.
+ * Bring the live hub back after a crash, retrying only while recovery remains plausible.
  *
- * Backoff is capped rather than unbounded, and it NEVER gives up. Those are deliberate and they trade
- * against each other:
- *   - Giving up is what produced today's outage. A hub that is unreachable forever, with the app still
- *     open, is the worst possible end state — the operator cannot tell a crash from a hang from a bug,
- *     and relaunching does not help because the supervisor is already gone.
- *   - Retrying hot is the other failure: a hub that dies instantly on boot (a corrupt journal row, a bad
- *     migration) would spin the CPU and flood the log. Hence the cap.
- * A crash-looping hub therefore settles into a slow, quiet retry that recovers by itself the moment the
- * underlying problem is fixed — including a fix applied by an agent, which is the point of this app.
- *
- * `consecutiveFailures` resets once a hub has stayed up for STABLE_MS, so an unrelated crash weeks later
- * starts from a fast retry rather than inheriting an old penalty.
+ * Backoff limits frequency; MAX_REVIVE_FAILURES limits lifetime. A supervisor whose checkout disappeared,
+ * whose dead port is still held, or whose replacement fails repeatedly cannot repair itself and must exit
+ * so stale code does not outlive every future fix.
  */
 const BACKOFF_MS = [500, 1_000, 2_000, 5_000, 10_000, 20_000, 30_000]
 const STABLE_MS = 60_000
-let consecutiveFailures = 0
+const reviveFailures = new ReviveFailureGuard()
+const workerFailures = new ReviveFailureGuard()
+let reviveFailureAttempts = 0
 let reviving = false
+
+function recordReviveFailure(cause: string): void {
+  const state = reviveFailures.record(cause)
+  reviveFailureAttempts = state.attempts
+  log(
+    `recovery failure ${state.attempts}/${MAX_REVIVE_FAILURES}` +
+      ` (same cause ${state.repeated} time(s)): ${cause}`
+  )
+  if (state.exhausted) {
+    terminateSupervisor(
+      `hub recovery failed ${state.attempts} time(s); last cause repeated ${state.repeated} time(s): ${cause}`
+    )
+  }
+}
+
+async function portIsListening(port: number, timeoutMs = 500): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false
+    const socket = createConnection({ host: '127.0.0.1', port })
+    const finish = (occupied: boolean): void => {
+      if (settled) return
+      settled = true
+      socket.destroy()
+      resolve(occupied)
+    }
+    socket.once('connect', () => finish(true))
+    socket.once('error', () => finish(false))
+    socket.setTimeout(timeoutMs, () => finish(false))
+    socket.unref()
+  })
+}
 
 /**
  * Does a hub on this port actually SERVE, as opposed to merely exist?
@@ -257,13 +330,20 @@ async function reviveLiveHub(): Promise<void> {
   if (reviving || tearingDown) return
   reviving = true
   try {
-    for (;;) {
+    while (reviveFailureAttempts < MAX_REVIVE_FAILURES) {
       if (tearingDown) return
-      const wait = BACKOFF_MS[Math.min(consecutiveFailures, BACKOFF_MS.length - 1)] as number
-      consecutiveFailures++
-      log(`live hub is down — respawning in ${wait}ms (attempt ${consecutiveFailures})`)
+      const preflightIssue = revivePreflightIssue(
+        currentRuntimeIssue(),
+        FIXED_PORT,
+        await portIsListening(FIXED_PORT)
+      )
+      if (preflightIssue) terminateSupervisor(preflightIssue)
+      const wait = BACKOFF_MS[Math.min(Math.max(0, reviveFailureAttempts - 1), BACKOFF_MS.length - 1)] as number
+      log(`live hub is down — respawning in ${wait}ms (attempt ${reviveFailureAttempts + 1}/${MAX_REVIVE_FAILURES})`)
       await new Promise((r) => setTimeout(r, wait))
       if (tearingDown) return
+      const delayedRuntimeIssue = currentRuntimeIssue()
+      if (delayedRuntimeIssue) terminateSupervisor(delayedRuntimeIssue)
       let candidate: HubHandle | undefined
       try {
         candidate = spawnHub(FIXED_PORT, 'blue')
@@ -289,7 +369,8 @@ async function reviveLiveHub(): Promise<void> {
           void hubAnswersHealth(settled.port ?? FIXED_PORT).then((ok) => {
             if (live !== settled) return
             if (ok) {
-              consecutiveFailures = 0
+              reviveFailures.reset()
+              reviveFailureAttempts = 0
             } else {
               // Alive but not serving. Treat it as a failed attempt and go round again rather than
               // leaving the operator with a process that exists and a hub that does not.
@@ -305,10 +386,10 @@ async function reviveLiveHub(): Promise<void> {
         // spawning another accumulates siblings that then make every later attempt fail for a *different*
         // reason than the original one — a self-inflicted crash loop layered on top of the real fault.
         if (candidate) killTree(candidate.child)
-        log(`respawn attempt ${consecutiveFailures} failed: ${String(err)}`)
-        // loop and try again after a longer wait
+        recordReviveFailure(String(err))
       }
     }
+    terminateSupervisor(`hub recovery exhausted ${MAX_REVIVE_FAILURES} attempts`)
   } finally {
     reviving = false
   }
@@ -469,6 +550,15 @@ function teardown(signal: NodeJS.Signals): void {
 process.on('SIGINT', () => teardown('SIGINT'))
 process.on('SIGTERM', () => teardown('SIGTERM'))
 
+// A loaded JavaScript module remains executable after its file or whole worktree is deleted. Check the
+// invariant independently of hub crashes so even a still-serving orphan cannot live indefinitely on code
+// that no longer exists and can never receive a fix.
+setInterval(() => {
+  if (tearingDown) return
+  const issue = currentRuntimeIssue()
+  if (issue) terminateSupervisor(issue)
+}, 30_000).unref?.()
+
 log(`supervisor starting (pid ${process.pid})`)
 boot().catch((err) => {
   // A FIRST boot that fails must NOT end the supervisor — this was the brick.
@@ -485,10 +575,9 @@ boot().catch((err) => {
   // alive and trying when that happens, so the fix takes effect without the operator knowing to relaunch
   // anything. Exiting guarantees the opposite: nothing is running to notice the repair.
   //
-  // So: fall into the same capped-backoff loop, which never gives up, and say plainly what is happening.
-  // The retry is cheap and the cap means a permanently broken install settles into one quiet attempt
-  // every 30s rather than a hot loop.
+  // So: fall into the same bounded backoff loop. Transient failures get another chance; permanent
+  // failures stop with a discoverable terminal diagnostic instead of leaving stale code alive forever.
   log(`hub failed its FIRST boot: ${String(err)}`)
-  log('supervisor staying up and retrying — fix the cause and it will come back on its own')
+  recordReviveFailure(String(err))
   void reviveLiveHub()
 })

@@ -12,6 +12,7 @@
     "hub:bundle": "node scripts/bundle-hub.mjs",
     "bundle:audit": "node scripts/bundle-hub.mjs --self-test",
     "accept:restart": "node scripts/acceptance-restart-survival.mjs",
+    "accept:orphan-supervisor": "node scripts/acceptance-hubctl-orphan.mjs",
     "desktop": "pnpm --filter desktop tauri dev",
     "desktop:build": "pnpm --filter desktop tauri build",
     "web:dev": "pnpm --filter web dev",
@@ -27,6 +28,7 @@
     "sandbox:down": "node scripts/sandbox.mjs down",
     "sandbox:reset": "node scripts/sandbox.mjs reset",
     "sandbox:app": "node scripts/sandbox.mjs app",
+    "supervisors:status": "node scripts/supervisors-status.mjs",
     "drive": "node scripts/sandbox-drive.mjs"
   }
 }
