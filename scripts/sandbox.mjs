@@ -126,6 +126,20 @@ async function up() {
   fs.mkdirSync(DATA, { recursive: true })
   if (isolatedProfiles) fs.mkdirSync(PROFILES, { recursive: true })
 
+  // WHICH profiles directory this sandbox uses must never be inherited by accident.
+  //
+  // Previously HUB_PROFILES_DIR was set ONLY in the isolated case, so --shared-profiles meant "whatever
+  // the parent process happened to have". Run from a developer shell that is unset, and the hub falls back
+  // to <repo>/profiles. Run from an AGENT inside the installed app, the app's own HUB_PROFILES_DIR is
+  // inherited and "shared" silently means the operator's REAL accounts. One command, two very different
+  // blast radii, decided by who launched it — and that is precisely how a throwaway sandbox came to claim
+  // all four of the operator's logins.
+  //
+  // Resolve it here, always pass it explicitly, and print it. If the sandbox is going to touch real
+  // credentials, the operator should be able to read that off the screen rather than infer it.
+  const sharedProfilesDir = path.resolve(process.env.HUB_PROFILES_DIR ?? path.join(REPO, 'profiles'))
+  const effectiveProfiles = isolatedProfiles ? PROFILES : sharedProfilesDir
+
   const env = {
     ...process.env,
     HUB_WORKER: '1',
@@ -140,6 +154,8 @@ async function up() {
     // sandbox — but never the reverse. Without this flag an idle sandbox can sit on every account the
     // operator has, which is exactly what happened before it existed.
     HUB_TRANSIENT: '1',
+    // Always explicit — see the resolution note above. Never left to inheritance.
+    HUB_PROFILES_DIR: effectiveProfiles,
     // Never advertise a sandbox on the mesh: a disposable hub must not appear in the operator's fleet
     // roster, and certainly must not be reachable from another machine.
     MESH_EXPOSE: '0',
@@ -149,7 +165,6 @@ async function up() {
     // precisely because that case is the one worth exercising.
     HUB_RESTART_MAX_DEFER_MS: process.env.SANDBOX_MAX_DEFER_MS ?? '3000',
   }
-  if (isolatedProfiles) env.HUB_PROFILES_DIR = PROFILES
   // Inherited supervision vars would make the sandbox think it is a green being promoted by the LIVE
   // hubctl. Strip them so it always boots as its own independent supervisor.
   delete env.HUB_SUPERVISED
@@ -178,7 +193,7 @@ async function up() {
     if (h) {
       console.log(`sandbox up  pid=${child.pid}  http://127.0.0.1:${PORT}`)
       console.log(`  data     ${DATA}`)
-      console.log(`  profiles ${isolatedProfiles ? PROFILES + ' (isolated, empty)' : 'SHARED with your real profiles'}`)
+      console.log(`  profiles ${effectiveProfiles}${isolatedProfiles ? ' (isolated, empty)' : ' (SHARED)'}`)
       if (isolatedProfiles) console.log('  agents   unavailable until you sign in a throwaway sandbox account')
       else console.warn('  WARNING  --shared-profiles was explicitly requested; live profile ownership will be enforced')
       console.log(`  log      ${LOG}`)
