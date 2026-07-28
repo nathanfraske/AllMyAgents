@@ -22,6 +22,12 @@ import { execFileSync } from 'node:child_process'
 const PORT = process.env.AMA_PORT ?? '7777'
 const BASE = `http://127.0.0.1:${PORT}`
 const asJson = process.argv.includes('--json')
+// --wait BLOCKS until something needs a human, then exits. That inversion is the whole point: polling
+// this by hand means noticing a stalled agent whenever someone happens to ask, which is not monitoring.
+// Run it in the background and let its EXIT be the notification.
+const waitMode = process.argv.includes('--wait')
+const pollSeconds = Number(process.argv.find((a) => a.startsWith('--every='))?.slice(8) ?? 60)
+const maxMinutes = Number(process.argv.find((a) => a.startsWith('--for='))?.slice(6) ?? 90)
 
 function installedDataDir() {
   if (process.platform === 'win32') {
@@ -172,16 +178,17 @@ function replyGist(row) {
   }
 }
 
-const report = []
-let sessions
-try {
-  sessions = await api('/api/sessions')
-} catch (error) {
-  console.error(`fleet-watch: cannot read the hub — ${error.message}`)
-  process.exit(2)
-}
+async function scan() {
+  const report = []
+  let sessions
+  try {
+    sessions = await api('/api/sessions')
+  } catch (error) {
+    console.error(`fleet-watch: cannot read the hub — ${error.message}`)
+    process.exit(2)
+  }
 
-for (const s of sessions) {
+  for (const s of sessions) {
   if (!AGENT_TITLES.test(s.title ?? '')) continue
   const { input: lastInput, reply: lastReply, error: lastError } = lastOfEachKind(s.id)
 
@@ -215,17 +222,33 @@ for (const s of sessions) {
     said: replyGist(lastReply),
     ahead,
     dirty,
-    error: lastError ? String(JSON.parse(lastError.payload)?.message ?? '').slice(0, 90) : null,
-  })
+      error: lastError ? String(JSON.parse(lastError.payload)?.message ?? '').slice(0, 90) : null,
+    })
+  }
+  return report
 }
 
-if (asJson) {
-  console.log(JSON.stringify(report, null, 1))
-} else {
-  const needs = report.filter((r) => /ERRORED|NEVER MESSAGED|NO REPLY|NO WORK/.test(r.verdict))
+/** Worth SHOWING in a report — anything an operator might want to look at. */
+const NEEDS_ME = /ERRORED|NEVER MESSAGED|NO REPLY|NO WORK/
+
+/**
+ * Worth WAKING someone for. Deliberately narrower than NEEDS_ME.
+ *
+ * "Replied but produced nothing" belongs in a report and not in an alarm: an agent that has finished and
+ * is waiting for orders looks exactly like one that declined, and once a wave lands the whole fleet sits
+ * in that state. Waking on it meant the watcher fired the instant it started, every time, which is how a
+ * monitor teaches people to ignore it.
+ *
+ * So wake on the two things that are unambiguously mine to fix: an agent that is STUCK, and work that has
+ * landed and is waiting to be integrated.
+ */
+const WAKE_STUCK = /ERRORED|NEVER MESSAGED|NO REPLY/
+
+function print(report) {
+  const needs = report.filter((r) => NEEDS_ME.test(r.verdict))
   console.log(`\n${report.length} agents · ${report.filter((r) => r.status === 'active').length} working · ${needs.length} need attention\n`)
   for (const r of report) {
-    const mark = /ERRORED|NEVER MESSAGED|NO REPLY|NO WORK/.test(r.verdict) ? '!' : ' '
+    const mark = NEEDS_ME.test(r.verdict) ? '!' : ' '
     console.log(
       `${mark} ${(r.title ?? '').padEnd(12)} ${r.status.padEnd(8)} in:${(r.lastInputAt ?? '--').padEnd(9)} out:${(r.lastReplyAt ?? '--').padEnd(9)} ${r.verdict}`
     )
@@ -235,4 +258,60 @@ if (asJson) {
     if (r.error) console.log(`               error: ${r.error}`)
   }
   console.log()
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+if (!waitMode) {
+  const report = await scan()
+  if (asJson) console.log(JSON.stringify(report, null, 1))
+  else print(report)
+} else {
+  // BLOCK UNTIL SOMETHING NEEDS A HUMAN. Exiting IS the alert: run this in the background and its
+  // completion is what pulls attention back, instead of attention having to be volunteered. Polling this
+  // by hand meant noticing a stalled agent whenever somebody thought to ask, which is not monitoring.
+  //
+  // It always terminates and says why. A watcher with no deadline is one nobody notices has died, and
+  // "nothing needed me for 90 minutes" is a real result rather than a failure.
+  const deadline = Date.now() + maxMinutes * 60_000
+  let ticks = 0
+  for (;;) {
+    const report = await scan()
+    const stuck = report.filter((r) => WAKE_STUCK.test(r.verdict))
+    // Work waiting to be integrated is the other reason worth interrupting for: it is mine to do, and
+    // leaving it unmerged is how four agents end up holding divergent branches over the same files.
+    const landed = report.filter((r) => r.dirty > 0 || /done: \d+ commit/.test(r.verdict))
+    const unmerged = landed.filter((r) => {
+      try {
+        return (
+          Number(
+            execFileSync('git', ['rev-list', '--count', `main..agent/${r.id}`], {
+              encoding: 'utf8',
+              stdio: ['ignore', 'pipe', 'ignore'],
+            }).trim()
+          ) > 0
+        )
+      } catch {
+        return false
+      }
+    })
+    if (stuck.length || unmerged.length) {
+      const why = [
+        stuck.length ? `${stuck.length} stuck` : null,
+        unmerged.length ? `${unmerged.length} with unmerged work (${unmerged.map((r) => r.title).join(', ')})` : null,
+      ]
+        .filter(Boolean)
+        .join(' · ')
+      console.log(`\nfleet-watch: ${why} — after ${ticks} quiet check(s)`)
+      print(report)
+      process.exit(0)
+    }
+    if (Date.now() >= deadline) {
+      console.log(`\nfleet-watch: ${maxMinutes}m elapsed, nothing needed attention (${ticks} checks).`)
+      print(report)
+      process.exit(0)
+    }
+    ticks += 1
+    await sleep(pollSeconds * 1000)
+  }
 }
