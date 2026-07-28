@@ -235,9 +235,11 @@ describe('New project pipeline', () => {
       'manager-session',
       expect.objectContaining({
         enabled: true,
+        permissionMode: 'safe',
         startingPrompt: expect.stringMatching(/Control room/i),
       }),
     )
+    expect(apiMock.setMode).not.toHaveBeenCalled()
     expect(onlaunched).toHaveBeenLastCalledWith(expect.objectContaining({
       project,
       failed: [expect.objectContaining({ agentId: 'project-manager' })],

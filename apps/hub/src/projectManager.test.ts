@@ -95,6 +95,63 @@ function transition(sessions: SessionManager, id: string, status: SessionStatus)
   ;(sessions as unknown as { setStatusById(id: string, status: SessionStatus): void }).setStatusById(id, status)
 }
 
+describe('project manager permission ceiling', () => {
+  it('keeps the operator-selected Safe mode when promoting a Full chat', () => {
+    const { sessions, journal, seed } = buildHub()
+    const manager = seed({ id: 'manager', permissionMode: 'full' })
+
+    sessions.configureProjectManager(
+      'manager',
+      {
+        enabled: true,
+        maxLiveChildren: 2,
+        allowedProfiles: ['p1'],
+        permissionMode: 'safe',
+      },
+      'operator',
+    )
+
+    expect(manager.permissionMode).toBe('safe')
+    expect(manager.managerPermissionModeCeiling).toBe('safe')
+    expect(sessions.list().find((record) => record.id === 'manager')?.permissionMode).toBe('safe')
+    const persisted = journal.db
+      .prepare('SELECT record FROM sessions WHERE id = ?')
+      .get('manager') as { record: string }
+    expect(JSON.parse(persisted.record)).toMatchObject({
+      permissionMode: 'safe',
+      managerPermissionModeCeiling: 'safe',
+    })
+    expect(
+      journal.recentEventsForSession('manager').filter((event) => event.kind === 'session/mode'),
+    ).toEqual([
+      expect.objectContaining({
+        payload: expect.objectContaining({ permissionMode: 'safe', source: 'manager/grant' }),
+      }),
+    ])
+  })
+
+  it('rejects the next raise above the grant and leaves parent and child modes unchanged', () => {
+    const { sessions, seed } = buildHub()
+    const manager = seed({ id: 'manager', permissionMode: 'full' })
+    sessions.configureProjectManager(
+      'manager',
+      {
+        enabled: true,
+        allowedProfiles: ['p1'],
+        permissionMode: 'safe',
+        maxChildPermissionMode: 'safe',
+      },
+      'operator',
+    )
+    const child = seed({ id: 'child', parentSessionId: 'manager', permissionMode: 'safe' })
+
+    expect(() => sessions.setMode('manager', 'full')).toThrow(/manager.*operator-granted ceiling/i)
+    expect(() => sessions.setMode('child', 'full')).toThrow(/parent manager.*operator-granted ceiling/i)
+    expect(manager.permissionMode).toBe('safe')
+    expect(child.permissionMode).toBe('safe')
+  })
+})
+
 describe('project manager lifecycle awareness', () => {
   it('pushes one report for each real start, idle, stop, and error transition', () => {
     const { sessions, seed } = buildHub()

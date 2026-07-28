@@ -150,10 +150,12 @@ describe('Manager setup', () => {
       'manager',
       expect.objectContaining({
         operatorTask: 'Coordinate the release now.',
+        permissionMode: 'edits',
         maxChildPermissionMode: 'full',
         standingInstructions: expect.stringMatching(/delegate.*AllMyAgents workers/is),
       }),
     )
+    expect(setMode).not.toHaveBeenCalled()
     expect(send).toHaveBeenCalledWith(
       'manager',
       expect.stringMatching(/list_agents.*child_status.*Coordinate the release now\./is),
