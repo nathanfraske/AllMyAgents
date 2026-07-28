@@ -64,6 +64,7 @@
   let attachments = $state<ComposerAttachment[]>([])
   let attachmentInput = $state<HTMLInputElement | null>(null)
   let draggingFiles = $state(false)
+  let paneDragDepth = 0
   let sending = $state(false)
 
   function stageFiles(files: Iterable<File>): void {
@@ -119,26 +120,83 @@
   }
 
   function hasDraggedFiles(e: DragEvent): boolean {
-    return Array.from(e.dataTransfer?.types ?? []).includes('Files')
+    return (
+      Array.from(e.dataTransfer?.types ?? []).includes('Files') ||
+      (e.dataTransfer?.files?.length ?? 0) > 0
+    )
   }
 
-  function onComposerDragOver(e: DragEvent): void {
-    if (!hasDraggedFiles(e)) return
+  function isDroppedPlainText(file: File): boolean {
+    return file.type === 'text/plain' || file.type === 'text/markdown' || /\.(txt|md|markdown)$/i.test(file.name)
+  }
+
+  async function stageDroppedFiles(files: Iterable<File>): Promise<void> {
+    const dropped = Array.from(files)
+    const plainText = dropped.filter(isDroppedPlainText)
+    const attachmentsToStage = dropped.filter((file) => !isDroppedPlainText(file))
+
+    // Images and documents use the picker/composer's one staging seam, including its validation and
+    // single current error. Explicit .txt/.md drops are the deliberate exception: like promoted pastes,
+    // they stay visible as a chip but travel in the provider-neutral TEXT payload, never the attachment
+    // path that has historically dropped non-image Codex input.
+    if (attachmentsToStage.length) stageFiles(attachmentsToStage)
+    else sendErr = ''
+
+    let currentError = sendErr
+    let nextPastes = [...pastes]
+    for (const file of plainText) {
+      const validationError = validateIncoming(file, attachments.length + nextPastes.length)
+      if (validationError) {
+        currentError = validationError
+        continue
+      }
+      try {
+        const content = await file.text()
+        nextPastes.push({
+          id: `drop:${crypto.randomUUID?.() ?? `${Date.now()}-${nextPastes.length}`}`,
+          name: file.name,
+          content,
+        })
+      } catch {
+        currentError = `Could not read “${file.name}” as text.`
+      }
+    }
+    pastes = nextPastes
+    sendErr = currentError
+  }
+
+  function onPaneDragEnter(e: DragEvent): void {
+    // Prevent the webview from treating any pane drop as a navigation, even when the payload is not a
+    // stageable file. File drags additionally turn on the pane-wide affordance.
     e.preventDefault()
-    e.stopPropagation()
+    if (!hasDraggedFiles(e)) return
+    paneDragDepth += 1
     draggingFiles = true
   }
 
-  function onComposerDragLeave(e: DragEvent): void {
-    if (e.currentTarget === e.target) draggingFiles = false
+  function onPaneDragOver(e: DragEvent): void {
+    e.preventDefault()
+    if (!hasDraggedFiles(e)) return
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+    draggingFiles = true
   }
 
-  function onComposerDrop(e: DragEvent): void {
-    if (!hasDraggedFiles(e)) return
+  function onPaneDragLeave(e: DragEvent): void {
     e.preventDefault()
-    e.stopPropagation()
+    if (!hasDraggedFiles(e)) return
+    paneDragDepth = Math.max(0, paneDragDepth - 1)
+    if (paneDragDepth === 0) draggingFiles = false
+  }
+
+  function onPaneDrop(e: DragEvent): void {
+    // This is the sole drop handler for the pane, including the composer. Keeping it above both targets
+    // makes a composer drop bubble exactly once instead of being staged by nested handlers.
+    e.preventDefault()
     draggingFiles = false
-    if (e.dataTransfer?.files) stageFiles(e.dataTransfer.files)
+    paneDragDepth = 0
+    if (hasDraggedFiles(e) && e.dataTransfer?.files) {
+      void stageDroppedFiles(e.dataTransfer.files)
+    }
   }
 
   // Large pastes promoted to chips (see pastePromote.ts). Content is held here and inlined into the
@@ -845,6 +903,19 @@
 {#if !view}
   <div class="empty dim">select a session, or press + to spawn one</div>
 {:else}
+  <div
+    class="chat-drop-target"
+    class:composer-only={composerOnly}
+    class:dragging-files={draggingFiles}
+    ondragenter={onPaneDragEnter}
+    ondragover={onPaneDragOver}
+    ondragleave={onPaneDragLeave}
+    ondrop={onPaneDrop}
+    role="presentation"
+  >
+  {#if draggingFiles}
+    <div class="pane-drop-feedback" role="status">Drop files to attach</div>
+  {/if}
   {#if !embedded && !composerOnly}
   <div class="head" class:reorderable={multiPane} title={multiPane ? 'Drag this header to rearrange the pane' : undefined}>
     <ProviderLogo provider={view.record.provider} size={16} />
@@ -1007,9 +1078,6 @@
     <div
       class="composer"
       class:dragging-files={draggingFiles}
-      ondragover={onComposerDragOver}
-      ondragleave={onComposerDragLeave}
-      ondrop={onComposerDrop}
       role="presentation"
     >
       {#if cmdOpen}
@@ -1136,10 +1204,26 @@
        {#if !composerOnly}<AgentPanel items={view.items} sessionId={view.record.id} provider={view.record.provider} />{/if}
     </div>
   </div>
+  </div>
 {/if}
 
 <style>
   .empty { display: grid; place-items: center; height: 100%; }
+  .chat-drop-target {
+    position: relative; flex: 1; display: flex; flex-direction: column;
+    width: 100%; min-width: 0; min-height: 0;
+  }
+  .chat-drop-target.composer-only { flex: none; min-height: auto; }
+  .chat-drop-target.dragging-files {
+    box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent) 70%, transparent);
+  }
+  .pane-drop-feedback {
+    position: absolute; inset: 0.55rem; z-index: 50; pointer-events: none;
+    display: grid; place-items: center; border: 2px dashed var(--accent); border-radius: 12px;
+    color: var(--text); background: color-mix(in srgb, var(--accent) 12%, var(--surface) 82%);
+    font-size: 0.86rem; font-weight: 600; letter-spacing: 0.01em;
+    box-shadow: var(--shadow-2);
+  }
   .head {
     display: flex; align-items: center; gap: 0.5rem; min-width: 0; padding: 0.45rem 0.75rem;
     border-bottom: 1px solid var(--border); container: thread-head / inline-size;
