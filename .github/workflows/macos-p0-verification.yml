@@ -113,7 +113,7 @@ jobs:
           done
           test -s /tmp/health-repaired.json
           LOG="$HOME/Library/Application Support/direct.cec.allmyagents/logs/desktop.log"
-          grep -F "persisted dependencies are broken; repairing once" "$LOG"
+          grep -F "persisted dependencies are broken; repair attempt 1/2" "$LOG"
           grep -F "hub dependencies installed and verified" "$LOG"
           test -s "$NATIVE"
           cat /tmp/health-repaired.json
