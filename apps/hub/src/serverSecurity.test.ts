@@ -186,6 +186,40 @@ describe('device-authenticated control plane', () => {
     await once(socket, 'close')
   })
 
+  it('sends a replay boundary after the backlog and before subsequently journaled events', async () => {
+    const { base, deviceToken, journal, record } = await build()
+    journal.append(record.id, 'test/replayed', { value: 'history' })
+    const messages: Array<Record<string, unknown>> = []
+    const socket = new WebSocket(`${base.replace('http:', 'ws:')}/ws?since=0`, {
+      headers: { authorization: `Bearer ${deviceToken}` },
+    })
+    try {
+      socket.on('message', (data) => messages.push(JSON.parse(String(data)) as Record<string, unknown>))
+      await once(socket, 'open')
+
+      await vi.waitFor(() => {
+        expect(messages.some((message) => message.type === 'replay-complete')).toBe(true)
+      })
+      journal.append(record.id, 'test/live', { value: 'now' })
+      await vi.waitFor(() => {
+        expect(messages.some((message) => message.kind === 'test/live')).toBe(true)
+      })
+
+      const replayIndex = messages.findIndex((message) => message.kind === 'test/replayed')
+      const startIndex = messages.findIndex((message) => message.type === 'replay-start')
+      const boundaryIndex = messages.findIndex((message) => message.type === 'replay-complete')
+      const liveIndex = messages.findIndex((message) => message.kind === 'test/live')
+      expect(startIndex).toBeGreaterThanOrEqual(0)
+      expect(replayIndex).toBeGreaterThan(startIndex)
+      expect(replayIndex).toBeGreaterThanOrEqual(0)
+      expect(boundaryIndex).toBeGreaterThan(replayIndex)
+      expect(liveIndex).toBeGreaterThan(boundaryIndex)
+      expect(messages[boundaryIndex]?.lastSeq).toBe(messages[replayIndex]?.seq)
+    } finally {
+      socket.terminate()
+    }
+  })
+
   it('keeps the independently authenticated agent bridge working without the device token', async () => {
     const { base } = await build()
     const response = await fetch(`${base}/internal/agent-tool`, {

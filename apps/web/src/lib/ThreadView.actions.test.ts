@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { render, fireEvent, cleanup, screen } from '@testing-library/svelte'
+import { render, fireEvent, cleanup, screen, waitFor } from '@testing-library/svelte'
 import ThreadView from './ThreadView.svelte'
 import { store, type SessionView } from './store.svelte'
 import type { SessionRecord } from './api'
@@ -64,6 +64,7 @@ beforeEach(() => {
   store.approvals = []
   store.usage = []
   store.selectedId = null
+  store.replayPresentationActive = false
 })
 afterEach(() => cleanup())
 
@@ -113,6 +114,49 @@ describe('session lifecycle buttons surface a failed write at the footer', () =>
     await fireEvent.click(screen.getByTitle('interrupt current turn'))
     await Promise.resolve()
     expect(screen.queryByText(/failed:/)).toBeNull()
+  })
+})
+
+describe('replay presentation', () => {
+  it('keeps an in-progress multi-frame rebuild hidden until the boundary state clears', async () => {
+    seed({ status: 'idle' })
+    store.replayPresentationActive = true
+    const rendered = render(ThreadView, { props: { sessionId: 's1' } })
+    expect(rendered.container.querySelector('.stream')?.classList.contains('replay-rebuild')).toBe(true)
+
+    store.replayPresentationActive = false
+    await waitFor(() => {
+      expect(rendered.container.querySelector('.stream')?.classList.contains('replay-rebuild')).toBe(false)
+    })
+  })
+
+  it('omits the enter-animation class from replayed items and keeps it on live items', () => {
+    seed({ status: 'idle' })
+    store.sessions.s1!.items = [
+      {
+        key: 'history',
+        kind: 'user',
+        ts: '2026-07-26T00:00:01.000Z',
+        text: 'replayed transcript item',
+        replayed: true,
+      },
+      {
+        key: 'live',
+        kind: 'assistant',
+        ts: '2026-07-26T00:00:02.000Z',
+        text: 'live transcript item',
+        replayed: false,
+      },
+    ]
+
+    render(ThreadView, { props: { sessionId: 's1' } })
+
+    expect(
+      screen.getByText('replayed transcript item').closest('.stream-node')?.classList.contains('animate-in')
+    ).toBe(false)
+    expect(
+      screen.getByText('live transcript item').closest('.stream-node')?.classList.contains('animate-in')
+    ).toBe(true)
   })
 })
 

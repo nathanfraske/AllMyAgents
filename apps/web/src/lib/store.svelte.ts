@@ -14,7 +14,7 @@ import { isChatBusy, nextOrderKey, orderChats, type ChatOrderFacts } from './cha
 import { extractCodexReasoning } from './codexGroup'
 import { attachmentsFromPayload, type AttachmentMeta } from './attachments'
 import type { AgentOutcome } from './agentTree'
-import type { ApprovalRecord, FleetSite, HistoryItem, HistoryPage, HubEvent, HubPrefs, ProfileInfo, ProjectInfo, ScanResult, SessionRecord, UsageSnapshot } from './api'
+import type { ApprovalRecord, FleetSite, HistoryItem, HistoryPage, HubEvent, HubPrefs, HubStreamMessage, ProfileInfo, ProjectInfo, ReplayComplete, ReplayStart, ScanResult, SessionRecord, UsageSnapshot } from './api'
 
 // Verbose client tracing — on in dev, compiled out of prod builds. Toggle off in dev by setting
 // localStorage['ama:verbose'] = '0'. Surfaces the load/connect/replay/scan milestones so a stall is
@@ -95,6 +95,11 @@ export interface ThreadItem {
   // True for a turn reconstructed from the vendor transcript on open (imported chats), vs a live/
   // journaled event. Drives condensed rendering + a "history" affordance; carries no precise ts.
   historical?: boolean
+  /**
+   * Presentation only: the item rebuilt state before the socket's replay-complete boundary, so it must
+   * not play the "new transcript item" enter animation. It remains a normal, fully rendered item.
+   */
+  replayed?: boolean
   // Inter-agent bus message (kind: 'bus'): whether this session sent or received it, the other
   // party's label, and an optional subject. `text` holds the message body.
   busDir?: 'sent' | 'received'
@@ -1372,15 +1377,18 @@ export class HubStore {
 
   private connect(): void {
     vlog('ws: connecting (replay from seq 0)')
+    this.beginReplayPresentation()
     const ws = new WebSocket(this.wsUrl(0))
     this.ws = ws
     ws.onopen = () => {
       vlog('ws: open')
       this.markConnected()
+      if (this.replayPresentationActive) this.scheduleReplayIdleFallback()
     }
-    ws.onmessage = (e) => this.ingest(JSON.parse(e.data as string) as HubEvent)
+    ws.onmessage = (e) => this.ingest(JSON.parse(e.data as string) as HubStreamMessage)
     ws.onclose = () => {
       vlog('ws: closed — reconnecting in 1.5s')
+      this.finishReplayPresentation()
       this.markDisconnected()
       setTimeout(() => this.reconnect(), 1500)
     }
@@ -1396,11 +1404,68 @@ export class HubStore {
    * one path that puts agent output on screen. If it is retried, it needs a real test around the flush,
    * not just a code read.
    */
-  private pendingEvents: HubEvent[] = []
+  private pendingEvents: HubStreamMessage[] = []
   private flushScheduled = false
+  /** True only while state is rebuilding before the socket's replay-complete boundary. */
+  replayPresentationActive = $state(false)
+  private applyingReplayedEvent = false
+  private replayIdleFallback: ReturnType<typeof setTimeout> | null = null
+  private replayHardFallback: ReturnType<typeof setTimeout> | null = null
 
-  private ingest(event: HubEvent): void {
-    this.pendingEvents.push(event)
+  /**
+   * Arm presentation-only replay mode for a new socket. Journal events still enter the ordinary FIFO
+   * and apply on the next frame; `push` merely stamps transcript items they create as replayed.
+   *
+   * Older hubs do not send the boundary. Resetting the short timer for each event lets their backlog
+   * rebuild silently, then returns future traffic to normal after the stream goes quiet. The hard cap
+   * guarantees a continuously busy legacy stream can never remain in replay mode forever.
+   */
+  private beginReplayPresentation(): void {
+    this.finishReplayPresentation()
+    this.replayPresentationActive = true
+    this.replayHardFallback = setTimeout(() => this.finishReplayPresentation(), 10_000)
+  }
+
+  private scheduleReplayIdleFallback(): void {
+    if (this.replayIdleFallback) clearTimeout(this.replayIdleFallback)
+    this.replayIdleFallback = setTimeout(() => this.finishReplayPresentation(), 500)
+  }
+
+  private finishReplayPresentation(): void {
+    this.replayPresentationActive = false
+    if (this.replayIdleFallback) clearTimeout(this.replayIdleFallback)
+    if (this.replayHardFallback) clearTimeout(this.replayHardFallback)
+    this.replayIdleFallback = null
+    this.replayHardFallback = null
+  }
+
+  private isReplayStart(message: HubStreamMessage): message is ReplayStart {
+    return 'type' in message && message.type === 'replay-start'
+  }
+
+  private isReplayComplete(message: HubStreamMessage): message is ReplayComplete {
+    return 'type' in message && message.type === 'replay-complete'
+  }
+
+  /**
+   * A new hub announces boundary support before replay. Once seen, a short legacy timeout must not
+   * interrupt a large valid backlog; WebSocket delivery is ordered/reliable, and socket close handles a
+   * broken connection. The long cap is only a final guard against a malformed hub that starts but never
+   * completes the protocol.
+   */
+  private confirmReplayProtocol(): void {
+    if (this.replayIdleFallback) clearTimeout(this.replayIdleFallback)
+    if (this.replayHardFallback) clearTimeout(this.replayHardFallback)
+    this.replayIdleFallback = null
+    this.replayPresentationActive = true
+    this.replayHardFallback = setTimeout(() => this.finishReplayPresentation(), 60_000)
+  }
+
+  private ingest(message: HubStreamMessage): void {
+    this.pendingEvents.push(message)
+    if (this.replayPresentationActive && !this.isReplayStart(message) && !this.isReplayComplete(message)) {
+      this.scheduleReplayIdleFallback()
+    }
     if (this.flushScheduled) return
     this.flushScheduled = true
     // MUST be a macrotask. queueMicrotask drains at the end of the SAME task that queued it, and every
@@ -1431,25 +1496,39 @@ export class HubStore {
     this.flushScheduled = false
     const batch = this.pendingEvents
     this.pendingEvents = []
-    for (const ev of batch) {
+    for (const message of batch) {
+      if (this.isReplayStart(message)) {
+        this.confirmReplayProtocol()
+        continue
+      }
+      if (this.isReplayComplete(message)) {
+        this.finishReplayPresentation()
+        continue
+      }
+      this.applyingReplayedEvent = this.replayPresentationActive
       try {
-        this.apply(ev)
+        this.apply(message)
       } catch (err) {
-        console.error('[store] failed to apply event', ev?.kind, ev?.seq, err)
+        console.error('[store] failed to apply event', message?.kind, message?.seq, err)
+      } finally {
+        this.applyingReplayedEvent = false
       }
     }
   }
 
   private reconnect(): void {
     vlog(`ws: reconnecting (replay from seq ${this.lastSeq})`)
+    this.beginReplayPresentation()
     const ws = new WebSocket(this.wsUrl(this.lastSeq))
     this.ws = ws
     ws.onopen = () => {
       vlog('ws: reopened')
       this.markConnected()
+      if (this.replayPresentationActive) this.scheduleReplayIdleFallback()
     }
-    ws.onmessage = (e) => this.ingest(JSON.parse(e.data as string) as HubEvent)
+    ws.onmessage = (e) => this.ingest(JSON.parse(e.data as string) as HubStreamMessage)
     ws.onclose = () => {
+      this.finishReplayPresentation()
       this.markDisconnected()
       setTimeout(() => this.reconnect(), 1500)
     }
@@ -1542,7 +1621,9 @@ export class HubStore {
         if (p.title) {
           view.record.title = p.title
           if (p.source === 'user' || p.source === 'auto') view.record.titleSource = p.source
-          this.markGlitch(sessionId) // auto-name-on-materialize or a rename → glitch the sidebar label
+          if (!this.applyingReplayedEvent) {
+            this.markGlitch(sessionId) // live auto-name-on-materialize or rename → glitch the sidebar
+          }
         }
         break
       }
@@ -2357,7 +2438,11 @@ export class HubStore {
   }
 
   private push(view: SessionView, item: Partial<ThreadItem> & { kind: ItemKind; ts: string }): ThreadItem {
-    const complete = { key: item.key ?? `i${view.items.length}:${item.ts}`, ...item } as ThreadItem
+    const complete = {
+      key: item.key ?? `i${view.items.length}:${item.ts}`,
+      replayed: item.replayed ?? this.applyingReplayedEvent,
+      ...item,
+    } as ThreadItem
     view.items.push(complete)
     return complete
   }
