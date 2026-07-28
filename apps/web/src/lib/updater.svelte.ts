@@ -47,6 +47,14 @@ export const updatesSupported = inTauri
 // to. Checking again (or a NEWER version appearing) still shows it.
 const DISMISS_KEY = 'allmyagents.updateDismissed'
 
+/**
+ * How often a running app re-checks for a release. Six hours is deliberately unhurried: releases are not
+ * frequent, the check is a network round trip the operator did not ask for, and a banner that appears
+ * within a few hours of a release is soon enough for an alpha. Short enough that an app left open all
+ * week still finds out; long enough that nobody notices it happening.
+ */
+const RECHECK_MS = 6 * 60 * 60 * 1000
+
 class UpdaterStore {
   /** Latest check result, or null if we've never successfully checked. */
   info = $state<UpdateInfo | null>(null)
@@ -56,6 +64,8 @@ class UpdaterStore {
   error = $state<string | null>(null)
   /** True once a check has completed at least once this session. */
   checked = $state(false)
+  /** Handle for the repeat check, so it can be stopped and cannot be started twice. */
+  private timer: ReturnType<typeof setInterval> | null = null
   /** The operator clicked "Later" on this session's banner. */
   dismissed = $state(false)
 
@@ -94,10 +104,40 @@ class UpdaterStore {
     }
   }
 
-  /** Check once on launch, honoring the operator's auto-check setting (default on). */
+  /**
+   * Check on launch AND keep checking, honoring the operator's auto-check setting (default on).
+   *
+   * WHY THE REPEAT IS NOT OPTIONAL FOR THIS APP. A launch-only check assumes the app is restarted often
+   * enough to notice a release. AllMyAgents is the opposite of that by design: it supervises long-running
+   * agents, survives its own hub restarts, and is meant to be left open for days. The operator's own
+   * install proved the consequence — it had been running 9.4 hours, 0.1.6 shipped during that window, and
+   * the app never learned it existed. From the inside that is indistinguishable from a broken updater.
+   *
+   * Nothing is downloaded or installed here; `check` is read-only and the operator still consents to the
+   * install. A dismissed version stays dismissed (bannerVisible compares against DISMISS_KEY), so the
+   * repeat surfaces a NEWER release rather than nagging about the one they already declined.
+   */
   async checkOnLaunch(): Promise<void> {
     if (!settings.autoCheckUpdates) return
     await this.check(true)
+    this.startPeriodicChecks()
+  }
+
+  /** Re-check on a slow cadence for as long as the app stays open. Idempotent: safe to call twice. */
+  startPeriodicChecks(): void {
+    if (!updatesSupported || this.timer !== null) return
+    this.timer = setInterval(() => {
+      // Re-read the setting each time rather than capturing it: turning auto-check off in Settings should
+      // stop the polling that is already running, not just prevent the next app launch from starting it.
+      if (!settings.autoCheckUpdates) return
+      void this.check(true)
+    }, RECHECK_MS)
+  }
+
+  stopPeriodicChecks(): void {
+    if (this.timer === null) return
+    clearInterval(this.timer)
+    this.timer = null
   }
 
   /**
