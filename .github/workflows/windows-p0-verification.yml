@@ -499,9 +499,17 @@ jobs:
                 Get-Process -Id $_ -ErrorAction SilentlyContinue
               }
             ).Count -eq 0
-            $installedVersion = (
-              [Diagnostics.FileVersionInfo]::GetVersionInfo($env:AMA_UPDATE_EXE)
-            ).ProductVersion
+            $installedVersion = ''
+            if (Test-Path $env:AMA_UPDATE_EXE) {
+              try {
+                $installedVersion = (
+                  [Diagnostics.FileVersionInfo]::GetVersionInfo($env:AMA_UPDATE_EXE)
+                ).ProductVersion
+              } catch {
+                # MSI has a normal remove/replace window. Keep polling instead of turning that transient
+                # absence into a false failure before the locked-file result is known.
+              }
+            }
             try {
               $newHealth = Invoke-RestMethod http://127.0.0.1:7777/api/health -TimeoutSec 2
             } catch {
@@ -524,9 +532,15 @@ jobs:
                 Get-Process -Id $_ -ErrorAction SilentlyContinue
               }
             )
-            $version = (
-              [Diagnostics.FileVersionInfo]::GetVersionInfo($env:AMA_UPDATE_EXE)
-            ).ProductVersion
+            $version = if (Test-Path $env:AMA_UPDATE_EXE) {
+              try {
+                ([Diagnostics.FileVersionInfo]::GetVersionInfo($env:AMA_UPDATE_EXE)).ProductVersion
+              } catch {
+                '(temporarily unreadable)'
+              }
+            } else {
+              '(missing)'
+            }
             if (Test-Path 'C:\Windows\Temp\ama-live-updater-msi.log') {
               Get-Content 'C:\Windows\Temp\ama-live-updater-msi.log' -Tail 120
             }
