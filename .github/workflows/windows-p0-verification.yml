@@ -1,0 +1,227 @@
+name: Windows P0 verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      break_hub_startup:
+        description: 'Deliberately corrupt the installed hub entry to prove this workflow goes red'
+        required: false
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - 'apps/desktop/**'
+      - 'apps/hub/src/index.ts'
+      - '.github/workflows/windows-p0-verification.yml'
+      - '.github/workflows/release.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  launch-and-repair:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'apps/desktop/src-tauri -> target'
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build the real MSI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # PowerShell strips quotes from inline native-command JSON. A config file preserves valid JSON.
+          '{"bundle":{"createUpdaterArtifacts":false}}' |
+            Set-Content -Path ci-nosign.json -Encoding utf8
+          pnpm --filter desktop exec tauri build --bundles msi --config (Resolve-Path ci-nosign.json).Path
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          Copy-Item apps\desktop\src-tauri\target\release\bundle\msi\*.msi artifacts\
+
+      - name: Install it the way a user does
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = (Get-ChildItem artifacts\*.msi | Select-Object -First 1).FullName
+          if (-not $msi) { throw 'the build produced no MSI' }
+          $install = Start-Process msiexec.exe `
+            -ArgumentList @('/i', "`"$msi`"", '/qn', '/l*v', "$env:RUNNER_TEMP\allmyagents-msi.log") `
+            -Wait -PassThru
+          if ($install.ExitCode -ne 0) {
+            Get-Content "$env:RUNNER_TEMP\allmyagents-msi.log" -Tail 80
+            throw "msiexec failed with $($install.ExitCode)"
+          }
+
+          $roots = @("$env:LOCALAPPDATA\Programs", "$env:ProgramFiles", "${env:ProgramFiles(x86)}") |
+            Where-Object { $_ -and (Test-Path $_) }
+          $exe = Get-ChildItem -Path $roots -Include 'allmyagents-desktop.exe','AllMyAgents.exe' `
+            -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { throw 'the MSI installed no AllMyAgents executable' }
+
+          $shortcutRoots = @(
+            "$env:APPDATA\Microsoft\Windows\Start Menu\Programs",
+            "$env:ProgramData\Microsoft\Windows\Start Menu\Programs"
+          )
+          $shortcut = Get-ChildItem -Path $shortcutRoots -Filter '*AllMyAgents*.lnk' `
+            -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $shortcut) { throw 'the MSI installed no AllMyAgents Start Menu shortcut' }
+
+          "AMA_INSTALLED_EXE=$($exe.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "AMA_SHORTCUT=$($shortcut.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "installed executable: $($exe.FullName)"
+          Write-Host "installed shortcut:   $($shortcut.FullName)"
+
+      - name: Optional deliberate startup break
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.break_hub_startup }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # This is a manual proof switch. A run with it enabled must fail at the health requirement.
+          $entry = Join-Path (Split-Path $env:AMA_INSTALLED_EXE -Parent) 'hub-runtime\apps\hub\dist\hubctl.js'
+          if (-not (Test-Path $entry)) { throw "cannot find installed hub entry at $entry" }
+          "throw new Error('intentional Windows P0 gate failure')" |
+            Set-Content -Path $entry -Encoding utf8
+          Write-Host "::warning::installed hub startup deliberately broken; the health step must go red"
+
+      - name: Launch through the installed shortcut and require a healthy hub
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # A Start Menu launch does not inherit setup-node's dev-shell PATH. Reconstruct the persistent
+          # machine/user environment, then ask Windows ShellExecute to open the installed .lnk.
+          $machinePath = [Environment]::GetEnvironmentVariable('PATH', 'Machine')
+          $userPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
+          $env:PATH = "$machinePath;$userPath"
+          Start-Process -FilePath $env:AMA_SHORTCUT
+
+          $healthy = $false
+          foreach ($attempt in 1..180) {
+            try {
+              Invoke-WebRequest http://127.0.0.1:7777/api/health -UseBasicParsing `
+                -TimeoutSec 2 -OutFile "$env:RUNNER_TEMP\health-first.json"
+              $healthy = $true
+              break
+            } catch {
+              Start-Sleep -Seconds 2
+            }
+          }
+          if (-not $healthy) { throw 'installed app never produced a healthy hub' }
+          Get-Content "$env:RUNNER_TEMP\health-first.json"
+
+          # Derive the hub root from the log the installed process really wrote. The second candidate
+          # handles packaged-app redirection if packaging ever changes; the test never blindly asserts
+          # against the unredirected path while the process wrote somewhere else.
+          $logCandidates = @("$env:LOCALAPPDATA\direct.cec.allmyagents\logs\desktop.log")
+          if (Test-Path "$env:LOCALAPPDATA\Packages") {
+            $logCandidates += Get-ChildItem "$env:LOCALAPPDATA\Packages" -Directory |
+              ForEach-Object {
+                Join-Path $_.FullName 'LocalCache\Local\direct.cec.allmyagents\logs\desktop.log'
+              }
+          }
+          $log = $logCandidates | Where-Object { Test-Path $_ } |
+            ForEach-Object { Get-Item $_ } | Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+          if (-not $log) { throw 'healthy installed app wrote no discoverable desktop.log' }
+          $localRoot = Split-Path (Split-Path $log.FullName -Parent) -Parent
+          $hub = Join-Path $localRoot 'hub\apps\hub'
+          if (-not (Test-Path $hub)) { throw "log-derived hub root does not exist: $hub" }
+
+          "AMA_DESKTOP_LOG=$($log.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "AMA_INSTALLED_HUB=$hub" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "desktop log: $($log.FullName)"
+          Write-Host "hub root:    $hub"
+          Copy-Item $log.FullName "$env:RUNNER_TEMP\desktop-first.log"
+
+      - name: Corrupt a marker-matching native tree
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $processName = [IO.Path]::GetFileNameWithoutExtension($env:AMA_INSTALLED_EXE)
+          Get-Process -Name $processName -ErrorAction SilentlyContinue |
+            ForEach-Object { & taskkill.exe /PID $_.Id /T /F | Out-Host }
+          foreach ($attempt in 1..30) {
+            try {
+              Invoke-WebRequest http://127.0.0.1:7777/api/health -UseBasicParsing -TimeoutSec 1 |
+                Out-Null
+              Start-Sleep -Seconds 1
+            } catch { break }
+          }
+
+          $marker = Join-Path $env:AMA_INSTALLED_HUB 'node_modules\.ama-deps-ok'
+          if (-not (Test-Path $marker)) { throw "ready marker missing at $marker" }
+          $native = Get-ChildItem (Join-Path $env:AMA_INSTALLED_HUB 'node_modules\better-sqlite3') `
+            -Filter '*.node' -Recurse | Select-Object -First 1
+          if (-not $native) { throw 'better-sqlite3 native module was not installed' }
+          [IO.File]::WriteAllBytes($native.FullName, [byte[]]@())
+          if ((Get-Item $native.FullName).Length -ne 0) { throw 'native module was not emptied' }
+          if (-not (Test-Path $marker)) { throw 'corruption unexpectedly removed the ready marker' }
+          "AMA_CORRUPTED_NATIVE=$($native.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "corrupted native module: $($native.FullName)"
+
+      - name: Relaunch through the shortcut and prove detection and repair
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $machinePath = [Environment]::GetEnvironmentVariable('PATH', 'Machine')
+          $userPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
+          $env:PATH = "$machinePath;$userPath"
+          Start-Process -FilePath $env:AMA_SHORTCUT
+
+          $healthy = $false
+          foreach ($attempt in 1..180) {
+            try {
+              Invoke-WebRequest http://127.0.0.1:7777/api/health -UseBasicParsing `
+                -TimeoutSec 2 -OutFile "$env:RUNNER_TEMP\health-repaired.json"
+              $healthy = $true
+              break
+            } catch {
+              Start-Sleep -Seconds 2
+            }
+          }
+          if (-not $healthy) { throw 'hub did not recover after native-module corruption' }
+
+          $logText = Get-Content $env:AMA_DESKTOP_LOG -Raw
+          if (-not $logText.Contains('persisted dependencies are broken; repair attempt 1/2')) {
+            throw 'desktop log does not show corruption detection'
+          }
+          if (-not $logText.Contains('hub dependencies installed and verified')) {
+            throw 'desktop log does not show successful dependency repair'
+          }
+          if ((Get-Item $env:AMA_CORRUPTED_NATIVE).Length -eq 0) {
+            throw 'repair left the native module empty'
+          }
+          Copy-Item $env:AMA_DESKTOP_LOG "$env:RUNNER_TEMP\desktop-repaired.log"
+          Get-Content "$env:RUNNER_TEMP\health-repaired.json"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-p0
+          path: |
+            ${{ runner.temp }}\allmyagents-msi.log
+            ${{ runner.temp }}\desktop-first.log
+            ${{ runner.temp }}\desktop-repaired.log
+            ${{ runner.temp }}\health-first.json
+            ${{ runner.temp }}\health-repaired.json
+          if-no-files-found: warn
+
+      - name: Cleanup
+        if: always()
+        shell: pwsh
+        run: |
+          $processName = if ($env:AMA_INSTALLED_EXE) {
+            [IO.Path]::GetFileNameWithoutExtension($env:AMA_INSTALLED_EXE)
+          }
+          if ($processName) {
+            Get-Process -Name $processName -ErrorAction SilentlyContinue |
+              ForEach-Object { & taskkill.exe /PID $_.Id /T /F | Out-Host }
+          }

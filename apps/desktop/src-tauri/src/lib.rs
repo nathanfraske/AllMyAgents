@@ -37,7 +37,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus};
+use std::process::{Child, Command, Output};
 #[cfg(target_os = "macos")]
 use std::process::Stdio;
 use std::io::{Read, Write};
@@ -45,6 +45,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 /// Where the desktop shell's diagnostics land, once `init_log` has run.
@@ -487,6 +488,170 @@ fn deps_marker_want(app: &AppHandle, manifest: &str) -> String {
     )
 }
 
+const MAX_REPAIR_ATTEMPTS: u8 = 2;
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct RepairState {
+    fingerprint: String,
+    attempts: u8,
+}
+
+impl RepairState {
+    fn record_attempt(&mut self, fingerprint: &str) {
+        if self.fingerprint != fingerprint {
+            self.fingerprint = fingerprint.to_string();
+            self.attempts = 0;
+        }
+        self.attempts = self.attempts.saturating_add(1);
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum RepairDecision {
+    Allowed,
+    Blocked,
+}
+
+fn repair_decision(state: &RepairState, fingerprint: &str) -> RepairDecision {
+    if state.fingerprint == fingerprint && state.attempts >= MAX_REPAIR_ATTEMPTS {
+        RepairDecision::Blocked
+    } else {
+        RepairDecision::Allowed
+    }
+}
+
+fn repair_fingerprint(want: &str) -> String {
+    format!("{:x}", Sha256::digest(want.as_bytes()))
+}
+
+fn repair_state_path(dest_hub: &Path) -> PathBuf {
+    dest_hub.join(".ama-dependency-repair")
+}
+
+fn read_repair_state(dest_hub: &Path) -> RepairState {
+    let Ok(text) = fs::read_to_string(repair_state_path(dest_hub)) else {
+        return RepairState::default();
+    };
+    let mut lines = text.lines();
+    let fingerprint = lines.next().unwrap_or_default().to_string();
+    let attempts = lines.next().and_then(|v| v.parse::<u8>().ok()).unwrap_or_default();
+    RepairState {
+        fingerprint,
+        attempts,
+    }
+}
+
+fn write_repair_state(dest_hub: &Path, state: &RepairState) -> std::io::Result<()> {
+    let path = repair_state_path(dest_hub);
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)?;
+    write!(file, "{}\n{}\n", state.fingerprint, state.attempts)?;
+    file.sync_all()
+}
+
+fn clear_repair_state(dest_hub: &Path) {
+    if let Err(error) = fs::remove_file(repair_state_path(dest_hub)) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            logln(&format!(
+                "[desktop] could not clear dependency repair state: {error}"
+            ));
+        }
+    }
+}
+
+fn redact_url_credentials(line: &str) -> String {
+    let mut redacted = line.to_string();
+    let mut search_from = 0;
+    while let Some(scheme_offset) = redacted[search_from..].find("://") {
+        let authority_start = search_from + scheme_offset + 3;
+        let authority_end = redacted[authority_start..]
+            .find(['/', '\\', '?', '#', ' ', '\t'])
+            .map(|offset| authority_start + offset)
+            .unwrap_or(redacted.len());
+        let Some(at_offset) = redacted[authority_start..authority_end].find('@') else {
+            search_from = authority_end;
+            continue;
+        };
+        let at = authority_start + at_offset;
+        redacted.replace_range(authority_start..at, "[redacted]");
+        search_from = authority_start + "[redacted]@".len();
+    }
+    redacted
+}
+
+fn sanitize_npm_diagnostic(diagnostic: &str) -> String {
+    diagnostic
+        .lines()
+        .map(|line| {
+            let lower = line.to_ascii_lowercase();
+            if lower.contains("_authtoken") || lower.contains("_auth=") {
+                "[redacted npm credential line]".to_string()
+            } else {
+                redact_url_credentials(line)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn npm_diagnostic(output: &Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = sanitize_npm_diagnostic(&format!("{}\n{}", stdout.trim(), stderr.trim()));
+    combined
+        .chars()
+        .rev()
+        .take(8_000)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect()
+}
+
+fn npm_reported_network_failure(diagnostic: &str) -> bool {
+    let diagnostic = diagnostic.to_ascii_lowercase();
+    [
+        "code enetwork",
+        "code eai_again",
+        "code enotfound",
+        "code etimedout",
+        "code enetunreach",
+        "code esockettimedout",
+        "code econnreset",
+        "code econnrefused",
+        "code econnaborted",
+        "network request to",
+        "network timeout at",
+    ]
+    .iter()
+    .any(|needle| diagnostic.contains(needle))
+}
+
+fn npm_install_failure_message(code: i32, diagnostic: &str, log: &Path) -> String {
+    if npm_reported_network_failure(diagnostic) {
+        format!(
+            "AllMyAgents could not download its hub dependencies because npm reported a network failure (exit {code}). Check your internet connection, firewall, or npm registry access, then reopen the app. Full details are in {}.",
+            log.display()
+        )
+    } else {
+        format!(
+            "AllMyAgents could not install its hub dependencies (npm exit {code}). This was not identified as a network failure. See the actual npm error in {}.",
+            log.display()
+        )
+    }
+}
+
+fn repair_blocked_message(hub_home: &Path, log: &Path) -> String {
+    format!(
+        "Automatic dependency repair failed twice and is now paused, so AllMyAgents will not reinstall on every launch. See the failure details in {}. To retry deliberately, close AllMyAgents and rename or remove the regenerable hub directory at {}, then reopen the app. Your chats, projects, worktrees, and profiles are stored separately and are not removed.",
+        log.display(),
+        hub_home.display()
+    )
+}
+
 /// Cheap pre-check (run on the main thread) so we only pop the setup window when a
 /// first-run (or post-update) `npm install` is actually needed.
 fn release_needs_install(app: &AppHandle) -> bool {
@@ -507,13 +672,13 @@ fn run_npm_install(
     npm_cli: &Path,
     node_dir: &Path,
     dest_hub: &Path,
-) -> std::io::Result<ExitStatus> {
+) -> std::io::Result<Output> {
     Command::new(node_cmd)
         .arg(plain(npm_cli))
         .args(["install", "--omit=dev", "--no-audit", "--no-fund", "--loglevel=error"])
         .current_dir(plain(dest_hub))
         .env("PATH", prepend_path(&[node_dir.to_path_buf()]))
-        .status()
+        .output()
 }
 
 /// Load the hub's own production entry with the bundled Node. Verification mode stops before touching
@@ -643,7 +808,7 @@ fn splash_error(splash: &Option<WebviewWindow>, msg: &str) {
         let js = format!(
             "document.body.setAttribute('data-state','error');\
              var m=document.getElementById('msg');if(m)m.textContent={msg:?};\
-             var s=document.getElementById('sub');if(s)s.textContent='Close this window, then reopen AllMyAgents once you are online.';"
+             var s=document.getElementById('sub');if(s)s.textContent='Note the message above, fix the reported problem, then reopen AllMyAgents.';"
         );
         let _ = w.eval(&js);
     }
@@ -702,7 +867,11 @@ fn release_boot(
     let (payload_hub, node_dir, home) = match (payload_hub_dir(&app), bundled_node_dir(&app), hub_home(&app)) {
         (Some(a), Some(b), Some(c)) => (a, b, c),
         _ => {
-            splash_error(&splash, "Could not resolve the app's resource or data directory.");
+            boot_error(
+                &app,
+                &splash,
+                "Could not resolve the app's resource or data directory.",
+            );
             return;
         }
     };
@@ -713,7 +882,11 @@ fn release_boot(
 
     let dest_hub = home.join("apps").join("hub");
     if let Err(e) = fs::create_dir_all(&dest_hub) {
-        splash_error(&splash, &format!("Could not create the data directory: {e}"));
+        boot_error(
+            &app,
+            &splash,
+            &format!("Could not create the data directory: {e}"),
+        );
         return;
     }
 
@@ -721,11 +894,15 @@ fn release_boot(
     // hub — and the node_modules the install creates next to it — live together.
     let _ = fs::remove_dir_all(dest_hub.join("dist"));
     if let Err(e) = copy_dir(&payload_hub.join("dist"), &dest_hub.join("dist")) {
-        splash_error(&splash, &format!("Could not stage the hub: {e}"));
+        boot_error(&app, &splash, &format!("Could not stage the hub: {e}"));
         return;
     }
     if let Err(e) = fs::copy(payload_hub.join("package.json"), dest_hub.join("package.json")) {
-        splash_error(&splash, &format!("Could not stage the hub manifest: {e}"));
+        boot_error(
+            &app,
+            &splash,
+            &format!("Could not stage the hub manifest: {e}"),
+        );
         return;
     }
     // THE LOCKFILE HAS TO TRAVEL WITH THE MANIFEST, or pinning the manifest is cosmetic.
@@ -755,66 +932,214 @@ fn release_boot(
     let marker = deps_marker(&dest_hub);
     let have = fs::read_to_string(&marker).unwrap_or_default();
     if manifest.is_empty() {
-        splash_error(&splash, "The shipped hub manifest is missing or empty.");
+        boot_error(
+            &app,
+            &splash,
+            "The shipped hub manifest is missing or empty.",
+        );
         return;
     }
 
+    let log = log_path(&app).unwrap_or_else(|| PathBuf::from("(no log path available)"));
+    let fingerprint = repair_fingerprint(&want);
+    let mut repair_state = read_repair_state(&dest_hub);
     let mut install_needed = have != want;
+    let mut repair_mode = false;
     if !install_needed {
         match verify_hub_dependencies(&node_cmd, &node_dir, &dest_hub) {
-            Ok(()) => logln("[desktop] persisted hub dependencies verified"),
+            Ok(()) => {
+                logln("[desktop] persisted hub dependencies verified");
+                clear_repair_state(&dest_hub);
+            }
             Err(e) => {
-                logln(&format!("[desktop] persisted dependencies are broken; repairing once: {e}"));
+                if repair_decision(&repair_state, &fingerprint) == RepairDecision::Blocked {
+                    boot_error(
+                        &app,
+                        &splash,
+                        &repair_blocked_message(&home, &log),
+                    );
+                    return;
+                }
+                repair_state.record_attempt(&fingerprint);
+                if let Err(state_error) = write_repair_state(&dest_hub, &repair_state) {
+                    boot_error(
+                        &app,
+                        &splash,
+                        &format!(
+                            "AllMyAgents found broken hub dependencies but could not safely record the repair limit ({state_error}). No repair was attempted. See {}.",
+                            log.display()
+                        ),
+                    );
+                    return;
+                }
+                logln(&format!(
+                    "[desktop] persisted dependencies are broken; repair attempt {}/{}: {e}",
+                    repair_state.attempts, MAX_REPAIR_ATTEMPTS
+                ));
                 install_needed = true;
+                repair_mode = true;
                 let _ = fs::remove_file(&marker);
                 if let Err(remove_error) = fs::remove_dir_all(dest_hub.join("node_modules")) {
                     if remove_error.kind() != std::io::ErrorKind::NotFound {
-                        splash_error(&splash, &format!("Could not clear broken hub dependencies: {remove_error}"));
+                        boot_error(
+                            &app,
+                            &splash,
+                            &format!(
+                                "Could not clear broken hub dependencies: {remove_error}. See {}.",
+                                log.display()
+                            ),
+                        );
                         return;
                     }
                 }
             }
         }
-    }
-    if install_needed {
-        logln("[desktop] installing hub dependencies via bundled npm…");
-        match run_npm_install(&node_cmd, &npm_cli, &node_dir, &dest_hub) {
-            Ok(s) if s.success() => {}
-            Ok(s) => {
-                splash_error(&splash, &format!("Could not install the hub's dependencies (npm exited {}). See {}.", s.code().unwrap_or(-1), log_path(&app).map(|p| p.display().to_string()).unwrap_or_else(|| "(no log)".into())));
+    } else if repair_state.fingerprint == fingerprint && repair_state.attempts > 0 {
+        // A prior repair died after its marker was removed. It is still a repair on the next launch;
+        // treating it as a fresh install here is the loop that used to reinstall forever.
+        if repair_decision(&repair_state, &fingerprint) == RepairDecision::Blocked {
+            boot_error(
+                &app,
+                &splash,
+                &repair_blocked_message(&home, &log),
+            );
+            return;
+        }
+        repair_state.record_attempt(&fingerprint);
+        if let Err(state_error) = write_repair_state(&dest_hub, &repair_state) {
+            boot_error(
+                &app,
+                &splash,
+                &format!(
+                    "AllMyAgents could not safely record the repair limit ({state_error}). No repair was attempted. See {}.",
+                    log.display()
+                ),
+            );
+            return;
+        }
+        repair_mode = true;
+        let _ = fs::remove_file(&marker);
+        if let Err(remove_error) = fs::remove_dir_all(dest_hub.join("node_modules")) {
+            if remove_error.kind() != std::io::ErrorKind::NotFound {
+                boot_error(
+                    &app,
+                    &splash,
+                    &format!(
+                        "Could not clear broken hub dependencies: {remove_error}. See {}.",
+                        log.display()
+                    ),
+                );
                 return;
             }
-            Err(e) => {
-                splash_error(&splash, &format!("Could not run the bundled npm: {e}"));
+        }
+    }
+    if install_needed {
+        loop {
+            if repair_mode {
+                logln(&format!(
+                    "[desktop] installing clean hub dependencies (repair attempt {}/{MAX_REPAIR_ATTEMPTS}) via bundled npm",
+                    repair_state.attempts
+                ));
+            } else {
+                logln("[desktop] installing hub dependencies via bundled npm");
+            }
+
+            let output = match run_npm_install(&node_cmd, &npm_cli, &node_dir, &dest_hub) {
+                Ok(output) => output,
+                Err(e) => {
+                    boot_error(
+                        &app,
+                        &splash,
+                        &format!("Could not run the bundled npm: {e}. See {}.", log.display()),
+                    );
+                    return;
+                }
+            };
+            if !output.status.success() {
+                let diagnostic = npm_diagnostic(&output);
+                logln(&format!(
+                    "[desktop] npm install failed ({}):\n{}",
+                    output.status, diagnostic
+                ));
+                let message = if repair_mode
+                    && repair_decision(&repair_state, &fingerprint) == RepairDecision::Blocked
+                {
+                    repair_blocked_message(&home, &log)
+                } else {
+                    npm_install_failure_message(
+                        output.status.code().unwrap_or(-1),
+                        &diagnostic,
+                        &log,
+                    )
+                };
+                boot_error(&app, &splash, &message);
                 return;
+            }
+
+            match verify_hub_dependencies(&node_cmd, &node_dir, &dest_hub) {
+                Ok(()) => break,
+                Err(verify_error) => {
+                    logln(&format!(
+                        "[desktop] installed tree failed verification: {verify_error}"
+                    ));
+                    if repair_decision(&repair_state, &fingerprint)
+                        == RepairDecision::Blocked
+                    {
+                        boot_error(
+                            &app,
+                            &splash,
+                            &repair_blocked_message(&home, &log),
+                        );
+                        return;
+                    }
+
+                    repair_state.record_attempt(&fingerprint);
+                    if let Err(state_error) = write_repair_state(&dest_hub, &repair_state) {
+                        boot_error(
+                            &app,
+                            &splash,
+                            &format!(
+                                "The installed dependencies failed verification, but AllMyAgents could not safely record the repair limit ({state_error}). No repair was attempted. See {}.",
+                                log.display()
+                            ),
+                        );
+                        return;
+                    }
+                    repair_mode = true;
+                    logln(&format!(
+                        "[desktop] clean reinstall scheduled (repair attempt {}/{MAX_REPAIR_ATTEMPTS})",
+                        repair_state.attempts
+                    ));
+                    let _ = fs::remove_file(&marker);
+                    if let Err(remove_error) =
+                        fs::remove_dir_all(dest_hub.join("node_modules"))
+                    {
+                        if remove_error.kind() != std::io::ErrorKind::NotFound {
+                            boot_error(
+                                &app,
+                                &splash,
+                                &format!(
+                                    "Could not clear the failed dependency tree: {remove_error}. See {}.",
+                                    log.display()
+                                ),
+                            );
+                            return;
+                        }
+                    }
+                }
             }
         }
 
-        if let Err(first_error) = verify_hub_dependencies(&node_cmd, &node_dir, &dest_hub) {
-            logln(&format!("[desktop] installed tree failed verification; clean reinstalling once: {first_error}"));
-            let _ = fs::remove_file(&marker);
-            if let Err(e) = fs::remove_dir_all(dest_hub.join("node_modules")) {
-                splash_error(&splash, &format!("Could not clear the failed dependency tree: {e}"));
-                return;
-            }
-            match run_npm_install(&node_cmd, &npm_cli, &node_dir, &dest_hub) {
-                Ok(s) if s.success() => {}
-                Ok(s) => {
-                    splash_error(&splash, &format!("The clean dependency reinstall failed (npm exited {}). See {}.", s.code().unwrap_or(-1), log_path(&app).map(|p| p.display().to_string()).unwrap_or_else(|| "(no log)".into())));
-                    return;
-                }
-                Err(e) => {
-                    splash_error(&splash, &format!("Could not run the clean dependency reinstall: {e}"));
-                    return;
-                }
-            }
-            if let Err(e) = verify_hub_dependencies(&node_cmd, &node_dir, &dest_hub) {
-                splash_error(&splash, &format!("Hub dependencies are still unusable after a clean reinstall. See {}. Verification said: {e}", log_path(&app).map(|p| p.display().to_string()).unwrap_or_else(|| "(no log)".into())));
-                return;
-            }
-        }
+        clear_repair_state(&dest_hub);
         if let Err(e) = fs::write(&marker, &want) {
-            splash_error(&splash, &format!("Dependencies verified, but readiness could not be recorded: {e}"));
+            boot_error(
+                &app,
+                &splash,
+                &format!(
+                    "Dependencies verified, but readiness could not be recorded: {e}. See {}.",
+                    log.display()
+                ),
+            );
             return;
         }
         logln("[desktop] hub dependencies installed and verified");
@@ -825,7 +1150,11 @@ fn release_boot(
     let (hub_data_dir, hub_profiles_dir) = match materialize_app_data(&app) {
         Ok(pair) => pair,
         Err(e) => {
-            splash_error(&splash, &format!("Could not create the app-data directory: {e}"));
+            boot_error(
+                &app,
+                &splash,
+                &format!("Could not create the app-data directory: {e}"),
+            );
             return;
         }
     };
@@ -865,7 +1194,7 @@ fn release_boot(
             }
         }
         Err(e) => {
-            splash_error(&splash, &format!("Could not start the hub: {e}"));
+            boot_error(&app, &splash, &format!("Could not start the hub: {e}"));
             return;
         }
     }
@@ -1191,4 +1520,96 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod dependency_repair_tests {
+    use super::*;
+
+    #[test]
+    fn two_failed_repairs_block_another_install_and_name_recovery_paths() {
+        let mut state = RepairState::default();
+        state.record_attempt("manifest-a");
+        state.record_attempt("manifest-a");
+
+        assert_eq!(
+            repair_decision(&state, "manifest-a"),
+            RepairDecision::Blocked
+        );
+
+        let message = repair_blocked_message(
+            Path::new(r"C:\Users\tester\AppData\Local\direct.cec.allmyagents\hub"),
+            Path::new(r"C:\Users\tester\AppData\Local\direct.cec.allmyagents\logs\desktop.log"),
+        );
+        assert!(message.contains("failed twice"));
+        assert!(message.contains("desktop.log"));
+        assert!(message.contains(r"direct.cec.allmyagents\hub"));
+    }
+
+    #[test]
+    fn npm_errors_only_blame_the_network_when_the_diagnostic_supports_it() {
+        let log = Path::new(r"C:\Users\tester\AppData\Local\direct.cec.allmyagents\logs\desktop.log");
+        let offline = npm_install_failure_message(
+            1,
+            "npm error code ENETWORK\nnpm error network request failed",
+            log,
+        );
+        assert!(offline.to_ascii_lowercase().contains("internet"));
+        assert!(offline.contains("desktop.log"));
+
+        let path_bug = npm_install_failure_message(
+            1,
+            "Error: EISDIR: illegal operation on a directory, lstat 'C:'",
+            log,
+        );
+        assert!(!path_bug.to_ascii_lowercase().contains("internet"));
+        assert!(path_bug.contains("not identified as a network failure"));
+        assert!(path_bug.contains("desktop.log"));
+    }
+
+    #[test]
+    fn npm_diagnostics_written_to_desktop_log_redact_credentials() {
+        let diagnostic = sanitize_npm_diagnostic(
+            "npm error fetch https://build-user:secret@registry.example.test/pkg\n//registry.example.test/:_authToken=also-secret",
+        );
+        assert!(diagnostic.contains("https://[redacted]@registry.example.test/pkg"));
+        assert!(diagnostic.contains("[redacted npm credential line]"));
+        assert!(!diagnostic.contains("secret"));
+        assert!(!diagnostic.contains("build-user"));
+    }
+
+    #[test]
+    fn repair_guard_is_scoped_to_the_broken_payload() {
+        let mut state = RepairState::default();
+        state.record_attempt("manifest-a");
+        state.record_attempt("manifest-a");
+        assert_eq!(
+            repair_decision(&state, "manifest-a"),
+            RepairDecision::Blocked
+        );
+        assert_eq!(
+            repair_decision(&state, "manifest-b"),
+            RepairDecision::Allowed
+        );
+    }
+
+    #[test]
+    fn repair_attempts_survive_a_process_restart() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "allmyagents-repair-state-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create isolated repair-state fixture");
+
+        let mut state = RepairState::default();
+        state.record_attempt("manifest-a");
+        write_repair_state(&root, &state).expect("persist repair state");
+
+        assert_eq!(read_repair_state(&root), state);
+        fs::remove_dir_all(&root).expect("remove isolated repair-state fixture");
+    }
 }
