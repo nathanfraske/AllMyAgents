@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 
 export type WorktreeInspection =
@@ -109,6 +110,49 @@ export class WorkspaceManager {
     const resolved = path.resolve(target)
     if (path.dirname(resolved) !== root) throw new Error(`not an app-managed project path: ${target}`)
     fs.rmSync(resolved, { recursive: true, force: true })
+  }
+
+  /**
+   * The destructive half of project deletion. Callers must obtain an explicit operator confirmation
+   * before reaching this method. Worktrees are unregistered first while their repository still exists;
+   * the project directory is removed last.
+   */
+  removeProjectFiles(
+    projectPath: string,
+    projectWorktrees: ReadonlyArray<{ repo?: string; worktree: string }>,
+  ): void {
+    const resolvedProject = path.resolve(projectPath)
+    const filesystemRoot = path.parse(resolvedProject).root
+    const forbidden = [
+      filesystemRoot,
+      path.resolve(os.homedir()),
+      path.resolve(this.managedRoot()),
+      path.resolve(this.worktreesRoot),
+      path.resolve(this.scratchRoot),
+      path.resolve(this.namedProjectsRoot),
+    ]
+    if (forbidden.some((candidate) => this.samePath(candidate, resolvedProject))) {
+      throw new Error(`refusing to delete a broad application or filesystem root: ${resolvedProject}`)
+    }
+
+    for (const item of projectWorktrees) {
+      const resolvedWorktree = path.resolve(item.worktree)
+      if (!this.samePath(path.dirname(resolvedWorktree), this.worktreesRoot)) {
+        throw new Error(`refusing to delete a worktree outside the managed worktree root: ${resolvedWorktree}`)
+      }
+      if (!fs.existsSync(resolvedWorktree)) continue
+      if (item.repo && fs.existsSync(item.repo)) {
+        try {
+          this.git(item.repo, ['worktree', 'remove', '--force', resolvedWorktree])
+          continue
+        } catch {
+          // The checkout may already be unregistered. Removing the exact recorded worktree remains
+          // within the explicitly-confirmed project scope.
+        }
+      }
+      fs.rmSync(resolvedWorktree, { recursive: true, force: true })
+    }
+    fs.rmSync(resolvedProject, { recursive: true, force: true })
   }
 
   isRepo(repo: string): boolean {

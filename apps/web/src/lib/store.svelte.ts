@@ -1259,6 +1259,31 @@ export class HubStore {
     return out
   }
 
+  async deleteProject(
+    id: string,
+    deleteFiles = false,
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    try {
+      const out = await api.deleteProject(id, deleteFiles)
+      if (out?.ok !== true) {
+        return { ok: false, error: out?.error?.trim() || 'the hub did not confirm deletion' }
+      }
+      for (const sessionId of out.detachedSessionIds ?? []) {
+        const view = this.sessions[sessionId]
+        if (view) view.record.projectId = undefined
+      }
+      for (const sessionId of out.deletedSessionIds ?? []) this.removeSessionLocal(sessionId)
+      this.projects = this.projects.filter((project) => project.id !== id)
+      if (this.projectViewId === id) this.goHome()
+      return { ok: true }
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : 'the hub could not be reached',
+      }
+    }
+  }
+
   // Rename a chat optimistically (freezes auto-naming). The canonical session/titled echo re-applies
   // the same value — a visual no-op — so no suppress bookkeeping is needed; only rollback on error.
   renameSession(id: string, title: string): void {
@@ -1573,6 +1598,14 @@ export class HubStore {
         profile.authError = auth.message
       }
     }
+    if (kind === 'project/deleted') {
+      const id = (payload as { id?: string }).id
+      if (id) {
+        this.projects = this.projects.filter((project) => project.id !== id)
+        if (this.projectViewId === id) this.goHome()
+      }
+      return
+    }
     if (!sessionId) return
 
     if (kind === 'session/created') {
@@ -1781,6 +1814,9 @@ export class HubStore {
         if (p.serviceTier !== undefined) view.record.serviceTier = p.serviceTier ?? undefined
         break
       }
+      case 'session/project-detached':
+        view.record.projectId = undefined
+        break
       case 'session/error':
         this.push(view, { kind: 'error', ts, text: (payload as { message: string }).message })
         // Also invalidate the last-turn verdict. Without this, a session-level failure left an EARLIER

@@ -692,6 +692,26 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, { valid: true, name, path: projectPath })
         return
       }
+      const deletionMatch = /^\/api\/projects\/([^/]+)\/deletion$/.exec(url.pathname)
+      if (method === 'GET' && deletionMatch) {
+        const projectId = decodeURIComponent(deletionMatch[1] as string)
+        const inspection = sessions.inspectProjectDeletion(projectId)
+        if (!inspection) {
+          json(res, { error: `unknown project: ${projectId}` }, 404)
+          return
+        }
+        json(res, inspection)
+        return
+      }
+      const deleteProjectMatch = /^\/api\/projects\/([^/]+)$/.exec(url.pathname)
+      if (method === 'DELETE' && deleteProjectMatch) {
+        const projectId = decodeURIComponent(deleteProjectMatch[1] as string)
+        const result = await sessions.deleteProject(projectId, {
+          deleteFiles: url.searchParams.get('deleteFiles') === 'true',
+        })
+        json(res, result, result.ok ? 200 : 409)
+        return
+      }
       const activityMatch = /^\/api\/projects\/([^/]+)\/activity$/.exec(url.pathname)
       if (method === 'GET' && activityMatch) {
         const projectId = decodeURIComponent(activityMatch[1] as string)

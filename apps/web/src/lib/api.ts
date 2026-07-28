@@ -41,6 +41,44 @@ export interface ProjectDraftValidation {
   path: string
 }
 
+export interface ProjectDeletionInspection {
+  projectId: string
+  projectPath: string
+  sessions: Array<{
+    id: string
+    title: string
+    status: string
+    cwd: string
+  }>
+  changes: Array<{
+    kind: 'uncommitted' | 'untracked'
+    path: string
+    checkoutPath: string
+    sessionId?: string
+  }>
+  localCommits: Array<{
+    hash: string
+    subject: string
+    checkoutPath: string
+    sessionId?: string
+  }>
+  worktrees: Array<{
+    sessionId: string
+    title: string
+    path: string
+    branch?: string
+    status: string
+  }>
+  inspectionErrors: Array<{ path: string; message: string }>
+}
+
+export interface ProjectDeletionResult {
+  ok?: boolean
+  error?: string
+  detachedSessionIds?: string[]
+  deletedSessionIds?: string[]
+}
+
 export type WorktreeChangeKind = 'uncommitted' | 'committed' | 'both'
 
 export interface WorktreeProjectActivity {
@@ -628,6 +666,12 @@ export const api = {
   projects: () => jget<ProjectInfo[]>('/api/projects'),
   projectActivity: (projectId: string) =>
     jget<WorktreeProjectActivity>(`/api/projects/${encodeURIComponent(projectId)}/activity`),
+  inspectProjectDeletion: (projectId: string) =>
+    jget<ProjectDeletionInspection>(`/api/projects/${encodeURIComponent(projectId)}/deletion`),
+  deleteProject: (projectId: string, deleteFiles = false) =>
+    jdelete<ProjectDeletionResult>(
+      `/api/projects/${encodeURIComponent(projectId)}${deleteFiles ? '?deleteFiles=true' : ''}`,
+    ),
   validateProject: (name: string, path: string) =>
     jpost<ProjectDraftValidation | { error: string }>('/api/projects/validate', { name, path }),
   createProject: (name: string, path: string) =>
