@@ -154,6 +154,52 @@
     return files
   })
 
+  interface CollisionGroup {
+    file: string
+    sessionIds: string[]
+  }
+
+  function riskPathKey(file: string): string {
+    return file.replaceAll('\\', '/').toLocaleLowerCase()
+  }
+
+  function isTestPath(file: string): boolean {
+    const normalized = riskPathKey(file)
+    return (
+      /(?:^|\/)(?:test|tests|__tests__|fixtures?)(?:\/|$)/.test(normalized) ||
+      /\.(?:test|spec)\.[^/]+$/.test(normalized)
+    )
+  }
+
+  const collisionGroups = $derived.by(() => {
+    const byFile = new Map<string, CollisionGroup>()
+    for (const risk of activity?.risks ?? []) {
+      if (risk.risk !== 'concurrent-write') continue
+      const key = riskPathKey(risk.file)
+      const group = byFile.get(key) ?? { file: risk.file, sessionIds: [] }
+      group.sessionIds = [...new Set([...group.sessionIds, ...risk.sessionIds])]
+      byFile.set(key, group)
+    }
+    return [...byFile.values()].sort((left, right) => {
+      const participants = right.sessionIds.length - left.sessionIds.length
+      if (participants) return participants
+      const testRank = Number(isTestPath(left.file)) - Number(isTestPath(right.file))
+      return testRank || left.file.localeCompare(right.file)
+    })
+  })
+
+  const staleRisks = $derived(
+    (activity?.risks ?? []).filter((risk) => risk.risk === 'stale-base'),
+  )
+
+  function collisionAgents(sessionIds: string[]): string {
+    const names = sessionIds
+      .map((id) => label(store.sessions[id], id.slice(0, 8)))
+      .sort((left, right) => left.localeCompare(right))
+    if (names.length < 3) return names.join(' and ')
+    return `${names.slice(0, -1).join(', ')} and ${names.at(-1)}`
+  }
+
   interface CommRow {
     key: string
     ts: string
@@ -303,19 +349,41 @@
         />
       </div>
     {:else}
-    {#if activity?.risks.length}
-      <section class="risks" aria-label="Worktree risks">
-        {#each activity.risks as risk (`${risk.risk}:${risk.file}:${risk.sessionIds.join(':')}`)}
+    {#if collisionGroups.length}
+      <section class="risks collision-risks" aria-label="Worktree collision risks">
+        <details class="risk-fold">
+          <summary class="risk-summary">
+            <span class="risk-mark" aria-hidden="true">!</span>
+            <span class="risk-summary-copy">
+              <strong>{collisionGroups.length} file collision{collisionGroups.length === 1 ? '' : 's'}</strong>
+              <span>
+                Worst: {collisionGroups[0]!.sessionIds.length} agents in {collisionGroups[0]!.file}
+              </span>
+            </span>
+            <span class="fold-hint">Review contention</span>
+          </summary>
+          <div class="risk-list">
+            {#each collisionGroups as risk (riskPathKey(risk.file))}
+              <article class="risk">
+                <span class="risk-kind">{risk.sessionIds.length} agents</span>
+                <span class="risk-file">{risk.file}</span>
+                <span class="risk-detail">{collisionAgents(risk.sessionIds)} are changing this file</span>
+              </article>
+            {/each}
+          </div>
+        </details>
+      </section>
+    {/if}
+
+    {#if staleRisks.length}
+      <section class="risks stale-risks" aria-label="Stale worktree risks">
+        {#each staleRisks as risk (`${risk.file}:${risk.sessionIds.join(':')}`)}
           <article class="risk">
-            <span class="risk-kind">{risk.risk === 'concurrent-write' ? 'Collision' : 'Stale base'}</span>
+            <span class="risk-kind">Stale base</span>
             <span class="risk-file">{risk.file}</span>
             <span class="risk-detail">
-              {#if risk.risk === 'concurrent-write'}
-                {risk.sessionIds.map((id) => label(store.sessions[id], id.slice(0, 8))).join(' and ')} are changing this file
-              {:else}
-                {label(store.sessions[risk.sessionIds[0]], risk.sessionIds[0]?.slice(0, 8))}
-                is {risk.commitsBehind} commit{risk.commitsBehind === 1 ? '' : 's'} behind
-              {/if}
+              {label(store.sessions[risk.sessionIds[0]], risk.sessionIds[0]?.slice(0, 8))}
+              is {risk.commitsBehind} commit{risk.commitsBehind === 1 ? '' : 's'} behind
             </span>
           </article>
         {/each}
@@ -371,12 +439,19 @@
 
                 <div class="files">
                   {#if fileActivity?.files.length}
+                    <details class="file-fold">
+                      <summary class="files-summary">
+                        {fileActivity.files.length} file{fileActivity.files.length === 1 ? '' : 's'} being worked on
+                      </summary>
+                      <div class="file-list">
                     {#each fileActivity.files as changed (changed.file)}
                       <span class="file" title={`${fileActivity.worktree}\n${changed.kind}`}>
                         {changed.file}
                         {#if changed.kind !== 'uncommitted'}<em>{changed.kind}</em>{/if}
                       </span>
                     {/each}
+                      </div>
+                    </details>
                   {:else if !view.record.worktree}
                     <span class="file-empty" title={view.record.cwd}>Works directly in the project</span>
                   {:else if !activity}
@@ -483,9 +558,27 @@
   .summary .blocked, .summary .failed { color: var(--red); border-color: color-mix(in srgb, var(--red) 35%, var(--border)); }
   .summary .working { color: var(--accent); }
   .risks { max-width: 1400px; margin: 0 auto 1rem; display: grid; gap: .45rem; }
+  .risk-fold { overflow: hidden; border: 1px solid color-mix(in srgb, var(--red) 52%, var(--border));
+    border-radius: var(--r-lg); background: color-mix(in srgb, var(--red) 8%, var(--surface)); }
+  .risk-summary { display: flex; align-items: center; gap: .7rem; padding: .7rem .8rem; cursor: pointer;
+    list-style: none; }
+  .risk-summary::-webkit-details-marker { display: none; }
+  .risk-mark { display: grid; place-items: center; width: 1.35rem; height: 1.35rem; flex: none;
+    border-radius: 50%; color: var(--surface); background: var(--red); font-size: var(--text-xs);
+    font-weight: var(--fw-semibold); }
+  .risk-summary-copy { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: .12rem; }
+  .risk-summary-copy strong { color: var(--red); font-size: var(--text-sm); }
+  .risk-summary-copy span { overflow: hidden; color: var(--muted); font-family: var(--mono);
+    font-size: var(--text-2xs); text-overflow: ellipsis; white-space: nowrap; }
+  .fold-hint { flex: none; color: var(--red); font-size: var(--text-2xs); font-weight: var(--fw-medium); }
+  .risk-fold[open] .risk-summary { border-bottom: 1px solid color-mix(in srgb, var(--red) 28%, var(--border)); }
+  .risk-list { display: grid; }
   .risk { display: grid; grid-template-columns: auto minmax(100px, auto) 1fr; align-items: center; gap: .65rem;
     padding: .65rem .8rem; border: 1px solid color-mix(in srgb, var(--red) 44%, var(--border));
     border-radius: var(--r-lg); background: color-mix(in srgb, var(--red) 7%, var(--surface)); }
+  .risk-list .risk { border: 0; border-top: 1px solid var(--border-subtle); border-radius: 0;
+    background: transparent; }
+  .risk-list .risk:first-child { border-top: 0; }
   .risk-kind { color: var(--red); font-size: var(--text-2xs); font-weight: var(--fw-semibold);
     letter-spacing: var(--ls-label); text-transform: uppercase; }
   .risk-file { font-family: var(--mono); font-size: var(--text-xs); font-weight: var(--fw-medium); }
@@ -521,6 +614,12 @@
   .state.done { color: var(--green, #2e9e63); }
   .state.failed, .state.blocked { color: var(--red); }
   .files { display: flex; flex-wrap: wrap; gap: .3rem; margin: .55rem 0 .05rem 1.45rem; }
+  .file-fold { width: 100%; min-width: 0; }
+  .files-summary { width: fit-content; cursor: pointer; color: var(--muted); font-size: var(--text-2xs);
+    font-weight: var(--fw-medium); }
+  .files-summary:hover { color: var(--accent); }
+  .file-fold[open] .files-summary { margin-bottom: .4rem; }
+  .file-list { display: flex; flex-wrap: wrap; gap: .3rem; }
   .file { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: .2rem .4rem;
     border: 1px solid var(--border-subtle); border-radius: var(--r-sm); background: var(--surface-2);
     font-family: var(--mono); font-size: var(--text-2xs); }

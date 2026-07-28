@@ -114,6 +114,28 @@ function pathKey(value: string): string {
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized
 }
 
+function isTestPath(value: string): boolean {
+  const normalized = value.replaceAll('\\', '/').toLowerCase()
+  return (
+    /(?:^|\/)(?:test|tests|__tests__|fixtures?)(?:\/|$)/.test(normalized) ||
+    /\.(?:test|spec)\.[^/]+$/.test(normalized)
+  )
+}
+
+function compareRiskSeverity(a: WorktreeRiskSnapshot, b: WorktreeRiskSnapshot): number {
+  if (a.risk !== b.risk) return a.risk === 'concurrent-write' ? -1 : 1
+  if (a.risk === 'concurrent-write') {
+    const participants = b.sessionIds.length - a.sessionIds.length
+    if (participants) return participants
+    const testRank = Number(isTestPath(a.file)) - Number(isTestPath(b.file))
+    if (testRank) return testRank
+  } else {
+    const commits = b.commitsBehind - a.commitsBehind
+    if (commits) return commits
+  }
+  return a.file.localeCompare(b.file)
+}
+
 function repoKey(value: string): string {
   return pathKey(path.resolve(value))
 }
@@ -431,7 +453,25 @@ export class WorktreeCollisionDetector {
       }
       const addRisk = (projectIds: Array<string | undefined>, risk: WorktreeRiskSnapshot): void => {
         for (const projectId of new Set(projectIds.filter((id): id is string => Boolean(id)))) {
-          activityFor(projectId).risks.push(risk)
+          const activity = activityFor(projectId)
+          if (risk.risk === 'concurrent-write') {
+            const existing = activity.risks.find(
+              (candidate) =>
+                candidate.risk === 'concurrent-write' &&
+                pathKey(candidate.file) === pathKey(risk.file)
+            )
+            if (existing) {
+              existing.sessionIds = [...new Set([...existing.sessionIds, ...risk.sessionIds])].sort()
+              existing.commitsBehind = Math.max(existing.commitsBehind, risk.commitsBehind)
+              continue
+            }
+            activity.risks.push({
+              ...risk,
+              sessionIds: [...new Set(risk.sessionIds)].sort(),
+            })
+            continue
+          }
+          activity.risks.push(risk)
         }
       }
       const groups = new Map<string, SessionRecord[]>()
@@ -583,7 +623,7 @@ export class WorktreeCollisionDetector {
       }
       for (const activity of nextActivity.values()) {
         activity.agents.sort((a, b) => a.label.localeCompare(b.label))
-        activity.risks.sort((a, b) => a.file.localeCompare(b.file) || a.risk.localeCompare(b.risk))
+        activity.risks.sort(compareRiskSeverity)
       }
       this.activityByProject = nextActivity
     } finally {

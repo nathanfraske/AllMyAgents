@@ -187,11 +187,81 @@ describe('ProjectView', () => {
     expect(screen.getByText('Claude agent')).toBeTruthy()
     expect(screen.getByText(/2\/2 done/)).toBeTruthy()
     await waitFor(() => expect(screen.getByText('apps/manager.ts')).toBeTruthy())
-    expect(screen.getByText('Collision')).toBeTruthy()
+    expect(screen.getByText('1 file collision')).toBeTruthy()
     expect(screen.getAllByText('apps/shared.ts').length).toBeGreaterThan(0)
     expect(screen.getByText(/Bose → Reviewer/)).toBeTruthy()
     expect(screen.getByText('Please review the patch.')).toBeTruthy()
     expect(screen.getAllByText(/Bose → Reviewer/)).toHaveLength(1)
+  })
+
+  it('collapses pair-wise collision noise into counted per-file groups ranked by severity', async () => {
+    const pair = (file: string, left: string, right: string): WorktreeProjectActivity['risks'][number] => ({
+      risk: 'concurrent-write',
+      file,
+      sessionIds: [left, right],
+      commitsBehind: 0,
+      mainAdvance: [],
+    })
+    apiMock.projectActivity.mockResolvedValue({
+      ...activity,
+      agents: activity.agents.map((agent) =>
+        agent.sessionId === 'manager'
+          ? {
+              ...agent,
+              files: [
+                { file: 'apps/hub/src/server.ts', kind: 'uncommitted' as const },
+                { file: 'apps/hub/src/projectManager.test.ts', kind: 'uncommitted' as const },
+                { file: 'apps/web/src/lib/api.ts', kind: 'uncommitted' as const },
+                { file: 'apps/web/src/lib/api.test.ts', kind: 'uncommitted' as const },
+              ],
+            }
+          : agent,
+      ),
+      risks: [
+        pair('apps/hub/src/server.ts', 'manager', 'worker'),
+        pair('apps/hub/src/server.ts', 'manager', 'reviewer'),
+        pair('apps/hub/src/server.ts', 'manager', 'blocked'),
+        pair('apps/hub/src/server.ts', 'worker', 'reviewer'),
+        pair('apps/hub/src/server.ts', 'worker', 'blocked'),
+        pair('apps/hub/src/server.ts', 'reviewer', 'blocked'),
+        pair('apps/hub/src/projectManager.test.ts', 'manager', 'worker'),
+        pair('apps/hub/src/projectManager.test.ts', 'manager', 'reviewer'),
+        pair('apps/hub/src/projectManager.test.ts', 'worker', 'reviewer'),
+        pair('apps/web/src/lib/api.test.ts', 'manager', 'worker'),
+        pair('apps/web/src/lib/api.ts', 'manager', 'worker'),
+      ],
+    })
+
+    render(ProjectView, { props: { projectId: project.id } })
+
+    const collisionSummary = await screen.findByText('4 file collisions')
+    const collisionDetails = collisionSummary.closest('details')
+    expect(collisionDetails?.hasAttribute('open')).toBe(false)
+    expect(collisionDetails?.textContent).toMatch(/worst.*4 agents/i)
+
+    await fireEvent.click(collisionSummary.closest('summary')!)
+    expect(collisionDetails?.hasAttribute('open')).toBe(true)
+    const rankedFiles = Array.from(collisionDetails!.querySelectorAll('.risk-file')).map(
+      (node) => node.textContent,
+    )
+    expect(rankedFiles).toEqual([
+      'apps/hub/src/server.ts',
+      'apps/hub/src/projectManager.test.ts',
+      'apps/web/src/lib/api.ts',
+      'apps/web/src/lib/api.test.ts',
+    ])
+    expect(collisionDetails?.querySelectorAll('.risk')).toHaveLength(4)
+    expect(collisionDetails?.textContent).toMatch(/Noether/)
+    expect(collisionDetails?.textContent).toMatch(/Bose/)
+    expect(collisionDetails?.textContent).toMatch(/Reviewer/)
+    expect(collisionDetails?.textContent).toMatch(/Blocked/)
+
+    const filesSummary = screen.getByText('4 files being worked on')
+    const filesDetails = filesSummary.closest('details')
+    expect(filesDetails?.hasAttribute('open')).toBe(false)
+    await fireEvent.click(filesSummary.closest('summary')!)
+    expect(filesDetails?.hasAttribute('open')).toBe(true)
+    expect(filesDetails?.querySelectorAll('.file')).toHaveLength(4)
   })
 
   it('drills through to a chat and leaves the project dashboard', async () => {
