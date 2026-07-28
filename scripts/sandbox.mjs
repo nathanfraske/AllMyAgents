@@ -267,6 +267,12 @@ async function app() {
       cwd: REPO,
       stdio: 'inherit',
       shell: process.platform === 'win32',
+      // `shell: true` on Windows runs the command through cmd.exe, and cmd.exe brings a CONSOLE WINDOW
+      // with it unless told otherwise. The operator watched black windows appear at random for hours —
+      // one per sandbox app, from their own runs and from every agent that started one — with no way to
+      // tell them apart from something malicious. That is a poor thing to inflict on someone's desktop.
+      // Output still reaches this process through stdio: 'inherit'; only the stray window goes away.
+      windowsHide: true,
       env: {
         ...process.env,
         HUB_URL: `http://127.0.0.1:${PORT}`,
