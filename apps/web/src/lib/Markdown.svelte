@@ -3,14 +3,18 @@
   // injected as pre-sanitized HTML (see markdown.ts — every string here has been through
   // DOMPurify); fenced code blocks render as the native CodeBlock component so the copy
   // button and its state are real Svelte, not injected markup.
+  import { onMount } from 'svelte'
   import { renderMarkdown } from './markdown'
   import CodeBlock from './CodeBlock.svelte'
+  import { installTranscriptCopy } from './transcriptCopy'
 
   let { text }: { text: string } = $props()
   const segments = $derived(renderMarkdown(text))
+
+  onMount(installTranscriptCopy)
 </script>
 
-<div class="prose">
+<div class="prose" data-transcript-copy>
   {#each segments as seg (seg.key)}
     {#if seg.type === 'code'}
       <div class="seg"><CodeBlock code={seg.code} lang={seg.lang} html={seg.html} /></div>
