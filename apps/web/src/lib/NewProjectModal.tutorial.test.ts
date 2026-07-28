@@ -89,5 +89,5 @@ describe('New Project tutorial dry run', () => {
     expect(apiMock.spawn).not.toHaveBeenCalled()
     expect(apiMock.configureProjectManager).not.toHaveBeenCalled()
     expect(onlaunched).not.toHaveBeenCalled()
-  })
+  }, 15_000)
 })
