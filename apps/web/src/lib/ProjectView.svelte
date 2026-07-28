@@ -3,6 +3,7 @@
   import { api, type WorktreeProjectActivity } from './api'
   import { store, type SessionView, type ThreadItem } from './store.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
+  import DeleteProjectDialog from './DeleteProjectDialog.svelte'
   import TaskStrip from './TaskStrip.svelte'
   import ThreadView from './ThreadView.svelte'
   import { agentActivity } from './toolBlurb'
@@ -22,6 +23,7 @@
   let selectedMode = $state<ProjectViewMode>('overview')
   let peekOpen = $state(true)
   let modeProjectId = $state('')
+  let deleteDialogOpen = $state(false)
 
   $effect.pre(() => {
     if (modeProjectId === projectId) return
@@ -291,6 +293,9 @@
           {#if statusCounts.blocked}<span class="blocked">{statusCounts.blocked} blocked</span>{/if}
           {#if statusCounts.failed}<span class="failed">{statusCounts.failed} failed</span>{/if}
         </div>
+        {#if !project.siteId}
+          <button class="delete-project" onclick={() => (deleteDialogOpen = true)}>Delete project…</button>
+        {/if}
       </div>
     </header>
 
@@ -456,6 +461,14 @@
   {/if}
 </section>
 
+{#if project && deleteDialogOpen}
+  <DeleteProjectDialog
+    {project}
+    onclose={() => (deleteDialogOpen = false)}
+    ondelete={(deleteFiles) => store.deleteProject(project.id, deleteFiles)}
+  />
+{/if}
+
 <style>
   .project-view { box-sizing: border-box; width: 100%; min-width: 0; height: 100%; overflow: hidden auto;
     padding: clamp(1rem, 2.5vw, 2rem); background: var(--bg); }
@@ -471,6 +484,9 @@
   .summary { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: .4rem; color: var(--muted);
     font-size: var(--text-xs); }
   .head-actions { display: flex; flex-direction: column; align-items: flex-end; gap: .55rem; }
+  .delete-project { color: var(--dim); font-size: var(--text-2xs); text-decoration: underline;
+    text-underline-offset: .18rem; }
+  .delete-project:hover { color: var(--bad-text); }
   .view-toggle { display: grid; grid-template-columns: 1fr 1fr; padding: 3px; border: 1px solid var(--border);
     border-radius: var(--r-lg); background: var(--surface-2); box-shadow: var(--edge-hi); }
   .view-toggle button { min-width: 7rem; padding: .42rem .75rem; border-radius: calc(var(--r-lg) - 3px);

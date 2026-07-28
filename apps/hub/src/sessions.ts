@@ -62,6 +62,10 @@ import {
   type WorktreeStalenessCheck,
 } from './worktreeCollisionDetector.js'
 import {
+  inspectProjectDeletion,
+  type ProjectDeletionInspection,
+} from './projectDeletion.js'
+import {
   AttachmentInputError,
   isPdfAttachment,
   isTextAttachment,
@@ -1262,6 +1266,95 @@ export class SessionManager {
       ...record,
       unreadFromTeammates: pending.get(record.id) ?? 0,
     }))
+  }
+
+  inspectProjectDeletion(projectId: string): ProjectDeletionInspection | undefined {
+    const project = this.projects.get(projectId)
+    return project ? inspectProjectDeletion(project, this.list()) : undefined
+  }
+
+  /**
+   * Remove a project from the app without confusing record deletion with file deletion.
+   *
+   * Safe/default mode only detaches its chats to Unfiled. The exact worktrees and working directories
+   * stay in place and running turns are not interrupted. Destructive mode is an explicit second route:
+   * it first stops every project chat and refuses while any writer is still unwinding, then removes the
+   * recorded managed worktrees and project directory before tombstoning the chats.
+   */
+  async deleteProject(
+    projectId: string,
+    options: { deleteFiles?: boolean } = {},
+  ): Promise<
+    | { ok: true; detachedSessionIds: string[]; deletedSessionIds: string[] }
+    | { ok: false; error: string }
+  > {
+    const project = this.projects.get(projectId)
+    if (!project) return { ok: false, error: `unknown project: ${projectId}` }
+    const projectSessions = this.list().filter((record) => record.projectId === projectId)
+
+    if (options.deleteFiles) {
+      for (const record of projectSessions) await this.stop(record.id).catch(() => undefined)
+      const stillBusy = projectSessions.filter((record) => this.executor.isBusy(record.id))
+      if (stillBusy.length) {
+        return {
+          ok: false,
+          error:
+            `The project was preserved because ${stillBusy.length} agent${
+              stillBusy.length === 1 ? ' is' : 's are'
+            } still shutting down. Try again after they settle. Work remains at ${project.path}`,
+        }
+      }
+      try {
+        this.workspace.removeProjectFiles(
+          project.path,
+          projectSessions
+            .filter((record): record is SessionRecord & { worktree: string } => Boolean(record.worktree))
+            .map((record) => ({ repo: record.repo, worktree: record.worktree })),
+        )
+      } catch (error) {
+        return {
+          ok: false,
+          error:
+            `The project record and chats were preserved because file removal failed. ` +
+            `${error instanceof Error ? error.message : String(error)}`,
+        }
+      }
+      for (const record of projectSessions) await this.tombstoneSessionRecord(record)
+      this.projects.remove(projectId)
+      this.journal.append(null, 'project/deleted', {
+        id: projectId,
+        path: project.path,
+        deleteFiles: true,
+        deletedSessionIds: projectSessions.map((record) => record.id),
+      })
+      return {
+        ok: true,
+        detachedSessionIds: [],
+        deletedSessionIds: projectSessions.map((record) => record.id),
+      }
+    }
+
+    for (const record of projectSessions) {
+      record.projectId = undefined
+      this.persist(record)
+      this.journal.append(record.id, 'session/project-detached', {
+        projectId,
+        cwd: record.cwd,
+        worktree: record.worktree ?? null,
+      })
+    }
+    this.projects.remove(projectId)
+    this.journal.append(null, 'project/deleted', {
+      id: projectId,
+      path: project.path,
+      deleteFiles: false,
+      detachedSessionIds: projectSessions.map((record) => record.id),
+    })
+    return {
+      ok: true,
+      detachedSessionIds: projectSessions.map((record) => record.id),
+      deletedSessionIds: [],
+    }
   }
 
   /**
@@ -3580,6 +3673,16 @@ export class SessionManager {
       this.setStatus(record, 'idle')
     }
     return { ok: true, status: record.status }
+  }
+
+  /** Remove an already-stopped session after its project files were explicitly discarded. */
+  private async tombstoneSessionRecord(record: SessionRecord): Promise<void> {
+    this.journal.append(record.id, 'session/deleted', { id: record.id })
+    this.sessions.delete(record.id)
+    this.clearManagerStallCheck(record.id)
+    this.ingestedWseq.delete(record.id)
+    await this.executor.stopSession(record.id)
+    this.store.remove(record.id)
   }
 
   // Delete a chat/session for good. Idempotent: an unknown id returns ok:false (404-style) and
