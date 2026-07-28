@@ -201,6 +201,7 @@ describe('New project pipeline', () => {
     expect(screen.getByRole('dialog', { name: 'New project' }).contains(
       screen.getByLabelText('Manager account'),
     )).toBe(true)
+    await fireEvent.click(screen.getByRole('checkbox', { name: 'Enable a project manager' }))
 
     await fireEvent.click(screen.getByRole('button', { name: 'Review and finalize' }))
     await fireEvent.click(screen.getByRole('button', { name: 'Create project without agents' }))
@@ -210,6 +211,34 @@ describe('New project pipeline', () => {
       expect(onlaunched).toHaveBeenCalledWith({ project, started: [], failed: [] }))
   })
 
+  it('includes an enabled manager in the launch without a second add-to-launch action', async () => {
+    const onlaunched = vi.fn()
+    render(NewProjectModal, { onclose: vi.fn(), onlaunched })
+    await advanceLocalDraft()
+
+    await fireEvent.click(screen.getByRole('checkbox', { name: 'Enable a project manager' }))
+    expect(screen.queryByRole('button', { name: 'Add to project launch' })).toBeNull()
+
+    const manager = { ...record('manager-session'), title: `${project.name} manager` }
+    apiMock.spawn.mockResolvedValue(manager)
+    apiMock.configureProjectManager.mockResolvedValue({ ...manager, isProjectManager: true })
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Review and finalize' }))
+    await fireEvent.click(screen.getByRole('button', { name: 'Launch project with team' }))
+
+    await vi.waitFor(() => expect(apiMock.spawn).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: project.id,
+      useWorktree: false,
+    })))
+    await vi.waitFor(() => expect(onlaunched).toHaveBeenCalledWith(expect.objectContaining({
+      started: [expect.objectContaining({
+        agentId: 'project-manager',
+        sessionId: 'manager-session',
+      })],
+      failed: [],
+    })))
+  })
+
   it('defers the embedded manager until Launch and retries configuration without spawning a duplicate', async () => {
     const onlaunched = vi.fn()
     render(NewProjectModal, { onclose: vi.fn(), onlaunched })
@@ -217,7 +246,6 @@ describe('New project pipeline', () => {
 
     await fireEvent.click(screen.getByRole('checkbox', { name: 'Enable a project manager' }))
     expect(apiMock.spawn).not.toHaveBeenCalled()
-    await fireEvent.click(screen.getByRole('button', { name: 'Add to project launch' }))
     await fireEvent.click(screen.getByRole('button', { name: 'Review and finalize' }))
 
     const manager = { ...record('manager-session'), title: `${project.name} manager` }
@@ -263,7 +291,6 @@ describe('New project pipeline', () => {
     await advanceLocalDraft()
 
     await fireEvent.click(screen.getByRole('checkbox', { name: 'Enable a project manager' }))
-    await fireEvent.click(screen.getByRole('button', { name: 'Add to project launch' }))
     await fireEvent.click(screen.getByRole('button', { name: 'Add starting agent' }))
     await fireEvent.input(screen.getByLabelText('Starting prompt 1'), {
       target: { value: 'Run this independent task.' },

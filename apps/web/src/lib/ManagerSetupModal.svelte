@@ -34,7 +34,7 @@
     initialProjectId?: string
     draftProject?: Pick<ProjectInfo, 'name' | 'path'>
     onCreateProject?: () => void
-    onConfigured?: (config: ManagerLaunchConfig) => void
+    onConfigured?: (config: ManagerLaunchConfig | null) => void
   }
 
   let {
@@ -85,6 +85,7 @@
   let busy = $state(false)
   let error = $state('')
   let saved = $state(false)
+  let lastDeferredConfig = ''
 
   const selectedRecord = $derived(selectedId ? store.sessions[selectedId]?.record : undefined)
   const project = $derived(
@@ -543,6 +544,26 @@
     if (!briefTouched) orientationBrief = generatedOrientationBrief()
     if (!standingTouched) standingInstructions = defaultStandingInstructions()
   })
+
+  // In the stepped project flow, enabling the manager is the inclusion decision. Synchronize the
+  // in-memory launch draft as fields change; there is deliberately no second "add to launch" action.
+  $effect(() => {
+    if (!embedded || !deferLaunch || !initialized) return
+    const config = launchConfig()
+    if (validate(config)) {
+      if (lastDeferredConfig) {
+        lastDeferredConfig = ''
+        onConfigured?.(null)
+      }
+      saved = false
+      return
+    }
+    const serialized = JSON.stringify(config)
+    if (serialized === lastDeferredConfig) return
+    lastDeferredConfig = serialized
+    saved = true
+    onConfigured?.(config)
+  })
 </script>
 
 <svelte:window onkeydown={onKey} />
@@ -857,17 +878,22 @@
       <p class="audit"><Icon name="history" size={13} /> Grants, changes, use, role selection, and revocations are journaled.</p>
 
       {#if error}<p class="error">{error}</p>{/if}
+      {#if embedded && deferLaunch}
+        <div class="included">
+          <b>{saved ? 'Included in project launch' : 'Finish the required manager fields'}</b>
+          <span>{saved ? 'Changes here update the launch automatically.' : 'The project will not launch until this manager configuration is valid.'}</span>
+        </div>
+      {:else}
       <button class="primary" disabled={busy || (mode === 'promote' && !selectedRecord)} onclick={grant}>
         {busy
           ? 'Launching…'
-          : embedded && deferLaunch
-            ? 'Add to project launch'
-            : isActiveManager || saved
+          : isActiveManager || saved
               ? 'Update granted scope'
               : mode === 'create'
                 ? 'Create and launch manager'
                 : 'Make this chat a manager and launch'}
       </button>
+      {/if}
       {#if isActiveManager || (saved && !deferLaunch)}
         <button class="revoke" disabled={busy} onclick={revoke}>Revoke manager role</button>
       {/if}
@@ -933,6 +959,9 @@
   fieldset > p { margin: .05rem 0 .7rem; color: var(--dim); font-size: .72rem; line-height: 1.4; }
   .grant-state { display: flex; flex-direction: column; gap: .18rem; margin: .15rem 0 .7rem; padding: .58rem; border-radius: var(--r-md); background: var(--surface-2); }
   .grant-state.on { background: color-mix(in srgb, var(--accent) 12%, var(--surface-2)); }
+  .included { display: grid; gap: .18rem; padding: .65rem .75rem; border: 1px solid var(--border-accent);
+    border-radius: var(--r-md); background: color-mix(in srgb, var(--accent) 10%, var(--surface-2)); }
+  .included span { color: var(--dim); font-size: var(--text-xs); }
   .grant-state b { font-size: .75rem; }
   .grant-state span { color: var(--dim); font-size: .7rem; }
   .choices, .tool-grid { display: flex; flex-wrap: wrap; gap: .5rem .8rem; }
