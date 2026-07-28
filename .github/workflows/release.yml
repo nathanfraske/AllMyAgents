@@ -93,6 +93,7 @@ on:
 # tauri-action creates the GitHub Release and uploads the installers/updater assets to it.
 permissions:
   contents: write
+  actions: write
 
 # A re-pushed tag should not race a run already publishing to the same release.
 concurrency:
@@ -100,8 +101,20 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  launch-and-repair-gate:
+    name: installed launch-and-repair gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dispatch exact-tag durability verification and wait for both platforms
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/wait-release-verification.mjs
+
   release:
     name: build (${{ matrix.platform }})
+    needs: launch-and-repair-gate
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 60
     strategy:
