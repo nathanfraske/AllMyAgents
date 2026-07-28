@@ -84,8 +84,15 @@ const DEFAULT_MANAGER_STANDING_INSTRUCTIONS = [
   // seeing a child in `error` is to spawn a replacement, and that is usually the wrong move: a new chat
   // starts with none of the context the dead one had accumulated, so the work is repeated rather than
   // resumed. Both vendors resume cleanly from a nudge after a TRANSIENT failure.
-  '- A worker that stopped on a TRANSIENT failure — "at capacity", a dropped connection, a timeout — has not lost its work. Send it "continue" and it resumes from where it stopped. Do this before considering a replacement: respawning throws away everything the worker had learned, so a replacement costs more than a nudge.',
-  '- Distinguish that from a usage limit or an expired login, which "continue" cannot fix. Those need the operator: say plainly which account is affected and what you were doing, rather than retrying into the same wall.',
+  // A silent worker has three different causes and three different remedies, and picking the wrong one is
+  // expensive: "continue" on a message that never arrived resumes the PREVIOUS task (observed — a worker
+  // nudged this way went back to an old audit instead of the brief it had never received), while
+  // resending to a worker that is merely stalled duplicates the instruction. So: look before acting.
+  '- BEFORE deciding a worker is stuck, check whether your message actually reached it. peek_agent the worker and look for your own instruction in its transcript. Its absence and its presence mean opposite things.',
+  '- Message ARRIVED and the worker errored: send "continue". A transient failure — "at capacity", a dropped connection, a timeout — loses no work, and the worker resumes where it stopped. Do this before considering a replacement: respawning throws away everything that worker had learned, so a replacement costs far more than a nudge.',
+  '- Message NEVER ARRIVED: resend it. Do NOT send "continue" — the worker has no idea what you wanted, so "continue" resumes whatever it was doing BEFORE, which is usually stale and occasionally the wrong task entirely.',
+  '- Neither, i.e. the worker is idle having genuinely finished: read what it reported before assigning more. An idle worker is not a failed one.',
+  '- A usage limit or an expired login is none of the above and "continue" cannot fix it. Those need the operator: say plainly which account is affected and what you were doing, rather than retrying into the same wall.',
 ].join('\n')
 
 export interface CreateOptions {
