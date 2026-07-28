@@ -6,6 +6,7 @@
   import Icon from './Icon.svelte'
   import { modelsFor } from './catalog'
   import { updater, updatesSupported } from './updater.svelte'
+  import { countLiveUpdateTurns } from './updateSafety'
   import {
     closePreparedTarget,
     openExternalUrl,
@@ -36,6 +37,15 @@
   } = $props()
   let writeError = $state('')
   let activeTab = $state<SettingsTabId>(loadSettingsTab())
+  const updateLiveTurns = $derived(countLiveUpdateTurns(store.sessions))
+  let waitForUpdateIdle = $state(false)
+
+  $effect(() => {
+    if (waitForUpdateIdle && updateLiveTurns === 0 && !updater.busy) {
+      waitForUpdateIdle = false
+      void updater.install()
+    }
+  })
 
   $effect(() => {
     if (initialTab) activeTab = initialTab
@@ -638,9 +648,25 @@
         <div class="upd-row">
           <button class="btn" onclick={() => updater.check()} disabled={updater.busy}>{updater.busy ? 'Checking…' : 'Check for updates'}</button>
           {#if updater.info?.available}
-            <button class="btn btn-primary" onclick={() => updater.install()} disabled={updater.busy}>Update to {updater.info.version}</button>
+            {#if waitForUpdateIdle}
+              <button class="btn" onclick={() => (waitForUpdateIdle = false)}>Cancel waiting</button>
+            {:else if updateLiveTurns > 0}
+              <button class="btn" onclick={() => updater.install({ allowLiveTurns: true })} disabled={updater.busy}>Update anyway</button>
+              <button class="btn btn-primary" onclick={() => (waitForUpdateIdle = true)} disabled={updater.busy}>Update when idle</button>
+            {:else}
+              <button class="btn btn-primary" onclick={() => updater.install()} disabled={updater.busy}>Update to {updater.info.version}</button>
+            {/if}
           {/if}
         </div>
+        {#if updater.info?.available && updateLiveTurns > 0}
+          <p class="hint upd-warn">
+            {updateLiveTurns} {updateLiveTurns === 1 ? 'chat is' : 'chats are'} mid-turn. Updating restarts everything,
+            so that work would be lost.
+          </p>
+        {/if}
+        {#if waitForUpdateIdle}
+          <p class="hint upd-warn">Waiting for {updateLiveTurns} {updateLiveTurns === 1 ? 'turn' : 'turns'} to finish, then updating…</p>
+        {/if}
         {#if updater.error}
           <p class="hint upd-err">{updater.error}</p>
         {:else if updater.info?.available}
@@ -793,6 +819,7 @@
   .hint { font-size: var(--text-xs); line-height: 1.5; }
   .upd-row { display: flex; gap: var(--space-3); flex-wrap: wrap; margin: var(--space-3) 0 var(--space-2); }
   .upd-err { color: var(--bad); }
+  .upd-warn { color: var(--warn-text, #d08700); }
   .hint code { background: var(--bg); padding: 0 0.25rem; border-radius: var(--r-xs); }
   .budget-auto { display: flex; align-items: center; gap: var(--space-4); flex-wrap: wrap; margin-bottom: var(--space-3); }
   .budget-auto .hint { flex: 1; min-width: 12rem; }

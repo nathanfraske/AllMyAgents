@@ -108,6 +108,7 @@ fn hub_addr() -> String {
 struct HubProcess(Mutex<Option<Child>>);
 
 /// What is (or isn't) on the hub port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HubProbe {
     /// OUR hub answered `/api/health` with the shape our hub returns. Don't spawn a second one.
     Ours,
@@ -1311,8 +1312,13 @@ async fn updater_check(app: AppHandle) -> Result<UpdateInfo, String> {
 /// Download + verify + install the available update, then relaunch. Only ever
 /// called from an explicit "Update now" click — there is no code path that
 /// reaches this without the operator consenting. The signature check happens
-/// inside `download_and_install`; a bad signature fails here rather than
-/// installing.
+/// inside `download`; a bad signature fails before the running hub is touched.
+///
+/// Windows is intentionally split into download → quiesce → install. The
+/// updater plugin's NSIS path calls `std::process::exit(0)` immediately after it
+/// starts the installer, bypassing Tauri's Exit event. Relying on that event to
+/// kill the hub therefore leaves the installed `hub-runtime/node/node.exe`
+/// mapped while NSIS tries to replace it.
 #[cfg(desktop)]
 #[tauri::command]
 async fn updater_install(app: AppHandle) -> Result<(), String> {
@@ -1323,13 +1329,336 @@ async fn updater_install(app: AppHandle) -> Result<(), String> {
         .await
         .map_err(|e| format!("Could not check for updates: {e}"))?
         .ok_or_else(|| "No update is available.".to_string())?;
-    update
-        .download_and_install(|_chunk, _total| {}, || {})
+    let bytes = update
+        .download(|_chunk, _total| {}, || {})
         .await
-        .map_err(|e| format!("Update failed: {e}"))?;
+        .map_err(|e| format!("Could not download or verify the update: {e}"))?;
+    quiesce_for_update(&app)?;
+    update.install(bytes).map_err(|e| format!("Could not start the verified update: {e}"))?;
     // The hub child is torn down by the Exit handler in `run()` before the process
-    // goes away, so the new build starts from a clean slate.
-    app.restart();
+    // goes away on platforms whose updater returns. Windows exits from inside
+    // `install`, after `quiesce_for_update` has already released the runtime.
+    app.restart()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UpdateReleaseFailure {
+    port_occupied: bool,
+    runtime_locked: bool,
+}
+
+/// Poll a pair of independent updater preconditions. Keeping the loop injectable
+/// makes the dangerous condition testable: a released file does not excuse a
+/// live hub port, and a vacant port does not excuse a mapped executable.
+fn wait_for_update_release_with<P, R, S>(
+    attempts: usize,
+    mut port_is_vacant: P,
+    mut runtime_is_writable: R,
+    mut pause: S,
+) -> Result<(), UpdateReleaseFailure>
+where
+    P: FnMut() -> bool,
+    R: FnMut() -> bool,
+    S: FnMut(),
+{
+    let attempts = attempts.max(1);
+    let mut last = UpdateReleaseFailure {
+        port_occupied: true,
+        runtime_locked: true,
+    };
+    for attempt in 0..attempts {
+        last = UpdateReleaseFailure {
+            port_occupied: !port_is_vacant(),
+            runtime_locked: !runtime_is_writable(),
+        };
+        if !last.port_occupied && !last.runtime_locked {
+            return Ok(());
+        }
+        if attempt + 1 < attempts {
+            pause();
+        }
+    }
+    Err(last)
+}
+
+fn hub_port_is_vacant() -> bool {
+    let Ok(addr) = hub_addr().parse::<SocketAddr>() else { return false };
+    TcpStream::connect_timeout(&addr, Duration::from_millis(150)).is_err()
+}
+
+/// Prove the installed runtime can be replaced without changing a byte. Windows
+/// executable mappings reject this exclusive ReadWrite open with a sharing
+/// violation; FileShare::None mirrors the release gate and NSIS's replacement
+/// precondition.
+fn runtime_is_exclusively_writable(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(path)
+            .is_ok()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        true
+    }
+}
+
+#[cfg(windows)]
+fn normalized_windows_path(path: &Path) -> String {
+    plain(path)
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_start_matches(r"\\?\")
+        .to_lowercase()
+}
+
+#[cfg(windows)]
+fn process_image_path(pid: u32) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let mut buffer = vec![0u16; 32_768];
+    let mut length = buffer.len() as u32;
+    let result = unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut length,
+        )
+    };
+    let _ = unsafe { CloseHandle(process) };
+    result
+        .is_ok()
+        .then(|| PathBuf::from(OsString::from_wide(&buffer[..length as usize])))
+}
+
+/// Return only processes executing the exact bundled runtime. Matching the full
+/// image path is the safety boundary: an operator's unrelated system Node must
+/// never be included.
+#[cfg(windows)]
+fn runtime_processes(path: &Path) -> Vec<u32> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let target = normalized_windows_path(path);
+    let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
+        return Vec::new();
+    };
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut matches = Vec::new();
+    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok();
+    while more {
+        let pid = entry.th32ProcessID;
+        if process_image_path(pid)
+            .is_some_and(|image| normalized_windows_path(&image) == target)
+        {
+            matches.push(pid);
+        }
+        more = unsafe { Process32NextW(snapshot, &mut entry) }.is_ok();
+    }
+    let _ = unsafe { CloseHandle(snapshot) };
+    matches
+}
+
+#[cfg(not(windows))]
+fn runtime_processes(_path: &Path) -> Vec<u32> {
+    Vec::new()
+}
+
+/// Restart Manager can identify a file holder even when querying its executable
+/// path is denied. This is diagnostic only: shutdown remains restricted to
+/// exact-path bundled Node processes.
+#[cfg(windows)]
+fn runtime_lock_holders(path: &Path) -> Vec<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
+    use windows::Win32::System::RestartManager::{
+        RmEndSession, RmGetList, RmRegisterResources, RmStartSession, RM_PROCESS_INFO,
+        CCH_RM_SESSION_KEY,
+    };
+
+    let mut session = 0u32;
+    let mut key = vec![0u16; CCH_RM_SESSION_KEY as usize + 1];
+    if unsafe { RmStartSession(&mut session, None, PWSTR(key.as_mut_ptr())) } != ERROR_SUCCESS {
+        return Vec::new();
+    }
+    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let files = [PCWSTR(wide_path.as_ptr())];
+    if unsafe { RmRegisterResources(session, Some(&files), None, None) } != ERROR_SUCCESS {
+        let _ = unsafe { RmEndSession(session) };
+        return Vec::new();
+    }
+
+    let mut needed = 0u32;
+    let mut count = 0u32;
+    let mut reasons = 0u32;
+    let first = unsafe { RmGetList(session, &mut needed, &mut count, None, &mut reasons) };
+    let mut holders = Vec::new();
+    if first == ERROR_MORE_DATA && needed > 0 {
+        let mut info = vec![RM_PROCESS_INFO::default(); needed as usize];
+        count = needed;
+        if unsafe {
+            RmGetList(
+                session,
+                &mut needed,
+                &mut count,
+                Some(info.as_mut_ptr()),
+                &mut reasons,
+            )
+        } == ERROR_SUCCESS
+        {
+            holders.extend(info.into_iter().take(count as usize).map(|process| {
+                let end = process
+                    .strAppName
+                    .iter()
+                    .position(|c| *c == 0)
+                    .unwrap_or(process.strAppName.len());
+                let name = String::from_utf16_lossy(&process.strAppName[..end]);
+                if name.is_empty() {
+                    format!("PID {}", process.Process.dwProcessId)
+                } else {
+                    format!("{name} (PID {})", process.Process.dwProcessId)
+                }
+            }));
+        }
+    }
+    let _ = unsafe { RmEndSession(session) };
+    holders
+}
+
+#[cfg(not(windows))]
+fn runtime_lock_holders(_path: &Path) -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn terminate_runtime_processes(path: &Path) {
+    let target = normalized_windows_path(path);
+    for pid in runtime_processes(path) {
+        // A PID can be recycled after the snapshot. Re-check the image at the
+        // last possible moment so a newly-created unrelated process can never
+        // be swept merely because it inherited a stale number.
+        if !process_image_path(pid)
+            .is_some_and(|image| normalized_windows_path(&image) == target)
+        {
+            continue;
+        }
+        logln(&format!(
+            "[desktop] updater stopping orphaned bundled-runtime process {pid} ({})",
+            path.display()
+        ));
+        let mut command = Command::new("taskkill");
+        command.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        hide_console(&mut command);
+        match command.output() {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => logln(&format!(
+                "[desktop] updater could not stop bundled-runtime PID {pid}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Err(error) => logln(&format!(
+                "[desktop] updater could not invoke taskkill for bundled-runtime PID {pid}: {error}"
+            )),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn terminate_runtime_processes(_path: &Path) {}
+
+/// Stop everything that can keep the installed runtime mapped, then prove both
+/// the network endpoint and file handle are released. Failure returns to the UI
+/// before the verified installer is started, leaving the current install intact.
+fn quiesce_for_update(app: &AppHandle) -> Result<(), String> {
+    let runtime = bundled_node_dir(app)
+        .map(|dir| dir.join(node_exe_name()))
+        .ok_or_else(|| {
+            "Update was not started because the bundled runtime path could not be resolved.".to_string()
+        })?;
+    if !runtime.exists() {
+        return Err(format!(
+            "Update was not started because the bundled runtime is missing: {}",
+            runtime.display()
+        ));
+    }
+
+    let owned = app
+        .try_state::<HubProcess>()
+        .and_then(|state| state.0.lock().ok()?.take());
+    if let Some(mut child) = owned {
+        logln("[desktop] updater quiescing the shell-owned hub tree");
+        kill_hub(&mut child);
+    }
+    terminate_runtime_processes(&runtime);
+
+    let release = wait_for_update_release_with(
+        80,
+        hub_port_is_vacant,
+        || runtime_is_exclusively_writable(&runtime),
+        || thread::sleep(Duration::from_millis(125)),
+    );
+    if let Err(failure) = release {
+        let port = if failure.port_occupied {
+            match probe_hub() {
+                HubProbe::Ours => format!("the AllMyAgents hub is still answering on {}", hub_addr()),
+                HubProbe::Foreign => format!("another process is still using {}", hub_addr()),
+                HubProbe::Vacant => format!("{} did not release consistently", hub_addr()),
+            }
+        } else {
+            format!("{} is vacant", hub_addr())
+        };
+        let exact_pids = runtime_processes(&runtime);
+        let holders = runtime_lock_holders(&runtime);
+        let file = if failure.runtime_locked {
+            if !holders.is_empty() {
+                format!("{} is held by {}", runtime.display(), holders.join(", "))
+            } else if !exact_pids.is_empty() {
+                format!(
+                    "{} is still held by PID(s) {}",
+                    runtime.display(),
+                    exact_pids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
+                )
+            } else {
+                format!(
+                    "Windows still denies exclusive write access to {}, but did not identify the holder",
+                    runtime.display()
+                )
+            }
+        } else {
+            format!("{} is writable", runtime.display())
+        };
+        let message = format!(
+            "Update was not started because the running hub could not be stopped safely: {port}; {file}. The current installation is unchanged. Close the named process or restart Windows, then retry."
+        );
+        logln(&format!("[desktop] updater quiesce failed: {message}"));
+        return Err(message);
+    }
+
+    logln(&format!(
+        "[desktop] updater quiesce complete: {} vacant and {} exclusively writable",
+        hub_addr(),
+        runtime.display()
+    ));
+    Ok(())
 }
 
 /// Remove a macOS install without involving the hub. A detached helper waits for this process to exit
@@ -1611,5 +1940,58 @@ mod dependency_repair_tests {
 
         assert_eq!(read_repair_state(&root), state);
         fs::remove_dir_all(&root).expect("remove isolated repair-state fixture");
+    }
+}
+
+#[cfg(test)]
+mod updater_quiesce_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn updater_waits_until_both_the_hub_port_and_runtime_are_released() {
+        let attempts = Cell::new(0usize);
+        let result = wait_for_update_release_with(
+            4,
+            || {
+                let attempt = attempts.get();
+                attempt >= 2
+            },
+            || {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                attempt >= 3
+            },
+            || {},
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(attempts.get(), 4);
+    }
+
+    #[test]
+    fn updater_refuses_to_install_while_the_hub_is_still_listening() {
+        let result = wait_for_update_release_with(1, || false, || true, || {});
+
+        assert_eq!(
+            result,
+            Err(UpdateReleaseFailure {
+                port_occupied: true,
+                runtime_locked: false,
+            })
+        );
+    }
+
+    #[test]
+    fn updater_refuses_to_install_while_the_runtime_is_still_locked() {
+        let result = wait_for_update_release_with(1, || true, || false, || {});
+
+        assert_eq!(
+            result,
+            Err(UpdateReleaseFailure {
+                port_occupied: false,
+                runtime_locked: true,
+            })
+        );
     }
 }
