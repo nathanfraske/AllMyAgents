@@ -117,6 +117,67 @@ describe('WorktreeCollisionDetector', () => {
     )
   }, 20_000)
 
+  it('groups pair-wise dashboard collisions by file and ranks the most severe contention first', async () => {
+    const { root, repo, knuth, hopper } = fixture()
+    const makeAgent = (id: string, title: string): SessionRecord => {
+      const worktree = path.join(root, 'worktrees', id)
+      git(repo, 'worktree', 'add', '-b', `agent/${id}`, worktree)
+      return {
+        ...knuth,
+        id,
+        title,
+        profileId: `profile-${id}`,
+        cwd: worktree,
+        worktree,
+        branch: `agent/${id}`,
+      }
+    }
+    const cori = makeAgent('cori', 'Cori')
+    const simon = makeAgent('simon', 'Simon')
+    const agents = [knuth, hopper, cori, simon]
+    const write = (agent: SessionRecord, file: string): void => {
+      const target = path.join(agent.worktree!, file)
+      fs.mkdirSync(path.dirname(target), { recursive: true })
+      fs.writeFileSync(target, `// ${agent.id}\n`)
+    }
+
+    for (const agent of agents) write(agent, 'apps/hub/src/server.ts')
+    for (const agent of [knuth, hopper, cori]) write(agent, 'apps/hub/src/projectManager.test.ts')
+    for (const agent of [knuth, hopper]) {
+      write(agent, 'apps/web/src/lib/api.ts')
+      write(agent, 'apps/web/src/lib/api.test.ts')
+    }
+
+    const detector = new WorktreeCollisionDetector({
+      sessions: () => agents,
+      steer: async () => true,
+    })
+    await detector.poll()
+
+    expect(detector.projectActivity('project-1').risks).toEqual([
+      expect.objectContaining({
+        risk: 'concurrent-write',
+        file: 'apps/hub/src/server.ts',
+        sessionIds: ['cori', 'hopper', 'knuth', 'simon'],
+      }),
+      expect.objectContaining({
+        risk: 'concurrent-write',
+        file: 'apps/hub/src/projectManager.test.ts',
+        sessionIds: ['cori', 'hopper', 'knuth'],
+      }),
+      expect.objectContaining({
+        risk: 'concurrent-write',
+        file: 'apps/web/src/lib/api.ts',
+        sessionIds: ['hopper', 'knuth'],
+      }),
+      expect.objectContaining({
+        risk: 'concurrent-write',
+        file: 'apps/web/src/lib/api.test.ts',
+        sessionIds: ['hopper', 'knuth'],
+      }),
+    ])
+  }, 30_000)
+
   it('steers exactly once when the base branch advances across a file this agent modified', async () => {
     const { repo, knuth } = fixture()
     const steer = vi.fn(async (_sessionId: string, _message: string) => true)
