@@ -323,7 +323,9 @@ jobs:
           @'
           use std::process::{Command, exit};
           fn main() {
-              let status = Command::new("node")
+              let node = std::env::var_os("AMA_CI_SYSTEM_NODE")
+                  .expect("AMA_CI_SYSTEM_NODE was not inherited by the installed test app");
+              let status = Command::new(node)
                   .args(std::env::args_os().skip(1))
                   .status()
                   .expect("could not launch the workflow runner Node");
@@ -406,6 +408,9 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          # The source MSI's deliberate node.exe forwarder must use this absolute path. Asking Windows
+          # to resolve the bare name "node" from inside node.exe finds the forwarder itself first.
+          $env:AMA_CI_SYSTEM_NODE = (Get-Command node -ErrorAction Stop).Source
           $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-port=$env:AMA_CDP_PORT"
           Start-Process -FilePath $env:AMA_UPDATE_SHORTCUT
 
