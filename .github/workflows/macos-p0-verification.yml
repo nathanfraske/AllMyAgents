@@ -2,6 +2,13 @@ name: macOS P0 verification
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - 'apps/desktop/**'
+      - 'apps/hub/src/index.ts'
+      - 'apps/web/src/lib/SettingsModal.svelte'
+      - 'scripts/install-macos.sh'
+      - '.github/workflows/macos-p0-verification.yml'
 
 permissions:
   contents: read
