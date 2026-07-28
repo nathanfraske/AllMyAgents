@@ -1,0 +1,131 @@
+name: macOS P0 verification
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'apps/desktop/**'
+      - 'apps/hub/src/index.ts'
+      - 'apps/web/src/lib/SettingsModal.svelte'
+      - 'scripts/install-macos.sh'
+      - '.github/workflows/macos-p0-verification.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  launch-and-repair:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-latest, macos-15-intel]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'apps/desktop/src-tauri -> target'
+      - run: pnpm install --frozen-lockfile
+      - name: Build and install the app
+        env:
+          APPLE_SIGNING_IDENTITY: '-'
+        run: |
+          set -euo pipefail
+          uname -m
+          sw_vers
+          pnpm --filter desktop exec tauri build --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          APP="$(find apps/desktop/src-tauri/target/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$APP"
+          rm -rf /Applications/AllMyAgents.app
+          cp -R "$APP" /Applications/AllMyAgents.app
+          NODE=/Applications/AllMyAgents.app/Contents/Resources/hub-runtime/node/node
+          test -x "$NODE"
+          "$NODE" --version
+      - name: Launch through LaunchServices and require a healthy hub
+        run: |
+          set -euo pipefail
+          open -a /Applications/AllMyAgents.app
+          for i in $(seq 1 180); do
+            if curl -fsS --max-time 2 http://127.0.0.1:7777/api/health -o /tmp/health-first.json; then break; fi
+            sleep 2
+          done
+          test -s /tmp/health-first.json
+          cat /tmp/health-first.json
+          LOG="$HOME/Library/Application Support/direct.cec.allmyagents/logs/desktop.log"
+          test -s "$LOG"
+          cp "$LOG" /tmp/desktop-first.log
+      - name: Corrupt a marker-matching native tree, then prove self-healing
+        run: |
+          set -euo pipefail
+          pkill -x allmyagents-desktop || true
+          pkill -f hubctl || true
+          sleep 5
+          HUB="$HOME/Library/Application Support/direct.cec.allmyagents/hub/apps/hub"
+          MARKER="$HUB/node_modules/.ama-deps-ok"
+          test -s "$MARKER"
+          NATIVE="$(find "$HUB/node_modules/better-sqlite3" -name '*.node' -print -quit)"
+          test -n "$NATIVE"
+          : > "$NATIVE"
+          test -s "$MARKER"
+          open -a /Applications/AllMyAgents.app
+          for i in $(seq 1 180); do
+            if curl -fsS --max-time 2 http://127.0.0.1:7777/api/health -o /tmp/health-repaired.json; then break; fi
+            sleep 2
+          done
+          test -s /tmp/health-repaired.json
+          LOG="$HOME/Library/Application Support/direct.cec.allmyagents/logs/desktop.log"
+          grep -F "persisted dependencies are broken; repairing once" "$LOG"
+          grep -F "hub dependencies installed and verified" "$LOG"
+          test -s "$NATIVE"
+          cat /tmp/health-repaired.json
+      - name: Installer node guard fails loudly for a non-executable runtime
+        run: |
+          set -euo pipefail
+          NODE=/Applications/AllMyAgents.app/Contents/Resources/hub-runtime/node/node
+          chmod -x "$NODE"
+          if [ -x "$NODE" ]; then
+            echo "::error::runner filesystem did not preserve the removed executable bit"
+            exit 1
+          fi
+          set +e
+          /bin/bash -c '[ -x "$1" ] || { echo "the bundled Node runtime is missing or not executable at $1 -- refusing to leave a dead-window install" >&2; exit 1; }' guard "$NODE" 2>/tmp/node-guard.log
+          rc=$?
+          set -e
+          test "$rc" -ne 0
+          grep -F "refusing to leave a dead-window install" /tmp/node-guard.log
+      - name: Piped uninstall prompts on /dev/tty and --yes works headlessly
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/uninstall-prompt"
+          mkdir -p "$ROOT/home/Library/Application Support/direct.cec.allmyagents" "$ROOT/apps"
+          touch "$ROOT/home/Library/Application Support/direct.cec.allmyagents/probe"
+          printf 'y\n' | script -q /dev/null /bin/bash -c "HOME='$ROOT/home' AMA_DEST='$ROOT/apps' cat '$GITHUB_WORKSPACE/scripts/install-macos.sh' | HOME='$ROOT/home' AMA_DEST='$ROOT/apps' /bin/bash -s -- --uninstall"
+          test ! -e "$ROOT/home/Library/Application Support/direct.cec.allmyagents"
+
+          ROOT="$RUNNER_TEMP/uninstall-yes"
+          mkdir -p "$ROOT/home/Library/Application Support/direct.cec.allmyagents" "$ROOT/apps"
+          cat scripts/install-macos.sh | HOME="$ROOT/home" AMA_DEST="$ROOT/apps" /bin/bash -s -- --uninstall --yes
+          test ! -e "$ROOT/home/Library/Application Support/direct.cec.allmyagents"
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-p0-${{ matrix.runner }}
+          path: |
+            /tmp/desktop-first.log
+            /tmp/health-first.json
+            /tmp/health-repaired.json
+            /tmp/node-guard.log
+      - name: Cleanup
+        if: always()
+        run: |
+          pkill -x allmyagents-desktop 2>/dev/null || true
+          pkill -f hubctl 2>/dev/null || true
+          rm -rf /Applications/AllMyAgents.app

@@ -81,13 +81,19 @@ rm -f  /usr/local/bin/allmyagents ~/.local/bin/allmyagents     # the `allmyagent
 
 The first path is the one that matters: it holds `profiles/`, and that is where your Claude and Codex logins live. Deleting the app alone leaves them on disk.
 
-To have the installer do all of it — including removing the PATH line it added — run it the same way you installed it:
+To remove the app, launcher, PATH line, and regenerable hub files while keeping chats and logins, run it the same way you installed it:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nathanfraske/AllMyAgents/main/scripts/install-macos.sh | bash -s -- --uninstall
 ```
 
 `bash -s --` is what forwards the flag to a script arriving on a pipe. The install command above leaves no file on your disk, so there is no local `install-macos.sh` to invoke — earlier versions of this README told you to run one, which never worked for anyone who installed the documented way.
+
+To also permanently delete chats, settings, worktrees, and saved Claude/Codex logins, explicitly add `--purge-data`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nathanfraske/AllMyAgents/main/scripts/install-macos.sh | bash -s -- --uninstall --purge-data
+```
 
 <details>
 <summary>Why a command instead of just the .dmg</summary>

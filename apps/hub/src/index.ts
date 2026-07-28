@@ -44,6 +44,19 @@ import {
   type PreflightFailure,
 } from './preflight.js'
 
+// The desktop shell runs the shipped hub entry with this flag before trusting a persisted
+// node_modules tree. Static ESM imports have already linked the hub's real module graph by the time
+// this executes; opening an in-memory Journal additionally loads and executes better-sqlite3's native
+// addon, the failure most likely to survive an interrupted install or an architecture/ABI change.
+// Nothing under HUB_DATA_DIR or HUB_PROFILES_DIR is touched in this mode.
+if (process.env.AMA_VERIFY_HUB_DEPS === '1') {
+  const verificationJournal = new Journal(':memory:')
+  verificationJournal.db.prepare('SELECT 1 AS ok').get()
+  verificationJournal.db.close()
+  console.log('[hub-deps] verified entry module graph and better-sqlite3 native binding')
+  process.exit(0)
+}
+
 const repoRoot = path.resolve(import.meta.dirname, '..', '..', '..')
 const supervised = process.env.HUB_SUPERVISED === '1' && typeof process.send === 'function'
 // HUB_DATA_DIR relocates the journal/config/worktrees/unfiled-workspaces/device-token root off the repo's data/. Profiles keep

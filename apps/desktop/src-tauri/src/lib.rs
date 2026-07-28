@@ -37,7 +37,9 @@ use std::ffi::OsString;
 use std::fs;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, ExitStatus};
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
 use std::io::{Read, Write};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -476,6 +478,15 @@ fn deps_marker(dest_hub: &Path) -> PathBuf {
     dest_hub.join("node_modules").join(".ama-deps-ok")
 }
 
+fn deps_marker_want(app: &AppHandle, manifest: &str) -> String {
+    format!(
+        "allmyagents-desktop={}\nmanifest-bytes={}\n{}",
+        app.package_info().version,
+        manifest.len(),
+        manifest
+    )
+}
+
 /// Cheap pre-check (run on the main thread) so we only pop the setup window when a
 /// first-run (or post-update) `npm install` is actually needed.
 fn release_needs_install(app: &AppHandle) -> bool {
@@ -488,7 +499,56 @@ fn release_needs_install(app: &AppHandle) -> bool {
     let have = hub_home(app)
         .map(|h| fs::read_to_string(deps_marker(&h.join("apps").join("hub"))).unwrap_or_default())
         .unwrap_or_default();
-    want != have
+    deps_marker_want(app, &want) != have
+}
+
+fn run_npm_install(
+    node_cmd: &Path,
+    npm_cli: &Path,
+    node_dir: &Path,
+    dest_hub: &Path,
+) -> std::io::Result<ExitStatus> {
+    Command::new(node_cmd)
+        .arg(plain(npm_cli))
+        .args(["install", "--omit=dev", "--no-audit", "--no-fund", "--loglevel=error"])
+        .current_dir(plain(dest_hub))
+        .env("PATH", prepend_path(&[node_dir.to_path_buf()]))
+        .status()
+}
+
+/// Load the hub's own production entry with the bundled Node. Verification mode stops before touching
+/// operator data or opening a port, but only after the real ESM graph links and better-sqlite3 executes
+/// an in-memory query.
+fn verify_hub_dependencies(
+    node_cmd: &Path,
+    node_dir: &Path,
+    dest_hub: &Path,
+) -> Result<(), String> {
+    let entry = dest_hub.join("dist").join("index.js");
+    let output = Command::new(node_cmd)
+        .arg(plain(&entry))
+        .current_dir(plain(dest_hub))
+        .env("PATH", prepend_path(&[node_dir.to_path_buf()]))
+        .env("AMA_VERIFY_HUB_DEPS", "1")
+        .output()
+        .map_err(|e| format!("could not run dependency verification: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let tail = stderr
+        .chars()
+        .rev()
+        .take(2000)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    Err(format!(
+        "dependency verification exited {}: {}",
+        output.status,
+        tail.trim()
+    ))
 }
 
 /// Minimal base64 (no dependency) for embedding the splash HTML in a data: URL.
@@ -688,51 +748,76 @@ fn release_boot(
         logln("[desktop] no lockfile in the payload — dependency versions will resolve unpinned");
     }
 
-    // Deps ready when the marker matches the shipped manifest (handles first run
-    // and dependency changes shipped by an app update).
-    let want = fs::read_to_string(dest_hub.join("package.json")).unwrap_or_default();
+    // A marker is version-aware and means "this app verified this tree", not "npm exited zero".
+    // Even a matching marker gets a live check so later corruption cannot persist indefinitely.
+    let manifest = fs::read_to_string(dest_hub.join("package.json")).unwrap_or_default();
+    let want = deps_marker_want(&app, &manifest);
     let marker = deps_marker(&dest_hub);
     let have = fs::read_to_string(&marker).unwrap_or_default();
-    if want.is_empty() || want != have {
-        logln("[desktop] first-run: installing hub dependencies via npm…");
-        // plain(): a verbatim \\?\ path here is what made every Windows install fail — node cannot
-        // resolve a `\\?\`-prefixed main module and exits before npm starts. See plain().
-        let status = Command::new(&node_cmd)
-            .arg(plain(&npm_cli))
-            .args(["install", "--omit=dev", "--no-audit", "--no-fund", "--loglevel=error"])
-            .current_dir(plain(&dest_hub))
-            // Node on PATH so npm's lifecycle scripts (e.g. better-sqlite3's
-            // prebuild-install) that shell out to `node` resolve it.
-            .env("PATH", prepend_path(std::slice::from_ref(&node_dir)))
-            .status();
-        match status {
-            Ok(s) if s.success() => {
-                let _ = fs::write(&marker, &want);
-                logln("[desktop] hub dependencies installed");
+    if manifest.is_empty() {
+        splash_error(&splash, "The shipped hub manifest is missing or empty.");
+        return;
+    }
+
+    let mut install_needed = have != want;
+    if !install_needed {
+        match verify_hub_dependencies(&node_cmd, &node_dir, &dest_hub) {
+            Ok(()) => logln("[desktop] persisted hub dependencies verified"),
+            Err(e) => {
+                logln(&format!("[desktop] persisted dependencies are broken; repairing once: {e}"));
+                install_needed = true;
+                let _ = fs::remove_file(&marker);
+                if let Err(remove_error) = fs::remove_dir_all(dest_hub.join("node_modules")) {
+                    if remove_error.kind() != std::io::ErrorKind::NotFound {
+                        splash_error(&splash, &format!("Could not clear broken hub dependencies: {remove_error}"));
+                        return;
+                    }
+                }
             }
+        }
+    }
+    if install_needed {
+        logln("[desktop] installing hub dependencies via bundled npm…");
+        match run_npm_install(&node_cmd, &npm_cli, &node_dir, &dest_hub) {
+            Ok(s) if s.success() => {}
             Ok(s) => {
-                // Do NOT claim this is a network problem. It said "an internet connection is required"
-                // for ANY non-zero exit, so a path bug that made node die before npm even started was
-                // reported to two testers as their wifi being at fault — which is precisely why the
-                // failure went undiagnosed. State what actually happened and where to look.
-                splash_error(
-                    &splash,
-                    &format!(
-                        "Could not install the hub's dependencies (npm exited {}). This is usually a missing internet connection on first run, but the details are in the log: {}",
-                        s.code().unwrap_or(-1),
-                        log_path(&app).map(|p| p.display().to_string()).unwrap_or_else(|| "(no log)".into())
-                    ),
-                );
+                splash_error(&splash, &format!("Could not install the hub's dependencies (npm exited {}). See {}.", s.code().unwrap_or(-1), log_path(&app).map(|p| p.display().to_string()).unwrap_or_else(|| "(no log)".into())));
                 return;
             }
             Err(e) => {
-                splash_error(
-                    &splash,
-                    &format!("Could not run the bundled npm ({e}). An internet connection is required the first time."),
-                );
+                splash_error(&splash, &format!("Could not run the bundled npm: {e}"));
                 return;
             }
         }
+
+        if let Err(first_error) = verify_hub_dependencies(&node_cmd, &node_dir, &dest_hub) {
+            logln(&format!("[desktop] installed tree failed verification; clean reinstalling once: {first_error}"));
+            let _ = fs::remove_file(&marker);
+            if let Err(e) = fs::remove_dir_all(dest_hub.join("node_modules")) {
+                splash_error(&splash, &format!("Could not clear the failed dependency tree: {e}"));
+                return;
+            }
+            match run_npm_install(&node_cmd, &npm_cli, &node_dir, &dest_hub) {
+                Ok(s) if s.success() => {}
+                Ok(s) => {
+                    splash_error(&splash, &format!("The clean dependency reinstall failed (npm exited {}). See {}.", s.code().unwrap_or(-1), log_path(&app).map(|p| p.display().to_string()).unwrap_or_else(|| "(no log)".into())));
+                    return;
+                }
+                Err(e) => {
+                    splash_error(&splash, &format!("Could not run the clean dependency reinstall: {e}"));
+                    return;
+                }
+            }
+            if let Err(e) = verify_hub_dependencies(&node_cmd, &node_dir, &dest_hub) {
+                splash_error(&splash, &format!("Hub dependencies are still unusable after a clean reinstall. See {}. Verification said: {e}", log_path(&app).map(|p| p.display().to_string()).unwrap_or_else(|| "(no log)".into())));
+                return;
+            }
+        }
+        if let Err(e) = fs::write(&marker, &want) {
+            splash_error(&splash, &format!("Dependencies verified, but readiness could not be recorded: {e}"));
+            return;
+        }
+        logln("[desktop] hub dependencies installed and verified");
     }
 
     // First-run app-data materialization: journal/config/worktrees + managed
@@ -918,6 +1003,74 @@ async fn updater_install(app: AppHandle) -> Result<(), String> {
     app.restart();
 }
 
+/// Remove a macOS install without involving the hub. A detached helper waits for this process to exit
+/// before deleting the running bundle; operator data is preserved unless the UI passes the explicit
+/// opt-in. The regenerable identifier-scoped hub home is always removed.
+#[cfg(desktop)]
+#[tauri::command]
+fn uninstall_macos(app: AppHandle, remove_user_data: bool) -> Result<(), String> {
+    // No `return` here: with the macOS arm below cfg'd out, this block IS the tail expression on every
+    // other platform, and an explicit return trips clippy::needless_return — which is a hard error under
+    // the `-D warnings` gate that CI runs on Windows.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, remove_user_data);
+        Err("In-app uninstall is currently available on macOS only.".to_string())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let exe = std::env::current_exe().map_err(|e| format!("could not locate the running app: {e}"))?;
+        let bundle = exe
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .ok_or_else(|| "could not resolve the application bundle".to_string())?
+            .to_path_buf();
+        if bundle.extension().and_then(|s| s.to_str()) != Some("app") {
+            return Err(format!("refusing to remove unexpected bundle path {}", bundle.display()));
+        }
+        let hub_root = app
+            .path()
+            .app_local_data_dir()
+            .map_err(|e| format!("could not resolve the regenerable hub directory: {e}"))?;
+        let user_root = app_data_root(&app)
+            .ok_or_else(|| "could not resolve the AllMyAgents user-data directory".to_string())?;
+        let pid = std::process::id().to_string();
+        let script = r#"
+pid="$1"; bundle="$2"; hub="$3"; user_data="$4"; purge="$5"
+while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
+rm -rf -- "$bundle" "$hub"
+for launcher in /usr/local/bin/allmyagents "$HOME/.local/bin/allmyagents" /opt/homebrew/bin/allmyagents; do
+  if [ -f "$launcher" ] && grep -qF "generated by the AllMyAgents installer" "$launcher" 2>/dev/null; then
+    rm -f -- "$launcher"
+  fi
+done
+if [ "$purge" = 1 ]; then rm -rf -- "$user_data"; fi
+"#;
+        let mut helper = Command::new("/bin/sh");
+        helper
+            .arg("-c")
+            .arg(script)
+            .arg("allmyagents-uninstall")
+            .arg(&pid)
+            .arg(&bundle)
+            .arg(&hub_root)
+            .arg(&user_root)
+            .arg(if remove_user_data { "1" } else { "0" })
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        set_own_group(&mut helper);
+        helper.spawn().map_err(|e| format!("could not start the uninstall helper: {e}"))?;
+        logln(&format!(
+            "[desktop] uninstall scheduled; operator data {}",
+            if remove_user_data { "will be deleted" } else { "will be kept" }
+        ));
+        app.exit(0);
+        Ok(())
+    }
+}
+
 /// Best-effort teardown of the hub child and its whole process tree. The child is spawned in its own
 /// process group (`set_own_group`), which is what makes the POSIX branch below able to reach the
 /// descendants at all.
@@ -970,6 +1123,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             updater_check,
             updater_install,
+            uninstall_macos,
             hub_device_token
         ]);
 

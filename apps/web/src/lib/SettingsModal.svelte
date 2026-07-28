@@ -145,6 +145,26 @@
     }
   }
 
+  let uninstallBusy = $state(false)
+  let uninstallError = $state('')
+  let removeUserData = $state(false)
+  async function uninstallMac(): Promise<void> {
+    const consequence = removeUserData
+      ? 'This removes the app, all chats and settings, and every saved Claude and Codex login. This cannot be undone.'
+      : 'This removes the app and its regenerable hub files. Your chats, settings, and saved Claude and Codex logins will be kept.'
+    if (!confirm(`${consequence}\n\nContinue?`)) return
+    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T> } } }).__TAURI__?.core?.invoke
+    if (!invoke) return
+    uninstallBusy = true
+    uninstallError = ''
+    try {
+      await invoke<void>('uninstall_macos', { removeUserData })
+    } catch (error) {
+      uninstallError = error instanceof Error ? error.message : String(error)
+      uninstallBusy = false
+    }
+  }
+
   let revealToken = $state(false)
   let revealedToken = $state('')
   let copied = $state(false)
@@ -637,6 +657,15 @@
         {/if}
       </div>
       <p class="hint dim">Cleanly recycles the hub under the supervisor (blue-green flip — sub-second, running sessions restored). No approval needed; a plain hub with no supervisor can't self-restart.</p>
+      {#if inTauri}
+        <div class="uninstall-block">
+          <h4>Uninstall AllMyAgents</h4>
+          <p class="hint dim">Works even when the hub is down. By default it removes the app and regenerable hub files but keeps your chats, settings, and vendor credentials.</p>
+          <label class="opt"><input type="checkbox" bind:checked={removeUserData} /> Also permanently delete chats, settings, and saved Claude/Codex logins</label>
+          <button class="btn btn-danger" onclick={uninstallMac} disabled={uninstallBusy}>{uninstallBusy ? 'Uninstalling…' : 'Uninstall app'}</button>
+          {#if uninstallError}<p class="hint upd-err">{uninstallError}</p>{/if}
+        </div>
+      {/if}
     </section>
 
     <section class="danger" class:tab-hidden={!settingsTabHasSection(activeTab, 'Danger Zone')}>
