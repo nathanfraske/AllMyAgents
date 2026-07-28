@@ -124,7 +124,7 @@ export class UsageMonitor {
   }
 
   async pollClaudeOnce(): Promise<void> {
-    for (const p of this.profiles.filter((x) => x.provider === 'claude')) {
+    for (const p of this.profiles.filter((x) => x.provider === 'claude' && x.available !== false && x.authStatus !== 'signed_out')) {
       try {
         const lines = await readClaudeUsage(p.dir)
         if (lines.length === 0) continue
@@ -144,7 +144,7 @@ export class UsageMonitor {
 
   async pollCodexOnce(): Promise<void> {
     if (!this.codexReader) return
-    for (const p of this.profiles.filter((x) => x.provider === 'codex')) {
+    for (const p of this.profiles.filter((x) => x.provider === 'codex' && x.available !== false && x.authStatus !== 'signed_out')) {
       try {
         const raw = (await this.codexReader(p.id)) as { rateLimits?: CodexLimitInfo & { primary?: CodexLimitInfo } }
         const limits = raw?.rateLimits

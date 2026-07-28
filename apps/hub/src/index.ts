@@ -15,6 +15,7 @@ import {
 } from './journal.js'
 import { ProjectStore } from './projects.js'
 import { scanProfiles, setClaudeConnectorPolicy } from './profiles.js'
+import { ProfileOwnership } from './profileOwnership.js'
 import { SessionManager } from './sessions.js'
 import { SessionStore } from './store.js'
 import { startServer } from './server.js'
@@ -128,6 +129,24 @@ try {
 journal.setMaxListeners(64)
 const store = new SessionStore(journal.db)
 const profiles = scanProfiles(profilesDir)
+const profileOwnership = new ProfileOwnership({
+  ownerId: process.env.HUB_PROFILE_OWNER_ID ?? crypto.randomUUID(),
+  pid: Number(process.env.HUB_PROFILE_OWNER_PID ?? process.pid),
+  port: Number(process.env.HUB_PROFILE_OWNER_PORT ?? process.env.HUB_PORT ?? 7777),
+})
+for (const profile of profiles) {
+  const claim = profileOwnership.claim(profile.id, profile.dir)
+  profile.authStatus = 'signed_in'
+  if (!claim.owned) {
+    profile.available = false
+    profile.ownerPort = claim.owner.port
+    profile.unavailableReason = `Another AllMyAgents hub (port ${claim.owner.port}) is using ${profile.id}. This hub will not refresh its credentials.`
+    console.error(`[profiles] ${profile.unavailableReason}`)
+  } else {
+    profile.available = true
+    console.log(`[profiles] owns ${profile.id}${claim.reclaimed ? ' (reclaimed stale claim)' : ''}`)
+  }
+}
 const profileMap = new Map(profiles.map((p) => [p.id, p]))
 const approvals = new ApprovalService(journal)
 const usage = new UsageMonitor(journal, profiles, config)
@@ -388,6 +407,14 @@ restartState.booted = true
 function rescanProfiles(): typeof profiles {
   for (const p of scanProfiles(profilesDir)) {
     if (!profileMap.has(p.id)) {
+      const claim = profileOwnership.claim(p.id, p.dir)
+      p.available = claim.owned
+      p.authStatus = 'signed_in'
+      if (!claim.owned) {
+        p.ownerPort = claim.owner.port
+        p.unavailableReason = `Another AllMyAgents hub (port ${claim.owner.port}) is using ${p.id}. This hub will not refresh its credentials.`
+        console.error(`[profiles] ${p.unavailableReason}`)
+      }
       profileMap.set(p.id, p)
       usage.addProfile(p) // pushes into the shared `profiles` array (same reference)
       journal.append(null, 'profiles/added', { id: p.id, provider: p.provider })
@@ -425,7 +452,7 @@ const meshPeerPorts: number[] = Array.isArray(config.mesh?.peerPorts)
   : []
 
 // Listen on the BOOT port (0 → ephemeral for a green); the server reports its actual port back.
-const server = startServer({ port: bootPort, defaultCwd: dataDir, profilesDir, journal, sessions, profiles, approvals, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity: (projectId) => worktreeCollisions.projectActivity(projectId) })
+const server = startServer({ port: bootPort, defaultCwd: dataDir, profilesDir, profileOwnership, journal, sessions, profiles, approvals, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity: (projectId) => worktreeCollisions.projectActivity(projectId) })
 
 // Register the mesh advert — factored so a promoted green can (re)register once it owns the port.
 function registerMesh(): void {
@@ -528,6 +555,7 @@ function shutdown(signal: string): void {
   // land even if the guard fires first.
   mesh.stopAutoRegister()
   void Promise.allSettled([mesh.deregister(), sessions.shutdown()]).finally(() => {
+    if (!supervised) profileOwnership.releaseAll()
     clearTimeout(guard)
     console.log(`[hub] ${signal} — stopped`)
     done()

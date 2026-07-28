@@ -17,9 +17,10 @@ import { tokenMatches } from './deviceToken.js'
 import { pickFolder } from './native.js'
 import { computeStats } from './stats.js'
 import { buildFleet, probeHubHealth } from './fleet.js'
-import { cancelLogin, credentialsExist, getLogin, startLogin } from './loginLauncher.js'
+import { archiveCredentialForReauth, cancelLogin, credentialsExist, getLogin, startLogin } from './loginLauncher.js'
 import { readProjectConfig } from './importScan.js'
 import { pickableProfiles, setClaudeConnectorPolicy } from './profiles.js'
+import { ProfileOwnership } from './profileOwnership.js'
 import { asFileWriteDiffDensity } from './types.js'
 import type { DangerFlags, HubEvent, HubPrefs, ManagerAgentType, Profile, Provider } from './types.js'
 import type { Executor } from './executor.js'
@@ -351,6 +352,7 @@ export interface ServerOptions {
   /** The managed-profiles root (HUB_PROFILES_DIR or repo profiles/) — where the login flow creates a new
    *  profile dir. Threaded from index.ts so it stays in lockstep with where the hub SCANS profiles. */
   profilesDir: string
+  profileOwnership?: ProfileOwnership
   journal: Journal
   sessions: SessionManager
   profiles: Profile[]
@@ -455,6 +457,11 @@ export function persistPrefs(
 
 export function startServer(opts: ServerOptions): http.Server {
   const { port, defaultCwd, profilesDir, journal, sessions, profiles, approvals, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity } = opts
+  const profileOwnership = opts.profileOwnership ?? new ProfileOwnership({
+    ownerId: `server-${process.pid}`,
+    pid: process.pid,
+    port,
+  })
   // Runtime repositories live beside the journal/config under HUB_DATA_DIR, never in the shipped hub
   // payload or profiles tree. GitHubImportService keeps auth entirely inside an existing `gh` session.
   const github = new GitHubImportService(
@@ -585,9 +592,19 @@ export function startServer(opts: ServerOptions): http.Server {
           return
         }
         const profileDir = path.join(profilesDir, name)
-        if (credentialsExist(provider as Provider, profileDir)) {
+        const reauth = body.reauth === true
+        try {
+          profileOwnership.assertOwned(name, profileDir, reauth ? 'replace credentials' : 'create credentials')
+        } catch (error) {
+          json(res, { ok: false, error: error instanceof Error ? error.message : String(error) }, 409)
+          return
+        }
+        if (credentialsExist(provider as Provider, profileDir) && !reauth) {
           json(res, { ok: false, error: `profiles/${name} already has ${provider} credentials` }, 409)
           return
+        }
+        if (reauth) {
+          archiveCredentialForReauth(provider as Provider, profileDir)
         }
         const login = await startLogin(provider as Provider, profileDir)
         const ok = login.status === 'waiting' || login.status === 'complete'
@@ -620,6 +637,10 @@ export function startServer(opts: ServerOptions): http.Server {
         if (login.status === 'complete') {
           const list = rescanProfiles()
           const profile = list.find((p) => p.id === name)
+          if (profile) {
+            profile.authStatus = 'signed_in'
+            profile.authError = undefined
+          }
           loginNames.delete(loginId)
           json(res, {
             ok: true,

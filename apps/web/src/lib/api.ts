@@ -14,6 +14,11 @@ export interface AttachmentRef {
 export interface ProfileInfo {
   id: string
   provider: 'claude' | 'codex'
+  available?: boolean
+  unavailableReason?: string
+  ownerPort?: number
+  authStatus?: 'signed_in' | 'signed_out'
+  authError?: string
 }
 
 export interface ProjectInfo {
@@ -600,8 +605,8 @@ export const api = {
   profiles: () => jget<ProfileInfo[]>('/api/profiles'),
   stats: () => jget<StatsResult>('/api/stats'),
   rescanProfiles: () => jpost<ProfileInfo[] | ApiError>('/api/profiles/rescan'),
-  login: (provider: 'claude' | 'codex', name: string) =>
-    jpost<LoginResult>('/api/accounts/login', { provider, name }),
+  login: (provider: 'claude' | 'codex', name: string, reauth = false) =>
+    jpost<LoginResult>('/api/accounts/login', { provider, name, reauth }),
   loginStatus: (id: string) => jget<LoginResult>(`/api/accounts/login/${encodeURIComponent(id)}`),
   cancelLogin: (id: string) => jdelete<LoginResult>(`/api/accounts/login/${encodeURIComponent(id)}`),
   pickFolder: () => jpost<{ path: string }>('/api/pick-folder'),

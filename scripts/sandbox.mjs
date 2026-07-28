@@ -16,11 +16,9 @@
 //   - port          → 7788 by default   never 7777, enforced below rather than by convention
 //   - process tree  → its own hubctl + hub + agent worker, tracked by a pidfile here
 //
-// WHAT IS SHARED, deliberately: the managed PROFILES directory, i.e. vendor credentials. Without it no
-// agent can actually run and the sandbox can only test the shell. Sharing is read-mostly (the hub writes
-// settings.json when connector policy changes), so pass --isolated-profiles for a copy-free empty profile
-// root when testing anything that touches profile settings. The tradeoff is stated rather than hidden
-// because "which credentials is this using" should never be a guess.
+// PROFILES ARE ISOLATED BY DEFAULT. A sandbox with no logins cannot run an agent, but that failure is
+// recoverable; sharing rotating OAuth credentials with another hub can sign the operator out. Explicit
+// --shared-profiles is available for exceptional manual use and is protected by the hub's ownership claim.
 import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -40,7 +38,7 @@ const PORT = Number(process.env.SANDBOX_PORT ?? 7788)
 
 const argv = process.argv.slice(2)
 const cmd = argv[0] ?? 'status'
-const isolatedProfiles = argv.includes('--isolated-profiles')
+const isolatedProfiles = !argv.includes('--shared-profiles')
 
 // ---- guards --------------------------------------------------------------------------------------
 // These are checks, not comments, because "the sandbox must not touch the live hub" is exactly the kind
@@ -134,6 +132,9 @@ async function up() {
     HUBCTL_DEV: '1',
     HUB_FIXED_PORT: String(PORT),
     HUB_DATA_DIR: DATA,
+    // Also suppress registration of ~/.claude and ~/.codex as resumable homes. Empty managed profiles
+    // are not isolation if a restored/imported session can still launch against the operator's CLI home.
+    HUB_ISOLATED_PROFILES: isolatedProfiles ? '1' : '0',
     // Never advertise a sandbox on the mesh: a disposable hub must not appear in the operator's fleet
     // roster, and certainly must not be reachable from another machine.
     MESH_EXPOSE: '0',
@@ -173,6 +174,8 @@ async function up() {
       console.log(`sandbox up  pid=${child.pid}  http://127.0.0.1:${PORT}`)
       console.log(`  data     ${DATA}`)
       console.log(`  profiles ${isolatedProfiles ? PROFILES + ' (isolated, empty)' : 'SHARED with your real profiles'}`)
+      if (isolatedProfiles) console.log('  agents   unavailable until you sign in a throwaway sandbox account')
+      else console.warn('  WARNING  --shared-profiles was explicitly requested; live profile ownership will be enforced')
       console.log(`  log      ${LOG}`)
       return
     }

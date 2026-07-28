@@ -5,7 +5,7 @@ import path from 'node:path'
 import { PassThrough } from 'node:stream'
 import type { ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 import { describe, expect, it } from 'vitest'
-import { loginCaptureError, parseLoginOutput, startLogin } from './loginLauncher.js'
+import { archiveCredentialForReauth, getLogin, loginCaptureError, parseLoginOutput, startLogin } from './loginLauncher.js'
 
 function failedChild(output: string): ChildProcessWithoutNullStreams {
   const child = new EventEmitter() as ChildProcessWithoutNullStreams
@@ -20,6 +20,23 @@ function failedChild(output: string): ChildProcessWithoutNullStreams {
   queueMicrotask(() => {
     stderr.write(output)
     child.emit('close', 1, null)
+  })
+  return child
+}
+
+function successfulClaudeChild(profileDir: string): ChildProcessWithoutNullStreams {
+  const child = new EventEmitter() as ChildProcessWithoutNullStreams
+  const stdout = new PassThrough()
+  Object.assign(child, {
+    stdin: new PassThrough(),
+    stdout,
+    stderr: new PassThrough(),
+    killed: false,
+    kill: () => true,
+  })
+  queueMicrotask(() => {
+    stdout.write('https://claude.com/cai/oauth/authorize?client_id=throwaway&state=test\n')
+    setTimeout(() => fs.writeFileSync(path.join(profileDir, '.credentials.json'), '{"oauth":"fresh"}'), 15)
   })
   return child
 }
@@ -88,6 +105,28 @@ describe('vendor login URL capture', () => {
       expect(result.status).toBe('failed')
       expect(result.error).toContain('Codex did not provide a sign-in URL')
       expect(result.error).toContain('Login failed before emitting a link.')
+    } finally {
+      fs.rmSync(profileDir, { recursive: true, force: true })
+    }
+  })
+
+  it('re-authenticates a genuinely invalid credential instead of accepting the stale file', async () => {
+    const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-login-invalid-'))
+    try {
+      const credential = path.join(profileDir, '.credentials.json')
+      fs.writeFileSync(credential, '{"oauth":"deliberately-invalid"}')
+      const archived = archiveCredentialForReauth('claude', profileDir)
+      expect(archived && fs.existsSync(archived)).toBe(true)
+      expect(fs.existsSync(credential)).toBe(false)
+
+      const attempt = await startLogin('claude', profileDir, {
+        spawnProcess: (() => successfulClaudeChild(profileDir)) as unknown as typeof spawn,
+        loginTimeoutMs: 2_000,
+      })
+      expect(attempt.status).toBe('waiting')
+      await new Promise((resolve) => setTimeout(resolve, 1_100))
+      expect(getLogin(attempt.id)?.status).toBe('complete')
+      expect(fs.readFileSync(credential, 'utf8')).toContain('fresh')
     } finally {
       fs.rmSync(profileDir, { recursive: true, force: true })
     }

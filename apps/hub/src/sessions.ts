@@ -22,6 +22,10 @@ import type {
   SessionRecord,
   SessionStatus,
 } from './types.js'
+
+export function isOAuthSignedOutError(message: string): boolean {
+  return /oauth session expired|could not be refreshed|refresh[_ -]?token[_ -]?reused|invalid[_ -]?grant|authentication.*expired/i.test(message)
+}
 import { writeManagedInstructions, agentContract } from './instructions.js'
 import type { InstructionStore } from './instructions.js'
 import { identityOf, readableScopes, type SessionIdentity } from './identity.js'
@@ -969,7 +973,7 @@ export class SessionManager {
     // spawn) — deliberately NOT to the usage-polled set, so the hub never eagerly spawns `/usage`
     // probes into the user's real ~/.claude or touches ~/.codex's token on a timer. The vendor
     // process is spawned against the home only when the user explicitly resumes an imported chat.
-    this.registerDefaultHomes()
+    if (process.env.HUB_ISOLATED_PROFILES !== '1') this.registerDefaultHomes()
     this.loadRecords()
     // WORKER MODE: the smart re-attach (attachWorker) decides each restored session's fate against the
     // still-running worker, and is driven ASYNCHRONOUSLY off the WorkerClient's 'attached' event — not
@@ -1945,12 +1949,16 @@ export class SessionManager {
   private profileOf(record: SessionRecord): Profile {
     const profile = this.profiles.get(record.profileId)
     if (!profile) throw new Error(`unknown profile: ${record.profileId}`)
+    if (profile.available === false) throw new Error(profile.unavailableReason ?? `profile ${profile.id} is unavailable`)
+    if (profile.authStatus === 'signed_out') throw new Error(`${profile.id} is signed out. Sign in again from Settings → Accounts.`)
     return profile
   }
 
   async create(profileId: string, opts: CreateOptions): Promise<SessionRecord> {
     const profile = this.profiles.get(profileId)
     if (!profile) throw new Error(`unknown profile: ${profileId}`)
+    if (profile.available === false) throw new Error(profile.unavailableReason ?? `profile ${profileId} is unavailable`)
+    if (profile.authStatus === 'signed_out') throw new Error(`${profileId} is signed out. Sign in again from Settings → Accounts.`)
     this.usage.assertNotBlocked(profileId)
     const id = crypto.randomUUID()
     // Resolve a project (named folder) into a working directory / repo, if given.
@@ -2488,6 +2496,16 @@ export class SessionManager {
       this.interruptedAt.delete(sessionId)
       this.setStatusById(sessionId, 'idle')
       return
+    }
+    const record = this.sessions.get(sessionId)
+    if (record && isOAuthSignedOutError(message)) {
+      const profile = this.profiles.get(record.profileId)
+      if (profile) {
+        profile.authStatus = 'signed_out'
+        profile.authError = message
+      }
+      message = `${record.profileId} is signed out because its OAuth session expired and could not be refreshed. Sign in again from Settings → Accounts.`
+      this.journal.append(null, 'profile/auth', { profileId: record.profileId, status: 'signed_out', message })
     }
     this.journal.append(sessionId, 'session/error', { message })
     this.setStatusById(sessionId, 'error')

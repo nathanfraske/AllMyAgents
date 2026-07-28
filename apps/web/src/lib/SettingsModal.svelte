@@ -199,10 +199,6 @@
     })
   })
 
-  const loginCmd = $derived(
-    `pnpm login:${addProvider} profiles/${addName.trim() || (addProvider + '-b')}`
-  )
-
   async function rescan(): Promise<void> {
     rescanning = true
     const result = await store.rescanProfiles()
@@ -248,7 +244,7 @@
 
   // The hub captures OAuth while the desktop shell owns opening the browser. A plain browser reserves
   // a tab synchronously so popup blocking cannot turn the delayed URL handoff into a silent no-op.
-  async function login(): Promise<void> {
+  async function login(reauth = false): Promise<void> {
     const name = addName.trim()
     if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
       loginState = 'error'
@@ -264,7 +260,7 @@
     loginUrl = ''
     loginCode = ''
     try {
-      const r = await api.login(addProvider, name)
+      const r = await api.login(addProvider, name, reauth)
       if (loginRequestCancelled || loginState !== 'waiting') {
         closePreparedTarget(target)
         if (r.loginId) void api.cancelLogin(r.loginId)
@@ -297,6 +293,12 @@
       loginMsg = e instanceof Error ? e.message : 'Login request failed.'
       loginId = ''
     }
+  }
+
+  function reauthenticate(profile: (typeof store.profiles)[number]): void {
+    addProvider = profile.provider
+    addName = profile.id
+    void login(true)
   }
 
   async function cancelActiveLogin(): Promise<void> {
@@ -402,10 +404,18 @@
       <h3>Accounts</h3>
       <div class="accounts">
         {#each store.profiles as p (p.id)}
-          <div class="acct">
+          <div class="acct" class:signed-out={p.authStatus === 'signed_out'} class:unavailable={p.available === false}>
             <ProviderLogo provider={p.provider} size={14} />
             <span class="aid">{p.id}</span>
             <span class="aprov dim">{p.provider}</span>
+            {#if p.authStatus === 'signed_out'}
+              <span class="status error" title={p.authError}>Signed out</span>
+              <button class="btn btn-primary" onclick={() => reauthenticate(p)}>Sign in again</button>
+            {:else if p.available === false}
+              <span class="status error" title={p.unavailableReason}>
+                In use by another hub{p.ownerPort ? ` (port ${p.ownerPort})` : ''}
+              </span>
+            {/if}
           </div>
         {/each}
       </div>
@@ -416,7 +426,7 @@
             <option value="codex">Codex</option>
           </select>
           <input placeholder="profile name (e.g. claude-work)" bind:value={addName} disabled={loginState === 'waiting'} />
-          <button class="btn btn-primary" onclick={login} disabled={loginState === 'waiting'}>
+          <button class="btn btn-primary" onclick={() => login(false)} disabled={loginState === 'waiting'}>
             {loginState === 'waiting' ? 'waiting…' : 'Log in'}
           </button>
         </div>
@@ -428,9 +438,6 @@
             <a class="btn" href={loginUrl} target="_blank" rel="noopener noreferrer">Open sign-in page</a>
             {#if loginCode}<code class="login-code">{loginCode}</code>{/if}
           </div>
-        {:else if loginState === 'error'}
-          <p class="hint dim">If browser sign-in is unavailable, run this fallback and then Rescan:</p>
-          <code class="cmd">{loginCmd}</code>
         {/if}
         {#if loginState === 'waiting'}
           <button class="btn" onclick={cancelActiveLogin}>Cancel</button>

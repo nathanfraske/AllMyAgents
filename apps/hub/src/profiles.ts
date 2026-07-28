@@ -83,7 +83,7 @@ export function pickableProfiles<T extends { id: string }>(profiles: readonly T[
 export function setClaudeConnectorPolicy(profiles: Profile[], enable: boolean): string[] {
   const written: string[] = []
   for (const p of profiles) {
-    if (p.provider !== 'claude' || !isManagedProfile(p.id)) continue
+    if (p.provider !== 'claude' || !isManagedProfile(p.id) || p.available === false) continue
     const file = path.join(p.dir, 'settings.json')
     try {
       let obj: Record<string, unknown> = {}
