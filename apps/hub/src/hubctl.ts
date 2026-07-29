@@ -20,6 +20,7 @@ import crypto from 'node:crypto'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { sendToHub, waitForHubMsg, healthCheck, type HubMsg } from './restartHandshake.js'
 import { defaultWorkerSocket } from './workerTransport.js'
+import { JournalBackupOwnershipProtocol } from './journalBackupOwnership.js'
 
 /** The hard public singleton the web client hardcodes (`api.ts:145`). Blue owns it; green takes it on promote.
  *  HUB_FIXED_PORT overrides it for an isolated harness (e.g. the restart-survival acceptance test) so a
@@ -63,6 +64,8 @@ interface HubHandle {
 let live: HubHandle | null = null
 /** True while a blue-green flip is running — a re-entrant restart is ignored. */
 let flipInFlight = false
+/** Exactly one supervised hub may schedule journal backups against the shared data root. */
+const journalBackupOwnership = new JournalBackupOwnershipProtocol()
 
 /**
  * Every hub process we've spawned and not yet reaped. Lets a signal / fatal tear ALL of them down
@@ -271,6 +274,8 @@ async function reviveLiveHub(): Promise<void> {
         const ready = await waitForHubMsg(next.child, 'ready', 20_000)
         next.port = ready.port
         next.restored = ready.restored
+        await healthCheck(next.port, { expectRestored: next.restored })
+        await journalBackupOwnership.activateInitialBlueAfterHealth(next.child)
         setLive(next)
         candidate = undefined // adopted; the failure path below must not kill it
         log(`hub recovered on :${next.port} — ${next.restored} session(s) restored`)
@@ -368,6 +373,25 @@ function killTree(child: ChildProcess): void {
   }
 }
 
+async function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup()
+      reject(new Error(`hub process did not exit within ${timeoutMs}ms after kill`))
+    }, timeoutMs)
+    const onExit = (): void => {
+      cleanup()
+      resolve()
+    }
+    const cleanup = (): void => {
+      clearTimeout(timer)
+      child.off('exit', onExit)
+    }
+    child.once('exit', onExit)
+  })
+}
+
 /** Ask a hub to retire, then hard-kill its tree if it hasn't exited within `graceMs`. Non-blocking. */
 function reap(handle: HubHandle, graceMs: number): void {
   const child = handle.child
@@ -391,11 +415,20 @@ async function boot(): Promise<void> {
   }
   log(`booting hub (blue) on :${FIXED_PORT}`)
   const blue = spawnHub(FIXED_PORT, 'blue')
-  const ready = await waitForHubMsg(blue.child, 'ready', 20_000)
-  blue.port = ready.port
-  blue.restored = ready.restored
-  setLive(blue)
-  log(`hub (blue) live on :${blue.port} — ${blue.restored} session(s) restored (schema v${ready.schemaVersion})`)
+  try {
+    const ready = await waitForHubMsg(blue.child, 'ready', 20_000)
+    blue.port = ready.port
+    blue.restored = ready.restored
+    await healthCheck(blue.port, { expectRestored: blue.restored })
+    await journalBackupOwnership.activateInitialBlueAfterHealth(blue.child)
+    setLive(blue)
+    log(`hub (blue) live on :${blue.port} — ${blue.restored} session(s) restored (schema v${ready.schemaVersion})`)
+  } catch (error) {
+    // Activation may have applied even if its acknowledgement was lost. Kill this provisional owner
+    // before the retry loop can consider another process for the shared backup directory.
+    killTree(blue.child)
+    throw error
+  }
 }
 
 /**
@@ -416,6 +449,7 @@ async function restart(reason: string): Promise<void> {
   flipInFlight = true
   const blue = live
   let promoted = false
+  let greenBackupActivationAttempted = false
   log(`restart requested (${reason}) — booting green on an ephemeral port`)
   const green = spawnHub(0, 'green')
   try {
@@ -426,6 +460,8 @@ async function restart(reason: string): Promise<void> {
     await healthCheck(green.port, { expectRestored: blue.restored })
     log('green health-check passed — flipping 7777')
 
+    await journalBackupOwnership.pauseBlueBeforeDrain(blue.child)
+    log('blue journal backups paused — current generation settled')
     sendToHub(blue.child, { type: 'drain' }) // blue: 503 new sessions, close the 7777 listener, stay alive
     blue.state = 'draining'
     await waitForHubMsg(blue.child, 'released', 5_000)
@@ -433,11 +469,16 @@ async function restart(reason: string): Promise<void> {
 
     sendToHub(green.child, { type: 'promote', port: FIXED_PORT }) // green: re-listen on 7777
     await waitForHubMsg(green.child, 'promoted', 8_000)
-    promoted = true
     green.port = FIXED_PORT
-    log(`green promoted — now live on :${FIXED_PORT}`)
+    log(`green promoted on :${FIXED_PORT} — acquiring journal backup ownership`)
 
+    // Promotion binds the public listener; ownership acknowledgement is the final commit gate. If it
+    // fails, green can still be killed and blue resumed/re-listened without two backup writers.
+    greenBackupActivationAttempted = true
+    await journalBackupOwnership.activatePromotedGreen(green.child)
+    promoted = true
     setLive(green) // swap + re-wire the restart-request listener onto green
+    log(`green live on :${FIXED_PORT} with journal backup ownership`)
     sendToHub(blue.child, { type: 'retire' }) // blue: finish in-flight, close WS, shut down, exit(0)
     blue.state = 'retired'
     reap(blue, 3_000) // ...or kill blue's tree if it doesn't exit in 3s
@@ -452,7 +493,22 @@ async function restart(reason: string): Promise<void> {
       // green tree and tell blue it was aborted so it journals hub/restart-aborted for the operator.
       log(`restart aborted — rolling back to blue: ${String(err)}`)
       killTree(green.child)
-      sendToHub(blue.child, { type: 'restart-aborted', error: String(err) })
+      try {
+        sendToHub(blue.child, { type: 'restart-aborted', error: String(err) })
+      } catch (abortSignalError) {
+        // Backup resume is the safety action and must still be attempted even if the explanatory journal
+        // signal cannot cross a closing IPC channel.
+        log(`could not send restart-aborted to blue: ${String(abortSignalError)}`)
+      }
+      try {
+        // If green may have applied activation but lost its acknowledgement, fence it by confirmed process
+        // death before issuing blue's higher-epoch resume. Other rollback paths never activated green.
+        if (greenBackupActivationAttempted) await waitForChildExit(green.child, 5_000)
+        await journalBackupOwnership.resumeBlueAfterRollback(blue.child)
+        log('blue journal backups resumed after rollback')
+      } catch (resumeError) {
+        log(`blue journal backup resume failed after rollback: ${String(resumeError)}`)
+      }
     }
   } finally {
     flipInFlight = false

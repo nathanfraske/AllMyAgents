@@ -557,17 +557,27 @@ export function startServer(opts: ServerOptions): http.Server {
       // Public health probe — the supervisor health-checks a booting green hub with this before any
       // port handoff. `boot:'complete'` only once sessions.boot() has run (restartState.booted).
       if (method === 'GET' && url.pathname === '/api/health') {
-        json(res, {
-          boot: restartState.booted ? 'complete' : 'booting',
-          restoredSessions: sessions.list().length,
-          schemaVersion: SCHEMA_VERSION,
-          pid: process.pid,
-          // The port we are ACTUALLY listening on, not the boot port. A promoted green booted on an
-          // ephemeral port (HUB_PORT=0) and then re-listened on the fixed public port, so the boot value
-          // would report `0` for the rest of that hub's life (the known-broken health path in the alpha
-          // plan — observed live on a promoted green). Falls back to the boot port before the listener is up.
-          port: (server.address() as { port?: number } | null)?.port ?? port,
-        })
+        const backupDegraded = restartState.journalBackup.status === 'degraded'
+        json(
+          res,
+          {
+            boot: backupDegraded
+              ? 'degraded'
+              : restartState.booted
+                ? 'complete'
+                : 'booting',
+            restoredSessions: sessions.list().length,
+            schemaVersion: SCHEMA_VERSION,
+            pid: process.pid,
+            journalBackup: restartState.journalBackup,
+            // The port we are ACTUALLY listening on, not the boot port. A promoted green booted on an
+            // ephemeral port (HUB_PORT=0) and then re-listened on the fixed public port, so the boot value
+            // would report `0` for the rest of that hub's life (the known-broken health path in the alpha
+            // plan — observed live on a promoted green). Falls back to the boot port before the listener is up.
+            port: (server.address() as { port?: number } | null)?.port ?? port,
+          },
+          backupDegraded ? 503 : 200
+        )
         return
       }
       // Codex agent-tool bridge → hub. The stdio MCP bridge codex spawns per thread posts each tool

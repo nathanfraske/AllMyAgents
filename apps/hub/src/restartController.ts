@@ -9,6 +9,7 @@
 import type http from 'node:http'
 import type { Socket } from 'node:net'
 import type { Executor } from './executor.js'
+import type { JournalBackupRuntimeState } from './journalBackup.js'
 import type { Journal } from './journal.js'
 import type { SessionManager } from './sessions.js'
 
@@ -19,6 +20,7 @@ export interface RestartState {
   draining: boolean
   promoting: boolean
   sockets: Set<Socket>
+  journalBackup: JournalBackupRuntimeState
 }
 
 export interface RestartControllerDeps {
@@ -29,6 +31,9 @@ export interface RestartControllerDeps {
   publicPort: number //           the fixed public port (7777) — green promotes to it; blue re-claims it on rollback
   send: (msg: unknown) => void // process.send, bound
   onPromoted: () => void //       start deferred services (usage polling + mesh) once we own the port
+  // Defense in depth for planned retire: the parent protocol pauses blue before drain, but retire itself
+  // still settles and terminally disables backup work before process.exit.
+  stopJournalBackups: () => Promise<void>
   // The execution seam (docs/agent-worker-impl.md §8.4). Only its `signalDraining?` is used here — to hold
   // worker relays before blue's socket drops (drain) and un-drain a rolled-back flip (abort). WORKER-MODE
   // ONLY: the in-process executor implements no signalDraining, so both calls are a no-op and the flag-off
@@ -37,7 +42,37 @@ export interface RestartControllerDeps {
 }
 
 export class RestartController {
+  private listenerTransition: Promise<void> | undefined
+  private supervisorDisconnected = false
+
   constructor(private readonly deps: RestartControllerDeps) {}
+
+  private notifySupervisor(message: unknown): void {
+    if (!this.supervisorDisconnected) this.deps.send(message)
+  }
+
+  /**
+   * Resolve a parent-death race from observable listener state, never from a stale blue/green label.
+   *
+   * A disconnect can arrive while close/re-listen is between callbacks. Waiting for that already-started
+   * transition is not a delay heuristic: it observes the exact completion event, then grants orphan
+   * ownership only to the process demonstrably bound to the fixed public port.
+   */
+  async resolveOrphanedListenerOwnership(): Promise<boolean> {
+    this.supervisorDisconnected = true
+    for (;;) {
+      const transition = this.listenerTransition
+      if (!transition) break
+      await transition
+    }
+    if (!this.deps.server.listening) return false
+    const address = this.deps.server.address()
+    return (
+      address !== null &&
+      typeof address !== 'string' &&
+      address.port === this.deps.publicPort
+    )
+  }
 
   /**
    * BLUE: stop taking new sessions (server.ts returns 503 while draining), DESTROY live sockets so the
@@ -45,7 +80,7 @@ export class RestartController {
    * open forever; the clients auto-reconnect to green — then close the listener and signal `released`.
    */
   async drain(): Promise<void> {
-    const { server, journal, state, send, executor } = this.deps
+    const { server, journal, state, executor } = this.deps
     // FIRST, before we close anything: tell the worker we're draining so it HOLDS new relays (queues them
     // without racing the about-to-die socket) — a planned flip then has zero failed in-flight sends; green's
     // attach flushes them (§8.4). No-op in-process (no worker to drain), so flag-off is unchanged.
@@ -60,8 +95,14 @@ export class RestartController {
       }
     }
     state.sockets.clear()
-    await new Promise<void>((resolve) => server.close(() => resolve()))
-    send({ type: 'released' })
+    const transition = new Promise<void>((resolve) => server.close(() => resolve()))
+    this.listenerTransition = transition
+    try {
+      await transition
+    } finally {
+      if (this.listenerTransition === transition) this.listenerTransition = undefined
+    }
+    this.notifySupervisor({ type: 'released' })
   }
 
   /**
@@ -71,12 +112,23 @@ export class RestartController {
    * server.ts's global error handler defers to us while `state.promoting` is set.
    */
   promote(port: number): void {
-    const { server, sessions, state, send, onPromoted } = this.deps
+    const { server, sessions, state, onPromoted } = this.deps
     state.promoting = true
+    let settleTransition!: () => void
+    const transition = new Promise<void>((resolve) => {
+      settleTransition = resolve
+    })
+    this.listenerTransition = transition
+    const settled = (): void => {
+      if (this.listenerTransition === transition) this.listenerTransition = undefined
+      settleTransition()
+    }
     const onError = (err: NodeJS.ErrnoException): void => {
+      server.off('error', onError)
       server.off('listening', onListening)
       state.promoting = false
-      send({ type: 'promote-failed', error: err.message })
+      this.notifySupervisor({ type: 'promote-failed', error: err.message })
+      settled()
     }
     const onListening = (): void => {
       server.off('error', onError)
@@ -84,7 +136,8 @@ export class RestartController {
       state.draining = false
       sessions.reconcileStale()
       onPromoted()
-      send({ type: 'promoted' })
+      this.notifySupervisor({ type: 'promoted' })
+      settled()
     }
     server.once('error', onError)
     server.once('listening', onListening)
@@ -99,7 +152,17 @@ export class RestartController {
       }
     }
     state.sockets.clear()
-    server.close(() => server.listen(port, '127.0.0.1'))
+    try {
+      server.close(() => {
+        try {
+          server.listen(port, '127.0.0.1')
+        } catch (error) {
+          onError(error as NodeJS.ErrnoException)
+        }
+      })
+    } catch (error) {
+      onError(error as NodeJS.ErrnoException)
+    }
   }
 
   /**
@@ -108,8 +171,9 @@ export class RestartController {
    * blue's live turn here; Phase 2's supervised worker removes that.
    */
   async retire(): Promise<void> {
-    const { journal, sessions } = this.deps
+    const { journal, sessions, stopJournalBackups } = this.deps
     journal.append(null, 'hub/retiring', {})
+    await stopJournalBackups()
     await sessions.shutdown({ graceful: true })
     process.exit(0)
   }
@@ -131,8 +195,32 @@ export class RestartController {
     executor.signalDraining?.(false)
     if (state.draining) {
       state.draining = false
-      server.once('error', (e: NodeJS.ErrnoException) => console.error(`[hub] rollback re-listen failed: ${e.message}`))
-      server.listen(publicPort, '127.0.0.1')
+      let settleTransition!: () => void
+      const transition = new Promise<void>((resolve) => {
+        settleTransition = resolve
+      })
+      this.listenerTransition = transition
+      const settled = (): void => {
+        if (this.listenerTransition === transition) this.listenerTransition = undefined
+        settleTransition()
+      }
+      const onError = (e: NodeJS.ErrnoException): void => {
+        server.off('error', onError)
+        server.off('listening', onListening)
+        console.error(`[hub] rollback re-listen failed: ${e.message}`)
+        settled()
+      }
+      const onListening = (): void => {
+        server.off('error', onError)
+        settled()
+      }
+      server.once('error', onError)
+      server.once('listening', onListening)
+      try {
+        server.listen(publicPort, '127.0.0.1')
+      } catch (error) {
+        onError(error as NodeJS.ErrnoException)
+      }
     }
   }
 }

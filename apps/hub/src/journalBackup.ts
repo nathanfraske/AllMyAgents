@@ -1,6 +1,13 @@
+import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
+import { createRequire } from 'node:module'
 import path from 'node:path'
 import type Database from 'better-sqlite3'
+import type {
+  JournalBackupControlCommand,
+  JournalBackupControlResult,
+} from './restartHandshake.js'
+import { JournalBackupLease } from './journalBackupLease.js'
 
 /**
  * Periodic, verified snapshots of the journal.
@@ -42,12 +49,19 @@ export interface JournalBackupOptions {
   /** Injectable for tests. */
   now?: () => Date
   log?: (message: string) => void
+  /** Capped retry schedule used only after standalone/orphan listener activation fails. */
+  activationRetryMs?: readonly number[]
+  /** Surfaces intentional inactivity and activation failures through hub health. */
+  onStateChange?: (state: JournalBackupRuntimeState) => void
 }
 
 const DEFAULT_INTERVAL_MS = 30 * 60 * 1000
 const DEFAULT_KEEP = 6
+const DEFAULT_ACTIVATION_RETRY_MS = [250, 1_000, 5_000, 10_000, 30_000] as const
 const PREFIX = 'hub-'
 const SUFFIX = '.db'
+const PARTIAL_SUFFIX = `${SUFFIX}.partial`
+const require = createRequire(import.meta.url)
 
 export interface SnapshotResult {
   ok: boolean
@@ -56,17 +70,27 @@ export interface SnapshotResult {
   error?: string
 }
 
+export type JournalBackupRuntimeState =
+  | { status: 'inactive' }
+  | { status: 'active' }
+  | { status: 'degraded'; error: string }
+
+export type JournalBackupActivationResult =
+  | { ok: true }
+  | { ok: false; error: string }
+
 export type JournalSnapshotTask = (
   db: Database.Database,
   options: JournalBackupOptions
 ) => Promise<SnapshotResult>
 
 export interface JournalBackupSupervisor {
-  /**
-   * Declare that the HTTP server has bound and announced readiness. Idempotent; no backup work or timer
-   * exists before this call.
-   */
-  serverReady(): void
+  /** Activate an unsupervised hub after its HTTP listener is ready. */
+  activateStandalone(): JournalBackupActivationResult
+  /** Apply one parent-supervisor ownership command, ordered by monotonically increasing epoch. */
+  applyControl(command: JournalBackupControlCommand): Promise<JournalBackupControlResult>
+  /** Pause new work, clear timers, and settle the current generation without becoming terminal. */
+  pause(): Promise<void>
   /** Stop future work and wait for the one supervised snapshot, if any, to settle. */
   stop(): Promise<void>
 }
@@ -81,7 +105,11 @@ export async function snapshotJournal(
   fs.mkdirSync(options.dir, { recursive: true })
 
   const stamp = now().toISOString().replace(/[:.]/g, '-')
-  const target = path.join(options.dir, `${PREFIX}${stamp}${SUFFIX}`)
+  // Timestamp-only names collide across blue/green processes and even within one millisecond. The UUID
+  // makes both the staging file and final generation unique across processes sharing this directory.
+  const generation = `${PREFIX}${stamp}-${process.pid}-${randomUUID()}`
+  const target = path.join(options.dir, `${generation}${SUFFIX}`)
+  const partial = path.join(options.dir, `${generation}${PARTIAL_SUFFIX}`)
   let sourceHadEvents = false
   if (!options.verify) {
     try {
@@ -97,32 +125,59 @@ export async function snapshotJournal(
 
   try {
     // Online backup: consistent even while the hub is mid-turn.
-    await db.backup(target)
+    await db.backup(partial)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     log(`[journal-backup] snapshot FAILED: ${message}`)
     try {
-      fs.rmSync(target, { force: true })
+      fs.rmSync(partial, { force: true })
     } catch {
       /* nothing to clean up */
     }
     return { ok: false, error: message }
   }
 
-  const verified = options.verify ? options.verify(target) : defaultVerify(target, sourceHadEvents)
+  let verified = false
+  try {
+    verified = options.verify ? options.verify(partial) : defaultVerify(partial, sourceHadEvents)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    log(`[journal-backup] snapshot FAILED verification: ${message}`)
+    try {
+      fs.rmSync(partial, { force: true })
+    } catch {
+      /* best effort */
+    }
+    return { ok: false, error: message }
+  }
   if (!verified) {
     // A snapshot that does not pass its own integrity check is worse than none: it would sit there
     // looking like insurance. Remove it and say so loudly.
-    log(`[journal-backup] snapshot at ${target} FAILED verification and was discarded — the live journal may already be damaged`)
+    log(`[journal-backup] snapshot at ${partial} FAILED verification and was discarded — the live journal may already be damaged`)
     try {
-      fs.rmSync(target, { force: true })
+      fs.rmSync(partial, { force: true })
     } catch {
       /* best effort */
     }
     return { ok: false, error: 'snapshot failed integrity verification' }
   }
 
-  const bytes = fs.statSync(target).size
+  let bytes: number
+  try {
+    bytes = fs.statSync(partial).size
+    // Same-directory rename is the publication boundary. A hard kill before it leaves only `.partial`;
+    // a kill after it leaves a fully verified final. The collision-free target is never overwritten.
+    fs.renameSync(partial, target)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    log(`[journal-backup] snapshot FAILED publication: ${message}`)
+    try {
+      fs.rmSync(partial, { force: true })
+    } catch {
+      /* best effort */
+    }
+    return { ok: false, error: message }
+  }
   log(`[journal-backup] verified snapshot ${path.basename(target)} (${(bytes / 1_048_576).toFixed(1)} MB)`)
   rotate(options.dir, options.keep ?? DEFAULT_KEEP, log)
   return { ok: true, file: target, bytes }
@@ -185,12 +240,39 @@ function rotate(dir: string, keep: number, log: (m: string) => void): void {
 }
 
 /**
+ * Ownership makes every recognized partial stale: this runs only as an inactive supervisor becomes the
+ * exclusive owner. Rotation never sees these names, so a crash cannot evict a verified generation.
+ */
+function cleanupStalePartials(dir: string, log: (m: string) => void): void {
+  let entries: string[]
+  try {
+    entries = fs
+      .readdirSync(dir)
+      .filter((name) => name.startsWith(PREFIX) && name.endsWith(PARTIAL_SUFFIX))
+  } catch {
+    return
+  }
+  for (const entry of entries) {
+    try {
+      fs.rmSync(path.join(dir, entry), { force: true })
+      log(`[journal-backup] removed stale partial ${entry}`)
+    } catch (error) {
+      log(
+        `[journal-backup] stale partial cleanup FAILED for ${entry}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+    }
+  }
+}
+
+/**
  * Supervise initial + periodic backups without putting journal IO on the startup critical path.
  *
- * `serverReady()` is the lifecycle gate: it schedules the initial snapshot for the next event-loop turn,
- * after the listening callback and readiness announcement have returned. Each completion schedules the
- * next interval, so a slow snapshot can never overlap another generation. Timers are unref'd so they do
- * not hold the hub open; `stop()` clears pending work and joins the single in-flight promise.
+ * Standalone callers activate after listening. Supervised callers remain inactive until an epoch-ordered
+ * parent command grants ownership. Each completion schedules the next interval, so a slow snapshot can
+ * never overlap another generation. Timers are unref'd so they do not hold the hub open; pause/stop clear
+ * pending work and join the single in-flight promise.
  */
 export function createJournalBackupSupervisor(
   db: Database.Database,
@@ -199,14 +281,34 @@ export function createJournalBackupSupervisor(
 ): JournalBackupSupervisor {
   const intervalMs = options.intervalMs ?? DEFAULT_INTERVAL_MS
   const log = options.log ?? (() => {})
-  let ready = false
+  const activationRetryMs =
+    options.activationRetryMs?.length ? options.activationRetryMs : DEFAULT_ACTIVATION_RETRY_MS
+  const onStateChange = options.onStateChange ?? (() => {})
+  const lease = new JournalBackupLease(options.dir, log)
+  let active = false
   let stopped = false
+  let activationRetryTimer: NodeJS.Timeout | undefined
+  let activationRetryAttempt = 0
   let initialTask: NodeJS.Immediate | undefined
   let periodicTimer: NodeJS.Timeout | undefined
   let inFlight: Promise<void> | undefined
+  let runWhenIdle = false
+  let cleanupPending = false
+  let latestControl:
+    | {
+        epoch: number
+        requestId: string
+        result: Promise<JournalBackupControlResult>
+      }
+    | undefined
+
+  const clearActivationRetry = (): void => {
+    if (activationRetryTimer) clearTimeout(activationRetryTimer)
+    activationRetryTimer = undefined
+  }
 
   const schedulePeriodic = (): void => {
-    if (stopped) return
+    if (stopped || !active || periodicTimer) return
     periodicTimer = setTimeout(() => {
       periodicTimer = undefined
       launch('snapshot')
@@ -215,7 +317,12 @@ export function createJournalBackupSupervisor(
   }
 
   const launch = (label: 'initial snapshot' | 'snapshot'): void => {
-    if (stopped || inFlight) return
+    if (stopped || !active || inFlight) return
+    runWhenIdle = false
+    if (cleanupPending) {
+      cleanupPending = false
+      cleanupStalePartials(options.dir, log)
+    }
     const task = Promise.resolve()
       .then(() => takeSnapshot(db, options))
       .then(() => undefined)
@@ -224,31 +331,180 @@ export function createJournalBackupSupervisor(
       })
       .finally(() => {
         if (inFlight === task) inFlight = undefined
-        schedulePeriodic()
+        if (stopped || !active) return
+        if (runWhenIdle) scheduleImmediate()
+        else schedulePeriodic()
       })
     inFlight = task
   }
 
+  const scheduleImmediate = (): void => {
+    if (stopped || !active || inFlight || initialTask) return
+    initialTask = setImmediate(() => {
+      initialTask = undefined
+      launch('initial snapshot')
+    })
+    initialTask.unref?.()
+  }
+
+  const activate = (): string | undefined => {
+    if (stopped) return 'backup supervisor is stopped'
+    if (active) return undefined
+    try {
+      // Acquire before stale-partial cleanup or scheduling. A replacement process that loses this race
+      // cannot touch an old owner's in-progress partial, even if the old hubctl no longer exists.
+      lease.acquire()
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error)
+    }
+    active = true
+    cleanupPending = true
+    runWhenIdle = true
+    scheduleImmediate()
+    return undefined
+  }
+
+  const attemptActivation = (): JournalBackupActivationResult => {
+    const error = activate()
+    if (error) {
+      onStateChange({ status: 'degraded', error })
+      return { ok: false, error }
+    }
+    activationRetryAttempt = 0
+    onStateChange({ status: 'active' })
+    return { ok: true }
+  }
+
+  const scheduleStandaloneActivationRetry = (
+    failure: JournalBackupActivationResult & { ok: false }
+  ): void => {
+    if (stopped || active || activationRetryTimer) return
+    const delay =
+      activationRetryMs[
+        Math.min(activationRetryAttempt, activationRetryMs.length - 1)
+      ] ?? DEFAULT_ACTIVATION_RETRY_MS[DEFAULT_ACTIVATION_RETRY_MS.length - 1]
+    activationRetryAttempt += 1
+    log(
+      `[journal-backup] activation retry in ${delay}ms after failure: ${failure.error}`
+    )
+    activationRetryTimer = setTimeout(() => {
+      activationRetryTimer = undefined
+      const result = attemptActivation()
+      if (!result.ok) scheduleStandaloneActivationRetry(result)
+    }, delay)
+    activationRetryTimer.unref?.()
+  }
+
+  const pause = async (): Promise<void> => {
+    clearActivationRetry()
+    active = false
+    runWhenIdle = false
+    if (initialTask) clearImmediate(initialTask)
+    initialTask = undefined
+    if (periodicTimer) clearTimeout(periodicTimer)
+    periodicTimer = undefined
+    const current = inFlight
+    if (current) await current
+    // A higher-epoch resume can arrive while this pause is settling a generation. In that case active is
+    // true again and the old pause must neither release the lease nor defeat the resume.
+    if (!active) {
+      try {
+        lease.release()
+        onStateChange({ status: 'inactive' })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        onStateChange({ status: 'degraded', error: message })
+        log(`[journal-backup] pause failed to release ownership: ${message}`)
+        throw error
+      }
+    }
+  }
+
+  const controlResult = (
+    command: JournalBackupControlCommand,
+    applied: boolean,
+    error?: string
+  ): JournalBackupControlResult => ({
+    type: 'journal-backup-control-result',
+    requestId: command.requestId,
+    epoch: command.epoch,
+    active,
+    applied,
+    ...(error ? { error } : {}),
+  })
+
+  const applyControl = (
+    command: JournalBackupControlCommand
+  ): Promise<JournalBackupControlResult> => {
+    if (
+      !Number.isSafeInteger(command.epoch) ||
+      command.epoch < 0 ||
+      typeof command.requestId !== 'string' ||
+      command.requestId.length === 0
+    ) {
+      return Promise.resolve(controlResult(command, false, 'invalid backup ownership command'))
+    }
+    if (stopped) {
+      return Promise.resolve(controlResult(command, false, 'backup supervisor is stopped'))
+    }
+    if (
+      latestControl?.epoch === command.epoch &&
+      latestControl.requestId === command.requestId
+    ) {
+      return latestControl.result
+    }
+    if (latestControl && command.epoch <= latestControl.epoch) {
+      return Promise.resolve(controlResult(command, false))
+    }
+
+    // Defer the operation one microtask so latestControl is installed before a synchronous activation
+    // result is formed. A pause mutates `active` before awaiting; a newer resume can therefore supersede
+    // it while the old in-flight generation settles, and the late pause completion cannot flip it back.
+    const result = Promise.resolve().then(async () => {
+      let error: string | undefined
+      try {
+        if (command.active) {
+          const activation = attemptActivation()
+          if (!activation.ok) error = activation.error
+        } else {
+          await pause()
+        }
+      } catch (controlError) {
+        error =
+          controlError instanceof Error ? controlError.message : String(controlError)
+      }
+      const stillCurrent =
+        latestControl?.epoch === command.epoch &&
+        latestControl.requestId === command.requestId
+      return controlResult(command, stillCurrent && !error, error)
+    })
+    latestControl = {
+      epoch: command.epoch,
+      requestId: command.requestId,
+      result,
+    }
+    return result
+  }
+
   return {
-    serverReady(): void {
-      if (ready || stopped) return
-      ready = true
-      // One snapshot promptly after readiness. setImmediate is a lifecycle yield, not a time guess: the
-      // server's listening callback (including its supervisor-ready IPC) completes before backup IO begins.
-      initialTask = setImmediate(() => {
-        initialTask = undefined
-        launch('initial snapshot')
-      })
-      initialTask.unref?.()
+    activateStandalone(): JournalBackupActivationResult {
+      const result = attemptActivation()
+      if (!result.ok) {
+        log(`[journal-backup] standalone activation failed: ${result.error}`)
+        scheduleStandaloneActivationRetry(result)
+      }
+      return result
+    },
+    applyControl(command): Promise<JournalBackupControlResult> {
+      return applyControl(command)
+    },
+    pause(): Promise<void> {
+      return pause()
     },
     async stop(): Promise<void> {
       stopped = true
-      if (initialTask) clearImmediate(initialTask)
-      initialTask = undefined
-      if (periodicTimer) clearTimeout(periodicTimer)
-      periodicTimer = undefined
-      const active = inFlight
-      if (active) await active
+      clearActivationRetry()
+      await pause()
     },
   }
 }

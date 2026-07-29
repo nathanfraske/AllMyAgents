@@ -17,6 +17,7 @@ import { SessionManager } from './sessions.js'
 import { SessionStore } from './store.js'
 import { UsageMonitor } from './usage.js'
 import { WorkspaceManager } from './workspace.js'
+import type { RestartState } from './restartController.js'
 
 const cleanups: Array<() => void | Promise<void>> = []
 
@@ -75,6 +76,13 @@ async function build() {
   sessions.execAgentTool = async () => 'bridge-ok'
   const record = await sessions.create(profile.id, { cwd: root, useWorktree: false })
   const deviceToken = 'test-device-token-at-least-thirty-two-characters'
+  const restartState: RestartState = {
+    booted: true,
+    sockets: new Set(),
+    draining: false,
+    promoting: false,
+    journalBackup: { status: 'active' },
+  }
   const server = startServer({
     port: 0,
     defaultCwd: root,
@@ -108,7 +116,7 @@ async function build() {
     // The old control plane failed open in precisely this configuration.
     requireToken: false,
     agentToolSecret: 'test-agent-bridge-secret-at-least-32-characters',
-    restartState: { booted: true, sockets: new Set(), draining: false, promoting: false } as never,
+    restartState,
     executor,
     workspace,
     configPath: path.join(root, 'config.json'),
@@ -130,6 +138,7 @@ async function build() {
     danger,
     journal,
     record,
+    restartState,
   }
 }
 
@@ -138,6 +147,25 @@ function auth(token: string): HeadersInit {
 }
 
 describe('device-authenticated control plane', () => {
+  it('makes journal-backup activation failure visible on the public health probe', async () => {
+    const { base, restartState } = await build()
+    restartState.journalBackup = {
+      status: 'degraded',
+      error: 'journal backup lease is unavailable',
+    }
+
+    const response = await fetch(`${base}/api/health`)
+
+    expect(response.status).toBe(503)
+    expect(await response.json()).toMatchObject({
+      boot: 'degraded',
+      journalBackup: {
+        status: 'degraded',
+        error: 'journal backup lease is unavailable',
+      },
+    })
+  })
+
   it('rejects unauthenticated journal reads and mutations even when legacy requireToken is false', async () => {
     const { base, danger, record } = await build()
 

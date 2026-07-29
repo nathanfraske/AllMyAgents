@@ -61,6 +61,24 @@ if (process.env.AMA_VERIFY_HUB_DEPS === '1') {
 
 const repoRoot = path.resolve(import.meta.dirname, '..', '..', '..')
 const supervised = process.env.HUB_SUPERVISED === '1' && typeof process.send === 'function'
+function sendSupervisorMessage(message: unknown): void {
+  if (!process.connected || !process.send) return
+  try {
+    process.send(message as never, (error) => {
+      if (error && (error as NodeJS.ErrnoException).code !== 'ERR_IPC_CHANNEL_CLOSED') {
+        console.error(`[hub] supervisor IPC send failed: ${error.message}`)
+      }
+    })
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ERR_IPC_CHANNEL_CLOSED') {
+      console.error(
+        `[hub] supervisor IPC send failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+    }
+  }
+}
 // HUB_DATA_DIR relocates the journal/config/worktrees/unfiled-workspaces/device-token root off the repo's data/. Profiles keep
 // their real repo path so auth still resolves. Unset → repo data/ (byte-identical to today); set only by an
 // isolated harness (e.g. the restart-survival acceptance test) to keep its DB + state off the live hub's.
@@ -142,6 +160,14 @@ try {
 // the cap so a healthy number of connections doesn't emit a spurious MaxListeners leak warning.
 journal.setMaxListeners(64)
 
+const restartState: RestartState = {
+  booted: false,
+  draining: false,
+  promoting: false,
+  sockets: new Set(),
+  journalBackup: { status: 'inactive' },
+}
+
 // AUTOMATIC, VERIFIED JOURNAL SNAPSHOTS.
 //
 // The operator's journal was corrupted twice in two days; the second time it was truncated to an empty
@@ -159,10 +185,10 @@ const journalBackupsDir = path.join(dataDir, 'backups')
 const journalBackups = createJournalBackupSupervisor(journal.db, {
   dir: journalBackupsDir,
   log: (message) => console.log(message),
+  onStateChange: (state) => {
+    restartState.journalBackup = state
+  },
 })
-// RestartController.retire() exits directly rather than going through shutdown(); synchronously clear any
-// queued timer there too. The normal signal path below additionally awaits an in-flight generation.
-process.once('exit', () => void journalBackups.stop())
 const store = new SessionStore(journal.db)
 const profiles = scanProfiles(profilesDir)
 const profileOwnership = new ProfileOwnership({
@@ -438,8 +464,6 @@ if (agentBridge) {
   })
 }
 
-const restartState: RestartState = { booted: false, draining: false, promoting: false, sockets: new Set() }
-
 sessions.boot({ reconcile: !isGreen }) // green defers stale-reconcile to promote (it doesn't own the port yet)
 if (!isGreen) usage.startPolling() //     green starts polling only once it owns the port (on promote)
 restartState.booted = true
@@ -533,12 +557,17 @@ server.once('listening', () => {
   )
   console.log(`[hub] device token ${requireToken ? 'REQUIRED for /api + /ws' : 'not enforced (local)'} — pair remote devices from Settings → Mesh`)
   // Tell the supervisor we're up (report the ACTUAL port so it health-checks green's ephemeral port).
-  if (supervised && process.send) {
-    process.send({ type: 'ready', port: actualPort, restored: sessions.list().length, schemaVersion: SCHEMA_VERSION })
+  if (supervised) {
+    sendSupervisorMessage({
+      type: 'ready',
+      port: actualPort,
+      restored: sessions.list().length,
+      schemaVersion: SCHEMA_VERSION,
+    })
   }
-  // This call only queues the initial snapshot for the next event-loop turn. The listener is bound and
-  // the supervisor-ready message is already dispatched before any backup or verification work can begin.
-  journalBackups.serverReady()
+  // Standalone owns its data root once listening. Under hubctl, both blue and green stay inactive here:
+  // the parent grants one explicit cross-process owner only after health / handoff completes.
+  if (!supervised) journalBackups.activateStandalone()
   // Blue / standalone own the port at boot → advertise now. Green defers mesh to promote.
   if (!isGreen) {
     registerMesh()
@@ -550,7 +579,7 @@ server.once('listening', () => {
 // Under supervision, wire the restart handshake: the hub asks hubctl to flip; hubctl drives
 // drain/promote/retire back to us. onPromoted starts the services green deferred until it owns the port.
 if (supervised && process.send) {
-  const send = process.send.bind(process)
+  const send = sendSupervisorMessage
   const controller = new RestartController({
     server,
     sessions,
@@ -564,6 +593,7 @@ if (supervised && process.send) {
       startJournalMaintenance()
       worktreeCollisions.start()
     },
+    stopJournalBackups: () => journalBackups.stop(),
     // §8.4: drain() signals the worker to hold relays before blue's socket drops; abort() un-drains a
     // rolled-back flip. No-op in-process (the in-process executor implements no signalDraining), so the
     // flag-off restart path is byte-identical.
@@ -585,8 +615,54 @@ if (supervised && process.send) {
       case 'restart-aborted':
         controller.abort(msg.error)
         break
+      case 'journal-backup-control':
+        void journalBackups
+          .applyControl(msg)
+          .then((result) => send(result))
+          .catch((error: unknown) => {
+            console.error(
+              `[journal-backup] ownership response failed: ${
+                error instanceof Error ? error.message : String(error)
+              }`
+            )
+          })
+        break
     }
   })
+  let supervisorDisconnectHandled = false
+  const handleSupervisorDisconnect = (): void => {
+    if (supervisorDisconnectHandled) return
+    supervisorDisconnectHandled = true
+    void controller
+      .resolveOrphanedListenerOwnership()
+      .then((ownsPublicListener) => {
+        if (!ownsPublicListener) {
+          console.log(
+            '[journal-backup] supervisor disconnected; this hub does not own the public listener and will stop'
+          )
+          shutdown('supervisor disconnect without public listener')
+          return
+        }
+        const activation = journalBackups.activateStandalone()
+        console.log(
+          activation.ok
+            ? '[journal-backup] supervisor disconnected; public listener retained backup ownership'
+            : `[journal-backup] supervisor disconnected; public listener backup ownership is degraded and retrying: ${activation.error}`
+        )
+      })
+      .catch((error: unknown) => {
+        console.error(
+          `[journal-backup] supervisor disconnect ownership resolution failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        )
+        shutdown('supervisor disconnect ownership failure')
+      })
+  }
+  process.once('disconnect', handleSupervisorDisconnect)
+  // A parent can disappear during module boot, before this listener is installed. The IPC state is the
+  // durable observation; checking it after registration closes that missed-event window.
+  if (!process.connected) handleSupervisorDisconnect()
 }
 
 // Best-effort: pull our site out of the node's exposed map on a clean exit so a stopped hub

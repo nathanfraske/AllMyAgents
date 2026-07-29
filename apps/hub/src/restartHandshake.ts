@@ -14,12 +14,29 @@ import type { ChildProcess } from 'node:child_process'
 /** Bump when a hub change is incompatible with an older on-disk schema (Phase 3 migration guard). */
 export const SCHEMA_VERSION = 1
 
+export interface JournalBackupControlCommand {
+  type: 'journal-backup-control'
+  requestId: string
+  epoch: number
+  active: boolean
+}
+
+export interface JournalBackupControlResult {
+  type: 'journal-backup-control-result'
+  requestId: string
+  epoch: number
+  active: boolean
+  applied: boolean
+  error?: string
+}
+
 /** Supervisor -> hub. */
 export type SupervisorMsg =
   | { type: 'drain' } //   stop accepting new sessions (503), close the listener, keep the process alive
   | { type: 'promote'; port: number } // re-listen on the fixed public port (green taking over)
   | { type: 'retire' } //  finish in-flight, close WS, graceful shutdown, exit(0)
   | { type: 'restart-aborted'; error: string } // runs on BLUE when green failed → journal it for the operator
+  | JournalBackupControlCommand
 
 /** Hub -> supervisor. */
 export type HubMsg =
@@ -27,6 +44,7 @@ export type HubMsg =
   | { type: 'released' } //      drain done: listener closed, port free
   | { type: 'promoted' } //      now listening on the fixed port
   | { type: 'promote-failed'; error: string } // could not bind the fixed port (EADDRINUSE) → supervisor rolls back
+  | JournalBackupControlResult
   /**
    * Preflight refused to boot: a positively-detected fatal condition (a corrupt database, a data
    * directory that cannot be written, a schema written by a NEWER hub), found before the hub commits to
@@ -90,6 +108,61 @@ export function waitForHubMsg<T extends HubMsg['type']>(
     }
     child.on('message', onMsg as (m: unknown) => void)
     child.on('exit', onExit)
+  })
+}
+
+/**
+ * Send one ownership command and wait for its exact acknowledgement.
+ *
+ * The waiter is installed before send so an immediate peer cannot win the race. Synchronous and callback
+ * send failures tear the waiter down immediately instead of leaking a listener until the control timeout.
+ */
+export function requestJournalBackupControl(
+  child: ChildProcess,
+  command: JournalBackupControlCommand,
+  timeoutMs: number
+): Promise<JournalBackupControlResult> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup()
+      reject(new Error(`timed out after ${timeoutMs}ms waiting for journal backup control ${command.requestId}`))
+    }, timeoutMs)
+    const onMsg = (message: HubMsg): void => {
+      if (
+        message &&
+        typeof message === 'object' &&
+        message.type === 'journal-backup-control-result' &&
+        message.requestId === command.requestId
+      ) {
+        cleanup()
+        resolve(message)
+      } else if (message && typeof message === 'object' && message.type === 'preflight-failed') {
+        cleanup()
+        reject(new Error(`hub refused backup ownership control: ${message.message}`))
+      }
+    }
+    const onExit = (): void => {
+      cleanup()
+      reject(new Error(`hub exited while applying journal backup control ${command.requestId}`))
+    }
+    function cleanup(): void {
+      clearTimeout(timer)
+      child.off('message', onMsg as (message: unknown) => void)
+      child.off('exit', onExit)
+    }
+    child.on('message', onMsg as (message: unknown) => void)
+    child.on('exit', onExit)
+    try {
+      if (!child.send) throw new Error('hub IPC channel is unavailable')
+      child.send(command, (error) => {
+        if (!error) return
+        cleanup()
+        reject(error)
+      })
+    } catch (error) {
+      cleanup()
+      reject(error)
+    }
   })
 }
 

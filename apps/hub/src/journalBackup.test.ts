@@ -1,9 +1,12 @@
+import { spawn, type ChildProcess } from 'node:child_process'
 import { once } from 'node:events'
 import fs from 'node:fs'
 import http from 'node:http'
+import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import { performance } from 'node:perf_hooks'
+import { pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Journal } from './journal.js'
 import { createJournalBackupSupervisor, snapshotJournal, type SnapshotResult } from './journalBackup.js'
@@ -18,6 +21,7 @@ import { createJournalBackupSupervisor, snapshotJournal, type SnapshotResult } f
 const dirs: string[] = []
 const journals: Journal[] = []
 const servers: http.Server[] = []
+const children: ChildProcess[] = []
 const tmp = (): string => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-journal-backup-'))
   dirs.push(dir)
@@ -26,6 +30,12 @@ const tmp = (): string => {
 
 afterEach(async () => {
   vi.useRealTimers()
+  for (const child of children.splice(0)) {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+    if (child.exitCode === null && child.signalCode === null) {
+      await new Promise<void>((resolve) => child.once('exit', () => resolve()))
+    }
+  }
   for (const server of servers.splice(0)) {
     if (!server.listening) continue
     await new Promise<void>((resolve) => server.close(() => resolve()))
@@ -71,6 +81,195 @@ function get(port: number, pathname: string): Promise<{ status: number; body: st
     })
     request.on('error', reject)
   })
+}
+
+function spawnEvalModule(source: string): ChildProcess {
+  const child = spawn(
+    process.execPath,
+    ['--import', 'tsx/esm', '--input-type=module', '--eval', source],
+    {
+      cwd: path.resolve(import.meta.dirname, '..'),
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    }
+  )
+  children.push(child)
+  return child
+}
+
+function spawnBackupSupervisorChild(backups: string): ChildProcess {
+  const backupModule = pathToFileURL(path.join(import.meta.dirname, 'journalBackup.ts')).href
+  return spawnEvalModule(`
+    const fs = await import('node:fs')
+    const { createJournalBackupSupervisor } = await import(${JSON.stringify(backupModule)})
+    let releaseSnapshot
+    const snapshotGate = new Promise((resolve) => {
+      releaseSnapshot = resolve
+    })
+    fs.mkdirSync(${JSON.stringify(backups)}, { recursive: true })
+    const backups = createJournalBackupSupervisor(
+      {},
+      { dir: ${JSON.stringify(backups)}, intervalMs: 60_000 },
+      async () => {
+        const partial = ${JSON.stringify(path.join(backups, 'hub-held.db.partial'))}
+        fs.writeFileSync(partial, String(process.pid))
+        process.send?.({ type: 'snapshot-started', partial })
+        await snapshotGate
+        return { ok: true }
+      }
+    )
+    process.on('message', (message) => {
+      if (message?.type === 'release-snapshot') {
+        releaseSnapshot()
+        return
+      }
+      if (message?.type !== 'journal-backup-control') return
+      void backups.applyControl(message).then((result) => process.send?.({
+        type: 'control-result',
+        result
+      }))
+    })
+    process.send?.({ type: 'child-ready' })
+    setInterval(() => {}, 60_000)
+  `)
+}
+
+function waitForChildMessage<T extends { type: string }>(
+  child: ChildProcess,
+  type: T['type'],
+  timeoutMs = 20_000
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    let stderr = ''
+    child.stderr?.setEncoding('utf8')
+    child.stderr?.on('data', (chunk: string) => (stderr += chunk))
+    const timer = setTimeout(() => {
+      cleanup()
+      reject(new Error(`child timed out waiting for ${type}${stderr ? `: ${stderr}` : ''}`))
+    }, timeoutMs)
+    const onMessage = (raw: unknown): void => {
+      const message = raw as T & { error?: string }
+      if (message?.type === 'snapshot-error') {
+        cleanup()
+        reject(new Error(message.error ?? 'snapshot child failed'))
+        return
+      }
+      if (message?.type !== type) return
+      cleanup()
+      resolve(message)
+    }
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      cleanup()
+      reject(new Error(`child exited before ${type} (code=${String(code)} signal=${String(signal)})${stderr ? `: ${stderr}` : ''}`))
+    }
+    const cleanup = (): void => {
+      clearTimeout(timer)
+      child.off('message', onMessage)
+      child.off('exit', onExit)
+    }
+    child.on('message', onMessage)
+    child.once('exit', onExit)
+  })
+}
+
+async function controlBackupChild(
+  child: ChildProcess,
+  requestId: string,
+  epoch: number,
+  active: boolean
+): Promise<{
+  type: 'journal-backup-control-result'
+  requestId: string
+  epoch: number
+  active: boolean
+  applied: boolean
+  error?: string
+}> {
+  const response = waitForChildMessage<{
+    type: 'control-result'
+    result: {
+      type: 'journal-backup-control-result'
+      requestId: string
+      epoch: number
+      active: boolean
+      applied: boolean
+      error?: string
+    }
+  }>(child, 'control-result')
+  child.send({
+    type: 'journal-backup-control',
+    requestId,
+    epoch,
+    active,
+  })
+  return (await response).result
+}
+
+async function waitForExit(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return
+  await new Promise<void>((resolve) => child.once('exit', () => resolve()))
+}
+
+async function snapshotInChild(
+  sourceFile: string,
+  backups: string,
+  timestamp: string
+): Promise<SnapshotResult> {
+  const backupModule = pathToFileURL(path.join(import.meta.dirname, 'journalBackup.ts')).href
+  const databaseModule = pathToFileURL(createRequire(import.meta.url).resolve('better-sqlite3')).href
+  const child = spawnEvalModule(`
+    const [{ snapshotJournal }, databaseModule] = await Promise.all([
+      import(${JSON.stringify(backupModule)}),
+      import(${JSON.stringify(databaseModule)})
+    ])
+    const Database = databaseModule.default
+    const db = new Database(${JSON.stringify(sourceFile)}, { readonly: true, fileMustExist: true })
+    try {
+      const result = await snapshotJournal(db, {
+        dir: ${JSON.stringify(backups)},
+        now: () => new Date(${JSON.stringify(timestamp)})
+      })
+      await new Promise((resolve, reject) => process.send?.(
+        { type: 'snapshot-result', result },
+        (error) => error ? reject(error) : resolve()
+      ))
+    } catch (error) {
+      process.send?.({ type: 'snapshot-error', error: String(error) })
+    } finally {
+      db.close()
+      process.disconnect?.()
+    }
+  `)
+  const message = await waitForChildMessage<{
+    type: 'snapshot-result'
+    result: SnapshotResult
+  }>(child, 'snapshot-result')
+  await waitForExit(child)
+  return message.result
+}
+
+async function interruptSnapshotInChild(backups: string): Promise<string> {
+  const backupModule = pathToFileURL(path.join(import.meta.dirname, 'journalBackup.ts')).href
+  const child = spawnEvalModule(`
+    const fs = await import('node:fs')
+    const { snapshotJournal } = await import(${JSON.stringify(backupModule)})
+    const db = {
+      prepare: () => ({ get: () => ({ hasEvents: 1 }) }),
+      backup: async (target) => {
+        fs.writeFileSync(target, 'not a verified sqlite database')
+        process.send?.({ type: 'partial-created', target })
+        await new Promise(() => {})
+      }
+    }
+    await snapshotJournal(db, { dir: ${JSON.stringify(backups)} })
+  `)
+  const message = await waitForChildMessage<{
+    type: 'partial-created'
+    target: string
+  }>(child, 'partial-created')
+  child.kill('SIGKILL')
+  await waitForExit(child)
+  return message.target
 }
 
 describe('journal snapshots', () => {
@@ -125,6 +324,7 @@ describe('journal snapshots', () => {
     expect(result.ok).toBe(false)
     expect(result.error).toMatch(/verification/i)
     expect(fs.readdirSync(backups).filter((f) => f.endsWith('.db'))).toEqual([])
+    expect(fs.readdirSync(backups).filter((f) => f.endsWith('.partial'))).toEqual([])
   })
 
   it('accepts a genuinely empty source journal', async () => {
@@ -188,6 +388,9 @@ describe('journal snapshots', () => {
     const root = tmp()
     const journal = makeJournal(root, 5)
     const backups = path.join(root, 'backups')
+    fs.mkdirSync(backups, { recursive: true })
+    const interrupted = path.join(backups, 'hub-interrupted.db.partial')
+    fs.writeFileSync(interrupted, 'incomplete')
 
     let clock = Date.parse('2026-07-29T00:00:00.000Z')
     for (let i = 0; i < 5; i++) {
@@ -203,10 +406,158 @@ describe('journal snapshots', () => {
     // The three most recent stamps survive.
     expect(kept[2]).toContain('2026-07-29T00-05-00')
     expect(kept[0]).toContain('2026-07-29T00-03-00')
+    expect(fs.existsSync(interrupted)).toBe(true) // rotation considers verified finals only
+  })
+
+  it('publishes collision-free verified finals across processes sharing an identical clock', async () => {
+    const root = tmp()
+    const journal = makeJournal(root, 12)
+    const sourceFile = path.join(root, 'hub.db')
+    const backups = path.join(root, 'backups')
+    const timestamp = '2026-07-29T12:34:56.789Z'
+
+    const [first, second] = await Promise.all([
+      snapshotInChild(sourceFile, backups, timestamp),
+      snapshotInChild(sourceFile, backups, timestamp),
+    ])
+
+    expect(first.ok).toBe(true)
+    expect(second.ok).toBe(true)
+    expect(first.file).not.toBe(second.file)
+    const entries = fs.readdirSync(backups)
+    expect(entries.filter((name) => name.endsWith('.db'))).toHaveLength(2)
+    expect(entries.filter((name) => name.endsWith('.partial'))).toEqual([])
+  })
+
+  it('a forced process exit can leave only a partial, which the next exclusive owner cleans', async () => {
+    const root = tmp()
+    const backupsDir = path.join(root, 'backups')
+    const interruptedTarget = await interruptSnapshotInChild(backupsDir)
+
+    expect(path.dirname(interruptedTarget)).toBe(backupsDir)
+    expect(path.basename(interruptedTarget)).toMatch(/\.db\.partial$/)
+    expect(fs.readdirSync(backupsDir).filter((name) => name.endsWith('.db'))).toEqual([])
+    expect(fs.existsSync(interruptedTarget)).toBe(true)
+
+    const journal = makeJournal(root, 4)
+    const published = deferred<SnapshotResult>()
+    const backups = createJournalBackupSupervisor(
+      journal.db,
+      { dir: backupsDir, intervalMs: 60_000 },
+      async (db, options) => {
+        const result = await snapshotJournal(db, options)
+        published.resolve(result)
+        return result
+      }
+    )
+    backups.activateStandalone()
+    const result = await published.promise
+    await backups.stop()
+
+    expect(result.ok).toBe(true)
+    expect(fs.existsSync(interruptedTarget)).toBe(false)
+    expect(fs.readdirSync(backupsDir).filter((name) => name.endsWith('.partial'))).toEqual([])
   })
 })
 
 describe('journal backup lifecycle', () => {
+  it('returns a visible activation failure and can recover after the live lease owner releases', async () => {
+    const root = tmp()
+    const journal = makeJournal(root, 1)
+    const options = { dir: path.join(root, 'backups'), intervalMs: 60_000 }
+    const takeSnapshot = async (): Promise<SnapshotResult> => ({ ok: true })
+    const owner = createJournalBackupSupervisor(journal.db, options, takeSnapshot)
+    const contenderStates: string[] = []
+    const contender = createJournalBackupSupervisor(
+      journal.db,
+      {
+        ...options,
+        activationRetryMs: [5],
+        onStateChange: (state) => contenderStates.push(state.status),
+      },
+      takeSnapshot
+    )
+
+    try {
+      expect(owner.activateStandalone()).toEqual({ ok: true })
+      expect(contender.activateStandalone()).toMatchObject({
+        ok: false,
+        error: expect.stringMatching(/lease|owned|locked/i),
+      })
+      expect(contenderStates).toContain('degraded')
+
+      await owner.stop()
+      await vi.waitFor(() => expect(contenderStates.at(-1)).toBe('active'))
+      expect(contender.activateStandalone()).toEqual({ ok: true })
+    } finally {
+      await Promise.allSettled([owner.stop(), contender.stop()])
+    }
+  })
+
+  it('hands the cross-process lease from settled blue to promoted green', async () => {
+    const root = tmp()
+    const backupsDir = path.join(root, 'backups')
+    const blue = spawnBackupSupervisorChild(backupsDir)
+    await waitForChildMessage(blue, 'child-ready')
+    const blueSnapshotStarted = waitForChildMessage(blue, 'snapshot-started')
+    expect(await controlBackupChild(blue, 'blue-active', 1, true)).toMatchObject({
+      applied: true,
+      active: true,
+    })
+    await blueSnapshotStarted
+
+    const paused = controlBackupChild(blue, 'blue-pause', 2, false)
+    blue.send({ type: 'release-snapshot' })
+    expect(await paused).toMatchObject({ applied: true, active: false })
+
+    const green = spawnBackupSupervisorChild(backupsDir)
+    await waitForChildMessage(green, 'child-ready')
+    const greenSnapshotStarted = waitForChildMessage(green, 'snapshot-started')
+    expect(await controlBackupChild(green, 'green-active', 1, true)).toMatchObject({
+      applied: true,
+      active: true,
+    })
+    await greenSnapshotStarted
+  })
+
+  it('keeps a surviving hub fenced after supervisor IPC loss and lets a replacement acquire only after owner death', async () => {
+    const root = tmp()
+    const backupsDir = path.join(root, 'backups')
+    const survivingHub = spawnBackupSupervisorChild(backupsDir)
+    await waitForChildMessage(survivingHub, 'child-ready')
+    const oldSnapshotStarted = waitForChildMessage(survivingHub, 'snapshot-started')
+    expect(await controlBackupChild(survivingHub, 'old-owner', 1, true)).toMatchObject({
+      applied: true,
+      active: true,
+    })
+    await oldSnapshotStarted
+
+    // Model hubctl disappearing while its detached hub survives. The old hub is no longer reachable by
+    // its parent, so an in-memory epoch cannot protect a replacement process.
+    survivingHub.disconnect()
+    expect(survivingHub.exitCode).toBeNull()
+
+    const blockedReplacement = spawnBackupSupervisorChild(backupsDir)
+    await waitForChildMessage(blockedReplacement, 'child-ready')
+    expect(await controlBackupChild(blockedReplacement, 'replacement-while-live', 1, true)).toMatchObject({
+      applied: false,
+      active: false,
+      error: expect.stringMatching(/owned|lease|process/i),
+    })
+
+    survivingHub.kill('SIGKILL')
+    await waitForExit(survivingHub)
+
+    const successor = spawnBackupSupervisorChild(backupsDir)
+    await waitForChildMessage(successor, 'child-ready')
+    const successorSnapshotStarted = waitForChildMessage(successor, 'snapshot-started')
+    expect(await controlBackupChild(successor, 'replacement-after-death', 1, true)).toMatchObject({
+      applied: true,
+      active: true,
+    })
+    await successorSnapshotStarted
+  }, 30_000)
+
   it('binds and answers readiness while a deliberately slow initial snapshot is still in flight', async () => {
     const root = tmp()
     const journal = makeJournal(root, 5)
@@ -247,7 +598,7 @@ describe('journal backup lifecycle', () => {
     expect(snapshotStartedAt).toBe(0)
     server.once('listening', () => {
       listeningAt = performance.now()
-      backups.serverReady()
+      backups.activateStandalone()
     })
     server.listen(0, '127.0.0.1')
     await once(server, 'listening')
@@ -300,7 +651,7 @@ describe('journal backup lifecycle', () => {
       takeSnapshot
     )
 
-    backups.serverReady()
+    backups.activateStandalone()
     await vi.advanceTimersByTimeAsync(0)
     expect(takeSnapshot).toHaveBeenCalledTimes(1)
 
@@ -341,7 +692,7 @@ describe('journal backup lifecycle', () => {
       }
     )
 
-    backups.serverReady()
+    backups.activateStandalone()
     const result = await published.promise
     expect(result.ok).toBe(true)
 
@@ -362,5 +713,67 @@ describe('journal backup lifecycle', () => {
     expect(copy.pragma('quick_check')).toEqual([{ quick_check: 'ok' }])
     expect(copy.prepare('SELECT COUNT(*) AS n FROM events').get()).toEqual({ n: 7 })
     copy.close()
+  })
+
+  it('keeps supervised work inactive until activated and ignores a late pause after a newer resume', async () => {
+    vi.useFakeTimers()
+    const root = tmp()
+    const journal = makeJournal(root, 5)
+    const firstRun = deferred<SnapshotResult>()
+    const takeSnapshot = vi.fn(() => firstRun.promise)
+    const backups = createJournalBackupSupervisor(
+      journal.db,
+      { dir: path.join(root, 'backups'), intervalMs: 60_000 },
+      takeSnapshot
+    )
+
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(takeSnapshot).not.toHaveBeenCalled()
+
+    const activated = await backups.applyControl({
+      type: 'journal-backup-control',
+      requestId: 'activate-blue-after-health',
+      epoch: 1,
+      active: true,
+    })
+    expect(activated).toMatchObject({ applied: true, active: true, epoch: 1 })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(takeSnapshot).toHaveBeenCalledTimes(1)
+
+    let pauseSettled = false
+    const pausing = backups
+      .applyControl({
+        type: 'journal-backup-control',
+        requestId: 'pause-blue-before-drain',
+        epoch: 2,
+        active: false,
+      })
+      .then((result) => {
+        pauseSettled = true
+        return result
+      })
+    await Promise.resolve()
+    expect(pauseSettled).toBe(false)
+
+    const resumed = await backups.applyControl({
+      type: 'journal-backup-control',
+      requestId: 'resume-blue-after-rollback',
+      epoch: 3,
+      active: true,
+    })
+    expect(resumed).toMatchObject({ applied: true, active: true, epoch: 3 })
+
+    firstRun.resolve({ ok: true })
+    const supersededPause = await pausing
+    expect(supersededPause).toMatchObject({ applied: false, active: true, epoch: 2 })
+
+    const latePause = await backups.applyControl({
+      type: 'journal-backup-control',
+      requestId: 'late-pause-blue',
+      epoch: 2,
+      active: false,
+    })
+    expect(latePause).toMatchObject({ applied: false, active: true, epoch: 2 })
+    await backups.stop()
   })
 })
