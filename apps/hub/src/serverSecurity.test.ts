@@ -1,4 +1,5 @@
 import fs from 'node:fs'
+import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { once } from 'node:events'
@@ -18,6 +19,8 @@ import { SessionStore } from './store.js'
 import { UsageMonitor } from './usage.js'
 import { WorkspaceManager } from './workspace.js'
 import type { RestartState } from './restartController.js'
+import { RestartController } from './restartController.js'
+import { waitForPortRelease } from './restartRollback.js'
 
 const cleanups: Array<() => void | Promise<void>> = []
 
@@ -81,7 +84,9 @@ async function build() {
     sockets: new Set(),
     draining: false,
     promoting: false,
+    rollbackRebinding: false,
     journalBackup: { status: 'active' },
+    journalBackupRequired: true,
   }
   const server = startServer({
     port: 0,
@@ -139,6 +144,10 @@ async function build() {
     journal,
     record,
     restartState,
+    server,
+    sessions,
+    executor,
+    publicPort: address.port,
   }
 }
 
@@ -164,6 +173,79 @@ describe('device-authenticated control plane', () => {
         error: 'journal backup lease is unavailable',
       },
     })
+  })
+
+  it('reports a public hub with required but inactive backup ownership as degraded', async () => {
+    const { base, restartState } = await build()
+    restartState.journalBackupRequired = true
+    restartState.journalBackup = { status: 'inactive' }
+
+    const response = await fetch(`${base}/api/health`)
+
+    expect(response.status).toBe(503)
+    expect(await response.json()).toMatchObject({
+      boot: 'degraded',
+      journalBackup: {
+        status: 'degraded',
+        error: expect.stringMatching(/required.*inactive/i),
+      },
+    })
+  })
+
+  it('lets the rollback controller own EADDRINUSE and report failure without the global handler exiting', async () => {
+    const {
+      server,
+      sessions,
+      journal,
+      restartState,
+      executor,
+      publicPort,
+    } = await build()
+    const sent: unknown[] = []
+    const controller = new RestartController({
+      server,
+      sessions,
+      journal,
+      state: restartState,
+      publicPort,
+      send: (message) => sent.push(message),
+      onPromoted: () => {},
+      stopJournalBackups: async () => {},
+      executor,
+    })
+    restartState.journalBackup = { status: 'inactive' }
+    await controller.drain()
+    await waitForPortRelease(publicPort, 2_000)
+
+    const reservation = http.createServer()
+    await new Promise<void>((resolve, reject) => {
+      reservation.once('error', reject)
+      reservation.listen(publicPort, '127.0.0.1', () => {
+        reservation.off('error', reject)
+        resolve()
+      })
+    })
+    cleanups.push(
+      () =>
+        new Promise<void>((resolve) => {
+          if (!reservation.listening) {
+            resolve()
+            return
+          }
+          reservation.close(() => resolve())
+        })
+    )
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined as never) as typeof process.exit)
+
+    await controller.abort('forced rollback collision')
+
+    expect(exit).not.toHaveBeenCalled()
+    expect(sent).toContainEqual({
+      type: 'rollback-failed',
+      error: expect.stringMatching(/EADDRINUSE|address already in use/i),
+    })
+    expect(restartState.rollbackRebinding).toBe(false)
+    exit.mockRestore()
   })
 
   it('rejects unauthenticated journal reads and mutations even when legacy requireToken is false', async () => {

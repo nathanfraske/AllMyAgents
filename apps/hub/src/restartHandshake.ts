@@ -44,6 +44,8 @@ export type HubMsg =
   | { type: 'released' } //      drain done: listener closed, port free
   | { type: 'promoted' } //      now listening on the fixed port
   | { type: 'promote-failed'; error: string } // could not bind the fixed port (EADDRINUSE) → supervisor rolls back
+  | { type: 'rollback-rebound' } // blue has successfully reclaimed the fixed public listener
+  | { type: 'rollback-failed'; error: string } // blue could not reclaim the fixed listener; supervisor must revive
   | JournalBackupControlResult
   /**
    * Preflight refused to boot: a positively-detected fatal condition (a corrupt database, a data
@@ -87,6 +89,14 @@ export function waitForHubMsg<T extends HubMsg['type']>(
       } else if (m && typeof m === 'object' && m.type === 'promote-failed' && type === 'promoted') {
         cleanup()
         reject(new Error(`promote failed: ${(m as { error?: string }).error ?? 'unknown'}`))
+      } else if (
+        m &&
+        typeof m === 'object' &&
+        m.type === 'rollback-failed' &&
+        type === 'rollback-rebound'
+      ) {
+        cleanup()
+        reject(new Error(`rollback rebind failed: ${m.error}`))
       } else if (m && typeof m === 'object' && m.type === 'preflight-failed') {
         // Preflight found a positively-fatal condition and refused to boot. Without this the child simply
         // exits and the caller reports "hub exited while waiting for 'ready'" — true, useless, and the
@@ -108,6 +118,57 @@ export function waitForHubMsg<T extends HubMsg['type']>(
     }
     child.on('message', onMsg as (m: unknown) => void)
     child.on('exit', onExit)
+  })
+}
+
+/**
+ * Tell blue to roll back and wait for the listener transition itself, not merely IPC delivery.
+ * The response listener is installed before send so a local test peer or very fast child cannot race it.
+ */
+export function requestRestartAbort(
+  child: ChildProcess,
+  error: string,
+  timeoutMs: number
+): Promise<Extract<HubMsg, { type: 'rollback-rebound' }>> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup()
+      reject(new Error(`timed out after ${timeoutMs}ms waiting for blue rollback rebind`))
+    }, timeoutMs)
+    const onMsg = (message: HubMsg): void => {
+      if (message?.type === 'rollback-rebound') {
+        cleanup()
+        resolve(message)
+      } else if (message?.type === 'rollback-failed') {
+        cleanup()
+        reject(new Error(`rollback rebind failed: ${message.error}`))
+      } else if (message?.type === 'preflight-failed') {
+        cleanup()
+        reject(new Error(`hub refused rollback rebind: ${message.message}`))
+      }
+    }
+    const onExit = (): void => {
+      cleanup()
+      reject(new Error('blue exited while reclaiming the public listener'))
+    }
+    function cleanup(): void {
+      clearTimeout(timer)
+      child.off('message', onMsg as (message: unknown) => void)
+      child.off('exit', onExit)
+    }
+    child.on('message', onMsg as (message: unknown) => void)
+    child.once('exit', onExit)
+    try {
+      if (!child.send) throw new Error('hub IPC channel is unavailable')
+      child.send({ type: 'restart-aborted', error }, (sendError) => {
+        if (!sendError) return
+        cleanup()
+        reject(sendError)
+      })
+    } catch (sendError) {
+      cleanup()
+      reject(sendError)
+    }
   })
 }
 

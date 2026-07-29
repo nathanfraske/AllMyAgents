@@ -51,6 +51,8 @@ export interface JournalBackupOptions {
   log?: (message: string) => void
   /** Capped retry schedule used only after standalone/orphan listener activation fails. */
   activationRetryMs?: readonly number[]
+  /** Maximum graceful wait for an in-flight generation during process shutdown. */
+  shutdownWaitMs?: number
   /** Surfaces intentional inactivity and activation failures through hub health. */
   onStateChange?: (state: JournalBackupRuntimeState) => void
 }
@@ -58,6 +60,7 @@ export interface JournalBackupOptions {
 const DEFAULT_INTERVAL_MS = 30 * 60 * 1000
 const DEFAULT_KEEP = 6
 const DEFAULT_ACTIVATION_RETRY_MS = [250, 1_000, 5_000, 10_000, 30_000] as const
+const DEFAULT_SHUTDOWN_WAIT_MS = 2_000
 const PREFIX = 'hub-'
 const SUFFIX = '.db'
 const PARTIAL_SUFFIX = `${SUFFIX}.partial`
@@ -283,6 +286,7 @@ export function createJournalBackupSupervisor(
   const log = options.log ?? (() => {})
   const activationRetryMs =
     options.activationRetryMs?.length ? options.activationRetryMs : DEFAULT_ACTIVATION_RETRY_MS
+  const shutdownWaitMs = Math.max(0, options.shutdownWaitMs ?? DEFAULT_SHUTDOWN_WAIT_MS)
   const onStateChange = options.onStateChange ?? (() => {})
   const lease = new JournalBackupLease(options.dir, log)
   let active = false
@@ -294,6 +298,8 @@ export function createJournalBackupSupervisor(
   let inFlight: Promise<void> | undefined
   let runWhenIdle = false
   let cleanupPending = false
+  let activationWaitingForInFlight = false
+  let deferredStopCleanup = false
   let latestControl:
     | {
         epoch: number
@@ -325,12 +331,23 @@ export function createJournalBackupSupervisor(
     }
     const task = Promise.resolve()
       .then(() => takeSnapshot(db, options))
-      .then(() => undefined)
+      .then((result) => {
+        if (!result.ok) {
+          const error = result.error ?? 'snapshot returned an unknown failure'
+          onStateChange({ status: 'degraded', error })
+          log(`[journal-backup] ${label} failed: ${error}`)
+          return
+        }
+        if (active && !stopped) onStateChange({ status: 'active' })
+      })
       .catch((error: unknown) => {
-        log(`[journal-backup] ${label} failed: ${String(error)}`)
+        const message = error instanceof Error ? error.message : String(error)
+        onStateChange({ status: 'degraded', error: message })
+        log(`[journal-backup] ${label} failed: ${message}`)
       })
       .finally(() => {
         if (inFlight === task) inFlight = undefined
+        activationWaitingForInFlight = false
         if (stopped || !active) return
         if (runWhenIdle) scheduleImmediate()
         else schedulePeriodic()
@@ -360,18 +377,28 @@ export function createJournalBackupSupervisor(
     active = true
     cleanupPending = true
     runWhenIdle = true
+    activationWaitingForInFlight = inFlight !== undefined
     scheduleImmediate()
     return undefined
   }
 
   const attemptActivation = (): JournalBackupActivationResult => {
+    const wasActive = active
     const error = activate()
     if (error) {
       onStateChange({ status: 'degraded', error })
       return { ok: false, error }
     }
+    if (activationWaitingForInFlight && inFlight) {
+      const settlingError =
+        'previous journal backup generation is still settling before ownership can resume'
+      onStateChange({ status: 'degraded', error: settlingError })
+      // The higher epoch is applied immediately so the older pause cannot later release the lease.
+      // Health stays degraded until that exact generation settles; no second generation can overlap it.
+      return { ok: true }
+    }
     activationRetryAttempt = 0
-    onStateChange({ status: 'active' })
+    if (!wasActive) onStateChange({ status: 'active' })
     return { ok: true }
   }
 
@@ -398,11 +425,13 @@ export function createJournalBackupSupervisor(
   const pause = async (): Promise<void> => {
     clearActivationRetry()
     active = false
+    activationWaitingForInFlight = false
     runWhenIdle = false
     if (initialTask) clearImmediate(initialTask)
     initialTask = undefined
     if (periodicTimer) clearTimeout(periodicTimer)
     periodicTimer = undefined
+    onStateChange({ status: 'inactive' })
     const current = inFlight
     if (current) await current
     // A higher-epoch resume can arrive while this pause is settling a generation. In that case active is
@@ -504,7 +533,52 @@ export function createJournalBackupSupervisor(
     async stop(): Promise<void> {
       stopped = true
       clearActivationRetry()
-      await pause()
+      active = false
+      activationWaitingForInFlight = false
+      runWhenIdle = false
+      if (initialTask) clearImmediate(initialTask)
+      initialTask = undefined
+      if (periodicTimer) clearTimeout(periodicTimer)
+      periodicTimer = undefined
+      onStateChange({ status: 'inactive' })
+
+      const current = inFlight
+      if (!current) {
+        lease.release()
+        return
+      }
+
+      let timeout: NodeJS.Timeout | undefined
+      const settled = await Promise.race([
+        current.then(() => true),
+        new Promise<false>((resolve) => {
+          timeout = setTimeout(() => resolve(false), shutdownWaitMs)
+        }),
+      ])
+      if (timeout) clearTimeout(timeout)
+      if (settled) {
+        lease.release()
+        onStateChange({ status: 'inactive' })
+        return
+      }
+
+      const error = `journal backup generation did not settle within ${shutdownWaitMs}ms shutdown guard`
+      onStateChange({ status: 'degraded', error })
+      log(`[journal-backup] ${error}; process exit will contain the unpublished partial`)
+      if (!deferredStopCleanup) {
+        deferredStopCleanup = true
+        void current.then(() => {
+          try {
+            lease.release()
+            onStateChange({ status: 'inactive' })
+          } catch (releaseError) {
+            const message =
+              releaseError instanceof Error ? releaseError.message : String(releaseError)
+            onStateChange({ status: 'degraded', error: message })
+            log(`[journal-backup] deferred shutdown lease release failed: ${message}`)
+          }
+        })
+      }
     },
   }
 }

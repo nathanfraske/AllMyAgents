@@ -6,10 +6,14 @@ import {
 } from './restartHandshake.js'
 
 export const JOURNAL_BACKUP_CONTROL_TIMEOUT_MS = 120_000
+export const JOURNAL_BACKUP_ACTIVATION_TIMEOUT_MS = 5_000
 
 export interface JournalBackupOwnershipOptions {
   requestId?: () => string
+  /** Backward-compatible test override for both pause and activation. */
   timeoutMs?: number
+  pauseTimeoutMs?: number
+  activationTimeoutMs?: number
 }
 
 /**
@@ -24,11 +28,19 @@ export class JournalBackupOwnershipProtocol {
   private epoch = 0
   private owner: ChildProcess | undefined
   private readonly requestId: () => string
-  private readonly timeoutMs: number
+  private readonly pauseTimeoutMs: number
+  private readonly activationTimeoutMs: number
 
   constructor(options: JournalBackupOwnershipOptions = {}) {
     this.requestId = options.requestId ?? randomUUID
-    this.timeoutMs = options.timeoutMs ?? JOURNAL_BACKUP_CONTROL_TIMEOUT_MS
+    this.pauseTimeoutMs =
+      options.pauseTimeoutMs ??
+      options.timeoutMs ??
+      JOURNAL_BACKUP_CONTROL_TIMEOUT_MS
+    this.activationTimeoutMs =
+      options.activationTimeoutMs ??
+      options.timeoutMs ??
+      JOURNAL_BACKUP_ACTIVATION_TIMEOUT_MS
   }
 
   /** Initial/revived blue only: call after the parent has consumed ready and completed HTTP health. */
@@ -37,13 +49,13 @@ export class JournalBackupOwnershipProtocol {
     // Ownership is provisional before send: if the acknowledgement is lost after the hub applied the
     // command, no replacement may activate until this process is known dead or explicitly paused.
     this.owner = blue
-    await this.setActive(blue, true)
+    await this.setActive(blue, true, this.activationTimeoutMs)
   }
 
   /** Blue only: settle its generation and receive the pause acknowledgement before sending drain. */
   async pauseBlueBeforeDrain(blue: ChildProcess): Promise<void> {
     this.assertNoOtherOwner(blue)
-    await this.setActive(blue, false)
+    await this.setActive(blue, false, this.pauseTimeoutMs)
     if (this.owner === blue) this.owner = undefined
   }
 
@@ -51,14 +63,14 @@ export class JournalBackupOwnershipProtocol {
   async resumeBlueAfterRollback(blue: ChildProcess): Promise<void> {
     this.assertNoOtherOwner(blue)
     this.owner = blue
-    await this.setActive(blue, true)
+    await this.setActive(blue, true, this.activationTimeoutMs)
   }
 
   /** Green only: call after the parent has received `promoted`, never after ephemeral health alone. */
   async activatePromotedGreen(green: ChildProcess): Promise<void> {
     this.assertNoOtherOwner(green)
     this.owner = green
-    await this.setActive(green, true)
+    await this.setActive(green, true, this.activationTimeoutMs)
   }
 
   private assertNoOtherOwner(candidate: ChildProcess): void {
@@ -73,7 +85,11 @@ export class JournalBackupOwnershipProtocol {
     }
   }
 
-  private async setActive(child: ChildProcess, active: boolean): Promise<void> {
+  private async setActive(
+    child: ChildProcess,
+    active: boolean,
+    timeoutMs: number
+  ): Promise<void> {
     const command: JournalBackupControlCommand = {
       type: 'journal-backup-control',
       requestId: this.requestId(),
@@ -83,7 +99,7 @@ export class JournalBackupOwnershipProtocol {
     const result = await requestJournalBackupControl(
       child,
       command,
-      this.timeoutMs
+      timeoutMs
     )
     if (result.epoch !== command.epoch) {
       throw new Error(

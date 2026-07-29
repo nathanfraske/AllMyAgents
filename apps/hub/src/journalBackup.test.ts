@@ -134,6 +134,53 @@ function spawnBackupSupervisorChild(backups: string): ChildProcess {
   `)
 }
 
+function spawnHungRetireChild(backups: string): ChildProcess {
+  const backupModule = pathToFileURL(path.join(import.meta.dirname, 'journalBackup.ts')).href
+  return spawnEvalModule(`
+    const fs = await import('node:fs')
+    const path = await import('node:path')
+    const { createJournalBackupSupervisor } = await import(${JSON.stringify(backupModule)})
+    fs.mkdirSync(${JSON.stringify(backups)}, { recursive: true })
+    const partial = path.join(${JSON.stringify(backups)}, 'hub-never-resolving.db.partial')
+    const backups = createJournalBackupSupervisor(
+      {},
+      {
+        dir: ${JSON.stringify(backups)},
+        intervalMs: 60_000,
+        shutdownWaitMs: 50
+      },
+      async () => {
+        fs.writeFileSync(partial, String(process.pid))
+        process.send?.({ type: 'snapshot-started', partial })
+        await new Promise(() => {})
+      }
+    )
+    let retiring = false
+    const retire = () => {
+      if (retiring) return
+      retiring = true
+      void backups.stop().then(() => {
+        if (!process.send) process.exit(0)
+        process.send({ type: 'retire-stopped' }, () => process.exit(0))
+      })
+    }
+    process.on('message', (message) => {
+      if (message?.type === 'journal-backup-control') {
+        void backups.applyControl(message).then((result) => process.send?.({
+          type: 'control-result',
+          result
+        }))
+        return
+      }
+      if (message?.type !== 'retire') return
+      retire()
+    })
+    process.on('SIGTERM', retire)
+    process.send?.({ type: 'child-ready' })
+    setInterval(() => {}, 60_000)
+  `)
+}
+
 function waitForChildMessage<T extends { type: string }>(
   child: ChildProcess,
   type: T['type'],
@@ -461,6 +508,50 @@ describe('journal snapshots', () => {
 })
 
 describe('journal backup lifecycle', () => {
+  it.each([
+    {
+      name: 'returned failure',
+      task: async (): Promise<SnapshotResult> => ({
+        ok: false,
+        error: 'snapshot verification rejected the generation',
+      }),
+      message: /verification rejected/i,
+    },
+    {
+      name: 'thrown failure',
+      task: async (): Promise<SnapshotResult> => {
+        throw new Error('snapshot task threw')
+      },
+      message: /task threw/i,
+    },
+  ])('surfaces a $name as degraded backup health', async ({ task, message }) => {
+    const root = tmp()
+    const journal = makeJournal(root, 1)
+    const states: Array<{ status: string; error?: string }> = []
+    const degraded = deferred<void>()
+    const backups = createJournalBackupSupervisor(
+      journal.db,
+      {
+        dir: path.join(root, 'backups'),
+        intervalMs: 60_000,
+        onStateChange: (state) => {
+          states.push(state)
+          if (state.status === 'degraded') degraded.resolve()
+        },
+      },
+      task
+    )
+
+    backups.activateStandalone()
+    await degraded.promise
+
+    expect(states.at(-1)).toMatchObject({
+      status: 'degraded',
+      error: expect.stringMatching(message),
+    })
+    await backups.stop()
+  })
+
   it('returns a visible activation failure and can recover after the live lease owner releases', async () => {
     const root = tmp()
     const journal = makeJournal(root, 1)
@@ -557,6 +648,73 @@ describe('journal backup lifecycle', () => {
     })
     await successorSnapshotStarted
   }, 30_000)
+
+  it('bounds retire with a never-resolving snapshot, then lets a successor clean its partial and acquire', async () => {
+    const root = tmp()
+    const backupsDir = path.join(root, 'backups')
+    const hung = spawnHungRetireChild(backupsDir)
+    await waitForChildMessage(hung, 'child-ready')
+    const started = waitForChildMessage<{
+      type: 'snapshot-started'
+      partial: string
+    }>(hung, 'snapshot-started')
+    expect(await controlBackupChild(hung, 'hung-owner', 1, true)).toMatchObject({
+      applied: true,
+      active: true,
+    })
+    const { partial } = await started
+    expect(fs.existsSync(partial)).toBe(true)
+
+    const retired = waitForChildMessage(hung, 'retire-stopped', 1_000)
+    hung.send({ type: 'retire' })
+    await retired
+    await waitForExit(hung)
+
+    const successor = spawnBackupSupervisorChild(backupsDir)
+    await waitForChildMessage(successor, 'child-ready')
+    const successorStarted = waitForChildMessage(successor, 'snapshot-started')
+    expect(await controlBackupChild(successor, 'successor-owner', 1, true)).toMatchObject({
+      applied: true,
+      active: true,
+    })
+    await successorStarted
+    expect(fs.existsSync(partial)).toBe(false)
+  }, 10_000)
+
+  it('contains a never-resolving snapshot on SIGTERM and releases the lease for a successor', async () => {
+    const root = tmp()
+    const backupsDir = path.join(root, 'backups')
+    const hung = spawnHungRetireChild(backupsDir)
+    await waitForChildMessage(hung, 'child-ready')
+    const started = waitForChildMessage<{
+      type: 'snapshot-started'
+      partial: string
+    }>(hung, 'snapshot-started')
+    expect(await controlBackupChild(hung, 'signal-owner', 1, true)).toMatchObject({
+      applied: true,
+      active: true,
+    })
+    const { partial } = await started
+
+    hung.kill('SIGTERM')
+    await Promise.race([
+      waitForExit(hung),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('hung snapshot child ignored SIGTERM guard')), 1_000)
+      ),
+    ])
+    expect(fs.existsSync(partial)).toBe(true)
+
+    const successor = spawnBackupSupervisorChild(backupsDir)
+    await waitForChildMessage(successor, 'child-ready')
+    const successorStarted = waitForChildMessage(successor, 'snapshot-started')
+    expect(await controlBackupChild(successor, 'signal-successor', 1, true)).toMatchObject({
+      applied: true,
+      active: true,
+    })
+    await successorStarted
+    expect(fs.existsSync(partial)).toBe(false)
+  }, 10_000)
 
   it('binds and answers readiness while a deliberately slow initial snapshot is still in flight', async () => {
     const root = tmp()

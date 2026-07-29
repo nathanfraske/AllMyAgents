@@ -100,8 +100,10 @@ function spawnOrphanFixture(
       booted: true,
       draining: false,
       promoting: false,
+      rollbackRebinding: false,
       sockets: new Set(),
-      journalBackup: { status: 'inactive' }
+      journalBackup: { status: 'inactive' },
+      journalBackupRequired: false,
     }
     const backups = createJournalBackupSupervisor(
       {},

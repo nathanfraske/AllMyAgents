@@ -32,8 +32,10 @@ function controllerDeps(
       booted: true,
       draining: false,
       promoting: false,
+      rollbackRebinding: false,
       sockets: new Set(),
       journalBackup: { status: 'active' },
+      journalBackupRequired: true,
     },
     send: (message: unknown) => {
       sent.push(message)
@@ -126,13 +128,59 @@ describe('RestartController journal backup ownership', () => {
   it('waits through rollback re-listen before resuming orphaned blue ownership', async () => {
     const server = http.createServer()
     const publicPort = await listenEphemeral(server)
-    const deps = controllerDeps(server, publicPort)
+    const sent: unknown[] = []
+    const deps = controllerDeps(server, publicPort, sent)
     const controller = new RestartController(deps)
 
     await controller.drain()
-    controller.abort('test rollback')
+    await controller.abort('test rollback')
 
     expect(await controller.resolveOrphanedListenerOwnership()).toBe(true)
     expect((server.address() as { port: number }).port).toBe(publicPort)
+    expect(sent).toContainEqual({ type: 'rollback-rebound' })
+    expect(deps.state.rollbackRebinding).toBe(false)
+  })
+
+  it('serializes rollback rebind behind an existing listener transition', async () => {
+    const server = http.createServer()
+    const publicPort = await listenEphemeral(server)
+    const sent: unknown[] = []
+    const deps = controllerDeps(server, publicPort, sent)
+    const controller = new RestartController(deps)
+
+    const draining = controller.drain()
+    const aborting = controller.abort('overlapping rollback')
+    await Promise.all([draining, aborting])
+
+    expect(sent).toEqual([{ type: 'released' }, { type: 'rollback-rebound' }])
+    expect(server.listening).toBe(true)
+    expect((server.address() as { port: number }).port).toBe(publicPort)
+  })
+
+  it('owns rollback bind errors and reports a typed failure instead of claiming rebound', async () => {
+    const server = http.createServer()
+    const publicPort = await listenEphemeral(server)
+    const sent: unknown[] = []
+    const deps = controllerDeps(server, publicPort, sent)
+    const controller = new RestartController(deps)
+
+    await controller.drain()
+    const reservation = http.createServer()
+    servers.push(reservation)
+    await new Promise<void>((resolve) => reservation.listen(publicPort, '127.0.0.1', resolve))
+
+    await controller.abort('reserved rollback port')
+
+    expect(sent).toContainEqual({
+      type: 'rollback-failed',
+      error: expect.stringMatching(/EADDRINUSE|address already in use/i),
+    })
+    expect(sent).not.toContainEqual({ type: 'rollback-rebound' })
+    expect(deps.state.rollbackRebinding).toBe(false)
+    expect(deps.state.journalBackupRequired).toBe(true)
+    expect(deps.state.journalBackup).toMatchObject({
+      status: 'degraded',
+      error: expect.stringMatching(/rollback/i),
+    })
   })
 })

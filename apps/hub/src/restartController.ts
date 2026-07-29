@@ -19,8 +19,11 @@ export interface RestartState {
   booted: boolean
   draining: boolean
   promoting: boolean
+  rollbackRebinding: boolean
   sockets: Set<Socket>
   journalBackup: JournalBackupRuntimeState
+  /** Sticky once this process owns or is reclaiming the public listener. */
+  journalBackupRequired: boolean
 }
 
 export interface RestartControllerDeps {
@@ -49,6 +52,14 @@ export class RestartController {
 
   private notifySupervisor(message: unknown): void {
     if (!this.supervisorDisconnected) this.deps.send(message)
+  }
+
+  private requireJournalBackupOwnership(error: string): void {
+    const { state } = this.deps
+    state.journalBackupRequired = true
+    if (state.journalBackup.status !== 'active') {
+      state.journalBackup = { status: 'degraded', error }
+    }
   }
 
   /**
@@ -134,6 +145,9 @@ export class RestartController {
       server.off('error', onError)
       state.promoting = false
       state.draining = false
+      this.requireJournalBackupOwnership(
+        'promoted public listener is waiting for journal backup ownership'
+      )
       sessions.reconcileStale()
       onPromoted()
       this.notifySupervisor({ type: 'promoted' })
@@ -179,12 +193,11 @@ export class RestartController {
   }
 
   /**
-   * BLUE: green failed. Journal the abort. If we had ALREADY drained (released the port) when green
-   * failed, re-claim the fixed port so the hub isn't left dark — green never bound it (it failed at
-   * health-check or its own listen), so the port is free for us again. If green failed BEFORE our
-   * drain, state.draining is false and we were never disturbed.
+   * BLUE: green failed. Journal the abort. If we had already drained, reclaim the fixed port only after
+   * hubctl has confirmed any promoted green is dead and the port bind-probes free. If green failed before
+   * drain, state.draining is false and the existing listener is acknowledged without another listen().
    */
-  abort(error: string): void {
+  async abort(error: string): Promise<void> {
     const { server, journal, state, publicPort, executor } = this.deps
     journal.append(null, 'hub/restart-aborted', { error })
     // RELEASE the drain hold (the M2 correctness item, §8.4): green failed, blue is staying live, so un-drain
@@ -193,34 +206,68 @@ export class RestartController {
     // harmless no-op when the worker was never draining (green failed before blue's drain()), and the release
     // when it was — so we always pair the drain with its release. No-op in-process (no worker).
     executor.signalDraining?.(false)
-    if (state.draining) {
-      state.draining = false
-      let settleTransition!: () => void
-      const transition = new Promise<void>((resolve) => {
-        settleTransition = resolve
-      })
-      this.listenerTransition = transition
-      const settled = (): void => {
-        if (this.listenerTransition === transition) this.listenerTransition = undefined
-        settleTransition()
-      }
-      const onError = (e: NodeJS.ErrnoException): void => {
-        server.off('error', onError)
-        server.off('listening', onListening)
-        console.error(`[hub] rollback re-listen failed: ${e.message}`)
-        settled()
-      }
-      const onListening = (): void => {
-        server.off('error', onError)
-        settled()
-      }
-      server.once('error', onError)
-      server.once('listening', onListening)
-      try {
-        server.listen(publicPort, '127.0.0.1')
-      } catch (error) {
-        onError(error as NodeJS.ErrnoException)
-      }
+
+    // Drain, promote, orphan resolution, and rollback all share one server. Never overwrite an
+    // already-running close/listen promise: wait for the exact callback, then own the next transition.
+    for (;;) {
+      const existing = this.listenerTransition
+      if (!existing) break
+      await existing
     }
+
+    this.requireJournalBackupOwnership(
+      'rollback public listener is waiting for journal backup ownership'
+    )
+    if (!state.draining) {
+      this.notifySupervisor({ type: 'rollback-rebound' })
+      return
+    }
+
+    state.rollbackRebinding = true
+    let settleTransition!: () => void
+    const transition = new Promise<void>((resolve) => {
+      settleTransition = resolve
+    })
+    this.listenerTransition = transition
+    let settledAlready = false
+    const settled = (): void => {
+      if (settledAlready) return
+      settledAlready = true
+      if (this.listenerTransition === transition) this.listenerTransition = undefined
+      settleTransition()
+    }
+    const onError = (bindError: NodeJS.ErrnoException): void => {
+      server.off('error', onError)
+      server.off('listening', onListening)
+      state.draining = true
+      executor.signalDraining?.(true)
+      const message = bindError.message || bindError.code || String(bindError)
+      state.journalBackup = {
+        status: 'degraded',
+        error: `rollback failed to reclaim the public listener: ${message}`,
+      }
+      console.error(`[hub] rollback re-listen failed: ${message}`)
+      this.notifySupervisor({ type: 'rollback-failed', error: message })
+      settled()
+    }
+    const onListening = (): void => {
+      server.off('error', onError)
+      state.draining = false
+      this.notifySupervisor({ type: 'rollback-rebound' })
+      settled()
+    }
+    server.once('error', onError)
+    server.once('listening', onListening)
+    try {
+      server.listen(publicPort, '127.0.0.1')
+    } catch (bindError) {
+      onError(bindError as NodeJS.ErrnoException)
+    }
+    await transition
+    // Keep the controller's error-ownership flag set for the entire synchronous EventEmitter dispatch.
+    // A platform may also surface a synchronous listen failure and then enqueue the matching error event;
+    // drain that event-loop turn before releasing ownership so the global listener still defers.
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    state.rollbackRebinding = false
   }
 }

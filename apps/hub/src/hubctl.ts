@@ -21,6 +21,11 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { sendToHub, waitForHubMsg, healthCheck, type HubMsg } from './restartHandshake.js'
 import { defaultWorkerSocket } from './workerTransport.js'
 import { JournalBackupOwnershipProtocol } from './journalBackupOwnership.js'
+import {
+  abandonLiveForRevival,
+  FlipRecoveryTracker,
+  rollbackToBlue,
+} from './restartRollback.js'
 
 /** The hard public singleton the web client hardcodes (`api.ts:145`). Blue owns it; green takes it on promote.
  *  HUB_FIXED_PORT overrides it for an isolated harness (e.g. the restart-survival acceptance test) so a
@@ -57,13 +62,15 @@ interface HubHandle {
   color: HubColor
   port: number // 7777 for the live hub; the ephemeral port for a booting green (until it's promoted)
   restored: number // sessions restored, from the hub's `ready` message
-  state: 'booting' | 'live' | 'draining' | 'retired'
+  state: 'booting' | 'live' | 'draining' | 'promoted' | 'retired'
 }
 
 /** The hub currently listening on 7777. */
 let live: HubHandle | null = null
 /** True while a blue-green flip is running — a re-entrant restart is ignored. */
 let flipInFlight = false
+/** Defers an unexpected live-blue exit until the flip either adopts green or rolls back. */
+const flipRecovery = new FlipRecoveryTracker()
 /** Exactly one supervised hub may schedule journal backups against the shared data root. */
 const journalBackupOwnership = new JournalBackupOwnershipProtocol()
 
@@ -148,9 +155,10 @@ function spawnHub(port: number, color: HubColor): HubHandle {
     //
     // A supervisor that exits when its child dies is not supervising. Respawn with backoff instead, the
     // same shape the agent worker above already uses.
-    if (!expected && live === handle && !flipInFlight) {
-      live = null
-      void reviveLiveHub()
+    if (!expected && live === handle) {
+      clearLiveHandle(handle)
+      const recovery = flipRecovery.noteUnexpectedLiveExit(flipInFlight)
+      if (recovery === 'revive-now') void reviveLiveHub()
     }
   })
   return handle
@@ -324,6 +332,7 @@ function setLive(handle: HubHandle): void {
   if (live && restartListener) live.child.off('message', restartListener)
   live = handle
   handle.state = 'live'
+  flipRecovery.adoptLiveReplacement()
   const listener = (m: unknown): void => {
     const msg = m as HubMsg
     if (msg && typeof msg === 'object' && msg.type === 'restart-request') {
@@ -333,6 +342,13 @@ function setLive(handle: HubHandle): void {
   }
   restartListener = listener
   handle.child.on('message', listener)
+}
+
+function clearLiveHandle(handle: HubHandle): void {
+  if (live !== handle) return
+  if (restartListener) handle.child.off('message', restartListener)
+  restartListener = null
+  live = null
 }
 
 /** Hard-kill a child and its whole process tree. Best-effort — never throws out of a teardown path. */
@@ -433,9 +449,9 @@ async function boot(): Promise<void> {
 
 /**
  * The blue-green flip. Boot green on an ephemeral port, health-check it against blue's shared `data/`,
- * then sequence the 7777 hand-off. Any failure BEFORE green owns 7777 is a clean rollback: kill green,
- * tell blue (which is untouched, or re-listens on the abort) it was aborted. Once green is promoted the
- * flip has committed — a later hiccup is cleanup noise, never a reason to tear the new live hub down.
+ * then sequence the 7777 hand-off. Before backup ownership commits, rollback kills green and, if it had
+ * already bound 7777, confirms both process death and port release before blue may re-listen. Once green
+ * has both the listener and backup ownership the flip has committed; later cleanup errors never roll back.
  */
 async function restart(reason: string): Promise<void> {
   if (flipInFlight) {
@@ -448,8 +464,8 @@ async function restart(reason: string): Promise<void> {
   }
   flipInFlight = true
   const blue = live
-  let promoted = false
-  let greenBackupActivationAttempted = false
+  let committed = false
+  let greenOwnsPublicListener = false
   log(`restart requested (${reason}) — booting green on an ephemeral port`)
   const green = spawnHub(0, 'green')
   try {
@@ -469,14 +485,17 @@ async function restart(reason: string): Promise<void> {
 
     sendToHub(green.child, { type: 'promote', port: FIXED_PORT }) // green: re-listen on 7777
     await waitForHubMsg(green.child, 'promoted', 8_000)
+    // `promoted` means the fixed listener is already bound. Track that fact immediately, before backup
+    // activation or any other await, so every failure path fences this port before blue can rebind.
+    greenOwnsPublicListener = true
     green.port = FIXED_PORT
+    green.state = 'promoted'
     log(`green promoted on :${FIXED_PORT} — acquiring journal backup ownership`)
 
     // Promotion binds the public listener; ownership acknowledgement is the final commit gate. If it
     // fails, green can still be killed and blue resumed/re-listened without two backup writers.
-    greenBackupActivationAttempted = true
     await journalBackupOwnership.activatePromotedGreen(green.child)
-    promoted = true
+    committed = true
     setLive(green) // swap + re-wire the restart-request listener onto green
     log(`green live on :${FIXED_PORT} with journal backup ownership`)
     sendToHub(blue.child, { type: 'retire' }) // blue: finish in-flight, close WS, shut down, exit(0)
@@ -484,34 +503,52 @@ async function restart(reason: string): Promise<void> {
     reap(blue, 3_000) // ...or kill blue's tree if it doesn't exit in 3s
     log('blue retiring')
   } catch (err) {
-    if (promoted) {
+    if (committed) {
       // Green already owns 7777 (the flip committed) — a failure here is post-flip cleanup, NOT a
       // rollback trigger. Tearing green down now would leave 7777 dead; just surface it.
       log(`post-flip cleanup error (green is live): ${String(err)}`)
     } else {
-      // ROLLBACK: green never took 7777 and blue is untouched (or re-listens on the abort). Kill the
-      // green tree and tell blue it was aborted so it journals hub/restart-aborted for the operator.
       log(`restart aborted — rolling back to blue: ${String(err)}`)
-      killTree(green.child)
       try {
-        sendToHub(blue.child, { type: 'restart-aborted', error: String(err) })
-      } catch (abortSignalError) {
-        // Backup resume is the safety action and must still be attempted even if the explanatory journal
-        // signal cannot cross a closing IPC channel.
-        log(`could not send restart-aborted to blue: ${String(abortSignalError)}`)
-      }
-      try {
-        // If green may have applied activation but lost its acknowledgement, fence it by confirmed process
-        // death before issuing blue's higher-epoch resume. Other rollback paths never activated green.
-        if (greenBackupActivationAttempted) await waitForChildExit(green.child, 5_000)
-        await journalBackupOwnership.resumeBlueAfterRollback(blue.child)
+        await rollbackToBlue({
+          blue: blue.child,
+          green: green.child,
+          publicPort: FIXED_PORT,
+          reason: String(err),
+          greenOwnsPublicListener,
+          killGreen: (child) => {
+            green.state = 'retired'
+            killTree(child)
+          },
+          waitForGreenExit: waitForChildExit,
+          resumeBlue: () => journalBackupOwnership.resumeBlueAfterRollback(blue.child),
+          onResumeFailure: (resumeError, nextDelayMs) => {
+            log(
+              nextDelayMs === undefined
+                ? `blue journal backup resume exhausted retries: ${String(resumeError)}`
+                : `blue journal backup resume failed: ${String(resumeError)}; retrying in ${nextDelayMs}ms`
+            )
+          },
+        })
         log('blue journal backups resumed after rollback')
-      } catch (resumeError) {
-        log(`blue journal backup resume failed after rollback: ${String(resumeError)}`)
+      } catch (rollbackError) {
+        await abandonLiveForRevival({
+          child: blue.child,
+          reason: String(rollbackError),
+          clearLive: () => clearLiveHandle(blue),
+          markRetired: () => {
+            blue.state = 'retired'
+          },
+          requestDeferredRecovery: () => flipRecovery.requestDeferredRecovery(),
+          kill: killTree,
+          waitForExit: waitForChildExit,
+          log,
+        })
       }
     }
   } finally {
     flipInFlight = false
+    if (flipRecovery.finishFlip(live !== null)) void reviveLiveHub()
   }
 }
 

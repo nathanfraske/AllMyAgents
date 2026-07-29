@@ -164,8 +164,10 @@ const restartState: RestartState = {
   booted: false,
   draining: false,
   promoting: false,
+  rollbackRebinding: false,
   sockets: new Set(),
   journalBackup: { status: 'inactive' },
+  journalBackupRequired: false,
 }
 
 // AUTOMATIC, VERIFIED JOURNAL SNAPSHOTS.
@@ -186,6 +188,7 @@ const journalBackups = createJournalBackupSupervisor(journal.db, {
   dir: journalBackupsDir,
   log: (message) => console.log(message),
   onStateChange: (state) => {
+    if (state.status !== 'inactive') restartState.journalBackupRequired = true
     restartState.journalBackup = state
   },
 })
@@ -567,7 +570,10 @@ server.once('listening', () => {
   }
   // Standalone owns its data root once listening. Under hubctl, both blue and green stay inactive here:
   // the parent grants one explicit cross-process owner only after health / handoff completes.
-  if (!supervised) journalBackups.activateStandalone()
+  if (!supervised) {
+    restartState.journalBackupRequired = true
+    journalBackups.activateStandalone()
+  }
   // Blue / standalone own the port at boot → advertise now. Green defers mesh to promote.
   if (!isGreen) {
     registerMesh()
@@ -613,7 +619,17 @@ if (supervised && process.send) {
         void controller.retire()
         break
       case 'restart-aborted':
-        controller.abort(msg.error)
+        void controller.abort(msg.error).catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error)
+          restartState.rollbackRebinding = false
+          restartState.draining = true
+          restartState.journalBackupRequired = true
+          restartState.journalBackup = {
+            status: 'degraded',
+            error: `rollback transition failed: ${message}`,
+          }
+          send({ type: 'rollback-failed', error: message })
+        })
         break
       case 'journal-backup-control':
         void journalBackups

@@ -557,7 +557,19 @@ export function startServer(opts: ServerOptions): http.Server {
       // Public health probe — the supervisor health-checks a booting green hub with this before any
       // port handoff. `boot:'complete'` only once sessions.boot() has run (restartState.booted).
       if (method === 'GET' && url.pathname === '/api/health') {
-        const backupDegraded = restartState.journalBackup.status === 'degraded'
+        const requiredButInactive =
+          restartState.journalBackupRequired &&
+          restartState.journalBackup.status === 'inactive'
+        const reportedBackupState = requiredButInactive
+          ? {
+              status: 'degraded' as const,
+              error: 'journal backup ownership is required but inactive',
+            }
+          : restartState.journalBackup
+        const backupDegraded =
+          reportedBackupState.status === 'degraded' ||
+          (restartState.journalBackupRequired &&
+            reportedBackupState.status !== 'active')
         json(
           res,
           {
@@ -569,7 +581,7 @@ export function startServer(opts: ServerOptions): http.Server {
             restoredSessions: sessions.list().length,
             schemaVersion: SCHEMA_VERSION,
             pid: process.pid,
-            journalBackup: restartState.journalBackup,
+            journalBackup: reportedBackupState,
             // The port we are ACTUALLY listening on, not the boot port. A promoted green booted on an
             // ephemeral port (HUB_PORT=0) and then re-listened on the fixed public port, so the boot value
             // would report `0` for the rest of that hub's life (the known-broken health path in the alpha
@@ -1688,6 +1700,13 @@ export function startServer(opts: ServerOptions): http.Server {
       return tokenMatches(deviceToken, wsUrl.searchParams.get('token') ?? bearerToken(info.req))
     },
   })
+  // ws forwards the underlying HTTP server's `error` event onto the WebSocketServer before later HTTP
+  // listeners run. Without an error listener here, EADDRINUSE throws from ws first and prevents the
+  // RestartController from emitting typed promote/rollback failure IPC.
+  wss.on('error', (error) => {
+    if (restartState.promoting || restartState.rollbackRebinding) return
+    console.error(`[hub] websocket server error: ${error.message}`)
+  })
   wss.on('connection', (ws, req) => {
     const url = new URL(req.url ?? '/ws', 'http://localhost')
     const since = Number(url.searchParams.get('since') ?? 0)
@@ -1721,9 +1740,9 @@ export function startServer(opts: ServerOptions): http.Server {
   })
   server.on('error', (err: NodeJS.ErrnoException) => {
     if (err.code === 'EADDRINUSE') {
-      // During a promote re-listen the RestartController's own once('error') handler owns this (it
-      // signals promote-failed → the supervisor rolls back to blue). Don't also exit here.
-      if (restartState.promoting) return
+      // During promote or rollback re-listen the RestartController's own once('error') handler owns
+      // this and sends a typed result to hubctl. Don't also exit before that recovery protocol runs.
+      if (restartState.promoting || restartState.rollbackRebinding) return
       console.error(`[hub] port ${port} is already in use — is another hub instance running? (set HUB_PORT to override)`)
       process.exit(1)
     }
