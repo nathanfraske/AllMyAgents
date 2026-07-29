@@ -75,9 +75,9 @@ describe('computeComposerHeight', () => {
 })
 
 describe('composerAutoGrow', () => {
-  it('handles typing, programmatic draft restoration, overflow, and clear-after-send collapse', async () => {
+  it('ignores a wrapping placeholder while handling typing, draft restoration, overflow, and clear', async () => {
     const viewport = new EventTarget() as EventTarget & { height: number }
-    viewport.height = 800
+    viewport.height = 600
     Object.defineProperty(window, 'visualViewport', { configurable: true, value: viewport })
     const fonts = new EventTarget() as EventTarget & { ready: Promise<unknown> }
     fonts.ready = Promise.resolve(fonts)
@@ -88,12 +88,16 @@ describe('composerAutoGrow', () => {
     const composer = document.createElement('div')
     const textarea = document.createElement('textarea')
     textarea.rows = 2
+    textarea.placeholder =
+      'Ask for follow-up changes… (Enter to send, Shift+Enter for newline)'
     composer.append(textarea)
     container.append(composer)
     document.body.append(container)
 
-    let baseHeight = 48
-    let contentHeight = 48
+    const viewportWidth = 390
+    let baseHeight = 46
+    // Chromium includes a wrapping placeholder in scrollHeight even though the textarea value is empty.
+    let contentHeight = 192
     let containerHeight = 600
     const chromeHeight = 60
     Object.defineProperty(textarea, 'scrollHeight', {
@@ -103,16 +107,20 @@ describe('composerAutoGrow', () => {
       get: () => Math.max(0, contentHeight - 2),
     })
     textarea.getBoundingClientRect = () =>
-      rect(textarea.style.height ? Number.parseFloat(textarea.style.height) : baseHeight)
+      rect(textarea.style.height ? Number.parseFloat(textarea.style.height) : baseHeight, viewportWidth)
     composer.getBoundingClientRect = () =>
-      rect((textarea.style.height ? Number.parseFloat(textarea.style.height) : baseHeight) + chromeHeight)
-    container.getBoundingClientRect = () => rect(containerHeight)
+      rect(
+        (textarea.style.height ? Number.parseFloat(textarea.style.height) : baseHeight) + chromeHeight,
+        viewportWidth,
+      )
+    container.getBoundingClientRect = () => rect(containerHeight, viewportWidth)
 
     const action = composerAutoGrow(textarea, '')
-    expect(textarea.style.height).toBe('48px')
+    expect(textarea.style.height).toBe('46px')
     expect(textarea.style.overflowY).toBe('hidden')
 
     contentHeight = 180
+    textarea.value = 'A real paragraph that wraps onto several measured lines.'
     textarea.dispatchEvent(new InputEvent('input', { bubbles: true }))
     await Promise.resolve()
     expect(textarea.style.height).toBe('180px')
@@ -127,20 +135,23 @@ describe('composerAutoGrow', () => {
     expect(textarea.scrollTop).toBe(72)
 
     contentHeight = 190
+    textarea.value = 'restored paragraph'
     action.update?.('restored paragraph')
     await Promise.resolve()
     expect(textarea.style.height).toBe('190px')
     expect(textarea.style.overflowY).toBe('hidden')
 
     textarea.scrollTop = 80
-    contentHeight = baseHeight
+    textarea.value = ''
+    contentHeight = 192
     action.update?.('')
     await Promise.resolve()
-    expect(textarea.style.height).toBe('48px')
+    expect(textarea.style.height).toBe('46px')
     expect(textarea.style.overflowY).toBe('hidden')
     expect(textarea.scrollTop).toBe(0)
 
     contentHeight = 500
+    textarea.value = 'another long draft'
     viewport.height = 400
     viewport.dispatchEvent(new Event('resize'))
     await Promise.resolve()
@@ -150,6 +161,7 @@ describe('composerAutoGrow', () => {
     containerHeight = 900
     baseHeight = 56
     contentHeight = 56
+    textarea.value = ''
     fonts.dispatchEvent(new Event('loadingdone'))
     await Promise.resolve()
     expect(textarea.style.height).toBe('56px')

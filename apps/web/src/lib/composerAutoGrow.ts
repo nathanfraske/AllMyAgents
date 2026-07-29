@@ -85,7 +85,10 @@ export function composerAutoGrow(node: HTMLTextAreaElement, _value = ''): {
     const intrinsicHeight = node.getBoundingClientRect().height
     const minHeight = Math.max(1, intrinsicHeight, cssPixels(style.minHeight))
     const borderHeight = cssPixels(style.borderTopWidth) + cssPixels(style.borderBottomWidth)
-    const contentHeight = Math.max(minHeight, node.scrollHeight + borderHeight)
+    // Chromium includes wrapped placeholder text in scrollHeight. A placeholder is guidance, not draft
+    // content: an empty value must always collapse to the measured two-row floor.
+    const contentHeight =
+      node.value === '' ? minHeight : Math.max(minHeight, node.scrollHeight + borderHeight)
     const composerHeight = composer?.getBoundingClientRect().height ?? minHeight
     const chromeHeight = Math.max(0, composerHeight - intrinsicHeight)
     const measuredContainerHeight =
