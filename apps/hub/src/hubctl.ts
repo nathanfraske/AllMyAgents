@@ -465,7 +465,7 @@ async function restart(reason: string): Promise<void> {
   flipInFlight = true
   const blue = live
   let committed = false
-  let greenOwnsPublicListener = false
+  let greenMayOwnPublicListener = false
   log(`restart requested (${reason}) — booting green on an ephemeral port`)
   const green = spawnHub(0, 'green')
   try {
@@ -483,11 +483,12 @@ async function restart(reason: string): Promise<void> {
     await waitForHubMsg(blue.child, 'released', 5_000)
     log('blue drained — 7777 released')
 
+    // From this point the public bind is ambiguous until green exits: it can bind successfully and lose
+    // its `promoted` IPC acknowledgement. Fence rollback BEFORE sending the command so an ACK timeout
+    // still waits for confirmed green death and an explicit port-release probe before blue can rebind.
+    greenMayOwnPublicListener = true
     sendToHub(green.child, { type: 'promote', port: FIXED_PORT }) // green: re-listen on 7777
     await waitForHubMsg(green.child, 'promoted', 8_000)
-    // `promoted` means the fixed listener is already bound. Track that fact immediately, before backup
-    // activation or any other await, so every failure path fences this port before blue can rebind.
-    greenOwnsPublicListener = true
     green.port = FIXED_PORT
     green.state = 'promoted'
     log(`green promoted on :${FIXED_PORT} — acquiring journal backup ownership`)
@@ -515,7 +516,7 @@ async function restart(reason: string): Promise<void> {
           green: green.child,
           publicPort: FIXED_PORT,
           reason: String(err),
-          greenOwnsPublicListener,
+          greenMayOwnPublicListener,
           killGreen: (child) => {
             green.state = 'retired'
             killTree(child)

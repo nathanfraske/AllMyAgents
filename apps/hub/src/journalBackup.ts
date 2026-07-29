@@ -1,8 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
-import { createRequire } from 'node:module'
 import path from 'node:path'
-import type Database from 'better-sqlite3'
+import Database from 'better-sqlite3'
 import type {
   JournalBackupControlCommand,
   JournalBackupControlResult,
@@ -64,7 +63,6 @@ const DEFAULT_SHUTDOWN_WAIT_MS = 2_000
 const PREFIX = 'hub-'
 const SUFFIX = '.db'
 const PARTIAL_SUFFIX = `${SUFFIX}.partial`
-const require = createRequire(import.meta.url)
 
 export interface SnapshotResult {
   ok: boolean
@@ -194,9 +192,6 @@ function hasAnyEvents(db: Pick<Database.Database, 'prepare'>): boolean {
 }
 
 function defaultVerify(file: string, sourceHadEvents: boolean): boolean {
-  // Required lazily so this module stays importable in environments without the native addon (tests that
-  // only exercise rotation, for instance).
-  const Database = require('better-sqlite3') as typeof import('better-sqlite3')
   let db: import('better-sqlite3').Database | undefined
   try {
     db = new Database(file, { readonly: true, fileMustExist: true })

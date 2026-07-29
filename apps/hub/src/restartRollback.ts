@@ -25,7 +25,8 @@ export interface RollbackToBlueOptions {
   green: ChildProcess
   publicPort: number
   reason: string
-  greenOwnsPublicListener: boolean
+  /** True once promotion was sent: the ACK may be lost after green has already bound the port. */
+  greenMayOwnPublicListener: boolean
   killGreen: (green: ChildProcess) => void
   waitForGreenExit: (green: ChildProcess, timeoutMs: number) => Promise<void>
   resumeBlue: () => Promise<void>
@@ -120,7 +121,7 @@ export async function rollbackToBlue(options: RollbackToBlueOptions): Promise<vo
     green,
     publicPort,
     reason,
-    greenOwnsPublicListener,
+    greenMayOwnPublicListener,
     killGreen,
     waitForGreenExit,
     resumeBlue,
@@ -131,7 +132,7 @@ export async function rollbackToBlue(options: RollbackToBlueOptions): Promise<vo
   const resumeRetryMs = options.resumeRetryMs ?? [250, 1_000, 5_000]
 
   killGreen(green)
-  if (greenOwnsPublicListener) {
+  if (greenMayOwnPublicListener) {
     try {
       await waitForGreenExit(green, options.greenExitTimeoutMs ?? 5_000)
     } catch (error) {

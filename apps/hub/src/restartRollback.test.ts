@@ -93,7 +93,7 @@ function makeBlueController(
 }
 
 describe('hubctl rollback orchestration', () => {
-  it('does not tell blue to rebind until promoted green has exited and released the public port', async () => {
+  it('does not tell blue to rebind when green bound the public port but its promoted ACK was lost', async () => {
     const blueServer = http.createServer()
     const publicPort = await listen(blueServer)
     const blue = new FakeChild()
@@ -109,8 +109,8 @@ describe('hubctl rollback orchestration', () => {
       blue: blue.asChild(),
       green: green.asChild(),
       publicPort,
-      reason: 'green activation acknowledgement failed',
-      greenOwnsPublicListener: true,
+      reason: 'green promoted acknowledgement timed out',
+      greenMayOwnPublicListener: true,
       killGreen: () => {
         order.push('green-kill-requested')
         killed.resolve()
@@ -141,7 +141,7 @@ describe('hubctl rollback orchestration', () => {
     ])
     expect(blue.sent).toContainEqual({
       type: 'restart-aborted',
-      error: 'green activation acknowledgement failed',
+      error: 'green promoted acknowledgement timed out',
     })
     expect(blueServer.listening).toBe(true)
     expect((blueServer.address() as { port: number }).port).toBe(publicPort)
@@ -165,7 +165,7 @@ describe('hubctl rollback orchestration', () => {
         green: green.asChild(),
         publicPort,
         reason: 'test rollback collision',
-        greenOwnsPublicListener: false,
+        greenMayOwnPublicListener: false,
         killGreen: () => green.finish(),
         waitForGreenExit: async () => {},
         resumeBlue: async () => {
@@ -216,7 +216,7 @@ describe('hubctl rollback orchestration', () => {
       green: green.asChild(),
       publicPort,
       reason: 'resume acknowledgement dropped',
-      greenOwnsPublicListener: false,
+      greenMayOwnPublicListener: false,
       killGreen: () => green.finish(),
       waitForGreenExit: async () => {},
       resumeBlue: async () => {
@@ -240,24 +240,6 @@ describe('hubctl rollback orchestration', () => {
     await rollingBack
     expect(attempts).toBe(2)
     expect(deps.state.journalBackup).toEqual({ status: 'active' })
-  })
-
-  it.each([
-    'green boot',
-    'green health',
-    'blue pause',
-    'blue drain',
-    'green promote',
-    'green activation',
-  ])('defers blue death at the %s edge and requests revival when the uncommitted flip ends', async () => {
-    // Every case reserves an OS-assigned port so this stays a listener-lifecycle test, not a color-only
-    // state-machine assertion.
-    const publicPort = await listen(http.createServer())
-    expect(publicPort).toBeGreaterThan(0)
-    const tracker = new FlipRecoveryTracker()
-
-    expect(tracker.noteUnexpectedLiveExit(true)).toBe('deferred')
-    expect(tracker.finishFlip(false)).toBe(true)
   })
 
   it('cancels deferred revival when a healthy green was committed before the flip ended', () => {

@@ -97,6 +97,53 @@ function spawnEvalModule(source: string): ChildProcess {
   return child
 }
 
+function spawnBuiltEvalModule(source: string): ChildProcess {
+  const child = spawn(
+    process.execPath,
+    ['--input-type=module', '--eval', source],
+    {
+      cwd: path.resolve(import.meta.dirname, '..'),
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    }
+  )
+  children.push(child)
+  return child
+}
+
+async function buildHubForEsmRuntime(): Promise<string> {
+  const hubRoot = path.resolve(import.meta.dirname, '..')
+  const buildRoot = fs.mkdtempSync(path.join(hubRoot, '.journal-backup-esm-'))
+  dirs.push(buildRoot)
+  const outDir = path.join(buildRoot, 'dist')
+  const tsc = createRequire(import.meta.url).resolve('typescript/bin/tsc')
+  const compiler = spawn(
+    process.execPath,
+    [tsc, '-p', path.join(hubRoot, 'tsconfig.build.json'), '--outDir', outDir],
+    {
+      cwd: hubRoot,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }
+  )
+  children.push(compiler)
+  let output = ''
+  compiler.stdout?.setEncoding('utf8')
+  compiler.stderr?.setEncoding('utf8')
+  compiler.stdout?.on('data', (chunk: string) => (output += chunk))
+  compiler.stderr?.on('data', (chunk: string) => (output += chunk))
+  const [code, signal] = await once(compiler, 'exit') as [
+    number | null,
+    NodeJS.Signals | null,
+  ]
+  if (code !== 0) {
+    throw new Error(
+      `temporary hub ESM build failed (code=${String(code)} signal=${String(signal)}): ${output}`
+    )
+  }
+  return pathToFileURL(path.join(outDir, 'journalBackup.js')).href
+}
+
 function spawnBackupSupervisorChild(backups: string): ChildProcess {
   const backupModule = pathToFileURL(path.join(import.meta.dirname, 'journalBackup.ts')).href
   return spawnEvalModule(`
@@ -265,6 +312,50 @@ async function snapshotInChild(
   const backupModule = pathToFileURL(path.join(import.meta.dirname, 'journalBackup.ts')).href
   const databaseModule = pathToFileURL(createRequire(import.meta.url).resolve('better-sqlite3')).href
   const child = spawnEvalModule(`
+    if (typeof require !== 'undefined') {
+      throw new Error('snapshot child unexpectedly has a CommonJS require global')
+    }
+    const [{ snapshotJournal }, databaseModule] = await Promise.all([
+      import(${JSON.stringify(backupModule)}),
+      import(${JSON.stringify(databaseModule)})
+    ])
+    const Database = databaseModule.default
+    const db = new Database(${JSON.stringify(sourceFile)}, { readonly: true, fileMustExist: true })
+    try {
+      const result = await snapshotJournal(db, {
+        dir: ${JSON.stringify(backups)},
+        now: () => new Date(${JSON.stringify(timestamp)})
+      })
+      await new Promise((resolve, reject) => process.send?.(
+        { type: 'snapshot-result', result },
+        (error) => error ? reject(error) : resolve()
+      ))
+    } catch (error) {
+      process.send?.({ type: 'snapshot-error', error: String(error) })
+    } finally {
+      db.close()
+      process.disconnect?.()
+    }
+  `)
+  const message = await waitForChildMessage<{
+    type: 'snapshot-result'
+    result: SnapshotResult
+  }>(child, 'snapshot-result')
+  await waitForExit(child)
+  return message.result
+}
+
+async function snapshotBuiltEsmInChild(
+  sourceFile: string,
+  backups: string,
+  timestamp: string
+): Promise<SnapshotResult> {
+  const backupModule = await buildHubForEsmRuntime()
+  const databaseModule = pathToFileURL(createRequire(import.meta.url).resolve('better-sqlite3')).href
+  const child = spawnBuiltEvalModule(`
+    if (typeof require !== 'undefined') {
+      throw new Error('compiled snapshot child unexpectedly has a CommonJS require global')
+    }
     const [{ snapshotJournal }, databaseModule] = await Promise.all([
       import(${JSON.stringify(backupModule)}),
       import(${JSON.stringify(databaseModule)})
@@ -336,6 +427,29 @@ describe('journal snapshots', () => {
     expect(copy.pragma('quick_check')).toEqual([{ quick_check: 'ok' }])
     copy.close()
   })
+
+  it('verifies and retains a snapshot through the compiled Node ESM runtime without a require global', async () => {
+    const root = tmp()
+    const journal = makeJournal(root, 3)
+    const backups = path.join(root, 'backups')
+
+    const result = await snapshotBuiltEsmInChild(
+      path.join(root, 'hub.db'),
+      backups,
+      '2026-07-29T12:00:00.000Z'
+    )
+
+    expect(result.ok).toBe(true)
+    expect(result.file).toEqual(expect.stringMatching(/\.db$/))
+    expect(fs.existsSync(result.file as string)).toBe(true)
+    expect(fs.readdirSync(backups).filter((name) => name.endsWith('.partial'))).toEqual([])
+
+    const Database = (await import('better-sqlite3')).default
+    const copy = new Database(result.file as string, { readonly: true, fileMustExist: true })
+    expect(copy.pragma('quick_check')).toEqual([{ quick_check: 'ok' }])
+    expect(copy.prepare('SELECT COUNT(*) AS n FROM events').get()).toEqual({ n: 3 })
+    copy.close()
+  }, 30_000)
 
   it('snapshots a LIVE journal that is still being written', async () => {
     // The failure this guards against is a plain file copy of a database mid-write, which captures a torn
