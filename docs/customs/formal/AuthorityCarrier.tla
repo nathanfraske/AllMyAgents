@@ -2,9 +2,13 @@
 EXTENDS Integers, FiniteSets, TLC
 
 \* Bounded candidate model for release authority and portable carriers.
-\* Carrier manifests and GovernanceProposals are candidates only.  A release is
-\* active only when the external witness has selected a HeadReceipt.  Local
-\* copies, observations, and high-water values are deliberately non-authoritative.
+\* Carrier manifests and GovernanceProposals are candidates only.  A normal
+\* Release becomes active only through an externally accepted HeadReceipt.  A
+\* distinct externally accepted RecoveryTransition can select only its
+\* SafeRecoveryRelease at the new term's sequence zero.  ReceiptIds is the
+\* finite abstract identifier carrier shared by these disjoint wire-object
+\* kinds; it does not collapse their authority roles.  Local copies,
+\* observations, and high-water values are deliberately non-authoritative.
 
 CONSTANTS
     ProjectIds, GenesisDigests, ProposalIds, ReleaseIds, ReceiptIds,
@@ -22,6 +26,7 @@ ApplicabilityValues ==
     {TrueApplicability, FalseApplicability, UnknownApplicability}
 ProposalKinds == {"ordinary", "forkGenesis"}
 ReleaseKinds == {"ordinary", "forkGenesis", "recovery"}
+NormalPlaneReleaseKinds == {"ordinary", "forkGenesis"}
 RecoveryOperations == {"fetch", "inspect", "verify", "restore", "rotate"}
 RuntimeOperations == {"inference", "tools", "secrets", "normalEffects"}
 
@@ -108,6 +113,7 @@ VARIABLES
     witnessTerm,
     witnessSequence,
     acceptedHeadReceipt,
+    acceptedRecoveryTransition,
     frozen,
     freezeBase,
     fleetTrustAnchor,
@@ -136,7 +142,8 @@ vars ==
       pendingSequenced, pendingRecovery, headReceipts,
       conflictingReceipts, quarantinedReleases, receiptIdentity, receiptTerm,
       receiptSequence, receiptParent, receiptRelease, receiptClosure,
-      witnessTerm, witnessSequence, acceptedHeadReceipt, frozen, freezeBase,
+      witnessTerm, witnessSequence, acceptedHeadReceipt,
+      acceptedRecoveryTransition, frozen, freezeBase,
       fleetTrustAnchor, projectTrustPin, carrierAt, receiptAt, closureAt,
       decryptableAt, applicabilityAt, localObservedReceipt,
       localObservedSequence, allowedUses, deniedUses, falseResolvedUses,
@@ -163,7 +170,7 @@ ReceiptVars ==
     <<headReceipts, conflictingReceipts, quarantinedReleases,
       receiptIdentity, receiptTerm, receiptSequence, receiptParent,
       receiptRelease, receiptClosure, witnessTerm, witnessSequence,
-      acceptedHeadReceipt, frozen, freezeBase>>
+      acceptedHeadReceipt, acceptedRecoveryTransition, frozen, freezeBase>>
 
 LocalVars ==
     <<fleetTrustAnchor, projectTrustPin, carrierAt, receiptAt, closureAt,
@@ -204,7 +211,7 @@ Init ==
     /\ releaseSequence =
         [r \in ReleaseIds |-> ZeroSequence]
     /\ releaseParent =
-        [r \in ReleaseIds |-> NoRelease]
+        [r \in ReleaseIds |-> NoReceipt]
     /\ releaseClosure =
         [r \in ReleaseIds |-> {}]
     /\ releaseKey =
@@ -227,7 +234,7 @@ Init ==
     /\ receiptSequence =
         [q \in ReceiptIds |-> ZeroSequence]
     /\ receiptParent =
-        [q \in ReceiptIds |-> NoRelease]
+        [q \in ReceiptIds |-> NoReceipt]
     /\ receiptRelease =
         [q \in ReceiptIds |-> NoRelease]
     /\ receiptClosure =
@@ -238,9 +245,11 @@ Init ==
         [i \in IdentityUniverse |-> ZeroSequence]
     /\ acceptedHeadReceipt =
         [i \in IdentityUniverse |-> NoReceipt]
+    /\ acceptedRecoveryTransition =
+        [i \in IdentityUniverse |-> NoReceipt]
     /\ frozen = {}
     /\ freezeBase =
-        [i \in IdentityUniverse |-> NoRelease]
+        [i \in IdentityUniverse |-> NoReceipt]
     /\ fleetTrustAnchor =
         [s \in Sites |-> InitialFleetAnchor]
     /\ projectTrustPin =
@@ -266,20 +275,23 @@ Init ==
     /\ recoveryOperationsPerformed = {}
     /\ recoveryRuntimeOperations = {}
 
-SelectedReceipt(i) == acceptedHeadReceipt[i]
+SelectedCheckpoint(i) ==
+    IF acceptedRecoveryTransition[i] # NoReceipt
+        THEN acceptedRecoveryTransition[i]
+        ELSE acceptedHeadReceipt[i]
 
 SelectedRelease(i) ==
-    IF i \in frozen \/ SelectedReceipt(i) = NoReceipt
+    IF i \in frozen \/ SelectedCheckpoint(i) = NoReceipt
         THEN NoRelease
-        ELSE receiptRelease[SelectedReceipt(i)]
+        ELSE receiptRelease[SelectedCheckpoint(i)]
 
 ClosureComplete(r) ==
     /\ r \in candidateReleases
     /\ RequiredClosure \subseteq releaseClosure[r]
 
-ReceiptBindsRelease(q) ==
+CheckpointBindsRelease(q) ==
     LET r == receiptRelease[q]
-    IN  /\ q \in headReceipts
+    IN  /\ q \in headReceipts \cup recoveryTransitions
         /\ r \in candidateReleases
         /\ receiptIdentity[q] = releaseIdentity[r]
         /\ receiptTerm[q] = releaseTerm[r]
@@ -287,11 +299,17 @@ ReceiptBindsRelease(q) ==
         /\ receiptParent[q] = releaseParent[r]
         /\ receiptClosure[q] = releaseClosure[r]
         /\ ClosureComplete(r)
+        /\ IF q \in headReceipts
+              THEN releaseKind[r] \in NormalPlaneReleaseKinds
+              ELSE /\ q \in recoveryTransitions
+                   /\ r \in recoveryReleases
+                   /\ releaseKind[r] = "recovery"
+                   /\ receiptSequence[q] = ZeroSequence
 
-SiteTrustsReceipt(s, q) ==
+SiteTrustsCheckpoint(s, q) ==
     LET r == receiptRelease[q]
         i == receiptIdentity[q]
-    IN  /\ q \in headReceipts
+    IN  /\ q \in headReceipts \cup recoveryTransitions
         /\ r \in candidateReleases
         /\ fleetTrustAnchor[s] = InitialFleetAnchor
         /\ projectTrustPin[s][i] = releaseKey[r]
@@ -306,7 +324,7 @@ SiteHasCompleteClosure(s, r) ==
     /\ ApplicabilityResolvedAt(s, r)
 
 CanUseAt(s, i) ==
-    LET q == SelectedReceipt(i)
+    LET q == SelectedCheckpoint(i)
         r == SelectedRelease(i)
     IN  /\ i \in knownIdentities
         /\ i \notin frozen
@@ -315,8 +333,8 @@ CanUseAt(s, i) ==
         /\ q \in receiptAt[s]
         /\ r \in carrierAt[s]
         /\ localObservedReceipt[s][i] = q
-        /\ ReceiptBindsRelease(q)
-        /\ SiteTrustsReceipt(s, q)
+        /\ CheckpointBindsRelease(q)
+        /\ SiteTrustsCheckpoint(s, q)
         /\ SiteHasCompleteClosure(s, r)
 
 AuthorGovernanceProposal(p, i, closure) ==
@@ -331,7 +349,7 @@ AuthorGovernanceProposal(p, i, closure) ==
     /\ proposalIdentity' =
         [proposalIdentity EXCEPT ![p] = i]
     /\ proposalBaseReceipt' =
-        [proposalBaseReceipt EXCEPT ![p] = acceptedHeadReceipt[i]]
+        [proposalBaseReceipt EXCEPT ![p] = SelectedCheckpoint(i)]
     /\ proposalClosure' =
         [proposalClosure EXCEPT ![p] = closure]
     /\ proposalKind' =
@@ -373,7 +391,7 @@ SequencerCommit(p, r, nextSequence) ==
     /\ LET i == proposalIdentity[p]
        IN  /\ i \in knownIdentities
            /\ i \notin frozen
-           /\ proposalBaseReceipt[p] = acceptedHeadReceipt[i]
+           /\ proposalBaseReceipt[p] = SelectedCheckpoint(i)
            /\ RequiredClosure \subseteq proposalClosure[p]
            /\ pendingSequenced[i] = NoRelease
            /\ pendingRecovery[i] = NoRelease
@@ -389,7 +407,7 @@ SequencerCommit(p, r, nextSequence) ==
            /\ releaseSequence' =
                 [releaseSequence EXCEPT ![r] = nextSequence]
            /\ releaseParent' =
-                [releaseParent EXCEPT ![r] = SelectedRelease(i)]
+                [releaseParent EXCEPT ![r] = SelectedCheckpoint(i)]
            /\ releaseClosure' =
                 [releaseClosure EXCEPT ![r] = proposalClosure[p]]
            /\ releaseKey' =
@@ -418,10 +436,10 @@ AcceptHeadReceipt(i, q) ==
     /\ i \notin frozen
     /\ LET r == pendingSequenced[i]
        IN  /\ r \in sequencedReleases
-           /\ q \in ReceiptIds \ headReceipts
+           /\ q \in ReceiptIds \ (headReceipts \cup recoveryTransitions)
            /\ releaseTerm[r] = witnessTerm[i]
            /\ releaseSequence[r] = witnessSequence[i] + 1
-           /\ releaseParent[r] = SelectedRelease(i)
+           /\ releaseParent[r] = SelectedCheckpoint(i)
            /\ ClosureComplete(r)
            /\ headReceipts' = headReceipts \cup {q}
            /\ receiptIdentity' =
@@ -440,6 +458,8 @@ AcceptHeadReceipt(i, q) ==
                 [witnessSequence EXCEPT ![i] = releaseSequence[r]]
            /\ acceptedHeadReceipt' =
                 [acceptedHeadReceipt EXCEPT ![i] = q]
+           /\ acceptedRecoveryTransition' =
+                [acceptedRecoveryTransition EXCEPT ![i] = NoReceipt]
            /\ pendingSequenced' =
                 [pendingSequenced EXCEPT ![i] = NoRelease]
     /\ UNCHANGED <<AvailabilityVars, IdentityVars, ProposalVars,
@@ -456,6 +476,7 @@ HeadReceiptFor(i) ==
 StageSameSlotCandidate(i, r, closure) ==
     /\ i \in knownIdentities
     /\ acceptedHeadReceipt[i] # NoReceipt
+    /\ acceptedRecoveryTransition[i] = NoReceipt
     /\ r \in ReleaseIds \ candidateReleases
     /\ closure \subseteq ClosureItems
     /\ RequiredClosure \subseteq closure
@@ -486,8 +507,9 @@ PublishConflictingReceipt(i, r, q) ==
     /\ witnessAvailable
     /\ i \in knownIdentities
     /\ acceptedHeadReceipt[i] # NoReceipt
+    /\ acceptedRecoveryTransition[i] = NoReceipt
     /\ r \in candidateReleases
-    /\ q \in ReceiptIds \ headReceipts
+    /\ q \in ReceiptIds \ (headReceipts \cup recoveryTransitions)
     /\ LET selected == acceptedHeadReceipt[i]
        IN  /\ r # receiptRelease[selected]
            /\ releaseIdentity[r] = i
@@ -515,9 +537,10 @@ PublishConflictingReceipt(i, r, q) ==
                 [receiptClosure EXCEPT ![q] = releaseClosure[r]]
            /\ frozen' = frozen \cup {i}
            /\ freezeBase' =
-                [freezeBase EXCEPT ![i] = receiptParent[selected]]
+                [freezeBase EXCEPT ![i] = selected]
     /\ UNCHANGED <<AvailabilityVars, IdentityVars, ProposalVars, ReleaseVars,
                    witnessTerm, witnessSequence, acceptedHeadReceipt,
+                   acceptedRecoveryTransition,
                    LocalVars, RecoveryAuditVars>>
 
 SafeRecoveryRelease(i, r, newTerm, newKey, closure) ==
@@ -540,12 +563,9 @@ SafeRecoveryRelease(i, r, newTerm, newKey, closure) ==
     /\ releaseTerm' =
         [releaseTerm EXCEPT ![r] = newTerm]
     /\ releaseSequence' =
-        [releaseSequence EXCEPT ![r] = ZeroSequence + 1]
+        [releaseSequence EXCEPT ![r] = ZeroSequence]
     /\ releaseParent' =
-        [releaseParent EXCEPT
-            ![r] = IF i \in frozen
-                    THEN freezeBase[i]
-                    ELSE SelectedRelease(i)]
+        [releaseParent EXCEPT ![r] = freezeBase[i]]
     /\ releaseClosure' =
         [releaseClosure EXCEPT ![r] = closure]
     /\ releaseKey' =
@@ -569,11 +589,10 @@ RecoveryTransition(i, q) ==
     /\ i \in knownIdentities
     /\ LET r == pendingRecovery[i]
        IN  /\ r \in recoveryReleases
-           /\ q \in ReceiptIds \ headReceipts
+           /\ q \in ReceiptIds \ (headReceipts \cup recoveryTransitions)
            /\ releaseTerm[r] = witnessTerm[i] + 1
-           /\ releaseSequence[r] = ZeroSequence + 1
+           /\ releaseSequence[r] = ZeroSequence
            /\ ClosureComplete(r)
-           /\ headReceipts' = headReceipts \cup {q}
            /\ receiptIdentity' =
                 [receiptIdentity EXCEPT ![q] = i]
            /\ receiptTerm' =
@@ -591,7 +610,9 @@ RecoveryTransition(i, q) ==
            /\ witnessSequence' =
                 [witnessSequence EXCEPT ![i] = releaseSequence[r]]
            /\ acceptedHeadReceipt' =
-                [acceptedHeadReceipt EXCEPT ![i] = q]
+                [acceptedHeadReceipt EXCEPT ![i] = NoReceipt]
+           /\ acceptedRecoveryTransition' =
+                [acceptedRecoveryTransition EXCEPT ![i] = q]
            /\ frozen' = frozen \ {i}
            /\ authorityKey' =
                 [authorityKey EXCEPT ![i] = releaseKey[r]]
@@ -603,7 +624,8 @@ RecoveryTransition(i, q) ==
                    recoveryReleases, releaseIdentity, releaseTerm,
                    releaseSequence, releaseParent, releaseClosure, releaseKey,
                    releaseProposal, releaseKind, pendingSequenced,
-                   conflictingReceipts, quarantinedReleases, freezeBase,
+                   headReceipts, conflictingReceipts, quarantinedReleases,
+                   freezeBase,
                    LocalVars, recoveryOperationsPerformed,
                    recoveryRuntimeOperations>>
 
@@ -635,9 +657,9 @@ CopyCarrier(source, destination, r) ==
                    localObservedReceipt, localObservedSequence, allowedUses,
                    deniedUses, falseResolvedUses, RecoveryAuditVars>>
 
-ImportReceipt(s, q) ==
+ImportCheckpoint(s, q) ==
     /\ s \in Sites
-    /\ q \in headReceipts
+    /\ q \in headReceipts \cup recoveryTransitions
     /\ q \notin receiptAt[s]
     /\ receiptAt' = [receiptAt EXCEPT ![s] = @ \cup {q}]
     /\ UNCHANGED <<AvailabilityVars, IdentityVars, ProposalVars, ReleaseVars,
@@ -670,14 +692,15 @@ ObserveExternalHead(s, i) ==
     /\ s \in Sites
     /\ i \in knownIdentities
     /\ i \notin frozen
-    /\ acceptedHeadReceipt[i] # NoReceipt
-    /\ acceptedHeadReceipt[i] \in receiptAt[s]
-    /\ receiptRelease[acceptedHeadReceipt[i]] \in carrierAt[s]
-    /\ SiteTrustsReceipt(s, acceptedHeadReceipt[i])
-    /\ localObservedReceipt' =
-        [localObservedReceipt EXCEPT ![s][i] = acceptedHeadReceipt[i]]
-    /\ localObservedSequence' =
-        [localObservedSequence EXCEPT ![s][i] = witnessSequence[i]]
+    /\ LET q == SelectedCheckpoint(i)
+       IN  /\ q # NoReceipt
+           /\ q \in receiptAt[s]
+           /\ receiptRelease[q] \in carrierAt[s]
+           /\ SiteTrustsCheckpoint(s, q)
+           /\ localObservedReceipt' =
+                [localObservedReceipt EXCEPT ![s][i] = q]
+           /\ localObservedSequence' =
+                [localObservedSequence EXCEPT ![s][i] = witnessSequence[i]]
     /\ UNCHANGED <<AvailabilityVars, IdentityVars, ProposalVars, ReleaseVars,
                    ReceiptVars, fleetTrustAnchor, projectTrustPin, carrierAt,
                    receiptAt, closureAt, decryptableAt, applicabilityAt,
@@ -732,7 +755,7 @@ InstallCurrentProjectTrustPin(s, i) ==
 EvaluateActiveAtSite(s, i) ==
     /\ s \in Sites
     /\ i \in knownIdentities
-    /\ LET q == acceptedHeadReceipt[i]
+    /\ LET q == SelectedCheckpoint(i)
            r == IF q = NoReceipt THEN NoRelease ELSE receiptRelease[q]
        IN
        IF CanUseAt(s, i)
@@ -799,7 +822,7 @@ Next ==
     \/ \E s \in Sites, r \in ReleaseIds : ImportCarrier(s, r)
     \/ \E source \in Sites, destination \in Sites, r \in ReleaseIds :
           CopyCarrier(source, destination, r)
-    \/ \E s \in Sites, q \in ReceiptIds : ImportReceipt(s, q)
+    \/ \E s \in Sites, q \in ReceiptIds : ImportCheckpoint(s, q)
     \/ \E s \in Sites, item \in ClosureItems, d \in BOOLEAN,
           a \in ApplicabilityValues :
           InstallClosureEvidence(s, item, d, a)
@@ -839,7 +862,7 @@ TypeOK ==
     /\ releaseIdentity \in [ReleaseIds -> IdentityUniverse]
     /\ releaseTerm \in [ReleaseIds -> Terms]
     /\ releaseSequence \in [ReleaseIds -> Sequences]
-    /\ releaseParent \in [ReleaseIds -> ReleaseIds \cup {NoRelease}]
+    /\ releaseParent \in [ReleaseIds -> ReceiptIds \cup {NoReceipt}]
     /\ releaseClosure \in [ReleaseIds -> SUBSET ClosureItems]
     /\ releaseKey \in [ReleaseIds -> RootKeys \cup {NoRootKey}]
     /\ releaseProposal \in
@@ -851,12 +874,14 @@ TypeOK ==
         [IdentityUniverse -> ReleaseIds \cup {NoRelease}]
     /\ headReceipts \subseteq ReceiptIds
     /\ conflictingReceipts \subseteq headReceipts
+    /\ recoveryTransitions \subseteq ReceiptIds
+    /\ headReceipts \cap recoveryTransitions = {}
     /\ quarantinedReleases \subseteq candidateReleases
     /\ receiptIdentity \in [ReceiptIds -> IdentityUniverse]
     /\ receiptTerm \in [ReceiptIds -> Terms]
     /\ receiptSequence \in [ReceiptIds -> Sequences]
     /\ receiptParent \in
-        [ReceiptIds -> ReleaseIds \cup {NoRelease}]
+        [ReceiptIds -> ReceiptIds \cup {NoReceipt}]
     /\ receiptRelease \in
         [ReceiptIds -> ReleaseIds \cup {NoRelease}]
     /\ receiptClosure \in [ReceiptIds -> SUBSET ClosureItems]
@@ -864,9 +889,11 @@ TypeOK ==
     /\ witnessSequence \in [IdentityUniverse -> Sequences]
     /\ acceptedHeadReceipt \in
         [IdentityUniverse -> ReceiptIds \cup {NoReceipt}]
+    /\ acceptedRecoveryTransition \in
+        [IdentityUniverse -> ReceiptIds \cup {NoReceipt}]
     /\ frozen \subseteq knownIdentities
     /\ freezeBase \in
-        [IdentityUniverse -> ReleaseIds \cup {NoRelease}]
+        [IdentityUniverse -> ReceiptIds \cup {NoReceipt}]
     /\ fleetTrustAnchor \in [Sites -> FleetAnchors]
     /\ projectTrustPin \in
         [Sites -> [IdentityUniverse -> RootKeys]]
@@ -884,7 +911,6 @@ TypeOK ==
     /\ allowedUses \subseteq UseUniverse
     /\ deniedUses \subseteq Sites \X IdentityUniverse
     /\ falseResolvedUses \subseteq allowedUses
-    /\ recoveryTransitions \subseteq headReceipts
     /\ recoveryOperationsPerformed \subseteq RecoveryOperations
     /\ recoveryRuntimeOperations \subseteq RuntimeOperations
 
@@ -899,20 +925,48 @@ OneLogicalSequencer ==
         /\ releaseSequence[r1] = releaseSequence[r2]
         => r1 = r2
 
-HeadReceiptSelectedActiveRelease ==
+AcceptedCheckpointSelectsActiveRelease ==
     \A i \in knownIdentities :
         IF i \in frozen
             THEN SelectedRelease(i) = NoRelease
             ELSE
-                acceptedHeadReceipt[i] = NoReceipt \/
-                /\ acceptedHeadReceipt[i] \in headReceipts
-                /\ ReceiptBindsRelease(acceptedHeadReceipt[i])
-                /\ receiptIdentity[acceptedHeadReceipt[i]] = i
-                /\ receiptTerm[acceptedHeadReceipt[i]] = witnessTerm[i]
-                /\ receiptSequence[acceptedHeadReceipt[i]] =
-                     witnessSequence[i]
-                /\ SelectedRelease(i) =
-                     receiptRelease[acceptedHeadReceipt[i]]
+                LET q == SelectedCheckpoint(i)
+                IN  q = NoReceipt \/
+                    /\ q \in headReceipts \cup recoveryTransitions
+                    /\ CheckpointBindsRelease(q)
+                    /\ receiptIdentity[q] = i
+                    /\ receiptTerm[q] = witnessTerm[i]
+                    /\ receiptSequence[q] = witnessSequence[i]
+                    /\ SelectedRelease(i) = receiptRelease[q]
+
+NormalHeadReceiptSelectsOrdinaryRelease ==
+    \A i \in knownIdentities :
+        acceptedHeadReceipt[i] = NoReceipt \/
+            /\ acceptedRecoveryTransition[i] = NoReceipt
+            /\ acceptedHeadReceipt[i] \in headReceipts
+            /\ releaseKind[receiptRelease[acceptedHeadReceipt[i]]]
+                 \in NormalPlaneReleaseKinds
+            /\ SelectedCheckpoint(i) = acceptedHeadReceipt[i]
+
+RecoveryTransitionSelectsSafeRecoveryRelease ==
+    \A i \in knownIdentities :
+        acceptedRecoveryTransition[i] = NoReceipt \/
+            /\ acceptedHeadReceipt[i] = NoReceipt
+            /\ acceptedRecoveryTransition[i] \in recoveryTransitions
+            /\ receiptRelease[acceptedRecoveryTransition[i]]
+                 \in recoveryReleases
+            /\ releaseKind[
+                 receiptRelease[acceptedRecoveryTransition[i]]] = "recovery"
+            /\ receiptTerm[acceptedRecoveryTransition[i]] = witnessTerm[i]
+            /\ receiptSequence[acceptedRecoveryTransition[i]] = ZeroSequence
+            /\ witnessSequence[i] = ZeroSequence
+            /\ SelectedCheckpoint(i) = acceptedRecoveryTransition[i]
+
+FirstNormalHeadAfterRecoveryParentsTransition ==
+    \A q \in headReceipts :
+        /\ receiptTerm[q] > InitialTerm
+        /\ receiptSequence[q] = ZeroSequence + 1
+        => receiptParent[q] \in recoveryTransitions
 
 CandidateCarriersAreNonAuthorizing ==
     /\ \A i \in knownIdentities :
@@ -920,16 +974,16 @@ CandidateCarriersAreNonAuthorizing ==
             => SelectedRelease(i) \in
                 sequencedReleases \cup recoveryReleases
     /\ \A use \in allowedUses :
-        /\ use[3] \in headReceipts
+        /\ use[3] \in headReceipts \cup recoveryTransitions
         /\ receiptRelease[use[3]] = use[4]
-        /\ ReceiptBindsRelease(use[3])
+        /\ CheckpointBindsRelease(use[3])
 
 ActiveClosureIsComplete ==
     \A i \in knownIdentities :
         SelectedRelease(i) # NoRelease
             => ClosureComplete(SelectedRelease(i))
 
-ReceiptEquivocationFreezes ==
+HeadReceiptEquivocationFreezes ==
     \A q1 \in headReceipts, q2 \in headReceipts :
         /\ q1 # q2
         /\ receiptIdentity[q1] = receiptIdentity[q2]
@@ -948,9 +1002,10 @@ GovernanceOnlyRecovery ==
     /\ recoveryRuntimeOperations = {}
     /\ RecoveryOperations \cap RuntimeOperations = {}
     /\ \A q \in recoveryTransitions :
-        /\ q \in headReceipts
+        /\ q \notin headReceipts
         /\ receiptRelease[q] \in recoveryReleases
         /\ releaseKind[receiptRelease[q]] = "recovery"
+        /\ receiptSequence[q] = ZeroSequence
 
 ForksMintNewIdentity ==
     \A i \in knownIdentities :
@@ -1002,6 +1057,7 @@ OfflineCannotAdvanceAuthority ==
         /\ witnessTerm' = witnessTerm
         /\ witnessSequence' = witnessSequence
         /\ acceptedHeadReceipt' = acceptedHeadReceipt
+        /\ acceptedRecoveryTransition' = acceptedRecoveryTransition
         /\ headReceipts' = headReceipts
         /\ recoveryTransitions' = recoveryTransitions
 
@@ -1014,11 +1070,11 @@ NewAllowedUseIsCurrentAndComplete ==
         /\ use \in allowedUses'
         => /\ use[2] \in knownIdentities
            /\ use[2] \notin frozen
-           /\ use[3] = acceptedHeadReceipt[use[2]]
+           /\ use[3] = SelectedCheckpoint(use[2])
            /\ use[4] = SelectedRelease(use[2])
            /\ CanUseAt(use[1], use[2])
 
-UseLinearizesAtExternalReceipt ==
+UseLinearizesAtAcceptedCheckpoint ==
     [][NewAllowedUseIsCurrentAndComplete]_vars
 
 PendingProposalResources(p) ==
@@ -1027,7 +1083,7 @@ PendingProposalResources(p) ==
         /\ i \in knownIdentities
         /\ i \notin frozen
         /\ RequiredClosure \subseteq proposalClosure[p]
-        /\ proposalBaseReceipt[p] = acceptedHeadReceipt[i]
+        /\ proposalBaseReceipt[p] = SelectedCheckpoint(i)
         /\ pendingSequenced[i] = NoRelease
         /\ pendingRecovery[i] = NoRelease
         /\ \E r \in ReleaseIds \ candidateReleases,
@@ -1042,24 +1098,24 @@ ConditionalSequencerLiveness ==
         => (p \in proposals \ committedProposals
              ~> p \in committedProposals)
 
-PendingWitnessResources(i) ==
+PendingHeadReceiptResources(i) ==
     /\ i \in knownIdentities
     /\ i \notin frozen
     /\ pendingSequenced[i] \in sequencedReleases
-    /\ \E q \in ReceiptIds \ headReceipts : TRUE
+    /\ \E q \in ReceiptIds \ (headReceipts \cup recoveryTransitions) : TRUE
 
-ConditionalWitnessLiveness ==
+ConditionalHeadReceiptLiveness ==
     \A i \in IdentityUniverse :
         /\ <>[]witnessAvailable
         /\ [](pendingSequenced[i] # NoRelease =>
-                PendingWitnessResources(i))
+                PendingHeadReceiptResources(i))
         => (pendingSequenced[i] # NoRelease
              ~> pendingSequenced[i] = NoRelease \/ i \in frozen)
 
 PendingRecoveryResources(i) ==
     /\ i \in knownIdentities
     /\ pendingRecovery[i] \in recoveryReleases
-    /\ \E q \in ReceiptIds \ headReceipts : TRUE
+    /\ \E q \in ReceiptIds \ (headReceipts \cup recoveryTransitions) : TRUE
 
 ConditionalRecoveryLiveness ==
     \A i \in IdentityUniverse :
@@ -1094,7 +1150,8 @@ MutationSpec == Init /\ [][UnsafeNext]_vars
 \* Targeted finite harness for the witnessed-head/equivocation/recovery path.
 \* It uses the same production actions but removes unrelated local-state and
 \* availability interleavings.  The adversarial configs provide exactly three
-\* releases and receipts: selected, conflicting, and recovery.
+\* releases and checkpoint identifiers: selected HeadReceipt, conflicting
+\* HeadReceipt, and distinct RecoveryTransition.
 AdversarialNext ==
     \/ \E p \in ProposalIds :
           AuthorGovernanceProposal(p, BaseIdentity, RequiredClosure)
@@ -1119,6 +1176,12 @@ ForkHarnessNext ==
 ForkHarnessSpec == Init /\ [][ForkHarnessNext]_vars
 
 RecoveryReachabilitySentinel == recoveryTransitions = {}
+PostRecoveryHeadReachabilitySentinel ==
+    ~(\E i \in knownIdentities, q \in headReceipts :
+        /\ acceptedHeadReceipt[i] = q
+        /\ receiptTerm[q] > InitialTerm
+        /\ receiptSequence[q] = ZeroSequence + 1
+        /\ receiptParent[q] \in recoveryTransitions)
 EquivocationReachabilitySentinel == frozen = {}
 FalseApplicabilityReachabilitySentinel == falseResolvedUses = {}
 ForkReachabilitySentinel == knownIdentities = {BaseIdentity}
