@@ -240,6 +240,15 @@ async function status() {
   console.log(`log       ${LOG}`)
 }
 
+export function buildSandboxAppNetwork(webPort, bindHost = '127.0.0.1') {
+  const advertisedHost = bindHost.includes(':') ? `[${bindHost}]` : bindHost
+  return {
+    bindHost,
+    advertisedUrl: `http://${advertisedHost}:${webPort}`,
+    viteArgs: ['--host', bindHost, '--port', String(webPort), '--strictPort'],
+  }
+}
+
 /**
  * The throwaway APP: a Vite dev server whose proxy points at the sandbox hub instead of the live one.
  *
@@ -254,7 +263,8 @@ async function app() {
     process.exit(1)
   }
   const webPort = Number(process.env.SANDBOX_WEB_PORT ?? 5274) // 5273 is the normal dev server
-  console.log(`sandbox app  http://127.0.0.1:${webPort}  →  hub 127.0.0.1:${PORT}`)
+  const appNetwork = buildSandboxAppNetwork(webPort)
+  console.log(`sandbox app  ${appNetwork.advertisedUrl}  →  hub 127.0.0.1:${PORT}`)
   // NO SHELL. This used to run pnpm through cmd.exe because Node 20+ refuses to spawn a .cmd directly
   // (CVE-2024-27980), and that shell is what put a black console window on the operator's desktop — one
   // per sandbox app, from their own runs and from every agent that started one, indistinguishable at a
@@ -279,7 +289,7 @@ async function app() {
   const leading = pnpmJs ? [pnpmJs] : []
   const child = spawn(
     program,
-    [...leading, '--filter', 'web', 'dev', '--port', String(webPort), '--strictPort'],
+    [...leading, '--filter', 'web', 'dev', ...appNetwork.viteArgs],
     {
       cwd: REPO,
       stdio: 'inherit',
@@ -304,9 +314,11 @@ async function reset() {
 }
 
 const commands = { up, down, status, reset, app, logs: () => console.log(tail(200)) }
-const run = commands[cmd]
-if (!run) {
-  console.error(`unknown command '${cmd}'. Use: up | app | down | status | logs | reset`)
-  process.exit(2)
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const run = commands[cmd]
+  if (!run) {
+    console.error(`unknown command '${cmd}'. Use: up | app | down | status | logs | reset`)
+    process.exit(2)
+  }
+  await run()
 }
-await run()
