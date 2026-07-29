@@ -15,6 +15,14 @@ describe('narrow-pane layout contracts', () => {
     expect(thread).toMatch(/class="ccontrol[^"]*"\s+title=/)
   })
 
+  it('wires bounded auto-grow onto the existing multiline composer without replacing its controls', () => {
+    expect(thread).toMatch(/import\s+\{\s*composerAutoGrow\s*\}\s+from\s+'\.\/composerAutoGrow'/)
+    expect(thread).toMatch(/<textarea[^>]*rows="2"[^>]*aria-label=\{composerLabel\}[^>]*use:composerAutoGrow=\{text\}[^>]*onkeydown=\{onKey\}/s)
+    expect(thread).toMatch(/\.composer textarea\s*\{[^}]*overflow-y:\s*hidden/s)
+    expect(thread).toMatch(/<AttachmentPreview[\s\S]*<textarea[\s\S]*<div class="cfoot"/)
+    expect(thread).toMatch(/e\.key === 'Enter' && !e\.shiftKey && !e\.isComposing/)
+  })
+
   it('keeps the open agent panel in flow beside the conversation and stacks it in narrow panes', () => {
     expect(thread).toMatch(/class="thread-body"/)
     expect(thread).toMatch(/class="conversation"/)

@@ -31,6 +31,7 @@
   import { findModel, defaultModelFor } from './catalog'
   import { settings } from './settings.svelte'
   import { onDestroy, untrack } from 'svelte'
+  import { composerAutoGrow } from './composerAutoGrow'
   import { loadComposerDrafts, saveComposerDrafts } from './uiState'
   import { resolveSlash, builtinsForProvider, builtinNeedsArg, loadProfileCommands, type SlashResult } from './commands'
   import { resolveWorkingContext, truncatePathTail } from './workingContext'
@@ -967,7 +968,7 @@
 
   <div class="thread-container" class:composer-only={composerOnly}>
     <div class="thread-body">
-      <div class="conversation">
+      <div class="conversation" data-composer-height-container>
   {#if !composerOnly || peekItems > 0}
   <div
     class="stream scroll"
@@ -1100,7 +1101,8 @@
         vendor={view.record.provider}
         onremove={removeAttachment}
       />
-      <textarea rows="2" aria-label={composerLabel} placeholder={isDraft ? 'Describe the first task… (Enter to start the chat, Shift+Enter for newline)' : steerable ? 'Steer the running turn… (delivered at the next tool boundary)' : active ? 'Queue a message… (sends when the current turn finishes)' : 'Ask for follow-up changes…  (Enter to send, Shift+Enter for newline)'}
+      <textarea rows="2" wrap="soft" aria-label={composerLabel} use:composerAutoGrow={text}
+        placeholder={isDraft ? 'Describe the first task… (Enter to start the chat, Shift+Enter for newline)' : steerable ? 'Steer the running turn… (delivered at the next tool boundary)' : active ? 'Queue a message… (sends when the current turn finishes)' : 'Ask for follow-up changes…  (Enter to send, Shift+Enter for newline)'}
         bind:this={taRef} bind:value={text} onkeydown={onKey} onpaste={onPaste}></textarea>
       <div class="cfoot">
         <input
@@ -1356,7 +1358,10 @@
   .composer:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent); }
   .composer.dragging-files { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 7%, var(--surface)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent); }
   @media (prefers-reduced-motion: no-preference) { .composer { transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease); } }
-  .composer textarea { width: 100%; background: none; border: none; resize: none; padding: 0.1rem 0.2rem; }
+  .composer textarea {
+    width: 100%; background: none; border: none; resize: none; padding: 0.1rem 0.2rem;
+    overflow-x: hidden; overflow-y: hidden; overscroll-behavior: contain; scrollbar-gutter: stable;
+  }
   .cfoot {
     display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem 0.4rem; margin-top: 0.35rem;
     min-width: 0; container-type: inline-size; container-name: composer-footer;
