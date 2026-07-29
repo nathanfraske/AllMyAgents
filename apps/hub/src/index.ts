@@ -16,6 +16,7 @@ import {
 import { ProjectStore } from './projects.js'
 import { profileAuthEvidence, scanProfiles, setClaudeConnectorPolicy } from './profiles.js'
 import { ProfileOwnership } from './profileOwnership.js'
+import { startJournalBackups } from './journalBackup.js'
 import { SessionManager } from './sessions.js'
 import { SessionStore } from './store.js'
 import { startServer } from './server.js'
@@ -140,6 +141,26 @@ try {
 // close — legitimately more than the EventEmitter default of 10 for a multi-pane/fleet hub. Raise
 // the cap so a healthy number of connections doesn't emit a spurious MaxListeners leak warning.
 journal.setMaxListeners(64)
+
+// AUTOMATIC, VERIFIED JOURNAL SNAPSHOTS.
+//
+// The operator's journal was corrupted twice in two days; the second time it was truncated to an empty
+// schema, and the only reason fourteen hours of history survived at all was a backup a human happened to
+// take by hand. Nothing in the product was protecting it. This is that protection: a consistent online
+// snapshot on boot and every 30 minutes, each one integrity-checked before it is kept, six generations
+// retained so one bad snapshot cannot erase the safety net.
+//
+// Deliberately started BEFORE sessions restore and before the server listens. If this hub is about to be
+// killed by an update, a supervisor, or a forced reboot, the snapshot worth having is the one taken
+// before any of that — not the one scheduled for later.
+//
+// SUPERVISED HUBS ONLY TAKE ONE SET. During a blue-green flip two hubs briefly share this database; both
+// snapshotting would double the IO for no benefit, and green is the one that will survive.
+const journalBackupsDir = path.join(dataDir, 'backups')
+const stopJournalBackups = startJournalBackups(journal.db, {
+  dir: journalBackupsDir,
+  log: (message) => console.log(message),
+})
 const store = new SessionStore(journal.db)
 const profiles = scanProfiles(profilesDir)
 const profileOwnership = new ProfileOwnership({
@@ -580,6 +601,7 @@ function shutdown(signal: string): void {
   // race the guard above; sessions.shutdown() dispatches the codex kills synchronously so they
   // land even if the guard fires first.
   mesh.stopAutoRegister()
+  stopJournalBackups()
   void Promise.allSettled([mesh.deregister(), sessions.shutdown()]).finally(() => {
     if (!supervised) profileOwnership.releaseAll()
     clearTimeout(guard)

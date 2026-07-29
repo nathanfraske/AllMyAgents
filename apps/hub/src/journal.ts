@@ -97,6 +97,23 @@ export class Journal extends EventEmitter {
     // §4.3). WAL allows many readers + one writer, but with NO busy_timeout a concurrent writer throws
     // SQLITE_BUSY immediately. Wait up to 5s so the sub-second flip window never surfaces a spurious error.
     this.db.pragma('busy_timeout = 5000')
+    // DURABILITY. Without this SQLite uses synchronous=NORMAL under WAL, which does not fsync the WAL on
+    // every commit: a power cut or a hard kill mid-write can leave the WAL torn, and a torn WAL takes the
+    // whole journal down with it.
+    //
+    // That is not hypothetical here. This journal is subjected to exactly those conditions as a matter of
+    // routine: the supervisor kills hubs with `taskkill /T /F` on Windows and SIGTERM to a process group on
+    // POSIX, blue-green restarts overlap two writers, and the operator's machine took three forced Windows
+    // Update reboots in four minutes. Their journal was corrupted twice in two days and once had to be
+    // restored from a backup, losing fourteen hours of history.
+    //
+    // FULL costs an fsync per commit. That is the correct trade for a store whose entire purpose is to be
+    // the durable record of what every agent did — a fast journal that loses a day is worth nothing.
+    this.db.pragma('synchronous = FULL')
+    // Bound how much unflushed history the WAL can accumulate. It had grown to 15 MB, which is both a large
+    // window of work to lose and a large surface to corrupt. Checkpointing more eagerly keeps the base file
+    // close to current, so a damaged WAL costs minutes rather than hours.
+    this.db.pragma('wal_autocheckpoint = 256')
     this.db.exec(
       'CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, session TEXT, kind TEXT NOT NULL, payload TEXT NOT NULL)'
     )
