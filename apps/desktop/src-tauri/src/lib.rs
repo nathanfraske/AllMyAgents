@@ -35,12 +35,12 @@ mod browser;
 
 use std::ffi::OsString;
 use std::fs;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output};
 #[cfg(target_os = "macos")]
 use std::process::Stdio;
-use std::io::{Read, Write};
+use std::process::{Child, Command, Output};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -53,7 +53,13 @@ static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
 
 /// `<app_local_data_dir>/logs/desktop.log` — beside the hub home, on the local (never-roaming) disk.
 pub fn log_path(app: &AppHandle) -> Option<PathBuf> {
-    Some(app.path().app_local_data_dir().ok()?.join("logs").join("desktop.log"))
+    Some(
+        app.path()
+            .app_local_data_dir()
+            .ok()?
+            .join("logs")
+            .join("desktop.log"),
+    )
 }
 
 /// Start writing diagnostics to a FILE as well as stderr.
@@ -70,7 +76,10 @@ fn init_log(app: &AppHandle) {
     let _ = fs::create_dir_all(path.parent().unwrap_or(&path));
     // Truncate rather than append past a sane size: this is a startup diagnostic, not an audit trail,
     // and an unbounded log on a machine nobody is watching is its own small bug.
-    if fs::metadata(&path).map(|m| m.len() > 2_000_000).unwrap_or(false) {
+    if fs::metadata(&path)
+        .map(|m| m.len() > 2_000_000)
+        .unwrap_or(false)
+    {
         let _ = fs::remove_file(&path);
     }
     let _ = LOG_FILE.set(path);
@@ -131,7 +140,9 @@ enum HubProbe {
 ///
 /// A booting green answers 200 with `boot:"booting"`; that is still our hub, so it counts as `Ours`.
 fn probe_hub() -> HubProbe {
-    let Ok(addr) = hub_addr().parse::<SocketAddr>() else { return HubProbe::Vacant };
+    let Ok(addr) = hub_addr().parse::<SocketAddr>() else {
+        return HubProbe::Vacant;
+    };
     let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_millis(500)) {
         Ok(s) => s,
         Err(_) => return HubProbe::Vacant, // connection refused / nothing listening
@@ -228,7 +239,9 @@ fn spawn_hub_dev(browser_secret: &str, browser_address: &str) -> Option<Child> {
     let hub_addr = hub_addr();
     match probe_hub() {
         HubProbe::Ours => {
-            logln(&format!("[desktop] our hub already answering on {hub_addr} — not spawning a second one"));
+            logln(&format!(
+                "[desktop] our hub already answering on {hub_addr} — not spawning a second one"
+            ));
             return None;
         }
         HubProbe::Foreign => {
@@ -365,13 +378,26 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// The read-only hub payload shipped inside the app bundle
 /// (`<resource_dir>/hub-runtime/apps/hub`, containing `dist/` + `package.json`).
 fn payload_hub_dir(app: &AppHandle) -> Option<PathBuf> {
-    Some(app.path().resource_dir().ok()?.join("hub-runtime").join("apps").join("hub"))
+    Some(
+        app.path()
+            .resource_dir()
+            .ok()?
+            .join("hub-runtime")
+            .join("apps")
+            .join("hub"),
+    )
 }
 
 /// The bundled Node directory (`<resource_dir>/hub-runtime/node`, holds node(.exe)
 /// and `node_modules/npm`).
 fn bundled_node_dir(app: &AppHandle) -> Option<PathBuf> {
-    Some(app.path().resource_dir().ok()?.join("hub-runtime").join("node"))
+    Some(
+        app.path()
+            .resource_dir()
+            .ok()?
+            .join("hub-runtime")
+            .join("node"),
+    )
 }
 
 /// Writable "hub home" that holds the app's own CODE: the staged `apps/hub/dist`
@@ -466,7 +492,10 @@ fn hub_device_token(app: AppHandle) -> Result<String, String> {
 /// Program Files) install dir, whatever the process cwd happens to be.
 fn materialize_app_data(app: &AppHandle) -> std::io::Result<(PathBuf, PathBuf)> {
     let root = app_data_root(app).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "could not resolve the per-user app-data directory")
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "could not resolve the per-user app-data directory",
+        )
     })?;
     let data = root.join("data");
     let profiles = root.join("profiles");
@@ -535,7 +564,10 @@ fn read_repair_state(dest_hub: &Path) -> RepairState {
     };
     let mut lines = text.lines();
     let fingerprint = lines.next().unwrap_or_default().to_string();
-    let attempts = lines.next().and_then(|v| v.parse::<u8>().ok()).unwrap_or_default();
+    let attempts = lines
+        .next()
+        .and_then(|v| v.parse::<u8>().ok())
+        .unwrap_or_default();
     RepairState {
         fingerprint,
         attempts,
@@ -676,7 +708,13 @@ fn run_npm_install(
 ) -> std::io::Result<Output> {
     Command::new(node_cmd)
         .arg(plain(npm_cli))
-        .args(["install", "--omit=dev", "--no-audit", "--no-fund", "--loglevel=error"])
+        .args([
+            "install",
+            "--omit=dev",
+            "--no-audit",
+            "--no-fund",
+            "--loglevel=error",
+        ])
         .current_dir(plain(dest_hub))
         .env("PATH", prepend_path(&[node_dir.to_path_buf()]))
         .output()
@@ -728,8 +766,16 @@ fn base64(input: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(T[(n >> 18 & 63) as usize] as char);
         out.push(T[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -748,7 +794,9 @@ body[data-state=error] h1{color:#ff8a8a}"#;
 /// Minimal HTML escaping for text baked straight into the splash page (a message can carry a path or a
 /// child's exit string — neither is trusted to be markup-safe).
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Build the splash/error page with its message baked in. Baking (rather than eval'ing after load) is
@@ -840,7 +888,9 @@ fn release_boot(
     // Reachability guard — prove what is on the port before deciding, and never spawn a second hub.
     match probe_hub() {
         HubProbe::Ours => {
-            logln(&format!("[desktop] our hub already answering on {hub_addr} — not spawning"));
+            logln(&format!(
+                "[desktop] our hub already answering on {hub_addr} — not spawning"
+            ));
             if let Some(w) = &splash {
                 let _ = w.close();
             }
@@ -865,7 +915,11 @@ fn release_boot(
     }
 
     // Resolve the shipped payload + bundled Node, and the writable hub home.
-    let (payload_hub, node_dir, home) = match (payload_hub_dir(&app), bundled_node_dir(&app), hub_home(&app)) {
+    let (payload_hub, node_dir, home) = match (
+        payload_hub_dir(&app),
+        bundled_node_dir(&app),
+        hub_home(&app),
+    ) {
         (Some(a), Some(b), Some(c)) => (a, b, c),
         _ => {
             boot_error(
@@ -878,8 +932,16 @@ fn release_boot(
     };
     // Prefer the bundled Node; fall back to a system `node` on PATH if missing.
     let node = node_dir.join(node_exe_name());
-    let node_cmd = if node.exists() { node } else { PathBuf::from(node_exe_name()) };
-    let npm_cli = node_dir.join("node_modules").join("npm").join("bin").join("npm-cli.js");
+    let node_cmd = if node.exists() {
+        node
+    } else {
+        PathBuf::from(node_exe_name())
+    };
+    let npm_cli = node_dir
+        .join("node_modules")
+        .join("npm")
+        .join("bin")
+        .join("npm-cli.js");
 
     let dest_hub = home.join("apps").join("hub");
     if let Err(e) = fs::create_dir_all(&dest_hub) {
@@ -898,7 +960,10 @@ fn release_boot(
         boot_error(&app, &splash, &format!("Could not stage the hub: {e}"));
         return;
     }
-    if let Err(e) = fs::copy(payload_hub.join("package.json"), dest_hub.join("package.json")) {
+    if let Err(e) = fs::copy(
+        payload_hub.join("package.json"),
+        dest_hub.join("package.json"),
+    ) {
         boot_error(
             &app,
             &splash,
@@ -920,7 +985,9 @@ fn release_boot(
     let lock = payload_hub.join("package-lock.json");
     if lock.exists() {
         if let Err(e) = fs::copy(&lock, dest_hub.join("package-lock.json")) {
-            logln(&format!("[desktop] could not stage the lockfile ({e}); install will resolve unpinned"));
+            logln(&format!(
+                "[desktop] could not stage the lockfile ({e}); install will resolve unpinned"
+            ));
         }
     } else {
         logln("[desktop] no lockfile in the payload — dependency versions will resolve unpinned");
@@ -954,11 +1021,7 @@ fn release_boot(
             }
             Err(e) => {
                 if repair_decision(&repair_state, &fingerprint) == RepairDecision::Blocked {
-                    boot_error(
-                        &app,
-                        &splash,
-                        &repair_blocked_message(&home, &log),
-                    );
+                    boot_error(&app, &splash, &repair_blocked_message(&home, &log));
                     return;
                 }
                 repair_state.record_attempt(&fingerprint);
@@ -999,11 +1062,7 @@ fn release_boot(
         // A prior repair died after its marker was removed. It is still a repair on the next launch;
         // treating it as a fresh install here is the loop that used to reinstall forever.
         if repair_decision(&repair_state, &fingerprint) == RepairDecision::Blocked {
-            boot_error(
-                &app,
-                &splash,
-                &repair_blocked_message(&home, &log),
-            );
+            boot_error(&app, &splash, &repair_blocked_message(&home, &log));
             return;
         }
         repair_state.record_attempt(&fingerprint);
@@ -1083,14 +1142,8 @@ fn release_boot(
                     logln(&format!(
                         "[desktop] installed tree failed verification: {verify_error}"
                     ));
-                    if repair_decision(&repair_state, &fingerprint)
-                        == RepairDecision::Blocked
-                    {
-                        boot_error(
-                            &app,
-                            &splash,
-                            &repair_blocked_message(&home, &log),
-                        );
+                    if repair_decision(&repair_state, &fingerprint) == RepairDecision::Blocked {
+                        boot_error(&app, &splash, &repair_blocked_message(&home, &log));
                         return;
                     }
 
@@ -1112,9 +1165,7 @@ fn release_boot(
                         repair_state.attempts
                     ));
                     let _ = fs::remove_file(&marker);
-                    if let Err(remove_error) =
-                        fs::remove_dir_all(dest_hub.join("node_modules"))
-                    {
+                    if let Err(remove_error) = fs::remove_dir_all(dest_hub.join("node_modules")) {
                         if remove_error.kind() != std::io::ErrorKind::NotFound {
                             boot_error(
                                 &app,
@@ -1187,7 +1238,11 @@ fn release_boot(
     hide_console(&mut cmd); // Windows: no stray black console window in front of the app
     match cmd.spawn() {
         Ok(child) => {
-            logln(&format!("[desktop] spawned bundled hub (pid {}) — {}", child.id(), entry.display()));
+            logln(&format!(
+                "[desktop] spawned bundled hub (pid {}) — {}",
+                child.id(),
+                entry.display()
+            ));
             if let Some(state) = app.try_state::<HubProcess>() {
                 if let Ok(mut g) = state.0.lock() {
                     *g = Some(child);
@@ -1233,12 +1288,18 @@ fn release_boot(
         }
         return;
     }
-    let log_hint = log_path(&app).map(|p| p.display().to_string()).unwrap_or_else(|| "(no log)".into());
+    let log_hint = log_path(&app)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(no log)".into());
     let detail = match exited {
         Some(status) => format!("The hub started but exited before it was ready ({status})."),
         None => "The hub started but did not become ready in time.".to_string(),
     };
-    boot_error(&app, &splash, &format!("{detail} Its log may say why: {log_hint}"));
+    boot_error(
+        &app,
+        &splash,
+        &format!("{detail} Its log may say why: {log_hint}"),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1323,7 +1384,9 @@ async fn updater_check(app: AppHandle) -> Result<UpdateInfo, String> {
 #[tauri::command]
 async fn updater_install(app: AppHandle) -> Result<(), String> {
     use tauri_plugin_updater::UpdaterExt;
-    let updater = app.updater().map_err(|e| format!("Updater is not configured yet ({e})."))?;
+    let updater = app
+        .updater()
+        .map_err(|e| format!("Updater is not configured yet ({e})."))?;
     let update = updater
         .check()
         .await
@@ -1334,7 +1397,9 @@ async fn updater_install(app: AppHandle) -> Result<(), String> {
         .await
         .map_err(|e| format!("Could not download or verify the update: {e}"))?;
     quiesce_for_update(&app)?;
-    update.install(bytes).map_err(|e| format!("Could not start the verified update: {e}"))?;
+    update
+        .install(bytes)
+        .map_err(|e| format!("Could not start the verified update: {e}"))?;
     // The hub child is torn down by the Exit handler in `run()` before the process
     // goes away on platforms whose updater returns. Windows exits from inside
     // `install`, after `quiesce_for_update` has already released the runtime.
@@ -1382,7 +1447,9 @@ where
 }
 
 fn hub_port_is_vacant() -> bool {
-    let Ok(addr) = hub_addr().parse::<SocketAddr>() else { return false };
+    let Ok(addr) = hub_addr().parse::<SocketAddr>() else {
+        return false;
+    };
     TcpStream::connect_timeout(&addr, Duration::from_millis(150)).is_err()
 }
 
@@ -1467,9 +1534,7 @@ fn runtime_processes(path: &Path) -> Vec<u32> {
     let mut more = unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok();
     while more {
         let pid = entry.th32ProcessID;
-        if process_image_path(pid)
-            .is_some_and(|image| normalized_windows_path(&image) == target)
-        {
+        if process_image_path(pid).is_some_and(|image| normalized_windows_path(&image) == target) {
             matches.push(pid);
         }
         more = unsafe { Process32NextW(snapshot, &mut entry) }.is_ok();
@@ -1492,8 +1557,8 @@ fn runtime_lock_holders(path: &Path) -> Vec<String> {
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
     use windows::Win32::System::RestartManager::{
-        RmEndSession, RmGetList, RmRegisterResources, RmStartSession, RM_PROCESS_INFO,
-        CCH_RM_SESSION_KEY,
+        RmEndSession, RmGetList, RmRegisterResources, RmStartSession, CCH_RM_SESSION_KEY,
+        RM_PROCESS_INFO,
     };
 
     let mut session = 0u32;
@@ -1557,9 +1622,7 @@ fn terminate_runtime_processes(path: &Path) {
         // A PID can be recycled after the snapshot. Re-check the image at the
         // last possible moment so a newly-created unrelated process can never
         // be swept merely because it inherited a stale number.
-        if !process_image_path(pid)
-            .is_some_and(|image| normalized_windows_path(&image) == target)
-        {
+        if !process_image_path(pid).is_some_and(|image| normalized_windows_path(&image) == target) {
             continue;
         }
         logln(&format!(
@@ -1592,7 +1655,8 @@ fn quiesce_for_update(app: &AppHandle) -> Result<(), String> {
     let runtime = bundled_node_dir(app)
         .map(|dir| dir.join(node_exe_name()))
         .ok_or_else(|| {
-            "Update was not started because the bundled runtime path could not be resolved.".to_string()
+            "Update was not started because the bundled runtime path could not be resolved."
+                .to_string()
         })?;
     if !runtime.exists() {
         return Err(format!(
@@ -1619,7 +1683,9 @@ fn quiesce_for_update(app: &AppHandle) -> Result<(), String> {
     if let Err(failure) = release {
         let port = if failure.port_occupied {
             match probe_hub() {
-                HubProbe::Ours => format!("the AllMyAgents hub is still answering on {}", hub_addr()),
+                HubProbe::Ours => {
+                    format!("the AllMyAgents hub is still answering on {}", hub_addr())
+                }
                 HubProbe::Foreign => format!("another process is still using {}", hub_addr()),
                 HubProbe::Vacant => format!("{} did not release consistently", hub_addr()),
             }
@@ -1635,7 +1701,11 @@ fn quiesce_for_update(app: &AppHandle) -> Result<(), String> {
                 format!(
                     "{} is still held by PID(s) {}",
                     runtime.display(),
-                    exact_pids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
+                    exact_pids
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )
             } else {
                 format!(
@@ -1677,7 +1747,8 @@ fn uninstall_macos(app: AppHandle, remove_user_data: bool) -> Result<(), String>
     }
     #[cfg(target_os = "macos")]
     {
-        let exe = std::env::current_exe().map_err(|e| format!("could not locate the running app: {e}"))?;
+        let exe = std::env::current_exe()
+            .map_err(|e| format!("could not locate the running app: {e}"))?;
         let bundle = exe
             .parent()
             .and_then(Path::parent)
@@ -1685,7 +1756,10 @@ fn uninstall_macos(app: AppHandle, remove_user_data: bool) -> Result<(), String>
             .ok_or_else(|| "could not resolve the application bundle".to_string())?
             .to_path_buf();
         if bundle.extension().and_then(|s| s.to_str()) != Some("app") {
-            return Err(format!("refusing to remove unexpected bundle path {}", bundle.display()));
+            return Err(format!(
+                "refusing to remove unexpected bundle path {}",
+                bundle.display()
+            ));
         }
         let hub_root = app
             .path()
@@ -1719,10 +1793,16 @@ if [ "$purge" = 1 ]; then rm -rf -- "$user_data"; fi
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         set_own_group(&mut helper);
-        helper.spawn().map_err(|e| format!("could not start the uninstall helper: {e}"))?;
+        helper
+            .spawn()
+            .map_err(|e| format!("could not start the uninstall helper: {e}"))?;
         logln(&format!(
             "[desktop] uninstall scheduled; operator data {}",
-            if remove_user_data { "will be deleted" } else { "will be kept" }
+            if remove_user_data {
+                "will be deleted"
+            } else {
+                "will be kept"
+            }
         ));
         app.exit(0);
         Ok(())
@@ -1807,8 +1887,7 @@ pub fn run() {
 
             if cfg!(debug_assertions) {
                 // Dev: spawn `pnpm hub:dev` synchronously, as before.
-                let child =
-                    spawn_hub_dev(&browser_bridge.secret, &browser_bridge.address);
+                let child = spawn_hub_dev(&browser_bridge.secret, &browser_bridge.address);
                 if let Some(state) = app.try_state::<HubProcess>() {
                     if let Ok(mut g) = state.0.lock() {
                         *g = child;
@@ -1877,7 +1956,8 @@ mod dependency_repair_tests {
 
     #[test]
     fn npm_errors_only_blame_the_network_when_the_diagnostic_supports_it() {
-        let log = Path::new(r"C:\Users\tester\AppData\Local\direct.cec.allmyagents\logs\desktop.log");
+        let log =
+            Path::new(r"C:\Users\tester\AppData\Local\direct.cec.allmyagents\logs\desktop.log");
         let offline = npm_install_failure_message(
             1,
             "npm error code ENETWORK\nnpm error network request failed",
