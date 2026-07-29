@@ -3,6 +3,71 @@
 All notable stewardship changes are recorded here. This log records documentation history, not canonical
 standard releases.
 
+## 2026-07-29 — academic evidence and transparency correction
+
+### Added
+
+- Added explicit research questions, falsifiers, validity threats, and evidence-mode requirements.
+- Incorporated defensible carrier/governance/recovery material from preserved unmerged commit `819eedf` as
+  Candidate/Open research only.
+- Added Candidate normal `HeadReceipt` authorization plus the restricted independent `RecoveryTransition`
+  exception while keeping non-authorizing witness registration/inclusion/consistency evidence distinct; the
+  base wire profile defines no parallel custom `WitnessReceipt` object.
+- Added the narrow Candidate `InstantaneousAttestationPrecondition`, evaluated with applicability once per
+  one-NormBody Custom and exact EvidenceTypeDef-declared relevant canonical target dimensions.
+- Added bounded conformance rules for non-exhaustive suites, exhaustive finite closed domains, continuous
+  independent observation, and formal model-to-implementation correspondence.
+- Added OpenA2A AAP and Standards Track RFC 9942/9943 SCITT related work from primary sources.
+- Recorded formal state `70458fc6cc7903d6da984865c617e3f1ef5bcb38` (base
+  `a2b57551863241d90bca663ee07190accfa834d2`), including exact SANY/TLC toolchain, seven finite configuration
+  scopes, state counts, depths, no-error results, three expected mutation counterexamples, thirteen
+  reachability sentinels, and explicit revision/discovery noncoverage.
+- Added Candidate immutable Custom-series evolution and bounded `pacs-project-fs-v1` discovery, while marking
+  promotion-source wire evidence, lifecycle formalization, general cross-platform/archive discovery, and
+  physical resolver/export model coverage Unsupported/HOLD.
+
+### Corrected
+
+- Removed survey language that ranked “nearest” work or could be read as a first/only/no-standard novelty
+  claim; comparisons are now dated and feature-specific.
+- Clarified that definite-False applicability omits the containing Custom with provenance and never skips
+  individual IAP atoms; security-relevant Unknown denies; corrected wire NEG-25 retains the atom-skip bypass
+  as a negative vector.
+- Clarified that attestations bind all and only the closed canonical target dimensions declared relevant by
+  their EvidenceTypeDef.
+- Clarified that SCITT can prove signed-statement registration, VDS inclusion, and profile-supported
+  consistency, but not Customs project authority or active-head selection.
+- Incorporated the bounded wire review: complete per-kind `ProtectedTarget` digests, HeadReceipt’s external
+  sequencer and acceptance bindings, and explicit Open/HOLD wire registries, trust, key/freshness, privacy,
+  resource-ceiling, and recovery work.
+- Replaced any implication of an authoritative `PolicyImage` with the recomputed canonical policy tuple;
+  preserved provider-envelope identifiers as exact opaque bytes; and removed the manifest/target hash cycle.
+- Reconciled corrected Candidate wire-profile state `beb974c30a922ca47679b1427dd241923a13628d`:
+  HeadReceipt remains the sole normal selector for an ordinary Release and is accepted with a distinct
+  exact-subject head SignatureBundle; SCITT witness submission names that bundle and exact scope; each
+  protected-target kind binds its exact fields; and RequirementAtom has no atom-local applicability.
+- Qualified the recovery exception: an independently accepted higher-term, sequence-0 `RecoveryTransition`
+  selects only its `SafeRecoveryRelease`; the next normal HeadReceipt parents it at sequence 1, while recovery
+  ceremony, threshold, credential custody, and nonrollback mechanics remain HOLD.
+- Corrected the normal HeadReceipt parent binding to a typed generic `parentHeadCheckpointRef`, allowed
+  EvidenceTypeDef to name an exact sorted set of closed target kinds while each attestation binds one complete
+  target of one registered allowed kind, and reserved “Ratified” for external proposition status rather than
+  project-governance promotion.
+- Cross-referenced final Candidate specification state `ba74c76cdd90a61ccdb3bda9460f8c4d07af49ee`,
+  including PACS-HEAD-001–007, PACS-REC-001–007, PACS-CLOSE-001–003, PACS-CARRIER-001–006,
+  PACS-LIFE-004/005/007/008/009, PACS-APP-001–003, PACS-IAP-003–006, PACS-CLAIM-001–007, and
+  PACS-TEST-003, without treating a written clause as ratification, conformance evidence, or authority to
+  lift HOLD.
+- Normalized every claim-ledger status cell to the fixed vocabulary: Ratified, Candidate, Open, Rejected, or
+  Empirical-only.
+
+### Status and provenance
+
+- Required `git rebase main` completed as a no-op at current main `6ba3e9c` before editing.
+- No proposition was promoted by this research pass. No accepted proof or implementation evidence is
+  reported. Implementation remains **HOLD**.
+- Only `rough-draft-paper.md`, `claim-evidence-ledger.md`, and this changelog were edited.
+
 ## 2026-07-29 — consolidated corrective pass
 
 ### Corrected
