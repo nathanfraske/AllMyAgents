@@ -3,15 +3,38 @@
 All notable stewardship changes are recorded here. This log records documentation history, not canonical
 standard releases.
 
+## 2026-07-29 — consolidated corrective pass
+
+### Corrected
+
+- Narrowed currentness to decision-current admission at authoritative CAS-consume plus atomic audit/outbox
+  commit; replaced reusable receipts with durable outbox work.
+- Separated crash/restart, rollback/clone, and Byzantine/equivocation threat profiles; limited the base claim
+  to at-most-one authoritative enqueue.
+- Made output release a typed Effect, removed runtime fork identity, separated project/fleet trust bootstrap,
+  and distinguished SemanticCharter from adapter rendering and the complete provider envelope.
+- Replaced independent capability-field intersections with relational tuples and registered lattices; made
+  approval typed evidence for fresh re-evaluation.
+- Added the closed one-NormBody Custom union, authenticated three-valued FactSnapshot applicability,
+  identity-map failure rules, two-stage deviation compilation, expanded negative vectors, related work, and
+  working-name collision findings.
+- Corrected RFC 9162 to Experimental §11.3 and narrowed OPA conflict wording to “may,” with no cross-bundle
+  ordering claim.
+- Added evidence class G for locally authenticated governance reports. No Candidate/Open item was promoted.
+  Implementation remains HOLD.
+- Clarified that the authoritative gateway must own/proxy transport, the four targets are decision views
+  rather than mandatory persisted objects, assurance is an orthogonal capability matrix, external generation
+  is distinct from local SessionIncarnation, and wall-clock time is non-authoritative absent trusted time.
+
 ## 2026-07-29 — reconciled v0 Candidate architecture
 
 ### Changed
 
-- Recorded the four-target authorization machine, closed typed receipt union, strict-current linearization
-  semantics, typed meet algebra, release/high-water profile, Agent Customs lifecycle, and five-tier assurance
-  taxonomy as Candidate only.
-- Kept `TrustPin` in the local sidecar as the bootstrap binding for `(ProjectId, GenesisDigest)`; the portable
-  signed chain begins at `ProjectGenesis`.
+- Recorded the initial four-target authorization machine, decision union, admission-currentness, meet,
+  release/high-water, Agent lifecycle, and assurance taxonomy as Candidate only; the corrective entry above
+  supersedes its overbroad details.
+- Recorded a then-generic local trust-pin bootstrap; the corrective entry above replaces it with independent
+  `ProjectTrustPin` and `FleetTrustAnchor`.
 - Defined one-shot currentness at the authority decision and indivisible local guarded-dispatch transition,
   without claiming physical simultaneity or retroactive invalidation of an admitted remote operation.
 - Added explicit rejected claims, degradation behavior, ten counterexamples, automated conformance oracles,

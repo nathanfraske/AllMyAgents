@@ -178,55 +178,62 @@ claim by claim, retaining superseded states in the ledgers and changelog.
 
 ## 12. Reconciled v0 candidate authorization machine
 
-This section records a reconciled architecture as **Candidate**. Four target kinds bind progressively more
-runtime state, and no receipt for one kind authorizes another [C-100–C-112].
+This section records a reconciled architecture as **Candidate**. Four typed decision views bind progressively
+more runtime state, but they are not four mandatory persisted objects. No decision for one kind authorizes
+another [C-100–C-112].
 
 ### 12.1 PolicyImage
 
-A `PolicyImage` is the exact deterministic compilation of:
-
-`KernelRef + FleetRef + ProjectRef + optional agent trial + compiler/profile + artifact digest`.
+A deviation-free `PolicyBasis` deterministically compiles active Kernel, Fleet, Project, and optional agent
+Customs plus registry/compiler refs. Exact `DeviationGrant`s then bind the PolicyBasis digest, `RuleRef`,
+subject/target scope, expiry, authority, and compensation. A final `PolicyImage` may bind the PolicyBasis
+plus accepted DeviationGrant refs, but whether it is separately authoritative/persisted is an Open minimality
+and naming choice; admission must bind the equivalent final tuple and request-specific SemanticCharter.
 
 `FleetRef` is irreducible: a project or agent cannot compile away the fleet ceiling. The compiler is a
 versioned deterministic component, not a model. A model compiling the policy that governs its own request
-would make the trust argument circular [C-106].
+would make the trust argument circular. The artifact digest is output/binding, not an input to its own
+compilation. A DeviationGrant cannot bind a final PolicyImage digest that includes itself [C-106].
 
 ### 12.2 ActivationTarget
 
-An `ActivationTarget` binds a `PolicyImage` to stable `AgentId`, provider/adapter, `enforcerId`, and a
-never-reused `activationFence` representing the session incarnation. A restarted or resurrected session
-receives a new fence; an old receipt fails even if every readable field or display name matches [C-107].
+An `ActivationTarget` binds the final policy tuple to stable `AgentId`, provider/adapter, `enforcerId`,
+distinct `SessionIncarnation`, and authority-owned live Enforcer/Activation generation (`ActivationFence`).
+Restart creates a new incarnation and generation. A local incarnation/fence does not survive exact cloning;
+only external gateway single-live-channel/generation state can fence clones in a stronger profile [C-107].
 
 ### 12.3 InferenceAdmissionTarget and RequestCharter
 
-An `InferenceAdmissionTarget` binds the activation target to the exact `SessionGrant` head, exact deviations,
-canonical request, provider/model/adapter, final rendered bytes and length, and tool-surface digest. The
-corresponding `RequestCharter` is the deterministic projection and rendered admission artifact. Rendering
-must finish before admission; overflow or attempted silent truncation denies. A suffix rendered after
-authorization is unauthorized even if the earlier prefix was valid [C-108–C-110].
+An `InferenceAdmissionTarget` binds exact grant/deviations and canonical request; both the vendor-neutral
+`SemanticCharter` and adapter-specific `CharterRendering` / `VendorRequestManifest` digests; renderer/adapter
+profile; and the complete observable provider envelope: provider/model, account/tenant, endpoint/region,
+conversation/cache/context identifiers, tool definitions and implementation identities, attachments, all
+instruction channels/roles, generation parameters, and final exact bytes/length. Rendering finishes before
+admission; overflow or silent truncation denies [C-108–C-110].
 
 ### 12.4 EffectAuthorizationTarget
 
-An `EffectAuthorizationTarget` binds current activation, grant, and deviations to the canonical action,
-adapter, origin inference, and a stable operation identifier. Scheduled or queued operations re-authorize at
-execution rather than spending a stale queued receipt [C-111].
+An `EffectAuthorizationTarget` binds activation, grant, deviations, a fully canonicalized capability target,
+adapter, origin inference, and stable operation identifier. `output.release` is a typed Effect. A strong
+profile buffers final output and freshly authorizes release; streaming/chunk disclosure is weaker and
+irreversible. Scheduled work receives a fresh execution-time decision [C-111].
 
 A single `DecisionRequest` / `Receipt` envelope is Candidate only as a closed discriminated union of
 `activate | infer | effect`. The signed domain includes the kind and target-specific bindings, making
-receipts non-interchangeable across kind, fence, incarnation, project, fork, adapter, provider, and model
+decisions non-interchangeable across kind, fence, incarnation, project, adapter, provider, and model
 [C-112].
 
 ## 13. Freshness profiles
 
-**Strict-current** means an online, nonce-bound, single-use receipt at every AllMyAgents-controlled provider
-dispatch and every protected effect, followed by atomic verify-and-dispatch. “Current” means the authority’s
-head at the receipt linearization point, not timeless latestness. If the authority is unavailable, no
-strict-current inference or protected effect occurs [C-120–C-123].
+**Decision-current admission** requires an authoritative guarded gateway that owns or proxies the actual
+provider/effect transport. It atomically CAS-consumes the exact request and commits an audit record plus
+durable outbox enqueue. Returning an allow decision to a remote enforcer that dispatches later is not atomic
+current admission. Workers receive outbox work, not reusable bearer capability. Currentness exists at that
+admission linearization; remote completion is only admitted [C-120–C-123].
 
-A lease may exist only under a separately named bounded-stability/offline profile. It cannot claim
-strict-current. Authority changes cannot retroactively stop already accepted remote inference, retract
-delivered output, or undo external effects. During a partition, strict-current availability is intentionally
-sacrificed rather than guessed [C-124, C-125].
+Other profiles are **bounded-stability** and **snapshot**. Neither claims decision-current admission.
+Authority changes cannot retroactively stop accepted remote work, retract disclosed output, or undo effects
+[C-124, C-125].
 
 ## 14. Candidate v0 precedence and obligation algebra
 
@@ -236,28 +243,37 @@ agent trials can narrow only. The hard authorization result is intersection with
 
 | Field | Meet |
 |---|---|
-| actions, resources, destinations | set intersection |
-| `maxRisk`, `maxData`, `maxBytes`, `validUntil` | minimum |
-| `requiredApprovals`, `auditTags` | set union |
+| complete `(action, resource, destination, conditions)` capability tuples | relation intersection or membership predicate over fully canonicalized target |
+| `maxRisk`, `maxData` | meet in named registered lattices |
+| `maxBytes`, `validUntil` | minimum |
+| requirements | conjunctive all-of typed evidence |
+| `auditTags` | set union |
 | `sandbox` | Boolean OR |
 
-An unknown type, field, operator, invalid value, or undefined meet denies. Arbitrary prose, stateful
-obligations, and disjunctive obligation systems remain Open and keep implementation on HOLD [C-131, C-132].
+Independent action/resource/destination intersections are forbidden because they can synthesize cross-product
+authority. Approval is typed evidence for a fresh current decision, never permission by itself. Complex
+threshold/quorum logic is one externally attested evidence atom or remains Open. Unknown or invalid meet
+denies [C-131, C-132].
 
 ## 15. Candidate release and carrier profile
 
-`ProjectIdentity = (random ProjectId, GenesisDigest)`. A local `TrustPin` bootstraps trust by binding that
-pair; it is sidecar state, not a portable signed-chain object. The portable graph contains immutable signed
-content-addressed objects and one linear v0 Release chain with explicit forks:
+`ProjectIdentity = (random ProjectId, GenesisDigest)`. Two independent local bindings bootstrap it:
+`ProjectTrustPin` binds ProjectId/genesis/project root or locator; `FleetTrustAnchor` supplies FleetRef. A
+project never selects its fleet ceiling or self-authenticates, and fleet identity is not embedded in project
+identity because projects move between fleets.
 
-`ProjectGenesis → RootTransition* → AuthorityGrant(term) → Release* → CustomRevision references`.
+The portable graph has one active linear Release head per ProjectIdentity. Root/authority transitions may
+interleave with Releases, each of which binds exact authority term and root epoch. Copies, clones, and
+worktrees preserve identity. Competing signed heads are equivocation and quarantine. An intentional fork
+mints a new ProjectId/GenesisDigest with optional parent provenance; no runtime fork identifier exists.
 
 Verification tracks a local high-water mark and fails on missing, corrupt, unsupported, or equivocal
 required material [C-140–C-143].
 
 A capsule carries the closed portable graph. A transport profile states whether it includes that graph
 physically or carries an authenticated companion locator. Local sidecars contain trust pins, mounts, private
-keys/endpoints, high-water state, receipts, caches, compiled Charters, and the private `AgentId` map. Capsules
+keys/endpoints, high-water state, decision/audit records, caches, compiled Charters, and the private `AgentId`
+map. Capsules
 contain no secrets, process fences, or reusable authority credentials [C-144].
 
 Root loss has no magical recovery. Content addressing detects differing objects but does not stop a cloned
@@ -267,26 +283,25 @@ not an adopted Customs protocol [C-145, C-146].
 
 ## 16. Agent Customs lifecycle
 
-Personal and trial Customs can narrow only their stable `AgentId`; they cannot widen authority or affect
-other agents, security, or governance. The Candidate lifecycle is:
+Personal and trial Customs can steer security-relevant choices, but cannot expand reference-monitor
+authority, mutate higher governance, or enter another AgentId’s Charter. Trials require isolation and
+consent; agent authorship never activates. The Candidate lifecycle is:
 
 `draft → trial/shadow → personal active → promotion proposal/review → new project Custom`.
 
-There is no silent promotion or synchronization. Imports are quarantined and inactive. Capsules omit
-`AgentId` by default and carry a project/export-scoped principal whose private map stays local. Culture is
-emergent evidence, not a stored object [C-150–C-153].
+There is no silent promotion or synchronization. Self-adoption requires explicit granted capability and a
+non-widening check. Promotion creates a new project-owned Custom with lineage/provenance and project
+ratification. Identity authority binds stable AgentId to the session and private
+`(ProjectId, ProjectPrincipalId) ↔ AgentId` map; missing or ambiguous mapping denies, and name/self-claim
+never resolves it. Imports are inactive in quarantine [C-150–C-153].
 
 ## 17. Assurance and containment
 
-Conformance claims are capability-by-capability and distinguish [C-160]:
-
-- **Carrier Assurance** — selected objects arrived and decoded under a named carrier profile.
-- **Delivery Assurance** — exact authenticated bytes reached a controlled dispatch boundary.
-- **Declared Effect Assurance** — declared protected effects received current authorization.
-- **Contained Effect Assurance** — bypass tests support that all claimed effect paths cross the enforcer.
-- **Semantic Assurance** — bounded empirical evidence only; never model understanding or obedience.
-
-Freshness profile is orthogonal to all five. One “Customs enabled” flag is prohibited.
+Conformance is a capability matrix, not a monotone ladder [C-160]. Independent columns are **Carrier**,
+**Projection**, **Delivery**, **EffectAuthorization**, **EffectContainment**, **OutputRelease**, and
+**SemanticEvaluation**. Each reports `Enforced`, `Detected`, `Empirical`, or `Unsupported` where meaningful.
+A strong Carrier cell implies nothing about output or semantics. Freshness and threat profiles are
+orthogonal. One “Customs enabled” flag is prohibited.
 
 Full containment cannot be claimed for an ambient vendor CLI without OS/container isolation and brokered
 filesystem, process, network, Git, secrets, and browser access. The protected-boundary registry must cover at
@@ -298,14 +313,15 @@ This boundary follows established reasoning: complete mediation checks every acc
 always invoked, tamper-resistant, and verifiable; PDP/PEP architectures separate decision from enforcement;
 and execution monitoring cannot enforce arbitrary semantic properties [C-164–C-167]. Saltzer and
 Schroeder’s economy-of-mechanism principle supports keeping the v0 meet small. OPA’s signed-bundle behavior
-is useful implementation precedent for validate-before-activation and for treating multi-source conflicts
-as errors, but it is not an adopted Customs engine [C-168].
+is useful implementation precedent for validate-before-activation; its documentation says conflicting
+bundles loaded at different times may enter an error state and supplies no cross-bundle ordering. OPA is not
+an adopted Customs engine [C-168].
 
 ## 18. Rejected hard claims and explicit degradation
 
 Rejected claims include: every physical vendor inference was admitted; hidden retry or compaction carried
 the Charter; the model understood or obeyed; remote cancellation retroactively retracted accepted work or
-delivered output; strict-current operation remained current through authority partition; and external
+delivered output; decision-current admission remained available through authority partition; and external
 effects are universally exactly once [C-170].
 
 Required degradations and tests are explicit: guidance overflow denies; admitted bytes are checked exactly;
@@ -316,42 +332,92 @@ guidance change rotates to a new provider context [C-171].
 
 ## 19. Counterexample catalogue
 
-Mandatory negative vectors are: queued-receipt TOCTOU; render-after-admission suffix; cached provider
-context; inference receipt reused for effect; signer-clone split view; travel without high-water; display-name
-rebind; session resurrection/ABA; model-in-compiler circularity; and ambiguous approval [C-180].
+Mandatory negative vectors include queued-decision TOCTOU; render-after-admission suffix; hidden/cached
+provider context; inference decision reused for effect; exact-clone double-spend; rollback; signer split
+view; midstream output release; fact spoof/provenance downgrade; relational cross-product; account/tenant/
+endpoint replay; project-trust/fleet-trust/locator substitution; scoped-map loss/erasure; AgentId/name/
+self-claim confusion; session resurrection/ABA; model-in-compiler and deviation/image circularity; and
+approval replay after a policy change [C-180].
 
 ## 20. Automated conformance oracles
 
 The Candidate suite must demonstrate [C-181]:
 
-- zero provider calls without a valid inference receipt and exact final-byte equality;
-- nonce single use and no cross-kind/fence/incarnation/project/fork/adapter/provider/model receipt reuse;
-- zero protected effects without a current effect receipt;
-- head changes invalidate unspent receipts, while already admitted operations remain admitted; overflow
-  denies; restart fences survive crashes;
+- zero adapter-dispatched provider calls observed at the named controlled boundary without a valid admission
+  decision and exact final-envelope equality;
+- at-most-one authoritative enqueue per consumed request and no cross-kind/fence/incarnation/project/
+  adapter/provider/model/account/tenant/endpoint reuse;
+- zero protected effects without a fresh effect decision;
+- head changes invalidate unconsumed requests, while admitted operations remain admitted; overflow denies;
 - fail-closed unknown fields/old peers and stable operation identifiers;
 - new provider context after authoritative guidance changes;
 - execution-time scheduler, bus, and approval checks;
 - containment bypass tests for every claimed boundary;
 - display-name rebinding changes no ownership;
-- offline stale capsules cause zero strict-current dispatch;
+- offline stale capsules cause zero decision-current admission;
 - assurance is emitted capability-by-capability, never as one enabled flag.
 
 ## 21. Formal gate
 
 The next research artifact should be three TLA+/PlusCal modules [C-190]:
 
-- **A — authority and carrier:** trust, releases, high-water rollback, equivocation, moves, and forks;
+- **A — authority and carrier:** independent project/fleet trust, releases, high-water rollback,
+  equivocation, moves, and intentional new-identity forks;
 - **B — runtime authorization:** activation, admission, effects, grants, restart fences, generation changes,
   and compaction;
 - **C — agent lifecycle and privacy:** identity/name separation, scoped principals, trials, promotion,
   quarantine, and erasure.
 
 The gate requires safety properties plus conditional liveness under explicit availability/fairness
-assumptions. Lamport’s separation of safety and liveness motivates the structure but proves nothing about
-this Candidate [C-191].
+assumptions, and retained model-check artifacts before any ratification proposal. Lamport’s separation of
+safety and liveness motivates the structure but proves nothing about this Candidate [C-191].
 
 Implementation remains **HOLD** until canonical encoding/schema, trust bootstrap/recovery, carrier profiles,
 formal model/model-check artifacts, cross-implementation vectors, a closed effect registry/canonicalizers,
 atomic guarded dispatch, exact adapter capacity tests, OS containment, output-release rules, authority
 epochs/high-water/nonces, stable `AgentId` bindings, and auxiliary-inference inventory are resolved [C-192].
+
+## 22. Closed Custom and applicability candidate
+
+One v0 Custom is one immutable `NormBody`, not a multi-clause bundle [C-200]:
+
+- **Guard** — forbids or constrains; never positively Allows. Positive authority comes from SessionGrant or
+  capability-grant state.
+- **Requirement** — typed all-of evidence; approvals are bound typed evidence.
+- **Guidance** — mandatory semantic content without machine-obedience assurance.
+- **Evaluation** — empirical evidence only and never authority.
+
+Authorship, observations, and rationale are provenance, not applicability or authority. Applicability uses
+closed registered selectors over a canonical authenticated `FactSnapshot` with issuer, provenance, and
+freshness. Evaluation is three-valued. Any security-relevant Unknown—including Guidance applicability—
+denies projection until the fact exists; unknown scoped guidance is not injected. Evaluation may remain
+unknown but cannot authorize [C-201, C-202].
+
+Ordering exists only for canonical serialization and diagnostics; authority composition is monotone
+narrowing. Different content in one declared exclusive guidance slot is a fatal conflict. Arbitrary
+semantic contradiction across distinct guidance remains empirical/Open [C-203].
+
+## 23. Threat profiles and achievable claim
+
+Claims separately name base crash/restart, rollback/clone resistance, or Byzantine signer/equivocation
+profiles [C-210]. Local nonce sets, fences, high-water, and VM state do not survive an exact clone or
+rollback. Strong anti-clone requires an external non-rollback authoritative ledger/gateway, hardware
+fencing, quorum/consensus, destination deduplication, or sole channel ownership. The base claim is
+**at-most-one authoritative enqueue**, never universal exactly-once provider computation/effect
+[C-211, C-212].
+
+Gateway timestamps are audit metadata unless a named trusted-time profile backs them. Security ordering uses
+authority epoch and sequence, not wall-clock time [C-213].
+
+## 24. Related work and working name
+
+Within the dated primary corpus inspected on 2026-07-29, no finalized specification was found combining the
+full Customs requirements. This is a bounded survey result, never a first/only/no-standard claim [C-220].
+The `.agent`/`.agents` directory proposal is the nearest project-carrier work in progress. Microsoft Agent
+Control Specification and Agent OS are enforcement neighbors. The individual AIP draft independently
+separates stable identifier, key material, and human-readable name. AuthZEN’s draft approval profile returns
+approval context to a fresh authorization re-evaluation rather than making approval itself authority
+[C-221–C-224].
+
+“Customs” also names a trade/border domain, and “PACS” is established medical-imaging terminology. Portable
+Agentic Customs / PACS is a working name only pending collision review [C-225].

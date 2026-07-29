@@ -41,11 +41,16 @@ Implementation status is **HOLD** pending the formal blockers in the decision le
 ## Reconciled v0 research shape
 
 The current v0 architecture is a **Candidate**, not a ratified standard or implementation authorization. Its
-minimal authorization machine has four typed targets: `PolicyImage`, `ActivationTarget`,
-`InferenceAdmissionTarget` / `RequestCharter`, and `EffectAuthorizationTarget`.
+minimal authorization machine has four typed decision views: policy basis/image binding, activation,
+inference admission/RequestCharter, and effect authorization. These are not four mandatory persisted
+objects; whether `PolicyImage` exists as a separate authoritative artifact remains Open.
 
-A generic request/receipt envelope is acceptable only as a closed discriminated union of those target
-kinds; authorization receipts are never interchangeable across kinds. Strict-current operation requires
-online, nonce-bound, single-use authorization at each controlled inference dispatch and protected effect.
-The construction, algebra, carrier, schemas, adapters, containment boundary, and formal proof artifacts
-remain Candidate or Open as indexed by the ledgers.
+A generic decision envelope is acceptable only as a closed discriminated union of those target kinds;
+decisions are never interchangeable across kinds and workers receive no reusable bearer receipt. The
+strongest profile is **decision-current admission**: a gateway that owns/proxies the actual transport
+atomically CAS-consumes the exact request, commits an audit record, and durably enqueues the send. Returning
+“allow” to a remote dispatcher is not atomic current admission. Later completion is admitted, not
+current-at-execution. The calculus, carrier, anti-clone claims, adapters, and proofs remain Candidate/Open.
+
+“Portable Agentic Customs” and “PACS” are working names only; both have material terminology/acronym
+collisions documented in the evidence ledger.

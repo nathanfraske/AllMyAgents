@@ -36,29 +36,41 @@ entry and provenance. Silence, apparent consensus, implementation, and model mem
 | D-024 | Vendor adapter | Empirical-only | No current vendor behavior is recorded as portable fact in this baseline. | Placeholder boundary; requires dated test artifacts before adding findings. |
 | D-030 | Project | Ratified | Implementation work is HOLD pending formal blockers. | Authorized manager brief, 2026-07-29. Documentation research may continue. |
 | D-031 | Normative | Open | Specify Charter applicability, ordering, precedence, conflict resolution, defaults, provenance, and error output. | D-003 ratifies the concept, not its algorithm. |
-| D-100 | Implementation profile | Candidate | Use four typed targets: PolicyImage, ActivationTarget, InferenceAdmissionTarget/RequestCharter, and EffectAuthorizationTarget. | Reconciled v0 proposal, 2026-07-29; not ratified. |
-| D-101 | Implementation profile | Candidate | A generic request/receipt is a closed activate/infer/effect union with non-interchangeable signed domains. | Formal model pending. |
+| D-100 | Implementation profile | Candidate | Use four typed decision views for policy binding, activation, inference admission/RequestCharter, and effect authorization. | Not four mandatory persisted objects; separate authoritative PolicyImage is an Open minimality/naming choice. |
+| D-101 | Implementation profile | Candidate | A generic decision is a closed activate/infer/effect union with non-interchangeable signed domains; workers receive durable outbox work, not reusable bearer receipts. | Formal model pending. |
 | D-102 | Normative | Candidate | FleetRef is irreducible; Kernel and exact SessionGrant ceilings are nonwaivable; agent trials only narrow. | Algebra proof pending. |
-| D-103 | Implementation profile | Candidate | Strict-current uses online nonce-bound single-use receipts and atomic verify-and-dispatch at each controlled inference and protected effect. | Current means authority head at receipt linearization. |
-| D-104 | Implementation profile | Candidate | Bounded-stability/offline lease is separately named and never claims strict-current. | Explicit availability/freshness tradeoff. |
-| D-105 | Normative | Candidate | v0 hard authorization uses default-deny typed meet: intersections, minima, unions, and sandbox OR only. | Unknown/invalid meet denies; arbitrary obligations Open. |
-| D-106 | Implementation profile | Candidate | Project identity is `(random ProjectId, GenesisDigest)`; local TrustPin binds that pair, while the portable chain is `ProjectGenesis → RootTransition* → AuthorityGrant(term) → Release* → CustomRevision refs`, with explicit forks and local high-water. | TrustPin is sidecar bootstrap state, not a portable chain object; schemas/encoding Open. |
+| D-103 | Implementation profile | Candidate | Decision-current admission requires an authoritative gateway owning/proxying transport and atomically CAS-consuming the exact request with audit plus durable outbox enqueue. | Returning allow to a later remote dispatcher is not atomic current admission. |
+| D-104 | Implementation profile | Candidate | Freshness profiles are decision-current admission, bounded-stability, and snapshot. | Only the first claims authority currentness at admission. |
+| D-105 | Normative | Candidate | v0 hard authorization uses default-deny relational capability tuples, registered risk/data lattices, minima, all-of typed evidence, audit-tag union, and sandbox OR. | Independent field intersections forbidden; unknown/invalid meet denies. |
+| D-106 | Implementation profile | Candidate | One linear Release head exists per `(ProjectId, GenesisDigest)`; transitions interleave and each Release binds authority term/root epoch. Competing heads quarantine; intentional fork mints a new identity. | No runtime fork identifier. Schemas/encoding Open. |
 | D-107 | Implementation profile | Candidate | Capsules carry a closed portable graph or profile-declared authenticated companion locator; mutable/private runtime state stays in sidecars. | No secrets, fences, reusable authority credentials in capsules. |
-| D-108 | Normative | Candidate | Agent trial/personal Customs narrow one stable AgentId only and require reviewed promotion to create a project Custom. | Imports inactive in quarantine; no silent sync/promotion. |
-| D-109 | Normative | Candidate | Report Carrier, Delivery, Declared Effect, Contained Effect, and empirical-only Semantic Assurance separately, with orthogonal freshness. | Prohibits one “Customs enabled” claim. |
+| D-108 | Normative | Candidate | Personal/trial Customs cannot expand reference-monitor authority, mutate higher governance, or enter another AgentId’s Charter; trials require isolation/consent and promotion creates a project-owned Custom. | They may steer security-relevant choices; authorship never activates. |
+| D-109 | Normative | Candidate | Report an independent capability matrix for Carrier, Projection, Delivery, EffectAuthorization, EffectContainment, OutputRelease, and SemanticEvaluation, with Enforced/Detected/Empirical/Unsupported cells. | Freshness/threat profiles orthogonal; no tier implication or aggregate enabled claim. |
 | D-110 | Normative | Open | Close and canonicalize protected-effect registry and output-release rule. | Required for containment claims. |
-| D-111 | Implementation profile | Open | Specify atomic guarded dispatcher, authority epoch/head/nonces, durable high-water, and crash semantics. | Required for strict-current/replay safety. |
+| D-111 | Implementation profile | Open | Specify authoritative CAS-consume plus audit/outbox transaction, authority epoch/head, durable high-water, and crash semantics. | Required for decision-current admission; no reusable bearer receipt. |
 | D-112 | Vendor adapter | Open | Prove exact admission/effect capacity per adapter, including auxiliary/hidden inference and provider-context rotation. | Ambient behavior cannot be presumed mediated. |
 | D-113 | Implementation profile | Open | Establish OS/container containment and broker filesystem/process/network/Git/secrets/browser paths. | Requires bypass evidence. |
 | D-114 | Formal | Open | Produce/model-check TLA+/PlusCal modules A (authority/carrier), B (runtime authorization), and C (agent lifecycle/privacy). | Safety plus conditional liveness. |
 | D-115 | Normative | Rejected | Claim every physical vendor inference was admitted or hidden retry/compaction carried the Charter. | Uncontrolled vendor paths exceed assurance. |
-| D-116 | Normative | Rejected | Claim model obedience, retroactive cancellation/retraction, strict-current availability during partition, or universal exactly-once effects. | Exceeds enforceability or physical reversibility. |
+| D-116 | Normative | Rejected | Claim model obedience, retroactive cancellation/retraction, decision-current admission availability during partition, or universal exactly-once effects. | Exceeds enforceability or physical reversibility. |
 | D-117 | Implementation profile | Open | Define witness/transparency handling for signer equivocation and split views. | Content addressing alone is insufficient. |
 | D-118 | Normative | Open | Define exact approval target, lifetime, consumption, delegation, and ambiguity-denial semantics. | Prevent approval replay/confusion. |
+| D-119 | Normative | Candidate | `output.release` is a typed Effect; strong profile buffers final output for fresh release authorization, while streaming is weaker and irreversible. | Exact output rule remains Open. |
+| D-120 | Implementation profile | Candidate | `ProjectTrustPin` and `FleetTrustAnchor` are independent local bindings; a project neither selects FleetRef nor self-authenticates. | Projects can move across fleets. |
+| D-121 | Normative | Candidate | Separate vendor-neutral SemanticCharter from adapter CharterRendering/VendorRequestManifest and bind both plus the complete observable provider envelope. | Renderer/envelope canonicalizers Open. |
+| D-122 | Normative | Candidate | One Custom is one immutable NormBody in the closed Guard/Requirement/Guidance/Evaluation union. | Guard cannot positively Allow; Evaluation never authorizes. |
+| D-123 | Normative | Candidate | Applicability evaluates closed selectors over authenticated FactSnapshot with three-valued logic; security-relevant Unknown denies, including Guidance applicability. | Unknown Evaluation may remain non-authorizing. |
+| D-124 | Normative | Candidate | Identity authority resolves AgentId through session binding and private project-principal map; missing/ambiguous map, name, and self-claim fail closed. | Self-adoption needs granted capability plus non-widening check. |
+| D-125 | Assurance | Candidate | Threat profiles separately state crash/restart, rollback/clone resistance, and Byzantine signer/equivocation. | Local state alone cannot resist exact clone/rollback. |
+| D-126 | Assurance | Candidate | Base dispatch claim is at-most-one authoritative enqueue. | Never universal exactly-once provider computation/effect. |
+| D-127 | Research | Open | Portable Agentic Customs/PACS is a working name pending trade-domain and medical-acronym collision review. | No naming ratification. |
+| D-128 | Implementation profile | Candidate | Compile deviation-free PolicyBasis; bind DeviationGrants to its digest and exact rule/scope/expiry/authority/compensation; then bind accepted refs into the final policy tuple. | Tuple may be named/materialized PolicyImage; prevents self-reference; exact schema Open. |
+| D-129 | Normative | Candidate | Security ordering uses authority epoch/sequence; gateway time is audit metadata unless a named trusted-time profile applies. | Trusted-time profile remains Open. |
 
 ## Formal unblock gate
 
 Implementation remains on HOLD until the authorized governance process identifies a bounded implementable
 profile and, at minimum, closes or explicitly defers D-011 through D-020, D-031, D-110 through D-114,
 D-117, and D-118 with stated conformance consequences. A prototype cannot close these decisions merely by
-choosing defaults.
+choosing defaults. Currentness, anti-clone resistance, carrier profiles, calculus, agent lifecycle, and
+adapter guarantees remain Candidate/Open; model-check artifacts are required before ratification.
