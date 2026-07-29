@@ -1,6 +1,6 @@
 // One-time COLD entry into worker mode on a live install.
 //
-//   node scripts/relaunch-worker.mjs [--delay-ms 45000]
+//   node scripts/relaunch-worker.mjs --data-dir C:\absolute\operator\data [--delay-ms 45000]
 //
 // Worker mode is entered when hubctl STARTS — a running hub cannot grow a worker — so the very first
 // launch after enabling it must be a cold restart. This script performs that restart *from outside the
@@ -20,17 +20,28 @@ import fs from 'node:fs'
 import path from 'node:path'
 import http from 'node:http'
 import { fileURLToPath } from 'node:url'
+import {
+  buildRelaunchEnv,
+  resolveRelaunchDataRoot,
+  validateExistingRelaunchRoot,
+} from './relaunch-worker-config.mjs'
 
 const REPO = path.resolve(fileURLToPath(import.meta.url), '..', '..')
 const HUB = path.join(REPO, 'apps', 'hub')
-const DATA = path.join(REPO, 'data')
+let DATA
+try {
+  DATA = resolveRelaunchDataRoot({ argv: process.argv.slice(2), env: process.env })
+  validateExistingRelaunchRoot(DATA)
+} catch (error) {
+  process.stderr.write(`[relaunch-worker] ${error instanceof Error ? error.message : String(error)}\n`)
+  process.exit(78)
+}
 const LOG = path.join(DATA, 'relaunch.log')
 const STATUS = path.join(DATA, 'relaunch-status.json')
 const PORT = 7777
 const argDelay = process.argv.indexOf('--delay-ms')
 const DELAY_MS = argDelay > -1 ? Number(process.argv[argDelay + 1]) : 45000
 
-fs.mkdirSync(DATA, { recursive: true })
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 function log(msg) {
   const line = `[${new Date().toISOString()}] ${msg}\n`
@@ -95,11 +106,13 @@ async function waitForHealthy(ms = 120000) {
   return null
 }
 
-function launch(withWorker) {
-  const env = { ...process.env }
-  for (const k of ['HUB_SUPERVISED', 'HUB_PORT', 'HUB_WORKER_SOCKET', 'HUB_DATA_DIR', 'HUB_FIXED_PORT', 'HUB_PROFILES_DIR', 'HUB_RESTART_MAX_DEFER_MS']) delete env[k]
-  if (withWorker) env.HUB_WORKER = '1'
-  else delete env.HUB_WORKER
+function launch(withWorker, expectedRestoredSessions) {
+  const env = buildRelaunchEnv({
+    baseEnv: process.env,
+    dataDir: DATA,
+    withWorker,
+    expectedRestoredSessions,
+  })
   const out = fs.openSync(path.join(DATA, withWorker ? 'hubctl-worker.log' : 'hubctl-fallback.log'), 'a')
   const child = spawn(process.execPath, ['--import', 'tsx/esm', 'src/hubctl.ts'], {
     cwd: HUB,
@@ -118,6 +131,12 @@ try {
 
   const before = await health()
   log(`live hub before: ${JSON.stringify(before)}`)
+  const expectedRestoredSessions =
+    typeof before?.restoredSessions === 'number' &&
+    Number.isSafeInteger(before.restoredSessions) &&
+    before.restoredSessions >= 0
+      ? before.restoredSessions
+      : 0
   const pids = hubTreePids()
   log(`killing hub tree: ${pids.join(', ') || '(none found)'}`)
   for (const pid of pids) {
@@ -128,7 +147,7 @@ try {
   log(`port ${PORT} free: ${freed}`)
   await sleep(1500) // let the old worker's named pipe close before the new one claims it
 
-  const pid = launch(true)
+  const pid = launch(true, expectedRestoredSessions)
   log(`relaunched hubctl WITH worker mode (pid ${pid})`)
   const h = await waitForHealthy()
   const pipe = workerPipeUp()
@@ -145,7 +164,7 @@ try {
     for (const p of hubTreePids()) spawnSync('taskkill', ['/PID', String(p), '/T', '/F'])
     await waitForPortFree()
     await sleep(1500)
-    const fbPid = launch(false)
+    const fbPid = launch(false, expectedRestoredSessions)
     const fb = await waitForHealthy()
     log(`fallback hubctl (pid ${fbPid}) health: ${JSON.stringify(fb)}`)
     verdict.ok = !!fb

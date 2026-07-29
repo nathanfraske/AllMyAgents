@@ -265,7 +265,15 @@ fn spawn_hub_dev(browser_secret: &str, browser_address: &str) -> Option<Child> {
         cmd.env("HUB_FIXED_PORT", port);
     }
     if let Ok(data_dir) = std::env::var("AMA_HUB_DATA_DIR") {
-        cmd.env("HUB_DATA_DIR", data_dir);
+        let data_dir = PathBuf::from(data_dir);
+        let expectation = if data_dir.is_dir() {
+            DataRootExpectation::Existing
+        } else {
+            DataRootExpectation::FirstRun
+        };
+        cmd.env("HUB_DATA_DIR", plain(&data_dir));
+        cmd.env("HUB_DATA_ROOT_EXPECTATION", expectation.as_env());
+        cmd.env("HUB_EXPECTED_RESTORED_SESSIONS", "0");
     }
     cmd.env("AMA_DESKTOP_BROWSER_SECRET", browser_secret);
     cmd.env("AMA_DESKTOP_BROWSER_ADDR", browser_address);
@@ -452,27 +460,69 @@ fn hub_device_token(app: AppHandle) -> Result<String, String> {
     ))
 }
 
-/// First-run materialization of the app-data layout: create
-/// `<app_data_root>/data` and `<app_data_root>/profiles` and hand back the pair to
-/// pass to the hub as `HUB_DATA_DIR` / `HUB_PROFILES_DIR` (apps/hub/src/index.ts).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DataRootExpectation {
+    FirstRun,
+    Existing,
+}
+
+impl DataRootExpectation {
+    fn as_env(self) -> &'static str {
+        match self {
+            Self::FirstRun => "first-run",
+            Self::Existing => "existing",
+        }
+    }
+}
+
+/// Materialize an already-resolved app-data root and preserve whether `data/` existed BEFORE this call.
 ///
-/// Both are created EMPTY. The bundle ships no profile and therefore no
-/// credential (scripts/bundle-hub.mjs enforces that); the operator's first login
-/// in the app creates `profiles/<id>` here, on their own machine.
+/// That distinction is the installed hub's fail-loud contract: only an actually absent directory gets one
+/// explicit first-run expectation. Once `data/` exists, a missing hub.db is an error for the Node preflight,
+/// never permission to silently create another production journal.
+fn materialize_app_data_at(
+    root: &Path,
+) -> std::io::Result<(PathBuf, PathBuf, DataRootExpectation)> {
+    let data = root.join("data");
+    let profiles = root.join("profiles");
+    let expectation = match fs::metadata(&data) {
+        Ok(metadata) if metadata.is_dir() => DataRootExpectation::Existing,
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("the app-data path is not a directory: {}", data.display()),
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DataRootExpectation::FirstRun,
+        Err(error) => return Err(error),
+    };
+    fs::create_dir_all(&data)?;
+    fs::create_dir_all(&profiles)?;
+    Ok((data, profiles, expectation))
+}
+
+/// First-run materialization of the app-data layout: create
+/// `<app_data_root>/data` and `<app_data_root>/profiles` and hand back the paths plus their pre-existing
+/// expectation to pass to the hub (apps/hub/src/index.ts).
+///
+/// On first run both are created empty. The bundle ships no profile and therefore no credential
+/// (scripts/bundle-hub.mjs enforces that); the operator's first login in the app creates
+/// `profiles/<id>` here, on their own machine. Existing directories are never emptied.
 ///
 /// Passing the vars explicitly — instead of relying on the hub's "three levels up
 /// from dist/" derivation — is the whole point: it pins the installed app's data
 /// to a per-user location that is never the repo and never the (read-only,
 /// Program Files) install dir, whatever the process cwd happens to be.
-fn materialize_app_data(app: &AppHandle) -> std::io::Result<(PathBuf, PathBuf)> {
+fn materialize_app_data(
+    app: &AppHandle,
+) -> std::io::Result<(PathBuf, PathBuf, DataRootExpectation)> {
     let root = app_data_root(app).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "could not resolve the per-user app-data directory")
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "could not resolve the per-user app-data directory",
+        )
     })?;
-    let data = root.join("data");
-    let profiles = root.join("profiles");
-    fs::create_dir_all(&data)?;
-    fs::create_dir_all(&profiles)?;
-    Ok((data, profiles))
+    materialize_app_data_at(&root)
 }
 
 /// The install marker: present + matching the shipped manifest ⇒ deps are ready.
@@ -1148,8 +1198,8 @@ fn release_boot(
 
     // First-run app-data materialization: journal/config/worktrees + managed
     // profiles go to the per-user app-data root, NEVER the repo or the install dir.
-    let (hub_data_dir, hub_profiles_dir) = match materialize_app_data(&app) {
-        Ok(pair) => pair,
+    let (hub_data_dir, hub_profiles_dir, data_root_expectation) = match materialize_app_data(&app) {
+        Ok(layout) => layout,
         Err(e) => {
             boot_error(
                 &app,
@@ -1160,9 +1210,10 @@ fn release_boot(
         }
     };
     logln(&format!(
-        "[desktop] app data: HUB_DATA_DIR={} HUB_PROFILES_DIR={}",
+        "[desktop] app data: HUB_DATA_DIR={} HUB_PROFILES_DIR={} expectation={}",
         hub_data_dir.display(),
-        hub_profiles_dir.display()
+        hub_profiles_dir.display(),
+        data_root_expectation.as_env()
     ));
 
     // Spawn the hub with the bundled Node. PATH carries the hub's own .bin (so the
@@ -1179,8 +1230,10 @@ fn release_boot(
         .env("HUB_WORKER", hub_worker_flag()) // live turns survive a hub restart (see hub_worker_flag)
         // hubctl forwards its whole env to every hub it supervises (blue AND green),
         // so setting these here pins the data + profile roots across restarts too.
-        .env("HUB_DATA_DIR", &hub_data_dir)
-        .env("HUB_PROFILES_DIR", &hub_profiles_dir)
+        .env("HUB_DATA_DIR", plain(&hub_data_dir))
+        .env("HUB_PROFILES_DIR", plain(&hub_profiles_dir))
+        .env("HUB_DATA_ROOT_EXPECTATION", data_root_expectation.as_env())
+        .env("HUB_EXPECTED_RESTORED_SESSIONS", "0")
         .env("AMA_DESKTOP_BROWSER_SECRET", &browser_secret)
         .env("AMA_DESKTOP_BROWSER_ADDR", &browser_address);
     set_own_group(&mut cmd); // POSIX: own process group so kill_hub can group-signal the whole tree
@@ -1849,6 +1902,64 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod data_root_tests {
+    use super::*;
+
+    fn isolated_root(label: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "allmyagents-data-root-{label}-{}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn only_an_absent_data_directory_is_classified_as_first_run() {
+        let root = isolated_root("first-run");
+        let (data, profiles, expectation) =
+            materialize_app_data_at(&root).expect("materialize isolated first run");
+
+        assert_eq!(expectation, DataRootExpectation::FirstRun);
+        assert!(data.is_dir());
+        assert!(profiles.is_dir());
+
+        fs::remove_dir_all(root).expect("remove isolated first-run fixture");
+    }
+
+    #[test]
+    fn a_preexisting_empty_data_directory_is_existing_not_a_second_first_run() {
+        let root = isolated_root("existing");
+        let data = root.join("data");
+        fs::create_dir_all(&data).expect("create isolated existing data root");
+
+        let (_, _, expectation) =
+            materialize_app_data_at(&root).expect("materialize isolated existing root");
+
+        assert_eq!(expectation, DataRootExpectation::Existing);
+        assert!(!data.join("hub.db").exists());
+
+        fs::remove_dir_all(root).expect("remove isolated existing fixture");
+    }
+
+    #[test]
+    fn node_environment_paths_are_plain_consistently_with_script_and_cwd_paths() {
+        assert_eq!(
+            plain(Path::new(
+                r"\\?\C:\Users\tester\AppData\Roaming\AllMyAgents\data"
+            )),
+            PathBuf::from(r"C:\Users\tester\AppData\Roaming\AllMyAgents\data")
+        );
+        assert_eq!(
+            plain(Path::new(r"\\?\UNC\server\share\AllMyAgents\data")),
+            PathBuf::from(r"\\server\share\AllMyAgents\data")
+        );
+    }
 }
 
 #[cfg(test)]

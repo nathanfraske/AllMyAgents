@@ -24,6 +24,16 @@ function validJournal(dataDir: string, userVersion = 0): string {
   return journalPath
 }
 
+function addPersistedSessions(journalPath: string, count: number): void {
+  const db = new Database(journalPath)
+  db.exec('CREATE TABLE sessions (id TEXT PRIMARY KEY, record TEXT NOT NULL, updated TEXT NOT NULL)')
+  const insert = db.prepare('INSERT INTO sessions (id, record, updated) VALUES (?, ?, ?)')
+  for (let i = 0; i < count; i++) {
+    insert.run(`session-${i}`, JSON.stringify({ id: `session-${i}` }), new Date(i).toISOString())
+  }
+  db.close()
+}
+
 afterEach(() => {
   vi.restoreAllMocks()
   for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true })
@@ -114,6 +124,103 @@ describe('hub preflight', () => {
     expect(result.ok).toBe(true)
     expect(result.checks).toContainEqual(
       expect.objectContaining({ name: 'database-integrity', status: 'passed', detail: 'ok' })
+    )
+  })
+
+  it('does not create a data directory when an expected existing root is missing', () => {
+    const parent = tempDataDir()
+    const dataDir = path.join(parent, 'missing-data')
+    const journalPath = path.join(dataDir, 'hub.db')
+
+    const result = runHubPreflight({
+      dataDir,
+      journalPath,
+      schemaVersion: SCHEMA_VERSION,
+      dataRootExpectation: 'existing',
+      expectedRestoredSessions: 0,
+    })
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.failure.code).toBe('expected-data-root-missing')
+    expect(fs.existsSync(dataDir)).toBe(false)
+  })
+
+  it('does not create hub.db when an expected existing journal is missing', () => {
+    const dataDir = tempDataDir()
+    const journalPath = path.join(dataDir, 'hub.db')
+
+    const result = runHubPreflight({
+      dataDir,
+      journalPath,
+      schemaVersion: SCHEMA_VERSION,
+      dataRootExpectation: 'existing',
+      expectedRestoredSessions: 0,
+    })
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.failure.code).toBe('expected-journal-missing')
+    expect(fs.existsSync(journalPath)).toBe(false)
+  })
+
+  it('allows an explicit first run with expectation zero to create the data root', () => {
+    const parent = tempDataDir()
+    const dataDir = path.join(parent, 'new-data')
+    const journalPath = path.join(dataDir, 'hub.db')
+
+    const result = runHubPreflight({
+      dataDir,
+      journalPath,
+      schemaVersion: SCHEMA_VERSION,
+      dataRootExpectation: 'first-run',
+      expectedRestoredSessions: 0,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(fs.existsSync(dataDir)).toBe(true)
+    expect(fs.existsSync(journalPath)).toBe(false)
+  })
+
+  it('fails read-only when a positive expected roster floor finds zero persisted sessions', () => {
+    const dataDir = tempDataDir()
+    const journalPath = validJournal(dataDir, SCHEMA_VERSION)
+    addPersistedSessions(journalPath, 0)
+    const before = fs.readFileSync(journalPath)
+    const openSpy = vi.spyOn(fs, 'openSync')
+
+    const result = runHubPreflight({
+      dataDir,
+      journalPath,
+      schemaVersion: SCHEMA_VERSION,
+      dataRootExpectation: 'existing',
+      expectedRestoredSessions: 4,
+    })
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.failure).toMatchObject({ code: 'restored-session-floor-missed' })
+    expect(result.failure.message).toMatch(/expected at least 4|zero persisted sessions/i)
+    expect(fs.readFileSync(journalPath)).toEqual(before)
+    expect(openSpy.mock.calls.some(([, flags]) => flags === 'wx')).toBe(false)
+  })
+
+  it('accepts an existing journal whose persisted roster satisfies a positive floor', () => {
+    const dataDir = tempDataDir()
+    const journalPath = validJournal(dataDir, SCHEMA_VERSION)
+    addPersistedSessions(journalPath, 3)
+
+    const result = runHubPreflight({
+      dataDir,
+      journalPath,
+      schemaVersion: SCHEMA_VERSION,
+      dataRootExpectation: 'existing',
+      expectedRestoredSessions: 3,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(result.checks).toContainEqual(
+      expect.objectContaining({ name: 'restored-session-floor', status: 'passed' })
     )
   })
 })
