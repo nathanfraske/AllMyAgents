@@ -56,6 +56,21 @@ export interface SnapshotResult {
   error?: string
 }
 
+export type JournalSnapshotTask = (
+  db: Database.Database,
+  options: JournalBackupOptions
+) => Promise<SnapshotResult>
+
+export interface JournalBackupSupervisor {
+  /**
+   * Declare that the HTTP server has bound and announced readiness. Idempotent; no backup work or timer
+   * exists before this call.
+   */
+  serverReady(): void
+  /** Stop future work and wait for the one supervised snapshot, if any, to settle. */
+  stop(): Promise<void>
+}
+
 /** Take ONE verified snapshot. Exported so an operator action and the timer share a single code path. */
 export async function snapshotJournal(
   db: Database.Database,
@@ -67,6 +82,18 @@ export async function snapshotJournal(
 
   const stamp = now().toISOString().replace(/[:.]/g, '-')
   const target = path.join(options.dir, `${PREFIX}${stamp}${SUFFIX}`)
+  let sourceHadEvents = false
+  if (!options.verify) {
+    try {
+      // Capture the weakest useful source invariant before the online backup starts. An empty source is
+      // legitimate; a source that already has history must not turn into a schema-only snapshot.
+      sourceHadEvents = hasAnyEvents(db)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      log(`[journal-backup] snapshot FAILED source validation: ${message}`)
+      return { ok: false, error: message }
+    }
+  }
 
   try {
     // Online backup: consistent even while the hub is mid-turn.
@@ -82,8 +109,8 @@ export async function snapshotJournal(
     return { ok: false, error: message }
   }
 
-  const verify = options.verify ?? defaultVerify
-  if (!verify(target)) {
+  const verified = options.verify ? options.verify(target) : defaultVerify(target, sourceHadEvents)
+  if (!verified) {
     // A snapshot that does not pass its own integrity check is worse than none: it would sit there
     // looking like insurance. Remove it and say so loudly.
     log(`[journal-backup] snapshot at ${target} FAILED verification and was discarded — the live journal may already be damaged`)
@@ -101,7 +128,14 @@ export async function snapshotJournal(
   return { ok: true, file: target, bytes }
 }
 
-function defaultVerify(file: string): boolean {
+function hasAnyEvents(db: Pick<Database.Database, 'prepare'>): boolean {
+  const row = db
+    .prepare('SELECT EXISTS(SELECT 1 FROM events LIMIT 1) AS hasEvents')
+    .get() as { hasEvents?: unknown } | undefined
+  return row?.hasEvents === 1
+}
+
+function defaultVerify(file: string, sourceHadEvents: boolean): boolean {
   // Required lazily so this module stays importable in environments without the native addon (tests that
   // only exercise rotation, for instance).
   const Database = require('better-sqlite3') as typeof import('better-sqlite3')
@@ -111,10 +145,11 @@ function defaultVerify(file: string): boolean {
     const rows = db.pragma('quick_check') as Array<Record<string, unknown>>
     const findings = rows.flatMap((row) => Object.values(row).map(String))
     if (findings.length !== 1 || findings[0]?.toLowerCase() !== 'ok') return false
-    // Presence of the events table matters as much as structural integrity: a schema-only file passes
-    // quick_check happily, and a schema-only file is exactly what a truncation looks like.
-    db.prepare('SELECT COUNT(*) AS n FROM events').get()
-    return true
+    // Querying the table proves it exists. Requiring a row only when the source already had one rejects
+    // the truncation shape without falsely rejecting a brand-new, legitimately empty journal. EXISTS also
+    // avoids a full COUNT(*) scan of a hundreds-of-megabytes journal.
+    const snapshotHasEvents = hasAnyEvents(db)
+    return !sourceHadEvents || snapshotHasEvents
   } catch {
     return false
   } finally {
@@ -149,24 +184,71 @@ function rotate(dir: string, keep: number, log: (m: string) => void): void {
   }
 }
 
-/** Start periodic snapshots. Returns a stop function. The timer is unref'd so it never holds the hub open. */
-export function startJournalBackups(db: Database.Database, options: JournalBackupOptions): () => void {
+/**
+ * Supervise initial + periodic backups without putting journal IO on the startup critical path.
+ *
+ * `serverReady()` is the lifecycle gate: it schedules the initial snapshot for the next event-loop turn,
+ * after the listening callback and readiness announcement have returned. Each completion schedules the
+ * next interval, so a slow snapshot can never overlap another generation. Timers are unref'd so they do
+ * not hold the hub open; `stop()` clears pending work and joins the single in-flight promise.
+ */
+export function createJournalBackupSupervisor(
+  db: Database.Database,
+  options: JournalBackupOptions,
+  takeSnapshot: JournalSnapshotTask = snapshotJournal
+): JournalBackupSupervisor {
   const intervalMs = options.intervalMs ?? DEFAULT_INTERVAL_MS
   const log = options.log ?? (() => {})
+  let ready = false
   let stopped = false
+  let initialTask: NodeJS.Immediate | undefined
+  let periodicTimer: NodeJS.Timeout | undefined
+  let inFlight: Promise<void> | undefined
 
-  // One snapshot promptly after boot. If the hub is about to be killed — by an update, a supervisor, or a
-  // forced reboot — the most valuable copy is the one taken before that happens, not thirty minutes in.
-  void snapshotJournal(db, options).catch((e: unknown) => log(`[journal-backup] initial snapshot failed: ${String(e)}`))
-
-  const timer = setInterval(() => {
+  const schedulePeriodic = (): void => {
     if (stopped) return
-    void snapshotJournal(db, options).catch((e: unknown) => log(`[journal-backup] snapshot failed: ${String(e)}`))
-  }, intervalMs)
-  timer.unref?.()
+    periodicTimer = setTimeout(() => {
+      periodicTimer = undefined
+      launch('snapshot')
+    }, intervalMs)
+    periodicTimer.unref?.()
+  }
 
-  return () => {
-    stopped = true
-    clearInterval(timer)
+  const launch = (label: 'initial snapshot' | 'snapshot'): void => {
+    if (stopped || inFlight) return
+    const task = Promise.resolve()
+      .then(() => takeSnapshot(db, options))
+      .then(() => undefined)
+      .catch((error: unknown) => {
+        log(`[journal-backup] ${label} failed: ${String(error)}`)
+      })
+      .finally(() => {
+        if (inFlight === task) inFlight = undefined
+        schedulePeriodic()
+      })
+    inFlight = task
+  }
+
+  return {
+    serverReady(): void {
+      if (ready || stopped) return
+      ready = true
+      // One snapshot promptly after readiness. setImmediate is a lifecycle yield, not a time guess: the
+      // server's listening callback (including its supervisor-ready IPC) completes before backup IO begins.
+      initialTask = setImmediate(() => {
+        initialTask = undefined
+        launch('initial snapshot')
+      })
+      initialTask.unref?.()
+    },
+    async stop(): Promise<void> {
+      stopped = true
+      if (initialTask) clearImmediate(initialTask)
+      initialTask = undefined
+      if (periodicTimer) clearTimeout(periodicTimer)
+      periodicTimer = undefined
+      const active = inFlight
+      if (active) await active
+    },
   }
 }

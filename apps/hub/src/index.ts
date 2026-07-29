@@ -16,7 +16,7 @@ import {
 import { ProjectStore } from './projects.js'
 import { profileAuthEvidence, scanProfiles, setClaudeConnectorPolicy } from './profiles.js'
 import { ProfileOwnership } from './profileOwnership.js'
-import { startJournalBackups } from './journalBackup.js'
+import { createJournalBackupSupervisor } from './journalBackup.js'
 import { SessionManager } from './sessions.js'
 import { SessionStore } from './store.js'
 import { startServer } from './server.js'
@@ -150,17 +150,19 @@ journal.setMaxListeners(64)
 // snapshot on boot and every 30 minutes, each one integrity-checked before it is kept, six generations
 // retained so one bad snapshot cannot erase the safety net.
 //
-// Deliberately started BEFORE sessions restore and before the server listens. If this hub is about to be
-// killed by an update, a supervisor, or a forced reboot, the snapshot worth having is the one taken
-// before any of that — not the one scheduled for later.
+// The supervisor is constructed here but does NO work until the server's listening callback declares
+// readiness below. A large initial snapshot must never sit on the port-bind/readiness critical path.
 //
 // SUPERVISED HUBS ONLY TAKE ONE SET. During a blue-green flip two hubs briefly share this database; both
 // snapshotting would double the IO for no benefit, and green is the one that will survive.
 const journalBackupsDir = path.join(dataDir, 'backups')
-const stopJournalBackups = startJournalBackups(journal.db, {
+const journalBackups = createJournalBackupSupervisor(journal.db, {
   dir: journalBackupsDir,
   log: (message) => console.log(message),
 })
+// RestartController.retire() exits directly rather than going through shutdown(); synchronously clear any
+// queued timer there too. The normal signal path below additionally awaits an in-flight generation.
+process.once('exit', () => void journalBackups.stop())
 const store = new SessionStore(journal.db)
 const profiles = scanProfiles(profilesDir)
 const profileOwnership = new ProfileOwnership({
@@ -534,6 +536,9 @@ server.once('listening', () => {
   if (supervised && process.send) {
     process.send({ type: 'ready', port: actualPort, restored: sessions.list().length, schemaVersion: SCHEMA_VERSION })
   }
+  // This call only queues the initial snapshot for the next event-loop turn. The listener is bound and
+  // the supervisor-ready message is already dispatched before any backup or verification work can begin.
+  journalBackups.serverReady()
   // Blue / standalone own the port at boot → advertise now. Green defers mesh to promote.
   if (!isGreen) {
     registerMesh()
@@ -601,8 +606,7 @@ function shutdown(signal: string): void {
   // race the guard above; sessions.shutdown() dispatches the codex kills synchronously so they
   // land even if the guard fires first.
   mesh.stopAutoRegister()
-  stopJournalBackups()
-  void Promise.allSettled([mesh.deregister(), sessions.shutdown()]).finally(() => {
+  void Promise.allSettled([journalBackups.stop(), mesh.deregister(), sessions.shutdown()]).finally(() => {
     if (!supervised) profileOwnership.releaseAll()
     clearTimeout(guard)
     console.log(`[hub] ${signal} — stopped`)
