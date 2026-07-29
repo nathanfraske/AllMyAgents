@@ -45,12 +45,14 @@ minimal authorization machine has four typed decision views: policy basis/image 
 inference admission/RequestCharter, and effect authorization. These are not four mandatory persisted
 objects; whether `PolicyImage` exists as a separate authoritative artifact remains Open.
 
-A generic decision envelope is acceptable only as a closed discriminated union of those target kinds;
-decisions are never interchangeable across kinds and workers receive no reusable bearer receipt. The
-strongest profile is **decision-current admission**: a gateway that owns/proxies the actual transport
-atomically CAS-consumes the exact request, commits an audit record, and durably enqueues the send. Returning
-“allow” to a remote dispatcher is not atomic current admission. Later completion is admitted, not
-current-at-execution. The calculus, carrier, anti-clone claims, adapters, and proofs remain Candidate/Open.
+A generic `DecisionRequest` / non-authorizing `DecisionRecord` pair is acceptable only as a closed
+discriminated union; records are never interchangeable across kinds. The untrusted agent worker receives
+neither reusable authorization nor provider/effect transport authority. The strongest profile is
+**decision-current admission**: a gateway that owns/proxies the actual transport
+re-evaluates at dequeue/execution, atomically checks current policy/grant, CAS-consumes the exact attempt,
+records its non-authorizing DecisionRecord/audit, and transitions to immediate gateway-owned send. Queue
+entries are unauthorizing intent; delayed/recovered jobs re-evaluate. Later completion is admitted, not
+current-at-execution. The remaining claims and proofs remain Candidate/Open.
 
 “Portable Agentic Customs” and “PACS” are working names only; both have material terminology/acronym
 collisions documented in the evidence ledger.

@@ -7,10 +7,10 @@ standard releases.
 
 ### Corrected
 
-- Narrowed currentness to decision-current admission at authoritative CAS-consume plus atomic audit/outbox
-  commit; replaced reusable receipts with durable outbox work.
+- Narrowed currentness to gateway-owned dequeue-time re-evaluation plus atomic current-check/CAS/record/send;
+  queue entries are unauthorizing intent and reusable receipts are absent.
 - Separated crash/restart, rollback/clone, and Byzantine/equivocation threat profiles; limited the base claim
-  to at-most-one authoritative enqueue.
+  to at-most-one authoritative gateway send transition per exact attempt.
 - Made output release a typed Effect, removed runtime fork identity, separated project/fleet trust bootstrap,
   and distinguished SemanticCharter from adapter rendering and the complete provider envelope.
 - Replaced independent capability-field intersections with relational tuples and registered lattices; made
@@ -25,6 +25,13 @@ standard releases.
 - Clarified that the authoritative gateway must own/proxy transport, the four targets are decision views
   rather than mandatory persisted objects, assurance is an orthogonal capability matrix, external generation
   is distinct from local SessionIncarnation, and wall-clock time is non-authoritative absent trusted time.
+- Corrected related work to the `.agents` WIP specification; renamed authorization artifacts to
+  non-authorizing DecisionRecords; restricted outbox/transport authority to the gateway dispatcher;
+  separated ordinary generation rotation from logical SessionIncarnation recreation; and removed
+  order-sensitive precedence in favor of commutative authority meet.
+- Made queued/outbox work unauthorizing intent: decision-current admission now re-evaluates at dequeue and
+  atomically records the current decision immediately before gateway-owned send; delayed/recovered jobs
+  re-evaluate and the formal gate includes queue-head-change/crash traces.
 
 ## 2026-07-29 — reconciled v0 Candidate architecture
 

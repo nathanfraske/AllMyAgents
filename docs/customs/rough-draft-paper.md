@@ -199,8 +199,9 @@ compilation. A DeviationGrant cannot bind a final PolicyImage digest that includ
 
 An `ActivationTarget` binds the final policy tuple to stable `AgentId`, provider/adapter, `enforcerId`,
 distinct `SessionIncarnation`, and authority-owned live Enforcer/Activation generation (`ActivationFence`).
-Restart creates a new incarnation and generation. A local incarnation/fence does not survive exact cloning;
-only external gateway single-live-channel/generation state can fence clones in a stronger profile [C-107].
+An enforcer/worker restart rotates the generation but preserves the logical SessionIncarnation. Only logical
+session recreation/resurrection mints a new incarnation. A local incarnation/fence does not survive exact
+cloning; only external gateway single-live-channel/generation state can fence clones [C-107].
 
 ### 12.3 InferenceAdmissionTarget and RequestCharter
 
@@ -218,18 +219,20 @@ adapter, origin inference, and stable operation identifier. `output.release` is 
 profile buffers final output and freshly authorizes release; streaming/chunk disclosure is weaker and
 irreversible. Scheduled work receives a fresh execution-time decision [C-111].
 
-A single `DecisionRequest` / `Receipt` envelope is Candidate only as a closed discriminated union of
-`activate | infer | effect`. The signed domain includes the kind and target-specific bindings, making
-decisions non-interchangeable across kind, fence, incarnation, project, adapter, provider, and model
-[C-112].
+A `DecisionRequest` and non-authorizing `DecisionRecord` are Candidate only as a closed discriminated union
+of `activate | infer | effect`. An audit receipt, if emitted, is explicitly non-authorizing. The signed
+domain includes kind and target-specific bindings, making records non-interchangeable across kind, fence,
+incarnation, project, adapter, provider, and model [C-112].
 
 ## 13. Freshness profiles
 
 **Decision-current admission** requires an authoritative guarded gateway that owns or proxies the actual
-provider/effect transport. It atomically CAS-consumes the exact request and commits an audit record plus
-durable outbox enqueue. Returning an allow decision to a remote enforcer that dispatches later is not atomic
-current admission. Workers receive outbox work, not reusable bearer capability. Currentness exists at that
-admission linearization; remote completion is only admitted [C-120–C-123].
+provider/effect transport. A durable queue/outbox entry is unauthorizing intent. At dequeue/execution the
+gateway re-evaluates, atomically checks current policy and grant, CAS-consumes the exact attempt/request,
+writes the DecisionRecord/audit, and transitions the job to immediate gateway-owned send. A delayed or
+recovered job re-evaluates; no cached allow survives. The untrusted agent worker receives neither reusable
+authorization nor provider/effect transport authority. Currentness exists at this local linearization;
+remote completion is only admitted [C-120–C-123].
 
 Other profiles are **bounded-stability** and **snapshot**. Neither claims decision-current admission.
 Authority changes cannot retroactively stop accepted remote work, retract disclosed output, or undo effects
@@ -237,9 +240,10 @@ Authority changes cannot retroactively stop accepted remote work, retract disclo
 
 ## 14. Candidate v0 precedence and obligation algebra
 
-Validation, freshness, and required-audit failures deny. Kernel and the exact `SessionGrant` ceilings are
-nonwaivable. Fleet applies before Project. Exact deviations can name only waivable Fleet or Project rules;
-agent trials can narrow only. The hard authorization result is intersection with default deny [C-130].
+Validation, freshness, and required-audit failures deny. Kernel and exact `SessionGrant` ceilings are
+nonwaivable. Fleet, Project, and agent constraints combine by commutative monotone meet; lower authority
+cannot waive a higher rule. Canonical scope order is diagnostics/serialization only. Exact governed
+DeviationGrants handle only their named waivable rules [C-130].
 
 | Field | Meet |
 |---|---|
@@ -345,8 +349,8 @@ The Candidate suite must demonstrate [C-181]:
 
 - zero adapter-dispatched provider calls observed at the named controlled boundary without a valid admission
   decision and exact final-envelope equality;
-- at-most-one authoritative enqueue per consumed request and no cross-kind/fence/incarnation/project/
-  adapter/provider/model/account/tenant/endpoint reuse;
+- at-most-one authoritative gateway send transition per exact attempt and no cross-kind/fence/incarnation/
+  project/adapter/provider/model/account/tenant/endpoint reuse;
 - zero protected effects without a fresh effect decision;
 - head changes invalidate unconsumed requests, while admitted operations remain admitted; overflow denies;
 - fail-closed unknown fields/old peers and stable operation identifiers;
@@ -403,7 +407,8 @@ Claims separately name base crash/restart, rollback/clone resistance, or Byzanti
 profiles [C-210]. Local nonce sets, fences, high-water, and VM state do not survive an exact clone or
 rollback. Strong anti-clone requires an external non-rollback authoritative ledger/gateway, hardware
 fencing, quorum/consensus, destination deduplication, or sole channel ownership. The base claim is
-**at-most-one authoritative enqueue**, never universal exactly-once provider computation/effect
+**at-most-one authoritative gateway send transition per exact attempt**, never universal exactly-once
+provider computation/effect
 [C-211, C-212].
 
 Gateway timestamps are audit metadata unless a named trusted-time profile backs them. Security ordering uses
@@ -413,8 +418,10 @@ authority epoch and sequence, not wall-clock time [C-213].
 
 Within the dated primary corpus inspected on 2026-07-29, no finalized specification was found combining the
 full Customs requirements. This is a bounded survey result, never a first/only/no-standard claim [C-220].
-The `.agent`/`.agents` directory proposal is the nearest project-carrier work in progress. Microsoft Agent
-Control Specification and Agent OS are enforcement neighbors. The individual AIP draft independently
+The `.agents Repository Folder Specification` is the nearest project-carrier work in progress: it defines
+canonical repository configuration and deterministic resolution but not authenticated freshness, AgentId
+lifecycle, or governed amendment activation. Microsoft Agent Control Specification and Agent OS are
+enforcement neighbors. The individual AIP draft independently
 separates stable identifier, key material, and human-readable name. AuthZEN’s draft approval profile returns
 approval context to a fresh authorization re-evaluation rather than making approval itself authority
 [C-221–C-224].
