@@ -3,6 +3,32 @@
 All notable stewardship changes are recorded here. This log records documentation history, not canonical
 standard releases.
 
+## 2026-07-29 — reconciled v0 Candidate architecture
+
+### Changed
+
+- Recorded the four-target authorization machine, closed typed receipt union, strict-current linearization
+  semantics, typed meet algebra, release/high-water profile, Agent Customs lifecycle, and five-tier assurance
+  taxonomy as Candidate only.
+- Kept `TrustPin` in the local sidecar as the bootstrap binding for `(ProjectId, GenesisDigest)`; the portable
+  signed chain begins at `ProjectGenesis`.
+- Defined one-shot currentness at the authority decision and indivisible local guarded-dispatch transition,
+  without claiming physical simultaneity or retroactive invalidation of an admitted remote operation.
+- Added explicit rejected claims, degradation behavior, ten counterexamples, automated conformance oracles,
+  and a three-module TLA+/PlusCal formal gate.
+- Expanded HOLD blockers for canonical schemas, authority/recovery, carrier profiles, formal artifacts,
+  effect registry/canonicalizers, atomic dispatch, adapter capacity, OS containment, output release,
+  epochs/high-water/nonces, identity bindings, and auxiliary inference.
+- Added bounded primary-source support for complete mediation/reference monitors, execution-monitor
+  enforceability, PDP/PEP separation, OPA bundle activation/conflict precedent, split-view limitations, and
+  safety/liveness methodology.
+
+### Status
+
+- No proposition was promoted to Ratified.
+- Existing Ratified vocabulary, identity/privacy boundaries, lane separation, and HOLD state were preserved.
+- Product code was not modified.
+
 ## 2026-07-29 — initial replacement-steward baseline
 
 ### Added

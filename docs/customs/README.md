@@ -37,3 +37,15 @@ Status vocabulary is fixed for this research record:
 - **Empirical-only** — observed in a bounded environment and not generalized.
 
 Implementation status is **HOLD** pending the formal blockers in the decision ledger.
+
+## Reconciled v0 research shape
+
+The current v0 architecture is a **Candidate**, not a ratified standard or implementation authorization. Its
+minimal authorization machine has four typed targets: `PolicyImage`, `ActivationTarget`,
+`InferenceAdmissionTarget` / `RequestCharter`, and `EffectAuthorizationTarget`.
+
+A generic request/receipt envelope is acceptable only as a closed discriminated union of those target
+kinds; authorization receipts are never interchangeable across kinds. Strict-current operation requires
+online, nonce-bound, single-use authorization at each controlled inference dispatch and protected effect.
+The construction, algebra, carrier, schemas, adapters, containment boundary, and formal proof artifacts
+remain Candidate or Open as indexed by the ledgers.

@@ -175,3 +175,183 @@ This baseline was reconstructed from the manager’s authorized brief and primar
 does not contain recoverable prose from the prior steward’s blocked worktree, and it does not claim that the
 local repository is canonical governance state. Future updates must reconcile forwarded canonical material
 claim by claim, retaining superseded states in the ledgers and changelog.
+
+## 12. Reconciled v0 candidate authorization machine
+
+This section records a reconciled architecture as **Candidate**. Four target kinds bind progressively more
+runtime state, and no receipt for one kind authorizes another [C-100–C-112].
+
+### 12.1 PolicyImage
+
+A `PolicyImage` is the exact deterministic compilation of:
+
+`KernelRef + FleetRef + ProjectRef + optional agent trial + compiler/profile + artifact digest`.
+
+`FleetRef` is irreducible: a project or agent cannot compile away the fleet ceiling. The compiler is a
+versioned deterministic component, not a model. A model compiling the policy that governs its own request
+would make the trust argument circular [C-106].
+
+### 12.2 ActivationTarget
+
+An `ActivationTarget` binds a `PolicyImage` to stable `AgentId`, provider/adapter, `enforcerId`, and a
+never-reused `activationFence` representing the session incarnation. A restarted or resurrected session
+receives a new fence; an old receipt fails even if every readable field or display name matches [C-107].
+
+### 12.3 InferenceAdmissionTarget and RequestCharter
+
+An `InferenceAdmissionTarget` binds the activation target to the exact `SessionGrant` head, exact deviations,
+canonical request, provider/model/adapter, final rendered bytes and length, and tool-surface digest. The
+corresponding `RequestCharter` is the deterministic projection and rendered admission artifact. Rendering
+must finish before admission; overflow or attempted silent truncation denies. A suffix rendered after
+authorization is unauthorized even if the earlier prefix was valid [C-108–C-110].
+
+### 12.4 EffectAuthorizationTarget
+
+An `EffectAuthorizationTarget` binds current activation, grant, and deviations to the canonical action,
+adapter, origin inference, and a stable operation identifier. Scheduled or queued operations re-authorize at
+execution rather than spending a stale queued receipt [C-111].
+
+A single `DecisionRequest` / `Receipt` envelope is Candidate only as a closed discriminated union of
+`activate | infer | effect`. The signed domain includes the kind and target-specific bindings, making
+receipts non-interchangeable across kind, fence, incarnation, project, fork, adapter, provider, and model
+[C-112].
+
+## 13. Freshness profiles
+
+**Strict-current** means an online, nonce-bound, single-use receipt at every AllMyAgents-controlled provider
+dispatch and every protected effect, followed by atomic verify-and-dispatch. “Current” means the authority’s
+head at the receipt linearization point, not timeless latestness. If the authority is unavailable, no
+strict-current inference or protected effect occurs [C-120–C-123].
+
+A lease may exist only under a separately named bounded-stability/offline profile. It cannot claim
+strict-current. Authority changes cannot retroactively stop already accepted remote inference, retract
+delivered output, or undo external effects. During a partition, strict-current availability is intentionally
+sacrificed rather than guessed [C-124, C-125].
+
+## 14. Candidate v0 precedence and obligation algebra
+
+Validation, freshness, and required-audit failures deny. Kernel and the exact `SessionGrant` ceilings are
+nonwaivable. Fleet applies before Project. Exact deviations can name only waivable Fleet or Project rules;
+agent trials can narrow only. The hard authorization result is intersection with default deny [C-130].
+
+| Field | Meet |
+|---|---|
+| actions, resources, destinations | set intersection |
+| `maxRisk`, `maxData`, `maxBytes`, `validUntil` | minimum |
+| `requiredApprovals`, `auditTags` | set union |
+| `sandbox` | Boolean OR |
+
+An unknown type, field, operator, invalid value, or undefined meet denies. Arbitrary prose, stateful
+obligations, and disjunctive obligation systems remain Open and keep implementation on HOLD [C-131, C-132].
+
+## 15. Candidate release and carrier profile
+
+`ProjectIdentity = (random ProjectId, GenesisDigest)`. A local `TrustPin` bootstraps trust by binding that
+pair; it is sidecar state, not a portable signed-chain object. The portable graph contains immutable signed
+content-addressed objects and one linear v0 Release chain with explicit forks:
+
+`ProjectGenesis → RootTransition* → AuthorityGrant(term) → Release* → CustomRevision references`.
+
+Verification tracks a local high-water mark and fails on missing, corrupt, unsupported, or equivocal
+required material [C-140–C-143].
+
+A capsule carries the closed portable graph. A transport profile states whether it includes that graph
+physically or carries an authenticated companion locator. Local sidecars contain trust pins, mounts, private
+keys/endpoints, high-water state, receipts, caches, compiled Charters, and the private `AgentId` map. Capsules
+contain no secrets, process fences, or reusable authority credentials [C-144].
+
+Root loss has no magical recovery. Content addressing detects differing objects but does not stop a cloned
+signer from presenting consistent, signed split views; signer equivocation remains HOLD without a
+witness/transparency mechanism. Certificate Transparency gossip is precedent for isolated-view limitations,
+not an adopted Customs protocol [C-145, C-146].
+
+## 16. Agent Customs lifecycle
+
+Personal and trial Customs can narrow only their stable `AgentId`; they cannot widen authority or affect
+other agents, security, or governance. The Candidate lifecycle is:
+
+`draft → trial/shadow → personal active → promotion proposal/review → new project Custom`.
+
+There is no silent promotion or synchronization. Imports are quarantined and inactive. Capsules omit
+`AgentId` by default and carry a project/export-scoped principal whose private map stays local. Culture is
+emergent evidence, not a stored object [C-150–C-153].
+
+## 17. Assurance and containment
+
+Conformance claims are capability-by-capability and distinguish [C-160]:
+
+- **Carrier Assurance** — selected objects arrived and decoded under a named carrier profile.
+- **Delivery Assurance** — exact authenticated bytes reached a controlled dispatch boundary.
+- **Declared Effect Assurance** — declared protected effects received current authorization.
+- **Contained Effect Assurance** — bypass tests support that all claimed effect paths cross the enforcer.
+- **Semantic Assurance** — bounded empirical evidence only; never model understanding or obedience.
+
+Freshness profile is orthogonal to all five. One “Customs enabled” flag is prohibited.
+
+Full containment cannot be claimed for an ambient vendor CLI without OS/container isolation and brokered
+filesystem, process, network, Git, secrets, and browser access. The protected-boundary registry must cover at
+least provider data/cost, output release, filesystem, process, network, Git, bus/messages, memory, Customs
+mutation, credentials, browser/UI, approvals/delegation, project/session lifecycle, attachments, telemetry,
+updates/plugins/MCP, and schedulers. Queued actions re-authorize when executed [C-161–C-163].
+
+This boundary follows established reasoning: complete mediation checks every access; a reference monitor is
+always invoked, tamper-resistant, and verifiable; PDP/PEP architectures separate decision from enforcement;
+and execution monitoring cannot enforce arbitrary semantic properties [C-164–C-167]. Saltzer and
+Schroeder’s economy-of-mechanism principle supports keeping the v0 meet small. OPA’s signed-bundle behavior
+is useful implementation precedent for validate-before-activation and for treating multi-source conflicts
+as errors, but it is not an adopted Customs engine [C-168].
+
+## 18. Rejected hard claims and explicit degradation
+
+Rejected claims include: every physical vendor inference was admitted; hidden retry or compaction carried
+the Charter; the model understood or obeyed; remote cancellation retroactively retracted accepted work or
+delivered output; strict-current operation remained current through authority partition; and external
+effects are universally exactly once [C-170].
+
+Required degradations and tests are explicit: guidance overflow denies; admitted bytes are checked exactly;
+a hidden-call stub is reported outside assurance; a mid-turn generation change blocks later tools and
+quarantines or labels the remaining stream; an ignored interrupt yields `cancellation-unconfirmed` with zero
+authorized effects; ambient raw-effect attempts must fail before containment is advertised; authoritative
+guidance change rotates to a new provider context [C-171].
+
+## 19. Counterexample catalogue
+
+Mandatory negative vectors are: queued-receipt TOCTOU; render-after-admission suffix; cached provider
+context; inference receipt reused for effect; signer-clone split view; travel without high-water; display-name
+rebind; session resurrection/ABA; model-in-compiler circularity; and ambiguous approval [C-180].
+
+## 20. Automated conformance oracles
+
+The Candidate suite must demonstrate [C-181]:
+
+- zero provider calls without a valid inference receipt and exact final-byte equality;
+- nonce single use and no cross-kind/fence/incarnation/project/fork/adapter/provider/model receipt reuse;
+- zero protected effects without a current effect receipt;
+- head changes invalidate unspent receipts, while already admitted operations remain admitted; overflow
+  denies; restart fences survive crashes;
+- fail-closed unknown fields/old peers and stable operation identifiers;
+- new provider context after authoritative guidance changes;
+- execution-time scheduler, bus, and approval checks;
+- containment bypass tests for every claimed boundary;
+- display-name rebinding changes no ownership;
+- offline stale capsules cause zero strict-current dispatch;
+- assurance is emitted capability-by-capability, never as one enabled flag.
+
+## 21. Formal gate
+
+The next research artifact should be three TLA+/PlusCal modules [C-190]:
+
+- **A — authority and carrier:** trust, releases, high-water rollback, equivocation, moves, and forks;
+- **B — runtime authorization:** activation, admission, effects, grants, restart fences, generation changes,
+  and compaction;
+- **C — agent lifecycle and privacy:** identity/name separation, scoped principals, trials, promotion,
+  quarantine, and erasure.
+
+The gate requires safety properties plus conditional liveness under explicit availability/fairness
+assumptions. Lamport’s separation of safety and liveness motivates the structure but proves nothing about
+this Candidate [C-191].
+
+Implementation remains **HOLD** until canonical encoding/schema, trust bootstrap/recovery, carrier profiles,
+formal model/model-check artifacts, cross-implementation vectors, a closed effect registry/canonicalizers,
+atomic guarded dispatch, exact adapter capacity tests, OS containment, output-release rules, authority
+epochs/high-water/nonces, stable `AgentId` bindings, and auxiliary-inference inventory are resolved [C-192].
