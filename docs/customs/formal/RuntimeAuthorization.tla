@@ -971,11 +971,122 @@ ConditionalEffectReconciliation ==
         => (r \in needsReconciliation
              ~> effectOutcome[r] \in FinalOutcomes)
 
-Spec ==
+FullSpec ==
     /\ Init
     /\ [][Next]_vars
     /\ \A r \in RequestIds : WF_vars(ProcessFor(r))
     /\ \A r \in RequestIds : WF_vars(CompleteInference(r))
     /\ \A r \in RequestIds : WF_vars(ResolveEffectFor(r))
+
+\* Finite harnesses use the production actions above while removing unrelated
+\* availability and arbitrary-rights interleavings.  FullSpec retains the full
+\* transition union for future larger runs.
+
+QueueCurrentInference(r, session) ==
+    QueueNewIntent(
+        r, session, currentIncarnation[session],
+        currentEnforcerGeneration, InferenceTarget, NoRequest)
+
+QueueCurrentDownstream(r, session, target, source) ==
+    /\ target \in {EffectTarget, OutputReleaseTarget}
+    /\ source \in inferenceCompleted
+    /\ QueueNewIntent(
+        r, session, currentIncarnation[session],
+        currentEnforcerGeneration, target, source)
+
+QueueStaleDownstream(r, session, target, source) ==
+    /\ target \in {EffectTarget, OutputReleaseTarget}
+    /\ source \in inferenceCompleted
+    /\ requestSession[source] = session
+    /\ admissionPolicy[source] # currentPolicy \/
+       admissionGrantEpoch[source] # grantEpoch[session] \/
+       admissionIncarnation[source] # currentIncarnation[session] \/
+       admissionGeneration[source] # currentEnforcerGeneration
+    /\ QueueNewIntent(
+        r, session, currentIncarnation[session],
+        currentEnforcerGeneration, target, source)
+
+InstallFullGrant(session, grant, epoch) ==
+    InstallSessionGrant(
+        session, grant, epoch, HigherConstraint, {})
+
+AdvancePolicy(policy) ==
+    ApplyCustom("evaluate", policy, policyCeiling)
+
+FiniteNext ==
+    \/ \E s \in SessionIds, g \in GrantIds, e \in GrantEpochs :
+          InstallFullGrant(s, g, e)
+    \/ \E r \in RequestIds, s \in SessionIds :
+          QueueCurrentInference(r, s)
+    \/ \E r \in RequestIds, retry \in RetryCounts :
+          RetryIntent(r, retry)
+    \/ \E r \in RequestIds : ProcessFor(r)
+    \/ \E r \in RequestIds : CompleteInference(r)
+    \/ \E p \in PolicyDigests : AdvancePolicy(p)
+    \/ \E s \in SessionIds, e \in GrantEpochs :
+          RevokeSessionGrant(s, e)
+    \/ \E g \in EnforcerGenerations : RotateEnforcerGeneration(g)
+    \/ RecoverGateway
+    \/ \E w \in Workers, r \in RequestIds : CacheDecision(w, r)
+    \/ \E source \in Workers, destination \in Workers :
+          CloneWorkerState(source, destination)
+    \/ \E w \in Workers, r \in RequestIds : PresentReceipt(w, r)
+
+TargetedNext ==
+    \/ FiniteNext
+    \/ \E r \in RequestIds, s \in SessionIds,
+          target \in {EffectTarget, OutputReleaseTarget},
+          source \in RequestIds :
+          QueueCurrentDownstream(r, s, target, source)
+    \/ \E r \in RequestIds, s \in SessionIds,
+          target \in {EffectTarget, OutputReleaseTarget},
+          source \in RequestIds :
+          QueueStaleDownstream(r, s, target, source)
+    \/ \E r \in RequestIds : ResolveEffectFor(r)
+    \/ CrashGateway
+
+FiniteSpec ==
+    /\ Init
+    /\ [][FiniteNext]_vars
+    /\ \A r \in RequestIds : WF_vars(ProcessFor(r))
+    /\ \A r \in RequestIds : WF_vars(CompleteInference(r))
+
+TargetedSpec ==
+    /\ Init
+    /\ [][TargetedNext]_vars
+    /\ \A r \in RequestIds : WF_vars(ProcessFor(r))
+    /\ \A r \in RequestIds : WF_vars(CompleteInference(r))
+    /\ \A r \in RequestIds : WF_vars(ResolveEffectFor(r))
+
+\* Expected-failure mutation: a cached denied DecisionRecord is treated as a
+\* bearer allow and sent without admission/CAS.  This action is never in a
+\* passing specification.
+UnsafeBearerReceiptSend(w, r) ==
+    /\ w \in Workers
+    /\ r \in workerReceipts[w]
+    /\ r \notin admitted
+    /\ r \notin gatewaySent
+    /\ gatewaySent' = gatewaySent \cup {r}
+    /\ sendCount' = [sendCount EXCEPT ![r] = 1]
+    /\ UNCHANGED <<AvailabilityVars, PolicyVars, SessionVars, RequestVars,
+                   DecisionVars, AdmissionVars, abandonedBeforeSend,
+                   admissionCount, completed, inferenceCompleted,
+                   effectAttempted, outputReleased, effectOutcome,
+                   needsReconciliation, WorkerVars>>
+
+BearerMutationNext ==
+    FiniteNext \/
+    \E w \in Workers, r \in RequestIds :
+        UnsafeBearerReceiptSend(w, r)
+
+BearerMutationSpec == Init /\ [][BearerMutationNext]_vars
+
+CrashBeforeTransportReachabilitySentinel == abandonedBeforeSend = {}
+EffectReconciliationReachabilitySentinel == needsReconciliation = {}
+StaleDownstreamDenialReachabilitySentinel ==
+    \A r \in decisionDenied :
+        requestTarget[r] = InferenceTarget
+
+Spec == FiniteSpec
 
 =============================================================================

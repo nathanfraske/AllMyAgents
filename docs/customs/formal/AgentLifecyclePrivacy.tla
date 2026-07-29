@@ -967,6 +967,97 @@ ConditionalDraftReviewLiveness ==
     \A draft \in DraftIds :
         draft \in draftCandidates ~> draft \notin draftCandidates
 
+\* Targeted finite harnesses reuse the lifecycle actions while removing
+\* unrelated import/availability interleavings.
+LifecycleHarnessNext ==
+    \/ \E a \in AgentIds : IssueSelfAdoptCapability(a)
+    \/ \E a \in AgentIds, d \in DraftIds, b \in NormBodies,
+          k \in NormKinds, rights \in SUBSET PermissionAtoms :
+          AuthorDraft(a, d, b, k, rights)
+    \/ \E a \in AgentIds, d \in DraftIds :
+          SelfAdoptShadow(a, d)
+    \/ \E p \in ProjectIds, principal \in ProjectPrincipals,
+          a \in AgentIds, d \in DraftIds :
+          StartTrial(p, principal, a, d)
+    \/ \E p \in ProjectIds, principal \in ProjectPrincipals,
+          a \in AgentIds, d \in DraftIds :
+          ActivateTrial(p, principal, a, d)
+    \/ \E p \in ProjectIds, principal \in ProjectPrincipals,
+          a \in AgentIds : EraseMapping(p, principal, a)
+    \/ \E p \in ProjectIds, principal \in ProjectPrincipals,
+          d \in DraftIds : FailClosedOverlayAttempt(p, principal, d)
+    \/ \E p \in ProjectIds, principal \in ProjectPrincipals,
+          a \in AgentIds, d \in DraftIds :
+          FailClosedNameOrSelfClaim(p, principal, a, d)
+    \/ \E p \in ProjectIds, d \in DraftIds :
+          RequestPromotion(p, d)
+    \/ \E p \in ProjectIds, d \in DraftIds : PromoteFor(p, d)
+    \/ \E c \in CustomIds : AdvanceCustomToTrial(c)
+    \/ \E c \in CustomIds : ActivateProjectCustom(c)
+    \/ \E x \in CapsuleIds, p \in ProjectIds,
+          principal \in ProjectPrincipals, c \in CustomIds :
+          CreateCapsule(x, p, principal, c)
+    \/ \E a \in AgentIds : RetireAgent(a)
+
+MappingHarnessNext ==
+    \/ \E a \in AgentIds, n \in Names, auth \in AgentAuthorities :
+          EnrollAgent(a, n, auth)
+    \/ \E p \in ProjectIds, principal \in ProjectPrincipals,
+          a \in AgentIds : StageMappingImport(p, principal, a)
+    \/ \E p \in ProjectIds, principal \in ProjectPrincipals,
+          a \in AgentIds : ReviewMappingFor(p, principal, a)
+    \/ \E p \in ProjectIds, principal \in ProjectPrincipals :
+          ResolveMappingAmbiguity(p, principal)
+    \/ \E p \in ProjectIds, principal \in ProjectPrincipals,
+          a \in AgentIds : EraseMapping(p, principal, a)
+    \/ \E p \in ProjectIds, principal \in ProjectPrincipals,
+          d \in DraftIds : FailClosedOverlayAttempt(p, principal, d)
+    \/ \E p \in ProjectIds, principal \in ProjectPrincipals,
+          a \in AgentIds, d \in DraftIds :
+          FailClosedNameOrSelfClaim(p, principal, a, d)
+    \/ \E a \in AgentIds : RetireAgent(a)
+
+LifecycleHarnessSpec ==
+    /\ Init
+    /\ [][LifecycleHarnessNext]_vars
+    /\ \A p \in ProjectIds, d \in DraftIds :
+          WF_vars(PromoteFor(p, d))
+
+MappingHarnessSpec ==
+    /\ Init
+    /\ [][MappingHarnessNext]_vars
+    /\ \A p \in ProjectIds, principal \in ProjectPrincipals,
+          a \in AgentIds : WF_vars(ReviewMappingFor(p, principal, a))
+
+\* Expected-failure mutation: a readable-name/self claim installs an active
+\* overlay after the private scoped mapping is absent.
+UnsafeNameClaimOverlay(project, principal, agent, draft) ==
+    /\ project \in ProjectIds
+    /\ principal \in ProjectPrincipals
+    /\ agent \in activeAgents
+    /\ draft \in drafts
+    /\ displayName[agent] \in Names
+    /\ ~UniqueOwner(project, principal, agent)
+    /\ <<project, principal, agent, draft>> \notin activeOverlays
+    /\ activeOverlays' =
+        activeOverlays \cup {<<project, principal, agent, draft>>}
+    /\ UNCHANGED <<AgentVars, ProjectVars, MappingVars, DraftVars,
+                   shadowAdoptions, trialOverlays, pendingPromotions,
+                   CustomVars, CapsuleVars>>
+
+MappingMutationNext ==
+    LifecycleHarnessNext \/
+    \E p \in ProjectIds, principal \in ProjectPrincipals,
+       a \in AgentIds, d \in DraftIds :
+       UnsafeNameClaimOverlay(p, principal, a, d)
+
+MappingMutationSpec == Init /\ [][MappingMutationNext]_vars
+
+PromotionReachabilitySentinel == promotedCustoms = {}
+CapsuleReachabilitySentinel == capsules = {}
+MappingAmbiguityReachabilitySentinel == ambiguousPairs = {}
+FailClosedReachabilitySentinel == failedOverlayRequests = {}
+
 Spec ==
     /\ Init
     /\ [][Next]_vars
