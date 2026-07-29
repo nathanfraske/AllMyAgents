@@ -154,8 +154,12 @@ async function handle(message) {
     await close()
     await listen(message.port)
     mark('green-bound-public')
-    console.log('[fixture] green bound public listener; promoted ACK sent')
-    send({ type: 'promoted' })
+    if (scenario === 'lost-promoted-ack') {
+      console.log('[fixture] green bound public listener; promoted ACK withheld')
+    } else {
+      console.log('[fixture] green bound public listener; promoted ACK sent')
+      send({ type: 'promoted' })
+    }
     return
   }
 
@@ -183,9 +187,16 @@ process.on('disconnect', () => process.exit(0))
 
 class OutputCapture {
   text = ''
+  private readonly messages: unknown[] = []
   private waiters = new Set<{
     pattern: RegExp
     resolve: () => void
+    reject: (error: Error) => void
+    timer: NodeJS.Timeout
+  }>()
+  private messageWaiters = new Set<{
+    type: string
+    resolve: (message: unknown) => void
     reject: (error: Error) => void
     timer: NodeJS.Timeout
   }>()
@@ -202,6 +213,21 @@ class OutputCapture {
     }
     child.stdout?.on('data', append)
     child.stderr?.on('data', append)
+    child.on('message', (message: unknown) => {
+      this.messages.push(message)
+      for (const waiter of [...this.messageWaiters]) {
+        if (
+          !message ||
+          typeof message !== 'object' ||
+          (message as { type?: unknown }).type !== waiter.type
+        ) {
+          continue
+        }
+        clearTimeout(waiter.timer)
+        this.messageWaiters.delete(waiter)
+        waiter.resolve(message)
+      }
+    })
     child.once('exit', (code, signal) => {
       for (const waiter of [...this.waiters]) {
         clearTimeout(waiter.timer)
@@ -209,6 +235,16 @@ class OutputCapture {
         waiter.reject(
           new Error(
             `hubctl exited before ${String(waiter.pattern)} ` +
+              `(code=${String(code)} signal=${String(signal)}):\n${this.text}`
+          )
+        )
+      }
+      for (const waiter of [...this.messageWaiters]) {
+        clearTimeout(waiter.timer)
+        this.messageWaiters.delete(waiter)
+        waiter.reject(
+          new Error(
+            `hubctl exited before IPC ${waiter.type} ` +
               `(code=${String(code)} signal=${String(signal)}):\n${this.text}`
           )
         )
@@ -235,6 +271,48 @@ class OutputCapture {
   count(fragment: string): number {
     return this.text.split(fragment).length - 1
   }
+
+  countMessages(type: string): number {
+    return this.messages.filter(
+      (message) =>
+        !!message &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === type
+    ).length
+  }
+
+  waitForMessage<T extends { type: string }>(
+    type: T['type'],
+    timeoutMs = 20_000
+  ): Promise<T> {
+    const existing = this.messages.find(
+      (message) =>
+        !!message &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === type
+    )
+    if (existing) return Promise.resolve(existing as T)
+    return new Promise<T>((resolve, reject) => {
+      const waiter = {
+        type,
+        resolve: (message: unknown) => resolve(message as T),
+        reject,
+        timer: setTimeout(() => {
+          this.messageWaiters.delete(waiter)
+          reject(new Error(`timed out waiting for hubctl IPC ${type}:\n${this.text}`))
+        }, timeoutMs),
+      }
+      this.messageWaiters.add(waiter)
+    })
+  }
+}
+
+function replaceExactly(source: string, from: string, to: string, label: string): string {
+  const first = source.indexOf(from)
+  if (first < 0 || source.indexOf(from, first + from.length) >= 0) {
+    throw new Error(`compiled hubctl ${label} seam was not unique`)
+  }
+  return source.slice(0, first) + to + source.slice(first + from.length)
 }
 
 async function compileHubFixture(): Promise<void> {
@@ -265,6 +343,64 @@ async function compileHubFixture(): Promise<void> {
     )
   }
   hubctlEntry = path.join(outDir, 'hubctl.js')
+  let compiledHubctl = fs.readFileSync(hubctlEntry, 'utf8')
+  compiledHubctl = replaceExactly(
+    compiledHubctl,
+    "await waitForHubMsg(green.child, 'promoted', 8_000);",
+    "await waitForHubMsg(green.child, 'promoted', Number(process.env.HUB_TEST_PROMOTE_ACK_TIMEOUT_MS ?? 8_000));",
+    'promotion timeout'
+  )
+  compiledHubctl = replaceExactly(
+    compiledHubctl,
+    `killGreen: (child) => {
+                        green.state = 'retired';
+                        killTree(child);
+                    },`,
+    `killGreen: (child) => {
+                        green.state = 'retired';
+                        if (process.env.HUB_TEST_HOLD_GREEN_KILL === '1' && process.send) {
+                            const release = (message) => {
+                                if (message?.type === 'hubctl-test-probe-green-kill-wait') {
+                                    process.send({ type: 'hubctl-test-green-kill-waiting' });
+                                    return;
+                                }
+                                if (message?.type !== 'hubctl-test-release-green-kill')
+                                    return;
+                                process.off('message', release);
+                                killTree(child);
+                            };
+                            process.on('message', release);
+                            process.send({ type: 'hubctl-test-green-kill-pending', pid: child.pid });
+                        }
+                        else {
+                            killTree(child);
+                        }
+                    },`,
+    'green kill'
+  )
+  if (process.env.AMA_HUBCTL_MUTATE_PROMOTION_FENCE === '1') {
+    compiledHubctl = replaceExactly(
+      compiledHubctl,
+      `greenMayOwnPublicListener = true;
+        sendToHub(green.child, { type: 'promote', port: FIXED_PORT }); // green: re-listen on 7777
+        await waitForHubMsg(green.child, 'promoted', Number(process.env.HUB_TEST_PROMOTE_ACK_TIMEOUT_MS ?? 8_000));`,
+      `sendToHub(green.child, { type: 'promote', port: FIXED_PORT }); // MUTATION: fence moved after ACK
+        await waitForHubMsg(green.child, 'promoted', Number(process.env.HUB_TEST_PROMOTE_ACK_TIMEOUT_MS ?? 8_000));
+        greenMayOwnPublicListener = true;`,
+      'promotion fence mutation'
+    )
+  }
+  fs.writeFileSync(hubctlEntry, compiledHubctl)
+  const rollbackEntry = path.join(outDir, 'restartRollback.js')
+  let compiledRollback = fs.readFileSync(rollbackEntry, 'utf8')
+  compiledRollback = replaceExactly(
+    compiledRollback,
+    'await requestRebind(blue, reason, options.rollbackRebindTimeoutMs ?? 8_000);',
+    `process.send?.({ type: 'hubctl-test-blue-rebind-attempt' });
+        await requestRebind(blue, reason, options.rollbackRebindTimeoutMs ?? 8_000);`,
+    'blue rebind observation'
+  )
+  fs.writeFileSync(rollbackEntry, compiledRollback)
   fs.writeFileSync(path.join(outDir, 'index.js'), fixtureHub)
 }
 
@@ -284,6 +420,7 @@ async function startScenario(
     | 'precommit-blue-death'
     | 'post-listener-blue-death-failure'
     | 'post-listener-blue-death-commit'
+    | 'lost-promoted-ack'
 ): Promise<{ capture: OutputCapture; stateDir: string }> {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-hubctl-backup-recovery-'))
   scenarioRoots.push(root)
@@ -296,6 +433,10 @@ async function startScenario(
     HUB_TEST_SCENARIO: scenario,
     HUB_TEST_STATE_DIR: stateDir,
   }
+  if (scenario === 'lost-promoted-ack') {
+    env.HUB_TEST_PROMOTE_ACK_TIMEOUT_MS = '100'
+    env.HUB_TEST_HOLD_GREEN_KILL = '1'
+  }
   delete env.HUBCTL_DEV
   delete env.HUB_WORKER
   delete env.HUB_WORKER_SOCKET
@@ -303,7 +444,7 @@ async function startScenario(
     cwd: hubRoot,
     env,
     windowsHide: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   })
   supervisors.push(child)
   const capture = new OutputCapture(child)
@@ -339,6 +480,37 @@ afterAll(() => {
 })
 
 describe('hubctl live-blue death during backup handoff', () => {
+  it('fences a public green whose promoted ACK is lost before blue can rebind', async () => {
+    const { capture } = await startScenario('lost-promoted-ack')
+
+    await capture.waitFor(/green bound public listener; promoted ACK withheld/)
+    await capture.waitForMessage<{ type: 'hubctl-test-green-kill-pending' }>(
+      'hubctl-test-green-kill-pending'
+    )
+    capture.child.send?.({ type: 'hubctl-test-probe-green-kill-wait' })
+    await capture.waitForMessage<{ type: 'hubctl-test-green-kill-waiting' }>(
+      'hubctl-test-green-kill-waiting'
+    )
+
+    expect(capture.countMessages('hubctl-test-blue-rebind-attempt')).toBe(0)
+    expect(capture.text).not.toContain('restart-aborted reached a surviving blue')
+    expect(capture.text).not.toContain('EADDRINUSE')
+
+    capture.child.send?.({ type: 'hubctl-test-release-green-kill' })
+    await capture.waitFor(/hub\(green\) exited/)
+    await capture.waitForMessage<{ type: 'hubctl-test-blue-rebind-attempt' }>(
+      'hubctl-test-blue-rebind-attempt'
+    )
+    await capture.waitFor(/restart-aborted reached a surviving blue/)
+    await capture.waitFor(/blue journal backups resumed after rollback/)
+
+    expect(capture.text.indexOf('hub(green) exited')).toBeLessThan(
+      capture.text.indexOf('restart-aborted reached a surviving blue')
+    )
+    expect(capture.text).not.toContain('EADDRINUSE')
+    expect(capture.count('live hub is down — respawning')).toBe(0)
+  }, 15_000)
+
   it('clears a blue that dies before pause acknowledgement and revives exactly once', async () => {
     const { capture } = await startScenario('precommit-blue-death')
 
@@ -350,7 +522,7 @@ describe('hubctl live-blue death during backup handoff', () => {
     expect(capture.text).not.toContain('restart-aborted reached a surviving blue')
     expect(capture.text).not.toContain('EADDRINUSE')
     expect(capture.count('live hub is down — respawning')).toBe(1)
-  })
+  }, 15_000)
 
   it('fences green, skips dead-blue rollback, and revives once after pre-ownership failure', async () => {
     const { capture, stateDir } = await startScenario('post-listener-blue-death-failure')
@@ -367,7 +539,7 @@ describe('hubctl live-blue death during backup handoff', () => {
     expect(capture.text).not.toContain('restart-aborted reached a surviving blue')
     expect(capture.text).not.toContain('EADDRINUSE')
     expect(capture.count('live hub is down — respawning')).toBe(1)
-  })
+  }, 15_000)
 
   it('cancels deferred revival when green commits after blue dies post-listener', async () => {
     const { capture, stateDir } = await startScenario('post-listener-blue-death-commit')
@@ -383,5 +555,5 @@ describe('hubctl live-blue death during backup handoff', () => {
 
     expect(capture.text).not.toContain('EADDRINUSE')
     expect(capture.count('live hub is down — respawning')).toBe(0)
-  })
+  }, 15_000)
 })
