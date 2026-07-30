@@ -26,6 +26,7 @@ struct SharedWebViewEnvironment;
 const PROTOCOL_VERSION: u32 = 1;
 const PREPARED_ACTION_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_PREPARED_ACTIONS_PER_TAB: usize = 128;
+#[cfg(windows)]
 const MAX_TABS_PER_SESSION: usize = 8;
 // Base64 plus the authenticated JSON envelope must remain below the hub's
 // independently enforced 12.5 MB browser-response frame limit.
@@ -101,6 +102,7 @@ struct PendingDownload {
     name: String,
     mime: String,
     max_bytes: u64,
+    #[cfg(any(windows, test))]
     automatic_download_permission_armed: bool,
     completion: DownloadCompletion,
 }
@@ -207,10 +209,12 @@ impl Drop for PendingDownloadCleanup {
     }
 }
 
+#[cfg(any(windows, test))]
 fn download_exceeds_bound(received: i64, max_bytes: u64) -> bool {
     received >= 0 && received as u64 > max_bytes
 }
 
+#[cfg(any(windows, test))]
 fn download_interrupt_reason_label(reason: i32) -> &'static str {
     match reason {
         0 => "none",
@@ -967,7 +971,7 @@ fn build_browser_window(
     event_tx: &mpsc::Sender<NavigationEvent>,
     session_id: &str,
     policy: Arc<Mutex<NavigationPolicy>>,
-    shared_environment: Option<SharedWebViewEnvironment>,
+    _shared_environment: Option<SharedWebViewEnvironment>,
 ) -> Result<(WebviewWindow, Arc<Mutex<NavigationPolicy>>), String> {
     let event_instance = instance_id.to_string();
     let event_session = session_id.to_string();
@@ -979,7 +983,7 @@ fn build_browser_window(
     let navigation_policy = policy.clone();
     let event_policy = policy.clone();
     let download_policy = policy.clone();
-    let mut builder = WebviewWindowBuilder::new(
+    let builder = WebviewWindowBuilder::new(
         app,
         label,
         WebviewUrl::External("about:blank".parse().unwrap()),
@@ -991,9 +995,11 @@ fn build_browser_window(
     .general_autofill_enabled(false)
     .additional_browser_args(BROWSER_ARGS);
     #[cfg(windows)]
-    if let Some(environment) = shared_environment {
-        builder = builder.with_environment(environment);
-    }
+    let builder = if let Some(environment) = _shared_environment {
+        builder.with_environment(environment)
+    } else {
+        builder
+    };
     let window = builder
         .on_download(move |_, event| handle_download_event(event, &download_policy))
         .on_new_window(|_, _| NewWindowResponse::Deny)
@@ -1083,6 +1089,7 @@ fn complete_download(pending: &PendingDownload, result: Result<CompletedDownload
     }
 }
 
+#[cfg(any(windows, test))]
 fn consume_automatic_download_permission(
     policy: &mut NavigationPolicy,
 ) -> Result<PendingDownload, String> {
@@ -1099,6 +1106,7 @@ fn consume_automatic_download_permission(
     Ok(pending.clone())
 }
 
+#[cfg(any(windows, test))]
 fn interrupt_pending_download_permission(policy: &NavigationPolicy, permission_kind: i32) {
     if let Some(pending) = policy.pending_download.as_ref() {
         complete_download(
@@ -2084,6 +2092,7 @@ fn create_new_tab(
 }
 
 #[cfg(not(windows))]
+#[allow(clippy::too_many_arguments)]
 fn create_new_tab(
     _app: &AppHandle,
     _root: &Path,
@@ -2473,6 +2482,7 @@ fn commit_download(
         name,
         mime,
         max_bytes: quota.max_bytes,
+        #[cfg(any(windows, test))]
         automatic_download_permission_armed: true,
         completion: completion.clone(),
     };
