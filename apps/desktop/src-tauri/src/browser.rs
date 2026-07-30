@@ -99,6 +99,7 @@ struct PendingDownload {
     name: String,
     mime: String,
     max_bytes: u64,
+    automatic_download_permission_armed: bool,
     completion: DownloadCompletion,
 }
 
@@ -1015,6 +1016,33 @@ fn complete_download(pending: &PendingDownload, result: Result<CompletedDownload
     }
 }
 
+fn consume_automatic_download_permission(
+    policy: &mut NavigationPolicy,
+) -> Result<PendingDownload, String> {
+    let pending = policy.pending_download.as_mut().ok_or_else(|| {
+        "Automatic-download permission denied: no one-use download action is armed for this tab."
+            .to_string()
+    })?;
+    if !pending.automatic_download_permission_armed {
+        let reason = "Download interrupted: WebView2 requested automatic-download permission more than once for the one-use action.".to_string();
+        complete_download(pending, Err(reason.clone()));
+        return Err(reason);
+    }
+    pending.automatic_download_permission_armed = false;
+    Ok(pending.clone())
+}
+
+fn interrupt_pending_download_permission(policy: &NavigationPolicy, permission_kind: i32) {
+    if let Some(pending) = policy.pending_download.as_ref() {
+        complete_download(
+            pending,
+            Err(format!(
+                "Download interrupted: WebView2 requested denied permission kind {permission_kind} instead of the one-use automatic-download permission."
+            )),
+        );
+    }
+}
+
 fn handle_download_event(
     event: tauri::webview::DownloadEvent<'_>,
     policy: &Arc<Mutex<NavigationPolicy>>,
@@ -1110,8 +1138,10 @@ fn harden_windows_profile(
     navigation_policy: &Arc<Mutex<NavigationPolicy>>,
 ) {
     use webview2_com::Microsoft::Web::WebView2::Win32::{
-        ICoreWebView2, ICoreWebView2Profile6, ICoreWebView2_13, ICoreWebView2_4,
-        COREWEBVIEW2_PERMISSION_STATE_DENY,
+        ICoreWebView2, ICoreWebView2PermissionRequestedEventArgs3, ICoreWebView2Profile6,
+        ICoreWebView2_13, ICoreWebView2_4, COREWEBVIEW2_PERMISSION_KIND,
+        COREWEBVIEW2_PERMISSION_KIND_MULTIPLE_AUTOMATIC_DOWNLOADS,
+        COREWEBVIEW2_PERMISSION_STATE_ALLOW, COREWEBVIEW2_PERMISSION_STATE_DENY,
     };
     use webview2_com::{
         BytesReceivedChangedEventHandler, DownloadStartingEventHandler,
@@ -1131,11 +1161,57 @@ fn harden_windows_profile(
                 profile.SetIsGeneralAutofillEnabled(false)?;
             }
             let mut token = 0_i64;
+            let permission_policy = navigation_policy.clone();
             unsafe {
                 webview.add_PermissionRequested(
-                    &PermissionRequestedEventHandler::create(Box::new(|_, args| {
+                    &PermissionRequestedEventHandler::create(Box::new(move |_, args| {
                         if let Some(args) = args {
-                            args.SetState(COREWEBVIEW2_PERMISSION_STATE_DENY)?;
+                            let mut kind = COREWEBVIEW2_PERMISSION_KIND::default();
+                            args.PermissionKind(&mut kind)?;
+                            if kind == COREWEBVIEW2_PERMISSION_KIND_MULTIPLE_AUTOMATIC_DOWNLOADS {
+                                let pending = permission_policy.lock().map_err(|_| {
+                                    "Automatic-download permission denied: browser policy lock was poisoned."
+                                        .to_string()
+                                }).and_then(|mut policy| {
+                                    consume_automatic_download_permission(&mut policy)
+                                });
+                                match pending {
+                                    Ok(pending) => {
+                                        let ephemeral = args
+                                            .cast::<ICoreWebView2PermissionRequestedEventArgs3>()
+                                            .and_then(|args| args.SetSavesInProfile(false));
+                                        if let Err(error) = ephemeral {
+                                            complete_download(
+                                                &pending,
+                                                Err(format!(
+                                                    "Download interrupted: WebView2 could not make the one-use automatic-download permission ephemeral: {error}"
+                                                )),
+                                            );
+                                            args.SetState(COREWEBVIEW2_PERMISSION_STATE_DENY)?;
+                                            return Ok(());
+                                        }
+                                        if let Err(error) =
+                                            args.SetState(COREWEBVIEW2_PERMISSION_STATE_ALLOW)
+                                        {
+                                            complete_download(
+                                                &pending,
+                                                Err(format!(
+                                                    "Download interrupted: WebView2 could not apply the one-use automatic-download permission: {error}"
+                                                )),
+                                            );
+                                            return Err(error);
+                                        }
+                                    }
+                                    Err(_) => {
+                                        args.SetState(COREWEBVIEW2_PERMISSION_STATE_DENY)?;
+                                    }
+                                }
+                            } else {
+                                if let Ok(policy) = permission_policy.lock() {
+                                    interrupt_pending_download_permission(&policy, kind.0);
+                                }
+                                args.SetState(COREWEBVIEW2_PERMISSION_STATE_DENY)?;
+                            }
                         }
                         Ok(())
                     })),
@@ -2282,6 +2358,7 @@ fn commit_download(
         name,
         mime,
         max_bytes: quota.max_bytes,
+        automatic_download_permission_armed: true,
         completion: completion.clone(),
     };
     {
@@ -2841,6 +2918,75 @@ mod tests {
     }
 
     #[test]
+    fn automatic_download_permission_is_one_use_and_reports_reuse() {
+        let completion = Arc::new((Mutex::new(None), Condvar::new()));
+        let mut policy = NavigationPolicy {
+            pending_download: Some(PendingDownload {
+                origin: "https://example.com".to_string(),
+                destination: PathBuf::from("one-use.part"),
+                name: "one-use.txt".to_string(),
+                mime: "text/plain".to_string(),
+                max_bytes: 1024,
+                automatic_download_permission_armed: true,
+                completion: completion.clone(),
+            }),
+            ..NavigationPolicy::default()
+        };
+
+        assert!(consume_automatic_download_permission(&mut policy).is_ok());
+        assert!(
+            !policy
+                .pending_download
+                .as_ref()
+                .unwrap()
+                .automatic_download_permission_armed
+        );
+        let reuse = consume_automatic_download_permission(&mut policy)
+            .err()
+            .expect("reusing the one-use permission must fail");
+        assert!(reuse.contains("more than once"));
+        let surfaced = completion
+            .0
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the waiting download must receive the interruption");
+        match surfaced {
+            Err(reason) => assert!(reason.contains("more than once")),
+            Ok(_) => panic!("permission reuse cannot complete a download"),
+        }
+    }
+
+    #[test]
+    fn unrelated_webview_permission_interrupts_an_armed_download() {
+        let completion = Arc::new((Mutex::new(None), Condvar::new()));
+        let policy = NavigationPolicy {
+            pending_download: Some(PendingDownload {
+                origin: "https://example.com".to_string(),
+                destination: PathBuf::from("denied.part"),
+                name: "denied.txt".to_string(),
+                mime: "text/plain".to_string(),
+                max_bytes: 1024,
+                automatic_download_permission_armed: true,
+                completion: completion.clone(),
+            }),
+            ..NavigationPolicy::default()
+        };
+
+        interrupt_pending_download_permission(&policy, 2);
+        let surfaced = completion
+            .0
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the waiting download must receive the denied permission");
+        match surfaced {
+            Err(reason) => assert!(reason.contains("denied permission kind 2")),
+            Ok(_) => panic!("a denied permission cannot complete a download"),
+        }
+    }
+
+    #[test]
     fn download_origin_policy_allows_exact_cdn_grant_and_denies_other_redirects() {
         let policy = Arc::new(Mutex::new(NavigationPolicy::default()));
         policy
@@ -3074,6 +3220,9 @@ mod tests {
                     != Some(super::super::base64(b"physical webview2 download").as_str())
                 {
                     return Err("physical download bytes mismatch".to_string());
+                }
+                if b"physical webview2 download".len() != 26 {
+                    return Err("physical fixture no longer exercises a 26-byte import".to_string());
                 }
                 let staging = worker_root
                     .join("agent-browser")
