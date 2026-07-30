@@ -38,9 +38,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
-use std::process::Stdio;
-use std::process::{Child, Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -98,6 +96,23 @@ fn logln(msg: &str) {
             let _ = writeln!(f, "{msg}");
         }
     }
+}
+
+/// Route the managed hub tree into the same durable startup log as the desktop shell.
+///
+/// A GUI-launched process has no useful inherited console on Windows or macOS. `hubctl`
+/// also passes these handles to its blue/green hub children, so binding both streams here
+/// preserves the actual module-link, preflight, and bind failure instead of reducing every
+/// child-side startup problem to the desktop's generic readiness timeout.
+fn capture_hub_output(cmd: &mut Command) {
+    let Some(path) = LOG_FILE.get() else { return };
+    let Ok(stdout) = fs::OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let Ok(stderr) = fs::OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    cmd.stdout(Stdio::from(stdout)).stderr(Stdio::from(stderr));
 }
 
 /// Where the hub listens. Release builds are fixed to the product port. A debug-only override lets the
@@ -1236,6 +1251,7 @@ fn release_boot(
         .env("AMA_DESKTOP_BROWSER_ADDR", &browser_address);
     set_own_group(&mut cmd); // POSIX: own process group so kill_hub can group-signal the whole tree
     hide_console(&mut cmd); // Windows: no stray black console window in front of the app
+    capture_hub_output(&mut cmd);
     match cmd.spawn() {
         Ok(child) => {
             logln(&format!(
