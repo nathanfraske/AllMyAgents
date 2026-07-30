@@ -1,6 +1,9 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import { createRequire } from 'node:module'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { isMainThread, parentPort, Worker, workerData } from 'node:worker_threads'
 import Database from 'better-sqlite3'
 import {
   runHubPreflight,
@@ -33,6 +36,21 @@ const MAX_GENERATION_ENTRIES = 16
 const MAX_STAGING_ENTRIES = 16
 const MAX_INCIDENTS = 64
 const MAX_QUARANTINE_BYTES = 1n << 40n
+export const JOURNAL_RECOVERY_WORKER_ABSOLUTE_MS = 5 * 60_000
+
+type JournalRecoveryWorkerRequest = {
+  kind: 'journal-recovery-v1'
+  attemptId: string
+  operationId: string
+  dataDir: string
+  journalPath: string
+  schemaVersion: number
+}
+
+export type JournalRecoveryWorkerResult = {
+  preflight: HubPreflightResult
+  recovery?: RecoveryReceipt
+}
 
 export type AutomaticRecoveryCause =
   | 'sqlite-corruption'
@@ -1228,6 +1246,59 @@ export function listRecoveryGenerations(
   return generations
 }
 
+export type StrongRecoverySnapshotCoverage = {
+  rootId: string
+  journalId: string
+  generation: string
+  manifestSha256: string
+  snapshotMaxSeq: string
+  snapshotEventHighWater: string
+  deleteThroughSeq: string
+}
+
+/**
+ * Read-only compaction gate. Only the newest canonical strong generation may cover deletion; an
+ * invalid newest generation fails closed instead of falling back. Legacy flat backups, filenames,
+ * mtimes, and quick_check results are never consulted.
+ */
+export function verifyStrongRecoverySnapshotCoverage(options: {
+  dataDir: string
+  journalPath: string
+  maxSchemaVersion: number
+  deleteThroughSeq: string
+}): StrongRecoverySnapshotCoverage {
+  const dataDir = path.resolve(options.dataDir)
+  const journalPath = path.resolve(options.journalPath)
+  if (path.dirname(journalPath) !== dataDir || path.basename(journalPath) !== 'hub.db') {
+    throw new Error('strong recovery coverage requires the exact data-root hub.db path')
+  }
+  decimal(options.deleteThroughSeq, 'prospective compaction delete frontier')
+  const binding = parseRootBinding(recoveryPaths(dataDir).rootBinding)
+  const candidates = scanRecoveryCandidates(dataDir)
+  const newest = candidates[0]
+  if (!newest) throw new Error('no strong recovery generation covers compaction')
+  if (BigInt(newest.manifest.generation) >= BigInt(binding.nextGeneration)) {
+    throw new Error('newest recovery generation exceeds reserved generation authority')
+  }
+  const generation = verifyGeneration(newest.directory, binding, options.maxSchemaVersion)
+  const frontier = BigInt(options.deleteThroughSeq)
+  if (
+    BigInt(generation.manifest.maxSeq) < frontier ||
+    BigInt(generation.manifest.eventHighWater) < frontier
+  ) {
+    throw new Error('newest strong recovery generation does not cover the delete frontier')
+  }
+  return {
+    rootId: binding.rootId,
+    journalId: binding.activeJournalId,
+    generation: generation.manifest.generation,
+    manifestSha256: sha256File(path.join(generation.directory, MANIFEST_FILE)),
+    snapshotMaxSeq: generation.manifest.maxSeq,
+    snapshotEventHighWater: generation.manifest.eventHighWater,
+    deleteThroughSeq: options.deleteThroughSeq,
+  }
+}
+
 function selectRecoveryGeneration(
   dataDir: string,
   maxSchemaVersion: number
@@ -2229,6 +2300,105 @@ function readReceipt(file: string): RecoveryReceipt {
   return raw as RecoveryReceipt
 }
 
+function verifyCanonicalQuarantineEvidence(
+  paths: RecoveryPaths,
+  receipt: RecoveryReceipt
+): void {
+  const canonicalDirectory = path.join(paths.quarantine, receipt.planId)
+  if (path.resolve(receipt.quarantineDir) !== path.resolve(canonicalDirectory)) {
+    throw new Error('recovery receipt does not bind its canonical quarantine incident')
+  }
+  const incidentState = lstatState(canonicalDirectory)
+  if (
+    incidentState.state !== 'present' ||
+    !incidentState.stat.isDirectory() ||
+    incidentState.stat.isSymbolicLink()
+  ) {
+    throw new Error('canonical quarantine incident is missing or not a real directory')
+  }
+  const quarantineReal = fs.realpathSync.native(paths.quarantine)
+  if (path.dirname(fs.realpathSync.native(canonicalDirectory)) !== quarantineReal) {
+    throw new Error('canonical quarantine incident escaped its owned directory')
+  }
+
+  const evidenceFile = path.join(canonicalDirectory, EVIDENCE_FILE)
+  assertRegular(evidenceFile, true)
+  if (sha256File(evidenceFile) !== receipt.evidenceSha256) {
+    throw new Error('recovery receipt evidence digest is invalid')
+  }
+  const evidence = object(readJson(evidenceFile))
+  const evidenceRoot = object(evidence?.root)
+  if (
+    !evidence ||
+    evidence.format !== FORMAT ||
+    evidence.planId !== receipt.planId ||
+    evidence.cause !== receipt.cause ||
+    evidence.rootId !== receipt.rootId ||
+    evidence.journalId !== receipt.journalId ||
+    evidence.generation !== receipt.generation ||
+    evidence.priorActiveGeneration !== receipt.previousActiveGeneration ||
+    evidence.priorActiveManifestSha256 !== receipt.previousActiveManifestSha256 ||
+    !evidenceRoot ||
+    typeof evidenceRoot.realPath !== 'string' ||
+    typeof evidenceRoot.dev !== 'string' ||
+    !DECIMAL.test(evidenceRoot.dev) ||
+    typeof evidenceRoot.ino !== 'string' ||
+    !DECIMAL.test(evidenceRoot.ino) ||
+    typeof evidence.createdAt !== 'string' ||
+    !Array.isArray(evidence.family) ||
+    evidence.family.length < 1 ||
+    evidence.family.length > SQLITE_FAMILY.length
+  ) {
+    throw new Error('canonical quarantine evidence manifest is malformed or conflicts with its receipt')
+  }
+  timestamp(evidence.createdAt, 'recovery evidence creation time')
+
+  const family: FileFingerprint[] = []
+  const familyNames = new Set<string>()
+  for (const item of evidence.family) {
+    const entry = object(item)
+    if (
+      !entry ||
+      !SQLITE_FAMILY.includes(entry.name as (typeof SQLITE_FAMILY)[number]) ||
+      familyNames.has(String(entry.name)) ||
+      typeof entry.dev !== 'string' ||
+      !DECIMAL.test(entry.dev) ||
+      typeof entry.ino !== 'string' ||
+      !DECIMAL.test(entry.ino) ||
+      typeof entry.size !== 'string' ||
+      !DECIMAL.test(entry.size) ||
+      typeof entry.mtimeNs !== 'string' ||
+      !DECIMAL.test(entry.mtimeNs) ||
+      typeof entry.sha256 !== 'string' ||
+      !SHA256.test(entry.sha256)
+    ) {
+      throw new Error('canonical quarantine evidence contains a malformed family identity')
+    }
+    familyNames.add(String(entry.name))
+    family.push(entry as FileFingerprint)
+  }
+
+  const incidentEntries = boundedEntries(
+    canonicalDirectory,
+    SQLITE_FAMILY.length + 1,
+    'recovery incident files'
+  )
+  const expectedEntries = new Set<string>([EVIDENCE_FILE, ...family.map((entry) => entry.name)])
+  if (
+    incidentEntries.length !== expectedEntries.size ||
+    incidentEntries.some((entry) => !expectedEntries.has(entry))
+  ) {
+    throw new Error('canonical quarantine incident closure differs from its evidence manifest')
+  }
+  for (const expected of family) {
+    const file = path.join(canonicalDirectory, expected.name)
+    assertRegular(file, true)
+    if (!sameFingerprint(file, expected)) {
+      throw new Error(`quarantined SQLite family identity changed: ${expected.name}`)
+    }
+  }
+}
+
 function completeRecoveryTransition(
   paths: RecoveryPaths,
   plan: RecoveryPlan,
@@ -2909,6 +3079,197 @@ export function bootstrapJournalRecovery(options: {
   }
 }
 
+/**
+ * Run independent classification/recovery off the supervisor thread. A valid result is bound to the
+ * exact Worker instance and fresh attempt ID. Timeout, exit without a result, malformed output, or a
+ * lost acknowledgement leaves the root offline; callers must never infer completion from absence.
+ */
+export function bootstrapJournalRecoveryInWorker(options: {
+  dataDir: string
+  journalPath: string
+  schemaVersion: number
+  operationId: string
+  attemptId: string
+  timeoutMs?: number
+  onLiveness?: (elapsedMs: number) => void
+}): Promise<JournalRecoveryWorkerResult> {
+  if (!isMainThread) {
+    return Promise.reject(new Error('nested journal recovery workers are forbidden'))
+  }
+  const timeoutMs = options.timeoutMs ?? JOURNAL_RECOVERY_WORKER_ABSOLUTE_MS
+  if (
+    !SAFE_UUID.test(options.operationId) ||
+    !SAFE_UUID.test(options.attemptId) ||
+    !Number.isSafeInteger(options.schemaVersion) ||
+    options.schemaVersion < 0 ||
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs < 1 ||
+    timeoutMs > JOURNAL_RECOVERY_WORKER_ABSOLUTE_MS
+  ) {
+    return Promise.reject(new Error('invalid journal recovery worker contract'))
+  }
+  return new Promise((resolve, reject) => {
+    const moduleUrl = new URL(import.meta.url)
+    const sourceIsTypeScript = fileURLToPath(moduleUrl).endsWith('.ts')
+    const worker = new Worker(moduleUrl, {
+      ...(sourceIsTypeScript
+        ? {
+            execArgv: [
+              '--import',
+              pathToFileURL(createRequire(import.meta.url).resolve('tsx/esm')).href,
+            ],
+          }
+        : {}),
+      workerData: {
+        kind: 'journal-recovery-v1',
+        attemptId: options.attemptId,
+        operationId: options.operationId,
+        dataDir: options.dataDir,
+        journalPath: options.journalPath,
+        schemaVersion: options.schemaVersion,
+      } satisfies JournalRecoveryWorkerRequest,
+    })
+    const startedAt = Date.now()
+    let settled = false
+    const livenessTimer = setInterval(() => {
+      options.onLiveness?.(Date.now() - startedAt)
+    }, 10_000)
+    const absoluteTimer = setTimeout(() => {
+      finish(new Error('journal recovery worker exceeded its absolute execution ceiling'))
+    }, timeoutMs)
+    const finish = (error?: unknown, result?: JournalRecoveryWorkerResult): void => {
+      if (settled) return
+      settled = true
+      clearInterval(livenessTimer)
+      clearTimeout(absoluteTimer)
+      void worker.terminate()
+      if (error !== undefined) reject(error)
+      else resolve(result!)
+    }
+    worker.on('message', (message: unknown) => {
+      const raw =
+        message !== null && typeof message === 'object'
+          ? (message as Record<string, unknown>)
+          : undefined
+      if (!raw || raw.attemptId !== options.attemptId) {
+        finish(new Error('journal recovery worker result attempt binding is invalid'))
+        return
+      }
+      if (raw.kind === 'journal-recovery-error-v1') {
+        if (
+          Object.keys(raw).sort().join(',') !== 'attemptId,error,kind' ||
+          typeof raw.error !== 'string' ||
+          raw.error.length < 1 ||
+          raw.error.length > 4_096
+        ) {
+          finish(new Error('journal recovery worker returned a malformed error'))
+        } else {
+          finish(new Error(`journal recovery worker failed: ${raw.error}`))
+        }
+        return
+      }
+      if (
+        raw.kind !== 'journal-recovery-result-v1' ||
+        Object.keys(raw).sort().join(',') !== 'attemptId,kind,result' ||
+        raw.result === null ||
+        typeof raw.result !== 'object'
+      ) {
+        finish(new Error('journal recovery worker returned a malformed result'))
+        return
+      }
+      const result = raw.result as Record<string, unknown>
+      const keys = Object.keys(result).sort().join(',')
+      if (
+        (keys !== 'preflight' && keys !== 'preflight,recovery') ||
+        result.preflight === null ||
+        typeof result.preflight !== 'object' ||
+        typeof (result.preflight as Record<string, unknown>).ok !== 'boolean'
+      ) {
+        finish(new Error('journal recovery worker returned invalid preflight evidence'))
+        return
+      }
+      if (result.recovery !== undefined) {
+        const recovery = result.recovery as Partial<RecoveryReceipt>
+        if (
+          recovery === null ||
+          typeof recovery !== 'object' ||
+          typeof recovery.planId !== 'string' ||
+          !SAFE_UUID.test(recovery.planId) ||
+          typeof recovery.generation !== 'string' ||
+          !DECIMAL.test(recovery.generation) ||
+          typeof recovery.quarantineDir !== 'string' ||
+          typeof recovery.receiptFile !== 'string' ||
+          typeof recovery.evidenceSha256 !== 'string' ||
+          !SHA256.test(recovery.evidenceSha256)
+        ) {
+          finish(new Error('journal recovery worker returned invalid receipt evidence'))
+          return
+        }
+      }
+      finish(undefined, result as JournalRecoveryWorkerResult)
+    })
+    worker.once('error', (error) => finish(error))
+    worker.once('exit', (exitCode) => {
+      if (!settled) {
+        finish(
+          new Error(
+            `journal recovery worker exited without an acknowledged result (code ${exitCode})`
+          )
+        )
+      }
+    })
+  })
+}
+
+const recoveryWorkerRequest =
+  !isMainThread && workerData !== null && typeof workerData === 'object'
+    ? (workerData as Partial<JournalRecoveryWorkerRequest>)
+    : undefined
+if (recoveryWorkerRequest?.kind === 'journal-recovery-v1') {
+  try {
+    if (
+      Object.keys(recoveryWorkerRequest).sort().join(',') !==
+        'attemptId,dataDir,journalPath,kind,operationId,schemaVersion' ||
+      typeof recoveryWorkerRequest.attemptId !== 'string' ||
+      !SAFE_UUID.test(recoveryWorkerRequest.attemptId) ||
+      typeof recoveryWorkerRequest.operationId !== 'string' ||
+      !SAFE_UUID.test(recoveryWorkerRequest.operationId) ||
+      typeof recoveryWorkerRequest.dataDir !== 'string' ||
+      recoveryWorkerRequest.dataDir.length < 1 ||
+      recoveryWorkerRequest.dataDir.length > 32_768 ||
+      typeof recoveryWorkerRequest.journalPath !== 'string' ||
+      recoveryWorkerRequest.journalPath.length < 1 ||
+      recoveryWorkerRequest.journalPath.length > 32_768 ||
+      !Number.isSafeInteger(recoveryWorkerRequest.schemaVersion) ||
+      Number(recoveryWorkerRequest.schemaVersion) < 0
+    ) {
+      throw new Error('journal recovery worker request is malformed')
+    }
+    const boot = bootstrapJournalRecovery({
+      dataDir: recoveryWorkerRequest.dataDir,
+      journalPath: recoveryWorkerRequest.journalPath,
+      schemaVersion: Number(recoveryWorkerRequest.schemaVersion),
+      operationId: recoveryWorkerRequest.operationId,
+    })
+    const result: JournalRecoveryWorkerResult = {
+      preflight: boot.preflight,
+      ...(boot.recovery ? { recovery: boot.recovery } : {}),
+    }
+    boot.lease.release()
+    parentPort?.postMessage({
+      kind: 'journal-recovery-result-v1',
+      attemptId: recoveryWorkerRequest.attemptId,
+      result,
+    })
+  } catch (error) {
+    parentPort?.postMessage({
+      kind: 'journal-recovery-error-v1',
+      attemptId: recoveryWorkerRequest.attemptId,
+      error: String(error).slice(0, 4_096),
+    })
+  }
+}
+
 function ensureRecoveryNoticeSchema(db: Database.Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS journal_recovery_notices (
@@ -2991,6 +3352,7 @@ export function consumeRecoveryReceipts(journal: {
     if (receipt.rootId !== binding.rootId || receipt.journalId !== currentJournalId) {
       throw new Error(`recovery receipt ${receipt.planId} belongs to a different root or journal`)
     }
+    verifyCanonicalQuarantineEvidence(paths, receipt)
     const existing = selectNotice.get(receipt.planId) as
       | {
           generation?: unknown
@@ -3011,11 +3373,6 @@ export function consumeRecoveryReceipts(journal: {
         throw new Error(`recovery notice ${receipt.planId} conflicts with its immutable receipt`)
       }
       continue
-    }
-    const evidenceFile = path.join(receipt.quarantineDir, EVIDENCE_FILE)
-    assertRegular(evidenceFile, true)
-    if (sha256File(evidenceFile) !== receipt.evidenceSha256) {
-      throw new Error(`recovery receipt ${receipt.planId} failed quarantine evidence verification`)
     }
     const recordedAt = receipt.completedAt
     const payload = {
@@ -3077,28 +3434,26 @@ export function validateRecoveryReceiptsBeforeWritableOpen(options: {
         MAX_INCIDENTS,
         'recovery incidents'
       )) {
-        if (SAFE_UUID.test(entry)) {
-          retainedIncidentIds.add(entry)
-          if (!completed.has(entry)) {
-            throw new Error('quarantine incident lacks completed receipt authority')
-          }
-        } else if (!/^archive-[A-Za-z0-9._-]{1,80}$/.test(entry)) {
-          throw new Error('noncanonical quarantine entry is not an explicit operator archive')
-        } else {
-          const archivedId = entry.slice('archive-'.length)
-          if (SAFE_UUID.test(archivedId) && completed.has(archivedId)) {
-            retainedIncidentIds.add(archivedId)
-          }
+        if (!SAFE_UUID.test(entry) || retainedIncidentIds.has(entry)) {
+          throw new Error('quarantine incident name is noncanonical or duplicated')
+        }
+        retainedIncidentIds.add(entry)
+        if (!completed.has(entry)) {
+          throw new Error('quarantine incident lacks completed receipt authority')
         }
       }
     }
-    const receiptEntries = boundedEntries(
+    const rawReceiptEntries = boundedEntries(
       paths.receipts,
       MAX_INCIDENTS,
       'recovery receipts'
     )
-      .filter((entry) => entry.endsWith('.json'))
-      .sort()
+    for (const entry of rawReceiptEntries) {
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/i.test(entry)) {
+        throw new Error('recovery receipt directory contains a noncanonical entry')
+      }
+    }
+    const receiptEntries = rawReceiptEntries.sort()
     const existing = new Map<string, Record<string, unknown>>()
     if (lstatState(options.journalPath).state === 'present') {
       db = new Database(options.journalPath, { readonly: true, fileMustExist: true })
@@ -3151,19 +3506,19 @@ export function validateRecoveryReceiptsBeforeWritableOpen(options: {
         ) {
           throw new Error('durable recovery notice conflicts with its immutable receipt')
         }
-        continue
       }
-      const evidenceFile = path.join(receipt.quarantineDir, EVIDENCE_FILE)
-      assertRegular(evidenceFile, true)
-      if (sha256File(evidenceFile) !== receipt.evidenceSha256) {
-        throw new Error('recovery receipt evidence digest is invalid')
-      }
+      verifyCanonicalQuarantineEvidence(paths, receipt)
     }
     if (receiptEntries.length !== completed.size) {
       throw new Error('completed recovery receipt index is incomplete')
     }
     if (retainedIncidentIds.size !== completed.size) {
       throw new Error('completed recovery receipt lacks its canonical quarantine incident')
+    }
+    for (const planId of existing.keys()) {
+      if (!SAFE_UUID.test(planId) || !completed.has(planId)) {
+        throw new Error('durable recovery notice lacks completed receipt authority')
+      }
     }
   } catch (error) {
     result = {

@@ -24,6 +24,7 @@ import {
   PreflightRefusalError,
   SCHEMA_VERSION,
   sendToHub,
+  waitForHubReady,
   waitForHubMsg,
   healthCheck,
   type HubMsg,
@@ -36,7 +37,7 @@ import {
   rollbackToBlue,
   waitForPortRelease,
 } from './restartRollback.js'
-import { bootstrapJournalRecovery } from './journalRecovery.js'
+import { bootstrapJournalRecoveryInWorker } from './journalRecovery.js'
 
 /** The hard public singleton the web client hardcodes (`api.ts:145`). Blue owns it; green takes it on promote.
  *  HUB_FIXED_PORT overrides it for an isolated harness (e.g. the restart-survival acceptance test) so a
@@ -73,7 +74,22 @@ interface HubHandle {
   color: HubColor
   port: number // 7777 for the live hub; the ephemeral port for a booting green (until it's promoted)
   restored: number // sessions restored, from the hub's `ready` message
+  preflightAttemptId: string
   state: 'booting' | 'live' | 'draining' | 'promoted' | 'retired'
+}
+
+function waitForReady(handle: HubHandle) {
+  return waitForHubReady(
+    handle.child,
+    handle.preflightAttemptId,
+    undefined,
+    (phase, elapsedMs) =>
+      log(
+        `hub(${handle.color}) preflight phase: ${phase}${
+          phase === 'integrity-check' ? ' — integrity verification still running' : ''
+        } elapsedMs=${elapsedMs}`
+      )
+  )
 }
 
 /** The hub currently listening on 7777. */
@@ -165,6 +181,7 @@ function hubLaunchCommand(): { cmd: string; args: string[] } {
  */
 function spawnHub(port: number, color: HubColor): HubHandle {
   const { cmd, args } = hubLaunchCommand()
+  const preflightAttemptId = crypto.randomUUID()
   const child = spawn(cmd, args, {
     stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
     // POSIX (macOS/Linux): run each hub as its OWN process-group leader so killTree can signal the
@@ -181,9 +198,23 @@ function spawnHub(port: number, color: HubColor): HubHandle {
     windowsHide: true,
     // Worker mode (opt-in) injects HUB_WORKER_SOCKET so blue AND green connect to the same worker; when
     // disabled the spread adds nothing, so the env is byte-identical to today (docs/agent-worker-impl.md §5.1).
-    env: { ...process.env, ...profileOwnerEnv, HUB_PORT: String(port), HUB_SUPERVISED: '1', ...(workerSocket ? { HUB_WORKER_SOCKET: workerSocket } : {}) },
+    env: {
+      ...process.env,
+      ...profileOwnerEnv,
+      HUB_PORT: String(port),
+      HUB_SUPERVISED: '1',
+      HUB_PREFLIGHT_ATTEMPT_ID: preflightAttemptId,
+      ...(workerSocket ? { HUB_WORKER_SOCKET: workerSocket } : {}),
+    },
   })
-  const handle: HubHandle = { child, color, port, restored: 0, state: 'booting' }
+  const handle: HubHandle = {
+    child,
+    color,
+    port,
+    restored: 0,
+    preflightAttemptId,
+    state: 'booting',
+  }
   children.add(child)
   child.on('error', (err) => log(`hub(${color}) failed to spawn: ${String(err)}`))
   child.on('exit', (code, signal) => {
@@ -333,7 +364,7 @@ async function reviveLiveHub(): Promise<void> {
       try {
         candidate = spawnHub(FIXED_PORT, 'blue')
         const next = candidate
-        const ready = await waitForHubMsg(next.child, 'ready', 20_000)
+        const ready = await waitForReady(next)
         next.port = ready.port
         next.restored = ready.restored
         await healthCheck(next.port, { expectRestored: next.restored })
@@ -504,27 +535,31 @@ function enterRecoveryPoison(
       throw new Error('preflight refusal is not eligible for automatic recovery; root remains offline')
     }
 
-    const recovery = bootstrapJournalRecovery({
+    const recoveryAttemptId = crypto.randomUUID()
+    const recovery = await bootstrapJournalRecoveryInWorker({
       dataDir,
       journalPath: path.join(dataDir, 'hub.db'),
       schemaVersion: SCHEMA_VERSION,
       operationId,
-    })
-    try {
-      if (!recovery.preflight.ok) {
-        throw new Error(
-          `independent recovery classifier refused [${recovery.preflight.failure.code}]: ${recovery.preflight.failure.message}`
-        )
-      }
-      if (!recovery.recovery) {
-        log('independent copied-family classifier found no recoverable corruption; attempting one fresh normal boot')
-      } else {
+      attemptId: recoveryAttemptId,
+      onLiveness: (elapsedMs) =>
         log(
-          `recovery operation ${operationId} restored generation ${recovery.recovery.generation}; quarantine=${recovery.recovery.quarantineDir}`
-        )
-      }
-    } finally {
-      recovery.lease.release()
+          `independent journal recovery still running; operation=${operationId}; attempt=${recoveryAttemptId}; elapsedMs=${elapsedMs}`
+        ),
+    })
+    if (!recovery.preflight.ok) {
+      throw new Error(
+        `independent recovery classifier refused [${recovery.preflight.failure.code}]: ${recovery.preflight.failure.message}`
+      )
+    }
+    if (!recovery.recovery) {
+      log(
+        'independent copied-family classifier found no recoverable corruption; attempting one fresh normal boot'
+      )
+    } else {
+      log(
+        `recovery operation ${recovery.recovery.planId} restored generation ${recovery.recovery.generation}; quarantine=${recovery.recovery.quarantineDir}`
+      )
     }
 
     let freshWorker: ChildProcess | null = null
@@ -541,7 +576,7 @@ function enterRecoveryPoison(
         }
       }
       freshBlue = spawnHub(FIXED_PORT, 'blue')
-      const ready = await waitForHubMsg(freshBlue.child, 'ready', 20_000)
+      const ready = await waitForReady(freshBlue)
       freshBlue.port = ready.port
       freshBlue.restored = ready.restored
       await healthCheck(freshBlue.port, { expectRestored: freshBlue.restored })
@@ -619,7 +654,7 @@ async function boot(): Promise<void> {
   log(`booting hub (blue) on :${FIXED_PORT}`)
   const blue = spawnHub(FIXED_PORT, 'blue')
   try {
-    const ready = await waitForHubMsg(blue.child, 'ready', 20_000)
+    const ready = await waitForReady(blue)
     blue.port = ready.port
     blue.restored = ready.restored
     await healthCheck(blue.port, { expectRestored: blue.restored })
@@ -669,7 +704,7 @@ async function restart(reason: string): Promise<void> {
   log(`restart requested (${reason}) — booting green on an ephemeral port`)
   const green = spawnHub(0, 'green')
   try {
-    const ready = await waitForHubMsg(green.child, 'ready', 15_000)
+    const ready = await waitForReady(green)
     green.port = ready.port
     green.restored = ready.restored
     log(`green ready on :${green.port} — ${green.restored} session(s) restored; health-checking`)

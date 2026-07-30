@@ -8,6 +8,7 @@ import { snapshotJournal } from './journalBackup.js'
 import {
   JournalRecoveryLease,
   bootstrapJournalRecovery,
+  bootstrapJournalRecoveryInWorker,
   consumeRecoveryReceipts,
   dismissRecoveryNotice,
   ensureRecoveryEnrollment,
@@ -17,6 +18,7 @@ import {
   recoveryPaths,
   validateRecoveryReceiptsBeforeWritableOpen,
   verifyNormalJournalLineage,
+  verifyStrongRecoverySnapshotCoverage,
 } from './journalRecovery.js'
 import { SCHEMA_VERSION } from './restartHandshake.js'
 
@@ -57,6 +59,136 @@ afterEach(() => {
 })
 
 describe('owned journal corruption recovery', () => {
+  it('runs healthy independent classification in a source/tsx worker', async () => {
+    const dataDir = root()
+    const journal = open(dataDir)
+    journal.append('s1', 'session/input', { text: 'healthy-worker-classification' })
+    await strongSnapshot(dataDir, journal, new Date('2026-07-29T00:00:00.000Z'))
+    journal.db.close()
+
+    const result = await bootstrapJournalRecoveryInWorker({
+      dataDir,
+      journalPath: path.join(dataDir, 'hub.db'),
+      schemaVersion: SCHEMA_VERSION,
+      operationId: '11111111-1111-4111-8111-111111111111',
+      attemptId: '22222222-2222-4222-8222-222222222222',
+    })
+
+    expect(result.preflight.ok).toBe(true)
+    expect(result.recovery).toBeUndefined()
+  })
+
+  it('keeps the caller responsive and the journal unchanged when recovery worker execution wedges', async () => {
+    const dataDir = root()
+    const journal = open(dataDir)
+    journal.append('s1', 'session/input', { text: 'worker-timeout-is-offline' })
+    journal.db.close()
+    const journalPath = path.join(dataDir, 'hub.db')
+    const before = fs.readFileSync(journalPath)
+    const lease = new JournalRecoveryLease(dataDir)
+    lease.acquireShared()
+    lease.acquireExclusive()
+    let parentTimerRan = false
+    const parentTimer = setTimeout(() => {
+      parentTimerRan = true
+    }, 10)
+
+    try {
+      await expect(
+        bootstrapJournalRecoveryInWorker({
+          dataDir,
+          journalPath,
+          schemaVersion: SCHEMA_VERSION,
+          operationId: '33333333-3333-4333-8333-333333333333',
+          attemptId: '44444444-4444-4444-8444-444444444444',
+          timeoutMs: 100,
+        })
+      ).rejects.toThrow(/absolute execution ceiling/i)
+      expect(parentTimerRan).toBe(true)
+      expect(fs.readFileSync(journalPath)).toEqual(before)
+    } finally {
+      clearTimeout(parentTimer)
+      lease.release()
+    }
+  })
+
+  it('exports read-only strong-snapshot coverage for an exact compaction frontier', async () => {
+    const dataDir = root()
+    const journal = open(dataDir)
+    journal.append('s1', 'session/input', { text: 'covered-one' })
+    journal.append('s1', 'session/input', { text: 'covered-two' })
+    await strongSnapshot(dataDir, journal, new Date('2026-07-29T00:00:00.000Z'))
+
+    const coverage = verifyStrongRecoverySnapshotCoverage({
+      dataDir,
+      journalPath: path.join(dataDir, 'hub.db'),
+      maxSchemaVersion: SCHEMA_VERSION,
+      deleteThroughSeq: '2',
+    })
+
+    expect(coverage).toMatchObject({
+      generation: '1',
+      snapshotMaxSeq: '2',
+      snapshotEventHighWater: '2',
+      deleteThroughSeq: '2',
+    })
+    expect(coverage.rootId).toMatch(/^[0-9a-f-]{36}$/i)
+    expect(coverage.journalId).toMatch(/^[0-9a-f-]{36}$/i)
+    expect(coverage.manifestSha256).toMatch(/^[0-9a-f]{64}$/)
+    expect(() =>
+      verifyStrongRecoverySnapshotCoverage({
+        dataDir,
+        journalPath: path.join(dataDir, 'hub.db'),
+        maxSchemaVersion: SCHEMA_VERSION,
+        deleteThroughSeq: '3',
+      })
+    ).toThrow(/does not cover/i)
+  })
+
+  it('never falls back from an invalid newest strong generation or to a legacy flat backup', async () => {
+    const dataDir = root()
+    const journal = open(dataDir)
+    journal.append('s1', 'session/input', { text: 'generation-one' })
+    await strongSnapshot(dataDir, journal, new Date('2026-07-29T00:00:00.000Z'))
+    journal.append('s1', 'session/input', { text: 'generation-two' })
+    await strongSnapshot(dataDir, journal, new Date('2026-07-29T00:01:00.000Z'))
+    const newest = fs
+      .readdirSync(recoveryPaths(dataDir).generations)
+      .filter((entry) => entry.startsWith('g-'))
+      .sort()
+      .at(-1)!
+    fs.appendFileSync(
+      path.join(recoveryPaths(dataDir).generations, newest, 'snapshot.db'),
+      Buffer.from([0])
+    )
+
+    expect(() =>
+      verifyStrongRecoverySnapshotCoverage({
+        dataDir,
+        journalPath: path.join(dataDir, 'hub.db'),
+        maxSchemaVersion: SCHEMA_VERSION,
+        deleteThroughSeq: '1',
+      })
+    ).toThrow()
+
+    const legacyDataDir = root('ama-legacy-flat-backup')
+    const legacyJournal = open(legacyDataDir)
+    legacyJournal.append('legacy', 'session/input', { text: 'legacy-only' })
+    fs.mkdirSync(path.join(legacyDataDir, 'backups'), { recursive: true })
+    fs.copyFileSync(
+      path.join(legacyDataDir, 'hub.db'),
+      path.join(legacyDataDir, 'backups', 'hub-legacy.db')
+    )
+    expect(() =>
+      verifyStrongRecoverySnapshotCoverage({
+        dataDir: legacyDataDir,
+        journalPath: path.join(legacyDataDir, 'hub.db'),
+        maxSchemaVersion: SCHEMA_VERSION,
+        deleteThroughSeq: '1',
+      })
+    ).toThrow()
+  })
+
   it.each([
     'after-enrollment-intent',
     'after-enrollment-identity',
@@ -1148,9 +1280,7 @@ describe('owned journal corruption recovery', () => {
     fs.unlinkSync(path.join(recovered.recovery!.quarantineDir, 'evidence.json'))
     expect(
       validateRecoveryReceiptsBeforeWritableOpen({ dataDir, journalPath })
-    ).toBeUndefined()
-    expect(consumeRecoveryReceipts(restored)).toBe(0)
-    restored.db.prepare('DELETE FROM journal_recovery_notices WHERE plan_id = ?').run(replayed.planId)
+    ).toMatchObject({ code: 'database-validation-unavailable' })
     expect(() => consumeRecoveryReceipts(restored)).toThrow(/evidence|ENOENT/i)
   })
 
@@ -1174,6 +1304,114 @@ describe('owned journal corruption recovery', () => {
       validateRecoveryReceiptsBeforeWritableOpen({ dataDir, journalPath })
     ).toMatchObject({ code: 'database-validation-unavailable' })
   })
+
+  it.each([
+    [
+      'deleted family member after notice dismissal',
+      (
+        dataDir: string,
+        recovered: NonNullable<ReturnType<typeof bootstrapJournalRecovery>['recovery']>
+      ) => {
+        const restored = open(dataDir)
+        expect(consumeRecoveryReceipts(restored)).toBe(1)
+        expect(dismissRecoveryNotice(restored.db, recovered.planId)).toBe(true)
+        restored.db.close()
+        const member = fs
+          .readdirSync(recovered.quarantineDir)
+          .find((entry) => entry.startsWith('hub.db'))
+        expect(member).toBeDefined()
+        fs.unlinkSync(path.join(recovered.quarantineDir, member!))
+      },
+    ],
+    [
+      'replaced family member',
+      (
+        _dataDir: string,
+        recovered: NonNullable<ReturnType<typeof bootstrapJournalRecovery>['recovery']>
+      ) => {
+        const member = fs
+          .readdirSync(recovered.quarantineDir)
+          .find((entry) => entry.startsWith('hub.db'))
+        expect(member).toBeDefined()
+        const file = path.join(recovered.quarantineDir, member!)
+        fs.unlinkSync(file)
+        fs.writeFileSync(file, 'replacement')
+      },
+    ],
+    [
+      'duplicate archive incident',
+      (
+        dataDir: string,
+        recovered: NonNullable<ReturnType<typeof bootstrapJournalRecovery>['recovery']>
+      ) => {
+        const paths = recoveryPaths(dataDir)
+        fs.mkdirSync(path.join(paths.quarantine, `archive-${recovered.planId}`))
+      },
+    ],
+  ])('fails closed on %s before writable open', async (_label, mutate) => {
+    const dataDir = root()
+    const journal = open(dataDir)
+    journal.append('s1', 'session/input', { text: 'continuous-evidence' })
+    await strongSnapshot(dataDir, journal, new Date('2026-07-29T00:00:00.000Z'))
+    journal.db.close()
+    const journalPath = path.join(dataDir, 'hub.db')
+    fs.writeFileSync(journalPath, Buffer.alloc(96 * 1024, 0x73))
+    const result = bootstrapJournalRecovery({
+      dataDir,
+      journalPath,
+      schemaVersion: SCHEMA_VERSION,
+    })
+    result.lease.release()
+    const recovered = result.recovery!
+    mutate(dataDir, recovered)
+
+    expect(
+      validateRecoveryReceiptsBeforeWritableOpen({ dataDir, journalPath })
+    ).toMatchObject({ code: 'database-validation-unavailable' })
+  })
+
+  it.each(['receipt', 'notice'])(
+    'fails closed when an orphan recovery %s is present before writable open',
+    async (kind) => {
+      const dataDir = root()
+      const journal = open(dataDir)
+      journal.append('s1', 'session/input', { text: 'orphan-evidence' })
+      await strongSnapshot(dataDir, journal, new Date('2026-07-29T00:00:00.000Z'))
+      journal.db.close()
+      const journalPath = path.join(dataDir, 'hub.db')
+      fs.writeFileSync(journalPath, Buffer.alloc(96 * 1024, 0x74))
+      const result = bootstrapJournalRecovery({
+        dataDir,
+        journalPath,
+        schemaVersion: SCHEMA_VERSION,
+      })
+      result.lease.release()
+      const recovered = result.recovery!
+      const orphanId = '99999999-9999-4999-8999-999999999999'
+      if (kind === 'receipt') {
+        fs.copyFileSync(
+          recovered.receiptFile,
+          path.join(recoveryPaths(dataDir).receipts, `${orphanId}.json`)
+        )
+      } else {
+        const restored = open(dataDir)
+        expect(consumeRecoveryReceipts(restored)).toBe(1)
+        restored.db
+          .prepare(
+            `INSERT INTO journal_recovery_notices (
+               plan_id, generation, snapshot_max_seq, snapshot_event_high_water,
+               quarantine_dir, recorded_at, dismissed_at
+             ) VALUES (?, '1', '0', '0', ?, '2026-07-29T00:00:00.000Z', NULL)`
+          )
+          .run(orphanId, path.join(recoveryPaths(dataDir).quarantine, orphanId))
+        restored.db.close()
+      }
+
+      expect(
+        validateRecoveryReceiptsBeforeWritableOpen({ dataDir, journalPath })
+      ).toMatchObject({ code: 'database-validation-unavailable' })
+    }
+  )
 
   it('keeps a completed recovery offline when its root-bound receipt disappears', async () => {
     const dataDir = root()

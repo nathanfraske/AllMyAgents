@@ -20,6 +20,10 @@ export const ASK_RESTART_INTERRUPT_MARGIN_MS = 250
 // Worst case: three SQLite writes may each wait the configured 5s busy_timeout, followed by the Ask
 // grace, interrupt dispatch, and listener-close margin. Keep this single-sourced with hubctl.
 export const HUB_DRAIN_RELEASE_TIMEOUT_MS = 30_000
+export const HUB_PREFLIGHT_START_TIMEOUT_MS = 10_000
+export const HUB_PREFLIGHT_LIVENESS_TIMEOUT_MS = 10_000
+export const HUB_PREFLIGHT_ABSOLUTE_TIMEOUT_MS = 5 * 60_000
+export const HUB_PREFLIGHT_STATUS_INTERVAL_MS = 10_000
 
 export interface JournalBackupControlCommand {
   type: 'journal-backup-control'
@@ -37,6 +41,13 @@ export interface JournalBackupControlResult {
   error?: string
 }
 
+export type PreflightLiveness = {
+  type: 'preflight-liveness'
+  attemptId: string
+  phase: 'starting' | 'integrity-check' | 'booting'
+  sequence: number
+}
+
 /** Supervisor -> hub. */
 export type SupervisorMsg =
   | { type: 'drain' } //   stop accepting new sessions (503), close the listener, keep the process alive
@@ -47,7 +58,14 @@ export type SupervisorMsg =
 
 /** Hub -> supervisor. */
 export type HubMsg =
-  | { type: 'ready'; port: number; restored: number; schemaVersion: number } // after boot() + listening
+  | {
+      type: 'ready'
+      attemptId: string
+      port: number
+      restored: number
+      schemaVersion: number
+    } // after boot() + listening
+  | PreflightLiveness
   | {
       type: 'released'
       questionTurns: { settled: number; outcomeUnknown: number }
@@ -74,6 +92,7 @@ export type HubMsg =
    */
   | {
       type: 'preflight-failed'
+      attemptId: string
       code: string
       message: string
       recovery: string
@@ -117,6 +136,13 @@ export class MalformedPreflightRefusalError extends Error {
   }
 }
 
+export class MalformedPreflightLivenessError extends Error {
+  constructor(detail = 'hub sent malformed preflight liveness') {
+    super(detail)
+    this.name = 'MalformedPreflightLivenessError'
+  }
+}
+
 function boundedIpcText(
   value: unknown,
   label: string,
@@ -143,6 +169,14 @@ function parsePreflightRefusal(value: unknown): PreflightRefusal {
       ? (value as Record<string, unknown>)
       : undefined
   if (!raw || raw.type !== 'preflight-failed') throw new MalformedPreflightRefusalError()
+  if (
+    typeof raw.attemptId !== 'string' ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      raw.attemptId
+    )
+  ) {
+    throw new MalformedPreflightRefusalError()
+  }
   const code = boundedIpcText(raw.code, 'code', 128, false)
   const message = boundedIpcText(raw.message, 'message', 4096, true)
   const recovery = boundedIpcText(raw.recovery, 'recovery', 4096, true)
@@ -155,8 +189,16 @@ function parsePreflightRefusal(value: unknown): PreflightRefusal {
   ) {
     throw new MalformedPreflightRefusalError()
   }
+  const expectedKeys =
+    cause === undefined
+      ? 'attemptId,code,message,recovery,type'
+      : 'attemptId,code,message,recovery,recoveryCause,type'
+  if (Object.keys(raw).sort().join(',') !== expectedKeys) {
+    throw new MalformedPreflightRefusalError()
+  }
   return {
     type: 'preflight-failed',
+    attemptId: raw.attemptId,
     code,
     message,
     recovery,
@@ -164,8 +206,172 @@ function parsePreflightRefusal(value: unknown): PreflightRefusal {
   }
 }
 
+function parsePreflightLiveness(value: unknown): PreflightLiveness {
+  const raw =
+    value !== null && typeof value === 'object'
+      ? (value as Record<string, unknown>)
+      : undefined
+  if (
+    !raw ||
+    raw.type !== 'preflight-liveness' ||
+    Object.keys(raw).sort().join(',') !== 'attemptId,phase,sequence,type' ||
+    typeof raw.attemptId !== 'string' ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      raw.attemptId
+    ) ||
+    (raw.phase !== 'starting' && raw.phase !== 'integrity-check' && raw.phase !== 'booting') ||
+    !Number.isSafeInteger(raw.sequence) ||
+    Number(raw.sequence) < 0
+  ) {
+    throw new MalformedPreflightLivenessError()
+  }
+  return raw as PreflightLiveness
+}
+
 export function sendToHub(child: ChildProcess, msg: SupervisorMsg): void {
   child.send?.(msg)
+}
+
+export function waitForHubReady(
+  child: ChildProcess,
+  attemptId: string,
+  deadlines: {
+    startTimeoutMs: number
+    livenessTimeoutMs: number
+    absoluteTimeoutMs: number
+  } = {
+    startTimeoutMs: HUB_PREFLIGHT_START_TIMEOUT_MS,
+    livenessTimeoutMs: HUB_PREFLIGHT_LIVENESS_TIMEOUT_MS,
+    absoluteTimeoutMs: HUB_PREFLIGHT_ABSOLUTE_TIMEOUT_MS,
+  },
+  onStatus?: (phase: PreflightLiveness['phase'], elapsedMs: number) => void
+): Promise<Extract<HubMsg, { type: 'ready' }>> {
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      attemptId
+    ) ||
+    !Number.isSafeInteger(deadlines.startTimeoutMs) ||
+    deadlines.startTimeoutMs < 1 ||
+    !Number.isSafeInteger(deadlines.livenessTimeoutMs) ||
+    deadlines.livenessTimeoutMs < 1 ||
+    !Number.isSafeInteger(deadlines.absoluteTimeoutMs) ||
+    deadlines.absoluteTimeoutMs <= deadlines.startTimeoutMs ||
+    deadlines.absoluteTimeoutMs <= deadlines.livenessTimeoutMs
+  ) {
+    return Promise.reject(new Error('invalid preflight readiness contract'))
+  }
+  return new Promise((resolve, reject) => {
+    let lastSequence = -1
+    let phase: PreflightLiveness['phase'] | undefined
+    const startedAt = Date.now()
+    let lastStatusAt = Number.NEGATIVE_INFINITY
+    let livenessTimer: ReturnType<typeof setTimeout> | undefined
+    const startTimer = setTimeout(() => {
+      fail(new Error('timed out waiting for validated preflight start'))
+    }, deadlines.startTimeoutMs)
+    const absoluteTimer = setTimeout(() => {
+      fail(new Error('preflight exceeded its absolute readiness ceiling'))
+    }, deadlines.absoluteTimeoutMs)
+    const armLivenessDeadline = (): void => {
+      if (livenessTimer) clearTimeout(livenessTimer)
+      livenessTimer = setTimeout(() => {
+        fail(new Error('timed out waiting for preflight liveness'))
+      }, deadlines.livenessTimeoutMs)
+    }
+    const onMsg = (message: unknown): void => {
+      const raw =
+        message !== null && typeof message === 'object'
+          ? (message as Record<string, unknown>)
+          : undefined
+      if (raw?.type === 'preflight-liveness') {
+        let liveness: PreflightLiveness
+        try {
+          liveness = parsePreflightLiveness(message)
+        } catch (error) {
+          fail(error)
+          return
+        }
+        if (liveness.attemptId !== attemptId) {
+          fail(new MalformedPreflightLivenessError('preflight liveness attempt binding is invalid'))
+          return
+        }
+        const invalidInitial =
+          lastSequence === -1 && (liveness.sequence !== 0 || liveness.phase !== 'starting')
+        const invalidContinuation =
+          lastSequence >= 0 &&
+          (liveness.sequence !== lastSequence + 1 ||
+            liveness.phase === 'starting' ||
+            (phase === 'starting' && liveness.phase !== 'integrity-check') ||
+            (phase === 'booting' && liveness.phase !== 'booting'))
+        if (invalidInitial || invalidContinuation) {
+          fail(new MalformedPreflightLivenessError('preflight liveness ordering is invalid'))
+          return
+        }
+        lastSequence = liveness.sequence
+        const phaseChanged = phase !== liveness.phase
+        phase = liveness.phase
+        const elapsedMs = Date.now() - startedAt
+        if (phaseChanged || elapsedMs - lastStatusAt >= HUB_PREFLIGHT_STATUS_INTERVAL_MS) {
+          lastStatusAt = elapsedMs
+          onStatus?.(phase, elapsedMs)
+        }
+        if (lastSequence === 0) clearTimeout(startTimer)
+        armLivenessDeadline()
+        return
+      }
+      if (raw?.type === 'ready') {
+        if (phase !== 'booting') {
+          fail(new Error('hub reported ready before validated preflight booting phase'))
+          return
+        }
+        const ready = raw as Record<string, unknown>
+        if (
+          Object.keys(ready).sort().join(',') !==
+            'attemptId,port,restored,schemaVersion,type' ||
+          ready.attemptId !== attemptId ||
+          !Number.isSafeInteger(ready.port) ||
+          Number(ready.port) < 1 ||
+          Number(ready.port) > 65_535 ||
+          !Number.isSafeInteger(ready.restored) ||
+          Number(ready.restored) < 0 ||
+          !Number.isSafeInteger(ready.schemaVersion) ||
+          Number(ready.schemaVersion) < 0
+        ) {
+          fail(new Error('hub reported malformed readiness'))
+          return
+        }
+        cleanup()
+        resolve(ready as Extract<HubMsg, { type: 'ready' }>)
+        return
+      }
+      if (raw?.type === 'preflight-failed') {
+        cleanup()
+        try {
+          const refusal = parsePreflightRefusal(message)
+          if (refusal.attemptId !== attemptId) throw new MalformedPreflightRefusalError()
+          reject(new PreflightRefusalError(refusal))
+        } catch (error) {
+          reject(error)
+        }
+      }
+    }
+    const onExit = (): void => {
+      fail(new Error("hub exited while waiting for 'ready'"))
+    }
+    function fail(error: unknown): void {
+      cleanup()
+      reject(error)
+    }
+    function cleanup(): void {
+      clearTimeout(startTimer)
+      clearTimeout(absoluteTimer)
+      if (livenessTimer) clearTimeout(livenessTimer)
+      child.off('message', onMsg)
+      child.off('exit', onExit)
+    }
+    child.on('message', onMsg)
+    child.on('exit', onExit)
+  })
 }
 
 /**

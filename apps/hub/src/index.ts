@@ -44,6 +44,7 @@ import {
   recordExistingSchemaVersion,
   recordSchemaVersion,
   runHubPreflight,
+  runHubPreflightInWorker,
   type PreflightFailure,
 } from './preflight.js'
 import {
@@ -91,9 +92,43 @@ function sendSupervisorMessage(message: unknown): void {
 // isolated harness (e.g. the restart-survival acceptance test) to keep its DB + state off the live hub's.
 const dataDir = process.env.HUB_DATA_DIR ? path.resolve(process.env.HUB_DATA_DIR) : path.join(repoRoot, 'data')
 const journalPath = path.join(dataDir, 'hub.db')
+const preflightAttemptId = process.env.HUB_PREFLIGHT_ATTEMPT_ID
+const validPreflightAttempt =
+  typeof preflightAttemptId === 'string' &&
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    preflightAttemptId
+  )
+if (supervised && !validPreflightAttempt) {
+  console.error('[hub-preflight] supervised boot lacks a valid preflight attempt binding')
+  process.exit(PREFLIGHT_EXIT_CODE)
+}
+let preflightLivenessSequence = 0
+let preflightLivenessPhase: 'starting' | 'integrity-check' | 'booting' = 'starting'
+let preflightLivenessTimer: ReturnType<typeof setInterval> | undefined
+// This is a parent-thread liveness/phase lease, not proof that SQLite advanced between frames.
+// The supervisor's absolute ceiling remains authoritative even while valid leases continue.
+const sendPreflightLiveness = (): void => {
+  if (!supervised || !validPreflightAttempt) return
+  sendSupervisorMessage({
+    type: 'preflight-liveness',
+    attemptId: preflightAttemptId,
+    phase: preflightLivenessPhase,
+    sequence: preflightLivenessSequence++,
+  })
+}
+if (supervised) {
+  sendPreflightLiveness()
+  preflightLivenessPhase = 'integrity-check'
+  sendPreflightLiveness()
+  preflightLivenessTimer = setInterval(sendPreflightLiveness, 1_000)
+}
 
 async function reportPreflightFailure(failure: PreflightFailure): Promise<never> {
-  const message = { type: 'preflight-failed' as const, ...failure }
+  const message = {
+    type: 'preflight-failed' as const,
+    ...(validPreflightAttempt ? { attemptId: preflightAttemptId } : {}),
+    ...failure,
+  }
   console.error(`[hub-preflight] ${JSON.stringify(message)}`)
   if (supervised && process.send) {
     await new Promise<void>((resolve) => {
@@ -126,7 +161,25 @@ try {
       'Keep the data root offline. Resolve the lease, filesystem, or recovery-metadata error and restart AllMyAgents.',
   })
 }
-const preflight = runHubPreflight({ dataDir, journalPath, schemaVersion: SCHEMA_VERSION })
+const preflight = await (async () => {
+  try {
+    return supervised
+      ? await runHubPreflightInWorker({
+          dataDir,
+          journalPath,
+          schemaVersion: SCHEMA_VERSION,
+          onLiveness: () => {},
+        })
+      : runHubPreflight({ dataDir, journalPath, schemaVersion: SCHEMA_VERSION })
+  } catch (error) {
+    return reportPreflightFailure({
+      code: 'database-validation-unavailable',
+      message: `The isolated preflight verifier failed: ${error instanceof Error ? error.message : String(error)}`,
+      recovery:
+        'Keep the data root offline. Repair the verifier/runtime failure and restart AllMyAgents.',
+    })
+  }
+})()
 for (const check of preflight.checks) {
   const line = `[hub-preflight] ${check.name}: ${check.status} (${check.durationMs}ms) — ${check.detail}`
   if (check.status === 'skipped') console.warn(line)
@@ -151,6 +204,10 @@ if (fs.existsSync(journalPath)) {
       recovery: 'Check free disk space and write permission for hub.db, then restart AllMyAgents.',
     })
   }
+}
+if (supervised) {
+  preflightLivenessPhase = 'booting'
+  sendPreflightLiveness()
 }
 // HUB_PROFILES_DIR relocates the managed-profiles root (auth creds + settings) off the repo's profiles/ —
 // the alpha step toward keeping credentials out of the repo/bundle path (%APPDATA%/AllMyAgents/profiles on a
@@ -615,8 +672,13 @@ server.once('listening', () => {
   console.log(`[hub] device token ${requireToken ? 'REQUIRED for /api + /ws' : 'not enforced (local)'} — pair remote devices from Settings → Mesh`)
   // Tell the supervisor we're up (report the ACTUAL port so it health-checks green's ephemeral port).
   if (supervised) {
+    if (preflightLivenessTimer) {
+      clearInterval(preflightLivenessTimer)
+      preflightLivenessTimer = undefined
+    }
     sendSupervisorMessage({
       type: 'ready',
+      attemptId: preflightAttemptId,
       port: actualPort,
       restored: sessions.list().length,
       schemaVersion: SCHEMA_VERSION,

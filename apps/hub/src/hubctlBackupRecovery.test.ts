@@ -73,6 +73,30 @@ server.on('connection', (socket) => {
 })
 
 const send = (message) => process.send?.(message)
+const preflightAttemptId = process.env.HUB_PREFLIGHT_ATTEMPT_ID
+if (
+  typeof preflightAttemptId !== 'string' ||
+  !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(preflightAttemptId)
+) {
+  throw new Error('fixture hub is missing its preflight attempt binding')
+}
+let preflightLivenessSequence = 0
+let preflightLivenessPhase = 'starting'
+const sendPreflightLiveness = () =>
+  send({
+    type: 'preflight-liveness',
+    attemptId: preflightAttemptId,
+    phase: preflightLivenessPhase,
+    sequence: preflightLivenessSequence++,
+  })
+const sendPreflightFailure = (failure) =>
+  send({ type: 'preflight-failed', attemptId: preflightAttemptId, ...failure })
+fs.appendFileSync(marker('preflight-attempt-ids'), preflightAttemptId + String.fromCharCode(10))
+sendPreflightLiveness()
+preflightLivenessPhase = 'integrity-check'
+sendPreflightLiveness()
+const preflightLivenessLease = setInterval(sendPreflightLiveness, 1_000)
+preflightLivenessLease.unref?.()
 const listen = (port) => new Promise((resolve, reject) => {
   const onError = (error) => {
     server.off('listening', onListening)
@@ -105,8 +129,7 @@ if (
   (role === 'blue' && bootOrdinal === 2 && scenario === 'revive-positive-corruption')
 ) {
   const positive = scenario !== 'green-offline-refusal'
-  send({
-    type: 'preflight-failed',
+  sendPreflightFailure({
     code: positive ? 'database-corrupt' : 'database-validation-unavailable',
     message: positive ? 'fixture confirmed SQLite corruption' : 'fixture cannot conclusively validate the shared journal',
     recovery: positive ? 'run independently verified recovery' : 'keep the shared root offline',
@@ -117,8 +140,7 @@ if (
 }
 
 if (firstBlue && scenario.startsWith('initial-positive-')) {
-  send({
-    type: 'preflight-failed',
+  sendPreflightFailure({
     code: 'database-corrupt',
     message: 'fixture confirmed initial SQLite corruption',
     recovery: 'run independently verified recovery',
@@ -134,7 +156,7 @@ if (firstBlue && scenario === 'initial-lost-preflight-ipc') {
 }
 
 if (firstBlue && scenario === 'initial-malformed-preflight-ipc') {
-  send({ type: 'preflight-failed', code: 42, message: { unbounded: true } })
+  sendPreflightFailure({ code: 42, message: { unbounded: true } })
   setTimeout(() => process.exit(78), 10)
   await new Promise(() => {})
 }
@@ -149,7 +171,7 @@ if (firstBlue && scenario === 'initial-wal-validation-unavailable') {
     throw new Error('normal WAL preflight unexpectedly acquired recovery authority')
   }
   mark('initial-wal-normal-unavailable')
-  send({ type: 'preflight-failed', ...result.failure })
+  sendPreflightFailure(result.failure)
   setTimeout(() => process.exit(78), 10)
   await new Promise(() => {})
 }
@@ -188,14 +210,13 @@ if (
     if (lineage) result = { ok: false, checks: result.checks, failure: lineage }
   }
   if (!result.ok) {
-    send({ type: 'preflight-failed', ...result.failure })
+    sendPreflightFailure(result.failure)
     setTimeout(() => process.exit(78), 10)
     await new Promise(() => {})
   }
   mark('fresh-normal-preflight-passed')
   if (scenario === 'initial-positive-fresh-preflight-failure') {
-    send({
-      type: 'preflight-failed',
+    sendPreflightFailure({
       code: 'database-validation-unavailable',
       message: 'fixture rejected the fresh recovery child after its controlling preflight',
       recovery: 'keep the recovered root offline',
@@ -211,7 +232,16 @@ if (
 await listen(requestedPort)
 const address = server.address()
 if (!address || typeof address === 'string') throw new Error('fixture listener did not bind')
-send({ type: 'ready', port: address.port, restored: 0, schemaVersion: 1 })
+preflightLivenessPhase = 'booting'
+sendPreflightLiveness()
+clearInterval(preflightLivenessLease)
+send({
+  type: 'ready',
+  attemptId: preflightAttemptId,
+  port: address.port,
+  restored: 0,
+  schemaVersion: 1,
+})
 
 let restartRequested = false
 if (firstBlue && scenario.startsWith('post-listener-')) {
@@ -514,23 +544,14 @@ async function compileHubFixture(): Promise<void> {
   )
   compiledHubctl = replaceExactly(
     compiledHubctl,
-    `schemaVersion: SCHEMA_VERSION,
-            operationId,
-        });`,
-    `schemaVersion: SCHEMA_VERSION,
-            operationId,
-            failpoint: (edge) => {
-                if (process.env.HUB_TEST_SCENARIO !== 'initial-positive-lost-recovery-ack' ||
-                    edge !== 'after-plan-publication-before-classifier-cleanup')
-                    return;
-                const marker = path.join(dataDir, 'lost-recovery-ack-injected');
-                if (fs.existsSync(marker))
-                    return;
-                fs.writeFileSync(marker, operationId);
-                process.exit(91);
-            },
-        });`,
-    'lost recovery acknowledgement'
+    `attemptId: recoveryAttemptId,
+            onLiveness:`,
+    `attemptId: recoveryAttemptId,
+            ...(process.env.HUB_TEST_SCENARIO === 'initial-positive-wedged-recovery-worker'
+                ? { timeoutMs: 200 }
+                : {}),
+            onLiveness:`,
+    'wedged recovery worker deadline'
   )
   compiledHubctl = replaceExactly(
     compiledHubctl,
@@ -587,6 +608,38 @@ async function compileHubFixture(): Promise<void> {
     )
   }
   fs.writeFileSync(hubctlEntry, compiledHubctl)
+  const recoveryEntry = path.join(outDir, 'journalRecovery.js')
+  let compiledRecovery = fs.readFileSync(recoveryEntry, 'utf8')
+  compiledRecovery = replaceExactly(
+    compiledRecovery,
+    `const boot = bootstrapJournalRecovery({
+            dataDir: recoveryWorkerRequest.dataDir,`,
+    `if (process.env.HUB_TEST_SCENARIO === 'initial-positive-wedged-recovery-worker') {
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+        }
+        const boot = bootstrapJournalRecovery({
+            dataDir: recoveryWorkerRequest.dataDir,`,
+    'wedged recovery worker'
+  )
+  compiledRecovery = replaceExactly(
+    compiledRecovery,
+    `operationId: recoveryWorkerRequest.operationId,
+        });`,
+    `operationId: recoveryWorkerRequest.operationId,
+            failpoint: (edge) => {
+                if (process.env.HUB_TEST_SCENARIO !== 'initial-positive-lost-recovery-ack' ||
+                    edge !== 'after-plan-publication-before-classifier-cleanup')
+                    return;
+                const marker = path.join(recoveryWorkerRequest.dataDir, 'lost-recovery-ack-injected');
+                if (fs.existsSync(marker))
+                    return;
+                fs.writeFileSync(marker, recoveryWorkerRequest.operationId);
+                process.exit(91);
+            },
+        });`,
+    'lost recovery worker acknowledgement'
+  )
+  fs.writeFileSync(recoveryEntry, compiledRecovery)
   const rollbackEntry = path.join(outDir, 'restartRollback.js')
   let compiledRollback = fs.readFileSync(rollbackEntry, 'utf8')
   compiledRollback = replaceExactly(
@@ -674,6 +727,7 @@ async function startScenario(
     | 'initial-positive-child-exit-uncertain'
     | 'initial-positive-port-release-failure'
     | 'initial-positive-lost-recovery-ack'
+    | 'initial-positive-wedged-recovery-worker'
     | 'initial-positive-replacement-worker-death'
     | 'initial-positive-fresh-preflight-failure'
     | 'initial-positive-fresh-ready-failure'
@@ -709,6 +763,7 @@ async function startScenario(
       'initial-positive-child-exit-uncertain',
       'initial-positive-port-release-failure',
       'initial-positive-lost-recovery-ack',
+      'initial-positive-wedged-recovery-worker',
       'initial-positive-replacement-worker-death',
       'initial-positive-fresh-preflight-failure',
       'initial-positive-fresh-ready-failure',
@@ -753,6 +808,7 @@ async function startScenario(
       'initial-positive-child-exit-uncertain',
       'initial-positive-port-release-failure',
       'initial-positive-lost-recovery-ack',
+      'initial-positive-wedged-recovery-worker',
       'initial-positive-replacement-worker-death',
       'initial-positive-fresh-preflight-failure',
       'initial-positive-fresh-ready-failure',
@@ -778,6 +834,22 @@ async function stopSupervisor(child: ChildProcess): Promise<void> {
   if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
 }
 
+function expectFreshPreflightAttempts(stateDir: string, minimum: number): void {
+  const attempts = fs
+    .readFileSync(path.join(stateDir, 'preflight-attempt-ids'), 'utf8')
+    .split(/\r?\n/)
+    .filter(Boolean)
+  expect(attempts.length).toBeGreaterThanOrEqual(minimum)
+  expect(
+    attempts.every((attempt) =>
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        attempt
+      )
+    )
+  ).toBe(true)
+  expect(new Set(attempts).size).toBe(attempts.length)
+}
+
 beforeAll(async () => {
   await compileHubFixture()
 }, 30_000)
@@ -798,7 +870,7 @@ afterAll(() => {
 
 describe('hubctl live-blue death during backup handoff', () => {
   it('fences a public green whose promoted ACK is lost before blue can rebind', async () => {
-    const { capture } = await startScenario('lost-promoted-ack')
+    const { capture, stateDir } = await startScenario('lost-promoted-ack')
 
     await capture.waitFor(/green bound public listener; promoted ACK withheld/)
     await capture.waitForMessage<{ type: 'hubctl-test-green-kill-pending' }>(
@@ -812,6 +884,7 @@ describe('hubctl live-blue death during backup handoff', () => {
     expect(capture.countMessages('hubctl-test-blue-rebind-attempt')).toBe(0)
     expect(capture.text).not.toContain('restart-aborted reached a surviving blue')
     expect(capture.text).not.toContain('EADDRINUSE')
+    expectFreshPreflightAttempts(stateDir, 2)
 
     capture.child.send?.({ type: 'hubctl-test-release-green-kill' })
     await capture.waitFor(/hub\(green\) exited/)
@@ -900,6 +973,10 @@ describe('hubctl live-blue death during backup handoff', () => {
     expect(capture.text).not.toContain('blue journal backups resumed after rollback')
     expect(fs.readFileSync(path.join(stateDir, 'blue-boot-count'), 'utf8')).toBe('2')
     expect(fs.existsSync(path.join(stateDir, 'fresh-normal-preflight-passed'))).toBe(true)
+    expectFreshPreflightAttempts(stateDir, 3)
+    expect(capture.text).toMatch(/preflight phase: starting/)
+    expect(capture.text).toMatch(/preflight phase: integrity-check/)
+    expect(capture.text).toMatch(/preflight phase: booting/)
     const restored = new Journal(path.join(dataDir, 'hub.db'))
     expect(
       restored
@@ -928,6 +1005,7 @@ describe('hubctl live-blue death during backup handoff', () => {
     expect(capture.text).not.toContain('blue journal backups resumed after rollback')
     expect(fs.readFileSync(path.join(stateDir, 'blue-boot-count'), 'utf8')).toBe('2')
     expect(fs.existsSync(path.join(stateDir, 'fresh-normal-preflight-passed'))).toBe(true)
+    expectFreshPreflightAttempts(stateDir, 2)
     if (scenario === 'initial-wal-validation-unavailable') {
       expect(fs.existsSync(path.join(stateDir, 'initial-wal-normal-unavailable'))).toBe(true)
     }
@@ -947,6 +1025,7 @@ describe('hubctl live-blue death during backup handoff', () => {
     expect(capture.text).not.toContain('blue journal backups resumed after rollback')
     expect(fs.readFileSync(path.join(stateDir, 'blue-boot-count'), 'utf8')).toBe('3')
     expect(fs.existsSync(path.join(stateDir, 'fresh-normal-preflight-passed'))).toBe(true)
+    expectFreshPreflightAttempts(stateDir, 3)
   }, 30_000)
 
   it('keeps a no-snapshot positive incident byte-identical and persistently offline', async () => {
@@ -1004,14 +1083,29 @@ describe('hubctl live-blue death during backup handoff', () => {
     30_000
   )
 
+  it('keeps a wedged independent recovery worker bounded, responsive, and offline', async () => {
+    const { capture, dataDir } = await startScenario(
+      'initial-positive-wedged-recovery-worker'
+    )
+    const journalPath = path.join(dataDir, 'hub.db')
+    const before = fs.readFileSync(journalPath)
+
+    await capture.waitFor(/journal recovery worker exceeded its absolute execution ceiling/)
+    await capture.waitFor(/journal recovery remains visibly OFFLINE/)
+
+    expect(capture.child.exitCode).toBeNull()
+    expect(fs.readFileSync(journalPath)).toEqual(before)
+    expect(capture.text).not.toContain('recovery reboot committed')
+    expect(fs.existsSync(path.join(dataDir, 'journal-recovery', 'active-plan.json'))).toBe(false)
+  }, 30_000)
+
   it('reconciles a lost recovery completion with the same durable operation exactly once', async () => {
     const { capture, dataDir, env } = await startScenario(
       'initial-positive-lost-recovery-ack'
     )
-    if (capture.child.exitCode === null && capture.child.signalCode === null) {
-      await once(capture.child, 'exit')
-    }
-    expect(capture.child.exitCode).toBe(91)
+    await capture.waitFor(/journal recovery worker exited without an acknowledged result/)
+    await capture.waitFor(/journal recovery remains visibly OFFLINE/)
+    expect(capture.child.exitCode).toBeNull()
 
     const operationId = fs
       .readFileSync(path.join(dataDir, 'lost-recovery-ack-injected'), 'utf8')
@@ -1025,6 +1119,10 @@ describe('hubctl live-blue death during backup handoff', () => {
       JSON.parse(fs.readFileSync(path.join(recoveryDir, 'active-plan.json'), 'utf8'))
     ).toMatchObject({ id: operationId })
 
+    capture.child.kill()
+    if (capture.child.exitCode === null && capture.child.signalCode === null) {
+      await once(capture.child, 'exit')
+    }
     const replacement = spawnScenarioSupervisor(env)
     await replacement.waitFor(/recovery reboot committed on/)
 

@@ -4,7 +4,11 @@ import path from 'node:path'
 import Database from 'better-sqlite3'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SCHEMA_VERSION } from './restartHandshake.js'
-import { recordSchemaVersion, runHubPreflight } from './preflight.js'
+import {
+  recordSchemaVersion,
+  runHubPreflight,
+  runHubPreflightInWorker,
+} from './preflight.js'
 
 const dirs: string[] = []
 
@@ -135,6 +139,31 @@ describe('hub preflight', () => {
     const result = runHubPreflight({ dataDir, journalPath, schemaVersion: SCHEMA_VERSION })
 
     expect(result.ok).toBe(true)
+    expect(result.checks).toContainEqual(
+      expect.objectContaining({
+        name: 'database-integrity',
+        status: 'passed',
+        detail: 'ok; event payload JSON is valid',
+      })
+    )
+  })
+
+  it('runs the same full integrity proof while the hub maintains a liveness lease', async () => {
+    const dataDir = tempDataDir()
+    const journalPath = validJournal(dataDir)
+    let livenessRenewals = 0
+
+    const result = await runHubPreflightInWorker({
+      dataDir,
+      journalPath,
+      schemaVersion: SCHEMA_VERSION,
+      onLiveness: () => {
+        livenessRenewals += 1
+      },
+    })
+
+    expect(result.ok).toBe(true)
+    expect(livenessRenewals).toBeGreaterThan(0)
     expect(result.checks).toContainEqual(
       expect.objectContaining({
         name: 'database-integrity',

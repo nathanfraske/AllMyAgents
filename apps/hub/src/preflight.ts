@@ -1,7 +1,15 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import { createRequire } from 'node:module'
 import path from 'node:path'
 import { performance } from 'node:perf_hooks'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import {
+  isMainThread,
+  parentPort,
+  Worker,
+  workerData,
+} from 'node:worker_threads'
 import Database from 'better-sqlite3'
 
 export const PREFLIGHT_EXIT_CODE = 78
@@ -39,6 +47,8 @@ const CORRUPT_SQLITE_CODES = new Set(['SQLITE_CORRUPT', 'SQLITE_NOTADB'])
 const WAL_MAGIC = new Set([0x377f0682, 0x377f0683])
 const WAL_VERSION = 3_007_000
 const MAX_WAL_FRAMES = 16_777_216
+const PREFLIGHT_WORKER_LIVENESS_INTERVAL_MS = 1_000
+const PREFLIGHT_WORKER_ABSOLUTE_MS = 5 * 60_000
 
 type WalValidation =
   | { status: 'ok'; validCommit: boolean; ignoredTail: boolean }
@@ -671,5 +681,128 @@ export function recordExistingSchemaVersion(journalPath: string, schemaVersion: 
     recordSchemaVersion(db, schemaVersion)
   } finally {
     db.close()
+  }
+}
+
+type PreflightWorkerRequest = {
+  kind: 'hub-preflight-v1'
+  dataDir: string
+  journalPath: string
+  schemaVersion: number
+}
+
+type PreflightWorkerResponse =
+  | { kind: 'result'; result: HubPreflightResult }
+  | { kind: 'error'; error: string }
+
+export function runHubPreflightInWorker(options: {
+  dataDir: string
+  journalPath: string
+  schemaVersion: number
+  onLiveness: () => void
+}): Promise<HubPreflightResult> {
+  if (!isMainThread) {
+    return Promise.reject(new Error('nested preflight workers are forbidden'))
+  }
+  return new Promise((resolve, reject) => {
+    const moduleUrl = new URL(import.meta.url)
+    const sourceIsTypeScript = fileURLToPath(moduleUrl).endsWith('.ts')
+    const worker = new Worker(moduleUrl, {
+      ...(sourceIsTypeScript
+        ? {
+            execArgv: [
+              '--import',
+              pathToFileURL(createRequire(import.meta.url).resolve('tsx/esm')).href,
+            ],
+          }
+        : {}),
+      workerData: {
+        kind: 'hub-preflight-v1',
+        dataDir: options.dataDir,
+        journalPath: options.journalPath,
+        schemaVersion: options.schemaVersion,
+      } satisfies PreflightWorkerRequest,
+    })
+    let settled = false
+    let livenessTimer: ReturnType<typeof setInterval> | undefined
+    let absoluteTimer: ReturnType<typeof setTimeout> | undefined
+    const finish = (error?: unknown, result?: HubPreflightResult): void => {
+      if (settled) return
+      settled = true
+      if (livenessTimer) clearInterval(livenessTimer)
+      if (absoluteTimer) clearTimeout(absoluteTimer)
+      void worker.terminate()
+      if (error !== undefined) reject(error)
+      else resolve(result!)
+    }
+    const renewLivenessLease = (): void => {
+      try {
+        options.onLiveness()
+      } catch (error) {
+        finish(error)
+      }
+    }
+    livenessTimer = setInterval(
+      renewLivenessLease,
+      PREFLIGHT_WORKER_LIVENESS_INTERVAL_MS
+    )
+    absoluteTimer = setTimeout(() => {
+      finish(new Error('preflight worker exceeded its absolute verification ceiling'))
+    }, PREFLIGHT_WORKER_ABSOLUTE_MS)
+    worker.on('message', (message: unknown) => {
+      const response =
+        message !== null && typeof message === 'object'
+          ? (message as Record<string, unknown>)
+          : undefined
+      if (
+        response?.kind === 'result' &&
+        response.result !== null &&
+        typeof response.result === 'object'
+      ) {
+        finish(undefined, response.result as HubPreflightResult)
+      } else if (
+        response?.kind === 'error' &&
+        typeof response.error === 'string' &&
+        response.error.length > 0 &&
+        response.error.length <= 4096
+      ) {
+        finish(new Error(`preflight worker failed: ${response.error}`))
+      } else {
+        finish(new Error('preflight worker returned a malformed result'))
+      }
+    })
+    worker.once('error', (error) => finish(error))
+    worker.once('exit', (code) => {
+      if (!settled) finish(new Error(`preflight worker exited before a result (code ${code})`))
+    })
+    renewLivenessLease()
+  })
+}
+
+const workerRequest =
+  !isMainThread && workerData !== null && typeof workerData === 'object'
+    ? (workerData as Partial<PreflightWorkerRequest>)
+    : undefined
+if (workerRequest?.kind === 'hub-preflight-v1') {
+  try {
+    if (
+      typeof workerRequest.dataDir !== 'string' ||
+      typeof workerRequest.journalPath !== 'string' ||
+      !Number.isSafeInteger(workerRequest.schemaVersion) ||
+      Number(workerRequest.schemaVersion) < 0
+    ) {
+      throw new Error('preflight worker request is malformed')
+    }
+    const result = runHubPreflight({
+      dataDir: workerRequest.dataDir,
+      journalPath: workerRequest.journalPath,
+      schemaVersion: Number(workerRequest.schemaVersion),
+    })
+    parentPort?.postMessage({ kind: 'result', result } satisfies PreflightWorkerResponse)
+  } catch (error) {
+    parentPort?.postMessage({
+      kind: 'error',
+      error: errorText(error).slice(0, 4096),
+    } satisfies PreflightWorkerResponse)
   }
 }
