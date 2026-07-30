@@ -3,11 +3,14 @@ import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest'
-import { Journal, WSEQ_RESET_KIND } from './journal.js'
+import { Journal, TransientHistoryIndexingError, WSEQ_RESET_KIND } from './journal.js'
+import { verifyRecentCompactionSnapshot } from './journalCompactionGate.js'
 
 type CondenseResult = {
   commandOutputDeltasDeleted: number
   diffSnapshotsDeleted: number
+  transientPayloadBytesDeleted: number
+  oversizedTransientRowsRetained: number
   cursorCheckpointsWritten: number
 }
 
@@ -15,8 +18,10 @@ type CondensableJournal = Journal & {
   condenseCompletedCodex(options: {
     nowMs: number
     graceMs: number
+    deleteThroughSeq?: number
     maxCommandOutputDeltas?: number
     maxDiffSnapshots?: number
+    maxTransientPayloadBytes?: number
   }): CondenseResult
 }
 
@@ -30,6 +35,7 @@ function condense(
   options: {
     maxCommandOutputDeltas?: number
     maxDiffSnapshots?: number
+    maxTransientPayloadBytes?: number
   } = {}
 ): CondenseResult {
   return (journal as CondensableJournal).condenseCompletedCodex({
@@ -148,7 +154,7 @@ describe('completed Codex journal condensation', () => {
     }
   })
 
-  it('keeps one authoritative diff for an old completed turn and leaves live or recent turns untouched', () => {
+  it('keeps one cumulative diff per old correlated turn without claiming a missing terminal outcome', () => {
     vi.useFakeTimers()
     const journal = new Journal(path.join(tmp, 'diffs.db'))
     try {
@@ -167,14 +173,13 @@ describe('completed Codex journal condensation', () => {
       })
 
       const result = condense(journal)
-      expect(result.diffSnapshotsDeleted).toBe(2)
+      expect(result.diffSnapshotsDeleted).toBe(3)
       const remaining = journal
         .since(0, 100)
         .filter((event) => event.kind === 'codex/turn/diff/updated')
         .map((event) => event.payload as { turnId: string; diff: string })
       expect(remaining).toEqual([
         { threadId: 'thread-1', turnId: 'done', diff: 'final' },
-        { threadId: 'thread-1', turnId: 'live', diff: 'live-1' },
         { threadId: 'thread-1', turnId: 'live', diff: 'live-2' },
         { threadId: 'thread-1', turnId: 'recent', diff: 'recent-1' },
         { threadId: 'thread-1', turnId: 'recent', diff: 'recent-final' },
@@ -197,6 +202,162 @@ describe('completed Codex journal condensation', () => {
       expect(condense(journal, { maxCommandOutputDeltas: 2 }).commandOutputDeltasDeleted).toBe(2)
       expect(condense(journal, { maxCommandOutputDeltas: 2 }).commandOutputDeltasDeleted).toBe(2)
       expect(condense(journal, { maxCommandOutputDeltas: 2 }).commandOutputDeltasDeleted).toBe(1)
+    } finally {
+      journal.db.close()
+    }
+  })
+
+  it('freezes snapshot coverage at the exact deletion frontier instead of lifecycle high-water', () => {
+    vi.useFakeTimers()
+    const journal = new Journal(path.join(tmp, 'snapshot-frontier.db'))
+    try {
+      let firstCandidate = 0
+      at(OLD, () => {
+        journal.append('s', 'codex/item/completed', completedCommand('done', 'turn-done'))
+        firstCandidate = journal.append(
+          's',
+          'codex/item/commandExecution/outputDelta',
+          commandDelta('done', 'turn-done', 'covered')
+        ).seq
+      })
+      while (!journal.backfillTransientEventIndex(5).complete) {
+        // bounded projection catch-up is deliberately resumable
+      }
+
+      const deleteThroughSeq = journal.condensationCandidateFrontier({
+        nowMs: NOW,
+        graceMs: HOUR,
+      })
+      expect(deleteThroughSeq).toBe(firstCandidate)
+
+      const operationId = '11111111-1111-4111-8111-111111111111'
+      const lifecycle = journal.recordCompactionLifecycle(operationId, 'started', {
+        detail: 'Bounded journal maintenance child is being launched.',
+        now: new Date(NOW).toISOString(),
+      })
+      const startSeq = journal.replayCheckpoint().cursor
+      expect(startSeq).toBe(deleteThroughSeq + 1)
+      expect(lifecycle.phase).toBe('started')
+
+      const verifier = vi.fn((_directory: string, requiredThroughSeq: number) => ({
+        ok: true as const,
+        evidence: {
+          rootId: 'root-1',
+          journalId: 'journal-1',
+          generation: '1',
+          snapshotMaxSeq: String(requiredThroughSeq),
+          snapshotEventHighWater: String(requiredThroughSeq),
+          verifiedAt: new Date(NOW).toISOString(),
+        },
+      }))
+      expect(
+        verifyRecentCompactionSnapshot('/owned', deleteThroughSeq, NOW, verifier)
+      ).toMatchObject({ ok: true })
+      expect(verifier).toHaveBeenCalledWith('/owned', firstCandidate, NOW)
+
+      let laterCandidate = 0
+      at(OLD, () => {
+        laterCandidate = journal.append(
+          's',
+          'codex/item/commandExecution/outputDelta',
+          commandDelta('done', 'turn-done', 'not covered yet')
+        ).seq
+      })
+      while (!journal.backfillTransientEventIndex(5).complete) {
+        // catch up without changing the operation's immutable deletion frontier
+      }
+      const result = (journal as CondensableJournal).condenseCompletedCodex({
+        nowMs: NOW,
+        graceMs: HOUR,
+        deleteThroughSeq,
+      })
+      expect(result.commandOutputDeltasDeleted).toBe(1)
+      expect(journal.db.prepare('SELECT seq FROM events WHERE seq = ?').get(firstCandidate)).toBeUndefined()
+      expect(journal.db.prepare('SELECT seq FROM events WHERE seq = ?').get(startSeq)).toEqual({
+        seq: startSeq,
+      })
+      expect(journal.db.prepare('SELECT seq FROM events WHERE seq = ?').get(laterCandidate)).toEqual({
+        seq: laterCandidate,
+      })
+    } finally {
+      journal.db.close()
+    }
+  })
+
+  it('builds its maintenance projection in bounded resumable batches without a live events index build', () => {
+    const file = path.join(tmp, 'projection-upgrade.db')
+    const raw = new Database(file)
+    raw.exec(
+      'CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, session TEXT, kind TEXT NOT NULL, payload TEXT NOT NULL, wseq INTEGER)'
+    )
+    const insert = raw.prepare(
+      'INSERT INTO events (ts, session, kind, payload) VALUES (?, ?, ?, ?)'
+    )
+    for (let i = 0; i < 12; i += 1) {
+      insert.run(
+        OLD.toISOString(),
+        's',
+        'codex/item/commandExecution/outputDelta',
+        JSON.stringify(commandDelta(`item-${i}`, `turn-${i}`, 'x'))
+      )
+      insert.run(
+        OLD.toISOString(),
+        's',
+        'codex/item/completed',
+        JSON.stringify(completedCommand(`item-${i}`, `turn-${i}`))
+      )
+    }
+    raw.close()
+
+    const journal = new Journal(file)
+    try {
+      expect(() => condense(journal)).toThrow(TransientHistoryIndexingError)
+      const first = journal.backfillTransientEventIndex(5)
+      expect(first).toMatchObject({ complete: false, scannedThrough: 5 })
+      let pass = first
+      while (!pass.complete) pass = journal.backfillTransientEventIndex(5)
+      expect(pass.target).toBe(24)
+      expect(condense(journal).commandOutputDeltasDeleted).toBe(12)
+      expect(
+        journal.db
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'events' AND name LIKE 'idx_events_condense_%'"
+          )
+          .all()
+      ).toEqual([])
+    } finally {
+      journal.db.close()
+    }
+  })
+
+  it('retains an individually oversized transient without starving later bounded cleanup', () => {
+    vi.useFakeTimers()
+    const journal = new Journal(path.join(tmp, 'oversized-transient.db'))
+    try {
+      at(OLD, () => {
+        journal.append(
+          's',
+          'codex/item/commandExecution/outputDelta',
+          commandDelta('huge', 'turn-huge', 'x'.repeat(4_096))
+        )
+        journal.append('s', 'codex/item/completed', completedCommand('huge', 'turn-huge'))
+        journal.append(
+          's',
+          'codex/item/commandExecution/outputDelta',
+          commandDelta('small', 'turn-small', 'ok')
+        )
+        journal.append('s', 'codex/item/completed', completedCommand('small', 'turn-small'))
+      })
+
+      const result = condense(journal, { maxTransientPayloadBytes: 1_024 })
+      expect(result.commandOutputDeltasDeleted).toBe(1)
+      expect(result.transientPayloadBytesDeleted).toBeLessThanOrEqual(1_024)
+      expect(result.oversizedTransientRowsRetained).toBe(1)
+      const remaining = journal
+        .since(0, 20)
+        .filter((candidate) => candidate.kind === 'codex/item/commandExecution/outputDelta')
+      expect(remaining).toHaveLength(1)
+      expect((remaining[0]?.payload as { itemId?: string }).itemId).toBe('huge')
     } finally {
       journal.db.close()
     }

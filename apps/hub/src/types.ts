@@ -159,11 +159,15 @@ export interface HubEvent {
 /** Non-journal WebSocket control envelope separating replayed state from subsequent live events. */
 export interface ReplayStart {
   type: 'replay-start'
+  generation: number
+  highWater: number
+  resetFloorSeq: number
 }
 
 export interface ReplayComplete {
   type: 'replay-complete'
   lastSeq: number
+  generation: number
 }
 
 export type ApprovalStatus = 'pending' | 'approved' | 'denied' | 'timeout'

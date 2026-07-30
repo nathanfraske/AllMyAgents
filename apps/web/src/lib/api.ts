@@ -391,14 +391,62 @@ export interface HubEvent {
 /** Non-journal WebSocket control envelope separating replayed state from subsequent live events. */
 export interface ReplayStart {
   type: 'replay-start'
+  generation: number
+  highWater: number
+  resetFloorSeq: number
 }
 
 export interface ReplayComplete {
   type: 'replay-complete'
   lastSeq: number
+  generation: number
 }
 
-export type HubStreamMessage = HubEvent | ReplayStart | ReplayComplete
+export interface ReplayResetRequired {
+  type: 'replay-reset-required'
+  reason:
+    | 'baseline-required'
+    | 'generation-changed'
+    | 'invalid-cursor'
+    | 'tail-too-large'
+    | 'client-queue-overflow'
+  checkpoint: {
+    version: 1
+    generation: number
+    cursor: number
+    resetFloorSeq: number
+  }
+}
+
+export type HubStreamMessage = HubEvent | ReplayStart | ReplayComplete | ReplayResetRequired
+
+export interface ReplayBaseline {
+  version: 1
+  generation: number
+  highWaterSeq: number
+  resetFloorSeq: number
+  sessions: SessionRecord[]
+  projects: ProjectInfo[]
+  journalCompaction: JournalCompactionStatus | null
+}
+
+export interface JournalCompactionStatus {
+  operationId: string
+  phase: 'started' | 'progress' | 'completed' | 'failed' | 'unobservable'
+  startedAt: string
+  updatedAt: string
+  rowsDeleted: number
+  payloadBytesDeleted: number
+  detail: string
+}
+
+export interface JournalHistoryPage {
+  events: HubEvent[]
+  olderCursor: number | null
+  hasOlder: boolean
+  encodedBytes: number
+  checkpointGeneration: number
+}
 
 // In the packaged desktop app the frontend is served from tauri.localhost, so relative URLs
 // never reach the hub. Detect the Tauri webview and target the loopback hub directly. In the
@@ -723,6 +771,7 @@ export interface BrowserStatus {
 }
 
 export const api = {
+  replayBaseline: () => jget<ReplayBaseline>('/api/replay-baseline'),
   profiles: () => jget<ProfileInfo[]>('/api/profiles'),
   stats: () => jget<StatsResult>('/api/stats'),
   rescanProfiles: () => jpost<ProfileInfo[] | ApiError>('/api/profiles/rescan'),
@@ -781,6 +830,13 @@ export const api = {
   // On-demand vendor transcript history for an imported chat (bounded tail; `before` byte cursor pages older).
   history: (id: string, before?: number) =>
     jget<HistoryPage>(`/api/sessions/${id}/history${before != null ? `?before=${before}` : ''}`),
+  journalHistory: (id: string, generation: number, before?: number) => {
+    const query = new URLSearchParams({ generation: String(generation) })
+    if (before != null) query.set('before', String(before))
+    return jget<JournalHistoryPage>(
+      `/api/sessions/${encodeURIComponent(id)}/journal-history?${query.toString()}`,
+    )
+  },
   approvals: () => jget<ApprovalRecord[]>('/api/approvals'),
   questions: () => jget<QuestionRecord[]>('/api/questions'),
   recoveryNotices: () => jget<RecoveryNotice[]>('/api/recovery-notices'),

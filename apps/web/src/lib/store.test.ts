@@ -32,6 +32,22 @@ vi.mock('./api', () => {
       dismissRecoveryNotice: vi.fn(ok),
       usage: vi.fn(async () => []),
       sessions: vi.fn(async () => []),
+      replayBaseline: vi.fn(async () => ({
+        version: 1,
+        generation: 1,
+        highWaterSeq: 0,
+        resetFloorSeq: 0,
+        sessions: [],
+        projects: [],
+        journalCompaction: null,
+      })),
+      journalHistory: vi.fn(async () => ({
+        events: [],
+        olderCursor: null,
+        hasOlder: false,
+        encodedBytes: 0,
+        checkpointGeneration: 1,
+      })),
       spawn: vi.fn(async () => rec('spawned')),
       send: vi.fn(ok),
       stop: vi.fn(ok),
@@ -110,6 +126,9 @@ beforeEach(() => {
   store.questions = []
   store.recoveryNotices = []
   store.usage = []
+  store.questions = []
+  store.journalCompaction = null
+  store.replayGeneration = 0
   store.prefs = { chatNamePool: 'everyone', steerMessagesAtToolBoundary: true }
   store.dragSession = null
   store.dropZone = null
@@ -767,7 +786,9 @@ describe('event batching (replay does not render frame-by-frame)', () => {
 })
 
 describe('replay boundary presentation', () => {
-  type ReplayControl = { type: 'replay-start' } | { type: 'replay-complete'; lastSeq: number }
+  type ReplayControl =
+    | { type: 'replay-start'; generation: number; highWater: number; resetFloorSeq: number }
+    | { type: 'replay-complete'; lastSeq: number; generation: number }
   type ReplayStore = {
     beginReplayPresentation(): void
     ingest(message: HubEvent | ReplayControl): void
@@ -776,20 +797,23 @@ describe('replay boundary presentation', () => {
 
   function harness(): { replayStore: HubStore; transport: ReplayStore } {
     const replayStore = new HubStore()
+    replayStore.replayGeneration = 1
     return { replayStore, transport: replayStore as unknown as ReplayStore }
   }
 
   it('marks the backlog silent and only animates transcript items after the boundary', () => {
     const { replayStore, transport } = harness()
     transport.beginReplayPresentation()
-    transport.ingest({ type: 'replay-start' })
+    transport.ingest({ type: 'replay-start', generation: 1, highWater: 2, resetFloorSeq: 0 })
     transport.ingest(evt({ seq: 1, kind: 'session/created', sessionId: 's1', payload: rec('s1') }))
     transport.ingest(evt({ seq: 2, kind: 'session/input', sessionId: 's1', payload: { text: 'history' } }))
     transport.flushEvents()
     expect(replayStore.replayPresentationActive).toBe(true)
-    expect(replayStore.sessions.s1?.items.map((item) => item.text)).toEqual(['history'])
+    expect(replayStore.sessions.s1).toBeUndefined()
 
-    transport.ingest({ type: 'replay-complete', lastSeq: 2 })
+    transport.ingest({ type: 'replay-complete', lastSeq: 2, generation: 1 })
+    transport.flushEvents()
+    expect(replayStore.sessions.s1?.items.map((item) => item.text)).toEqual(['history'])
     transport.ingest(evt({ seq: 3, kind: 'session/input', sessionId: 's1', payload: { text: 'live' } }))
 
     transport.flushEvents()
@@ -805,14 +829,14 @@ describe('replay boundary presentation', () => {
   it('applies every replayed event to transcript state rather than dropping or deferring it', () => {
     const { replayStore, transport } = harness()
     transport.beginReplayPresentation()
-    transport.ingest({ type: 'replay-start' })
+    transport.ingest({ type: 'replay-start', generation: 1, highWater: 12, resetFloorSeq: 0 })
     transport.ingest(evt({ seq: 1, kind: 'session/created', sessionId: 's1', payload: rec('s1') }))
     for (let seq = 2; seq <= 12; seq++) {
       transport.ingest(
         evt({ seq, kind: 'session/input', sessionId: 's1', payload: { text: `replayed-${seq}` } })
       )
     }
-    transport.ingest({ type: 'replay-complete', lastSeq: 12 })
+    transport.ingest({ type: 'replay-complete', lastSeq: 12, generation: 1 })
 
     transport.flushEvents()
 
@@ -820,6 +844,49 @@ describe('replay boundary presentation', () => {
       replayStore.sessions.s1?.items.filter((item) => item.kind === 'user').map((item) => item.text)
     ).toEqual(Array.from({ length: 11 }, (_, index) => `replayed-${index + 2}`))
     expect(replayStore.lastSeq).toBe(12)
+  })
+
+  it('adopts a newer generation only when its durable reset floor is already behind the cursor', () => {
+    const { replayStore, transport } = harness()
+    replayStore.lastSeq = 10
+    transport.ingest({ type: 'replay-start', generation: 101, highWater: 10, resetFloorSeq: 8 })
+    transport.ingest({ type: 'replay-complete', lastSeq: 10, generation: 101 })
+    transport.flushEvents()
+
+    expect(replayStore.replayGeneration).toBe(101)
+    expect(replayStore.lastSeq).toBe(10)
+  })
+
+  it('bounds a paused live-event batch and resets truthfully instead of dropping overflow', async () => {
+    vi.useFakeTimers()
+    try {
+      const { replayStore, transport } = harness()
+      const internals = replayStore as unknown as {
+        pendingEvents: HubEvent[]
+        pendingEventBytes: number
+        refreshRequiredBaseline(): Promise<boolean>
+      }
+      const refresh = vi
+        .spyOn(internals, 'refreshRequiredBaseline')
+        .mockResolvedValue(false)
+      for (let seq = 1; seq <= 1_025; seq += 1) {
+        transport.ingest(
+          evt({
+            seq,
+            kind: 'session/activity',
+            sessionId: 's1',
+            payload: { marker: `live-${seq}` },
+          })
+        )
+      }
+      await Promise.resolve()
+
+      expect(internals.pendingEvents.length).toBe(0)
+      expect(internals.pendingEventBytes).toBe(0)
+      expect(refresh).toHaveBeenCalledOnce()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('falls back to normal live presentation when an older hub never sends a boundary', () => {
@@ -845,6 +912,156 @@ describe('replay boundary presentation', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+describe('bounded cold baseline and global maintenance status', () => {
+  it('installs current state without requesting or decoding any historical journal row', () => {
+    vi.mocked(api.journalHistory).mockClear()
+    const cold = new HubStore()
+    const install = cold as unknown as {
+      installReplayBaseline(baseline: Awaited<ReturnType<typeof api.replayBaseline>>): void
+    }
+    const payloadTrap = new Proxy(
+      {},
+      {
+        get() {
+          throw new Error('historical payload was decoded during cold baseline')
+        },
+      }
+    )
+    void payloadTrap
+
+    install.installReplayBaseline({
+      version: 1,
+      generation: 7,
+      highWaterSeq: 690_000,
+      resetFloorSeq: 500_000,
+      sessions: [rec('s1')],
+      projects: [],
+      journalCompaction: null,
+    })
+    expect(cold.sessions.s1?.items).toEqual([])
+    expect(cold.lastSeq).toBe(690_000)
+    expect(cold.replayGeneration).toBe(7)
+    expect(api.journalHistory).not.toHaveBeenCalled()
+  })
+
+  it('keeps database maintenance global instead of injecting it into every chat transcript', () => {
+    seed('s1')
+    apply(
+      evt({
+        seq: 1,
+        kind: 'journal/compaction-progress',
+        payload: {
+          operationId: '11111111-1111-4111-8111-111111111111',
+          phase: 'progress',
+          startedAt: '2026-07-30T12:00:00.000Z',
+          updatedAt: '2026-07-30T12:00:01.000Z',
+          rowsDeleted: 5_000,
+          payloadBytesDeleted: 8_000_000,
+          detail: 'Committed one bounded batch.',
+        },
+      })
+    )
+
+    expect(store.journalCompaction).toEqual(
+      expect.objectContaining({ phase: 'progress', rowsDeleted: 5_000 })
+    )
+    expect(store.sessions.s1?.items).toEqual([])
+  })
+
+  it('hydrates a hub-native transcript through the pure page reducer without live side effects', async () => {
+    const cold = new HubStore()
+    const install = cold as unknown as {
+      installReplayBaseline(baseline: Awaited<ReturnType<typeof api.replayBaseline>>): void
+    }
+    install.installReplayBaseline({
+      version: 1,
+      generation: 3,
+      highWaterSeq: 50,
+      resetFloorSeq: 0,
+      sessions: [rec('s1')],
+      projects: [],
+      journalCompaction: null,
+    })
+    vi.mocked(api.approvals).mockClear()
+    vi.mocked(api.journalHistory).mockResolvedValueOnce({
+      events: [
+        evt({ seq: 10, kind: 'approval/requested', sessionId: 's1', payload: { id: 'old' } }),
+        evt({ seq: 11, kind: 'session/input', sessionId: 's1', payload: { text: 'old prompt' } }),
+      ],
+      olderCursor: 10,
+      hasOlder: true,
+      encodedBytes: 200,
+      checkpointGeneration: 3,
+    })
+
+    await cold.ensureHistory('s1')
+
+    expect(cold.sessions.s1?.items.map((item) => item.text)).toEqual(['old prompt'])
+    expect(cold.sessions.s1?.journalHistoryOlderCursor).toBe(10)
+    expect(api.approvals).not.toHaveBeenCalled()
+    expect(api.journalHistory).toHaveBeenCalledWith('s1', 3, 51)
+  })
+
+  it('replaces lazy history pages inside an 80-item / 512KiB pane window', async () => {
+    const cold = new HubStore()
+    const install = cold as unknown as {
+      installReplayBaseline(baseline: Awaited<ReturnType<typeof api.replayBaseline>>): void
+    }
+    install.installReplayBaseline({
+      version: 1,
+      generation: 4,
+      highWaterSeq: 10_000,
+      resetFloorSeq: 0,
+      sessions: [rec('s1')],
+      projects: [],
+      journalCompaction: null,
+    })
+    cold.selectedId = 's1'
+    const page = (prefix: string, start: number) => ({
+      events: Array.from({ length: 80 }, (_, index) =>
+        evt({
+          seq: start + index,
+          kind: 'session/input',
+          sessionId: 's1',
+          payload: { text: `${prefix}-${index}-${'x'.repeat(2_000)}` },
+        })
+      ),
+      olderCursor: start,
+      hasOlder: true,
+      encodedBytes: 170_000,
+      checkpointGeneration: 4,
+    })
+    vi.mocked(api.journalHistory).mockResolvedValueOnce(page('latest', 9_000))
+    await cold.ensureHistory('s1')
+
+    for (let pageIndex = 0; pageIndex < 8; pageIndex += 1) {
+      vi.mocked(api.journalHistory).mockResolvedValueOnce(
+        page(`older-${pageIndex}`, 8_000 - pageIndex * 100)
+      )
+      await cold.loadOlderHistory('s1')
+      const items = cold.sessions.s1?.items ?? []
+      expect(items.length).toBeLessThanOrEqual(80)
+      expect(new TextEncoder().encode(JSON.stringify(items)).byteLength).toBeLessThanOrEqual(
+        512 * 1024
+      )
+    }
+
+    const texts = cold.sessions.s1?.items.map((item) => item.text) ?? []
+    expect(texts.some((text) => text?.startsWith('older-7-'))).toBe(true)
+    expect(texts.some((text) => text?.startsWith('latest-'))).toBe(false)
+
+    for (let index = 0; index < 100; index += 1) {
+      cold.pushUserEcho('s1', `live-${index}-${'y'.repeat(6_000)}`)
+    }
+    const liveWindow = cold.sessions.s1?.items ?? []
+    expect(liveWindow.length).toBeLessThanOrEqual(80)
+    expect(new TextEncoder().encode(JSON.stringify(liveWindow)).byteLength).toBeLessThanOrEqual(
+      512 * 1024
+    )
+    expect(cold.sessions.s1?.journalHistoryOlderCursor).not.toBeNull()
   })
 })
 

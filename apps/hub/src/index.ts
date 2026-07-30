@@ -9,8 +9,10 @@ import { QuestionService } from './questions.js'
 import {
   JOURNAL_CONDENSE_GRACE_MS,
   JOURNAL_CONDENSE_INTERVAL_MS,
+  JOURNAL_CONDENSE_MAX_AGENT_MESSAGE_DELTAS,
   JOURNAL_CONDENSE_MAX_COMMAND_DELTAS,
   JOURNAL_CONDENSE_MAX_DIFF_SNAPSHOTS,
+  JOURNAL_CONDENSE_MAX_TRANSIENT_BYTES,
   Journal,
   type JournalCondenseResult,
 } from './journal.js'
@@ -427,15 +429,21 @@ const isGreen = supervised && bootPort === 0
 // worker ingestion. The Journal method bounds deletes as well, limiting the cross-process SQLite write lock
 // and WAL burst. A failure is logged and retried next interval; maintenance must never become a boot cause.
 type JournalMaintenanceMessage =
-  | { type: 'journal-condensed'; result: JournalCondenseResult }
-  | { type: 'journal-condense-error'; error: string }
+  | { type: 'journal-condensed'; operationId: string; result: JournalCondenseResult }
+  | { type: 'journal-condense-deferred'; operationId: string; reason: string }
+  | { type: 'journal-condense-error'; operationId: string; error: string }
 
 let journalMaintenanceTimer: NodeJS.Timeout | undefined
+let journalMaintenanceImmediate: NodeJS.Immediate | undefined
 let journalMaintenanceChild: ChildProcess | undefined
 
 function runJournalMaintenance(): void {
   if (journalMaintenanceChild) return // a slow disk gets one job, never an accumulating process queue
+  const operationId = crypto.randomUUID()
   try {
+    journal.recordCompactionLifecycle(operationId, 'started', {
+      detail: 'Bounded journal maintenance child is being launched.',
+    })
     const sourceMode = import.meta.url.endsWith('.ts')
     const entry = path.join(import.meta.dirname, sourceMode ? 'journalMaintenance.ts' : 'journalMaintenance.js')
     // Source mode needs tsx. Resolve it against this package and pass an absolute URL: a bare `tsx/esm`
@@ -447,9 +455,13 @@ function runJournalMaintenance(): void {
       entry,
       [
         journalPath,
+        journalBackupsDir,
+        operationId,
         String(JOURNAL_CONDENSE_GRACE_MS),
         String(JOURNAL_CONDENSE_MAX_COMMAND_DELTAS),
+        String(JOURNAL_CONDENSE_MAX_AGENT_MESSAGE_DELTAS),
         String(JOURNAL_CONDENSE_MAX_DIFF_SNAPSHOTS),
+        String(JOURNAL_CONDENSE_MAX_TRANSIENT_BYTES),
       ],
       {
         execArgv,
@@ -457,54 +469,127 @@ function runJournalMaintenance(): void {
       }
     )
     journalMaintenanceChild = child
-    let reportedFailure = false
+    let terminalReported = false
     const guard = setTimeout(() => {
-      reportedFailure = true
+      if (!terminalReported) {
+        terminalReported = true
+        try {
+          journal.recordCompactionLifecycle(operationId, 'unobservable', {
+            detail: 'Maintenance child exceeded its bounded observation window and was terminated.',
+          })
+        } catch (error) {
+          console.error(
+            `[journal] could not record condensation observation loss: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          )
+        }
+      }
       console.error('[journal] condensation exceeded one interval; terminating it so maintenance can retry')
       child.kill()
     }, JOURNAL_CONDENSE_INTERVAL_MS - 10_000)
     guard.unref?.()
     child.on('message', (raw: unknown) => {
       const msg = raw as JournalMaintenanceMessage
+      if (msg?.operationId !== operationId) return
       if (msg?.type === 'journal-condense-error') {
-        reportedFailure = true
+        terminalReported = true
         console.error(`[journal] condensation failed: ${msg.error}`)
         return
       }
+      if (msg?.type === 'journal-condense-deferred') {
+        terminalReported = true
+        console.warn(`[journal] condensation deferred without deletion: ${msg.reason}`)
+        return
+      }
       if (msg?.type !== 'journal-condensed') return
-      const { commandOutputDeltasDeleted, diffSnapshotsDeleted, cursorCheckpointsWritten } = msg.result
-      if (commandOutputDeltasDeleted || diffSnapshotsDeleted || cursorCheckpointsWritten) {
+      terminalReported = true
+      const {
+        commandOutputDeltasDeleted,
+        agentMessageDeltasDeleted,
+        diffSnapshotsDeleted,
+        transientPayloadBytesDeleted,
+        cursorCheckpointsWritten,
+      } = msg.result
+      if (
+        commandOutputDeltasDeleted ||
+        agentMessageDeltasDeleted ||
+        diffSnapshotsDeleted ||
+        cursorCheckpointsWritten
+      ) {
         console.log(
-          `[journal] condensed ${commandOutputDeltasDeleted} command deltas + ${diffSnapshotsDeleted} diff snapshots` +
+          `[journal] condensed ${commandOutputDeltasDeleted} command deltas + ${agentMessageDeltasDeleted} message deltas + ${diffSnapshotsDeleted} diff snapshots (${transientPayloadBytesDeleted} payload bytes)` +
             (cursorCheckpointsWritten ? `; wrote ${cursorCheckpointsWritten} wseq checkpoint(s)` : '')
         )
       }
     })
     child.once('error', (error) => {
       clearTimeout(guard)
-      reportedFailure = true
+      if (!terminalReported) {
+        terminalReported = true
+        try {
+          journal.recordCompactionLifecycle(operationId, 'unobservable', {
+            detail: `Maintenance child launch failed: ${error.message}`,
+          })
+        } catch {
+          /* the launch error is still reported below */
+        }
+      }
       if (journalMaintenanceChild === child) journalMaintenanceChild = undefined
       console.error(`[journal] could not launch condensation: ${error.message}`)
     })
     child.once('exit', (code, signal) => {
       clearTimeout(guard)
       if (journalMaintenanceChild === child) journalMaintenanceChild = undefined
-      if (code !== 0 && !reportedFailure) {
+      if (!terminalReported) {
+        terminalReported = true
+        try {
+          journal.recordCompactionLifecycle(operationId, 'unobservable', {
+            detail: `Maintenance child exited without a terminal report (${
+              signal ? `signal ${signal}` : `code ${String(code)}`
+            }).`,
+          })
+        } catch (error) {
+          console.error(
+            `[journal] could not record condensation observation loss: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          )
+        }
+      }
+      if (code !== 0) {
         console.error(`[journal] condensation child exited ${signal ? `on ${signal}` : `with code ${String(code)}`}`)
       }
     })
   } catch (error) {
+    try {
+      journal.recordCompactionLifecycle(operationId, 'unobservable', {
+        detail: `Maintenance launch was not observable: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      })
+    } catch {
+      /* launch failure is still reported below */
+    }
     console.error(`[journal] could not launch condensation: ${error instanceof Error ? error.message : String(error)}`)
   }
 }
 
 function startJournalMaintenance(): void {
   if (journalMaintenanceTimer) return
+  // Queue the first bounded attempt only after this process owns the public role. The child performs the
+  // strong-snapshot gate and truthfully defers without deleting when recovery evidence is not ready.
+  journalMaintenanceImmediate = setImmediate(() => {
+    journalMaintenanceImmediate = undefined
+    runJournalMaintenance()
+  })
   journalMaintenanceTimer = setInterval(runJournalMaintenance, JOURNAL_CONDENSE_INTERVAL_MS)
   journalMaintenanceTimer.unref?.()
 }
 
 function stopJournalMaintenance(): void {
+  if (journalMaintenanceImmediate) clearImmediate(journalMaintenanceImmediate)
+  journalMaintenanceImmediate = undefined
   if (journalMaintenanceTimer) clearInterval(journalMaintenanceTimer)
   journalMaintenanceTimer = undefined
   // Killing a one-shot child mid-transaction is safe: SQLite rolls it back. Do not leave an unsupervised

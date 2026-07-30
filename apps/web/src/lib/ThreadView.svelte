@@ -328,7 +328,11 @@
     return tail
   }
   const displayedRenderNodes = $derived(
-    composerOnly && peekItems > 0 ? tailRenderNodes(renderNodes, peekItems) : renderNodes,
+    composerOnly && peekItems > 0
+      ? tailRenderNodes(renderNodes, peekItems)
+      : view?.historyViewingOlder
+        ? renderNodes.slice(0, 120)
+        : tailRenderNodes(renderNodes, 120),
   )
   const model = $derived(view?.record.model ?? '')
   const options = $derived<Record<string, string>>({
@@ -1072,6 +1076,19 @@
     bind:this={scroller}
     onscroll={onScroll}
   >
+    {#if !composerOnly && (view.journalHistoryOlderCursor != null || view.historyOlderCursor != null)}
+      <button
+        class="history-page"
+        disabled={view.loadingHistory}
+        onclick={() => void store.loadOlderHistory(view.record.id)}
+      >
+        {view.loadingHistory ? 'Loading history…' : 'Load older history'}
+      </button>
+    {:else if !composerOnly && view.historyViewingOlder}
+      <button class="history-page" onclick={() => store.showLatestHistory(view.record.id)}>
+        Back to latest
+      </button>
+    {/if}
     <!-- Items produced INSIDE a spawned sub-agent are excluded here and rendered in the agent panel
          instead: a background agent's tool spam would otherwise bury the conversation you are actually
          having. `agentId` is set only for sub-agent output, so the main thread is unaffected. -->
@@ -1418,6 +1435,7 @@
   .hbtn:hover:not(:disabled) { border-color: var(--border-strong); color: var(--text); }
   .hbtn:disabled { opacity: 0.4; cursor: default; }
   .stream { flex: 1; display: flex; flex-direction: column; gap: 0.55rem; padding: 1rem 1.1rem; max-width: 900px; width: 100%; margin: 0 auto; container-type: inline-size; }
+  .history-page { align-self: center; max-width: 18rem; }
   .stream.replay-rebuild { visibility: hidden; }
   .stream-node { min-width: 0; }
   @media (prefers-reduced-motion: no-preference) {

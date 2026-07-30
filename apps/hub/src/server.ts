@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
 import { pipeline } from 'node:stream/promises'
-import { WebSocketServer, WebSocket } from 'ws'
+import { WebSocketServer } from 'ws'
 import type { ApprovalService } from './approvals.js'
 import {
   parseQuestionDecisionBody,
@@ -10,7 +10,13 @@ import {
   QuestionOwnershipError,
 } from './questions.js'
 import type { QuestionService } from './questions.js'
-import type { Journal } from './journal.js'
+import {
+  JOURNAL_HISTORY_PAGE_MAX_BYTES,
+  JOURNAL_HISTORY_PAGE_MAX_ROWS,
+  ReplayGenerationChangedError,
+  SessionHistoryIndexingError,
+  type Journal,
+} from './journal.js'
 import type { ProjectStore } from './projects.js'
 import type { SessionManager } from './sessions.js'
 import type { UsageMonitor } from './usage.js'
@@ -28,7 +34,7 @@ import { readProjectConfig } from './importScan.js'
 import { pickableProfiles, setClaudeConnectorPolicy } from './profiles.js'
 import { ProfileOwnership } from './profileOwnership.js'
 import { asFileWriteDiffDensity } from './types.js'
-import type { DangerFlags, HubEvent, HubPrefs, ManagerAgentType, Profile, Provider, ReplayComplete, ReplayStart } from './types.js'
+import type { DangerFlags, HubPrefs, ManagerAgentType, Profile, Provider } from './types.js'
 import type { Executor } from './executor.js'
 import type { WorktreeProjectActivity } from './worktreeCollisionDetector.js'
 import type { WorkspaceManager } from './workspace.js'
@@ -42,6 +48,12 @@ import {
   dismissRecoveryNotice,
   listRecoveryNotices,
 } from './journalRecovery.js'
+import { attachReplayStream, ReplayPrincipalBudget } from './replayStream.js'
+import { durableReplaySessions } from './replayBaseline.js'
+
+const REPLAY_BASELINE_MAX_BYTES = 2 * 1024 * 1024
+const REPLAY_BASELINE_MAX_SESSIONS = 5_000
+const REPLAY_BASELINE_MAX_PROJECTS = 1_000
 
 const PAGE = `<!doctype html>
 <html>
@@ -160,11 +172,23 @@ async function sendInput() {
   if (out.error) alert(out.error)
   document.getElementById('text').value = ''
 }
-function connectEvents() {
+async function connectEvents() {
   const box = document.getElementById('events')
-  const ws = new WebSocket('ws://' + location.host + '/ws?since=0')
+  const baseline = await j('/api/replay-baseline')
+  if (!baseline || baseline.error || !Number.isSafeInteger(baseline.highWaterSeq)) {
+    setTimeout(connectEvents, 2000)
+    return
+  }
+  const ws = new WebSocket(
+    'ws://' + location.host + '/ws?since=' + baseline.highWaterSeq + '&generation=' + baseline.generation
+  )
   ws.onmessage = (e) => {
     const ev = JSON.parse(e.data)
+    if (ev.type === 'replay-reset-required') {
+      ws.close()
+      return
+    }
+    if (ev.type === 'replay-start' || ev.type === 'replay-complete') return
     const line = document.createElement('div')
     const payload = JSON.stringify(ev.payload)
     line.innerHTML = '<span class="muted">' + ev.ts.slice(11, 19) + '</span> <span class="k">' + ev.kind + '</span> ' +
@@ -470,6 +494,7 @@ export function persistPrefs(
 
 export function startServer(opts: ServerOptions): http.Server {
   const { port, defaultCwd, profilesDir, journal, sessions, profiles, approvals, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity } = opts
+  const replayPrincipalBudget = new ReplayPrincipalBudget()
   const questions = opts.questions
   const profileOwnership = opts.profileOwnership ?? new ProfileOwnership({
     ownerId: `server-${process.pid}`,
@@ -1279,10 +1304,50 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, usage.list())
         return
       }
+      if (method === 'GET' && url.pathname === '/api/replay-baseline') {
+        // Every included record and the watermark comes from this one SQLite snapshot. Process-owner
+        // state (approvals/questions) and volatile config/usage live on their bounded side endpoints and
+        // refresh after the socket connects; mixing those in-memory values here would let a foreign hub
+        // commit outrun the baseline forever.
+        const baseline = journal.readReplaySnapshot((checkpoint) => ({
+          version: checkpoint.version,
+          generation: checkpoint.generation,
+          highWaterSeq: checkpoint.cursor,
+          resetFloorSeq: checkpoint.resetFloorSeq,
+          sessions: durableReplaySessions(journal.db, bus.pendingCounts()),
+          projects: projects.list(),
+          journalCompaction: journal.latestCompactionLifecycle(),
+        }))
+        if (
+          baseline.sessions.length > REPLAY_BASELINE_MAX_SESSIONS ||
+          baseline.projects.length > REPLAY_BASELINE_MAX_PROJECTS
+        ) {
+          json(res, { error: 'current-state replay baseline exceeds its row bound' }, 503)
+          return
+        }
+        if (Buffer.byteLength(JSON.stringify(baseline)) > REPLAY_BASELINE_MAX_BYTES) {
+          json(res, { error: 'current-state replay baseline exceeds its byte bound' }, 503)
+          return
+        }
+        json(res, baseline)
+        return
+      }
       if (method === 'GET' && url.pathname === '/api/events') {
-        // Page the full backlog from `since` (not just the first 2000 rows) so a caller polling
-        // over HTTP gets the same complete, gap-free history the WS replay delivers.
-        json(res, [...journal.replay(Number(url.searchParams.get('since') ?? 0))])
+        // Diagnostic polling is bounded too. A caller that needs more advances `since`; there is no
+        // endpoint left that materializes the 981 MB journal in one response.
+        const since = Number(url.searchParams.get('since') ?? 0)
+        if (!Number.isSafeInteger(since) || since < 0) throw new BadRequestError('invalid since cursor')
+        const checkpoint = journal.replayCheckpoint()
+        const page = journal.boundedReplayPage(since, checkpoint.cursor, {
+          maxRows: 2_000,
+          maxBytes: 2 * 1024 * 1024,
+          maxFrameBytes: 512 * 1024,
+        })
+        if (page.tooLarge) {
+          json(res, { error: 'journal event exceeds diagnostic response bound', seq: page.tooLarge.seq }, 413)
+          return
+        }
+        json(res, page)
         return
       }
       if (method === 'POST' && url.pathname === '/api/sessions') {
@@ -1666,6 +1731,61 @@ export function startServer(opts: ServerOptions): http.Server {
         }
         return
       }
+      const journalHistoryMatch = /^\/api\/sessions\/([^/]+)\/journal-history$/.exec(url.pathname)
+      if (method === 'GET' && journalHistoryMatch) {
+        const beforeRaw = url.searchParams.get('before')
+        const beforeSeq = beforeRaw == null || beforeRaw === '' ? undefined : Number(beforeRaw)
+        const generation = Number(url.searchParams.get('generation'))
+        if (
+          beforeSeq !== undefined &&
+          (!Number.isSafeInteger(beforeSeq) || beforeSeq < 1)
+        ) {
+          throw new BadRequestError('invalid journal history cursor')
+        }
+        if (!Number.isSafeInteger(generation) || generation < 1) {
+          throw new BadRequestError('journal history generation is required')
+        }
+        try {
+          json(
+            res,
+            journal.sessionHistoryPage(journalHistoryMatch[1] as string, {
+              beforeSeq,
+              expectedGeneration: generation,
+              maxRows: JOURNAL_HISTORY_PAGE_MAX_ROWS,
+              maxBytes: JOURNAL_HISTORY_PAGE_MAX_BYTES,
+            })
+          )
+        } catch (error) {
+          if (error instanceof SessionHistoryIndexingError) {
+            json(
+              res,
+              {
+                error: 'journal history index is building',
+                retryable: true,
+                scannedThrough: error.scannedThrough,
+                target: error.target,
+              },
+              503
+            )
+            return
+          }
+          if (error instanceof ReplayGenerationChangedError) {
+            json(
+              res,
+              {
+                error: 'journal history generation changed',
+                resetRequired: true,
+                expected: error.expected,
+                actual: error.actual,
+              },
+              409
+            )
+            return
+          }
+          throw error
+        }
+        return
+      }
       const deleteMatch = /^\/api\/sessions\/([^/]+)\/delete$/.exec(url.pathname)
       if (method === 'POST' && deleteMatch) {
         const body = await readBody(req)
@@ -1764,27 +1884,15 @@ export function startServer(opts: ServerOptions): http.Server {
   })
   wss.on('connection', (ws, req) => {
     const url = new URL(req.url ?? '/ws', 'http://localhost')
-    const since = Number(url.searchParams.get('since') ?? 0)
-    let replayedThrough = since
-    const replayStart: ReplayStart = { type: 'replay-start' }
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(replayStart))
-    // Replay the ENTIRE backlog from `since` (paged inside replay() so a huge journal isn't loaded
+    const since = Number(url.searchParams.get('since'))
+    const generationValue = url.searchParams.get('generation')
+    const generation = generationValue === null ? undefined : Number(generationValue)
+    try {
+      attachReplayStream(ws, journal, { since, generation, principalBudget: replayPrincipalBudget })
+    } catch {
+      ws.close(1011, 'journal replay unavailable')
+    }
     // at once), then attach the live listener — all synchronously, with no `await` between the last
-    // replayed event and journal.on(), so no live event can slip into the gap or be sent twice. The
-    // non-journal boundary is queued in that same gap-free window; it reports stream position only and
-    // lets the client distinguish rebuilt history from the live events that follow. The client also
-    // dedups on seq <= lastSeq, covering any reconnect overlap.
-    for (const event of journal.replay(since)) {
-      replayedThrough = event.seq
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event))
-    }
-    const boundary: ReplayComplete = { type: 'replay-complete', lastSeq: replayedThrough }
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(boundary))
-    const listener = (event: HubEvent): void => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event))
-    }
-    journal.on('event', listener)
-    ws.on('close', () => journal.off('event', listener))
   })
 
   // Track live sockets so a blue-green drain can destroy them and free the fixed port promptly (WS

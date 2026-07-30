@@ -366,6 +366,23 @@
   </div>
 {/if}
 <RecoveryNoticeBanner />
+{#if store.journalCompaction}
+  <div
+    class="journal-maintenance"
+    class:problem={store.journalCompaction.phase === 'failed' || store.journalCompaction.phase === 'unobservable'}
+    role="status"
+    aria-live="polite"
+  >
+    <strong>Journal maintenance:</strong>
+    <span>{store.journalCompaction.detail}</span>
+    {#if store.journalCompaction.rowsDeleted > 0}
+      <span class="maintenance-count">
+        {store.journalCompaction.rowsDeleted.toLocaleString()} superseded rows,
+        {(store.journalCompaction.payloadBytesDeleted / 1_048_576).toFixed(1)} MiB
+      </span>
+    {/if}
+  </div>
+{/if}
 <div
   class="shell"
   class:dragging={sidebarDrag || !!colDrag}
@@ -490,6 +507,19 @@
     border: 2px solid currentColor; border-right-color: transparent;
     animation: hubspin 0.9s linear infinite;
   }
+  .journal-maintenance {
+    display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap;
+    padding: 0.35rem var(--space-4);
+    border-bottom: 1px solid var(--border);
+    background: color-mix(in srgb, var(--accent) 8%, var(--bg));
+    color: var(--text-dim); font-size: var(--text-xs); line-height: 1.35;
+  }
+  .journal-maintenance strong { color: var(--text); }
+  .journal-maintenance.problem {
+    background: var(--warn-bg, rgba(180, 120, 0, 0.14));
+    color: var(--warn-text, #d08700);
+  }
+  .maintenance-count { margin-left: auto; font-variant-numeric: tabular-nums; }
   @keyframes hubspin { to { transform: rotate(360deg); } }
   /* Respect the OS "reduce motion" setting — a permanent spinner is exactly the kind of thing it exists for. */
   @media (prefers-reduced-motion: reduce) { .hubdown .spin { animation: none; } }

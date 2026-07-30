@@ -80,6 +80,7 @@ async function build() {
   )
   sessions.execAgentTool = async () => 'bridge-ok'
   const record = await sessions.create(profile.id, { cwd: root, useWorktree: false })
+  sessions.questionService.activatePublicOwner()
   const deviceToken = 'test-device-token-at-least-thirty-two-characters'
   const restartState: RestartState = {
     booted: true,
@@ -291,9 +292,15 @@ describe('device-authenticated control plane', () => {
 
   it('accepts an authenticated WebSocket bearer header for the trusted dev proxy', async () => {
     const { base, deviceToken } = await build()
-    const socket = new WebSocket(`${base.replace('http:', 'ws:')}/ws?since=0`, {
+    const response = await fetch(`${base}/api/replay-baseline`, { headers: auth(deviceToken) })
+    expect(response.status).toBe(200)
+    const baseline = (await response.json()) as { highWaterSeq: number; generation: number }
+    const socket = new WebSocket(
+      `${base.replace('http:', 'ws:')}/ws?since=${baseline.highWaterSeq}&generation=${baseline.generation}`,
+      {
       headers: { authorization: `Bearer ${deviceToken}` },
-    })
+      }
+    )
     await once(socket, 'open')
     expect(socket.readyState).toBe(WebSocket.OPEN)
     socket.close()
@@ -302,11 +309,27 @@ describe('device-authenticated control plane', () => {
 
   it('sends a replay boundary after the backlog and before subsequently journaled events', async () => {
     const { base, deviceToken, journal, record } = await build()
+    const baselineResponse = await fetch(`${base}/api/replay-baseline`, {
+      headers: auth(deviceToken),
+    })
+    expect(baselineResponse.status).toBe(200)
+    const baseline = (await baselineResponse.json()) as {
+      generation: number
+      highWaterSeq: number
+      resetFloorSeq: number
+      sessions: unknown[]
+      journalCompaction: unknown
+    }
+    expect(baseline.sessions.length).toBeGreaterThan(0)
+    expect(baseline.resetFloorSeq).toBe(0)
     journal.append(record.id, 'test/replayed', { value: 'history' })
     const messages: Array<Record<string, unknown>> = []
-    const socket = new WebSocket(`${base.replace('http:', 'ws:')}/ws?since=0`, {
-      headers: { authorization: `Bearer ${deviceToken}` },
-    })
+    const socket = new WebSocket(
+      `${base.replace('http:', 'ws:')}/ws?since=${baseline.highWaterSeq}&generation=${baseline.generation}`,
+      {
+        headers: { authorization: `Bearer ${deviceToken}` },
+      }
+    )
     try {
       socket.on('message', (data) => messages.push(JSON.parse(String(data)) as Record<string, unknown>))
       await once(socket, 'open')

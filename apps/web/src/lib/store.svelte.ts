@@ -12,9 +12,10 @@ import {
 import { rowFate } from './fleetMerge'
 import { isChatBusy, nextOrderKey, orderChats, type ChatOrderFacts } from './chatOrder'
 import { extractCodexReasoning } from './codexGroup'
+import { reduceJournalHistory } from './journalHistoryReducer'
 import { attachmentsFromPayload, type AttachmentMeta } from './attachments'
 import type { AgentOutcome } from './agentTree'
-import type { ApprovalRecord, FleetSite, HistoryItem, HistoryPage, HubEvent, HubPrefs, HubStreamMessage, ProfileInfo, ProjectInfo, QuestionRecord, RecoveryNotice, ReplayComplete, ReplayStart, ScanResult, SessionRecord, UsageSnapshot } from './api'
+import type { ApprovalRecord, FleetSite, HistoryItem, HistoryPage, HubEvent, HubPrefs, HubStreamMessage, JournalCompactionStatus, JournalHistoryPage, ProfileInfo, ProjectInfo, QuestionRecord, RecoveryNotice, ReplayBaseline, ReplayComplete, ReplayResetRequired, ReplayStart, ScanResult, SessionRecord, UsageSnapshot } from './api'
 
 // Verbose client tracing — on in dev, compiled out of prod builds. Toggle off in dev by setting
 // localStorage['ama:verbose'] = '0'. Surfaces the load/connect/replay/scan milestones so a stall is
@@ -36,6 +37,11 @@ function perfNow(): number {
 function msSince(t0: number): string {
   return `${Math.round(perfNow() - t0)}ms`
 }
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength
+}
+const THREAD_WINDOW_MAX_ITEMS = 80
+const THREAD_WINDOW_MAX_BYTES = 512 * 1024
 
 export interface StatusInfo {
   key: string
@@ -52,6 +58,7 @@ export type ItemKind =
   | 'error'
   | 'note'
   | 'bus'
+  | 'compaction'
 
 export interface ThreadItem {
   key: string
@@ -149,6 +156,9 @@ export interface SessionView {
   // spinner; `historyOlderCursor` is the byte offset for "load older" (null when fully loaded).
   loadingHistory?: boolean
   historyOlderCursor?: number | null
+  journalHistoryOlderCursor?: number | null
+  journalHistoryGeneration?: number
+  historyViewingOlder?: boolean
 }
 
 interface ClaudeBlock {
@@ -293,6 +303,7 @@ export class HubStore {
   questions = $state<QuestionRecord[]>([])
   recoveryNotices = $state<RecoveryNotice[]>([])
   usage = $state<UsageSnapshot[]>([])
+  journalCompaction = $state<JournalCompactionStatus | null>(null)
   // Hub-owned ordinary preferences. Shared here so the composer and Settings read the same live value;
   // absent/failed bootstrap keeps the server's default-on behavior rather than disabling steering.
   prefs = $state<HubPrefs>({ chatNamePool: 'everyone', steerMessagesAtToolBoundary: true })
@@ -316,6 +327,9 @@ export class HubStore {
   // The sidebar watches this to play a brief glitch on that row's label, then clears it.
   recentlyChanged = $state<Record<string, number>>({})
   lastSeq = 0
+  replayGeneration = 0
+  private replayBaselineSeq = 0
+  private baselineRefreshing = false
   // --- Unified fleet view (first cut, read-only) -----------------------------------------------
   // The fleet roster from GET /api/fleet (this hub + reachable co-owned peers). In the single-machine
   // case this is just the local entry, so nothing below changes the UI. Remote sites' projects +
@@ -367,19 +381,13 @@ export class HubStore {
    * Defer the flush to the end of the tick and re-read the session's status before sending, so a status
    * that is immediately superseded within the same batch cannot trigger a send.
    *
-   * WHAT THIS DOES NOT DO — and an earlier version of this comment wrongly claimed it did. It is NOT a
-   * replay barrier. The WebSocket replays the journal from seq 0 on every connect with no
-   * replay-complete marker, and — per `ingest` below — EVERY WebSocket message arrives as its own task,
-   * with batching bounded by a frame rather than by the backlog. So a large replay spans many tasks: an
-   * old `session/status idle` can end one batch, this timer can fire, and the `active` that says the
-   * session is actually busy right now arrives only in a later batch. Deferring narrows the window to a
-   * single batch; it does not close it, and under load it will not.
+   * This timer is not the replay barrier. The versioned transport stages the complete bounded tail until
+   * its replay-complete marker; none of those messages mutates the store before that terminal envelope.
+   * An old `session/status idle` followed by the current active state is therefore applied in one
+   * synchronous flush, and this timer reads the final post-tail status.
    *
-   * THE REAL FIX, still open: the server should emit a non-journal replay-complete control envelope after
-   * its synchronous replay loop and before live delivery, and the client must run no mutating replay side
-   * effect until it sees that envelope — then re-read the final status once. That envelope is a statement
-   * about STREAM position ("everything through seq N has been delivered"), not a second opinion about
-   * whether a session is busy, so it does not add another authority; `record.status` stays the only one.
+   * The replay-complete envelope states only that everything through sequence N was delivered. It is not
+   * a second opinion about whether a session is busy, so `record.status` remains the sole authority.
    *
    * The transactional rollback in flushQueue below is independent of this and does hold: whatever causes
    * a send to fail, the text goes back on the queue rather than vanishing.
@@ -576,6 +584,38 @@ export class HubStore {
     }
   }
 
+  private installReplayBaseline(baseline: ReplayBaseline): void {
+    const retained = Object.fromEntries(
+      Object.entries(this.sessions).filter(([, view]) => view.draft || view.record.siteId),
+    )
+    this.sessions = retained
+    for (const record of baseline.sessions) this.ensure(record)
+    const remoteProjects = this.projects.filter((project) => project.siteId)
+    this.projects = [...baseline.projects, ...remoteProjects]
+    this.journalCompaction = baseline.journalCompaction
+    this.replayGeneration = baseline.generation
+    this.replayBaselineSeq = baseline.highWaterSeq
+    this.lastSeq = baseline.highWaterSeq
+    this.historyPulled.clear()
+    this.pendingEvents = []
+    this.pendingEventBytes = 0
+    this.stagedTail = null
+    this.stagedTailBytes = 0
+  }
+
+  private async refreshRequiredBaseline(): Promise<boolean> {
+    if (this.baselineRefreshing) return false
+    this.baselineRefreshing = true
+    try {
+      const baseline = await api.replayBaseline().catch(() => null)
+      if (!baseline) return false
+      this.installReplayBaseline(baseline)
+      return true
+    } finally {
+      this.baselineRefreshing = false
+    }
+  }
+
   async init(): Promise<void> {
     const t0 = perfNow()
     vlog('init: start')
@@ -596,6 +636,15 @@ export class HubStore {
       this.needsPairing = true
       return
     }
+    // The current-state baseline is the only required bootstrap read. It is bounded and replaces the old
+    // seq=0 replay; without it there is no truthful cursor/generation from which a socket may connect.
+    const baseline = await api.replayBaseline().catch(() => null)
+    if (!baseline) {
+      setTimeout(() => void this.init(), 1000)
+      return
+    }
+    this.installReplayBaseline(baseline)
+
     // OPTIONAL SIDE DATA MUST NEVER STOP THE SOCKET FROM BEING CREATED.
     //
     // These bootstrap awaits used to be uncaught, and connect() — the ONLY place the WebSocket is ever
@@ -1372,9 +1421,9 @@ export class HubStore {
     // Desktop app → loopback hub directly; browser (dev) → same origin, proxied by Vite.
     return HUB_WS || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`
   }
-  private wsUrl(since: number): string {
+  private wsUrl(since: number, generation: number): string {
     const t = getHubToken()
-    return `${this.wsBase()}/ws?since=${since}${t ? `&token=${encodeURIComponent(t)}` : ''}`
+    return `${this.wsBase()}/ws?since=${since}&generation=${generation}${t ? `&token=${encodeURIComponent(t)}` : ''}`
   }
 
   /**
@@ -1413,21 +1462,27 @@ export class HubStore {
   }
 
   private connect(): void {
-    vlog('ws: connecting (replay from seq 0)')
+    vlog(`ws: connecting (bounded tail from seq ${this.lastSeq}, generation ${this.replayGeneration})`)
     this.beginReplayPresentation()
-    const ws = new WebSocket(this.wsUrl(0))
+    const ws = new WebSocket(this.wsUrl(this.lastSeq, this.replayGeneration))
     this.ws = ws
     ws.onopen = () => {
       vlog('ws: open')
       this.markConnected()
       if (this.replayPresentationActive) this.scheduleReplayIdleFallback()
     }
-    ws.onmessage = (e) => this.ingest(JSON.parse(e.data as string) as HubStreamMessage)
+    ws.onmessage = (e) => {
+      try {
+        this.ingest(JSON.parse(e.data as string) as HubStreamMessage)
+      } catch {
+        ws.close()
+      }
+    }
     ws.onclose = () => {
       vlog('ws: closed — reconnecting in 1.5s')
       this.finishReplayPresentation()
       this.markDisconnected()
-      setTimeout(() => this.reconnect(), 1500)
+      if (!this.baselineRefreshing) setTimeout(() => this.reconnect(), 1500)
     }
   }
 
@@ -1442,6 +1497,9 @@ export class HubStore {
    * not just a code read.
    */
   private pendingEvents: HubStreamMessage[] = []
+  private pendingEventBytes = 0
+  private stagedTail: HubStreamMessage[] | null = null
+  private stagedTailBytes = 0
   private flushScheduled = false
   /** True only while state is rebuilding before the socket's replay-complete boundary. */
   replayPresentationActive = $state(false)
@@ -1484,6 +1542,10 @@ export class HubStore {
     return 'type' in message && message.type === 'replay-complete'
   }
 
+  private isReplayReset(message: HubStreamMessage): message is ReplayResetRequired {
+    return 'type' in message && message.type === 'replay-reset-required'
+  }
+
   /**
    * A new hub announces boundary support before replay. Once seen, a short legacy timeout must not
    * interrupt a large valid backlog; WebSocket delivery is ordered/reliable, and socket close handles a
@@ -1499,7 +1561,105 @@ export class HubStore {
   }
 
   private ingest(message: HubStreamMessage): void {
-    this.pendingEvents.push(message)
+    if (this.isReplayReset(message)) {
+      this.stagedTail = null
+      this.stagedTailBytes = 0
+      this.pendingEvents = []
+      this.pendingEventBytes = 0
+      this.ws?.close()
+      void this.refreshRequiredBaseline().then((ready) => {
+        if (ready) this.connect()
+        else {
+          this.replayGeneration = 0
+          setTimeout(() => this.reconnect(), 1500)
+        }
+      })
+      return
+    }
+    if (this.isReplayStart(message)) {
+      if (message.generation !== this.replayGeneration) {
+        if (this.lastSeq < message.resetFloorSeq) {
+          this.ingest({
+            type: 'replay-reset-required',
+            reason: 'generation-changed',
+            checkpoint: {
+              version: 1,
+              generation: message.generation,
+              cursor: message.highWater,
+              resetFloorSeq: message.resetFloorSeq,
+            },
+          })
+          return
+        }
+        this.replayGeneration = message.generation
+      }
+      this.stagedTail = [message]
+      this.stagedTailBytes = utf8Bytes(JSON.stringify(message))
+      return
+    }
+    if (this.stagedTail) {
+      const encodedBytes = utf8Bytes(JSON.stringify(message))
+      this.stagedTailBytes += encodedBytes
+      if (
+        this.stagedTail.length > 5_001 ||
+        this.stagedTailBytes > 2 * 1024 * 1024 ||
+        (this.isReplayComplete(message) && message.generation !== this.replayGeneration)
+      ) {
+        this.ingest({
+          type: 'replay-reset-required',
+          reason: 'tail-too-large',
+          checkpoint: {
+            version: 1,
+            generation: this.replayGeneration,
+            cursor: this.lastSeq,
+            resetFloorSeq: this.lastSeq,
+          },
+        })
+        return
+      }
+      this.stagedTail.push(message)
+      if (!this.isReplayComplete(message)) return
+      if (
+        this.pendingEvents.length + this.stagedTail.length > 1_024 ||
+        this.pendingEventBytes + this.stagedTailBytes > 2 * 1024 * 1024
+      ) {
+        this.ingest({
+          type: 'replay-reset-required',
+          reason: 'client-queue-overflow',
+          checkpoint: {
+            version: 1,
+            generation: this.replayGeneration,
+            cursor: this.lastSeq,
+            resetFloorSeq: this.lastSeq,
+          },
+        })
+        return
+      }
+      this.pendingEvents.push(...this.stagedTail)
+      this.pendingEventBytes += this.stagedTailBytes
+      this.stagedTail = null
+      this.stagedTailBytes = 0
+    } else {
+      const encodedBytes = utf8Bytes(JSON.stringify(message))
+      if (
+        this.pendingEvents.length >= 1_024 ||
+        this.pendingEventBytes + encodedBytes > 2 * 1024 * 1024
+      ) {
+        this.ingest({
+          type: 'replay-reset-required',
+          reason: 'client-queue-overflow',
+          checkpoint: {
+            version: 1,
+            generation: this.replayGeneration,
+            cursor: this.lastSeq,
+            resetFloorSeq: this.lastSeq,
+          },
+        })
+        return
+      }
+      this.pendingEvents.push(message)
+      this.pendingEventBytes += encodedBytes
+    }
     if (this.replayPresentationActive && !this.isReplayStart(message) && !this.isReplayComplete(message)) {
       this.scheduleReplayIdleFallback()
     }
@@ -1533,7 +1693,12 @@ export class HubStore {
     this.flushScheduled = false
     const batch = this.pendingEvents
     this.pendingEvents = []
+    this.pendingEventBytes = 0
     for (const message of batch) {
+      if (this.isReplayReset(message)) {
+        this.ingest(message)
+        continue
+      }
       if (this.isReplayStart(message)) {
         this.confirmReplayProtocol()
         continue
@@ -1545,6 +1710,14 @@ export class HubStore {
       this.applyingReplayedEvent = this.replayPresentationActive
       try {
         this.apply(message)
+        if (
+          message.sessionId &&
+          this.basePanes().flat().includes(message.sessionId) &&
+          this.historyPulled.has(message.sessionId)
+        ) {
+          const view = this.sessions[message.sessionId]
+          if (view) this.boundJournalThreadWindow(view)
+        }
       } catch (err) {
         console.error('[store] failed to apply event', message?.kind, message?.seq, err)
       } finally {
@@ -1554,20 +1727,38 @@ export class HubStore {
   }
 
   private reconnect(): void {
+    if (this.replayGeneration < 1) {
+      void this.refreshRequiredBaseline().then((ready) => {
+        if (ready) this.connect()
+        else {
+          this.replayGeneration = 0
+          setTimeout(() => this.reconnect(), 1500)
+        }
+      })
+      return
+    }
     vlog(`ws: reconnecting (replay from seq ${this.lastSeq})`)
     this.beginReplayPresentation()
-    const ws = new WebSocket(this.wsUrl(this.lastSeq))
+    const ws = new WebSocket(this.wsUrl(this.lastSeq, this.replayGeneration))
     this.ws = ws
     ws.onopen = () => {
       vlog('ws: reopened')
       this.markConnected()
       if (this.replayPresentationActive) this.scheduleReplayIdleFallback()
     }
-    ws.onmessage = (e) => this.ingest(JSON.parse(e.data as string) as HubStreamMessage)
+    ws.onmessage = (e) => {
+      try {
+        this.ingest(JSON.parse(e.data as string) as HubStreamMessage)
+      } catch {
+        ws.close()
+      }
+    }
     ws.onclose = () => {
       this.finishReplayPresentation()
       this.markDisconnected()
-      setTimeout(() => this.reconnect(), 1500)
+      this.stagedTail = null
+      this.stagedTailBytes = 0
+      if (!this.baselineRefreshing) setTimeout(() => this.reconnect(), 1500)
     }
   }
 
@@ -1624,6 +1815,21 @@ export class HubStore {
       if (id) {
         this.projects = this.projects.filter((project) => project.id !== id)
         if (this.projectViewId === id) this.goHome()
+      }
+      return
+    }
+    if (kind.startsWith('journal/compaction-')) {
+      const status = payload as Partial<JournalCompactionStatus>
+      if (
+        typeof status.operationId === 'string' &&
+        typeof status.phase === 'string' &&
+        typeof status.startedAt === 'string' &&
+        typeof status.updatedAt === 'string' &&
+        typeof status.rowsDeleted === 'number' &&
+        typeof status.payloadBytesDeleted === 'number' &&
+        typeof status.detail === 'string'
+      ) {
+        this.journalCompaction = status as JournalCompactionStatus
       }
       return
     }
@@ -1717,7 +1923,7 @@ export class HubStore {
       }
       case 'session/activity': {
         // Real last-turn time backfilled for an imported chat (hub-side, on first history read). Apply
-        // it so the sidebar shows/sorts by real recency even across a refresh (this replays from seq 0).
+        // it so the sidebar shows/sorts by real recency from a bounded tail or live update.
         const p = payload as { lastActivity?: string }
         if (p.lastActivity) {
           view.record.lastActivity = p.lastActivity
@@ -2197,6 +2403,7 @@ export class HubStore {
       last_tool_name?: string
       usage?: { tool_uses?: number }
       patch?: { status?: string }
+      message?: string
     }
     // `claude/system` is a firehose (this journal: ~5k `thinking_tokens` rows to 1k task rows). Bail before
     // touching items for everything that is not a task bookend.
@@ -2206,6 +2413,15 @@ export class HubStore {
     // startup, so a snapshot replayed out of a journal can wedge a run as permanently live. The edge
     // stream below is the correlatable truth; a level we cannot reset would be worse than no signal.
     const st = p.subtype
+    if (st === 'compact_boundary') {
+      this.push(view, {
+        kind: 'compaction',
+        ts,
+        status: 'completed',
+        text: p.message ?? 'Context compaction completed.',
+      })
+      return
+    }
     if (st !== 'task_started' && st !== 'task_progress' && st !== 'task_notification' && st !== 'task_updated') return
 
     // `tool_use_id` is present on nearly every row and is the direct key; `task_updated` never carries one
@@ -2535,6 +2751,13 @@ export class HubStore {
       ...item,
     } as ThreadItem
     view.items.push(complete)
+    if (
+      !view.record.imported &&
+      this.historyPulled.has(view.record.id) &&
+      this.basePanes().flat().includes(view.record.id)
+    ) {
+      this.boundJournalThreadWindow(view)
+    }
     return complete
   }
 
@@ -2544,6 +2767,74 @@ export class HubStore {
 
   private toThreadItem(h: HistoryItem, key: string, fallbackTs: string): ThreadItem {
     return { key, kind: h.kind, ts: h.ts ?? fallbackTs, text: h.text, toolName: h.toolName, toolInput: h.toolInput, toolResult: h.toolResult, toolError: h.toolError, historical: true }
+  }
+
+  private installJournalHistoryWindow(view: SessionView, history: ThreadItem[]): void {
+    // History pages are journal-authoritative and reloadable. Keep one bounded window in the pane rather
+    // than accumulating every page in JS while merely hiding old DOM nodes. Preserve the newest live
+    // items, then fill the remaining logical/byte budget with the requested history page.
+    const live = view.items
+      .filter((item) => item.historical !== true)
+      .slice(-THREAD_WINDOW_MAX_ITEMS)
+    const selectedLive: ThreadItem[] = []
+    let bytes = 0
+    for (let index = live.length - 1; index >= 0; index -= 1) {
+      const item = live[index] as ThreadItem
+      const itemBytes = utf8Bytes(JSON.stringify(item))
+      if (
+        selectedLive.length >= THREAD_WINDOW_MAX_ITEMS ||
+        bytes + itemBytes > THREAD_WINDOW_MAX_BYTES
+      ) {
+        break
+      }
+      selectedLive.unshift(item)
+      bytes += itemBytes
+    }
+    const selectedHistory: ThreadItem[] = []
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+      const item = history[index] as ThreadItem
+      const itemBytes = utf8Bytes(JSON.stringify(item))
+      if (
+        selectedHistory.length + selectedLive.length >= THREAD_WINDOW_MAX_ITEMS ||
+        bytes + itemBytes > THREAD_WINDOW_MAX_BYTES
+      ) {
+        break
+      }
+      selectedHistory.unshift(item)
+      bytes += itemBytes
+    }
+    view.items = [...selectedHistory, ...selectedLive]
+  }
+
+  private boundJournalThreadWindow(view: SessionView): void {
+    if (view.record.imported) return
+    let encodedBytes = utf8Bytes(JSON.stringify(view.items))
+    if (
+      view.items.length <= THREAD_WINDOW_MAX_ITEMS &&
+      encodedBytes <= THREAD_WINDOW_MAX_BYTES
+    ) {
+      return
+    }
+    const selected: ThreadItem[] = []
+    encodedBytes = 2
+    for (let index = view.items.length - 1; index >= 0; index -= 1) {
+      const item = view.items[index] as ThreadItem
+      const itemBytes = utf8Bytes(JSON.stringify(item)) + (selected.length > 0 ? 1 : 0)
+      if (
+        selected.length >= THREAD_WINDOW_MAX_ITEMS ||
+        encodedBytes + itemBytes > THREAD_WINDOW_MAX_BYTES
+      ) {
+        break
+      }
+      selected.unshift(item)
+      encodedBytes += itemBytes
+    }
+    if (selected.length === view.items.length) return
+    view.items = selected
+    // The evicted prefix remains authoritative in SQLite. Point the existing "Load older" affordance at
+    // the latest durable page rather than retaining those items invisibly in heap.
+    view.journalHistoryGeneration = this.replayGeneration
+    view.journalHistoryOlderCursor = this.lastSeq + 1
   }
 
   // Lazily pull an IMPORTED chat's on-disk transcript the first time it's opened and prepend it above
@@ -2559,7 +2850,29 @@ export class HubStore {
       this.historyPulled.add(id)
       return
     }
-    if (!view.record.imported && !view.record.vendorSessionId) return
+    if (!view.record.imported) {
+      this.historyPulled.add(id)
+      view.loadingHistory = true
+      const page = await api
+        .journalHistory(id, this.replayGeneration, this.replayBaselineSeq + 1)
+        .catch(() => null)
+      view.loadingHistory = false
+      if (!page || !Array.isArray(page.events)) {
+        this.historyPulled.delete(id)
+        return
+      }
+      let historyItems: ThreadItem[]
+      try {
+        historyItems = reduceJournalHistory(page.events)
+      } catch {
+        this.historyPulled.delete(id)
+        return
+      }
+      this.installJournalHistoryWindow(view, historyItems)
+      view.journalHistoryGeneration = page.checkpointGeneration
+      view.journalHistoryOlderCursor = page.hasOlder ? page.olderCursor : null
+      return
+    }
     // Already has real turns (live session, or history loaded) — nothing to backfill.
     if (view.items.some((i) => i.kind === 'user' || i.kind === 'assistant')) {
       this.historyPulled.add(id)
@@ -2587,7 +2900,27 @@ export class HubStore {
   // Page OLDER history above what's shown (the "load older" affordance for long imported chats).
   async loadOlderHistory(id: string): Promise<void> {
     const view = this.sessions[id]
-    if (!view || view.historyOlderCursor == null || view.loadingHistory) return
+    if (!view || view.loadingHistory) return
+    if (view.journalHistoryOlderCursor != null) {
+      const cursor = view.journalHistoryOlderCursor
+      view.loadingHistory = true
+      const page: JournalHistoryPage | null = await api
+        .journalHistory(id, view.journalHistoryGeneration ?? this.replayGeneration, cursor)
+        .catch(() => null)
+      view.loadingHistory = false
+      if (!page || !Array.isArray(page.events)) return
+      let historyItems: ThreadItem[]
+      try {
+        historyItems = reduceJournalHistory(page.events)
+      } catch {
+        return
+      }
+      this.installJournalHistoryWindow(view, historyItems)
+      view.journalHistoryOlderCursor = page.hasOlder ? page.olderCursor : null
+      view.historyViewingOlder = true
+      return
+    }
+    if (view.historyOlderCursor == null) return
     const cursor = view.historyOlderCursor
     view.loadingHistory = true
     const page: HistoryPage | null = await api.history(id, cursor).catch(() => null)
@@ -2596,6 +2929,21 @@ export class HubStore {
     const older = page.items.map((h, i) => this.toThreadItem(h, `hist:o${cursor}:${i}`, view.record.createdAt))
     view.items = [...older, ...view.items] // older turns go above everything already shown
     view.historyOlderCursor = page.hasOlder ? page.olderCursor : null
+    view.historyViewingOlder = true
+  }
+
+  showLatestHistory(id: string): void {
+    const view = this.sessions[id]
+    if (!view) return
+    view.historyViewingOlder = false
+    if (view.journalHistoryGeneration !== undefined) {
+      // An older page replaced the prior history window. Reload the bounded latest page from the journal;
+      // live items remain in the pane and are deduplicated by their stable reducer keys.
+      view.items = view.items.filter((item) => item.historical !== true)
+      view.journalHistoryOlderCursor = undefined
+      this.historyPulled.delete(id)
+      void this.ensureHistory(id)
+    }
   }
 
   select(id: string): void {
