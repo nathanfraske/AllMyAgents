@@ -59,6 +59,29 @@ afterEach(() => {
 })
 
 describe('owned journal corruption recovery', () => {
+  it('allows a conclusive first install while the fresh recovery lease is held', () => {
+    const dataDir = root('ama-first-install')
+    const journalPath = path.join(dataDir, 'hub.db')
+    const lease = new JournalRecoveryLease(dataDir)
+    lease.acquireShared()
+    try {
+      expect(fs.existsSync(journalPath)).toBe(false)
+      expect(fs.existsSync(recoveryPaths(dataDir).rootBinding)).toBe(false)
+      expect(
+        verifyNormalJournalLineage({
+          dataDir,
+          journalPath,
+          maxSchemaVersion: SCHEMA_VERSION,
+        })
+      ).toBeUndefined()
+      expect(
+        validateRecoveryReceiptsBeforeWritableOpen({ dataDir, journalPath })
+      ).toBeUndefined()
+    } finally {
+      lease.release()
+    }
+  })
+
   it('runs healthy independent classification in a source/tsx worker', async () => {
     const dataDir = root()
     const journal = open(dataDir)

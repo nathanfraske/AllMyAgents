@@ -3416,6 +3416,21 @@ export function validateRecoveryReceiptsBeforeWritableOpen(options: {
   let db: Database.Database | undefined
   let result: PreflightFailure | undefined
   try {
+    const bindingState = lstatState(paths.rootBinding)
+    if (bindingState.state === 'missing') {
+      const rootState = lstatState(paths.root)
+      if (rootState.state === 'missing') return undefined
+      if (!rootState.stat.isDirectory() || rootState.stat.isSymbolicLink()) {
+        throw new Error('recovery namespace is not a real directory')
+      }
+      if (hasPriorRecoveryNamespaceHistory(paths)) {
+        throw new Error('root binding is missing despite prior recovery receipt history')
+      }
+      // The shared lease deliberately creates the guarded ownership database before
+      // first-install preflight. That lease alone is not recovery enrollment or receipt
+      // history, so a genuinely empty journal may proceed and enroll on its first snapshot.
+      return undefined
+    }
     const binding = parseRootBinding(paths.rootBinding)
     const receiptState = lstatState(paths.receipts)
     if (receiptState.state === 'missing') {
