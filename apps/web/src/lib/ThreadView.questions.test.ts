@@ -156,6 +156,19 @@ describe('ThreadView question lifecycle', () => {
       'New question from Claude. 2 pending.'
     )
     expect(document.activeElement).toBe(composer)
+    const firstAnnouncementNode = screen.getByRole('status').firstElementChild
+
+    store.questions = [question, { ...question, id: 'q3' }]
+    await waitFor(() =>
+      expect(screen.getByRole('status').firstElementChild).not.toBe(
+        firstAnnouncementNode
+      )
+    )
+    expect(screen.getAllByRole('status')).toHaveLength(1)
+    expect(screen.getByRole('status').textContent).toBe(
+      'New question from Claude. 2 pending.'
+    )
+    expect(document.activeElement).toBe(composer)
 
     store.questions = [question]
     await waitFor(() => {

@@ -375,7 +375,7 @@
   let questionArrivalSession: string | undefined
   let previousQuestionIds: string[] = []
   let questionArrivalTimer: ReturnType<typeof setTimeout> | undefined
-  let questionArrivalGeneration = 0
+  let questionArrivalGeneration = $state(0)
 
   function clearQuestionArrival(): void {
     questionArrivalGeneration += 1
@@ -1132,7 +1132,9 @@
     {#if questions.length > 0}
       <div class="question-stack" role="region" aria-label="Pending questions">
         <span class="question-arrival" role="status" aria-live="polite" aria-atomic="true">
-          {questionArrival}
+          {#key questionArrivalGeneration}
+            <span>{questionArrival}</span>
+          {/key}
         </span>
         {#each questions as question, questionIndex (question.id)}
           <QuestionCard
