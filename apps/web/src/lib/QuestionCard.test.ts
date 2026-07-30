@@ -40,9 +40,7 @@ describe('QuestionCard', () => {
     expect(
       screen.getByRole('form', { name: 'Question from Claude 1 of 1' })
     ).toBeTruthy()
-    expect(screen.getByRole('status').textContent).toMatch(
-      /new question from claude, 1 of 1/i
-    )
+    expect(screen.queryByRole('status')).toBeNull()
     expect(screen.getByText('Which format should I use?')).toBeTruthy()
     expect(screen.getAllByText('Other')).toHaveLength(2)
     expect(screen.queryByText(/approve once/i)).toBeNull()

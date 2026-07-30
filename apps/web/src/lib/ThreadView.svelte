@@ -371,6 +371,66 @@
   const st = $derived(view ? store.status(view) : { key: 'idle', label: '' })
   const approvals = $derived(view ? store.approvals.filter((a) => a.sessionId === view.record.id) : [])
   const questions = $derived(view ? store.questions.filter((q) => q.sessionId === view.record.id) : [])
+  let questionArrival = $state('')
+  let questionArrivalSession: string | undefined
+  let previousQuestionIds: string[] = []
+  let questionArrivalTimer: ReturnType<typeof setTimeout> | undefined
+  let questionArrivalGeneration = 0
+
+  function clearQuestionArrival(): void {
+    questionArrivalGeneration += 1
+    if (questionArrivalTimer) clearTimeout(questionArrivalTimer)
+    questionArrivalTimer = undefined
+    questionArrival = ''
+  }
+
+  function announceQuestionArrival(message: string): void {
+    if (questionArrivalTimer) clearTimeout(questionArrivalTimer)
+    const generation = ++questionArrivalGeneration
+    questionArrival = message
+    questionArrivalTimer = setTimeout(() => {
+      if (questionArrivalGeneration !== generation) return
+      questionArrival = ''
+      questionArrivalTimer = undefined
+    }, 1_500)
+  }
+
+  onDestroy(clearQuestionArrival)
+  $effect(() => {
+    const currentSession = view?.record.id
+    const currentIds = questions.map((question) => question.id)
+    if (currentSession !== questionArrivalSession) {
+      questionArrivalSession = currentSession
+      if (currentIds.length === 0) {
+        clearQuestionArrival()
+      } else {
+        announceQuestionArrival(
+          currentIds.length === 1
+            ? 'One pending question from Claude.'
+            : `${currentIds.length} pending questions from Claude.`
+        )
+      }
+    } else {
+      const previous = new Set(previousQuestionIds)
+      const arrived = currentIds.reduce(
+        (count, id) => count + (previous.has(id) ? 0 : 1),
+        0
+      )
+      if (arrived > 0) {
+        announceQuestionArrival(
+          arrived === 1
+            ? `New question from Claude. ${currentIds.length} pending.`
+            : `${arrived} new questions from Claude. ${currentIds.length} pending.`
+        )
+      } else if (currentIds.length < previousQuestionIds.length) {
+        // Removal is not an arrival. Clear stale count text without replacing it with another message.
+        clearQuestionArrival()
+      }
+    }
+    // The service permits at most four pending questions per session. Keep only the current snapshot:
+    // removal/reorder is silent, and memory never grows with historical ids.
+    previousQuestionIds = currentIds.slice(0, 4)
+  })
   const queue = $derived(sid ? store.queueFor(sid) : [])
   const workingContext = $derived.by(() => {
     const resolved = view
@@ -1071,6 +1131,9 @@
 
     {#if questions.length > 0}
       <div class="question-stack" role="region" aria-label="Pending questions">
+        <span class="question-arrival" role="status" aria-live="polite" aria-atomic="true">
+          {questionArrival}
+        </span>
         {#each questions as question, questionIndex (question.id)}
           <QuestionCard
             record={question}
@@ -1390,6 +1453,17 @@
     overflow-y: auto;
     overscroll-behavior: contain;
     scrollbar-gutter: stable;
+  }
+  .question-arrival {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }
   @media (max-height: 650px) {
     .question-stack { max-height: 34dvh; }

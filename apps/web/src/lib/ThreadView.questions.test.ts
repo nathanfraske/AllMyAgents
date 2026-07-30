@@ -134,22 +134,76 @@ describe('ThreadView question lifecycle', () => {
     expect(store.status(view)).toEqual({ key: 'approval', label: 'needs approval' })
   })
 
-  it('announces a newly arrived card without stealing composer focus', async () => {
+  it('announces one appended card once without stealing composer focus', async () => {
     seed()
-    store.questions = []
     render(ThreadView, { props: { sessionId: 's1' } })
     const composer = screen.getByRole('textbox')
     composer.focus()
     expect(document.activeElement).toBe(composer)
+    expect(screen.getAllByRole('status')).toHaveLength(1)
+    expect(screen.getByRole('status').textContent).toBe(
+      'One pending question from Claude.'
+    )
+
+    store.questions = [question, { ...question, id: 'q2' }]
+    await waitFor(() =>
+      expect(
+        screen.getByRole('form', { name: 'Question from Claude 2 of 2' })
+      ).toBeTruthy()
+    )
+    expect(screen.getAllByRole('status')).toHaveLength(1)
+    expect(screen.getByRole('status').textContent).toBe(
+      'New question from Claude. 2 pending.'
+    )
+    expect(document.activeElement).toBe(composer)
 
     store.questions = [question]
-    await waitFor(() =>
+    await waitFor(() => {
       expect(
         screen.getByRole('form', { name: 'Question from Claude 1 of 1' })
       ).toBeTruthy()
-    )
-    expect(screen.getByRole('status').textContent).toMatch(/new question from claude/i)
+      expect(screen.getByRole('status').textContent).toBe('')
+    })
     expect(document.activeElement).toBe(composer)
+
+    store.questions = [question, { ...question, id: 'q2' }]
+    await waitFor(() =>
+      expect(screen.getByRole('status').textContent).toBe(
+        'New question from Claude. 2 pending.'
+      )
+    )
+    expect(screen.getAllByRole('status')).toHaveLength(1)
+    expect(document.activeElement).toBe(composer)
+  })
+
+  it('does not announce removal or reorder as a new arrival', async () => {
+    seed()
+    const records = ['q1', 'q2', 'q3'].map((id) => ({
+      ...question,
+      id,
+      questions: [{ ...question.questions[0]!, question: `Prompt ${id}?` }],
+    }))
+    store.questions = records
+    render(ThreadView, { props: { sessionId: 's1' } })
+    const stack = screen.getByRole('region', { name: 'Pending questions' })
+    const announcement = screen.getByRole('status').textContent
+    expect(announcement).toBe('3 pending questions from Claude.')
+
+    store.questions = [records[2]!, records[0]!, records[1]!]
+    await waitFor(() =>
+      expect(
+        Array.from(stack.querySelectorAll('.prompt'), (node) => node.textContent)
+      ).toEqual(['Prompt q3?', 'Prompt q1?', 'Prompt q2?'])
+    )
+    expect(screen.getByRole('status').textContent).toBe(announcement)
+
+    store.questions = [records[2]!, records[0]!]
+    await waitFor(() =>
+      expect(
+        stack.querySelectorAll('form[aria-label^="Question from Claude "]')
+      ).toHaveLength(2)
+    )
+    expect(screen.getByRole('status').textContent).toBe('')
   })
 
   it('bounds the aggregate question stack so the composer remains reachable on short viewports', () => {
@@ -182,7 +236,14 @@ describe('ThreadView question lifecycle', () => {
     expect(
       stack.querySelector('form[aria-label="Question from Claude 4 of 4"]')
     ).toBeTruthy()
-    expect(screen.getAllByRole('status')).toHaveLength(4)
+    const forms = Array.from(
+      stack.querySelectorAll<HTMLFormElement>('form[aria-label^="Question from Claude "]')
+    )
+    expect(new Set(forms.map((form) => form.getAttribute('aria-label'))).size).toBe(4)
+    expect(screen.getAllByRole('status')).toHaveLength(1)
+    expect(screen.getByRole('status').textContent).toBe(
+      '4 pending questions from Claude.'
+    )
     const source = fs.readFileSync(
       path.join(import.meta.dirname, 'ThreadView.svelte'),
       'utf8'

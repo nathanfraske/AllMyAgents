@@ -152,9 +152,6 @@
     onsubmit={submit}
     aria-label={`Question from Claude ${ordinal} of ${total}`}
   >
-    <span class="arrival" role="status" aria-live="polite">
-      New question from Claude, {ordinal} of {total}.
-    </span>
     <div class="question-top">
       <span class="question-label">QUESTION FROM CLAUDE</span>
       <span class="question-count">{record.questions.length} {record.questions.length === 1 ? 'question' : 'questions'}</span>
@@ -323,16 +320,5 @@
   }
   .error, .invalid {
     color: var(--danger);
-  }
-  .arrival {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    margin: -1px;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
-    border: 0;
   }
 </style>
