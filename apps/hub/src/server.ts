@@ -1504,6 +1504,28 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, sessions.browserStatus(browserLocalMatch[1] as string))
         return
       }
+      const browserTabsMatch = /^\/api\/sessions\/([^/]+)\/browser\/tabs$/.exec(url.pathname)
+      if (method === 'POST' && browserTabsMatch) {
+        const body = await readBody(req)
+        if (typeof body.enabled !== 'boolean') {
+          json(res, { error: 'enabled must be boolean' }, 400)
+          return
+        }
+        await sessions.setBrowserTabs(browserTabsMatch[1] as string, body.enabled)
+        json(res, sessions.browserStatus(browserTabsMatch[1] as string))
+        return
+      }
+      const browserDownloadsMatch = /^\/api\/sessions\/([^/]+)\/browser\/downloads$/.exec(url.pathname)
+      if (method === 'POST' && browserDownloadsMatch) {
+        const body = await readBody(req)
+        if (typeof body.enabled !== 'boolean') {
+          json(res, { error: 'enabled must be boolean' }, 400)
+          return
+        }
+        await sessions.setBrowserDownloads(browserDownloadsMatch[1] as string, body.enabled)
+        json(res, sessions.browserStatus(browserDownloadsMatch[1] as string))
+        return
+      }
       const browserOriginMatch = /^\/api\/sessions\/([^/]+)\/browser\/origins\/revoke$/.exec(url.pathname)
       if (method === 'POST' && browserOriginMatch) {
         const body = await readBody(req)

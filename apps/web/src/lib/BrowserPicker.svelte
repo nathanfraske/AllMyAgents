@@ -21,6 +21,8 @@
   let retainedProfile = $state(false)
   let publicOriginGrants = $state<string[]>([])
   let localNetworkEnabled = $state(false)
+  let tabsEnabled = $state(false)
+  let downloadsEnabled = $state(false)
 
   $effect(() => {
     enabled = initialEnabled
@@ -39,6 +41,8 @@
       retainedProfile = state.retainedProfile
       publicOriginGrants = state.publicOriginGrants
       localNetworkEnabled = state.localNetworkEnabled
+      tabsEnabled = state.tabsEnabled
+      downloadsEnabled = state.downloadsEnabled
     } catch (error) {
       available = false
       reason = error instanceof Error ? error.message : 'Could not reach the browser broker.'
@@ -59,6 +63,8 @@
       retainedProfile = result.retainedProfile
       publicOriginGrants = result.publicOriginGrants
       localNetworkEnabled = result.localNetworkEnabled
+      tabsEnabled = result.tabsEnabled
+      downloadsEnabled = result.downloadsEnabled
     }
     busy = false
   }
@@ -101,6 +107,28 @@
     busy = false
   }
 
+  async function setTabs(): Promise<void> {
+    busy = true
+    const result = await api.setBrowserTabs(sessionId, !tabsEnabled)
+    if ('error' in result) reason = result.error
+    else {
+      tabsEnabled = result.tabsEnabled
+      reason = result.reason ?? null
+    }
+    busy = false
+  }
+
+  async function setDownloads(): Promise<void> {
+    busy = true
+    const result = await api.setBrowserDownloads(sessionId, !downloadsEnabled)
+    if ('error' in result) reason = result.error
+    else {
+      downloadsEnabled = result.downloadsEnabled
+      reason = result.reason ?? null
+    }
+    busy = false
+  }
+
   function openMenu(): void {
     open = !open
     if (open) void refresh()
@@ -136,6 +164,14 @@
         <button class="network" class:on={localNetworkEnabled} onclick={setLocalNetwork} disabled={busy}>
           <span><b>Local network &amp; dev servers</b><small>Loopback, private, and link-local sites</small></span>
           <span>{localNetworkEnabled ? 'on' : 'off'}</span>
+        </button>
+        <button class="network" class:on={tabsEnabled} onclick={setTabs} disabled={busy}>
+          <span><b>Additional tabs</b><small>Each new tab needs a one-use operator approval</small></span>
+          <span>{tabsEnabled ? 'on' : 'off'}</span>
+        </button>
+        <button class="network" class:on={downloadsEnabled} onclick={setDownloads} disabled={busy}>
+          <span><b>Downloads</b><small>Inert, quota-bound files owned only by this chat</small></span>
+          <span>{downloadsEnabled ? 'on' : 'off'}</span>
         </button>
         {#if publicOriginGrants.length}
           <div class="grants">

@@ -1,6 +1,21 @@
 export const BROWSER_PROTOCOL_VERSION = 1 as const
 
-export type BrowserOperation = 'navigate' | 'read' | 'screenshot' | 'show' | 'close' | 'clear'
+export type BrowserOperation =
+  | 'navigate'
+  | 'read'
+  | 'screenshot'
+  | 'click_prepare'
+  | 'click_commit'
+  | 'tabs_list'
+  | 'tab_open_prepare'
+  | 'tab_open_commit'
+  | 'tab_switch'
+  | 'tab_close'
+  | 'download_prepare'
+  | 'download_commit'
+  | 'show'
+  | 'close'
+  | 'clear'
 
 export interface BrowserCommand {
   id: string
@@ -12,13 +27,22 @@ export interface BrowserCommand {
 
 export type BrowserResultContent =
   | { type: 'text'; text: string }
-  | { type: 'image'; data: string; mimeType: 'image/png' }
+  | {
+      type: 'image'
+      data: string
+      mimeType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp'
+    }
 
 export interface BrowserCommandResult {
   id: string
   protocolVersion: typeof BROWSER_PROTOCOL_VERSION
   ok: boolean
   content?: BrowserResultContent[]
+  /**
+   * Host-authored control metadata. This is consumed by the hub and is never
+   * forwarded verbatim as model-visible tool content.
+   */
+  data?: Record<string, unknown>
   error?: string
 }
 

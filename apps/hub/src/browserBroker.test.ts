@@ -107,6 +107,37 @@ describe('BrowserBroker', () => {
     ).resolves.toEqual([{ type: 'text', text: 'page' }])
   })
 
+  it('keeps host-authored approval metadata out of ordinary model-visible content', async () => {
+    const broker = new BrowserBroker({
+      transport: transport(async (input) => ({
+        hello,
+        result: {
+          id: input.id,
+          protocolVersion: BROWSER_PROTOCOL_VERSION,
+          ok: true,
+          content: [],
+          data: {
+            token: 'action_0123456789abcdef',
+            descriptor: { kind: 'button', name: 'Delete account' },
+          },
+        },
+      })),
+    })
+    await broker.refresh()
+
+    await expect(broker.executeDetailed({
+      sessionId: 'session-a',
+      operation: 'click_prepare',
+      arguments: { ref: 'el_0123456789abcdef', pageGeneration: 'page_0123456789abcdef' },
+    })).resolves.toEqual({
+      content: [],
+      data: {
+        token: 'action_0123456789abcdef',
+        descriptor: { kind: 'button', name: 'Delete account' },
+      },
+    })
+  })
+
   it('queues a security-sensitive close behind an in-flight session command', async () => {
     let finishRead: ((command: BrowserCommand) => void) | undefined
     const broker = new BrowserBroker({

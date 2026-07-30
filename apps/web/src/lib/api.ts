@@ -768,6 +768,8 @@ export interface BrowserStatus {
   retainedProfile: boolean
   publicOriginGrants: string[]
   localNetworkEnabled: boolean
+  tabsEnabled: boolean
+  downloadsEnabled: boolean
 }
 
 export const api = {
@@ -924,6 +926,10 @@ export const api = {
     ),
   setBrowserLocalNetwork: (id: string, enabled: boolean) =>
     jpost<BrowserStatus | ApiError>(`/api/sessions/${id}/browser/local-network`, { enabled }),
+  setBrowserTabs: (id: string, enabled: boolean) =>
+    jpost<BrowserStatus | ApiError>(`/api/sessions/${id}/browser/tabs`, { enabled }),
+  setBrowserDownloads: (id: string, enabled: boolean) =>
+    jpost<BrowserStatus | ApiError>(`/api/sessions/${id}/browser/downloads`, { enabled }),
   revokeBrowserOrigin: (id: string, origin: string) =>
     jpost<BrowserStatus | ApiError>(`/api/sessions/${id}/browser/origins/revoke`, { origin }),
   showBrowser: (id: string) =>

@@ -123,10 +123,27 @@ export const AUTO_ALLOW_TOOLS = new Set([
   'mcp__allmyagents__memory_read',
   'mcp__allmyagents__practice_read',
   'mcp__allmyagents__practice_list',
+  // Read-only/session-view browser tools still pass through SessionManager's positive operator-turn
+  // attribution gate. Auto-allowing them here prevents a meaningless generic SDK prompt; it does not
+  // grant Browser, cross a bus turn, or bypass session/tab ownership.
+  'mcp__allmyagents__browser_read_page',
+  'mcp__allmyagents__browser_tabs',
+  'mcp__allmyagents__browser_switch_tab',
+  'mcp__allmyagents__browser_close_tab',
+  'mcp__allmyagents__browser_download_read',
+  'mcp__allmyagents__browser_screenshot',
+  'mcp__allmyagents__browser_status',
 ])
 export const SELF_GATING_TOOLS = new Set([
   'mcp__allmyagents__practice_write',
   'mcp__allmyagents__practice_edit',
+  // These handlers own their meaningful browser approvals: navigate asks only for a new public-origin
+  // grant, while click/tab/download prepare a native descriptor then ask exactly once for that target.
+  // canUseTool must not put a generic tool prompt in front of those host-authored prompts.
+  'mcp__allmyagents__browser_navigate',
+  'mcp__allmyagents__browser_click',
+  'mcp__allmyagents__browser_open_tab',
+  'mcp__allmyagents__browser_download',
 ])
 
 /** Hub-owned services the in-process executor calls directly (shared references — the same objects the
@@ -208,7 +225,7 @@ export interface InProcessExecutorHubHooks {
   ): { ok: boolean; taskId?: string; error?: string }
   browser(
     sessionId: string,
-    operation: 'navigate' | 'read' | 'screenshot' | 'status',
+    operation: Parameters<AgentServices['browser']>[1],
     args: Record<string, unknown>
   ): ReturnType<AgentServices['browser']>
 }

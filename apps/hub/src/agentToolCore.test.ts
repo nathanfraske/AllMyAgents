@@ -19,6 +19,7 @@ interface Harness {
   sent: { to: BusAddress; subject?: string; body: string }[]
   journaled: { kind: string; payload: unknown }[]
   approvals: { kind: string; payload: unknown }[]
+  browserCalls: { sessionId: string; operation: string; args: Record<string, unknown> }[]
 }
 
 function makeHarness(opts: {
@@ -36,6 +37,7 @@ function makeHarness(opts: {
   const sent: Harness['sent'] = []
   const journaled: Harness['journaled'] = []
   const approvals: Harness['approvals'] = []
+  const browserCalls: Harness['browserCalls'] = []
   const services: AgentServices = {
     send: (_from, to, subject, body) => {
       sent.push({ to, subject, body })
@@ -45,7 +47,10 @@ function makeHarness(opts: {
     roster: () => opts.roster ?? [],
     peek: (_caller, _target) => opts.peek ?? { found: false },
     childStatus: () => opts.childStatus ?? { ok: false, error: 'not a project manager' },
-    browser: async () => [{ type: 'text', text: 'browser unavailable in test' }],
+    browser: async (sessionId, operation, args) => {
+      browserCalls.push({ sessionId, operation, args })
+      return [{ type: 'text', text: 'browser unavailable in test' }]
+    },
     memory,
     practices,
     requireApproval: async (_id, kind, payload) => {
@@ -56,7 +61,7 @@ function makeHarness(opts: {
     danger: () => opts.danger ?? SAFE,
     journal: (_sid, kind, payload) => journaled.push({ kind, payload }),
   }
-  return { services, memory, practices, sent, journaled, approvals }
+  return { services, memory, practices, sent, journaled, approvals, browserCalls }
 }
 
 describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)', () => {
@@ -80,6 +85,13 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
       'practice_list',
       'browser_navigate',
       'browser_read_page',
+      'browser_click',
+      'browser_tabs',
+      'browser_open_tab',
+      'browser_switch_tab',
+      'browser_close_tab',
+      'browser_download',
+      'browser_download_read',
       'browser_screenshot',
       'browser_status',
     ])
@@ -101,6 +113,43 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
     // memory_write requires title + body; missing them yields a friendly validation message, not a throw.
     const msg = await runAgentTool('memory_write', { title: 'only title' }, { identity: idA, services: h.services })
     expect(msg).toMatch(/Invalid arguments for memory_write/)
+  })
+})
+
+describe('Agent Browser semantic actions', () => {
+  it('forwards only exact opaque click identity plus the bounded approval summary', async () => {
+    const h = makeHarness()
+    await runAgentTool(
+      'browser_click',
+      {
+        ref: 'el_0123456789abcdef',
+        page_generation: 'page_0123456789abcdef',
+        target_summary: 'Submit checkout',
+      },
+      { identity: idA, services: h.services },
+    )
+    expect(h.browserCalls).toEqual([{
+      sessionId: 's1',
+      operation: 'click',
+      args: {
+        ref: 'el_0123456789abcdef',
+        pageGeneration: 'page_0123456789abcdef',
+        targetSummary: 'Submit checkout',
+      },
+    }])
+  })
+
+  it('does not offer raw selectors, JavaScript, coordinates, paths, or reusable download grants', () => {
+    const selected = AGENT_TOOLS.filter((tool) => [
+      'browser_click',
+      'browser_open_tab',
+      'browser_download',
+      'browser_download_read',
+    ].includes(tool.name))
+    const schema = JSON.stringify(selected.map((tool) => tool.schema))
+    for (const forbidden of ['selector', 'javascript', 'coordinate', 'x', 'y', 'path', 'grantToken']) {
+      expect(schema).not.toContain(`"${forbidden}"`)
+    }
   })
 })
 

@@ -83,6 +83,10 @@ export interface SessionRecord {
   browserOriginGrants?: string[]
   /** Separate owner grant for loopback/private/link-local web origins. Safe default is OFF. */
   browserLocalNetworkEnabled?: boolean
+  /** Allows explicit, approval-bound creation of additional tabs for this session only. */
+  browserTabsEnabled?: boolean
+  /** Allows approval-bound downloads into this session's inert, quota-bound native store. */
+  browserDownloadsEnabled?: boolean
   /** Whether this session has created a persistent isolated profile directory. */
   browserProfileRetained?: boolean
   /** Operator-granted project-manager role. Agents can consume this marker but never set it. */
