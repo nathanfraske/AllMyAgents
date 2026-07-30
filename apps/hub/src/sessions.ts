@@ -154,6 +154,25 @@ const MANAGER_ROSTER_DETAIL_LIMIT = 8
 const MANAGER_ROSTER_PATH_LIMIT = 12
 const MANAGER_ROSTER_MAX_CHARS = 8_000
 
+export interface ProfileTurnSettlementResult {
+  settled: boolean
+  outcomeUnknownSessionIds: string[]
+  outcomeUnknownOperationIds: string[]
+}
+
+export interface ProfileTurnFreezeReceipt {
+  readonly profileId: string
+  readonly publicEpoch: number
+  readonly generationId: string
+  readonly freezeId: string
+}
+
+interface ProfileAdmissionLease {
+  readonly operationId: string
+  markDispatched(): void
+  release(): void
+}
+
 export class SessionManager {
   private readonly sessions = new Map<string, SessionRecord>()
   // Per-session set of memory ids already auto-recalled into context, so the same memory isn't
@@ -192,6 +211,18 @@ export class SessionManager {
   // continue to their exact captured terminal promise; queued operator/bus input remains durable and is
   // delivered only after rollback or by the promoted process.
   private restartTurnAdmissionFrozen = false
+  private readonly profileTurnAdmission = new Map<
+    string,
+    {
+      publicEpoch: number
+      generationId: string
+      frozen: boolean
+      freezeId?: string
+      inFlight: Map<string, { dispatched: boolean }>
+    }
+  >()
+  private readonly profileSettlementWaiters = new Set<() => void>()
+  private readonly sessionTurnGeneration = new Map<string, number>()
   // At most one database batch may be crossing the live-steer boundary per recipient. busSend can be
   // called again while the executor acknowledgement is in flight; without this fence both deliveries
   // would select the same undelivered rows and inject the same framed messages twice.
@@ -339,6 +370,7 @@ export class SessionManager {
       if (replay) {
         record.status = status
         this.persist(record)
+        this.notifyProfileSettlement()
         return
       }
       this.setStatus(record, status)
@@ -1332,6 +1364,254 @@ export class SessionManager {
     }
   }
 
+  private profileAdmissionState(profileId: string): {
+    publicEpoch: number
+    generationId: string
+    frozen: boolean
+    freezeId?: string
+    inFlight: Map<string, { dispatched: boolean }>
+  } {
+    let state = this.profileTurnAdmission.get(profileId)
+    if (!state) {
+      state = {
+        publicEpoch: 0,
+        generationId: 'legacy-unfenced',
+        frozen: false,
+        inFlight: new Map(),
+      }
+      this.profileTurnAdmission.set(profileId, state)
+    }
+    return state
+  }
+
+  private beginProfileAdmission(profileId: string): ProfileAdmissionLease {
+    const state = this.profileAdmissionState(profileId)
+    if (state.frozen) {
+      throw new Error(
+        `new turns for profile ${profileId} are temporarily unavailable while its credentials change`,
+      )
+    }
+    const operationId = crypto.randomUUID()
+    const operation = { dispatched: false }
+    state.inFlight.set(operationId, operation)
+    let released = false
+    return {
+      operationId,
+      markDispatched: () => {
+        if (released) throw new Error(`Profile admission ${operationId} is already released`)
+        operation.dispatched = true
+      },
+      release: () => {
+        if (released) return
+        released = true
+        state.inFlight.delete(operationId)
+        this.notifyProfileSettlement()
+      },
+    }
+  }
+
+  freezeProfileTurnAdmission(
+    profileId: string,
+    publicEpoch: number,
+    generationId: string,
+  ): ProfileTurnFreezeReceipt {
+    if (!Number.isSafeInteger(publicEpoch) || publicEpoch < 0) {
+      throw new Error(
+        `Profile turn-admission epoch must be a non-negative safe integer; got ${publicEpoch}`,
+      )
+    }
+    if (!generationId.trim()) throw new Error('Profile turn-admission generation is required')
+    const current = this.profileAdmissionState(profileId)
+    if (publicEpoch < current.publicEpoch) {
+      throw new Error(
+        `Cannot move profile ${profileId} turn admission backwards from ${current.publicEpoch} to ${publicEpoch}`,
+      )
+    }
+    if (
+      publicEpoch === current.publicEpoch &&
+      current.generationId !== 'legacy-unfenced' &&
+      current.generationId !== generationId
+    ) {
+      throw new Error(
+        `Profile ${profileId} epoch ${publicEpoch} belongs to generation ${current.generationId}, not ${generationId}`,
+      )
+    }
+    if (
+      current.frozen &&
+      current.publicEpoch === publicEpoch &&
+      current.generationId === generationId &&
+      current.freezeId
+    ) {
+      return { profileId, publicEpoch, generationId, freezeId: current.freezeId }
+    }
+    current.publicEpoch = publicEpoch
+    current.generationId = generationId
+    current.frozen = true
+    current.freezeId = crypto.randomUUID()
+    this.notifyProfileSettlement()
+    return {
+      profileId,
+      publicEpoch,
+      generationId,
+      freezeId: current.freezeId,
+    }
+  }
+
+  thawProfileTurnAdmission(receipt: ProfileTurnFreezeReceipt): boolean {
+    const current = this.profileTurnAdmission.get(receipt.profileId)
+    if (
+      !current?.frozen ||
+      current.publicEpoch !== receipt.publicEpoch ||
+      current.generationId !== receipt.generationId ||
+      current.freezeId !== receipt.freezeId
+    ) {
+      return false
+    }
+    current.frozen = false
+    current.freezeId = undefined
+    this.notifyProfileSettlement()
+    for (const record of this.sessions.values()) {
+      if (
+        record.profileId === receipt.profileId &&
+        (record.status === 'idle' || record.status === 'active')
+      ) {
+        setImmediate(() => this.deliverBus(record.id))
+      }
+    }
+    return true
+  }
+
+  private profileUnsettledSessionIds(profileId: string): string[] {
+    const out: string[] = []
+    for (const record of this.sessions.values()) {
+      if (record.profileId !== profileId) continue
+      if (
+        record.status === 'active' ||
+        record.status === 'starting' ||
+        this.executor.isBusy(record.id)
+      ) {
+        out.push(record.id)
+      }
+    }
+    return out
+  }
+
+  private notifyProfileSettlement(): void {
+    for (const notify of [...this.profileSettlementWaiters]) notify()
+  }
+
+  private markTurnDispatched(sessionId: string): number {
+    const generation = (this.sessionTurnGeneration.get(sessionId) ?? 0) + 1
+    this.sessionTurnGeneration.set(sessionId, generation)
+    this.notifyProfileSettlement()
+    return generation
+  }
+
+  async settleProfileTurns(
+    receipt: ProfileTurnFreezeReceipt,
+    timeoutMs: number,
+  ): Promise<ProfileTurnSettlementResult> {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) {
+      throw new Error(`Profile settlement timeout must be a non-negative safe integer; got ${timeoutMs}`)
+    }
+    const state = this.profileTurnAdmission.get(receipt.profileId)
+    if (
+      !state?.frozen ||
+      state.publicEpoch !== receipt.publicEpoch ||
+      state.generationId !== receipt.generationId ||
+      state.freezeId !== receipt.freezeId
+    ) {
+      throw new Error(`Profile ${receipt.profileId} freeze receipt is stale or no longer authoritative`)
+    }
+
+    return await new Promise<ProfileTurnSettlementResult>((resolve) => {
+      let finished = false
+      let handles:
+        | Array<{ sessionId: string; turnGeneration: number }>
+        | undefined
+      const finish = (result: ProfileTurnSettlementResult): void => {
+        if (finished) return
+        finished = true
+        clearTimeout(timer)
+        this.profileSettlementWaiters.delete(check)
+        resolve(result)
+      }
+      const check = (): void => {
+        const live = this.profileTurnAdmission.get(receipt.profileId)
+        if (
+          !live?.frozen ||
+          live.publicEpoch !== receipt.publicEpoch ||
+          live.generationId !== receipt.generationId ||
+          live.freezeId !== receipt.freezeId
+        ) {
+          finish({
+            settled: false,
+            outcomeUnknownSessionIds:
+              handles?.map((handle) => handle.sessionId) ??
+              this.profileUnsettledSessionIds(receipt.profileId),
+            outcomeUnknownOperationIds: [...(live?.inFlight.keys() ?? [])],
+          })
+          return
+        }
+        if (live.inFlight.size > 0) return
+        if (!handles) {
+          handles = this.profileUnsettledSessionIds(receipt.profileId).map((sessionId) => ({
+            sessionId,
+            turnGeneration: this.sessionTurnGeneration.get(sessionId) ?? 0,
+          }))
+          void Promise.allSettled(
+            handles.map((handle) => this.interrupt(handle.sessionId)),
+          ).then(() => this.notifyProfileSettlement())
+        }
+        const pending = handles.filter((handle) => {
+          if ((this.sessionTurnGeneration.get(handle.sessionId) ?? 0) !== handle.turnGeneration) {
+            return true
+          }
+          const record = this.sessions.get(handle.sessionId)
+          return (
+            record?.status === 'active' ||
+            record?.status === 'starting' ||
+            this.executor.isBusy(handle.sessionId)
+          )
+        })
+        if (pending.length === 0) {
+          finish({
+            settled: true,
+            outcomeUnknownSessionIds: [],
+            outcomeUnknownOperationIds: [],
+          })
+        }
+      }
+      const timer = setTimeout(() => {
+        finish({
+          settled: false,
+          outcomeUnknownSessionIds:
+            handles
+              ?.filter((handle) => {
+                if (
+                  (this.sessionTurnGeneration.get(handle.sessionId) ?? 0) !==
+                  handle.turnGeneration
+                ) {
+                  return true
+                }
+                const record = this.sessions.get(handle.sessionId)
+                return (
+                  record?.status === 'active' ||
+                  record?.status === 'starting' ||
+                  this.executor.isBusy(handle.sessionId)
+                )
+              })
+              .map((handle) => handle.sessionId) ??
+            this.profileUnsettledSessionIds(receipt.profileId),
+          outcomeUnknownOperationIds: [...state.inFlight.keys()],
+        })
+      }, timeoutMs)
+      timer.unref()
+      this.profileSettlementWaiters.add(check)
+      check()
+    })
+  }
+
   setRestartTurnAdmissionFrozen(frozen: boolean): void {
     this.restartTurnAdmissionFrozen = frozen
     if (!frozen) {
@@ -2226,6 +2506,7 @@ export class SessionManager {
     }
     this.persist(record)
     this.journal.append(record.id, 'session/status', { status })
+    this.notifyProfileSettlement()
     if (status === 'active' && record.parentSessionId) this.scheduleManagerStallCheck(record.id)
     else this.clearManagerStallCheck(record.id)
     if (record.parentSessionId && previous !== status) {
@@ -2399,6 +2680,19 @@ export class SessionManager {
 
   async create(profileId: string, opts: CreateOptions): Promise<SessionRecord> {
     this.assertTurnAdmissionOpen()
+    const admission = this.beginProfileAdmission(profileId)
+    try {
+      return await this.createAdmitted(profileId, opts, admission)
+    } finally {
+      admission.release()
+    }
+  }
+
+  private async createAdmitted(
+    profileId: string,
+    opts: CreateOptions,
+    admission: ProfileAdmissionLease,
+  ): Promise<SessionRecord> {
     const profile = this.profiles.get(profileId)
     if (!profile) throw new Error(`unknown profile: ${profileId}`)
     if (profile.available === false) throw new Error(profile.unavailableReason ?? `profile ${profileId} is unavailable`)
@@ -2548,15 +2842,22 @@ export class SessionManager {
       // observable side effect, so lazy-vs-eager is invisible). Fire-and-forget, as before.
       if (opts.prompt) {
         acceptInitialPrompt()
-        void this.executor.runTurn(this.specOf(record), opts.prompt, 'operator')
+        admission.markDispatched()
+        this.markTurnDispatched(record.id)
+        // Executor.runTurn resolves at the provider-accepted/turn-start boundary. Keep the profile
+        // admission lease until that exact acknowledgement so a credential freeze cannot observe
+        // inFlight=0 in the dispatch -> active-status gap and archive credentials under a live turn.
+        await this.executor.runTurn(this.specOf(record), opts.prompt, 'operator')
       }
     } else {
+      admission.markDispatched()
       const threadId = await this.executor.startThread(this.specOf(record))
       record.vendorSessionId = threadId
       this.persist(record)
       this.setStatus(record, 'idle')
       if (opts.prompt) {
         acceptInitialPrompt()
+        this.markTurnDispatched(record.id)
         await this.executor.runTurn(this.specOf(record), opts.prompt, 'operator')
       }
     }
@@ -2655,7 +2956,12 @@ export class SessionManager {
         skipped++
         continue
       }
-      imported.push(this.adoptChat(projectId, chat))
+      const admission = this.beginProfileAdmission(chat.profileId)
+      try {
+        imported.push(this.adoptChat(projectId, chat))
+      } finally {
+        admission.release()
+      }
     }
     const notFound = [...wanted].filter((id) => !byId.has(id))
     return { imported, skipped, notFound }
@@ -2716,6 +3022,22 @@ export class SessionManager {
     this.assertTurnAdmissionOpen()
     const record = this.sessions.get(sessionId)
     if (!record) throw new Error(`unknown session: ${sessionId}`)
+    const admission = this.beginProfileAdmission(record.profileId)
+    try {
+      await this.sendAdmitted(record, text, override, attachmentIds, admission)
+    } finally {
+      admission.release()
+    }
+  }
+
+  private async sendAdmitted(
+    record: SessionRecord,
+    text: string,
+    override: TurnOverride,
+    attachmentIds: readonly string[],
+    admission: ProfileAdmissionLease,
+  ): Promise<void> {
+    const sessionId = record.id
     if (record.status === 'stopped') throw new Error('session is stopped')
     this.usage.assertNotBlocked(record.profileId)
     // ADMISSION BEFORE SIDE EFFECTS. The busy check used to sit below, after the input had already been
@@ -2735,6 +3057,7 @@ export class SessionManager {
       // Acceptance comes BEFORE transcript side effects for the same reason as a fresh send below: if the
       // turn ended in the race to the executor, the web queue receives a rejection and can keep/retry the
       // message. A phantom session/input would falsely claim the model saw text that never crossed.
+      admission.markDispatched()
       if (attachments.length) await this.executor.steer(sessionId, text, attachments)
       else await this.executor.steer(sessionId, text)
       this.journal.append(sessionId, 'session/input', { text, attachments })
@@ -2768,9 +3091,14 @@ export class SessionManager {
     // Dynamic manager roster/task state is regenerated at the actual turn boundary. A compacted
     // conversation therefore receives current children without relying on the model to remember a tool.
     this.materializeSessionInstructions(record)
+    admission.markDispatched()
+    this.markTurnDispatched(record.id)
     if (record.provider === 'claude') {
-      if (attachments.length) void this.executor.runTurn(this.specOf(record), text, 'operator', attachments)
-      else void this.executor.runTurn(this.specOf(record), text, 'operator')
+      if (attachments.length) {
+        await this.executor.runTurn(this.specOf(record), text, 'operator', attachments)
+      } else {
+        await this.executor.runTurn(this.specOf(record), text, 'operator')
+      }
     } else {
       if (attachments.length) await this.executor.runTurn(this.specOf(record), text, 'operator', attachments)
       else await this.executor.runTurn(this.specOf(record), text, 'operator')
@@ -2780,10 +3108,16 @@ export class SessionManager {
   async steer(sessionId: string, text: string, attachmentIds: readonly string[] = []): Promise<void> {
     const record = this.sessions.get(sessionId)
     if (!record) throw new Error(`unknown session: ${sessionId}`)
-    const attachments = this.attachmentsFor(record, attachmentIds)
-    if (attachments.length) await this.executor.steer(sessionId, text, attachments)
-    else await this.executor.steer(sessionId, text)
-    this.journal.append(sessionId, 'session/steered', { text, attachments })
+    const admission = this.beginProfileAdmission(record.profileId)
+    try {
+      const attachments = this.attachmentsFor(record, attachmentIds)
+      admission.markDispatched()
+      if (attachments.length) await this.executor.steer(sessionId, text, attachments)
+      else await this.executor.steer(sessionId, text)
+      this.journal.append(sessionId, 'session/steered', { text, attachments })
+    } finally {
+      admission.release()
+    }
   }
 
   /**
@@ -2795,7 +3129,14 @@ export class SessionManager {
   async steerWorktreeCollision(sessionId: string, text: string): Promise<boolean> {
     const record = this.sessions.get(sessionId)
     if (record?.status !== 'active' || !record.worktree) return false
+    let admission: ProfileAdmissionLease
     try {
+      admission = this.beginProfileAdmission(record.profileId)
+    } catch {
+      return false
+    }
+    try {
+      admission.markDispatched()
       await this.executor.steer(sessionId, text)
       this.journal.append(sessionId, 'session/worktree-collision-steered', { text })
       return true
@@ -2805,6 +3146,8 @@ export class SessionManager {
         error: error instanceof Error ? error.message : String(error),
       })
       return false
+    } finally {
+      admission.release()
     }
   }
 
@@ -2847,7 +3190,14 @@ export class SessionManager {
       const source = participants.find((record) => record.parentSessionId === manager.id)
       if (!source) continue
       if (manager.status === 'active' || manager.status === 'starting') {
+        let admission: ProfileAdmissionLease
         try {
+          admission = this.beginProfileAdmission(manager.profileId)
+        } catch {
+          continue
+        }
+        try {
+          admission.markDispatched()
           await this.executor.steer(manager.id, framed)
           this.journal.append(manager.id, 'manager/worktree-risk-steered', {
             participantSessionIds,
@@ -2862,6 +3212,8 @@ export class SessionManager {
             risk: risk.risk,
             error: error instanceof Error ? error.message : String(error),
           })
+        } finally {
+          admission.release()
         }
       }
       this.bus.post({
@@ -3217,12 +3569,17 @@ export class SessionManager {
   rename(sessionId: string, title: string): void {
     const record = this.sessions.get(sessionId)
     if (!record) throw new Error(`unknown session: ${sessionId}`)
-    const clean = sanitizeTitle(title)
-    if (!clean) throw new Error('title cannot be empty')
-    record.title = clean
-    record.titleSource = 'user'
-    this.persist(record)
-    this.journal.append(sessionId, 'session/titled', { title: clean, source: 'user' })
+    const admission = this.beginProfileAdmission(record.profileId)
+    try {
+      const clean = sanitizeTitle(title)
+      if (!clean) throw new Error('title cannot be empty')
+      record.title = clean
+      record.titleSource = 'user'
+      this.persist(record)
+      this.journal.append(sessionId, 'session/titled', { title: clean, source: 'user' })
+    } finally {
+      admission.release()
+    }
   }
 
   // ---- Inter-agent bus (DESIGN D10) --------------------------------------------------------------
@@ -3597,9 +3954,18 @@ export class SessionManager {
   }
 
   private async steerBus(sessionId: string, messages: BusMessage[], framed: string): Promise<void> {
+    const recordAtAdmission = this.sessions.get(sessionId)
+    if (!recordAtAdmission) return
+    let admission: ProfileAdmissionLease
+    try {
+      admission = this.beginProfileAdmission(recordAtAdmission.profileId)
+    } catch {
+      return
+    }
     this.busSteerInFlight.add(sessionId)
     let accepted = false
     try {
+      admission.markDispatched()
       await this.executor.steer(sessionId, framed)
       // Mark durable delivery only AFTER the provider/worker accepted the steer. If the turn ended first,
       // these rows remain pending and the ordinary idle delivery path can start them as their own turn.
@@ -3612,6 +3978,7 @@ export class SessionManager {
         }`
       )
     } finally {
+      admission.release()
       this.busSteerInFlight.delete(sessionId)
       const record = this.sessions.get(sessionId)
       // An idle transition can race the rejected acknowledgement while the in-flight fence suppresses its
@@ -3633,6 +4000,15 @@ export class SessionManager {
    * retried per message; the full mail remains pending for the ordinary turn-boundary path.
    */
   private async noticePendingBus(sessionId: string): Promise<void> {
+    const record = this.sessions.get(sessionId)
+    if (!record) return
+    let admission: ProfileAdmissionLease
+    try {
+      admission = this.beginProfileAdmission(record.profileId)
+    } catch {
+      return
+    }
+    try {
     if (
       this.busNoticeTurns.has(sessionId) ||
       this.journal.hasBusPendingNoticeInCurrentTurn(sessionId)
@@ -3646,6 +4022,7 @@ export class SessionManager {
     this.journal.append(sessionId, 'bus/pending-notice-attempted', { count: pending.length })
     const noun = pending.length === 1 ? 'message' : 'messages'
     try {
+      admission.markDispatched()
       await this.executor.steer(
         sessionId,
         `You have ${pending.length} teammate ${noun} waiting. Call read_messages to read ${
@@ -3659,6 +4036,9 @@ export class SessionManager {
         }`
       )
     }
+    } finally {
+      admission.release()
+    }
   }
 
   /**
@@ -3670,6 +4050,7 @@ export class SessionManager {
     if (this.restartTurnAdmissionFrozen) return
     const record = this.sessions.get(sessionId)
     if (!record) return
+    if (this.profileTurnAdmission.get(record.profileId)?.frozen) return
     if (record.status === 'active' || record.status === 'starting') {
       if (!this.steerMessagesAtToolBoundary()) {
         // If a full-message steer is already crossing the boundary, let its acknowledgement decide which
@@ -3695,24 +4076,42 @@ export class SessionManager {
     if (record.provider === 'claude' && this.executor.isBusy(sessionId)) return
     const pending = this.bus.pending(sessionId)
     if (!pending.length) return
-    this.materializeSessionInstructions(record)
-    this.markBusDelivered(sessionId, pending)
-    const framed = frameBusMessages(pending)
+    let admission: ProfileAdmissionLease
+    try {
+      admission = this.beginProfileAdmission(record.profileId)
+    } catch {
+      return
+    }
+    let releaseSynchronously = true
+    try {
+      this.materializeSessionInstructions(record)
+      this.markBusDelivered(sessionId, pending)
+      const framed = frameBusMessages(pending)
     // origin: 'bus' tags the turn so risky in-process tools self-gate (hard-deny) — a teammate
     // message is semi-trusted and must never drive a practice/hook write on its own. The clamped
     // permission mode rides in the spec, so by default a bus-triggered turn never inherits full/bypass.
     // The Danger Zone flag lifts the clamp for owners who want the mode they picked to apply to every
     // turn in the chat; the self-gates above are separate and keep their own busCanUseRiskyTools switch.
-    const spec = {
-      ...this.specOf(record),
-      permissionMode: clampMode(this.effectivePermissionMode(record), this.danger.fullAccessAnyOrigin === true),
-    }
+      const spec = {
+        ...this.specOf(record),
+        permissionMode: clampMode(this.effectivePermissionMode(record), this.danger.fullAccessAnyOrigin === true),
+      }
     // Tag this bus-caused turn so a Codex agent tool call (bridge → execAgentTool) sees isBusTurn and
     // hard-denies practice writes — the same self-gate provenance the executor tags for the Claude path.
     // Cleared when the session leaves 'active' (setStatus), so it spans the whole turn.
-    this.busTurnSessions.add(record.id)
-    this.journal.append(record.id, 'session/turn-origin', { origin: 'bus' })
-    void this.executor.runTurn(spec, framed, 'bus')
+      this.busTurnSessions.add(record.id)
+      this.journal.append(record.id, 'session/turn-origin', { origin: 'bus' })
+      admission.markDispatched()
+      this.markTurnDispatched(record.id)
+      const accepted = this.executor.runTurn(spec, framed, 'bus')
+      releaseSynchronously = false
+      // deliverBus intentionally stays synchronous for its many scheduling callers, but the admission
+      // itself remains live through the executor's explicit acceptance promise. A hung/unknown handoff is
+      // therefore visible to bounded profile settlement instead of silently disappearing.
+      void accepted.finally(() => admission.release())
+    } finally {
+      if (releaseSynchronously) admission.release()
+    }
   }
 
   /**
@@ -3940,10 +4339,17 @@ export class SessionManager {
   readCodexLimits(profileId: string): Promise<unknown> {
     const profile = this.profiles.get(profileId)
     if (!profile) throw new Error(`unknown profile: ${profileId}`)
+    const admission = this.beginProfileAdmission(profileId)
     // This also lazily spawns the profile's codex app-server — register the MCP config first (same
     // reason as specOf; guarded to once per profile, no-op without a wired bridge).
-    this.ensureCodexMcpConfig(profile)
-    return this.executor.readCodexLimits(profileId, profile.dir)
+    try {
+      this.ensureCodexMcpConfig(profile)
+      admission.markDispatched()
+      return this.executor.readCodexLimits(profileId, profile.dir).finally(() => admission.release())
+    } catch (error) {
+      admission.release()
+      throw error
+    }
   }
 
   /**

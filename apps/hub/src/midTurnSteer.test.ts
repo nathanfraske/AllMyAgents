@@ -39,6 +39,9 @@ function build(
     pref?: boolean
     provider?: 'claude' | 'codex'
     startThread?: () => Promise<string>
+    runTurn?: Executor['runTurn']
+    interrupt?: (sessionId: string) => Promise<void>
+    isBusy?: (sessionId: string) => boolean
   } = {}
 ) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-steer-'))
@@ -49,17 +52,18 @@ function build(
   const bus = new AgentBus(journal.db)
   const steer = vi.fn(opts.steer ?? (async () => {}))
   const startThread = vi.fn(opts.startThread ?? (async () => 'thread-1'))
-  const runTurn = vi.fn(async () => {})
+  const runTurn = vi.fn(opts.runTurn ?? (async () => {}))
+  const interrupt = vi.fn(opts.interrupt ?? (async () => {}))
   const executor: Executor = {
     startThread,
     runTurn,
     steer,
-    interrupt: async () => {},
+    interrupt,
     stopSession: async () => {},
     readCodexLimits: async () => ({}),
     listLive: async () => [],
     attach: async () => {},
-    isBusy: () => true,
+    isBusy: opts.isBusy ?? (() => true),
   }
   const profile: Profile = {
     id: 'p1',
@@ -101,7 +105,7 @@ function build(
   }
   ;(sessions as unknown as { sessions: Map<string, SessionRecord> }).sessions.set(record.id, record)
   store.upsert(record)
-  return { sessions, journal, bus, record, steer, startThread, runTurn }
+  return { sessions, journal, bus, record, steer, startThread, runTurn, interrupt }
 }
 
 async function settle(): Promise<void> {
@@ -170,6 +174,217 @@ describe('SessionManager mid-turn steering', () => {
     await settle()
     expect(steer).toHaveBeenCalledOnce()
     expect(bus.pending('s1')).toHaveLength(0)
+  })
+
+  it('freezes only the selected profile before any new transcript or title mutation', async () => {
+    const { sessions, journal, record } = build()
+    sessions.freezeProfileTurnAdmission('p1', 5, 'blue-generation')
+
+    await expect(sessions.send('s1', 'must remain absent')).rejects.toThrow(
+      /credentials change/i,
+    )
+    expect(
+      journal.since(0).filter(
+        (event) =>
+          event.kind === 'session/input' &&
+          (event.payload as { text?: string }).text === 'must remain absent',
+      ),
+    ).toEqual([])
+    expect(() => sessions.rename(record.id, 'must remain absent')).toThrow(/credentials change/i)
+    expect(record.title).toBeUndefined()
+  })
+
+  it('finishes and journals an admitted Codex create after freeze races its thread acknowledgement', async () => {
+    let releaseThread!: () => void
+    const threadReady = new Promise<string>((resolve) => {
+      releaseThread = () => resolve('thread-after-profile-freeze')
+    })
+    const { sessions, journal, startThread, runTurn } = build({
+      provider: 'codex',
+      startThread: () => threadReady,
+      isBusy: () => false,
+    })
+
+    const creating = sessions.create('p1', {
+      prompt: 'must not dispatch after profile freeze',
+    })
+    await vi.waitFor(() => expect(startThread).toHaveBeenCalledOnce())
+    sessions.freezeProfileTurnAdmission('p1', 9, 'blue-generation')
+    releaseThread()
+
+    await expect(creating).resolves.toMatchObject({
+      profileId: 'p1',
+      vendorSessionId: 'thread-after-profile-freeze',
+    })
+    expect(runTurn).toHaveBeenCalledOnce()
+    expect(
+      journal.since(0).filter(
+        (event) =>
+          event.kind === 'session/input' &&
+          (event.payload as { text?: string }).text ===
+            'must not dispatch after profile freeze',
+      ),
+    ).toHaveLength(1)
+  })
+
+  it('keeps a Claude create admitted until the executor acknowledges turn start', async () => {
+    let acceptTurn!: () => void
+    const turnAccepted = new Promise<void>((resolve) => {
+      acceptTurn = resolve
+    })
+    let busySessionId: string | undefined
+    const { sessions, runTurn, interrupt, record } = build({
+      isBusy: (sessionId) => sessionId === busySessionId,
+      runTurn: async (spec) => {
+        await turnAccepted
+        busySessionId = spec.sessionId
+      },
+    })
+    record.status = 'idle'
+
+    const creating = sessions.create('p1', { prompt: 'create across credential freeze' })
+    await vi.waitFor(() => expect(runTurn).toHaveBeenCalledOnce())
+    const receipt = sessions.freezeProfileTurnAdmission('p1', 10, 'blue-generation')
+    const settling = sessions.settleProfileTurns(receipt, 1_000)
+    await Promise.resolve()
+    expect(interrupt).not.toHaveBeenCalled()
+
+    acceptTurn()
+    const created = await creating
+    await vi.waitFor(() => expect(interrupt).toHaveBeenCalledWith(created.id))
+    busySessionId = undefined
+    sessions.applyLifecycle({ t: 'turnCompleted', sessionId: created.id, wseq: 1 })
+    await expect(settling).resolves.toEqual({
+      settled: true,
+      outcomeUnknownSessionIds: [],
+      outcomeUnknownOperationIds: [],
+    })
+  })
+
+  it('settles a frozen profile from explicit lifecycle notification without polling', async () => {
+    let busy = true
+    const { sessions, record, interrupt } = build({
+      isBusy: () => busy,
+    })
+    const receipt = sessions.freezeProfileTurnAdmission('p1', 11, 'blue-generation')
+
+    const settling = sessions.settleProfileTurns(receipt, 1_000)
+    await vi.waitFor(() => expect(interrupt).toHaveBeenCalledWith(record.id))
+    busy = false
+    sessions.applyLifecycle({ t: 'turnCompleted', sessionId: record.id, wseq: 1 })
+
+    await expect(settling).resolves.toEqual({
+      settled: true,
+      outcomeUnknownSessionIds: [],
+      outcomeUnknownOperationIds: [],
+    })
+  })
+
+  it('reports exact unknown sessions when profile settlement hits its bound', async () => {
+    const { sessions, record } = build({ isBusy: () => true })
+    const receipt = sessions.freezeProfileTurnAdmission('p1', 13, 'blue-generation')
+
+    await expect(sessions.settleProfileTurns(receipt, 10)).resolves.toEqual({
+      settled: false,
+      outcomeUnknownSessionIds: [record.id],
+      outcomeUnknownOperationIds: [],
+    })
+    await expect(sessions.send(record.id, 'still frozen')).rejects.toThrow(
+      /credentials change/i,
+    )
+
+    expect(sessions.thawProfileTurnAdmission(receipt)).toBe(true)
+    await expect(sessions.send(record.id, 'rollback reopened admission')).resolves.toBeUndefined()
+    await settle()
+  })
+
+  it('waits an admitted steer ACK, journals accepted input, then snapshots and interrupts the exact turn', async () => {
+    let acceptSteer!: () => void
+    const steerAccepted = new Promise<void>((resolve) => {
+      acceptSteer = resolve
+    })
+    let busy = true
+    const { sessions, journal, steer, interrupt, record } = build({
+      steer: () => steerAccepted,
+      isBusy: () => busy,
+    })
+
+    const sending = sessions.send('s1', 'raced with credential freeze')
+    await vi.waitFor(() => expect(steer).toHaveBeenCalledOnce())
+    const receipt = sessions.freezeProfileTurnAdmission('p1', 15, 'blue-generation')
+    const settling = sessions.settleProfileTurns(receipt, 1_000)
+    await Promise.resolve()
+    expect(interrupt).not.toHaveBeenCalled()
+    acceptSteer()
+
+    await expect(sending).resolves.toBeUndefined()
+    expect(
+      journal.since(0).filter(
+        (event) =>
+          event.kind === 'session/input' &&
+          (event.payload as { text?: string }).text === 'raced with credential freeze',
+      ),
+    ).toHaveLength(1)
+    await vi.waitFor(() => expect(interrupt).toHaveBeenCalledWith(record.id))
+    busy = false
+    sessions.applyLifecycle({ t: 'turnCompleted', sessionId: record.id, wseq: 1 })
+    await expect(settling).resolves.toEqual({
+      settled: true,
+      outcomeUnknownSessionIds: [],
+      outcomeUnknownOperationIds: [],
+    })
+  })
+
+  it('keeps a fresh Claude send admitted through a delayed runTurn-start acknowledgement', async () => {
+    let acceptTurn!: () => void
+    const turnAccepted = new Promise<void>((resolve) => {
+      acceptTurn = resolve
+    })
+    let busy = false
+    const { sessions, runTurn, interrupt, record } = build({
+      isBusy: () => busy,
+      runTurn: async () => {
+        await turnAccepted
+        busy = true
+      },
+    })
+    record.status = 'idle'
+
+    const sending = sessions.send(record.id, 'send across credential freeze')
+    await vi.waitFor(() => expect(runTurn).toHaveBeenCalledOnce())
+    const receipt = sessions.freezeProfileTurnAdmission('p1', 17, 'blue-generation')
+    const settling = sessions.settleProfileTurns(receipt, 1_000)
+    await Promise.resolve()
+    expect(interrupt).not.toHaveBeenCalled()
+
+    acceptTurn()
+    await sending
+    await vi.waitFor(() => expect(interrupt).toHaveBeenCalledWith(record.id))
+    busy = false
+    sessions.applyLifecycle({ t: 'turnCompleted', sessionId: record.id, wseq: 1 })
+    await expect(settling).resolves.toEqual({
+      settled: true,
+      outcomeUnknownSessionIds: [],
+      outcomeUnknownOperationIds: [],
+    })
+  })
+
+  it('requires the exact freeze receipt to thaw and rejects equal-epoch generation aliases', async () => {
+    const { sessions, record } = build()
+    const first = sessions.freezeProfileTurnAdmission('p1', 21, 'blue-generation')
+    expect(sessions.thawProfileTurnAdmission(first)).toBe(true)
+    const second = sessions.freezeProfileTurnAdmission('p1', 21, 'blue-generation')
+
+    expect(second.freezeId).not.toBe(first.freezeId)
+    expect(sessions.thawProfileTurnAdmission(first)).toBe(false)
+    expect(() =>
+      sessions.freezeProfileTurnAdmission('p1', 21, 'green-generation'),
+    ).toThrow(/belongs to generation/i)
+    await expect(sessions.send(record.id, 'stale thaw must not open admission')).rejects.toThrow(
+      /credentials change/i,
+    )
+    expect(sessions.thawProfileTurnAdmission(second)).toBe(true)
+    await settle()
   })
 
   it('delivers a worktree collision as a direct live steer with distinct guardrail provenance', async () => {

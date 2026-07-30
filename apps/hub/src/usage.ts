@@ -12,11 +12,21 @@ import type {
 const CODEX_POLL_MS = 15 * 60 * 1000
 const CLAUDE_POLL_MS = 20 * 60 * 1000
 
+export interface ProfileUsageAuthority {
+  readonly profileId: string
+  readonly publicEpoch: number
+  readonly nonce: number
+}
+
 export class UsageMonitor {
   private readonly snapshots = new Map<string, UsageSnapshot>()
   private codexReader: ((profileId: string) => Promise<unknown>) | undefined
   private pollTimer: NodeJS.Timeout | undefined
   private claudeTimer: NodeJS.Timeout | undefined
+  private readonly profileAuthorities = new Map<
+    string,
+    { publicEpoch: number; active: boolean; nonce: number }
+  >()
 
   constructor(
     private readonly journal: Journal,
@@ -60,7 +70,46 @@ export class UsageMonitor {
     return this.snapshots.get(profileId)
   }
 
-  noteClaude(profileId: string, info: ClaudeLimitInfo): void {
+  setProfileAuthority(profileId: string, publicEpoch: number, active: boolean): void {
+    if (!Number.isSafeInteger(publicEpoch) || publicEpoch < 0) {
+      throw new Error(`Profile usage epoch must be a non-negative safe integer; got ${publicEpoch}`)
+    }
+    const current = this.profileAuthorities.get(profileId)
+    if (current && publicEpoch < current.publicEpoch) {
+      throw new Error(
+        `Cannot move profile ${profileId} usage authority backwards from ${current.publicEpoch} to ${publicEpoch}`,
+      )
+    }
+    this.profileAuthorities.set(profileId, {
+      publicEpoch,
+      active,
+      nonce: (current?.nonce ?? 0) + 1,
+    })
+  }
+
+  captureProfileAuthority(profileId: string): ProfileUsageAuthority | undefined {
+    const current = this.profileAuthorities.get(profileId)
+    if (!current?.active) return undefined
+    return { profileId, publicEpoch: current.publicEpoch, nonce: current.nonce }
+  }
+
+  private canPublish(profileId: string, authority?: ProfileUsageAuthority): boolean {
+    const current = this.profileAuthorities.get(profileId)
+    if (!current) return authority === undefined
+    return (
+      authority?.profileId === profileId &&
+      current.active &&
+      authority.publicEpoch === current.publicEpoch &&
+      authority.nonce === current.nonce
+    )
+  }
+
+  noteClaude(
+    profileId: string,
+    info: ClaudeLimitInfo,
+    authority?: ProfileUsageAuthority,
+  ): void {
+    if (!this.canPublish(profileId, authority)) return
     const snap = this.snapshot(profileId)
     if (!snap) return
     snap.claude = info
@@ -68,13 +117,23 @@ export class UsageMonitor {
     this.evaluate(snap)
   }
 
-  noteClaudeCost(profileId: string, costUsd: number | undefined): void {
+  noteClaudeCost(
+    profileId: string,
+    costUsd: number | undefined,
+    authority?: ProfileUsageAuthority,
+  ): void {
+    if (!this.canPublish(profileId, authority)) return
     const snap = this.snapshot(profileId)
     if (!snap || typeof costUsd !== 'number') return
     snap.totalCostUsd = (snap.totalCostUsd ?? 0) + costUsd
   }
 
-  noteCodex(profileId: string, limits: CodexLimitInfo): void {
+  noteCodex(
+    profileId: string,
+    limits: CodexLimitInfo,
+    authority?: ProfileUsageAuthority,
+  ): void {
+    if (!this.canPublish(profileId, authority)) return
     const snap = this.snapshot(profileId)
     if (!snap) return
     snap.codex = limits
@@ -125,9 +184,12 @@ export class UsageMonitor {
 
   async pollClaudeOnce(): Promise<void> {
     for (const p of this.profiles.filter((x) => x.provider === 'claude' && x.available !== false && x.authStatus !== 'signed_out')) {
+      const authority = this.captureProfileAuthority(p.id)
+      if (this.profileAuthorities.has(p.id) && !authority) continue
       try {
         const lines = await readClaudeUsage(p.dir)
         if (lines.length === 0) continue
+        if (!this.canPublish(p.id, authority)) continue
         const snap = this.snapshot(p.id)
         if (!snap) continue
         snap.claudeUsage = lines
@@ -145,6 +207,8 @@ export class UsageMonitor {
   async pollCodexOnce(): Promise<void> {
     if (!this.codexReader) return
     for (const p of this.profiles.filter((x) => x.provider === 'codex' && x.available !== false && x.authStatus !== 'signed_out')) {
+      const authority = this.captureProfileAuthority(p.id)
+      if (this.profileAuthorities.has(p.id) && !authority) continue
       try {
         const raw = (await this.codexReader(p.id)) as { rateLimits?: CodexLimitInfo & { primary?: CodexLimitInfo } }
         const limits = raw?.rateLimits
@@ -156,7 +220,8 @@ export class UsageMonitor {
           rateLimitReachedType: (limits as CodexLimitInfo).rateLimitReachedType,
           planType: (limits as CodexLimitInfo).planType,
         }
-        this.noteCodex(p.id, flat)
+        if (!this.canPublish(p.id, authority)) continue
+        this.noteCodex(p.id, flat, authority)
         this.journal.append(null, 'usage/snapshot', { profileId: p.id, codex: flat })
       } catch (err) {
         this.journal.append(null, 'usage/poll-error', {
