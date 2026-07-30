@@ -3,6 +3,7 @@ import { ApprovalService } from './approvals.js'
 import { Journal } from './journal.js'
 import { MemoryStore } from './memory.js'
 import { PracticeStore } from './practices.js'
+import { QuestionService } from './questions.js'
 import { UsageMonitor } from './usage.js'
 import type { WorkerSessionSpec } from './workerProtocol.js'
 
@@ -82,6 +83,7 @@ describe('assign_child_task auto-allow parity', () => {
         const approvalRequest = vi.spyOn(approvals, 'request').mockResolvedValue(true)
         const executor = new InProcessExecutor({
           approvals,
+          questions: new QuestionService(journal),
           usage: new UsageMonitor(journal, [], {}),
           danger: { busCanUseRiskyTools: false, autoApprovePractices: false },
           memory: new MemoryStore(journal.db),
