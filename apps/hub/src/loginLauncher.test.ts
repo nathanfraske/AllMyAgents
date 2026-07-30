@@ -115,6 +115,14 @@ function durableState(input: {
   ownerEpoch?: string
   publicEpoch?: number
   generationId?: string
+  phase?:
+    | 'prepared'
+    | 'archiving'
+    | 'archived'
+    | 'spawned'
+    | 'waiting'
+    | 'restoring'
+    | 'termination-unknown'
 }): Record<string, unknown> {
   const provider = input.provider ?? 'claude'
   const attemptId = input.attemptId ?? '11111111-1111-4111-8111-111111111111'
@@ -136,7 +144,7 @@ function durableState(input: {
     publicEpoch: input.publicEpoch ?? 1,
     generationId: input.generationId ?? 'blue-generation',
     leaseId: 'refresh-lease',
-    phase: input.archivePath ? 'archived' : 'prepared',
+    phase: input.phase ?? (input.archivePath ? 'archived' : 'prepared'),
     createdAt: '2026-07-30T00:00:00.000Z',
     updatedAt: '2026-07-30T00:00:00.000Z',
   }
@@ -861,6 +869,240 @@ describe('vendor login URL capture', () => {
       await vi.waitFor(() => expect(getLogin(attempt.id)?.status).toBe('cancelled'))
     } finally {
       setLoginAdmission(true)
+      fs.rmSync(profileDir, { recursive: true, force: true })
+    }
+  })
+
+  it('forces or durably releases authority from a TERM-ignoring login child within its termination bound', async () => {
+    const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-login-term-ignore-'))
+    try {
+      const child = new EventEmitter() as ChildProcessWithoutNullStreams
+      const stdout = new PassThrough()
+      const kill = vi.fn(() => true)
+      Object.assign(child, {
+        stdin: new PassThrough(),
+        stdout,
+        stderr: new PassThrough(),
+        pid: 31_001,
+        killed: false,
+        kill,
+      })
+      queueMicrotask(() =>
+        stdout.write('https://claude.com/cai/oauth/authorize?state=term-ignore\n'),
+      )
+      const release = vi.fn()
+      const killProcessGroup = vi.fn(
+        ((pid: number, signal?: NodeJS.Signals | number) => {
+          if (signal === 'SIGKILL') {
+            queueMicrotask(() => child.emit('close', null, 'SIGKILL'))
+          }
+          return true
+        }) as typeof process.kill,
+      )
+      const attempt = await startLogin('claude', profileDir, {
+        acquireLease: () => refreshLease(release),
+        spawnProcess: (() => child) as unknown as typeof spawn,
+        terminationTimeoutMs: 20,
+        terminationControl: {
+          platform: 'linux',
+          spawnTreeKiller: vi.fn() as unknown as typeof spawn,
+          killProcessGroup,
+        },
+      })
+
+      cancelLogin(attempt.id)
+      const drain = await settleLoginsForRestart(500)
+
+      expect(drain.settled + drain.outcomeUnknown).toBe(1)
+      expect(release).toHaveBeenCalledOnce()
+      expect(killProcessGroup).toHaveBeenNthCalledWith(1, -31_001, 'SIGTERM')
+      expect(killProcessGroup).toHaveBeenNthCalledWith(2, -31_001, 'SIGKILL')
+      expect(kill).not.toHaveBeenCalled()
+      if (drain.outcomeUnknown === 1) {
+        expect(
+          JSON.parse(
+            fs.readFileSync(
+              path.join(profileDir, '.allmyagents-login-attempt.json'),
+              'utf8',
+            ),
+          ),
+        ).toMatchObject({ phase: 'termination-unknown' })
+      }
+    } finally {
+      setLoginAdmission(true)
+      fs.rmSync(profileDir, { recursive: true, force: true })
+    }
+  })
+
+  it('waits for Windows taskkill completion after the direct child closes', async () => {
+    const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-login-taskkill-await-'))
+    try {
+      const child = new EventEmitter() as ChildProcessWithoutNullStreams
+      Object.assign(child, {
+        stdin: new PassThrough(),
+        stdout: new PassThrough(),
+        stderr: new PassThrough(),
+        pid: 31_002,
+        killed: false,
+        kill: vi.fn(() => true),
+      })
+      const killer = new EventEmitter() as ReturnType<typeof spawn>
+      Object.assign(killer, { unref: vi.fn() })
+      const spawnTreeKiller = vi.fn(() => killer) as unknown as typeof spawn
+      const release = vi.fn()
+      const attempt = await startLogin('claude', profileDir, {
+        acquireLease: () => refreshLease(release),
+        spawnProcess: (() => child) as unknown as typeof spawn,
+        terminationTimeoutMs: 20,
+        terminationControl: {
+          platform: 'win32',
+          spawnTreeKiller,
+          killProcessGroup: vi.fn() as unknown as typeof process.kill,
+        },
+      })
+
+      cancelLogin(attempt.id)
+      child.emit('close', null, 'SIGTERM')
+      await Promise.resolve()
+      expect(release).not.toHaveBeenCalled()
+
+      killer.emit('close', 0, null)
+      await vi.waitFor(() => expect(release).toHaveBeenCalledOnce())
+      expect(spawnTreeKiller).toHaveBeenCalledWith(
+        'taskkill',
+        ['/PID', '31002', '/T', '/F'],
+        expect.objectContaining({ windowsHide: true, stdio: 'ignore' }),
+      )
+      expect(getLogin(attempt.id)?.status).toBe('cancelled')
+    } finally {
+      fs.rmSync(profileDir, { recursive: true, force: true })
+    }
+  })
+
+  it('leaves a replacement live credential untouched when the original changes before archive publication', async () => {
+    const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-login-archive-replace-'))
+    try {
+      const credential = path.join(profileDir, '.credentials.json')
+      const displaced = `${credential}.displaced`
+      const prior = '{"oauth":"prior"}'
+      const replacement = '{"oauth":"replacement"}'
+      fs.writeFileSync(credential, prior)
+      let replacementIdentity: fs.BigIntStats | undefined
+      const replaceAfterDigest = vi.fn(() => {
+          originalRename(credential, displaced)
+          fs.writeFileSync(credential, replacement)
+          replacementIdentity = fs.lstatSync(credential, { bigint: true })
+      })
+      const originalRename = fs.renameSync.bind(fs)
+
+      const attempt = await startLogin('claude', profileDir, {
+        reauth: true,
+        acquireLease: () => refreshLease(),
+        failpoint: replaceAfterDigest,
+        spawnProcess: (() => {
+          throw new Error('vendor must not launch after credential replacement')
+        }) as unknown as typeof spawn,
+      })
+
+      expect(replaceAfterDigest).toHaveBeenCalledWith(
+        'after-prior-digest-before-archive-link',
+      )
+      expect(attempt.status).toBe('failed')
+      expect(fs.readFileSync(credential, 'utf8')).toBe(replacement)
+      expect(replacementIdentity).toBeDefined()
+      expect(fs.lstatSync(credential, { bigint: true })).toMatchObject({
+        dev: replacementIdentity?.dev,
+        ino: replacementIdentity?.ino,
+      })
+      expect(
+        fs.readdirSync(profileDir).filter((entry) => entry.includes('.signed-out-')),
+      ).toEqual([])
+      expect(fs.readFileSync(displaced, 'utf8')).toBe(prior)
+    } finally {
+      vi.restoreAllMocks()
+      fs.rmSync(profileDir, { recursive: true, force: true })
+    }
+  })
+
+  it('recovers a crash after restore hardlink publication as restored-prior, never accepted-new', () => {
+    const profilesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-login-restore-published-'))
+    try {
+      const profileDir = path.join(profilesDir, 'claude-a')
+      fs.mkdirSync(profileDir)
+      const credential = path.join(profileDir, '.credentials.json')
+      const attemptId = '77777777-7777-4777-8777-777777777777'
+      const archive = `${credential}.signed-out-${attemptId}`
+      const prior = JSON.stringify({
+        claudeAiOauth: { accessToken: 'prior', expiresAt: Date.now() + 60_000 },
+      })
+      const priorSha256 = crypto.createHash('sha256').update(prior).digest('hex')
+      fs.writeFileSync(archive, prior)
+      fs.linkSync(archive, credential)
+      fs.writeFileSync(
+        path.join(profileDir, '.allmyagents-login-attempt.json'),
+        JSON.stringify(
+          durableState({
+            profileDir,
+            attemptId,
+            archivePath: archive,
+            priorSha256,
+            phase: 'restoring',
+          }),
+        ),
+      )
+
+      expect(
+        reconcileInterruptedLogins(profilesDir, () =>
+          refreshLease(vi.fn(), { publicEpoch: 2, generationId: 'green-generation' }),
+        ),
+      ).toEqual([
+        expect.objectContaining({
+          profileId: 'claude-a',
+          attemptId,
+          outcome: 'restored-prior',
+        }),
+      ])
+      expect(fs.readFileSync(credential, 'utf8')).toBe(prior)
+      expect(fs.existsSync(archive)).toBe(false)
+      expect(
+        fs.existsSync(path.join(profileDir, '.allmyagents-login-attempt.json')),
+      ).toBe(false)
+    } finally {
+      fs.rmSync(profilesDir, { recursive: true, force: true })
+    }
+  })
+
+  it('publishes the durable restoring phase before the rollback hardlink', async () => {
+    const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-login-restoring-phase-'))
+    try {
+      const credential = path.join(profileDir, '.credentials.json')
+      fs.writeFileSync(credential, '{"oauth":"prior"}')
+      const stateFile = path.join(profileDir, '.allmyagents-login-attempt.json')
+      const originalLink = fs.linkSync.bind(fs)
+      let observedPhase: string | undefined
+      vi.spyOn(fs, 'linkSync').mockImplementation(((source: fs.PathLike, target: fs.PathLike) => {
+        if (
+          String(source).includes('.signed-out-') &&
+          path.resolve(String(target)) === path.resolve(credential)
+        ) {
+          observedPhase = JSON.parse(fs.readFileSync(stateFile, 'utf8')).phase
+        }
+        return originalLink(source, target)
+      }) as typeof fs.linkSync)
+
+      const attempt = await startLogin('claude', profileDir, {
+        reauth: true,
+        acquireLease: () => refreshLease(),
+        spawnProcess: (() => {
+          throw new Error('simulated spawn failure')
+        }) as unknown as typeof spawn,
+      })
+
+      expect(attempt.status).toBe('failed')
+      expect(observedPhase).toBe('restoring')
+      expect(fs.readFileSync(credential, 'utf8')).toBe('{"oauth":"prior"}')
+    } finally {
+      vi.restoreAllMocks()
       fs.rmSync(profileDir, { recursive: true, force: true })
     }
   })

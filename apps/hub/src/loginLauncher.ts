@@ -88,7 +88,14 @@ interface DurableLoginAttempt {
   publicEpoch: number
   generationId: string
   leaseId: string
-  phase: 'prepared' | 'archived' | 'spawned' | 'waiting'
+  phase:
+    | 'prepared'
+    | 'archiving'
+    | 'archived'
+    | 'spawned'
+    | 'waiting'
+    | 'restoring'
+    | 'termination-unknown'
   createdAt: string
   updatedAt: string
 }
@@ -115,9 +122,18 @@ interface LoginAttemptInternal extends LoginAttempt {
     status: Exclude<LoginStatus, 'capturing' | 'waiting' | 'settling'>
     error?: string
   }
+  terminationTimeoutMs: number
+  terminationControl: LoginTerminationControl
+  terminationPromise?: Promise<'settled' | 'unknown'>
   finalized: boolean
-  finalizedPromise: Promise<void>
-  resolveFinalized: () => void
+  finalizedPromise: Promise<'settled' | 'unknown'>
+  resolveFinalized: (outcome: 'settled' | 'unknown') => void
+}
+
+interface LoginTerminationControl {
+  platform: NodeJS.Platform
+  spawnTreeKiller: typeof spawn
+  killProcessGroup: typeof process.kill
 }
 
 export interface StartLoginOptions {
@@ -129,6 +145,9 @@ export interface StartLoginOptions {
   profileId?: string
   acquireLease?: () => ProfileRefreshLease
   idempotencyKey?: string
+  failpoint?: (edge: 'after-prior-digest-before-archive-link') => void
+  /** Deterministic process-tree fault injection; production callers use the native defaults. */
+  terminationControl?: LoginTerminationControl
 }
 
 const attempts = new Map<string, LoginAttemptInternal>()
@@ -327,27 +346,91 @@ function clearAttemptTimers(attempt: LoginAttemptInternal): void {
   if (attempt.credentialPoll) clearInterval(attempt.credentialPoll)
 }
 
-function terminate(attempt: LoginAttemptInternal): void {
+function waitForChildClose(
+  attempt: LoginAttemptInternal,
+  timeoutMs: number,
+): Promise<boolean> {
   const child = attempt.child
-  if (!child || attempt.childClosed) return
+  if (!child || attempt.childClosed) return Promise.resolve(true)
+  return new Promise<boolean>((resolve) => {
+    let finished = false
+    const done = (closed: boolean): void => {
+      if (finished) return
+      finished = true
+      clearTimeout(timer)
+      child.removeListener('close', onClose)
+      resolve(closed)
+    }
+    const onClose = (): void => done(true)
+    const timer = setTimeout(() => done(attempt.childClosed), Math.max(0, timeoutMs))
+    timer.unref()
+    child.once('close', onClose)
+  })
+}
+
+function waitForProcessClose(
+  child: ReturnType<typeof spawn>,
+  timeoutMs: number,
+): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let finished = false
+    const done = (closed: boolean): void => {
+      if (finished) return
+      finished = true
+      clearTimeout(timer)
+      child.removeListener('close', onClose)
+      child.removeListener('error', onError)
+      resolve(closed)
+    }
+    const onClose = (): void => done(true)
+    const onError = (): void => done(false)
+    const timer = setTimeout(() => done(false), Math.max(0, timeoutMs))
+    timer.unref()
+    child.once('close', onClose)
+    child.once('error', onError)
+  })
+}
+
+async function terminateProcessTree(
+  attempt: LoginAttemptInternal,
+): Promise<'settled' | 'unknown'> {
+  const child = attempt.child
+  if (!child || attempt.childClosed) return 'settled'
+  const timeoutMs = attempt.terminationTimeoutMs
+  const control = attempt.terminationControl
   try {
-    if (process.platform === 'win32' && child.pid) {
-      const killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
+    if (control.platform === 'win32' && child.pid) {
+      const killer = control.spawnTreeKiller('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
         windowsHide: true,
         stdio: 'ignore',
       })
       killer.unref()
+      const [killerClosed, childClosed] = await Promise.all([
+        waitForProcessClose(killer, timeoutMs),
+        waitForChildClose(attempt, timeoutMs),
+      ])
+      return killerClosed && childClosed ? 'settled' : 'unknown'
     } else if (child.pid) {
       try {
-        process.kill(-child.pid, 'SIGTERM')
+        control.killProcessGroup(-child.pid, 'SIGTERM')
       } catch {
-        child.kill()
+        child.kill('SIGTERM')
       }
+      if (await waitForChildClose(attempt, timeoutMs)) return 'settled'
+      try {
+        control.killProcessGroup(-child.pid, 'SIGKILL')
+      } catch {
+        child.kill('SIGKILL')
+      }
+      return (await waitForChildClose(attempt, timeoutMs)) ? 'settled' : 'unknown'
     } else {
-      child.kill()
+      child.kill('SIGTERM')
+      if (await waitForChildClose(attempt, timeoutMs)) return 'settled'
+      child.kill('SIGKILL')
+      return (await waitForChildClose(attempt, timeoutMs)) ? 'settled' : 'unknown'
     }
   } catch {
-    // The child may cross its exit boundary while termination is dispatched.
+    return attempt.childClosed ? 'settled' : 'unknown'
   }
 }
 
@@ -441,8 +524,81 @@ function fsyncParentDirectory(file: string): void {
   }
 }
 
-function sha256File(file: string): string {
-  return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
+interface OpenCredentialSnapshot {
+  fd: number
+  identity: fs.BigIntStats
+  sha256: string
+}
+
+function openCredentialSnapshot(file: string): OpenCredentialSnapshot {
+  const pathIdentity = fs.lstatSync(file, { bigint: true })
+  if (!pathIdentity.isFile() || pathIdentity.isSymbolicLink()) {
+    throw new Error('credential target is not a regular file')
+  }
+  const fd = fs.openSync(file, 'r+')
+  try {
+    const openedIdentity = fs.fstatSync(fd, { bigint: true })
+    if (!sameFileIdentity(pathIdentity, openedIdentity)) {
+      throw new Error('credential target changed while opening')
+    }
+    const sha256 = crypto.createHash('sha256').update(fs.readFileSync(fd)).digest('hex')
+    return { fd, identity: openedIdentity, sha256 }
+  } catch (error) {
+    fs.closeSync(fd)
+    throw error
+  }
+}
+
+function removeExactPath(file: string, identity: fs.BigIntStats): void {
+  const current = fs.lstatSync(file, { bigint: true })
+  if (!sameFileIdentity(current, identity)) {
+    throw new Error(`refusing to remove a replaced file: ${path.basename(file)}`)
+  }
+  fs.rmSync(file)
+  fsyncParentDirectory(file)
+}
+
+function publishCredentialArchive(
+  source: string,
+  archive: string,
+  snapshot: OpenCredentialSnapshot,
+  beforeLink?: () => void,
+): void {
+  let publishedArchive: fs.BigIntStats | undefined
+  try {
+    try {
+      fs.lstatSync(archive)
+      throw Object.assign(new Error('credential archive already exists'), { code: 'EEXIST' })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    beforeLink?.()
+    fs.linkSync(source, archive)
+    publishedArchive = fs.lstatSync(archive, { bigint: true })
+    if (!sameFileIdentity(snapshot.identity, publishedArchive)) {
+      throw new Error('live credential changed before archive publication')
+    }
+    const sourceAfterLink = fs.lstatSync(source, { bigint: true })
+    if (!sameFileIdentity(snapshot.identity, sourceAfterLink)) {
+      throw new Error('live credential changed during archive publication')
+    }
+    fs.fsyncSync(snapshot.fd)
+    removeExactPath(source, snapshot.identity)
+    const archiveAfterUnlink = fs.lstatSync(archive, { bigint: true })
+    if (!sameFileIdentity(snapshot.identity, archiveAfterUnlink)) {
+      throw new Error('credential archive path changed after publication')
+    }
+    fsyncFile(archive)
+  } catch (error) {
+    if (publishedArchive) {
+      try {
+        removeExactPath(archive, publishedArchive)
+      } catch {
+        // Preserve a path whose identity no longer matches the link created by this operation.
+      }
+    }
+    throw error
+  }
 }
 
 function restoreArchiveNoReplace(
@@ -521,6 +677,68 @@ function restoreArchiveNoReplace(
   }
 }
 
+function regularFileOrAbsent(file: string): fs.BigIntStats | undefined {
+  try {
+    const stat = fs.lstatSync(file, { bigint: true })
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error(`${path.basename(file)} is not a regular file`)
+    }
+    return stat
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw error
+  }
+}
+
+/**
+ * Finish the physical state left by a crash after restore publication.
+ *
+ * `false` means the target is still absent and the ordinary no-replace restore should publish it.
+ * `true` means the target is the exact restored inode/digest (with or without the archive hardlink)
+ * and any remaining archive name has been durably removed.
+ */
+function completeRestoringPublication(
+  archive: string,
+  target: string,
+  expectedSha256: string,
+): boolean {
+  const targetIdentity = regularFileOrAbsent(target)
+  if (!targetIdentity) return false
+  const targetSnapshot = openCredentialSnapshot(target)
+  try {
+    if (!sameFileIdentity(targetIdentity, targetSnapshot.identity)) {
+      throw new Error('restored credential changed while opening')
+    }
+    if (targetSnapshot.sha256 !== expectedSha256) {
+      throw new Error('restored credential digest does not match the prior credential')
+    }
+    const archiveIdentity = regularFileOrAbsent(archive)
+    if (archiveIdentity) {
+      const archiveSnapshot = openCredentialSnapshot(archive)
+      try {
+        if (
+          !sameFileIdentity(targetSnapshot.identity, archiveSnapshot.identity) ||
+          archiveSnapshot.sha256 !== expectedSha256
+        ) {
+          throw new Error('restore target and archive are not the same prior-credential inode')
+        }
+      } finally {
+        fs.closeSync(archiveSnapshot.fd)
+      }
+    }
+    fs.fsyncSync(targetSnapshot.fd)
+    fsyncParentDirectory(target)
+    const targetAfter = fs.lstatSync(target, { bigint: true })
+    if (!sameFileIdentity(targetSnapshot.identity, targetAfter)) {
+      throw new Error('restored credential path changed before recovery publication')
+    }
+    if (archiveIdentity) removeExactPath(archive, archiveIdentity)
+    return true
+  } finally {
+    fs.closeSync(targetSnapshot.fd)
+  }
+}
+
 function assertCurrentAuthority(attempt: LoginAttemptInternal): void {
   if (attempt.authority && !attempt.authority.isCurrent()) {
     throw new Error(
@@ -568,6 +786,7 @@ function restorePriorCredential(attempt: LoginAttemptInternal): string | undefin
   const target = durable.credentialPath
   const archive = durable.archivePath
   try {
+    if (durable.phase !== 'restoring') updateDurablePhase(attempt, 'restoring')
     restoreArchiveNoReplace(archive, target, durable.priorSha256)
     return undefined
   } catch (error) {
@@ -605,9 +824,50 @@ function finalizeAttempt(attempt: LoginAttemptInternal): void {
     }
   }
   attempt.authority?.release()
-  attempt.resolveFinalized()
+  attempt.resolveFinalized('settled')
   const cleanup = setTimeout(() => attempts.delete(attempt.id), 10 * 60_000)
   cleanup.unref()
+}
+
+function settlePendingTerminal(attempt: LoginAttemptInternal): void {
+  const pending = attempt.pendingTerminal
+  if (!pending) return
+  attempt.pendingTerminal = undefined
+  attempt.status = pending.status
+  attempt.error = pending.error
+  finalizeAttempt(attempt)
+}
+
+function finalizeTerminationUnknown(attempt: LoginAttemptInternal): void {
+  if (attempt.finalized) return
+  try {
+    updateDurablePhase(attempt, 'termination-unknown')
+  } catch (error) {
+    attempt.error = `${
+      attempt.error ?? 'Vendor process termination could not be confirmed.'
+    } Durable outcome-unknown publication also failed: ${
+      error instanceof Error ? error.message : String(error)
+    }`
+  }
+  attempt.pendingTerminal = undefined
+  attempt.status = 'settling'
+  attempt.error =
+    attempt.error ??
+    'Vendor process-tree termination could not be confirmed; credential outcome remains unknown.'
+  attempt.finalized = true
+  attempt.authority?.release()
+  attempt.resolveFinalized('unknown')
+  const cleanup = setTimeout(() => attempts.delete(attempt.id), 10 * 60_000)
+  cleanup.unref()
+}
+
+function beginTermination(attempt: LoginAttemptInternal): void {
+  if (attempt.terminationPromise) return
+  attempt.terminationPromise = terminateProcessTree(attempt).then((outcome) => {
+    if (outcome === 'settled') settlePendingTerminal(attempt)
+    else finalizeTerminationUnknown(attempt)
+    return outcome
+  })
 }
 
 function finish(
@@ -623,7 +883,7 @@ function finish(
     attempt.error = error
       ? `${error} Waiting for the vendor process to stop and credential state to settle.`
       : 'Waiting for the vendor process to stop and credential state to settle.'
-    terminate(attempt)
+    beginTermination(attempt)
     return
   }
   attempt.status = status
@@ -666,9 +926,11 @@ function makeAttempt(input: {
   profileDir: string
   authority?: ProfileRefreshLease
   requestKey?: string
+  terminationTimeoutMs: number
+  terminationControl: LoginTerminationControl
 }): LoginAttemptInternal {
-  let resolveFinalized = (): void => {}
-  const finalizedPromise = new Promise<void>((resolve) => {
+  let resolveFinalized = (_outcome: 'settled' | 'unknown'): void => {}
+  const finalizedPromise = new Promise<'settled' | 'unknown'>((resolve) => {
     resolveFinalized = resolve
   })
   return {
@@ -686,6 +948,7 @@ function makeAttempt(input: {
 function prepareDurableAttempt(
   attempt: LoginAttemptInternal,
   reauth: boolean,
+  failpoint?: StartLoginOptions['failpoint'],
 ): void {
   const authority = attempt.authority
   if (!authority) return
@@ -693,13 +956,11 @@ function prepareDurableAttempt(
   const credentialPath = credentialsPath(attempt.provider, attempt.profileDir)
   let archivePath: string | undefined
   let priorSha256: string | undefined
+  let priorSnapshot: OpenCredentialSnapshot | undefined
   if (reauth) {
     try {
-      const stat = fs.lstatSync(credentialPath)
-      if (!stat.isFile() || stat.isSymbolicLink()) {
-        throw new Error('credential target is not a regular file')
-      }
-      priorSha256 = sha256File(credentialPath)
+      priorSnapshot = openCredentialSnapshot(credentialPath)
+      priorSha256 = priorSnapshot.sha256
       archivePath = `${credentialPath}.signed-out-${attempt.id}`
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
@@ -725,14 +986,19 @@ function prepareDurableAttempt(
     createdAt: now,
     updatedAt: now,
   }
-  writeJsonAtomic(attemptStateFile(attempt.profileDir), attempt.durable)
-  assertCurrentAuthority(attempt)
-  if (archivePath) {
-    fs.renameSync(credentialPath, archivePath)
-    fsyncFile(archivePath)
-    fsyncParentDirectory(archivePath)
+  try {
+    writeJsonAtomic(attemptStateFile(attempt.profileDir), attempt.durable)
     assertCurrentAuthority(attempt)
-    updateDurablePhase(attempt, 'archived')
+    if (archivePath && priorSnapshot) {
+      updateDurablePhase(attempt, 'archiving')
+      publishCredentialArchive(credentialPath, archivePath, priorSnapshot, () =>
+        failpoint?.('after-prior-digest-before-archive-link'),
+      )
+      assertCurrentAuthority(attempt)
+      updateDurablePhase(attempt, 'archived')
+    }
+  } finally {
+    if (priorSnapshot) fs.closeSync(priorSnapshot.fd)
   }
 }
 
@@ -822,13 +1088,21 @@ export function startLogin(
     provider,
     profileId,
     profileDir: resolvedProfileDir,
+    terminationTimeoutMs: opts.terminationTimeoutMs ?? DEFAULT_TERMINATION_TIMEOUT_MS,
+    terminationControl:
+      opts.terminationControl ??
+      {
+        platform: process.platform,
+        spawnTreeKiller: spawn,
+        killProcessGroup: process.kill.bind(process),
+      },
     ...(authority ? { authority } : {}),
     ...(opts.idempotencyKey ? { requestKey: opts.idempotencyKey } : {}),
   })
   attempts.set(id, attempt)
 
   try {
-    prepareDurableAttempt(attempt, opts.reauth === true)
+    prepareDurableAttempt(attempt, opts.reauth === true, opts.failpoint)
   } catch (error) {
     finish(
       attempt,
@@ -922,11 +1196,10 @@ export function startLogin(
   child.once('close', (code, signal) => {
     attempt.childClosed = true
     if (attempt.pendingTerminal) {
-      const pending = attempt.pendingTerminal
-      attempt.pendingTerminal = undefined
-      attempt.status = pending.status
-      attempt.error = pending.error
-      finalizeAttempt(attempt)
+      // A cancellation/timeout owns a process-tree fence. On Windows, direct-child close can precede
+      // taskkill's tree walk; on POSIX the TERM boundary can precede SIGKILL escalation. Let the bounded
+      // termination promise confirm the tree outcome before credential restore or authority release.
+      if (!attempt.terminationPromise) settlePendingTerminal(attempt)
       return
     }
     if (durableCredentialReady(provider, resolvedProfileDir)) {
@@ -1012,8 +1285,7 @@ export async function settleLoginsForRestart(
       const timeout = new Promise<'unknown'>((resolve) => {
         timer = setTimeout(() => resolve('unknown'), timeoutMs)
       })
-      const settled = attempt.finalizedPromise.then(() => 'settled' as const)
-      const result = await Promise.race([settled, timeout])
+      const result = await Promise.race([attempt.finalizedPromise, timeout])
       if (timer) clearTimeout(timer)
       return result
     }),
@@ -1131,7 +1403,15 @@ function readDurableAttempt(profileDir: string): DurableLoginAttemptRead {
       typeof raw.leaseId !== 'string' ||
       !raw.leaseId ||
       raw.leaseId.length > 128 ||
-      !['prepared', 'archived', 'spawned', 'waiting'].includes(String(raw.phase)) ||
+      ![
+        'prepared',
+        'archiving',
+        'archived',
+        'spawned',
+        'waiting',
+        'restoring',
+        'termination-unknown',
+      ].includes(String(raw.phase)) ||
       typeof raw.createdAt !== 'string' ||
       typeof raw.updatedAt !== 'string'
     ) {
@@ -1249,7 +1529,7 @@ export function reconcileInterruptedLogins(
       })
       continue
     }
-    const durable = parsed.attempt
+    let durable = parsed.attempt
     let authority: ProfileRefreshLease
     try {
       authority = acquireLease(durable.profileId, profileDir, 'reconcile interrupted sign-in')
@@ -1294,6 +1574,66 @@ export function reconcileInterruptedLogins(
         })
         continue
       }
+      if (durable.phase === 'termination-unknown') {
+        results.push({
+          profileId: durable.profileId,
+          attemptId: durable.attemptId,
+          outcome: 'busy',
+          error:
+            'The interrupted vendor process-tree outcome is unknown; credentials were not accepted or restored.',
+        })
+        continue
+      }
+      if (
+        (durable.phase === 'archiving' || durable.phase === 'restoring') &&
+        durable.archivePath &&
+        durable.priorSha256
+      ) {
+        try {
+          if (
+            completeRestoringPublication(
+              durable.archivePath,
+              durable.credentialPath,
+              durable.priorSha256,
+            )
+          ) {
+            if (!authority.isCurrent()) {
+              results.push({
+                profileId: durable.profileId,
+                attemptId: durable.attemptId,
+                outcome: 'busy',
+                error: 'Credential reconciliation authority changed before publication.',
+              })
+              continue
+            }
+            fs.rmSync(attemptStateFile(profileDir), { force: true })
+            fsyncParentDirectory(attemptStateFile(profileDir))
+            results.push({
+              profileId: durable.profileId,
+              attemptId: durable.attemptId,
+              outcome: 'restored-prior',
+            })
+            continue
+          }
+        } catch (error) {
+          const state = attemptStateFile(profileDir)
+          try {
+            fs.renameSync(state, `${state}.conflict-${durable.attemptId}`)
+            fsyncParentDirectory(state)
+          } catch {
+            /* retaining the active name is safer than deleting an unresolved saga */
+          }
+          results.push({
+            profileId: durable.profileId,
+            attemptId: durable.attemptId,
+            outcome: 'conflict',
+            error: `Interrupted restored credential could not be verified safely: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          })
+          continue
+        }
+      }
       if (durableCredentialReady(durable.provider, profileDir)) {
         if (!authority.isCurrent()) {
           results.push({
@@ -1314,6 +1654,8 @@ export function reconcileInterruptedLogins(
         continue
       }
       if (durable.archivePath && durable.priorSha256) {
+        const archivePath = durable.archivePath
+        const priorSha256 = durable.priorSha256
         if (!authority.isCurrent()) {
           results.push({
             profileId: durable.profileId,
@@ -1324,10 +1666,21 @@ export function reconcileInterruptedLogins(
           continue
         }
         try {
+          if (durable.phase !== 'restoring') {
+            durable = {
+              ...durable,
+              phase: 'restoring',
+              updatedAt: new Date().toISOString(),
+            }
+            writeJsonAtomic(attemptStateFile(profileDir), durable)
+            if (!authority.isCurrent()) {
+              throw new Error('Credential reconciliation authority changed before restore publication.')
+            }
+          }
           restoreArchiveNoReplace(
-            durable.archivePath,
+            archivePath,
             durable.credentialPath,
-            durable.priorSha256,
+            priorSha256,
             () => options.failpoint?.('before-archive-link'),
           )
         } catch (error) {
