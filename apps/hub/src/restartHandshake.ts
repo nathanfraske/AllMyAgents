@@ -17,13 +17,89 @@ import type { PreflightFailure } from './preflight.js'
 export const SCHEMA_VERSION = 1
 export const ASK_RESTART_TURN_GRACE_MS = 10_000
 export const ASK_RESTART_INTERRUPT_MARGIN_MS = 250
-// Worst case: three SQLite writes may each wait the configured 5s busy_timeout, followed by the Ask
-// grace, interrupt dispatch, and listener-close margin. Keep this single-sourced with hubctl.
+// Worst case: profile-login settlement (4s), then three SQLite writes at the configured 5s
+// busy_timeout, followed by the Ask grace, interrupt dispatch, and listener-close margin.
 export const HUB_DRAIN_RELEASE_TIMEOUT_MS = 30_000
 export const HUB_PREFLIGHT_START_TIMEOUT_MS = 10_000
 export const HUB_PREFLIGHT_LIVENESS_TIMEOUT_MS = 10_000
 export const HUB_PREFLIGHT_ABSOLUTE_TIMEOUT_MS = 5 * 60_000
 export const HUB_PREFLIGHT_STATUS_INTERVAL_MS = 10_000
+
+export interface ProfileGenerationAuthority {
+  readonly generationId: string
+  readonly publicEpoch: number
+  readonly active: boolean
+}
+
+export class ProfilePublicEpochSequence {
+  constructor(private value = 0) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`Invalid initial profile public epoch: ${value}`)
+    }
+  }
+
+  get current(): number {
+    return this.value
+  }
+
+  next(): number {
+    if (this.value >= Number.MAX_SAFE_INTEGER) {
+      throw new Error('Profile public epoch sequence is exhausted')
+    }
+    this.value += 1
+    return this.value
+  }
+}
+
+export function profileGenerationEnvironment(
+  authority: ProfileGenerationAuthority,
+): Record<string, string> {
+  requireProfileGenerationId(authority.generationId)
+  requireProfilePublicEpoch(authority.publicEpoch)
+  return {
+    HUB_PROFILE_GENERATION_ID: authority.generationId,
+    HUB_PROFILE_PUBLIC_EPOCH: String(authority.publicEpoch),
+    HUB_PROFILE_PUBLIC_ACTIVE: authority.active ? '1' : '0',
+  }
+}
+
+export function parseProfileGenerationEnvironment(
+  env: NodeJS.ProcessEnv | Record<string, string | undefined>,
+): ProfileGenerationAuthority {
+  const generationId = env.HUB_PROFILE_GENERATION_ID
+  requireProfileGenerationId(generationId)
+  const rawEpoch = env.HUB_PROFILE_PUBLIC_EPOCH
+  if (typeof rawEpoch !== 'string' || !/^[1-9][0-9]*$/.test(rawEpoch)) {
+    throw new Error('Profile public epoch environment value is not canonical')
+  }
+  const publicEpoch = Number(rawEpoch)
+  requireProfilePublicEpoch(publicEpoch)
+  if (String(publicEpoch) !== rawEpoch) {
+    throw new Error('Profile public epoch environment value is not lossless')
+  }
+  const rawActive = env.HUB_PROFILE_PUBLIC_ACTIVE
+  if (rawActive !== '0' && rawActive !== '1') {
+    throw new Error('Profile public active environment value must be exactly 0 or 1')
+  }
+  return { generationId, publicEpoch, active: rawActive === '1' }
+}
+
+function requireProfileGenerationId(value: unknown): asserts value is string {
+  if (
+    typeof value !== 'string' ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+      value,
+    )
+  ) {
+    throw new Error('Profile generation id must be a canonical UUID')
+  }
+}
+
+function requireProfilePublicEpoch(value: unknown): asserts value is number {
+  if (!Number.isSafeInteger(value) || Number(value) < 1) {
+    throw new Error(`Profile public epoch must be a positive safe integer; got ${String(value)}`)
+  }
+}
 
 export interface JournalBackupControlCommand {
   type: 'journal-backup-control'
@@ -51,9 +127,9 @@ export type PreflightLiveness = {
 /** Supervisor -> hub. */
 export type SupervisorMsg =
   | { type: 'drain' } //   stop accepting new sessions (503), close the listener, keep the process alive
-  | { type: 'promote'; port: number } // re-listen on the fixed public port (green taking over)
+  | { type: 'promote'; port: number; profilePublicEpoch: number } // re-listen on the fixed public port (green taking over)
   | { type: 'retire' } //  finish in-flight, close WS, graceful shutdown, exit(0)
-  | { type: 'restart-aborted'; error: string } // runs on BLUE when green failed → journal it for the operator
+  | { type: 'restart-aborted'; error: string; profilePublicEpoch: number } // runs on BLUE when green failed → journal it for the operator
   | JournalBackupControlCommand
 
 /** Hub -> supervisor. */
@@ -69,11 +145,12 @@ export type HubMsg =
   | {
       type: 'released'
       questionTurns: { settled: number; outcomeUnknown: number }
+      loginAttempts: { settled: number; outcomeUnknown: number }
     } // drain done: listener closed, port free
   | { type: 'drain-failed'; error: string } // blue kept the listener because pre-drain durability failed
-  | { type: 'promoted' } //      now listening on the fixed port
+  | { type: 'promoted'; profilePublicEpoch: number } // now listening on the fixed port
   | { type: 'promote-failed'; error: string } // could not bind the fixed port (EADDRINUSE) → supervisor rolls back
-  | { type: 'rollback-rebound' } // blue has successfully reclaimed the fixed public listener
+  | { type: 'rollback-rebound'; profilePublicEpoch: number } // blue has successfully reclaimed the fixed public listener
   | { type: 'rollback-failed'; error: string } // blue could not reclaim the fixed listener; supervisor must revive
   | JournalBackupControlResult
   /**
@@ -391,17 +468,16 @@ export function waitForHubMsg<T extends HubMsg['type']>(
     const onMsg = (m: HubMsg): void => {
       if (m && typeof m === 'object' && m.type === type) {
         if (type === 'released') {
-          const counts = (m as { questionTurns?: { settled?: unknown; outcomeUnknown?: unknown } })
-            .questionTurns
+          const released = m as {
+            questionTurns?: { settled?: unknown; outcomeUnknown?: unknown }
+            loginAttempts?: { settled?: unknown; outcomeUnknown?: unknown }
+          }
           if (
-            !counts ||
-            !Number.isSafeInteger(counts.settled) ||
-            (counts.settled as number) < 0 ||
-            !Number.isSafeInteger(counts.outcomeUnknown) ||
-            (counts.outcomeUnknown as number) < 0
+            !validReleasedCounts(released.questionTurns) ||
+            !validReleasedCounts(released.loginAttempts)
           ) {
             cleanup()
-            reject(new Error("invalid hub 'released' question-turn counts"))
+            reject(new Error("invalid hub 'released' settlement counts"))
             return
           }
         }
@@ -455,7 +531,8 @@ export function waitForHubMsg<T extends HubMsg['type']>(
 export function requestRestartAbort(
   child: ChildProcess,
   error: string,
-  timeoutMs: number
+  timeoutMs: number,
+  profilePublicEpoch?: number,
 ): Promise<Extract<HubMsg, { type: 'rollback-rebound' }>> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -464,6 +541,14 @@ export function requestRestartAbort(
     }, timeoutMs)
     const onMsg = (message: HubMsg): void => {
       if (message?.type === 'rollback-rebound') {
+        if (
+          profilePublicEpoch !== undefined &&
+          message.profilePublicEpoch !== profilePublicEpoch
+        ) {
+          cleanup()
+          reject(new Error('blue acknowledged an unexpected profile public epoch'))
+          return
+        }
         cleanup()
         resolve(message)
       } else if (message?.type === 'rollback-failed') {
@@ -487,16 +572,35 @@ export function requestRestartAbort(
     child.once('exit', onExit)
     try {
       if (!child.send) throw new Error('hub IPC channel is unavailable')
-      child.send({ type: 'restart-aborted', error }, (sendError) => {
-        if (!sendError) return
-        cleanup()
-        reject(sendError)
-      })
+      child.send(
+        {
+          type: 'restart-aborted',
+          error,
+          ...(profilePublicEpoch === undefined ? {} : { profilePublicEpoch }),
+        },
+        (sendError) => {
+          if (!sendError) return
+          cleanup()
+          reject(sendError)
+        },
+      )
     } catch (sendError) {
       cleanup()
       reject(sendError)
     }
   })
+}
+
+function validReleasedCounts(
+  counts: { settled?: unknown; outcomeUnknown?: unknown } | undefined,
+): boolean {
+  return (
+    !!counts &&
+    Number.isSafeInteger(counts.settled) &&
+    Number(counts.settled) >= 0 &&
+    Number.isSafeInteger(counts.outcomeUnknown) &&
+    Number(counts.outcomeUnknown) >= 0
+  )
 }
 
 /**

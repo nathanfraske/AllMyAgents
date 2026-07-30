@@ -216,6 +216,12 @@ describe('device-authenticated control plane', () => {
       send: (message) => sent.push(message),
       onPromoted: () => {},
       stopJournalBackups: async () => {},
+      profileRuntime: {
+        prepareRestart: async () => ({ settled: 0, outcomeUnknown: 0 }),
+        deactivatePublicGeneration: () => {},
+        activatePublicGeneration: () => {},
+        resumeLoginAdmission: () => {},
+      },
       executor,
     })
     restartState.journalBackup = { status: 'inactive' }

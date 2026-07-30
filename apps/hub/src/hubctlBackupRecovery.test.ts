@@ -23,7 +23,7 @@ import http from 'node:http'
 import path from 'node:path'
 import { runHubPreflight } from './preflight.js'
 import { verifyNormalJournalLineage } from './journalRecovery.js'
-import { SCHEMA_VERSION } from './restartHandshake.js'
+import { parseProfileGenerationEnvironment, SCHEMA_VERSION } from './restartHandshake.js'
 
 const scenario = process.env.HUB_TEST_SCENARIO
 const stateDir = process.env.HUB_TEST_STATE_DIR
@@ -39,6 +39,10 @@ const marker = (name) => path.join(stateDir, name)
 const mark = (name) => fs.writeFileSync(marker(name), String(process.pid))
 const has = (name) => fs.existsSync(marker(name))
 const role = requestedPort === 0 ? 'green' : 'blue'
+const profileAuthority = parseProfileGenerationEnvironment(process.env)
+if (profileAuthority.active !== (role === 'blue')) {
+  throw new Error('fixture hub received the wrong profile public-generation role')
+}
 let bootOrdinal = 0
 if (role === 'blue') {
   const bootFile = marker('blue-boot-count')
@@ -320,6 +324,7 @@ async function handle(message) {
     send({
       type: 'released',
       questionTurns: { settled: 0, outcomeUnknown: 0 },
+      loginAttempts: { settled: 0, outcomeUnknown: 0 },
     })
     return
   }
@@ -332,7 +337,10 @@ async function handle(message) {
       console.log('[fixture] green bound public listener; promoted ACK withheld')
     } else {
       console.log('[fixture] green bound public listener; promoted ACK sent')
-      send({ type: 'promoted' })
+      send({
+        type: 'promoted',
+        profilePublicEpoch: message.profilePublicEpoch,
+      })
     }
     return
   }
@@ -340,7 +348,10 @@ async function handle(message) {
   if (message?.type === 'restart-aborted') {
     console.log('[fixture] restart-aborted reached a surviving blue')
     if (!server.listening) await listen(publicPort)
-    send({ type: 'rollback-rebound' })
+    send({
+      type: 'rollback-rebound',
+      profilePublicEpoch: message.profilePublicEpoch,
+    })
     return
   }
 
@@ -599,10 +610,20 @@ async function compileHubFixture(): Promise<void> {
     compiledHubctl = replaceExactly(
       compiledHubctl,
       `greenMayOwnPublicListener = true;
-        sendToHub(green.child, { type: 'promote', port: FIXED_PORT }); // green: re-listen on 7777
-        await waitForHubMsg(green.child, 'promoted', Number(process.env.HUB_TEST_PROMOTE_ACK_TIMEOUT_MS ?? 8_000));`,
-      `sendToHub(green.child, { type: 'promote', port: FIXED_PORT }); // MUTATION: fence moved after ACK
-        await waitForHubMsg(green.child, 'promoted', Number(process.env.HUB_TEST_PROMOTE_ACK_TIMEOUT_MS ?? 8_000));
+        const promotionEpoch = profilePublicEpochs.next();
+        sendToHub(green.child, {
+            type: 'promote',
+            port: FIXED_PORT,
+            profilePublicEpoch: promotionEpoch,
+        }); // green: re-listen on 7777
+        const promoted = await waitForHubMsg(green.child, 'promoted', Number(process.env.HUB_TEST_PROMOTE_ACK_TIMEOUT_MS ?? 8_000));`,
+      `const promotionEpoch = profilePublicEpochs.next();
+        sendToHub(green.child, {
+            type: 'promote',
+            port: FIXED_PORT,
+            profilePublicEpoch: promotionEpoch,
+        }); // MUTATION: fence moved after ACK
+        const promoted = await waitForHubMsg(green.child, 'promoted', Number(process.env.HUB_TEST_PROMOTE_ACK_TIMEOUT_MS ?? 8_000));
         greenMayOwnPublicListener = true;`,
       'promotion fence mutation'
     )

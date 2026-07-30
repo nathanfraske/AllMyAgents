@@ -53,7 +53,7 @@ export class UsageMonitor {
 
   addProfile(p: Profile): void {
     if (this.snapshots.has(p.id)) return
-    this.profiles.push(p)
+    if (!this.profiles.some((profile) => profile.id === p.id)) this.profiles.push(p)
     this.snapshots.set(p.id, {
       profileId: p.id,
       provider: p.provider,

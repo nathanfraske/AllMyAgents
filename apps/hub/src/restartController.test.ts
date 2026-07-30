@@ -43,6 +43,12 @@ function controllerDeps(
     },
     onPromoted: () => {},
     stopJournalBackups: async () => {},
+    profileRuntime: {
+      prepareRestart: vi.fn(async () => ({ settled: 0, outcomeUnknown: 0 })),
+      deactivatePublicGeneration: vi.fn(),
+      activatePublicGeneration: vi.fn(),
+      resumeLoginAdmission: vi.fn(),
+    },
     journal: { append: () => {} },
     questions: {
       deactivatePublicOwner: () => 0,
@@ -77,6 +83,7 @@ describe('RestartController journal backup ownership', () => {
 
     await expect(new RestartController(deps).drain()).rejects.toThrow(/SQLITE_FULL/)
     expect(deactivatePublicOwnerForRestart).toHaveBeenCalledTimes(1)
+    expect(deps.profileRuntime.resumeLoginAdmission).toHaveBeenCalledOnce()
     expect(signalDraining).not.toHaveBeenCalled()
     expect(server.listening).toBe(true)
     expect(deps.state.draining).toBe(false)
@@ -123,6 +130,50 @@ describe('RestartController journal backup ownership', () => {
       {
         type: 'released',
         questionTurns: { settled: 1, outcomeUnknown: 0 },
+        loginAttempts: { settled: 0, outcomeUnknown: 0 },
+      },
+    ])
+  })
+
+  it('closes login admission and awaits bounded settlement evidence before released', async () => {
+    const server = http.createServer()
+    const publicPort = await listenEphemeral(server)
+    const order: string[] = []
+    const sent: unknown[] = []
+    const deps = controllerDeps(server, publicPort, sent)
+    let settle!: (value: { settled: number; outcomeUnknown: number }) => void
+    deps.profileRuntime.prepareRestart = vi.fn(
+      () =>
+        new Promise<{ settled: number; outcomeUnknown: number }>((resolve) => {
+          order.push('login-admission-closed')
+          settle = resolve
+        }),
+    )
+    deps.profileRuntime.deactivatePublicGeneration = vi.fn(() => {
+      order.push('profile-generation-deactivated')
+    })
+    deps.send = (message) => {
+      order.push('released')
+      sent.push(message)
+    }
+
+    const draining = new RestartController(deps).drain()
+    await vi.waitFor(() => expect(deps.profileRuntime.prepareRestart).toHaveBeenCalledOnce())
+    expect(sent).toEqual([])
+
+    settle({ settled: 2, outcomeUnknown: 1 })
+    await draining
+
+    expect(order).toEqual([
+      'login-admission-closed',
+      'profile-generation-deactivated',
+      'released',
+    ])
+    expect(sent).toEqual([
+      {
+        type: 'released',
+        questionTurns: { settled: 0, outcomeUnknown: 0 },
+        loginAttempts: { settled: 2, outcomeUnknown: 1 },
       },
     ])
   })
@@ -181,9 +232,30 @@ describe('RestartController journal backup ownership', () => {
       expect(activatePublicOwner).toHaveBeenCalledOnce()
       expect(freeze.mock.calls).toEqual([[true], [false]])
       expect(signalDraining).toHaveBeenLastCalledWith(false)
+      expect(deps.profileRuntime.resumeLoginAdmission).toHaveBeenCalledOnce()
       expect(sent).toEqual([])
     }
   )
+
+  it('reopens login admission when bounded login settlement itself fails', async () => {
+    const server = http.createServer()
+    const publicPort = await listenEphemeral(server)
+    const deps = controllerDeps(server, publicPort)
+    deps.profileRuntime.prepareRestart = vi.fn(async () => {
+      throw new Error('login settlement failed')
+    })
+    const deactivateQuestions = vi.fn(() => [])
+    deps.questions.deactivatePublicOwnerForRestart = deactivateQuestions
+
+    await expect(new RestartController(deps).drain()).rejects.toThrow(
+      /login settlement failed/,
+    )
+
+    expect(deps.profileRuntime.resumeLoginAdmission).toHaveBeenCalledOnce()
+    expect(deactivateQuestions).not.toHaveBeenCalled()
+    expect(deps.state.draining).toBe(false)
+    expect(server.listening).toBe(true)
+  })
 
   it('returns false when a rejected pre-close drain cannot reclaim ownership and closes blue', async () => {
     const server = http.createServer()
@@ -336,6 +408,23 @@ describe('RestartController journal backup ownership', () => {
     expect(sent).toEqual([]) // the dead supervisor cannot consume `promoted`
   })
 
+  it('activates and acknowledges the exact supervisor promotion epoch before exposing green', async () => {
+    const reservation = http.createServer()
+    const publicPort = await listenEphemeral(reservation)
+    await new Promise<void>((resolve) => reservation.close(() => resolve()))
+    const server = http.createServer()
+    await listenEphemeral(server)
+    const sent: unknown[] = []
+    const deps = controllerDeps(server, publicPort, sent)
+
+    new RestartController(deps).promote(publicPort, 2)
+
+    await vi.waitFor(() =>
+      expect(sent).toContainEqual({ type: 'promoted', profilePublicEpoch: 2 }),
+    )
+    expect(deps.profileRuntime.activatePublicGeneration).toHaveBeenCalledWith(2)
+  })
+
   it('closes the promoted listener when question ownership activation cannot commit', async () => {
     const reservation = http.createServer()
     const publicPort = await listenEphemeral(reservation)
@@ -434,6 +523,23 @@ describe('RestartController journal backup ownership', () => {
     expect(deactivatePublicOwnerForRestart).toHaveBeenCalledTimes(1)
     expect(activatePublicOwner).toHaveBeenCalledTimes(1)
     expect(signalDraining.mock.calls).toEqual([[true], [false]])
+  })
+
+  it('activates and acknowledges the exact supervisor rollback epoch before reopening blue', async () => {
+    const server = http.createServer()
+    const publicPort = await listenEphemeral(server)
+    const sent: unknown[] = []
+    const deps = controllerDeps(server, publicPort, sent)
+    const controller = new RestartController(deps)
+
+    await controller.drain()
+    await controller.abort('test rollback', 3)
+
+    expect(deps.profileRuntime.activatePublicGeneration).toHaveBeenCalledWith(3)
+    expect(sent).toContainEqual({
+      type: 'rollback-rebound',
+      profilePublicEpoch: 3,
+    })
   })
 
   it('idempotently reclaims question ownership when abort happens before blue drains', async () => {
@@ -587,7 +693,7 @@ describe('RestartController journal backup ownership', () => {
     expect(sent).toEqual([{ type: 'rollback-rebound' }])
   })
 
-  it('serializes rollback rebind behind an existing listener transition', async () => {
+  it('cancels an immediate rollback before the listener transition begins', async () => {
     const server = http.createServer()
     const publicPort = await listenEphemeral(server)
     const sent: unknown[] = []
@@ -601,8 +707,8 @@ describe('RestartController journal backup ownership', () => {
     await Promise.all([draining, aborting])
 
     expect(sent).toEqual([{ type: 'rollback-rebound' }])
-    expect(close).toHaveBeenCalledTimes(1)
-    expect(listen).toHaveBeenCalledTimes(1)
+    expect(close).not.toHaveBeenCalled()
+    expect(listen).not.toHaveBeenCalled()
     expect(server.listening).toBe(true)
     expect((server.address() as { port: number }).port).toBe(publicPort)
   })

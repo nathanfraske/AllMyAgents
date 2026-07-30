@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ChildProcess } from 'node:child_process'
+import { PROFILE_LOGIN_RESTART_SETTLEMENT_TIMEOUT_MS } from './profileRuntime.js'
 import {
   ASK_RESTART_INTERRUPT_MARGIN_MS,
   ASK_RESTART_TURN_GRACE_MS,
@@ -9,6 +10,9 @@ import {
   HUB_PREFLIGHT_STATUS_INTERVAL_MS,
   MalformedPreflightRefusalError,
   PreflightRefusalError,
+  ProfilePublicEpochSequence,
+  parseProfileGenerationEnvironment,
+  profileGenerationEnvironment,
   waitForHubReady,
   waitForHubMsg,
 } from './restartHandshake.js'
@@ -267,11 +271,13 @@ describe('restart handshake question-turn evidence', () => {
     peer.emit('message', {
       type: 'released',
       questionTurns: { settled: 2, outcomeUnknown: 1 },
+      loginAttempts: { settled: 3, outcomeUnknown: 1 },
     })
 
     await expect(waiting).resolves.toEqual({
       type: 'released',
       questionTurns: { settled: 2, outcomeUnknown: 1 },
+      loginAttempts: { settled: 3, outcomeUnknown: 1 },
     })
   })
 
@@ -280,10 +286,30 @@ describe('restart handshake question-turn evidence', () => {
     { settled: -1, outcomeUnknown: 0 },
     { settled: 0.5, outcomeUnknown: 0 },
     { settled: 0, outcomeUnknown: Number.MAX_SAFE_INTEGER + 1 },
-  ])('rejects malformed released evidence: %j', async (questionTurns) => {
+  ])('rejects malformed released question evidence: %j', async (questionTurns) => {
     const peer = child()
     const waiting = waitForHubMsg(peer, 'released', 1_000)
-    peer.emit('message', { type: 'released', questionTurns })
+    peer.emit('message', {
+      type: 'released',
+      questionTurns,
+      loginAttempts: { settled: 0, outcomeUnknown: 0 },
+    })
+    await expect(waiting).rejects.toThrow(/invalid hub 'released'/)
+  })
+
+  it.each([
+    undefined,
+    { settled: -1, outcomeUnknown: 0 },
+    { settled: 0.5, outcomeUnknown: 0 },
+    { settled: 0, outcomeUnknown: Number.MAX_SAFE_INTEGER + 1 },
+  ])('rejects malformed released login evidence: %j', async (loginAttempts) => {
+    const peer = child()
+    const waiting = waitForHubMsg(peer, 'released', 1_000)
+    peer.emit('message', {
+      type: 'released',
+      questionTurns: { settled: 0, outcomeUnknown: 0 },
+      loginAttempts,
+    })
     await expect(waiting).rejects.toThrow(/invalid hub 'released'/)
   })
 
@@ -291,6 +317,7 @@ describe('restart handshake question-turn evidence', () => {
     const worstCaseDatabaseWaits = 3 * 5_000
     expect(HUB_DRAIN_RELEASE_TIMEOUT_MS).toBeGreaterThan(
       worstCaseDatabaseWaits +
+        PROFILE_LOGIN_RESTART_SETTLEMENT_TIMEOUT_MS +
         ASK_RESTART_TURN_GRACE_MS +
         ASK_RESTART_INTERRUPT_MARGIN_MS
     )
@@ -360,5 +387,41 @@ describe('restart handshake question-turn evidence', () => {
       ...fields,
     })
     await expect(waiting).rejects.toBeInstanceOf(MalformedPreflightRefusalError)
+  })
+})
+
+describe('profile public-generation handshake', () => {
+  it('round-trips a canonical generation environment and rejects spoofed values', () => {
+    const authority = {
+      generationId: '11111111-1111-4111-8111-111111111111',
+      publicEpoch: 7,
+      active: false,
+    }
+    expect(parseProfileGenerationEnvironment(profileGenerationEnvironment(authority))).toEqual(
+      authority,
+    )
+    expect(() =>
+      parseProfileGenerationEnvironment({
+        ...profileGenerationEnvironment(authority),
+        HUB_PROFILE_PUBLIC_EPOCH: '07',
+      }),
+    ).toThrow(/profile public epoch/i)
+    expect(() =>
+      parseProfileGenerationEnvironment({
+        ...profileGenerationEnvironment(authority),
+        HUB_PROFILE_PUBLIC_ACTIVE: 'true',
+      }),
+    ).toThrow(/profile public active/i)
+  })
+
+  it('allocates strictly monotonic safe epochs and never reuses a consumed promotion', () => {
+    const epochs = new ProfilePublicEpochSequence()
+    expect(epochs.next()).toBe(1)
+    expect(epochs.next()).toBe(2)
+    expect(epochs.next()).toBe(3)
+    expect(epochs.current).toBe(3)
+    expect(() => new ProfilePublicEpochSequence(Number.MAX_SAFE_INTEGER).next()).toThrow(
+      /exhausted/i,
+    )
   })
 })

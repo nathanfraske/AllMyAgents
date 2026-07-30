@@ -117,6 +117,12 @@ function spawnOrphanFixture(
       send: () => {},
       onPromoted: () => {},
       stopJournalBackups: () => backups.stop(),
+      profileRuntime: {
+        prepareRestart: async () => ({ settled: 0, outcomeUnknown: 0 }),
+        deactivatePublicGeneration: () => {},
+        activatePublicGeneration: () => {},
+        resumeLoginAdmission: () => {},
+      },
       journal: { append: () => {} },
       questions: {
         deactivatePublicOwner: () => 0,

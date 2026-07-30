@@ -12,6 +12,7 @@ import type { Executor } from './executor.js'
 import type { JournalBackupRuntimeState } from './journalBackup.js'
 import type { Journal } from './journal.js'
 import type { QuestionService } from './questions.js'
+import type { ProfileRuntime } from './profileRuntime.js'
 import type { SessionManager } from './sessions.js'
 import { ASK_RESTART_TURN_GRACE_MS } from './restartHandshake.js'
 
@@ -45,6 +46,13 @@ export interface RestartControllerDeps {
   // ONLY: the in-process executor implements no signalDraining, so both calls are a no-op and the flag-off
   // restart path is byte-identical.
   executor: Executor
+  profileRuntime: Pick<
+    ProfileRuntime,
+    | 'prepareRestart'
+    | 'deactivatePublicGeneration'
+    | 'activatePublicGeneration'
+    | 'resumeLoginAdmission'
+  >
   /** Test override; production uses the handshake layer's shared grace. */
   questionTurnGraceMs?: number
 }
@@ -137,6 +145,21 @@ export class RestartController {
     const { server, journal, questions, sessions, state, executor } = this.deps
     state.draining = true
     sessions.setRestartTurnAdmissionFrozen(true)
+    let loginBoundary: { settled: number; outcomeUnknown: number }
+    try {
+      loginBoundary = await this.deps.profileRuntime.prepareRestart()
+    } catch (error) {
+      this.deps.profileRuntime.resumeLoginAdmission()
+      state.draining = false
+      sessions.setRestartTurnAdmissionFrozen(false)
+      throw error
+    }
+    if (operation.abortRequested) {
+      this.deps.profileRuntime.resumeLoginAdmission()
+      state.draining = false
+      sessions.setRestartTurnAdmissionFrozen(false)
+      return
+    }
     // An in-process SDK callback cannot survive process retirement. Close every question durably and
     // settle its callback BEFORE releasing the public listener; if SQLite is BUSY/FULL/I/O-failed this
     // throws and the drain stops here, leaving blue authoritative for the supervisor's rollback.
@@ -144,6 +167,7 @@ export class RestartController {
     try {
       interrupted = questions.deactivatePublicOwnerForRestart()
     } catch (error) {
+      this.deps.profileRuntime.resumeLoginAdmission()
       state.draining = false
       sessions.setRestartTurnAdmissionFrozen(false)
       throw error
@@ -188,11 +212,13 @@ export class RestartController {
       }
       if (operation.abortRequested) return
       questions.recordRestartBoundaries(interrupted, new Set(boundary.settled))
+      this.deps.profileRuntime.deactivatePublicGeneration()
     } catch (error) {
       // The listener is still bound. Reclaim every public mutation boundary before reporting drain-failed;
       // interruption rows remain truthful and activation turns any unfinished notice into outcome-unknown.
       try {
         questions.activatePublicOwner()
+        this.deps.profileRuntime.resumeLoginAdmission()
         sessions.setRestartTurnAdmissionFrozen(false)
         executor.signalDraining?.(false)
         state.draining = false
@@ -232,6 +258,7 @@ export class RestartController {
         settled: boundary.settled.length,
         outcomeUnknown: boundary.outcomeUnknown.length,
       },
+      loginAttempts: loginBoundary,
     })
   }
 
@@ -241,7 +268,7 @@ export class RestartController {
    * grabbed the port in the gap) signal `promote-failed` so the supervisor rolls back to blue.
    * server.ts's global error handler defers to us while `state.promoting` is set.
    */
-  promote(port: number): void {
+  promote(port: number, profilePublicEpoch?: number): void {
     const { server, sessions, state, onPromoted } = this.deps
     state.promoting = true
     let settleTransition!: () => void
@@ -262,7 +289,12 @@ export class RestartController {
     }
     const onListening = (): void => {
       server.off('error', onError)
+      let profileActivated = false
       try {
+        if (profilePublicEpoch !== undefined) {
+          this.deps.profileRuntime.activatePublicGeneration(profilePublicEpoch)
+          profileActivated = true
+        }
         // The listener callback runs synchronously before another request can be dispatched. Claiming here
         // closes crash-orphaned summary rows without letting booting green touch live blue callbacks.
         this.deps.questions.activatePublicOwner()
@@ -286,6 +318,17 @@ export class RestartController {
               : String(deactivationError)
           }`
         }
+        if (profileActivated) {
+          try {
+            this.deps.profileRuntime.deactivatePublicGeneration()
+          } catch (deactivationError) {
+            message += `; profile ownership rollback failed: ${
+              deactivationError instanceof Error
+                ? deactivationError.message
+                : String(deactivationError)
+            }`
+          }
+        }
         server.close(() => {
           this.notifySupervisor({
             type: 'promote-failed',
@@ -295,7 +338,10 @@ export class RestartController {
         })
         return
       }
-      this.notifySupervisor({ type: 'promoted' })
+      this.notifySupervisor({
+        type: 'promoted',
+        ...(profilePublicEpoch === undefined ? {} : { profilePublicEpoch }),
+      })
       settled()
     }
     server.once('error', onError)
@@ -342,9 +388,9 @@ export class RestartController {
    * hubctl has confirmed any promoted green is dead and the port bind-probes free. If green failed before
    * drain, state.draining is false and the existing listener is acknowledged without another listen().
    */
-  async abort(error: string): Promise<void> {
+  async abort(error: string, profilePublicEpoch?: number): Promise<void> {
     if (this.abortOperation) return this.abortOperation
-    const operation = this.runAbort(error)
+    const operation = this.runAbort(error, profilePublicEpoch)
     this.abortOperation = operation
     try {
       await operation
@@ -353,7 +399,7 @@ export class RestartController {
     }
   }
 
-  private async runAbort(error: string): Promise<void> {
+  private async runAbort(error: string, profilePublicEpoch?: number): Promise<void> {
     const { server, journal, state, publicPort, executor, questions } = this.deps
     const drain = this.drainOperation
     if (drain) {
@@ -388,7 +434,14 @@ export class RestartController {
     )
 
     const reclaimQuestionOwner = async (): Promise<void> => {
+      let profileActivated = false
       try {
+        if (profilePublicEpoch !== undefined) {
+          this.deps.profileRuntime.activatePublicGeneration(profilePublicEpoch)
+          profileActivated = true
+        } else {
+          this.deps.profileRuntime.resumeLoginAdmission()
+        }
         // Idempotent when green failed before blue released ownership; essential after drain terminalized
         // the old callbacks. Do not expose the listener or release worker relays until this durable claim
         // succeeds.
@@ -396,7 +449,10 @@ export class RestartController {
         this.deps.sessions.setRestartTurnAdmissionFrozen(false)
         executor.signalDraining?.(false)
         state.draining = false
-        this.notifySupervisor({ type: 'rollback-rebound' })
+        this.notifySupervisor({
+          type: 'rollback-rebound',
+          ...(profilePublicEpoch === undefined ? {} : { profilePublicEpoch }),
+        })
       } catch (activationError) {
         state.draining = true
         let message = `rollback failed to reactivate question ownership: ${
@@ -410,6 +466,17 @@ export class RestartController {
               ? deactivationError.message
               : String(deactivationError)
           }`
+        }
+        if (profileActivated) {
+          try {
+            this.deps.profileRuntime.deactivatePublicGeneration()
+          } catch (deactivationError) {
+            message += `; profile ownership release failed: ${
+              deactivationError instanceof Error
+                ? deactivationError.message
+                : String(deactivationError)
+            }`
+          }
         }
         try {
           executor.signalDraining?.(true)

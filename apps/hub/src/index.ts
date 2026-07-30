@@ -19,6 +19,7 @@ import {
 import { ProjectStore } from './projects.js'
 import { profileAuthEvidence, scanProfiles, setClaudeConnectorPolicy } from './profiles.js'
 import { ProfileOwnership } from './profileOwnership.js'
+import { ProfileRuntime } from './profileRuntime.js'
 import { createJournalBackupSupervisor } from './journalBackup.js'
 import { SessionManager } from './sessions.js'
 import { SessionStore } from './store.js'
@@ -40,7 +41,12 @@ import { asChatNamePool } from './title.js'
 import { asFileWriteDiffDensity } from './types.js'
 import type { DangerFlags, HubConfig, HubPrefs } from './types.js'
 import { RestartController, type RestartState } from './restartController.js'
-import { SCHEMA_VERSION, type SupervisorMsg } from './restartHandshake.js'
+import {
+  parseProfileGenerationEnvironment,
+  SCHEMA_VERSION,
+  type ProfileGenerationAuthority,
+  type SupervisorMsg,
+} from './restartHandshake.js'
 import {
   PREFLIGHT_EXIT_CODE,
   recordExistingSchemaVersion,
@@ -71,6 +77,9 @@ if (process.env.AMA_VERIFY_HUB_DEPS === '1') {
 
 const repoRoot = path.resolve(import.meta.dirname, '..', '..', '..')
 const supervised = process.env.HUB_SUPERVISED === '1' && typeof process.send === 'function'
+const bootPort = Number(process.env.HUB_PORT ?? 7777)
+const publicPort = supervised ? Number(process.env.HUB_FIXED_PORT ?? 7777) : bootPort
+const isGreen = supervised && bootPort === 0
 function sendSupervisorMessage(message: unknown): void {
   if (!process.connected || !process.send) return
   try {
@@ -125,7 +134,15 @@ if (supervised) {
   preflightLivenessTimer = setInterval(sendPreflightLiveness, 1_000)
 }
 
-async function reportPreflightFailure(failure: PreflightFailure): Promise<never> {
+async function reportPreflightFailure(
+  failure:
+    | PreflightFailure
+    | {
+        code: 'profile-generation-invalid'
+        message: string
+        recovery: string
+      },
+): Promise<never> {
   const message = {
     type: 'preflight-failed' as const,
     ...(validPreflightAttempt ? { attemptId: preflightAttemptId } : {}),
@@ -151,6 +168,26 @@ async function reportPreflightFailure(failure: PreflightFailure): Promise<never>
   }
   process.exit(PREFLIGHT_EXIT_CODE)
 }
+
+const profileGeneration: ProfileGenerationAuthority = await (async () => {
+  try {
+    return supervised
+      ? parseProfileGenerationEnvironment(process.env)
+      : {
+          generationId: crypto.randomUUID(),
+          publicEpoch: 1,
+          active: true,
+        }
+  } catch (error) {
+    return reportPreflightFailure({
+      code: 'profile-generation-invalid',
+      message: `The supervisor supplied invalid profile authority: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      recovery: 'Keep this hub offline and restart the AllMyAgents desktop supervisor.',
+    })
+  }
+})()
 
 const recoveryLease = new JournalRecoveryLease(dataDir)
 try {
@@ -287,7 +324,7 @@ const journalBackups = createJournalBackupSupervisor(journal.db, {
 })
 process.once('exit', () => recoveryLease.release())
 const store = new SessionStore(journal.db)
-const profiles = scanProfiles(profilesDir)
+const profiles: ReturnType<typeof scanProfiles> = []
 const profileOwnership = new ProfileOwnership({
   ownerId: process.env.HUB_PROFILE_OWNER_ID ?? crypto.randomUUID(),
   pid: Number(process.env.HUB_PROFILE_OWNER_PID ?? process.pid),
@@ -296,20 +333,11 @@ const profileOwnership = new ProfileOwnership({
   // app take an account back from a sandbox that is squatting on it. Absent for a real install, so the
   // installed app is never the one that yields.
   transient: process.env.HUB_TRANSIENT === '1',
+}, {
+  generationId: profileGeneration.generationId,
+  publicGenerationActive: profileGeneration.active,
+  publicEpoch: profileGeneration.publicEpoch,
 })
-for (const profile of profiles) {
-  const claim = profileOwnership.claim(profile.id, profile.dir)
-  refreshProfileAuth(profile)
-  if (!claim.owned) {
-    profile.available = false
-    profile.ownerPort = claim.owner.port
-    profile.unavailableReason = `Another AllMyAgents hub (port ${claim.owner.port}) is using ${profile.id}. This hub will not refresh its credentials.`
-    console.error(`[profiles] ${profile.unavailableReason}`)
-  } else {
-    profile.available = true
-    console.log(`[profiles] owns ${profile.id}${claim.reclaimed ? ' (reclaimed stale claim)' : ''}`)
-  }
-}
 const profileMap = new Map(profiles.map((p) => [p.id, p]))
 const approvals = new ApprovalService(journal)
 const questions = new QuestionService(journal)
@@ -354,10 +382,28 @@ const prefs: HubPrefs = {
   steerMessagesAtToolBoundary: config.prefs?.steerMessagesAtToolBoundary !== false,
   fileWriteDiffDensity: asFileWriteDiffDensity(config.prefs?.fileWriteDiffDensity),
 }
-// Apply the connector policy to managed claude profiles at boot (safe default OFF → connectors suppressed).
-// The SDK reads disableClaudeAiConnectors from each profile's settings.json, so this makes the flag
-// authoritative on startup; the Danger-Zone toggle re-applies it on a flip (server.ts). Never touches ~/.claude.
-setClaudeConnectorPolicy(profiles, danger.enableClaudeConnectors === true)
+let profileBootstrapComplete = false
+const profileRuntime = new ProfileRuntime({
+  profilesDir,
+  profiles,
+  profileMap,
+  profileOwnership,
+  usage,
+  generation: profileGeneration,
+  scanProfiles: () => scanProfiles(profilesDir),
+  refreshAuth: refreshProfileAuth,
+  onAdded: (profile) => {
+    usage.addProfile(profile)
+    if (profileBootstrapComplete) {
+      journal.append(null, 'profiles/added', { id: profile.id, provider: profile.provider })
+    }
+  },
+  applyConnectorPolicy: (profile) =>
+    setClaudeConnectorPolicy([profile], danger.enableClaudeConnectors === true),
+  log: (message) => console.error(message),
+})
+profileRuntime.bootstrap()
+profileBootstrapComplete = true
 // Agent execution runs behind the Executor seam (docs/agent-worker-impl.md §4.1). The implementation is
 // chosen by the presence of HUB_WORKER_SOCKET (§4.4, the Phase-2 feature flag hubctl injects when worker
 // mode is opted into): absent → the in-process executor (byte-identical to today); present → a
@@ -416,12 +462,6 @@ approvals.setAutoApprove((sessionId, kind, payload) => sessions.isAutoApproved(s
 // hubctl launches us with HUB_SUPERVISED=1 + an IPC channel. A booting "green" gets HUB_PORT=0
 // (ephemeral) and promotes to the fixed public port 7777 only after passing the supervisor's
 // health-check; an unsupervised standalone hub behaves exactly as before.
-const bootPort = Number(process.env.HUB_PORT ?? 7777)
-// The fixed public port a green promotes to / a rollback re-claims — HUB_FIXED_PORT keeps it in lockstep with
-// hubctl's override so an isolated harness promotes to its own port, not 7777. Unset → 7777 as before.
-const publicPort = supervised ? Number(process.env.HUB_FIXED_PORT ?? 7777) : bootPort
-const isGreen = supervised && bootPort === 0
-
 // --- Journal condensation ----------------------------------------------------------------------
 // The measured journal grew to 390 MB / 375k events in three days, mostly two superseded Codex streams.
 // Run maintenance only after this process owns the public role, and in a ONE-SHOT CHILD: better-sqlite3's
@@ -650,25 +690,7 @@ if (!isGreen) usage.startPolling() //     green starts polling only once it owns
 restartState.booted = true
 
 function rescanProfiles(): typeof profiles {
-  for (const p of scanProfiles(profilesDir)) {
-    const existing = profileMap.get(p.id)
-    if (existing) {
-      refreshProfileAuth(existing)
-      continue
-    }
-    const claim = profileOwnership.claim(p.id, p.dir)
-    p.available = claim.owned
-    refreshProfileAuth(p)
-    if (!claim.owned) {
-      p.ownerPort = claim.owner.port
-      p.unavailableReason = `Another AllMyAgents hub (port ${claim.owner.port}) is using ${p.id}. This hub will not refresh its credentials.`
-      console.error(`[profiles] ${p.unavailableReason}`)
-    }
-    profileMap.set(p.id, p)
-    usage.addProfile(p) // pushes into the shared `profiles` array (same reference)
-    journal.append(null, 'profiles/added', { id: p.id, provider: p.provider })
-  }
-  return profiles
+  return profileRuntime.rescan()
 }
 
 function refreshProfileAuth(profile: (typeof profiles)[number]): void {
@@ -802,6 +824,7 @@ if (supervised && process.send) {
       worktreeCollisions.start()
     },
     stopJournalBackups: () => journalBackups.stop(),
+    profileRuntime,
     // §8.4: drain() signals the worker to hold relays before blue's socket drops; abort() un-drains a
     // rolled-back flip. No-op in-process (the in-process executor implements no signalDraining), so the
     // flag-off restart path is byte-identical.
@@ -819,13 +842,13 @@ if (supervised && process.send) {
         })
         break
       case 'promote':
-        controller.promote(msg.port)
+        controller.promote(msg.port, msg.profilePublicEpoch)
         break
       case 'retire':
         void controller.retire()
         break
       case 'restart-aborted':
-        void controller.abort(msg.error).catch((error: unknown) => {
+        void controller.abort(msg.error, msg.profilePublicEpoch).catch((error: unknown) => {
           const message = error instanceof Error ? error.message : String(error)
           restartState.rollbackRebinding = false
           restartState.draining = true

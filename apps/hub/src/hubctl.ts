@@ -22,12 +22,16 @@ import {
   HUB_DRAIN_RELEASE_TIMEOUT_MS,
   MalformedPreflightRefusalError,
   PreflightRefusalError,
+  ProfilePublicEpochSequence,
   SCHEMA_VERSION,
+  profileGenerationEnvironment,
+  requestRestartAbort,
   sendToHub,
   waitForHubReady,
   waitForHubMsg,
   healthCheck,
   type HubMsg,
+  type ProfileGenerationAuthority,
 } from './restartHandshake.js'
 import { defaultWorkerSocket } from './workerTransport.js'
 import { JournalBackupOwnershipProtocol } from './journalBackupOwnership.js'
@@ -49,6 +53,7 @@ const profileOwnerEnv = {
   HUB_PROFILE_OWNER_PID: String(process.pid),
   HUB_PROFILE_OWNER_PORT: String(FIXED_PORT),
 }
+const profilePublicEpochs = new ProfilePublicEpochSequence()
 
 /**
  * Worker mode (docs/agent-worker-impl.md §5) is OPT-IN — the hard requirement is that flag-off is
@@ -75,7 +80,25 @@ interface HubHandle {
   port: number // 7777 for the live hub; the ephemeral port for a booting green (until it's promoted)
   restored: number // sessions restored, from the hub's `ready` message
   preflightAttemptId: string
+  profileGenerationId: string
+  profilePublicEpoch: number
   state: 'booting' | 'live' | 'draining' | 'promoted' | 'retired'
+}
+
+function nextActiveProfileAuthority(): ProfileGenerationAuthority {
+  return {
+    generationId: crypto.randomUUID(),
+    publicEpoch: profilePublicEpochs.next(),
+    active: true,
+  }
+}
+
+function standbyProfileAuthority(current: HubHandle): ProfileGenerationAuthority {
+  return {
+    generationId: crypto.randomUUID(),
+    publicEpoch: current.profilePublicEpoch,
+    active: false,
+  }
 }
 
 function waitForReady(handle: HubHandle) {
@@ -179,7 +202,11 @@ function hubLaunchCommand(): { cmd: string; args: string[] } {
  * stdout/stderr surfacing exactly as today while giving us `child.send()`/`child.on('message')`.
  * `HUB_PORT=0` asks the OS for an ephemeral port (green); the hub reports its ACTUAL port in `ready`.
  */
-function spawnHub(port: number, color: HubColor): HubHandle {
+function spawnHub(
+  port: number,
+  color: HubColor,
+  profileAuthority: ProfileGenerationAuthority,
+): HubHandle {
   const { cmd, args } = hubLaunchCommand()
   const preflightAttemptId = crypto.randomUUID()
   const child = spawn(cmd, args, {
@@ -201,6 +228,7 @@ function spawnHub(port: number, color: HubColor): HubHandle {
     env: {
       ...process.env,
       ...profileOwnerEnv,
+      ...profileGenerationEnvironment(profileAuthority),
       HUB_PORT: String(port),
       HUB_SUPERVISED: '1',
       HUB_PREFLIGHT_ATTEMPT_ID: preflightAttemptId,
@@ -213,6 +241,8 @@ function spawnHub(port: number, color: HubColor): HubHandle {
     port,
     restored: 0,
     preflightAttemptId,
+    profileGenerationId: profileAuthority.generationId,
+    profilePublicEpoch: profileAuthority.publicEpoch,
     state: 'booting',
   }
   children.add(child)
@@ -362,7 +392,7 @@ async function reviveLiveHub(): Promise<void> {
       if (tearingDown) return
       let candidate: HubHandle | undefined
       try {
-        candidate = spawnHub(FIXED_PORT, 'blue')
+        candidate = spawnHub(FIXED_PORT, 'blue', nextActiveProfileAuthority())
         const next = candidate
         const ready = await waitForReady(next)
         next.port = ready.port
@@ -575,7 +605,7 @@ function enterRecoveryPoison(
           throw new Error('fresh worker generation did not remain alive for recovery reboot')
         }
       }
-      freshBlue = spawnHub(FIXED_PORT, 'blue')
+      freshBlue = spawnHub(FIXED_PORT, 'blue', nextActiveProfileAuthority())
       const ready = await waitForReady(freshBlue)
       freshBlue.port = ready.port
       freshBlue.restored = ready.restored
@@ -652,7 +682,7 @@ async function boot(): Promise<void> {
     spawnWorker()
   }
   log(`booting hub (blue) on :${FIXED_PORT}`)
-  const blue = spawnHub(FIXED_PORT, 'blue')
+  const blue = spawnHub(FIXED_PORT, 'blue', nextActiveProfileAuthority())
   try {
     const ready = await waitForReady(blue)
     blue.port = ready.port
@@ -702,7 +732,7 @@ async function restart(reason: string): Promise<void> {
   let committed = false
   let greenMayOwnPublicListener = false
   log(`restart requested (${reason}) — booting green on an ephemeral port`)
-  const green = spawnHub(0, 'green')
+  const green = spawnHub(0, 'green', standbyProfileAuthority(blue))
   try {
     const ready = await waitForReady(green)
     green.port = ready.port
@@ -721,16 +751,27 @@ async function restart(reason: string): Promise<void> {
       HUB_DRAIN_RELEASE_TIMEOUT_MS
     )
     log(
-      `blue drained — 7777 released (question turns settled=${released.questionTurns.settled}, outcome-unknown=${released.questionTurns.outcomeUnknown})`
+      `blue drained — 7777 released (question turns settled=${released.questionTurns.settled}, outcome-unknown=${released.questionTurns.outcomeUnknown}; login attempts settled=${released.loginAttempts.settled}, outcome-unknown=${released.loginAttempts.outcomeUnknown})`
     )
 
     // From this point the public bind is ambiguous until green exits: it can bind successfully and lose
     // its `promoted` IPC acknowledgement. Fence rollback BEFORE sending the command so an ACK timeout
     // still waits for confirmed green death and an explicit port-release probe before blue can rebind.
     greenMayOwnPublicListener = true
-    sendToHub(green.child, { type: 'promote', port: FIXED_PORT }) // green: re-listen on 7777
-    await waitForHubMsg(green.child, 'promoted', 8_000)
+    const promotionEpoch = profilePublicEpochs.next()
+    sendToHub(green.child, {
+      type: 'promote',
+      port: FIXED_PORT,
+      profilePublicEpoch: promotionEpoch,
+    }) // green: re-listen on 7777
+    const promoted = await waitForHubMsg(green.child, 'promoted', 8_000)
+    if (promoted.profilePublicEpoch !== promotionEpoch) {
+      throw new Error(
+        `green acknowledged profile epoch ${promoted.profilePublicEpoch}, expected ${promotionEpoch}`,
+      )
+    }
     green.port = FIXED_PORT
+    green.profilePublicEpoch = promotionEpoch
     green.state = 'promoted'
     log(`green promoted on :${FIXED_PORT} — acquiring journal backup ownership`)
 
@@ -761,6 +802,7 @@ async function restart(reason: string): Promise<void> {
     } else {
       log(`restart aborted — rolling back to blue: ${String(err)}`)
       try {
+        let rollbackEpoch: number | undefined
         await rollbackToBlue({
           blue: blue.child,
           green: green.child,
@@ -772,6 +814,10 @@ async function restart(reason: string): Promise<void> {
             killTree(child)
           },
           waitForGreenExit: waitForChildExit,
+          requestBlueRebind: (child, rollbackReason, timeoutMs) => {
+            rollbackEpoch = profilePublicEpochs.next()
+            return requestRestartAbort(child, rollbackReason, timeoutMs, rollbackEpoch)
+          },
           resumeBlue: () => journalBackupOwnership.resumeBlueAfterRollback(blue.child),
           onResumeFailure: (resumeError, nextDelayMs) => {
             log(
@@ -781,6 +827,10 @@ async function restart(reason: string): Promise<void> {
             )
           },
         })
+        if (rollbackEpoch === undefined) {
+          throw new Error('blue rollback completed without a profile public epoch')
+        }
+        blue.profilePublicEpoch = rollbackEpoch
         log('blue journal backups resumed after rollback')
       } catch (rollbackError) {
         await abandonLiveForRevival({
