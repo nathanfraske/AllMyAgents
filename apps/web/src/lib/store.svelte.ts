@@ -14,7 +14,7 @@ import { isChatBusy, nextOrderKey, orderChats, type ChatOrderFacts } from './cha
 import { extractCodexReasoning } from './codexGroup'
 import { attachmentsFromPayload, type AttachmentMeta } from './attachments'
 import type { AgentOutcome } from './agentTree'
-import type { ApprovalRecord, FleetSite, HistoryItem, HistoryPage, HubEvent, HubPrefs, HubStreamMessage, ProfileInfo, ProjectInfo, QuestionRecord, ReplayComplete, ReplayStart, ScanResult, SessionRecord, UsageSnapshot } from './api'
+import type { ApprovalRecord, FleetSite, HistoryItem, HistoryPage, HubEvent, HubPrefs, HubStreamMessage, ProfileInfo, ProjectInfo, QuestionRecord, RecoveryNotice, ReplayComplete, ReplayStart, ScanResult, SessionRecord, UsageSnapshot } from './api'
 
 // Verbose client tracing — on in dev, compiled out of prod builds. Toggle off in dev by setting
 // localStorage['ama:verbose'] = '0'. Surfaces the load/connect/replay/scan milestones so a stall is
@@ -291,6 +291,7 @@ export class HubStore {
   })
   approvals = $state<ApprovalRecord[]>([])
   questions = $state<QuestionRecord[]>([])
+  recoveryNotices = $state<RecoveryNotice[]>([])
   usage = $state<UsageSnapshot[]>([])
   // Hub-owned ordinary preferences. Shared here so the composer and Settings read the same live value;
   // absent/failed bootstrap keeps the server's default-on behavior rather than disabling steering.
@@ -1142,14 +1143,23 @@ export class HubStore {
   async refreshSideData(): Promise<void> {
     // Side data is refreshed on a debounce from the event stream, so a transient failure simply means
     // the next event refreshes it. Throwing out of here would take the whole ingest path down.
-    const [approvals, questions, usage] = await Promise.all([
+    const [approvals, questions, recoveryNotices, usage] = await Promise.all([
       api.approvals().catch(() => null),
       api.questions().catch(() => null),
+      api.recoveryNotices().catch(() => null),
       api.usage().catch(() => null),
     ])
     if (approvals) this.approvals = approvals
     if (questions) this.questions = questions
+    if (recoveryNotices) this.recoveryNotices = recoveryNotices
     if (usage) this.usage = usage
+  }
+
+  async dismissRecoveryNotice(planId: string): Promise<boolean> {
+    const result = await api.dismissRecoveryNotice(planId)
+    if ('error' in result && result.error) return false
+    this.recoveryNotices = this.recoveryNotices.filter((notice) => notice.planId !== planId)
+    return true
   }
 
   async setPrefs(patch: Partial<HubPrefs>): Promise<{ error?: string }> {
@@ -1595,6 +1605,7 @@ export class HubStore {
       kind === 'question/resolved' ||
       kind === 'question/recovery-unknown' ||
       kind === 'question/restart-interrupted' ||
+      kind === 'journal/recovered' ||
       kind.startsWith('usage/')
     ) {
       this.scheduleSideRefresh()

@@ -13,6 +13,7 @@
   import { tutorials, type AccountLoginView } from './lib/tutorialState.svelte'
   import Titlebar from './lib/Titlebar.svelte'
   import UpdateBanner from './lib/UpdateBanner.svelte'
+  import RecoveryNoticeBanner from './lib/RecoveryNoticeBanner.svelte'
   import { cubicOut } from 'svelte/easing'
   import type { TransitionConfig } from 'svelte/transition'
 
@@ -364,6 +365,7 @@
     <span class="elapsed">{store.hubDownSeconds}s</span>
   </div>
 {/if}
+<RecoveryNoticeBanner />
 <div
   class="shell"
   class:dragging={sidebarDrag || !!colDrag}

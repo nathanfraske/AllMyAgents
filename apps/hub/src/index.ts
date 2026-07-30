@@ -46,6 +46,12 @@ import {
   runHubPreflight,
   type PreflightFailure,
 } from './preflight.js'
+import {
+  consumeRecoveryReceipts,
+  JournalRecoveryLease,
+  validateRecoveryReceiptsBeforeWritableOpen,
+  verifyNormalJournalLineage,
+} from './journalRecovery.js'
 
 // The desktop shell runs the shipped hub entry with this flag before trusting a persisted
 // node_modules tree. Static ESM imports have already linked the hub's real module graph by the time
@@ -109,6 +115,17 @@ async function reportPreflightFailure(failure: PreflightFailure): Promise<never>
   process.exit(PREFLIGHT_EXIT_CODE)
 }
 
+const recoveryLease = new JournalRecoveryLease(dataDir)
+try {
+  recoveryLease.acquireShared()
+} catch (error) {
+  await reportPreflightFailure({
+    code: 'database-validation-unavailable',
+    message: `The journal ownership boundary could not be established: ${error instanceof Error ? error.message : String(error)}`,
+    recovery:
+      'Keep the data root offline. Resolve the lease, filesystem, or recovery-metadata error and restart AllMyAgents.',
+  })
+}
 const preflight = runHubPreflight({ dataDir, journalPath, schemaVersion: SCHEMA_VERSION })
 for (const check of preflight.checks) {
   const line = `[hub-preflight] ${check.name}: ${check.status} (${check.durationMs}ms) — ${check.detail}`
@@ -116,6 +133,14 @@ for (const check of preflight.checks) {
   else console.log(line)
 }
 if (!preflight.ok) await reportPreflightFailure(preflight.failure)
+const lineageFailure = verifyNormalJournalLineage({
+  dataDir,
+  journalPath,
+  maxSchemaVersion: SCHEMA_VERSION,
+})
+if (lineageFailure) await reportPreflightFailure(lineageFailure)
+const receiptFailure = validateRecoveryReceiptsBeforeWritableOpen({ dataDir, journalPath })
+if (receiptFailure) await reportPreflightFailure(receiptFailure)
 if (fs.existsSync(journalPath)) {
   try {
     recordExistingSchemaVersion(journalPath, SCHEMA_VERSION)
@@ -156,6 +181,12 @@ try {
     recovery: 'Check free disk space and write permission for hub.db, then restart AllMyAgents.',
   })
 }
+const consumedRecoveryReceipts = consumeRecoveryReceipts(journal)
+if (consumedRecoveryReceipts > 0) {
+  console.warn(
+    `[journal-recovery] recorded ${consumedRecoveryReceipts} recovery notice(s); post-snapshot tail outcome remains unknown`
+  )
+}
 // Each live WebSocket (pane / device / reconnect) attaches a journal 'event' listener, removed on
 // close — legitimately more than the EventEmitter default of 10 for a multi-pane/fleet hub. Raise
 // the cap so a healthy number of connections doesn't emit a spurious MaxListeners leak warning.
@@ -187,12 +218,15 @@ const restartState: RestartState = {
 const journalBackupsDir = path.join(dataDir, 'backups')
 const journalBackups = createJournalBackupSupervisor(journal.db, {
   dir: journalBackupsDir,
+  recoveryDataDir: dataDir,
+  recoveryKeep: 6,
   log: (message) => console.log(message),
   onStateChange: (state) => {
     if (state.status !== 'inactive') restartState.journalBackupRequired = true
     restartState.journalBackup = state
   },
 })
+process.once('exit', () => recoveryLease.release())
 const store = new SessionStore(journal.db)
 const profiles = scanProfiles(profilesDir)
 const profileOwnership = new ProfileOwnership({

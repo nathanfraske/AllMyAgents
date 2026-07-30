@@ -11,6 +11,15 @@ export interface AttachmentRef {
   size: number
 }
 
+export interface RecoveryNotice {
+  planId: string
+  generation: string
+  snapshotMaxSeq: string
+  snapshotEventHighWater: string
+  quarantineDir: string
+  recordedAt: string
+}
+
 export interface ProfileInfo {
   id: string
   provider: 'claude' | 'codex'
@@ -774,6 +783,12 @@ export const api = {
     jget<HistoryPage>(`/api/sessions/${id}/history${before != null ? `?before=${before}` : ''}`),
   approvals: () => jget<ApprovalRecord[]>('/api/approvals'),
   questions: () => jget<QuestionRecord[]>('/api/questions'),
+  recoveryNotices: () => jget<RecoveryNotice[]>('/api/recovery-notices'),
+  dismissRecoveryNotice: (planId: string) =>
+    jpost<{ ok?: boolean; error?: string }>(
+      `/api/recovery-notices/${encodeURIComponent(planId)}/dismiss`,
+      {}
+    ),
   usage: () => jget<UsageSnapshot[]>('/api/usage'),
   refreshUsage: () => jpost<UsageSnapshot[] | ApiError>('/api/usage/refresh'),
   // NOTE: spawn does NOT take `attachments`. Uploads are session-owned (their id is minted by the upload

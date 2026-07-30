@@ -9,6 +9,9 @@ export const PREFLIGHT_EXIT_CODE = 78
 export type PreflightFailureCode =
   | 'data-dir-not-writable'
   | 'database-corrupt'
+  | 'database-orphan-family'
+  | 'database-lineage-invalid'
+  | 'database-validation-unavailable'
   | 'schema-too-new'
   | 'schema-version-unrecordable'
   | 'question-owner-activation-failed'
@@ -24,6 +27,7 @@ export type PreflightFailure = {
   code: PreflightFailureCode
   message: string
   recovery: string
+  recoveryCause?: 'sqlite-corruption' | 'orphan-family' | 'lineage-rollback'
 }
 
 export type HubPreflightResult =
@@ -32,6 +36,14 @@ export type HubPreflightResult =
 
 const WRITE_FAILURE_CODES = new Set(['EACCES', 'EDQUOT', 'ENOSPC', 'EPERM', 'EROFS'])
 const CORRUPT_SQLITE_CODES = new Set(['SQLITE_CORRUPT', 'SQLITE_NOTADB'])
+const WAL_MAGIC = new Set([0x377f0682, 0x377f0683])
+const WAL_VERSION = 3_007_000
+const MAX_WAL_FRAMES = 16_777_216
+
+type WalValidation =
+  | { status: 'ok'; validCommit: boolean; ignoredTail: boolean }
+  | { status: 'corrupt'; detail: string }
+  | { status: 'unavailable'; detail: string }
 
 function errorText(error: unknown): string {
   if (!(error instanceof Error)) return String(error)
@@ -60,24 +72,183 @@ function writeFailure(error: unknown, dataDir: string): PreflightFailure | undef
 function corruptionFailure(error: unknown, journalPath: string): PreflightFailure | undefined {
   const code = errorCode(error)
   const text = errorText(error)
-  if (
-    (!code || !CORRUPT_SQLITE_CODES.has(code)) &&
-    !/database disk image is malformed|file is not a database|malformed database schema/i.test(text)
-  ) {
-    return undefined
-  }
+  if (!code || !CORRUPT_SQLITE_CODES.has(code)) return undefined
   return {
     code: 'database-corrupt',
     message: `The journal database failed SQLite validation (${journalPath}): ${text}`,
     recovery:
-      'Keep the damaged hub.db for recovery, then restore a known-good backup or move it aside and restart to create an empty journal.',
+      'Keep the damaged SQLite family for evidence. AllMyAgents may restore only an identity-bound verified recovery generation; otherwise it stays offline.',
+    recoveryCause: 'sqlite-corruption',
   }
+}
+
+function walChecksum(
+  bytes: Buffer,
+  littleEndian: boolean,
+  seed: readonly [number, number]
+): [number, number] {
+  let [s1, s2] = seed
+  for (let offset = 0; offset < bytes.length; offset += 8) {
+    const first = littleEndian
+      ? bytes.readUInt32LE(offset)
+      : bytes.readUInt32BE(offset)
+    const second = littleEndian
+      ? bytes.readUInt32LE(offset + 4)
+      : bytes.readUInt32BE(offset + 4)
+    s1 = (s1 + first + s2) >>> 0
+    s2 = (s2 + second + s1) >>> 0
+  }
+  return [s1, s2]
+}
+
+function validateWalFile(walPath: string): WalValidation {
+  let fd: number | undefined
+  let result: WalValidation = { status: 'unavailable', detail: 'validation did not complete' }
+  try {
+    const stat = fs.lstatSync(walPath, { bigint: true })
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      return { status: 'unavailable', detail: 'WAL path is not a regular non-link file' }
+    }
+    if (stat.size === 0n) return { status: 'ok', validCommit: false, ignoredTail: false }
+    if (stat.size < 4n) {
+      return { status: 'unavailable', detail: 'sidecar is too short to identify as SQLite WAL' }
+    }
+    fd = fs.openSync(walPath, 'r')
+    const header = Buffer.alloc(32)
+    const headerBytes = fs.readSync(fd, header, 0, header.length, 0)
+    if (headerBytes < 4) {
+      return { status: 'unavailable', detail: 'sidecar is too short to identify as SQLite WAL' }
+    }
+    const magic = header.readUInt32BE(0)
+    if (!WAL_MAGIC.has(magic)) {
+      return { status: 'unavailable', detail: 'sidecar does not have a recognized SQLite WAL magic' }
+    }
+    if (headerBytes !== header.length) {
+      return { status: 'corrupt', detail: 'recognized SQLite WAL header is truncated' }
+    }
+    if (header.readUInt32BE(4) !== WAL_VERSION) {
+      return { status: 'corrupt', detail: 'recognized SQLite WAL has an invalid format version' }
+    }
+    const encodedPageSize = header.readUInt32BE(8)
+    const pageSize = encodedPageSize === 1 ? 65_536 : encodedPageSize
+    if (
+      pageSize < 512 ||
+      pageSize > 65_536 ||
+      (pageSize & (pageSize - 1)) !== 0
+    ) {
+      return { status: 'corrupt', detail: 'recognized SQLite WAL has an invalid page size' }
+    }
+    const frameBytes = BigInt(pageSize + 24)
+    const payloadBytes = stat.size - 32n
+    const frameCount = payloadBytes / frameBytes
+    const tailBytes = payloadBytes % frameBytes
+    if (frameCount > BigInt(MAX_WAL_FRAMES)) {
+      return {
+        status: 'unavailable',
+        detail: 'recognized SQLite WAL exceeds the bounded validation frame count',
+      }
+    }
+    const littleEndian = magic === 0x377f0682
+    let checksum = walChecksum(header.subarray(0, 24), littleEndian, [0, 0])
+    if (checksum[0] !== header.readUInt32BE(24) || checksum[1] !== header.readUInt32BE(28)) {
+      return { status: 'corrupt', detail: 'recognized SQLite WAL header checksum is invalid' }
+    }
+    const salt1 = header.readUInt32BE(16)
+    const salt2 = header.readUInt32BE(20)
+    const frame = Buffer.alloc(pageSize + 24)
+    let validCommit = false
+    const laterSameSaltCommit = (start: bigint): boolean => {
+      const laterHeader = Buffer.alloc(24)
+      for (let later = start; later < frameCount; later += 1n) {
+        const laterPosition = 32n + later * frameBytes
+        if (laterPosition > BigInt(Number.MAX_SAFE_INTEGER)) break
+        if (
+          fs.readSync(fd!, laterHeader, 0, laterHeader.length, Number(laterPosition)) !==
+          laterHeader.length
+        ) {
+          break
+        }
+        if (
+          laterHeader.readUInt32BE(8) === salt1 &&
+          laterHeader.readUInt32BE(12) === salt2 &&
+          laterHeader.readUInt32BE(4) !== 0
+        ) {
+          return true
+        }
+      }
+      return false
+    }
+    for (let index = 0n; index < frameCount; index += 1n) {
+      const position = 32n + index * frameBytes
+      if (position > BigInt(Number.MAX_SAFE_INTEGER)) {
+        return { status: 'unavailable', detail: 'recognized SQLite WAL offset exceeds safe bounds' }
+      }
+      const bytes = fs.readSync(fd, frame, 0, frame.length, Number(position))
+      if (bytes !== frame.length) {
+        return { status: 'corrupt', detail: 'recognized SQLite WAL frame is truncated' }
+      }
+      if (frame.readUInt32BE(0) === 0) {
+        if (frame.readUInt32BE(4) !== 0 || laterSameSaltCommit(index + 1n)) {
+          return { status: 'corrupt', detail: 'recognized committed WAL frame has page number zero' }
+        }
+        if (validCommit) return { status: 'ok', validCommit, ignoredTail: true }
+        return { status: 'unavailable', detail: 'WAL page-zero boundary is ambiguous' }
+      }
+      if (frame.readUInt32BE(8) !== salt1 || frame.readUInt32BE(12) !== salt2) {
+        if (laterSameSaltCommit(index + 1n)) {
+          return { status: 'corrupt', detail: 'WAL salt mismatch hides a later committed frame' }
+        }
+        if (validCommit) return { status: 'ok', validCommit, ignoredTail: true }
+        return { status: 'unavailable', detail: 'WAL salt boundary is ambiguous' }
+      }
+      checksum = walChecksum(frame.subarray(0, 8), littleEndian, checksum)
+      checksum = walChecksum(frame.subarray(24), littleEndian, checksum)
+      if (
+        checksum[0] !== frame.readUInt32BE(16) ||
+        checksum[1] !== frame.readUInt32BE(20)
+      ) {
+        let committedTail = frame.readUInt32BE(4) !== 0
+        if (!committedTail) {
+          committedTail = laterSameSaltCommit(index + 1n)
+        }
+        if (!committedTail) {
+          return { status: 'ok', validCommit, ignoredTail: true }
+        }
+        return {
+          status: 'corrupt',
+          detail: `recognized committed SQLite WAL frame ${index + 1n} checksum is invalid`,
+        }
+      }
+      if (frame.readUInt32BE(4) !== 0) validCommit = true
+    }
+    result = { status: 'ok', validCommit, ignoredTail: tailBytes !== 0n }
+  } catch (error) {
+    result = { status: 'unavailable', detail: errorText(error) }
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd)
+      } catch (error) {
+        result = {
+          status: 'unavailable',
+          detail: `WAL validation handle could not close: ${errorText(error)}`,
+        }
+      }
+    }
+  }
+  return result
 }
 
 export function runHubPreflight(options: {
   dataDir: string
   journalPath: string
   schemaVersion: number
+  /** Injectable only so error classification can be exercised without damaging a real database. */
+  openReadonly?: (file: string) => Database.Database
+  /** Injectable only for conclusive missing/path-shape classification tests. */
+  lstat?: typeof fs.lstatSync
+  /** Only an exclusive supervisor classifier may interpret stable raw sidecar bytes. */
+  stableFamily?: boolean
 }): HubPreflightResult {
   const { dataDir, journalPath, schemaVersion } = options
   const checks: PreflightCheck[] = []
@@ -100,12 +271,16 @@ export function runHubPreflight(options: {
   } catch (error) {
     const failure = writeFailure(error, dataDir)
     if (failure) return { ok: false, checks, failure }
-    checks.push({
-      name: 'data-dir-writable',
-      status: 'skipped',
-      detail: `probe was inconclusive: ${errorText(error)}`,
-      durationMs: elapsed(writeStarted),
-    })
+    return {
+      ok: false,
+      checks,
+      failure: {
+        code: 'database-validation-unavailable',
+        message: `The hub data directory write probe failed unexpectedly (${dataDir}): ${errorText(error)}`,
+        recovery:
+          'Do not open or recover the journal until the data-root filesystem error is resolved.',
+      },
+    }
   } finally {
     if (probeFd !== undefined) {
       try {
@@ -123,7 +298,134 @@ export function runHubPreflight(options: {
     }
   }
 
-  if (!fs.existsSync(journalPath)) {
+  const lstat = (file: fs.PathLike): fs.Stats | fs.BigIntStats =>
+    options.lstat
+      ? options.lstat(file)
+      : fs.lstatSync(file, { bigint: true })
+  type PathClassification =
+    | { state: 'missing' }
+    | {
+        state: 'regular'
+        identity: {
+          dev: string
+          ino: string
+          size: string
+          mtimeNs: string
+          ctimeNs: string
+        }
+      }
+    | { state: 'invalid'; detail: string }
+  const classifyPath = (
+    file: string
+  ): PathClassification => {
+    try {
+      const stat = lstat(file)
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        return { state: 'invalid', detail: 'path is not a regular non-symlink file' }
+      }
+      return {
+        state: 'regular',
+        identity: {
+          dev: String(stat.dev),
+          ino: String(stat.ino),
+          size: String(stat.size),
+          mtimeNs:
+            'mtimeNs' in stat
+              ? String(stat.mtimeNs)
+              : String(BigInt(Math.trunc(Number(stat.mtimeMs) * 1_000_000))),
+          ctimeNs:
+            'ctimeNs' in stat
+              ? String(stat.ctimeNs)
+              : String(BigInt(Math.trunc(Number(stat.ctimeMs) * 1_000_000))),
+        },
+      }
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') return { state: 'missing' }
+      return { state: 'invalid', detail: errorText(error) }
+    }
+  }
+  const main = classifyPath(journalPath)
+  if (main.state === 'invalid') {
+    return {
+      ok: false,
+      checks,
+      failure: {
+        code: 'database-validation-unavailable',
+        message: `The journal path could not be conclusively classified (${journalPath}): ${main.detail}`,
+        recovery:
+          'Do not attempt automatic recovery. Resolve the path, permission, or filesystem error and restart AllMyAgents.',
+      },
+    }
+  }
+  const sidecars = ['-wal', '-shm', '-journal'].map((suffix) => ({
+    suffix,
+    classification: classifyPath(`${journalPath}${suffix}`),
+  }))
+  const initialFamily = [
+    { file: journalPath, classification: main },
+    ...sidecars.map(({ suffix, classification }) => ({
+      file: `${journalPath}${suffix}`,
+      classification,
+    })),
+  ]
+  const familyChange = (allowEmptyDerivedSidecars = false): string | undefined => {
+    for (const expected of initialFamily) {
+      const actual = classifyPath(expected.file)
+      if (actual.state !== expected.classification.state) {
+        if (
+          allowEmptyDerivedSidecars &&
+          expected.classification.state === 'missing' &&
+          actual.state === 'regular' &&
+          (expected.file.endsWith('-wal') || expected.file.endsWith('-shm'))
+        ) {
+          continue
+        }
+        return `${expected.file} changed from ${expected.classification.state} to ${actual.state}`
+      }
+      if (
+        actual.state === 'regular' &&
+        expected.classification.state === 'regular' &&
+        (actual.identity.dev !== expected.classification.identity.dev ||
+          actual.identity.ino !== expected.classification.identity.ino)
+      ) {
+        return `${expected.file} filesystem identity changed`
+      }
+      if (actual.state === 'invalid') {
+        return `${expected.file} became unverifiable: ${actual.detail}`
+      }
+    }
+    return undefined
+  }
+  const invalidSidecar = sidecars.find(({ classification }) => classification.state === 'invalid')
+  if (invalidSidecar?.classification.state === 'invalid') {
+    return {
+      ok: false,
+      checks,
+      failure: {
+        code: 'database-validation-unavailable',
+        message: `A SQLite sidecar could not be conclusively classified (${journalPath}${invalidSidecar.suffix}): ${invalidSidecar.classification.detail}`,
+        recovery:
+          'Do not attempt automatic recovery. Resolve the path, permission, or filesystem error and restart AllMyAgents.',
+      },
+    }
+  }
+  if (main.state === 'missing') {
+    const orphanSidecars = sidecars
+      .filter(({ classification }) => classification.state === 'regular')
+      .map(({ suffix }) => suffix)
+    if (orphanSidecars.length > 0) {
+      return {
+        ok: false,
+        checks,
+        failure: {
+          code: 'database-orphan-family',
+          message: `The main journal is missing while SQLite sidecars remain (${orphanSidecars.join(', ')}).`,
+          recovery:
+            'Keep the orphaned SQLite family for evidence. AllMyAgents may restore only an identity-bound verified recovery generation; otherwise it stays offline.',
+          recoveryCause: 'orphan-family',
+        },
+      }
+    }
     checks.push({
       name: 'database-schema',
       status: 'skipped',
@@ -139,11 +441,83 @@ export function runHubPreflight(options: {
     return { ok: true, checks }
   }
 
+  const wal = sidecars.find(({ suffix }) => suffix === '-wal')
+  if (wal?.classification.state === 'regular') {
+    const validation = validateWalFile(`${journalPath}-wal`)
+    if (validation.status === 'corrupt') {
+      return {
+        ok: false,
+        checks,
+        failure: {
+          code: options.stableFamily
+            ? 'database-corrupt'
+            : 'database-validation-unavailable',
+          message: `The journal WAL failed bounded read-only validation (${journalPath}-wal): ${validation.detail}`,
+          recovery: options.stableFamily
+            ? 'Keep the damaged SQLite family for evidence. AllMyAgents may restore only an identity-bound verified recovery generation; otherwise it stays offline.'
+            : 'Stop shared-root processes and run the exclusive isolated-family classifier. This concurrent scan is suspicion only and does not authorize mutation.',
+          ...(options.stableFamily ? { recoveryCause: 'sqlite-corruption' as const } : {}),
+        },
+      }
+    }
+    if (validation.status === 'unavailable') {
+      return {
+        ok: false,
+        checks,
+        failure: {
+          code: 'database-validation-unavailable',
+          message: `The journal WAL could not be conclusively validated read-only (${journalPath}-wal): ${validation.detail}`,
+          recovery:
+            'Do not attempt automatic recovery. Preserve the SQLite family and resolve the sidecar, permission, or filesystem ambiguity.',
+        },
+      }
+    }
+  }
+  const shm = sidecars.find(({ suffix }) => suffix === '-shm')
+  if (options.stableFamily && shm?.classification.state === 'regular') {
+    const bytes = BigInt(shm.classification.identity.size)
+    if (bytes === 0n || bytes % 32_768n !== 0n) {
+      return {
+        ok: false,
+        checks,
+        failure: {
+          code: 'database-validation-unavailable',
+          message: `The journal shared-memory sidecar has an unverifiable size (${journalPath}-shm): ${bytes} bytes`,
+          recovery:
+            'Do not attempt automatic recovery. Preserve the SQLite family and resolve the derived shared-memory ambiguity.',
+        },
+      }
+    }
+  }
+  const beforeOpenChange = familyChange()
+  if (beforeOpenChange) {
+    return {
+      ok: false,
+      checks,
+      failure: {
+        code: 'database-validation-unavailable',
+        message: `The SQLite family changed before read-only validation: ${beforeOpenChange}`,
+        recovery:
+          'Do not attempt automatic recovery. Stop concurrent mutation and restart from a stable data root.',
+      },
+    }
+  }
+
   const databaseStarted = performance.now()
   let db: Database.Database | undefined
   let schemaChecked = false
+  let result: HubPreflightResult
   try {
-    db = new Database(journalPath, { readonly: true, fileMustExist: true })
+    db =
+      options.openReadonly?.(journalPath) ??
+      new Database(journalPath, { readonly: true, fileMustExist: true })
+    const afterOpenChange = familyChange(true)
+    if (afterOpenChange) {
+      throw Object.assign(
+        new Error(`SQLite family changed while opening read-only: ${afterOpenChange}`),
+        { code: 'AMA_PATH_IDENTITY_CHANGED' }
+      )
+    }
     db.pragma('query_only = ON')
     db.pragma('busy_timeout = 1000')
 
@@ -156,7 +530,7 @@ export function runHubPreflight(options: {
       durationMs: elapsed(databaseStarted),
     })
     if (storedVersion > schemaVersion) {
-      return {
+      result = {
         ok: false,
         checks,
         failure: {
@@ -166,55 +540,117 @@ export function runHubPreflight(options: {
             'Reinstall a hub version compatible with this database, or restore a backup created by this older version. Do not lower user_version by hand.',
         },
       }
-    }
-
-    const integrityStarted = performance.now()
-    const rows = db.pragma('integrity_check') as Array<Record<string, unknown>>
-    const findings = rows.flatMap((row) => Object.values(row).map(String))
-    if (findings.length !== 1 || findings[0]?.toLowerCase() !== 'ok') {
-      return {
-        ok: false,
-        checks,
-        failure: {
-          code: 'database-corrupt',
-          message: `The journal failed PRAGMA integrity_check: ${findings.join('; ') || 'SQLite returned no result'}`,
-          recovery:
-            'Keep the damaged hub.db for recovery, then restore a known-good backup or move it aside and restart to create an empty journal.',
-        },
+    } else {
+      const integrityStarted = performance.now()
+      const rows = db.pragma('integrity_check') as Array<Record<string, unknown>>
+      const findings = rows.flatMap((row) => Object.values(row).map(String))
+      if (findings.length !== 1 || findings[0]?.toLowerCase() !== 'ok') {
+        result = {
+          ok: false,
+          checks,
+          failure: {
+            code: 'database-corrupt',
+            message: `The journal failed PRAGMA integrity_check: ${findings.join('; ') || 'SQLite returned no result'}`,
+            recovery:
+              'Keep the damaged SQLite family for evidence. AllMyAgents may restore only an identity-bound verified recovery generation; otherwise it stays offline.',
+            recoveryCause: 'sqlite-corruption',
+          },
+        }
+      } else {
+        const invalidPayload = db
+          .prepare('SELECT seq FROM events WHERE json_valid(payload) = 0 ORDER BY seq LIMIT 1')
+          .get() as { seq?: unknown } | undefined
+        if (invalidPayload) {
+          result = {
+            ok: false,
+            checks,
+            failure: {
+              code: 'database-corrupt',
+              message: `The journal contains invalid JSON in event sequence ${String(invalidPayload.seq)}.`,
+              recovery:
+                'Keep the damaged SQLite family for evidence. AllMyAgents may restore only an identity-bound verified recovery generation; otherwise it stays offline.',
+              recoveryCause: 'sqlite-corruption',
+            },
+          }
+        } else {
+          checks.push({
+            name: 'database-integrity',
+            status: 'passed',
+            detail: 'ok; event payload JSON is valid',
+            durationMs: elapsed(integrityStarted),
+          })
+          result = { ok: true, checks }
+        }
       }
     }
-    checks.push({
-      name: 'database-integrity',
-      status: 'passed',
-      detail: 'ok',
-      durationMs: elapsed(integrityStarted),
-    })
   } catch (error) {
     const failure = corruptionFailure(error, journalPath)
-    if (failure) return { ok: false, checks, failure }
-    if (!schemaChecked) {
+    if (failure) {
+      result = { ok: false, checks, failure }
+    } else {
+      if (!schemaChecked) {
+        checks.push({
+          name: 'database-schema',
+          status: 'skipped',
+          detail: `read-only check was unavailable: ${errorText(error)}`,
+          durationMs: elapsed(databaseStarted),
+        })
+      }
       checks.push({
-        name: 'database-schema',
+        name: 'database-integrity',
         status: 'skipped',
         detail: `read-only check was unavailable: ${errorText(error)}`,
         durationMs: elapsed(databaseStarted),
       })
-    }
-    checks.push({
-      name: 'database-integrity',
-      status: 'skipped',
-      detail: `read-only check was unavailable: ${errorText(error)}`,
-      durationMs: elapsed(databaseStarted),
-    })
-  } finally {
-    try {
-      db?.close()
-    } catch {
-      /* a read-only preflight cleanup cannot make a healthy hub fail to boot */
+      result = {
+        ok: false,
+        checks,
+        failure: {
+          code: 'database-validation-unavailable',
+          message: `The journal could not be conclusively validated read-only (${journalPath}): ${errorText(error)}`,
+          recovery:
+            'Do not attempt automatic recovery. Resolve the lock, I/O, disk, permission, or SQLite error and restart AllMyAgents.',
+        },
+      }
     }
   }
-
-  return { ok: true, checks }
+  let closeFailed = false
+  try {
+    db?.close()
+  } catch (error) {
+    closeFailed = true
+    result = {
+      ok: false,
+      checks,
+      failure: {
+        code: 'database-validation-unavailable',
+        message: `The journal read-only validation handle could not be closed (${journalPath}): ${errorText(error)}`,
+        recovery:
+          'Do not attempt automatic recovery. The validating process must exit so the OS closes the uncertain handle before a supervisor may retry.',
+      },
+    }
+  }
+  if (!closeFailed && db?.open) {
+    try {
+      db.close()
+    } catch {
+      /* the first close failure is already the typed result */
+    }
+  }
+  const afterCloseChange = familyChange(true)
+  if (afterCloseChange) {
+    result = {
+      ok: false,
+      checks,
+      failure: {
+        code: 'database-validation-unavailable',
+        message: `The SQLite family changed during read-only validation: ${afterCloseChange}`,
+        recovery:
+          'Do not attempt automatic recovery. Stop concurrent mutation and restart from a stable data root.',
+      },
+    }
+  }
+  return result
 }
 
 export function recordSchemaVersion(db: Database.Database, schemaVersion: number): void {

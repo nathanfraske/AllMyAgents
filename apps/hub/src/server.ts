@@ -38,6 +38,10 @@ import { AttachmentInputError, attachmentLimitForMime, isClaudeImageMime } from 
 import { GitHubImportService } from './githubImport.js'
 import { classifyWorkspacePath, type WorkspacePath } from './workspaceLocation.js'
 import { WslService } from './wsl.js'
+import {
+  dismissRecoveryNotice,
+  listRecoveryNotices,
+} from './journalRecovery.js'
 
 const PAGE = `<!doctype html>
 <html>
@@ -1200,6 +1204,28 @@ export function startServer(opts: ServerOptions): http.Server {
       }
       if (method === 'GET' && url.pathname === '/api/questions') {
         json(res, questions.pending())
+        return
+      }
+      if (method === 'GET' && url.pathname === '/api/recovery-notices') {
+        json(res, listRecoveryNotices(journal.db))
+        return
+      }
+      const recoveryNoticeMatch =
+        /^\/api\/recovery-notices\/([^/]+)\/dismiss$/.exec(url.pathname)
+      if (method === 'POST' && recoveryNoticeMatch) {
+        let planId: string
+        try {
+          const rawPlanId = recoveryNoticeMatch[1]!
+          if (rawPlanId.length > 128) throw new Error('recovery notice id is too long')
+          planId = decodeURIComponent(rawPlanId)
+          if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(planId)) {
+            throw new Error('recovery notice id is not a UUID')
+          }
+        } catch {
+          throw new BadRequestError('recovery notice id is malformed')
+        }
+        const found = dismissRecoveryNotice(journal.db, planId)
+        json(res, found ? { ok: true } : { error: 'recovery notice not found' }, found ? 200 : 404)
         return
       }
       if (method === 'GET' && url.pathname === '/api/usage') {

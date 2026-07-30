@@ -10,6 +10,8 @@
  */
 import http from 'node:http'
 import type { ChildProcess } from 'node:child_process'
+import type { AutomaticRecoveryCause } from './journalRecovery.js'
+import type { PreflightFailure } from './preflight.js'
 
 /** Bump when a hub change is incompatible with an older on-disk schema (Phase 3 migration guard). */
 export const SCHEMA_VERSION = 1
@@ -70,8 +72,97 @@ export type HubMsg =
    *
    * `recovery` is operator-facing guidance, not a log line — it is the sentence the desktop shell shows.
    */
-  | { type: 'preflight-failed'; code: string; message: string; recovery: string }
+  | {
+      type: 'preflight-failed'
+      code: string
+      message: string
+      recovery: string
+      recoveryCause?: NonNullable<PreflightFailure['recoveryCause']>
+    }
   | { type: 'restart-request'; reason: string; bySession?: string } // hub asks the supervisor to flip
+
+export type PreflightRefusal = Extract<HubMsg, { type: 'preflight-failed' }>
+
+export function validatedAutomaticRecoveryCause(
+  refusal: PreflightRefusal
+): AutomaticRecoveryCause | undefined {
+  if (refusal.code === 'database-corrupt' && refusal.recoveryCause === 'sqlite-corruption') {
+    return refusal.recoveryCause
+  }
+  if (
+    refusal.code === 'database-orphan-family' &&
+    refusal.recoveryCause === 'orphan-family'
+  ) {
+    return refusal.recoveryCause
+  }
+  return undefined
+}
+
+export class PreflightRefusalError extends Error {
+  readonly refusal: PreflightRefusal
+  readonly automaticRecoveryCause: AutomaticRecoveryCause | undefined
+
+  constructor(refusal: PreflightRefusal) {
+    super(`preflight refused to boot [${refusal.code}]: ${refusal.message} — ${refusal.recovery}`)
+    this.name = 'PreflightRefusalError'
+    this.refusal = refusal
+    this.automaticRecoveryCause = validatedAutomaticRecoveryCause(refusal)
+  }
+}
+
+export class MalformedPreflightRefusalError extends Error {
+  constructor() {
+    super('hub sent a malformed preflight refusal')
+    this.name = 'MalformedPreflightRefusalError'
+  }
+}
+
+function boundedIpcText(
+  value: unknown,
+  label: string,
+  maxLength: number,
+  allowNewline: boolean
+): string {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value.length > maxLength ||
+    value.includes('\0') ||
+    (allowNewline ? /[\u0001-\u0008\u000b\u000c\u000e-\u001f\u007f]/ : /[\u0000-\u001f\u007f]/).test(
+      value
+    )
+  ) {
+    throw new MalformedPreflightRefusalError()
+  }
+  return value
+}
+
+function parsePreflightRefusal(value: unknown): PreflightRefusal {
+  const raw =
+    value !== null && typeof value === 'object'
+      ? (value as Record<string, unknown>)
+      : undefined
+  if (!raw || raw.type !== 'preflight-failed') throw new MalformedPreflightRefusalError()
+  const code = boundedIpcText(raw.code, 'code', 128, false)
+  const message = boundedIpcText(raw.message, 'message', 4096, true)
+  const recovery = boundedIpcText(raw.recovery, 'recovery', 4096, true)
+  const cause = raw.recoveryCause
+  if (
+    cause !== undefined &&
+    cause !== 'sqlite-corruption' &&
+    cause !== 'orphan-family' &&
+    cause !== 'lineage-rollback'
+  ) {
+    throw new MalformedPreflightRefusalError()
+  }
+  return {
+    type: 'preflight-failed',
+    code,
+    message,
+    recovery,
+    ...(cause !== undefined ? { recoveryCause: cause } : {}),
+  }
+}
 
 export function sendToHub(child: ChildProcess, msg: SupervisorMsg): void {
   child.send?.(msg)
@@ -130,8 +221,11 @@ export function waitForHubMsg<T extends HubMsg['type']>(
         // exact log line the operator saw while a corrupt database sat undiagnosed. The hub already knows
         // both what is wrong and what would fix it; carry that instead of throwing it away.
         cleanup()
-        const p = m as { code?: string; message?: string; recovery?: string }
-        reject(new Error(`preflight refused to boot [${p.code ?? 'unknown'}]: ${p.message ?? ''} — ${p.recovery ?? ''}`))
+        try {
+          reject(new PreflightRefusalError(parsePreflightRefusal(m)))
+        } catch (error) {
+          reject(error)
+        }
       }
     }
     const onExit = (): void => {

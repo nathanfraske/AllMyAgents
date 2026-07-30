@@ -28,6 +28,8 @@ vi.mock('./api', () => {
       })),
       approvals: vi.fn(async () => []),
       questions: vi.fn(async () => []),
+      recoveryNotices: vi.fn(async () => []),
+      dismissRecoveryNotice: vi.fn(ok),
       usage: vi.fn(async () => []),
       sessions: vi.fn(async () => []),
       spawn: vi.fn(async () => rec('spawned')),
@@ -105,6 +107,8 @@ beforeEach(() => {
   store.profiles = []
   store.projects = []
   store.approvals = []
+  store.questions = []
+  store.recoveryNotices = []
   store.usage = []
   store.prefs = { chatNamePool: 'everyone', steerMessagesAtToolBoundary: true }
   store.dragSession = null
@@ -574,6 +578,28 @@ describe('apply()', () => {
       expect(text).not.toContain(absent)
     }
   )
+})
+
+describe('global recovery notice replay', () => {
+  it('refreshes the durable banner after journal/recovered replay without a page reload', async () => {
+    vi.useFakeTimers()
+    const notice = {
+      planId: '11111111-1111-4111-8111-111111111111',
+      generation: '7',
+      snapshotMaxSeq: '40',
+      snapshotEventHighWater: '44',
+      quarantineDir: 'C:\\evidence\\incident',
+      recordedAt: '2026-07-29T00:00:00.000Z',
+    }
+    vi.mocked(api.recoveryNotices).mockResolvedValueOnce([notice])
+
+    apply(evt({ seq: 1, kind: 'journal/recovered', sessionId: null }))
+    await vi.advanceTimersByTimeAsync(301)
+
+    expect(api.recoveryNotices).toHaveBeenCalled()
+    expect(store.recoveryNotices).toEqual([notice])
+    vi.useRealTimers()
+  })
 })
 
 // --- cross-restart UI-state persistence -----------------------------------------------------

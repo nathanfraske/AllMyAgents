@@ -20,6 +20,9 @@ import crypto from 'node:crypto'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import {
   HUB_DRAIN_RELEASE_TIMEOUT_MS,
+  MalformedPreflightRefusalError,
+  PreflightRefusalError,
+  SCHEMA_VERSION,
   sendToHub,
   waitForHubMsg,
   healthCheck,
@@ -31,7 +34,9 @@ import {
   abandonLiveForRevival,
   FlipRecoveryTracker,
   rollbackToBlue,
+  waitForPortRelease,
 } from './restartRollback.js'
+import { bootstrapJournalRecovery } from './journalRecovery.js'
 
 /** The hard public singleton the web client hardcodes (`api.ts:145`). Blue owns it; green takes it on promote.
  *  HUB_FIXED_PORT overrides it for an isolated harness (e.g. the restart-survival acceptance test) so a
@@ -93,9 +98,44 @@ let restartListener: ((m: unknown) => void) | null = null
 let workerHandle: ChildProcess | null = null
 /** Set while a signal/fatal teardown is killing the tree, so the worker's exit handler doesn't respawn. */
 let tearingDown = false
+/** Poison latch: while true no old hub/worker may be revived against a root under recovery review. */
+let recoveryPoisoned = false
+let recoveryInFlight: Promise<void> | undefined
+let recoveryOfflineHold: ReturnType<typeof setInterval> | undefined
 
 function log(msg: string): void {
   console.log(`[hubctl] ${msg}`)
+}
+
+function recoveryPolicyForFailure(
+  error: unknown,
+  child: ChildProcess
+): RecoveryTriggerPolicy | 'ordinary' {
+  if (error instanceof PreflightRefusalError) {
+    if (error.refusal.code === 'question-owner-activation-failed') return 'ordinary'
+    if (error.refusal.code === 'database-validation-unavailable') {
+      // This refusal is not mutation authority. It only routes to the poison path where every
+      // shared-root process is stopped and an isolated, stable family copy is classified once.
+      return 'automatic'
+    }
+    if (
+      error.refusal.code === 'database-lineage-invalid' &&
+      error.refusal.recoveryCause === 'lineage-rollback'
+    ) {
+      // A crash may have published an authorized fallback while its exact active plan still needs
+      // completion. The poison path may resume that plan; this refusal alone never authorizes bytes.
+      return 'automatic'
+    }
+    return error.automaticRecoveryCause ? 'automatic' : 'offline-only'
+  }
+  if (child.exitCode === 78) return 'automatic'
+  if (error instanceof MalformedPreflightRefusalError) {
+    // The malformed frame is never authority to mutate. The "automatic" path first kills every
+    // shared-root process, takes exclusive ownership, and independently classifies an isolated exact
+    // family copy. Only that closed classifier can authorize sqlite-corruption/orphan-family recovery.
+    return 'automatic'
+  }
+  return 'ordinary'
 }
 
 /**
@@ -163,8 +203,10 @@ function spawnHub(port: number, color: HubColor): HubHandle {
     // same shape the agent worker above already uses.
     if (!expected && live === handle) {
       clearLiveHandle(handle)
-      const recovery = flipRecovery.noteUnexpectedLiveExit(flipInFlight)
-      if (recovery === 'revive-now') void reviveLiveHub()
+      if (!recoveryPoisoned) {
+        const recovery = flipRecovery.noteUnexpectedLiveExit(flipInFlight)
+        if (recovery === 'revive-now') void reviveLiveHub()
+      }
     }
   })
   return handle
@@ -191,8 +233,8 @@ function workerLaunchCommand(): { cmd: string; args: string[] } {
  * semantics — re-attach across a WORKER restart is out of scope here). Only called in worker mode, so
  * `workerSocket` is defined (guarded regardless).
  */
-function spawnWorker(): void {
-  if (!workerSocket) return
+function spawnWorker(): ChildProcess | undefined {
+  if (!workerSocket) return undefined
   const { cmd, args } = workerLaunchCommand()
   // The worker relays browser calls back to the hub and never talks to the
   // desktop bridge itself. Do not let the bridge secret flow through the
@@ -219,9 +261,15 @@ function spawnWorker(): void {
     children.delete(child)
     const wasCurrent = workerHandle === child
     if (wasCurrent) workerHandle = null
-    log(`worker exited (code=${code ?? 'null'} signal=${signal ?? 'null'})${tearingDown ? '' : ' — respawning'}`)
-    if (!tearingDown && wasCurrent) spawnWorker()
+    const shouldRespawn = !tearingDown && !recoveryPoisoned
+    log(
+      `worker exited (code=${code ?? 'null'} signal=${signal ?? 'null'})${
+        shouldRespawn ? ' — respawning' : ''
+      }`
+    )
+    if (shouldRespawn && wasCurrent) spawnWorker()
   })
+  return child
 }
 
 /**
@@ -271,7 +319,7 @@ async function hubAnswersHealth(port: number, timeoutMs = 3_000): Promise<boolea
 }
 
 async function reviveLiveHub(): Promise<void> {
-  if (reviving || tearingDown) return
+  if (reviving || tearingDown || recoveryPoisoned) return
   reviving = true
   try {
     for (;;) {
@@ -324,6 +372,13 @@ async function reviveLiveHub(): Promise<void> {
         // spawning another accumulates siblings that then make every later attempt fail for a *different*
         // reason than the original one — a self-inflicted crash loop layered on top of the real fault.
         if (candidate) killTree(candidate.child)
+        if (candidate) {
+          const policy = recoveryPolicyForFailure(err, candidate.child)
+          if (policy !== 'ordinary') {
+            await enterRecoveryPoison(`revived blue preflight: ${String(err)}`, [candidate], policy)
+            return
+          }
+        }
         log(`respawn attempt ${consecutiveFailures} failed: ${String(err)}`)
         // loop and try again after a longer wait
       }
@@ -414,6 +469,132 @@ async function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise
   })
 }
 
+function childIsRunning(child: ChildProcess | null): boolean {
+  return child !== null && child.exitCode === null && child.signalCode === null
+}
+
+type RecoveryTriggerPolicy = 'automatic' | 'offline-only'
+
+function enterRecoveryPoison(
+  reason: string,
+  implicated: HubHandle[],
+  policy: RecoveryTriggerPolicy
+): Promise<void> {
+  if (recoveryInFlight) return recoveryInFlight
+  recoveryPoisoned = true
+  recoveryOfflineHold ??= setInterval(() => {
+    // Intentionally ref'ed: an offline poisoned supervisor must remain present so the desktop cannot
+    // relaunch a second supervisor against an unresolved root. Recovery is operator-visible in logs;
+    // there is deliberately no hot retry or repeated byte mutation.
+  }, 60_000)
+  const operationId = crypto.randomUUID()
+  const task = (async () => {
+    log(`journal recovery poison latched (${reason}); operation=${operationId}`)
+    for (const handle of implicated) handle.state = 'retired'
+    if (live) clearLiveHandle(live)
+    const victims = [...children]
+    for (const child of victims) killTree(child)
+    await Promise.all(victims.map((child) => waitForChildExit(child, 10_000)))
+    if (workerHandle && (workerHandle.exitCode === null && workerHandle.signalCode === null)) {
+      throw new Error('old worker generation did not exit')
+    }
+    workerHandle = null
+    await waitForPortRelease(FIXED_PORT, 10_000)
+    if (policy !== 'automatic') {
+      throw new Error('preflight refusal is not eligible for automatic recovery; root remains offline')
+    }
+
+    const recovery = bootstrapJournalRecovery({
+      dataDir,
+      journalPath: path.join(dataDir, 'hub.db'),
+      schemaVersion: SCHEMA_VERSION,
+      operationId,
+    })
+    try {
+      if (!recovery.preflight.ok) {
+        throw new Error(
+          `independent recovery classifier refused [${recovery.preflight.failure.code}]: ${recovery.preflight.failure.message}`
+        )
+      }
+      if (!recovery.recovery) {
+        log('independent copied-family classifier found no recoverable corruption; attempting one fresh normal boot')
+      } else {
+        log(
+          `recovery operation ${operationId} restored generation ${recovery.recovery.generation}; quarantine=${recovery.recovery.quarantineDir}`
+        )
+      }
+    } finally {
+      recovery.lease.release()
+    }
+
+    let freshWorker: ChildProcess | null = null
+    let freshBlue: HubHandle | undefined
+    try {
+      if (workerSocket) {
+        freshWorker = spawnWorker() ?? null
+        if (
+          !freshWorker ||
+          freshWorker.exitCode !== null ||
+          freshWorker.signalCode !== null
+        ) {
+          throw new Error('fresh worker generation did not remain alive for recovery reboot')
+        }
+      }
+      freshBlue = spawnHub(FIXED_PORT, 'blue')
+      const ready = await waitForHubMsg(freshBlue.child, 'ready', 20_000)
+      freshBlue.port = ready.port
+      freshBlue.restored = ready.restored
+      await healthCheck(freshBlue.port, { expectRestored: freshBlue.restored })
+      await journalBackupOwnership.activateInitialBlueAfterHealth(freshBlue.child)
+      if (
+        workerSocket &&
+        (!freshWorker ||
+          workerHandle !== freshWorker ||
+          !childIsRunning(freshWorker))
+      ) {
+        throw new Error('fresh worker generation died before recovery reboot committed')
+      }
+      setLive(freshBlue)
+      // This synchronous handoff is the generation fence. Once poison clears, an exit callback for
+      // the verified fresh worker is permitted to respawn it. There is no await between the final
+      // generation check, publishing the live hub, and clearing the latch, so an exit cannot be
+      // observed in the old "suppressed forever" policy window.
+      recoveryPoisoned = false
+      if (workerSocket && !childIsRunning(workerHandle)) {
+        freshWorker = spawnWorker() ?? null
+        if (!childIsRunning(freshWorker)) {
+          recoveryPoisoned = true
+          clearLiveHandle(freshBlue)
+          throw new Error('fresh worker generation could not be committed after recovery')
+        }
+      }
+      if (recoveryOfflineHold) {
+        clearInterval(recoveryOfflineHold)
+        recoveryOfflineHold = undefined
+      }
+      recoveryInFlight = undefined
+      log(`recovery reboot committed on :${freshBlue.port}; operation=${operationId}`)
+    } catch (error) {
+      if (freshBlue) {
+        freshBlue.state = 'retired'
+        killTree(freshBlue.child)
+        await waitForChildExit(freshBlue.child, 10_000).catch(() => {})
+      }
+      if (freshWorker) {
+        killTree(freshWorker)
+        await waitForChildExit(freshWorker, 10_000).catch(() => {})
+      }
+      throw error
+    }
+  })().catch((error: unknown) => {
+    log(
+      `journal recovery remains visibly OFFLINE; operation=${operationId}; ${error instanceof Error ? error.message : String(error)}`
+    )
+  })
+  recoveryInFlight = task
+  return task
+}
+
 /** Ask a hub to retire, then hard-kill its tree if it hasn't exited within `graceMs`. Non-blocking. */
 function reap(handle: HubHandle, graceMs: number): void {
   const child = handle.child
@@ -446,9 +627,18 @@ async function boot(): Promise<void> {
     setLive(blue)
     log(`hub (blue) live on :${blue.port} — ${blue.restored} session(s) restored (schema v${ready.schemaVersion})`)
   } catch (error) {
+    const recoveryPolicy = recoveryPolicyForFailure(error, blue.child)
     // Activation may have applied even if its acknowledgement was lost. Kill this provisional owner
     // before the retry loop can consider another process for the shared backup directory.
     killTree(blue.child)
+    if (recoveryPolicy !== 'ordinary') {
+      await enterRecoveryPoison(
+        `initial blue preflight: ${String(error)}`,
+        [blue],
+        recoveryPolicy
+      )
+      return
+    }
     throw error
   }
 }
@@ -460,6 +650,10 @@ async function boot(): Promise<void> {
  * has both the listener and backup ownership the flip has committed; later cleanup errors never roll back.
  */
 async function restart(reason: string): Promise<void> {
+  if (recoveryPoisoned) {
+    log(`restart ignored while journal recovery is latched offline: ${reason}`)
+    return
+  }
   if (flipInFlight) {
     log(`restart ignored (already flipping): ${reason}`)
     return
@@ -516,6 +710,15 @@ async function restart(reason: string): Promise<void> {
     reap(blue, 3_000) // ...or kill blue's tree if it doesn't exit in 3s
     log('blue retiring')
   } catch (err) {
+    const recoveryPolicy = recoveryPolicyForFailure(err, green.child)
+    if (!committed && recoveryPolicy !== 'ordinary') {
+      await enterRecoveryPoison(
+        `green preflight during restart: ${String(err)}`,
+        [blue, green],
+        recoveryPolicy
+      )
+      return
+    }
     if (committed) {
       // Green already owns 7777 (the flip committed) — a failure here is post-flip cleanup, NOT a
       // rollback trigger. Tearing green down now would leave 7777 dead; just surface it.
@@ -561,13 +764,17 @@ async function restart(reason: string): Promise<void> {
     }
   } finally {
     flipInFlight = false
-    if (flipRecovery.finishFlip(live !== null)) void reviveLiveHub()
+    if (!recoveryPoisoned && flipRecovery.finishFlip(live !== null)) void reviveLiveHub()
   }
 }
 
 /** On a shell signal, tear down every hub tree and exit. (The desktop shell also taskkills our tree.) */
 function teardown(signal: NodeJS.Signals): void {
   tearingDown = true // stop the worker's exit handler from respawning it into a teardown
+  if (recoveryOfflineHold) {
+    clearInterval(recoveryOfflineHold)
+    recoveryOfflineHold = undefined
+  }
   log(`${signal} — tearing down hub(s) and exiting`)
   for (const child of children) killTree(child)
   process.exit(0)

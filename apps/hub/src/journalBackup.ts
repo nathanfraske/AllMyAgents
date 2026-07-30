@@ -7,6 +7,11 @@ import type {
   JournalBackupControlResult,
 } from './restartHandshake.js'
 import { JournalBackupLease } from './journalBackupLease.js'
+import {
+  ensureRecoveryEnrollment,
+  publishRecoveryGeneration,
+} from './journalRecovery.js'
+import { SCHEMA_VERSION } from './restartHandshake.js'
 
 /**
  * Periodic, verified snapshots of the journal.
@@ -54,6 +59,12 @@ export interface JournalBackupOptions {
   shutdownWaitMs?: number
   /** Surfaces intentional inactivity and activation failures through hub health. */
   onStateChange?: (state: JournalBackupRuntimeState) => void
+  /**
+   * Healthy installed hubs set this to their data root. The compatibility flat file and the owned,
+   * identity-bound generation become hard links to one verified inode, avoiding doubled retention.
+   */
+  recoveryDataDir?: string
+  recoveryKeep?: number
 }
 
 const DEFAULT_INTERVAL_MS = 30 * 60 * 1000
@@ -69,6 +80,7 @@ export interface SnapshotResult {
   file?: string
   bytes?: number
   error?: string
+  recoveryGeneration?: string
 }
 
 export type JournalBackupRuntimeState =
@@ -112,6 +124,15 @@ export async function snapshotJournal(
   const target = path.join(options.dir, `${generation}${SUFFIX}`)
   const partial = path.join(options.dir, `${generation}${PARTIAL_SUFFIX}`)
   let sourceHadEvents = false
+  if (options.recoveryDataDir) {
+    try {
+      ensureRecoveryEnrollment(db, options.recoveryDataDir)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      log(`[journal-backup] recovery enrollment FAILED: ${message}`)
+      return { ok: false, error: message }
+    }
+  }
   if (!options.verify) {
     try {
       // Capture the weakest useful source invariant before the online backup starts. An empty source is
@@ -180,8 +201,31 @@ export async function snapshotJournal(
     return { ok: false, error: message }
   }
   log(`[journal-backup] verified snapshot ${path.basename(target)} (${(bytes / 1_048_576).toFixed(1)} MB)`)
+  let recoveryGeneration: string | undefined
+  if (options.recoveryDataDir) {
+    try {
+      const generation = publishRecoveryGeneration({
+        dataDir: options.recoveryDataDir,
+        snapshotFile: target,
+        maxSchemaVersion: SCHEMA_VERSION,
+        keep: options.recoveryKeep ?? options.keep ?? DEFAULT_KEEP,
+      })
+      recoveryGeneration = generation.manifest.generation
+      log(
+        `[journal-backup] enrolled recovery generation ${recoveryGeneration} for journal ${generation.manifest.journalId}`
+      )
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      log(`[journal-backup] recovery generation FAILED: ${message}`)
+      // The compatibility flat file remains operator evidence, but it is intentionally NOT recovery
+      // eligible. Keep it inside the same bounded retention budget rather than accumulating a second,
+      // unbounded failure stream, and surface degraded state so self-heal is never silently assumed.
+      rotate(options.dir, options.keep ?? DEFAULT_KEEP, log)
+      return { ok: false, file: target, bytes, error: message }
+    }
+  }
   rotate(options.dir, options.keep ?? DEFAULT_KEEP, log)
-  return { ok: true, file: target, bytes }
+  return { ok: true, file: target, bytes, ...(recoveryGeneration ? { recoveryGeneration } : {}) }
 }
 
 function hasAnyEvents(db: Pick<Database.Database, 'prepare'>): boolean {
