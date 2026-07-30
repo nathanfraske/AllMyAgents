@@ -4,6 +4,7 @@ import path from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { WebSocketServer, WebSocket } from 'ws'
 import type { ApprovalService } from './approvals.js'
+import { parseQuestionDecisionBody, QuestionInputError, QuestionService } from './questions.js'
 import type { Journal } from './journal.js'
 import type { ProjectStore } from './projects.js'
 import type { SessionManager } from './sessions.js'
@@ -359,6 +360,7 @@ export interface ServerOptions {
   sessions: SessionManager
   profiles: Profile[]
   approvals: ApprovalService
+  questions?: QuestionService
   usage: UsageMonitor
   projects: ProjectStore
   workspace: WorkspaceManager
@@ -459,6 +461,7 @@ export function persistPrefs(
 
 export function startServer(opts: ServerOptions): http.Server {
   const { port, defaultCwd, profilesDir, journal, sessions, profiles, approvals, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity } = opts
+  const questions = opts.questions ?? new QuestionService(journal)
   const profileOwnership = opts.profileOwnership ?? new ProfileOwnership({
     ownerId: `server-${process.pid}`,
     pid: process.pid,
@@ -1190,6 +1193,10 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, approvals.pending())
         return
       }
+      if (method === 'GET' && url.pathname === '/api/questions') {
+        json(res, questions.pending())
+        return
+      }
       if (method === 'GET' && url.pathname === '/api/usage') {
         json(res, usage.list())
         return
@@ -1345,6 +1352,15 @@ export function startServer(opts: ServerOptions): http.Server {
       if (method === 'POST' && approvalMatch) {
         const body = await readBody(req)
         const found = approvals.resolve(approvalMatch[1] as string, body.approve === true)
+        json(res, { ok: found }, found ? 200 : 404)
+        return
+      }
+      const questionMatch = /^\/api\/questions\/([^/]+)$/.exec(url.pathname)
+      if (method === 'POST' && questionMatch) {
+        const decision = parseQuestionDecisionBody(await readBody(req))
+        const found = decision.kind === 'cancel'
+          ? questions.cancel(questionMatch[1] as string)
+          : questions.answer(questionMatch[1] as string, decision.answers)
         json(res, { ok: found }, found ? 200 : 404)
         return
       }
@@ -1681,6 +1697,10 @@ export function startServer(opts: ServerOptions): http.Server {
         return
       }
       if (err instanceof AttachmentInputError) {
+        json(res, { error: err.message }, 400)
+        return
+      }
+      if (err instanceof QuestionInputError) {
         json(res, { error: err.message }, 400)
         return
       }

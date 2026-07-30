@@ -5,6 +5,7 @@ import path from 'node:path'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
 import { ApprovalService } from './approvals.js'
+import { QuestionService, resolveWorkerQuestion } from './questions.js'
 import {
   JOURNAL_CONDENSE_GRACE_MS,
   JOURNAL_CONDENSE_INTERVAL_MS,
@@ -218,6 +219,7 @@ for (const profile of profiles) {
 }
 const profileMap = new Map(profiles.map((p) => [p.id, p]))
 const approvals = new ApprovalService(journal)
+const questions = new QuestionService(journal)
 const usage = new UsageMonitor(journal, profiles, config)
 const workspace = new WorkspaceManager(path.join(dataDir, 'worktrees'), path.join(dataDir, 'workspaces'))
 const projects = new ProjectStore(journal.db)
@@ -283,12 +285,14 @@ const executor: Executor = workerSocket
       // the idempotent approvals.request(id) so a re-issue across a restart dedups (§7.2).
       runRelay: (method, args) => sessions.runRelay(method, args),
       resolveApproval: (approvalId, sessionId, kind, payload) => approvals.request(sessionId, kind, payload, approvalId),
+      resolveQuestion: (request) => resolveWorkerQuestion(questions, sessions.list(), request),
+      abortQuestion: (questionId, sessionId) => questions.abort(questionId, sessionId),
       // Step 5 (§6, §7.1): on every WorkerClient (re)connect, re-attach to the still-running worker and
       // replay the in-flight turn's event gap gap-free + exactly-once — so a mid-turn survives a hub restart.
       attachWorker: () => sessions.attachWorker(),
     })
-  : new InProcessExecutor({ approvals, usage, danger, memory, practices })
-sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, dataDir, executor, prefs, browserBroker)
+  : new InProcessExecutor({ approvals, questions, usage, danger, memory, practices })
+sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, dataDir, executor, prefs, browserBroker, questions)
 browserBroker.onNavigation((event) =>
   sessions.noteBrowserNavigation(event.sessionId, event.url, event.title, event.actor, event.ok, event.errorCode)
 )
@@ -528,7 +532,7 @@ const meshPeerPorts: number[] = Array.isArray(config.mesh?.peerPorts)
   : []
 
 // Listen on the BOOT port (0 → ephemeral for a green); the server reports its actual port back.
-const server = startServer({ port: bootPort, defaultCwd: dataDir, profilesDir, profileOwnership, journal, sessions, profiles, approvals, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity: (projectId) => worktreeCollisions.projectActivity(projectId) })
+const server = startServer({ port: bootPort, defaultCwd: dataDir, profilesDir, profileOwnership, journal, sessions, profiles, approvals, questions, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity: (projectId) => worktreeCollisions.projectActivity(projectId) })
 
 // Register the mesh advert — factored so a promoted green can (re)register once it owns the port.
 function registerMesh(): void {

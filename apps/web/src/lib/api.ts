@@ -320,6 +320,30 @@ export interface ApprovalRecord {
   createdAt: string
 }
 
+export interface QuestionOption {
+  label: string
+  description: string
+  /** Inert plain text only. The host never renders SDK preview content as HTML. */
+  preview?: string
+}
+
+export interface QuestionPrompt {
+  question: string
+  header: string
+  options: QuestionOption[]
+  multiSelect: boolean
+}
+
+export interface QuestionRecord {
+  id: string
+  sessionId: string
+  toolUseId: string
+  requestId: string
+  questions: QuestionPrompt[]
+  status: 'pending' | 'answered' | 'cancelled' | 'aborted'
+  createdAt: string
+}
+
 export interface ClaudeUsageLine {
   label: string
   percent: number
@@ -751,6 +775,7 @@ export const api = {
   history: (id: string, before?: number) =>
     jget<HistoryPage>(`/api/sessions/${id}/history${before != null ? `?before=${before}` : ''}`),
   approvals: () => jget<ApprovalRecord[]>('/api/approvals'),
+  questions: () => jget<QuestionRecord[]>('/api/questions'),
   usage: () => jget<UsageSnapshot[]>('/api/usage'),
   refreshUsage: () => jpost<UsageSnapshot[] | ApiError>('/api/usage/refresh'),
   // NOTE: spawn does NOT take `attachments`. Uploads are session-owned (their id is minted by the upload
@@ -871,6 +896,14 @@ export const api = {
   // Typed so a caller can tell an accepted decision (200 { ok:true }) from a 404/401/network failure
   // ({ error }) — the approval UI must NOT clear a pending prompt it never actually resolved.
   decide: (id: string, approve: boolean) => jpost<{ ok?: boolean; error?: string }>(`/api/approvals/${id}`, { approve }),
+  answerQuestion: (id: string, answers: Record<string, string>) =>
+    jpost<{ ok?: boolean; error?: string }>(`/api/questions/${encodeURIComponent(id)}`, {
+      answers,
+    }),
+  cancelQuestion: (id: string) =>
+    jpost<{ ok?: boolean; error?: string }>(`/api/questions/${encodeURIComponent(id)}`, {
+      cancel: true,
+    }),
   mesh: () => jget<MeshStatus>('/api/mesh'),
   revealDeviceToken: () => jpost<{ token?: string; error?: string }>('/api/device-token/reveal'),
   setMesh: (enable: boolean) => jpost<MeshStatus | ApiError>('/api/mesh', { enable }),

@@ -28,6 +28,7 @@
   import Icon from './Icon.svelte'
   import AgentPanel from './AgentPanel.svelte'
   import TaskStrip from './TaskStrip.svelte'
+  import QuestionCard from './QuestionCard.svelte'
   import { findModel, defaultModelFor } from './catalog'
   import { settings } from './settings.svelte'
   import { onDestroy, untrack } from 'svelte'
@@ -369,6 +370,7 @@
   const steerable = $derived(active && store.prefs.steerMessagesAtToolBoundary)
   const st = $derived(view ? store.status(view) : { key: 'idle', label: '' })
   const approvals = $derived(view ? store.approvals.filter((a) => a.sessionId === view.record.id) : [])
+  const questions = $derived(view ? store.questions.filter((q) => q.sessionId === view.record.id) : [])
   const queue = $derived(sid ? store.queueFor(sid) : [])
   const workingContext = $derived.by(() => {
     const resolved = view
@@ -840,6 +842,39 @@
     // resolved → the refresh has already dropped the prompt; nothing to surface.
   }
 
+  let questionError = $state<{ id: string; msg: string } | null>(null)
+  async function answerQuestion(id: string, answers: Record<string, string>): Promise<void> {
+    questionError = null
+    const result = await api.answerQuestion(id, answers)
+    if (result.ok) {
+      // Do not depend on a WebSocket edge to remove a successfully settled card.
+      store.questions = store.questions.filter((question) => question.id !== id)
+      return
+    }
+    await store.refreshSideData().catch(() => {})
+    if (store.questions.some((question) => question.id === id)) {
+      questionError = { id, msg: result.error ?? 'The answers were not accepted; try again.' }
+    } else {
+      store.pushLocalNote(
+        view?.record.id ?? '',
+        'That question was already resolved elsewhere; your response was not submitted.'
+      )
+    }
+  }
+
+  async function cancelQuestion(id: string): Promise<void> {
+    questionError = null
+    const result = await api.cancelQuestion(id)
+    if (result.ok) {
+      store.questions = store.questions.filter((question) => question.id !== id)
+      return
+    }
+    await store.refreshSideData().catch(() => {})
+    if (store.questions.some((question) => question.id === id)) {
+      questionError = { id, msg: result.error ?? 'The cancellation was not accepted; try again.' }
+    }
+  }
+
   /** "Always allow" — grant the tool for this chat FIRST, then approve the request that prompted it, so
    *  the operator is not asked again for the same tool. The grant is hub-side, so it applies immediately. */
   let grantError = $state<string | null>(null)
@@ -1033,6 +1068,15 @@
     {/if}
     <!-- The agent's task board, directly above the chatbar. -->
     {#if !composerOnly}<TaskStrip items={view.items} />{/if}
+
+    {#each questions as question (question.id)}
+      <QuestionCard
+        record={question}
+        error={questionError?.id === question.id ? questionError.msg : undefined}
+        onsubmit={(answers) => answerQuestion(question.id, answers)}
+        oncancel={() => cancelQuestion(question.id)}
+      />
+    {/each}
 
     {#each approvals as a (a.id)}
       {@const blurb = approvalBlurb(a.kind, a.payload)}

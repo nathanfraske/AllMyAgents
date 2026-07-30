@@ -13,12 +13,13 @@ import { buildAgentMcpServer, type AgentServices } from './agentTools.js'
 import type { ManagerSpawnResult } from './agentToolCore.js'
 import type { SessionIdentity } from './identity.js'
 import type { ApprovalService } from './approvals.js'
+import { QuestionInputError, type QuestionService } from './questions.js'
 import type { UsageMonitor } from './usage.js'
 import type { MemoryStore } from './memory.js'
 import type { PracticeStore } from './practices.js'
 import type { BusAddress, BusMessage } from './bus.js'
 import type { ClaudeLimitInfo, DangerFlags, SessionStatus } from './types.js'
-import type { LiveSession, WorkerSessionSpec } from './workerProtocol.js'
+import { stableQuestionId, type LiveSession, type WorkerSessionSpec } from './workerProtocol.js'
 import { checkWriteScope } from './writeScope.js'
 import type { AttachmentMeta } from './attachments.js'
 
@@ -111,6 +112,7 @@ export const SELF_GATING_TOOLS = new Set([
  *  hub holds, so e.g. the Danger Zone flags read live). */
 export interface InProcessExecutorServices {
   approvals: ApprovalService
+  questions: QuestionService
   usage: UsageMonitor
   danger: DangerFlags
   memory: MemoryStore
@@ -360,6 +362,49 @@ export class InProcessExecutor implements Executor {
           }
         },
         async (toolName, input, context) => {
+          if (toolName === 'AskUserQuestion') {
+            if (!context?.toolUseID || !context.requestId || !context.signal) {
+              return {
+                behavior: 'deny',
+                message: 'AskUserQuestion arrived without required SDK correlation; no answer was submitted',
+              }
+            }
+            try {
+              const outcome = await this.services.questions.request({
+                id: stableQuestionId(spec.sessionId, context.toolUseID, context.requestId),
+                sessionId: spec.sessionId,
+                toolUseId: context.toolUseID,
+                requestId: context.requestId,
+                input,
+                signal: context.signal,
+              })
+              if (outcome.kind === 'answered') {
+                return { behavior: 'allow', updatedInput: outcome.updatedInput }
+              }
+              return {
+                behavior: 'deny',
+                message:
+                  outcome.reason === 'aborted'
+                    ? 'The question was cancelled because the turn was interrupted.'
+                    : outcome.reason === 'recovery-unknown'
+                      ? 'The answer was submitted before a hub restart, but exact delivery could not be verified. Ask again if the answer is still needed.'
+                      : 'The user cancelled the question.',
+              }
+            } catch (error) {
+              if (error instanceof QuestionInputError) {
+                this.h.journal(spec.sessionId, 'question/rejected', {
+                  toolUseId: context.toolUseID,
+                  requestId: context.requestId,
+                  message: error.message,
+                })
+                return {
+                  behavior: 'deny',
+                  message: `AskUserQuestion was rejected because its input was invalid: ${error.message}`,
+                }
+              }
+              throw error
+            }
+          }
           // The hub's own SAFE agent tools (inter-agent bus + shared memory reads/writes + practice
           // reads) are ACL-enforced in-tool; gating them behind human approval would defeat
           // autonomous coordination.

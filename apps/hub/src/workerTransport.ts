@@ -33,7 +33,10 @@ import {
   HUB_RELAY_DELIVERED_BACKSTOP_MS,
   HUB_RELAY_TIMEOUT_MS,
   HubUnavailableError,
+  QUESTION_RELAY_BYTES_MAX,
+  QUESTION_RELAY_QUEUE_MAX,
   RELAY_QUEUE_MAX,
+  RELAY_PENDING_BYTES_MAX,
   type HubToWorker,
   type WorkerToHub,
 } from './workerProtocol.js'
@@ -190,23 +193,38 @@ export class WorkerFrameChannel extends EventEmitter {
 /** The wseq-tagged vendor stream (worker→hub). Retention/replay lives in the caller's wseqBuffer. */
 type EventLaneMsg = Extract<WorkerToHub, { t: 'event' | 'turnStarted' | 'turnCompleted' | 'turnError' }>
 /** Self-gating tool-handler relays — each has an awaiting caller and a correlated reply. */
-type RelayLaneMsg = Extract<WorkerToHub, { t: 'rpc' | 'approvalRequest' }>
+type RelayLaneMsg = Extract<
+  WorkerToHub,
+  { t: 'rpc' | 'approvalRequest' | 'questionRequest' | 'questionAbort' }
+>
 /** The hub→worker replies that resolve a {@link RelayLaneMsg}. */
-type RelayReply = Extract<HubToWorker, { t: 'rpcResult' | 'approvalResolved' }>
+type RelayReply = Extract<
+  HubToWorker,
+  { t: 'rpcResult' | 'approvalResolved' | 'questionResolved' | 'questionAbortAck' }
+>
 
 function isEventLane(msg: WorkerToHub): msg is EventLaneMsg {
   return msg.t === 'event' || msg.t === 'turnStarted' || msg.t === 'turnCompleted' || msg.t === 'turnError'
 }
 function isRelayLane(msg: WorkerToHub): msg is RelayLaneMsg {
-  return msg.t === 'rpc' || msg.t === 'approvalRequest'
+  return (
+    msg.t === 'rpc' ||
+    msg.t === 'approvalRequest' ||
+    msg.t === 'questionRequest' ||
+    msg.t === 'questionAbort'
+  )
 }
 
 /** Namespaced correlation key so a `callId` and an `approvalId` can never collide in the pending map. */
 function relayKey(msg: RelayLaneMsg): string {
-  return msg.t === 'rpc' ? `rpc:${msg.callId}` : `ap:${msg.approvalId}`
+  if (msg.t === 'rpc') return `rpc:${msg.callId}`
+  if (msg.t === 'approvalRequest') return `ap:${msg.approvalId}`
+  return `${msg.t === 'questionRequest' ? 'q' : 'qa'}:${msg.questionId}`
 }
 function replyKey(msg: RelayReply): string {
-  return msg.t === 'rpcResult' ? `rpc:${msg.callId}` : `ap:${msg.approvalId}`
+  if (msg.t === 'rpcResult') return `rpc:${msg.callId}`
+  if (msg.t === 'approvalResolved') return `ap:${msg.approvalId}`
+  return `${msg.t === 'questionResolved' ? 'q' : 'qa'}:${msg.questionId}`
 }
 
 interface PendingRelay {
@@ -217,6 +235,8 @@ interface PendingRelay {
   /** The Promise handed to the caller — reused to COALESCE a duplicate/re-issued relay (same stable key)
    *  onto the in-flight one instead of overwriting + orphaning it (H1). */
   readonly promise: Promise<RelayReply>
+  /** UTF-8 JSON estimate retained by this entry. */
+  readonly bytes: number
   /** The transient→terminal timer, armed ONLY while waiting for a hub to attach (cleared once delivered). */
   timer: ReturnType<typeof setTimeout> | undefined
 }
@@ -267,6 +287,7 @@ export class WorkerServer {
   private draining = false
   /** RELAY lane. Insertion order == flush order (Map preserves it). Keyed by {@link relayKey}. */
   private readonly pendingRelays = new Map<string, PendingRelay>()
+  private pendingRelayBytes = 0
 
   constructor(
     private readonly socketPath: string,
@@ -346,13 +367,38 @@ export class WorkerServer {
       resolve = res
       reject = rej
     })
+    const json = JSON.stringify(msg)
+    const bytes = Buffer.byteLength(json ?? 'null', 'utf8')
+    const matchingQuestionAbort =
+      msg.t === 'questionAbort' && this.pendingRelays.has(`q:${msg.questionId}`)
+    if (msg.t === 'questionRequest') {
+      let questionCount = 0
+      let questionBytes = 0
+      for (const pending of this.pendingRelays.values()) {
+        if (pending.msg.t !== 'questionRequest') continue
+        questionCount += 1
+        questionBytes += pending.bytes
+      }
+      if (
+        questionCount >= QUESTION_RELAY_QUEUE_MAX ||
+        questionBytes + bytes > QUESTION_RELAY_BYTES_MAX
+      ) {
+        reject(new HubUnavailableError('Too many interactive questions are pending; retry later.'))
+        return promise
+      }
+    }
     // Overflow is terminal for the NEWCOMER — never evict an in-flight relay that has an awaiting caller.
-    if (this.pendingRelays.size >= RELAY_QUEUE_MAX) {
+    if (
+      !matchingQuestionAbort &&
+      (this.pendingRelays.size >= RELAY_QUEUE_MAX ||
+        this.pendingRelayBytes + bytes > RELAY_PENDING_BYTES_MAX)
+    ) {
       reject(new HubUnavailableError())
       return promise
     }
-    const entry: PendingRelay = { key, msg, resolve, reject, promise, timer: undefined }
+    const entry: PendingRelay = { key, msg, resolve, reject, promise, bytes, timer: undefined }
     this.pendingRelays.set(key, entry)
+    this.pendingRelayBytes += bytes
     if (this.channelReady()) {
       // Delivered to a live hub; await the reply. No reach-a-hub timer while delivered: the 45s bound governs
       // REACHING a hub, not the reply latency — an approval legitimately waits on a human (§8.3). L6 arms a
@@ -379,6 +425,8 @@ export class WorkerServer {
         return
       case 'rpcResult':
       case 'approvalResolved':
+      case 'questionResolved':
+      case 'questionAbortAck':
         this.resolveRelay(msg)
         return
       case 'hello':
@@ -407,7 +455,7 @@ export class WorkerServer {
   async close(): Promise<void> {
     for (const entry of [...this.pendingRelays.values()]) {
       this.clearTimer(entry)
-      this.pendingRelays.delete(entry.key)
+      this.removeRelay(entry)
       entry.reject(new HubUnavailableError())
     }
     // L4: destroy EVERY accepted channel — the current one, a retiring predecessor, and any connection still
@@ -444,7 +492,14 @@ export class WorkerServer {
     }
     // A late frame from a retiring channel must not act on behalf of the live one. Replies are the
     // exception — resolving a pending relay by id is idempotent and safe from any channel.
-    if (this.current && channel !== this.current && msg.t !== 'rpcResult' && msg.t !== 'approvalResolved') {
+    if (
+      this.current &&
+      channel !== this.current &&
+      msg.t !== 'rpcResult' &&
+      msg.t !== 'approvalResolved' &&
+      msg.t !== 'questionResolved' &&
+      msg.t !== 'questionAbortAck'
+    ) {
       debug(`ignoring ${msg.t} from a non-current channel`)
       return
     }
@@ -513,7 +568,7 @@ export class WorkerServer {
   private resolveRelay(msg: RelayReply): void {
     const entry = this.pendingRelays.get(replyKey(msg))
     if (!entry) return // unknown or already-resolved (a re-delivered reply after a flush) — safe no-op
-    this.pendingRelays.delete(entry.key)
+    this.removeRelay(entry)
     this.clearTimer(entry)
     entry.resolve(msg)
   }
@@ -526,7 +581,9 @@ export class WorkerServer {
    * HubUnavailableError, mapped to HUB_UNAVAILABLE_TEXT at the tool boundary (§8.3).
    */
   private armDeliveredBackstop(entry: PendingRelay): void {
-    if (entry.msg.t === 'rpc') this.armTimer(entry, HUB_RELAY_DELIVERED_BACKSTOP_MS)
+    if (entry.msg.t === 'rpc' || entry.msg.t === 'questionAbort') {
+      this.armTimer(entry, HUB_RELAY_DELIVERED_BACKSTOP_MS)
+    }
   }
 
   private armTimer(entry: PendingRelay, ms: number): void {
@@ -535,7 +592,7 @@ export class WorkerServer {
       // Identity guard: only settle if THIS entry still owns its slot. Coalescing means it always does,
       // but this keeps a stale timer from ever cross-evicting a live entry under future refactors.
       if (this.pendingRelays.get(entry.key) === entry) {
-        this.pendingRelays.delete(entry.key)
+        this.removeRelay(entry)
         entry.reject(new HubUnavailableError())
       }
     }, ms)
@@ -548,6 +605,11 @@ export class WorkerServer {
       clearTimeout(entry.timer)
       entry.timer = undefined
     }
+  }
+
+  private removeRelay(entry: PendingRelay): void {
+    if (!this.pendingRelays.delete(entry.key)) return
+    this.pendingRelayBytes = Math.max(0, this.pendingRelayBytes - entry.bytes)
   }
 
   private channelReady(): boolean {
@@ -710,7 +772,14 @@ export class WorkerClient extends EventEmitter {
   onTurnLifecycle(cb: (msg: Extract<WorkerToHub, { t: 'turnStarted' | 'turnCompleted' | 'turnError' }>) => void): void {
     this.on('turnLifecycle', cb)
   }
-  onRelay(cb: (msg: Extract<WorkerToHub, { t: 'approvalRequest' | 'rpc' }>) => void): void {
+  onRelay(
+    cb: (
+      msg: Extract<
+        WorkerToHub,
+        { t: 'approvalRequest' | 'rpc' | 'questionRequest' | 'questionAbort' }
+      >
+    ) => void
+  ): void {
     this.on('relay', cb)
   }
   onRestartRequest(cb: (msg: Extract<WorkerToHub, { t: 'restartRequest' }>) => void): void {
@@ -758,6 +827,8 @@ export class WorkerClient extends EventEmitter {
         return
       case 'approvalRequest':
       case 'rpc':
+      case 'questionRequest':
+      case 'questionAbort':
         this.emit('relay', msg)
         return
       case 'restartRequest':

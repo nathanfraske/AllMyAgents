@@ -24,7 +24,9 @@ type EventSink = (kind: string, payload: unknown) => void
  */
 export interface ClaudePermissionContext {
   matchedAskRule?: { source: string; toolName: string; ruleContent?: string }
-  toolUseID?: string
+  signal: AbortSignal
+  toolUseID: string
+  requestId: string
   agentID?: string
 }
 

@@ -2,7 +2,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   HUB_RELAY_TIMEOUT_MS,
   HubUnavailableError,
+  QUESTION_RELAY_QUEUE_MAX,
   RELAY_QUEUE_MAX,
+  type HubToWorker,
   type WorkerToHub,
 } from './workerProtocol.js'
 import { FrameDecoder, WorkerServer, defaultWorkerSocket, encodeFrame } from './workerTransport.js'
@@ -145,9 +147,163 @@ function unboundServer() {
   return new WorkerServer('\\\\.\\pipe\\test-never-bound')
 }
 
+interface FakeChannel {
+  send(message: WorkerToHub): void
+  readonly isClosed: boolean
+  destroy(): void
+  readonly writes: WorkerToHub[]
+}
+
+function attachFakeChannel(server: WorkerServer, epoch: number): FakeChannel {
+  const writes: WorkerToHub[] = []
+  let closed = false
+  const channel: FakeChannel = {
+    send: (message) => writes.push(message),
+    get isClosed() {
+      return closed
+    },
+    destroy: () => {
+      closed = true
+    },
+    writes,
+  }
+  const state = server as unknown as {
+    channels: Set<FakeChannel>
+    attach(
+      channel: FakeChannel,
+      hello: Extract<HubToWorker, { t: 'hello' }>
+    ): void
+  }
+  state.channels.add(channel)
+  state.attach(channel, {
+    t: 'hello',
+    attachEpoch: epoch,
+    danger: {
+      busCanUseRiskyTools: false,
+      autoApprovePractices: false,
+    },
+  })
+  return channel
+}
+
+function question(questionId: string, preview = 'comparison'): Extract<WorkerToHub, { t: 'questionRequest' }> {
+  return {
+    t: 'questionRequest',
+    questionId,
+    sessionId: 's',
+    toolUseId: `tool-${questionId}`,
+    requestId: `request-${questionId}`,
+    input: {
+      questions: [
+        {
+          question: `Question ${questionId}?`,
+          header: 'Choice',
+          options: [
+            { label: 'One', description: 'First.', preview },
+            { label: 'Two', description: 'Second.' },
+          ],
+          multiSelect: false,
+        },
+      ],
+    },
+  }
+}
+
 function rpc(callId: string): Extract<WorkerToHub, { t: 'rpc' }> {
   return { t: 'rpc', callId, method: 'memory.write', args: { note: callId } }
 }
+
+describe('WorkerServer question relay lane - dedicated resource and cancellation bounds', () => {
+  it(`retains exactly ${QUESTION_RELAY_QUEUE_MAX} large questions and rejects the newcomer without eviction`, async () => {
+    const server = unboundServer()
+    const retained: Promise<unknown>[] = []
+    const largePreview = 'x'.repeat(320_000)
+    for (let index = 0; index < QUESTION_RELAY_QUEUE_MAX; index += 1) {
+      retained.push(server.relay(question(`q${index}`, largePreview)).catch((error) => error))
+    }
+    expect(server.pendingRelayCount).toBe(QUESTION_RELAY_QUEUE_MAX)
+    await expect(server.relay(question('overflow', largePreview))).rejects.toBeInstanceOf(
+      HubUnavailableError
+    )
+    expect(server.pendingRelayCount).toBe(QUESTION_RELAY_QUEUE_MAX)
+    await server.close()
+    await Promise.all(retained)
+  })
+
+  it('reserves room for a matching abort even when the ordinary relay lane is full', async () => {
+    const server = unboundServer()
+    const pendingQuestion = server.relay(question('stop-me')).catch((error) => error)
+    for (let index = 1; index < RELAY_QUEUE_MAX; index += 1) {
+      server.relay(rpc(`fill-${index}`)).catch(() => {})
+    }
+    expect(server.pendingRelayCount).toBe(RELAY_QUEUE_MAX)
+
+    const abort = server.relay({ t: 'questionAbort', questionId: 'stop-me', sessionId: 's' })
+    expect(server.pendingRelayCount).toBe(RELAY_QUEUE_MAX + 1)
+    server.onHub({ t: 'questionAbortAck', questionId: 'stop-me', aborted: true })
+    await expect(abort).resolves.toMatchObject({ t: 'questionAbortAck', aborted: true })
+    server.onHub({
+      t: 'questionResolved',
+      questionId: 'stop-me',
+      outcome: { kind: 'cancelled', reason: 'aborted' },
+    })
+    await expect(pendingQuestion).resolves.toMatchObject({
+      t: 'questionResolved',
+      outcome: { kind: 'cancelled', reason: 'aborted' },
+    })
+    expect(server.pendingRelayCount).toBe(RELAY_QUEUE_MAX - 1)
+    await server.close()
+  })
+
+  it('does not apply the delivered rpc backstop to a human-interaction question', async () => {
+    vi.useFakeTimers()
+    try {
+      const server = unboundServer()
+      attachFakeChannel(server, 1)
+      const pending = server.relay(question('slow-human'))
+      const settled = pending.then(() => 'resolved', () => 'rejected')
+      await vi.advanceTimersByTimeAsync(240_000)
+      expect(server.pendingRelayCount).toBe(1)
+      server.onHub({
+        t: 'questionResolved',
+        questionId: 'slow-human',
+        outcome: { kind: 'cancelled' },
+      })
+      expect(await settled).toBe('resolved')
+      await server.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('accepts a late correlated question answer from a retiring channel after successor attach', async () => {
+    const server = unboundServer()
+    const oldChannel = attachFakeChannel(server, 1)
+    const pending = server.relay(question('blue-green'))
+    const successor = attachFakeChannel(server, 2)
+    expect(oldChannel.isClosed).toBe(true)
+    const dispatch = (
+      server as unknown as {
+        dispatch(message: HubToWorker, channel: FakeChannel): void
+      }
+    ).dispatch.bind(server)
+    dispatch(
+      {
+        t: 'questionResolved',
+        questionId: 'blue-green',
+        outcome: { kind: 'cancelled' },
+      },
+      oldChannel
+    )
+    await expect(pending).resolves.toMatchObject({
+      t: 'questionResolved',
+      questionId: 'blue-green',
+    })
+    expect(server.pendingRelayCount).toBe(0)
+    expect(successor.isClosed).toBe(false)
+    await server.close()
+  })
+})
 
 describe('WorkerServer relay lane — overflow is terminal for the newcomer (never drop-oldest)', () => {
   it(`rejects the ${RELAY_QUEUE_MAX + 1}th queued relay with HubUnavailableError and keeps the earlier ${RELAY_QUEUE_MAX}`, async () => {

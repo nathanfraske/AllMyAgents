@@ -11,6 +11,14 @@ import { sanitizeJournalPayload } from './journalPayload.js'
 import { redactedJson } from './redact.js'
 import type { ApprovalStatus, HubEvent } from './types.js'
 
+export interface ResolvedQuestion {
+  sessionId: string
+  status: 'answered' | 'cancelled' | 'aborted'
+  toolUseId: string
+  requestId: string
+  questionDigest: string
+}
+
 /**
  * The per-session marker a restarted hub journals when the worker has respawned and the session's worker
  * `wseq` will RESTART at 1 for the next worker era (docs/agent-worker-impl.md §7.1 — F1). The reset-aware
@@ -87,6 +95,8 @@ export class Journal extends EventEmitter {
   // Lazily built the first time a re-issued approval is reconciled (worker mode only — the in-process
   // executor never supplies a stable id, so this never runs flag-off, keeping the constructor byte-identical).
   private resolvedApprovalStmt: Database.Statement | undefined
+  private resolvedQuestionStmt: Database.Statement | undefined
+  private questionRecoveryUnknownStmt: Database.Statement | undefined
 
   constructor(file: string) {
     super()
@@ -1048,6 +1058,61 @@ export class Journal extends EventEmitter {
     // Only a terminal status counts as "resolved"; anything else (never expected on an approval/resolved row)
     // is treated as not-resolved so the caller re-prompts rather than silently swallowing the request.
     return status === 'approved' || status === 'denied' || status === 'timeout' ? status : undefined
+  }
+
+  /**
+   * Durable terminal result for one vendor-correlated AskUserQuestion invocation. Unlike legacy approval
+   * recovery, the id is derived from the SDK's per-invocation toolUseID + requestId rather than payload,
+   * so replay cannot turn one answer into a standing answer for a later byte-identical question.
+   */
+  resolvedQuestion(id: string): ResolvedQuestion | undefined {
+    if (!this.resolvedQuestionStmt) {
+      this.db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_events_resolved_question ON events(json_extract(payload, '$.id')) WHERE kind = 'question/resolved'"
+      )
+      this.resolvedQuestionStmt = this.db.prepare(
+        "SELECT session, payload FROM events WHERE kind = 'question/resolved' AND json_extract(payload, '$.id') = ? ORDER BY seq DESC LIMIT 1"
+      )
+    }
+    const row = this.resolvedQuestionStmt.get(id) as
+      | { session: string | null; payload: string }
+      | undefined
+    if (!row?.session) return undefined
+    try {
+      const payload = JSON.parse(row.payload) as Partial<Omit<ResolvedQuestion, 'sessionId'>>
+      if (
+        (payload.status !== 'answered' &&
+          payload.status !== 'cancelled' &&
+          payload.status !== 'aborted') ||
+        typeof payload.toolUseId !== 'string' ||
+        typeof payload.requestId !== 'string' ||
+        typeof payload.questionDigest !== 'string'
+      ) {
+        return undefined
+      }
+      return {
+        sessionId: row.session,
+        status: payload.status,
+        toolUseId: payload.toolUseId,
+        requestId: payload.requestId,
+        questionDigest: payload.questionDigest,
+      }
+    } catch {
+      return undefined
+    }
+  }
+
+  /** Whether this exact invocation already received the one operator-visible lost-reply notice. */
+  questionRecoveryUnknownNoted(id: string): boolean {
+    if (!this.questionRecoveryUnknownStmt) {
+      this.db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_events_question_recovery_unknown ON events(json_extract(payload, '$.id')) WHERE kind = 'question/recovery-unknown'"
+      )
+      this.questionRecoveryUnknownStmt = this.db.prepare(
+        "SELECT 1 AS present FROM events WHERE kind = 'question/recovery-unknown' AND json_extract(payload, '$.id') = ? LIMIT 1"
+      )
+    }
+    return this.questionRecoveryUnknownStmt.get(id) !== undefined
   }
 
   since(seq: number, limit = 2000): HubEvent[] {

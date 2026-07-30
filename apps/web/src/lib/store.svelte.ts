@@ -14,7 +14,7 @@ import { isChatBusy, nextOrderKey, orderChats, type ChatOrderFacts } from './cha
 import { extractCodexReasoning } from './codexGroup'
 import { attachmentsFromPayload, type AttachmentMeta } from './attachments'
 import type { AgentOutcome } from './agentTree'
-import type { ApprovalRecord, FleetSite, HistoryItem, HistoryPage, HubEvent, HubPrefs, HubStreamMessage, ProfileInfo, ProjectInfo, ReplayComplete, ReplayStart, ScanResult, SessionRecord, UsageSnapshot } from './api'
+import type { ApprovalRecord, FleetSite, HistoryItem, HistoryPage, HubEvent, HubPrefs, HubStreamMessage, ProfileInfo, ProjectInfo, QuestionRecord, ReplayComplete, ReplayStart, ScanResult, SessionRecord, UsageSnapshot } from './api'
 
 // Verbose client tracing — on in dev, compiled out of prod builds. Toggle off in dev by setting
 // localStorage['ama:verbose'] = '0'. Surfaces the load/connect/replay/scan milestones so a stall is
@@ -290,6 +290,7 @@ export class HubStore {
     return prefixes
   })
   approvals = $state<ApprovalRecord[]>([])
+  questions = $state<QuestionRecord[]>([])
   usage = $state<UsageSnapshot[]>([])
   // Hub-owned ordinary preferences. Shared here so the composer and Settings read the same live value;
   // absent/failed bootstrap keeps the server's default-on behavior rather than disabling steering.
@@ -1115,13 +1116,12 @@ export class HubStore {
   }
 
   status(view: SessionView): StatusInfo {
+    if (this.questions.some((question) => question.sessionId === view.record.id)) {
+      return { key: 'question', label: 'awaiting answer' }
+    }
     const pending = this.approvals.filter((a) => a.sessionId === view.record.id)
     if (pending.length > 0) {
-      const isQuestion = pending.some((a) => {
-        const tool = (a.payload as { toolName?: string } | null)?.toolName ?? a.kind
-        return /AskUserQuestion|ExitPlanMode|elicitation|user.input/i.test(String(tool))
-      })
-      return isQuestion ? { key: 'question', label: 'awaiting answer' } : { key: 'approval', label: 'needs approval' }
+      return { key: 'approval', label: 'needs approval' }
     }
     switch (view.record.status) {
       case 'starting':
@@ -1142,11 +1142,13 @@ export class HubStore {
   async refreshSideData(): Promise<void> {
     // Side data is refreshed on a debounce from the event stream, so a transient failure simply means
     // the next event refreshes it. Throwing out of here would take the whole ingest path down.
-    const [approvals, usage] = await Promise.all([
+    const [approvals, questions, usage] = await Promise.all([
       api.approvals().catch(() => null),
+      api.questions().catch(() => null),
       api.usage().catch(() => null),
     ])
     if (approvals) this.approvals = approvals
+    if (questions) this.questions = questions
     if (usage) this.usage = usage
   }
 
@@ -1586,7 +1588,14 @@ export class HubStore {
     // usage/approval events in one burst, and firing refreshSideData() per event stormed the hub with
     // 500+ requests and saturated the browser's ~6-connection pool, so the roster never populated and
     // any new request (a project scan) stalled behind them. Debounced to a single refresh per burst.
-    if (kind === 'approval/requested' || kind === 'approval/resolved' || kind.startsWith('usage/')) {
+    if (
+      kind === 'approval/requested' ||
+      kind === 'approval/resolved' ||
+      kind === 'question/requested' ||
+      kind === 'question/resolved' ||
+      kind === 'question/recovery-unknown' ||
+      kind.startsWith('usage/')
+    ) {
       this.scheduleSideRefresh()
     }
 
@@ -1647,6 +1656,17 @@ export class HubStore {
             text: (payload as { text?: string }).text ?? '',
             attachments: attachmentsFromPayload(payload),
           })
+        break
+      }
+      case 'question/recovery-unknown': {
+        const message = (payload as { message?: string }).message
+        this.push(view, {
+          kind: 'note',
+          ts,
+          text:
+            message ??
+            'A prior answer could not be verified after recovery. The agent was told to ask again if needed.',
+        })
         break
       }
       case 'session/titled': {

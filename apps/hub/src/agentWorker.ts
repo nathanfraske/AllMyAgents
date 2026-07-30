@@ -29,7 +29,7 @@
  *     branches here are only the TRUE >HUB_RELAY_TIMEOUT_MS orphan).
  *   - Transient-gap queue tuning (drain pre-signal, stable-callId write dedup) is STEP 7.
  */
-import { ClaudeDriver } from './adapters/claude.js'
+import { ClaudeDriver, type ClaudePermissionContext } from './adapters/claude.js'
 import {
   CodexClient,
   codexRequestResult,
@@ -52,10 +52,16 @@ import type { Practice } from './practices.js'
 import type { SessionIdentity } from './identity.js'
 import type { DangerFlags } from './types.js'
 import {
+  parseAskUserQuestionInput,
+  QuestionInputError,
+  type QuestionOutcome,
+} from './questions.js'
+import {
   HUB_UNAVAILABLE_TEXT,
   HubUnavailableError,
   newWorkerGeneration,
   stableApprovalId,
+  stableQuestionId,
   type HubToWorker,
   type LiveSession,
   type RelayMethod,
@@ -731,8 +737,55 @@ export class AgentWorker {
     spec: WorkerSessionSpec,
     toolName: string,
     input: unknown,
-    context?: { matchedAskRule?: { source: string; toolName: string; ruleContent?: string } }
+    context?: ClaudePermissionContext
   ): Promise<{ behavior: 'allow'; updatedInput: unknown } | { behavior: 'deny'; message: string }> {
+    if (toolName === 'AskUserQuestion') {
+      if (!context?.toolUseID || !context.requestId || !context.signal) {
+        return {
+          behavior: 'deny',
+          message: 'AskUserQuestion arrived without required SDK correlation; no answer was submitted',
+        }
+      }
+      try {
+        const outcome = await this.relayQuestion(
+          spec.sessionId,
+          parseAskUserQuestionInput(input),
+          context
+        )
+        if (outcome.kind === 'answered') {
+          return { behavior: 'allow', updatedInput: outcome.updatedInput }
+        }
+        return {
+          behavior: 'deny',
+          message:
+            outcome.reason === 'aborted'
+              ? 'The question was cancelled because the turn was interrupted.'
+              : outcome.reason === 'recovery-unknown'
+                ? 'The answer was submitted before a hub restart, but exact delivery could not be verified. Ask again if the answer is still needed.'
+                : outcome.reason === 'rejected'
+                  ? outcome.message ?? 'The question was rejected by the hub.'
+                  : outcome.reason === 'unavailable'
+                    ? outcome.message ?? HUB_UNAVAILABLE_TEXT
+                : 'The user cancelled the question.',
+        }
+      } catch (error) {
+        if (error instanceof QuestionInputError) {
+          this.emitEvent(spec.sessionId, 'question/rejected', {
+            toolUseId: context.toolUseID,
+            requestId: context.requestId,
+            message: error.message,
+          })
+          return {
+            behavior: 'deny',
+            message: `AskUserQuestion was rejected because its input was invalid: ${error.message}`,
+          }
+        }
+        if (error instanceof HubUnavailableError) {
+          return { behavior: 'deny', message: HUB_UNAVAILABLE_TEXT }
+        }
+        throw error
+      }
+    }
     if (AUTO_ALLOW_TOOLS.has(toolName)) return { behavior: 'allow', updatedInput: input }
     if (SELF_GATING_TOOLS.has(toolName)) {
       if (this.busTurnSessions.has(spec.sessionId) && !this.danger.busCanUseRiskyTools) {
@@ -802,6 +855,41 @@ export class AgentWorker {
     const reply = await this.server.relay({ t: 'approvalRequest', approvalId, sessionId, kind, payload })
     if (reply.t !== 'approvalResolved') throw new Error(`approval ${kind}: unexpected reply ${reply.t}`)
     return reply.approved
+  }
+
+  /** Relay one interactive question under vendor per-invocation identity. The request is inserted before
+   * the abort relay, so an already-aborted signal still reaches a successor hub in request→abort order. */
+  private async relayQuestion(
+    sessionId: string,
+    rawInput: unknown,
+    context: ClaudePermissionContext
+  ): Promise<QuestionOutcome> {
+    const input = parseAskUserQuestionInput(rawInput)
+    const questionId = stableQuestionId(sessionId, context.toolUseID, context.requestId)
+    const pending = this.server.relay({
+      t: 'questionRequest',
+      questionId,
+      sessionId,
+      toolUseId: context.toolUseID,
+      requestId: context.requestId,
+      input,
+    })
+    const abort = (): void => {
+      void this.server
+        .relay({ t: 'questionAbort', questionId, sessionId })
+        .catch(() => {})
+    }
+    if (context.signal.aborted) abort()
+    else context.signal.addEventListener('abort', abort, { once: true })
+    try {
+      const reply = await pending
+      if (reply.t !== 'questionResolved') {
+        throw new Error(`question ${questionId}: unexpected reply ${reply.t}`)
+      }
+      return reply.outcome
+    } finally {
+      context.signal.removeEventListener('abort', abort)
+    }
   }
 
   /** Worktree containment. Shared with InProcessExecutor via ./writeScope.js — see the note there on why

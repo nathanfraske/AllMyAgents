@@ -320,6 +320,8 @@ describe('(a) stable-callId write dedup — a re-flushed write executes exactly 
       requestRestart: () => {},
       runRelay: (method, args) => sessions.runRelay(method, args),
       resolveApproval: async () => true,
+      resolveQuestion: async () => ({ kind: 'cancelled' }),
+      abortQuestion: () => false,
       attachWorker: async () => {},
     }
     const executor = new WorkerExecutor(client as unknown as WorkerClient, hub)

@@ -7,6 +7,7 @@ import { defaultHomeProfiles, isManagedProfile } from './profiles.js'
 import { mapCodexTokenUsage } from './adapters/codex.js'
 import { readHistoryPage, locateTranscript, type HistoryPage } from './transcript.js'
 import type { ApprovalService } from './approvals.js'
+import { QuestionService } from './questions.js'
 import { WSEQ_RESET_KIND, type Journal } from './journal.js'
 import type { ProjectStore } from './projects.js'
 import type { SessionStore } from './store.js'
@@ -154,6 +155,7 @@ const MANAGER_ROSTER_PATH_LIMIT = 12
 const MANAGER_ROSTER_MAX_CHARS = 8_000
 
 export class SessionManager {
+  private readonly questions: QuestionService
   private readonly sessions = new Map<string, SessionRecord>()
   // Per-session set of memory ids already auto-recalled into context, so the same memory isn't
   // re-injected turn after turn (automatic recall; gated by autoMemoryRecall).
@@ -235,12 +237,15 @@ export class SessionManager {
       chatNamePool: DEFAULT_CHAT_NAME_POOL,
       steerMessagesAtToolBoundary: true,
     },
-    private readonly browserBroker?: BrowserBroker
+    private readonly browserBroker?: BrowserBroker,
+    questions?: QuestionService
   ) {
+    this.questions = questions ?? new QuestionService(this.journal)
     this.executor =
       executor ??
       new InProcessExecutor({
         approvals: this.approvals,
+        questions: this.questions,
         usage: this.usage,
         danger: this.danger,
         memory: this.memory,

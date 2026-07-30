@@ -8,6 +8,7 @@
 import crypto from 'node:crypto'
 import type { DangerFlags } from './types.js'
 import type { AttachmentMeta } from './attachments.js'
+import type { QuestionOutcome } from './questions.js'
 
 /** The subset of a SessionRecord the worker's driver needs — the worker holds no record + never opens the store. */
 export interface WorkerSessionSpec {
@@ -56,6 +57,8 @@ export type HubToWorker =
   // (the M2 correctness item). Absent/true = start draining.
   | { t: 'draining'; on?: boolean }
   | { t: 'approvalResolved'; approvalId: string; approved: boolean }
+  | { t: 'questionResolved'; questionId: string; outcome: QuestionOutcome }
+  | { t: 'questionAbortAck'; questionId: string; aborted: boolean }
   | { t: 'rpcResult'; callId: string; ok: boolean; value?: unknown; error?: string }
 
 /** Worker → hub. */
@@ -79,6 +82,15 @@ export type WorkerToHub =
   | { t: 'turnError'; sessionId: string; wseq: number; message: string; replay?: boolean }
   // self-gating tool-handler relays (worker's MCP handlers reaching hub-owned services):
   | { t: 'approvalRequest'; approvalId: string; sessionId: string; kind: string; payload: unknown }
+  | {
+      t: 'questionRequest'
+      questionId: string
+      sessionId: string
+      toolUseId: string
+      requestId: string
+      input: unknown
+    }
+  | { t: 'questionAbort'; questionId: string; sessionId: string }
   | { t: 'rpc'; callId: string; method: RelayMethod; args: unknown } // callId STABLE across re-flush → hub dedups writes (§8.2)
   | { t: 'restartRequest'; reason: string; bySession?: string }
   // command acks/replies:
@@ -122,6 +134,12 @@ export const RELAY_QUEUE_MAX = 1_000 //           worker relay-lane bound; overf
 // can't hang the tool forever. Well above a flip window (HUB_RELAY_TIMEOUT_MS) yet well under the SDK's
 // patience; the approvalRequest path is deliberately EXEMPT (it legitimately blocks on a human up to the
 // hub's 10-min ApprovalService timeout, which always replies), so only rpc(bus/memory/practices) get it.
+/** Interactive question bodies are much larger than ordinary relays. Keep a separate closed count/byte
+ * bound so a model cannot retain RELAY_QUEUE_MAX multi-hundred-KiB question payloads in the worker. */
+export const QUESTION_RELAY_QUEUE_MAX = 8
+export const QUESTION_RELAY_BYTES_MAX = 4 * 1024 * 1024
+/** Aggregate retained relay estimate, independent of the on-wire decoder's corruption ceiling. */
+export const RELAY_PENDING_BYTES_MAX = 8 * 1024 * 1024
 export const HUB_RELAY_DELIVERED_BACKSTOP_MS = 120_000
 
 /** The ONE retryable shape a tool returns when a relay exceeds the transient bound — never a permanent
@@ -170,6 +188,17 @@ export function stableApprovalId(sessionId: string, kind: string, payload: unkno
   h.update('\0')
   h.update(safeStringify(payload))
   return `ap_${h.digest('hex').slice(0, 24)}`
+}
+
+/** Per-vendor-invocation question identity. Payload is deliberately absent: two simultaneous identical
+ * asks have distinct toolUseID/requestId pairs and must remain distinct interactive requests. */
+export function stableQuestionId(sessionId: string, toolUseId: string, requestId: string): string {
+  const h = crypto.createHash('sha256')
+  h.update('allmyagents.ask-user-question.id.v1\0')
+  // JSON's array framing is unambiguous even if a future vendor id contains a delimiter/control byte.
+  // Plain NUL concatenation made ["a\0b","c"] collide with ["a","b\0c"] at the hash input.
+  h.update(JSON.stringify([sessionId, toolUseId, requestId]))
+  return `q_${h.digest('hex').slice(0, 32)}`
 }
 
 /** Stable JSON for hashing — recursively sorts object keys so equal payloads hash equal regardless of
