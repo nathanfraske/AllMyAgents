@@ -112,7 +112,8 @@ describe('RestartController journal backup ownership', () => {
     expect(freeze).toHaveBeenCalledWith(true)
     expect(settleQuestionTurnsForRestart).toHaveBeenCalledWith(
       ['s1'],
-      ASK_RESTART_TURN_GRACE_MS
+      ASK_RESTART_TURN_GRACE_MS,
+      expect.any(AbortSignal)
     )
     expect(recordRestartBoundaries).toHaveBeenCalledWith(
       interrupted,
@@ -414,24 +415,88 @@ describe('RestartController journal backup ownership', () => {
     })
   })
 
+  it('cancels a supervisor-timed-out Ask drain before close and emits only rollback-rebound', async () => {
+    const server = http.createServer()
+    const publicPort = await listenEphemeral(server)
+    const sent: unknown[] = []
+    const deps = controllerDeps(server, publicPort, sent)
+    const freeze = vi.fn()
+    deps.sessions.setRestartTurnAdmissionFrozen = freeze
+    const activatePublicOwner = vi.fn(() => 0)
+    const recordRestartBoundaries = vi.fn(() => 1)
+    deps.questions = {
+      ...deps.questions,
+      deactivatePublicOwnerForRestart: () => [
+        {
+          restartGeneration: 'slow-drain',
+          sessionId: 's1',
+          questionCount: 1,
+          questionIds: ['q1'],
+        },
+      ],
+      recordRestartBoundaries,
+      activatePublicOwner,
+    } as never
+    let releaseSettlement!: () => void
+    const settleQuestionTurnsForRestart = vi.fn(
+      () =>
+        new Promise<{ settled: string[]; outcomeUnknown: string[] }>(
+          (resolve) => {
+            releaseSettlement = () =>
+              resolve({ settled: ['s1'], outcomeUnknown: [] })
+          }
+        )
+    )
+    const signalDraining = vi.fn()
+    deps.executor = {
+      settleQuestionTurnsForRestart,
+      signalDraining,
+    } as never
+    const listen = vi.spyOn(server, 'listen')
+    const close = vi.spyOn(server, 'close')
+    const controller = new RestartController(deps)
+
+    const draining = controller.drain()
+    await vi.waitFor(() =>
+      expect(settleQuestionTurnsForRestart).toHaveBeenCalledOnce()
+    )
+    const aborting = controller.abort('supervisor drain timeout')
+    await Promise.all([draining, aborting])
+
+    expect(sent).toEqual([{ type: 'rollback-rebound' }])
+    expect(server.listening).toBe(true)
+    expect((server.address() as { port: number }).port).toBe(publicPort)
+    expect(listen).not.toHaveBeenCalled()
+    expect(close).not.toHaveBeenCalled()
+    expect(recordRestartBoundaries).not.toHaveBeenCalled()
+    expect(activatePublicOwner).toHaveBeenCalledOnce()
+    expect(freeze.mock.calls).toEqual([[true], [false]])
+    expect(signalDraining.mock.calls).toEqual([[true], [false]])
+    expect(deps.state.draining).toBe(false)
+    expect(deps.state.journalBackup).toEqual({ status: 'active' })
+
+    // A non-cooperative/late settlement cannot revive the cancelled drain or emit `released`.
+    releaseSettlement()
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(sent).toEqual([{ type: 'rollback-rebound' }])
+  })
+
   it('serializes rollback rebind behind an existing listener transition', async () => {
     const server = http.createServer()
     const publicPort = await listenEphemeral(server)
     const sent: unknown[] = []
     const deps = controllerDeps(server, publicPort, sent)
     const controller = new RestartController(deps)
+    const listen = vi.spyOn(server, 'listen')
+    const close = vi.spyOn(server, 'close')
 
     const draining = controller.drain()
     const aborting = controller.abort('overlapping rollback')
     await Promise.all([draining, aborting])
 
-    expect(sent).toEqual([
-      {
-        type: 'released',
-        questionTurns: { settled: 0, outcomeUnknown: 0 },
-      },
-      { type: 'rollback-rebound' },
-    ])
+    expect(sent).toEqual([{ type: 'rollback-rebound' }])
+    expect(close).toHaveBeenCalledTimes(1)
+    expect(listen).toHaveBeenCalledTimes(1)
     expect(server.listening).toBe(true)
     expect((server.address() as { port: number }).port).toBe(publicPort)
   })

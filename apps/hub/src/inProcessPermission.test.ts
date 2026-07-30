@@ -89,6 +89,34 @@ describe('InProcessExecutor AskUserQuestion permission callback', () => {
     })
   })
 
+  it('cancels exact-turn settlement without dispatching a late interrupt after rollback', async () => {
+    const executor = new InProcessExecutor({} as never)
+    executor.bindHub({} as never)
+    const interrupt = vi.spyOn(executor, 'interrupt').mockResolvedValue()
+    ;(
+      executor as unknown as {
+        turnSettlements: Map<string, { token: symbol; promise: Promise<void> }>
+      }
+    ).turnSettlements.set('with-handle', {
+      token: Symbol('with-handle'),
+      promise: new Promise<void>(() => {}),
+    })
+    const abort = new AbortController()
+
+    const settling = executor.settleQuestionTurnsForRestart(
+      ['with-handle'],
+      60_000,
+      abort.signal
+    )
+    abort.abort()
+
+    await expect(settling).resolves.toEqual({
+      settled: [],
+      outcomeUnknown: ['with-handle'],
+    })
+    expect(interrupt).not.toHaveBeenCalled()
+  })
+
   it('returns the exact system-interruption marker without answers or user-cancellation wording', async () => {
     const executor = new InProcessExecutor({
       approvals: { request: async () => true },

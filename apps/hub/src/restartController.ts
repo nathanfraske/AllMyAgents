@@ -49,8 +49,15 @@ export interface RestartControllerDeps {
   questionTurnGraceMs?: number
 }
 
+interface DrainOperation {
+  abortRequested: boolean
+  abortController: AbortController
+  promise: Promise<void>
+}
+
 export class RestartController {
   private listenerTransition: Promise<void> | undefined
+  private drainOperation: DrainOperation | undefined
   private supervisorDisconnected = false
 
   constructor(private readonly deps: RestartControllerDeps) {}
@@ -96,6 +103,27 @@ export class RestartController {
    * open forever; the clients auto-reconnect to green — then close the listener and signal `released`.
    */
   async drain(): Promise<void> {
+    if (this.drainOperation) return this.drainOperation.promise
+    const operation: DrainOperation = {
+      abortRequested: false,
+      abortController: new AbortController(),
+      promise: undefined as unknown as Promise<void>,
+    }
+    this.drainOperation = operation
+    operation.promise = this.runDrain(operation)
+    // The whole drain is one listener-ownership transition, including the Ask grace before close. Parent
+    // loss therefore observes the exact final listener state, and abort can cancel/await this operation
+    // instead of racing a still-bound blue with a second listen().
+    this.listenerTransition = operation.promise
+    try {
+      await operation.promise
+    } finally {
+      if (this.drainOperation === operation) this.drainOperation = undefined
+      if (this.listenerTransition === operation.promise) this.listenerTransition = undefined
+    }
+  }
+
+  private async runDrain(operation: DrainOperation): Promise<void> {
     const { server, journal, questions, sessions, state, executor } = this.deps
     state.draining = true
     sessions.setRestartTurnAdmissionFrozen(true)
@@ -118,15 +146,37 @@ export class RestartController {
       executor.signalDraining?.(true)
       journal.append(null, 'hub/draining', {})
       const sessionIds = interrupted.map((turn) => turn.sessionId)
-      boundary =
-        sessionIds.length === 0
-          ? { settled: [], outcomeUnknown: [] }
-          : executor.settleQuestionTurnsForRestart
-            ? await executor.settleQuestionTurnsForRestart(
-                sessionIds,
-                this.deps.questionTurnGraceMs ?? ASK_RESTART_TURN_GRACE_MS
-              )
-            : { settled: [], outcomeUnknown: sessionIds }
+      if (sessionIds.length === 0) {
+        boundary = { settled: [], outcomeUnknown: [] }
+      } else if (executor.settleQuestionTurnsForRestart) {
+        const settlement = executor.settleQuestionTurnsForRestart(
+          sessionIds,
+          this.deps.questionTurnGraceMs ?? ASK_RESTART_TURN_GRACE_MS,
+          operation.abortController.signal
+        )
+        let removeAbort: (() => void) | undefined
+        const result = await Promise.race([
+          settlement.then((value) => ({ kind: 'settled' as const, value })),
+          new Promise<{ kind: 'aborted' }>((resolve) => {
+            if (operation.abortController.signal.aborted) {
+              resolve({ kind: 'aborted' })
+              return
+            }
+            const abort = () => resolve({ kind: 'aborted' })
+            operation.abortController.signal.addEventListener('abort', abort, {
+              once: true,
+            })
+            removeAbort = () =>
+              operation.abortController.signal.removeEventListener('abort', abort)
+          }),
+        ])
+        removeAbort?.()
+        if (result.kind === 'aborted') return
+        boundary = result.value
+      } else {
+        boundary = { settled: [], outcomeUnknown: sessionIds }
+      }
+      if (operation.abortRequested) return
       questions.recordRestartBoundaries(interrupted, new Set(boundary.settled))
     } catch (error) {
       // The listener is still bound. Reclaim every public mutation boundary before reporting drain-failed;
@@ -154,6 +204,7 @@ export class RestartController {
       }
       throw error
     }
+    if (operation.abortRequested) return
     for (const s of state.sockets) {
       try {
         s.destroy()
@@ -163,12 +214,8 @@ export class RestartController {
     }
     state.sockets.clear()
     const transition = new Promise<void>((resolve) => server.close(() => resolve()))
-    this.listenerTransition = transition
-    try {
-      await transition
-    } finally {
-      if (this.listenerTransition === transition) this.listenerTransition = undefined
-    }
+    await transition
+    if (operation.abortRequested) return
     this.notifySupervisor({
       type: 'released',
       questionTurns: {
@@ -287,7 +334,24 @@ export class RestartController {
    */
   async abort(error: string): Promise<void> {
     const { server, journal, state, publicPort, executor, questions } = this.deps
+    const drain = this.drainOperation
+    if (drain) {
+      // A supervisor timeout cancels this exact drain generation. Fence first so a close callback cannot
+      // emit a late `released`, and abort the exact-turn grace so it cannot interrupt a turn after blue
+      // has rolled back.
+      drain.abortRequested = true
+      drain.abortController.abort()
+    }
     journal.append(null, 'hub/restart-aborted', { error })
+    if (drain) {
+      try {
+        await drain.promise
+      } catch {
+        // The drain caller reports genuine drain failures. Rollback still has to reclaim or fail closed.
+      }
+      if (this.drainOperation === drain) this.drainOperation = undefined
+      if (this.listenerTransition === drain.promise) this.listenerTransition = undefined
+    }
     // Release the worker drain hold only after blue also reclaims QuestionService ownership. Otherwise a
     // rebound can accept turns while AskUserQuestion still fails closed.
     // Drain, promote, orphan resolution, and rollback all share one server. Never overwrite an
@@ -357,7 +421,13 @@ export class RestartController {
       }
     }
 
-    if (!state.draining) {
+    const address = server.address()
+    const publicListenerStillBound =
+      server.listening &&
+      address !== null &&
+      typeof address !== 'string' &&
+      address.port === publicPort
+    if (!state.draining || publicListenerStillBound) {
       await reclaimQuestionOwner()
       return
     }

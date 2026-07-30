@@ -74,7 +74,8 @@ export interface Executor {
    */
   settleQuestionTurnsForRestart?(
     sessionIds: readonly string[],
-    timeoutMs: number
+    timeoutMs: number,
+    signal?: AbortSignal
   ): Promise<{ settled: string[]; outcomeUnknown: string[] }>
   /**
    * Push the live Danger Zone flags to the executor so the worker's cached `danger()` (read by the MCP
@@ -541,7 +542,8 @@ export class InProcessExecutor implements Executor {
 
   async settleQuestionTurnsForRestart(
     sessionIds: readonly string[],
-    timeoutMs: number
+    timeoutMs: number,
+    signal?: AbortSignal
   ): Promise<{ settled: string[]; outcomeUnknown: string[] }> {
     const snapshots = [...new Set(sessionIds)].map((sessionId) => ({
       sessionId,
@@ -555,20 +557,32 @@ export class InProcessExecutor implements Executor {
       })
     })
     let timer: NodeJS.Timeout | undefined
+    let removeAbort: (() => void) | undefined
     await Promise.race([
       Promise.allSettled(observed),
       new Promise<void>((resolve) => {
         timer = setTimeout(resolve, Math.max(0, timeoutMs))
       }),
+      new Promise<void>((resolve) => {
+        if (!signal) return
+        if (signal.aborted) {
+          resolve()
+          return
+        }
+        const abort = () => resolve()
+        signal.addEventListener('abort', abort, { once: true })
+        removeAbort = () => signal.removeEventListener('abort', abort)
+      }),
     ])
     if (timer) clearTimeout(timer)
+    removeAbort?.()
     const outcomeUnknown = snapshots
       .filter(({ sessionId, promise }) => !promise || !settled.has(sessionId))
       .map(({ sessionId }) => sessionId)
     const expiredExactHandles = snapshots
       .filter(({ sessionId, promise }) => promise && !settled.has(sessionId))
       .map(({ sessionId }) => sessionId)
-    if (expiredExactHandles.length) {
+    if (expiredExactHandles.length && !signal?.aborted) {
       // Dispatch and briefly observe every interrupt before listener release. The handshake owns the shared
       // bounded drain deadline, so an unresponsive provider remains unknown rather than holding the port.
       let interruptTimer: NodeJS.Timeout | undefined
