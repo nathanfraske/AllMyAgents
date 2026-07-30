@@ -146,7 +146,10 @@ async function handle(message) {
 
   if (message?.type === 'drain') {
     await close()
-    send({ type: 'released' })
+    send({
+      type: 'released',
+      questionTurns: { settled: 0, outcomeUnknown: 0 },
+    })
     return
   }
 

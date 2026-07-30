@@ -1,7 +1,12 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { InProcessExecutor } from './executor.js'
 import { Journal } from './journal.js'
-import { QuestionService } from './questions.js'
+import {
+  ASK_INTERRUPTED_BY_RESTART_MESSAGE,
+  ASK_UNAVAILABLE_MESSAGE,
+  QuestionOwnershipError,
+  QuestionService,
+} from './questions.js'
 import type { WorkerSessionSpec } from './workerProtocol.js'
 
 type GateResult =
@@ -41,6 +46,112 @@ function permissionGate(
 }
 
 describe('InProcessExecutor AskUserQuestion permission callback', () => {
+  it('classifies a missing exact turn handle as unknown and awaits bounded interrupt dispatch', async () => {
+    const executor = new InProcessExecutor({} as never)
+    executor.bindHub({} as never)
+    let releaseInterrupt!: () => void
+    const interrupt = vi
+      .spyOn(executor, 'interrupt')
+      .mockImplementation(
+        () =>
+          new Promise<void>((resolve) => {
+            releaseInterrupt = resolve
+          })
+      )
+    const pending = new Promise<void>(() => {})
+    ;(
+      executor as unknown as {
+        turnSettlements: Map<string, { token: symbol; promise: Promise<void> }>
+      }
+    ).turnSettlements.set('with-handle', {
+      token: Symbol('with-handle'),
+      promise: pending,
+    })
+
+    const settling = executor.settleQuestionTurnsForRestart(
+      ['with-handle', 'missing-handle'],
+      0
+    )
+    await vi.waitFor(() => expect(interrupt).toHaveBeenCalledTimes(1))
+    expect(interrupt).toHaveBeenCalledWith('with-handle')
+    expect(interrupt).not.toHaveBeenCalledWith('missing-handle')
+    let completed = false
+    void settling.then(() => {
+      completed = true
+    })
+    await Promise.resolve()
+    expect(completed).toBe(false)
+    releaseInterrupt()
+
+    await expect(settling).resolves.toEqual({
+      settled: [],
+      outcomeUnknown: ['with-handle', 'missing-handle'],
+    })
+  })
+
+  it('returns the exact system-interruption marker without answers or user-cancellation wording', async () => {
+    const executor = new InProcessExecutor({
+      approvals: { request: async () => true },
+      questions: {
+        request: async () => ({
+          kind: 'interrupted',
+          reason: 'restart',
+          message: ASK_INTERRUPTED_BY_RESTART_MESSAGE,
+        }),
+      },
+    } as never)
+    executor.bindHub({ journal: () => {} } as never)
+    const result = await permissionGate(executor, spec('safe'))(
+      'AskUserQuestion',
+      { questions: [] },
+      {
+        toolUseID: 'tool-ok',
+        requestId: 'request-ok',
+        signal: new AbortController().signal,
+      }
+    )
+
+    expect(result).toEqual({
+      behavior: 'deny',
+      message: ASK_INTERRUPTED_BY_RESTART_MESSAGE,
+    })
+    if (result.behavior !== 'deny') throw new Error('expected deny')
+    expect(
+      result.message.match(/ALLMYAGENTS_ASK_INTERRUPTED_BY_RESTART_V1/gu)
+    ).toHaveLength(1)
+    expect(result.message).not.toContain('The user cancelled')
+    expect(result).not.toHaveProperty('updatedInput')
+  })
+
+  it('treats a repeat Ask during inactive restart ownership as system unavailability, not user refusal', async () => {
+    const executor = new InProcessExecutor({
+      approvals: { request: async () => true },
+      questions: {
+        request: async () => {
+          throw new QuestionOwnershipError()
+        },
+      },
+    } as never)
+    executor.bindHub({ journal: () => {} } as never)
+
+    await expect(
+      permissionGate(executor, spec('safe'))(
+        'AskUserQuestion',
+        { questions: [] },
+        {
+          toolUseID: 'tool-repeat',
+          requestId: 'request-repeat',
+          signal: new AbortController().signal,
+        }
+      )
+    ).resolves.toEqual({
+      behavior: 'deny',
+      message: ASK_UNAVAILABLE_MESSAGE,
+    })
+    expect(ASK_UNAVAILABLE_MESSAGE).toContain('NOT A USER RESPONSE')
+    expect(ASK_UNAVAILABLE_MESSAGE).not.toContain('The user cancelled')
+  })
+
   it('denies malformed Ask correlation without journaling raw SDK identifiers', async () => {
     const journaled: Array<{ kind: string; payload: unknown }> = []
     const executor = new InProcessExecutor({

@@ -18,7 +18,13 @@ import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
-import { sendToHub, waitForHubMsg, healthCheck, type HubMsg } from './restartHandshake.js'
+import {
+  HUB_DRAIN_RELEASE_TIMEOUT_MS,
+  sendToHub,
+  waitForHubMsg,
+  healthCheck,
+  type HubMsg,
+} from './restartHandshake.js'
 import { defaultWorkerSocket } from './workerTransport.js'
 import { JournalBackupOwnershipProtocol } from './journalBackupOwnership.js'
 import {
@@ -480,8 +486,14 @@ async function restart(reason: string): Promise<void> {
     log('blue journal backups paused — current generation settled')
     sendToHub(blue.child, { type: 'drain' }) // blue: 503 new sessions, close the 7777 listener, stay alive
     blue.state = 'draining'
-    await waitForHubMsg(blue.child, 'released', 5_000)
-    log('blue drained — 7777 released')
+    const released = await waitForHubMsg(
+      blue.child,
+      'released',
+      HUB_DRAIN_RELEASE_TIMEOUT_MS
+    )
+    log(
+      `blue drained — 7777 released (question turns settled=${released.questionTurns.settled}, outcome-unknown=${released.questionTurns.outcomeUnknown})`
+    )
 
     // From this point the public bind is ambiguous until green exits: it can bind successfully and lose
     // its `promoted` IPC acknowledgement. Fence rollback BEFORE sending the command so an ACK timeout

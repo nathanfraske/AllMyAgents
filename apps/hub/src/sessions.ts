@@ -188,6 +188,10 @@ export class SessionManager {
   // clamped spec lives only in the surviving worker would otherwise be judged by the STORED session mode
   // on the successor hub and silently bypass the clamp again. Cleared in setStatus alongside the bus tag.
   private readonly operatorTurnSessions = new Set<string>()
+  // Planned restart freezes every NEW turn before unanswered Ask callbacks are settled. Existing turns may
+  // continue to their exact captured terminal promise; queued operator/bus input remains durable and is
+  // delivered only after rollback or by the promoted process.
+  private restartTurnAdmissionFrozen = false
   // At most one database batch may be crossing the live-steer boundary per recipient. busSend can be
   // called again while the executor acknowledgement is in flight; without this fence both deliveries
   // would select the same undelivered rows and inject the same framed messages twice.
@@ -1322,6 +1326,23 @@ export class SessionManager {
     return [...this.sessions.values()]
   }
 
+  private assertTurnAdmissionOpen(): void {
+    if (this.restartTurnAdmissionFrozen) {
+      throw new Error('new turns are temporarily unavailable while the hub restarts')
+    }
+  }
+
+  setRestartTurnAdmissionFrozen(frozen: boolean): void {
+    this.restartTurnAdmissionFrozen = frozen
+    if (!frozen) {
+      for (const record of this.sessions.values()) {
+        if (record.status === 'idle' || record.status === 'active') {
+          setImmediate(() => this.deliverBus(record.id))
+        }
+      }
+    }
+  }
+
   /** API roster enriched with undelivered bus counts. AgentBus does ONE grouped query and this joins it
    *  in memory; never regress this into pending(id) per row on the UI's hot polling path. */
   listForApi(): SessionApiRecord[] {
@@ -2377,6 +2398,7 @@ export class SessionManager {
   }
 
   async create(profileId: string, opts: CreateOptions): Promise<SessionRecord> {
+    this.assertTurnAdmissionOpen()
     const profile = this.profiles.get(profileId)
     if (!profile) throw new Error(`unknown profile: ${profileId}`)
     if (profile.available === false) throw new Error(profile.unavailableReason ?? `profile ${profileId} is unavailable`)
@@ -2504,9 +2526,16 @@ export class SessionManager {
     this.sessions.set(id, record)
     this.persist(record)
     this.journal.append(id, 'session/created', record)
-    if (opts.prompt) {
+    const acceptInitialPrompt = (): void => {
+      if (!opts.prompt) return
+      this.assertTurnAdmissionOpen()
       this.journal.append(id, 'session/input', { text: opts.prompt, attachments: [] })
       this.autoTitle(record, opts.prompt)
+      if (!opts.parentSessionId) this.operatorTurnSessions.add(id)
+      this.journal.append(id, 'session/turn-origin', {
+        origin: opts.parentSessionId ? 'manager' : 'operator',
+        managerSessionId: opts.parentSessionId ?? null,
+      })
     }
 
     // A first prompt is an operator turn exactly like a later send, so it gets the same provenance tag —
@@ -2518,11 +2547,7 @@ export class SessionManager {
       // The executor builds the driver lazily on this first runTurn (driver construction has no
       // observable side effect, so lazy-vs-eager is invisible). Fire-and-forget, as before.
       if (opts.prompt) {
-        if (!opts.parentSessionId) this.operatorTurnSessions.add(id)
-        this.journal.append(id, 'session/turn-origin', {
-          origin: opts.parentSessionId ? 'manager' : 'operator',
-          managerSessionId: opts.parentSessionId ?? null,
-        })
+        acceptInitialPrompt()
         void this.executor.runTurn(this.specOf(record), opts.prompt, 'operator')
       }
     } else {
@@ -2531,11 +2556,7 @@ export class SessionManager {
       this.persist(record)
       this.setStatus(record, 'idle')
       if (opts.prompt) {
-        if (!opts.parentSessionId) this.operatorTurnSessions.add(id)
-        this.journal.append(id, 'session/turn-origin', {
-          origin: opts.parentSessionId ? 'manager' : 'operator',
-          managerSessionId: opts.parentSessionId ?? null,
-        })
+        acceptInitialPrompt()
         await this.executor.runTurn(this.specOf(record), opts.prompt, 'operator')
       }
     }
@@ -2692,6 +2713,7 @@ export class SessionManager {
     override: TurnOverride = {},
     attachmentIds: readonly string[] = []
   ): Promise<void> {
+    this.assertTurnAdmissionOpen()
     const record = this.sessions.get(sessionId)
     if (!record) throw new Error(`unknown session: ${sessionId}`)
     if (record.status === 'stopped') throw new Error('session is stopped')
@@ -3645,6 +3667,7 @@ export class SessionManager {
    * historical path: a new bus-origin turn with full access clamped unless fullAccessAnyOrigin lifts it.
    */
   private deliverBus(sessionId: string): void {
+    if (this.restartTurnAdmissionFrozen) return
     const record = this.sessions.get(sessionId)
     if (!record) return
     if (record.status === 'active' || record.status === 'starting') {

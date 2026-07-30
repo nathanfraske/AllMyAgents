@@ -1594,6 +1594,7 @@ export class HubStore {
       kind === 'question/requested' ||
       kind === 'question/resolved' ||
       kind === 'question/recovery-unknown' ||
+      kind === 'question/restart-interrupted' ||
       kind.startsWith('usage/')
     ) {
       this.scheduleSideRefresh()
@@ -1666,6 +1667,29 @@ export class HubStore {
           text:
             message ??
             'A prior answer could not be verified after recovery. The agent was told to ask again if needed.',
+        })
+        break
+      }
+      case 'question/restart-interrupted': {
+        const interruption = payload as {
+          phase?: 'planned' | 'crash'
+          turnBoundary?: 'completed' | 'unknown'
+          questionCount?: number
+        }
+        const count = interruption.questionCount ?? 1
+        const noun = count === 1 ? 'question' : 'questions'
+        const outcome =
+          interruption.phase === 'planned'
+            ? interruption.turnBoundary === 'completed'
+              ? 'The live Claude callback was released with a system-interruption result, and that exact turn then reached a terminal boundary before restart.'
+              : 'The live callback was released, but whether Claude processed the interruption before restart is unknown.'
+            : 'The previous provider process was not reachable, so no interruption response was delivered to it.'
+        this.push(view, {
+          kind: 'note',
+          ts,
+          text:
+            `SYSTEM INTERRUPTION — NOT A USER RESPONSE. The hub restart interrupted ${count} unanswered ${noun}. ` +
+            `No answer, cancellation, decline, choice, or preference was supplied. ${outcome}`,
         })
         break
       }

@@ -13,6 +13,11 @@ import type { ChildProcess } from 'node:child_process'
 
 /** Bump when a hub change is incompatible with an older on-disk schema (Phase 3 migration guard). */
 export const SCHEMA_VERSION = 1
+export const ASK_RESTART_TURN_GRACE_MS = 10_000
+export const ASK_RESTART_INTERRUPT_MARGIN_MS = 250
+// Worst case: three SQLite writes may each wait the configured 5s busy_timeout, followed by the Ask
+// grace, interrupt dispatch, and listener-close margin. Keep this single-sourced with hubctl.
+export const HUB_DRAIN_RELEASE_TIMEOUT_MS = 30_000
 
 export interface JournalBackupControlCommand {
   type: 'journal-backup-control'
@@ -41,7 +46,10 @@ export type SupervisorMsg =
 /** Hub -> supervisor. */
 export type HubMsg =
   | { type: 'ready'; port: number; restored: number; schemaVersion: number } // after boot() + listening
-  | { type: 'released' } //      drain done: listener closed, port free
+  | {
+      type: 'released'
+      questionTurns: { settled: number; outcomeUnknown: number }
+    } // drain done: listener closed, port free
   | { type: 'drain-failed'; error: string } // blue kept the listener because pre-drain durability failed
   | { type: 'promoted' } //      now listening on the fixed port
   | { type: 'promote-failed'; error: string } // could not bind the fixed port (EADDRINUSE) → supervisor rolls back
@@ -85,6 +93,21 @@ export function waitForHubMsg<T extends HubMsg['type']>(
     }, timeoutMs)
     const onMsg = (m: HubMsg): void => {
       if (m && typeof m === 'object' && m.type === type) {
+        if (type === 'released') {
+          const counts = (m as { questionTurns?: { settled?: unknown; outcomeUnknown?: unknown } })
+            .questionTurns
+          if (
+            !counts ||
+            !Number.isSafeInteger(counts.settled) ||
+            (counts.settled as number) < 0 ||
+            !Number.isSafeInteger(counts.outcomeUnknown) ||
+            (counts.outcomeUnknown as number) < 0
+          ) {
+            cleanup()
+            reject(new Error("invalid hub 'released' question-turn counts"))
+            return
+          }
+        }
         cleanup()
         resolve(m as Extract<HubMsg, { type: T }>)
       } else if (m && typeof m === 'object' && m.type === 'drain-failed' && type === 'released') {

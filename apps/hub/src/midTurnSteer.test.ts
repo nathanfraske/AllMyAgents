@@ -33,7 +33,14 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true })
 })
 
-function build(opts: { steer?: (sessionId: string, text: string) => Promise<void>; pref?: boolean } = {}) {
+function build(
+  opts: {
+    steer?: (sessionId: string, text: string) => Promise<void>
+    pref?: boolean
+    provider?: 'claude' | 'codex'
+    startThread?: () => Promise<string>
+  } = {}
+) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-steer-'))
   dirs.push(dir)
   const journal = new Journal(path.join(dir, 'hub.db'))
@@ -41,9 +48,11 @@ function build(opts: { steer?: (sessionId: string, text: string) => Promise<void
   const store = new SessionStore(journal.db)
   const bus = new AgentBus(journal.db)
   const steer = vi.fn(opts.steer ?? (async () => {}))
+  const startThread = vi.fn(opts.startThread ?? (async () => 'thread-1'))
+  const runTurn = vi.fn(async () => {})
   const executor: Executor = {
-    startThread: async () => 'thread-1',
-    runTurn: async () => {},
+    startThread,
+    runTurn,
     steer,
     interrupt: async () => {},
     stopSession: async () => {},
@@ -52,7 +61,11 @@ function build(opts: { steer?: (sessionId: string, text: string) => Promise<void
     attach: async () => {},
     isBusy: () => true,
   }
-  const profile: Profile = { id: 'p1', provider: 'claude', dir: path.join(dir, 'profile') }
+  const profile: Profile = {
+    id: 'p1',
+    provider: opts.provider ?? 'claude',
+    dir: path.join(dir, 'profile'),
+  }
   const prefs = {
     chatNamePool: 'everyone',
     ...(opts.pref === undefined ? {} : { steerMessagesAtToolBoundary: opts.pref }),
@@ -88,7 +101,7 @@ function build(opts: { steer?: (sessionId: string, text: string) => Promise<void
   }
   ;(sessions as unknown as { sessions: Map<string, SessionRecord> }).sessions.set(record.id, record)
   store.upsert(record)
-  return { sessions, journal, bus, record, steer }
+  return { sessions, journal, bus, record, steer, startThread, runTurn }
 }
 
 async function settle(): Promise<void> {
@@ -97,6 +110,68 @@ async function settle(): Promise<void> {
 }
 
 describe('SessionManager mid-turn steering', () => {
+  it('rechecks admission after async thread creation and never journals a phantom first prompt', async () => {
+    let releaseThread!: () => void
+    const threadReady = new Promise<string>((resolve) => {
+      releaseThread = () => resolve('thread-after-freeze')
+    })
+    const { sessions, journal, startThread, runTurn } = build({
+      provider: 'codex',
+      startThread: () => threadReady,
+    })
+
+    const creating = sessions.create('p1', {
+      prompt: 'must not dispatch after restart freeze',
+    })
+    await vi.waitFor(() => expect(startThread).toHaveBeenCalledOnce())
+    sessions.setRestartTurnAdmissionFrozen(true)
+    releaseThread()
+
+    await expect(creating).rejects.toThrow(/temporarily unavailable/)
+    expect(runTurn).not.toHaveBeenCalled()
+    expect(
+      journal
+        .since(0)
+        .filter(
+          (event) =>
+            event.kind === 'session/input' &&
+            (event.payload as { text?: string }).text ===
+              'must not dispatch after restart freeze'
+        )
+    ).toEqual([])
+  })
+
+  it('freezes operator and idle-bus turn admission until restart rollback releases it', async () => {
+    const { sessions, bus, steer } = build()
+    bus.post({
+      from: {
+        sessionId: 's2',
+        profileId: 'p2',
+        provider: 'claude',
+        projectId: 'proj1',
+        label: 'Teammate',
+      },
+      project: 'proj1',
+      to: { kind: 'session', id: 's1' },
+      body: 'stay queued during restart',
+      recipients: ['s1'],
+    })
+
+    sessions.setRestartTurnAdmissionFrozen(true)
+    await expect(sessions.send('s1', 'new operator input')).rejects.toThrow(
+      /temporarily unavailable/
+    )
+    ;(sessions as unknown as { deliverBus(sessionId: string): void }).deliverBus('s1')
+    await settle()
+    expect(steer).not.toHaveBeenCalled()
+    expect(bus.pending('s1')).toHaveLength(1)
+
+    sessions.setRestartTurnAdmissionFrozen(false)
+    await settle()
+    expect(steer).toHaveBeenCalledOnce()
+    expect(bus.pending('s1')).toHaveLength(0)
+  })
+
   it('delivers a worktree collision as a direct live steer with distinct guardrail provenance', async () => {
     const { sessions, journal, record, steer } = build()
     record.worktree = record.cwd

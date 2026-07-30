@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import Database from 'better-sqlite3'
 import { Journal } from './journal.js'
 import {
+  ASK_INTERRUPTED_BY_RESTART_MESSAGE,
   MAX_PENDING_QUESTIONS_GLOBAL,
   MAX_PENDING_QUESTIONS_PER_SESSION,
   parseQuestionDecisionBody,
@@ -36,6 +41,7 @@ const QUESTIONS: AskUserQuestionInput = {
 }
 
 const opened: Journal[] = []
+const tempDirs: string[] = []
 
 function fresh(journal = new Journal(':memory:')) {
   opened.push(journal)
@@ -57,6 +63,9 @@ function fresh(journal = new Journal(':memory:')) {
 
 afterEach(() => {
   while (opened.length) opened.pop()!.db.close()
+  while (tempDirs.length) {
+    fs.rmSync(tempDirs.pop()!, { recursive: true, force: true })
+  }
 })
 
 describe('QuestionService lifecycle', () => {
@@ -248,7 +257,7 @@ describe('QuestionService lifecycle', () => {
   })
 
   it('keeps an inactive green unable to list, allocate, answer, or cancel blue questions', () => {
-    const { journal, questions: blue, request, count } = fresh()
+    const { journal, questions: blue, request, count, events } = fresh()
     void request()
     const green = new QuestionService(journal)
 
@@ -269,7 +278,7 @@ describe('QuestionService lifecycle', () => {
   })
 
   it('leaves live blue untouched during green construction and terminalizes it only at public activation', async () => {
-    const { journal, questions: blue, request, count } = fresh()
+    const { journal, questions: blue, request, count, events } = fresh()
     const bluePending = request()
     const green = new QuestionService(journal)
 
@@ -280,11 +289,198 @@ describe('QuestionService lifecycle', () => {
     expect(green.activatePublicOwner()).toBe(1)
     expect(blue.pending()).toEqual([])
     await expect(bluePending).resolves.toEqual({
-      kind: 'cancelled',
-      reason: 'hub-restarted',
+      kind: 'interrupted',
+      reason: 'restart',
+      message: ASK_INTERRUPTED_BY_RESTART_MESSAGE,
     })
     expect(count('question/resolved')).toBe(1)
+    expect(
+      events.find((event) => event.kind === 'question/restart-interrupted')
+        ?.payload
+    ).toEqual({
+      reason: 'interrupted_by_restart',
+      phase: 'crash',
+      turnBoundary: 'unknown',
+      questionCount: 1,
+    })
     expect(green.activatePublicOwner()).toBe(0)
+  })
+
+  it('groups planned restart interruption into one durable turn notice and records its exact boundary once', async () => {
+    const { journal, questions, request, events } = fresh()
+    const first = request()
+    const second = questions.request({
+      id: 'q-second',
+      sessionId: 's1',
+      toolUseId: 'toolu_2',
+      requestId: 'control_2',
+      input: QUESTIONS,
+    })
+
+    const interrupted = questions.deactivatePublicOwnerForRestart()
+
+    expect(interrupted).toEqual([
+      expect.objectContaining({ sessionId: 's1', questionCount: 2 }),
+    ])
+    await expect(first).resolves.toEqual({
+      kind: 'interrupted',
+      reason: 'restart',
+      message: ASK_INTERRUPTED_BY_RESTART_MESSAGE,
+    })
+    await expect(second).resolves.toEqual({
+      kind: 'interrupted',
+      reason: 'restart',
+      message: ASK_INTERRUPTED_BY_RESTART_MESSAGE,
+    })
+    expect(
+      journal.db
+        .prepare("SELECT status FROM question_lifecycles ORDER BY id")
+        .all()
+    ).toEqual([{ status: 'interrupted' }, { status: 'interrupted' }])
+    expect(events.filter((event) => event.kind === 'question/restart-interrupted')).toEqual([])
+    expect(JSON.stringify(journal.since(0))).not.toContain(
+      'ALLMYAGENTS_ASK_INTERRUPTED_BY_RESTART_V1'
+    )
+
+    expect(
+      questions.recordRestartBoundaries(interrupted, new Set(['s1']))
+    ).toBe(1)
+    expect(
+      questions.recordRestartBoundaries(interrupted, new Set(['s1']))
+    ).toBe(0)
+    expect(
+      events
+        .filter((event) => event.kind === 'question/restart-interrupted')
+        .map((event) => event.payload)
+    ).toEqual([
+      {
+        reason: 'interrupted_by_restart',
+        phase: 'planned',
+        turnBoundary: 'completed',
+        questionCount: 2,
+      },
+    ])
+
+    questions.activatePublicOwner()
+    const third = questions.request({
+      id: 'q-third',
+      sessionId: 's1',
+      toolUseId: 'toolu_3',
+      requestId: 'control_3',
+      input: QUESTIONS,
+    })
+    const secondDrain = questions.deactivatePublicOwnerForRestart()
+    expect(secondDrain[0]!.restartGeneration).not.toBe(
+      interrupted[0]!.restartGeneration
+    )
+    await expect(third).resolves.toMatchObject({
+      kind: 'interrupted',
+      reason: 'restart',
+    })
+    expect(
+      questions.recordRestartBoundaries(secondDrain, new Set(['s1']))
+    ).toBe(1)
+    expect(
+      events.filter((event) => event.kind === 'question/restart-interrupted')
+    ).toHaveLength(2)
+  })
+
+  it('settles callbacks from the committed batch receipt without a fallible post-commit reread', async () => {
+    const { journal, questions, request } = fresh()
+    const pending = request()
+    const resolvedQuestion = vi
+      .spyOn(journal, 'resolvedQuestion')
+      .mockImplementation(() => {
+        throw new Error('post-commit read unavailable')
+      })
+
+    const interrupted = questions.deactivatePublicOwnerForRestart()
+
+    expect(resolvedQuestion).not.toHaveBeenCalled()
+    expect(questions.isPublicOwner).toBe(false)
+    expect(interrupted[0]).toMatchObject({
+      sessionId: 's1',
+      questionCount: 1,
+      questionIds: ['q-stable'],
+    })
+    await expect(pending).resolves.toEqual({
+      kind: 'interrupted',
+      reason: 'restart',
+      message: ASK_INTERRUPTED_BY_RESTART_MESSAGE,
+    })
+  })
+
+  it('turns a crash-left pending notice into one unknown notification without retrying a provider', async () => {
+    const { journal, questions: blue, request, events } = fresh()
+    const pending = request()
+    const interrupted = blue.deactivatePublicOwnerForRestart()
+    await expect(pending).resolves.toMatchObject({
+      kind: 'interrupted',
+      reason: 'restart',
+    })
+    expect(events.filter((event) => event.kind === 'question/restart-interrupted')).toEqual([])
+
+    const successor = new QuestionService(journal)
+    expect(successor.activatePublicOwner()).toBe(0)
+    expect(successor.activatePublicOwner()).toBe(0)
+    expect(blue.recordRestartBoundaries(interrupted, new Set())).toBe(0)
+    expect(
+      events
+        .filter((event) => event.kind === 'question/restart-interrupted')
+        .map((event) => event.payload)
+    ).toEqual([
+      {
+        reason: 'interrupted_by_restart',
+        phase: 'planned',
+        turnBoundary: 'unknown',
+        questionCount: 1,
+      },
+    ])
+  })
+
+  it('transactionally widens the prior candidate lifecycle CHECK without losing rows', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-question-migration-'))
+    tempDirs.push(dir)
+    const file = path.join(dir, 'hub.db')
+    const legacy = new Database(file)
+    legacy.exec(`
+      CREATE TABLE question_lifecycles (
+        id TEXT PRIMARY KEY,
+        session TEXT NOT NULL,
+        correlation_digest TEXT NOT NULL,
+        tool_use_id_length INTEGER NOT NULL,
+        request_id_length INTEGER NOT NULL,
+        question_digest TEXT NOT NULL,
+        owner_epoch TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'answered', 'cancelled', 'aborted')),
+        terminal_reason TEXT,
+        input_bytes INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO question_lifecycles VALUES
+        ('legacy', 's1', 'corr', 4, 7, 'digest', 'old-owner', 'aborted', 'hub-restarted', 10, '2026-01-01T00:00:00.000Z');
+    `)
+    legacy.close()
+
+    const journal = new Journal(file)
+    opened.push(journal)
+    expect(journal.resolvedQuestion('legacy')).toMatchObject({
+      status: 'aborted',
+      reason: 'hub-restarted',
+    })
+    const sql = (
+      journal.db
+        .prepare("SELECT sql FROM sqlite_master WHERE name = 'question_lifecycles'")
+        .get() as { sql: string }
+    ).sql
+    expect(sql).toContain("'interrupted'")
+    journal.db
+      .prepare(
+        `INSERT INTO question_lifecycles VALUES
+         ('new', 's1', 'corr2', 4, 7, 'digest2', 'new-owner', 'interrupted',
+          'interrupted_by_restart', 10, '2026-01-01T00:00:01.000Z')`
+      )
+      .run()
   })
 
   it('rolls back the whole foreign terminalization set when one audit append fails', async () => {
@@ -315,8 +511,16 @@ describe('QuestionService lifecycle', () => {
     append.mockRestore()
     expect(green.activatePublicOwner()).toBe(2)
     expect(blue.pending()).toEqual([])
-    await expect(first).resolves.toEqual({ kind: 'cancelled', reason: 'hub-restarted' })
-    await expect(second).resolves.toEqual({ kind: 'cancelled', reason: 'hub-restarted' })
+    await expect(first).resolves.toEqual({
+      kind: 'interrupted',
+      reason: 'restart',
+      message: ASK_INTERRUPTED_BY_RESTART_MESSAGE,
+    })
+    await expect(second).resolves.toEqual({
+      kind: 'interrupted',
+      reason: 'restart',
+      message: ASK_INTERRUPTED_BY_RESTART_MESSAGE,
+    })
     expect(count('question/resolved')).toBe(2)
   })
 

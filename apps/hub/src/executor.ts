@@ -14,6 +14,7 @@ import type { ManagerSpawnResult } from './agentToolCore.js'
 import type { SessionIdentity } from './identity.js'
 import type { ApprovalService } from './approvals.js'
 import {
+  ASK_UNAVAILABLE_MESSAGE,
   QuestionInputError,
   QuestionOwnershipError,
   type QuestionService,
@@ -31,6 +32,7 @@ import {
 } from './workerProtocol.js'
 import { checkWriteScope } from './writeScope.js'
 import type { AttachmentMeta } from './attachments.js'
+import { ASK_RESTART_INTERRUPT_MARGIN_MS } from './restartHandshake.js'
 
 /**
  * The Executor seam (docs/agent-worker-impl.md §4.1). Agent execution — the ClaudeDriver / CodexClient
@@ -65,6 +67,15 @@ export interface Executor {
   attach(since: Record<string, number>): Promise<void>
   /** True while this session's claude driver is mid-turn — backs the "a turn is already in progress" guard. */
   isBusy(sessionId: string): boolean
+  /**
+   * Snapshot the exact in-process turn promises currently owning unanswered questions, then observe their
+   * terminal boundary without confusing a stale terminal with a later turn. Worker mode never implements
+   * this because AskUserQuestion is denied before crossing its unauthenticated control channel.
+   */
+  settleQuestionTurnsForRestart?(
+    sessionIds: readonly string[],
+    timeoutMs: number
+  ): Promise<{ settled: string[]; outcomeUnknown: string[] }>
   /**
    * Push the live Danger Zone flags to the executor so the worker's cached `danger()` (read by the MCP
    * gates, §3.3) stays current. WORKER-MODE ONLY: the in-process executor reads the shared `danger`
@@ -219,6 +230,10 @@ export class InProcessExecutor implements Executor {
   // for the whole window a tool handler can run in. Set from runTurn's `origin`, cleared in `finally`;
   // read by the self-gate + canUseTool to hard-deny risky in-process tools on bus turns.
   private readonly busTurnSessions = new Set<string>()
+  private readonly turnSettlements = new Map<
+    string,
+    { token: symbol; promise: Promise<void> }
+  >()
   private hub: InProcessExecutorHubHooks | undefined
 
   constructor(private readonly services: InProcessExecutorServices) {}
@@ -390,25 +405,26 @@ export class InProcessExecutor implements Executor {
               if (outcome.kind === 'answered') {
                 return { behavior: 'allow', updatedInput: outcome.updatedInput }
               }
+              if (outcome.kind === 'interrupted') {
+                return { behavior: 'deny', message: outcome.message }
+              }
               return {
                 behavior: 'deny',
                 message:
                   outcome.reason === 'aborted'
                     ? 'The question was cancelled because the turn was interrupted.'
-                    : outcome.reason === 'hub-restarted'
-                      ? 'The question was cancelled because the hub restarted. Ask again if it is still needed.'
-                      : outcome.reason === 'worker-restarted'
-                        ? 'The question was cancelled because the agent worker restarted. Ask again if it is still needed.'
                     : outcome.reason === 'recovery-unknown'
                       ? 'The answer was submitted before a hub restart, but exact delivery could not be verified. Ask again if the answer is still needed.'
+                    : outcome.reason === 'unavailable'
+                      ? outcome.message ??
+                        'AskUserQuestion is unavailable; no user response was inferred.'
                       : 'The user cancelled the question.',
               }
             } catch (error) {
               if (error instanceof QuestionOwnershipError) {
                 return {
                   behavior: 'deny',
-                  message:
-                    'AskUserQuestion is temporarily unavailable because this hub does not own the public question lifecycle.',
+                  message: ASK_UNAVAILABLE_MESSAGE,
                 }
               }
               if (
@@ -509,9 +525,68 @@ export class InProcessExecutor implements Executor {
     // fire-and-forget (the turn runs to completion in the background); a codex turn awaits through the
     // turn/start ack. Both turn loops catch their own errors, so neither rejects.
     if (spec.provider === 'claude') {
-      void this.runClaudeTurn(spec, prompt, origin, attachments)
+      const token = Symbol(spec.sessionId)
+      const promise = this.runClaudeTurn(spec, prompt, origin, attachments)
+      this.turnSettlements.set(spec.sessionId, { token, promise })
+      const clear = (): void => {
+        if (this.turnSettlements.get(spec.sessionId)?.token === token) {
+          this.turnSettlements.delete(spec.sessionId)
+        }
+      }
+      void promise.then(clear, clear)
     } else {
       await this.runCodexTurn(spec, prompt, origin, attachments)
+    }
+  }
+
+  async settleQuestionTurnsForRestart(
+    sessionIds: readonly string[],
+    timeoutMs: number
+  ): Promise<{ settled: string[]; outcomeUnknown: string[] }> {
+    const snapshots = [...new Set(sessionIds)].map((sessionId) => ({
+      sessionId,
+      promise: this.turnSettlements.get(sessionId)?.promise,
+    }))
+    const settled = new Set<string>()
+    const observed = snapshots.map(({ sessionId, promise }) => {
+      if (!promise) return Promise.resolve()
+      return promise.finally(() => {
+        settled.add(sessionId)
+      })
+    })
+    let timer: NodeJS.Timeout | undefined
+    await Promise.race([
+      Promise.allSettled(observed),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, Math.max(0, timeoutMs))
+      }),
+    ])
+    if (timer) clearTimeout(timer)
+    const outcomeUnknown = snapshots
+      .filter(({ sessionId, promise }) => !promise || !settled.has(sessionId))
+      .map(({ sessionId }) => sessionId)
+    const expiredExactHandles = snapshots
+      .filter(({ sessionId, promise }) => promise && !settled.has(sessionId))
+      .map(({ sessionId }) => sessionId)
+    if (expiredExactHandles.length) {
+      // Dispatch and briefly observe every interrupt before listener release. The handshake owns the shared
+      // bounded drain deadline, so an unresponsive provider remains unknown rather than holding the port.
+      let interruptTimer: NodeJS.Timeout | undefined
+      await Promise.race([
+        Promise.allSettled(
+          expiredExactHandles.map((sessionId) => this.interrupt(sessionId))
+        ),
+        new Promise<void>((resolve) => {
+          interruptTimer = setTimeout(resolve, ASK_RESTART_INTERRUPT_MARGIN_MS)
+        }),
+      ])
+      if (interruptTimer) clearTimeout(interruptTimer)
+    }
+    return {
+      settled: snapshots
+        .filter(({ sessionId, promise }) => promise && settled.has(sessionId))
+        .map(({ sessionId }) => sessionId),
+      outcomeUnknown,
     }
   }
 

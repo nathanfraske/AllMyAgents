@@ -13,6 +13,7 @@ import type { JournalBackupRuntimeState } from './journalBackup.js'
 import type { Journal } from './journal.js'
 import type { QuestionService } from './questions.js'
 import type { SessionManager } from './sessions.js'
+import { ASK_RESTART_TURN_GRACE_MS } from './restartHandshake.js'
 
 /** Shared by reference with server.ts, which reads it for /api/health + the draining 503 guard and
  *  tracks live sockets so drain() can free the port. */
@@ -44,6 +45,8 @@ export interface RestartControllerDeps {
   // ONLY: the in-process executor implements no signalDraining, so both calls are a no-op and the flag-off
   // restart path is byte-identical.
   executor: Executor
+  /** Test override; production uses the handshake layer's shared grace. */
+  questionTurnGraceMs?: number
 }
 
 export class RestartController {
@@ -93,17 +96,64 @@ export class RestartController {
    * open forever; the clients auto-reconnect to green — then close the listener and signal `released`.
    */
   async drain(): Promise<void> {
-    const { server, journal, questions, state, executor } = this.deps
+    const { server, journal, questions, sessions, state, executor } = this.deps
+    state.draining = true
+    sessions.setRestartTurnAdmissionFrozen(true)
     // An in-process SDK callback cannot survive process retirement. Close every question durably and
     // settle its callback BEFORE releasing the public listener; if SQLite is BUSY/FULL/I/O-failed this
     // throws and the drain stops here, leaving blue authoritative for the supervisor's rollback.
-    questions.deactivatePublicOwner()
+    let interrupted
+    try {
+      interrupted = questions.deactivatePublicOwnerForRestart()
+    } catch (error) {
+      state.draining = false
+      sessions.setRestartTurnAdmissionFrozen(false)
+      throw error
+    }
     // FIRST, before we close anything: tell the worker we're draining so it HOLDS new relays (queues them
     // without racing the about-to-die socket) — a planned flip then has zero failed in-flight sends; green's
     // attach flushes them (§8.4). No-op in-process (no worker to drain), so flag-off is unchanged.
-    executor.signalDraining?.(true)
-    state.draining = true
-    journal.append(null, 'hub/draining', {})
+    let boundary: { settled: string[]; outcomeUnknown: string[] }
+    try {
+      executor.signalDraining?.(true)
+      journal.append(null, 'hub/draining', {})
+      const sessionIds = interrupted.map((turn) => turn.sessionId)
+      boundary =
+        sessionIds.length === 0
+          ? { settled: [], outcomeUnknown: [] }
+          : executor.settleQuestionTurnsForRestart
+            ? await executor.settleQuestionTurnsForRestart(
+                sessionIds,
+                this.deps.questionTurnGraceMs ?? ASK_RESTART_TURN_GRACE_MS
+              )
+            : { settled: [], outcomeUnknown: sessionIds }
+      questions.recordRestartBoundaries(interrupted, new Set(boundary.settled))
+    } catch (error) {
+      // The listener is still bound. Reclaim every public mutation boundary before reporting drain-failed;
+      // interruption rows remain truthful and activation turns any unfinished notice into outcome-unknown.
+      try {
+        questions.activatePublicOwner()
+        sessions.setRestartTurnAdmissionFrozen(false)
+        executor.signalDraining?.(false)
+        state.draining = false
+      } catch (reclaimError) {
+        state.draining = true
+        const message = `pre-close drain failed and blue could not reclaim ownership: ${
+          reclaimError instanceof Error ? reclaimError.message : String(reclaimError)
+        }`
+        state.journalBackup = { status: 'degraded', error: message }
+        for (const socket of state.sockets) socket.destroy()
+        state.sockets.clear()
+        await new Promise<void>((resolve) => {
+          if (!server.listening) return resolve()
+          server.close(() => resolve())
+        })
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}; ${message}`
+        )
+      }
+      throw error
+    }
     for (const s of state.sockets) {
       try {
         s.destroy()
@@ -119,7 +169,13 @@ export class RestartController {
     } finally {
       if (this.listenerTransition === transition) this.listenerTransition = undefined
     }
-    this.notifySupervisor({ type: 'released' })
+    this.notifySupervisor({
+      type: 'released',
+      questionTurns: {
+        settled: boundary.settled.length,
+        outcomeUnknown: boundary.outcomeUnknown.length,
+      },
+    })
   }
 
   /**
@@ -252,6 +308,7 @@ export class RestartController {
         // the old callbacks. Do not expose the listener or release worker relays until this durable claim
         // succeeds.
         questions.activatePublicOwner()
+        this.deps.sessions.setRestartTurnAdmissionFrozen(false)
         executor.signalDraining?.(false)
         state.draining = false
         this.notifySupervisor({ type: 'rollback-rebound' })

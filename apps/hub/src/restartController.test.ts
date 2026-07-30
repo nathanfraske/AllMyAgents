@@ -1,6 +1,7 @@
 import http from 'node:http'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { RestartController, type RestartControllerDeps } from './restartController.js'
+import { ASK_RESTART_TURN_GRACE_MS } from './restartHandshake.js'
 
 const servers: http.Server[] = []
 
@@ -43,8 +44,17 @@ function controllerDeps(
     onPromoted: () => {},
     stopJournalBackups: async () => {},
     journal: { append: () => {} },
-    questions: { deactivatePublicOwner: () => 0, activatePublicOwner: () => 0 },
-    sessions: { reconcileStale: () => {}, shutdown: async () => {} },
+    questions: {
+      deactivatePublicOwner: () => 0,
+      deactivatePublicOwnerForRestart: () => [],
+      recordRestartBoundaries: () => 0,
+      activatePublicOwner: () => 0,
+    },
+    sessions: {
+      reconcileStale: () => {},
+      shutdown: async () => {},
+      setRestartTurnAdmissionFrozen: () => {},
+    },
     executor: {},
   } as unknown as RestartControllerDeps
 }
@@ -55,20 +65,121 @@ describe('RestartController journal backup ownership', () => {
     const publicPort = await listenEphemeral(server)
     const sent: unknown[] = []
     const deps = controllerDeps(server, publicPort, sent)
-    const deactivatePublicOwner = vi.fn(() => {
+    const deactivatePublicOwnerForRestart = vi.fn(() => {
       throw new Error('SQLITE_FULL while terminalizing questions')
     })
-    deps.questions = { deactivatePublicOwner } as never
+    deps.questions = {
+      ...deps.questions,
+      deactivatePublicOwnerForRestart,
+    } as never
     const signalDraining = vi.fn()
     deps.executor = { signalDraining } as never
 
     await expect(new RestartController(deps).drain()).rejects.toThrow(/SQLITE_FULL/)
-    expect(deactivatePublicOwner).toHaveBeenCalledTimes(1)
+    expect(deactivatePublicOwnerForRestart).toHaveBeenCalledTimes(1)
     expect(signalDraining).not.toHaveBeenCalled()
     expect(server.listening).toBe(true)
     expect(deps.state.draining).toBe(false)
     expect(sent).toEqual([])
   })
+
+  it('waits on exact question-turn handles and reports typed settled evidence before release', async () => {
+    const server = http.createServer()
+    const publicPort = await listenEphemeral(server)
+    const sent: unknown[] = []
+    const deps = controllerDeps(server, publicPort, sent)
+    const freeze = vi.fn()
+    deps.sessions.setRestartTurnAdmissionFrozen = freeze
+    const interrupted = [
+      {
+        restartGeneration: 'drain-1',
+        sessionId: 's1',
+        questionCount: 2,
+        questionIds: ['q1', 'q2'],
+      },
+    ]
+    const recordRestartBoundaries = vi.fn(() => 1)
+    deps.questions.deactivatePublicOwnerForRestart = vi.fn(() => interrupted)
+    deps.questions.recordRestartBoundaries = recordRestartBoundaries
+    const settleQuestionTurnsForRestart = vi.fn(async () => ({
+      settled: ['s1'],
+      outcomeUnknown: [],
+    }))
+    deps.executor = { settleQuestionTurnsForRestart } as never
+
+    await new RestartController(deps).drain()
+
+    expect(freeze).toHaveBeenCalledWith(true)
+    expect(settleQuestionTurnsForRestart).toHaveBeenCalledWith(
+      ['s1'],
+      ASK_RESTART_TURN_GRACE_MS
+    )
+    expect(recordRestartBoundaries).toHaveBeenCalledWith(
+      interrupted,
+      new Set(['s1'])
+    )
+    expect(sent).toEqual([
+      {
+        type: 'released',
+        questionTurns: { settled: 1, outcomeUnknown: 0 },
+      },
+    ])
+  })
+
+  it.each(['signal', 'journal', 'settle', 'record'] as const)(
+    'reclaims the still-bound blue after a pre-close %s failure',
+    async (phase) => {
+      const server = http.createServer()
+      const publicPort = await listenEphemeral(server)
+      const sent: unknown[] = []
+      const deps = controllerDeps(server, publicPort, sent)
+      const freeze = vi.fn()
+      deps.sessions.setRestartTurnAdmissionFrozen = freeze
+      const activatePublicOwner = vi.fn(() => 0)
+      deps.questions = {
+        ...deps.questions,
+        deactivatePublicOwnerForRestart: () => [
+          {
+            restartGeneration: 'drain-1',
+            sessionId: 's1',
+            questionCount: 1,
+            questionIds: ['q1'],
+          },
+        ],
+        recordRestartBoundaries: () => {
+          if (phase === 'record') throw new Error('record failed')
+          return 1
+        },
+        activatePublicOwner,
+      } as never
+      const signalDraining = vi.fn((draining: boolean) => {
+        if (phase === 'signal' && draining) throw new Error('signal failed')
+      })
+      deps.executor = {
+        signalDraining,
+        settleQuestionTurnsForRestart: async () => {
+          if (phase === 'settle') throw new Error('settle failed')
+          return { settled: ['s1'], outcomeUnknown: [] }
+        },
+      } as never
+      const append = deps.journal.append.bind(deps.journal)
+      deps.journal.append = (...args: Parameters<typeof append>) => {
+        if (phase === 'journal') throw new Error('journal failed')
+        return append(...args)
+      }
+
+      await expect(new RestartController(deps).drain()).rejects.toThrow(
+        new RegExp(`${phase} failed`)
+      )
+
+      expect(server.listening).toBe(true)
+      expect(deps.state.draining).toBe(false)
+      expect(activatePublicOwner).toHaveBeenCalledOnce()
+      expect(freeze.mock.calls).toEqual([[true], [false]])
+      expect(signalDraining).toHaveBeenLastCalledWith(false)
+      expect(sent).toEqual([])
+    }
+  )
 
   it('settles and permanently stops backup work before a planned blue retire exits', async () => {
     const order: string[] = []
@@ -155,6 +266,7 @@ describe('RestartController journal backup ownership', () => {
     const sent: unknown[] = []
     const deps = controllerDeps(server, publicPort, sent)
     deps.questions = {
+      ...deps.questions,
       deactivatePublicOwner: () => 0,
       activatePublicOwner: () => {
         throw new Error('SQLITE_IOERR during public claim')
@@ -184,11 +296,13 @@ describe('RestartController journal backup ownership', () => {
       const deps = controllerDeps(server, publicPort, sent)
       const deactivatePublicOwner = vi.fn(() => 0)
       deps.questions = {
+        ...deps.questions,
         activatePublicOwner: () => 0,
         deactivatePublicOwner,
       } as never
       if (phase === 'reconcile') {
         deps.sessions = {
+          ...deps.sessions,
           reconcileStale: () => {
             throw new Error('reconcile failed')
           },
@@ -220,9 +334,13 @@ describe('RestartController journal backup ownership', () => {
     const publicPort = await listenEphemeral(server)
     const sent: unknown[] = []
     const deps = controllerDeps(server, publicPort, sent)
-    const deactivatePublicOwner = vi.fn(() => 0)
+    const deactivatePublicOwnerForRestart = vi.fn(() => [])
     const activatePublicOwner = vi.fn(() => 0)
-    deps.questions = { deactivatePublicOwner, activatePublicOwner } as never
+    deps.questions = {
+      ...deps.questions,
+      deactivatePublicOwnerForRestart,
+      activatePublicOwner,
+    } as never
     const signalDraining = vi.fn()
     deps.executor = { signalDraining } as never
     const controller = new RestartController(deps)
@@ -234,7 +352,7 @@ describe('RestartController journal backup ownership', () => {
     expect((server.address() as { port: number }).port).toBe(publicPort)
     expect(sent).toContainEqual({ type: 'rollback-rebound' })
     expect(deps.state.rollbackRebinding).toBe(false)
-    expect(deactivatePublicOwner).toHaveBeenCalledTimes(1)
+    expect(deactivatePublicOwnerForRestart).toHaveBeenCalledTimes(1)
     expect(activatePublicOwner).toHaveBeenCalledTimes(1)
     expect(signalDraining.mock.calls).toEqual([[true], [false]])
   })
@@ -246,6 +364,7 @@ describe('RestartController journal backup ownership', () => {
     const deps = controllerDeps(server, publicPort, sent)
     const activatePublicOwner = vi.fn(() => 0)
     deps.questions = {
+      ...deps.questions,
       deactivatePublicOwner: vi.fn(() => 0),
       activatePublicOwner,
     } as never
@@ -267,6 +386,7 @@ describe('RestartController journal backup ownership', () => {
     const sent: unknown[] = []
     const deps = controllerDeps(server, publicPort, sent)
     deps.questions = {
+      ...deps.questions,
       deactivatePublicOwner: vi.fn(() => 0),
       activatePublicOwner: vi.fn(() => {
         throw new Error('SQLITE_FULL during rollback claim')
@@ -305,7 +425,13 @@ describe('RestartController journal backup ownership', () => {
     const aborting = controller.abort('overlapping rollback')
     await Promise.all([draining, aborting])
 
-    expect(sent).toEqual([{ type: 'released' }, { type: 'rollback-rebound' }])
+    expect(sent).toEqual([
+      {
+        type: 'released',
+        questionTurns: { settled: 0, outcomeUnknown: 0 },
+      },
+      { type: 'rollback-rebound' },
+    ])
     expect(server.listening).toBe(true)
     expect((server.address() as { port: number }).port).toBe(publicPort)
   })

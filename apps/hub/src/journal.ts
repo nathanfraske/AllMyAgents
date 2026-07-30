@@ -13,10 +13,10 @@ import type { ApprovalStatus, HubEvent } from './types.js'
 
 export interface ResolvedQuestion {
   sessionId: string
-  status: 'answered' | 'cancelled' | 'aborted'
+  status: 'answered' | 'cancelled' | 'aborted' | 'interrupted'
   correlationDigest: string
   questionDigest: string
-  reason?: 'hub-restarted' | 'worker-restarted'
+  reason?: 'hub-restarted' | 'worker-restarted' | 'interrupted_by_restart'
 }
 
 export interface DurableQuestion {
@@ -37,6 +37,14 @@ export interface RegisterQuestionResult {
 export interface ResolveQuestionResult {
   written: boolean
   state: ResolvedQuestion
+}
+
+export interface RestartInterruptedTurn {
+  restartGeneration: string
+  sessionId: string
+  questionCount: number
+  /** Owner-process receipt only; never persisted or journaled. */
+  questionIds: readonly string[]
 }
 
 /**
@@ -158,14 +166,79 @@ export class Journal extends EventEmitter {
         request_id_length INTEGER NOT NULL,
         question_digest TEXT NOT NULL,
         owner_epoch TEXT NOT NULL,
-        status TEXT NOT NULL CHECK (status IN ('pending', 'answered', 'cancelled', 'aborted')),
+        status TEXT NOT NULL CHECK (status IN ('pending', 'answered', 'cancelled', 'aborted', 'interrupted')),
         terminal_reason TEXT,
         input_bytes INTEGER NOT NULL,
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_question_lifecycles_pending
         ON question_lifecycles(status, session);
+      CREATE TABLE IF NOT EXISTS question_restart_interruptions (
+        restart_generation TEXT NOT NULL,
+        session TEXT NOT NULL,
+        phase TEXT NOT NULL CHECK (phase IN ('planned', 'crash')),
+        boundary TEXT NOT NULL CHECK (boundary IN ('pending', 'completed', 'unknown')),
+        question_count INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (restart_generation, session)
+      );
+      CREATE INDEX IF NOT EXISTS idx_question_restart_interruptions_pending
+        ON question_restart_interruptions(boundary, session);
     `)
+    // The immediately preceding Ask candidate allowed only `aborted`. A test/live candidate DB can survive
+    // into this build even though older public releases had no table at all. Widen the CHECK transactionally
+    // instead of relying on CREATE TABLE IF NOT EXISTS, which never updates an existing constraint.
+    const questionLifecycleSql = (
+      this.db
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'question_lifecycles'")
+        .get() as { sql?: string } | undefined
+    )?.sql
+    if (questionLifecycleSql && !questionLifecycleSql.includes("'interrupted'")) {
+      try {
+        this.db.exec(`
+          BEGIN IMMEDIATE;
+          DROP INDEX IF EXISTS idx_question_lifecycles_pending;
+          ALTER TABLE question_lifecycles RENAME TO question_lifecycles_before_interrupted;
+          CREATE TABLE question_lifecycles (
+            id TEXT PRIMARY KEY,
+            session TEXT NOT NULL,
+            correlation_digest TEXT NOT NULL,
+            tool_use_id_length INTEGER NOT NULL,
+            request_id_length INTEGER NOT NULL,
+            question_digest TEXT NOT NULL,
+            owner_epoch TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('pending', 'answered', 'cancelled', 'aborted', 'interrupted')),
+            terminal_reason TEXT,
+            input_bytes INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+          );
+          INSERT INTO question_lifecycles
+            (id, session, correlation_digest, tool_use_id_length, request_id_length,
+             question_digest, owner_epoch, status, terminal_reason, input_bytes, created_at)
+          SELECT id, session, correlation_digest, tool_use_id_length, request_id_length,
+                 question_digest, owner_epoch, status, terminal_reason, input_bytes, created_at
+          FROM question_lifecycles_before_interrupted;
+          DROP TABLE question_lifecycles_before_interrupted;
+          CREATE INDEX idx_question_lifecycles_pending
+            ON question_lifecycles(status, session);
+          COMMIT;
+        `)
+      } catch (error) {
+        try {
+          this.db.exec('ROLLBACK')
+        } catch {
+          /* transaction may already have rolled back */
+        }
+        const racedSql = (
+          this.db
+            .prepare(
+              "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'question_lifecycles'"
+            )
+            .get() as { sql?: string } | undefined
+        )?.sql
+        if (!racedSql?.includes("'interrupted'")) throw error
+      }
+    }
     // Additive, back-compat: tag worker-relayed events with their per-session worker seq so a restarted
     // hub can derive the durable re-attach cursor MAX(wseq) (docs/agent-worker-impl.md §7.1). Old rows
     // are NULL. Guarded so re-running on an already-migrated DB is a no-op.
@@ -1309,16 +1382,22 @@ export class Journal extends EventEmitter {
     })
   }
 
-  /** Foreign-owner pending rows have no callback in this process; close them before public promotion. */
-  terminalizeForeignQuestions(ownerEpoch: string): number {
+  /**
+   * Planned blue drain: atomically close every callback owned by this process and retain only a body-free
+   * marker saying its containing turn still needs an observed terminal boundary.
+   */
+  terminalizeOwnedQuestionsForRestart(
+    ownerEpoch: string,
+    restartGeneration: string
+  ): RestartInterruptedTurn[] {
     return this.atomic(() => {
       const rows = this.db
         .prepare(
           `SELECT id FROM question_lifecycles
-           WHERE status = 'pending' AND owner_epoch <> ? ORDER BY created_at, id`
+           WHERE status = 'pending' AND owner_epoch = ? ORDER BY created_at, id`
         )
         .all(ownerEpoch) as Array<{ id: string }>
-      let count = 0
+      const questionIds = new Map<string, string[]>()
       for (const { id } of rows) {
         const state = this.questionLifecycle(id)
         if (!state || state.status !== 'pending') continue
@@ -1329,11 +1408,147 @@ export class Journal extends EventEmitter {
             correlationDigest: state.correlationDigest,
             questionDigest: state.questionDigest,
           },
-          'aborted',
-          'hub-restarted'
+          'interrupted',
+          'interrupted_by_restart'
         )
-        if (result.written) count += 1
+        if (!result.written) continue
+        const ids = questionIds.get(state.sessionId) ?? []
+        ids.push(id)
+        questionIds.set(state.sessionId, ids)
       }
+      const interrupted = [...questionIds].map(([sessionId, ids]) => ({
+        restartGeneration,
+        sessionId,
+        questionCount: ids.length,
+        questionIds: ids,
+      }))
+      for (const turn of interrupted) {
+        this.db
+          .prepare(
+            `INSERT OR IGNORE INTO question_restart_interruptions
+               (restart_generation, session, phase, boundary, question_count, created_at)
+             VALUES (?, ?, 'planned', 'pending', ?, ?)`
+          )
+          .run(
+            restartGeneration,
+            turn.sessionId,
+            turn.questionCount,
+            new Date().toISOString()
+          )
+      }
+      return interrupted
+    })
+  }
+
+  /**
+   * Record the observed same-turn boundary before blue releases its listener. A timeout is deliberately
+   * "unknown", not a fabricated cancellation or a fresh provider turn. The CAS makes notification
+   * idempotent across duplicate supervisor messages.
+   */
+  completeQuestionRestartInterruptions(
+    interrupted: readonly RestartInterruptedTurn[],
+    completedSessionIds: ReadonlySet<string>
+  ): number {
+    return this.atomic(() => {
+      let written = 0
+      for (const turn of interrupted) {
+        const boundary = completedSessionIds.has(turn.sessionId) ? 'completed' : 'unknown'
+        const changed = this.db
+          .prepare(
+            `UPDATE question_restart_interruptions
+             SET boundary = ?
+             WHERE restart_generation = ? AND session = ? AND boundary = 'pending'`
+          )
+          .run(boundary, turn.restartGeneration, turn.sessionId)
+        if (changed.changes !== 1) continue
+        this.append(turn.sessionId, 'question/restart-interrupted', {
+          reason: 'interrupted_by_restart',
+          phase: this.db
+            .prepare(
+              `SELECT phase FROM question_restart_interruptions
+               WHERE restart_generation = ? AND session = ?`
+            )
+            .pluck()
+            .get(turn.restartGeneration, turn.sessionId),
+          turnBoundary: boundary,
+          questionCount: turn.questionCount,
+        })
+        written += 1
+      }
+      return written
+    })
+  }
+
+  /** Foreign-owner rows have no callback in this process; close and surface them before promotion. */
+  terminalizeForeignQuestions(ownerEpoch: string): number {
+    return this.atomic(() => {
+      const rows = this.db
+        .prepare(
+          `SELECT id FROM question_lifecycles
+           WHERE status = 'pending' AND owner_epoch <> ? ORDER BY created_at, id`
+        )
+        .all(ownerEpoch) as Array<{ id: string }>
+      let count = 0
+      const counts = new Map<string, Map<string, number>>()
+      for (const { id } of rows) {
+        const state = this.questionLifecycle(id)
+        if (!state || state.status !== 'pending') continue
+        const result = this.resolveQuestion(
+          id,
+          {
+            sessionId: state.sessionId,
+            correlationDigest: state.correlationDigest,
+            questionDigest: state.questionDigest,
+          },
+          'interrupted',
+          'interrupted_by_restart'
+        )
+        if (!result.written) continue
+        let sessions = counts.get(state.ownerEpoch)
+        if (!sessions) {
+          sessions = new Map()
+          counts.set(state.ownerEpoch, sessions)
+        }
+        sessions.set(state.sessionId, (sessions.get(state.sessionId) ?? 0) + 1)
+        count += 1
+      }
+      for (const [sourceOwnerEpoch, sessions] of counts) {
+        for (const [sessionId, questionCount] of sessions) {
+          this.db
+            .prepare(
+              `INSERT OR IGNORE INTO question_restart_interruptions
+                 (restart_generation, session, phase, boundary, question_count, created_at)
+               VALUES (?, ?, 'crash', 'pending', ?, ?)`
+            )
+            .run(
+              `crash:${sourceOwnerEpoch}`,
+              sessionId,
+              questionCount,
+              new Date().toISOString()
+            )
+        }
+      }
+
+      // A hard kill can happen after planned terminalization but before blue records whether the same turn
+      // finished. The public successor may surface that ambiguity exactly once, but must never retry it.
+      const pending = this.db
+        .prepare(
+          `SELECT restart_generation AS restartGeneration, session AS sessionId,
+                  question_count AS questionCount
+           FROM question_restart_interruptions
+           WHERE boundary = 'pending'
+           ORDER BY created_at, restart_generation, session`
+        )
+        .all() as Array<{
+        restartGeneration: string
+        sessionId: string
+        questionCount: number
+      }>
+      const pendingTurns: RestartInterruptedTurn[] = pending.map((turn) => ({
+        ...turn,
+        questionIds: [],
+      }))
+      this.completeQuestionRestartInterruptions(pendingTurns, new Set())
       return count
     })
   }

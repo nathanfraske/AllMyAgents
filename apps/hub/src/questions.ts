@@ -1,5 +1,9 @@
 import crypto from 'node:crypto'
-import type { Journal, ResolvedQuestion } from './journal.js'
+import type {
+  Journal,
+  ResolvedQuestion,
+  RestartInterruptedTurn,
+} from './journal.js'
 
 const MAX_QUESTION_TEXT = 2_000
 const MAX_HEADER = 12
@@ -10,6 +14,10 @@ const MAX_ANSWER = 4_000
 const MAX_CORRELATION = 512
 export const MAX_PENDING_QUESTIONS_PER_SESSION = 4
 export const MAX_PENDING_QUESTIONS_GLOBAL = 32
+export const ASK_INTERRUPTED_BY_RESTART_MESSAGE =
+  'ALLMYAGENTS_ASK_INTERRUPTED_BY_RESTART_V1 — SYSTEM INTERRUPTION — NOT A USER RESPONSE. No answer, decline, cancellation, choice, or preference was supplied by the user. Do not infer any preference or refusal from this event. Continue the current turn now without an answer; do not wait for the user and do not treat this event as a choice. If the missing information is still essential, state that clearly; a future turn may ask again after restart.'
+export const ASK_UNAVAILABLE_MESSAGE =
+  'ALLMYAGENTS_ASK_UNAVAILABLE_V1 — SYSTEM UNAVAILABLE — NOT A USER RESPONSE. No answer, decline, cancellation, choice, or preference was supplied by the user. Continue the current turn without waiting and do not infer a response.'
 
 export interface AskUserQuestionOption {
   label: string
@@ -40,18 +48,26 @@ export type QuestionOutcome =
       }
     }
   | {
+      kind: 'interrupted'
+      reason: 'restart' | 'worker-restart'
+      message: string
+    }
+  | {
       kind: 'cancelled'
       reason?:
         | 'aborted'
-        | 'hub-restarted'
-        | 'worker-restarted'
         | 'recovery-unknown'
         | 'rejected'
         | 'unavailable'
       message?: string
     }
 
-export type QuestionStatus = 'pending' | 'answered' | 'cancelled' | 'aborted'
+export type QuestionStatus =
+  | 'pending'
+  | 'answered'
+  | 'cancelled'
+  | 'aborted'
+  | 'interrupted'
 
 export interface QuestionRecord {
   id: string
@@ -283,23 +299,43 @@ function recoveredOutcome(
     // not recover its exact bytes, so it truthfully fails closed and lets Claude ask again if still needed.
     return { kind: 'cancelled', reason: 'recovery-unknown' }
   }
-  return durable.status === 'aborted'
-    ? {
-        kind: 'cancelled',
-        reason:
-          durable.reason === 'hub-restarted' || durable.reason === 'worker-restarted'
-            ? durable.reason
-            : 'aborted',
-      }
-    : { kind: 'cancelled' }
+  if (durable.status === 'interrupted') {
+    return {
+      kind: 'interrupted',
+      reason: 'restart',
+      message: ASK_INTERRUPTED_BY_RESTART_MESSAGE,
+    }
+  }
+  if (durable.status !== 'aborted') return { kind: 'cancelled' }
+  if (durable.reason === 'hub-restarted') {
+    return {
+      kind: 'interrupted',
+      reason: 'restart',
+      message: ASK_INTERRUPTED_BY_RESTART_MESSAGE,
+    }
+  }
+  if (durable.reason === 'worker-restarted') {
+    return {
+      kind: 'interrupted',
+      reason: 'worker-restart',
+      message:
+        'ALLMYAGENTS_ASK_INTERRUPTED_BY_WORKER_RESTART_V1 — SYSTEM INTERRUPTION — NOT A USER RESPONSE. No answer was collected.',
+    }
+  }
+  if (durable.reason === undefined) return { kind: 'cancelled', reason: 'aborted' }
+  return {
+    kind: 'cancelled',
+    reason: 'unavailable',
+    message: 'The durable question terminal reason is unknown; no user response was inferred.',
+  }
 }
 
 /**
  * Hub-owned, non-authorizing AskUserQuestion lifecycle.
  *
  * It deliberately does not share ApprovalService: an answer is tool input, never a grant. Stable vendor
- * invocation correlation lets a surviving worker re-issue across a hub restart without making an answer
- * reusable by a later identical-payload question.
+ * invocation correlation makes in-process retries idempotent without making an answer reusable by a later
+ * identical-payload question. Worker recovery remains unavailable until the control channel is authenticated.
  */
 export class QuestionService {
   private readonly pendingMap = new Map<string, PendingEntry>()
@@ -328,10 +364,61 @@ export class QuestionService {
 
   /** Planned blue drain: settle owned callbacks durably before relinquishing the public role. */
   deactivatePublicOwner(): number {
-    if (!this.publicOwnerActive) return 0
-    const terminalized = this.abortAll('hub-restarted')
+    return this.deactivatePublicOwnerForRestart().length
+  }
+
+  /**
+   * Planned blue drain with the exact body-free question/session set that must reach a same-turn terminal
+   * boundary before listener release. No answer or prompt bytes cross this seam.
+   */
+  deactivatePublicOwnerForRestart(): RestartInterruptedTurn[] {
+    if (!this.publicOwnerActive) return []
+    const interrupted = this.journal.terminalizeOwnedQuestionsForRestart(
+      this.ownerEpoch,
+      crypto.randomUUID()
+    )
+    const interruptedIds = new Set(
+      interrupted.flatMap((turn) => turn.questionIds)
+    )
+    for (const entry of [...this.pendingMap.values()]) {
+      if (interruptedIds.has(entry.record.id)) {
+        this.settle(
+          entry,
+          {
+            kind: 'interrupted',
+            reason: 'restart',
+            message: ASK_INTERRUPTED_BY_RESTART_MESSAGE,
+          },
+          'interrupted'
+        )
+      } else {
+        // A local pending callback absent from the authoritative owner-batch receipt cannot safely be
+        // classified as answered/cancelled without another durable read. Fail closed without inventing a
+        // user response; this path requires an impossible same-owner external mutation.
+        this.settle(
+          entry,
+          {
+            kind: 'cancelled',
+            reason: 'unavailable',
+            message:
+              'The question lifecycle changed outside its owner batch; no user response was inferred.',
+          },
+          'interrupted'
+        )
+      }
+    }
     this.publicOwnerActive = false
-    return terminalized
+    return interrupted
+  }
+
+  recordRestartBoundaries(
+    interrupted: readonly RestartInterruptedTurn[],
+    completedSessionIds: ReadonlySet<string>
+  ): number {
+    return this.journal.completeQuestionRestartInterruptions(
+      interrupted,
+      completedSessionIds
+    )
   }
 
   get isPublicOwner(): boolean {
@@ -490,11 +577,24 @@ export class QuestionService {
     let terminalized = 0
     for (const entry of [...this.pendingMap.values()]) {
       if (this.reconcile(entry)) continue
+      const outcome: QuestionOutcome =
+        reason === 'hub-restarted'
+          ? {
+              kind: 'interrupted',
+              reason: 'restart',
+              message: ASK_INTERRUPTED_BY_RESTART_MESSAGE,
+            }
+          : {
+              kind: 'interrupted',
+              reason: 'worker-restart',
+              message:
+                'ALLMYAGENTS_ASK_INTERRUPTED_BY_WORKER_RESTART_V1 — SYSTEM INTERRUPTION — NOT A USER RESPONSE. No answer was collected.',
+            }
       if (
         this.finish(
           entry,
           'aborted',
-          { kind: 'cancelled', reason },
+          outcome,
           reason
         )
       ) {

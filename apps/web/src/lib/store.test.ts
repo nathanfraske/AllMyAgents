@@ -27,6 +27,7 @@ vi.mock('./api', () => {
         ...patch,
       })),
       approvals: vi.fn(async () => []),
+      questions: vi.fn(async () => []),
       usage: vi.fn(async () => []),
       sessions: vi.fn(async () => []),
       spawn: vi.fn(async () => rec('spawned')),
@@ -526,6 +527,53 @@ describe('apply()', () => {
     expect(store.sessions.new).toBeDefined() // newer, applied
     expect(store.lastSeq).toBe(6)
   })
+
+  it.each([
+    {
+      phase: 'planned',
+      turnBoundary: 'completed',
+      expected: 'exact turn then reached a terminal boundary',
+      absent: 'Claude received',
+    },
+    {
+      phase: 'planned',
+      turnBoundary: 'unknown',
+      expected: 'whether Claude processed the interruption before restart is unknown',
+      absent: 'delivered to Claude',
+    },
+    {
+      phase: 'crash',
+      turnBoundary: 'unknown',
+      expected: 'no interruption response was delivered',
+      absent: 'live callback was released',
+    },
+  ] as const)(
+    'renders one truthful $phase/$turnBoundary restart interruption note',
+    ({ phase, turnBoundary, expected, absent }) => {
+      seed('ask-restart')
+      const event = evt({
+        seq: 1,
+        kind: 'question/restart-interrupted',
+        sessionId: 'ask-restart',
+        payload: { phase, turnBoundary, questionCount: 2 },
+      })
+
+      apply(event)
+      apply(event)
+
+      const notes = store.sessions['ask-restart']!.items.filter(
+        (item) => item.kind === 'note'
+      )
+      expect(notes).toHaveLength(1)
+      const text = (notes[0] as { text: string }).text
+      expect(text).toContain('SYSTEM INTERRUPTION — NOT A USER RESPONSE')
+      expect(text).toContain(
+        'No answer, cancellation, decline, choice, or preference was supplied.'
+      )
+      expect(text).toContain(expected)
+      expect(text).not.toContain(absent)
+    }
+  )
 })
 
 // --- cross-restart UI-state persistence -----------------------------------------------------
