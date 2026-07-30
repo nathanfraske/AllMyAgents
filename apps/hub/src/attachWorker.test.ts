@@ -273,6 +273,7 @@ afterEach(async () => {
 interface FakeHub {
   journal: Journal
   store: SessionStore
+  usage: UsageMonitor
   sessions: SessionManager
   setLive: (l: LiveSession[]) => void
   // Run a hook INSIDE executor.attach() — i.e. between attachWorker's liveIds snapshot and its stale sweep —
@@ -331,7 +332,7 @@ function wireHub(deps: HubDeps): FakeHub {
     isBusy: () => false,
   }
   const sessions = new SessionManager(deps.journal, deps.store, deps.profiles, deps.approvals, deps.usage, deps.workspace, deps.projects, deps.instructions, deps.bus, deps.memory, deps.practices, SAFE, false, deps.tmp, new QuestionService(deps.journal), fakeExecutor)
-  return { journal: deps.journal, store: deps.store, sessions, setLive: (l) => (liveToReturn = l), setOnAttach: (fn) => (onAttach = fn), attachCalls, runTurnCalls, rebuild: () => wireHub(deps) }
+  return { journal: deps.journal, store: deps.store, usage: deps.usage, sessions, setLive: (l) => (liveToReturn = l), setOnAttach: (fn) => (onAttach = fn), attachCalls, runTurnCalls, rebuild: () => wireHub(deps) }
 }
 
 /** A SessionManager wired to a FAKE executor whose listLive()/attach() the test controls. A non-InProcess
@@ -367,6 +368,31 @@ function seedRecord(store: SessionStore, id: string, status: SessionStatus, prov
 }
 
 describe('SessionManager.attachWorker — the exactly-once replay cursor (hub side, §7.1)', () => {
+  it('publishes worker-ingested Claude usage with the current profile authority', () => {
+    const h = buildHub()
+    const profile: Profile = {
+      id: 'p1',
+      provider: 'claude',
+      dir: path.join(os.tmpdir(), 'p1'),
+    }
+    h.usage.addProfile(profile)
+    h.usage.setProfileAuthority(profile.id, 9, true)
+    seedRecord(h.store, 'usage-session', 'active')
+    h.sessions.loadRecords()
+
+    h.sessions.ingestWorkerEvent('usage-session', 1, 'claude/rate_limit_event', {
+      rate_limit_info: { status: 'allowed' },
+    })
+    h.sessions.ingestWorkerEvent('usage-session', 2, 'claude/result', {
+      total_cost_usd: 2.5,
+    })
+
+    expect(h.usage.list()[0]).toMatchObject({
+      claude: { status: 'allowed' },
+      totalCostUsd: 2.5,
+    })
+  })
+
   it('seeds the replay cursor from the durable lastJournaledWseq; replays wseq>cursor once, DROPS wseq<=cursor', async () => {
     const h = buildHub()
     seedRecord(h.store, 'active1', 'active')

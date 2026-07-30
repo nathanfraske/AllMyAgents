@@ -21,6 +21,7 @@ export interface ProfileUsageAuthority {
 export class UsageMonitor {
   private readonly snapshots = new Map<string, UsageSnapshot>()
   private codexReader: ((profileId: string) => Promise<unknown>) | undefined
+  private claudeReader = readClaudeUsage
   private pollTimer: NodeJS.Timeout | undefined
   private claudeTimer: NodeJS.Timeout | undefined
   private readonly profileAuthorities = new Map<
@@ -45,6 +46,10 @@ export class UsageMonitor {
 
   setCodexReader(reader: (profileId: string) => Promise<unknown>): void {
     this.codexReader = reader
+  }
+
+  setClaudeReader(reader: typeof readClaudeUsage): void {
+    this.claudeReader = reader
   }
 
   list(): UsageSnapshot[] {
@@ -187,7 +192,7 @@ export class UsageMonitor {
       const authority = this.captureProfileAuthority(p.id)
       if (this.profileAuthorities.has(p.id) && !authority) continue
       try {
-        const lines = await readClaudeUsage(p.dir)
+        const lines = await this.claudeReader(p.dir)
         if (lines.length === 0) continue
         if (!this.canPublish(p.id, authority)) continue
         const snap = this.snapshot(p.id)
@@ -196,6 +201,7 @@ export class UsageMonitor {
         snap.updatedAt = new Date().toISOString()
         this.journal.append(null, 'usage/snapshot', { profileId: p.id, claudeUsage: lines })
       } catch (err) {
+        if (!this.canPublish(p.id, authority)) continue
         this.journal.append(null, 'usage/poll-error', {
           profileId: p.id,
           message: err instanceof Error ? err.message : String(err),
@@ -224,6 +230,7 @@ export class UsageMonitor {
         this.noteCodex(p.id, flat, authority)
         this.journal.append(null, 'usage/snapshot', { profileId: p.id, codex: flat })
       } catch (err) {
+        if (!this.canPublish(p.id, authority)) continue
         this.journal.append(null, 'usage/poll-error', {
           profileId: p.id,
           message: err instanceof Error ? err.message : String(err),

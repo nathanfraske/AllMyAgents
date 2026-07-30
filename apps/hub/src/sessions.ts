@@ -428,10 +428,16 @@ export class SessionManager {
     const profileId = this.sessions.get(sessionId)?.profileId
     if (kind === 'claude/rate_limit_event') {
       const info = (payload as { rate_limit_info?: ClaudeLimitInfo }).rate_limit_info
-      if (info && profileId) this.usage.noteClaude(profileId, info)
+      if (info && profileId) {
+        const authority = this.usage.captureProfileAuthority(profileId)
+        this.usage.noteClaude(profileId, info, authority)
+      }
     } else if (kind === 'claude/result') {
       const cost = (payload as { total_cost_usd?: number }).total_cost_usd
-      if (profileId) this.usage.noteClaudeCost(profileId, cost)
+      if (profileId) {
+        const authority = this.usage.captureProfileAuthority(profileId)
+        this.usage.noteClaudeCost(profileId, cost, authority)
+      }
     } else if (kind === 'codex/thread/tokenUsage/updated') {
       const tokens = mapCodexTokenUsage(payload)
       if (tokens) this.journal.append(sessionId, 'session/tokens', tokens)

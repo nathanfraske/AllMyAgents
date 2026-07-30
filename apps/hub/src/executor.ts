@@ -380,10 +380,14 @@ export class InProcessExecutor implements Executor {
           this.h.journal(spec.sessionId, kind, payload)
           if (kind === 'claude/rate_limit_event') {
             const info = (payload as { rate_limit_info?: ClaudeLimitInfo }).rate_limit_info
-            if (info) this.services.usage.noteClaude(spec.profileId, info)
+            if (info) {
+              const authority = this.services.usage.captureProfileAuthority(spec.profileId)
+              this.services.usage.noteClaude(spec.profileId, info, authority)
+            }
           } else if (kind === 'claude/result') {
             const cost = (payload as { total_cost_usd?: number }).total_cost_usd
-            this.services.usage.noteClaudeCost(spec.profileId, cost)
+            const authority = this.services.usage.captureProfileAuthority(spec.profileId)
+            this.services.usage.noteClaudeCost(spec.profileId, cost, authority)
           }
         },
         async (toolName, input, context) => {
