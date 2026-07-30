@@ -230,15 +230,10 @@ export class RestartController {
    * drain, state.draining is false and the existing listener is acknowledged without another listen().
    */
   async abort(error: string): Promise<void> {
-    const { server, journal, state, publicPort, executor } = this.deps
+    const { server, journal, state, publicPort, executor, questions } = this.deps
     journal.append(null, 'hub/restart-aborted', { error })
-    // RELEASE the drain hold (the M2 correctness item, §8.4): green failed, blue is staying live, so un-drain
-    // the worker or every relay the live turn held during the drain window would sit until it wrongly timed
-    // out to HubUnavailableError even though the hub never went away. Unconditional + idempotent: it is a
-    // harmless no-op when the worker was never draining (green failed before blue's drain()), and the release
-    // when it was — so we always pair the drain with its release. No-op in-process (no worker).
-    executor.signalDraining?.(false)
-
+    // Release the worker drain hold only after blue also reclaims QuestionService ownership. Otherwise a
+    // rebound can accept turns while AskUserQuestion still fails closed.
     // Drain, promote, orphan resolution, and rollback all share one server. Never overwrite an
     // already-running close/listen promise: wait for the exact callback, then own the next transition.
     for (;;) {
@@ -250,8 +245,63 @@ export class RestartController {
     this.requireJournalBackupOwnership(
       'rollback public listener is waiting for journal backup ownership'
     )
+
+    const reclaimQuestionOwner = async (): Promise<void> => {
+      try {
+        // Idempotent when green failed before blue released ownership; essential after drain terminalized
+        // the old callbacks. Do not expose the listener or release worker relays until this durable claim
+        // succeeds.
+        questions.activatePublicOwner()
+        executor.signalDraining?.(false)
+        state.draining = false
+        this.notifySupervisor({ type: 'rollback-rebound' })
+      } catch (activationError) {
+        state.draining = true
+        let message = `rollback failed to reactivate question ownership: ${
+          activationError instanceof Error ? activationError.message : String(activationError)
+        }`
+        try {
+          questions.deactivatePublicOwner()
+        } catch (deactivationError) {
+          message += `; question ownership release failed: ${
+            deactivationError instanceof Error
+              ? deactivationError.message
+              : String(deactivationError)
+          }`
+        }
+        try {
+          executor.signalDraining?.(true)
+        } catch (signalError) {
+          message += `; worker drain signal failed: ${
+            signalError instanceof Error ? signalError.message : String(signalError)
+          }`
+        }
+        state.journalBackup = {
+          status: 'degraded',
+          error: message,
+        }
+        console.error(`[hub] ${message}`)
+        await new Promise<void>((resolve) => {
+          if (!server.listening) {
+            resolve()
+            return
+          }
+          try {
+            server.close(() => resolve())
+          } catch (closeError) {
+            message += `; listener close failed: ${
+              closeError instanceof Error ? closeError.message : String(closeError)
+            }`
+            state.journalBackup = { status: 'degraded', error: message }
+            resolve()
+          }
+        })
+        this.notifySupervisor({ type: 'rollback-failed', error: message })
+      }
+    }
+
     if (!state.draining) {
-      this.notifySupervisor({ type: 'rollback-rebound' })
+      await reclaimQuestionOwner()
       return
     }
 
@@ -284,9 +334,7 @@ export class RestartController {
     }
     const onListening = (): void => {
       server.off('error', onError)
-      state.draining = false
-      this.notifySupervisor({ type: 'rollback-rebound' })
-      settled()
+      void reclaimQuestionOwner().finally(settled)
     }
     server.once('error', onError)
     server.once('listening', onListening)

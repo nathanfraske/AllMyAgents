@@ -220,6 +220,11 @@ describe('RestartController journal backup ownership', () => {
     const publicPort = await listenEphemeral(server)
     const sent: unknown[] = []
     const deps = controllerDeps(server, publicPort, sent)
+    const deactivatePublicOwner = vi.fn(() => 0)
+    const activatePublicOwner = vi.fn(() => 0)
+    deps.questions = { deactivatePublicOwner, activatePublicOwner } as never
+    const signalDraining = vi.fn()
+    deps.executor = { signalDraining } as never
     const controller = new RestartController(deps)
 
     await controller.drain()
@@ -229,6 +234,64 @@ describe('RestartController journal backup ownership', () => {
     expect((server.address() as { port: number }).port).toBe(publicPort)
     expect(sent).toContainEqual({ type: 'rollback-rebound' })
     expect(deps.state.rollbackRebinding).toBe(false)
+    expect(deactivatePublicOwner).toHaveBeenCalledTimes(1)
+    expect(activatePublicOwner).toHaveBeenCalledTimes(1)
+    expect(signalDraining.mock.calls).toEqual([[true], [false]])
+  })
+
+  it('idempotently reclaims question ownership when abort happens before blue drains', async () => {
+    const server = http.createServer()
+    const publicPort = await listenEphemeral(server)
+    const sent: unknown[] = []
+    const deps = controllerDeps(server, publicPort, sent)
+    const activatePublicOwner = vi.fn(() => 0)
+    deps.questions = {
+      deactivatePublicOwner: vi.fn(() => 0),
+      activatePublicOwner,
+    } as never
+    const signalDraining = vi.fn()
+    deps.executor = { signalDraining } as never
+
+    await new RestartController(deps).abort('green failed before drain')
+
+    expect(activatePublicOwner).toHaveBeenCalledOnce()
+    expect(signalDraining).toHaveBeenCalledOnce()
+    expect(signalDraining).toHaveBeenCalledWith(false)
+    expect(sent).toEqual([{ type: 'rollback-rebound' }])
+    expect(server.listening).toBe(true)
+  })
+
+  it('closes the rollback listener when question ownership cannot be reactivated', async () => {
+    const server = http.createServer()
+    const publicPort = await listenEphemeral(server)
+    const sent: unknown[] = []
+    const deps = controllerDeps(server, publicPort, sent)
+    deps.questions = {
+      deactivatePublicOwner: vi.fn(() => 0),
+      activatePublicOwner: vi.fn(() => {
+        throw new Error('SQLITE_FULL during rollback claim')
+      }),
+    } as never
+    const signalDraining = vi.fn()
+    deps.executor = { signalDraining } as never
+    const controller = new RestartController(deps)
+
+    await controller.drain()
+    await controller.abort('rollback ownership failure')
+
+    expect(server.listening).toBe(false)
+    expect(deps.state.draining).toBe(true)
+    expect(deps.state.rollbackRebinding).toBe(false)
+    expect(signalDraining.mock.calls).toEqual([[true], [true]])
+    expect(sent).toContainEqual({
+      type: 'rollback-failed',
+      error: expect.stringContaining('SQLITE_FULL'),
+    })
+    expect(sent).not.toContainEqual({ type: 'rollback-rebound' })
+    expect(deps.state.journalBackup).toMatchObject({
+      status: 'degraded',
+      error: expect.stringContaining('question ownership'),
+    })
   })
 
   it('serializes rollback rebind behind an existing listener transition', async () => {
