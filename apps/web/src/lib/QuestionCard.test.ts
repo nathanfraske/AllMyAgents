@@ -6,8 +6,6 @@ import type { QuestionRecord } from './api'
 const record: QuestionRecord = {
   id: 'q1',
   sessionId: 's1',
-  toolUseId: 'toolu_1',
-  requestId: 'control_1',
   status: 'pending',
   createdAt: '2026-07-29T00:00:00.000Z',
   questions: [
@@ -39,6 +37,12 @@ describe('QuestionCard', () => {
     render(QuestionCard, { props: { record, onsubmit: vi.fn(), oncancel: vi.fn() } })
 
     expect(screen.getByText('QUESTION FROM CLAUDE')).toBeTruthy()
+    expect(
+      screen.getByRole('form', { name: 'Question from Claude 1 of 1' })
+    ).toBeTruthy()
+    expect(screen.getByRole('status').textContent).toMatch(
+      /new question from claude, 1 of 1/i
+    )
     expect(screen.getByText('Which format should I use?')).toBeTruthy()
     expect(screen.getAllByText('Other')).toHaveLength(2)
     expect(screen.queryByText(/approve once/i)).toBeNull()
@@ -89,6 +93,9 @@ describe('QuestionCard', () => {
     await fireEvent.click(submit)
     expect(onsubmit).toHaveBeenCalledTimes(1)
     expect(submit).toHaveProperty('disabled', true)
+    for (const fieldset of screen.getAllByRole('group')) {
+      expect(fieldset).toHaveProperty('disabled', true)
+    }
     release()
     await waitFor(() =>
       expect(screen.getByRole('button', { name: 'Cancel question' })).toHaveProperty(
@@ -134,6 +141,10 @@ describe('QuestionCard', () => {
     const { container } = render(QuestionCard, {
       props: { record: hostile, onsubmit, oncancel: vi.fn() },
     })
+    const previewBeforeSelection = screen.getByText('<img src=x onerror=alert(1)>')
+    expect(
+      previewBeforeSelection.closest('.option')?.classList.contains('selected')
+    ).toBe(false)
     await fireEvent.click(screen.getByLabelText('Keep'))
     await fireEvent.click(screen.getByLabelText('Own'))
     await fireEvent.click(screen.getByRole('button', { name: 'Submit answers' }))
@@ -146,7 +157,71 @@ describe('QuestionCard', () => {
     )
     expect(container.querySelector('img')).toBeNull()
     expect(screen.getByText('<img src=x onerror=alert(1)>')).toBeTruthy()
+    const keep = screen.getByLabelText('Keep')
+    const description = screen.getByText('Keep the exact key.')
+    const preview = screen.getByText('<img src=x onerror=alert(1)>')
+    expect(keep.getAttribute('aria-describedby')?.split(' ')).toEqual(
+      expect.arrayContaining([description.id, preview.id])
+    )
+    expect(preview.closest('.option')?.classList.contains('preview-active')).toBe(
+      true
+    )
     expect(({} as Record<string, unknown>).polluted).toBeUndefined()
+  })
+
+  it('shows only the most recently focused or selected preview for a multi-select question', async () => {
+    const withPreviews: QuestionRecord = {
+      ...record,
+      id: 'q-preview-focus',
+      questions: [
+        {
+          question: 'Choose several',
+          header: 'Choices',
+          options: [
+            { label: 'One', description: 'First.', preview: 'Preview one' },
+            { label: 'Two', description: 'Second.', preview: 'Preview two' },
+            { label: 'Three', description: 'Third.', preview: 'Preview three' },
+            { label: 'Four', description: 'Fourth.', preview: 'Preview four' },
+          ],
+          multiSelect: true,
+        },
+      ],
+    }
+    render(QuestionCard, {
+      props: { record: withPreviews, onsubmit: vi.fn(), oncancel: vi.fn() },
+    })
+
+    await fireEvent.click(screen.getByLabelText('One'))
+    await fireEvent.click(screen.getByLabelText('Two'))
+    expect(
+      screen.getByText('Preview one').closest('.option')?.classList.contains('selected')
+    ).toBe(true)
+    expect(
+      screen
+        .getByText('Preview one')
+        .closest('.option')
+        ?.classList.contains('preview-active')
+    ).toBe(false)
+    expect(
+      screen
+        .getByText('Preview two')
+        .closest('.option')
+        ?.classList.contains('preview-active')
+    ).toBe(true)
+
+    await fireEvent.focus(screen.getByLabelText('Three'))
+    expect(
+      screen
+        .getByText('Preview two')
+        .closest('.option')
+        ?.classList.contains('preview-active')
+    ).toBe(false)
+    expect(
+      screen
+        .getByText('Preview three')
+        .closest('.option')
+        ?.classList.contains('preview-active')
+    ).toBe(true)
   })
 
   it('fails closed with an invalid record shape', () => {

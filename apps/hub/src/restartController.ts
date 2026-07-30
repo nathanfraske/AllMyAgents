@@ -11,6 +11,7 @@ import type { Socket } from 'node:net'
 import type { Executor } from './executor.js'
 import type { JournalBackupRuntimeState } from './journalBackup.js'
 import type { Journal } from './journal.js'
+import type { QuestionService } from './questions.js'
 import type { SessionManager } from './sessions.js'
 
 /** Shared by reference with server.ts, which reads it for /api/health + the draining 503 guard and
@@ -30,6 +31,7 @@ export interface RestartControllerDeps {
   server: http.Server
   sessions: SessionManager
   journal: Journal
+  questions: QuestionService
   state: RestartState
   publicPort: number //           the fixed public port (7777) — green promotes to it; blue re-claims it on rollback
   send: (msg: unknown) => void // process.send, bound
@@ -91,7 +93,11 @@ export class RestartController {
    * open forever; the clients auto-reconnect to green — then close the listener and signal `released`.
    */
   async drain(): Promise<void> {
-    const { server, journal, state, executor } = this.deps
+    const { server, journal, questions, state, executor } = this.deps
+    // An in-process SDK callback cannot survive process retirement. Close every question durably and
+    // settle its callback BEFORE releasing the public listener; if SQLite is BUSY/FULL/I/O-failed this
+    // throws and the drain stops here, leaving blue authoritative for the supervisor's rollback.
+    questions.deactivatePublicOwner()
     // FIRST, before we close anything: tell the worker we're draining so it HOLDS new relays (queues them
     // without racing the about-to-die socket) — a planned flip then has zero failed in-flight sends; green's
     // attach flushes them (§8.4). No-op in-process (no worker to drain), so flag-off is unchanged.
@@ -143,13 +149,39 @@ export class RestartController {
     }
     const onListening = (): void => {
       server.off('error', onError)
-      state.promoting = false
-      state.draining = false
-      this.requireJournalBackupOwnership(
-        'promoted public listener is waiting for journal backup ownership'
-      )
-      sessions.reconcileStale()
-      onPromoted()
+      try {
+        // The listener callback runs synchronously before another request can be dispatched. Claiming here
+        // closes crash-orphaned summary rows without letting booting green touch live blue callbacks.
+        this.deps.questions.activatePublicOwner()
+        state.promoting = false
+        state.draining = false
+        this.requireJournalBackupOwnership(
+          'promoted public listener is waiting for journal backup ownership'
+        )
+        sessions.reconcileStale()
+        onPromoted()
+      } catch (error) {
+        state.promoting = false
+        state.draining = true
+        let message = error instanceof Error ? error.message : String(error)
+        try {
+          this.deps.questions.deactivatePublicOwner()
+        } catch (deactivationError) {
+          message += `; question ownership rollback failed: ${
+            deactivationError instanceof Error
+              ? deactivationError.message
+              : String(deactivationError)
+          }`
+        }
+        server.close(() => {
+          this.notifySupervisor({
+            type: 'promote-failed',
+            error: `post-bind promotion failed: ${message}`,
+          })
+          settled()
+        })
+        return
+      }
       this.notifySupervisor({ type: 'promoted' })
       settled()
     }

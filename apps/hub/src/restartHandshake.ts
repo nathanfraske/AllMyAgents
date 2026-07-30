@@ -42,6 +42,7 @@ export type SupervisorMsg =
 export type HubMsg =
   | { type: 'ready'; port: number; restored: number; schemaVersion: number } // after boot() + listening
   | { type: 'released' } //      drain done: listener closed, port free
+  | { type: 'drain-failed'; error: string } // blue kept the listener because pre-drain durability failed
   | { type: 'promoted' } //      now listening on the fixed port
   | { type: 'promote-failed'; error: string } // could not bind the fixed port (EADDRINUSE) → supervisor rolls back
   | { type: 'rollback-rebound' } // blue has successfully reclaimed the fixed public listener
@@ -86,6 +87,9 @@ export function waitForHubMsg<T extends HubMsg['type']>(
       if (m && typeof m === 'object' && m.type === type) {
         cleanup()
         resolve(m as Extract<HubMsg, { type: T }>)
+      } else if (m && typeof m === 'object' && m.type === 'drain-failed' && type === 'released') {
+        cleanup()
+        reject(new Error(`drain failed: ${m.error}`))
       } else if (m && typeof m === 'object' && m.type === 'promote-failed' && type === 'promoted') {
         cleanup()
         reject(new Error(`promote failed: ${(m as { error?: string }).error ?? 'unknown'}`))

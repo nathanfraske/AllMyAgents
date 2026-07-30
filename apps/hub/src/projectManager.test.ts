@@ -16,6 +16,7 @@ import { SessionStore } from './store.js'
 import type { Profile, SessionRecord, SessionStatus } from './types.js'
 import { UsageMonitor } from './usage.js'
 import { WorkspaceManager } from './workspace.js'
+import { QuestionService } from './questions.js'
 
 const cleanups: Array<() => void> = []
 
@@ -70,6 +71,7 @@ function buildHub() {
     { busCanUseRiskyTools: false, autoApprovePractices: false },
     false,
     root,
+    new QuestionService(journal),
     executor
   )
   const seed = (record: Partial<SessionRecord> & Pick<SessionRecord, 'id'>): SessionRecord => {

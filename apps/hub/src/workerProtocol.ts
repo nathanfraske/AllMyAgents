@@ -8,7 +8,6 @@
 import crypto from 'node:crypto'
 import type { DangerFlags } from './types.js'
 import type { AttachmentMeta } from './attachments.js'
-import type { QuestionOutcome } from './questions.js'
 
 /** The subset of a SessionRecord the worker's driver needs — the worker holds no record + never opens the store. */
 export interface WorkerSessionSpec {
@@ -57,8 +56,6 @@ export type HubToWorker =
   // (the M2 correctness item). Absent/true = start draining.
   | { t: 'draining'; on?: boolean }
   | { t: 'approvalResolved'; approvalId: string; approved: boolean }
-  | { t: 'questionResolved'; questionId: string; outcome: QuestionOutcome }
-  | { t: 'questionAbortAck'; questionId: string; aborted: boolean }
   | { t: 'rpcResult'; callId: string; ok: boolean; value?: unknown; error?: string }
 
 /** Worker → hub. */
@@ -82,15 +79,6 @@ export type WorkerToHub =
   | { t: 'turnError'; sessionId: string; wseq: number; message: string; replay?: boolean }
   // self-gating tool-handler relays (worker's MCP handlers reaching hub-owned services):
   | { t: 'approvalRequest'; approvalId: string; sessionId: string; kind: string; payload: unknown }
-  | {
-      t: 'questionRequest'
-      questionId: string
-      sessionId: string
-      toolUseId: string
-      requestId: string
-      input: unknown
-    }
-  | { t: 'questionAbort'; questionId: string; sessionId: string }
   | { t: 'rpc'; callId: string; method: RelayMethod; args: unknown } // callId STABLE across re-flush → hub dedups writes (§8.2)
   | { t: 'restartRequest'; reason: string; bySession?: string }
   // command acks/replies:
@@ -134,12 +122,6 @@ export const RELAY_QUEUE_MAX = 1_000 //           worker relay-lane bound; overf
 // can't hang the tool forever. Well above a flip window (HUB_RELAY_TIMEOUT_MS) yet well under the SDK's
 // patience; the approvalRequest path is deliberately EXEMPT (it legitimately blocks on a human up to the
 // hub's 10-min ApprovalService timeout, which always replies), so only rpc(bus/memory/practices) get it.
-/** Interactive question bodies are much larger than ordinary relays. Keep a separate closed count/byte
- * bound so a model cannot retain RELAY_QUEUE_MAX multi-hundred-KiB question payloads in the worker. */
-export const QUESTION_RELAY_QUEUE_MAX = 8
-export const QUESTION_RELAY_BYTES_MAX = 4 * 1024 * 1024
-/** Aggregate retained relay estimate, independent of the on-wire decoder's corruption ceiling. */
-export const RELAY_PENDING_BYTES_MAX = 8 * 1024 * 1024
 export const HUB_RELAY_DELIVERED_BACKSTOP_MS = 120_000
 
 /** The ONE retryable shape a tool returns when a relay exceeds the transient bound — never a permanent
@@ -192,12 +174,37 @@ export function stableApprovalId(sessionId: string, kind: string, payload: unkno
 
 /** Per-vendor-invocation question identity. Payload is deliberately absent: two simultaneous identical
  * asks have distinct toolUseID/requestId pairs and must remain distinct interactive requests. */
+export const MAX_QUESTION_CORRELATION_CHARS = 512
+
+export class InvalidQuestionCorrelationError extends Error {
+  constructor(field: string) {
+    super(`${field} must be a non-empty bounded string without control characters`)
+    this.name = 'InvalidQuestionCorrelationError'
+  }
+}
+
+function boundedQuestionCorrelation(value: unknown, field: string): string {
+  // Reject on the cheap UTF-16 bound before JSON.stringify can allocate a second attacker-sized string.
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value.length > MAX_QUESTION_CORRELATION_CHARS ||
+    /[\u0000-\u001f\u007f]/u.test(value)
+  ) {
+    throw new InvalidQuestionCorrelationError(field)
+  }
+  return value
+}
+
 export function stableQuestionId(sessionId: string, toolUseId: string, requestId: string): string {
+  const boundedSessionId = boundedQuestionCorrelation(sessionId, 'session id')
+  const boundedToolUseId = boundedQuestionCorrelation(toolUseId, 'toolUseID')
+  const boundedRequestId = boundedQuestionCorrelation(requestId, 'requestId')
   const h = crypto.createHash('sha256')
   h.update('allmyagents.ask-user-question.id.v1\0')
   // JSON's array framing is unambiguous even if a future vendor id contains a delimiter/control byte.
   // Plain NUL concatenation made ["a\0b","c"] collide with ["a","b\0c"] at the hash input.
-  h.update(JSON.stringify([sessionId, toolUseId, requestId]))
+  h.update(JSON.stringify([boundedSessionId, boundedToolUseId, boundedRequestId]))
   return `q_${h.digest('hex').slice(0, 32)}`
 }
 

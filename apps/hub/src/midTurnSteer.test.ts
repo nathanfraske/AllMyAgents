@@ -15,6 +15,7 @@ import { MemoryStore } from './memory.js'
 import { PracticeStore } from './practices.js'
 import type { Executor } from './executor.js'
 import type { DangerFlags, Profile, SessionRecord } from './types.js'
+import { QuestionService } from './questions.js'
 
 const SAFE: DangerFlags = {
   busCanUseRiskyTools: false,
@@ -71,6 +72,7 @@ function build(opts: { steer?: (sessionId: string, text: string) => Promise<void
     SAFE,
     false,
     dir,
+    new QuestionService(journal),
     executor,
     prefs as never
   )

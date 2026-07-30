@@ -15,6 +15,7 @@ import { AgentBus } from './bus.js'
 import { MemoryStore } from './memory.js'
 import { PracticeStore } from './practices.js'
 import type { DangerFlags, ManagerAgentType, SessionRecord } from './types.js'
+import { QuestionService } from './questions.js'
 
 /**
  * SECURITY REGRESSION — the hub-side auto-approve policy must not become a blanket "full ⇒ yes".
@@ -63,7 +64,8 @@ function makeSessions(danger: DangerFlags = SAFE): { sessions: SessionManager; s
     new PracticeStore(journal.db),
     danger,
     false,
-    dir
+    dir,
+    new QuestionService(journal)
   )
   const seed = (over: Partial<SessionRecord> = {}): SessionRecord => {
     const record: SessionRecord = {

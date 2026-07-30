@@ -82,6 +82,7 @@ function makeBlueController(
     onPromoted: () => {},
     stopJournalBackups: async () => {},
     journal: { append: () => {} },
+    questions: { deactivatePublicOwner: () => 0, activatePublicOwner: () => 0 },
     sessions: { reconcileStale: () => {}, shutdown: async () => {} },
     executor: {},
   } as unknown as RestartControllerDeps

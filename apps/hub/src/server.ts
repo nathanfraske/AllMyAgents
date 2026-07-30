@@ -4,7 +4,12 @@ import path from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { WebSocketServer, WebSocket } from 'ws'
 import type { ApprovalService } from './approvals.js'
-import { parseQuestionDecisionBody, QuestionInputError, QuestionService } from './questions.js'
+import {
+  parseQuestionDecisionBody,
+  QuestionInputError,
+  QuestionOwnershipError,
+} from './questions.js'
+import type { QuestionService } from './questions.js'
 import type { Journal } from './journal.js'
 import type { ProjectStore } from './projects.js'
 import type { SessionManager } from './sessions.js'
@@ -360,7 +365,7 @@ export interface ServerOptions {
   sessions: SessionManager
   profiles: Profile[]
   approvals: ApprovalService
-  questions?: QuestionService
+  questions: QuestionService
   usage: UsageMonitor
   projects: ProjectStore
   workspace: WorkspaceManager
@@ -461,7 +466,7 @@ export function persistPrefs(
 
 export function startServer(opts: ServerOptions): http.Server {
   const { port, defaultCwd, profilesDir, journal, sessions, profiles, approvals, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity } = opts
-  const questions = opts.questions ?? new QuestionService(journal)
+  const questions = opts.questions
   const profileOwnership = opts.profileOwnership ?? new ProfileOwnership({
     ownerId: `server-${process.pid}`,
     pid: process.pid,
@@ -1702,6 +1707,10 @@ export function startServer(opts: ServerOptions): http.Server {
       }
       if (err instanceof QuestionInputError) {
         json(res, { error: err.message }, 400)
+        return
+      }
+      if (err instanceof QuestionOwnershipError) {
+        json(res, { error: err.message }, 503)
         return
       }
       json(res, { error: err instanceof Error ? err.message : String(err) }, 500)

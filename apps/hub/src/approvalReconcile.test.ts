@@ -88,8 +88,6 @@ describe('approval reconciliation across a hub restart (§7.2) — end-to-end ov
       recall: (_sessionId, prompt) => prompt,
       requestRestart: () => {},
       runRelay,
-      resolveQuestion: async () => ({ kind: 'cancelled' }),
-      abortQuestion: () => false,
       attachWorker: async () => {},
     }
 
@@ -186,8 +184,6 @@ describe('approval reconciliation across a hub restart (§7.2) — end-to-end ov
       recall: (_s, p) => p,
       requestRestart: () => {},
       runRelay,
-      resolveQuestion: async () => ({ kind: 'cancelled' }),
-      abortQuestion: () => false,
       attachWorker: async () => {},
     }
 

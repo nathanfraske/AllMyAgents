@@ -1069,14 +1069,20 @@
     <!-- The agent's task board, directly above the chatbar. -->
     {#if !composerOnly}<TaskStrip items={view.items} />{/if}
 
-    {#each questions as question (question.id)}
-      <QuestionCard
-        record={question}
-        error={questionError?.id === question.id ? questionError.msg : undefined}
-        onsubmit={(answers) => answerQuestion(question.id, answers)}
-        oncancel={() => cancelQuestion(question.id)}
-      />
-    {/each}
+    {#if questions.length > 0}
+      <div class="question-stack" role="region" aria-label="Pending questions">
+        {#each questions as question, questionIndex (question.id)}
+          <QuestionCard
+            record={question}
+            ordinal={questionIndex + 1}
+            total={questions.length}
+            error={questionError?.id === question.id ? questionError.msg : undefined}
+            onsubmit={(answers) => answerQuestion(question.id, answers)}
+            oncancel={() => cancelQuestion(question.id)}
+          />
+        {/each}
+      </div>
+    {/if}
 
     {#each approvals as a (a.id)}
       {@const blurb = approvalBlurb(a.kind, a.payload)}
@@ -1375,6 +1381,19 @@
   .jumpcount { font-variant-numeric: tabular-nums; }
   @media (prefers-reduced-motion: no-preference) { .jumpbtn { animation: pop-in var(--dur-fast) var(--ease); } }
   .approval-card { background: var(--surface); border: 1px solid var(--warn); border-radius: 10px; padding: 0.5rem 0.7rem; margin-bottom: 0.5rem; }
+  .question-stack {
+    display: grid;
+    gap: 0.5rem;
+    max-height: min(42dvh, 30rem);
+    margin-bottom: 0.5rem;
+    padding-right: 0.2rem;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
+  }
+  @media (max-height: 650px) {
+    .question-stack { max-height: 34dvh; }
+  }
   .atop { display: flex; gap: 0.5rem; align-items: center; }
   .alabel { font-size: 0.66rem; letter-spacing: 0.08em; color: var(--warn); }
   .asummary { margin-top: 0.3rem; font-size: var(--text-sm); color: var(--text); font-weight: var(--fw-medium); }

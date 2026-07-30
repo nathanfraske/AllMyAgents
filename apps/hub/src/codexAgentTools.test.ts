@@ -15,6 +15,7 @@ import { MemoryStore } from './memory.js'
 import { PracticeStore } from './practices.js'
 import { SessionManager } from './sessions.js'
 import type { Profile, SessionRecord, SessionStatus } from './types.js'
+import { QuestionService } from './questions.js'
 
 // Build a SessionManager on an in-memory DB (real hub plumbing; no vendor processes / network), plus
 // the store + stores we assert against. The Codex agent-tool path (execAgentTool) is exercised WITHOUT
@@ -35,7 +36,8 @@ function setup() {
   const practices = new PracticeStore(db)
   const sessions = new SessionManager(
     journal, store, new Map(profiles.map((p) => [p.id, p])), approvals, usage, workspace, projects, instructions,
-    bus, memory, practices, { busCanUseRiskyTools: false, autoApprovePractices: false }, false, tmp
+    bus, memory, practices, { busCanUseRiskyTools: false, autoApprovePractices: false }, false, tmp,
+    new QuestionService(journal)
   )
   const inject = (records: SessionRecord[]) => {
     for (const r of records) store.upsert(r)

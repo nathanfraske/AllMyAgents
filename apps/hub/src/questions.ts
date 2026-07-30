@@ -1,6 +1,5 @@
 import crypto from 'node:crypto'
 import type { Journal, ResolvedQuestion } from './journal.js'
-import { stableQuestionId } from './workerProtocol.js'
 
 const MAX_QUESTION_TEXT = 2_000
 const MAX_HEADER = 12
@@ -42,7 +41,13 @@ export type QuestionOutcome =
     }
   | {
       kind: 'cancelled'
-      reason?: 'aborted' | 'recovery-unknown' | 'rejected' | 'unavailable'
+      reason?:
+        | 'aborted'
+        | 'hub-restarted'
+        | 'worker-restarted'
+        | 'recovery-unknown'
+        | 'rejected'
+        | 'unavailable'
       message?: string
     }
 
@@ -51,8 +56,6 @@ export type QuestionStatus = 'pending' | 'answered' | 'cancelled' | 'aborted'
 export interface QuestionRecord {
   id: string
   sessionId: string
-  toolUseId: string
-  requestId: string
   questions: AskUserQuestion[]
   status: QuestionStatus
   createdAt: string
@@ -67,16 +70,12 @@ export interface QuestionRequest {
   signal?: AbortSignal
 }
 
-export interface WorkerQuestionRequest {
-  questionId: string
-  sessionId: string
-  toolUseId: string
-  requestId: string
-  input: unknown
-}
 
 interface PendingEntry {
   record: QuestionRecord
+  toolUseId: string
+  requestId: string
+  correlationDigest: string
   digest: string
   resolve: (outcome: QuestionOutcome) => void
   promise: Promise<QuestionOutcome>
@@ -87,6 +86,13 @@ export class QuestionInputError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'QuestionInputError'
+  }
+}
+
+export class QuestionOwnershipError extends Error {
+  constructor(message = 'This hub does not own the public question lifecycle.') {
+    super(message)
+    this.name = 'QuestionOwnershipError'
   }
 }
 
@@ -236,19 +242,29 @@ export function questionDigest(input: AskUserQuestionInput): string {
     .digest('hex')
 }
 
+function questionCorrelationDigest(
+  sessionId: string,
+  toolUseId: string,
+  requestId: string
+): string {
+  return crypto
+    .createHash('sha256')
+    .update('allmyagents.ask-user-question.correlation.v1\0')
+    .update(canonical([sessionId, toolUseId, requestId]))
+    .digest('hex')
+}
+
 function recoveredOutcome(
   durable: ResolvedQuestion,
   expected: {
     sessionId: string
-    toolUseId: string
-    requestId: string
+    correlationDigest: string
     digest: string
   }
 ): QuestionOutcome {
   if (
     durable.sessionId !== expected.sessionId ||
-    durable.toolUseId !== expected.toolUseId ||
-    durable.requestId !== expected.requestId ||
+    durable.correlationDigest !== expected.correlationDigest ||
     durable.questionDigest !== expected.digest
   ) {
     throw new QuestionInputError('durable question correlation conflicts with the current request')
@@ -260,7 +276,13 @@ function recoveredOutcome(
     return { kind: 'cancelled', reason: 'recovery-unknown' }
   }
   return durable.status === 'aborted'
-    ? { kind: 'cancelled', reason: 'aborted' }
+    ? {
+        kind: 'cancelled',
+        reason:
+          durable.reason === 'hub-restarted' || durable.reason === 'worker-restarted'
+            ? durable.reason
+            : 'aborted',
+      }
     : { kind: 'cancelled' }
 }
 
@@ -273,36 +295,67 @@ function recoveredOutcome(
  */
 export class QuestionService {
   private readonly pendingMap = new Map<string, PendingEntry>()
+  private readonly ownerEpoch = crypto.randomUUID()
+  private publicOwnerActive = false
 
   constructor(private readonly journal: Journal) {}
 
   pending(): QuestionRecord[] {
+    this.requirePublicOwner()
+    for (const entry of [...this.pendingMap.values()]) this.reconcile(entry)
     return [...this.pendingMap.values()].map((entry) => entry.record)
   }
 
+  /**
+   * Claim the public role after cold boot or supervised promotion. Construction is deliberately inert:
+   * a booting green overlaps live blue and must not close blue's callback. Activation terminalizes only
+   * foreign-process summaries, whose exact bodies/callbacks are unrecoverable in this process.
+   */
+  activatePublicOwner(): number {
+    if (this.publicOwnerActive) return 0
+    const terminalized = this.journal.terminalizeForeignQuestions(this.ownerEpoch)
+    this.publicOwnerActive = true
+    return terminalized
+  }
+
+  /** Planned blue drain: settle owned callbacks durably before relinquishing the public role. */
+  deactivatePublicOwner(): number {
+    if (!this.publicOwnerActive) return 0
+    const terminalized = this.abortAll('hub-restarted')
+    this.publicOwnerActive = false
+    return terminalized
+  }
+
+  get isPublicOwner(): boolean {
+    return this.publicOwnerActive
+  }
+
   request(request: QuestionRequest): Promise<QuestionOutcome> {
+    this.requirePublicOwner()
     const id = correlation(request.id, 'question id')
     const sessionId = correlation(request.sessionId, 'session id')
     const toolUseId = correlation(request.toolUseId, 'toolUseID')
     const requestId = correlation(request.requestId, 'requestId')
     const input = parseAskUserQuestionInput(request.input)
     const digest = questionDigest(input)
+    const correlationDigest = questionCorrelationDigest(sessionId, toolUseId, requestId)
     const existing = this.pendingMap.get(id)
     if (existing) {
       if (
         existing.record.sessionId !== sessionId ||
-        existing.record.toolUseId !== toolUseId ||
-        existing.record.requestId !== requestId ||
+        existing.toolUseId !== toolUseId ||
+        existing.requestId !== requestId ||
         existing.digest !== digest
       ) {
         throw new QuestionInputError('question id collided with different correlation or questions')
       }
+      this.reconcile(existing)
       return existing.promise
     }
 
     const durable = this.journal.resolvedQuestion(id)
     if (durable) {
-      const outcome = recoveredOutcome(durable, { sessionId, toolUseId, requestId, digest })
+      const outcome = recoveredOutcome(durable, { sessionId, correlationDigest, digest })
       if (
         outcome.kind === 'cancelled' &&
         outcome.reason === 'recovery-unknown' &&
@@ -310,8 +363,7 @@ export class QuestionService {
       ) {
         this.journal.append(sessionId, 'question/recovery-unknown', {
           id,
-          toolUseId,
-          requestId,
+          correlationDigest,
           message:
             'An answer was submitted before the hub restarted, but its exact delivery cannot be verified. The agent was told to ask again if needed.',
         })
@@ -319,24 +371,9 @@ export class QuestionService {
       return Promise.resolve(outcome)
     }
 
-    // Same-id dedup and durable recovery happen first so a legitimate retry still coalesces at capacity.
-    // A new request fails before journaling or retaining its body.
-    if (this.pendingMap.size >= MAX_PENDING_QUESTIONS_GLOBAL) {
-      throw new QuestionInputError('too many pending questions in this hub')
-    }
-    let sessionPending = 0
-    for (const entry of this.pendingMap.values()) {
-      if (entry.record.sessionId === sessionId) sessionPending += 1
-    }
-    if (sessionPending >= MAX_PENDING_QUESTIONS_PER_SESSION) {
-      throw new QuestionInputError('too many pending questions for this session')
-    }
-
     const record: QuestionRecord = {
       id,
       sessionId,
-      toolUseId,
-      requestId,
       questions: input.questions,
       status: 'pending',
       createdAt: new Date().toISOString(),
@@ -345,9 +382,63 @@ export class QuestionService {
     const promise = new Promise<QuestionOutcome>((settle) => {
       resolve = settle
     })
-    const entry: PendingEntry = { record, digest, resolve, promise }
+    const entry: PendingEntry = {
+      record,
+      toolUseId,
+      requestId,
+      correlationDigest,
+      digest,
+      resolve,
+      promise,
+    }
+    let registered
+    try {
+      registered = this.journal.registerQuestion(
+        {
+          id,
+          sessionId,
+          correlationDigest,
+          toolUseIdLength: toolUseId.length,
+          requestIdLength: requestId.length,
+          questionDigest: digest,
+          ownerEpoch: this.ownerEpoch,
+          inputBytes: Buffer.byteLength(canonical(input), 'utf8'),
+          createdAt: record.createdAt,
+          questionCount: input.questions.length,
+        },
+        {
+          global: MAX_PENDING_QUESTIONS_GLOBAL,
+          perSession: MAX_PENDING_QUESTIONS_PER_SESSION,
+        }
+      )
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (/too many pending questions/u.test(message)) throw new QuestionInputError(message)
+      throw error
+    }
+    this.assertDurableCorrelation(registered.state, entry)
+    if (registered.state.status !== 'pending') {
+      const outcome = recoveredOutcome(
+        registered.state as ResolvedQuestion,
+        {
+        sessionId,
+        correlationDigest,
+        digest,
+        }
+      )
+      return Promise.resolve(outcome)
+    }
+    if (!registered.created && registered.state.ownerEpoch !== this.ownerEpoch) {
+      return Promise.resolve({
+        kind: 'cancelled',
+        reason: 'unavailable',
+        message:
+          'This question is owned by another live hub process and cannot be answered through this process.',
+      })
+    }
+    // The durable request and bounded active body exist before local retention. If the transaction fails,
+    // no quota slot or promise remains; post-commit subscriber failures are contained by Journal.atomic().
     this.pendingMap.set(id, entry)
-    this.journal.append(sessionId, 'question/requested', record)
     if (request.signal) {
       const abort = () => this.abort(id)
       if (request.signal.aborted) abort()
@@ -360,78 +451,126 @@ export class QuestionService {
   }
 
   answer(id: string, rawAnswers: unknown): boolean {
+    this.requirePublicOwner()
     const entry = this.pendingMap.get(id)
     if (!entry) return false
+    if (this.reconcile(entry)) return false
     const answers = parseQuestionAnswers(entry.record.questions, rawAnswers)
     const updatedInput = { questions: entry.record.questions, answers }
     return this.finish(entry, 'answered', { kind: 'answered', updatedInput })
   }
 
   cancel(id: string): boolean {
+    this.requirePublicOwner()
     const entry = this.pendingMap.get(id)
-    return entry ? this.finish(entry, 'cancelled', { kind: 'cancelled' }) : false
+    if (!entry || this.reconcile(entry)) return false
+    return this.finish(entry, 'cancelled', { kind: 'cancelled' })
   }
 
   abort(id: string, sessionId?: string): boolean {
+    this.requirePublicOwner()
     const entry = this.pendingMap.get(id)
     if (entry && sessionId !== undefined && entry.record.sessionId !== sessionId) return false
-    return entry
-      ? this.finish(entry, 'aborted', { kind: 'cancelled', reason: 'aborted' })
-      : false
+    if (!entry || this.reconcile(entry)) return false
+    return this.finish(entry, 'aborted', { kind: 'cancelled', reason: 'aborted' })
+  }
+
+  /** Terminalize every callback owned by this process before restart releases its public listener. */
+  abortAll(
+    reason: 'hub-restarted' | 'worker-restarted' = 'worker-restarted'
+  ): number {
+    let terminalized = 0
+    for (const entry of [...this.pendingMap.values()]) {
+      if (this.reconcile(entry)) continue
+      if (
+        this.finish(
+          entry,
+          'aborted',
+          { kind: 'cancelled', reason },
+          reason
+        )
+      ) {
+        terminalized += 1
+      }
+    }
+    return terminalized
   }
 
   private finish(
     entry: PendingEntry,
     status: Exclude<QuestionStatus, 'pending'>,
-    outcome: QuestionOutcome
+    outcome: QuestionOutcome,
+    reason?: 'hub-restarted' | 'worker-restarted'
   ): boolean {
     if (this.pendingMap.get(entry.record.id) !== entry) return false
+    const terminal = this.journal.resolveQuestion(
+      entry.record.id,
+      {
+        sessionId: entry.record.sessionId,
+        correlationDigest: entry.correlationDigest,
+        questionDigest: entry.digest,
+      },
+      status,
+      reason
+    )
+    if (!terminal.written) {
+      this.settle(
+        entry,
+        recoveredOutcome(terminal.state, {
+          sessionId: entry.record.sessionId,
+          correlationDigest: entry.correlationDigest,
+          digest: entry.digest,
+        }),
+        terminal.state.status
+      )
+      return false
+    }
+    this.settle(entry, outcome, status)
+    return true
+  }
+
+  private reconcile(entry: PendingEntry): boolean {
+    const durable = this.journal.resolvedQuestion(entry.record.id)
+    if (!durable) return false
+    const outcome = recoveredOutcome(durable, {
+      sessionId: entry.record.sessionId,
+      correlationDigest: entry.correlationDigest,
+      digest: entry.digest,
+    })
+    this.settle(entry, outcome, durable.status)
+    return true
+  }
+
+  private settle(
+    entry: PendingEntry,
+    outcome: QuestionOutcome,
+    status: Exclude<QuestionStatus, 'pending'>
+  ): void {
+    if (this.pendingMap.get(entry.record.id) !== entry) return
     this.pendingMap.delete(entry.record.id)
     entry.removeAbort?.()
     entry.record.status = status
-    this.journal.append(entry.record.sessionId, 'question/resolved', {
-      id: entry.record.id,
-      status,
-      toolUseId: entry.record.toolUseId,
-      requestId: entry.record.requestId,
-      questionDigest: entry.digest,
-    })
     entry.resolve(outcome)
-    return true
   }
-}
 
-/** Hub worker-socket boundary: recompute identity and validate the owning provider before allocation. */
-export function resolveWorkerQuestion(
-  questions: QuestionService,
-  sessions: ReadonlyArray<{ id: string; provider: string }>,
-  request: WorkerQuestionRequest
-): Promise<QuestionOutcome> {
-  const expectedId = stableQuestionId(
-    request.sessionId,
-    request.toolUseId,
-    request.requestId
-  )
-  if (request.questionId !== expectedId) {
-    return Promise.resolve({
-      kind: 'cancelled',
-      reason: 'rejected',
-      message: 'Question correlation did not match the hub-computed identity.',
-    })
+  private assertDurableCorrelation(
+    state: {
+      sessionId: string
+      correlationDigest: string
+      questionDigest: string
+    },
+    entry: PendingEntry
+  ): void {
+    if (
+      state.sessionId !== entry.record.sessionId ||
+      state.correlationDigest !== entry.correlationDigest ||
+      state.questionDigest !== entry.digest
+    ) {
+      throw new QuestionInputError('question id collided with different correlation or questions')
+    }
   }
-  const record = sessions.find((candidate) => candidate.id === request.sessionId)
-  if (!record || record.provider !== 'claude') {
-    return Promise.resolve({
-      kind: 'cancelled',
-      reason: 'rejected',
-      message: 'Question session is missing or is not a Claude session.',
-    })
+
+  private requirePublicOwner(): void {
+    if (!this.publicOwnerActive) throw new QuestionOwnershipError()
   }
-  return questions.request({
-    id: expectedId,
-    sessionId: request.sessionId,
-    toolUseId: request.toolUseId,
-    requestId: request.requestId,
-    input: request.input,
-  })
 }

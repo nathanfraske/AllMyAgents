@@ -19,6 +19,7 @@ import { AgentBus } from './bus.js'
 import { MemoryStore } from './memory.js'
 import { PracticeStore } from './practices.js'
 import { SessionManager } from './sessions.js'
+import { QuestionService } from './questions.js'
 
 // STEP 4 round-trips (docs/agent-worker-impl.md §3.3): the worker's MCP tool handlers relay bus/memory/
 // practices/approval back to hub-owned services. These two halves must agree on the wire shape, so they
@@ -229,7 +230,7 @@ describe('SessionManager.runRelay — hub-side dispatch (mirrors InProcessExecut
     const bus = new AgentBus(journal.db)
     const memory = new MemoryStore(journal.db)
     const practices = new PracticeStore(journal.db)
-    const sessions = new SessionManager(journal, store, new Map(), approvals, usage, workspace, projects, instructions, bus, memory, practices, SAFE, false, tmp)
+    const sessions = new SessionManager(journal, store, new Map(), approvals, usage, workspace, projects, instructions, bus, memory, practices, SAFE, false, tmp, new QuestionService(journal))
     return { sessions }
   }
   afterEach(() => {

@@ -36,7 +36,7 @@ afterEach(async () => {
   while (cleanups.length) await cleanups.pop()?.()
 })
 
-async function build() {
+async function build(activate = true) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-questions-api-'))
   const journal = new Journal(path.join(root, 'hub.db'))
   const questions = new QuestionService(journal)
@@ -68,9 +68,12 @@ async function build() {
     configPath: path.join(root, 'config.json'),
   } satisfies ServerOptions)
   if (!server.listening) await once(server, 'listening')
+  if (activate) questions.activatePublicOwner()
   const address = server.address() as { port: number }
   cleanups.push(async () => {
-    for (const pending of questions.pending()) questions.cancel(pending.id)
+    if (questions.isPublicOwner) {
+      for (const pending of questions.pending()) questions.cancel(pending.id)
+    }
     if (server.listening) {
       const closed = new Promise<void>((resolve) => server.close(() => resolve()))
       server.closeAllConnections()
@@ -94,6 +97,23 @@ function requestHeaders(token: string): HeadersInit {
 }
 
 describe('authenticated question HTTP lifecycle', () => {
+  it('fails GET and POST closed while a booting green has not claimed public ownership', async () => {
+    const { base, deviceToken } = await build(false)
+    const listed = await fetch(`${base}/api/questions`, {
+      headers: requestHeaders(deviceToken),
+    })
+    expect(listed.status).toBe(503)
+    expect(await listed.json()).toMatchObject({ error: expect.stringContaining('does not own') })
+
+    const answered = await fetch(`${base}/api/questions/q-blue`, {
+      method: 'POST',
+      headers: requestHeaders(deviceToken),
+      body: '{"cancel":true}',
+    })
+    expect(answered.status).toBe(503)
+    expect(await answered.json()).toMatchObject({ error: expect.stringContaining('does not own') })
+  })
+
   it('lists pending questions and preserves hostile-looking exact answer keys through POST', async () => {
     const { base, deviceToken, questions } = await build()
     const pending = questions.request({

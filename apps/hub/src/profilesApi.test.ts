@@ -40,6 +40,7 @@ describe('GET /api/profiles contract', () => {
       sessions: sessions as never,
       profiles: [profile],
       approvals: {} as never,
+      questions: {} as never,
       usage: {} as never,
       projects: {} as never,
       workspace: {} as never,

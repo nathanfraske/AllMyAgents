@@ -18,6 +18,7 @@ import { PracticeStore } from './practices.js'
 import type { Executor } from './executor.js'
 import type { LiveSession, WorkerToHub } from './workerProtocol.js'
 import type { DangerFlags, Profile, Provider, SessionRecord, SessionStatus } from './types.js'
+import { QuestionService } from './questions.js'
 
 // STEP 5 (docs/agent-worker-impl.md §6 + §7.1): after a hub restart a fresh hub re-attaches to the still-
 // running worker and the in-flight turn's events replay gap-free, exactly-once. These tests exercise BOTH
@@ -329,7 +330,7 @@ function wireHub(deps: HubDeps): FakeHub {
     },
     isBusy: () => false,
   }
-  const sessions = new SessionManager(deps.journal, deps.store, deps.profiles, deps.approvals, deps.usage, deps.workspace, deps.projects, deps.instructions, deps.bus, deps.memory, deps.practices, SAFE, false, deps.tmp, fakeExecutor)
+  const sessions = new SessionManager(deps.journal, deps.store, deps.profiles, deps.approvals, deps.usage, deps.workspace, deps.projects, deps.instructions, deps.bus, deps.memory, deps.practices, SAFE, false, deps.tmp, new QuestionService(deps.journal), fakeExecutor)
   return { journal: deps.journal, store: deps.store, sessions, setLive: (l) => (liveToReturn = l), setOnAttach: (fn) => (onAttach = fn), attachCalls, runTurnCalls, rebuild: () => wireHub(deps) }
 }
 

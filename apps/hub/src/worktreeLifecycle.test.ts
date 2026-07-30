@@ -16,6 +16,7 @@ import type { Profile } from './types.js'
 import { ApprovalService } from './approvals.js'
 import { UsageMonitor } from './usage.js'
 import { WorkspaceManager } from './workspace.js'
+import { QuestionService } from './questions.js'
 
 const cleanups: Array<() => void> = []
 
@@ -77,6 +78,7 @@ function buildHub() {
     { busCanUseRiskyTools: false, autoApprovePractices: false },
     false,
     hubRoot,
+    new QuestionService(journal),
     executor
   )
   const projectId = projects.create('fixture', repo).id

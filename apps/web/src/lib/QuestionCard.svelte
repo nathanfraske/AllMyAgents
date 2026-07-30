@@ -4,11 +4,15 @@
   let {
     record,
     error,
+    ordinal = 1,
+    total = 1,
     onsubmit,
     oncancel,
   }: {
     record: QuestionRecord
     error?: string
+    ordinal?: number
+    total?: number
     onsubmit: (answers: Record<string, string>) => Promise<void>
     oncancel: () => Promise<void>
   } = $props()
@@ -28,11 +32,20 @@
   )
   let choices = $state<number[][]>([])
   let otherText = $state<string[]>([])
+  let activePreview = $state<number[]>([])
   let busy = $state(false)
   let localError = $state('')
 
   function selected(questionIndex: number, optionIndex: number): boolean {
     return choices[questionIndex]?.includes(optionIndex) ?? false
+  }
+
+  function descriptionId(questionIndex: number, optionIndex: number): string {
+    return `question-${record.id}-${questionIndex}-${optionIndex}-description`
+  }
+
+  function previewId(questionIndex: number, optionIndex: number): string {
+    return `question-${record.id}-${questionIndex}-${optionIndex}-preview`
   }
 
   function choose(questionIndex: number, optionIndex: number, multiSelect: boolean): void {
@@ -48,7 +61,17 @@
     )
     nextChoices[questionIndex] = next
     choices = nextChoices
+    activatePreview(questionIndex, optionIndex)
     localError = ''
+  }
+
+  function activatePreview(questionIndex: number, optionIndex: number): void {
+    const next = Array.from(
+      { length: record.questions.length },
+      (_, index) => activePreview[index] ?? OTHER
+    )
+    next[questionIndex] = optionIndex
+    activePreview = next
   }
 
   function setOther(questionIndex: number, value: string): void {
@@ -124,44 +147,58 @@
     Cannot display this question safely. No answer was submitted.
   </div>
 {:else}
-  <form class="question-card" onsubmit={submit} aria-label="Question from Claude">
+  <form
+    class="question-card"
+    onsubmit={submit}
+    aria-label={`Question from Claude ${ordinal} of ${total}`}
+  >
+    <span class="arrival" role="status" aria-live="polite">
+      New question from Claude, {ordinal} of {total}.
+    </span>
     <div class="question-top">
       <span class="question-label">QUESTION FROM CLAUDE</span>
       <span class="question-count">{record.questions.length} {record.questions.length === 1 ? 'question' : 'questions'}</span>
     </div>
 
     {#each record.questions as question, questionIndex}
-      <fieldset aria-label={`${question.header}: ${question.question}`}>
+      <fieldset aria-label={`${question.header}: ${question.question}`} disabled={busy}>
         <legend>
           <span class="header">{question.header}</span>
           <span class="prompt">{question.question}</span>
         </legend>
         <div class="options">
           {#each question.options as option, optionIndex}
-            <label class="option">
+            <label
+              class:selected={selected(questionIndex, optionIndex)}
+              class:preview-active={activePreview[questionIndex] === optionIndex}
+              class="option"
+            >
               <input
                 type={question.multiSelect ? 'checkbox' : 'radio'}
                 aria-label={option.label}
+                aria-describedby={`${descriptionId(questionIndex, optionIndex)}${option.preview ? ` ${previewId(questionIndex, optionIndex)}` : ''}`}
                 name={`question-${record.id}-${questionIndex}`}
                 checked={selected(questionIndex, optionIndex)}
                 onchange={() => choose(questionIndex, optionIndex, question.multiSelect)}
+                onfocus={() => activatePreview(questionIndex, optionIndex)}
               />
               <span>
                 <strong>{option.label}</strong>
-                <small>{option.description}</small>
-                {#if option.preview}<pre class="preview">{option.preview}</pre>{/if}
+                <small id={descriptionId(questionIndex, optionIndex)}>{option.description}</small>
+                {#if option.preview}<pre id={previewId(questionIndex, optionIndex)} class="preview">{option.preview}</pre>{/if}
               </span>
             </label>
           {/each}
-          <label class="option">
+          <label class:selected={selected(questionIndex, OTHER)} class="option">
             <input
               type={question.multiSelect ? 'checkbox' : 'radio'}
               aria-label="Other"
+              aria-describedby={descriptionId(questionIndex, OTHER)}
               name={`question-${record.id}-${questionIndex}`}
               checked={selected(questionIndex, OTHER)}
               onchange={() => choose(questionIndex, OTHER, question.multiSelect)}
             />
-            <span><strong>Other</strong><small>Enter a different answer.</small></span>
+            <span><strong>Other</strong><small id={descriptionId(questionIndex, OTHER)}>Enter a different answer.</small></span>
           </label>
           {#if selected(questionIndex, OTHER)}
             <input
@@ -253,6 +290,7 @@
     overflow-wrap: anywhere;
   }
   .preview {
+    display: none;
     max-height: 120px;
     margin: 4px 0 0;
     padding: 6px;
@@ -262,6 +300,9 @@
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
+  .option.preview-active .preview {
+    display: block;
+  }
   .other {
     width: 100%;
     box-sizing: border-box;
@@ -269,11 +310,29 @@
   .actions button {
     padding: 6px 10px;
   }
+  .actions {
+    position: sticky;
+    bottom: 0;
+    z-index: 1;
+    padding-block: 6px;
+    background: color-mix(in srgb, var(--secondary) 7%, var(--surface));
+  }
   .submit {
     color: var(--surface);
     background: var(--secondary);
   }
   .error, .invalid {
     color: var(--danger);
+  }
+  .arrival {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }
 </style>

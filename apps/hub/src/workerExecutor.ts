@@ -1,9 +1,8 @@
 import type { Executor } from './executor.js'
 import type { WorkerClient } from './workerTransport.js'
 import type { DangerFlags } from './types.js'
-import { nextReqId, stableQuestionId, type HubToWorker, type LiveSession, type RelayMethod, type WorkerSessionSpec, type WorkerToHub } from './workerProtocol.js'
+import { nextReqId, type HubToWorker, type LiveSession, type RelayMethod, type WorkerSessionSpec, type WorkerToHub } from './workerProtocol.js'
 import type { AttachmentMeta } from './attachments.js'
-import type { QuestionOutcome } from './questions.js'
 
 function errText(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
@@ -53,14 +52,6 @@ export interface WorkerExecutorHubCallbacks {
   requestRestart(reason: string, bySession?: string): void
   runRelay(method: RelayMethod, args: unknown): unknown
   resolveApproval(approvalId: string, sessionId: string, kind: string, payload: unknown): Promise<boolean>
-  resolveQuestion(request: {
-    questionId: string
-    sessionId: string
-    toolUseId: string
-    requestId: string
-    input: unknown
-  }): Promise<QuestionOutcome>
-  abortQuestion(questionId: string, sessionId: string): boolean
   attachWorker(): Promise<void>
 }
 
@@ -119,9 +110,7 @@ export class WorkerExecutor implements Executor {
     // channel (rpcResult / approvalResolved); the WorkerServer correlates the reply by callId/approvalId.
     this.client.onRelay((msg) => {
       if (msg.t === 'rpc') this.dispatchRpc(msg)
-      else if (msg.t === 'approvalRequest') this.dispatchApproval(msg)
-      else if (msg.t === 'questionRequest') this.dispatchQuestion(msg)
-      else this.dispatchQuestionAbort(msg)
+      else this.dispatchApproval(msg)
     })
     // The attached worker's generation handshake (§8.2 / F1). A CHANGE means the worker RESPAWNED (its
     // callSeq reset to wc1), so the served-write cache — keyed by callId alone — must be dropped before its
@@ -386,54 +375,6 @@ export class WorkerExecutor implements Executor {
         console.warn(`[worker-executor] approval resolve failed for ${msg.approvalId}: ${errText(err)}`)
         this.client.send({ t: 'approvalResolved', approvalId: msg.approvalId, approved: false })
       })
-  }
-
-  /** AskUserQuestion is interactive input, not an approval. Keep its dedicated service result intact all
-   * the way back to canUseTool; there is intentionally no boolean/grant-shaped conversion here. */
-  private dispatchQuestion(msg: Extract<WorkerToHub, { t: 'questionRequest' }>): void {
-    const expectedId = stableQuestionId(msg.sessionId, msg.toolUseId, msg.requestId)
-    if (msg.questionId !== expectedId) {
-      this.client.send({
-        t: 'questionResolved',
-        questionId: msg.questionId,
-        outcome: {
-          kind: 'cancelled',
-          reason: 'rejected',
-          message: 'Question correlation did not match the hub-computed identity.',
-        },
-      })
-      return
-    }
-    this.hub
-      .resolveQuestion({
-        questionId: msg.questionId,
-        sessionId: msg.sessionId,
-        toolUseId: msg.toolUseId,
-        requestId: msg.requestId,
-        input: msg.input,
-      })
-      .then((outcome) =>
-        this.client.send({ t: 'questionResolved', questionId: msg.questionId, outcome })
-      )
-      .catch((error) => {
-        console.warn(
-          `[worker-executor] question resolve failed for ${msg.questionId}: ${errText(error)}`
-        )
-        this.client.send({
-          t: 'questionResolved',
-          questionId: msg.questionId,
-          outcome: {
-            kind: 'cancelled',
-            reason: 'unavailable',
-            message: `The hub could not retain this question: ${errText(error)}`,
-          },
-        })
-      })
-  }
-
-  private dispatchQuestionAbort(msg: Extract<WorkerToHub, { t: 'questionAbort' }>): void {
-    const aborted = this.hub.abortQuestion(msg.questionId, msg.sessionId)
-    this.client.send({ t: 'questionAbortAck', questionId: msg.questionId, aborted })
   }
 
   /** Issue a command whose reply is a plain `ack`, throwing the worker's error when `ok:false`. */

@@ -14,9 +14,29 @@ import type { ApprovalStatus, HubEvent } from './types.js'
 export interface ResolvedQuestion {
   sessionId: string
   status: 'answered' | 'cancelled' | 'aborted'
-  toolUseId: string
-  requestId: string
+  correlationDigest: string
   questionDigest: string
+  reason?: 'hub-restarted' | 'worker-restarted'
+}
+
+export interface DurableQuestion {
+  id: string
+  sessionId: string
+  correlationDigest: string
+  questionDigest: string
+  ownerEpoch: string
+  status: 'pending' | ResolvedQuestion['status']
+  reason?: ResolvedQuestion['reason']
+}
+
+export interface RegisterQuestionResult {
+  created: boolean
+  state: DurableQuestion
+}
+
+export interface ResolveQuestionResult {
+  written: boolean
+  state: ResolvedQuestion
 }
 
 /**
@@ -95,7 +115,6 @@ export class Journal extends EventEmitter {
   // Lazily built the first time a re-issued approval is reconciled (worker mode only — the in-process
   // executor never supplies a stable id, so this never runs flag-off, keeping the constructor byte-identical).
   private resolvedApprovalStmt: Database.Statement | undefined
-  private resolvedQuestionStmt: Database.Statement | undefined
   private questionRecoveryUnknownStmt: Database.Statement | undefined
 
   constructor(file: string) {
@@ -127,6 +146,26 @@ export class Journal extends EventEmitter {
     this.db.exec(
       'CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, session TEXT, kind TEXT NOT NULL, payload TEXT NOT NULL)'
     )
+    // Interactive question bodies are needed only while the matching SDK callback is live and therefore
+    // stay only in the bounded owner process memory. This table stores summary metadata (never prompt,
+    // description, preview, or answer bytes). Its primary key is the cross-process blue/green CAS.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS question_lifecycles (
+        id TEXT PRIMARY KEY,
+        session TEXT NOT NULL,
+        correlation_digest TEXT NOT NULL,
+        tool_use_id_length INTEGER NOT NULL,
+        request_id_length INTEGER NOT NULL,
+        question_digest TEXT NOT NULL,
+        owner_epoch TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'answered', 'cancelled', 'aborted')),
+        terminal_reason TEXT,
+        input_bytes INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_question_lifecycles_pending
+        ON question_lifecycles(status, session);
+    `)
     // Additive, back-compat: tag worker-relayed events with their per-session worker seq so a restarted
     // hub can derive the durable re-attach cursor MAX(wseq) (docs/agent-worker-impl.md §7.1). Old rows
     // are NULL. Guarded so re-running on an already-migrated DB is a no-op.
@@ -1066,40 +1105,17 @@ export class Journal extends EventEmitter {
    * so replay cannot turn one answer into a standing answer for a later byte-identical question.
    */
   resolvedQuestion(id: string): ResolvedQuestion | undefined {
-    if (!this.resolvedQuestionStmt) {
-      this.db.exec(
-        "CREATE INDEX IF NOT EXISTS idx_events_resolved_question ON events(json_extract(payload, '$.id')) WHERE kind = 'question/resolved'"
-      )
-      this.resolvedQuestionStmt = this.db.prepare(
-        "SELECT session, payload FROM events WHERE kind = 'question/resolved' AND json_extract(payload, '$.id') = ? ORDER BY seq DESC LIMIT 1"
-      )
-    }
-    const row = this.resolvedQuestionStmt.get(id) as
-      | { session: string | null; payload: string }
-      | undefined
-    if (!row?.session) return undefined
-    try {
-      const payload = JSON.parse(row.payload) as Partial<Omit<ResolvedQuestion, 'sessionId'>>
-      if (
-        (payload.status !== 'answered' &&
-          payload.status !== 'cancelled' &&
-          payload.status !== 'aborted') ||
-        typeof payload.toolUseId !== 'string' ||
-        typeof payload.requestId !== 'string' ||
-        typeof payload.questionDigest !== 'string'
-      ) {
-        return undefined
-      }
+    const lifecycle = this.questionLifecycle(id)
+    if (lifecycle && lifecycle.status !== 'pending') {
       return {
-        sessionId: row.session,
-        status: payload.status,
-        toolUseId: payload.toolUseId,
-        requestId: payload.requestId,
-        questionDigest: payload.questionDigest,
+        sessionId: lifecycle.sessionId,
+        status: lifecycle.status,
+        correlationDigest: lifecycle.correlationDigest,
+        questionDigest: lifecycle.questionDigest,
+        ...(lifecycle.reason ? { reason: lifecycle.reason } : {}),
       }
-    } catch {
-      return undefined
     }
+    return undefined
   }
 
   /** Whether this exact invocation already received the one operator-visible lost-reply notice. */
@@ -1113,6 +1129,213 @@ export class Journal extends EventEmitter {
       )
     }
     return this.questionRecoveryUnknownStmt.get(id) !== undefined
+  }
+
+  /** Return one materialized question summary; active bodies never enter this database. */
+  questionLifecycle(id: string): DurableQuestion | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT id, session, correlation_digest, question_digest, owner_epoch, status,
+                terminal_reason
+         FROM question_lifecycles WHERE id = ?`
+      )
+      .get(id) as
+      | {
+          id: string
+          session: string
+          correlation_digest: string
+          question_digest: string
+          owner_epoch: string
+          status: DurableQuestion['status']
+          terminal_reason: ResolvedQuestion['reason'] | null
+        }
+      | undefined
+    if (!row) return undefined
+    return {
+      id: row.id,
+      sessionId: row.session,
+      correlationDigest: row.correlation_digest,
+      questionDigest: row.question_digest,
+      ownerEpoch: row.owner_epoch,
+      status: row.status,
+      ...(row.terminal_reason ? { reason: row.terminal_reason } : {}),
+    }
+  }
+
+  /**
+   * Atomically register bounded lifecycle metadata. A failed append rolls back the row; a post-commit
+   * subscriber failure is contained by atomic(), so callers never retain a phantom.
+   */
+  registerQuestion(
+    question: {
+      id: string
+      sessionId: string
+      correlationDigest: string
+      toolUseIdLength: number
+      requestIdLength: number
+      questionDigest: string
+      ownerEpoch: string
+      inputBytes: number
+      createdAt: string
+      questionCount: number
+    },
+    limits: { global: number; perSession: number }
+  ): RegisterQuestionResult {
+    return this.atomic(() => {
+      const existing = this.questionLifecycle(question.id)
+      if (existing) return { created: false, state: existing }
+      const global = (
+        this.db
+          .prepare("SELECT COUNT(*) AS n FROM question_lifecycles WHERE status = 'pending'")
+          .get() as { n: number }
+      ).n
+      if (global >= limits.global) throw new Error('too many pending questions in this hub')
+      const session = (
+        this.db
+          .prepare(
+            "SELECT COUNT(*) AS n FROM question_lifecycles WHERE status = 'pending' AND session = ?"
+          )
+          .get(question.sessionId) as { n: number }
+      ).n
+      if (session >= limits.perSession) {
+        throw new Error('too many pending questions for this session')
+      }
+      this.db
+        .prepare(
+          `INSERT INTO question_lifecycles
+             (id, session, correlation_digest, tool_use_id_length, request_id_length,
+              question_digest, owner_epoch, status, terminal_reason, input_bytes, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)`
+        )
+        .run(
+          question.id,
+          question.sessionId,
+          question.correlationDigest,
+          question.toolUseIdLength,
+          question.requestIdLength,
+          question.questionDigest,
+          question.ownerEpoch,
+          question.inputBytes,
+          question.createdAt
+        )
+      // Full prompts/descriptions/previews are intentionally absent from the append-only replay stream.
+      this.append(question.sessionId, 'question/requested', {
+        id: question.id,
+        correlationDigest: question.correlationDigest,
+        toolUseIdLength: question.toolUseIdLength,
+        requestIdLength: question.requestIdLength,
+        questionDigest: question.questionDigest,
+        questionCount: question.questionCount,
+        inputBytes: question.inputBytes,
+      })
+      return {
+        created: true,
+        state: this.questionLifecycle(question.id)!,
+      }
+    })
+  }
+
+  /** CAS pending -> terminal and its audit row in one SQLite transaction. */
+  resolveQuestion(
+    id: string,
+    expected: {
+      sessionId: string
+      correlationDigest: string
+      questionDigest: string
+    },
+    status: ResolvedQuestion['status'],
+    reason?: ResolvedQuestion['reason']
+  ): ResolveQuestionResult {
+    return this.atomic(() => {
+      const before = this.questionLifecycle(id)
+      if (!before) throw new Error('question lifecycle is missing')
+      if (
+        before.sessionId !== expected.sessionId ||
+        before.correlationDigest !== expected.correlationDigest ||
+        before.questionDigest !== expected.questionDigest
+      ) {
+        throw new Error('durable question correlation conflicts with the current request')
+      }
+      if (before.status !== 'pending') {
+        return {
+          written: false,
+          state: {
+            sessionId: before.sessionId,
+            status: before.status,
+            correlationDigest: before.correlationDigest,
+            questionDigest: before.questionDigest,
+            ...(before.reason ? { reason: before.reason } : {}),
+          },
+        }
+      }
+      const changed = this.db
+        .prepare(
+          `UPDATE question_lifecycles
+           SET status = ?, terminal_reason = ?
+           WHERE id = ? AND status = 'pending'`
+        )
+        .run(status, reason ?? null, id)
+      if (changed.changes !== 1) {
+        const raced = this.questionLifecycle(id)
+        if (!raced || raced.status === 'pending') throw new Error('question terminal CAS failed')
+        return {
+          written: false,
+          state: {
+            sessionId: raced.sessionId,
+            status: raced.status,
+            correlationDigest: raced.correlationDigest,
+            questionDigest: raced.questionDigest,
+            ...(raced.reason ? { reason: raced.reason } : {}),
+          },
+        }
+      }
+      this.append(expected.sessionId, 'question/resolved', {
+        id,
+        status,
+        correlationDigest: expected.correlationDigest,
+        questionDigest: expected.questionDigest,
+        ...(reason ? { reason } : {}),
+      })
+      return {
+        written: true,
+        state: {
+          sessionId: expected.sessionId,
+          status,
+          correlationDigest: expected.correlationDigest,
+          questionDigest: expected.questionDigest,
+          ...(reason ? { reason } : {}),
+        },
+      }
+    })
+  }
+
+  /** Foreign-owner pending rows have no callback in this process; close them before public promotion. */
+  terminalizeForeignQuestions(ownerEpoch: string): number {
+    return this.atomic(() => {
+      const rows = this.db
+        .prepare(
+          `SELECT id FROM question_lifecycles
+           WHERE status = 'pending' AND owner_epoch <> ? ORDER BY created_at, id`
+        )
+        .all(ownerEpoch) as Array<{ id: string }>
+      let count = 0
+      for (const { id } of rows) {
+        const state = this.questionLifecycle(id)
+        if (!state || state.status !== 'pending') continue
+        const result = this.resolveQuestion(
+          id,
+          {
+            sessionId: state.sessionId,
+            correlationDigest: state.correlationDigest,
+            questionDigest: state.questionDigest,
+          },
+          'aborted',
+          'hub-restarted'
+        )
+        if (result.written) count += 1
+      }
+      return count
+    })
   }
 
   since(seq: number, limit = 2000): HubEvent[] {

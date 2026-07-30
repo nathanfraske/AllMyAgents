@@ -43,12 +43,33 @@ function controllerDeps(
     onPromoted: () => {},
     stopJournalBackups: async () => {},
     journal: { append: () => {} },
+    questions: { deactivatePublicOwner: () => 0, activatePublicOwner: () => 0 },
     sessions: { reconcileStale: () => {}, shutdown: async () => {} },
     executor: {},
   } as unknown as RestartControllerDeps
 }
 
 describe('RestartController journal backup ownership', () => {
+  it('terminalizes question callbacks before releasing blue and fails the drain closed on audit failure', async () => {
+    const server = http.createServer()
+    const publicPort = await listenEphemeral(server)
+    const sent: unknown[] = []
+    const deps = controllerDeps(server, publicPort, sent)
+    const deactivatePublicOwner = vi.fn(() => {
+      throw new Error('SQLITE_FULL while terminalizing questions')
+    })
+    deps.questions = { deactivatePublicOwner } as never
+    const signalDraining = vi.fn()
+    deps.executor = { signalDraining } as never
+
+    await expect(new RestartController(deps).drain()).rejects.toThrow(/SQLITE_FULL/)
+    expect(deactivatePublicOwner).toHaveBeenCalledTimes(1)
+    expect(signalDraining).not.toHaveBeenCalled()
+    expect(server.listening).toBe(true)
+    expect(deps.state.draining).toBe(false)
+    expect(sent).toEqual([])
+  })
+
   it('settles and permanently stops backup work before a planned blue retire exits', async () => {
     const order: string[] = []
     vi.spyOn(process, 'exit').mockImplementation((() => {
@@ -124,6 +145,75 @@ describe('RestartController journal backup ownership', () => {
     expect((server.address() as { port: number }).port).toBe(publicPort)
     expect(sent).toEqual([]) // the dead supervisor cannot consume `promoted`
   })
+
+  it('closes the promoted listener when question ownership activation cannot commit', async () => {
+    const reservation = http.createServer()
+    const publicPort = await listenEphemeral(reservation)
+    await new Promise<void>((resolve) => reservation.close(() => resolve()))
+    const server = http.createServer()
+    await listenEphemeral(server)
+    const sent: unknown[] = []
+    const deps = controllerDeps(server, publicPort, sent)
+    deps.questions = {
+      deactivatePublicOwner: () => 0,
+      activatePublicOwner: () => {
+        throw new Error('SQLITE_IOERR during public claim')
+      },
+    } as never
+
+    new RestartController(deps).promote(publicPort)
+    await vi.waitFor(() =>
+      expect(sent).toContainEqual({
+        type: 'promote-failed',
+        error: expect.stringContaining('SQLITE_IOERR'),
+      })
+    )
+    expect(server.listening).toBe(false)
+    expect(deps.state.draining).toBe(true)
+  })
+
+  it.each(['reconcile', 'deferred-services'] as const)(
+    'closes the promoted listener when the %s post-bind step fails',
+    async (phase) => {
+      const reservation = http.createServer()
+      const publicPort = await listenEphemeral(reservation)
+      await new Promise<void>((resolve) => reservation.close(() => resolve()))
+      const server = http.createServer()
+      await listenEphemeral(server)
+      const sent: unknown[] = []
+      const deps = controllerDeps(server, publicPort, sent)
+      const deactivatePublicOwner = vi.fn(() => 0)
+      deps.questions = {
+        activatePublicOwner: () => 0,
+        deactivatePublicOwner,
+      } as never
+      if (phase === 'reconcile') {
+        deps.sessions = {
+          reconcileStale: () => {
+            throw new Error('reconcile failed')
+          },
+        } as never
+      } else {
+        deps.onPromoted = () => {
+          throw new Error('deferred startup failed')
+        }
+      }
+
+      new RestartController(deps).promote(publicPort)
+      await vi.waitFor(() =>
+        expect(
+          sent.filter(
+            (message) =>
+              (message as { type?: string }).type === 'promote-failed'
+          )
+        ).toHaveLength(1)
+      )
+      expect(server.listening).toBe(false)
+      expect(sent).not.toContainEqual({ type: 'promoted' })
+      expect(deactivatePublicOwner).toHaveBeenCalledTimes(1)
+      expect(deps.state.draining).toBe(true)
+    }
+  )
 
   it('waits through rollback re-listen before resuming orphaned blue ownership', async () => {
     const server = http.createServer()

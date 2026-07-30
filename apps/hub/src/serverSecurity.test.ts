@@ -20,6 +20,7 @@ import { UsageMonitor } from './usage.js'
 import { WorkspaceManager } from './workspace.js'
 import type { RestartState } from './restartController.js'
 import { RestartController } from './restartController.js'
+import { QuestionService } from './questions.js'
 import { waitForPortRelease } from './restartRollback.js'
 
 const cleanups: Array<() => void | Promise<void>> = []
@@ -74,6 +75,7 @@ async function build() {
     danger,
     false,
     root,
+    new QuestionService(journal),
     executor
   )
   sessions.execAgentTool = async () => 'bridge-ok'
@@ -96,6 +98,7 @@ async function build() {
     sessions,
     profiles: [profile],
     approvals,
+    questions: sessions.questionService,
     usage,
     projects,
     instructions,
@@ -206,6 +209,7 @@ describe('device-authenticated control plane', () => {
       server,
       sessions,
       journal,
+      questions: sessions.questionService,
       state: restartState,
       publicPort,
       send: (message) => sent.push(message),

@@ -337,8 +337,6 @@ export interface QuestionPrompt {
 export interface QuestionRecord {
   id: string
   sessionId: string
-  toolUseId: string
-  requestId: string
   questions: QuestionPrompt[]
   status: 'pending' | 'answered' | 'cancelled' | 'aborted'
   createdAt: string

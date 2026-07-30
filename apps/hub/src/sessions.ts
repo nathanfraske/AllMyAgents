@@ -155,7 +155,6 @@ const MANAGER_ROSTER_PATH_LIMIT = 12
 const MANAGER_ROSTER_MAX_CHARS = 8_000
 
 export class SessionManager {
-  private readonly questions: QuestionService
   private readonly sessions = new Map<string, SessionRecord>()
   // Per-session set of memory ids already auto-recalled into context, so the same memory isn't
   // re-injected turn after turn (automatic recall; gated by autoMemoryRecall).
@@ -226,6 +225,8 @@ export class SessionManager {
     private readonly danger: DangerFlags,
     private readonly autoMemoryRecall: boolean,
     private readonly defaultCwd: string,
+    /** Required root-owned interactive-input service; never construct a private fallback. */
+    readonly questionService: QuestionService,
     // The execution seam. Optional: defaults to an in-process executor built from this manager's own
     // services, so existing callers/tests are unchanged; index.ts injects one explicitly.
     executor?: Executor,
@@ -237,15 +238,13 @@ export class SessionManager {
       chatNamePool: DEFAULT_CHAT_NAME_POOL,
       steerMessagesAtToolBoundary: true,
     },
-    private readonly browserBroker?: BrowserBroker,
-    questions?: QuestionService
+    private readonly browserBroker?: BrowserBroker
   ) {
-    this.questions = questions ?? new QuestionService(this.journal)
     this.executor =
       executor ??
       new InProcessExecutor({
         approvals: this.approvals,
-        questions: this.questions,
+        questions: this.questionService,
         usage: this.usage,
         danger: this.danger,
         memory: this.memory,

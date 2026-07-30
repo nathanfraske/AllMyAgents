@@ -14,6 +14,7 @@ import { SessionStore } from './store.js'
 import type { SessionRecord } from './types.js'
 import { UsageMonitor } from './usage.js'
 import { WorkspaceManager } from './workspace.js'
+import { QuestionService } from './questions.js'
 
 const SAFE = { busCanUseRiskyTools: false, autoApprovePractices: false }
 
@@ -56,6 +57,7 @@ describe('SessionManager browser turn provenance', () => {
       SAFE,
       false,
       tmp,
+      new QuestionService(journal),
     )
     manager.loadRecords()
     const provenance = manager as unknown as {
@@ -102,6 +104,7 @@ describe('SessionManager browser turn provenance', () => {
       SAFE,
       false,
       tmp,
+      new QuestionService(journal),
     )
     manager.loadRecords()
     const provenance = manager as unknown as { operatorTurnSessions: Set<string> }

@@ -11,6 +11,7 @@ export type PreflightFailureCode =
   | 'database-corrupt'
   | 'schema-too-new'
   | 'schema-version-unrecordable'
+  | 'question-owner-activation-failed'
 
 export type PreflightCheck = {
   name: 'data-dir-writable' | 'database-schema' | 'database-integrity'

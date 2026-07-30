@@ -1,6 +1,6 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import { WorkerExecutor, type WorkerExecutorHubCallbacks } from './workerExecutor.js'
-import { HubUnavailableError, stableQuestionId } from './workerProtocol.js'
+import { HubUnavailableError } from './workerProtocol.js'
 import type { WorkerClient } from './workerTransport.js'
 import type { WorkerSessionSpec, WorkerToHub } from './workerProtocol.js'
 import type { AttachmentMeta } from './attachments.js'
@@ -41,8 +41,6 @@ function recordingHub(): {
     requestRestart: () => {},
     runRelay: () => undefined,
     resolveApproval: async () => false,
-    resolveQuestion: async () => ({ kind: 'cancelled' }),
-    abortQuestion: () => false,
     attachWorker: async () => {},
   }
   return { hub, lifecycle }
@@ -55,101 +53,6 @@ const SPEC: WorkerSessionSpec = {
   profileDir: '/tmp/p',
   cwd: '/tmp',
 } as unknown as WorkerSessionSpec
-
-describe('WorkerExecutor question relay dispatch', () => {
-  it('recomputes ids, preserves valid outcomes, reports hub failure truthfully, and binds abort session', async () => {
-    let relay: ((message: WorkerToHub) => void) | undefined
-    const sent: unknown[] = []
-    const client = {
-      onEvent: () => {},
-      onTurnLifecycle: () => {},
-      onRestartRequest: () => {},
-      onRelay: (handler: (message: WorkerToHub) => void) => {
-        relay = handler
-      },
-      onWelcome: () => {},
-      on: () => {},
-      connect: () => {},
-      call: async () => {
-        throw new Error('unused')
-      },
-      send: (message: unknown) => sent.push(message),
-    } as unknown as WorkerClient
-    const resolveQuestion = vi.fn()
-    const abortQuestion = vi.fn(() => true)
-    const { hub } = recordingHub()
-    hub.resolveQuestion = resolveQuestion
-    hub.abortQuestion = abortQuestion
-    new WorkerExecutor(client, hub)
-
-    const validId = stableQuestionId('s1', 'tool1', 'request1')
-    relay?.({
-      t: 'questionRequest',
-      questionId: 'caller-chosen',
-      sessionId: 's1',
-      toolUseId: 'tool1',
-      requestId: 'request1',
-      input: {},
-    })
-    expect(resolveQuestion).not.toHaveBeenCalled()
-    expect(sent.at(-1)).toMatchObject({
-      t: 'questionResolved',
-      questionId: 'caller-chosen',
-      outcome: { kind: 'cancelled', reason: 'rejected' },
-    })
-
-    resolveQuestion.mockResolvedValueOnce({
-      kind: 'answered',
-      updatedInput: { questions: [], answers: {} },
-    })
-    relay?.({
-      t: 'questionRequest',
-      questionId: validId,
-      sessionId: 's1',
-      toolUseId: 'tool1',
-      requestId: 'request1',
-      input: {},
-    })
-    await Promise.resolve()
-    expect(resolveQuestion).toHaveBeenCalledWith({
-      questionId: validId,
-      sessionId: 's1',
-      toolUseId: 'tool1',
-      requestId: 'request1',
-      input: {},
-    })
-    expect(sent.at(-1)).toMatchObject({
-      t: 'questionResolved',
-      questionId: validId,
-      outcome: { kind: 'answered' },
-    })
-
-    resolveQuestion.mockRejectedValueOnce(new Error('question store unavailable'))
-    relay?.({
-      t: 'questionRequest',
-      questionId: validId,
-      sessionId: 's1',
-      toolUseId: 'tool1',
-      requestId: 'request1',
-      input: {},
-    })
-    await Promise.resolve()
-    await Promise.resolve()
-    expect(sent.at(-1)).toMatchObject({
-      t: 'questionResolved',
-      questionId: validId,
-      outcome: { kind: 'cancelled', reason: 'unavailable' },
-    })
-
-    relay?.({ t: 'questionAbort', questionId: validId, sessionId: 's1' })
-    expect(abortQuestion).toHaveBeenCalledWith(validId, 's1')
-    expect(sent.at(-1)).toEqual({
-      t: 'questionAbortAck',
-      questionId: validId,
-      aborted: true,
-    })
-  })
-})
 
 /**
  * REGRESSION (worker-unavailable send is silently lost).

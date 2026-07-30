@@ -5,7 +5,7 @@ import path from 'node:path'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
 import { ApprovalService } from './approvals.js'
-import { QuestionService, resolveWorkerQuestion } from './questions.js'
+import { QuestionService } from './questions.js'
 import {
   JOURNAL_CONDENSE_GRACE_MS,
   JOURNAL_CONDENSE_INTERVAL_MS,
@@ -285,14 +285,12 @@ const executor: Executor = workerSocket
       // the idempotent approvals.request(id) so a re-issue across a restart dedups (§7.2).
       runRelay: (method, args) => sessions.runRelay(method, args),
       resolveApproval: (approvalId, sessionId, kind, payload) => approvals.request(sessionId, kind, payload, approvalId),
-      resolveQuestion: (request) => resolveWorkerQuestion(questions, sessions.list(), request),
-      abortQuestion: (questionId, sessionId) => questions.abort(questionId, sessionId),
       // Step 5 (§6, §7.1): on every WorkerClient (re)connect, re-attach to the still-running worker and
       // replay the in-flight turn's event gap gap-free + exactly-once — so a mid-turn survives a hub restart.
       attachWorker: () => sessions.attachWorker(),
     })
   : new InProcessExecutor({ approvals, questions, usage, danger, memory, practices })
-sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, dataDir, executor, prefs, browserBroker, questions)
+sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, dataDir, questions, executor, prefs, browserBroker)
 browserBroker.onNavigation((event) =>
   sessions.noteBrowserNavigation(event.sessionId, event.url, event.title, event.actor, event.ok, event.errorCode)
 )
@@ -554,6 +552,24 @@ function registerMesh(): void {
 
 server.once('listening', () => {
   const actualPort = (server.address() as { port?: number } | null)?.port ?? bootPort
+  if (!isGreen) {
+    try {
+      // Claim only after this process has actually won the public bind. A contender that loses with
+      // EADDRINUSE never reaches this callback and therefore cannot terminalize the incumbent's questions.
+      // The callback runs synchronously before Node dispatches an HTTP request on the new listener.
+      questions.activatePublicOwner()
+    } catch (error) {
+      restartState.draining = true
+      const message = error instanceof Error ? error.message : String(error)
+      server.close()
+      void reportPreflightFailure({
+        code: 'question-owner-activation-failed',
+        message: `The hub bound its public listener but could not claim question ownership: ${message}`,
+        recovery: 'Check free disk space and journal write access, then restart AllMyAgents.',
+      })
+      return
+    }
+  }
   journal.append(null, 'hub/started', {
     port: actualPort,
     profiles: profiles.map((p) => ({ id: p.id, provider: p.provider })),
@@ -594,6 +610,7 @@ if (supervised && process.send) {
     server,
     sessions,
     journal,
+    questions,
     state: restartState,
     publicPort,
     send,
@@ -614,7 +631,11 @@ if (supervised && process.send) {
     if (!msg || typeof msg !== 'object') return
     switch (msg.type) {
       case 'drain':
-        void controller.drain()
+        void controller.drain().catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error)
+          console.error(`[hub] drain failed before releasing the public listener: ${message}`)
+          send({ type: 'drain-failed', error: message })
+        })
         break
       case 'promote':
         controller.promote(msg.port)

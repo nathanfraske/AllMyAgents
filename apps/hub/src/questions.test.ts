@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Journal } from './journal.js'
 import {
   MAX_PENDING_QUESTIONS_GLOBAL,
@@ -6,7 +6,6 @@ import {
   parseQuestionDecisionBody,
   QuestionInputError,
   QuestionService,
-  resolveWorkerQuestion,
   type AskUserQuestionInput,
 } from './questions.js'
 import type { HubEvent } from './types.js'
@@ -43,6 +42,7 @@ function fresh(journal = new Journal(':memory:')) {
   const events: HubEvent[] = []
   journal.on('event', (event) => events.push(event))
   const questions = new QuestionService(journal)
+  questions.activatePublicOwner()
   const request = () =>
     questions.request({
       id: 'q-stable',
@@ -60,6 +60,80 @@ afterEach(() => {
 })
 
 describe('QuestionService lifecycle', () => {
+  it('retains no local entry or durable lifecycle when the requested audit append fails', () => {
+    const { journal, questions, request, count } = fresh()
+    const append = vi.spyOn(journal, 'append').mockImplementationOnce(() => {
+      throw new Error('requested audit unavailable')
+    })
+
+    expect(() => request()).toThrow(/requested audit unavailable/)
+    expect(questions.pending()).toEqual([])
+    expect(count('question/requested')).toBe(0)
+
+    append.mockRestore()
+    const retry = request()
+    expect(questions.pending()).toHaveLength(1)
+    questions.cancel('q-stable')
+    return expect(retry).resolves.toEqual({ kind: 'cancelled' })
+  })
+
+  it('keeps the entry and abort listener intact until the resolved audit is durable', async () => {
+    const { journal, questions, count } = fresh()
+    const controller = new AbortController()
+    let settled = false
+    const pending = questions
+      .request({
+        id: 'q-stable',
+        sessionId: 's1',
+        toolUseId: 'toolu_1',
+        requestId: 'control_1',
+        input: QUESTIONS,
+        signal: controller.signal,
+      })
+      .finally(() => {
+        settled = true
+      })
+    const originalAppend = journal.append.bind(journal)
+    const append = vi.spyOn(journal, 'append').mockImplementation((sessionId, kind, payload) => {
+      if (kind === 'question/resolved') throw new Error('resolved audit unavailable')
+      return originalAppend(sessionId, kind, payload)
+    })
+
+    expect(() =>
+      questions.answer('q-stable', {
+        'Which format should I use?': 'Detailed',
+        'Which sections should I include?': 'Results',
+      })
+    ).toThrow(/resolved audit unavailable/)
+    expect(settled).toBe(false)
+    expect(questions.pending()).toMatchObject([{ id: 'q-stable', status: 'pending' }])
+    expect(count('question/resolved')).toBe(0)
+
+    append.mockRestore()
+    controller.abort()
+    await expect(pending).resolves.toEqual({ kind: 'cancelled', reason: 'aborted' })
+    expect(count('question/resolved')).toBe(1)
+  })
+
+  it('treats subscriber failure after an atomic commit as committed, never as a retryable rollback', async () => {
+    const { journal, questions, request, count } = fresh()
+    journal.on('event', () => {
+      throw new Error('websocket subscriber failed')
+    })
+
+    const pending = request()
+    expect(questions.pending()).toHaveLength(1)
+    expect(
+      questions.answer('q-stable', {
+        'Which format should I use?': 'Detailed',
+        'Which sections should I include?': 'Results',
+      })
+    ).toBe(true)
+    await expect(pending).resolves.toMatchObject({ kind: 'answered' })
+    expect(count('question/requested')).toBe(1)
+    expect(count('question/resolved')).toBe(1)
+  })
+
   it('keeps a valid question pending without creating a permission approval', async () => {
     const { questions, request, count } = fresh()
     let settled = false
@@ -72,8 +146,6 @@ describe('QuestionService lifecycle', () => {
     expect(questions.pending()[0]).toMatchObject({
       id: 'q-stable',
       sessionId: 's1',
-      toolUseId: 'toolu_1',
-      requestId: 'control_1',
       status: 'pending',
       questions: QUESTIONS.questions,
     })
@@ -175,6 +247,79 @@ describe('QuestionService lifecycle', () => {
     await expect(first).resolves.toEqual({ kind: 'cancelled' })
   })
 
+  it('keeps an inactive green unable to list, allocate, answer, or cancel blue questions', () => {
+    const { journal, questions: blue, request, count } = fresh()
+    void request()
+    const green = new QuestionService(journal)
+
+    expect(() => green.pending()).toThrow(/does not own/)
+    expect(() =>
+      green.request({
+        id: 'q-green',
+        sessionId: 's1',
+        toolUseId: 'tool-green',
+        requestId: 'request-green',
+        input: QUESTIONS,
+      })
+    ).toThrow(/does not own/)
+    expect(() => green.answer('q-stable', {})).toThrow(/does not own/)
+    expect(() => green.cancel('q-stable')).toThrow(/does not own/)
+    expect(blue.pending()).toHaveLength(1)
+    expect(count('question/requested')).toBe(1)
+  })
+
+  it('leaves live blue untouched during green construction and terminalizes it only at public activation', async () => {
+    const { journal, questions: blue, request, count } = fresh()
+    const bluePending = request()
+    const green = new QuestionService(journal)
+
+    expect(blue.pending()).toHaveLength(1)
+    expect(() => green.pending()).toThrow(/does not own/)
+    expect(count('question/resolved')).toBe(0)
+
+    expect(green.activatePublicOwner()).toBe(1)
+    expect(blue.pending()).toEqual([])
+    await expect(bluePending).resolves.toEqual({
+      kind: 'cancelled',
+      reason: 'hub-restarted',
+    })
+    expect(count('question/resolved')).toBe(1)
+    expect(green.activatePublicOwner()).toBe(0)
+  })
+
+  it('rolls back the whole foreign terminalization set when one audit append fails', async () => {
+    const { journal, questions: blue, request, count } = fresh()
+    const first = request()
+    const second = blue.request({
+      id: 'q-second',
+      sessionId: 's1',
+      toolUseId: 'toolu_2',
+      requestId: 'control_2',
+      input: QUESTIONS,
+    })
+    const green = new QuestionService(journal)
+    const originalAppend = journal.append.bind(journal)
+    let resolutions = 0
+    const append = vi.spyOn(journal, 'append').mockImplementation((sessionId, kind, payload) => {
+      if (kind === 'question/resolved' && ++resolutions === 2) {
+        throw new Error('SQLITE_FULL during second foreign terminal')
+      }
+      return originalAppend(sessionId, kind, payload)
+    })
+
+    expect(() => green.activatePublicOwner()).toThrow(/SQLITE_FULL/)
+    expect(green.isPublicOwner).toBe(false)
+    expect(blue.pending()).toHaveLength(2)
+    expect(count('question/resolved')).toBe(0)
+
+    append.mockRestore()
+    expect(green.activatePublicOwner()).toBe(2)
+    expect(blue.pending()).toEqual([])
+    await expect(first).resolves.toEqual({ kind: 'cancelled', reason: 'hub-restarted' })
+    await expect(second).resolves.toEqual({ kind: 'cancelled', reason: 'hub-restarted' })
+    expect(count('question/resolved')).toBe(2)
+  })
+
   it('never reconstructs a secret-like answer from the redacted journal after a lost reply', async () => {
     const { journal, questions, request, count } = fresh()
     const pending = request()
@@ -196,6 +341,7 @@ describe('QuestionService lifecycle', () => {
     expect(audit.payload).not.toContain('updatedInput')
 
     const successor = new QuestionService(journal)
+    successor.activatePublicOwner()
     await expect(
       successor.request({
         id: 'q-stable',
@@ -210,7 +356,11 @@ describe('QuestionService lifecycle', () => {
     expect(count('question/resolved')).toBe(1)
     expect(count('question/recovery-unknown')).toBe(1)
     await expect(
-      new QuestionService(journal).request({
+      (() => {
+        const recovered = new QuestionService(journal)
+        recovered.activatePublicOwner()
+        return recovered
+      })().request({
         id: 'q-stable',
         sessionId: 's1',
         toolUseId: 'toolu_1',
@@ -221,6 +371,101 @@ describe('QuestionService lifecycle', () => {
     expect(count('question/recovery-unknown')).toBe(1)
   })
 
+  it('keeps prompt, preview, and raw vendor correlation bytes out of SQLite and replay', async () => {
+    const { journal, questions } = fresh()
+    const privateQuestion = 'PRIVATE QUESTION BODY must stay in owner memory'
+    const privateDescription = 'PRIVATE DESCRIPTION must not reach a backup'
+    const privatePreview = 'PRIVATE PREVIEW must not reach WAL or replay'
+    const privateToolUseId = 'toolu_PRIVATE_CORRELATION'
+    const privateRequestId = 'request_PRIVATE_CORRELATION'
+    const pending = questions.request({
+      id: 'q-private-storage',
+      sessionId: 's-private',
+      toolUseId: privateToolUseId,
+      requestId: privateRequestId,
+      input: {
+        questions: [
+          {
+            question: privateQuestion,
+            header: 'Private',
+            options: [
+              {
+                label: 'One',
+                description: privateDescription,
+                preview: privatePreview,
+              },
+              { label: 'Two', description: 'Second.' },
+            ],
+            multiSelect: false,
+          },
+        ],
+      },
+    })
+
+    const durableRows = journal.db
+      .prepare(
+        `SELECT id, session, correlation_digest, tool_use_id_length, request_id_length,
+                question_digest, owner_epoch, status, terminal_reason, input_bytes, created_at
+         FROM question_lifecycles`
+      )
+      .all()
+    const replayPayloads = journal.db
+      .prepare("SELECT payload FROM events WHERE kind LIKE 'question/%'")
+      .all()
+    const persisted = JSON.stringify({ durableRows, replayPayloads })
+    for (const secret of [
+      privateQuestion,
+      privateDescription,
+      privatePreview,
+      privateToolUseId,
+      privateRequestId,
+    ]) {
+      expect(persisted).not.toContain(secret)
+    }
+    expect(questions.pending()[0]?.questions[0]?.question).toBe(privateQuestion)
+    questions.cancel('q-private-storage')
+    await pending
+  })
+
+  it('keeps replay bytes bounded across repeated maximum-shape question bodies', async () => {
+    const { journal, questions } = fresh()
+    const maxInput: AskUserQuestionInput = {
+      questions: Array.from({ length: 4 }, (_, questionIndex) => ({
+        question: `Q${questionIndex}-${'q'.repeat(1_990)}`,
+        header: `Header${questionIndex}`,
+        options: Array.from({ length: 4 }, (_, optionIndex) => ({
+          label: `Option ${optionIndex}`,
+          description: `D${questionIndex}${optionIndex}-${'d'.repeat(1_990)}`,
+          preview: `P${questionIndex}${optionIndex}-${'p'.repeat(19_990)}`,
+        })),
+        multiSelect: questionIndex % 2 === 0,
+      })),
+    }
+    for (let index = 0; index < 16; index += 1) {
+      const id = `q-max-${index}`
+      const pending = questions.request({
+        id,
+        sessionId: 's-max',
+        toolUseId: `tool-max-${index}`,
+        requestId: `request-max-${index}`,
+        input: maxInput,
+      })
+      questions.cancel(id)
+      await pending
+    }
+
+    const payloads = journal.db
+      .prepare("SELECT payload FROM events WHERE kind IN ('question/requested', 'question/resolved')")
+      .all() as Array<{ payload: string }>
+    expect(payloads).toHaveLength(32)
+    expect(payloads.reduce((bytes, row) => bytes + Buffer.byteLength(row.payload), 0)).toBeLessThan(
+      32_000
+    )
+    const replay = JSON.stringify(journal.since(0, 100))
+    expect(replay).not.toContain('pppppppppppppppp')
+    expect(replay).not.toContain('dddddddddddddddd')
+  })
+
   it('recovers cancellation after restart and re-offers an unresolved request', async () => {
     const { journal, questions, request, count } = fresh()
     const cancelled = request()
@@ -228,6 +473,7 @@ describe('QuestionService lifecycle', () => {
     await cancelled
 
     const successor = new QuestionService(journal)
+    successor.activatePublicOwner()
     await expect(
       successor.request({
         id: 'q-stable',
@@ -239,6 +485,7 @@ describe('QuestionService lifecycle', () => {
     ).resolves.toEqual({ kind: 'cancelled' })
 
     const unresolved = new QuestionService(journal)
+    unresolved.activatePublicOwner()
     const open = unresolved.request({
       id: 'q-open',
       sessionId: 's1',
@@ -472,16 +719,22 @@ describe('AskUserQuestion schema validation', () => {
   })
 })
 
-describe('hub worker question dispatch boundary', () => {
-  it('uses unambiguous correlation framing and rejects control-bearing service identifiers', () => {
-    const left = stableQuestionId('session', 'a\0b', 'c')
-    const right = stableQuestionId('session', 'a', 'b\0c')
-    expect(left).not.toBe(right)
+describe('question correlation codec', () => {
+  it('rejects ambiguous delimiter splits and oversized identifiers before hashing', () => {
+    expect(() => stableQuestionId('session', 'a\0b', 'c')).toThrow(
+      /without control characters/
+    )
+    expect(() => stableQuestionId('session', 'a', 'b\0c')).toThrow(
+      /without control characters/
+    )
+    expect(() => stableQuestionId('session', 'x'.repeat(513), 'c')).toThrow(
+      /bounded string/
+    )
 
     const { questions } = fresh()
     expect(() =>
       questions.request({
-        id: left,
+        id: 'q-control-rejected',
         sessionId: 'session',
         toolUseId: 'a\0b',
         requestId: 'c',
@@ -491,51 +744,4 @@ describe('hub worker question dispatch boundary', () => {
     expect(questions.pending()).toEqual([])
   })
 
-  it('rejects caller-chosen ids and missing/non-Claude sessions before QuestionService', async () => {
-    const { questions, count } = fresh()
-    const request = {
-      questionId: 'caller-chosen',
-      sessionId: 's1',
-      toolUseId: 'tool-worker',
-      requestId: 'request-worker',
-      input: QUESTIONS,
-    }
-    await expect(
-      resolveWorkerQuestion(questions, [{ id: 's1', provider: 'claude' }], request)
-    ).resolves.toMatchObject({ kind: 'cancelled', reason: 'rejected' })
-
-    const expectedId = stableQuestionId('s1', 'tool-worker', 'request-worker')
-    await expect(
-      resolveWorkerQuestion(questions, [], { ...request, questionId: expectedId })
-    ).resolves.toMatchObject({ kind: 'cancelled', reason: 'rejected' })
-    await expect(
-      resolveWorkerQuestion(
-        questions,
-        [{ id: 's1', provider: 'codex' }],
-        { ...request, questionId: expectedId }
-      )
-    ).resolves.toMatchObject({ kind: 'cancelled', reason: 'rejected' })
-    expect(questions.pending()).toEqual([])
-    expect(count('question/requested')).toBe(0)
-  })
-
-  it('admits the exact computed id for an existing Claude session', async () => {
-    const { questions, count } = fresh()
-    const questionId = stableQuestionId('s1', 'tool-worker', 'request-worker')
-    const pending = resolveWorkerQuestion(
-      questions,
-      [{ id: 's1', provider: 'claude' }],
-      {
-        questionId,
-        sessionId: 's1',
-        toolUseId: 'tool-worker',
-        requestId: 'request-worker',
-        input: QUESTIONS,
-      }
-    )
-    expect(questions.pending().map((record) => record.id)).toEqual([questionId])
-    expect(count('question/requested')).toBe(1)
-    questions.cancel(questionId)
-    await expect(pending).resolves.toEqual({ kind: 'cancelled' })
-  })
 })

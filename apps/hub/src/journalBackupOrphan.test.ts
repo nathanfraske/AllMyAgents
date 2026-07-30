@@ -118,6 +118,7 @@ function spawnOrphanFixture(
       onPromoted: () => {},
       stopJournalBackups: () => backups.stop(),
       journal: { append: () => {} },
+      questions: { deactivatePublicOwner: () => 0, activatePublicOwner: () => 0 },
       sessions: { reconcileStale: () => {}, shutdown: async () => {} },
       executor: {}
     })

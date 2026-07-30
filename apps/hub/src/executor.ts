@@ -13,13 +13,22 @@ import { buildAgentMcpServer, type AgentServices } from './agentTools.js'
 import type { ManagerSpawnResult } from './agentToolCore.js'
 import type { SessionIdentity } from './identity.js'
 import type { ApprovalService } from './approvals.js'
-import { QuestionInputError, type QuestionService } from './questions.js'
+import {
+  QuestionInputError,
+  QuestionOwnershipError,
+  type QuestionService,
+} from './questions.js'
 import type { UsageMonitor } from './usage.js'
 import type { MemoryStore } from './memory.js'
 import type { PracticeStore } from './practices.js'
 import type { BusAddress, BusMessage } from './bus.js'
 import type { ClaudeLimitInfo, DangerFlags, SessionStatus } from './types.js'
-import { stableQuestionId, type LiveSession, type WorkerSessionSpec } from './workerProtocol.js'
+import {
+  InvalidQuestionCorrelationError,
+  stableQuestionId,
+  type LiveSession,
+  type WorkerSessionSpec,
+} from './workerProtocol.js'
 import { checkWriteScope } from './writeScope.js'
 import type { AttachmentMeta } from './attachments.js'
 
@@ -386,15 +395,32 @@ export class InProcessExecutor implements Executor {
                 message:
                   outcome.reason === 'aborted'
                     ? 'The question was cancelled because the turn was interrupted.'
+                    : outcome.reason === 'hub-restarted'
+                      ? 'The question was cancelled because the hub restarted. Ask again if it is still needed.'
+                      : outcome.reason === 'worker-restarted'
+                        ? 'The question was cancelled because the agent worker restarted. Ask again if it is still needed.'
                     : outcome.reason === 'recovery-unknown'
                       ? 'The answer was submitted before a hub restart, but exact delivery could not be verified. Ask again if the answer is still needed.'
                       : 'The user cancelled the question.',
               }
             } catch (error) {
-              if (error instanceof QuestionInputError) {
+              if (error instanceof QuestionOwnershipError) {
+                return {
+                  behavior: 'deny',
+                  message:
+                    'AskUserQuestion is temporarily unavailable because this hub does not own the public question lifecycle.',
+                }
+              }
+              if (
+                error instanceof QuestionInputError ||
+                error instanceof InvalidQuestionCorrelationError
+              ) {
                 this.h.journal(spec.sessionId, 'question/rejected', {
-                  toolUseId: context.toolUseID,
-                  requestId: context.requestId,
+                  code: 'invalid-question-input',
+                  toolUseIdLength:
+                    typeof context.toolUseID === 'string' ? context.toolUseID.length : null,
+                  requestIdLength:
+                    typeof context.requestId === 'string' ? context.requestId.length : null,
                   message: error.message,
                 })
                 return {
