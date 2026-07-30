@@ -31,6 +31,7 @@ const MAX_TABS_PER_SESSION: usize = 8;
 // independently enforced 12.5 MB browser-response frame limit.
 const MAX_DOWNLOAD_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SESSION_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
+const BROWSER_ARGS: &str = "--disable-features=AutofillServerCommunication";
 const _: () = assert!(MAX_DOWNLOAD_BYTES < 12_500_000);
 const _: () = assert!(MAX_SESSION_DOWNLOAD_BYTES >= MAX_DOWNLOAD_BYTES);
 static NAVIGATION_POLICIES: OnceLock<Mutex<HashMap<String, Arc<Mutex<NavigationPolicy>>>>> =
@@ -54,6 +55,7 @@ struct NavigationPolicy {
     semantic_elements: HashMap<String, SemanticElement>,
     prepared: HashMap<String, PreparedAction>,
     pending_download: Option<PendingDownload>,
+    native_security_ready: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -207,6 +209,42 @@ impl Drop for PendingDownloadCleanup {
 
 fn download_exceeds_bound(received: i64, max_bytes: u64) -> bool {
     received >= 0 && received as u64 > max_bytes
+}
+
+fn download_interrupt_reason_label(reason: i32) -> &'static str {
+    match reason {
+        0 => "none",
+        1 => "file_failed",
+        2 => "file_access_denied",
+        3 => "file_no_space",
+        4 => "file_name_too_long",
+        5 => "file_too_large",
+        6 => "file_malicious",
+        7 => "file_transient_error",
+        8 => "file_blocked_by_policy",
+        9 => "file_security_check_failed",
+        10 => "file_too_short",
+        11 => "file_hash_mismatch",
+        12 => "network_failed",
+        13 => "network_timeout",
+        14 => "network_disconnected",
+        15 => "network_server_down",
+        16 => "network_invalid_request",
+        17 => "server_failed",
+        18 => "server_no_range",
+        19 => "server_bad_content",
+        20 => "server_unauthorized",
+        21 => "server_certificate_problem",
+        22 => "server_forbidden",
+        23 => "server_unexpected_response",
+        24 => "server_content_length_mismatch",
+        25 => "server_cross_origin_redirect",
+        26 => "user_canceled",
+        27 => "user_shutdown",
+        28 => "user_paused",
+        29 => "download_process_crashed",
+        _ => "unknown",
+    }
 }
 
 fn remove_partial_download(path: &Path) {
@@ -892,7 +930,18 @@ fn ensure_window(
         guard.local_network = local_network;
     }
     if let Some(window) = app.get_webview_window(&label) {
-        return Ok((window, policy));
+        let ready = policy
+            .lock()
+            .map_err(|_| "browser navigation policy lock was poisoned".to_string())?
+            .native_security_ready;
+        return if ready {
+            Ok((window, policy))
+        } else {
+            Err(
+                "isolated browser window is not available until native security setup completes."
+                    .to_string(),
+            )
+        };
     }
     let profile = profile_path(root, session_id);
     fs::create_dir_all(&profile)
@@ -937,16 +986,15 @@ fn build_browser_window(
     )
     .title("AllMyAgents — isolated agent browser")
     .inner_size(1100.0, 760.0)
+    .visible(false)
     .data_directory(profile)
     .general_autofill_enabled(false)
-    .additional_browser_args(
-        "--deny-permission-prompts --disable-features=AutofillServerCommunication",
-    );
+    .additional_browser_args(BROWSER_ARGS);
     #[cfg(windows)]
     if let Some(environment) = shared_environment {
         builder = builder.with_environment(environment);
     }
-    builder
+    let window = builder
         .on_download(move |_, event| handle_download_event(event, &download_policy))
         .on_new_window(|_, _| NewWindowResponse::Deny)
         .on_navigation(move |url| {
@@ -999,11 +1047,30 @@ fn build_browser_window(
             });
         })
         .build()
-        .map(|window| {
-            harden_windows_profile(&window, &policy);
-            (window, policy)
-        })
-        .map_err(|e| format!("could not create isolated browser window: {e}"))
+        .map_err(|e| format!("could not create isolated browser window: {e}"))?;
+    if let Err(error) = harden_windows_profile(&window, &policy) {
+        let _ = window.close();
+        return Err(format!(
+            "isolated browser stayed hidden because native security handlers could not be installed: {error}"
+        ));
+    }
+    if let Err(error) = window.show() {
+        let _ = window.close();
+        return Err(format!(
+            "could not expose the secured isolated browser window: {error}"
+        ));
+    }
+    match policy.lock() {
+        Ok(mut policy) => policy.native_security_ready = true,
+        Err(_) => {
+            let _ = window.close();
+            return Err(
+                "secured isolated browser closed because its readiness state could not be recorded."
+                    .to_string(),
+            );
+        }
+    }
+    Ok((window, policy))
 }
 
 fn complete_download(pending: &PendingDownload, result: Result<CompletedDownload, String>) {
@@ -1077,12 +1144,16 @@ fn handle_download_event(
             let Some(pending) = pending else {
                 return false;
             };
+            if !success {
+                remove_partial_download(&pending.destination);
+                #[cfg(not(windows))]
+                complete_download(
+                    &pending,
+                    Err("Download was cancelled or failed in the native browser.".to_string()),
+                );
+                return true;
+            }
             let result = (|| -> Result<CompletedDownload, String> {
-                if !success {
-                    return Err(
-                        "Download was cancelled or failed in the native browser.".to_string()
-                    );
-                }
                 if !download_uri_matches_approved_origin(&pending.origin, url.as_str()) {
                     return Err(
                         "Download final origin did not match its one-use approval.".to_string()
@@ -1136,21 +1207,24 @@ fn download_uri_matches_approved_origin(approved_origin: &str, actual_uri: &str)
 fn harden_windows_profile(
     window: &WebviewWindow,
     navigation_policy: &Arc<Mutex<NavigationPolicy>>,
-) {
+) -> Result<(), String> {
     use webview2_com::Microsoft::Web::WebView2::Win32::{
         ICoreWebView2, ICoreWebView2PermissionRequestedEventArgs3, ICoreWebView2Profile6,
-        ICoreWebView2_13, ICoreWebView2_4, COREWEBVIEW2_PERMISSION_KIND,
-        COREWEBVIEW2_PERMISSION_KIND_MULTIPLE_AUTOMATIC_DOWNLOADS,
+        ICoreWebView2_13, ICoreWebView2_4, COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON,
+        COREWEBVIEW2_DOWNLOAD_STATE, COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED,
+        COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_MULTIPLE_AUTOMATIC_DOWNLOADS,
         COREWEBVIEW2_PERMISSION_STATE_ALLOW, COREWEBVIEW2_PERMISSION_STATE_DENY,
     };
     use webview2_com::{
         BytesReceivedChangedEventHandler, DownloadStartingEventHandler,
-        PermissionRequestedEventHandler,
+        PermissionRequestedEventHandler, StateChangedEventHandler,
     };
     use windows::core::Interface;
 
     let navigation_policy = navigation_policy.clone();
-    let _ = window.with_webview(move |platform| {
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    window
+        .with_webview(move |platform| {
         let outcome = (|| -> windows::core::Result<()> {
             let controller = platform.controller();
             let webview: ICoreWebView2 = unsafe { controller.CoreWebView2()? };
@@ -1227,22 +1301,56 @@ fn harden_windows_profile(
                             return Ok(());
                         };
                         let operation = args.DownloadOperation()?;
-                        let max_bytes = navigation_policy
+                        let pending = navigation_policy
                             .lock()
                             .ok()
-                            .and_then(|policy| {
-                                policy
-                                    .pending_download
-                                    .as_ref()
-                                    .map(|pending| pending.max_bytes)
-                            })
-                            .unwrap_or(0);
+                            .and_then(|policy| policy.pending_download.clone());
+                        let Some(pending) = pending else {
+                            operation.Cancel()?;
+                            return Ok(());
+                        };
+                        let max_bytes = pending.max_bytes;
+                        let state_pending = pending.clone();
+                        let mut state_token = 0_i64;
+                        operation.add_StateChanged(
+                            &StateChangedEventHandler::create(Box::new(
+                                move |operation, _| {
+                                    let Some(operation) = operation else {
+                                        return Ok(());
+                                    };
+                                    let mut state = COREWEBVIEW2_DOWNLOAD_STATE::default();
+                                    operation.State(&mut state)?;
+                                    if state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED {
+                                        let mut reason =
+                                            COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON::default();
+                                        operation.InterruptReason(&mut reason)?;
+                                        complete_download(
+                                            &state_pending,
+                                            Err(format!(
+                                                "Native download was interrupted by WebView2: {} (code {}).",
+                                                download_interrupt_reason_label(reason.0),
+                                                reason.0,
+                                            )),
+                                        );
+                                    }
+                                    Ok(())
+                                },
+                            )),
+                            &mut state_token,
+                        )?;
                         let mut total = -1_i64;
                         operation.TotalBytesToReceive(&mut total)?;
                         if max_bytes == 0 || download_exceeds_bound(total, max_bytes) {
+                            complete_download(
+                                &pending,
+                                Err(format!(
+                                    "Native download was cancelled before transfer because its declared size {total} exceeded the {max_bytes}-byte remaining limit."
+                                )),
+                            );
                             operation.Cancel()?;
                             return Ok(());
                         }
+                        let bytes_pending = pending.clone();
                         let mut bytes_token = 0_i64;
                         operation.add_BytesReceivedChanged(
                             &BytesReceivedChangedEventHandler::create(Box::new(
@@ -1253,6 +1361,12 @@ fn harden_windows_profile(
                                     let mut received = 0_i64;
                                     operation.BytesReceived(&mut received)?;
                                     if download_exceeds_bound(received, max_bytes) {
+                                        complete_download(
+                                            &bytes_pending,
+                                            Err(format!(
+                                                "Native download was cancelled after receiving {received} bytes because it exceeded the {max_bytes}-byte remaining limit."
+                                            )),
+                                        );
                                         operation.Cancel()?;
                                     }
                                     Ok(())
@@ -1267,19 +1381,20 @@ fn harden_windows_profile(
             }
             Ok(())
         })();
-        if let Err(error) = outcome {
-            super::logln(&format!(
-                "[browser] could not apply all WebView2 profile hardening: {error}"
-            ));
-        }
-    });
+            let _ = result_tx.send(outcome.map_err(|error| error.to_string()));
+        })
+        .map_err(|error| format!("could not schedule native WebView2 hardening: {error}"))?;
+    result_rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|error| format!("native WebView2 hardening did not acknowledge: {error}"))?
 }
 
 #[cfg(not(windows))]
 fn harden_windows_profile(
     _window: &WebviewWindow,
     _navigation_policy: &Arc<Mutex<NavigationPolicy>>,
-) {
+) -> Result<(), String> {
+    Ok(())
 }
 
 fn wait_for_page(window: &WebviewWindow, requested: &str) -> String {
@@ -2784,6 +2899,27 @@ mod tests {
         assert!(constant_time_equal(b"correct-secret", b"correct-secret"));
         assert!(!constant_time_equal(b"wrong-secret", b"correct-secret"));
         assert!(!constant_time_equal(b"correct", b"correct-secret"));
+    }
+
+    #[test]
+    fn browser_arguments_do_not_bypass_the_native_permission_handler() {
+        assert!(!BROWSER_ARGS.contains("deny-permission-prompts"));
+        assert!(BROWSER_ARGS.contains("disable-features=AutofillServerCommunication"));
+    }
+
+    #[test]
+    fn webview2_interruption_codes_are_reported_truthfully() {
+        assert_eq!(download_interrupt_reason_label(13), "network_timeout");
+        assert_eq!(
+            download_interrupt_reason_label(25),
+            "server_cross_origin_redirect"
+        );
+        assert_eq!(download_interrupt_reason_label(26), "user_canceled");
+        assert_eq!(
+            download_interrupt_reason_label(29),
+            "download_process_crashed"
+        );
+        assert_eq!(download_interrupt_reason_label(1000), "unknown");
     }
 
     #[test]
