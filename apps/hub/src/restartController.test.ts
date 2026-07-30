@@ -169,11 +169,14 @@ describe('RestartController journal backup ownership', () => {
         return append(...args)
       }
 
-      await expect(new RestartController(deps).drain()).rejects.toThrow(
-        new RegExp(`${phase} failed`)
-      )
+      const controller = new RestartController(deps)
+      const draining = controller.drain()
+      const orphanOwnership = controller.resolveOrphanedListenerOwnership()
+
+      await expect(draining).rejects.toThrow(new RegExp(`${phase} failed`))
 
       expect(server.listening).toBe(true)
+      expect(await orphanOwnership).toBe(true)
       expect(deps.state.draining).toBe(false)
       expect(activatePublicOwner).toHaveBeenCalledOnce()
       expect(freeze.mock.calls).toEqual([[true], [false]])
@@ -181,6 +184,45 @@ describe('RestartController journal backup ownership', () => {
       expect(sent).toEqual([])
     }
   )
+
+  it('returns false when a rejected pre-close drain cannot reclaim ownership and closes blue', async () => {
+    const server = http.createServer()
+    const publicPort = await listenEphemeral(server)
+    const deps = controllerDeps(server, publicPort)
+    deps.questions = {
+      ...deps.questions,
+      deactivatePublicOwnerForRestart: () => [
+        {
+          restartGeneration: 'failed-reclaim',
+          sessionId: 's1',
+          questionCount: 1,
+          questionIds: ['q1'],
+        },
+      ],
+      activatePublicOwner: () => {
+        throw new Error('SQLITE_IOERR while reclaiming question owner')
+      },
+    } as never
+    deps.executor = {
+      signalDraining: () => {},
+      settleQuestionTurnsForRestart: async () => {
+        throw new Error('provider settlement failed')
+      },
+    } as never
+    const controller = new RestartController(deps)
+
+    const draining = controller.drain()
+    const orphanOwnership = controller.resolveOrphanedListenerOwnership()
+
+    await expect(draining).rejects.toThrow(/could not reclaim ownership/)
+    await expect(orphanOwnership).resolves.toBe(false)
+    expect(server.listening).toBe(false)
+    expect(deps.state.draining).toBe(true)
+    expect(deps.state.journalBackup).toMatchObject({
+      status: 'degraded',
+      error: expect.stringContaining('could not reclaim ownership'),
+    })
+  })
 
   it('settles and permanently stops backup work before a planned blue retire exits', async () => {
     const order: string[] = []
@@ -225,6 +267,42 @@ describe('RestartController journal backup ownership', () => {
       controllerDeps(ephemeralServer, nonPublicPort)
     )
     expect(await ephemeralController.resolveOrphanedListenerOwnership()).toBe(false)
+  })
+
+  it('observes a genuinely new successor listener transition after the first settles', async () => {
+    const server = http.createServer()
+    const publicPort = await listenEphemeral(server)
+    const controller = new RestartController(
+      controllerDeps(server, publicPort)
+    )
+    const slot = controller as unknown as {
+      listenerTransition: Promise<void> | undefined
+    }
+    let settleFirst!: () => void
+    let settleSecond!: () => void
+    const first = new Promise<void>((resolve) => {
+      settleFirst = resolve
+    })
+    const second = new Promise<void>((resolve) => {
+      settleSecond = resolve
+    })
+    slot.listenerTransition = first
+    void first.then(() => {
+      slot.listenerTransition = second
+    })
+
+    const ownership = controller.resolveOrphanedListenerOwnership()
+    settleFirst()
+    await Promise.resolve()
+    let observed = false
+    void ownership.then(() => {
+      observed = true
+    })
+    await Promise.resolve()
+    expect(observed).toBe(false)
+
+    settleSecond()
+    await expect(ownership).resolves.toBe(true)
   })
 
   it('waits through disconnect-vs-drain and leaves a released blue inactive', async () => {
@@ -377,6 +455,34 @@ describe('RestartController journal backup ownership', () => {
     expect(activatePublicOwner).toHaveBeenCalledOnce()
     expect(signalDraining).toHaveBeenCalledOnce()
     expect(signalDraining).toHaveBeenCalledWith(false)
+    expect(sent).toEqual([{ type: 'rollback-rebound' }])
+    expect(server.listening).toBe(true)
+  })
+
+  it('coalesces concurrent duplicate abort delivery into one activation and rebound acknowledgement', async () => {
+    const server = http.createServer()
+    const publicPort = await listenEphemeral(server)
+    const sent: unknown[] = []
+    const deps = controllerDeps(server, publicPort, sent)
+    const append = vi.fn()
+    deps.journal = { append } as never
+    const activatePublicOwner = vi.fn(() => 0)
+    deps.questions = {
+      ...deps.questions,
+      activatePublicOwner,
+    } as never
+    const signalDraining = vi.fn()
+    deps.executor = { signalDraining } as never
+    const controller = new RestartController(deps)
+
+    await Promise.all([
+      controller.abort('same rollback'),
+      controller.abort('same rollback'),
+    ])
+
+    expect(append).toHaveBeenCalledOnce()
+    expect(activatePublicOwner).toHaveBeenCalledOnce()
+    expect(signalDraining).toHaveBeenCalledOnce()
     expect(sent).toEqual([{ type: 'rollback-rebound' }])
     expect(server.listening).toBe(true)
   })

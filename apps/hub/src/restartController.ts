@@ -58,6 +58,7 @@ interface DrainOperation {
 export class RestartController {
   private listenerTransition: Promise<void> | undefined
   private drainOperation: DrainOperation | undefined
+  private abortOperation: Promise<void> | undefined
   private supervisorDisconnected = false
 
   constructor(private readonly deps: RestartControllerDeps) {}
@@ -86,7 +87,16 @@ export class RestartController {
     for (;;) {
       const transition = this.listenerTransition
       if (!transition) break
-      await transition
+      try {
+        await transition
+      } catch {
+        // A rejected drain can still have successfully reclaimed every public boundary while keeping the
+        // fixed listener bound. Transition outcome is not listener ownership; observe the final socket
+        // state after this exact transition settles, then loop in case it started a successor transition.
+      }
+      // Do not re-await the same already-settled (especially rejected) promise. Clear only by identity:
+      // a genuinely new close/rebind transition installed while we awaited remains visible to the loop.
+      if (this.listenerTransition === transition) this.listenerTransition = undefined
     }
     if (!this.deps.server.listening) return false
     const address = this.deps.server.address()
@@ -333,6 +343,17 @@ export class RestartController {
    * drain, state.draining is false and the existing listener is acknowledged without another listen().
    */
   async abort(error: string): Promise<void> {
+    if (this.abortOperation) return this.abortOperation
+    const operation = this.runAbort(error)
+    this.abortOperation = operation
+    try {
+      await operation
+    } finally {
+      if (this.abortOperation === operation) this.abortOperation = undefined
+    }
+  }
+
+  private async runAbort(error: string): Promise<void> {
     const { server, journal, state, publicPort, executor, questions } = this.deps
     const drain = this.drainOperation
     if (drain) {
