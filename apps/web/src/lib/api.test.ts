@@ -172,6 +172,98 @@ describe('transport (res.ok respected; errors are not data)', () => {
   })
 })
 
+describe('bounded profile-login transport', () => {
+  it('posts the stable idempotency key and accepts a capturing response without a URL', async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init: RequestInit) => {
+        calls.push({ url, init })
+        return {
+          ok: true,
+          status: 202,
+          text: async () =>
+            JSON.stringify({
+              ok: true,
+              loginId: 'public-1',
+              profileId: 'claude-a',
+              provider: 'claude',
+              status: 'capturing',
+            }),
+        }
+      }),
+    )
+    const { api } = await loadApi()
+
+    await expect(
+      api.login('claude', 'claude-a', true, 'request-1'),
+    ).resolves.toMatchObject({
+      ok: true,
+      loginId: 'public-1',
+      status: 'capturing',
+    })
+    expect(JSON.parse(String(calls[0]?.init.body))).toEqual({
+      provider: 'claude',
+      name: 'claude-a',
+      reauth: true,
+      idempotencyKey: 'request-1',
+    })
+    expect(calls[0]?.init.signal).toBeInstanceOf(AbortSignal)
+  })
+
+  it('aborts a login request that never receives an HTTP response', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        (_url: string, init: RequestInit) =>
+          new Promise((_resolve, reject) => {
+            init.signal?.addEventListener('abort', () =>
+              reject(new DOMException('aborted', 'AbortError')),
+            )
+          }),
+      ),
+    )
+    const { api, LOGIN_HTTP_TIMEOUT_MS } = await loadApi()
+
+    const pending = api.login('claude', 'claude-a', true, 'request-timeout')
+    await vi.advanceTimersByTimeAsync(LOGIN_HTTP_TIMEOUT_MS)
+    await expect(pending).resolves.toMatchObject({ error: expect.any(String) })
+    vi.useRealTimers()
+  })
+
+  it('recovers only the same profile and idempotency key', async () => {
+    let requested = ''
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        requested = url
+        return {
+          ok: true,
+          status: 200,
+          text: async () =>
+            JSON.stringify({
+              ok: true,
+              loginId: 'public-recovered',
+              status: 'settling',
+            }),
+        }
+      }),
+    )
+    const { api } = await loadApi()
+
+    await expect(
+      api.loginForProfile('claude-a', 'request:recover'),
+    ).resolves.toMatchObject({
+      loginId: 'public-recovered',
+      status: 'settling',
+    })
+    expect(requested).toContain(
+      '/api/accounts/login/profile/claude-a?key=request%3Arecover',
+    )
+  })
+})
+
 // The attachment upload contract (raw bytes, not JSON). A failed upload must SURFACE as { error } at the
 // composer — a file that silently fails to attach is the same class of bug as one that silently fails to
 // reach the vendor — never throw, never be mistaken for a stored ref.

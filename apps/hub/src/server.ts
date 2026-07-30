@@ -29,10 +29,11 @@ import { tokenMatches } from './deviceToken.js'
 import { pickFolder } from './native.js'
 import { computeStats } from './stats.js'
 import { buildFleet, probeHubHealth } from './fleet.js'
-import { archiveCredentialForReauth, cancelLogin, credentialsExist, getLogin, startLogin } from './loginLauncher.js'
+import { credentialsExist } from './loginLauncher.js'
+import type { ProfileLoginCoordinator } from './profileLoginCoordinator.js'
 import { readProjectConfig } from './importScan.js'
 import { pickableProfiles, setClaudeConnectorPolicy } from './profiles.js'
-import { ProfileOwnership } from './profileOwnership.js'
+import type { ProfileOwnership } from './profileOwnership.js'
 import { asFileWriteDiffDensity } from './types.js'
 import type { DangerFlags, HubPrefs, ManagerAgentType, Profile, Provider } from './types.js'
 import type { Executor } from './executor.js'
@@ -389,6 +390,10 @@ export interface ServerOptions {
    *  profile dir. Threaded from index.ts so it stays in lockstep with where the hub SCANS profiles. */
   profilesDir: string
   profileOwnership?: ProfileOwnership
+  profileLoginCoordinator?: Pick<
+    ProfileLoginCoordinator,
+    'start' | 'get' | 'getForProfile' | 'cancel'
+  >
   journal: Journal
   sessions: SessionManager
   profiles: Profile[]
@@ -496,11 +501,6 @@ export function startServer(opts: ServerOptions): http.Server {
   const { port, defaultCwd, profilesDir, journal, sessions, profiles, approvals, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity } = opts
   const replayPrincipalBudget = new ReplayPrincipalBudget()
   const questions = opts.questions
-  const profileOwnership = opts.profileOwnership ?? new ProfileOwnership({
-    ownerId: `server-${process.pid}`,
-    pid: process.pid,
-    port,
-  })
   // Runtime repositories live beside the journal/config under HUB_DATA_DIR, never in the shipped hub
   // payload or profiles tree. GitHubImportService keeps auth entirely inside an existing `gh` session.
   const github = new GitHubImportService(
@@ -508,7 +508,7 @@ export function startServer(opts: ServerOptions): http.Server {
     (name, projectPath, location) => projects.create(name, projectPath, location)
   )
   const wsl = new WslService()
-  const loginNames = new Map<string, string>()
+  const profileLoginCoordinator = opts.profileLoginCoordinator
 
   async function resolveProjectPath(rawPath: string, distro?: string): Promise<WorkspacePath> {
     const syntax = classifyWorkspacePath(rawPath, { distro })
@@ -686,9 +686,14 @@ export function startServer(opts: ServerOptions): http.Server {
       // The hub owns a headless vendor auth process and captures the OAuth URL. The desktop opens the
       // URL through its native shell; a headless/remote caller gets the same URL to open manually.
       if (method === 'POST' && url.pathname === '/api/accounts/login') {
+        if (!profileLoginCoordinator) {
+          json(res, { ok: false, error: 'profile sign-in coordinator is unavailable' }, 503)
+          return
+        }
         const body = await readBody(req)
         const provider = body.provider
         const name = String(body.name ?? '')
+        const idempotencyKey = String(body.idempotencyKey ?? '')
         if (provider !== 'claude' && provider !== 'codex') {
           json(res, { ok: false, error: 'provider must be claude|codex' }, 400)
           return
@@ -697,77 +702,95 @@ export function startServer(opts: ServerOptions): http.Server {
           json(res, { ok: false, error: 'name must match ^[a-zA-Z0-9_-]+$' }, 400)
           return
         }
+        if (!/^[a-zA-Z0-9._:-]{1,128}$/.test(idempotencyKey)) {
+          json(res, { ok: false, error: 'idempotencyKey is required' }, 400)
+          return
+        }
         const profileDir = path.join(profilesDir, name)
         const reauth = body.reauth === true
-        try {
-          profileOwnership.assertOwned(name, profileDir, reauth ? 'replace credentials' : 'create credentials')
-        } catch (error) {
-          json(res, { ok: false, error: error instanceof Error ? error.message : String(error) }, 409)
+        const existing = profileLoginCoordinator.getForProfile(
+          name,
+          idempotencyKey,
+        )
+        if (existing) {
+          if (existing.provider !== provider) {
+            json(
+              res,
+              {
+                ok: false,
+                error:
+                  'The idempotency key belongs to a different sign-in request.',
+              },
+              409,
+            )
+            return
+          }
+          json(
+            res,
+            {
+              ...existing,
+              manual: `pnpm login:${provider} profiles/${name}`,
+            },
+            existing.ok ? (existing.status === 'complete' ? 200 : 202) : 409,
+          )
           return
         }
         if (credentialsExist(provider as Provider, profileDir) && !reauth) {
           json(res, { ok: false, error: `profiles/${name} already has ${provider} credentials` }, 409)
           return
         }
-        if (reauth) {
-          archiveCredentialForReauth(provider as Provider, profileDir)
-        }
-        const login = await startLogin(provider as Provider, profileDir)
-        const ok = login.status === 'waiting' || login.status === 'complete'
-        if (ok) loginNames.set(login.id, name)
+        const login = await profileLoginCoordinator.start({
+          provider: provider as Provider,
+          profileId: name,
+          reauth,
+          idempotencyKey,
+        })
         json(
           res,
           {
-            ok,
-            loginId: login.id,
-            provider,
-            status: login.status,
-            url: login.url,
-            code: login.code,
-            error: login.error,
+            ...login,
             manual: `pnpm login:${provider} profiles/${name}`,
           },
-          ok ? 200 : 502
+          login.ok ? (login.status === 'complete' ? 200 : 202) : 409
         )
+        return
+      }
+      const accountLoginProfileMatch =
+        /^\/api\/accounts\/login\/profile\/([^/]+)$/.exec(url.pathname)
+      if (accountLoginProfileMatch && method === 'GET') {
+        if (!profileLoginCoordinator) {
+          json(res, { ok: false, error: 'profile sign-in coordinator is unavailable' }, 503)
+          return
+        }
+        const profileId = decodeURIComponent(accountLoginProfileMatch[1] as string)
+        const idempotencyKey = url.searchParams.get('key') ?? ''
+        const login = profileLoginCoordinator.getForProfile(
+          profileId,
+          idempotencyKey,
+        )
+        if (!login) {
+          json(res, { ok: false, error: 'unknown profile sign-in attempt' }, 404)
+          return
+        }
+        json(res, login)
         return
       }
       const accountLoginMatch = /^\/api\/accounts\/login\/([^/]+)$/.exec(url.pathname)
       if (accountLoginMatch && (method === 'GET' || method === 'DELETE')) {
+        if (!profileLoginCoordinator) {
+          json(res, { ok: false, error: 'profile sign-in coordinator is unavailable' }, 503)
+          return
+        }
         const loginId = decodeURIComponent(accountLoginMatch[1] as string)
-        const login = method === 'DELETE' ? cancelLogin(loginId) : getLogin(loginId)
+        const login =
+          method === 'DELETE'
+            ? profileLoginCoordinator.cancel(loginId)
+            : profileLoginCoordinator.get(loginId)
         if (!login) {
           json(res, { ok: false, error: 'unknown or expired login attempt' }, 404)
           return
         }
-        const name = loginNames.get(loginId)
-        if (login.status === 'complete') {
-          const list = rescanProfiles()
-          const profile = list.find((p) => p.id === name)
-          if (profile) {
-            profile.authStatus = 'signed_in'
-            profile.authError = undefined
-          }
-          loginNames.delete(loginId)
-          json(res, {
-            ok: true,
-            loginId,
-            status: login.status,
-            provider: login.provider,
-            added: profile?.id ?? name,
-          })
-          return
-        }
-        const ok = method === 'DELETE' || login.status === 'capturing' || login.status === 'waiting'
-        if (!ok) loginNames.delete(loginId)
-        json(res, {
-          ok,
-          loginId,
-          provider: login.provider,
-          status: login.status,
-          url: login.url,
-          code: login.code,
-          error: login.error,
-        })
+        json(res, login)
         return
       }
       if (method === 'POST' && url.pathname === '/api/pick-folder') {

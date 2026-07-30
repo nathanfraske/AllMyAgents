@@ -20,6 +20,10 @@ import { ProjectStore } from './projects.js'
 import { profileAuthEvidence, scanProfiles, setClaudeConnectorPolicy } from './profiles.js'
 import { ProfileOwnership } from './profileOwnership.js'
 import { ProfileRuntime } from './profileRuntime.js'
+import {
+  ProfileLoginCoordinator,
+  ProfileLoginRegistry,
+} from './profileLoginCoordinator.js'
 import { createJournalBackupSupervisor } from './journalBackup.js'
 import { SessionManager } from './sessions.js'
 import { SessionStore } from './store.js'
@@ -430,6 +434,20 @@ const executor: Executor = workerSocket
     })
   : new InProcessExecutor({ approvals, questions, usage, danger, memory, practices })
 sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, dataDir, questions, executor, prefs, browserBroker)
+const profileLoginCoordinator = new ProfileLoginCoordinator({
+  profilesDir,
+  registry: new ProfileLoginRegistry(path.join(dataDir, 'profile-logins.json')),
+  profileRuntime,
+  profileOwnership,
+  sessions,
+})
+// Active ProfileRuntime bootstrap above already reconciled any crash-left credential saga. Publish the
+// same durable public attempt as terminal/unknown now; a successor never recreates the predecessor's
+// process-local turn freeze.
+if (profileRuntime.currentGeneration().active) {
+  profileLoginCoordinator.recoverAfterProfileBootstrap()
+}
+process.once('exit', () => profileLoginCoordinator.dispose())
 browserBroker.onNavigation((event) =>
   sessions.noteBrowserNavigation(event.sessionId, event.url, event.title, event.actor, event.ok, event.errorCode)
 )
@@ -728,7 +746,7 @@ const meshPeerPorts: number[] = Array.isArray(config.mesh?.peerPorts)
   : []
 
 // Listen on the BOOT port (0 → ephemeral for a green); the server reports its actual port back.
-const server = startServer({ port: bootPort, defaultCwd: dataDir, profilesDir, profileOwnership, journal, sessions, profiles, approvals, questions, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity: (projectId) => worktreeCollisions.projectActivity(projectId) })
+const server = startServer({ port: bootPort, defaultCwd: dataDir, profilesDir, profileOwnership, profileLoginCoordinator, journal, sessions, profiles, approvals, questions, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity: (projectId) => worktreeCollisions.projectActivity(projectId) })
 
 // Register the mesh advert — factored so a promoted green can (re)register once it owns the port.
 function registerMesh(): void {

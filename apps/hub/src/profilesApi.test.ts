@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { once } from 'node:events'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { startServer, type ServerOptions } from './server.js'
 import { SessionManager } from './sessions.js'
 import type { Profile } from './types.js'
@@ -83,5 +83,144 @@ describe('GET /api/profiles contract', () => {
       authStatus: 'signed_out',
       authError: 'test credential expired',
     }])
+  })
+})
+
+describe('profile login API recovery contract', () => {
+  it('returns bounded capturing truth and recovers/cancels the same public attempt by id or profile+key', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-profile-login-api-'))
+    const deviceToken = 'profile-login-api-test-device-token-at-least-32-characters'
+    const state = {
+      started: false,
+      status: 'capturing' as
+        | 'capturing'
+        | 'settling'
+        | 'cancelled',
+    }
+    const view = () => ({
+      ok: state.status !== 'cancelled',
+      loginId: 'public-attempt-1',
+      profileId: 'claude-a',
+      provider: 'claude' as const,
+      status: state.status,
+    })
+    const start = vi.fn(async () => {
+      state.started = true
+      return view()
+    })
+    const get = vi.fn(() => view())
+    const getForProfile = vi.fn((profileId: string, key: string) =>
+      state.started && profileId === 'claude-a' && key === 'request-1'
+        ? view()
+        : undefined,
+    )
+    const cancel = vi.fn(() => {
+      state.status = 'settling'
+      return view()
+    })
+    const sessions = { list: () => [], listProfiles: () => [] }
+    const server = startServer({
+      port: 0,
+      defaultCwd: root,
+      profilesDir: root,
+      journal: {} as never,
+      sessions: sessions as never,
+      profiles: [],
+      approvals: {} as never,
+      questions: {} as never,
+      usage: {} as never,
+      projects: {} as never,
+      workspace: {} as never,
+      instructions: {} as never,
+      bus: {} as never,
+      memory: {} as never,
+      practices: {} as never,
+      danger: { busCanUseRiskyTools: false, autoApprovePractices: false },
+      prefs: { chatNamePool: 'everyone', steerMessagesAtToolBoundary: true },
+      rescanProfiles: () => [],
+      mesh: {} as never,
+      deviceToken,
+      requireToken: true,
+      restartState: {
+        booted: true,
+        sockets: new Set(),
+        draining: false,
+        promoting: false,
+      } as never,
+      executor: {} as never,
+      configPath: path.join(root, 'config.json'),
+      profileLoginCoordinator: {
+        start,
+        get,
+        getForProfile,
+        cancel,
+      },
+    } satisfies ServerOptions)
+    if (!server.listening) await once(server, 'listening')
+    const address = server.address() as { port: number }
+    cleanups.push(async () => {
+      if (server.listening) {
+        const closed = new Promise<void>((resolve) => server.close(() => resolve()))
+        server.closeAllConnections()
+        await closed
+      }
+      fs.rmSync(root, { recursive: true, force: true })
+    })
+    const base = `http://127.0.0.1:${address.port}`
+    const headers = {
+      authorization: `Bearer ${deviceToken}`,
+      'content-type': 'application/json',
+    }
+
+    const response = await fetch(`${base}/api/accounts/login`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        provider: 'claude',
+        name: 'claude-a',
+        reauth: true,
+        idempotencyKey: 'request-1',
+      }),
+    })
+    expect(response.status).toBe(202)
+    expect(await response.json()).toMatchObject({
+      ok: true,
+      loginId: 'public-attempt-1',
+      status: 'capturing',
+    })
+    expect(start).toHaveBeenCalledWith({
+      provider: 'claude',
+      profileId: 'claude-a',
+      reauth: true,
+      idempotencyKey: 'request-1',
+    })
+
+    const recovered = await fetch(
+      `${base}/api/accounts/login/profile/claude-a?key=request-1`,
+      { headers },
+    )
+    expect(recovered.status).toBe(200)
+    expect(await recovered.json()).toMatchObject({
+      loginId: 'public-attempt-1',
+      status: 'capturing',
+    })
+    expect(getForProfile).toHaveBeenCalledWith('claude-a', 'request-1')
+
+    const wrongKey = await fetch(
+      `${base}/api/accounts/login/profile/claude-a?key=wrong`,
+      { headers },
+    )
+    expect(wrongKey.status).toBe(404)
+
+    const cancelling = await fetch(
+      `${base}/api/accounts/login/public-attempt-1`,
+      { method: 'DELETE', headers },
+    )
+    expect(cancelling.status).toBe(200)
+    expect(await cancelling.json()).toMatchObject({
+      ok: true,
+      status: 'settling',
+    })
+    expect(cancel).toHaveBeenCalledWith('public-attempt-1')
   })
 })

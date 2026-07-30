@@ -532,13 +532,19 @@ async function request<T>(
   url: string,
   base: string,
   body?: unknown,
-  expectedStatuses: readonly number[] = []
+  expectedStatuses: readonly number[] = [],
+  signal?: AbortSignal
 ): Promise<HttpResult<T>> {
   const headers: Record<string, string> = { ...authHeaders() }
   if (method !== 'GET') headers['content-type'] = 'application/json'
   let res: Response
   try {
-    res = await fetch(base + url, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined })
+    res = await fetch(base + url, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal,
+    })
   } catch (e) {
     return { ok: false, status: 0, error: e instanceof Error ? e.message : 'network error' }
   }
@@ -590,6 +596,37 @@ async function jdelete<T>(url: string): Promise<T> {
   return r.data
 }
 
+export const LOGIN_HTTP_TIMEOUT_MS = 8_000
+
+async function boundedLoginRequest<T>(
+  method: 'GET' | 'POST' | 'DELETE',
+  url: string,
+  body?: unknown,
+): Promise<T> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), LOGIN_HTTP_TIMEOUT_MS)
+  try {
+    try {
+      const result = await request<T>(
+        method,
+        url,
+        HUB_HTTP,
+        body,
+        [],
+        controller.signal,
+      )
+      if (!result.ok) return { error: result.error } as T
+      return result.data
+    } catch (error) {
+      return {
+        error: error instanceof Error ? error.message : 'network error',
+      } as T
+    }
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
 // Some POSTs use a non-2xx status as a deliberate, typed outcome rather than a transport failure. Keep
 // that exception explicit at the call site so ordinary 401/404/409 responses still collapse to {error}.
 async function jpostExpected<T>(
@@ -605,9 +642,10 @@ async function jpostExpected<T>(
 export interface LoginResult {
   ok: boolean
   loginId?: string
+  profileId?: string
   added?: string
   provider?: string
-  status?: 'capturing' | 'waiting' | 'complete' | 'failed' | 'cancelled' | 'timed-out'
+  status?: 'capturing' | 'waiting' | 'settling' | 'complete' | 'failed' | 'cancelled' | 'timed-out'
   url?: string
   code?: string
   manual?: string
@@ -777,10 +815,33 @@ export const api = {
   profiles: () => jget<ProfileInfo[]>('/api/profiles'),
   stats: () => jget<StatsResult>('/api/stats'),
   rescanProfiles: () => jpost<ProfileInfo[] | ApiError>('/api/profiles/rescan'),
-  login: (provider: 'claude' | 'codex', name: string, reauth = false) =>
-    jpost<LoginResult>('/api/accounts/login', { provider, name, reauth }),
-  loginStatus: (id: string) => jget<LoginResult>(`/api/accounts/login/${encodeURIComponent(id)}`),
-  cancelLogin: (id: string) => jdelete<LoginResult>(`/api/accounts/login/${encodeURIComponent(id)}`),
+  login: (
+    provider: 'claude' | 'codex',
+    name: string,
+    reauth: boolean,
+    idempotencyKey: string,
+  ) =>
+    boundedLoginRequest<LoginResult>('POST', '/api/accounts/login', {
+      provider,
+      name,
+      reauth,
+      idempotencyKey,
+    }),
+  loginForProfile: (name: string, idempotencyKey: string) =>
+    boundedLoginRequest<LoginResult>(
+      'GET',
+      `/api/accounts/login/profile/${encodeURIComponent(name)}?key=${encodeURIComponent(idempotencyKey)}`,
+    ),
+  loginStatus: (id: string) =>
+    boundedLoginRequest<LoginResult>(
+      'GET',
+      `/api/accounts/login/${encodeURIComponent(id)}`,
+    ),
+  cancelLogin: (id: string) =>
+    boundedLoginRequest<LoginResult>(
+      'DELETE',
+      `/api/accounts/login/${encodeURIComponent(id)}`,
+    ),
   pickFolder: () => jpost<{ path: string }>('/api/pick-folder'),
   wslCapability: () => jget<WslCapability>('/api/wsl/capability'),
   projects: () => jget<ProjectInfo[]>('/api/projects'),
