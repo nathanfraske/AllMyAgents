@@ -421,7 +421,6 @@ export class InProcessExecutor implements Executor {
                     typeof context.toolUseID === 'string' ? context.toolUseID.length : null,
                   requestIdLength:
                     typeof context.requestId === 'string' ? context.requestId.length : null,
-                  message: error.message,
                 })
                 return {
                   behavior: 'deny',

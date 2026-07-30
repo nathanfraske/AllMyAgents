@@ -122,8 +122,16 @@ function object(value: unknown, field: string): Record<string, unknown> {
 }
 
 function exactKeys(value: Record<string, unknown>, allowed: readonly string[], field: string): void {
-  const extras = Object.keys(value).filter((key) => !allowed.includes(key))
-  if (extras.length) throw new QuestionInputError(`${field} has unsupported field: ${extras[0]}`)
+  // Fail on the first unexpected enumerable key without retaining an attacker-sized key array, and never
+  // echo a model-controlled property name into an error that may cross a logging boundary.
+  for (const key in value) {
+    if (!Object.hasOwn(value, key) || !allowed.includes(key)) {
+      throw new QuestionInputError(`${field} has unsupported fields`)
+    }
+  }
+  if (Object.getOwnPropertySymbols(value).length > 0) {
+    throw new QuestionInputError(`${field} has unsupported fields`)
+  }
 }
 
 function boundedString(value: unknown, field: string, max: number): string {
