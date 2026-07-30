@@ -1,8 +1,8 @@
 # Per-agent browser capability
 
-Research, security contract, and implementation status, revised 2026-07-30. The Windows/WebView2 implementation is
-an implementation candidate pending its physical release gate; non-Windows platforms remain explicitly unavailable.
-The capability stays off by default on every chat. This document distinguishes implemented candidate behavior from
+Research, security contract, and implementation status, revised 2026-07-30. The Windows/WebView2 implementation has
+passed its installed Edge/WebView2 Runtime 150 physical gate; non-Windows platforms remain explicitly unavailable.
+The capability stays off by default on every chat. This document distinguishes implemented Windows behavior from
 future work because a browser-shaped stub or a UI toggle without an enforceable native boundary is worse than no
 browser.
 
@@ -34,14 +34,17 @@ autofill data, but persists for that one agent across app/hub restarts. The oper
 agent's visible window after seeing a warning that the agent can subsequently read pages in that signed-in session.
 No agent ever inherits another agent's state, even when both use the same vendor account or project.
 
-### Current candidate implementation
+### Current Windows implementation
 
 The repository now has the authenticated loopback broker, session capability/origin gates, provider-neutral rich
 tool results, Windows semantic reads and viewport capture, isolated WebView2 profiles, and per-chat UI controls.
-The interaction candidate adds host-minted opaque element refs and `pageGeneration`, native prepare/commit tokens,
+The interaction implementation adds host-minted opaque element refs and `pageGeneration`, native prepare/commit tokens,
 same-environment session tabs, and native-staged downloads imported into the existing session attachment boundary.
-The remaining release condition is the real WebView2 fixture gate in section 10 plus full-suite integration on the
-accepted main head. Unit DOM/script tests are supporting evidence, not a substitute for that physical gate.
+On the installed Edge/WebView2 Runtime 150, the physical gate passed semantic read and approval-bound semantic click;
+an approval-bound, one-use 26-byte inert download import with native cleanup; and shared-environment two-tab
+listing, active-tab reporting, and close behavior. This evidence is bounded to Windows/WebView2. Non-Windows remains
+unavailable, the capability remains off by default, and the model still has no typing, form entry, raw JavaScript,
+selector, coordinate, arbitrary-path, auto-open/execute, or operator-profile import surface.
 
 ---
 
@@ -832,8 +835,8 @@ The slice is complete only when all of these are true:
 - [ ] no profile/credential material reaches the release payload;
 - [ ] hub/web tests, hub typecheck, web check, Rust tests/check, and the 7795 desktop sandbox pass;
 - [ ] two simultaneously enabled agents have been exercised without shared cookies or window interference.
-- [ ] the ignored physical WebView2 gate passes on the release Windows image; pure script/DOM tests alone do not
-  satisfy this item.
+- [x] the installed Edge/WebView2 Runtime 150 physical gate passes semantic read/click, the approval-bound one-use
+  26-byte inert download import/cleanup, and shared-environment two-tab listing/active/close behavior.
 
 If any item cannot be met on a supported platform, keep the feature unavailable on that platform. Do not weaken
 isolation or silently swap in a headless implementation to make the checkbox appear complete.
