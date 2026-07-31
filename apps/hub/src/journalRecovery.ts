@@ -500,10 +500,46 @@ function writeJsonExclusive(
     failpoint?.(`after-${edge}-partial-fsync`)
   }
   fs.linkSync(partial, file)
+  const publishedIdentity = fs.lstatSync(file, { bigint: true })
   failpoint?.(`after-${edge}-link`)
   syncFile(file)
   syncDirectory(parent)
-  fs.unlinkSync(partial)
+  try {
+    fs.unlinkSync(partial)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    let finalStat: fs.BigIntStats | undefined
+    try {
+      finalStat = fs.lstatSync(file, { bigint: true })
+    } catch (statError) {
+      if ((statError as NodeJS.ErrnoException).code !== 'ENOENT') throw statError
+    }
+    const bytesMatch = finalStat !== undefined && fs.readFileSync(file).equals(bytes)
+    // Node's Windows stat inode value can change when NTFS drops the other hard-link name, even
+    // though the surviving path still has the exact bytes on the same volume. POSIX inode identity
+    // remains stable and is enforced there.
+    const identityMatches =
+      finalStat !== undefined &&
+      finalStat.dev === publishedIdentity.dev &&
+      (process.platform === 'win32' || finalStat.ino === publishedIdentity.ino)
+    if (
+      finalStat === undefined ||
+      !finalStat.isFile() ||
+      finalStat.isSymbolicLink() ||
+      !identityMatches ||
+      finalStat.nlink !== 1n ||
+      !bytesMatch
+    ) {
+      const observed = finalStat
+        ? `dev=${finalStat.dev} ino=${finalStat.ino} links=${finalStat.nlink} bytesMatch=${bytesMatch}`
+        : 'missing'
+      throw new Error(
+        `recovery metadata partial disappeared before its exact publication could be verified: ${file} (${observed}; expected volume=${publishedIdentity.dev} exact bytes and one link)`
+      )
+    }
+    // Another exact reader observed the two-link publication, validated the shared inode, and
+    // completed the partial cleanup first. That is already the durable state this writer wanted.
+  }
   failpoint?.(`after-${edge}-partial-unlink`)
   syncDirectory(parent)
 }
@@ -910,13 +946,18 @@ export function ensureRecoveryEnrollment(
       `)
       options.failpoint?.('after-enrollment-identity')
     }
-    writeJsonExclusive(paths.rootBinding, {
-      format: FORMAT,
-      rootId: intent.rootId,
-      activeJournalId: intent.journalId,
-      nextGeneration: '1',
-      ownershipDatabase,
-    } satisfies RootBinding)
+    writeJsonExclusive(
+      paths.rootBinding,
+      {
+        format: FORMAT,
+        rootId: intent.rootId,
+        activeJournalId: intent.journalId,
+        nextGeneration: '1',
+        ownershipDatabase,
+      } satisfies RootBinding,
+      options.failpoint,
+      'enrollment-root-binding-publication'
+    )
     options.failpoint?.('after-enrollment-root-binding')
   } else if (!identityTableExisted) {
     throw new Error('recovery root binding exists but the journal identity table is missing')

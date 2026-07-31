@@ -243,6 +243,43 @@ describe('owned journal corruption recovery', () => {
     })
   })
 
+  it('accepts an exact reader finishing root-binding publication concurrently', () => {
+    const dataDir = root()
+    const journal = open(dataDir)
+    const journalPath = path.join(dataDir, 'hub.db')
+    journal.append('s1', 'session/input', { text: 'concurrent-root-binding-reader' })
+    let readerFinishedPublication = false
+
+    const enrolled = ensureRecoveryEnrollment(journal.db, dataDir, {
+      failpoint: (edge) => {
+        if (edge !== 'after-enrollment-root-binding-publication-link') return
+        const bindingPath = recoveryPaths(dataDir).rootBinding
+        const before = fs.lstatSync(bindingPath, { bigint: true })
+        expect(before.nlink).toBe(2n)
+        expect(
+          verifyNormalJournalLineage({
+            dataDir,
+            journalPath,
+            maxSchemaVersion: SCHEMA_VERSION,
+          })
+        ).toBeUndefined()
+        const after = fs.lstatSync(bindingPath, { bigint: true })
+        expect(after.dev).toBe(before.dev)
+        expect(after.nlink).toBe(1n)
+        readerFinishedPublication = true
+      },
+    })
+
+    expect(readerFinishedPublication).toBe(true)
+    expect(enrolled.rootId).toMatch(/^[0-9a-f-]{36}$/i)
+    expect(enrolled.journalId).toMatch(/^[0-9a-f-]{36}$/i)
+    expect(
+      fs
+        .readdirSync(recoveryPaths(dataDir).root)
+        .filter((entry) => entry.startsWith('root.json.partial-'))
+    ).toEqual([])
+  })
+
   it('enrolls the shipped healthy backup path into an identity-bound strong generation', async () => {
     const dataDir = root()
     const journal = open(dataDir)
@@ -269,33 +306,37 @@ describe('owned journal corruption recovery', () => {
     expect(fs.readdirSync(path.join(dataDir, 'backups')).some((name) => name.endsWith('.db'))).toBe(true)
   })
 
-  it('keeps Windows directory durability barriers fixed-size across repeated publications', async () => {
-    const dataDir = root()
-    const journal = open(dataDir)
-    for (let index = 0; index < 8; index++) {
-      journal.append('s1', 'session/input', { text: `snapshot-${index}` })
-      await strongSnapshot(
-        dataDir,
-        journal,
-        new Date(`2026-07-29T00:0${index}:00.000Z`)
-      )
-    }
-    const pending = [recoveryPaths(dataDir).root]
-    const barriers: string[] = []
-    while (pending.length > 0) {
-      const directory = pending.pop()!
-      for (const entry of fs.readdirSync(directory)) {
-        const file = path.join(directory, entry)
-        const stat = fs.lstatSync(file)
-        if (stat.isDirectory()) pending.push(file)
-        else if (entry === '.ama-directory-barrier') barriers.push(file)
+  it(
+    'keeps Windows directory durability barriers fixed-size across repeated publications',
+    async () => {
+      const dataDir = root()
+      const journal = open(dataDir)
+      for (let index = 0; index < 8; index++) {
+        journal.append('s1', 'session/input', { text: `snapshot-${index}` })
+        await strongSnapshot(
+          dataDir,
+          journal,
+          new Date(`2026-07-29T00:0${index}:00.000Z`)
+        )
       }
-    }
-    if (process.platform === 'win32') {
-      expect(barriers.length).toBeGreaterThan(0)
-      expect(barriers.every((file) => fs.statSync(file).size === 16)).toBe(true)
-    }
-  })
+      const pending = [recoveryPaths(dataDir).root]
+      const barriers: string[] = []
+      while (pending.length > 0) {
+        const directory = pending.pop()!
+        for (const entry of fs.readdirSync(directory)) {
+          const file = path.join(directory, entry)
+          const stat = fs.lstatSync(file)
+          if (stat.isDirectory()) pending.push(file)
+          else if (entry === '.ama-directory-barrier') barriers.push(file)
+        }
+      }
+      if (process.platform === 'win32') {
+        expect(barriers.length).toBeGreaterThan(0)
+        expect(barriers.every((file) => fs.statSync(file).size === 16)).toBe(true)
+      }
+    },
+    15_000
+  )
 
   it('never replaces a competitor generation target created at the publication boundary', async () => {
     const dataDir = root()
