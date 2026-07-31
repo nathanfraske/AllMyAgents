@@ -48,6 +48,12 @@ function condense(
     maxHistorySourceBytes: number
   }> = {}
 ): HistoryCondenseResult {
+  while (!journal.backfillSessionEventIndex(5_000).complete) {
+    // Production advances both projections in bounded post-ready batches before history deletion.
+  }
+  while (!journal.backfillTransientEventIndex(5_000).complete) {
+    // Keep this helper on the same terminal-discovery contract as journal maintenance.
+  }
   return (journal as HistoryCondensableJournal).condenseCompletedCodex({
     nowMs: NOW,
     graceMs: 60 * 60 * 1000,

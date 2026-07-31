@@ -83,6 +83,10 @@ export interface SessionRecord {
   browserOriginGrants?: string[]
   /** Separate owner grant for loopback/private/link-local web origins. Safe default is OFF. */
   browserLocalNetworkEnabled?: boolean
+  /** Allows explicit, approval-bound creation of additional tabs for this session only. */
+  browserTabsEnabled?: boolean
+  /** Allows approval-bound downloads into this session's inert, quota-bound native store. */
+  browserDownloadsEnabled?: boolean
   /** Whether this session has created a persistent isolated profile directory. */
   browserProfileRetained?: boolean
   /** Operator-granted project-manager role. Agents can consume this marker but never set it. */
@@ -159,11 +163,15 @@ export interface HubEvent {
 /** Non-journal WebSocket control envelope separating replayed state from subsequent live events. */
 export interface ReplayStart {
   type: 'replay-start'
+  generation: number
+  highWater: number
+  resetFloorSeq: number
 }
 
 export interface ReplayComplete {
   type: 'replay-complete'
   lastSeq: number
+  generation: number
 }
 
 export type ApprovalStatus = 'pending' | 'approved' | 'denied' | 'timeout'

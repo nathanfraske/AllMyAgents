@@ -11,6 +11,15 @@ export interface AttachmentRef {
   size: number
 }
 
+export interface RecoveryNotice {
+  planId: string
+  generation: string
+  snapshotMaxSeq: string
+  snapshotEventHighWater: string
+  quarantineDir: string
+  recordedAt: string
+}
+
 export interface ProfileInfo {
   id: string
   provider: 'claude' | 'codex'
@@ -320,6 +329,28 @@ export interface ApprovalRecord {
   createdAt: string
 }
 
+export interface QuestionOption {
+  label: string
+  description: string
+  /** Inert plain text only. The host never renders SDK preview content as HTML. */
+  preview?: string
+}
+
+export interface QuestionPrompt {
+  question: string
+  header: string
+  options: QuestionOption[]
+  multiSelect: boolean
+}
+
+export interface QuestionRecord {
+  id: string
+  sessionId: string
+  questions: QuestionPrompt[]
+  status: 'pending' | 'answered' | 'cancelled' | 'aborted'
+  createdAt: string
+}
+
 export interface ClaudeUsageLine {
   label: string
   percent: number
@@ -360,14 +391,62 @@ export interface HubEvent {
 /** Non-journal WebSocket control envelope separating replayed state from subsequent live events. */
 export interface ReplayStart {
   type: 'replay-start'
+  generation: number
+  highWater: number
+  resetFloorSeq: number
 }
 
 export interface ReplayComplete {
   type: 'replay-complete'
   lastSeq: number
+  generation: number
 }
 
-export type HubStreamMessage = HubEvent | ReplayStart | ReplayComplete
+export interface ReplayResetRequired {
+  type: 'replay-reset-required'
+  reason:
+    | 'baseline-required'
+    | 'generation-changed'
+    | 'invalid-cursor'
+    | 'tail-too-large'
+    | 'client-queue-overflow'
+  checkpoint: {
+    version: 1
+    generation: number
+    cursor: number
+    resetFloorSeq: number
+  }
+}
+
+export type HubStreamMessage = HubEvent | ReplayStart | ReplayComplete | ReplayResetRequired
+
+export interface ReplayBaseline {
+  version: 1
+  generation: number
+  highWaterSeq: number
+  resetFloorSeq: number
+  sessions: SessionRecord[]
+  projects: ProjectInfo[]
+  journalCompaction: JournalCompactionStatus | null
+}
+
+export interface JournalCompactionStatus {
+  operationId: string
+  phase: 'started' | 'progress' | 'completed' | 'failed' | 'unobservable'
+  startedAt: string
+  updatedAt: string
+  rowsDeleted: number
+  payloadBytesDeleted: number
+  detail: string
+}
+
+export interface JournalHistoryPage {
+  events: HubEvent[]
+  olderCursor: number | null
+  hasOlder: boolean
+  encodedBytes: number
+  checkpointGeneration: number
+}
 
 // In the packaged desktop app the frontend is served from tauri.localhost, so relative URLs
 // never reach the hub. Detect the Tauri webview and target the loopback hub directly. In the
@@ -453,13 +532,19 @@ async function request<T>(
   url: string,
   base: string,
   body?: unknown,
-  expectedStatuses: readonly number[] = []
+  expectedStatuses: readonly number[] = [],
+  signal?: AbortSignal
 ): Promise<HttpResult<T>> {
   const headers: Record<string, string> = { ...authHeaders() }
   if (method !== 'GET') headers['content-type'] = 'application/json'
   let res: Response
   try {
-    res = await fetch(base + url, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined })
+    res = await fetch(base + url, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal,
+    })
   } catch (e) {
     return { ok: false, status: 0, error: e instanceof Error ? e.message : 'network error' }
   }
@@ -511,6 +596,37 @@ async function jdelete<T>(url: string): Promise<T> {
   return r.data
 }
 
+export const LOGIN_HTTP_TIMEOUT_MS = 8_000
+
+async function boundedLoginRequest<T>(
+  method: 'GET' | 'POST' | 'DELETE',
+  url: string,
+  body?: unknown,
+): Promise<T> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), LOGIN_HTTP_TIMEOUT_MS)
+  try {
+    try {
+      const result = await request<T>(
+        method,
+        url,
+        HUB_HTTP,
+        body,
+        [],
+        controller.signal,
+      )
+      if (!result.ok) return { error: result.error } as T
+      return result.data
+    } catch (error) {
+      return {
+        error: error instanceof Error ? error.message : 'network error',
+      } as T
+    }
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
 // Some POSTs use a non-2xx status as a deliberate, typed outcome rather than a transport failure. Keep
 // that exception explicit at the call site so ordinary 401/404/409 responses still collapse to {error}.
 async function jpostExpected<T>(
@@ -526,9 +642,10 @@ async function jpostExpected<T>(
 export interface LoginResult {
   ok: boolean
   loginId?: string
+  profileId?: string
   added?: string
   provider?: string
-  status?: 'capturing' | 'waiting' | 'complete' | 'failed' | 'cancelled' | 'timed-out'
+  status?: 'capturing' | 'waiting' | 'settling' | 'complete' | 'failed' | 'cancelled' | 'timed-out'
   url?: string
   code?: string
   manual?: string
@@ -689,16 +806,42 @@ export interface BrowserStatus {
   retainedProfile: boolean
   publicOriginGrants: string[]
   localNetworkEnabled: boolean
+  tabsEnabled: boolean
+  downloadsEnabled: boolean
 }
 
 export const api = {
+  replayBaseline: () => jget<ReplayBaseline>('/api/replay-baseline'),
   profiles: () => jget<ProfileInfo[]>('/api/profiles'),
   stats: () => jget<StatsResult>('/api/stats'),
   rescanProfiles: () => jpost<ProfileInfo[] | ApiError>('/api/profiles/rescan'),
-  login: (provider: 'claude' | 'codex', name: string, reauth = false) =>
-    jpost<LoginResult>('/api/accounts/login', { provider, name, reauth }),
-  loginStatus: (id: string) => jget<LoginResult>(`/api/accounts/login/${encodeURIComponent(id)}`),
-  cancelLogin: (id: string) => jdelete<LoginResult>(`/api/accounts/login/${encodeURIComponent(id)}`),
+  login: (
+    provider: 'claude' | 'codex',
+    name: string,
+    reauth: boolean,
+    idempotencyKey: string,
+  ) =>
+    boundedLoginRequest<LoginResult>('POST', '/api/accounts/login', {
+      provider,
+      name,
+      reauth,
+      idempotencyKey,
+    }),
+  loginForProfile: (name: string, idempotencyKey: string) =>
+    boundedLoginRequest<LoginResult>(
+      'GET',
+      `/api/accounts/login/profile/${encodeURIComponent(name)}?key=${encodeURIComponent(idempotencyKey)}`,
+    ),
+  loginStatus: (id: string) =>
+    boundedLoginRequest<LoginResult>(
+      'GET',
+      `/api/accounts/login/${encodeURIComponent(id)}`,
+    ),
+  cancelLogin: (id: string) =>
+    boundedLoginRequest<LoginResult>(
+      'DELETE',
+      `/api/accounts/login/${encodeURIComponent(id)}`,
+    ),
   pickFolder: () => jpost<{ path: string }>('/api/pick-folder'),
   wslCapability: () => jget<WslCapability>('/api/wsl/capability'),
   projects: () => jget<ProjectInfo[]>('/api/projects'),
@@ -750,7 +893,21 @@ export const api = {
   // On-demand vendor transcript history for an imported chat (bounded tail; `before` byte cursor pages older).
   history: (id: string, before?: number) =>
     jget<HistoryPage>(`/api/sessions/${id}/history${before != null ? `?before=${before}` : ''}`),
+  journalHistory: (id: string, generation: number, before?: number) => {
+    const query = new URLSearchParams({ generation: String(generation) })
+    if (before != null) query.set('before', String(before))
+    return jget<JournalHistoryPage>(
+      `/api/sessions/${encodeURIComponent(id)}/journal-history?${query.toString()}`,
+    )
+  },
   approvals: () => jget<ApprovalRecord[]>('/api/approvals'),
+  questions: () => jget<QuestionRecord[]>('/api/questions'),
+  recoveryNotices: () => jget<RecoveryNotice[]>('/api/recovery-notices'),
+  dismissRecoveryNotice: (planId: string) =>
+    jpost<{ ok?: boolean; error?: string }>(
+      `/api/recovery-notices/${encodeURIComponent(planId)}/dismiss`,
+      {}
+    ),
   usage: () => jget<UsageSnapshot[]>('/api/usage'),
   refreshUsage: () => jpost<UsageSnapshot[] | ApiError>('/api/usage/refresh'),
   // NOTE: spawn does NOT take `attachments`. Uploads are session-owned (their id is minted by the upload
@@ -830,6 +987,10 @@ export const api = {
     ),
   setBrowserLocalNetwork: (id: string, enabled: boolean) =>
     jpost<BrowserStatus | ApiError>(`/api/sessions/${id}/browser/local-network`, { enabled }),
+  setBrowserTabs: (id: string, enabled: boolean) =>
+    jpost<BrowserStatus | ApiError>(`/api/sessions/${id}/browser/tabs`, { enabled }),
+  setBrowserDownloads: (id: string, enabled: boolean) =>
+    jpost<BrowserStatus | ApiError>(`/api/sessions/${id}/browser/downloads`, { enabled }),
   revokeBrowserOrigin: (id: string, origin: string) =>
     jpost<BrowserStatus | ApiError>(`/api/sessions/${id}/browser/origins/revoke`, { origin }),
   showBrowser: (id: string) =>
@@ -871,6 +1032,14 @@ export const api = {
   // Typed so a caller can tell an accepted decision (200 { ok:true }) from a 404/401/network failure
   // ({ error }) — the approval UI must NOT clear a pending prompt it never actually resolved.
   decide: (id: string, approve: boolean) => jpost<{ ok?: boolean; error?: string }>(`/api/approvals/${id}`, { approve }),
+  answerQuestion: (id: string, answers: Record<string, string>) =>
+    jpost<{ ok?: boolean; error?: string }>(`/api/questions/${encodeURIComponent(id)}`, {
+      answers,
+    }),
+  cancelQuestion: (id: string) =>
+    jpost<{ ok?: boolean; error?: string }>(`/api/questions/${encodeURIComponent(id)}`, {
+      cancel: true,
+    }),
   mesh: () => jget<MeshStatus>('/api/mesh'),
   revealDeviceToken: () => jpost<{ token?: string; error?: string }>('/api/device-token/reveal'),
   setMesh: (enable: boolean) => jpost<MeshStatus | ApiError>('/api/mesh', { enable }),

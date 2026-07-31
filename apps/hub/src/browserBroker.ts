@@ -175,11 +175,11 @@ export class BrowserBroker {
     }
   }
 
-  async execute(input: {
+  async executeDetailed(input: {
     sessionId: string
     operation: BrowserOperation
     arguments: Record<string, unknown>
-  }): Promise<BrowserResultContent[]> {
+  }): Promise<{ content: BrowserResultContent[]; data?: Record<string, unknown> }> {
     if (!this.status().available) await this.refresh()
     const state = this.status()
     if (!state.available) throw new Error(state.reason)
@@ -227,7 +227,10 @@ export class BrowserBroker {
       if (!response.result.ok) {
         throw new Error(response.result.error || 'The desktop browser command failed.')
       }
-      return response.result.content ?? []
+      return {
+        content: response.result.content ?? [],
+        ...(response.result.data ? { data: response.result.data } : {}),
+      }
     } catch (err) {
       if (timedOut) {
         throw new Error('Browser unavailable: the desktop browser host did not answer in time.')
@@ -238,6 +241,14 @@ export class BrowserBroker {
       if (this.activeCommands.get(input.sessionId) === active) this.activeCommands.delete(input.sessionId)
       this.noteSessionIdle(input.sessionId)
     }
+  }
+
+  async execute(input: {
+    sessionId: string
+    operation: BrowserOperation
+    arguments: Record<string, unknown>
+  }): Promise<BrowserResultContent[]> {
+    return (await this.executeDetailed(input)).content
   }
 
   cancelSession(sessionId: string): void {

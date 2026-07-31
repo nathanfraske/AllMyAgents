@@ -3,7 +3,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import SettingsModal from './SettingsModal.svelte'
 import { store } from './store.svelte'
 
-const login = vi.hoisted(() => vi.fn(() => new Promise(() => {})))
+const loginMocks = vi.hoisted(() => ({
+  login: vi.fn(() => new Promise(() => {})),
+  loginStatus: vi.fn(),
+  loginForProfile: vi.fn(),
+  cancelLogin: vi.fn(() => Promise.resolve({ ok: true, status: 'settling' })),
+}))
 
 vi.mock('./externalUrl', () => ({
   prepareExternalTarget: () => null,
@@ -18,8 +23,10 @@ vi.mock('./api', async (original) => {
     ...actual,
     api: new Proxy({} as typeof actual.api, {
       get: (_target, property) => {
-        if (property === 'login') return login
-        if (property === 'cancelLogin') return () => Promise.resolve({ ok: true })
+        if (property === 'login') return loginMocks.login
+        if (property === 'loginStatus') return loginMocks.loginStatus
+        if (property === 'loginForProfile') return loginMocks.loginForProfile
+        if (property === 'cancelLogin') return loginMocks.cancelLogin
         if (property === 'mesh') {
           return () => Promise.resolve({
             enabled: false,
@@ -48,7 +55,12 @@ vi.mock('./api', async (original) => {
 afterEach(() => {
   cleanup()
   store.profiles = []
-  login.mockClear()
+  loginMocks.login.mockReset()
+  loginMocks.login.mockImplementation(() => new Promise(() => {}))
+  loginMocks.loginStatus.mockReset()
+  loginMocks.loginForProfile.mockReset()
+  loginMocks.cancelLogin.mockReset()
+  loginMocks.cancelLogin.mockResolvedValue({ ok: true, status: 'settling' })
 })
 
 describe('tutorial account waiting integration', () => {
@@ -69,7 +81,12 @@ describe('tutorial account waiting integration', () => {
     expect(screen.getByRole('button', { name: 'Re-authenticate codex-healthy' })).toBeTruthy()
 
     await fireEvent.click(signedOut)
-    expect(login).toHaveBeenCalledWith('claude', 'claude-signed-out', true)
+    expect(loginMocks.login).toHaveBeenCalledWith(
+      'claude',
+      'claude-signed-out',
+      true,
+      expect.any(String),
+    )
   })
 
   it('offers Cancel before the hub has returned a browser URL', async () => {
@@ -89,7 +106,60 @@ describe('tutorial account waiting integration', () => {
     expect(screen.getByRole('button', { name: 'Cancel' })).toBeTruthy()
 
     await fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
-    expect(screen.getByText('Sign-in cancelled. No account was added.')).toBeTruthy()
+    expect(
+      screen.getByText(
+        'Cancelling as soon as the durable sign-in attempt is confirmed…',
+      ),
+    ).toBeTruthy()
+    expect(screen.queryByText(/Sign-in cancelled/)).toBeNull()
+  })
+
+  it('accepts capturing without a URL, shows settling, and waits for terminal cancellation truth', async () => {
+    loginMocks.login.mockResolvedValue({
+      ok: true,
+      loginId: 'public-1',
+      profileId: 'claude-capturing',
+      provider: 'claude',
+      status: 'capturing',
+    })
+    loginMocks.loginStatus.mockResolvedValue({
+      ok: false,
+      loginId: 'public-1',
+      profileId: 'claude-capturing',
+      provider: 'claude',
+      status: 'cancelled',
+      error: 'Prior credential restored.',
+    })
+    loginMocks.loginForProfile.mockResolvedValue({
+      ok: false,
+      loginId: 'public-1',
+      profileId: 'claude-capturing',
+      provider: 'claude',
+      status: 'cancelled',
+      error: 'Prior credential restored.',
+    })
+    render(SettingsModal, {
+      props: {
+        onclose: () => {},
+        initialTab: 'accounts',
+      },
+    })
+    await fireEvent.input(screen.getByPlaceholderText('profile name (e.g. claude-work)'), {
+      target: { value: 'claude-capturing' },
+    })
+    await fireEvent.click(screen.getByRole('button', { name: 'Log in' }))
+
+    expect(
+      await screen.findByText('Waiting for the sign-in page from the provider…'),
+    ).toBeTruthy()
+    expect(screen.queryByRole('link', { name: 'Open sign-in page' })).toBeNull()
+    await fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(
+      screen.getByText('Cancelling sign-in and restoring credential state safely…'),
+    ).toBeTruthy()
+    expect(loginMocks.cancelLogin).toHaveBeenCalledWith('public-1')
+
+    expect(await screen.findByText('Prior credential restored.', {}, { timeout: 2_000 })).toBeTruthy()
   })
 
   it('offers deliberate replay actions from Settings', async () => {

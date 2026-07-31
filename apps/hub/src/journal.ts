@@ -11,6 +11,42 @@ import { sanitizeJournalPayload } from './journalPayload.js'
 import { redactedJson } from './redact.js'
 import type { ApprovalStatus, HubEvent } from './types.js'
 
+export interface ResolvedQuestion {
+  sessionId: string
+  status: 'answered' | 'cancelled' | 'aborted' | 'interrupted'
+  correlationDigest: string
+  questionDigest: string
+  reason?: 'hub-restarted' | 'worker-restarted' | 'interrupted_by_restart'
+}
+
+export interface DurableQuestion {
+  id: string
+  sessionId: string
+  correlationDigest: string
+  questionDigest: string
+  ownerEpoch: string
+  status: 'pending' | ResolvedQuestion['status']
+  reason?: ResolvedQuestion['reason']
+}
+
+export interface RegisterQuestionResult {
+  created: boolean
+  state: DurableQuestion
+}
+
+export interface ResolveQuestionResult {
+  written: boolean
+  state: ResolvedQuestion
+}
+
+export interface RestartInterruptedTurn {
+  restartGeneration: string
+  sessionId: string
+  questionCount: number
+  /** Owner-process receipt only; never persisted or journaled. */
+  questionIds: readonly string[]
+}
+
 /**
  * The per-session marker a restarted hub journals when the worker has respawned and the session's worker
  * `wseq` will RESTART at 1 for the next worker era (docs/agent-worker-impl.md §7.1 — F1). The reset-aware
@@ -32,7 +68,13 @@ export const WSEQ_CHECKPOINT_KIND = 'session/wseq-checkpoint'
 export const JOURNAL_CONDENSE_GRACE_MS = 60 * 60 * 1000
 export const JOURNAL_CONDENSE_INTERVAL_MS = 5 * 60 * 1000
 export const JOURNAL_CONDENSE_MAX_COMMAND_DELTAS = 5_000
-export const JOURNAL_CONDENSE_MAX_DIFF_SNAPSHOTS = 25
+export const JOURNAL_CONDENSE_MAX_AGENT_MESSAGE_DELTAS = 5_000
+export const JOURNAL_CONDENSE_MAX_DIFF_SNAPSHOTS = 5_000
+export const JOURNAL_CONDENSE_MAX_DELETE_ROWS = 3_500
+export const JOURNAL_CONDENSE_MAX_TRANSIENT_BYTES = 8 * 1024 * 1024
+export const JOURNAL_REPLAY_PROTOCOL_VERSION = 1 as const
+export const JOURNAL_HISTORY_PAGE_MAX_ROWS = 80
+export const JOURNAL_HISTORY_PAGE_MAX_BYTES = 512 * 1024
 // These horizons describe a possible opt-in history policy, but both lossy batch limits stay ZERO until a
 // future explicit operator control enables it. The distinction is load-bearing: the one-hour condensation
 // above removes only SUPERSEDED rows (an intermediate diff, or a delta whose completed item durably contains
@@ -51,8 +93,12 @@ export const JOURNAL_HISTORY_ROLLUP_CHARS = 32_000
 export type JournalCondenseOptions = {
   nowMs?: number
   graceMs?: number
+  /** Immutable inclusive event frontier proven covered by the deletion-authorizing snapshot. */
+  deleteThroughSeq?: number
   maxCommandOutputDeltas?: number
+  maxAgentMessageDeltas?: number
   maxDiffSnapshots?: number
+  maxTransientPayloadBytes?: number
   historyGraceMs?: number
   historyRetentionMs?: number
   maxHistoryTurns?: number
@@ -65,7 +111,11 @@ export type JournalCondenseOptions = {
 
 export type JournalCondenseResult = {
   commandOutputDeltasDeleted: number
+  agentMessageDeltasDeleted: number
   diffSnapshotsDeleted: number
+  transientPayloadBytesDeleted: number
+  oversizedTransientRowsRetained: number
+  writerLockMs: number
   cursorCheckpointsWritten: number
   historyTurnsRolledUp: number
   historyTurnsDeferred: number
@@ -74,6 +124,80 @@ export type JournalCondenseResult = {
   historyPayloadBytesSelected: number
   historyPayloadBytesWritten: number
   replication: ReplicationPruneGate
+}
+
+export interface ReplayCheckpoint {
+  version: typeof JOURNAL_REPLAY_PROTOCOL_VERSION
+  generation: number
+  cursor: number
+  resetFloorSeq: number
+}
+
+export interface SessionHistoryPage {
+  events: HubEvent[]
+  olderCursor: number | null
+  hasOlder: boolean
+  encodedBytes: number
+  checkpointGeneration: number
+}
+
+export interface BoundedReplayPage {
+  checkpoint: ReplayCheckpoint
+  events: HubEvent[]
+  lastSeq: number
+  hasMore: boolean
+  encodedBytes: number
+  tooLarge?: {
+    seq: number
+    encodedBytes: number
+  }
+}
+
+export type JournalCompactionPhase =
+  | 'started'
+  | 'progress'
+  | 'completed'
+  | 'failed'
+  | 'unobservable'
+
+export interface JournalCompactionStatus {
+  operationId: string
+  phase: JournalCompactionPhase
+  startedAt: string
+  updatedAt: string
+  rowsDeleted: number
+  payloadBytesDeleted: number
+  detail: string
+}
+
+export class SessionHistoryIndexingError extends Error {
+  constructor(
+    readonly scannedThrough: number,
+    readonly target: number
+  ) {
+    super(`journal history index is building (${scannedThrough}/${target})`)
+    this.name = 'SessionHistoryIndexingError'
+  }
+}
+
+export class TransientHistoryIndexingError extends Error {
+  constructor(
+    readonly scannedThrough: number,
+    readonly target: number
+  ) {
+    super(`journal transient maintenance index is building (${scannedThrough}/${target})`)
+    this.name = 'TransientHistoryIndexingError'
+  }
+}
+
+export class ReplayGenerationChangedError extends Error {
+  constructor(
+    readonly expected: number,
+    readonly actual: number
+  ) {
+    super(`journal replay generation changed (${expected} -> ${actual})`)
+    this.name = 'ReplayGenerationChangedError'
+  }
 }
 
 export class Journal extends EventEmitter {
@@ -87,6 +211,7 @@ export class Journal extends EventEmitter {
   // Lazily built the first time a re-issued approval is reconciled (worker mode only — the in-process
   // executor never supplies a stable id, so this never runs flag-off, keeping the constructor byte-identical).
   private resolvedApprovalStmt: Database.Statement | undefined
+  private questionRecoveryUnknownStmt: Database.Statement | undefined
 
   constructor(file: string) {
     super()
@@ -117,6 +242,91 @@ export class Journal extends EventEmitter {
     this.db.exec(
       'CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, session TEXT, kind TEXT NOT NULL, payload TEXT NOT NULL)'
     )
+    // Interactive question bodies are needed only while the matching SDK callback is live and therefore
+    // stay only in the bounded owner process memory. This table stores summary metadata (never prompt,
+    // description, preview, or answer bytes). Its primary key is the cross-process blue/green CAS.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS question_lifecycles (
+        id TEXT PRIMARY KEY,
+        session TEXT NOT NULL,
+        correlation_digest TEXT NOT NULL,
+        tool_use_id_length INTEGER NOT NULL,
+        request_id_length INTEGER NOT NULL,
+        question_digest TEXT NOT NULL,
+        owner_epoch TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'answered', 'cancelled', 'aborted', 'interrupted')),
+        terminal_reason TEXT,
+        input_bytes INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_question_lifecycles_pending
+        ON question_lifecycles(status, session);
+      CREATE TABLE IF NOT EXISTS question_restart_interruptions (
+        restart_generation TEXT NOT NULL,
+        session TEXT NOT NULL,
+        phase TEXT NOT NULL CHECK (phase IN ('planned', 'crash')),
+        boundary TEXT NOT NULL CHECK (boundary IN ('pending', 'completed', 'unknown')),
+        question_count INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (restart_generation, session)
+      );
+      CREATE INDEX IF NOT EXISTS idx_question_restart_interruptions_pending
+        ON question_restart_interruptions(boundary, session);
+    `)
+    // The immediately preceding Ask candidate allowed only `aborted`. A test/live candidate DB can survive
+    // into this build even though older public releases had no table at all. Widen the CHECK transactionally
+    // instead of relying on CREATE TABLE IF NOT EXISTS, which never updates an existing constraint.
+    const questionLifecycleSql = (
+      this.db
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'question_lifecycles'")
+        .get() as { sql?: string } | undefined
+    )?.sql
+    if (questionLifecycleSql && !questionLifecycleSql.includes("'interrupted'")) {
+      try {
+        this.db.exec(`
+          BEGIN IMMEDIATE;
+          DROP INDEX IF EXISTS idx_question_lifecycles_pending;
+          ALTER TABLE question_lifecycles RENAME TO question_lifecycles_before_interrupted;
+          CREATE TABLE question_lifecycles (
+            id TEXT PRIMARY KEY,
+            session TEXT NOT NULL,
+            correlation_digest TEXT NOT NULL,
+            tool_use_id_length INTEGER NOT NULL,
+            request_id_length INTEGER NOT NULL,
+            question_digest TEXT NOT NULL,
+            owner_epoch TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('pending', 'answered', 'cancelled', 'aborted', 'interrupted')),
+            terminal_reason TEXT,
+            input_bytes INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+          );
+          INSERT INTO question_lifecycles
+            (id, session, correlation_digest, tool_use_id_length, request_id_length,
+             question_digest, owner_epoch, status, terminal_reason, input_bytes, created_at)
+          SELECT id, session, correlation_digest, tool_use_id_length, request_id_length,
+                 question_digest, owner_epoch, status, terminal_reason, input_bytes, created_at
+          FROM question_lifecycles_before_interrupted;
+          DROP TABLE question_lifecycles_before_interrupted;
+          CREATE INDEX idx_question_lifecycles_pending
+            ON question_lifecycles(status, session);
+          COMMIT;
+        `)
+      } catch (error) {
+        try {
+          this.db.exec('ROLLBACK')
+        } catch {
+          /* transaction may already have rolled back */
+        }
+        const racedSql = (
+          this.db
+            .prepare(
+              "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'question_lifecycles'"
+            )
+            .get() as { sql?: string } | undefined
+        )?.sql
+        if (!racedSql?.includes("'interrupted'")) throw error
+      }
+    }
     // Additive, back-compat: tag worker-relayed events with their per-session worker seq so a restarted
     // hub can derive the durable re-attach cursor MAX(wseq) (docs/agent-worker-impl.md §7.1). Old rows
     // are NULL. Guarded so re-running on an already-migrated DB is a no-op.
@@ -144,9 +354,61 @@ export class Journal extends EventEmitter {
         wseq INTEGER NOT NULL,
         event_seq INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS journal_replay_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        generation INTEGER NOT NULL CHECK (generation >= 1),
+        reset_floor_seq INTEGER NOT NULL DEFAULT 0 CHECK (reset_floor_seq >= 0),
+        updated_at TEXT NOT NULL
+      );
+      INSERT OR IGNORE INTO journal_replay_state
+        (singleton, generation, reset_floor_seq, updated_at)
+      VALUES (1, 1, 0, '1970-01-01T00:00:00.000Z');
+      CREATE TABLE IF NOT EXISTS journal_session_event_index (
+        session TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        PRIMARY KEY (session, seq)
+      ) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS journal_session_index_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        scanned_through INTEGER NOT NULL CHECK (scanned_through >= 0)
+      );
+      INSERT OR IGNORE INTO journal_session_index_state (singleton, scanned_through) VALUES (1, 0);
+      CREATE TABLE IF NOT EXISTS journal_transient_event_index (
+        seq INTEGER PRIMARY KEY,
+        kind TEXT NOT NULL,
+        ts TEXT NOT NULL,
+        session TEXT,
+        payload_bytes INTEGER NOT NULL CHECK (payload_bytes >= 0),
+        thread_id TEXT,
+        turn_id TEXT,
+        item_id TEXT,
+        item_type TEXT,
+        canonical_terminal INTEGER NOT NULL DEFAULT 0 CHECK (canonical_terminal IN (0, 1))
+      );
+      CREATE INDEX IF NOT EXISTS idx_journal_transient_kind_seq
+        ON journal_transient_event_index(kind, seq);
+      CREATE TABLE IF NOT EXISTS journal_transient_index_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        scanned_through INTEGER NOT NULL CHECK (scanned_through >= 0)
+      );
+      INSERT OR IGNORE INTO journal_transient_index_state (singleton, scanned_through)
+      VALUES (1, 0);
       CREATE TABLE IF NOT EXISTS journal_migrations (
         name TEXT PRIMARY KEY
       );
+      CREATE TABLE IF NOT EXISTS journal_compaction_runs (
+        operation_id TEXT PRIMARY KEY,
+        phase TEXT NOT NULL CHECK (
+          phase IN ('started', 'progress', 'completed', 'failed', 'unobservable')
+        ),
+        started_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        rows_deleted INTEGER NOT NULL CHECK (rows_deleted >= 0),
+        payload_bytes_deleted INTEGER NOT NULL CHECK (payload_bytes_deleted >= 0),
+        detail TEXT NOT NULL CHECK (length(detail) <= 512)
+      );
+      CREATE INDEX IF NOT EXISTS idx_journal_compaction_runs_updated
+        ON journal_compaction_runs(updated_at DESC, operation_id DESC);
 
       CREATE TRIGGER IF NOT EXISTS events_worker_cursor_advance
       AFTER INSERT ON events
@@ -170,7 +432,135 @@ export class Journal extends EventEmitter {
           wseq = 0,
           event_seq = excluded.event_seq;
       END;
+
+      CREATE TRIGGER IF NOT EXISTS events_session_index_insert
+      AFTER INSERT ON events
+      WHEN NEW.session IS NOT NULL
+      BEGIN
+        INSERT OR IGNORE INTO journal_session_event_index (session, seq) VALUES (NEW.session, NEW.seq);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS events_session_index_delete
+      AFTER DELETE ON events
+      WHEN OLD.session IS NOT NULL
+      BEGIN
+        DELETE FROM journal_session_event_index WHERE session = OLD.session AND seq = OLD.seq;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS events_session_index_frontier
+      AFTER INSERT ON events
+      BEGIN
+        UPDATE journal_session_index_state
+        SET scanned_through = NEW.seq
+        WHERE singleton = 1
+          AND scanned_through >= COALESCE(
+            (SELECT MAX(seq) FROM events WHERE seq < NEW.seq),
+            0
+          );
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS events_transient_index_insert
+      AFTER INSERT ON events
+      WHEN NEW.kind IN (
+        'claude/result',
+        'codex/item/completed',
+        'codex/turn/completed',
+        'codex/item/commandExecution/outputDelta',
+        'codex/item/agentMessage/delta',
+        'codex/turn/diff/updated'
+      )
+      BEGIN
+        INSERT OR REPLACE INTO journal_transient_event_index
+          (
+            seq,
+            kind,
+            ts,
+            session,
+            payload_bytes,
+            thread_id,
+            turn_id,
+            item_id,
+            item_type,
+            canonical_terminal
+          )
+        VALUES (
+          NEW.seq,
+          NEW.kind,
+          NEW.ts,
+          NEW.session,
+          length(CAST(NEW.payload AS BLOB)),
+          CASE WHEN json_valid(NEW.payload) THEN json_extract(NEW.payload, '$.threadId') END,
+          CASE
+            WHEN json_valid(NEW.payload) AND NEW.kind = 'codex/turn/completed'
+              THEN json_extract(NEW.payload, '$.turn.id')
+            WHEN json_valid(NEW.payload)
+              THEN json_extract(NEW.payload, '$.turnId')
+          END,
+          CASE WHEN json_valid(NEW.payload) THEN
+            COALESCE(
+              json_extract(NEW.payload, '$.item.id'),
+              json_extract(NEW.payload, '$.itemId')
+            )
+          END,
+          CASE WHEN json_valid(NEW.payload) THEN json_extract(NEW.payload, '$.item.type') END,
+          CASE
+            WHEN NEW.kind = 'codex/item/completed'
+              AND json_valid(NEW.payload)
+              AND (
+                (
+                  json_extract(NEW.payload, '$.item.type') = 'commandExecution'
+                  AND typeof(json_extract(NEW.payload, '$.item.aggregatedOutput')) = 'text'
+                )
+                OR (
+                  json_extract(NEW.payload, '$.item.type') = 'agentMessage'
+                  AND typeof(json_extract(NEW.payload, '$.item.text')) = 'text'
+                )
+              )
+            THEN 1
+            ELSE 0
+          END
+        );
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS events_transient_index_delete
+      AFTER DELETE ON events
+      BEGIN
+        DELETE FROM journal_transient_event_index WHERE seq = OLD.seq;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS events_transient_index_frontier
+      AFTER INSERT ON events
+      BEGIN
+        UPDATE journal_transient_index_state
+        SET scanned_through = NEW.seq
+        WHERE singleton = 1
+          AND scanned_through >= COALESCE(
+            (SELECT MAX(seq) FROM events WHERE seq < NEW.seq),
+            0
+          );
+      END;
     `)
+    const hasResetFloor =
+      (this.db
+        .prepare(
+          "SELECT 1 FROM pragma_table_info('journal_replay_state') WHERE name = 'reset_floor_seq'"
+        )
+        .get() as unknown) != null
+    if (!hasResetFloor) {
+      try {
+        this.db.exec(
+          'ALTER TABLE journal_replay_state ADD COLUMN reset_floor_seq INTEGER NOT NULL DEFAULT 0 CHECK (reset_floor_seq >= 0)'
+        )
+      } catch (error) {
+        const raced =
+          (this.db
+            .prepare(
+              "SELECT 1 FROM pragma_table_info('journal_replay_state') WHERE name = 'reset_floor_seq'"
+            )
+            .get() as unknown) != null
+        if (!raced) throw error
+      }
+    }
     // Additive migration for journals written before worker_cursors existed. Create the INSERT triggers
     // first, then backfill with INSERT/UPSERT: if the briefly-concurrent blue writes while green migrates,
     // its trigger-created row wins when newer and the backfill can only raise (never lower) that high-water.
@@ -317,6 +707,776 @@ export class Journal extends EventEmitter {
     return row?.m ?? 0
   }
 
+  recordCompactionLifecycle(
+    operationId: string,
+    phase: JournalCompactionPhase,
+    values: {
+      rowsDeleted?: number
+      payloadBytesDeleted?: number
+      detail: string
+      now?: string
+    }
+  ): JournalCompactionStatus {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(operationId)) {
+      throw new Error('journal compaction operation id is invalid')
+    }
+    if (!['started', 'progress', 'completed', 'failed', 'unobservable'].includes(phase)) {
+      throw new Error('journal compaction phase is invalid')
+    }
+    const rowsDeleted = values.rowsDeleted ?? 0
+    const payloadBytesDeleted = values.payloadBytesDeleted ?? 0
+    if (
+      !Number.isSafeInteger(rowsDeleted) ||
+      rowsDeleted < 0 ||
+      !Number.isSafeInteger(payloadBytesDeleted) ||
+      payloadBytesDeleted < 0
+    ) {
+      throw new Error('journal compaction counters are invalid')
+    }
+    const detail = values.detail.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 512)
+    const now = values.now ?? new Date().toISOString()
+    if (Number.isNaN(Date.parse(now)) || new Date(now).toISOString() !== now) {
+      throw new Error('journal compaction timestamp is invalid')
+    }
+    const status = this.db.transaction(() => {
+      const existing = this.db
+        .prepare(
+          `SELECT
+             operation_id AS operationId,
+             phase,
+             started_at AS startedAt,
+             updated_at AS updatedAt,
+             rows_deleted AS rowsDeleted,
+             payload_bytes_deleted AS payloadBytesDeleted,
+             detail
+           FROM journal_compaction_runs
+           WHERE operation_id = ?`
+        )
+        .get(operationId) as JournalCompactionStatus | undefined
+      if (!existing && phase !== 'started') {
+        throw new Error('journal compaction lifecycle has no started boundary')
+      }
+      if (existing) {
+        const terminal = ['completed', 'failed', 'unobservable'].includes(existing.phase)
+        if (terminal) {
+          if (
+            existing.phase === phase &&
+            existing.rowsDeleted === rowsDeleted &&
+            existing.payloadBytesDeleted === payloadBytesDeleted &&
+            existing.detail === detail
+          ) {
+            return existing
+          }
+          throw new Error('journal compaction lifecycle is already terminal')
+        }
+        if (phase === 'started') return existing
+      }
+      const startedAt = existing?.startedAt ?? now
+      const result: JournalCompactionStatus = {
+        operationId,
+        phase,
+        startedAt,
+        updatedAt: now,
+        rowsDeleted,
+        payloadBytesDeleted,
+        detail,
+      }
+      this.db
+        .prepare(
+          `INSERT INTO journal_compaction_runs
+             (operation_id, phase, started_at, updated_at, rows_deleted, payload_bytes_deleted, detail)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(operation_id) DO UPDATE SET
+             phase = excluded.phase,
+             updated_at = excluded.updated_at,
+             rows_deleted = excluded.rows_deleted,
+             payload_bytes_deleted = excluded.payload_bytes_deleted,
+             detail = excluded.detail`
+        )
+        .run(
+          operationId,
+          phase,
+          startedAt,
+          now,
+          rowsDeleted,
+          payloadBytesDeleted,
+          detail
+        )
+      this.append(null, `journal/compaction-${phase}`, result)
+      if (phase === 'completed' || phase === 'failed' || phase === 'unobservable') {
+        this.db
+          .prepare(
+            `DELETE FROM journal_compaction_runs
+             WHERE operation_id IN (
+               SELECT operation_id
+               FROM journal_compaction_runs
+               ORDER BY updated_at DESC, operation_id DESC
+               LIMIT -1 OFFSET 32
+             )`
+          )
+          .run()
+      }
+      return result
+    }).immediate()
+    return status
+  }
+
+  latestCompactionLifecycle(): JournalCompactionStatus | null {
+    const row = this.db
+      .prepare(
+        `SELECT
+           operation_id AS operationId,
+           phase,
+           started_at AS startedAt,
+           updated_at AS updatedAt,
+           rows_deleted AS rowsDeleted,
+           payload_bytes_deleted AS payloadBytesDeleted,
+           detail
+         FROM journal_compaction_runs
+         ORDER BY updated_at DESC, operation_id DESC
+         LIMIT 1`
+      )
+      .get() as JournalCompactionStatus | undefined
+    return row ?? null
+  }
+
+  /**
+   * The small authority used by a cold client instead of replaying from zero. `generation` changes in the
+   * same transaction as every destructive rewrite; `cursor` is the exact event high-water in this SQLite
+   * snapshot. Callers that also need materialized state use {@link readReplaySnapshot} so those values and
+   * the watermark cannot straddle a concurrent append.
+   */
+  replayCheckpoint(): ReplayCheckpoint {
+    const state = this.db
+      .prepare(
+        'SELECT generation, reset_floor_seq AS resetFloorSeq FROM journal_replay_state WHERE singleton = 1'
+      )
+      .get() as { generation?: unknown; resetFloorSeq?: unknown } | undefined
+    const generation = state?.generation
+    const resetFloorSeq = state?.resetFloorSeq
+    const cursor = this.db.prepare('SELECT COALESCE(MAX(seq), 0) FROM events').pluck().get()
+    if (
+      typeof generation !== 'number' ||
+      !Number.isSafeInteger(generation) ||
+      generation < 1 ||
+      typeof resetFloorSeq !== 'number' ||
+      !Number.isSafeInteger(resetFloorSeq) ||
+      resetFloorSeq < 0 ||
+      typeof cursor !== 'number' ||
+      !Number.isSafeInteger(cursor) ||
+      cursor < 0
+    ) {
+      throw new Error('journal replay checkpoint is invalid')
+    }
+    return {
+      version: JOURNAL_REPLAY_PROTOCOL_VERSION,
+      generation,
+      cursor,
+      resetFloorSeq,
+    }
+  }
+
+  /**
+   * Establish one SQLite read snapshot before evaluating current-state repositories that share this
+   * connection. The callback must remain synchronous: an await would retain a read transaction across an
+   * arbitrary event-loop turn and could pin the WAL.
+   */
+  readReplaySnapshot<T>(read: (checkpoint: ReplayCheckpoint) => T): T {
+    const ownsSnapshot = !this.db.inTransaction
+    if (ownsSnapshot) this.db.exec('BEGIN DEFERRED')
+    try {
+      const checkpoint = this.replayCheckpoint()
+      const value = read(checkpoint)
+      if (value instanceof Promise) throw new Error('replay snapshot callback must be synchronous')
+      return value
+    } finally {
+      if (ownsSnapshot && this.db.inTransaction) this.db.exec('COMMIT')
+    }
+  }
+
+  /**
+   * Latest bounded journal rows for one hub-native chat. The result is returned oldest-to-newest so a
+   * side-effect-free transcript reducer can consume it directly; `olderCursor` is exclusive on the next
+   * request. A single row larger than the page budget is explicit rather than an infinite retry loop.
+   */
+  sessionHistoryPage(
+    sessionId: string,
+    options: {
+      beforeSeq?: number
+      maxRows?: number
+      maxBytes?: number
+      expectedGeneration?: number
+    } = {}
+  ): SessionHistoryPage {
+    if (!sessionId || sessionId.length > 256) throw new Error('invalid session id')
+    const maxRows = options.maxRows ?? JOURNAL_HISTORY_PAGE_MAX_ROWS
+    const maxBytes = options.maxBytes ?? JOURNAL_HISTORY_PAGE_MAX_BYTES
+    for (const [name, value, maximum] of [
+      ['maxRows', maxRows, JOURNAL_HISTORY_PAGE_MAX_ROWS],
+      ['maxBytes', maxBytes, JOURNAL_HISTORY_PAGE_MAX_BYTES],
+    ] as const) {
+      if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
+        throw new Error(`${name} is outside the supported history-page bound`)
+      }
+    }
+    return this.readReplaySnapshot((checkpoint) => {
+      if (
+        options.expectedGeneration !== undefined &&
+        options.expectedGeneration !== checkpoint.generation
+      ) {
+        throw new ReplayGenerationChangedError(options.expectedGeneration, checkpoint.generation)
+      }
+      const indexedThrough = this.db
+        .prepare('SELECT scanned_through FROM journal_session_index_state WHERE singleton = 1')
+        .pluck()
+        .get()
+      if (
+        typeof indexedThrough !== 'number' ||
+        !Number.isSafeInteger(indexedThrough) ||
+        indexedThrough < checkpoint.cursor
+      ) {
+        throw new SessionHistoryIndexingError(
+          typeof indexedThrough === 'number' && Number.isSafeInteger(indexedThrough)
+            ? indexedThrough
+            : 0,
+          checkpoint.cursor
+        )
+      }
+      const beforeSeq = options.beforeSeq ?? checkpoint.cursor + 1
+      if (!Number.isSafeInteger(beforeSeq) || beforeSeq < 1) {
+        throw new Error('beforeSeq is outside the supported history-page bound')
+      }
+      const rows = this.db
+        .prepare(
+          `SELECT
+             event.seq,
+             event.ts,
+             event.session,
+             event.kind,
+             CASE
+               WHEN length(CAST(event.payload AS BLOB)) <= ? THEN event.payload
+               ELSE NULL
+             END AS payload,
+             length(CAST(event.payload AS BLOB)) AS payload_bytes
+           FROM journal_session_event_index AS session_event
+           JOIN events AS event ON event.seq = session_event.seq
+           WHERE session_event.session = ? AND session_event.seq < ?
+           ORDER BY session_event.seq DESC
+           LIMIT ?`
+        )
+        .all(maxBytes, sessionId, beforeSeq, maxRows + 1) as Array<{
+        seq: number
+        ts: string
+        session: string
+        kind: string
+        payload: string | null
+        payload_bytes: number
+      }>
+      const selected: HubEvent[] = []
+      let encodedBytes = 0
+      let hasOlder = rows.length > maxRows
+      for (const row of rows.slice(0, maxRows)) {
+        const envelopeBytes =
+          Buffer.byteLength(
+            JSON.stringify({
+              seq: row.seq,
+              ts: row.ts,
+              sessionId: row.session,
+              kind: row.kind,
+              payload: null,
+            })
+          ) -
+          Buffer.byteLength('null') +
+          row.payload_bytes
+        let event: HubEvent
+        let bytes: number
+        if (envelopeBytes > maxBytes || row.payload === null) {
+          event = {
+            seq: row.seq,
+            ts: row.ts,
+            sessionId: row.session,
+            kind: 'journal/history-event-oversized',
+            payload: {
+              originalKind: row.kind,
+              originalPayloadBytes: row.payload_bytes,
+              message:
+                'This retained history event is larger than the bounded history page and was not transferred.',
+            },
+          }
+          bytes = Buffer.byteLength(JSON.stringify(event))
+        } else {
+          event = {
+            seq: row.seq,
+            ts: row.ts,
+            sessionId: row.session,
+            kind: row.kind,
+            payload: parsePayload(row.payload, row.seq),
+          }
+          bytes = Buffer.byteLength(JSON.stringify(event))
+          if (bytes > maxBytes) {
+            throw new Error('journal history payload changed while building its bounded page')
+          }
+        }
+        if (encodedBytes + bytes > maxBytes) {
+          hasOlder = true
+          break
+        }
+        selected.push(event)
+        encodedBytes += bytes
+      }
+      selected.reverse()
+      return {
+        events: selected,
+        olderCursor: hasOlder ? (selected[0]?.seq ?? null) : null,
+        hasOlder,
+        encodedBytes,
+        checkpointGeneration: checkpoint.generation,
+      }
+    })
+  }
+
+  /**
+   * Crash-resumable post-ready projection used by bounded per-session history. It advances in small writer
+   * transactions instead of creating a giant `(session,seq)` index synchronously while a 981 MB journal is
+   * booting. INSERT/DELETE triggers keep already-projected and newly appended rows exact.
+   */
+  backfillSessionEventIndex(maxRows = 5_000): {
+    rowsIndexed: number
+    scannedThrough: number
+    target: number
+    complete: boolean
+  } {
+    if (!Number.isSafeInteger(maxRows) || maxRows < 1 || maxRows > 50_000) {
+      throw new Error('session history index batch is outside the supported bound')
+    }
+    return this.db.transaction(() => {
+      const scanned = this.db
+        .prepare('SELECT scanned_through FROM journal_session_index_state WHERE singleton = 1')
+        .pluck()
+        .get()
+      if (typeof scanned !== 'number' || !Number.isSafeInteger(scanned) || scanned < 0) {
+        throw new Error('journal session history index state is invalid')
+      }
+      const target = this.db.prepare('SELECT COALESCE(MAX(seq), 0) FROM events').pluck().get()
+      if (typeof target !== 'number' || !Number.isSafeInteger(target) || target < 0) {
+        throw new Error('journal session history index target is invalid')
+      }
+      const rows = this.db
+        .prepare(
+          `SELECT seq, session
+           FROM events
+           WHERE seq > ?
+           ORDER BY seq
+           LIMIT ?`
+        )
+        .all(scanned, maxRows) as Array<{ seq: number; session: string | null }>
+      const insert = this.db.prepare(
+        'INSERT OR IGNORE INTO journal_session_event_index (session, seq) VALUES (?, ?)'
+      )
+      let rowsIndexed = 0
+      for (const row of rows) {
+        if (row.session !== null) rowsIndexed += insert.run(row.session, row.seq).changes
+      }
+      const scannedThrough = Math.max(scanned, rows.at(-1)?.seq ?? target)
+      this.db
+        .prepare(
+          'UPDATE journal_session_index_state SET scanned_through = ? WHERE singleton = 1'
+        )
+        .run(scannedThrough)
+      return {
+        rowsIndexed,
+        scannedThrough,
+        target,
+        complete: scannedThrough >= target,
+      }
+    }).immediate()
+  }
+
+  /**
+   * Crash-resumable post-ready projection for the bounded maintenance kinds. The projection and
+   * its small `(kind,seq)` index start empty, so an upgraded 981 MB journal never pays a synchronous
+   * full-table index build during boot or its first maintenance pass. Database triggers cover new rows
+   * while bounded batches advance the durable frontier across existing rows.
+   */
+  backfillTransientEventIndex(maxRows = 5_000): {
+    rowsIndexed: number
+    scannedThrough: number
+    target: number
+    complete: boolean
+  } {
+    if (!Number.isSafeInteger(maxRows) || maxRows < 1 || maxRows > 50_000) {
+      throw new Error('transient maintenance index batch is outside the supported bound')
+    }
+    return this.db.transaction(() => {
+      const scanned = this.db
+        .prepare('SELECT scanned_through FROM journal_transient_index_state WHERE singleton = 1')
+        .pluck()
+        .get()
+      if (typeof scanned !== 'number' || !Number.isSafeInteger(scanned) || scanned < 0) {
+        throw new Error('journal transient maintenance index state is invalid')
+      }
+      const target = this.db.prepare('SELECT COALESCE(MAX(seq), 0) FROM events').pluck().get()
+      if (typeof target !== 'number' || !Number.isSafeInteger(target) || target < 0) {
+        throw new Error('journal transient maintenance index target is invalid')
+      }
+      const rows = this.db
+        .prepare(
+          `SELECT
+             seq,
+             kind,
+             ts,
+             session,
+             length(CAST(payload AS BLOB)) AS payload_bytes,
+             CASE WHEN json_valid(payload) THEN json_extract(payload, '$.threadId') END AS thread_id,
+             CASE
+               WHEN json_valid(payload) AND kind = 'codex/turn/completed'
+                 THEN json_extract(payload, '$.turn.id')
+               WHEN json_valid(payload)
+                 THEN json_extract(payload, '$.turnId')
+             END AS turn_id,
+             CASE WHEN json_valid(payload) THEN
+               COALESCE(json_extract(payload, '$.item.id'), json_extract(payload, '$.itemId'))
+             END AS item_id,
+             CASE WHEN json_valid(payload) THEN json_extract(payload, '$.item.type') END AS item_type,
+             CASE
+               WHEN kind = 'codex/item/completed'
+                 AND json_valid(payload)
+                 AND (
+                   (
+                     json_extract(payload, '$.item.type') = 'commandExecution'
+                     AND typeof(json_extract(payload, '$.item.aggregatedOutput')) = 'text'
+                   )
+                   OR (
+                     json_extract(payload, '$.item.type') = 'agentMessage'
+                     AND typeof(json_extract(payload, '$.item.text')) = 'text'
+                   )
+                 )
+               THEN 1
+               ELSE 0
+             END AS canonical_terminal
+           FROM events
+           WHERE seq > ?
+           ORDER BY seq
+           LIMIT ?`
+        )
+        .all(scanned, maxRows) as Array<{
+        seq: number
+        kind: string
+        ts: string
+        session: string | null
+        payload_bytes: number
+        thread_id: string | null
+        turn_id: string | null
+        item_id: string | null
+        item_type: string | null
+        canonical_terminal: number
+      }>
+      const insert = this.db.prepare(
+        `INSERT OR IGNORE INTO journal_transient_event_index
+           (
+             seq,
+             kind,
+             ts,
+             session,
+             payload_bytes,
+             thread_id,
+             turn_id,
+             item_id,
+             item_type,
+             canonical_terminal
+           )
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+         WHERE ? IN (
+           'claude/result',
+           'codex/item/completed',
+           'codex/turn/completed',
+           'codex/item/commandExecution/outputDelta',
+           'codex/item/agentMessage/delta',
+           'codex/turn/diff/updated'
+         )`
+      )
+      let rowsIndexed = 0
+      for (const row of rows) {
+        rowsIndexed += insert
+          .run(
+            row.seq,
+            row.kind,
+            row.ts,
+            row.session,
+            row.payload_bytes,
+            row.thread_id,
+            row.turn_id,
+            row.item_id,
+            row.item_type,
+            row.canonical_terminal,
+            row.kind
+          )
+          .changes
+      }
+      const scannedThrough = Math.max(scanned, rows.at(-1)?.seq ?? target)
+      this.db
+        .prepare(
+          'UPDATE journal_transient_index_state SET scanned_through = ? WHERE singleton = 1'
+        )
+        .run(scannedThrough)
+      return {
+        rowsIndexed,
+        scannedThrough,
+        target,
+        complete: scannedThrough >= target,
+      }
+    }).immediate()
+  }
+
+  /**
+   * Read a replay page without decoding a row until its stored JSON bytes fit both the frame and remaining
+   * page budgets. This is the authority used by the WebSocket catch-up path; `since()` remains a convenient
+   * diagnostic API but is deliberately not used for bounded transport.
+   */
+  boundedReplayPage(
+    afterSeq: number,
+    throughSeq: number,
+    options: {
+      maxRows: number
+      maxBytes: number
+      maxFrameBytes: number
+    }
+  ): BoundedReplayPage {
+    for (const [name, value, maximum] of [
+      ['afterSeq', afterSeq, Number.MAX_SAFE_INTEGER],
+      ['throughSeq', throughSeq, Number.MAX_SAFE_INTEGER],
+      ['maxRows', options.maxRows, 5_000],
+      ['maxBytes', options.maxBytes, 2 * 1024 * 1024],
+      ['maxFrameBytes', options.maxFrameBytes, 512 * 1024],
+    ] as const) {
+      if (!Number.isSafeInteger(value) || value < (name.startsWith('max') ? 1 : 0) || value > maximum) {
+        throw new Error(`${name} is outside the supported bounded replay range`)
+      }
+    }
+    if (throughSeq < afterSeq) throw new Error('bounded replay high-water precedes its cursor')
+    return this.readReplaySnapshot((checkpoint) => {
+      const rawPayloadLimit = Math.min(options.maxFrameBytes, options.maxBytes)
+      const rows = this.db
+        .prepare(
+          `SELECT
+             seq,
+             ts,
+             session,
+             kind,
+             CASE
+               WHEN length(CAST(payload AS BLOB)) <= ? THEN payload
+               ELSE NULL
+             END AS payload,
+             length(CAST(payload AS BLOB)) AS payload_bytes
+           FROM events
+           WHERE seq > ? AND seq <= ?
+           ORDER BY seq ASC
+           LIMIT ?`
+        )
+        .all(rawPayloadLimit, afterSeq, throughSeq, options.maxRows + 1) as Array<{
+        seq: number
+        ts: string
+        session: string | null
+        kind: string
+        payload: string | null
+        payload_bytes: number
+      }>
+      const events: HubEvent[] = []
+      let encodedBytes = 0
+      for (const row of rows.slice(0, options.maxRows)) {
+        const envelopeBytes =
+          Buffer.byteLength(
+            JSON.stringify({
+              seq: row.seq,
+              ts: row.ts,
+              sessionId: row.session,
+              kind: row.kind,
+              payload: null,
+            })
+          ) -
+          Buffer.byteLength('null') +
+          row.payload_bytes
+        if (envelopeBytes > options.maxFrameBytes || row.payload === null) {
+          return {
+            checkpoint,
+            events,
+            lastSeq: events.at(-1)?.seq ?? afterSeq,
+            hasMore: true,
+            encodedBytes,
+            tooLarge: { seq: row.seq, encodedBytes: envelopeBytes },
+          }
+        }
+        if (encodedBytes + envelopeBytes > options.maxBytes) break
+        const event: HubEvent = {
+          seq: row.seq,
+          ts: row.ts,
+          sessionId: row.session,
+          kind: row.kind,
+          payload: parsePayload(row.payload, row.seq),
+        }
+        const bytes = Buffer.byteLength(JSON.stringify(event))
+        if (bytes > options.maxFrameBytes) {
+          return {
+            checkpoint,
+            events,
+            lastSeq: events.at(-1)?.seq ?? afterSeq,
+            hasMore: true,
+            encodedBytes,
+            tooLarge: { seq: row.seq, encodedBytes: bytes },
+          }
+        }
+        if (encodedBytes + bytes > options.maxBytes) break
+        events.push(event)
+        encodedBytes += bytes
+      }
+      const lastSeq = events.at(-1)?.seq ?? afterSeq
+      return {
+        checkpoint,
+        events,
+        lastSeq,
+        hasMore: lastSeq < throughSeq,
+        encodedBytes,
+      }
+    })
+  }
+
+  private advanceReplayGeneration(now: string, changedThroughSeq: number): void {
+    if (
+      !Number.isSafeInteger(changedThroughSeq) ||
+      changedThroughSeq < 0
+    ) {
+      throw new Error('journal replay reset floor is invalid')
+    }
+    const changed = this.db
+      .prepare(
+        `UPDATE journal_replay_state
+         SET generation = generation + 1,
+             reset_floor_seq = MAX(reset_floor_seq, ?),
+             updated_at = ?
+         WHERE singleton = 1 AND generation < 9007199254740991`
+      )
+      .run(changedThroughSeq, now)
+    if (changed.changes !== 1) throw new Error('journal replay generation cannot advance safely')
+  }
+
+  /**
+   * Highest event that is currently a safe superseded-stream deletion candidate.
+   *
+   * Maintenance freezes this frontier after its bounded projection catches up, then verifies snapshot
+   * coverage through exactly this value. Lifecycle/progress rows written after that point cannot move the
+   * authorization goalpost, and a later candidate remains untouched until a later verified operation.
+   */
+  condensationCandidateFrontier(
+    options: Pick<
+      JournalCondenseOptions,
+      'nowMs' | 'graceMs' | 'maxTransientPayloadBytes'
+    > = {}
+  ): number {
+    const nowMs = options.nowMs ?? Date.now()
+    const graceMs = options.graceMs ?? JOURNAL_CONDENSE_GRACE_MS
+    const maxTransientPayloadBytes =
+      options.maxTransientPayloadBytes ?? JOURNAL_CONDENSE_MAX_TRANSIENT_BYTES
+    for (const [name, value] of [
+      ['nowMs', nowMs],
+      ['graceMs', graceMs],
+      ['maxTransientPayloadBytes', maxTransientPayloadBytes],
+    ] as const) {
+      if (!Number.isFinite(value) || value < 0) {
+        throw new Error(`${name} must be a finite non-negative number`)
+      }
+    }
+    const indexedThrough = this.db
+      .prepare('SELECT scanned_through FROM journal_transient_index_state WHERE singleton = 1')
+      .pluck()
+      .get()
+    const target = this.db.prepare('SELECT COALESCE(MAX(seq), 0) FROM events').pluck().get()
+    if (
+      typeof indexedThrough !== 'number' ||
+      !Number.isSafeInteger(indexedThrough) ||
+      typeof target !== 'number' ||
+      !Number.isSafeInteger(target)
+    ) {
+      throw new Error('journal transient maintenance projection state is invalid')
+    }
+    if (indexedThrough < target) throw new TransientHistoryIndexingError(indexedThrough, target)
+    const cutoff = new Date(nowMs - graceMs).toISOString()
+    const row = this.db
+      .prepare(
+        `SELECT COALESCE(MAX(candidate.seq), 0) AS frontier
+         FROM journal_transient_event_index AS candidate
+         WHERE candidate.ts <= ?
+           AND candidate.payload_bytes <= ?
+           AND (
+             (
+               candidate.kind = 'codex/item/commandExecution/outputDelta'
+               AND candidate.session IS NOT NULL
+               AND candidate.thread_id IS NOT NULL
+               AND candidate.turn_id IS NOT NULL
+               AND candidate.item_id IS NOT NULL
+               AND EXISTS (
+                 SELECT 1
+                 FROM journal_transient_event_index AS terminal
+                 WHERE terminal.kind = 'codex/item/completed'
+                   AND terminal.ts <= ?
+                   AND terminal.session = candidate.session
+                   AND terminal.thread_id = candidate.thread_id
+                   AND terminal.turn_id = candidate.turn_id
+                   AND terminal.item_id = candidate.item_id
+                   AND terminal.item_type = 'commandExecution'
+                   AND terminal.canonical_terminal = 1
+               )
+             )
+             OR (
+               candidate.kind = 'codex/item/agentMessage/delta'
+               AND candidate.session IS NOT NULL
+               AND candidate.thread_id IS NOT NULL
+               AND candidate.turn_id IS NOT NULL
+               AND candidate.item_id IS NOT NULL
+               AND EXISTS (
+                 SELECT 1
+                 FROM journal_transient_event_index AS terminal
+                 WHERE terminal.kind = 'codex/item/completed'
+                   AND terminal.ts <= ?
+                   AND terminal.session = candidate.session
+                   AND terminal.thread_id = candidate.thread_id
+                   AND terminal.turn_id = candidate.turn_id
+                   AND terminal.item_id = candidate.item_id
+                   AND terminal.item_type = 'agentMessage'
+                   AND terminal.canonical_terminal = 1
+               )
+             )
+             OR (
+               candidate.kind = 'codex/turn/diff/updated'
+               AND candidate.session IS NOT NULL
+               AND candidate.thread_id IS NOT NULL
+               AND candidate.turn_id IS NOT NULL
+               AND candidate.seq < (
+                 SELECT MAX(newer.seq)
+                 FROM journal_transient_event_index AS newer
+                 WHERE newer.kind = 'codex/turn/diff/updated'
+                   AND newer.session = candidate.session
+                   AND newer.thread_id = candidate.thread_id
+                   AND newer.turn_id = candidate.turn_id
+               )
+             )
+           )`
+      )
+      .get(
+        cutoff,
+        Math.floor(maxTransientPayloadBytes),
+        cutoff,
+        cutoff
+      ) as { frontier: unknown }
+    if (
+      typeof row.frontier !== 'number' ||
+      !Number.isSafeInteger(row.frontier) ||
+      row.frontier < 0
+    ) {
+      throw new Error('journal condensation candidate frontier is invalid')
+    }
+    return row.frontier
+  }
+
   /**
    * Condense the two measured Codex firehoses, then project old completed turns into bounded history.
    *
@@ -339,8 +1499,13 @@ export class Journal extends EventEmitter {
   condenseCompletedCodex(options: JournalCondenseOptions = {}): JournalCondenseResult {
     const nowMs = options.nowMs ?? Date.now()
     const graceMs = options.graceMs ?? JOURNAL_CONDENSE_GRACE_MS
+    const deleteThroughSeq = options.deleteThroughSeq ?? Number.MAX_SAFE_INTEGER
     const maxCommandOutputDeltas = options.maxCommandOutputDeltas ?? JOURNAL_CONDENSE_MAX_COMMAND_DELTAS
+    const maxAgentMessageDeltas =
+      options.maxAgentMessageDeltas ?? JOURNAL_CONDENSE_MAX_AGENT_MESSAGE_DELTAS
     const maxDiffSnapshots = options.maxDiffSnapshots ?? JOURNAL_CONDENSE_MAX_DIFF_SNAPSHOTS
+    const maxTransientPayloadBytes =
+      options.maxTransientPayloadBytes ?? JOURNAL_CONDENSE_MAX_TRANSIENT_BYTES
     const historyGraceMs = options.historyGraceMs ?? JOURNAL_HISTORY_GRACE_MS
     const historyRetentionMs = options.historyRetentionMs ?? JOURNAL_HISTORY_RETENTION_MS
     const maxHistoryTurns = options.maxHistoryTurns ?? JOURNAL_HISTORY_MAX_TURNS
@@ -352,8 +1517,11 @@ export class Journal extends EventEmitter {
     for (const [name, value] of [
       ['nowMs', nowMs],
       ['graceMs', graceMs],
+      ['deleteThroughSeq', deleteThroughSeq],
       ['maxCommandOutputDeltas', maxCommandOutputDeltas],
+      ['maxAgentMessageDeltas', maxAgentMessageDeltas],
       ['maxDiffSnapshots', maxDiffSnapshots],
+      ['maxTransientPayloadBytes', maxTransientPayloadBytes],
       ['historyGraceMs', historyGraceMs],
       ['historyRetentionMs', historyRetentionMs],
       ['maxHistoryTurns', maxHistoryTurns],
@@ -365,8 +1533,13 @@ export class Journal extends EventEmitter {
     ] as const) {
       if (!Number.isFinite(value) || value < 0) throw new Error(`${name} must be a finite non-negative number`)
     }
+    if (!Number.isSafeInteger(deleteThroughSeq)) {
+      throw new Error('deleteThroughSeq must be a safe integer')
+    }
     const commandLimit = Math.floor(maxCommandOutputDeltas)
+    const messageLimit = Math.floor(maxAgentMessageDeltas)
     const diffLimit = Math.floor(maxDiffSnapshots)
+    const transientByteLimit = Math.floor(maxTransientPayloadBytes)
     const now = new Date(nowMs).toISOString()
     const cutoff = new Date(nowMs - graceMs).toISOString()
     // Replication is opt-in for existing journals. Once configured, however, it is a hard deletion gate:
@@ -374,22 +1547,25 @@ export class Journal extends EventEmitter {
     // DELETE/UPDATE path by the kth replica's durable snapshot seq. An offline fleet therefore grows past
     // its last verified watermark; it never quietly trades the only archive copy for free disk.
     const replication = reserveReplicationPruneGate(this.db)
-    const maxPrunableSeq = replication.maxPrunableSeq
+    const maxPrunableSeq = Math.min(replication.maxPrunableSeq, deleteThroughSeq)
+    const transientIndexedThrough = this.db
+      .prepare('SELECT scanned_through FROM journal_transient_index_state WHERE singleton = 1')
+      .pluck()
+      .get()
+    const transientTarget = this.db.prepare('SELECT COALESCE(MAX(seq), 0) FROM events').pluck().get()
+    if (
+      typeof transientIndexedThrough !== 'number' ||
+      !Number.isSafeInteger(transientIndexedThrough) ||
+      typeof transientTarget !== 'number' ||
+      !Number.isSafeInteger(transientTarget)
+    ) {
+      throw new Error('journal transient maintenance projection state is invalid')
+    }
+    if (transientIndexedThrough < transientTarget) {
+      throw new TransientHistoryIndexingError(transientIndexedThrough, transientTarget)
+    }
 
-    // Built lazily by the maintenance child, after the hub is healthy. Creating an index over the operator's
-    // existing 375k-row journal at boot would turn a recoverability feature into a new deterministic boot
-    // dependency. The partial indexes cover only the four maintenance kinds; ordinary durable events pay no
-    // index write cost.
     this.db.exec(`
-      CREATE INDEX IF NOT EXISTS idx_events_condense_command_completed
-        ON events (ts, seq) WHERE kind = 'codex/item/completed';
-      CREATE INDEX IF NOT EXISTS idx_events_condense_turn_completed
-        ON events (ts, seq) WHERE kind = 'codex/turn/completed';
-      CREATE INDEX IF NOT EXISTS idx_events_condense_command_delta
-        ON events (seq) WHERE kind = 'codex/item/commandExecution/outputDelta';
-      CREATE INDEX IF NOT EXISTS idx_events_condense_diff
-        ON events (seq) WHERE kind = 'codex/turn/diff/updated';
-
       CREATE TEMP TABLE IF NOT EXISTS journal_condense_commands (
         session TEXT NOT NULL,
         thread_id TEXT NOT NULL,
@@ -397,17 +1573,19 @@ export class Journal extends EventEmitter {
         item_id TEXT NOT NULL,
         PRIMARY KEY (session, thread_id, turn_id, item_id)
       ) WITHOUT ROWID;
-      CREATE TEMP TABLE IF NOT EXISTS journal_condense_turns (
+      CREATE TEMP TABLE IF NOT EXISTS journal_condense_messages (
         session TEXT NOT NULL,
         thread_id TEXT NOT NULL,
         turn_id TEXT NOT NULL,
-        PRIMARY KEY (session, thread_id, turn_id)
+        item_id TEXT NOT NULL,
+        PRIMARY KEY (session, thread_id, turn_id, item_id)
       ) WITHOUT ROWID;
       CREATE TEMP TABLE IF NOT EXISTS journal_condense_diff_keep (
         seq INTEGER PRIMARY KEY
       );
       CREATE TEMP TABLE IF NOT EXISTS journal_condense_delete (
-        seq INTEGER PRIMARY KEY
+        seq INTEGER PRIMARY KEY,
+        payload_bytes INTEGER NOT NULL
       );
     `)
 
@@ -418,7 +1596,7 @@ export class Journal extends EventEmitter {
     const selectCandidates = (): void => {
       this.db.exec(`
         DELETE FROM journal_condense_commands;
-        DELETE FROM journal_condense_turns;
+        DELETE FROM journal_condense_messages;
         DELETE FROM journal_condense_diff_keep;
         DELETE FROM journal_condense_delete;
       `)
@@ -426,77 +1604,52 @@ export class Journal extends EventEmitter {
         .prepare(
           `INSERT OR IGNORE INTO journal_condense_commands (session, thread_id, turn_id, item_id)
            SELECT session, thread_id, turn_id, item_id
-           FROM (
-             SELECT
-               session,
-               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.threadId') END AS thread_id,
-               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.turnId') END AS turn_id,
-               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.item.id') END AS item_id,
-               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.item.type') END AS item_type,
-               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.item.aggregatedOutput') END AS final_output
-             FROM events
-             WHERE kind = 'codex/item/completed' AND ts <= ? AND session IS NOT NULL
-           )
-           WHERE typeof(thread_id) = 'text'
-             AND typeof(turn_id) = 'text'
-             AND typeof(item_id) = 'text'
+           FROM journal_transient_event_index
+           WHERE kind = 'codex/item/completed'
+             AND ts <= ?
+             AND session IS NOT NULL
+             AND thread_id IS NOT NULL
+             AND turn_id IS NOT NULL
+             AND item_id IS NOT NULL
              AND item_type = 'commandExecution'
-             AND typeof(final_output) = 'text'`
+             AND canonical_terminal = 1`
         )
         .run(cutoff)
       this.db
         .prepare(
-          `INSERT OR IGNORE INTO journal_condense_turns (session, thread_id, turn_id)
-           SELECT session, thread_id, turn_id
-           FROM (
-             SELECT
-               session,
-               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.threadId') END AS thread_id,
-               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.turn.id') END AS turn_id
-             FROM events
-             WHERE kind = 'codex/turn/completed' AND ts <= ? AND session IS NOT NULL
-           )
-           WHERE typeof(thread_id) = 'text' AND typeof(turn_id) = 'text'`
+          `INSERT OR IGNORE INTO journal_condense_messages (session, thread_id, turn_id, item_id)
+           SELECT session, thread_id, turn_id, item_id
+           FROM journal_transient_event_index
+           WHERE kind = 'codex/item/completed'
+             AND ts <= ?
+             AND session IS NOT NULL
+             AND thread_id IS NOT NULL
+             AND turn_id IS NOT NULL
+             AND item_id IS NOT NULL
+             AND item_type = 'agentMessage'
+             AND canonical_terminal = 1`
         )
         .run(cutoff)
-
-      // The final diff is itself authoritative: turn/completed carries status/items but no patch. Compute the
-      // newest valid snapshot across the whole matched turn (not merely before cutoff), then exclude it.
+      // App-server defines turn/diff/updated as the WHOLE current cumulative patch, not a delta. Keep the
+      // newest well-correlated snapshot for every turn even if its terminal went missing during a provider
+      // crash; older snapshots are superseded by that row without making any claim about the turn outcome.
+      // Invalid/missing identities never enter this table and therefore fail closed.
       this.db.exec(`
         INSERT OR IGNORE INTO journal_condense_diff_keep (seq)
-        SELECT MAX(candidate.seq)
-        FROM (
-          SELECT
-            seq,
-            session,
-            CASE WHEN json_valid(payload) THEN json_extract(payload, '$.threadId') END AS thread_id,
-            CASE WHEN json_valid(payload) THEN json_extract(payload, '$.turnId') END AS turn_id
-          FROM events
-          WHERE kind = 'codex/turn/diff/updated' AND session IS NOT NULL
-        ) AS candidate
-        JOIN journal_condense_turns AS terminal
-          ON terminal.session = candidate.session
-         AND terminal.thread_id = candidate.thread_id
-         AND terminal.turn_id = candidate.turn_id
-        WHERE typeof(candidate.thread_id) = 'text' AND typeof(candidate.turn_id) = 'text'
-        GROUP BY candidate.session, candidate.thread_id, candidate.turn_id;
+        SELECT MAX(seq)
+        FROM journal_transient_event_index
+        WHERE kind = 'codex/turn/diff/updated'
+          AND session IS NOT NULL
+          AND thread_id IS NOT NULL
+          AND turn_id IS NOT NULL
+        GROUP BY session, thread_id, turn_id;
       `)
 
       this.db
         .prepare(
-          `INSERT OR IGNORE INTO journal_condense_delete (seq)
-           SELECT candidate.seq
-           FROM (
-             SELECT
-               seq,
-               ts,
-               session,
-               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.threadId') END AS thread_id,
-               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.turnId') END AS turn_id,
-               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.itemId') END AS item_id
-             FROM events
-             WHERE kind = 'codex/item/commandExecution/outputDelta' AND session IS NOT NULL
-           ) AS candidate
+          `INSERT OR IGNORE INTO journal_condense_delete (seq, payload_bytes)
+           SELECT candidate.seq, candidate.payload_bytes
+           FROM journal_transient_event_index AS candidate
            JOIN journal_condense_commands AS terminal
              ON terminal.session = candidate.session
             AND terminal.thread_id = candidate.thread_id
@@ -504,48 +1657,100 @@ export class Journal extends EventEmitter {
             AND terminal.item_id = candidate.item_id
            WHERE candidate.ts <= ?
              AND candidate.seq <= ?
-             AND typeof(candidate.thread_id) = 'text'
-             AND typeof(candidate.turn_id) = 'text'
-             AND typeof(candidate.item_id) = 'text'
+             AND candidate.kind = 'codex/item/commandExecution/outputDelta'
+             AND candidate.session IS NOT NULL
+             AND candidate.thread_id IS NOT NULL
+             AND candidate.turn_id IS NOT NULL
+             AND candidate.item_id IS NOT NULL
            ORDER BY candidate.seq
            LIMIT ?`
         )
         .run(cutoff, maxPrunableSeq, commandLimit)
       this.db
         .prepare(
-          `INSERT OR IGNORE INTO journal_condense_delete (seq)
-           SELECT candidate.seq
-           FROM (
-             SELECT
-               seq,
-               ts,
-               session,
-               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.threadId') END AS thread_id,
-               CASE WHEN json_valid(payload) THEN json_extract(payload, '$.turnId') END AS turn_id
-             FROM events
-             WHERE kind = 'codex/turn/diff/updated' AND session IS NOT NULL
-           ) AS candidate
-           JOIN journal_condense_turns AS terminal
+          `INSERT OR IGNORE INTO journal_condense_delete (seq, payload_bytes)
+           SELECT candidate.seq, candidate.payload_bytes
+           FROM journal_transient_event_index AS candidate
+           JOIN journal_condense_messages AS terminal
              ON terminal.session = candidate.session
             AND terminal.thread_id = candidate.thread_id
             AND terminal.turn_id = candidate.turn_id
+            AND terminal.item_id = candidate.item_id
+           WHERE candidate.ts <= ?
+             AND candidate.seq <= ?
+             AND candidate.kind = 'codex/item/agentMessage/delta'
+             AND candidate.session IS NOT NULL
+             AND candidate.thread_id IS NOT NULL
+             AND candidate.turn_id IS NOT NULL
+             AND candidate.item_id IS NOT NULL
+           ORDER BY candidate.seq
+           LIMIT ?`
+        )
+        .run(cutoff, maxPrunableSeq, messageLimit)
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO journal_condense_delete (seq, payload_bytes)
+           SELECT candidate.seq, candidate.payload_bytes
+           FROM journal_transient_event_index AS candidate
            LEFT JOIN journal_condense_diff_keep AS keep ON keep.seq = candidate.seq
            WHERE candidate.ts <= ?
              AND candidate.seq <= ?
              AND keep.seq IS NULL
-             AND typeof(candidate.thread_id) = 'text'
-             AND typeof(candidate.turn_id) = 'text'
+             AND candidate.kind = 'codex/turn/diff/updated'
+             AND candidate.session IS NOT NULL
+             AND candidate.thread_id IS NOT NULL
+             AND candidate.turn_id IS NOT NULL
            ORDER BY candidate.seq
            LIMIT ?`
         )
         .run(cutoff, maxPrunableSeq, diffLimit)
+      // The row limits bound statement work; this single cumulative budget additionally bounds WAL/write
+      // amplification when retained cumulative diffs are hundreds of KiB each. Candidate discovery remains
+      // read-only and the committed DELETE batch can never exceed this selected payload total.
+      //
+      // An individually oversized row is retained and reported, but it cannot starve every later bounded
+      // candidate. Removing it before the running sum lets maintenance continue making safe progress.
+      this.db
+        .prepare('DELETE FROM journal_condense_delete WHERE payload_bytes > ?')
+        .run(transientByteLimit)
+      this.db
+        .prepare(
+          `DELETE FROM journal_condense_delete
+           WHERE seq IN (
+             SELECT seq
+             FROM journal_condense_delete
+             ORDER BY seq
+             LIMIT -1 OFFSET ?
+           )`
+        )
+        .run(JOURNAL_CONDENSE_MAX_DELETE_ROWS)
+      this.db
+        .prepare(
+          `DELETE FROM journal_condense_delete
+           WHERE seq IN (
+             SELECT seq
+             FROM (
+               SELECT
+                 seq,
+                 SUM(payload_bytes) OVER (ORDER BY seq) AS cumulative_bytes
+               FROM journal_condense_delete
+             )
+             WHERE cumulative_bytes > ?
+           )`
+        )
+        .run(transientByteLimit)
     }
     selectCandidates()
 
     const applyDeletes = this.db.transaction(
       (): Pick<
         JournalCondenseResult,
-        'commandOutputDeltasDeleted' | 'diffSnapshotsDeleted' | 'cursorCheckpointsWritten'
+        | 'commandOutputDeltasDeleted'
+        | 'agentMessageDeltasDeleted'
+        | 'diffSnapshotsDeleted'
+        | 'transientPayloadBytesDeleted'
+        | 'oversizedTransientRowsRetained'
+        | 'cursorCheckpointsWritten'
       > => {
         // worker_cursors makes the new reader independent of event retention. A rollback can still launch the
         // old MAX(wseq)-from-events reader, though, so if a selected transient row is the current anchor, first
@@ -567,10 +1772,50 @@ export class Journal extends EventEmitter {
             WSEQ_CHECKPOINT_KIND,
             JSON.stringify({ reason: 'journal condensation replaced a transient wseq anchor' })
           ).changes
+        const transientPayloadBytesDeleted = this.db
+          .prepare('SELECT COALESCE(SUM(payload_bytes), 0) FROM journal_condense_delete')
+          .pluck()
+          .get()
+        if (
+          typeof transientPayloadBytesDeleted !== 'number' ||
+          !Number.isSafeInteger(transientPayloadBytesDeleted) ||
+          transientPayloadBytesDeleted < 0 ||
+          transientPayloadBytesDeleted > transientByteLimit
+        ) {
+          throw new Error('journal condensation selected an invalid payload-byte batch')
+        }
+        const oversizedTransientRowsRetained = this.db
+          .prepare(
+            `SELECT COUNT(*)
+             FROM journal_transient_event_index
+             WHERE seq <= ?
+               AND kind IN (
+                 'codex/item/commandExecution/outputDelta',
+                 'codex/item/agentMessage/delta',
+                 'codex/turn/diff/updated'
+               )
+               AND payload_bytes > ?`
+          )
+          .pluck()
+          .get(maxPrunableSeq, transientByteLimit)
+        if (
+          typeof oversizedTransientRowsRetained !== 'number' ||
+          !Number.isSafeInteger(oversizedTransientRowsRetained) ||
+          oversizedTransientRowsRetained < 0
+        ) {
+          throw new Error('journal condensation oversized-row count is invalid')
+        }
         const commandOutputDeltasDeleted = this.db
           .prepare(
             `DELETE FROM events
              WHERE kind = 'codex/item/commandExecution/outputDelta'
+               AND seq IN (SELECT seq FROM journal_condense_delete)`
+          )
+          .run().changes
+        const agentMessageDeltasDeleted = this.db
+          .prepare(
+            `DELETE FROM events
+             WHERE kind = 'codex/item/agentMessage/delta'
                AND seq IN (SELECT seq FROM journal_condense_delete)`
           )
           .run().changes
@@ -581,10 +1826,37 @@ export class Journal extends EventEmitter {
                AND seq IN (SELECT seq FROM journal_condense_delete)`
           )
           .run().changes
-        return { commandOutputDeltasDeleted, diffSnapshotsDeleted, cursorCheckpointsWritten }
+        if (
+          commandOutputDeltasDeleted > 0 ||
+          agentMessageDeltasDeleted > 0 ||
+          diffSnapshotsDeleted > 0
+        ) {
+          const changedThroughSeq = this.db
+            .prepare('SELECT COALESCE(MAX(seq), 0) FROM journal_condense_delete')
+            .pluck()
+            .get()
+          if (
+            typeof changedThroughSeq !== 'number' ||
+            !Number.isSafeInteger(changedThroughSeq) ||
+            changedThroughSeq < 1
+          ) {
+            throw new Error('journal condensation changed rows without a reset floor')
+          }
+          this.advanceReplayGeneration(now, changedThroughSeq)
+        }
+        return {
+          commandOutputDeltasDeleted,
+          agentMessageDeltasDeleted,
+          diffSnapshotsDeleted,
+          transientPayloadBytesDeleted,
+          oversizedTransientRowsRetained,
+          cursorCheckpointsWritten,
+        }
       }
     )
+    const writerStarted = process.hrtime.bigint()
     const transient = applyDeletes.immediate()
+    const writerLockMs = Number(process.hrtime.bigint() - writerStarted) / 1_000_000
     const history = this.rollupCompletedHistory({
       nowMs,
       historyGraceMs,
@@ -600,6 +1872,7 @@ export class Journal extends EventEmitter {
     return {
       ...transient,
       ...history,
+      writerLockMs,
       cursorCheckpointsWritten: transient.cursorCheckpointsWritten + history.cursorCheckpointsWritten,
       replication,
     }
@@ -634,7 +1907,13 @@ export class Journal extends EventEmitter {
     maxPrunableSeq: number
   }): Omit<
     JournalCondenseResult,
-    'commandOutputDeltasDeleted' | 'diffSnapshotsDeleted' | 'replication'
+    | 'commandOutputDeltasDeleted'
+    | 'agentMessageDeltasDeleted'
+    | 'diffSnapshotsDeleted'
+    | 'transientPayloadBytesDeleted'
+    | 'oversizedTransientRowsRetained'
+    | 'writerLockMs'
+    | 'replication'
   > {
     const empty = {
       cursorCheckpointsWritten: 0,
@@ -674,11 +1953,6 @@ export class Journal extends EventEmitter {
         payload_bytes_deleted INTEGER NOT NULL,
         updated_at TEXT NOT NULL
       );
-      CREATE INDEX IF NOT EXISTS idx_events_history_terminals
-        ON events (ts, seq) WHERE kind IN ('claude/result', 'codex/turn/completed');
-      CREATE INDEX IF NOT EXISTS idx_events_history_terminal_session
-        ON events (session, seq) WHERE kind IN ('claude/result', 'codex/turn/completed');
-
       CREATE TEMP TABLE IF NOT EXISTS journal_history_delete (
         seq INTEGER PRIMARY KEY
       );
@@ -686,15 +1960,15 @@ export class Journal extends EventEmitter {
 
     const terminals = this.db
       .prepare(
-        `SELECT event.seq, event.ts, event.session, event.kind
-         FROM events AS event
-         LEFT JOIN journal_turn_rollups AS done ON done.terminal_seq = event.seq
-         WHERE event.session IS NOT NULL
-           AND event.kind IN ('claude/result', 'codex/turn/completed')
-           AND event.ts <= ?
-           AND event.seq <= ?
+        `SELECT candidate.seq, candidate.ts, candidate.session, candidate.kind
+         FROM journal_transient_event_index AS candidate
+         LEFT JOIN journal_turn_rollups AS done ON done.terminal_seq = candidate.seq
+         WHERE candidate.session IS NOT NULL
+           AND candidate.kind IN ('claude/result', 'codex/turn/completed')
+           AND candidate.ts <= ?
+           AND candidate.seq <= ?
            AND done.terminal_seq IS NULL
-         ORDER BY event.seq
+         ORDER BY candidate.seq
          LIMIT ?`
       )
       .all(cutoff, options.maxPrunableSeq, options.maxHistoryTurns) as Array<{
@@ -707,25 +1981,29 @@ export class Journal extends EventEmitter {
     const result = { ...empty }
     const previousTerminalStmt = this.db.prepare(
       `SELECT MAX(seq) AS seq
-       FROM events
+       FROM journal_transient_event_index
        WHERE session = ? AND seq < ? AND kind IN ('claude/result', 'codex/turn/completed')`
     )
     const turnRowsStmt = this.db.prepare(
-      `SELECT seq, ts, session, kind, payload, wseq
-       FROM events
-       WHERE session = ? AND seq > ? AND seq <= ?
-       ORDER BY seq`
+      `SELECT event.seq, event.ts, event.session, event.kind, event.payload, event.wseq
+       FROM journal_session_event_index AS session_event
+       JOIN events AS event ON event.seq = session_event.seq
+       WHERE session_event.session = ? AND session_event.seq > ? AND session_event.seq <= ?
+       ORDER BY session_event.seq`
     )
     const turnSizeStmt = this.db.prepare(
-      `SELECT COUNT(*) AS rows, COALESCE(SUM(length(CAST(payload AS BLOB))), 0) AS bytes
-       FROM events
-       WHERE session = ? AND seq > ? AND seq <= ?`
+      `SELECT COUNT(*) AS rows, COALESCE(SUM(length(CAST(event.payload AS BLOB))), 0) AS bytes
+       FROM journal_session_event_index AS session_event
+       JOIN events AS event ON event.seq = session_event.seq
+       WHERE session_event.session = ? AND session_event.seq > ? AND session_event.seq <= ?`
     )
     const currentStateRowsStmt = this.db.prepare(
-      `SELECT MAX(seq) AS seq
-       FROM events
-       WHERE session = ? AND kind IN ('codex/thread/tokenUsage/updated', 'session/tokens')
-       GROUP BY kind`
+      `SELECT MAX(event.seq) AS seq
+       FROM journal_session_event_index AS session_event
+       JOIN events AS event ON event.seq = session_event.seq
+       WHERE session_event.session = ?
+         AND event.kind IN ('codex/thread/tokenUsage/updated', 'session/tokens')
+       GROUP BY event.kind`
     )
     const clearDeleteStmt = this.db.prepare('DELETE FROM journal_history_delete')
     const selectDeleteStmt = this.db.prepare('INSERT OR IGNORE INTO journal_history_delete (seq) VALUES (?)')
@@ -1048,6 +2326,387 @@ export class Journal extends EventEmitter {
     // Only a terminal status counts as "resolved"; anything else (never expected on an approval/resolved row)
     // is treated as not-resolved so the caller re-prompts rather than silently swallowing the request.
     return status === 'approved' || status === 'denied' || status === 'timeout' ? status : undefined
+  }
+
+  /**
+   * Durable terminal result for one vendor-correlated AskUserQuestion invocation. Unlike legacy approval
+   * recovery, the id is derived from the SDK's per-invocation toolUseID + requestId rather than payload,
+   * so replay cannot turn one answer into a standing answer for a later byte-identical question.
+   */
+  resolvedQuestion(id: string): ResolvedQuestion | undefined {
+    const lifecycle = this.questionLifecycle(id)
+    if (lifecycle && lifecycle.status !== 'pending') {
+      return {
+        sessionId: lifecycle.sessionId,
+        status: lifecycle.status,
+        correlationDigest: lifecycle.correlationDigest,
+        questionDigest: lifecycle.questionDigest,
+        ...(lifecycle.reason ? { reason: lifecycle.reason } : {}),
+      }
+    }
+    return undefined
+  }
+
+  /** Whether this exact invocation already received the one operator-visible lost-reply notice. */
+  questionRecoveryUnknownNoted(id: string): boolean {
+    if (!this.questionRecoveryUnknownStmt) {
+      this.db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_events_question_recovery_unknown ON events(json_extract(payload, '$.id')) WHERE kind = 'question/recovery-unknown'"
+      )
+      this.questionRecoveryUnknownStmt = this.db.prepare(
+        "SELECT 1 AS present FROM events WHERE kind = 'question/recovery-unknown' AND json_extract(payload, '$.id') = ? LIMIT 1"
+      )
+    }
+    return this.questionRecoveryUnknownStmt.get(id) !== undefined
+  }
+
+  /** Return one materialized question summary; active bodies never enter this database. */
+  questionLifecycle(id: string): DurableQuestion | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT id, session, correlation_digest, question_digest, owner_epoch, status,
+                terminal_reason
+         FROM question_lifecycles WHERE id = ?`
+      )
+      .get(id) as
+      | {
+          id: string
+          session: string
+          correlation_digest: string
+          question_digest: string
+          owner_epoch: string
+          status: DurableQuestion['status']
+          terminal_reason: ResolvedQuestion['reason'] | null
+        }
+      | undefined
+    if (!row) return undefined
+    return {
+      id: row.id,
+      sessionId: row.session,
+      correlationDigest: row.correlation_digest,
+      questionDigest: row.question_digest,
+      ownerEpoch: row.owner_epoch,
+      status: row.status,
+      ...(row.terminal_reason ? { reason: row.terminal_reason } : {}),
+    }
+  }
+
+  /**
+   * Atomically register bounded lifecycle metadata. A failed append rolls back the row; a post-commit
+   * subscriber failure is contained by atomic(), so callers never retain a phantom.
+   */
+  registerQuestion(
+    question: {
+      id: string
+      sessionId: string
+      correlationDigest: string
+      toolUseIdLength: number
+      requestIdLength: number
+      questionDigest: string
+      ownerEpoch: string
+      inputBytes: number
+      createdAt: string
+      questionCount: number
+    },
+    limits: { global: number; perSession: number }
+  ): RegisterQuestionResult {
+    return this.atomic(() => {
+      const existing = this.questionLifecycle(question.id)
+      if (existing) return { created: false, state: existing }
+      const global = (
+        this.db
+          .prepare("SELECT COUNT(*) AS n FROM question_lifecycles WHERE status = 'pending'")
+          .get() as { n: number }
+      ).n
+      if (global >= limits.global) throw new Error('too many pending questions in this hub')
+      const session = (
+        this.db
+          .prepare(
+            "SELECT COUNT(*) AS n FROM question_lifecycles WHERE status = 'pending' AND session = ?"
+          )
+          .get(question.sessionId) as { n: number }
+      ).n
+      if (session >= limits.perSession) {
+        throw new Error('too many pending questions for this session')
+      }
+      this.db
+        .prepare(
+          `INSERT INTO question_lifecycles
+             (id, session, correlation_digest, tool_use_id_length, request_id_length,
+              question_digest, owner_epoch, status, terminal_reason, input_bytes, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)`
+        )
+        .run(
+          question.id,
+          question.sessionId,
+          question.correlationDigest,
+          question.toolUseIdLength,
+          question.requestIdLength,
+          question.questionDigest,
+          question.ownerEpoch,
+          question.inputBytes,
+          question.createdAt
+        )
+      // Full prompts/descriptions/previews are intentionally absent from the append-only replay stream.
+      this.append(question.sessionId, 'question/requested', {
+        id: question.id,
+        correlationDigest: question.correlationDigest,
+        toolUseIdLength: question.toolUseIdLength,
+        requestIdLength: question.requestIdLength,
+        questionDigest: question.questionDigest,
+        questionCount: question.questionCount,
+        inputBytes: question.inputBytes,
+      })
+      return {
+        created: true,
+        state: this.questionLifecycle(question.id)!,
+      }
+    })
+  }
+
+  /** CAS pending -> terminal and its audit row in one SQLite transaction. */
+  resolveQuestion(
+    id: string,
+    expected: {
+      sessionId: string
+      correlationDigest: string
+      questionDigest: string
+    },
+    status: ResolvedQuestion['status'],
+    reason?: ResolvedQuestion['reason']
+  ): ResolveQuestionResult {
+    return this.atomic(() => {
+      const before = this.questionLifecycle(id)
+      if (!before) throw new Error('question lifecycle is missing')
+      if (
+        before.sessionId !== expected.sessionId ||
+        before.correlationDigest !== expected.correlationDigest ||
+        before.questionDigest !== expected.questionDigest
+      ) {
+        throw new Error('durable question correlation conflicts with the current request')
+      }
+      if (before.status !== 'pending') {
+        return {
+          written: false,
+          state: {
+            sessionId: before.sessionId,
+            status: before.status,
+            correlationDigest: before.correlationDigest,
+            questionDigest: before.questionDigest,
+            ...(before.reason ? { reason: before.reason } : {}),
+          },
+        }
+      }
+      const changed = this.db
+        .prepare(
+          `UPDATE question_lifecycles
+           SET status = ?, terminal_reason = ?
+           WHERE id = ? AND status = 'pending'`
+        )
+        .run(status, reason ?? null, id)
+      if (changed.changes !== 1) {
+        const raced = this.questionLifecycle(id)
+        if (!raced || raced.status === 'pending') throw new Error('question terminal CAS failed')
+        return {
+          written: false,
+          state: {
+            sessionId: raced.sessionId,
+            status: raced.status,
+            correlationDigest: raced.correlationDigest,
+            questionDigest: raced.questionDigest,
+            ...(raced.reason ? { reason: raced.reason } : {}),
+          },
+        }
+      }
+      this.append(expected.sessionId, 'question/resolved', {
+        id,
+        status,
+        correlationDigest: expected.correlationDigest,
+        questionDigest: expected.questionDigest,
+        ...(reason ? { reason } : {}),
+      })
+      return {
+        written: true,
+        state: {
+          sessionId: expected.sessionId,
+          status,
+          correlationDigest: expected.correlationDigest,
+          questionDigest: expected.questionDigest,
+          ...(reason ? { reason } : {}),
+        },
+      }
+    })
+  }
+
+  /**
+   * Planned blue drain: atomically close every callback owned by this process and retain only a body-free
+   * marker saying its containing turn still needs an observed terminal boundary.
+   */
+  terminalizeOwnedQuestionsForRestart(
+    ownerEpoch: string,
+    restartGeneration: string
+  ): RestartInterruptedTurn[] {
+    return this.atomic(() => {
+      const rows = this.db
+        .prepare(
+          `SELECT id FROM question_lifecycles
+           WHERE status = 'pending' AND owner_epoch = ? ORDER BY created_at, id`
+        )
+        .all(ownerEpoch) as Array<{ id: string }>
+      const questionIds = new Map<string, string[]>()
+      for (const { id } of rows) {
+        const state = this.questionLifecycle(id)
+        if (!state || state.status !== 'pending') continue
+        const result = this.resolveQuestion(
+          id,
+          {
+            sessionId: state.sessionId,
+            correlationDigest: state.correlationDigest,
+            questionDigest: state.questionDigest,
+          },
+          'interrupted',
+          'interrupted_by_restart'
+        )
+        if (!result.written) continue
+        const ids = questionIds.get(state.sessionId) ?? []
+        ids.push(id)
+        questionIds.set(state.sessionId, ids)
+      }
+      const interrupted = [...questionIds].map(([sessionId, ids]) => ({
+        restartGeneration,
+        sessionId,
+        questionCount: ids.length,
+        questionIds: ids,
+      }))
+      for (const turn of interrupted) {
+        this.db
+          .prepare(
+            `INSERT OR IGNORE INTO question_restart_interruptions
+               (restart_generation, session, phase, boundary, question_count, created_at)
+             VALUES (?, ?, 'planned', 'pending', ?, ?)`
+          )
+          .run(
+            restartGeneration,
+            turn.sessionId,
+            turn.questionCount,
+            new Date().toISOString()
+          )
+      }
+      return interrupted
+    })
+  }
+
+  /**
+   * Record the observed same-turn boundary before blue releases its listener. A timeout is deliberately
+   * "unknown", not a fabricated cancellation or a fresh provider turn. The CAS makes notification
+   * idempotent across duplicate supervisor messages.
+   */
+  completeQuestionRestartInterruptions(
+    interrupted: readonly RestartInterruptedTurn[],
+    completedSessionIds: ReadonlySet<string>
+  ): number {
+    return this.atomic(() => {
+      let written = 0
+      for (const turn of interrupted) {
+        const boundary = completedSessionIds.has(turn.sessionId) ? 'completed' : 'unknown'
+        const changed = this.db
+          .prepare(
+            `UPDATE question_restart_interruptions
+             SET boundary = ?
+             WHERE restart_generation = ? AND session = ? AND boundary = 'pending'`
+          )
+          .run(boundary, turn.restartGeneration, turn.sessionId)
+        if (changed.changes !== 1) continue
+        this.append(turn.sessionId, 'question/restart-interrupted', {
+          reason: 'interrupted_by_restart',
+          phase: this.db
+            .prepare(
+              `SELECT phase FROM question_restart_interruptions
+               WHERE restart_generation = ? AND session = ?`
+            )
+            .pluck()
+            .get(turn.restartGeneration, turn.sessionId),
+          turnBoundary: boundary,
+          questionCount: turn.questionCount,
+        })
+        written += 1
+      }
+      return written
+    })
+  }
+
+  /** Foreign-owner rows have no callback in this process; close and surface them before promotion. */
+  terminalizeForeignQuestions(ownerEpoch: string): number {
+    return this.atomic(() => {
+      const rows = this.db
+        .prepare(
+          `SELECT id FROM question_lifecycles
+           WHERE status = 'pending' AND owner_epoch <> ? ORDER BY created_at, id`
+        )
+        .all(ownerEpoch) as Array<{ id: string }>
+      let count = 0
+      const counts = new Map<string, Map<string, number>>()
+      for (const { id } of rows) {
+        const state = this.questionLifecycle(id)
+        if (!state || state.status !== 'pending') continue
+        const result = this.resolveQuestion(
+          id,
+          {
+            sessionId: state.sessionId,
+            correlationDigest: state.correlationDigest,
+            questionDigest: state.questionDigest,
+          },
+          'interrupted',
+          'interrupted_by_restart'
+        )
+        if (!result.written) continue
+        let sessions = counts.get(state.ownerEpoch)
+        if (!sessions) {
+          sessions = new Map()
+          counts.set(state.ownerEpoch, sessions)
+        }
+        sessions.set(state.sessionId, (sessions.get(state.sessionId) ?? 0) + 1)
+        count += 1
+      }
+      for (const [sourceOwnerEpoch, sessions] of counts) {
+        for (const [sessionId, questionCount] of sessions) {
+          this.db
+            .prepare(
+              `INSERT OR IGNORE INTO question_restart_interruptions
+                 (restart_generation, session, phase, boundary, question_count, created_at)
+               VALUES (?, ?, 'crash', 'pending', ?, ?)`
+            )
+            .run(
+              `crash:${sourceOwnerEpoch}`,
+              sessionId,
+              questionCount,
+              new Date().toISOString()
+            )
+        }
+      }
+
+      // A hard kill can happen after planned terminalization but before blue records whether the same turn
+      // finished. The public successor may surface that ambiguity exactly once, but must never retry it.
+      const pending = this.db
+        .prepare(
+          `SELECT restart_generation AS restartGeneration, session AS sessionId,
+                  question_count AS questionCount
+           FROM question_restart_interruptions
+           WHERE boundary = 'pending'
+           ORDER BY created_at, restart_generation, session`
+        )
+        .all() as Array<{
+        restartGeneration: string
+        sessionId: string
+        questionCount: number
+      }>
+      const pendingTurns: RestartInterruptedTurn[] = pending.map((turn) => ({
+        ...turn,
+        questionIds: [],
+      }))
+      this.completeQuestionRestartInterruptions(pendingTurns, new Set())
+      return count
+    })
   }
 
   since(seq: number, limit = 2000): HubEvent[] {

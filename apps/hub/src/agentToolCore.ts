@@ -115,7 +115,14 @@ export interface AgentServices {
   /** Operate the app-owned browser bound to this exact AllMyAgents session. */
   browser(
     sessionId: string,
-    operation: Extract<BrowserOperation, 'navigate' | 'read' | 'screenshot'> | 'status',
+    operation:
+      | Extract<BrowserOperation, 'navigate' | 'read' | 'screenshot' | 'tab_switch' | 'tab_close'>
+      | 'click'
+      | 'tabs'
+      | 'tab_open'
+      | 'download'
+      | 'download_read'
+      | 'status',
     args: Record<string, unknown>
   ): Awaitable<BrowserResultContent[]>
   memory: MemoryServices
@@ -552,6 +559,93 @@ const browserRead = defineTool({
     services.browser(identity.sessionId, 'read', { maxChars: args.max_chars ?? 12000 }),
 })
 
+const browserClick = defineTool({
+  name: 'browser_click',
+  description:
+    'Click one semantic element from the most recent browser_read_page result. Requires its exact opaque ref and pageGeneration; raw selectors, JavaScript, coordinates, and guessed targets are not accepted. Every click is revalidated by the desktop host and requires operator approval.',
+  schema: {
+    ref: z.string().min(16).max(160).describe('opaque element ref returned by browser_read_page'),
+    page_generation: z.string().min(16).max(160).describe('opaque pageGeneration returned by browser_read_page'),
+    target_summary: z.string().trim().min(1).max(240).describe('short human-readable description shown in the approval prompt'),
+  },
+  run: async (args, { identity, services }) =>
+    services.browser(identity.sessionId, 'click', {
+      ref: args.ref,
+      pageGeneration: args.page_generation,
+      targetSummary: args.target_summary,
+    }),
+})
+
+const browserTabs = defineTool({
+  name: 'browser_tabs',
+  description:
+    'List this chat browser\'s session-owned tabs and the active tab. It never exposes or switches another chat\'s tabs.',
+  schema: {},
+  run: async (_args, { identity, services }) =>
+    services.browser(identity.sessionId, 'tabs', {}),
+})
+
+const browserOpenTab = defineTool({
+  name: 'browser_open_tab',
+  description:
+    'Open one new session-owned tab at an absolute http(s) URL. The operator must enable tabs for this chat and approve the one-use tab creation token.',
+  schema: {
+    url: z.string().url().describe('absolute http or https URL'),
+    target_summary: z.string().trim().min(1).max(240).describe('short reason shown in the approval prompt'),
+  },
+  run: async (args, { identity, services }) =>
+    services.browser(identity.sessionId, 'tab_open', {
+      url: args.url,
+      targetSummary: args.target_summary,
+    }),
+})
+
+const browserSwitchTab = defineTool({
+  name: 'browser_switch_tab',
+  description: 'Switch to one opaque tab id returned by browser_tabs, within this chat only.',
+  schema: { tab_id: z.string().min(8).max(160) },
+  run: async (args, { identity, services }) =>
+    services.browser(identity.sessionId, 'tab_switch', { tabId: args.tab_id }),
+})
+
+const browserCloseTab = defineTool({
+  name: 'browser_close_tab',
+  description: 'Close one opaque tab id returned by browser_tabs, within this chat only.',
+  schema: { tab_id: z.string().min(8).max(160) },
+  run: async (args, { identity, services }) =>
+    services.browser(identity.sessionId, 'tab_close', { tabId: args.tab_id }),
+})
+
+const browserDownload = defineTool({
+  name: 'browser_download',
+  description:
+    'Download one semantic link from the most recent browser_read_page result into this chat\'s inert, quota-bound native download area. Requires the exact opaque ref and pageGeneration plus operator approval. It cannot choose a path, execute, auto-open, or share the result.',
+  schema: {
+    ref: z.string().min(16).max(160).describe('opaque download/link ref returned by browser_read_page'),
+    page_generation: z.string().min(16).max(160).describe('opaque pageGeneration returned by browser_read_page'),
+    target_summary: z.string().trim().min(1).max(240).describe('short human-readable description shown in the approval prompt'),
+  },
+  run: async (args, { identity, services }) =>
+    services.browser(identity.sessionId, 'download', {
+      ref: args.ref,
+      pageGeneration: args.page_generation,
+      targetSummary: args.target_summary,
+    }),
+})
+
+const browserDownloadRead = defineTool({
+  name: 'browser_download_read',
+  description:
+    'Read one inert browser download owned by this exact chat, using the opaque attachment id returned by browser_download. Text is bounded, images retain their safe image content, and cross-chat ids fail closed. It never reveals a host path or opens or executes the file.',
+  schema: {
+    attachment_id: z.string().uuid().describe('opaque same-chat attachment id returned by browser_download'),
+  },
+  run: async (args, { identity, services }) =>
+    services.browser(identity.sessionId, 'download_read', {
+      attachmentId: args.attachment_id,
+    }),
+})
+
 const browserScreenshot = defineTool({
   name: 'browser_screenshot',
   description:
@@ -594,6 +688,13 @@ export const AGENT_TOOLS: readonly AgentToolSpec[] = [
   practiceList,
   browserNavigate,
   browserRead,
+  browserClick,
+  browserTabs,
+  browserOpenTab,
+  browserSwitchTab,
+  browserCloseTab,
+  browserDownload,
+  browserDownloadRead,
   browserScreenshot,
   browserStatus,
 ]

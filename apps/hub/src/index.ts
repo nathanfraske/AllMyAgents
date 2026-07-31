@@ -5,17 +5,25 @@ import path from 'node:path'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
 import { ApprovalService } from './approvals.js'
+import { QuestionService } from './questions.js'
 import {
   JOURNAL_CONDENSE_GRACE_MS,
   JOURNAL_CONDENSE_INTERVAL_MS,
+  JOURNAL_CONDENSE_MAX_AGENT_MESSAGE_DELTAS,
   JOURNAL_CONDENSE_MAX_COMMAND_DELTAS,
   JOURNAL_CONDENSE_MAX_DIFF_SNAPSHOTS,
+  JOURNAL_CONDENSE_MAX_TRANSIENT_BYTES,
   Journal,
   type JournalCondenseResult,
 } from './journal.js'
 import { ProjectStore } from './projects.js'
 import { profileAuthEvidence, scanProfiles, setClaudeConnectorPolicy } from './profiles.js'
 import { ProfileOwnership } from './profileOwnership.js'
+import { ProfileRuntime } from './profileRuntime.js'
+import {
+  ProfileLoginCoordinator,
+  ProfileLoginRegistry,
+} from './profileLoginCoordinator.js'
 import { createJournalBackupSupervisor } from './journalBackup.js'
 import { SessionManager } from './sessions.js'
 import { SessionStore } from './store.js'
@@ -37,14 +45,26 @@ import { asChatNamePool } from './title.js'
 import { asFileWriteDiffDensity } from './types.js'
 import type { DangerFlags, HubConfig, HubPrefs } from './types.js'
 import { RestartController, type RestartState } from './restartController.js'
-import { SCHEMA_VERSION, type SupervisorMsg } from './restartHandshake.js'
+import {
+  parseProfileGenerationEnvironment,
+  SCHEMA_VERSION,
+  type ProfileGenerationAuthority,
+  type SupervisorMsg,
+} from './restartHandshake.js'
 import {
   PREFLIGHT_EXIT_CODE,
   recordExistingSchemaVersion,
   recordSchemaVersion,
   runHubPreflight,
+  runHubPreflightInWorker,
   type PreflightFailure,
 } from './preflight.js'
+import {
+  consumeRecoveryReceipts,
+  JournalRecoveryLease,
+  validateRecoveryReceiptsBeforeWritableOpen,
+  verifyNormalJournalLineage,
+} from './journalRecovery.js'
 
 // The desktop shell runs the shipped hub entry with this flag before trusting a persisted
 // node_modules tree. Static ESM imports have already linked the hub's real module graph by the time
@@ -61,6 +81,9 @@ if (process.env.AMA_VERIFY_HUB_DEPS === '1') {
 
 const repoRoot = path.resolve(import.meta.dirname, '..', '..', '..')
 const supervised = process.env.HUB_SUPERVISED === '1' && typeof process.send === 'function'
+const bootPort = Number(process.env.HUB_PORT ?? 7777)
+const publicPort = supervised ? Number(process.env.HUB_FIXED_PORT ?? 7777) : bootPort
+const isGreen = supervised && bootPort === 0
 function sendSupervisorMessage(message: unknown): void {
   if (!process.connected || !process.send) return
   try {
@@ -84,9 +107,51 @@ function sendSupervisorMessage(message: unknown): void {
 // isolated harness (e.g. the restart-survival acceptance test) to keep its DB + state off the live hub's.
 const dataDir = process.env.HUB_DATA_DIR ? path.resolve(process.env.HUB_DATA_DIR) : path.join(repoRoot, 'data')
 const journalPath = path.join(dataDir, 'hub.db')
+const preflightAttemptId = process.env.HUB_PREFLIGHT_ATTEMPT_ID
+const validPreflightAttempt =
+  typeof preflightAttemptId === 'string' &&
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    preflightAttemptId
+  )
+if (supervised && !validPreflightAttempt) {
+  console.error('[hub-preflight] supervised boot lacks a valid preflight attempt binding')
+  process.exit(PREFLIGHT_EXIT_CODE)
+}
+let preflightLivenessSequence = 0
+let preflightLivenessPhase: 'starting' | 'integrity-check' | 'booting' = 'starting'
+let preflightLivenessTimer: ReturnType<typeof setInterval> | undefined
+// This is a parent-thread liveness/phase lease, not proof that SQLite advanced between frames.
+// The supervisor's absolute ceiling remains authoritative even while valid leases continue.
+const sendPreflightLiveness = (): void => {
+  if (!supervised || !validPreflightAttempt) return
+  sendSupervisorMessage({
+    type: 'preflight-liveness',
+    attemptId: preflightAttemptId,
+    phase: preflightLivenessPhase,
+    sequence: preflightLivenessSequence++,
+  })
+}
+if (supervised) {
+  sendPreflightLiveness()
+  preflightLivenessPhase = 'integrity-check'
+  sendPreflightLiveness()
+  preflightLivenessTimer = setInterval(sendPreflightLiveness, 1_000)
+}
 
-async function reportPreflightFailure(failure: PreflightFailure): Promise<never> {
-  const message = { type: 'preflight-failed' as const, ...failure }
+async function reportPreflightFailure(
+  failure:
+    | PreflightFailure
+    | {
+        code: 'profile-generation-invalid'
+        message: string
+        recovery: string
+      },
+): Promise<never> {
+  const message = {
+    type: 'preflight-failed' as const,
+    ...(validPreflightAttempt ? { attemptId: preflightAttemptId } : {}),
+    ...failure,
+  }
   console.error(`[hub-preflight] ${JSON.stringify(message)}`)
   if (supervised && process.send) {
     await new Promise<void>((resolve) => {
@@ -108,13 +173,70 @@ async function reportPreflightFailure(failure: PreflightFailure): Promise<never>
   process.exit(PREFLIGHT_EXIT_CODE)
 }
 
-const preflight = runHubPreflight({ dataDir, journalPath, schemaVersion: SCHEMA_VERSION })
+const profileGeneration: ProfileGenerationAuthority = await (async () => {
+  try {
+    return supervised
+      ? parseProfileGenerationEnvironment(process.env)
+      : {
+          generationId: crypto.randomUUID(),
+          publicEpoch: 1,
+          active: true,
+        }
+  } catch (error) {
+    return reportPreflightFailure({
+      code: 'profile-generation-invalid',
+      message: `The supervisor supplied invalid profile authority: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      recovery: 'Keep this hub offline and restart the AllMyAgents desktop supervisor.',
+    })
+  }
+})()
+
+const recoveryLease = new JournalRecoveryLease(dataDir)
+try {
+  recoveryLease.acquireShared()
+} catch (error) {
+  await reportPreflightFailure({
+    code: 'database-validation-unavailable',
+    message: `The journal ownership boundary could not be established: ${error instanceof Error ? error.message : String(error)}`,
+    recovery:
+      'Keep the data root offline. Resolve the lease, filesystem, or recovery-metadata error and restart AllMyAgents.',
+  })
+}
+const preflight = await (async () => {
+  try {
+    return supervised
+      ? await runHubPreflightInWorker({
+          dataDir,
+          journalPath,
+          schemaVersion: SCHEMA_VERSION,
+          onLiveness: () => {},
+        })
+      : runHubPreflight({ dataDir, journalPath, schemaVersion: SCHEMA_VERSION })
+  } catch (error) {
+    return reportPreflightFailure({
+      code: 'database-validation-unavailable',
+      message: `The isolated preflight verifier failed: ${error instanceof Error ? error.message : String(error)}`,
+      recovery:
+        'Keep the data root offline. Repair the verifier/runtime failure and restart AllMyAgents.',
+    })
+  }
+})()
 for (const check of preflight.checks) {
   const line = `[hub-preflight] ${check.name}: ${check.status} (${check.durationMs}ms) — ${check.detail}`
   if (check.status === 'skipped') console.warn(line)
   else console.log(line)
 }
 if (!preflight.ok) await reportPreflightFailure(preflight.failure)
+const lineageFailure = verifyNormalJournalLineage({
+  dataDir,
+  journalPath,
+  maxSchemaVersion: SCHEMA_VERSION,
+})
+if (lineageFailure) await reportPreflightFailure(lineageFailure)
+const receiptFailure = validateRecoveryReceiptsBeforeWritableOpen({ dataDir, journalPath })
+if (receiptFailure) await reportPreflightFailure(receiptFailure)
 if (fs.existsSync(journalPath)) {
   try {
     recordExistingSchemaVersion(journalPath, SCHEMA_VERSION)
@@ -125,6 +247,10 @@ if (fs.existsSync(journalPath)) {
       recovery: 'Check free disk space and write permission for hub.db, then restart AllMyAgents.',
     })
   }
+}
+if (supervised) {
+  preflightLivenessPhase = 'booting'
+  sendPreflightLiveness()
 }
 // HUB_PROFILES_DIR relocates the managed-profiles root (auth creds + settings) off the repo's profiles/ —
 // the alpha step toward keeping credentials out of the repo/bundle path (%APPDATA%/AllMyAgents/profiles on a
@@ -154,6 +280,12 @@ try {
     message: `The journal opened, but its schema version could not be recorded: ${error instanceof Error ? error.message : String(error)}`,
     recovery: 'Check free disk space and write permission for hub.db, then restart AllMyAgents.',
   })
+}
+const consumedRecoveryReceipts = consumeRecoveryReceipts(journal)
+if (consumedRecoveryReceipts > 0) {
+  console.warn(
+    `[journal-recovery] recorded ${consumedRecoveryReceipts} recovery notice(s); post-snapshot tail outcome remains unknown`
+  )
 }
 // Each live WebSocket (pane / device / reconnect) attaches a journal 'event' listener, removed on
 // close — legitimately more than the EventEmitter default of 10 for a multi-pane/fleet hub. Raise
@@ -186,14 +318,17 @@ const restartState: RestartState = {
 const journalBackupsDir = path.join(dataDir, 'backups')
 const journalBackups = createJournalBackupSupervisor(journal.db, {
   dir: journalBackupsDir,
+  recoveryDataDir: dataDir,
+  recoveryKeep: 6,
   log: (message) => console.log(message),
   onStateChange: (state) => {
     if (state.status !== 'inactive') restartState.journalBackupRequired = true
     restartState.journalBackup = state
   },
 })
+process.once('exit', () => recoveryLease.release())
 const store = new SessionStore(journal.db)
-const profiles = scanProfiles(profilesDir)
+const profiles: ReturnType<typeof scanProfiles> = []
 const profileOwnership = new ProfileOwnership({
   ownerId: process.env.HUB_PROFILE_OWNER_ID ?? crypto.randomUUID(),
   pid: Number(process.env.HUB_PROFILE_OWNER_PID ?? process.pid),
@@ -202,22 +337,14 @@ const profileOwnership = new ProfileOwnership({
   // app take an account back from a sandbox that is squatting on it. Absent for a real install, so the
   // installed app is never the one that yields.
   transient: process.env.HUB_TRANSIENT === '1',
+}, {
+  generationId: profileGeneration.generationId,
+  publicGenerationActive: profileGeneration.active,
+  publicEpoch: profileGeneration.publicEpoch,
 })
-for (const profile of profiles) {
-  const claim = profileOwnership.claim(profile.id, profile.dir)
-  refreshProfileAuth(profile)
-  if (!claim.owned) {
-    profile.available = false
-    profile.ownerPort = claim.owner.port
-    profile.unavailableReason = `Another AllMyAgents hub (port ${claim.owner.port}) is using ${profile.id}. This hub will not refresh its credentials.`
-    console.error(`[profiles] ${profile.unavailableReason}`)
-  } else {
-    profile.available = true
-    console.log(`[profiles] owns ${profile.id}${claim.reclaimed ? ' (reclaimed stale claim)' : ''}`)
-  }
-}
 const profileMap = new Map(profiles.map((p) => [p.id, p]))
 const approvals = new ApprovalService(journal)
+const questions = new QuestionService(journal)
 const usage = new UsageMonitor(journal, profiles, config)
 const workspace = new WorkspaceManager(path.join(dataDir, 'worktrees'), path.join(dataDir, 'workspaces'))
 const projects = new ProjectStore(journal.db)
@@ -259,10 +386,28 @@ const prefs: HubPrefs = {
   steerMessagesAtToolBoundary: config.prefs?.steerMessagesAtToolBoundary !== false,
   fileWriteDiffDensity: asFileWriteDiffDensity(config.prefs?.fileWriteDiffDensity),
 }
-// Apply the connector policy to managed claude profiles at boot (safe default OFF → connectors suppressed).
-// The SDK reads disableClaudeAiConnectors from each profile's settings.json, so this makes the flag
-// authoritative on startup; the Danger-Zone toggle re-applies it on a flip (server.ts). Never touches ~/.claude.
-setClaudeConnectorPolicy(profiles, danger.enableClaudeConnectors === true)
+let profileBootstrapComplete = false
+const profileRuntime = new ProfileRuntime({
+  profilesDir,
+  profiles,
+  profileMap,
+  profileOwnership,
+  usage,
+  generation: profileGeneration,
+  scanProfiles: () => scanProfiles(profilesDir),
+  refreshAuth: refreshProfileAuth,
+  onAdded: (profile) => {
+    usage.addProfile(profile)
+    if (profileBootstrapComplete) {
+      journal.append(null, 'profiles/added', { id: profile.id, provider: profile.provider })
+    }
+  },
+  applyConnectorPolicy: (profile) =>
+    setClaudeConnectorPolicy([profile], danger.enableClaudeConnectors === true),
+  log: (message) => console.error(message),
+})
+profileRuntime.bootstrap()
+profileBootstrapComplete = true
 // Agent execution runs behind the Executor seam (docs/agent-worker-impl.md §4.1). The implementation is
 // chosen by the presence of HUB_WORKER_SOCKET (§4.4, the Phase-2 feature flag hubctl injects when worker
 // mode is opted into): absent → the in-process executor (byte-identical to today); present → a
@@ -287,8 +432,22 @@ const executor: Executor = workerSocket
       // replay the in-flight turn's event gap gap-free + exactly-once — so a mid-turn survives a hub restart.
       attachWorker: () => sessions.attachWorker(),
     })
-  : new InProcessExecutor({ approvals, usage, danger, memory, practices })
-sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, dataDir, executor, prefs, browserBroker)
+  : new InProcessExecutor({ approvals, questions, usage, danger, memory, practices })
+sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, dataDir, questions, executor, prefs, browserBroker)
+const profileLoginCoordinator = new ProfileLoginCoordinator({
+  profilesDir,
+  registry: new ProfileLoginRegistry(path.join(dataDir, 'profile-logins.json')),
+  profileRuntime,
+  profileOwnership,
+  sessions,
+})
+// Active ProfileRuntime bootstrap above already reconciled any crash-left credential saga. Publish the
+// same durable public attempt as terminal/unknown now; a successor never recreates the predecessor's
+// process-local turn freeze.
+if (profileRuntime.currentGeneration().active) {
+  profileLoginCoordinator.recoverAfterProfileBootstrap()
+}
+process.once('exit', () => profileLoginCoordinator.dispose())
 browserBroker.onNavigation((event) =>
   sessions.noteBrowserNavigation(event.sessionId, event.url, event.title, event.actor, event.ok, event.errorCode)
 )
@@ -321,12 +480,6 @@ approvals.setAutoApprove((sessionId, kind, payload) => sessions.isAutoApproved(s
 // hubctl launches us with HUB_SUPERVISED=1 + an IPC channel. A booting "green" gets HUB_PORT=0
 // (ephemeral) and promotes to the fixed public port 7777 only after passing the supervisor's
 // health-check; an unsupervised standalone hub behaves exactly as before.
-const bootPort = Number(process.env.HUB_PORT ?? 7777)
-// The fixed public port a green promotes to / a rollback re-claims — HUB_FIXED_PORT keeps it in lockstep with
-// hubctl's override so an isolated harness promotes to its own port, not 7777. Unset → 7777 as before.
-const publicPort = supervised ? Number(process.env.HUB_FIXED_PORT ?? 7777) : bootPort
-const isGreen = supervised && bootPort === 0
-
 // --- Journal condensation ----------------------------------------------------------------------
 // The measured journal grew to 390 MB / 375k events in three days, mostly two superseded Codex streams.
 // Run maintenance only after this process owns the public role, and in a ONE-SHOT CHILD: better-sqlite3's
@@ -334,15 +487,21 @@ const isGreen = supervised && bootPort === 0
 // worker ingestion. The Journal method bounds deletes as well, limiting the cross-process SQLite write lock
 // and WAL burst. A failure is logged and retried next interval; maintenance must never become a boot cause.
 type JournalMaintenanceMessage =
-  | { type: 'journal-condensed'; result: JournalCondenseResult }
-  | { type: 'journal-condense-error'; error: string }
+  | { type: 'journal-condensed'; operationId: string; result: JournalCondenseResult }
+  | { type: 'journal-condense-deferred'; operationId: string; reason: string }
+  | { type: 'journal-condense-error'; operationId: string; error: string }
 
 let journalMaintenanceTimer: NodeJS.Timeout | undefined
+let journalMaintenanceImmediate: NodeJS.Immediate | undefined
 let journalMaintenanceChild: ChildProcess | undefined
 
 function runJournalMaintenance(): void {
   if (journalMaintenanceChild) return // a slow disk gets one job, never an accumulating process queue
+  const operationId = crypto.randomUUID()
   try {
+    journal.recordCompactionLifecycle(operationId, 'started', {
+      detail: 'Bounded journal maintenance child is being launched.',
+    })
     const sourceMode = import.meta.url.endsWith('.ts')
     const entry = path.join(import.meta.dirname, sourceMode ? 'journalMaintenance.ts' : 'journalMaintenance.js')
     // Source mode needs tsx. Resolve it against this package and pass an absolute URL: a bare `tsx/esm`
@@ -354,9 +513,13 @@ function runJournalMaintenance(): void {
       entry,
       [
         journalPath,
+        journalBackupsDir,
+        operationId,
         String(JOURNAL_CONDENSE_GRACE_MS),
         String(JOURNAL_CONDENSE_MAX_COMMAND_DELTAS),
+        String(JOURNAL_CONDENSE_MAX_AGENT_MESSAGE_DELTAS),
         String(JOURNAL_CONDENSE_MAX_DIFF_SNAPSHOTS),
+        String(JOURNAL_CONDENSE_MAX_TRANSIENT_BYTES),
       ],
       {
         execArgv,
@@ -364,54 +527,127 @@ function runJournalMaintenance(): void {
       }
     )
     journalMaintenanceChild = child
-    let reportedFailure = false
+    let terminalReported = false
     const guard = setTimeout(() => {
-      reportedFailure = true
+      if (!terminalReported) {
+        terminalReported = true
+        try {
+          journal.recordCompactionLifecycle(operationId, 'unobservable', {
+            detail: 'Maintenance child exceeded its bounded observation window and was terminated.',
+          })
+        } catch (error) {
+          console.error(
+            `[journal] could not record condensation observation loss: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          )
+        }
+      }
       console.error('[journal] condensation exceeded one interval; terminating it so maintenance can retry')
       child.kill()
     }, JOURNAL_CONDENSE_INTERVAL_MS - 10_000)
     guard.unref?.()
     child.on('message', (raw: unknown) => {
       const msg = raw as JournalMaintenanceMessage
+      if (msg?.operationId !== operationId) return
       if (msg?.type === 'journal-condense-error') {
-        reportedFailure = true
+        terminalReported = true
         console.error(`[journal] condensation failed: ${msg.error}`)
         return
       }
+      if (msg?.type === 'journal-condense-deferred') {
+        terminalReported = true
+        console.warn(`[journal] condensation deferred without deletion: ${msg.reason}`)
+        return
+      }
       if (msg?.type !== 'journal-condensed') return
-      const { commandOutputDeltasDeleted, diffSnapshotsDeleted, cursorCheckpointsWritten } = msg.result
-      if (commandOutputDeltasDeleted || diffSnapshotsDeleted || cursorCheckpointsWritten) {
+      terminalReported = true
+      const {
+        commandOutputDeltasDeleted,
+        agentMessageDeltasDeleted,
+        diffSnapshotsDeleted,
+        transientPayloadBytesDeleted,
+        cursorCheckpointsWritten,
+      } = msg.result
+      if (
+        commandOutputDeltasDeleted ||
+        agentMessageDeltasDeleted ||
+        diffSnapshotsDeleted ||
+        cursorCheckpointsWritten
+      ) {
         console.log(
-          `[journal] condensed ${commandOutputDeltasDeleted} command deltas + ${diffSnapshotsDeleted} diff snapshots` +
+          `[journal] condensed ${commandOutputDeltasDeleted} command deltas + ${agentMessageDeltasDeleted} message deltas + ${diffSnapshotsDeleted} diff snapshots (${transientPayloadBytesDeleted} payload bytes)` +
             (cursorCheckpointsWritten ? `; wrote ${cursorCheckpointsWritten} wseq checkpoint(s)` : '')
         )
       }
     })
     child.once('error', (error) => {
       clearTimeout(guard)
-      reportedFailure = true
+      if (!terminalReported) {
+        terminalReported = true
+        try {
+          journal.recordCompactionLifecycle(operationId, 'unobservable', {
+            detail: `Maintenance child launch failed: ${error.message}`,
+          })
+        } catch {
+          /* the launch error is still reported below */
+        }
+      }
       if (journalMaintenanceChild === child) journalMaintenanceChild = undefined
       console.error(`[journal] could not launch condensation: ${error.message}`)
     })
     child.once('exit', (code, signal) => {
       clearTimeout(guard)
       if (journalMaintenanceChild === child) journalMaintenanceChild = undefined
-      if (code !== 0 && !reportedFailure) {
+      if (!terminalReported) {
+        terminalReported = true
+        try {
+          journal.recordCompactionLifecycle(operationId, 'unobservable', {
+            detail: `Maintenance child exited without a terminal report (${
+              signal ? `signal ${signal}` : `code ${String(code)}`
+            }).`,
+          })
+        } catch (error) {
+          console.error(
+            `[journal] could not record condensation observation loss: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          )
+        }
+      }
+      if (code !== 0) {
         console.error(`[journal] condensation child exited ${signal ? `on ${signal}` : `with code ${String(code)}`}`)
       }
     })
   } catch (error) {
+    try {
+      journal.recordCompactionLifecycle(operationId, 'unobservable', {
+        detail: `Maintenance launch was not observable: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      })
+    } catch {
+      /* launch failure is still reported below */
+    }
     console.error(`[journal] could not launch condensation: ${error instanceof Error ? error.message : String(error)}`)
   }
 }
 
 function startJournalMaintenance(): void {
   if (journalMaintenanceTimer) return
+  // Queue the first bounded attempt only after this process owns the public role. The child performs the
+  // strong-snapshot gate and truthfully defers without deleting when recovery evidence is not ready.
+  journalMaintenanceImmediate = setImmediate(() => {
+    journalMaintenanceImmediate = undefined
+    runJournalMaintenance()
+  })
   journalMaintenanceTimer = setInterval(runJournalMaintenance, JOURNAL_CONDENSE_INTERVAL_MS)
   journalMaintenanceTimer.unref?.()
 }
 
 function stopJournalMaintenance(): void {
+  if (journalMaintenanceImmediate) clearImmediate(journalMaintenanceImmediate)
+  journalMaintenanceImmediate = undefined
   if (journalMaintenanceTimer) clearInterval(journalMaintenanceTimer)
   journalMaintenanceTimer = undefined
   // Killing a one-shot child mid-transaction is safe: SQLite rolls it back. Do not leave an unsupervised
@@ -472,25 +708,7 @@ if (!isGreen) usage.startPolling() //     green starts polling only once it owns
 restartState.booted = true
 
 function rescanProfiles(): typeof profiles {
-  for (const p of scanProfiles(profilesDir)) {
-    const existing = profileMap.get(p.id)
-    if (existing) {
-      refreshProfileAuth(existing)
-      continue
-    }
-    const claim = profileOwnership.claim(p.id, p.dir)
-    p.available = claim.owned
-    refreshProfileAuth(p)
-    if (!claim.owned) {
-      p.ownerPort = claim.owner.port
-      p.unavailableReason = `Another AllMyAgents hub (port ${claim.owner.port}) is using ${p.id}. This hub will not refresh its credentials.`
-      console.error(`[profiles] ${p.unavailableReason}`)
-    }
-    profileMap.set(p.id, p)
-    usage.addProfile(p) // pushes into the shared `profiles` array (same reference)
-    journal.append(null, 'profiles/added', { id: p.id, provider: p.provider })
-  }
-  return profiles
+  return profileRuntime.rescan()
 }
 
 function refreshProfileAuth(profile: (typeof profiles)[number]): void {
@@ -528,7 +746,7 @@ const meshPeerPorts: number[] = Array.isArray(config.mesh?.peerPorts)
   : []
 
 // Listen on the BOOT port (0 → ephemeral for a green); the server reports its actual port back.
-const server = startServer({ port: bootPort, defaultCwd: dataDir, profilesDir, profileOwnership, journal, sessions, profiles, approvals, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity: (projectId) => worktreeCollisions.projectActivity(projectId) })
+const server = startServer({ port: bootPort, defaultCwd: dataDir, profilesDir, profileOwnership, profileLoginCoordinator, journal, sessions, profiles, approvals, questions, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity: (projectId) => worktreeCollisions.projectActivity(projectId) })
 
 // Register the mesh advert — factored so a promoted green can (re)register once it owns the port.
 function registerMesh(): void {
@@ -550,6 +768,24 @@ function registerMesh(): void {
 
 server.once('listening', () => {
   const actualPort = (server.address() as { port?: number } | null)?.port ?? bootPort
+  if (!isGreen) {
+    try {
+      // Claim only after this process has actually won the public bind. A contender that loses with
+      // EADDRINUSE never reaches this callback and therefore cannot terminalize the incumbent's questions.
+      // The callback runs synchronously before Node dispatches an HTTP request on the new listener.
+      questions.activatePublicOwner()
+    } catch (error) {
+      restartState.draining = true
+      const message = error instanceof Error ? error.message : String(error)
+      server.close()
+      void reportPreflightFailure({
+        code: 'question-owner-activation-failed',
+        message: `The hub bound its public listener but could not claim question ownership: ${message}`,
+        recovery: 'Check free disk space and journal write access, then restart AllMyAgents.',
+      })
+      return
+    }
+  }
   journal.append(null, 'hub/started', {
     port: actualPort,
     profiles: profiles.map((p) => ({ id: p.id, provider: p.provider })),
@@ -561,8 +797,13 @@ server.once('listening', () => {
   console.log(`[hub] device token ${requireToken ? 'REQUIRED for /api + /ws' : 'not enforced (local)'} — pair remote devices from Settings → Mesh`)
   // Tell the supervisor we're up (report the ACTUAL port so it health-checks green's ephemeral port).
   if (supervised) {
+    if (preflightLivenessTimer) {
+      clearInterval(preflightLivenessTimer)
+      preflightLivenessTimer = undefined
+    }
     sendSupervisorMessage({
       type: 'ready',
+      attemptId: preflightAttemptId,
       port: actualPort,
       restored: sessions.list().length,
       schemaVersion: SCHEMA_VERSION,
@@ -590,6 +831,7 @@ if (supervised && process.send) {
     server,
     sessions,
     journal,
+    questions,
     state: restartState,
     publicPort,
     send,
@@ -600,6 +842,7 @@ if (supervised && process.send) {
       worktreeCollisions.start()
     },
     stopJournalBackups: () => journalBackups.stop(),
+    profileRuntime,
     // §8.4: drain() signals the worker to hold relays before blue's socket drops; abort() un-drains a
     // rolled-back flip. No-op in-process (the in-process executor implements no signalDraining), so the
     // flag-off restart path is byte-identical.
@@ -610,16 +853,20 @@ if (supervised && process.send) {
     if (!msg || typeof msg !== 'object') return
     switch (msg.type) {
       case 'drain':
-        void controller.drain()
+        void controller.drain().catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error)
+          console.error(`[hub] drain failed before releasing the public listener: ${message}`)
+          send({ type: 'drain-failed', error: message })
+        })
         break
       case 'promote':
-        controller.promote(msg.port)
+        controller.promote(msg.port, msg.profilePublicEpoch)
         break
       case 'retire':
         void controller.retire()
         break
       case 'restart-aborted':
-        void controller.abort(msg.error).catch((error: unknown) => {
+        void controller.abort(msg.error, msg.profilePublicEpoch).catch((error: unknown) => {
           const message = error instanceof Error ? error.message : String(error)
           restartState.rollbackRebinding = false
           restartState.draining = true

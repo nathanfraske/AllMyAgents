@@ -154,12 +154,20 @@ jobs:
           mkdir -p "$ROOT/home/Library/Application Support/direct.cec.allmyagents" "$ROOT/apps"
           cat scripts/install-macos.sh | HOME="$ROOT/home" AMA_DEST="$ROOT/apps" /bin/bash -s -- --uninstall --yes
           test ! -e "$ROOT/home/Library/Application Support/direct.cec.allmyagents"
+      - name: Preserve the current desktop log even when first health never arrives
+        if: always()
+        run: |
+          LOG="$HOME/Library/Application Support/direct.cec.allmyagents/logs/desktop.log"
+          if [ -f "$LOG" ]; then
+            cp "$LOG" /tmp/desktop-current.log
+          fi
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: macos-p0-${{ matrix.runner }}
           path: |
+            /tmp/desktop-current.log
             /tmp/desktop-first.log
             /tmp/health-first.json
             /tmp/health-repaired.json

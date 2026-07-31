@@ -2,9 +2,21 @@ import fs from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
 import { pipeline } from 'node:stream/promises'
-import { WebSocketServer, WebSocket } from 'ws'
+import { WebSocketServer } from 'ws'
 import type { ApprovalService } from './approvals.js'
-import type { Journal } from './journal.js'
+import {
+  parseQuestionDecisionBody,
+  QuestionInputError,
+  QuestionOwnershipError,
+} from './questions.js'
+import type { QuestionService } from './questions.js'
+import {
+  JOURNAL_HISTORY_PAGE_MAX_BYTES,
+  JOURNAL_HISTORY_PAGE_MAX_ROWS,
+  ReplayGenerationChangedError,
+  SessionHistoryIndexingError,
+  type Journal,
+} from './journal.js'
 import type { ProjectStore } from './projects.js'
 import type { SessionManager } from './sessions.js'
 import type { UsageMonitor } from './usage.js'
@@ -17,12 +29,13 @@ import { tokenMatches } from './deviceToken.js'
 import { pickFolder } from './native.js'
 import { computeStats } from './stats.js'
 import { buildFleet, probeHubHealth } from './fleet.js'
-import { archiveCredentialForReauth, cancelLogin, credentialsExist, getLogin, startLogin } from './loginLauncher.js'
+import { credentialsExist } from './loginLauncher.js'
+import type { ProfileLoginCoordinator } from './profileLoginCoordinator.js'
 import { readProjectConfig } from './importScan.js'
 import { pickableProfiles, setClaudeConnectorPolicy } from './profiles.js'
-import { ProfileOwnership } from './profileOwnership.js'
+import type { ProfileOwnership } from './profileOwnership.js'
 import { asFileWriteDiffDensity } from './types.js'
-import type { DangerFlags, HubEvent, HubPrefs, ManagerAgentType, Profile, Provider, ReplayComplete, ReplayStart } from './types.js'
+import type { DangerFlags, HubPrefs, ManagerAgentType, Profile, Provider } from './types.js'
 import type { Executor } from './executor.js'
 import type { WorktreeProjectActivity } from './worktreeCollisionDetector.js'
 import type { WorkspaceManager } from './workspace.js'
@@ -32,6 +45,16 @@ import { AttachmentInputError, attachmentLimitForMime, isClaudeImageMime } from 
 import { GitHubImportService } from './githubImport.js'
 import { classifyWorkspacePath, type WorkspacePath } from './workspaceLocation.js'
 import { WslService } from './wsl.js'
+import {
+  dismissRecoveryNotice,
+  listRecoveryNotices,
+} from './journalRecovery.js'
+import { attachReplayStream, ReplayPrincipalBudget } from './replayStream.js'
+import { durableReplaySessions } from './replayBaseline.js'
+
+const REPLAY_BASELINE_MAX_BYTES = 2 * 1024 * 1024
+const REPLAY_BASELINE_MAX_SESSIONS = 5_000
+const REPLAY_BASELINE_MAX_PROJECTS = 1_000
 
 const PAGE = `<!doctype html>
 <html>
@@ -150,11 +173,23 @@ async function sendInput() {
   if (out.error) alert(out.error)
   document.getElementById('text').value = ''
 }
-function connectEvents() {
+async function connectEvents() {
   const box = document.getElementById('events')
-  const ws = new WebSocket('ws://' + location.host + '/ws?since=0')
+  const baseline = await j('/api/replay-baseline')
+  if (!baseline || baseline.error || !Number.isSafeInteger(baseline.highWaterSeq)) {
+    setTimeout(connectEvents, 2000)
+    return
+  }
+  const ws = new WebSocket(
+    'ws://' + location.host + '/ws?since=' + baseline.highWaterSeq + '&generation=' + baseline.generation
+  )
   ws.onmessage = (e) => {
     const ev = JSON.parse(e.data)
+    if (ev.type === 'replay-reset-required') {
+      ws.close()
+      return
+    }
+    if (ev.type === 'replay-start' || ev.type === 'replay-complete') return
     const line = document.createElement('div')
     const payload = JSON.stringify(ev.payload)
     line.innerHTML = '<span class="muted">' + ev.ts.slice(11, 19) + '</span> <span class="k">' + ev.kind + '</span> ' +
@@ -355,10 +390,15 @@ export interface ServerOptions {
    *  profile dir. Threaded from index.ts so it stays in lockstep with where the hub SCANS profiles. */
   profilesDir: string
   profileOwnership?: ProfileOwnership
+  profileLoginCoordinator?: Pick<
+    ProfileLoginCoordinator,
+    'start' | 'get' | 'getForProfile' | 'cancel'
+  >
   journal: Journal
   sessions: SessionManager
   profiles: Profile[]
   approvals: ApprovalService
+  questions: QuestionService
   usage: UsageMonitor
   projects: ProjectStore
   workspace: WorkspaceManager
@@ -459,11 +499,8 @@ export function persistPrefs(
 
 export function startServer(opts: ServerOptions): http.Server {
   const { port, defaultCwd, profilesDir, journal, sessions, profiles, approvals, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity } = opts
-  const profileOwnership = opts.profileOwnership ?? new ProfileOwnership({
-    ownerId: `server-${process.pid}`,
-    pid: process.pid,
-    port,
-  })
+  const replayPrincipalBudget = new ReplayPrincipalBudget()
+  const questions = opts.questions
   // Runtime repositories live beside the journal/config under HUB_DATA_DIR, never in the shipped hub
   // payload or profiles tree. GitHubImportService keeps auth entirely inside an existing `gh` session.
   const github = new GitHubImportService(
@@ -471,7 +508,7 @@ export function startServer(opts: ServerOptions): http.Server {
     (name, projectPath, location) => projects.create(name, projectPath, location)
   )
   const wsl = new WslService()
-  const loginNames = new Map<string, string>()
+  const profileLoginCoordinator = opts.profileLoginCoordinator
 
   async function resolveProjectPath(rawPath: string, distro?: string): Promise<WorkspacePath> {
     const syntax = classifyWorkspacePath(rawPath, { distro })
@@ -649,9 +686,14 @@ export function startServer(opts: ServerOptions): http.Server {
       // The hub owns a headless vendor auth process and captures the OAuth URL. The desktop opens the
       // URL through its native shell; a headless/remote caller gets the same URL to open manually.
       if (method === 'POST' && url.pathname === '/api/accounts/login') {
+        if (!profileLoginCoordinator) {
+          json(res, { ok: false, error: 'profile sign-in coordinator is unavailable' }, 503)
+          return
+        }
         const body = await readBody(req)
         const provider = body.provider
         const name = String(body.name ?? '')
+        const idempotencyKey = String(body.idempotencyKey ?? '')
         if (provider !== 'claude' && provider !== 'codex') {
           json(res, { ok: false, error: 'provider must be claude|codex' }, 400)
           return
@@ -660,77 +702,95 @@ export function startServer(opts: ServerOptions): http.Server {
           json(res, { ok: false, error: 'name must match ^[a-zA-Z0-9_-]+$' }, 400)
           return
         }
+        if (!/^[a-zA-Z0-9._:-]{1,128}$/.test(idempotencyKey)) {
+          json(res, { ok: false, error: 'idempotencyKey is required' }, 400)
+          return
+        }
         const profileDir = path.join(profilesDir, name)
         const reauth = body.reauth === true
-        try {
-          profileOwnership.assertOwned(name, profileDir, reauth ? 'replace credentials' : 'create credentials')
-        } catch (error) {
-          json(res, { ok: false, error: error instanceof Error ? error.message : String(error) }, 409)
+        const existing = profileLoginCoordinator.getForProfile(
+          name,
+          idempotencyKey,
+        )
+        if (existing) {
+          if (existing.provider !== provider) {
+            json(
+              res,
+              {
+                ok: false,
+                error:
+                  'The idempotency key belongs to a different sign-in request.',
+              },
+              409,
+            )
+            return
+          }
+          json(
+            res,
+            {
+              ...existing,
+              manual: `pnpm login:${provider} profiles/${name}`,
+            },
+            existing.ok ? (existing.status === 'complete' ? 200 : 202) : 409,
+          )
           return
         }
         if (credentialsExist(provider as Provider, profileDir) && !reauth) {
           json(res, { ok: false, error: `profiles/${name} already has ${provider} credentials` }, 409)
           return
         }
-        if (reauth) {
-          archiveCredentialForReauth(provider as Provider, profileDir)
-        }
-        const login = await startLogin(provider as Provider, profileDir)
-        const ok = login.status === 'waiting' || login.status === 'complete'
-        if (ok) loginNames.set(login.id, name)
+        const login = await profileLoginCoordinator.start({
+          provider: provider as Provider,
+          profileId: name,
+          reauth,
+          idempotencyKey,
+        })
         json(
           res,
           {
-            ok,
-            loginId: login.id,
-            provider,
-            status: login.status,
-            url: login.url,
-            code: login.code,
-            error: login.error,
+            ...login,
             manual: `pnpm login:${provider} profiles/${name}`,
           },
-          ok ? 200 : 502
+          login.ok ? (login.status === 'complete' ? 200 : 202) : 409
         )
+        return
+      }
+      const accountLoginProfileMatch =
+        /^\/api\/accounts\/login\/profile\/([^/]+)$/.exec(url.pathname)
+      if (accountLoginProfileMatch && method === 'GET') {
+        if (!profileLoginCoordinator) {
+          json(res, { ok: false, error: 'profile sign-in coordinator is unavailable' }, 503)
+          return
+        }
+        const profileId = decodeURIComponent(accountLoginProfileMatch[1] as string)
+        const idempotencyKey = url.searchParams.get('key') ?? ''
+        const login = profileLoginCoordinator.getForProfile(
+          profileId,
+          idempotencyKey,
+        )
+        if (!login) {
+          json(res, { ok: false, error: 'unknown profile sign-in attempt' }, 404)
+          return
+        }
+        json(res, login)
         return
       }
       const accountLoginMatch = /^\/api\/accounts\/login\/([^/]+)$/.exec(url.pathname)
       if (accountLoginMatch && (method === 'GET' || method === 'DELETE')) {
+        if (!profileLoginCoordinator) {
+          json(res, { ok: false, error: 'profile sign-in coordinator is unavailable' }, 503)
+          return
+        }
         const loginId = decodeURIComponent(accountLoginMatch[1] as string)
-        const login = method === 'DELETE' ? cancelLogin(loginId) : getLogin(loginId)
+        const login =
+          method === 'DELETE'
+            ? profileLoginCoordinator.cancel(loginId)
+            : profileLoginCoordinator.get(loginId)
         if (!login) {
           json(res, { ok: false, error: 'unknown or expired login attempt' }, 404)
           return
         }
-        const name = loginNames.get(loginId)
-        if (login.status === 'complete') {
-          const list = rescanProfiles()
-          const profile = list.find((p) => p.id === name)
-          if (profile) {
-            profile.authStatus = 'signed_in'
-            profile.authError = undefined
-          }
-          loginNames.delete(loginId)
-          json(res, {
-            ok: true,
-            loginId,
-            status: login.status,
-            provider: login.provider,
-            added: profile?.id ?? name,
-          })
-          return
-        }
-        const ok = method === 'DELETE' || login.status === 'capturing' || login.status === 'waiting'
-        if (!ok) loginNames.delete(loginId)
-        json(res, {
-          ok,
-          loginId,
-          provider: login.provider,
-          status: login.status,
-          url: login.url,
-          code: login.code,
-          error: login.error,
-        })
+        json(res, login)
         return
       }
       if (method === 'POST' && url.pathname === '/api/pick-folder') {
@@ -1190,6 +1250,32 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, approvals.pending())
         return
       }
+      if (method === 'GET' && url.pathname === '/api/questions') {
+        json(res, questions.pending())
+        return
+      }
+      if (method === 'GET' && url.pathname === '/api/recovery-notices') {
+        json(res, listRecoveryNotices(journal.db))
+        return
+      }
+      const recoveryNoticeMatch =
+        /^\/api\/recovery-notices\/([^/]+)\/dismiss$/.exec(url.pathname)
+      if (method === 'POST' && recoveryNoticeMatch) {
+        let planId: string
+        try {
+          const rawPlanId = recoveryNoticeMatch[1]!
+          if (rawPlanId.length > 128) throw new Error('recovery notice id is too long')
+          planId = decodeURIComponent(rawPlanId)
+          if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(planId)) {
+            throw new Error('recovery notice id is not a UUID')
+          }
+        } catch {
+          throw new BadRequestError('recovery notice id is malformed')
+        }
+        const found = dismissRecoveryNotice(journal.db, planId)
+        json(res, found ? { ok: true } : { error: 'recovery notice not found' }, found ? 200 : 404)
+        return
+      }
       if (method === 'GET' && url.pathname === '/api/usage') {
         json(res, usage.list())
         return
@@ -1241,10 +1327,50 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, usage.list())
         return
       }
+      if (method === 'GET' && url.pathname === '/api/replay-baseline') {
+        // Every included record and the watermark comes from this one SQLite snapshot. Process-owner
+        // state (approvals/questions) and volatile config/usage live on their bounded side endpoints and
+        // refresh after the socket connects; mixing those in-memory values here would let a foreign hub
+        // commit outrun the baseline forever.
+        const baseline = journal.readReplaySnapshot((checkpoint) => ({
+          version: checkpoint.version,
+          generation: checkpoint.generation,
+          highWaterSeq: checkpoint.cursor,
+          resetFloorSeq: checkpoint.resetFloorSeq,
+          sessions: durableReplaySessions(journal.db, bus.pendingCounts()),
+          projects: projects.list(),
+          journalCompaction: journal.latestCompactionLifecycle(),
+        }))
+        if (
+          baseline.sessions.length > REPLAY_BASELINE_MAX_SESSIONS ||
+          baseline.projects.length > REPLAY_BASELINE_MAX_PROJECTS
+        ) {
+          json(res, { error: 'current-state replay baseline exceeds its row bound' }, 503)
+          return
+        }
+        if (Buffer.byteLength(JSON.stringify(baseline)) > REPLAY_BASELINE_MAX_BYTES) {
+          json(res, { error: 'current-state replay baseline exceeds its byte bound' }, 503)
+          return
+        }
+        json(res, baseline)
+        return
+      }
       if (method === 'GET' && url.pathname === '/api/events') {
-        // Page the full backlog from `since` (not just the first 2000 rows) so a caller polling
-        // over HTTP gets the same complete, gap-free history the WS replay delivers.
-        json(res, [...journal.replay(Number(url.searchParams.get('since') ?? 0))])
+        // Diagnostic polling is bounded too. A caller that needs more advances `since`; there is no
+        // endpoint left that materializes the 981 MB journal in one response.
+        const since = Number(url.searchParams.get('since') ?? 0)
+        if (!Number.isSafeInteger(since) || since < 0) throw new BadRequestError('invalid since cursor')
+        const checkpoint = journal.replayCheckpoint()
+        const page = journal.boundedReplayPage(since, checkpoint.cursor, {
+          maxRows: 2_000,
+          maxBytes: 2 * 1024 * 1024,
+          maxFrameBytes: 512 * 1024,
+        })
+        if (page.tooLarge) {
+          json(res, { error: 'journal event exceeds diagnostic response bound', seq: page.tooLarge.seq }, 413)
+          return
+        }
+        json(res, page)
         return
       }
       if (method === 'POST' && url.pathname === '/api/sessions') {
@@ -1348,6 +1474,15 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, { ok: found }, found ? 200 : 404)
         return
       }
+      const questionMatch = /^\/api\/questions\/([^/]+)$/.exec(url.pathname)
+      if (method === 'POST' && questionMatch) {
+        const decision = parseQuestionDecisionBody(await readBody(req))
+        const found = decision.kind === 'cancel'
+          ? questions.cancel(questionMatch[1] as string)
+          : questions.answer(questionMatch[1] as string, decision.answers)
+        json(res, { ok: found }, found ? 200 : 404)
+        return
+      }
       const modeMatch = /^\/api\/sessions\/([^/]+)\/mode$/.exec(url.pathname)
       if (method === 'POST' && modeMatch) {
         const body = await readBody(req)
@@ -1390,6 +1525,28 @@ export function startServer(opts: ServerOptions): http.Server {
         }
         await sessions.setBrowserLocalNetwork(browserLocalMatch[1] as string, body.enabled)
         json(res, sessions.browserStatus(browserLocalMatch[1] as string))
+        return
+      }
+      const browserTabsMatch = /^\/api\/sessions\/([^/]+)\/browser\/tabs$/.exec(url.pathname)
+      if (method === 'POST' && browserTabsMatch) {
+        const body = await readBody(req)
+        if (typeof body.enabled !== 'boolean') {
+          json(res, { error: 'enabled must be boolean' }, 400)
+          return
+        }
+        await sessions.setBrowserTabs(browserTabsMatch[1] as string, body.enabled)
+        json(res, sessions.browserStatus(browserTabsMatch[1] as string))
+        return
+      }
+      const browserDownloadsMatch = /^\/api\/sessions\/([^/]+)\/browser\/downloads$/.exec(url.pathname)
+      if (method === 'POST' && browserDownloadsMatch) {
+        const body = await readBody(req)
+        if (typeof body.enabled !== 'boolean') {
+          json(res, { error: 'enabled must be boolean' }, 400)
+          return
+        }
+        await sessions.setBrowserDownloads(browserDownloadsMatch[1] as string, body.enabled)
+        json(res, sessions.browserStatus(browserDownloadsMatch[1] as string))
         return
       }
       const browserOriginMatch = /^\/api\/sessions\/([^/]+)\/browser\/origins\/revoke$/.exec(url.pathname)
@@ -1619,6 +1776,61 @@ export function startServer(opts: ServerOptions): http.Server {
         }
         return
       }
+      const journalHistoryMatch = /^\/api\/sessions\/([^/]+)\/journal-history$/.exec(url.pathname)
+      if (method === 'GET' && journalHistoryMatch) {
+        const beforeRaw = url.searchParams.get('before')
+        const beforeSeq = beforeRaw == null || beforeRaw === '' ? undefined : Number(beforeRaw)
+        const generation = Number(url.searchParams.get('generation'))
+        if (
+          beforeSeq !== undefined &&
+          (!Number.isSafeInteger(beforeSeq) || beforeSeq < 1)
+        ) {
+          throw new BadRequestError('invalid journal history cursor')
+        }
+        if (!Number.isSafeInteger(generation) || generation < 1) {
+          throw new BadRequestError('journal history generation is required')
+        }
+        try {
+          json(
+            res,
+            journal.sessionHistoryPage(journalHistoryMatch[1] as string, {
+              beforeSeq,
+              expectedGeneration: generation,
+              maxRows: JOURNAL_HISTORY_PAGE_MAX_ROWS,
+              maxBytes: JOURNAL_HISTORY_PAGE_MAX_BYTES,
+            })
+          )
+        } catch (error) {
+          if (error instanceof SessionHistoryIndexingError) {
+            json(
+              res,
+              {
+                error: 'journal history index is building',
+                retryable: true,
+                scannedThrough: error.scannedThrough,
+                target: error.target,
+              },
+              503
+            )
+            return
+          }
+          if (error instanceof ReplayGenerationChangedError) {
+            json(
+              res,
+              {
+                error: 'journal history generation changed',
+                resetRequired: true,
+                expected: error.expected,
+                actual: error.actual,
+              },
+              409
+            )
+            return
+          }
+          throw error
+        }
+        return
+      }
       const deleteMatch = /^\/api\/sessions\/([^/]+)\/delete$/.exec(url.pathname)
       if (method === 'POST' && deleteMatch) {
         const body = await readBody(req)
@@ -1684,6 +1896,14 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, { error: err.message }, 400)
         return
       }
+      if (err instanceof QuestionInputError) {
+        json(res, { error: err.message }, 400)
+        return
+      }
+      if (err instanceof QuestionOwnershipError) {
+        json(res, { error: err.message }, 503)
+        return
+      }
       json(res, { error: err instanceof Error ? err.message : String(err) }, 500)
     }
   }
@@ -1709,27 +1929,15 @@ export function startServer(opts: ServerOptions): http.Server {
   })
   wss.on('connection', (ws, req) => {
     const url = new URL(req.url ?? '/ws', 'http://localhost')
-    const since = Number(url.searchParams.get('since') ?? 0)
-    let replayedThrough = since
-    const replayStart: ReplayStart = { type: 'replay-start' }
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(replayStart))
-    // Replay the ENTIRE backlog from `since` (paged inside replay() so a huge journal isn't loaded
+    const since = Number(url.searchParams.get('since'))
+    const generationValue = url.searchParams.get('generation')
+    const generation = generationValue === null ? undefined : Number(generationValue)
+    try {
+      attachReplayStream(ws, journal, { since, generation, principalBudget: replayPrincipalBudget })
+    } catch {
+      ws.close(1011, 'journal replay unavailable')
+    }
     // at once), then attach the live listener — all synchronously, with no `await` between the last
-    // replayed event and journal.on(), so no live event can slip into the gap or be sent twice. The
-    // non-journal boundary is queued in that same gap-free window; it reports stream position only and
-    // lets the client distinguish rebuilt history from the live events that follow. The client also
-    // dedups on seq <= lastSeq, covering any reconnect overlap.
-    for (const event of journal.replay(since)) {
-      replayedThrough = event.seq
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event))
-    }
-    const boundary: ReplayComplete = { type: 'replay-complete', lastSeq: replayedThrough }
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(boundary))
-    const listener = (event: HubEvent): void => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event))
-    }
-    journal.on('event', listener)
-    ws.on('close', () => journal.off('event', listener))
   })
 
   // Track live sockets so a blue-green drain can destroy them and free the fixed port promptly (WS

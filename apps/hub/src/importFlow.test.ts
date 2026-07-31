@@ -16,6 +16,7 @@ import { SessionManager } from './sessions.js'
 import { encodeClaudeCwd } from './importScan.js'
 import { CLAUDE_DEFAULT_ID, CODEX_DEFAULT_ID } from './profiles.js'
 import type { HubEvent, Profile } from './types.js'
+import { QuestionService } from './questions.js'
 
 // Build a SessionManager on temp resources (real hub plumbing, no vendor processes / network).
 function buildManager(tmp: string, profiles: Profile[], dbName = 'hub.db') {
@@ -30,7 +31,7 @@ function buildManager(tmp: string, profiles: Profile[], dbName = 'hub.db') {
   const bus = new AgentBus(journal.db)
   const memory = new MemoryStore(journal.db)
   const practices = new PracticeStore(journal.db)
-  const sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, { busCanUseRiskyTools: false, autoApprovePractices: false }, false, tmp)
+  const sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, { busCanUseRiskyTools: false, autoApprovePractices: false }, false, tmp, new QuestionService(journal))
   return { sessions, store, journal, projects, profileMap }
 }
 
@@ -77,7 +78,7 @@ describe('SessionManager.importChats (integration)', () => {
     const bus = new AgentBus(journal.db)
     const memory = new MemoryStore(journal.db)
     const practices = new PracticeStore(journal.db)
-    sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, { busCanUseRiskyTools: false, autoApprovePractices: false }, false, tmp)
+    sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, { busCanUseRiskyTools: false, autoApprovePractices: false }, false, tmp, new QuestionService(journal))
 
     projectId = projects.create('MyApp', target).id
     journal.on('event', (e) => events.push(e))

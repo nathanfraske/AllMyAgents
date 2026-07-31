@@ -29,7 +29,7 @@
  *     branches here are only the TRUE >HUB_RELAY_TIMEOUT_MS orphan).
  *   - Transient-gap queue tuning (drain pre-signal, stable-callId write dedup) is STEP 7.
  */
-import { ClaudeDriver } from './adapters/claude.js'
+import { ClaudeDriver, type ClaudePermissionContext } from './adapters/claude.js'
 import {
   CodexClient,
   codexRequestResult,
@@ -731,8 +731,18 @@ export class AgentWorker {
     spec: WorkerSessionSpec,
     toolName: string,
     input: unknown,
-    context?: { matchedAskRule?: { source: string; toolName: string; ruleContent?: string } }
+    context?: ClaudePermissionContext
   ): Promise<{ behavior: 'allow'; updatedInput: unknown } | { behavior: 'deny'; message: string }> {
+    if (toolName === 'AskUserQuestion') {
+      // The worker socket's current hello/welcome stream is local but unauthenticated. A forged peer could
+      // otherwise inject or settle operator questions. Keep the default in-process path fully functional,
+      // but fail closed here until the whole control protocol (not only question frames) is authenticated.
+      return {
+        behavior: 'deny',
+        message:
+          'AskUserQuestion is unavailable in worker mode until the worker control channel is authenticated.',
+      }
+    }
     if (AUTO_ALLOW_TOOLS.has(toolName)) return { behavior: 'allow', updatedInput: input }
     if (SELF_GATING_TOOLS.has(toolName)) {
       if (this.busTurnSessions.has(spec.sessionId) && !this.danger.busCanUseRiskyTools) {
@@ -804,6 +814,8 @@ export class AgentWorker {
     return reply.approved
   }
 
+  /** Relay one interactive question under vendor per-invocation identity. The request is inserted before
+   * the abort relay, so an already-aborted signal still reaches a successor hub in request→abort order. */
   /** Worktree containment. Shared with InProcessExecutor via ./writeScope.js — see the note there on why
    *  this must not exist twice, and on the NotebookEdit escape both copies used to have. */
   private checkWriteScope(spec: WorkerSessionSpec, toolName: string, input: unknown): string | undefined {

@@ -18,6 +18,7 @@ import { InstructionStore } from './instructions.js'
 import { AgentBus } from './bus.js'
 import { MemoryStore } from './memory.js'
 import { PracticeStore } from './practices.js'
+import { QuestionService } from './questions.js'
 import {
   HUB_RELAY_DELIVERED_BACKSTOP_MS,
   HUB_RELAY_TIMEOUT_MS,
@@ -310,7 +311,8 @@ describe('(a) stable-callId write dedup — a re-flushed write executes exactly 
       new PracticeStore(journal.db),
       SAFE,
       false,
-      tmp
+      tmp,
+      new QuestionService(journal)
     )
     const client = new FakeWorkerClient()
     const hub: WorkerExecutorHubCallbacks = {
@@ -544,6 +546,7 @@ describe('(e) turn-boundary-preferred flip (§8.4 optimization)', () => {
       SAFE,
       false,
       tmp,
+      new QuestionService(journal),
       fakeExecutor
     )
     const restarts: Array<{ reason: string; by?: string }> = []

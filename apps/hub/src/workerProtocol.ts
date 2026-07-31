@@ -172,6 +172,42 @@ export function stableApprovalId(sessionId: string, kind: string, payload: unkno
   return `ap_${h.digest('hex').slice(0, 24)}`
 }
 
+/** Per-vendor-invocation question identity. Payload is deliberately absent: two simultaneous identical
+ * asks have distinct toolUseID/requestId pairs and must remain distinct interactive requests. */
+export const MAX_QUESTION_CORRELATION_CHARS = 512
+
+export class InvalidQuestionCorrelationError extends Error {
+  constructor(field: string) {
+    super(`${field} must be a non-empty bounded string without control characters`)
+    this.name = 'InvalidQuestionCorrelationError'
+  }
+}
+
+function boundedQuestionCorrelation(value: unknown, field: string): string {
+  // Reject on the cheap UTF-16 bound before JSON.stringify can allocate a second attacker-sized string.
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value.length > MAX_QUESTION_CORRELATION_CHARS ||
+    /[\u0000-\u001f\u007f]/u.test(value)
+  ) {
+    throw new InvalidQuestionCorrelationError(field)
+  }
+  return value
+}
+
+export function stableQuestionId(sessionId: string, toolUseId: string, requestId: string): string {
+  const boundedSessionId = boundedQuestionCorrelation(sessionId, 'session id')
+  const boundedToolUseId = boundedQuestionCorrelation(toolUseId, 'toolUseID')
+  const boundedRequestId = boundedQuestionCorrelation(requestId, 'requestId')
+  const h = crypto.createHash('sha256')
+  h.update('allmyagents.ask-user-question.id.v1\0')
+  // JSON's array framing is unambiguous even if a future vendor id contains a delimiter/control byte.
+  // Plain NUL concatenation made ["a\0b","c"] collide with ["a","b\0c"] at the hash input.
+  h.update(JSON.stringify([boundedSessionId, boundedToolUseId, boundedRequestId]))
+  return `q_${h.digest('hex').slice(0, 32)}`
+}
+
 /** Stable JSON for hashing — recursively sorts object keys so equal payloads hash equal regardless of
  *  key order. Uses CODE-UNIT ordering (not localeCompare) so the canonical form is identical across
  *  runtimes/locales/ICU versions — the whole point is cross-process determinism. */

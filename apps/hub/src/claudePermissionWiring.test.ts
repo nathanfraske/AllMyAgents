@@ -39,7 +39,9 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
 
 const { ClaudeDriver } = await import('./adapters/claude.js')
 
-function makeDriver(canUseTool?: (t: string, i: unknown) => Promise<unknown>) {
+function makeDriver(
+  canUseTool?: (t: string, i: unknown, context?: unknown) => Promise<unknown>
+) {
   return new ClaudeDriver(
     '/tmp/profile',
     '/tmp/cwd',
@@ -90,5 +92,52 @@ describe('ClaudeDriver permission wiring', () => {
     const [name, input] = handler.mock.calls[0]!
     expect(name).toBe('Write')
     expect(input).toEqual({ file_path: '/etc/passwd' })
+  })
+
+  it('forwards the exact SDK correlation and abort context to the host handler', async () => {
+    const handler = vi.fn(
+      async (_toolName: string, input: unknown, _context?: unknown) => ({
+        behavior: 'allow' as const,
+        updatedInput: input,
+      })
+    )
+    await makeDriver(handler).send('hi', { permissionMode: 'safe' })
+
+    const installed = captured[0]!.canUseTool as (
+      toolName: string,
+      input: unknown,
+      context: unknown
+    ) => Promise<unknown>
+    const signal = new AbortController().signal
+    const context = {
+      signal,
+      toolUseID: 'toolu_context',
+      requestId: 'control_context',
+      agentID: 'agent_context',
+      matchedAskRule: {
+        source: 'user_settings',
+        toolName: 'AskUserQuestion',
+        ruleContent: 'ask the operator',
+      },
+    }
+    const input = { questions: [{ question: 'Exact?' }] }
+    await installed('AskUserQuestion', input, context)
+
+    expect(handler).toHaveBeenCalledTimes(1)
+    const [toolName, forwardedInput, forwardedContext] = handler.mock.calls[0]!
+    expect(toolName).toBe('AskUserQuestion')
+    expect(forwardedInput).toBe(input)
+    expect(forwardedContext).toBe(context)
+    expect(forwardedContext).toMatchObject({
+      signal,
+      toolUseID: 'toolu_context',
+      requestId: 'control_context',
+      agentID: 'agent_context',
+      matchedAskRule: {
+        source: 'user_settings',
+        toolName: 'AskUserQuestion',
+        ruleContent: 'ask the operator',
+      },
+    })
   })
 })

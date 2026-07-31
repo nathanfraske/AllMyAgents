@@ -13,14 +13,26 @@ import { buildAgentMcpServer, type AgentServices } from './agentTools.js'
 import type { ManagerSpawnResult } from './agentToolCore.js'
 import type { SessionIdentity } from './identity.js'
 import type { ApprovalService } from './approvals.js'
+import {
+  ASK_UNAVAILABLE_MESSAGE,
+  QuestionInputError,
+  QuestionOwnershipError,
+  type QuestionService,
+} from './questions.js'
 import type { UsageMonitor } from './usage.js'
 import type { MemoryStore } from './memory.js'
 import type { PracticeStore } from './practices.js'
 import type { BusAddress, BusMessage } from './bus.js'
 import type { ClaudeLimitInfo, DangerFlags, SessionStatus } from './types.js'
-import type { LiveSession, WorkerSessionSpec } from './workerProtocol.js'
+import {
+  InvalidQuestionCorrelationError,
+  stableQuestionId,
+  type LiveSession,
+  type WorkerSessionSpec,
+} from './workerProtocol.js'
 import { checkWriteScope } from './writeScope.js'
 import type { AttachmentMeta } from './attachments.js'
+import { ASK_RESTART_INTERRUPT_MARGIN_MS } from './restartHandshake.js'
 
 /**
  * The Executor seam (docs/agent-worker-impl.md §4.1). Agent execution — the ClaudeDriver / CodexClient
@@ -55,6 +67,16 @@ export interface Executor {
   attach(since: Record<string, number>): Promise<void>
   /** True while this session's claude driver is mid-turn — backs the "a turn is already in progress" guard. */
   isBusy(sessionId: string): boolean
+  /**
+   * Snapshot the exact in-process turn promises currently owning unanswered questions, then observe their
+   * terminal boundary without confusing a stale terminal with a later turn. Worker mode never implements
+   * this because AskUserQuestion is denied before crossing its unauthenticated control channel.
+   */
+  settleQuestionTurnsForRestart?(
+    sessionIds: readonly string[],
+    timeoutMs: number,
+    signal?: AbortSignal
+  ): Promise<{ settled: string[]; outcomeUnknown: string[] }>
   /**
    * Push the live Danger Zone flags to the executor so the worker's cached `danger()` (read by the MCP
    * gates, §3.3) stays current. WORKER-MODE ONLY: the in-process executor reads the shared `danger`
@@ -95,21 +117,40 @@ export const AUTO_ALLOW_TOOLS = new Set([
   'mcp__allmyagents__spawn_agent',
   'mcp__allmyagents__set_child_authority',
   'mcp__allmyagents__decide_child_approval',
+  'mcp__allmyagents__assign_child_task',
   'mcp__allmyagents__memory_write',
   'mcp__allmyagents__memory_search',
   'mcp__allmyagents__memory_read',
   'mcp__allmyagents__practice_read',
   'mcp__allmyagents__practice_list',
+  // Read-only/session-view browser tools still pass through SessionManager's positive operator-turn
+  // attribution gate. Auto-allowing them here prevents a meaningless generic SDK prompt; it does not
+  // grant Browser, cross a bus turn, or bypass session/tab ownership.
+  'mcp__allmyagents__browser_read_page',
+  'mcp__allmyagents__browser_tabs',
+  'mcp__allmyagents__browser_switch_tab',
+  'mcp__allmyagents__browser_close_tab',
+  'mcp__allmyagents__browser_download_read',
+  'mcp__allmyagents__browser_screenshot',
+  'mcp__allmyagents__browser_status',
 ])
 export const SELF_GATING_TOOLS = new Set([
   'mcp__allmyagents__practice_write',
   'mcp__allmyagents__practice_edit',
+  // These handlers own their meaningful browser approvals: navigate asks only for a new public-origin
+  // grant, while click/tab/download prepare a native descriptor then ask exactly once for that target.
+  // canUseTool must not put a generic tool prompt in front of those host-authored prompts.
+  'mcp__allmyagents__browser_navigate',
+  'mcp__allmyagents__browser_click',
+  'mcp__allmyagents__browser_open_tab',
+  'mcp__allmyagents__browser_download',
 ])
 
 /** Hub-owned services the in-process executor calls directly (shared references — the same objects the
  *  hub holds, so e.g. the Danger Zone flags read live). */
 export interface InProcessExecutorServices {
   approvals: ApprovalService
+  questions: QuestionService
   usage: UsageMonitor
   danger: DangerFlags
   memory: MemoryStore
@@ -184,7 +225,7 @@ export interface InProcessExecutorHubHooks {
   ): { ok: boolean; taskId?: string; error?: string }
   browser(
     sessionId: string,
-    operation: 'navigate' | 'read' | 'screenshot' | 'status',
+    operation: Parameters<AgentServices['browser']>[1],
     args: Record<string, unknown>
   ): ReturnType<AgentServices['browser']>
 }
@@ -207,6 +248,10 @@ export class InProcessExecutor implements Executor {
   // for the whole window a tool handler can run in. Set from runTurn's `origin`, cleared in `finally`;
   // read by the self-gate + canUseTool to hard-deny risky in-process tools on bus turns.
   private readonly busTurnSessions = new Set<string>()
+  private readonly turnSettlements = new Map<
+    string,
+    { token: symbol; promise: Promise<void> }
+  >()
   private hub: InProcessExecutorHubHooks | undefined
 
   constructor(private readonly services: InProcessExecutorServices) {}
@@ -352,13 +397,77 @@ export class InProcessExecutor implements Executor {
           this.h.journal(spec.sessionId, kind, payload)
           if (kind === 'claude/rate_limit_event') {
             const info = (payload as { rate_limit_info?: ClaudeLimitInfo }).rate_limit_info
-            if (info) this.services.usage.noteClaude(spec.profileId, info)
+            if (info) {
+              const authority = this.services.usage.captureProfileAuthority(spec.profileId)
+              this.services.usage.noteClaude(spec.profileId, info, authority)
+            }
           } else if (kind === 'claude/result') {
             const cost = (payload as { total_cost_usd?: number }).total_cost_usd
-            this.services.usage.noteClaudeCost(spec.profileId, cost)
+            const authority = this.services.usage.captureProfileAuthority(spec.profileId)
+            this.services.usage.noteClaudeCost(spec.profileId, cost, authority)
           }
         },
         async (toolName, input, context) => {
+          if (toolName === 'AskUserQuestion') {
+            if (!context?.toolUseID || !context.requestId || !context.signal) {
+              return {
+                behavior: 'deny',
+                message: 'AskUserQuestion arrived without required SDK correlation; no answer was submitted',
+              }
+            }
+            try {
+              const outcome = await this.services.questions.request({
+                id: stableQuestionId(spec.sessionId, context.toolUseID, context.requestId),
+                sessionId: spec.sessionId,
+                toolUseId: context.toolUseID,
+                requestId: context.requestId,
+                input,
+                signal: context.signal,
+              })
+              if (outcome.kind === 'answered') {
+                return { behavior: 'allow', updatedInput: outcome.updatedInput }
+              }
+              if (outcome.kind === 'interrupted') {
+                return { behavior: 'deny', message: outcome.message }
+              }
+              return {
+                behavior: 'deny',
+                message:
+                  outcome.reason === 'aborted'
+                    ? 'The question was cancelled because the turn was interrupted.'
+                    : outcome.reason === 'recovery-unknown'
+                      ? 'The answer was submitted before a hub restart, but exact delivery could not be verified. Ask again if the answer is still needed.'
+                    : outcome.reason === 'unavailable'
+                      ? outcome.message ??
+                        'AskUserQuestion is unavailable; no user response was inferred.'
+                      : 'The user cancelled the question.',
+              }
+            } catch (error) {
+              if (error instanceof QuestionOwnershipError) {
+                return {
+                  behavior: 'deny',
+                  message: ASK_UNAVAILABLE_MESSAGE,
+                }
+              }
+              if (
+                error instanceof QuestionInputError ||
+                error instanceof InvalidQuestionCorrelationError
+              ) {
+                this.h.journal(spec.sessionId, 'question/rejected', {
+                  code: 'invalid-question-input',
+                  toolUseIdLength:
+                    typeof context.toolUseID === 'string' ? context.toolUseID.length : null,
+                  requestIdLength:
+                    typeof context.requestId === 'string' ? context.requestId.length : null,
+                })
+                return {
+                  behavior: 'deny',
+                  message: `AskUserQuestion was rejected because its input was invalid: ${error.message}`,
+                }
+              }
+              throw error
+            }
+          }
           // The hub's own SAFE agent tools (inter-agent bus + shared memory reads/writes + practice
           // reads) are ACL-enforced in-tool; gating them behind human approval would defeat
           // autonomous coordination.
@@ -438,9 +547,81 @@ export class InProcessExecutor implements Executor {
     // fire-and-forget (the turn runs to completion in the background); a codex turn awaits through the
     // turn/start ack. Both turn loops catch their own errors, so neither rejects.
     if (spec.provider === 'claude') {
-      void this.runClaudeTurn(spec, prompt, origin, attachments)
+      const token = Symbol(spec.sessionId)
+      const promise = this.runClaudeTurn(spec, prompt, origin, attachments)
+      this.turnSettlements.set(spec.sessionId, { token, promise })
+      const clear = (): void => {
+        if (this.turnSettlements.get(spec.sessionId)?.token === token) {
+          this.turnSettlements.delete(spec.sessionId)
+        }
+      }
+      void promise.then(clear, clear)
     } else {
       await this.runCodexTurn(spec, prompt, origin, attachments)
+    }
+  }
+
+  async settleQuestionTurnsForRestart(
+    sessionIds: readonly string[],
+    timeoutMs: number,
+    signal?: AbortSignal
+  ): Promise<{ settled: string[]; outcomeUnknown: string[] }> {
+    const snapshots = [...new Set(sessionIds)].map((sessionId) => ({
+      sessionId,
+      promise: this.turnSettlements.get(sessionId)?.promise,
+    }))
+    const settled = new Set<string>()
+    const observed = snapshots.map(({ sessionId, promise }) => {
+      if (!promise) return Promise.resolve()
+      return promise.finally(() => {
+        settled.add(sessionId)
+      })
+    })
+    let timer: NodeJS.Timeout | undefined
+    let removeAbort: (() => void) | undefined
+    await Promise.race([
+      Promise.allSettled(observed),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, Math.max(0, timeoutMs))
+      }),
+      new Promise<void>((resolve) => {
+        if (!signal) return
+        if (signal.aborted) {
+          resolve()
+          return
+        }
+        const abort = () => resolve()
+        signal.addEventListener('abort', abort, { once: true })
+        removeAbort = () => signal.removeEventListener('abort', abort)
+      }),
+    ])
+    if (timer) clearTimeout(timer)
+    removeAbort?.()
+    const outcomeUnknown = snapshots
+      .filter(({ sessionId, promise }) => !promise || !settled.has(sessionId))
+      .map(({ sessionId }) => sessionId)
+    const expiredExactHandles = snapshots
+      .filter(({ sessionId, promise }) => promise && !settled.has(sessionId))
+      .map(({ sessionId }) => sessionId)
+    if (expiredExactHandles.length && !signal?.aborted) {
+      // Dispatch and briefly observe every interrupt before listener release. The handshake owns the shared
+      // bounded drain deadline, so an unresponsive provider remains unknown rather than holding the port.
+      let interruptTimer: NodeJS.Timeout | undefined
+      await Promise.race([
+        Promise.allSettled(
+          expiredExactHandles.map((sessionId) => this.interrupt(sessionId))
+        ),
+        new Promise<void>((resolve) => {
+          interruptTimer = setTimeout(resolve, ASK_RESTART_INTERRUPT_MARGIN_MS)
+        }),
+      ])
+      if (interruptTimer) clearTimeout(interruptTimer)
+    }
+    return {
+      settled: snapshots
+        .filter(({ sessionId, promise }) => promise && settled.has(sessionId))
+        .map(({ sessionId }) => sessionId),
+      outcomeUnknown,
     }
   }
 

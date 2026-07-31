@@ -15,6 +15,7 @@ import { ApprovalService } from './approvals.js'
 import { UsageMonitor } from './usage.js'
 import { WorkspaceManager } from './workspace.js'
 import type { WorkerSessionSpec } from './workerProtocol.js'
+import { QuestionService } from './questions.js'
 
 const cleanups: Array<() => void> = []
 
@@ -69,6 +70,7 @@ describe('per-project executable-config trust seam', () => {
       { busCanUseRiskyTools: false, autoApprovePractices: false },
       false,
       tmp,
+      new QuestionService(journal),
       executor
     )
     cleanups.push(() => {

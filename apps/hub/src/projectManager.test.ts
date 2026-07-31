@@ -16,6 +16,7 @@ import { SessionStore } from './store.js'
 import type { Profile, SessionRecord, SessionStatus } from './types.js'
 import { UsageMonitor } from './usage.js'
 import { WorkspaceManager } from './workspace.js'
+import { QuestionService } from './questions.js'
 
 const cleanups: Array<() => void> = []
 
@@ -70,6 +71,7 @@ function buildHub() {
     { busCanUseRiskyTools: false, autoApprovePractices: false },
     false,
     root,
+    new QuestionService(journal),
     executor
   )
   const seed = (record: Partial<SessionRecord> & Pick<SessionRecord, 'id'>): SessionRecord => {
@@ -351,7 +353,7 @@ describe('project manager visibility into its own workers', () => {
     expect(sessions.busPeek('other-manager', 'child', { view: 'tasks' })).toEqual({ found: false })
   })
 
-  it('journals manager-assigned tasks onto the same board and rejects a non-child', () => {
+  it('journals manager-assigned tasks onto the same board and rejects a non-child without journaling', () => {
     const { sessions, journal, seed } = buildHub()
     seed({ id: 'manager', isProjectManager: true, projectId: 'project', title: 'Curie' })
     seed({ id: 'child', parentSessionId: 'manager', projectId: 'project' })
@@ -363,9 +365,15 @@ describe('project manager visibility into its own workers', () => {
     })
     expect(assigned.ok).toBe(true)
     expect(assigned.taskId).toMatch(/^manager:/)
+    const eventCountBeforeRejection = (
+      journal.db.prepare('SELECT COUNT(*) AS count FROM events').get() as { count: number }
+    ).count
     expect(
       sessions.managerAssignChildTask('manager', 'unrelated', { title: 'This must fail' }),
     ).toEqual({ ok: false, error: 'target is not this manager’s direct child' })
+    expect(
+      (journal.db.prepare('SELECT COUNT(*) AS count FROM events').get() as { count: number }).count,
+    ).toBe(eventCountBeforeRejection)
 
     const tasks = sessions.busPeek('manager', 'child', { view: 'tasks' })
     expect(tasks.summary).toContain('Own the parser files')
@@ -378,6 +386,68 @@ describe('project manager visibility into its own workers', () => {
         }),
       ]),
     )
+  })
+
+  it('rejects a task update owned by another manager without journaling', () => {
+    const { sessions, journal, seed } = buildHub()
+    seed({ id: 'manager', isProjectManager: true, projectId: 'project', title: 'Curie' })
+    seed({ id: 'child', parentSessionId: 'manager', projectId: 'project' })
+    journal.append('child', 'manager/task-assigned', {
+      version: 1,
+      id: 'manager:prior-owner',
+      title: 'Prior assignment',
+      status: 'pending',
+      managerSessionId: 'prior-manager',
+      managerLabel: 'Noether',
+      childSessionId: 'child',
+      assignedAt: '2026-07-29T12:00:00.000Z',
+    })
+    const eventCountBeforeRejection = (
+      journal.db.prepare('SELECT COUNT(*) AS count FROM events').get() as { count: number }
+    ).count
+
+    expect(
+      sessions.managerAssignChildTask('manager', 'child', {
+        taskId: 'manager:prior-owner',
+        title: 'Attempted takeover',
+        status: 'in_progress',
+      }),
+    ).toEqual({ ok: false, error: 'task is not an assignment owned by this manager' })
+    expect(
+      (journal.db.prepare('SELECT COUNT(*) AS count FROM events').get() as { count: number }).count,
+    ).toBe(eventCountBeforeRejection)
+  })
+
+  it('rejects taking over an agent-origin task without journaling', () => {
+    const { sessions, journal, seed } = buildHub()
+    seed({ id: 'manager', isProjectManager: true, projectId: 'project', title: 'Curie' })
+    seed({ id: 'child', parentSessionId: 'manager', projectId: 'project' })
+    journal.append('child', 'claude/assistant', {
+      message: {
+        content: [
+          { type: 'tool_use', id: 'task-create', name: 'TaskCreate', input: { subject: 'Agent-owned task' } },
+        ],
+      },
+    })
+    journal.append('child', 'claude/user', {
+      message: {
+        content: [{ type: 'tool_result', tool_use_id: 'task-create', content: 'Created task #7' }],
+      },
+    })
+    const eventCountBeforeRejection = (
+      journal.db.prepare('SELECT COUNT(*) AS count FROM events').get() as { count: number }
+    ).count
+
+    expect(
+      sessions.managerAssignChildTask('manager', 'child', {
+        taskId: '7',
+        title: 'Attempted manager takeover',
+        status: 'completed',
+      }),
+    ).toEqual({ ok: false, error: 'task is not an assignment owned by this manager' })
+    expect(
+      (journal.db.prepare('SELECT COUNT(*) AS count FROM events').get() as { count: number }).count,
+    ).toBe(eventCountBeforeRejection)
   })
 
   it('reports an empty child board honestly', () => {

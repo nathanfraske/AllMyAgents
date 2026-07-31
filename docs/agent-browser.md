@@ -1,9 +1,10 @@
 # Per-agent browser capability
 
-Research and implementation specification, 2026-07-27. **Specification only: no product code is enabled by this
-change.** This document records the scope decision explicitly because a browser-shaped stub is worse than no browser:
-the current desktop/hub boundary cannot yet provide an app-owned, isolated, visible browser with semantic reads and
-screenshots end to end.
+Research, security contract, and implementation status, revised 2026-07-30. The Windows/WebView2 implementation has
+passed its installed Edge/WebView2 Runtime 150 physical gate; non-Windows platforms remain explicitly unavailable.
+The capability stays off by default on every chat. This document distinguishes implemented Windows behavior from
+future work because a browser-shaped stub or a UI toggle without an enforceable native boundary is worse than no
+browser.
 
 This document supersedes the browser-specific recommendation in `docs/agent-native-tools.md` and the claim in
 `docs/t3code-tooling-gaps.md` that T3Code has no browser tooling. Those documents were written three days earlier.
@@ -21,9 +22,10 @@ Build an **AllMyAgents-owned browser**, not a bridge to the operator's everyday 
 - one persistent, initially blank browser data store per agent session;
 - off by default, enabled explicitly on the individual chat;
 - the same hub-owned tool contract for Claude and Codex;
-- first slice: navigate, semantic page read, and screenshot only;
-- no agent click, type, form submission, upload, download, arbitrary JavaScript, raw CDP, credential filling, or
-  operator-profile import;
+- observation: navigate, semantic page read, screenshot, and session-owned tab listing;
+- bounded mutation: approval-bound semantic click, controlled tabs, and inert downloads only;
+- no raw selector, coordinates, model-supplied JavaScript, typing, form-value entry, upload, raw CDP, credential
+  filling, arbitrary download path, auto-open/execute, or operator-profile import;
 - durable, session-attributed navigation journal;
 - browsing is hard-denied on teammate-message and other non-operator turns in the first slice.
 
@@ -32,22 +34,17 @@ autofill data, but persists for that one agent across app/hub restarts. The oper
 agent's visible window after seeing a warning that the agent can subsequently read pages in that signed-in session.
 No agent ever inherits another agent's state, even when both use the same vendor account or project.
 
-### Why no code in this cut
+### Current Windows implementation
 
-`apps/desktop/src-tauri/src/lib.rs` proves the shell can create additional webview windows, and Tauri supports a
-per-webview data directory. That is only the first 20 percent of the capability. The current application has:
-
-1. no authenticated request/response broker from the Node hub to the Rust desktop;
-2. no safe, cross-platform way to return evaluated page data from an untrusted webview;
-3. no cross-platform webview screenshot implementation;
-4. a text-only agent-tool result type, so neither provider transport can return an MCP image block;
-5. no per-session browser capability on `SessionRecord`;
-6. no browser host in the web UI and no browser-specific audit projection.
-
-Adding tools before all six exist would expose calls that hang when the desktop is absent, or tempt a fallback to
-HTTP/headless Playwright that is neither the visible app browser nor the isolated browser the operator authorized.
-Adding only a toggle would create a control that controls nothing. The first merge should therefore be an atomic
-vertical slice satisfying the acceptance tests in section 11.
+The repository now has the authenticated loopback broker, session capability/origin gates, provider-neutral rich
+tool results, Windows semantic reads and viewport capture, isolated WebView2 profiles, and per-chat UI controls.
+The interaction implementation adds host-minted opaque element refs and `pageGeneration`, native prepare/commit tokens,
+same-environment session tabs, and native-staged downloads imported into the existing session attachment boundary.
+On the installed Edge/WebView2 Runtime 150, the physical gate passed semantic read and approval-bound semantic click;
+an approval-bound, one-use 26-byte inert download import with native cleanup; and shared-environment two-tab
+listing, active-tab reporting, and close behavior. This evidence is bounded to Windows/WebView2. Non-Windows remains
+unavailable, the capability remains off by default, and the model still has no typing, form entry, raw JavaScript,
+selector, coordinate, arbitrary-path, auto-open/execute, or operator-profile import surface.
 
 ---
 
@@ -191,7 +188,8 @@ The first product is named **Agent Browser**:
 - initial identity: signed out and empty;
 - persistence: same session across restarts;
 - visibility: dedicated in-app browser window/pane labeled with the agent;
-- model powers: navigate, semantic read, screenshot;
+- model powers: navigate, semantic read, screenshot, semantic click, controlled session tabs, and inert
+  session-owned download/import/read;
 - operator powers: view, focus, navigate manually, sign in manually, close, clear profile;
 - default: off.
 
@@ -213,22 +211,27 @@ A bridge to the operator's real Chrome is a **different future product**, named 
 
 Nothing in the first product silently upgrades to this mode.
 
-### 2.3 Interaction is deliberately excluded
+### 2.3 Interaction is deliberately narrow
 
-Clicking and typing are not needed to prove the browser architecture. They introduce:
+Typing and unconstrained automation remain excluded. The only mutation primitive is a native two-phase semantic
+click: the model supplies an opaque ref and exact `pageGeneration` returned by `browser_read_page`; native code
+revalidates identity, visibility, enabled state, and descriptor before producing the one operator prompt, then
+consumes a one-use token and repeats the validation atomically with the click. This closes:
 
 - mutation and transaction classification;
 - destructive/sensitive action confirmation;
 - CSRF and form-submission risk;
-- upload/download handling;
+- arbitrary upload/download handling;
 - secret and payment-field handling;
 - popup, permission, clipboard, camera, microphone, and notification decisions;
 - ambiguity between operator input and agent input;
 - replay/idempotency concerns after a bridge reconnect.
 
-The read-only slice is already useful for documentation research, visual inspection, verifying a deployed page,
-reading rendered client-side content, and capturing a screenshot. Interaction should be a later capability with its
-own approval vocabulary, not extra parameters on `browser_navigate`.
+No tool accepts selectors, JavaScript, coordinates, or a path. A target-blank click can create a tab only when the
+separate tabs grant is on and the exact host-authored target is approved. A download requires its own grant and
+approval, explicit semantic download link, same-origin/final-origin checks, native byte-progress cancellation,
+bounded staging, and import as an inert same-session attachment. These are distinct approval kinds, not extra
+parameters on `browser_navigate`.
 
 ---
 
@@ -248,7 +251,7 @@ These are acceptance criteria, not aspirations.
 
 ### Origin of authority
 
-7. The first slice accepts browser calls only while the current turn origin is `operator`.
+7. Browser calls are accepted only while the current turn origin is `operator`.
 8. Teammate-message, monitor, restored/replayed, and unknown origins fail closed, even if
    `busCanUseRiskyTools`, `fullAccessAnyOrigin`, or Full Access is enabled.
 9. Enabling Agent Browser does not auto-approve future interaction tools when those tools eventually exist.
@@ -273,10 +276,11 @@ These are acceptance criteria, not aspirations.
 16. Only `http:` and `https:` top-level URLs are accepted. Reject `file:`, `data:`, `javascript:`, `blob:`,
     browser-internal schemes, URL userinfo, and malformed URLs.
 17. Redirects are checked by the desktop host too; a valid initial URL cannot redirect into a forbidden scheme.
-18. Popups/new windows are denied in the first slice. Target-blank navigation stays in the same journaled tab only
-    after the same URL policy.
-19. Downloads, file chooser, clipboard, geolocation, notifications, camera, microphone, MIDI, serial, USB, Bluetooth,
-    and screen capture are denied.
+18. Uncontrolled popups/new windows are denied. A new tab is created only from a one-use native tab token while the
+    session tabs grant remains on, and every tab shares that session's exact WebView2 environment/profile.
+19. Downloads are denied unless a separate downloads grant and one-use semantic action approval are current. File
+    chooser, clipboard, geolocation, notifications, camera, microphone, MIDI, serial, USB, Bluetooth, and screen
+    capture remain denied.
 20. Password and general autofill are disabled. The isolated profile has no extension store.
 21. Arbitrary JavaScript and raw CDP are not model tools.
 22. Page text is untrusted data. The semantic-read result says so, is size-capped, and never becomes system
@@ -340,8 +344,9 @@ The operator may type into the visible browser directly. Before the first manual
 > This browser belongs only to **{agent name}**. It does not use your normal browser logins. If you sign in here,
 > this agent can read pages available to that signed-in session until you clear its browser data.
 
-The model has no type/click tool in the first slice, so it cannot fill a login itself. A future secure-auth feature
-must fill secrets native-side and return only success/failure; it must not add a `password` string to an MCP schema.
+The model has no typing or form-value tool, so it cannot fill a login itself. Semantic click exposes no form values.
+A future secure-auth feature must fill secrets native-side and return only success/failure; it must not add a
+`password` string to an MCP schema.
 
 ### 4.3 Lifetime
 
@@ -492,7 +497,7 @@ platform is an explicit capability error, not a desktop screenshot fallback.
 
 ---
 
-## 6. Model tools in the first slice
+## 6. Model tools
 
 ### `browser_navigate`
 
@@ -521,8 +526,59 @@ Arguments:
 { maxChars?: number }
 ```
 
-Reads only the selected agent browser's current page. It does not navigate, evaluate model-supplied JavaScript, or
-return form values. Return safe URL/title and the bounded semantic snapshot.
+Reads only the selected agent browser's active session tab. It does not navigate, evaluate model-supplied JavaScript,
+or return form values. It returns safe URL/title, an opaque `pageGeneration`, and opaque refs on visible links and
+controls in the bounded semantic snapshot. Refs are host-minted, session/tab/page-bound, and are not selectors.
+
+### `browser_click`
+
+```ts
+{ ref: string; page_generation: string; target_summary: string }
+```
+
+`target_summary` is bounded context for the operator, not authority and not the descriptor. The desktop validates the
+exact ref/generation and returns its own origin/page/target descriptor. The hub prompts once with that host-authored
+descriptor. For a cross-origin link, that same prompt also names and, if approved, grants the exact destination
+origin; denial leaves the origin policy unchanged. The hub rechecks session/turn authority and sends only the one-use
+token plus the updated native origin policy back. The desktop consumes the token before atomically revalidating
+identity/visibility/enabled state and clicking. Stale generation, changed descriptor, reuse, cross-session use,
+disabled target, or revoked authority denies.
+
+### Tab tools
+
+- `browser_tabs {}` lists opaque ids for this session only.
+- `browser_open_tab { url, target_summary }` requires the separate tabs grant and one host-described approval. That
+  single prompt includes any exact new-origin grant; it is never preceded by a generic tool or origin prompt.
+- `browser_switch_tab { tab_id }` and `browser_close_tab { tab_id }` accept only ids from that session.
+
+There are at most eight tabs per session. All use the same session WebView2 environment and profile. Native
+`target=_blank` remains denied unless an approved click is converted into this controlled creation path.
+
+### Download tools
+
+```ts
+browser_download {
+  ref: string
+  page_generation: string
+  target_summary: string
+}
+browser_download_read { attachment_id: string }
+```
+
+Download requires the separate downloads grant, an explicit semantic download link, and one operator approval for the
+host-authored target. When the exact link points to a CDN or signed-link origin not yet granted, that same prompt names
+and grants only the exact destination origin; denial does not change policy and there is no preceding generic/origin
+prompt. The updated policy reaches native commit before the click. WebView2's native download-start URI must have that
+approved origin, and the finished URI is checked again; a redirect to any other origin cancels. WebView2 reports native
+byte progress and cancels above 8 MiB; staging uses a derived session directory, partial files are removed, and the
+authenticated JSON response is independently capped at 12.5 MB. Before native transfer begins, the desktop reserves
+the smaller of 8 MiB and the session's remaining 64 MiB cumulative budget; WebView2 cancels on the first progress event
+above that exact bound, failed transfers do not advance the counter, and only successfully imported bytes are
+committed. The hub validates and imports bytes through the existing attachment pipeline, returns only opaque id/name/
+MIME/size/origin metadata, and can read a bounded same-turn text/image/extracted-text representation using
+`browser_download_read`. The read id must have been minted by a browser download for that exact live session; another
+session fails even if it learns the UUID. No API accepts or returns a host path, executes, auto-opens, or shares a
+download.
 
 ### `browser_screenshot`
 
@@ -545,6 +601,7 @@ This small read-only tool may be included because it makes failure states legibl
 - current safe URL/title/window visible;
 - retained isolated profile yes/no;
 - public/local origin grants.
+- additional-tabs and downloads grants.
 
 It returns no cookies, history, credential state, bridge address, or profile path.
 
@@ -611,6 +668,14 @@ browser/navigation-finished
 browser/navigation-failed
 browser/page-read
 browser/screenshot
+browser/action-approved
+browser/tabs-granted
+browser/tabs-revoked
+browser/downloads-granted
+browser/downloads-revoked
+browser/download-approved
+browser/download-completed
+browser/download-read-denied
 browser/profile-cleared
 browser/host-connected
 browser/host-disconnected
@@ -686,6 +751,12 @@ Every implementation test below must be observed failing for the intended reason
 - broker rejects duplicate/late results and fails pending calls on timeout/disconnect;
 - no desktop host is a fast explicit error;
 - screenshot size/mime bounds are enforced.
+- only exact browser tool names are classified as auto-allowed or self-gating, so click/tab-open/download have one
+  host-described prompt rather than a generic tool prompt followed by a second prompt;
+- stale generation/ref, changed/hidden/disabled target, wrong action kind, token reuse, and cross-session token fail;
+- browser download completion becomes an existing safe attachment owned by the exact session; cross-session read
+  fails and no path is model-visible;
+- response frame, per-file, aggregate-byte, pending-action, and tab-count bounds are enforced.
 
 ### Provider parity tests
 
@@ -702,7 +773,9 @@ Every implementation test below must be observed failing for the intended reason
 - labels/path-like session IDs cannot escape the root;
 - A and B use different platform website-data stores;
 - main webview and A use different stores;
-- forbidden permissions and popup/download handlers deny;
+- forbidden permissions and uncontrolled popup/download handlers deny;
+- real WebView2 prepare/commit clicks a host-annotated element, creates a second tab in the same environment, and
+  downloads a fixture while reporting native progress/cancellation;
 - forbidden redirect is cancelled and reported;
 - page script cannot call Tauri commands or discover bridge credentials;
 - a bridge client without the secret/protocol version is rejected.
@@ -715,6 +788,8 @@ Run a local fixture server with:
 - a cookie set/read endpoint;
 - redirect endpoints including forbidden/new-origin redirects;
 - a deterministic colored viewport for screenshot assertions.
+- semantic click/tab/download fixtures, including target mutation, hidden/disabled replacement, popup attempts,
+  redirect-origin changes, oversized/partial downloads, and misleading model summaries.
 
 Then:
 
@@ -727,6 +802,9 @@ Then:
 7. inspect durable journal attribution and safe URL fields;
 8. restart hub and repeat the cookie check;
 9. clear A, prove A's cookie is gone and B remains unchanged.
+10. prepare a click, mutate/disable the target, and prove commit denies; then perform one unchanged click exactly once.
+11. open/switch/close an approved second tab and prove opaque ids cannot cross from A to B.
+12. download a bounded text fixture, read it by opaque attachment id in A, and prove B cannot resolve it.
 
 ### UI tests
 
@@ -747,8 +825,8 @@ The slice is complete only when all of these are true:
 - [ ] enabling one agent cannot enable or create state for another;
 - [ ] browser window is app-owned, visible, and labeled with the agent;
 - [ ] profile starts blank and cookie-isolation E2E passes;
-- [ ] `browser_navigate`, `browser_read_page`, `browser_screenshot`, and `browser_status` work for Claude and Codex;
-- [ ] no click/type/forms/uploads/downloads/arbitrary JS/raw CDP tools exist;
+- [ ] observation, semantic click, controlled tab, inert download/read, and status tools work for Claude and Codex;
+- [ ] no type/form-value/upload/raw-selector/coordinates/model-JS/arbitrary-path/auto-open/raw-CDP tools exist;
 - [ ] only operator-origin turns can browse;
 - [ ] public and local/private origin policies are enforced;
 - [ ] navigation is durably journaled with safe URL fields;
@@ -757,6 +835,8 @@ The slice is complete only when all of these are true:
 - [ ] no profile/credential material reaches the release payload;
 - [ ] hub/web tests, hub typecheck, web check, Rust tests/check, and the 7795 desktop sandbox pass;
 - [ ] two simultaneously enabled agents have been exercised without shared cookies or window interference.
+- [x] the installed Edge/WebView2 Runtime 150 physical gate passes semantic read/click, the approval-bound one-use
+  26-byte inert download import/cleanup, and shared-environment two-tab listing/active/close behavior.
 
 If any item cannot be met on a supported platform, keep the feature unavailable on that platform. Do not weaken
 isolation or silently swap in a headless implementation to make the checkbox appear complete.
@@ -770,18 +850,17 @@ isolation or silently swap in a headless implementation to make the checkbox app
 - console and bounded network diagnostics;
 - Playwright/AX-backed snapshots where available;
 - full-page screenshot;
-- multiple tabs with explicit per-agent tab identity;
 - screenshot/history audit retention policy.
 
-### Phase 3: interaction
+### Phase 3: broader interaction
 
-- semantic click only, then type/press;
-- operator/site/action approvals;
+- type/press and carefully scoped form editing;
+- sensitive-action classifiers beyond the current exact semantic-target approval;
 - sensitive/destructive transaction classifier;
 - operator input preemption;
 - form-value and secret redaction;
 - no automatic replay after reconnect;
-- explicit file upload/download product decisions.
+- explicit file-upload product decision and richer download inspection/retention.
 
 ### Phase 4: authentication
 

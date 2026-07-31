@@ -11,6 +11,7 @@
     closePreparedTarget,
     openExternalUrl,
     prepareExternalTarget,
+    type PreparedExternalTarget,
   } from './externalUrl'
   import { inTauri } from './window'
   import type { AccountLoginView } from './tutorialState.svelte'
@@ -212,17 +213,43 @@
   let addName = $state('')
   let rescanning = $state(false)
 
-  let loginState = $state<'idle' | 'waiting' | 'done' | 'error' | 'cancelled'>('idle')
+  type LoginUiState =
+    | 'idle'
+    | 'capturing'
+    | 'waiting'
+    | 'settling'
+    | 'done'
+    | 'error'
+    | 'cancelled'
+  let loginState = $state<LoginUiState>('idle')
   let loginMsg = $state('')
   let loginId = $state('')
+  let loginRequestKey = $state('')
   let loginUrl = $state('')
   let loginCode = $state('')
   let loginStartedAt = $state<number | undefined>()
   let loginRequestCancelled = false
+  let loginCancelSent = false
+
+  const loginActive = (): boolean =>
+    loginState === 'capturing' ||
+    loginState === 'waiting' ||
+    loginState === 'settling'
+
+  function tutorialLoginStatus(): AccountLoginView['status'] {
+    if (
+      loginState === 'capturing' ||
+      loginState === 'waiting' ||
+      loginState === 'settling'
+    ) {
+      return 'waiting'
+    }
+    return loginState
+  }
 
   $effect(() => {
     onloginstate({
-      status: loginState,
+      status: tutorialLoginStatus(),
       provider: addProvider,
       startedAt: loginStartedAt,
       message: loginMsg,
@@ -248,26 +275,95 @@
 
   const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
-  async function finishLogin(id: string, name: string): Promise<void> {
-    while (loginState === 'waiting' && loginId === id) {
-      await delay(1_000)
-      const result = await api.loginStatus(id)
-      if (loginId !== id || loginState !== 'waiting') return
-      if (result.status === 'waiting' || result.status === 'capturing') continue
+  function createLoginRequestKey(): string {
+    return (
+      globalThis.crypto?.randomUUID?.() ??
+      `web-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    )
+  }
+
+  async function openLoginUrl(
+    result: Awaited<ReturnType<typeof api.loginStatus>>,
+    target: PreparedExternalTarget,
+  ): Promise<void> {
+    if (!result.url || result.url === loginUrl) return
+    loginUrl = result.url
+    loginCode = result.code ?? ''
+    // Claude 2.1.218 has no no-browser flag and opens the captured URL itself. In the local desktop
+    // shell, opening it again would create two tabs; remote/plain-browser clients still use the app
+    // opener because the hub-side browser may not exist or may be on another machine.
+    const opened =
+      addProvider === 'claude' && inTauri
+        ? true
+        : await openExternalUrl(result.url, target)
+    loginMsg = opened
+      ? 'Waiting for you to finish in the browser…'
+      : 'The browser could not be opened automatically. Use “Open sign-in page” below, then finish there.'
+  }
+
+  async function finishLogin(
+    initial: Awaited<ReturnType<typeof api.login>>,
+    name: string,
+    requestKey: string,
+    target: PreparedExternalTarget,
+  ): Promise<void> {
+    let result = initial
+    const id = result.loginId
+    if (!id) return
+    loginId = id
+    while (loginId === id) {
+      if (
+        result.status === 'capturing' ||
+        result.status === 'waiting' ||
+        result.status === 'settling'
+      ) {
+        loginState = result.status
+        if (result.status === 'capturing') {
+          loginMsg = 'Waiting for the sign-in page from the provider…'
+        } else if (result.status === 'settling') {
+          loginMsg = loginRequestCancelled
+            ? 'Cancelling sign-in and restoring the prior credential safely…'
+            : 'Finishing credential recovery safely…'
+        }
+        await openLoginUrl(result, target)
+        if (loginRequestCancelled && !loginCancelSent) {
+          loginCancelSent = true
+          result = await api.cancelLogin(id)
+          continue
+        }
+        await delay(1_000)
+        result = await api.loginStatus(id)
+        if (!result || 'error' in result) {
+          const recovered = await api.loginForProfile(name, requestKey)
+          if (!recovered || 'error' in recovered) {
+            loginMsg =
+              'The hub is reconnecting. This sign-in attempt is still tracked and will be recovered automatically.'
+            continue
+          }
+          result = recovered
+        }
+        continue
+      }
       if (result.status === 'complete' && result.ok) {
         const scan = await store.rescanProfiles()
         if (scan.error) throw new Error(scan.error)
         loginState = 'done'
         loginMsg = `Added ${result.added ?? name}. It now appears in your accounts.`
         loginId = ''
+        loginRequestKey = ''
         loginUrl = ''
         loginCode = ''
         addName = ''
         return
       }
       loginState = result.status === 'cancelled' ? 'cancelled' : 'error'
-      loginMsg = result.error ?? 'Sign-in ended before the account was added. Retry or use Rescan accounts.'
+      loginMsg =
+        result.error ??
+        (result.status === 'cancelled'
+          ? 'Sign-in was cancelled after the prior credential was restored.'
+          : 'Sign-in ended before the account was added. Retry or use Rescan accounts.')
       loginId = ''
+      loginRequestKey = ''
       return
     }
   }
@@ -283,44 +379,36 @@
     }
     const target = prepareExternalTarget()
     loginRequestCancelled = false
-    loginState = 'waiting'
+    loginCancelSent = false
+    loginState = 'settling'
     loginStartedAt = Date.now()
-    loginMsg = `Starting ${addProvider === 'claude' ? 'Claude' : 'Codex'} sign-in…`
+    loginMsg = `Preparing ${addProvider === 'claude' ? 'Claude' : 'Codex'} sign-in safely…`
     loginId = ''
+    loginRequestKey = createLoginRequestKey()
     loginUrl = ''
     loginCode = ''
     try {
-      const r = await api.login(addProvider, name, reauth)
-      if (loginRequestCancelled || loginState !== 'waiting') {
-        closePreparedTarget(target)
-        if (r.loginId) void api.cancelLogin(r.loginId)
-        return
+      let r = await api.login(addProvider, name, reauth, loginRequestKey)
+      if (!r.loginId) {
+        const recovered = await api.loginForProfile(name, loginRequestKey)
+        if (recovered.loginId) r = recovered
       }
-      if (!r.ok || !r.loginId || !r.url) {
+      if (!r.loginId) {
         closePreparedTarget(target)
         loginState = 'error'
-        loginMsg = r.error ?? 'The login command did not provide a browser sign-in URL.'
+        loginMsg =
+          r.error ??
+          'The hub could not confirm a durable sign-in attempt. No successful sign-in was assumed.'
         return
       }
-      loginId = r.loginId
-      loginUrl = r.url
-      loginCode = r.code ?? ''
-      // Claude 2.1.218 has no no-browser flag and opens the captured URL itself. In the local desktop
-      // shell, opening it again would create two tabs; remote/plain-browser clients still use the app
-      // opener because the hub-side browser may not exist or may be on another machine.
-      const opened = addProvider === 'claude' && inTauri
-        ? true
-        : await openExternalUrl(r.url, target)
-      loginMsg = opened
-        ? 'Waiting for you to finish in the browser…'
-        : 'The browser could not be opened automatically. Use “Open sign-in page” below, then finish there.'
-      await finishLogin(r.loginId, name)
+      await finishLogin(r, name, loginRequestKey, target)
     } catch (e) {
       closePreparedTarget(target)
-      if (loginRequestCancelled) return
-      if (loginId) void api.cancelLogin(loginId)
       loginState = 'error'
-      loginMsg = e instanceof Error ? e.message : 'Login request failed.'
+      loginMsg =
+        e instanceof Error
+          ? e.message
+          : 'Sign-in status could not be verified. No successful sign-in or cancellation was assumed.'
       loginId = ''
     }
   }
@@ -334,13 +422,15 @@
   async function cancelActiveLogin(): Promise<void> {
     loginRequestCancelled = true
     const id = loginId
-    loginId = ''
-    loginState = 'cancelled'
+    loginState = 'settling'
     loginStartedAt = undefined
-    loginMsg = 'Sign-in cancelled. No account was added.'
-    loginUrl = ''
-    loginCode = ''
-    if (id) await api.cancelLogin(id)
+    loginMsg = id
+      ? 'Cancelling sign-in and restoring credential state safely…'
+      : 'Cancelling as soon as the durable sign-in attempt is confirmed…'
+    if (id && !loginCancelSent) {
+      loginCancelSent = true
+      await api.cancelLogin(id)
+    }
   }
 
   function closeModal(): void {
@@ -451,20 +541,20 @@
               class:btn-primary={p.authStatus === 'signed_out'}
               aria-label={p.authStatus === 'signed_out' ? 'Sign in again' : `Re-authenticate ${p.id}`}
               onclick={() => reauthenticate(p)}
-              disabled={loginState === 'waiting'}
+              disabled={loginActive()}
             >{p.authStatus === 'signed_out' ? 'Sign in again' : 'Re-authenticate'}</button>
           </div>
         {/each}
       </div>
       <div class="add" data-tutorial-anchor="account-sign-in">
         <div class="add-row">
-          <select bind:value={addProvider} disabled={loginState === 'waiting'}>
+          <select bind:value={addProvider} disabled={loginActive()}>
             <option value="claude">Claude</option>
             <option value="codex">Codex</option>
           </select>
-          <input placeholder="profile name (e.g. claude-work)" bind:value={addName} disabled={loginState === 'waiting'} />
-          <button class="btn btn-primary" onclick={() => login(false)} disabled={loginState === 'waiting'}>
-            {loginState === 'waiting' ? 'waiting…' : 'Log in'}
+          <input placeholder="profile name (e.g. claude-work)" bind:value={addName} disabled={loginActive()} />
+          <button class="btn btn-primary" onclick={() => login(false)} disabled={loginActive()}>
+            {loginActive() ? 'waiting…' : 'Log in'}
           </button>
         </div>
         {#if loginState !== 'idle'}
@@ -476,7 +566,7 @@
             {#if loginCode}<code class="login-code">{loginCode}</code>{/if}
           </div>
         {/if}
-        {#if loginState === 'waiting'}
+        {#if loginActive()}
           <button class="btn" onclick={cancelActiveLogin}>Cancel</button>
         {/if}
         <p class="hint dim">Sign-in runs inside the app with no terminal window. Keep this panel open while you finish in the browser.</p>

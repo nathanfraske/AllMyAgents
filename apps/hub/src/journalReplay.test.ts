@@ -1,0 +1,378 @@
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest'
+import { Journal } from './journal.js'
+
+const HOUR = 60 * 60 * 1000
+const NOW = Date.parse('2026-07-30T12:00:00.000Z')
+const OLD = new Date(NOW - 2 * HOUR)
+const RECENT = new Date(NOW - 30 * 60 * 1000)
+
+function at(when: Date, run: () => void): void {
+  vi.setSystemTime(when)
+  run()
+}
+
+function indexAll(journal: Journal): void {
+  while (!journal.backfillSessionEventIndex(10).complete) {
+    // Deliberately small batches exercise the resumable cursor.
+  }
+}
+
+describe('bounded replay checkpoints and journal history', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-replay-'))
+
+  afterEach(() => vi.useRealTimers())
+  afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }))
+
+  it('serves a versioned current cursor and a latest-first bounded session page', () => {
+    const journal = new Journal(path.join(tmp, 'checkpoint.db'))
+    try {
+      expect(journal.replayCheckpoint()).toEqual({
+        version: 1,
+        generation: 1,
+        cursor: 0,
+        resetFloorSeq: 0,
+      })
+      for (let index = 0; index < 12; index += 1) {
+        journal.append('s', 'session/input', { text: `message-${index}` })
+      }
+      journal.append('other', 'session/input', { text: 'not in this page' })
+
+      const checkpoint = journal.replayCheckpoint()
+      expect(checkpoint).toEqual({
+        version: 1,
+        generation: 1,
+        cursor: 13,
+        resetFloorSeq: 0,
+      })
+      expect(journal.sessionHistoryPage('s').events).toHaveLength(12)
+      indexAll(journal)
+      const page = journal.sessionHistoryPage('s', {
+        beforeSeq: checkpoint.cursor + 1,
+        maxRows: 5,
+        maxBytes: 8 * 1024,
+      })
+      expect(page.events.map((event) => (event.payload as { text: string }).text)).toEqual([
+        'message-7',
+        'message-8',
+        'message-9',
+        'message-10',
+        'message-11',
+      ])
+      expect(page.events.every((event) => event.sessionId === 's')).toBe(true)
+      expect(page.hasOlder).toBe(true)
+      expect(page.olderCursor).toBe(page.events[0]?.seq)
+      expect(page.checkpointGeneration).toBe(1)
+
+      const older = journal.sessionHistoryPage('s', {
+        beforeSeq: page.olderCursor!,
+        maxRows: 5,
+        maxBytes: 8 * 1024,
+      })
+      expect(older.events.map((event) => (event.payload as { text: string }).text)).toEqual([
+        'message-2',
+        'message-3',
+        'message-4',
+        'message-5',
+        'message-6',
+      ])
+      expect(older.hasOlder).toBe(true)
+    } finally {
+      journal.db.close()
+    }
+  })
+
+  it('never exceeds the page byte budget and progresses past an individually oversized row', () => {
+    const journal = new Journal(path.join(tmp, 'bytes.db'))
+    try {
+      journal.append('s', 'session/input', { text: 'a'.repeat(700) })
+      journal.append('s', 'session/input', { text: 'b'.repeat(700) })
+      indexAll(journal)
+      const page = journal.sessionHistoryPage('s', {
+        maxRows: 80,
+        maxBytes: 1_024,
+      })
+      expect(page.events).toHaveLength(1)
+      expect(page.encodedBytes).toBeLessThanOrEqual(1_024)
+      expect(page.hasOlder).toBe(true)
+
+      journal.db
+        .prepare('INSERT INTO events (ts, session, kind, payload) VALUES (?, ?, ?, ?)')
+        .run(OLD.toISOString(), 's', 'session/input', `{"unparseable":"${'x'.repeat(2 * 1024 * 1024)}`)
+      indexAll(journal)
+      const oversized = journal.sessionHistoryPage('s', {
+        maxRows: 80,
+        maxBytes: 1_024,
+      })
+      expect(oversized.events).toEqual([
+        expect.objectContaining({
+          kind: 'journal/history-event-oversized',
+          payload: expect.objectContaining({
+            originalKind: 'session/input',
+            originalPayloadBytes: expect.any(Number),
+          }),
+        }),
+      ])
+      expect(oversized.olderCursor).toBe(oversized.events[0]?.seq)
+      const progressed = journal.sessionHistoryPage('s', {
+        beforeSeq: oversized.olderCursor!,
+        maxRows: 80,
+        maxBytes: 1_024,
+      })
+      expect(progressed.events[0]?.seq).toBeLessThan(oversized.events[0]!.seq)
+    } finally {
+      journal.db.close()
+    }
+  })
+
+  it('keeps a completed projection frontier complete across appends, deletes, and reopen', () => {
+    const file = path.join(tmp, 'frontier.db')
+    let journal = new Journal(file)
+    try {
+      journal.append('s', 'session/input', { text: 'first' })
+      indexAll(journal)
+      journal.append('s', 'session/input', { text: 'second' })
+      expect(journal.sessionHistoryPage('s').events).toHaveLength(2)
+      journal.db.prepare('DELETE FROM events WHERE seq = 2').run()
+      expect(journal.sessionHistoryPage('s').events).toHaveLength(1)
+      journal.db.close()
+
+      journal = new Journal(file)
+      journal.append('s', 'session/input', { text: 'after restart' })
+      expect(journal.sessionHistoryPage('s').events.map((row) => row.seq)).toEqual([1, 3])
+    } finally {
+      if (journal.db.open) journal.db.close()
+    }
+  })
+
+  it('does not decode an oversized raw replay row before returning a bounded refusal', () => {
+    const journal = new Journal(path.join(tmp, 'raw-replay.db'))
+    try {
+      journal.db
+        .prepare('INSERT INTO events (ts, session, kind, payload) VALUES (?, ?, ?, ?)')
+        .run(OLD.toISOString(), 's', 'session/input', `{"secret":"${'z'.repeat(2 * 1024 * 1024)}`)
+      const checkpoint = journal.replayCheckpoint()
+      const page = journal.boundedReplayPage(0, checkpoint.cursor, {
+        maxRows: 10,
+        maxBytes: 2 * 1024 * 1024,
+        maxFrameBytes: 512 * 1024,
+      })
+      expect(page.events).toEqual([])
+      expect(page.tooLarge).toEqual(expect.objectContaining({ seq: 1 }))
+      expect(page.checkpoint).toEqual(checkpoint)
+    } finally {
+      journal.db.close()
+    }
+  })
+
+  it('uses the bounded session projection instead of scanning the payload-heavy event tree', () => {
+    const journal = new Journal(path.join(tmp, 'sparse.db'))
+    try {
+      for (let index = 0; index < 300; index += 1) {
+        journal.append(index % 149 === 0 ? 'needle' : `other-${index % 17}`, 'session/input', {
+          text: 'x'.repeat(256),
+        })
+      }
+      indexAll(journal)
+      const plan = journal.db
+        .prepare(
+          `EXPLAIN QUERY PLAN
+           SELECT event.seq
+           FROM journal_session_event_index AS session_event
+           JOIN events AS event ON event.seq = session_event.seq
+           WHERE session_event.session = ? AND session_event.seq < ?
+           ORDER BY session_event.seq DESC
+           LIMIT ?`
+        )
+        .all('needle', Number.MAX_SAFE_INTEGER, 80) as Array<{ detail: string }>
+      expect(plan.map((row) => row.detail).join('\n')).toMatch(/PRIMARY KEY \(session=\? AND seq<\?\)/i)
+      expect(journal.sessionHistoryPage('needle').events).toHaveLength(3)
+    } finally {
+      journal.db.close()
+    }
+  })
+
+  it('advances the replay generation atomically when superseded terminal data is removed', () => {
+    vi.useFakeTimers()
+    const journal = new Journal(path.join(tmp, 'generation.db'))
+    let highestDeletedSeq = 0
+    try {
+      at(OLD, () => {
+        journal.append('s', 'codex/item/agentMessage/delta', {
+          threadId: 'thread',
+          turnId: 'turn',
+          itemId: 'answer',
+          delta: 'hel',
+        })
+        highestDeletedSeq = journal.appendWorker(
+          's',
+          'codex/item/agentMessage/delta',
+          { threadId: 'thread', turnId: 'turn', itemId: 'answer', delta: 'lo' },
+          9
+        ).seq
+        journal.append('s', 'codex/item/completed', {
+          threadId: 'thread',
+          turnId: 'turn',
+          item: { id: 'answer', type: 'agentMessage', text: 'hello' },
+        })
+        highestDeletedSeq = journal.append('s', 'codex/turn/diff/updated', {
+          threadId: 'thread',
+          turnId: 'stuck-turn',
+          diff: 'first',
+        }).seq
+        journal.append('s', 'codex/turn/diff/updated', {
+          threadId: 'thread',
+          turnId: 'stuck-turn',
+          diff: 'final',
+        })
+      })
+
+      const before = journal.replayCheckpoint()
+      const result = journal.condenseCompletedCodex({
+        nowMs: NOW,
+        graceMs: HOUR,
+        maxCommandOutputDeltas: 10_000,
+        maxAgentMessageDeltas: 10_000,
+        maxDiffSnapshots: 10_000,
+      })
+      const after = journal.replayCheckpoint()
+
+      expect(result.agentMessageDeltasDeleted).toBe(2)
+      expect(result.diffSnapshotsDeleted).toBe(1)
+      expect(result.cursorCheckpointsWritten).toBe(1)
+      expect(after.generation).toBe(before.generation + 1)
+      expect(after.resetFloorSeq).toBe(highestDeletedSeq)
+      expect(journal.lastJournaledWseq('s')).toBe(9)
+      expect(
+        journal.since(0, 100).filter((event) => event.kind === 'codex/item/agentMessage/delta')
+      ).toHaveLength(0)
+      expect(
+        journal.since(0, 100).filter((event) => event.kind === 'codex/turn/diff/updated')
+      ).toEqual([
+        expect.objectContaining({
+          payload: { threadId: 'thread', turnId: 'stuck-turn', diff: 'final' },
+        }),
+      ])
+    } finally {
+      journal.db.close()
+    }
+  })
+
+  it('keeps active, recent, malformed, and non-canonical message data fail closed', () => {
+    vi.useFakeTimers()
+    const journal = new Journal(path.join(tmp, 'fail-closed.db'))
+    try {
+      at(OLD, () => {
+        journal.append('s', 'codex/item/agentMessage/delta', {
+          threadId: 'thread',
+          turnId: 'active',
+          itemId: 'no-terminal',
+          delta: 'keep',
+        })
+        journal.append('s', 'codex/item/agentMessage/delta', {
+          threadId: 'thread',
+          turnId: 'unknown',
+          itemId: 'missing-final-text',
+          delta: 'keep',
+        })
+        journal.append('s', 'codex/item/completed', {
+          threadId: 'thread',
+          turnId: 'unknown',
+          item: { id: 'missing-final-text', type: 'agentMessage' },
+        })
+        journal.db
+          .prepare('INSERT INTO events (ts, session, kind, payload) VALUES (?, ?, ?, ?)')
+          .run(OLD.toISOString(), 's', 'codex/item/agentMessage/delta', '{"broken":"\\')
+      })
+      at(RECENT, () => {
+        journal.append('s', 'codex/item/agentMessage/delta', {
+          threadId: 'thread',
+          turnId: 'recent',
+          itemId: 'recent',
+          delta: 'keep',
+        })
+        journal.append('s', 'codex/item/completed', {
+          threadId: 'thread',
+          turnId: 'recent',
+          item: { id: 'recent', type: 'agentMessage', text: 'keep' },
+        })
+      })
+
+      const before = journal.replayCheckpoint()
+      const result = journal.condenseCompletedCodex({
+        nowMs: NOW,
+        graceMs: HOUR,
+        maxAgentMessageDeltas: 10_000,
+      })
+      expect(result.agentMessageDeltasDeleted).toBe(0)
+      expect(journal.replayCheckpoint().generation).toBe(before.generation)
+      expect(
+        journal.since(0, 100).filter((event) => event.kind === 'codex/item/agentMessage/delta')
+      ).toHaveLength(4)
+    } finally {
+      journal.db.close()
+    }
+  })
+
+  it('journals a bounded global maintenance lifecycle across restart with idempotent terminal evidence', () => {
+    const file = path.join(tmp, 'compaction-lifecycle.db')
+    const operationId = '11111111-1111-4111-8111-111111111111'
+    let journal = new Journal(file)
+    try {
+      journal.recordCompactionLifecycle(operationId, 'started', {
+        detail: 'started',
+        now: '2026-07-30T12:00:00.000Z',
+      })
+      journal.recordCompactionLifecycle(operationId, 'progress', {
+        rowsDeleted: 10,
+        payloadBytesDeleted: 1_024,
+        detail: 'bounded progress',
+        now: '2026-07-30T12:00:01.000Z',
+      })
+    } finally {
+      journal.db.close()
+    }
+
+    journal = new Journal(file)
+    try {
+      const completed = journal.recordCompactionLifecycle(operationId, 'completed', {
+        rowsDeleted: 10,
+        payloadBytesDeleted: 1_024,
+        detail: 'complete',
+        now: '2026-07-30T12:00:02.000Z',
+      })
+      expect(journal.latestCompactionLifecycle()).toEqual(completed)
+      const beforeDuplicate = journal.replayCheckpoint().cursor
+      expect(
+        journal.recordCompactionLifecycle(operationId, 'completed', {
+          rowsDeleted: 10,
+          payloadBytesDeleted: 1_024,
+          detail: 'complete',
+          now: '2026-07-30T12:00:03.000Z',
+        })
+      ).toEqual(completed)
+      expect(journal.replayCheckpoint().cursor).toBe(beforeDuplicate)
+      expect(() =>
+        journal.recordCompactionLifecycle(operationId, 'failed', {
+          rowsDeleted: 10,
+          payloadBytesDeleted: 1_024,
+          detail: 'conflicting terminal',
+        })
+      ).toThrow(/already terminal/)
+      expect(
+        journal
+          .since(0, 100)
+          .filter((event) => event.kind.startsWith('journal/compaction-'))
+          .map((event) => event.kind)
+      ).toEqual([
+        'journal/compaction-started',
+        'journal/compaction-progress',
+        'journal/compaction-completed',
+      ])
+    } finally {
+      journal.db.close()
+    }
+  })
+})

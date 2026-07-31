@@ -28,6 +28,7 @@
   import Icon from './Icon.svelte'
   import AgentPanel from './AgentPanel.svelte'
   import TaskStrip from './TaskStrip.svelte'
+  import QuestionCard from './QuestionCard.svelte'
   import { findModel, defaultModelFor } from './catalog'
   import { settings } from './settings.svelte'
   import { onDestroy, untrack } from 'svelte'
@@ -327,7 +328,11 @@
     return tail
   }
   const displayedRenderNodes = $derived(
-    composerOnly && peekItems > 0 ? tailRenderNodes(renderNodes, peekItems) : renderNodes,
+    composerOnly && peekItems > 0
+      ? tailRenderNodes(renderNodes, peekItems)
+      : view?.historyViewingOlder
+        ? renderNodes.slice(0, 120)
+        : tailRenderNodes(renderNodes, 120),
   )
   const model = $derived(view?.record.model ?? '')
   const options = $derived<Record<string, string>>({
@@ -369,6 +374,67 @@
   const steerable = $derived(active && store.prefs.steerMessagesAtToolBoundary)
   const st = $derived(view ? store.status(view) : { key: 'idle', label: '' })
   const approvals = $derived(view ? store.approvals.filter((a) => a.sessionId === view.record.id) : [])
+  const questions = $derived(view ? store.questions.filter((q) => q.sessionId === view.record.id) : [])
+  let questionArrival = $state('')
+  let questionArrivalSession: string | undefined
+  let previousQuestionIds: string[] = []
+  let questionArrivalTimer: ReturnType<typeof setTimeout> | undefined
+  let questionArrivalGeneration = $state(0)
+
+  function clearQuestionArrival(): void {
+    questionArrivalGeneration += 1
+    if (questionArrivalTimer) clearTimeout(questionArrivalTimer)
+    questionArrivalTimer = undefined
+    questionArrival = ''
+  }
+
+  function announceQuestionArrival(message: string): void {
+    if (questionArrivalTimer) clearTimeout(questionArrivalTimer)
+    const generation = ++questionArrivalGeneration
+    questionArrival = message
+    questionArrivalTimer = setTimeout(() => {
+      if (questionArrivalGeneration !== generation) return
+      questionArrival = ''
+      questionArrivalTimer = undefined
+    }, 1_500)
+  }
+
+  onDestroy(clearQuestionArrival)
+  $effect(() => {
+    const currentSession = view?.record.id
+    const currentIds = questions.map((question) => question.id)
+    if (currentSession !== questionArrivalSession) {
+      questionArrivalSession = currentSession
+      if (currentIds.length === 0) {
+        clearQuestionArrival()
+      } else {
+        announceQuestionArrival(
+          currentIds.length === 1
+            ? 'One pending question from Claude.'
+            : `${currentIds.length} pending questions from Claude.`
+        )
+      }
+    } else {
+      const previous = new Set(previousQuestionIds)
+      const arrived = currentIds.reduce(
+        (count, id) => count + (previous.has(id) ? 0 : 1),
+        0
+      )
+      if (arrived > 0) {
+        announceQuestionArrival(
+          arrived === 1
+            ? `New question from Claude. ${currentIds.length} pending.`
+            : `${arrived} new questions from Claude. ${currentIds.length} pending.`
+        )
+      } else if (currentIds.length < previousQuestionIds.length) {
+        // Removal is not an arrival. Clear stale count text without replacing it with another message.
+        clearQuestionArrival()
+      }
+    }
+    // The service permits at most four pending questions per session. Keep only the current snapshot:
+    // removal/reorder is silent, and memory never grows with historical ids.
+    previousQuestionIds = currentIds.slice(0, 4)
+  })
   const queue = $derived(sid ? store.queueFor(sid) : [])
   const workingContext = $derived.by(() => {
     const resolved = view
@@ -840,6 +906,39 @@
     // resolved → the refresh has already dropped the prompt; nothing to surface.
   }
 
+  let questionError = $state<{ id: string; msg: string } | null>(null)
+  async function answerQuestion(id: string, answers: Record<string, string>): Promise<void> {
+    questionError = null
+    const result = await api.answerQuestion(id, answers)
+    if (result.ok) {
+      // Do not depend on a WebSocket edge to remove a successfully settled card.
+      store.questions = store.questions.filter((question) => question.id !== id)
+      return
+    }
+    await store.refreshSideData().catch(() => {})
+    if (store.questions.some((question) => question.id === id)) {
+      questionError = { id, msg: result.error ?? 'The answers were not accepted; try again.' }
+    } else {
+      store.pushLocalNote(
+        view?.record.id ?? '',
+        'That question was already resolved elsewhere; your response was not submitted.'
+      )
+    }
+  }
+
+  async function cancelQuestion(id: string): Promise<void> {
+    questionError = null
+    const result = await api.cancelQuestion(id)
+    if (result.ok) {
+      store.questions = store.questions.filter((question) => question.id !== id)
+      return
+    }
+    await store.refreshSideData().catch(() => {})
+    if (store.questions.some((question) => question.id === id)) {
+      questionError = { id, msg: result.error ?? 'The cancellation was not accepted; try again.' }
+    }
+  }
+
   /** "Always allow" — grant the tool for this chat FIRST, then approve the request that prompted it, so
    *  the operator is not asked again for the same tool. The grant is hub-side, so it applies immediately. */
   let grantError = $state<string | null>(null)
@@ -977,6 +1076,19 @@
     bind:this={scroller}
     onscroll={onScroll}
   >
+    {#if !composerOnly && (view.journalHistoryOlderCursor != null || view.historyOlderCursor != null)}
+      <button
+        class="history-page"
+        disabled={view.loadingHistory}
+        onclick={() => void store.loadOlderHistory(view.record.id)}
+      >
+        {view.loadingHistory ? 'Loading history…' : 'Load older history'}
+      </button>
+    {:else if !composerOnly && view.historyViewingOlder}
+      <button class="history-page" onclick={() => store.showLatestHistory(view.record.id)}>
+        Back to latest
+      </button>
+    {/if}
     <!-- Items produced INSIDE a spawned sub-agent are excluded here and rendered in the agent panel
          instead: a background agent's tool spam would otherwise bury the conversation you are actually
          having. `agentId` is set only for sub-agent output, so the main thread is unaffected. -->
@@ -1033,6 +1145,26 @@
     {/if}
     <!-- The agent's task board, directly above the chatbar. -->
     {#if !composerOnly}<TaskStrip items={view.items} />{/if}
+
+    {#if questions.length > 0}
+      <div class="question-stack" role="region" aria-label="Pending questions">
+        <span class="question-arrival" role="status" aria-live="polite" aria-atomic="true">
+          {#key questionArrivalGeneration}
+            <span>{questionArrival}</span>
+          {/key}
+        </span>
+        {#each questions as question, questionIndex (question.id)}
+          <QuestionCard
+            record={question}
+            ordinal={questionIndex + 1}
+            total={questions.length}
+            error={questionError?.id === question.id ? questionError.msg : undefined}
+            onsubmit={(answers) => answerQuestion(question.id, answers)}
+            oncancel={() => cancelQuestion(question.id)}
+          />
+        {/each}
+      </div>
+    {/if}
 
     {#each approvals as a (a.id)}
       {@const blurb = approvalBlurb(a.kind, a.payload)}
@@ -1303,6 +1435,7 @@
   .hbtn:hover:not(:disabled) { border-color: var(--border-strong); color: var(--text); }
   .hbtn:disabled { opacity: 0.4; cursor: default; }
   .stream { flex: 1; display: flex; flex-direction: column; gap: 0.55rem; padding: 1rem 1.1rem; max-width: 900px; width: 100%; margin: 0 auto; container-type: inline-size; }
+  .history-page { align-self: center; max-width: 18rem; }
   .stream.replay-rebuild { visibility: hidden; }
   .stream-node { min-width: 0; }
   @media (prefers-reduced-motion: no-preference) {
@@ -1331,6 +1464,30 @@
   .jumpcount { font-variant-numeric: tabular-nums; }
   @media (prefers-reduced-motion: no-preference) { .jumpbtn { animation: pop-in var(--dur-fast) var(--ease); } }
   .approval-card { background: var(--surface); border: 1px solid var(--warn); border-radius: 10px; padding: 0.5rem 0.7rem; margin-bottom: 0.5rem; }
+  .question-stack {
+    display: grid;
+    gap: 0.5rem;
+    max-height: min(42dvh, 30rem);
+    margin-bottom: 0.5rem;
+    padding-right: 0.2rem;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
+  }
+  .question-arrival {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+  @media (max-height: 650px) {
+    .question-stack { max-height: 34dvh; }
+  }
   .atop { display: flex; gap: 0.5rem; align-items: center; }
   .alabel { font-size: 0.66rem; letter-spacing: 0.08em; color: var(--warn); }
   .asummary { margin-top: 0.3rem; font-size: var(--text-sm); color: var(--text); font-weight: var(--fw-medium); }

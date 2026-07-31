@@ -81,8 +81,24 @@ function makeBlueController(
     send: (message: unknown) => queueMicrotask(() => blue.emit('message', message)),
     onPromoted: () => {},
     stopJournalBackups: async () => {},
+    profileRuntime: {
+      prepareRestart: async () => ({ settled: 0, outcomeUnknown: 0 }),
+      deactivatePublicGeneration: () => {},
+      activatePublicGeneration: () => {},
+      resumeLoginAdmission: () => {},
+    },
     journal: { append: () => {} },
-    sessions: { reconcileStale: () => {}, shutdown: async () => {} },
+    questions: {
+      deactivatePublicOwner: () => 0,
+      deactivatePublicOwnerForRestart: () => [],
+      recordRestartBoundaries: () => 0,
+      activatePublicOwner: () => 0,
+    },
+    sessions: {
+      reconcileStale: () => {},
+      shutdown: async () => {},
+      setRestartTurnAdmissionFrozen: () => {},
+    },
     executor: {},
   } as unknown as RestartControllerDeps
   const controller = new RestartController(deps)

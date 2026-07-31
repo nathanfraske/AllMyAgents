@@ -20,6 +20,7 @@ import { UsageMonitor } from './usage.js'
 import { WorkspaceManager } from './workspace.js'
 import { MAX_IMAGE_BYTES, saveAttachment } from './attachments.js'
 import type { AttachmentMeta } from './attachments.js'
+import { QuestionService } from './questions.js'
 import { CodexClient } from './adapters/codex.js'
 import { extractXlsxText } from './officeDocuments.js'
 import { strToU8, zipSync } from 'fflate'
@@ -211,6 +212,7 @@ async function build(provider: 'claude' | 'codex' = 'claude') {
     { busCanUseRiskyTools: false, autoApprovePractices: false },
     false,
     tmp,
+    new QuestionService(journal),
     executor
   )
   const record = await sessions.create(profile.id, { cwd: tmp, useWorktree: false })
@@ -222,6 +224,7 @@ async function build(provider: 'claude' | 'codex' = 'claude') {
     sessions,
     profiles: [profile],
     approvals,
+    questions: sessions.questionService,
     usage,
     projects,
     workspace,

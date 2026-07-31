@@ -1,0 +1,951 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import Database from 'better-sqlite3'
+import { Journal } from './journal.js'
+import {
+  ASK_INTERRUPTED_BY_RESTART_MESSAGE,
+  MAX_PENDING_QUESTIONS_GLOBAL,
+  MAX_PENDING_QUESTIONS_PER_SESSION,
+  parseQuestionDecisionBody,
+  QuestionInputError,
+  QuestionService,
+  type AskUserQuestionInput,
+} from './questions.js'
+import type { HubEvent } from './types.js'
+import { stableQuestionId } from './workerProtocol.js'
+
+const QUESTIONS: AskUserQuestionInput = {
+  questions: [
+    {
+      question: 'Which format should I use?',
+      header: 'Format',
+      options: [
+        { label: 'Summary', description: 'A short overview.' },
+        { label: 'Detailed', description: 'A complete explanation.' },
+      ],
+      multiSelect: false,
+    },
+    {
+      question: 'Which sections should I include?',
+      header: 'Sections',
+      options: [
+        { label: 'Intro', description: 'Opening context.' },
+        { label: 'Results', description: 'The measured results.' },
+        { label: 'Next steps', description: 'Recommended follow-up.' },
+      ],
+      multiSelect: true,
+    },
+  ],
+}
+
+const opened: Journal[] = []
+const tempDirs: string[] = []
+
+function fresh(journal = new Journal(':memory:')) {
+  opened.push(journal)
+  const events: HubEvent[] = []
+  journal.on('event', (event) => events.push(event))
+  const questions = new QuestionService(journal)
+  questions.activatePublicOwner()
+  const request = () =>
+    questions.request({
+      id: 'q-stable',
+      sessionId: 's1',
+      toolUseId: 'toolu_1',
+      requestId: 'control_1',
+      input: QUESTIONS,
+    })
+  const count = (kind: string) => events.filter((event) => event.kind === kind).length
+  return { journal, questions, request, events, count }
+}
+
+afterEach(() => {
+  while (opened.length) opened.pop()!.db.close()
+  while (tempDirs.length) {
+    fs.rmSync(tempDirs.pop()!, { recursive: true, force: true })
+  }
+})
+
+describe('QuestionService lifecycle', () => {
+  it('retains no local entry or durable lifecycle when the requested audit append fails', () => {
+    const { journal, questions, request, count } = fresh()
+    const append = vi.spyOn(journal, 'append').mockImplementationOnce(() => {
+      throw new Error('requested audit unavailable')
+    })
+
+    expect(() => request()).toThrow(/requested audit unavailable/)
+    expect(questions.pending()).toEqual([])
+    expect(count('question/requested')).toBe(0)
+
+    append.mockRestore()
+    const retry = request()
+    expect(questions.pending()).toHaveLength(1)
+    questions.cancel('q-stable')
+    return expect(retry).resolves.toEqual({ kind: 'cancelled' })
+  })
+
+  it('keeps the entry and abort listener intact until the resolved audit is durable', async () => {
+    const { journal, questions, count } = fresh()
+    const controller = new AbortController()
+    let settled = false
+    const pending = questions
+      .request({
+        id: 'q-stable',
+        sessionId: 's1',
+        toolUseId: 'toolu_1',
+        requestId: 'control_1',
+        input: QUESTIONS,
+        signal: controller.signal,
+      })
+      .finally(() => {
+        settled = true
+      })
+    const originalAppend = journal.append.bind(journal)
+    const append = vi.spyOn(journal, 'append').mockImplementation((sessionId, kind, payload) => {
+      if (kind === 'question/resolved') throw new Error('resolved audit unavailable')
+      return originalAppend(sessionId, kind, payload)
+    })
+
+    expect(() =>
+      questions.answer('q-stable', {
+        'Which format should I use?': 'Detailed',
+        'Which sections should I include?': 'Results',
+      })
+    ).toThrow(/resolved audit unavailable/)
+    expect(settled).toBe(false)
+    expect(questions.pending()).toMatchObject([{ id: 'q-stable', status: 'pending' }])
+    expect(count('question/resolved')).toBe(0)
+
+    append.mockRestore()
+    controller.abort()
+    await expect(pending).resolves.toEqual({ kind: 'cancelled', reason: 'aborted' })
+    expect(count('question/resolved')).toBe(1)
+  })
+
+  it('treats subscriber failure after an atomic commit as committed, never as a retryable rollback', async () => {
+    const { journal, questions, request, count } = fresh()
+    journal.on('event', () => {
+      throw new Error('websocket subscriber failed')
+    })
+
+    const pending = request()
+    expect(questions.pending()).toHaveLength(1)
+    expect(
+      questions.answer('q-stable', {
+        'Which format should I use?': 'Detailed',
+        'Which sections should I include?': 'Results',
+      })
+    ).toBe(true)
+    await expect(pending).resolves.toMatchObject({ kind: 'answered' })
+    expect(count('question/requested')).toBe(1)
+    expect(count('question/resolved')).toBe(1)
+  })
+
+  it('keeps a valid question pending without creating a permission approval', async () => {
+    const { questions, request, count } = fresh()
+    let settled = false
+    const answer = request().finally(() => {
+      settled = true
+    })
+
+    expect(settled).toBe(false)
+    expect(questions.pending()).toHaveLength(1)
+    expect(questions.pending()[0]).toMatchObject({
+      id: 'q-stable',
+      sessionId: 's1',
+      status: 'pending',
+      questions: QUESTIONS.questions,
+    })
+    expect(count('question/requested')).toBe(1)
+    expect(count('approval/requested')).toBe(0)
+
+    questions.cancel('q-stable')
+    await expect(answer).resolves.toEqual({ kind: 'cancelled' })
+  })
+
+  it('answers with the exact original questions and exact-question-keyed strings', async () => {
+    const { questions, request, count } = fresh()
+    const pending = request()
+    const answers = {
+      'Which format should I use?': 'Detailed',
+      'Which sections should I include?': 'Intro, Next steps',
+    }
+
+    expect(questions.answer('q-stable', answers)).toBe(true)
+    await expect(pending).resolves.toEqual({
+      kind: 'answered',
+      updatedInput: { questions: QUESTIONS.questions, answers },
+    })
+    expect(questions.pending()).toEqual([])
+    expect(count('question/resolved')).toBe(1)
+    expect(count('approval/resolved')).toBe(0)
+  })
+
+  it('supports free-text Other answers while rejecting blank, missing, and extra answers', async () => {
+    const { questions, request } = fresh()
+    const pending = request()
+
+    expect(() =>
+      questions.answer('q-stable', {
+        'Which format should I use?': 'Use the house style instead',
+      })
+    ).toThrow(QuestionInputError)
+    expect(() =>
+      questions.answer('q-stable', {
+        'Which format should I use?': 'Detailed',
+        'Which sections should I include?': '   ',
+      })
+    ).toThrow(QuestionInputError)
+    expect(() =>
+      questions.answer('q-stable', {
+        'Which format should I use?': 'Detailed',
+        'Which sections should I include?': 'Intro',
+        'Not asked': 'Surprise',
+      })
+    ).toThrow(QuestionInputError)
+
+    const answers = {
+      'Which format should I use?': 'Use the house style instead',
+      'Which sections should I include?': 'Intro, Results',
+    }
+    expect(questions.answer('q-stable', answers)).toBe(true)
+    await expect(pending).resolves.toMatchObject({ kind: 'answered', updatedInput: { answers } })
+  })
+
+  it('cancels explicitly and never turns cancellation into an empty allow', async () => {
+    const { questions, request, events } = fresh()
+    const pending = request()
+    expect(questions.cancel('q-stable')).toBe(true)
+    await expect(pending).resolves.toEqual({ kind: 'cancelled' })
+    expect(events.find((event) => event.kind === 'question/resolved')?.payload).toMatchObject({
+      id: 'q-stable',
+      status: 'cancelled',
+    })
+    expect(questions.cancel('q-stable')).toBe(false)
+  })
+
+  it('binds abort to the owning session', async () => {
+    const { questions, request } = fresh()
+    const pending = request()
+    expect(questions.abort('q-stable', 'other-session')).toBe(false)
+    expect(questions.pending()).toHaveLength(1)
+    expect(questions.abort('q-stable', 's1')).toBe(true)
+    await expect(pending).resolves.toEqual({ kind: 'cancelled', reason: 'aborted' })
+  })
+
+  it('coalesces a same-correlation reissue and rejects a colliding id with different correlation/input', async () => {
+    const { questions, request, count } = fresh()
+    const first = request()
+    const second = request()
+    expect(second).toBe(first)
+    expect(count('question/requested')).toBe(1)
+
+    expect(() =>
+      questions.request({
+        id: 'q-stable',
+        sessionId: 's1',
+        toolUseId: 'toolu_other',
+        requestId: 'control_1',
+        input: QUESTIONS,
+      })
+    ).toThrow(QuestionInputError)
+
+    questions.cancel('q-stable')
+    await expect(first).resolves.toEqual({ kind: 'cancelled' })
+  })
+
+  it('keeps an inactive green unable to list, allocate, answer, or cancel blue questions', () => {
+    const { journal, questions: blue, request, count, events } = fresh()
+    void request()
+    const green = new QuestionService(journal)
+
+    expect(() => green.pending()).toThrow(/does not own/)
+    expect(() =>
+      green.request({
+        id: 'q-green',
+        sessionId: 's1',
+        toolUseId: 'tool-green',
+        requestId: 'request-green',
+        input: QUESTIONS,
+      })
+    ).toThrow(/does not own/)
+    expect(() => green.answer('q-stable', {})).toThrow(/does not own/)
+    expect(() => green.cancel('q-stable')).toThrow(/does not own/)
+    expect(blue.pending()).toHaveLength(1)
+    expect(count('question/requested')).toBe(1)
+  })
+
+  it('leaves live blue untouched during green construction and terminalizes it only at public activation', async () => {
+    const { journal, questions: blue, request, count, events } = fresh()
+    const bluePending = request()
+    const green = new QuestionService(journal)
+
+    expect(blue.pending()).toHaveLength(1)
+    expect(() => green.pending()).toThrow(/does not own/)
+    expect(count('question/resolved')).toBe(0)
+
+    expect(green.activatePublicOwner()).toBe(1)
+    expect(blue.pending()).toEqual([])
+    await expect(bluePending).resolves.toEqual({
+      kind: 'interrupted',
+      reason: 'restart',
+      message: ASK_INTERRUPTED_BY_RESTART_MESSAGE,
+    })
+    expect(count('question/resolved')).toBe(1)
+    expect(
+      events.find((event) => event.kind === 'question/restart-interrupted')
+        ?.payload
+    ).toEqual({
+      reason: 'interrupted_by_restart',
+      phase: 'crash',
+      turnBoundary: 'unknown',
+      questionCount: 1,
+    })
+    expect(green.activatePublicOwner()).toBe(0)
+  })
+
+  it('groups planned restart interruption into one durable turn notice and records its exact boundary once', async () => {
+    const { journal, questions, request, events } = fresh()
+    const first = request()
+    const second = questions.request({
+      id: 'q-second',
+      sessionId: 's1',
+      toolUseId: 'toolu_2',
+      requestId: 'control_2',
+      input: QUESTIONS,
+    })
+
+    const interrupted = questions.deactivatePublicOwnerForRestart()
+
+    expect(interrupted).toEqual([
+      expect.objectContaining({ sessionId: 's1', questionCount: 2 }),
+    ])
+    await expect(first).resolves.toEqual({
+      kind: 'interrupted',
+      reason: 'restart',
+      message: ASK_INTERRUPTED_BY_RESTART_MESSAGE,
+    })
+    await expect(second).resolves.toEqual({
+      kind: 'interrupted',
+      reason: 'restart',
+      message: ASK_INTERRUPTED_BY_RESTART_MESSAGE,
+    })
+    expect(
+      journal.db
+        .prepare("SELECT status FROM question_lifecycles ORDER BY id")
+        .all()
+    ).toEqual([{ status: 'interrupted' }, { status: 'interrupted' }])
+    expect(events.filter((event) => event.kind === 'question/restart-interrupted')).toEqual([])
+    expect(JSON.stringify(journal.since(0))).not.toContain(
+      'ALLMYAGENTS_ASK_INTERRUPTED_BY_RESTART_V1'
+    )
+
+    expect(
+      questions.recordRestartBoundaries(interrupted, new Set(['s1']))
+    ).toBe(1)
+    expect(
+      questions.recordRestartBoundaries(interrupted, new Set(['s1']))
+    ).toBe(0)
+    expect(
+      events
+        .filter((event) => event.kind === 'question/restart-interrupted')
+        .map((event) => event.payload)
+    ).toEqual([
+      {
+        reason: 'interrupted_by_restart',
+        phase: 'planned',
+        turnBoundary: 'completed',
+        questionCount: 2,
+      },
+    ])
+
+    questions.activatePublicOwner()
+    const third = questions.request({
+      id: 'q-third',
+      sessionId: 's1',
+      toolUseId: 'toolu_3',
+      requestId: 'control_3',
+      input: QUESTIONS,
+    })
+    const secondDrain = questions.deactivatePublicOwnerForRestart()
+    expect(secondDrain[0]!.restartGeneration).not.toBe(
+      interrupted[0]!.restartGeneration
+    )
+    await expect(third).resolves.toMatchObject({
+      kind: 'interrupted',
+      reason: 'restart',
+    })
+    expect(
+      questions.recordRestartBoundaries(secondDrain, new Set(['s1']))
+    ).toBe(1)
+    expect(
+      events.filter((event) => event.kind === 'question/restart-interrupted')
+    ).toHaveLength(2)
+  })
+
+  it('settles callbacks from the committed batch receipt without a fallible post-commit reread', async () => {
+    const { journal, questions, request } = fresh()
+    const pending = request()
+    const resolvedQuestion = vi
+      .spyOn(journal, 'resolvedQuestion')
+      .mockImplementation(() => {
+        throw new Error('post-commit read unavailable')
+      })
+
+    const interrupted = questions.deactivatePublicOwnerForRestart()
+
+    expect(resolvedQuestion).not.toHaveBeenCalled()
+    expect(questions.isPublicOwner).toBe(false)
+    expect(interrupted[0]).toMatchObject({
+      sessionId: 's1',
+      questionCount: 1,
+      questionIds: ['q-stable'],
+    })
+    await expect(pending).resolves.toEqual({
+      kind: 'interrupted',
+      reason: 'restart',
+      message: ASK_INTERRUPTED_BY_RESTART_MESSAGE,
+    })
+  })
+
+  it('turns a crash-left pending notice into one unknown notification without retrying a provider', async () => {
+    const { journal, questions: blue, request, events } = fresh()
+    const pending = request()
+    const interrupted = blue.deactivatePublicOwnerForRestart()
+    await expect(pending).resolves.toMatchObject({
+      kind: 'interrupted',
+      reason: 'restart',
+    })
+    expect(events.filter((event) => event.kind === 'question/restart-interrupted')).toEqual([])
+
+    const successor = new QuestionService(journal)
+    expect(successor.activatePublicOwner()).toBe(0)
+    expect(successor.activatePublicOwner()).toBe(0)
+    expect(blue.recordRestartBoundaries(interrupted, new Set())).toBe(0)
+    expect(
+      events
+        .filter((event) => event.kind === 'question/restart-interrupted')
+        .map((event) => event.payload)
+    ).toEqual([
+      {
+        reason: 'interrupted_by_restart',
+        phase: 'planned',
+        turnBoundary: 'unknown',
+        questionCount: 1,
+      },
+    ])
+  })
+
+  it('transactionally widens the prior candidate lifecycle CHECK without losing rows', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-question-migration-'))
+    tempDirs.push(dir)
+    const file = path.join(dir, 'hub.db')
+    const legacy = new Database(file)
+    legacy.exec(`
+      CREATE TABLE question_lifecycles (
+        id TEXT PRIMARY KEY,
+        session TEXT NOT NULL,
+        correlation_digest TEXT NOT NULL,
+        tool_use_id_length INTEGER NOT NULL,
+        request_id_length INTEGER NOT NULL,
+        question_digest TEXT NOT NULL,
+        owner_epoch TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'answered', 'cancelled', 'aborted')),
+        terminal_reason TEXT,
+        input_bytes INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO question_lifecycles VALUES
+        ('legacy', 's1', 'corr', 4, 7, 'digest', 'old-owner', 'aborted', 'hub-restarted', 10, '2026-01-01T00:00:00.000Z');
+    `)
+    legacy.close()
+
+    const journal = new Journal(file)
+    opened.push(journal)
+    expect(journal.resolvedQuestion('legacy')).toMatchObject({
+      status: 'aborted',
+      reason: 'hub-restarted',
+    })
+    const sql = (
+      journal.db
+        .prepare("SELECT sql FROM sqlite_master WHERE name = 'question_lifecycles'")
+        .get() as { sql: string }
+    ).sql
+    expect(sql).toContain("'interrupted'")
+    journal.db
+      .prepare(
+        `INSERT INTO question_lifecycles VALUES
+         ('new', 's1', 'corr2', 4, 7, 'digest2', 'new-owner', 'interrupted',
+          'interrupted_by_restart', 10, '2026-01-01T00:00:01.000Z')`
+      )
+      .run()
+  })
+
+  it('rolls back the whole foreign terminalization set when one audit append fails', async () => {
+    const { journal, questions: blue, request, count } = fresh()
+    const first = request()
+    const second = blue.request({
+      id: 'q-second',
+      sessionId: 's1',
+      toolUseId: 'toolu_2',
+      requestId: 'control_2',
+      input: QUESTIONS,
+    })
+    const green = new QuestionService(journal)
+    const originalAppend = journal.append.bind(journal)
+    let resolutions = 0
+    const append = vi.spyOn(journal, 'append').mockImplementation((sessionId, kind, payload) => {
+      if (kind === 'question/resolved' && ++resolutions === 2) {
+        throw new Error('SQLITE_FULL during second foreign terminal')
+      }
+      return originalAppend(sessionId, kind, payload)
+    })
+
+    expect(() => green.activatePublicOwner()).toThrow(/SQLITE_FULL/)
+    expect(green.isPublicOwner).toBe(false)
+    expect(blue.pending()).toHaveLength(2)
+    expect(count('question/resolved')).toBe(0)
+
+    append.mockRestore()
+    expect(green.activatePublicOwner()).toBe(2)
+    expect(blue.pending()).toEqual([])
+    await expect(first).resolves.toEqual({
+      kind: 'interrupted',
+      reason: 'restart',
+      message: ASK_INTERRUPTED_BY_RESTART_MESSAGE,
+    })
+    await expect(second).resolves.toEqual({
+      kind: 'interrupted',
+      reason: 'restart',
+      message: ASK_INTERRUPTED_BY_RESTART_MESSAGE,
+    })
+    expect(count('question/resolved')).toBe(2)
+  })
+
+  it('never reconstructs a secret-like answer from the redacted journal after a lost reply', async () => {
+    const { journal, questions, request, count } = fresh()
+    const pending = request()
+    const answers = {
+      'Which format should I use?': 'token: sk-ant-this-is-a-secret-like-custom-answer',
+      'Which sections should I include?': 'Results',
+    }
+    questions.answer('q-stable', answers)
+    await expect(pending).resolves.toMatchObject({
+      kind: 'answered',
+      updatedInput: { answers },
+    })
+    expect(count('question/requested')).toBe(1)
+    expect(count('question/resolved')).toBe(1)
+    const audit = journal.db
+      .prepare("SELECT payload FROM events WHERE kind = 'question/resolved'")
+      .get() as { payload: string }
+    expect(audit.payload).not.toContain('sk-ant-this-is-a-secret-like-custom-answer')
+    expect(audit.payload).not.toContain('updatedInput')
+
+    const successor = new QuestionService(journal)
+    successor.activatePublicOwner()
+    await expect(
+      successor.request({
+        id: 'q-stable',
+        sessionId: 's1',
+        toolUseId: 'toolu_1',
+        requestId: 'control_1',
+        input: QUESTIONS,
+      })
+    ).resolves.toEqual({ kind: 'cancelled', reason: 'recovery-unknown' })
+    expect(successor.pending()).toEqual([])
+    expect(count('question/requested')).toBe(1)
+    expect(count('question/resolved')).toBe(1)
+    expect(count('question/recovery-unknown')).toBe(1)
+    await expect(
+      (() => {
+        const recovered = new QuestionService(journal)
+        recovered.activatePublicOwner()
+        return recovered
+      })().request({
+        id: 'q-stable',
+        sessionId: 's1',
+        toolUseId: 'toolu_1',
+        requestId: 'control_1',
+        input: QUESTIONS,
+      })
+    ).resolves.toEqual({ kind: 'cancelled', reason: 'recovery-unknown' })
+    expect(count('question/recovery-unknown')).toBe(1)
+  })
+
+  it('keeps prompt, preview, and raw vendor correlation bytes out of SQLite and replay', async () => {
+    const { journal, questions } = fresh()
+    const privateQuestion = 'PRIVATE QUESTION BODY must stay in owner memory'
+    const privateDescription = 'PRIVATE DESCRIPTION must not reach a backup'
+    const privatePreview = 'PRIVATE PREVIEW must not reach WAL or replay'
+    const privateToolUseId = 'toolu_PRIVATE_CORRELATION'
+    const privateRequestId = 'request_PRIVATE_CORRELATION'
+    const pending = questions.request({
+      id: 'q-private-storage',
+      sessionId: 's-private',
+      toolUseId: privateToolUseId,
+      requestId: privateRequestId,
+      input: {
+        questions: [
+          {
+            question: privateQuestion,
+            header: 'Private',
+            options: [
+              {
+                label: 'One',
+                description: privateDescription,
+                preview: privatePreview,
+              },
+              { label: 'Two', description: 'Second.' },
+            ],
+            multiSelect: false,
+          },
+        ],
+      },
+    })
+
+    const durableRows = journal.db
+      .prepare(
+        `SELECT id, session, correlation_digest, tool_use_id_length, request_id_length,
+                question_digest, owner_epoch, status, terminal_reason, input_bytes, created_at
+         FROM question_lifecycles`
+      )
+      .all()
+    const replayPayloads = journal.db
+      .prepare("SELECT payload FROM events WHERE kind LIKE 'question/%'")
+      .all()
+    const persisted = JSON.stringify({ durableRows, replayPayloads })
+    for (const secret of [
+      privateQuestion,
+      privateDescription,
+      privatePreview,
+      privateToolUseId,
+      privateRequestId,
+    ]) {
+      expect(persisted).not.toContain(secret)
+    }
+    expect(questions.pending()[0]?.questions[0]?.question).toBe(privateQuestion)
+    questions.cancel('q-private-storage')
+    await pending
+  })
+
+  it('keeps replay bytes bounded across repeated maximum-shape question bodies', async () => {
+    const { journal, questions } = fresh()
+    const maxInput: AskUserQuestionInput = {
+      questions: Array.from({ length: 4 }, (_, questionIndex) => ({
+        question: `Q${questionIndex}-${'q'.repeat(1_990)}`,
+        header: `Header${questionIndex}`,
+        options: Array.from({ length: 4 }, (_, optionIndex) => ({
+          label: `Option ${optionIndex}`,
+          description: `D${questionIndex}${optionIndex}-${'d'.repeat(1_990)}`,
+          preview: `P${questionIndex}${optionIndex}-${'p'.repeat(19_990)}`,
+        })),
+        multiSelect: questionIndex % 2 === 0,
+      })),
+    }
+    for (let index = 0; index < 16; index += 1) {
+      const id = `q-max-${index}`
+      const pending = questions.request({
+        id,
+        sessionId: 's-max',
+        toolUseId: `tool-max-${index}`,
+        requestId: `request-max-${index}`,
+        input: maxInput,
+      })
+      questions.cancel(id)
+      await pending
+    }
+
+    const payloads = journal.db
+      .prepare("SELECT payload FROM events WHERE kind IN ('question/requested', 'question/resolved')")
+      .all() as Array<{ payload: string }>
+    expect(payloads).toHaveLength(32)
+    expect(payloads.reduce((bytes, row) => bytes + Buffer.byteLength(row.payload), 0)).toBeLessThan(
+      32_000
+    )
+    const replay = JSON.stringify(journal.since(0, 100))
+    expect(replay).not.toContain('pppppppppppppppp')
+    expect(replay).not.toContain('dddddddddddddddd')
+  })
+
+  it('recovers cancellation after restart and re-offers an unresolved request', async () => {
+    const { journal, questions, request, count } = fresh()
+    const cancelled = request()
+    questions.cancel('q-stable')
+    await cancelled
+
+    const successor = new QuestionService(journal)
+    successor.activatePublicOwner()
+    await expect(
+      successor.request({
+        id: 'q-stable',
+        sessionId: 's1',
+        toolUseId: 'toolu_1',
+        requestId: 'control_1',
+        input: QUESTIONS,
+      })
+    ).resolves.toEqual({ kind: 'cancelled' })
+
+    const unresolved = new QuestionService(journal)
+    unresolved.activatePublicOwner()
+    const open = unresolved.request({
+      id: 'q-open',
+      sessionId: 's1',
+      toolUseId: 'toolu_open',
+      requestId: 'control_open',
+      input: QUESTIONS,
+    })
+    expect(unresolved.pending().map((record) => record.id)).toEqual(['q-open'])
+    expect(count('question/requested')).toBe(2)
+    unresolved.cancel('q-open')
+    await open
+  })
+
+  it('bounds pending questions before journaling while same-id retries still dedup at capacity', async () => {
+    const { questions, count } = fresh()
+    const pending: Promise<unknown>[] = []
+    for (let index = 0; index < MAX_PENDING_QUESTIONS_PER_SESSION; index += 1) {
+      pending.push(
+        questions.request({
+          id: `q-session-${index}`,
+          sessionId: 's-cap',
+          toolUseId: `tool-${index}`,
+          requestId: `request-${index}`,
+          input: QUESTIONS,
+        })
+      )
+    }
+    const duplicate = questions.request({
+      id: 'q-session-0',
+      sessionId: 's-cap',
+      toolUseId: 'tool-0',
+      requestId: 'request-0',
+      input: QUESTIONS,
+    })
+    expect(duplicate).toBe(pending[0])
+    expect(() =>
+      questions.request({
+        id: 'q-session-overflow',
+        sessionId: 's-cap',
+        toolUseId: 'tool-overflow',
+        requestId: 'request-overflow',
+        input: QUESTIONS,
+      })
+    ).toThrow(/too many pending questions for this session/)
+    expect(count('question/requested')).toBe(MAX_PENDING_QUESTIONS_PER_SESSION)
+
+    for (const record of questions.pending()) questions.cancel(record.id)
+    await Promise.all(pending)
+  })
+
+  it('enforces the global pending bound across sessions without evicting existing questions', async () => {
+    const { questions, count } = fresh()
+    const pending: Promise<unknown>[] = []
+    for (let index = 0; index < MAX_PENDING_QUESTIONS_GLOBAL; index += 1) {
+      pending.push(
+        questions.request({
+          id: `q-global-${index}`,
+          sessionId: `s-${Math.floor(index / MAX_PENDING_QUESTIONS_PER_SESSION)}`,
+          toolUseId: `tool-global-${index}`,
+          requestId: `request-global-${index}`,
+          input: QUESTIONS,
+        })
+      )
+    }
+    expect(() =>
+      questions.request({
+        id: 'q-global-overflow',
+        sessionId: 's-overflow',
+        toolUseId: 'tool-global-overflow',
+        requestId: 'request-global-overflow',
+        input: QUESTIONS,
+      })
+    ).toThrow(/too many pending questions in this hub/)
+    expect(questions.pending()).toHaveLength(MAX_PENDING_QUESTIONS_GLOBAL)
+    expect(count('question/requested')).toBe(MAX_PENDING_QUESTIONS_GLOBAL)
+
+    for (const record of questions.pending()) questions.cancel(record.id)
+    await Promise.all(pending)
+  })
+
+  it('preserves prototype-looking exact question keys without mutating or losing object properties', async () => {
+    const { questions } = fresh()
+    const input: AskUserQuestionInput = {
+      questions: [
+        {
+          question: '__proto__',
+          header: 'Prototype',
+          options: [
+            { label: 'Keep', description: 'Keep the exact key.' },
+            { label: 'Reject', description: 'Reject the choice.' },
+          ],
+          multiSelect: false,
+        },
+        {
+          question: 'constructor',
+          header: 'Constructor',
+          options: [
+            { label: 'Own', description: 'Create an own property.' },
+            { label: 'Skip', description: 'Skip this option.' },
+          ],
+          multiSelect: false,
+        },
+      ],
+    }
+    const pending = questions.request({
+      id: 'q-special-keys',
+      sessionId: 's-special',
+      toolUseId: 'tool-special',
+      requestId: 'request-special',
+      input,
+    })
+    const rawAnswers = JSON.parse('{"__proto__":"Keep","constructor":"Own"}') as unknown
+    expect(questions.answer('q-special-keys', rawAnswers)).toBe(true)
+    const outcome = await pending
+    expect(outcome).toMatchObject({
+      kind: 'answered',
+      updatedInput: { answers: { __proto__: 'Keep', constructor: 'Own' } },
+    })
+    if (outcome.kind !== 'answered') throw new Error('expected answered outcome')
+    expect(Object.hasOwn(outcome.updatedInput.answers, '__proto__')).toBe(true)
+    expect(Object.hasOwn(outcome.updatedInput.answers, 'constructor')).toBe(true)
+    expect(JSON.parse(JSON.stringify(outcome.updatedInput.answers))).toEqual(
+      JSON.parse('{"__proto__":"Keep","constructor":"Own"}')
+    )
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined()
+  })
+})
+
+describe('AskUserQuestion schema validation', () => {
+  it.each([
+    ['missing questions', {}],
+    ['zero questions', { questions: [] }],
+    ['too many questions', { questions: Array.from({ length: 5 }, () => QUESTIONS.questions[0]) }],
+    ['duplicate question text', { questions: [QUESTIONS.questions[0], QUESTIONS.questions[0]] }],
+    [
+      'too few options',
+      {
+        questions: [
+          {
+            question: 'Choose?',
+            header: 'Choice',
+            options: [{ label: 'One', description: 'Only one.' }],
+            multiSelect: false,
+          },
+        ],
+      },
+    ],
+    [
+      'model-supplied Other',
+      {
+        questions: [
+          {
+            question: 'Choose?',
+            header: 'Choice',
+            options: [
+              { label: 'One', description: 'First.' },
+              { label: 'Other', description: 'Injected ambiguity.' },
+            ],
+            multiSelect: false,
+          },
+        ],
+      },
+    ],
+    [
+      'unknown question field',
+      {
+        questions: [
+          {
+            ...QUESTIONS.questions[0],
+            surprise: true,
+          },
+        ],
+      },
+    ],
+  ])('fails closed for %s', (_label, input) => {
+    const { questions } = fresh()
+    expect(() =>
+      questions.request({
+        id: 'q-invalid',
+        sessionId: 's1',
+        toolUseId: 'toolu_invalid',
+        requestId: 'control_invalid',
+        input,
+      })
+    ).toThrow(QuestionInputError)
+    expect(questions.pending()).toEqual([])
+  })
+
+  it('rejects a very large string before retaining or journaling it', () => {
+    const { questions, count } = fresh()
+    expect(() =>
+      questions.request({
+        id: 'q-huge',
+        sessionId: 's1',
+        toolUseId: 'toolu_huge',
+        requestId: 'control_huge',
+        input: {
+          questions: [
+            {
+              ...QUESTIONS.questions[0],
+              question: 'x'.repeat(1_000_000),
+            },
+          ],
+        },
+      })
+    ).toThrow(QuestionInputError)
+    expect(questions.pending()).toEqual([])
+    expect(count('question/requested')).toBe(0)
+  })
+
+  it('accepts only the two closed API response shapes and rejects hostile/inherited keys', () => {
+    expect(parseQuestionDecisionBody({ cancel: true })).toEqual({ kind: 'cancel' })
+    expect(parseQuestionDecisionBody({ answers: { a: 'b' } })).toEqual({
+      kind: 'answer',
+      answers: { a: 'b' },
+    })
+
+    const inherited = Object.create({ answers: { a: 'inherited' } }) as object
+    for (const body of [
+      {},
+      { cancel: false },
+      { cancel: false, answers: {} },
+      { cancel: true, answers: {} },
+      { answers: {}, extra: true },
+      JSON.parse('{"__proto__":{},"answers":{}}'),
+      { constructor: {}, answers: {} },
+      inherited,
+    ]) {
+      expect(() => parseQuestionDecisionBody(body)).toThrow(QuestionInputError)
+    }
+  })
+})
+
+describe('question correlation codec', () => {
+  it('rejects ambiguous delimiter splits and oversized identifiers before hashing', () => {
+    expect(() => stableQuestionId('session', 'a\0b', 'c')).toThrow(
+      /without control characters/
+    )
+    expect(() => stableQuestionId('session', 'a', 'b\0c')).toThrow(
+      /without control characters/
+    )
+    expect(() => stableQuestionId('session', 'x'.repeat(513), 'c')).toThrow(
+      /bounded string/
+    )
+
+    const { questions } = fresh()
+    expect(() =>
+      questions.request({
+        id: 'q-control-rejected',
+        sessionId: 'session',
+        toolUseId: 'a\0b',
+        requestId: 'c',
+        input: QUESTIONS,
+      })
+    ).toThrow(/control characters/)
+    expect(questions.pending()).toEqual([])
+  })
+
+})

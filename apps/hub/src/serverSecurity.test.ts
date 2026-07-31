@@ -20,6 +20,7 @@ import { UsageMonitor } from './usage.js'
 import { WorkspaceManager } from './workspace.js'
 import type { RestartState } from './restartController.js'
 import { RestartController } from './restartController.js'
+import { QuestionService } from './questions.js'
 import { waitForPortRelease } from './restartRollback.js'
 
 const cleanups: Array<() => void | Promise<void>> = []
@@ -74,10 +75,12 @@ async function build() {
     danger,
     false,
     root,
+    new QuestionService(journal),
     executor
   )
   sessions.execAgentTool = async () => 'bridge-ok'
   const record = await sessions.create(profile.id, { cwd: root, useWorktree: false })
+  sessions.questionService.activatePublicOwner()
   const deviceToken = 'test-device-token-at-least-thirty-two-characters'
   const restartState: RestartState = {
     booted: true,
@@ -96,6 +99,7 @@ async function build() {
     sessions,
     profiles: [profile],
     approvals,
+    questions: sessions.questionService,
     usage,
     projects,
     instructions,
@@ -206,11 +210,18 @@ describe('device-authenticated control plane', () => {
       server,
       sessions,
       journal,
+      questions: sessions.questionService,
       state: restartState,
       publicPort,
       send: (message) => sent.push(message),
       onPromoted: () => {},
       stopJournalBackups: async () => {},
+      profileRuntime: {
+        prepareRestart: async () => ({ settled: 0, outcomeUnknown: 0 }),
+        deactivatePublicGeneration: () => {},
+        activatePublicGeneration: () => {},
+        resumeLoginAdmission: () => {},
+      },
       executor,
     })
     restartState.journalBackup = { status: 'inactive' }
@@ -287,9 +298,15 @@ describe('device-authenticated control plane', () => {
 
   it('accepts an authenticated WebSocket bearer header for the trusted dev proxy', async () => {
     const { base, deviceToken } = await build()
-    const socket = new WebSocket(`${base.replace('http:', 'ws:')}/ws?since=0`, {
+    const response = await fetch(`${base}/api/replay-baseline`, { headers: auth(deviceToken) })
+    expect(response.status).toBe(200)
+    const baseline = (await response.json()) as { highWaterSeq: number; generation: number }
+    const socket = new WebSocket(
+      `${base.replace('http:', 'ws:')}/ws?since=${baseline.highWaterSeq}&generation=${baseline.generation}`,
+      {
       headers: { authorization: `Bearer ${deviceToken}` },
-    })
+      }
+    )
     await once(socket, 'open')
     expect(socket.readyState).toBe(WebSocket.OPEN)
     socket.close()
@@ -298,11 +315,27 @@ describe('device-authenticated control plane', () => {
 
   it('sends a replay boundary after the backlog and before subsequently journaled events', async () => {
     const { base, deviceToken, journal, record } = await build()
+    const baselineResponse = await fetch(`${base}/api/replay-baseline`, {
+      headers: auth(deviceToken),
+    })
+    expect(baselineResponse.status).toBe(200)
+    const baseline = (await baselineResponse.json()) as {
+      generation: number
+      highWaterSeq: number
+      resetFloorSeq: number
+      sessions: unknown[]
+      journalCompaction: unknown
+    }
+    expect(baseline.sessions.length).toBeGreaterThan(0)
+    expect(baseline.resetFloorSeq).toBe(0)
     journal.append(record.id, 'test/replayed', { value: 'history' })
     const messages: Array<Record<string, unknown>> = []
-    const socket = new WebSocket(`${base.replace('http:', 'ws:')}/ws?since=0`, {
-      headers: { authorization: `Bearer ${deviceToken}` },
-    })
+    const socket = new WebSocket(
+      `${base.replace('http:', 'ws:')}/ws?since=${baseline.highWaterSeq}&generation=${baseline.generation}`,
+      {
+        headers: { authorization: `Bearer ${deviceToken}` },
+      }
+    )
     try {
       socket.on('message', (data) => messages.push(JSON.parse(String(data)) as Record<string, unknown>))
       await once(socket, 'open')
@@ -365,5 +398,66 @@ describe('device-authenticated control plane', () => {
     })
     expect(reveal.status).toBe(200)
     expect(await reveal.json()).toEqual({ token: deviceToken })
+  })
+
+  it('authenticates recovery notices and validates idempotent exact-id dismissal', async () => {
+    const { base, deviceToken, journal } = await build()
+    const unauthenticated = await fetch(`${base}/api/recovery-notices`)
+    expect(unauthenticated.status).toBe(401)
+
+    const empty = await fetch(`${base}/api/recovery-notices`, {
+      headers: auth(deviceToken),
+    })
+    expect(empty.status).toBe(200)
+    expect(await empty.json()).toEqual([])
+
+    const planId = '11111111-1111-4111-8111-111111111111'
+    journal.db
+      .prepare(
+        `INSERT INTO journal_recovery_notices (
+           plan_id, generation, snapshot_max_seq, snapshot_event_high_water,
+           quarantine_dir, recorded_at, dismissed_at
+         ) VALUES (?, '7', '420', '425', ?, '2026-07-29T00:00:00.000Z', NULL)`
+      )
+      .run(planId, `C:\\evidence\\${planId}`)
+
+    const listed = await fetch(`${base}/api/recovery-notices`, {
+      headers: auth(deviceToken),
+    })
+    expect(await listed.json()).toEqual([
+      {
+        planId,
+        generation: '7',
+        snapshotMaxSeq: '420',
+        snapshotEventHighWater: '425',
+        quarantineDir: `C:\\evidence\\${planId}`,
+        recordedAt: '2026-07-29T00:00:00.000Z',
+      },
+    ])
+
+    for (const suffix of ['%zz', 'x'.repeat(129), 'abc', '%2F', '%00', '%E2%98%83']) {
+      const malformed = await fetch(`${base}/api/recovery-notices/${suffix}/dismiss`, {
+        method: 'POST',
+        headers: auth(deviceToken),
+      })
+      expect(malformed.status).toBe(400)
+    }
+    const missing = await fetch(
+      `${base}/api/recovery-notices/22222222-2222-4222-8222-222222222222/dismiss`,
+      { method: 'POST', headers: auth(deviceToken) }
+    )
+    expect(missing.status).toBe(404)
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const dismissed = await fetch(`${base}/api/recovery-notices/${planId}/dismiss`, {
+        method: 'POST',
+        headers: auth(deviceToken),
+      })
+      expect(dismissed.status).toBe(200)
+    }
+    const after = await fetch(`${base}/api/recovery-notices`, {
+      headers: auth(deviceToken),
+    })
+    expect(await after.json()).toEqual([])
   })
 })
