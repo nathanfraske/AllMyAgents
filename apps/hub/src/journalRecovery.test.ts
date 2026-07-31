@@ -243,6 +243,43 @@ describe('owned journal corruption recovery', () => {
     })
   })
 
+  it('accepts an exact reader finishing root-binding publication concurrently', () => {
+    const dataDir = root()
+    const journal = open(dataDir)
+    const journalPath = path.join(dataDir, 'hub.db')
+    journal.append('s1', 'session/input', { text: 'concurrent-root-binding-reader' })
+    let readerFinishedPublication = false
+
+    const enrolled = ensureRecoveryEnrollment(journal.db, dataDir, {
+      failpoint: (edge) => {
+        if (edge !== 'after-enrollment-root-binding-publication-link') return
+        const bindingPath = recoveryPaths(dataDir).rootBinding
+        const before = fs.lstatSync(bindingPath, { bigint: true })
+        expect(before.nlink).toBe(2n)
+        expect(
+          verifyNormalJournalLineage({
+            dataDir,
+            journalPath,
+            maxSchemaVersion: SCHEMA_VERSION,
+          })
+        ).toBeUndefined()
+        const after = fs.lstatSync(bindingPath, { bigint: true })
+        expect(after.dev).toBe(before.dev)
+        expect(after.nlink).toBe(1n)
+        readerFinishedPublication = true
+      },
+    })
+
+    expect(readerFinishedPublication).toBe(true)
+    expect(enrolled.rootId).toMatch(/^[0-9a-f-]{36}$/i)
+    expect(enrolled.journalId).toMatch(/^[0-9a-f-]{36}$/i)
+    expect(
+      fs
+        .readdirSync(recoveryPaths(dataDir).root)
+        .filter((entry) => entry.startsWith('root.json.partial-'))
+    ).toEqual([])
+  })
+
   it('enrolls the shipped healthy backup path into an identity-bound strong generation', async () => {
     const dataDir = root()
     const journal = open(dataDir)
