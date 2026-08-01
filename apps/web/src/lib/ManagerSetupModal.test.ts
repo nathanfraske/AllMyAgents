@@ -4,12 +4,13 @@ import ManagerSetupModal from './ManagerSetupModal.svelte'
 import { store, type SessionView } from './store.svelte'
 import type { SessionRecord } from './api'
 
-const { configureProjectManager, spawn, send, setMode, setSettings } = vi.hoisted(() => ({
+const { configureProjectManager, spawn, send, setMode, setSettings, rename } = vi.hoisted(() => ({
   configureProjectManager: vi.fn(),
   spawn: vi.fn(),
   send: vi.fn(),
   setMode: vi.fn(),
   setSettings: vi.fn(),
+  rename: vi.fn(),
 }))
 
 vi.mock('./api', async (orig) => {
@@ -23,7 +24,7 @@ vi.mock('./api', async (orig) => {
       send,
       setMode,
       setSettings,
-      rename: vi.fn(async () => ({ ok: true })),
+      rename,
     },
   }
 })
@@ -47,6 +48,7 @@ beforeEach(() => {
   setMode.mockResolvedValue({ ok: true })
   setSettings.mockResolvedValue(session('settings', 'Settings').record)
   send.mockResolvedValue({ ok: true })
+  rename.mockResolvedValue({ ok: true })
   store.projects = [{ id: 'project-1', name: 'Demo project', path: 'C:/repo', createdAt: '2026-07-27T00:00:00.000Z' }]
   store.profiles = [
     { id: 'codex-a', provider: 'codex' },
@@ -54,6 +56,7 @@ beforeEach(() => {
   ]
   store.sessions = { existing: session('existing', 'Existing chat') }
   store.managerSetupSessionId = 'existing'
+  store.projectViewId = 'project-1'
 })
 
 describe('Manager setup', () => {
@@ -114,7 +117,7 @@ describe('Manager setup', () => {
     expect(getByLabelText(/agent type name/i)).toBeTruthy()
     expect(getByLabelText(/what is this agent for/i)).toBeTruthy()
     expect(getByLabelText(/worker model/i)).toBeTruthy()
-    expect(getByLabelText(/reasoning.*effort/i)).toBeTruthy()
+    expect(getByLabelText(/^reasoning \/ effort$/i)).toBeTruthy()
     expect(getByRole('button', { name: /let manager choose using usage limits/i })).toBeTruthy()
   })
 
@@ -234,5 +237,51 @@ describe('Manager setup', () => {
     expect(queryByRole('button', { name: /add to project launch/i })).toBeNull()
     expect(onConfigured.mock.calls[0]?.[0].standingInstructions).toMatch(/worktree/i)
     expect(spawn).not.toHaveBeenCalled()
+  })
+
+  it('edits an existing manager in project context without navigating into its chat or widening an override', async () => {
+    store.sessions.existing!.record = {
+      ...store.sessions.existing!.record,
+      isProjectManager: true,
+      model: 'gpt-5.6-terra',
+      effort: 'high',
+      permissionMode: 'full',
+      permissionModeOperatorOverride: true,
+      permissionModeOperatorOverrideCeiling: 'full',
+      managerPermissionModeCeiling: 'safe',
+      managerMaxChildPermissionMode: 'edits',
+      managerAllowedProfiles: ['codex-a'],
+      managerAllowedModels: { 'codex-a': ['gpt-5.6-terra'] },
+    }
+    configureProjectManager.mockImplementation(async (id: string, config: Record<string, unknown>) => ({
+      ...store.sessions[id]!.record,
+      title: 'Release manager',
+      permissionMode: config.permissionMode,
+      managerPermissionModeCeiling: config.permissionMode,
+    }))
+    const onSaved = vi.fn()
+    const { getByRole, getByLabelText, getByText } = render(ManagerSetupModal, {
+      embedded: true,
+      stayInProject: true,
+      initialProjectId: 'project-1',
+      initialManagerId: 'existing',
+      onSaved,
+    })
+
+    expect(getByText('Editing existing manager')).toBeTruthy()
+    expect(getByText(/account owns this live vendor thread/i)).toBeTruthy()
+    expect((getByLabelText('Manager permission level') as HTMLSelectElement).value).toBe('safe')
+    await fireEvent.input(getByLabelText('Manager display name'), { target: { value: 'Release manager' } })
+    await fireEvent.click(getByRole('button', { name: 'Save manager settings' }))
+
+    await waitFor(() => expect(configureProjectManager).toHaveBeenCalled())
+    expect(rename).toHaveBeenCalledWith('existing', 'Release manager')
+    expect(configureProjectManager).toHaveBeenCalledWith(
+      'existing',
+      expect.objectContaining({ permissionMode: 'safe', maxChildPermissionMode: 'edits' }),
+    )
+    expect(onSaved).toHaveBeenCalledWith(expect.objectContaining({ id: 'existing' }))
+    expect(store.projectViewId).toBe('project-1')
+    expect(send).not.toHaveBeenCalled()
   })
 })

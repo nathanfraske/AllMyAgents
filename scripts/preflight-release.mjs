@@ -190,7 +190,15 @@ check('hub typecheck', () => {
   return 'clean'
 })
 check('web check', () => {
-  const m = expectOutput('pnpm --filter web check 2>&1', /COMPLETED (\d+) FILES (\d+) ERRORS/, 'web check')
+  const m = expectOutput(
+    'pnpm --filter web check 2>&1',
+    /(?:COMPLETED (\d+) FILES (\d+) ERRORS|svelte-check found (\d+) errors and (\d+) warnings)/,
+    'web check',
+  )
+  if (m[3] !== undefined) {
+    if (m[3] !== '0' || m[4] !== '0') throw new Error(`${m[3]} errors, ${m[4]} warnings`)
+    return '0 errors, 0 warnings'
+  }
   if (m[2] !== '0') throw new Error(`${m[2]} errors`)
   return `${m[1]} files, 0 errors`
 })

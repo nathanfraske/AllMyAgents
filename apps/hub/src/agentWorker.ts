@@ -145,12 +145,13 @@ export function buildWorkerAgentServices(deps: WorkerAgentServiceDeps): AgentSer
       }>,
     spawnAgent: (managerSessionId, input) =>
       deps.relayRpc('manager.spawn', { managerSessionId, input }) as Promise<ManagerSpawnResult>,
-    setChildAuthority: (managerSessionId, childSessionId, authorities, tools) =>
+    setChildAuthority: (managerSessionId, childSessionId, authorities, tools, permissionMode) =>
       deps.relayRpc('manager.setChildAuthority', {
         managerSessionId,
         childSessionId,
         authorities,
         tools,
+        permissionMode,
       }) as Promise<{ ok: boolean; error?: string }>,
     decideChildApproval: (managerSessionId, approvalId, approve) =>
       deps.relayRpc('manager.decideChildApproval', {

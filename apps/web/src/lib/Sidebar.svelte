@@ -27,6 +27,37 @@
   } from './folders'
 
   let filter = $state('')
+  let statusPopover = $state<'hub' | 'journal' | null>(null)
+  let statusRegion = $state<HTMLDivElement | null>(null)
+
+  const journalPhase = $derived(store.journalCompaction?.phase ?? 'idle')
+  const journalLabel = $derived.by(() => {
+    switch (journalPhase) {
+      case 'started': return 'starting'
+      case 'progress': return 'working'
+      case 'completed': return 'completed'
+      case 'failed': return 'failed'
+      case 'unobservable': return 'status unavailable'
+      default: return 'idle'
+    }
+  })
+
+  function toggleStatus(kind: 'hub' | 'journal'): void {
+    statusPopover = statusPopover === kind ? null : kind
+  }
+
+  function closeStatusOnOutside(event: PointerEvent): void {
+    if (statusPopover && !statusRegion?.contains(event.target as Node)) statusPopover = null
+  }
+
+  function closeStatusOnEscape(event: KeyboardEvent): void {
+    if (event.key === 'Escape') statusPopover = null
+  }
+
+  function displayStatusTime(value: string): string {
+    const time = Date.parse(value)
+    return Number.isFinite(time) ? new Date(time).toLocaleString() : value
+  }
 
   function pathFor(id: string): string {
     return store.projects.find((p) => p.id === id)?.path ?? ''
@@ -204,13 +235,20 @@
   }
 
   function openSessionRow(s: SessionView): void {
-    // A manager represents the whole team in the sidebar. Its primary destination is therefore the
-    // project workspace, not an ordinary chat pane; Manager setup remains available from Managers.
+    // Keep the manager inside its project workspace, but enter the full conversation explicitly. A
+    // remembered Overview choice must not turn a click on a chat row into a two-click navigation.
     if (s.record.isProjectManager && s.record.projectId) {
-      store.openProjectView(s.record.projectId)
+      store.openProjectView(s.record.projectId, 'manager')
       return
     }
     store.select(s.record.id)
+  }
+
+  async function openNewProjectChat(e: MouseEvent, projectId: string): Promise<void> {
+    // The action lives inside a draggable project header. Stop that ancestor gesture from winning the
+    // click, then let newSession create and select the draft (which also exits Project Overview).
+    e.stopPropagation()
+    await store.newSession(undefined, projectId)
   }
 
   // Inline rename: double-click the label (or the rename action). Enter commits, Esc cancels.
@@ -265,8 +303,10 @@
   // {#each} below turns into no DOM movement at all.
   const groups = $derived.by(() => {
     const q = filter.toLowerCase()
-    const match = (s: SessionView): boolean =>
-      !q || `${s.record.profileId} ${s.record.cwd} ${s.record.model ?? ''}`.toLowerCase().includes(q)
+    const match = (s: SessionView): boolean => {
+      const account = store.profiles.find((profile) => profile.id === s.record.profileId)
+      return !q || `${s.record.profileId} ${account?.displayName ?? ''} ${s.record.cwd} ${s.record.model ?? ''}`.toLowerCase().includes(q)
+    }
     const byProject = new Map<string, SessionView[]>()
     for (const s of store.sessionList) {
       if (!match(s)) continue
@@ -623,6 +663,8 @@
   }
 </script>
 
+<svelte:window onpointerdown={closeStatusOnOutside} onkeydown={closeStatusOnEscape} />
+
 <div class="sidebar">
   <!-- Connectivity strip (its own row, below the title bar, above search). The title bar owns the ONE
        brand/wordmark now, so this no longer repeats it; it carries the home control (kept as a one-click
@@ -637,10 +679,98 @@
       aria-label="Home"
       onclick={() => store.goHome()}
     ><Icon name="home" size={17} /><span>Home</span></button>
-    <span class="conn-label" class:down={!store.connected}>
-      {store.connected ? 'Connected' : store.hubDownSeconds > 0 ? `Reconnecting… ${store.hubDownSeconds}s` : 'Reconnecting…'}
-    </span>
-    <span class="conn-dot" class:on={store.connected}></span>
+    <div class="status-cluster" bind:this={statusRegion}>
+      <button
+        class="status-trigger hub-status"
+        class:problem={!store.connected}
+        type="button"
+        aria-haspopup="dialog"
+        aria-expanded={statusPopover === 'hub'}
+        aria-controls="hub-status-popout"
+        aria-label={`Hub: ${store.connected ? 'connected' : 'reconnecting'}`}
+        title="Hub connection details"
+        onclick={() => toggleStatus('hub')}
+      >
+        <span class="conn-label" class:down={!store.connected}>
+          {store.connected ? 'Connected' : store.hubDownSeconds > 0 ? `Reconnecting… ${store.hubDownSeconds}s` : 'Reconnecting…'}
+        </span>
+        <span class="status-dot" class:ok={store.connected} class:bad={!store.connected}></span>
+      </button>
+      <button
+        class="status-trigger journal-status"
+        class:working={journalPhase === 'started' || journalPhase === 'progress'}
+        class:ok={journalPhase === 'completed'}
+        class:bad={journalPhase === 'failed'}
+        class:warn={journalPhase === 'unobservable'}
+        type="button"
+        aria-haspopup="dialog"
+        aria-expanded={statusPopover === 'journal'}
+        aria-controls="journal-status-popout"
+        aria-label={`Journal maintenance: ${journalLabel}`}
+        title={`Journal maintenance: ${journalLabel}`}
+        onclick={() => toggleStatus('journal')}
+      >
+        <Icon name="timer" size={13} />
+        <span
+          class="status-dot"
+          class:working={journalPhase === 'started' || journalPhase === 'progress'}
+          class:ok={journalPhase === 'completed'}
+          class:bad={journalPhase === 'failed'}
+          class:warn={journalPhase === 'unobservable'}
+        ></span>
+      </button>
+
+      {#if statusPopover === 'hub'}
+        <dialog id="hub-status-popout" class="status-popout" aria-label="Hub connection" open>
+          <div class="status-popout-head">
+            <strong>Hub connection</strong>
+            <span class="status-state" class:problem={!store.connected}>
+              <span class="status-dot" class:ok={store.connected} class:bad={!store.connected}></span>
+              {store.connected ? 'Connected' : 'Reconnecting'}
+            </span>
+          </div>
+          {#if store.connected}
+            <p>The live connection to the local hub is active.</p>
+          {:else if store.hubDownSeconds >= 20}
+            <p>The hub is being restarted automatically. Retry intervals can back off to 30 seconds.</p>
+          {:else}
+            <p>The live connection was interrupted and the app is reconnecting.</p>
+          {/if}
+          {#if !store.connected && store.hubDownSeconds > 0}
+            <div class="status-metric"><span>Disconnected for</span><b>{store.hubDownSeconds}s</b></div>
+          {/if}
+        </dialog>
+      {:else if statusPopover === 'journal'}
+        <dialog id="journal-status-popout" class="status-popout" aria-label="Journal maintenance" open>
+          <div class="status-popout-head">
+            <strong>Journal maintenance</strong>
+            <span
+              class="status-state"
+              class:working={journalPhase === 'started' || journalPhase === 'progress'}
+              class:problem={journalPhase === 'failed' || journalPhase === 'unobservable'}
+            >{journalLabel}</span>
+          </div>
+          {#if store.journalCompaction}
+            <p>{store.journalCompaction.detail}</p>
+            <div class="status-metrics">
+              <div class="status-metric">
+                <span>Superseded rows</span>
+                <b>{store.journalCompaction.rowsDeleted.toLocaleString()}</b>
+              </div>
+              <div class="status-metric">
+                <span>Payload reclaimed</span>
+                <b>{(store.journalCompaction.payloadBytesDeleted / 1_048_576).toFixed(1)} MiB</b>
+              </div>
+            </div>
+            <div class="status-time">
+              Updated <time datetime={store.journalCompaction.updatedAt}>{displayStatusTime(store.journalCompaction.updatedAt)}</time>
+            </div>
+          {:else}
+            <p>No journal maintenance activity has been reported during this run.</p>
+          {/if}
+        </dialog>
+      {/if}
+    </div>
   </div>
 
   <div class="search"><span class="sicon"><Icon name="search" size={13} /></span><input placeholder="Search sessions" bind:value={filter} /></div>
@@ -714,7 +844,7 @@
           <button class="gadd" title="new folder" onclick={(e) => addFolder(e, g.id)}><Icon name="folder-plus" size={13} /></button>
           {#if g.id !== '__none__'}
             <button class="gadd" title="import existing chats" onclick={(e) => openImport(e, g.id)}><Icon name="download" size={13} /></button>
-            <button class="gadd" title="new chat here" onclick={() => store.newSession(undefined, g.id)}><Icon name="plus" size={14} /></button>
+            <button class="gadd" title="new chat here" onclick={(e) => openNewProjectChat(e, g.id)}><Icon name="plus" size={14} /></button>
           {/if}
         </div>
         {#if store.importPanelFor?.projectId === g.id}
@@ -784,10 +914,10 @@
                 class:orphanedchild={en.orphanedManager}
                 style={`--manager-depth:${en.managerDepth}`}
                 title={s.record.isProjectManager && s.record.projectId
-                  ? `Open ${managerProjectName(s)} project overview`
+                  ? `Open ${managerProjectName(s)} manager conversation`
                   : undefined}
                 aria-label={s.record.isProjectManager && s.record.projectId
-                  ? `Open ${managerProjectName(s)} project overview`
+                  ? `Open ${managerProjectName(s)} manager conversation`
                   : undefined}
                 role="button"
                 tabindex="0"
@@ -887,7 +1017,7 @@
 
 <style>
   .sidebar { display: flex; flex-direction: column; height: 100%; min-height: 0; background: var(--sidebar); border-right: 1px solid var(--border); }
-  .connbar { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); border-bottom: 1px solid var(--border-subtle); }
+  .connbar { position: relative; display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); border-bottom: 1px solid var(--border-subtle); }
   .homebtn { display: inline-flex; align-items: center; justify-content: center; gap: var(--space-2);
     height: 38px; padding: 0 var(--space-3); border: 1px solid var(--border); border-radius: var(--r-md);
     background: var(--surface); color: var(--text); font-size: var(--text-sm); font-weight: var(--fw-semibold);
@@ -895,10 +1025,37 @@
   .homebtn:hover { border-color: var(--border-accent); background: var(--surface-2); color: var(--text); }
   .homebtn.current { border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
     background: color-mix(in srgb, var(--accent) 10%, var(--surface)); color: var(--accent); }
-  .conn-label { flex: 1; min-width: 0; font-size: var(--text-xs); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .status-cluster { position: relative; display: flex; align-items: center; justify-content: flex-end; gap: var(--space-1); flex: 1; min-width: 0; }
+  .status-trigger { display: inline-flex; align-items: center; justify-content: center; gap: var(--space-2); height: 28px;
+    border: 1px solid transparent; border-radius: var(--r-pill); color: var(--muted); background: transparent; }
+  .status-trigger:hover, .status-trigger[aria-expanded='true'] { color: var(--text); border-color: var(--border); background: var(--surface-2); }
+  .hub-status { flex: 1; min-width: 0; justify-content: flex-end; padding: 0 var(--space-2); }
+  .journal-status { flex: none; width: 32px; padding: 0; }
+  .journal-status.working { color: var(--accent); }
+  .journal-status.ok { color: var(--ok); }
+  .journal-status.warn { color: var(--warn); }
+  .journal-status.bad { color: var(--bad-text); }
+  .conn-label { min-width: 0; font-size: var(--text-xs); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
   .conn-label.down { color: var(--warn, #d08700); }
-  .conn-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08); }
-  .conn-dot.on { background: var(--ok); }
+  .status-dot { display: inline-block; flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--dim); box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08); }
+  .status-dot.working { background: var(--accent); }
+  .status-dot.ok { background: var(--ok); }
+  .status-dot.warn { background: var(--warn); }
+  .status-dot.bad { background: var(--bad); }
+  .status-popout { position: absolute; z-index: 20; top: calc(100% + var(--space-2)); right: auto; bottom: auto; left: 0;
+    width: min(268px, calc(100vw - 112px)); max-width: none; max-height: none; margin: 0;
+    display: flex; flex-direction: column; gap: var(--space-3); padding: var(--space-4);
+    border: 1px solid var(--border-strong); border-radius: var(--r-lg); background: var(--surface);
+    color: var(--text); box-shadow: var(--shadow-4, 0 20px 55px rgba(0, 0, 0, 0.5)); }
+  .status-popout-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); font-size: var(--text-sm); }
+  .status-state { display: inline-flex; align-items: center; gap: var(--space-2); color: var(--muted); font-size: var(--text-xs); text-transform: capitalize; }
+  .status-state.working { color: var(--accent); }
+  .status-state.problem { color: var(--warn); }
+  .status-popout p { margin: 0; color: var(--text-dim); font-size: var(--text-xs); line-height: 1.5; }
+  .status-metrics { display: grid; gap: var(--space-2); }
+  .status-metric { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); color: var(--text-dim); font-size: var(--text-xs); }
+  .status-metric b { color: var(--text); font-weight: var(--fw-medium); font-variant-numeric: tabular-nums; }
+  .status-time { color: var(--dim); font-size: var(--text-2xs); }
   .search { position: relative; padding: 0 var(--space-4) var(--space-3); }
   .sicon { position: absolute; left: 1.15rem; top: calc(50% - 0.25rem); transform: translateY(-50%); color: var(--dim); display: grid; }
   .search input { width: 100%; padding-left: 1.9rem; }

@@ -25,6 +25,7 @@
   import { defaultModelFor, findModel, modelsFor } from './catalog'
   import Icon from './Icon.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
+  import { profileLabel, profileOptionLabel } from './profileLabel'
   import { store } from './store.svelte'
 
   interface Props {
@@ -32,9 +33,12 @@
     embedded?: boolean
     deferLaunch?: boolean
     initialProjectId?: string
+    initialManagerId?: string
+    stayInProject?: boolean
     draftProject?: Pick<ProjectInfo, 'name' | 'path'>
     onCreateProject?: () => void
     onConfigured?: (config: ManagerLaunchConfig | null) => void
+    onSaved?: (record: SessionRecord) => void
   }
 
   let {
@@ -42,9 +46,12 @@
     embedded = false,
     deferLaunch = false,
     initialProjectId = '',
+    initialManagerId = '',
+    stayInProject = false,
     draftProject,
     onCreateProject,
     onConfigured,
+    onSaved,
   }: Props = $props()
 
   type Mode = 'promote' | 'create'
@@ -67,6 +74,7 @@
   let selectedId = $state('')
   let projectId = $state('')
   let managerProfileId = $state(store.defaultProfileId() ?? '')
+  let managerTitle = $state('')
   let managerModel = $state('')
   let managerEffort = $state('')
   let permissionMode = $state<PermissionMode>('safe')
@@ -129,7 +137,7 @@
     return [
       `ROLE\nYou are a project manager in AllMyAgents. You run a team of real AllMyAgents chats on the operator’s behalf: decompose the task, delegate bounded work, watch progress and collisions, and act on what you learn. This full starting prompt is your manager brief; OPERATOR TASK at the end is the assignment to execute now.`,
       `PROJECT\nManage ${projectName} at ${projectPath}.\nWhat is already here: ${existing.length ? existing.join('; ') : 'no other project chats are running yet'}.`,
-      `YOUR ALLMYAGENTS TOOLS\n- list_agents: see the project teammates you can address.\n- spawn_agent: create a real child chat in this app; it gets an isolated git worktree by default. Use an operator-defined agent_type when one fits.\n- child_status: get the live running / idle / stopped / errored tally without polling.\n- peek_agent: inspect a worker without interrupting it. For your own children you may request activity, full transcript, changes, tasks, approvals/blockers, worktree state, or all views.\n- assign_child_task: put an audited assignment on a direct child’s task board; the operator sees that same board. Use the task id to update its state later.\n- set_child_authority: grant or revoke only the worker Git actions and exact tools inside your grant ceiling; changes apply to that worker’s next tool call.\n- send_message and read_messages: coordinate through the project bus. Prefer a direct message to one session; broadcast only when every project agent must act.\n- practice_write / practice_list / practice_read / practice_edit: manage durable team conventions that future agents should follow.\n- memory_write / memory_search / memory_read: retain and retrieve project facts and decisions.`,
+      `YOUR ALLMYAGENTS TOOLS\n- list_agents: see the project teammates you can address.\n- spawn_agent: create a real child chat in this app; it gets an isolated git worktree by default. Use an operator-defined agent_type when one fits.\n- child_status: get the live running / idle / stopped / errored tally without polling.\n- peek_agent: inspect a worker without interrupting it. For your own children you may request activity, full transcript, changes, tasks, approvals/blockers, worktree state, or all views.\n- assign_child_task: put an audited assignment on a direct child’s task board; the operator sees that same board. Use the task id to update its state later.\n- set_child_authority: grant or revoke only the worker Git actions, exact tools, and permission mode inside your grant ceiling; changes apply to that worker’s next tool call.\n- send_message and read_messages: coordinate through the project bus. Prefer a direct message to one session; broadcast only when every project agent must act.\n- practice_write / practice_list / practice_read / practice_edit: manage durable team conventions that future agents should follow.\n- memory_write / memory_search / memory_read: retain and retrieve project facts and decisions.`,
       `CHILD APPROVAL TOOL\n- decide_child_approval: approve or deny one pending request from your own direct child when child approvals are enabled. The hub refuses unrelated children and anything outside your operator-granted ceiling.`,
       `IMPORTANT — TOOL LAYERS\nUse the hub-provided AllMyAgents tools described above. In Codex, choose the fully-qualified mcp__allmyagents__spawn_agent and mcp__allmyagents__list_agents tools (some clients render those names as mcp__allmyagents.spawn_agent and mcp__allmyagents.list_agents). Never call collaboration.spawn_agent, collaboration.list_agents, or another native collabAgentToolCall for project work. The native Codex or Claude harness may expose similar names, but those tools do not create the real app chats and worktrees you are managing. If a worker does not appear in the AllMyAgents sidebar with a session id, parentSessionId, and worktree, treat that as a failed delegation and retry with the mcp__allmyagents tool.`,
       `GRANTED BRIEF AND LIMITS\n- Grant ceiling means the maximum scope the operator gave you; every child grant must stay inside it.\n- At most ${maxLiveChildren} live direct children. The hub refuses an additional spawn at the bound.\n- Child permission modes may not exceed ${maxChildPermissionMode}.\n- Exact worker profile_id values you may pass to spawn_agent: ${workerScope.profiles.length ? workerScope.profiles.join(', ') : 'none'}.\n- Worker Git permissions you may grant: ${delegation.length ? authority : 'none'}.\n- Additional exact worker tools you may grant: ${allowedTools.length ? allowedTools.join(', ') : 'none'}.\n- Child approval decisions: ${canApproveChildren ? 'enabled for your own direct children, within the same grant ceiling' : 'disabled; the operator answers pending approvals'}.\n- Delegation only narrows: a manager cannot grant what it does not hold — including an authority, account, model, permission mode, or tool.\n- You have full non-interfering visibility into your own children, and only those children.\n${roles.length ? `Worker roles (prefer their exact agent_type id when one fits):\n${roles.join('\n')}` : `No named worker roles are configured; call spawn_agent with profile_id "${workerScope.profiles[0] ?? 'unavailable'}" and its default model.`}`,
@@ -176,6 +184,7 @@
 
   function resetGrantDefaults(): void {
     const profile = store.profiles.find((candidate) => candidate.id === managerProfileId)
+    managerTitle = ''
     managerModel = profile ? defaultModelFor(profile.provider)?.slug ?? '' : ''
     managerEffort = ''
     permissionMode = 'safe'
@@ -201,9 +210,14 @@
     if (!record) return
     projectId = record.projectId ?? ''
     managerProfileId = record.profileId
+    managerTitle = record.title ?? chatLabel(record)
     managerModel = record.model ?? defaultModelFor(record.provider)?.slug ?? ''
     managerEffort = record.effort ?? ''
-    permissionMode = (record.permissionMode as PermissionMode | undefined) ?? 'safe'
+    // An explicit one-chat operator override is not the manager's reusable grant. Editing the manager
+    // must start from the persisted grant ceiling or merely pressing Save would silently widen it.
+    permissionMode = record.managerPermissionModeCeiling
+      ?? (record.permissionMode as PermissionMode | undefined)
+      ?? 'safe'
     maxChildPermissionMode = record.managerMaxChildPermissionMode ?? 'safe'
     maxLiveChildren = record.managerMaxLiveChildren ?? 4
     delegation = [...(record.managerDelegation ?? [])]
@@ -365,7 +379,7 @@
   function profileScope(profileId: string): string {
     const profile = store.profiles.find((item) => item.id === profileId)
     const models = scope.models[profileId] ?? []
-    return `${profileId} · ${models.length ? models.join(', ') : `${profile?.provider ?? 'account'} default model`}`
+    return `${profile ? profileOptionLabel(profile) : profileId} · ${models.length ? models.join(', ') : `${profile?.provider ?? 'account'} default model`}`
   }
 
   function launchConfig(): ManagerLaunchConfig {
@@ -438,13 +452,22 @@
         })
         if ('error' in created) throw new Error(created.error)
         record = created
-        const name = `${project?.name ?? 'Project'} manager`
+        const name = managerTitle.trim() || `${project?.name ?? 'Project'} manager`
+        managerTitle = name
         record.title = name
         record.titleSource = 'user'
         store.upsertSessionRecord(record)
-        await api.rename(record.id, name)
+        const renamed = await api.rename(record.id, name)
+        if (renamed?.error) throw new Error(renamed.error)
       }
       if (!record) throw new Error('Choose the chat to promote.')
+      const desiredTitle = managerTitle.trim()
+      if (desiredTitle && desiredTitle !== record.title) {
+        const renamed = await api.rename(record.id, desiredTitle)
+        if (renamed?.error) throw new Error(renamed.error)
+        record.title = desiredTitle
+        record.titleSource = 'user'
+      }
       const settingsResult = await api.setSettings(record.id, {
         model: managerModel || undefined,
         effort: managerEffort || undefined,
@@ -475,8 +498,11 @@
       selectedId = configured.id
       mode = 'promote'
       saved = true
-      store.select(configured.id)
-      if (!wasActive) onclose()
+      onSaved?.(configured)
+      if (!stayInProject) {
+        store.select(configured.id)
+        if (!wasActive) onclose()
+      }
     } catch (cause) {
       error = cause instanceof Error ? cause.message : String(cause)
     } finally {
@@ -522,8 +548,8 @@
   $effect(() => {
     if (initialized) return
     initialized = true
-    const startingId = store.managerSetupSessionId ?? ''
-    if (!embedded && startingId) {
+    const startingId = initialManagerId || (!embedded ? store.managerSetupSessionId ?? '' : '')
+    if (startingId) {
       mode = 'promote'
       loadChat(startingId)
     }
@@ -597,16 +623,53 @@
   <div class="body">
     <section class="setup">
       {#if mode === 'promote'}
-        <label>
-          <span>Chat to promote</span>
-          <select value={selectedId} onchange={(event) => loadChat((event.target as HTMLSelectElement).value)}>
-            {#each eligibleChats as view (view.record.id)}
-              <option value={view.record.id}>{chatLabel(view.record)} · {store.projects.find((p) => p.id === view.record.projectId)?.name}</option>
-            {/each}
-          </select>
-        </label>
-        {#if eligibleChats.length === 0}
-          <p class="empty">Start a chat inside a project first, or choose “Create new manager.”</p>
+        {#if embedded && initialManagerId}
+          <div class="manager-target">
+            <span>Editing existing manager</span>
+            <strong>{selectedRecord ? chatLabel(selectedRecord) : 'Manager unavailable'}</strong>
+          </div>
+        {:else}
+          <label>
+            <span>Chat to promote</span>
+            <select value={selectedId} onchange={(event) => loadChat((event.target as HTMLSelectElement).value)}>
+              {#each eligibleChats as view (view.record.id)}
+                <option value={view.record.id}>{chatLabel(view.record)} · {store.projects.find((p) => p.id === view.record.projectId)?.name}</option>
+              {/each}
+            </select>
+          </label>
+          {#if eligibleChats.length === 0}
+            <p class="empty">Start a chat inside a project first, or choose “Create new manager.”</p>
+          {/if}
+        {/if}
+
+        {#if selectedRecord}
+          <label>
+            <span>Manager display name</span>
+            <input bind:value={managerTitle} aria-label="Manager display name" />
+          </label>
+          <div class="row two">
+            <div class="field">
+              <span class="field-label">Manager account</span>
+              <div class="fixed-value"><ProviderLogo provider={selectedRecord.provider} size={14} />{managerProfile ? profileOptionLabel(managerProfile) : managerProfileId}</div>
+              <small>The account owns this live vendor thread. Create a replacement manager to change accounts safely.</small>
+            </div>
+            <label>
+              <span>Manager model</span>
+              <select bind:value={managerModel}>
+                {#each managerModels as model (model.slug)}<option value={model.slug}>{model.name}</option>{/each}
+              </select>
+            </label>
+          </div>
+          {#if managerEffortOptions.length}
+            <label>
+              <span>Manager reasoning / effort</span>
+              <select bind:value={managerEffort}>
+                {#each managerEffortOptions as option (option.value)}
+                  <option value={option.value}>{option.label}</option>
+                {/each}
+              </select>
+            </label>
+          {/if}
         {/if}
       {:else}
         <div class="row two">
@@ -614,7 +677,7 @@
             <span>Manager account</span>
             <select value={managerProfileId} onchange={(event) => chooseManagerProfile((event.target as HTMLSelectElement).value)}>
               {#each store.profiles as profile (profile.id)}
-                <option value={profile.id}>{profile.id} · {profile.provider}</option>
+                <option value={profile.id}>{profileOptionLabel(profile)} · {profile.provider}</option>
               {/each}
             </select>
           </label>
@@ -763,7 +826,7 @@
                   <span>Worker account</span>
                   <select value={role.profileId} onchange={(event) => chooseRoleProfile(index, (event.target as HTMLSelectElement).value)}>
                     {#each store.profiles as profile (profile.id)}
-                      <option value={profile.id}>{profile.id} · {profile.provider}</option>
+                      <option value={profile.id}>{profileOptionLabel(profile)} · {profile.provider}</option>
                     {/each}
                   </select>
                 </label>
@@ -796,7 +859,7 @@
                       onchange={(event) => toggleUsageProfile(index, profile.id, (event.target as HTMLInputElement).checked)}
                     />
                     <ProviderLogo provider={profile.provider} size={14} />
-                    <b>{profile.id}</b>
+                    <b title={profile.id}>{profileLabel(profile)}</b>
                     <span class:blocked={store.usage.find((item) => item.profileId === profile.id)?.blocked}>{usageLabel(profile.id)}</span>
                   </label>
                 {/each}
@@ -886,9 +949,9 @@
       {:else}
       <button class="primary" disabled={busy || (mode === 'promote' && !selectedRecord)} onclick={grant}>
         {busy
-          ? 'Launching…'
+          ? stayInProject ? 'Saving…' : 'Launching…'
           : isActiveManager || saved
-              ? 'Update granted scope'
+              ? stayInProject ? 'Save manager settings' : 'Update granted scope'
               : mode === 'create'
                 ? 'Create and launch manager'
                 : 'Make this chat a manager and launch'}
@@ -934,6 +997,9 @@
   .row.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .row.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .project-choice { display: flex; gap: .5rem; }
+  .manager-target { display: grid; gap: .2rem; padding: .7rem .8rem; border: 1px solid var(--border-accent);
+    border-radius: var(--r-md); background: color-mix(in srgb, var(--accent) 8%, var(--surface-2)); }
+  .manager-target span { color: var(--dim); font-size: var(--text-xs); }
   .project-choice > :first-child { flex: 1; }
   .fixed-value { display: flex; align-items: center; gap: .45rem; padding: .55rem .65rem; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-2); }
   .secondary { color: var(--text); border: 1px solid var(--border); background: var(--surface-2); border-radius: var(--r-md); padding: .5rem .7rem; font-size: var(--text-xs); }

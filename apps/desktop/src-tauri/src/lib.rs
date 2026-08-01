@@ -98,6 +98,68 @@ fn logln(msg: &str) {
     }
 }
 
+/// WebView2 can lose or wedge only its renderer while the native window and hub remain healthy. Without
+/// this callback the UI is completely silent: JavaScript timers, Cancel/Escape handlers, repaint, and
+/// even diagnostics all stop together. Record the native failure and reload the main document for the
+/// renderer failure classes that WebView2 says are recoverable from the host side.
+#[cfg(windows)]
+fn install_main_webview_failure_handler(window: &WebviewWindow) -> Result<(), String> {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2, COREWEBVIEW2_PROCESS_FAILED_KIND,
+        COREWEBVIEW2_PROCESS_FAILED_KIND_FRAME_RENDER_PROCESS_EXITED,
+        COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED,
+        COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE,
+    };
+    use webview2_com::ProcessFailedEventHandler;
+
+    window
+        .with_webview(move |platform| {
+            let outcome = (|| -> windows::core::Result<()> {
+                let controller = platform.controller();
+                let webview: ICoreWebView2 = unsafe { controller.CoreWebView2()? };
+                let mut token = 0_i64;
+                unsafe {
+                    webview.add_ProcessFailed(
+                        &ProcessFailedEventHandler::create(Box::new(move |sender, args| {
+                            let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
+                            if let Some(args) = args {
+                                args.ProcessFailedKind(&mut kind)?;
+                            }
+                            logln(&format!(
+                                "[desktop] main WebView2 process failed (kind={}); renderer recovery requested",
+                                kind.0
+                            ));
+                            if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED
+                                || kind
+                                    == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE
+                                || kind
+                                    == COREWEBVIEW2_PROCESS_FAILED_KIND_FRAME_RENDER_PROCESS_EXITED
+                            {
+                                if let Some(sender) = sender {
+                                    sender.Reload()?;
+                                }
+                            }
+                            Ok(())
+                        })),
+                        &mut token,
+                    )?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = outcome {
+                logln(&format!(
+                    "[desktop] could not register the main WebView2 process-failure callback: {error}"
+                ));
+            }
+        })
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(windows))]
+fn install_main_webview_failure_handler(_window: &WebviewWindow) -> Result<(), String> {
+    Ok(())
+}
+
 /// Route the managed hub tree into the same durable startup log as the desktop shell.
 ///
 /// A GUI-launched process has no useful inherited console on Windows or macOS. `hubctl`
@@ -1887,6 +1949,17 @@ pub fn run() {
             // stderr that a GUI-launched app does not have, which is how two testers' hubs failed with
             // no recoverable explanation.
             init_log(&app.handle().clone());
+            if let Some(main_window) = app.get_webview_window("main") {
+                if let Err(error) = install_main_webview_failure_handler(&main_window) {
+                    logln(&format!(
+                        "[desktop] could not install the main renderer-failure handler: {error}"
+                    ));
+                }
+            } else {
+                logln(
+                    "[desktop] main window was unavailable while installing renderer diagnostics",
+                );
+            }
             app.manage(HubProcess(Mutex::new(None)));
             let browser_bridge = match browser::start(app.handle().clone()) {
                 Ok(bridge) => bridge,

@@ -47,4 +47,25 @@ describe('AccountPicker first run', () => {
     await fireEvent.click(screen.getByRole('button', { name: /open settings/i }))
     expect(store.settingsOpen).toBe(true)
   })
+
+  it('explains why a live manager account cannot be silently ported from its embedded project view', async () => {
+    store.profiles = [
+      { id: 'claude-default', provider: 'claude' },
+      { id: 'claude-other', provider: 'claude' },
+    ]
+    const managerView: SessionView = {
+      ...importedView,
+      record: { ...importedView.record, imported: false, isProjectManager: true },
+    }
+    const useAccount = vi.spyOn(store, 'useAccount')
+
+    render(AccountPicker, { props: { view: managerView } })
+    await fireEvent.click(screen.getByRole('button', { name: /claude-default/i }))
+
+    expect(screen.getByText('Account locked')).toBeTruthy()
+    expect(screen.getByText(/bound to its live vendor thread and operator grant/i)).toBeTruthy()
+    expect(screen.queryByText('claude-other')).toBeNull()
+    expect(useAccount).not.toHaveBeenCalled()
+    useAccount.mockRestore()
+  })
 })

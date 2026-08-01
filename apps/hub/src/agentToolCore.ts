@@ -94,7 +94,8 @@ export interface AgentServices {
     managerSessionId: string,
     childSessionId: string,
     authorities: DelegatedAuthority[],
-    tools?: string[]
+    tools?: string[],
+    permissionMode?: 'safe' | 'edits' | 'full',
   ): Awaitable<{ ok: boolean; error?: string }>
   /** Decide one currently-pending approval for the manager's own direct child, within its live ceiling. */
   decideChildApproval?(
@@ -340,19 +341,29 @@ const spawnAgent = defineTool({
 const setChildAuthority = defineTool({
   name: 'set_child_authority',
   description:
-    'Project managers only: replace a direct child agent\'s delegated Git authority. Allowed values are commit and push; an empty list revokes all delegated authority immediately.',
+    'Project managers only: replace a direct child agent\'s delegated Git authority and optionally its exact tool grant or permission mode. Every value remains bounded by the operator-granted manager ceiling and applies on the child\'s next tool call.',
   schema: {
     child_session: z.string().describe('direct child session id'),
     authorities: z.array(z.enum(['commit', 'push'])).describe('the complete replacement grant; [] revokes all'),
     tools: z.array(z.string()).optional().describe('complete replacement tool grant; omit to keep it unchanged'),
+    permission_mode: z
+      .enum(['safe', 'edits', 'full'])
+      .optional()
+      .describe('new child permission mode; omit to keep it unchanged; cannot exceed your child ceiling'),
   },
   run: async (args, { identity, services }) => {
     if (!services.setChildAuthority) return 'Not changed: this hub does not support manager delegation.'
-    const result = await services.setChildAuthority(identity.sessionId, args.child_session, args.authorities, args.tools)
+    const result = await services.setChildAuthority(
+      identity.sessionId,
+      args.child_session,
+      args.authorities,
+      args.tools,
+      args.permission_mode,
+    )
     return result.ok
       ? `Updated ${args.child_session}: ${args.authorities.length ? args.authorities.join(', ') : 'no Git authority'}${
           args.tools ? `; tools ${args.tools.length ? args.tools.join(', ') : 'none'}` : ''
-        }.`
+        }${args.permission_mode ? `; permission ${args.permission_mode}` : ''}.`
       : `Not changed: ${result.error ?? 'unknown error'}`
   },
 })

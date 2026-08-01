@@ -4,6 +4,8 @@ export type Provider = 'claude' | 'codex'
 
 export interface Profile {
   id: string
+  /** Operator-facing alias. The immutable id remains the credential/session ownership key. */
+  displayName?: string
   provider: Provider
   dir: string
   available?: boolean
@@ -72,6 +74,12 @@ export interface SessionRecord {
   effort?: string
   serviceTier?: string
   permissionMode?: 'safe' | 'edits' | 'full'
+  /** An authenticated, explicit operator choice for this one chat. It bypasses manager ceilings without
+   *  silently widening the manager's reusable grant for every other child. */
+  permissionModeOperatorOverride?: boolean
+  /** Highest mode this one managed chat may receive after an explicit operator override. Unlike the
+   *  manager-wide child ceiling, this does not grant the same authority over sibling chats. */
+  permissionModeOperatorOverrideCeiling?: 'safe' | 'edits' | 'full'
   /** Tool names the operator chose "always allow" for in THIS chat, so they stop being prompted for them.
    *  Consulted by the hub's approval policy (approvals.setAutoApprove), which is the single chokepoint both
    *  the worker and in-process executors funnel through — so adding one takes effect immediately, mid-turn,
@@ -113,7 +121,8 @@ export interface SessionRecord {
   managerStandingInstructions?: string
   /** Operator grant allowing this manager to decide pending approvals for its own direct children. */
   managerCanApproveChildren?: boolean
-  /** Maximum permission mode the operator granted to this manager itself. Generic mode changes may narrow it, never raise it. */
+  /** Maximum permission mode the operator granted to this manager itself. Bounded changes may narrow it;
+   *  a separately authenticated per-chat operator override may exceed it without rewriting the grant. */
   managerPermissionModeCeiling?: 'safe' | 'edits' | 'full'
   /** Maximum permission mode a manager may assign to direct children. Missing legacy grants fail closed to safe. */
   managerMaxChildPermissionMode?: 'safe' | 'edits' | 'full'
@@ -368,6 +377,8 @@ export interface DangerFlags {
 
 export interface HubConfig {
   overage?: Record<string, OveragePolicy>
+  /** Human-facing aliases keyed by immutable managed-profile id. */
+  profileNames?: Record<string, string>
   mesh?: MeshConfig
   security?: SecurityConfig
   features?: FeaturesConfig

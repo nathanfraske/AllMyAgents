@@ -207,7 +207,8 @@ export interface InProcessExecutorHubHooks {
     managerSessionId: string,
     childSessionId: string,
     authorities: Array<'commit' | 'push'>,
-    tools?: string[]
+    tools?: string[],
+    permissionMode?: 'safe' | 'edits' | 'full',
   ): { ok: boolean; error?: string }
   managerDecideChildApproval(
     managerSessionId: string,
@@ -278,8 +279,14 @@ export class InProcessExecutor implements Executor {
       peek: (caller, target, options) => this.h.busPeek(caller, target, options),
       childStatus: (managerSessionId) => this.h.managerChildStatus(managerSessionId),
       spawnAgent: (managerSessionId, input) => this.h.managerSpawn(managerSessionId, input),
-      setChildAuthority: (managerSessionId, childSessionId, authorities, tools) =>
-        this.h.managerSetChildAuthority(managerSessionId, childSessionId, authorities, tools),
+      setChildAuthority: (managerSessionId, childSessionId, authorities, tools, permissionMode) =>
+        this.h.managerSetChildAuthority(
+          managerSessionId,
+          childSessionId,
+          authorities,
+          tools,
+          permissionMode,
+        ),
       decideChildApproval: (managerSessionId, approvalId, approve) =>
         this.h.managerDecideChildApproval(managerSessionId, approvalId, approve),
       assignChildTask: (managerSessionId, childSessionId, input) =>

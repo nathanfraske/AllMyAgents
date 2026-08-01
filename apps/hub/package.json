@@ -6,13 +6,14 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "hubctl:dev": "tsx src/hubctl.ts",
+    "recovery:known-good": "tsx src/journalRecoveryOperator.ts",
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "0.3.218",
-    "@anthropic-ai/claude-code": "2.1.218",
+    "@anthropic-ai/claude-agent-sdk": "0.3.220",
+    "@anthropic-ai/claude-code": "2.1.220",
     "@openai/codex": "0.145.0",
     "better-sqlite3": "12.11.1",
     "fflate": "0.8.2",

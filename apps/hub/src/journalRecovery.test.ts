@@ -7,11 +7,13 @@ import { Journal } from './journal.js'
 import { snapshotJournal } from './journalBackup.js'
 import {
   JournalRecoveryLease,
+  acceptKnownGoodJournal,
   bootstrapJournalRecovery,
   bootstrapJournalRecoveryInWorker,
   consumeRecoveryReceipts,
   dismissRecoveryNotice,
   ensureRecoveryEnrollment,
+  inspectKnownGoodJournal,
   listRecoveryGenerations,
   listRecoveryNotices,
   publishRecoveryGeneration,
@@ -59,6 +61,123 @@ afterEach(() => {
 })
 
 describe('owned journal corruption recovery', () => {
+  it('accepts an explicitly confirmed known-good legacy journal and journals the operator decision', () => {
+    const dataDir = root('ama-known-good')
+    const journal = open(dataDir)
+    journal.append('s1', 'session/input', { text: 'healthy legacy history' })
+    journal.db.close()
+    const paths = recoveryPaths(dataDir)
+    const lease = new JournalRecoveryLease(dataDir)
+    lease.acquireShared()
+    lease.release()
+    fs.writeFileSync(paths.head, 'legacy metadata evidence')
+
+    const inspection = inspectKnownGoodJournal({
+      dataDir,
+      journalPath: path.join(dataDir, 'hub.db'),
+      maxSchemaVersion: SCHEMA_VERSION,
+    })
+    expect(() =>
+      acceptKnownGoodJournal({
+        dataDir,
+        journalPath: path.join(dataDir, 'hub.db'),
+        maxSchemaVersion: SCHEMA_VERSION,
+        confirmSha256: '0'.repeat(64),
+        reason: 'Operator independently verified this legacy journal.',
+      })
+    ).toThrow(/confirmation mismatch/i)
+
+    const accepted = acceptKnownGoodJournal({
+      dataDir,
+      journalPath: path.join(dataDir, 'hub.db'),
+      maxSchemaVersion: SCHEMA_VERSION,
+      confirmSha256: inspection.sha256,
+      reason: 'Operator independently verified this legacy journal.',
+    })
+
+    expect(accepted.operationId).toMatch(/^[0-9a-f-]{36}$/i)
+    expect(fs.readFileSync(path.join(accepted.archiveDirectory, 'head.json'), 'utf8')).toBe(
+      'legacy metadata evidence'
+    )
+    expect(fs.existsSync(path.join(dataDir, 'journal-recovery-known-good-acceptance.json'))).toBe(
+      false
+    )
+    expect(
+      verifyNormalJournalLineage({
+        dataDir,
+        journalPath: path.join(dataDir, 'hub.db'),
+        maxSchemaVersion: SCHEMA_VERSION,
+      })
+    ).toBeUndefined()
+    const acceptedJournal = open(dataDir)
+    const audit = acceptedJournal.db
+      .prepare(
+        `SELECT payload FROM events
+         WHERE kind = 'journal/operator-known-good-accepted'`
+      )
+      .get() as { payload?: string }
+    expect(JSON.parse(audit.payload ?? '{}')).toMatchObject({
+      operationId: accepted.operationId,
+      sourceSha256: inspection.sha256,
+      reason: 'Operator independently verified this legacy journal.',
+    })
+  })
+
+  it('resumes a known-good acceptance after a mid-archive crash with complete evidence metadata', () => {
+    const dataDir = root('ama-known-good-resume')
+    const journal = open(dataDir)
+    journal.append('s1', 'session/input', { text: 'healthy legacy history' })
+    journal.db.close()
+    const paths = recoveryPaths(dataDir)
+    const lease = new JournalRecoveryLease(dataDir)
+    lease.acquireShared()
+    lease.release()
+    fs.writeFileSync(paths.head, 'legacy head evidence')
+    fs.writeFileSync(path.join(paths.root, 'legacy-extra.json'), 'legacy extra evidence')
+
+    const journalPath = path.join(dataDir, 'hub.db')
+    const reason = 'Operator independently verified this interrupted legacy journal.'
+    const inspection = inspectKnownGoodJournal({
+      dataDir,
+      journalPath,
+      maxSchemaVersion: SCHEMA_VERSION,
+    })
+    let interrupted = false
+    expect(() =>
+      acceptKnownGoodJournal({
+        dataDir,
+        journalPath,
+        maxSchemaVersion: SCHEMA_VERSION,
+        confirmSha256: inspection.sha256,
+        reason,
+        failpoint: (edge) => {
+          if (!interrupted && edge.startsWith('after-known-good-archive-')) {
+            interrupted = true
+            throw new Error('simulated mid-archive crash')
+          }
+        },
+      })
+    ).toThrow(/simulated mid-archive crash/)
+
+    const accepted = acceptKnownGoodJournal({
+      dataDir,
+      journalPath,
+      maxSchemaVersion: SCHEMA_VERSION,
+      confirmSha256: inspection.sha256,
+      reason,
+    })
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(accepted.archiveDirectory, 'operator-acceptance.json'), 'utf8'),
+    ) as { archivedEntries?: string[] }
+    expect(manifest.archivedEntries).toEqual(['head.json', 'legacy-extra.json'])
+    expect(fs.readFileSync(path.join(accepted.archiveDirectory, 'head.json'), 'utf8')).toBe(
+      'legacy head evidence',
+    )
+    expect(
+      fs.readFileSync(path.join(accepted.archiveDirectory, 'legacy-extra.json'), 'utf8'),
+    ).toBe('legacy extra evidence')
+  })
+
   it('allows a conclusive first install while the fresh recovery lease is held', () => {
     const dataDir = root('ama-first-install')
     const journalPath = path.join(dataDir, 'hub.db')
@@ -108,13 +227,10 @@ describe('owned journal corruption recovery', () => {
     journal.db.close()
     const journalPath = path.join(dataDir, 'hub.db')
     const before = fs.readFileSync(journalPath)
-    const lease = new JournalRecoveryLease(dataDir)
-    lease.acquireShared()
-    lease.acquireExclusive()
     let parentTimerRan = false
     const parentTimer = setTimeout(() => {
       parentTimerRan = true
-    }, 10)
+    }, 0)
 
     try {
       await expect(
@@ -124,14 +240,17 @@ describe('owned journal corruption recovery', () => {
           schemaVersion: SCHEMA_VERSION,
           operationId: '33333333-3333-4333-8333-333333333333',
           attemptId: '44444444-4444-4444-8444-444444444444',
-          timeoutMs: 100,
+          // Worker startup necessarily crosses an event-loop boundary. A one-millisecond ceiling
+          // deterministically exercises the parent watchdog without manufacturing a database lock;
+          // SQLite reports a held recovery lease synchronously on macOS instead of waiting as it does
+          // on Windows, which made the old lock-based wedge test platform-dependent.
+          timeoutMs: 1,
         })
       ).rejects.toThrow(/absolute execution ceiling/i)
       expect(parentTimerRan).toBe(true)
       expect(fs.readFileSync(journalPath)).toEqual(before)
     } finally {
       clearTimeout(parentTimer)
-      lease.release()
     }
   })
 
@@ -1183,6 +1302,34 @@ describe('owned journal corruption recovery', () => {
         .filter((entry) => entry.startsWith('.classifier-'))
     ).toHaveLength(0)
     resumed.lease.release()
+  })
+
+  it('removes unpublished classifier and restore copies after an ordinary preparation failure', async () => {
+    const dataDir = root()
+    const journal = open(dataDir)
+    journal.append('s1', 'session/input', { text: 'preparation-cleanup' })
+    await strongSnapshot(dataDir, journal, new Date('2026-07-29T00:00:00.000Z'))
+    journal.db.close()
+    const paths = recoveryPaths(dataDir)
+    const generation = listRecoveryGenerations(dataDir, SCHEMA_VERSION)[0]
+    expect(generation).toBeDefined()
+    fs.truncateSync(path.join(generation!.directory, 'snapshot.db'), 17)
+    fs.writeFileSync(path.join(dataDir, 'hub.db'), Buffer.alloc(96 * 1024, 0x52))
+
+    expect(() =>
+      bootstrapJournalRecovery({
+        dataDir,
+        journalPath: path.join(dataDir, 'hub.db'),
+        schemaVersion: SCHEMA_VERSION,
+      })
+    ).toThrow(/no identity-bound verified recovery generation/i)
+
+    expect(fs.existsSync(paths.activePlan)).toBe(false)
+    expect(
+      fs.readdirSync(paths.staging).filter((entry) => entry !== '.ama-directory-barrier')
+    ).toEqual([])
+    expect(fs.existsSync(path.join(dataDir, 'hub.db-wal'))).toBe(false)
+    expect(fs.existsSync(path.join(dataDir, 'hub.db-shm'))).toBe(false)
   })
 
   it('reverifies a cleaning-phase publication before issuing a durable receipt', async () => {

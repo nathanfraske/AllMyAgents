@@ -389,6 +389,8 @@ export interface ServerOptions {
   /** The managed-profiles root (HUB_PROFILES_DIR or repo profiles/) — where the login flow creates a new
    *  profile dir. Threaded from index.ts so it stays in lockstep with where the hub SCANS profiles. */
   profilesDir: string
+  /** Mutable, config-backed display aliases keyed by immutable profile id. */
+  profileNames?: Record<string, string>
   profileOwnership?: ProfileOwnership
   profileLoginCoordinator?: Pick<
     ProfileLoginCoordinator,
@@ -498,7 +500,7 @@ export function persistPrefs(
 }
 
 export function startServer(opts: ServerOptions): http.Server {
-  const { port, defaultCwd, profilesDir, journal, sessions, profiles, approvals, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity } = opts
+  const { port, defaultCwd, profilesDir, profileNames = {}, journal, sessions, profiles, approvals, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity } = opts
   const replayPrincipalBudget = new ReplayPrincipalBudget()
   const questions = opts.questions
   // Runtime repositories live beside the journal/config under HUB_DATA_DIR, never in the shipped hub
@@ -672,6 +674,65 @@ export function startServer(opts: ServerOptions): http.Server {
       if (method === 'POST' && url.pathname === '/api/profiles/rescan') {
         rescanProfiles() // pick up any newly-added managed logins under profiles/*
         json(res, pickableProfiles(sessions.listProfiles()))
+        return
+      }
+      const profileNameMatch = /^\/api\/profiles\/([^/]+)\/name$/.exec(url.pathname)
+      if (method === 'POST' && profileNameMatch) {
+        const profileId = decodeURIComponent(profileNameMatch[1] as string)
+        const profile = profiles.find((candidate) => candidate.id === profileId)
+        if (!profile) {
+          json(res, { error: `unknown managed profile: ${profileId}` }, 404)
+          return
+        }
+        const body = await readBody(req)
+        if (typeof body.displayName !== 'string') {
+          json(res, { error: 'displayName must be a string' }, 400)
+          return
+        }
+        const requested = body.displayName.trim()
+        if (requested.length > 80 || /[\u0000-\u001f\u007f]/u.test(requested)) {
+          json(res, { error: 'account name must be 80 characters or fewer and contain no control characters' }, 400)
+          return
+        }
+        const displayName = requested && requested !== profileId ? requested : undefined
+        const folded = (displayName ?? profileId).toLowerCase()
+        const collision = profiles.find((candidate) =>
+          candidate.id !== profileId &&
+          (candidate.id.toLowerCase() === folded ||
+            (candidate.displayName ?? candidate.id).toLowerCase() === folded),
+        )
+        if (collision) {
+          json(res, { error: `another account is already named "${displayName ?? profileId}"` }, 409)
+          return
+        }
+
+        const priorName = profile.displayName
+        const priorPersisted = profileNames[profileId]
+        if (displayName) {
+          profile.displayName = displayName
+          profileNames[profileId] = displayName
+        } else {
+          delete profile.displayName
+          delete profileNames[profileId]
+        }
+        const persistError = patchConfig(configPath, 'profileNames', { ...profileNames })
+        if (persistError) {
+          if (priorName) profile.displayName = priorName
+          else delete profile.displayName
+          if (priorPersisted) profileNames[profileId] = priorPersisted
+          else delete profileNames[profileId]
+          journal.append(null, 'config/profile-names-persist-failed', {
+            profileId,
+            message: persistError,
+          })
+          json(res, { error: `account name could not be saved: ${persistError}` }, 500)
+          return
+        }
+        journal.append(null, 'profiles/renamed', {
+          id: profileId,
+          displayName: displayName ?? null,
+        })
+        json(res, pickableProfiles(sessions.listProfiles()).find((candidate) => candidate.id === profileId))
         return
       }
       // A profile's custom slash commands (<configDir>/commands/*.md) — the SAME files the Claude
@@ -972,6 +1033,29 @@ export function startServer(opts: ServerOptions): http.Server {
             : undefined,
         )
         json(res, project)
+        return
+      }
+      const projectSettingsMatch = /^\/api\/projects\/([^/]+)\/settings$/.exec(url.pathname)
+      if (method === 'POST' && projectSettingsMatch) {
+        const projectId = projectSettingsMatch[1] as string
+        const existing = projects.get(projectId)
+        if (!existing) {
+          json(res, { error: `unknown project: ${projectId}` }, 404)
+          return
+        }
+        const body = await readBody(req)
+        if (typeof body.name !== 'string' || !body.name.trim()) {
+          json(res, { error: 'project name is required' }, 400)
+          return
+        }
+        const updated = projects.updateName(projectId, body.name)
+        if (updated.name !== existing.name) {
+          journal.append(null, 'project/updated', {
+            projectId,
+            changes: { name: { from: existing.name, to: updated.name } },
+          })
+        }
+        json(res, updated)
         return
       }
       if (method === 'POST' && url.pathname === '/api/projects/managed') {
@@ -1491,7 +1575,19 @@ export function startServer(opts: ServerOptions): http.Server {
           json(res, { error: 'permissionMode must be safe|edits|full' }, 400)
           return
         }
-        sessions.setMode(modeMatch[1] as string, m)
+        if (body.operatorOverride !== undefined && typeof body.operatorOverride !== 'boolean') {
+          json(res, { error: 'operatorOverride must be boolean' }, 400)
+          return
+        }
+        const operatorOverride = body.operatorOverride === true
+        // A normal mode pick remains bounded. Crossing a manager ceiling is a separate, explicit owner
+        // action and therefore requires the device capability even on installations whose ordinary local
+        // API is not token-gated.
+        if (operatorOverride && !authed) {
+          json(res, { error: 'operator device token required for a permission override' }, 403)
+          return
+        }
+        sessions.setMode(modeMatch[1] as string, m, operatorOverride ? 'operator-override' : 'bounded')
         json(res, { ok: true })
         return
       }

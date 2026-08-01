@@ -6,6 +6,7 @@ import { createRequire } from 'node:module'
 import { AGENT_MCP_SERVER_NAME } from '../codexMcpConfig.js'
 import { windowsPathToWsl } from '../workspaceLocation.js'
 import { nativeWslExecutable, spawnInWsl } from '../wslProcess.js'
+import { repairCodexRolloutPaths } from '../codexRolloutRelocation.js'
 import {
   documentTextBlock,
   isPdfAttachment,
@@ -308,6 +309,15 @@ export class CodexClient {
   }
 
   private async startInner(): Promise<void> {
+    // Codex indexes each rollout by absolute path in state_N.sqlite. A profile first used from a Windows
+    // packaged app can later appear at the normal Roaming root while that index still points into the
+    // package's vanished LocalCache virtualization tree. Repair only exact, contained root relocations
+    // before app-server opens the database; otherwise every affected thread/resume fails independently.
+    if (!this.wsl) {
+      const relocation = repairCodexRolloutPaths(this.profileDir)
+      for (const repair of relocation.repairs) this.onEvent('codex/rollout-path-rebased', repair)
+      for (const warning of relocation.warnings) this.onEvent('codex/rollout-path-repair-warning', warning)
+    }
     const env = {
       ...process.env,
       CODEX_HOME: this.wsl ? windowsPathToWsl(this.profileDir) : this.profileDir,

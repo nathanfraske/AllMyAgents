@@ -266,6 +266,15 @@ try {
   /* no config yet — defaults apply (overage: block) */
 }
 
+// Account names are aliases, never identity migrations. Credential directories, session rows, usage
+// history, manager grants, and account-scoped instructions continue to use the immutable profile id.
+const profileNames: Record<string, string> = Object.fromEntries(
+  Object.entries(config.profileNames ?? {}).flatMap(([id, value]) => {
+    const name = typeof value === 'string' ? value.trim() : ''
+    return name && name.length <= 80 && !/[\u0000-\u001f\u007f]/u.test(name) ? [[id, name]] : []
+  }),
+)
+
 const journal = new Journal(journalPath)
 try {
   recordSchemaVersion(journal.db, SCHEMA_VERSION)
@@ -394,12 +403,19 @@ const profileRuntime = new ProfileRuntime({
   profileOwnership,
   usage,
   generation: profileGeneration,
-  scanProfiles: () => scanProfiles(profilesDir),
+  scanProfiles: () => scanProfiles(profilesDir).map((profile) => ({
+    ...profile,
+    ...(profileNames[profile.id] ? { displayName: profileNames[profile.id] } : {}),
+  })),
   refreshAuth: refreshProfileAuth,
   onAdded: (profile) => {
     usage.addProfile(profile)
     if (profileBootstrapComplete) {
-      journal.append(null, 'profiles/added', { id: profile.id, provider: profile.provider })
+      journal.append(null, 'profiles/added', {
+        id: profile.id,
+        provider: profile.provider,
+        ...(profile.displayName ? { displayName: profile.displayName } : {}),
+      })
     }
   },
   applyConnectorPolicy: (profile) =>
@@ -746,7 +762,7 @@ const meshPeerPorts: number[] = Array.isArray(config.mesh?.peerPorts)
   : []
 
 // Listen on the BOOT port (0 → ephemeral for a green); the server reports its actual port back.
-const server = startServer({ port: bootPort, defaultCwd: dataDir, profilesDir, profileOwnership, profileLoginCoordinator, journal, sessions, profiles, approvals, questions, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity: (projectId) => worktreeCollisions.projectActivity(projectId) })
+const server = startServer({ port: bootPort, defaultCwd: dataDir, profilesDir, profileNames, profileOwnership, profileLoginCoordinator, journal, sessions, profiles, approvals, questions, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity: (projectId) => worktreeCollisions.projectActivity(projectId) })
 
 // Register the mesh advert — factored so a promoted green can (re)register once it owns the port.
 function registerMesh(): void {
@@ -792,7 +808,7 @@ server.once('listening', () => {
     restoredSessions: sessions.list().length,
   })
   console.log(
-    `[hub] http://127.0.0.1:${actualPort} — profiles: ${profiles.map((p) => `${p.id}(${p.provider})`).join(', ') || 'none found'} — sessions restored: ${sessions.list().length}`
+    `[hub] http://127.0.0.1:${actualPort} — profiles: ${profiles.map((p) => `${p.id}(${p.provider})`).join(', ') || 'none found'} — sessions restored: ${sessions.list().length} — profilesDir=${profilesDir} — dataDir=${dataDir}`
   )
   console.log(`[hub] device token ${requireToken ? 'REQUIRED for /api + /ws' : 'not enforced (local)'} — pair remote devices from Settings → Mesh`)
   // Tell the supervisor we're up (report the ACTUAL port so it health-checks green's ephemeral port).

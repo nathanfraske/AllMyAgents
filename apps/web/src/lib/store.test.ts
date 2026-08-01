@@ -32,6 +32,7 @@ vi.mock('./api', () => {
       dismissRecoveryNotice: vi.fn(ok),
       usage: vi.fn(async () => []),
       sessions: vi.fn(async () => []),
+      history: vi.fn(async () => ({ items: [], olderCursor: null, hasOlder: false })),
       replayBaseline: vi.fn(async () => ({
         version: 1,
         generation: 1,
@@ -112,6 +113,7 @@ function evt(over: Partial<HubEvent> & { seq: number; kind: string }): HubEvent 
 // Reset the singleton between tests — it persists across the file. localStorage is cleared too so
 // the layout-persistence tests don't leak stored state into one another.
 beforeEach(() => {
+  vi.clearAllMocks()
   localStorage.clear()
   store.sessions = {}
   store.queues = {}
@@ -525,6 +527,74 @@ describe('apply()', () => {
     expect(store.sessions.st1?.record.status).toBe('idle')
   })
 
+  it('shows an accepted optimistic turn as working before the status event arrives', () => {
+    seed('optimistic-status')
+
+    store.noteSent('optimistic-status')
+
+    expect(store.status(store.sessions['optimistic-status']!)).toEqual({
+      key: 'working',
+      label: 'working',
+    })
+  })
+
+  it('repairs a missed active status from the authoritative hub roster', async () => {
+    seed('reconciled-status')
+    vi.mocked(api.sessions).mockResolvedValueOnce([
+      rec('reconciled-status', { status: 'active' }),
+    ])
+
+    await store.syncRecordsFromHub()
+
+    expect(store.sessions['reconciled-status']?.record.status).toBe('active')
+    expect(store.status(store.sessions['reconciled-status']!)).toMatchObject({ key: 'working' })
+  })
+
+  it('does not let a slow roster response overwrite a newer streamed status', async () => {
+    seed('status-race')
+    let resolveRoster!: (records: SessionRecord[]) => void
+    vi.mocked(api.sessions).mockReturnValueOnce(
+      new Promise<SessionRecord[]>((resolve) => {
+        resolveRoster = resolve
+      })
+    )
+    const syncing = store.syncRecordsFromHub()
+    apply(
+      evt({
+        seq: 1,
+        kind: 'session/status',
+        sessionId: 'status-race',
+        payload: { status: 'active' },
+      })
+    )
+    resolveRoster([rec('status-race', { status: 'idle' })])
+
+    await syncing
+
+    expect(store.sessions['status-race']?.record.status).toBe('active')
+  })
+
+  it('allows only one bounded authoritative status refresh at a time', async () => {
+    let resolveRoster!: (records: SessionRecord[]) => void
+    vi.mocked(api.sessions).mockReturnValueOnce(
+      new Promise<SessionRecord[]>((resolve) => {
+        resolveRoster = resolve
+      }),
+    )
+
+    const first = store.syncRecordsFromHub()
+    const overlapping = store.syncRecordsFromHub()
+
+    expect(api.sessions).toHaveBeenCalledTimes(1)
+    await overlapping
+    resolveRoster([])
+    await first
+
+    vi.mocked(api.sessions).mockResolvedValueOnce([])
+    await store.syncRecordsFromHub()
+    expect(api.sessions).toHaveBeenCalledTimes(2)
+  })
+
   // The flush is now DEFERRED to the end of the tick, so the status can be superseded before anything is
   // sent (see scheduleQueueFlush). This test asserted the old synchronous behaviour; awaiting a tick is
   // the whole change, and the send itself is unchanged.
@@ -783,6 +853,52 @@ describe('event batching (replay does not render frame-by-frame)', () => {
     const texts = (store.sessions.s1?.items ?? []).filter((i) => i.kind === 'user').map((i) => i.text)
     expect(texts).toContain('survivor')
   })
+
+  it('applies a project rename from another operator window without a reload', () => {
+    store.projects = [{ id: 'p1', name: 'Before', path: 'C:/repo', createdAt: '2026-07-31T00:00:00.000Z' }]
+    ingest(evt({
+      seq: 1,
+      kind: 'project/updated',
+      sessionId: null,
+      payload: { projectId: 'p1', changes: { name: { from: 'Before', to: 'After' } } },
+    }))
+
+    flush()
+
+    expect(store.projects[0]?.name).toBe('After')
+  })
+
+  it('applies an account display-name change without changing its immutable id', () => {
+    store.profiles = [{ id: 'claude-a', provider: 'claude', displayName: 'Before' }]
+    ingest(evt({
+      seq: 1,
+      kind: 'profiles/renamed',
+      sessionId: null,
+      payload: { id: 'claude-a', displayName: 'After' },
+    }))
+
+    flush()
+
+    expect(store.profiles).toEqual([{ id: 'claude-a', provider: 'claude', displayName: 'After' }])
+  })
+
+  it('adds the live account alias when a bounded completion-side rescan is unavailable', () => {
+    store.profiles = []
+    ingest(evt({
+      seq: 1,
+      kind: 'profiles/added',
+      sessionId: null,
+      payload: { id: 'codex-research', provider: 'codex', displayName: 'Research account' },
+    }))
+
+    flush()
+
+    expect(store.profiles).toEqual([{
+      id: 'codex-research',
+      provider: 'codex',
+      displayName: 'Research account',
+    }])
+  })
 })
 
 describe('replay boundary presentation', () => {
@@ -937,7 +1053,7 @@ describe('bounded cold baseline and global maintenance status', () => {
       generation: 7,
       highWaterSeq: 690_000,
       resetFloorSeq: 500_000,
-      sessions: [rec('s1')],
+      sessions: [rec('s1'), rec('s2')],
       projects: [],
       journalCompaction: null,
     })
@@ -1002,10 +1118,44 @@ describe('bounded cold baseline and global maintenance status', () => {
     expect(cold.sessions.s1?.items.map((item) => item.text)).toEqual(['old prompt'])
     expect(cold.sessions.s1?.journalHistoryOlderCursor).toBe(10)
     expect(api.approvals).not.toHaveBeenCalled()
-    expect(api.journalHistory).toHaveBeenCalledWith('s1', 3, 51)
+    expect(api.journalHistory).toHaveBeenCalledWith('s1', 3, 51, expect.anything())
   })
 
-  it('replaces lazy history pages inside an 80-item / 512KiB pane window', async () => {
+  it('retries an imported transcript after a bounded first-load failure', async () => {
+    const cold = new HubStore()
+    const install = cold as unknown as {
+      installReplayBaseline(baseline: Awaited<ReturnType<typeof api.replayBaseline>>): void
+    }
+    install.installReplayBaseline({
+      version: 1,
+      generation: 3,
+      highWaterSeq: 50,
+      resetFloorSeq: 0,
+      sessions: [rec('imported-1', { imported: true })],
+      projects: [],
+      journalCompaction: null,
+    })
+    vi.mocked(api.history).mockRejectedValueOnce(new Error('temporary history outage'))
+
+    await cold.ensureHistory('imported-1')
+
+    expect(cold.sessions['imported-1']?.loadingHistory).toBe(false)
+    expect(cold.sessions['imported-1']?.historyLoadError).toContain('temporary history outage')
+
+    vi.mocked(api.history).mockResolvedValueOnce({
+      items: [{ kind: 'user', text: 'restored transcript' }],
+      olderCursor: null,
+      hasOlder: false,
+    })
+    await cold.ensureHistory('imported-1')
+
+    expect(cold.sessions['imported-1']?.items.map((item) => item.text)).toContain(
+      'restored transcript',
+    )
+    expect(api.history).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps every lazily loaded page and live item when scrolling or tabbing away and back', async () => {
     const cold = new HubStore()
     const install = cold as unknown as {
       installReplayBaseline(baseline: Awaited<ReturnType<typeof api.replayBaseline>>): void
@@ -1037,31 +1187,32 @@ describe('bounded cold baseline and global maintenance status', () => {
     vi.mocked(api.journalHistory).mockResolvedValueOnce(page('latest', 9_000))
     await cold.ensureHistory('s1')
 
+    const latestCount = cold.sessions.s1?.items.length ?? 0
+    expect(latestCount).toBeGreaterThan(0)
+
     for (let pageIndex = 0; pageIndex < 8; pageIndex += 1) {
       vi.mocked(api.journalHistory).mockResolvedValueOnce(
         page(`older-${pageIndex}`, 8_000 - pageIndex * 100)
       )
       await cold.loadOlderHistory('s1')
-      const items = cold.sessions.s1?.items ?? []
-      expect(items.length).toBeLessThanOrEqual(80)
-      expect(new TextEncoder().encode(JSON.stringify(items)).byteLength).toBeLessThanOrEqual(
-        512 * 1024
-      )
     }
 
     const texts = cold.sessions.s1?.items.map((item) => item.text) ?? []
     expect(texts.some((text) => text?.startsWith('older-7-'))).toBe(true)
-    expect(texts.some((text) => text?.startsWith('latest-'))).toBe(false)
+    expect(texts.some((text) => text?.startsWith('latest-'))).toBe(true)
+    expect((cold.sessions.s1?.items.length ?? 0)).toBeGreaterThan(latestCount)
 
     for (let index = 0; index < 100; index += 1) {
       cold.pushUserEcho('s1', `live-${index}-${'y'.repeat(6_000)}`)
     }
-    const liveWindow = cold.sessions.s1?.items ?? []
-    expect(liveWindow.length).toBeLessThanOrEqual(80)
-    expect(new TextEncoder().encode(JSON.stringify(liveWindow)).byteLength).toBeLessThanOrEqual(
-      512 * 1024
-    )
-    expect(cold.sessions.s1?.journalHistoryOlderCursor).not.toBeNull()
+    const beforeTabSwitch = cold.sessions.s1?.items.map((item) => item.key) ?? []
+    cold.select('s2')
+    cold.select('s1')
+
+    expect(cold.sessions.s1?.items.map((item) => item.key)).toEqual(beforeTabSwitch)
+    expect(cold.sessions.s1?.items.some((item) => item.text?.startsWith('latest-'))).toBe(true)
+    expect(cold.sessions.s1?.items.some((item) => item.text?.startsWith('older-7-'))).toBe(true)
+    expect(cold.sessions.s1?.items.some((item) => item.text?.startsWith('live-99-'))).toBe(true)
   })
 })
 

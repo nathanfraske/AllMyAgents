@@ -20,20 +20,27 @@
   import ModelPicker from './ModelPicker.svelte'
   import TraitsControl from './TraitsControl.svelte'
   import PermissionPicker from './PermissionPicker.svelte'
-  import BrowserPicker from './BrowserPicker.svelte'
   import WorktreePicker from './WorktreePicker.svelte'
   import AccountPicker from './AccountPicker.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
   import FirstChatGuide from './FirstChatGuide.svelte'
   import Icon from './Icon.svelte'
   import AgentPanel from './AgentPanel.svelte'
+  import BrowserPanel from './BrowserPanel.svelte'
   import TaskStrip from './TaskStrip.svelte'
   import QuestionCard from './QuestionCard.svelte'
   import { findModel, defaultModelFor } from './catalog'
   import { settings } from './settings.svelte'
-  import { onDestroy, untrack } from 'svelte'
+  import { onDestroy, tick, untrack } from 'svelte'
   import { composerAutoGrow } from './composerAutoGrow'
-  import { loadComposerDrafts, saveComposerDrafts } from './uiState'
+  import {
+    loadComposerDrafts,
+    loadThreadSidePanel,
+    saveComposerDrafts,
+    saveThreadSidePanel,
+    type ThreadSidePanel,
+  } from './uiState'
+  import { profileLabel } from './profileLabel'
   import { resolveSlash, builtinsForProvider, builtinNeedsArg, loadProfileCommands, type SlashResult } from './commands'
   import { resolveWorkingContext, truncatePathTail } from './workingContext'
   import type { AttachmentRef, CommandInfo } from './api'
@@ -46,6 +53,8 @@
     composerOnly = false,
     peekItems = 0,
     composerLabel,
+    onpanedragstart,
+    onpanedragend,
   }: {
     sessionId?: string
     paneIndex?: number
@@ -54,6 +63,8 @@
     composerOnly?: boolean
     peekItems?: number
     composerLabel?: string
+    onpanedragstart?: (event: DragEvent) => void
+    onpanedragend?: (event: DragEvent) => void
   } = $props()
 
   let text = $state('')
@@ -281,6 +292,8 @@
   // history prepends and rollbacks). Both reset when the pane switches chats.
   let jumpAway = $state(false)
   let anchorKey = $state<string | null>(null)
+  let olderLoadRetryAt = 0
+  let olderLoadInFlight = false
   // `/` command picker: the textarea (for refocus after completion), the profile's on-disk custom
   // commands, the highlighted row, and an Escape-dismissal latch.
   let taRef = $state<HTMLTextAreaElement | null>(null)
@@ -291,6 +304,48 @@
   const activeId = $derived(sessionId ?? store.selectedId ?? null)
   const view = $derived(activeId ? (store.sessions[activeId] ?? null) : null)
   const sid = $derived(view?.record.id ?? '')
+  const browserAgentLabel = $derived.by(() => {
+    if (!view) return 'this agent'
+    if (view.record.title) return view.record.title
+    const profile = store.profiles.find((candidate) => candidate.id === view.record.profileId)
+    return profile ? profileLabel(profile) : view.record.profileId
+  })
+  function accountName(profileId: string): string {
+    const profile = store.profiles.find((candidate) => candidate.id === profileId)
+    return profile ? profileLabel(profile) : profileId
+  }
+  let sidePanelFor = $state('')
+  let sidePanel = $state<ThreadSidePanel | null>(null)
+  $effect(() => {
+    if (!sid || sid === sidePanelFor) return
+    sidePanelFor = sid
+    sidePanel = loadThreadSidePanel(sid)
+  })
+  function setSidePanel(panel: ThreadSidePanel | null): void {
+    sidePanel = panel
+    if (sid) saveThreadSidePanel(sid, panel)
+  }
+  const permissionBoundary = $derived.by(() => {
+    if (!view) return null
+    if (view.record.isProjectManager) {
+      return {
+        scope: 'manager' as const,
+        ceiling: view.record.managerPermissionModeCeiling ?? 'safe' as const,
+        managedBy: 'the operator',
+      }
+    }
+    if (!view.record.parentSessionId) return null
+    const parent = store.sessions[view.record.parentSessionId]
+    return {
+      scope: 'child' as const,
+      ceiling: parent?.record.isProjectManager
+        ? (parent.record.managerMaxChildPermissionMode ?? 'safe')
+        : 'safe',
+      managedBy: parent
+        ? store.sessionLabel(parent.record.id)
+        : 'The unavailable parent manager',
+    }
+  })
   // Both drafts and real sessions now source their picks from the RECORD — a draft's live on the local
   // draft record, a real session's are persisted hub-side (setModel/setOption write through). One source
   // of truth means the pills always show what the next turn will actually use, for either vendor.
@@ -371,7 +426,12 @@
   // The hub's input route handles provider-neutral mid-turn steering at the next tool boundary. Keep
   // queuing only as the explicit preference fallback; the composer must not silently treat Claude as
   // less steerable than Codex when the same transport supports both.
-  const steerable = $derived(active && store.prefs.steerMessagesAtToolBoundary)
+  // `starting` means the hub accepted a turn but the vendor stream is not ready for steering yet. Treating
+  // it as steerable raced the startup handshake: Enter posted a steer that could fail and leave the text
+  // behind. Queue during that short phase; switch to direct steering only after the live `active` state.
+  const steerable = $derived(
+    view?.record.status === 'active' && store.prefs.steerMessagesAtToolBoundary,
+  )
   const st = $derived(view ? store.status(view) : { key: 'idle', label: '' })
   const approvals = $derived(view ? store.approvals.filter((a) => a.sessionId === view.record.id) : [])
   const questions = $derived(view ? store.questions.filter((q) => q.sessionId === view.record.id) : [])
@@ -563,6 +623,58 @@
     }
   })
 
+  async function loadOlderAtTop(force = false): Promise<void> {
+    if (
+      !scroller ||
+      !view ||
+      composerOnly ||
+      olderLoadInFlight ||
+      view.loadingHistory ||
+      (view.journalHistoryOlderCursor == null && view.historyOlderCursor == null) ||
+      (!force && Date.now() < olderLoadRetryAt)
+    ) return
+    olderLoadInFlight = true
+    const priorHeight = scroller.scrollHeight
+    const priorTop = scroller.scrollTop
+    try {
+      const loaded = await store.loadOlderHistory(view.record.id)
+      await tick()
+      if (loaded && scroller) {
+        // Every older page prepends; keep the first previously-visible row under the cursor.
+        scroller.scrollTop = priorTop + Math.max(0, scroller.scrollHeight - priorHeight)
+        olderLoadRetryAt = 0
+      } else {
+        // An index-building/transport failure remains visibly retryable without hammering the hub on
+        // every scroll event while the scrollbar rests at zero.
+        olderLoadRetryAt = Date.now() + 2_000
+      }
+    } finally {
+      olderLoadInFlight = false
+    }
+  }
+
+  $effect(() => {
+    const currentId = sid
+    const hasOlder =
+      view?.journalHistoryOlderCursor != null || view?.historyOlderCursor != null
+    const loading = view?.loadingHistory === true
+    // Track rendered content as well as cursors. A latest page can be shorter than the viewport, in
+    // which case there is no scrollbar and therefore no scroll event to request the next page. Fill only
+    // until the pane gains real scroll range; ordinary top-scroll loading takes over from there.
+    mainItems.length
+    if (!currentId || !hasOlder || loading || composerOnly) return
+    void tick().then(() => {
+      if (
+        sid !== currentId ||
+        !scroller ||
+        scroller.clientHeight <= 0 ||
+        scroller.scrollHeight > scroller.clientHeight + 1 ||
+        scroller.scrollTop > 96
+      ) return
+      void loadOlderAtTop()
+    })
+  })
+
   function onScroll(): void {
     if (!scroller) return
     const m = { scrollTop: scroller.scrollTop, scrollHeight: scroller.scrollHeight, clientHeight: scroller.clientHeight }
@@ -572,6 +684,7 @@
     // Anchor the "new" count to the last item the moment you scroll away; clear it once you're back down.
     if (!away) anchorKey = null
     else if (anchorKey === null) anchorKey = mainItems[mainItems.length - 1]?.key ?? null
+    if (m.scrollTop <= 96) void loadOlderAtTop()
   }
   const newBelow = $derived(newItemsBelow(mainItems.map((i) => i.key), anchorKey))
   function jumpToBottom(): void {
@@ -604,6 +717,8 @@
     actionErr = {}
     jumpAway = false
     anchorKey = null
+    olderLoadRetryAt = 0
+    olderLoadInFlight = false
     stick = true
     pastes = [] // promoted pastes belong to the chat they were pasted into
     untrack(clearAttachments) // staged files belong to the chat they were attached to
@@ -1017,7 +1132,16 @@
     <div class="pane-drop-feedback" role="status">Drop files to attach</div>
   {/if}
   {#if !embedded && !composerOnly}
-  <div class="head" class:reorderable={multiPane} title={multiPane ? 'Drag this header to rearrange the pane' : undefined}>
+  <div
+    class="head"
+    role="group"
+    aria-label="Chat pane header"
+    class:reorderable={multiPane}
+    title={multiPane ? 'Drag this header to rearrange the pane' : undefined}
+    draggable={multiPane}
+    ondragstart={onpanedragstart}
+    ondragend={onpanedragend}
+  >
     <ProviderLogo provider={view.record.provider} size={16} />
     <div class="headmain">
       <div class="headtop">
@@ -1026,11 +1150,11 @@
         {:else if multiPane}
           <select class="paneselect" value={view.record.id} onchange={(e) => store.setPaneSession(paneIndex, (e.target as HTMLSelectElement).value)}>
             {#each store.sessionList as s (s.record.id)}
-              <option value={s.record.id}>{s.record.title ?? `${s.record.profileId} · ${(s.record.worktree ?? s.record.cwd).split(/[\\/]/).pop()}`}</option>
+              <option value={s.record.id}>{s.record.title ?? `${accountName(s.record.profileId)} · ${(s.record.worktree ?? s.record.cwd).split(/[\\/]/).pop()}`}</option>
             {/each}
           </select>
         {:else}
-          <span class="title">{view.record.title ?? view.record.profileId}</span>
+          <span class="title">{view.record.title ?? accountName(view.record.profileId)}</span>
         {/if}
         <span class="statuschip {st.key}" title={st.label}>
           <span class="dot {st.key}"></span><span class="statuslabel">{st.label}</span>
@@ -1080,14 +1204,17 @@
       <button
         class="history-page"
         disabled={view.loadingHistory}
-        onclick={() => void store.loadOlderHistory(view.record.id)}
+        onclick={() => void loadOlderAtTop(true)}
       >
         {view.loadingHistory ? 'Loading history…' : 'Load older history'}
       </button>
     {:else if !composerOnly && view.historyViewingOlder}
-      <button class="history-page" onclick={() => store.showLatestHistory(view.record.id)}>
+      <button class="history-page" onclick={() => { store.showLatestHistory(view.record.id); jumpToBottom() }}>
         Back to latest
       </button>
+    {/if}
+    {#if !composerOnly && view.historyLoadError}
+      <span class="history-error" role="alert">{view.historyLoadError}</span>
     {/if}
     <!-- Items produced INSIDE a spawned sub-agent are excluded here and rendered in the agent panel
          instead: a background agent's tool spam would otherwise bury the conversation you are actually
@@ -1278,13 +1405,16 @@
               sessionId={view.record.id}
               mode={view.record.permissionMode ?? 'safe'}
               allowedTools={view.record.allowedTools ?? []}
-            />
-          </div>
-          <div class="ccontrol c-browser" title="Per-chat isolated browser">
-            <BrowserPicker
-              sessionId={view.record.id}
-              agentLabel={view.record.title || view.record.profileId}
-              initialEnabled={view.record.browserEnabled === true}
+              ceiling={permissionBoundary?.ceiling}
+              managedScope={permissionBoundary?.scope}
+              managedBy={permissionBoundary?.managedBy}
+              operatorOverrideActive={view.record.permissionModeOperatorOverride === true}
+              operatorOverrideCeiling={view.record.permissionModeOperatorOverrideCeiling}
+              onchange={(next, operatorOverride) => {
+                view.record.permissionMode = next
+                view.record.permissionModeOperatorOverride = operatorOverride || undefined
+                view.record.permissionModeOperatorOverrideCeiling = operatorOverride ? next : undefined
+              }}
             />
           </div>
         {/if}
@@ -1335,7 +1465,26 @@
       </div>
       <!-- Open panels are an in-flow sibling: they consume layout space instead of covering the
            transcript. The narrow-pane container query stacks the panel below this conversation. -->
-       {#if !composerOnly}<AgentPanel items={view.items} sessionId={view.record.id} provider={view.record.provider} />{/if}
+       {#if !composerOnly}
+         <AgentPanel
+           items={view.items}
+           sessionId={view.record.id}
+           provider={view.record.provider}
+           open={sidePanel === 'agents'}
+           onopen={() => setSidePanel('agents')}
+           onclose={() => setSidePanel(null)}
+         />
+         {#if !isDraft}
+           <BrowserPanel
+             sessionId={view.record.id}
+             agentLabel={browserAgentLabel}
+             initialEnabled={view.record.browserEnabled === true}
+             open={sidePanel === 'browser'}
+             onopen={() => setSidePanel('browser')}
+             onclose={() => setSidePanel(null)}
+           />
+         {/if}
+       {/if}
     </div>
   </div>
   </div>
@@ -1436,6 +1585,7 @@
   .hbtn:disabled { opacity: 0.4; cursor: default; }
   .stream { flex: 1; display: flex; flex-direction: column; gap: 0.55rem; padding: 1rem 1.1rem; max-width: 900px; width: 100%; margin: 0 auto; container-type: inline-size; }
   .history-page { align-self: center; max-width: 18rem; }
+  .history-error { align-self: center; max-width: 34rem; color: var(--danger); font-size: 0.78rem; text-align: center; }
   .stream.replay-rebuild { visibility: hidden; }
   .stream-node { min-width: 0; }
   @media (prefers-reduced-motion: no-preference) {

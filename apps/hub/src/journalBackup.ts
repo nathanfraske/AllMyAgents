@@ -32,7 +32,7 @@ import { SCHEMA_VERSION } from './restartHandshake.js'
  *
  *  - VERIFIES the snapshot before keeping it. An unverified backup is a belief, not a backup, and the
  *    failure we are guarding against is silent corruption — the case where the thing you saved was
- *    already broken. A snapshot that fails quick_check is deleted and reported, never retained as if it
+ *    already broken. A snapshot that fails integrity_check is deleted and reported, never retained as if it
  *    were good.
  *
  *  - Keeps SEVERAL generations. Corruption is often noticed long after it starts; a single rolling copy
@@ -50,6 +50,12 @@ export interface JournalBackupOptions {
   intervalMs?: number
   /** How many verified generations to keep. */
   keep?: number
+  /** Total compatibility-snapshot budget. The newest verified generation is always retained. */
+  maxRetainedBytes?: number
+  /** Free space reserved in addition to the source journal's estimated snapshot size. */
+  minimumFreeBytes?: number
+  /** Injectable disk-capacity probe for tests. */
+  availableBytes?: (dir: string) => bigint
   /** Injectable for tests. */
   now?: () => Date
   log?: (message: string) => void
@@ -69,6 +75,8 @@ export interface JournalBackupOptions {
 
 const DEFAULT_INTERVAL_MS = 30 * 60 * 1000
 const DEFAULT_KEEP = 6
+const DEFAULT_MAX_RETAINED_BYTES = 8 * 1024 * 1024 * 1024
+const DEFAULT_MINIMUM_FREE_BYTES = 256 * 1024 * 1024
 const DEFAULT_ACTIVATION_RETRY_MS = [250, 1_000, 5_000, 10_000, 30_000] as const
 const DEFAULT_SHUTDOWN_WAIT_MS = 2_000
 const PREFIX = 'hub-'
@@ -116,116 +124,159 @@ export async function snapshotJournal(
   const now = options.now ?? (() => new Date())
   const log = options.log ?? (() => {})
   fs.mkdirSync(options.dir, { recursive: true })
+  const keep = Math.max(1, Math.trunc(options.keep ?? DEFAULT_KEEP))
+  const maxRetainedBytes = positiveByteLimit(
+    options.maxRetainedBytes,
+    DEFAULT_MAX_RETAINED_BYTES
+  )
+  const rotateSnapshots = (): void =>
+    rotate(options.dir, keep, maxRetainedBytes, log)
 
-  const stamp = now().toISOString().replace(/[:.]/g, '-')
-  // Timestamp-only names collide across blue/green processes and even within one millisecond. The UUID
-  // makes both the staging file and final generation unique across processes sharing this directory.
-  const generation = `${PREFIX}${stamp}-${process.pid}-${randomUUID()}`
-  const target = path.join(options.dir, `${generation}${SUFFIX}`)
-  const partial = path.join(options.dir, `${generation}${PARTIAL_SUFFIX}`)
-  let sourceHadEvents = false
-  if (options.recoveryDataDir) {
-    try {
-      ensureRecoveryEnrollment(db, options.recoveryDataDir)
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      log(`[journal-backup] recovery enrollment FAILED: ${message}`)
-      return { ok: false, error: message }
-    }
-  }
-  if (!options.verify) {
-    try {
-      // Capture the weakest useful source invariant before the online backup starts. An empty source is
-      // legitimate; a source that already has history must not turn into a schema-only snapshot.
-      sourceHadEvents = hasAnyEvents(db)
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      log(`[journal-backup] snapshot FAILED source validation: ${message}`)
-      return { ok: false, error: message }
-    }
-  }
-
+  // Rotation is both a precondition (old generations must not crowd out the next snapshot) and a
+  // finally action. In particular, enrollment, source-validation, backup, verification, and publication
+  // failures must not allow a legacy pile to grow forever.
+  rotateSnapshots()
   try {
-    // Online backup: consistent even while the hub is mid-turn.
-    await db.backup(partial)
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    log(`[journal-backup] snapshot FAILED: ${message}`)
-    try {
-      fs.rmSync(partial, { force: true })
-    } catch {
-      /* nothing to clean up */
-    }
-    return { ok: false, error: message }
-  }
-
-  let verified = false
-  try {
-    verified = options.verify ? options.verify(partial) : defaultVerify(partial, sourceHadEvents)
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    log(`[journal-backup] snapshot FAILED verification: ${message}`)
-    try {
-      fs.rmSync(partial, { force: true })
-    } catch {
-      /* best effort */
-    }
-    return { ok: false, error: message }
-  }
-  if (!verified) {
-    // A snapshot that does not pass its own integrity check is worse than none: it would sit there
-    // looking like insurance. Remove it and say so loudly.
-    log(`[journal-backup] snapshot at ${partial} FAILED verification and was discarded — the live journal may already be damaged`)
-    try {
-      fs.rmSync(partial, { force: true })
-    } catch {
-      /* best effort */
-    }
-    return { ok: false, error: 'snapshot failed integrity verification' }
-  }
-
-  let bytes: number
-  try {
-    bytes = fs.statSync(partial).size
-    // Same-directory rename is the publication boundary. A hard kill before it leaves only `.partial`;
-    // a kill after it leaves a fully verified final. The collision-free target is never overwritten.
-    fs.renameSync(partial, target)
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    log(`[journal-backup] snapshot FAILED publication: ${message}`)
-    try {
-      fs.rmSync(partial, { force: true })
-    } catch {
-      /* best effort */
-    }
-    return { ok: false, error: message }
-  }
-  log(`[journal-backup] verified snapshot ${path.basename(target)} (${(bytes / 1_048_576).toFixed(1)} MB)`)
-  let recoveryGeneration: string | undefined
-  if (options.recoveryDataDir) {
-    try {
-      const generation = publishRecoveryGeneration({
-        dataDir: options.recoveryDataDir,
-        snapshotFile: target,
-        maxSchemaVersion: SCHEMA_VERSION,
-        keep: options.recoveryKeep ?? options.keep ?? DEFAULT_KEEP,
-      })
-      recoveryGeneration = generation.manifest.generation
-      log(
-        `[journal-backup] enrolled recovery generation ${recoveryGeneration} for journal ${generation.manifest.journalId}`
+    const sourceBytes = estimateSourceBytes(db)
+    if (sourceBytes > 0n) {
+      const reserveBytes = BigInt(
+        positiveByteLimit(options.minimumFreeBytes, DEFAULT_MINIMUM_FREE_BYTES)
       )
+      try {
+        const availableBytes = options.availableBytes
+          ? options.availableBytes(options.dir)
+          : filesystemAvailableBytes(options.dir)
+        const requiredBytes = sourceBytes + reserveBytes
+        if (availableBytes < requiredBytes) {
+          const message =
+            `insufficient free space for journal snapshot: ${formatBytes(availableBytes)} available; ` +
+            `${formatBytes(requiredBytes)} required (${formatBytes(sourceBytes)} source + ` +
+            `${formatBytes(reserveBytes)} reserve)`
+          log(`[journal-backup] snapshot SKIPPED: ${message}`)
+          return { ok: false, error: message }
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        log(`[journal-backup] snapshot FAILED free-space preflight: ${message}`)
+        return { ok: false, error: message }
+      }
+    }
+
+    const stamp = now().toISOString().replace(/[:.]/g, '-')
+    // Timestamp-only names collide across blue/green processes and even within one millisecond. The UUID
+    // makes both the staging file and final generation unique across processes sharing this directory.
+    const generation = `${PREFIX}${stamp}-${process.pid}-${randomUUID()}`
+    const target = path.join(options.dir, `${generation}${SUFFIX}`)
+    const partial = path.join(options.dir, `${generation}${PARTIAL_SUFFIX}`)
+    let sourceHadEvents = false
+    if (options.recoveryDataDir) {
+      try {
+        ensureRecoveryEnrollment(db, options.recoveryDataDir)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        log(`[journal-backup] recovery enrollment FAILED: ${message}`)
+        return { ok: false, error: message }
+      }
+    }
+    if (!options.verify) {
+      try {
+        // Capture the weakest useful source invariant before the online backup starts. An empty source is
+        // legitimate; a source that already has history must not turn into a schema-only snapshot.
+        sourceHadEvents = hasAnyEvents(db)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        log(`[journal-backup] snapshot FAILED source validation: ${message}`)
+        return { ok: false, error: message }
+      }
+    }
+
+    try {
+      // Online backup: consistent even while the hub is mid-turn.
+      await db.backup(partial)
+      // SQLite online backup preserves the source's WAL journal-mode header. A standalone snapshot has
+      // no live WAL to replay, and opening that header read-only on Windows manufactures `-wal`/`-shm`
+      // files that can remain locked long enough to break strong-generation publication. Normalize the
+      // private staging database to DELETE mode before verification or hard-link publication.
+      normalizeSnapshotJournalMode(partial)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      log(`[journal-backup] recovery generation FAILED: ${message}`)
-      // The compatibility flat file remains operator evidence, but it is intentionally NOT recovery
-      // eligible. Keep it inside the same bounded retention budget rather than accumulating a second,
-      // unbounded failure stream, and surface degraded state so self-heal is never silently assumed.
-      rotate(options.dir, options.keep ?? DEFAULT_KEEP, log)
-      return { ok: false, file: target, bytes, error: message }
+      log(`[journal-backup] snapshot FAILED: ${message}`)
+      try {
+        fs.rmSync(partial, { force: true })
+      } catch {
+        /* nothing to clean up */
+      }
+      return { ok: false, error: message }
     }
+
+    let verified = false
+    try {
+      verified = options.verify ? options.verify(partial) : defaultVerify(partial, sourceHadEvents)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      log(`[journal-backup] snapshot FAILED verification: ${message}`)
+      try {
+        fs.rmSync(partial, { force: true })
+      } catch {
+        /* best effort */
+      }
+      return { ok: false, error: message }
+    }
+    if (!verified) {
+      // A snapshot that does not pass its own integrity check is worse than none: it would sit there
+      // looking like insurance. Remove it and say so loudly.
+      log(`[journal-backup] snapshot at ${partial} FAILED verification and was discarded — the live journal may already be damaged`)
+      try {
+        fs.rmSync(partial, { force: true })
+      } catch {
+        /* best effort */
+      }
+      return { ok: false, error: 'snapshot failed integrity verification' }
+    }
+
+    let bytes: number
+    try {
+      bytes = fs.statSync(partial).size
+      // Same-directory rename is the publication boundary. A hard kill before it leaves only `.partial`;
+      // a kill after it leaves a fully verified final. The collision-free target is never overwritten.
+      fs.renameSync(partial, target)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      log(`[journal-backup] snapshot FAILED publication: ${message}`)
+      try {
+        fs.rmSync(partial, { force: true })
+      } catch {
+        /* best effort */
+      }
+      return { ok: false, error: message }
+    }
+    log(`[journal-backup] verified snapshot ${path.basename(target)} (${(bytes / 1_048_576).toFixed(1)} MB)`)
+    let recoveryGeneration: string | undefined
+    if (options.recoveryDataDir) {
+      try {
+        const generation = publishRecoveryGeneration({
+          dataDir: options.recoveryDataDir,
+          snapshotFile: target,
+          maxSchemaVersion: SCHEMA_VERSION,
+          keep: options.recoveryKeep ?? options.keep ?? DEFAULT_KEEP,
+        })
+        recoveryGeneration = generation.manifest.generation
+        log(
+          `[journal-backup] enrolled recovery generation ${recoveryGeneration} for journal ${generation.manifest.journalId}`
+        )
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        log(`[journal-backup] recovery generation FAILED: ${message}`)
+        // The compatibility flat file remains operator evidence, but it is intentionally NOT recovery
+        // eligible. Keep it inside the same bounded retention budget rather than accumulating a second,
+        // unbounded failure stream, and surface degraded state so self-heal is never silently assumed.
+        return { ok: false, file: target, bytes, error: message }
+      }
+    }
+    return { ok: true, file: target, bytes, ...(recoveryGeneration ? { recoveryGeneration } : {}) }
+  } finally {
+    rotateSnapshots()
   }
-  rotate(options.dir, options.keep ?? DEFAULT_KEEP, log)
-  return { ok: true, file: target, bytes, ...(recoveryGeneration ? { recoveryGeneration } : {}) }
 }
 
 function hasAnyEvents(db: Pick<Database.Database, 'prepare'>): boolean {
@@ -239,7 +290,7 @@ function defaultVerify(file: string, sourceHadEvents: boolean): boolean {
   let db: import('better-sqlite3').Database | undefined
   try {
     db = new Database(file, { readonly: true, fileMustExist: true })
-    const rows = db.pragma('quick_check') as Array<Record<string, unknown>>
+    const rows = db.pragma('integrity_check') as Array<Record<string, unknown>>
     const findings = rows.flatMap((row) => Object.values(row).map(String))
     if (findings.length !== 1 || findings[0]?.toLowerCase() !== 'ok') return false
     // Querying the table proves it exists. Requiring a row only when the source already had one rejects
@@ -258,25 +309,89 @@ function defaultVerify(file: string, sourceHadEvents: boolean): boolean {
   }
 }
 
-function rotate(dir: string, keep: number, log: (m: string) => void): void {
-  let entries: string[]
+function positiveByteLimit(value: number | undefined, fallback: number): number {
+  if (value === undefined) return fallback
+  if (!Number.isFinite(value) || value < 0) return fallback
+  return Math.trunc(value)
+}
+
+function normalizeSnapshotJournalMode(file: string): void {
+  let db: import('better-sqlite3').Database | undefined
+  let closeError: unknown
+  try {
+    db = new Database(file, { fileMustExist: true })
+    const mode = String(db.pragma('journal_mode = DELETE', { simple: true })).toLowerCase()
+    if (mode !== 'delete') {
+      throw new Error(`snapshot refused standalone DELETE journal mode (${mode})`)
+    }
+  } finally {
+    try {
+      db?.close()
+    } catch (error) {
+      closeError = error
+    }
+    if (closeError) {
+      throw new Error(
+        `snapshot journal-mode handle could not close: ${closeError instanceof Error ? closeError.message : String(closeError)}`
+      )
+    }
+  }
+}
+
+function estimateSourceBytes(db: Database.Database): bigint {
+  try {
+    const pageCount = db.pragma('page_count', { simple: true }) as number
+    const pageSize = db.pragma('page_size', { simple: true }) as number
+    if (!Number.isSafeInteger(pageCount) || !Number.isSafeInteger(pageSize)) return 0n
+    if (pageCount <= 0 || pageSize <= 0) return 0n
+    return BigInt(pageCount) * BigInt(pageSize)
+  } catch {
+    // Test doubles and non-file sources may not expose pragmas. Snapshot verification remains the final
+    // authority; the preflight is applied whenever the real SQLite connection can report its size.
+    return 0n
+  }
+}
+
+function filesystemAvailableBytes(dir: string): bigint {
+  const stats = fs.statfsSync(dir, { bigint: true })
+  return stats.bavail * stats.bsize
+}
+
+function formatBytes(bytes: bigint): string {
+  const mib = Number(bytes / 1_048_576n)
+  return `${mib.toLocaleString('en-US')} MiB`
+}
+
+function rotate(
+  dir: string,
+  keep: number,
+  maxRetainedBytes: number,
+  log: (m: string) => void
+): void {
+  let entries: Array<{ name: string; bytes: bigint }>
   try {
     entries = fs
       .readdirSync(dir)
       .filter((name) => name.startsWith(PREFIX) && name.endsWith(SUFFIX))
       .sort()
+      .map((name) => ({ name, bytes: BigInt(fs.statSync(path.join(dir, name)).size) }))
   } catch {
     return
   }
+  let retainedBytes = entries.reduce((total, entry) => total + entry.bytes, 0n)
+  const byteLimit = BigInt(maxRetainedBytes)
   // Oldest first; drop from the front only.
-  while (entries.length > keep) {
+  while (entries.length > 1 && (entries.length > keep || retainedBytes > byteLimit)) {
     const victim = entries.shift()
     if (!victim) break
     try {
-      fs.rmSync(path.join(dir, victim), { force: true })
-      log(`[journal-backup] rotated out ${victim}`)
+      fs.rmSync(path.join(dir, victim.name), { force: true })
+      retainedBytes -= victim.bytes
+      log(`[journal-backup] rotated out ${victim.name}`)
     } catch {
-      /* leaving an extra generation is harmless */
+      // Preserve oldest-first semantics: if this victim cannot be removed, do not sacrifice newer
+      // verified generations to pretend the retention target was met.
+      break
     }
   }
 }

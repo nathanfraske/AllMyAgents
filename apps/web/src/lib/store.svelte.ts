@@ -3,10 +3,12 @@ import { settings } from './settings.svelte'
 import { alertDialog } from './dialog.svelte'
 import {
   loadLastLayout,
+  loadProjectViewMode,
   saveLastLayout,
   loadQueues,
   saveQueues,
   type PersistedLayout,
+  type ProjectViewMode,
   type QueuedEntry,
 } from './uiState'
 import { rowFate } from './fleetMerge'
@@ -40,8 +42,26 @@ function msSince(t0: number): string {
 function utf8Bytes(value: string): number {
   return new TextEncoder().encode(value).byteLength
 }
-const THREAD_WINDOW_MAX_ITEMS = 80
-const THREAD_WINDOW_MAX_BYTES = 512 * 1024
+const HUB_READ_TIMEOUT_MS = 8_000
+
+async function boundedHubRead<T>(
+  label: string,
+  read: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController()
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      controller.abort()
+      reject(new Error(`${label} timed out after ${HUB_READ_TIMEOUT_MS / 1_000} seconds.`))
+    }, HUB_READ_TIMEOUT_MS)
+  })
+  try {
+    return await Promise.race([read(controller.signal), deadline])
+  } finally {
+    if (timeout) clearTimeout(timeout)
+  }
+}
 
 export interface StatusInfo {
   key: string
@@ -155,6 +175,7 @@ export interface SessionView {
   // Imported-chat history (loaded on open from the vendor transcript). `loadingHistory` gates a
   // spinner; `historyOlderCursor` is the byte offset for "load older" (null when fully loaded).
   loadingHistory?: boolean
+  historyLoadError?: string
   historyOlderCursor?: number | null
   journalHistoryOlderCursor?: number | null
   journalHistoryGeneration?: number
@@ -312,6 +333,13 @@ export class HubStore {
   selectedId = $state<string | null>(null)
   /** The read-first project dashboard. Mutually exclusive with visible chat panes. */
   projectViewId = $state<string | null>(null)
+  /**
+   * The project surface to show for the current navigation. A manager row is an explicit request for
+   * the full conversation; ordinary project entry restores the operator's last project-local choice.
+   * Keeping this beside projectViewId also makes a click while that same project is already open
+   * reactive instead of relying on ProjectView to remount.
+   */
+  projectViewMode = $state<ProjectViewMode | null>(null)
   settingsOpen = $state(false)
   // Queued messages survive a refresh: you already committed to sending that text, so losing it because
   // the page reloaded is data loss. Restored from localStorage and re-saved on every mutation.
@@ -337,6 +365,9 @@ export class HubStore {
   // namespacing + a site tag for the sidebar badge; the LOCAL hub keeps its live WS + apply() as-is.
   fleetSites = $state<FleetSite[]>([])
   private fleetTimer: ReturnType<typeof setInterval> | null = null
+  private statusReconcileTimer: ReturnType<typeof setInterval> | null = null
+  private statusReconcileInFlight = false
+  private readonly latestStatusSeq = new Map<string, number>()
 
   // --- Import prompt ---------------------------------------------------------------------------
   // Which project's "import existing chats" panel is open (id + folder path, plus an optional
@@ -596,6 +627,9 @@ export class HubStore {
     this.replayGeneration = baseline.generation
     this.replayBaselineSeq = baseline.highWaterSeq
     this.lastSeq = baseline.highWaterSeq
+    // Status sequence fences belong to the replay generation that produced them. Keeping one across a
+    // required baseline reset could cause a perfectly current roster response to be rejected forever.
+    this.latestStatusSeq.clear()
     this.historyPulled.clear()
     this.pendingEvents = []
     this.pendingEventBytes = 0
@@ -668,6 +702,11 @@ export class HubStore {
     // slow/large backlog. Cheap (one GET) and idempotent.
     setTimeout(() => void this.syncRecordsFromHub(), 800)
     setTimeout(() => void this.syncRecordsFromHub(), 3000)
+    if (!this.statusReconcileTimer) {
+      this.statusReconcileTimer = setInterval(() => {
+        if (this.connected) void this.syncRecordsFromHub()
+      }, 5_000)
+    }
     // Belt and braces: if sessions were already loaded above, ensure() has come and gone, so nudge the
     // restore directly. scheduleAutoRestore is idempotent and re-arms itself while the roster is empty.
     this.scheduleAutoRestore()
@@ -690,32 +729,55 @@ export class HubStore {
    * also replays. The hub is authoritative for all of them (specOf feeds these exact fields into every
    * turn), so re-reading /api/sessions is the honest fix rather than trusting event reconstruction.
    *
-   * Deliberately does NOT touch `status` or activity: those belong to the live event stream, and
-   * stomping them here would resurrect the class of bug where a stale write pins a chat on the wrong
-   * state. Settings only.
+   * Status is also reconciled because a renderer/socket gap must not leave an active hub session labelled
+   * Ready indefinitely. The request-start sequence fence below prevents a slow HTTP response from
+   * overwriting a newer status event that arrived while the request was in flight.
    */
   async syncRecordsFromHub(): Promise<void> {
-    const rows = await api.sessions().catch(() => [] as SessionRecord[])
-    if (!Array.isArray(rows)) return
-    for (const rec of rows) {
-      const v = this.sessions[rec.id]
-      if (!v || v.draft) continue // not merged yet (a later pass catches it), or a local draft we own
-      v.record.permissionMode = rec.permissionMode
-      v.record.model = rec.model
-      v.record.effort = rec.effort
-      v.record.serviceTier = rec.serviceTier
-      v.record.isProjectManager = rec.isProjectManager
-      v.record.managerMaxLiveChildren = rec.managerMaxLiveChildren
-      v.record.managerPermissionModeCeiling = rec.managerPermissionModeCeiling
-      v.record.managerMaxChildPermissionMode = rec.managerMaxChildPermissionMode
-      v.record.managerDelegation = rec.managerDelegation
-      v.record.managerAllowedProfiles = rec.managerAllowedProfiles
-      v.record.managerAllowedModels = rec.managerAllowedModels
-      v.record.managerAllowedTools = rec.managerAllowedTools
-      v.record.parentSessionId = rec.parentSessionId
-      v.record.delegatedAuthorities = rec.delegatedAuthorities
-      v.record.delegatedTools = rec.delegatedTools
-      if (rec.title) v.record.title = rec.title
+    if (this.statusReconcileInFlight) return
+    this.statusReconcileInFlight = true
+    const requestStartedAtSeq = this.lastSeq
+    try {
+      const rows = await boundedHubRead('Hub status refresh', (signal) =>
+        api.sessions(signal),
+      ).catch(() => null)
+      if (!Array.isArray(rows)) return
+      for (const rec of rows) {
+        const v = this.sessions[rec.id]
+        if (!v || v.draft) continue // not merged yet (a later pass catches it), or a local draft we own
+        v.record.permissionMode = rec.permissionMode
+        v.record.permissionModeOperatorOverride = rec.permissionModeOperatorOverride
+        v.record.permissionModeOperatorOverrideCeiling = rec.permissionModeOperatorOverrideCeiling
+        v.record.model = rec.model
+        v.record.effort = rec.effort
+        v.record.serviceTier = rec.serviceTier
+        v.record.isProjectManager = rec.isProjectManager
+        v.record.managerMaxLiveChildren = rec.managerMaxLiveChildren
+        v.record.managerPermissionModeCeiling = rec.managerPermissionModeCeiling
+        v.record.managerMaxChildPermissionMode = rec.managerMaxChildPermissionMode
+        v.record.managerDelegation = rec.managerDelegation
+        v.record.managerAllowedProfiles = rec.managerAllowedProfiles
+        v.record.managerAllowedModels = rec.managerAllowedModels
+        v.record.managerAllowedTools = rec.managerAllowedTools
+        v.record.parentSessionId = rec.parentSessionId
+        v.record.delegatedAuthorities = rec.delegatedAuthorities
+        v.record.delegatedTools = rec.delegatedTools
+        if (rec.title) v.record.title = rec.title
+        if ((this.latestStatusSeq.get(rec.id) ?? 0) <= requestStartedAtSeq) {
+          const prior = v.record.status
+          v.record.status = rec.status
+          if (rec.status === 'active' || rec.status === 'starting') {
+            if (prior !== 'active' && prior !== 'starting') {
+              v.turnStartedAt ??= Date.now()
+              v.lastTurnOk = undefined
+            }
+          } else if (rec.status === 'idle' || rec.status === 'error' || rec.status === 'stopped') {
+            v.turnStartedAt = undefined
+          }
+        }
+      }
+    } finally {
+      this.statusReconcileInFlight = false
     }
   }
 
@@ -731,8 +793,8 @@ export class HubStore {
     }
   }
 
-  async rescanProfiles(): Promise<{ error?: string }> {
-    const result = await api.rescanProfiles()
+  async rescanProfiles(signal?: AbortSignal): Promise<{ error?: string }> {
+    const result = await api.rescanProfiles(signal)
     if ('error' in result) return result
     this.profiles = result
     return {}
@@ -1173,6 +1235,11 @@ export class HubStore {
     if (pending.length > 0) {
       return { key: 'approval', label: 'needs approval' }
     }
+    // `noteSent` is an accepted local turn-start fact and bridges the dispatch-to-status-event gap. It
+    // must drive every visible badge too, not only the transcript's thinking row.
+    if (viewIsBusy(view) && view.record.status === 'idle') {
+      return { key: 'working', label: 'working' }
+    }
     switch (view.record.status) {
       case 'starting':
         return { key: 'starting', label: 'starting' }
@@ -1366,6 +1433,7 @@ export class HubStore {
   // Remove a session from all local state: the roster, its queue, any panes it occupies, and
   // the selection. Idempotent — also runs when a `session/deleted` event arrives from the hub.
   private removeSessionLocal(id: string): void {
+    this.latestStatusSeq.delete(id)
     if (this.sessions[id]) {
       const { [id]: _drop, ...rest } = this.sessions
       this.sessions = rest
@@ -1710,14 +1778,6 @@ export class HubStore {
       this.applyingReplayedEvent = this.replayPresentationActive
       try {
         this.apply(message)
-        if (
-          message.sessionId &&
-          this.basePanes().flat().includes(message.sessionId) &&
-          this.historyPulled.has(message.sessionId)
-        ) {
-          const view = this.sessions[message.sessionId]
-          if (view) this.boundJournalThreadWindow(view)
-        }
       } catch (err) {
         console.error('[store] failed to apply event', message?.kind, message?.seq, err)
       } finally {
@@ -1810,11 +1870,62 @@ export class HubStore {
         profile.authError = auth.message
       }
     }
+    if (kind === 'profiles/added') {
+      const added = payload as {
+        id?: string
+        provider?: 'claude' | 'codex'
+        displayName?: unknown
+      }
+      if (
+        added.id &&
+        (added.provider === 'claude' || added.provider === 'codex') &&
+        !this.profiles.some((candidate) => candidate.id === added.id)
+      ) {
+        // ProfileRuntime journals this after its live roster has changed. Applying that stream fact
+        // directly keeps the account picker correct even when completion-side HTTP refresh times out.
+        this.profiles = [...this.profiles, {
+          id: added.id,
+          provider: added.provider,
+          ...(typeof added.displayName === 'string' && added.displayName.trim()
+            ? { displayName: added.displayName }
+            : {}),
+        }]
+      }
+    }
+    if (kind === 'profiles/renamed') {
+      const renamed = payload as { id?: string; displayName?: unknown }
+      if (renamed.id && (typeof renamed.displayName === 'string' || renamed.displayName === null)) {
+        this.profiles = this.profiles.map((profile) => {
+          if (profile.id !== renamed.id) return profile
+          const next = { ...profile }
+          if (typeof renamed.displayName === 'string' && renamed.displayName.trim()) {
+            next.displayName = renamed.displayName
+          } else {
+            delete next.displayName
+          }
+          return next
+        })
+      }
+      return
+    }
     if (kind === 'project/deleted') {
       const id = (payload as { id?: string }).id
       if (id) {
         this.projects = this.projects.filter((project) => project.id !== id)
         if (this.projectViewId === id) this.goHome()
+      }
+      return
+    }
+    if (kind === 'project/updated') {
+      const update = payload as {
+        projectId?: string
+        changes?: { name?: { to?: unknown } }
+      }
+      const name = update.changes?.name?.to
+      if (update.projectId && typeof name === 'string' && name.trim()) {
+        this.projects = this.projects.map((project) =>
+          project.id === update.projectId ? { ...project, name } : project,
+        )
       }
       return
     }
@@ -1959,6 +2070,7 @@ export class HubStore {
       }
       case 'session/status': {
         const status = (payload as { status: string }).status
+        this.latestStatusSeq.set(sessionId, event.seq)
         view.record.status = status
         this.push(view, { kind: 'status', ts, status })
         // Turn timing for the thinking indicator: a turn is in flight while active/starting,
@@ -2751,13 +2863,6 @@ export class HubStore {
       ...item,
     } as ThreadItem
     view.items.push(complete)
-    if (
-      !view.record.imported &&
-      this.historyPulled.has(view.record.id) &&
-      this.basePanes().flat().includes(view.record.id)
-    ) {
-      this.boundJournalThreadWindow(view)
-    }
     return complete
   }
 
@@ -2770,71 +2875,22 @@ export class HubStore {
   }
 
   private installJournalHistoryWindow(view: SessionView, history: ThreadItem[]): void {
-    // History pages are journal-authoritative and reloadable. Keep one bounded window in the pane rather
-    // than accumulating every page in JS while merely hiding old DOM nodes. Preserve the newest live
-    // items, then fill the remaining logical/byte budget with the requested history page.
-    const live = view.items
-      .filter((item) => item.historical !== true)
-      .slice(-THREAD_WINDOW_MAX_ITEMS)
-    const selectedLive: ThreadItem[] = []
-    let bytes = 0
-    for (let index = live.length - 1; index >= 0; index -= 1) {
-      const item = live[index] as ThreadItem
-      const itemBytes = utf8Bytes(JSON.stringify(item))
-      if (
-        selectedLive.length >= THREAD_WINDOW_MAX_ITEMS ||
-        bytes + itemBytes > THREAD_WINDOW_MAX_BYTES
-      ) {
-        break
-      }
-      selectedLive.unshift(item)
-      bytes += itemBytes
+    // The hub bounds every page by row count and encoded bytes. Once a page reaches the renderer, however,
+    // it is visible operator state: replacing it on the next upward scroll or evicting its prefix when a
+    // live item arrives makes the transcript appear to lose history. Accumulate only the pages the
+    // operator explicitly reaches, deduplicating stable reducer keys, and leave DOM virtualization as a
+    // presentation concern rather than deleting data out from under the scroll position.
+    const currentByKey = new Map(view.items.map((item) => [item.key, item]))
+    const combined: ThreadItem[] = []
+    const seen = new Set<string>()
+    for (const item of [...history, ...view.items]) {
+      if (seen.has(item.key)) continue
+      seen.add(item.key)
+      // Prefer the live/current representation when a bounded page overlaps the replay tail: it may
+      // already carry a tool result or lifecycle enrichment that the page reducer did not see.
+      combined.push(currentByKey.get(item.key) ?? item)
     }
-    const selectedHistory: ThreadItem[] = []
-    for (let index = history.length - 1; index >= 0; index -= 1) {
-      const item = history[index] as ThreadItem
-      const itemBytes = utf8Bytes(JSON.stringify(item))
-      if (
-        selectedHistory.length + selectedLive.length >= THREAD_WINDOW_MAX_ITEMS ||
-        bytes + itemBytes > THREAD_WINDOW_MAX_BYTES
-      ) {
-        break
-      }
-      selectedHistory.unshift(item)
-      bytes += itemBytes
-    }
-    view.items = [...selectedHistory, ...selectedLive]
-  }
-
-  private boundJournalThreadWindow(view: SessionView): void {
-    if (view.record.imported) return
-    let encodedBytes = utf8Bytes(JSON.stringify(view.items))
-    if (
-      view.items.length <= THREAD_WINDOW_MAX_ITEMS &&
-      encodedBytes <= THREAD_WINDOW_MAX_BYTES
-    ) {
-      return
-    }
-    const selected: ThreadItem[] = []
-    encodedBytes = 2
-    for (let index = view.items.length - 1; index >= 0; index -= 1) {
-      const item = view.items[index] as ThreadItem
-      const itemBytes = utf8Bytes(JSON.stringify(item)) + (selected.length > 0 ? 1 : 0)
-      if (
-        selected.length >= THREAD_WINDOW_MAX_ITEMS ||
-        encodedBytes + itemBytes > THREAD_WINDOW_MAX_BYTES
-      ) {
-        break
-      }
-      selected.unshift(item)
-      encodedBytes += itemBytes
-    }
-    if (selected.length === view.items.length) return
-    view.items = selected
-    // The evicted prefix remains authoritative in SQLite. Point the existing "Load older" affordance at
-    // the latest durable page rather than retaining those items invisibly in heap.
-    view.journalHistoryGeneration = this.replayGeneration
-    view.journalHistoryOlderCursor = this.lastSeq + 1
+    view.items = combined
   }
 
   // Lazily pull an IMPORTED chat's on-disk transcript the first time it's opened and prepend it above
@@ -2853,10 +2909,18 @@ export class HubStore {
     if (!view.record.imported) {
       this.historyPulled.add(id)
       view.loadingHistory = true
-      const page = await api
-        .journalHistory(id, this.replayGeneration, this.replayBaselineSeq + 1)
-        .catch(() => null)
-      view.loadingHistory = false
+      view.historyLoadError = undefined
+      let page: JournalHistoryPage | null = null
+      try {
+        page = await boundedHubRead('Latest journal history', (signal) =>
+          api.journalHistory(id, this.replayGeneration, this.replayBaselineSeq + 1, signal),
+        )
+      } catch (error) {
+        view.historyLoadError =
+          error instanceof Error ? error.message : 'Latest journal history could not be loaded.'
+      } finally {
+        view.loadingHistory = false
+      }
       if (!page || !Array.isArray(page.events)) {
         this.historyPulled.delete(id)
         return
@@ -2880,9 +2944,23 @@ export class HubStore {
     }
     this.historyPulled.add(id)
     view.loadingHistory = true
-    const page = await api.history(id).catch(() => null)
-    view.loadingHistory = false
-    if (!page || !page.items.length) return
+    view.historyLoadError = undefined
+    let page: HistoryPage | null = null
+    try {
+      page = await boundedHubRead('Imported chat history', (signal) =>
+        api.history(id, undefined, signal),
+      )
+    } catch (error) {
+      view.historyLoadError =
+        error instanceof Error ? error.message : 'Imported chat history could not be loaded.'
+    } finally {
+      view.loadingHistory = false
+    }
+    if (!page) {
+      this.historyPulled.delete(id)
+      return
+    }
+    if (!page.items.length) return
     const ts = view.record.createdAt
     const hist = page.items.map((h, i) => this.toThreadItem(h, `hist:${i}`, ts))
     view.items = [...hist, ...view.items] // prepend history; live turns (if any) stay below
@@ -2898,52 +2976,69 @@ export class HubStore {
   }
 
   // Page OLDER history above what's shown (the "load older" affordance for long imported chats).
-  async loadOlderHistory(id: string): Promise<void> {
+  async loadOlderHistory(id: string): Promise<boolean> {
     const view = this.sessions[id]
-    if (!view || view.loadingHistory) return
+    if (!view || view.loadingHistory) return false
+    view.historyLoadError = undefined
     if (view.journalHistoryOlderCursor != null) {
       const cursor = view.journalHistoryOlderCursor
       view.loadingHistory = true
-      const page: JournalHistoryPage | null = await api
-        .journalHistory(id, view.journalHistoryGeneration ?? this.replayGeneration, cursor)
-        .catch(() => null)
-      view.loadingHistory = false
-      if (!page || !Array.isArray(page.events)) return
+      let page: JournalHistoryPage | null = null
+      try {
+        page = await boundedHubRead('Older journal history', (signal) =>
+          api.journalHistory(
+            id,
+            view.journalHistoryGeneration ?? this.replayGeneration,
+            cursor,
+            signal,
+          ),
+        )
+      } catch (error) {
+        view.historyLoadError =
+          error instanceof Error ? error.message : 'Older history could not be loaded.'
+      } finally {
+        view.loadingHistory = false
+      }
+      if (!page || !Array.isArray(page.events)) return false
       let historyItems: ThreadItem[]
       try {
         historyItems = reduceJournalHistory(page.events)
-      } catch {
-        return
+      } catch (error) {
+        view.historyLoadError =
+          error instanceof Error ? error.message : 'Older history could not be decoded.'
+        return false
       }
       this.installJournalHistoryWindow(view, historyItems)
       view.journalHistoryOlderCursor = page.hasOlder ? page.olderCursor : null
       view.historyViewingOlder = true
-      return
+      return true
     }
-    if (view.historyOlderCursor == null) return
+    if (view.historyOlderCursor == null) return false
     const cursor = view.historyOlderCursor
     view.loadingHistory = true
-    const page: HistoryPage | null = await api.history(id, cursor).catch(() => null)
-    view.loadingHistory = false
-    if (!page) return
+    let page: HistoryPage | null = null
+    try {
+      page = await boundedHubRead('Older imported history', (signal) =>
+        api.history(id, cursor, signal),
+      )
+    } catch (error) {
+      view.historyLoadError =
+        error instanceof Error ? error.message : 'Older imported history could not be loaded.'
+    } finally {
+      view.loadingHistory = false
+    }
+    if (!page) return false
     const older = page.items.map((h, i) => this.toThreadItem(h, `hist:o${cursor}:${i}`, view.record.createdAt))
     view.items = [...older, ...view.items] // older turns go above everything already shown
     view.historyOlderCursor = page.hasOlder ? page.olderCursor : null
     view.historyViewingOlder = true
+    return true
   }
 
   showLatestHistory(id: string): void {
     const view = this.sessions[id]
     if (!view) return
     view.historyViewingOlder = false
-    if (view.journalHistoryGeneration !== undefined) {
-      // An older page replaced the prior history window. Reload the bounded latest page from the journal;
-      // live items remain in the pane and are deduplicated by their stable reducer keys.
-      view.items = view.items.filter((item) => item.historical !== true)
-      view.journalHistoryOlderCursor = undefined
-      this.historyPulled.delete(id)
-      void this.ensureHistory(id)
-    }
   }
 
   select(id: string): void {
@@ -2999,12 +3094,13 @@ export class HubStore {
    * Open the project-wide read model after a team launch. Keep the prior chat layout available through
    * Back, but never render it underneath the dashboard or make ProjectView pretend to be another pane.
    */
-  openProjectView(projectId: string): void {
+  openProjectView(projectId: string, mode?: ProjectViewMode): void {
     if (this.selectedId || this.splitPanes.length) {
       this.lastLayout = { selectedId: this.selectedId, splitPanes: this.splitPanes.map((r) => [...r]) }
     }
     this.selectedId = null
     this.splitPanes = []
+    this.projectViewMode = mode ?? loadProjectViewMode(projectId)
     this.projectViewId = projectId
   }
 

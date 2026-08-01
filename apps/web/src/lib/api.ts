@@ -22,6 +22,8 @@ export interface RecoveryNotice {
 
 export interface ProfileInfo {
   id: string
+  /** Editable operator-facing alias; id remains the immutable account key. */
+  displayName?: string
   provider: 'claude' | 'codex'
   available?: boolean
   unavailableReason?: string
@@ -190,6 +192,8 @@ export interface SessionRecord {
   effort?: string
   serviceTier?: string
   permissionMode?: string
+  permissionModeOperatorOverride?: boolean
+  permissionModeOperatorOverrideCeiling?: 'safe' | 'edits' | 'full'
   /** Tools the operator chose "always allow" for in this chat. Shown (and revocable) in the permission menu. */
   allowedTools?: string[]
   browserEnabled?: boolean
@@ -574,8 +578,8 @@ async function request<T>(
 // in `.catch(...)` (roster pulls fall back to [], a failed /api/fleet probe to null) — those guards
 // only appeared to work before because an error body was resolved as fake data and the catch never
 // fired, which is why a token-gated peer rendered ONLINE while its 401 roster body was iterated.
-async function jget<T>(url: string, base: string = HUB_HTTP): Promise<T> {
-  const r = await request<T>('GET', url, base)
+async function jget<T>(url: string, base: string = HUB_HTTP, signal?: AbortSignal): Promise<T> {
+  const r = await request<T>('GET', url, base, undefined, [], signal)
   if (!r.ok) throw new HubHttpError(r.error, r.status)
   return r.data
 }
@@ -602,8 +606,12 @@ async function boundedLoginRequest<T>(
   method: 'GET' | 'POST' | 'DELETE',
   url: string,
   body?: unknown,
+  signal?: AbortSignal,
 ): Promise<T> {
   const controller = new AbortController()
+  const abortFromCaller = (): void => controller.abort(signal?.reason)
+  if (signal?.aborted) abortFromCaller()
+  else signal?.addEventListener('abort', abortFromCaller, { once: true })
   const timeout = setTimeout(() => controller.abort(), LOGIN_HTTP_TIMEOUT_MS)
   try {
     try {
@@ -624,6 +632,7 @@ async function boundedLoginRequest<T>(
     }
   } finally {
     clearTimeout(timeout)
+    signal?.removeEventListener('abort', abortFromCaller)
   }
 }
 
@@ -814,33 +823,53 @@ export const api = {
   replayBaseline: () => jget<ReplayBaseline>('/api/replay-baseline'),
   profiles: () => jget<ProfileInfo[]>('/api/profiles'),
   stats: () => jget<StatsResult>('/api/stats'),
-  rescanProfiles: () => jpost<ProfileInfo[] | ApiError>('/api/profiles/rescan'),
+  // Account refresh is part of the login lifecycle, so it obeys the same transport bound as every
+  // login/status/cancel request. The optional outer signal also lets the whole-attempt deadline stop it.
+  rescanProfiles: (signal?: AbortSignal) =>
+    boundedLoginRequest<ProfileInfo[] | ApiError>(
+      'POST',
+      '/api/profiles/rescan',
+      undefined,
+      signal,
+    ),
+  renameProfile: (id: string, displayName: string) =>
+    jpost<ProfileInfo | ApiError>(
+      `/api/profiles/${encodeURIComponent(id)}/name`,
+      { displayName },
+    ),
   login: (
     provider: 'claude' | 'codex',
     name: string,
     reauth: boolean,
     idempotencyKey: string,
+    signal?: AbortSignal,
   ) =>
     boundedLoginRequest<LoginResult>('POST', '/api/accounts/login', {
       provider,
       name,
       reauth,
       idempotencyKey,
-    }),
-  loginForProfile: (name: string, idempotencyKey: string) =>
+    }, signal),
+  loginForProfile: (name: string, idempotencyKey: string, signal?: AbortSignal) =>
     boundedLoginRequest<LoginResult>(
       'GET',
       `/api/accounts/login/profile/${encodeURIComponent(name)}?key=${encodeURIComponent(idempotencyKey)}`,
+      undefined,
+      signal,
     ),
-  loginStatus: (id: string) =>
+  loginStatus: (id: string, signal?: AbortSignal) =>
     boundedLoginRequest<LoginResult>(
       'GET',
       `/api/accounts/login/${encodeURIComponent(id)}`,
+      undefined,
+      signal,
     ),
-  cancelLogin: (id: string) =>
+  cancelLogin: (id: string, signal?: AbortSignal) =>
     boundedLoginRequest<LoginResult>(
       'DELETE',
       `/api/accounts/login/${encodeURIComponent(id)}`,
+      undefined,
+      signal,
     ),
   pickFolder: () => jpost<{ path: string }>('/api/pick-folder'),
   wslCapability: () => jget<WslCapability>('/api/wsl/capability'),
@@ -865,6 +894,8 @@ export const api = {
       path,
       ...(distro ? { distro } : {}),
     }),
+  updateProject: (id: string, patch: { name: string }) =>
+    jpost<ProjectInfo | ApiError>(`/api/projects/${encodeURIComponent(id)}/settings`, patch),
   createManagedProject: (name: string, distro?: string) =>
     jpost<ProjectInfo | { error: string }>('/api/projects/managed', {
       name,
@@ -889,15 +920,21 @@ export const api = {
   scanProject: (path: string) => jpost<ScanResult | { error: string }>('/api/projects/scan', { path }),
   importChats: (projectId: string, vendorSessionIds: string[]) =>
     jpost<ImportResult | { error: string }>(`/api/projects/${projectId}/import`, { vendorSessionIds }),
-  sessions: () => jget<SessionRecord[]>('/api/sessions'),
+  sessions: (signal?: AbortSignal) => jget<SessionRecord[]>('/api/sessions', HUB_HTTP, signal),
   // On-demand vendor transcript history for an imported chat (bounded tail; `before` byte cursor pages older).
-  history: (id: string, before?: number) =>
-    jget<HistoryPage>(`/api/sessions/${id}/history${before != null ? `?before=${before}` : ''}`),
-  journalHistory: (id: string, generation: number, before?: number) => {
+  history: (id: string, before?: number, signal?: AbortSignal) =>
+    jget<HistoryPage>(
+      `/api/sessions/${id}/history${before != null ? `?before=${before}` : ''}`,
+      HUB_HTTP,
+      signal,
+    ),
+  journalHistory: (id: string, generation: number, before?: number, signal?: AbortSignal) => {
     const query = new URLSearchParams({ generation: String(generation) })
     if (before != null) query.set('before', String(before))
     return jget<JournalHistoryPage>(
       `/api/sessions/${encodeURIComponent(id)}/journal-history?${query.toString()}`,
+      HUB_HTTP,
+      signal,
     )
   },
   approvals: () => jget<ApprovalRecord[]>('/api/approvals'),
@@ -976,8 +1013,11 @@ export const api = {
   reopen: (id: string) => jpost<{ ok?: boolean; status?: string; error?: string }>(`/api/sessions/${id}/reopen`),
   deleteSession: (id: string, deleteBrowserData = false) =>
     jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/delete`, { deleteBrowserData }),
-  setMode: (id: string, permissionMode: string) =>
-    jpost<{ ok: boolean } | ApiError>(`/api/sessions/${id}/mode`, { permissionMode }),
+  setMode: (id: string, permissionMode: string, operatorOverride = false) =>
+    jpost<{ ok: boolean } | ApiError>(`/api/sessions/${id}/mode`, {
+      permissionMode,
+      operatorOverride,
+    }),
   browserStatus: (id: string) =>
     jget<BrowserStatus>(`/api/sessions/${id}/browser`),
   setBrowserEnabled: (id: string, enabled: boolean) =>

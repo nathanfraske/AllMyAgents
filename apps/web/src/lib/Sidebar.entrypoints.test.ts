@@ -39,6 +39,7 @@ beforeEach(() => {
   store.selectedId = null
   store.splitPanes = []
   store.projectViewId = null
+  store.projectViewMode = null
   store.lastProfileId = null
 })
 
@@ -59,7 +60,7 @@ describe('sidebar launch controls', () => {
     expect(screen.getByTitle('project managers')).toBeTruthy()
   })
 
-  it('opens a manager row as the doorway to its project overview', async () => {
+  it('opens a manager row directly in its full project-scoped conversation', async () => {
     store.sessions = {
       manager: {
         record: {
@@ -83,12 +84,23 @@ describe('sidebar launch controls', () => {
 
     render(Sidebar)
 
-    const manager = screen.getByRole('button', { name: 'Open Product project overview' })
-    expect(manager.textContent).toMatch(/open project overview/i)
+    const manager = screen.getByRole('button', { name: 'Open Product manager conversation' })
     await fireEvent.click(manager)
 
     expect(store.projectViewId).toBe(project.id)
+    expect(store.projectViewMode).toBe('manager')
     expect(store.selectedId).toBeNull()
     expect(store.splitPanes).toEqual([])
+  })
+
+  it('opens the new project chat instead of bubbling back to the project overview', async () => {
+    store.projectViewId = project.id
+    render(Sidebar)
+
+    await fireEvent.click(screen.getByTitle('new chat here'))
+
+    expect(store.projectViewId).toBeNull()
+    expect(store.selectedId).toMatch(/^draft:/)
+    expect(store.sessions[store.selectedId!]?.record.projectId).toBe(project.id)
   })
 })
