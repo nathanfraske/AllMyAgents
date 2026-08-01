@@ -15,6 +15,7 @@
   } from './externalUrl'
   import { inTauri } from './window'
   import type { AccountLoginView } from './tutorialState.svelte'
+  import { profileLabel, profileOptionLabel } from './profileLabel'
   import {
     loadSettingsTab,
     saveSettingsTab,
@@ -212,6 +213,44 @@
   let addProvider = $state<'claude' | 'codex'>('claude')
   let addName = $state('')
   let rescanning = $state(false)
+  let renamingProfileId = $state('')
+  let profileNameDraft = $state('')
+  let profileNameBusy = $state(false)
+  let profileNameError = $state('')
+
+  function beginProfileRename(profileId: string): void {
+    const profile = store.profiles.find((candidate) => candidate.id === profileId)
+    if (!profile) return
+    renamingProfileId = profileId
+    profileNameDraft = profile.displayName ?? profile.id
+    profileNameError = ''
+  }
+
+  function cancelProfileRename(): void {
+    renamingProfileId = ''
+    profileNameDraft = ''
+    profileNameError = ''
+  }
+
+  async function saveProfileName(profileId: string, reset = false): Promise<void> {
+    profileNameBusy = true
+    profileNameError = ''
+    try {
+      const result = await api.renameProfile(profileId, reset ? '' : profileNameDraft)
+      if ('error' in result) {
+        profileNameError = result.error
+        return
+      }
+      store.profiles = store.profiles.map((profile) =>
+        profile.id === result.id ? { ...profile, ...result } : profile,
+      )
+      cancelProfileRename()
+    } catch (error) {
+      profileNameError = error instanceof Error ? error.message : String(error)
+    } finally {
+      profileNameBusy = false
+    }
+  }
 
   type LoginUiState =
     | 'idle'
@@ -230,6 +269,11 @@
   let loginStartedAt = $state<number | undefined>()
   let loginRequestCancelled = false
   let loginCancelSent = false
+  let loginAttemptController: AbortController | undefined
+
+  // OAuth itself may legitimately take a while, but the UI must never poll forever. Per-request calls
+  // remain bounded to eight seconds; this is the independent ceiling for the complete attempt.
+  const LOGIN_ATTEMPT_TIMEOUT_MS = 10 * 60 * 1000
 
   const loginActive = (): boolean =>
     loginState === 'capturing' ||
@@ -306,12 +350,34 @@
     name: string,
     requestKey: string,
     target: PreparedExternalTarget,
+    signal: AbortSignal,
   ): Promise<void> {
     let result = initial
     const id = result.loginId
     if (!id) return
     loginId = id
     while (loginId === id) {
+      if (loginStartedAt && Date.now() - loginStartedAt >= LOGIN_ATTEMPT_TIMEOUT_MS) {
+        loginRequestCancelled = true
+        if (!loginCancelSent) {
+          loginCancelSent = true
+          await api.cancelLogin(id)
+        }
+        closePreparedTarget(target)
+        loginState = 'error'
+        loginStartedAt = undefined
+        loginMsg = 'Sign-in timed out and cancellation was requested. Retry when you are ready.'
+        loginId = ''
+        loginRequestKey = ''
+        return
+      }
+      // Cancellation is a lifecycle transition, not a property of the provider's current branch.
+      // Check it before dispatching on status so complete/error races cannot strand a dead Cancel button.
+      if (loginRequestCancelled && !loginCancelSent) {
+        loginCancelSent = true
+        result = await api.cancelLogin(id)
+        continue
+      }
       if (
         result.status === 'capturing' ||
         result.status === 'waiting' ||
@@ -326,15 +392,10 @@
             : 'Finishing credential recovery safely…'
         }
         await openLoginUrl(result, target)
-        if (loginRequestCancelled && !loginCancelSent) {
-          loginCancelSent = true
-          result = await api.cancelLogin(id)
-          continue
-        }
         await delay(1_000)
-        result = await api.loginStatus(id)
+        result = await api.loginStatus(id, signal)
         if (!result || 'error' in result) {
-          const recovered = await api.loginForProfile(name, requestKey)
+          const recovered = await api.loginForProfile(name, requestKey, signal)
           if (!recovered || 'error' in recovered) {
             loginMsg =
               'The hub is reconnecting. This sign-in attempt is still tracked and will be recovered automatically.'
@@ -345,10 +406,15 @@
         continue
       }
       if (result.status === 'complete' && result.ok) {
-        const scan = await store.rescanProfiles()
-        if (scan.error) throw new Error(scan.error)
+        // The credential is already durable. Roster presentation is best-effort: ProfileRuntime also
+        // publishes profiles/added on the live stream, so an HTTP refresh failure must not turn a
+        // successful login into an endless spinner or a false "signed out" state.
+        const scan = await store.rescanProfiles(signal)
         loginState = 'done'
-        loginMsg = `Added ${result.added ?? name}. It now appears in your accounts.`
+        loginStartedAt = undefined
+        loginMsg = scan.error
+          ? `Added ${result.added ?? name}. The account list will refresh automatically.`
+          : `Added ${result.added ?? name}. It now appears in your accounts.`
         loginId = ''
         loginRequestKey = ''
         loginUrl = ''
@@ -357,6 +423,7 @@
         return
       }
       loginState = result.status === 'cancelled' ? 'cancelled' : 'error'
+      loginStartedAt = undefined
       loginMsg =
         result.error ??
         (result.status === 'cancelled'
@@ -380,6 +447,9 @@
     const target = prepareExternalTarget()
     loginRequestCancelled = false
     loginCancelSent = false
+    loginAttemptController?.abort()
+    loginAttemptController = new AbortController()
+    const signal = loginAttemptController.signal
     loginState = 'settling'
     loginStartedAt = Date.now()
     loginMsg = `Preparing ${addProvider === 'claude' ? 'Claude' : 'Codex'} sign-in safely…`
@@ -388,9 +458,9 @@
     loginUrl = ''
     loginCode = ''
     try {
-      let r = await api.login(addProvider, name, reauth, loginRequestKey)
+      let r = await api.login(addProvider, name, reauth, loginRequestKey, signal)
       if (!r.loginId) {
-        const recovered = await api.loginForProfile(name, loginRequestKey)
+        const recovered = await api.loginForProfile(name, loginRequestKey, signal)
         if (recovered.loginId) r = recovered
       }
       if (!r.loginId) {
@@ -401,10 +471,11 @@
           'The hub could not confirm a durable sign-in attempt. No successful sign-in was assumed.'
         return
       }
-      await finishLogin(r, name, loginRequestKey, target)
+      await finishLogin(r, name, loginRequestKey, target, signal)
     } catch (e) {
       closePreparedTarget(target)
       loginState = 'error'
+      loginStartedAt = undefined
       loginMsg =
         e instanceof Error
           ? e.message
@@ -423,7 +494,9 @@
     loginRequestCancelled = true
     const id = loginId
     loginState = 'settling'
-    loginStartedAt = undefined
+    // Keep the original whole-attempt clock alive while cancellation settles. Clearing it here made a
+    // provider that never acknowledged cancellation poll forever—the exact terminal branch Cancel is
+    // supposed to escape.
     loginMsg = id
       ? 'Cancelling sign-in and restoring credential state safely…'
       : 'Cancelling as soon as the durable sign-in attempt is confirmed…'
@@ -435,6 +508,7 @@
 
   function closeModal(): void {
     loginRequestCancelled = true
+    loginAttemptController?.abort()
     if (loginId) void api.cancelLogin(loginId)
     onclose()
   }
@@ -482,12 +556,12 @@
       if (p.provider === 'codex' && planType && norm(planType) in PLAN_BUDGETS) {
         const usd = PLAN_BUDGETS[norm(planType)]!
         total += usd
-        lines.push(`${p.id}: ${planType} → $${usd}/mo`)
+        lines.push(`${profileLabel(p)}: ${planType} → $${usd}/mo`)
       } else {
         total += FALLBACK_USD
         assumed++
         const why = p.provider === 'claude' ? 'Claude tier not in usage data' : planType ? `unknown plan "${planType}"` : 'no usage data yet'
-        lines.push(`${p.id}: ${why} → assumed $${FALLBACK_USD}/mo`)
+        lines.push(`${profileLabel(p)}: ${why} → assumed $${FALLBACK_USD}/mo`)
       }
     }
     settings.setBudget(total || null)
@@ -524,25 +598,44 @@
       <h3>Accounts</h3>
       <div class="accounts">
         {#each store.profiles as p (p.id)}
-          <div class="acct" class:signed-out={p.authStatus === 'signed_out'} class:unavailable={p.available === false}>
-            <ProviderLogo provider={p.provider} size={14} />
-            <span class="aid">{p.id}</span>
-            <span class="aprov dim">{p.provider}</span>
-            {#if p.authStatus === 'signed_out'}
-              <span class="status error" title={p.authError}>Signed out</span>
-            {/if}
-            {#if p.available === false}
-              <span class="status error" title={p.unavailableReason}>
-                In use by another hub{p.ownerPort ? ` (port ${p.ownerPort})` : ''}
+          <div class="account-wrap">
+            <div class="acct" class:signed-out={p.authStatus === 'signed_out'} class:unavailable={p.available === false}>
+              <ProviderLogo provider={p.provider} size={14} />
+              <span class="account-identity">
+                <span class="aid">{profileLabel(p)}</span>
+                {#if p.displayName}<span class="profile-id dim">ID: {p.id}</span>{/if}
               </span>
+              <span class="aprov dim">{p.provider}</span>
+              {#if p.authStatus === 'signed_out'}
+                <span class="status error" title={p.authError}>Signed out</span>
+              {/if}
+              {#if p.available === false}
+                <span class="status error" title={p.unavailableReason}>
+                  In use by another hub{p.ownerPort ? ` (port ${p.ownerPort})` : ''}
+                </span>
+              {/if}
+              <button class="btn" aria-label={`Rename ${profileLabel(p)}`} onclick={() => beginProfileRename(p.id)}>Rename</button>
+              <button
+                class="btn"
+                class:btn-primary={p.authStatus === 'signed_out'}
+                aria-label={p.authStatus === 'signed_out' ? 'Sign in again' : `Re-authenticate ${profileLabel(p)}`}
+                onclick={() => reauthenticate(p)}
+                disabled={loginActive()}
+              >{p.authStatus === 'signed_out' ? 'Sign in again' : 'Re-authenticate'}</button>
+            </div>
+            {#if renamingProfileId === p.id}
+              <div class="rename-account">
+                <label>
+                  <span>Account display name</span>
+                  <input aria-label={`Account display name for ${p.id}`} bind:value={profileNameDraft} maxlength="80" />
+                </label>
+                <button class="btn btn-primary" aria-label="Save account name" disabled={profileNameBusy || !profileNameDraft.trim()} onclick={() => saveProfileName(p.id)}>Save</button>
+                {#if p.displayName}<button class="btn" disabled={profileNameBusy} onclick={() => saveProfileName(p.id, true)}>Use ID</button>{/if}
+                <button class="btn" disabled={profileNameBusy} onclick={cancelProfileRename}>Cancel</button>
+                {#if profileNameError}<p class="status error" role="alert">{profileNameError}</p>{/if}
+                <p class="hint dim">Only the displayed name changes. The stable ID <code>{p.id}</code> continues to own credentials, chats, grants, usage, and instructions.</p>
+              </div>
             {/if}
-            <button
-              class="btn"
-              class:btn-primary={p.authStatus === 'signed_out'}
-              aria-label={p.authStatus === 'signed_out' ? 'Sign in again' : `Re-authenticate ${p.id}`}
-              onclick={() => reauthenticate(p)}
-              disabled={loginActive()}
-            >{p.authStatus === 'signed_out' ? 'Sign in again' : 'Re-authenticate'}</button>
           </div>
         {/each}
       </div>
@@ -579,7 +672,7 @@
       <label class="opt row2">Account
         <select value={settings.defaultAccount} onchange={(e) => settings.set('defaultAccount', (e.target as HTMLSelectElement).value)}>
           <option value="">last used</option>
-          {#each store.profiles as p (p.id)}<option value={p.id}>{p.id} · {p.provider}</option>{/each}
+          {#each store.profiles as p (p.id)}<option value={p.id}>{profileOptionLabel(p)} · {p.provider}</option>{/each}
         </select>
       </label>
       <label class="opt row2">Permission mode
@@ -723,7 +816,7 @@
           <option value="vendor:claude">All Claude</option>
           <option value="vendor:codex">All Codex</option>
           {#each store.projects as p (p.id)}<option value="project:{p.id}">Project · {p.name}</option>{/each}
-          {#each store.profiles as pr (pr.id)}<option value="account:{pr.id}">Account · {pr.id}</option>{/each}
+          {#each store.profiles as pr (pr.id)}<option value="account:{pr.id}">Account · {profileOptionLabel(pr)}</option>{/each}
         </select>
       </label>
       <textarea class="instr" rows="6" bind:value={instrContent} placeholder="e.g. I'm the operator. Terse commits, no emoji. Prefer pnpm. Ask before anything destructive."></textarea>
@@ -882,9 +975,16 @@
   .tab-hidden { display: none; }
   section h3 { margin: 0 0 var(--space-3); font-size: var(--text-2xs); text-transform: uppercase; letter-spacing: var(--ls-label); color: var(--dim); }
   .accounts { display: flex; flex-direction: column; gap: var(--space-2); margin-bottom: var(--space-4); }
-  .acct { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-2) var(--space-3); background: var(--surface-2); border-radius: var(--r-md); box-shadow: var(--edge-hi); }
+  .account-wrap { display: flex; flex-direction: column; gap: var(--space-1); }
+  .acct { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; padding: var(--space-2) var(--space-3); background: var(--surface-2); border-radius: var(--r-md); box-shadow: var(--edge-hi); }
+  .account-identity { display: flex; flex-direction: column; min-width: 0; }
   .aid { font-weight: var(--fw-medium); }
+  .profile-id { font-size: 0.66rem; }
   .aprov { font-size: var(--text-xs); margin-left: auto; }
+  .rename-account { display: flex; align-items: end; gap: var(--space-2); flex-wrap: wrap; padding: var(--space-3); border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-1); }
+  .rename-account label { display: grid; gap: var(--space-1); flex: 1 1 240px; font-size: var(--text-xs); }
+  .rename-account input { width: 100%; }
+  .rename-account .hint, .rename-account .status { flex-basis: 100%; margin: 0; }
   .add { display: flex; flex-direction: column; gap: var(--space-3); }
   .add > .btn { align-self: flex-start; }
   .add-row { display: flex; gap: var(--space-2); }

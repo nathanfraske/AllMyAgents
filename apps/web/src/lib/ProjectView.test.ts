@@ -7,6 +7,7 @@ import type { ProjectInfo, SessionRecord, WorktreeProjectActivity } from './api'
 const apiMock = vi.hoisted(() => ({
   projectActivity: vi.fn(),
   send: vi.fn(),
+  updateProject: vi.fn(),
 }))
 
 vi.mock('./api', async (original) => {
@@ -98,6 +99,10 @@ beforeEach(() => {
   localStorage.clear()
   apiMock.projectActivity.mockReset().mockResolvedValue(activity)
   apiMock.send.mockReset().mockResolvedValue({ ok: true })
+  apiMock.updateProject.mockReset().mockImplementation(async (_id: string, patch: { name: string }) => ({
+    ...project,
+    name: patch.name,
+  }))
   const plan: ThreadItem = {
     key: 'plan',
     kind: 'tool',
@@ -168,6 +173,7 @@ beforeEach(() => {
     { id: 'approval-1', sessionId: 'blocked', kind: 'claude/tool', payload: {}, status: 'pending', createdAt: now },
   ]
   store.projectViewId = project.id
+  store.projectViewMode = null
 })
 
 afterEach(cleanup)
@@ -291,6 +297,34 @@ describe('ProjectView', () => {
     render(ProjectView, { props: { projectId: project.id } })
     expect(screen.getByRole('button', { name: 'Manager' }).getAttribute('aria-pressed')).toBe('true')
     expect(screen.getByText('I am coordinating the launch.')).toBeTruthy()
+  })
+
+  it('opens project-local project and manager editing without entering the manager chat', async () => {
+    render(ProjectView, { props: { projectId: project.id } })
+
+    await fireEvent.click(screen.getByRole('button', { name: /edit project & manager/i }))
+    expect(screen.getByRole('dialog', { name: 'Edit project and manager' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Edit manager settings' })).toBeTruthy()
+
+    const name = screen.getByRole('textbox', { name: 'Project name' })
+    await fireEvent.input(name, { target: { value: 'Alpha renamed' } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Save project settings' }))
+
+    await waitFor(() => expect(apiMock.updateProject).toHaveBeenCalledWith(project.id, { name: 'Alpha renamed' }))
+    expect(store.projects[0]?.name).toBe('Alpha renamed')
+    expect(store.projectViewId).toBe(project.id)
+  })
+
+  it('honors direct manager entry and hydrates it through the normal chat history path', async () => {
+    const ensureHistory = vi.spyOn(store, 'ensureHistory').mockResolvedValue()
+    store.openProjectView(project.id, 'manager')
+
+    render(ProjectView, { props: { projectId: project.id } })
+
+    expect(screen.getByRole('button', { name: 'Manager' }).getAttribute('aria-pressed')).toBe('true')
+    expect(screen.queryByRole('heading', { name: 'Team' })).toBeNull()
+    await waitFor(() => expect(ensureHistory).toHaveBeenCalledWith('manager'))
+    ensureHistory.mockRestore()
   })
 
   it("renders the manager record's account, model, effort, and permission instead of profile defaults", async () => {

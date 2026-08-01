@@ -364,7 +364,8 @@ describe('project-manager delegated authority security boundary', () => {
       managerSessionId: string,
       childSessionId: string,
       authorities: Array<'commit' | 'push'>,
-      tools?: string[]
+      tools?: string[],
+      permissionMode?: 'safe' | 'edits' | 'full',
     ): SessionRecord
     managerSpawn(
       managerSessionId: string,
@@ -415,6 +416,27 @@ describe('project-manager delegated authority security boundary', () => {
     expect(() => controls(sessions).setChildDelegation('s1', 'child', ['push'])).toThrow(
       /outside.*ceiling|cannot delegate.*push/i
     )
+  })
+
+  it('lets a manager change an existing child mode only inside the operator-granted child ceiling', () => {
+    const { sessions, seed } = makeSessions()
+    seed({
+      isProjectManager: true,
+      managerMaxLiveChildren: 2,
+      managerMaxChildPermissionMode: 'edits',
+    } as Partial<SessionRecord>)
+    const child = seed({
+      id: 'child',
+      parentSessionId: 's1',
+      permissionMode: 'safe',
+    } as Partial<SessionRecord>)
+
+    controls(sessions).setChildDelegation('s1', 'child', [], undefined, 'edits')
+    expect(child.permissionMode).toBe('edits')
+    expect(child.permissionModeOperatorOverride).toBeUndefined()
+    expect(() =>
+      controls(sessions).setChildDelegation('s1', 'child', [], undefined, 'full')
+    ).toThrow(/permission mode full.*outside.*ceiling/i)
   })
 
   it('revoking delegation stops the very next action, not merely the next session', () => {

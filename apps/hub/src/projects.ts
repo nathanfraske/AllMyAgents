@@ -47,6 +47,7 @@ export class ProjectStore {
   private readonly insertStmt: Database.Statement
   private readonly allStmt: Database.Statement
   private readonly getStmt: Database.Statement
+  private readonly updateNameStmt: Database.Statement
   private readonly delStmt: Database.Statement
   private readonly trustGetStmt: Database.Statement
   private readonly trustUpsertStmt: Database.Statement
@@ -84,6 +85,7 @@ export class ProjectStore {
     this.getStmt = db.prepare(
       'SELECT id, name, path, wslDistro, linuxPath, createdAt FROM projects WHERE id = ?',
     )
+    this.updateNameStmt = db.prepare('UPDATE projects SET name = ? WHERE id = ?')
     this.delStmt = db.prepare('DELETE FROM projects WHERE id = ?')
     this.trustGetStmt = db.prepare('SELECT fingerprint FROM project_config_trust WHERE projectId = ?')
     this.trustUpsertStmt = db.prepare(
@@ -125,6 +127,15 @@ export class ProjectStore {
       project.createdAt,
     )
     return project
+  }
+
+  updateName(id: string, rawName: string): Project {
+    const existing = this.get(id)
+    if (!existing) throw new Error(`unknown project: ${id}`)
+    const name = rawName.trim()
+    if (!name) throw new Error('project name is required')
+    this.updateNameStmt.run(name, id)
+    return this.get(id)!
   }
 
   remove(id: string): void {

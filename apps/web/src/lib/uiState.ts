@@ -32,6 +32,7 @@ const LAYOUT_KEY = 'allmyagents.ui.lastLayout'
 const FOLDERS_KEY = 'allmyagents.ui.collapsedFolders'
 /** Chats whose agent side panel is popped out — so it is still open after a reload or a hub restart. */
 const AGENT_PANELS_KEY = 'allmyagents.ui.openAgentPanels'
+const THREAD_SIDE_PANELS_KEY = 'allmyagents.ui.threadSidePanels'
 const PROJECT_VIEW_MODES_KEY = 'allmyagents.ui.projectViewModes'
 const PROJECT_PEEK_KEY = 'allmyagents.ui.projectTranscriptPeek'
 
@@ -280,6 +281,46 @@ export function saveComposerDrafts(drafts: Record<string, string>): void {
 export function saveOpenAgentPanels(ids: string[]): void {
   try {
     localStorage.setItem(AGENT_PANELS_KEY, JSON.stringify(ids))
+  } catch {
+    /* ignore */
+  }
+}
+
+export type ThreadSidePanel = 'agents' | 'browser'
+
+/** One in-flow side panel per chat. This prevents Browser + Agents from jointly crushing a split pane. */
+export function loadThreadSidePanel(sessionId: string): ThreadSidePanel | null {
+  try {
+    const raw = localStorage.getItem(THREAD_SIDE_PANELS_KEY)
+    if (raw) {
+      const value = JSON.parse(raw) as Record<string, unknown>
+      if (value?.[sessionId] === 'agents' || value?.[sessionId] === 'browser') {
+        return value[sessionId]
+      }
+    }
+    // Migrate the older agents-only persistence lazily.
+    if (loadOpenAgentPanels().includes(sessionId)) return 'agents'
+  } catch {
+    /* ignore */
+  }
+  return null
+}
+
+export function saveThreadSidePanel(sessionId: string, panel: ThreadSidePanel | null): void {
+  try {
+    const raw = localStorage.getItem(THREAD_SIDE_PANELS_KEY)
+    const parsed = raw ? JSON.parse(raw) as unknown : {}
+    const state = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? { ...(parsed as Record<string, unknown>) }
+      : {}
+    if (panel) state[sessionId] = panel
+    else delete state[sessionId]
+    localStorage.setItem(THREAD_SIDE_PANELS_KEY, JSON.stringify(state))
+    // Keep the old key accurate for compatibility with older builds during rollback.
+    const agents = new Set(loadOpenAgentPanels())
+    if (panel === 'agents') agents.add(sessionId)
+    else agents.delete(sessionId)
+    saveOpenAgentPanels([...agents])
   } catch {
     /* ignore */
   }

@@ -366,23 +366,6 @@
   </div>
 {/if}
 <RecoveryNoticeBanner />
-{#if store.journalCompaction}
-  <div
-    class="journal-maintenance"
-    class:problem={store.journalCompaction.phase === 'failed' || store.journalCompaction.phase === 'unobservable'}
-    role="status"
-    aria-live="polite"
-  >
-    <strong>Journal maintenance:</strong>
-    <span>{store.journalCompaction.detail}</span>
-    {#if store.journalCompaction.rowsDeleted > 0}
-      <span class="maintenance-count">
-        {store.journalCompaction.rowsDeleted.toLocaleString()} superseded rows,
-        {(store.journalCompaction.payloadBytesDeleted / 1_048_576).toFixed(1)} MiB
-      </span>
-    {/if}
-  </div>
-{/if}
 <div
   class="shell"
   class:dragging={sidebarDrag || !!colDrag}
@@ -424,12 +407,15 @@
                 class="pane"
                 class:panedrag={paneDragId === id}
                 style="flex: {colFlex[r]?.[c] ?? 1} 1 0"
-                draggable="true"
                 role="group"
                 aria-label={`Chat pane ${(rowOffsets[r] ?? 0) + c + 1}; drag its header to rearrange`}
-                ondragstart={(e) => startPaneDrag(id, e)}
-                ondragend={endPaneDrag}
-              ><ThreadView sessionId={id} paneIndex={(rowOffsets[r] ?? 0) + c} multiPane={totalPanes > 1} /></div>
+              ><ThreadView
+                sessionId={id}
+                paneIndex={(rowOffsets[r] ?? 0) + c}
+                multiPane={totalPanes > 1}
+                onpanedragstart={(e) => startPaneDrag(id, e)}
+                onpanedragend={endPaneDrag}
+              /></div>
             {/each}
             {#if store.dragSession && store.dropZone?.kind === 'col' && store.dropZone.row === r && store.dropZone.col === row.length}
               <div class="ghost-pane" transition:ghostReveal><span>drop here</span></div>
@@ -507,19 +493,6 @@
     border: 2px solid currentColor; border-right-color: transparent;
     animation: hubspin 0.9s linear infinite;
   }
-  .journal-maintenance {
-    display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap;
-    padding: 0.35rem var(--space-4);
-    border-bottom: 1px solid var(--border);
-    background: color-mix(in srgb, var(--accent) 8%, var(--bg));
-    color: var(--text-dim); font-size: var(--text-xs); line-height: 1.35;
-  }
-  .journal-maintenance strong { color: var(--text); }
-  .journal-maintenance.problem {
-    background: var(--warn-bg, rgba(180, 120, 0, 0.14));
-    color: var(--warn-text, #d08700);
-  }
-  .maintenance-count { margin-left: auto; font-variant-numeric: tabular-nums; }
   @keyframes hubspin { to { transform: rotate(360deg); } }
   /* Respect the OS "reduce motion" setting — a permanent spinner is exactly the kind of thing it exists for. */
   @media (prefers-reduced-motion: reduce) { .hubdown .spin { animation: none; } }

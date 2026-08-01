@@ -2,6 +2,7 @@
   import { store } from './store.svelte'
   import { settings } from './settings.svelte'
   import { resetIn } from './time'
+  import { profileLabel } from './profileLabel'
 
   function spendLabel(cost: number): string {
     if (settings.planBudgetUsd && settings.planBudgetUsd > 0) {
@@ -16,6 +17,11 @@
     if (status.includes('warning')) return { label: 'near limit', cls: 'warn' }
     return { label: status, cls: 'bad' }
   }
+
+  function accountName(profileId: string): string {
+    const profile = store.profiles.find((candidate) => candidate.id === profileId)
+    return profile ? profileLabel(profile) : profileId
+  }
 </script>
 
 <div class="usage">
@@ -23,7 +29,7 @@
     {@const cs = claudeState(u.claude?.status)}
     <div class="card" class:blocked={u.blocked}>
       <div class="head">
-        <b>{u.profileId}</b>
+        <b title={u.profileId}>{accountName(u.profileId)}</b>
         {#if u.claude?.isUsingOverage}<span class="tag bad">overage</span>{/if}
       </div>
       {#if u.claudeUsage && u.claudeUsage.length}

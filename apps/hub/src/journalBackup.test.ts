@@ -425,6 +425,7 @@ describe('journal snapshots', () => {
     const copy = new Database(result.file as string, { readonly: true })
     expect((copy.prepare('SELECT COUNT(*) AS n FROM events').get() as { n: number }).n).toBe(40)
     expect(copy.pragma('quick_check')).toEqual([{ quick_check: 'ok' }])
+    expect(copy.pragma('journal_mode', { simple: true })).toBe('delete')
     copy.close()
   })
 
@@ -486,6 +487,72 @@ describe('journal snapshots', () => {
     expect(result.error).toMatch(/verification/i)
     expect(fs.readdirSync(backups).filter((f) => f.endsWith('.db'))).toEqual([])
     expect(fs.readdirSync(backups).filter((f) => f.endsWith('.partial'))).toEqual([])
+  })
+
+  it('rotates old verified generations even when the new snapshot fails', async () => {
+    const root = tmp()
+    const journal = makeJournal(root, 5)
+    const backups = path.join(root, 'backups')
+    fs.mkdirSync(backups, { recursive: true })
+    for (const stamp of ['01', '02', '03', '04']) {
+      fs.writeFileSync(path.join(backups, `hub-2026-07-29T00-0${stamp}-00.db`), stamp)
+    }
+
+    const result = await snapshotJournal(journal.db, {
+      dir: backups,
+      keep: 2,
+      verify: () => false,
+    })
+
+    expect(result.ok).toBe(false)
+    expect(fs.readdirSync(backups).filter((name) => name.endsWith('.db')).sort()).toEqual([
+      'hub-2026-07-29T00-003-00.db',
+      'hub-2026-07-29T00-004-00.db',
+    ])
+  })
+
+  it('enforces a byte retention budget while preserving the newest verified generation', async () => {
+    const root = tmp()
+    const journal = makeJournal(root, 5)
+    const backups = path.join(root, 'backups')
+    fs.mkdirSync(backups, { recursive: true })
+    for (const stamp of ['01', '02', '03']) {
+      fs.writeFileSync(path.join(backups, `hub-2026-07-29T00-00-${stamp}.db`), Buffer.alloc(12))
+    }
+
+    await snapshotJournal(journal.db, {
+      dir: backups,
+      keep: 10,
+      maxRetainedBytes: 20,
+      verify: () => false,
+    })
+
+    expect(fs.readdirSync(backups).filter((name) => name.endsWith('.db'))).toEqual([
+      'hub-2026-07-29T00-00-03.db',
+    ])
+  })
+
+  it('refuses to start an online backup without room for the source and reserve', async () => {
+    const root = tmp()
+    const journal = makeJournal(root, 5)
+    const backups = path.join(root, 'backups')
+    let backupCalled = false
+    const source = {
+      prepare: (sql: string) => journal.db.prepare(sql),
+      pragma: (source: string, options?: { simple?: boolean }) =>
+        journal.db.pragma(source, options),
+      backup: async () => {
+        backupCalled = true
+      },
+    } as unknown as typeof journal.db
+
+    const result = await snapshotJournal(source, {
+      dir: backups,
+      availableBytes: () => 0n,
+    })
+
+    expect(result).toMatchObject({ ok: false, error: expect.stringMatching(/insufficient free space/i) })
+    expect(backupCalled).toBe(false)
   })
 
   it('accepts a genuinely empty source journal', async () => {

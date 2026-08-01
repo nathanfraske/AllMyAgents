@@ -152,6 +152,81 @@ describe('project manager permission ceiling', () => {
     expect(manager.permissionMode).toBe('safe')
     expect(child.permissionMode).toBe('safe')
   })
+
+  it('applies an explicit operator override to one child without rewriting the manager bound', () => {
+    const { sessions, journal, seed } = buildHub()
+    const manager = seed({
+      id: 'manager',
+      isProjectManager: true,
+      managerMaxChildPermissionMode: 'safe',
+    })
+    const child = seed({ id: 'child', parentSessionId: 'manager', permissionMode: 'safe' })
+
+    sessions.setMode('child', 'full', 'operator-override')
+
+    expect(child.permissionMode).toBe('full')
+    expect(child.permissionModeOperatorOverride).toBe(true)
+    expect(child.permissionModeOperatorOverrideCeiling).toBe('full')
+    expect(manager.managerMaxChildPermissionMode).toBe('safe')
+    expect(
+      (sessions as unknown as { effectivePermissionMode(record: SessionRecord): string })
+        .effectivePermissionMode(child),
+    ).toBe('full')
+    expect(journal.recentEventsForSession('child')).toContainEqual(expect.objectContaining({
+      kind: 'session/mode',
+      payload: expect.objectContaining({ source: 'operator/override', operatorOverride: true }),
+    }))
+
+    ;(sessions as unknown as {
+      setChildDelegation(
+        manager: string,
+        child: string,
+        authorities: Array<'commit' | 'push'>,
+        tools?: string[],
+        permissionMode?: 'safe' | 'edits' | 'full',
+      ): SessionRecord
+    }).setChildDelegation('manager', 'child', [], undefined, 'edits')
+    expect(child.permissionMode).toBe('edits')
+    expect(child.permissionModeOperatorOverrideCeiling).toBe('full')
+
+    ;(sessions as unknown as {
+      setChildDelegation(
+        manager: string,
+        child: string,
+        authorities: Array<'commit' | 'push'>,
+        tools?: string[],
+        permissionMode?: 'safe' | 'edits' | 'full',
+      ): SessionRecord
+    }).setChildDelegation('manager', 'child', [], undefined, 'full')
+    expect(child.permissionMode).toBe('full')
+  })
+
+  it('rematerializes a child grant immediately when the manager changes authority and mode', () => {
+    const { sessions, seed, repo } = buildHub()
+    seed({
+      id: 'manager',
+      isProjectManager: true,
+      managerDelegation: ['commit'],
+      managerAllowedTools: ['WebFetch'],
+      managerMaxChildPermissionMode: 'edits',
+    })
+    seed({ id: 'child', parentSessionId: 'manager', permissionMode: 'safe' })
+
+    ;(sessions as unknown as {
+      setChildDelegation(
+        manager: string,
+        child: string,
+        authorities: Array<'commit' | 'push'>,
+        tools?: string[],
+        permissionMode?: 'safe' | 'edits' | 'full',
+      ): SessionRecord
+    }).setChildDelegation('manager', 'child', ['commit'], ['WebFetch'], 'edits')
+
+    const instructions = fs.readFileSync(path.join(repo, 'CLAUDE.md'), 'utf8')
+    expect(instructions).toContain('Permission mode: edits')
+    expect(instructions).toContain('Delegated tools: WebFetch')
+    expect(instructions).toContain('Delegated Git actions: commit')
+  })
 })
 
 describe('project manager lifecycle awareness', () => {

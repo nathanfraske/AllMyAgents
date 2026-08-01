@@ -1,0 +1,171 @@
+import { cleanup, fireEvent, render, waitFor } from '@testing-library/svelte'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import ThreadView from './ThreadView.svelte'
+import { store, type SessionView } from './store.svelte'
+import type { SessionRecord } from './api'
+
+const apiMock = vi.hoisted(() => ({
+  send: vi.fn(),
+  browserStatus: vi.fn(),
+}))
+
+vi.mock('./api', async (original) => {
+  const actual = await original<typeof import('./api')>()
+  return {
+    ...actual,
+    api: new Proxy(apiMock as Record<string, unknown>, {
+      get: (target, property: string) =>
+        property in target ? target[property] : () => Promise.resolve([]),
+    }),
+  }
+})
+
+window.matchMedia = (() => ({
+  matches: false,
+  media: '',
+  onchange: null,
+  addListener() {},
+  removeListener() {},
+  addEventListener() {},
+  removeEventListener() {},
+  dispatchEvent: () => false,
+})) as unknown as typeof window.matchMedia
+
+function seed(): SessionView {
+  const record = {
+    id: 'interaction-session',
+    profileId: 'p1',
+    provider: 'codex',
+    cwd: 'C:/work',
+    status: 'idle',
+    createdAt: '2026-07-31T00:00:00.000Z',
+  } as SessionRecord
+  const view: SessionView = {
+    record,
+    items: [],
+    lastActivity: record.createdAt,
+    sawReasoning: false,
+    journalHistoryOlderCursor: 42,
+    journalHistoryGeneration: 1,
+  }
+  store.sessions = { [record.id]: view }
+  store.selectedId = record.id
+  return view
+}
+
+beforeEach(() => {
+  apiMock.send.mockReset().mockResolvedValue({ ok: true })
+  apiMock.browserStatus.mockReset().mockResolvedValue({
+    enabled: false,
+    available: true,
+    retainedProfile: false,
+    publicOriginGrants: [],
+    localNetworkEnabled: false,
+    tabsEnabled: false,
+    downloadsEnabled: false,
+  })
+  localStorage.clear()
+  store.sessions = {}
+  store.selectedId = null
+  store.approvals = []
+  store.questions = []
+  store.projects = []
+  store.prefs.steerMessagesAtToolBoundary = true
+})
+
+afterEach(() => {
+  vi.restoreAllMocks()
+  cleanup()
+})
+
+describe('transcript interaction boundaries', () => {
+  it('opens Browser as the same mutually-exclusive in-flow side panel used by Agents', async () => {
+    const view = seed()
+    view.items = [{
+      key: 'agent-spawn',
+      kind: 'tool',
+      ts: '2026-07-31T00:00:01.000Z',
+      toolName: 'Agent',
+      toolUseId: 'spawn-1',
+      toolInput: { description: 'Audit the browser panel' },
+      agentTaskId: 'task-1',
+    }]
+    const rendered = render(ThreadView, { props: { sessionId: 'interaction-session' } })
+
+    await fireEvent.click(rendered.getByTitle('Open isolated browser controls'))
+    expect(await rendered.findByRole('complementary', { name: 'Browser' })).toBeTruthy()
+
+    await fireEvent.click(rendered.getByTitle('Show the agents this chat spawned'))
+    expect(await rendered.findByRole('complementary', { name: 'Agents' })).toBeTruthy()
+    expect(rendered.queryByRole('complementary', { name: 'Browser' })).toBeNull()
+  })
+
+  it('loads older history automatically when the transcript is scrolled to the top', async () => {
+    seed()
+    const load = vi.spyOn(store, 'loadOlderHistory').mockResolvedValue(true)
+    const { container } = render(ThreadView, { props: { sessionId: 'interaction-session' } })
+    const transcript = container.querySelector('.stream.scroll') as HTMLDivElement
+    Object.defineProperties(transcript, {
+      scrollTop: { value: 0, writable: true },
+      scrollHeight: { value: 1_000, configurable: true },
+      clientHeight: { value: 500, configurable: true },
+    })
+
+    await fireEvent.scroll(transcript)
+
+    await waitFor(() => expect(load).toHaveBeenCalledWith('interaction-session'))
+  })
+
+  it('loads another page automatically when the latest history is too short to make a scrollbar', async () => {
+    const view = seed()
+    const load = vi.spyOn(store, 'loadOlderHistory').mockResolvedValue(true)
+    const { container } = render(ThreadView, { props: { sessionId: 'interaction-session' } })
+    const transcript = container.querySelector('.stream.scroll') as HTMLDivElement
+    Object.defineProperties(transcript, {
+      scrollTop: { value: 0, writable: true },
+      scrollHeight: { value: 320, configurable: true },
+      clientHeight: { value: 500, configurable: true },
+    })
+
+    // A completed latest-page render changes the tracked content without producing a scroll event.
+    view.items = [{
+      key: 'latest-page-item',
+      kind: 'assistant',
+      ts: '2026-07-31T00:00:01.000Z',
+      text: 'A short latest page.',
+      historical: true,
+    }]
+
+    await waitFor(() => expect(load).toHaveBeenCalledWith('interaction-session'))
+  })
+
+  it('makes only the pane header draggable so transcript and composer text remain selectable', () => {
+    seed()
+    const { container } = render(ThreadView, {
+      props: { sessionId: 'interaction-session', multiPane: true },
+    })
+    const header = container.querySelector('.head')
+    const textarea = container.querySelector('.composer textarea')
+    const transcript = container.querySelector('.stream.scroll')
+
+    expect(header?.getAttribute('draggable')).toBe('true')
+    expect(textarea?.closest('[draggable="true"]')).toBeNull()
+    expect(transcript?.closest('[draggable="true"]')).toBeNull()
+  })
+
+  it('queues and clears Enter during turn startup instead of attempting a premature steer', async () => {
+    const view = seed()
+    view.record.status = 'starting'
+    const { getByRole } = render(ThreadView, { props: { sessionId: 'interaction-session' } })
+    const composer = getByRole('textbox') as HTMLTextAreaElement
+
+    await fireEvent.input(composer, { target: { value: 'Follow this once startup settles.' } })
+    await fireEvent.keyDown(composer, { key: 'Enter' })
+
+    await waitFor(() => expect(store.queueFor('interaction-session')).toEqual([
+      'Follow this once startup settles.',
+    ]))
+    expect(apiMock.send).not.toHaveBeenCalled()
+    expect(composer.value).toBe('')
+  })
+})

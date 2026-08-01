@@ -5,7 +5,9 @@ import {
   loadCollapsedFolders,
   saveCollapsedFolders,
   loadQueues,
+  loadThreadSidePanel,
   saveQueues,
+  saveThreadSidePanel,
   type PersistedLayout,
 } from './uiState'
 
@@ -103,5 +105,18 @@ describe('queued-message persistence', () => {
     expect(loadQueues()).toEqual({
       s1: ['plain', { text: 'with file', attachments: [attachment] }],
     })
+  })
+})
+
+describe('thread side-panel persistence', () => {
+  it('keeps Browser and Agents mutually exclusive per chat and clears cleanly', () => {
+    saveThreadSidePanel('s1', 'browser')
+    expect(loadThreadSidePanel('s1')).toBe('browser')
+
+    saveThreadSidePanel('s1', 'agents')
+    expect(loadThreadSidePanel('s1')).toBe('agents')
+
+    saveThreadSidePanel('s1', null)
+    expect(loadThreadSidePanel('s1')).toBeNull()
   })
 })

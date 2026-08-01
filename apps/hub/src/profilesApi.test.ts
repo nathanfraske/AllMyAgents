@@ -13,12 +13,13 @@ afterEach(async () => {
   while (cleanups.length) await cleanups.pop()?.()
 })
 
-describe('GET /api/profiles contract', () => {
-  it('includes the ownership and authentication fields the account UI branches on', async () => {
+describe('profile account API contract', () => {
+  it('returns aliases and renames only the display layer while persisting and journaling it', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-profiles-api-'))
     const deviceToken = 'profiles-api-test-device-token-at-least-32-characters'
     const profile: Profile = {
       id: 'codex-expired',
+      displayName: 'Work Codex',
       provider: 'codex',
       dir: path.join(root, 'profile'),
       available: false,
@@ -28,6 +29,8 @@ describe('GET /api/profiles contract', () => {
       authError: 'test credential expired',
     }
     const sessionState = { profiles: new Map([[profile.id, profile]]) }
+    const profileNames: Record<string, string> = { [profile.id]: 'Work Codex' }
+    const append = vi.fn()
     const sessions = {
       list: () => [],
       listProfiles: SessionManager.prototype.listProfiles.bind(sessionState as never),
@@ -36,9 +39,10 @@ describe('GET /api/profiles contract', () => {
       port: 0,
       defaultCwd: root,
       profilesDir: root,
-      journal: {} as never,
+      journal: { append } as never,
       sessions: sessions as never,
       profiles: [profile],
+      profileNames,
       approvals: {} as never,
       questions: {} as never,
       usage: {} as never,
@@ -76,6 +80,7 @@ describe('GET /api/profiles contract', () => {
     expect(response.status).toBe(200)
     expect(await response.json()).toEqual([{
       id: 'codex-expired',
+      displayName: 'Work Codex',
       provider: 'codex',
       available: false,
       unavailableReason: 'owned by another test hub',
@@ -83,6 +88,33 @@ describe('GET /api/profiles contract', () => {
       authStatus: 'signed_out',
       authError: 'test credential expired',
     }])
+
+    const originalDir = profile.dir
+    const renamed = await fetch(
+      `http://127.0.0.1:${address.port}/api/profiles/codex-expired/name`,
+      {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${deviceToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ displayName: 'Personal research' }),
+      },
+    )
+
+    expect(renamed.status).toBe(200)
+    expect(await renamed.json()).toMatchObject({
+      id: 'codex-expired',
+      displayName: 'Personal research',
+    })
+    expect(profile).toMatchObject({ id: 'codex-expired', dir: originalDir, displayName: 'Personal research' })
+    expect(JSON.parse(fs.readFileSync(path.join(root, 'config.json'), 'utf8'))).toMatchObject({
+      profileNames: { 'codex-expired': 'Personal research' },
+    })
+    expect(append).toHaveBeenCalledWith(null, 'profiles/renamed', {
+      id: 'codex-expired',
+      displayName: 'Personal research',
+    })
   })
 })
 

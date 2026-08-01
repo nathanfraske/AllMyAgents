@@ -31,6 +31,7 @@
   import Icon from './Icon.svelte'
   import ManagerSetupModal, { type ManagerLaunchConfig } from './ManagerSetupModal.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
+  import { profileLabel, profileOptionLabel } from './profileLabel'
 
   let { onclose, onlaunched, tutorialStep }: {
     onclose: () => void
@@ -289,6 +290,11 @@
     }
   }
 
+  function accountName(profileId: string): string {
+    const profile = store.profiles.find((item) => item.id === profileId)
+    return profile ? profileLabel(profile) : profileId
+  }
+
   async function loadWslCapability(): Promise<void> {
     if (wslCapability || wslLoading) return
     wslLoading = true
@@ -454,7 +460,7 @@
   }
 
   function labelFor(agent: StartingAgent): string {
-    return `Agent ${agents.findIndex((item) => item.id === agent.id) + 1} · ${agent.profileId}`
+    return `Agent ${agents.findIndex((item) => item.id === agent.id) + 1} · ${accountName(agent.profileId)}`
   }
 
   function promptFor(agent: StartingAgent): string {
@@ -469,7 +475,7 @@
 
   function launchResult(): ProjectLaunchResult {
     const managerLabel = managerConfig
-      ? `Project manager · ${managerConfig.managerProfileId}`
+      ? `Project manager · ${accountName(managerConfig.managerProfileId)}`
       : 'Project manager'
     return {
       project: project!,
@@ -1107,7 +1113,7 @@
                     <span>Account {index + 1}</span>
                     <select aria-label={`Account ${index + 1}`} value={agent.profileId} onchange={(event) => changeProfile(agent, (event.target as HTMLSelectElement).value)}>
                       {#each store.profiles as profile (profile.id)}
-                        <option value={profile.id}>{profile.id} · {profile.provider}</option>
+                        <option value={profile.id}>{profileOptionLabel(profile)} · {profile.provider}</option>
                       {/each}
                     </select>
                   </label>
@@ -1191,7 +1197,7 @@
                 <div class="manager-review">
                   <Icon name="flag" size={16} />
                   <span>
-                    <b>Project manager · {managerConfig.managerProfileId}</b>
+                    <b>Project manager · {accountName(managerConfig.managerProfileId)}</b>
                     <small>
                       {managerConfig.agentTypes.length} child role{managerConfig.agentTypes.length === 1 ? '' : 's'} defined ·
                       {managerConfig.maxLiveChildren} live children · {managerConfig.permissionMode} permission
@@ -1210,7 +1216,7 @@
                   {#each agents as agent, index (agent.id)}
                     <div class="review-agent">
                       <ProviderLogo provider={store.profiles.find((item) => item.id === agent.profileId)?.provider ?? 'claude'} size={15} />
-                      <span><b>{index + 1}. {agent.profileId}</b><small>{agent.scope || agent.prompt}</small></span>
+                      <span><b>{index + 1}. {accountName(agent.profileId)}</b><small>{agent.scope || agent.prompt}</small></span>
                       <em class:ok={agent.status === 'started'} class:bad={agent.status === 'failed'}>
                         {agent.status === 'launching' ? 'Starting…' : agent.status === 'started' ? 'Started' : agent.status === 'failed' ? 'Did not start' : 'Ready'}
                       </em>
@@ -1241,7 +1247,7 @@
                     <li><span>{labelFor(agent)}</span><strong>{agent.error}</strong></li>
                   {/each}
                   {#if managerStatus === 'failed'}
-                    <li><span>Project manager · {managerConfig?.managerProfileId}</span><strong>{managerError}</strong></li>
+                    <li><span>Project manager · {managerConfig ? accountName(managerConfig.managerProfileId) : ''}</span><strong>{managerError}</strong></li>
                   {/if}
                 </ul>
                 <button class="primary" onclick={retryFailed}>Retry failed team member{failedCount === 1 ? '' : 's'}</button>

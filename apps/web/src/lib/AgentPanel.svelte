@@ -14,16 +14,26 @@
     items,
     sessionId,
     provider,
-  }: { items: ThreadItem[]; sessionId: string; provider: 'claude' | 'codex' } = $props()
+    open: controlledOpen,
+    onopen = () => {},
+    onclose = () => {},
+  }: {
+    items: ThreadItem[]
+    sessionId: string
+    provider: 'claude' | 'codex'
+    open?: boolean
+    onopen?: () => void
+    onclose?: () => void
+  } = $props()
 
-  // Popped-out state is remembered PER CHAT, so the panel is still open when you come back to this chat
-  // after a reload or a hub restart (the runs themselves rebuild from journal history).
-  // `open` is DERIVED from the id set + the current sessionId — a pane can be re-pointed at a different
-  // chat without remounting, and reading the set once at init would leave the panel showing the previous
-  // chat's state.
   let openIds = $state(new Set(loadOpenAgentPanels()))
-  const open = $derived(openIds.has(sessionId))
+  const open = $derived(controlledOpen ?? openIds.has(sessionId))
   function setOpen(v: boolean): void {
+    if (controlledOpen !== undefined) {
+      if (v) onopen()
+      else onclose()
+      return
+    }
     const next = new Set(openIds)
     if (v) next.add(sessionId)
     else next.delete(sessionId)

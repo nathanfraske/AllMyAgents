@@ -8,6 +8,8 @@ const loginMocks = vi.hoisted(() => ({
   loginStatus: vi.fn(),
   loginForProfile: vi.fn(),
   cancelLogin: vi.fn(() => Promise.resolve({ ok: true, status: 'settling' })),
+  rescanProfiles: vi.fn((): Promise<unknown> => Promise.resolve([])),
+  renameProfile: vi.fn(),
 }))
 
 vi.mock('./externalUrl', () => ({
@@ -27,6 +29,8 @@ vi.mock('./api', async (original) => {
         if (property === 'loginStatus') return loginMocks.loginStatus
         if (property === 'loginForProfile') return loginMocks.loginForProfile
         if (property === 'cancelLogin') return loginMocks.cancelLogin
+        if (property === 'rescanProfiles') return loginMocks.rescanProfiles
+        if (property === 'renameProfile') return loginMocks.renameProfile
         if (property === 'mesh') {
           return () => Promise.resolve({
             enabled: false,
@@ -53,6 +57,7 @@ vi.mock('./api', async (original) => {
 })
 
 afterEach(() => {
+  vi.useRealTimers()
   cleanup()
   store.profiles = []
   loginMocks.login.mockReset()
@@ -61,9 +66,38 @@ afterEach(() => {
   loginMocks.loginForProfile.mockReset()
   loginMocks.cancelLogin.mockReset()
   loginMocks.cancelLogin.mockResolvedValue({ ok: true, status: 'settling' })
+  loginMocks.rescanProfiles.mockReset()
+  loginMocks.rescanProfiles.mockResolvedValue([])
+  loginMocks.renameProfile.mockReset()
 })
 
 describe('tutorial account waiting integration', () => {
+  it('renames only the account display label and keeps the immutable id visible', async () => {
+    store.profiles = [
+      { id: 'claude-a', displayName: 'Old name', provider: 'claude', available: true, authStatus: 'signed_in' },
+    ]
+    loginMocks.renameProfile.mockResolvedValue({
+      id: 'claude-a',
+      displayName: 'Research Claude',
+      provider: 'claude',
+      available: true,
+      authStatus: 'signed_in',
+    })
+    render(SettingsModal, {
+      props: { onclose: () => {}, initialTab: 'accounts' },
+    })
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Rename Old name' }))
+    const input = screen.getByRole('textbox', { name: 'Account display name for claude-a' })
+    await fireEvent.input(input, { target: { value: 'Research Claude' } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Save account name' }))
+
+    expect(loginMocks.renameProfile).toHaveBeenCalledWith('claude-a', 'Research Claude')
+    expect(screen.getByText('Research Claude')).toBeTruthy()
+    expect(screen.getByText('ID: claude-a')).toBeTruthy()
+    expect(store.profiles[0]).toMatchObject({ id: 'claude-a', displayName: 'Research Claude' })
+  })
+
   it('offers a clickable re-authentication action before failure for every account', async () => {
     store.profiles = [
       { id: 'claude-signed-out', provider: 'claude', available: true, authStatus: 'signed_out' },
@@ -86,6 +120,7 @@ describe('tutorial account waiting integration', () => {
       'claude-signed-out',
       true,
       expect.any(String),
+      expect.anything(),
     )
   })
 
@@ -160,6 +195,69 @@ describe('tutorial account waiting integration', () => {
     expect(loginMocks.cancelLogin).toHaveBeenCalledWith('public-1')
 
     expect(await screen.findByText('Prior credential restored.', {}, { timeout: 2_000 })).toBeTruthy()
+  })
+
+  it('keeps the whole-attempt deadline active while cancellation is settling', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-07-31T12:00:00.000Z'))
+    loginMocks.login.mockResolvedValue({
+      ok: true,
+      loginId: 'public-cancel-timeout',
+      profileId: 'claude-cancel-timeout',
+      provider: 'claude',
+      status: 'capturing',
+    })
+    loginMocks.loginStatus.mockResolvedValue({
+      ok: true,
+      loginId: 'public-cancel-timeout',
+      profileId: 'claude-cancel-timeout',
+      provider: 'claude',
+      status: 'settling',
+    })
+    render(SettingsModal, {
+      props: {
+        onclose: () => {},
+        initialTab: 'accounts',
+      },
+    })
+    await fireEvent.input(screen.getByPlaceholderText('profile name (e.g. claude-work)'), {
+      target: { value: 'claude-cancel-timeout' },
+    })
+    await fireEvent.click(screen.getByRole('button', { name: 'Log in' }))
+    await fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+
+    vi.setSystemTime(new Date('2026-07-31T12:10:01.000Z'))
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    expect(
+      screen.getByText('Sign-in timed out and cancellation was requested. Retry when you are ready.'),
+    ).toBeTruthy()
+  })
+
+  it('finishes a durable login even when the bounded account refresh fails', async () => {
+    loginMocks.login.mockResolvedValue({
+      ok: true,
+      loginId: 'public-complete',
+      profileId: 'codex-bounded',
+      provider: 'codex',
+      status: 'complete',
+      added: 'codex-bounded',
+    })
+    loginMocks.rescanProfiles.mockResolvedValue({ error: 'request timed out' })
+    render(SettingsModal, {
+      props: {
+        onclose: () => {},
+        initialTab: 'accounts',
+      },
+    })
+    await fireEvent.input(screen.getByPlaceholderText('profile name (e.g. claude-work)'), {
+      target: { value: 'codex-bounded' },
+    })
+    await fireEvent.click(screen.getByRole('button', { name: 'Log in' }))
+
+    expect(
+      await screen.findByText('Added codex-bounded. The account list will refresh automatically.'),
+    ).toBeTruthy()
   })
 
   it('offers deliberate replay actions from Settings', async () => {

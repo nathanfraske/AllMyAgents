@@ -35,11 +35,16 @@ describe('narrow-pane layout contracts', () => {
     expect(thread).not.toMatch(/^\s*\.approval\s*\{/m)
   })
 
-  it('makes each existing pane a labelled drag source without changing the ghost animation path', () => {
-    expect(app).toMatch(/class="pane"[^>]*draggable="true"/)
-    expect(app).toMatch(/ondragstart=\{\(e\)\s*=>\s*startPaneDrag\(id,\s*e\)\}/)
+  it('limits pane dragging to its labelled header without changing the ghost animation path', () => {
+    expect(app).not.toMatch(/class="pane"[^>]*draggable=/)
+    expect(thread).toMatch(/class="head"[\s\S]{0,400}draggable=\{multiPane\}/)
+    expect(app).toMatch(/onpanedragstart=\{\(e\)\s*=>\s*startPaneDrag\(id,\s*e\)\}/)
     expect(app).toMatch(/\{#each row as id,\s*c \(id\)\}/)
     expect(app).toMatch(/Animate ONLY opacity \+ scale/)
     expect(app).not.toMatch(/ghostReveal[\s\S]{0,900}flex-grow:/)
+  })
+
+  it('keeps journal maintenance out of the full-width app banner lane', () => {
+    expect(app).not.toMatch(/class="journal-maintenance"/)
   })
 })

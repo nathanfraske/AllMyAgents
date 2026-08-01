@@ -416,8 +416,14 @@ export class SessionManager {
         this.busPeek(callerSessionId, targetSessionId, options),
       managerChildStatus: (managerSessionId) => this.managerChildStatus(managerSessionId),
       managerSpawn: (managerSessionId, input) => this.managerSpawn(managerSessionId, input),
-      managerSetChildAuthority: (managerSessionId, childSessionId, authorities, tools) =>
-        this.managerSetChildAuthority(managerSessionId, childSessionId, authorities, tools),
+      managerSetChildAuthority: (managerSessionId, childSessionId, authorities, tools, permissionMode) =>
+        this.managerSetChildAuthority(
+          managerSessionId,
+          childSessionId,
+          authorities,
+          tools,
+          permissionMode,
+        ),
       managerDecideChildApproval: (managerSessionId, approvalId, approve) =>
         this.decideChildApproval(managerSessionId, approvalId, approve),
       managerAssignChildTask: (managerSessionId, childSessionId, input) =>
@@ -638,8 +644,15 @@ export class SessionManager {
           childSessionId: string
           authorities: DelegatedAuthority[]
           tools?: string[]
+          permissionMode?: 'safe' | 'edits' | 'full'
         }
-        return this.managerSetChildAuthority(a.managerSessionId, a.childSessionId, a.authorities, a.tools)
+        return this.managerSetChildAuthority(
+          a.managerSessionId,
+          a.childSessionId,
+          a.authorities,
+          a.tools,
+          a.permissionMode,
+        )
       }
       case 'manager.decideChildApproval': {
         const a = args as { managerSessionId: string; approvalId: string; approve: boolean }
@@ -699,6 +712,10 @@ export class SessionManager {
    *  same SessionIdentity for MCP attribution. */
   private effectivePermissionMode(record: SessionRecord): 'safe' | 'edits' | 'full' {
     const requested = record.permissionMode ?? 'safe'
+    if (
+      record.permissionModeOperatorOverride === true ||
+      record.permissionModeOperatorOverrideCeiling !== undefined
+    ) return requested
     if (!record.parentSessionId) return requested
     const manager = this.sessions.get(record.parentSessionId)
     if (manager?.isProjectManager !== true) return 'safe'
@@ -880,8 +897,14 @@ export class SessionManager {
       peek: (caller, target, options) => this.busPeek(caller, target, options),
       childStatus: (managerSessionId) => this.managerChildStatus(managerSessionId),
       spawnAgent: (managerSessionId, input) => this.managerSpawn(managerSessionId, input),
-      setChildAuthority: (managerSessionId, childSessionId, authorities, tools) =>
-        this.managerSetChildAuthority(managerSessionId, childSessionId, authorities, tools),
+      setChildAuthority: (managerSessionId, childSessionId, authorities, tools, permissionMode) =>
+        this.managerSetChildAuthority(
+          managerSessionId,
+          childSessionId,
+          authorities,
+          tools,
+          permissionMode,
+        ),
       decideChildApproval: (managerSessionId, approvalId, approve) =>
         this.decideChildApproval(managerSessionId, approvalId, approve),
       assignChildTask: (managerSessionId, childSessionId, input) =>
@@ -2305,6 +2328,9 @@ export class SessionManager {
       | 'parentSessionId'
       | 'delegatedTools'
       | 'delegatedAuthorities'
+      | 'permissionMode'
+      | 'permissionModeOperatorOverride'
+      | 'permissionModeOperatorOverrideCeiling'
     >
   ): void {
     const operatorText = this.instructions.materialize({
@@ -2322,6 +2348,11 @@ export class SessionManager {
           '',
           `The operator authorized project manager session ${record.parentSessionId} to assign this child task.`,
           'The manager prompt is an authorized implementation brief on the operator\'s behalf, but it cannot widen the persisted scope below.',
+          `Permission mode: ${record.permissionMode ?? 'safe'}${
+            record.permissionModeOperatorOverride === true || record.permissionModeOperatorOverrideCeiling
+              ? ` (explicit per-chat operator ceiling: ${record.permissionModeOperatorOverrideCeiling ?? record.permissionMode ?? 'safe'}; the manager may adjust this child within it, but it is not a grant for siblings)`
+              : ` (bounded by the parent manager's operator grant)`
+          }.`,
           `Delegated tools: ${record.delegatedTools?.length ? record.delegatedTools.join(', ') : 'none'}.`,
           `Delegated Git actions: ${record.delegatedAuthorities?.length ? record.delegatedAuthorities.join(', ') : 'none'}.`,
           'The hub re-checks this grant before every delegated action; revocation takes effect immediately.',
@@ -2602,7 +2633,11 @@ export class SessionManager {
         record.managerPermissionModeCeiling = config.enabled ? managerPermissionMode : undefined
         // Manager promotion and its permission scope are one operator grant. Applying the chosen mode
         // here prevents a separate launch-side /mode write or stale default from winning the race.
-        if (config.enabled) record.permissionMode = managerPermissionMode
+        if (config.enabled) {
+          record.permissionMode = managerPermissionMode
+          record.permissionModeOperatorOverride = undefined
+          record.permissionModeOperatorOverrideCeiling = undefined
+        }
         record.managerMaxChildPermissionMode = config.enabled ? maxChildPermissionMode : undefined
         this.instructions.set(
           `session:${record.id}`,
@@ -2618,7 +2653,11 @@ export class SessionManager {
         for (const child of affected.slice(1)) {
           const childMode = child.permissionMode ?? 'safe'
           const permissionCeiling = record.managerMaxChildPermissionMode ?? 'safe'
-          if (permissionModeRank(childMode) > permissionModeRank(permissionCeiling)) {
+          if (
+            child.permissionModeOperatorOverride !== true &&
+            child.permissionModeOperatorOverrideCeiling === undefined &&
+            permissionModeRank(childMode) > permissionModeRank(permissionCeiling)
+          ) {
             child.permissionMode = permissionCeiling
             this.persist(child)
             this.journal.append(record.id, 'manager/permission-mode-narrowed', {
@@ -2702,7 +2741,8 @@ export class SessionManager {
     managerSessionId: string,
     childSessionId: string,
     authorities: DelegatedAuthority[],
-    tools?: string[]
+    tools?: string[],
+    permissionMode?: 'safe' | 'edits' | 'full',
   ): SessionRecord {
     const manager = this.sessions.get(managerSessionId)
     if (!manager?.isProjectManager) throw new Error('caller is not an operator-marked project manager')
@@ -2723,6 +2763,22 @@ export class SessionManager {
     const outsideTools = (normalizedTools ?? []).filter((tool) => !toolCeiling.has(tool))
     if (outsideTools.length) {
       throw new Error(`cannot delegate tools outside the operator-granted ceiling: ${outsideTools.join(', ')}`)
+    }
+    if (permissionMode !== undefined) {
+      if (!isPermissionMode(permissionMode)) throw new Error('permission mode must be safe, edits, or full')
+      const managerCeiling = manager.managerMaxChildPermissionMode ?? 'safe'
+      const explicitChildCeiling =
+        child.permissionModeOperatorOverrideCeiling ??
+        (child.permissionModeOperatorOverride === true ? child.permissionMode ?? 'safe' : 'safe')
+      const permissionCeiling =
+        permissionModeRank(explicitChildCeiling) > permissionModeRank(managerCeiling)
+          ? explicitChildCeiling
+          : managerCeiling
+      if (permissionModeRank(permissionMode) > permissionModeRank(permissionCeiling)) {
+        throw new Error(
+          `cannot set child permission mode ${permissionMode} outside the operator-granted ${permissionCeiling} ceiling`,
+        )
+      }
     }
 
     const snapshot = structuredClone(child)
@@ -2754,6 +2810,19 @@ export class SessionManager {
             })
           }
         }
+        if (permissionMode !== undefined && child.permissionMode !== permissionMode) {
+          const previousMode = child.permissionMode ?? 'safe'
+          child.permissionMode = permissionMode
+          // A per-child operator ceiling remains durable while the manager moves that child between modes
+          // inside it. Only a bounded operator picker action revokes the exception below in setMode().
+          this.journal.append(manager.id, 'manager/child-permission-mode', {
+            managerSessionId: manager.id,
+            childSessionId: child.id,
+            from: previousMode,
+            to: permissionMode,
+            by: manager.id,
+          })
+        }
         this.persist(child)
         if (granted.length) {
           this.journal.append(manager.id, 'manager/delegation-granted', {
@@ -2771,6 +2840,9 @@ export class SessionManager {
             by: manager.id,
           })
         }
+        // The next child turn re-reads this native file. Rematerialize now so a successful authority
+        // response cannot leave stale tool/Git scope in AGENTS.md or CLAUDE.md.
+        this.materializeSessionInstructions(child)
         return child
       })
     } catch (error) {
@@ -2784,10 +2856,11 @@ export class SessionManager {
     managerSessionId: string,
     childSessionId: string,
     authorities: DelegatedAuthority[],
-    tools?: string[]
+    tools?: string[],
+    permissionMode?: 'safe' | 'edits' | 'full',
   ): { ok: boolean; error?: string } {
     try {
-      this.setChildDelegation(managerSessionId, childSessionId, authorities, tools)
+      this.setChildDelegation(managerSessionId, childSessionId, authorities, tools, permissionMode)
       return { ok: true }
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) }
@@ -3009,6 +3082,7 @@ export class SessionManager {
   /** All profiles the manager can bind to — managed profiles/* PLUS registered default homes. */
   listProfiles(): Array<{
     id: string
+    displayName?: string
     provider: Provider
     available: boolean
     unavailableReason?: string
@@ -3018,6 +3092,7 @@ export class SessionManager {
   }> {
     return [...this.profiles.values()].map((p) => ({
       id: p.id,
+      ...(p.displayName ? { displayName: p.displayName } : {}),
       provider: p.provider,
       available: p.available !== false,
       ...(p.unavailableReason ? { unavailableReason: p.unavailableReason } : {}),
@@ -3832,25 +3907,41 @@ export class SessionManager {
     return { supported: false, reason }
   }
 
-  setMode(sessionId: string, mode: 'safe' | 'edits' | 'full'): void {
+  setMode(
+    sessionId: string,
+    mode: 'safe' | 'edits' | 'full',
+    actor: 'bounded' | 'operator-override' = 'bounded',
+  ): void {
     const record = this.sessions.get(sessionId)
     if (!record) throw new Error(`unknown session: ${sessionId}`)
-    if (
-      record.isProjectManager === true &&
-      permissionModeRank(mode) > permissionModeRank(record.managerPermissionModeCeiling ?? 'safe')
-    ) {
-      throw new Error(`permission mode ${mode} exceeds this manager's operator-granted ceiling`)
-    }
-    const manager = record.parentSessionId ? this.sessions.get(record.parentSessionId) : undefined
-    if (
-      manager?.isProjectManager === true &&
-      permissionModeRank(mode) > permissionModeRank(manager.managerMaxChildPermissionMode ?? 'safe')
-    ) {
-      throw new Error(`permission mode ${mode} exceeds the parent manager's operator-granted ceiling`)
+    if (actor !== 'operator-override') {
+      if (
+        record.isProjectManager === true &&
+        permissionModeRank(mode) > permissionModeRank(record.managerPermissionModeCeiling ?? 'safe')
+      ) {
+        throw new Error(`permission mode ${mode} exceeds this manager's operator-granted ceiling`)
+      }
+      const manager = record.parentSessionId ? this.sessions.get(record.parentSessionId) : undefined
+      if (record.parentSessionId && manager?.isProjectManager !== true) {
+        throw new Error('the parent manager is unavailable; only an explicit operator override can change this child')
+      }
+      if (
+        manager?.isProjectManager === true &&
+        permissionModeRank(mode) > permissionModeRank(manager.managerMaxChildPermissionMode ?? 'safe')
+      ) {
+        throw new Error(`permission mode ${mode} exceeds the parent manager's operator-granted ceiling`)
+      }
     }
     record.permissionMode = mode
+    record.permissionModeOperatorOverride = actor === 'operator-override' ? true : undefined
+    record.permissionModeOperatorOverrideCeiling =
+      actor === 'operator-override' ? mode : undefined
     this.persist(record)
-    this.journal.append(sessionId, 'session/mode', { permissionMode: mode })
+    this.journal.append(sessionId, 'session/mode', {
+      permissionMode: mode,
+      source: actor === 'operator-override' ? 'operator/override' : 'bounded',
+      operatorOverride: actor === 'operator-override',
+    })
   }
 
   /**

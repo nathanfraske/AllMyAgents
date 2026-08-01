@@ -612,7 +612,13 @@ function ensureRealDirectory(parent: string, directory: string): void {
     throw new Error(`recovery path is not a real directory: ${directory}`)
   }
   const directoryReal = fs.realpathSync.native(directory)
-  if (path.dirname(directoryReal) !== parentReal) {
+  const relative = path.relative(parentReal, directoryReal)
+  if (
+    relative === '' ||
+    relative === '..' ||
+    relative.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relative)
+  ) {
     throw new Error(`recovery directory escaped its expected parent: ${directory}`)
   }
 }
@@ -1806,8 +1812,17 @@ function rotateRecoveryGenerations(
     )
   }
   for (const generation of generations.slice(keep)) {
-    fs.rmSync(generation.directory, { recursive: true })
-    syncDirectory(path.dirname(generation.directory))
+    try {
+      fs.rmSync(generation.directory, { recursive: true })
+      syncDirectory(path.dirname(generation.directory))
+    } catch (error) {
+      // A bounded maintenance reader may still have a legacy WAL-mode snapshot's zero-byte sidecar
+      // mapped on Windows. The newly published generation is already verified and authoritative; defer
+      // oldest-first retention to the next snapshot instead of falsely degrading that publication.
+      // Quotas still fail closed before a later publication can exceed the evidence bound.
+      if (code(error) === 'EBUSY' || code(error) === 'EPERM') break
+      throw error
+    }
   }
 }
 
@@ -2001,6 +2016,388 @@ export class JournalRecoveryLease {
       this.db = undefined
       this.openedIdentity = undefined
     }
+  }
+}
+
+export type KnownGoodJournalInspection = {
+  journalPath: string
+  sha256: string
+  schemaVersion: number
+  eventCount: string
+  maxSeq: string
+  eventHighWater: string
+}
+
+type KnownGoodAcceptanceIntent = {
+  format: typeof FORMAT
+  operationId: string
+  sourceSha256: string
+  rootId: string
+  journalId: string
+  reason: string
+  archiveDirectory: string
+  createdAt: string
+}
+
+function knownGoodAcceptanceIntentFile(dataDir: string): string {
+  return path.join(path.resolve(dataDir), 'journal-recovery-known-good-acceptance.json')
+}
+
+function inspectKnownGoodCandidate(
+  journalPath: string,
+  maxSchemaVersion: number
+): KnownGoodJournalInspection {
+  assertRegular(journalPath)
+  let db: Database.Database | undefined
+  try {
+    db = new Database(journalPath, { fileMustExist: true })
+    db.pragma('busy_timeout = 0')
+    // The operator command holds the recovery lease exclusively. Fold an otherwise healthy WAL into the
+    // main file so the confirmation digest names the complete accepted family, not just one member.
+    db.pragma('wal_checkpoint(TRUNCATE)')
+    const schemaVersion = safeInteger(
+      db.pragma('user_version', { simple: true }),
+      'journal schema version'
+    )
+    if (schemaVersion > maxSchemaVersion) {
+      throw new Error(
+        `journal schema v${schemaVersion} is newer than supported v${maxSchemaVersion}`
+      )
+    }
+    const integrity = (db.pragma('integrity_check') as Array<Record<string, unknown>>).flatMap(
+      (row) => Object.values(row).map(String)
+    )
+    if (integrity.length !== 1 || integrity[0]?.toLowerCase() !== 'ok') {
+      throw new Error(`journal failed integrity_check: ${integrity.join('; ') || 'no result'}`)
+    }
+    const invalidPayload = db
+      .prepare('SELECT seq FROM events WHERE json_valid(payload) = 0 ORDER BY seq LIMIT 1')
+      .get() as { seq?: unknown } | undefined
+    if (invalidPayload) {
+      throw new Error(`journal contains invalid event JSON at seq ${String(invalidPayload.seq)}`)
+    }
+    const counts = db
+      .prepare(
+        `SELECT CAST(COUNT(*) AS TEXT) AS eventCount,
+                CAST(COALESCE(MAX(seq), 0) AS TEXT) AS maxSeq,
+                CAST(COALESCE(
+                  (SELECT seq FROM sqlite_sequence WHERE name = 'events'),
+                  0
+                ) AS TEXT) AS eventHighWater
+         FROM events`
+      )
+      .get() as Record<string, unknown> | undefined
+    const eventCount = decimal(counts?.eventCount, 'journal event count')
+    const maxSeq = decimal(counts?.maxSeq, 'journal max sequence')
+    const eventHighWater = decimal(counts?.eventHighWater, 'journal event high-water')
+    if (BigInt(eventHighWater) < BigInt(maxSeq)) {
+      throw new Error('journal event high-water is below an existing event sequence')
+    }
+    db.close()
+    db = undefined
+    return {
+      journalPath,
+      sha256: sha256File(journalPath),
+      schemaVersion,
+      eventCount,
+      maxSeq,
+      eventHighWater,
+    }
+  } finally {
+    db?.close()
+  }
+}
+
+/**
+ * Read-only in logical content (SQLite may checkpoint a WAL) and deliberately available while the normal
+ * hub is offline. The returned digest is the confirmation token required by acceptKnownGoodJournal.
+ */
+export function inspectKnownGoodJournal(options: {
+  dataDir: string
+  journalPath: string
+  maxSchemaVersion: number
+}): KnownGoodJournalInspection {
+  const dataDir = path.resolve(options.dataDir)
+  const journalPath = path.resolve(options.journalPath)
+  if (path.dirname(journalPath) !== dataDir || path.basename(journalPath) !== 'hub.db') {
+    throw new Error('known-good inspection requires the exact data-root hub.db path')
+  }
+  const lease = new JournalRecoveryLease(dataDir)
+  lease.acquireShared()
+  try {
+    lease.acquireExclusive()
+    lease.assertExclusiveAuthority()
+    return inspectKnownGoodCandidate(journalPath, options.maxSchemaVersion)
+  } finally {
+    lease.release()
+  }
+}
+
+function parseKnownGoodAcceptanceIntent(file: string, dataDir: string): KnownGoodAcceptanceIntent {
+  const raw = object(readJson(file))
+  if (
+    !raw ||
+    raw.format !== FORMAT ||
+    typeof raw.operationId !== 'string' ||
+    !SAFE_UUID.test(raw.operationId) ||
+    typeof raw.sourceSha256 !== 'string' ||
+    !SHA256.test(raw.sourceSha256) ||
+    typeof raw.rootId !== 'string' ||
+    !SAFE_UUID.test(raw.rootId) ||
+    typeof raw.journalId !== 'string' ||
+    !SAFE_UUID.test(raw.journalId) ||
+    typeof raw.reason !== 'string' ||
+    !raw.reason ||
+    raw.reason.length > 512 ||
+    typeof raw.archiveDirectory !== 'string' ||
+    typeof raw.createdAt !== 'string'
+  ) {
+    throw new Error('known-good acceptance intent is malformed')
+  }
+  timestamp(raw.createdAt, 'known-good acceptance creation time')
+  const archiveDirectory = path.resolve(raw.archiveDirectory)
+  if (
+    path.dirname(archiveDirectory) !== dataDir ||
+    !path.basename(archiveDirectory).startsWith('journal-recovery-operator-archive-')
+  ) {
+    throw new Error('known-good acceptance archive escaped the data root')
+  }
+  return { ...(raw as KnownGoodAcceptanceIntent), archiveDirectory }
+}
+
+function knownGoodDatabaseAcceptanceApplied(
+  journalPath: string,
+  intent: KnownGoodAcceptanceIntent
+): boolean {
+  let db: Database.Database | undefined
+  try {
+    db = new Database(journalPath, { readonly: true, fileMustExist: true })
+    const identityTable = (
+      db
+        .prepare(
+          `SELECT COUNT(*) AS count FROM sqlite_master
+           WHERE type = 'table' AND name = 'journal_recovery_identity'`
+        )
+        .get() as { count?: unknown }
+    ).count
+    if (identityTable !== 1 || readJournalIdentity(db) !== intent.journalId) return false
+    const events = db
+      .prepare(
+        `SELECT payload FROM events
+         WHERE kind = 'journal/operator-known-good-accepted'
+         ORDER BY seq DESC LIMIT 16`
+      )
+      .all() as Array<{ payload?: unknown }>
+    return events.some((row) => {
+      try {
+        return object(JSON.parse(String(row.payload)))?.operationId === intent.operationId
+      } catch {
+        return false
+      }
+    })
+  } catch {
+    return false
+  } finally {
+    db?.close()
+  }
+}
+
+/**
+ * Explicit operator override for a healthy journal that predates identity-bound recovery metadata.
+ * Existing recovery metadata is moved to a sibling evidence archive, never deleted. The current journal
+ * is fully integrity/payload checked, its exact digest must match the operator's confirmation, and the
+ * acceptance decision is appended to the journal in the same transaction that installs its new identity.
+ */
+export function acceptKnownGoodJournal(options: {
+  dataDir: string
+  journalPath: string
+  maxSchemaVersion: number
+  confirmSha256: string
+  reason: string
+  /** Crash-boundary injection for durability tests. */
+  failpoint?: (edge: string) => void
+}): KnownGoodJournalInspection & { operationId: string; archiveDirectory: string } {
+  const dataDir = path.resolve(options.dataDir)
+  const journalPath = path.resolve(options.journalPath)
+  if (path.dirname(journalPath) !== dataDir || path.basename(journalPath) !== 'hub.db') {
+    throw new Error('known-good acceptance requires the exact data-root hub.db path')
+  }
+  const confirmSha256 = options.confirmSha256.trim().toLowerCase()
+  if (!SHA256.test(confirmSha256)) throw new Error('known-good confirmation SHA-256 is malformed')
+  const reason = options.reason.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 512)
+  if (!reason) throw new Error('known-good acceptance requires an operator reason')
+
+  const lease = new JournalRecoveryLease(dataDir)
+  lease.acquireShared()
+  try {
+    lease.acquireExclusive()
+    lease.assertExclusiveAuthority()
+    const paths = ensureRecoveryRoot(dataDir)
+    const intentFile = knownGoodAcceptanceIntentFile(dataDir)
+    let intent: KnownGoodAcceptanceIntent
+    let inspection = inspectKnownGoodCandidate(journalPath, options.maxSchemaVersion)
+    let databaseApplied = false
+    const priorIntentState = lstatState(intentFile)
+    if (priorIntentState.state === 'present') {
+      intent = parseKnownGoodAcceptanceIntent(intentFile, dataDir)
+      if (intent.sourceSha256 !== confirmSha256 || intent.reason !== reason) {
+        throw new Error(
+          'unfinished known-good acceptance requires its original SHA-256 confirmation and reason'
+        )
+      }
+      databaseApplied = knownGoodDatabaseAcceptanceApplied(journalPath, intent)
+      if (!databaseApplied && inspection.sha256 !== confirmSha256) {
+        throw new Error('journal changed after the known-good acceptance intent was recorded')
+      }
+    } else {
+      if (inspection.sha256 !== confirmSha256) {
+        throw new Error(
+          `known-good confirmation mismatch: journal is ${inspection.sha256}, not ${confirmSha256}`
+        )
+      }
+      const operationId = crypto.randomUUID()
+      intent = {
+        format: FORMAT,
+        operationId,
+        sourceSha256: inspection.sha256,
+        rootId: crypto.randomUUID(),
+        journalId: crypto.randomUUID(),
+        reason,
+        archiveDirectory: path.join(
+          dataDir,
+          `journal-recovery-operator-archive-${new Date().toISOString().replace(/[:.]/g, '-')}-${operationId}`
+        ),
+        createdAt: new Date().toISOString(),
+      }
+      writeJsonExclusive(intentFile, intent)
+    }
+    const { operationId, archiveDirectory } = intent
+    if (databaseApplied && lstatState(paths.rootBinding).state === 'present') {
+      const binding = parseRootBinding(paths.rootBinding)
+      if (binding.rootId !== intent.rootId || binding.activeJournalId !== intent.journalId) {
+        throw new Error('known-good acceptance root binding conflicts with its durable intent')
+      }
+      ensureRecoveryOperationDirectories(dataDir)
+      fs.rmSync(intentFile)
+      syncDirectory(dataDir)
+      const accepted = inspectDatabase(journalPath, options.maxSchemaVersion)
+      return {
+        ...inspection,
+        sha256: intent.sourceSha256,
+        schemaVersion: accepted.schemaVersion,
+        eventCount: accepted.eventCount,
+        maxSeq: accepted.maxSeq,
+        eventHighWater: accepted.eventHighWater,
+        operationId,
+        archiveDirectory,
+      }
+    }
+    if (lstatState(archiveDirectory).state === 'missing') fs.mkdirSync(archiveDirectory)
+    syncDirectory(dataDir)
+
+    const preservedInPlace = new Set(['.ama-directory-barrier', path.basename(paths.leaseDb)])
+    for (const entry of fs.readdirSync(paths.root)) {
+      if (preservedInPlace.has(entry)) continue
+      const source = path.join(paths.root, entry)
+      const target = path.join(archiveDirectory, entry)
+      if (lstatState(target).state === 'present') {
+        throw new Error(`known-good recovery archive contains a conflicting live entry: ${target}`)
+      }
+      fs.renameSync(source, target)
+      // A crash can land between any two evidence moves. Flush each completed boundary so resume can
+      // trust the directories it actually observes, then rebuild the manifest from that durable archive
+      // rather than from this process's incomplete in-memory list.
+      syncDirectory(paths.root)
+      syncDirectory(archiveDirectory)
+      options.failpoint?.(`after-known-good-archive-${entry}`)
+    }
+    const archiveManifest = path.join(archiveDirectory, 'operator-acceptance.json')
+    if (lstatState(archiveManifest).state === 'missing') {
+      const archivedEntries = fs
+        .readdirSync(archiveDirectory)
+        .filter(
+          (entry) =>
+            entry !== path.basename(archiveManifest) &&
+            entry !== '.ama-directory-barrier',
+        )
+        .sort()
+      writeJsonExclusive(archiveManifest, { ...intent, archivedEntries })
+    }
+    syncDirectory(paths.root)
+    syncDirectory(archiveDirectory)
+
+    if (!knownGoodDatabaseAcceptanceApplied(journalPath, intent)) {
+      let db: Database.Database | undefined
+      try {
+        db = new Database(journalPath, { fileMustExist: true })
+        db.pragma('busy_timeout = 0')
+        const transaction = db.transaction(() => {
+          db!.exec(`
+            DROP TABLE IF EXISTS journal_recovery_identity;
+            CREATE TABLE journal_recovery_identity (
+              singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+              journal_id TEXT NOT NULL UNIQUE
+            );
+          `)
+          db!
+            .prepare(
+              'INSERT INTO journal_recovery_identity (singleton, journal_id) VALUES (1, ?)'
+            )
+            .run(intent.journalId)
+          db!
+            .prepare('INSERT INTO events (ts, session, kind, payload) VALUES (?, NULL, ?, ?)')
+            .run(
+              new Date().toISOString(),
+              'journal/operator-known-good-accepted',
+              JSON.stringify({
+                operationId,
+                sourceSha256: intent.sourceSha256,
+                reason,
+                archiveDirectory,
+              })
+            )
+        })
+        transaction()
+      } finally {
+        db?.close()
+      }
+    }
+
+    const ownership = assertRegular(paths.leaseDb, true)
+    const expectedBinding = {
+      format: FORMAT,
+      rootId: intent.rootId,
+      activeJournalId: intent.journalId,
+      nextGeneration: '1',
+      ownershipDatabase: {
+        dev: ownership.dev.toString(),
+        ino: ownership.ino.toString(),
+      },
+    } satisfies RootBinding
+    if (lstatState(paths.rootBinding).state === 'missing') {
+      writeJsonExclusive(paths.rootBinding, expectedBinding)
+    } else {
+      const actualBinding = parseRootBinding(paths.rootBinding)
+      if (JSON.stringify(actualBinding) !== JSON.stringify(expectedBinding)) {
+        throw new Error('known-good acceptance root binding conflicts with its durable intent')
+      }
+    }
+    ensureRecoveryOperationDirectories(dataDir)
+    fs.rmSync(intentFile)
+    syncDirectory(dataDir)
+    const accepted = inspectDatabase(journalPath, options.maxSchemaVersion)
+    inspection = { ...inspection, sha256: intent.sourceSha256 }
+    return {
+      ...inspection,
+      schemaVersion: accepted.schemaVersion,
+      eventCount: accepted.eventCount,
+      maxSeq: accepted.maxSeq,
+      eventHighWater: accepted.eventHighWater,
+      operationId,
+      archiveDirectory,
+    }
+  } finally {
+    lease.release()
   }
 }
 
@@ -2824,6 +3221,37 @@ function preparePlan(
   return plan
 }
 
+function cleanupUnpublishedRecoveryPreparation(
+  paths: RecoveryPaths,
+  operationId: string,
+  classifierDir: string
+): void {
+  // A durable active plan owns its staging artifacts and must always be resumed. Without that boundary,
+  // these are disposable derived copies; leaving them behind changes the next boot's classification from
+  // the original journal-family failure to an unrelated "incomplete recovery" failure.
+  if (lstatState(paths.activePlan).state === 'present') return
+  if (
+    path.dirname(classifierDir) !== paths.staging ||
+    path.basename(classifierDir) !== `.classifier-${operationId}`
+  ) {
+    throw new Error('refusing to clean an out-of-scope recovery classifier directory')
+  }
+  for (const file of [
+    path.join(paths.staging, `${operationId}.db.partial`),
+    path.join(paths.staging, `${operationId}.db`),
+  ]) {
+    if (lstatState(file).state === 'present') fs.rmSync(file, { force: true })
+  }
+  const classifierState = lstatState(classifierDir)
+  if (classifierState.state === 'present') {
+    if (!classifierState.stat.isDirectory() || classifierState.stat.isSymbolicLink()) {
+      throw new Error('refusing to clean a non-directory recovery classifier path')
+    }
+    fs.rmSync(classifierDir, { recursive: true, force: true })
+  }
+  syncDirectory(paths.staging)
+}
+
 export function bootstrapJournalRecovery(options: {
   dataDir: string
   journalPath: string
@@ -3075,6 +3503,17 @@ export function bootstrapJournalRecovery(options: {
         preflight.failure.recoveryCause === 'orphan-family')
     ) {
       const eligibleFailure = preflight.failure
+      let preparationFailpointThrew = false
+      const preparationFailpoint = options.failpoint
+        ? (edge: string): void => {
+            try {
+              options.failpoint?.(edge)
+            } catch (error) {
+              preparationFailpointThrew = true
+              throw error
+            }
+          }
+        : undefined
       try {
         const plan = preparePlan(
           dataDir,
@@ -3082,7 +3521,7 @@ export function bootstrapJournalRecovery(options: {
           eligibleFailure,
           classifierOperationId,
           capturedFamily,
-          options.failpoint
+          preparationFailpoint
         )
         options.failpoint?.('after-plan-publication-before-classifier-cleanup')
         fs.rmSync(classifierDir, { recursive: true, force: true })
@@ -3099,6 +3538,19 @@ export function bootstrapJournalRecovery(options: {
         // the published bytes can be opened, not authority to start serving.
         preflight = runHubPreflight({ dataDir, journalPath, schemaVersion: options.schemaVersion })
       } catch (error) {
+        if (!preparationFailpointThrew && lstatState(paths.activePlan).state === 'missing') {
+          try {
+            cleanupUnpublishedRecoveryPreparation(paths, classifierOperationId, classifierDir)
+          } catch (cleanupError) {
+            throw new JournalRecoveryBootstrapError(
+              eligibleFailure,
+              new AggregateError(
+                [error, cleanupError],
+                'recovery preparation failed and its unpublished staging debris could not be removed'
+              )
+            )
+          }
+        }
         throw new JournalRecoveryBootstrapError(eligibleFailure, error)
       }
     } else {

@@ -739,7 +739,7 @@ async function restart(reason: string): Promise<void> {
     green.restored = ready.restored
     log(`green ready on :${green.port} — ${green.restored} session(s) restored; health-checking`)
     await healthCheck(green.port, { expectRestored: blue.restored })
-    log('green health-check passed — flipping 7777')
+    log(`green health-check passed — flipping ${FIXED_PORT}`)
 
     await journalBackupOwnership.pauseBlueBeforeDrain(blue.child)
     log('blue journal backups paused — current generation settled')
@@ -751,7 +751,7 @@ async function restart(reason: string): Promise<void> {
       HUB_DRAIN_RELEASE_TIMEOUT_MS
     )
     log(
-      `blue drained — 7777 released (question turns settled=${released.questionTurns.settled}, outcome-unknown=${released.questionTurns.outcomeUnknown}; login attempts settled=${released.loginAttempts.settled}, outcome-unknown=${released.loginAttempts.outcomeUnknown})`
+      `blue drained — ${FIXED_PORT} released (question turns settled=${released.questionTurns.settled}, outcome-unknown=${released.questionTurns.outcomeUnknown}; login attempts settled=${released.loginAttempts.settled}, outcome-unknown=${released.loginAttempts.outcomeUnknown})`
     )
 
     // From this point the public bind is ambiguous until green exits: it can bind successfully and lose

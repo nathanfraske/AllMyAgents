@@ -6,6 +6,8 @@
   import DeleteProjectDialog from './DeleteProjectDialog.svelte'
   import TaskStrip from './TaskStrip.svelte'
   import ThreadView from './ThreadView.svelte'
+  import ProjectSettingsModal from './ProjectSettingsModal.svelte'
+  import { profileLabel } from './profileLabel'
   import { agentActivity } from './toolBlurb'
   import {
     loadProjectViewMode,
@@ -24,18 +26,29 @@
   let peekOpen = $state(true)
   let modeProjectId = $state('')
   let deleteDialogOpen = $state(false)
+  let projectSettingsOpen = $state(false)
 
   $effect.pre(() => {
-    if (modeProjectId === projectId) return
-    modeProjectId = projectId
-    selectedMode = loadProjectViewMode(projectId)
-    peekOpen = loadProjectTranscriptPeek(projectId)
+    const navigationMode = store.projectViewId === projectId ? store.projectViewMode : null
+    if (modeProjectId !== projectId) {
+      modeProjectId = projectId
+      selectedMode = navigationMode ?? loadProjectViewMode(projectId)
+      peekOpen = loadProjectTranscriptPeek(projectId)
+      return
+    }
+    // Opening a manager row while this same project overview is already mounted must still switch to
+    // the full chat. The store owns that navigation intent; local view toggles update it below.
+    if (navigationMode && navigationMode !== selectedMode) selectedMode = navigationMode
   })
 
   const project = $derived(store.projects.find((candidate) => candidate.id === projectId))
   const projectSessions = $derived(
     store.sessionList.filter((view) => view.record.projectId === projectId),
   )
+  function accountName(profileId: string): string {
+    const profile = store.profiles.find((candidate) => candidate.id === profileId)
+    return profile ? profileLabel(profile) : profileId
+  }
   const manager = $derived(
     projectSessions.find((view) => view.record.isProjectManager),
   )
@@ -46,8 +59,16 @@
 
   function selectMode(next: ProjectViewMode): void {
     selectedMode = next
+    store.projectViewMode = next
     saveProjectViewMode(projectId, next)
   }
+
+  // A full manager conversation is a normal chat surface and must hydrate through the same bounded,
+  // lazy history path as store.select(). The overview's four-item activity peek remains intentionally
+  // cheap; entering Manager mode makes the lossless transcript available without a second click.
+  $effect(() => {
+    if (mode === 'manager' && manager) void store.ensureHistory(manager.record.id)
+  })
 
   function toggleTranscriptPeek(): void {
     peekOpen = !peekOpen
@@ -348,6 +369,7 @@
           {#if statusCounts.failed}<span class="failed">{statusCounts.failed} failed</span>{/if}
         </div>
         {#if !project.siteId}
+          <button class="edit-project" onclick={() => (projectSettingsOpen = true)}>Edit project &amp; manager…</button>
           <button class="delete-project" onclick={() => (deleteDialogOpen = true)}>Delete project…</button>
         {/if}
       </div>
@@ -444,7 +466,7 @@
                       {#if agentRole(view)}
                         <span>{agentRole(view)}</span><span aria-hidden="true">·</span>
                       {/if}
-                      <span>{view.record.model || view.record.profileId}</span>
+                      <span>{view.record.model || accountName(view.record.profileId)}</span>
                     </span>
                   </span>
                   <span class="state {status}"><span class="dot"></span>{statusLabel(status)}</span>
@@ -544,6 +566,10 @@
   {/if}
 </section>
 
+{#if projectSettingsOpen}
+  <ProjectSettingsModal projectId={projectId} onclose={() => (projectSettingsOpen = false)} />
+{/if}
+
 {#if project && deleteDialogOpen}
   <DeleteProjectDialog
     {project}
@@ -571,8 +597,9 @@
   .summary { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: .4rem; color: var(--muted);
     font-size: var(--text-xs); }
   .head-actions { display: flex; flex-direction: column; align-items: flex-end; gap: .55rem; }
-  .delete-project { color: var(--dim); font-size: var(--text-2xs); text-decoration: underline;
+  .edit-project, .delete-project { color: var(--dim); font-size: var(--text-2xs); text-decoration: underline;
     text-underline-offset: .18rem; }
+  .edit-project:hover { color: var(--accent); }
   .delete-project:hover { color: var(--bad-text); }
   .view-toggle { display: grid; grid-template-columns: 1fr 1fr; padding: 3px; border: 1px solid var(--border);
     border-radius: var(--r-lg); background: var(--surface-2); box-shadow: var(--edge-hi); }
