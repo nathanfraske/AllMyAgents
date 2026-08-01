@@ -112,27 +112,12 @@ class ClaudeInputStream implements AsyncIterable<SDKUserMessage> {
   private readonly waiting: Array<(result: IteratorResult<SDKUserMessage>) => void> = []
   private inFlight: { resolve(): void; reject(error: Error): void } | undefined
   private closed = false
-  /**
-   * Number of user messages accepted by this stream, including the initial prompt and queued steering.
-   * Claude emits one top-level `result` for each message that actually runs. Keeping this count here is
-   * what lets the driver distinguish "the original prompt completed, but a steer is already queued" from
-   * "the whole query is complete".
-   *
-   * Before this existed, the first result unconditionally closed stdin. A priority-next steer could already
-   * be running by then, so Claude continued the second turn with its permission/control channel severed and
-   * every gated tool failed with `Tool permission request failed: AbortError: Stream closed` until the user
-   * started another turn. The live journal captured exactly that ordering: session/steered, result #1, then
-   * five permission-stream failures, then result #2.
-   */
-  private acceptedMessages = 1
-
   constructor(initial: SDKUserMessage) {
     this.queued.push({ message: initial })
   }
 
   push(message: SDKUserMessage): Promise<void> {
     if (this.closed) return Promise.reject(new Error('Claude input stream is closed'))
-    this.acceptedMessages += 1
     return new Promise<void>((resolve, reject) => {
       const accepted = { resolve, reject }
       const waiter = this.waiting.shift()
@@ -143,11 +128,6 @@ class ClaudeInputStream implements AsyncIterable<SDKUserMessage> {
         this.queued.push({ message, accepted })
       }
     })
-  }
-
-  /** True while at least one accepted prompt/steer has not produced its corresponding top-level result. */
-  hasUncompletedMessage(completedResults: number): boolean {
-    return this.acceptedMessages > completedResults
   }
 
   close(): void {
@@ -188,6 +168,15 @@ class ClaudeInputStream implements AsyncIterable<SDKUserMessage> {
     }
   }
 }
+
+/**
+ * A priority-next steer that has already crossed stdin can start its next SDK run just after the preceding
+ * result. Give that local hand-off a short window to emit its next `system/init`; otherwise close stdin and
+ * let the query settle. This is deliberately a quiet-boundary timer, not a message/result counter: the real
+ * Claude SDK coalesces multiple accepted steers into one result, so counting one result per input wedges the
+ * query open forever. One second is generous for a local stream event and still bounds a completed turn.
+ */
+const RESULT_QUIESCENCE_MS = 1_000
 
 export class ClaudeDriver {
   private vendorSessionId: string | undefined
@@ -304,13 +293,24 @@ export class ClaudeDriver {
     const q = query({ prompt: input, options: options as never })
     this.active = { query: q, input }
     let completedResults = 0
+    let resultCloseTimer: ReturnType<typeof setTimeout> | undefined
     try {
       for await (const message of q) {
         const m = message as {
           type: string
+          subtype?: string
           session_id?: string
           usage?: unknown
           message?: { usage?: unknown }
+          terminal_reason?: string
+        }
+        // A queued priority-next message really did become another SDK run. It commonly appears only a
+        // few milliseconds AFTER the previous result, so cancel that result's quiet-boundary close. The
+        // next result will schedule its own boundary. Do this before journaling so a slow event sink cannot
+        // consume the grace window and close a continuation that is already demonstrably live.
+        if (m.type === 'system' && m.subtype === 'init' && resultCloseTimer) {
+          clearTimeout(resultCloseTimer)
+          resultCloseTimer = undefined
         }
         if (typeof m.session_id === 'string') this.vendorSessionId = m.session_id
         this.onEvent(`claude/${m.type}`, message)
@@ -321,15 +321,24 @@ export class ClaudeDriver {
         else if (m.type === 'result') {
           completedResults += 1
           this.emitTokens(m.usage)
-          // A streaming query emits a result for EACH submitted user message. A priority-next steer may
-          // already have been accepted (and may even be executing) when the original prompt's result arrives.
-          // Closing here unconditionally severed the SDK's shared stdin control channel underneath that next
-          // turn. Close only once every accepted prompt/steer has produced its own result. A steer that loses
-          // the result-vs-push race is still rejected by input.close(), so its caller retains/retries it.
-          if (!input.hasUncompletedMessage(completedResults)) input.close()
+          if (resultCloseTimer) clearTimeout(resultCloseTimer)
+          // `aborted_streaming` is the SDK's explicit terminal answer to interrupting the stream. There can
+          // be no legitimate continuation behind it; closing immediately is what lets the worker emit its
+          // terminal lifecycle instead of leaving the chat permanently `active`.
+          if (m.terminal_reason === 'aborted_streaming') {
+            resultCloseTimer = undefined
+            input.close()
+          } else {
+            resultCloseTimer = setTimeout(() => {
+              resultCloseTimer = undefined
+              input.close()
+            }, RESULT_QUIESCENCE_MS)
+            resultCloseTimer.unref?.()
+          }
         }
       }
     } finally {
+      if (resultCloseTimer) clearTimeout(resultCloseTimer)
       if (completedResults > 0) input.close()
       else input.abort(new Error('Claude turn ended before queued input was accepted'))
       this.active = undefined

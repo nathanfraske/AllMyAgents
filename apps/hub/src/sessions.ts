@@ -4039,6 +4039,15 @@ export class SessionManager {
       }
     }
 
+    // "Always allow this tool in this chat" is an explicit, authenticated operator grant and therefore
+    // applies to the whole chat, including manager/bus-started turns and turns restored after a hub flip.
+    // Applying provenance before this check made the control acknowledge success, persist the tool, render
+    // "always allowing ... in this chat", and then ignore the grant on exactly those turns. That is both a
+    // broken promise and indistinguishable from a dead button. delegableToolName has already enforced the
+    // ordinary-execution kind allowlist, rejected user-authored ask rules, and excluded interactive tools,
+    // so a standing grant cannot widen a capability request or silence a question.
+    if (delegatedTool && (record.allowedTools?.includes(delegatedTool) ?? false)) return true
+
     // (1) ONLY A TURN THIS HUB STARTED FOR THE OPERATOR MAY SKIP THE PROMPT — a POSITIVE test, not
     // "isn't a bus turn". deliverBus builds its spec with clampMode(record.permissionMode) so a
     // teammate-caused turn never runs as `full` — "that would let a teammate message drive unapproved

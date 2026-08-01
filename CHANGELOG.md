@@ -3,6 +3,13 @@
 All notable operator-facing changes are recorded here. The linked release notes contain the complete
 feature and fix log used on the corresponding GitHub release.
 
+## v0.1.11-alpha.14 — 2026-08-01
+
+This release fixes a Claude streaming-lifecycle wedge discovered in a live project-manager turn and makes
+the operator's per-chat **Always allow** tool grant effective for manager- and teammate-started turns.
+
+[Full v0.1.11-alpha.14 release notes](docs/releases/v0.1.11-alpha.14.md)
+
 ## v0.1.10-alpha.13 — 2026-07-31
 
 This release focuses on journal durability, account re-authentication, long-history chat reliability,
