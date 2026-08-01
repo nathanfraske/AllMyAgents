@@ -227,13 +227,10 @@ describe('owned journal corruption recovery', () => {
     journal.db.close()
     const journalPath = path.join(dataDir, 'hub.db')
     const before = fs.readFileSync(journalPath)
-    const lease = new JournalRecoveryLease(dataDir)
-    lease.acquireShared()
-    lease.acquireExclusive()
     let parentTimerRan = false
     const parentTimer = setTimeout(() => {
       parentTimerRan = true
-    }, 10)
+    }, 0)
 
     try {
       await expect(
@@ -243,14 +240,17 @@ describe('owned journal corruption recovery', () => {
           schemaVersion: SCHEMA_VERSION,
           operationId: '33333333-3333-4333-8333-333333333333',
           attemptId: '44444444-4444-4444-8444-444444444444',
-          timeoutMs: 100,
+          // Worker startup necessarily crosses an event-loop boundary. A one-millisecond ceiling
+          // deterministically exercises the parent watchdog without manufacturing a database lock;
+          // SQLite reports a held recovery lease synchronously on macOS instead of waiting as it does
+          // on Windows, which made the old lock-based wedge test platform-dependent.
+          timeoutMs: 1,
         })
       ).rejects.toThrow(/absolute execution ceiling/i)
       expect(parentTimerRan).toBe(true)
       expect(fs.readFileSync(journalPath)).toEqual(before)
     } finally {
       clearTimeout(parentTimer)
-      lease.release()
     }
   })
 
