@@ -233,12 +233,25 @@ describe('SessionManager.isAutoApproved — full access is not a blanket yes', (
     expect(sessions.isAutoApproved('s1', 'practice/write', { toolName: 'Bash' })).toBe(false)
   })
 
-  it('an allowlist grant does not survive into a teammate-caused turn either', () => {
+  it('honors an explicit chat-wide allowlist grant on a teammate-caused turn', () => {
     const { sessions, seed } = makeSessions()
     seed({ permissionMode: 'safe' })
     sessions.allowTool('s1', 'Bash')
     markBusTurn(sessions, 's1')
-    expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(false)
+    expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(true)
+  })
+
+  it('does not let a chat-wide allowlist grant override a user-authored ask rule', () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'safe' })
+    sessions.allowTool('s1', 'Bash')
+    markBusTurn(sessions, 's1')
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', {
+        toolName: 'Bash',
+        matchedAskRule: { source: 'user_settings', toolName: 'Bash' },
+      })
+    ).toBe(false)
   })
 
   /**
