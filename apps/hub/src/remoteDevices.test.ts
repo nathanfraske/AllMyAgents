@@ -84,10 +84,13 @@ describe('DeviceExecutor target policy', () => {
       roots: [{ id: '', label: 'terminal', path: root, read: false, write: false, terminal: true }],
     })
     const command = process.platform === 'win32' ? 'Write-Output remote-ok' : 'printf remote-ok'
-    const result = await executor.execute({ op: 'exec', rootId: policy.roots[0]!.id, command, timeoutMs: 10_000 })
+    // A cold PowerShell process can take more than ten seconds to initialize on
+    // a saturated Windows CI runner. Keep the command bounded while testing the
+    // executor contract rather than the runner's process-start latency.
+    const result = await executor.execute({ op: 'exec', rootId: policy.roots[0]!.id, command, timeoutMs: 60_000 })
     expect(result).toMatchObject({ ok: true, exitCode: 0, timedOut: false })
     expect(result.stdout).toContain('remote-ok')
-  }, 20_000)
+  }, 75_000)
 })
 
 describe('FleetConnectionStore', () => {
