@@ -30,6 +30,9 @@ export interface ProfileInfo {
   ownerPort?: number
   authStatus?: 'signed_in' | 'signed_out'
   authError?: string
+  siteId?: string
+  siteLabel?: string
+  siteOnline?: boolean
 }
 
 export interface ProjectInfo {
@@ -177,10 +180,12 @@ export interface SessionRecord {
   id: string
   profileId: string
   provider: 'claude' | 'codex'
+  isOverseer?: boolean
   projectId?: string
   cwd: string
   repo?: string
   worktree?: string
+  workspacePressure?: WorkspacePressure
   branch?: string
   /** Spawn intent, distinct from the actual `worktree` outcome. */
   worktreeRequested?: boolean
@@ -196,6 +201,7 @@ export interface SessionRecord {
   permissionModeOperatorOverrideCeiling?: 'safe' | 'edits' | 'full'
   /** Tools the operator chose "always allow" for in this chat. Shown (and revocable) in the permission menu. */
   allowedTools?: string[]
+  remoteDeviceGrants?: RemoteDeviceGrant[]
   browserEnabled?: boolean
   isProjectManager?: boolean
   managerMaxLiveChildren?: number
@@ -477,8 +483,84 @@ export function setHubToken(t: string): void {
     /* ignore */
   }
 }
-function authHeaders(): Record<string, string> {
-  return hubToken ? { authorization: `Bearer ${hubToken}` } : {}
+function authHeaders(token = hubToken): Record<string, string> {
+  return token ? { authorization: `Bearer ${token}` } : {}
+}
+
+export interface WorkspacePressure {
+  level: 'warning' | 'critical'
+  totalBytes: number
+  artifactBytes: number
+  artifactGroups: Array<{ name: string; bytes: number }>
+  reasons: Array<'workspace-size' | 'build-artifacts' | 'low-disk'>
+  partial: boolean
+  observedAt: string
+  freeBytes?: number
+  lastNotifiedAt?: string
+}
+
+/**
+ * Remote hubs deliberately do not share this hub's device token. A token is paired once per fleet
+ * site and kept in browser-local storage, exactly like the local device token. The fleet directory
+ * supplies reachability only; it never transports a credential.
+ */
+const fleetTargets = new Map<string, FleetSite>()
+const fleetTokenKey = (siteId: string): string => `hub.fleet-token.${encodeURIComponent(siteId)}`
+
+export function configureFleetSites(sites: FleetSite[]): void {
+  // Keep last-known targets for the lifetime of this renderer. A peer can disappear from discovery
+  // while its last-known chats and queued messages remain visible; forgetting its prefix would make a
+  // namespaced remote id fall through to the LOCAL hub. A stale remote URL fails safely, while local
+  // misrouting could mutate the wrong machine. A returning peer overwrites the mapping below.
+  for (const site of sites) if (!site.local) fleetTargets.set(site.siteId, site)
+}
+
+export function getFleetSiteToken(siteId: string): string {
+  try {
+    return localStorage.getItem(fleetTokenKey(siteId)) ?? ''
+  } catch {
+    return ''
+  }
+}
+
+export function setFleetSiteToken(siteId: string, token: string): void {
+  try {
+    const key = fleetTokenKey(siteId)
+    if (token.trim()) localStorage.setItem(key, token.trim())
+    else localStorage.removeItem(key)
+  } catch {
+    /* ignore unavailable storage; the pairing check will remain explicit */
+  }
+}
+
+export interface HubResourceTarget {
+  id: string
+  baseUrl: string
+  token: string
+  site?: FleetSite
+}
+
+/** Resolve a namespaced fleet resource without ever treating an arbitrary colon as a site prefix. */
+export function resolveHubResource(id: string): HubResourceTarget {
+  for (const site of fleetTargets.values()) {
+    const prefix = `${site.siteId}:`
+    if (id.startsWith(prefix)) {
+      return { id: id.slice(prefix.length), baseUrl: site.baseUrl, token: getFleetSiteToken(site.siteId), site }
+    }
+  }
+  return { id, baseUrl: HUB_HTTP, token: hubToken }
+}
+
+export function fleetWebSocketUrl(site: FleetSite, since: number, generation: number): string {
+  const base = new URL(site.baseUrl)
+  base.protocol = base.protocol === 'https:' ? 'wss:' : 'ws:'
+  base.pathname = '/ws'
+  base.search = ''
+  base.searchParams.set('since', String(since))
+  base.searchParams.set('generation', String(generation))
+  const token = getFleetSiteToken(site.siteId)
+  if (token) base.searchParams.set('token', token)
+  return base.toString()
 }
 
 interface TauriInvokeBridge {
@@ -537,9 +619,10 @@ async function request<T>(
   base: string,
   body?: unknown,
   expectedStatuses: readonly number[] = [],
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  token = hubToken,
 ): Promise<HttpResult<T>> {
-  const headers: Record<string, string> = { ...authHeaders() }
+  const headers: Record<string, string> = { ...authHeaders(token) }
   if (method !== 'GET') headers['content-type'] = 'application/json'
   let res: Response
   try {
@@ -569,17 +652,15 @@ async function request<T>(
   return { ok: true, status: res.status, data: parsed as T }
 }
 
-// `base` defaults to the single local hub (HUB_HTTP); the fleet merge passes a REMOTE site's mapped
-// loopback base (http://localhost:<localPort>) to pull that machine's read-only roster.
-// TODO(full drive-remote, L): a remote site under `requireToken` needs ITS OWN token here — today we
-// reuse the single local `hubToken` (fine while enforcement is off, the first-cut assumption).
+// `base` defaults to the local hub. Fleet calls pass the mapped remote base and that site's separately
+// paired token explicitly; a local capability is never replayed against another machine.
 //
 // THROWS `HubHttpError` on any non-usable response. Every GET call site in the store already wraps this
 // in `.catch(...)` (roster pulls fall back to [], a failed /api/fleet probe to null) — those guards
 // only appeared to work before because an error body was resolved as fake data and the catch never
 // fired, which is why a token-gated peer rendered ONLINE while its 401 roster body was iterated.
-async function jget<T>(url: string, base: string = HUB_HTTP, signal?: AbortSignal): Promise<T> {
-  const r = await request<T>('GET', url, base, undefined, [], signal)
+async function jget<T>(url: string, base: string = HUB_HTTP, signal?: AbortSignal, token = hubToken): Promise<T> {
+  const r = await request<T>('GET', url, base, undefined, [], signal, token)
   if (!r.ok) throw new HubHttpError(r.error, r.status)
   return r.data
 }
@@ -598,6 +679,85 @@ async function jdelete<T>(url: string): Promise<T> {
   const r = await request<T>('DELETE', url, HUB_HTTP)
   if (!r.ok) return { error: r.error } as T
   return r.data
+}
+
+async function routedGet<T>(id: string, path: (rawId: string) => string, signal?: AbortSignal): Promise<T> {
+  const target = resolveHubResource(id)
+  return jget<T>(path(target.id), target.baseUrl, signal, target.token)
+}
+
+async function routedPost<T>(id: string, path: (rawId: string) => string, body?: unknown): Promise<T> {
+  const target = resolveHubResource(id)
+  const r = await request<T>('POST', path(target.id), target.baseUrl, body, [], undefined, target.token)
+  if (!r.ok) return { error: r.error } as T
+  return r.data
+}
+
+async function routedPostExpected<T>(
+  id: string,
+  path: (rawId: string) => string,
+  body: unknown,
+  expectedStatuses: readonly number[],
+): Promise<T> {
+  const target = resolveHubResource(id)
+  const r = await request<T>(
+    'POST', path(target.id), target.baseUrl, body, expectedStatuses, undefined, target.token,
+  )
+  if (!r.ok) return { error: r.error } as T
+  return r.data
+}
+
+async function routedDelete<T>(id: string, path: (rawId: string) => string): Promise<T> {
+  const target = resolveHubResource(id)
+  const r = await request<T>('DELETE', path(target.id), target.baseUrl, undefined, [], undefined, target.token)
+  if (!r.ok) return { error: r.error } as T
+  return r.data
+}
+
+function namespaceSessionResult(target: HubResourceTarget, value: SessionRecord | ApiError): SessionRecord | ApiError {
+  if (!target.site || 'error' in value) return value
+  return {
+    ...value,
+    id: `${target.site.siteId}:${value.id}`,
+    profileId: `${target.site.siteId}:${value.profileId}`,
+    projectId: value.projectId ? `${target.site.siteId}:${value.projectId}` : undefined,
+    parentSessionId: value.parentSessionId ? `${target.site.siteId}:${value.parentSessionId}` : undefined,
+    managerAllowedProfiles: value.managerAllowedProfiles?.map((id) => `${target.site!.siteId}:${id}`),
+    managerAllowedModels: value.managerAllowedModels
+      ? Object.fromEntries(Object.entries(value.managerAllowedModels).map(([id, models]) => [`${target.site!.siteId}:${id}`, models]))
+      : undefined,
+    managerAgentTypes: value.managerAgentTypes?.map((agentType) => ({
+      ...agentType,
+      profileId: agentType.profileId ? `${target.site!.siteId}:${agentType.profileId}` : undefined,
+      profileIds: agentType.profileIds?.map((id) => `${target.site!.siteId}:${id}`),
+    })),
+    siteId: target.site.siteId,
+    siteLabel: target.site.label,
+    siteOnline: true,
+  }
+}
+
+function namespaceProjectResult(target: HubResourceTarget, value: ProjectInfo | ApiError): ProjectInfo | ApiError {
+  if (!target.site || 'error' in value) return value
+  return {
+    ...value,
+    id: `${target.site.siteId}:${value.id}`,
+    siteId: target.site.siteId,
+    siteLabel: target.site.label,
+    siteOnline: true,
+  }
+}
+
+async function routedSessionPost(
+  id: string,
+  path: (rawId: string) => string,
+  body?: unknown,
+): Promise<SessionRecord | ApiError> {
+  const target = resolveHubResource(id)
+  const r = await request<SessionRecord | ApiError>(
+    'POST', path(target.id), target.baseUrl, body, [], undefined, target.token,
+  )
+  return namespaceSessionResult(target, r.ok ? r.data : { error: r.error })
 }
 
 export const LOGIN_HTTP_TIMEOUT_MS = 8_000
@@ -697,6 +857,63 @@ export interface FleetSite {
   local: boolean
   baseUrl: string
   online: boolean
+  /** Client-derived credential state; never supplied by the fleet directory itself. */
+  authState?: 'paired' | 'pairing-required' | 'error'
+  authError?: string
+}
+
+export type RemoteDeviceCapability = 'read' | 'write' | 'terminal'
+
+export interface RemoteDeviceGrant {
+  siteId: string
+  rootIds: string[]
+  capabilities: RemoteDeviceCapability[]
+}
+
+export interface DeviceRootPolicy {
+  id: string
+  label: string
+  path: string
+  environment?: { kind: 'wsl'; distro: string }
+  read: boolean
+  write: boolean
+  terminal: boolean
+}
+
+export interface RemoteExecutionEnvironment {
+  id: string
+  kind: 'host' | 'wsl'
+  label: string
+  platform: string
+  arch?: string
+  shell: string
+  distro?: string
+  state?: 'running' | 'stopped'
+  version?: 1 | 2
+  isDefault?: boolean
+}
+
+export interface DeviceExecutorCapabilities {
+  enabled: boolean
+  platform: string
+  arch: string
+  hostname: string
+  /** Added after the host-only executor shipped; absent on an older peer capability response. */
+  environments?: RemoteExecutionEnvironment[]
+  roots: DeviceRootPolicy[]
+}
+
+export interface FleetConnectionPublic {
+  siteId: string
+  label: string
+  updatedAt: string
+  paired: true
+}
+
+export interface RemoteDeviceCatalogEntry extends FleetConnectionPublic {
+  connected: boolean
+  error?: string
+  capabilities?: DeviceExecutorCapabilities
 }
 
 export interface Instruction {
@@ -745,6 +962,14 @@ export interface HubPrefs {
   steerMessagesAtToolBoundary: boolean
   /** Optional while bootstrap is using its pre-fetch fallback; the hub always returns a resolved value. */
   fileWriteDiffDensity?: FileWriteDiffDensity
+}
+
+export interface OverseerStatus {
+  configured: boolean
+  profileId?: string
+  sessionId?: string
+  session?: SessionRecord
+  available: boolean
 }
 
 export interface ApiError {
@@ -874,14 +1099,46 @@ export const api = {
   pickFolder: () => jpost<{ path: string }>('/api/pick-folder'),
   wslCapability: () => jget<WslCapability>('/api/wsl/capability'),
   projects: () => jget<ProjectInfo[]>('/api/projects'),
-  projectActivity: (projectId: string) =>
-    jget<WorktreeProjectActivity>(`/api/projects/${encodeURIComponent(projectId)}/activity`),
-  inspectProjectDeletion: (projectId: string) =>
-    jget<ProjectDeletionInspection>(`/api/projects/${encodeURIComponent(projectId)}/deletion`),
-  deleteProject: (projectId: string, deleteFiles = false) =>
-    jdelete<ProjectDeletionResult>(
-      `/api/projects/${encodeURIComponent(projectId)}${deleteFiles ? '?deleteFiles=true' : ''}`,
-    ),
+  projectActivity: async (projectId: string) => {
+    const target = resolveHubResource(projectId)
+    const value = await routedGet<WorktreeProjectActivity>(projectId, (id) => `/api/projects/${encodeURIComponent(id)}/activity`)
+    if (!target.site) return value
+    const prefix = (id: string): string => `${target.site!.siteId}:${id}`
+    return {
+      ...value,
+      projectId: prefix(value.projectId),
+      agents: value.agents.map((agent) => ({ ...agent, sessionId: prefix(agent.sessionId) })),
+      risks: value.risks.map((risk) => ({ ...risk, sessionIds: risk.sessionIds.map(prefix) })),
+    }
+  },
+  inspectProjectDeletion: async (projectId: string) => {
+    const target = resolveHubResource(projectId)
+    const value = await routedGet<ProjectDeletionInspection>(projectId, (id) => `/api/projects/${encodeURIComponent(id)}/deletion`)
+    if (!target.site) return value
+    const prefix = (id: string): string => `${target.site!.siteId}:${id}`
+    return {
+      ...value,
+      projectId: prefix(value.projectId),
+      sessions: value.sessions.map((session) => ({ ...session, id: prefix(session.id) })),
+      changes: value.changes.map((change) => ({ ...change, sessionId: change.sessionId ? prefix(change.sessionId) : undefined })),
+      localCommits: value.localCommits.map((commit) => ({ ...commit, sessionId: commit.sessionId ? prefix(commit.sessionId) : undefined })),
+      worktrees: value.worktrees.map((worktree) => ({ ...worktree, sessionId: prefix(worktree.sessionId) })),
+    }
+  },
+  deleteProject: async (projectId: string, deleteFiles = false) => {
+    const target = resolveHubResource(projectId)
+    const value = await routedDelete<ProjectDeletionResult>(
+      projectId,
+      (id) => `/api/projects/${encodeURIComponent(id)}${deleteFiles ? '?deleteFiles=true' : ''}`,
+    )
+    if (!target.site) return value
+    const prefix = (id: string): string => `${target.site!.siteId}:${id}`
+    return {
+      ...value,
+      detachedSessionIds: value.detachedSessionIds?.map(prefix),
+      deletedSessionIds: value.deletedSessionIds?.map(prefix),
+    }
+  },
   validateProject: (name: string, path: string, distro?: string) =>
     jpost<ProjectDraftValidation | { error: string }>('/api/projects/validate', {
       name,
@@ -894,8 +1151,11 @@ export const api = {
       path,
       ...(distro ? { distro } : {}),
     }),
-  updateProject: (id: string, patch: { name: string }) =>
-    jpost<ProjectInfo | ApiError>(`/api/projects/${encodeURIComponent(id)}/settings`, patch),
+  updateProject: async (id: string, patch: { name: string }) => {
+    const target = resolveHubResource(id)
+    const value = await routedPost<ProjectInfo | ApiError>(id, (raw) => `/api/projects/${encodeURIComponent(raw)}/settings`, patch)
+    return namespaceProjectResult(target, value)
+  },
   createManagedProject: (name: string, distro?: string) =>
     jpost<ProjectInfo | { error: string }>('/api/projects/managed', {
       name,
@@ -909,31 +1169,67 @@ export const api = {
       ...(distro ? { distro } : {}),
     }),
   githubClone: (id: string) => jget<GitHubCloneJob>(`/api/github/clones/${encodeURIComponent(id)}`),
-  // --- Unified fleet view (first cut, read-only) ---
+  // --- Unified fleet view ---
   // The fleet roster: this hub + every reachable co-owned peer's hub, badged by machine.
   fleet: () => jget<FleetSite[]>('/api/fleet'),
-  // Pull a roster from an ARBITRARY site base (a remote fleet site's mapped loopback base), not just
-  // the hard-wired local hub — how the store aggregates remote machines read-only.
-  projectsFrom: (base: string) => jget<ProjectInfo[]>('/api/projects', base),
-  sessionsFrom: (base: string) => jget<SessionRecord[]>('/api/sessions', base),
+  // Authenticate, bootstrap, and refresh an arbitrary mapped fleet hub with its own paired token.
+  authFrom: (site: FleetSite) =>
+    jget<{ requireToken: boolean; authed: boolean }>('/api/auth', site.baseUrl, undefined, getFleetSiteToken(site.siteId)),
+  replayBaselineFrom: (site: FleetSite) =>
+    jget<ReplayBaseline>('/api/replay-baseline', site.baseUrl, undefined, getFleetSiteToken(site.siteId)),
+  projectsFrom: (site: FleetSite) =>
+    jget<ProjectInfo[]>('/api/projects', site.baseUrl, undefined, getFleetSiteToken(site.siteId)),
+  sessionsFrom: (site: FleetSite) =>
+    jget<SessionRecord[]>('/api/sessions', site.baseUrl, undefined, getFleetSiteToken(site.siteId)),
+  profilesFrom: (site: FleetSite) =>
+    jget<ProfileInfo[]>('/api/profiles', site.baseUrl, undefined, getFleetSiteToken(site.siteId)),
+  approvalsFrom: (site: FleetSite) =>
+    jget<ApprovalRecord[]>('/api/approvals', site.baseUrl, undefined, getFleetSiteToken(site.siteId)),
+  questionsFrom: (site: FleetSite) =>
+    jget<QuestionRecord[]>('/api/questions', site.baseUrl, undefined, getFleetSiteToken(site.siteId)),
+  usageFrom: (site: FleetSite) =>
+    jget<UsageSnapshot[]>('/api/usage', site.baseUrl, undefined, getFleetSiteToken(site.siteId)),
+  saveFleetConnection: (siteId: string, label: string, token: string) =>
+    jpost<FleetConnectionPublic | ApiError>('/api/fleet/connections', { siteId, label, token }),
+  removeFleetConnection: (siteId: string) =>
+    jpost<{ ok?: boolean; removed?: boolean; error?: string }>(`/api/fleet/connections/${encodeURIComponent(siteId)}/remove`, {}),
+  fleetConnections: () => jget<FleetConnectionPublic[]>('/api/fleet/connections'),
   // Project import: preview existing vendor chats under a folder, then adopt the selected ones.
-  scanProject: (path: string) => jpost<ScanResult | { error: string }>('/api/projects/scan', { path }),
-  importChats: (projectId: string, vendorSessionIds: string[]) =>
-    jpost<ImportResult | { error: string }>(`/api/projects/${projectId}/import`, { vendorSessionIds }),
+  scanProject: (path: string, projectId?: string) => {
+    const target = resolveHubResource(projectId ?? '')
+    return request<ScanResult | { error: string }>(
+      'POST', '/api/projects/scan', target.baseUrl, { path }, [], undefined, target.token,
+    ).then((result) => result.ok ? result.data : { error: result.error })
+  },
+  importChats: async (projectId: string, vendorSessionIds: string[]) => {
+    const target = resolveHubResource(projectId)
+    const value = await routedPost<ImportResult | { error: string }>(
+      projectId,
+      (id) => `/api/projects/${encodeURIComponent(id)}/import`,
+      { vendorSessionIds },
+    )
+    if (!target.site || 'error' in value) return value
+    return {
+      ...value,
+      imported: value.imported.map((session) =>
+        namespaceSessionResult(target, session) as SessionRecord,
+      ),
+    }
+  },
   sessions: (signal?: AbortSignal) => jget<SessionRecord[]>('/api/sessions', HUB_HTTP, signal),
   // On-demand vendor transcript history for an imported chat (bounded tail; `before` byte cursor pages older).
   history: (id: string, before?: number, signal?: AbortSignal) =>
-    jget<HistoryPage>(
-      `/api/sessions/${id}/history${before != null ? `?before=${before}` : ''}`,
-      HUB_HTTP,
+    routedGet<HistoryPage>(
+      id,
+      (raw) => `/api/sessions/${encodeURIComponent(raw)}/history${before != null ? `?before=${before}` : ''}`,
       signal,
     ),
   journalHistory: (id: string, generation: number, before?: number, signal?: AbortSignal) => {
     const query = new URLSearchParams({ generation: String(generation) })
     if (before != null) query.set('before', String(before))
-    return jget<JournalHistoryPage>(
-      `/api/sessions/${encodeURIComponent(id)}/journal-history?${query.toString()}`,
-      HUB_HTTP,
+    return routedGet<JournalHistoryPage>(
+      id,
+      (raw) => `/api/sessions/${encodeURIComponent(raw)}/journal-history?${query.toString()}`,
       signal,
     )
   },
@@ -951,13 +1247,31 @@ export const api = {
   // route against an existing session), so the hub REFUSES attachments on create (server.ts) — the first
   // message with attachments is: spawn an empty session (no prompt) → uploadAttachment(id, file) per file
   // → send(id, prompt, { attachments: ids }).
-  spawn: (body: Record<string, unknown>) => jpost<SessionRecord | { error: string }>('/api/sessions', body),
+  spawn: (body: Record<string, unknown>) => {
+    const projectId = typeof body.projectId === 'string' ? body.projectId : ''
+    const target = resolveHubResource(projectId)
+    if (!target.site) return jpost<SessionRecord | { error: string }>('/api/sessions', body)
+    const profile = typeof body.profileId === 'string' ? resolveHubResource(body.profileId) : null
+    return request<SessionRecord | { error: string }>(
+      'POST',
+      '/api/sessions',
+      target.baseUrl,
+      {
+        ...body,
+        projectId: target.id,
+        ...(profile?.site?.siteId === target.site.siteId ? { profileId: profile.id } : {}),
+      },
+      [],
+      undefined,
+      target.token,
+    ).then((r) => namespaceSessionResult(target, r.ok ? r.data : { error: r.error }))
+  },
   // `attachments` is an array of attachment IDs (from uploadAttachment), NOT the metadata objects — the
   // hub resolves ids to the stored files (server.ts stringArray: "must be an array of ids").
   send: (id: string, text: string, extra: { model?: string; effort?: string; serviceTier?: string; attachments?: string[] } = {}) =>
-    jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/input`, { text, ...extra }),
+    routedPost<{ ok?: boolean; error?: string }>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/input`, { text, ...extra }),
   steer: (id: string, text: string, attachments?: string[]) =>
-    jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/steer`, { text, ...(attachments?.length ? { attachments } : {}) }),
+    routedPost<{ ok?: boolean; error?: string }>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/steer`, { text, ...(attachments?.length ? { attachments } : {}) }),
   /**
    * Upload ONE file's raw bytes to a session and get back its stored {@link AttachmentMeta} (id used to
    * reference it on the next send/steer), or `{ error }` on failure. Bespoke transport — NOT jpost — the
@@ -967,13 +1281,14 @@ export const api = {
    * that silently fails to reach the vendor. The hub enforces the real per-mime size cap while streaming.
    */
   async uploadAttachment(sessionId: string, file: File): Promise<AttachmentRef | { error: string }> {
-    const url = `${HUB_HTTP}/api/sessions/${encodeURIComponent(sessionId)}/attachments`
+    const target = resolveHubResource(sessionId)
+    const url = `${target.baseUrl}/api/sessions/${encodeURIComponent(target.id)}/attachments`
     let res: Response
     try {
       res = await fetch(url, {
         method: 'POST',
         headers: {
-          ...authHeaders(),
+          ...authHeaders(target.token),
           'content-type': file.type || 'application/octet-stream',
           // The hub reads x-filename verbatim as the stored name. HTTP header values are Latin-1, so a
           // filename with characters fetch cannot put in a header rejects here and surfaces as { error }.
@@ -1001,42 +1316,44 @@ export const api = {
     return parsed as AttachmentRef
   },
   // A profile's on-disk custom slash commands (for the `/` command picker).
-  commands: (profileId: string) => jget<CommandInfo[]>(`/api/profiles/${encodeURIComponent(profileId)}/commands`),
+  commands: (profileId: string) =>
+    routedGet<CommandInfo[]>(profileId, (raw) => `/api/profiles/${encodeURIComponent(raw)}/commands`),
   // Request on-demand context compaction (the `/compact` built-in). See CompactResult.
-  compact: (id: string) => jpost<CompactResult>(`/api/sessions/${id}/compact`),
-  interrupt: (id: string) => jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/interrupt`),
+  compact: (id: string) => routedPost<CompactResult>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/compact`),
+  interrupt: (id: string) => routedPost<{ ok?: boolean; error?: string }>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/interrupt`),
   interruptAgent: (id: string, targetId: string, label?: string) =>
-    jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/agents/interrupt`, { targetId, label }),
-  stop: (id: string) => jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/stop`),
+    routedPost<{ ok?: boolean; error?: string }>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/agents/interrupt`, { targetId, label }),
+  stop: (id: string) => routedPost<{ ok?: boolean; error?: string }>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/stop`),
   // The inverse of stop(): revive a stopped/errored chat to idle so it's usable again (composer frees,
   // bus-reachable). Fixes stop() being a permanent one-way brick.
-  reopen: (id: string) => jpost<{ ok?: boolean; status?: string; error?: string }>(`/api/sessions/${id}/reopen`),
+  reopen: (id: string) => routedPost<{ ok?: boolean; status?: string; error?: string }>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/reopen`),
   deleteSession: (id: string, deleteBrowserData = false) =>
-    jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/delete`, { deleteBrowserData }),
+    routedPost<{ ok?: boolean; error?: string }>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/delete`, { deleteBrowserData }),
   setMode: (id: string, permissionMode: string, operatorOverride = false) =>
-    jpost<{ ok: boolean } | ApiError>(`/api/sessions/${id}/mode`, {
+    routedPost<{ ok: boolean } | ApiError>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/mode`, {
       permissionMode,
       operatorOverride,
     }),
   browserStatus: (id: string) =>
-    jget<BrowserStatus>(`/api/sessions/${id}/browser`),
+    routedGet<BrowserStatus>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/browser`),
   setBrowserEnabled: (id: string, enabled: boolean) =>
-    jpost<BrowserStatus | ApiError>(
-      `/api/sessions/${id}/browser`,
+    routedPost<BrowserStatus | ApiError>(
+      id,
+      (raw) => `/api/sessions/${encodeURIComponent(raw)}/browser`,
       { enabled },
     ),
   setBrowserLocalNetwork: (id: string, enabled: boolean) =>
-    jpost<BrowserStatus | ApiError>(`/api/sessions/${id}/browser/local-network`, { enabled }),
+    routedPost<BrowserStatus | ApiError>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/browser/local-network`, { enabled }),
   setBrowserTabs: (id: string, enabled: boolean) =>
-    jpost<BrowserStatus | ApiError>(`/api/sessions/${id}/browser/tabs`, { enabled }),
+    routedPost<BrowserStatus | ApiError>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/browser/tabs`, { enabled }),
   setBrowserDownloads: (id: string, enabled: boolean) =>
-    jpost<BrowserStatus | ApiError>(`/api/sessions/${id}/browser/downloads`, { enabled }),
+    routedPost<BrowserStatus | ApiError>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/browser/downloads`, { enabled }),
   revokeBrowserOrigin: (id: string, origin: string) =>
-    jpost<BrowserStatus | ApiError>(`/api/sessions/${id}/browser/origins/revoke`, { origin }),
+    routedPost<BrowserStatus | ApiError>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/browser/origins/revoke`, { origin }),
   showBrowser: (id: string) =>
-    jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/browser/show`),
+    routedPost<{ ok?: boolean; error?: string }>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/browser/show`),
   clearBrowser: (id: string) =>
-    jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/browser/clear`),
+    routedPost<{ ok?: boolean; error?: string }>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/browser/clear`),
   configureProjectManager: (
     id: string,
     config: {
@@ -1055,39 +1372,65 @@ export const api = {
       permissionMode?: 'safe' | 'edits' | 'full'
       maxChildPermissionMode?: 'safe' | 'edits' | 'full'
     }
-  ) => jpost<SessionRecord | ApiError>(`/api/sessions/${id}/project-manager`, config),
+  ) => {
+    const target = resolveHubResource(id)
+    const stripProfile = (profileId: string): string => {
+      const profile = resolveHubResource(profileId)
+      return profile.site?.siteId === target.site?.siteId ? profile.id : profileId
+    }
+    return routedSessionPost(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/project-manager`, {
+      ...config,
+      allowedProfiles: config.allowedProfiles?.map(stripProfile),
+      allowedModels: config.allowedModels
+        ? Object.fromEntries(Object.entries(config.allowedModels).map(([profileId, models]) => [stripProfile(profileId), models]))
+        : undefined,
+      agentTypes: config.agentTypes?.map((agentType) => ({
+        ...agentType,
+        profileId: agentType.profileId ? stripProfile(agentType.profileId) : undefined,
+        profileIds: agentType.profileIds?.map(stripProfile),
+      })),
+    })
+  },
   /** "Always allow this tool in this chat" (allow=false revokes). Takes effect on the next tool call. */
   allowTool: (id: string, toolName: string, allow = true) =>
-    jpost<SessionRecord | ApiError>(`/api/sessions/${id}/allow-tool`, { toolName, allow }),
+    routedSessionPost(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/allow-tool`, { toolName, allow }),
+  remoteDeviceCatalog: (id: string) =>
+    routedGet<RemoteDeviceCatalogEntry[]>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/remote-devices`),
+  setRemoteDeviceGrants: (id: string, grants: RemoteDeviceGrant[]) =>
+    routedSessionPost(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/remote-devices`, { grants }),
   /** Persist a per-chat model / thinking effort / service tier immediately (survives reload + restart). */
   setSettings: (id: string, patch: { model?: string; effort?: string; serviceTier?: string }) =>
-    jpost<SessionRecord | ApiError>(`/api/sessions/${id}/settings`, patch),
+    routedSessionPost(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/settings`, patch),
   /** Mandatory pre-push/pre-merge check; `ok:false` means main touched files this branch changes. */
   checkIntegration: (id: string) =>
-    jpostExpected<WorktreeIntegrationCheck | ApiError>(
-      `/api/sessions/${id}/integration-check`,
+    routedPostExpected<WorktreeIntegrationCheck | ApiError>(
+      id,
+      (raw) => `/api/sessions/${encodeURIComponent(raw)}/integration-check`,
       {},
       [409]
     ),
   // Typed so a caller can tell an accepted decision (200 { ok:true }) from a 404/401/network failure
   // ({ error }) — the approval UI must NOT clear a pending prompt it never actually resolved.
-  decide: (id: string, approve: boolean) => jpost<{ ok?: boolean; error?: string }>(`/api/approvals/${id}`, { approve }),
+  decide: (id: string, approve: boolean) => routedPost<{ ok?: boolean; error?: string }>(id, (raw) => `/api/approvals/${encodeURIComponent(raw)}`, { approve }),
   answerQuestion: (id: string, answers: Record<string, string>) =>
-    jpost<{ ok?: boolean; error?: string }>(`/api/questions/${encodeURIComponent(id)}`, {
+    routedPost<{ ok?: boolean; error?: string }>(id, (raw) => `/api/questions/${encodeURIComponent(raw)}`, {
       answers,
     }),
   cancelQuestion: (id: string) =>
-    jpost<{ ok?: boolean; error?: string }>(`/api/questions/${encodeURIComponent(id)}`, {
+    routedPost<{ ok?: boolean; error?: string }>(id, (raw) => `/api/questions/${encodeURIComponent(raw)}`, {
       cancel: true,
     }),
   mesh: () => jget<MeshStatus>('/api/mesh'),
+  deviceExecutor: () => jget<DeviceExecutorCapabilities>('/api/device-executor'),
+  setDeviceExecutor: (enabled: boolean, roots: Array<Omit<DeviceRootPolicy, 'id'> & { id?: string }>) =>
+    jpost<DeviceExecutorCapabilities | ApiError>('/api/device-executor', { enabled, roots }),
   revealDeviceToken: () => jpost<{ token?: string; error?: string }>('/api/device-token/reveal'),
   setMesh: (enable: boolean) => jpost<MeshStatus | ApiError>('/api/mesh', { enable }),
   auth: () => jget<{ requireToken: boolean; authed: boolean }>('/api/auth'),
   instructions: () => jget<Instruction[]>('/api/instructions'),
   setInstructions: (scope: string, content: string) =>
     jpost<Instruction[] | ApiError>('/api/instructions', { scope, content }),
-  rename: (id: string, title: string) => jpost<{ ok?: boolean; error?: string }>(`/api/sessions/${id}/title`, { title }),
+  rename: (id: string, title: string) => routedPost<{ ok?: boolean; error?: string }>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/title`, { title }),
   memory: (scope?: string) => jget<Memory[]>(`/api/memory${scope ? `?scope=${encodeURIComponent(scope)}` : ''}`),
   searchMemory: (q: string, scope?: string) =>
     jget<Memory[]>(`/api/memory?q=${encodeURIComponent(q)}${scope ? `&scope=${encodeURIComponent(scope)}` : ''}`),
@@ -1099,6 +1442,8 @@ export const api = {
   // Owner preferences (hub-side settings that are not safety switches).
   prefs: () => jget<HubPrefs>('/api/config/prefs'),
   setPrefs: (patch: Partial<HubPrefs>) => jpost<HubPrefs | ApiError>('/api/config/prefs', patch),
+  overseer: () => jget<OverseerStatus>('/api/overseer'),
+  configureOverseer: (profileId: string) => jpost<OverseerStatus | ApiError>('/api/overseer', { profileId }),
   // Danger Zone toggles.
   danger: () => jget<DangerFlags>('/api/config/danger'),
   setDanger: (patch: Partial<DangerFlags>) => jpost<DangerFlags | ApiError>('/api/config/danger', patch),

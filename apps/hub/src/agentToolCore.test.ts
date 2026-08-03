@@ -51,6 +51,9 @@ function makeHarness(opts: {
       browserCalls.push({ sessionId, operation, args })
       return [{ type: 'text', text: 'browser unavailable in test' }]
     },
+    remoteDevices: async () => [],
+    remoteExecute: async () => ({ ok: false, error: 'remote device unavailable in test' }),
+    overseerControl: async () => ({ ok: false, error: 'not the overseer in test' }),
     memory,
     practices,
     requireApproval: async (_id, kind, payload) => {
@@ -94,6 +97,14 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
       'browser_download_read',
       'browser_screenshot',
       'browser_status',
+      'remote_list_devices',
+      'remote_ping',
+      'remote_inspect_environment',
+      'remote_list_files',
+      'remote_read_file',
+      'remote_write_file',
+      'remote_exec',
+      'overseer_control',
     ])
     for (const t of AGENT_TOOLS) {
       expect(t.description.length).toBeGreaterThan(10)
@@ -150,6 +161,47 @@ describe('Agent Browser semantic actions', () => {
     for (const forbidden of ['selector', 'javascript', 'coordinate', 'x', 'y', 'path', 'grantToken']) {
       expect(schema).not.toContain(`"${forbidden}"`)
     }
+  })
+})
+
+describe('remote testbed tools', () => {
+  it('reveals only the roots and capabilities granted to this chat', async () => {
+    const h = makeHarness()
+    h.services.remoteDevices = async () => [{
+      siteId: 'site-a',
+      label: 'Test Device',
+      connected: true,
+      platform: 'linux',
+      arch: 'arm64',
+      hostname: 'lab',
+      roots: [{
+        id: 'root-a',
+        label: 'Workspace',
+        path: '/operator/private/path',
+        read: true,
+        write: false,
+        terminal: false,
+        grantedCapabilities: ['read'],
+      }],
+    }]
+    const out = await runAgentTool('remote_list_devices', {}, { identity: idA, services: h.services })
+    expect(out).toContain('Test Device')
+    expect(out).toContain('root-a')
+    expect(out).not.toContain('/operator/private/path')
+  })
+
+  it('hard-denies remote execution on teammate-caused turns unless the operator enabled risky bus tools', async () => {
+    const h = makeHarness({ isBusTurn: true })
+    let called = false
+    h.services.remoteExecute = async () => {
+      called = true
+      return { ok: true, stdout: 'should not run', exitCode: 0 }
+    }
+    const out = await runAgentTool('remote_exec', {
+      device_id: 'site-a', root_id: 'root-a', command: 'echo unsafe',
+    }, { identity: idA, services: h.services })
+    expect(out).toMatch(/unavailable on a teammate-caused turn/u)
+    expect(called).toBe(false)
   })
 })
 

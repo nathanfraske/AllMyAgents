@@ -42,6 +42,7 @@ import {
   waitForPortRelease,
 } from './restartRollback.js'
 import { bootstrapJournalRecoveryInWorker } from './journalRecovery.js'
+import { writeOverseerSupervisorStatus, type OverseerSupervisorPhase } from './overseerSupervisor.js'
 
 /** The hard public singleton the web client hardcodes (`api.ts:145`). Blue owns it; green takes it on promote.
  *  HUB_FIXED_PORT overrides it for an isolated harness (e.g. the restart-survival acceptance test) so a
@@ -71,6 +72,9 @@ const dataDir = process.env.HUB_DATA_DIR
   : path.resolve(import.meta.dirname, '..', '..', '..', 'data')
 const workerEnabled = !!process.env.HUB_WORKER_SOCKET || process.env.HUB_WORKER === '1'
 const workerSocket: string | undefined = workerEnabled ? defaultWorkerSocket(dataDir) : undefined
+// Process-lifetime channel credential shared only with blue, green, and the worker. Each child captures
+// and deletes it before it can launch a vendor process; a supervisor reboot rotates it automatically.
+const workerSecret: string | undefined = workerEnabled ? crypto.randomBytes(32).toString('hex') : undefined
 
 type HubColor = 'blue' | 'green'
 
@@ -144,6 +148,14 @@ let recoveryOfflineHold: ReturnType<typeof setInterval> | undefined
 
 function log(msg: string): void {
   console.log(`[hubctl] ${msg}`)
+}
+
+function overseerStatus(
+  phase: OverseerSupervisorPhase,
+  detail: string,
+  extra: { hubPid?: number; port?: number; attempt?: number; error?: string } = {},
+): void {
+  writeOverseerSupervisorStatus(dataDir, { phase, detail, ...extra })
 }
 
 function recoveryPolicyForFailure(
@@ -232,7 +244,9 @@ function spawnHub(
       HUB_PORT: String(port),
       HUB_SUPERVISED: '1',
       HUB_PREFLIGHT_ATTEMPT_ID: preflightAttemptId,
-      ...(workerSocket ? { HUB_WORKER_SOCKET: workerSocket } : {}),
+      ...(workerSocket && workerSecret
+        ? { HUB_WORKER_SOCKET: workerSocket, HUB_WORKER_SECRET: workerSecret }
+        : {}),
     },
   })
   const handle: HubHandle = {
@@ -245,6 +259,7 @@ function spawnHub(
     profilePublicEpoch: profileAuthority.publicEpoch,
     state: 'booting',
   }
+  overseerStatus('booting', `Booting ${color} hub`, { hubPid: child.pid, port })
   children.add(child)
   child.on('error', (err) => log(`hub(${color}) failed to spawn: ${String(err)}`))
   child.on('exit', (code, signal) => {
@@ -300,7 +315,12 @@ function spawnWorker(): ChildProcess | undefined {
   // The worker relays browser calls back to the hub and never talks to the
   // desktop bridge itself. Do not let the bridge secret flow through the
   // worker into Claude/Codex subprocess environments.
-  const workerEnv: NodeJS.ProcessEnv = { ...process.env, ...profileOwnerEnv, HUB_WORKER_SOCKET: workerSocket }
+  const workerEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...profileOwnerEnv,
+    HUB_WORKER_SOCKET: workerSocket,
+    HUB_WORKER_SECRET: workerSecret,
+  }
   delete workerEnv.AMA_DESKTOP_BROWSER_SECRET
   delete workerEnv.AMA_DESKTOP_BROWSER_ADDR
   const child = spawn(cmd, args, {
@@ -387,6 +407,7 @@ async function reviveLiveHub(): Promise<void> {
       if (tearingDown) return
       const wait = BACKOFF_MS[Math.min(consecutiveFailures, BACKOFF_MS.length - 1)] as number
       consecutiveFailures++
+      overseerStatus('retrying', `Live hub is down; retrying in ${wait}ms`, { attempt: consecutiveFailures })
       log(`live hub is down — respawning in ${wait}ms (attempt ${consecutiveFailures})`)
       await new Promise((r) => setTimeout(r, wait))
       if (tearingDown) return
@@ -441,6 +462,10 @@ async function reviveLiveHub(): Promise<void> {
           }
         }
         log(`respawn attempt ${consecutiveFailures} failed: ${String(err)}`)
+        overseerStatus('retrying', 'Hub respawn attempt failed', {
+          attempt: consecutiveFailures,
+          error: String(err),
+        })
         // loop and try again after a longer wait
       }
     }
@@ -454,6 +479,10 @@ function setLive(handle: HubHandle): void {
   if (live && restartListener) live.child.off('message', restartListener)
   live = handle
   handle.state = 'live'
+  overseerStatus('live', `Hub is live with ${handle.restored} restored session(s)`, {
+    hubPid: handle.child.pid,
+    port: handle.port,
+  })
   flipRecovery.adoptLiveReplacement()
   const listener = (m: unknown): void => {
     const msg = m as HubMsg
@@ -471,6 +500,7 @@ function clearLiveHandle(handle: HubHandle): void {
   if (restartListener) handle.child.off('message', restartListener)
   restartListener = null
   live = null
+  overseerStatus('retrying', 'The live hub exited; supervisor recovery is active', { hubPid: handle.child.pid })
 }
 
 /** Hard-kill a child and its whole process tree. Best-effort — never throws out of a teardown path. */
@@ -543,6 +573,7 @@ function enterRecoveryPoison(
 ): Promise<void> {
   if (recoveryInFlight) return recoveryInFlight
   recoveryPoisoned = true
+  overseerStatus('recovering', 'Journal recovery boundary is active', { error: reason })
   recoveryOfflineHold ??= setInterval(() => {
     // Intentionally ref'ed: an offline poisoned supervisor must remain present so the desktop cannot
     // relaunch a second supervisor against an unresolved root. Recovery is operator-visible in logs;
@@ -562,6 +593,7 @@ function enterRecoveryPoison(
     workerHandle = null
     await waitForPortRelease(FIXED_PORT, 10_000)
     if (policy !== 'automatic') {
+      overseerStatus('offline', 'Journal preflight refused automatic recovery; root remains offline', { error: reason })
       throw new Error('preflight refusal is not eligible for automatic recovery; root remains offline')
     }
 
@@ -655,6 +687,7 @@ function enterRecoveryPoison(
     log(
       `journal recovery remains visibly OFFLINE; operation=${operationId}; ${error instanceof Error ? error.message : String(error)}`
     )
+    overseerStatus('offline', 'Journal recovery did not produce a bootable hub', { error: String(error) })
   })
   recoveryInFlight = task
   return task
@@ -728,6 +761,10 @@ async function restart(reason: string): Promise<void> {
     return
   }
   flipInFlight = true
+  overseerStatus('restarting', 'Blue-green restart requested', {
+    hubPid: live.child.pid,
+    port: live.port,
+  })
   const blue = live
   let committed = false
   let greenMayOwnPublicListener = false
@@ -861,12 +898,14 @@ function teardown(signal: NodeJS.Signals): void {
     recoveryOfflineHold = undefined
   }
   log(`${signal} — tearing down hub(s) and exiting`)
+  overseerStatus('stopping', `Supervisor stopping after ${signal}`)
   for (const child of children) killTree(child)
   process.exit(0)
 }
 process.on('SIGINT', () => teardown('SIGINT'))
 process.on('SIGTERM', () => teardown('SIGTERM'))
 
+overseerStatus('starting', 'Supervisor starting')
 log(`supervisor starting (pid ${process.pid})`)
 boot().catch((err) => {
   // A FIRST boot that fails must NOT end the supervisor — this was the brick.
@@ -887,6 +926,7 @@ boot().catch((err) => {
   // The retry is cheap and the cap means a permanently broken install settles into one quiet attempt
   // every 30s rather than a hot loop.
   log(`hub failed its FIRST boot: ${String(err)}`)
+  overseerStatus('retrying', 'Hub failed its first boot; supervisor will keep retrying', { error: String(err) })
   log('supervisor staying up and retrying — fix the cause and it will come back on its own')
   void reviveLiveHub()
 })

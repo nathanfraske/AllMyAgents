@@ -70,3 +70,40 @@ describe('MeshSite registration', () => {
     expect(calls).toBe(1)
   })
 })
+
+describe('MeshSite route recovery', () => {
+  it('invalidates the idempotent stale mapping before asking for a replacement', async () => {
+    vi.useFakeTimers()
+    const calls: string[] = []
+    const request: MeshControlRequest = async (cmd) => {
+      calls.push(cmd)
+      if (cmd === 'site_unmap') return { ok: true, result: {} }
+      if (cmd === 'site_map') return { ok: true, result: { localPort: 48123 } }
+      throw new Error(`unexpected command ${cmd}`)
+    }
+    const mesh = new MeshSite({ port: 7777, controlRequest: request })
+
+    const pending = mesh.recoverSiteMap('peer-AAAA', 7777)
+    await vi.runAllTimersAsync()
+    await expect(pending).resolves.toBe(48123)
+    expect(calls).toEqual(['site_unmap', 'site_map'])
+  })
+
+  it('does not churn an actually offline mapping inside the recovery cooldown', async () => {
+    vi.useFakeTimers()
+    let calls = 0
+    const request: MeshControlRequest = async (cmd) => {
+      calls += 1
+      if (cmd === 'site_unmap') return { ok: true, result: {} }
+      if (cmd === 'site_map') return { ok: true, result: { localPort: 48124 } }
+      throw new Error(`unexpected command ${cmd}`)
+    }
+    const mesh = new MeshSite({ port: 7777, controlRequest: request })
+
+    const first = mesh.recoverSiteMap('peer-BBBB', 7777)
+    await vi.runAllTimersAsync()
+    await first
+    await expect(mesh.recoverSiteMap('peer-BBBB', 7777)).resolves.toBeNull()
+    expect(calls).toBe(2)
+  })
+})

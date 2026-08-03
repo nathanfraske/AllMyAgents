@@ -7,6 +7,14 @@ with access routed local-vs-remote?
 
 Confidence tags: **CONFIRMED-FROM-SOURCE** (read the code) / **INFERENCE** / **NEEDS-NODE-INFO**.
 
+> **Implementation update — 2026-08-01.** The desktop/same-machine client now ships the “full thing”
+> described below: a separately paired token per hub, bounded baseline and independent WebSocket cursor
+> per site, remote history, namespaced approvals/questions/attachments, and mutation routing back to the
+> owning hub. Fleet discovery also replaces a mapped-but-byte-dead site route with a bounded,
+> cooldown-protected `site_unmap`/`site_map` cycle. The original first-cut analysis remains below as
+> design history. A browser running on a different physical device still needs the local-hub gateway
+> described in `cross-machine-bridges.md`, because a mapping's `localhost:<port>` belongs to the hub PC.
+
 ---
 
 ## TL;DR verdict

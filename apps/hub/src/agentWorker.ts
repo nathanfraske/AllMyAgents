@@ -56,6 +56,7 @@ import {
   HubUnavailableError,
   newWorkerGeneration,
   stableApprovalId,
+  workerWelcomeProof,
   type HubToWorker,
   type LiveSession,
   type RelayMethod,
@@ -167,6 +168,12 @@ export function buildWorkerAgentServices(deps: WorkerAgentServiceDeps): AgentSer
       }) as Promise<{ ok: boolean; taskId?: string; error?: string }>,
     browser: (sessionId, operation, args) =>
       deps.relayRpc('browser.execute', { sessionId, operation, args }) as ReturnType<AgentServices['browser']>,
+    remoteDevices: (sessionId) =>
+      deps.relayRpc('remote.list', { sessionId }) as ReturnType<AgentServices['remoteDevices']>,
+    remoteExecute: (sessionId, siteId, action) =>
+      deps.relayRpc('remote.execute', { sessionId, siteId, action }) as ReturnType<AgentServices['remoteExecute']>,
+    overseerControl: (sessionId, input) =>
+      deps.relayRpc('overseer.control', { sessionId, input }) as ReturnType<AgentServices['overseerControl']>,
     memory: {
       write: (input) => deps.relayRpc('memory.write', input) as Promise<Memory>,
       search: (query, opts) => deps.relayRpc('memory.search', { query, opts }) as Promise<Memory[]>,
@@ -253,7 +260,7 @@ export class AgentWorker {
   // gates through `workerServices.danger()`; safe-default (all-OFF) until the first push.
   private danger: DangerFlags = SAFE_DANGER
 
-  constructor(socketPath: string) {
+  constructor(socketPath: string, authSecret = '') {
     this.server = new WorkerServer(socketPath, {
       onMessage: (msg) => this.onCommand(msg),
       onAttach: (info) => {
@@ -262,12 +269,16 @@ export class AgentWorker {
         // WorkerServer.attach() calls onAttach BEFORE it re-flushes the pending relay lane, so this `welcome`
         // reaches the hub ahead of any re-flushed rpc; the hub thus updates/clears its served-write cache
         // before a re-flushed (or new-era) write could be consulted against it (F1).
-        this.server.send({ t: 'welcome', generation: this.generation })
+        this.server.send({
+          t: 'welcome',
+          generation: this.generation,
+          authProof: workerWelcomeProof(authSecret, info.authNonce, info.attachEpoch, this.generation),
+        })
       },
       // onBufferedEvent is deliberately left unset: every event/lifecycle message is appended to the
       // wseq buffer at emit time (to assign its wseq), so the buffer ALREADY retains it — there is nothing
       // extra to buffer here (§2.3: a pure observability sink the transport never depends on).
-    })
+    }, authSecret)
     this.workerServices = buildWorkerAgentServices({
       relayRpc: (method, args) => this.relayRpc(method, args),
       relayApproval: (sessionId, kind, payload) => this.relayApproval(sessionId, kind, payload),
@@ -861,11 +872,18 @@ export class AgentWorker {
 
 async function main(): Promise<void> {
   const socketPath = process.env.HUB_WORKER_SOCKET
+  const authSecret = process.env.HUB_WORKER_SECRET
+  // The worker launches vendor CLIs. Never let the control-channel credential enter their environment.
+  delete process.env.HUB_WORKER_SECRET
   if (!socketPath) {
     console.error('[worker] HUB_WORKER_SOCKET is not set — nothing to listen on; exiting')
     process.exit(1)
   }
-  const worker = new AgentWorker(socketPath)
+  if (!authSecret || authSecret.length < 32) {
+    console.error('[worker] HUB_WORKER_SECRET is missing or too short; exiting')
+    process.exit(1)
+  }
+  const worker = new AgentWorker(socketPath, authSecret)
   await worker.start()
   console.log(`[worker] listening on ${socketPath} (pid ${process.pid})`)
   // A worker shutdown is a full teardown (hubctl killTree, rare) — best-effort stop the vendor children.

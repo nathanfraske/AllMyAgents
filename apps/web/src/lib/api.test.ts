@@ -105,7 +105,9 @@ describe('transport (res.ok respected; errors are not data)', () => {
   it('jget THROWS HubHttpError on a 401 error body, so a token-gated peer cannot be iterated as data', async () => {
     stubFetch(401, { error: 'device token required' })
     const { api, HubHttpError } = await loadApi()
-    const err = await api.sessionsFrom('http://localhost:1234').then(
+    const err = await api.sessionsFrom({
+      siteId: 'peer', label: 'Peer', local: false, baseUrl: 'http://localhost:1234', online: true,
+    }).then(
       () => null,
       (e) => e
     )
@@ -168,6 +170,205 @@ describe('transport (res.ok respected; errors are not data)', () => {
       ok: false,
       commitsBehind: 2,
       staleFiles: [{ file: 'apps/hub/src/sessions.ts' }],
+    })
+  })
+})
+
+describe('remote fleet routing', () => {
+  it('uses the owning hub base, strips only its registered namespace, and sends its own token', async () => {
+    const values = new Map<string, string>()
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
+    })
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true }),
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const { api, configureFleetSites, setFleetSiteToken } = await loadApi()
+    configureFleetSites([{ siteId: 'peer:node', label: 'Remote', local: false, baseUrl: 'http://localhost:45678', online: true }])
+    setFleetSiteToken('peer:node', 'remote-secret')
+
+    await api.send('peer:node:session-1', 'hello')
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://localhost:45678/api/sessions/session-1/input',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({ authorization: 'Bearer remote-secret' }),
+      }),
+    )
+  })
+
+  it('namespaces a session record returned by a remote mutation so follow-up actions stay remote', async () => {
+    const values = new Map<string, string>()
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({
+        id: 'session-1', profileId: 'claude-a', provider: 'claude', projectId: 'project-1',
+        status: 'idle', cwd: 'C:/work', createdAt: '2026-08-01T00:00:00.000Z',
+      }),
+    })))
+    const { api, configureFleetSites, setFleetSiteToken } = await loadApi()
+    configureFleetSites([{ siteId: 'peer', label: 'Remote', local: false, baseUrl: 'http://localhost:45678', online: true }])
+    setFleetSiteToken('peer', 'remote-secret')
+
+    const result = await api.setSettings('peer:session-1', { model: 'opus' })
+
+    expect(result).toMatchObject({
+      id: 'peer:session-1',
+      profileId: 'peer:claude-a',
+      projectId: 'peer:project-1',
+      siteId: 'peer',
+      siteLabel: 'Remote',
+    })
+  })
+
+  it('loads and saves device grants on the chat-owning hub without namespacing opaque target device ids', async () => {
+    const values = new Map<string, string>()
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
+    })
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => ({
+      ok: true,
+      status: 200,
+      text: async () => init?.method === 'POST'
+        ? JSON.stringify({
+            id: 'session-1', profileId: 'codex-a', provider: 'codex', status: 'idle', cwd: '/work',
+            createdAt: '2026-08-01T00:00:00.000Z',
+            remoteDeviceGrants: [{ siteId: 'target-device', rootIds: ['root-a'], capabilities: ['read'] }],
+          })
+        : JSON.stringify([{ siteId: 'target-device', label: 'Lab', paired: true, connected: true }]),
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const { api, configureFleetSites, setFleetSiteToken } = await loadApi()
+    configureFleetSites([{ siteId: 'owner', label: 'Owner', local: false, baseUrl: 'http://localhost:45678', online: true }])
+    setFleetSiteToken('owner', 'owner-secret')
+
+    await api.remoteDeviceCatalog('owner:session-1')
+    const record = await api.setRemoteDeviceGrants('owner:session-1', [
+      { siteId: 'target-device', rootIds: ['root-a'], capabilities: ['read'] },
+    ])
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      'http://localhost:45678/api/sessions/session-1/remote-devices',
+      'http://localhost:45678/api/sessions/session-1/remote-devices',
+    ])
+    expect((fetchMock.mock.calls[1]?.[1]?.headers as Record<string, string>).authorization).toBe('Bearer owner-secret')
+    expect(record).toMatchObject({
+      id: 'owner:session-1',
+      remoteDeviceGrants: [{ siteId: 'target-device', rootIds: ['root-a'], capabilities: ['read'] }],
+    })
+  })
+
+  it('routes a remote spawn to the project owner and translates account ids in both directions', async () => {
+    const values = new Map<string, string>()
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
+    })
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({
+        id: 'session-2', profileId: 'claude-a', provider: 'claude', projectId: 'project-1',
+        status: 'idle', cwd: 'C:/remote-work', createdAt: '2026-08-01T00:00:00.000Z',
+      }),
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const { api, configureFleetSites, setFleetSiteToken } = await loadApi()
+    configureFleetSites([{ siteId: 'peer', label: 'Remote', local: false, baseUrl: 'http://localhost:45678', online: true }])
+    setFleetSiteToken('peer', 'remote-secret')
+
+    const result = await api.spawn({ projectId: 'peer:project-1', profileId: 'peer:claude-a' })
+
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('http://localhost:45678/api/sessions')
+    expect(JSON.parse(String(init.body))).toMatchObject({ projectId: 'project-1', profileId: 'claude-a' })
+    expect(init.headers).toMatchObject({ authorization: 'Bearer remote-secret' })
+    expect(result).toMatchObject({
+      id: 'peer:session-2',
+      profileId: 'peer:claude-a',
+      projectId: 'peer:project-1',
+      siteId: 'peer',
+    })
+  })
+
+  it('retains a last-known remote target so an offline namespaced id cannot fall through locally', async () => {
+    const values = new Map<string, string>()
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
+    })
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => ({
+      ok: true,
+      status: 200,
+      text: async () => '{"ok":true}',
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const { api, configureFleetSites, setFleetSiteToken } = await loadApi()
+    configureFleetSites([{ siteId: 'peer', label: 'Remote', local: false, baseUrl: 'http://localhost:45678', online: true }])
+    setFleetSiteToken('peer', 'remote-secret')
+    configureFleetSites([{ siteId: 'local', label: 'Here', local: true, baseUrl: '', online: true }])
+
+    await api.send('peer:session-1', 'still remote')
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('http://localhost:45678/api/sessions/session-1/input')
+  })
+
+  it('runs project transcript discovery and import on the owner, then namespaces imported chats', async () => {
+    const values = new Map<string, string>()
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
+    })
+    const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => ({
+      ok: true,
+      status: 200,
+      text: async () => url.endsWith('/scan')
+        ? JSON.stringify({ chats: [], byProfile: {}, config: { mcpServers: [], hooks: [], memoryFiles: [] }, warnings: [] })
+        : JSON.stringify({
+            imported: [{
+              id: 'imported-1', profileId: 'codex-a', provider: 'codex', projectId: 'project-1',
+              status: 'idle', cwd: 'C:/remote-work', createdAt: '2026-08-01T00:00:00.000Z',
+            }],
+            skipped: 0,
+            notFound: [],
+          }),
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const { api, configureFleetSites, setFleetSiteToken } = await loadApi()
+    configureFleetSites([{ siteId: 'peer', label: 'Remote', local: false, baseUrl: 'http://localhost:45678', online: true }])
+    setFleetSiteToken('peer', 'remote-secret')
+
+    await api.scanProject('C:/remote-work', 'peer:project-1')
+    const imported = await api.importChats('peer:project-1', ['vendor-1'])
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      'http://localhost:45678/api/projects/scan',
+      'http://localhost:45678/api/projects/project-1/import',
+    ])
+    expect(imported).toMatchObject({
+      imported: [{
+        id: 'peer:imported-1',
+        profileId: 'peer:codex-a',
+        projectId: 'peer:project-1',
+        siteId: 'peer',
+      }],
     })
   })
 })

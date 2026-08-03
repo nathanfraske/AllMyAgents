@@ -19,6 +19,7 @@ vi.mock('./api', () => {
     HUB_WS: '',
     api: {
       profiles: vi.fn(async () => []),
+      rescanProfiles: vi.fn(async () => []),
       projects: vi.fn(async () => []),
       prefs: vi.fn(async () => ({ chatNamePool: 'everyone', steerMessagesAtToolBoundary: true })),
       setPrefs: vi.fn(async (patch: Record<string, unknown>) => ({
@@ -898,6 +899,148 @@ describe('event batching (replay does not render frame-by-frame)', () => {
       provider: 'codex',
       displayName: 'Research account',
     }])
+  })
+
+  it.each(['claude-default', 'codex-default'])(
+    'does not turn the internal %s import binding into a live account',
+    (id) => {
+      store.profiles = []
+      ingest(evt({
+        seq: 1,
+        kind: 'profiles/added',
+        sessionId: null,
+        payload: { id, provider: id.startsWith('claude') ? 'claude' : 'codex', source: 'default-home' },
+      }))
+
+      flush()
+
+      expect(store.profiles).toEqual([])
+    },
+  )
+
+  it('filters internal vendor homes from a skewed rescan response', async () => {
+    vi.mocked(api.rescanProfiles).mockResolvedValueOnce([
+      { id: 'claude-default', provider: 'claude' },
+      { id: 'codex-default', provider: 'codex' },
+      { id: 'claude-work', provider: 'claude', displayName: 'Work' },
+    ])
+
+    await store.rescanProfiles()
+
+    expect(store.profiles).toEqual([
+      { id: 'claude-work', provider: 'claude', displayName: 'Work' },
+    ])
+  })
+})
+
+describe('workspace pressure events', () => {
+  it('applies and clears the durable workspace warning on the live session record', () => {
+    seed('pressure')
+    const pressure = {
+      level: 'warning' as const,
+      totalBytes: 5 * 1024 ** 3,
+      artifactBytes: 3 * 1024 ** 3,
+      artifactGroups: [{ name: 'node_modules', bytes: 3 * 1024 ** 3 }],
+      reasons: ['workspace-size', 'build-artifacts'] as const,
+      partial: false,
+      observedAt: '2026-08-02T00:00:00.000Z',
+    }
+
+    apply(evt({ seq: 1, sessionId: 'pressure', kind: 'session/workspace-pressure', payload: { pressure } }))
+    expect(store.sessions.pressure?.record.workspacePressure).toEqual(pressure)
+
+    apply(evt({ seq: 2, sessionId: 'pressure', kind: 'session/workspace-pressure-cleared', payload: {} }))
+    expect(store.sessions.pressure?.record.workspacePressure).toBeUndefined()
+  })
+})
+
+describe('provider context compaction lifecycle', () => {
+  it('shows Claude while compaction is running and updates the same row on failure', () => {
+    seed('claude-chat', { provider: 'claude' })
+    apply(evt({
+      seq: 1,
+      sessionId: 'claude-chat',
+      kind: 'claude/system',
+      payload: { subtype: 'status', status: 'compacting', uuid: 'status-start' },
+    }))
+
+    let rows = store.sessions['claude-chat']!.items.filter((item) => item.kind === 'compaction')
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({ status: 'started', text: 'Claude context compaction started…' })
+
+    apply(evt({
+      seq: 2,
+      sessionId: 'claude-chat',
+      kind: 'claude/system',
+      payload: {
+        subtype: 'status',
+        status: null,
+        compact_result: 'failed',
+        compact_error: 'summary request timed out',
+        uuid: 'status-finish',
+      },
+    }))
+
+    rows = store.sessions['claude-chat']!.items.filter((item) => item.kind === 'compaction')
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({
+      status: 'failed',
+      text: 'Claude context compaction failed: summary request timed out',
+    })
+  })
+
+  it('shows Codex contextCompaction from item start through completion without duplicating the deprecated notification', () => {
+    seed('codex-chat', { provider: 'codex' })
+    apply(evt({
+      seq: 1,
+      sessionId: 'codex-chat',
+      kind: 'codex/item/started',
+      payload: { item: { type: 'contextCompaction', id: 'compact-1' } },
+    }))
+
+    let rows = store.sessions['codex-chat']!.items.filter((item) => item.kind === 'compaction')
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({ status: 'started', text: 'Codex context compaction started…' })
+
+    apply(evt({
+      seq: 2,
+      sessionId: 'codex-chat',
+      kind: 'codex/item/completed',
+      payload: { item: { type: 'contextCompaction', id: 'compact-1' } },
+    }))
+    apply(evt({
+      seq: 3,
+      sessionId: 'codex-chat',
+      kind: 'codex/thread/compacted',
+      payload: { threadId: 'thread-1', turnId: 'turn-1' },
+    }))
+
+    rows = store.sessions['codex-chat']!.items.filter((item) => item.kind === 'compaction')
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({ status: 'completed', text: 'Codex context compaction completed.' })
+  })
+
+  it('marks a started compaction unobservable when the turn ends without a terminal provider signal', () => {
+    seed('codex-chat', { provider: 'codex' })
+    apply(evt({
+      seq: 1,
+      sessionId: 'codex-chat',
+      kind: 'codex/item/started',
+      payload: { item: { type: 'contextCompaction', id: 'compact-unknown' } },
+    }))
+    apply(evt({
+      seq: 2,
+      sessionId: 'codex-chat',
+      kind: 'codex/turn/completed',
+      payload: { turn: { status: 'completed' } },
+    }))
+
+    expect(store.sessions['codex-chat']!.items.filter((item) => item.kind === 'compaction')).toEqual([
+      expect.objectContaining({
+        status: 'unobservable',
+        text: 'Codex context compaction ended without an observable terminal result.',
+      }),
+    ])
   })
 })
 

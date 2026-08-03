@@ -1,7 +1,7 @@
 <script lang="ts">
   import { store } from './store.svelte'
   import { settings } from './settings.svelte'
-  import { api, type MeshStatus, type Instruction, type Practice, type DangerFlags, type HubPrefs } from './api'
+  import { api, getFleetSiteToken, type DeviceExecutorCapabilities, type DeviceRootPolicy, type MeshStatus, type Instruction, type Practice, type DangerFlags, type HubPrefs, type OverseerStatus } from './api'
   import ProviderLogo from './ProviderLogo.svelte'
   import Icon from './Icon.svelte'
   import { modelsFor } from './catalog'
@@ -39,8 +39,46 @@
   } = $props()
   let writeError = $state('')
   let activeTab = $state<SettingsTabId>(loadSettingsTab())
+  const localProfiles = $derived(store.profiles.filter((profile) => !profile.siteId))
+  const localProjects = $derived(store.projects.filter((project) => !project.siteId))
   const updateLiveTurns = $derived(countLiveUpdateTurns(store.sessions))
   let waitForUpdateIdle = $state(false)
+  let overseerStatus = $state<OverseerStatus | null>(null)
+  let overseerProfileId = $state('')
+  let overseerBusy = $state(false)
+  let overseerError = $state('')
+
+  $effect(() => {
+    void api.overseer().then((value) => {
+      overseerStatus = value
+      if (value.profileId) overseerProfileId = value.profileId
+    }).catch((error) => (overseerError = error instanceof Error ? error.message : String(error)))
+  })
+  $effect(() => {
+    if (!overseerProfileId) overseerProfileId = localProfiles.find((profile) => profile.available !== false && profile.authStatus !== 'signed_out')?.id ?? ''
+  })
+
+  async function configureOverseer(): Promise<void> {
+    if (!overseerProfileId) return
+    overseerBusy = true
+    overseerError = ''
+    try {
+      const value = await api.configureOverseer(overseerProfileId)
+      if ('error' in value) {
+        overseerError = value.error
+        return
+      }
+      overseerStatus = value
+      if (value.sessionId) {
+        onclose()
+        store.select(value.sessionId)
+      }
+    } catch (error) {
+      overseerError = error instanceof Error ? error.message : String(error)
+    } finally {
+      overseerBusy = false
+    }
+  }
 
   $effect(() => {
     if (waitForUpdateIdle && updateLiveTurns === 0 && !updater.busy) {
@@ -74,6 +112,80 @@
       } else writeError = result.error
     } finally {
       meshBusy = false
+    }
+  }
+  let fleetTokenDrafts = $state<Record<string, string>>({})
+  let fleetPairBusy = $state('')
+  let fleetPairError = $state<Record<string, string>>({})
+  async function pairFleetSite(siteId: string): Promise<void> {
+    fleetPairBusy = siteId
+    const ok = await store.pairFleetSite(siteId, fleetTokenDrafts[siteId] ?? '')
+    fleetPairError = { ...fleetPairError, [siteId]: ok ? '' : 'Token rejected. Copy the device token from that machine’s Remote access settings.' }
+    if (ok) fleetTokenDrafts = { ...fleetTokenDrafts, [siteId]: '' }
+    fleetPairBusy = ''
+  }
+
+  // Target-side testbed policy. Pairing never enables this: the operator must select exact local roots
+  // and capabilities here before any approved chat on another hub can use them.
+  let deviceExecutor = $state<DeviceExecutorCapabilities | null>(null)
+  let deviceRoots = $state<DeviceRootPolicy[]>([])
+  let deviceEnabled = $state(false)
+  let deviceBusy = $state(false)
+  let deviceError = $state('')
+  let deviceSaved = $state(false)
+  let deviceWslDistro = $state('')
+  let deviceWslPath = $state('/home')
+  $effect(() => {
+    void api.deviceExecutor().then((value) => {
+      deviceExecutor = value
+      deviceEnabled = value.enabled
+      deviceRoots = value.roots
+      if (!deviceWslDistro) deviceWslDistro = value.environments?.find((environment) => environment.kind === 'wsl')?.distro ?? ''
+    }).catch((error) => (deviceError = error instanceof Error ? error.message : String(error)))
+  })
+  async function addDeviceRoot(): Promise<void> {
+    const picked = await api.pickFolder()
+    if (!picked?.path) return
+    const label = picked.path.split(/[\\/]/u).filter(Boolean).at(-1) ?? picked.path
+    if (deviceRoots.some((root) => root.path.toLocaleLowerCase() === picked.path.toLocaleLowerCase())) return
+    deviceRoots = [...deviceRoots, { id: '', label, path: picked.path, read: true, write: false, terminal: false }]
+  }
+  function addDeviceWslRoot(): void {
+    const distro = deviceWslDistro.trim()
+    const linuxPath = deviceWslPath.trim()
+    if (!distro || !linuxPath.startsWith('/')) {
+      deviceError = 'Choose a WSL distro and enter an absolute Linux path.'
+      return
+    }
+    if (deviceRoots.some((root) => root.environment?.kind === 'wsl' && root.environment.distro === distro && root.path === linuxPath)) return
+    const label = linuxPath.split('/').filter(Boolean).at(-1) ?? `${distro} root`
+    deviceRoots = [...deviceRoots, {
+      id: '', label: `${label} (${distro})`, path: linuxPath, environment: { kind: 'wsl', distro },
+      read: true, write: false, terminal: false,
+    }]
+    deviceError = ''
+  }
+  function patchDeviceRoot(index: number, patch: Partial<DeviceRootPolicy>): void {
+    deviceRoots = deviceRoots.map((root, rootIndex) => rootIndex === index ? { ...root, ...patch } : root)
+  }
+  async function saveDevicePolicy(): Promise<void> {
+    deviceBusy = true
+    deviceError = ''
+    try {
+      const value = await api.setDeviceExecutor(deviceEnabled, deviceRoots)
+      if ('error' in value) {
+        deviceError = value.error
+        return
+      }
+      deviceExecutor = value
+      deviceEnabled = value.enabled
+      deviceRoots = value.roots
+      deviceSaved = true
+      setTimeout(() => (deviceSaved = false), 1400)
+    } catch (error) {
+      deviceError = error instanceof Error ? error.message : String(error)
+    } finally {
+      deviceBusy = false
     }
   }
 
@@ -408,18 +520,26 @@
       if (result.status === 'complete' && result.ok) {
         // The credential is already durable. Roster presentation is best-effort: ProfileRuntime also
         // publishes profiles/added on the live stream, so an HTTP refresh failure must not turn a
-        // successful login into an endless spinner or a false "signed out" state.
-        const scan = await store.rescanProfiles(signal)
+        // successful login into an endless spinner or a false "signed out" state. Complete the modal
+        // FIRST and refresh in the background: the old awaited rescan left the blocking account UI in
+        // "waiting" even after the provider and hub had both finished successfully.
         loginState = 'done'
         loginStartedAt = undefined
-        loginMsg = scan.error
-          ? `Added ${result.added ?? name}. The account list will refresh automatically.`
-          : `Added ${result.added ?? name}. It now appears in your accounts.`
+        loginMsg = `Added ${result.added ?? name}. It now appears in your accounts.`
         loginId = ''
         loginRequestKey = ''
         loginUrl = ''
         loginCode = ''
         addName = ''
+        queueMicrotask(() => {
+          void store.rescanProfiles().then((scan) => {
+            if (scan.error) {
+              loginMsg = `Added ${result.added ?? name}. The account list will refresh automatically.`
+            }
+          }).catch(() => {
+            loginMsg = `Added ${result.added ?? name}. The account list will refresh automatically.`
+          })
+        })
         return
       }
       loginState = result.status === 'cancelled' ? 'cancelled' : 'error'
@@ -542,14 +662,14 @@
   // Sum a monthly budget across the user's accounts from live usage data — entirely client-side.
   // Codex accounts carry `codex.planType` (e.g. "pro"); Claude accounts have no dollar tier.
   function autoDetectBudget(): void {
-    if (store.profiles.length === 0) {
+    if (localProfiles.length === 0) {
       autoResult = { total: 0, lines: ['No accounts detected yet — add one above, then try again.'], assumed: 0 }
       return
     }
     let total = 0
     let assumed = 0
     const lines: string[] = []
-    for (const p of store.profiles) {
+    for (const p of localProfiles) {
       const snap = store.usage.find((u) => u.profileId === p.id)
       // `planType` is present on Codex snapshots but isn't in the web UsageSnapshot type — read it safely.
       const planType = (snap?.codex as { planType?: string } | undefined)?.planType
@@ -597,7 +717,7 @@
     <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Accounts')}>
       <h3>Accounts</h3>
       <div class="accounts">
-        {#each store.profiles as p (p.id)}
+        {#each localProfiles as p (p.id)}
           <div class="account-wrap">
             <div class="acct" class:signed-out={p.authStatus === 'signed_out'} class:unavailable={p.available === false}>
               <ProviderLogo provider={p.provider} size={14} />
@@ -672,7 +792,7 @@
       <label class="opt row2">Account
         <select value={settings.defaultAccount} onchange={(e) => settings.set('defaultAccount', (e.target as HTMLSelectElement).value)}>
           <option value="">last used</option>
-          {#each store.profiles as p (p.id)}<option value={p.id}>{profileOptionLabel(p)} · {p.provider}</option>{/each}
+          {#each localProfiles as p (p.id)}<option value={p.id}>{profileOptionLabel(p)} · {p.provider}</option>{/each}
         </select>
       </label>
       <label class="opt row2">Permission mode
@@ -802,9 +922,92 @@
         <p class="hint dim">
           Token <b>required</b> for every request. Pair a phone or another PC by entering this token there once.
         </p>
+        {#if store.fleetSites.some((site) => !site.local)}
+          <div class="fleet-pairing">
+            <span class="tlabel">Fleet machines</span>
+            {#each store.fleetSites.filter((site) => !site.local) as site (site.siteId)}
+              <div class="fleet-peer">
+                <div class="fleet-peer-head">
+                  <span>{site.label}</span>
+                  <span class="mstate" class:on={site.online && site.authState === 'paired'} class:warn={site.online && site.authState !== 'paired'} class:off={!site.online}>
+                    {!site.online ? 'mesh offline' : site.authState === 'paired' ? 'paired · live' : 'pairing required'}
+                  </span>
+                </div>
+                {#if site.authState === 'paired' && getFleetSiteToken(site.siteId)}
+                  <div class="token-row">
+                    <span class="hint dim">This browser can read and control that hub.</span>
+                    <button class="btn" onclick={() => store.unpairFleetSite(site.siteId)}>forget token</button>
+                  </div>
+                {:else}
+                  <div class="token-row">
+                    <input
+                      type="password"
+                      autocomplete="off"
+                      placeholder="Paste that machine’s device token"
+                      value={fleetTokenDrafts[site.siteId] ?? ''}
+                      oninput={(event) => (fleetTokenDrafts = { ...fleetTokenDrafts, [site.siteId]: (event.target as HTMLInputElement).value })}
+                    />
+                    <button class="btn" disabled={fleetPairBusy === site.siteId || !site.online} onclick={() => pairFleetSite(site.siteId)}>
+                      {fleetPairBusy === site.siteId ? 'pairing…' : 'pair'}
+                    </button>
+                  </div>
+                {/if}
+                {#if fleetPairError[site.siteId] || site.authError}
+                  <p class="hint warn">{fleetPairError[site.siteId] || site.authError}</p>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        {/if}
       {:else}
         <p class="dim">Checking mesh…</p>
       {/if}
+
+      <div class="testbed-policy">
+        <div class="testbed-head">
+          <div>
+            <h4>Authorize this machine as a testbed</h4>
+            <p class="hint dim">Off by default. Only the roots and operations below can be granted to individual chats on another paired hub.</p>
+          </div>
+          <label class="switch-label"><input type="checkbox" bind:checked={deviceEnabled} /> enabled</label>
+        </div>
+        {#if deviceExecutor}
+          <p class="hint dim">{deviceExecutor.hostname} Â· {deviceExecutor.platform}/{deviceExecutor.arch}</p>
+        {/if}
+        <div class="device-roots">
+          {#each deviceRoots as root, index (`${root.id}:${root.environment?.kind === 'wsl' ? root.environment.distro : 'host'}:${root.path}`)}
+            <div class="device-root">
+              <div class="device-root-main">
+                <input aria-label="Root label" value={root.label} oninput={(event) => patchDeviceRoot(index, { label: (event.target as HTMLInputElement).value })} />
+                <code title={root.path}>{root.environment?.kind === 'wsl' ? `WSL ${root.environment.distro} · ${root.path}` : `host · ${root.path}`}</code>
+                <button class="btn" aria-label={`Remove ${root.label}`} onclick={() => (deviceRoots = deviceRoots.filter((_, rootIndex) => rootIndex !== index))}>remove</button>
+              </div>
+              <div class="device-capabilities">
+                <label><input type="checkbox" checked={root.read} onchange={(event) => patchDeviceRoot(index, { read: (event.target as HTMLInputElement).checked })} /> read</label>
+                <label><input type="checkbox" checked={root.write} onchange={(event) => patchDeviceRoot(index, { write: (event.target as HTMLInputElement).checked })} /> write</label>
+                <label><input type="checkbox" checked={root.terminal} onchange={(event) => patchDeviceRoot(index, { terminal: (event.target as HTMLInputElement).checked })} /> terminal</label>
+              </div>
+            </div>
+          {/each}
+        </div>
+        <div class="testbed-actions">
+          <button class="btn" onclick={addDeviceRoot}>Add approved host folder</button>
+          <button class="btn btn-primary" disabled={deviceBusy} onclick={saveDevicePolicy}>{deviceBusy ? 'savingâ€¦' : deviceSaved ? 'Saved âœ“' : 'Save testbed policy'}</button>
+        </div>
+        {#if deviceExecutor?.environments?.some((environment) => environment.kind === 'wsl')}
+          <div class="wsl-root-add">
+            <select aria-label="WSL distro" bind:value={deviceWslDistro}>
+              {#each deviceExecutor.environments.filter((environment) => environment.kind === 'wsl') as environment (environment.id)}
+                <option value={environment.distro}>{environment.label}{environment.state ? ` · ${environment.state}` : ''}</option>
+              {/each}
+            </select>
+            <input aria-label="WSL approved path" bind:value={deviceWslPath} placeholder="/home/operator/project" />
+            <button class="btn" onclick={addDeviceWslRoot}>Add approved WSL folder</button>
+          </div>
+        {/if}
+        {#if deviceError}<p class="hint warn" role="alert">{deviceError}</p>{/if}
+        <p class="hint dim">Terminal commands start in the selected root with bounded time and output, but the shell retains this OS account's normal machine access. Pairing a machine or selecting Full access in a chat does not grant this authority.</p>
+      </div>
     </section>
 
     <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Operator profile & instructions')}>
@@ -815,8 +1018,8 @@
           <option value="global">Global — every agent</option>
           <option value="vendor:claude">All Claude</option>
           <option value="vendor:codex">All Codex</option>
-          {#each store.projects as p (p.id)}<option value="project:{p.id}">Project · {p.name}</option>{/each}
-          {#each store.profiles as pr (pr.id)}<option value="account:{pr.id}">Account · {profileOptionLabel(pr)}</option>{/each}
+          {#each localProjects as p (p.id)}<option value="project:{p.id}">Project · {p.name}</option>{/each}
+          {#each localProfiles as pr (pr.id)}<option value="account:{pr.id}">Account · {profileOptionLabel(pr)}</option>{/each}
         </select>
       </label>
       <textarea class="instr" rows="6" bind:value={instrContent} placeholder="e.g. I'm the operator. Terse commits, no emoji. Prefer pnpm. Ask before anything destructive."></textarea>
@@ -859,6 +1062,27 @@
         {/if}
       </section>
     {/if}
+
+    <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Overseer')}>
+      <h3>Application Overseer</h3>
+      <p class="hint dim">A dedicated, projectless control chat that runs from the app checkout with operator-level hub tools. Its account choice is stored outside the journal, while every live action is identity-checked and journaled.</p>
+      <label class="opt row2">Default account
+        <select bind:value={overseerProfileId}>
+          <option value="" disabled>Choose an account</option>
+          {#each localProfiles as profile (profile.id)}
+            <option value={profile.id} disabled={profile.available === false || profile.authStatus === 'signed_out'}>{profileOptionLabel(profile)} · {profile.provider}</option>
+          {/each}
+        </select>
+      </label>
+      <div class="overseer-actions">
+        <button class="btn btn-primary" disabled={!overseerProfileId || overseerBusy} onclick={configureOverseer}>
+          {overseerBusy ? 'Preparing Overseer…' : overseerStatus?.sessionId ? 'Open / change Overseer' : 'Create Overseer'}
+        </button>
+        {#if overseerStatus?.sessionId}<span class="hint ok">Configured · {overseerStatus.available ? 'ready' : 'account unavailable'}</span>{/if}
+      </div>
+      {#if overseerError}<p class="hint warn" role="alert">{overseerError}</p>{/if}
+      <p class="hint dim">If SQLite preflight fails, the vendor chat cannot run because chat state is journal-backed. The independent supervisor remains alive, records bounded diagnostics outside the database, and keeps recovery/restart authority. This UI does not blur those two failure boundaries.</p>
+    </section>
 
     <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Getting started')}>
       <h3>Getting started</h3>
@@ -1023,8 +1247,27 @@
   .mstate.warn { color: var(--warn); }
   .mstate.off { color: var(--muted); }
   .token-row { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-2); flex-wrap: wrap; }
+  .token-row input { flex: 1 1 16rem; min-width: 10rem; }
   .tlabel { font-size: var(--text-xs); }
   .token { flex: 1; min-width: 9rem; overflow: hidden; text-overflow: ellipsis; }
+  .fleet-pairing { display: grid; gap: var(--space-2); margin-top: var(--space-4); }
+  .fleet-peer { border: 1px solid var(--border-subtle); border-radius: var(--r-md); padding: var(--space-3); background: var(--surface-1); }
+  .fleet-peer-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-2); font-size: var(--text-sm); }
+  .fleet-peer .hint { margin: 0; }
+  .testbed-policy { margin-top: var(--space-5); padding-top: var(--space-5); border-top: 1px solid var(--border); }
+  .testbed-head { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--space-4); }
+  .testbed-head h4 { margin: 0 0 var(--space-1); font-size: var(--text-sm); }
+  .testbed-head p { margin: 0; }
+  .switch-label { display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-xs); }
+  .device-roots { display: grid; gap: var(--space-2); margin: var(--space-3) 0; }
+  .device-root { border: 1px solid var(--border-subtle); border-radius: var(--r-md); padding: var(--space-3); background: var(--surface-1); }
+  .device-root-main { display: grid; grid-template-columns: minmax(7rem, .45fr) minmax(10rem, 1fr) auto; gap: var(--space-2); align-items: center; }
+  .device-root-main code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: var(--text-xs); }
+  .device-capabilities { display: flex; gap: var(--space-4); margin-top: var(--space-2); }
+  .device-capabilities label { display: flex; align-items: center; gap: var(--space-1); font-size: var(--text-xs); }
+  .testbed-actions { display: flex; gap: var(--space-2); flex-wrap: wrap; }
+  .wsl-root-add { display: grid; grid-template-columns: minmax(9rem, .6fr) minmax(12rem, 1fr) auto; gap: var(--space-2); margin-top: var(--space-2); }
+  .overseer-actions { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }
   .instr { width: 100%; font-family: var(--mono); font-size: var(--text-xs); resize: vertical; margin-bottom: var(--space-2); line-height: 1.5; }
   .danger h3 { color: var(--bad-text); }
   .danger-reveal { border-color: var(--bad); color: var(--bad-text); }

@@ -9,9 +9,18 @@
   let { view }: { view: SessionView } = $props()
   let open = $state(false)
 
+  const available = $derived(store.profilesForProject(view.record.projectId))
   const current = $derived(store.profiles.find((p) => p.id === view.record.profileId))
   const hasHistory = $derived(view.items.some((i) => i.kind === 'user' || i.kind === 'assistant'))
-  const buttonLabel = $derived(current ? profileLabel(current) : (store.profiles.length ? 'Choose account' : 'Add account'))
+  const buttonLabel = $derived(
+    current
+      ? profileLabel(current)
+      : available.length
+        ? 'Choose account'
+        : view.record.siteId
+          ? 'No account on this machine'
+          : 'Add account',
+  )
   const lockReason = $derived.by(() => {
     if (view.record.isProjectManager) {
       return 'This manager account is bound to its live vendor thread and operator grant. Use Managers to rebuild or reassign the manager safely.'
@@ -56,7 +65,7 @@
     <div class="menu">
       {#if lockReason}
         <div class="locked-note"><strong>Account locked</strong><span>{lockReason}</span></div>
-      {:else if store.profiles.length === 0}
+      {:else if available.length === 0}
         <div class="empty">
           <div>No accounts yet.</div>
           <div class="dim">Add a Claude or Codex account in Settings to start a chat.</div>
@@ -67,7 +76,7 @@
         </div>
       {:else}
         {#if hasHistory}<div class="note dim">switching ports this chat's context + files to that account</div>{/if}
-        {#each store.profiles as p (p.id)}
+        {#each available as p (p.id)}
           <button class="row" class:sel={p.id === view.record.profileId} onclick={() => pick(p.id)}>
             <ProviderLogo provider={p.provider} size={13} />
             <span class="id" title={profileOptionLabel(p)}>{profileLabel(p)}</span>

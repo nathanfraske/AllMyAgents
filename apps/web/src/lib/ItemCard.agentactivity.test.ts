@@ -26,6 +26,28 @@ function userItem(text: string): ThreadItem {
   return { key: 'u1', kind: 'user', ts: '2026-07-26T00:00:00.000Z', text }
 }
 
+describe('context compaction timeline line', () => {
+  it('renders an active compaction as a full-width live status row', () => {
+    render(ItemCard, {
+      props: {
+        item: {
+          key: 'compact-1',
+          kind: 'compaction',
+          ts: '2026-07-26T00:00:00.000Z',
+          status: 'started',
+          text: 'Codex context compaction started…',
+        },
+        sessionId: 's1',
+      },
+    })
+
+    const status = screen.getByRole('status')
+    expect(status.textContent).toContain('Codex context compaction started…')
+    expect(status.classList.contains('active')).toBe(true)
+    expect(status.getAttribute('aria-live')).toBe('polite')
+  })
+})
+
 describe('bus frame in a user turn renders as an inbound blurb, not raw text', () => {
   it('shows the count + sender names and collapses the raw frame + trust paragraph', () => {
     render(ItemCard, { props: { item: userItem(FRAME), sessionId: 's1' } })

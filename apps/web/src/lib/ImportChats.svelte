@@ -37,7 +37,7 @@
       applyResult(preloaded)
       return
     }
-    const out = await api.scanProject(path)
+    const out = await api.scanProject(path, projectId)
     if (!out || 'error' in out) {
       scanning = false
       error = (out as { error?: string } | null)?.error ?? 'scan failed'

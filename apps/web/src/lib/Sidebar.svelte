@@ -13,6 +13,7 @@
   import { flip } from 'svelte/animate'
   import { cubicOut } from 'svelte/easing'
   import { loadCollapsedFolders, saveCollapsedFolders } from './uiState'
+  import { saveSettingsTab } from './settingsSections'
   import {
     createFolder,
     deleteFolder,
@@ -29,6 +30,36 @@
   let filter = $state('')
   let statusPopover = $state<'hub' | 'journal' | null>(null)
   let statusRegion = $state<HTMLDivElement | null>(null)
+  let overseerSessionId = $state<string | null>(null)
+  let supervisorDiagnostics = $state<{
+    status?: { phase?: string; detail?: string; updatedAt?: string; attempt?: number; error?: string; overseerProfileId?: string }
+    statusPath?: string
+    logTail?: string
+  } | null>(null)
+  const liveOverseer = $derived(store.sessionList.find((session) => session.record.isOverseer === true))
+
+  $effect(() => {
+    if (!store.connected) return
+    void api.overseer().then((value) => (overseerSessionId = value.sessionId ?? null)).catch(() => {})
+  })
+  $effect(() => {
+    if (store.connected) {
+      supervisorDiagnostics = null
+      return
+    }
+    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: <T>(command: string) => Promise<T> } } }).__TAURI__?.core?.invoke
+    if (invoke) void invoke<typeof supervisorDiagnostics>('overseer_diagnostics').then((value) => (supervisorDiagnostics = value)).catch(() => {})
+  })
+
+  function openOverseer(): void {
+    const sessionId = liveOverseer?.record.id ?? overseerSessionId
+    if (sessionId) {
+      store.select(sessionId)
+      return
+    }
+    saveSettingsTab('system')
+    store.settingsOpen = true
+  }
 
   const journalPhase = $derived(store.journalCompaction?.phase ?? 'idle')
   const journalLabel = $derived.by(() => {
@@ -57,6 +88,14 @@
   function displayStatusTime(value: string): string {
     const time = Date.parse(value)
     return Number.isFinite(time) ? new Date(time).toLocaleString() : value
+  }
+
+  function workspacePressureTitle(session: SessionView): string {
+    const pressure = session.record.workspacePressure
+    if (!pressure) return ''
+    const gib = pressure.totalBytes / (1024 ** 3)
+    const size = `${pressure.partial ? 'at least ' : ''}${gib >= 10 ? gib.toFixed(1) : gib.toFixed(2)} GiB`
+    return `${pressure.level === 'critical' ? 'Critical' : 'Large'} managed workspace: ${size}. Open the chat for details.`
   }
 
   function pathFor(id: string): string {
@@ -309,6 +348,7 @@
     }
     const byProject = new Map<string, SessionView[]>()
     for (const s of store.sessionList) {
+      if (s.record.isOverseer) continue
       if (!match(s)) continue
       const key = s.record.projectId ?? '__none__'
       const arr = byProject.get(key) ?? []
@@ -669,7 +709,7 @@
   <!-- Connectivity strip (its own row, below the title bar, above search). The title bar owns the ONE
        brand/wordmark now, so this no longer repeats it; it carries the home control (kept as a one-click
        button — deleting the old brand button would have removed the way back to the dashboard) and reads
-       out the hub connection in WORDS, not just a colour, from store.connected + store.hubDownSeconds. -->
+       out the hub connection in WORDS, not just a colour, including cold-start versus reconnect. -->
   <div class="connbar">
     <button
       class="homebtn"
@@ -682,19 +722,29 @@
     <div class="status-cluster" bind:this={statusRegion}>
       <button
         class="status-trigger hub-status"
-        class:problem={!store.connected}
+        class:working={store.hubConnectionPhase === 'starting'}
+        class:problem={store.hubConnectionPhase === 'reconnecting'}
         type="button"
         aria-haspopup="dialog"
         aria-expanded={statusPopover === 'hub'}
         aria-controls="hub-status-popout"
-        aria-label={`Hub: ${store.connected ? 'connected' : 'reconnecting'}`}
+        aria-label={`Hub: ${store.hubConnectionPhase}`}
         title="Hub connection details"
         onclick={() => toggleStatus('hub')}
       >
-        <span class="conn-label" class:down={!store.connected}>
-          {store.connected ? 'Connected' : store.hubDownSeconds > 0 ? `Reconnecting… ${store.hubDownSeconds}s` : 'Reconnecting…'}
+        <span class="conn-label" class:down={store.hubConnectionPhase === 'reconnecting'}>
+          {store.hubConnectionPhase === 'connected'
+            ? 'Connected'
+            : store.hubConnectionPhase === 'starting'
+              ? store.hubDownSeconds > 0 ? `Starting hub… ${store.hubDownSeconds}s` : 'Starting hub…'
+              : store.hubDownSeconds > 0 ? `Reconnecting… ${store.hubDownSeconds}s` : 'Reconnecting…'}
         </span>
-        <span class="status-dot" class:ok={store.connected} class:bad={!store.connected}></span>
+        <span
+          class="status-dot"
+          class:ok={store.hubConnectionPhase === 'connected'}
+          class:working={store.hubConnectionPhase === 'starting'}
+          class:bad={store.hubConnectionPhase === 'reconnecting'}
+        ></span>
       </button>
       <button
         class="status-trigger journal-status"
@@ -724,20 +774,42 @@
         <dialog id="hub-status-popout" class="status-popout" aria-label="Hub connection" open>
           <div class="status-popout-head">
             <strong>Hub connection</strong>
-            <span class="status-state" class:problem={!store.connected}>
-              <span class="status-dot" class:ok={store.connected} class:bad={!store.connected}></span>
-              {store.connected ? 'Connected' : 'Reconnecting'}
+            <span
+              class="status-state"
+              class:working={store.hubConnectionPhase === 'starting'}
+              class:problem={store.hubConnectionPhase === 'reconnecting'}
+            >
+              <span
+                class="status-dot"
+                class:ok={store.hubConnectionPhase === 'connected'}
+                class:working={store.hubConnectionPhase === 'starting'}
+                class:bad={store.hubConnectionPhase === 'reconnecting'}
+              ></span>
+              {store.hubConnectionPhase === 'connected' ? 'Connected' : store.hubConnectionPhase === 'starting' ? 'Starting' : 'Reconnecting'}
             </span>
           </div>
-          {#if store.connected}
+          {#if store.hubConnectionPhase === 'connected'}
             <p>The live connection to the local hub is active.</p>
+          {:else if store.hubConnectionPhase === 'starting' && store.hubDownSeconds >= 20}
+            <p>The local hub is still starting. Its supervisor is checking startup and retrying automatically.</p>
+          {:else if store.hubConnectionPhase === 'starting'}
+            <p>The desktop app is waiting for the local hub to finish startup.</p>
           {:else if store.hubDownSeconds >= 20}
             <p>The hub is being restarted automatically. Retry intervals can back off to 30 seconds.</p>
           {:else}
             <p>The live connection was interrupted and the app is reconnecting.</p>
           {/if}
           {#if !store.connected && store.hubDownSeconds > 0}
-            <div class="status-metric"><span>Disconnected for</span><b>{store.hubDownSeconds}s</b></div>
+            <div class="status-metric"><span>{store.hubConnectionPhase === 'starting' ? 'Starting for' : 'Disconnected for'}</span><b>{store.hubDownSeconds}s</b></div>
+          {/if}
+          {#if !store.connected && supervisorDiagnostics?.status}
+            <div class="supervisor-diagnostic">
+              <strong>Supervisor · {supervisorDiagnostics.status.phase ?? 'unknown'}</strong>
+              <p>{supervisorDiagnostics.status.detail ?? 'No detail reported.'}</p>
+              {#if supervisorDiagnostics.status.attempt}<div class="status-metric"><span>Recovery attempt</span><b>{supervisorDiagnostics.status.attempt}</b></div>{/if}
+              {#if supervisorDiagnostics.status.error}<code>{supervisorDiagnostics.status.error}</code>{/if}
+              {#if supervisorDiagnostics.statusPath}<small title={supervisorDiagnostics.statusPath}>{supervisorDiagnostics.statusPath}</small>{/if}
+            </div>
           {/if}
         </dialog>
       {:else if statusPopover === 'journal'}
@@ -774,6 +846,12 @@
   </div>
 
   <div class="search"><span class="sicon"><Icon name="search" size={13} /></span><input placeholder="Search sessions" bind:value={filter} /></div>
+
+  <button class="overseer-entry" class:configured={!!(liveOverseer || overseerSessionId)} onclick={openOverseer}>
+    <span class="overseer-mark"><Icon name="activity" size={14} /></span>
+    <span><b>Overseer</b><small>{liveOverseer || overseerSessionId ? 'Application control' : 'Set up application control'}</small></span>
+    <Icon name="chevron-right" size={13} />
+  </button>
 
   <div class="sec-head">
     <span>PROJECTS</span>
@@ -978,6 +1056,13 @@
                   </span>
                 {/if}
                 {#if s.record.siteLabel}<span class="rbadge" title="on {s.record.siteLabel} (remote fleet machine)"><Icon name="server" size={9} /></span>{/if}
+                {#if s.record.workspacePressure}
+                  <span
+                    class="wpressure {s.record.workspacePressure.level}"
+                    title={workspacePressureTitle(s)}
+                    aria-label={workspacePressureTitle(s)}
+                  ><Icon name="hard-drive" size={11} /></span>
+                {/if}
                 {#if unread > 0}<span class="mbadge" title={unreadMailTitle(unread)} aria-label={unreadMailTitle(unread)}><Icon name="mail" size={10} /><span class="tnum">{unread}</span></span>{/if}
                 {#if pending > 0}<span class="pbadge tnum">{pending}</span>{/if}
                 {#if warnOf(s, st)}
@@ -1032,6 +1117,7 @@
   .hub-status { flex: 1; min-width: 0; justify-content: flex-end; padding: 0 var(--space-2); }
   .journal-status { flex: none; width: 32px; padding: 0; }
   .journal-status.working { color: var(--accent); }
+  .hub-status.working { color: var(--accent); }
   .journal-status.ok { color: var(--ok); }
   .journal-status.warn { color: var(--warn); }
   .journal-status.bad { color: var(--bad-text); }
@@ -1056,7 +1142,17 @@
   .status-metric { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); color: var(--text-dim); font-size: var(--text-xs); }
   .status-metric b { color: var(--text); font-weight: var(--fw-medium); font-variant-numeric: tabular-nums; }
   .status-time { color: var(--dim); font-size: var(--text-2xs); }
+  .supervisor-diagnostic { display: grid; gap: var(--space-2); padding-top: var(--space-2); border-top: 1px solid var(--border); }
+  .supervisor-diagnostic strong { color: var(--accent); font-size: var(--text-xs); text-transform: capitalize; }
+  .supervisor-diagnostic code { max-height: 5rem; overflow: auto; color: var(--warn); white-space: pre-wrap; font-size: var(--text-2xs); }
+  .supervisor-diagnostic small { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-2xs); }
   .search { position: relative; padding: 0 var(--space-4) var(--space-3); }
+  .overseer-entry { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: var(--space-2); margin: 0 var(--space-3) var(--space-3); padding: var(--space-2) var(--space-3); border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface); color: var(--text); text-align: left; }
+  .overseer-entry:hover, .overseer-entry.configured { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+  .overseer-entry span:nth-child(2) { display: flex; min-width: 0; flex-direction: column; }
+  .overseer-entry b { font-size: var(--text-xs); font-weight: var(--fw-semibold); }
+  .overseer-entry small { color: var(--muted); font-size: var(--text-2xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .overseer-mark { display: grid; color: var(--accent); }
   .sicon { position: absolute; left: 1.15rem; top: calc(50% - 0.25rem); transform: translateY(-50%); color: var(--dim); display: grid; }
   .search input { width: 100%; padding-left: 1.9rem; }
   .sec-head { display: flex; align-items: center; justify-content: space-between; padding: var(--space-2) var(--space-5); font-size: var(--text-2xs); letter-spacing: var(--ls-label); text-transform: uppercase; color: var(--dim); }
@@ -1244,6 +1340,8 @@
   .rdots { display: inline-flex; align-items: center; gap: 3px; flex: none; }
   .rdots i { width: 3px; height: 3px; border-radius: 50%; background: var(--accent); opacity: 0.4; }
   .rwarn { flex: none; display: inline-grid; place-items: center; color: var(--bad-text, #e5484d); }
+  .wpressure { flex: none; display: inline-grid; place-items: center; color: var(--warn); }
+  .wpressure.critical { color: var(--bad-text, #e5484d); }
   .pbadge { background: var(--warn); color: #111; border-radius: var(--r-pill); padding: 0 0.35rem; font-size: var(--text-2xs); font-weight: var(--fw-semibold); }
   /* Unread teammate mail. Same pill family as .pbadge, but the envelope glyph (not colour) carries the
      meaning — so it stays legible for anyone who can't distinguish the accent hue, and reads distinctly
@@ -1251,7 +1349,7 @@
   .mbadge { flex: none; display: inline-flex; align-items: center; gap: 0.15rem; background: var(--accent); color: #fff; border-radius: var(--r-pill); padding: 0 0.3rem; font-size: var(--text-2xs); font-weight: var(--fw-semibold); }
   .ractions { display: none; gap: 0.15rem; }
   .row:hover .ractions { display: flex; }
-  .row:hover .rtime, .row:hover .rdots, .row:hover .rwarn { display: none; }
+  .row:hover .rtime, .row:hover .rdots, .row:hover .rwarn, .row:hover .wpressure { display: none; }
   .mini { display: grid; place-items: center; color: var(--dim); width: 20px; height: 20px; border-radius: var(--r-xs); }
   .mini:hover { background: var(--surface-3); color: var(--text); }
   .mini.del:hover { background: var(--surface-3); color: var(--bad-text); }

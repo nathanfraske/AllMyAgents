@@ -229,6 +229,16 @@ export interface InProcessExecutorHubHooks {
     operation: Parameters<AgentServices['browser']>[1],
     args: Record<string, unknown>
   ): ReturnType<AgentServices['browser']>
+  remoteDevices(sessionId: string): ReturnType<AgentServices['remoteDevices']>
+  remoteExecute(
+    sessionId: string,
+    siteId: string,
+    action: Parameters<AgentServices['remoteExecute']>[2],
+  ): ReturnType<AgentServices['remoteExecute']>
+  overseerControl(
+    sessionId: string,
+    input: Parameters<AgentServices['overseerControl']>[1],
+  ): ReturnType<AgentServices['overseerControl']>
 }
 
 /**
@@ -292,6 +302,9 @@ export class InProcessExecutor implements Executor {
       assignChildTask: (managerSessionId, childSessionId, input) =>
         this.h.managerAssignChildTask(managerSessionId, childSessionId, input),
       browser: (sessionId, operation, args) => this.h.browser(sessionId, operation, args),
+      remoteDevices: (sessionId) => this.h.remoteDevices(sessionId),
+      remoteExecute: (sessionId, siteId, action) => this.h.remoteExecute(sessionId, siteId, action),
+      overseerControl: (sessionId, input) => this.h.overseerControl(sessionId, input),
       memory: this.services.memory,
       practices: this.services.practices,
       requireApproval: (id, kind, payload) => this.services.approvals.request(id.sessionId, kind, payload),

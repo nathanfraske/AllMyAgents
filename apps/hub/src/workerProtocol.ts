@@ -32,7 +32,7 @@ export interface WorkerSessionSpec {
 
 /** Hub → worker. Commands carry a reqId (request/reply); pushes are fire-and-forget. */
 export type HubToWorker =
-  | { t: 'hello'; attachEpoch: number; danger: DangerFlags } // first frame on every (re)connect; establishes the live channel
+  | { t: 'hello'; authNonce: string; authProof: string; attachEpoch: number; danger: DangerFlags } // first frame authenticates + establishes the live channel
   | { t: 'startThread'; reqId: string; spec: WorkerSessionSpec }
   | {
       t: 'runTurn'
@@ -66,7 +66,7 @@ export type WorkerToHub =
   // worker's) from a socket FLAP to the SAME process (same generation). It clears its served-write cache on
   // the former and keeps it on the latter, so §8.2 re-flush dedup still holds while F1 can't return a stale
   // cached write. Sent BEFORE the transport's on-attach relay re-flush (WorkerServer.attach order).
-  | { t: 'welcome'; generation: string }
+  | { t: 'welcome'; generation: string; authProof: string }
   // vendor event stream — the SAME kinds the hub journals today (claude/*, codex/*, session/tokens, …),
   // each tagged sessionId + a per-session monotonic wseq (§7):
   | { t: 'event'; sessionId: string; wseq: number; kind: string; payload: unknown }
@@ -111,6 +111,9 @@ export type RelayMethod =
   | 'practices.get'
   | 'practices.list'
   | 'browser.execute'
+  | 'remote.list'
+  | 'remote.execute'
+  | 'overseer.control'
 
 // --- Transient-gap constants + retryable shape (§1.5) — single source of truth for both sides. ---
 
@@ -156,6 +159,36 @@ export function nextReqId(): string {
  */
 export function newWorkerGeneration(): string {
   return `wg_${crypto.randomBytes(12).toString('hex')}`
+}
+
+/** Fresh per-connection nonce. The worker remembers used nonces so a captured hello cannot be replayed. */
+export function newWorkerAuthNonce(): string {
+  return crypto.randomBytes(32).toString('hex')
+}
+
+/** Direction-bound handshake proofs keep the process credential off the wire and authenticate both ends. */
+export function workerHelloProof(
+  secret: string,
+  authNonce: string,
+  attachEpoch: number,
+  danger: DangerFlags,
+): string {
+  return crypto
+    .createHmac('sha256', secret)
+    .update(`allmyagents.worker.hello.v1\0${authNonce}\0${attachEpoch}\0${safeStringify(danger)}`)
+    .digest('hex')
+}
+
+export function workerWelcomeProof(
+  secret: string,
+  authNonce: string,
+  attachEpoch: number,
+  generation: string,
+): string {
+  return crypto
+    .createHmac('sha256', secret)
+    .update(`allmyagents.worker.welcome.v1\0${authNonce}\0${attachEpoch}\0${generation}`)
+    .digest('hex')
 }
 
 /**

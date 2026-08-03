@@ -255,4 +255,26 @@ describe('buildFleet (unified-across-mesh roster, first cut)', () => {
     const awake = await buildFleet(shared)
     expect(awake[1]).toMatchObject({ siteId: 'sleepy', online: true })
   })
+
+  it('replaces a mapped-but-silent tunnel once and probes the replacement port', async () => {
+    const probes: string[] = []
+    const recovered: Array<[string, number]> = []
+    const out = await buildFleet(deps({
+      roster: async () => [member('peer', 'Remote PC')],
+      peerSites: async () => [advertised('peer-AAAA', 7777)],
+      siteMap: async () => 47020,
+      recoverSiteMap: async (node, port) => {
+        recovered.push([node, port])
+        return 47021
+      },
+      probeHealth: async (base) => {
+        probes.push(base)
+        return base.endsWith(':47021')
+      },
+    }))
+
+    expect(recovered).toEqual([['peer', 7777]])
+    expect(probes).toEqual(['http://localhost:47020', 'http://localhost:47021'])
+    expect(out[1]).toMatchObject({ baseUrl: 'http://localhost:47021', online: true })
+  })
 })

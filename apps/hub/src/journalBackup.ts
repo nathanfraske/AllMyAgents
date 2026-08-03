@@ -82,6 +82,8 @@ const DEFAULT_SHUTDOWN_WAIT_MS = 2_000
 const PREFIX = 'hub-'
 const SUFFIX = '.db'
 const PARTIAL_SUFFIX = `${SUFFIX}.partial`
+/** SQLite writes these beside any database it opens — including a read-only verification open. */
+const SIDECAR_SUFFIXES = ['-wal', '-shm'] as const
 
 export interface SnapshotResult {
   ok: boolean
@@ -386,6 +388,14 @@ function rotate(
     if (!victim) break
     try {
       fs.rmSync(path.join(dir, victim.name), { force: true })
+      // Retire the WHOLE SQLite family, not just the main file. Verification opens each snapshot, and on
+      // Windows even a read-only open manufactures `-wal`/`-shm` beside it (see the note in verify()).
+      // Rotation used to delete only the `.db`, so every generation it retired left its two sidecars
+      // behind permanently — they match neither this filter (`.db-wal` does not end in `.db`) nor the
+      // partial sweep. Hundreds accumulated in one operator's backups directory.
+      for (const sidecar of SIDECAR_SUFFIXES) {
+        fs.rmSync(path.join(dir, `${victim.name}${sidecar}`), { force: true })
+      }
       retainedBytes -= victim.bytes
       log(`[journal-backup] rotated out ${victim.name}`)
     } catch {
@@ -405,7 +415,15 @@ function cleanupStalePartials(dir: string, log: (m: string) => void): void {
   try {
     entries = fs
       .readdirSync(dir)
-      .filter((name) => name.startsWith(PREFIX) && name.endsWith(PARTIAL_SUFFIX))
+      // A staged partial is a whole SQLite family too. Matching only the exact `.db.partial` left every
+      // `.db.partial-wal` / `.db.partial-shm` on disk forever, since rotation's `.db` filter never sees
+      // them either — the same orphan class the rotation fix above closes.
+      .filter(
+        (name) =>
+          name.startsWith(PREFIX) &&
+          (name.endsWith(PARTIAL_SUFFIX) ||
+            SIDECAR_SUFFIXES.some((sidecar) => name.endsWith(`${PARTIAL_SUFFIX}${sidecar}`)))
+      )
   } catch {
     return
   }

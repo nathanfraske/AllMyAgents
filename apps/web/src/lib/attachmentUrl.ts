@@ -1,4 +1,4 @@
-import { HUB_HTTP, getHubToken } from './api'
+import { resolveHubResource } from './api'
 
 // The URL the transcript uses to DISPLAY a stored attachment (an <img src> or a download link). This is
 // the display/GET side of attachments; it is intentionally separate from the composer's staging object
@@ -9,7 +9,7 @@ import { HUB_HTTP, getHubToken } from './api'
 // `?token=` query param on the GET-serve route (noted to the hub owner). On a same-origin dev/sandbox
 // hub (no token) it is a plain relative URL that the vite proxy forwards.
 export function attachmentUrl(sessionId: string, attachmentId: string): string {
-  const base = `${HUB_HTTP}/api/sessions/${encodeURIComponent(sessionId)}/attachments/${encodeURIComponent(attachmentId)}`
-  const token = getHubToken()
-  return token ? `${base}?token=${encodeURIComponent(token)}` : base
+  const target = resolveHubResource(sessionId)
+  const url = `${target.baseUrl}/api/sessions/${encodeURIComponent(target.id)}/attachments/${encodeURIComponent(attachmentId)}`
+  return target.token ? `${url}?token=${encodeURIComponent(target.token)}` : url
 }

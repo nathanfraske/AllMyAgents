@@ -69,6 +69,12 @@ function seedDraft(provider: 'claude' | 'codex' = 'claude'): void {
   store.selectedId = 'draft:1'
 }
 
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((done) => (resolve = done))
+  return { promise, resolve }
+}
+
 function clipboardPaste(el: Element, files: File[], text = ''): void {
   const event = new Event('paste', { bubbles: true, cancelable: true }) as Event & { clipboardData: unknown }
   Object.defineProperty(event, 'clipboardData', {
@@ -351,5 +357,33 @@ describe('attachment composer front door', () => {
       expect.objectContaining({ attachments: ['att-first.png'] }),
     )
     expect(apiMock.deleteSession).not.toHaveBeenCalled()
+  })
+
+  it('carries new composer text across a delayed draft-to-real chat transition', async () => {
+    const pending = deferred<SessionRecord>()
+    apiMock.spawn.mockReturnValue(pending.promise)
+    seedDraft('claude')
+    const rendered = render(ThreadView, { props: { sessionId: 'draft:1' } })
+    let textarea = rendered.container.querySelector('.composer textarea') as HTMLTextAreaElement
+
+    await fireEvent.input(textarea, { target: { value: 'Start this chat.' } })
+    await fireEvent.keyDown(textarea, { key: 'Enter' })
+    await waitFor(() => expect(apiMock.spawn).toHaveBeenCalledTimes(1))
+    expect(textarea.value).toBe('')
+    await fireEvent.input(textarea, { target: { value: 'Follow-up typed during startup.' } })
+
+    pending.resolve({
+      id: 'real-1',
+      profileId: 'p1',
+      provider: 'claude',
+      cwd: 'C:/work',
+      status: 'starting',
+      createdAt: '2026-07-27T00:00:01.000Z',
+    } as SessionRecord)
+    await waitFor(() => expect(store.sessions['real-1']).toBeTruthy())
+    await rendered.rerender({ sessionId: 'real-1' })
+    textarea = rendered.container.querySelector('.composer textarea') as HTMLTextAreaElement
+
+    await waitFor(() => expect(textarea.value).toBe('Follow-up typed during startup.'))
   })
 })

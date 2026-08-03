@@ -93,4 +93,26 @@ describe('sidebar worktree marker', () => {
     expect(row?.querySelector('.manager-role-compact')?.textContent?.trim()).toBe('1')
     expect(row?.querySelector('.manager-role-compact')?.getAttribute('aria-hidden')).toBe('true')
   })
+
+  it('badges a measured large managed checkout without badging direct project work', () => {
+    store.sessions.isolated!.record.workspacePressure = {
+      level: 'critical',
+      totalBytes: 13 * 1024 ** 3,
+      artifactBytes: 9 * 1024 ** 3,
+      artifactGroups: [{ name: 'node_modules', bytes: 9 * 1024 ** 3 }],
+      reasons: ['workspace-size', 'build-artifacts'],
+      partial: true,
+      observedAt: createdAt,
+    }
+
+    const { container } = render(Sidebar)
+    const rows = [...container.querySelectorAll<HTMLElement>('.row')]
+    const isolated = rows.find((row) => row.textContent?.includes('isolated chat'))
+    const direct = rows.find((row) => row.textContent?.includes('direct chat'))
+
+    const pressure = isolated?.querySelector<HTMLElement>('.wpressure')
+    expect(pressure?.classList.contains('critical')).toBe(true)
+    expect(pressure?.title).toContain('at least 13.0 GiB')
+    expect(direct?.querySelector('.wpressure')).toBeNull()
+  })
 })

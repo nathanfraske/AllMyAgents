@@ -36,6 +36,7 @@ import type { DangerFlags, Profile, SessionRecord, SessionStatus } from './types
 // exercise the five step-7 properties (a)–(e) plus the transport lows (L4/L6) folded in, all socket-free.
 
 const SAFE: DangerFlags = { busCanUseRiskyTools: false, autoApprovePractices: false, autoApproveRestart: false }
+const WORKER_SECRET = 'transient-gap-worker-secret-000000000000000000000000'
 const IDENTITY: SessionIdentity = { sessionId: 's1', profileId: 'p1', provider: 'claude', projectId: 'proj1', label: 'demo' }
 
 /** Flush the microtask + one macrotask so a dispatchRpc's async serve + `send` settle. */
@@ -210,16 +211,21 @@ describe('WorkerClient.signalDraining — drain / release wiring (§8.4)', () =>
   interface ClientPeek {
     channel?: { send(m: HubToWorker): void; readonly isClosed: boolean; destroy(): void }
     attachEpoch: number
+    authenticated: boolean
   }
   function newClient(attachEpoch?: number): WorkerClient {
     // Constructed directly; we never call connect() on a real socket, only inject/read private state.
-    return new WorkerClient('\\\\.\\pipe\\ama-step7-client-never', attachEpoch !== undefined ? { attachEpoch } : {})
+    return new WorkerClient('\\\\.\\pipe\\ama-step7-client-never', {
+      ...(attachEpoch !== undefined ? { attachEpoch } : {}),
+      authSecret: WORKER_SECRET,
+    })
   }
 
   it('signalDraining(true) sends the drain hold when attached', () => {
     const client = newClient()
     const sent: HubToWorker[] = []
     ;(client as unknown as ClientPeek).channel = { send: (m) => sent.push(m), get isClosed() { return false }, destroy() {} }
+    ;(client as unknown as ClientPeek).authenticated = true
     client.signalDraining(true)
     expect(sent).toEqual([{ t: 'draining' }])
     client.close()
@@ -229,6 +235,7 @@ describe('WorkerClient.signalDraining — drain / release wiring (§8.4)', () =>
     const client = newClient()
     const sent: HubToWorker[] = []
     ;(client as unknown as ClientPeek).channel = { send: (m) => sent.push(m), get isClosed() { return false }, destroy() {} }
+    ;(client as unknown as ClientPeek).authenticated = true
     client.signalDraining(false)
     expect(sent).toEqual([{ t: 'draining', on: false }])
     client.close()

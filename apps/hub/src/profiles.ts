@@ -10,9 +10,10 @@ export interface ProfileAuthEvidence {
 
 /**
  * Infer only what the credential on disk can honestly prove at boot. A recognized token with a
- * future expiry (or a non-expiring API key) is locally signed in; a missing, malformed, or expired
- * credential is signed out. Tokens without an inspectable expiry remain unknown until a real login
- * or vendor request succeeds. File presence alone must never be reported as a healthy account.
+ * future expiry (or a non-expiring API key) is locally signed in; a missing or malformed credential is
+ * signed out. An expired access token WITH refresh material is deliberately unknown: OAuth access tokens
+ * are short-lived and the vendor refreshes them lazily, so expiry alone cannot honestly log an account
+ * out. A vendor invalid_grant/refresh failure remains the authoritative terminal signal elsewhere.
  */
 export function profileAuthEvidence(
   profile: Pick<Profile, 'id' | 'provider' | 'dir'>,
@@ -33,22 +34,32 @@ export function profileAuthEvidence(
   if (profile.provider === 'claude') {
     const oauth = asRecord(credential.claudeAiOauth)
     const token = stringValue(oauth?.accessToken) ?? stringValue(oauth?.access_token)
-    if (!token) return signedOut('Claude credential has no access token. Sign in again.')
+    const refresh = stringValue(oauth?.refreshToken) ?? stringValue(oauth?.refresh_token)
+    if (!token) {
+      return refresh ? {} : signedOut('Claude credential has no access or refresh token. Sign in again.')
+    }
 
     const expiry = claudeExpiryMs(oauth?.expiresAt ?? oauth?.expires_at)
     if (expiry === undefined) return {}
-    if (expiry <= nowMs) return signedOut('Claude credential has expired. Sign in again.')
+    if (expiry <= nowMs) {
+      return refresh ? {} : signedOut('Claude credential has expired and cannot be refreshed. Sign in again.')
+    }
     return { authStatus: 'signed_in' }
   }
 
   if (stringValue(credential.OPENAI_API_KEY)) return { authStatus: 'signed_in' }
   const tokens = asRecord(credential.tokens)
   const token = stringValue(tokens?.access_token) ?? stringValue(tokens?.accessToken)
-  if (!token) return signedOut('Codex credential has no access token. Sign in again.')
+  const refresh = stringValue(tokens?.refresh_token) ?? stringValue(tokens?.refreshToken)
+  if (!token) {
+    return refresh ? {} : signedOut('Codex credential has no access or refresh token. Sign in again.')
+  }
 
   const expiry = jwtExpiryMs(token)
   if (expiry === undefined) return {}
-  if (expiry <= nowMs) return signedOut('Codex credential has expired. Sign in again.')
+  if (expiry <= nowMs) {
+    return refresh ? {} : signedOut('Codex credential has expired and cannot be refreshed. Sign in again.')
+  }
   return { authStatus: 'signed_in' }
 }
 
