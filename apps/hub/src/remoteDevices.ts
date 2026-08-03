@@ -243,6 +243,18 @@ function wslEnvironmentId(distro: string): string {
   return `wsl:${distro}`
 }
 
+function environmentValue(name: string): string | undefined {
+  const entry = Object.entries(process.env).find(([key]) => key.toUpperCase() === name)
+  return entry?.[1]
+}
+
+function windowsPowerShell(): { program: string; label: string } {
+  const programFiles = environmentValue('PROGRAMFILES')
+  const modern = programFiles ? path.join(programFiles, 'PowerShell', '7', 'pwsh.exe') : undefined
+  if (modern && fs.existsSync(modern)) return { program: modern, label: 'PowerShell 7' }
+  return { program: 'powershell.exe', label: 'Windows PowerShell' }
+}
+
 function hostEnvironment(): RemoteExecutionEnvironment {
   return {
     id: 'host',
@@ -250,7 +262,7 @@ function hostEnvironment(): RemoteExecutionEnvironment {
     label: `${os.hostname()} host`,
     platform: process.platform,
     arch: process.arch,
-    shell: process.platform === 'win32' ? 'PowerShell' : '/bin/sh',
+    shell: process.platform === 'win32' ? windowsPowerShell().label : '/bin/sh',
   }
 }
 
@@ -561,7 +573,10 @@ export class DeviceExecutor {
     const wsl = root.environment?.kind === 'wsl' ? root.environment : undefined
     const relativeCwd = path.relative(this.filesystemRoot(root), cwd).split(path.sep).filter(Boolean)
     const linuxCwd = wsl ? path.posix.join(root.path, ...relativeCwd) : undefined
-    const program = wsl ? 'wsl.exe' : process.platform === 'win32' ? 'powershell.exe' : '/bin/sh'
+    // Prefer the maintained PowerShell runtime when present. Windows PowerShell 5.1 can spend
+    // an unbounded-looking amount of time in cold CLR/AMSI initialization on a loaded host;
+    // PowerShell 7 is also the shell GitHub's current Windows runners execute reliably.
+    const program = wsl ? 'wsl.exe' : process.platform === 'win32' ? windowsPowerShell().program : '/bin/sh'
     const args = wsl
       ? ['--distribution', wsl.distro, '--cd', linuxCwd!, '--exec', '/usr/bin/env', 'ALLMYAGENTS_REMOTE_TESTBED=1', '/bin/sh', '-lc', action.command]
       : process.platform === 'win32'
