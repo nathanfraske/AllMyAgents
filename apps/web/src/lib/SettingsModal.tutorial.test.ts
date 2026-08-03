@@ -260,6 +260,33 @@ describe('tutorial account waiting integration', () => {
     ).toBeTruthy()
   })
 
+  it('unblocks a completed login even if account presentation never returns', async () => {
+    loginMocks.login.mockResolvedValue({
+      ok: true,
+      loginId: 'public-complete-pending-scan',
+      profileId: 'claude-responsive',
+      provider: 'claude',
+      status: 'complete',
+      added: 'claude-responsive',
+    })
+    loginMocks.rescanProfiles.mockImplementation(() => new Promise(() => {}))
+    render(SettingsModal, {
+      props: {
+        onclose: () => {},
+        initialTab: 'accounts',
+      },
+    })
+    await fireEvent.input(screen.getByPlaceholderText('profile name (e.g. claude-work)'), {
+      target: { value: 'claude-responsive' },
+    })
+    await fireEvent.click(screen.getByRole('button', { name: 'Log in' }))
+
+    expect(
+      await screen.findByText('Added claude-responsive. It now appears in your accounts.'),
+    ).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'waiting…' })).toBeNull()
+  })
+
   it('offers deliberate replay actions from Settings', async () => {
     const replayFirst = vi.fn()
     const replayProject = vi.fn()

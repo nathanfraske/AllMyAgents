@@ -20,6 +20,7 @@
   import ModelPicker from './ModelPicker.svelte'
   import TraitsControl from './TraitsControl.svelte'
   import PermissionPicker from './PermissionPicker.svelte'
+  import RemoteDevicePicker from './RemoteDevicePicker.svelte'
   import WorktreePicker from './WorktreePicker.svelte'
   import AccountPicker from './AccountPicker.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
@@ -249,6 +250,20 @@
   // so writing it from an effect cannot feed back into reactivity.
   let drafts = loadComposerDrafts()
   let draftFor = $state('')
+  // A draft changes ids after its first send. Keep that transition explicit so text the operator starts
+  // typing while spawn/upload is still in flight follows the composer to the real chat instead of being
+  // replaced by the (usually empty) saved draft for the new id.
+  let materializingDraftFor = $state('')
+  let preserveComposerResetFor = $state('')
+
+  function adoptMaterializedComposer(draftId: string, realId: string): void {
+    const { [draftId]: _materialized, ...withoutDraft } = drafts
+    drafts = text ? { ...withoutDraft, [realId]: text } : withoutDraft
+    saveComposerDrafts(drafts)
+    draftFor = realId
+    materializingDraftFor = ''
+    preserveComposerResetFor = realId
+  }
 
   // Swap the composer's contents when the pane points at a different chat: stash the outgoing text,
   // restore the incoming one. untrack() so reading/writing `text` here never re-triggers this effect.
@@ -256,6 +271,14 @@
     const id = sid
     untrack(() => {
       if (id === draftFor) return
+      if (
+        materializingDraftFor &&
+        id !== materializingDraftFor &&
+        (!draftFor || materializingDraftFor === draftFor)
+      ) {
+        adoptMaterializedComposer(materializingDraftFor, id)
+        return
+      }
       if (draftFor) {
         drafts = { ...drafts, [draftFor]: text }
         saveComposerDrafts(drafts)
@@ -413,6 +436,27 @@
   const worktreeMismatch = $derived(
     !isDraft && view?.record.worktreeRequested === true && !view?.record.worktree
   )
+  function formatWorkspaceBytes(bytes: number): string {
+    const gib = bytes / (1024 ** 3)
+    return gib >= 1
+      ? `${gib >= 10 ? gib.toFixed(1) : gib.toFixed(2)} GiB`
+      : `${Math.max(0, Math.round(bytes / (1024 ** 2)))} MiB`
+  }
+  const workspacePressureDetail = $derived.by(() => {
+    const pressure = view?.record.workspacePressure
+    if (!pressure) return ''
+    const groups = pressure.artifactGroups
+      .slice(0, 3)
+      .map((group) => `${group.name} ${formatWorkspaceBytes(group.bytes)}`)
+      .join(', ')
+    const free = pressure.freeBytes === undefined
+      ? ''
+      : ` ${formatWorkspaceBytes(pressure.freeBytes)} remains free on the volume.`
+    return (
+      `${pressure.partial ? 'At least ' : ''}${formatWorkspaceBytes(pressure.totalBytes)} is in this managed checkout; ` +
+      `${formatWorkspaceBytes(pressure.artifactBytes)} is recognized build/dependency output${groups ? ` (${groups})` : ''}.${free}`
+    )
+  })
   // Draft-only inline permission picker (the real PermissionPicker posts to the hub, which a draft
   // has no session for). Mirrors the real picker's modes; writes the choice into the draft record.
   const PERM_MODES = [
@@ -713,13 +757,19 @@
   // the jump affordance, and re-pin to the bottom so the incoming chat opens at its live end rather than
   // inheriting the previous chat's scroll position.
   $effect(() => {
-    sid // track
+    const currentSid = sid
     actionErr = {}
     jumpAway = false
     anchorKey = null
     olderLoadRetryAt = 0
     olderLoadInFlight = false
     stick = true
+    // draft id → real id is the same composer. Keep text chips/files the operator staged while the
+    // first-turn request was pending; ordinary chat navigation still resets those chat-local controls.
+    if (preserveComposerResetFor === currentSid) {
+      preserveComposerResetFor = ''
+      return
+    }
     pastes = [] // promoted pastes belong to the chat they were pasted into
     untrack(clearAttachments) // staged files belong to the chat they were attached to
     return () => untrack(clearAttachments)
@@ -870,10 +920,10 @@
         const out = await api.uploadAttachment(sessionId, item.file)
         if ('error' in out) return { error: `Couldn’t attach “${item.name}”: ${out.error}` }
         ref = out
-        // A failed send keeps its successful uploads on the chips, so retrying reuses the same ids.
-        attachments = attachments.map((a) =>
-          a.id === item.id ? { ...a, uploaded: ref, uploadedFor: sessionId } : a
-        )
+        // The submitted batch is detached from the live composer while this awaits. Keep successful
+        // upload ids on that batch so a failed send can restore retryable chips without re-uploading.
+        item.uploaded = ref
+        item.uploadedFor = sessionId
       }
       uploaded.push(ref)
     }
@@ -883,17 +933,58 @@
     }
   }
 
-  function clearComposerAfterSend(): void {
+  interface ComposerSubmission {
+    composerId: string
+    text: string
+    pastes: PastedText[]
+    attachments: ComposerAttachment[]
+  }
+
+  function beginSubmission(composerId: string): ComposerSubmission {
+    const submission = {
+      composerId,
+      text,
+      pastes: [...pastes],
+      attachments: [...attachments],
+    }
+    // Accept the keystroke now, not whenever the network returns. Detaching the submitted batch
+    // immediately makes room for the operator's next thought and prevents a late success callback from
+    // clearing newer text.
     text = ''
     pastes = []
-    clearAttachments()
+    attachments = []
+    if (attachmentInput) attachmentInput.value = ''
     sendErr = ''
+    return submission
+  }
+
+  function completeSubmission(submission: ComposerSubmission): void {
+    for (const item of submission.attachments) {
+      if (item.previewUrl) URL.revokeObjectURL(item.previewUrl)
+    }
+  }
+
+  function restoreSubmission(submission: ComposerSubmission, error: string): void {
+    // Never put one chat's failed payload into another chat if navigation happened while awaiting.
+    if (draftFor === submission.composerId || sid === submission.composerId) {
+      text = submission.text
+        ? text
+          ? `${submission.text}\n\n${text}`
+          : submission.text
+        : text
+      pastes = [...submission.pastes, ...pastes]
+      attachments = [...submission.attachments, ...attachments]
+    } else if (submission.text) {
+      drafts = { ...drafts, [submission.composerId]: submission.text }
+      saveComposerDrafts(drafts)
+    }
+    sendErr = error
   }
 
   async function send(): Promise<void> {
     if (!view || !canSend) return
     const sid0 = view.record.id
-    const promoted = pastes
+    const promoted = [...pastes]
     const staged = [...attachments]
     const body = composeWithPastes(text, promoted)
     const unsupported = staged.find((a) => !vendorSupport(a, view.record.provider).ok)
@@ -903,15 +994,26 @@
         `“${unsupported.name}” is not supported here`
       return
     }
+    const submission = beginSubmission(sid0)
     sending = true
-    sendErr = ''
+    let settled = false
+    const succeed = (): void => {
+      if (settled) return
+      settled = true
+      completeSubmission(submission)
+    }
+    const fail = (error: string): void => {
+      if (settled) return
+      settled = true
+      restoreSubmission(submission, error)
+    }
     try {
       // A message carrying a paste chip or real file is never intercepted as a slash command.
       if (promoted.length === 0 && staged.length === 0 && body.trim().startsWith('/')) {
         const res = resolveSlash(body.trim(), view.record.provider)
         if (res.kind !== 'passthrough') {
           await runSlash(res, sid0)
-          clearComposerAfterSend()
+          succeed()
           return
         }
       }
@@ -919,13 +1021,20 @@
       // Preserve the existing single-request first-turn path when there are no files.
       if (view.draft && staged.length === 0) {
         stick = true
+        materializingDraftFor = sid0
         const out = await store.materializeDraft(sid0, body)
-        if (out.error) sendErr = out.error
-        else clearComposerAfterSend()
+        if (out.error) {
+          materializingDraftFor = ''
+          fail(out.error)
+        } else {
+          if (out.sessionId) adoptMaterializedComposer(sid0, out.sessionId)
+          succeed()
+        }
         return
       }
       if (view.draft) {
         stick = true
+        materializingDraftFor = sid0
         // Upload ids can only be minted after a session exists. The store keeps the draft visible while
         // this spawn-empty → upload → send transaction runs, and rolls the empty session back on failure.
         const out = await store.materializeDraft(sid0, '', async (realId) => {
@@ -939,14 +1048,19 @@
           })
           return sent.error ? { error: sent.error } : { ok: true }
         })
-        if (out.error) sendErr = out.error
-        else clearComposerAfterSend()
+        if (out.error) {
+          materializingDraftFor = ''
+          fail(out.error)
+        } else {
+          if (out.sessionId) adoptMaterializedComposer(sid0, out.sessionId)
+          succeed()
+        }
         return
       }
 
       const upload = await uploadStaged(sid0, staged)
       if ('error' in upload) {
-        sendErr = upload.error
+        fail(upload.error)
         return
       }
       // Busy? The normal input route performs provider-neutral steering and journals the operator input.
@@ -956,11 +1070,11 @@
           const out = await api.send(sid0, body, {
             attachments: upload.ids.length ? upload.ids : undefined,
           })
-          if (out.error) sendErr = out.error
-          else clearComposerAfterSend()
+          if (out.error) fail(out.error)
+          else succeed()
         } else {
           store.enqueue(sid0, body, upload.meta)
-          clearComposerAfterSend()
+          succeed()
         }
         return
       }
@@ -975,10 +1089,12 @@
       })
       if (out.error) {
         store.removeItem(sid0, key)
-        sendErr = out.error
+        fail(out.error)
       } else {
-        clearComposerAfterSend()
+        succeed()
       }
+    } catch (error) {
+      fail(error instanceof Error ? error.message : 'The message could not be sent.')
     } finally {
       sending = false
     }
@@ -1186,6 +1302,14 @@
       <Icon name="alert-triangle" size={14} />
       <span><strong>Worktree was requested, but this chat is working directly in the project folder.</strong>
         {view.record.worktreeFallbackReason ?? 'The hub did not report why the isolated checkout was not created.'}</span>
+    </div>
+  {/if}
+
+  {#if view.record.workspacePressure && !composerOnly}
+    <div class="workspace-pressure {view.record.workspacePressure.level}" role="alert">
+      <Icon name="hard-drive" size={14} />
+      <span><strong>{view.record.workspacePressure.level === 'critical' ? 'Workspace cleanup needed.' : 'Workspace is getting large.'}</strong>
+        {workspacePressureDetail} The agent has been notified; remove only regenerable artifacts, never source or uncommitted work.</span>
     </div>
   {/if}
 
@@ -1417,6 +1541,13 @@
               }}
             />
           </div>
+          <div class="ccontrol c-devices" title="Remote testbed access">
+            <RemoteDevicePicker
+              sessionId={view.record.id}
+              grants={view.record.remoteDeviceGrants ?? []}
+              onchange={(record) => (view.record.remoteDeviceGrants = record.remoteDeviceGrants)}
+            />
+          </div>
         {/if}
         {#if view.record.projectId}
           <div class="ccontrol c-worktree" title="Working location">
@@ -1532,6 +1663,12 @@
     color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, var(--surface));
     border-bottom: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border)); font-size: var(--text-sm); }
   .wtwarning strong { color: var(--text); margin-right: var(--space-1); }
+  .workspace-pressure { display: flex; align-items: flex-start; gap: var(--space-2); padding: var(--space-2) 1rem;
+    color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, var(--surface));
+    border-bottom: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border)); font-size: var(--text-sm); }
+  .workspace-pressure.critical { color: var(--bad-text); background: color-mix(in srgb, var(--bad) 9%, var(--surface));
+    border-bottom-color: color-mix(in srgb, var(--bad) 45%, var(--border)); }
+  .workspace-pressure strong { color: var(--text); margin-right: var(--space-1); }
   .thread-container {
     flex: 1; min-width: 0; min-height: 0;
     container-type: inline-size; container-name: thread-body;

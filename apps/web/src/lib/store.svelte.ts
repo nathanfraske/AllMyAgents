@@ -1,4 +1,14 @@
-import { api, bootstrapDesktopHubToken, HUB_WS, getHubToken, setHubToken } from './api'
+import {
+  api,
+  bootstrapDesktopHubToken,
+  configureFleetSites,
+  fleetWebSocketUrl,
+  getFleetSiteToken,
+  HUB_WS,
+  getHubToken,
+  setFleetSiteToken,
+  setHubToken,
+} from './api'
 import { settings } from './settings.svelte'
 import { alertDialog } from './dialog.svelte'
 import {
@@ -18,6 +28,72 @@ import { reduceJournalHistory } from './journalHistoryReducer'
 import { attachmentsFromPayload, type AttachmentMeta } from './attachments'
 import type { AgentOutcome } from './agentTree'
 import type { ApprovalRecord, FleetSite, HistoryItem, HistoryPage, HubEvent, HubPrefs, HubStreamMessage, JournalCompactionStatus, JournalHistoryPage, ProfileInfo, ProjectInfo, QuestionRecord, RecoveryNotice, ReplayBaseline, ReplayComplete, ReplayResetRequired, ReplayStart, ScanResult, SessionRecord, UsageSnapshot } from './api'
+
+interface RemoteStream {
+  site: FleetSite
+  socket: WebSocket | null
+  generation: number
+  baselineSeq: number
+  lastSeq: number
+  reconnectTimer: ReturnType<typeof setTimeout> | null
+  failures: number
+}
+
+const fleetId = (siteId: string, id: string): string => `${siteId}:${id}`
+// The session manager registers the operator's ordinary ~/.claude and ~/.codex homes under these
+// fixed ids so imported vendor conversations can be resumed. They are internal bindings, not
+// AllMyAgents-managed accounts. Keep this invariant at every client-side roster ingress too: an
+// older/skewed hub or a replayed registration event must not make them account-picker choices.
+const INTERNAL_VENDOR_HOME_IDS = new Set(['claude-default', 'codex-default'])
+const isVisibleAccountProfile = (profile: Pick<ProfileInfo, 'id'>): boolean =>
+  !INTERNAL_VENDOR_HOME_IDS.has(profile.id)
+const remoteProject = (site: FleetSite, project: ProjectInfo): ProjectInfo => ({
+  ...project,
+  id: fleetId(site.siteId, project.id),
+  siteId: site.siteId,
+  siteLabel: site.label,
+  siteOnline: true,
+})
+const remoteProfile = (site: FleetSite, profile: ProfileInfo): ProfileInfo => ({
+  ...profile,
+  id: fleetId(site.siteId, profile.id),
+  siteId: site.siteId,
+  siteLabel: site.label,
+  siteOnline: true,
+})
+const remoteSession = (site: FleetSite, session: SessionRecord): SessionRecord => ({
+  ...session,
+  id: fleetId(site.siteId, session.id),
+  profileId: fleetId(site.siteId, session.profileId),
+  projectId: session.projectId ? fleetId(site.siteId, session.projectId) : undefined,
+  parentSessionId: session.parentSessionId ? fleetId(site.siteId, session.parentSessionId) : undefined,
+  managerAllowedProfiles: session.managerAllowedProfiles?.map((id) => fleetId(site.siteId, id)),
+  managerAllowedModels: session.managerAllowedModels
+    ? Object.fromEntries(Object.entries(session.managerAllowedModels).map(([id, models]) => [fleetId(site.siteId, id), models]))
+    : undefined,
+  managerAgentTypes: session.managerAgentTypes?.map((agentType) => ({
+    ...agentType,
+    profileId: agentType.profileId ? fleetId(site.siteId, agentType.profileId) : undefined,
+    profileIds: agentType.profileIds?.map((id) => fleetId(site.siteId, id)),
+  })),
+  siteId: site.siteId,
+  siteLabel: site.label,
+  siteOnline: true,
+})
+const remoteApproval = (site: FleetSite, approval: ApprovalRecord): ApprovalRecord => ({
+  ...approval,
+  id: fleetId(site.siteId, approval.id),
+  sessionId: fleetId(site.siteId, approval.sessionId),
+})
+const remoteQuestion = (site: FleetSite, question: QuestionRecord): QuestionRecord => ({
+  ...question,
+  id: fleetId(site.siteId, question.id),
+  sessionId: fleetId(site.siteId, question.sessionId),
+})
+const remoteUsage = (site: FleetSite, usage: UsageSnapshot): UsageSnapshot => ({
+  ...usage,
+  profileId: fleetId(site.siteId, usage.profileId),
+})
 
 // Verbose client tracing — on in dev, compiled out of prod builds. Toggle off in dev by setting
 // localStorage['ama:verbose'] = '0'. Surfaces the load/connect/replay/scan milestones so a stall is
@@ -329,6 +405,8 @@ export class HubStore {
   // absent/failed bootstrap keeps the server's default-on behavior rather than disabling steering.
   prefs = $state<HubPrefs>({ chatNamePool: 'everyone', steerMessagesAtToolBoundary: true })
   connected = $state(false)
+  hubConnectionPhase = $state<'starting' | 'connected' | 'reconnecting'>('starting')
+  private everConnected = false
   needsPairing = $state(false)
   selectedId = $state<string | null>(null)
   /** The read-first project dashboard. Mutually exclusive with visible chat panes. */
@@ -358,13 +436,14 @@ export class HubStore {
   replayGeneration = 0
   private replayBaselineSeq = 0
   private baselineRefreshing = false
-  // --- Unified fleet view (first cut, read-only) -----------------------------------------------
-  // The fleet roster from GET /api/fleet (this hub + reachable co-owned peers). In the single-machine
-  // case this is just the local entry, so nothing below changes the UI. Remote sites' projects +
-  // sessions are POLLED read-only and merged into `projects`/`sessions` with `${siteId}:` id
-  // namespacing + a site tag for the sidebar badge; the LOCAL hub keeps its live WS + apply() as-is.
+  // --- Unified fleet view ----------------------------------------------------------------------
+  // Each remote hub has an independent credential, replay generation/cursor, and WebSocket. Resource
+  // ids remain namespaced in UI state and are routed back to the owner by api.ts.
   fleetSites = $state<FleetSite[]>([])
   private fleetTimer: ReturnType<typeof setInterval> | null = null
+  private fleetRefreshInFlight: Promise<void> | null = null
+  private readonly remoteStreams = new Map<string, RemoteStream>()
+  private readonly remoteSideRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private statusReconcileTimer: ReturnType<typeof setInterval> | null = null
   private statusReconcileInFlight = false
   private readonly latestStatusSeq = new Map<string, number>()
@@ -597,7 +676,7 @@ export class HubStore {
   private async loadBootstrapData(attempt = 0): Promise<void> {
     let failed = false
     const profiles = await api.profiles().catch(() => null)
-    if (profiles) this.profiles = profiles
+    if (profiles) this.replaceLocalProfiles(profiles)
     else failed = true
     const projects = await api.projects().catch(() => null)
     if (projects) this.projects = projects
@@ -613,6 +692,13 @@ export class HubStore {
     if (failed && attempt < 5) {
       setTimeout(() => void this.loadBootstrapData(attempt + 1), 1000 * (attempt + 1))
     }
+  }
+
+  private replaceLocalProfiles(local: ProfileInfo[]): void {
+    this.profiles = [
+      ...local.filter(isVisibleAccountProfile),
+      ...this.profiles.filter((profile) => profile.siteId),
+    ]
   }
 
   private installReplayBaseline(baseline: ReplayBaseline): void {
@@ -651,6 +737,7 @@ export class HubStore {
   }
 
   async init(): Promise<void> {
+    this.markStarting()
     const t0 = perfNow()
     vlog('init: start')
     // ARM the auto-reopen FIRST, before anything can load sessions. ensure() is what fires it, so if a
@@ -711,9 +798,8 @@ export class HubStore {
     // restore directly. scheduleAutoRestore is idempotent and re-arms itself while the roster is empty.
     this.scheduleAutoRestore()
     vlog(`init: bootstrap dispatched, WS connecting (${msSince(t0)})`)
-    // Fire-and-forget: pull the fleet roster and merge any remote machines' projects/sessions
-    // read-only. Non-blocking so local render stays instant; a no-node/no-peer hub gets just the
-    // local entry and this is a no-op (see refreshFleet).
+    // Fire-and-forget: discover and connect remote machines without delaying the local transcript.
+    // A no-node/no-peer hub gets just the local entry and this remains a no-op (see refreshFleet).
     this.startFleet()
     // NOTE: we deliberately do NOT scan every project on load — that walked ~/.codex + ~/.claude and
     // read thousands of transcript files per project, pegging the hub for minutes ("stuck scanning").
@@ -796,7 +882,7 @@ export class HubStore {
   async rescanProfiles(signal?: AbortSignal): Promise<{ error?: string }> {
     const result = await api.rescanProfiles(signal)
     if ('error' in result) return result
-    this.profiles = result
+    this.replaceLocalProfiles(result)
     return {}
   }
 
@@ -814,10 +900,16 @@ export class HubStore {
     this.managerSetupSessionId = null
   }
 
-  defaultProfileId(): string | undefined {
-    if (settings.defaultAccount && this.profiles.some((p) => p.id === settings.defaultAccount)) return settings.defaultAccount
-    if (this.lastProfileId && this.profiles.some((p) => p.id === this.lastProfileId)) return this.lastProfileId
-    return this.profiles[0]?.id
+  profilesForProject(projectId?: string): ProfileInfo[] {
+    const siteId = projectId ? this.projects.find((project) => project.id === projectId)?.siteId : undefined
+    return this.profiles.filter((profile) => siteId ? profile.siteId === siteId : !profile.siteId)
+  }
+
+  defaultProfileId(projectId?: string): string | undefined {
+    const available = this.profilesForProject(projectId)
+    if (settings.defaultAccount && available.some((p) => p.id === settings.defaultAccount)) return settings.defaultAccount
+    if (this.lastProfileId && available.some((p) => p.id === this.lastProfileId)) return this.lastProfileId
+    return available[0]?.id
   }
 
   // Open a new chat as a LOCAL DRAFT — no `api.spawn`, no hub session, no worktree. The draft
@@ -826,7 +918,15 @@ export class HubStore {
   // Applies the same defaults the old immediate-spawn path did (detached-chat defaults when no
   // project, default model per provider, default worktree preference).
   async newSession(profileId?: string, projectId?: string, useWorktree?: boolean): Promise<void> {
-    const pid = profileId ?? this.defaultProfileId()
+    // Resolve a detached default before choosing an account: a remote destination must choose from
+    // that machine's accounts, never silently carry a local profile id across the tunnel.
+    const detached = !projectId
+    const destProject = projectId ?? (detached ? (settings.detachedDefaultProjectId ?? undefined) : undefined)
+    const project = destProject ? this.projects.find((candidate) => candidate.id === destProject) : undefined
+    const available = this.profilesForProject(destProject)
+    const pid = profileId && available.some((profile) => profile.id === profileId)
+      ? profileId
+      : this.defaultProfileId(destProject)
     if (!pid) {
       this.settingsOpen = true
       return
@@ -835,8 +935,6 @@ export class HubStore {
     const model = profile?.provider === 'codex' ? settings.defaultCodexModel : settings.defaultClaudeModel
     // A chat opened without an explicit project is "detached/unfiled" — apply the operator's
     // detached-chat defaults: a default destination project (else stays Unfiled) and a mode.
-    const detached = !projectId
-    const destProject = projectId ?? (detached ? (settings.detachedDefaultProjectId ?? undefined) : undefined)
     const now = new Date().toISOString()
     const id = `draft:${crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`}`
     const view: SessionView = {
@@ -845,6 +943,9 @@ export class HubStore {
         profileId: pid,
         provider: profile?.provider ?? 'claude',
         projectId: destProject,
+        siteId: project?.siteId,
+        siteLabel: project?.siteLabel,
+        siteOnline: project?.siteOnline,
         cwd: '',
         status: 'idle',
         model: model || undefined,
@@ -1053,24 +1154,30 @@ export class HubStore {
     this.projects = [...local, ...remote]
   }
 
-  // --- Unified fleet view (first cut, read-only) -----------------------------------------------
-  // Poll the fleet roster and merge each REMOTE, ONLINE site's projects + sessions. Started
-  // fire-and-forget from init(); a periodic refresh keeps remote rosters roughly current (remote
-  // sites have no live WS in this first cut — that fan-out is the full drive-remote (L) work).
+  // --- Unified fleet view ----------------------------------------------------------------------
+  // Poll discovery/reachability while independent per-site WebSockets carry live state. The periodic
+  // baseline also reconciles current records after a missed route or remote hub restart.
   private startFleet(): void {
     if (this.fleetTimer) return // already running (init() can re-run after pairing)
     void this.refreshFleet()
     this.fleetTimer = setInterval(() => void this.refreshFleet(), 20000)
   }
 
-  // Fetch /api/fleet, then for every remote+online site pull its /api/projects + /api/sessions and
-  // merge them with `${siteId}:` id-namespacing (origin attribution + collision-safety) and a site
-  // tag for the sidebar badge. The LOCAL entry is skipped here — it stays on its existing base + live
-  // WS. Byte-identical to today when there are no remote sites and none were previously merged.
-  // TODO(full drive-remote, L): open a WS per remote site (per-site seq cursors) + route mutations
-  //   (spawn/send/steer/stop/mode/approve/rename/delete) to the owning site's base + token, instead
-  //   of this read-only poll. See docs/mesh-unified-fleet.md §5.
+  // Discover each peer, authenticate with that hub's own paired token, install its bounded baseline,
+  // then keep it current over an independent WebSocket. Failed auth/network reads remain explicit and
+  // preserve last-known rows; they are never collapsed to an authoritative empty roster.
   async refreshFleet(): Promise<void> {
+    if (this.fleetRefreshInFlight) return this.fleetRefreshInFlight
+    const refresh = this.refreshFleetNow()
+    this.fleetRefreshInFlight = refresh
+    try {
+      await refresh
+    } finally {
+      if (this.fleetRefreshInFlight === refresh) this.fleetRefreshInFlight = null
+    }
+  }
+
+  private async refreshFleetNow(): Promise<void> {
     const raw = await api.fleet().catch(() => null)
     // A non-array means we could not learn the roster at all (an older hub with no /api/fleet returns
     // {error}; a token-gated hub returns 401 {error}). buildFleet always returns at least the local
@@ -1084,45 +1191,104 @@ export class HubStore {
       if (hadRemote) this.flagRemoteUnreachable()
       return
     }
-    this.fleetSites = fleet
+    configureFleetSites(fleet)
     const remoteSites = fleet.filter((s) => !s.local)
     if (!remoteSites.length) {
       // No peers in the roster. If we HAD peers, that is far more likely the mesh node being down than
       // every machine being unpaired at once — keep their rows, flagged unreachable. With no peers and
       // nothing previously merged this is the pure single-machine path: leave local state completely
       // untouched (no reassignments, no reactivity churn), exactly as before this feature.
-      if (hadRemote) this.flagRemoteUnreachable()
+      if (hadRemote) {
+        this.flagRemoteUnreachable()
+        const retained = this.fleetSites
+          .filter((site) => !site.local)
+          .map((site) => ({ ...site, online: false, authError: 'The fleet directory is unavailable.' }))
+        this.fleetSites = [...fleet, ...retained]
+      } else {
+        this.fleetSites = fleet
+        this.stopRemovedRemoteStreams(new Set())
+      }
       return
     }
     const knownSiteIds = new Set(remoteSites.map((s) => s.siteId))
     const onlineSites = remoteSites.filter((s) => s.online)
-    const onlineSiteIds = new Set(onlineSites.map((s) => s.siteId))
 
     const pulled = await Promise.all(
       onlineSites.map(async (site) => {
-        const [projects, sessions] = await Promise.all([
-          api.projectsFrom(site.baseUrl).catch(() => [] as ProjectInfo[]),
-          api.sessionsFrom(site.baseUrl).catch(() => [] as SessionRecord[]),
+        const auth = await api.authFrom(site).catch((error) => ({
+          requireToken: true,
+          authed: false,
+          error: error instanceof Error ? error.message : 'Remote hub did not answer.',
+        }))
+        if (!auth.authed && auth.requireToken) {
+          const hasToken = Boolean(getFleetSiteToken(site.siteId))
+          site.authState = hasToken ? 'error' : 'pairing-required'
+          site.authError = 'error' in auth
+            ? auth.error
+            : hasToken
+              ? 'The saved token was rejected. Pair this machine again.'
+              : 'Enter this machine’s device token to pair it.'
+          return { site, baseline: null, profiles: null as ProfileInfo[] | null, approvals: null as ApprovalRecord[] | null, questions: null as QuestionRecord[] | null, usage: null as UsageSnapshot[] | null }
+        }
+        const baseline = await api.replayBaselineFrom(site).catch((error) => {
+          site.authState = 'error'
+          site.authError = error instanceof Error ? error.message : 'Remote baseline could not be loaded.'
+          return null
+        })
+        if (!baseline) return { site, baseline, profiles: null as ProfileInfo[] | null, approvals: null as ApprovalRecord[] | null, questions: null as QuestionRecord[] | null, usage: null as UsageSnapshot[] | null }
+        const token = getFleetSiteToken(site.siteId)
+        const saved = await api.saveFleetConnection(site.siteId, site.label, token).catch((error) => ({
+          error: error instanceof Error ? error.message : 'Could not store the device credential.',
+        }))
+        if ('error' in saved) {
+          site.authState = 'error'
+          site.authError = `Paired for viewing, but agent testbed access could not be secured: ${saved.error}`
+          return { site, baseline: null, profiles: null as ProfileInfo[] | null, approvals: null as ApprovalRecord[] | null, questions: null as QuestionRecord[] | null, usage: null as UsageSnapshot[] | null }
+        }
+        site.authState = 'paired'
+        delete site.authError
+        const [profiles, approvals, questions, usage] = await Promise.all([
+          api.profilesFrom(site).catch(() => null),
+          api.approvalsFrom(site).catch(() => null),
+          api.questionsFrom(site).catch(() => null),
+          api.usageFrom(site).catch(() => null),
         ])
-        return { site, projects, sessions }
+        return { site, baseline, profiles, approvals, questions, usage }
       })
     )
 
+    const offline = remoteSites.filter((site) => !site.online)
+    for (const site of offline) {
+      site.authState = getFleetSiteToken(site.siteId) ? 'paired' : 'pairing-required'
+      site.authError = 'The mesh route is offline.'
+    }
+    this.fleetSites = [...fleet.filter((site) => site.local), ...remoteSites]
+    const usable = pulled.filter((entry) => entry.baseline !== null) as Array<{
+      site: FleetSite
+      baseline: ReplayBaseline
+      profiles: ProfileInfo[] | null
+      approvals: ApprovalRecord[] | null
+      questions: QuestionRecord[] | null
+      usage: UsageSnapshot[] | null
+    }>
+    const onlineSiteIds = new Set(usable.map((entry) => entry.site.siteId))
+    const profileOnlineSiteIds = new Set(
+      usable.filter((entry) => entry.profiles !== null).map((entry) => entry.site.siteId),
+    )
+    for (const stream of [...this.remoteStreams.values()]) {
+      if (!onlineSiteIds.has(stream.site.siteId)) this.disposeRemoteStream(stream)
+    }
+
     const remoteProjects: ProjectInfo[] = []
+    const remoteProfiles: ProfileInfo[] = []
     const seenRemoteSessionIds = new Set<string>()
-    for (const { site, projects, sessions } of pulled) {
-      for (const p of projects) {
-        remoteProjects.push({ ...p, id: `${site.siteId}:${p.id}`, siteId: site.siteId, siteLabel: site.label, siteOnline: true })
+    const seenRemoteProfileIds = new Set<string>()
+    for (const { site, baseline, profiles, approvals, questions, usage } of usable) {
+      for (const p of baseline.projects) {
+        remoteProjects.push(remoteProject(site, p))
       }
-      for (const s of sessions) {
-        const rec: SessionRecord = {
-          ...s,
-          id: `${site.siteId}:${s.id}`,
-          projectId: s.projectId ? `${site.siteId}:${s.projectId}` : undefined,
-          siteId: site.siteId,
-          siteLabel: site.label,
-          siteOnline: true,
-        }
+      for (const s of baseline.sessions) {
+        const rec = remoteSession(site, s)
         seenRemoteSessionIds.add(rec.id)
         // ensure() keys by the namespaced id → never collides with a local (raw-id) session. Refresh
         // the view's lastActivity too so the sidebar re-sorts remote rows by their real recency
@@ -1135,7 +1301,16 @@ export class HubStore {
         // the same thrash as the local case, just at the polling cadence instead of the token cadence.
         if (!viewIsBusy(v)) v.orderKey = v.lastActivity
       }
+      for (const profile of profiles ?? []) {
+        if (!isVisibleAccountProfile(profile)) continue
+        const value = remoteProfile(site, profile)
+        remoteProfiles.push(value)
+        seenRemoteProfileIds.add(value.id)
+      }
+      this.replaceRemoteSideData(site, approvals, questions, usage)
+      this.connectRemoteSite(site, baseline)
     }
+    this.stopRemovedRemoteStreams(knownSiteIds)
     // Rows from a machine we could NOT reach are kept exactly as last seen and flagged unreachable —
     // "that box is off", not "your projects are gone". A row is only forgotten when we can actually see
     // its site and it no longer offers it, or when the site left the fleet. See fleetMerge.rowFate.
@@ -1144,6 +1319,20 @@ export class HubStore {
       .map((p) => ({ ...p, siteOnline: false }))
     const localProjects = this.projects.filter((p) => !p.siteId)
     this.projects = [...localProjects, ...remoteProjects, ...carried]
+
+    const carriedProfiles = this.profiles
+      .filter((profile) => !!profile.siteId && rowFate({
+        siteId: profile.siteId,
+        knownSiteIds,
+        onlineSiteIds: profileOnlineSiteIds,
+        seenNow: seenRemoteProfileIds.has(profile.id),
+      }) === 'mark-offline')
+      .map((profile) => ({ ...profile, siteOnline: false }))
+    this.profiles = [
+      ...this.profiles.filter((profile) => !profile.siteId),
+      ...remoteProfiles,
+      ...carriedProfiles,
+    ]
 
     for (const id of Object.keys(this.sessions)) {
       const v = this.sessions[id]
@@ -1155,10 +1344,228 @@ export class HubStore {
     }
   }
 
+  /** Pair (or replace) one remote hub credential, then retry discovery immediately. */
+  async pairFleetSite(siteId: string, token: string): Promise<boolean> {
+    const site = this.fleetSites.find((candidate) => candidate.siteId === siteId && !candidate.local)
+    if (!site || !token.trim()) return false
+    setFleetSiteToken(siteId, token)
+    configureFleetSites(this.fleetSites)
+    const auth = await api.authFrom(site).catch(() => null)
+    if (!auth?.authed && auth?.requireToken !== false) {
+      setFleetSiteToken(siteId, '')
+      site.authState = 'error'
+      site.authError = 'That token was rejected by the remote hub.'
+      this.fleetSites = [...this.fleetSites]
+      return false
+    }
+    const saved = await api.saveFleetConnection(siteId, site.label, token.trim()).catch((error) => ({
+      error: error instanceof Error ? error.message : 'Could not store the device credential.',
+    }))
+    if ('error' in saved) {
+      site.authState = 'error'
+      site.authError = `The remote hub accepted the token, but this hub could not store it securely: ${saved.error}`
+      this.fleetSites = [...this.fleetSites]
+      return false
+    }
+    site.authState = 'paired'
+    delete site.authError
+    this.fleetSites = [...this.fleetSites]
+    await this.refreshFleet()
+    return true
+  }
+
+  unpairFleetSite(siteId: string): void {
+    setFleetSiteToken(siteId, '')
+    void api.removeFleetConnection(siteId)
+    const stream = this.remoteStreams.get(siteId)
+    if (stream) this.disposeRemoteStream(stream)
+    const site = this.fleetSites.find((candidate) => candidate.siteId === siteId)
+    if (site) {
+      site.authState = 'pairing-required'
+      site.authError = 'Enter this machine’s device token to pair it.'
+      this.fleetSites = [...this.fleetSites]
+    }
+  }
+
+  private replaceRemoteSideData(
+    site: FleetSite,
+    approvals: ApprovalRecord[] | null,
+    questions: QuestionRecord[] | null,
+    usage: UsageSnapshot[] | null,
+  ): void {
+    const prefix = `${site.siteId}:`
+    if (approvals) {
+      this.approvals = [
+        ...this.approvals.filter((item) => !item.id.startsWith(prefix)),
+        ...approvals.map((item) => remoteApproval(site, item)),
+      ]
+    }
+    if (questions) {
+      this.questions = [
+        ...this.questions.filter((item) => !item.id.startsWith(prefix)),
+        ...questions.map((item) => remoteQuestion(site, item)),
+      ]
+    }
+    if (usage) {
+      const prefix = `${site.siteId}:`
+      this.usage = [
+        ...this.usage.filter((item) => !item.profileId.startsWith(prefix)),
+        ...usage.map((item) => remoteUsage(site, item)),
+      ]
+    }
+  }
+
+  private scheduleRemoteSideRefresh(siteId: string): void {
+    const current = this.remoteSideRefreshTimers.get(siteId)
+    if (current) clearTimeout(current)
+    this.remoteSideRefreshTimers.set(siteId, setTimeout(() => {
+      this.remoteSideRefreshTimers.delete(siteId)
+      const site = this.fleetSites.find((candidate) => candidate.siteId === siteId)
+      if (!site || site.authState !== 'paired') return
+      void Promise.all([
+        api.approvalsFrom(site).catch(() => null),
+        api.questionsFrom(site).catch(() => null),
+        api.usageFrom(site).catch(() => null),
+      ]).then(([approvals, questions, usage]) => {
+        this.replaceRemoteSideData(site, approvals, questions, usage)
+      })
+    }, 300))
+  }
+
+  private namespaceRemoteEvent(site: FleetSite, event: HubEvent): HubEvent {
+    let payload = event.payload
+    if (event.kind === 'session/created') payload = remoteSession(site, event.payload as SessionRecord)
+    else if (event.kind === 'session/deleted' && payload && typeof payload === 'object') {
+      const id = (payload as { id?: unknown }).id
+      payload = { ...(payload as Record<string, unknown>), ...(typeof id === 'string' ? { id: fleetId(site.siteId, id) } : {}) }
+    } else if (event.kind === 'project/deleted' && payload && typeof payload === 'object') {
+      const id = (payload as { id?: unknown }).id
+      payload = { ...(payload as Record<string, unknown>), ...(typeof id === 'string' ? { id: fleetId(site.siteId, id) } : {}) }
+    } else if (event.kind === 'project/updated' && payload && typeof payload === 'object') {
+      const id = (payload as { projectId?: unknown }).projectId
+      payload = { ...(payload as Record<string, unknown>), ...(typeof id === 'string' ? { projectId: fleetId(site.siteId, id) } : {}) }
+    } else if (event.kind === 'bus/sent' && payload && typeof payload === 'object') {
+      const to = (payload as { to?: { kind?: unknown; id?: unknown } }).to
+      if (to && (to.kind === 'session' || to.kind === 'project') && typeof to.id === 'string') {
+        payload = { ...(payload as Record<string, unknown>), to: { ...to, id: fleetId(site.siteId, to.id) } }
+      }
+    } else if (event.kind === 'bus/delivered' && payload && typeof payload === 'object') {
+      const from = (payload as { fromSession?: unknown }).fromSession
+      if (typeof from === 'string') payload = { ...(payload as Record<string, unknown>), fromSession: fleetId(site.siteId, from) }
+    }
+    return {
+      ...event,
+      sessionId: event.sessionId ? fleetId(site.siteId, event.sessionId) : null,
+      payload,
+    }
+  }
+
+  private connectRemoteSite(site: FleetSite, baseline: ReplayBaseline): void {
+    const current = this.remoteStreams.get(site.siteId)
+    if (current && current.generation === baseline.generation && current.site.baseUrl === site.baseUrl) {
+      current.site = site
+      current.baselineSeq = Math.max(current.baselineSeq, baseline.highWaterSeq)
+      // The baseline is authoritative through its high-water mark. Ignore older events that were
+      // still queued on an already-open socket, otherwise a periodic reconcile can briefly regress.
+      current.lastSeq = Math.max(current.lastSeq, baseline.highWaterSeq)
+      if (!current.socket && !current.reconnectTimer) this.openRemoteSocket(current)
+      return
+    }
+    if (current) this.disposeRemoteStream(current)
+    const stream: RemoteStream = {
+      site,
+      socket: null,
+      generation: baseline.generation,
+      baselineSeq: baseline.highWaterSeq,
+      lastSeq: baseline.highWaterSeq,
+      reconnectTimer: null,
+      failures: 0,
+    }
+    this.remoteStreams.set(site.siteId, stream)
+    this.openRemoteSocket(stream)
+    // A replaced mapping/generation may have hidden events while the old byte path was dead. Invalidate
+    // that site's lazy history windows and immediately reconcile any chat that is currently visible.
+    const visibleIds = new Set([this.selectedId, ...this.basePanes().flat()].filter((id): id is string => !!id))
+    for (const [id, view] of Object.entries(this.sessions)) {
+      if (view.record.siteId !== site.siteId) continue
+      this.historyPulled.delete(id)
+      if (visibleIds.has(id)) void this.ensureHistory(id)
+    }
+  }
+
+  private openRemoteSocket(stream: RemoteStream): void {
+    if (stream.socket) return
+    const socket = new WebSocket(fleetWebSocketUrl(stream.site, stream.lastSeq, stream.generation))
+    stream.socket = socket
+    socket.onopen = () => {
+      stream.failures = 0
+      stream.site.online = true
+      stream.site.authState = 'paired'
+      delete stream.site.authError
+      this.fleetSites = [...this.fleetSites]
+    }
+    socket.onmessage = (message) => {
+      let incoming: HubStreamMessage
+      try {
+        incoming = JSON.parse(message.data as string) as HubStreamMessage
+      } catch {
+        socket.close()
+        return
+      }
+      if (this.isReplayReset(incoming)) {
+        this.disposeRemoteStream(stream)
+        void this.refreshFleet()
+        return
+      }
+      if (this.isReplayStart(incoming)) {
+        if (incoming.generation !== stream.generation) {
+          this.disposeRemoteStream(stream)
+          void this.refreshFleet()
+        }
+        return
+      }
+      if (this.isReplayComplete(incoming)) {
+        stream.lastSeq = Math.max(stream.lastSeq, incoming.lastSeq)
+        return
+      }
+      this.apply(this.namespaceRemoteEvent(stream.site, incoming), stream.site.siteId)
+    }
+    socket.onclose = () => {
+      if (stream.socket !== socket) return
+      stream.socket = null
+      stream.failures += 1
+      if (stream.reconnectTimer) clearTimeout(stream.reconnectTimer)
+      stream.reconnectTimer = setTimeout(() => {
+        stream.reconnectTimer = null
+        if (!this.remoteStreams.has(stream.site.siteId)) return
+        if (stream.failures <= 2) this.openRemoteSocket(stream)
+        else void this.refreshFleet()
+      }, 1500)
+    }
+  }
+
+  private disposeRemoteStream(stream: RemoteStream): void {
+    this.remoteStreams.delete(stream.site.siteId)
+    if (stream.reconnectTimer) clearTimeout(stream.reconnectTimer)
+    stream.reconnectTimer = null
+    const socket = stream.socket
+    stream.socket = null
+    socket?.close()
+  }
+
+  private stopRemovedRemoteStreams(knownSiteIds: Set<string>): void {
+    for (const stream of this.remoteStreams.values()) {
+      if (!knownSiteIds.has(stream.site.siteId)) this.disposeRemoteStream(stream)
+    }
+  }
+
   /** Mark every merged remote row unreachable — we lost the roster, which says nothing about whether
    *  those machines are actually up. Keeps the rows visible rather than making work disappear. */
   private flagRemoteUnreachable(): void {
     this.projects = this.projects.map((p) => (p.siteId && p.siteOnline !== false ? { ...p, siteOnline: false } : p))
+    this.profiles = this.profiles.map((profile) =>
+      profile.siteId && profile.siteOnline !== false ? { ...profile, siteOnline: false } : profile,
+    )
     for (const v of Object.values(this.sessions)) {
       if (v.record.siteId && v.record.siteOnline !== false) v.record.siteOnline = false
     }
@@ -1167,19 +1574,24 @@ export class HubStore {
   // Adopt the selected existing vendor chats into a project. The hub persists them and journals
   // `session/created` + `session/titled`, so they also arrive over the WS (ensure() is idempotent);
   // we optimistically ensure the returned records for instant feedback and refresh the project
-  // roster + account list (a default-home import registers ~/.claude/~/.codex as a profile, which
-  // then appears in the picker). Returns counts for a toast/summary. Errors surface as { imported: 0 }.
+  // roster + managed-account list. A default-home import also registers an internal resume binding,
+  // but that binding is deliberately absent from account pickers. Returns counts for a toast/summary.
   async importChats(projectId: string, vendorSessionIds: string[]): Promise<{ imported: number; skipped: number }> {
+    const remote = this.projects.find((project) => project.id === projectId)?.siteId
     const out = await api.importChats(projectId, vendorSessionIds)
     if (!out || 'error' in out) return { imported: 0, skipped: 0 }
     for (const rec of out.imported) {
       this.ensure(rec)
       this.markGlitch(rec.id)
     }
-    await this.refreshProjects()
-    // Same: a failed refresh must leave the accounts we already have, not erase them.
-    const refreshed = await api.profiles().catch(() => null) // surface any newly-registered default-home account
-    if (refreshed) this.profiles = refreshed
+    if (remote) {
+      await this.refreshFleet()
+    } else {
+      await this.refreshProjects()
+      // Same: a failed refresh must leave the accounts we already have, not erase them.
+      const refreshed = await api.profiles().catch(() => null)
+      if (refreshed) this.replaceLocalProfiles(refreshed)
+    }
     return { imported: out.imported.length, skipped: out.skipped }
   }
 
@@ -1208,7 +1620,7 @@ export class HubStore {
     this.importChecked.add(projectId)
     const t0 = perfNow()
     vlog(`scan: start ${path}`)
-    const res = await api.scanProject(path)
+    const res = await api.scanProject(path, projectId)
     if (!res || 'error' in res) {
       vlog(`scan: failed ${path} (${msSince(t0)})`, res && 'error' in res ? res.error : '')
       return
@@ -1268,7 +1680,10 @@ export class HubStore {
     if (approvals) this.approvals = approvals
     if (questions) this.questions = questions
     if (recoveryNotices) this.recoveryNotices = recoveryNotices
-    if (usage) this.usage = usage
+    if (usage) {
+      const remoteProfileIds = new Set(this.profiles.filter((profile) => profile.siteId).map((profile) => profile.id))
+      this.usage = [...usage, ...this.usage.filter((item) => remoteProfileIds.has(item.profileId))]
+    }
   }
 
   async dismissRecoveryNotice(planId: string): Promise<boolean> {
@@ -1495,7 +1910,7 @@ export class HubStore {
   }
 
   /**
-   * How long the hub has been unreachable, in seconds — 0 whenever it is up.
+   * How long the UI has been waiting for the hub, in seconds — 0 whenever it is up.
    *
    * `connected` alone could not answer the question the operator actually had. A hub outage and a
    * sub-second blue-green flip both set it false, so the only honest thing to render from it was a 6px
@@ -1507,8 +1922,26 @@ export class HubStore {
   private downSince: number | null = null
   private downTicker: ReturnType<typeof setInterval> | null = null
 
+  private startHubWaitClock(): void {
+    if (this.downSince === null) this.downSince = Date.now()
+    if (!this.downTicker) {
+      this.downTicker = setInterval(() => {
+        if (this.downSince !== null) this.hubDownSeconds = Math.round((Date.now() - this.downSince) / 1000)
+      }, 1000)
+    }
+  }
+
+  private markStarting(): void {
+    if (this.everConnected) return
+    this.connected = false
+    this.hubConnectionPhase = 'starting'
+    this.startHubWaitClock()
+  }
+
   private markConnected(): void {
     this.connected = true
+    this.everConnected = true
+    this.hubConnectionPhase = 'connected'
     this.downSince = null
     this.hubDownSeconds = 0
     if (this.downTicker) {
@@ -1521,12 +1954,8 @@ export class HubStore {
    *  outage rather than restarting on every failed retry. */
   private markDisconnected(): void {
     this.connected = false
-    if (this.downSince === null) this.downSince = Date.now()
-    if (!this.downTicker) {
-      this.downTicker = setInterval(() => {
-        if (this.downSince !== null) this.hubDownSeconds = Math.round((Date.now() - this.downSince) / 1000)
-      }, 1000)
-    }
+    this.hubConnectionPhase = this.everConnected ? 'reconnecting' : 'starting'
+    this.startHubWaitClock()
   }
 
   private connect(): void {
@@ -1839,10 +2268,16 @@ export class HubStore {
     }, 250)
   }
 
-  private apply(event: HubEvent): void {
-    if (event.seq <= this.lastSeq) return
-    this.lastSeq = event.seq
-    this.noteReplay()
+  private apply(event: HubEvent, sourceSiteId?: string): void {
+    if (sourceSiteId) {
+      const remote = this.remoteStreams.get(sourceSiteId)
+      if (!remote || event.seq <= remote.lastSeq) return
+      remote.lastSeq = event.seq
+    } else {
+      if (event.seq <= this.lastSeq) return
+      this.lastSeq = event.seq
+      this.noteReplay()
+    }
     const { sessionId, kind, ts, payload } = event
 
     // Approvals + usage are re-fetched, but COALESCED: a journal replay surfaces hundreds of
@@ -1859,10 +2294,11 @@ export class HubStore {
       kind === 'journal/recovered' ||
       kind.startsWith('usage/')
     ) {
-      this.scheduleSideRefresh()
+      if (sourceSiteId) this.scheduleRemoteSideRefresh(sourceSiteId)
+      else this.scheduleSideRefresh()
     }
 
-    if (kind === 'profile/auth') {
+    if (!sourceSiteId && kind === 'profile/auth') {
       const auth = payload as { profileId?: string; status?: 'signed_in' | 'signed_out'; message?: string }
       const profile = this.profiles.find((candidate) => candidate.id === auth.profileId)
       if (profile && auth.status) {
@@ -1870,7 +2306,7 @@ export class HubStore {
         profile.authError = auth.message
       }
     }
-    if (kind === 'profiles/added') {
+    if (!sourceSiteId && kind === 'profiles/added') {
       const added = payload as {
         id?: string
         provider?: 'claude' | 'codex'
@@ -1878,6 +2314,7 @@ export class HubStore {
       }
       if (
         added.id &&
+        !INTERNAL_VENDOR_HOME_IDS.has(added.id) &&
         (added.provider === 'claude' || added.provider === 'codex') &&
         !this.profiles.some((candidate) => candidate.id === added.id)
       ) {
@@ -1892,7 +2329,7 @@ export class HubStore {
         }]
       }
     }
-    if (kind === 'profiles/renamed') {
+    if (!sourceSiteId && kind === 'profiles/renamed') {
       const renamed = payload as { id?: string; displayName?: unknown }
       if (renamed.id && (typeof renamed.displayName === 'string' || renamed.displayName === null)) {
         this.profiles = this.profiles.map((profile) => {
@@ -1929,7 +2366,7 @@ export class HubStore {
       }
       return
     }
-    if (kind.startsWith('journal/compaction-')) {
+    if (!sourceSiteId && kind.startsWith('journal/compaction-')) {
       const status = payload as Partial<JournalCompactionStatus>
       if (
         typeof status.operationId === 'string' &&
@@ -1958,7 +2395,9 @@ export class HubStore {
     if (!view) {
       // Event for a session we haven't seen created yet — fetch the roster lazily, but COALESCED: a
       // replay burst would otherwise fire one full /api/sessions per unseen event. One in-flight max.
-      if (!this.rosterFetchInFlight) {
+      if (sourceSiteId) {
+        void this.refreshFleet()
+      } else if (!this.rosterFetchInFlight) {
         this.rosterFetchInFlight = true
         void api
           .sessions()
@@ -2191,6 +2630,12 @@ export class HubStore {
         view.record.projectId = undefined
         break
       case 'session/error':
+        this.finishOpenCompaction(
+          view,
+          ts,
+          'failed',
+          `Context compaction failed: ${(payload as { message: string }).message}`,
+        )
         this.push(view, { kind: 'error', ts, text: (payload as { message: string }).message })
         // Also invalidate the last-turn verdict. Without this, a session-level failure left an EARLIER
         // success standing, so status() kept reporting the stale 'completed' from the previous turn while
@@ -2199,6 +2644,14 @@ export class HubStore {
         break
       case 'session/worktree-created':
         this.push(view, { kind: 'note', ts, text: `worktree: ${(payload as { worktree: string }).worktree}` })
+        break
+      case 'session/workspace-pressure': {
+        const pressure = (payload as { pressure?: SessionRecord['workspacePressure'] }).pressure
+        if (pressure) view.record.workspacePressure = pressure
+        break
+      }
+      case 'session/workspace-pressure-cleared':
+        delete view.record.workspacePressure
         break
       // A guardrail firing is the system WORKING, not the turn failing — the agent is told no and usually
       // carries on to succeed. These were rendered as red `error` items, which is a large part of why
@@ -2258,6 +2711,14 @@ export class HubStore {
         //    asked for, not an error — but is_error made it red and set lastTurnOk=false, so the chat
         //    showed a failure next to output that was fine.
         const interrupted = p.terminal_reason === 'aborted_streaming' || p.terminal_reason === 'aborted_tools'
+        this.finishOpenCompaction(
+          view,
+          ts,
+          p.is_error ? 'failed' : 'unobservable',
+          p.is_error
+            ? 'Claude context compaction failed before reporting a terminal boundary.'
+            : 'Claude context compaction ended without an observable terminal result.',
+        )
         if (interrupted) {
           this.push(view, { kind: 'note', ts, text: 'interrupted' })
           // UNDEFINED, not true. `lastTurnOk` is a two-state flag standing in for a three-state outcome,
@@ -2338,7 +2799,17 @@ export class HubStore {
         // `status === undefined` used to count as SUCCESS, so a malformed or unrecognised terminal event
         // rendered a green "completed" — the same false-green as the Claude interrupt path, reached by a
         // different route. Unknown is now neutral: it settles the turn without claiming it worked.
-        const status = (payload as { turn?: { status?: string } }).turn?.status
+        const turn = (payload as { turn?: { status?: string; error?: { message?: string } | string } }).turn
+        const status = turn?.status
+        const error = typeof turn?.error === 'string' ? turn.error : turn?.error?.message
+        this.finishOpenCompaction(
+          view,
+          ts,
+          status === 'failed' ? 'failed' : 'unobservable',
+          status === 'failed'
+            ? `Codex context compaction failed${error ? `: ${error}` : '.'}`
+            : 'Codex context compaction ended without an observable terminal result.',
+        )
         if (status === 'completed') view.lastTurnOk = true
         else if (status === 'failed') view.lastTurnOk = false
         else view.lastTurnOk = undefined // interrupted, or a status we do not recognise → neither
@@ -2381,6 +2852,7 @@ export class HubStore {
         break
       }
       case 'codex/item/started':
+        if (this.applyCodexCompaction(view, ts, payload, 'started')) break
         // A completed collab spawn call only means Codex launched the child. It is never treated as the
         // child completing; real child lifecycle arrives on codex/subagent/turn/* or agentsStates.
         this.applyCodexSpawnItem(view, ts, payload)
@@ -2388,6 +2860,18 @@ export class HubStore {
       case 'codex/item/completed':
         this.applyCodexItem(view, ts, payload)
         break
+      case 'codex/thread/compacted': {
+        const p = payload as { turnId?: string }
+        this.upsertCompaction(
+          view,
+          ts,
+          'codex',
+          'completed',
+          'Codex context compaction completed.',
+          p.turnId ? `turn:${p.turnId}` : undefined,
+        )
+        break
+      }
       case 'codex/item/agentMessage/delta': {
         const p = payload as { itemId?: string; delta?: string }
         if (p.itemId && typeof p.delta === 'string') this.upsertCodexText(view, ts, p.itemId, p.delta, true)
@@ -2504,12 +2988,64 @@ export class HubStore {
    * Background Bash tasks emit the same subtypes; they are self-filtering, since their `tool_use_id`
    * belongs to a Bash tool item and agentTree only ever reads these fields off an Agent/Task spawn.
    */
+  private activeCompaction(view: SessionView): ThreadItem | undefined {
+    return [...view.items].reverse().find((item) => item.kind === 'compaction' && item.status === 'started')
+  }
+
+  /**
+   * Keep one full-width timeline row live through the provider's observable lifecycle. Claude's status,
+   * boundary and result messages carry different UUIDs, while Codex's item id is stable, so a terminal
+   * event first targets its exact key and then the one open row. Duplicate terminal notifications emitted
+   * by the same compaction (Codex currently emits both item/completed and deprecated thread/compacted)
+   * collapse when they arrive together.
+   */
+  private upsertCompaction(
+    view: SessionView,
+    ts: string,
+    provider: 'claude' | 'codex',
+    status: 'started' | 'completed' | 'failed' | 'unobservable',
+    text: string,
+    operationId?: string,
+  ): ThreadItem {
+    const key = operationId ? `compaction:${provider}:${operationId}` : undefined
+    let item = key ? view.items.find((candidate) => candidate.key === key) : undefined
+    item ??= this.activeCompaction(view)
+    if (!item && status !== 'started') {
+      const latest = [...view.items].reverse().find((candidate) => candidate.kind === 'compaction')
+      const distance = latest ? Math.abs(Date.parse(ts) - Date.parse(latest.ts)) : Number.POSITIVE_INFINITY
+      if (latest && Number.isFinite(distance) && distance <= 5_000) {
+        if (latest.status === status) return latest
+        // A boundary/result can legitimately follow the SDK's status:null before the terminal detail.
+        // Correct that provisional unknown row in place instead of rendering two compactions.
+        if (latest.status === 'unobservable') item = latest
+      }
+    }
+    if (!item) return this.push(view, { kind: 'compaction', ts, status, text, key })
+    item.status = status
+    item.text = text
+    return item
+  }
+
+  private finishOpenCompaction(
+    view: SessionView,
+    ts: string,
+    status: 'failed' | 'unobservable',
+    text: string,
+  ): void {
+    if (!this.activeCompaction(view)) return
+    this.upsertCompaction(view, ts, view.record.provider, status, text)
+  }
+
   private applyClaudeSystem(view: SessionView, ts: string, payload: unknown): void {
     const p = payload as {
       subtype?: string
       task_id?: string
       tool_use_id?: string
-      status?: string
+      status?: string | null
+      compact_result?: 'success' | 'failed'
+      compact_error?: string
+      uuid?: string
+      compact_metadata?: { trigger?: 'manual' | 'auto'; pre_tokens?: number; post_tokens?: number }
       summary?: string
       subagent_type?: string
       last_tool_name?: string
@@ -2525,13 +3061,57 @@ export class HubStore {
     // startup, so a snapshot replayed out of a journal can wedge a run as permanently live. The edge
     // stream below is the correlatable truth; a level we cannot reset would be worse than no signal.
     const st = p.subtype
-    if (st === 'compact_boundary') {
-      this.push(view, {
-        kind: 'compaction',
+    if (st === 'status' && p.status === 'compacting') {
+      this.upsertCompaction(
+        view,
         ts,
-        status: 'completed',
-        text: p.message ?? 'Context compaction completed.',
-      })
+        'claude',
+        'started',
+        'Claude context compaction started…',
+        p.uuid,
+      )
+      return
+    }
+    if (st === 'status' && p.compact_result) {
+      const failed = p.compact_result === 'failed'
+      this.upsertCompaction(
+        view,
+        ts,
+        'claude',
+        failed ? 'failed' : 'completed',
+        failed
+          ? `Claude context compaction failed${p.compact_error ? `: ${p.compact_error}` : '.'}`
+          : 'Claude context compaction completed.',
+        p.uuid,
+      )
+      return
+    }
+    if (st === 'status' && p.status === null && this.activeCompaction(view)) {
+      this.upsertCompaction(
+        view,
+        ts,
+        'claude',
+        'unobservable',
+        'Claude context compaction ended without an observable terminal result.',
+        p.uuid,
+      )
+      return
+    }
+    if (st === 'compact_boundary') {
+      const meta = p.compact_metadata
+      const tokens = typeof meta?.pre_tokens === 'number'
+        ? typeof meta.post_tokens === 'number'
+          ? ` (${meta.pre_tokens.toLocaleString()} → ${meta.post_tokens.toLocaleString()} tokens)`
+          : ` (${meta.pre_tokens.toLocaleString()} tokens before compaction)`
+        : ''
+      this.upsertCompaction(
+        view,
+        ts,
+        'claude',
+        'completed',
+        p.message ?? `Claude context compaction completed${tokens}.`,
+        p.uuid,
+      )
       return
     }
     if (st !== 'task_started' && st !== 'task_progress' && st !== 'task_notification' && st !== 'task_updated') return
@@ -2752,6 +3332,10 @@ export class HubStore {
     const item = (payload as { item?: Record<string, unknown> }).item
     if (!item) return
     const type = item.type as string
+    if (type === 'contextCompaction') {
+      this.applyCodexCompaction(view, ts, payload, 'completed')
+      return
+    }
     if (type === 'collabAgentToolCall' || type === 'collabToolCall') {
       this.applyCodexSpawnItem(view, ts, payload)
       return
@@ -2801,6 +3385,28 @@ export class HubStore {
         agentId,
       })
     }
+  }
+
+  private applyCodexCompaction(
+    view: SessionView,
+    ts: string,
+    payload: unknown,
+    phase: 'started' | 'completed',
+  ): boolean {
+    const item = (payload as { item?: Record<string, unknown> }).item
+    if (item?.type !== 'contextCompaction') return false
+    const id = typeof item.id === 'string' ? item.id : undefined
+    this.upsertCompaction(
+      view,
+      ts,
+      'codex',
+      phase,
+      phase === 'started'
+        ? 'Codex context compaction started…'
+        : 'Codex context compaction completed.',
+      id,
+    )
+    return true
   }
 
   /**
@@ -2899,11 +3505,9 @@ export class HubStore {
   async ensureHistory(id: string): Promise<void> {
     const view = this.sessions[id]
     if (!view || this.historyPulled.has(id)) return
-    // A REMOTE fleet session has no local transcript to pull — its history + live stream live on its
-    // owning hub (the full drive-remote (L) work). Mark it pulled so opening it is a clean no-op,
-    // never a namespaced-id fetch against THIS hub. See docs/mesh-unified-fleet.md §5.
-    if (view.record.siteId) {
-      this.historyPulled.add(id)
+    const remote = view.record.siteId ? this.remoteStreams.get(view.record.siteId) : undefined
+    if (view.record.siteId && !remote) {
+      view.historyLoadError = 'Pair or reconnect the owning machine to load this history.'
       return
     }
     if (!view.record.imported) {
@@ -2913,7 +3517,12 @@ export class HubStore {
       let page: JournalHistoryPage | null = null
       try {
         page = await boundedHubRead('Latest journal history', (signal) =>
-          api.journalHistory(id, this.replayGeneration, this.replayBaselineSeq + 1, signal),
+          api.journalHistory(
+            id,
+            remote?.generation ?? this.replayGeneration,
+            (remote?.baselineSeq ?? this.replayBaselineSeq) + 1,
+            signal,
+          ),
         )
       } catch (error) {
         view.historyLoadError =

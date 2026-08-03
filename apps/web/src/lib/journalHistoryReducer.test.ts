@@ -65,6 +65,49 @@ describe('pure bounded journal history reducer', () => {
     ])
   })
 
+  it('reconstructs Claude and Codex compaction lifecycle rows from bounded journal history', () => {
+    const claude = reduceJournalHistory([
+      event(1, 'claude/system', {
+        subtype: 'status',
+        status: 'compacting',
+        uuid: 'claude-start',
+      }),
+      event(2, 'claude/system', {
+        subtype: 'compact_boundary',
+        uuid: 'claude-boundary',
+        compact_metadata: { trigger: 'auto', pre_tokens: 190_000, post_tokens: 31_000 },
+      }),
+      event(3, 'claude/system', {
+        subtype: 'status',
+        status: null,
+        compact_result: 'success',
+        uuid: 'claude-finish',
+      }),
+    ])
+    const codex = reduceJournalHistory([
+      event(4, 'codex/item/started', {
+        item: { type: 'contextCompaction', id: 'codex-compact' },
+      }),
+      event(5, 'codex/item/completed', {
+        item: { type: 'contextCompaction', id: 'codex-compact' },
+      }),
+      event(6, 'codex/thread/compacted', { threadId: 'thread-1', turnId: 'turn-1' }),
+    ])
+
+    expect(claude).toHaveLength(1)
+    expect(claude[0]).toMatchObject({
+      kind: 'compaction',
+      status: 'completed',
+      text: 'Claude context compaction completed (190,000 → 31,000 tokens).',
+    })
+    expect(codex).toHaveLength(1)
+    expect(codex[0]).toMatchObject({
+      kind: 'compaction',
+      status: 'completed',
+      text: 'Codex context compaction completed.',
+    })
+  })
+
   it('keeps a pane within its logical-item bound', () => {
     const items = reduceJournalHistory(
       Array.from({ length: 200 }, (_, index) =>

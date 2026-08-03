@@ -53,6 +53,12 @@ function seed(): SessionView {
   return view
 }
 
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((done) => (resolve = done))
+  return { promise, resolve }
+}
+
 beforeEach(() => {
   apiMock.send.mockReset().mockResolvedValue({ ok: true })
   apiMock.browserStatus.mockReset().mockResolvedValue({
@@ -167,5 +173,61 @@ describe('transcript interaction boundaries', () => {
     ]))
     expect(apiMock.send).not.toHaveBeenCalled()
     expect(composer.value).toBe('')
+  })
+
+  it('hands off a new turn immediately and never clears text typed while dispatch is pending', async () => {
+    seed()
+    const pending = deferred<{ ok: true }>()
+    apiMock.send.mockReturnValue(pending.promise)
+    const { container } = render(ThreadView, { props: { sessionId: 'interaction-session' } })
+    const composer = container.querySelector('.composer textarea') as HTMLTextAreaElement
+
+    await fireEvent.input(composer, { target: { value: 'Start the turn.' } })
+    await fireEvent.keyDown(composer, { key: 'Enter' })
+
+    await waitFor(() => expect(apiMock.send).toHaveBeenCalledTimes(1))
+    expect(composer.value).toBe('')
+    await fireEvent.input(composer, { target: { value: 'My next thought.' } })
+    pending.resolve({ ok: true })
+
+    await waitFor(() => expect(composer.value).toBe('My next thought.'))
+  })
+
+  it('hands off a steer immediately and never clears text typed while steering is pending', async () => {
+    const view = seed()
+    view.record.status = 'active'
+    const pending = deferred<{ ok: true }>()
+    apiMock.send.mockReturnValue(pending.promise)
+    const { container } = render(ThreadView, { props: { sessionId: 'interaction-session' } })
+    const composer = container.querySelector('.composer textarea') as HTMLTextAreaElement
+
+    await fireEvent.input(composer, { target: { value: 'Steer this turn.' } })
+    await fireEvent.keyDown(composer, { key: 'Enter' })
+
+    await waitFor(() => expect(apiMock.send).toHaveBeenCalledTimes(1))
+    expect(composer.value).toBe('')
+    await fireEvent.input(composer, { target: { value: 'Do not delete this.' } })
+    pending.resolve({ ok: true })
+
+    await waitFor(() => expect(composer.value).toBe('Do not delete this.'))
+  })
+
+  it('restores a failed submission ahead of any newer text without losing either', async () => {
+    seed()
+    const pending = deferred<{ error: string }>()
+    apiMock.send.mockReturnValue(pending.promise)
+    const { container, findByRole } = render(ThreadView, {
+      props: { sessionId: 'interaction-session' },
+    })
+    const composer = container.querySelector('.composer textarea') as HTMLTextAreaElement
+
+    await fireEvent.input(composer, { target: { value: 'Retry this message.' } })
+    await fireEvent.keyDown(composer, { key: 'Enter' })
+    await waitFor(() => expect(apiMock.send).toHaveBeenCalledTimes(1))
+    await fireEvent.input(composer, { target: { value: 'New text stays too.' } })
+    pending.resolve({ error: 'hub unavailable' })
+
+    expect((await findByRole('alert')).textContent).toContain('hub unavailable')
+    expect(composer.value).toBe('Retry this message.\n\nNew text stays too.')
   })
 })

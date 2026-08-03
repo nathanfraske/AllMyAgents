@@ -33,6 +33,28 @@ export interface Project {
 
 export type SessionStatus = 'starting' | 'active' | 'idle' | 'stopped' | 'error'
 export type DelegatedAuthority = 'commit' | 'push'
+export type RemoteDeviceCapability = 'read' | 'write' | 'terminal'
+
+/** Operator-owned capability grant for one chat. Device pairing alone never creates one. */
+export interface RemoteDeviceGrant {
+  siteId: string
+  /** Stable root ids advertised by the target hub; never caller-chosen absolute paths. */
+  rootIds: string[]
+  capabilities: RemoteDeviceCapability[]
+}
+
+export interface WorkspacePressure {
+  level: 'warning' | 'critical'
+  totalBytes: number
+  artifactBytes: number
+  artifactGroups: Array<{ name: string; bytes: number }>
+  reasons: Array<'workspace-size' | 'build-artifacts' | 'low-disk'>
+  /** True means byte counts are lower bounds because the bounded scan stopped early. */
+  partial: boolean
+  observedAt: string
+  freeBytes?: number
+  lastNotifiedAt?: string
+}
 
 export interface ManagerAgentType {
   id: string
@@ -50,10 +72,14 @@ export interface SessionRecord {
   id: string
   profileId: string
   provider: Provider
+  /** Hub-minted application overseer role. Public session creation can never set this flag. */
+  isOverseer?: boolean
   projectId?: string
   cwd: string
   repo?: string
   worktree?: string
+  /** Latest bounded managed-workspace pressure observation, persisted for agent and operator visibility. */
+  workspacePressure?: WorkspacePressure
   /** Concrete WSL filesystem plus distro-native paths. Host-facing fields above remain UNC projections. */
   wslDistro?: string
   executionCwd?: string
@@ -85,6 +111,8 @@ export interface SessionRecord {
    *  the worker and in-process executors funnel through — so adding one takes effect immediately, mid-turn,
    *  with no worker respawn. Per-chat by design: a blanket global allowlist is a much bigger blast radius. */
   allowedTools?: string[]
+  /** Exact remote machines/roots this chat may use through the AllMyAgents device tools. */
+  remoteDeviceGrants?: RemoteDeviceGrant[]
   /** App-owned browser capability. Safe default is OFF when absent. The profile remains session-keyed. */
   browserEnabled?: boolean
   /** Public http(s) origins approved for this exact session. Values are canonical URL origins. */
@@ -384,4 +412,12 @@ export interface HubConfig {
   features?: FeaturesConfig
   prefs?: PrefsConfig
   danger?: DangerConfig
+  /** Durable outside the journal so the designated account remains knowable during DB preflight failure. */
+  overseer?: OverseerConfig
+}
+
+export interface OverseerConfig {
+  profileId?: string
+  sessionId?: string
+  updatedAt?: string
 }

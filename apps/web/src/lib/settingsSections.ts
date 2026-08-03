@@ -4,7 +4,7 @@ export const SETTINGS_TABS = [
   { id: 'instructions', label: 'Instructions', sections: ['Operator profile & instructions'] },
   { id: 'remote', label: 'Remote access', sections: ['Remote access'] },
   { id: 'safety', label: 'Safety', sections: ['Danger Zone', 'Agent-authored practices'] },
-  { id: 'system', label: 'System', sections: ['Getting started', 'Updates', 'Maintenance'] },
+  { id: 'system', label: 'System', sections: ['Overseer', 'Getting started', 'Updates', 'Maintenance'] },
 ] as const
 
 export type SettingsTabId = (typeof SETTINGS_TABS)[number]['id']

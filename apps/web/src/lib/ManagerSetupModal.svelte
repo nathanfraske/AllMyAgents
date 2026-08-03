@@ -73,7 +73,9 @@
   let mode = $state<Mode>('create')
   let selectedId = $state('')
   let projectId = $state('')
-  let managerProfileId = $state(store.defaultProfileId() ?? '')
+  // Initialized by chooseMode once the owning project is known. Keeping this empty here also avoids
+  // accidentally choosing a local account before an initial remote project has been hydrated.
+  let managerProfileId = $state('')
   let managerTitle = $state('')
   let managerModel = $state('')
   let managerEffort = $state('')
@@ -96,6 +98,7 @@
   let lastDeferredConfig = ''
 
   const selectedRecord = $derived(selectedId ? store.sessions[selectedId]?.record : undefined)
+  const availableProfiles = $derived(store.profilesForProject(projectId))
   const project = $derived(
     store.projects.find((item) => item.id === projectId)
       ?? (draftProject
@@ -108,13 +111,18 @@
         : undefined),
   )
   const isActiveManager = $derived(selectedRecord?.isProjectManager === true)
-  const managerProfile = $derived(store.profiles.find((profile) => profile.id === managerProfileId))
+  const managerProfile = $derived(availableProfiles.find((profile) => profile.id === managerProfileId))
   const managerModels = $derived(managerProfile ? modelsFor(managerProfile.provider) : [])
   const managerEffortOptions = $derived(
     (findModel(managerModel) ?? (managerProfile ? defaultModelFor(managerProfile.provider) : undefined))
       ?.descriptors.find((descriptor) => descriptor.id === 'effort')?.options ?? [],
   )
   const scope = $derived(scopeFromAgentTypes())
+
+  function rawManagerProfileId(id: string): string {
+    const prefix = project?.siteId ? `${project.siteId}:` : ''
+    return prefix && id.startsWith(prefix) ? id.slice(prefix.length) : id
+  }
 
   function generatedPrompt(): string {
     const selectedProject = project
@@ -129,8 +137,8 @@
       .filter((role) => role.name.trim() && role.purpose.trim())
       .map((role) => {
         const runner = role.selection === 'usage-aware'
-          ? `choose the least-used unblocked account from ${(role.profileIds ?? []).join(', ')}`
-          : `${role.profileId ?? 'unselected account'} / ${role.model ?? 'default model'} / ${role.effort || 'default effort'}`
+          ? `choose the least-used unblocked account from ${(role.profileIds ?? []).map(rawManagerProfileId).join(', ')}`
+          : `${role.profileId ? rawManagerProfileId(role.profileId) : 'unselected account'} / ${role.model ?? 'default model'} / ${role.effort || 'default effort'}`
         return `- ${role.name.trim()} — agent_type "${role.id}": ${role.purpose.trim()} (${runner})`
       })
     const authority = delegation.length ? delegation.join(' and ') : 'neither commit nor push'
@@ -140,7 +148,7 @@
       `YOUR ALLMYAGENTS TOOLS\n- list_agents: see the project teammates you can address.\n- spawn_agent: create a real child chat in this app; it gets an isolated git worktree by default. Use an operator-defined agent_type when one fits.\n- child_status: get the live running / idle / stopped / errored tally without polling.\n- peek_agent: inspect a worker without interrupting it. For your own children you may request activity, full transcript, changes, tasks, approvals/blockers, worktree state, or all views.\n- assign_child_task: put an audited assignment on a direct child’s task board; the operator sees that same board. Use the task id to update its state later.\n- set_child_authority: grant or revoke only the worker Git actions, exact tools, and permission mode inside your grant ceiling; changes apply to that worker’s next tool call.\n- send_message and read_messages: coordinate through the project bus. Prefer a direct message to one session; broadcast only when every project agent must act.\n- practice_write / practice_list / practice_read / practice_edit: manage durable team conventions that future agents should follow.\n- memory_write / memory_search / memory_read: retain and retrieve project facts and decisions.`,
       `CHILD APPROVAL TOOL\n- decide_child_approval: approve or deny one pending request from your own direct child when child approvals are enabled. The hub refuses unrelated children and anything outside your operator-granted ceiling.`,
       `IMPORTANT — TOOL LAYERS\nUse the hub-provided AllMyAgents tools described above. In Codex, choose the fully-qualified mcp__allmyagents__spawn_agent and mcp__allmyagents__list_agents tools (some clients render those names as mcp__allmyagents.spawn_agent and mcp__allmyagents.list_agents). Never call collaboration.spawn_agent, collaboration.list_agents, or another native collabAgentToolCall for project work. The native Codex or Claude harness may expose similar names, but those tools do not create the real app chats and worktrees you are managing. If a worker does not appear in the AllMyAgents sidebar with a session id, parentSessionId, and worktree, treat that as a failed delegation and retry with the mcp__allmyagents tool.`,
-      `GRANTED BRIEF AND LIMITS\n- Grant ceiling means the maximum scope the operator gave you; every child grant must stay inside it.\n- At most ${maxLiveChildren} live direct children. The hub refuses an additional spawn at the bound.\n- Child permission modes may not exceed ${maxChildPermissionMode}.\n- Exact worker profile_id values you may pass to spawn_agent: ${workerScope.profiles.length ? workerScope.profiles.join(', ') : 'none'}.\n- Worker Git permissions you may grant: ${delegation.length ? authority : 'none'}.\n- Additional exact worker tools you may grant: ${allowedTools.length ? allowedTools.join(', ') : 'none'}.\n- Child approval decisions: ${canApproveChildren ? 'enabled for your own direct children, within the same grant ceiling' : 'disabled; the operator answers pending approvals'}.\n- Delegation only narrows: a manager cannot grant what it does not hold — including an authority, account, model, permission mode, or tool.\n- You have full non-interfering visibility into your own children, and only those children.\n${roles.length ? `Worker roles (prefer their exact agent_type id when one fits):\n${roles.join('\n')}` : `No named worker roles are configured; call spawn_agent with profile_id "${workerScope.profiles[0] ?? 'unavailable'}" and its default model.`}`,
+      `GRANTED BRIEF AND LIMITS\n- Grant ceiling means the maximum scope the operator gave you; every child grant must stay inside it.\n- At most ${maxLiveChildren} live direct children. The hub refuses an additional spawn at the bound.\n- Child permission modes may not exceed ${maxChildPermissionMode}.\n- Exact worker profile_id values you may pass to spawn_agent: ${workerScope.profiles.length ? workerScope.profiles.map(rawManagerProfileId).join(', ') : 'none'}.\n- Worker Git permissions you may grant: ${delegation.length ? authority : 'none'}.\n- Additional exact worker tools you may grant: ${allowedTools.length ? allowedTools.join(', ') : 'none'}.\n- Child approval decisions: ${canApproveChildren ? 'enabled for your own direct children, within the same grant ceiling' : 'disabled; the operator answers pending approvals'}.\n- Delegation only narrows: a manager cannot grant what it does not hold — including an authority, account, model, permission mode, or tool.\n- You have full non-interfering visibility into your own children, and only those children.\n${roles.length ? `Worker roles (prefer their exact agent_type id when one fits):\n${roles.join('\n')}` : `No named worker roles are configured; call spawn_agent with profile_id "${workerScope.profiles[0] ? rawManagerProfileId(workerScope.profiles[0]) : 'unavailable'}" and its default model.`}`,
       `OPERATING CADENCE\nTurn the operator task into bounded assignments with an expected output and a clear completion check. Spawn only useful parallel work. In each assignment, state the exact granted tools and require the worker to stay inside that envelope. At decision points use child_status; use peek_agent when status alone is insufficient. Verify a child’s transcript and worktree changes before relying on its result. If a child stalls, blocks, errors, exceeds scope, or collides: inspect it and send one direct corrective message. When it asks for an ungranted tool, redirect it to a granted alternative instead of widening authority or waiting; otherwise reassign or re-sequence when possible, and report any decision that needs the operator in this manager chat. Send one useful update per meaningful event rather than narrating every step. Finish with a concise report of each child’s final status, findings, files/commits changed, verification performed, and unresolved decisions.`,
       `OPERATOR TASK\nReplace this line with the task to begin, then start immediately.`,
     ].join('\n\n')
@@ -183,7 +191,7 @@
   }
 
   function resetGrantDefaults(): void {
-    const profile = store.profiles.find((candidate) => candidate.id === managerProfileId)
+    const profile = availableProfiles.find((candidate) => candidate.id === managerProfileId)
     managerTitle = ''
     managerModel = profile ? defaultModelFor(profile.provider)?.slug ?? '' : ''
     managerEffort = ''
@@ -244,13 +252,13 @@
     }
     selectedId = ''
     projectId = initialProjectId || store.projects[0]?.id || ''
-    managerProfileId = store.defaultProfileId() ?? ''
+    managerProfileId = store.defaultProfileId(projectId) ?? ''
     resetGrantDefaults()
   }
 
   function chooseManagerProfile(profileId: string): void {
     managerProfileId = profileId
-    const profile = store.profiles.find((candidate) => candidate.id === profileId)
+    const profile = availableProfiles.find((candidate) => candidate.id === profileId)
     managerModel = profile ? defaultModelFor(profile.provider)?.slug ?? '' : ''
     managerEffort = ''
   }
@@ -272,7 +280,7 @@
   }
 
   function addAgentType(): void {
-    const profile = store.profiles[0]
+    const profile = availableProfiles[0]
     const model = profile ? defaultModelFor(profile.provider) : undefined
     agentTypes = [
       ...agentTypes,
@@ -305,11 +313,11 @@
         selection,
         profileId: undefined,
         model: undefined,
-        profileIds: store.profiles.map((profile) => profile.id),
+        profileIds: availableProfiles.map((profile) => profile.id),
       })
       return
     }
-    const profile = store.profiles[0]
+    const profile = availableProfiles[0]
     updateAgentType(index, {
       selection,
       profileId: profile?.id,
@@ -319,7 +327,7 @@
   }
 
   function chooseRoleProfile(index: number, profileId: string): void {
-    const profile = store.profiles.find((candidate) => candidate.id === profileId)
+    const profile = availableProfiles.find((candidate) => candidate.id === profileId)
     const model = profile ? defaultModelFor(profile.provider) : undefined
     updateAgentType(index, {
       profileId,
@@ -377,7 +385,7 @@
   }
 
   function profileScope(profileId: string): string {
-    const profile = store.profiles.find((item) => item.id === profileId)
+    const profile = availableProfiles.find((item) => item.id === profileId)
     const models = scope.models[profileId] ?? []
     return `${profile ? profileOptionLabel(profile) : profileId} · ${models.length ? models.join(', ') : `${profile?.provider ?? 'account'} default model`}`
   }
@@ -676,7 +684,7 @@
           <label>
             <span>Manager account</span>
             <select value={managerProfileId} onchange={(event) => chooseManagerProfile((event.target as HTMLSelectElement).value)}>
-              {#each store.profiles as profile (profile.id)}
+              {#each availableProfiles as profile (profile.id)}
                 <option value={profile.id}>{profileOptionLabel(profile)} · {profile.provider}</option>
               {/each}
             </select>
@@ -825,7 +833,7 @@
                 <label>
                   <span>Worker account</span>
                   <select value={role.profileId} onchange={(event) => chooseRoleProfile(index, (event.target as HTMLSelectElement).value)}>
-                    {#each store.profiles as profile (profile.id)}
+                    {#each availableProfiles as profile (profile.id)}
                       <option value={profile.id}>{profileOptionLabel(profile)} · {profile.provider}</option>
                     {/each}
                   </select>
@@ -833,7 +841,7 @@
                 <label>
                   <span>Worker model</span>
                   <select value={role.model} onchange={(event) => updateAgentType(index, { model: (event.target as HTMLSelectElement).value })}>
-                    {#each modelsFor(store.profiles.find((profile) => profile.id === role.profileId)?.provider ?? 'codex') as model (model.slug)}
+                    {#each modelsFor(availableProfiles.find((profile) => profile.id === role.profileId)?.provider ?? 'codex') as model (model.slug)}
                       <option value={model.slug}>{model.name}</option>
                     {/each}
                   </select>
@@ -851,7 +859,7 @@
             {:else}
               <div class="usage-aware">
                 <p>The hub chooses the least-used account that is not blocked. It uses the live limits already shown by Usage Monitor; it never guesses or selects outside this list.</p>
-                {#each store.profiles as profile (profile.id)}
+                {#each availableProfiles as profile (profile.id)}
                   <label class="usage-profile">
                     <input
                       type="checkbox"

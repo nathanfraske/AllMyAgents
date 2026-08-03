@@ -91,6 +91,8 @@ async function build() {
     journalBackup: { status: 'active' },
     journalBackupRequired: true,
   }
+  const configPath = path.join(root, 'config.json')
+  const overseer: { profileId?: string; sessionId?: string; updatedAt?: string } = {}
   const server = startServer({
     port: 0,
     defaultCwd: root,
@@ -128,7 +130,9 @@ async function build() {
     restartState,
     executor,
     workspace,
-    configPath: path.join(root, 'config.json'),
+    configPath,
+    overseer,
+    overseerCwd: root,
   } satisfies ServerOptions)
   if (!server.listening) await once(server, 'listening')
   const address = server.address() as { port: number }
@@ -151,6 +155,9 @@ async function build() {
     server,
     sessions,
     executor,
+    configPath,
+    overseer,
+    root,
     publicPort: address.port,
   }
 }
@@ -294,6 +301,50 @@ describe('device-authenticated control plane', () => {
 
     const events = await fetch(`${base}/api/events`, { headers: auth(deviceToken) })
     expect(events.status).toBe(200)
+  })
+
+  it('mints the Overseer only through its authenticated configuration route', async () => {
+    const { base, deviceToken, sessions, configPath, root } = await build()
+    const headers = { ...auth(deviceToken), 'content-type': 'application/json' }
+
+    const ordinaryResponse = await fetch(`${base}/api/sessions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        profileId: 'claude-test',
+        cwd: root,
+        useWorktree: false,
+        permissionMode: 'full',
+        isOverseer: true,
+      }),
+    })
+    expect(ordinaryResponse.status).toBe(200)
+    expect(await ordinaryResponse.json()).not.toHaveProperty('isOverseer')
+
+    const response = await fetch(`${base}/api/overseer`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ profileId: 'claude-test' }),
+    })
+    expect(response.status).toBe(200)
+    const configured = await response.json() as { sessionId: string }
+    expect(sessions.list().find((record) => record.id === configured.sessionId)).toMatchObject({
+      isOverseer: true,
+      role: 'Application Overseer',
+      permissionMode: 'full',
+      permissionModeOperatorOverride: true,
+    })
+    expect(JSON.parse(fs.readFileSync(configPath, 'utf8'))).toMatchObject({
+      overseer: { profileId: 'claude-test', sessionId: configured.sessionId },
+    })
+
+    const repeat = await fetch(`${base}/api/overseer`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ profileId: 'claude-test' }),
+    })
+    expect(repeat.status).toBe(200)
+    await expect(repeat.json()).resolves.toMatchObject({ sessionId: configured.sessionId })
   })
 
   it('accepts an authenticated WebSocket bearer header for the trusted dev proxy', async () => {

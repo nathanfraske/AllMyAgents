@@ -27,12 +27,14 @@ afterEach(() => {
 describe('hub outage clock', () => {
   it('reads zero before anything has happened', () => {
     expect(store.hubDownSeconds).toBe(0)
+    expect(store.hubConnectionPhase).toBe('starting')
   })
 
-  it('counts up while the hub is unreachable', () => {
+  it('counts startup separately before a socket has ever opened', () => {
     priv(store).markDisconnected()
     vi.advanceTimersByTime(5_000)
     expect(store.hubDownSeconds).toBe(5)
+    expect(store.hubConnectionPhase).toBe('starting')
   })
 
   it('resets to zero the moment the socket reopens', () => {
@@ -42,6 +44,7 @@ describe('hub outage clock', () => {
     priv(store).markConnected()
     expect(store.hubDownSeconds).toBe(0)
     expect(store.connected).toBe(true)
+    expect(store.hubConnectionPhase).toBe('connected')
   })
 
   /**
@@ -73,6 +76,7 @@ describe('hub outage clock', () => {
     priv(store).markDisconnected()
     vi.advanceTimersByTime(2_000)
     expect(store.hubDownSeconds).toBe(2)
+    expect(store.hubConnectionPhase).toBe('reconnecting')
   })
 
   /**

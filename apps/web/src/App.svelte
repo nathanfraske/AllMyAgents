@@ -343,7 +343,8 @@
 <div class="app">
 <Titlebar />
 <!--
-  Hub outage banner. The supervisor restarts a dead hub by itself, but until it does the app can only
+  Hub lifecycle banner. Cold startup is explicit; after a prior connection, the supervisor restarts a
+  dead hub by itself, but until it does the app can only
   show stale content, and previously said so with a 6px grey dot in the sidebar — so a hub that had
   actually died looked like an app that had simply stopped working.
 
@@ -353,16 +354,20 @@
   so a long gap is expected behaviour rather than a hang, and saying so is the difference between
   "waiting" and "broken".
 -->
-{#if store.hubDownSeconds >= 4}
+{#if !store.needsPairing && (store.hubConnectionPhase === 'starting' || store.hubDownSeconds >= 4)}
   <div class="hubdown" role="status">
     <span class="spin"></span>
-    {#if store.hubDownSeconds < 20}
+    {#if store.hubConnectionPhase === 'starting' && store.hubDownSeconds < 20}
+      Starting the local hub…
+    {:else if store.hubConnectionPhase === 'starting'}
+      The local hub is still starting. Its supervisor is checking startup and retrying automatically.
+    {:else if store.hubDownSeconds < 20}
       Lost connection to the hub — reconnecting…
     {:else}
       The hub stopped. It's being restarted automatically — retries back off to 30s, so this can take a
       moment. Your agents' work is unaffected; they run in a separate process.
     {/if}
-    <span class="elapsed">{store.hubDownSeconds}s</span>
+    {#if store.hubDownSeconds > 0}<span class="elapsed">{store.hubDownSeconds}s</span>{/if}
   </div>
 {/if}
 <RecoveryNoticeBanner />

@@ -555,6 +555,51 @@ fn hub_device_token(app: AppHandle) -> Result<String, String> {
     ))
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OverseerDiagnostics {
+    status: Option<serde_json::Value>,
+    status_path: String,
+    log_tail: String,
+}
+
+/// Read the supervisor's bounded, journal-independent Overseer breadcrumb. This stays available to the
+/// bundled webview even when no hub is listening and SQLite/account caches were never opened.
+#[cfg(desktop)]
+#[tauri::command]
+fn overseer_diagnostics(app: AppHandle) -> Result<OverseerDiagnostics, String> {
+    let data_dir = if cfg!(debug_assertions) && std::env::var_os("AMA_HUB_DATA_DIR").is_some() {
+        PathBuf::from(std::env::var_os("AMA_HUB_DATA_DIR").expect("checked above"))
+    } else if cfg!(debug_assertions) {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("data")
+    } else {
+        app_data_root(&app)
+            .ok_or_else(|| "could not resolve the AllMyAgents data directory".to_string())?
+            .join("data")
+    };
+    let status_path = data_dir.join("overseer-supervisor.json");
+    let status = fs::read_to_string(&status_path)
+        .ok()
+        .filter(|text| text.len() <= 64 * 1024)
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    let log_tail = log_path(&app)
+        .and_then(|path| fs::read(path).ok())
+        .map(|bytes| {
+            let start = bytes.len().saturating_sub(16 * 1024);
+            String::from_utf8_lossy(&bytes[start..]).to_string()
+        })
+        .unwrap_or_default();
+    Ok(OverseerDiagnostics {
+        status,
+        status_path: status_path.display().to_string(),
+        log_tail,
+    })
+}
+
 /// First-run materialization of the app-data layout: create
 /// `<app_data_root>/data` and `<app_data_root>/profiles` and hand back the pair to
 /// pass to the hub as `HUB_DATA_DIR` / `HUB_PROFILES_DIR` (apps/hub/src/index.ts).
@@ -1940,7 +1985,8 @@ pub fn run() {
             updater_check,
             updater_install,
             uninstall_macos,
-            hub_device_token
+            hub_device_token,
+            overseer_diagnostics
         ]);
 
     builder

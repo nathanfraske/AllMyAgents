@@ -3,6 +3,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { isSolelyHubManagedInstructions } from './instructions.js'
 import type { Project } from './types.js'
 import { wslHostPath } from './workspaceLocation.js'
 
@@ -273,6 +274,150 @@ export class WorkspaceManager {
       fs.rmSync(resolvedWorktree, { recursive: true, force: true })
     }
     fs.rmSync(resolvedProject, { recursive: true, force: true })
+  }
+
+  /**
+   * Reclaim worktrees whose owning session no longer exists.
+   *
+   * Until this existed, a worktree was removed ONLY as part of `removeProjectFiles` — i.e. deleting the
+   * whole project behind an explicit operator confirmation. Nothing reclaimed the per-agent checkout when
+   * its session was deleted or never persisted, so the directory grew without bound: one operator reached
+   * 36 worktrees / 92 GB, of which 85 GB was regenerable `target/` and `node_modules/` and only ~7 GB was
+   * actual work. Nine of those had no owning session at all.
+   *
+   * SAFETY: an orphan is deleted only when git proves it holds nothing. Uncommitted changes or commits not
+   * reachable from its base leave it on disk and reported, because unmerged agent work is exactly what a
+   * disk-space sweep must never eat. Build artifacts are ignored when judging dirtiness — a stale `target/`
+   * is not a reason to keep a worktree forever.
+   *
+   * @param liveWorktrees absolute paths still claimed by a session; anything else under the root is orphaned.
+   * @returns what was removed and what was deliberately kept, for the caller to log.
+   */
+  reapOrphanWorktrees(liveWorktrees: Iterable<string>): {
+    removed: string[]
+    keptWithWork: Array<{ worktree: string; reason: string }>
+  } {
+    const live = new Set(
+      Array.from(liveWorktrees, (candidate) => this.normalizeForCompare(path.resolve(candidate)))
+    )
+    const removed: string[] = []
+    const keptWithWork: Array<{ worktree: string; reason: string }> = []
+
+    let entries: string[]
+    try {
+      entries = fs.readdirSync(this.worktreesRoot)
+    } catch {
+      return { removed, keptWithWork }
+    }
+
+    for (const entry of entries) {
+      const worktree = path.join(this.worktreesRoot, entry)
+      if (live.has(this.normalizeForCompare(worktree))) continue
+      try {
+        if (!fs.statSync(worktree).isDirectory()) continue
+      } catch {
+        continue
+      }
+      // Belt-and-braces containment: only ever a direct child of the managed root.
+      if (!this.samePath(path.dirname(path.resolve(worktree)), this.worktreesRoot)) continue
+
+      const retention = this.worktreeRetentionReason(worktree)
+      if (retention) {
+        keptWithWork.push({ worktree, reason: retention })
+        continue
+      }
+      try {
+        fs.rmSync(worktree, { recursive: true, force: true })
+        removed.push(worktree)
+      } catch (error) {
+        keptWithWork.push({
+          worktree,
+          reason: `could not be removed: ${error instanceof Error ? error.message : String(error)}`,
+        })
+      }
+    }
+    return { removed, keptWithWork }
+  }
+
+  /**
+   * Why an orphaned worktree must be kept, or undefined when git proves it holds nothing worth keeping.
+   *
+   * Fails CLOSED: if git cannot answer (not a checkout, binary missing, corrupt index), the worktree is
+   * retained. Deleting on "I could not tell" is how a sweep destroys work.
+   */
+  private worktreeRetentionReason(worktree: string): string | undefined {
+    let status: string
+    try {
+      status = this.git(worktree, ['status', '--porcelain'])
+    } catch (error) {
+      return `git status unavailable: ${error instanceof Error ? error.message : String(error)}`
+    }
+    const dirty = status
+      .split('\n')
+      .filter((line) => line.trim().length > 0)
+      .map((line) => {
+        // Porcelain v1 is `XY <path>`, and a rename reads `XY old -> new`. The status field must be
+        // stripped BEFORE matching, or a path test sees "?? target/" and never matches "target". The
+        // leading-space form (" M file") can arrive already trimmed, so accept one or two status chars.
+        const withoutStatus = line.replace(/^[ MADRCU?!]{1,2}\s+/, '')
+        const rename = withoutStatus.lastIndexOf(' -> ')
+        const candidate = rename >= 0 ? withoutStatus.slice(rename + 4) : withoutStatus
+        return candidate.replace(/^"(.*)"$/, '$1')
+      })
+      // Regenerable build output is not work. Everything else counts.
+      .filter((file) => !/(^|[/\\])(node_modules|target|dist|build)([/\\]|$)/.test(file))
+      // Neither is the instruction file the hub materializes into every worktree itself. Without this the
+      // sweep is inert in practice: each worktree carries an untracked CLAUDE.md/AGENTS.md the hub wrote,
+      // so every orphan looks dirty forever. Reuses the collision detector's own predicate, which returns
+      // false the moment the file holds any content a person wrote — so real edits still protect it.
+      .filter((file) => !this.isHubWrittenInstructionFile(worktree, file))
+    if (dirty.length > 0) return `${dirty.length} uncommitted change(s)`
+
+    // Commits the agent made that are reachable from NO other ref are unmerged work.
+    //
+    // The refs are enumerated explicitly rather than with `--exclude=... --branches`: that flag matches
+    // relative to the ref namespace it filters, so the obvious-looking `refs/heads/agent/*` silently
+    // matches nothing and every agent commit reads as already merged — which would delete exactly the
+    // work this check exists to protect. Agent branches are dropped from the "merged elsewhere" set so a
+    // commit that lives only on its own agent branch still counts as unmerged.
+    try {
+      const otherRefs = this.git(worktree, [
+        'for-each-ref',
+        '--format=%(refname)',
+        'refs/heads',
+        'refs/remotes',
+        'refs/tags',
+      ])
+        .split('\n')
+        .map((ref) => ref.trim())
+        .filter((ref) => ref.length > 0 && !ref.startsWith('refs/heads/agent/'))
+      const unreachable = this.git(worktree, ['log', '--oneline', 'HEAD', '--not', ...otherRefs])
+      if (unreachable.length > 0) {
+        return `${unreachable.split('\n').filter(Boolean).length} unmerged commit(s)`
+      }
+    } catch (error) {
+      return `git log unavailable: ${error instanceof Error ? error.message : String(error)}`
+    }
+    return undefined
+  }
+
+  /**
+   * True for a worktree-root CLAUDE.md/AGENTS.md whose entire contents this hub materialized.
+   *
+   * Fails CLOSED in both directions: a file it cannot read, or one carrying any authored content, is
+   * reported as real work so the worktree survives the sweep.
+   */
+  private isHubWrittenInstructionFile(worktree: string, file: string): boolean {
+    if (file !== 'CLAUDE.md' && file !== 'AGENTS.md') return false
+    try {
+      return isSolelyHubManagedInstructions(fs.readFileSync(path.join(worktree, file), 'utf8'))
+    } catch {
+      return false
+    }
+  }
+
+  private normalizeForCompare(candidate: string): string {
+    return process.platform === 'win32' ? candidate.toLowerCase() : candidate
   }
 
   isRepo(repo: string, location?: WslProjectLocation): boolean {

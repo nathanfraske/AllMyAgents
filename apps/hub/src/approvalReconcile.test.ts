@@ -24,6 +24,7 @@ import type { RelayMethod } from './workerProtocol.js'
 
 const IDENTITY: SessionIdentity = { sessionId: 's1', profileId: 'p1', provider: 'claude', projectId: 'proj1', label: 'demo' }
 const SAFE: DangerFlags = { busCanUseRiskyTools: false, autoApprovePractices: false, autoApproveRestart: false }
+const WORKER_SECRET = 'approval-reconcile-worker-secret-00000000000000000000'
 
 /** Invoke a built MCP tool handler exactly as the SDK dispatch does — `tool.handler(args, extra)` off the
  *  instance's registered-tool table (mirrors agentWorker.test.ts). Returns the WRAPPED handler. */
@@ -68,7 +69,7 @@ describe('approval reconciliation across a hub restart (§7.2) — end-to-end ov
     // WORKER: bind the real listener, then build the practice_write MCP handler exactly as the worker's driver
     // does — buildAgentMcpServer over the worker's OWN relay-backed AgentServices + the retryable-error wrap.
     // Calling it drives real relays over the real socket to whichever hub is currently attached.
-    const worker = new AgentWorker(socketPath)
+    const worker = new AgentWorker(socketPath, WORKER_SECRET)
     await worker.start()
     cleanups.push(() => worker.stop())
     const workerServices = (worker as unknown as { workerServices: AgentServices }).workerServices
@@ -94,7 +95,7 @@ describe('approval reconciliation across a hub restart (§7.2) — end-to-end ov
     // --- Hub A: it never resolves the approval; it will "crash" with the request still pending. ---
     const approvalsA = new ApprovalService(journal)
     const reachedA = deferred()
-    const clientA = new WorkerClient(socketPath, { attachEpoch: 1, danger: () => SAFE })
+    const clientA = new WorkerClient(socketPath, { attachEpoch: 1, danger: () => SAFE, authSecret: WORKER_SECRET })
     // resolveApproval mirrors index.ts exactly: approvals.request(sessionId, kind, payload, approvalId).
     new WorkerExecutor(clientA, {
       ...baseCallbacks,
@@ -119,7 +120,7 @@ describe('approval reconciliation across a hub restart (§7.2) — end-to-end ov
     // --- Hub B (the successor process): a FRESH ApprovalService over the SAME durable journal, higher epoch. ---
     const approvalsB = new ApprovalService(journal)
     const reachedB = deferred()
-    const clientB = new WorkerClient(socketPath, { attachEpoch: 2, danger: () => SAFE })
+    const clientB = new WorkerClient(socketPath, { attachEpoch: 2, danger: () => SAFE, authSecret: WORKER_SECRET })
     cleanups.push(() => clientB.close())
     new WorkerExecutor(clientB, {
       ...baseCallbacks,
@@ -166,7 +167,7 @@ describe('approval reconciliation across a hub restart (§7.2) — end-to-end ov
       fs.rmSync(tmp, { recursive: true, force: true })
     })
 
-    const worker = new AgentWorker(socketPath)
+    const worker = new AgentWorker(socketPath, WORKER_SECRET)
     await worker.start()
     cleanups.push(() => worker.stop())
     const workerServices = (worker as unknown as { workerServices: AgentServices }).workerServices
@@ -192,7 +193,7 @@ describe('approval reconciliation across a hub restart (§7.2) — end-to-end ov
     const reachedA = deferred()
     // Suppress hub A's approvalResolved so it truly never reaches the worker (simulating the lost-in-flight reply):
     // we resolve approvalsA out-of-band but the client is closed before the send lands.
-    const clientA = new WorkerClient(socketPath, { attachEpoch: 1, danger: () => SAFE })
+    const clientA = new WorkerClient(socketPath, { attachEpoch: 1, danger: () => SAFE, authSecret: WORKER_SECRET })
     let approvalIdSeen = ''
     new WorkerExecutor(clientA, {
       ...baseCallbacks,
@@ -214,7 +215,7 @@ describe('approval reconciliation across a hub restart (§7.2) — end-to-end ov
     // Hub B (successor, fresh map, same journal). On re-attach the worker re-flushes the approvalRequest; hub B's
     // approvals.request(id) finds the durable resolution and answers immediately — WITHOUT re-prompting.
     const approvalsB = new ApprovalService(journal)
-    const clientB = new WorkerClient(socketPath, { attachEpoch: 2, danger: () => SAFE })
+    const clientB = new WorkerClient(socketPath, { attachEpoch: 2, danger: () => SAFE, authSecret: WORKER_SECRET })
     cleanups.push(() => clientB.close())
     let reOffered = false
     new WorkerExecutor(clientB, {

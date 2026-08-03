@@ -180,6 +180,9 @@ export class MeshSite {
   private autoTimer: ReturnType<typeof setInterval> | undefined
   /** Last presence-derived sites per canonical device, retained across a peer's transient absence. */
   private readonly peerSitesCache = new Map<string, PeerSites>()
+  /** Silent tunnel failures do not emit a Reject. Bound explicit unmap/remap recovery per site. */
+  private readonly siteRecoveryAt = new Map<string, number>()
+  private readonly siteRecoveryInFlight = new Map<string, Promise<number | null>>()
 
   constructor(opts: {
     port: number
@@ -355,7 +358,7 @@ export class MeshSite {
     this.autoTimer = undefined
   }
 
-  // --- Fleet discovery + routing (unified-across-mesh view, first cut) --------------------------
+  // --- Fleet discovery + routing ---------------------------------------------------------------
   // These call the SAME node control socket + framing `register()` uses, just pointed at the
   // directory/routing commands the node already exposes (docs/mesh-unified-fleet.md §1). All are
   // fail-soft: no node here, or any error, yields empty/null — never a throw into the request path,
@@ -469,5 +472,30 @@ export class MeshSite {
     } catch {
       return null
     }
+  }
+
+  /**
+   * Replace a mapped-but-byte-dead tunnel. The node's `site_map` is idempotent, so calling it alone
+   * returns the same poisoned listener forever; an explicit unmap is the required invalidation.
+   * Recovery is single-flight and rate-limited because an actually offline peer is not an error loop.
+   */
+  async recoverSiteMap(node: string, port = 7777, cooldownMs = 60_000): Promise<number | null> {
+    const key = `${node.split('-', 1)[0]!.toLowerCase()}:${port}`
+    const active = this.siteRecoveryInFlight.get(key)
+    if (active) return active
+    const now = Date.now()
+    if (now - (this.siteRecoveryAt.get(key) ?? 0) < cooldownMs) return null
+    this.siteRecoveryAt.set(key, now)
+    const recovery = (async (): Promise<number | null> => {
+      try {
+        await this.request('site_unmap', { node, port }, 4000).catch(() => undefined)
+        await new Promise((resolve) => setTimeout(resolve, 250))
+        return await this.siteMap(node, port, 6000)
+      } finally {
+        this.siteRecoveryInFlight.delete(key)
+      }
+    })()
+    this.siteRecoveryInFlight.set(key, recovery)
+    return recovery
   }
 }

@@ -81,7 +81,14 @@
 {#if item.kind === 'status'}
   <div class="status muted">→ {item.status}</div>
 {:else if item.kind === 'compaction'}
-  <div class="compaction" role="status">
+  <div
+    class="compaction"
+    class:active={item.status === 'started'}
+    class:failed={item.status === 'failed'}
+    class:unknown={item.status === 'unobservable'}
+    role="status"
+    aria-live="polite"
+  >
     <span class="compaction-line" aria-hidden="true"></span>
     <span>{item.text ?? `Context compaction ${item.status ?? 'completed'}.`}</span>
     <span class="compaction-line" aria-hidden="true"></span>
@@ -179,6 +186,11 @@
   .status { font-size: 0.72rem; margin: 0.15rem 0; }
   .compaction { display: flex; align-items: center; gap: 0.65rem; width: 100%; color: var(--muted); font-size: 0.72rem; font-family: var(--mono); }
   .compaction-line { height: 1px; flex: 1; background: var(--border-strong); }
+  .compaction.active { color: var(--accent); }
+  .compaction.failed { color: var(--bad-text); }
+  .compaction.unknown { color: var(--warn); }
+  .compaction.active .compaction-line { background: color-mix(in srgb, var(--accent) 55%, var(--border-strong)); }
+  .compaction.failed .compaction-line { background: color-mix(in srgb, var(--bad-text) 55%, var(--border-strong)); }
   .note { font-size: 0.72rem; font-family: var(--mono); }
   .err { color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); border: 1px solid var(--bad); border-radius: 6px; padding: 0.4rem 0.6rem; font-size: 0.8rem; }
   .msg { border-radius: 8px; padding: 0.5rem 0.7rem; }

@@ -68,6 +68,41 @@ export function reduceJournalHistory(events: readonly HubEvent[]): ThreadItem[] 
       push({ kind: 'assistant', ts, text, key, agentId })
     }
   }
+  const activeCompaction = (): ThreadItem | undefined =>
+    [...items].reverse().find((item) => item.kind === 'compaction' && item.status === 'started')
+  const upsertCompaction = (
+    ts: string,
+    provider: 'claude' | 'codex',
+    status: 'started' | 'completed' | 'failed' | 'unobservable',
+    text: string,
+    operationId?: string,
+  ): void => {
+    const key = operationId ? `compaction:${provider}:${operationId}` : undefined
+    let item = key ? items.find((candidate) => candidate.key === key) : undefined
+    item ??= activeCompaction()
+    if (!item && status !== 'started') {
+      const latest = [...items].reverse().find((candidate) => candidate.kind === 'compaction')
+      const distance = latest ? Math.abs(Date.parse(ts) - Date.parse(latest.ts)) : Number.POSITIVE_INFINITY
+      if (latest && Number.isFinite(distance) && distance <= 5_000) {
+        if (latest.status === status) return
+        if (latest.status === 'unobservable') item = latest
+      }
+    }
+    if (!item) {
+      push({ kind: 'compaction', ts, status, text, key })
+      return
+    }
+    item.status = status
+    item.text = text
+  }
+  const finishOpenCompaction = (
+    ts: string,
+    provider: 'claude' | 'codex',
+    status: 'failed' | 'unobservable',
+    text: string,
+  ): void => {
+    if (activeCompaction()) upsertCompaction(ts, provider, status, text)
+  }
 
   for (const event of events) {
     eventSeq = event.seq
@@ -151,6 +186,12 @@ export function reduceJournalHistory(events: readonly HubEvent[]): ThreadItem[] 
       continue
     }
     if (kind === 'session/error') {
+      finishOpenCompaction(
+        ts,
+        'claude',
+        'failed',
+        `Context compaction failed: ${(payload as { message?: string }).message ?? 'session error'}`,
+      )
       push({ kind: 'error', ts, text: (payload as { message?: string }).message ?? 'session error' })
       continue
     }
@@ -243,14 +284,51 @@ export function reduceJournalHistory(events: readonly HubEvent[]): ThreadItem[] 
       continue
     }
     if (kind === 'claude/system') {
-      const p = payload as { subtype?: string; message?: string }
-      if (p.subtype === 'compact_boundary') {
-        push({
-          kind: 'compaction',
+      const p = payload as {
+        subtype?: string
+        message?: string
+        status?: string | null
+        compact_result?: 'success' | 'failed'
+        compact_error?: string
+        uuid?: string
+        compact_metadata?: { pre_tokens?: number; post_tokens?: number }
+      }
+      if (p.subtype === 'status' && p.status === 'compacting') {
+        upsertCompaction(ts, 'claude', 'started', 'Claude context compaction started…', p.uuid)
+      } else if (p.subtype === 'status' && p.compact_result) {
+        const failed = p.compact_result === 'failed'
+        upsertCompaction(
           ts,
-          status: 'completed',
-          text: p.message ?? 'Context compaction completed.',
-        })
+          'claude',
+          failed ? 'failed' : 'completed',
+          failed
+            ? `Claude context compaction failed${p.compact_error ? `: ${p.compact_error}` : '.'}`
+            : 'Claude context compaction completed.',
+          p.uuid,
+        )
+      } else if (p.subtype === 'status' && p.status === null && activeCompaction()) {
+        upsertCompaction(
+          ts,
+          'claude',
+          'unobservable',
+          'Claude context compaction ended without an observable terminal result.',
+          p.uuid,
+        )
+      }
+      if (p.subtype === 'compact_boundary') {
+        const meta = p.compact_metadata
+        const tokens = typeof meta?.pre_tokens === 'number'
+          ? typeof meta.post_tokens === 'number'
+            ? ` (${meta.pre_tokens.toLocaleString()} → ${meta.post_tokens.toLocaleString()} tokens)`
+            : ` (${meta.pre_tokens.toLocaleString()} tokens before compaction)`
+          : ''
+        upsertCompaction(
+          ts,
+          'claude',
+          'completed',
+          p.message ?? `Claude context compaction completed${tokens}.`,
+          p.uuid,
+        )
       }
       continue
     }
@@ -264,6 +342,14 @@ export function reduceJournalHistory(events: readonly HubEvent[]): ThreadItem[] 
       }
       const interrupted =
         p.terminal_reason === 'aborted_streaming' || p.terminal_reason === 'aborted_tools'
+      finishOpenCompaction(
+        ts,
+        'claude',
+        p.is_error ? 'failed' : 'unobservable',
+        p.is_error
+          ? 'Claude context compaction failed before reporting a terminal boundary.'
+          : 'Claude context compaction ended without an observable terminal result.',
+      )
       if (interrupted) push({ kind: 'note', ts, text: 'interrupted' })
       else if (p.is_error) {
         const errors = (p.errors ?? []).map(String).map((value) => value.trim()).filter(Boolean)
@@ -275,6 +361,43 @@ export function reduceJournalHistory(events: readonly HubEvent[]): ThreadItem[] 
             p.result?.trim() ||
             `turn failed (${p.terminal_reason ?? p.subtype ?? 'unknown error'})`,
         })
+      }
+      continue
+    }
+    if (kind === 'codex/thread/compacted') {
+      const p = payload as { turnId?: string }
+      upsertCompaction(
+        ts,
+        'codex',
+        'completed',
+        'Codex context compaction completed.',
+        p.turnId ? `turn:${p.turnId}` : undefined,
+      )
+      continue
+    }
+    if (kind === 'codex/turn/completed') {
+      const turn = (payload as { turn?: { status?: string; error?: { message?: string } | string } }).turn
+      const error = typeof turn?.error === 'string' ? turn.error : turn?.error?.message
+      finishOpenCompaction(
+        ts,
+        'codex',
+        turn?.status === 'failed' ? 'failed' : 'unobservable',
+        turn?.status === 'failed'
+          ? `Codex context compaction failed${error ? `: ${error}` : '.'}`
+          : 'Codex context compaction ended without an observable terminal result.',
+      )
+      continue
+    }
+    if (kind === 'codex/item/started') {
+      const item = (payload as { item?: Record<string, unknown> }).item
+      if (item?.type === 'contextCompaction') {
+        upsertCompaction(
+          ts,
+          'codex',
+          'started',
+          'Codex context compaction started…',
+          typeof item.id === 'string' ? item.id : undefined,
+        )
       }
       continue
     }
@@ -295,7 +418,15 @@ export function reduceJournalHistory(events: readonly HubEvent[]): ThreadItem[] 
       const item = p.item
       if (!item) continue
       const agentId = kind.startsWith('codex/subagent/') ? p.agentThreadId : undefined
-      if (item.type === 'agentMessage' && typeof item.id === 'string') {
+      if (item.type === 'contextCompaction' && !agentId) {
+        upsertCompaction(
+          ts,
+          'codex',
+          'completed',
+          'Codex context compaction completed.',
+          typeof item.id === 'string' ? item.id : undefined,
+        )
+      } else if (item.type === 'agentMessage' && typeof item.id === 'string') {
         upsertCodexText(ts, item.id, typeof item.text === 'string' ? item.text : '', false, agentId)
       } else if (item.type === 'reasoning') {
         push({

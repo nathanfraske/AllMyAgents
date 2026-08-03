@@ -1,0 +1,969 @@
+import crypto from 'node:crypto'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
+import type { RemoteDeviceCapability, RemoteDeviceGrant } from './types.js'
+
+const MAX_FILE_BYTES = 1024 * 1024
+const DEFAULT_READ_BYTES = 256 * 1024
+const MAX_DIRECTORY_ENTRIES = 500
+const MAX_COMMAND_CHARS = 16 * 1024
+const MAX_COMMAND_OUTPUT_BYTES = 512 * 1024
+const MAX_REMOTE_RESPONSE_BYTES = 2 * 1024 * 1024
+const MAX_COMMAND_TIMEOUT_MS = 120_000
+const MAX_DEVICE_ROOTS = 128
+const MAX_FLEET_CONNECTIONS = 256
+const MAX_CONCURRENT_COMMANDS = 8
+
+export interface FleetConnection {
+  siteId: string
+  label: string
+  token: string
+  updatedAt: string
+}
+
+export interface FleetConnectionPublic extends Omit<FleetConnection, 'token'> {
+  paired: true
+}
+
+function boundedPlain(value: unknown, field: string, max = 200): string {
+  if (typeof value !== 'string') throw new Error(`${field} must be a string`)
+  const out = value.trim()
+  if (!out || out.length > max || /[\u0000-\u001f\u007f]/u.test(out)) {
+    throw new Error(`${field} must be a non-empty bounded plain string`)
+  }
+  return out
+}
+
+function atomicPrivateJson(file: string, value: unknown): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  const temp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`
+  try {
+    fs.writeFileSync(temp, JSON.stringify(value, null, 2), { mode: 0o600 })
+    fs.renameSync(temp, file)
+    try { fs.chmodSync(file, 0o600) } catch { /* Windows ACLs are inherited from the data directory. */ }
+  } finally {
+    try { fs.unlinkSync(temp) } catch { /* rename already consumed it */ }
+  }
+}
+
+/** Hub-owned remote credentials. Tokens never enter an agent prompt or tool result. */
+export class FleetConnectionStore {
+  private readonly values = new Map<string, FleetConnection>()
+
+  constructor(private readonly file: string) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as { connections?: unknown }
+      if (Array.isArray(parsed.connections)) {
+        for (const raw of parsed.connections) {
+          const item = raw as Partial<FleetConnection>
+          if (
+            typeof item.siteId === 'string' && item.siteId.length > 0 && item.siteId.length <= 256 &&
+            typeof item.label === 'string' && item.label.length > 0 && item.label.length <= 200 &&
+            typeof item.token === 'string' && item.token.length >= 32 && item.token.length <= 512
+          ) {
+            this.values.set(item.siteId, {
+              siteId: item.siteId,
+              label: item.label,
+              token: item.token,
+              updatedAt: typeof item.updatedAt === 'string' ? item.updatedAt : new Date(0).toISOString(),
+            })
+          }
+        }
+      }
+    } catch {
+      /* First run or malformed file: fail closed to no remote credentials. */
+    }
+  }
+
+  list(): FleetConnectionPublic[] {
+    return [...this.values.values()].map(({ token: _token, ...item }) => ({ ...item, paired: true }))
+  }
+
+  get(siteId: string): FleetConnection | undefined {
+    return this.values.get(siteId)
+  }
+
+  upsert(input: { siteId: string; label: string; token: string }): FleetConnectionPublic {
+    const siteId = boundedPlain(input.siteId, 'site id', 256)
+    const label = boundedPlain(input.label, 'device label', 200)
+    const token = boundedPlain(input.token, 'remote device token', 512)
+    if (token.length < 32) throw new Error('remote device token is too short')
+    const existing = this.values.get(siteId)
+    if (existing?.label === label && existing.token === token) {
+      const { token: _token, ...publicValue } = existing
+      return { ...publicValue, paired: true }
+    }
+    if (!existing && this.values.size >= MAX_FLEET_CONNECTIONS) {
+      throw new Error(`remote device connection limit (${MAX_FLEET_CONNECTIONS}) reached`)
+    }
+    const value: FleetConnection = { siteId, label, token, updatedAt: new Date().toISOString() }
+    this.values.set(siteId, value)
+    this.persist()
+    const { token: _token, ...publicValue } = value
+    return { ...publicValue, paired: true }
+  }
+
+  remove(siteId: string): boolean {
+    const removed = this.values.delete(siteId)
+    if (removed) this.persist()
+    return removed
+  }
+
+  private persist(): void {
+    atomicPrivateJson(this.file, { version: 1, connections: [...this.values.values()] })
+  }
+}
+
+export interface DeviceRootPolicy {
+  id: string
+  label: string
+  path: string
+  /** Absent means the target's host OS. WSL roots use a distro-native absolute Linux path. */
+  environment?: { kind: 'wsl'; distro: string }
+  read: boolean
+  write: boolean
+  terminal: boolean
+}
+
+export interface DeviceExecutorPolicy {
+  enabled: boolean
+  roots: DeviceRootPolicy[]
+}
+
+export interface DeviceExecutorCapabilities {
+  enabled: boolean
+  platform: NodeJS.Platform
+  arch: string
+  hostname: string
+  environments: RemoteExecutionEnvironment[]
+  roots: DeviceRootPolicy[]
+}
+
+export interface RemoteExecutionEnvironment {
+  id: string
+  kind: 'host' | 'wsl'
+  label: string
+  platform: string
+  arch?: string
+  shell: string
+  distro?: string
+  state?: 'running' | 'stopped'
+  version?: 1 | 2
+  isDefault?: boolean
+}
+
+export interface RemoteEnvironmentInspection {
+  environmentId: string
+  kind: 'host' | 'wsl'
+  label: string
+  platform: string
+  arch: string
+  hostname: string
+  release: string
+  shell: string
+  cpuCount: number
+  totalMemoryBytes: number
+  tools: Record<string, boolean>
+}
+
+export interface RemoteDeviceTelemetry {
+  /** Time spent locating/refreshing the AllMyStuff route on the source hub. */
+  routeMs?: number
+  /** HTTP request/response time after the route was resolved. */
+  networkMs?: number
+  /** End-to-end source-side time. */
+  roundTripMs?: number
+  /** Time spent executing the operation on the target hub. */
+  targetMs?: number
+  bytesSent?: number
+  bytesReceived?: number
+  transferBytes?: number
+  transferBytesPerSecond?: number
+}
+
+export interface RemoteDeviceFailure {
+  stage: 'pairing' | 'route' | 'transport' | 'timeout' | 'protocol' | 'target'
+  code?: string
+}
+
+export type RemoteDeviceAction =
+  | { op: 'probe'; rootId: string }
+  | { op: 'inspect'; rootId: string }
+  | { op: 'list'; rootId: string; path?: string }
+  | { op: 'read'; rootId: string; path: string; encoding?: 'utf8' | 'base64'; maxBytes?: number }
+  | { op: 'write'; rootId: string; path: string; content: string; encoding?: 'utf8' | 'base64' }
+  | { op: 'exec'; rootId: string; command: string; cwd?: string; timeoutMs?: number }
+
+export interface RemoteDeviceActionResult {
+  ok: boolean
+  error?: string
+  failure?: RemoteDeviceFailure
+  telemetry?: RemoteDeviceTelemetry
+  environment?: RemoteEnvironmentInspection
+  entries?: Array<{ name: string; kind: 'file' | 'directory' | 'other'; size?: number }>
+  content?: string
+  encoding?: 'utf8' | 'base64'
+  bytes?: number
+  truncated?: boolean
+  stdout?: string
+  stderr?: string
+  exitCode?: number | null
+  signal?: string | null
+  timedOut?: boolean
+}
+
+function inside(root: string, target: string): boolean {
+  const rel = path.relative(root, target)
+  return rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel))
+}
+
+function relativePath(value: unknown, field: string, allowEmpty = false): string {
+  if (value === undefined && allowEmpty) return ''
+  if (typeof value !== 'string' || (!allowEmpty && value.length === 0) || value.length > 4096 || value.includes('\0')) {
+    throw new Error(`${field} must be a bounded relative path`)
+  }
+  if (path.isAbsolute(value)) throw new Error(`${field} must be relative to an approved root`)
+  const normalized = path.normalize(value || '.')
+  if (normalized === '..' || normalized.startsWith(`..${path.sep}`)) {
+    throw new Error(`${field} escapes the approved root`)
+  }
+  return normalized === '.' ? '' : normalized
+}
+
+function rootId(realPath: string): string {
+  const identity = process.platform === 'win32' || process.platform === 'darwin'
+    ? realPath.toLocaleLowerCase('en-US')
+    : realPath
+  return `root_${crypto.createHash('sha256').update(identity).digest('hex').slice(0, 20)}`
+}
+
+function wslEnvironmentId(distro: string): string {
+  return `wsl:${distro}`
+}
+
+function hostEnvironment(): RemoteExecutionEnvironment {
+  return {
+    id: 'host',
+    kind: 'host',
+    label: `${os.hostname()} host`,
+    platform: process.platform,
+    arch: process.arch,
+    shell: process.platform === 'win32' ? 'PowerShell' : '/bin/sh',
+  }
+}
+
+function decodeProcessOutput(value: Buffer | string | null | undefined): string {
+  if (typeof value === 'string') return value.replaceAll('\0', '').replace(/^\uFEFF/u, '')
+  if (!value) return ''
+  let zeroes = 0
+  for (let index = 1; index < value.length; index += 2) if (value[index] === 0) zeroes += 1
+  return value.toString(value.length > 1 && zeroes > value.length / 8 ? 'utf16le' : 'utf8')
+    .replaceAll('\0', '')
+    .replace(/^\uFEFF/u, '')
+}
+
+/** Parse redirected `wsl.exe --list --verbose` output without starting a stopped distro. */
+export function parseRemoteWslEnvironments(output: Buffer | string): RemoteExecutionEnvironment[] {
+  const environments: RemoteExecutionEnvironment[] = []
+  for (const raw of decodeProcessOutput(output).split(/\r?\n/u)) {
+    const line = raw.trimEnd()
+    if (!line.trim() || /^\s*NAME\s+STATE\s+VERSION\s*$/iu.test(line)) continue
+    const match = /^\s*(\*)?\s*(.+?)\s+(Running|Stopped)\s+([12])\s*$/iu.exec(line)
+    if (!match || /^docker-desktop(?:-data)?$/iu.test(match[2]!.trim())) continue
+    const distro = match[2]!.trim()
+    environments.push({
+      id: wslEnvironmentId(distro),
+      kind: 'wsl',
+      label: `${distro} (WSL)`,
+      platform: 'linux',
+      shell: '/bin/sh',
+      distro,
+      state: match[3]!.toLowerCase() === 'running' ? 'running' : 'stopped',
+      version: Number(match[4]) as 1 | 2,
+      isDefault: match[1] === '*',
+    })
+  }
+  return environments
+}
+
+function discoverExecutionEnvironments(): RemoteExecutionEnvironment[] {
+  const host = hostEnvironment()
+  if (process.platform !== 'win32') return [host]
+  const listed = spawnSync('wsl.exe', ['--list', '--verbose'], {
+    windowsHide: true,
+    encoding: 'buffer',
+    timeout: 5_000,
+    maxBuffer: 256 * 1024,
+  })
+  return listed.status === 0 ? [host, ...parseRemoteWslEnvironments(listed.stdout)] : [host]
+}
+
+function validateLinuxAbsolutePath(value: unknown, field: string): string {
+  if (typeof value !== 'string' || !value.startsWith('/') || value.length > 4096 || value.includes('\0')) {
+    throw new Error(`${field} must be a bounded absolute Linux path`)
+  }
+  const normalized = path.posix.normalize(value)
+  if (!normalized.startsWith('/')) throw new Error(`${field} must be an absolute Linux path`)
+  return normalized
+}
+
+/** Project one canonical distro-native path through WSL's local filesystem bridge. */
+export function wslUncPath(distro: string, linuxPath: string): string {
+  const name = boundedPlain(distro, 'WSL distro', 200)
+  if (/[\\/]/u.test(name)) throw new Error('WSL distro must not contain path separators')
+  const normalized = validateLinuxAbsolutePath(linuxPath, 'WSL path')
+  const suffix = normalized === '/' ? '' : normalized.slice(1).replaceAll('/', '\\')
+  return `\\\\wsl.localhost\\${name}${suffix ? `\\${suffix}` : ''}`
+}
+
+function capabilityFor(action: RemoteDeviceAction): RemoteDeviceCapability {
+  if (action.op === 'write') return 'write'
+  if (action.op === 'exec') return 'terminal'
+  return 'read'
+}
+
+/** Target-side execution boundary. Disabled with zero roots until the operator configures it. */
+export class DeviceExecutor {
+  private policy: DeviceExecutorPolicy = { enabled: false, roots: [] }
+  private activeCommands = 0
+
+  constructor(private readonly file: string) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as DeviceExecutorPolicy
+      this.policy = this.normalizePolicy(parsed)
+    } catch {
+      /* Safe default. */
+    }
+  }
+
+  capabilities(): DeviceExecutorCapabilities {
+    return {
+      enabled: this.policy.enabled,
+      platform: process.platform,
+      arch: process.arch,
+      hostname: os.hostname(),
+      environments: discoverExecutionEnvironments(),
+      roots: this.policy.roots.map((root) => ({ ...root })),
+    }
+  }
+
+  update(input: { enabled?: unknown; roots?: unknown }): DeviceExecutorCapabilities {
+    const roots = Array.isArray(input.roots) ? input.roots : this.policy.roots
+    this.policy = this.normalizePolicy({ enabled: input.enabled === true, roots: roots as DeviceRootPolicy[] })
+    atomicPrivateJson(this.file, { version: 1, ...this.policy })
+    return this.capabilities()
+  }
+
+  async execute(action: RemoteDeviceAction): Promise<RemoteDeviceActionResult> {
+    const started = performance.now()
+    const finish = (result: RemoteDeviceActionResult): RemoteDeviceActionResult => ({
+      ...result,
+      failure: result.ok ? undefined : (result.failure ?? { stage: 'target' }),
+      telemetry: { ...result.telemetry, targetMs: Math.max(0, Math.round((performance.now() - started) * 10) / 10) },
+    })
+    if (!this.policy.enabled) return finish({ ok: false, error: 'Remote device execution is disabled on this machine.' })
+    const root = this.policy.roots.find((item) => item.id === action.rootId)
+    if (!root) return finish({ ok: false, error: 'Unknown or revoked device root.' })
+    const needed = capabilityFor(action)
+    if (!root[needed]) return finish({ ok: false, error: `${needed} access is not enabled for this root.` })
+    try {
+      if (action.op === 'probe') return finish({ ok: true })
+      if (action.op === 'inspect') return finish(await this.inspect(root))
+      if (action.op === 'list') return finish(this.list(root, action.path))
+      if (action.op === 'read') return finish(this.read(root, action))
+      if (action.op === 'write') return finish(this.write(root, action))
+      if (this.activeCommands >= MAX_CONCURRENT_COMMANDS) {
+        return finish({ ok: false, error: `remote terminal concurrency limit (${MAX_CONCURRENT_COMMANDS}) reached` })
+      }
+      this.activeCommands += 1
+      try {
+        return finish(await this.exec(root, action))
+      } finally {
+        this.activeCommands -= 1
+      }
+    } catch (error) {
+      return finish({ ok: false, error: this.safeError(error, root.path) })
+    }
+  }
+
+  private normalizePolicy(input: DeviceExecutorPolicy): DeviceExecutorPolicy {
+    const roots: DeviceRootPolicy[] = []
+    const seen = new Set<string>()
+    for (const raw of (Array.isArray(input?.roots) ? input.roots : []).slice(0, MAX_DEVICE_ROOTS)) {
+      try {
+        const environment = raw.environment?.kind === 'wsl'
+          ? { kind: 'wsl' as const, distro: boundedPlain(raw.environment.distro, 'WSL distro', 200) }
+          : undefined
+        let real: string
+        let publicPath: string
+        if (environment) {
+          if (process.platform !== 'win32' || /[\\/]/u.test(environment.distro)) continue
+          const requested = validateLinuxAbsolutePath(raw.path, 'WSL root path')
+          const canonical = spawnSync('wsl.exe', [
+            '--distribution', environment.distro, '--exec', 'realpath', '--', requested,
+          ], { windowsHide: true, encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024 })
+          if (canonical.status !== 0) continue
+          publicPath = validateLinuxAbsolutePath(decodeProcessOutput(canonical.stdout).trim(), 'canonical WSL root path')
+          real = fs.realpathSync.native(wslUncPath(environment.distro, publicPath))
+        } else {
+          const requested = boundedPlain(raw.path, 'root path', 4096)
+          real = fs.realpathSync.native(path.resolve(requested))
+          publicPath = real
+        }
+        if (!fs.statSync(real).isDirectory()) continue
+        // Keep host IDs byte-for-byte compatible with the original host-only executor so enabling
+        // WSL support never silently revokes an existing grant. WSL roots need the environment in
+        // their identity because the same Linux path may exist in several distributions.
+        const id = environment
+          ? rootId(`${wslEnvironmentId(environment.distro)}:${publicPath}`)
+          : rootId(real)
+        if (seen.has(id)) continue
+        seen.add(id)
+        roots.push({
+          id,
+          label: typeof raw.label === 'string' && raw.label.trim()
+            ? boundedPlain(raw.label, 'root label', 100)
+            : environment
+              ? path.posix.basename(publicPath) || `${environment.distro} /`
+              : path.basename(real) || real,
+          path: publicPath,
+          ...(environment ? { environment } : {}),
+          read: raw.read === true,
+          write: raw.write === true,
+          terminal: raw.terminal === true,
+        })
+      } catch {
+        /* A missing/invalid root is revoked rather than broadening to an ancestor. */
+      }
+    }
+    return { enabled: input?.enabled === true, roots }
+  }
+
+  private filesystemRoot(root: DeviceRootPolicy): string {
+    return root.environment?.kind === 'wsl'
+      ? wslUncPath(root.environment.distro, root.path)
+      : root.path
+  }
+
+  private resolveExisting(root: DeviceRootPolicy, requested: unknown, field: string, directory = false): string {
+    const rel = relativePath(requested, field, true)
+    const base = this.filesystemRoot(root)
+    const lexical = path.resolve(base, rel)
+    if (!inside(base, lexical)) throw new Error(`${field} escapes the approved root`)
+    const real = fs.realpathSync.native(lexical)
+    if (!inside(base, real)) throw new Error(`${field} resolves outside the approved root`)
+    if (directory && !fs.statSync(real).isDirectory()) throw new Error(`${field} is not a directory`)
+    return real
+  }
+
+  private list(root: DeviceRootPolicy, requested: unknown): RemoteDeviceActionResult {
+    const dir = this.resolveExisting(root, requested, 'path', true)
+    const entries: fs.Dirent[] = []
+    const handle = fs.opendirSync(dir)
+    try {
+      while (entries.length <= MAX_DIRECTORY_ENTRIES) {
+        const entry = handle.readSync()
+        if (!entry) break
+        entries.push(entry)
+      }
+    } finally {
+      handle.closeSync()
+    }
+    const truncated = entries.length > MAX_DIRECTORY_ENTRIES
+    if (truncated) entries.length = MAX_DIRECTORY_ENTRIES
+    const out = entries.map((entry) => {
+      const kind = entry.isFile() ? 'file' as const : entry.isDirectory() ? 'directory' as const : 'other' as const
+      let size: number | undefined
+      if (kind === 'file') {
+        try { size = fs.statSync(path.join(dir, entry.name)).size } catch { /* raced with removal */ }
+      }
+      return { name: entry.name, kind, ...(size === undefined ? {} : { size }) }
+    })
+    return { ok: true, entries: out, truncated }
+  }
+
+  private read(root: DeviceRootPolicy, action: Extract<RemoteDeviceAction, { op: 'read' }>): RemoteDeviceActionResult {
+    const file = this.resolveExisting(root, action.path, 'path')
+    const stat = fs.statSync(file)
+    if (!stat.isFile()) throw new Error('path is not a regular file')
+    const max = Math.max(1, Math.min(Number(action.maxBytes) || DEFAULT_READ_BYTES, MAX_FILE_BYTES))
+    const handle = fs.openSync(file, 'r')
+    try {
+      const bytes = Math.min(stat.size, max)
+      const buffer = Buffer.alloc(bytes)
+      const read = fs.readSync(handle, buffer, 0, bytes, 0)
+      const value = buffer.subarray(0, read)
+      const encoding = action.encoding === 'base64' ? 'base64' : 'utf8'
+      return {
+        ok: true,
+        content: value.toString(encoding),
+        encoding,
+        bytes: read,
+        truncated: stat.size > read,
+      }
+    } finally {
+      fs.closeSync(handle)
+    }
+  }
+
+  private write(root: DeviceRootPolicy, action: Extract<RemoteDeviceAction, { op: 'write' }>): RemoteDeviceActionResult {
+    const rel = relativePath(action.path, 'path')
+    const base = this.filesystemRoot(root)
+    const target = path.resolve(base, rel)
+    if (!inside(base, target)) throw new Error('path escapes the approved root')
+    const parent = fs.realpathSync.native(path.dirname(target))
+    if (!inside(base, parent)) throw new Error('path resolves outside the approved root')
+    try {
+      const current = fs.lstatSync(target)
+      if (current.isSymbolicLink()) throw new Error('refusing to overwrite a symbolic link')
+      const real = fs.realpathSync.native(target)
+      if (!inside(base, real) || !current.isFile()) throw new Error('target is not a regular file inside the root')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    const encoding = action.encoding === 'base64' ? 'base64' : 'utf8'
+    if (typeof action.content !== 'string') throw new Error('content must be a string')
+    if (encoding === 'base64' && !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(action.content)) {
+      throw new Error('content is not valid base64')
+    }
+    const content = Buffer.from(action.content, encoding)
+    if (content.length > MAX_FILE_BYTES) throw new Error(`write exceeds ${MAX_FILE_BYTES} bytes`)
+    const temp = path.join(parent, `.${path.basename(target)}.ama-${crypto.randomBytes(6).toString('hex')}.tmp`)
+    try {
+      fs.writeFileSync(temp, content, { flag: 'wx' })
+      fs.renameSync(temp, target)
+    } finally {
+      try { fs.unlinkSync(temp) } catch { /* renamed or never created */ }
+    }
+    return { ok: true, bytes: content.length, encoding }
+  }
+
+  private exec(
+    root: DeviceRootPolicy,
+    action: Extract<RemoteDeviceAction, { op: 'exec' }>,
+  ): Promise<RemoteDeviceActionResult> {
+    if (typeof action.command !== 'string' || action.command.length === 0 || action.command.length > MAX_COMMAND_CHARS || action.command.includes('\0')) {
+      throw new Error('command must be a non-empty bounded string')
+    }
+    const cwd = this.resolveExisting(root, action.cwd, 'cwd', true)
+    const timeoutMs = Math.max(1000, Math.min(Number(action.timeoutMs) || 30_000, MAX_COMMAND_TIMEOUT_MS))
+    const allowedEnvironment = new Set([
+      'PATH', 'PATHEXT', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP', 'HOME', 'USERPROFILE',
+      'LANG', 'LC_ALL', 'TERM',
+    ])
+    const env: NodeJS.ProcessEnv = {}
+    for (const [key, value] of Object.entries(process.env)) {
+      if (allowedEnvironment.has(key.toUpperCase())) env[key] = value
+    }
+    env.ALLMYAGENTS_REMOTE_TESTBED = '1'
+    const wsl = root.environment?.kind === 'wsl' ? root.environment : undefined
+    const relativeCwd = path.relative(this.filesystemRoot(root), cwd).split(path.sep).filter(Boolean)
+    const linuxCwd = wsl ? path.posix.join(root.path, ...relativeCwd) : undefined
+    const program = wsl ? 'wsl.exe' : process.platform === 'win32' ? 'powershell.exe' : '/bin/sh'
+    const args = wsl
+      ? ['--distribution', wsl.distro, '--cd', linuxCwd!, '--exec', '/usr/bin/env', 'ALLMYAGENTS_REMOTE_TESTBED=1', '/bin/sh', '-lc', action.command]
+      : process.platform === 'win32'
+        ? ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', action.command]
+        : ['-lc', action.command]
+    return new Promise((resolve) => {
+      let child: ChildProcess
+      try {
+        child = spawn(program, args, {
+          cwd: wsl ? undefined : cwd,
+          env,
+          windowsHide: true,
+          detached: process.platform !== 'win32',
+          stdio: ['ignore', 'pipe', 'pipe'],
+        })
+      } catch (error) {
+        resolve({ ok: false, error: error instanceof Error ? error.message : String(error) })
+        return
+      }
+      const stdout: Buffer[] = []
+      const stderr: Buffer[] = []
+      let outputBytes = 0
+      let truncated = false
+      let timedOut = false
+      const collect = (chunks: Buffer[], chunk: Buffer): void => {
+        const remaining = MAX_COMMAND_OUTPUT_BYTES - outputBytes
+        if (remaining <= 0) { truncated = true; return }
+        if (chunk.length > remaining) {
+          chunks.push(chunk.subarray(0, remaining))
+          outputBytes = MAX_COMMAND_OUTPUT_BYTES
+          truncated = true
+          return
+        }
+        chunks.push(chunk)
+        outputBytes += chunk.length
+      }
+      child.stdout?.on('data', (chunk: Buffer) => collect(stdout, chunk))
+      child.stderr?.on('data', (chunk: Buffer) => collect(stderr, chunk))
+      const killTree = (): void => {
+        if (!child.pid) return
+        try {
+          if (process.platform === 'win32') {
+            spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore', timeout: 5000 })
+          } else {
+            process.kill(-child.pid, 'SIGKILL')
+          }
+        } catch {
+          try { child.kill('SIGKILL') } catch { /* already exited */ }
+        }
+      }
+      const timer = setTimeout(() => { timedOut = true; killTree() }, timeoutMs)
+      timer.unref?.()
+      child.once('error', (error) => {
+        clearTimeout(timer)
+        resolve({ ok: false, error: error.message })
+      })
+      child.once('close', (code, signal) => {
+        clearTimeout(timer)
+        resolve({
+          ok: !timedOut && code === 0,
+          ...(timedOut ? { error: `command timed out after ${timeoutMs}ms` } : {}),
+          stdout: Buffer.concat(stdout).toString('utf8'),
+          stderr: Buffer.concat(stderr).toString('utf8'),
+          exitCode: code,
+          signal,
+          timedOut,
+          truncated,
+        })
+      })
+    })
+  }
+
+  private async inspect(root: DeviceRootPolicy): Promise<RemoteDeviceActionResult> {
+    const toolNames = ['git', 'node', 'npm', 'python3', 'docker', 'gcc', 'make'] as const
+    if (root.environment?.kind !== 'wsl') {
+      const program = process.platform === 'win32' ? 'where.exe' : '/bin/sh'
+      const tools = Object.fromEntries(toolNames.map((tool) => {
+        const checked = process.platform === 'win32'
+          ? spawnSync(program, [tool], { windowsHide: true, stdio: 'ignore', timeout: 2_000 })
+          : spawnSync(program, ['-lc', `command -v ${tool}`], { windowsHide: true, stdio: 'ignore', timeout: 2_000 })
+        return [tool, checked.status === 0]
+      }))
+      return {
+        ok: true,
+        environment: {
+          environmentId: 'host',
+          kind: 'host',
+          label: `${os.hostname()} host`,
+          platform: process.platform,
+          arch: process.arch,
+          hostname: os.hostname(),
+          release: os.release(),
+          shell: process.platform === 'win32' ? 'PowerShell' : '/bin/sh',
+          cpuCount: os.cpus().length,
+          totalMemoryBytes: os.totalmem(),
+          tools,
+        },
+      }
+    }
+    const distro = root.environment.distro
+    const script = [
+      'printf "HOST\\t%s\\n" "$(hostname)"',
+      'printf "ARCH\\t%s\\n" "$(uname -m)"',
+      'printf "RELEASE\\t%s\\n" "$(uname -sr)"',
+      'printf "CPU\\t%s\\n" "$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || printf 0)"',
+      'printf "MEM\\t%s\\n" "$(awk \'/MemTotal/{print $2 * 1024}\' /proc/meminfo 2>/dev/null || printf 0)"',
+      ...toolNames.map((tool) => `command -v ${tool} >/dev/null 2>&1 && printf "TOOL\\t${tool}\\t1\\n" || printf "TOOL\\t${tool}\\t0\\n"`),
+    ].join('; ')
+    const result = spawnSync('wsl.exe', ['--distribution', distro, '--exec', '/bin/sh', '-lc', script], {
+      windowsHide: true,
+      encoding: 'utf8',
+      timeout: 10_000,
+      maxBuffer: 128 * 1024,
+    })
+    if (result.status !== 0) {
+      return { ok: false, error: `WSL environment inspection failed${result.error ? `: ${result.error.message}` : ''}` }
+    }
+    const values = new Map<string, string>()
+    const tools: Record<string, boolean> = {}
+    for (const line of decodeProcessOutput(result.stdout).split(/\r?\n/u)) {
+      const [key, name, value] = line.split('\t')
+      if (key === 'TOOL' && name) tools[name] = value === '1'
+      else if (key && name !== undefined) values.set(key, name)
+    }
+    return {
+      ok: true,
+      environment: {
+        environmentId: wslEnvironmentId(distro),
+        kind: 'wsl',
+        label: `${distro} (WSL)`,
+        platform: 'linux',
+        arch: values.get('ARCH') || 'unknown',
+        hostname: values.get('HOST') || distro,
+        release: values.get('RELEASE') || 'unknown',
+        shell: '/bin/sh',
+        cpuCount: Number(values.get('CPU')) || 0,
+        totalMemoryBytes: Number(values.get('MEM')) || 0,
+        tools,
+      },
+    }
+  }
+
+  private safeError(error: unknown, approvedRoot: string): string {
+    const message = error instanceof Error ? error.message : String(error)
+    const escaped = approvedRoot.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
+    return escaped ? message.replace(new RegExp(escaped, 'giu'), '[approved root]') : message
+  }
+}
+
+export interface RemoteDeviceView {
+  siteId: string
+  label: string
+  connected: boolean
+  error?: string
+  platform?: NodeJS.Platform
+  arch?: string
+  hostname?: string
+  environments?: RemoteExecutionEnvironment[]
+  roots: Array<DeviceRootPolicy & { grantedCapabilities: RemoteDeviceCapability[] }>
+}
+
+export interface RemoteDeviceCatalogEntry extends FleetConnectionPublic {
+  connected: boolean
+  error?: string
+  capabilities?: DeviceExecutorCapabilities
+}
+
+export interface RemoteDeviceRoute {
+  siteId: string
+  label: string
+  baseUrl: string
+  online: boolean
+}
+
+async function boundedJson(response: Response, onBytes?: (bytes: number) => void): Promise<unknown> {
+  const reader = response.body?.getReader()
+  if (!reader) return undefined
+  const chunks: Uint8Array[] = []
+  let total = 0
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    total += value.byteLength
+    if (total > MAX_REMOTE_RESPONSE_BYTES) {
+      await reader.cancel()
+      throw new Error('remote device response exceeded its size bound')
+    }
+    chunks.push(value)
+  }
+  const text = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString('utf8')
+  onBytes?.(total)
+  return text ? JSON.parse(text) : undefined
+}
+
+class RemoteRequestError extends Error {
+  constructor(
+    message: string,
+    readonly failure: RemoteDeviceFailure,
+    readonly telemetry: RemoteDeviceTelemetry,
+  ) {
+    super(message)
+  }
+}
+
+/** Source-side client. It intersects target policy with one session's durable operator grant. */
+export class RemoteDeviceController {
+  constructor(
+    private readonly connections: FleetConnectionStore,
+    private readonly resolveRoute: (siteId: string) => Promise<RemoteDeviceRoute | null>,
+  ) {}
+
+  listConnections(): FleetConnectionPublic[] {
+    return this.connections.list()
+  }
+
+  saveConnection(input: { siteId: string; label: string; token: string }): FleetConnectionPublic {
+    return this.connections.upsert(input)
+  }
+
+  removeConnection(siteId: string): boolean {
+    return this.connections.remove(siteId)
+  }
+
+  async listForGrants(grants: RemoteDeviceGrant[]): Promise<RemoteDeviceView[]> {
+    const bySite = new Map<string, RemoteDeviceGrant[]>()
+    for (const grant of grants) bySite.set(grant.siteId, [...(bySite.get(grant.siteId) ?? []), grant])
+    return Promise.all([...bySite].map(async ([siteId, siteGrants]) => {
+      const connection = this.connections.get(siteId)
+      if (!connection) return { siteId, label: siteId, connected: false, error: 'Device is not paired with this hub.', roots: [] }
+      try {
+        const capabilities = await this.request<DeviceExecutorCapabilities>(siteId, '/api/device-executor', 'GET')
+        return {
+          siteId,
+          label: connection.label,
+          connected: capabilities.enabled,
+          ...capabilities,
+          roots: capabilities.roots
+            .filter((root) => siteGrants.some((grant) => grant.rootIds.includes(root.id)))
+            .map((root) => ({
+              ...root,
+              grantedCapabilities: [...new Set(siteGrants
+                .filter((grant) => grant.rootIds.includes(root.id))
+                .flatMap((grant) => grant.capabilities)
+                .filter((capability) => root[capability]))],
+            })),
+        }
+      } catch (error) {
+        return { siteId, label: connection.label, connected: false, error: error instanceof Error ? error.message : String(error), roots: [] }
+      }
+    }))
+  }
+
+  async catalog(): Promise<RemoteDeviceCatalogEntry[]> {
+    return Promise.all(this.connections.list().map(async (connection) => {
+      try {
+        const capabilities = await this.capabilities(connection.siteId)
+        return {
+          ...connection,
+          connected: capabilities.enabled,
+          ...(!capabilities.enabled ? { error: 'Testbed access is disabled on this device.' } : {}),
+          capabilities,
+        }
+      } catch (error) {
+        return {
+          ...connection,
+          connected: false,
+          error: error instanceof Error ? error.message : String(error),
+        }
+      }
+    }))
+  }
+
+  async capabilities(siteId: string): Promise<DeviceExecutorCapabilities> {
+    return this.request<DeviceExecutorCapabilities>(siteId, '/api/device-executor', 'GET')
+  }
+
+  async execute(siteId: string, action: RemoteDeviceAction, actor: { sessionId: string; profileId: string }): Promise<RemoteDeviceActionResult> {
+    const timeout = action.op === 'exec'
+      ? Math.min(Number(action.timeoutMs) || 30_000, MAX_COMMAND_TIMEOUT_MS) + 10_000
+      : 15_000
+    const body = { action, actor }
+    try {
+      const result = await this.request<RemoteDeviceActionResult>(siteId, '/api/device-executor/action', 'POST', body, timeout, true)
+      const telemetry = result.telemetry ?? {}
+      const transferBytes = action.op === 'read' || action.op === 'write' ? result.bytes : undefined
+      return {
+        ...result,
+        failure: result.ok ? undefined : (result.failure ?? { stage: 'target' }),
+        telemetry: {
+          ...telemetry,
+          ...(transferBytes === undefined ? {} : {
+            transferBytes,
+            transferBytesPerSecond: Math.round(transferBytes / Math.max((telemetry.roundTripMs ?? 1) / 1000, 0.001)),
+          }),
+        },
+      }
+    } catch (error) {
+      if (error instanceof RemoteRequestError) {
+        return { ok: false, error: error.message, failure: error.failure, telemetry: error.telemetry }
+      }
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+        failure: { stage: 'transport' },
+      }
+    }
+  }
+
+  private async request<T>(
+    siteId: string,
+    pathname: string,
+    method: 'GET' | 'POST',
+    body?: unknown,
+    timeoutMs = 10_000,
+    instrument = false,
+  ): Promise<T> {
+    const started = performance.now()
+    const telemetry: RemoteDeviceTelemetry = {}
+    const connection = this.connections.get(siteId)
+    if (!connection) throw new RemoteRequestError('Device is not paired with this hub.', { stage: 'pairing' }, telemetry)
+    const routeStarted = performance.now()
+    let route: RemoteDeviceRoute | null
+    try {
+      route = await this.resolveRoute(siteId)
+    } catch (error) {
+      telemetry.routeMs = Math.round((performance.now() - routeStarted) * 10) / 10
+      telemetry.roundTripMs = Math.round((performance.now() - started) * 10) / 10
+      throw new RemoteRequestError(
+        error instanceof Error ? error.message : String(error),
+        { stage: 'route' },
+        telemetry,
+      )
+    }
+    telemetry.routeMs = Math.round((performance.now() - routeStarted) * 10) / 10
+    if (!route?.online) {
+      telemetry.roundTripMs = Math.round((performance.now() - started) * 10) / 10
+      throw new RemoteRequestError('The remote device route is offline.', { stage: 'route' }, telemetry)
+    }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    timer.unref?.()
+    const encodedBody = body === undefined ? undefined : JSON.stringify(body)
+    if (instrument) telemetry.bytesSent = encodedBody ? Buffer.byteLength(encodedBody) : 0
+    const networkStarted = performance.now()
+    try {
+      const response = await fetch(new URL(pathname, route.baseUrl), {
+        method,
+        headers: {
+          authorization: `Bearer ${connection.token}`,
+          ...(method === 'POST' ? { 'content-type': 'application/json' } : {}),
+        },
+        ...(encodedBody === undefined ? {} : { body: encodedBody }),
+        signal: controller.signal,
+      })
+      let parsed: T & { error?: string }
+      try {
+        parsed = await boundedJson(response, (bytes) => { if (instrument) telemetry.bytesReceived = bytes }) as T & { error?: string }
+      } catch (error) {
+        telemetry.networkMs = Math.round((performance.now() - networkStarted) * 10) / 10
+        telemetry.roundTripMs = Math.round((performance.now() - started) * 10) / 10
+        throw new RemoteRequestError(
+          `Remote device returned an invalid response: ${error instanceof Error ? error.message : String(error)}`,
+          { stage: 'protocol' },
+          telemetry,
+        )
+      }
+      telemetry.networkMs = Math.round((performance.now() - networkStarted) * 10) / 10
+      telemetry.roundTripMs = Math.round((performance.now() - started) * 10) / 10
+      if (!response.ok) {
+        const targetTelemetry = parsed && typeof parsed === 'object'
+          ? (parsed as T & { telemetry?: RemoteDeviceTelemetry }).telemetry
+          : undefined
+        throw new RemoteRequestError(
+          parsed?.error || `remote device returned HTTP ${response.status}`,
+          { stage: 'target', code: `HTTP_${response.status}` },
+          { ...targetTelemetry, ...telemetry },
+        )
+      }
+      if (instrument && parsed && typeof parsed === 'object') {
+        const value = parsed as T & { telemetry?: RemoteDeviceTelemetry }
+        value.telemetry = { ...value.telemetry, ...telemetry }
+      }
+      return parsed as T
+    } catch (error) {
+      if (error instanceof RemoteRequestError) throw error
+      telemetry.networkMs = Math.round((performance.now() - networkStarted) * 10) / 10
+      telemetry.roundTripMs = Math.round((performance.now() - started) * 10) / 10
+      if (controller.signal.aborted) {
+        throw new RemoteRequestError(
+          `remote device request timed out after ${timeoutMs}ms`,
+          { stage: 'timeout', code: 'TIMEOUT' },
+          telemetry,
+        )
+      }
+      const code = typeof (error as { code?: unknown })?.code === 'string' ? (error as { code: string }).code : undefined
+      throw new RemoteRequestError(
+        error instanceof Error ? error.message : String(error),
+        { stage: 'transport', ...(code ? { code } : {}) },
+        telemetry,
+      )
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+}

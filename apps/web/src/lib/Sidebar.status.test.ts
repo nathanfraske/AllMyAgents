@@ -33,6 +33,7 @@ beforeEach(() => {
   store.splitPanes = []
   store.projectViewId = null
   store.connected = true
+  store.hubConnectionPhase = 'connected'
   store.hubDownSeconds = 0
   store.journalCompaction = null
 })
@@ -53,6 +54,34 @@ describe('compact system status indicators', () => {
 
     await fireEvent.keyDown(window, { key: 'Escape' })
     expect(screen.queryByRole('dialog', { name: 'Hub connection' })).toBeNull()
+  })
+
+  it('presents cold startup as loading rather than a broken connection', async () => {
+    store.connected = false
+    store.hubConnectionPhase = 'starting'
+    store.hubDownSeconds = 7
+    render(Sidebar)
+
+    const trigger = screen.getByRole('button', { name: 'Hub: starting' })
+    expect(trigger.textContent).toContain('Starting hub… 7s')
+    await fireEvent.click(trigger)
+    expect(screen.getByRole('dialog', { name: 'Hub connection' }).textContent).toContain(
+      'waiting for the local hub to finish startup',
+    )
+  })
+
+  it('reserves reconnecting language for a connection that was actually lost', async () => {
+    store.connected = false
+    store.hubConnectionPhase = 'reconnecting'
+    store.hubDownSeconds = 7
+    render(Sidebar)
+
+    const trigger = screen.getByRole('button', { name: 'Hub: reconnecting' })
+    expect(trigger.textContent).toContain('Reconnecting… 7s')
+    await fireEvent.click(trigger)
+    expect(screen.getByRole('dialog', { name: 'Hub connection' }).textContent).toContain(
+      'live connection was interrupted',
+    )
   })
 
   it('shows journal lifecycle detail in an adjacent indicator instead of an always-open bar', async () => {

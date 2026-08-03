@@ -31,6 +31,7 @@ import { startServer } from './server.js'
 import { UsageMonitor } from './usage.js'
 import { WorkspaceManager } from './workspace.js'
 import { WorktreeCollisionDetector } from './worktreeCollisionDetector.js'
+import { WorkspacePressureMonitor } from './workspacePressure.js'
 import { MeshSite } from './meshSite.js'
 import { getOrCreateDeviceToken } from './deviceToken.js'
 import { InstructionStore } from './instructions.js'
@@ -41,6 +42,12 @@ import { BrowserBroker } from './browserBroker.js'
 import { InProcessExecutor, type Executor } from './executor.js'
 import { WorkerExecutor } from './workerExecutor.js'
 import { WorkerClient } from './workerTransport.js'
+import { buildFleet, probeHubHealth } from './fleet.js'
+import {
+  DeviceExecutor,
+  FleetConnectionStore,
+  RemoteDeviceController,
+} from './remoteDevices.js'
 import { asChatNamePool } from './title.js'
 import { asFileWriteDiffDensity } from './types.js'
 import type { DangerFlags, HubConfig, HubPrefs } from './types.js'
@@ -432,9 +439,23 @@ profileBootstrapComplete = true
 // recall / requestRestart). The callbacks forward to `sessions`, assigned just below — they only fire once
 // a worker message arrives (well after assignment), so the forward reference is safe.
 const workerSocket = process.env.HUB_WORKER_SOCKET
+const workerSecret = process.env.HUB_WORKER_SECRET
+// This process has fallback paths that can spawn vendor/login helpers. Keep the control bearer out of them.
+delete process.env.HUB_WORKER_SECRET
+if (workerSocket && (!workerSecret || workerSecret.length < 32)) {
+  throw new Error('HUB_WORKER_SECRET is required when HUB_WORKER_SOCKET is enabled')
+}
+// Overseer identity is duplicated deliberately outside SQLite: config.json tells the supervisor/UI which
+// account was designated even when journal preflight refuses to open. The live role is still rechecked
+// against the hub-minted SessionRecord on every control call.
+const overseer = {
+  ...(typeof config.overseer?.profileId === 'string' ? { profileId: config.overseer.profileId } : {}),
+  ...(typeof config.overseer?.sessionId === 'string' ? { sessionId: config.overseer.sessionId } : {}),
+  ...(typeof config.overseer?.updatedAt === 'string' ? { updatedAt: config.overseer.updatedAt } : {}),
+}
 let sessions: SessionManager
 const executor: Executor = workerSocket
-  ? new WorkerExecutor(new WorkerClient(workerSocket, { danger: () => danger }), {
+  ? new WorkerExecutor(new WorkerClient(workerSocket, { danger: () => danger, authSecret: workerSecret }), {
       ingestWorkerEvent: (sessionId, wseq, kind, payload) => sessions.ingestWorkerEvent(sessionId, wseq, kind, payload),
       applyLifecycle: (msg) => sessions.applyLifecycle(msg),
       recall: (sessionId, prompt) => sessions.recallForWorker(sessionId, prompt),
@@ -485,6 +506,13 @@ const worktreeCollisions = new WorktreeCollisionDetector({
   },
 })
 process.once('exit', () => worktreeCollisions.stop())
+const workspacePressure = new WorkspacePressureMonitor({
+  sessions: () => sessions.list(),
+  workspace,
+  report: (sessionId, pressure, notifyAgent) =>
+    sessions.reportWorkspacePressure(sessionId, pressure, notifyAgent),
+})
+process.once('exit', () => workspacePressure.stop())
 usage.setCodexReader((profileId) => sessions.readCodexLimits(profileId))
 // Let full-access chats and "always allow" grants skip the operator prompt. Installed here because the
 // policy reads session records, and ApprovalService is constructed before the SessionManager exists.
@@ -721,6 +749,29 @@ if (agentBridge) {
 
 sessions.boot({ reconcile: !isGreen }) // green defers stale-reconcile to promote (it doesn't own the port yet)
 if (!isGreen) usage.startPolling() //     green starts polling only once it owns the port (on promote)
+// Reclaim agent worktrees no session owns any more. Runs AFTER sessions.boot() so the live set is the
+// restored one, and only on blue — a green does not own the data root yet, and two hubs sweeping the same
+// directory would race. Orphans holding uncommitted or unmerged work are kept and named, never deleted.
+if (!isGreen) {
+  try {
+    const live = sessions
+      .list()
+      .map((session) => session.worktree)
+      .filter((worktree): worktree is string => typeof worktree === 'string' && worktree.length > 0)
+    const reaped = workspace.reapOrphanWorktrees(live)
+    if (reaped.removed.length > 0) {
+      console.log(`[workspace] reclaimed ${reaped.removed.length} orphaned worktree(s)`)
+    }
+    for (const kept of reaped.keptWithWork) {
+      console.log(`[workspace] kept orphaned worktree ${path.basename(kept.worktree)} — ${kept.reason}`)
+    }
+  } catch (error) {
+    // Never let a housekeeping sweep block startup.
+    console.error(
+      `[workspace] orphan worktree sweep failed: ${error instanceof Error ? error.message : String(error)}`
+    )
+  }
+}
 restartState.booted = true
 
 function rescanProfiles(): typeof profiles {
@@ -729,6 +780,10 @@ function rescanProfiles(): typeof profiles {
 
 function refreshProfileAuth(profile: (typeof profiles)[number]): void {
   const evidence = profileAuthEvidence(profile)
+  // Unknown refresh-capable credentials must not erase a real vendor refresh/invalid_grant failure
+  // already observed by this generation. On a fresh boot there is no prior state, so they remain
+  // honestly unknown and are not falsely logged out merely because an access token expired.
+  if (!evidence.authStatus && profile.authStatus === 'signed_out') return
   profile.authStatus = evidence.authStatus
   profile.authError = evidence.authError
 }
@@ -761,8 +816,30 @@ const meshPeerPorts: number[] = Array.isArray(config.mesh?.peerPorts)
   ? config.mesh.peerPorts.filter((p): p is number => Number.isInteger(p) && p > 0 && p < 65536)
   : []
 
+const deviceExecutor = new DeviceExecutor(path.join(dataDir, 'device-executor.json'))
+const fleetConnections = new FleetConnectionStore(path.join(dataDir, 'fleet-connections.json'))
+const remoteDevices = new RemoteDeviceController(fleetConnections, async (siteId) => {
+  const local = mesh.status()
+  const fleet = await buildFleet({
+    localSiteId: local.siteId,
+    localLabel: local.label,
+    localBaseUrl: `http://127.0.0.1:${local.port}`,
+    roster: () => mesh.ownedRoster(),
+    peerSites: () => mesh.peerSites(),
+    siteMap: (node, port) => mesh.siteMap(node, port),
+    recoverSiteMap: (node, port) => mesh.recoverSiteMap(node, port),
+    probeHealth: (baseUrl) => probeHubHealth(baseUrl, 5000),
+    extraPorts: meshPeerPorts,
+  })
+  const route = fleet.find((site) => !site.local && site.siteId === siteId)
+  return route
+    ? { siteId: route.siteId, label: route.label, baseUrl: route.baseUrl, online: route.online }
+    : null
+})
+sessions.setRemoteDeviceController(remoteDevices)
+
 // Listen on the BOOT port (0 → ephemeral for a green); the server reports its actual port back.
-const server = startServer({ port: bootPort, defaultCwd: dataDir, profilesDir, profileNames, profileOwnership, profileLoginCoordinator, journal, sessions, profiles, approvals, questions, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity: (projectId) => worktreeCollisions.projectActivity(projectId) })
+const server = startServer({ port: bootPort, defaultCwd: dataDir, profilesDir, profileNames, profileOwnership, profileLoginCoordinator, journal, sessions, profiles, approvals, questions, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity: (projectId) => worktreeCollisions.projectActivity(projectId), deviceExecutor, remoteDevices, overseer, overseerCwd: repoRoot })
 
 // Register the mesh advert — factored so a promoted green can (re)register once it owns the port.
 function registerMesh(): void {
@@ -836,6 +913,7 @@ server.once('listening', () => {
     registerMesh()
     startJournalMaintenance()
     worktreeCollisions.start()
+    workspacePressure.start()
   }
 })
 
@@ -856,6 +934,7 @@ if (supervised && process.send) {
       registerMesh()
       startJournalMaintenance()
       worktreeCollisions.start()
+      workspacePressure.start()
     },
     stopJournalBackups: () => journalBackups.stop(),
     profileRuntime,
@@ -952,6 +1031,7 @@ function shutdown(signal: string): void {
   shuttingDown = true
   stopJournalMaintenance()
   worktreeCollisions.stop()
+  workspacePressure.stop()
   const done = (): void => process.exit(0)
   // Cap the cleanup so a hung socket or child can't wedge shutdown.
   const guard = setTimeout(done, 2500)

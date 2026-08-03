@@ -2,8 +2,7 @@ import http from 'node:http'
 import type { FleetMember, PeerSites } from './meshSite.js'
 
 /**
- * Unified-across-mesh fleet view — FIRST CUT (read-only roster, badged by machine).
- * See docs/mesh-unified-fleet.md "First-cut path (S–M)".
+ * Unified-across-mesh fleet discovery and route health.
  *
  * `buildFleet` turns the node's fleet directory + cached presence adverts into the list
  * `GET /api/fleet` returns: always THIS hub as a `local:true` entry, plus each co-owned peer that
@@ -16,7 +15,7 @@ export interface FleetSite {
   /**
    * Stable id for this site. The local hub's `tcp:<port>` siteId, or a peer's canonical node id.
    * The web client prefixes each project/session id it pulls from a site with `${siteId}:` — for
-   * origin attribution (which machine a row is on) and, later, mutation routing to the owning hub.
+   * origin attribution and mutation routing to the owning hub.
    */
   siteId: string
   /** Human label to badge rows with (the fleet member's label, or the local hub's mesh label). */
@@ -45,6 +44,8 @@ export interface BuildFleetDeps {
   peerSites: () => Promise<PeerSites[]>
   /** `site_map(node, port)` → local loopback port, or null when the node won't map it (incl. self / offline peer). */
   siteMap: (node: string, port: number) => Promise<number | null>
+  /** Replace a mapped-but-unresponsive route (explicit unmap/remap), with rate limiting in the caller. */
+  recoverSiteMap?: (node: string, port: number) => Promise<number | null>
   /** `GET <baseUrl>/api/health` → true when a hub answered. */
   probeHealth: (baseUrl: string) => Promise<boolean>
   /** Explicit legacy candidate, when a caller has one. Omitted by the automatic path. */
@@ -123,11 +124,23 @@ export async function buildFleet(deps: BuildFleetDeps): Promise<FleetSite[]> {
         if (localPort == null) continue
         const baseUrl = `http://localhost:${localPort}`
         if (firstMapped === null) firstMapped = baseUrl
-        const online = await deps.probeHealth(baseUrl).catch(() => false)
+        let online = await deps.probeHealth(baseUrl).catch(() => false)
+        let recoveredBaseUrl = baseUrl
+        // A site mapping may remain marked active while its byte path is dead. `site_map` alone is
+        // idempotent and hands back that same listener, so replace it once before declaring the hub
+        // offline. MeshSite owns the cooldown/single-flight guard for genuinely absent peers.
+        if (!online && deps.recoverSiteMap) {
+          const recoveredPort = await deps.recoverSiteMap(m.device, port).catch(() => null)
+          if (recoveredPort != null) {
+            recoveredBaseUrl = `http://localhost:${recoveredPort}`
+            if (firstMapped === baseUrl) firstMapped = recoveredBaseUrl
+            online = await deps.probeHealth(recoveredBaseUrl).catch(() => false)
+          }
+        }
         // A HUB ANSWERED — stop here. Keep probing on failure, because a mapped-but-silent port proves
         // nothing: the tunnel binds locally whether or not anything serves on the far side.
         if (online) {
-          return { siteId: m.device, label: m.label || m.device.slice(0, 8), local: false, baseUrl, online: true }
+          return { siteId: m.device, label: m.label || m.device.slice(0, 8), local: false, baseUrl: recoveredBaseUrl, online: true }
         }
       }
       // Nothing answered on any candidate. Still list the peer when at least one port mapped: it IS a

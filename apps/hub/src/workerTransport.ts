@@ -34,10 +34,14 @@ import {
   HUB_RELAY_TIMEOUT_MS,
   HubUnavailableError,
   RELAY_QUEUE_MAX,
+  newWorkerAuthNonce,
+  workerHelloProof,
+  workerWelcomeProof,
   type HubToWorker,
   type WorkerToHub,
 } from './workerProtocol.js'
 import type { DangerFlags } from './types.js'
+import { tokenMatches } from './deviceToken.js'
 
 // --- Frame layout (identical to meshSite.ts:88-115) --------------------------------------------
 
@@ -51,6 +55,8 @@ const LEN_BYTES = 4
  * `FrameDecoder.push`. Generous: real event payloads are small; this only trips on a garbage stream.
  */
 const MAX_FRAME_BYTES = 64 * 1024 * 1024
+const WORKER_HANDSHAKE_TIMEOUT_MS = 5_000
+const MIN_WORKER_SECRET_CHARS = 32
 
 const EMPTY = Buffer.alloc(0)
 
@@ -227,7 +233,7 @@ export interface WorkerServerHandlers {
   /** Every hub→worker command/push that isn't transport-internal (i.e. not hello/draining and not a relay reply). */
   onMessage?: (msg: HubToWorker) => void
   /** A fresh hub won the epoch guard and is now THE channel — carries its `hello` (attachEpoch + danger). */
-  onAttach?: (info: { attachEpoch: number; danger: DangerFlags }) => void
+  onAttach?: (info: { attachEpoch: number; danger: DangerFlags; authNonce: string }) => void
   /**
    * EVENT-lane hook (§2.3): an event/lifecycle message that could not be sent live (no channel, or the
    * channel is draining). The caller wires its per-session wseqBuffer here for drop-oldest retention;
@@ -261,16 +267,21 @@ export class WorkerServer {
    *  connection still awaiting its `hello`. Tracked so `close()` can destroy EVERY socket, not just the
    *  current one, and never leak an accepted-but-unpromoted connection (L4). */
   private readonly channels = new Set<WorkerFrameChannel>()
+  /** Channels that completed the authenticated hello; includes a retiring predecessor until it closes. */
+  private readonly authenticatedChannels = new Set<WorkerFrameChannel>()
   /** Highest `attachEpoch` promoted so far; a `hello` below this is refused (§2.3). */
   private currentEpoch = Number.NEGATIVE_INFINITY
   /** Pre-flip hold: the current channel is about to drop, so new sends queue instead of racing it (§8.4). */
   private draining = false
   /** RELAY lane. Insertion order == flush order (Map preserves it). Keyed by {@link relayKey}. */
   private readonly pendingRelays = new Map<string, PendingRelay>()
+  /** Bounded replay cache for authenticated hello nonces. */
+  private readonly usedAuthNonces = new Map<string, true>()
 
   constructor(
     private readonly socketPath: string,
-    private readonly handlers: WorkerServerHandlers = {}
+    private readonly handlers: WorkerServerHandlers = {},
+    private readonly authSecret = '',
   ) {}
 
   /**
@@ -278,6 +289,9 @@ export class WorkerServer {
    * that didn't clean up); Windows named pipes need no cleanup. Resolves once listening.
    */
   listen(): Promise<void> {
+    if (this.authSecret.length < MIN_WORKER_SECRET_CHARS) {
+      return Promise.reject(new Error('HUB_WORKER_SECRET is missing or too short'))
+    }
     if (process.platform !== 'win32') {
       try {
         fs.unlinkSync(this.socketPath)
@@ -426,11 +440,18 @@ export class WorkerServer {
 
   private onConnection(socket: net.Socket): void {
     const channel = new WorkerFrameChannel(socket)
+    const handshakeTimer = setTimeout(() => channel.destroy(), WORKER_HANDSHAKE_TIMEOUT_MS)
+    handshakeTimer.unref?.()
     this.channels.add(channel) // L4: track from accept, before its hello — removed when it closes
     // A connection is not promoted until its `hello` clears the epoch guard.
-    channel.on('message', (msg: unknown) => this.dispatch(msg as HubToWorker, channel))
+    channel.on('message', (msg: unknown) => {
+      if ((msg as { t?: unknown }).t === 'hello') clearTimeout(handshakeTimer)
+      this.dispatch(msg as HubToWorker, channel)
+    })
     channel.on('closed', () => {
+      clearTimeout(handshakeTimer)
       this.channels.delete(channel)
+      this.authenticatedChannels.delete(channel)
       this.onChannelClosed(channel)
     })
     debug('hub connection opened (awaiting hello)')
@@ -440,6 +461,11 @@ export class WorkerServer {
   private dispatch(msg: HubToWorker, channel: WorkerFrameChannel): void {
     if (msg.t === 'hello') {
       this.attach(channel, msg)
+      return
+    }
+    if (!this.authenticatedChannels.has(channel)) {
+      warn(`refusing pre-authentication worker-channel message ${msg.t}`)
+      channel.destroy()
       return
     }
     // A late frame from a retiring channel must not act on behalf of the live one. Replies are the
@@ -452,18 +478,34 @@ export class WorkerServer {
   }
 
   private attach(channel: WorkerFrameChannel, hello: Extract<HubToWorker, { t: 'hello' }>): void {
+    const expectedProof = workerHelloProof(this.authSecret, hello.authNonce, hello.attachEpoch, hello.danger)
+    if (
+      !/^[a-f0-9]{64}$/u.test(hello.authNonce) ||
+      this.usedAuthNonces.has(hello.authNonce) ||
+      !tokenMatches(expectedProof, hello.authProof)
+    ) {
+      warn('refusing unauthenticated worker-channel hello')
+      channel.destroy()
+      return
+    }
+    this.usedAuthNonces.set(hello.authNonce, true)
+    if (this.usedAuthNonces.size > 4_096) {
+      const oldest = this.usedAuthNonces.keys().next().value as string | undefined
+      if (oldest) this.usedAuthNonces.delete(oldest)
+    }
     if (hello.attachEpoch < this.currentEpoch) {
       warn(`refusing stale hello epoch ${hello.attachEpoch} < ${this.currentEpoch}`)
       channel.destroy()
       return
     }
     const prev = this.current
+    this.authenticatedChannels.add(channel)
     this.current = channel
     this.currentEpoch = hello.attachEpoch
     this.draining = false
     if (prev && prev !== channel) prev.destroy() // retire the predecessor's channel
     debug(`hub attached at epoch ${hello.attachEpoch}; flushing ${this.pendingRelays.size} relay(s)`)
-    this.handlers.onAttach?.({ attachEpoch: hello.attachEpoch, danger: hello.danger })
+    this.handlers.onAttach?.({ attachEpoch: hello.attachEpoch, danger: hello.danger, authNonce: hello.authNonce })
     this.flushRelays()
   }
 
@@ -575,6 +617,8 @@ export interface WorkerClientOptions {
   attachEpoch?: number
   /** Current Danger Zone flags, read fresh on each (re)connect so `hello` carries live danger. */
   danger?: () => DangerFlags
+  /** Supervisor-minted bearer shared only by this hub process and its long-lived worker. */
+  authSecret?: string
 }
 
 const SAFE_DANGER: DangerFlags = {
@@ -611,6 +655,10 @@ export class WorkerClient extends EventEmitter {
   // refuse blue's reconnect forever (§8.4, M2).
   private attachEpoch: number
   private readonly dangerOf: () => DangerFlags
+  private readonly authSecret: string
+  private authNonce: string | undefined
+  private authenticated = false
+  private handshakeTimer: ReturnType<typeof setTimeout> | undefined
 
   constructor(
     private readonly socketPath: string,
@@ -619,11 +667,15 @@ export class WorkerClient extends EventEmitter {
     super()
     this.attachEpoch = opts.attachEpoch ?? Date.now()
     this.dangerOf = opts.danger ?? (() => SAFE_DANGER)
+    this.authSecret = opts.authSecret ?? ''
   }
 
   /** Open (or re-open) the connection. Idempotent while a live socket exists. */
   connect(): void {
     if (this.stopped) return
+    if (this.authSecret.length < MIN_WORKER_SECRET_CHARS) {
+      throw new Error('HUB_WORKER_SECRET is missing or too short')
+    }
     if (this.socket && !this.socket.destroyed) return
     this.clearReconnect()
 
@@ -633,12 +685,22 @@ export class WorkerClient extends EventEmitter {
 
     socket.on('connect', () => {
       connected = true
+      this.authenticated = false
+      this.authNonce = newWorkerAuthNonce()
       const channel = new WorkerFrameChannel(socket)
       this.channel = channel
       channel.on('message', (msg: unknown) => this.onWorker(msg as WorkerToHub))
-      channel.send({ t: 'hello', attachEpoch: this.attachEpoch, danger: this.dangerOf() })
-      debug(`attached to worker at epoch ${this.attachEpoch}`)
-      this.emit('attached')
+      const danger = this.dangerOf()
+      channel.send({
+        t: 'hello',
+        authNonce: this.authNonce,
+        authProof: workerHelloProof(this.authSecret, this.authNonce, this.attachEpoch, danger),
+        attachEpoch: this.attachEpoch,
+        danger,
+      })
+      this.handshakeTimer = setTimeout(() => channel.destroy(), WORKER_HANDSHAKE_TIMEOUT_MS)
+      this.handshakeTimer.unref?.()
+      debug(`connected to worker at epoch ${this.attachEpoch}; awaiting authenticated welcome`)
     })
     socket.on('error', (err: Error) => {
       // A pre-connect ENOENT/ECONNREFUSED is the normal "worker not up yet" case; 'close' follows and
@@ -646,11 +708,15 @@ export class WorkerClient extends EventEmitter {
       debug(`socket error: ${(err as NodeJS.ErrnoException).code ?? ''} ${err.message}`)
     })
     socket.on('close', () => {
+      this.clearHandshakeTimer()
+      const wasAuthenticated = this.authenticated
+      this.authenticated = false
+      this.authNonce = undefined
       this.channel = undefined
       this.socket = undefined
       // In-flight commands can no longer be answered on this connection → reject retryably (§8, §9.2).
       this.failPending()
-      if (connected) this.emit('detached')
+      if (connected && wasAuthenticated) this.emit('detached')
       this.scheduleReconnect()
     })
   }
@@ -724,7 +790,7 @@ export class WorkerClient extends EventEmitter {
 
   /** Whether a live channel is currently attached. */
   isAttached(): boolean {
-    return !!this.channel && !this.channel.isClosed
+    return this.authenticated && !!this.channel && !this.channel.isClosed
   }
 
   /** Stop for good: no more reconnects, tear down the socket, reject anything in flight. */
@@ -732,6 +798,9 @@ export class WorkerClient extends EventEmitter {
     this.stopped = true
     this.clearReconnect()
     this.failPending()
+    this.clearHandshakeTimer()
+    this.authenticated = false
+    this.authNonce = undefined
     this.channel?.destroy()
     this.channel = undefined
     this.socket?.destroy()
@@ -741,6 +810,11 @@ export class WorkerClient extends EventEmitter {
   // --- internals ---
 
   private onWorker(msg: WorkerToHub): void {
+    if (!this.authenticated && msg.t !== 'welcome') {
+      warn(`refusing pre-authentication worker message ${msg.t}`)
+      this.channel?.destroy()
+      return
+    }
     switch (msg.t) {
       case 'ack':
       case 'threadStarted':
@@ -764,7 +838,23 @@ export class WorkerClient extends EventEmitter {
         this.emit('restartRequest', msg)
         return
       case 'welcome':
+        if (this.authenticated) return
+        if (
+          !this.authNonce ||
+          !tokenMatches(
+            workerWelcomeProof(this.authSecret, this.authNonce, this.attachEpoch, msg.generation),
+            msg.authProof,
+          )
+        ) {
+          warn('refusing unauthenticated worker welcome')
+          this.channel?.destroy()
+          return
+        }
+        this.clearHandshakeTimer()
+        this.authenticated = true
         this.emit('welcome', msg)
+        debug(`authenticated to worker at epoch ${this.attachEpoch}`)
+        this.emit('attached')
         return
       default:
         debug(`unhandled worker message ${(msg as { t: string }).t}`)
@@ -805,6 +895,13 @@ export class WorkerClient extends EventEmitter {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = undefined
+    }
+  }
+
+  private clearHandshakeTimer(): void {
+    if (this.handshakeTimer) {
+      clearTimeout(this.handshakeTimer)
+      this.handshakeTimer = undefined
     }
   }
 }

@@ -8,6 +8,17 @@ in the code *now*, the account question that has not been specced anywhere, and 
 Everything marked CONFIRMED was read out of the source at the cited location. Everything marked INFERENCE
 follows from confirmed pieces but has not been executed end-to-end against two real machines.
 
+> **Implementation update — 2026-08-01.** The desktop/same-PC renderer is no longer read-only or
+> single-stream: it holds a distinct paired token and replay cursor per site, opens a WebSocket per hub,
+> loads remote journal/import history, routes remote mutations and attachment traffic, and exposes
+> pairing/reachability errors in Remote access settings. The off-machine browser/phone topology warning
+> in §1.0 still applies; that remaining case requires the server-side gateway in §3.
+
+> **Remote testbed update - 2026-08-01.** Paired tokens are now also persisted in a hub-private,
+> write-only connection store for server-to-server agent testbed calls. This closes the credential half of
+> the local-hub gateway for bounded remote files/terminals, without making pairing itself an execution
+> grant. See `remote-device-testbeds.md`. The off-machine browser topology issue below is unchanged.
+
 ---
 
 ## 1. Where we actually are

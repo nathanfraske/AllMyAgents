@@ -14,7 +14,7 @@ import { AgentBus } from './bus.js'
 import { MemoryStore } from './memory.js'
 import { PracticeStore } from './practices.js'
 import type { Executor } from './executor.js'
-import type { DangerFlags, Profile, SessionRecord } from './types.js'
+import type { DangerFlags, Profile, SessionRecord, WorkspacePressure } from './types.js'
 import { QuestionService } from './questions.js'
 
 const SAFE: DangerFlags = {
@@ -105,7 +105,7 @@ function build(
   }
   ;(sessions as unknown as { sessions: Map<string, SessionRecord> }).sessions.set(record.id, record)
   store.upsert(record)
-  return { sessions, journal, bus, record, steer, startThread, runTurn, interrupt }
+  return { sessions, journal, store, bus, record, steer, startThread, runTurn, interrupt }
 }
 
 async function settle(): Promise<void> {
@@ -114,6 +114,59 @@ async function settle(): Promise<void> {
 }
 
 describe('SessionManager mid-turn steering', () => {
+  it('delivers workspace pressure to an active turn and persists it into managed instructions', async () => {
+    const { sessions, journal, store, record, steer } = build()
+    const pressure: WorkspacePressure = {
+      level: 'critical',
+      totalBytes: 13 * 1024 ** 3,
+      artifactBytes: 9 * 1024 ** 3,
+      artifactGroups: [{ name: 'node_modules', bytes: 9 * 1024 ** 3 }],
+      reasons: ['workspace-size', 'build-artifacts'],
+      partial: false,
+      observedAt: '2026-08-02T00:00:00.000Z',
+      lastNotifiedAt: '2026-08-02T00:00:00.000Z',
+    }
+
+    await sessions.reportWorkspacePressure(record.id, pressure, true)
+
+    expect(steer).toHaveBeenCalledOnce()
+    expect(steer.mock.calls[0]?.[1]).toContain('Workspace size critical')
+    expect(record.workspacePressure).toEqual(pressure)
+    expect(store.all().find((candidate) => candidate.id === record.id)?.workspacePressure).toEqual(pressure)
+    expect(fs.readFileSync(path.join(record.cwd, 'CLAUDE.md'), 'utf8')).toContain(
+      '## Managed workspace size warning',
+    )
+    expect(
+      journal.since(0).find((event) => event.kind === 'session/workspace-pressure')?.payload,
+    ).toMatchObject({ delivery: 'steer-and-instructions' })
+  })
+
+  it('keeps the durable instruction when live delivery fails and removes it only after a full clear', async () => {
+    const { sessions, journal, record } = build({ steer: async () => { throw new Error('provider unavailable') } })
+    const pressure: WorkspacePressure = {
+      level: 'warning',
+      totalBytes: 5 * 1024 ** 3,
+      artifactBytes: 0,
+      artifactGroups: [],
+      reasons: ['workspace-size'],
+      partial: false,
+      observedAt: '2026-08-02T00:00:00.000Z',
+    }
+
+    await sessions.reportWorkspacePressure(record.id, pressure, true)
+    expect(fs.readFileSync(path.join(record.cwd, 'CLAUDE.md'), 'utf8')).toContain('Workspace size warning')
+    expect(
+      journal.since(0).find((event) => event.kind === 'session/workspace-pressure')?.payload,
+    ).toMatchObject({ delivery: 'instructions' })
+
+    await sessions.reportWorkspacePressure(record.id, undefined, false)
+    expect(record.workspacePressure).toBeUndefined()
+    expect(fs.readFileSync(path.join(record.cwd, 'CLAUDE.md'), 'utf8')).not.toContain(
+      'Managed workspace size warning',
+    )
+    expect(journal.since(0).some((event) => event.kind === 'session/workspace-pressure-cleared')).toBe(true)
+  })
+
   it('rechecks admission after async thread creation and never journals a phantom first prompt', async () => {
     let releaseThread!: () => void
     const threadReady = new Promise<string>((resolve) => {

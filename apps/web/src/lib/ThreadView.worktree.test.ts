@@ -117,4 +117,29 @@ describe('worktree intent and outcome', () => {
     expect(project).toHaveProperty('disabled', true)
     expect(worktree.title).toContain('C:/data/worktrees/37fa1798')
   })
+
+  it('shows the operator the same artifact pressure delivered to the agent', () => {
+    const view = seed({
+      cwd: 'C:/data/worktrees/37fa1798',
+      worktree: 'C:/data/worktrees/37fa1798',
+      workspacePressure: {
+        level: 'warning',
+        totalBytes: 5 * 1024 ** 3,
+        artifactBytes: 3 * 1024 ** 3,
+        artifactGroups: [{ name: 'node_modules', bytes: 3 * 1024 ** 3 }],
+        reasons: ['workspace-size', 'build-artifacts'],
+        partial: false,
+        observedAt: createdAt,
+        freeBytes: 9 * 1024 ** 3,
+      },
+    })
+    render(ThreadView, { props: { sessionId: view.record.id } })
+
+    const warning = screen.getByRole('alert')
+    expect(warning.textContent).toContain('Workspace is getting large')
+    expect(warning.textContent).toContain('5.00 GiB')
+    expect(warning.textContent).toContain('node_modules 3.00 GiB')
+    expect(warning.textContent).toContain('9.00 GiB remains free')
+    expect(warning.textContent).toContain('never source or uncommitted work')
+  })
 })

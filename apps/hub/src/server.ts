@@ -51,6 +51,12 @@ import {
 } from './journalRecovery.js'
 import { attachReplayStream, ReplayPrincipalBudget } from './replayStream.js'
 import { durableReplaySessions } from './replayBaseline.js'
+import type {
+  DeviceExecutor,
+  RemoteDeviceAction,
+  RemoteDeviceController,
+} from './remoteDevices.js'
+import type { OverseerConfig, RemoteDeviceCapability, RemoteDeviceGrant } from './types.js'
 
 const REPLAY_BASELINE_MAX_BYTES = 2 * 1024 * 1024
 const REPLAY_BASELINE_MAX_SESSIONS = 5_000
@@ -247,7 +253,14 @@ class BadRequestError extends Error {}
 
 async function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = []
-  for await (const chunk of req) chunks.push(chunk as Buffer)
+  let bytes = 0
+  const limit = 8 * 1024 * 1024
+  for await (const chunk of req) {
+    const value = chunk as Buffer
+    bytes += value.length
+    if (bytes > limit) throw new PayloadTooLargeError(`JSON body exceeds the ${limit}-byte limit`)
+    chunks.push(value)
+  }
   const raw = Buffer.concat(chunks).toString('utf8')
   if (!raw.trim()) return {}
   let parsed: unknown
@@ -435,6 +448,10 @@ export interface ServerOptions {
   configPath: string
   /** Cached output from the existing worktree detector. Reading this must never start another git scan. */
   projectActivity?: (projectId: string) => WorktreeProjectActivity
+  deviceExecutor?: DeviceExecutor
+  remoteDevices?: RemoteDeviceController
+  overseer?: OverseerConfig
+  overseerCwd?: string
 }
 
 /**
@@ -500,7 +517,9 @@ export function persistPrefs(
 }
 
 export function startServer(opts: ServerOptions): http.Server {
-  const { port, defaultCwd, profilesDir, profileNames = {}, journal, sessions, profiles, approvals, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity } = opts
+  const { port, defaultCwd, profilesDir, profileNames = {}, journal, sessions, profiles, approvals, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity, deviceExecutor, remoteDevices } = opts
+  const overseer = opts.overseer ?? {}
+  const overseerCwd = opts.overseerCwd ?? defaultCwd
   const replayPrincipalBudget = new ReplayPrincipalBudget()
   const questions = opts.questions
   // Runtime repositories live beside the journal/config under HUB_DATA_DIR, never in the shipped hub
@@ -1227,6 +1246,74 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, { ok: !!existing }, existing ? 200 : 404)
         return
       }
+      // The application Overseer is configured outside the journal (config.json), while its conversation
+      // is an ordinary journaled session. That split keeps the designated account knowable to the
+      // supervisor during DB failure without pretending a vendor turn can run when the journal cannot open.
+      if (method === 'GET' && url.pathname === '/api/overseer') {
+        const session = overseer.sessionId
+          ? sessions.listForApi().find((record) => record.id === overseer.sessionId && record.isOverseer === true)
+          : undefined
+        json(res, {
+          configured: typeof overseer.profileId === 'string' && overseer.profileId.length > 0,
+          profileId: overseer.profileId,
+          sessionId: session?.id,
+          session,
+          available: !!session && session.status !== 'error' && pickableProfiles(profiles).some((profile) =>
+            profile.id === overseer.profileId && profile.available !== false && profile.authStatus !== 'signed_out'),
+        })
+        return
+      }
+      if (method === 'POST' && url.pathname === '/api/overseer') {
+        const body = await readBody(req)
+        const profileId = str(body.profileId)
+        if (!profileId) {
+          json(res, { error: 'profileId is required' }, 400)
+          return
+        }
+        // Internal default vendor homes support imported-chat resume only. They are deliberately not
+        // account identities and must never be selectable for this elevated role.
+        const profile = pickableProfiles(profiles).find((candidate) => candidate.id === profileId)
+        if (!profile || profile.available === false || profile.authStatus === 'signed_out') {
+          json(res, { error: `profile ${profileId} is unavailable or signed out` }, 400)
+          return
+        }
+        const current = overseer.sessionId
+          ? sessions.list().find((record) => record.id === overseer.sessionId && record.isOverseer === true)
+          : undefined
+        if (current?.profileId === profileId) {
+          json(res, { configured: true, profileId, sessionId: current.id, session: current, available: true })
+          return
+        }
+        const created = await sessions.create(profileId, {
+          cwd: overseerCwd,
+          permissionMode: 'full',
+          useWorktree: false,
+          isOverseer: true,
+          role: 'Application Overseer',
+        })
+        const next: OverseerConfig = {
+          profileId,
+          sessionId: created.id,
+          updatedAt: new Date().toISOString(),
+        }
+        const persistError = patchConfig(configPath, 'overseer', next)
+        if (persistError) {
+          sessions.revokeOverseer(created.id)
+          json(res, { error: `Overseer configuration could not be persisted: ${persistError}` }, 500)
+          return
+        }
+        if (current && current.id !== created.id) sessions.revokeOverseer(current.id)
+        Object.assign(overseer, next)
+        journal.append(created.id, 'overseer/configured', {
+          profileId,
+          sessionId: created.id,
+          replacedSessionId: current?.id ?? null,
+          actor: 'operator',
+        })
+        json(res, { configured: true, profileId, sessionId: created.id, session: created, available: true })
+        return
+      }
+
       // Owner preferences — ordinary settings with no safety dimension, so they get their own route
       // rather than riding on /api/config/danger:
       // putting a cosmetic choice behind the Danger Zone's deliberate reveal would misrepresent both.
@@ -1378,7 +1465,7 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, { token: deviceToken })
         return
       }
-      // Unified-across-mesh fleet roster (read-only, first cut — docs/mesh-unified-fleet.md). Always
+      // Unified-across-mesh fleet discovery roster. Always
       // returns THIS hub as the local entry. Peer ports come from presence-advertised sites in the
       // node's session snapshot, so non-default ports are exact and no-hub machines get no map/probe.
       // `/api/health` distinguishes an online hub from a cached advert for a sleeping machine.
@@ -1392,10 +1479,112 @@ export function startServer(opts: ServerOptions): http.Server {
           roster: () => mesh.ownedRoster(),
           peerSites: () => mesh.peerSites(),
           siteMap: (node, p) => mesh.siteMap(node, p),
-          probeHealth: (baseUrl) => probeHubHealth(baseUrl, 1500),
+          recoverSiteMap: (node, p) => mesh.recoverSiteMap(node, p),
+          // A fresh route still has to negotiate before its first bytes flow. A short ordinary HTTP
+          // timeout falsely marked WAN peers offline while the tunnel was healthy but settling.
+          probeHealth: (baseUrl) => probeHubHealth(baseUrl, 5000),
           extraPorts: meshPeerPorts,
         })
         json(res, sites)
+        return
+      }
+      // Target-side testbed boundary. Device authentication proves the operator paired this hub; the
+      // executor's own disabled-by-default root policy is the independent authority to touch the OS.
+      if (method === 'GET' && url.pathname === '/api/device-executor') {
+        if (!deviceExecutor) { json(res, { error: 'device executor unavailable' }, 503); return }
+        json(res, deviceExecutor.capabilities())
+        return
+      }
+      if (method === 'POST' && url.pathname === '/api/device-executor') {
+        if (!deviceExecutor) { json(res, { error: 'device executor unavailable' }, 503); return }
+        const body = await readBody(req)
+        const capabilities = deviceExecutor.update({ enabled: body.enabled, roots: body.roots })
+        journal.append(null, 'device-executor/configured', {
+          enabled: capabilities.enabled,
+          roots: capabilities.roots.map((root) => ({
+            id: root.id,
+            label: root.label,
+            path: root.path,
+            environment: root.environment,
+            read: root.read,
+            write: root.write,
+            terminal: root.terminal,
+          })),
+          actor: 'operator',
+        })
+        json(res, capabilities)
+        return
+      }
+      if (method === 'POST' && url.pathname === '/api/device-executor/action') {
+        if (!deviceExecutor) { json(res, { error: 'device executor unavailable' }, 503); return }
+        const body = await readBody(req)
+        if (!body.action || typeof body.action !== 'object' || Array.isArray(body.action)) {
+          json(res, { error: 'action must be an object' }, 400)
+          return
+        }
+        const action = body.action as RemoteDeviceAction
+        if (!['probe', 'inspect', 'list', 'read', 'write', 'exec'].includes(action.op)) {
+          json(res, { error: 'unknown remote device operation' }, 400)
+          return
+        }
+        const actor = body.actor && typeof body.actor === 'object' && !Array.isArray(body.actor)
+          ? body.actor as Record<string, unknown>
+          : {}
+        const result = await deviceExecutor.execute(action)
+        journal.append(null, 'device-executor/action', {
+          op: action.op,
+          rootId: (str(action.rootId) ?? '').slice(0, 128),
+          path: (str(action.op === 'exec' ? action.cwd : action.op === 'read' || action.op === 'write' || action.op === 'list' ? action.path : undefined) ?? '').slice(0, 4096),
+          command: action.op === 'exec' ? (str(action.command) ?? '').slice(0, 500) : undefined,
+          actorSessionId: (str(actor.sessionId) ?? '').slice(0, 256),
+          actorProfileId: (str(actor.profileId) ?? '').slice(0, 256),
+          ok: result.ok,
+          error: result.error,
+          bytes: result.bytes,
+          exitCode: result.exitCode,
+          timedOut: result.timedOut,
+          truncated: result.truncated,
+          failure: result.failure,
+          telemetry: result.telemetry,
+        })
+        json(res, result, result.ok ? 200 : 400)
+        return
+      }
+      // Source-side credential registry. Remote tokens are write-only and never returned by this API.
+      if (method === 'GET' && url.pathname === '/api/fleet/connections') {
+        if (!remoteDevices) { json(res, { error: 'remote device controller unavailable' }, 503); return }
+        json(res, remoteDevices.listConnections())
+        return
+      }
+      if (method === 'POST' && url.pathname === '/api/fleet/connections') {
+        if (!remoteDevices) { json(res, { error: 'remote device controller unavailable' }, 503); return }
+        const body = await readBody(req)
+        const siteId = str(body.siteId)
+        const label = str(body.label)
+        const token = str(body.token)
+        if (!siteId || !label || !token) {
+          json(res, { error: 'siteId, label, and token are required' }, 400)
+          return
+        }
+        const saved = remoteDevices.saveConnection({ siteId, label, token })
+        journal.append(null, 'fleet/connection-paired', { siteId, label })
+        json(res, saved)
+        return
+      }
+      const connectionCapabilitiesMatch = /^\/api\/fleet\/connections\/([^/]+)\/capabilities$/.exec(url.pathname)
+      if (method === 'GET' && connectionCapabilitiesMatch) {
+        if (!remoteDevices) { json(res, { error: 'remote device controller unavailable' }, 503); return }
+        const siteId = decodeURIComponent(connectionCapabilitiesMatch[1] as string)
+        json(res, await remoteDevices.capabilities(siteId))
+        return
+      }
+      const connectionRemoveMatch = /^\/api\/fleet\/connections\/([^/]+)\/remove$/.exec(url.pathname)
+      if (method === 'POST' && connectionRemoveMatch) {
+        if (!remoteDevices) { json(res, { error: 'remote device controller unavailable' }, 503); return }
+        const siteId = decodeURIComponent(connectionRemoveMatch[1] as string)
+        const removed = remoteDevices.removeConnection(siteId)
+        if (removed) journal.append(null, 'fleet/connection-forgotten', { siteId })
+        json(res, { ok: true, removed })
         return
       }
       // Runtime toggle for exposing the hub as an AllMyStuff site. Registers/deregisters to match.
@@ -1799,6 +1988,42 @@ export function startServer(opts: ServerOptions): http.Server {
             ? sessions.disallowTool(allowToolMatch[1] as string, toolName)
             : sessions.allowTool(allowToolMatch[1] as string, toolName)
         json(res, record)
+        return
+      }
+      // Remote-machine authority is deliberately separate from permission mode and tool allowlists.
+      // Only this authenticated operator route can create/revoke it; agent MCP handlers can only consume it.
+      const remoteGrantMatch = /^\/api\/sessions\/([^/]+)\/remote-devices$/.exec(url.pathname)
+      if (method === 'GET' && remoteGrantMatch) {
+        json(res, await sessions.remoteDeviceCatalog(remoteGrantMatch[1] as string))
+        return
+      }
+      if (method === 'POST' && remoteGrantMatch) {
+        const body = await readBody(req)
+        if (!Array.isArray(body.grants)) {
+          json(res, { error: 'grants must be an array' }, 400)
+          return
+        }
+        const grants: RemoteDeviceGrant[] = []
+        for (const raw of body.grants) {
+          if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+            json(res, { error: 'each remote device grant must be an object' }, 400)
+            return
+          }
+          const value = raw as Record<string, unknown>
+          const siteId = str(value.siteId)
+          const rootIds = stringArray(value.rootIds, 'rootIds')
+          const capabilities = stringArray(value.capabilities, 'capabilities')
+          if (!siteId || capabilities.some((item) => !['read', 'write', 'terminal'].includes(item))) {
+            json(res, { error: 'invalid remote device grant' }, 400)
+            return
+          }
+          grants.push({
+            siteId,
+            rootIds,
+            capabilities: capabilities as RemoteDeviceCapability[],
+          })
+        }
+        json(res, await sessions.configureRemoteDeviceGrants(remoteGrantMatch[1] as string, grants))
         return
       }
       // Per-chat model / thinking effort / service tier, written through the moment it is picked so the

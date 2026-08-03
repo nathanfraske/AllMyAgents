@@ -78,6 +78,30 @@ describe('profileAuthEvidence', () => {
     })
     fs.rmSync(dir, { recursive: true, force: true })
   })
+
+  it.each([
+    {
+      provider: 'claude' as const,
+      file: '.credentials.json',
+      credential: {
+        claudeAiOauth: { accessToken: 'expired', refreshToken: 'refreshable', expiresAt: 999_000 },
+      },
+    },
+    {
+      provider: 'codex' as const,
+      file: 'auth.json',
+      credential: {
+        tokens: { access_token: jwt(999), refresh_token: 'refreshable' },
+      },
+    },
+  ])('does not falsely log out an expired but refresh-capable $provider credential', ({ provider, file, credential }) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), `ama-refresh-${provider}-`))
+    fs.writeFileSync(path.join(dir, file), JSON.stringify(credential))
+
+    expect(profileAuthEvidence({ id: `${provider}-refreshable`, provider, dir }, 1_000_000)).toEqual({})
+
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
 })
 
 describe('setClaudeConnectorPolicy', () => {
