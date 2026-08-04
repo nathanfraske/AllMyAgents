@@ -28,13 +28,17 @@
     onclose,
     initialTab,
     onloginstate = () => {},
+    onoverseerconfigured = () => {},
     onreplayfirst = () => {},
+    onreplayapptour = () => {},
     onreplayproject = () => {},
   }: {
     onclose: () => void
     initialTab?: SettingsTabId
     onloginstate?: (view: AccountLoginView) => void
+    onoverseerconfigured?: () => void
     onreplayfirst?: () => void
+    onreplayapptour?: () => void
     onreplayproject?: () => void
   } = $props()
   let writeError = $state('')
@@ -70,6 +74,7 @@
       }
       overseerStatus = value
       if (value.sessionId) {
+        onoverseerconfigured()
         onclose()
         store.select(value.sessionId)
       }
@@ -120,7 +125,7 @@
   async function pairFleetSite(siteId: string): Promise<void> {
     fleetPairBusy = siteId
     const ok = await store.pairFleetSite(siteId, fleetTokenDrafts[siteId] ?? '')
-    fleetPairError = { ...fleetPairError, [siteId]: ok ? '' : 'Token rejected. Copy the device token from that machine’s Remote access settings.' }
+    fleetPairError = { ...fleetPairError, [siteId]: ok ? '' : 'Pairing failed. Create a fresh pairing code on that machine, or use its legacy device token.' }
     if (ok) fleetTokenDrafts = { ...fleetTokenDrafts, [siteId]: '' }
     fleetPairBusy = ''
   }
@@ -292,6 +297,45 @@
   let revealToken = $state(false)
   let revealedToken = $state('')
   let copied = $state(false)
+  let pairingCode = $state('')
+  let pairingExpiresAt = $state('')
+  let pairingBusy = $state(false)
+  let pairingError = $state('')
+  let pairingCopied = $state(false)
+  async function issuePairingCode(): Promise<void> {
+    pairingBusy = true
+    pairingError = ''
+    try {
+      const result = await api.issuePairingCode()
+      if (result.error || !result.code || !result.expiresAt) {
+        pairingError = result.error || 'Could not create a pairing code'
+        return
+      }
+      pairingCode = result.code
+      pairingExpiresAt = result.expiresAt
+      const issuedCode = result.code
+      const remainingMs = Math.max(0, Date.parse(result.expiresAt) - Date.now())
+      setTimeout(() => {
+        if (pairingCode !== issuedCode) return
+        pairingCode = ''
+        pairingExpiresAt = ''
+      }, remainingMs)
+    } catch (error) {
+      pairingError = error instanceof Error ? error.message : String(error)
+    } finally {
+      pairingBusy = false
+    }
+  }
+  async function copyPairingCode(): Promise<void> {
+    if (!pairingCode) return
+    try {
+      await navigator.clipboard.writeText(pairingCode)
+      pairingCopied = true
+      setTimeout(() => (pairingCopied = false), 1400)
+    } catch {
+      /* ignore */
+    }
+  }
   async function loadDeviceToken(): Promise<string> {
     if (revealedToken) return revealedToken
     const result = await api.revealDeviceToken()
@@ -714,7 +758,7 @@
 
     <div class="body" id="settings-pane" role="tabpanel">
     {#if writeError}<p class="status error write-error">{writeError}</p>{/if}
-    <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Accounts')}>
+    <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Accounts')} data-overseer-anchor="accounts">
       <h3>Accounts</h3>
       <div class="accounts">
         {#each localProfiles as p (p.id)}
@@ -787,7 +831,7 @@
       </div>
     </section>
 
-    <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Defaults for new chats')}>
+    <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Defaults for new chats')} data-overseer-anchor="chat_defaults">
       <h3>Defaults for new chats</h3>
       <label class="opt row2">Account
         <select value={settings.defaultAccount} onchange={(e) => settings.set('defaultAccount', (e.target as HTMLSelectElement).value)}>
@@ -896,7 +940,7 @@
       <p class="hint dim">Spend shows as a percent of the plan budget when set. Claude usage (session / week / model) is polled from the free <code>/usage</code> command — Claude has no dollar tier in the data, so those accounts fall back to the entry tier.</p>
     </section>
 
-    <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Remote access')}>
+    <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Remote access')} data-overseer-anchor="remote_access">
       <h3>Remote access (mesh)</h3>
       {#if mesh}
         <label class="opt"><input type="checkbox" checked={mesh.enabled} disabled={meshBusy} onchange={(e) => toggleMesh((e.target as HTMLInputElement).checked)} /> Expose this hub to my AllMyStuff fleet</label>
@@ -913,15 +957,25 @@
           {/if}
         </div>
         <p class="hint dim">Rides your AllMyStuff mesh as a "site" (no Tailscale). The hub always stays on loopback — the local node tunnels it to your own devices, which need no grant.</p>
-        <div class="token-row">
-            <span class="tlabel dim">Device token</span>
+        <div class="token-row pairing-code-row">
+          <span class="tlabel dim">Pairing code</span>
+          <code class="cmd pairing-code">{pairingCode || '••••-••••'}</code>
+          <button class="btn" disabled={pairingBusy} onclick={issuePairingCode}>{pairingBusy ? 'creating…' : pairingCode ? 'new code' : 'create code'}</button>
+          <button class="btn" disabled={!pairingCode} onclick={copyPairingCode}>{pairingCopied ? 'copied' : 'copy'}</button>
+        </div>
+        <p class="hint dim">
+          Enter this one-use code on another device. It expires {pairingExpiresAt ? `at ${new Date(pairingExpiresAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}` : '10 minutes after creation'}.
+        </p>
+        {#if pairingError}<p class="hint warn">{pairingError}</p>{/if}
+        <details class="legacy-token">
+          <summary>Advanced: legacy device token</summary>
+          <div class="token-row">
             <code class="cmd token">{revealToken ? revealedToken : '•'.repeat(28)}</code>
             <button class="btn" onclick={toggleTokenReveal}>{revealToken ? 'hide' : 'show'}</button>
             <button class="btn" onclick={async () => copyToken(await loadDeviceToken())}>{copied ? 'copied' : 'copy'}</button>
-        </div>
-        <p class="hint dim">
-          Token <b>required</b> for every request. Pair a phone or another PC by entering this token there once.
-        </p>
+          </div>
+          <p class="hint dim">The permanent token is retained for existing clients and recovery. Prefer a short-lived pairing code for new devices.</p>
+        </details>
         {#if store.fleetSites.some((site) => !site.local)}
           <div class="fleet-pairing">
             <span class="tlabel">Fleet machines</span>
@@ -943,7 +997,7 @@
                     <input
                       type="password"
                       autocomplete="off"
-                      placeholder="Paste that machine’s device token"
+                      placeholder="Enter XXXX-XXXX pairing code"
                       value={fleetTokenDrafts[site.siteId] ?? ''}
                       oninput={(event) => (fleetTokenDrafts = { ...fleetTokenDrafts, [site.siteId]: (event.target as HTMLInputElement).value })}
                     />
@@ -1063,7 +1117,7 @@
       </section>
     {/if}
 
-    <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Overseer')}>
+    <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Overseer')} data-tutorial-anchor="overseer-setup">
       <h3>Application Overseer</h3>
       <p class="hint dim">A dedicated, projectless control chat that runs from the app checkout with operator-level hub tools. Its account choice is stored outside the journal, while every live action is identity-checked and journaled.</p>
       <label class="opt row2">Default account
@@ -1086,9 +1140,10 @@
 
     <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Getting started')}>
       <h3>Getting started</h3>
-      <p class="hint dim">Replay either guide whenever you want. Replaying does not make it appear automatically again.</p>
+      <p class="hint dim">The shortest path is one account, one Overseer, then a plain-language request. The visual tours remain available whenever you want them.</p>
       <div class="tutorial-actions">
-        <button class="btn" onclick={onreplayfirst}>Show getting started tutorial</button>
+        <button class="btn" onclick={onreplayfirst}>Set up account + Overseer</button>
+        <button class="btn" onclick={onreplayapptour}>Explore the app tour</button>
         <button class="btn" onclick={onreplayproject}>Explain New Project</button>
       </div>
     </section>
@@ -1115,7 +1170,7 @@
       {/if}
     </section>
 
-    <section class="danger" class:tab-hidden={!settingsTabHasSection(activeTab, 'Danger Zone')}>
+    <section class="danger" class:tab-hidden={!settingsTabHasSection(activeTab, 'Danger Zone')} data-overseer-anchor="safety">
       <h3>Danger Zone</h3>
       {#if !dangerRevealed}
         <p class="hint dim">Guardrails are safe defaults you can loosen — this is your own self-hosted tool. Review agent-authored practices and relax the gates here.</p>
@@ -1250,6 +1305,11 @@
   .token-row input { flex: 1 1 16rem; min-width: 10rem; }
   .tlabel { font-size: var(--text-xs); }
   .token { flex: 1; min-width: 9rem; overflow: hidden; text-overflow: ellipsis; }
+  .pairing-code { min-width: 8.5rem; letter-spacing: 0.12em; text-align: center; }
+  .legacy-token { margin: var(--space-3) 0 var(--space-4); }
+  .legacy-token summary { cursor: pointer; color: var(--muted); font-size: var(--text-xs); }
+  .legacy-token .token-row { margin-top: var(--space-2); }
+  .legacy-token p { margin: 0; }
   .fleet-pairing { display: grid; gap: var(--space-2); margin-top: var(--space-4); }
   .fleet-peer { border: 1px solid var(--border-subtle); border-radius: var(--r-md); padding: var(--space-3); background: var(--surface-1); }
   .fleet-peer-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-2); font-size: var(--text-sm); }

@@ -137,6 +137,7 @@ beforeEach(() => {
   store.dropZone = null
   store.connected = false
   store.settingsOpen = false
+  store.overseerUiGuide = null
   store.lastProfileId = null
   settings.autoSwitchToNewChat = true
   vi.stubGlobal('alert', vi.fn())
@@ -484,6 +485,27 @@ describe('newSession (draft) + materializeDraft', () => {
 // --- event application (apply) --------------------------------------------------------------
 
 describe('apply()', () => {
+  it('accepts a live allowlisted Overseer UI guide but never replays it into navigation state', () => {
+    apply(evt({
+      seq: 1,
+      kind: 'overseer/ui-guide-requested',
+      sessionId: 'overseer',
+      payload: { target: 'accounts', message: 'Sign in here.', projectId: null },
+    }))
+    expect(store.overseerUiGuide).toEqual({ target: 'accounts', message: 'Sign in here.', seq: 1 })
+
+    store.overseerUiGuide = null
+    ;(store as unknown as { applyingReplayedEvent: boolean }).applyingReplayedEvent = true
+    apply(evt({
+      seq: 2,
+      kind: 'overseer/ui-guide-requested',
+      sessionId: 'overseer',
+      payload: { target: 'safety', message: 'Old replayed request.' },
+    }))
+    ;(store as unknown as { applyingReplayedEvent: boolean }).applyingReplayedEvent = false
+    expect(store.overseerUiGuide).toBeNull()
+  })
+
   it('session/created ensures the session view', () => {
     apply(evt({ seq: 1, kind: 'session/created', sessionId: 'c1', payload: rec('c1') }))
     expect(store.sessions.c1).toBeDefined()

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { renderMarkdown } from './markdown'
+import { parseLocalFileHref, renderMarkdown } from './markdown'
 
 // renderMarkdown is the sole HTML-producing surface for chat message text. These tests pin the
 // two things that matter: (1) the sanitizer neutralizes hostile model output, and (2) ordinary
@@ -50,6 +50,69 @@ describe('renderMarkdown — safe links', () => {
     expect(out).toMatch(/href="https:\/\/example\.com"/)
     expect(out).toContain('target="_blank"')
     expect(out).toContain('rel="noopener noreferrer"')
+  })
+
+  it('decorates GitHub, PDF, and ordinary research links without loading remote icons', () => {
+    const out = html([
+      '[CI](https://github.com/acme/widgets/actions)',
+      '[datasheet](https://parts.example/TPS2121RUXR.pdf?rev=3)',
+      '[laminate rules](https://jlcpcb.com/help/article/laminated-structure)',
+    ].join(' '))
+
+    expect(out).toContain('data-link-kind="github"')
+    expect(out).toContain('data-link-host="github.com"')
+    expect(out).toContain('data-link-kind="pdf"')
+    expect(out).toContain('title="Open PDF from parts.example"')
+    expect(out).toContain('data-link-kind="web"')
+    expect(out).toContain('data-link-host="jlcpcb.com"')
+    expect(out).not.toMatch(/<img|favicon/i)
+  })
+  it('turns absolute local file links into inert operator-click reveal links', () => {
+    const out = html([
+      '[Windows](C:/work/docs/report.pdf:17:4)',
+      '[POSIX](/workspace/docs/report.md#L9)',
+      '[URL](file:///C:/work/docs/notes.txt)',
+    ].join(' '))
+
+    expect(out).toContain('data-local-path="C:/work/docs/report.pdf"')
+    expect(out).toContain('data-local-line="17"')
+    expect(out).toContain('data-local-column="4"')
+    expect(out).toContain('data-local-path="/workspace/docs/report.md"')
+    expect(out).toContain('data-local-line="9"')
+    expect(out).toContain('data-local-path="C:/work/docs/notes.txt"')
+    expect(out).not.toMatch(/href="(?:file:|C:|\/workspace)/i)
+    expect(out).not.toContain('target="_blank"')
+  })
+
+  it('does not trust local-path attributes supplied by raw model HTML', () => {
+    const out = html('<a href="https://example.com" data-local-path="C:/secret.txt">safe site</a>')
+    expect(out).not.toContain('data-local-path')
+    expect(out).toContain('href="https://example.com"')
+    expect(out).toContain('target="_blank"')
+  })
+})
+
+describe('parseLocalFileHref', () => {
+  it('recognizes Windows, UNC, file URL, and POSIX absolute paths', () => {
+    expect(parseLocalFileHref('C:\\work\\src\\app.ts:42:7')).toEqual({
+      path: 'C:\\work\\src\\app.ts', line: 42, column: 7,
+    })
+    expect(parseLocalFileHref('\\\\server\\share\\report.pdf')).toEqual({
+      path: '\\\\server\\share\\report.pdf',
+    })
+    expect(parseLocalFileHref('file:///C:/work/readme.md#L5')).toEqual({
+      path: 'C:/work/readme.md', line: 5,
+    })
+    expect(parseLocalFileHref('/workspace/readme.md:12')).toEqual({
+      path: '/workspace/readme.md', line: 12,
+    })
+  })
+
+  it('rejects relative, malformed, oversized, and NUL-containing paths', () => {
+    expect(parseLocalFileHref('docs/readme.md')).toBeNull()
+    expect(parseLocalFileHref('%zz')).toBeNull()
+    expect(parseLocalFileHref('/tmp/a\0b')).toBeNull()
+    expect(parseLocalFileHref(`/${'a'.repeat(8_193)}`)).toBeNull()
   })
 })
 

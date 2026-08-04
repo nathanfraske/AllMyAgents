@@ -469,8 +469,8 @@ export const HUB_HTTP = inTauri ? `http://127.0.0.1:${desktopHubPort}` : ''
 export const HUB_WS = inTauri ? `ws://127.0.0.1:${desktopHubPort}` : ''
 
 // Device token (localStorage-backed). Sent as a Bearer header on every request and as ?token= on
-// the WebSocket. The desktop obtains it from its OS-owned data directory; remote devices pair by
-// pasting an explicitly revealed token. It is never bootstrapped over unauthenticated HTTP.
+// the WebSocket. The desktop obtains it from its OS-owned data directory; remote devices normally
+// exchange a short-lived, one-use code for it. It is never bootstrapped over unauthenticated HTTP.
 let hubToken = (typeof localStorage !== 'undefined' && localStorage.getItem('hub.token')) || ''
 export function getHubToken(): string {
   return hubToken
@@ -673,6 +673,15 @@ async function jpost<T>(url: string, body?: unknown): Promise<T> {
   const r = await request<T>('POST', url, HUB_HTTP, body)
   if (!r.ok) return { error: r.error } as T
   return r.data
+}
+
+async function exchangePairingCode(
+  code: string,
+  base: string = HUB_HTTP,
+): Promise<{ token?: string; error?: string }> {
+  // Deliberately send no saved capability: this is the sole unauthenticated exchange endpoint.
+  const r = await request<{ token?: string }>('POST', '/api/pair', base, { code }, [], undefined, '')
+  return r.ok ? r.data : { error: r.error }
 }
 
 async function jdelete<T>(url: string): Promise<T> {
@@ -1425,6 +1434,9 @@ export const api = {
   setDeviceExecutor: (enabled: boolean, roots: Array<Omit<DeviceRootPolicy, 'id'> & { id?: string }>) =>
     jpost<DeviceExecutorCapabilities | ApiError>('/api/device-executor', { enabled, roots }),
   revealDeviceToken: () => jpost<{ token?: string; error?: string }>('/api/device-token/reveal'),
+  issuePairingCode: () =>
+    jpost<{ code?: string; expiresAt?: string; error?: string }>('/api/pairing-code'),
+  exchangePairingCode,
   setMesh: (enable: boolean) => jpost<MeshStatus | ApiError>('/api/mesh', { enable }),
   auth: () => jget<{ requireToken: boolean; authed: boolean }>('/api/auth'),
   instructions: () => jget<Instruction[]>('/api/instructions'),

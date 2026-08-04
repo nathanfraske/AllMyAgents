@@ -52,6 +52,23 @@ describe('tutorial eligibility and persistence', () => {
     expect(readTutorialDisposition(storage, NEW_PROJECT_TUTORIAL_KEY)).toBe('new')
   })
 
+  it('uses the short account-to-Overseer setup and keeps the full app tour optional', () => {
+    const tutorials = new TutorialController(storage)
+    tutorials.initializeFrom({ profiles: [], sessions: [] })
+
+    expect(tutorials.firstRunPhase).toBe('accounts')
+    tutorials.accountAdded()
+    expect(tutorials.firstRunPhase).toBe('overseer')
+    expect(tutorials.firstRunOpen).toBe(true)
+    tutorials.overseerConfigured()
+    expect(tutorials.firstRunOpen).toBe(false)
+    expect(readTutorialDisposition(storage, FIRST_RUN_TUTORIAL_KEY)).toBe('completed')
+
+    tutorials.replayAppTour()
+    expect(tutorials.firstRunOpen).toBe(true)
+    expect(tutorials.firstRunPhase).toBe('app')
+  })
+
   it('does not render an empty-install tutorial when the hub bootstrap fails', async () => {
     const tutorials = new TutorialController(storage)
 

@@ -462,7 +462,7 @@
   const PERM_MODES = [
     { id: 'safe', icon: 'lock', label: 'Safe', desc: 'ask before every tool' },
     { id: 'edits', icon: 'pencil', label: 'Edits', desc: 'auto-approve file edits' },
-    { id: 'full', icon: 'zap', label: 'Full access', desc: 'no approvals (careful)' },
+    { id: 'full', icon: 'zap', label: 'Full access', desc: 'ordinary tools auto-approved · host access (OS elevation still applies)' },
   ]
   let permOpen = $state(false)
   const draftMode = $derived(view?.record.permissionMode ?? 'safe')
@@ -1319,6 +1319,7 @@
   {#if !composerOnly || peekItems > 0}
   <div
     class="stream scroll"
+    data-overseer-anchor="history"
     class:peek-stream={composerOnly}
     class:replay-rebuild={store.replayPresentationActive}
     bind:this={scroller}
@@ -1380,7 +1381,7 @@
   </div>
   {/if}
 
-  <div class="composer-wrap">
+  <div class="composer-wrap" data-overseer-anchor="composer">
     <!-- Jump-to-bottom: floats just above the composer (never over it or the action-error slot). Shows
          "N new" when a turn has streamed content below while you read history; a plain arrow otherwise. -->
     {#if jumpAway && !composerOnly}
@@ -1506,7 +1507,7 @@
         <div class="ccontrol c-model" title={`Model: ${modelDef?.name ?? model ?? view.record.provider}`}><ModelPicker provider={view.record.provider} {model} onselect={setModel} /></div>
         {#if modelDef}<div class="ccontrol c-traits" title="Model effort and options"><TraitsControl descriptors={modelDef.descriptors} values={options} onchange={setOption} /></div>{/if}
         {#if isDraft}
-          <div class="dperm ccontrol" title={`Permission mode: ${draftModeDef.label}`}>
+          <div class="dperm ccontrol" data-overseer-anchor="permissions" title={`Permission mode: ${draftModeDef.label}`}>
             <button class="pill-btn" class:full={draftMode === 'full'} class:open={permOpen} title="permission mode for this chat" onclick={() => (permOpen = !permOpen)}>
               <span class="dlead"><Icon name={draftModeDef.icon} size={13} /></span><span class="control-label">{draftModeDef.label}</span><span class="dchev"><Icon name="chevron-down" size={12} /></span>
             </button>
@@ -1524,7 +1525,7 @@
             {/if}
           </div>
         {:else}
-          <div class="ccontrol c-permission" title={`Permission mode: ${view.record.permissionMode ?? 'safe'}`}>
+          <div class="ccontrol c-permission" data-overseer-anchor="permissions" title={`Permission mode: ${view.record.permissionMode ?? 'safe'}`}>
             <PermissionPicker
               sessionId={view.record.id}
               mode={view.record.permissionMode ?? 'safe'}

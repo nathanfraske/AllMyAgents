@@ -2,7 +2,7 @@ export const FIRST_RUN_TUTORIAL_KEY = 'allmyagents.firstRunTutorial'
 export const NEW_PROJECT_TUTORIAL_KEY = 'allmyagents.newProjectTutorial'
 
 export type TutorialDisposition = 'new' | 'in-progress' | 'completed' | 'skipped'
-export type FirstRunPhase = 'accounts' | 'app'
+export type FirstRunPhase = 'accounts' | 'overseer' | 'app'
 export type LoginStatus = 'idle' | 'waiting' | 'done' | 'error' | 'cancelled'
 
 export interface AccountLoginView {
@@ -58,7 +58,10 @@ function readRecord(storage: TutorialStorage | null, key: string): TutorialRecor
       return {
         schema: 1,
         disposition: parsed.disposition,
-        phase: parsed.phase === 'accounts' || parsed.phase === 'app' ? parsed.phase : undefined,
+        phase:
+          parsed.phase === 'accounts' || parsed.phase === 'overseer' || parsed.phase === 'app'
+            ? parsed.phase
+            : undefined,
         step: typeof parsed.step === 'number' && parsed.step >= 0 ? Math.floor(parsed.step) : undefined,
         updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : new Date(0).toISOString(),
       }
@@ -146,7 +149,7 @@ export class TutorialController {
 
     const record = readRecord(this.storage, FIRST_RUN_TUTORIAL_KEY)
     if (!isTerminal(record.disposition)) {
-      this.firstRunPhase = bootstrap.profiles.length > 0 ? 'app' : 'accounts'
+      this.firstRunPhase = bootstrap.profiles.length > 0 ? 'overseer' : 'accounts'
       this.firstRunStep = record.phase === this.firstRunPhase ? (record.step ?? 0) : 0
       this.firstRunOpen = true
       writeRecord(
@@ -162,12 +165,17 @@ export class TutorialController {
 
   accountAdded(): void {
     if (!this.firstRunOpen || this.firstRunPhase !== 'accounts') return
-    this.firstRunPhase = 'app'
+    this.firstRunPhase = 'overseer'
     this.firstRunStep = 0
     this.login = { status: 'done', message: 'Account connected.' }
     if (!this.firstRunReplay) {
-      writeRecord(this.storage, FIRST_RUN_TUTORIAL_KEY, 'in-progress', 'app', 0)
+      writeRecord(this.storage, FIRST_RUN_TUTORIAL_KEY, 'in-progress', 'overseer', 0)
     }
+  }
+
+  overseerConfigured(): void {
+    if (!this.firstRunOpen || this.firstRunPhase !== 'overseer') return
+    this.finishFirstRun()
   }
 
   setLogin(view: AccountLoginView): void {
@@ -205,7 +213,14 @@ export class TutorialController {
 
   replayFirstRun(hasAccounts: boolean): void {
     this.firstRunReplay = true
-    this.firstRunPhase = hasAccounts ? 'app' : 'accounts'
+    this.firstRunPhase = hasAccounts ? 'overseer' : 'accounts'
+    this.firstRunStep = 0
+    this.firstRunOpen = true
+  }
+
+  replayAppTour(): void {
+    this.firstRunReplay = true
+    this.firstRunPhase = 'app'
     this.firstRunStep = 0
     this.firstRunOpen = true
   }

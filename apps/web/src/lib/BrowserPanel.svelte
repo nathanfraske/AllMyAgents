@@ -163,12 +163,19 @@
 </script>
 
 {#if !open}
-  <button class="tab" class:on={enabled} onclick={onopen} title="Open isolated browser controls">
-    <Icon name="globe" size={13} />
-    Browser {enabled ? 'on' : 'off'}
+  <button
+    class="tab"
+    data-overseer-anchor="browser"
+    class:on={enabled}
+    onclick={onopen}
+    title="Open isolated browser controls"
+    aria-label={`Browser ${enabled ? 'on' : 'off'}`}
+  >
+    <span class="tab-icon"><Icon name="globe" size={13} /></span>
+    <span class="tab-label">Browser {enabled ? 'on' : 'off'}</span>
   </button>
 {:else}
-  <aside class="panel" aria-label="Browser">
+  <aside class="panel" data-overseer-anchor="browser" aria-label="Browser">
     <header>
       <span class="title"><Icon name="globe" size={14} /> Browser</span>
       <span class="state" class:on={enabled}>{enabled ? 'enabled' : 'off'}</span>
@@ -214,11 +221,18 @@
 {/if}
 
 <style>
-  .tab { position: absolute; top: 5.45rem; right: 0; z-index: 5; display: flex; align-items: center; gap: .4rem;
-    padding: .25rem .6rem .25rem .55rem; color: var(--text); background: var(--surface); border: 1px solid var(--border-strong);
-    border-right: 0; border-radius: 999px 0 0 999px; font-size: .74rem; }
-  .tab:hover, .tab.on { border-color: var(--warn); }
+  .tab { position: absolute; top: 5.45rem; right: 0; z-index: 5; display: flex; align-items: center; justify-content: flex-start;
+    width: 2rem; max-width: 2rem; min-width: 2rem; gap: .35rem; overflow: hidden;
+    padding: .3rem .48rem; color: var(--text); background: var(--surface); border: 1px solid var(--border-strong);
+    border-right: 0; border-radius: 999px 0 0 999px; font-size: .74rem;
+    transition: width var(--dur-fast) var(--ease), max-width var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease); }
+  .tab:hover, .tab:focus-visible { width: 7.1rem; max-width: 7.1rem; }
+  .tab:hover, .tab:focus-visible, .tab.on { border-color: var(--warn); }
   .tab.on { color: var(--warn); }
+  .tab-icon { display: inline-grid; place-items: center; flex: none; }
+  .tab-label { max-width: 0; opacity: 0; overflow: hidden; white-space: nowrap;
+    transition: max-width var(--dur-fast) var(--ease), opacity var(--dur-fast) var(--ease); }
+  .tab:hover .tab-label, .tab:focus-visible .tab-label { max-width: 5rem; opacity: 1; }
   .panel { position: relative; flex: 0 0 clamp(260px, 38%, 380px); width: clamp(260px, 38%, 380px); min-width: 0;
     min-height: 0; display: flex; flex-direction: column; background: var(--surface); border-left: 1px solid var(--border-strong); }
   header { display: flex; align-items: center; gap: .5rem; padding: .5rem .65rem; border-bottom: 1px solid var(--border); }

@@ -600,6 +600,81 @@ fn overseer_diagnostics(app: AppHandle) -> Result<OverseerDiagnostics, String> {
     })
 }
 
+/// Resolve an operator-clicked transcript path without letting the webview pass a relative target,
+/// a nonexistent path, or an unbounded argument into an OS process.
+#[cfg(desktop)]
+fn canonical_reveal_path(raw: &str) -> Result<PathBuf, String> {
+    let value = raw.trim();
+    if value.is_empty() || value.len() > 4_096 || value.contains('\0') {
+        return Err("invalid local path".to_string());
+    }
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err("only absolute local paths can be revealed".to_string());
+    }
+    fs::canonicalize(&path)
+        .map_err(|error| format!("the local path does not exist or cannot be resolved: {error}"))
+}
+
+#[cfg(all(desktop, windows))]
+fn shell_reveal_path(path: &Path) -> Result<(), String> {
+    // canonicalize() returns extended-length paths on Windows. Explorer's CLI is more reliable with
+    // the ordinary drive/UNC spelling, so remove only that syntactic prefix before passing one argv.
+    let value = path.to_string_lossy();
+    let explorer_path = if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = value.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    };
+    let mut command = Command::new("explorer.exe");
+    if path.is_file() {
+        command.arg("/select,");
+    }
+    command.arg(explorer_path);
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("could not open the Windows file manager: {error}"))
+}
+
+#[cfg(all(desktop, target_os = "macos"))]
+fn shell_reveal_path(path: &Path) -> Result<(), String> {
+    let mut command = Command::new("/usr/bin/open");
+    if path.is_file() {
+        command.arg("-R");
+    }
+    command
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("could not open Finder: {error}"))
+}
+
+#[cfg(all(desktop, unix, not(target_os = "macos")))]
+fn shell_reveal_path(path: &Path) -> Result<(), String> {
+    let target = if path.is_file() {
+        path.parent()
+            .ok_or_else(|| "the file has no containing directory".to_string())?
+    } else {
+        path
+    };
+    Command::new("xdg-open")
+        .arg(target)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("could not open the file manager: {error}"))
+}
+
+/// Reveal a file or directory in the operator's native file manager. This deliberately never opens
+/// the target itself, never invokes a shell, and is reachable only through an explicit transcript click.
+#[cfg(desktop)]
+#[tauri::command]
+fn reveal_local_path(path: String) -> Result<(), String> {
+    shell_reveal_path(&canonical_reveal_path(&path)?)
+}
+
 /// First-run materialization of the app-data layout: create
 /// `<app_data_root>/data` and `<app_data_root>/profiles` and hand back the pair to
 /// pass to the hub as `HUB_DATA_DIR` / `HUB_PROFILES_DIR` (apps/hub/src/index.ts).
@@ -1986,7 +2061,8 @@ pub fn run() {
             updater_install,
             uninstall_macos,
             hub_device_token,
-            overseer_diagnostics
+            overseer_diagnostics,
+            reveal_local_path
         ]);
 
     builder
@@ -2155,6 +2231,33 @@ mod dependency_repair_tests {
 
         assert_eq!(read_repair_state(&root), state);
         fs::remove_dir_all(&root).expect("remove isolated repair-state fixture");
+    }
+}
+
+#[cfg(all(test, desktop))]
+mod local_file_reveal_tests {
+    use super::*;
+
+    #[test]
+    fn reveal_target_must_be_absolute_and_exist() {
+        assert!(canonical_reveal_path("relative/file.txt").is_err());
+        assert!(canonical_reveal_path("").is_err());
+        assert!(canonical_reveal_path("/tmp/a\0b").is_err());
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "allmyagents-reveal-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create isolated reveal fixture");
+        let resolved = canonical_reveal_path(root.to_str().expect("UTF-8 fixture path"))
+            .expect("resolve existing absolute directory");
+        assert!(resolved.is_absolute());
+        assert!(resolved.is_dir());
+        fs::remove_dir_all(&root).expect("remove isolated reveal fixture");
     }
 }
 

@@ -49,13 +49,21 @@ import type { AttachmentMeta } from './attachments.js'
 import type { BusMessage } from './bus.js'
 import type { Memory } from './memory.js'
 import type { Practice } from './practices.js'
+import {
+  ASK_UNAVAILABLE_MESSAGE,
+  parseAskUserQuestionInput,
+  QuestionInputError,
+  type QuestionOutcome,
+} from './questions.js'
 import type { SessionIdentity } from './identity.js'
 import type { DangerFlags } from './types.js'
 import {
   HUB_UNAVAILABLE_TEXT,
   HubUnavailableError,
+  InvalidQuestionCorrelationError,
   newWorkerGeneration,
   stableApprovalId,
+  stableQuestionId,
   workerWelcomeProof,
   type HubToWorker,
   type LiveSession,
@@ -746,14 +754,7 @@ export class AgentWorker {
     context?: ClaudePermissionContext
   ): Promise<{ behavior: 'allow'; updatedInput: unknown } | { behavior: 'deny'; message: string }> {
     if (toolName === 'AskUserQuestion') {
-      // The worker socket's current hello/welcome stream is local but unauthenticated. A forged peer could
-      // otherwise inject or settle operator questions. Keep the default in-process path fully functional,
-      // but fail closed here until the whole control protocol (not only question frames) is authenticated.
-      return {
-        behavior: 'deny',
-        message:
-          'AskUserQuestion is unavailable in worker mode until the worker control channel is authenticated.',
-      }
+      return this.askUserQuestion(spec, input, context)
     }
     if (AUTO_ALLOW_TOOLS.has(toolName)) return { behavior: 'allow', updatedInput: input }
     if (SELF_GATING_TOOLS.has(toolName)) {
@@ -801,6 +802,85 @@ export class AgentWorker {
   }
 
   // ---- Hub relays (the worker's MCP handlers reaching hub-owned services, §3.3) -----------------
+
+  /** Worker-mode parity for the in-process AskUserQuestion callback. The hub owns validation,
+   * persistence, rendering, answers and restart recovery; the worker owns only the vendor promise. */
+  private async askUserQuestion(
+    spec: WorkerSessionSpec,
+    input: unknown,
+    context?: ClaudePermissionContext,
+  ): Promise<{ behavior: 'allow'; updatedInput: unknown } | { behavior: 'deny'; message: string }> {
+    if (!context?.toolUseID || !context.requestId || !context.signal) {
+      return {
+        behavior: 'deny',
+        message: 'AskUserQuestion arrived without required SDK correlation; no answer was submitted',
+      }
+    }
+
+    let id: string
+    let validatedInput: ReturnType<typeof parseAskUserQuestionInput>
+    try {
+      id = stableQuestionId(spec.sessionId, context.toolUseID, context.requestId)
+      validatedInput = parseAskUserQuestionInput(input)
+    } catch (error) {
+      if (error instanceof QuestionInputError || error instanceof InvalidQuestionCorrelationError) {
+        this.emitEvent(spec.sessionId, 'question/rejected', {
+          code: 'invalid-question-input',
+          toolUseIdLength: typeof context.toolUseID === 'string' ? context.toolUseID.length : null,
+          requestIdLength: typeof context.requestId === 'string' ? context.requestId.length : null,
+        })
+        return {
+          behavior: 'deny',
+          message: `AskUserQuestion was rejected because its input was invalid: ${error.message}`,
+        }
+      }
+      throw error
+    }
+
+    if (context.signal.aborted) {
+      return { behavior: 'deny', message: 'The question was cancelled because the turn was interrupted.' }
+    }
+
+    const abort = (): void => {
+      // The request relay is inserted before this listener can fire. WorkerServer preserves that order on
+      // a live socket and on a reconnect flush, so abort cannot overtake registration of its question.
+      void this.relayRpc('questions.abort', { id, sessionId: spec.sessionId }).catch(() => {
+        // The pending request relay remains restart-safe and will settle from the hub's durable row.
+      })
+    }
+    context.signal.addEventListener('abort', abort, { once: true })
+    try {
+      const outcome = (await this.relayRpc('questions.request', {
+        id,
+        sessionId: spec.sessionId,
+        toolUseId: context.toolUseID,
+        requestId: context.requestId,
+        input: validatedInput,
+      })) as QuestionOutcome
+      if (outcome.kind === 'answered') {
+        return { behavior: 'allow', updatedInput: outcome.updatedInput }
+      }
+      if (outcome.kind === 'interrupted') {
+        return { behavior: 'deny', message: outcome.message }
+      }
+      return {
+        behavior: 'deny',
+        message:
+          outcome.reason === 'aborted'
+            ? 'The question was cancelled because the turn was interrupted.'
+            : outcome.reason === 'recovery-unknown'
+              ? 'The answer was submitted before a hub restart, but exact delivery could not be verified. Ask again if the answer is still needed.'
+              : outcome.reason === 'unavailable'
+                ? outcome.message ?? ASK_UNAVAILABLE_MESSAGE
+                : 'The user cancelled the question.',
+      }
+    } catch (error) {
+      if (error instanceof HubUnavailableError) return { behavior: 'deny', message: HUB_UNAVAILABLE_TEXT }
+      return { behavior: 'deny', message: `AskUserQuestion could not be completed: ${errMessage(error)}` }
+    } finally {
+      context.signal.removeEventListener('abort', abort)
+    }
+  }
 
   private nextCallId(): string {
     this.callSeq += 1

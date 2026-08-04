@@ -798,7 +798,7 @@
 <svelte:window onkeydown={onKey} />
 
 <div class="backdrop" role="button" tabindex="-1" onclick={onclose} onkeydown={() => {}}></div>
-<div class="modal" role="dialog" aria-modal="true" aria-label="New project" data-tutorial-anchor="new-project-flow">
+<div class="modal" role="dialog" aria-modal="true" aria-label="New project" data-tutorial-anchor="new-project-flow" data-overseer-anchor="new_project">
   <header>
     <div>
       <span class="eyebrow">NEW PROJECT</span>

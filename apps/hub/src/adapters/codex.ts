@@ -186,10 +186,13 @@ function turnInput(text: string, attachments: readonly AttachmentMeta[]): Array<
  * clamp, and the ability to tighten a live chat from Full to Safe. Mapping `full` to `never` would hand
  * the decision to the vendor and lose all three. "No prompts" is the hub's answer to give, not Codex's.
  *
- * `full` deliberately does NOT use dangerFullAccess. The operator asking for no prompts is not the same
- * as asking for unrestricted disk access, and unlike Claude there is no hub-side write-scope check on the
- * Codex path — so the sandbox root IS the containment. Writable roots stay scoped to the session's own
- * worktree (or cwd), which is where its work belongs.
+ * `full` is the explicit operator choice that lifts Codex's filesystem/network sandbox. Approval requests
+ * still flow through the hub, so live mode changes, the audit trail, and the bus-origin clamp remain in
+ * force. A normal operator-origin Full turn receives dangerFullAccess; a teammate-caused turn is clamped
+ * to Edits before it reaches this function unless the operator separately enables Full access for every
+ * origin in Danger Zone. This does not manufacture OS administrator rights: Windows UAC / sudo still
+ * applies at the operating-system boundary, but Full no longer prevents an agent from invoking an
+ * operator-approved elevation mechanism.
  */
 export function codexTurnPolicy(spec: {
   permissionMode?: 'safe' | 'edits' | 'full'
@@ -198,7 +201,10 @@ export function codexTurnPolicy(spec: {
 }): Pick<CodexTurnOptions, 'approvalPolicy' | 'sandboxPolicy'> {
   return {
     approvalPolicy: 'on-request',
-    sandboxPolicy: { type: 'workspaceWrite', writableRoots: [spec.worktree ?? spec.cwd] },
+    sandboxPolicy:
+      spec.permissionMode === 'full'
+        ? { type: 'dangerFullAccess' }
+        : { type: 'workspaceWrite', writableRoots: [spec.worktree ?? spec.cwd] },
   }
 }
 

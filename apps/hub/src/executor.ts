@@ -70,7 +70,7 @@ export interface Executor {
   /**
    * Snapshot the exact in-process turn promises currently owning unanswered questions, then observe their
    * terminal boundary without confusing a stale terminal with a later turn. Worker mode never implements
-   * this because AskUserQuestion is denied before crossing its unauthenticated control channel.
+   * this because the worker owns the vendor promise and relays the durable question lifecycle to the hub.
    */
   settleQuestionTurnsForRestart?(
     sessionIds: readonly string[],
@@ -123,6 +123,10 @@ export const AUTO_ALLOW_TOOLS = new Set([
   'mcp__allmyagents__memory_read',
   'mcp__allmyagents__practice_read',
   'mcp__allmyagents__practice_list',
+  // The handler independently requires the hub-minted Overseer identity and direct operator provenance
+  // for every mutation. Auto-allowing the transport-level call lets a system failure alert run only the
+  // read-only status/failure_context operations on its deliberately clamped bus turn.
+  'mcp__allmyagents__overseer_control',
   // Read-only/session-view browser tools still pass through SessionManager's positive operator-turn
   // attribution gate. Auto-allowing them here prevents a meaningless generic SDK prompt; it does not
   // grant Browser, cross a bus turn, or bypass session/tab ownership.

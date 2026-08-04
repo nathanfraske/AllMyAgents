@@ -1,6 +1,7 @@
 export const TUTORIAL_ANCHORS = {
   settings: 'settings',
   accountSignIn: 'account-sign-in',
+  overseerSetup: 'overseer-setup',
   home: 'home',
   projectList: 'project-list',
   newProject: 'new-project',

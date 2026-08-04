@@ -26,6 +26,7 @@ import type { AgentBus } from './bus.js'
 import type { MemoryStore } from './memory.js'
 import type { PracticeStore } from './practices.js'
 import { tokenMatches } from './deviceToken.js'
+import { PairingCodeBroker } from './pairingCode.js'
 import { pickFolder } from './native.js'
 import { computeStats } from './stats.js'
 import { buildFleet, probeHubHealth } from './fleet.js'
@@ -521,6 +522,7 @@ export function startServer(opts: ServerOptions): http.Server {
   const overseer = opts.overseer ?? {}
   const overseerCwd = opts.overseerCwd ?? defaultCwd
   const replayPrincipalBudget = new ReplayPrincipalBudget()
+  const pairingCodes = new PairingCodeBroker(deviceToken)
   const questions = opts.questions
   // Runtime repositories live beside the journal/config under HUB_DATA_DIR, never in the shipped hub
   // payload or profiles tree. GitHubImportService keeps auth entirely inside an existing `gh` session.
@@ -530,6 +532,27 @@ export function startServer(opts: ServerOptions): http.Server {
   )
   const wsl = new WslService()
   const profileLoginCoordinator = opts.profileLoginCoordinator
+  sessions.setOverseerRuntime?.({
+    createProject: async (name, rawPath, distro) => {
+      const location = await resolveProjectPath(rawPath, distro)
+      if (location.kind === 'unavailable') throw new Error(location.reason)
+      return projects.create(
+        name,
+        location.hostPath,
+        location.kind === 'wsl'
+          ? { kind: 'wsl', distro: location.distro, linuxPath: location.linuxPath }
+          : undefined,
+      )
+    },
+    ...(profileLoginCoordinator
+      ? { startProfileLogin: (input) => profileLoginCoordinator.start(input) }
+      : {}),
+    githubRepositories: () => github.repositories(),
+    startGitHubClone: (repository, distro) =>
+      github.start(repository, distro ? { kind: 'wsl', distro } : { kind: 'local' }),
+    githubCloneStatus: (jobId) => github.job(jobId),
+    issuePairingCode: () => pairingCodes.issue(),
+  })
 
   async function resolveProjectPath(rawPath: string, distro?: string): Promise<WorkspacePath> {
     const syntax = classifyWorkspacePath(rawPath, { distro })
@@ -610,6 +633,19 @@ export function startServer(opts: ServerOptions): http.Server {
       // Public probe so an unpaired client can learn whether pairing is required (never gated).
       if (method === 'GET' && url.pathname === '/api/auth') {
         json(res, { requireToken: true, authed })
+        return
+      }
+      // Human-sized, one-use pairing code exchange. The code is created only by an authenticated
+      // operator action, lives in memory for ten minutes, and is guess-bounded by PairingCodeBroker.
+      // A successful exchange returns the long device capability once; the short code is then dead.
+      if (method === 'POST' && url.pathname === '/api/pair') {
+        const body = await readBody(req)
+        const result = pairingCodes.redeem(str(body.code) ?? '')
+        if (!result.ok) {
+          json(res, { error: 'pairing code is invalid, expired, or already used' }, 401)
+          return
+        }
+        json(res, { token: result.token })
         return
       }
       // Public health probe — the supervisor health-checks a booting green hub with this before any
@@ -1459,6 +1495,10 @@ export function startServer(opts: ServerOptions): http.Server {
       // authenticated POST initiated by an operator click in Settings.
       if (method === 'GET' && url.pathname === '/api/mesh') {
         json(res, { ...mesh.status(), requireToken: true })
+        return
+      }
+      if (method === 'POST' && url.pathname === '/api/pairing-code') {
+        json(res, pairingCodes.issue())
         return
       }
       if (method === 'POST' && url.pathname === '/api/device-token/reveal') {

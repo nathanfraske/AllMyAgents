@@ -500,6 +500,40 @@ describe('SessionManager mid-turn steering', () => {
     expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(true)
   })
 
+  it('labels a direct manager assignment as ordinary in-scope authority without widening capabilities', async () => {
+    const { sessions, bus, record, steer } = build()
+    record.parentSessionId = 'manager'
+    const manager: SessionRecord = {
+      id: 'manager',
+      profileId: 'p1',
+      provider: 'claude',
+      cwd: record.cwd,
+      projectId: record.projectId,
+      status: 'idle',
+      createdAt: new Date().toISOString(),
+      isProjectManager: true,
+    }
+    ;(sessions as unknown as { sessions: Map<string, SessionRecord> }).sessions.set(manager.id, manager)
+    bus.post({
+      from: { sessionId: manager.id, profileId: 'p1', provider: 'claude', projectId: 'proj1', label: 'Manager' },
+      project: 'proj1',
+      to: { kind: 'session', id: 's1' },
+      subject: 'Implement the fix',
+      body: 'Work in .worktrees/integration-trial.',
+      recipients: ['s1'],
+    })
+
+    ;(sessions as unknown as { deliverBus(sessionId: string): void }).deliverBus('s1')
+    await settle()
+
+    expect(steer).toHaveBeenCalledOnce()
+    const framed = steer.mock.calls[0]![1]
+    expect(framed).toContain('operator-designated direct project manager')
+    expect(framed).toContain('ordinary, reversible project work')
+    expect(framed).toContain('nested Git worktree underneath a writable workspace root remains inside that root')
+    expect(framed).toContain('does not expand those bounds')
+  })
+
   it('leaves a bus message queued when the live turn ends before the steer is accepted', async () => {
     const failure = new Error('no active Claude turn to steer')
     const { sessions, bus, steer } = build({ steer: async () => Promise.reject(failure) })
