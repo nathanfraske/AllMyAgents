@@ -2,6 +2,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { verifyDirectHubEnvelope } from './directHubProtocol.js'
+import type { MyOwnMeshRpcBridge } from './myOwnMeshRpc.js'
 import {
   DeviceExecutor,
   FleetConnectionStore,
@@ -106,6 +108,150 @@ describe('FleetConnectionStore', () => {
 })
 
 describe('RemoteDeviceController', () => {
+  it('uses the authenticated Site-free RPC lane for granted capabilities and actions', async () => {
+    const dir = tempDir()
+    const connections = new FleetConnectionStore(path.join(dir, 'connections.json'))
+    const remoteToken = 'r'.repeat(64)
+    const localToken = 'l'.repeat(64)
+    connections.upsert({ siteId: 'peerhub', label: 'Peer Hub', token: remoteToken })
+    const capabilities: DeviceExecutorCapabilities = {
+      enabled: true,
+      platform: process.platform,
+      arch: 'remote-arch',
+      hostname: 'remote-host',
+      environments: [{ id: 'host', kind: 'host', label: 'remote host', platform: process.platform, shell: 'shell' }],
+      roots: [{ id: 'root-one', label: 'One', path: '/private-target-path', read: true, write: true, terminal: true }],
+    }
+    const call = vi.fn(async (_peer: string, value: unknown) => {
+      const request = value as { kind?: unknown; envelope?: unknown }
+      expect(request.kind).toBe('authenticated')
+      const envelope = verifyDirectHubEnvelope(request.envelope, {
+        fromPeer: 'localhub-session',
+        token: localToken,
+      })
+      if (envelope.operation === 'device_capabilities') return capabilities
+      if (envelope.operation === 'device_action') return { ok: true, bytes: 512, content: 'remote data' }
+      throw new Error(`unexpected operation ${envelope.operation}`)
+    })
+    const bridge = {
+      identity: vi.fn(async () => ({ siteId: 'localhub', label: 'Local Hub' })),
+      peers: vi.fn(async () => [{ siteId: 'peerhub', label: 'Peer Hub', online: true, status: 'active', rttMs: 12 }]),
+      call,
+    } as unknown as MyOwnMeshRpcBridge
+    const resolveRoute = vi.fn(async () => null)
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('Site HTTP must not be used') }))
+    const controller = new RemoteDeviceController(connections, resolveRoute, { bridge, localDeviceToken: localToken })
+
+    await expect(controller.listForGrants([{
+      siteId: 'peerhub', rootIds: ['root-one'], capabilities: ['read', 'write'],
+    }])).resolves.toMatchObject([{
+      siteId: 'peerhub',
+      connected: true,
+      roots: [{ id: 'root-one', grantedCapabilities: ['read', 'write'] }],
+    }])
+    await expect(controller.execute('peerhub', {
+      op: 'read', rootId: 'root-one', path: 'fixture.txt',
+    }, { sessionId: 'session-a', profileId: 'profile-a' })).resolves.toMatchObject({
+      ok: true,
+      content: 'remote data',
+      telemetry: { routeMs: 0, roundTripMs: expect.any(Number), transferBytes: 512 },
+    })
+    expect(resolveRoute).not.toHaveBeenCalled()
+    expect(call).toHaveBeenCalledTimes(2)
+  })
+
+  it('pairs reciprocally over direct RPC without a Site route', async () => {
+    const dir = tempDir()
+    const connections = new FleetConnectionStore(path.join(dir, 'connections.json'))
+    const localToken = 'l'.repeat(64)
+    const remoteToken = 'r'.repeat(64)
+    const call = vi.fn(async (peer: string, value: unknown) => {
+      expect(peer).toBe('peerhub')
+      expect(value).toMatchObject({
+        kind: 'pair_exchange',
+        code: 'ABCD-EFGH',
+        source: { siteId: 'localhub', label: 'Local Hub', token: localToken },
+      })
+      return { siteId: 'peerhub', label: 'Peer Hub', token: remoteToken }
+    })
+    const bridge = {
+      identity: vi.fn(async () => ({ siteId: 'localhub', label: 'Local Hub' })),
+      call,
+    } as unknown as MyOwnMeshRpcBridge
+    const controller = new RemoteDeviceController(connections, async () => null, { bridge, localDeviceToken: localToken })
+
+    await expect(controller.pairDirect('peerhub', 'ABCD-EFGH')).resolves.toMatchObject({
+      siteId: 'peerhub', label: 'Peer Hub', paired: true,
+    })
+    expect(connections.get('peerhub')?.token).toBe(remoteToken)
+  })
+
+  it('does not use or pair through the direct lane while mesh exposure is disabled', async () => {
+    const dir = tempDir()
+    const connections = new FleetConnectionStore(path.join(dir, 'connections.json'))
+    connections.upsert({ siteId: 'peerhub', label: 'Peer Hub', token: 'r'.repeat(64) })
+    const capabilities: DeviceExecutorCapabilities = {
+      enabled: true,
+      platform: process.platform,
+      arch: 'site-arch',
+      hostname: 'site-host',
+      environments: [],
+      roots: [],
+    }
+    const bridge = {
+      identity: vi.fn(async () => ({ siteId: 'localhub', label: 'Local Hub' })),
+      peers: vi.fn(async () => [{ siteId: 'peerhub', label: 'Peer Hub', online: true, status: 'active' }]),
+      call: vi.fn(async () => { throw new Error('disabled direct lane must not be called') }),
+    } as unknown as MyOwnMeshRpcBridge
+    const resolveRoute = vi.fn(async () => ({
+      siteId: 'peerhub', label: 'Peer Hub', baseUrl: 'http://127.0.0.1:9999', online: true,
+    }))
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify(capabilities), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const controller = new RemoteDeviceController(connections, resolveRoute, {
+      bridge,
+      localDeviceToken: 'l'.repeat(64),
+      enabled: () => false,
+    })
+
+    await expect(controller.capabilities('peerhub')).resolves.toMatchObject({ hostname: 'site-host' })
+    await expect(controller.pairDirect('peerhub', 'ABCD-EFGH')).rejects.toThrow(/disabled/u)
+    expect(bridge.identity).not.toHaveBeenCalled()
+    expect(bridge.peers).not.toHaveBeenCalled()
+    expect(bridge.call).not.toHaveBeenCalled()
+    expect(resolveRoute).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not repeat a possibly executed remote command over the Site fallback after a direct RPC failure', async () => {
+    const dir = tempDir()
+    const connections = new FleetConnectionStore(path.join(dir, 'connections.json'))
+    connections.upsert({ siteId: 'peerhub', label: 'Peer Hub', token: 'r'.repeat(64) })
+    const bridge = {
+      identity: vi.fn(async () => ({ siteId: 'localhub', label: 'Local Hub' })),
+      peers: vi.fn(async () => [{ siteId: 'peerhub', label: 'Peer Hub', online: true, status: 'active' }]),
+      call: vi.fn(async () => { throw new Error('response was lost after dispatch') }),
+    } as unknown as MyOwnMeshRpcBridge
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ ok: true }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const controller = new RemoteDeviceController(connections, async () => ({
+      siteId: 'peerhub', label: 'Peer Hub', baseUrl: 'http://localhost:49999', online: true,
+    }), { bridge, localDeviceToken: 'l'.repeat(64) })
+
+    await expect(controller.execute('peerhub', {
+      op: 'exec', rootId: 'root-one', command: 'do-something-once',
+    }, { sessionId: 'session-a', profileId: 'profile-a' })).resolves.toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/response was lost after dispatch/u),
+      failure: { stage: 'transport' },
+      telemetry: { routeMs: 0, roundTripMs: expect.any(Number) },
+    })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
   it('authenticates target requests from the private store and intersects target roots with chat grants', async () => {
     const dir = tempDir()
     const connections = new FleetConnectionStore(path.join(dir, 'connections.json'))

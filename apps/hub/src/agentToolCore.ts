@@ -39,6 +39,8 @@ export interface OverseerControlInput {
     | 'launch_team'
     | 'remote_catalog'
     | 'set_remote_grants'
+    | 'list_overseer_peers'
+    | 'send_overseer_message'
     | 'start_account_login'
     | 'github_repositories'
     | 'clone_github_repository'
@@ -93,6 +95,8 @@ export interface OverseerControlInput {
   command?: string
   shell?: ElevatedShell
   timeoutMs?: number
+  siteId?: string
+  subject?: string
   uiTarget?:
     | 'home'
     | 'new_project'
@@ -137,6 +141,16 @@ export interface ManagerSpawnResult {
   worktreeFallbackReason?: string
 }
 
+export interface AgentRosterEntry {
+  sessionId: string
+  label: string
+  provider: string
+  status: string
+  projectId?: string
+  role?: string
+  isOverseer?: boolean
+}
+
 /** The subset of `MemoryStore` the agent tools call, widened to `Awaitable` so a worker RPC proxy can
  *  satisfy it. `MemoryStore` itself still satisfies it — a synchronous return is assignable to `Awaitable`. */
 export interface MemoryServices {
@@ -171,7 +185,7 @@ export interface AgentServices {
   /** Read + mark-read the caller's inbox. */
   inbox(sessionId: string): Awaitable<BusMessage[]>
   /** The teammates the caller can message (same project, not itself, not stopped). */
-  roster(sessionId: string): Awaitable<{ sessionId: string; label: string; provider: string; status: string }[]>
+  roster(sessionId: string): Awaitable<AgentRosterEntry[]>
   /** A read-only one-line snapshot of a teammate's current activity (peek_agent) — no message, no interrupt. */
   peek(
     callerSessionId: string,
@@ -295,13 +309,17 @@ function resolveWriteScope(id: SessionIdentity, kind: 'account' | 'project' | un
 const listAgents = defineTool({
   name: 'list_agents',
   description:
-    'List the other agents you can message — your teammates on the same project. Returns their session ids (use one verbatim as `to_session`), provider, and current status.',
+    'List the other agents in your allowed scope. Ordinary agents see same-project teammates; the application Overseer sees the complete local fleet, including stopped chats. Returns session ids (use one verbatim as `to_session`), project, role, provider, and current status.',
   schema: {},
   run: async (_args, { identity, services }) => {
     const roster = await services.roster(identity.sessionId)
     if (!roster.length) return 'No other agents are currently on your team.'
     return roster
-      .map((a) => `- ${a.label} — session ${a.sessionId} (${a.provider}, ${a.status})`)
+      .map((a) => {
+        const scope = a.projectId ? `project ${a.projectId}` : 'no project'
+        const role = a.role ? `, ${a.role}` : ''
+        return `- ${a.label} — session ${a.sessionId} (${a.provider}, ${a.status}, ${scope}${role})`
+      })
       .join('\n')
   },
 })
@@ -367,13 +385,13 @@ const readMessages = defineTool({
 const peekAgent = defineTool({
   name: 'peek_agent',
   description:
-    'See what a teammate agent is currently doing — their status and last activity — WITHOUT interrupting them or sending a message. Give `to_session` (from list_agents). Use it to check on a teammate before deciding whether to message them.',
+    'Inspect an agent without interrupting it or sending a message. Ordinary agents may read a same-project teammate summary; managers may deeply inspect direct children; the application Overseer may use every read-only view across the complete local fleet. Give `to_session` from list_agents.',
   schema: {
     to_session: z.string().describe('the teammate session id from list_agents'),
     view: z
       .enum(['summary', 'activity', 'transcript', 'changes', 'tasks', 'all'])
       .optional()
-      .describe('summary works for teammates; deep views are restricted to a manager’s own direct children'),
+      .describe('deep views require a manager’s direct child or the application Overseer'),
     after_seq: z
       .number()
       .int()
@@ -388,7 +406,7 @@ const peekAgent = defineTool({
     })
     return r.found && r.summary
       ? r.summary
-      : 'No such teammate on your project (check list_agents for a valid session id).'
+      : 'No agent is visible at that session id (check list_agents for a valid target).'
   },
 })
 
@@ -1019,13 +1037,14 @@ const overseerPreset = z.object({
 const overseerControl = defineTool({
   name: 'overseer_control',
   description:
-    'Application Overseer only: explain how AllMyAgents works; inspect fleet failures; configure projects, managers, reusable team presets, chats, accounts, remote-device grants, GitHub imports, mesh pairing, and safe hub restarts. Elevated commands require a configured project policy, blast-radius analysis, a separate explicit operator approval, and (on Windows) UAC. Mutations are denied on teammate-caused turns.',
+    'Application Overseer only: explain how AllMyAgents works; inspect fleet failures; configure projects, managers, reusable team presets, chats, accounts, remote-device grants, GitHub imports, mesh pairing, direct peer-Overseer messages, and safe hub restarts. Elevated commands require a configured project policy, blast-radius analysis, a separate explicit operator approval, and (on Windows) UAC. Mutations are denied on teammate-caused turns; a remote Overseer turn may only reply to the same authenticated peer.',
   schema: {
     operation: z.enum([
       'status', 'guide', 'ui_catalog', 'highlight_ui', 'failure_context', 'create_project', 'create_chat', 'send_chat', 'stop_chat',
       'reopen_chat', 'approve', 'set_mode', 'set_session_config', 'configure_manager',
       'list_team_presets', 'save_team_preset', 'delete_team_preset', 'launch_team',
-      'remote_catalog', 'set_remote_grants', 'start_account_login', 'github_repositories',
+      'remote_catalog', 'set_remote_grants', 'list_overseer_peers', 'send_overseer_message',
+      'start_account_login', 'github_repositories',
       'clone_github_repository', 'github_clone_status', 'issue_pairing_code',
       'get_elevation_policy', 'configure_elevation', 'analyze_elevated_command',
       'run_elevated_command', 'restart_hub',
@@ -1063,6 +1082,8 @@ const overseerControl = defineTool({
     command: z.string().min(1).max(8_000).optional(),
     shell: z.enum(['powershell', 'bash']).optional(),
     timeout_ms: z.number().int().min(1_000).max(15 * 60 * 1_000).optional(),
+    site_id: z.string().min(1).max(256).optional(),
+    subject: z.string().max(300).optional(),
     ui_target: z.enum([
       'home', 'new_project', 'project_overview', 'overseer', 'accounts', 'chat_defaults',
       'remote_access', 'safety', 'hub_status', 'managers', 'browser', 'composer',
@@ -1102,6 +1123,8 @@ const overseerControl = defineTool({
       command: args.command,
       shell: args.shell,
       timeoutMs: args.timeout_ms,
+      siteId: args.site_id,
+      subject: args.subject,
       uiTarget: args.ui_target,
       uiMessage: args.ui_message,
     })

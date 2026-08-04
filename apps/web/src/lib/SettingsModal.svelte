@@ -4,6 +4,7 @@
   import { api, getFleetSiteToken, type DeviceExecutorCapabilities, type DeviceRootPolicy, type MeshStatus, type Instruction, type Practice, type DangerFlags, type HubPrefs, type OverseerStatus } from './api'
   import ProviderLogo from './ProviderLogo.svelte'
   import Icon from './Icon.svelte'
+  import PairingCodeInput from './PairingCodeInput.svelte'
   import { modelsFor } from './catalog'
   import { updater, updatesSupported } from './updater.svelte'
   import { countLiveUpdateTurns } from './updateSafety'
@@ -104,6 +105,9 @@
   // Mesh remote-access status (loaded once; refreshed after a toggle).
   let mesh = $state<MeshStatus | null>(null)
   let meshBusy = $state(false)
+  let fleetRefreshBusy = $state(false)
+  let fleetRefreshError = $state('')
+  let fleetRefreshedAt = $state('')
   $effect(() => {
     void api.mesh().then((m) => (mesh = m))
   })
@@ -119,13 +123,28 @@
       meshBusy = false
     }
   }
+  async function refreshRemoteAccess(): Promise<void> {
+    if (fleetRefreshBusy) return
+    fleetRefreshBusy = true
+    fleetRefreshError = ''
+    try {
+      const [, status] = await Promise.all([store.refreshFleet(true), api.mesh()])
+      mesh = status
+      fleetRefreshedAt = new Date().toISOString()
+    } catch (error) {
+      fleetRefreshError = error instanceof Error ? error.message : String(error)
+    } finally {
+      fleetRefreshBusy = false
+    }
+  }
   let fleetTokenDrafts = $state<Record<string, string>>({})
   let fleetPairBusy = $state('')
   let fleetPairError = $state<Record<string, string>>({})
   async function pairFleetSite(siteId: string): Promise<void> {
     fleetPairBusy = siteId
     const ok = await store.pairFleetSite(siteId, fleetTokenDrafts[siteId] ?? '')
-    fleetPairError = { ...fleetPairError, [siteId]: ok ? '' : 'Pairing failed. Create a fresh pairing code on that machine, or use its legacy device token.' }
+    const detail = store.fleetSites.find((site) => site.siteId === siteId)?.authError
+    fleetPairError = { ...fleetPairError, [siteId]: ok ? '' : detail ?? 'Pairing failed. Create a fresh pairing code on that machine.' }
     if (ok) fleetTokenDrafts = { ...fleetTokenDrafts, [siteId]: '' }
     fleetPairBusy = ''
   }
@@ -941,7 +960,16 @@
     </section>
 
     <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Remote access')} data-overseer-anchor="remote_access">
-      <h3>Remote access (mesh)</h3>
+      <div class="remote-heading">
+        <h3>Remote access (mesh)</h3>
+        <div class="remote-refresh">
+          {#if fleetRefreshedAt}<span class="hint dim">checked {new Date(fleetRefreshedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })}</span>{/if}
+          <button class="btn" disabled={fleetRefreshBusy} onclick={refreshRemoteAccess}>
+            <Icon name="rotate-ccw" size={13} /> {fleetRefreshBusy ? 'checking…' : 'refresh'}
+          </button>
+        </div>
+      </div>
+      {#if fleetRefreshError}<p class="hint warn" role="alert">{fleetRefreshError}</p>{/if}
       {#if mesh}
         <label class="opt"><input type="checkbox" checked={mesh.enabled} disabled={meshBusy} onchange={(e) => toggleMesh((e.target as HTMLInputElement).checked)} /> Expose this hub to my AllMyStuff fleet</label>
         <div class="mesh-status">
@@ -983,8 +1011,17 @@
               <div class="fleet-peer">
                 <div class="fleet-peer-head">
                   <span>{site.label}</span>
-                  <span class="mstate" class:on={site.online && site.authState === 'paired'} class:warn={site.online && site.authState !== 'paired'} class:off={!site.online}>
-                    {!site.online ? 'mesh offline' : site.authState === 'paired' ? 'paired · live' : 'pairing required'}
+                  <span
+                    class="mstate"
+                    class:on={(site.online || site.directOnline) && site.authState === 'paired'}
+                    class:warn={(site.online || site.directOnline) && site.authState !== 'paired'}
+                    class:off={!site.online && !site.directOnline}
+                  >
+                    {site.online
+                      ? site.authState === 'paired' ? 'paired · live' : 'pairing required'
+                      : site.directOnline
+                        ? `direct control live${site.directRttMs !== undefined ? ` · ${site.directRttMs} ms` : ''}`
+                        : 'mesh offline'}
                   </span>
                 </div>
                 {#if site.authState === 'paired' && getFleetSiteToken(site.siteId)}
@@ -994,20 +1031,35 @@
                   </div>
                 {:else}
                   <div class="token-row">
-                    <input
-                      type="password"
-                      autocomplete="off"
-                      placeholder="Enter XXXX-XXXX pairing code"
+                    <PairingCodeInput
+                      label={`Pairing code for ${site.label}`}
                       value={fleetTokenDrafts[site.siteId] ?? ''}
-                      oninput={(event) => (fleetTokenDrafts = { ...fleetTokenDrafts, [site.siteId]: (event.target as HTMLInputElement).value })}
+                      onchange={(value) => (fleetTokenDrafts = { ...fleetTokenDrafts, [site.siteId]: value })}
+                      onenter={() => pairFleetSite(site.siteId)}
+                      disabled={fleetPairBusy === site.siteId || (!site.online && !site.directOnline)}
                     />
-                    <button class="btn" disabled={fleetPairBusy === site.siteId || !site.online} onclick={() => pairFleetSite(site.siteId)}>
+                    <button
+                      class="btn"
+                      disabled={
+                        fleetPairBusy === site.siteId ||
+                        (!site.online && !site.directOnline) ||
+                        (fleetTokenDrafts[site.siteId] ?? '').replace(/-/gu, '').length !== 8
+                      }
+                      onclick={() => pairFleetSite(site.siteId)}
+                    >
                       {fleetPairBusy === site.siteId ? 'pairing…' : 'pair'}
                     </button>
                   </div>
                 {/if}
                 {#if fleetPairError[site.siteId] || site.authError}
                   <p class="hint warn">{fleetPairError[site.siteId] || site.authError}</p>
+                {/if}
+                {#if !site.online && site.routeError}
+                  <p class="hint dim">
+                    {site.directOnline
+                      ? 'Pairing, remote testbeds, and Overseer messages use the direct channel. The unified remote-chat stream still needs a compatible Site route in this release.'
+                      : 'Refresh forces a new tunnel negotiation. If this persists, update or restart AllMyStuff on both machines.'}
+                  </p>
                 {/if}
               </div>
             {/each}
@@ -1297,12 +1349,15 @@
   .auto-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.15rem; }
   .auto-list li { font-size: var(--text-xs); font-family: var(--mono); }
   .mesh-status { display: flex; flex-direction: column; gap: var(--space-3); margin-bottom: var(--space-3); }
+  .remote-heading { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-3); }
+  .remote-heading h3 { margin: 0; }
+  .remote-refresh { display: flex; align-items: center; gap: var(--space-2); }
+  .remote-refresh .btn { display: inline-flex; align-items: center; gap: var(--space-1); }
   .mstate { font-size: var(--text-xs); line-height: 1.45; }
   .mstate.on { color: var(--ok); }
   .mstate.warn { color: var(--warn); }
   .mstate.off { color: var(--muted); }
   .token-row { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-2); flex-wrap: wrap; }
-  .token-row input { flex: 1 1 16rem; min-width: 10rem; }
   .tlabel { font-size: var(--text-xs); }
   .token { flex: 1; min-width: 9rem; overflow: hidden; text-overflow: ellipsis; }
   .pairing-code { min-width: 8.5rem; letter-spacing: 0.12em; text-align: center; }

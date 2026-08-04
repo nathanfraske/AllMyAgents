@@ -4,6 +4,9 @@ import os from 'node:os'
 import path from 'node:path'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import type { RemoteDeviceCapability, RemoteDeviceGrant } from './types.js'
+import type { DirectHubEnvelope } from './directHubProtocol.js'
+import { signDirectHubEnvelope, verifyDirectHubEnvelope } from './directHubProtocol.js'
+import type { MyOwnMeshRpcBridge } from './myOwnMeshRpc.js'
 
 const MAX_FILE_BYTES = 1024 * 1024
 const DEFAULT_READ_BYTES = 256 * 1024
@@ -25,6 +28,26 @@ export interface FleetConnection {
 
 export interface FleetConnectionPublic extends Omit<FleetConnection, 'token'> {
   paired: true
+}
+
+export interface DirectPairResult {
+  siteId: string
+  label: string
+  token: string
+  paired: true
+}
+
+export interface OverseerPeerStatus extends FleetConnectionPublic {
+  online: boolean
+  overseerAvailable?: boolean
+  transport?: 'myownmesh-rpc' | 'site'
+  error?: string
+}
+
+export interface DirectRemoteTransport {
+  bridge: MyOwnMeshRpcBridge
+  localDeviceToken: string
+  enabled?: () => boolean
 }
 
 function boundedPlain(value: unknown, field: string, max = 200): string {
@@ -786,6 +809,7 @@ export class RemoteDeviceController {
   constructor(
     private readonly connections: FleetConnectionStore,
     private readonly resolveRoute: (siteId: string) => Promise<RemoteDeviceRoute | null>,
+    private readonly direct?: DirectRemoteTransport,
   ) {}
 
   listConnections(): FleetConnectionPublic[] {
@@ -807,7 +831,7 @@ export class RemoteDeviceController {
       const connection = this.connections.get(siteId)
       if (!connection) return { siteId, label: siteId, connected: false, error: 'Device is not paired with this hub.', roots: [] }
       try {
-        const capabilities = await this.request<DeviceExecutorCapabilities>(siteId, '/api/device-executor', 'GET')
+        const capabilities = await this.capabilities(siteId)
         return {
           siteId,
           label: connection.label,
@@ -850,6 +874,8 @@ export class RemoteDeviceController {
   }
 
   async capabilities(siteId: string): Promise<DeviceExecutorCapabilities> {
+    const direct = await this.directCall<DeviceExecutorCapabilities>(siteId, 'device_capabilities', {}).catch(() => null)
+    if (direct) return direct
     return this.request<DeviceExecutorCapabilities>(siteId, '/api/device-executor', 'GET')
   }
 
@@ -858,6 +884,38 @@ export class RemoteDeviceController {
       ? Math.min(Number(action.timeoutMs) || 30_000, MAX_COMMAND_TIMEOUT_MS) + 10_000
       : 15_000
     const body = { action, actor }
+    const directStarted = performance.now()
+    let directResult: RemoteDeviceActionResult | null
+    try {
+      directResult = await this.directCall<RemoteDeviceActionResult>(siteId, 'device_action', body, timeout)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return {
+        ok: false,
+        error: `Direct MyOwnMesh action failed: ${message}`,
+        failure: { stage: /tim(?:ed?\s*out|eout)/iu.test(message) ? 'timeout' : 'transport' },
+        telemetry: { routeMs: 0, roundTripMs: Math.round((performance.now() - directStarted) * 10) / 10 },
+      }
+    }
+    if (directResult) {
+      const roundTripMs = Math.round((performance.now() - directStarted) * 10) / 10
+      const targetMs = directResult.telemetry?.targetMs
+      const transferBytes = action.op === 'read' || action.op === 'write' ? directResult.bytes : undefined
+      return {
+        ...directResult,
+        failure: directResult.ok ? undefined : (directResult.failure ?? { stage: 'target' }),
+        telemetry: {
+          ...directResult.telemetry,
+          routeMs: 0,
+          ...(targetMs === undefined ? {} : { networkMs: Math.max(0, Math.round((roundTripMs - targetMs) * 10) / 10) }),
+          roundTripMs,
+          ...(transferBytes === undefined ? {} : {
+            transferBytes,
+            transferBytesPerSecond: Math.round(transferBytes / Math.max(roundTripMs / 1000, 0.001)),
+          }),
+        },
+      }
+    }
     try {
       const result = await this.request<RemoteDeviceActionResult>(siteId, '/api/device-executor/action', 'POST', body, timeout, true)
       const telemetry = result.telemetry ?? {}
@@ -883,6 +941,117 @@ export class RemoteDeviceController {
         failure: { stage: 'transport' },
       }
     }
+  }
+
+  /** One-use code exchange over the site-free RPC lane; successful pairing becomes reciprocal. */
+  async pairDirect(siteId: string, code: string): Promise<DirectPairResult> {
+    if (!this.direct || this.direct.enabled?.() === false) {
+      throw new Error('The direct MyOwnMesh hub channel is unavailable or disabled.')
+    }
+    const identity = await this.direct.bridge.identity()
+    if (!identity) throw new Error('Could not resolve this device identity from MyOwnMesh.')
+    const response = await this.direct.bridge.call(siteId, {
+      kind: 'pair_exchange',
+      version: 1,
+      code,
+      source: {
+        siteId: identity.siteId,
+        label: identity.label,
+        token: this.direct.localDeviceToken,
+      },
+    }, 15_000) as { siteId?: unknown; label?: unknown; token?: unknown }
+    if (
+      typeof response?.siteId !== 'string' ||
+      typeof response?.label !== 'string' ||
+      typeof response?.token !== 'string'
+    ) {
+      throw new Error('The remote hub returned an invalid pairing response.')
+    }
+    if (response.siteId.toLowerCase() !== siteId.split('-', 1)[0]!.toLowerCase()) {
+      throw new Error('The pairing response identity did not match the requested mesh peer.')
+    }
+    const saved = this.connections.upsert({ siteId: response.siteId, label: response.label, token: response.token })
+    return { siteId: saved.siteId, label: saved.label, token: response.token, paired: true }
+  }
+
+  async overseerPeers(): Promise<OverseerPeerStatus[]> {
+    const directPeers = new Map(
+      (this.direct?.enabled?.() === false ? [] : await this.direct?.bridge.peers(true).catch(() => []) ?? [])
+        .map((peer) => [peer.siteId.toLowerCase(), peer] as const),
+    )
+    return Promise.all(this.connections.list().map(async (connection) => {
+      const peer = directPeers.get(connection.siteId.split('-', 1)[0]!.toLowerCase())
+      if (peer?.online) {
+        try {
+          const result = await this.directCall<{ overseerAvailable?: boolean }>(
+            connection.siteId,
+            'overseer_message',
+            { probe: true },
+          )
+          return {
+            ...connection,
+            online: true,
+            overseerAvailable: result?.overseerAvailable === true,
+            transport: 'myownmesh-rpc' as const,
+          }
+        } catch (error) {
+          return {
+            ...connection,
+            online: false,
+            transport: 'myownmesh-rpc' as const,
+            error: error instanceof Error ? error.message : String(error),
+          }
+        }
+      }
+      const route = await this.resolveRoute(connection.siteId).catch(() => null)
+      return {
+        ...connection,
+        online: route?.online === true,
+        transport: 'site' as const,
+        ...(!route?.online ? { error: 'No live direct RPC peer or Site route.' } : {}),
+      }
+    }))
+  }
+
+  async sendOverseerMessage(
+    siteId: string,
+    input: { subject?: string; body: string },
+  ): Promise<{ accepted: boolean; duplicate?: boolean; overseerSessionId?: string }> {
+    const result = await this.directCall<{ accepted?: boolean; duplicate?: boolean; overseerSessionId?: string }>(
+      siteId,
+      'overseer_message',
+      { subject: input.subject, body: input.body },
+    )
+    if (!result || result.accepted !== true) throw new Error('The remote Overseer did not accept the message.')
+    return { accepted: true, duplicate: result.duplicate, overseerSessionId: result.overseerSessionId }
+  }
+
+  verifyDirectEnvelope(value: unknown, fromPeer: string): DirectHubEnvelope {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('direct hub request is malformed')
+    const sourceSiteId = (value as { sourceSiteId?: unknown }).sourceSiteId
+    if (typeof sourceSiteId !== 'string') throw new Error('direct hub source id is missing')
+    const connection = this.connections.get(sourceSiteId)
+    if (!connection) throw new Error('The source hub is not reciprocally paired with this hub.')
+    return verifyDirectHubEnvelope(value, { fromPeer, token: connection.token })
+  }
+
+  private async directCall<T>(
+    siteId: string,
+    operation: DirectHubEnvelope['operation'],
+    payload: unknown,
+    timeoutMs = 10_000,
+  ): Promise<T | null> {
+    if (!this.direct || this.direct.enabled?.() === false) return null
+    const connection = this.connections.get(siteId)
+    if (!connection) return null
+    const canonicalSiteId = siteId.split('-', 1)[0]!.toLowerCase()
+    const peer = (await this.direct.bridge.peers().catch(() => []))
+      .find((candidate) => candidate.siteId.toLowerCase() === canonicalSiteId)
+    if (!peer?.online) return null
+    const identity = await this.direct.bridge.identity()
+    if (!identity) throw new Error('Could not resolve this hub identity from MyOwnMesh.')
+    const envelope = signDirectHubEnvelope(this.direct.localDeviceToken, identity, operation, payload)
+    return await this.direct.bridge.call(siteId, { kind: 'authenticated', envelope }, timeoutMs) as T
   }
 
   private async request<T>(

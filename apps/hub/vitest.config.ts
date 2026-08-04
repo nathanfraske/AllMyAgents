@@ -24,5 +24,11 @@ export default defineConfig({
   test: {
     include: ['src/**/*.test.ts'],
     environment: 'node',
+    // Several suites compile and launch disposable copies of the real hub. Letting Vitest size its pool
+    // from every logical CPU starves those child compilers on release machines until their independent
+    // 60-second safety bounds fire, followed by cleanup racing the still-running process. Four workers
+    // keeps ordinary tests parallel while leaving enough CPU/I/O for the production-path harnesses.
+    minWorkers: 1,
+    maxWorkers: 4,
   },
 })

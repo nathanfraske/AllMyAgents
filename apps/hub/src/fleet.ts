@@ -26,6 +26,12 @@ export interface FleetSite {
   baseUrl: string
   /** Whether a hub answered `/api/health` here. The client polls only remote + online sites. */
   online: boolean
+  /** Bounded operator-facing diagnosis when presence/mapping succeeded but hub health did not. */
+  routeError?: string
+  /** A site-free MyOwnMesh RPC control lane is active even if the TCP Site tunnel is not. */
+  directOnline?: boolean
+  directStatus?: string
+  directRttMs?: number
 }
 
 export interface BuildFleetDeps {
@@ -148,7 +154,15 @@ export async function buildFleet(deps: BuildFleetDeps): Promise<FleetSite[]> {
       // vanishes from the roster is indistinguishable from one that was never paired, which is the more
       // confusing failure. Dropping only the unmappable ones preserves the previous behaviour for those.
       if (firstMapped === null) return null
-      return { siteId: m.device, label: m.label || m.device.slice(0, 8), local: false, baseUrl: firstMapped, online: false }
+      return {
+        siteId: m.device,
+        label: m.label || m.device.slice(0, 8),
+        local: false,
+        baseUrl: firstMapped,
+        online: false,
+        routeError:
+          'This peer advertises an AllMyAgents hub and a local mesh tunnel was mapped, but /api/health did not answer after route recovery.',
+      }
     })
   )
   return [local, ...remotes.filter((s): s is FleetSite => s !== null)]

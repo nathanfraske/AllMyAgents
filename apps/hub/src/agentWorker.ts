@@ -143,7 +143,15 @@ export function buildWorkerAgentServices(deps: WorkerAgentServiceDeps): AgentSer
       deps.relayRpc('bus.send', { fromSessionId: from.sessionId, to, subject, body }) as Promise<{ ok: boolean; delivered: number; error?: string }>,
     inbox: (sessionId) => deps.relayRpc('bus.inbox', { sessionId }) as Promise<BusMessage[]>,
     roster: (sessionId) =>
-      deps.relayRpc('bus.roster', { sessionId }) as Promise<{ sessionId: string; label: string; provider: string; status: string }[]>,
+      deps.relayRpc('bus.roster', { sessionId }) as Promise<Array<{
+        sessionId: string
+        label: string
+        provider: string
+        status: string
+        projectId?: string
+        role?: string
+        isOverseer?: boolean
+      }>>,
     peek: (caller, target, options) =>
       deps.relayRpc('bus.peek', { caller, target, options }) as Promise<{ found: boolean; summary?: string }>,
     childStatus: (managerSessionId) =>

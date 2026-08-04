@@ -58,6 +58,7 @@ import type {
   RemoteDeviceController,
 } from './remoteDevices.js'
 import type { OverseerConfig, RemoteDeviceCapability, RemoteDeviceGrant } from './types.js'
+import type { MyOwnMeshRpcBridge } from './myOwnMeshRpc.js'
 
 const REPLAY_BASELINE_MAX_BYTES = 2 * 1024 * 1024
 const REPLAY_BASELINE_MAX_SESSIONS = 5_000
@@ -451,6 +452,8 @@ export interface ServerOptions {
   projectActivity?: (projectId: string) => WorktreeProjectActivity
   deviceExecutor?: DeviceExecutor
   remoteDevices?: RemoteDeviceController
+  /** Site-free authenticated hub transport over the existing MyOwnMesh app-data lane. */
+  directMesh?: MyOwnMeshRpcBridge
   overseer?: OverseerConfig
   overseerCwd?: string
 }
@@ -518,7 +521,7 @@ export function persistPrefs(
 }
 
 export function startServer(opts: ServerOptions): http.Server {
-  const { port, defaultCwd, profilesDir, profileNames = {}, journal, sessions, profiles, approvals, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity, deviceExecutor, remoteDevices } = opts
+  const { port, defaultCwd, profilesDir, profileNames = {}, journal, sessions, profiles, approvals, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity, deviceExecutor, remoteDevices, directMesh } = opts
   const overseer = opts.overseer ?? {}
   const overseerCwd = opts.overseerCwd ?? defaultCwd
   const replayPrincipalBudget = new ReplayPrincipalBudget()
@@ -552,6 +555,93 @@ export function startServer(opts: ServerOptions): http.Server {
       github.start(repository, distro ? { kind: 'wsl', distro } : { kind: 'local' }),
     githubCloneStatus: (jobId) => github.job(jobId),
     issuePairingCode: () => pairingCodes.issue(),
+  })
+
+  // Preferred cross-hub control plane: authenticated MyOwnMesh RPC, not a mapped localhost Site.
+  // Pairing is the only unauthenticated envelope, and it is still bound to the cryptographic mesh peer
+  // plus the target hub's short-lived one-use code. Success exchanges both hub capabilities so the
+  // relationship is reciprocal in one operator action. Every later operation is HMAC-authenticated too.
+  directMesh?.setHandler(async ({ from, payload }) => {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('direct hub request is malformed')
+    const request = payload as Record<string, unknown>
+    if (request.kind === 'pair_exchange') {
+      if (!remoteDevices) throw new Error('remote device controller unavailable')
+      const source = request.source && typeof request.source === 'object' && !Array.isArray(request.source)
+        ? request.source as Record<string, unknown>
+        : {}
+      const sourceSiteId = str(source.siteId)
+      const sourceLabel = str(source.label)
+      const sourceToken = str(source.token)
+      const code = str(request.code)
+      if (!sourceSiteId || !sourceLabel || !sourceToken || !code) throw new Error('pair exchange is incomplete')
+      if (
+        request.version !== 1 ||
+        sourceSiteId.length > 256 ||
+        sourceLabel.length > 200 ||
+        /[\u0000-\u001f\u007f]/u.test(sourceLabel) ||
+        sourceToken.length < 32 ||
+        sourceToken.length > 512
+      ) {
+        throw new Error('pair exchange identity is malformed')
+      }
+      if (sourceSiteId.split('-', 1)[0]!.toLowerCase() !== from.split('-', 1)[0]!.toLowerCase()) {
+        throw new Error('pair exchange source does not match the authenticated mesh peer')
+      }
+      const redeemed = pairingCodes.redeem(code)
+      if (!redeemed.ok) throw new Error('pairing code is invalid, expired, or already used')
+      const identity = await directMesh.identity()
+      if (!identity) throw new Error('target hub could not resolve its MyOwnMesh identity')
+      remoteDevices.saveConnection({ siteId: sourceSiteId, label: sourceLabel, token: sourceToken })
+      journal.append(null, 'fleet/connection-paired', {
+        siteId: sourceSiteId,
+        label: sourceLabel,
+        transport: 'myownmesh-rpc',
+        reciprocal: true,
+      })
+      return { siteId: identity.siteId, label: identity.label, token: redeemed.token }
+    }
+    if (request.kind !== 'authenticated' || !remoteDevices) throw new Error('direct hub request is unsupported')
+    const envelope = remoteDevices.verifyDirectEnvelope(request.envelope, from)
+    if (envelope.operation === 'device_capabilities') {
+      if (!deviceExecutor) throw new Error('device executor unavailable')
+      return deviceExecutor.capabilities()
+    }
+    if (envelope.operation === 'device_action') {
+      if (!deviceExecutor) throw new Error('device executor unavailable')
+      const content = envelope.payload && typeof envelope.payload === 'object' && !Array.isArray(envelope.payload)
+        ? envelope.payload as Record<string, unknown>
+        : {}
+      if (!content.action || typeof content.action !== 'object' || Array.isArray(content.action)) {
+        throw new Error('action must be an object')
+      }
+      const action = content.action as RemoteDeviceAction
+      if (!['probe', 'inspect', 'list', 'read', 'write', 'exec'].includes(action.op)) throw new Error('unknown remote device operation')
+      const result = await deviceExecutor.execute(action)
+      journal.append(null, 'device-executor/action', {
+        op: action.op,
+        rootId: (str(action.rootId) ?? '').slice(0, 128),
+        sourceSiteId: envelope.sourceSiteId,
+        transport: 'myownmesh-rpc',
+        ok: result.ok,
+        error: result.error,
+        bytes: result.bytes,
+        exitCode: result.exitCode,
+        timedOut: result.timedOut,
+        truncated: result.truncated,
+      })
+      return result
+    }
+    const content = envelope.payload && typeof envelope.payload === 'object' && !Array.isArray(envelope.payload)
+      ? envelope.payload as Record<string, unknown>
+      : {}
+    if (content.probe === true) return { overseerAvailable: sessions.overseerPeerStatus().available }
+    return sessions.receiveRemoteOverseerMessage({
+      sourceSiteId: envelope.sourceSiteId,
+      sourceLabel: envelope.sourceLabel,
+      messageId: envelope.messageId,
+      subject: str(content.subject),
+      body: str(content.body) ?? '',
+    })
   })
 
   async function resolveProjectPath(rawPath: string, distro?: string): Promise<WorkspacePath> {
@@ -1501,6 +1591,25 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, pairingCodes.issue())
         return
       }
+      if (method === 'POST' && url.pathname === '/api/fleet/pair-direct') {
+        if (!remoteDevices || !directMesh || !mesh.status().enabled) {
+          json(res, { error: 'direct mesh pairing is unavailable or disabled' }, 503)
+          return
+        }
+        const body = await readBody(req)
+        const siteId = str(body.siteId)
+        const code = str(body.code)
+        if (!siteId || !code) { json(res, { error: 'siteId and code are required' }, 400); return }
+        const paired = await remoteDevices.pairDirect(siteId, code)
+        journal.append(null, 'fleet/connection-paired', {
+          siteId: paired.siteId,
+          label: paired.label,
+          transport: 'myownmesh-rpc',
+          reciprocal: true,
+        })
+        json(res, paired)
+        return
+      }
       if (method === 'POST' && url.pathname === '/api/device-token/reveal') {
         json(res, { token: deviceToken })
         return
@@ -1512,6 +1621,7 @@ export function startServer(opts: ServerOptions): http.Server {
       // Fail-soft + fast with no node/no peers; gated by requireToken like every /api/* route.
       if (method === 'GET' && url.pathname === '/api/fleet') {
         const m = mesh.status()
+        const forceRouteRecovery = url.searchParams.get('refresh') === '1'
         const sites = await buildFleet({
           localSiteId: m.siteId,
           localLabel: m.label,
@@ -1519,12 +1629,37 @@ export function startServer(opts: ServerOptions): http.Server {
           roster: () => mesh.ownedRoster(),
           peerSites: () => mesh.peerSites(),
           siteMap: (node, p) => mesh.siteMap(node, p),
-          recoverSiteMap: (node, p) => mesh.recoverSiteMap(node, p),
+          recoverSiteMap: (node, p) => mesh.recoverSiteMap(node, p, forceRouteRecovery ? 0 : 60_000),
           // A fresh route still has to negotiate before its first bytes flow. A short ordinary HTTP
           // timeout falsely marked WAN peers offline while the tunnel was healthy but settling.
           probeHealth: (baseUrl) => probeHubHealth(baseUrl, 5000),
           extraPorts: meshPeerPorts,
         })
+        const directPeers = m.enabled
+          ? await directMesh?.peers(forceRouteRecovery).catch(() => []) ?? []
+          : []
+        for (const peer of directPeers) {
+          const existing = sites.find((site) => !site.local && site.siteId === peer.siteId)
+          if (existing) {
+            existing.directOnline = peer.online
+            existing.directStatus = peer.status
+            if (peer.rttMs !== undefined) existing.directRttMs = peer.rttMs
+            continue
+          }
+          sites.push({
+            siteId: peer.siteId,
+            label: peer.label,
+            local: false,
+            baseUrl: '',
+            online: false,
+            directOnline: peer.online,
+            directStatus: peer.status,
+            ...(peer.rttMs === undefined ? {} : { directRttMs: peer.rttMs }),
+            routeError: peer.online
+              ? 'The site-free MyOwnMesh control channel is live, but this peer has no usable TCP Site route for the unified chat view.'
+              : `MyOwnMesh peer state is ${peer.status}; direct hub control is not active.`,
+          })
+        }
         json(res, sites)
         return
       }
@@ -1630,7 +1765,13 @@ export function startServer(opts: ServerOptions): http.Server {
       // Runtime toggle for exposing the hub as an AllMyStuff site. Registers/deregisters to match.
       if (method === 'POST' && url.pathname === '/api/mesh') {
         const body = await readBody(req)
-        const status = await mesh.setEnabled(body.enable === true)
+        const enabled = body.enable === true
+        const status = await mesh.setEnabled(enabled)
+        if (directMesh) {
+          if (enabled) await directMesh.start()
+          else directMesh.stop()
+          journal.append(null, 'mesh/direct-rpc', directMesh.status())
+        }
         journal.append(null, 'mesh/site', status)
         json(res, status)
         return

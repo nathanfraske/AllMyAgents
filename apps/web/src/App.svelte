@@ -14,6 +14,7 @@
   import { tutorials, type AccountLoginView } from './lib/tutorialState.svelte'
   import Titlebar from './lib/Titlebar.svelte'
   import UpdateBanner from './lib/UpdateBanner.svelte'
+  import PairingCodeInput from './lib/PairingCodeInput.svelte'
   import RecoveryNoticeBanner from './lib/RecoveryNoticeBanner.svelte'
   import { cubicOut } from 'svelte/easing'
   import type { TransitionConfig } from 'svelte/transition'
@@ -539,8 +540,8 @@
     <div class="pair-card">
       <h2>Pair this device</h2>
       <p class="dim">On an already connected device, open <b>Settings → Remote access</b>, create a pairing code, and enter it here.</p>
-      <input placeholder="XXXX-XXXX pairing code" autocomplete="one-time-code" bind:value={pairToken} onkeydown={(e) => { if (e.key === 'Enter') doPair() }} />
-      <button class="pair-btn" onclick={doPair} disabled={!pairToken.trim()}>Pair device</button>
+      <PairingCodeInput bind:value={pairToken} onenter={doPair} />
+      <button class="pair-btn" onclick={doPair} disabled={pairToken.replace(/-/gu, '').length !== 8}>Pair device</button>
     </div>
   </div>
 {/if}
@@ -599,7 +600,6 @@
   .pair-card { width: min(420px, 90vw); background: var(--surface); border: 1px solid var(--border-strong); border-radius: 14px; padding: 1.5rem; display: flex; flex-direction: column; gap: 0.8rem; box-shadow: var(--shadow-4, 0 24px 70px rgba(0,0,0,0.6)); }
   .pair-card h2 { margin: 0; font-size: 1.1rem; }
   .pair-card p { font-size: 0.82rem; line-height: 1.5; margin: 0; }
-  .pair-card input { width: 100%; font-family: var(--mono); }
   .pair-btn { align-self: flex-start; background: var(--accent); color: #fff; border-radius: 8px; padding: 0.45rem 0.9rem; font-weight: 500; }
   .pair-btn:disabled { opacity: 0.5; cursor: default; }
   .handle, .pane-handle, .row-handle { background: transparent; flex: none; }

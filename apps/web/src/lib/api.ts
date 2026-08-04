@@ -867,6 +867,10 @@ export interface FleetSite {
   local: boolean
   baseUrl: string
   online: boolean
+  routeError?: string
+  directOnline?: boolean
+  directStatus?: string
+  directRttMs?: number
   /** Client-derived credential state; never supplied by the fleet directory itself. */
   authState?: 'paired' | 'pairing-required' | 'error'
   authError?: string
@@ -1181,7 +1185,13 @@ export const api = {
   githubClone: (id: string) => jget<GitHubCloneJob>(`/api/github/clones/${encodeURIComponent(id)}`),
   // --- Unified fleet view ---
   // The fleet roster: this hub + every reachable co-owned peer's hub, badged by machine.
-  fleet: () => jget<FleetSite[]>('/api/fleet'),
+  fleet: (forceRouteRecovery = false) =>
+    jget<FleetSite[]>(forceRouteRecovery ? '/api/fleet?refresh=1' : '/api/fleet'),
+  pairFleetSiteDirect: (siteId: string, code: string) =>
+    jpost<{ siteId?: string; label?: string; token?: string; paired?: boolean; error?: string }>(
+      '/api/fleet/pair-direct',
+      { siteId, code },
+    ),
   // Authenticate, bootstrap, and refresh an arbitrary mapped fleet hub with its own paired token.
   authFrom: (site: FleetSite) =>
     jget<{ requireToken: boolean; authed: boolean }>('/api/auth', site.baseUrl, undefined, getFleetSiteToken(site.siteId)),

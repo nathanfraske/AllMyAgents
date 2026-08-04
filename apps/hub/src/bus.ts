@@ -45,6 +45,8 @@ export class AgentBus {
   private readonly pendingCountsStmt: Database.Statement
   private readonly inboxStmt: Database.Statement
   private readonly getStmt: Database.Statement
+  private readonly claimExternalStmt: Database.Statement
+  private readonly pruneExternalStmt: Database.Statement
 
   constructor(db: Database.Database) {
     this.db = db
@@ -59,6 +61,12 @@ export class AgentBus {
     // The session list polls constantly. Keep its one grouped count proportional to PENDING mail, not to
     // every bus row ever written; delivered messages never enter this partial index.
     db.exec('CREATE INDEX IF NOT EXISTS idx_bus_pending_to ON bus_messages (toSession) WHERE delivered = 0')
+    db.exec(
+      `CREATE TABLE IF NOT EXISTS bus_external_receipts (
+        receiptKey TEXT PRIMARY KEY,
+        receivedAt TEXT NOT NULL
+      )`
+    )
     this.insertStmt = db.prepare(
       `INSERT INTO bus_messages (id, groupId, ts, fromSession, fromProfile, fromLabel, project, toKind, toId, toSession, subject, body)
        VALUES (@id, @groupId, @ts, @fromSession, @fromProfile, @fromLabel, @project, @toKind, @toId, @toSession, @subject, @body)`
@@ -69,20 +77,27 @@ export class AgentBus {
     )
     this.inboxStmt = db.prepare('SELECT * FROM bus_messages WHERE toSession = ? ORDER BY ts DESC LIMIT ?')
     this.getStmt = db.prepare('SELECT * FROM bus_messages WHERE id = ?')
+    this.claimExternalStmt = db.prepare(
+      'INSERT OR IGNORE INTO bus_external_receipts (receiptKey, receivedAt) VALUES (?, ?)'
+    )
+    this.pruneExternalStmt = db.prepare(
+      `DELETE FROM bus_external_receipts WHERE receiptKey IN (
+        SELECT receiptKey FROM bus_external_receipts ORDER BY receivedAt DESC LIMIT -1 OFFSET 10000
+      )`
+    )
   }
 
-  /** Fan a message out to a resolved set of recipient session ids. Returns the stored messages. */
-  post(input: {
+  private rowsFor(input: {
     from: SessionIdentity
     project: string | null
     to: BusAddress
     subject?: string
     body: string
     recipients: string[]
-  }): BusMessage[] {
+  }): InsertRow[] {
     const groupId = crypto.randomUUID()
     const ts = new Date().toISOString()
-    const rows: InsertRow[] = input.recipients.map((rid) => ({
+    return input.recipients.map((rid) => ({
       id: crypto.randomUUID(),
       groupId,
       ts,
@@ -96,11 +111,51 @@ export class AgentBus {
       subject: input.subject ?? null,
       body: input.body,
     }))
+  }
+
+  /** Fan a message out to a resolved set of recipient session ids. Returns the stored messages. */
+  post(input: {
+    from: SessionIdentity
+    project: string | null
+    to: BusAddress
+    subject?: string
+    body: string
+    recipients: string[]
+  }): BusMessage[] {
+    const rows = this.rowsFor(input)
     const insertMany = this.db.transaction((rs: InsertRow[]) => {
       for (const r of rs) this.insertStmt.run(r)
     })
     insertMany(rows)
     return rows.map((r) => ({ ...r, delivered: false, readAt: null }))
+  }
+
+  /**
+   * Atomically accept an authenticated external message exactly once and fan it into the ordinary bus.
+   * A process crash cannot leave a claimed receipt without its message (or vice versa), and the bounded
+   * receipt table makes a network retry harmless without becoming another unbounded journal.
+   */
+  postExternal(input: {
+    receiptKey: string
+    from: SessionIdentity
+    project: string | null
+    to: BusAddress
+    subject?: string
+    body: string
+    recipients: string[]
+  }): { accepted: boolean; messages: BusMessage[] } {
+    const rows = this.rowsFor(input)
+    const accepted = this.db.transaction(() => {
+      const claim = this.claimExternalStmt.run(input.receiptKey, new Date().toISOString())
+      if (claim.changes !== 1) return false
+      for (const row of rows) this.insertStmt.run(row)
+      this.pruneExternalStmt.run()
+      return true
+    })()
+    return {
+      accepted,
+      messages: accepted ? rows.map((row) => ({ ...row, delivered: false, readAt: null })) : [],
+    }
   }
 
   /** Undelivered messages queued for a session (delivery injects them into its next turn). */

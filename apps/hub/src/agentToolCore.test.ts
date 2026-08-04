@@ -255,7 +255,7 @@ describe('peek_agent (read-only teammate activity)', () => {
   it('reports a friendly miss when the target is unknown / cross-project (found:false)', async () => {
     const h = makeHarness({ peek: { found: false } })
     const out = await runAgentTool('peek_agent', { to_session: 'nope' }, { identity: idA, services: h.services })
-    expect(out).toMatch(/No such teammate/)
+    expect(out).toMatch(/No agent is visible/)
   })
 })
 

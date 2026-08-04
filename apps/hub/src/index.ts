@@ -33,6 +33,7 @@ import { WorkspaceManager } from './workspace.js'
 import { WorktreeCollisionDetector } from './worktreeCollisionDetector.js'
 import { WorkspacePressureMonitor } from './workspacePressure.js'
 import { MeshSite } from './meshSite.js'
+import { MyOwnMeshRpcBridge } from './myOwnMeshRpc.js'
 import { getOrCreateDeviceToken } from './deviceToken.js'
 import { InstructionStore } from './instructions.js'
 import { AgentBus } from './bus.js'
@@ -818,6 +819,9 @@ const meshPeerPorts: number[] = Array.isArray(config.mesh?.peerPorts)
 
 const deviceExecutor = new DeviceExecutor(path.join(dataDir, 'device-executor.json'))
 const fleetConnections = new FleetConnectionStore(path.join(dataDir, 'fleet-connections.json'))
+// The Site-free lane is still remote exposure and follows the exact same operator/config switch as Sites.
+// Keep the bridge allocated so a runtime enable can start it, but never register while mesh is disabled.
+const directMesh = new MyOwnMeshRpcBridge()
 const remoteDevices = new RemoteDeviceController(fleetConnections, async (siteId) => {
   const local = mesh.status()
   const fleet = await buildFleet({
@@ -835,14 +839,27 @@ const remoteDevices = new RemoteDeviceController(fleetConnections, async (siteId
   return route
     ? { siteId: route.siteId, label: route.label, baseUrl: route.baseUrl, online: route.online }
     : null
-})
+}, { bridge: directMesh, localDeviceToken: deviceToken, enabled: () => mesh.status().enabled })
 sessions.setRemoteDeviceController(remoteDevices)
 
 // Listen on the BOOT port (0 → ephemeral for a green); the server reports its actual port back.
-const server = startServer({ port: bootPort, defaultCwd: dataDir, profilesDir, profileNames, profileOwnership, profileLoginCoordinator, journal, sessions, profiles, approvals, questions, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity: (projectId) => worktreeCollisions.projectActivity(projectId), deviceExecutor, remoteDevices, overseer, overseerCwd: repoRoot })
+const server = startServer({ port: bootPort, defaultCwd: dataDir, profilesDir, profileNames, profileOwnership, profileLoginCoordinator, journal, sessions, profiles, approvals, questions, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity: (projectId) => worktreeCollisions.projectActivity(projectId), deviceExecutor, remoteDevices, directMesh, overseer, overseerCwd: repoRoot })
 
 // Register the mesh advert — factored so a promoted green can (re)register once it owns the port.
 function registerMesh(): void {
+  if (mesh.status().enabled) void directMesh.start().then(() => {
+    const status = directMesh.status()
+    if (status.available) {
+      console.log(`[mesh] direct hub RPC active on ${status.networkId ?? 'unknown fleet'}`)
+    } else {
+      console.log('[mesh] direct hub RPC is not active yet — background discovery will keep retrying')
+    }
+    journal.append(null, 'mesh/direct-rpc', status)
+  }).catch((error) => {
+    const message = error instanceof Error ? error.message : String(error)
+    console.log(`[mesh] direct hub RPC unavailable — ${message}`)
+    journal.append(null, 'mesh/direct-rpc', { available: false, error: message })
+  })
   void mesh.register().then((s) => {
     if (s.exposed) console.log(`[mesh] exposed as site "${s.label}" (${s.siteId}) — fleet peers open ${s.peerUrl}`)
     else if (s.enabled && s.nodePresent) console.log(`[mesh] node present but not exposed — ${s.error ?? 'unknown'}`)
@@ -936,6 +953,9 @@ if (supervised && process.send) {
       worktreeCollisions.start()
       workspacePressure.start()
     },
+    // The direct RPC method is process-local. Release it only once BLUE has actually surrendered the
+    // public listener, so GREEN can register the stable method without two hub generations competing.
+    onDrained: () => directMesh.stop(),
     stopJournalBackups: () => journalBackups.stop(),
     profileRuntime,
     // §8.4: drain() signals the worker to hold relays before blue's socket drops; abort() un-drains a
@@ -961,17 +981,23 @@ if (supervised && process.send) {
         void controller.retire()
         break
       case 'restart-aborted':
-        void controller.abort(msg.error, msg.profilePublicEpoch).catch((error: unknown) => {
-          const message = error instanceof Error ? error.message : String(error)
-          restartState.rollbackRebinding = false
-          restartState.draining = true
-          restartState.journalBackupRequired = true
-          restartState.journalBackup = {
-            status: 'degraded',
-            error: `rollback transition failed: ${message}`,
-          }
-          send({ type: 'rollback-failed', error: message })
-        })
+        void controller
+          .abort(msg.error, msg.profilePublicEpoch)
+          .then(() => {
+            // A drained BLUE that reclaims the public listener must reclaim its RPC method too.
+            if (!restartState.draining && mesh.status().enabled) void directMesh.start()
+          })
+          .catch((error: unknown) => {
+            const message = error instanceof Error ? error.message : String(error)
+            restartState.rollbackRebinding = false
+            restartState.draining = true
+            restartState.journalBackupRequired = true
+            restartState.journalBackup = {
+              status: 'degraded',
+              error: `rollback transition failed: ${message}`,
+            }
+            send({ type: 'rollback-failed', error: message })
+          })
         break
       case 'journal-backup-control':
         void journalBackups
@@ -1041,6 +1067,7 @@ function shutdown(signal: string): void {
   // race the guard above; sessions.shutdown() dispatches the codex kills synchronously so they
   // land even if the guard fires first.
   mesh.stopAutoRegister()
+  directMesh.stop()
   void Promise.allSettled([journalBackups.stop(), mesh.deregister(), sessions.shutdown()]).finally(() => {
     if (!supervised) profileOwnership.releaseAll()
     clearTimeout(guard)

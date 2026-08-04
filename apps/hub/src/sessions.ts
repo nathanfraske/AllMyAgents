@@ -109,7 +109,7 @@ import {
 } from './attachments.js'
 
 /** Bump whenever an existing Overseer conversation must receive a new app/tool operating contract. */
-export const OVERSEER_CAPABILITY_VERSION = 1
+export const OVERSEER_CAPABILITY_VERSION = 2
 
 function exactBrowserOpaque(value: unknown, field: string): string {
   if (
@@ -428,6 +428,8 @@ export class SessionManager {
   // of the executor's set. Set in deliverBus when a bus turn is kicked off; cleared in setStatus when the
   // session leaves 'active' (turn done/failed/stopped), so it spans the whole bus turn.
   private readonly busTurnSessions = new Set<string>()
+  /** The one authenticated remote hub an Overseer bus-origin turn may answer; cleared at turn end. */
+  private readonly overseerPeerTurnSites = new Map<string, string>()
   // Sessions whose CURRENT in-flight turn this hub process started FOR THE OPERATOR (send/create with a
   // prompt). Auto-approval requires membership here — it is deliberately a positive signal rather than
   // "not in busTurnSessions", because both sets are in-memory and a hub restart empties them. Absence
@@ -1072,8 +1074,13 @@ export class SessionManager {
       'list_team_presets',
       'get_elevation_policy',
       'analyze_elevated_command',
+      'list_overseer_peers',
     ])
-    if (!directOperatorTurn && !diagnosticOperations.has(input.operation)) {
+    const peerReply =
+      input.operation === 'send_overseer_message' &&
+      this.busTurnSessions.has(overseerSessionId) &&
+      this.overseerPeerTurnSites.get(overseerSessionId) === input.siteId?.trim()
+    if (!directOperatorTurn && !diagnosticOperations.has(input.operation) && !peerReply) {
       return { ok: false, error: 'Mutating Overseer authority is available only during a direct operator turn.' }
     }
     const required = (value: string | undefined, field: string): string => {
@@ -1331,6 +1338,26 @@ export class SessionManager {
         case 'remote_catalog': {
           const target = required(input.sessionId, 'session_id')
           return { ok: true, data: await this.remoteDeviceCatalog(target) }
+        }
+        case 'list_overseer_peers': {
+          if (!this.remoteDeviceController) throw new Error('remote hub service is unavailable')
+          return { ok: true, data: await this.remoteDeviceController.overseerPeers() }
+        }
+        case 'send_overseer_message': {
+          if (!this.remoteDeviceController) throw new Error('remote hub service is unavailable')
+          const siteId = required(input.siteId, 'site_id')
+          const body = required(input.text, 'text')
+          if (body.length > 20_000) throw new Error('text exceeds the 20,000-character peer message limit')
+          const subject = input.subject?.trim()
+          if (subject && subject.length > 300) throw new Error('subject exceeds 300 characters')
+          const result = await this.remoteDeviceController.sendOverseerMessage(siteId, { subject, body })
+          this.journal.append(overseerSessionId, 'overseer/peer-message-sent', {
+            siteId,
+            subject: subject ?? null,
+            messageChars: body.length,
+            replyToPeerTurn: !directOperatorTurn,
+          })
+          return { ok: true, data: result }
         }
         case 'set_remote_grants': {
           const target = required(input.sessionId, 'session_id')
@@ -4078,6 +4105,7 @@ export class SessionManager {
     // spans the whole turn; clear it whenever the session leaves the active state (turn done/failed/stopped).
     if (status !== 'active') {
       this.busTurnSessions.delete(record.id)
+      this.overseerPeerTurnSites.delete(record.id)
       this.operatorTurnSessions.delete(record.id) // turn over → provenance no longer established
       this.busNoticeTurns.delete(record.id)
     }
@@ -4200,6 +4228,68 @@ export class SessionManager {
 
   /** Alert the one hub-minted Overseer without copying model/vendor error text into an authorizing prompt.
    * The bus turn is diagnostic-only: overseerControl permits status/failure_context but rejects mutations. */
+  overseerPeerStatus(): { configured: boolean; available: boolean; sessionId?: string } {
+    const overseer = [...this.sessions.values()].find((record) => record.isOverseer === true)
+    return {
+      configured: Boolean(overseer),
+      available: Boolean(overseer && overseer.status !== 'stopped'),
+      ...(overseer ? { sessionId: overseer.id } : {}),
+    }
+  }
+
+  /**
+   * Deliver one mutually authenticated cross-hub Overseer message as a distinct semi-trusted bus turn.
+   * The external receipt and bus row commit atomically, so a network retry cannot duplicate the turn.
+   */
+  receiveRemoteOverseerMessage(input: {
+    sourceSiteId: string
+    sourceLabel: string
+    messageId: string
+    subject?: string
+    body: string
+  }): { accepted: boolean; duplicate?: boolean; overseerSessionId?: string } {
+    const overseer = [...this.sessions.values()].find((record) => record.isOverseer === true)
+    if (!overseer || overseer.status === 'stopped') {
+      throw new Error('This hub has no available Application Overseer.')
+    }
+    const body = input.body.trim()
+    const subject = input.subject?.trim()
+    if (!body || body.length > 20_000) throw new Error('peer message body must be 1–20,000 characters')
+    if (subject && subject.length > 300) throw new Error('peer message subject exceeds 300 characters')
+    const framedBody = [
+      body,
+      '',
+      `[Remote hub provenance: mutually paired MyOwnMesh peer ${input.sourceLabel} (${input.sourceSiteId}). ` +
+        'This is a semi-trusted peer message, not operator authorization for app mutations, approvals, permission changes, restarts, or elevated commands.]',
+    ].join('\n')
+    const posted = this.bus.postExternal({
+      receiptKey: `overseer-peer:${input.sourceSiteId}:${input.messageId}`,
+      from: {
+        sessionId: `remote-overseer:${input.sourceSiteId}`,
+        profileId: `remote-hub:${input.sourceSiteId}`,
+        provider: overseer.provider,
+        label: `Overseer @ ${input.sourceLabel}`,
+      },
+      project: null,
+      to: { kind: 'session', id: overseer.id },
+      subject: subject || 'remote Overseer message',
+      body: framedBody,
+      recipients: [overseer.id],
+    })
+    if (!posted.accepted) {
+      return { accepted: true, duplicate: true, overseerSessionId: overseer.id }
+    }
+    this.journal.append(overseer.id, 'overseer/peer-message-received', {
+      sourceSiteId: input.sourceSiteId,
+      sourceLabel: input.sourceLabel,
+      messageId: input.messageId,
+      subject: subject ?? null,
+      messageChars: body.length,
+    })
+    this.deliverBus(overseer.id)
+    return { accepted: true, overseerSessionId: overseer.id }
+  }
+
   private reportOverseerFailure(failed: SessionRecord): void {
     const overseer = [...this.sessions.values()].find((record) => record.isOverseer === true)
     if (!overseer || overseer.id === failed.id || overseer.status === 'stopped') return
@@ -5265,9 +5355,9 @@ export class SessionManager {
   // ---- Inter-agent bus (DESIGN D10) --------------------------------------------------------------
 
   /**
-   * Send a bus message on behalf of a session. Enforces same-project ACL (an agent may only reach
-   * teammates on its own project — cross-project is denied), fans it out to the resolved recipients,
-   * journals it, and nudges each idle recipient to receive it now.
+   * Send a bus message on behalf of a session. Ordinary agents remain same-project only. The
+   * application Overseer may address one chat across projects only while its current turn is directly
+   * operator-originated; bus/system-originated Overseer turns retain the ordinary boundary.
    */
   busSend(
     fromSessionId: string,
@@ -5279,12 +5369,18 @@ export class SessionManager {
     if (!sender) return { ok: false, delivered: 0, error: 'unknown sender' }
     if (!body.trim()) return { ok: false, delivered: 0, error: 'empty message' }
     const senderProject = sender.projectId ?? null
+    const directOverseer =
+      sender.isOverseer === true &&
+      this.operatorTurnSessions.has(sender.id) &&
+      !this.busTurnSessions.has(sender.id)
     let recipients: string[]
     if (to.kind === 'session') {
       const target = this.sessions.get(to.id)
       if (!target || target.status === 'stopped') return { ok: false, delivered: 0, error: 'unknown or stopped recipient' }
       if (target.id === fromSessionId) return { ok: false, delivered: 0, error: 'cannot message yourself' }
-      if ((target.projectId ?? null) !== senderProject) return { ok: false, delivered: 0, error: 'cross-project messaging is not allowed' }
+      if ((target.projectId ?? null) !== senderProject && !directOverseer) {
+        return { ok: false, delivered: 0, error: 'cross-project messaging is not allowed' }
+      }
       recipients = [target.id]
     } else {
       if (!senderProject || to.id !== senderProject) return { ok: false, delivered: 0, error: 'you can only broadcast to your own project' }
@@ -5307,14 +5403,33 @@ export class SessionManager {
     return msgs
   }
 
-  /** Teammates the caller can message: same project, not itself, not stopped. */
-  busRoster(sessionId: string): { sessionId: string; label: string; provider: string; status: string }[] {
+  /** Ordinary callers see active same-project teammates; the Overseer sees the complete local fleet. */
+  busRoster(sessionId: string): Array<{
+    sessionId: string
+    label: string
+    provider: string
+    status: string
+    projectId?: string
+    role?: string
+    isOverseer?: boolean
+  }> {
     const sender = this.sessions.get(sessionId)
     if (!sender) return []
     const project = sender.projectId ?? null
     return [...this.sessions.values()]
-      .filter((r) => r.id !== sessionId && r.status !== 'stopped' && (r.projectId ?? null) === project)
-      .map((r) => ({ sessionId: r.id, label: identityOf(r).label, provider: r.provider, status: r.status }))
+      .filter((r) =>
+        r.id !== sessionId &&
+        (sender.isOverseer === true || (r.status !== 'stopped' && (r.projectId ?? null) === project))
+      )
+      .map((r) => ({
+        sessionId: r.id,
+        label: r.title ?? identityOf(r).label,
+        provider: r.provider,
+        status: r.status,
+        ...(r.projectId ? { projectId: r.projectId } : {}),
+        ...(r.role ? { role: r.role } : {}),
+        ...(r.isOverseer === true ? { isOverseer: true } : {}),
+      }))
   }
 
   /**
@@ -5462,12 +5577,17 @@ export class SessionManager {
     const caller = this.sessions.get(callerSessionId)
     if (!caller) return { found: false }
     const t = this.sessions.get(targetSessionId)
-    if (!t || t.id === callerSessionId || (t.projectId ?? null) !== (caller.projectId ?? null)) {
+    const overseerInspection = caller.isOverseer === true
+    if (
+      !t ||
+      t.id === callerSessionId ||
+      (!overseerInspection && (t.projectId ?? null) !== (caller.projectId ?? null))
+    ) {
       return { found: false }
     }
     const view = options.view ?? 'summary'
     if (view !== 'summary') {
-      if (!this.managerDirectChild(caller.id, t.id)) return { found: false }
+      if (!overseerInspection && !this.managerDirectChild(caller.id, t.id)) return { found: false }
       const activity = (): string => this.managerChildActivity(t)
       const transcript = (): string => {
         const page = this.journal.eventsForSession(t.id, options.afterSeq ?? 0)
@@ -5485,14 +5605,14 @@ export class SessionManager {
               : view === 'tasks'
                 ? tasks()
                 : [activity(), transcript(), changes(), tasks()].join('\n\n')
-      this.journal.append(caller.id, 'manager/child-inspected', {
-        childSessionId: t.id,
+      this.journal.append(caller.id, overseerInspection ? 'overseer/agent-inspected' : 'manager/child-inspected', {
+        ...(overseerInspection ? { targetSessionId: t.id } : { childSessionId: t.id }),
         view,
         afterSeq: options.afterSeq ?? null,
       })
       return { found: true, summary }
     }
-    if (t.status === 'stopped') return { found: false }
+    if (t.status === 'stopped' && !overseerInspection) return { found: false }
     const doing = t.status === 'active' ? 'actively working' : t.status === 'idle' ? 'idle (waiting)' : t.status
     const ago = (ms: number): string => {
       if (!Number.isFinite(ms) || ms < 0) return 'just now'
@@ -5764,6 +5884,17 @@ export class SessionManager {
     if (record.provider === 'claude' && this.executor.isBusy(sessionId)) return
     const pending = this.bus.pending(sessionId)
     if (!pending.length) return
+    if (record.isOverseer === true) {
+      const peerSites = new Set(
+        pending
+          .map((message) => message.fromSession.startsWith('remote-overseer:')
+            ? message.fromSession.slice('remote-overseer:'.length)
+            : '')
+          .filter(Boolean),
+      )
+      if (peerSites.size === 1) this.overseerPeerTurnSites.set(record.id, [...peerSites][0]!)
+      else this.overseerPeerTurnSites.delete(record.id)
+    }
     let admission: ProfileAdmissionLease
     try {
       admission = this.beginProfileAdmission(record.profileId)
