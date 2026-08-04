@@ -84,6 +84,46 @@ describe('bounded replay checkpoints and journal history', () => {
     }
   })
 
+  it('pages transcript semantics instead of letting streaming deltas hide completed replies', () => {
+    const journal = new Journal(path.join(tmp, 'semantic-history.db'))
+    try {
+      journal.append('s', 'session/input', { text: 'operator prompt' })
+      for (let index = 0; index < 200; index += 1) {
+        journal.append('s', 'codex/item/agentMessage/delta', {
+          itemId: 'reply',
+          delta: `fragment-${index}`,
+        })
+      }
+      journal.append('s', 'codex/item/completed', {
+        item: { id: 'reply', type: 'agentMessage', text: 'durable completed reply' },
+      })
+      // This is the exact live failure shape: a completed commentary item followed by enough noisy
+      // output from the next long-running command to crowd it out of an 80-raw-row history page.
+      for (let index = 0; index < 400; index += 1) {
+        journal.append('s', 'codex/item/commandExecution/outputDelta', {
+          itemId: 'command',
+          delta: `test-output-${index}\n`,
+        })
+      }
+      indexAll(journal)
+
+      const page = journal.sessionHistoryPage('s', { maxRows: 5, maxBytes: 64 * 1024 })
+      expect(page.events.map((event) => event.kind)).toEqual([
+        'session/input',
+        'codex/item/completed',
+      ])
+      expect(page.events[1]?.payload).toEqual(
+        expect.objectContaining({
+          item: expect.objectContaining({ text: 'durable completed reply' }),
+        }),
+      )
+      expect(page.hasOlder).toBe(false)
+      expect(page.olderCursor).toBeNull()
+    } finally {
+      journal.db.close()
+    }
+  })
+
   it('never exceeds the page byte budget and progresses past an individually oversized row', () => {
     const journal = new Journal(path.join(tmp, 'bytes.db'))
     try {

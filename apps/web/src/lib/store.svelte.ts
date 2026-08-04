@@ -766,6 +766,11 @@ export class HubStore {
       const baseline = await api.replayBaseline().catch(() => null)
       if (!baseline) return false
       this.installReplayBaseline(baseline)
+      // A reset replaces every native SessionView, but the pane ids intentionally stay selected. Since
+      // ThreadView does not remount when that id is unchanged, select() cannot re-run ensureHistory for
+      // us. Rehydrate every open pane explicitly so a bounded reconnect never leaves a chat empty or
+      // frozen at its pre-gap cutoff. This is fire-and-forget so history I/O cannot delay the new socket.
+      for (const id of new Set(this.basePanes().flat())) void this.ensureHistory(id)
       return true
     } finally {
       this.baselineRefreshing = false
@@ -2171,7 +2176,7 @@ export class HubStore {
       this.stagedTail.push(message)
       if (!this.isReplayComplete(message)) return
       if (
-        this.pendingEvents.length + this.stagedTail.length > 1_024 ||
+        this.pendingEvents.length + this.stagedTail.length > 5_002 ||
         this.pendingEventBytes + this.stagedTailBytes > 2 * 1024 * 1024
       ) {
         this.ingest({
@@ -2192,10 +2197,20 @@ export class HubStore {
       this.stagedTailBytes = 0
     } else {
       const encodedBytes = utf8Bytes(JSON.stringify(message))
+      // A hidden/background WebView may enqueue thousands of WebSocket message tasks before either
+      // requestAnimationFrame or the 50ms fallback gets a turn. Resetting to a cold baseline here used
+      // to discard the exact assistant messages the operator was waiting for. Drain the already-bounded
+      // live batch synchronously instead: applying at most 1,024 events is finite, preserves FIFO, and
+      // lets the next message continue without turning renderer scheduling pressure into data loss.
       if (
         this.pendingEvents.length >= 1_024 ||
         this.pendingEventBytes + encodedBytes > 2 * 1024 * 1024
       ) {
+        this.flushEvents()
+      }
+      // A single frame cannot reach this in the current server protocol (512 KiB frame ceiling), but
+      // retain a truthful reset if an incompatible future/older hub sends one giant message.
+      if (encodedBytes > 2 * 1024 * 1024) {
         this.ingest({
           type: 'replay-reset-required',
           reason: 'client-queue-overflow',

@@ -5,6 +5,25 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.14-alpha.17 — 2026-08-03
+
+This patch repairs a live transcript cutoff that could leave a foreground chat stranded while the agent,
+hub, and journal continued normally. Paused renderer queues now drain without discarding events, bounded
+reconnects rehydrate every open pane, and journal history pages prioritize durable transcript semantics
+over redundant streaming deltas.
+
+[Full v0.1.14-alpha.17 release notes](docs/releases/v0.1.14-alpha.17.md)
+
+- A background or scheduling-paused WebView no longer converts its 1,025th queued event into a cold
+  baseline reset. It synchronously drains the finite 1,024-event batch and preserves strict FIFO delivery.
+- Required baseline resets now explicitly reload journal history for every selected or split-pane chat,
+  including when the session id stays unchanged and `ThreadView` therefore does not remount.
+- Per-session history paging now selects user messages, completed provider items, errors, bus messages,
+  compaction lifecycle, and other visible semantics before applying the 80-row/512 KiB bounds. Thousands
+  of token, reasoning, or command-output deltas can no longer hide completed replies.
+- The raw journal remains lossless. Semantic filtering applies only to the bounded renderer projection and
+  uses the existing generation-checked SQLite read snapshot and per-session sequence index.
+
 ## v0.1.13-alpha.16 — 2026-08-03
 
 This release turns the Application Overseer into a practical setup, teaching, and recovery assistant;
