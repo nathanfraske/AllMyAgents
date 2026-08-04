@@ -5,6 +5,27 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.15-alpha.18 — 2026-08-04
+
+This patch keeps lazily reached history contiguous with the live end, repairs durable chat activity clocks,
+and upgrades existing Application Overseer conversations onto the current app/tool contract without losing
+their account binding or history.
+
+[Full v0.1.15-alpha.18 release notes](docs/releases/v0.1.15-alpha.18.md)
+
+- After scrolling upward into lazy history, the transcript now retains one continuous reached window through
+  the actual latest reply. The bottom of a historical 120-item slice can no longer masquerade as the live end.
+- Hub-native records now persist activity at provider-neutral status boundaries. Legacy records missing that
+  field recover it from the newest retained transcript item, and relative labels continue aging while idle.
+- Overseer contracts are versioned. The public-owner boot/restart reconciliation upgrades an existing
+  Overseer in place, reasserts Full Access plus its explicit operator override, rewrites the current native
+  instructions/tool manifest, and journals one idempotent capability-upgrade event.
+- The migration remains behind the blue-green ownership fence: a booting green hub only reads the shared
+  roster and cannot rewrite Overseer state until it has won the public listener handoff.
+- The current Overseer control surface includes application guidance and UI highlighting, fleet diagnostics,
+  projects/chats/managers/team presets, approvals and access overrides, model/effort configuration, account
+  login, GitHub clone setup, mesh pairing, remote testbeds, audited elevation, and supervised hub restart.
+
 ## v0.1.14-alpha.17 — 2026-08-03
 
 This patch repairs a live transcript cutoff that could leave a foreground chat stranded while the agent,

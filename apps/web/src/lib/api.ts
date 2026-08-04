@@ -181,6 +181,7 @@ export interface SessionRecord {
   profileId: string
   provider: 'claude' | 'codex'
   isOverseer?: boolean
+  overseerCapabilityVersion?: number
   projectId?: string
   cwd: string
   repo?: string

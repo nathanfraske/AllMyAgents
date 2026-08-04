@@ -1,7 +1,7 @@
-export function relativeTime(iso: string): string {
+export function relativeTime(iso: string, nowMs = Date.now()): string {
   const then = new Date(iso).getTime()
   if (Number.isNaN(then)) return ''
-  const s = Math.max(0, (Date.now() - then) / 1000)
+  const s = Math.max(0, (nowMs - then) / 1000)
   if (s < 8) return 'just now'
   if (s < 60) return `${Math.floor(s)}s ago`
   const m = s / 60

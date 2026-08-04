@@ -31,6 +31,7 @@ function harness() {
   const profileDir = path.join(root, 'profile')
   fs.mkdirSync(profileDir)
   const journal = new Journal(path.join(root, 'hub.db'))
+  const store = new SessionStore(journal.db)
   const approvals = new ApprovalService(journal)
   const profiles: Profile[] = [{ id: 'p1', provider: 'claude', dir: profileDir }]
   const executor: Executor = {
@@ -47,7 +48,7 @@ function harness() {
   const bus = new AgentBus(journal.db)
   const sessions = new SessionManager(
     journal,
-    new SessionStore(journal.db),
+    store,
     new Map(profiles.map((profile) => [profile.id, profile])),
     approvals,
     new UsageMonitor(journal, profiles, {}),
@@ -80,10 +81,55 @@ function harness() {
     journal.db.close()
     fs.rmSync(root, { recursive: true, force: true })
   })
-  return { root, journal, approvals, sessions, executor, bus, seed, markOperator, markBus }
+  return { root, journal, store, approvals, sessions, executor, bus, seed, markOperator, markBus }
 }
 
 describe('application Overseer authority', () => {
+  it('upgrades an existing durable Overseer in place exactly once', () => {
+    const h = harness()
+    h.store.upsert({
+      id: 'legacy-overseer',
+      profileId: 'p1',
+      provider: 'claude',
+      cwd: h.root,
+      status: 'idle',
+      createdAt: '2026-07-01T00:00:00.000Z',
+      isOverseer: true,
+      permissionMode: 'safe',
+    })
+
+    h.sessions.loadRecords()
+    const loadedLegacy = h.store.all().find((record) => record.id === 'legacy-overseer')
+    expect(loadedLegacy).toMatchObject({ permissionMode: 'safe' })
+    expect(loadedLegacy?.overseerCapabilityVersion).toBeUndefined()
+    expect(h.journal.recentEventsForSession('legacy-overseer', 20)).toEqual([])
+
+    h.sessions.reconcileStale()
+
+    expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
+      isOverseer: true,
+      overseerCapabilityVersion: 1,
+      permissionMode: 'full',
+      permissionModeOperatorOverride: true,
+      role: 'Application Overseer',
+    })
+    expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
+      'Overseer capability manifest version 1',
+    )
+    const upgrades = () => h.journal.recentEventsForSession('legacy-overseer', 20)
+      .filter((event) => event.kind === 'overseer/capabilities-upgraded')
+    expect(upgrades()).toHaveLength(1)
+    expect(upgrades()[0]?.payload).toMatchObject({
+      fromVersion: 0,
+      toVersion: 1,
+      conversationPreserved: true,
+      tools: expect.arrayContaining(['overseer_control', 'remote_exec', 'browser_navigate']),
+    })
+
+    h.sessions.reconcileStale()
+    expect(upgrades()).toHaveLength(1)
+  })
+
   it('requires the hub-minted role and direct operator provenance for mutations', async () => {
     const h = harness()
     h.seed({ id: 'ordinary' })

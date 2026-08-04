@@ -28,6 +28,13 @@
   } from './folders'
 
   let filter = $state('')
+  // Relative labels must age even while an idle sidebar receives no other state updates. Previously
+  // "just now"/"3m ago" could remain frozen until an unrelated event happened to rerender the row.
+  let relativeNow = $state(Date.now())
+  $effect(() => {
+    const timer = window.setInterval(() => (relativeNow = Date.now()), 15_000)
+    return () => window.clearInterval(timer)
+  })
   let statusPopover = $state<'hub' | 'journal' | null>(null)
   let statusRegion = $state<HTMLDivElement | null>(null)
   let overseerSessionId = $state<string | null>(null)
@@ -1068,11 +1075,11 @@
                 {#if pending > 0}<span class="pbadge tnum">{pending}</span>{/if}
                 {#if warnOf(s, st)}
                   <span class="rwarn" title={warnTitle(st)} aria-label={warnTitle(st)}><Icon name="alert-triangle" size={12} /></span>
-                  <span class="rtime dim tnum">{relativeTime(s.lastActivity)}</span>
+                  <span class="rtime dim tnum">{relativeTime(s.lastActivity, relativeNow)}</span>
                 {:else if st.key === 'working' || st.key === 'starting'}
                   <span class="rtime rdots" title={st.label} aria-label="working"><i></i><i></i><i></i></span>
                 {:else}
-                  <span class="rtime dim tnum">{relativeTime(s.lastActivity)}</span>
+                  <span class="rtime dim tnum">{relativeTime(s.lastActivity, relativeNow)}</span>
                 {/if}
                 <span class="ractions">
                   <button class="mini" title="rename" onclick={(e) => startRename(e, s)}><Icon name="pencil" size={12} /></button>

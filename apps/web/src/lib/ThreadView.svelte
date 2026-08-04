@@ -409,7 +409,12 @@
     composerOnly && peekItems > 0
       ? tailRenderNodes(renderNodes, peekItems)
       : view?.historyViewingOlder
-        ? renderNodes.slice(0, 120)
+        // Older pages are fetched only when the operator reaches them, and the store retains exactly
+        // those fetched pages. Keep that reached history CONTIGUOUS with the live tail. Rendering only
+        // the first 120 nodes here made the bottom of the scrollbox an artificial cutoff: after one
+        // upward history load, scrolling back down could never reach the latest reply. The normal
+        // unopened-chat path remains a bounded 120-node tail; only explicitly reached history expands.
+        ? renderNodes
         : tailRenderNodes(renderNodes, 120),
   )
   const model = $derived(view?.record.model ?? '')
