@@ -25,6 +25,8 @@ over redundant streaming deltas.
   uses the existing generation-checked SQLite read snapshot and per-session sequence index.
 - The Apple Silicon one-command installer gate now authenticates its GitHub release lookup, eliminating
   false release failures when a shared runner IP has exhausted the anonymous API quota.
+- Windows backup/recovery tests now wait for force-killed supervisor processes to release their compiled
+  fixture before cleanup, and allow measured loaded-machine time for compiled-runtime verification.
 
 ## v0.1.13-alpha.16 — 2026-08-03
 

@@ -852,7 +852,18 @@ async function stopSupervisor(child: ChildProcess): Promise<void> {
     once(child, 'exit'),
     new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
   ])
-  if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill('SIGKILL')
+    // On Windows kill() requests termination but does not synchronously release the executable and its
+    // loaded fixture files. Returning here used to race afterAll's recursive removal of buildRoot/dist,
+    // producing a false ENOTEMPTY release failure while every scenario assertion had passed.
+    if (child.exitCode === null && child.signalCode === null) {
+      await Promise.race([
+        once(child, 'exit'),
+        new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
+      ])
+    }
+  }
 }
 
 function expectFreshPreflightAttempts(stateDir: string, minimum: number): void {
@@ -873,7 +884,7 @@ function expectFreshPreflightAttempts(stateDir: string, minimum: number): void {
 
 beforeAll(async () => {
   await compileHubFixture()
-}, 30_000)
+}, 60_000)
 
 afterEach(async () => {
   await Promise.all(supervisors.splice(0).map(stopSupervisor))
@@ -885,7 +896,7 @@ afterEach(async () => {
 
 afterAll(() => {
   if (buildRoot) {
-    fs.rmSync(buildRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 })
+    fs.rmSync(buildRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 })
   }
 })
 

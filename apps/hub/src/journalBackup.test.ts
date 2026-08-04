@@ -450,7 +450,7 @@ describe('journal snapshots', () => {
     expect(copy.pragma('quick_check')).toEqual([{ quick_check: 'ok' }])
     expect(copy.prepare('SELECT COUNT(*) AS n FROM events').get()).toEqual({ n: 3 })
     copy.close()
-  }, 30_000)
+  }, 60_000)
 
   it('snapshots a LIVE journal that is still being written', async () => {
     // The failure this guards against is a plain file copy of a database mid-write, which captures a torn
