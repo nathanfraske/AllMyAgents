@@ -12,6 +12,7 @@ import { MemoryStore } from './memory.js'
 import { PracticeStore } from './practices.js'
 import { ProjectStore } from './projects.js'
 import { QuestionService } from './questions.js'
+import type { RemoteDeviceController } from './remoteDevices.js'
 import { SessionManager } from './sessions.js'
 import { SessionStore } from './store.js'
 import type { Profile, SessionRecord } from './types.js'
@@ -36,7 +37,7 @@ function harness() {
   const profiles: Profile[] = [{ id: 'p1', provider: 'claude', dir: profileDir }]
   const executor: Executor = {
     startThread: async () => 'unused',
-    runTurn: async () => {},
+    runTurn: vi.fn(async () => {}),
     steer: vi.fn(async () => {}),
     interrupt: async () => {},
     stopSession: async () => {},
@@ -108,20 +109,20 @@ describe('application Overseer authority', () => {
 
     expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
       isOverseer: true,
-      overseerCapabilityVersion: 1,
+      overseerCapabilityVersion: 2,
       permissionMode: 'full',
       permissionModeOperatorOverride: true,
       role: 'Application Overseer',
     })
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
-      'Overseer capability manifest version 1',
+      'Overseer capability manifest version 2',
     )
     const upgrades = () => h.journal.recentEventsForSession('legacy-overseer', 20)
       .filter((event) => event.kind === 'overseer/capabilities-upgraded')
     expect(upgrades()).toHaveLength(1)
     expect(upgrades()[0]?.payload).toMatchObject({
       fromVersion: 0,
-      toVersion: 1,
+      toVersion: 2,
       conversationPreserved: true,
       tools: expect.arrayContaining(['overseer_control', 'remote_exec', 'browser_navigate']),
     })
@@ -149,6 +150,87 @@ describe('application Overseer authority', () => {
     await expect(h.sessions.overseerControl('overseer', {
       operation: 'set_mode', sessionId: 'ordinary', permissionMode: 'full',
     })).resolves.toMatchObject({ ok: false })
+  })
+
+  it('gives the Overseer a complete read-only fleet view without widening ordinary agent ACLs', () => {
+    const h = harness()
+    h.seed({ id: 'overseer', title: 'Overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'project-a-agent', title: 'Ada', projectId: 'project-a', role: 'Reviewer' })
+    h.seed({ id: 'project-b-agent', title: 'Turing', projectId: 'project-b', status: 'stopped' })
+    h.seed({ id: 'project-a-peer', title: 'Hopper', projectId: 'project-a' })
+
+    expect(h.sessions.busRoster('overseer')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sessionId: 'project-a-agent', label: 'Ada', projectId: 'project-a', role: 'Reviewer' }),
+      expect.objectContaining({ sessionId: 'project-b-agent', label: 'Turing', projectId: 'project-b', status: 'stopped' }),
+    ]))
+    expect(h.sessions.busRoster('project-a-agent').map((record) => record.sessionId)).toEqual(['project-a-peer'])
+
+    expect(h.sessions.busPeek('overseer', 'project-b-agent', { view: 'activity' })).toMatchObject({
+      found: true,
+      summary: expect.stringContaining('project-b-agent'),
+    })
+    expect(h.sessions.busPeek('project-a-agent', 'project-b-agent', { view: 'summary' })).toEqual({ found: false })
+    expect(h.journal.recentEventsForSession('overseer', 20)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'overseer/agent-inspected',
+        payload: expect.objectContaining({ targetSessionId: 'project-b-agent', view: 'activity' }),
+      }),
+    ]))
+  })
+
+  it('allows only a direct operator-origin Overseer turn to message across projects', () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'target', projectId: 'project-b', status: 'active' })
+
+    expect(h.sessions.busSend('overseer', { kind: 'session', id: 'target' }, 'check', 'Before operator')).toMatchObject({
+      ok: false,
+      error: 'cross-project messaging is not allowed',
+    })
+    h.markOperator('overseer')
+    expect(h.sessions.busSend('overseer', { kind: 'session', id: 'target' }, 'check', 'Operator request')).toEqual({
+      ok: true,
+      delivered: 1,
+    })
+    h.markBus('overseer')
+    expect(h.sessions.busSend('overseer', { kind: 'session', id: 'target' }, 'check', 'Peer request')).toMatchObject({
+      ok: false,
+      error: 'cross-project messaging is not allowed',
+    })
+  })
+
+  it('deduplicates authenticated peer messages and permits a bus turn to reply only to its source hub', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, overseerCapabilityVersion: 2, permissionMode: 'full' })
+    const sendOverseerMessage = vi.fn(async () => ({ accepted: true }))
+    h.sessions.setRemoteDeviceController({
+      sendOverseerMessage,
+    } as unknown as RemoteDeviceController)
+    const input = {
+      sourceSiteId: 'peerhub',
+      sourceLabel: 'Peer Hub',
+      messageId: 'cc8be0e3-f389-4be9-a140-8d102d67271e',
+      subject: 'status',
+      body: 'Please compare the release state.',
+    }
+
+    expect(h.sessions.receiveRemoteOverseerMessage(input)).toMatchObject({
+      accepted: true, overseerSessionId: 'overseer',
+    })
+    expect(h.sessions.receiveRemoteOverseerMessage(input)).toMatchObject({
+      accepted: true, duplicate: true, overseerSessionId: 'overseer',
+    })
+    expect(h.executor.runTurn).toHaveBeenCalledTimes(1)
+    expect(h.bus.inbox('overseer')).toHaveLength(1)
+    expect(h.bus.inbox('overseer')[0]?.body).toContain('semi-trusted peer message')
+
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'send_overseer_message', siteId: 'different-peer', text: 'not allowed',
+    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/direct operator turn/u) })
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'send_overseer_message', siteId: 'peerhub', text: 'reply',
+    })).resolves.toMatchObject({ ok: true })
+    expect(sendOverseerMessage).toHaveBeenCalledOnce()
   })
 
   it('provides a provider-neutral app guide without requiring mutating authority', async () => {

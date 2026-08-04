@@ -71,6 +71,8 @@ describe('RestartController journal backup ownership', () => {
     const publicPort = await listenEphemeral(server)
     const sent: unknown[] = []
     const deps = controllerDeps(server, publicPort, sent)
+    const onDrained = vi.fn()
+    deps.onDrained = onDrained
     const deactivatePublicOwnerForRestart = vi.fn(() => {
       throw new Error('SQLITE_FULL while terminalizing questions')
     })
@@ -86,6 +88,7 @@ describe('RestartController journal backup ownership', () => {
     expect(deps.profileRuntime.resumeLoginAdmission).toHaveBeenCalledOnce()
     expect(signalDraining).not.toHaveBeenCalled()
     expect(server.listening).toBe(true)
+    expect(onDrained).not.toHaveBeenCalled()
     expect(deps.state.draining).toBe(false)
     expect(sent).toEqual([])
   })
@@ -95,6 +98,8 @@ describe('RestartController journal backup ownership', () => {
     const publicPort = await listenEphemeral(server)
     const sent: unknown[] = []
     const deps = controllerDeps(server, publicPort, sent)
+    const onDrained = vi.fn(() => expect(server.listening).toBe(false))
+    deps.onDrained = onDrained
     const freeze = vi.fn()
     deps.sessions.setRestartTurnAdmissionFrozen = freeze
     const interrupted = [
@@ -126,6 +131,7 @@ describe('RestartController journal backup ownership', () => {
       interrupted,
       new Set(['s1'])
     )
+    expect(onDrained).toHaveBeenCalledOnce()
     expect(sent).toEqual([
       {
         type: 'released',

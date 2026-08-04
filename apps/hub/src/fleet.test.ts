@@ -91,7 +91,14 @@ describe('buildFleet (unified-across-mesh roster, first cut)', () => {
         probeHealth: async () => false, // mapped a port, but no hub answered
       })
     )
-    expect(out[1]).toEqual({ siteId: 'nodeC', label: 'Media box', local: false, baseUrl: 'http://localhost:43000', online: false })
+    expect(out[1]).toEqual({
+      siteId: 'nodeC',
+      label: 'Media box',
+      local: false,
+      baseUrl: 'http://localhost:43000',
+      online: false,
+      routeError: expect.stringMatching(/advertises an AllMyAgents hub.*health did not answer/u),
+    })
   })
 
   it('falls back to a short node-id label when the member label is empty', async () => {

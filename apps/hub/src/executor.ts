@@ -183,7 +183,15 @@ export interface InProcessExecutorHubHooks {
   onCodexExit(profileId: string, payload: unknown): void
   busSend(fromSessionId: string, to: BusAddress, subject: string | undefined, body: string): { ok: boolean; delivered: number; error?: string }
   busInbox(sessionId: string): BusMessage[]
-  busRoster(sessionId: string): { sessionId: string; label: string; provider: string; status: string }[]
+  busRoster(sessionId: string): Array<{
+    sessionId: string
+    label: string
+    provider: string
+    status: string
+    projectId?: string
+    role?: string
+    isOverseer?: boolean
+  }>
   busPeek(
     callerSessionId: string,
     targetSessionId: string,

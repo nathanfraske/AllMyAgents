@@ -1,8 +1,9 @@
 # Remote device testbeds
 
 Remote testbeds let an agent on one AllMyAgents hub use explicitly approved files or a terminal on another
-authorized fleet machine. Execution stays on the target machine and rides the existing AllMyStuff site
-mapping; file contents and command results return through the two hubs.
+authorized fleet machine. Execution stays on the target machine. The preferred transport is AllMyStuff's
+authenticated application RPC lane, which needs no exposed TCP Site or second hub port; upgraded hubs retain
+the mapped Site/HTTP route only as a compatibility fallback.
 
 ## Operator flow
 
@@ -10,9 +11,11 @@ mapping; file contents and command results return through the two hubs.
    testbed**.
 2. Add one or more local folders. Enable `read`, `write`, and/or `terminal` separately for each folder and
    save. The safe default is disabled with no roots.
-3. Pair the target hub from the controlling hub's Remote access settings using that target's device token.
-   The browser keeps its normal fleet credential, and the controlling hub stores a private copy for
-   server-to-server testbed calls. The token is never returned by the connection API or an agent tool.
+3. Create a short-lived one-use pairing code on either hub and enter its eight characters in the other
+   hub's Remote access settings. Pairing is bound to the authenticated mesh peer identity and exchanges the
+   two hub capabilities reciprocally, so one operator action pairs both directions. Long device tokens remain
+   available only for compatibility with an older peer and are never returned by a connection-list API or
+   agent tool.
 4. In a chat, open **Devices**, select the exact target roots and operations, and save. This is a durable
    per-chat operator grant. Fleet pairing and the chat's Safe/Edits/Full mode do not imply it.
 5. The agent can discover only its granted device/root labels and opaque IDs, then use:
@@ -24,7 +27,9 @@ removing a root capability also fails closed immediately, even if a source chat 
 
 ## Security boundary
 
-- Every target route remains protected by the target hub's device token.
+- Every direct request is bound to the cryptographically authenticated MyOwnMesh peer and HMAC-authenticated
+  again with the paired source hub's device capability. Envelopes include a protocol version, random message
+  id, and a five-minute timestamp window.
 - Source credentials live in `fleet-connections.json` under the hub data directory with private file mode;
   public APIs expose only site label, id, and pairing time.
 - The target policy stores canonical real paths. File paths must be relative, lexical escapes are refused,
@@ -83,6 +88,10 @@ Failures are classified as pairing, route, transport, timeout, protocol, or targ
 agent distinguish an unpaired device or offline route from a slow target, rejected path, command failure,
 or malformed response. Target timing is retained even when the target rejects an action. These are
 application-level measurements through the paired hub route, not ICMP measurements.
+
+Once an action has selected the direct lane, an ambiguous transport failure is returned to the caller and is
+not repeated over the HTTP compatibility route. This prevents a write or shell command that may already have
+run on the target from being executed twice.
 
 ## Platform and topology
 

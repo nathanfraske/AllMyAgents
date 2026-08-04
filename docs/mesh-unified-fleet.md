@@ -15,6 +15,14 @@ Confidence tags: **CONFIRMED-FROM-SOURCE** (read the code) / **INFERENCE** / **N
 > design history. A browser running on a different physical device still needs the local-hub gateway
 > described in `cross-machine-bridges.md`, because a mapping's `localhost:<port>` belongs to the hub PC.
 
+> **Transport update â€” 2026-08-04.** Pairing, remote file/terminal/WSL testbeds, route telemetry, and
+> authenticated Overseer-to-Overseer messages now prefer MyOwnMesh's generic application RPC lane. This
+> needs no Site mapping and no second TCP port: the hub registers `allmyagents.hub.v1` on its existing local
+> daemon event connection, and outgoing calls use the daemon's authenticated peer route. Site HTTP/WebSocket
+> remains a compatibility path and still carries the unified remote-chat stream in this release. The Remote
+> access panel reports those two states independently instead of collapsing a healthy direct channel into
+> "mesh route offline."
+
 ---
 
 ## TL;DR verdict

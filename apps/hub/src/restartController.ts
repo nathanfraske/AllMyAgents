@@ -38,6 +38,8 @@ export interface RestartControllerDeps {
   publicPort: number //           the fixed public port (7777) — green promotes to it; blue re-claims it on rollback
   send: (msg: unknown) => void // process.send, bound
   onPromoted: () => void //       start deferred services (usage polling + mesh) once we own the port
+  /** Stop process-local public transports after BLUE has actually released the listener. */
+  onDrained?: () => void
   // Defense in depth for planned retire: the parent protocol pauses blue before drain, but retire itself
   // still settles and terminally disables backup work before process.exit.
   stopJournalBackups: () => Promise<void>
@@ -252,6 +254,7 @@ export class RestartController {
     const transition = new Promise<void>((resolve) => server.close(() => resolve()))
     await transition
     if (operation.abortRequested) return
+    this.deps.onDrained?.()
     this.notifySupervisor({
       type: 'released',
       questionTurns: {

@@ -1213,9 +1213,14 @@ export class HubStore {
   // Discover each peer, authenticate with that hub's own paired token, install its bounded baseline,
   // then keep it current over an independent WebSocket. Failed auth/network reads remain explicit and
   // preserve last-known rows; they are never collapsed to an authoritative empty roster.
-  async refreshFleet(): Promise<void> {
-    if (this.fleetRefreshInFlight) return this.fleetRefreshInFlight
-    const refresh = this.refreshFleetNow()
+  async refreshFleet(forceRouteRecovery = false): Promise<void> {
+    if (this.fleetRefreshInFlight) {
+      await this.fleetRefreshInFlight
+      // A manual refresh promises a fresh route negotiation. Do not let a coincident background poll
+      // silently absorb that request; run the forced pass immediately after the existing one settles.
+      if (!forceRouteRecovery) return
+    }
+    const refresh = this.refreshFleetNow(forceRouteRecovery)
     this.fleetRefreshInFlight = refresh
     try {
       await refresh
@@ -1224,8 +1229,8 @@ export class HubStore {
     }
   }
 
-  private async refreshFleetNow(): Promise<void> {
-    const raw = await api.fleet().catch(() => null)
+  private async refreshFleetNow(forceRouteRecovery = false): Promise<void> {
+    const raw = await api.fleet(forceRouteRecovery).catch(() => null)
     // A non-array means we could not learn the roster at all (an older hub with no /api/fleet returns
     // {error}; a token-gated hub returns 401 {error}). buildFleet always returns at least the local
     // entry, so an empty array means the same thing.
@@ -1307,7 +1312,9 @@ export class HubStore {
     const offline = remoteSites.filter((site) => !site.online)
     for (const site of offline) {
       site.authState = getFleetSiteToken(site.siteId) ? 'paired' : 'pairing-required'
-      site.authError = 'The mesh route is offline.'
+      site.authError = site.directOnline
+        ? 'Direct hub control is live, but the TCP Site route for the unified chat view is offline.'
+        : site.routeError ?? 'The mesh route is offline.'
     }
     this.fleetSites = [...fleet.filter((site) => site.local), ...remoteSites]
     const usable = pulled.filter((entry) => entry.baseline !== null) as Array<{
@@ -1396,9 +1403,30 @@ export class HubStore {
     const site = this.fleetSites.find((candidate) => candidate.siteId === siteId && !candidate.local)
     if (!site || !token.trim()) return false
     const supplied = token.trim()
+    if (!site.online && !looksLikePairingCode(supplied)) {
+      site.authState = 'error'
+      site.authError = 'A direct-only peer must be paired with its eight-character one-use code.'
+      this.fleetSites = [...this.fleetSites]
+      return false
+    }
     let credential = supplied
     if (looksLikePairingCode(supplied)) {
-      const exchanged = await api.exchangePairingCode(supplied, site.baseUrl)
+      let exchanged: { token?: string; error?: string }
+      if (site.directOnline) {
+        const direct = await api.pairFleetSiteDirect(site.siteId, supplied).catch((error) => ({
+          error: error instanceof Error ? error.message : 'Direct mesh pairing failed.',
+        }))
+        exchanged = { token: 'token' in direct ? direct.token : undefined, error: direct.error }
+        // An upgraded peer uses the Site-free channel. A mixed-version peer may not have registered
+        // the RPC method yet, so retain the old HTTP exchange as a compatibility fallback when its Site works.
+        if (!exchanged.token && site.online && site.baseUrl) {
+          exchanged = await api.exchangePairingCode(supplied, site.baseUrl)
+        }
+      } else if (site.online && site.baseUrl) {
+        exchanged = await api.exchangePairingCode(supplied, site.baseUrl)
+      } else {
+        exchanged = { error: site.routeError ?? 'No live direct channel or Site route reaches that hub.' }
+      }
       credential = exchanged.token?.trim() ?? ''
       if (!credential) {
         site.authState = 'error'
@@ -1409,7 +1437,7 @@ export class HubStore {
     }
     setFleetSiteToken(siteId, credential)
     configureFleetSites(this.fleetSites)
-    const auth = await api.authFrom(site).catch(() => null)
+    const auth = site.online && site.baseUrl ? await api.authFrom(site).catch(() => null) : { authed: true, requireToken: true }
     if (!auth?.authed && auth?.requireToken !== false) {
       setFleetSiteToken(siteId, '')
       site.authState = 'error'
