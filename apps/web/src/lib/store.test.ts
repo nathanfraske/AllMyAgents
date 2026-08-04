@@ -1138,7 +1138,7 @@ describe('replay boundary presentation', () => {
     expect(replayStore.lastSeq).toBe(10)
   })
 
-  it('bounds a paused live-event batch and resets truthfully instead of dropping overflow', async () => {
+  it('drains a paused live-event batch without resetting or dropping overflow', async () => {
     vi.useFakeTimers()
     try {
       const { replayStore, transport } = harness()
@@ -1162,9 +1162,17 @@ describe('replay boundary presentation', () => {
       }
       await Promise.resolve()
 
-      expect(internals.pendingEvents.length).toBe(0)
+      // The 1,025th message synchronously drained the first bounded batch, then remained queued for
+      // the ordinary frame flush. No baseline jump was allowed to skip the paused renderer's events.
+      expect(replayStore.lastSeq).toBe(1_024)
+      expect(internals.pendingEvents).toHaveLength(1)
+      expect(internals.pendingEventBytes).toBeGreaterThan(0)
+      expect(refresh).not.toHaveBeenCalled()
+
+      transport.flushEvents()
+      expect(replayStore.lastSeq).toBe(1_025)
+      expect(internals.pendingEvents).toHaveLength(0)
       expect(internals.pendingEventBytes).toBe(0)
-      expect(refresh).toHaveBeenCalledOnce()
     } finally {
       vi.useRealTimers()
     }
@@ -1284,6 +1292,51 @@ describe('bounded cold baseline and global maintenance status', () => {
     expect(cold.sessions.s1?.journalHistoryOlderCursor).toBe(10)
     expect(api.approvals).not.toHaveBeenCalled()
     expect(api.journalHistory).toHaveBeenCalledWith('s1', 3, 51, expect.anything())
+  })
+
+  it('rehydrates every open native pane after a required baseline reset', async () => {
+    const recovering = new HubStore()
+    recovering.selectedId = 's1'
+    recovering.sessions.s1 = {
+      record: rec('s1'),
+      items: [{ key: 'stale', kind: 'assistant', ts: '2026-01-01T00:00:00.000Z', text: 'stale cutoff' }],
+      lastActivity: '2026-01-01T00:00:00.000Z',
+      sawReasoning: false,
+    }
+    vi.mocked(api.replayBaseline).mockResolvedValueOnce({
+      version: 1,
+      generation: 9,
+      highWaterSeq: 100,
+      resetFloorSeq: 80,
+      sessions: [rec('s1')],
+      projects: [],
+      journalCompaction: null,
+    })
+    vi.mocked(api.journalHistory).mockResolvedValueOnce({
+      events: [
+        evt({
+          seq: 99,
+          kind: 'codex/item/completed',
+          sessionId: 's1',
+          payload: { item: { id: 'reply', type: 'agentMessage', text: 'recovered reply' } },
+        }),
+      ],
+      olderCursor: null,
+      hasOlder: false,
+      encodedBytes: 200,
+      checkpointGeneration: 9,
+    })
+    const transport = recovering as unknown as {
+      refreshRequiredBaseline(): Promise<boolean>
+    }
+
+    await expect(transport.refreshRequiredBaseline()).resolves.toBe(true)
+    await vi.waitFor(() => {
+      expect(recovering.sessions.s1?.items.map((item) => item.text)).toContain('recovered reply')
+    })
+
+    expect(recovering.sessions.s1?.items.map((item) => item.text)).not.toContain('stale cutoff')
+    expect(api.journalHistory).toHaveBeenCalledWith('s1', 9, 101, expect.anything())
   })
 
   it('retries an imported transcript after a bounded first-load failure', async () => {

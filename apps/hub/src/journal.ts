@@ -75,6 +75,33 @@ export const JOURNAL_CONDENSE_MAX_TRANSIENT_BYTES = 8 * 1024 * 1024
 export const JOURNAL_REPLAY_PROTOCOL_VERSION = 1 as const
 export const JOURNAL_HISTORY_PAGE_MAX_ROWS = 80
 export const JOURNAL_HISTORY_PAGE_MAX_BYTES = 512 * 1024
+
+// A history page is a transcript projection, not a second copy of the raw worker protocol. Codex
+// streams one journal row for almost every text/output fragment, so selecting the latest 80 raw rows
+// can return nothing but deltas from a single tool call and strand every completed operator/assistant
+// message behind hundreds of "load older" requests. Every kind below is independently meaningful to
+// journalHistoryReducer; terminal Codex items already carry the complete message/tool payload, making
+// their preceding deltas redundant for recovery. Keep this list beside the storage query so the DB can
+// use the per-session sequence index and skip transient rows before applying the row/byte page bounds.
+const JOURNAL_HISTORY_EVENT_KINDS = [
+  'session/input',
+  'bus/sent',
+  'bus/delivered',
+  'question/recovery-unknown',
+  'question/restart-interrupted',
+  'session/error',
+  'session/mode',
+  'session/worktree-created',
+  'memory/recalled',
+  'claude/assistant',
+  'claude/user',
+  'claude/system',
+  'claude/result',
+  'codex/thread/compacted',
+  'codex/turn/completed',
+  'codex/item/completed',
+  'codex/subagent/item/completed',
+] as const
 // These horizons describe a possible opt-in history policy, but both lossy batch limits stay ZERO until a
 // future explicit operator control enables it. The distinction is load-bearing: the one-hour condensation
 // above removes only SUPERSEDED rows (an intermediate diff, or a delta whose completed item durably contains
@@ -946,6 +973,7 @@ export class Journal extends EventEmitter {
       if (!Number.isSafeInteger(beforeSeq) || beforeSeq < 1) {
         throw new Error('beforeSeq is outside the supported history-page bound')
       }
+      const historyKindPlaceholders = JOURNAL_HISTORY_EVENT_KINDS.map(() => '?').join(', ')
       const rows = this.db
         .prepare(
           `SELECT
@@ -960,11 +988,29 @@ export class Journal extends EventEmitter {
              length(CAST(event.payload AS BLOB)) AS payload_bytes
            FROM journal_session_event_index AS session_event
            JOIN events AS event ON event.seq = session_event.seq
-           WHERE session_event.session = ? AND session_event.seq < ?
+           WHERE session_event.session = ?
+             AND session_event.seq < ?
+             AND (
+               event.kind IN (${historyKindPlaceholders})
+               OR (
+                 event.kind = 'codex/item/started'
+                 AND CASE
+                   WHEN json_valid(event.payload)
+                   THEN json_extract(event.payload, '$.item.type')
+                   ELSE NULL
+                 END = 'contextCompaction'
+               )
+             )
            ORDER BY session_event.seq DESC
            LIMIT ?`
         )
-        .all(maxBytes, sessionId, beforeSeq, maxRows + 1) as Array<{
+        .all(
+          maxBytes,
+          sessionId,
+          beforeSeq,
+          ...JOURNAL_HISTORY_EVENT_KINDS,
+          maxRows + 1
+        ) as Array<{
         seq: number
         ts: string
         session: string
