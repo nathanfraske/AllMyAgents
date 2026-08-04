@@ -23,6 +23,8 @@ over redundant streaming deltas.
   of token, reasoning, or command-output deltas can no longer hide completed replies.
 - The raw journal remains lossless. Semantic filtering applies only to the bounded renderer projection and
   uses the existing generation-checked SQLite read snapshot and per-session sequence index.
+- The Apple Silicon one-command installer gate now authenticates its GitHub release lookup, eliminating
+  false release failures when a shared runner IP has exhausted the anonymous API quota.
 
 ## v0.1.13-alpha.16 — 2026-08-03
 

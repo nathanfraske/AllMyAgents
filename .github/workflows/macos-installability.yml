@@ -369,6 +369,9 @@ jobs:
       - name: Install via scripts/install-macos.sh
         env:
           AMA_TAG: ${{ github.event.inputs.tag || github.event.release.tag_name }}
+          # Shared macOS runner IPs routinely exhaust GitHub's anonymous release-API quota. The
+          # installer already supports authenticated lookups; make this gate exercise that stable path.
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           /bin/bash scripts/install-macos.sh   # see clean-machine-install.yml: `bash` finds Homebrew 5 and hides 3.2-only bugs
