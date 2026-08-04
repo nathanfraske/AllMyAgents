@@ -1290,6 +1290,8 @@ describe('bounded cold baseline and global maintenance status', () => {
 
     expect(cold.sessions.s1?.items.map((item) => item.text)).toEqual(['old prompt'])
     expect(cold.sessions.s1?.journalHistoryOlderCursor).toBe(10)
+    expect(cold.sessions.s1?.lastActivity).toBe('2026-01-01T00:00:05.000Z')
+    expect(cold.sessions.s1?.record.lastActivity).toBe('2026-01-01T00:00:05.000Z')
     expect(api.approvals).not.toHaveBeenCalled()
     expect(api.journalHistory).toHaveBeenCalledWith('s1', 3, 51, expect.anything())
   })

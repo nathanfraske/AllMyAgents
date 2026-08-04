@@ -145,6 +145,27 @@ describe('transcript interaction boundaries', () => {
     await waitFor(() => expect(load).toHaveBeenCalledWith('interaction-session'))
   })
 
+  it('keeps the live tail rendered after older history has been reached', () => {
+    const view = seed()
+    view.record.provider = 'claude'
+    view.journalHistoryOlderCursor = null
+    view.historyViewingOlder = true
+    view.items = Array.from({ length: 160 }, (_, index) => ({
+      key: `history-${index}`,
+      kind: 'assistant' as const,
+      ts: `2026-07-31T00:${String(Math.floor(index / 60)).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}.000Z`,
+      text: index === 0 ? 'oldest reached reply' : index === 159 ? 'actual latest reply' : `reply ${index}`,
+      historical: index < 80,
+    }))
+
+    const rendered = render(ThreadView, { props: { sessionId: 'interaction-session' } })
+
+    expect(rendered.getByText('oldest reached reply')).toBeTruthy()
+    // Regression: the older-history branch rendered slice(0, 120), so the apparent scroll bottom
+    // permanently omitted this live-tail item after the operator had scrolled upward once.
+    expect(rendered.getByText('actual latest reply')).toBeTruthy()
+  })
+
   it('makes only the pane header draggable so transcript and composer text remain selectable', () => {
     seed()
     const { container } = render(ThreadView, {

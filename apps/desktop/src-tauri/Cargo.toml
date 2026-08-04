@@ -4,7 +4,7 @@ name = "allmyagents-desktop"
 # updater manifest actually use). MSI/WiX rejects semver pre-release suffixes, so
 # the ALPHA marker lives only in the git tag (v0.1.4-alpha.5) — every alpha after
 # the first must bump this numeric version or the updater has nothing to compare.
-version = "0.1.14"
+version = "0.1.15"
 description = "AllMyAgents desktop shell"
 authors = ["CEC"]
 edition = "2021"

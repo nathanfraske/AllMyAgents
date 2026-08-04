@@ -74,6 +74,8 @@ export interface SessionRecord {
   provider: Provider
   /** Hub-minted application overseer role. Public session creation can never set this flag. */
   isOverseer?: boolean
+  /** Version of the app-level Overseer contract last materialized for this durable conversation. */
+  overseerCapabilityVersion?: number
   projectId?: string
   cwd: string
   repo?: string

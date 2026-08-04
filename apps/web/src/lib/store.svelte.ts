@@ -3586,6 +3586,29 @@ export class HubStore {
     view.items = combined
   }
 
+  private reconcileNativeHistoryActivity(view: SessionView, history: readonly ThreadItem[]): void {
+    // Older hub-native records did not persist lastActivity. On reconnect they therefore fell back to
+    // createdAt ("3d ago" in the production reproduction) even though the bounded transcript page held
+    // a reply from minutes ago. Recover the newest valid item timestamp from the LATEST page. Never move
+    // a clock backwards: a live event may already be newer than the page's high-water mark.
+    let newestTs: string | undefined
+    let newestMs = Number.NEGATIVE_INFINITY
+    for (const item of history) {
+      const itemMs = Date.parse(item.ts)
+      if (!Number.isFinite(itemMs) || itemMs <= newestMs) continue
+      newestMs = itemMs
+      newestTs = item.ts
+    }
+    if (!newestTs) return
+    const currentMs = Date.parse(view.lastActivity)
+    if (Number.isFinite(currentMs) && currentMs >= newestMs) return
+    view.record.lastActivity = newestTs
+    view.lastActivity = newestTs
+    // Preserve the no-sidebar-shuffle-while-working policy. A settled chat may immediately take its
+    // truthful recency position; a live chat's order key stays frozen until its terminal status arrives.
+    if (!viewIsBusy(view)) view.orderKey = newestTs
+  }
+
   // Lazily pull an IMPORTED chat's on-disk transcript the first time it's opened and prepend it above
   // any live turns — so the thread shows real history instead of an empty pane. Hub-native chats skip
   // this (their history already replays over the WS). Never clobbers a thread that already has content.
@@ -3629,6 +3652,7 @@ export class HubStore {
         return
       }
       this.installJournalHistoryWindow(view, historyItems)
+      this.reconcileNativeHistoryActivity(view, historyItems)
       view.journalHistoryGeneration = page.checkpointGeneration
       view.journalHistoryOlderCursor = page.hasOlder ? page.olderCursor : null
       return

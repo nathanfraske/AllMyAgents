@@ -786,6 +786,23 @@ describe('SessionManager — an operator Stop survives the interrupted turn\'s o
 })
 
 describe('SessionManager.applyLifecycle — replayed markers do not re-journal or start a bus turn (F2)', () => {
+  it('persists a live turn boundary as canonical last activity without refreshing replayed markers', () => {
+    const h = buildHub()
+    seedRecord(h.store, 's', 'active')
+    const seeded = h.store.all().find((record) => record.id === 's')!
+    seeded.lastActivity = '2026-07-01T00:00:00.000Z'
+    h.store.upsert(seeded)
+    h.sessions.loadRecords()
+
+    const beforeLive = Date.now()
+    h.sessions.applyLifecycle({ t: 'turnCompleted', sessionId: 's', wseq: 4 })
+    const liveActivity = h.store.all().find((record) => record.id === 's')?.lastActivity
+    expect(Date.parse(liveActivity ?? '')).toBeGreaterThanOrEqual(beforeLive)
+
+    h.sessions.applyLifecycle({ t: 'turnStarted', sessionId: 's', wseq: 1, replay: true })
+    expect(h.store.all().find((record) => record.id === 's')?.lastActivity).toBe(liveActivity)
+  })
+
   it('a re-attach does NOT duplicate session/status | session/error rows', async () => {
     const h = buildHub()
     seedRecord(h.store, 's', 'active')
