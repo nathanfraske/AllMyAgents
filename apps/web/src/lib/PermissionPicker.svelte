@@ -35,7 +35,7 @@
   const MODES = [
     { id: 'safe', icon: 'lock', label: 'Safe', desc: 'ask before every tool' },
     { id: 'edits', icon: 'pencil', label: 'Edits', desc: 'auto-approve file edits' },
-    { id: 'full', icon: 'zap', label: 'Full access', desc: 'no approvals (careful)' },
+    { id: 'full', icon: 'zap', label: 'Full access', desc: 'ordinary tools auto-approved · host access (OS elevation still applies)' },
   ]
   const current = $derived(MODES.find((m) => m.id === (mode || 'safe')) ?? MODES[0])
   const ranks: Record<PermissionMode, number> = { safe: 0, edits: 1, full: 2 }

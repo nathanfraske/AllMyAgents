@@ -50,7 +50,7 @@ export interface WorkerExecutorHubCallbacks {
   applyLifecycle(msg: Extract<WorkerToHub, { t: 'turnStarted' | 'turnCompleted' | 'turnError' }>): void
   recall(sessionId: string, prompt: string): string
   requestRestart(reason: string, bySession?: string): void
-  runRelay(method: RelayMethod, args: unknown): unknown
+  runRelay(method: RelayMethod, args: unknown): unknown | Promise<unknown>
   resolveApproval(approvalId: string, sessionId: string, kind: string, payload: unknown): Promise<boolean>
   attachWorker(): Promise<void>
 }

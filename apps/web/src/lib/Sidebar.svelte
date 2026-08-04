@@ -714,12 +714,13 @@
     <button
       class="homebtn"
       data-tutorial-anchor="home"
+      data-overseer-anchor="home"
       class:current={!store.selectedId && store.splitPanes.length === 0 && !store.projectViewId}
       title="Home — projects and launchpad"
       aria-label="Home"
       onclick={() => store.goHome()}
     ><Icon name="home" size={17} /><span>Home</span></button>
-    <div class="status-cluster" bind:this={statusRegion}>
+    <div class="status-cluster" bind:this={statusRegion} data-overseer-anchor="hub_status">
       <button
         class="status-trigger hub-status"
         class:working={store.hubConnectionPhase === 'starting'}
@@ -847,7 +848,7 @@
 
   <div class="search"><span class="sicon"><Icon name="search" size={13} /></span><input placeholder="Search sessions" bind:value={filter} /></div>
 
-  <button class="overseer-entry" class:configured={!!(liveOverseer || overseerSessionId)} onclick={openOverseer}>
+  <button class="overseer-entry" data-overseer-anchor="overseer" class:configured={!!(liveOverseer || overseerSessionId)} onclick={openOverseer}>
     <span class="overseer-mark"><Icon name="activity" size={14} /></span>
     <span><b>Overseer</b><small>{liveOverseer || overseerSessionId ? 'Application control' : 'Set up application control'}</small></span>
     <Icon name="chevron-right" size={13} />
@@ -855,7 +856,7 @@
 
   <div class="sec-head">
     <span>PROJECTS</span>
-    <button class="manager-entry" title="project managers" onclick={() => store.openManagerSetup()}>
+    <button class="manager-entry" data-overseer-anchor="managers" title="project managers" onclick={() => store.openManagerSetup()}>
       <Icon name="flag" size={12} /><span>Managers</span>
     </button>
   </div>

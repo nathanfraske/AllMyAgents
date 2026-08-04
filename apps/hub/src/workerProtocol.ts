@@ -114,6 +114,8 @@ export type RelayMethod =
   | 'remote.list'
   | 'remote.execute'
   | 'overseer.control'
+  | 'questions.request'
+  | 'questions.abort'
 
 // --- Transient-gap constants + retryable shape (§1.5) — single source of truth for both sides. ---
 

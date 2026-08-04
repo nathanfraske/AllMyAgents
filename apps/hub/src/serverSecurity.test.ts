@@ -451,6 +451,38 @@ describe('device-authenticated control plane', () => {
     expect(await reveal.json()).toEqual({ token: deviceToken })
   })
 
+  it('exchanges an authenticated, short-lived pairing code for the device token exactly once', async () => {
+    const { base, deviceToken } = await build()
+
+    const unauthenticatedIssue = await fetch(`${base}/api/pairing-code`, { method: 'POST' })
+    expect(unauthenticatedIssue.status).toBe(401)
+
+    const issue = await fetch(`${base}/api/pairing-code`, {
+      method: 'POST',
+      headers: auth(deviceToken),
+    })
+    expect(issue.status).toBe(200)
+    const issued = (await issue.json()) as { code: string; expiresAt: string }
+    expect(issued.code).toMatch(/^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}-[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}$/u)
+    expect(Date.parse(issued.expiresAt)).toBeGreaterThan(Date.now())
+
+    const exchange = await fetch(`${base}/api/pair`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code: issued.code.toLowerCase() }),
+    })
+    expect(exchange.status).toBe(200)
+    expect(await exchange.json()).toEqual({ token: deviceToken })
+
+    const replay = await fetch(`${base}/api/pair`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code: issued.code }),
+    })
+    expect(replay.status).toBe(401)
+    await expect(replay.json()).resolves.not.toHaveProperty('token')
+  })
+
   it('authenticates recovery notices and validates idempotent exact-id dismissal', async () => {
     const { base, deviceToken, journal } = await build()
     const unauthenticated = await fetch(`${base}/api/recovery-notices`)

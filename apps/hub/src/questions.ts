@@ -335,7 +335,8 @@ function recoveredOutcome(
  *
  * It deliberately does not share ApprovalService: an answer is tool input, never a grant. Stable vendor
  * invocation correlation makes in-process retries idempotent without making an answer reusable by a later
- * identical-payload question. Worker recovery remains unavailable until the control channel is authenticated.
+ * identical-payload question. Worker calls use the same durable lifecycle over the mutually-authenticated
+ * local control channel.
  */
 export class QuestionService {
   private readonly pendingMap = new Map<string, PendingEntry>()

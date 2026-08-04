@@ -568,7 +568,9 @@ export class WorkerServer {
    * HubUnavailableError, mapped to HUB_UNAVAILABLE_TEXT at the tool boundary (§8.3).
    */
   private armDeliveredBackstop(entry: PendingRelay): void {
-    if (entry.msg.t === 'rpc') this.armTimer(entry, HUB_RELAY_DELIVERED_BACKSTOP_MS)
+    if (entry.msg.t === 'rpc' && entry.msg.method !== 'questions.request') {
+      this.armTimer(entry, HUB_RELAY_DELIVERED_BACKSTOP_MS)
+    }
   }
 
   private armTimer(entry: PendingRelay, ms: number): void {

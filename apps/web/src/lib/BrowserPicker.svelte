@@ -141,6 +141,8 @@
     class:on={enabled}
     class:open
     onclick={openMenu}
+    aria-label={`Browser ${enabled ? 'on' : 'off'}`}
+    aria-expanded={open}
     title={enabled ? 'Isolated browser enabled for this chat' : 'Browser off for this chat'}
   >
     <span class="lead"><Icon name="globe" size={13} /></span>
@@ -195,11 +197,33 @@
 
 <style>
   .wrap { position: relative; min-width: 0; }
+  .pill-btn {
+    width: 2rem;
+    min-width: 2rem;
+    max-width: 2rem;
+    justify-content: flex-start;
+    overflow: hidden;
+    transition: max-width var(--dur-fast) var(--ease), width var(--dur-fast) var(--ease);
+  }
+  .pill-btn:hover,
+  .pill-btn:focus-visible,
+  .pill-btn.open { width: 8.2rem; max-width: 8.2rem; }
   .pill-btn.on { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, transparent); }
   .lead, .chev { display: inline-grid; }
   .lead { color: inherit; }
-  .chev { opacity: 0.6; }
-  .pill-label { white-space: nowrap; }
+  .chev, .pill-label {
+    max-width: 0;
+    opacity: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    transition: max-width var(--dur-fast) var(--ease), opacity var(--dur-fast) var(--ease);
+  }
+  .pill-btn:hover .chev,
+  .pill-btn:focus-visible .chev,
+  .pill-btn.open .chev { max-width: 1rem; opacity: 0.6; }
+  .pill-btn:hover .pill-label,
+  .pill-btn:focus-visible .pill-label,
+  .pill-btn.open .pill-label { max-width: 6rem; opacity: 1; }
   .scrim { position: fixed; inset: 0; border: 0; background: transparent; z-index: 10; }
   .menu {
     position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 11; width: min(360px, 82vw);

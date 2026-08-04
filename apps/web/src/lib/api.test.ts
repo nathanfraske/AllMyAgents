@@ -148,6 +148,32 @@ describe('transport (res.ok respected; errors are not data)', () => {
     expect(res.id).toBe('s1')
   })
 
+  it('exchanges a short pairing code without replaying a saved device capability', async () => {
+    vi.stubGlobal('localStorage', {
+      getItem: () => 'saved-local-device-token',
+      setItem: vi.fn(),
+    })
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ token: 'exchanged-device-token' }),
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const { api } = await loadApi()
+
+    await expect(api.exchangePairingCode('ABCD-EFGH', 'http://localhost:45678')).resolves.toEqual({
+      token: 'exchanged-device-token',
+    })
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://localhost:45678/api/pair',
+      expect.objectContaining({
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ code: 'ABCD-EFGH' }),
+      }),
+    )
+  })
+
   it('integration check preserves the typed 409 gate result, including exact stale files and commits', async () => {
     stubFetch(409, {
       ok: false,

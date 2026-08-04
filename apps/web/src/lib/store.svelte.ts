@@ -39,6 +39,10 @@ interface RemoteStream {
   failures: number
 }
 
+function looksLikePairingCode(value: string): boolean {
+  return /^[23456789A-HJ-NP-Z]{4}[\s-]?[23456789A-HJ-NP-Z]{4}$/iu.test(value.trim())
+}
+
 const fleetId = (siteId: string, id: string): string => `${siteId}:${id}`
 // The session manager registers the operator's ordinary ~/.claude and ~/.codex homes under these
 // fixed ids so imported vendor conversations can be resumed. They are internal bindings, not
@@ -375,6 +379,35 @@ function moveInto(ids: string[], fromId: string, toId: string): string[] {
   return next
 }
 
+export type OverseerUiTarget =
+  | 'home'
+  | 'new_project'
+  | 'project_overview'
+  | 'overseer'
+  | 'accounts'
+  | 'chat_defaults'
+  | 'remote_access'
+  | 'safety'
+  | 'hub_status'
+  | 'managers'
+  | 'browser'
+  | 'composer'
+  | 'permissions'
+  | 'history'
+
+export interface OverseerUiGuide {
+  target: OverseerUiTarget
+  message: string
+  projectId?: string
+  seq: number
+}
+
+const OVERSEER_UI_TARGETS = new Set<OverseerUiTarget>([
+  'home', 'new_project', 'project_overview', 'overseer', 'accounts', 'chat_defaults',
+  'remote_access', 'safety', 'hub_status', 'managers', 'browser', 'composer',
+  'permissions', 'history',
+])
+
 // Exported for tests, which need a FRESH instance per case — the singleton below carries state between
 // them. Application code should always use `store`, never construct a second one.
 export class HubStore {
@@ -419,6 +452,9 @@ export class HubStore {
    */
   projectViewMode = $state<ProjectViewMode | null>(null)
   settingsOpen = $state(false)
+  /** One live, allowlisted UI teaching request emitted by the hub-minted Overseer. Replayed journal
+   * history never populates this, so reopening the app cannot unexpectedly navigate or spotlight UI. */
+  overseerUiGuide = $state<OverseerUiGuide | null>(null)
   // Queued messages survive a refresh: you already committed to sending that text, so losing it because
   // the page reloaded is data loss. Restored from localStorage and re-saved on every mutation.
   queues = $state<Record<string, QueuedEntry[]>>(loadQueues())
@@ -867,9 +903,15 @@ export class HubStore {
     }
   }
 
-  // Pair this device by pasting a token (from another device's Settings → Mesh), then load.
+  // Pair this device with a one-use short code (or a legacy long token), then load.
   async pair(token: string): Promise<void> {
-    setHubToken(token.trim())
+    const supplied = token.trim()
+    let credential = supplied
+    if (looksLikePairingCode(supplied)) {
+      const exchanged = await api.exchangePairingCode(supplied)
+      credential = exchanged.token?.trim() ?? ''
+    }
+    setHubToken(credential)
     const auth = await api.auth().catch(() => ({ requireToken: true, authed: false }))
     if (auth.authed || !auth.requireToken) {
       this.needsPairing = false
@@ -1227,7 +1269,7 @@ export class HubStore {
             ? auth.error
             : hasToken
               ? 'The saved token was rejected. Pair this machine again.'
-              : 'Enter this machine’s device token to pair it.'
+              : 'Enter this machine’s XXXX-XXXX pairing code to pair it.'
           return { site, baseline: null, profiles: null as ProfileInfo[] | null, approvals: null as ApprovalRecord[] | null, questions: null as QuestionRecord[] | null, usage: null as UsageSnapshot[] | null }
         }
         const baseline = await api.replayBaselineFrom(site).catch((error) => {
@@ -1348,7 +1390,19 @@ export class HubStore {
   async pairFleetSite(siteId: string, token: string): Promise<boolean> {
     const site = this.fleetSites.find((candidate) => candidate.siteId === siteId && !candidate.local)
     if (!site || !token.trim()) return false
-    setFleetSiteToken(siteId, token)
+    const supplied = token.trim()
+    let credential = supplied
+    if (looksLikePairingCode(supplied)) {
+      const exchanged = await api.exchangePairingCode(supplied, site.baseUrl)
+      credential = exchanged.token?.trim() ?? ''
+      if (!credential) {
+        site.authState = 'error'
+        site.authError = exchanged.error ?? 'That pairing code was rejected by the remote hub.'
+        this.fleetSites = [...this.fleetSites]
+        return false
+      }
+    }
+    setFleetSiteToken(siteId, credential)
     configureFleetSites(this.fleetSites)
     const auth = await api.authFrom(site).catch(() => null)
     if (!auth?.authed && auth?.requireToken !== false) {
@@ -1358,7 +1412,7 @@ export class HubStore {
       this.fleetSites = [...this.fleetSites]
       return false
     }
-    const saved = await api.saveFleetConnection(siteId, site.label, token.trim()).catch((error) => ({
+    const saved = await api.saveFleetConnection(siteId, site.label, credential).catch((error) => ({
       error: error instanceof Error ? error.message : 'Could not store the device credential.',
     }))
     if ('error' in saved) {
@@ -1382,7 +1436,7 @@ export class HubStore {
     const site = this.fleetSites.find((candidate) => candidate.siteId === siteId)
     if (site) {
       site.authState = 'pairing-required'
-      site.authError = 'Enter this machine’s device token to pair it.'
+      site.authError = 'Enter this machine’s XXXX-XXXX pairing code to pair it.'
       this.fleetSites = [...this.fleetSites]
     }
   }
@@ -2378,6 +2432,24 @@ export class HubStore {
         typeof status.detail === 'string'
       ) {
         this.journalCompaction = status as JournalCompactionStatus
+      }
+      return
+    }
+    if (!sourceSiteId && kind === 'overseer/ui-guide-requested') {
+      const guide = payload as { target?: string; message?: string; projectId?: string | null }
+      if (
+        !this.applyingReplayedEvent &&
+        OVERSEER_UI_TARGETS.has(guide.target as OverseerUiTarget) &&
+        typeof guide.message === 'string' &&
+        guide.message.trim().length > 0 &&
+        guide.message.length <= 600
+      ) {
+        this.overseerUiGuide = {
+          target: guide.target as OverseerUiTarget,
+          message: guide.message.trim(),
+          ...(typeof guide.projectId === 'string' && guide.projectId ? { projectId: guide.projectId } : {}),
+          seq: event.seq,
+        }
       }
       return
     }

@@ -324,6 +324,7 @@
 <section
   class="project-view"
   data-tutorial-anchor="project-view"
+  data-overseer-anchor="project_overview"
   class:manager-mode={mode === 'manager'}
   aria-label={project ? `${project.name} project ${mode}` : 'Project overview'}
 >

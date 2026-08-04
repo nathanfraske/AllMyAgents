@@ -35,6 +35,18 @@ describe('first-run tutorial overlay', () => {
     expect(screen.getByText(/usually takes about 30 seconds/i)).toBeTruthy()
     expect(screen.getByText(/elapsed/i)).toBeTruthy()
   })
+
+  it('finishes the shortest path at Overseer setup and points to conversational onboarding', () => {
+    tutorials.replayFirstRun(true)
+    store.settingsOpen = true
+
+    render(TutorialOverlay, { props: { kind: 'first-run' } })
+
+    expect(screen.getByText('Choose your Overseer')).toBeTruthy()
+    expect(screen.getByText(/set this up for me/i)).toBeTruthy()
+    expect(screen.getByText(/show me around/i)).toBeTruthy()
+    expect(screen.getByText(/full visual tour.*remain available/i)).toBeTruthy()
+  })
 })
 
 describe('first New Project tutorial overlay', () => {

@@ -9,6 +9,7 @@
   import ProjectView from './lib/ProjectView.svelte'
   import NewProjectModal, { type ProjectLaunchResult } from './lib/NewProjectModal.svelte'
   import TutorialOverlay from './lib/TutorialOverlay.svelte'
+  import OverseerUiGuide from './lib/OverseerUiGuide.svelte'
   import { api } from './lib/api'
   import { tutorials, type AccountLoginView } from './lib/tutorialState.svelte'
   import Titlebar from './lib/Titlebar.svelte'
@@ -30,7 +31,10 @@
         return { profiles, sessions }
       })
       if (loaded) {
-        if (tutorials.firstRunOpen && tutorials.firstRunPhase === 'accounts') {
+        if (
+          tutorials.firstRunOpen &&
+          (tutorials.firstRunPhase === 'accounts' || tutorials.firstRunPhase === 'overseer')
+        ) {
           store.settingsOpen = true
         } else if (tutorials.firstRunOpen) {
           store.goHome()
@@ -50,8 +54,7 @@
       store.profiles.length > 0
     ) {
       tutorials.accountAdded()
-      store.settingsOpen = false
-      store.goHome()
+      store.settingsOpen = true
     }
   })
 
@@ -68,11 +71,21 @@
 
   function replayFirstRun(): void {
     tutorials.replayFirstRun(store.profiles.length > 0)
-    if (tutorials.firstRunPhase === 'accounts') store.settingsOpen = true
+    if (tutorials.firstRunPhase === 'accounts' || tutorials.firstRunPhase === 'overseer') store.settingsOpen = true
     else {
       store.settingsOpen = false
       store.goHome()
     }
+  }
+
+  function replayAppTour(): void {
+    store.settingsOpen = false
+    store.goHome()
+    tutorials.replayAppTour()
+  }
+
+  function overseerConfigured(): void {
+    tutorials.overseerConfigured()
   }
 
   function replayNewProject(): void {
@@ -97,6 +110,51 @@
     store.closeManagerSetup()
     newProjectOpen = true
   }
+
+  let handledOverseerGuideSeq = -1
+  $effect(() => {
+    const guide = store.overseerUiGuide
+    if (!guide || guide.seq === handledOverseerGuideSeq) return
+    handledOverseerGuideSeq = guide.seq
+    switch (guide.target) {
+      case 'home':
+        store.settingsOpen = false
+        store.goHome()
+        break
+      case 'new_project':
+        store.settingsOpen = false
+        store.goHome()
+        newProjectOpen = true
+        break
+      case 'project_overview':
+        store.settingsOpen = false
+        if (guide.projectId) store.openProjectView(guide.projectId)
+        break
+      case 'accounts':
+      case 'chat_defaults':
+      case 'remote_access':
+      case 'safety':
+        store.settingsOpen = true
+        break
+      case 'managers':
+        store.settingsOpen = false
+        store.openManagerSetup()
+        break
+      default:
+        // Sidebar and chat targets are already mounted in the current layout.
+        break
+    }
+  })
+
+  const guideSettingsTab = $derived.by(() => {
+    switch (store.overseerUiGuide?.target) {
+      case 'accounts': return 'accounts' as const
+      case 'chat_defaults': return 'chats' as const
+      case 'remote_access': return 'remote' as const
+      case 'safety': return 'safety' as const
+      default: return undefined
+    }
+  })
 
   // Mirror the open layout (selected chat + split panes) to localStorage on every change, so the
   // next launch can OFFER to reopen it. Reading both here makes the effect reactive; the store only
@@ -438,9 +496,17 @@
 {#if store.settingsOpen}
   <SettingsModal
     onclose={() => (store.settingsOpen = false)}
-    initialTab={tutorials.firstRunOpen && tutorials.firstRunPhase === 'accounts' ? 'accounts' : undefined}
+    initialTab={tutorials.firstRunOpen
+      ? tutorials.firstRunPhase === 'accounts'
+        ? 'accounts'
+        : tutorials.firstRunPhase === 'overseer'
+          ? 'system'
+          : undefined
+      : guideSettingsTab}
     onloginstate={loginStateChanged}
+    onoverseerconfigured={overseerConfigured}
     onreplayfirst={replayFirstRun}
+    onreplayapptour={replayAppTour}
     onreplayproject={replayNewProject}
   />
 {/if}
@@ -462,12 +528,18 @@
 {:else if tutorials.newProjectOpen}
   <TutorialOverlay kind="new-project" />
 {/if}
+{#if store.overseerUiGuide}
+  <OverseerUiGuide
+    guide={store.overseerUiGuide}
+    ondismiss={() => (store.overseerUiGuide = null)}
+  />
+{/if}
 {#if store.needsPairing}
   <div class="pairing-overlay">
     <div class="pair-card">
       <h2>Pair this device</h2>
-      <p class="dim">This hub requires a device token. On a device that's already connected, open <b>Settings → Mesh</b>, copy the token, and paste it here.</p>
-      <input placeholder="device token" bind:value={pairToken} onkeydown={(e) => { if (e.key === 'Enter') doPair() }} />
+      <p class="dim">On an already connected device, open <b>Settings → Remote access</b>, create a pairing code, and enter it here.</p>
+      <input placeholder="XXXX-XXXX pairing code" autocomplete="one-time-code" bind:value={pairToken} onkeydown={(e) => { if (e.key === 'Enter') doPair() }} />
       <button class="pair-btn" onclick={doPair} disabled={!pairToken.trim()}>Pair device</button>
     </div>
   </div>

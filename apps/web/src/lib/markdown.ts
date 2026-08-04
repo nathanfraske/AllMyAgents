@@ -29,16 +29,119 @@ const marked = new Marked({ gfm: true, breaks: true })
 // Install the link-hardening hook exactly once. The module-scope guard keeps Vite HMR from
 // stacking duplicate hooks across reloads.
 let hooksInstalled = false
+export interface LocalFileLink {
+  path: string
+  line?: number
+  column?: number
+}
+
+/** Recognize the absolute path forms emitted by both vendors. The value is display data until an
+ * operator click reaches the native reveal command; rendering never reads or probes the path. */
+export function parseLocalFileHref(raw: string): LocalFileLink | null {
+  let value = raw.trim()
+  if (!value || value.length > 8_192 || value.includes('\0')) return null
+  try {
+    value = decodeURIComponent(value)
+  } catch {
+    return null
+  }
+
+  if (/^file:\/\//iu.test(value)) {
+    try {
+      const url = new URL(value)
+      if (url.protocol !== 'file:') return null
+      const host = url.hostname
+      value = host && host !== 'localhost'
+        ? `//${host}${url.pathname}${url.hash}`
+        : `${url.pathname}${url.hash}`
+      value = decodeURIComponent(value)
+    } catch {
+      return null
+    }
+  }
+
+  // Marked prefixes a Windows drive path with '/' only when the model used /C:/... or file:///C:/....
+  if (/^\/[A-Za-z]:[\\/]/u.test(value)) value = value.slice(1)
+  const absolute = /^[A-Za-z]:[\\/]/u.test(value) || /^\\\\[^\\/]+[\\/][^\\/]+/u.test(value) || /^\//u.test(value)
+  if (!absolute) return null
+
+  let line: number | undefined
+  let column: number | undefined
+  const suffix = /:(\d+)(?::(\d+))?$/u.exec(value)
+  if (suffix) {
+    value = value.slice(0, suffix.index)
+    line = Number(suffix[1])
+    column = suffix[2] ? Number(suffix[2]) : undefined
+  } else {
+    const fragment = /#L(\d+)(?:C(\d+))?$/iu.exec(value)
+    if (fragment) {
+      value = value.slice(0, fragment.index)
+      line = Number(fragment[1])
+      column = fragment[2] ? Number(fragment[2]) : undefined
+    }
+  }
+  if (!value || value.length > 4_096) return null
+  return { path: value, ...(line ? { line } : {}), ...(column ? { column } : {}) }
+}
+
+function decorateSafeLink(node: Element): void {
+  const href = node.getAttribute('href')
+  if (!href) return
+  let kind: 'github' | 'pdf' | 'web' | undefined
+  let host: string | undefined
+  try {
+    const url = new URL(href)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return
+    host = url.hostname.toLowerCase().replace(/^www\./, '')
+    if (/\.pdf$/i.test(url.pathname)) kind = 'pdf'
+    else if (host === 'github.com' || host.endsWith('.github.com')) kind = 'github'
+    else kind = 'web'
+  } catch {
+    return
+  }
+  node.setAttribute('data-link-kind', kind)
+  if (host) node.setAttribute('data-link-host', host)
+  if (!node.hasAttribute('title')) {
+    node.setAttribute('title', kind === 'pdf' ? `Open PDF from ${host}` : `Open ${host}`)
+  }
+}
+
 function installHooks(): void {
   if (hooksInstalled) return
   hooksInstalled = true
+  DOMPurify.addHook('beforeSanitizeAttributes', (candidate) => {
+    if (!(candidate instanceof Element) || candidate.tagName !== 'A') return
+    // Raw model HTML is allowed through Markdown before sanitization. Remove any forged marker first;
+    // only an href that this parser independently recognizes may recreate it.
+    candidate.removeAttribute('data-local-path')
+    candidate.removeAttribute('data-local-line')
+    candidate.removeAttribute('data-local-column')
+    const href = candidate.getAttribute('href')
+    const local = href ? parseLocalFileHref(href) : null
+    if (!local) return
+    candidate.setAttribute('href', '#')
+    candidate.setAttribute('data-local-path', local.path)
+    if (local.line) candidate.setAttribute('data-local-line', String(local.line))
+    if (local.column) candidate.setAttribute('data-local-column', String(local.column))
+  })
   // Every surviving link opens in a new context with no opener handle. DOMPurify has already
   // rejected javascript:/vbscript:/unsafe-data: URLs via its default URI policy — this only
   // hardens the links that were safe to begin with.
   DOMPurify.addHook('afterSanitizeAttributes', (node) => {
     if (node.tagName === 'A' && node.hasAttribute('href')) {
+      const localPath = node.getAttribute('data-local-path')
+      if (localPath) {
+        node.removeAttribute('target')
+        node.removeAttribute('rel')
+        node.setAttribute('data-link-kind', /\.pdf$/iu.test(localPath) ? 'pdf' : 'file')
+        node.setAttribute('title', `Reveal ${localPath}`)
+        return
+      }
       node.setAttribute('target', '_blank')
       node.setAttribute('rel', 'noopener noreferrer')
+      // Rich link identity is derived only from the already-sanitized URL and rendered with local CSS.
+      // Never fetch a favicon here: message rendering must remain a zero-network, zero-click surface.
+      decorateSafeLink(node)
     }
   })
 }

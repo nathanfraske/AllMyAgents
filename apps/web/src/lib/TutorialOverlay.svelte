@@ -87,9 +87,16 @@
 
   const accountStep: StepCopy = {
     anchor: TUTORIAL_ANCHORS.accountSignIn,
-    eyebrow: 'CONNECT AN ACCOUNT',
-    title: 'Add Claude or Codex',
-    body: 'Connect an account so AllMyAgents can start agents for you. Choose a provider, give the account a name you will recognize, then use the real Log in button below.',
+    eyebrow: 'STEP 1 OF 2',
+    title: 'Connect one account',
+    body: 'Choose Claude or Codex, give the account a name you will recognize, and use the real Log in button below. That is all the app needs before it can create your Overseer.',
+  }
+
+  const overseerStep: StepCopy = {
+    anchor: TUTORIAL_ANCHORS.overseerSetup,
+    eyebrow: 'STEP 2 OF 2',
+    title: 'Choose your Overseer',
+    body: 'Select the account you just connected and create the Overseer. The app will open its chat. Say "set this up for me" to have it build projects and teams, or "show me around" to ask how anything works.',
   }
 
   const step = $derived(
@@ -97,11 +104,17 @@
       ? projectSteps[tutorials.newProjectStep]!
       : tutorials.firstRunPhase === 'accounts'
         ? accountStep
-        : appSteps[tutorials.firstRunStep]!,
+        : tutorials.firstRunPhase === 'overseer'
+          ? overseerStep
+          : appSteps[tutorials.firstRunStep]!,
   )
   const stepIndex = $derived(kind === 'new-project' ? tutorials.newProjectStep : tutorials.firstRunStep)
   const stepCount = $derived(
-    kind === 'new-project' ? projectSteps.length : tutorials.firstRunPhase === 'accounts' ? 1 : appSteps.length,
+    kind === 'new-project'
+      ? projectSteps.length
+      : tutorials.firstRunPhase === 'accounts' || tutorials.firstRunPhase === 'overseer'
+        ? 1
+        : appSteps.length,
   )
   const waiting = $derived(kind === 'first-run' && tutorials.firstRunPhase === 'accounts' && tutorials.login.status === 'waiting')
   let elapsed = $state(0)
@@ -172,7 +185,7 @@
     else tutorials.skipFirstRun()
   }
 
-  function reopenAccounts(): void {
+  function reopenSettings(): void {
     store.settingsOpen = true
   }
 
@@ -228,7 +241,12 @@
       <p class="account-note">This tour continues automatically as soon as the account appears.</p>
     {/if}
     {#if !store.settingsOpen}
-      <button class="primary" onclick={reopenAccounts}>Open Accounts</button>
+      <button class="primary" onclick={reopenSettings}>Open Accounts</button>
+    {/if}
+  {:else if kind === 'first-run' && tutorials.firstRunPhase === 'overseer'}
+    <p class="account-note">Creating it finishes this setup guide. The full visual tour and New Project walkthrough remain available in Settings whenever you want them.</p>
+    {#if !store.settingsOpen}
+      <button class="primary" onclick={reopenSettings}>Open Overseer setup</button>
     {/if}
   {/if}
 
@@ -236,7 +254,7 @@
     <p class="missing">This part of the app is not visible yet. You can continue—the tour will never wait on a missing control.</p>
   {/if}
 
-  {#if !(kind === 'first-run' && tutorials.firstRunPhase === 'accounts')}
+  {#if !(kind === 'first-run' && (tutorials.firstRunPhase === 'accounts' || tutorials.firstRunPhase === 'overseer'))}
     <div class="tour-actions">
       <span>{stepIndex + 1} of {stepCount}</span>
       <div>

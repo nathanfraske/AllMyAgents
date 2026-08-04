@@ -10,6 +10,8 @@ const loginMocks = vi.hoisted(() => ({
   cancelLogin: vi.fn(() => Promise.resolve({ ok: true, status: 'settling' })),
   rescanProfiles: vi.fn((): Promise<unknown> => Promise.resolve([])),
   renameProfile: vi.fn(),
+  overseer: vi.fn(() => Promise.resolve({ configured: false, available: false })),
+  configureOverseer: vi.fn(),
 }))
 
 vi.mock('./externalUrl', () => ({
@@ -31,6 +33,8 @@ vi.mock('./api', async (original) => {
         if (property === 'cancelLogin') return loginMocks.cancelLogin
         if (property === 'rescanProfiles') return loginMocks.rescanProfiles
         if (property === 'renameProfile') return loginMocks.renameProfile
+        if (property === 'overseer') return loginMocks.overseer
+        if (property === 'configureOverseer') return loginMocks.configureOverseer
         if (property === 'mesh') {
           return () => Promise.resolve({
             enabled: false,
@@ -69,6 +73,9 @@ afterEach(() => {
   loginMocks.rescanProfiles.mockReset()
   loginMocks.rescanProfiles.mockResolvedValue([])
   loginMocks.renameProfile.mockReset()
+  loginMocks.overseer.mockReset()
+  loginMocks.overseer.mockResolvedValue({ configured: false, available: false })
+  loginMocks.configureOverseer.mockReset()
 })
 
 describe('tutorial account waiting integration', () => {
@@ -289,20 +296,51 @@ describe('tutorial account waiting integration', () => {
 
   it('offers deliberate replay actions from Settings', async () => {
     const replayFirst = vi.fn()
+    const replayApp = vi.fn()
     const replayProject = vi.fn()
     render(SettingsModal, {
       props: {
         onclose: () => {},
         initialTab: 'system',
         onreplayfirst: replayFirst,
+        onreplayapptour: replayApp,
         onreplayproject: replayProject,
       },
     })
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Show getting started tutorial' }))
+    await fireEvent.click(screen.getByRole('button', { name: 'Set up account + Overseer' }))
+    await fireEvent.click(screen.getByRole('button', { name: 'Explore the app tour' }))
     await fireEvent.click(screen.getByRole('button', { name: 'Explain New Project' }))
 
     expect(replayFirst).toHaveBeenCalledOnce()
+    expect(replayApp).toHaveBeenCalledOnce()
     expect(replayProject).toHaveBeenCalledOnce()
+  })
+
+  it('finishes short onboarding only after the selected Overseer is created', async () => {
+    store.profiles = [
+      { id: 'claude-guide', provider: 'claude', available: true, authStatus: 'signed_in' },
+    ]
+    loginMocks.configureOverseer.mockResolvedValue({
+      configured: true,
+      profileId: 'claude-guide',
+      sessionId: 'overseer-guide',
+      available: true,
+    })
+    const configured = vi.fn()
+    const close = vi.fn()
+    render(SettingsModal, {
+      props: {
+        onclose: close,
+        initialTab: 'system',
+        onoverseerconfigured: configured,
+      },
+    })
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Create Overseer' }))
+
+    expect(loginMocks.configureOverseer).toHaveBeenCalledWith('claude-guide')
+    expect(configured).toHaveBeenCalledOnce()
+    expect(close).toHaveBeenCalledOnce()
   })
 })

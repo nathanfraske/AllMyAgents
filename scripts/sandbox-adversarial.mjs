@@ -19,6 +19,7 @@ import path from 'node:path'
 const PORT = 7788
 const BASE = `http://127.0.0.1:${PORT}`
 const SANDBOX_CONFIG = path.resolve('.sandbox/data/config.json')
+const SANDBOX_TOKEN = path.resolve('.sandbox/data/device-token.txt')
 
 if (process.env.HUB_PORT === '7777' || process.argv.includes('--port=7777')) {
   console.error('refusing to run against the live hub on 7777')
@@ -52,9 +53,13 @@ function must(name, condition, whyItFailed = '') {
 }
 
 async function api(method, pathname, body) {
+  const token = fs.readFileSync(SANDBOX_TOKEN, 'utf8').trim()
   const res = await fetch(`${BASE}${pathname}`, {
     method,
-    headers: body === undefined ? {} : { 'content-type': 'application/json' },
+    headers: {
+      authorization: `Bearer ${token}`,
+      ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+    },
     body: body === undefined ? undefined : JSON.stringify(body),
   })
   const text = await res.text()
@@ -199,11 +204,12 @@ async function groupMalformed() {
     ['POST', '/api/sessions', JSON.stringify({ profileId: '../../etc/passwd' })],
     ['GET', '/api/sessions/%2e%2e%2f%2e%2e%2fetc%2fpasswd/journal', undefined],
   ]
+  const token = fs.readFileSync(SANDBOX_TOKEN, 'utf8').trim()
   for (const [method, pathname, body] of probes) {
     try {
       const res = await fetch(`${BASE}${pathname}`, {
         method,
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
         body,
       })
       must(`${method} ${pathname.slice(0, 46)} does not 5xx`, res.status < 500, `got ${res.status}`)
@@ -279,8 +285,9 @@ async function groupPoisonedJournal() {
     bad('replay returned events', `got ${JSON.stringify(replay.json).slice(0, 160)}`)
   }
 
-  // And it must survive a RESTART with the poison still on disk — the original brick was a crash LOOP
-  // at startup, which a still-running process would not have shown.
+  // And it must survive a RESTART. Current preflight correctly refuses the poisoned family, then the
+  // supervisor restores an identity-bound verified generation; the original bug was an unrecoverable
+  // crash loop, so a still-running process alone would not prove this boundary.
   const { execSync } = await import('node:child_process')
   execSync('node scripts/sandbox.mjs down', { stdio: 'ignore' })
   execSync('node scripts/sandbox.mjs up', { stdio: 'ignore' })
@@ -293,7 +300,7 @@ async function groupPoisonedJournal() {
       break
     }
   }
-  must('hub BOOTS with the poisoned row still on disk', booted, 'did not come back within 30s')
+  must('hub safely RECOVERS and boots after a poisoned journal', booted, 'did not come back within 30s')
 }
 
 const GROUPS = {
@@ -325,4 +332,12 @@ if (fail) {
   console.log('\nfailures:')
   for (const f of failures) console.log(`  - ${f}`)
 }
-process.exit(fail === 0 ? 0 : 1)
+// Keep a machine-readable result because the poison/restart group intentionally tears down the process
+// tree that owns the sandbox, which can detach the captured Windows console stream in some runners.
+fs.writeFileSync(
+  path.resolve('.sandbox/adversarial-result.json'),
+  `${JSON.stringify({ pass, fail, failures, completedAt: new Date().toISOString() }, null, 2)}\n`,
+)
+// Let Node drain stdout/stderr before exit. `process.exit(...)` can drop the entire result table on
+// Windows when this harness is run under a release orchestrator with piped output.
+process.exitCode = fail === 0 ? 0 : 1

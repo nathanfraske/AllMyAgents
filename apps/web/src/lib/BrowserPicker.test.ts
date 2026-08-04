@@ -54,7 +54,10 @@ describe('BrowserPicker', () => {
     })
 
     expect(screen.getByText('Browser off')).toBeTruthy()
-    await fireEvent.click(screen.getByTitle('Browser off for this chat'))
+    const trigger = screen.getByRole('button', { name: 'Browser off' })
+    expect(trigger.getAttribute('aria-expanded')).toBe('false')
+    await fireEvent.click(trigger)
+    expect(trigger.getAttribute('aria-expanded')).toBe('true')
     expect(document.body.textContent).toContain(
       'This browser belongs only to Hopper. It does not use your normal browser logins. If you sign in here, this agent can read pages available to that signed-in session until you clear its browser data.',
     )

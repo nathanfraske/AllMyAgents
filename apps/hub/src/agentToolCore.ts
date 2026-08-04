@@ -5,22 +5,110 @@ import type { BusAddress, BusMessage } from './bus.js'
 import type { Memory } from './memory.js'
 import type { Practice } from './practices.js'
 import { decidePracticeGate, practiceScope } from './practices.js'
-import type { DangerFlags, DelegatedAuthority } from './types.js'
+import type {
+  DangerFlags,
+  DelegatedAuthority,
+  ManagerAgentType,
+  Provider,
+  RemoteDeviceGrant,
+} from './types.js'
+import type { ElevatedShell, ElevationScope } from './elevatedCommand.js'
+import type { TeamPresetDraft } from './teamPresets.js'
 import type { BrowserOperation, BrowserResultContent } from './browserProtocol.js'
 import type { RemoteDeviceAction, RemoteDeviceActionResult, RemoteDeviceView } from './remoteDevices.js'
 
 export interface OverseerControlInput {
-  operation: 'status' | 'create_project' | 'create_chat' | 'send_chat' | 'stop_chat' | 'reopen_chat' | 'approve' | 'set_mode' | 'restart_hub'
+  operation:
+    | 'status'
+    | 'guide'
+    | 'ui_catalog'
+    | 'highlight_ui'
+    | 'failure_context'
+    | 'create_project'
+    | 'create_chat'
+    | 'send_chat'
+    | 'stop_chat'
+    | 'reopen_chat'
+    | 'approve'
+    | 'set_mode'
+    | 'set_session_config'
+    | 'configure_manager'
+    | 'list_team_presets'
+    | 'save_team_preset'
+    | 'delete_team_preset'
+    | 'launch_team'
+    | 'remote_catalog'
+    | 'set_remote_grants'
+    | 'start_account_login'
+    | 'github_repositories'
+    | 'clone_github_repository'
+    | 'github_clone_status'
+    | 'issue_pairing_code'
+    | 'get_elevation_policy'
+    | 'configure_elevation'
+    | 'analyze_elevated_command'
+    | 'run_elevated_command'
+    | 'restart_hub'
   projectId?: string
   profileId?: string
   sessionId?: string
   approvalId?: string
+  presetId?: string
+  cloneJobId?: string
   name?: string
   path?: string
   text?: string
+  reason?: string
+  model?: string
+  effort?: string
+  serviceTier?: string
+  role?: string
   approve?: boolean
+  reauth?: boolean
+  provider?: Provider
   permissionMode?: 'safe' | 'edits' | 'full'
   useWorktree?: boolean
+  preset?: TeamPresetDraft
+  managerConfig?: {
+    enabled: boolean
+    maxLiveChildren?: number
+    delegation?: DelegatedAuthority[]
+    allowedProfiles?: string[]
+    allowedModels?: Record<string, string[]>
+    allowedTools?: string[]
+    agentTypes?: ManagerAgentType[]
+    startingPrompt?: string
+    orientationBrief?: string
+    operatorTask?: string
+    standingInstructions?: string
+    canApproveChildren?: boolean
+    permissionMode?: 'safe' | 'edits' | 'full'
+    maxChildPermissionMode?: 'safe' | 'edits' | 'full'
+  }
+  remoteGrants?: RemoteDeviceGrant[]
+  repository?: string
+  distro?: string
+  elevationScope?: ElevationScope
+  allowedPaths?: string[]
+  command?: string
+  shell?: ElevatedShell
+  timeoutMs?: number
+  uiTarget?:
+    | 'home'
+    | 'new_project'
+    | 'project_overview'
+    | 'overseer'
+    | 'accounts'
+    | 'chat_defaults'
+    | 'remote_access'
+    | 'safety'
+    | 'hub_status'
+    | 'managers'
+    | 'browser'
+    | 'composer'
+    | 'permissions'
+    | 'history'
+  uiMessage?: string
 }
 
 export interface OverseerControlResult {
@@ -869,22 +957,118 @@ const remoteExec = defineTool({
   },
 })
 
+const overseerPermissionMode = z.enum(['safe', 'edits', 'full'])
+const overseerAgentType = z.object({
+  id: z.string().min(1).max(80),
+  name: z.string().min(1).max(100),
+  purpose: z.string().min(1).max(2_000),
+  selection: z.enum(['fixed', 'usage-aware']),
+  profileId: z.string().max(256).optional(),
+  profileIds: z.array(z.string().min(1).max(256)).max(32).optional(),
+  model: z.string().max(256).optional(),
+  effort: z.string().max(64).optional(),
+}).strict()
+const overseerManagerConfig = z.object({
+  enabled: z.boolean(),
+  maxLiveChildren: z.number().int().min(1).max(16).optional(),
+  delegation: z.array(z.enum(['commit', 'push'])).max(2).optional(),
+  allowedProfiles: z.array(z.string().min(1).max(256)).max(32).optional(),
+  allowedModels: z.record(z.string(), z.array(z.string().min(1).max(256)).max(64)).optional(),
+  allowedTools: z.array(z.string().min(1).max(128)).max(128).optional(),
+  agentTypes: z.array(overseerAgentType).max(16).optional(),
+  startingPrompt: z.string().max(20_000).optional(),
+  orientationBrief: z.string().max(20_000).optional(),
+  operatorTask: z.string().max(20_000).optional(),
+  standingInstructions: z.string().max(20_000).optional(),
+  canApproveChildren: z.boolean().optional(),
+  permissionMode: overseerPermissionMode.optional(),
+  maxChildPermissionMode: overseerPermissionMode.optional(),
+}).strict()
+const overseerPreset = z.object({
+  id: z.string().max(256).optional(),
+  name: z.string().min(1).max(120),
+  description: z.string().max(2_000).optional(),
+  manager: z.object({
+    profileId: z.string().min(1).max(256),
+    model: z.string().max(256).optional(),
+    effort: z.string().max(64).optional(),
+    permissionMode: overseerPermissionMode,
+    maxChildPermissionMode: overseerPermissionMode,
+    maxLiveChildren: z.number().int().min(1).max(16),
+    canApproveChildren: z.boolean(),
+    delegation: z.array(z.enum(['commit', 'push'])).max(2),
+    allowedTools: z.array(z.string().min(1).max(128)).max(128),
+    orientationBrief: z.string().max(20_000).optional(),
+    standingInstructions: z.string().max(20_000).optional(),
+  }).strict(),
+  agents: z.array(z.object({
+    id: z.string().min(1).max(80),
+    name: z.string().min(1).max(100),
+    purpose: z.string().min(1).max(2_000),
+    prompt: z.string().min(1).max(20_000),
+    profileId: z.string().min(1).max(256),
+    model: z.string().max(256).optional(),
+    effort: z.string().max(64).optional(),
+    permissionMode: overseerPermissionMode,
+    useWorktree: z.boolean(),
+    authorities: z.array(z.enum(['commit', 'push'])).max(2),
+    tools: z.array(z.string().min(1).max(128)).max(128),
+  }).strict()).min(1).max(16),
+}).strict()
+
 const overseerControl = defineTool({
   name: 'overseer_control',
   description:
-    'Application Overseer only: inspect and operate hub-owned projects, chats, approvals, permission overrides, and safe hub restart. The hub denies ordinary sessions and teammate-caused turns even if they call this tool.',
+    'Application Overseer only: explain how AllMyAgents works; inspect fleet failures; configure projects, managers, reusable team presets, chats, accounts, remote-device grants, GitHub imports, mesh pairing, and safe hub restarts. Elevated commands require a configured project policy, blast-radius analysis, a separate explicit operator approval, and (on Windows) UAC. Mutations are denied on teammate-caused turns.',
   schema: {
-    operation: z.enum(['status', 'create_project', 'create_chat', 'send_chat', 'stop_chat', 'reopen_chat', 'approve', 'set_mode', 'restart_hub']),
+    operation: z.enum([
+      'status', 'guide', 'ui_catalog', 'highlight_ui', 'failure_context', 'create_project', 'create_chat', 'send_chat', 'stop_chat',
+      'reopen_chat', 'approve', 'set_mode', 'set_session_config', 'configure_manager',
+      'list_team_presets', 'save_team_preset', 'delete_team_preset', 'launch_team',
+      'remote_catalog', 'set_remote_grants', 'start_account_login', 'github_repositories',
+      'clone_github_repository', 'github_clone_status', 'issue_pairing_code',
+      'get_elevation_policy', 'configure_elevation', 'analyze_elevated_command',
+      'run_elevated_command', 'restart_hub',
+    ]),
     project_id: z.string().max(256).optional(),
     profile_id: z.string().max(256).optional(),
     session_id: z.string().max(256).optional(),
     approval_id: z.string().max(256).optional(),
+    preset_id: z.string().max(256).optional(),
+    clone_job_id: z.string().max(256).optional(),
     name: z.string().max(200).optional(),
     path: z.string().max(4096).optional(),
     text: z.string().max(100_000).optional(),
+    reason: z.string().max(2_000).optional(),
+    model: z.string().max(256).optional(),
+    effort: z.string().max(64).optional(),
+    service_tier: z.string().max(64).optional(),
+    role: z.string().max(2_000).optional(),
     approve: z.boolean().optional(),
-    permission_mode: z.enum(['safe', 'edits', 'full']).optional(),
+    reauth: z.boolean().optional(),
+    provider: z.enum(['claude', 'codex']).optional(),
+    permission_mode: overseerPermissionMode.optional(),
     use_worktree: z.boolean().optional(),
+    preset: overseerPreset.optional(),
+    manager_config: overseerManagerConfig.optional(),
+    remote_grants: z.array(z.object({
+      siteId: z.string().min(1).max(256),
+      rootIds: z.array(z.string().min(1).max(128)).min(1).max(64),
+      capabilities: z.array(z.enum(['read', 'write', 'terminal'])).min(1).max(3),
+    }).strict()).max(32).optional(),
+    repository: z.string().max(512).optional(),
+    distro: z.string().max(256).optional(),
+    elevation_scope: z.enum(['disabled', 'project', 'machine']).optional(),
+    allowed_paths: z.array(z.string().min(1).max(4096)).max(15).optional(),
+    command: z.string().min(1).max(8_000).optional(),
+    shell: z.enum(['powershell', 'bash']).optional(),
+    timeout_ms: z.number().int().min(1_000).max(15 * 60 * 1_000).optional(),
+    ui_target: z.enum([
+      'home', 'new_project', 'project_overview', 'overseer', 'accounts', 'chat_defaults',
+      'remote_access', 'safety', 'hub_status', 'managers', 'browser', 'composer',
+      'permissions', 'history',
+    ]).optional(),
+    ui_message: z.string().min(1).max(600).optional(),
   },
   run: async (args, { identity, services }) => {
     const result = await services.overseerControl(identity.sessionId, {
@@ -893,12 +1077,33 @@ const overseerControl = defineTool({
       profileId: args.profile_id,
       sessionId: args.session_id,
       approvalId: args.approval_id,
+      presetId: args.preset_id,
+      cloneJobId: args.clone_job_id,
       name: args.name,
       path: args.path,
       text: args.text,
+      reason: args.reason,
+      model: args.model,
+      effort: args.effort,
+      serviceTier: args.service_tier,
+      role: args.role,
       approve: args.approve,
+      reauth: args.reauth,
+      provider: args.provider,
       permissionMode: args.permission_mode,
       useWorktree: args.use_worktree,
+      preset: args.preset,
+      managerConfig: args.manager_config,
+      remoteGrants: args.remote_grants,
+      repository: args.repository,
+      distro: args.distro,
+      elevationScope: args.elevation_scope,
+      allowedPaths: args.allowed_paths,
+      command: args.command,
+      shell: args.shell,
+      timeoutMs: args.timeout_ms,
+      uiTarget: args.ui_target,
+      uiMessage: args.ui_message,
     })
     if (!result.ok) return `Overseer control denied or failed: ${result.error ?? 'unknown error'}`
     return result.data === undefined ? 'Overseer operation completed.' : JSON.stringify(result.data, null, 2)
