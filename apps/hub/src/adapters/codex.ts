@@ -7,6 +7,7 @@ import { AGENT_MCP_SERVER_NAME } from '../codexMcpConfig.js'
 import { windowsPathToWsl } from '../workspaceLocation.js'
 import { nativeWslExecutable, spawnInWsl } from '../wslProcess.js'
 import { repairCodexRolloutPaths } from '../codexRolloutRelocation.js'
+import { CODEX_COMPACTION_PROMPT } from '../compactionContinuity.js'
 import {
   documentTextBlock,
   isPdfAttachment,
@@ -53,6 +54,7 @@ export type CodexApprovalHandler = (method: string, params: unknown) => Promise<
 /** Codex server-request method for an MCP **elicitation** (a server asking the user), as opposed to the
  *  exec/patch approvals. Codex raises one the first time a thread uses a given MCP server's tool. */
 export const CODEX_ELICITATION_METHOD = 'mcpServer/elicitation/request'
+export const CODEX_PERMISSIONS_APPROVAL_METHOD = 'item/permissions/requestApproval'
 
 /**
  * Build the JSON-RPC result codex expects for a server request. THE SHAPES DIFFER and getting it wrong is
@@ -123,10 +125,25 @@ export function codexGrantKey(method: string): string {
   return core || method
 }
 
-export function codexRequestResult(method: string, approved: boolean): Record<string, string> {
-  return method === CODEX_ELICITATION_METHOD
-    ? { action: approved ? 'accept' : 'decline' }
-    : { decision: approved ? 'accept' : 'decline' }
+export function codexRequestResult(
+  method: string,
+  approved: boolean,
+  params?: unknown,
+): Record<string, unknown> {
+  if (method === CODEX_ELICITATION_METHOD) {
+    return { action: approved ? 'accept' : 'decline' }
+  }
+  if (method === CODEX_PERMISSIONS_APPROVAL_METHOD) {
+    const requested = (params as { permissions?: unknown } | null)?.permissions
+    const permissions = approved && requested !== null && typeof requested === 'object' && !Array.isArray(requested)
+      ? requested
+      : {}
+    // App-server 0.145 does not accept the ordinary `{decision}` response for request_permissions.
+    // It requires the granted SUBSET. Echoing only the exact requested profile after hub approval is
+    // fail-closed, and turn scope avoids silently converting one operator decision into a durable grant.
+    return { permissions, scope: 'turn' }
+  }
+  return { decision: approved ? 'accept' : 'decline' }
 }
 
 /**
@@ -288,6 +305,14 @@ export class CodexClient {
   private readonly subagentSubscriptions = new Set<string>()
   // threadId -> id of the turn currently running on that thread (for steer's expectedTurnId)
   private readonly activeTurns = new Map<string, string>()
+  /** Last developer-instruction bytes applied to each root thread. Invalidated after compaction. */
+  private readonly developerInstructionsByThread = new Map<string, string>()
+  /**
+   * `thread/start` allocates an id before app-server has written a rollout. `thread/resume` rejects that
+   * id until the first turn starts, even on the same live connection. Keep the short pristine window
+   * explicit so a concurrent topology change cannot turn the first send into "no rollout found".
+   */
+  private readonly pristineThreads = new Set<string>()
   private initPromise: Promise<void> | undefined
 
   constructor(
@@ -397,9 +422,9 @@ export class CodexClient {
       if (this.onApproval) {
         void this.onApproval(method, routed.payload)
           .then((result) => this.send({ id, result }))
-          .catch(() => this.send({ id, result: { decision: 'decline' } }))
+          .catch(() => this.send({ id, result: codexRequestResult(method, false, msg.params) }))
       } else {
-        this.send({ id, result: { decision: 'decline' } })
+        this.send({ id, result: codexRequestResult(method, false, msg.params) })
       }
       return
     }
@@ -407,10 +432,23 @@ export class CodexClient {
     // new turn's id (params.turn.id); turn/completed and turn/error end that turn.
     if (msg.method === 'turn/started') {
       const p = msg.params as { threadId?: string; turn?: { id?: string } } | null
-      if (p?.threadId && p.turn?.id) this.activeTurns.set(p.threadId, p.turn.id)
+      if (p?.threadId && p.turn?.id) {
+        this.activeTurns.set(p.threadId, p.turn.id)
+        this.pristineThreads.delete(p.threadId)
+      }
     } else if (msg.method === 'turn/completed' || msg.method === 'turn/error') {
       const p = msg.params as { threadId?: string } | null
       if (p?.threadId) this.activeTurns.delete(p.threadId)
+    }
+    if (msg.method === 'item/completed') {
+      const p = msg.params as { threadId?: string; item?: { type?: string } } | null
+      if (p?.threadId && p.item?.type === 'contextCompaction') {
+        // Developer instructions are thread settings and remain in Codex's protected prefix across
+        // compaction. Clear the local equality cache anyway so the next turn reasserts the exact live
+        // app/topology bytes through thread/resume instead of trusting that invariant indefinitely.
+        // This does NOT clear the vendor thread, its new continuity summary, or any conversation state.
+        this.developerInstructionsByThread.delete(p.threadId)
+      }
     }
     const method = msg.method as string
     const routed = this.routeThreadPayload(msg.params ?? null)
@@ -422,25 +460,62 @@ export class CodexClient {
     this.onEvent(routed.isSubagent ? `codex/subagent/${method}` : `codex/${method}`, routed.payload)
   }
 
-  async startThread(cwd: string): Promise<string> {
+  async startThread(cwd: string, developerInstructions?: string): Promise<string> {
     await this.ensureStarted()
+    const normalized = developerInstructions?.trim()
+    const params: Record<string, unknown> = {
+      cwd,
+      // Installed app-server 0.145 exposes thread-scoped config overrides on thread/start. The official
+      // Codex config key is snake_case; unlike developerInstructions, this controls the summary request
+      // itself. CODEX_COMPACTION_PROMPT is deliberately a complete replacement prompt.
+      config: { compact_prompt: CODEX_COMPACTION_PROMPT },
+    }
+    if (normalized) params.developerInstructions = normalized
     const result = await this.request<{
       threadId?: string
       thread?: { id?: string; parentThreadId?: string | null }
-    }>('thread/start', { cwd })
+    }>('thread/start', params)
     const threadId = result.threadId ?? result.thread?.id
     if (!threadId) throw new Error('thread/start returned no thread id')
     this.threadParents.set(threadId, result.thread?.parentThreadId ?? null)
+    this.pristineThreads.add(threadId)
+    if (normalized) this.developerInstructionsByThread.set(threadId, normalized)
     return threadId
   }
 
-  async resumeThread(threadId: string): Promise<void> {
+  async resumeThread(threadId: string, developerInstructions?: string): Promise<void> {
     await this.ensureStarted()
+    const normalized = developerInstructions?.trim()
+    const params: Record<string, unknown> = {
+      threadId,
+      // Reassert the compaction contract when joining an existing thread, including threads created by
+      // an older AllMyAgents cut. This upgrades current sessions without requiring recreation.
+      config: { compact_prompt: CODEX_COMPACTION_PROMPT },
+    }
+    if (normalized) params.developerInstructions = normalized
     const result = await this.request<{ thread?: { id?: string; parentThreadId?: string | null } }>(
       'thread/resume',
-      { threadId }
+      params
     )
-    this.threadParents.set(result.thread?.id ?? threadId, result.thread?.parentThreadId ?? null)
+    const resumedId = result.thread?.id ?? threadId
+    this.threadParents.set(resumedId, result.thread?.parentThreadId ?? null)
+    this.pristineThreads.delete(threadId)
+    this.pristineThreads.delete(resumedId)
+    if (normalized) this.developerInstructionsByThread.set(resumedId, normalized)
+  }
+
+  /** Refresh changed app/topology instructions on an already-loaded thread without adding a fake turn. */
+  async ensureDeveloperInstructions(threadId: string, developerInstructions?: string): Promise<void> {
+    const normalized = developerInstructions?.trim()
+    if (!normalized || this.developerInstructionsByThread.get(threadId) === normalized) return
+    // The initial developer contract is already installed on this in-memory thread. App-server does not
+    // expose an in-place pre-turn mutation seam, and thread/resume cannot address it until a rollout
+    // exists. Keep the safe initial bytes for turn one; after turn/started clears this marker, the next
+    // accepted turn can refresh changed topology through the supported resume seam.
+    if (this.pristineThreads.has(threadId)) return
+    // The generated 0.145 protocol exposes developerInstructions on thread/start and thread/resume,
+    // not as an arbitrary turn/start field. Rejoining a running thread is the supported update seam.
+    await this.resumeThread(threadId, normalized)
   }
 
   /**

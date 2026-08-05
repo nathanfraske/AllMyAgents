@@ -305,6 +305,19 @@ describe('ProjectView', () => {
     expect(store.projectViewId).toBeNull()
   })
 
+  it('shows a child purpose control without opening the child chat when it is inspected', async () => {
+    store.selectedId = null
+    render(ProjectView, { props: { projectId: project.id } })
+
+    const purpose = screen.getByRole('button', { name: 'Bose purpose: Collision writer' })
+    await fireEvent.click(purpose)
+
+    expect(store.selectedId).toBeNull()
+    expect(store.projectViewId).toBe(project.id)
+    expect(purpose.getAttribute('aria-expanded')).toBe('true')
+    expect(screen.getByRole('note').textContent).toMatch(/Purpose.*Collision writer/u)
+  })
+
   it('switches between overview and the full manager conversation and remembers the choice', async () => {
     const view = render(ProjectView, { props: { projectId: project.id } })
 

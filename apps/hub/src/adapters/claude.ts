@@ -40,6 +40,8 @@ export interface ClaudeTurnOptions {
   model?: string
   permissionMode?: 'safe' | 'edits' | 'full'
   effort?: string
+  /** App-host contract that must remain authoritative across resume and vendor compaction. */
+  systemPrompt?: string
   /**
    * Whether the operator has approved THIS project's own executable config (`.mcp.json` servers +
    * `.claude/settings.json` hooks). Default/undefined = NOT approved → the safe-default gate below stops
@@ -240,6 +242,16 @@ export class ClaudeDriver {
     }
     if (this.vendorSessionId) options.resume = this.vendorSessionId
     if (turnOptions.model) options.model = turnOptions.model
+    const systemPrompt = turnOptions.systemPrompt?.trim()
+    if (systemPrompt) {
+      // CLAUDE.md is still useful project context, but a resumed Claude Code conversation is not
+      // guaranteed to rediscover a changed file and a vendor compaction may summarize prior reminders.
+      // The preset append is the SDK's system-level seam: it is supplied on EVERY query invocation, so
+      // the live AllMyAgents tool/permission contract remains present without replacing Claude Code's
+      // own system prompt. Subagents receive the same host boundary if Claude creates any internally.
+      options.systemPrompt = { type: 'preset', preset: 'claude_code', append: systemPrompt }
+      options.appendSubagentSystemPrompt = systemPrompt
+    }
     // DELIBERATELY NOT MAPPED ONTO THE SDK'S permissionMode. Our modes are enforced by the hub, and
     // handing them to the vendor as well does not reinforce them — it REPLACES them with something weaker.
     //

@@ -25,6 +25,16 @@ export interface WorkerSessionSpec {
   effort?: string
   serviceTier?: string
   permissionMode?: 'safe' | 'edits' | 'full'
+  /**
+   * Claude-only app-host contract appended to Claude Code's system prompt for every invocation. Unlike
+   * CLAUDE.md, this is present on resumed conversations and survives the vendor's context compaction.
+   */
+  claudeSystemPrompt?: string
+  /**
+   * Codex-only app-host contract set as thread developer instructions. Unlike AGENTS.md, this can be
+   * refreshed on an already-running/resumed thread and remains part of the prefix across compaction.
+   */
+  codexDeveloperInstructions?: string
   /** True only when the operator approved this project's executable MCP/hook config. */
   trustProjectConfig?: boolean
   vendorSessionId?: string // claude --resume id / codex threadId to resume
@@ -134,6 +144,10 @@ export const HUB_RELAY_DELIVERED_BACKSTOP_MS = 120_000
  *  "denied"/"disabled"/"gone" shape, which an agent reads as a broken system (§8.3). */
 export const HUB_UNAVAILABLE_TEXT =
   'The hub is briefly unavailable (it is restarting). Nothing was lost — retry this tool call in a moment.'
+
+/** Shared Claude denial guidance so in-process and detached-worker execution cannot drift. */
+export const CLAUDE_PERMISSION_DENIED_TEXT =
+  'Denied by the AllMyAgents hub. Do not replace this tool permission with a prose or AskUserQuestion request. If this was delegated work, report the exact blocked tool and action upstream with mcp__allmyagents__send_message, then continue any unblocked work.'
 
 export class HubUnavailableError extends Error {
   readonly retryable = true

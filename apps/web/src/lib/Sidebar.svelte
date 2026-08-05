@@ -7,6 +7,7 @@
   import { shouldBadgeNodes } from './fleetMerge'
   import Usage from './Usage.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
+  import AgentPurposeInfo from './AgentPurposeInfo.svelte'
   import Icon from './Icon.svelte'
   import { unreadMailCount, unreadMailTitle } from './unreadMail'
   import ImportChats from './ImportChats.svelte'
@@ -1199,6 +1200,9 @@
                 {:else}
                   <!-- svelte-ignore a11y_no_static_element_interactions -->
                   <span class="rlabel" class:glitch={glitching.has(s.record.id)} ondblclick={(e) => startRename(e, s)}>{label(s)}</span>
+                {/if}
+                {#if en.managerDepth > 0 && s.record.role?.trim()}
+                  <AgentPurposeInfo agentName={label(s)} purpose={s.record.role.trim()} />
                 {/if}
                 {#if s.record.worktree}
                   <span class="wtbadge" title={s.record.worktree} aria-label={`Worktree branch ${s.record.branch ?? s.record.worktree.split(/[\\/]/).pop()}`}>

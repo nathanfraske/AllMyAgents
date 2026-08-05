@@ -103,4 +103,37 @@ describe('sidebar launch controls', () => {
     expect(store.selectedId).toMatch(/^draft:/)
     expect(store.sessions[store.selectedId!]?.record.projectId).toBe(project.id)
   })
+
+  it('lets the operator inspect a managed child purpose without opening its chat', async () => {
+    store.sessions = {
+      manager: {
+        record: {
+          id: 'manager', profileId: 'claude-main', provider: 'claude', projectId: project.id,
+          cwd: project.path, status: 'idle', title: 'Noether', isProjectManager: true,
+          managerTeams: [{ id: 'team-a', name: 'Core', createdAt: project.createdAt, activatedAt: project.createdAt }],
+          managerActiveTeamId: 'team-a', createdAt: project.createdAt,
+        },
+        items: [], lastActivity: project.createdAt, sawReasoning: false,
+      },
+      child: {
+        record: {
+          id: 'child', profileId: 'claude-main', provider: 'claude', projectId: project.id,
+          cwd: project.path, status: 'idle', title: 'Bose', parentSessionId: 'manager',
+          managerTeamId: 'team-a', managerTeamName: 'Core', role: 'Audit concurrency and reproduce races.',
+          createdAt: project.createdAt,
+        },
+        items: [], lastActivity: project.createdAt, sawReasoning: false,
+      },
+    }
+
+    render(Sidebar)
+    const purpose = screen.getByRole('button', {
+      name: 'Bose purpose: Audit concurrency and reproduce races.',
+    })
+    await fireEvent.click(purpose)
+
+    expect(store.selectedId).toBeNull()
+    expect(purpose.getAttribute('aria-expanded')).toBe('true')
+    expect(screen.getByRole('note').textContent).toMatch(/Audit concurrency and reproduce races\./u)
+  })
 })

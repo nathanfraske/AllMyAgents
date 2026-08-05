@@ -28,6 +28,16 @@ import { strToU8, zipSync } from 'fflate'
 const cleanups: Array<() => void | Promise<void>> = []
 const TEST_DEVICE_TOKEN = 'attachment-test-device-token-at-least-32-characters'
 const nativeFetch = globalThis.fetch
+// WHATWG Fetch refuses these ports even when a test server successfully binds one. Port 0 may select
+// any host ephemeral range, so explicitly rebind rather than letting a valid HTTP harness fail as
+// `TypeError: bad port` on machines whose ephemeral range overlaps the blocked list.
+const FETCH_FORBIDDEN_PORTS = new Set([
+  1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95,
+  101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161,
+  179, 389, 427, 465, 512, 513, 514, 515, 526, 530, 531, 532, 540, 548, 554, 556, 563,
+  587, 601, 636, 989, 990, 993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060,
+  5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6697, 10080,
+])
 
 function fetch(input: string | URL | Request, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers)
@@ -243,8 +253,19 @@ async function build(provider: 'claude' | 'codex' = 'claude') {
     configPath: path.join(tmp, 'config.json'),
   } satisfies ServerOptions)
   if (!server.listening) await once(server, 'listening')
-  const address = server.address() as { port: number }
+  let address = server.address() as { port: number }
+  while (FETCH_FORBIDDEN_PORTS.has(address.port)) {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve())
+    })
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    address = server.address() as { port: number }
+  }
   cleanups.push(async () => {
+    // Session creation queues one idle bus-delivery tick. Drain it before closing the shared test DB so
+    // an early assertion/fetch failure cannot turn harmless cleanup into an uncaught SQLite exception.
+    await new Promise<void>((resolve) => setImmediate(resolve))
     if (server.listening) {
       const closed = new Promise<void>((resolve) => server.close(() => resolve()))
       server.closeAllConnections()

@@ -47,6 +47,7 @@ function harness() {
     isBusy: () => false,
   }
   const bus = new AgentBus(journal.db)
+  const projects = new ProjectStore(journal.db, journal)
   const sessions = new SessionManager(
     journal,
     store,
@@ -54,7 +55,7 @@ function harness() {
     approvals,
     new UsageMonitor(journal, profiles, {}),
     new WorkspaceManager(path.join(root, 'worktrees')),
-    new ProjectStore(journal.db, journal),
+    projects,
     new InstructionStore(journal.db),
     bus,
     new MemoryStore(journal.db),
@@ -82,7 +83,7 @@ function harness() {
     journal.db.close()
     fs.rmSync(root, { recursive: true, force: true })
   })
-  return { root, journal, store, approvals, sessions, executor, bus, profiles, seed, markOperator, markBus }
+  return { root, journal, store, approvals, sessions, executor, bus, projects, profiles, seed, markOperator, markBus }
 }
 
 describe('application Overseer authority', () => {
@@ -96,26 +97,27 @@ describe('application Overseer authority', () => {
       status: 'idle',
       createdAt: '2026-07-01T00:00:00.000Z',
       isOverseer: true,
+      overseerCapabilityVersion: 3,
       permissionMode: 'safe',
     })
 
     h.sessions.loadRecords()
     const loadedLegacy = h.store.all().find((record) => record.id === 'legacy-overseer')
     expect(loadedLegacy).toMatchObject({ permissionMode: 'safe' })
-    expect(loadedLegacy?.overseerCapabilityVersion).toBeUndefined()
+    expect(loadedLegacy?.overseerCapabilityVersion).toBe(3)
     expect(h.journal.recentEventsForSession('legacy-overseer', 20)).toEqual([])
 
     h.sessions.reconcileStale()
 
     expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
       isOverseer: true,
-      overseerCapabilityVersion: 3,
+      overseerCapabilityVersion: 4,
       permissionMode: 'full',
       permissionModeOperatorOverride: true,
       role: 'Application Overseer',
     })
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
-      'Overseer capability manifest version 3',
+      'Overseer capability manifest version 4',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'mcp__allmyagents__overseer_control',
@@ -127,8 +129,8 @@ describe('application Overseer authority', () => {
       .filter((event) => event.kind === 'overseer/capabilities-upgraded')
     expect(upgrades()).toHaveLength(1)
     expect(upgrades()[0]?.payload).toMatchObject({
-      fromVersion: 0,
-      toVersion: 3,
+      fromVersion: 3,
+      toVersion: 4,
       conversationPreserved: true,
       tools: expect.arrayContaining(['overseer_control', 'remote_exec', 'browser_navigate']),
     })
@@ -427,6 +429,165 @@ describe('application Overseer authority', () => {
     expect(h.executor.steer).not.toHaveBeenCalled()
     expect(h.bus.pending('overseer')).toHaveLength(1)
     expect(h.bus.pending('overseer')[0]?.subject).toBe('fleet failure')
+  })
+
+  it('reinjects role-specific Claude app tools after a compacted conversation resumes', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full', vendorSessionId: 'resume-overseer' })
+    h.seed({ id: 'manager', isProjectManager: true, projectId: 'project-a' })
+    h.seed({ id: 'child', parentSessionId: 'manager', projectId: 'project-a' })
+
+    await h.sessions.send('overseer', 'inspect the fleet')
+    h.journal.append('overseer', 'claude/system', { subtype: 'compact_boundary' })
+    await h.sessions.send('overseer', 'continue after compaction')
+    await h.sessions.send('manager', 'check the team')
+    await h.sessions.send('child', 'report status')
+
+    const calls = vi.mocked(h.executor.runTurn).mock.calls
+    const overseerSpecs = calls
+      .filter(([, prompt]) => prompt === 'inspect the fleet' || prompt === 'continue after compaction')
+      .map(([spec]) => spec)
+    expect(overseerSpecs).toHaveLength(2)
+    for (const spec of overseerSpecs) {
+      expect(spec.vendorSessionId).toBe('resume-overseer')
+      expect(spec.claudeSystemPrompt).toMatch(/ToolSearch.*allmyagents/u)
+      expect(spec.claudeSystemPrompt).toMatch(/mcp__allmyagents__overseer_control/u)
+      expect(spec.claudeSystemPrompt).toMatch(/fleet-wide/u)
+      expect(spec.claudeSystemPrompt).toMatch(/AskUserQuestion/u)
+      expect(spec.claudeSystemPrompt).toMatch(/COMPACTION CONTINUITY CONTRACT/u)
+      expect(spec.claudeSystemPrompt).toMatch(/active objective.*current project.*current slice/su)
+      expect(spec.claudeSystemPrompt).toMatch(/exact next useful action/u)
+    }
+    expect(calls.find(([, prompt]) => prompt === 'check the team')?.[0].claudeSystemPrompt).toMatch(
+      /decide_child_approval/u,
+    )
+    expect(calls.find(([, prompt]) => prompt === 'report status')?.[0].claudeSystemPrompt).toMatch(
+      /report a real scope or permission block upstream/u,
+    )
+  })
+
+  it('gives Codex live developer instructions with bounded fleet/team topology and provider discipline', async () => {
+    const h = harness()
+    const projectDir = path.join(h.root, 'project-alpha')
+    const unrelatedDir = path.join(h.root, 'project-archive')
+    fs.mkdirSync(projectDir)
+    fs.mkdirSync(unrelatedDir)
+    const project = h.projects.create('Project Alpha', projectDir)
+    const unrelated = h.projects.create('Archive', unrelatedDir)
+    const old = '2020-01-01T00:00:00.000Z'
+    h.seed({ id: 'overseer', provider: 'codex', isOverseer: true, permissionMode: 'full' })
+    h.seed({
+      id: 'manager', provider: 'codex', title: 'Noether', isProjectManager: true,
+      projectId: project.id, managerActiveTeamId: 'team-live',
+      managerTeams: [
+        { id: 'team-live', name: 'Current', createdAt: old, activatedAt: old },
+        { id: 'team-old', name: 'Stashed', createdAt: old, activatedAt: old, stashedAt: old },
+      ],
+    })
+    h.seed({
+      id: 'child-active', provider: 'codex', title: 'Bose', status: 'active', projectId: project.id,
+      parentSessionId: 'manager', managerTeamId: 'team-live', managerTeamName: 'Current',
+    })
+    h.seed({
+      id: 'mentioned-old', provider: 'claude', title: 'Shannon', status: 'idle', projectId: project.id,
+      lastActivity: old, createdAt: old,
+    })
+    h.seed({
+      id: 'unrelated-old', provider: 'claude', title: 'Archived Agent', status: 'idle',
+      projectId: unrelated.id, lastActivity: old, createdAt: old,
+    })
+
+    await h.sessions.send('manager', 'Coordinate the active team.')
+    await h.sessions.send('overseer', 'Check Project Alpha and tell me its exact status.')
+
+    const calls = vi.mocked(h.executor.runTurn).mock.calls
+    const managerSpec = calls.find(([, prompt]) => prompt === 'Coordinate the active team.')?.[0]
+    const overseerSpec = calls.find(([, prompt]) => prompt === 'Check Project Alpha and tell me its exact status.')?.[0]
+    expect(managerSpec?.claudeSystemPrompt).toBeUndefined()
+    expect(managerSpec?.codexDeveloperInstructions).toMatch(/Codex-manager discipline/u)
+    expect(managerSpec?.codexDeveloperInstructions).toMatch(/COMPACTION CONTINUITY CONTRACT/u)
+    expect(managerSpec?.codexDeveloperInstructions).toMatch(/"activeTeamId":"team-live"/u)
+    expect(managerSpec?.codexDeveloperInstructions).toMatch(/"id":"team-old".*"state":"stashed"/u)
+    expect(managerSpec?.codexDeveloperInstructions).toMatch(/"id":"child-active","name":"Bose","status":"active"/u)
+    expect(overseerSpec?.codexDeveloperInstructions).toMatch(/Direct operator text mentioned: Project Alpha/u)
+    expect(overseerSpec?.codexDeveloperInstructions).toContain('mentioned-old')
+    expect(overseerSpec?.codexDeveloperInstructions).not.toContain('unrelated-old')
+    expect(overseerSpec?.codexDeveloperInstructions).toMatch(/activityWindowDays":7/u)
+  })
+
+  it('routes a Codex child approval to its capable manager without duplicating it to the Overseer', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({
+      id: 'manager', title: 'Manager', isProjectManager: true, managerCanApproveChildren: true,
+      projectId: 'project-a', status: 'idle',
+    })
+    h.seed({ id: 'child', title: 'Worker', parentSessionId: 'manager', projectId: 'project-a', status: 'active' })
+
+    const decision = h.approvals.request('child', 'codex/item/commandExecution/requestApproval', {
+      toolName: 'commandExecution', command: 'git status',
+    })
+    const pending = h.approvals.pending()[0]!
+
+    expect(h.bus.inbox('manager')).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        subject: 'child approval pending',
+        body: expect.stringMatching(new RegExp(`${pending.id}.*commandExecution: git status`, 'su')),
+      }),
+    ]))
+    expect(h.bus.inbox('overseer')).toHaveLength(0)
+    expect(h.journal.recentEventsForSession('child', 20)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'manager/child-approval-reported' }),
+    ]))
+    h.approvals.resolve(pending.id, false)
+    await expect(decision).resolves.toBe(false)
+  })
+
+  it('falls back to the Overseer when a manager cannot receive or decide a permission prompt', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full', status: 'idle' })
+    h.seed({
+      id: 'manager', title: 'Manager', isProjectManager: true, managerCanApproveChildren: false,
+      projectId: 'project-a', status: 'idle',
+    })
+    h.seed({ id: 'child', title: 'Worker', parentSessionId: 'manager', projectId: 'project-a', status: 'active' })
+
+    const decision = h.approvals.request('child', 'claude/tool', {
+      toolName: 'Write', input: { file_path: 'C:/work/file.ts' },
+    })
+    const pending = h.approvals.pending()[0]!
+
+    expect(h.bus.inbox('manager')).toHaveLength(0)
+    expect(h.bus.inbox('overseer')).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        subject: 'approval awaiting operator',
+        body: expect.stringMatching(new RegExp(`${pending.id}.*Write: C:/work/file.ts.*direct operator turn`, 'su')),
+      }),
+    ]))
+    expect(h.journal.recentEventsForSession('child', 20)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'overseer/approval-reported' }),
+    ]))
+    h.approvals.resolve(pending.id, false)
+    await expect(decision).resolves.toBe(false)
+  })
+
+  it('never steers a pending approval into an active privileged Overseer turn', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full', status: 'active' })
+    h.markOperator('overseer')
+    h.seed({ id: 'manager', title: 'Manager', isProjectManager: true, status: 'active' })
+
+    const decision = h.approvals.request('manager', 'claude/tool', {
+      toolName: 'Bash', input: { command: 'git status' },
+    })
+    const pending = h.approvals.pending()[0]!
+
+    expect(h.executor.steer).not.toHaveBeenCalled()
+    expect(h.bus.pending('overseer')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ subject: 'approval awaiting operator' }),
+    ]))
+    h.approvals.resolve(pending.id, false)
+    await expect(decision).resolves.toBe(false)
   })
 
   it('requires configured scope, a separate operator approval, and the elevation runner', async () => {

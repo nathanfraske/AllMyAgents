@@ -3,6 +3,7 @@
   import { api, type WorktreeProjectActivity } from './api'
   import { store, type SessionView, type ThreadItem } from './store.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
+  import AgentPurposeInfo from './AgentPurposeInfo.svelte'
   import DeleteProjectDialog from './DeleteProjectDialog.svelte'
   import TaskStrip from './TaskStrip.svelte'
   import ThreadView from './ThreadView.svelte'
@@ -466,28 +467,33 @@
               {@const status = projectStatus(view)}
               {@const fileActivity = filesBySession.get(view.record.id)}
               <article class="agent" class:child={row.depth > 0} style={`--depth:${row.depth}`}>
-                <button
-                  class="agent-main"
-                  aria-label={`Open ${agentName(view)} chat`}
-                  onclick={() => openChat(view.record.id)}
-                >
-                  <ProviderLogo provider={view.record.provider} size={18} />
-                  <span class="agent-title">
-                    <span class="name">{agentName(view)}</span>
-                    <span class="meta">
-                      {#if agentRole(view)}
-                        <span>{agentRole(view)}</span><span aria-hidden="true">·</span>
-                      {/if}
-                      {#if view.record.managerTeamName}
-                        <span class="team-meta">{view.record.managerTeamName} · {managerTeamState(view) ?? 'historical'}</span><span aria-hidden="true">·</span>
-                      {/if}
-                      <span>{view.record.model || accountName(view.record.profileId)}</span>
-                      <span aria-hidden="true">·</span>
-                      <span class="agent-id" title={`Immutable agent ID: ${view.record.id}`}>ID {shortAgentId(view.record.id)}</span>
+                <div class="agent-main">
+                  <button
+                    class="agent-open"
+                    aria-label={`Open ${agentName(view)} chat`}
+                    onclick={() => openChat(view.record.id)}
+                  >
+                    <ProviderLogo provider={view.record.provider} size={18} />
+                    <span class="agent-title">
+                      <span class="name">{agentName(view)}</span>
+                      <span class="meta">
+                        {#if agentRole(view)}
+                          <span>{agentRole(view)}</span><span aria-hidden="true">·</span>
+                        {/if}
+                        {#if view.record.managerTeamName}
+                          <span class="team-meta">{view.record.managerTeamName} · {managerTeamState(view) ?? 'historical'}</span><span aria-hidden="true">·</span>
+                        {/if}
+                        <span>{view.record.model || accountName(view.record.profileId)}</span>
+                        <span aria-hidden="true">·</span>
+                        <span class="agent-id" title={`Immutable agent ID: ${view.record.id}`}>ID {shortAgentId(view.record.id)}</span>
+                      </span>
                     </span>
-                  </span>
+                  </button>
+                  {#if row.depth > 0 && view.record.role?.trim()}
+                    <AgentPurposeInfo agentName={agentName(view)} purpose={view.record.role.trim()} />
+                  {/if}
                   <span class="state {status}"><span class="dot"></span>{statusLabel(status)}</span>
-                </button>
+                </div>
 
                 <div class="files">
                   {#if fileActivity?.files.length}
@@ -686,9 +692,10 @@
   .agent.child { position: relative; }
   .agent.child::before { content: ''; position: absolute; left: -.45rem; top: 0; bottom: 0;
     border-left: 1px solid var(--border-strong); }
-  .agent-main { display: flex; align-items: center; gap: .55rem; width: 100%; padding: 0; color: inherit;
+  .agent-main { display: flex; align-items: center; gap: .45rem; width: 100%; color: inherit; }
+  .agent-open { display: flex; align-items: center; gap: .55rem; min-width: 0; flex: 1; padding: 0; color: inherit;
     background: none; border: 0; text-align: left; cursor: pointer; }
-  .agent-main:hover .name { color: var(--accent); }
+  .agent-open:hover .name { color: var(--accent); }
   .agent-title { min-width: 0; flex: 1; display: flex; flex-direction: column; }
   .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-sm);
     font-weight: var(--fw-semibold); }
