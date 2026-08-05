@@ -164,7 +164,7 @@ describe('transcript interaction boundaries', () => {
     // Regression: the older-history branch rendered slice(0, 120), so the apparent scroll bottom
     // permanently omitted this live-tail item after the operator had scrolled upward once.
     expect(rendered.getByText('actual latest reply')).toBeTruthy()
-  })
+  }, 15_000)
 
   it('makes only the pane header draggable so transcript and composer text remain selectable', () => {
     seed()

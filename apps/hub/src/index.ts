@@ -3,6 +3,7 @@ import { fork, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { createRequire } from 'node:module'
+import { performance } from 'node:perf_hooks'
 import { pathToFileURL } from 'node:url'
 import { ApprovalService } from './approvals.js'
 import { QuestionService } from './questions.js'
@@ -85,6 +86,18 @@ if (process.env.AMA_VERIFY_HUB_DEPS === '1') {
   verificationJournal.db.close()
   console.log('[hub-deps] verified entry module graph and better-sqlite3 native binding')
   process.exit(0)
+}
+
+const hubStartupStartedAt = performance.now()
+let hubStartupPreviousPhaseAt = hubStartupStartedAt
+function reportHubStartupPhase(phase: string, detail = ''): void {
+  const now = performance.now()
+  const phaseMs = Math.round((now - hubStartupPreviousPhaseAt) * 10) / 10
+  const totalMs = Math.round((now - hubStartupStartedAt) * 10) / 10
+  hubStartupPreviousPhaseAt = now
+  console.log(
+    `[hub-startup] ${phase}: ${phaseMs}ms (total ${totalMs}ms)${detail ? ` — ${detail}` : ''}`
+  )
 }
 
 const repoRoot = path.resolve(import.meta.dirname, '..', '..', '..')
@@ -256,6 +269,7 @@ if (fs.existsSync(journalPath)) {
     })
   }
 }
+reportHubStartupPhase('preflight complete')
 if (supervised) {
   preflightLivenessPhase = 'booting'
   sendPreflightLiveness()
@@ -304,6 +318,7 @@ if (consumedRecoveryReceipts > 0) {
     `[journal-recovery] recorded ${consumedRecoveryReceipts} recovery notice(s); post-snapshot tail outcome remains unknown`
   )
 }
+reportHubStartupPhase('journal opened')
 // Each live WebSocket (pane / device / reconnect) attaches a journal 'event' listener, removed on
 // close — legitimately more than the EventEmitter default of 10 for a multi-pane/fleet hub. Raise
 // the cap so a healthy number of connections doesn't emit a spurious MaxListeners leak warning.
@@ -432,6 +447,7 @@ const profileRuntime = new ProfileRuntime({
 })
 profileRuntime.bootstrap()
 profileBootstrapComplete = true
+reportHubStartupPhase('profiles restored', `${profiles.length} managed profile(s)`)
 // Agent execution runs behind the Executor seam (docs/agent-worker-impl.md §4.1). The implementation is
 // chosen by the presence of HUB_WORKER_SOCKET (§4.4, the Phase-2 feature flag hubctl injects when worker
 // mode is opted into): absent → the in-process executor (byte-identical to today); present → a
@@ -749,30 +765,104 @@ if (agentBridge) {
 }
 
 sessions.boot({ reconcile: !isGreen }) // green defers stale-reconcile to promote (it doesn't own the port yet)
+reportHubStartupPhase('sessions restored', `${sessions.list().length} session(s)`)
 if (!isGreen) usage.startPolling() //     green starts polling only once it owns the port (on promote)
-// Reclaim agent worktrees no session owns any more. Runs AFTER sessions.boot() so the live set is the
-// restored one, and only on blue — a green does not own the data root yet, and two hubs sweeping the same
-// directory would race. Orphans holding uncommitted or unmerged work are kept and named, never deleted.
-if (!isGreen) {
+// Reclaim agent worktrees no session owns only AFTER the listener is ready, in a one-shot child. This used
+// to run synchronously between sessions.boot() and startServer(), and a setImmediate version could still
+// win the event-loop race against the supervisor's first HTTP health probe. Serial Git checks and recursive
+// build-artifact cleanup now cannot delay either port bind or any request. Green schedules the child only
+// after promotion owns the data root. The live snapshot is taken before fork, on the single hub event loop,
+// so an existing session's checkout cannot be mistaken for an orphan.
+type WorkspaceHousekeepingMessage =
+  | {
+      type: 'workspace-reaped'
+      durationMs: number
+      liveCount: number
+      removed: string[]
+      keptWithWork: Array<{ worktree: string; reason: string }>
+    }
+  | { type: 'workspace-reap-error'; error: string }
+
+let workspaceHousekeepingChild: ChildProcess | undefined
+function scheduleWorkspaceHousekeeping(): void {
+  if (workspaceHousekeepingChild) return
+  const live = sessions
+    .list()
+    .map((session) => session.worktree)
+    .filter((worktree): worktree is string => typeof worktree === 'string' && worktree.length > 0)
+  // A one-minute eligibility grace makes the snapshot/worker boundary fail closed even on a filesystem
+  // with coarse timestamps. A checkout created after this snapshot is simply reconsidered next boot.
+  const eligibleBeforeMs = Date.now() - 60_000
   try {
-    const live = sessions
-      .list()
-      .map((session) => session.worktree)
-      .filter((worktree): worktree is string => typeof worktree === 'string' && worktree.length > 0)
-    const reaped = workspace.reapOrphanWorktrees(live)
-    if (reaped.removed.length > 0) {
-      console.log(`[workspace] reclaimed ${reaped.removed.length} orphaned worktree(s)`)
-    }
-    for (const kept of reaped.keptWithWork) {
-      console.log(`[workspace] kept orphaned worktree ${path.basename(kept.worktree)} — ${kept.reason}`)
-    }
+    const sourceMode = import.meta.url.endsWith('.ts')
+    const entry = path.join(import.meta.dirname, sourceMode ? 'workspaceMaintenance.ts' : 'workspaceMaintenance.js')
+    const execArgv = sourceMode
+      ? ['--import', pathToFileURL(createRequire(import.meta.url).resolve('tsx/esm')).href]
+      : []
+    const child = fork(
+      entry,
+      [path.join(dataDir, 'worktrees'), path.join(dataDir, 'workspaces')],
+      { execArgv, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] },
+    )
+    workspaceHousekeepingChild = child
+    let terminalReported = false
+    const guard = setTimeout(() => {
+      if (terminalReported) return
+      terminalReported = true
+      console.error('[workspace] orphan worktree sweep exceeded 15 minutes and was terminated')
+      child.kill()
+    }, 15 * 60 * 1000)
+    guard.unref?.()
+    child.on('message', (raw: unknown) => {
+      const message = raw as WorkspaceHousekeepingMessage
+      if (message?.type === 'workspace-reap-error') {
+        terminalReported = true
+        console.error(`[workspace] orphan worktree sweep failed: ${message.error}`)
+        return
+      }
+      if (message?.type !== 'workspace-reaped') return
+      terminalReported = true
+      if (message.removed.length > 0) {
+        console.log(`[workspace] reclaimed ${message.removed.length} orphaned worktree(s)`)
+      }
+      for (const kept of message.keptWithWork) {
+        console.log(`[workspace] kept orphaned worktree ${path.basename(kept.worktree)} — ${kept.reason}`)
+      }
+      console.log(
+        `[hub-startup] post-ready workspace housekeeping: ${message.durationMs}ms` +
+          ` — ${message.liveCount} live, ${message.removed.length} reclaimed, ${message.keptWithWork.length} kept`
+      )
+    })
+    child.once('error', (error) => {
+      clearTimeout(guard)
+      terminalReported = true
+      if (workspaceHousekeepingChild === child) workspaceHousekeepingChild = undefined
+      console.error(`[workspace] could not launch orphan sweep: ${error.message}`)
+    })
+    child.once('exit', (code, signal) => {
+      clearTimeout(guard)
+      if (workspaceHousekeepingChild === child) workspaceHousekeepingChild = undefined
+      if (!terminalReported) {
+        console.error(
+          `[workspace] orphan sweep exited without a result (${signal ? `signal ${signal}` : `code ${String(code)}`})`
+        )
+      }
+    })
+    child.send({ type: 'reap', liveWorktrees: live, eligibleBeforeMs }, (error) => {
+      if (!error) return
+      console.error(`[workspace] could not dispatch orphan sweep: ${error.message}`)
+      child.kill()
+    })
   } catch (error) {
-    // Never let a housekeeping sweep block startup.
     console.error(
-      `[workspace] orphan worktree sweep failed: ${error instanceof Error ? error.message : String(error)}`
+      `[workspace] could not launch orphan sweep: ${error instanceof Error ? error.message : String(error)}`
     )
   }
 }
+process.once('exit', () => {
+  workspaceHousekeepingChild?.kill()
+  workspaceHousekeepingChild = undefined
+})
 restartState.booted = true
 
 function rescanProfiles(): typeof profiles {
@@ -878,6 +968,7 @@ function registerMesh(): void {
 
 server.once('listening', () => {
   const actualPort = (server.address() as { port?: number } | null)?.port ?? bootPort
+  reportHubStartupPhase('listener ready', `port ${actualPort}`)
   if (!isGreen) {
     try {
       // Claim only after this process has actually won the public bind. A contender that loses with
@@ -927,6 +1018,7 @@ server.once('listening', () => {
   }
   // Blue / standalone own the port at boot → advertise now. Green defers mesh to promote.
   if (!isGreen) {
+    scheduleWorkspaceHousekeeping()
     registerMesh()
     startJournalMaintenance()
     worktreeCollisions.start()
@@ -948,6 +1040,7 @@ if (supervised && process.send) {
     send,
     onPromoted: () => {
       usage.startPolling()
+      scheduleWorkspaceHousekeeping()
       registerMesh()
       startJournalMaintenance()
       worktreeCollisions.start()

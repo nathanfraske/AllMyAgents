@@ -206,4 +206,49 @@ describe('Sidebar with folder state', () => {
     expect(el.querySelector('.row.manager .rlabel')?.textContent).toBe('one')
     expect(el.querySelector('.row.managedchild .rlabel')?.textContent).toBe('two')
   })
+
+  it('groups manager children into independently collapsible active and stashed teams', () => {
+    store.sessions.s1!.record.isProjectManager = true
+    store.sessions.s1!.record.managerTeams = [
+      { id: 'team-a', name: 'Builders', createdAt: '2026-01-01T00:00:00.000Z', activatedAt: '2026-01-02T00:00:00.000Z' },
+      { id: 'team-b', name: 'Reviewers', createdAt: '2026-01-01T00:00:00.000Z', activatedAt: '2026-01-01T00:00:00.000Z', stashedAt: '2026-01-02T00:00:00.000Z' },
+    ]
+    store.sessions.s1!.record.managerActiveTeamId = 'team-a'
+    store.sessions.s2!.record.parentSessionId = 's1'
+    store.sessions.s2!.record.managerTeamId = 'team-a'
+    store.sessions.s2!.record.managerTeamName = 'Builders'
+    store.sessions.s4 = seedSession('s4', 'proj-a', 'review child')
+    store.sessions.s4.record.parentSessionId = 's1'
+    store.sessions.s4.record.managerTeamId = 'team-b'
+    store.sessions.s4.record.managerTeamName = 'Reviewers'
+    store.sessions.s4.record.status = 'stopped'
+    localStorage.setItem('allmyagents.ui.collapsedFolders', JSON.stringify(['team:s1:team-a']))
+
+    const { container } = render(Sidebar)
+    const el = container as HTMLElement
+    const headers = [...el.querySelectorAll('.manager-team-head')].map((node) => node.textContent?.replace(/\s+/g, ' ').trim())
+    expect(headers).toEqual(['Builders active 1', 'Reviewers stashed 1'])
+    expect(labels(el)).not.toContain('two')
+    expect(labels(el)).toContain('review child')
+    expect(el.querySelector('[aria-label="expand team Builders"]')).not.toBeNull()
+    expect(el.querySelector('[aria-label="collapse team Reviewers"]')).not.toBeNull()
+  })
+
+  it('reveals an errored child even when only its team is collapsed', () => {
+    store.sessions.s1!.record.isProjectManager = true
+    store.sessions.s1!.record.managerTeams = [
+      { id: 'team-a', name: 'Builders', createdAt: '2026-01-01T00:00:00.000Z', activatedAt: '2026-01-01T00:00:00.000Z' },
+    ]
+    store.sessions.s1!.record.managerActiveTeamId = 'team-a'
+    store.sessions.s2!.record.parentSessionId = 's1'
+    store.sessions.s2!.record.managerTeamId = 'team-a'
+    store.sessions.s2!.record.managerTeamName = 'Builders'
+    store.sessions.s2!.record.status = 'error'
+    localStorage.setItem('allmyagents.ui.collapsedFolders', JSON.stringify(['team:s1:team-a']))
+
+    const { container } = render(Sidebar)
+    const el = container as HTMLElement
+    expect(labels(el)).toContain('two')
+    expect(el.querySelector('.row.attentionchild .rlabel')?.textContent).toBe('two')
+  })
 })

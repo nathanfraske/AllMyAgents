@@ -191,6 +191,36 @@ describe('vendor login URL capture', () => {
     })
   })
 
+  it('uses normal browser OAuth by default and enables device auth only when explicitly requested', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-codex-login-mode-'))
+    const calls: string[][] = []
+    const spawnProcess = ((_command: string, args: readonly string[]) => {
+      calls.push([...args])
+      return failedChild('Codex login stopped for command-shape test.')
+    }) as unknown as typeof spawn
+    try {
+      const browser = await startLogin('codex', path.join(root, 'browser'), {
+        spawnProcess,
+        captureTimeoutMs: 100,
+      })
+      const device = await startLogin('codex', path.join(root, 'device'), {
+        authMode: 'device',
+        spawnProcess,
+        captureTimeoutMs: 100,
+      })
+
+      expect(calls[0]?.slice(-1)).toEqual(['login'])
+      expect(calls[0]).not.toContain('--device-auth')
+      expect(calls[1]?.slice(-2)).toEqual(['login', '--device-auth'])
+      await vi.waitFor(() => {
+        expect(getLogin(browser.id)?.status).toBe('failed')
+        expect(getLogin(device.id)?.status).toBe('failed')
+      })
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   it('surfaces captured vendor output when no login URL can be parsed', () => {
     const message = loginCaptureError('codex', '\u001b[31mLogin failed before emitting a link.\u001b[0m')
 

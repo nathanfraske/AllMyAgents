@@ -434,6 +434,7 @@ describe('bounded profile-login transport', () => {
       name: 'claude-a',
       reauth: true,
       idempotencyKey: 'request-1',
+      authMode: 'browser',
     })
     expect(calls[0]?.init.signal).toBeInstanceOf(AbortSignal)
   })

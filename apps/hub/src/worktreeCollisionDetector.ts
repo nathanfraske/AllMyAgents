@@ -6,6 +6,8 @@ import { isSolelyHubManagedInstructions } from './instructions.js'
 import type { SessionRecord } from './types.js'
 
 export const WORKTREE_COLLISION_POLL_MS = 2_000
+const WORKTREE_SHELVED_ACTIVITY_POLL_MS = 5 * 60_000
+const WORKTREE_SHELVED_REFRESHES_PER_POLL = 2
 
 export type WorktreeChangeKind = 'uncommitted' | 'committed' | 'both'
 type ChangeKind = WorktreeChangeKind
@@ -49,11 +51,17 @@ export interface WorktreeRiskEvent {
  * consumers never run a second `git status`/`git diff`, and they never scrape transcripts for filenames.
  */
 export interface WorktreeAgentActivity {
+  /** Immutable AllMyAgents identity; duplicated explicitly so exports never mistake a display label for provenance. */
+  agentId: string
   sessionId: string
   label: string
+  managerSessionId: string | null
+  teamId: string | null
+  teamName: string | null
   branch: string | null
   worktree: string
   files: Array<{ file: string; kind: WorktreeChangeKind }>
+  commits: Array<{ hash: string; subject: string }>
   baseCommit: string
   mainCommit: string
   commitsBehind: number
@@ -333,13 +341,39 @@ interface SessionInspection {
   commitsBehind: number
   diverged: boolean
   changes: Map<string, ChangedPath>
+  commits: Array<{ hash: string; subject: string }>
   staleFiles: WorktreeStaleFile[]
+}
+
+async function agentCommits(record: SessionRecord, mainCommit: string): Promise<Array<{ hash: string; subject: string }>> {
+  const output = await git(
+    record.worktree!,
+    ['log', '--format=%H%x09%s', '--max-count=100', `${mainCommit}..HEAD`, '--'],
+    record,
+  )
+  return output
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => {
+      const tab = line.indexOf('\t')
+      return tab < 0
+        ? { hash: line, subject: '' }
+        : {
+            hash: line.slice(0, tab),
+            // Commit messages are repository-controlled input. Keep dashboard snapshots bounded and
+            // strip terminal controls before they reach logs, accessibility labels, or remote exports.
+            subject: line.slice(tab + 1).replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 240),
+          }
+    })
 }
 
 async function inspectSession(record: SessionRecord): Promise<SessionInspection> {
   const mainCommit = await mainCommitFor(record)
   const baseCommit = await baseCommitFor(record, mainCommit)
-  const changes = await changesFor(record, mainCommit)
+  const [changes, commits] = await Promise.all([
+    changesFor(record, mainCommit),
+    agentCommits(record, mainCommit),
+  ])
   const diverged =
     baseCommit === mainCommit
       ? false
@@ -383,7 +417,7 @@ async function inspectSession(record: SessionRecord): Promise<SessionInspection>
       })
     }
   }
-  return { record, baseCommit, mainCommit, commitsBehind, diverged, changes, staleFiles }
+  return { record, baseCommit, mainCommit, commitsBehind, diverged, changes, commits, staleFiles }
 }
 
 /**
@@ -451,10 +485,9 @@ function detail(name: string, file: string, kind: ChangeKind): string {
 }
 
 /**
- * Polls only active, worktree-backed sessions. Staleness applies even to a lone writer; concurrent-write
- * comparison begins only when a repository has at least two active writers. Collisions notify the later
- * writer only: that is the agent with the cheapest opportunity to change course, and sending the same
- * fact to both doubles interruption/token cost.
+ * Activity includes active/idle worktrees and durable manager-team worktrees, including stopped stashed
+ * teams, so shelving never erases provenance from the dashboard. Risk detection remains active-only:
+ * a stopped checkout is historical work, not a concurrent writer that should receive a steer.
  */
 export class WorktreeCollisionDetector {
   private readonly firstSeen = new Map<string, number>()
@@ -463,6 +496,7 @@ export class WorktreeCollisionDetector {
   private timer: ReturnType<typeof setInterval> | undefined
   private polling = false
   private activityByProject = new Map<string, WorktreeProjectActivity>()
+  private readonly shelvedInspections = new Map<string, { inspectedAt: number; value: SessionInspection }>()
 
   constructor(private readonly options: WorktreeCollisionDetectorOptions) {}
 
@@ -493,6 +527,7 @@ export class WorktreeCollisionDetector {
     if (this.polling) return
     if (this.options.enabled?.() === false) {
       this.activityByProject = new Map()
+      this.shelvedInspections.clear()
       return
     }
     this.polling = true
@@ -532,18 +567,44 @@ export class WorktreeCollisionDetector {
       }
       const groups = new Map<string, SessionRecord[]>()
       for (const record of this.options.sessions()) {
-        if (record.status !== 'active' || !record.repo || !record.worktree) continue
+        if (!record.repo || !record.worktree) continue
+        const activelyExecuting = record.status === 'active' || record.status === 'starting'
+        // Preserve the old active-only cost for ordinary chats. Managed teams are the deliberate
+        // exception: their idle/stopped worktrees must remain visible while a lineup is shelved.
+        if (!activelyExecuting && !record.managerTeamId) continue
         const key = worktreeRepoKey(record)
         const group = groups.get(key) ?? []
         group.push(record)
         groups.set(key, group)
       }
+      const visibleSessionIds = new Set([...groups.values()].flat().map((record) => record.id))
+      for (const sessionId of this.shelvedInspections.keys()) {
+        if (!visibleSessionIds.has(sessionId)) this.shelvedInspections.delete(sessionId)
+      }
+      // A manager can retain dozens of stashed teams. Refresh only a bounded number per ordinary
+      // two-second poll; all others keep their last trustworthy snapshot. Active managed worktrees seed
+      // this cache continuously, so shelving a team remains immediately attributable without spawning a
+      // burst of Git processes for every historical checkout at once.
+      let shelvedRefreshesRemaining = WORKTREE_SHELVED_REFRESHES_PER_POLL
 
       for (const records of groups.values()) {
         const inspected = await Promise.all(
           records.map(async (record) => {
+            const live = record.status === 'active' || record.status === 'starting'
+            const cached = this.shelvedInspections.get(record.id)
             try {
-              return await inspectSession(record)
+              if (!live && cached && Date.now() - cached.inspectedAt < WORKTREE_SHELVED_ACTIVITY_POLL_MS) {
+                return { ...cached.value, record }
+              }
+              if (!live && shelvedRefreshesRemaining <= 0) {
+                return cached ? { ...cached.value, record } : undefined
+              }
+              if (!live) shelvedRefreshesRemaining -= 1
+              const value = await inspectSession(record)
+              if (record.managerTeamId) {
+                this.shelvedInspections.set(record.id, { inspectedAt: Date.now(), value })
+              }
+              return value
             } catch (error) {
               // A disappearing/broken worktree must not stop the hub or suppress checks for healthy peers.
               console.warn(
@@ -551,7 +612,7 @@ export class WorktreeCollisionDetector {
                   error instanceof Error ? error.message : String(error)
                 }`
               )
-              return undefined
+              return cached ? { ...cached.value, record } : undefined
             }
           })
         )
@@ -561,13 +622,18 @@ export class WorktreeCollisionDetector {
           const projectId = item.record.projectId
           if (!projectId) continue
           activityFor(projectId).agents.push({
+            agentId: item.record.id,
             sessionId: item.record.id,
             label: agentName(item.record),
+            managerSessionId: item.record.parentSessionId ?? null,
+            teamId: item.record.managerTeamId ?? null,
+            teamName: item.record.managerTeamName ?? null,
             branch: item.record.branch ?? null,
             worktree: item.record.worktree!,
             files: [...item.changes.values()]
               .map((changed) => ({ file: changed.display, kind: changed.kind }))
               .sort((a, b) => a.file.localeCompare(b.file)),
+            commits: item.commits,
             baseCommit: item.baseCommit,
             mainCommit: item.mainCommit,
             commitsBehind: item.commitsBehind,
@@ -575,7 +641,8 @@ export class WorktreeCollisionDetector {
           })
         }
 
-        for (const item of healthy) {
+        const activeHealthy = healthy.filter((item) => item.record.status === 'active')
+        for (const item of activeHealthy) {
           for (const staleFile of item.staleFiles) {
             const advanceKey = staleFile.commits[0]?.commit ?? item.mainCommit
             const riskKey = `stale-base\0${item.record.id}\0${pathKey(staleFile.file)}\0${advanceKey}`
@@ -610,9 +677,9 @@ export class WorktreeCollisionDetector {
           }
         }
 
-        if (healthy.length < 2) continue
+        if (activeHealthy.length < 2) continue
         const writersByPath = new Map<string, Writer[]>()
-        for (const item of healthy) {
+        for (const item of activeHealthy) {
           const record = item.record
           const changes = item.changes
           for (const [fileKey, changedPath] of changes) {
@@ -638,7 +705,7 @@ export class WorktreeCollisionDetector {
               const collisionKey = `concurrent-write\0${ids[0]}\0${ids[1]}\0${fileKey}`
               const later = a.firstSeen > b.firstSeen ? a : b
               const other = later === a ? b : a
-              const laterInspection = healthy.find((item) => item.record.id === later.record.id)!
+              const laterInspection = activeHealthy.find((item) => item.record.id === later.record.id)!
               addRisk([a.record.projectId, b.record.projectId], {
                 risk: 'concurrent-write',
                 file: later.path.display,

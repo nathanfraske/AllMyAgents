@@ -124,11 +124,17 @@ export interface WorktreeProjectActivity {
   projectId: string
   observedAt: string | null
   agents: Array<{
+    /** Immutable AllMyAgents identity. Kept alongside sessionId for explicit provenance in exports/UI. */
+    agentId: string
     sessionId: string
     label: string
+    managerSessionId: string | null
+    teamId: string | null
+    teamName: string | null
     branch: string | null
     worktree: string
     files: Array<{ file: string; kind: WorktreeChangeKind }>
+    commits: Array<{ hash: string; subject: string }>
     baseCommit: string
     mainCommit: string
     commitsBehind: number
@@ -211,6 +217,9 @@ export interface SessionRecord {
   managerAllowedModels?: Record<string, string[]>
   managerAllowedTools?: string[]
   managerAgentTypes?: ManagerAgentType[]
+  managerTeams?: ManagerTeam[]
+  managerActiveTeamId?: string
+  managerTeamCapabilityVersion?: number
   managerStartingPrompt?: string
   managerOrientationBrief?: string
   managerOperatorTask?: string
@@ -219,6 +228,8 @@ export interface SessionRecord {
   managerPermissionModeCeiling?: 'safe' | 'edits' | 'full'
   managerMaxChildPermissionMode?: 'safe' | 'edits' | 'full'
   parentSessionId?: string
+  managerTeamId?: string
+  managerTeamName?: string
   delegatedAuthorities?: Array<'commit' | 'push'>
   delegatedTools?: string[]
   title?: string
@@ -248,6 +259,15 @@ export interface SessionRecord {
   siteLabel?: string
   /** Whether that machine answered the last roster probe. False = last-known row, machine unreachable. */
   siteOnline?: boolean
+}
+
+export interface ManagerTeam {
+  id: string
+  name: string
+  createdAt: string
+  activatedAt: string
+  stashedAt?: string
+  presetId?: string
 }
 
 export interface ManagerAgentType {
@@ -824,12 +844,15 @@ export interface LoginResult {
   profileId?: string
   added?: string
   provider?: string
+  authMode?: LoginAuthMode
   status?: 'capturing' | 'waiting' | 'settling' | 'complete' | 'failed' | 'cancelled' | 'timed-out'
   url?: string
   code?: string
   manual?: string
   error?: string
 }
+
+export type LoginAuthMode = 'browser' | 'device'
 
 export interface DayStat {
   date: string
@@ -1081,6 +1104,7 @@ export const api = {
     name: string,
     reauth: boolean,
     idempotencyKey: string,
+    authMode: LoginAuthMode = 'browser',
     signal?: AbortSignal,
   ) =>
     boundedLoginRequest<LoginResult>('POST', '/api/accounts/login', {
@@ -1088,6 +1112,7 @@ export const api = {
       name,
       reauth,
       idempotencyKey,
+      authMode,
     }, signal),
   loginForProfile: (name: string, idempotencyKey: string, signal?: AbortSignal) =>
     boundedLoginRequest<LoginResult>(
@@ -1121,7 +1146,13 @@ export const api = {
     return {
       ...value,
       projectId: prefix(value.projectId),
-      agents: value.agents.map((agent) => ({ ...agent, sessionId: prefix(agent.sessionId) })),
+      agents: value.agents.map((agent) => ({
+        ...agent,
+        agentId: prefix(agent.agentId),
+        sessionId: prefix(agent.sessionId),
+        managerSessionId: agent.managerSessionId ? prefix(agent.managerSessionId) : null,
+        teamId: agent.teamId ? prefix(agent.teamId) : null,
+      })),
       risks: value.risks.map((risk) => ({ ...risk, sessionIds: risk.sessionIds.map(prefix) })),
     }
   },

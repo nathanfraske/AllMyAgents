@@ -62,22 +62,32 @@ const activity: WorktreeProjectActivity = {
   observedAt: now,
   agents: [
     {
+      agentId: 'manager',
       sessionId: 'manager',
       label: 'Manager',
+      managerSessionId: null,
+      teamId: null,
+      teamName: null,
       branch: 'agent/manager',
       worktree: 'C:/worktrees/manager',
       files: [{ file: 'apps/manager.ts', kind: 'uncommitted' }],
+      commits: [],
       baseCommit: 'a'.repeat(40),
       mainCommit: 'a'.repeat(40),
       commitsBehind: 0,
       diverged: false,
     },
     {
+      agentId: 'worker',
       sessionId: 'worker',
       label: 'Worker',
+      managerSessionId: 'manager',
+      teamId: 'team-a',
+      teamName: 'Core team',
       branch: 'agent/worker',
       worktree: 'C:/worktrees/worker',
       files: [{ file: 'apps/shared.ts', kind: 'uncommitted' }],
+      commits: [{ hash: 'b'.repeat(40), subject: 'Implement shared worker path' }],
       baseCommit: 'a'.repeat(40),
       mainCommit: 'a'.repeat(40),
       commitsBehind: 0,
@@ -161,10 +171,21 @@ beforeEach(() => {
       'manager',
       'Noether',
       'active',
-      { isProjectManager: true, role: 'Project manager' },
+      {
+        isProjectManager: true,
+        role: 'Project manager',
+        managerTeams: [{ id: 'team-a', name: 'Core team', createdAt: now, activatedAt: now }],
+        managerActiveTeamId: 'team-a',
+      },
       [earlyManagerReply, ...middleManagerReplies, plan, managerReply],
     ),
-    worker: session('worker', 'Bose', 'idle', { parentSessionId: 'manager', role: 'Collision writer', lastTurnOk: true }, [sentTool, sent]),
+    worker: session('worker', 'Bose', 'idle', {
+      parentSessionId: 'manager',
+      managerTeamId: 'team-a',
+      managerTeamName: 'Core team',
+      role: 'Collision writer',
+      lastTurnOk: true,
+    }, [sentTool, sent]),
     reviewer: session('reviewer', 'Reviewer', 'error', { lastTurnOk: false }),
     blocked: session('blocked', 'Blocked', 'idle'),
     nameless,
@@ -190,9 +211,14 @@ describe('ProjectView', () => {
     expect(screen.getAllByText('Project manager')).toHaveLength(1)
     expect(screen.getByText('Bose')).toBeTruthy()
     expect(screen.getByText('Collision writer')).toBeTruthy()
+    expect(screen.getByText('Core team · active')).toBeTruthy()
+    expect(screen.getAllByText('ID worker').length).toBeGreaterThan(0)
     expect(screen.getByText('Claude agent')).toBeTruthy()
     expect(screen.getByText(/2\/2 done/)).toBeTruthy()
     await waitFor(() => expect(screen.getByText('apps/manager.ts')).toBeTruthy())
+    expect(screen.getByText('1 attributable commit')).toBeTruthy()
+    await fireEvent.click(screen.getByText('1 attributable commit').closest('summary')!)
+    expect(screen.getByText('Implement shared worker path')).toBeTruthy()
     expect(screen.getByText('1 file collision')).toBeTruthy()
     expect(screen.getAllByText('apps/shared.ts').length).toBeGreaterThan(0)
     expect(screen.getByText(/Bose → Reviewer/)).toBeTruthy()
@@ -434,7 +460,7 @@ describe('ProjectView', () => {
     render(ProjectView, { props: { projectId: project.id } })
 
     await waitFor(() => expect(apiMock.projectActivity).toHaveBeenCalled())
-    expect(screen.getAllByText(/direct-project agents are not tracked/i)).toHaveLength(1)
+    expect(screen.getAllByText(/shared-checkout edits cannot be attributed/i)).toHaveLength(1)
     expect(screen.getByText('Works directly in the project')).toBeTruthy()
     expect(screen.queryByText(/file monitor unavailable/i)).toBeNull()
     expect(screen.queryByText(/file monitoring is unavailable/i)).toBeNull()

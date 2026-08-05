@@ -286,6 +286,174 @@ describe('project manager lifecycle awareness', () => {
   })
 })
 
+describe('project manager durable teams', () => {
+  type TeamInput = {
+    operation: 'list' | 'create' | 'activate' | 'rename'
+    teamId?: string
+    name?: string
+    activate?: boolean
+    interruptActive?: boolean
+  }
+  const manageTeam = (
+    sessions: SessionManager,
+    managerSessionId: string,
+    input: TeamInput,
+  ): Promise<{ ok: boolean; summary?: string; error?: string }> =>
+    (sessions as unknown as {
+      managerManageTeam(
+        managerId: string,
+        input: TeamInput,
+      ): Promise<{ ok: boolean; summary?: string; error?: string }>
+    }).managerManageTeam(managerSessionId, input)
+
+  it('migrates legacy children into one stable initial team', () => {
+    const { sessions, journal, seed } = buildHub()
+    const manager = seed({ id: 'manager', projectId: 'project' })
+    const legacy = seed({ id: 'legacy-child', parentSessionId: 'manager', projectId: 'project' })
+
+    sessions.configureProjectManager(
+      manager.id,
+      { enabled: true, allowedProfiles: ['p1'] },
+      'operator',
+    )
+
+    expect(manager.managerTeams).toHaveLength(1)
+    expect(manager.managerTeams?.[0]?.name).toBe('Team 1')
+    expect(manager.managerActiveTeamId).toBe(manager.managerTeams?.[0]?.id)
+    expect(legacy.managerTeamId).toBe(manager.managerActiveTeamId)
+    expect(legacy.managerTeamName).toBe('Team 1')
+    expect(journal.recentEventsForSession(manager.id)).toEqual(
+      expect.arrayContaining([expect.objectContaining({ kind: 'manager/teams-updated' })]),
+    )
+  })
+
+  it('refuses to shelve a running team without an explicit interrupt, then preserves and reopens exact sessions', async () => {
+    const { sessions, journal, seed, repo } = buildHub()
+    const manager = seed({ id: 'manager', projectId: 'project' })
+    sessions.configureProjectManager(
+      manager.id,
+      { enabled: true, allowedProfiles: ['p1'] },
+      'operator',
+    )
+    const firstTeam = manager.managerTeams![0]!
+    const outgoing = seed({
+      id: 'outgoing-child',
+      title: 'Builder',
+      parentSessionId: manager.id,
+      managerTeamId: firstTeam.id,
+      managerTeamName: firstTeam.name,
+      projectId: 'project',
+      status: 'active',
+      cwd: repo,
+      branch: 'agent/builder',
+    })
+    const created = await manageTeam(sessions, manager.id, {
+      operation: 'create',
+      name: 'Review team',
+    })
+    expect(created.ok).toBe(true)
+    const secondTeam = manager.managerTeams!.find((team) => team.name === 'Review team')!
+    const incoming = seed({
+      id: 'incoming-child',
+      title: 'Reviewer',
+      parentSessionId: manager.id,
+      managerTeamId: secondTeam.id,
+      managerTeamName: secondTeam.name,
+      projectId: 'project',
+      status: 'stopped',
+      cwd: repo,
+      branch: 'agent/reviewer',
+    })
+    const originalReopen = sessions.reopen.bind(sessions)
+    const activeTeamSeenByReopen: string[] = []
+    vi.spyOn(sessions, 'reopen').mockImplementation((sessionId) => {
+      activeTeamSeenByReopen.push(manager.managerActiveTeamId!)
+      return originalReopen(sessionId)
+    })
+
+    const refused = await manageTeam(sessions, manager.id, {
+      operation: 'activate',
+      teamId: secondTeam.id,
+    })
+    expect(refused.ok).toBe(false)
+    expect(refused.error).toMatch(/cannot stash.*running/i)
+    expect(manager.managerActiveTeamId).toBe(firstTeam.id)
+    expect(outgoing.status).toBe('active')
+
+    const switched = await manageTeam(sessions, manager.id, {
+      operation: 'activate',
+      teamId: secondTeam.id,
+      interruptActive: true,
+    })
+    expect(switched.ok).toBe(true)
+    expect(manager.managerActiveTeamId).toBe(secondTeam.id)
+    expect(outgoing.status).toBe('stopped')
+    expect(outgoing.id).toBe('outgoing-child')
+    expect(outgoing.cwd).toBe(repo)
+    expect(outgoing.branch).toBe('agent/builder')
+    expect(incoming.status).toBe('idle')
+    expect(activeTeamSeenByReopen).toEqual([firstTeam.id])
+    expect(incoming.id).toBe('incoming-child')
+    expect(manager.managerTeams?.find((team) => team.id === firstTeam.id)?.stashedAt).toBeTruthy()
+    expect(manager.managerTeams?.find((team) => team.id === secondTeam.id)?.stashedAt).toBeUndefined()
+    expect(journal.recentEventsForSession(manager.id)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'manager/team-activated',
+          payload: expect.objectContaining({
+            fromTeamId: firstTeam.id,
+            teamId: secondTeam.id,
+            shelvedSessionIds: ['outgoing-child'],
+            interruptedSessionIds: ['outgoing-child'],
+          }),
+        }),
+      ]),
+    )
+    // reopen() schedules queued-bus delivery on the next immediate; let it settle before the fixture
+    // closes the shared test database.
+    await new Promise<void>((resolve) => setImmediate(resolve))
+  })
+
+  it('rejects a parallel mutation while an activation is awaiting the outgoing stop', async () => {
+    const { sessions, seed } = buildHub()
+    const manager = seed({ id: 'manager', projectId: 'project' })
+    sessions.configureProjectManager(manager.id, { enabled: true, allowedProfiles: ['p1'] }, 'operator')
+    const firstTeam = manager.managerTeams![0]!
+    seed({
+      id: 'outgoing-child',
+      parentSessionId: manager.id,
+      managerTeamId: firstTeam.id,
+      managerTeamName: firstTeam.name,
+      projectId: 'project',
+      status: 'active',
+    })
+    await manageTeam(sessions, manager.id, { operation: 'create', name: 'Review team' })
+    const secondTeam = manager.managerTeams!.find((team) => team.name === 'Review team')!
+    const originalStop = sessions.stop.bind(sessions)
+    let releaseStop!: () => void
+    const stopGate = new Promise<void>((resolve) => { releaseStop = resolve })
+    vi.spyOn(sessions, 'stop').mockImplementation(async (sessionId) => {
+      await stopGate
+      await originalStop(sessionId)
+    })
+
+    const activating = manageTeam(sessions, manager.id, {
+      operation: 'activate',
+      teamId: secondTeam.id,
+      interruptActive: true,
+    })
+    await Promise.resolve()
+    const parallel = await manageTeam(sessions, manager.id, { operation: 'create', name: 'Too soon' })
+
+    expect(parallel).toEqual({
+      ok: false,
+      error: 'another team operation is still settling; retry after it completes',
+    })
+    releaseStop()
+    expect((await activating).ok).toBe(true)
+  })
+})
+
 describe('project manager durable live roster', () => {
   it('rebuilds the direct-child roster for the first turn after compaction without a tool call', async () => {
     const { sessions, journal, seed, repo } = buildHub()

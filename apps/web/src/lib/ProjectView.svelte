@@ -137,6 +137,17 @@
       : undefined
   }
 
+  function shortAgentId(id: string): string {
+    return (id.split(':').at(-1) ?? id).slice(0, 8)
+  }
+
+  function managerTeamState(view: SessionView): 'active' | 'stashed' | undefined {
+    if (!view.record.managerTeamId || !view.record.parentSessionId) return undefined
+    return store.sessions[view.record.parentSessionId]?.record.managerActiveTeamId === view.record.managerTeamId
+      ? 'active'
+      : 'stashed'
+  }
+
   const statusCounts = $derived.by(() => {
     const counts: Record<ProjectStatus, number> = {
       working: 0,
@@ -438,8 +449,8 @@
           {:else if directProjectCount}
             <span
               class="monitor-note"
-              title="The collision detector reads isolated git worktrees; agents working in the shared project folder have no separate checkout to inspect."
-            >Worktree changes only · direct-project agents are not tracked</span>
+              title="A shared project checkout has no trustworthy per-agent boundary. Its edits are never guessed onto one agent; use isolated worktrees for attributable files and commits."
+            >Shared-checkout edits cannot be attributed · use worktrees</span>
           {/if}
         </div>
 
@@ -467,7 +478,12 @@
                       {#if agentRole(view)}
                         <span>{agentRole(view)}</span><span aria-hidden="true">·</span>
                       {/if}
+                      {#if view.record.managerTeamName}
+                        <span class="team-meta">{view.record.managerTeamName} · {managerTeamState(view) ?? 'historical'}</span><span aria-hidden="true">·</span>
+                      {/if}
                       <span>{view.record.model || accountName(view.record.profileId)}</span>
+                      <span aria-hidden="true">·</span>
+                      <span class="agent-id" title={`Immutable agent ID: ${view.record.id}`}>ID {shortAgentId(view.record.id)}</span>
                     </span>
                   </span>
                   <span class="state {status}"><span class="dot"></span>{statusLabel(status)}</span>
@@ -481,7 +497,7 @@
                       </summary>
                       <div class="file-list">
                     {#each fileActivity.files as changed (changed.file)}
-                      <span class="file" title={`${fileActivity.worktree}\n${changed.kind}`}>
+                      <span class="file" title={`Agent ID: ${fileActivity.agentId}\nTeam: ${fileActivity.teamName ?? 'none'}\n${fileActivity.worktree}\n${changed.kind}`}>
                         {changed.file}
                         {#if changed.kind !== 'uncommitted'}<em>{changed.kind}</em>{/if}
                       </span>
@@ -494,6 +510,20 @@
                     <span class="file-empty">Checking worktree…</span>
                   {:else}
                     <span class="file-empty">No active file changes</span>
+                  {/if}
+                  {#if fileActivity?.commits.length}
+                    <details class="file-fold commit-fold">
+                      <summary class="files-summary">
+                        {fileActivity.commits.length} attributable commit{fileActivity.commits.length === 1 ? '' : 's'}
+                      </summary>
+                      <div class="commit-list">
+                        {#each fileActivity.commits as commit (commit.hash)}
+                          <span class="commit" title={`Agent ID: ${fileActivity.agentId}\n${commit.hash}`}>
+                            <code>{commit.hash.slice(0, 8)}</code>{commit.subject || 'Untitled commit'}
+                          </span>
+                        {/each}
+                      </div>
+                    </details>
                   {/if}
                 </div>
 
@@ -663,6 +693,8 @@
   .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-sm);
     font-weight: var(--fw-semibold); }
   .meta { display: flex; align-items: center; gap: .35rem; overflow: hidden; color: var(--dim); font-size: var(--text-2xs); }
+  .team-meta { color: var(--accent); }
+  .agent-id { flex: none; font-family: var(--mono); color: var(--muted); }
   .state { display: inline-flex; align-items: center; gap: .35rem; flex: none; color: var(--muted);
     font-size: var(--text-2xs); white-space: nowrap; }
   .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
@@ -676,6 +708,10 @@
   .files-summary:hover { color: var(--accent); }
   .file-fold[open] .files-summary { margin-bottom: .4rem; }
   .file-list { display: flex; flex-wrap: wrap; gap: .3rem; }
+  .commit-list { display: grid; gap: .25rem; }
+  .commit { display: flex; align-items: baseline; gap: .45rem; min-width: 0; color: var(--muted); font-size: var(--text-2xs); }
+  .commit code { flex: none; color: var(--accent); font-family: var(--mono); }
+  .commit-fold { margin-top: .15rem; }
   .file { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: .2rem .4rem;
     border: 1px solid var(--border-subtle); border-radius: var(--r-sm); background: var(--surface-2);
     font-family: var(--mono); font-size: var(--text-2xs); }

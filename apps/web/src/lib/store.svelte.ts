@@ -71,6 +71,11 @@ const remoteSession = (site: FleetSite, session: SessionRecord): SessionRecord =
   profileId: fleetId(site.siteId, session.profileId),
   projectId: session.projectId ? fleetId(site.siteId, session.projectId) : undefined,
   parentSessionId: session.parentSessionId ? fleetId(site.siteId, session.parentSessionId) : undefined,
+  managerTeams: session.managerTeams?.map((team) => ({ ...team, id: fleetId(site.siteId, team.id) })),
+  managerActiveTeamId: session.managerActiveTeamId
+    ? fleetId(site.siteId, session.managerActiveTeamId)
+    : undefined,
+  managerTeamId: session.managerTeamId ? fleetId(site.siteId, session.managerTeamId) : undefined,
   managerAllowedProfiles: session.managerAllowedProfiles?.map((id) => fleetId(site.siteId, id)),
   managerAllowedModels: session.managerAllowedModels
     ? Object.fromEntries(Object.entries(session.managerAllowedModels).map(([id, models]) => [fleetId(site.siteId, id), models]))
@@ -886,7 +891,12 @@ export class HubStore {
         v.record.managerAllowedProfiles = rec.managerAllowedProfiles
         v.record.managerAllowedModels = rec.managerAllowedModels
         v.record.managerAllowedTools = rec.managerAllowedTools
+        v.record.managerTeams = rec.managerTeams
+        v.record.managerActiveTeamId = rec.managerActiveTeamId
+        v.record.managerTeamCapabilityVersion = rec.managerTeamCapabilityVersion
         v.record.parentSessionId = rec.parentSessionId
+        v.record.managerTeamId = rec.managerTeamId
+        v.record.managerTeamName = rec.managerTeamName
         v.record.delegatedAuthorities = rec.delegatedAuthorities
         v.record.delegatedTools = rec.delegatedTools
         if (rec.title) v.record.title = rec.title
@@ -1539,6 +1549,37 @@ export class HubStore {
     } else if (event.kind === 'bus/delivered' && payload && typeof payload === 'object') {
       const from = (payload as { fromSession?: unknown }).fromSession
       if (typeof from === 'string') payload = { ...(payload as Record<string, unknown>), fromSession: fleetId(site.siteId, from) }
+    } else if (event.kind === 'manager/teams-updated' && payload && typeof payload === 'object') {
+      const state = payload as {
+        managerSessionId?: unknown
+        activeTeamId?: unknown
+        teams?: Array<Record<string, unknown>>
+        assignments?: Array<Record<string, unknown>>
+      }
+      payload = {
+        ...(payload as Record<string, unknown>),
+        managerSessionId:
+          typeof state.managerSessionId === 'string'
+            ? fleetId(site.siteId, state.managerSessionId)
+            : state.managerSessionId,
+        activeTeamId:
+          typeof state.activeTeamId === 'string' ? fleetId(site.siteId, state.activeTeamId) : state.activeTeamId,
+        teams: state.teams?.map((team) => ({
+          ...team,
+          id: typeof team.id === 'string' ? fleetId(site.siteId, team.id) : team.id,
+        })),
+        assignments: state.assignments?.map((assignment) => ({
+          ...assignment,
+          sessionId:
+            typeof assignment.sessionId === 'string'
+              ? fleetId(site.siteId, assignment.sessionId)
+              : assignment.sessionId,
+          teamId:
+            typeof assignment.teamId === 'string'
+              ? fleetId(site.siteId, assignment.teamId)
+              : assignment.teamId,
+        })),
+      }
     }
     return {
       ...event,
@@ -2655,6 +2696,25 @@ export class HubStore {
         // until the queue drained into a dead worker. An error boundary should surface the queue for the
         // operator to retry, not spend it. The text stays queued and goes on the next real completion.
         if (status === 'idle') this.scheduleQueueFlush(sessionId)
+        break
+      }
+      case 'manager/teams-updated': {
+        const p = payload as {
+          capabilityVersion?: number
+          activeTeamId?: string | null
+          teams?: SessionRecord['managerTeams']
+          assignments?: Array<{ sessionId?: string; teamId?: string | null; teamName?: string | null }>
+        }
+        view.record.managerTeams = p.teams
+        view.record.managerActiveTeamId = p.activeTeamId ?? undefined
+        view.record.managerTeamCapabilityVersion = p.capabilityVersion ?? view.record.managerTeamCapabilityVersion
+        for (const assignment of p.assignments ?? []) {
+          if (!assignment.sessionId) continue
+          const child = this.sessions[assignment.sessionId]
+          if (!child) continue
+          child.record.managerTeamId = assignment.teamId ?? undefined
+          child.record.managerTeamName = assignment.teamName ?? undefined
+        }
         break
       }
       case 'session/agent-stop-requested': {

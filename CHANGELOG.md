@@ -5,6 +5,47 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.17-alpha.20 — 2026-08-04
+
+This release adds durable manager-team generations and exact worktree/commit provenance, removes expensive
+historical Git polling, unblocks journal maintenance on large databases, moves recoverable workspace cleanup
+out of the hub readiness path, and repairs Codex sign-in so ordinary browser OAuth never requires a terminal
+or device-code security setting.
+
+[Full v0.1.17-alpha.20 release notes](docs/releases/v0.1.17-alpha.20.md)
+
+- Managers can create, rename, list, and activate durable teams. Switching preserves the prior team's work,
+  independently collapsible active/stashed team folders expose the lineup, and migration gives existing
+  children a stable default team without rewriting their identities.
+- Project activity attributes dirty files and commits to immutable agent/session, manager, team, branch, and
+  worktree identities. Shared-checkout ambiguity is stated explicitly instead of inventing attribution.
+- Historical attribution is cached and rate-limited; stashed teams no longer launch an unbounded Git-process
+  burst every poll while their last trustworthy snapshot remains visible.
+- Lazy composite indexes now let bounded journal condensation advance on the operator-scale journal. Startup
+  emits phase timing, begins serving before conservative orphan-worktree cleanup, and gives fresh exits a grace
+  period so a just-finished agent is not reclaimed during restart.
+- Codex sign-in follows the current official CLI contract: `codex login` browser OAuth is the recommended
+  default, while `codex login --device-auth` is an explicit remote/headless option. Device URL/code/copy
+  controls live in the app, and every launch, opener, poll, failure, cancel, and post-login refresh is bounded.
+
+## v0.1.16-alpha.19 — 2026-08-04
+
+This release moved pairing, approved remote testbed operations, and Overseer-to-Overseer communication onto an
+authenticated Site-free MyOwnMesh RPC lane, while preserving Site HTTP only as a mixed-version compatibility
+path for the unified remote chat stream.
+
+[Full v0.1.16-alpha.19 release notes](docs/releases/v0.1.16-alpha.19.md)
+
+- Reciprocal short-code pairing and every subsequent direct request bind to authenticated mesh peer identity,
+  HMAC request evidence, replay protection, device policy, and the exact operator-granted chat scope.
+- Remote files, terminals, bounded environment discovery, WSL distributions, telemetry, transfer diagnostics,
+  and no-duplicate mutating fallback work without a mapped Site.
+- Remote access gained forced refresh and truthful Site-versus-direct status. Overseers gained whole-fleet
+  inspection, authenticated peer discovery/messaging, exact-source reply authority, and automatic in-place
+  capability migration for existing durable sessions.
+- Exact-once receipts, blue/green handler ownership, disabled-exposure tests, and full packaged/native/sandbox
+  release gates close the transport and lifecycle boundaries documented in the full notes.
+
 ## v0.1.15-alpha.18 — 2026-08-04
 
 This patch keeps lazily reached history contiguous with the live end, repairs durable chat activity clocks,

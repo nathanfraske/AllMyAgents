@@ -291,9 +291,15 @@ export class WorkspaceManager {
    * is not a reason to keep a worktree forever.
    *
    * @param liveWorktrees absolute paths still claimed by a session; anything else under the root is orphaned.
+   * @param options.eligibleBeforeMs optional fail-closed age boundary. Directories created or changed at
+   *   or after this instant are deferred, which lets a post-ready worker operate from a live-session
+   *   snapshot without racing a brand-new checkout created after that snapshot.
    * @returns what was removed and what was deliberately kept, for the caller to log.
    */
-  reapOrphanWorktrees(liveWorktrees: Iterable<string>): {
+  reapOrphanWorktrees(
+    liveWorktrees: Iterable<string>,
+    options: { eligibleBeforeMs?: number } = {},
+  ): {
     removed: string[]
     keptWithWork: Array<{ worktree: string; reason: string }>
   } {
@@ -314,7 +320,17 @@ export class WorkspaceManager {
       const worktree = path.join(this.worktreesRoot, entry)
       if (live.has(this.normalizeForCompare(worktree))) continue
       try {
-        if (!fs.statSync(worktree).isDirectory()) continue
+        const stat = fs.statSync(worktree)
+        if (!stat.isDirectory()) continue
+        if (options.eligibleBeforeMs !== undefined) {
+          // `birthtimeMs` is reliable on Windows (the production platform); `ctimeMs` is the safe
+          // fallback elsewhere. Taking the newest timestamp also deliberately defers an old checkout
+          // whose directory metadata changed during startup. If a filesystem supplies neither, keep it.
+          const observedAt = Math.max(stat.birthtimeMs || 0, stat.ctimeMs || 0)
+          if (!Number.isFinite(observedAt) || observedAt <= 0 || observedAt >= options.eligibleBeforeMs) {
+            continue
+          }
+        }
       } catch {
         continue
       }
