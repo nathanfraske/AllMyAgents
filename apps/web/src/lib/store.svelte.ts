@@ -1548,6 +1548,14 @@ export class HubStore {
     else if (event.kind === 'session/deleted' && payload && typeof payload === 'object') {
       const id = (payload as { id?: unknown }).id
       payload = { ...(payload as Record<string, unknown>), ...(typeof id === 'string' ? { id: fleetId(site.siteId, id) } : {}) }
+    } else if (event.kind === 'project/created' && payload && typeof payload === 'object') {
+      const project = (payload as { project?: unknown }).project
+      if (project && typeof project === 'object') {
+        payload = {
+          ...(payload as Record<string, unknown>),
+          project: remoteProject(site, project as ProjectInfo),
+        }
+      }
     } else if (event.kind === 'project/deleted' && payload && typeof payload === 'object') {
       const id = (payload as { id?: unknown }).id
       payload = { ...(payload as Record<string, unknown>), ...(typeof id === 'string' ? { id: fleetId(site.siteId, id) } : {}) }
@@ -2493,6 +2501,23 @@ export class HubStore {
           }
           return next
         })
+      }
+      return
+    }
+    if (kind === 'project/created') {
+      const project = (payload as { project?: Partial<ProjectInfo> }).project
+      if (
+        project &&
+        typeof project.id === 'string' &&
+        typeof project.name === 'string' &&
+        typeof project.path === 'string' &&
+        typeof project.createdAt === 'string'
+      ) {
+        const created = project as ProjectInfo
+        const existing = this.projects.findIndex((candidate) => candidate.id === created.id)
+        this.projects = existing < 0
+          ? [...this.projects, created]
+          : this.projects.map((candidate, index) => index === existing ? created : candidate)
       }
       return
     }

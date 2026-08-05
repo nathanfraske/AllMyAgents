@@ -891,6 +891,34 @@ describe('event batching (replay does not render frame-by-frame)', () => {
     expect(store.projects[0]?.name).toBe('After')
   })
 
+  it('adds a project created by the Overseer without a reload and de-duplicates a matching API response', () => {
+    const project = {
+      id: 'p-overseer',
+      name: 'Overseer Lab',
+      path: 'C:/repo/overseer-lab',
+      createdAt: '2026-08-05T19:09:34.000Z',
+    }
+    ingest(evt({
+      seq: 1,
+      kind: 'project/created',
+      sessionId: null,
+      payload: { project },
+    }))
+    flush()
+
+    expect(store.projects).toEqual([project])
+
+    ingest(evt({
+      seq: 2,
+      kind: 'project/created',
+      sessionId: null,
+      payload: { project: { ...project, name: 'Overseer Lab (canonical)' } },
+    }))
+    flush()
+
+    expect(store.projects).toEqual([{ ...project, name: 'Overseer Lab (canonical)' }])
+  })
+
   it('applies an account display-name change without changing its immutable id', () => {
     store.profiles = [{ id: 'claude-a', provider: 'claude', displayName: 'Before' }]
     ingest(evt({

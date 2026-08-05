@@ -40,6 +40,13 @@ import { TeamPresetStore, type TeamPreset } from './teamPresets.js'
 export function isOAuthSignedOutError(message: string): boolean {
   return /oauth session expired|could not be refreshed|refresh[_ -]?token[_ -]?reused|invalid[_ -]?grant|authentication.*expired/i.test(message)
 }
+
+export function isClaudeSubscriptionAccessError(message: string): boolean {
+  return (
+    /organization has disabled claude subscription access for claude code/i.test(message) ||
+    /claude code (?:is|was) not enabled (?:in|for) (?:this|your|the) organization/i.test(message)
+  )
+}
 import { writeManagedInstructions, agentContract } from './instructions.js'
 import type { InstructionStore } from './instructions.js'
 import { identityOf, readableScopes, type SessionIdentity } from './identity.js'
@@ -2943,6 +2950,12 @@ export class SessionManager {
   }
 
   private beginProfileAdmission(profileId: string): ProfileAdmissionLease {
+    const profile = this.profiles.get(profileId)
+    if (profile?.authStatus === 'signed_out') {
+      throw new Error(
+        profile.authError ?? `${profileId} is signed out. Sign in again from Settings → Accounts.`,
+      )
+    }
     const state = this.profileAdmissionState(profileId)
     if (state.frozen) {
       throw new Error(
@@ -5159,13 +5172,18 @@ export class SessionManager {
       return
     }
     const record = this.sessions.get(sessionId)
-    if (record && isOAuthSignedOutError(message)) {
+    const oauthExpired = isOAuthSignedOutError(message)
+    const claudeSubscriptionRejected =
+      record?.provider === 'claude' && isClaudeSubscriptionAccessError(message)
+    if (record && (oauthExpired || claudeSubscriptionRejected)) {
+      message = claudeSubscriptionRejected
+        ? `${record.profileId}'s authenticated Claude account is bound to an organization that rejected Claude Code subscription access. Re-authenticate it from Settings → Accounts and select an account or organization with Claude Code enabled, or ask that organization's administrator to enable access.`
+        : `${record.profileId} is signed out because its OAuth session expired and could not be refreshed. Sign in again from Settings → Accounts.`
       const profile = this.profiles.get(record.profileId)
       if (profile) {
         profile.authStatus = 'signed_out'
         profile.authError = message
       }
-      message = `${record.profileId} is signed out because its OAuth session expired and could not be refreshed. Sign in again from Settings → Accounts.`
       this.journal.append(null, 'profile/auth', { profileId: record.profileId, status: 'signed_out', message })
     }
     this.journal.append(sessionId, 'session/error', { message })

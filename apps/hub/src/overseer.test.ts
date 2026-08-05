@@ -54,7 +54,7 @@ function harness() {
     approvals,
     new UsageMonitor(journal, profiles, {}),
     new WorkspaceManager(path.join(root, 'worktrees')),
-    new ProjectStore(journal.db),
+    new ProjectStore(journal.db, journal),
     new InstructionStore(journal.db),
     bus,
     new MemoryStore(journal.db),
@@ -82,7 +82,7 @@ function harness() {
     journal.db.close()
     fs.rmSync(root, { recursive: true, force: true })
   })
-  return { root, journal, store, approvals, sessions, executor, bus, seed, markOperator, markBus }
+  return { root, journal, store, approvals, sessions, executor, bus, profiles, seed, markOperator, markBus }
 }
 
 describe('application Overseer authority', () => {
@@ -293,6 +293,13 @@ describe('application Overseer authority', () => {
     const project = await h.sessions.overseerControl('overseer', { operation: 'create_project', name: 'Lab' })
     expect(project).toMatchObject({ ok: true, data: { name: 'Lab' } })
     const projectId = (project.data as { id: string }).id
+    expect(h.journal.since(0)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'project/created',
+        sessionId: null,
+        payload: { project: expect.objectContaining({ id: projectId, name: 'Lab' }) },
+      }),
+    ]))
     const chat = await h.sessions.overseerControl('overseer', {
       operation: 'create_chat', profileId: 'p1', projectId, permissionMode: 'edits', useWorktree: false,
     })
@@ -374,6 +381,39 @@ describe('application Overseer authority', () => {
     await expect(h.sessions.overseerControl('overseer', {
       operation: 'set_mode', sessionId: 'failed', permissionMode: 'full',
     })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/direct operator turn/u) })
+  })
+
+  it('turns Claude organization entitlement rejection into one actionable account re-authentication state', async () => {
+    const h = harness()
+    h.seed({ id: 'failed', status: 'active', title: 'Rejected Claude worker' })
+
+    h.sessions.failTurn(
+      'failed',
+      'Claude Code returned an error result: Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access',
+    )
+
+    expect(h.profiles[0]).toMatchObject({
+      authStatus: 'signed_out',
+      authError: expect.stringMatching(/organization that rejected Claude Code subscription access/u),
+    })
+    expect(h.journal.since(0)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'profile/auth',
+        sessionId: null,
+        payload: expect.objectContaining({
+          profileId: 'p1',
+          status: 'signed_out',
+          message: expect.stringMatching(/Re-authenticate it from Settings/u),
+        }),
+      }),
+    ]))
+
+    const inputsBeforeRetry = h.journal.since(0).filter((event) => event.kind === 'session/input').length
+    await expect(h.sessions.send('failed', 'retry with the same rejected credential')).rejects.toThrow(
+      /organization that rejected Claude Code subscription access/u,
+    )
+    expect(h.executor.runTurn).not.toHaveBeenCalled()
+    expect(h.journal.since(0).filter((event) => event.kind === 'session/input')).toHaveLength(inputsBeforeRetry)
   })
 
   it('queues failure alerts until a privileged operator turn ends', () => {
