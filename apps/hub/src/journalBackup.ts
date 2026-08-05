@@ -12,6 +12,7 @@ import {
   publishRecoveryGeneration,
 } from './journalRecovery.js'
 import { SCHEMA_VERSION } from './restartHandshake.js'
+import type { JournalProgressUpdate } from './journalProgress.js'
 
 /**
  * Periodic, verified snapshots of the journal.
@@ -71,6 +72,8 @@ export interface JournalBackupOptions {
    */
   recoveryDataDir?: string
   recoveryKeep?: number
+  /** Out-of-band supervisor heartbeat; failures are diagnostic and can never fail a snapshot. */
+  onProgress?: (progress: JournalProgressUpdate) => void
 }
 
 const DEFAULT_INTERVAL_MS = 30 * 60 * 1000
@@ -125,7 +128,36 @@ export async function snapshotJournal(
 ): Promise<SnapshotResult> {
   const now = options.now ?? (() => new Date())
   const log = options.log ?? (() => {})
+  const progressOperationId = randomUUID()
+  let progressCompleted = false
+  let sourceBytes = 0n
+  let bytesCompleted = 0
+  const reportProgress = (
+    phase: string,
+    active: boolean,
+    suspendWatchdog = false,
+    detail = ''
+  ): void => {
+    try {
+      options.onProgress?.({
+        operationId: progressOperationId,
+        phase,
+        active,
+        suspendWatchdog,
+        bytesCompleted,
+        databaseBytes: Number(sourceBytes),
+        detail,
+      })
+    } catch (error) {
+      log(
+        `[journal-backup] progress heartbeat failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+    }
+  }
   fs.mkdirSync(options.dir, { recursive: true })
+  reportProgress('preparing', true)
   const keep = Math.max(1, Math.trunc(options.keep ?? DEFAULT_KEEP))
   const maxRetainedBytes = positiveByteLimit(
     options.maxRetainedBytes,
@@ -139,7 +171,7 @@ export async function snapshotJournal(
   // failures must not allow a legacy pile to grow forever.
   rotateSnapshots()
   try {
-    const sourceBytes = estimateSourceBytes(db)
+    sourceBytes = estimateSourceBytes(db)
     if (sourceBytes > 0n) {
       const reserveBytes = BigInt(
         positiveByteLimit(options.minimumFreeBytes, DEFAULT_MINIMUM_FREE_BYTES)
@@ -194,7 +226,18 @@ export async function snapshotJournal(
 
     try {
       // Online backup: consistent even while the hub is mid-turn.
-      await db.backup(partial)
+      reportProgress('copying', true)
+      await db.backup(partial, {
+        progress: ({ totalPages, remainingPages }) => {
+          const copiedPages = Math.max(0, totalPages - remainingPages)
+          bytesCompleted = totalPages > 0
+            ? Number((sourceBytes * BigInt(copiedPages)) / BigInt(totalPages))
+            : 0
+          reportProgress('copying', true, false, `${copiedPages}/${totalPages} SQLite pages copied`)
+          return 1_000
+        },
+      })
+      bytesCompleted = fs.statSync(partial).size
       // SQLite online backup preserves the source's WAL journal-mode header. A standalone snapshot has
       // no live WAL to replay, and opening that header read-only on Windows manufactures `-wal`/`-shm`
       // files that can remain locked long enough to break strong-generation publication. Normalize the
@@ -213,6 +256,9 @@ export async function snapshotJournal(
 
     let verified = false
     try {
+      // integrity_check is synchronous native work with no progress callback. This explicit phase tells
+      // hubctl never to kill this process in the middle of the verification/lineage safety boundary.
+      reportProgress('verifying-snapshot', true, true)
       verified = options.verify ? options.verify(partial) : defaultVerify(partial, sourceHadEvents)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
@@ -256,6 +302,7 @@ export async function snapshotJournal(
     let recoveryGeneration: string | undefined
     if (options.recoveryDataDir) {
       try {
+        reportProgress('publishing-lineage', true, true)
         const generation = publishRecoveryGeneration({
           dataDir: options.recoveryDataDir,
           snapshotFile: target,
@@ -275,8 +322,15 @@ export async function snapshotJournal(
         return { ok: false, file: target, bytes, error: message }
       }
     }
+    progressCompleted = true
     return { ok: true, file: target, bytes, ...(recoveryGeneration ? { recoveryGeneration } : {}) }
   } finally {
+    reportProgress(
+      progressCompleted ? 'completed' : 'failed',
+      false,
+      false,
+      progressCompleted ? 'Verified snapshot and lineage publication completed.' : 'Snapshot did not complete.'
+    )
     rotateSnapshots()
   }
 }

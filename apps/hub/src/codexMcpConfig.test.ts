@@ -5,7 +5,9 @@ import path from 'node:path'
 import {
   renderCodexAgentMcpBlock,
   stripCodexAgentMcpBlock,
+  upsertCodexFileCredentialStore,
   upsertCodexAgentMcp,
+  writeCodexFileCredentialStoreConfig,
   writeCodexAgentMcpConfig,
   type CodexAgentMcpOptions,
 } from './codexMcpConfig.js'
@@ -66,6 +68,7 @@ describe('upsert / strip (preserve the operator config; own only our table)', ()
     ].join('\n')
     const next = upsertCodexAgentMcp(existing, OPTS)
     expect(next).toContain('model = "gpt-5-codex"')
+    expect(next).toContain('cli_auth_credentials_store = "file"')
     expect(next).toContain('[mcp_servers.playwright]')
     expect(next).toContain('args = ["@playwright/mcp@latest"]')
     expect(next).toContain('[mcp_servers.allmyagents]')
@@ -97,6 +100,36 @@ describe('upsert / strip (preserve the operator config; own only our table)', ()
     expect(stripped).not.toContain('allmyagents')
     expect(stripped).toContain('[mcp_servers.keepme]')
     expect(stripped).toContain('command = "keep"')
+  })
+})
+
+describe('managed profile credential storage', () => {
+  it('pins the documented file store before the first table without disturbing nested keys', () => {
+    const existing = [
+      'model = "gpt-5-codex"',
+      'cli_auth_credentials_store = "keyring" # incompatible with profile auth.json isolation',
+      '',
+      '[mcp_servers.keepme]',
+      'cli_auth_credentials_store = "nested-value-that-is-not-the-root-key"',
+      'command = "keep"',
+    ].join('\n')
+    const next = upsertCodexFileCredentialStore(existing)
+    expect(next.match(/^cli_auth_credentials_store = "file"$/gm)).toHaveLength(1)
+    expect(next).not.toContain('cli_auth_credentials_store = "keyring"')
+    expect(next).toContain('cli_auth_credentials_store = "nested-value-that-is-not-the-root-key"')
+    expect(next.indexOf('cli_auth_credentials_store = "file"')).toBeLessThan(
+      next.indexOf('[mcp_servers.keepme]'),
+    )
+  })
+
+  it('materializes file-backed auth for a fresh managed CODEX_HOME', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-codex-auth-config-'))
+    try {
+      const file = writeCodexFileCredentialStoreConfig(tmp)
+      expect(fs.readFileSync(file, 'utf8')).toBe('cli_auth_credentials_store = "file"\n')
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
   })
 })
 

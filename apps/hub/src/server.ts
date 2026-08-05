@@ -712,7 +712,10 @@ export function startServer(opts: ServerOptions): http.Server {
         res.setHeader('Access-Control-Allow-Origin', origin)
         res.setHeader('Vary', 'Origin')
         res.setHeader('Access-Control-Allow-Headers', 'content-type, x-filename, authorization, x-hub-token')
-        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        // Project deletion is the first browser-facing DELETE route. Omitting DELETE here makes the
+        // browser reject its preflight before the authenticated request reaches the hub, which surfaces
+        // only as the misleading transport error "Failed to fetch" in the desktop UI.
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
       }
       if (method === 'OPTIONS') {
         res.writeHead(204)

@@ -159,3 +159,52 @@ describe('tutorial eligibility and persistence', () => {
     expect(readTutorialDisposition(storage, NEW_PROJECT_TUTORIAL_KEY)).toBe('completed')
   })
 })
+
+describe('setLogin reactivity (the sign-in freeze)', () => {
+  // A sign-in used to lock the entire app: SettingsModal mirrors login state to the tutorial from inside
+  // an `$effect`, and setLogin READ `login` (for startedAt) then WROTE it on the same synchronous pass.
+  // Svelte 5 tracks reads made by functions an effect calls, so the effect depended on the very state it
+  // wrote — and since each call built a fresh object, the write always looked like a change. The effect
+  // retriggered forever, pegging the renderer and compositor while the hub sat idle.
+  //
+  // `$effect` needs a component context, so these assert the two properties that make the cycle
+  // impossible rather than instantiating one: the read is untracked, and an unchanged view is not written.
+  it('does not mint a new object identity for an unchanged waiting view', () => {
+    const c = new TutorialController(new MemoryStorage())
+    c.setLogin({ status: 'waiting', provider: 'claude', startedAt: 1000, message: 'Signing in…' })
+    const first = c.login
+
+    c.setLogin({ status: 'waiting', provider: 'claude', startedAt: 1000, message: 'Signing in…' })
+
+    // Identity must be preserved — a fresh object here is what woke the effect on every pass.
+    expect(c.login).toBe(first)
+  })
+
+  it('converges instead of changing on every repeated call', () => {
+    const c = new TutorialController(new MemoryStorage())
+    const view = { status: 'waiting' as const, provider: 'claude' as const, message: 'Preparing…' }
+
+    c.setLogin(view)
+    const settled = c.login
+    for (let i = 0; i < 25; i++) c.setLogin(view)
+
+    expect(c.login).toBe(settled)
+    expect(c.login.status).toBe('waiting')
+    // startedAt is stamped once and then held, not re-stamped on every mirror.
+    expect(c.login.startedAt).toBe(settled.startedAt)
+  })
+
+  it('still updates when the view genuinely changes, and clears startedAt when not waiting', () => {
+    const c = new TutorialController(new MemoryStorage())
+    c.setLogin({ status: 'waiting', provider: 'claude', startedAt: 5, message: 'a' })
+    expect(c.login.startedAt).toBe(5)
+
+    c.setLogin({ status: 'waiting', provider: 'claude', startedAt: 5, message: 'b' })
+    expect(c.login.message).toBe('b')
+    expect(c.login.startedAt).toBe(5)
+
+    c.setLogin({ status: 'done', provider: 'claude', message: 'Account connected.' })
+    expect(c.login.status).toBe('done')
+    expect(c.login.startedAt).toBeUndefined()
+  })
+})

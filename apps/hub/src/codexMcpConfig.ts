@@ -37,6 +37,7 @@ export interface CodexAgentMcpOptions {
 }
 
 export const AGENT_MCP_SERVER_NAME = 'allmyagents'
+const FILE_CREDENTIAL_STORE = 'cli_auth_credentials_store = "file"'
 
 /** Encode a string as a TOML basic string (escaping backslashes + quotes). */
 function tomlStr(s: string): string {
@@ -91,12 +92,59 @@ export function stripCodexAgentMcpBlock(existing: string, serverName = AGENT_MCP
   return out.join('\n').replace(/\n{3,}/g, '\n\n').replace(/\s*$/, '') + '\n'
 }
 
+/**
+ * AllMyAgents profiles are intentionally isolated CODEX_HOME directories and the login saga verifies,
+ * archives, restores, and watches `<profile>/auth.json`. Codex's `auto` credential-store mode may choose
+ * the OS keyring instead, which makes a successful login invisible to that per-profile durability
+ * boundary and can make later app-server launches appear signed out. Pin only this app-managed profile
+ * to the documented file store while preserving every unrelated top-level key and table.
+ */
+export function upsertCodexFileCredentialStore(existing: string): string {
+  const lines = existing.replace(/\r\n/g, '\n').split('\n')
+  const firstTable = lines.findIndex((line) => /^\s*\[\[?[^\]]+\]\]?\s*(?:#.*)?$/.test(line))
+  const topLevelEnd = firstTable === -1 ? lines.length : firstTable
+  let replaced = false
+  const topLevel: string[] = []
+  for (let index = 0; index < topLevelEnd; index += 1) {
+    const line = lines[index]!
+    if (/^\s*cli_auth_credentials_store\s*=/.test(line)) {
+      if (!replaced) topLevel.push(FILE_CREDENTIAL_STORE)
+      replaced = true
+    } else {
+      topLevel.push(line)
+    }
+  }
+  if (!replaced) {
+    while (topLevel.length && topLevel[topLevel.length - 1] === '') topLevel.pop()
+    topLevel.push(FILE_CREDENTIAL_STORE)
+    if (firstTable !== -1) topLevel.push('')
+  }
+  const remainder = firstTable === -1 ? [] : lines.slice(firstTable)
+  return [...topLevel, ...remainder].join('\n').replace(/\s*$/, '') + '\n'
+}
+
 /** Compute the new config.toml text: strip our old tables, then append the fresh block. */
 export function upsertCodexAgentMcp(existing: string, opts: CodexAgentMcpOptions): string {
   const name = opts.serverName ?? AGENT_MCP_SERVER_NAME
-  const stripped = stripCodexAgentMcpBlock(existing, name).replace(/\s*$/, '')
+  const credentialBound = upsertCodexFileCredentialStore(existing)
+  const stripped = stripCodexAgentMcpBlock(credentialBound, name).replace(/\s*$/, '')
   const block = renderCodexAgentMcpBlock(opts)
   return (stripped ? stripped + '\n\n' : '') + block + '\n'
+}
+
+/** Pin an app-managed CODEX_HOME to auth.json before launching login, even before it has a chat/MCP block. */
+export function writeCodexFileCredentialStoreConfig(codexHome: string): string {
+  const file = path.join(codexHome, 'config.toml')
+  let existing = ''
+  try {
+    existing = fs.readFileSync(file, 'utf8')
+  } catch {
+    /* fresh managed profile */
+  }
+  const next = upsertCodexFileCredentialStore(existing)
+  fs.mkdirSync(codexHome, { recursive: true })
+  if (next !== existing) fs.writeFileSync(file, next)
+  return file
 }
 
 /**

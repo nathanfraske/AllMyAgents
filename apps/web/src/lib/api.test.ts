@@ -148,6 +148,24 @@ describe('transport (res.ok respected; errors are not data)', () => {
     expect(res.id).toBe('s1')
   })
 
+  it('preserves the actual generation on a stale journal-history fence', async () => {
+    stubFetch(409, {
+      error: 'journal history generation changed',
+      resetRequired: true,
+      expected: 4,
+      actual: 5,
+    })
+    const { api, JournalHistoryGenerationChangedError } = await loadApi()
+
+    const error = await api.journalHistory('s1', 4, 9_100).then(
+      () => null,
+      (value) => value,
+    )
+
+    expect(error).toBeInstanceOf(JournalHistoryGenerationChangedError)
+    expect(error).toMatchObject({ status: 409, expected: 4, actual: 5 })
+  })
+
   it('exchanges a short pairing code without replaying a saved device capability', async () => {
     vi.stubGlobal('localStorage', {
       getItem: () => 'saved-local-device-token',

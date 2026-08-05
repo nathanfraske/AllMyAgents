@@ -497,6 +497,8 @@ export class WorktreeCollisionDetector {
   private polling = false
   private activityByProject = new Map<string, WorktreeProjectActivity>()
   private readonly shelvedInspections = new Map<string, { inspectedAt: number; value: SessionInspection }>()
+  /** Missing checkout paths are cheap-stat'd each poll, but logged only on the present→missing edge. */
+  private readonly missingWorktrees = new Map<string, string>()
 
   constructor(private readonly options: WorktreeCollisionDetectorOptions) {}
 
@@ -528,6 +530,7 @@ export class WorktreeCollisionDetector {
     if (this.options.enabled?.() === false) {
       this.activityByProject = new Map()
       this.shelvedInspections.clear()
+      this.missingWorktrees.clear()
       return
     }
     this.polling = true
@@ -581,6 +584,9 @@ export class WorktreeCollisionDetector {
       for (const sessionId of this.shelvedInspections.keys()) {
         if (!visibleSessionIds.has(sessionId)) this.shelvedInspections.delete(sessionId)
       }
+      for (const sessionId of this.missingWorktrees.keys()) {
+        if (!visibleSessionIds.has(sessionId)) this.missingWorktrees.delete(sessionId)
+      }
       // A manager can retain dozens of stashed teams. Refresh only a bounded number per ordinary
       // two-second poll; all others keep their last trustworthy snapshot. Active managed worktrees seed
       // this cache continuously, so shelving a team remains immediately attributable without spawning a
@@ -593,6 +599,24 @@ export class WorktreeCollisionDetector {
             const live = record.status === 'active' || record.status === 'starting'
             const cached = this.shelvedInspections.get(record.id)
             try {
+              let worktreePresent = false
+              try {
+                worktreePresent = (await fs.stat(record.worktree!)).isDirectory()
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+              }
+              if (!worktreePresent) {
+                if (this.missingWorktrees.get(record.id) !== record.worktree) {
+                  this.missingWorktrees.set(record.id, record.worktree!)
+                  console.warn(
+                    `[worktree-collision] checkout is absent; pausing Git inspection for ${record.worktree}`
+                  )
+                }
+                // A stashed team deliberately retains its last trustworthy attribution snapshot even
+                // after its checkout is reaped. Ordinary active sessions have no cache and disappear.
+                return cached ? { ...cached.value, record } : undefined
+              }
+              this.missingWorktrees.delete(record.id)
               if (!live && cached && Date.now() - cached.inspectedAt < WORKTREE_SHELVED_ACTIVITY_POLL_MS) {
                 return { ...cached.value, record }
               }
@@ -607,11 +631,15 @@ export class WorktreeCollisionDetector {
               return value
             } catch (error) {
               // A disappearing/broken worktree must not stop the hub or suppress checks for healthy peers.
-              console.warn(
-                `[worktree-collision] could not inspect ${record.worktree}: ${
-                  error instanceof Error ? error.message : String(error)
-                }`
-              )
+              const missing = (error as NodeJS.ErrnoException).code === 'ENOENT'
+              if (!missing || this.missingWorktrees.get(record.id) !== record.worktree) {
+                if (missing) this.missingWorktrees.set(record.id, record.worktree!)
+                console.warn(
+                  `[worktree-collision] could not inspect ${record.worktree}: ${
+                    error instanceof Error ? error.message : String(error)
+                  }`
+                )
+              }
               return cached ? { ...cached.value, record } : undefined
             }
           })

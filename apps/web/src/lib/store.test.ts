@@ -1434,6 +1434,70 @@ describe('bounded cold baseline and global maintenance status', () => {
     expect(cold.sessions.s1?.items.some((item) => item.text?.startsWith('older-7-'))).toBe(true)
     expect(cold.sessions.s1?.items.some((item) => item.text?.startsWith('live-99-'))).toBe(true)
   })
+
+  it('transparently retries the same older cursor when maintenance advances history generation', async () => {
+    const cold = new HubStore()
+    const install = cold as unknown as {
+      installReplayBaseline(baseline: Awaited<ReturnType<typeof api.replayBaseline>>): void
+    }
+    install.installReplayBaseline({
+      version: 1,
+      generation: 4,
+      highWaterSeq: 10_000,
+      resetFloorSeq: 0,
+      sessions: [rec('s1')],
+      projects: [],
+      journalCompaction: null,
+    })
+    vi.mocked(api.journalHistory).mockResolvedValueOnce({
+      events: [
+        evt({
+          seq: 9_100,
+          kind: 'codex/item/completed',
+          sessionId: 's1',
+          payload: { item: { id: 'latest', type: 'agentMessage', text: 'latest retained' } },
+        }),
+      ],
+      olderCursor: 9_100,
+      hasOlder: true,
+      encodedBytes: 200,
+      checkpointGeneration: 4,
+    })
+    await cold.ensureHistory('s1')
+
+    vi.mocked(api.journalHistory)
+      .mockRejectedValueOnce(
+        Object.assign(new Error('journal history generation changed (4 -> 5)'), {
+          name: 'JournalHistoryGenerationChangedError',
+          expected: 4,
+          actual: 5,
+        }),
+      )
+      .mockResolvedValueOnce({
+        events: [
+          evt({
+            seq: 8_500,
+            kind: 'session/input',
+            sessionId: 's1',
+            payload: { text: 'older retained' },
+          }),
+        ],
+        olderCursor: 8_500,
+        hasOlder: true,
+        encodedBytes: 100,
+        checkpointGeneration: 5,
+      })
+
+    await expect(cold.loadOlderHistory('s1')).resolves.toBe(true)
+
+    expect(api.journalHistory).toHaveBeenNthCalledWith(2, 's1', 4, 9_100, expect.anything())
+    expect(api.journalHistory).toHaveBeenNthCalledWith(3, 's1', 5, 9_100, expect.anything())
+    expect(cold.sessions.s1?.journalHistoryGeneration).toBe(5)
+    expect(cold.sessions.s1?.historyLoadError).toBeUndefined()
+    expect(cold.sessions.s1?.items.map((item) => item.text)).toEqual(
+      expect.arrayContaining(['older retained', 'latest retained']),
+    )
+  })
 })
 
 

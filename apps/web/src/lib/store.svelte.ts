@@ -148,6 +148,19 @@ async function boundedHubRead<T>(
   }
 }
 
+function changedJournalHistoryGeneration(error: unknown): number | undefined {
+  if (
+    !(error instanceof Error) ||
+    error.name !== 'JournalHistoryGenerationChangedError' ||
+    !('actual' in error) ||
+    !Number.isSafeInteger((error as { actual?: unknown }).actual) ||
+    Number((error as { actual: number }).actual) < 1
+  ) {
+    return undefined
+  }
+  return Number((error as { actual: number }).actual)
+}
+
 export interface StatusInfo {
   key: string
   label: string
@@ -3713,18 +3726,34 @@ export class HubStore {
       view.loadingHistory = true
       view.historyLoadError = undefined
       let page: JournalHistoryPage | null = null
+      const requestedGeneration = remote?.generation ?? this.replayGeneration
+      const beforeSeq = (remote?.baselineSeq ?? this.replayBaselineSeq) + 1
       try {
         page = await boundedHubRead('Latest journal history', (signal) =>
           api.journalHistory(
             id,
-            remote?.generation ?? this.replayGeneration,
-            (remote?.baselineSeq ?? this.replayBaselineSeq) + 1,
+            requestedGeneration,
+            beforeSeq,
             signal,
           ),
         )
       } catch (error) {
-        view.historyLoadError =
-          error instanceof Error ? error.message : 'Latest journal history could not be loaded.'
+        const actualGeneration = changedJournalHistoryGeneration(error)
+        if (actualGeneration !== undefined && actualGeneration !== requestedGeneration) {
+          try {
+            page = await boundedHubRead('Latest journal history', (signal) =>
+              api.journalHistory(id, actualGeneration, beforeSeq, signal),
+            )
+          } catch (retryError) {
+            view.historyLoadError =
+              retryError instanceof Error
+                ? retryError.message
+                : 'Latest journal history could not be loaded.'
+          }
+        } else {
+          view.historyLoadError =
+            error instanceof Error ? error.message : 'Latest journal history could not be loaded.'
+        }
       } finally {
         view.loadingHistory = false
       }
@@ -3790,20 +3819,33 @@ export class HubStore {
     view.historyLoadError = undefined
     if (view.journalHistoryOlderCursor != null) {
       const cursor = view.journalHistoryOlderCursor
+      const requestedGeneration = view.journalHistoryGeneration ?? this.replayGeneration
       view.loadingHistory = true
       let page: JournalHistoryPage | null = null
       try {
         page = await boundedHubRead('Older journal history', (signal) =>
           api.journalHistory(
             id,
-            view.journalHistoryGeneration ?? this.replayGeneration,
+            requestedGeneration,
             cursor,
             signal,
           ),
         )
       } catch (error) {
-        view.historyLoadError =
-          error instanceof Error ? error.message : 'Older history could not be loaded.'
+        const actualGeneration = changedJournalHistoryGeneration(error)
+        if (actualGeneration !== undefined && actualGeneration !== requestedGeneration) {
+          try {
+            page = await boundedHubRead('Older journal history', (signal) =>
+              api.journalHistory(id, actualGeneration, cursor, signal),
+            )
+          } catch (retryError) {
+            view.historyLoadError =
+              retryError instanceof Error ? retryError.message : 'Older history could not be loaded.'
+          }
+        } else {
+          view.historyLoadError =
+            error instanceof Error ? error.message : 'Older history could not be loaded.'
+        }
       } finally {
         view.loadingHistory = false
       }
@@ -3817,6 +3859,7 @@ export class HubStore {
         return false
       }
       this.installJournalHistoryWindow(view, historyItems)
+      view.journalHistoryGeneration = page.checkpointGeneration
       view.journalHistoryOlderCursor = page.hasOlder ? page.olderCursor : null
       view.historyViewingOlder = true
       return true

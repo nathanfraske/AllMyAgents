@@ -43,6 +43,7 @@ import {
 } from './restartRollback.js'
 import { bootstrapJournalRecoveryInWorker } from './journalRecovery.js'
 import { writeOverseerSupervisorStatus, type OverseerSupervisorPhase } from './overseerSupervisor.js'
+import { readJournalProgress } from './journalProgress.js'
 
 /** The hard public singleton the web client hardcodes (`api.ts:145`). Blue owns it; green takes it on promote.
  *  HUB_FIXED_PORT overrides it for an isolated harness (e.g. the restart-survival acceptance test) so a
@@ -371,6 +372,8 @@ function spawnWorker(): ChildProcess | undefined {
  */
 const BACKOFF_MS = [500, 1_000, 2_000, 5_000, 10_000, 20_000, 30_000]
 const STABLE_MS = 60_000
+const HEALTH_NO_PROGRESS_MS = 90_000
+const HEALTH_RECHECK_MS = 5_000
 let consecutiveFailures = 0
 let reviving = false
 
@@ -397,6 +400,87 @@ async function hubAnswersHealth(port: number, timeoutMs = 3_000): Promise<boolea
   } catch {
     return false
   }
+}
+
+/**
+ * A missed HTTP timeout proves only that the event loop did not answer quickly. SQLite integrity checks
+ * and lineage hashing are synchronous native work. Observe a bounded no-progress window, and never kill
+ * while this exact hub instance reports that it is inside the crash-sensitive lineage boundary. A dead
+ * child is still handled immediately by its exit listener.
+ */
+function observeRevivedHubStability(settled: HubHandle): void {
+  let healthFailureStartedAt: number | undefined
+  let lastProgressAt = Date.now()
+  let lastProgressSignature = ''
+  let loggedProtection = false
+
+  const schedule = (delayMs: number): void => {
+    const timer = setTimeout(() => void observe(), delayMs)
+    timer.unref?.()
+  }
+  const observe = async (): Promise<void> => {
+    if (live !== settled) return
+    if (settled.child.exitCode !== null || settled.child.signalCode !== null) return
+    if (await hubAnswersHealth(settled.port ?? FIXED_PORT)) {
+      consecutiveFailures = 0
+      return
+    }
+
+    const now = Date.now()
+    // The no-progress clock starts when health first becomes unavailable, not when the worker was
+    // spawned. Otherwise the initial STABLE_MS delay silently consumes most of the promised observation
+    // window and a first missed probe can still kill a merely busy hub after only ~30 seconds.
+    if (healthFailureStartedAt === undefined) {
+      healthFailureStartedAt = now
+      lastProgressAt = now
+    }
+    const pid = settled.child.pid
+    const progress = pid === undefined
+      ? undefined
+      : readJournalProgress(dataDir, pid, settled.preflightAttemptId)
+    if (progress) {
+      const signature = [
+        progress.operationId,
+        progress.sequence,
+        progress.phase,
+        progress.rowsCompleted,
+        progress.bytesCompleted,
+        progress.active,
+      ].join(':')
+      if (signature !== lastProgressSignature) {
+        lastProgressSignature = signature
+        lastProgressAt = now
+      }
+      if (progress.active && progress.suspendWatchdog) {
+        if (!loggedProtection) {
+          loggedProtection = true
+          log(
+            `hub health is temporarily unresponsive during protected journal phase ${progress.phase}; ` +
+              'watchdog termination is suspended until that crash-sensitive boundary exits'
+          )
+        }
+        schedule(HEALTH_RECHECK_MS)
+        return
+      }
+    }
+
+    if (now - lastProgressAt < HEALTH_NO_PROGRESS_MS) {
+      if (!loggedProtection) {
+        loggedProtection = true
+        log(
+          `hub did not answer /api/health; observing for ${HEALTH_NO_PROGRESS_MS}ms of no progress before respawn`
+        )
+      }
+      schedule(HEALTH_RECHECK_MS)
+      return
+    }
+    log(
+      `hub made no observable progress for ${now - Math.max(lastProgressAt, healthFailureStartedAt)}ms ` +
+        'while /api/health was unavailable — treating as failed and respawning'
+    )
+    killTree(settled.child)
+  }
+  schedule(STABLE_MS)
 }
 
 async function reviveLiveHub(): Promise<void> {
@@ -431,22 +515,7 @@ async function reviveLiveHub(): Promise<void> {
         // only, so a hub that was alive but wedged — an event loop blocked, a native addon spinning —
         // counted as recovered and reset the backoff. A supervisor that accepts a process it cannot talk
         // to is measuring the wrong thing, which is the same mistake as exiting when the child dies.
-        const settled = next
-        setTimeout(() => {
-          if (live !== settled) return
-          if (settled.child.exitCode !== null || settled.child.signalCode !== null) return
-          void hubAnswersHealth(settled.port ?? FIXED_PORT).then((ok) => {
-            if (live !== settled) return
-            if (ok) {
-              consecutiveFailures = 0
-            } else {
-              // Alive but not serving. Treat it as a failed attempt and go round again rather than
-              // leaving the operator with a process that exists and a hub that does not.
-              log('hub is running but not answering /api/health — treating as failed and respawning')
-              killTree(settled.child)
-            }
-          })
-        }, STABLE_MS).unref?.()
+        observeRevivedHubStability(next)
         return
       } catch (err) {
         // KILL THE CANDIDATE BEFORE TRYING AGAIN. A spawn that never reached `ready` is still a live
