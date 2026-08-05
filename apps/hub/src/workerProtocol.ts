@@ -99,6 +99,7 @@ export type RelayMethod =
   | 'bus.roster'
   | 'bus.peek'
   | 'manager.childStatus'
+  | 'manager.manageTeam'
   | 'manager.spawn'
   | 'manager.setChildAuthority'
   | 'manager.decideChildApproval'

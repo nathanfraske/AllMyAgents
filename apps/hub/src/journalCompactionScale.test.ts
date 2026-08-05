@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
+import { performance } from 'node:perf_hooks'
 import { Worker } from 'node:worker_threads'
 import { afterAll, describe, expect, it } from 'vitest'
 import {
@@ -16,6 +17,91 @@ const OLD = '2026-07-30T10:00:00.000Z'
 describe('measured journal compaction scale', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-compaction-scale-'))
   afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }))
+
+  it(
+    'indexes terminal correlations before selecting the incident-sized maintenance frontier',
+    () => {
+      const journal = new Journal(path.join(tmp, 'frontier-correlation.db'))
+      try {
+        // The live failure had ~700k transient candidates and ~82k completed items. With only the old
+        // (kind, seq) index, every correlated terminal lookup walked most completed items and the selector
+        // never returned inside the maintenance child's 4m50s lifetime. Keep the fixture materially smaller
+        // for CI while preserving the pathological many-candidates x many-terminals query shape.
+        journal.db.exec(`
+          BEGIN IMMEDIATE;
+          WITH RECURSIVE n(value) AS (
+            VALUES(1)
+            UNION ALL SELECT value + 1 FROM n WHERE value < 100000
+          )
+          INSERT INTO journal_transient_event_index (
+            seq, kind, ts, session, payload_bytes, thread_id, turn_id, item_id,
+            item_type, canonical_terminal
+          )
+          SELECT
+            value,
+            'codex/item/commandExecution/outputDelta',
+            '${OLD}',
+            'scale',
+            1,
+            'thread',
+            'turn-' || ((value - 1) % 25000),
+            'item-' || ((value - 1) % 25000),
+            NULL,
+            0
+          FROM n;
+          WITH RECURSIVE n(value) AS (
+            VALUES(1)
+            UNION ALL SELECT value + 1 FROM n WHERE value < 25000
+          )
+          INSERT INTO journal_transient_event_index (
+            seq, kind, ts, session, payload_bytes, thread_id, turn_id, item_id,
+            item_type, canonical_terminal
+          )
+          SELECT
+            100000 + value,
+            'codex/item/completed',
+            '${OLD}',
+            'scale',
+            1,
+            'thread',
+            'turn-' || (value - 1),
+            'item-' || (value - 1),
+            'commandExecution',
+            1
+          FROM n;
+          COMMIT;
+        `)
+
+        const started = performance.now()
+        const frontier = journal.condensationCandidateFrontier({
+          nowMs: NOW,
+          graceMs: 60 * 60 * 1000,
+          maxTransientPayloadBytes: JOURNAL_CONDENSE_MAX_TRANSIENT_BYTES,
+        })
+        const elapsedMs = performance.now() - started
+
+        expect(frontier).toBe(100_000)
+        // The missing-index plan does not complete inside the 30-second test lifetime. Leave ample room
+        // for contended hosted runners while still proving the correlated lookup is indexed.
+        expect(elapsedMs).toBeLessThan(15_000)
+        const indexes = new Set(
+          (
+            journal.db
+              .prepare(
+                `SELECT name FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = 'journal_transient_event_index'`
+              )
+              .all() as Array<{ name: string }>
+          ).map((row) => row.name)
+        )
+        expect(indexes).toContain('idx_journal_transient_terminal_correlation')
+        expect(indexes).toContain('idx_journal_transient_diff_correlation')
+      } finally {
+        journal.db.close()
+      }
+    },
+    30_000
+  )
 
   it(
     'converges the logical 205k-row / 555MB-equivalent selector accounting in bounded batches',

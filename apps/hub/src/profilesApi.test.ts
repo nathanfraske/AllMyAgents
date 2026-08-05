@@ -134,6 +134,7 @@ describe('profile login API recovery contract', () => {
       loginId: 'public-attempt-1',
       profileId: 'claude-a',
       provider: 'claude' as const,
+      authMode: 'browser' as const,
       status: state.status,
     })
     const start = vi.fn(async () => {
@@ -225,6 +226,7 @@ describe('profile login API recovery contract', () => {
       profileId: 'claude-a',
       reauth: true,
       idempotencyKey: 'request-1',
+      authMode: 'browser',
     })
 
     const recovered = await fetch(

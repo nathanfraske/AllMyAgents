@@ -68,6 +68,20 @@ export interface ManagerAgentType {
   effort?: string
 }
 
+/**
+ * One durable child-team generation owned by a project manager. Team identity is independent from its
+ * display name so renaming a team never changes which sessions/worktrees belong to it.
+ */
+export interface ManagerTeam {
+  id: string
+  name: string
+  createdAt: string
+  activatedAt: string
+  stashedAt?: string
+  /** Saved preset provenance when the team was provisioned from one; never an authority grant. */
+  presetId?: string
+}
+
 export interface SessionRecord {
   id: string
   profileId: string
@@ -141,6 +155,10 @@ export interface SessionRecord {
   managerAllowedTools?: string[]
   /** Operator-defined worker briefs the manager may request by name. */
   managerAgentTypes?: ManagerAgentType[]
+  /** Bounded durable child-team generations. Exactly one id is active while the manager role is enabled. */
+  managerTeams?: ManagerTeam[]
+  managerActiveTeamId?: string
+  managerTeamCapabilityVersion?: number
   /** Editable launch brief retained with the grant so the operator can reconstruct what was handed over. */
   managerStartingPrompt?: string
   /** Editable orientation portion of the launch brief, kept separate from the operator's task in the UI. */
@@ -158,6 +176,10 @@ export interface SessionRecord {
   managerMaxChildPermissionMode?: 'safe' | 'edits' | 'full'
   /** Durable session lineage for sidebar nesting and hub-originated child reports. */
   parentSessionId?: string
+  /** Immutable team-generation membership assigned by the parent manager at child creation. */
+  managerTeamId?: string
+  /** Denormalized historical label so an orphaned child still explains which team owned it. */
+  managerTeamName?: string
   /** Authorities this child received from its manager, still subject to the manager's live ceiling. */
   delegatedAuthorities?: DelegatedAuthority[]
   /** Exact tool names granted to this child, still subject to the manager's live ceiling. */

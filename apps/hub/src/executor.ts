@@ -201,6 +201,10 @@ export interface InProcessExecutorHubHooks {
     }
   ): { found: boolean; summary?: string }
   managerChildStatus(managerSessionId: string): { ok: boolean; summary?: string; error?: string }
+  managerManageTeam(
+    managerSessionId: string,
+    input: Parameters<NonNullable<AgentServices['manageTeam']>>[1],
+  ): ReturnType<NonNullable<AgentServices['manageTeam']>>
   managerSpawn(
     managerSessionId: string,
     input: {
@@ -300,6 +304,7 @@ export class InProcessExecutor implements Executor {
       roster: (sessionId) => this.h.busRoster(sessionId),
       peek: (caller, target, options) => this.h.busPeek(caller, target, options),
       childStatus: (managerSessionId) => this.h.managerChildStatus(managerSessionId),
+      manageTeam: (managerSessionId, input) => this.h.managerManageTeam(managerSessionId, input),
       spawnAgent: (managerSessionId, input) => this.h.managerSpawn(managerSessionId, input),
       setChildAuthority: (managerSessionId, childSessionId, authorities, tools, permissionMode) =>
         this.h.managerSetChildAuthority(

@@ -30,7 +30,7 @@ import { PairingCodeBroker } from './pairingCode.js'
 import { pickFolder } from './native.js'
 import { computeStats } from './stats.js'
 import { buildFleet, probeHubHealth } from './fleet.js'
-import { credentialsExist } from './loginLauncher.js'
+import { credentialsExist, type LoginAuthMode } from './loginLauncher.js'
 import type { ProfileLoginCoordinator } from './profileLoginCoordinator.js'
 import { readProjectConfig } from './importScan.js'
 import { pickableProfiles, setClaudeConnectorPolicy } from './profiles.js'
@@ -912,6 +912,21 @@ export function startServer(opts: ServerOptions): http.Server {
           json(res, { ok: false, error: 'idempotencyKey is required' }, 400)
           return
         }
+        const requestedAuthMode = body.authMode
+        if (
+          requestedAuthMode !== undefined &&
+          requestedAuthMode !== 'browser' &&
+          requestedAuthMode !== 'device'
+        ) {
+          json(res, { ok: false, error: 'authMode must be browser|device' }, 400)
+          return
+        }
+        if (provider === 'claude' && requestedAuthMode === 'device') {
+          json(res, { ok: false, error: 'device-code sign-in is available only for Codex' }, 400)
+          return
+        }
+        const authMode: LoginAuthMode =
+          provider === 'codex' ? (requestedAuthMode ?? 'browser') : 'browser'
         const profileDir = path.join(profilesDir, name)
         const reauth = body.reauth === true
         const existing = profileLoginCoordinator.getForProfile(
@@ -919,13 +934,13 @@ export function startServer(opts: ServerOptions): http.Server {
           idempotencyKey,
         )
         if (existing) {
-          if (existing.provider !== provider) {
+          if (existing.provider !== provider || existing.authMode !== authMode) {
             json(
               res,
               {
                 ok: false,
                 error:
-                  'The idempotency key belongs to a different sign-in request.',
+                  'The idempotency key belongs to a different provider or sign-in method.',
               },
               409,
             )
@@ -950,6 +965,7 @@ export function startServer(opts: ServerOptions): http.Server {
           profileId: name,
           reauth,
           idempotencyKey,
+          authMode,
         })
         json(
           res,

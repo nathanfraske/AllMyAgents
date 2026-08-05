@@ -6,6 +6,7 @@ import {
   getLogin,
   getLoginForProfile,
   startLogin,
+  type LoginAuthMode,
   type LoginAttempt,
   type LoginStatus,
   type StartLoginOptions,
@@ -33,6 +34,8 @@ interface ProfileLoginRecord {
   profileId: string
   profileDir: string
   provider: Provider
+  /** Missing on pre-upgrade records, whose Codex launcher always used device auth. */
+  authMode?: LoginAuthMode
   reauth: boolean
   status: LoginStatus
   error?: string
@@ -50,6 +53,7 @@ export interface ProfileLoginResult {
   loginId: string
   profileId: string
   provider: Provider
+  authMode: LoginAuthMode
   status: LoginStatus
   url?: string
   code?: string
@@ -62,6 +66,16 @@ export interface StartProfileLoginRequest {
   profileId: string
   reauth: boolean
   idempotencyKey: string
+  authMode?: LoginAuthMode
+}
+
+function requestedAuthMode(request: Pick<StartProfileLoginRequest, 'provider' | 'authMode'>): LoginAuthMode {
+  return request.provider === 'codex' ? (request.authMode ?? 'browser') : 'browser'
+}
+
+function recordedAuthMode(record: Pick<ProfileLoginRecord, 'provider' | 'authMode'>): LoginAuthMode {
+  // Before this field existed Codex was unconditionally launched with --device-auth.
+  return record.provider === 'codex' ? (record.authMode ?? 'device') : 'browser'
 }
 
 function syncDirectory(directory: string): void {
@@ -153,6 +167,9 @@ function validRecord(value: unknown): value is ProfileLoginRecord {
     /^[a-zA-Z0-9_-]+$/.test(record.profileId) &&
     typeof record.profileDir === 'string' &&
     (record.provider === 'claude' || record.provider === 'codex') &&
+    (record.authMode === undefined ||
+      record.authMode === 'browser' ||
+      record.authMode === 'device') &&
     typeof record.reauth === 'boolean' &&
     typeof record.status === 'string' &&
     (ACTIVE.has(record.status as LoginStatus) ||
@@ -205,6 +222,7 @@ export class ProfileLoginRegistry {
       profileId: request.profileId,
       profileDir: path.resolve(profileDir),
       provider: request.provider,
+      authMode: requestedAuthMode(request),
       reauth: request.reauth,
       status: 'settling',
       createdAt: now,
@@ -338,6 +356,7 @@ export class ProfileLoginCoordinator {
 
   async start(request: StartProfileLoginRequest): Promise<ProfileLoginResult> {
     this.validateRequest(request)
+    const authMode = requestedAuthMode(request)
     const generation = this.options.profileRuntime.currentGeneration()
     if (!generation.active) {
       return this.failure(
@@ -365,12 +384,24 @@ export class ProfileLoginCoordinator {
           'A different sign-in request is already active for this profile.',
         )
       }
+      if (
+        begun.record.provider !== request.provider ||
+        begun.record.reauth !== request.reauth ||
+        recordedAuthMode(begun.record) !== authMode
+      ) {
+        return this.failure(
+          request,
+          begun.record.loginId,
+          'The idempotency key belongs to a different sign-in method or request.',
+        )
+      }
       return this.refresh(begun.record)
     }
     const record = begun.record
     if (
       record.provider !== request.provider ||
       record.reauth !== request.reauth ||
+      recordedAuthMode(record) !== authMode ||
       record.profileDir !== path.resolve(profileDir)
     ) {
       return this.failure(
@@ -412,6 +443,7 @@ export class ProfileLoginCoordinator {
         reauth: request.reauth,
         profileId: request.profileId,
         idempotencyKey: request.idempotencyKey,
+        authMode,
         acquireLease: () =>
           this.options.profileOwnership.acquireRefreshLease(
             request.profileId,
@@ -641,6 +673,7 @@ export class ProfileLoginCoordinator {
       loginId: record.loginId,
       profileId: record.profileId,
       provider: record.provider,
+      authMode: recordedAuthMode(record),
       status: record.status,
       ...(detail?.url ? { url: detail.url } : {}),
       ...(detail?.code ? { code: detail.code } : {}),
@@ -659,6 +692,7 @@ export class ProfileLoginCoordinator {
       loginId,
       profileId: request.profileId,
       provider: request.provider,
+      authMode: requestedAuthMode(request),
       status: 'failed',
       error,
     }
@@ -676,6 +710,16 @@ export class ProfileLoginCoordinator {
     }
     if (!/^[a-zA-Z0-9._:-]{1,128}$/.test(request.idempotencyKey)) {
       throw new Error('Sign-in idempotency key is invalid.')
+    }
+    if (
+      request.authMode !== undefined &&
+      request.authMode !== 'browser' &&
+      request.authMode !== 'device'
+    ) {
+      throw new Error('Sign-in method must be browser or device.')
+    }
+    if (request.provider === 'claude' && request.authMode === 'device') {
+      throw new Error('Device-code sign-in is available only for Codex.')
     }
     const resolved = path.resolve(this.profilesDir, request.profileId)
     if (path.dirname(resolved) !== this.profilesDir) {

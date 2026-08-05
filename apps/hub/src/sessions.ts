@@ -19,6 +19,7 @@ import type {
   DelegatedAuthority,
   HubEvent,
   ManagerAgentType,
+  ManagerTeam,
   Profile,
   Provider,
   RemoteDeviceCapability,
@@ -110,6 +111,9 @@ import {
 
 /** Bump whenever an existing Overseer conversation must receive a new app/tool operating contract. */
 export const OVERSEER_CAPABILITY_VERSION = 2
+/** Bump when existing manager conversations need a rematerialized team-management contract. */
+export const MANAGER_TEAM_CAPABILITY_VERSION = 1
+const MAX_MANAGER_TEAMS = 32
 
 function exactBrowserOpaque(value: unknown, field: string): string {
   if (
@@ -211,6 +215,7 @@ const DEFAULT_MANAGER_STANDING_INSTRUCTIONS = [
   '- Delegate all bounded project work by default to real AllMyAgents workers through the hub-provided spawn_agent tool; your job is to decompose, coordinate, inspect, and verify.',
   '- Use the AllMyAgents tool layer, never the vendor harness equivalents. spawn_agent and list_agents exist in both layers; only the AllMyAgents versions create real app chats with isolated worktrees, lifecycle reporting, collision detection, and operator visibility.',
   '- Your workers are real chats. If the operator cannot see a worker in the sidebar, you did not create it through AllMyAgents.',
+  '- Use manage_team to keep multiple durable worker lineups. A team switch shelves the outgoing chats without deleting their transcripts, branches, dirty files, or worktrees, then reopens the selected team. Never request interrupt_active unless the operator explicitly wants currently running outgoing turns stopped.',
   '- Keep your task board current, inspect direct children with peek_agent view "tasks", and use assign_child_task so the operator-visible board records what you delegated.',
   // Learned from the operator, who has recovered more of these by hand than anyone. The instinct on
   // seeing a child in `error` is to spawn a replacement, and that is usually the wrong move: a new chat
@@ -333,6 +338,9 @@ export interface CreateOptions {
   useWorktree?: boolean
   /** Hub-internal lineage. The public create route never accepts these fields. */
   parentSessionId?: string
+  /** Hub-internal durable team membership. Public session creation never forwards these fields. */
+  managerTeamId?: string
+  managerTeamName?: string
   delegatedAuthorities?: DelegatedAuthority[]
   delegatedTools?: string[]
   /** Hub-internal only. The public session route deliberately never forwards this field. */
@@ -462,6 +470,8 @@ export class SessionManager {
   private readonly busNoticeTurns = new Set<string>()
   /** One silence watchdog per active managed child; timers are unref'd and emit at most one stall report. */
   private readonly managerStallTimers = new Map<string, NodeJS.Timeout>()
+  /** Team activation crosses async executor boundaries; reject parallel mutations instead of interleaving them. */
+  private readonly managerTeamOperations = new Set<string>()
   // Codex profiles whose config.toml `[mcp_servers.allmyagents]` we've already (re)written this boot —
   // so the lazy per-profile materialization (ensureCodexMcpConfig, driven from specOf/readCodexLimits) is
   // written once before the app-server starts, not re-read+rewritten on every turn.
@@ -556,6 +566,7 @@ export class SessionManager {
       busPeek: (callerSessionId, targetSessionId, options) =>
         this.busPeek(callerSessionId, targetSessionId, options),
       managerChildStatus: (managerSessionId) => this.managerChildStatus(managerSessionId),
+      managerManageTeam: (managerSessionId, input) => this.managerManageTeam(managerSessionId, input),
       managerSpawn: (managerSessionId, input) => this.managerSpawn(managerSessionId, input),
       managerSetChildAuthority: (managerSessionId, childSessionId, authorities, tools, permissionMode) =>
         this.managerSetChildAuthority(
@@ -765,6 +776,13 @@ export class SessionManager {
       }
       case 'manager.childStatus':
         return this.managerChildStatus((args as { managerSessionId: string }).managerSessionId)
+      case 'manager.manageTeam': {
+        const a = args as {
+          managerSessionId: string
+          input: Parameters<NonNullable<AgentServices['manageTeam']>>[1]
+        }
+        return this.managerManageTeam(a.managerSessionId, a.input)
+      }
       case 'manager.spawn': {
         const a = args as {
           managerSessionId: string
@@ -1597,9 +1615,15 @@ export class SessionManager {
           canApproveChildren: preset.manager.canApproveChildren,
           permissionMode: preset.manager.permissionMode,
           maxChildPermissionMode: preset.manager.maxChildPermissionMode,
+          initialTeamName: preset.name,
+          initialTeamPresetId: preset.id,
         },
         'operator',
       )
+      const launchTeam = (manager.managerTeams ?? []).find(
+        (team) => team.id === manager.managerActiveTeamId,
+      )
+      if (!launchTeam) throw new Error('manager team initialization failed')
 
       const children: Array<{ id: string; agentTypeId: string; name: string; role: string }> = []
       for (const agent of preset.agents) {
@@ -1610,6 +1634,8 @@ export class SessionManager {
           permissionMode: agent.permissionMode,
           useWorktree: agent.useWorktree,
           parentSessionId: manager.id,
+          managerTeamId: launchTeam.id,
+          managerTeamName: launchTeam.name,
           role: agent.purpose,
           agentTypeId: agent.id,
           agentTypeName: agent.name,
@@ -1638,6 +1664,7 @@ export class SessionManager {
       this.journal.append(overseerSessionId, 'overseer/team-launched', {
         projectId,
         presetId: preset.id,
+        managerTeamId: launchTeam.id,
         managerSessionId: manager.id,
         childSessionIds: children.map((child) => child.id),
         actor: overseerSessionId,
@@ -1779,6 +1806,7 @@ export class SessionManager {
       roster: (sessionId) => this.busRoster(sessionId),
       peek: (caller, target, options) => this.busPeek(caller, target, options),
       childStatus: (managerSessionId) => this.managerChildStatus(managerSessionId),
+      manageTeam: (managerSessionId, input) => this.managerManageTeam(managerSessionId, input),
       spawnAgent: (managerSessionId, input) => this.managerSpawn(managerSessionId, input),
       setChildAuthority: (managerSessionId, childSessionId, authorities, tools, permissionMode) =>
         this.managerSetChildAuthority(
@@ -2593,7 +2621,7 @@ export class SessionManager {
     if (this.workerMode) {
       // A normal/cold hub already owns the public role; a booting green passes reconcile:false and must
       // remain read-only until promote() calls reconcileStale after winning the listener handoff.
-      if (opts?.reconcile !== false) this.upgradeOverseerSessions()
+      if (opts?.reconcile !== false) this.upgradeDurableSessionCapabilities()
       return
     }
     // A booting GREEN hub (blue-green restart) passes reconcile:false and defers reconcileStale() to
@@ -2609,6 +2637,17 @@ export class SessionManager {
 
   private upgradeOverseerSessions(): void {
     for (const record of this.sessions.values()) this.upgradeOverseerCapabilities(record)
+  }
+
+  private upgradeManagerTeamSessions(): void {
+    for (const record of this.sessions.values()) {
+      if (record.isProjectManager === true) this.ensureManagerTeams(record, 'Team 1', undefined, 'upgrade')
+    }
+  }
+
+  private upgradeDurableSessionCapabilities(): void {
+    this.upgradeOverseerSessions()
+    this.upgradeManagerTeamSessions()
   }
 
   /**
@@ -2651,7 +2690,7 @@ export class SessionManager {
   reconcileStale(): void {
     // This method runs only for the current public owner: at ordinary boot, or synchronously after a
     // green hub wins promote(). Keep all versioned Overseer writes on this side of the ownership fence.
-    this.upgradeOverseerSessions()
+    this.upgradeDurableSessionCapabilities()
     if (this.workerMode) {
       void this.attachWorker().catch((err) => console.warn(`[hub] attachWorker (reconcileStale) failed: ${err instanceof Error ? err.message : String(err)}`))
       return
@@ -3377,9 +3416,17 @@ export class SessionManager {
   }
 
   private managerRosterInstructions(managerSessionId: string): string {
+    const manager = this.sessions.get(managerSessionId)
+    const teams = manager?.managerTeams ?? []
     const children = [...this.sessions.values()]
       .filter((record) => record.parentSessionId === managerSessionId)
-      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+      .sort((left, right) => {
+        const leftTeam = teams.findIndex((team) => team.id === left.managerTeamId)
+        const rightTeam = teams.findIndex((team) => team.id === right.managerTeamId)
+        return (leftTeam < 0 ? Number.MAX_SAFE_INTEGER : leftTeam) -
+          (rightTeam < 0 ? Number.MAX_SAFE_INTEGER : rightTeam) ||
+          left.createdAt.localeCompare(right.createdAt)
+      })
     const counts = { running: 0, idle: 0, stopped: 0, errored: 0 }
     for (const child of children) {
       if (child.status === 'starting' || child.status === 'active') counts.running += 1
@@ -3392,6 +3439,7 @@ export class SessionManager {
       '',
       'This is a fresh hub snapshot, not conversation memory. Unknown means unknown; do not infer idle from silence.',
       `Tally: ${counts.running} running, ${counts.idle} idle, ${counts.stopped} stopped, ${counts.errored} errored.`,
+      `Teams: ${teams.length}; active: ${teams.find((team) => team.id === manager?.managerActiveTeamId)?.name ?? 'unknown'}. Use manage_team to list exact stable ids or switch teams safely.`,
     ]
     if (!children.length) lines.push('- No direct children.')
     for (const child of children.slice(0, MANAGER_ROSTER_DETAIL_LIMIT)) {
@@ -3408,6 +3456,7 @@ export class SessionManager {
         '',
         `### ${this.rosterLine(child.title ?? identityOf(child).label)} (${child.id})`,
         `- status: ${child.status}`,
+        `- team: ${this.rosterLine(child.managerTeamName ?? 'legacy / unassigned')} (${child.managerTeamId ?? 'unknown id'})${child.managerTeamId === manager?.managerActiveTeamId ? ' [ACTIVE]' : ' [STASHED]'}`,
         `- agent type: ${this.rosterLine(child.agentTypeName ?? child.role ?? 'unknown / not recorded')}`,
         `- profile / model: ${child.profileId} / ${this.rosterLine(child.model ?? 'provider default')}`,
         `- worktree: ${this.rosterLine(child.worktree ?? 'none / shared project checkout')}`,
@@ -3518,6 +3567,9 @@ export class SessionManager {
       canApproveChildren?: boolean
       permissionMode?: 'safe' | 'edits' | 'full'
       maxChildPermissionMode?: 'safe' | 'edits' | 'full'
+      /** Hub-internal launch provenance. Public manager configuration never needs to supply these. */
+      initialTeamName?: string
+      initialTeamPresetId?: string
     },
     actor: 'operator' | 'agent'
   ): SessionRecord {
@@ -3667,6 +3719,14 @@ export class SessionManager {
               })
             }
           }
+        }
+        if (config.enabled) {
+          this.ensureManagerTeams(
+            record,
+            config.initialTeamName ?? 'Team 1',
+            config.initialTeamPresetId,
+            'configure',
+          )
         }
         this.persist(record)
         this.journal.append(record.id, config.enabled ? 'manager/granted' : 'manager/revoked', {
@@ -3854,6 +3914,7 @@ export class SessionManager {
   ): Promise<ManagerSpawnResult> {
     const manager = this.sessions.get(managerSessionId)
     if (!manager?.isProjectManager) return { ok: false, error: 'caller is not an operator-marked project manager' }
+    const managerTeam = this.ensureManagerTeams(manager, 'Team 1', undefined, 'spawn')
     const max = manager.managerMaxLiveChildren
     if (!Number.isInteger(max) || (max ?? 0) < 1) return { ok: false, error: 'manager has no valid live-child limit' }
     const live = [...this.sessions.values()].filter(
@@ -3970,6 +4031,8 @@ export class SessionManager {
         permissionMode: requestedPermissionMode,
         useWorktree: input.useWorktree !== false,
         parentSessionId: manager.id,
+        managerTeamId: managerTeam.id,
+        managerTeamName: managerTeam.name,
         role: resolvedAgentType?.purpose,
         agentTypeId: resolvedAgentType?.id,
         agentTypeName: resolvedAgentType?.name,
@@ -3985,6 +4048,8 @@ export class SessionManager {
           worktree: child.worktree ?? null,
           agentTypeId: child.agentTypeId ?? null,
           agentTypeName: child.agentTypeName ?? null,
+          teamId: managerTeam.id,
+          teamName: managerTeam.name,
         })
         if (authorities.length || tools.length) {
           this.setChildDelegation(manager.id, child.id, authorities, tools)
@@ -4496,6 +4561,8 @@ export class SessionManager {
       permissionMode: opts.isOverseer === true ? 'full' : opts.permissionMode,
       permissionModeOperatorOverride: opts.isOverseer === true ? true : undefined,
       parentSessionId: opts.parentSessionId,
+      managerTeamId: opts.managerTeamId,
+      managerTeamName: opts.managerTeamName,
       delegatedAuthorities: opts.delegatedAuthorities?.length
         ? [...new Set(opts.delegatedAuthorities)]
         : undefined,
@@ -5438,6 +5505,349 @@ export class SessionManager {
    * for an unknown / self / stopped / cross-project target (fails closed, same scope as the bus).
    */
   /** Exact live state for direct children. Starting and active both count as running. */
+  private managerChildren(managerSessionId: string): SessionRecord[] {
+    return [...this.sessions.values()]
+      .filter((record) => record.parentSessionId === managerSessionId)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+  }
+
+  /**
+   * Upgrade legacy managers/children onto the durable team-generation model. This is deliberately
+   * idempotent: boot may call it repeatedly, but it writes only when a manager or child actually needs
+   * migration. Existing session ids, vendor conversations, worktrees, and branches never change.
+   */
+  private ensureManagerTeams(
+    manager: SessionRecord,
+    initialName = 'Team 1',
+    presetId?: string,
+    reason: 'upgrade' | 'configure' | 'spawn' | 'launch' | 'tool' = 'tool',
+  ): ManagerTeam {
+    if (manager.isProjectManager !== true) throw new Error('caller is not an operator-marked project manager')
+    const now = new Date().toISOString()
+    const seen = new Set<string>()
+    const sourceTeams = Array.isArray(manager.managerTeams) ? manager.managerTeams : []
+    const teams = sourceTeams
+      .filter((team): team is ManagerTeam => {
+        if (
+          !team ||
+          typeof team.id !== 'string' ||
+          !team.id ||
+          typeof team.name !== 'string' ||
+          !team.name.trim() ||
+          typeof team.createdAt !== 'string' ||
+          typeof team.activatedAt !== 'string' ||
+          seen.has(team.id)
+        ) {
+          return false
+        }
+        seen.add(team.id)
+        return true
+      })
+      .slice(0, MAX_MANAGER_TEAMS)
+      .map((team) => ({ ...team, name: team.name.trim().slice(0, 120) }))
+    // Persist repairs to malformed fields too, not only removals. Without this comparison, trimming a
+    // legacy/team name was visible for one process but silently reverted on the next boot.
+    let changed = JSON.stringify(teams) !== JSON.stringify(sourceTeams)
+    if (!teams.length) {
+      teams.push({
+        id: crypto.randomUUID(),
+        name: normalizeManagerTeamName(initialName),
+        createdAt: now,
+        activatedAt: now,
+        ...(presetId ? { presetId } : {}),
+      })
+      changed = true
+    }
+    let active = teams.find((team) => team.id === manager.managerActiveTeamId)
+    if (!active) {
+      active = teams[0]!
+      changed = true
+    }
+    for (const team of teams) {
+      if (team.id === active.id) {
+        if (team.stashedAt !== undefined) {
+          delete team.stashedAt
+          changed = true
+        }
+      } else if (!team.stashedAt) {
+        team.stashedAt = now
+        changed = true
+      }
+    }
+    manager.managerTeams = teams
+    manager.managerActiveTeamId = active.id
+    if ((manager.managerTeamCapabilityVersion ?? 0) < MANAGER_TEAM_CAPABILITY_VERSION) {
+      manager.managerTeamCapabilityVersion = MANAGER_TEAM_CAPABILITY_VERSION
+      changed = true
+    }
+    for (const child of this.managerChildren(manager.id)) {
+      const childTeam = teams.find((team) => team.id === child.managerTeamId) ?? active
+      if (child.managerTeamId !== childTeam.id || child.managerTeamName !== childTeam.name) {
+        child.managerTeamId = childTeam.id
+        child.managerTeamName = childTeam.name
+        this.persist(child)
+        changed = true
+      }
+    }
+    if (changed) {
+      this.persist(manager)
+      this.materializeSessionInstructions(manager)
+      this.appendManagerTeamState(manager, 'manager/teams-upgraded', { reason })
+    }
+    return active
+  }
+
+  private appendManagerTeamState(
+    manager: SessionRecord,
+    kind: string,
+    detail: Record<string, unknown>,
+  ): void {
+    const teams = manager.managerTeams ?? []
+    const assignments = this.managerChildren(manager.id).map((child) => ({
+      sessionId: child.id,
+      teamId: child.managerTeamId ?? null,
+      teamName: child.managerTeamName ?? null,
+    }))
+    const state = {
+      managerSessionId: manager.id,
+      capabilityVersion: manager.managerTeamCapabilityVersion ?? MANAGER_TEAM_CAPABILITY_VERSION,
+      activeTeamId: manager.managerActiveTeamId ?? null,
+      teams,
+      assignments,
+      ...detail,
+    }
+    this.journal.append(manager.id, kind, state)
+    this.journal.append(manager.id, 'manager/teams-updated', state)
+  }
+
+  private managerTeamSummary(manager: SessionRecord): string {
+    const teams = manager.managerTeams ?? []
+    const children = this.managerChildren(manager.id)
+    const rows = teams.map((team) => {
+      const members = children.filter((child) => child.managerTeamId === team.id)
+      const running = members.filter((child) => child.status === 'starting' || child.status === 'active').length
+      const idle = members.filter((child) => child.status === 'idle').length
+      const stopped = members.filter((child) => child.status === 'stopped').length
+      const errored = members.length - running - idle - stopped
+      const state = team.id === manager.managerActiveTeamId ? 'ACTIVE' : 'STASHED'
+      return `- ${team.name} (${team.id}) [${state}]: ${members.length} agent(s); ${running} running, ${idle} idle, ${stopped} stopped, ${errored} errored.`
+    })
+    return [
+      `Manager teams: ${teams.length}; active team id: ${manager.managerActiveTeamId ?? 'none'}.`,
+      ...(rows.length ? rows : ['No teams.']),
+      'Team switching preserves session ids, transcripts, branches, dirty files, and worktrees. Agent ids are the immutable session ids shown above and in child_status.',
+    ].join('\n')
+  }
+
+  private resolveManagerTeam(manager: SessionRecord, teamId: string | undefined): ManagerTeam {
+    const id = teamId?.trim()
+    if (!id) throw new Error('team_id is required')
+    const team = (manager.managerTeams ?? []).find((candidate) => candidate.id === id)
+    if (!team) throw new Error(`unknown manager team: ${id}`)
+    return team
+  }
+
+  private async managerManageTeam(
+    managerSessionId: string,
+    input: {
+      operation: 'list' | 'create' | 'activate' | 'rename'
+      teamId?: string
+      name?: string
+      activate?: boolean
+      interruptActive?: boolean
+    },
+  ): Promise<{ ok: boolean; summary?: string; error?: string }> {
+    const manager = this.sessions.get(managerSessionId)
+    if (!manager?.isProjectManager) return { ok: false, error: 'caller is not an operator-marked project manager' }
+    if (this.managerTeamOperations.has(manager.id)) {
+      return { ok: false, error: 'another team operation is still settling; retry after it completes' }
+    }
+    this.managerTeamOperations.add(manager.id)
+    try {
+      this.ensureManagerTeams(manager, 'Team 1', undefined, 'tool')
+      if (input.operation === 'list') return { ok: true, summary: this.managerTeamSummary(manager) }
+      if (input.operation === 'create') {
+        if ((manager.managerTeams?.length ?? 0) >= MAX_MANAGER_TEAMS) {
+          throw new Error(`a manager may retain at most ${MAX_MANAGER_TEAMS} teams`)
+        }
+        const name = normalizeManagerTeamName(input.name)
+        if (manager.managerTeams!.some((team) => team.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
+          throw new Error(`a team named ${name} already exists`)
+        }
+        if (input.activate === true && input.interruptActive !== true) {
+          const running = this.managerChildren(manager.id).filter(
+            (child) =>
+              child.managerTeamId === manager.managerActiveTeamId &&
+              (child.status === 'starting' || child.status === 'active'),
+          )
+          if (running.length) {
+            throw new Error(
+              `Cannot create and activate ${name} while ${running.length} outgoing agent(s) are running. ` +
+              'Create it as stashed first, wait for those turns to settle, or retry with interrupt_active only after the operator explicitly requests interruption.',
+            )
+          }
+        }
+        const now = new Date().toISOString()
+        const team: ManagerTeam = {
+          id: crypto.randomUUID(),
+          name,
+          createdAt: now,
+          activatedAt: now,
+          stashedAt: now,
+        }
+        manager.managerTeams!.push(team)
+        this.persist(manager)
+        this.appendManagerTeamState(manager, 'manager/team-created', { teamId: team.id, teamName: team.name })
+        if (input.activate === true) {
+          return await this.activateManagerTeam(manager, team, input.interruptActive === true)
+        }
+        return {
+          ok: true,
+          summary: `Created stashed team ${team.name} (${team.id}).\n${this.managerTeamSummary(manager)}`,
+        }
+      }
+      if (input.operation === 'rename') {
+        const team = this.resolveManagerTeam(manager, input.teamId)
+        const name = normalizeManagerTeamName(input.name)
+        if (
+          manager.managerTeams!.some(
+            (candidate) => candidate.id !== team.id && candidate.name.toLocaleLowerCase() === name.toLocaleLowerCase(),
+          )
+        ) {
+          throw new Error(`a team named ${name} already exists`)
+        }
+        const previousName = team.name
+        team.name = name
+        for (const child of this.managerChildren(manager.id).filter((child) => child.managerTeamId === team.id)) {
+          child.managerTeamName = name
+          this.persist(child)
+        }
+        this.persist(manager)
+        this.materializeSessionInstructions(manager)
+        this.appendManagerTeamState(manager, 'manager/team-renamed', {
+          teamId: team.id,
+          previousName,
+          teamName: name,
+        })
+        return { ok: true, summary: `Renamed ${previousName} to ${name}.\n${this.managerTeamSummary(manager)}` }
+      }
+      if (input.operation === 'activate') {
+        return await this.activateManagerTeam(
+          manager,
+          this.resolveManagerTeam(manager, input.teamId),
+          input.interruptActive === true,
+        )
+      }
+      throw new Error(`unknown team operation: ${String(input.operation)}`)
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    } finally {
+      this.managerTeamOperations.delete(manager.id)
+    }
+  }
+
+  private async activateManagerTeam(
+    manager: SessionRecord,
+    target: ManagerTeam,
+    interruptActive: boolean,
+  ): Promise<{ ok: boolean; summary?: string; error?: string }> {
+    const current = (manager.managerTeams ?? []).find((team) => team.id === manager.managerActiveTeamId)
+    if (!current) throw new Error('manager has no active team')
+    if (current.id === target.id) {
+      return { ok: true, summary: `${target.name} is already active.\n${this.managerTeamSummary(manager)}` }
+    }
+    const outgoing = this.managerChildren(manager.id).filter((child) => child.managerTeamId === current.id)
+    const running = outgoing.filter((child) => child.status === 'starting' || child.status === 'active')
+    if (running.length && !interruptActive) {
+      return {
+        ok: false,
+        error:
+          `Cannot stash ${current.name} while ${running.length} agent(s) are running: ` +
+          `${running.map((child) => `${child.title ?? identityOf(child).label} (${child.id})`).join(', ')}. ` +
+          'Wait for them to become idle, or retry with interrupt_active only after the operator explicitly requests interruption.',
+      }
+    }
+    for (const child of outgoing) {
+      if (child.status === 'starting' || child.status === 'active' || child.status === 'idle') {
+        await this.stop(child.id)
+      }
+    }
+    // stop() crosses the executor boundary and yields. Refuse to publish a stale decision if an operator
+    // revoked/reconfigured/deleted this manager while those acknowledgements were in flight.
+    if (
+      this.sessions.get(manager.id) !== manager ||
+      manager.isProjectManager !== true ||
+      manager.managerActiveTeamId !== current.id ||
+      !(manager.managerTeams ?? []).some((team) => team.id === target.id)
+    ) {
+      return {
+        ok: false,
+        error: 'manager team state changed while the outgoing team was settling; review the current roster and retry',
+      }
+    }
+    const warnings: string[] = []
+    const reopenedSessionIds: string[] = []
+    const incoming = this.managerChildren(manager.id).filter((child) => child.managerTeamId === target.id)
+    for (const child of incoming) {
+      if (child.status !== 'stopped' && child.status !== 'error') continue
+      const reopened = this.reopen(child.id)
+      if (reopened.ok) reopenedSessionIds.push(child.id)
+      else warnings.push(`${child.title ?? identityOf(child).label} (${child.id}): ${reopened.error}`)
+    }
+    // Commit the durable pointer only after every external stop/reopen effect has returned. A death before
+    // this transaction leaves the old team active and the same activation safely retryable; a death after
+    // it restores the complete new team plus both audit rows. Never expose a half-published switch.
+    const prior = {
+      managerActiveTeamId: manager.managerActiveTeamId,
+      currentStashedAt: current.stashedAt,
+      targetActivatedAt: target.activatedAt,
+      targetStashedAt: target.stashedAt,
+    }
+    const now = new Date().toISOString()
+    try {
+      this.journal.atomic(() => {
+        current.stashedAt = now
+        target.activatedAt = now
+        delete target.stashedAt
+        manager.managerActiveTeamId = target.id
+        this.persist(manager)
+        this.appendManagerTeamState(manager, 'manager/team-activated', {
+          fromTeamId: current.id,
+          fromTeamName: current.name,
+          teamId: target.id,
+          teamName: target.name,
+          interruptedSessionIds: interruptActive ? running.map((child) => child.id) : [],
+          shelvedSessionIds: outgoing.map((child) => child.id),
+          reopenedSessionIds,
+          warnings,
+        })
+      })
+    } catch (error) {
+      manager.managerActiveTeamId = prior.managerActiveTeamId
+      if (prior.currentStashedAt === undefined) delete current.stashedAt
+      else current.stashedAt = prior.currentStashedAt
+      target.activatedAt = prior.targetActivatedAt
+      if (prior.targetStashedAt === undefined) delete target.stashedAt
+      else target.stashedAt = prior.targetStashedAt
+      throw error
+    }
+    try {
+      this.materializeSessionInstructions(manager)
+    } catch (error) {
+      warnings.push(
+        `Manager instructions could not be refreshed: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+    return {
+      ok: true,
+      summary: [
+        `Activated ${target.name}; ${current.name} is stashed. Preserved ${outgoing.length} outgoing chat(s) and their worktrees.`,
+        ...(warnings.length ? [`Warnings:\n${warnings.map((warning) => `- ${warning}`).join('\n')}`] : []),
+        this.managerTeamSummary(manager),
+      ].join('\n'),
+    }
+  }
+
   private managerDirectChild(
     managerSessionId: string,
     childSessionId: string
@@ -5500,6 +5910,7 @@ export class SessionManager {
   managerChildStatus(managerSessionId: string): { ok: boolean; summary?: string; error?: string } {
     const manager = this.sessions.get(managerSessionId)
     if (!manager?.isProjectManager) return { ok: false, error: 'caller is not an operator-marked project manager' }
+    this.ensureManagerTeams(manager, 'Team 1', undefined, 'tool')
     const children = [...this.sessions.values()].filter((record) => record.parentSessionId === manager.id)
     const counts = { running: 0, idle: 0, stopped: 0, errored: 0 }
     for (const child of children) {
@@ -5510,11 +5921,17 @@ export class SessionManager {
     }
     const rows = children
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
-      .map((child) => `- ${child.title ?? identityOf(child).label} (${child.id}): ${child.status}`)
+      .map(
+        (child) =>
+          `- ${child.title ?? identityOf(child).label} (${child.id}): ${child.status}; ` +
+          `team ${child.managerTeamName ?? 'unknown'} (${child.managerTeamId ?? 'unknown id'})` +
+          `${child.managerTeamId === manager.managerActiveTeamId ? ' [ACTIVE]' : ' [STASHED]'}`,
+      )
     return {
       ok: true,
       summary: [
         `Children: ${counts.running} running, ${counts.idle} idle, ${counts.stopped} stopped, ${counts.errored} errored.`,
+        this.managerTeamSummary(manager),
         ...(rows.length ? rows : ['No direct children.']),
       ].join('\n'),
     }
@@ -6371,6 +6788,15 @@ function normalizeNames(value: readonly unknown[]): string[] {
     if (name && name.length <= 120 && !out.includes(name)) out.push(name)
   }
   return out
+}
+
+function normalizeManagerTeamName(value: unknown): string {
+  if (typeof value !== 'string') throw new Error('team name is required')
+  const name = value.replace(/\s+/g, ' ').trim()
+  if (!name || name.length > 120 || /[\u0000-\u001f\u007f]/u.test(name)) {
+    throw new Error('team name must contain 1 to 120 printable characters')
+  }
+  return name
 }
 
 function normalizeManagerAgentTypes(

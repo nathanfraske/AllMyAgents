@@ -127,6 +127,7 @@ describe('tutorial account waiting integration', () => {
       'claude-signed-out',
       true,
       expect.any(String),
+      'browser',
       expect.anything(),
     )
   })
@@ -292,6 +293,96 @@ describe('tutorial account waiting integration', () => {
       await screen.findByText('Added claude-responsive. It now appears in your accounts.'),
     ).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'waiting…' })).toBeNull()
+  })
+
+  it('defaults Codex to browser sign-in and unlocks immediately after a failed device attempt', async () => {
+    loginMocks.login
+      .mockResolvedValueOnce({
+        ok: false,
+        loginId: 'public-device-failed',
+        profileId: 'codex-login-method',
+        provider: 'codex',
+        authMode: 'device',
+        status: 'failed',
+        error: 'Enable device code authorization in ChatGPT Security Settings.',
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        loginId: 'public-browser-complete',
+        profileId: 'codex-login-method',
+        provider: 'codex',
+        authMode: 'browser',
+        status: 'complete',
+        added: 'codex-login-method',
+      })
+
+    render(SettingsModal, {
+      props: { onclose: () => {}, initialTab: 'accounts' },
+    })
+    await fireEvent.change(screen.getByRole('combobox', { name: 'Account provider' }), {
+      target: { value: 'codex' },
+    })
+    const method = screen.getByRole('combobox', { name: 'Codex sign-in method' })
+    expect((method as HTMLSelectElement).value).toBe('browser')
+    await fireEvent.change(method, { target: { value: 'device' } })
+    await fireEvent.input(screen.getByRole('textbox', { name: 'Profile name' }), {
+      target: { value: 'codex-login-method' },
+    })
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Log in' }))
+    expect(await screen.findByText(/Enable device code authorization/)).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Log in' }).hasAttribute('disabled')).toBe(false)
+
+    await fireEvent.change(method, { target: { value: 'browser' } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Log in' }))
+    expect(await screen.findByText(/Added codex-login-method/)).toBeTruthy()
+    expect(loginMocks.login.mock.calls[0]?.slice(0, 5)).toEqual([
+      'codex',
+      'codex-login-method',
+      false,
+      expect.any(String),
+      'device',
+    ])
+    expect(loginMocks.login.mock.calls[1]?.slice(0, 5)).toEqual([
+      'codex',
+      'codex-login-method',
+      false,
+      expect.any(String),
+      'browser',
+    ])
+  })
+
+  it('shows the Codex device code in the app with an explicit copy action', async () => {
+    loginMocks.login.mockResolvedValue({
+      ok: true,
+      loginId: 'public-device-waiting',
+      profileId: 'codex-device-code',
+      provider: 'codex',
+      authMode: 'device',
+      status: 'waiting',
+      url: 'https://auth.openai.com/codex/device',
+      code: 'ABCD-EFGHJ',
+    })
+    loginMocks.loginStatus.mockImplementation(() => new Promise(() => {}))
+
+    render(SettingsModal, {
+      props: { onclose: () => {}, initialTab: 'accounts' },
+    })
+    await fireEvent.change(screen.getByRole('combobox', { name: 'Account provider' }), {
+      target: { value: 'codex' },
+    })
+    await fireEvent.change(screen.getByRole('combobox', { name: 'Codex sign-in method' }), {
+      target: { value: 'device' },
+    })
+    await fireEvent.input(screen.getByRole('textbox', { name: 'Profile name' }), {
+      target: { value: 'codex-device-code' },
+    })
+    await fireEvent.click(screen.getByRole('button', { name: 'Log in' }))
+
+    expect(await screen.findByText('ABCD-EFGHJ')).toBeTruthy()
+    expect(screen.getByRole('link', { name: 'Open sign-in page' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Copy Codex device code' })).toBeTruthy()
+    expect(screen.getByText(/not entered in a terminal or chat/i)).toBeTruthy()
   })
 
   it('offers deliberate replay actions from Settings', async () => {

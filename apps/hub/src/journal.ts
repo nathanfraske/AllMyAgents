@@ -230,6 +230,7 @@ export class ReplayGenerationChangedError extends Error {
 export class Journal extends EventEmitter {
   readonly db: Database.Database
   private readonly atomicEventBuffers: HubEvent[][] = []
+  private transientMaintenanceIndexesReady = false
   private readonly insertStmt: Database.Statement
   private readonly insertWorkerStmt: Database.Statement
   private readonly lastWseqStmt: Database.Statement
@@ -1418,6 +1419,14 @@ export class Journal extends EventEmitter {
       'nowMs' | 'graceMs' | 'maxTransientPayloadBytes'
     > = {}
   ): number {
+    // These indexes are deliberately lazy. Production calls this method only from the post-ready
+    // maintenance child; building them in Journal's constructor would put a one-time 700k-row index
+    // migration back on the hub's port-bind critical path. Without the correlation keys, SQLite can only
+    // use idx_journal_transient_kind_seq for each EXISTS/MAX probe. On the operator's measured journal that
+    // meant scanning ~82k terminal rows for each of ~700k transient rows: every maintenance child exhausted
+    // its 4m50s observation window without selecting one deletion, the journal grew indefinitely, and the
+    // mandatory boot integrity pass eventually took more than forty seconds by itself.
+    this.ensureTransientMaintenanceIndexes()
     const nowMs = options.nowMs ?? Date.now()
     const graceMs = options.graceMs ?? JOURNAL_CONDENSE_GRACE_MS
     const maxTransientPayloadBytes =
@@ -1543,6 +1552,7 @@ export class Journal extends EventEmitter {
    * full VACUUM.
    */
   condenseCompletedCodex(options: JournalCondenseOptions = {}): JournalCondenseResult {
+    this.ensureTransientMaintenanceIndexes()
     const nowMs = options.nowMs ?? Date.now()
     const graceMs = options.graceMs ?? JOURNAL_CONDENSE_GRACE_MS
     const deleteThroughSeq = options.deleteThroughSeq ?? Number.MAX_SAFE_INTEGER
@@ -1922,6 +1932,39 @@ export class Journal extends EventEmitter {
       cursorCheckpointsWritten: transient.cursorCheckpointsWritten + history.cursorCheckpointsWritten,
       replication,
     }
+  }
+
+  /**
+   * Build selector-only indexes outside ordinary hub startup.
+   *
+   * They live on the bounded transient projection rather than the payload-heavy events table. The partial
+   * terminal index contains only canonical completed items; the diff index contains only cumulative patch
+   * snapshots. New Journal instances still issue IF NOT EXISTS once per maintenance operation, while the
+   * in-object flag avoids repeating schema preparation for every bounded delete batch.
+   */
+  private ensureTransientMaintenanceIndexes(): void {
+    if (this.transientMaintenanceIndexesReady) return
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_journal_transient_terminal_correlation
+        ON journal_transient_event_index (
+          session,
+          thread_id,
+          turn_id,
+          item_id,
+          item_type,
+          ts
+        )
+        WHERE kind = 'codex/item/completed' AND canonical_terminal = 1;
+      CREATE INDEX IF NOT EXISTS idx_journal_transient_diff_correlation
+        ON journal_transient_event_index (
+          session,
+          thread_id,
+          turn_id,
+          seq
+        )
+        WHERE kind = 'codex/turn/diff/updated';
+    `)
+    this.transientMaintenanceIndexesReady = true
   }
 
   /**

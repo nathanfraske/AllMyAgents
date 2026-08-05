@@ -406,6 +406,18 @@
     | { key: string; kind: 'empty'; railId: string; railEnd: true; folder: ChatFolder }
     | {
         key: string
+        kind: 'manager-team'
+        railId: string | null
+        railEnd: boolean
+        managerId: string
+        teamId: string
+        name: string
+        active: boolean
+        count: number
+        attentionRevealed: boolean
+      }
+    | {
+        key: string
         kind: 'chat'
         railId: string | null
         railEnd: boolean
@@ -464,17 +476,74 @@
       roots: SessionView[],
       railId: string | null
     ): void => {
-      const rows: Array<{
-        s: SessionView
-        depth: number
-        nested: SessionView[]
-        attentionRevealed: boolean
-      }> = []
+      type TreeRow =
+        | {
+            kind: 'chat'
+            s: SessionView
+            depth: number
+            nested: SessionView[]
+            attentionRevealed: boolean
+          }
+        | {
+            kind: 'manager-team'
+            managerId: string
+            teamId: string
+            name: string
+            active: boolean
+            count: number
+            attentionRevealed: boolean
+          }
+      const rows: TreeRow[] = []
       const visit = (item: SessionView, depth: number, attentionOnly = false, attentionRevealed = false): void => {
         if (emitted.has(item.record.id) || suppressed.has(item.record.id)) return
         emitted.add(item.record.id)
         const nested = children.get(item.record.id) ?? []
-        rows.push({ s: item, depth, nested, attentionRevealed })
+        rows.push({ kind: 'chat', s: item, depth, nested, attentionRevealed })
+        if (item.record.isProjectManager && (nested.length || (item.record.managerTeams?.length ?? 0) > 0)) {
+          const declared = item.record.managerTeams ?? []
+          const declaredIds = new Set(declared.map((team) => team.id))
+          const groups = declared.map((team) => ({
+            id: team.id,
+            name: team.name,
+            active: team.id === item.record.managerActiveTeamId,
+            members: nested.filter((child) => child.record.managerTeamId === team.id),
+          }))
+          const legacy = nested.filter(
+            (child) => !child.record.managerTeamId || !declaredIds.has(child.record.managerTeamId),
+          )
+          if (legacy.length || groups.length === 0) {
+            groups.push({
+              id: '__legacy__',
+              name: groups.length ? 'Unassigned' : 'Team 1',
+              active: groups.length === 0,
+              members: legacy.length ? legacy : nested,
+            })
+          }
+          const managerCollapsed = attentionOnly || collapsed.has(`manager:${item.record.id}`)
+          for (const group of groups) {
+            if (filter && group.members.length === 0) continue
+            const urgent = group.members.filter((child) => subtreeNeedsAttention(child))
+            if (managerCollapsed && urgent.length === 0) {
+              for (const child of group.members) suppressTree(child)
+              continue
+            }
+            rows.push({
+              kind: 'manager-team',
+              managerId: item.record.id,
+              teamId: group.id,
+              name: group.name,
+              active: group.active,
+              count: group.members.length,
+              attentionRevealed: managerCollapsed,
+            })
+            const teamCollapsed = managerCollapsed || collapsed.has(`team:${item.record.id}:${group.id}`)
+            for (const child of group.members) {
+              if (teamCollapsed && !subtreeNeedsAttention(child)) suppressTree(child)
+              else visit(child, depth + 1, teamCollapsed, teamCollapsed)
+            }
+          }
+          return
+        }
         if (attentionOnly || collapsed.has(`manager:${item.record.id}`)) {
           // Collapse hides routine work, not work that needs the operator. Preserve the ancestry path
           // to each approval/error so the urgent row is both findable and still attributable.
@@ -487,18 +556,34 @@
         for (const child of nested) visit(child, depth + 1)
       }
       for (const root of roots) visit(root, 0)
-      rows.forEach(({ s, depth, nested, attentionRevealed }, index) => {
+      rows.forEach((row, index) => {
+        const railEnd = railId !== null && index === rows.length - 1
+        if (row.kind === 'manager-team') {
+          out.push({
+            key: `mt:${row.managerId}:${row.teamId}`,
+            kind: 'manager-team',
+            railId,
+            railEnd,
+            managerId: row.managerId,
+            teamId: row.teamId,
+            name: row.name,
+            active: row.active,
+            count: row.count,
+            attentionRevealed: row.attentionRevealed,
+          })
+          return
+        }
         out.push({
-          key: `c:${s.record.id}`,
+          key: `c:${row.s.record.id}`,
           kind: 'chat',
           railId,
-          railEnd: railId !== null && index === rows.length - 1,
-          s,
-          managerDepth: depth,
-          managerHasChildren: nested.length > 0,
-          managerChildCount: nested.length,
-          attentionRevealed,
-          orphanedManager: orphaned.has(s.record.id),
+          railEnd,
+          s: row.s,
+          managerDepth: row.depth,
+          managerHasChildren: row.nested.length > 0 || (row.s.record.managerTeams?.length ?? 0) > 0,
+          managerChildCount: row.nested.length,
+          attentionRevealed: row.attentionRevealed,
+          orphanedManager: orphaned.has(row.s.record.id),
         })
       })
     }
@@ -985,6 +1070,28 @@
               <div class="fempty dim" class:droptarget={isDropTarget(g.id, en.folder.id)}
                 ondragover={(e) => dragOverTarget(e, g.id, undefined, en.folder.id)}
                 ondragenter={preventIfDragging}>drag chats here</div>
+            {:else if en.kind === 'manager-team'}
+              {@const teamCollapseKey = `team:${en.managerId}:${en.teamId}`}
+              {@const teamCollapsed = collapsed.has(teamCollapseKey)}
+              <div
+                class="manager-team-head"
+                class:active={en.active}
+                class:attention={en.attentionRevealed}
+                title={`${en.active ? 'Active' : 'Stashed'} manager team · ${en.count} ${en.count === 1 ? 'agent' : 'agents'}`}
+              >
+                <button
+                  class="manager-team-toggle"
+                  title={teamCollapsed ? `expand ${en.name}` : `collapse ${en.name}`}
+                  aria-label={teamCollapsed ? `expand team ${en.name}` : `collapse team ${en.name}`}
+                  onclick={() => toggleCollapse(teamCollapseKey)}
+                >
+                  <Icon name={teamCollapsed ? 'chevron-right' : 'chevron-down'} size={10} />
+                </button>
+                <span class="manager-team-icon" aria-hidden="true"><Icon name="flag" size={10} /></span>
+                <span class="manager-team-name">{en.name}</span>
+                <span class="manager-team-state">{en.active ? 'active' : 'stashed'}</span>
+                <span class="manager-team-count tnum">{en.count}</span>
+              </div>
             {:else}
               {@const s = en.s}
               {@const st = store.status(s)}
@@ -1049,7 +1156,7 @@
                     <span class="rlabel" class:glitch={glitching.has(s.record.id)} ondblclick={(e) => startRename(e, s)}>{label(s)}</span>
                     <span class="manager-role" aria-hidden="true">
                       <Icon name="flag" size={9} />
-                      <span class="manager-role-full">open project overview · {en.managerChildCount} {en.managerChildCount === 1 ? 'agent' : 'agents'}</span>
+                      <span class="manager-role-full">open project overview · {s.record.managerTeams?.length ?? 1} {(s.record.managerTeams?.length ?? 1) === 1 ? 'team' : 'teams'} · {en.managerChildCount} {en.managerChildCount === 1 ? 'agent' : 'agents'}</span>
                       <span class="manager-role-compact" aria-hidden="true">{en.managerChildCount}</span>
                     </span>
                   </span>
@@ -1244,6 +1351,20 @@
     box-shadow: inset 3px 0 0 var(--accent), inset 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent);
   }
   .row.managedchild { margin-left: calc(var(--manager-depth) * 0.85rem); width: calc(100% - (var(--manager-depth) * 0.85rem)); }
+  .manager-team-head {
+    display: flex; align-items: center; gap: var(--space-2); min-width: 0;
+    margin-left: 0.85rem; padding: 0.28rem var(--space-3) 0.18rem var(--space-4);
+    color: var(--dim); font-size: var(--text-2xs); letter-spacing: 0.045em;
+    text-transform: uppercase; border-left: 1px solid color-mix(in srgb, var(--border) 75%, transparent);
+  }
+  .manager-team-head.active { color: var(--accent); border-left-color: color-mix(in srgb, var(--accent) 65%, transparent); }
+  .manager-team-head.attention { color: var(--warn); border-left-color: color-mix(in srgb, var(--warn) 65%, transparent); }
+  .manager-team-toggle, .manager-team-icon { flex: none; display: grid; place-items: center; width: 12px; color: inherit; }
+  .manager-team-toggle:hover { color: var(--text); }
+  .manager-team-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: var(--fw-semibold); }
+  .manager-team-state { flex: none; opacity: 0.78; }
+  .manager-team-count { flex: none; margin-left: auto; min-width: 1.25rem; text-align: center; padding: 0.02rem 0.28rem;
+    border: 1px solid currentColor; border-radius: var(--r-pill); opacity: 0.76; }
   .manager-toggle, .manager-branch { flex: none; display: grid; place-items: center; width: 12px; color: var(--dim); }
   .manager-toggle { color: var(--accent); }
   .manager-toggle:hover { color: var(--text); }

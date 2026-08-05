@@ -101,12 +101,18 @@ describe('WorktreeCollisionDetector', () => {
 
   it('exposes its existing inspection as a project activity snapshot without a second git scan', async () => {
     const { knuth, hopper } = fixture()
+    knuth.parentSessionId = 'manager-1'
+    knuth.managerTeamId = 'team-1'
+    knuth.managerTeamName = 'Builders'
     const detector = new WorktreeCollisionDetector({
       sessions: () => [knuth, hopper],
       steer: async () => true,
     })
 
     fs.writeFileSync(path.join(knuth.worktree!, 'knuth-only.ts'), 'export const knuth = true\n')
+    fs.writeFileSync(path.join(knuth.worktree!, 'committed.ts'), 'export const committed = true\n')
+    git(knuth.worktree!, 'add', 'committed.ts')
+    git(knuth.worktree!, 'commit', '-m', 'attribute this commit')
     fs.writeFileSync(path.join(knuth.worktree!, 'shared.ts'), 'export const value = 2\n')
     fs.writeFileSync(path.join(hopper.worktree!, 'shared.ts'), 'export const value = 3\n')
 
@@ -121,8 +127,14 @@ describe('WorktreeCollisionDetector', () => {
             files: [{ file: 'shared.ts', kind: 'uncommitted' }],
           }),
           expect.objectContaining({
+            agentId: 'knuth',
             sessionId: 'knuth',
+            managerSessionId: 'manager-1',
+            teamId: 'team-1',
+            teamName: 'Builders',
+            commits: [expect.objectContaining({ subject: 'attribute this commit' })],
             files: expect.arrayContaining([
+              { file: 'committed.ts', kind: 'committed' },
               { file: 'knuth-only.ts', kind: 'uncommitted' },
               { file: 'shared.ts', kind: 'uncommitted' },
             ]),
@@ -136,6 +148,45 @@ describe('WorktreeCollisionDetector', () => {
           }),
         ],
       })
+    )
+  }, 20_000)
+
+  it('keeps a stashed team worktree attributable without treating it as an active collision writer', async () => {
+    const { knuth, hopper } = fixture()
+    hopper.status = 'stopped'
+    hopper.parentSessionId = 'manager-1'
+    hopper.managerTeamId = 'team-stashed'
+    hopper.managerTeamName = 'Reviewers'
+    const steer = vi.fn(async () => true)
+    const detector = new WorktreeCollisionDetector({ sessions: () => [knuth, hopper], steer })
+    fs.writeFileSync(path.join(knuth.worktree!, 'shared.ts'), 'export const value = 2\n')
+    fs.writeFileSync(path.join(hopper.worktree!, 'shared.ts'), 'export const value = 3\n')
+
+    await detector.poll()
+
+    expect(detector.projectActivity('project-1').agents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          agentId: 'hopper',
+          sessionId: 'hopper',
+          managerSessionId: 'manager-1',
+          teamId: 'team-stashed',
+          teamName: 'Reviewers',
+          files: [{ file: 'shared.ts', kind: 'uncommitted' }],
+        }),
+      ]),
+    )
+    expect(detector.projectActivity('project-1').risks).toEqual([])
+    expect(steer).not.toHaveBeenCalled()
+
+    // A stashed team keeps its last trustworthy attribution without re-running Git on every 2s poll.
+    // Removing the disposable fixture checkout proves this second snapshot came from the bounded cache.
+    fs.rmSync(hopper.worktree!, { recursive: true, force: true })
+    await detector.poll()
+    expect(detector.projectActivity('project-1').agents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ sessionId: 'hopper', teamId: 'team-stashed' }),
+      ]),
     )
   }, 20_000)
 

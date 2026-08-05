@@ -31,6 +31,7 @@ function makeHarness(opts: {
   danger?: DangerFlags
   peek?: { found: boolean; summary?: string }
   childStatus?: { ok: boolean; summary?: string; error?: string }
+  manageTeam?: { ok: boolean; summary?: string; error?: string }
 } = {}): Harness {
   const memory = new MemoryStore(new Database(':memory:'))
   const practices = new PracticeStore(new Database(':memory:'))
@@ -47,6 +48,7 @@ function makeHarness(opts: {
     roster: () => opts.roster ?? [],
     peek: (_caller, _target) => opts.peek ?? { found: false },
     childStatus: () => opts.childStatus ?? { ok: false, error: 'not a project manager' },
+    manageTeam: () => opts.manageTeam ?? { ok: false, error: 'not a project manager' },
     browser: async (sessionId, operation, args) => {
       browserCalls.push({ sessionId, operation, args })
       return [{ type: 'text', text: 'browser unavailable in test' }]
@@ -75,6 +77,7 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
       'read_messages',
       'peek_agent',
       'child_status',
+      'manage_team',
       'spawn_agent',
       'set_child_authority',
       'decide_child_approval',
@@ -264,6 +267,16 @@ describe('child_status (manager lifecycle tally)', () => {
     const summary = 'Children: 2 running, 1 idle, 1 stopped, 1 errored.'
     const h = makeHarness({ childStatus: { ok: true, summary } })
     expect(await runAgentTool('child_status', {}, { identity: idA, services: h.services })).toBe(summary)
+  })
+})
+
+describe('manage_team (durable manager lineups)', () => {
+  it('returns the hub-authored team summary', async () => {
+    const summary = 'Manager teams: 2; active team id: team-a.'
+    const h = makeHarness({ manageTeam: { ok: true, summary } })
+    expect(
+      await runAgentTool('manage_team', { operation: 'list' }, { identity: idA, services: h.services }),
+    ).toBe(summary)
   })
 })
 

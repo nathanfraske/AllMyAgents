@@ -160,6 +160,10 @@ export function buildWorkerAgentServices(deps: WorkerAgentServiceDeps): AgentSer
         summary?: string
         error?: string
       }>,
+    manageTeam: (managerSessionId, input) =>
+      deps.relayRpc('manager.manageTeam', { managerSessionId, input }) as ReturnType<
+        NonNullable<AgentServices['manageTeam']>
+      >,
     spawnAgent: (managerSessionId, input) =>
       deps.relayRpc('manager.spawn', { managerSessionId, input }) as Promise<ManagerSpawnResult>,
     setChildAuthority: (managerSessionId, childSessionId, authorities, tools, permissionMode) =>

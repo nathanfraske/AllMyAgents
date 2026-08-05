@@ -1,7 +1,7 @@
 <script lang="ts">
   import { store } from './store.svelte'
   import { settings } from './settings.svelte'
-  import { api, getFleetSiteToken, type DeviceExecutorCapabilities, type DeviceRootPolicy, type MeshStatus, type Instruction, type Practice, type DangerFlags, type HubPrefs, type OverseerStatus } from './api'
+  import { api, getFleetSiteToken, type DeviceExecutorCapabilities, type DeviceRootPolicy, type MeshStatus, type Instruction, type Practice, type DangerFlags, type HubPrefs, type LoginAuthMode, type OverseerStatus } from './api'
   import ProviderLogo from './ProviderLogo.svelte'
   import Icon from './Icon.svelte'
   import PairingCodeInput from './PairingCodeInput.svelte'
@@ -441,6 +441,8 @@
   let loginRequestKey = $state('')
   let loginUrl = $state('')
   let loginCode = $state('')
+  let loginCodeCopied = $state(false)
+  let codexLoginMode = $state<LoginAuthMode>('browser')
   let loginStartedAt = $state<number | undefined>()
   let loginRequestCancelled = false
   let loginCancelSent = false
@@ -508,16 +510,41 @@
     if (!result.url || result.url === loginUrl) return
     loginUrl = result.url
     loginCode = result.code ?? ''
-    // Claude 2.1.218 has no no-browser flag and opens the captured URL itself. In the local desktop
-    // shell, opening it again would create two tabs; remote/plain-browser clients still use the app
-    // opener because the hub-side browser may not exist or may be on another machine.
+    loginCodeCopied = false
+    // Claude and normal Codex OAuth open their own browser from the local desktop process. Opening the
+    // captured URL again would create two tabs. Device auth and remote/plain-browser clients need the
+    // app opener. Bound that native handoff so a failed shell integration cannot strand login polling.
+    const vendorOpenedLocalBrowser =
+      inTauri &&
+      (addProvider === 'claude' ||
+        (addProvider === 'codex' && codexLoginMode === 'browser'))
     const opened =
-      addProvider === 'claude' && inTauri
+      vendorOpenedLocalBrowser
         ? true
-        : await openExternalUrl(result.url, target)
-    loginMsg = opened
-      ? 'Waiting for you to finish in the browser…'
-      : 'The browser could not be opened automatically. Use “Open sign-in page” below, then finish there.'
+        : await Promise.race([
+            openExternalUrl(result.url, target),
+            delay(3_000).then(() => false),
+          ])
+    if (result.code) {
+      loginMsg = opened
+        ? 'Enter the displayed code on the Codex sign-in page. The code is not entered in a terminal or chat.'
+        : 'Open the sign-in page below and enter the displayed code there. The code is not entered in a terminal or chat.'
+    } else {
+      loginMsg = opened
+        ? 'Waiting for you to finish in the browser…'
+        : 'The browser could not be opened automatically. Use “Open sign-in page” below, then finish there.'
+    }
+  }
+
+  async function copyLoginCode(): Promise<void> {
+    if (!loginCode) return
+    try {
+      await navigator.clipboard.writeText(loginCode)
+      loginCodeCopied = true
+      setTimeout(() => (loginCodeCopied = false), 1_400)
+    } catch {
+      loginMsg = 'Select and copy the code, then enter it on the Codex sign-in page.'
+    }
   }
 
   async function finishLogin(
@@ -593,7 +620,9 @@
         loginRequestKey = ''
         loginUrl = ''
         loginCode = ''
+        loginCodeCopied = false
         addName = ''
+        closePreparedTarget(target)
         queueMicrotask(() => {
           void store.rescanProfiles().then((scan) => {
             if (scan.error) {
@@ -614,6 +643,7 @@
           : 'Sign-in ended before the account was added. Retry or use Rescan accounts.')
       loginId = ''
       loginRequestKey = ''
+      closePreparedTarget(target)
       return
     }
   }
@@ -640,8 +670,10 @@
     loginRequestKey = createLoginRequestKey()
     loginUrl = ''
     loginCode = ''
+    loginCodeCopied = false
     try {
-      let r = await api.login(addProvider, name, reauth, loginRequestKey, signal)
+      const authMode: LoginAuthMode = addProvider === 'codex' ? codexLoginMode : 'browser'
+      let r = await api.login(addProvider, name, reauth, loginRequestKey, authMode, signal)
       if (!r.loginId) {
         const recovered = await api.loginForProfile(name, loginRequestKey, signal)
         if (recovered.loginId) r = recovered
@@ -824,22 +856,44 @@
       </div>
       <div class="add" data-tutorial-anchor="account-sign-in">
         <div class="add-row">
-          <select bind:value={addProvider} disabled={loginActive()}>
+          <select aria-label="Account provider" bind:value={addProvider} disabled={loginActive()}>
             <option value="claude">Claude</option>
             <option value="codex">Codex</option>
           </select>
-          <input placeholder="profile name (e.g. claude-work)" bind:value={addName} disabled={loginActive()} />
+          <input aria-label="Profile name" placeholder="profile name (e.g. claude-work)" bind:value={addName} disabled={loginActive()} />
           <button class="btn btn-primary" onclick={() => login(false)} disabled={loginActive()}>
             {loginActive() ? 'waiting…' : 'Log in'}
           </button>
         </div>
+        {#if addProvider === 'codex'}
+          <label class="login-method">
+            <span>Codex sign-in method</span>
+            <select aria-label="Codex sign-in method" bind:value={codexLoginMode} disabled={loginActive()}>
+              <option value="browser">Browser sign-in (no code)</option>
+              <option value="device">Device code (remote or headless)</option>
+            </select>
+          </label>
+          <p class="hint dim">
+            {codexLoginMode === 'browser'
+              ? 'Recommended on this computer. Codex opens ChatGPT in your browser and completes through its local callback; there is no terminal code to enter.'
+              : 'Use only when a browser cannot complete on this computer. ChatGPT device-code authorization must be enabled; enter the code on the linked webpage, never in a terminal or chat.'}
+          </p>
+        {/if}
         {#if loginState !== 'idle'}
           <p class="status {loginState}">{loginMsg}</p>
         {/if}
         {#if loginUrl}
           <div class="login-actions">
             <a class="btn" href={loginUrl} target="_blank" rel="noopener noreferrer">Open sign-in page</a>
-            {#if loginCode}<code class="login-code">{loginCode}</code>{/if}
+            {#if loginCode}
+              <span class="login-code-wrap">
+                <span class="dim">Device code</span>
+                <code class="login-code">{loginCode}</code>
+                <button class="btn" aria-label="Copy Codex device code" onclick={copyLoginCode}>
+                  {loginCodeCopied ? 'copied' : 'copy code'}
+                </button>
+              </span>
+            {/if}
           </div>
         {/if}
         {#if loginActive()}
@@ -1322,8 +1376,11 @@
   .add-row select { flex: none; }
   .add-row input { flex: 1; }
   .add-row .btn { flex: none; align-self: stretch; }
+  .login-method { display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-xs); }
+  .login-method select { min-width: min(100%, 18rem); }
   .login-actions { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
   .login-actions a { text-decoration: none; }
+  .login-code-wrap { display: inline-flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
   .login-code { font-size: var(--text-sm); letter-spacing: 0.08em; user-select: all; }
   .cmd { display: block; background: var(--bg); border: 1px solid var(--border-subtle); border-radius: var(--r-md); padding: var(--space-3) var(--space-4); font-size: var(--text-xs); color: var(--cyan); }
   .status { font-size: var(--text-xs); line-height: 1.45; margin: 0.1rem 0 0.15rem; }

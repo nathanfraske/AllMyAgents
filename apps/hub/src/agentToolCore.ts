@@ -141,6 +141,12 @@ export interface ManagerSpawnResult {
   worktreeFallbackReason?: string
 }
 
+export interface ManagerTeamControlResult {
+  ok: boolean
+  summary?: string
+  error?: string
+}
+
 export interface AgentRosterEntry {
   sessionId: string
   label: string
@@ -197,6 +203,17 @@ export interface AgentServices {
   ): Awaitable<{ found: boolean; summary?: string }>
   /** Exact current direct-child status tally for an operator-marked project manager. */
   childStatus?(managerSessionId: string): Awaitable<{ ok: boolean; summary?: string; error?: string }>
+  /** Create, rename, inspect, or activate one of the manager's durable child-team generations. */
+  manageTeam?(
+    managerSessionId: string,
+    input: {
+      operation: 'list' | 'create' | 'activate' | 'rename'
+      teamId?: string
+      name?: string
+      activate?: boolean
+      interruptActive?: boolean
+    }
+  ): Awaitable<ManagerTeamControlResult>
   /** Project-manager-only spawn. The hub derives the caller from the bound session identity. */
   spawnAgent?(
     managerSessionId: string,
@@ -421,6 +438,32 @@ const childStatus = defineTool({
     return result.ok && result.summary
       ? result.summary
       : `Status unavailable: ${result.error ?? 'unknown error'}`
+  },
+})
+
+const manageTeam = defineTool({
+  name: 'manage_team',
+  description:
+    'Project managers only: list, create, rename, or activate durable child teams. Activating a team shelves the outgoing team without deleting chats, transcripts, branches, dirty files, or worktrees, and reopens the selected team. Active outgoing turns are never interrupted unless interrupt_active is explicitly true.',
+  schema: {
+    operation: z.enum(['list', 'create', 'activate', 'rename']),
+    team_id: z.string().min(1).max(256).optional().describe('stable team id returned by list/create'),
+    name: z.string().min(1).max(120).optional().describe('team name for create or rename'),
+    activate: z.boolean().optional().describe('for create: immediately activate the new team'),
+    interrupt_active: z.boolean().optional().describe('for activate: explicitly stop active outgoing children before shelving them'),
+  },
+  run: async (args, { identity, services }) => {
+    if (!services.manageTeam) return 'Team operation unavailable: this hub does not support manager team generations.'
+    const result = await services.manageTeam(identity.sessionId, {
+      operation: args.operation,
+      teamId: args.team_id,
+      name: args.name,
+      activate: args.activate,
+      interruptActive: args.interrupt_active,
+    })
+    return result.ok
+      ? result.summary ?? 'Team operation completed.'
+      : `Team operation not completed: ${result.error ?? 'unknown error'}`
   },
 })
 
@@ -1144,6 +1187,7 @@ export const AGENT_TOOLS: readonly AgentToolSpec[] = [
   readMessages,
   peekAgent,
   childStatus,
+  manageTeam,
   spawnAgent,
   setChildAuthority,
   decideChildApproval,

@@ -41,6 +41,8 @@ export type LoginStatus =
   | 'cancelled'
   | 'timed-out'
 
+export type LoginAuthMode = 'browser' | 'device'
+
 export interface LoginAttempt {
   id: string
   provider: Provider
@@ -141,6 +143,8 @@ export interface StartLoginOptions {
   loginTimeoutMs?: number
   terminationTimeoutMs?: number
   spawnProcess?: typeof spawn
+  /** Codex browser OAuth is the local-desktop default; device auth is an explicit headless fallback. */
+  authMode?: LoginAuthMode
   reauth?: boolean
   profileId?: string
   acquireLease?: () => ProfileRefreshLease
@@ -298,7 +302,10 @@ function sameFileIdentity(left: fs.BigIntStats, right: fs.BigIntStats): boolean 
   )
 }
 
-function loginCommand(provider: Provider): { command: string; args: string[] } {
+function loginCommand(
+  provider: Provider,
+  authMode: LoginAuthMode = 'browser',
+): { command: string; args: string[] } {
   if (process.platform === 'win32') {
     if (provider === 'claude') {
       return {
@@ -318,13 +325,16 @@ function loginCommand(provider: Provider): { command: string; args: string[] } {
       args: [
         path.resolve(binDir(), '..', '@openai', 'codex', 'bin', 'codex.js'),
         'login',
-        '--device-auth',
+        ...(authMode === 'device' ? ['--device-auth'] : []),
       ],
     }
   }
   return {
     command: path.join(binDir(), provider),
-    args: provider === 'claude' ? ['auth', 'login'] : ['login', '--device-auth'],
+    args:
+      provider === 'claude'
+        ? ['auth', 'login']
+        : ['login', ...(authMode === 'device' ? ['--device-auth'] : [])],
   }
 }
 
@@ -1114,7 +1124,7 @@ export function startLogin(
     return Promise.resolve(publicAttempt(attempt))
   }
 
-  const { command, args } = loginCommand(provider)
+  const { command, args } = loginCommand(provider, opts.authMode ?? 'browser')
   const spawnProcess = opts.spawnProcess ?? spawn
   try {
     attempt.child = spawnProcess(command, args, {

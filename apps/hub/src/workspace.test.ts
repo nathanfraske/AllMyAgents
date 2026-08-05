@@ -82,6 +82,16 @@ describe('WorkspaceManager', () => {
       expect(fs.existsSync(live.worktree)).toBe(true)
     })
 
+    it('defers a checkout newer than the caller snapshot boundary', () => {
+      const { repo, workspace } = scenario()
+      const recent = workspace.create(repo, '22222223-recent')
+
+      const result = workspace.reapOrphanWorktrees([], { eligibleBeforeMs: Date.now() - 60_000 })
+
+      expect(result).toEqual({ removed: [], keptWithWork: [] })
+      expect(fs.existsSync(recent.worktree)).toBe(true)
+    })
+
     it('KEEPS an orphan holding uncommitted changes', () => {
       const { repo, workspace } = scenario()
       const orphan = workspace.create(repo, '33333333-dirty')
