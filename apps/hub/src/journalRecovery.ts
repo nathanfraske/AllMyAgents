@@ -1408,6 +1408,60 @@ function publishedRecoveryHeads(dataDir: string, binding: RootBinding): Recovery
   return heads
 }
 
+function assertRecoveryTransitionReceipt(
+  dataDir: string,
+  binding: RootBinding,
+  active: RecoveryHead
+): NonNullable<RootBinding['recoveryTransition']> {
+  const transition = binding.recoveryTransition
+  if (
+    !transition ||
+    transition.restoredGeneration !== active.generation ||
+    !transition.receiptSha256
+  ) {
+    throw new Error(
+      'active recovery generation lacks an immutable completed recovery transition'
+    )
+  }
+  const receiptFile = path.join(
+    recoveryPaths(dataDir).receipts,
+    `${transition.planId}.json`
+  )
+  assertRegular(receiptFile, true)
+  const receipt = readReceipt(receiptFile)
+  if (
+    sha256File(receiptFile) !== transition.receiptSha256 ||
+    receipt.planId !== transition.planId ||
+    receipt.rootId !== binding.rootId ||
+    receipt.journalId !== binding.activeJournalId ||
+    receipt.generation !== active.generation ||
+    receipt.previousActiveGeneration !== transition.previousGeneration ||
+    receipt.previousActiveManifestSha256 !== transition.previousManifestSha256
+  ) {
+    throw new Error(
+      'active recovery generation conflicts with its immutable recovery receipt'
+    )
+  }
+  return transition
+}
+
+function assertCompletedRecoveryTransition(
+  dataDir: string,
+  binding: RootBinding,
+  active: RecoveryHead,
+  highest: RecoveryHead
+): void {
+  const transition = assertRecoveryTransitionReceipt(dataDir, binding, active)
+  if (
+    transition.previousGeneration !== highest.generation ||
+    transition.previousManifestSha256 !== highest.manifestSha256
+  ) {
+    throw new Error(
+      'lower active recovery generation conflicts with its completed recovery predecessor'
+    )
+  }
+}
+
 function controllingPublishedHead(
   dataDir: string,
   binding: RootBinding
@@ -1422,39 +1476,231 @@ function controllingPublishedHead(
     )
   }
   if (highest && BigInt(active.generation) < BigInt(highest.generation)) {
-    const transition = binding.recoveryTransition
-    if (
-      !transition ||
-      transition.restoredGeneration !== active.generation ||
-      transition.previousGeneration !== highest.generation ||
-      transition.previousManifestSha256 !== highest.manifestSha256 ||
-      !transition.receiptSha256
-    ) {
-      throw new Error(
-        'lower active recovery generation lacks an immutable completed recovery transition'
-      )
-    }
-    const receiptFile = path.join(
-      recoveryPaths(dataDir).receipts,
-      `${transition.planId}.json`
-    )
-    assertRegular(receiptFile, true)
-    const receipt = readReceipt(receiptFile)
-    if (
-      sha256File(receiptFile) !== transition.receiptSha256 ||
-      receipt.planId !== transition.planId ||
-      receipt.rootId !== binding.rootId ||
-      receipt.journalId !== binding.activeJournalId ||
-      receipt.generation !== active.generation ||
-      receipt.previousActiveGeneration !== highest.generation ||
-      receipt.previousActiveManifestSha256 !== highest.manifestSha256
-    ) {
-      throw new Error(
-        'lower active recovery generation conflicts with its immutable recovery receipt'
-      )
-    }
+    assertCompletedRecoveryTransition(dataDir, binding, active, highest)
   }
   return active
+}
+
+/**
+ * Classifier/generation copies in staging are derived, unpublished bytes. With no durable active plan
+ * they own no authority and must not turn a later healthy boot into a different permanent refusal.
+ * Delete only the exact names and path types this module creates; unknown evidence remains untouched.
+ */
+function reconcileInterruptedRecoveryStaging(
+  paths: RecoveryPaths,
+  mutate = false
+): void {
+  if (
+    lstatState(paths.activePlan).state === 'present' ||
+    lstatState(paths.staging).state === 'missing'
+  ) {
+    return
+  }
+  const stagingState = lstatState(paths.staging)
+  if (
+    stagingState.state !== 'present' ||
+    !stagingState.stat.isDirectory() ||
+    stagingState.stat.isSymbolicLink()
+  ) {
+    throw new Error('recovery staging is not a real directory')
+  }
+  let removed = false
+  for (const entry of boundedEntries(paths.staging, MAX_STAGING_ENTRIES, 'recovery staging')) {
+    const classifier = /^\.classifier-([0-9a-f-]{36})$/i.exec(entry)
+    const generation = /^\.generation-(?:0|[1-9][0-9]*)-[0-9]+-([0-9a-f-]{36})$/i.exec(entry)
+    const restore = /^([0-9a-f-]{36})\.db(?:\.partial)?$/i.exec(entry)
+    if (!classifier && !generation && !restore) continue
+    const operationId = (classifier ?? generation ?? restore)?.[1]
+    if (!operationId || !SAFE_UUID.test(operationId)) continue
+    if (!mutate) {
+      throw new Error(
+        'interrupted recovery staging requires exclusive supervisor reconciliation'
+      )
+    }
+    const target = path.join(paths.staging, entry)
+    const state = lstatState(target)
+    if (state.state !== 'present') continue
+    if (classifier || generation) {
+      if (!state.stat.isDirectory() || state.stat.isSymbolicLink()) {
+        throw new Error(`interrupted recovery staging path is not a real directory: ${entry}`)
+      }
+      fs.rmSync(target, { recursive: true, force: true })
+    } else {
+      assertRegular(target, true)
+      fs.unlinkSync(target)
+    }
+    removed = true
+  }
+  if (removed) syncDirectory(paths.staging)
+}
+
+function headForGeneration(generation: RecoveryGeneration): RecoveryHead {
+  return {
+    format: FORMAT,
+    rootId: generation.manifest.rootId,
+    journalId: generation.manifest.journalId,
+    generation: generation.manifest.generation,
+    eventHighWater: generation.manifest.eventHighWater,
+    manifestSha256: sha256File(path.join(generation.directory, MANIFEST_FILE)),
+  }
+}
+
+function sameHead(left: RecoveryHead, right: RecoveryHead): boolean {
+  return (
+    left.rootId === right.rootId &&
+    left.journalId === right.journalId &&
+    left.generation === right.generation &&
+    left.eventHighWater === right.eventHighWater &&
+    left.manifestSha256 === right.manifestSha256
+  )
+}
+
+/**
+ * A generation directory is immutable evidence first and becomes controlling state only through the
+ * atomic root.json pointer. A crash can necessarily land after the immutable directory is durable but
+ * before that one-file activation. On boot, independently verify and adopt that candidate. Invalid
+ * unactivated candidates are disposable failed publications; an active or completed-rollback member is
+ * never deleted here. head.json is derived display/diagnostic metadata and is rebuilt from root.json.
+ */
+function reconcilePublishedGenerationActivation(
+  dataDir: string,
+  binding: RootBinding,
+  maxSchemaVersion: number,
+  mutate = false
+): { binding: RootBinding; head?: RecoveryHead } {
+  const paths = recoveryPaths(dataDir)
+  const activeOrdinal = binding.activeGeneration === undefined
+    ? undefined
+    : BigInt(binding.activeGeneration)
+  let removed = false
+  const generationEntries = lstatState(paths.generations).state === 'missing'
+    ? []
+    : boundedEntries(
+        paths.generations,
+        MAX_GENERATION_ENTRIES,
+        'recovery generations'
+      )
+  for (const entry of generationEntries) {
+    const match = /^g-([0-9]{20})-[0-9a-f]{24}$/.exec(entry)
+    if (!match) continue
+    const ordinal = BigInt(match[1]!).toString()
+    if (BigInt(ordinal) >= BigInt(binding.nextGeneration)) {
+      throw new Error(
+        `recovery generation ${ordinal} is not below reserved authority ${binding.nextGeneration}`
+      )
+    }
+    if (activeOrdinal !== undefined && BigInt(ordinal) <= activeOrdinal) continue
+    if (binding.recoveryTransition?.previousGeneration === ordinal) continue
+    const directory = path.join(paths.generations, entry)
+    try {
+      verifyGeneration(directory, binding, maxSchemaVersion)
+    } catch {
+      if (!mutate) {
+        throw new Error(
+          `unactivated recovery generation ${ordinal} requires exclusive supervisor reconciliation`
+        )
+      }
+      const state = lstatState(directory)
+      if (
+        state.state !== 'present' ||
+        !state.stat.isDirectory() ||
+        state.stat.isSymbolicLink()
+      ) {
+        throw new Error(`invalid unactivated recovery generation is not a real directory: ${entry}`)
+      }
+      fs.rmSync(directory, { recursive: true, force: true })
+      removed = true
+    }
+  }
+  if (removed) syncDirectory(paths.generations)
+
+  let nextBinding = binding
+  const heads = publishedRecoveryHeads(dataDir, nextBinding)
+  const highest = heads[0]
+  const active = nextBinding.activeGeneration === undefined
+    ? undefined
+    : heads.find((candidate) => candidate.generation === nextBinding.activeGeneration)
+  if (nextBinding.activeGeneration !== undefined && !active) {
+    throw new Error(
+      `active recovery generation ${nextBinding.activeGeneration} is not a published verified generation`
+    )
+  }
+
+  let adopt = nextBinding.activeGeneration === undefined ? highest : undefined
+  if (
+    active &&
+    highest &&
+    BigInt(active.generation) < BigInt(highest.generation)
+  ) {
+    const transition = nextBinding.recoveryTransition
+    if (!transition) {
+      adopt = highest
+    } else {
+      // A completed rollback intentionally leaves the active generation below the generation it
+      // replaced. Validate that immutable decision against its named predecessor first. Only a still
+      // newer verified generation can be an interrupted publication awaiting adoption; a missing or
+      // damaged rollback receipt must remain an offline condition, never an excuse to reactivate the
+      // generation the operator just recovered away from.
+      assertRecoveryTransitionReceipt(dataDir, nextBinding, active)
+      const priorOrdinal = BigInt(transition.previousGeneration)
+      const highestOrdinal = BigInt(highest.generation)
+      if (highestOrdinal === priorOrdinal) {
+        assertCompletedRecoveryTransition(dataDir, nextBinding, active, highest)
+      } else if (highestOrdinal > priorOrdinal) {
+        adopt = highest
+      }
+    }
+  }
+  if (adopt) {
+    if (!mutate) {
+      throw new Error(
+        `published recovery generation ${adopt.generation} requires exclusive activation reconciliation`
+      )
+    }
+    const candidate = scanRecoveryCandidates(dataDir).find(
+      (item) => item.manifest.generation === adopt!.generation
+    )
+    if (!candidate) throw new Error('published activation candidate disappeared')
+    const verified = verifyGeneration(candidate.directory, nextBinding, maxSchemaVersion)
+    const verifiedHead = headForGeneration(verified)
+    if (!sameHead(verifiedHead, adopt)) {
+      throw new Error('published activation candidate changed during verification')
+    }
+    nextBinding = {
+      ...nextBinding,
+      activeGeneration: verified.manifest.generation,
+      recoveryTransition: undefined,
+    }
+    writeJsonAtomic(paths.rootBinding, nextBinding)
+  }
+
+  const controlling = controllingPublishedHead(dataDir, nextBinding)
+  if (controlling) {
+    let matches = false
+    const state = lstatState(paths.head)
+    if (state.state === 'present') {
+      if (!state.stat.isFile() || state.stat.isSymbolicLink()) {
+        throw new Error('recovery head is not a regular metadata file')
+      }
+      try {
+        matches = sameHead(parseHead(paths.head), controlling)
+      } catch {
+        matches = false
+      }
+    }
+    if (!matches) {
+      // head.json is explicitly non-authoritative derived metadata. Rebuilding it does not activate a
+      // generation or authorize recovery bytes, so it may be repaired during ordinary shared-owner
+      // preflight. Every writer derives the same immutable head from root.json plus verified manifests.
+      writeJsonAtomic(paths.head, controlling)
+    }
+  } else if (lstatState(paths.head).state === 'present') {
+    // Likewise, an orphaned display/index head can be removed without changing lineage authority.
+    assertRegular(paths.head, true)
+    fs.unlinkSync(paths.head)
+    syncDirectory(paths.root)
+  }
+  return { binding: nextBinding, head: controlling }
 }
 
 export function verifyNormalJournalLineage(options: {
@@ -1485,20 +1731,7 @@ export function verifyNormalJournalLineage(options: {
         path.resolve(options.journalPath) === path.join(path.resolve(options.dataDir), 'hub.db') &&
         lstatState(paths.staging).state === 'present'
       ) {
-        const pendingClassifiers = boundedEntries(
-          paths.staging,
-          MAX_STAGING_ENTRIES,
-          'recovery staging'
-        ).filter((entry) => /^\.classifier-[0-9a-f-]{36}$/i.test(entry))
-        if (pendingClassifiers.length > 0) {
-          return {
-            code: 'database-validation-unavailable',
-            message:
-              'An isolated journal classifier operation is incomplete and requires supervisor reconciliation.',
-            recovery:
-              'Keep the hub offline. The supervisor must reconcile the exact classifier intent before normal readiness.',
-          }
-        }
+        reconcileInterruptedRecoveryStaging(paths)
       }
     }
     if (lstatState(paths.rootBinding).state === 'missing') {
@@ -1562,24 +1795,13 @@ export function verifyNormalJournalLineage(options: {
   let head: RecoveryHead | undefined
   try {
     binding = parseRootBinding(paths.rootBinding)
-    const publishedHeads = publishedRecoveryHeads(options.dataDir, binding)
-    if (lstatState(paths.head).state === 'present') {
-      head = parseHead(paths.head)
-      if (head.rootId !== binding.rootId || head.journalId !== binding.activeJournalId) {
-        throw new Error('recovery head does not match root binding')
-      }
-      if (
-        !publishedHeads.some(
-          (candidate) =>
-            candidate.generation === head!.generation &&
-            candidate.eventHighWater === head!.eventHighWater &&
-            candidate.manifestSha256 === head!.manifestSha256
-        )
-      ) {
-        throw new Error('recovery head does not match any published verified generation')
-      }
-    }
-    head = controllingPublishedHead(options.dataDir, binding)
+    const reconciled = reconcilePublishedGenerationActivation(
+      options.dataDir,
+      binding,
+      options.maxSchemaVersion
+    )
+    binding = reconciled.binding
+    head = reconciled.head
   } catch (error) {
     return {
       code: 'database-validation-unavailable',
@@ -1772,6 +1994,7 @@ export function publishRecoveryGeneration(options: {
       path.join(finalDirectory, SNAPSHOT_FILE),
       finalDirectory
     )
+    options.failpoint?.('after-generation-publication-before-activation', finalDirectory)
     writeJsonAtomic(paths.rootBinding, {
       ...parseRootBinding(paths.rootBinding),
       activeGeneration: verified.manifest.generation,
@@ -3332,6 +3555,18 @@ export function bootstrapJournalRecovery(options: {
     lease.acquireExclusive()
     lease.assertExclusiveAuthority()
     const operationPaths = ensureRecoveryOperationDirectories(dataDir)
+    // With no active plan, every prior classifier/restore staging member is an unpublished derived copy.
+    // Start classification from the live family instead of allowing interrupted debris to manufacture a
+    // different refusal on the next boot.
+    reconcileInterruptedRecoveryStaging(operationPaths, true)
+    if (lstatState(operationPaths.rootBinding).state === 'present') {
+      reconcilePublishedGenerationActivation(
+        dataDir,
+        parseRootBinding(operationPaths.rootBinding),
+        options.schemaVersion,
+        true
+      )
+    }
     const incompleteClassifierEntries = boundedEntries(
       paths.staging,
       MAX_STAGING_ENTRIES,

@@ -1,7 +1,9 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/svelte'
+import { tick } from 'svelte'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import SettingsModal from './SettingsModal.svelte'
 import { store } from './store.svelte'
+import { TutorialController } from './tutorialState.svelte'
 
 const loginMocks = vi.hoisted(() => ({
   login: vi.fn(() => new Promise(() => {})),
@@ -12,13 +14,18 @@ const loginMocks = vi.hoisted(() => ({
   renameProfile: vi.fn(),
   overseer: vi.fn(() => Promise.resolve({ configured: false, available: false })),
   configureOverseer: vi.fn(),
+  openExternalUrl: vi.fn(() => Promise.resolve(true)),
 }))
 
 vi.mock('./externalUrl', () => ({
-  prepareExternalTarget: () => null,
+  prepareExternalTarget: () => ({ popup: null }),
   closePreparedTarget: () => {},
-  openExternalUrl: () => Promise.resolve(true),
+  openExternalUrl: loginMocks.openExternalUrl,
 }))
+
+// Exercise the desktop branch. The regression existed only in Tauri: the web fallback opened the URL,
+// while the desktop path incorrectly assumed the piped Codex CLI had already done so.
+vi.mock('./window', () => ({ inTauri: true }))
 
 vi.mock('./api', async (original) => {
   const actual = await original<typeof import('./api')>()
@@ -76,9 +83,43 @@ afterEach(() => {
   loginMocks.overseer.mockReset()
   loginMocks.overseer.mockResolvedValue({ configured: false, available: false })
   loginMocks.configureOverseer.mockReset()
+  loginMocks.openExternalUrl.mockReset()
+  loginMocks.openExternalUrl.mockResolvedValue(true)
 })
 
 describe('tutorial account waiting integration', () => {
+  it('mirrors a rendered sign-in into tutorial state without recursively retriggering its effect', async () => {
+    const tutorial = new TutorialController(null)
+    const mirrored: string[] = []
+
+    render(SettingsModal, {
+      props: {
+        onclose: () => {},
+        initialTab: 'accounts',
+        onloginstate: (view) => {
+          mirrored.push(view.status)
+          // Fail quickly and legibly if the self-triggering effect ever returns instead of allowing the
+          // test renderer to spin until Vitest's global timeout.
+          if (mirrored.length > 20) throw new Error('tutorial login mirror did not converge')
+          tutorial.setLogin(view)
+        },
+      },
+    })
+    await fireEvent.input(screen.getByPlaceholderText('profile name (e.g. claude-work)'), {
+      target: { value: 'claude-render-loop-regression' },
+    })
+    await fireEvent.click(screen.getByRole('button', { name: 'Log in' }))
+
+    await vi.waitFor(() => expect(tutorial.login.status).toBe('waiting'))
+    await tick()
+    const convergedAt = mirrored.length
+    await tick()
+
+    expect(mirrored.length).toBe(convergedAt)
+    expect(mirrored).toContain('waiting')
+    expect(convergedAt).toBeLessThan(20)
+  })
+
   it('renames only the account display label and keeps the immutable id visible', async () => {
     store.profiles = [
       { id: 'claude-a', displayName: 'Old name', provider: 'claude', available: true, authStatus: 'signed_in' },
@@ -350,6 +391,73 @@ describe('tutorial account waiting integration', () => {
       expect.any(String),
       'browser',
     ])
+  })
+
+  it('opens a captured Codex browser OAuth URL through the desktop opener', async () => {
+    loginMocks.login.mockResolvedValue({
+      ok: true,
+      loginId: 'public-browser-waiting',
+      profileId: 'codex-browser-open',
+      provider: 'codex',
+      authMode: 'browser',
+      status: 'waiting',
+      url: 'https://auth.openai.com/oauth/authorize?client_id=ama-test',
+    })
+    loginMocks.loginStatus.mockImplementation(() => new Promise(() => {}))
+
+    render(SettingsModal, {
+      props: { onclose: () => {}, initialTab: 'accounts' },
+    })
+    await fireEvent.change(screen.getByRole('combobox', { name: 'Account provider' }), {
+      target: { value: 'codex' },
+    })
+    await fireEvent.input(screen.getByRole('textbox', { name: 'Profile name' }), {
+      target: { value: 'codex-browser-open' },
+    })
+    await fireEvent.click(screen.getByRole('button', { name: 'Log in' }))
+
+    await vi.waitFor(() => {
+      expect(loginMocks.openExternalUrl).toHaveBeenCalledWith(
+        'https://auth.openai.com/oauth/authorize?client_id=ama-test',
+        { popup: null },
+      )
+    })
+    expect(await screen.findByText(/Waiting for you to finish in the browser/)).toBeTruthy()
+  })
+
+  it('uses browser OAuth for one-click Codex re-auth even after device mode was selected', async () => {
+    store.profiles = [
+      { id: 'codex-reauth', provider: 'codex', available: true, authStatus: 'signed_in' },
+    ]
+    loginMocks.login.mockResolvedValue({
+      ok: false,
+      loginId: 'public-reauth-failed',
+      profileId: 'codex-reauth',
+      provider: 'codex',
+      authMode: 'browser',
+      status: 'failed',
+      error: 'test terminal state',
+    })
+
+    render(SettingsModal, {
+      props: { onclose: () => {}, initialTab: 'accounts' },
+    })
+    await fireEvent.change(screen.getByRole('combobox', { name: 'Account provider' }), {
+      target: { value: 'codex' },
+    })
+    await fireEvent.change(screen.getByRole('combobox', { name: 'Codex sign-in method' }), {
+      target: { value: 'device' },
+    })
+    await fireEvent.click(screen.getByRole('button', { name: 'Re-authenticate codex-reauth' }))
+
+    expect(loginMocks.login).toHaveBeenCalledWith(
+      'codex',
+      'codex-reauth',
+      true,
+      expect.any(String),
+      'browser',
+      expect.anything(),
+    )
   })
 
   it('shows the Codex device code in the app with an explicit copy action', async () => {

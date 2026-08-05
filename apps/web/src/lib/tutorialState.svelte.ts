@@ -1,3 +1,5 @@
+import { untrack } from 'svelte'
+
 export const FIRST_RUN_TUTORIAL_KEY = 'allmyagents.firstRunTutorial'
 export const NEW_PROJECT_TUTORIAL_KEY = 'allmyagents.newProjectTutorial'
 
@@ -179,11 +181,37 @@ export class TutorialController {
   }
 
   setLogin(view: AccountLoginView): void {
+    // THE READ HERE MUST BE UNTRACKED, AND THE WRITE MUST BE CONDITIONAL.
+    //
+    // This runs synchronously inside SettingsModal's `$effect`, which mirrors login state up to the
+    // tutorial. Svelte 5 tracks every `$state` read that happens during an effect — including reads
+    // inside functions the effect calls. Reading `this.login` plainly therefore made `login` a
+    // dependency of that effect, while the line below WRITES `login` on the very same pass. Each call
+    // builds a fresh object, so the write always counted as a change and the effect retriggered itself
+    // forever.
+    //
+    // It armed only during a sign-in: the `startedAt` branch is the sole place the previous value was
+    // read, and it is reached only when `view.status === 'waiting'` — which SettingsModal reports for
+    // `capturing`/`waiting`/`settling`. So the moment an account sign-in began, the renderer and the
+    // compositor pegged and the entire app froze, while the hub sat idle and the sign-in itself
+    // completed normally. That is why fixing the login/polling logic never helped.
+    const previous = untrack(() => this.login)
     const startedAt =
       view.status === 'waiting'
-        ? (this.login.status === 'waiting' ? this.login.startedAt : (view.startedAt ?? Date.now()))
+        ? (previous.status === 'waiting' ? previous.startedAt : (view.startedAt ?? Date.now()))
         : undefined
-    this.login = { ...view, startedAt }
+    const next = { ...view, startedAt }
+    // Belt and braces: an unchanged view must not mint a new object identity either, so no observer can
+    // be woken by a write that carries no information.
+    if (
+      previous.status === next.status &&
+      previous.provider === next.provider &&
+      previous.startedAt === next.startedAt &&
+      previous.message === next.message
+    ) {
+      return
+    }
+    this.login = next
   }
 
   setFirstRunStep(step: number): void {

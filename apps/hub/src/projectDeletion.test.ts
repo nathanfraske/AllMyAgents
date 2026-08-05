@@ -196,6 +196,21 @@ describe('project deletion preflight', () => {
     expect(fs.existsSync(hub.repo)).toBe(true)
   })
 
+  it('removes an explicitly confirmed project directory and its records', async () => {
+    const hub = buildHub()
+    fs.writeFileSync(path.join(hub.repo, 'CLAUDE.md'), 'operator-confirmed disposable project\n')
+
+    const result = await hub.sessions.deleteProject(hub.project.id, { deleteFiles: true })
+
+    expect(result).toEqual({
+      ok: true,
+      detachedSessionIds: [],
+      deletedSessionIds: [],
+    })
+    expect(hub.projects.get(hub.project.id)).toBeUndefined()
+    expect(fs.existsSync(hub.repo)).toBe(false)
+  })
+
   it('lists files in a plain project even when a parent directory is a Git repository', () => {
     const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ama-project-delete-plain-')))
     git(root, 'init')

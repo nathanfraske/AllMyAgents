@@ -429,6 +429,43 @@ describe('journal snapshots', () => {
     copy.close()
   })
 
+  it('reports copy progress and protects synchronous verification and lineage publication', async () => {
+    const root = tmp()
+    const journal = makeJournal(root, 40)
+    const backups = path.join(root, 'backups')
+    const progress: Array<{
+      phase: string
+      active: boolean
+      suspendWatchdog?: boolean
+      operationId: string
+    }> = []
+
+    const result = await snapshotJournal(journal.db, {
+      dir: backups,
+      recoveryDataDir: root,
+      onProgress: (update) => progress.push(update),
+    })
+
+    expect(result.ok).toBe(true)
+    expect(new Set(progress.map((update) => update.operationId)).size).toBe(1)
+    expect(progress).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ phase: 'copying', active: true, suspendWatchdog: false }),
+        expect.objectContaining({
+          phase: 'verifying-snapshot',
+          active: true,
+          suspendWatchdog: true,
+        }),
+        expect.objectContaining({
+          phase: 'publishing-lineage',
+          active: true,
+          suspendWatchdog: true,
+        }),
+        expect.objectContaining({ phase: 'completed', active: false, suspendWatchdog: false }),
+      ])
+    )
+  })
+
   it('verifies and retains a snapshot through the compiled Node ESM runtime without a require global', async () => {
     const root = tmp()
     const journal = makeJournal(root, 3)

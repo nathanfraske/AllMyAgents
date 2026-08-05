@@ -12,6 +12,7 @@ import type { SessionRecord } from './types.js'
 const roots: string[] = []
 
 afterEach(() => {
+  vi.restoreAllMocks()
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true })
 })
 
@@ -80,6 +81,25 @@ function fixture(): {
 }
 
 describe('WorktreeCollisionDetector', () => {
+  it('does not spawn or log a failing Git inspection every poll for a vanished worktree', async () => {
+    const { knuth } = fixture()
+    fs.rmSync(knuth.worktree!, { recursive: true, force: true })
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const detector = new WorktreeCollisionDetector({
+      sessions: () => [knuth],
+      steer: async () => true,
+    })
+
+    await detector.poll()
+    await detector.poll()
+    await detector.poll()
+
+    expect(warning).toHaveBeenCalledOnce()
+    expect(warning).toHaveBeenCalledWith(expect.stringMatching(/checkout is absent/i))
+    expect(detector.projectActivity('project-1').agents).toEqual([])
+    warning.mockRestore()
+  })
+
   it('never groups identical Linux path tails from different distros', () => {
     const { knuth } = fixture()
     const ubuntu: SessionRecord = {

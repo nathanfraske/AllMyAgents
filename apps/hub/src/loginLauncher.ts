@@ -5,6 +5,7 @@ import path from 'node:path'
 import { profileAuthEvidence } from './profiles.js'
 import type { ProfileRefreshLease } from './profileOwnership.js'
 import type { Profile, Provider } from './types.js'
+import { writeCodexFileCredentialStoreConfig } from './codexMcpConfig.js'
 
 const CRED_FILE: Record<Provider, string> = {
   claude: '.credentials.json',
@@ -1110,6 +1111,21 @@ export function startLogin(
     ...(opts.idempotencyKey ? { requestKey: opts.idempotencyKey } : {}),
   })
   attempts.set(id, attempt)
+
+  if (provider === 'codex') {
+    try {
+      writeCodexFileCredentialStoreConfig(resolvedProfileDir)
+    } catch (error) {
+      finish(
+        attempt,
+        'failed',
+        `Could not bind Codex sign-in to this managed profile's credential store: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      )
+      return Promise.resolve(publicAttempt(attempt))
+    }
+  }
 
   try {
     prepareDurableAttempt(attempt, opts.reauth === true, opts.failpoint)

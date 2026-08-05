@@ -511,13 +511,12 @@
     loginUrl = result.url
     loginCode = result.code ?? ''
     loginCodeCopied = false
-    // Claude and normal Codex OAuth open their own browser from the local desktop process. Opening the
-    // captured URL again would create two tabs. Device auth and remote/plain-browser clients need the
-    // app opener. Bound that native handoff so a failed shell integration cannot strand login polling.
-    const vendorOpenedLocalBrowser =
-      inTauri &&
-      (addProvider === 'claude' ||
-        (addProvider === 'codex' && codexLoginMode === 'browser'))
+    // Claude currently opens its own browser from the local desktop process. Codex cannot be treated the
+    // same way: its stdout/stderr are piped so the hub can capture the callback URL, and in that launch
+    // shape the CLI may print the URL without successfully handing it to the OS. Always open a captured
+    // Codex URL through the app-owned native opener. Bound that handoff so a failed shell integration
+    // cannot strand login polling; the visible fallback link remains available either way.
+    const vendorOpenedLocalBrowser = inTauri && addProvider === 'claude'
     const opened =
       vendorOpenedLocalBrowser
         ? true
@@ -702,6 +701,10 @@
   function reauthenticate(profile: (typeof store.profiles)[number]): void {
     addProvider = profile.provider
     addName = profile.id
+    // Re-authentication is a one-click local desktop action. Do not silently reuse a prior device-code
+    // selection from the add-account form: the documented/default Codex flow is browser OAuth, while
+    // device auth is an explicit remote/headless fallback that may be disabled in ChatGPT settings.
+    if (profile.provider === 'codex') codexLoginMode = 'browser'
     void login(true)
   }
 

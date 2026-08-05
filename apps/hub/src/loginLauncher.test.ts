@@ -212,6 +212,12 @@ describe('vendor login URL capture', () => {
       expect(calls[0]?.slice(-1)).toEqual(['login'])
       expect(calls[0]).not.toContain('--device-auth')
       expect(calls[1]?.slice(-2)).toEqual(['login', '--device-auth'])
+      expect(fs.readFileSync(path.join(root, 'browser', 'config.toml'), 'utf8')).toContain(
+        'cli_auth_credentials_store = "file"',
+      )
+      expect(fs.readFileSync(path.join(root, 'device', 'config.toml'), 'utf8')).toContain(
+        'cli_auth_credentials_store = "file"',
+      )
       await vi.waitFor(() => {
         expect(getLogin(browser.id)?.status).toBe('failed')
         expect(getLogin(device.id)?.status).toBe('failed')

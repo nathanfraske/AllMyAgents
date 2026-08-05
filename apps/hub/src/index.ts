@@ -26,6 +26,11 @@ import {
   ProfileLoginRegistry,
 } from './profileLoginCoordinator.js'
 import { createJournalBackupSupervisor } from './journalBackup.js'
+import {
+  JournalProgressReporter,
+  sizeAwareJournalMaintenanceBudgetMs,
+  sizeAwareJournalMaintenanceNoProgressMs,
+} from './journalProgress.js'
 import { SessionManager } from './sessions.js'
 import { SessionStore } from './store.js'
 import { startServer } from './server.js'
@@ -134,6 +139,7 @@ const validPreflightAttempt =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
     preflightAttemptId
   )
+const hubProcessInstanceId = validPreflightAttempt ? preflightAttemptId! : crypto.randomUUID()
 if (supervised && !validPreflightAttempt) {
   console.error('[hub-preflight] supervised boot lacks a valid preflight attempt binding')
   process.exit(PREFLIGHT_EXIT_CODE)
@@ -348,10 +354,22 @@ const restartState: RestartState = {
 // SUPERVISED HUBS ONLY TAKE ONE SET. During a blue-green flip two hubs briefly share this database; both
 // snapshotting would double the IO for no benefit, and green is the one that will survive.
 const journalBackupsDir = path.join(dataDir, 'backups')
+const journalProgress = new JournalProgressReporter(
+  dataDir,
+  process.pid,
+  hubProcessInstanceId,
+  (error) =>
+    console.error(
+      `[journal] out-of-band progress heartbeat failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    )
+)
 const journalBackups = createJournalBackupSupervisor(journal.db, {
   dir: journalBackupsDir,
   recoveryDataDir: dataDir,
   recoveryKeep: 6,
+  onProgress: (progress) => journalProgress.report(progress),
   log: (message) => console.log(message),
   onStateChange: (state) => {
     if (state.status !== 'inactive') restartState.journalBackupRequired = true
@@ -551,6 +569,13 @@ type JournalMaintenanceMessage =
   | { type: 'journal-condensed'; operationId: string; result: JournalCondenseResult }
   | { type: 'journal-condense-deferred'; operationId: string; reason: string }
   | { type: 'journal-condense-error'; operationId: string; error: string }
+  | {
+      type: 'journal-condense-progress'
+      operationId: string
+      phase: string
+      rowsCompleted: number
+      bytesCompleted: number
+    }
 
 let journalMaintenanceTimer: NodeJS.Timeout | undefined
 let journalMaintenanceImmediate: NodeJS.Immediate | undefined
@@ -570,6 +595,14 @@ function runJournalMaintenance(): void {
     const execArgv = sourceMode
       ? ['--import', pathToFileURL(createRequire(import.meta.url).resolve('tsx/esm')).href]
       : []
+    let journalBytes = 0
+    try {
+      journalBytes = fs.statSync(journalPath).size
+    } catch {
+      /* a fresh journal uses the minimum bounded budget */
+    }
+    const workBudgetMs = sizeAwareJournalMaintenanceBudgetMs(journalBytes)
+    const noProgressMs = sizeAwareJournalMaintenanceNoProgressMs(journalBytes)
     const child = fork(
       entry,
       [
@@ -581,6 +614,7 @@ function runJournalMaintenance(): void {
         String(JOURNAL_CONDENSE_MAX_AGENT_MESSAGE_DELTAS),
         String(JOURNAL_CONDENSE_MAX_DIFF_SNAPSHOTS),
         String(JOURNAL_CONDENSE_MAX_TRANSIENT_BYTES),
+        String(workBudgetMs),
       ],
       {
         execArgv,
@@ -589,12 +623,14 @@ function runJournalMaintenance(): void {
     )
     journalMaintenanceChild = child
     let terminalReported = false
-    const guard = setTimeout(() => {
+    let lastProgressAt = Date.now()
+    const guard = setInterval(() => {
+      if (Date.now() - lastProgressAt < noProgressMs) return
       if (!terminalReported) {
         terminalReported = true
         try {
           journal.recordCompactionLifecycle(operationId, 'unobservable', {
-            detail: 'Maintenance child exceeded its bounded observation window and was terminated.',
+            detail: `Maintenance child made no directly observable progress for ${noProgressMs}ms and was terminated.`,
           })
         } catch (error) {
           console.error(
@@ -604,13 +640,20 @@ function runJournalMaintenance(): void {
           )
         }
       }
-      console.error('[journal] condensation exceeded one interval; terminating it so maintenance can retry')
+      console.error(
+        `[journal] condensation made no progress for ${noProgressMs}ms; terminating it so maintenance can retry`
+      )
+      clearInterval(guard)
       child.kill()
-    }, JOURNAL_CONDENSE_INTERVAL_MS - 10_000)
+    }, Math.min(10_000, Math.max(1_000, Math.floor(noProgressMs / 6))))
     guard.unref?.()
     child.on('message', (raw: unknown) => {
       const msg = raw as JournalMaintenanceMessage
       if (msg?.operationId !== operationId) return
+      if (msg?.type === 'journal-condense-progress') {
+        lastProgressAt = Date.now()
+        return
+      }
       if (msg?.type === 'journal-condense-error') {
         terminalReported = true
         console.error(`[journal] condensation failed: ${msg.error}`)
@@ -643,7 +686,7 @@ function runJournalMaintenance(): void {
       }
     })
     child.once('error', (error) => {
-      clearTimeout(guard)
+      clearInterval(guard)
       if (!terminalReported) {
         terminalReported = true
         try {
@@ -658,7 +701,7 @@ function runJournalMaintenance(): void {
       console.error(`[journal] could not launch condensation: ${error.message}`)
     })
     child.once('exit', (code, signal) => {
-      clearTimeout(guard)
+      clearInterval(guard)
       if (journalMaintenanceChild === child) journalMaintenanceChild = undefined
       if (!terminalReported) {
         terminalReported = true

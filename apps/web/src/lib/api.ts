@@ -622,6 +622,17 @@ export class HubHttpError extends Error {
   }
 }
 
+/** A history cursor is still a stable sequence boundary; only its replay-generation fence went stale. */
+export class JournalHistoryGenerationChangedError extends HubHttpError {
+  constructor(
+    readonly expected: number,
+    readonly actual: number,
+  ) {
+    super(`journal history generation changed (${expected} -> ${actual})`, 409)
+    this.name = 'JournalHistoryGenerationChangedError'
+  }
+}
+
 /**
  * The single place a hub response becomes a typed result. `ok:false` NEVER carries `data`, so an error
  * body can never be read as if it were `T` — the whole point of this transport. Before it existed, a
@@ -1275,14 +1286,39 @@ export const api = {
       (raw) => `/api/sessions/${encodeURIComponent(raw)}/history${before != null ? `?before=${before}` : ''}`,
       signal,
     ),
-  journalHistory: (id: string, generation: number, before?: number, signal?: AbortSignal) => {
+  journalHistory: async (id: string, generation: number, before?: number, signal?: AbortSignal) => {
     const query = new URLSearchParams({ generation: String(generation) })
     if (before != null) query.set('before', String(before))
-    return routedGet<JournalHistoryPage>(
-      id,
-      (raw) => `/api/sessions/${encodeURIComponent(raw)}/journal-history?${query.toString()}`,
+    const target = resolveHubResource(id)
+    const result = await request<
+      | JournalHistoryPage
+      | { error: string; resetRequired: true; expected: number; actual: number }
+    >(
+      'GET',
+      `/api/sessions/${encodeURIComponent(target.id)}/journal-history?${query.toString()}`,
+      target.baseUrl,
+      undefined,
+      [409],
       signal,
+      target.token,
     )
+    if (!result.ok) throw new HubHttpError(result.error, result.status)
+    if (result.status === 409) {
+      const changed = result.data as { expected?: unknown; actual?: unknown }
+      if (
+        !Number.isSafeInteger(changed.expected) ||
+        !Number.isSafeInteger(changed.actual) ||
+        Number(changed.expected) < 1 ||
+        Number(changed.actual) < 1
+      ) {
+        throw new HubHttpError('journal history generation changed without a valid reset fence', 409)
+      }
+      throw new JournalHistoryGenerationChangedError(
+        Number(changed.expected),
+        Number(changed.actual),
+      )
+    }
+    return result.data as JournalHistoryPage
   },
   approvals: () => jget<ApprovalRecord[]>('/api/approvals'),
   questions: () => jget<QuestionRecord[]>('/api/questions'),

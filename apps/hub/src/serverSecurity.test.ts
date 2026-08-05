@@ -167,6 +167,24 @@ function auth(token: string): HeadersInit {
 }
 
 describe('device-authenticated control plane', () => {
+  it('allows the packaged UI to preflight authenticated project deletion', async () => {
+    const { base } = await build()
+
+    const response = await fetch(`${base}/api/projects/project-to-delete`, {
+      method: 'OPTIONS',
+      headers: {
+        origin: 'http://tauri.localhost',
+        'access-control-request-method': 'DELETE',
+        'access-control-request-headers': 'authorization, content-type',
+      },
+    })
+
+    expect(response.status).toBe(204)
+    expect(response.headers.get('access-control-allow-origin')).toBe('http://tauri.localhost')
+    expect(response.headers.get('access-control-allow-methods')?.split(/,\s*/)).toContain('DELETE')
+    expect(response.headers.get('access-control-allow-headers')).toContain('authorization')
+  })
+
   it('makes journal-backup activation failure visible on the public health probe', async () => {
     const { base, restartState } = await build()
     restartState.journalBackup = {

@@ -5,6 +5,34 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.18-alpha.21 — 2026-08-05
+
+This release makes journal lineage publication crash-atomic and recoverable, teaches the supervisor to
+distinguish slow maintenance from a dead hub, repairs lazy history across generation changes, and removes the
+renderer loop that froze the entire app while an otherwise successful account sign-in completed.
+
+[Full v0.1.18-alpha.21 release notes](docs/releases/v0.1.18-alpha.21.md)
+
+- Recovery adopts a fully verified generation interrupted between publication and activation, discards
+  incomplete staging, rebuilds derived lineage metadata, and preserves immutable rollback receipts. Kill-point
+  tests exercise both sides of the publication boundary with real child processes.
+- Maintenance and backup work report instance-bound progress, committed rows, and written bytes out of band.
+  The supervisor waits for a true no-progress interval, suspends termination during protected lineage phases,
+  and no longer kills a healthy hub merely because one HTTP health request timed out.
+- Lazy transcript history retries a stable cursor against the new generation while preserving the already
+  reached history, live tail, and scroll anchor. Scrolling no longer strands the current replies behind a
+  generation-change error.
+- Account sign-in no longer creates a Svelte effect that both reads and writes tutorial login state. The mirror
+  uses an untracked read and identity-stable no-op guard, so Claude and Codex logins can settle without pegging
+  the renderer even when the credential was already stored successfully.
+- Codex browser OAuth is opened by the desktop app, re-authentication resets to that documented default, and
+  managed profiles pin CLI credentials to their own `auth.json` rather than depending on an ambient keychain.
+- Project deletion now passes the packaged browser's authenticated CORS preflight for `DELETE`; both safe
+  detachment and explicitly confirmed file removal reach the existing hub transaction.
+- Existing Overseers migrate to capability contract v3 and are directed to the fleet-wide Overseer inspection
+  path instead of a project-scoped vendor `peek_agent` tool. Missing worktrees are also detected without
+  spawning the same failing Git probe on every poll.
+
 ## v0.1.17-alpha.20 — 2026-08-04
 
 This release adds durable manager-team generations and exact worktree/commit provenance, removes expensive

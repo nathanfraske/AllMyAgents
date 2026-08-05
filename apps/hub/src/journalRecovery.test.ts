@@ -1,6 +1,10 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { spawn } from 'node:child_process'
+import { once } from 'node:events'
+import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
 import Database from 'better-sqlite3'
 import { afterEach, describe, expect, it } from 'vitest'
 import { Journal } from './journal.js'
@@ -51,6 +55,24 @@ async function strongSnapshot(dataDir: string, journal: Journal, now: Date): Pro
     now: () => now,
   })
   if (!result.ok) throw new Error(`strong snapshot failed: ${result.error}`)
+}
+
+async function runHardCrashModule(source: string): Promise<void> {
+  const loader = pathToFileURL(createRequire(import.meta.url).resolve('tsx/esm')).href
+  const child = spawn(
+    process.execPath,
+    ['--import', loader, '--input-type=module', '--eval', source],
+    { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true }
+  )
+  let stderr = ''
+  child.stderr?.setEncoding('utf8')
+  child.stderr?.on('data', (chunk: string) => (stderr += chunk))
+  const timeout = setTimeout(() => child.kill('SIGKILL'), 15_000)
+  const [code, signal] = await once(child, 'exit') as [number | null, NodeJS.Signals | null]
+  clearTimeout(timeout)
+  if (code === 0 && signal === null) {
+    throw new Error(`hard-crash fixture exited normally: ${stderr}`)
+  }
 }
 
 afterEach(() => {
@@ -522,6 +544,221 @@ describe('owned journal corruption recovery', () => {
     ).toHaveLength(3)
   })
 
+  it('adopts a fully verified generation after a crash between publication and activation', async () => {
+    const dataDir = root('ama-generation-activation')
+    const journal = open(dataDir)
+    journal.append('s1', 'session/input', { text: 'generation-one' })
+    await strongSnapshot(dataDir, journal, new Date('2026-07-29T00:00:00.000Z'))
+    journal.append('s1', 'session/input', { text: 'generation-two' })
+    const snapshot = path.join(dataDir, 'activation-candidate.db')
+    await journal.db.backup(snapshot)
+    const paths = recoveryPaths(dataDir)
+
+    expect(() =>
+      publishRecoveryGeneration({
+        dataDir,
+        snapshotFile: snapshot,
+        maxSchemaVersion: SCHEMA_VERSION,
+        failpoint: (edge) => {
+          if (edge === 'after-generation-publication-before-activation') {
+            throw new Error('crash before root activation')
+          }
+        },
+      })
+    ).toThrow(/crash before root activation/i)
+    expect(JSON.parse(fs.readFileSync(paths.rootBinding, 'utf8'))).toMatchObject({
+      activeGeneration: '1',
+      nextGeneration: '3',
+    })
+
+    expect(
+      verifyNormalJournalLineage({
+        dataDir,
+        journalPath: path.join(dataDir, 'hub.db'),
+        maxSchemaVersion: SCHEMA_VERSION,
+      })
+    ).toMatchObject({ code: 'database-validation-unavailable' })
+    const reconciled = bootstrapJournalRecovery({
+      dataDir,
+      journalPath: path.join(dataDir, 'hub.db'),
+      schemaVersion: SCHEMA_VERSION,
+    })
+    expect(reconciled.preflight.ok).toBe(true)
+    expect(reconciled.recovery).toBeUndefined()
+    reconciled.lease.release()
+    expect(JSON.parse(fs.readFileSync(paths.rootBinding, 'utf8'))).toMatchObject({
+      activeGeneration: '2',
+      nextGeneration: '3',
+    })
+    expect(JSON.parse(fs.readFileSync(paths.head, 'utf8'))).toMatchObject({
+      generation: '2',
+      eventHighWater: '2',
+    })
+  })
+
+  it('survives an actual process kill after generation publication and before activation', async () => {
+    const dataDir = root('ama-generation-hard-crash')
+    const journal = open(dataDir)
+    journal.append('s1', 'session/input', { text: 'generation-one' })
+    await strongSnapshot(dataDir, journal, new Date('2026-07-29T00:00:00.000Z'))
+    journal.append('s1', 'session/input', { text: 'generation-two' })
+    const snapshot = path.join(dataDir, 'hard-crash-candidate.db')
+    await journal.db.backup(snapshot)
+    const recoveryModule = pathToFileURL(
+      path.join(import.meta.dirname, 'journalRecovery.ts')
+    ).href
+
+    await runHardCrashModule(`
+      const { publishRecoveryGeneration } = await import(${JSON.stringify(recoveryModule)});
+      publishRecoveryGeneration({
+        dataDir: ${JSON.stringify(dataDir)},
+        snapshotFile: ${JSON.stringify(snapshot)},
+        maxSchemaVersion: ${SCHEMA_VERSION},
+        failpoint: (edge) => {
+          if (edge === 'after-generation-publication-before-activation') {
+            process.kill(process.pid, 'SIGKILL');
+            throw new Error('hard kill returned unexpectedly');
+          }
+        },
+      });
+    `)
+
+    expect(
+      verifyNormalJournalLineage({
+        dataDir,
+        journalPath: path.join(dataDir, 'hub.db'),
+        maxSchemaVersion: SCHEMA_VERSION,
+      })
+    ).toMatchObject({ code: 'database-validation-unavailable' })
+    const reconciled = bootstrapJournalRecovery({
+      dataDir,
+      journalPath: path.join(dataDir, 'hub.db'),
+      schemaVersion: SCHEMA_VERSION,
+    })
+    expect(reconciled.preflight.ok).toBe(true)
+    expect(reconciled.recovery).toBeUndefined()
+    reconciled.lease.release()
+    expect(JSON.parse(fs.readFileSync(recoveryPaths(dataDir).rootBinding, 'utf8'))).toMatchObject({
+      activeGeneration: '2',
+    })
+  })
+
+  it('never bypasses a completed rollback receipt while adopting an interrupted later publication', async () => {
+    const dataDir = root('ama-generation-after-rollback')
+    const journal = open(dataDir)
+    journal.append('s1', 'session/input', { text: 'generation-one' })
+    await strongSnapshot(dataDir, journal, new Date('2026-07-29T00:00:00.000Z'))
+    journal.append('s1', 'session/input', { text: 'generation-two' })
+    await strongSnapshot(dataDir, journal, new Date('2026-07-29T00:01:00.000Z'))
+    journal.db.close()
+
+    const generations = listRecoveryGenerations(dataDir, SCHEMA_VERSION)
+    fs.truncateSync(path.join(generations[0]!.directory, 'snapshot.db'), 17)
+    const journalPath = path.join(dataDir, 'hub.db')
+    fs.writeFileSync(journalPath, Buffer.alloc(64 * 1024, 0x47))
+    const recovered = bootstrapJournalRecovery({
+      dataDir,
+      journalPath,
+      schemaVersion: SCHEMA_VERSION,
+    })
+    expect(recovered.recovery).toMatchObject({ generation: '1', previousActiveGeneration: '2' })
+    const receiptFile = recovered.recovery!.receiptFile
+    const receiptBytes = fs.readFileSync(receiptFile)
+    recovered.lease.release()
+
+    const restored = open(dataDir)
+    restored.append('s1', 'session/input', { text: 'generation-three' })
+    const candidate = path.join(dataDir, 'post-rollback-candidate.db')
+    await restored.db.backup(candidate)
+    restored.db.close()
+    expect(() =>
+      publishRecoveryGeneration({
+        dataDir,
+        snapshotFile: candidate,
+        maxSchemaVersion: SCHEMA_VERSION,
+        failpoint: (edge) => {
+          if (edge === 'after-generation-publication-before-activation') {
+            throw new Error('crash after rollback publication')
+          }
+        },
+      })
+    ).toThrow(/crash after rollback publication/i)
+
+    fs.unlinkSync(receiptFile)
+    expect(
+      verifyNormalJournalLineage({ dataDir, journalPath, maxSchemaVersion: SCHEMA_VERSION })
+    ).toMatchObject({ code: 'database-validation-unavailable' })
+    expect(JSON.parse(fs.readFileSync(recoveryPaths(dataDir).rootBinding, 'utf8'))).toMatchObject({
+      activeGeneration: '1',
+    })
+
+    fs.writeFileSync(receiptFile, receiptBytes)
+    const reconciled = bootstrapJournalRecovery({
+      dataDir,
+      journalPath,
+      schemaVersion: SCHEMA_VERSION,
+    })
+    expect(reconciled.preflight.ok).toBe(true)
+    expect(reconciled.recovery).toBeUndefined()
+    reconciled.lease.release()
+    expect(JSON.parse(fs.readFileSync(recoveryPaths(dataDir).rootBinding, 'utf8'))).toMatchObject({
+      activeGeneration: '3',
+    })
+  })
+
+  it('discards incomplete unactivated generation and classifier staging debris on boot', async () => {
+    const dataDir = root('ama-recovery-debris')
+    const journal = open(dataDir)
+    journal.append('s1', 'session/input', { text: 'stable-generation' })
+    await strongSnapshot(dataDir, journal, new Date('2026-07-29T00:00:00.000Z'))
+    const snapshot = path.join(dataDir, 'partial-candidate.db')
+    await journal.db.backup(snapshot)
+    expect(() =>
+      publishRecoveryGeneration({
+        dataDir,
+        snapshotFile: snapshot,
+        maxSchemaVersion: SCHEMA_VERSION,
+        failpoint: (edge) => {
+          if (edge === 'after-generation-member-snapshot.db') {
+            throw new Error('partial generation crash')
+          }
+        },
+      })
+    ).toThrow(/partial generation crash/i)
+    const paths = recoveryPaths(dataDir)
+    const classifier = path.join(
+      paths.staging,
+      '.classifier-55555555-5555-4555-8555-555555555555'
+    )
+    fs.mkdirSync(classifier)
+    fs.writeFileSync(path.join(classifier, 'incomplete-copy'), 'derived debris')
+
+    expect(
+      verifyNormalJournalLineage({
+        dataDir,
+        journalPath: path.join(dataDir, 'hub.db'),
+        maxSchemaVersion: SCHEMA_VERSION,
+      })
+    ).toMatchObject({ code: 'database-validation-unavailable' })
+    expect(fs.existsSync(classifier)).toBe(true)
+    const reconciled = bootstrapJournalRecovery({
+      dataDir,
+      journalPath: path.join(dataDir, 'hub.db'),
+      schemaVersion: SCHEMA_VERSION,
+    })
+    expect(reconciled.preflight.ok).toBe(true)
+    expect(reconciled.recovery).toBeUndefined()
+    reconciled.lease.release()
+    expect(fs.existsSync(classifier)).toBe(false)
+    expect(
+      fs.readdirSync(paths.generations).filter((entry) => entry.startsWith('g-'))
+    ).toHaveLength(1)
+    expect(JSON.parse(fs.readFileSync(paths.rootBinding, 'utf8'))).toMatchObject({
+      activeGeneration: '1',
+      nextGeneration: '3',
+    })
+  })
+
   it('restores only an owned verified generation and retains the exact damaged family as evidence', async () => {
     const dataDir = root()
     const journal = open(dataDir)
@@ -690,7 +927,7 @@ describe('owned journal corruption recovery', () => {
     boot.lease.release()
   })
 
-  it('rejects a lowered active generation without an immutable recovery transition', async () => {
+  it('self-heals a verified published generation whose activation pointer was not advanced', async () => {
     const dataDir = root()
     const journal = open(dataDir)
     journal.append('s1', 'session/input', { text: 'first' })
@@ -705,13 +942,23 @@ describe('owned journal corruption recovery', () => {
     delete binding.recoveryTransition
     fs.writeFileSync(bindingFile, `${JSON.stringify(binding, null, 2)}\n`)
 
-    const lowered = verifyNormalJournalLineage({
+    const pending = verifyNormalJournalLineage({
       dataDir,
       journalPath: path.join(dataDir, 'hub.db'),
       maxSchemaVersion: SCHEMA_VERSION,
     })
-    expect(lowered).toMatchObject({ code: 'database-validation-unavailable' })
-    expect(lowered).not.toHaveProperty('recoveryCause')
+    expect(pending).toMatchObject({ code: 'database-validation-unavailable' })
+    const reconciled = bootstrapJournalRecovery({
+      dataDir,
+      journalPath: path.join(dataDir, 'hub.db'),
+      schemaVersion: SCHEMA_VERSION,
+    })
+    expect(reconciled.preflight.ok).toBe(true)
+    expect(reconciled.recovery).toBeUndefined()
+    reconciled.lease.release()
+    expect(JSON.parse(fs.readFileSync(bindingFile, 'utf8'))).toMatchObject({
+      activeGeneration: '2',
+    })
   })
 
   it('fails closed on a malformed directory claiming the same canonical generation ordinal', async () => {
@@ -1089,7 +1336,7 @@ describe('owned journal corruption recovery', () => {
     resumed.lease.release()
   })
 
-  it('reconciles a completed receipt before removing its interrupted classifier intent', async () => {
+  it('removes interrupted classifier debris after its completed receipt is durable', async () => {
     const dataDir = root()
     const journal = open(dataDir)
     journal.append('s1', 'session/input', { text: 'classifier-cleanup' })
@@ -1130,18 +1377,18 @@ describe('owned journal corruption recovery', () => {
         maxSchemaVersion: SCHEMA_VERSION,
       })
     ).toMatchObject({ code: 'database-validation-unavailable' })
-
     const reconciled = bootstrapJournalRecovery({
       dataDir,
       journalPath,
       schemaVersion: SCHEMA_VERSION,
     })
+    expect(reconciled.preflight.ok).toBe(true)
+    reconciled.lease.release()
     expect(
       fs.readdirSync(recoveryPaths(dataDir).staging).filter((entry) =>
         entry.startsWith('.classifier-')
       )
     ).toHaveLength(0)
-    reconciled.lease.release()
   })
 
   it.each([
@@ -1739,7 +1986,7 @@ describe('owned journal corruption recovery', () => {
     })
   })
 
-  it('fails closed when head.json points to no matching verified generation', async () => {
+  it('rebuilds derived head.json when it points to no matching verified generation', async () => {
     const dataDir = root()
     const journal = open(dataDir)
     journal.append('s1', 'session/input', { text: 'head-integrity' })
@@ -1754,7 +2001,54 @@ describe('owned journal corruption recovery', () => {
         journalPath: path.join(dataDir, 'hub.db'),
         maxSchemaVersion: SCHEMA_VERSION,
       })
-    ).toMatchObject({ code: 'database-validation-unavailable' })
+    ).toBeUndefined()
+    expect(JSON.parse(fs.readFileSync(headFile, 'utf8'))).toMatchObject({ generation: '1' })
+  })
+
+  it('reclassifies cleanly after an actual process kill leaves unpublished classifier debris', async () => {
+    const dataDir = root('ama-classifier-hard-crash')
+    const journal = open(dataDir)
+    journal.append('s1', 'session/input', { text: 'owned-before-crash' })
+    await strongSnapshot(dataDir, journal, new Date('2026-07-29T00:00:00.000Z'))
+    journal.db.close()
+    const journalPath = path.join(dataDir, 'hub.db')
+    fs.writeFileSync(journalPath, Buffer.alloc(96 * 1024, 0x47))
+    const recoveryModule = pathToFileURL(
+      path.join(import.meta.dirname, 'journalRecovery.ts')
+    ).href
+
+    await runHardCrashModule(`
+      const { bootstrapJournalRecovery } = await import(${JSON.stringify(recoveryModule)});
+      bootstrapJournalRecovery({
+        dataDir: ${JSON.stringify(dataDir)},
+        journalPath: ${JSON.stringify(journalPath)},
+        schemaVersion: ${SCHEMA_VERSION},
+        failpoint: (edge) => {
+          if (edge === 'after-classifier-fsync-hub.db') {
+            process.kill(process.pid, 'SIGKILL');
+            throw new Error('hard kill returned unexpectedly');
+          }
+        },
+      });
+    `)
+    expect(
+      fs.readdirSync(recoveryPaths(dataDir).staging).filter((entry) =>
+        entry.startsWith('.classifier-')
+      )
+    ).toHaveLength(1)
+
+    const recovered = bootstrapJournalRecovery({
+      dataDir,
+      journalPath,
+      schemaVersion: SCHEMA_VERSION,
+    })
+    expect(recovered.recovery?.generation).toBe('1')
+    expect(
+      fs.readdirSync(recoveryPaths(dataDir).staging).filter((entry) =>
+        entry.startsWith('.classifier-')
+      )
+    ).toHaveLength(0)
+    recovered.lease.release()
   })
 
   it('never publishes a newer ordinal with a regressed event high-water', async () => {

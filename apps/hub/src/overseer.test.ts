@@ -109,20 +109,26 @@ describe('application Overseer authority', () => {
 
     expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
       isOverseer: true,
-      overseerCapabilityVersion: 2,
+      overseerCapabilityVersion: 3,
       permissionMode: 'full',
       permissionModeOperatorOverride: true,
       role: 'Application Overseer',
     })
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
-      'Overseer capability manifest version 2',
+      'Overseer capability manifest version 3',
+    )
+    expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
+      'mcp__allmyagents__overseer_control',
+    )
+    expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
+      'Do not use the vendor-native list_agents or peek_agent',
     )
     const upgrades = () => h.journal.recentEventsForSession('legacy-overseer', 20)
       .filter((event) => event.kind === 'overseer/capabilities-upgraded')
     expect(upgrades()).toHaveLength(1)
     expect(upgrades()[0]?.payload).toMatchObject({
       fromVersion: 0,
-      toVersion: 2,
+      toVersion: 3,
       conversationPreserved: true,
       tools: expect.arrayContaining(['overseer_control', 'remote_exec', 'browser_navigate']),
     })
