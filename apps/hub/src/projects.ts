@@ -7,6 +7,11 @@ import type { Project } from './types.js'
 
 type ProjectLocation = NonNullable<Project['location']>
 
+interface ProjectLifecycleJournal {
+  atomic<T>(fn: () => T): T
+  append(sessionId: string | null, kind: string, payload: unknown): unknown
+}
+
 interface ProjectRow {
   id: string
   name: string
@@ -53,7 +58,10 @@ export class ProjectStore {
   private readonly trustUpsertStmt: Database.Statement
   private readonly trustDelStmt: Database.Statement
 
-  constructor(db: Database.Database) {
+  constructor(
+    private readonly db: Database.Database,
+    private readonly lifecycle?: ProjectLifecycleJournal,
+  ) {
     db.exec(
       'CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL, createdAt TEXT NOT NULL)'
     )
@@ -118,14 +126,22 @@ export class ProjectStore {
     if (this.list().some((existing) => projectFilesystemKey(existing) === filesystemKey)) {
       throw new Error(`This project directory is already added: ${project.path}`)
     }
-    this.insertStmt.run(
-      project.id,
-      project.name,
-      project.path,
-      project.location?.distro ?? null,
-      project.location?.linuxPath ?? null,
-      project.createdAt,
-    )
+    const insert = (): void => {
+      this.insertStmt.run(
+        project.id,
+        project.name,
+        project.path,
+        project.location?.distro ?? null,
+        project.location?.linuxPath ?? null,
+        project.createdAt,
+      )
+      this.lifecycle?.append(null, 'project/created', { project })
+    }
+    // A project must not become visible in the durable registry without the lifecycle row that makes
+    // every already-open operator window learn about it. This matters especially for Overseer-created
+    // projects: there is no initiating browser request whose response could patch one local store.
+    if (this.lifecycle) this.lifecycle.atomic(insert)
+    else insert()
     return project
   }
 

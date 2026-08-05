@@ -28,4 +28,24 @@ describe('project editing', () => {
     expect(() => projects.updateName('missing', 'Name')).toThrow(/unknown project/i)
     db.close()
   })
+
+  it('rolls the project row back when its live lifecycle event cannot be committed', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-project-create-atomic-'))
+    roots.push(root)
+    const projectDir = path.join(root, 'project')
+    fs.mkdirSync(projectDir)
+    const db = new Database(path.join(root, 'hub.db'))
+    const projects = new ProjectStore(db, {
+      atomic<T>(fn: () => T): T {
+        return db.transaction(fn).immediate()
+      },
+      append(): never {
+        throw new Error('synthetic lifecycle failure')
+      },
+    })
+
+    expect(() => projects.create('Never visible', projectDir)).toThrow(/lifecycle failure/u)
+    expect(projects.list()).toEqual([])
+    db.close()
+  })
 })

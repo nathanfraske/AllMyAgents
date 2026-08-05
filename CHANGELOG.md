@@ -34,6 +34,12 @@ renderer loop that froze the entire app while an otherwise successful account si
   spawning the same failing Git probe on every poll.
 - The dedicated Overseer sidebar entry now shows its truthful live lifecycle—thinking, idle, awaiting input,
   error, stopped, or unavailable—without requiring the operator to open the conversation first.
+- Projects created through the Overseer now commit a canonical `project/created` lifecycle event in the same
+  transaction as the project row. Every open local or remote project view upserts that event immediately, so a
+  successful setup no longer exists only in the hub while the sidebar remains stale.
+- Claude's organization-level “subscription access disabled” response is recognized as an account access
+  failure. After the first authoritative rejection, central turn admission gates the affected profile with exact
+  re-authentication/admin guidance instead of letting every attached Claude agent independently fail its next turn.
 
 ## v0.1.17-alpha.20 — 2026-08-04
 
