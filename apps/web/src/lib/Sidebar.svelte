@@ -44,6 +44,29 @@
     logTail?: string
   } | null>(null)
   const liveOverseer = $derived(store.sessionList.find((session) => session.record.isOverseer === true))
+  const overseerLifecycle = $derived.by(() => {
+    if (!liveOverseer) {
+      return overseerSessionId
+        ? { key: 'unavailable', label: 'unavailable' }
+        : { key: 'setup', label: 'not set up' }
+    }
+    const status = store.status(liveOverseer)
+    switch (status.key) {
+      case 'working':
+      case 'starting':
+        return { key: 'thinking', label: 'thinking' }
+      case 'question':
+      case 'approval':
+        return { key: 'attention', label: status.label }
+      case 'error':
+        return { key: 'error', label: 'error' }
+      case 'stopped':
+        return { key: 'stopped', label: 'stopped' }
+      default:
+        // "Completed" describes the prior turn; the Overseer's current lifecycle state is idle.
+        return { key: 'idle', label: 'idle' }
+    }
+  })
 
   $effect(() => {
     if (!store.connected) return
@@ -940,10 +963,23 @@
 
   <div class="search"><span class="sicon"><Icon name="search" size={13} /></span><input placeholder="Search sessions" bind:value={filter} /></div>
 
-  <button class="overseer-entry" data-overseer-anchor="overseer" class:configured={!!(liveOverseer || overseerSessionId)} onclick={openOverseer}>
+  <button
+    class="overseer-entry"
+    data-overseer-anchor="overseer"
+    class:configured={!!(liveOverseer || overseerSessionId)}
+    aria-label={`Open Overseer — ${overseerLifecycle.label}`}
+    title={`Overseer status: ${overseerLifecycle.label}`}
+    onclick={openOverseer}
+  >
     <span class="overseer-mark"><Icon name="activity" size={14} /></span>
-    <span><b>Overseer</b><small>{liveOverseer || overseerSessionId ? 'Application control' : 'Set up application control'}</small></span>
-    <Icon name="chevron-right" size={13} />
+    <span class="overseer-copy"><b>Overseer</b><small>{liveOverseer || overseerSessionId ? 'Application control' : 'Set up application control'}</small></span>
+    <span class="overseer-tail">
+      <span class="overseer-state {overseerLifecycle.key}">
+        <i class="overseer-state-dot" aria-hidden="true"></i>
+        <span>{overseerLifecycle.label}</span>
+      </span>
+      <Icon name="chevron-right" size={13} />
+    </span>
   </button>
 
   <div class="sec-head">
@@ -1262,12 +1298,26 @@
   .supervisor-diagnostic code { max-height: 5rem; overflow: auto; color: var(--warn); white-space: pre-wrap; font-size: var(--text-2xs); }
   .supervisor-diagnostic small { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-2xs); }
   .search { position: relative; padding: 0 var(--space-4) var(--space-3); }
-  .overseer-entry { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: var(--space-2); margin: 0 var(--space-3) var(--space-3); padding: var(--space-2) var(--space-3); border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface); color: var(--text); text-align: left; }
+  .overseer-entry { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: var(--space-2); margin: 0 var(--space-3) var(--space-3); padding: var(--space-2) var(--space-3); border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface); color: var(--text); text-align: left; }
   .overseer-entry:hover, .overseer-entry.configured { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
-  .overseer-entry span:nth-child(2) { display: flex; min-width: 0; flex-direction: column; }
+  .overseer-copy { display: flex; min-width: 0; flex-direction: column; }
   .overseer-entry b { font-size: var(--text-xs); font-weight: var(--fw-semibold); }
   .overseer-entry small { color: var(--muted); font-size: var(--text-2xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .overseer-mark { display: grid; color: var(--accent); }
+  .overseer-tail, .overseer-state { display: inline-flex; align-items: center; }
+  .overseer-tail { gap: var(--space-1); color: var(--dim); }
+  .overseer-state { gap: 0.28rem; max-width: 7rem; color: var(--muted); font-size: var(--text-2xs); white-space: nowrap; }
+  .overseer-state > span { overflow: hidden; text-overflow: ellipsis; }
+  .overseer-state-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: currentColor; opacity: 0.9; }
+  .overseer-state.thinking { color: var(--accent); }
+  .overseer-state.idle { color: var(--ok); }
+  .overseer-state.attention, .overseer-state.unavailable { color: var(--warn); }
+  .overseer-state.error { color: var(--bad-text, #e5484d); }
+  .overseer-state.stopped, .overseer-state.setup { color: var(--dim); }
+  @media (prefers-reduced-motion: no-preference) {
+    .overseer-state.thinking .overseer-state-dot { animation: overseer-thinking-pulse 1.2s ease-in-out infinite; }
+    @keyframes overseer-thinking-pulse { 0%, 100% { opacity: 0.35; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1.2); } }
+  }
   .sicon { position: absolute; left: 1.15rem; top: calc(50% - 0.25rem); transform: translateY(-50%); color: var(--dim); display: grid; }
   .search input { width: 100%; padding-left: 1.9rem; }
   .sec-head { display: flex; align-items: center; justify-content: space-between; padding: var(--space-2) var(--space-5); font-size: var(--text-2xs); letter-spacing: var(--ls-label); text-transform: uppercase; color: var(--dim); }

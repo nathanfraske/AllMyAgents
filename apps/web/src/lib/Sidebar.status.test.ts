@@ -117,4 +117,36 @@ describe('compact system status indicators', () => {
       'No journal maintenance activity has been reported during this run.',
     )
   })
+
+  it.each([
+    ['active', 'thinking'],
+    ['starting', 'thinking'],
+    ['idle', 'idle'],
+    ['error', 'error'],
+    ['stopped', 'stopped'],
+  ] as const)('shows the Overseer %s lifecycle as %s', (status, label) => {
+    store.sessions = {
+      overseer: {
+        record: {
+          id: 'overseer',
+          profileId: 'claude-overseer',
+          provider: 'claude',
+          cwd: 'C:/work/app',
+          status,
+          title: 'Overseer',
+          isOverseer: true,
+          createdAt: '2026-08-05T12:00:00.000Z',
+        },
+        items: [],
+        lastActivity: '2026-08-05T12:00:00.000Z',
+        sawReasoning: false,
+      },
+    }
+
+    render(Sidebar)
+
+    const entry = screen.getByRole('button', { name: `Open Overseer — ${label}` })
+    expect(within(entry).getByText(label)).toBeTruthy()
+    expect(entry.querySelector('.overseer-state')?.classList.contains(label)).toBe(true)
+  })
 })

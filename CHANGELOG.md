@@ -32,6 +32,8 @@ renderer loop that froze the entire app while an otherwise successful account si
 - Existing Overseers migrate to capability contract v3 and are directed to the fleet-wide Overseer inspection
   path instead of a project-scoped vendor `peek_agent` tool. Missing worktrees are also detected without
   spawning the same failing Git probe on every poll.
+- The dedicated Overseer sidebar entry now shows its truthful live lifecycle—thinking, idle, awaiting input,
+  error, stopped, or unavailable—without requiring the operator to open the conversation first.
 
 ## v0.1.17-alpha.20 — 2026-08-04
 
