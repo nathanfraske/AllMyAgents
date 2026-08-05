@@ -58,6 +58,7 @@ import {
 import type { SessionIdentity } from './identity.js'
 import type { DangerFlags } from './types.js'
 import {
+  CLAUDE_PERMISSION_DENIED_TEXT,
   HUB_UNAVAILABLE_TEXT,
   HubUnavailableError,
   InvalidQuestionCorrelationError,
@@ -428,6 +429,7 @@ export class AgentWorker {
           model: spec.model,
           permissionMode: spec.permissionMode,
           effort: spec.effort,
+          systemPrompt: spec.claudeSystemPrompt,
           trustProjectConfig: spec.trustProjectConfig,
         },
         attachments
@@ -473,7 +475,7 @@ export class AgentWorker {
 
   private async startThread(spec: WorkerSessionSpec): Promise<string> {
     const client = this.codexClientFor(spec.profileId, spec.profileDir, spec.wsl)
-    const threadId = await client.startThread(spec.cwd)
+    const threadId = await client.startThread(spec.cwd, spec.codexDeveloperInstructions)
     this.codexThreads.set(spec.sessionId, threadId)
     this.codexSessionClients.set(spec.sessionId, client)
     return threadId
@@ -485,13 +487,14 @@ export class AgentWorker {
     let threadId = this.codexThreads.get(spec.sessionId)
     if (!threadId) {
       if (!spec.vendorSessionId) throw new Error('codex session has no persisted thread id')
-      await client.resumeThread(spec.vendorSessionId)
+      await client.resumeThread(spec.vendorSessionId, spec.codexDeveloperInstructions)
       threadId = spec.vendorSessionId
       this.codexThreads.set(spec.sessionId, threadId)
       // In-process journals session/thread-resumed here (a hub side effect); in the worker it is emitted
       // into the wseq'd event stream so the hub journals it identically (§3.2).
       this.emitEvent(spec.sessionId, 'session/thread-resumed', { threadId })
     }
+    await client.ensureDeveloperInstructions(threadId, spec.codexDeveloperInstructions)
     return { client, threadId }
   }
 
@@ -689,9 +692,9 @@ export class AgentWorker {
    *  in-process does), relays an operator approval, and maps the decision. A HubUnavailableError past the
    *  transient bound declines (safe terminal — the codex approval protocol has no retryable-text channel;
    *  the agent can retry the action). */
-  private async codexApproval(method: string, params: unknown): Promise<Record<string, string>> {
+  private async codexApproval(method: string, params: unknown): Promise<Record<string, unknown>> {
     // Our own agent MCP server needs no prompt (parity with the Claude AUTO_ALLOW set).
-    if (isOwnAgentServerRequest(method, params)) return codexRequestResult(method, true)
+    if (isOwnAgentServerRequest(method, params)) return codexRequestResult(method, true, params)
     const threadId = (params as { threadId?: string } | null)?.threadId
     const sessionId = threadId ? this.sessionForThread(threadId) : undefined
     try {
@@ -699,11 +702,11 @@ export class AgentWorker {
       // "Always allow" button and the hub's allowlist all work for Codex without a second code path.
       const approvalPayload = { ...(params as Record<string, unknown> | null), toolName: codexGrantKey(method) }
       const approved = await this.relayApproval(sessionId ?? 'unattributed', `codex/${method}`, approvalPayload)
-      return codexRequestResult(method, approved)
+      return codexRequestResult(method, approved, params)
     } catch {
       // TODO(step 6): a codex approval in flight across a hub restart is re-flushed by the transport +
       // deduped by the idempotent approvals.request(id); this decline is only the TRUE >45s-orphan terminal.
-      return codexRequestResult(method, false)
+      return codexRequestResult(method, false, params)
     }
   }
 
@@ -801,7 +804,12 @@ export class AgentWorker {
         // Carried so the hub's auto-approve policy can honour a user-configured ask rule.
         matchedAskRule: context?.matchedAskRule,
       })
-      return approved ? { behavior: 'allow', updatedInput: input } : { behavior: 'deny', message: 'denied from hub' }
+      return approved
+        ? { behavior: 'allow', updatedInput: input }
+        : {
+            behavior: 'deny',
+            message: CLAUDE_PERMISSION_DENIED_TEXT,
+          }
     } catch (err) {
       // A hub gone past the transient bound (HubUnavailableError): canUseTool has no retryable-text channel
       // (it can only allow/deny), so fail CLOSED with the retryable text as the deny reason — the agent can

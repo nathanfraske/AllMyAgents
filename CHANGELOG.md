@@ -5,6 +5,44 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.19-alpha.22 — 2026-08-05
+
+This release keeps Claude and Codex connected to their live AllMyAgents role, tool, permission, and bounded
+topology contracts across resumed and compacted conversations, routes otherwise stranded child permission
+prompts to the correct upstream authority, and adds an accessible purpose inspector beside every managed child.
+
+[Full v0.1.19-alpha.22 release notes](docs/releases/v0.1.19-alpha.22.md)
+
+- Claude receives a role-specific AllMyAgents system append on every SDK query, including resumed turns after
+  vendor context compaction. Overseers are directed to the fleet-wide app tools, managers to the real child/team
+  tools, and managed workers to their persisted upstream reporting path.
+- Codex receives the equivalent contract through the app-server's supported thread developer-instruction seam.
+  Changed topology is refreshed on a loaded thread, and a completed compaction forces reassertion on the next
+  turn instead of depending on one-time `AGENTS.md` discovery.
+- Compaction now preserves the active objective, project and slice, scope, constraints, acceptance criteria,
+  verified progress, current work, blockers, durable artifacts, team assignments, and exact next action. Codex
+  receives a complete `compact_prompt`; Claude's compactor receives the same continuity contract through its
+  per-query system append. Refreshing the local instruction cache never clears either vendor's thread or summary.
+- Existing Overseer conversations migrate in place to capability contract v4, retaining account binding,
+  history, and identity while receiving the durable provider-native discovery and permission-routing contract.
+- Managers receive exact active/stashed team state plus bounded child ID/name/status mappings. Overseers receive
+  a capped seven-day fleet/project index, with active work and explicitly mentioned projects included, and must
+  refresh mentioned projects through live status/list/peek tools before reporting or acting.
+- Manager guidance pushes independent work across the requested active-team capacity. Claude managers are
+  guarded against passive/meandering holding loops; Codex managers are guarded against unbounded investigation,
+  benign-noise escalation, scope growth, and consuming the whole context after acceptance criteria pass.
+- A child approval first reaches a capable direct manager. If that manager cannot decide or receive it, the
+  request is surfaced to the available Overseer with its exact bounded action and reason for escalation; only a
+  direct operator turn can approve through the privileged control plane.
+- Provider-specific denial feedback prevents prose/user-question permission loops and tells delegated agents to
+  report the precise blocked action upstream while continuing unblocked work. Codex `request_permissions` now
+  receives the documented granted subset rather than the incompatible command-approval response shape.
+- Managed-child rows in both the sidebar and Project Overview now include a compact information control. Hover,
+  keyboard focus, or click reveals the full configured purpose without navigating away or opening the chat.
+- Release verification also hardens the attachment test harness against WHATWG-forbidden ephemeral ports and
+  drains its queued bus callback before teardown, removing a Windows-only false failure without weakening the
+  production path or assertions.
+
 ## v0.1.18-alpha.21 — 2026-08-05
 
 This release makes journal lineage publication crash-atomic and recoverable, teaches the supervisor to

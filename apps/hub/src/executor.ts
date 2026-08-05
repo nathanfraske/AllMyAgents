@@ -25,6 +25,7 @@ import type { PracticeStore } from './practices.js'
 import type { BusAddress, BusMessage } from './bus.js'
 import type { ClaudeLimitInfo, DangerFlags, SessionStatus } from './types.js'
 import {
+  CLAUDE_PERMISSION_DENIED_TEXT,
   InvalidQuestionCorrelationError,
   stableQuestionId,
   type LiveSession,
@@ -408,14 +409,14 @@ export class InProcessExecutor implements Executor {
         },
         async (method, params) => {
           // Our own agent MCP server needs no prompt (parity with the Claude AUTO_ALLOW set).
-          if (isOwnAgentServerRequest(method, params)) return codexRequestResult(method, true)
+          if (isOwnAgentServerRequest(method, params)) return codexRequestResult(method, true, params)
           const threadId = (params as { threadId?: string } | null)?.threadId
           const sessionId = threadId ? this.sessionIdForThread(threadId) : undefined
           // Same normalisation as the worker path: Codex approvals carry no toolName, and every
           // downstream consumer (card title, Always allow, allowlist policy) keys on one.
           const approvalPayload = { ...(params as Record<string, unknown> | null), toolName: codexGrantKey(method) }
           const approved = await this.services.approvals.request(sessionId ?? 'unattributed', `codex/${method}`, approvalPayload)
-          return codexRequestResult(method, approved)
+          return codexRequestResult(method, approved, params)
         },
         wsl,
       )
@@ -539,7 +540,10 @@ export class InProcessExecutor implements Executor {
           })
           return approved
             ? { behavior: 'allow', updatedInput: input }
-            : { behavior: 'deny', message: 'denied from hub' }
+            : {
+                behavior: 'deny',
+                message: CLAUDE_PERMISSION_DENIED_TEXT,
+              }
         },
         // Per-session in-process MCP server: the inter-agent bus + shared-memory tools, bound to this
         // session's identity so every call is attributed to the real caller.
@@ -554,7 +558,7 @@ export class InProcessExecutor implements Executor {
 
   async startThread(spec: WorkerSessionSpec): Promise<string> {
     const client = this.codexClientFor(spec.profileId, spec.profileDir, spec.wsl)
-    const threadId = await client.startThread(spec.cwd)
+    const threadId = await client.startThread(spec.cwd, spec.codexDeveloperInstructions)
     this.codexThreads.set(spec.sessionId, threadId)
     this.codexSessionClients.set(spec.sessionId, client)
     return threadId
@@ -566,11 +570,12 @@ export class InProcessExecutor implements Executor {
     let threadId = this.codexThreads.get(spec.sessionId)
     if (!threadId) {
       if (!spec.vendorSessionId) throw new Error('codex session has no persisted thread id')
-      await client.resumeThread(spec.vendorSessionId)
+      await client.resumeThread(spec.vendorSessionId, spec.codexDeveloperInstructions)
       threadId = spec.vendorSessionId
       this.codexThreads.set(spec.sessionId, threadId)
       this.h.journal(spec.sessionId, 'session/thread-resumed', { threadId })
     }
+    await client.ensureDeveloperInstructions(threadId, spec.codexDeveloperInstructions)
     return { client, threadId }
   }
 
@@ -680,6 +685,7 @@ export class InProcessExecutor implements Executor {
           model: spec.model,
           permissionMode: spec.permissionMode,
           effort: spec.effort,
+          systemPrompt: spec.claudeSystemPrompt,
           trustProjectConfig: spec.trustProjectConfig,
         },
         attachments

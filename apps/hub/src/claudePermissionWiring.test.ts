@@ -72,6 +72,26 @@ describe('ClaudeDriver permission wiring', () => {
     expect(typeof captured[0]!.canUseTool).toBe('function')
   })
 
+  it('appends the AllMyAgents host contract at the system boundary on every resumed invocation', async () => {
+    const driver = makeDriver(async () => ({ behavior: 'allow', updatedInput: {} }))
+    driver.restore('claude-resume-id')
+    const reminder = 'Use mcp__allmyagents__overseer_control and inspect the live schema after compaction.'
+
+    await driver.send('first', { systemPrompt: reminder })
+    await driver.send('second', { systemPrompt: reminder })
+
+    expect(captured).toHaveLength(2)
+    for (const options of captured) {
+      expect(options.resume).toBe('claude-resume-id')
+      expect(options.systemPrompt).toEqual({
+        type: 'preset',
+        preset: 'claude_code',
+        append: reminder,
+      })
+      expect(options.appendSubagentSystemPrompt).toBe(reminder)
+    }
+  })
+
   it('passes the handler decision through unchanged, including a denial', async () => {
     // Parameters are declared so the mock's recorded call tuple is typed — a zero-arg vi.fn infers
     // `calls: []`, and destructuring one is a compile error rather than a test failure.
