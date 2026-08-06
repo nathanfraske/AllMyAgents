@@ -1137,6 +1137,31 @@ export function startServer(opts: ServerOptions): http.Server {
         )
         return
       }
+      const projectGitHubPolicyMatch = /^\/api\/projects\/([^/]+)\/github-automation$/.exec(url.pathname)
+      if ((method === 'GET' || method === 'POST') && projectGitHubPolicyMatch) {
+        const projectId = decodeURIComponent(projectGitHubPolicyMatch[1] as string)
+        try {
+          if (method === 'GET') {
+            json(res, sessions.githubAutomationPolicy('project', projectId))
+            return
+          }
+          // A standing remote-mutation grant is stronger than an ordinary settings write. Require the
+          // owner device token even on deployments that leave broad local API token enforcement off.
+          if (!authed) {
+            json(res, { error: 'operator device token required' }, 403)
+            return
+          }
+          const body = await readBody(req)
+          const capabilities = stringArray(body.capabilities, 'capabilities')
+          json(
+            res,
+            sessions.configureGitHubAutomationPolicy('project', projectId, capabilities, 'operator'),
+          )
+        } catch (error) {
+          json(res, { error: error instanceof Error ? error.message : String(error) }, 400)
+        }
+        return
+      }
       // Optional GitHub import. Capability detection is intentionally lazy: a GitHub-less/offline first
       // run never invokes `gh`, makes a network request, or waits on this feature.
       if (method === 'GET' && url.pathname === '/api/github/capability') {
@@ -2188,6 +2213,29 @@ export function startServer(opts: ServerOptions): http.Server {
             ? sessions.disallowTool(allowToolMatch[1] as string, toolName)
             : sessions.allowTool(allowToolMatch[1] as string, toolName)
         json(res, record)
+        return
+      }
+      const sessionGitHubPolicyMatch = /^\/api\/sessions\/([^/]+)\/github-automation$/.exec(url.pathname)
+      if ((method === 'GET' || method === 'POST') && sessionGitHubPolicyMatch) {
+        const sessionId = decodeURIComponent(sessionGitHubPolicyMatch[1] as string)
+        try {
+          if (method === 'GET') {
+            json(res, sessions.githubAutomationPolicy('session', sessionId))
+            return
+          }
+          if (!authed) {
+            json(res, { error: 'operator device token required' }, 403)
+            return
+          }
+          const body = await readBody(req)
+          const capabilities = stringArray(body.capabilities, 'capabilities')
+          json(
+            res,
+            sessions.configureGitHubAutomationPolicy('session', sessionId, capabilities, 'operator'),
+          )
+        } catch (error) {
+          json(res, { error: error instanceof Error ? error.message : String(error) }, 400)
+        }
         return
       }
       // Remote-machine authority is deliberately separate from permission mode and tool allowlists.

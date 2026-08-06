@@ -2,7 +2,12 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/svelte'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import PermissionPicker from './PermissionPicker.svelte'
 
-const apiMock = vi.hoisted(() => ({ setMode: vi.fn(), allowTool: vi.fn() }))
+const apiMock = vi.hoisted(() => ({
+  setMode: vi.fn(),
+  allowTool: vi.fn(),
+  sessionGitHubAutomation: vi.fn(),
+  setSessionGitHubAutomation: vi.fn(),
+}))
 
 vi.mock('./api', async (original) => {
   const actual = await original<typeof import('./api')>()
@@ -12,6 +17,20 @@ vi.mock('./api', async (original) => {
 beforeEach(() => {
   apiMock.setMode.mockReset().mockResolvedValue({ ok: true })
   apiMock.allowTool.mockReset().mockResolvedValue({ ok: true })
+  apiMock.sessionGitHubAutomation.mockReset().mockResolvedValue({
+    scope: 'session',
+    targetId: 'child',
+    capabilities: [],
+    updatedAt: '',
+  })
+  apiMock.setSessionGitHubAutomation.mockReset().mockImplementation(
+    async (id: string, capabilities: string[]) => ({
+      scope: 'session',
+      targetId: id,
+      capabilities,
+      updatedAt: new Date().toISOString(),
+    }),
+  )
 })
 
 afterEach(cleanup)
@@ -74,5 +93,20 @@ describe('managed permission boundaries', () => {
     await fireEvent.click(screen.getByTitle('Permission mode: Edits · operator override'))
     expect(screen.getByText(/explicitly extended this child to full/i)).toBeTruthy()
     expect(screen.getByText(/sibling grants are unchanged/i)).toBeTruthy()
+  })
+
+  it('configures a narrow exact-chat GitHub grant without always-allowing Bash', async () => {
+    render(PermissionPicker, {
+      props: { sessionId: 'manager', mode: 'safe' },
+    })
+
+    await fireEvent.click(screen.getByTitle('Permission mode: Safe'))
+    const pullRequests = await screen.findByRole('checkbox', { name: 'PR work' })
+    await fireEvent.click(pullRequests)
+
+    expect(apiMock.setSessionGitHubAutomation).toHaveBeenCalledWith('manager', ['pull_requests'])
+    expect(apiMock.allowTool).not.toHaveBeenCalled()
+    expect(screen.getByText(/project chats stay bound to their remote/i)).toBeTruthy()
+    expect(screen.getByText(/Overseer use remains direct-operator only/i)).toBeTruthy()
   })
 })

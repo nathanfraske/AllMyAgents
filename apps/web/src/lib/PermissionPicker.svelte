@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { api } from './api'
+  import { api, type GitHubAutomationCapability } from './api'
   import Icon from './Icon.svelte'
 
   // `allowedTools` are the per-chat "always allow" grants made from an approval prompt. They are listed
@@ -31,6 +31,19 @@
   let open = $state(false)
   let revokeError = $state<string | null>(null)
   let modeError = $state<string | null>(null)
+  let githubCapabilities = $state<GitHubAutomationCapability[]>([])
+  let githubLoaded = $state(false)
+  let githubLoadedFor = $state('')
+  let githubStateSessionId = $state('')
+  let githubBusy = $state<GitHubAutomationCapability | null>(null)
+  let githubError = $state<string | null>(null)
+
+  const GITHUB_CAPABILITIES: Array<{ id: GitHubAutomationCapability; label: string }> = [
+    { id: 'pull_requests', label: 'PR work' },
+    { id: 'pull_request_merges', label: 'PR merges' },
+    { id: 'workflow_runs', label: 'Actions runs' },
+    { id: 'repository_pushes', label: 'Non-force pushes' },
+  ]
 
   const MODES = [
     { id: 'safe', icon: 'lock', label: 'Safe', desc: 'ask before every tool' },
@@ -70,6 +83,58 @@
     }
     onchange?.(id, operatorOverride)
     open = false
+  }
+
+  async function loadGitHubPolicy(): Promise<void> {
+    if (!open || (githubLoaded && githubLoadedFor === sessionId)) return
+    const requestedSessionId = sessionId
+    githubError = null
+    try {
+      const policy = await api.sessionGitHubAutomation(requestedSessionId)
+      if (sessionId !== requestedSessionId) return
+      githubCapabilities = [...policy.capabilities]
+      githubLoaded = true
+      githubLoadedFor = requestedSessionId
+    } catch (cause) {
+      if (sessionId !== requestedSessionId) return
+      githubError = cause instanceof Error ? cause.message : String(cause)
+    }
+  }
+
+  $effect(() => {
+    if (githubStateSessionId !== sessionId) {
+      githubStateSessionId = sessionId
+      githubCapabilities = []
+      githubLoaded = false
+      githubLoadedFor = ''
+      githubBusy = null
+      githubError = null
+    }
+    if (open && (!githubLoaded || githubLoadedFor !== sessionId)) void loadGitHubPolicy()
+  })
+
+  async function toggleGitHub(capability: GitHubAutomationCapability): Promise<void> {
+    if (githubBusy) return
+    const targetSessionId = sessionId
+    const previous = [...githubCapabilities]
+    const next = previous.includes(capability)
+      ? previous.filter((item) => item !== capability)
+      : [...previous, capability]
+    githubCapabilities = next
+    githubBusy = capability
+    githubError = null
+    try {
+      const policy = await api.setSessionGitHubAutomation(targetSessionId, next)
+      if ('error' in policy) throw new Error(policy.error)
+      if (sessionId !== targetSessionId) return
+      githubCapabilities = [...policy.capabilities]
+    } catch (cause) {
+      if (sessionId !== targetSessionId) return
+      githubCapabilities = previous
+      githubError = cause instanceof Error ? cause.message : String(cause)
+    } finally {
+      if (sessionId === targetSessionId) githubBusy = null
+    }
   }
 
   /** Revoke an "always allow" grant so the tool prompts again. Surfaces failure instead of silently
@@ -115,6 +180,25 @@
         {/each}
         {#if revokeError}<div class="gerr">{revokeError}</div>{/if}
       {/if}
+      <div class="sep"></div>
+      <div class="grouphead dim">GitHub automation Â· this chat only</div>
+      <div class="policy-note dim">Narrow standing grants; project chats stay bound to their remote. Overseer use remains direct-operator only.</div>
+      {#if !githubLoaded && !githubError}
+        <div class="policy-note dim">Loadingâ€¦</div>
+      {:else}
+        {#each GITHUB_CAPABILITIES as capability (capability.id)}
+          <label class="github-grant">
+            <input
+              type="checkbox"
+              checked={githubCapabilities.includes(capability.id)}
+              disabled={githubBusy !== null}
+              onchange={() => void toggleGitHub(capability.id)}
+            />
+            <span>{capability.label}</span>
+          </label>
+        {/each}
+      {/if}
+      {#if githubError}<div class="gerr">GitHub policy failed: {githubError}</div>{/if}
     </div>
   {/if}
 </div>
@@ -129,7 +213,7 @@
   .lead { display: inline-grid; color: var(--muted); }
   .chev { display: inline-grid; opacity: 0.6; }
   .scrim { position: fixed; inset: 0; background: transparent; border: none; z-index: 10; }
-  .menu { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 11; min-width: 210px; background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: var(--r-lg); padding: var(--space-1); box-shadow: var(--shadow-3), var(--edge-hi); }
+  .menu { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 11; min-width: 250px; max-height: min(70vh, 540px); overflow-y: auto; background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: var(--r-lg); padding: var(--space-1); box-shadow: var(--shadow-3), var(--edge-hi); }
   .boundary-note { max-width: 280px; padding: var(--space-2) var(--space-3); color: var(--muted);
     font-size: var(--text-xs); line-height: 1.4; border-bottom: 1px solid var(--border); }
   @media (prefers-reduced-motion: no-preference) { .menu { animation: pop-in var(--dur-fast) var(--ease); } }
@@ -151,4 +235,7 @@
   .revoke { margin-left: auto; font-size: var(--text-xs); color: var(--muted); border: 1px solid var(--border); border-radius: var(--r-sm); padding: 0 var(--space-2); flex: none; }
   .revoke:hover { color: var(--bad-text); border-color: var(--bad); }
   .gerr { font-size: var(--text-xs); color: var(--bad-text); padding: var(--space-1) var(--space-3); }
+  .policy-note { max-width: 275px; padding: 0 var(--space-3) var(--space-2); font-size: .66rem; line-height: 1.35; }
+  .github-grant { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-1) var(--space-3); cursor: pointer; font-size: var(--text-xs); }
+  .github-grant input { accent-color: var(--accent); }
 </style>

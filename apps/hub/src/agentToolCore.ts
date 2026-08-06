@@ -16,6 +16,10 @@ import type { ElevatedShell, ElevationScope } from './elevatedCommand.js'
 import type { TeamPresetDraft } from './teamPresets.js'
 import type { BrowserOperation, BrowserResultContent } from './browserProtocol.js'
 import type { RemoteDeviceAction, RemoteDeviceActionResult, RemoteDeviceView } from './remoteDevices.js'
+import type {
+  GitHubAutomationCapability,
+  GitHubAutomationPolicyScope,
+} from './githubAutomationPolicy.js'
 
 export interface OverseerControlInput {
   operation:
@@ -45,6 +49,8 @@ export interface OverseerControlInput {
     | 'github_repositories'
     | 'clone_github_repository'
     | 'github_clone_status'
+    | 'get_github_automation_policy'
+    | 'configure_github_automation'
     | 'issue_pairing_code'
     | 'get_elevation_policy'
     | 'configure_elevation'
@@ -89,6 +95,8 @@ export interface OverseerControlInput {
   }
   remoteGrants?: RemoteDeviceGrant[]
   repository?: string
+  githubScope?: GitHubAutomationPolicyScope
+  githubCapabilities?: GitHubAutomationCapability[]
   distro?: string
   elevationScope?: ElevationScope
   allowedPaths?: string[]
@@ -1080,7 +1088,7 @@ const overseerPreset = z.object({
 const overseerControl = defineTool({
   name: 'overseer_control',
   description:
-    'Application Overseer only: explain how AllMyAgents works; inspect fleet failures; configure projects, managers, reusable team presets, chats, accounts, remote-device grants, GitHub imports, mesh pairing, direct peer-Overseer messages, and safe hub restarts. Elevated commands require a configured project policy, blast-radius analysis, a separate explicit operator approval, and (on Windows) UAC. Mutations are denied on teammate-caused turns; a remote Overseer turn may only reply to the same authenticated peer.',
+    'Application Overseer only: explain how AllMyAgents works; inspect fleet failures; configure projects, managers, reusable team presets, chats, accounts, remote-device grants, narrow GitHub automation policies/imports, mesh pairing, direct peer-Overseer messages, and safe hub restarts. GitHub automation can be granted to one exact session or every chat attached to one project, and covers only the explicitly listed PR/workflow/push capabilities. Elevated commands require a configured project policy, blast-radius analysis, a separate explicit operator approval, and (on Windows) UAC. Mutations are denied on teammate-caused turns; a remote Overseer turn may only reply to the same authenticated peer.',
   schema: {
     operation: z.enum([
       'status', 'guide', 'ui_catalog', 'highlight_ui', 'failure_context', 'create_project', 'create_chat', 'send_chat', 'stop_chat',
@@ -1088,7 +1096,8 @@ const overseerControl = defineTool({
       'list_team_presets', 'save_team_preset', 'delete_team_preset', 'launch_team',
       'remote_catalog', 'set_remote_grants', 'list_overseer_peers', 'send_overseer_message',
       'start_account_login', 'github_repositories',
-      'clone_github_repository', 'github_clone_status', 'issue_pairing_code',
+      'clone_github_repository', 'github_clone_status',
+      'get_github_automation_policy', 'configure_github_automation', 'issue_pairing_code',
       'get_elevation_policy', 'configure_elevation', 'analyze_elevated_command',
       'run_elevated_command', 'restart_hub',
     ]),
@@ -1119,6 +1128,10 @@ const overseerControl = defineTool({
       capabilities: z.array(z.enum(['read', 'write', 'terminal'])).min(1).max(3),
     }).strict()).max(32).optional(),
     repository: z.string().max(512).optional(),
+    github_scope: z.enum(['project', 'session']).optional(),
+    github_capabilities: z.array(z.enum([
+      'pull_requests', 'pull_request_merges', 'workflow_runs', 'repository_pushes',
+    ])).max(4).optional(),
     distro: z.string().max(256).optional(),
     elevation_scope: z.enum(['disabled', 'project', 'machine']).optional(),
     allowed_paths: z.array(z.string().min(1).max(4096)).max(15).optional(),
@@ -1160,6 +1173,8 @@ const overseerControl = defineTool({
       managerConfig: args.manager_config,
       remoteGrants: args.remote_grants,
       repository: args.repository,
+      githubScope: args.github_scope,
+      githubCapabilities: args.github_capabilities,
       distro: args.distro,
       elevationScope: args.elevation_scope,
       allowedPaths: args.allowed_paths,
