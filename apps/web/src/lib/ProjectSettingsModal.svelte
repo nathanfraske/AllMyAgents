@@ -1,7 +1,11 @@
 <script lang="ts">
   import Icon from './Icon.svelte'
   import ManagerSetupModal from './ManagerSetupModal.svelte'
-  import { api, type SessionRecord } from './api'
+  import {
+    api,
+    type GitHubAutomationCapability,
+    type SessionRecord,
+  } from './api'
   import { store } from './store.svelte'
   import { profileOptionLabel } from './profileLabel'
 
@@ -13,6 +17,21 @@
   let saving = $state(false)
   let error = $state('')
   let saved = $state('')
+  let githubCapabilities = $state<GitHubAutomationCapability[]>([])
+  let savedGithubCapabilities = $state<GitHubAutomationCapability[]>([])
+  let githubLoading = $state(false)
+  let githubSaving = $state(false)
+
+  const GITHUB_CAPABILITIES: Array<{
+    id: GitHubAutomationCapability
+    label: string
+    description: string
+  }> = [
+    { id: 'pull_requests', label: 'Pull-request work', description: 'Create, edit, comment on, review, close, reopen, and inspect PRs.' },
+    { id: 'pull_request_merges', label: 'Merge pull requests', description: 'Merge remains separate because it changes the protected branch.' },
+    { id: 'workflow_runs', label: 'GitHub Actions runs', description: 'Dispatch, inspect, rerun, or cancel workflow runs.' },
+    { id: 'repository_pushes', label: 'Repository pushes', description: 'Allow each single non-force push to origin; force/delete pushes and active hooks still ask.' },
+  ]
 
   const project = $derived(store.projects.find((item) => item.id === projectId))
   const manager = $derived(
@@ -28,7 +47,51 @@
     if (!project || loadedProjectId === project.id) return
     loadedProjectId = project.id
     name = project.name
+    void loadGitHubPolicy(project.id)
   })
+
+  async function loadGitHubPolicy(id: string): Promise<void> {
+    githubLoading = true
+    try {
+      const policy = await api.projectGitHubAutomation(id)
+      githubCapabilities = [...policy.capabilities]
+      savedGithubCapabilities = [...policy.capabilities]
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : String(cause)
+    } finally {
+      githubLoading = false
+    }
+  }
+
+  function toggleGitHubCapability(capability: GitHubAutomationCapability): void {
+    githubCapabilities = githubCapabilities.includes(capability)
+      ? githubCapabilities.filter((item) => item !== capability)
+      : [...githubCapabilities, capability]
+  }
+
+  function sameGitHubCapabilities(): boolean {
+    return [...githubCapabilities].sort().join(',') === [...savedGithubCapabilities].sort().join(',')
+  }
+
+  async function saveGitHubPolicy(): Promise<void> {
+    if (!project) return
+    error = ''
+    saved = ''
+    githubSaving = true
+    try {
+      const policy = await api.setProjectGitHubAutomation(project.id, githubCapabilities)
+      if ('error' in policy) throw new Error(policy.error)
+      githubCapabilities = [...policy.capabilities]
+      savedGithubCapabilities = [...policy.capabilities]
+      saved = policy.capabilities.length
+        ? 'GitHub automation policy saved.'
+        : 'GitHub automation policy revoked.'
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : String(cause)
+    } finally {
+      githubSaving = false
+    }
+  }
 
   async function saveProject(): Promise<void> {
     if (!project) return
@@ -102,6 +165,40 @@
             <div class="fixed-path">WSL · {project.location.distro} · {project.location.linuxPath}</div>
           </div>
         {/if}
+        <div class="github-policy">
+          <div>
+            <span class="field-title">GitHub automation</span>
+            <small>
+              Always allow only these recognized operations for every chat attached to this project,
+              including manager-driven turns. Commands remain confined to this project's live GitHub
+              remote. Generic Bash, <code>gh api</code>, auth/secrets, repository administration,
+              composed shell commands, and force/delete pushes still ask.
+            </small>
+          </div>
+          {#if githubLoading}
+            <div class="policy-loading">Loading policyâ€¦</div>
+          {:else}
+            <div class="policy-options">
+              {#each GITHUB_CAPABILITIES as capability (capability.id)}
+                <label class="policy-option">
+                  <input
+                    type="checkbox"
+                    checked={githubCapabilities.includes(capability.id)}
+                    onchange={() => toggleGitHubCapability(capability.id)}
+                  />
+                  <span><b>{capability.label}</b><small>{capability.description}</small></span>
+                </label>
+              {/each}
+            </div>
+            <button
+              class="secondary"
+              disabled={githubSaving || sameGitHubCapabilities()}
+              onclick={saveGitHubPolicy}
+            >
+              {githubSaving ? 'Savingâ€¦' : 'Save GitHub automation'}
+            </button>
+          {/if}
+        </div>
         {#if error}<p class="error" role="alert">{error}</p>{/if}
         {#if saved}<p class="saved" role="status">{saved}</p>{/if}
         <button class="primary" disabled={saving || name.trim() === project.name} onclick={saveProject}>
@@ -173,6 +270,18 @@
   .primary { color: white; background: var(--accent); }
   .primary:disabled { opacity: .45; }
   .secondary { color: var(--text); border: 1px solid var(--border); background: var(--surface-2); }
+  .secondary:disabled { opacity: .45; }
+  .github-policy { display: grid; gap: .7rem; padding: .85rem; border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--surface-2); }
+  .github-policy > div:first-child { display: grid; gap: .35rem; }
+  .field-title { font-size: var(--text-xs); font-weight: var(--fw-semibold); }
+  .github-policy code { color: var(--text-dim); font-family: var(--mono); }
+  .policy-options { display: grid; gap: .45rem; }
+  .policy-option { display: grid; grid-template-columns: auto 1fr; align-items: start; gap: .58rem; padding: .55rem; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-1); cursor: pointer; }
+  .policy-option input { width: auto; margin-top: .15rem; accent-color: var(--accent); }
+  .policy-option span { display: grid; gap: .12rem; }
+  .policy-option b { font-size: var(--text-xs); }
+  .policy-option small { font-weight: var(--fw-normal); }
+  .policy-loading { color: var(--dim); font-size: var(--text-xs); }
   .error { margin: 0; color: var(--danger); }
   .saved, .manager-saved { margin: 0; color: var(--ok); font-size: var(--text-xs); }
   .manager-form { position: relative; }

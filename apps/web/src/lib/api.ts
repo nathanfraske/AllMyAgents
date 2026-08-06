@@ -154,6 +154,19 @@ export interface GitHubCapability {
   reason?: string
 }
 
+export type GitHubAutomationCapability =
+  | 'pull_requests'
+  | 'pull_request_merges'
+  | 'workflow_runs'
+  | 'repository_pushes'
+
+export interface GitHubAutomationPolicy {
+  scope: 'project' | 'session'
+  targetId: string
+  capabilities: GitHubAutomationCapability[]
+  updatedAt: string
+}
+
 export interface GitHubRepository {
   nameWithOwner: string
   name: string
@@ -1212,6 +1225,17 @@ export const api = {
     const value = await routedPost<ProjectInfo | ApiError>(id, (raw) => `/api/projects/${encodeURIComponent(raw)}/settings`, patch)
     return namespaceProjectResult(target, value)
   },
+  projectGitHubAutomation: (id: string) =>
+    routedGet<GitHubAutomationPolicy>(
+      id,
+      (raw) => `/api/projects/${encodeURIComponent(raw)}/github-automation`,
+    ),
+  setProjectGitHubAutomation: (id: string, capabilities: GitHubAutomationCapability[]) =>
+    routedPost<GitHubAutomationPolicy | ApiError>(
+      id,
+      (raw) => `/api/projects/${encodeURIComponent(raw)}/github-automation`,
+      { capabilities },
+    ),
   createManagedProject: (name: string, distro?: string) =>
     jpost<ProjectInfo | { error: string }>('/api/projects/managed', {
       name,
@@ -1481,6 +1505,17 @@ export const api = {
   /** "Always allow this tool in this chat" (allow=false revokes). Takes effect on the next tool call. */
   allowTool: (id: string, toolName: string, allow = true) =>
     routedSessionPost(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/allow-tool`, { toolName, allow }),
+  sessionGitHubAutomation: (id: string) =>
+    routedGet<GitHubAutomationPolicy>(
+      id,
+      (raw) => `/api/sessions/${encodeURIComponent(raw)}/github-automation`,
+    ),
+  setSessionGitHubAutomation: (id: string, capabilities: GitHubAutomationCapability[]) =>
+    routedPost<GitHubAutomationPolicy | ApiError>(
+      id,
+      (raw) => `/api/sessions/${encodeURIComponent(raw)}/github-automation`,
+      { capabilities },
+    ),
   remoteDeviceCatalog: (id: string) =>
     routedGet<RemoteDeviceCatalogEntry[]>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/remote-devices`),
   setRemoteDeviceGrants: (id: string, grants: RemoteDeviceGrant[]) =>

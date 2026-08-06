@@ -97,30 +97,33 @@ describe('application Overseer authority', () => {
       status: 'idle',
       createdAt: '2026-07-01T00:00:00.000Z',
       isOverseer: true,
-      overseerCapabilityVersion: 3,
+      overseerCapabilityVersion: 4,
       permissionMode: 'safe',
     })
 
     h.sessions.loadRecords()
     const loadedLegacy = h.store.all().find((record) => record.id === 'legacy-overseer')
     expect(loadedLegacy).toMatchObject({ permissionMode: 'safe' })
-    expect(loadedLegacy?.overseerCapabilityVersion).toBe(3)
+    expect(loadedLegacy?.overseerCapabilityVersion).toBe(4)
     expect(h.journal.recentEventsForSession('legacy-overseer', 20)).toEqual([])
 
     h.sessions.reconcileStale()
 
     expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
       isOverseer: true,
-      overseerCapabilityVersion: 4,
+      overseerCapabilityVersion: 5,
       permissionMode: 'full',
       permissionModeOperatorOverride: true,
       role: 'Application Overseer',
     })
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
-      'Overseer capability manifest version 4',
+      'Overseer capability manifest version 5',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'mcp__allmyagents__overseer_control',
+    )
+    expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
+      'configure_github_automation',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'Do not use the vendor-native list_agents or peek_agent',
@@ -129,8 +132,8 @@ describe('application Overseer authority', () => {
       .filter((event) => event.kind === 'overseer/capabilities-upgraded')
     expect(upgrades()).toHaveLength(1)
     expect(upgrades()[0]?.payload).toMatchObject({
-      fromVersion: 3,
-      toVersion: 4,
+      fromVersion: 4,
+      toVersion: 5,
       conversationPreserved: true,
       tools: expect.arrayContaining(['overseer_control', 'remote_exec', 'browser_navigate']),
     })
@@ -588,6 +591,52 @@ describe('application Overseer authority', () => {
     ]))
     h.approvals.resolve(pending.id, false)
     await expect(decision).resolves.toBe(false)
+  })
+
+  it('lets a direct operator configure narrow project or exact-session GitHub automation', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'manager', isProjectManager: true, permissionMode: 'safe' })
+    const projectId = h.projects.create('GitHub Policy Lab', h.root).id
+
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'configure_github_automation',
+      githubScope: 'project',
+      projectId,
+      githubCapabilities: ['pull_requests', 'workflow_runs'],
+    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/direct operator turn/u) })
+
+    h.markOperator('overseer')
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'configure_github_automation',
+      githubScope: 'project',
+      projectId,
+      githubCapabilities: ['pull_requests', 'workflow_runs'],
+    })).resolves.toMatchObject({
+      ok: true,
+      data: { scope: 'project', targetId: projectId, capabilities: ['pull_requests', 'workflow_runs'] },
+    })
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'configure_github_automation',
+      githubScope: 'session',
+      sessionId: 'manager',
+      githubCapabilities: ['pull_request_merges'],
+    })).resolves.toMatchObject({
+      ok: true,
+      data: { scope: 'session', targetId: 'manager', capabilities: ['pull_request_merges'] },
+    })
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'get_github_automation_policy', githubScope: 'session', sessionId: 'manager',
+    })).resolves.toMatchObject({
+      ok: true,
+      data: { capabilities: ['pull_request_merges'] },
+    })
+    expect(h.journal.recentEventsForSession('manager', 20)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'github-automation/policy-configured',
+        payload: expect.objectContaining({ actor: 'overseer:overseer' }),
+      }),
+    ]))
   })
 
   it('requires configured scope, a separate operator approval, and the elevation runner', async () => {

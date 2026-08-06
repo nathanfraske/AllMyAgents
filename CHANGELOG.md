@@ -5,6 +5,33 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.20-alpha.23 — 2026-08-05
+
+This release adds durable, operator-owned GitHub automation grants for managers, managed workers,
+scratchpads, and the Overseer without turning Full Access or a broad shell allow-list into implicit
+GitHub authority. The policy is available at project or exact-chat scope, enforced through the shared
+Claude/Codex approval chokepoint, and fully journaled for later audit.
+
+[Full v0.1.20-alpha.23 release notes](docs/releases/v0.1.20-alpha.23.md)
+
+- Added durable, operator-owned GitHub automation policies at both project and exact-chat scope. Project
+  grants follow manager/team rotations; exact-chat grants cover one manager, worker, scratchpad, or Overseer.
+  Both are configurable from the access picker, project settings, authenticated API, or a direct-operator
+  Overseer control turn.
+- GitHub automation is split into pull-request work, pull-request merges, workflow runs, and repository
+  pushes. It applies to manager/teammate-driven turns without widening Full Access or always-allowing Bash,
+  while Overseer use remains restricted to a positively identified direct operator turn. Every policy change
+  and auto-approved use remains journaled.
+- The closed operation classifier fails back to an operator prompt for `gh api`, authentication, secrets,
+  repository administration, workflow enable/disable, admin merges, shell chaining/substitution/redirection,
+  file-upload/download convenience flags, implicit PR-creation pushes, unknown tools/verbs, cross-project
+  repository selectors, local `gh`/`git` lookalikes, force/delete pushes, non-origin or alternate push
+  destinations, implicit/multi-ref pushes, repository-controlled Git execution settings, and repositories
+  with active/custom Git hooks.
+- Existing Overseer conversations migrate in place to capability contract v5 so Claude and Codex discover
+  the new `get_github_automation_policy` and `configure_github_automation` operations after restart or
+  compaction instead of depending on an old remembered tool inventory.
+
 ## v0.1.19-alpha.22 — 2026-08-05
 
 This release keeps Claude and Codex connected to their live AllMyAgents role, tool, permission, and bounded

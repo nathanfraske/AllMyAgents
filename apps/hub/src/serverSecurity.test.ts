@@ -157,6 +157,7 @@ async function build() {
     executor,
     configPath,
     overseer,
+    projects,
     root,
     publicPort: address.port,
   }
@@ -167,6 +168,47 @@ function auth(token: string): HeadersInit {
 }
 
 describe('device-authenticated control plane', () => {
+  it('persists GitHub automation only through authenticated project/session policy routes', async () => {
+    const { base, deviceToken, projects, record, root, sessions, journal } = await build()
+    const project = projects.create('Policy project', root)
+    const url = `${base}/api/projects/${project.id}/github-automation`
+    const body = JSON.stringify({ capabilities: ['pull_requests', 'workflow_runs'] })
+
+    const unauthenticated = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body,
+    })
+    expect(unauthenticated.status).toBe(401)
+    expect(sessions.githubAutomationPolicy('project', project.id).capabilities).toEqual([])
+
+    const configured = await fetch(url, {
+      method: 'POST',
+      headers: { ...auth(deviceToken), 'content-type': 'application/json' },
+      body,
+    })
+    expect(configured.status).toBe(200)
+    expect(await configured.json()).toMatchObject({
+      scope: 'project', targetId: project.id, capabilities: ['pull_requests', 'workflow_runs'],
+    })
+
+    const sessionConfigured = await fetch(`${base}/api/sessions/${record.id}/github-automation`, {
+      method: 'POST',
+      headers: { ...auth(deviceToken), 'content-type': 'application/json' },
+      body: JSON.stringify({ capabilities: ['pull_request_merges'] }),
+    })
+    expect(sessionConfigured.status).toBe(200)
+    expect(await sessionConfigured.json()).toMatchObject({
+      scope: 'session', targetId: record.id, capabilities: ['pull_request_merges'],
+    })
+    expect(journal.recentEventsForSession(record.id, 20)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'github-automation/policy-configured',
+        payload: expect.objectContaining({ actor: 'operator' }),
+      }),
+    ]))
+  })
+
   it('allows the packaged UI to preflight authenticated project deletion', async () => {
     const { base } = await build()
 

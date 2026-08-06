@@ -44,12 +44,19 @@ afterEach(() => {
   for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true })
 })
 
-function makeSessions(danger: DangerFlags = SAFE): { sessions: SessionManager; seed: (over?: Partial<SessionRecord>) => SessionRecord } {
+function makeSessions(danger: DangerFlags = SAFE): {
+  sessions: SessionManager
+  projects: ProjectStore
+  dir: string
+  journal: Journal
+  seed: (over?: Partial<SessionRecord>) => SessionRecord
+} {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-autoapprove-'))
   dirs.push(dir)
   const journal = new Journal(path.join(dir, 'hub.db'))
   opened.push(journal)
   const store = new SessionStore(journal.db)
+  const projects = new ProjectStore(journal.db)
   const sessions = new SessionManager(
     journal,
     store,
@@ -57,7 +64,7 @@ function makeSessions(danger: DangerFlags = SAFE): { sessions: SessionManager; s
     new ApprovalService(journal),
     new UsageMonitor(journal, [], {}),
     new WorkspaceManager(path.join(dir, 'wt')),
-    new ProjectStore(journal.db),
+    projects,
     new InstructionStore(journal.db),
     new AgentBus(journal.db),
     new MemoryStore(journal.db),
@@ -81,7 +88,7 @@ function makeSessions(danger: DangerFlags = SAFE): { sessions: SessionManager; s
     ;(sessions as unknown as { sessions: Map<string, SessionRecord> }).sessions.set(record.id, record)
     return record
   }
-  return { sessions, seed }
+  return { sessions, projects, dir, journal, seed }
 }
 
 /** Establish operator provenance for the in-flight turn, exactly as send() does. */
@@ -350,6 +357,362 @@ describe('SessionManager.isAutoApproved — full access is not a blanket yes', (
     sessions.allowTool('s1', 'Bash')
     sessions.disallowTool('s1', 'Bash')
     expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(false)
+  })
+})
+
+describe('operator-owned GitHub automation policy', () => {
+  const claudeCommand = (command: string, extra: Record<string, unknown> = {}) => ({
+    toolName: 'Bash',
+    input: { command },
+    ...extra,
+  })
+
+  function createGitHubProject() {
+    const harness = makeSessions()
+    execFileSync('git', ['init'], { cwd: harness.dir, stdio: 'ignore' })
+    execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/acme/widget.git'], {
+      cwd: harness.dir,
+      stdio: 'ignore',
+    })
+    const project = harness.projects.create('Widget', harness.dir)
+    const record = harness.seed({
+      permissionMode: 'safe',
+      projectId: project.id,
+      cwd: harness.dir,
+      repo: harness.dir,
+      isProjectManager: true,
+    })
+    return { ...harness, project, record }
+  }
+
+  it('lets an exact manager session perform granted PR work on a manager-driven turn', () => {
+    const { sessions, seed, journal } = makeSessions()
+    seed({ permissionMode: 'safe', isProjectManager: true })
+    sessions.configureGitHubAutomationPolicy('session', 's1', ['pull_requests'], 'operator')
+    markBusTurn(sessions, 's1')
+
+    expect(
+      sessions.isAutoApproved(
+        's1',
+        'claude/tool',
+        claudeCommand('gh pr comment 42 --body "Bounded fix"'),
+      ),
+    ).toBe(true)
+    expect(
+      [...journal.replay(0)].some(
+        (event) => event.sessionId === 's1' && event.kind === 'github-automation/auto-approved',
+      ),
+    ).toBe(true)
+  })
+
+  it('uses the same bounded policy for Codex command approvals and their PowerShell envelope', () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'safe', isProjectManager: true, provider: 'codex' })
+    sessions.configureGitHubAutomationPolicy('session', 's1', ['pull_requests'], 'operator')
+    markBusTurn(sessions, 's1')
+
+    expect(
+      sessions.isAutoApproved('s1', 'codex/item/commandExecution/requestApproval', {
+        toolName: 'commandExecution',
+        command: [
+          'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+          '-Command',
+          'gh pr comment 42 --body tested',
+        ],
+        commandActions: [{ command: 'gh pr comment 42 --body tested' }],
+      }),
+    ).toBe(true)
+    expect(
+      sessions.isAutoApproved('s1', 'codex/item/commandExecution/requestApproval', {
+        toolName: 'commandExecution',
+        commandActions: [{ command: 'gh pr comment 42 --body tested && gh repo delete acme/widget' }],
+      }),
+    ).toBe(false)
+  })
+
+  it('keeps an Overseer grant direct-operator-only so peer/diagnostic turns cannot mutate GitHub', () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'safe', isOverseer: true })
+    sessions.configureGitHubAutomationPolicy('session', 's1', ['pull_requests'], 'operator')
+
+    markBusTurn(sessions, 's1')
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', claudeCommand('gh pr comment 42 --body fix')),
+    ).toBe(false)
+
+    ;(sessions as unknown as { busTurnSessions: Set<string> }).busTurnSessions.delete('s1')
+    markOperatorTurn(sessions, 's1')
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', claudeCommand('gh pr comment 42 --body fix')),
+    ).toBe(true)
+  })
+
+  it('applies a project grant to a manager turn and confines it to the live project remote', () => {
+    const { sessions, project } = createGitHubProject()
+    sessions.configureGitHubAutomationPolicy('project', project.id, ['pull_requests'], 'operator')
+    markBusTurn(sessions, 's1')
+
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', claudeCommand('gh pr comment 42 --body approved')),
+    ).toBe(true)
+    expect(
+      sessions.isAutoApproved(
+        's1',
+        'claude/tool',
+        claudeCommand('gh pr comment 42 --repo other/repository --body denied'),
+      ),
+    ).toBe(false)
+    expect(
+      sessions.isAutoApproved(
+        's1',
+        'claude/tool',
+        claudeCommand('gh pr comment 42 -Rother/repository --body denied'),
+      ),
+    ).toBe(false)
+    expect(
+      sessions.isAutoApproved(
+        's1',
+        'claude/tool',
+        claudeCommand('gh pr comment 42 -R acme/widget -R other/repository --body denied'),
+      ),
+    ).toBe(false)
+  })
+
+  it('makes an implicit PR-create push explicit by requiring --head to disable pushing and forking', () => {
+    const { sessions, project } = createGitHubProject()
+    sessions.configureGitHubAutomationPolicy('project', project.id, ['pull_requests'], 'operator')
+    markBusTurn(sessions, 's1')
+    const command = claudeCommand('gh pr create --title fix --body tested')
+    expect(sessions.isAutoApproved('s1', 'claude/tool', command)).toBe(false)
+    expect(
+      sessions.isAutoApproved(
+        's1',
+        'claude/tool',
+        claudeCommand('gh pr create --head feature/login --title --body tested'),
+      ),
+    ).toBe(false)
+    expect(
+      sessions.isAutoApproved(
+        's1',
+        'claude/tool',
+        claudeCommand('gh pr comment 42 --body'),
+      ),
+    ).toBe(false)
+
+    expect(
+      sessions.isAutoApproved(
+        's1',
+        'claude/tool',
+        claudeCommand('gh pr create --head feature/login --title fix --body tested'),
+      ),
+    ).toBe(true)
+  })
+
+  it('keeps merge independent from ordinary pull-request work', () => {
+    const { sessions, project } = createGitHubProject()
+    sessions.configureGitHubAutomationPolicy('project', project.id, ['pull_requests'], 'operator')
+    markBusTurn(sessions, 's1')
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', claudeCommand('gh pr merge 42 --squash')),
+    ).toBe(false)
+
+    sessions.configureGitHubAutomationPolicy(
+      'project',
+      project.id,
+      ['pull_requests', 'pull_request_merges'],
+      'operator',
+    )
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', claudeCommand('gh pr merge 42 --squash')),
+    ).toBe(true)
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', claudeCommand('gh pr merge 42 --admin')),
+    ).toBe(false)
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', claudeCommand('gh pr merge 42')),
+    ).toBe(false)
+  })
+
+  it('allows bounded Actions operations but not gh api, auth, secrets, or shell composition', () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'safe', isOverseer: true })
+    sessions.configureGitHubAutomationPolicy('session', 's1', ['workflow_runs'], 'operator')
+    markOperatorTurn(sessions, 's1')
+
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', claudeCommand('gh workflow run ci.yml --ref main')),
+    ).toBe(true)
+    for (const command of [
+      'gh api repos/acme/widget/hooks',
+      'gh auth logout',
+      'gh secret set TOKEN',
+      'gh workflow disable ci.yml',
+      'gh workflow run',
+      'gh run rerun',
+      'gh workflow run ci.yml -F token=@C:\\secrets.txt',
+      'gh run download 123 -D C:\\outside',
+      'gh workflow run ci.yml && gh repo delete acme/widget',
+    ]) {
+      expect(sessions.isAutoApproved('s1', 'claude/tool', claudeCommand(command))).toBe(false)
+    }
+  })
+
+  it('does not let PR convenience flags upload or delete local/user content', () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'safe', isProjectManager: true })
+    sessions.configureGitHubAutomationPolicy('session', 's1', ['pull_requests'], 'operator')
+    markBusTurn(sessions, 's1')
+    for (const command of [
+      'gh pr comment 42 --body-file C:\\secrets.txt',
+      'gh pr comment 42',
+      'gh pr create --title fix --template C:\\secrets.txt',
+      'gh pr comment 42 --delete-last --yes',
+      'C:\\tools\\gh.exe pr comment 42 --body lookalike',
+    ]) {
+      expect(sessions.isAutoApproved('s1', 'claude/tool', claudeCommand(command))).toBe(false)
+    }
+  })
+
+  it('never overrides an explicit ask rule', () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'safe', isProjectManager: true })
+    sessions.configureGitHubAutomationPolicy('session', 's1', ['pull_requests'], 'operator')
+    markBusTurn(sessions, 's1')
+    expect(
+      sessions.isAutoApproved(
+        's1',
+        'claude/tool',
+        claudeCommand('gh pr comment 42 --body fix', {
+          matchedAskRule: { source: 'user_settings', toolName: 'Bash' },
+        }),
+      ),
+    ).toBe(false)
+  })
+
+  it('allows only non-force pushes from the project repository and refuses active hooks', () => {
+    const { sessions, project, dir } = createGitHubProject()
+    sessions.configureGitHubAutomationPolicy('project', project.id, ['repository_pushes'], 'operator')
+    markBusTurn(sessions, 's1')
+
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', claudeCommand('git push -u origin feature/login')),
+    ).toBe(true)
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', claudeCommand('git push --force origin main')),
+    ).toBe(false)
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', claudeCommand('git push feature/login')),
+    ).toBe(false)
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', claudeCommand('git push origin')),
+    ).toBe(false)
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', claudeCommand('./git push origin feature/login')),
+    ).toBe(false)
+    execFileSync('git', ['config', 'remote.origin.pushurl', 'file:///tmp/not-github'], { cwd: dir })
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', claudeCommand('git push origin feature/login')),
+    ).toBe(false)
+    execFileSync('git', ['config', '--unset-all', 'remote.origin.pushurl'], { cwd: dir })
+    execFileSync('git', ['remote', 'set-url', 'origin', 'owner/repository'], { cwd: dir })
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', claudeCommand('git push origin feature/login')),
+    ).toBe(false)
+    execFileSync('git', ['remote', 'set-url', 'origin', 'https://github.com/acme/widget.git'], { cwd: dir })
+    fs.writeFileSync(path.join(dir, 'git.cmd'), '@echo not git')
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', claudeCommand('git push origin feature/login')),
+    ).toBe(false)
+    fs.unlinkSync(path.join(dir, 'git.cmd'))
+    execFileSync('git', ['config', '--local', 'push.pushOption', 'unexpected-server-option'], { cwd: dir })
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', claudeCommand('git push origin feature/login')),
+    ).toBe(false)
+    execFileSync('git', ['config', '--local', '--unset-all', 'push.pushOption'], { cwd: dir })
+    fs.writeFileSync(path.join(dir, '.git', 'hooks', 'pre-push'), '# hook')
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', claudeCommand('git push origin feature/login')),
+    ).toBe(false)
+  })
+
+  it('refuses every Windows repository-local executable that can shadow gh', () => {
+    const { sessions, project, dir } = createGitHubProject()
+    sessions.configureGitHubAutomationPolicy('project', project.id, ['pull_requests'], 'operator')
+    markBusTurn(sessions, 's1')
+    for (const extension of ['.com', '.exe', '.cmd', '.bat', '.ps1']) {
+      const shadow = path.join(dir, `gh${extension}`)
+      fs.writeFileSync(shadow, 'not the GitHub CLI')
+      expect(
+        sessions.isAutoApproved('s1', 'claude/tool', claudeCommand('gh pr view 42')),
+      ).toBe(false)
+      fs.rmSync(shadow)
+    }
+  })
+
+  it('recognizes the official GitHub MCP PR surface but not a generic or lookalike tool', () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'safe', isProjectManager: true })
+    sessions.configureGitHubAutomationPolicy('session', 's1', ['pull_requests'], 'operator')
+    markBusTurn(sessions, 's1')
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', {
+        toolName: 'mcp__github__create_pull_request',
+        input: { owner: 'acme', repo: 'widget', title: 'Fix' },
+      }),
+    ).toBe(true)
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', {
+        toolName: 'mcp__github__delete_repository',
+        input: { owner: 'acme', repo: 'widget' },
+      }),
+    ).toBe(false)
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', {
+        toolName: 'mcp__untrusted__create_pull_request',
+        input: { owner: 'acme', repo: 'widget' },
+      }),
+    ).toBe(false)
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', {
+        toolName: 'mcp__github__create_pull_request',
+        input: { owner: 'acme', repo: 'widget', repository: 'other/repository', title: 'Conflict' },
+      }),
+    ).toBe(false)
+  })
+
+  it('rejects unknown capabilities atomically and supports explicit revocation', () => {
+    const { sessions, seed, journal } = makeSessions()
+    seed({ permissionMode: 'safe', isProjectManager: true })
+    sessions.configureGitHubAutomationPolicy('session', 's1', ['pull_requests'], 'operator')
+    expect(() =>
+      sessions.configureGitHubAutomationPolicy(
+        'session',
+        's1',
+        ['pull_requests', 'repository_admin'],
+        'operator',
+      ),
+    ).toThrow(/may contain only/)
+    expect(sessions.githubAutomationPolicy('session', 's1').capabilities).toEqual(['pull_requests'])
+
+    journal.db.exec(`
+      CREATE TRIGGER reject_github_policy_audit
+      BEFORE INSERT ON events
+      WHEN NEW.kind = 'github-automation/policy-configured'
+      BEGIN
+        SELECT RAISE(ABORT, 'forced audit failure');
+      END;
+    `)
+    expect(() =>
+      sessions.configureGitHubAutomationPolicy('session', 's1', ['workflow_runs'], 'operator'),
+    ).toThrow(/forced audit failure/)
+    expect(sessions.githubAutomationPolicy('session', 's1').capabilities).toEqual(['pull_requests'])
+    journal.db.exec('DROP TRIGGER reject_github_policy_audit')
+
+    sessions.configureGitHubAutomationPolicy('session', 's1', [], 'operator')
+    markBusTurn(sessions, 's1')
+    expect(
+      sessions.isAutoApproved('s1', 'claude/tool', claudeCommand('gh pr comment 42 --body fix')),
+    ).toBe(false)
   })
 })
 
