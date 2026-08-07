@@ -1,7 +1,7 @@
 <script lang="ts">
   import { store } from './store.svelte'
   import { settings } from './settings.svelte'
-  import { api, getFleetSiteToken, type DeviceExecutorCapabilities, type DeviceRootPolicy, type MeshStatus, type Instruction, type Practice, type DangerFlags, type HubPrefs, type LoginAuthMode, type OverseerStatus } from './api'
+  import { api, getFleetSiteToken, type DeviceExecutorCapabilities, type DeviceRootPolicy, type MeshStatus, type Instruction, type Practice, type DangerFlags, type HubPrefs, type LoginAuthMode, type OverseerStatus, type NotificationPreferences, type ElevationBrokerStatus } from './api'
   import ProviderLogo from './ProviderLogo.svelte'
   import Icon from './Icon.svelte'
   import PairingCodeInput from './PairingCodeInput.svelte'
@@ -52,13 +52,71 @@
   let overseerProfileId = $state('')
   let overseerBusy = $state(false)
   let overseerError = $state('')
+  let overseerMode = $state<'standard' | 'tokenmaxxing' | 'eco'>('standard')
+  let overseerModeGuidance = $state('')
+  let overseerModeIdeas = $state('')
+  let overseerModeMaxAgents = $state(2)
+  let overseerModeEffort = $state('low')
+  let overseerModeBusy = $state(false)
+  let overseerModeSaved = $state(false)
+  let notificationPrefs = $state<NotificationPreferences>({
+    managerCompletions: true,
+    overseerCompletions: true,
+    agentCompletions: false,
+    errors: true,
+    approvals: true,
+    stalls: true,
+    journalPressure: true,
+    desktopEnabled: false,
+  })
+  let notificationError = $state('')
+  let notificationSaved = $state(false)
+  let elevationBroker = $state<ElevationBrokerStatus | null>(null)
 
   $effect(() => {
     void api.overseer().then((value) => {
       overseerStatus = value
       if (value.profileId) overseerProfileId = value.profileId
+      loadOverseerModeDraft(value.operatingMode ?? 'standard', value)
     }).catch((error) => (overseerError = error instanceof Error ? error.message : String(error)))
   })
+  $effect(() => {
+    void api.notificationPreferences()
+      .then((value) => (notificationPrefs = value))
+      .catch((error) => (notificationError = error instanceof Error ? error.message : String(error)))
+    void api.elevationBroker().then((value) => (elevationBroker = value)).catch(() => {})
+  })
+
+  async function setNotificationPreferences(patch: Partial<NotificationPreferences>): Promise<void> {
+    notificationError = ''
+    const value = await api.setNotificationPreferences(patch)
+    if ('error' in value) {
+      notificationError = value.error
+      return
+    }
+    notificationPrefs = value
+    notificationSaved = true
+    window.setTimeout(() => (notificationSaved = false), 1_400)
+  }
+
+  async function toggleDesktopNotifications(enabled: boolean): Promise<void> {
+    if (!enabled) {
+      await setNotificationPreferences({ desktopEnabled: false })
+      return
+    }
+    if (typeof Notification === 'undefined') {
+      notificationError = 'Desktop notifications are unavailable in this renderer. The in-app inbox remains active.'
+      return
+    }
+    const permission = Notification.permission === 'granted'
+      ? 'granted'
+      : await Notification.requestPermission()
+    if (permission !== 'granted') {
+      notificationError = 'Desktop notification permission was not granted. The in-app inbox remains active.'
+      return
+    }
+    await setNotificationPreferences({ desktopEnabled: true })
+  }
   $effect(() => {
     if (!overseerProfileId) overseerProfileId = localProfiles.find((profile) => profile.available !== false && profile.authStatus !== 'signed_out')?.id ?? ''
   })
@@ -83,6 +141,50 @@
       overseerError = error instanceof Error ? error.message : String(error)
     } finally {
       overseerBusy = false
+    }
+  }
+
+  function loadOverseerModeDraft(
+    mode: 'standard' | 'tokenmaxxing' | 'eco',
+    status = overseerStatus,
+  ): void {
+    overseerMode = mode
+    if (mode === 'standard') return
+    const policy = status?.modePolicies?.[mode] ?? (status?.operatingMode === mode ? status.policy : undefined)
+    overseerModeGuidance = policy?.guidance ?? ''
+    overseerModeIdeas = (policy?.ideaPool ?? []).join('\n')
+    overseerModeMaxAgents = policy?.maxParallelAgents ?? (mode === 'tokenmaxxing' ? 16 : 2)
+    overseerModeEffort = policy?.preferredEffort ?? (mode === 'tokenmaxxing' ? 'high' : 'low')
+  }
+
+  async function saveOverseerMode(): Promise<void> {
+    overseerModeBusy = true
+    overseerModeSaved = false
+    overseerError = ''
+    try {
+      const value = await api.setOverseerMode({
+        operatingMode: overseerMode,
+        ...(overseerMode === 'standard'
+          ? {}
+          : {
+              guidance: overseerModeGuidance,
+              ideaPool: overseerModeIdeas.split(/\r?\n/u).map((idea) => idea.trim()).filter(Boolean),
+              maxParallelAgents: overseerModeMaxAgents,
+              preferredEffort: overseerModeEffort,
+            }),
+      })
+      if ('error' in value) {
+        overseerError = value.error
+        return
+      }
+      overseerStatus = { ...overseerStatus, ...value } as OverseerStatus
+      loadOverseerModeDraft(value.operatingMode ?? overseerMode, overseerStatus)
+      overseerModeSaved = true
+      window.setTimeout(() => (overseerModeSaved = false), 1_400)
+    } catch (error) {
+      overseerError = error instanceof Error ? error.message : String(error)
+    } finally {
+      overseerModeBusy = false
     }
   }
 
@@ -735,56 +837,6 @@
     if (e.key === 'Escape') closeModal()
   }
 
-  // --- Auto monthly budget from subscription level -------------------------------------
-  // Monthly USD budget per known subscription tier. Deliberately simple, documented anchors
-  // (edit to taste): the entry "Pro" / "Plus" tier ≈ $20, Claude Max 5× ≈ $100, Max 20× ≈ $200.
-  // Keyed by the tier string (normalised to lowercase alphanumerics) as it appears in the live
-  // usage snapshot. The Max* keys are only reachable if a usage source ever reports such a tier
-  // string — Claude accounts today expose only session/week percentages, no dollar tier.
-  const PLAN_BUDGETS: Record<string, number> = {
-    free: 0,
-    plus: 20, // ChatGPT Plus
-    pro: 20, // Claude Pro / ChatGPT entry "Pro"
-    team: 30,
-    business: 30,
-    enterprise: 60,
-    max: 100, max5: 100, max5x: 100, // Claude Max 5×
-    max20: 200, max20x: 200, // Claude Max 20×
-  }
-  // When a tier can't be read (Claude, or an unknown Codex plan), assume the entry tier and flag it.
-  const FALLBACK_USD = 20
-  const norm = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]/g, '')
-
-  let autoResult = $state<{ total: number; lines: string[]; assumed: number } | null>(null)
-
-  // Sum a monthly budget across the user's accounts from live usage data — entirely client-side.
-  // Codex accounts carry `codex.planType` (e.g. "pro"); Claude accounts have no dollar tier.
-  function autoDetectBudget(): void {
-    if (localProfiles.length === 0) {
-      autoResult = { total: 0, lines: ['No accounts detected yet — add one above, then try again.'], assumed: 0 }
-      return
-    }
-    let total = 0
-    let assumed = 0
-    const lines: string[] = []
-    for (const p of localProfiles) {
-      const snap = store.usage.find((u) => u.profileId === p.id)
-      // `planType` is present on Codex snapshots but isn't in the web UsageSnapshot type — read it safely.
-      const planType = (snap?.codex as { planType?: string } | undefined)?.planType
-      if (p.provider === 'codex' && planType && norm(planType) in PLAN_BUDGETS) {
-        const usd = PLAN_BUDGETS[norm(planType)]!
-        total += usd
-        lines.push(`${profileLabel(p)}: ${planType} → $${usd}/mo`)
-      } else {
-        total += FALLBACK_USD
-        assumed++
-        const why = p.provider === 'claude' ? 'Claude tier not in usage data' : planType ? `unknown plan "${planType}"` : 'no usage data yet'
-        lines.push(`${profileLabel(p)}: ${why} → assumed $${FALLBACK_USD}/mo`)
-      }
-    }
-    settings.setBudget(total || null)
-    autoResult = { total, lines, assumed }
-  }
 </script>
 
 <svelte:window onkeydown={onKey} />
@@ -996,24 +1048,8 @@
 
     <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Usage')}>
       <h3>Usage</h3>
-      <label class="opt"><input type="checkbox" checked={settings.showSpend} onchange={() => settings.toggleSpend()} /> Show accumulated spend</label>
-      <label class="opt budget">Plan budget ($/month)
-        <input type="number" min="0" placeholder="e.g. 100" value={settings.planBudgetUsd ?? ''}
-          onchange={(e) => settings.setBudget(Number((e.target as HTMLInputElement).value) || null)} />
-      </label>
-      <div class="budget-auto">
-        <button class="btn" onclick={autoDetectBudget}>Auto-detect from plan</button>
-        <span class="hint dim">Sums a monthly budget from each account's detected subscription tier.</span>
-      </div>
-      {#if autoResult}
-        <div class="auto-result">
-          <div class="auto-total">Budget set to <b>${autoResult.total}/mo</b>{#if autoResult.assumed} · {autoResult.assumed} account{autoResult.assumed === 1 ? '' : 's'} fell back to an assumed tier{/if}</div>
-          <ul class="auto-list">
-            {#each autoResult.lines as l (l)}<li class="dim">{l}</li>{/each}
-          </ul>
-        </div>
-      {/if}
-      <p class="hint dim">Spend shows as a percent of the plan budget when set. Claude usage (session / week / model) is polled from the free <code>/usage</code> command — Claude has no dollar tier in the data, so those accounts fall back to the entry tier.</p>
+      <label class="opt"><input type="checkbox" checked={settings.showSpend} onchange={() => settings.toggleSpend()} /> Show API-equivalent model-cost estimate</label>
+      <p class="hint dim">This is the provider SDK's token-priced API equivalent accumulated since this hub process started. It is not your bill or subscription-plan utilization. The session and weekly quota bars are the authoritative usage values.</p>
     </section>
 
     <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Remote access')} data-overseer-anchor="remote_access">
@@ -1243,8 +1279,72 @@
         </button>
         {#if overseerStatus?.sessionId}<span class="hint ok">Configured · {overseerStatus.available ? 'ready' : 'account unavailable'}</span>{/if}
       </div>
+      <fieldset class="overseer-mode">
+        <legend>Operating mode</legend>
+        <label class="opt row2">Mode
+          <select value={overseerMode} onchange={(event) => loadOverseerModeDraft((event.target as HTMLSelectElement).value as typeof overseerMode)}>
+            <option value="standard">Standard</option>
+            <option value="tokenmaxxing">Tokenmaxxing</option>
+            <option value="eco">Eco</option>
+          </select>
+        </label>
+        {#if overseerMode === 'tokenmaxxing'}
+          <p class="hint dim">The Overseer checks live weekly quotas and reset times, then asks what useful review/audit swarm you want before launching it. Saved ideas are suggestions, never automatic work.</p>
+        {:else if overseerMode === 'eco'}
+          <p class="hint dim">The Overseer prefers the cheapest still-capable model, lower effort, reuse of existing agents, and small evidence-first steps.</p>
+        {:else}
+          <p class="hint dim">Resource use follows the task normally. Your saved Tokenmaxxing and Eco presets remain available when you switch back.</p>
+        {/if}
+        {#if overseerMode !== 'standard'}
+          <label class="opt row2">Maximum parallel agents
+            <input type="number" min="1" max="16" bind:value={overseerModeMaxAgents} />
+          </label>
+          <label class="opt row2">Preferred effort
+            <input bind:value={overseerModeEffort} placeholder={overseerMode === 'eco' ? 'low' : 'high'} />
+          </label>
+          <label class="field"><span>Your definition of this mode</span>
+            <textarea rows="3" bind:value={overseerModeGuidance} placeholder="Optional durable guidance for your Overseer"></textarea>
+          </label>
+          <label class="field"><span>Preset idea pool <small>one idea per line</small></span>
+            <textarea rows="4" bind:value={overseerModeIdeas} placeholder="Review the permission boundary&#10;Audit recovery and restart behavior"></textarea>
+          </label>
+        {/if}
+        <div class="overseer-actions">
+          <button class="btn" disabled={overseerModeBusy} onclick={saveOverseerMode}>
+            {overseerModeBusy ? 'Saving mode…' : 'Save operating mode'}
+          </button>
+          {#if overseerModeSaved}<span class="hint ok">Mode saved and injected into the current Overseer.</span>{/if}
+        </div>
+      </fieldset>
       {#if overseerError}<p class="hint warn" role="alert">{overseerError}</p>{/if}
       <p class="hint dim">If SQLite preflight fails, the vendor chat cannot run because chat state is journal-backed. The independent supervisor remains alive, records bounded diagnostics outside the database, and keeps recovery/restart authority. This UI does not blur those two failure boundaries.</p>
+    </section>
+
+    <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Notifications')}>
+      <h3>Notifications</h3>
+      <p class="hint dim">Alerts are kept in a bounded in-app inbox. Routine child completions go to their manager; only manager and Overseer completions notify you by default.</p>
+      <label class="opt"><input type="checkbox" checked={notificationPrefs.managerCompletions} onchange={(event) => setNotificationPreferences({ managerCompletions: (event.target as HTMLInputElement).checked })} /> Manager turn completions</label>
+      <label class="opt"><input type="checkbox" checked={notificationPrefs.overseerCompletions} onchange={(event) => setNotificationPreferences({ overseerCompletions: (event.target as HTMLInputElement).checked })} /> Overseer turn completions</label>
+      <label class="opt"><input type="checkbox" checked={notificationPrefs.agentCompletions} onchange={(event) => setNotificationPreferences({ agentCompletions: (event.target as HTMLInputElement).checked })} /> Every agent turn completion</label>
+      <label class="opt"><input type="checkbox" checked={notificationPrefs.errors} onchange={(event) => setNotificationPreferences({ errors: (event.target as HTMLInputElement).checked })} /> Agent and manager errors</label>
+      <label class="opt"><input type="checkbox" checked={notificationPrefs.approvals} onchange={(event) => setNotificationPreferences({ approvals: (event.target as HTMLInputElement).checked })} /> Permission and elevated-command approvals</label>
+      <label class="opt"><input type="checkbox" checked={notificationPrefs.stalls} onchange={(event) => setNotificationPreferences({ stalls: (event.target as HTMLInputElement).checked })} /> Stalled child detection</label>
+      <label class="opt"><input type="checkbox" checked={notificationPrefs.journalPressure} onchange={(event) => setNotificationPreferences({ journalPressure: (event.target as HTMLInputElement).checked })} /> Journal and recovery storage pressure</label>
+      <label class="opt"><input type="checkbox" checked={notificationPrefs.desktopEnabled} onchange={(event) => toggleDesktopNotifications((event.target as HTMLInputElement).checked)} /> Also show eligible alerts as desktop notifications</label>
+      {#if notificationSaved}<p class="hint ok">Notification preferences saved.</p>{/if}
+      {#if notificationError}<p class="hint warn" role="alert">{notificationError}</p>{/if}
+      <p class="hint dim">Approval and error alerts remain immediate. Notification delivery rows expire after 30 days and are capped at 1,000; source lifecycle evidence stays in the journal.</p>
+    </section>
+
+    <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Privileged operations')}>
+      <h3>Privileged operations</h3>
+      <p class="hint dim">{elevationBroker?.detail ?? 'Checking the privileged-operation broker…'}</p>
+      {#if elevationBroker}
+        <p class="status" class:error={!elevationBroker.available} class:ok={elevationBroker.available}>
+          {elevationBroker.available ? 'On-demand UAC broker available' : 'Privileged broker unavailable'}
+        </p>
+      {/if}
+      <p class="hint dim">Full Access controls agent-tool prompts; it never silently grants Administrator/root. The Overseer must configure a bounded project policy, analyze the command, and obtain a separate operator approval before the one-shot elevated process is launched. No permanently elevated resident service is installed.</p>
     </section>
 
     <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Getting started')}>
@@ -1393,8 +1493,6 @@
   .status.error { color: var(--bad-text); }
   .write-error { margin: 0; }
   .opt { display: flex; align-items: center; gap: var(--space-3); margin-bottom: var(--space-3); }
-  .opt.budget { flex-wrap: wrap; }
-  .opt.budget input { width: 6rem; margin-left: auto; }
   .opt.row2 { justify-content: space-between; }
   .opt.row2 select { min-width: 11rem; }
   .hint { font-size: var(--text-xs); line-height: 1.5; }
@@ -1402,12 +1500,6 @@
   .upd-err { color: var(--bad); }
   .upd-warn { color: var(--warn-text, #d08700); }
   .hint code { background: var(--bg); padding: 0 0.25rem; border-radius: var(--r-xs); }
-  .budget-auto { display: flex; align-items: center; gap: var(--space-4); flex-wrap: wrap; margin-bottom: var(--space-3); }
-  .budget-auto .hint { flex: 1; min-width: 12rem; }
-  .auto-result { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--r-lg); padding: var(--space-3) var(--space-4); margin-bottom: var(--space-4); box-shadow: var(--edge-hi); }
-  .auto-total { font-size: var(--text-sm); margin-bottom: var(--space-2); }
-  .auto-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.15rem; }
-  .auto-list li { font-size: var(--text-xs); font-family: var(--mono); }
   .mesh-status { display: flex; flex-direction: column; gap: var(--space-3); margin-bottom: var(--space-3); }
   .remote-heading { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-3); }
   .remote-heading h3 { margin: 0; }

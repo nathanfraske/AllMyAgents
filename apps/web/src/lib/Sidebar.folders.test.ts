@@ -128,6 +128,56 @@ describe('Sidebar with folder state', () => {
     expect(el.querySelector('.manager-role svg')).not.toBeNull()
   })
 
+  it('keeps a retired child visible and labels its preserved lifecycle state', () => {
+    store.sessions.s1!.record.isProjectManager = true
+    store.sessions.s2!.record.parentSessionId = 's1'
+    store.sessions.s2!.record.status = 'stopped'
+    store.sessions.s2!.record.managerRetiredAt = '2026-08-07T12:00:00.000Z'
+    store.sessions.s2!.record.managerRetiredReason = 'replaced after context exhaustion'
+
+    const { container } = render(Sidebar)
+    const retired = (container as HTMLElement).querySelector('.row.managedchild .retired-child')
+    expect(retired?.textContent).toBe('retired')
+    expect(retired?.getAttribute('title')).toMatch(/chat and workspace are preserved/i)
+    expect(labels(container as HTMLElement)).toContain('two')
+  })
+
+  it('nests a worker-created one-shot agent beneath its scientist parent', () => {
+    store.sessions.s1!.record.isProjectManager = true
+    store.sessions.s2!.record.parentSessionId = 's1'
+    store.sessions.s4 = seedSession('s4', 'proj-a', 'two II')
+    store.sessions.s4.record.parentSessionId = 's2'
+    store.sessions.s4.record.managerRootSessionId = 's1'
+    store.sessions.s4.record.isOneShotSubagent = true
+    store.sessions.s4.record.oneShotOrdinal = 2
+
+    const { container } = render(Sidebar)
+    const el = container as HTMLElement
+    expect([...el.querySelectorAll('.group:first-child .rlabel')].map((node) => node.textContent))
+      .toEqual(['one', 'two', 'two II'])
+    const nestedRows = [...el.querySelectorAll('.row.managedchild')]
+    expect(nestedRows.map((row) => row.getAttribute('style'))).toEqual([
+      '--manager-depth: 1;',
+      '--manager-depth: 2;',
+    ])
+    expect(el.querySelector('[title="collapse child agents"]')).not.toBeNull()
+  })
+
+  it('lets the worker collapse only its own one-shot descendants', () => {
+    store.sessions.s1!.record.isProjectManager = true
+    store.sessions.s2!.record.parentSessionId = 's1'
+    store.sessions.s4 = seedSession('s4', 'proj-a', 'two II')
+    store.sessions.s4.record.parentSessionId = 's2'
+    store.sessions.s4.record.managerRootSessionId = 's1'
+    store.sessions.s4.record.isOneShotSubagent = true
+    localStorage.setItem('allmyagents.ui.collapsedFolders', JSON.stringify(['manager:s2']))
+
+    const { container } = render(Sidebar)
+    const el = container as HTMLElement
+    expect(labels(el)).toContain('two')
+    expect(labels(el)).not.toContain('two II')
+  })
+
   it('restores a collapsed manager subtree from the existing collapsed-state store', () => {
     store.sessions.s1!.record.isProjectManager = true
     store.sessions.s2!.record.parentSessionId = 's1'

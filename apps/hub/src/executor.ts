@@ -182,7 +182,13 @@ export interface InProcessExecutorHubHooks {
   recall(sessionId: string, prompt: string): string
   /** A codex app-server child exited — the hub fails its in-flight sessions (unless a planned retire). */
   onCodexExit(profileId: string, payload: unknown): void
-  busSend(fromSessionId: string, to: BusAddress, subject: string | undefined, body: string): { ok: boolean; delivered: number; error?: string }
+  busSend(
+    fromSessionId: string,
+    to: BusAddress,
+    subject: string | undefined,
+    body: string,
+    wake?: boolean,
+  ): { ok: boolean; delivered: number; deferred?: number; error?: string }
   busInbox(sessionId: string): BusMessage[]
   busRoster(sessionId: string): Array<{
     sessionId: string
@@ -206,6 +212,10 @@ export interface InProcessExecutorHubHooks {
     managerSessionId: string,
     input: Parameters<NonNullable<AgentServices['manageTeam']>>[1],
   ): ReturnType<NonNullable<AgentServices['manageTeam']>>
+  managerManageChild(
+    managerSessionId: string,
+    input: Parameters<NonNullable<AgentServices['manageChild']>>[1],
+  ): ReturnType<NonNullable<AgentServices['manageChild']>>
   managerSpawn(
     managerSessionId: string,
     input: {
@@ -240,7 +250,7 @@ export interface InProcessExecutorHubHooks {
       title: string
       status?: 'pending' | 'in_progress' | 'completed' | 'abandoned'
     },
-  ): { ok: boolean; taskId?: string; error?: string }
+  ): { ok: boolean; taskId?: string; warning?: string; error?: string }
   browser(
     sessionId: string,
     operation: Parameters<AgentServices['browser']>[1],
@@ -300,12 +310,13 @@ export class InProcessExecutor implements Executor {
   //      services; isBusTurn is executor-local. -----------------------------------------------------
   private agentServices(): AgentServices {
     return {
-      send: (from, to, subject, body) => this.h.busSend(from.sessionId, to, subject, body),
+      send: (from, to, subject, body, wake) => this.h.busSend(from.sessionId, to, subject, body, wake),
       inbox: (sessionId) => this.h.busInbox(sessionId),
       roster: (sessionId) => this.h.busRoster(sessionId),
       peek: (caller, target, options) => this.h.busPeek(caller, target, options),
       childStatus: (managerSessionId) => this.h.managerChildStatus(managerSessionId),
       manageTeam: (managerSessionId, input) => this.h.managerManageTeam(managerSessionId, input),
+      manageChild: (managerSessionId, input) => this.h.managerManageChild(managerSessionId, input),
       spawnAgent: (managerSessionId, input) => this.h.managerSpawn(managerSessionId, input),
       setChildAuthority: (managerSessionId, childSessionId, authorities, tools, permissionMode) =>
         this.h.managerSetChildAuthority(
@@ -378,7 +389,12 @@ export class InProcessExecutor implements Executor {
           }
           const threadId = (payload as { threadId?: string } | null)?.threadId
           const sessionId = threadId ? this.sessionIdForThread(threadId) : undefined
-          this.h.journal(sessionId ?? null, kind, payload)
+          const normalizedTokens = sessionId && kind === 'codex/thread/tokenUsage/updated'
+            ? mapCodexTokenUsage(payload)
+            : undefined
+          // Recognized token telemetry is current-state data. Journal one bounded normalized row; if a
+          // future app-server shape cannot be mapped, retain its raw envelope so support can widen the map.
+          this.h.journal(sessionId ?? null, normalizedTokens ? 'session/tokens' : kind, normalizedTokens ?? payload)
           if (sessionId && kind === 'codex/turn/completed') {
             // EVERY codex turn ends here — success, interruption and failure alike — and turn.status is
             // what tells them apart. This used to unconditionally setStatus('idle'), so a FAILED turn
@@ -399,12 +415,6 @@ export class InProcessExecutor implements Executor {
           // the adapter itself treats turn/error as terminal (it clears its activeTurns for both).
           else if (sessionId && kind === 'codex/turn/error') {
             this.h.failTurn(sessionId, codexTurnErrorMessage(payload))
-          }
-          // Forward the app-server's token-usage notifications to the UI's live counter. The raw
-          // `codex/thread/tokenUsage/updated` event is still journaled above for field verification.
-          if (sessionId && kind === 'codex/thread/tokenUsage/updated') {
-            const tokens = mapCodexTokenUsage(payload)
-            if (tokens) this.h.journal(sessionId, 'session/tokens', tokens)
           }
         },
         async (method, params) => {

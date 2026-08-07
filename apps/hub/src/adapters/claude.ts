@@ -179,6 +179,10 @@ class ClaudeInputStream implements AsyncIterable<SDKUserMessage> {
  * query open forever. One second is generous for a local stream event and still bounds a completed turn.
  */
 const RESULT_QUIESCENCE_MS = 1_000
+/** Keep resumed app sessions well below the measured 900k+ cache-rebuild regime. Claude Code performs
+ *  the actual vendor compaction and emits its normal status/boundary lifecycle; the app supplies only
+ *  the supported flag-settings policy. */
+export const CLAUDE_AUTO_COMPACT_WINDOW = 500_000
 
 export class ClaudeDriver {
   private vendorSessionId: string | undefined
@@ -222,6 +226,10 @@ export class ClaudeDriver {
     const options: Record<string, unknown> = {
       env,
       cwd: this.cwd,
+      settings: {
+        autoCompactEnabled: true,
+        autoCompactWindow: CLAUDE_AUTO_COMPACT_WINDOW,
+      },
     }
     if (this.wsl) {
       const executable = nativeWslExecutable(this.wsl.distro, 'claude')
@@ -296,7 +304,10 @@ export class ClaudeDriver {
       // disableAllHooks goes in the BASE `settings` layer, not `managedSettings`: the latter is filtered
       // "restrictive-only" and silently drops any key not on its allowlist (disableAllHooks is not on it),
       // so a managedSettings.disableAllHooks is ignored and project hooks still fire — verified.
-      options.settings = { disableAllHooks: true }
+      options.settings = {
+        ...(options.settings as Record<string, unknown>),
+        disableAllHooks: true,
+      }
     }
     // A string prompt selects the SDK's one-shot mode, where control requests and additional input are
     // unsupported. Its AsyncIterable form selects streaming I/O. The stream stays open until this turn's
@@ -329,10 +340,10 @@ export class ClaudeDriver {
         // Surface token usage to the UI's live counter as the turn streams. Assistant messages
         // carry usage under `.message.usage` (the Anthropic API message); the final `result`
         // message carries it at the top level. The SDK gives no total, so we derive it.
-        if (m.type === 'assistant') this.emitTokens(m.message?.usage)
+        if (m.type === 'assistant') this.emitTokens(m.message?.usage, 'request')
         else if (m.type === 'result') {
           completedResults += 1
-          this.emitTokens(m.usage)
+          this.emitTokens(m.usage, 'turn')
           if (resultCloseTimer) clearTimeout(resultCloseTimer)
           // `aborted_streaming` is the SDK's explicit terminal answer to interrupting the stream. There can
           // be no legitimate continuation behind it; closing immediately is what lets the worker emit its
@@ -377,7 +388,7 @@ export class ClaudeDriver {
   //
   // Kept as separate fields as well as the total, so a reader can still distinguish fresh input from
   // cache reads — that distinction is the whole reason prompt caching is worth having.
-  private emitTokens(usage: unknown): void {
+  private emitTokens(usage: unknown, scope: 'request' | 'turn'): void {
     if (!usage || typeof usage !== 'object') return
     const u = usage as Record<string, unknown>
     const input = numField(u.input_tokens)
@@ -385,12 +396,24 @@ export class ClaudeDriver {
     const cacheWrite = numField(u.cache_creation_input_tokens)
     const output = numField(u.output_tokens)
     if (input === undefined && output === undefined && cacheRead === undefined && cacheWrite === undefined) return
-    const out: { input?: number; cacheRead?: number; cacheWrite?: number; output?: number; total?: number } = {}
+    const out: {
+      input?: number
+      cacheRead?: number
+      cacheWrite?: number
+      output?: number
+      total?: number
+      contextUsed?: number
+      scope: 'request' | 'turn'
+    } = { scope }
     if (input !== undefined) out.input = input
     if (cacheRead !== undefined) out.cacheRead = cacheRead
     if (cacheWrite !== undefined) out.cacheWrite = cacheWrite
     if (output !== undefined) out.output = output
     out.total = (input ?? 0) + (cacheRead ?? 0) + (cacheWrite ?? 0) + (output ?? 0)
+    // Assistant usage describes one actual model request. Result usage is aggregate turn accounting and
+    // must not be mistaken for the next request's context occupancy (multi-step turns can make it many
+    // times larger than the model window).
+    if (scope === 'request') out.contextUsed = (input ?? 0) + (cacheRead ?? 0) + (cacheWrite ?? 0)
     this.onEvent('session/tokens', out)
   }
 

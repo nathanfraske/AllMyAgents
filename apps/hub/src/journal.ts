@@ -70,6 +70,7 @@ export const JOURNAL_CONDENSE_INTERVAL_MS = 5 * 60 * 1000
 export const JOURNAL_CONDENSE_MAX_COMMAND_DELTAS = 5_000
 export const JOURNAL_CONDENSE_MAX_AGENT_MESSAGE_DELTAS = 5_000
 export const JOURNAL_CONDENSE_MAX_DIFF_SNAPSHOTS = 5_000
+export const JOURNAL_CONDENSE_MAX_ITEM_STARTED = 5_000
 export const JOURNAL_CONDENSE_MAX_DELETE_ROWS = 3_500
 export const JOURNAL_CONDENSE_MAX_TRANSIENT_BYTES = 8 * 1024 * 1024
 export const JOURNAL_REPLAY_PROTOCOL_VERSION = 1 as const
@@ -125,6 +126,7 @@ export type JournalCondenseOptions = {
   maxCommandOutputDeltas?: number
   maxAgentMessageDeltas?: number
   maxDiffSnapshots?: number
+  maxItemStarted?: number
   maxTransientPayloadBytes?: number
   historyGraceMs?: number
   historyRetentionMs?: number
@@ -140,6 +142,7 @@ export type JournalCondenseResult = {
   commandOutputDeltasDeleted: number
   agentMessageDeltasDeleted: number
   diffSnapshotsDeleted: number
+  itemStartedDeleted: number
   transientPayloadBytesDeleted: number
   oversizedTransientRowsRetained: number
   writerLockMs: number
@@ -227,6 +230,17 @@ export class ReplayGenerationChangedError extends Error {
   }
 }
 
+/** SQLite writer contention is expected while the live hub and maintenance child share the WAL. */
+export function isTransientSqliteContention(error: unknown): boolean {
+  const code = typeof error === 'object' && error !== null && 'code' in error
+    ? String((error as { code?: unknown }).code ?? '')
+    : ''
+  if (code === 'SQLITE_BUSY' || code.startsWith('SQLITE_BUSY_')) return true
+  if (code === 'SQLITE_LOCKED' || code.startsWith('SQLITE_LOCKED_')) return true
+  const message = error instanceof Error ? error.message : String(error)
+  return /\b(?:database|database table|schema) is locked\b/i.test(message)
+}
+
 export class Journal extends EventEmitter {
   readonly db: Database.Database
   private readonly atomicEventBuffers: HubEvent[][] = []
@@ -241,15 +255,20 @@ export class Journal extends EventEmitter {
   private resolvedApprovalStmt: Database.Statement | undefined
   private questionRecoveryUnknownStmt: Database.Statement | undefined
 
-  constructor(file: string) {
+  constructor(file: string, options: { busyTimeoutMs?: number } = {}) {
     super()
+    const requestedBusyTimeoutMs = options.busyTimeoutMs ?? 5_000
+    if (!Number.isSafeInteger(requestedBusyTimeoutMs) || requestedBusyTimeoutMs < 0 || requestedBusyTimeoutMs > 60_000) {
+      throw new Error('journal busy timeout must be a whole number from 0 to 60000 milliseconds')
+    }
     fs.mkdirSync(path.dirname(file), { recursive: true })
     this.db = new Database(file)
     this.db.pragma('journal_mode = WAL')
     // Two hub processes briefly share this DB during a blue-green restart (docs/agent-detachment-impl.md
     // §4.3). WAL allows many readers + one writer, but with NO busy_timeout a concurrent writer throws
-    // SQLITE_BUSY immediately. Wait up to 5s so the sub-second flip window never surfaces a spurious error.
-    this.db.pragma('busy_timeout = 5000')
+    // SQLITE_BUSY immediately. Ordinary connections wait 5s; isolated maintenance may opt into a longer,
+    // still-bounded wait without stalling the hub's event loop.
+    this.db.pragma(`busy_timeout = ${requestedBusyTimeoutMs}`)
     // DURABILITY. Without this SQLite uses synchronous=NORMAL under WAL, which does not fsync the WAL on
     // every commit: a power cut or a hard kill mid-write can leave the WAL torn, and a torn WAL takes the
     // whole journal down with it.
@@ -491,6 +510,7 @@ export class Journal extends EventEmitter {
       AFTER INSERT ON events
       WHEN NEW.kind IN (
         'claude/result',
+        'codex/item/started',
         'codex/item/completed',
         'codex/turn/completed',
         'codex/item/commandExecution/outputDelta',
@@ -638,6 +658,22 @@ export class Journal extends EventEmitter {
       `)
     })
     backfillWorkerCursors.immediate()
+    // The transient projection predates `codex/item/started`. Merely widening the trigger would index
+    // future rows but strand every existing start row behind a frontier already marked complete. Rewind
+    // only the projection cursor (never the journal itself) once; the post-ready maintenance child then
+    // replays the table in its existing bounded batches, INSERT OR IGNORE-ing old projection members and
+    // adding the newly eligible kind without putting a full events scan back on startup.
+    const widenTransientProjection = this.db.transaction(() => {
+      const done = this.db
+        .prepare("SELECT 1 FROM journal_migrations WHERE name = 'transient-item-started-v1'")
+        .get() as unknown
+      if (done) return
+      this.db.exec(`
+        UPDATE journal_transient_index_state SET scanned_through = 0 WHERE singleton = 1;
+        INSERT INTO journal_migrations (name) VALUES ('transient-item-started-v1');
+      `)
+    })
+    widenTransientProjection.immediate()
     this.insertStmt = this.db.prepare('INSERT INTO events (ts, session, kind, payload) VALUES (?, ?, ?, ?)')
     this.insertWorkerStmt = this.db.prepare('INSERT INTO events (ts, session, kind, payload, wseq) VALUES (?, ?, ?, ?, ?)')
     // This lookup is independent of condensable rows. The reset-aware legacy event query remains valid too
@@ -1235,6 +1271,7 @@ export class Journal extends EventEmitter {
          SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
          WHERE ? IN (
            'claude/result',
+           'codex/item/started',
            'codex/item/completed',
            'codex/turn/completed',
            'codex/item/commandExecution/outputDelta',
@@ -1463,6 +1500,23 @@ export class Journal extends EventEmitter {
            AND candidate.payload_bytes <= ?
            AND (
              (
+               candidate.kind = 'codex/item/started'
+               AND candidate.session IS NOT NULL
+               AND candidate.thread_id IS NOT NULL
+               AND candidate.turn_id IS NOT NULL
+               AND candidate.item_id IS NOT NULL
+               AND EXISTS (
+                 SELECT 1
+                 FROM journal_transient_event_index AS terminal
+                 WHERE terminal.kind = 'codex/item/completed'
+                   AND terminal.ts <= ?
+                   AND terminal.session = candidate.session
+                   AND terminal.thread_id = candidate.thread_id
+                   AND terminal.turn_id = candidate.turn_id
+                   AND terminal.item_id = candidate.item_id
+               )
+             )
+             OR (
                candidate.kind = 'codex/item/commandExecution/outputDelta'
                AND candidate.session IS NOT NULL
                AND candidate.thread_id IS NOT NULL
@@ -1520,6 +1574,7 @@ export class Journal extends EventEmitter {
         cutoff,
         Math.floor(maxTransientPayloadBytes),
         cutoff,
+        cutoff,
         cutoff
       ) as { frontier: unknown }
     if (
@@ -1560,6 +1615,7 @@ export class Journal extends EventEmitter {
     const maxAgentMessageDeltas =
       options.maxAgentMessageDeltas ?? JOURNAL_CONDENSE_MAX_AGENT_MESSAGE_DELTAS
     const maxDiffSnapshots = options.maxDiffSnapshots ?? JOURNAL_CONDENSE_MAX_DIFF_SNAPSHOTS
+    const maxItemStarted = options.maxItemStarted ?? JOURNAL_CONDENSE_MAX_ITEM_STARTED
     const maxTransientPayloadBytes =
       options.maxTransientPayloadBytes ?? JOURNAL_CONDENSE_MAX_TRANSIENT_BYTES
     const historyGraceMs = options.historyGraceMs ?? JOURNAL_HISTORY_GRACE_MS
@@ -1577,6 +1633,7 @@ export class Journal extends EventEmitter {
       ['maxCommandOutputDeltas', maxCommandOutputDeltas],
       ['maxAgentMessageDeltas', maxAgentMessageDeltas],
       ['maxDiffSnapshots', maxDiffSnapshots],
+      ['maxItemStarted', maxItemStarted],
       ['maxTransientPayloadBytes', maxTransientPayloadBytes],
       ['historyGraceMs', historyGraceMs],
       ['historyRetentionMs', historyRetentionMs],
@@ -1595,6 +1652,7 @@ export class Journal extends EventEmitter {
     const commandLimit = Math.floor(maxCommandOutputDeltas)
     const messageLimit = Math.floor(maxAgentMessageDeltas)
     const diffLimit = Math.floor(maxDiffSnapshots)
+    const startedLimit = Math.floor(maxItemStarted)
     const transientByteLimit = Math.floor(maxTransientPayloadBytes)
     const now = new Date(nowMs).toISOString()
     const cutoff = new Date(nowMs - graceMs).toISOString()
@@ -1636,6 +1694,13 @@ export class Journal extends EventEmitter {
         item_id TEXT NOT NULL,
         PRIMARY KEY (session, thread_id, turn_id, item_id)
       ) WITHOUT ROWID;
+      CREATE TEMP TABLE IF NOT EXISTS journal_condense_completed_items (
+        session TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        PRIMARY KEY (session, thread_id, turn_id, item_id)
+      ) WITHOUT ROWID;
       CREATE TEMP TABLE IF NOT EXISTS journal_condense_diff_keep (
         seq INTEGER PRIMARY KEY
       );
@@ -1653,6 +1718,7 @@ export class Journal extends EventEmitter {
       this.db.exec(`
         DELETE FROM journal_condense_commands;
         DELETE FROM journal_condense_messages;
+        DELETE FROM journal_condense_completed_items;
         DELETE FROM journal_condense_diff_keep;
         DELETE FROM journal_condense_delete;
       `)
@@ -1700,7 +1766,41 @@ export class Journal extends EventEmitter {
           AND turn_id IS NOT NULL
         GROUP BY session, thread_id, turn_id;
       `)
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO journal_condense_completed_items (session, thread_id, turn_id, item_id)
+           SELECT session, thread_id, turn_id, item_id
+           FROM journal_transient_event_index
+           WHERE kind = 'codex/item/completed'
+             AND ts <= ?
+             AND session IS NOT NULL
+             AND thread_id IS NOT NULL
+             AND turn_id IS NOT NULL
+             AND item_id IS NOT NULL`
+        )
+        .run(cutoff)
 
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO journal_condense_delete (seq, payload_bytes)
+           SELECT candidate.seq, candidate.payload_bytes
+           FROM journal_transient_event_index AS candidate
+           JOIN journal_condense_completed_items AS terminal
+             ON terminal.session = candidate.session
+            AND terminal.thread_id = candidate.thread_id
+            AND terminal.turn_id = candidate.turn_id
+            AND terminal.item_id = candidate.item_id
+           WHERE candidate.ts <= ?
+             AND candidate.seq <= ?
+             AND candidate.kind = 'codex/item/started'
+             AND candidate.session IS NOT NULL
+             AND candidate.thread_id IS NOT NULL
+             AND candidate.turn_id IS NOT NULL
+             AND candidate.item_id IS NOT NULL
+           ORDER BY candidate.seq
+           LIMIT ?`
+        )
+        .run(cutoff, maxPrunableSeq, startedLimit)
       this.db
         .prepare(
           `INSERT OR IGNORE INTO journal_condense_delete (seq, payload_bytes)
@@ -1804,6 +1904,7 @@ export class Journal extends EventEmitter {
         | 'commandOutputDeltasDeleted'
         | 'agentMessageDeltasDeleted'
         | 'diffSnapshotsDeleted'
+        | 'itemStartedDeleted'
         | 'transientPayloadBytesDeleted'
         | 'oversizedTransientRowsRetained'
         | 'cursorCheckpointsWritten'
@@ -1848,7 +1949,8 @@ export class Journal extends EventEmitter {
                AND kind IN (
                  'codex/item/commandExecution/outputDelta',
                  'codex/item/agentMessage/delta',
-                 'codex/turn/diff/updated'
+                 'codex/turn/diff/updated',
+                 'codex/item/started'
                )
                AND payload_bytes > ?`
           )
@@ -1882,10 +1984,18 @@ export class Journal extends EventEmitter {
                AND seq IN (SELECT seq FROM journal_condense_delete)`
           )
           .run().changes
+        const itemStartedDeleted = this.db
+          .prepare(
+            `DELETE FROM events
+             WHERE kind = 'codex/item/started'
+               AND seq IN (SELECT seq FROM journal_condense_delete)`
+          )
+          .run().changes
         if (
           commandOutputDeltasDeleted > 0 ||
           agentMessageDeltasDeleted > 0 ||
-          diffSnapshotsDeleted > 0
+          diffSnapshotsDeleted > 0 ||
+          itemStartedDeleted > 0
         ) {
           const changedThroughSeq = this.db
             .prepare('SELECT COALESCE(MAX(seq), 0) FROM journal_condense_delete')
@@ -1904,6 +2014,7 @@ export class Journal extends EventEmitter {
           commandOutputDeltasDeleted,
           agentMessageDeltasDeleted,
           diffSnapshotsDeleted,
+          itemStartedDeleted,
           transientPayloadBytesDeleted,
           oversizedTransientRowsRetained,
           cursorCheckpointsWritten,
@@ -1955,6 +2066,15 @@ export class Journal extends EventEmitter {
           ts
         )
         WHERE kind = 'codex/item/completed' AND canonical_terminal = 1;
+      CREATE INDEX IF NOT EXISTS idx_journal_transient_completed_item_correlation
+        ON journal_transient_event_index (
+          session,
+          thread_id,
+          turn_id,
+          item_id,
+          ts
+        )
+        WHERE kind = 'codex/item/completed';
       CREATE INDEX IF NOT EXISTS idx_journal_transient_diff_correlation
         ON journal_transient_event_index (
           session,
@@ -1999,6 +2119,7 @@ export class Journal extends EventEmitter {
     | 'commandOutputDeltasDeleted'
     | 'agentMessageDeltasDeleted'
     | 'diffSnapshotsDeleted'
+    | 'itemStartedDeleted'
     | 'transientPayloadBytesDeleted'
     | 'oversizedTransientRowsRetained'
     | 'writerLockMs'
@@ -2888,6 +3009,41 @@ export class Journal extends EventEmitter {
       kind: row.kind,
       payload: parsePayload(row.payload, row.seq),
     }))
+  }
+
+  /**
+   * Latest bounded context-occupancy projection for one session. The session/sequence side index keeps
+   * this proportional to that chat, not the full journal. Prefer request-scoped rows; old releases did
+   * not label scope, so fall back to their latest token row and let the caller apply a conservative
+   * interpretation. Condensation deliberately retains the newest `session/tokens` state row.
+   */
+  latestSessionTokenUsage(sessionId: string): { ts: string; payload: unknown } | undefined {
+    const select = (requestScoped: boolean): { ts: string; payload: string } | undefined =>
+      this.db
+        .prepare(
+          `SELECT event.ts, event.payload
+           FROM journal_session_event_index AS session_event
+           JOIN events AS event ON event.seq = session_event.seq
+           WHERE session_event.session = ?
+             AND event.kind = 'session/tokens'
+             ${requestScoped
+               ? `AND json_valid(event.payload)
+                  AND (
+                    json_extract(event.payload, '$.scope') = 'request'
+                    OR json_type(event.payload, '$.contextUsed') IN ('integer', 'real')
+                  )`
+               : ''}
+           ORDER BY session_event.seq DESC
+           LIMIT 1`
+        )
+        .get(sessionId) as { ts: string; payload: string } | undefined
+    const row = select(true) ?? select(false)
+    if (!row) return undefined
+    try {
+      return { ts: row.ts, payload: JSON.parse(row.payload) as unknown }
+    } catch {
+      return undefined
+    }
   }
 
   /**

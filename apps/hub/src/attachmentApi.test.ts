@@ -365,6 +365,38 @@ describe('session attachment API', () => {
     expect(Buffer.from(await downloaded.arrayBuffer())).toEqual(bytes)
   })
 
+  it('allows query authentication only for an exact attachment GET so transcript files survive reload', async () => {
+    const { base, record } = await build()
+    const bytes = Buffer.from('durable-transcript-image')
+    const uploaded = await fetch(`${base}/api/sessions/${record.id}/attachments`, {
+      method: 'POST',
+      headers: { 'content-type': 'image/png', 'x-filename': 'durable.png' },
+      body: bytes,
+    })
+    const meta = (await uploaded.json()) as AttachmentMeta
+    const token = encodeURIComponent(TEST_DEVICE_TOKEN)
+
+    const image = await nativeFetch(
+      `${base}/api/sessions/${record.id}/attachments/${meta.id}?token=${token}`
+    )
+    expect(image.status).toBe(200)
+    expect(image.headers.get('referrer-policy')).toBe('no-referrer')
+    expect(image.headers.get('cache-control')).toBe('private, no-store')
+    expect(Buffer.from(await image.arrayBuffer())).toEqual(bytes)
+
+    const ordinaryApi = await nativeFetch(`${base}/api/sessions?token=${token}`)
+    expect(ordinaryApi.status).toBe(401)
+    const wrongToken = await nativeFetch(
+      `${base}/api/sessions/${record.id}/attachments/${meta.id}?token=wrong`
+    )
+    expect(wrongToken.status).toBe(401)
+    const mutation = await nativeFetch(
+      `${base}/api/sessions/${record.id}/attachments/${meta.id}?token=${token}`,
+      { method: 'POST' }
+    )
+    expect(mutation.status).toBe(401)
+  })
+
   it('never serves HTML or SVG as inline active content on the hub origin', async () => {
     const { base, record } = await build()
     const htmlUpload = await fetch(`${base}/api/sessions/${record.id}/attachments`, {

@@ -230,7 +230,10 @@ export interface TokenUsage {
   input?: number
   output?: number
   total?: number
-  context?: number
+  contextUsed?: number
+  contextWindow?: number
+  /** Context occupancy is for the latest model request, not an aggregate app turn. */
+  scope?: 'request'
 }
 
 function numField(value: unknown): number | undefined {
@@ -242,8 +245,8 @@ function numField(value: unknown): number | undefined {
  * token shape. The exact field names vary by installed app-server version, so this probes both a
  * nested usage object (`params.usage` / `tokenUsage` / `tokens` / `info`) and the flat params, in
  * camelCase and snake_case, and never throws on missing fields. Returns undefined when nothing
- * usable is present. The raw notification is still journaled as `codex/thread/tokenUsage/updated`,
- * so the live wire shape can be sanity-checked and this mapping widened if the names differ.
+ * usable is present. An unrecognized shape is still journaled raw; a recognized shape is journaled once
+ * as this bounded projection instead of storing both the large vendor envelope and a derived duplicate.
  */
 export function mapCodexTokenUsage(params: unknown): TokenUsage | undefined {
   if (!params || typeof params !== 'object') return undefined
@@ -251,6 +254,12 @@ export function mapCodexTokenUsage(params: unknown): TokenUsage | undefined {
   const nested = [p.usage, p.tokenUsage, p.tokens, p.info].find(
     (v): v is Record<string, unknown> => !!v && typeof v === 'object'
   )
+  const codexUsage = p.tokenUsage && typeof p.tokenUsage === 'object'
+    ? p.tokenUsage as Record<string, unknown>
+    : undefined
+  const last = codexUsage?.last && typeof codexUsage.last === 'object'
+    ? codexUsage.last as Record<string, unknown>
+    : undefined
   const pick = (...keys: string[]): number | undefined => {
     for (const src of [nested, p]) {
       if (!src) continue
@@ -265,7 +274,7 @@ export function mapCodexTokenUsage(params: unknown): TokenUsage | undefined {
   const output = pick('output_tokens', 'outputTokens', 'output', 'completion_tokens', 'completionTokens')
   let total = pick('total_tokens', 'totalTokens', 'total', 'total_token_usage', 'totalTokenUsage')
   if (total === undefined && input !== undefined && output !== undefined) total = input + output
-  const context = pick(
+  const genericContext = pick(
     'context_window',
     'contextWindow',
     'context',
@@ -274,11 +283,17 @@ export function mapCodexTokenUsage(params: unknown): TokenUsage | undefined {
     'used_context_window',
     'usedContextWindow'
   )
+  const contextUsed = numField(last?.inputTokens) ?? numField(last?.totalTokens) ?? genericContext
+  const contextWindow = numField(codexUsage?.modelContextWindow) ?? pick('model_context_window')
   const out: TokenUsage = {}
   if (input !== undefined) out.input = input
   if (output !== undefined) out.output = output
   if (total !== undefined) out.total = total
-  if (context !== undefined) out.context = context
+  if (contextUsed !== undefined) {
+    out.contextUsed = contextUsed
+    out.scope = 'request'
+  }
+  if (contextWindow !== undefined) out.contextWindow = contextWindow
   return Object.keys(out).length > 0 ? out : undefined
 }
 

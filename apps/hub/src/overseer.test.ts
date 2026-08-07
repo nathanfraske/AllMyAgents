@@ -12,10 +12,11 @@ import { MemoryStore } from './memory.js'
 import { PracticeStore } from './practices.js'
 import { ProjectStore } from './projects.js'
 import { QuestionService } from './questions.js'
+import { applyOverseerModeUpdate } from './overseerMode.js'
 import type { RemoteDeviceController } from './remoteDevices.js'
 import { SessionManager } from './sessions.js'
 import { SessionStore } from './store.js'
-import type { Profile, SessionRecord } from './types.js'
+import type { OverseerConfig, Profile, SessionRecord } from './types.js'
 import { UsageMonitor } from './usage.js'
 import { WorkspaceManager } from './workspace.js'
 
@@ -97,27 +98,27 @@ describe('application Overseer authority', () => {
       status: 'idle',
       createdAt: '2026-07-01T00:00:00.000Z',
       isOverseer: true,
-      overseerCapabilityVersion: 4,
+      overseerCapabilityVersion: 5,
       permissionMode: 'safe',
     })
 
     h.sessions.loadRecords()
     const loadedLegacy = h.store.all().find((record) => record.id === 'legacy-overseer')
     expect(loadedLegacy).toMatchObject({ permissionMode: 'safe' })
-    expect(loadedLegacy?.overseerCapabilityVersion).toBe(4)
+    expect(loadedLegacy?.overseerCapabilityVersion).toBe(5)
     expect(h.journal.recentEventsForSession('legacy-overseer', 20)).toEqual([])
 
     h.sessions.reconcileStale()
 
     expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
       isOverseer: true,
-      overseerCapabilityVersion: 5,
+      overseerCapabilityVersion: 6,
       permissionMode: 'full',
       permissionModeOperatorOverride: true,
       role: 'Application Overseer',
     })
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
-      'Overseer capability manifest version 5',
+      'Overseer capability manifest version 6',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'mcp__allmyagents__overseer_control',
@@ -132,8 +133,8 @@ describe('application Overseer authority', () => {
       .filter((event) => event.kind === 'overseer/capabilities-upgraded')
     expect(upgrades()).toHaveLength(1)
     expect(upgrades()[0]?.payload).toMatchObject({
-      fromVersion: 4,
-      toVersion: 5,
+      fromVersion: 5,
+      toVersion: 6,
       conversationPreserved: true,
       tools: expect.arrayContaining(['overseer_control', 'remote_exec', 'browser_navigate']),
     })
@@ -323,6 +324,14 @@ describe('application Overseer authority', () => {
       operation: 'approve', approvalId, approve: true,
     })).resolves.toMatchObject({ ok: true })
     await expect(pending).resolves.toBe(true)
+    const afterInterventions = await h.sessions.overseerControl('overseer', { operation: 'status' })
+    const targetStatus = (afterInterventions.data as {
+      sessions: Array<{ id: string; operatorInterventions: string[] }>
+    }).sessions.find((session) => session.id === 'target')
+    expect(targetStatus?.operatorInterventions).toEqual(expect.arrayContaining([
+      expect.stringMatching(/operator overrode permission mode to full/u),
+      expect.stringMatching(/operator approved commandExecution/u),
+    ]))
 
     const restart = vi.fn()
     h.sessions.setRestartSignal(restart)
@@ -523,7 +532,7 @@ describe('application Overseer authority', () => {
     h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
     h.seed({
       id: 'manager', title: 'Manager', isProjectManager: true, managerCanApproveChildren: true,
-      projectId: 'project-a', status: 'idle',
+      managerAllowedTools: ['commandExecution'], projectId: 'project-a', status: 'idle',
     })
     h.seed({ id: 'child', title: 'Worker', parentSessionId: 'manager', projectId: 'project-a', status: 'active' })
 
@@ -541,6 +550,89 @@ describe('application Overseer authority', () => {
     expect(h.bus.inbox('overseer')).toHaveLength(0)
     expect(h.journal.recentEventsForSession('child', 20)).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: 'manager/child-approval-reported' }),
+    ]))
+    h.approvals.resolve(pending.id, false)
+    await expect(decision).resolves.toBe(false)
+  })
+
+  it('persists and reinjects operating modes only from a direct operator turn', async () => {
+    const h = harness()
+    let config: OverseerConfig = {}
+    h.sessions.setOverseerRuntime({
+      overseerConfig: () => structuredClone(config),
+      configureOverseerMode: (update) => {
+        config = applyOverseerModeUpdate(config, update)
+        return structuredClone(config)
+      },
+    })
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full', overseerCapabilityVersion: 6 })
+
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'get_operating_mode',
+    })).resolves.toMatchObject({ ok: true, data: { operatingMode: 'standard' } })
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'set_operating_mode',
+      operatingMode: 'eco',
+      maxParallelAgents: 1,
+    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/direct operator turn/u) })
+
+    h.markOperator('overseer')
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'set_operating_mode',
+      operatingMode: 'tokenmaxxing',
+      modeGuidance: 'Prioritize the quota resetting first.',
+      ideaPool: ['Audit recovery', 'Review permissions'],
+      maxParallelAgents: 8,
+      preferredEffort: 'high',
+    })).resolves.toMatchObject({
+      ok: true,
+      data: {
+        operatingMode: 'tokenmaxxing',
+        policy: { maxParallelAgents: 8, ideaPool: ['Audit recovery', 'Review permissions'] },
+      },
+    })
+    const instructions = fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')
+    expect(instructions).toContain('OVERSEER OPERATING MODE: TOKENMAXXING (ACTIVE)')
+    expect(instructions).toContain('Prioritize the quota resetting first.')
+    expect(h.journal.recentEventsForSession('overseer')).toContainEqual(expect.objectContaining({
+      kind: 'overseer/operating-mode-changed',
+      payload: expect.objectContaining({ operatingMode: 'tokenmaxxing' }),
+    }))
+  })
+
+  it('routes a child approval outside the manager exact-tool ceiling to the Overseer instead of wedging at the manager', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full', status: 'idle' })
+    h.seed({
+      id: 'manager', title: 'Manager', isProjectManager: true, managerCanApproveChildren: true,
+      managerAllowedTools: ['browser'], projectId: 'project-a', status: 'idle',
+    })
+    h.seed({ id: 'child', title: 'Worker', parentSessionId: 'manager', projectId: 'project-a', status: 'active' })
+
+    const decision = h.approvals.request('child', 'claude/tool', {
+      toolName: 'PowerShell', input: { command: 'Get-Content README.md' },
+    })
+    const pending = h.approvals.pending()[0]!
+
+    expect(h.bus.inbox('manager')).toHaveLength(0)
+    expect(h.bus.inbox('overseer')).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        subject: 'approval awaiting operator',
+        body: expect.stringMatching(
+          new RegExp(`${pending.id}.*PowerShell.*Manager cannot approve this request: PowerShell is outside.*direct operator turn`, 'su'),
+        ),
+      }),
+    ]))
+    expect(h.journal.recentEventsForSession('child', 20)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'manager/child-approval-outside-ceiling',
+        payload: expect.objectContaining({
+          managerSessionId: 'manager',
+          approvalId: pending.id,
+          reason: expect.stringMatching(/PowerShell.*tool ceiling/u),
+        }),
+      }),
+      expect.objectContaining({ kind: 'overseer/approval-reported' }),
     ]))
     h.approvals.resolve(pending.id, false)
     await expect(decision).resolves.toBe(false)

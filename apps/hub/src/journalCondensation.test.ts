@@ -3,12 +3,18 @@ import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest'
-import { Journal, TransientHistoryIndexingError, WSEQ_RESET_KIND } from './journal.js'
+import {
+  isTransientSqliteContention,
+  Journal,
+  TransientHistoryIndexingError,
+  WSEQ_RESET_KIND,
+} from './journal.js'
 import { verifyRecentCompactionSnapshot } from './journalCompactionGate.js'
 
 type CondenseResult = {
   commandOutputDeltasDeleted: number
   diffSnapshotsDeleted: number
+  itemStartedDeleted: number
   transientPayloadBytesDeleted: number
   oversizedTransientRowsRetained: number
   cursorCheckpointsWritten: number
@@ -21,6 +27,7 @@ type CondensableJournal = Journal & {
     deleteThroughSeq?: number
     maxCommandOutputDeltas?: number
     maxDiffSnapshots?: number
+    maxItemStarted?: number
     maxTransientPayloadBytes?: number
   }): CondenseResult
 }
@@ -35,6 +42,7 @@ function condense(
   options: {
     maxCommandOutputDeltas?: number
     maxDiffSnapshots?: number
+    maxItemStarted?: number
     maxTransientPayloadBytes?: number
   } = {}
 ): CondenseResult {
@@ -62,6 +70,10 @@ function completedCommand(itemId: string, turnId: string): Record<string, unknow
   }
 }
 
+function startedItem(itemId: string, turnId: string, type = 'commandExecution'): Record<string, unknown> {
+  return { threadId: 'thread-1', turnId, item: { type, id: itemId, command: 'echo test' } }
+}
+
 function diff(turnId: string, value: string): Record<string, unknown> {
   return { threadId: 'thread-1', turnId, diff: value }
 }
@@ -75,6 +87,18 @@ describe('completed Codex journal condensation', () => {
 
   afterEach(() => vi.useRealTimers())
   afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }))
+
+  it('gives the maintenance connection a bounded longer writer wait and classifies only lock contention', () => {
+    const journal = new Journal(path.join(tmp, 'maintenance-busy-timeout.db'), { busyTimeoutMs: 30_000 })
+    try {
+      expect(journal.db.pragma('busy_timeout', { simple: true })).toBe(30_000)
+      expect(isTransientSqliteContention(Object.assign(new Error('database is locked'), { code: 'SQLITE_BUSY' }))).toBe(true)
+      expect(isTransientSqliteContention(Object.assign(new Error('database table is locked'), { code: 'SQLITE_LOCKED' }))).toBe(true)
+      expect(isTransientSqliteContention(Object.assign(new Error('disk I/O error'), { code: 'SQLITE_IOERR' }))).toBe(false)
+    } finally {
+      journal.db.close()
+    }
+  })
 
   it('keeps the durable worker cursor after the event row carrying its high wseq is gone', () => {
     const file = path.join(tmp, 'legacy-cursor.db')
@@ -149,6 +173,67 @@ describe('completed Codex journal condensation', () => {
           .map((event) => (event.payload as { itemId?: string }).itemId)
       ).toEqual(['live', 'done', 'no-final', undefined, 'recent'])
       expect((rows.find((event) => (event.payload as { __unreadable?: boolean }).__unreadable)?.payload as { __unreadable: boolean }).__unreadable).toBe(true)
+    } finally {
+      journal.db.close()
+    }
+  })
+
+  it('removes an old item start only after the exact completed item is durable', () => {
+    vi.useFakeTimers()
+    const journal = new Journal(path.join(tmp, 'completed-starts.db'))
+    try {
+      at(OLD, () => {
+        journal.append('s', 'codex/item/started', startedItem('done', 'turn-done'))
+        journal.append('s', 'codex/item/completed', completedCommand('done', 'turn-done'))
+        journal.append('s', 'codex/item/started', startedItem('live', 'turn-live'))
+        journal.append('s', 'codex/item/started', startedItem('same-id', 'turn-a'))
+        journal.append('s', 'codex/item/completed', completedCommand('same-id', 'turn-b'))
+        // A context-compaction lifecycle without full correlation remains visible and fails closed.
+        journal.append('s', 'codex/item/started', { item: { type: 'contextCompaction', id: 'compact' } })
+        journal.append('s', 'codex/item/completed', { item: { type: 'contextCompaction', id: 'compact' } })
+      })
+      at(RECENT, () => {
+        journal.append('s', 'codex/item/started', startedItem('recent', 'turn-recent'))
+        journal.append('s', 'codex/item/completed', completedCommand('recent', 'turn-recent'))
+      })
+
+      const result = condense(journal)
+      expect(result.itemStartedDeleted).toBe(1)
+      expect(journal.since(0, 100).filter((event) => event.kind === 'codex/item/started').map((event) => {
+        const payload = event.payload as { turnId?: string; item?: { id?: string } }
+        return [payload.turnId, payload.item?.id]
+      })).toEqual([
+        ['turn-live', 'live'],
+        ['turn-a', 'same-id'],
+        [undefined, 'compact'],
+        ['turn-recent', 'recent'],
+      ])
+    } finally {
+      journal.db.close()
+    }
+  })
+
+  it('rewinds only the bounded projection frontier when upgrading a journal that predates start indexing', () => {
+    vi.useFakeTimers()
+    const file = path.join(tmp, 'started-projection-upgrade.db')
+    let journal = new Journal(file)
+    at(OLD, () => {
+      journal.append('s', 'codex/item/started', startedItem('upgrade', 'turn-upgrade'))
+      journal.append('s', 'codex/item/completed', completedCommand('upgrade', 'turn-upgrade'))
+    })
+    while (!journal.backfillTransientEventIndex(10).complete) {}
+    const target = journal.db.prepare('SELECT MAX(seq) FROM events').pluck().get() as number
+    // Recreate the exact old-version state: frontier complete, but the new kind absent and migration unseen.
+    journal.db.prepare("DELETE FROM journal_transient_event_index WHERE kind = 'codex/item/started'").run()
+    journal.db.prepare('UPDATE journal_transient_index_state SET scanned_through = ? WHERE singleton = 1').run(target)
+    journal.db.prepare("DELETE FROM journal_migrations WHERE name = 'transient-item-started-v1'").run()
+    journal.db.close()
+
+    journal = new Journal(file)
+    try {
+      expect(journal.db.prepare('SELECT scanned_through FROM journal_transient_index_state').pluck().get()).toBe(0)
+      while (!journal.backfillTransientEventIndex(1).complete) {}
+      expect(condense(journal).itemStartedDeleted).toBe(1)
     } finally {
       journal.db.close()
     }

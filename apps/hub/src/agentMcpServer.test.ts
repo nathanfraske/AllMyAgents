@@ -33,7 +33,7 @@ describe('AgentMcpServer (the real stdio MCP server codex loads for the Codex pa
     expect(out).toHaveLength(0)
   })
 
-  it('tools/list returns all 10 tools with a valid JSON-Schema inputSchema', async () => {
+  it('tools/list returns every shared tool with a valid JSON-Schema inputSchema', async () => {
     const { server, out } = driver(okExecutor)
     await server.handleLine(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: { _meta: { progressToken: 0 } } }))
     const tools = (out[0]! as { result: { tools: { name: string; description: string; inputSchema: Record<string, unknown> }[] } }).result.tools
@@ -42,10 +42,10 @@ describe('AgentMcpServer (the real stdio MCP server codex loads for the Codex pa
       expect(t.inputSchema.type).toBe('object')
       expect(t.description.length).toBeGreaterThan(10)
     }
-    // send_message's schema advertises the expected args (body required; to_session/subject optional).
+    // send_message's schema advertises the expected args (body required; routing/wake controls optional).
     const send = tools.find((t) => t.name === 'send_message')!
     const props = send.inputSchema.properties as Record<string, unknown>
-    expect(Object.keys(props).sort()).toEqual(['body', 'subject', 'to_session'])
+    expect(Object.keys(props).sort()).toEqual(['body', 'subject', 'to_session', 'wake'])
     expect(send.inputSchema.required).toEqual(['body'])
   })
 

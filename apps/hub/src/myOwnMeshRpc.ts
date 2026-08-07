@@ -5,6 +5,7 @@ import path from 'node:path'
 const DEFAULT_METHOD = 'allmyagents.hub.v1'
 const MAX_CONTROL_LINE_BYTES = 3 * 1024 * 1024
 const MAX_ERROR_CHARS = 2_000
+const NETWORK_DISCOVERY_TTL_MS = 15_000
 
 export interface MyOwnMeshControlResponse<T = unknown> {
   ok: boolean
@@ -123,22 +124,95 @@ function allMyStuffPeer(peer: MyOwnMeshPeer): boolean {
   return Array.isArray(tags) && tags.some((tag) => typeof tag === 'string' && tag.toLowerCase() === 'allmystuff')
 }
 
-/** Prefer the actual AllMyStuff fleet, never the LAN claim/support helper networks. */
-export function selectFleetNetwork(candidates: MyOwnMeshNetworkCandidate[]): MyOwnMeshNetworkCandidate | undefined {
+function helperNetwork(candidate: MyOwnMeshNetworkCandidate): boolean {
+  const label = `${candidate.label ?? ''} ${candidate.config_id} ${candidate.network_id ?? ''}`.toLowerCase()
+  return label.includes('local claim') || label.includes('support')
+}
+
+function fleetNetworkScore(candidate: MyOwnMeshNetworkCandidate): number {
+  const label = `${candidate.label ?? ''} ${candidate.config_id} ${candidate.network_id ?? ''}`.toLowerCase()
+  const peers = candidate.peers ?? []
+  let score = candidate.phase === 'active' ? 10 : 0
+  if (label.includes('fleet')) score += 100
+  if (label.includes('allmystuff')) score += 30
+  score += peers.filter(allMyStuffPeer).length * 25
+  // Reachability is more important than a cosmetic network name. In particular, a network named
+  // "Fleet" must not win when the requested machine is pending there but active on another owned mesh.
+  score += peers.filter((peer) => allMyStuffPeer(peer) && peer.status === 'active').length * 100
+  return score
+}
+
+/**
+ * Every non-helper MyOwnMesh network that can carry AllMyStuff application RPC, best route first.
+ * A Hub may share more than one mesh with a peer; retaining all of them lets routing be decided for
+ * the target device instead of pinning the entire application to one globally scored network.
+ */
+export function selectFleetNetworks(candidates: MyOwnMeshNetworkCandidate[]): MyOwnMeshNetworkCandidate[] {
   return candidates
-    .map((candidate) => {
-      const label = `${candidate.label ?? ''} ${candidate.config_id} ${candidate.network_id ?? ''}`.toLowerCase()
-      const peers = candidate.peers ?? []
-      let score = candidate.phase === 'active' ? 10 : 0
-      if (label.includes('fleet')) score += 100
-      if (label.includes('allmystuff')) score += 30
-      if (label.includes('local claim') || label.includes('support')) score -= 200
-      score += peers.filter(allMyStuffPeer).length * 25
-      score += peers.filter((peer) => peer.status === 'active').length * 5
-      return { candidate, score }
-    })
-    .filter(({ candidate }) => (candidate.peers ?? []).some(allMyStuffPeer))
-    .sort((left, right) => right.score - left.score)[0]?.candidate
+    .filter((candidate) => !helperNetwork(candidate) && (candidate.peers ?? []).some(allMyStuffPeer))
+    .map((candidate) => ({ candidate, score: fleetNetworkScore(candidate) }))
+    .sort((left, right) => right.score - left.score)
+    .map(({ candidate }) => candidate)
+}
+
+/** Backwards-compatible primary route for status text and callers that truly need one network. */
+export function selectFleetNetwork(candidates: MyOwnMeshNetworkCandidate[]): MyOwnMeshNetworkCandidate | undefined {
+  return selectFleetNetworks(candidates)[0]
+}
+
+function peerStatusRank(status: string | undefined): number {
+  if (status === 'active') return 4
+  if (status === 'pending_approval') return 3
+  if (status === 'sighted') return 2
+  if (status === 'offline') return 1
+  return 0
+}
+
+/** Merge duplicate peer presence across networks, preferring an active and then lower-latency route. */
+export function mergeFleetPeers(candidates: MyOwnMeshNetworkCandidate[]): DirectMeshPeer[] {
+  const merged = new Map<string, MyOwnMeshPeer>()
+  for (const candidate of candidates) {
+    for (const peer of candidate.peers ?? []) {
+      if (!allMyStuffPeer(peer)) continue
+      const siteId = canonicalDevice(peer.device_id)
+      if (!siteId) continue
+      const current = merged.get(siteId)
+      const rank = peerStatusRank(peer.status)
+      const currentRank = peerStatusRank(current?.status)
+      const latency = typeof peer.rtt_ms === 'number' ? peer.rtt_ms : Number.POSITIVE_INFINITY
+      const currentLatency = typeof current?.rtt_ms === 'number' ? current.rtt_ms : Number.POSITIVE_INFINITY
+      if (!current || rank > currentRank || (rank === currentRank && latency < currentLatency)) {
+        merged.set(siteId, peer)
+      }
+    }
+  }
+  return [...merged.entries()].map(([siteId, peer]) => ({
+    siteId,
+    label: safeLabel(peer.label, siteId.slice(0, 8)),
+    online: peer.status === 'active',
+    status: peer.status ?? 'unknown',
+    ...(typeof peer.rtt_ms === 'number' ? { rttMs: peer.rtt_ms } : {}),
+  }))
+}
+
+/** Pick an active application-RPC route for one peer from an already best-first network list. */
+export function selectPeerNetwork(
+  candidates: MyOwnMeshNetworkCandidate[],
+  peerId: string,
+): MyOwnMeshNetworkCandidate | undefined {
+  const wanted = canonicalDevice(peerId)
+  return candidates
+    .map((candidate, order) => ({
+      candidate,
+      order,
+      peer: (candidate.peers ?? []).find((peer) => allMyStuffPeer(peer) && canonicalDevice(peer.device_id) === wanted),
+    }))
+    .filter((entry) => entry.peer?.status === 'active')
+    .sort((left, right) => {
+      const leftRtt = typeof left.peer?.rtt_ms === 'number' ? left.peer.rtt_ms : Number.POSITIVE_INFINITY
+      const rightRtt = typeof right.peer?.rtt_ms === 'number' ? right.peer.rtt_ms : Number.POSITIVE_INFINITY
+      return leftRtt - rightRtt || left.order - right.order
+    })[0]?.candidate
 }
 
 /**
@@ -147,9 +221,12 @@ export function selectFleetNetwork(candidates: MyOwnMeshNetworkCandidate[]): MyO
  * No TCP listener, mapped localhost port, or AllMyStuff Site is involved.
  */
 export class MyOwnMeshRpcBridge {
-  private networkId = ''
+  private networks: MyOwnMeshNetworkCandidate[] = []
+  private networkDiscoveredAt = 0
   private handler: DirectMeshHandler | null = null
-  private eventSocket: net.Socket | null = null
+  private readonly eventSockets = new Map<string, net.Socket>()
+  private readonly connectingNetworks = new Map<string, Promise<void>>()
+  private readonly connectingSockets = new Map<string, net.Socket>()
   private stopped = true
   private reconnectTimer: NodeJS.Timeout | null = null
   private reconnectAttempt = 0
@@ -160,8 +237,15 @@ export class MyOwnMeshRpcBridge {
     private readonly method = DEFAULT_METHOD,
   ) {}
 
-  status(): { available: boolean; networkId?: string; method: string } {
-    return { available: Boolean(this.networkId && this.eventSocket && !this.eventSocket.destroyed), ...(this.networkId ? { networkId: this.networkId } : {}), method: this.method }
+  status(): { available: boolean; networkId?: string; networkIds?: string[]; method: string } {
+    const networkIds = [...this.eventSockets.entries()]
+      .filter(([, socket]) => !socket.destroyed)
+      .map(([network]) => network)
+    return {
+      available: networkIds.length > 0,
+      ...(networkIds[0] ? { networkId: networkIds[0], networkIds } : {}),
+      method: this.method,
+    }
   }
 
   async identity(): Promise<DirectMeshIdentity | null> {
@@ -182,17 +266,9 @@ export class MyOwnMeshRpcBridge {
   }
 
   async peers(forceDiscovery = false): Promise<DirectMeshPeer[]> {
-    const network = await this.discoverNetwork(forceDiscovery)
-    if (!network) return []
-    return (network.peers ?? [])
-      .filter(allMyStuffPeer)
-      .map((peer) => ({
-        siteId: canonicalDevice(peer.device_id),
-        label: safeLabel(peer.label, canonicalDevice(peer.device_id).slice(0, 8)),
-        online: peer.status === 'active',
-        status: peer.status ?? 'unknown',
-        ...(typeof peer.rtt_ms === 'number' ? { rttMs: peer.rtt_ms } : {}),
-      }))
+    const networks = await this.discoverNetworks(forceDiscovery)
+    if (!this.stopped) void this.syncInboundNetworks(networks)
+    return mergeFleetPeers(networks)
   }
 
   setHandler(handler: DirectMeshHandler): void {
@@ -210,13 +286,26 @@ export class MyOwnMeshRpcBridge {
     this.stopped = true
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
     this.reconnectTimer = null
-    this.eventSocket?.destroy()
-    this.eventSocket = null
+    for (const socket of this.eventSockets.values()) socket.destroy()
+    for (const socket of this.connectingSockets.values()) socket.destroy()
+    this.eventSockets.clear()
+    this.connectingNetworks.clear()
+    this.connectingSockets.clear()
   }
 
   async call(peer: string, payload: unknown, timeoutMs = 20_000): Promise<unknown> {
-    const network = await this.discoverNetwork()
-    if (!network) throw new Error('No active AllMyStuff fleet network with compatible peers was found.')
+    let networks = await this.discoverNetworks()
+    let network = selectPeerNetwork(networks, peer)
+    if (!network) {
+      networks = await this.discoverNetworks(true)
+      network = selectPeerNetwork(networks, peer)
+    }
+    if (!network) {
+      const known = mergeFleetPeers(networks).find((candidate) => candidate.siteId === canonicalDevice(peer))
+      throw new Error(known
+        ? `MyOwnMesh peer ${known.label} is ${known.status} on every eligible shared network.`
+        : 'No active AllMyStuff fleet route to that peer was found.')
+    }
     const response = await this.request<{ response?: unknown }>({
       op: 'rpc_call',
       network: network.config_id,
@@ -228,23 +317,26 @@ export class MyOwnMeshRpcBridge {
     return response.data?.response
   }
 
-  private async discoverNetwork(force = false): Promise<MyOwnMeshNetworkCandidate | undefined> {
-    if (this.networkId && !force) {
-      const peers = await this.readPeers(this.networkId)
-      return { config_id: this.networkId, phase: 'active', peers }
+  private async discoverNetworks(force = false): Promise<MyOwnMeshNetworkCandidate[]> {
+    if (this.networks.length > 0 && !force && Date.now() - this.networkDiscoveredAt < NETWORK_DISCOVERY_TTL_MS) {
+      this.networks = await Promise.all(this.networks.map(async (candidate) => ({
+        ...candidate,
+        peers: await this.readPeers(candidate.config_id),
+      })))
+      return this.networks
     }
     const preferred = process.env.ALLMYAGENTS_MESH_NETWORK?.trim()
     const listed = await this.request<{ networks?: MyOwnMeshNetworkCandidate[] }>({ op: 'networks_list' }, 5_000).catch(() => null)
-    if (!listed?.ok) return undefined
+    if (!listed?.ok) return this.networks
     const candidates = await Promise.all((listed.data?.networks ?? []).map(async (candidate) => ({
       ...candidate,
       peers: await this.readPeers(candidate.config_id),
     })))
-    const selected = preferred
-      ? candidates.find((candidate) => candidate.config_id === preferred || candidate.network_id === preferred)
-      : selectFleetNetwork(candidates)
-    this.networkId = selected?.config_id ?? ''
-    return selected
+    this.networks = preferred
+      ? candidates.filter((candidate) => candidate.config_id === preferred || candidate.network_id === preferred)
+      : selectFleetNetworks(candidates)
+    this.networkDiscoveredAt = Date.now()
+    return this.networks
   }
 
   private async readPeers(network: string): Promise<MyOwnMeshPeer[]> {
@@ -253,14 +345,42 @@ export class MyOwnMeshRpcBridge {
   }
 
   private async connectInbound(): Promise<void> {
-    if (this.stopped || this.eventSocket) return
-    const network = await this.discoverNetwork(true)
-    if (!network) {
+    if (this.stopped) return
+    const networks = await this.discoverNetworks(true)
+    if (networks.length === 0) {
       this.scheduleReconnect()
       return
     }
+    await this.syncInboundNetworks(networks)
+    if (this.eventSockets.size < networks.length) this.scheduleReconnect()
+  }
+
+  private async syncInboundNetworks(networks: MyOwnMeshNetworkCandidate[]): Promise<void> {
+    if (this.stopped) return
+    const desired = new Set(networks.map((network) => network.config_id))
+    for (const [network, socket] of this.eventSockets) {
+      if (!desired.has(network)) socket.destroy()
+    }
+    await Promise.allSettled(networks.map((network) => this.connectInboundNetwork(network.config_id)))
+  }
+
+  private async connectInboundNetwork(network: string): Promise<void> {
+    if (this.stopped || this.eventSockets.has(network)) return
+    const pending = this.connectingNetworks.get(network)
+    if (pending) return pending
+    const connection = this.openInboundNetwork(network)
+    this.connectingNetworks.set(network, connection)
+    try {
+      await connection
+    } finally {
+      if (this.connectingNetworks.get(network) === connection) this.connectingNetworks.delete(network)
+    }
+  }
+
+  private async openInboundNetwork(network: string): Promise<void> {
     await new Promise<void>((resolve, reject) => {
       const socket = net.createConnection(this.socketPath)
+      this.connectingSockets.set(network, socket)
       let buffer = ''
       let acknowledged = false
       let settled = false
@@ -302,9 +422,17 @@ export class MyOwnMeshRpcBridge {
               return
             }
             acknowledged = true
-            this.eventSocket = socket
-            void this.registerHandler(clientId, network.config_id)
+            void this.registerHandler(clientId, network)
               .then(() => {
+                if (this.stopped || socket.destroyed) {
+                  finishStart(new Error(this.stopped
+                    ? 'Direct mesh bridge stopped during registration'
+                    : 'MyOwnMesh event socket closed during registration'))
+                  if (!socket.destroyed) socket.destroy()
+                  return
+                }
+                this.connectingSockets.delete(network)
+                this.eventSockets.set(network, socket)
                 this.reconnectAttempt = 0
                 finishStart()
               })
@@ -317,12 +445,13 @@ export class MyOwnMeshRpcBridge {
       socket.on('error', (error) => finishStart(error))
       socket.on('close', () => {
         clearTimeout(timeout)
-        if (this.eventSocket === socket) this.eventSocket = null
-        if (!acknowledged) finishStart(new Error('MyOwnMesh event socket closed before subscription'))
+        if (this.connectingSockets.get(network) === socket) this.connectingSockets.delete(network)
+        if (this.eventSockets.get(network) === socket) this.eventSockets.delete(network)
+        if (!settled) finishStart(new Error(acknowledged
+          ? 'MyOwnMesh event socket closed during registration'
+          : 'MyOwnMesh event socket closed before subscription'))
         this.scheduleReconnect()
       })
-    }).catch(() => {
-      this.scheduleReconnect()
     })
   }
 

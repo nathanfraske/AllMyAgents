@@ -42,6 +42,7 @@
     type ThreadSidePanel,
   } from './uiState'
   import { profileLabel } from './profileLabel'
+  import { apiEquivalentCostLabel } from './usageDisplay'
   import { resolveSlash, builtinsForProvider, builtinNeedsArg, loadProfileCommands, type SlashResult } from './commands'
   import { resolveWorkingContext, truncatePathTail } from './workingContext'
   import type { AttachmentRef, CommandInfo } from './api'
@@ -853,8 +854,8 @@
     if (view.contextUsed && view.contextWindow) {
       parts.push(`context ${Math.round((view.contextUsed / view.contextWindow) * 100)}% (${fmtTokens(view.contextUsed)}/${fmtTokens(view.contextWindow)})`)
     }
-    if (view.costUsd) parts.push(`$${view.costUsd.toFixed(4)} this session`)
-    else if (typeof u?.totalCostUsd === 'number') parts.push(`$${u.totalCostUsd.toFixed(4)} this hub run`)
+    if (view.costUsd) parts.push(apiEquivalentCostLabel(view.costUsd, 'this session'))
+    else if (typeof u?.totalCostUsd === 'number') parts.push(apiEquivalentCostLabel(u.totalCostUsd))
     return parts.length ? `usage · ${parts.join(' · ')}` : 'no usage data yet'
   }
 

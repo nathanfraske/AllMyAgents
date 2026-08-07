@@ -140,8 +140,19 @@ export interface WorkerAgentServiceDeps {
  */
 export function buildWorkerAgentServices(deps: WorkerAgentServiceDeps): AgentServices {
   return {
-    send: (from, to, subject, body) =>
-      deps.relayRpc('bus.send', { fromSessionId: from.sessionId, to, subject, body }) as Promise<{ ok: boolean; delivered: number; error?: string }>,
+    send: (from, to, subject, body, wake) =>
+      deps.relayRpc('bus.send', {
+        fromSessionId: from.sessionId,
+        to,
+        subject,
+        body,
+        ...(wake === undefined ? {} : { wake }),
+      }) as Promise<{
+        ok: boolean
+        delivered: number
+        deferred?: number
+        error?: string
+      }>,
     inbox: (sessionId) => deps.relayRpc('bus.inbox', { sessionId }) as Promise<BusMessage[]>,
     roster: (sessionId) =>
       deps.relayRpc('bus.roster', { sessionId }) as Promise<Array<{
@@ -165,6 +176,10 @@ export function buildWorkerAgentServices(deps: WorkerAgentServiceDeps): AgentSer
       deps.relayRpc('manager.manageTeam', { managerSessionId, input }) as ReturnType<
         NonNullable<AgentServices['manageTeam']>
       >,
+    manageChild: (managerSessionId, input) =>
+      deps.relayRpc('manager.manageChild', { managerSessionId, input }) as ReturnType<
+        NonNullable<AgentServices['manageChild']>
+      >,
     spawnAgent: (managerSessionId, input) =>
       deps.relayRpc('manager.spawn', { managerSessionId, input }) as Promise<ManagerSpawnResult>,
     setChildAuthority: (managerSessionId, childSessionId, authorities, tools, permissionMode) =>
@@ -186,7 +201,7 @@ export function buildWorkerAgentServices(deps: WorkerAgentServiceDeps): AgentSer
         managerSessionId,
         childSessionId,
         input,
-      }) as Promise<{ ok: boolean; taskId?: string; error?: string }>,
+      }) as Promise<{ ok: boolean; taskId?: string; warning?: string; error?: string }>,
     browser: (sessionId, operation, args) =>
       deps.relayRpc('browser.execute', { sessionId, operation, args }) as ReturnType<AgentServices['browser']>,
     remoteDevices: (sessionId) =>

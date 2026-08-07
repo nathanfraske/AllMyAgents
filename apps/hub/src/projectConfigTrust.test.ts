@@ -173,7 +173,7 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
     })()
   },
 }))
-const { ClaudeDriver } = await import('./adapters/claude.js')
+const { ClaudeDriver, CLAUDE_AUTO_COMPACT_WINDOW } = await import('./adapters/claude.js')
 const driver = () => new ClaudeDriver('/tmp/profile', '/tmp/cwd', () => {}, (async () => ({ behavior: 'allow', updatedInput: {} })) as never)
 
 describe('ClaudeDriver project-config gate (safe default)', () => {
@@ -192,6 +192,9 @@ describe('ClaudeDriver project-config gate (safe default)', () => {
     await driver().send('hi', { permissionMode: 'safe', trustProjectConfig: true })
     const o = captured[0]!
     expect(o.strictMcpConfig).not.toBe(true)
-    expect(o.settings).toBeUndefined()
+    expect(o.settings).toEqual({
+      autoCompactEnabled: true,
+      autoCompactWindow: CLAUDE_AUTO_COMPACT_WINDOW,
+    })
   })
 })

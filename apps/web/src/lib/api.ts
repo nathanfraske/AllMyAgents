@@ -238,11 +238,20 @@ export interface SessionRecord {
   managerOperatorTask?: string
   managerStandingInstructions?: string
   managerCanApproveChildren?: boolean
+  managerPauseExhaustedAccounts?: boolean
+  managerAllowWorkerSubagents?: boolean
+  managerMaxSubagentsPerWorker?: number
   managerPermissionModeCeiling?: 'safe' | 'edits' | 'full'
   managerMaxChildPermissionMode?: 'safe' | 'edits' | 'full'
   parentSessionId?: string
+  isOneShotSubagent?: boolean
+  managerRootSessionId?: string
+  oneShotOrdinal?: number
   managerTeamId?: string
   managerTeamName?: string
+  managerRetiredAt?: string
+  managerRetiredBySessionId?: string
+  managerRetiredReason?: string
   delegatedAuthorities?: Array<'commit' | 'push'>
   delegatedTools?: string[]
   title?: string
@@ -1025,12 +1034,62 @@ export interface HubPrefs {
   fileWriteDiffDensity?: FileWriteDiffDensity
 }
 
+export interface NotificationPreferences {
+  managerCompletions: boolean
+  overseerCompletions: boolean
+  agentCompletions: boolean
+  errors: boolean
+  approvals: boolean
+  stalls: boolean
+  journalPressure: boolean
+  desktopEnabled: boolean
+}
+
+export interface NotificationRecord {
+  id: string
+  kind: 'session-completed' | 'session-error' | 'approval-required' | 'session-stalled' | 'journal-pressure' | 'hub-warning'
+  severity: 'info' | 'warning' | 'error'
+  title: string
+  body: string
+  sourceRole: 'agent' | 'manager' | 'overseer' | 'system'
+  route: 'operator' | 'manager' | 'overseer'
+  sessionId?: string
+  projectId?: string
+  createdAt: string
+  readAt?: string
+  desktopEligible: boolean
+  desktopDeliveredAt?: string
+}
+
+export interface NotificationInbox {
+  items: NotificationRecord[]
+  unread: number
+}
+
+export interface ElevationBrokerStatus {
+  available: boolean
+  mode: 'on-demand-uac' | 'unavailable'
+  persistentService: false
+  fullAccessImpliesElevation: false
+  detail: string
+}
+
 export interface OverseerStatus {
   configured: boolean
   profileId?: string
   sessionId?: string
   session?: SessionRecord
   available: boolean
+  operatingMode?: 'standard' | 'tokenmaxxing' | 'eco'
+  policy?: OverseerModePolicy
+  modePolicies?: Partial<Record<'tokenmaxxing' | 'eco', OverseerModePolicy>>
+}
+
+export interface OverseerModePolicy {
+  guidance?: string
+  ideaPool: string[]
+  maxParallelAgents: number
+  preferredEffort?: string
 }
 
 export interface ApiError {
@@ -1075,6 +1134,7 @@ export interface BusMessage {
   toSession: string
   subject: string | null
   body: string
+  wake: boolean
   delivered: boolean
   readAt: string | null
 }
@@ -1480,6 +1540,9 @@ export const api = {
       operatorTask?: string
       standingInstructions?: string
       canApproveChildren?: boolean
+      pauseExhaustedAccounts?: boolean
+      allowWorkerSubagents?: boolean
+      maxSubagentsPerWorker?: number
       permissionMode?: 'safe' | 'edits' | 'full'
       maxChildPermissionMode?: 'safe' | 'edits' | 'full'
     }
@@ -1567,8 +1630,24 @@ export const api = {
   // Owner preferences (hub-side settings that are not safety switches).
   prefs: () => jget<HubPrefs>('/api/config/prefs'),
   setPrefs: (patch: Partial<HubPrefs>) => jpost<HubPrefs | ApiError>('/api/config/prefs', patch),
+  notifications: (limit = 100) => jget<NotificationInbox>(`/api/notifications?limit=${Math.max(1, Math.min(250, Math.trunc(limit)))}`),
+  notificationPreferences: () => jget<NotificationPreferences>('/api/notifications/preferences'),
+  setNotificationPreferences: (patch: Partial<NotificationPreferences>) =>
+    jpost<NotificationPreferences | ApiError>('/api/notifications/preferences', patch),
+  markNotificationsRead: (ids?: string[]) =>
+    jpost<{ ok?: boolean; changed?: number } | ApiError>('/api/notifications/read', ids ? { ids } : { all: true }),
+  markNotificationsDesktopDelivered: (ids: string[]) =>
+    jpost<{ ok?: boolean; changed?: number } | ApiError>('/api/notifications/desktop-delivered', { ids }),
+  elevationBroker: () => jget<ElevationBrokerStatus>('/api/elevation'),
   overseer: () => jget<OverseerStatus>('/api/overseer'),
   configureOverseer: (profileId: string) => jpost<OverseerStatus | ApiError>('/api/overseer', { profileId }),
+  setOverseerMode: (input: {
+    operatingMode: 'standard' | 'tokenmaxxing' | 'eco'
+    guidance?: string
+    ideaPool?: string[]
+    maxParallelAgents?: number
+    preferredEffort?: string
+  }) => jpost<OverseerStatus | ApiError>('/api/overseer/mode', input),
   // Danger Zone toggles.
   danger: () => jget<DangerFlags>('/api/config/danger'),
   setDanger: (patch: Partial<DangerFlags>) => jpost<DangerFlags | ApiError>('/api/config/danger', patch),

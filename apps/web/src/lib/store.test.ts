@@ -537,6 +537,17 @@ describe('apply()', () => {
     expect(store.sessions.t2?.liveTokens?.total).toBe(10)
   })
 
+  it('session/tokens carries normalized Codex context occupancy without the raw vendor envelope', () => {
+    seed('t-context', { provider: 'codex' })
+    apply(evt({
+      seq: 1,
+      kind: 'session/tokens',
+      sessionId: 't-context',
+      payload: { contextUsed: 42_000, contextWindow: 258_000 },
+    }))
+    expect(store.sessions['t-context']).toMatchObject({ contextUsed: 42_000, contextWindow: 258_000 })
+  })
+
   it('session/status sets turnStartedAt while active and clears it when idle', () => {
     seed('st1')
     expect(store.sessions.st1?.turnStartedAt).toBeUndefined()

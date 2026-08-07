@@ -1042,7 +1042,7 @@ describe('project-manager delegated authority security boundary', () => {
     })).toBe(false)
   })
 
-  it('a manager cannot approve for a chat that is not its direct child', async () => {
+  it('a manager cannot approve for a chat outside its validated hierarchy', async () => {
     const { sessions, seed } = makeSessions()
     seed({
       isProjectManager: true,
@@ -1060,7 +1060,7 @@ describe('project-manager delegated authority security boundary', () => {
 
     expect(controls(sessions).decideChildApproval('s1', approvalId, true)).toMatchObject({
       ok: false,
-      error: expect.stringMatching(/direct child/i),
+      error: expect.stringMatching(/manager.s hierarchy/i),
     })
     expect(approvals.pending()).toHaveLength(1)
     approvals.resolve(approvalId, false)

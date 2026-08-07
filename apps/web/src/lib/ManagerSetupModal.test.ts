@@ -60,13 +60,13 @@ beforeEach(() => {
 })
 
 describe('Manager setup', () => {
-  it('explains the role, required scope, and own-child visibility before granting', () => {
+  it('explains the role, required scope, and managed-hierarchy visibility before granting', () => {
     const { getByText, getAllByText } = render(ManagerSetupModal, { onclose: vi.fn() })
     expect(getByText(/spawns and oversees other agents on your behalf/i)).toBeTruthy()
     expect(getAllByText('Project')).toHaveLength(2)
     expect(getByText('Worker accounts & models')).toBeTruthy()
     expect(getByText('Live child limit')).toBeTruthy()
-    expect(getByText(/its own children, and only those/i)).toBeTruthy()
+    expect(getByText(/its own managed hierarchy, and only that hierarchy/i)).toBeTruthy()
   })
 
   it('makes promotion and creation two clear choices in one flow', () => {
@@ -100,13 +100,14 @@ describe('Manager setup', () => {
     )
   })
 
-  it('makes worker Git delegation and optional exact tool grants unambiguous', () => {
+  it('makes worker Git delegation and exact approval/tool ceilings unambiguous on Windows too', () => {
     const { getByText, getAllByText, getByLabelText } = render(ManagerSetupModal, { onclose: vi.fn() })
-    expect(getByText('What the manager may grant to workers')).toBeTruthy()
+    expect(getByText('Git actions the manager may grant or approve once')).toBeTruthy()
     expect(getByText(/no worker can be granted commit or push/i)).toBeTruthy()
-    expect(getByText(/optional.*workers request approval/i)).toBeTruthy()
+    expect(getByText(/requests outside this exact list go to the operator or overseer/i)).toBeTruthy()
     expect(getByText(/choose common tools below/i)).toBeTruthy()
     expect(getAllByText('Read').length).toBeGreaterThan(0)
+    expect(getAllByText('PowerShell').length).toBeGreaterThan(0)
     expect(getByLabelText(/custom exact tool name/i)).toBeTruthy()
   })
 
@@ -190,6 +191,7 @@ describe('Manager setup', () => {
     expect(prompt).toContain('Demo project')
     expect(prompt).toContain('C:/repo')
     expect(prompt).toMatch(/spawn_agent.*isolated.*worktree/is)
+    expect(prompt).toMatch(/manage_child.*retire.*preserv.*live-child slot/is)
     expect(prompt).toMatch(/child_status.*peek_agent.*set_child_authority.*decide_child_approval/is)
     expect(prompt).toMatch(/send_message.*direct.*broadcast/is)
     expect(prompt).toMatch(/practice.*memory/is)
@@ -206,6 +208,7 @@ describe('Manager setup', () => {
     const standing = (getByLabelText(/standing manager rules/i) as HTMLTextAreaElement).value
     expect(standing).toMatch(/mcp__allmyagents(?:__|\.)spawn_agent/i)
     expect(standing).toMatch(/never.*collaboration\.spawn_agent/is)
+    expect(standing).toMatch(/manage_child.*retire.*releases capacity/is)
   })
 
   it('offers Lane O project creation inline and returns a deferred embedded launch config', async () => {

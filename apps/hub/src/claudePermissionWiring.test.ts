@@ -37,7 +37,7 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
   },
 }))
 
-const { ClaudeDriver } = await import('./adapters/claude.js')
+const { ClaudeDriver, CLAUDE_AUTO_COMPACT_WINDOW } = await import('./adapters/claude.js')
 
 function makeDriver(
   canUseTool?: (t: string, i: unknown, context?: unknown) => Promise<unknown>
@@ -70,6 +70,18 @@ describe('ClaudeDriver permission wiring', () => {
   it('always installs canUseTool, which is where the hub policy is enforced', async () => {
     await makeDriver(async () => ({ behavior: 'allow', updatedInput: {} })).send('hi', { permissionMode: 'full' })
     expect(typeof captured[0]!.canUseTool).toBe('function')
+  })
+
+  it('enables the supported Claude auto-compaction window on every resumed app turn', async () => {
+    const driver = makeDriver()
+    driver.restore('large-resumed-session')
+
+    await driver.send('new task', { trustProjectConfig: true })
+
+    expect(captured[0]!.settings).toMatchObject({
+      autoCompactEnabled: true,
+      autoCompactWindow: CLAUDE_AUTO_COMPACT_WINDOW,
+    })
   })
 
   it('appends the AllMyAgents host contract at the system boundary on every resumed invocation', async () => {
