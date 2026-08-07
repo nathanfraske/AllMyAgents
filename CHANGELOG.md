@@ -5,6 +5,36 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.21-alpha.24 — 2026-08-07
+
+This release closes the high-context manager dead end, adds bounded worker-owned one-shot agents and
+reversible child retirement, gives the Overseer durable Tokenmaxxing/Eco policies, introduces a bounded
+notification center and journal-pressure diagnostics, and makes mesh discovery and maintenance contention
+truthful under the operator's live workload.
+
+[Full v0.1.21-alpha.24 release notes](docs/releases/v0.1.21-alpha.24.md)
+
+- Claude enables its supported automatic compaction window on every resumed query; Codex context occupancy is
+  normalized into the same provider-neutral telemetry. Background mail no longer launches another enormous
+  idle turn above the bounded context threshold, while active turns still accept steering and queued mail is
+  folded into the next operator-started turn.
+- Managers can non-destructively retire an idle, failed, or stopped child, free its live slot, spawn a successor,
+  and reactivate the preserved child later when team and capacity bounds allow. Enabled workers can create
+  tightly bounded same-account one-shot descendants rendered beneath them as Name II, III, and so on.
+- Tokenmaxxing and Eco mode are durable, direct-operator Overseer policies with reusable guidance/idea pools,
+  explicit concurrency bounds, live quota/reset inspection, and provider-native reinjection after compaction.
+- A durable 30-day/1,000-row notification inbox covers manager/Overseer completions by default plus errors,
+  approvals, stalls, and journal pressure; desktop notifications are separately opt-in. Full Access still does
+  not imply Administrator/root, and the UI reports the existing one-shot audited elevation broker honestly.
+- Journal maintenance now compacts completed-item starts, retains recovery generations by bytes as well as
+  count, exposes `pnpm journal:audit`, and warns on allocated/retained storage without rescanning the event table.
+  Its isolated writer waits longer under live traffic and records residual SQLite contention as a deferred retry
+  instead of a false terminal failure.
+- MyOwnMesh now discovers every eligible owned network, selects the route where the requested peer is actually
+  active, registers inbound Hub RPC on each shared mesh, and automatically warms presence-advertised Hub ports.
+- Reloaded transcript attachments use a narrowly scoped read-only capability URL for the exact attachment GET;
+  query authentication remains rejected for every other API route and every mutation.
+
 ## v0.1.20-alpha.23 — 2026-08-05
 
 This release adds durable, operator-owned GitHub automation grants for managers, managed workers,

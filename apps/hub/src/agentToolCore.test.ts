@@ -16,7 +16,7 @@ interface Harness {
   services: AgentServices
   memory: MemoryStore
   practices: PracticeStore
-  sent: { to: BusAddress; subject?: string; body: string }[]
+  sent: { to: BusAddress; subject?: string; body: string; wake?: boolean }[]
   journaled: { kind: string; payload: unknown }[]
   approvals: { kind: string; payload: unknown }[]
   browserCalls: { sessionId: string; operation: string; args: Record<string, unknown> }[]
@@ -25,13 +25,14 @@ interface Harness {
 function makeHarness(opts: {
   roster?: { sessionId: string; label: string; provider: string; status: string }[]
   inbox?: { fromLabel: string; fromSession: string; subject: string | null; body: string }[]
-  sendResult?: { ok: boolean; delivered: number; error?: string }
+  sendResult?: { ok: boolean; delivered: number; deferred?: number; error?: string }
   approve?: boolean
   isBusTurn?: boolean
   danger?: DangerFlags
   peek?: { found: boolean; summary?: string }
   childStatus?: { ok: boolean; summary?: string; error?: string }
   manageTeam?: { ok: boolean; summary?: string; error?: string }
+  manageChild?: { ok: boolean; summary?: string; error?: string }
 } = {}): Harness {
   const memory = new MemoryStore(new Database(':memory:'))
   const practices = new PracticeStore(new Database(':memory:'))
@@ -40,8 +41,8 @@ function makeHarness(opts: {
   const approvals: Harness['approvals'] = []
   const browserCalls: Harness['browserCalls'] = []
   const services: AgentServices = {
-    send: (_from, to, subject, body) => {
-      sent.push({ to, subject, body })
+    send: (_from, to, subject, body, wake) => {
+      sent.push({ to, subject, body, wake })
       return opts.sendResult ?? { ok: true, delivered: 1 }
     },
     inbox: () => (opts.inbox ?? []) as never,
@@ -49,6 +50,7 @@ function makeHarness(opts: {
     peek: (_caller, _target) => opts.peek ?? { found: false },
     childStatus: () => opts.childStatus ?? { ok: false, error: 'not a project manager' },
     manageTeam: () => opts.manageTeam ?? { ok: false, error: 'not a project manager' },
+    manageChild: () => opts.manageChild ?? { ok: false, error: 'not a project manager' },
     browser: async (sessionId, operation, args) => {
       browserCalls.push({ sessionId, operation, args })
       return [{ type: 'text', text: 'browser unavailable in test' }]
@@ -78,6 +80,7 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
       'peek_agent',
       'child_status',
       'manage_team',
+      'manage_child',
       'spawn_agent',
       'set_child_authority',
       'decide_child_approval',
@@ -280,6 +283,20 @@ describe('manage_team (durable manager lineups)', () => {
   })
 })
 
+describe('manage_child (reversible manager retirement)', () => {
+  it('returns the hub-authored preservation and capacity result', async () => {
+    const summary = 'Retired Corbato and released one live-child slot; workspace preserved.'
+    const h = makeHarness({ manageChild: { ok: true, summary } })
+    expect(
+      await runAgentTool(
+        'manage_child',
+        { operation: 'retire', child_session: 'child-1', reason: 'context exhausted' },
+        { identity: idA, services: h.services },
+      ),
+    ).toBe(summary)
+  })
+})
+
 describe('send_message (bus addressing)', () => {
   it('addresses a specific teammate when to_session is given', async () => {
     const h = makeHarness({ sendResult: { ok: true, delivered: 1 } })
@@ -294,6 +311,29 @@ describe('send_message (bus addressing)', () => {
     const out = await runAgentTool('send_message', { body: 'team update' }, { identity: idA, services: h.services })
     expect(out).toBe('Delivered to 3 agent(s).')
     expect(h.sent[0]!.to).toEqual({ kind: 'project', id: 'p1' })
+  })
+
+  it('can queue a non-urgent message without waking an idle recipient', async () => {
+    const h = makeHarness({ sendResult: { ok: true, delivered: 1 } })
+    const out = await runAgentTool(
+      'send_message',
+      { to_session: 'peer99', body: 'checkpoint only', wake: false },
+      { identity: idA, services: h.services },
+    )
+    expect(out).toBe('Queued for 1 agent(s) without starting an idle turn.')
+    expect(h.sent[0]?.wake).toBe(false)
+  })
+
+  it('reports automatic high-context deferral as queued rather than failed', async () => {
+    const h = makeHarness({
+      sendResult: { ok: true, delivered: 1, deferred: 1, error: 'Held one expensive idle wake.' },
+    })
+    const out = await runAgentTool(
+      'send_message',
+      { to_session: 'peer99', body: 'new note' },
+      { identity: idA, services: h.services },
+    )
+    expect(out).toMatch(/1 high-context idle recipient.*Held one expensive idle wake/is)
   })
 
   it('refuses a broadcast when the caller is not in a project (no fan-out target)', async () => {

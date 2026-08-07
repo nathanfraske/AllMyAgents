@@ -505,6 +505,28 @@ describe('owned journal corruption recovery', () => {
     expect(fs.readFileSync(path.join(competitor, 'competitor-evidence'), 'utf8')).toBe('retain')
   })
 
+  it('bounds recovery generations by bytes as well as count while retaining the newest', async () => {
+    const dataDir = root('ama-recovery-byte-retention')
+    const journal = open(dataDir)
+    journal.append('s1', 'session/input', { text: 'generation-one' })
+    await strongSnapshot(dataDir, journal, new Date('2026-07-29T00:00:00.000Z'))
+    journal.append('s1', 'session/input', { text: 'generation-two' })
+    const snapshot = path.join(dataDir, 'byte-budget-candidate.db')
+    await journal.db.backup(snapshot)
+    const bytes = fs.statSync(snapshot).size
+
+    publishRecoveryGeneration({
+      dataDir,
+      snapshotFile: snapshot,
+      maxSchemaVersion: SCHEMA_VERSION,
+      keep: 6,
+      maxRetainedBytes: bytes,
+    })
+
+    expect(listRecoveryGenerations(dataDir, SCHEMA_VERSION).map((item) => item.manifest.generation))
+      .toEqual(['2'])
+  })
+
   it('retains a partially published generation as evidence and publishes only a new ordinal', async () => {
     const dataDir = root()
     const journal = open(dataDir)

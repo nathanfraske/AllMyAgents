@@ -145,7 +145,7 @@ export interface SessionRecord {
   isProjectManager?: boolean
   /** Bounded direct-child capacity for a manager. Absent is never interpreted as unlimited. */
   managerMaxLiveChildren?: number
-  /** The operator's ceiling: authorities this manager may grant to its own direct children. */
+  /** The operator's ceiling: authorities this manager may grant inside its own managed hierarchy. */
   managerDelegation?: DelegatedAuthority[]
   /** Profiles (agent/account types) this manager may choose for children. Empty/absent means none. */
   managerAllowedProfiles?: string[]
@@ -167,19 +167,37 @@ export interface SessionRecord {
   managerOperatorTask?: string
   /** Session-scoped operator instructions rematerialized into CLAUDE.md/AGENTS.md for every later turn. */
   managerStandingInstructions?: string
-  /** Operator grant allowing this manager to decide pending approvals for its own direct children. */
+  /** Operator grant allowing this manager to decide pending approvals inside its own managed hierarchy. */
   managerCanApproveChildren?: boolean
+  /** When enabled, the hub refuses new dispatch to managed agents whose account is at a hard usage
+   *  limit, unless the provider reports active paid overage/credits. Missing legacy grants are off. */
+  managerPauseExhaustedAccounts?: boolean
+  /** Operator grant allowing each direct worker to create bounded same-account, one-shot descendants. */
+  managerAllowWorkerSubagents?: boolean
+  /** Maximum concurrently running one-shot descendants per direct worker. */
+  managerMaxSubagentsPerWorker?: number
   /** Maximum permission mode the operator granted to this manager itself. Bounded changes may narrow it;
    *  a separately authenticated per-chat operator override may exceed it without rewriting the grant. */
   managerPermissionModeCeiling?: 'safe' | 'edits' | 'full'
-  /** Maximum permission mode a manager may assign to direct children. Missing legacy grants fail closed to safe. */
+  /** Maximum permission mode a manager may assign within its hierarchy. Missing legacy grants fail closed to safe. */
   managerMaxChildPermissionMode?: 'safe' | 'edits' | 'full'
   /** Durable session lineage for sidebar nesting and hub-originated child reports. */
   parentSessionId?: string
+  /** Marks a bounded worker-created descendant. It inherits its parent's account and live grant. */
+  isOneShotSubagent?: boolean
+  /** Root project manager that owns this nested descendant's audit/approval lineage. */
+  managerRootSessionId?: string
+  /** 2-based lineage ordinal used for stable scientist names (II, III, IV…). */
+  oneShotOrdinal?: number
   /** Immutable team-generation membership assigned by the parent manager at child creation. */
   managerTeamId?: string
   /** Denormalized historical label so an orphaned child still explains which team owned it. */
   managerTeamName?: string
+  /** Reversible, non-destructive manager retirement. The chat, transcript, branch, dirty files, and
+   *  worktree remain available, but the child no longer consumes live capacity or reopens with its team. */
+  managerRetiredAt?: string
+  managerRetiredBySessionId?: string
+  managerRetiredReason?: string
   /** Authorities this child received from its manager, still subject to the manager's live ceiling. */
   delegatedAuthorities?: DelegatedAuthority[]
   /** Exact tool names granted to this child, still subject to the manager's live ceiling. */
@@ -444,4 +462,19 @@ export interface OverseerConfig {
   profileId?: string
   sessionId?: string
   updatedAt?: string
+  operatingMode?: OverseerOperatingMode
+  modePolicies?: Partial<Record<Exclude<OverseerOperatingMode, 'standard'>, OverseerModePolicy>>
+}
+
+export type OverseerOperatingMode = 'standard' | 'tokenmaxxing' | 'eco'
+
+export interface OverseerModePolicy {
+  /** Operator-authored durable interpretation of this mode. */
+  guidance?: string
+  /** Reusable task/audit ideas the Overseer may offer; never authorization to launch them. */
+  ideaPool: string[]
+  /** Hard prompt-level concurrency ceiling; hub launch ceilings still apply independently. */
+  maxParallelAgents: number
+  /** Preferred effort label; the Overseer must still choose a model that supports it. */
+  preferredEffort?: string
 }

@@ -38,6 +38,7 @@ import { UsageMonitor } from './usage.js'
 import { WorkspaceManager } from './workspace.js'
 import { WorktreeCollisionDetector } from './worktreeCollisionDetector.js'
 import { WorkspacePressureMonitor } from './workspacePressure.js'
+import { JournalPressureMonitor } from './journalPressure.js'
 import { MeshSite } from './meshSite.js'
 import { MyOwnMeshRpcBridge } from './myOwnMeshRpc.js'
 import { getOrCreateDeviceToken } from './deviceToken.js'
@@ -46,6 +47,7 @@ import { AgentBus } from './bus.js'
 import { MemoryStore } from './memory.js'
 import { PracticeStore } from './practices.js'
 import { BrowserBroker } from './browserBroker.js'
+import { NotificationService } from './notifications.js'
 import { InProcessExecutor, type Executor } from './executor.js'
 import { WorkerExecutor } from './workerExecutor.js'
 import { WorkerClient } from './workerTransport.js'
@@ -354,6 +356,7 @@ const restartState: RestartState = {
 // SUPERVISED HUBS ONLY TAKE ONE SET. During a blue-green flip two hubs briefly share this database; both
 // snapshotting would double the IO for no benefit, and green is the one that will survive.
 const journalBackupsDir = path.join(dataDir, 'backups')
+const notifications = new NotificationService(journal.db)
 const journalProgress = new JournalProgressReporter(
   dataDir,
   process.pid,
@@ -374,6 +377,17 @@ const journalBackups = createJournalBackupSupervisor(journal.db, {
   onStateChange: (state) => {
     if (state.status !== 'inactive') restartState.journalBackupRequired = true
     restartState.journalBackup = state
+    if (state.status === 'degraded') {
+      notifications.publish({
+        kind: 'hub-warning',
+        severity: 'error',
+        sourceRole: 'system',
+        route: 'operator',
+        title: 'Journal backup protection is degraded',
+        body: state.error,
+        dedupeKey: `journal-backup-degraded:${state.error.slice(0, 160)}:${new Date().toISOString().slice(0, 10)}`,
+      })
+    }
   },
 })
 process.once('exit', () => recoveryLease.release())
@@ -505,7 +519,7 @@ const executor: Executor = workerSocket
       attachWorker: () => sessions.attachWorker(),
     })
   : new InProcessExecutor({ approvals, questions, usage, danger, memory, practices })
-sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, dataDir, questions, executor, prefs, browserBroker)
+sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, dataDir, questions, executor, prefs, browserBroker, notifications)
 const profileLoginCoordinator = new ProfileLoginCoordinator({
   profilesDir,
   registry: new ProfileLoginRegistry(path.join(dataDir, 'profile-logins.json')),
@@ -548,6 +562,12 @@ const workspacePressure = new WorkspacePressureMonitor({
     sessions.reportWorkspacePressure(sessionId, pressure, notifyAgent),
 })
 process.once('exit', () => workspacePressure.stop())
+const journalPressure = new JournalPressureMonitor({
+  dbPath: journalPath,
+  db: journal.db,
+  notifications,
+})
+process.once('exit', () => journalPressure.stop())
 usage.setCodexReader((profileId) => sessions.readCodexLimits(profileId))
 // Let full-access chats and "always allow" grants skip the operator prompt. Installed here because the
 // policy reads session records, and ApprovalService is constructed before the SessionManager exists.
@@ -670,6 +690,7 @@ function runJournalMaintenance(): void {
         commandOutputDeltasDeleted,
         agentMessageDeltasDeleted,
         diffSnapshotsDeleted,
+        itemStartedDeleted,
         transientPayloadBytesDeleted,
         cursorCheckpointsWritten,
       } = msg.result
@@ -677,10 +698,11 @@ function runJournalMaintenance(): void {
         commandOutputDeltasDeleted ||
         agentMessageDeltasDeleted ||
         diffSnapshotsDeleted ||
+        itemStartedDeleted ||
         cursorCheckpointsWritten
       ) {
         console.log(
-          `[journal] condensed ${commandOutputDeltasDeleted} command deltas + ${agentMessageDeltasDeleted} message deltas + ${diffSnapshotsDeleted} diff snapshots (${transientPayloadBytesDeleted} payload bytes)` +
+          `[journal] condensed ${commandOutputDeltasDeleted} command deltas + ${agentMessageDeltasDeleted} message deltas + ${diffSnapshotsDeleted} diff snapshots + ${itemStartedDeleted} completed-item start rows (${transientPayloadBytesDeleted} payload bytes)` +
             (cursorCheckpointsWritten ? `; wrote ${cursorCheckpointsWritten} wseq checkpoint(s)` : '')
         )
       }
@@ -976,7 +998,7 @@ const remoteDevices = new RemoteDeviceController(fleetConnections, async (siteId
 sessions.setRemoteDeviceController(remoteDevices)
 
 // Listen on the BOOT port (0 → ephemeral for a green); the server reports its actual port back.
-const server = startServer({ port: bootPort, defaultCwd: dataDir, profilesDir, profileNames, profileOwnership, profileLoginCoordinator, journal, sessions, profiles, approvals, questions, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity: (projectId) => worktreeCollisions.projectActivity(projectId), deviceExecutor, remoteDevices, directMesh, overseer, overseerCwd: repoRoot })
+const server = startServer({ port: bootPort, defaultCwd: dataDir, profilesDir, profileNames, profileOwnership, profileLoginCoordinator, journal, sessions, profiles, approvals, questions, notifications, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity: (projectId) => worktreeCollisions.projectActivity(projectId), deviceExecutor, remoteDevices, directMesh, overseer, overseerCwd: repoRoot })
 
 // Register the mesh advert — factored so a promoted green can (re)register once it owns the port.
 function registerMesh(): void {
@@ -1066,6 +1088,7 @@ server.once('listening', () => {
     startJournalMaintenance()
     worktreeCollisions.start()
     workspacePressure.start()
+    journalPressure.start()
   }
 })
 
@@ -1088,6 +1111,7 @@ if (supervised && process.send) {
       startJournalMaintenance()
       worktreeCollisions.start()
       workspacePressure.start()
+      journalPressure.start()
     },
     // The direct RPC method is process-local. Release it only once BLUE has actually surrendered the
     // public listener, so GREEN can register the stable method without two hub generations competing.
@@ -1194,6 +1218,7 @@ function shutdown(signal: string): void {
   stopJournalMaintenance()
   worktreeCollisions.stop()
   workspacePressure.stop()
+  journalPressure.stop()
   const done = (): void => process.exit(0)
   // Cap the cleanup so a hung socket or child can't wedge shutdown.
   const guard = setTimeout(done, 2500)

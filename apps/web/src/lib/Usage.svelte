@@ -3,13 +3,7 @@
   import { settings } from './settings.svelte'
   import { resetIn } from './time'
   import { profileLabel } from './profileLabel'
-
-  function spendLabel(cost: number): string {
-    if (settings.planBudgetUsd && settings.planBudgetUsd > 0) {
-      return `${Math.round((cost / settings.planBudgetUsd) * 100)}% of plan`
-    }
-    return `$${cost.toFixed(3)} this run`
-  }
+  import { apiEquivalentCostLabel } from './usageDisplay'
 
   function claudeState(status?: string): { label: string; cls: string } {
     if (!status) return { label: 'unknown', cls: 'idle' }
@@ -49,7 +43,10 @@
         <div class="hint dim">detailed usage loading…</div>
       {/if}
       {#if u.claude && settings.showSpend && typeof u.totalCostUsd === 'number' && u.totalCostUsd > 0}
-        <div class="spend dim" title="spend this hub run">{spendLabel(u.totalCostUsd)}</div>
+        <div
+          class="spend dim"
+          title="SDK token-price estimate accumulated by this hub process; not a bill or subscription-plan percentage"
+        >{apiEquivalentCostLabel(u.totalCostUsd)}</div>
       {/if}
       {#if u.codex}
         <div class="line">

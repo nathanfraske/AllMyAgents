@@ -168,6 +168,36 @@ function auth(token: string): HeadersInit {
 }
 
 describe('device-authenticated control plane', () => {
+  it('serves durable notification preferences and the non-resident elevation broker status', async () => {
+    const { base, deviceToken, journal } = await build()
+    const headers = { ...auth(deviceToken), 'content-type': 'application/json' }
+
+    const initial = await fetch(`${base}/api/notifications/preferences`, { headers: auth(deviceToken) })
+    expect(initial.status).toBe(200)
+    expect(await initial.json()).toMatchObject({
+      managerCompletions: true,
+      overseerCompletions: true,
+      agentCompletions: false,
+      desktopEnabled: false,
+    })
+
+    const changed = await fetch(`${base}/api/notifications/preferences`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ desktopEnabled: true, agentCompletions: true }),
+    })
+    expect(changed.status).toBe(200)
+    expect(await changed.json()).toMatchObject({ desktopEnabled: true, agentCompletions: true })
+    expect(journal.since(0, 100).some((event) => event.kind === 'config/notifications')).toBe(true)
+
+    const elevation = await fetch(`${base}/api/elevation`, { headers: auth(deviceToken) })
+    expect(elevation.status).toBe(200)
+    expect(await elevation.json()).toMatchObject({
+      persistentService: false,
+      fullAccessImpliesElevation: false,
+    })
+  })
+
   it('persists GitHub automation only through authenticated project/session policy routes', async () => {
     const { base, deviceToken, projects, record, root, sessions, journal } = await build()
     const project = projects.create('Policy project', root)

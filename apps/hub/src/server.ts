@@ -58,11 +58,23 @@ import type {
   RemoteDeviceController,
 } from './remoteDevices.js'
 import type { OverseerConfig, RemoteDeviceCapability, RemoteDeviceGrant } from './types.js'
+import {
+  applyOverseerModeUpdate,
+  effectiveOverseerMode,
+  type OverseerModeUpdate,
+} from './overseerMode.js'
 import type { MyOwnMeshRpcBridge } from './myOwnMeshRpc.js'
+import {
+  EphemeralNotificationService,
+  NotificationService,
+  type NotificationCenter,
+  type NotificationPreferences,
+} from './notifications.js'
 
 const REPLAY_BASELINE_MAX_BYTES = 2 * 1024 * 1024
 const REPLAY_BASELINE_MAX_SESSIONS = 5_000
 const REPLAY_BASELINE_MAX_PROJECTS = 1_000
+const ATTACHMENT_READ_PATH = /^\/api\/sessions\/([^/]+)\/attachments\/([^/]+)$/
 
 const PAGE = `<!doctype html>
 <html>
@@ -416,6 +428,7 @@ export interface ServerOptions {
   profiles: Profile[]
   approvals: ApprovalService
   questions: QuestionService
+  notifications?: NotificationCenter
   usage: UsageMonitor
   projects: ProjectStore
   workspace: WorkspaceManager
@@ -522,8 +535,19 @@ export function persistPrefs(
 
 export function startServer(opts: ServerOptions): http.Server {
   const { port, defaultCwd, profilesDir, profileNames = {}, journal, sessions, profiles, approvals, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity, deviceExecutor, remoteDevices, directMesh } = opts
+  const notifications = opts.notifications ?? (journal.db
+    ? new NotificationService(journal.db)
+    : new EphemeralNotificationService())
   const overseer = opts.overseer ?? {}
   const overseerCwd = opts.overseerCwd ?? defaultCwd
+  const configureOverseerMode = (update: OverseerModeUpdate): OverseerConfig => {
+    const next = applyOverseerModeUpdate(overseer, update)
+    const persistError = patchConfig(configPath, 'overseer', next)
+    if (persistError) throw new Error(`Overseer mode could not be persisted: ${persistError}`)
+    Object.assign(overseer, next)
+    sessions.refreshOverseerInstructions()
+    return next
+  }
   const replayPrincipalBudget = new ReplayPrincipalBudget()
   const pairingCodes = new PairingCodeBroker(deviceToken)
   const questions = opts.questions
@@ -536,6 +560,8 @@ export function startServer(opts: ServerOptions): http.Server {
   const wsl = new WslService()
   const profileLoginCoordinator = opts.profileLoginCoordinator
   sessions.setOverseerRuntime?.({
+    overseerConfig: () => structuredClone(overseer),
+    configureOverseerMode,
     createProject: async (name, rawPath, distro) => {
       const location = await resolveProjectPath(rawPath, distro)
       if (location.kind === 'unavailable') throw new Error(location.reason)
@@ -722,7 +748,14 @@ export function startServer(opts: ServerOptions): http.Server {
         res.end()
         return
       }
-      const authed = tokenMatches(deviceToken, bearerToken(req))
+      // `<img>` and ordinary download links cannot attach the Authorization header used by fetch().
+      // Permit the device capability in the query string for this one exact, read-only resource route.
+      // Never broaden query authentication to another API or method: URLs can leak into logs/history.
+      const attachmentReadMatch = method === 'GET' ? ATTACHMENT_READ_PATH.exec(url.pathname) : null
+      const authed =
+        tokenMatches(deviceToken, bearerToken(req)) ||
+        (attachmentReadMatch !== null &&
+          tokenMatches(deviceToken, url.searchParams.get('token') ?? undefined))
       // Public probe so an unpaired client can learn whether pairing is required (never gated).
       if (method === 'GET' && url.pathname === '/api/auth') {
         json(res, { requireToken: true, authed })
@@ -1428,9 +1461,39 @@ export function startServer(opts: ServerOptions): http.Server {
           profileId: overseer.profileId,
           sessionId: session?.id,
           session,
+          ...effectiveOverseerMode(overseer),
+          modePolicies: overseer.modePolicies ?? {},
           available: !!session && session.status !== 'error' && pickableProfiles(profiles).some((profile) =>
             profile.id === overseer.profileId && profile.available !== false && profile.authStatus !== 'signed_out'),
         })
+        return
+      }
+      if (method === 'POST' && url.pathname === '/api/overseer/mode') {
+        const body = await readBody(req)
+        try {
+          const next = configureOverseerMode({
+            operatingMode: body.operatingMode as OverseerModeUpdate['operatingMode'],
+            guidance: body.guidance as string | undefined,
+            ideaPool: body.ideaPool as string[] | undefined,
+            maxParallelAgents: body.maxParallelAgents as number | undefined,
+            preferredEffort: body.preferredEffort as string | undefined,
+          })
+          journal.append(overseer.sessionId ?? null, 'overseer/operating-mode-changed', {
+            ...effectiveOverseerMode(next),
+            actor: 'operator',
+          })
+          json(res, {
+            configured: typeof next.profileId === 'string' && next.profileId.length > 0,
+            profileId: next.profileId,
+            sessionId: next.sessionId,
+            ...effectiveOverseerMode(next),
+            modePolicies: next.modePolicies ?? {},
+            available: !!next.sessionId && sessions.list().some((record) =>
+              record.id === next.sessionId && record.status !== 'error' && record.status !== 'stopped'),
+          })
+        } catch (error) {
+          json(res, { error: error instanceof Error ? error.message : String(error) }, 400)
+        }
         return
       }
       if (method === 'POST' && url.pathname === '/api/overseer') {
@@ -1451,7 +1514,15 @@ export function startServer(opts: ServerOptions): http.Server {
           ? sessions.list().find((record) => record.id === overseer.sessionId && record.isOverseer === true)
           : undefined
         if (current?.profileId === profileId) {
-          json(res, { configured: true, profileId, sessionId: current.id, session: current, available: true })
+          json(res, {
+            configured: true,
+            profileId,
+            sessionId: current.id,
+            session: current,
+            ...effectiveOverseerMode(overseer),
+            modePolicies: overseer.modePolicies ?? {},
+            available: true,
+          })
           return
         }
         const created = await sessions.create(profileId, {
@@ -1462,6 +1533,7 @@ export function startServer(opts: ServerOptions): http.Server {
           role: 'Application Overseer',
         })
         const next: OverseerConfig = {
+          ...overseer,
           profileId,
           sessionId: created.id,
           updatedAt: new Date().toISOString(),
@@ -1480,7 +1552,15 @@ export function startServer(opts: ServerOptions): http.Server {
           replacedSessionId: current?.id ?? null,
           actor: 'operator',
         })
-        json(res, { configured: true, profileId, sessionId: created.id, session: created, available: true })
+        json(res, {
+          configured: true,
+          profileId,
+          sessionId: created.id,
+          session: created,
+          ...effectiveOverseerMode(next),
+          modePolicies: next.modePolicies ?? {},
+          available: true,
+        })
         return
       }
 
@@ -1589,6 +1669,62 @@ export function startServer(opts: ServerOptions): http.Server {
       }
       if (method === 'GET' && url.pathname === '/api/approvals') {
         json(res, approvals.pending())
+        return
+      }
+      if (method === 'GET' && url.pathname === '/api/notifications') {
+        const requested = Number(url.searchParams.get('limit') ?? 100)
+        const limit = Number.isFinite(requested) ? requested : 100
+        json(res, { items: notifications.list(limit), unread: notifications.unreadCount() })
+        return
+      }
+      if (method === 'GET' && url.pathname === '/api/notifications/preferences') {
+        json(res, notifications.getPreferences())
+        return
+      }
+      if (method === 'POST' && url.pathname === '/api/notifications/preferences') {
+        const body = await readBody(req)
+        const allowed: Array<keyof NotificationPreferences> = [
+          'managerCompletions',
+          'overseerCompletions',
+          'agentCompletions',
+          'errors',
+          'approvals',
+          'stalls',
+          'journalPressure',
+          'desktopEnabled',
+        ]
+        const patch: Partial<NotificationPreferences> = {}
+        for (const key of allowed) if (typeof body[key] === 'boolean') patch[key] = body[key]
+        const next = notifications.setPreferences(patch)
+        journal.append(null, 'config/notifications', next)
+        json(res, next)
+        return
+      }
+      if (method === 'POST' && url.pathname === '/api/notifications/read') {
+        const body = await readBody(req)
+        const ids = body.all === true ? undefined : stringArray(body.ids, 'ids')
+        json(res, { ok: true, changed: notifications.markRead(ids) })
+        return
+      }
+      if (method === 'POST' && url.pathname === '/api/notifications/desktop-delivered') {
+        const body = await readBody(req)
+        json(res, {
+          ok: true,
+          changed: notifications.markDesktopDelivered(stringArray(body.ids, 'ids')),
+        })
+        return
+      }
+      if (method === 'GET' && url.pathname === '/api/elevation') {
+        const available = process.platform === 'win32'
+        json(res, {
+          available,
+          mode: available ? 'on-demand-uac' : 'unavailable',
+          persistentService: false,
+          fullAccessImpliesElevation: false,
+          detail: available
+            ? 'Privileged commands use a one-shot Windows UAC broker after project policy, blast-radius analysis, and a separate operator approval.'
+            : 'The privileged command broker currently supports Windows UAC only.',
+        })
         return
       }
       if (method === 'GET' && url.pathname === '/api/questions') {
@@ -1937,8 +2073,8 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, await sessions.storeAttachment(sessionId, rawName, mime, bytes))
         return
       }
-      const attachmentGetMatch = /^\/api\/sessions\/([^/]+)\/attachments\/([^/]+)$/.exec(url.pathname)
-      if (method === 'GET' && attachmentGetMatch) {
+      const attachmentGetMatch = attachmentReadMatch
+      if (attachmentGetMatch) {
         const attachment = sessions.attachment(attachmentGetMatch[1] as string, attachmentGetMatch[2] as string)
         if (!attachment) {
           json(res, { error: 'attachment not found' }, 404)
@@ -1954,6 +2090,8 @@ export function startServer(opts: ServerOptions): http.Server {
           'content-disposition': inline ? 'inline' : attachmentDisposition(attachment.name),
           'content-security-policy': "default-src 'none'; sandbox",
           'x-content-type-options': 'nosniff',
+          'referrer-policy': 'no-referrer',
+          'cache-control': 'private, no-store',
         })
         try {
           await pipeline(fs.createReadStream(attachment.path), res)
@@ -1968,7 +2106,15 @@ export function startServer(opts: ServerOptions): http.Server {
       const approvalMatch = /^\/api\/approvals\/([^/]+)$/.exec(url.pathname)
       if (method === 'POST' && approvalMatch) {
         const body = await readBody(req)
+        const pending = approvals.pending().find((candidate) => candidate.id === approvalMatch[1])
         const found = approvals.resolve(approvalMatch[1] as string, body.approve === true)
+        if (found && pending) {
+          journal.append(pending.sessionId, 'operator/approval-decided', {
+            approvalId: pending.id,
+            kind: pending.kind,
+            decision: body.approve === true ? 'approved' : 'denied',
+          })
+        }
         json(res, { ok: found }, found ? 200 : 404)
         return
       }
@@ -2141,6 +2287,24 @@ export function startServer(opts: ServerOptions): http.Server {
           json(res, { error: 'canApproveChildren must be boolean' }, 400)
           return
         }
+        if (body.pauseExhaustedAccounts !== undefined && typeof body.pauseExhaustedAccounts !== 'boolean') {
+          json(res, { error: 'pauseExhaustedAccounts must be boolean' }, 400)
+          return
+        }
+        if (body.allowWorkerSubagents !== undefined && typeof body.allowWorkerSubagents !== 'boolean') {
+          json(res, { error: 'allowWorkerSubagents must be boolean' }, 400)
+          return
+        }
+        const maxSubagentsPerWorker = body.maxSubagentsPerWorker === undefined
+          ? undefined
+          : Number(body.maxSubagentsPerWorker)
+        if (
+          maxSubagentsPerWorker !== undefined &&
+          (!Number.isInteger(maxSubagentsPerWorker) || maxSubagentsPerWorker < 1 || maxSubagentsPerWorker > 8)
+        ) {
+          json(res, { error: 'maxSubagentsPerWorker must be a whole number from 1 to 8' }, 400)
+          return
+        }
         const managerPermissionMode =
           body.permissionMode === undefined ? undefined : str(body.permissionMode)
         if (
@@ -2188,6 +2352,9 @@ export function startServer(opts: ServerOptions): http.Server {
             operatorTask: body.operatorTask as string | undefined,
             standingInstructions: body.standingInstructions as string | undefined,
             canApproveChildren: body.canApproveChildren as boolean | undefined,
+            pauseExhaustedAccounts: body.pauseExhaustedAccounts as boolean | undefined,
+            allowWorkerSubagents: body.allowWorkerSubagents as boolean | undefined,
+            maxSubagentsPerWorker,
             permissionMode: managerPermissionMode,
             maxChildPermissionMode,
           },

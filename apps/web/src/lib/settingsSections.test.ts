@@ -25,7 +25,14 @@ describe('settings area tabs', () => {
     expect(sectionsForSettingsTab('instructions')).toEqual(['Operator profile & instructions'])
     expect(sectionsForSettingsTab('remote')).toEqual(['Remote access'])
     expect(sectionsForSettingsTab('safety')).toEqual(['Danger Zone', 'Agent-authored practices'])
-    expect(sectionsForSettingsTab('system')).toEqual(['Overseer', 'Getting started', 'Updates', 'Maintenance'])
+    expect(sectionsForSettingsTab('system')).toEqual([
+      'Overseer',
+      'Notifications',
+      'Privileged operations',
+      'Getting started',
+      'Updates',
+      'Maintenance',
+    ])
     expect(settingsTabHasSection('safety', 'Agent-authored practices')).toBe(true)
     expect(settingsTabHasSection('accounts', 'Maintenance')).toBe(false)
   })

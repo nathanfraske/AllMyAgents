@@ -25,6 +25,38 @@ function harness(): { db: Database.Database; bus: AgentBus; from: SessionIdentit
 }
 
 describe('AgentBus external delivery receipts', () => {
+  it('migrates legacy mail and durably records no-wake delivery intent', () => {
+    const db = new Database(':memory:')
+    databases.push(db)
+    db.exec(`CREATE TABLE bus_messages (
+      id TEXT PRIMARY KEY, groupId TEXT NOT NULL, ts TEXT NOT NULL,
+      fromSession TEXT NOT NULL, fromProfile TEXT NOT NULL, fromLabel TEXT NOT NULL,
+      project TEXT, toKind TEXT NOT NULL, toId TEXT NOT NULL, toSession TEXT NOT NULL,
+      subject TEXT, body TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, readAt TEXT)`)
+    const bus = new AgentBus(db)
+    const from: SessionIdentity = {
+      sessionId: 'manager',
+      profileId: 'profile',
+      provider: 'claude',
+      projectId: 'project',
+      label: 'Manager',
+    }
+
+    bus.post({
+      from,
+      project: 'project',
+      to: { kind: 'session', id: 'child' },
+      body: 'hold this note',
+      recipients: ['child'],
+      wake: false,
+    })
+
+    expect(bus.pending('child')).toMatchObject([{ wake: false }])
+    expect(
+      db.prepare("SELECT 1 FROM pragma_table_info('bus_messages') WHERE name = 'wake'").get(),
+    ).toBeTruthy()
+  })
+
   it('fans an authenticated cross-hub message out exactly once across retries', () => {
     const { bus, from } = harness()
     const input = {

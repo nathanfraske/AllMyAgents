@@ -72,6 +72,45 @@ describe('MeshSite registration', () => {
 })
 
 describe('MeshSite route recovery', () => {
+  it('automatically maps presence-advertised AllMyAgents hubs on owned devices', async () => {
+    const mapped: Array<[string, number]> = []
+    const request: MeshControlRequest = async (cmd, args) => {
+      if (cmd === 'owned_roster') {
+        return { ok: true, result: { members: [{ device: 'laptop', label: 'Laptop' }] } }
+      }
+      if (cmd === 'session_snapshot') {
+        return {
+          ok: true,
+          result: {
+            peers: [
+              {
+                node: 'laptop-AAAA',
+                sites: [
+                  { id: 'tcp:8123', label: 'AllMyAgents laptop', port: 8123 },
+                  { id: 'tcp:9000', label: 'Unrelated service', port: 9000 },
+                ],
+              },
+              {
+                node: 'not-owned-BBBB',
+                sites: [{ id: 'tcp:7777', label: 'AllMyAgents', port: 7777 }],
+              },
+            ],
+          },
+        }
+      }
+      if (cmd === 'site_map') {
+        const route = args as { node: string; port: number }
+        mapped.push([route.node, route.port])
+        return { ok: true, result: { localPort: 48_000 + mapped.length } }
+      }
+      throw new Error(`unexpected command ${cmd}`)
+    }
+    const mesh = new MeshSite({ port: 7777, enable: true, controlRequest: request })
+
+    await expect(mesh.warmPeerHubRoutes()).resolves.toBe(1)
+    expect(mapped).toEqual([['laptop-AAAA', 8123]])
+  })
+
   it('invalidates the idempotent stale mapping before asking for a replacement', async () => {
     vi.useFakeTimers()
     const calls: string[] = []

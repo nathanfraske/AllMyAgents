@@ -22,6 +22,7 @@ import path from 'node:path'
 
 // Control-socket frame tags (node/src/node_control.rs).
 const TAG_JSON = 0
+const MAX_AUTO_HUB_ROUTES = 64
 
 export interface WireResponse {
   ok: boolean
@@ -183,6 +184,8 @@ export class MeshSite {
   /** Silent tunnel failures do not emit a Reject. Bound explicit unmap/remap recovery per site. */
   private readonly siteRecoveryAt = new Map<string, number>()
   private readonly siteRecoveryInFlight = new Map<string, Promise<number | null>>()
+  /** Automatic mapping is idempotent, but never let overlapping upkeep ticks multiply IPC work. */
+  private routeWarmupInFlight: Promise<number> | null = null
 
   constructor(opts: {
     port: number
@@ -334,6 +337,7 @@ export class MeshSite {
         // Confirm periodically that we are still in the node's map: a node restart, or another app
         // calling site_set_exposed with a stale map, drops us silently. Re-registering is idempotent.
         const cur = await this.register()
+        if (cur.nodePresent) await this.warmPeerHubRoutes()
         if (!cur.exposed && wasExposed) {
           wasExposed = false
           onChange?.(cur)
@@ -341,12 +345,16 @@ export class MeshSite {
         return
       }
       const s = await this.register()
+      if (s.nodePresent) await this.warmPeerHubRoutes()
       if (s.exposed && !wasExposed) {
         wasExposed = true
         onChange?.(s)
       }
     }
     this.autoTimer = setInterval(() => void tick().catch(() => undefined), intervalMs)
+    // `register()` has already run before this loop starts in production. Warm routes immediately so
+    // opening the Remote panel is never the action that makes an incoming Hub become reachable.
+    if (this.last.nodePresent) void this.warmPeerHubRoutes().catch(() => undefined)
     // Never hold the process open for this — it is background upkeep, not work.
     this.autoTimer.unref?.()
   }
@@ -451,6 +459,42 @@ export class MeshSite {
       // A node restart or temporary socket loss must not make a known sleeping hub vanish.
     }
     return [...this.peerSitesCache.values()]
+  }
+
+  /**
+   * Idempotently pre-map every presence-advertised AllMyAgents Hub owned by this fleet. The web client
+   * still probes `/api/health` before trusting a route, but it no longer has to open the Remote panel (or
+   * wait for its fleet poll) to cause the underlying mesh tunnel to exist.
+   */
+  async warmPeerHubRoutes(timeoutMs = 4000): Promise<number> {
+    if (this.routeWarmupInFlight) return this.routeWarmupInFlight
+    const warmup = (async (): Promise<number> => {
+      const [members, peers] = await Promise.all([this.ownedRoster(timeoutMs), this.peerSites(timeoutMs)])
+      const owned = new Set(members.map((member) => member.device.split('-', 1)[0]!.toLowerCase()))
+      const routes: Array<{ node: string; port: number }> = []
+      const seen = new Set<string>()
+      for (const peer of peers) {
+        const canonical = peer.device.split('-', 1)[0]!.toLowerCase()
+        if (!owned.has(canonical)) continue
+        for (const site of peer.sites) {
+          if (!/^allmyagents(?:\b|$)/i.test(site.label.trim())) continue
+          const key = `${canonical}:${site.port}`
+          if (seen.has(key)) continue
+          seen.add(key)
+          routes.push({ node: peer.device, port: site.port })
+          if (routes.length >= MAX_AUTO_HUB_ROUTES) break
+        }
+        if (routes.length >= MAX_AUTO_HUB_ROUTES) break
+      }
+      const mapped = await Promise.all(routes.map(({ node, port }) => this.siteMap(node, port, timeoutMs)))
+      return mapped.filter((port): port is number => port !== null).length
+    })()
+    this.routeWarmupInFlight = warmup
+    try {
+      return await warmup
+    } finally {
+      if (this.routeWarmupInFlight === warmup) this.routeWarmupInFlight = null
+    }
   }
 
   /**

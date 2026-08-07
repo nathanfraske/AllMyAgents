@@ -178,7 +178,8 @@ describe('manual physical journal compaction stress', () => {
             const deleted =
               result.commandOutputDeltasDeleted +
               result.agentMessageDeltasDeleted +
-              result.diffSnapshotsDeleted
+              result.diffSnapshotsDeleted +
+              result.itemStartedDeleted
             rowsDeleted += deleted
             bytesDeleted += result.transientPayloadBytesDeleted
             maxWalBytes = Math.max(maxWalBytes, fileBytes(`${file}-wal`))

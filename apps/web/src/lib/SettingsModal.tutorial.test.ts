@@ -1,6 +1,7 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/svelte'
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/svelte'
 import { tick } from 'svelte'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { OverseerStatus } from './api'
 import SettingsModal from './SettingsModal.svelte'
 import { store } from './store.svelte'
 import { TutorialController } from './tutorialState.svelte'
@@ -12,8 +13,9 @@ const loginMocks = vi.hoisted(() => ({
   cancelLogin: vi.fn(() => Promise.resolve({ ok: true, status: 'settling' })),
   rescanProfiles: vi.fn((): Promise<unknown> => Promise.resolve([])),
   renameProfile: vi.fn(),
-  overseer: vi.fn(() => Promise.resolve({ configured: false, available: false })),
+  overseer: vi.fn(() => Promise.resolve({ configured: false, available: false } as OverseerStatus)),
   configureOverseer: vi.fn(),
+  setOverseerMode: vi.fn(),
   openExternalUrl: vi.fn(() => Promise.resolve(true)),
 }))
 
@@ -42,6 +44,7 @@ vi.mock('./api', async (original) => {
         if (property === 'renameProfile') return loginMocks.renameProfile
         if (property === 'overseer') return loginMocks.overseer
         if (property === 'configureOverseer') return loginMocks.configureOverseer
+        if (property === 'setOverseerMode') return loginMocks.setOverseerMode
         if (property === 'mesh') {
           return () => Promise.resolve({
             enabled: false,
@@ -83,11 +86,63 @@ afterEach(() => {
   loginMocks.overseer.mockReset()
   loginMocks.overseer.mockResolvedValue({ configured: false, available: false })
   loginMocks.configureOverseer.mockReset()
+  loginMocks.setOverseerMode.mockReset()
   loginMocks.openExternalUrl.mockReset()
   loginMocks.openExternalUrl.mockResolvedValue(true)
 })
 
 describe('tutorial account waiting integration', () => {
+  it('persists a reusable Tokenmaxxing policy and reports immediate injection', async () => {
+    loginMocks.overseer.mockResolvedValue({
+      configured: true,
+      available: true,
+      sessionId: 'overseer',
+      operatingMode: 'standard',
+      modePolicies: {},
+    })
+    loginMocks.setOverseerMode.mockResolvedValue({
+      configured: true,
+      available: true,
+      sessionId: 'overseer',
+      operatingMode: 'tokenmaxxing',
+      policy: {
+        guidance: 'Use capacity resetting soon.',
+        ideaPool: ['Audit recovery', 'Review permissions'],
+        maxParallelAgents: 9,
+        preferredEffort: 'high',
+      },
+      modePolicies: {
+        tokenmaxxing: {
+          guidance: 'Use capacity resetting soon.',
+          ideaPool: ['Audit recovery', 'Review permissions'],
+          maxParallelAgents: 9,
+          preferredEffort: 'high',
+        },
+      },
+    })
+    render(SettingsModal, { props: { onclose: () => {}, initialTab: 'system' } })
+
+    const modeGroup = await screen.findByRole('group', { name: 'Operating mode' })
+    await fireEvent.change(within(modeGroup).getByLabelText('Mode'), { target: { value: 'tokenmaxxing' } })
+    await fireEvent.input(within(modeGroup).getByLabelText('Maximum parallel agents'), { target: { value: '9' } })
+    await fireEvent.input(within(modeGroup).getByLabelText('Your definition of this mode'), {
+      target: { value: 'Use capacity resetting soon.' },
+    })
+    await fireEvent.input(within(modeGroup).getByLabelText(/Preset idea pool/), {
+      target: { value: 'Audit recovery\nReview permissions' },
+    })
+    await fireEvent.click(within(modeGroup).getByRole('button', { name: 'Save operating mode' }))
+
+    expect(loginMocks.setOverseerMode).toHaveBeenCalledWith({
+      operatingMode: 'tokenmaxxing',
+      guidance: 'Use capacity resetting soon.',
+      ideaPool: ['Audit recovery', 'Review permissions'],
+      maxParallelAgents: 9,
+      preferredEffort: 'high',
+    })
+    expect(await screen.findByText('Mode saved and injected into the current Overseer.')).toBeTruthy()
+  })
+
   it('mirrors a rendered sign-in into tutorial state without recursively retriggering its effect', async () => {
     const tutorial = new TutorialController(null)
     const mirrored: string[] = []

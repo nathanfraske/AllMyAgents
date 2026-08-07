@@ -12,6 +12,9 @@ export interface TeamPresetManager {
   maxChildPermissionMode: TeamPermissionMode
   maxLiveChildren: number
   canApproveChildren: boolean
+  pauseExhaustedAccounts?: boolean
+  allowWorkerSubagents?: boolean
+  maxSubagentsPerWorker?: number
   delegation: DelegatedAuthority[]
   allowedTools: string[]
   orientationBrief?: string
@@ -110,6 +113,9 @@ export function normalizeTeamPreset(value: unknown, existing?: TeamPreset): Team
     maxChildPermissionMode: mode(rawManager.maxChildPermissionMode, 'preset.manager.maxChildPermissionMode'),
     maxLiveChildren: Number(rawManager.maxLiveChildren),
     canApproveChildren: rawManager.canApproveChildren === true,
+    pauseExhaustedAccounts: rawManager.pauseExhaustedAccounts === true,
+    allowWorkerSubagents: rawManager.allowWorkerSubagents === true,
+    maxSubagentsPerWorker: Number(rawManager.maxSubagentsPerWorker ?? 2),
     delegation: authorities(rawManager.delegation ?? [], 'preset.manager.delegation'),
     allowedTools: names(rawManager.allowedTools ?? [], 'preset.manager.allowedTools'),
     ...(text(rawManager.orientationBrief, 'preset.manager.orientationBrief', 20_000, false)
@@ -121,6 +127,9 @@ export function normalizeTeamPreset(value: unknown, existing?: TeamPreset): Team
   }
   if (!Number.isInteger(manager.maxLiveChildren) || manager.maxLiveChildren < raw.agents.length || manager.maxLiveChildren > 16) {
     throw new Error('preset.manager.maxLiveChildren must be a whole number from the agent count through 16')
+  }
+  if (!Number.isInteger(manager.maxSubagentsPerWorker) || manager.maxSubagentsPerWorker! < 1 || manager.maxSubagentsPerWorker! > 8) {
+    throw new Error('preset.manager.maxSubagentsPerWorker must be a whole number from 1 to 8')
   }
   const ids = new Set<string>()
   const agents = raw.agents.map((item, index): TeamPresetAgent => {

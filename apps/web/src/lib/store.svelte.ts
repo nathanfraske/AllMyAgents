@@ -904,12 +904,18 @@ export class HubStore {
         v.record.managerAllowedProfiles = rec.managerAllowedProfiles
         v.record.managerAllowedModels = rec.managerAllowedModels
         v.record.managerAllowedTools = rec.managerAllowedTools
+        v.record.managerPauseExhaustedAccounts = rec.managerPauseExhaustedAccounts
+        v.record.managerAllowWorkerSubagents = rec.managerAllowWorkerSubagents
+        v.record.managerMaxSubagentsPerWorker = rec.managerMaxSubagentsPerWorker
         v.record.managerTeams = rec.managerTeams
         v.record.managerActiveTeamId = rec.managerActiveTeamId
         v.record.managerTeamCapabilityVersion = rec.managerTeamCapabilityVersion
         v.record.parentSessionId = rec.parentSessionId
         v.record.managerTeamId = rec.managerTeamId
         v.record.managerTeamName = rec.managerTeamName
+        v.record.managerRetiredAt = rec.managerRetiredAt
+        v.record.managerRetiredBySessionId = rec.managerRetiredBySessionId
+        v.record.managerRetiredReason = rec.managerRetiredReason
         v.record.delegatedAuthorities = rec.delegatedAuthorities
         v.record.delegatedTools = rec.delegatedTools
         if (rec.title) v.record.title = rec.title
@@ -2755,6 +2761,38 @@ export class HubStore {
         }
         break
       }
+      case 'manager/child-retired': {
+        const p = payload as {
+          managerSessionId?: string
+          childSessionId?: string
+          retiredAt?: string
+          reason?: string
+        }
+        const child = p.childSessionId ? this.sessions[p.childSessionId] : undefined
+        if (child && p.retiredAt) {
+          child.record.managerRetiredAt = p.retiredAt
+          child.record.managerRetiredBySessionId = p.managerSessionId
+          child.record.managerRetiredReason = p.reason
+        }
+        this.push(view, {
+          kind: 'note',
+          ts,
+          text: `child retired — chat and workspace preserved${p.reason ? `: ${p.reason}` : ''}`,
+        })
+        break
+      }
+      case 'manager/child-retirement-cleared':
+      case 'manager/child-reactivated': {
+        const p = payload as { childSessionId?: string }
+        const child = p.childSessionId ? this.sessions[p.childSessionId] : undefined
+        if (child) {
+          child.record.managerRetiredAt = undefined
+          child.record.managerRetiredBySessionId = undefined
+          child.record.managerRetiredReason = undefined
+        }
+        this.push(view, { kind: 'note', ts, text: 'retired child reactivated with its preserved workspace' })
+        break
+      }
       case 'session/agent-stop-requested': {
         const p = payload as { targetId?: string; label?: string }
         const who = p.label?.trim() || (p.targetId ? `sub-agent ${p.targetId.slice(0, 8)}` : 'sub-agent')
@@ -3059,9 +3097,11 @@ export class HubStore {
         break
       }
       case 'session/tokens': {
-        const p = payload as { input?: number; output?: number; total?: number }
+        const p = payload as { input?: number; output?: number; total?: number; contextUsed?: number; contextWindow?: number }
         const sum = (p.input ?? 0) + (p.output ?? 0)
         view.liveTokens = { input: p.input, output: p.output, total: p.total ?? (sum > 0 ? sum : undefined) }
+        if (typeof p.contextUsed === 'number') view.contextUsed = p.contextUsed
+        if (typeof p.contextWindow === 'number') view.contextWindow = p.contextWindow
         break
       }
       case 'codex/item/started':

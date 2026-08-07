@@ -165,7 +165,8 @@ describe('measured journal compaction scale', () => {
           const deleted =
             result.commandOutputDeltasDeleted +
             result.agentMessageDeltasDeleted +
-            result.diffSnapshotsDeleted
+            result.diffSnapshotsDeleted +
+            result.itemStartedDeleted
           deletedRows += deleted
           representedBytes += result.transientPayloadBytesDeleted
           expect(result.transientPayloadBytesDeleted).toBeLessThanOrEqual(

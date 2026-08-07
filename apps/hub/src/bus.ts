@@ -26,17 +26,23 @@ export interface BusMessage {
   toSession: string
   subject: string | null
   body: string
+  /** False means the message may join an already-running or operator-started turn, but may not
+   *  create a new recipient turn on its own. This is durable so a hub restart cannot turn a held
+   *  high-context note back into an expensive wake-up. */
+  wake: boolean
   delivered: boolean
   readAt: string | null
 }
 
-interface Row extends Omit<BusMessage, 'delivered' | 'readAt'> {
+interface Row extends Omit<BusMessage, 'wake' | 'delivered' | 'readAt'> {
+  wake: number
   delivered: number
   readAt: string | null
 }
 
 // The subset written on insert (delivered/readAt default in SQL); keys must match the @named params.
-type InsertRow = Omit<BusMessage, 'delivered' | 'readAt'>
+// SQLite binds the durable boolean as 0/1 and hydrate restores the public boolean shape.
+type InsertRow = Omit<BusMessage, 'wake' | 'delivered' | 'readAt'> & { wake: number }
 
 export class AgentBus {
   private readonly db: Database.Database
@@ -55,8 +61,19 @@ export class AgentBus {
         id TEXT PRIMARY KEY, groupId TEXT NOT NULL, ts TEXT NOT NULL,
         fromSession TEXT NOT NULL, fromProfile TEXT NOT NULL, fromLabel TEXT NOT NULL,
         project TEXT, toKind TEXT NOT NULL, toId TEXT NOT NULL, toSession TEXT NOT NULL,
-        subject TEXT, body TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, readAt TEXT)`
+        subject TEXT, body TEXT NOT NULL, wake INTEGER NOT NULL DEFAULT 1,
+        delivered INTEGER NOT NULL DEFAULT 0, readAt TEXT)`
     )
+    // Additive migration for journals created before wake policy was durable. Existing mail keeps its
+    // historical wake behavior; only newly held messages opt out.
+    const hasWake = db.prepare("SELECT 1 FROM pragma_table_info('bus_messages') WHERE name = 'wake'").get()
+    if (!hasWake) {
+      try {
+        db.exec('ALTER TABLE bus_messages ADD COLUMN wake INTEGER NOT NULL DEFAULT 1')
+      } catch (error) {
+        if (!/duplicate column/i.test(error instanceof Error ? error.message : String(error))) throw error
+      }
+    }
     db.exec('CREATE INDEX IF NOT EXISTS idx_bus_to ON bus_messages (toSession, ts)')
     // The session list polls constantly. Keep its one grouped count proportional to PENDING mail, not to
     // every bus row ever written; delivered messages never enter this partial index.
@@ -68,8 +85,8 @@ export class AgentBus {
       )`
     )
     this.insertStmt = db.prepare(
-      `INSERT INTO bus_messages (id, groupId, ts, fromSession, fromProfile, fromLabel, project, toKind, toId, toSession, subject, body)
-       VALUES (@id, @groupId, @ts, @fromSession, @fromProfile, @fromLabel, @project, @toKind, @toId, @toSession, @subject, @body)`
+      `INSERT INTO bus_messages (id, groupId, ts, fromSession, fromProfile, fromLabel, project, toKind, toId, toSession, subject, body, wake)
+       VALUES (@id, @groupId, @ts, @fromSession, @fromProfile, @fromLabel, @project, @toKind, @toId, @toSession, @subject, @body, @wake)`
     )
     this.pendingStmt = db.prepare('SELECT * FROM bus_messages WHERE toSession = ? AND delivered = 0 ORDER BY ts ASC')
     this.pendingCountsStmt = db.prepare(
@@ -94,9 +111,14 @@ export class AgentBus {
     subject?: string
     body: string
     recipients: string[]
+    /** Default for all recipients. Omitted preserves the historical wake-on-send behavior. */
+    wake?: boolean
+    /** Per-recipient automatic deferrals (for example the high-context wake guard). */
+    noWakeRecipients?: readonly string[]
   }): InsertRow[] {
     const groupId = crypto.randomUUID()
     const ts = new Date().toISOString()
+    const noWake = new Set(input.noWakeRecipients ?? [])
     return input.recipients.map((rid) => ({
       id: crypto.randomUUID(),
       groupId,
@@ -110,6 +132,7 @@ export class AgentBus {
       toSession: rid,
       subject: input.subject ?? null,
       body: input.body,
+      wake: input.wake !== false && !noWake.has(rid) ? 1 : 0,
     }))
   }
 
@@ -121,13 +144,15 @@ export class AgentBus {
     subject?: string
     body: string
     recipients: string[]
+    wake?: boolean
+    noWakeRecipients?: readonly string[]
   }): BusMessage[] {
     const rows = this.rowsFor(input)
     const insertMany = this.db.transaction((rs: InsertRow[]) => {
       for (const r of rs) this.insertStmt.run(r)
     })
     insertMany(rows)
-    return rows.map((r) => ({ ...r, delivered: false, readAt: null }))
+    return rows.map((r) => ({ ...r, wake: !!r.wake, delivered: false, readAt: null }))
   }
 
   /**
@@ -143,6 +168,8 @@ export class AgentBus {
     subject?: string
     body: string
     recipients: string[]
+    wake?: boolean
+    noWakeRecipients?: readonly string[]
   }): { accepted: boolean; messages: BusMessage[] } {
     const rows = this.rowsFor(input)
     const accepted = this.db.transaction(() => {
@@ -154,7 +181,7 @@ export class AgentBus {
     })()
     return {
       accepted,
-      messages: accepted ? rows.map((row) => ({ ...row, delivered: false, readAt: null })) : [],
+      messages: accepted ? rows.map((row) => ({ ...row, wake: !!row.wake, delivered: false, readAt: null })) : [],
     }
   }
 
@@ -179,6 +206,14 @@ export class AgentBus {
     if (!ids.length) return
     this.db
       .prepare(`UPDATE bus_messages SET delivered = 1 WHERE id IN (${ids.map(() => '?').join(',')})`)
+      .run(...ids)
+  }
+
+  /** Atomically downgrade queued mail so it cannot create an idle turn after this hub exits. */
+  holdWake(ids: string[]): void {
+    if (!ids.length) return
+    this.db
+      .prepare(`UPDATE bus_messages SET wake = 0 WHERE delivered = 0 AND id IN (${ids.map(() => '?').join(',')})`)
       .run(...ids)
   }
 
@@ -218,5 +253,5 @@ export class AgentBus {
 }
 
 function hydrate(r: Row): BusMessage {
-  return { ...r, delivered: !!r.delivered, readAt: r.readAt }
+  return { ...r, wake: !!r.wake, delivered: !!r.delivered, readAt: r.readAt }
 }

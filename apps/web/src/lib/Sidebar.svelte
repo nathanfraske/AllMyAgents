@@ -11,6 +11,7 @@
   import Icon from './Icon.svelte'
   import { unreadMailCount, unreadMailTitle } from './unreadMail'
   import ImportChats from './ImportChats.svelte'
+  import NotificationCenter from './NotificationCenter.svelte'
   import { flip } from 'svelte/animate'
   import { cubicOut } from 'svelte/easing'
   import { loadCollapsedFolders, saveCollapsedFolders } from './uiState'
@@ -461,7 +462,9 @@
     for (const item of g.sessions) {
       const parent = item.record.parentSessionId
       if (!parent) continue
-      if (!byId.get(parent)?.record.isProjectManager) {
+      const parentRecord = byId.get(parent)?.record
+      const validNestedAgent = item.record.isOneShotSubagent === true && Boolean(parentRecord)
+      if (!parentRecord || (!parentRecord.isProjectManager && !validNestedAgent)) {
         // A child can outlive a deleted manager (or a revoked manager role). It must remain a root row,
         // but it should not silently lose the context that it was delegated work.
         orphaned.add(item.record.id)
@@ -886,6 +889,7 @@
           class:warn={journalPhase === 'unobservable'}
         ></span>
       </button>
+      <NotificationCenter />
 
       {#if statusPopover === 'hub'}
         <dialog id="hub-status-popout" class="status-popout" aria-label="Hub connection" open>
@@ -1201,6 +1205,12 @@
                   <!-- svelte-ignore a11y_no_static_element_interactions -->
                   <span class="rlabel" class:glitch={glitching.has(s.record.id)} ondblclick={(e) => startRename(e, s)}>{label(s)}</span>
                 {/if}
+                {#if en.managerDepth > 0 && s.record.managerRetiredAt}
+                  <span
+                    class="retired-child"
+                    title={`Retired ${s.record.managerRetiredAt}${s.record.managerRetiredReason ? ` — ${s.record.managerRetiredReason}` : ''}. Chat and workspace are preserved.`}
+                  >retired</span>
+                {/if}
                 {#if en.managerDepth > 0 && s.record.role?.trim()}
                   <AgentPurposeInfo agentName={label(s)} purpose={s.record.role.trim()} />
                 {/if}
@@ -1405,6 +1415,17 @@
     box-shadow: inset 3px 0 0 var(--accent), inset 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent);
   }
   .row.managedchild { margin-left: calc(var(--manager-depth) * 0.85rem); width: calc(100% - (var(--manager-depth) * 0.85rem)); }
+  .retired-child {
+    flex: none;
+    color: var(--dim);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 0 0.3rem;
+    font-size: 0.58rem;
+    line-height: 1.25;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
   .manager-team-head {
     display: flex; align-items: center; gap: var(--space-2); min-width: 0;
     margin-left: 0.85rem; padding: 0.28rem var(--space-3) 0.18rem var(--space-4);

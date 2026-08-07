@@ -1882,6 +1882,7 @@ export function publishRecoveryGeneration(options: {
   snapshotFile: string
   maxSchemaVersion: number
   keep?: number
+  maxRetainedBytes?: number
   failpoint?: (edge: string, target?: string) => void
 }): RecoveryGeneration {
   const dataDir = path.resolve(options.dataDir)
@@ -2008,7 +2009,12 @@ export function publishRecoveryGeneration(options: {
       eventHighWater: verified.manifest.eventHighWater,
       manifestSha256: sha256(fs.readFileSync(path.join(finalDirectory, MANIFEST_FILE))),
     } satisfies RecoveryHead)
-    rotateRecoveryGenerations(dataDir, options.keep ?? 6, options.maxSchemaVersion)
+    rotateRecoveryGenerations(
+      dataDir,
+      options.keep ?? 6,
+      options.maxSchemaVersion,
+      options.maxRetainedBytes,
+    )
     return verified
   } catch (error) {
     try {
@@ -2023,9 +2029,16 @@ export function publishRecoveryGeneration(options: {
 function rotateRecoveryGenerations(
   dataDir: string,
   keep: number,
-  _maxSchemaVersion: number
+  _maxSchemaVersion: number,
+  maxRetainedBytes?: number,
 ): void {
   if (!Number.isSafeInteger(keep) || keep < 1) throw new Error('recovery retention must be positive')
+  if (
+    maxRetainedBytes !== undefined &&
+    (!Number.isSafeInteger(maxRetainedBytes) || maxRetainedBytes < 0)
+  ) {
+    throw new Error('recovery byte retention must be a non-negative safe integer')
+  }
   const paths = recoveryPaths(dataDir)
   const entries = fs.readdirSync(paths.generations)
   const generations = scanRecoveryCandidates(dataDir)
@@ -2034,10 +2047,28 @@ function rotateRecoveryGenerations(
       `recovery generation evidence exceeds bounded retention (${entries.length} entries, ${generations.length} canonical)`
     )
   }
-  for (const generation of generations.slice(keep)) {
+  let retainedBytes = generations.reduce(
+    (total, generation) => total + BigInt(generation.manifest.databaseBytes),
+    0n,
+  )
+  const byteLimit = maxRetainedBytes === undefined
+    ? undefined
+    : BigInt(maxRetainedBytes)
+  // Newest first. Always retain at least the newest independently verified generation, even when one
+  // snapshot alone exceeds the byte target. Backup and recovery entries are hard links in the normal
+  // path, so applying the same byte budget to both directories bounds UNIQUE snapshot data instead of
+  // letting two count-only policies multiply a growing journal by twelve.
+  while (
+    generations.length > 1 &&
+    (generations.length > keep || (byteLimit !== undefined && retainedBytes > byteLimit))
+  ) {
+    const generation = generations.at(-1)
+    if (!generation) break
     try {
       fs.rmSync(generation.directory, { recursive: true })
       syncDirectory(path.dirname(generation.directory))
+      generations.pop()
+      retainedBytes -= BigInt(generation.manifest.databaseBytes)
     } catch (error) {
       // A bounded maintenance reader may still have a legacy WAL-mode snapshot's zero-byte sidecar
       // mapped on Windows. The newly published generation is already verified and authoritative; defer

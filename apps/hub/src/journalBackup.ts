@@ -72,6 +72,8 @@ export interface JournalBackupOptions {
    */
   recoveryDataDir?: string
   recoveryKeep?: number
+  /** Byte budget shared by the strong recovery generations. Defaults to maxRetainedBytes (8 GiB). */
+  recoveryMaxRetainedBytes?: number
   /** Out-of-band supervisor heartbeat; failures are diagnostic and can never fail a snapshot. */
   onProgress?: (progress: JournalProgressUpdate) => void
 }
@@ -308,6 +310,10 @@ export async function snapshotJournal(
           snapshotFile: target,
           maxSchemaVersion: SCHEMA_VERSION,
           keep: options.recoveryKeep ?? options.keep ?? DEFAULT_KEEP,
+          maxRetainedBytes: positiveByteLimit(
+            options.recoveryMaxRetainedBytes ?? options.maxRetainedBytes,
+            DEFAULT_MAX_RETAINED_BYTES,
+          ),
         })
         recoveryGeneration = generation.manifest.generation
         log(

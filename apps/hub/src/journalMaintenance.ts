@@ -7,6 +7,7 @@
  */
 import path from 'node:path'
 import {
+  isTransientSqliteContention,
   Journal,
   TransientHistoryIndexingError,
   type JournalCondenseResult,
@@ -43,6 +44,7 @@ const [
 const PROJECTION_BATCH_ROWS = 5_000
 const PROJECTION_PROGRESS_ROWS = 50_000
 const DELETE_PROGRESS_BATCHES = 10
+const MAINTENANCE_BUSY_TIMEOUT_MS = 30_000
 const parsedWorkBudgetMs = Number(workBudgetRaw)
 const WORK_BUDGET_MS =
   Number.isSafeInteger(parsedWorkBudgetMs) &&
@@ -91,7 +93,10 @@ async function main(): Promise<{ message: MaintenanceMessage; exitCode: number }
     if (!backupDirectory) throw new Error('journal backup directory is required')
     if (!operationId) throw new Error('journal maintenance operation id is required')
     reportProgress('starting', 0, 0)
-    journal = new Journal(file)
+    // The live hub must remain responsive and wins ordinary writer races. Maintenance runs out of
+    // process and can wait longer for its bounded write transaction without blocking the renderer,
+    // HTTP, WebSocket, or worker-ingestion loops.
+    journal = new Journal(file, { busyTimeoutMs: MAINTENANCE_BUSY_TIMEOUT_MS })
     journal.recordCompactionLifecycle(operationId, 'started', {
       detail: 'Bounded journal maintenance started.',
     })
@@ -218,6 +223,7 @@ async function main(): Promise<{ message: MaintenanceMessage; exitCode: number }
         aggregate.commandOutputDeltasDeleted += result.commandOutputDeltasDeleted
         aggregate.agentMessageDeltasDeleted += result.agentMessageDeltasDeleted
         aggregate.diffSnapshotsDeleted += result.diffSnapshotsDeleted
+        aggregate.itemStartedDeleted += result.itemStartedDeleted
         aggregate.transientPayloadBytesDeleted += result.transientPayloadBytesDeleted
         aggregate.oversizedTransientRowsRetained = result.oversizedTransientRowsRetained
         aggregate.writerLockMs = Math.max(aggregate.writerLockMs, result.writerLockMs)
@@ -234,6 +240,7 @@ async function main(): Promise<{ message: MaintenanceMessage; exitCode: number }
         result.commandOutputDeltasDeleted +
         result.agentMessageDeltasDeleted +
         result.diffSnapshotsDeleted +
+        result.itemStartedDeleted +
         result.historyRowsDeleted
       rowsDeleted += deleted
       payloadBytesDeleted +=
@@ -272,6 +279,29 @@ async function main(): Promise<{ message: MaintenanceMessage; exitCode: number }
     }
   } catch (error) {
     const message = boundedMessage(error)
+    if (isTransientSqliteContention(error)) {
+      const reason = `transient SQLite writer contention; retrying at the next maintenance interval (${message})`
+      try {
+        if (journal && operationId) {
+          journal.recordCompactionLifecycle(operationId, 'unobservable', {
+            rowsDeleted,
+            payloadBytesDeleted,
+            detail: reason,
+          })
+        }
+      } catch {
+        // The parent still receives a truthful deferred result. A later maintenance operation is
+        // independent and resumes from the durable projection/delete frontier.
+      }
+      return {
+        message: {
+          type: 'journal-condense-deferred',
+          operationId: operationId ?? 'unknown',
+          reason,
+        },
+        exitCode: 0,
+      }
+    }
     try {
       if (journal && operationId) {
         journal.recordCompactionLifecycle(operationId, 'failed', {
