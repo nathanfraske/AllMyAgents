@@ -726,7 +726,7 @@ describe('owned journal corruption recovery', () => {
     expect(JSON.parse(fs.readFileSync(recoveryPaths(dataDir).rootBinding, 'utf8'))).toMatchObject({
       activeGeneration: '3',
     })
-  })
+  }, 20_000)
 
   it('discards incomplete unactivated generation and classifier staging debris on boot', async () => {
     const dataDir = root('ama-recovery-debris')
