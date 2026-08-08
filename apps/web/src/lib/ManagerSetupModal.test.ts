@@ -4,13 +4,15 @@ import ManagerSetupModal from './ManagerSetupModal.svelte'
 import { store, type SessionView } from './store.svelte'
 import type { SessionRecord } from './api'
 
-const { configureProjectManager, spawn, send, setMode, setSettings, rename } = vi.hoisted(() => ({
+const { configureProjectManager, reassignProjectManager, spawn, send, setMode, setSettings, rename, sessionsApi } = vi.hoisted(() => ({
   configureProjectManager: vi.fn(),
+  reassignProjectManager: vi.fn(),
   spawn: vi.fn(),
   send: vi.fn(),
   setMode: vi.fn(),
   setSettings: vi.fn(),
   rename: vi.fn(),
+  sessionsApi: vi.fn(),
 }))
 
 vi.mock('./api', async (orig) => {
@@ -20,11 +22,13 @@ vi.mock('./api', async (orig) => {
     api: {
       ...actual.api,
       configureProjectManager,
+      reassignProjectManager,
       spawn,
       send,
       setMode,
       setSettings,
       rename,
+      sessions: sessionsApi,
     },
   }
 })
@@ -55,6 +59,7 @@ beforeEach(() => {
     { id: 'claude-a', provider: 'claude' },
   ]
   store.sessions = { existing: session('existing', 'Existing chat') }
+  sessionsApi.mockImplementation(async () => Object.values(store.sessions).map((view) => view.record))
   store.managerSetupSessionId = 'existing'
   store.projectViewId = 'project-1'
 })
@@ -66,6 +71,7 @@ describe('Manager setup', () => {
     expect(getAllByText('Project')).toHaveLength(2)
     expect(getByText('Worker accounts & models')).toBeTruthy()
     expect(getByText('Live child limit')).toBeTruthy()
+    expect(getByText(/disabled, unavailable, and out-of-ceiling manager requests automatically escalate/i)).toBeTruthy()
     expect(getByText(/its own managed hierarchy, and only that hierarchy/i)).toBeTruthy()
   })
 
@@ -272,7 +278,7 @@ describe('Manager setup', () => {
     })
 
     expect(getByText('Editing existing manager')).toBeTruthy()
-    expect(getByText(/account owns this live vendor thread/i)).toBeTruthy()
+    expect(getByText(/moves the live manager role and complete team hierarchy/i)).toBeTruthy()
     expect((getByLabelText('Manager permission level') as HTMLSelectElement).value).toBe('safe')
     await fireEvent.input(getByLabelText('Manager display name'), { target: { value: 'Release manager' } })
     await fireEvent.click(getByRole('button', { name: 'Save manager settings' }))
@@ -285,6 +291,61 @@ describe('Manager setup', () => {
     )
     expect(onSaved).toHaveBeenCalledWith(expect.objectContaining({ id: 'existing' }))
     expect(store.projectViewId).toBe('project-1')
+    expect(send).not.toHaveBeenCalled()
+  })
+
+  it('moves an existing manager to another account and keeps the old chat as a stopped snapshot', async () => {
+    store.sessions.existing!.record = {
+      ...store.sessions.existing!.record,
+      isProjectManager: true,
+      managerAllowedProfiles: ['codex-a', 'claude-a'],
+      managerMaxLiveChildren: 4,
+    }
+    store.sessions.child = session('child', 'Allen')
+    store.sessions.child.record.parentSessionId = 'existing'
+    const successor = {
+      ...session('manager-successor', 'Existing chat').record,
+      profileId: 'claude-a',
+      provider: 'claude' as const,
+      isProjectManager: true,
+      managerReassignedFromSessionId: 'existing',
+      managerReassignedAt: '2026-08-07T23:30:00.000Z',
+      managerAllowedProfiles: ['codex-a', 'claude-a'],
+      managerMaxLiveChildren: 4,
+    }
+    reassignProjectManager.mockResolvedValue(successor)
+    configureProjectManager.mockImplementation(async (id: string) => ({
+      ...successor,
+      id,
+    }))
+    const onSaved = vi.fn()
+    const { getByRole, getByLabelText } = render(ManagerSetupModal, {
+      embedded: true,
+      stayInProject: true,
+      initialProjectId: 'project-1',
+      initialManagerId: 'existing',
+      onSaved,
+    })
+
+    await fireEvent.change(getByLabelText('Manager account'), { target: { value: 'claude-a' } })
+    await fireEvent.click(getByRole('button', { name: 'Save manager settings' }))
+
+    await waitFor(() => expect(reassignProjectManager).toHaveBeenCalledWith(
+      'existing',
+      expect.objectContaining({ profileId: 'claude-a' }),
+    ))
+    expect(configureProjectManager).toHaveBeenCalledWith(
+      'manager-successor',
+      expect.objectContaining({ enabled: true }),
+    )
+    expect(store.sessions.existing!.record).toMatchObject({
+      status: 'stopped',
+      isProjectManager: false,
+      managerReassignedToSessionId: 'manager-successor',
+    })
+    expect(store.sessions.existing!.record.title).toMatch(/snapshot\)$/i)
+    expect(store.sessions.child!.record.parentSessionId).toBe('manager-successor')
+    expect(onSaved).toHaveBeenCalledWith(expect.objectContaining({ id: 'manager-successor' }))
     expect(send).not.toHaveBeenCalled()
   })
 })

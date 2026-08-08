@@ -897,6 +897,9 @@ export class HubStore {
         v.record.effort = rec.effort
         v.record.serviceTier = rec.serviceTier
         v.record.isProjectManager = rec.isProjectManager
+        v.record.managerReassignedFromSessionId = rec.managerReassignedFromSessionId
+        v.record.managerReassignedToSessionId = rec.managerReassignedToSessionId
+        v.record.managerReassignedAt = rec.managerReassignedAt
         v.record.managerMaxLiveChildren = rec.managerMaxLiveChildren
         v.record.managerPermissionModeCeiling = rec.managerPermissionModeCeiling
         v.record.managerMaxChildPermissionMode = rec.managerMaxChildPermissionMode
@@ -904,6 +907,12 @@ export class HubStore {
         v.record.managerAllowedProfiles = rec.managerAllowedProfiles
         v.record.managerAllowedModels = rec.managerAllowedModels
         v.record.managerAllowedTools = rec.managerAllowedTools
+        v.record.managerAgentTypes = rec.managerAgentTypes
+        v.record.managerStartingPrompt = rec.managerStartingPrompt
+        v.record.managerOrientationBrief = rec.managerOrientationBrief
+        v.record.managerOperatorTask = rec.managerOperatorTask
+        v.record.managerStandingInstructions = rec.managerStandingInstructions
+        v.record.managerCanApproveChildren = rec.managerCanApproveChildren
         v.record.managerPauseExhaustedAccounts = rec.managerPauseExhaustedAccounts
         v.record.managerAllowWorkerSubagents = rec.managerAllowWorkerSubagents
         v.record.managerMaxSubagentsPerWorker = rec.managerMaxSubagentsPerWorker
@@ -918,6 +927,22 @@ export class HubStore {
         v.record.managerRetiredReason = rec.managerRetiredReason
         v.record.delegatedAuthorities = rec.delegatedAuthorities
         v.record.delegatedTools = rec.delegatedTools
+        v.record.allowedTools = rec.allowedTools
+        v.record.remoteDeviceGrants = rec.remoteDeviceGrants
+        v.record.browserEnabled = rec.browserEnabled
+        v.record.browserOriginGrants = rec.browserOriginGrants
+        v.record.browserLocalNetworkEnabled = rec.browserLocalNetworkEnabled
+        v.record.browserTabsEnabled = rec.browserTabsEnabled
+        v.record.browserDownloadsEnabled = rec.browserDownloadsEnabled
+        v.record.repo = rec.repo
+        v.record.worktree = rec.worktree
+        v.record.wslDistro = rec.wslDistro
+        v.record.executionCwd = rec.executionCwd
+        v.record.executionRepo = rec.executionRepo
+        v.record.branch = rec.branch
+        v.record.baseCommit = rec.baseCommit
+        v.record.baseRef = rec.baseRef
+        v.record.workspacePressure = rec.workspacePressure
         if (rec.title) v.record.title = rec.title
         if ((this.latestStatusSeq.get(rec.id) ?? 0) <= requestStartedAtSeq) {
           const prior = v.record.status
@@ -2759,6 +2784,14 @@ export class HubStore {
           child.record.managerTeamId = assignment.teamId ?? undefined
           child.record.managerTeamName = assignment.teamName ?? undefined
         }
+        break
+      }
+      case 'manager/reassigned-out':
+      case 'manager/reassigned-in': {
+        // session/created intentionally carries only the provisional fresh thread. Pull the atomic
+        // handoff result immediately so every open renderer sees the new manager, hierarchy, and
+        // least-authority predecessor without waiting for the periodic five-second reconciliation.
+        void this.syncRecordsFromHub()
         break
       }
       case 'manager/child-retired': {

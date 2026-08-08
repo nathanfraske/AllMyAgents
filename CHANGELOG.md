@@ -21,6 +21,13 @@ truthful under the operator's live workload.
 - Managers can non-destructively retire an idle, failed, or stopped child, free its live slot, spawn a successor,
   and reactivate the preserved child later when team and capacity bounds allow. Enabled workers can create
   tightly bounded same-account one-shot descendants rendered beneath them as Name II, III, and so on.
+- An idle project manager can move to another logged-in Claude or Codex account from Edit Project & Managers or
+  through a direct-operator Overseer turn. The hub creates a fresh vendor thread, atomically transfers teams,
+  descendants, grants, pending mail, and narrow session policy, and retains the previous chat as a stopped
+  least-authority transcript snapshot.
+- Overseer project setup now requires an explicit choice about whether the manager may decide descendant
+  approvals inside its exact Git/tool ceiling. Disabled, unavailable, and out-of-ceiling requests escalate with
+  their exact action and reason for Overseer blast-radius review and a direct operator decision.
 - Tokenmaxxing and Eco mode are durable, direct-operator Overseer policies with reusable guidance/idea pools,
   explicit concurrency bounds, live quota/reset inspection, and provider-native reinjection after compaction.
 - A durable 30-day/1,000-row notification inbox covers manager/Overseer completions by default plus errors,

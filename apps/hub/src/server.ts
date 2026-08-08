@@ -2226,6 +2226,38 @@ export function startServer(opts: ServerOptions): http.Server {
       // Operator control-plane only: there is deliberately no corresponding agent tool. The role marker
       // is the trust boundary that unlocks spawn_agent; models may consume it but can never promote a
       // session. Every grant/revoke is persisted on the session record and journaled by SessionManager.
+      const managerReassignMatch = /^\/api\/sessions\/([^/]+)\/project-manager\/reassign$/.exec(url.pathname)
+      if (method === 'POST' && managerReassignMatch) {
+        if (!authed) {
+          json(res, { error: 'operator device token required' }, 403)
+          return
+        }
+        const body = await readBody(req)
+        const profileId = str(body.profileId)
+        if (!profileId) {
+          json(res, { error: 'profileId is required' }, 400)
+          return
+        }
+        if (body.model !== undefined && typeof body.model !== 'string') {
+          json(res, { error: 'model must be text' }, 400)
+          return
+        }
+        if (body.effort !== undefined && typeof body.effort !== 'string') {
+          json(res, { error: 'effort must be text' }, 400)
+          return
+        }
+        const record = await sessions.reassignProjectManager(
+          managerReassignMatch[1] as string,
+          {
+            profileId,
+            model: body.model as string | undefined,
+            effort: body.effort as string | undefined,
+          },
+          'operator',
+        )
+        json(res, record)
+        return
+      }
       const managerMatch = /^\/api\/sessions\/([^/]+)\/project-manager$/.exec(url.pathname)
       if (method === 'POST' && managerMatch) {
         // This role grant is stronger than ordinary local API writes, so it always requires the owner

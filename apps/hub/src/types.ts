@@ -143,6 +143,11 @@ export interface SessionRecord {
   browserProfileRetained?: boolean
   /** Operator-granted project-manager role. Agents can consume this marker but never set it. */
   isProjectManager?: boolean
+  /** Durable account-handoff lineage. The predecessor remains as a stopped transcript snapshot while
+   *  the successor owns the live manager role, hierarchy, teams, and workspace. */
+  managerReassignedFromSessionId?: string
+  managerReassignedToSessionId?: string
+  managerReassignedAt?: string
   /** Bounded direct-child capacity for a manager. Absent is never interpreted as unlimited. */
   managerMaxLiveChildren?: number
   /** The operator's ceiling: authorities this manager may grant inside its own managed hierarchy. */

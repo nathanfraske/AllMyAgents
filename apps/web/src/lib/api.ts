@@ -205,8 +205,13 @@ export interface SessionRecord {
   cwd: string
   repo?: string
   worktree?: string
+  wslDistro?: string
+  executionCwd?: string
+  executionRepo?: string
   workspacePressure?: WorkspacePressure
   branch?: string
+  baseCommit?: string
+  baseRef?: string
   /** Spawn intent, distinct from the actual `worktree` outcome. */
   worktreeRequested?: boolean
   /** Why a requested worktree was not created; absent when intent and outcome agree. */
@@ -223,7 +228,14 @@ export interface SessionRecord {
   allowedTools?: string[]
   remoteDeviceGrants?: RemoteDeviceGrant[]
   browserEnabled?: boolean
+  browserOriginGrants?: string[]
+  browserLocalNetworkEnabled?: boolean
+  browserTabsEnabled?: boolean
+  browserDownloadsEnabled?: boolean
   isProjectManager?: boolean
+  managerReassignedFromSessionId?: string
+  managerReassignedToSessionId?: string
+  managerReassignedAt?: string
   managerMaxLiveChildren?: number
   managerDelegation?: Array<'commit' | 'push'>
   managerAllowedProfiles?: string[]
@@ -1563,6 +1575,20 @@ export const api = {
         profileId: agentType.profileId ? stripProfile(agentType.profileId) : undefined,
         profileIds: agentType.profileIds?.map(stripProfile),
       })),
+    })
+  },
+  reassignProjectManager: (
+    id: string,
+    config: { profileId: string; model?: string; effort?: string },
+  ) => {
+    const target = resolveHubResource(id)
+    const profile = resolveHubResource(config.profileId)
+    if (profile.site?.siteId !== target.site?.siteId) {
+      return Promise.resolve({ error: 'the manager account must belong to the same hub as the project' })
+    }
+    return routedSessionPost(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/project-manager/reassign`, {
+      ...config,
+      profileId: profile.id,
     })
   },
   /** "Always allow this tool in this chat" (allow=false revokes). Takes effect on the next tool call. */

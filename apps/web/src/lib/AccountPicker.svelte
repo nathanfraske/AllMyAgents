@@ -23,7 +23,7 @@
   )
   const lockReason = $derived.by(() => {
     if (view.record.isProjectManager) {
-      return 'This manager account is bound to its live vendor thread and operator grant. Use Managers to rebuild or reassign the manager safely.'
+      return 'Move this manager from Edit Project & Managers. The app will transfer its live role and team, while preserving this vendor thread as a snapshot.'
     }
     if (view.record.parentSessionId) {
       const parent = store.sessions[view.record.parentSessionId]
