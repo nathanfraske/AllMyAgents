@@ -1,7 +1,7 @@
 <script lang="ts">
   import { store } from './store.svelte'
   import { settings } from './settings.svelte'
-  import { resetIn } from './time'
+  import { resetLabel } from './time'
   import { profileLabel } from './profileLabel'
   import { apiEquivalentCostLabel } from './usageDisplay'
 
@@ -30,7 +30,7 @@
         {#each u.claudeUsage as line (line.label)}
           <div class="bars">
             <div class="line small"><span class="muted">{line.label.replace('Current ', '')}</span>
-              <span class="reset dim">{line.percent}%{#if line.resetsAt} · {resetIn(line.resetsAt)}{/if}</span></div>
+              <span class="reset dim">{line.percent}%{#if line.resetsAt} · {resetLabel(line.resetsAt)}{/if}</span></div>
             <div class="bar"><div class="fill" class:hot={line.percent > 85} style="width:{line.percent}%"></div></div>
           </div>
         {/each}
@@ -38,7 +38,7 @@
         <div class="line">
           <span class="state {cs.cls}">{cs.label}</span>
           <span class="muted">{u.claude.rateLimitType ?? '5h'} window</span>
-          {#if u.claude.resetsAt}<span class="reset dim">resets {resetIn(u.claude.resetsAt)}</span>{/if}
+          {#if u.claude.resetsAt}<span class="reset dim">{resetLabel(u.claude.resetsAt)}</span>{/if}
         </div>
         <div class="hint dim">detailed usage loading…</div>
       {/if}
@@ -54,7 +54,7 @@
         </div>
         <div class="line small">
           <span class="muted">{u.codex.usedPercent ?? '?'}% weekly</span>
-          {#if u.codex.resetsAt}<span class="reset dim">resets {resetIn(u.codex.resetsAt)}</span>{/if}
+          {#if u.codex.resetsAt}<span class="reset dim">{resetLabel(u.codex.resetsAt)}</span>{/if}
         </div>
       {/if}
       {#if u.blocked}<div class="bad small">blocked: {u.blockedReason}</div>{/if}

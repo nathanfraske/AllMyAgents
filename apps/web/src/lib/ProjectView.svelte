@@ -386,7 +386,7 @@
           </div>
         {/if}
         <div class="summary" aria-label="Team status summary">
-          <span><strong>{projectSessions.length}</strong> agents</span>
+          <span><strong>{activeProjectSessions.length}</strong> agents</span>
           {#if statusCounts.working}<span class="working">{statusCounts.working} working</span>{/if}
           {#if statusCounts.blocked}<span class="blocked">{statusCounts.blocked} blocked</span>{/if}
           {#if statusCounts.failed}<span class="failed">{statusCounts.failed} failed</span>{/if}

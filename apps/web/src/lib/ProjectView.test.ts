@@ -319,7 +319,7 @@ describe('ProjectView', () => {
   })
 
   it('keeps retired children out of the live team and exposes them as preserved records', async () => {
-    store.sessions.retired = session('retired', 'Corbato', 'stopped', {
+    store.sessions.retired = session('retired', 'Corbato', 'active', {
       parentSessionId: 'manager',
       managerTeamId: 'team-a',
       managerTeamName: 'Core team',
@@ -329,6 +329,7 @@ describe('ProjectView', () => {
 
     const { container } = render(ProjectView, { props: { projectId: project.id } })
 
+    expect(screen.getByLabelText('Team status summary').textContent).toMatch(/5 agents/)
     expect([...container.querySelectorAll('.agent-list .name')].map((node) => node.textContent)).not.toContain('Corbato')
     expect(screen.getByText('1 retired agent record')).toBeTruthy()
     expect(screen.getByText(/Archived agents are absent from the working catalog/)).toBeTruthy()

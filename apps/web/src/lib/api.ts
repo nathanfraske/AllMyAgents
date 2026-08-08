@@ -904,13 +904,13 @@ export type LoginAuthMode = 'browser' | 'device'
 export interface DayStat {
   date: string
   turns: number
-  cost: number
-  projects: Record<string, { turns: number; cost: number }>
+  apiEquivalentCostUsd: number
+  projects: Record<string, { turns: number; apiEquivalentCostUsd: number }>
 }
 export interface StatsResult {
   days: DayStat[]
   totalTurns: number
-  totalCost: number
+  totalApiEquivalentCostUsd: number
   totalSessions: number
 }
 

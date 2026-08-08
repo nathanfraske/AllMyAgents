@@ -517,6 +517,9 @@ describe('project manager reversible child retirement', () => {
     expect(journal.recentEventsForSession(child.id).some((event) => event.kind === 'session/deleted')).toBe(false)
     expect(sessions.managerChildStatus(manager.id).summary).toMatch(/Retired records: 1.*Retired records.*Corbato.*retired/is)
 
+    // Retirement, not a coincidental stopped status, is the capacity boundary. A stale lifecycle
+    // replay must not put this archived record back into the live-child count.
+    child.status = 'idle'
     await expect(spawn({ profileId: 'p1', prompt: 'Continue in a fresh bounded context.', useWorktree: false }))
       .resolves.toMatchObject({ ok: true, sessionId: expect.any(String) })
     await new Promise<void>((resolve) => setImmediate(resolve))

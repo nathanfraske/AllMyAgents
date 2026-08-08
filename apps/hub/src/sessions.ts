@@ -4909,6 +4909,7 @@ export class SessionManager {
     const live = [...this.sessions.values()].filter(
       (record) =>
         record.parentSessionId === manager.id &&
+        !record.managerRetiredAt &&
         (record.status === 'starting' || record.status === 'active' || record.status === 'idle')
     ).length
     if (live >= (max as number)) {
@@ -7558,6 +7559,7 @@ export class SessionManager {
           (record) =>
             record.id !== child.id &&
             record.parentSessionId === manager.id &&
+            !record.managerRetiredAt &&
             (record.status === 'starting' || record.status === 'active' || record.status === 'idle'),
         ).length
         if (live >= (max as number)) {

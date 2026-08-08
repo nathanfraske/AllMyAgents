@@ -22,7 +22,7 @@ window.matchMedia = ((query: string) => ({
 })) as unknown as typeof window.matchMedia
 
 beforeEach(() => {
-  stats.mockResolvedValue({ days: [], totalTurns: 0, totalCost: 0 })
+  stats.mockResolvedValue({ days: [], totalTurns: 0, totalApiEquivalentCostUsd: 0, totalSessions: 0 })
   store.sessions = {}
   store.projects = []
   store.lastLayout = null

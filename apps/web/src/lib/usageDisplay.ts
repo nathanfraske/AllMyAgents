@@ -5,9 +5,14 @@
  */
 export function apiEquivalentCostLabel(
   costUsd: number,
-  scope: 'this hub run' | 'this session' = 'this hub run',
+  scope: 'this hub run' | 'this session' | 'past year' | 'this day' = 'this hub run',
 ): string {
   if (!Number.isFinite(costUsd) || costUsd < 0) return 'API-equivalent cost unavailable'
+  return `${apiEquivalentCostAmount(costUsd)} API-equivalent ${scope}`
+}
+
+export function apiEquivalentCostAmount(costUsd: number): string {
+  if (!Number.isFinite(costUsd) || costUsd < 0) return 'unavailable'
   const digits = costUsd >= 100 ? 0 : costUsd >= 10 ? 1 : 2
-  return `~$${costUsd.toFixed(digits)} API-equivalent ${scope}`
+  return `~$${costUsd.toFixed(digits)}`
 }
