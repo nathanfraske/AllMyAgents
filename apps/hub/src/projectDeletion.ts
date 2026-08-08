@@ -1,7 +1,11 @@
-import { execFileSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import type { Project, SessionRecord } from './types.js'
+
+const MAX_RENDERED_CHANGES = 500
+const INSPECTION_TIMEOUT_MS = 20_000
+const GIT_MAX_BUFFER_BYTES = 16 * 1024 * 1024
 
 export interface ProjectDeletionChange {
   kind: 'uncommitted' | 'untracked'
@@ -35,6 +39,9 @@ export interface ProjectDeletionInspection {
     cwd: string
   }>
   changes: ProjectDeletionChange[]
+  /** Exact number discovered when inspection completed. `changes` is a bounded display sample. */
+  changeCount: number
+  changesTruncated: boolean
   localCommits: ProjectDeletionCommit[]
   worktrees: ProjectDeletionWorktree[]
   inspectionErrors: Array<{ path: string; message: string }>
@@ -46,11 +53,28 @@ interface Checkout {
   baseCommit?: string
 }
 
-function git(cwd: string, args: string[]): string {
-  return execFileSync('git', ['-C', cwd, ...args], {
-    encoding: 'utf8',
-    windowsHide: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
+function remainingMs(deadline: number): number {
+  const remaining = deadline - Date.now()
+  if (remaining <= 0) throw new Error(`inspection exceeded ${INSPECTION_TIMEOUT_MS / 1_000} seconds`)
+  return remaining
+}
+
+function git(cwd: string, args: string[], deadline: number): Promise<string> {
+  const timeout = remainingMs(deadline)
+  return new Promise((resolve, reject) => {
+    execFile('git', ['-C', cwd, ...args], {
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout,
+      maxBuffer: GIT_MAX_BUFFER_BYTES,
+    }, (error, stdout, stderr) => {
+      if (!error) {
+        resolve(stdout)
+        return
+      }
+      const message = stderr.trim() || error.message
+      reject(new Error(message))
+    })
   })
 }
 
@@ -68,47 +92,62 @@ function pathKey(value: string): string {
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved
 }
 
-function nulPaths(cwd: string, args: string[]): string[] {
-  return git(cwd, args)
+async function nulPaths(cwd: string, args: string[], deadline: number): Promise<string[]> {
+  return (await git(cwd, args, deadline))
     .split('\0')
     .filter(Boolean)
     .map((relative) => path.resolve(cwd, relative))
 }
 
-function plainFiles(root: string): string[] {
+async function plainFiles(
+  root: string,
+  deadline: number,
+): Promise<{ files: string[]; count: number }> {
   const files: string[] = []
+  let count = 0
+  let visited = 0
   const pending = [root]
   while (pending.length) {
+    remainingMs(deadline)
     const current = pending.pop()!
-    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+    const directory = await fs.promises.opendir(current)
+    for await (const entry of directory) {
       const target = path.join(current, entry.name)
       if (entry.isDirectory()) pending.push(target)
-      else files.push(target)
+      else {
+        count += 1
+        if (files.length < MAX_RENDERED_CHANGES) files.push(target)
+      }
+      visited += 1
+      if (visited % 256 === 0) {
+        remainingMs(deadline)
+        await new Promise<void>((resolve) => setImmediate(resolve))
+      }
     }
   }
-  return files.sort()
+  return { files: files.sort(), count }
 }
 
-function localCommits(checkout: Checkout): ProjectDeletionCommit[] {
+async function localCommits(checkout: Checkout, deadline: number): Promise<ProjectDeletionCommit[]> {
   let range = 'HEAD'
   try {
-    const upstream = git(checkout.path, [
+    const upstream = (await git(checkout.path, [
       'rev-parse',
       '--abbrev-ref',
       '--symbolic-full-name',
       '@{upstream}',
-    ]).trim()
+    ], deadline)).trim()
     if (upstream) range = `${upstream}..HEAD`
   } catch {
     if (checkout.baseCommit) range = `${checkout.baseCommit}..HEAD`
   }
 
-  const raw = git(checkout.path, [
+  const raw = await git(checkout.path, [
     'log',
     '--max-count=200',
     '--format=%H%x1f%s%x1e',
     range,
-  ])
+  ], deadline)
   return raw
     .split('\x1e')
     .map((entry) => entry.trim())
@@ -128,10 +167,11 @@ function localCommits(checkout: Checkout): ProjectDeletionCommit[] {
  * Read-only preflight for project deletion. Every path returned is absolute so the confirmation surface
  * can point at recoverable work rather than hiding it behind counts.
  */
-export function inspectProjectDeletion(
+export async function inspectProjectDeletion(
   project: Project,
   projectSessions: readonly SessionRecord[],
-): ProjectDeletionInspection {
+): Promise<ProjectDeletionInspection> {
+  const deadline = Date.now() + INSPECTION_TIMEOUT_MS
   const sessions = projectSessions.filter((session) => session.projectId === project.id)
   const worktrees: ProjectDeletionWorktree[] = sessions
     .filter((session): session is SessionRecord & { worktree: string } => Boolean(session.worktree))
@@ -157,6 +197,7 @@ export function inspectProjectDeletion(
   }
 
   const changes: ProjectDeletionChange[] = []
+  let changeCount = 0
   const commits: ProjectDeletionCommit[] = []
   const inspectionErrors: Array<{ path: string; message: string }> = []
   for (const checkout of checkouts.values()) {
@@ -167,15 +208,17 @@ export function inspectProjectDeletion(
       let isGit = false
       try {
         isGit =
-          git(checkout.path, ['rev-parse', '--is-inside-work-tree']).trim() === 'true' &&
-          pathKey(git(checkout.path, ['rev-parse', '--show-toplevel']).trim()) === pathKey(checkout.path)
+          (await git(checkout.path, ['rev-parse', '--is-inside-work-tree'], deadline)).trim() === 'true' &&
+          pathKey((await git(checkout.path, ['rev-parse', '--show-toplevel'], deadline)).trim()) === pathKey(checkout.path)
       } catch {
         // A chosen local directory does not have to be a repository. Every file in it is still real
         // local-only work and must be named before a destructive delete.
       }
       if (!isGit) {
         if (checkout.sessionId) throw new Error('recorded worktree is not a Git working tree')
-        for (const localPath of plainFiles(checkout.path)) {
+        const plain = await plainFiles(checkout.path, deadline)
+        changeCount += plain.count
+        for (const localPath of plain.files) {
           changes.push({
             kind: 'untracked',
             path: localPath,
@@ -185,31 +228,37 @@ export function inspectProjectDeletion(
         continue
       }
       const modified = new Set([
-        ...nulPaths(checkout.path, ['diff', '--name-only', '-z']),
-        ...nulPaths(checkout.path, ['diff', '--cached', '--name-only', '-z']),
+        ...await nulPaths(checkout.path, ['diff', '--name-only', '-z'], deadline),
+        ...await nulPaths(checkout.path, ['diff', '--cached', '--name-only', '-z'], deadline),
       ])
       for (const changedPath of modified) {
-        changes.push({
-          kind: 'uncommitted',
-          path: changedPath,
-          checkoutPath: checkout.path,
-          ...(checkout.sessionId ? { sessionId: checkout.sessionId } : {}),
-        })
+        changeCount += 1
+        if (changes.length < MAX_RENDERED_CHANGES) {
+          changes.push({
+            kind: 'uncommitted',
+            path: changedPath,
+            checkoutPath: checkout.path,
+            ...(checkout.sessionId ? { sessionId: checkout.sessionId } : {}),
+          })
+        }
       }
-      for (const untrackedPath of nulPaths(checkout.path, [
+      for (const untrackedPath of await nulPaths(checkout.path, [
         'ls-files',
         '--others',
         '--exclude-standard',
         '-z',
-      ])) {
-        changes.push({
-          kind: 'untracked',
-          path: untrackedPath,
-          checkoutPath: checkout.path,
-          ...(checkout.sessionId ? { sessionId: checkout.sessionId } : {}),
-        })
+      ], deadline)) {
+        changeCount += 1
+        if (changes.length < MAX_RENDERED_CHANGES) {
+          changes.push({
+            kind: 'untracked',
+            path: untrackedPath,
+            checkoutPath: checkout.path,
+            ...(checkout.sessionId ? { sessionId: checkout.sessionId } : {}),
+          })
+        }
       }
-      commits.push(...localCommits(checkout))
+      commits.push(...await localCommits(checkout, deadline))
     } catch (error) {
       inspectionErrors.push({
         path: checkout.path,
@@ -228,6 +277,8 @@ export function inspectProjectDeletion(
       cwd: canonical(session.cwd),
     })),
     changes,
+    changeCount,
+    changesTruncated: changeCount > changes.length,
     localCommits: commits,
     worktrees,
     inspectionErrors,

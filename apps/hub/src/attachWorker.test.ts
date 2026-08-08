@@ -368,6 +368,30 @@ function seedRecord(store: SessionStore, id: string, status: SessionStatus, prov
 }
 
 describe('SessionManager.attachWorker — the exactly-once replay cursor (hub side, §7.1)', () => {
+  it('coalesces command output bursts and flushes them before the terminal lifecycle boundary', () => {
+    const h = buildHub()
+    seedRecord(h.store, 'command-session', 'active', 'codex')
+    h.sessions.loadRecords()
+
+    h.sessions.ingestWorkerEvent('command-session', 1, 'codex/item/commandExecution/outputDelta', {
+      threadId: 'thread', turnId: 'turn', itemId: 'command', delta: 'first ',
+    })
+    h.sessions.ingestWorkerEvent('command-session', 2, 'codex/item/commandExecution/outputDelta', {
+      threadId: 'thread', turnId: 'turn', itemId: 'command', delta: 'second',
+    })
+    expect(h.journal.since(0).filter((event) => event.kind === 'codex/item/commandExecution/outputDelta')).toHaveLength(0)
+
+    h.sessions.applyLifecycle({ t: 'turnCompleted', sessionId: 'command-session', wseq: 3 })
+
+    const output = h.journal.since(0).filter((event) => event.kind === 'codex/item/commandExecution/outputDelta')
+    expect(output).toHaveLength(1)
+    expect(output[0]).toMatchObject({
+      sessionId: 'command-session',
+      payload: { threadId: 'thread', turnId: 'turn', itemId: 'command', delta: 'first second' },
+    })
+    expect(h.sessions.lastJournaledWseq('command-session')).toBe(2)
+  })
+
   it('publishes worker-ingested Claude usage with the current profile authority', () => {
     const h = buildHub()
     const profile: Profile = {
@@ -786,6 +810,25 @@ describe('SessionManager — an operator Stop survives the interrupted turn\'s o
 })
 
 describe('SessionManager.applyLifecycle — replayed markers do not re-journal or start a bus turn (F2)', () => {
+  it('persists Claude resume identity from the first streamed init event before turn completion', () => {
+    const h = buildHub()
+    seedRecord(h.store, 's', 'active')
+    h.sessions.loadRecords()
+
+    h.sessions.ingestWorkerEvent('s', 1, 'session/vendor-session-observed', {
+      vendorSessionId: 'claude-first-turn-id',
+    })
+
+    expect(h.store.all().find((record) => record.id === 's')?.vendorSessionId).toBe('claude-first-turn-id')
+    expect(h.journal.since(0)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        sessionId: 's',
+        kind: 'session/vendor-session-observed',
+        payload: { vendorSessionId: 'claude-first-turn-id' },
+      }),
+    ]))
+  })
+
   it('persists a live turn boundary as canonical last activity without refreshing replayed markers', () => {
     const h = buildHub()
     seedRecord(h.store, 's', 'active')

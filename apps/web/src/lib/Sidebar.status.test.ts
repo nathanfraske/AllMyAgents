@@ -149,4 +149,63 @@ describe('compact system status indicators', () => {
     expect(within(entry).getByText(label)).toBeTruthy()
     expect(entry.querySelector('.overseer-state')?.classList.contains(label)).toBe(true)
   })
+
+  it('never promotes a paired hub Overseer into the local application-control slot', async () => {
+    store.sessions = {
+      'peer-node:remote-overseer': {
+        record: {
+          id: 'peer-node:remote-overseer',
+          profileId: 'peer-node:claude-remote',
+          provider: 'claude',
+          cwd: 'C:/remote/app',
+          status: 'active',
+          title: 'Overseer @ Remote Hub',
+          isOverseer: true,
+          siteId: 'peer-node',
+          siteLabel: 'Remote Hub',
+          siteOnline: true,
+          createdAt: '2026-08-08T12:00:00.000Z',
+        },
+        items: [],
+        lastActivity: '2026-08-08T12:00:00.000Z',
+        sawReasoning: false,
+      },
+    }
+
+    render(Sidebar)
+
+    const localEntry = screen.getByRole('button', { name: /Open Overseer.*not set up/i })
+    expect(screen.getByText('Overseer @ Remote Hub')).toBeTruthy()
+
+    await fireEvent.click(localEntry)
+    expect(store.selectedId).toBeNull()
+    expect(store.settingsOpen).toBe(true)
+  })
+
+  it('opens the local Overseer while leaving a peer Overseer in the remote roster', async () => {
+    store.sessions = {
+      local: {
+        record: {
+          id: 'local', profileId: 'claude-local', provider: 'claude', cwd: 'C:/local/app',
+          status: 'idle', title: 'Overseer', isOverseer: true, createdAt: '2026-08-08T12:00:00.000Z',
+        },
+        items: [], lastActivity: '2026-08-08T12:00:00.000Z', sawReasoning: false,
+      },
+      'peer-node:remote': {
+        record: {
+          id: 'peer-node:remote', profileId: 'peer-node:claude-remote', provider: 'claude', cwd: 'C:/remote/app',
+          status: 'active', title: 'Overseer @ Remote Hub', isOverseer: true,
+          siteId: 'peer-node', siteLabel: 'Remote Hub', siteOnline: true,
+          createdAt: '2026-08-08T12:00:00.000Z',
+        },
+        items: [], lastActivity: '2026-08-08T12:00:00.000Z', sawReasoning: false,
+      },
+    }
+
+    render(Sidebar)
+    await fireEvent.click(screen.getByRole('button', { name: /Open Overseer.*idle/i }))
+
+    expect(store.selectedId).toBe('local')
+    expect(screen.getByText('Overseer @ Remote Hub')).toBeTruthy()
+  })
 })

@@ -318,6 +318,27 @@ describe('ProjectView', () => {
     expect(screen.getByRole('note').textContent).toMatch(/Purpose.*Collision writer/u)
   })
 
+  it('keeps retired children out of the live team and exposes them as preserved records', async () => {
+    store.sessions.retired = session('retired', 'Corbato', 'stopped', {
+      parentSessionId: 'manager',
+      managerTeamId: 'team-a',
+      managerTeamName: 'Core team',
+      managerRetiredAt: '2026-08-08T12:00:00.000Z',
+      managerRetiredReason: 'replaced after context exhaustion',
+    })
+
+    const { container } = render(ProjectView, { props: { projectId: project.id } })
+
+    expect([...container.querySelectorAll('.agent-list .name')].map((node) => node.textContent)).not.toContain('Corbato')
+    expect(screen.getByText('1 retired agent record')).toBeTruthy()
+    expect(screen.getByText(/Archived agents are absent from the working catalog/)).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Open retired record for Corbato' })).toBeTruthy()
+    expect(screen.getByText(/replaced after context exhaustion/)).toBeTruthy()
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Open retired record for Corbato' }))
+    expect(store.selectedId).toBe('retired')
+  })
+
   it('switches between overview and the full manager conversation and remembers the choice', async () => {
     const view = render(ProjectView, { props: { projectId: project.id } })
 

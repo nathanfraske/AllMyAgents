@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildFleet, type BuildFleetDeps } from './fleet.js'
+import { buildFleet, rosterAuthorizesDevice, type BuildFleetDeps } from './fleet.js'
 import type { FleetMember } from './meshSite.js'
 
 // A deps builder with sensible fakes; each test overrides just what it exercises. No node, no
@@ -22,6 +22,15 @@ const member = (device: string, label = ''): FleetMember => ({ device, label })
 const advertised = (device: string, port: number, label = 'AllMyAgents') => ({
   device,
   sites: [{ id: `tcp:${port}`, label, port }],
+})
+
+describe('signed fleet admission', () => {
+  it('matches canonical device identity while refusing sighted identities absent from the roster', () => {
+    const roster = [member('abcdef-AB123', 'Owned')]
+    expect(rosterAuthorizesDevice(roster, 'ABCDEF-other')).toBe(true)
+    expect(rosterAuthorizesDevice(roster, 'abcdef')).toBe(true)
+    expect(rosterAuthorizesDevice(roster, 'sighted-peer')).toBe(false)
+  })
 })
 
 describe('buildFleet (unified-across-mesh roster, first cut)', () => {

@@ -515,7 +515,7 @@ describe('project manager reversible child retirement', () => {
       payload: expect.objectContaining({ managerSessionId: manager.id, reason: 'context compaction unavailable' }),
     }))
     expect(journal.recentEventsForSession(child.id).some((event) => event.kind === 'session/deleted')).toBe(false)
-    expect(sessions.managerChildStatus(manager.id).summary).toMatch(/1 retired.*Corbato.*retired/is)
+    expect(sessions.managerChildStatus(manager.id).summary).toMatch(/Retired records: 1.*Retired records.*Corbato.*retired/is)
 
     await expect(spawn({ profileId: 'p1', prompt: 'Continue in a fresh bounded context.', useWorktree: false }))
       .resolves.toMatchObject({ ok: true, sessionId: expect.any(String) })
@@ -611,7 +611,7 @@ describe('project manager lifecycle awareness', () => {
 
     const result = sessions.managerChildStatus('manager')
     expect(result.ok).toBe(true)
-    expect(result.summary).toContain('2 running, 1 idle, 1 stopped, 0 retired, 1 errored')
+    expect(result.summary).toContain('Active children: 2 running, 1 idle, 1 stopped, 1 errored. Retired records: 0.')
     expect(result.summary).toContain('(starting): starting')
     expect(result.summary).toContain('(active): active')
     expect(result.summary).not.toContain('grandchild')

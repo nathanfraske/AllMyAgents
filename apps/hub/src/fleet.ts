@@ -68,6 +68,12 @@ function canonicalDevice(id: string): string {
   return id.split('-', 1)[0]!.toLowerCase()
 }
 
+/** Admission-grade same-fleet check over the node's signed owned-roster. */
+export function rosterAuthorizesDevice(roster: readonly FleetMember[], deviceId: string): boolean {
+  const wanted = canonicalDevice(deviceId)
+  return wanted.length > 0 && roster.some((member) => canonicalDevice(member.device) === wanted)
+}
+
 function isHubLabel(label: string): boolean {
   return /^allmyagents(?:\b|$)/i.test(label.trim())
 }

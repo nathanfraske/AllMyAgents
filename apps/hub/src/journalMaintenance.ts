@@ -14,6 +14,7 @@ import {
 } from './journal.js'
 import { verifyRecentCompactionSnapshot } from './journalCompactionGate.js'
 import { verifyStrongRecoverySnapshotCoverage } from './journalRecovery.js'
+import { reserveReplicationPruneGate } from './journalReplication.js'
 import { SCHEMA_VERSION } from './restartHandshake.js'
 
 type MaintenanceMessage =
@@ -146,6 +147,37 @@ async function main(): Promise<{ message: MaintenanceMessage; exitCode: number }
       graceMs: Number(graceRaw),
       maxTransientPayloadBytes: Number(byteLimitRaw),
     })
+    if (candidateFrontier === 0) {
+      // Snapshot verification hashes and integrity-checks the complete recovery generation. On a
+      // multi-gigabyte journal that consumed 14-19 seconds every five minutes even after maintenance had
+      // reached steady state and there was not one row it was authorized to delete. A zero frontier also
+      // bounds history rollup to seq 0, so there is no destructive work requiring snapshot coverage.
+      aggregate = {
+        commandOutputDeltasDeleted: 0,
+        agentMessageDeltasDeleted: 0,
+        diffSnapshotsDeleted: 0,
+        itemStartedDeleted: 0,
+        transientPayloadBytesDeleted: 0,
+        oversizedTransientRowsRetained: 0,
+        writerLockMs: 0,
+        cursorCheckpointsWritten: 0,
+        historyTurnsRolledUp: 0,
+        historyTurnsDeferred: 0,
+        historyTurnsExpired: 0,
+        historyRowsDeleted: 0,
+        historyPayloadBytesSelected: 0,
+        historyPayloadBytesWritten: 0,
+        replication: reserveReplicationPruneGate(journal.db),
+      }
+      journal.recordCompactionLifecycle(operationId, 'completed', {
+        detail: 'Journal maintenance is current; no snapshot verification or deletion was needed.',
+      })
+      reportProgress('completed', 0, 0)
+      return {
+        message: { type: 'journal-condensed', operationId, result: aggregate },
+        exitCode: 0,
+      }
+    }
     reportProgress('verifying-snapshot-coverage', lastProjectionProgress, payloadBytesDeleted)
     const snapshot = verifyRecentCompactionSnapshot(
       backupDirectory,

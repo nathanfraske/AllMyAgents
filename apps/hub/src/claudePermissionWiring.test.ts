@@ -32,7 +32,9 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
     // Must be genuinely async-iterable: ClaudeDriver.send awaits `for await` to completion, and a plain
     // array would not exercise the same path.
     return (async function* () {
-      yield { type: 'result', subtype: 'success', is_error: false, result: 'ok' }
+      const session_id = typeof params.options.resume === 'string' ? params.options.resume : 'new-claude-session'
+      yield { type: 'system', subtype: 'init', session_id }
+      yield { type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id }
     })()
   },
 }))
@@ -70,6 +72,20 @@ describe('ClaudeDriver permission wiring', () => {
   it('always installs canUseTool, which is where the hub policy is enforced', async () => {
     await makeDriver(async () => ({ behavior: 'allow', updatedInput: {} })).send('hi', { permissionMode: 'full' })
     expect(typeof captured[0]!.canUseTool).toBe('function')
+  })
+
+  it('announces a fresh Claude resume id at init instead of waiting for turn completion', async () => {
+    const events: Array<{ kind: string; payload: unknown }> = []
+    const driver = new ClaudeDriver('/tmp/profile', '/tmp/cwd', (kind, payload) => events.push({ kind, payload }))
+
+    await driver.send('long first turn')
+
+    expect(events[0]).toEqual({
+      kind: 'session/vendor-session-observed',
+      payload: { vendorSessionId: 'new-claude-session' },
+    })
+    expect(driver.sessionId).toBe('new-claude-session')
+    expect(events.filter((event) => event.kind === 'session/vendor-session-observed')).toHaveLength(1)
   })
 
   it('enables the supported Claude auto-compaction window on every resumed app turn', async () => {

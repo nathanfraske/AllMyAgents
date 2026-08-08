@@ -6,6 +6,7 @@ import { loadLastLayout, saveLastLayout } from './uiState'
 import { buildAgentRuns } from './agentTree'
 import { alertDialog } from './dialog.svelte'
 import { buildTaskBoard } from './taskBoard'
+import { reduceJournalHistory } from './journalHistoryReducer'
 import type { HubEvent, SessionRecord } from './api'
 
 // The store imports ./api (real network / WebSocket) and ./settings.svelte (localStorage).
@@ -50,10 +51,23 @@ vi.mock('./api', () => {
         encodedBytes: 0,
         checkpointGeneration: 1,
       })),
+      fleet: vi.fn(async () => []),
+      authFrom: vi.fn(async () => ({ requireToken: true, authed: true })),
+      replayBaselineFrom: vi.fn(async () => null),
+      saveFleetConnection: vi.fn(async () => ({
+        siteId: 'peer', label: 'Peer', updatedAt: '2026-01-01T00:00:00.000Z', paired: true,
+      })),
       spawn: vi.fn(async () => rec('spawned')),
+      pairFleetSiteDirect: vi.fn(async () => ({ siteId: 'peer', label: 'Peer', token: 't'.repeat(64), paired: true })),
       send: vi.fn(ok),
       stop: vi.fn(ok),
       deleteSession: vi.fn(ok),
+    },
+    configureFleetSites: vi.fn(),
+    getFleetSiteToken: (siteId: string) => localStorage.getItem(`test.fleet.${siteId}`) ?? '',
+    setFleetSiteToken: (siteId: string, token: string) => {
+      if (token) localStorage.setItem(`test.fleet.${siteId}`, token)
+      else localStorage.removeItem(`test.fleet.${siteId}`)
     },
   }
 })
@@ -701,6 +715,158 @@ describe('apply()', () => {
       expect(text).not.toContain(absent)
     }
   )
+})
+
+describe('automatic signed-fleet trust', () => {
+  it('links a direct same-fleet hub with no pairing code and retains its reciprocal credential', async () => {
+    const site = {
+      siteId: 'peer',
+      label: 'Peer',
+      local: false,
+      baseUrl: '',
+      online: false,
+      directOnline: true,
+      authState: 'pairing-required' as const,
+    }
+    store.fleetSites = [site]
+
+    await (store as unknown as { autoTrustFleetSite(site: unknown): Promise<void> }).autoTrustFleetSite(site)
+
+    expect(api.pairFleetSiteDirect).toHaveBeenCalledWith('peer')
+    expect(localStorage.getItem('test.fleet.peer')).toBe('t'.repeat(64))
+    expect(site.authState).toBe('paired')
+  })
+})
+
+describe('remote reachability hysteresis', () => {
+  it('keeps remote rows and an open stream online through a transient fleet probe failure', async () => {
+    const remote = new HubStore()
+    remote.projects = [{
+      id: 'peer:project', name: 'Remote project', path: '/remote',
+      createdAt: '2026-01-01T00:00:00.000Z', siteId: 'peer', siteOnline: true,
+    }]
+    remote.sessions['peer:session'] = {
+      record: rec('peer:session', { siteId: 'peer', siteOnline: true }),
+      items: [], lastActivity: '2026-01-01T00:00:00.000Z', sawReasoning: false,
+    }
+    const socket = { readyState: 1, close: vi.fn() }
+    const internals = remote as unknown as {
+      remoteStreams: Map<string, {
+        site: { siteId: string; label: string; local: false; baseUrl: string; online: true }
+        socket: typeof socket
+        generation: number
+        baselineSeq: number
+        lastSeq: number
+        reconnectTimer: null
+        failures: number
+      }>
+      refreshFleetNow(force?: boolean): Promise<void>
+    }
+    internals.remoteStreams.set('peer', {
+      site: { siteId: 'peer', label: 'Peer', local: false, baseUrl: 'http://peer', online: true },
+      socket, generation: 1, baselineSeq: 10, lastSeq: 10, reconnectTimer: null, failures: 0,
+    })
+    vi.mocked(api.fleet).mockResolvedValueOnce([
+      { siteId: 'local', label: 'Local', local: true, baseUrl: '', online: true },
+      { siteId: 'peer', label: 'Peer', local: false, baseUrl: 'http://peer', online: false },
+    ])
+    vi.mocked(api.replayBaselineFrom).mockRejectedValueOnce(new Error('transient timeout'))
+
+    await internals.refreshFleetNow()
+
+    expect(remote.projects[0]).toMatchObject({ id: 'peer:project', siteOnline: true })
+    expect(remote.sessions['peer:session']?.record.siteOnline).toBe(true)
+    expect(internals.remoteStreams.has('peer')).toBe(true)
+    expect(socket.close).not.toHaveBeenCalled()
+  })
+})
+
+describe('remote transcript ordering and overlap identity', () => {
+  it('adopts canonical sequence keys for multiple optimistic sends and isolated rollbacks', () => {
+    const optimistic = new HubStore()
+    optimistic.sessions.s1 = {
+      record: rec('s1'),
+      items: [],
+      lastActivity: '2026-01-01T00:00:00.000Z',
+      sawReasoning: false,
+    }
+    const failedKey = optimistic.pushUserEcho('s1', 'failed before acceptance')
+    optimistic.pushUserEcho('s1', 'accepted after it')
+    optimistic.removeItem('s1', failedKey)
+    ;(optimistic as unknown as { apply(event: HubEvent): void }).apply(evt({
+      seq: 7,
+      kind: 'session/input',
+      sessionId: 's1',
+      payload: { text: 'accepted after it' },
+    }))
+
+    expect(optimistic.sessions.s1?.items).toMatchObject([
+      { key: 'journal:7:0', text: 'accepted after it' },
+    ])
+  })
+
+  it('deduplicates a live steer against lazy history and rejects stale remote sequence rows', () => {
+    const remote = new HubStore()
+    const id = 'peerhub:s1'
+    remote.sessions[id] = {
+      record: rec(id, { siteId: 'peerhub' }),
+      items: [],
+      lastActivity: '2026-01-01T00:00:00.000Z',
+      sawReasoning: false,
+    }
+    const internals = remote as unknown as {
+      remoteStreams: Map<string, {
+        site: { siteId: string; label: string; local: false; baseUrl: string; online: true }
+        socket: null
+        generation: number
+        baselineSeq: number
+        lastSeq: number
+        reconnectTimer: null
+        failures: number
+      }>
+      apply(event: HubEvent, sourceSiteId?: string): void
+      installJournalHistoryWindow(view: (typeof remote.sessions)[string], history: ReturnType<typeof reduceJournalHistory>): void
+    }
+    internals.remoteStreams.set('peerhub', {
+      site: { siteId: 'peerhub', label: 'Peer Hub', local: false, baseUrl: 'http://remote', online: true },
+      socket: null,
+      generation: 3,
+      baselineSeq: 40,
+      lastSeq: 40,
+      reconnectTimer: null,
+      failures: 0,
+    })
+    const steer = evt({
+      seq: 50,
+      kind: 'session/input',
+      sessionId: id,
+      payload: { text: 'steer once' },
+    })
+    internals.apply(steer, 'peerhub')
+    expect(remote.sessions[id]?.items).toMatchObject([
+      { key: 'journal:50:0', kind: 'user', text: 'steer once' },
+    ])
+
+    // A reconnect replay cannot apply the same or an older event again.
+    internals.apply(steer, 'peerhub')
+    internals.apply(evt({
+      seq: 49,
+      kind: 'session/input',
+      sessionId: id,
+      payload: { text: 'stale duplicate' },
+    }), 'peerhub')
+
+    // The lazy history window overlaps seq 50. Its reducer now produces the same stable key as the
+    // live path, so reconciliation keeps one row and places truly older history before it.
+    const history = reduceJournalHistory([
+      evt({ seq: 20, kind: 'session/input', sessionId: 's1', payload: { text: 'older' } }),
+      evt({ seq: 50, kind: 'session/input', sessionId: 's1', payload: { text: 'steer once' } }),
+    ])
+    internals.installJournalHistoryWindow(remote.sessions[id]!, history)
+
+    expect(remote.sessions[id]?.items.map((item) => item.text)).toEqual(['older', 'steer once'])
+    expect(remote.sessions[id]?.items.filter((item) => item.text === 'steer once')).toHaveLength(1)
+  })
 })
 
 describe('global recovery notice replay', () => {

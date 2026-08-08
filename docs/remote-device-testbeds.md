@@ -11,16 +11,19 @@ the mapped Site/HTTP route only as a compatibility fallback.
    testbed**.
 2. Add one or more local folders. Enable `read`, `write`, and/or `terminal` separately for each folder and
    save. The safe default is disabled with no roots.
-3. Create a short-lived one-use pairing code on either hub and enter its eight characters in the other
-   hub's Remote access settings. Pairing is bound to the authenticated mesh peer identity and exchanges the
-   two hub capabilities reciprocally, so one operator action pairs both directions. Long device tokens remain
-   available only for compatibility with an older peer and are never returned by a connection-list API or
-   agent tool.
+3. Devices already admitted to the same signed AllMyStuff fleet link automatically over their authenticated
+   mesh identities; a sighted peer or a machine that merely shares some other mesh does not qualify. For a
+   peer outside that fleet, create one short-lived one-use pairing code on either hub and enter its eight
+   characters in the other hub's Remote access settings. Either path exchanges the two hub capabilities
+   reciprocally, so there is no second reverse-pairing ceremony. Long device tokens remain available only for
+   compatibility with an older peer and are never returned by a connection-list API or agent tool.
 4. In a chat, open **Devices**, select the exact target roots and operations, and save. This is a durable
    per-chat operator grant. Fleet pairing and the chat's Safe/Edits/Full mode do not imply it.
 5. The agent can discover only its granted device/root labels and opaque IDs, then use:
    `remote_ping`, `remote_inspect_environment`, `remote_list_files`, `remote_read_file`,
-   `remote_write_file`, and `remote_exec`.
+   `remote_create_directory`, `remote_write_file`, and `remote_exec`. A folder transfer mirrors its
+   directory tree with `remote_create_directory` before writing the contained files; empty directories
+   are therefore preserved too.
 
 Revoking a chat grant takes effect on its next tool call. Disabling the target policy, deleting a root, or
 removing a root capability also fails closed immediately, even if a source chat still has an older grant.
@@ -35,6 +38,8 @@ removing a root capability also fails closed immediately, even if a source chat 
 - The target policy stores canonical real paths. File paths must be relative, lexical escapes are refused,
   and existing symlinks are resolved and checked against the approved root.
 - Reads and writes are limited to 1 MiB. Writes use a same-directory temporary file and atomic rename.
+  Directory creation requires the same explicit write grant and checks every existing component without
+  following a link or junction outside the root.
 - Directory listings, JSON bodies, remote responses, command text, command output, and command duration are
   bounded. Timed-out command process trees are terminated.
 - Remote access is denied on teammate/bus-caused turns by default. The existing explicit risky-bus operator

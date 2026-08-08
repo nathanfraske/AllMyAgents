@@ -95,6 +95,8 @@ export interface ProjectDeletionInspection {
     checkoutPath: string
     sessionId?: string
   }>
+  changeCount?: number
+  changesTruncated?: boolean
   localCommits: Array<{
     hash: string
     subject: string
@@ -1252,9 +1254,9 @@ export const api = {
       risks: value.risks.map((risk) => ({ ...risk, sessionIds: risk.sessionIds.map(prefix) })),
     }
   },
-  inspectProjectDeletion: async (projectId: string) => {
+  inspectProjectDeletion: async (projectId: string, signal?: AbortSignal) => {
     const target = resolveHubResource(projectId)
-    const value = await routedGet<ProjectDeletionInspection>(projectId, (id) => `/api/projects/${encodeURIComponent(id)}/deletion`)
+    const value = await routedGet<ProjectDeletionInspection>(projectId, (id) => `/api/projects/${encodeURIComponent(id)}/deletion`, signal)
     if (!target.site) return value
     const prefix = (id: string): string => `${target.site!.siteId}:${id}`
     return {
@@ -1325,10 +1327,10 @@ export const api = {
   // The fleet roster: this hub + every reachable co-owned peer's hub, badged by machine.
   fleet: (forceRouteRecovery = false) =>
     jget<FleetSite[]>(forceRouteRecovery ? '/api/fleet?refresh=1' : '/api/fleet'),
-  pairFleetSiteDirect: (siteId: string, code: string) =>
+  pairFleetSiteDirect: (siteId: string, code?: string) =>
     jpost<{ siteId?: string; label?: string; token?: string; paired?: boolean; error?: string }>(
       '/api/fleet/pair-direct',
-      { siteId, code },
+      { siteId, ...(code ? { code } : {}) },
     ),
   // Authenticate, bootstrap, and refresh an arbitrary mapped fleet hub with its own paired token.
   authFrom: (site: FleetSite) =>
@@ -1451,10 +1453,14 @@ export const api = {
   },
   // `attachments` is an array of attachment IDs (from uploadAttachment), NOT the metadata objects — the
   // hub resolves ids to the stored files (server.ts stringArray: "must be an array of ids").
-  send: (id: string, text: string, extra: { model?: string; effort?: string; serviceTier?: string; attachments?: string[] } = {}) =>
+  send: (id: string, text: string, extra: { model?: string; effort?: string; serviceTier?: string; attachments?: string[]; requestId?: string } = {}) =>
     routedPost<{ ok?: boolean; error?: string }>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/input`, { text, ...extra }),
-  steer: (id: string, text: string, attachments?: string[]) =>
-    routedPost<{ ok?: boolean; error?: string }>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/steer`, { text, ...(attachments?.length ? { attachments } : {}) }),
+  steer: (id: string, text: string, attachments?: string[], requestId?: string) =>
+    routedPost<{ ok?: boolean; error?: string }>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/steer`, {
+      text,
+      ...(attachments?.length ? { attachments } : {}),
+      ...(requestId ? { requestId } : {}),
+    }),
   /**
    * Upload ONE file's raw bytes to a session and get back its stored {@link AttachmentMeta} (id used to
    * reference it on the next send/steer), or `{ error }` on failure. Bespoke transport — NOT jpost — the

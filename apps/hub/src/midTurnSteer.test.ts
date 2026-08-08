@@ -114,6 +114,27 @@ async function settle(): Promise<void> {
 }
 
 describe('SessionManager mid-turn steering', () => {
+  it('delivers a retried remote steer request exactly once', async () => {
+    let release!: () => void
+    const steering = new Promise<void>((resolve) => { release = resolve })
+    const { sessions, journal, steer } = build({ steer: async () => steering })
+
+    const first = sessions.send('s1', 'one remote correction', {}, [], 'remote-request-1')
+    const retry = sessions.send('s1', 'one remote correction', {}, [], 'remote-request-1')
+    await vi.waitFor(() => expect(steer).toHaveBeenCalledOnce())
+    release()
+    await expect(Promise.all([first, retry])).resolves.toEqual([undefined, undefined])
+
+    expect(steer).toHaveBeenCalledOnce()
+    expect(journal.since(0).filter((event) =>
+      event.kind === 'session/input' &&
+      (event.payload as { text?: string }).text === 'one remote correction'
+    )).toHaveLength(1)
+    await expect(
+      sessions.send('s1', 'different content', {}, [], 'remote-request-1')
+    ).rejects.toThrow(/reused for different content/u)
+  })
+
   it('delivers workspace pressure to an active turn and persists it into managed instructions', async () => {
     const { sessions, journal, store, record, steer } = build()
     const pressure: WorkspacePressure = {

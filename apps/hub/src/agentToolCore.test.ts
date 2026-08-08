@@ -108,6 +108,7 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
       'remote_inspect_environment',
       'remote_list_files',
       'remote_read_file',
+      'remote_create_directory',
       'remote_write_file',
       'remote_exec',
       'overseer_control',

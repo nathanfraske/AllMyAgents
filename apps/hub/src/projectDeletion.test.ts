@@ -100,7 +100,7 @@ function buildHub() {
 }
 
 describe('project deletion preflight', () => {
-  it('reports the actual local-only files, commits, and live worktree paths', () => {
+  it('reports the actual local-only files, commits, and live worktree paths', async () => {
     const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ama-project-delete-')))
     const repo = path.join(root, 'project')
     const worktree = path.join(root, 'worktree')
@@ -139,7 +139,7 @@ describe('project deletion preflight', () => {
       createdAt: new Date().toISOString(),
     }
 
-    const result = inspectProjectDeletion(project, [session])
+    const result = await inspectProjectDeletion(project, [session])
 
     expect(result.projectPath).toBe(repo)
     expect(result.changes).toEqual(expect.arrayContaining([
@@ -172,9 +172,11 @@ describe('project deletion preflight', () => {
       },
     ])
     expect(result.inspectionErrors).toEqual([])
+    expect(result.changeCount).toBe(2)
+    expect(result.changesTruncated).toBe(false)
 
     cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }))
-  })
+  }, 20_000)
 
   it('removes only the project association by default and preserves dirty work', async () => {
     const hub = buildHub()
@@ -211,7 +213,7 @@ describe('project deletion preflight', () => {
     expect(fs.existsSync(hub.repo)).toBe(false)
   })
 
-  it('lists files in a plain project even when a parent directory is a Git repository', () => {
+  it('lists files in a plain project even when a parent directory is a Git repository', async () => {
     const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ama-project-delete-plain-')))
     git(root, 'init')
     const projectRoot = path.join(root, 'plain-project')
@@ -226,7 +228,7 @@ describe('project deletion preflight', () => {
       createdAt: new Date().toISOString(),
     }
 
-    const result = inspectProjectDeletion(project, [])
+    const result = await inspectProjectDeletion(project, [])
 
     expect(result.changes).toEqual([
       {
@@ -235,6 +237,35 @@ describe('project deletion preflight', () => {
         checkoutPath: projectRoot,
       },
     ])
+    expect(result.inspectionErrors).toEqual([])
+    expect(result.changeCount).toBe(1)
+    expect(result.changesTruncated).toBe(false)
+    cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }))
+  })
+
+  it('keeps a large plain-directory inspection responsive and bounds the renderer payload', async () => {
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ama-project-delete-large-')))
+    const projectRoot = path.join(root, 'plain-project')
+    fs.mkdirSync(projectRoot)
+    for (let index = 0; index < 525; index += 1) {
+      fs.writeFileSync(path.join(projectRoot, `artifact-${String(index).padStart(4, '0')}.bin`), 'x')
+    }
+    const project: Project = {
+      id: 'large-project',
+      name: 'Large plain folder',
+      path: projectRoot,
+      createdAt: new Date().toISOString(),
+    }
+    let eventLoopAdvanced = false
+    const inspecting = inspectProjectDeletion(project, [])
+    setImmediate(() => { eventLoopAdvanced = true })
+
+    const result = await inspecting
+
+    expect(eventLoopAdvanced).toBe(true)
+    expect(result.changeCount).toBe(525)
+    expect(result.changes).toHaveLength(500)
+    expect(result.changesTruncated).toBe(true)
     expect(result.inspectionErrors).toEqual([])
     cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }))
   })

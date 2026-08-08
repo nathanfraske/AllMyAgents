@@ -47,6 +47,12 @@ export interface RestartInterruptedTurn {
   questionIds: readonly string[]
 }
 
+export interface RestartContinuityExcerpt {
+  sourceSeq: number
+  questionCount: number
+  events: Array<{ seq: number; kind: string; payload: unknown }>
+}
+
 /**
  * The per-session marker a restarted hub journals when the worker has respawned and the session's worker
  * `wseq` will RESTART at 1 for the next worker era (docs/agent-worker-impl.md §7.1 — F1). The reset-aware
@@ -2843,6 +2849,59 @@ export class Journal extends EventEmitter {
       }
       return written
     })
+  }
+
+  /**
+   * Return one not-yet-injected, bounded conversation excerpt after an interrupted interactive question.
+   * This is the durable fallback for the rare case where the vendor resume identity/process is unavailable.
+   * Only conversational rows are selected; tool output and command streams never enter the capsule.
+   */
+  restartContinuityExcerpt(sessionId: string, limit = 120): RestartContinuityExcerpt | undefined {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
+      throw new Error('restart continuity limit is outside the supported bound')
+    }
+    const interrupted = this.db.prepare(
+      `SELECT source.seq, source.payload
+       FROM journal_session_event_index AS source_index
+       JOIN events AS source ON source.seq = source_index.seq
+       WHERE source_index.session = ? AND source.kind = 'question/restart-interrupted'
+         AND NOT EXISTS (
+           SELECT 1
+           FROM journal_session_event_index AS injected_index
+           JOIN events AS injected ON injected.seq = injected_index.seq
+           WHERE injected_index.session = source_index.session
+             AND injected.kind = 'session/restart-continuity-injected'
+             AND CAST(json_extract(injected.payload, '$.sourceSeq') AS INTEGER) = source.seq
+         )
+       ORDER BY source_index.seq DESC LIMIT 1`
+    ).get(sessionId) as { seq: number; payload: string } | undefined
+    if (!interrupted) return undefined
+    const rows = this.db.prepare(
+      `SELECT seq, kind, payload FROM (
+         SELECT event.seq, event.kind, event.payload
+         FROM journal_session_event_index AS session_event
+         JOIN events AS event ON event.seq = session_event.seq
+         WHERE session_event.session = ? AND session_event.seq < ? AND event.kind IN (
+           'session/input', 'claude/assistant', 'claude/result',
+           'codex/item/completed', 'codex/subagent/item/completed'
+         )
+         ORDER BY session_event.seq DESC LIMIT ?
+       ) ORDER BY seq ASC`
+    ).all(sessionId, interrupted.seq, limit) as Array<{ seq: number; kind: string; payload: string }>
+    let questionCount = 1
+    try {
+      const payload = JSON.parse(interrupted.payload) as { questionCount?: unknown }
+      if (typeof payload.questionCount === 'number' && Number.isSafeInteger(payload.questionCount)) {
+        questionCount = payload.questionCount
+      }
+    } catch {
+      // The journal guarantees JSON, but a missing count must not suppress continuity recovery.
+    }
+    return {
+      sourceSeq: interrupted.seq,
+      questionCount,
+      events: rows.map((row) => ({ ...row, payload: JSON.parse(row.payload) as unknown })),
+    }
   }
 
   /** Foreign-owner rows have no callback in this process; close and surface them before promotion. */

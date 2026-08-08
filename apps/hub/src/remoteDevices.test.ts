@@ -9,6 +9,7 @@ import {
   FleetConnectionStore,
   RemoteDeviceController,
   parseRemoteWslEnvironments,
+  remoteCapabilityForAction,
   wslUncPath,
   type DeviceExecutorCapabilities,
 } from './remoteDevices.js'
@@ -27,6 +28,13 @@ afterEach(() => {
 })
 
 describe('DeviceExecutor target policy', () => {
+  it('classifies directory creation as a write at every grant boundary', () => {
+    expect(remoteCapabilityForAction({ op: 'mkdir', rootId: 'root', path: 'nested' })).toBe('write')
+    expect(remoteCapabilityForAction({ op: 'write', rootId: 'root', path: 'file', content: '' })).toBe('write')
+    expect(remoteCapabilityForAction({ op: 'list', rootId: 'root' })).toBe('read')
+    expect(remoteCapabilityForAction({ op: 'exec', rootId: 'root', command: 'true' })).toBe('terminal')
+  })
+
   it('is disabled with no roots until the operator explicitly configures it', async () => {
     const dir = tempDir()
     const executor = new DeviceExecutor(path.join(dir, 'policy.json'))
@@ -66,6 +74,17 @@ describe('DeviceExecutor target policy', () => {
       bytes: 7,
     })
     expect(fs.readFileSync(path.join(root, 'created.txt'), 'utf8')).toBe('written')
+    await expect(executor.execute({
+      op: 'mkdir', rootId, path: path.join('nested', 'empty'), recursive: true,
+    })).resolves.toMatchObject({ ok: true, created: true })
+    expect(fs.statSync(path.join(root, 'nested', 'empty')).isDirectory()).toBe(true)
+    await expect(executor.execute({
+      op: 'write', rootId, path: path.join('nested', 'copied.txt'), content: 'folder payload',
+    })).resolves.toMatchObject({ ok: true, bytes: 14 })
+    expect(fs.readFileSync(path.join(root, 'nested', 'copied.txt'), 'utf8')).toBe('folder payload')
+    await expect(executor.execute({
+      op: 'mkdir', rootId, path: path.join('missing-parent', 'leaf'), recursive: false,
+    })).resolves.toMatchObject({ ok: false, error: 'parent directory does not exist' })
     await expect(executor.execute({ op: 'write', rootId, path: 'bad.bin', content: '**invalid**', encoding: 'base64' })).resolves.toMatchObject({
       ok: false,
       error: 'content is not valid base64',
@@ -108,6 +127,17 @@ describe('FleetConnectionStore', () => {
 })
 
 describe('RemoteDeviceController', () => {
+  it('reports unchanged credentials so periodic fleet reconciliation stays audit-idempotent', () => {
+    const dir = tempDir()
+    const connections = new FleetConnectionStore(path.join(dir, 'connections.json'))
+    const controller = new RemoteDeviceController(connections, async () => null)
+    const token = 'r'.repeat(64)
+
+    expect(controller.saveConnection({ siteId: 'peer', label: 'Peer', token }).changed).toBe(true)
+    expect(controller.saveConnection({ siteId: 'peer', label: 'Peer', token }).changed).toBe(false)
+    expect(controller.saveConnection({ siteId: 'peer', label: 'Renamed', token }).changed).toBe(true)
+  })
+
   it('uses the authenticated Site-free RPC lane for granted capabilities and actions', async () => {
     const dir = tempDir()
     const connections = new FleetConnectionStore(path.join(dir, 'connections.json'))
@@ -181,6 +211,31 @@ describe('RemoteDeviceController', () => {
     const controller = new RemoteDeviceController(connections, async () => null, { bridge, localDeviceToken: localToken })
 
     await expect(controller.pairDirect('peerhub', 'ABCD-EFGH')).resolves.toMatchObject({
+      siteId: 'peerhub', label: 'Peer Hub', paired: true,
+    })
+    expect(connections.get('peerhub')?.token).toBe(remoteToken)
+  })
+
+  it('requests signed-fleet reciprocal trust without a code', async () => {
+    const dir = tempDir()
+    const connections = new FleetConnectionStore(path.join(dir, 'connections.json'))
+    const localToken = 'l'.repeat(64)
+    const remoteToken = 'r'.repeat(64)
+    const call = vi.fn(async (_peer: string, value: unknown) => {
+      expect(value).toMatchObject({
+        kind: 'fleet_trust_exchange',
+        source: { siteId: 'localhub', label: 'Local Hub', token: localToken },
+      })
+      expect(value).not.toHaveProperty('code')
+      return { siteId: 'peerhub', label: 'Peer Hub', token: remoteToken }
+    })
+    const bridge = {
+      identity: vi.fn(async () => ({ siteId: 'localhub', label: 'Local Hub' })),
+      call,
+    } as unknown as MyOwnMeshRpcBridge
+    const controller = new RemoteDeviceController(connections, async () => null, { bridge, localDeviceToken: localToken })
+
+    await expect(controller.pairDirect('peerhub')).resolves.toMatchObject({
       siteId: 'peerhub', label: 'Peer Hub', paired: true,
     })
     expect(connections.get('peerhub')?.token).toBe(remoteToken)

@@ -45,7 +45,11 @@
     statusPath?: string
     logTail?: string
   } | null>(null)
-  const liveOverseer = $derived(store.sessionList.find((session) => session.record.isOverseer === true))
+  // Fleet baselines preserve a remote session's role so it remains intelligible in the remote roster.
+  // That role is not local authority: only a session owned by this hub may occupy its control slot.
+  const liveOverseer = $derived(
+    store.sessionList.find((session) => session.record.isOverseer === true && !session.record.siteId),
+  )
   const overseerLifecycle = $derived.by(() => {
     if (!liveOverseer) {
       return overseerSessionId
@@ -380,7 +384,13 @@
     }
     const byProject = new Map<string, SessionView[]>()
     for (const s of store.sessionList) {
-      if (s.record.isOverseer) continue
+      // The dedicated entry replaces only THIS hub's Overseer row. A peer Overseer remains visible in
+      // its remote roster and can be opened as a conversation without becoming local app control.
+      if (s.record.isOverseer && !s.record.siteId) continue
+      // Retirement is an archive boundary, not another live lifecycle state. Keep the SessionView in
+      // the store so transcripts, worktrees, attribution, and manager reactivation remain available,
+      // but do not leave the archived row in the working chat catalog forever.
+      if (s.record.managerRetiredAt) continue
       if (!match(s)) continue
       const key = s.record.projectId ?? '__none__'
       const arr = byProject.get(key) ?? []
@@ -1205,12 +1215,6 @@
                   <!-- svelte-ignore a11y_no_static_element_interactions -->
                   <span class="rlabel" class:glitch={glitching.has(s.record.id)} ondblclick={(e) => startRename(e, s)}>{label(s)}</span>
                 {/if}
-                {#if en.managerDepth > 0 && s.record.managerRetiredAt}
-                  <span
-                    class="retired-child"
-                    title={`Retired ${s.record.managerRetiredAt}${s.record.managerRetiredReason ? ` — ${s.record.managerRetiredReason}` : ''}. Chat and workspace are preserved.`}
-                  >retired</span>
-                {/if}
                 {#if en.managerDepth > 0 && s.record.role?.trim()}
                   <AgentPurposeInfo agentName={label(s)} purpose={s.record.role.trim()} />
                 {/if}
@@ -1415,17 +1419,6 @@
     box-shadow: inset 3px 0 0 var(--accent), inset 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent);
   }
   .row.managedchild { margin-left: calc(var(--manager-depth) * 0.85rem); width: calc(100% - (var(--manager-depth) * 0.85rem)); }
-  .retired-child {
-    flex: none;
-    color: var(--dim);
-    border: 1px solid var(--line);
-    border-radius: 999px;
-    padding: 0 0.3rem;
-    font-size: 0.58rem;
-    line-height: 1.25;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-  }
   .manager-team-head {
     display: flex; align-items: center; gap: var(--space-2); min-width: 0;
     margin-left: 0.85rem; padding: 0.28rem var(--space-3) 0.18rem var(--space-4);

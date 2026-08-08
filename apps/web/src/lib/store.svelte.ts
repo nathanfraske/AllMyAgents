@@ -481,8 +481,9 @@ export class HubStore {
   // reads `orderedProjects` / `orderedChats` to apply them.
   projectOrder = $state<string[]>(loadOrder(ORDER_PROJECTS_KEY))
   chatOrder = $state<Record<string, string[]>>(loadChatOrders())
-  // One-shot flags: suppress a Codex `userMessage` event when we've already echoed it optimistically.
-  private suppressNextUserMsg: Record<string, boolean> = {}
+  // Optimistic user item keys waiting for their canonical session/input sequence. A queue (not a
+  // boolean) keeps two accepted sends from consuming one another's acknowledgement.
+  private suppressNextUserMsg: Record<string, string[]> = {}
   // id -> ms timestamp of the last time a chat MATERIALIZED (draft → real) or was (re)TITLED.
   // The sidebar watches this to play a brief glitch on that row's label, then clears it.
   recentlyChanged = $state<Record<string, number>>({})
@@ -496,6 +497,7 @@ export class HubStore {
   fleetSites = $state<FleetSite[]>([])
   private fleetTimer: ReturnType<typeof setInterval> | null = null
   private fleetRefreshInFlight: Promise<void> | null = null
+  private readonly fleetAutoTrustRetryAt = new Map<string, number>()
   private readonly remoteStreams = new Map<string, RemoteStream>()
   private readonly remoteSideRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private statusReconcileTimer: ReturnType<typeof setInterval> | null = null
@@ -1284,6 +1286,10 @@ export class HubStore {
   }
 
   private async refreshFleetNow(forceRouteRecovery = false): Promise<void> {
+    // A live authenticated stream is stronger reachability evidence than one slow HTTP health probe.
+    // Keep it authoritative through this refresh so an overloaded local/remote hub cannot make every
+    // agent on that machine flash offline or tear down its own functioning event stream.
+    const liveStreamSiteIds = this.liveRemoteSiteIds()
     const raw = await api.fleet(forceRouteRecovery).catch(() => null)
     // A non-array means we could not learn the roster at all (an older hub with no /api/fleet returns
     // {error}; a token-gated hub returns 401 {error}). buildFleet always returns at least the local
@@ -1294,7 +1300,7 @@ export class HubStore {
     if (!fleet) {
       // NEVER wipe merged rows because WE could not ask. Losing the roster is our problem, not evidence
       // that another machine's projects stopped existing — flag them unreachable and keep them.
-      if (hadRemote) this.flagRemoteUnreachable()
+      if (hadRemote) this.flagRemoteUnreachable(liveStreamSiteIds)
       return
     }
     configureFleetSites(fleet)
@@ -1305,10 +1311,12 @@ export class HubStore {
       // nothing previously merged this is the pure single-machine path: leave local state completely
       // untouched (no reassignments, no reactivity churn), exactly as before this feature.
       if (hadRemote) {
-        this.flagRemoteUnreachable()
+        this.flagRemoteUnreachable(liveStreamSiteIds)
         const retained = this.fleetSites
           .filter((site) => !site.local)
-          .map((site) => ({ ...site, online: false, authError: 'The fleet directory is unavailable.' }))
+          .map((site) => liveStreamSiteIds.has(site.siteId)
+            ? { ...site, online: true, authState: 'paired' as const, authError: undefined }
+            : { ...site, online: false, authError: 'The fleet directory is unavailable.' })
         this.fleetSites = [...fleet, ...retained]
       } else {
         this.fleetSites = fleet
@@ -1316,7 +1324,19 @@ export class HubStore {
       }
       return
     }
+    // A direct peer in the signed AllMyStuff owned-roster already crossed the operator's device trust
+    // boundary. Ask the local hub to exchange reciprocal capabilities before probing HTTP so both
+    // browsers become usable without two independent pairing-code ceremonies. The target re-checks
+    // signed roster membership; sighted/custom-mesh peers fail closed and still need a code.
+    await Promise.all(remoteSites.map((site) => this.autoTrustFleetSite(site)))
     const knownSiteIds = new Set(remoteSites.map((s) => s.siteId))
+    for (const site of remoteSites) {
+      if (liveStreamSiteIds.has(site.siteId)) {
+        site.online = true
+        site.authState = 'paired'
+        delete site.authError
+      }
+    }
     const onlineSites = remoteSites.filter((s) => s.online)
 
     const pulled = await Promise.all(
@@ -1380,11 +1400,16 @@ export class HubStore {
       usage: UsageSnapshot[] | null
     }>
     const onlineSiteIds = new Set(usable.map((entry) => entry.site.siteId))
+    const retainedLiveSiteIds = new Set(
+      [...liveStreamSiteIds].filter((siteId) => knownSiteIds.has(siteId) && !onlineSiteIds.has(siteId)),
+    )
     const profileOnlineSiteIds = new Set(
       usable.filter((entry) => entry.profiles !== null).map((entry) => entry.site.siteId),
     )
     for (const stream of [...this.remoteStreams.values()]) {
-      if (!onlineSiteIds.has(stream.site.siteId)) this.disposeRemoteStream(stream)
+      if (!onlineSiteIds.has(stream.site.siteId) && !retainedLiveSiteIds.has(stream.site.siteId)) {
+        this.disposeRemoteStream(stream)
+      }
     }
 
     const remoteProjects: ProjectInfo[] = []
@@ -1423,19 +1448,24 @@ export class HubStore {
     // "that box is off", not "your projects are gone". A row is only forgotten when we can actually see
     // its site and it no longer offers it, or when the site left the fleet. See fleetMerge.rowFate.
     const carried = this.projects
-      .filter((p) => !!p.siteId && rowFate({ siteId: p.siteId, knownSiteIds, onlineSiteIds, seenNow: false }) === 'mark-offline')
-      .map((p) => ({ ...p, siteOnline: false }))
+      .filter((p) => !!p.siteId && (
+        retainedLiveSiteIds.has(p.siteId) ||
+        rowFate({ siteId: p.siteId, knownSiteIds, onlineSiteIds, seenNow: false }) === 'mark-offline'
+      ))
+      .map((p) => ({ ...p, siteOnline: retainedLiveSiteIds.has(p.siteId!) }))
     const localProjects = this.projects.filter((p) => !p.siteId)
     this.projects = [...localProjects, ...remoteProjects, ...carried]
 
     const carriedProfiles = this.profiles
-      .filter((profile) => !!profile.siteId && rowFate({
-        siteId: profile.siteId,
-        knownSiteIds,
-        onlineSiteIds: profileOnlineSiteIds,
-        seenNow: seenRemoteProfileIds.has(profile.id),
-      }) === 'mark-offline')
-      .map((profile) => ({ ...profile, siteOnline: false }))
+      .filter((profile) => !!profile.siteId && (
+        retainedLiveSiteIds.has(profile.siteId) || rowFate({
+          siteId: profile.siteId,
+          knownSiteIds,
+          onlineSiteIds: profileOnlineSiteIds,
+          seenNow: seenRemoteProfileIds.has(profile.id),
+        }) === 'mark-offline'
+      ))
+      .map((profile) => ({ ...profile, siteOnline: retainedLiveSiteIds.has(profile.siteId!) }))
     this.profiles = [
       ...this.profiles.filter((profile) => !profile.siteId),
       ...remoteProfiles,
@@ -1446,16 +1476,40 @@ export class HubStore {
       const v = this.sessions[id]
       const site = v?.record.siteId
       if (!v || !site) continue // local sessions + drafts are never touched here
+      if (retainedLiveSiteIds.has(site)) {
+        v.record.siteOnline = true
+        continue
+      }
       const fate = rowFate({ siteId: site, knownSiteIds, onlineSiteIds, seenNow: seenRemoteSessionIds.has(id) })
       if (fate === 'drop') this.removeSessionLocal(id)
       else if (fate === 'mark-offline') v.record.siteOnline = false
     }
   }
 
+  private async autoTrustFleetSite(site: FleetSite): Promise<void> {
+    if (!site.directOnline || getFleetSiteToken(site.siteId)) return
+    const now = Date.now()
+    if ((this.fleetAutoTrustRetryAt.get(site.siteId) ?? 0) > now) return
+    const result = await api.pairFleetSiteDirect(site.siteId).catch((error) => ({
+      error: error instanceof Error ? error.message : 'Automatic same-fleet trust failed.',
+    }))
+    const credential = ('token' in result ? result.token : undefined)?.trim() ?? ''
+    if (!credential) {
+      // Discovery runs repeatedly; bound a version-skewed or non-fleet peer to one quiet attempt per
+      // minute instead of turning the direct RPC lane into a retry storm.
+      this.fleetAutoTrustRetryAt.set(site.siteId, now + 60_000)
+      return
+    }
+    this.fleetAutoTrustRetryAt.delete(site.siteId)
+    setFleetSiteToken(site.siteId, credential)
+    site.authState = 'paired'
+    delete site.authError
+  }
+
   /** Pair (or replace) one remote hub credential, then retry discovery immediately. */
   async pairFleetSite(siteId: string, token: string): Promise<boolean> {
     const site = this.fleetSites.find((candidate) => candidate.siteId === siteId && !candidate.local)
-    if (!site || !token.trim()) return false
+    if (!site || (!token.trim() && !site.directOnline)) return false
     const supplied = token.trim()
     if (!site.online && !looksLikePairingCode(supplied)) {
       site.authState = 'error'
@@ -1464,7 +1518,18 @@ export class HubStore {
       return false
     }
     let credential = supplied
-    if (looksLikePairingCode(supplied)) {
+    if (!supplied && site.directOnline) {
+      const direct = await api.pairFleetSiteDirect(site.siteId).catch((error) => ({
+        error: error instanceof Error ? error.message : 'Automatic same-fleet trust failed.',
+      }))
+      credential = ('token' in direct ? direct.token : undefined)?.trim() ?? ''
+      if (!credential) {
+        site.authState = 'error'
+        site.authError = direct.error ?? 'This peer is not in the signed AllMyStuff fleet roster; use a one-use code.'
+        this.fleetSites = [...this.fleetSites]
+        return false
+      }
+    } else if (looksLikePairingCode(supplied)) {
       let exchanged: { token?: string; error?: string }
       if (site.directOnline) {
         const direct = await api.pairFleetSiteDirect(site.siteId, supplied).catch((error) => ({
@@ -1739,15 +1804,29 @@ export class HubStore {
     }
   }
 
+  private liveRemoteSiteIds(): Set<string> {
+    return new Set(
+      [...this.remoteStreams.values()]
+        .filter((stream) => stream.socket?.readyState === 1)
+        .map((stream) => stream.site.siteId),
+    )
+  }
+
   /** Mark every merged remote row unreachable — we lost the roster, which says nothing about whether
    *  those machines are actually up. Keeps the rows visible rather than making work disappear. */
-  private flagRemoteUnreachable(): void {
-    this.projects = this.projects.map((p) => (p.siteId && p.siteOnline !== false ? { ...p, siteOnline: false } : p))
+  private flagRemoteUnreachable(except = new Set<string>()): void {
+    this.projects = this.projects.map((p) => (
+      p.siteId && !except.has(p.siteId) && p.siteOnline !== false ? { ...p, siteOnline: false } : p
+    ))
     this.profiles = this.profiles.map((profile) =>
-      profile.siteId && profile.siteOnline !== false ? { ...profile, siteOnline: false } : profile,
+      profile.siteId && !except.has(profile.siteId) && profile.siteOnline !== false
+        ? { ...profile, siteOnline: false }
+        : profile,
     )
     for (const v of Object.values(this.sessions)) {
-      if (v.record.siteId && v.record.siteOnline !== false) v.record.siteOnline = false
+      if (v.record.siteId && !except.has(v.record.siteId) && v.record.siteOnline !== false) {
+        v.record.siteOnline = false
+      }
     }
   }
 
@@ -1915,7 +1994,7 @@ export class HubStore {
     this.touch(v, ts)
     // Suppress the canonical session/input event (and Codex's own userMessage) that the hub will
     // echo back over the WS, so the optimistic bubble isn't duplicated.
-    this.suppressNextUserMsg[sessionId] = true
+    this.suppressNextUserMsg[sessionId] = [...(this.suppressNextUserMsg[sessionId] ?? []), key]
     return key
   }
 
@@ -1938,7 +2017,9 @@ export class HubStore {
     if (!v) return
     const i = v.items.findIndex((it) => it.key === key)
     if (i >= 0) v.items.splice(i, 1)
-    delete this.suppressNextUserMsg[sessionId]
+    const pending = (this.suppressNextUserMsg[sessionId] ?? []).filter((candidate) => candidate !== key)
+    if (pending.length) this.suppressNextUserMsg[sessionId] = pending
+    else delete this.suppressNextUserMsg[sessionId]
     // The fresh send failed — clear the in-flight markers so the thinking spinner doesn't stick.
     v.turnStartedAt = undefined
     v.liveTokens = undefined
@@ -2468,7 +2549,7 @@ export class HubStore {
       this.lastSeq = event.seq
       this.noteReplay()
     }
-    const { sessionId, kind, ts, payload } = event
+    const { seq, sessionId, kind, ts, payload } = event
 
     // Approvals + usage are re-fetched, but COALESCED: a journal replay surfaces hundreds of
     // usage/approval events in one burst, and firing refreshSideData() per event stormed the hub with
@@ -2641,12 +2722,29 @@ export class HubStore {
         // The canonical user message (journaled by the hub, so it replays + is timestamped).
         // Skip if we already rendered it optimistically this turn. Attachments are METADATA the hub
         // journaled ({id,name,mime,size}); the transcript renders images by hub URL, never from bytes.
-        if (this.suppressNextUserMsg[sessionId]) delete this.suppressNextUserMsg[sessionId]
-        else
+        const pending = this.suppressNextUserMsg[sessionId]
+        const optimisticKey = pending?.shift()
+        if (pending && pending.length === 0) delete this.suppressNextUserMsg[sessionId]
+        const optimistic = optimisticKey
+          ? view.items.find((item) => item.key === optimisticKey)
+          : undefined
+        if (optimistic) {
+          // Adopt the canonical journal identity instead of merely suppressing the echo. A later lazy
+          // history overlap can now recognize this exact optimistic row and cannot duplicate/reorder it.
+          optimistic.key = `journal:${seq}:0`
+          optimistic.ts = ts
+          optimistic.text = (payload as { text?: string }).text ?? optimistic.text
+          optimistic.attachments = attachmentsFromPayload(payload)
+        } else
           this.push(view, {
             kind: 'user',
             ts,
             text: (payload as { text?: string }).text ?? '',
+            // Journal history uses this exact identity. Without it, a live remote steer and the
+            // overlapping lazy-history page survived reconciliation as two different rows; the
+            // historical copy was then prepended above older conversation while the live copy stayed
+            // at the tail. One accepted steer consequently looked both duplicated and out of order.
+            key: `journal:${seq}:0`,
             attachments: attachmentsFromPayload(payload),
           })
         break

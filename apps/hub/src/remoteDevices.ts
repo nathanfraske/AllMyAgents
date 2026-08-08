@@ -30,6 +30,11 @@ export interface FleetConnectionPublic extends Omit<FleetConnection, 'token'> {
   paired: true
 }
 
+export interface FleetConnectionSaveResult extends FleetConnectionPublic {
+  /** False when a periodic fleet refresh merely re-presented the already stored credential. */
+  changed: boolean
+}
+
 export interface DirectPairResult {
   siteId: string
   label: string
@@ -216,6 +221,7 @@ export type RemoteDeviceAction =
   | { op: 'inspect'; rootId: string }
   | { op: 'list'; rootId: string; path?: string }
   | { op: 'read'; rootId: string; path: string; encoding?: 'utf8' | 'base64'; maxBytes?: number }
+  | { op: 'mkdir'; rootId: string; path: string; recursive?: boolean }
   | { op: 'write'; rootId: string; path: string; content: string; encoding?: 'utf8' | 'base64' }
   | { op: 'exec'; rootId: string; command: string; cwd?: string; timeoutMs?: number }
 
@@ -229,6 +235,7 @@ export interface RemoteDeviceActionResult {
   content?: string
   encoding?: 'utf8' | 'base64'
   bytes?: number
+  created?: boolean
   truncated?: boolean
   stdout?: string
   stderr?: string
@@ -353,8 +360,8 @@ export function wslUncPath(distro: string, linuxPath: string): string {
   return `\\\\wsl.localhost\\${name}${suffix ? `\\${suffix}` : ''}`
 }
 
-function capabilityFor(action: RemoteDeviceAction): RemoteDeviceCapability {
-  if (action.op === 'write') return 'write'
+export function remoteCapabilityForAction(action: RemoteDeviceAction): RemoteDeviceCapability {
+  if (action.op === 'write' || action.op === 'mkdir') return 'write'
   if (action.op === 'exec') return 'terminal'
   return 'read'
 }
@@ -401,13 +408,14 @@ export class DeviceExecutor {
     if (!this.policy.enabled) return finish({ ok: false, error: 'Remote device execution is disabled on this machine.' })
     const root = this.policy.roots.find((item) => item.id === action.rootId)
     if (!root) return finish({ ok: false, error: 'Unknown or revoked device root.' })
-    const needed = capabilityFor(action)
+    const needed = remoteCapabilityForAction(action)
     if (!root[needed]) return finish({ ok: false, error: `${needed} access is not enabled for this root.` })
     try {
       if (action.op === 'probe') return finish({ ok: true })
       if (action.op === 'inspect') return finish(await this.inspect(root))
       if (action.op === 'list') return finish(this.list(root, action.path))
       if (action.op === 'read') return finish(this.read(root, action))
+      if (action.op === 'mkdir') return finish(this.mkdir(root, action))
       if (action.op === 'write') return finish(this.write(root, action))
       if (this.activeCommands >= MAX_CONCURRENT_COMMANDS) {
         return finish({ ok: false, error: `remote terminal concurrency limit (${MAX_CONCURRENT_COMMANDS}) reached` })
@@ -573,6 +581,39 @@ export class DeviceExecutor {
       try { fs.unlinkSync(temp) } catch { /* renamed or never created */ }
     }
     return { ok: true, bytes: content.length, encoding }
+  }
+
+  /**
+   * Create a directory tree without ever following an existing link or junction out of the granted
+   * root. Remote file transfer previously exposed list/read/write but no directory mutation, so a
+   * folder containing `src/a.ts` failed as soon as `src` did not already exist on the target.
+   */
+  private mkdir(root: DeviceRootPolicy, action: Extract<RemoteDeviceAction, { op: 'mkdir' }>): RemoteDeviceActionResult {
+    const rel = relativePath(action.path, 'path')
+    const base = this.filesystemRoot(root)
+    const target = path.resolve(base, rel)
+    if (!inside(base, target)) throw new Error('path escapes the approved root')
+    const parts = path.relative(base, target).split(path.sep).filter(Boolean)
+    let cursor = base
+    let created = false
+    for (const part of parts) {
+      cursor = path.join(cursor, part)
+      try {
+        const stat = fs.lstatSync(cursor)
+        if (stat.isSymbolicLink()) throw new Error('refusing to traverse a symbolic link')
+        if (!stat.isDirectory()) throw new Error('a path component is not a directory')
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+        if (action.recursive !== true && cursor !== target) {
+          throw new Error('parent directory does not exist')
+        }
+        fs.mkdirSync(cursor)
+        created = true
+      }
+      const real = fs.realpathSync.native(cursor)
+      if (!inside(base, real)) throw new Error('path resolves outside the approved root')
+    }
+    return { ok: true, created }
   }
 
   private exec(
@@ -816,8 +857,10 @@ export class RemoteDeviceController {
     return this.connections.list()
   }
 
-  saveConnection(input: { siteId: string; label: string; token: string }): FleetConnectionPublic {
-    return this.connections.upsert(input)
+  saveConnection(input: { siteId: string; label: string; token: string }): FleetConnectionSaveResult {
+    const previous = this.connections.get(input.siteId)
+    const changed = previous?.label !== input.label || previous.token !== input.token
+    return { ...this.connections.upsert(input), changed }
   }
 
   removeConnection(siteId: string): boolean {
@@ -943,17 +986,21 @@ export class RemoteDeviceController {
     }
   }
 
-  /** One-use code exchange over the site-free RPC lane; successful pairing becomes reciprocal. */
-  async pairDirect(siteId: string, code: string): Promise<DirectPairResult> {
+  /**
+   * Reciprocal capability exchange over the Site-free RPC lane. A supplied code is the compatibility
+   * path; an omitted code asks the target to authorize the authenticated peer from its signed fleet
+   * roster. The target, not this caller, decides whether that stronger pre-existing trust exists.
+   */
+  async pairDirect(siteId: string, code?: string): Promise<DirectPairResult> {
     if (!this.direct || this.direct.enabled?.() === false) {
       throw new Error('The direct MyOwnMesh hub channel is unavailable or disabled.')
     }
     const identity = await this.direct.bridge.identity()
     if (!identity) throw new Error('Could not resolve this device identity from MyOwnMesh.')
     const response = await this.direct.bridge.call(siteId, {
-      kind: 'pair_exchange',
+      kind: code ? 'pair_exchange' : 'fleet_trust_exchange',
       version: 1,
-      code,
+      ...(code ? { code } : {}),
       source: {
         siteId: identity.siteId,
         label: identity.label,

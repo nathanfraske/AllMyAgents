@@ -5,6 +5,36 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.22-alpha.25 — 2026-08-08
+
+This release prevents healthy direct mesh routes from flickering offline, makes remote sends/steers idempotent
+and ordered, transfers directory trees to remote testbeds, restores interrupted Claude context after hub restart,
+bounds project-deletion inspection, reduces journal write amplification, and separates retired agent records from
+the active working catalog.
+
+[Full v0.1.22-alpha.25 release notes](docs/releases/v0.1.22-alpha.25.md)
+
+- A live direct remote stream now remains authoritative through transient fleet-refresh or Site-health failures.
+  Passive polling no longer destroys and recreates a working route, while explicit Refresh still performs recovery.
+- Remote operator messages and steers carry stable request identities through direct and Site-compatible paths, so
+  retries cannot double-send or reorder a steer above older durable messages. Attachments retain the same identity.
+- Remote testbeds can create nested destination directories and transfer complete folder trees, including into a
+  granted WSL root, with bounded progress, latency, byte counts, and exact failure reporting.
+- Same signed-fleet peers establish reciprocal trust in one operation; direct peers can still enter an optional
+  pairing code when automatic fleet trust is unavailable, avoiding a no-code dead end.
+- Claude persists a vendor session as soon as the first authoritative session id arrives. A bounded continuity
+  capsule recovers the interrupted objective, recent conversation, and unanswered question after a hub restart
+  without injecting raw tool output or protocol envelopes.
+- Project deletion inspection and removal are asynchronous, abortable, time-bounded, and capped for display so a
+  large or slow checkout cannot freeze the renderer. The hub returns a precise timeout/failure instead of hanging.
+- Journal maintenance skips an expensive recovery-generation verification pass when no row is eligible for
+  condensation, and high-volume Codex command deltas are losslessly coalesced before journaling.
+- Retired manager children now leave the sidebar and `list_agents` active catalog. Their immutable ID, transcript,
+  workspace, attribution, retirement reason, and reversible reactivation path remain in a project archive and
+  `child_status`; manager guidance now reuses ordinary idle workers and retires only at a real replacement boundary.
+- Remote account/profile selectors use a compact human label instead of exposing mesh-qualified internal IDs, and
+  the local Overseer remains hub-local rather than being replaced by a remote hub's Overseer record.
+
 ## v0.1.21-alpha.24 — 2026-08-07
 
 This release closes the high-context manager dead end, adds bounded worker-owned one-shot agents and
