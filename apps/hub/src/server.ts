@@ -29,7 +29,7 @@ import { tokenMatches } from './deviceToken.js'
 import { PairingCodeBroker } from './pairingCode.js'
 import { pickFolder } from './native.js'
 import { computeStats } from './stats.js'
-import { buildFleet, probeHubHealth } from './fleet.js'
+import { buildFleet, probeHubHealth, rosterAuthorizesDevice } from './fleet.js'
 import { credentialsExist, type LoginAuthMode } from './loginLauncher.js'
 import type { ProfileLoginCoordinator } from './profileLoginCoordinator.js'
 import { readProjectConfig } from './importScan.js'
@@ -590,7 +590,7 @@ export function startServer(opts: ServerOptions): http.Server {
   directMesh?.setHandler(async ({ from, payload }) => {
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('direct hub request is malformed')
     const request = payload as Record<string, unknown>
-    if (request.kind === 'pair_exchange') {
+    if (request.kind === 'pair_exchange' || request.kind === 'fleet_trust_exchange') {
       if (!remoteDevices) throw new Error('remote device controller unavailable')
       const source = request.source && typeof request.source === 'object' && !Array.isArray(request.source)
         ? request.source as Record<string, unknown>
@@ -599,7 +599,7 @@ export function startServer(opts: ServerOptions): http.Server {
       const sourceLabel = str(source.label)
       const sourceToken = str(source.token)
       const code = str(request.code)
-      if (!sourceSiteId || !sourceLabel || !sourceToken || !code) throw new Error('pair exchange is incomplete')
+      if (!sourceSiteId || !sourceLabel || !sourceToken) throw new Error('pair exchange is incomplete')
       if (
         request.version !== 1 ||
         sourceSiteId.length > 256 ||
@@ -613,18 +613,39 @@ export function startServer(opts: ServerOptions): http.Server {
       if (sourceSiteId.split('-', 1)[0]!.toLowerCase() !== from.split('-', 1)[0]!.toLowerCase()) {
         throw new Error('pair exchange source does not match the authenticated mesh peer')
       }
-      const redeemed = pairingCodes.redeem(code)
-      if (!redeemed.ok) throw new Error('pairing code is invalid, expired, or already used')
+      let targetToken: string
+      let trust: 'one-use-code' | 'signed-fleet-roster'
+      if (request.kind === 'fleet_trust_exchange') {
+        // Mirror AllMyStuff's privileged-plane trust boundary: the signed owned-roster is durable
+        // proof that the operator already admitted this device to the same fleet. Being sighted on a
+        // mesh, sharing an arbitrary network, or merely carrying an AllMyStuff capability tag is not
+        // enough. The RPC lane authenticates `from`; this roster check supplies authorization.
+        const owned = await mesh.ownedRoster()
+        if (!rosterAuthorizesDevice(owned, from)) {
+          throw new Error('automatic hub trust requires membership in the signed AllMyStuff fleet roster')
+        }
+        targetToken = deviceToken
+        trust = 'signed-fleet-roster'
+      } else {
+        if (!code) throw new Error('pair exchange is incomplete')
+        const redeemed = pairingCodes.redeem(code)
+        if (!redeemed.ok) throw new Error('pairing code is invalid, expired, or already used')
+        targetToken = redeemed.token
+        trust = 'one-use-code'
+      }
       const identity = await directMesh.identity()
       if (!identity) throw new Error('target hub could not resolve its MyOwnMesh identity')
-      remoteDevices.saveConnection({ siteId: sourceSiteId, label: sourceLabel, token: sourceToken })
-      journal.append(null, 'fleet/connection-paired', {
-        siteId: sourceSiteId,
-        label: sourceLabel,
-        transport: 'myownmesh-rpc',
-        reciprocal: true,
-      })
-      return { siteId: identity.siteId, label: identity.label, token: redeemed.token }
+      const reciprocal = remoteDevices.saveConnection({ siteId: sourceSiteId, label: sourceLabel, token: sourceToken })
+      if (reciprocal.changed) {
+        journal.append(null, 'fleet/connection-paired', {
+          siteId: sourceSiteId,
+          label: sourceLabel,
+          transport: 'myownmesh-rpc',
+          reciprocal: true,
+          trust,
+        })
+      }
+      return { siteId: identity.siteId, label: identity.label, token: targetToken }
     }
     if (request.kind !== 'authenticated' || !remoteDevices) throw new Error('direct hub request is unsupported')
     const envelope = remoteDevices.verifyDirectEnvelope(request.envelope, from)
@@ -641,7 +662,7 @@ export function startServer(opts: ServerOptions): http.Server {
         throw new Error('action must be an object')
       }
       const action = content.action as RemoteDeviceAction
-      if (!['probe', 'inspect', 'list', 'read', 'write', 'exec'].includes(action.op)) throw new Error('unknown remote device operation')
+      if (!['probe', 'inspect', 'list', 'read', 'mkdir', 'write', 'exec'].includes(action.op)) throw new Error('unknown remote device operation')
       const result = await deviceExecutor.execute(action)
       journal.append(null, 'device-executor/action', {
         op: action.op,
@@ -1140,7 +1161,7 @@ export function startServer(opts: ServerOptions): http.Server {
           json(res, { error: `unknown project: ${projectId}` }, 404)
           return
         }
-        json(res, inspection)
+        json(res, await inspection)
         return
       }
       const deleteProjectMatch = /^\/api\/projects\/([^/]+)$/.exec(url.pathname)
@@ -1779,13 +1800,14 @@ export function startServer(opts: ServerOptions): http.Server {
         const body = await readBody(req)
         const siteId = str(body.siteId)
         const code = str(body.code)
-        if (!siteId || !code) { json(res, { error: 'siteId and code are required' }, 400); return }
+        if (!siteId) { json(res, { error: 'siteId is required' }, 400); return }
         const paired = await remoteDevices.pairDirect(siteId, code)
         journal.append(null, 'fleet/connection-paired', {
           siteId: paired.siteId,
           label: paired.label,
           transport: 'myownmesh-rpc',
           reciprocal: true,
+          trust: code ? 'one-use-code' : 'signed-fleet-roster',
         })
         json(res, paired)
         return
@@ -1809,7 +1831,13 @@ export function startServer(opts: ServerOptions): http.Server {
           roster: () => mesh.ownedRoster(),
           peerSites: () => mesh.peerSites(),
           siteMap: (node, p) => mesh.siteMap(node, p),
-          recoverSiteMap: (node, p) => mesh.recoverSiteMap(node, p, forceRouteRecovery ? 0 : 60_000),
+          // A background roster poll is observational. Destroying and recreating the Site mapping after
+          // one slow health response also kills the healthy remote WebSocket that was proving the route
+          // alive, which made every remote agent flicker offline together. Route mutation is reserved for
+          // the operator's explicit Refresh action (or an actual remote operation in index.ts).
+          ...(forceRouteRecovery
+            ? { recoverSiteMap: (node: string, p: number) => mesh.recoverSiteMap(node, p, 0) }
+            : {}),
           // A fresh route still has to negotiate before its first bytes flow. A short ordinary HTTP
           // timeout falsely marked WAN peers offline while the tunnel was healthy but settling.
           probeHealth: (baseUrl) => probeHubHealth(baseUrl, 5000),
@@ -1878,7 +1906,7 @@ export function startServer(opts: ServerOptions): http.Server {
           return
         }
         const action = body.action as RemoteDeviceAction
-        if (!['probe', 'inspect', 'list', 'read', 'write', 'exec'].includes(action.op)) {
+        if (!['probe', 'inspect', 'list', 'read', 'mkdir', 'write', 'exec'].includes(action.op)) {
           json(res, { error: 'unknown remote device operation' }, 400)
           return
         }
@@ -1922,7 +1950,9 @@ export function startServer(opts: ServerOptions): http.Server {
           return
         }
         const saved = remoteDevices.saveConnection({ siteId, label, token })
-        journal.append(null, 'fleet/connection-paired', { siteId, label })
+        // The web client reconciles this credential on every fleet refresh. Persisting is already
+        // idempotent; keep the audit journal truthful too instead of recording a fresh "pair" every 20s.
+        if (saved.changed) journal.append(null, 'fleet/connection-paired', { siteId, label })
         json(res, saved)
         return
       }
@@ -2498,10 +2528,15 @@ export function startServer(opts: ServerOptions): http.Server {
       const steerMatch = /^\/api\/sessions\/([^/]+)\/steer$/.exec(url.pathname)
       if (method === 'POST' && steerMatch) {
         const body = await readBody(req)
+        const requestId = body.requestId === undefined ? undefined : str(body.requestId)
+        if (body.requestId !== undefined && (!requestId || !/^[a-zA-Z0-9._:-]{1,128}$/u.test(requestId))) {
+          throw new BadRequestError('requestId must be a bounded opaque id')
+        }
         await sessions.steer(
           steerMatch[1] as string,
           String(body.text ?? ''),
-          stringArray(body.attachments, 'attachments')
+          stringArray(body.attachments, 'attachments'),
+          requestId,
         )
         json(res, { ok: true })
         return
@@ -2623,6 +2658,10 @@ export function startServer(opts: ServerOptions): http.Server {
         const verb = sessionAction[2] as string
         if (verb === 'input') {
           const body = await readBody(req)
+          const requestId = body.requestId === undefined ? undefined : str(body.requestId)
+          if (body.requestId !== undefined && (!requestId || !/^[a-zA-Z0-9._:-]{1,128}$/u.test(requestId))) {
+            throw new BadRequestError('requestId must be a bounded opaque id')
+          }
           await sessions.send(
             id,
             String(body.text ?? ''),
@@ -2631,7 +2670,8 @@ export function startServer(opts: ServerOptions): http.Server {
               effort: body.effort === undefined ? undefined : String(body.effort),
               serviceTier: body.serviceTier === undefined ? undefined : String(body.serviceTier),
             },
-            stringArray(body.attachments, 'attachments')
+            stringArray(body.attachments, 'attachments'),
+            requestId,
           )
         } else if (verb === 'interrupt') {
           await sessions.interrupt(id)

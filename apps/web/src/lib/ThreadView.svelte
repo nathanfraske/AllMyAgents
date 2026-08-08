@@ -941,6 +941,7 @@
 
   interface ComposerSubmission {
     composerId: string
+    requestId: string
     text: string
     pastes: PastedText[]
     attachments: ComposerAttachment[]
@@ -949,6 +950,7 @@
   function beginSubmission(composerId: string): ComposerSubmission {
     const submission = {
       composerId,
+      requestId: crypto.randomUUID?.() ?? `input-${Date.now()}-${Math.random().toString(36).slice(2)}`,
       text,
       pastes: [...pastes],
       attachments: [...attachments],
@@ -1051,6 +1053,7 @@
             effort: options.effort ?? undefined,
             serviceTier: options.serviceTier ?? undefined,
             attachments: upload.ids,
+            requestId: submission.requestId,
           })
           return sent.error ? { error: sent.error } : { ok: true }
         })
@@ -1075,6 +1078,7 @@
         if (steerable) {
           const out = await api.send(sid0, body, {
             attachments: upload.ids.length ? upload.ids : undefined,
+            requestId: submission.requestId,
           })
           if (out.error) fail(out.error)
           else succeed()
@@ -1092,6 +1096,7 @@
         effort: options.effort ?? undefined,
         serviceTier: options.serviceTier ?? undefined,
         attachments: upload.ids.length ? upload.ids : undefined,
+        requestId: submission.requestId,
       })
       if (out.error) {
         store.removeItem(sid0, key)

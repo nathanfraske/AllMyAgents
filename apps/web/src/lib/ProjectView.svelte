@@ -46,16 +46,26 @@
   const projectSessions = $derived(
     store.sessionList.filter((view) => view.record.projectId === projectId),
   )
+  const activeProjectSessions = $derived(
+    projectSessions.filter((view) => !view.record.managerRetiredAt),
+  )
+  const retiredProjectSessions = $derived(
+    projectSessions
+      .filter((view) => Boolean(view.record.managerRetiredAt))
+      .sort((left, right) =>
+        (right.record.managerRetiredAt ?? '').localeCompare(left.record.managerRetiredAt ?? ''),
+      ),
+  )
   function accountName(profileId: string): string {
     const profile = store.profiles.find((candidate) => candidate.id === profileId)
     return profile ? profileLabel(profile) : profileId
   }
   const manager = $derived(
-    projectSessions.find((view) => view.record.isProjectManager),
+    activeProjectSessions.find((view) => view.record.isProjectManager),
   )
   const mode = $derived<ProjectViewMode>(manager ? selectedMode : 'overview')
   const directProjectCount = $derived(
-    projectSessions.filter((view) => !view.record.worktree).length,
+    activeProjectSessions.filter((view) => !view.record.worktree).length,
   )
 
   function selectMode(next: ProjectViewMode): void {
@@ -157,7 +167,7 @@
       failed: 0,
       blocked: 0,
     }
-    for (const view of projectSessions) counts[projectStatus(view)]++
+    for (const view of activeProjectSessions) counts[projectStatus(view)]++
     return counts
   })
 
@@ -165,7 +175,7 @@
     const rows: AgentRow[] = []
     const used = new Set<string>()
     const byParent = new Map<string, SessionView[]>()
-    for (const view of projectSessions) {
+    for (const view of activeProjectSessions) {
       const parent = view.record.parentSessionId
       if (!parent) continue
       const children = byParent.get(parent) ?? []
@@ -178,8 +188,8 @@
       rows.push({ view, depth })
       for (const child of byParent.get(view.record.id) ?? []) add(child, depth + 1)
     }
-    for (const manager of projectSessions.filter((view) => view.record.isProjectManager)) add(manager, 0)
-    for (const view of projectSessions) add(view, 0)
+    for (const manager of activeProjectSessions.filter((view) => view.record.isProjectManager)) add(manager, 0)
+    for (const view of activeProjectSessions) add(view, 0)
     return rows
   })
 
@@ -538,6 +548,23 @@
             {/each}
           </div>
         {/if}
+        {#if retiredProjectSessions.length}
+          <details class="retired-records">
+            <summary>{retiredProjectSessions.length} retired agent {retiredProjectSessions.length === 1 ? 'record' : 'records'}</summary>
+            <p>Archived agents are absent from the working catalog. Their transcripts, workspaces, immutable IDs, and attribution remain available for audit or manager reactivation.</p>
+            <div class="retired-list">
+              {#each retiredProjectSessions as view (view.record.id)}
+                <button class="retired-record" onclick={() => openChat(view.record.id)} aria-label={`Open retired record for ${agentName(view)}`}>
+                  <span><strong>{agentName(view)}</strong> · ID {shortAgentId(view.record.id)}</span>
+                  <small>
+                    Retired {view.record.managerRetiredAt}
+                    {#if view.record.managerRetiredReason} · {view.record.managerRetiredReason}{/if}
+                  </small>
+                </button>
+              {/each}
+            </div>
+          </details>
+        {/if}
       </section>
 
       <section class="card comms">
@@ -725,6 +752,15 @@
   .file em { margin-left: .35rem; color: var(--muted); font-family: inherit; font-style: normal; }
   .file-empty { color: var(--dim); font-size: var(--text-2xs); }
   .agent :global(.strip) { margin: .55rem 0 0 1.45rem; background: var(--surface-2); }
+  .retired-records { padding: .7rem .85rem; border-top: 1px solid var(--border-subtle); color: var(--muted); }
+  .retired-records summary { cursor: pointer; font-size: var(--text-xs); font-weight: var(--fw-semibold); }
+  .retired-records > p { margin: .45rem 0 .6rem; color: var(--dim); font-size: var(--text-2xs); line-height: 1.45; }
+  .retired-list { display: grid; gap: .35rem; }
+  .retired-record { display: flex; flex-direction: column; align-items: flex-start; gap: .15rem; width: 100%;
+    padding: .45rem .55rem; border: 1px solid var(--border-subtle); border-radius: var(--r-md);
+    background: var(--surface-2); color: var(--muted); text-align: left; }
+  .retired-record:hover { color: var(--text); border-color: var(--border-strong); }
+  .retired-record small { color: var(--dim); }
   .comms-list { list-style: none; margin: 0; padding: 0; max-height: min(70vh, 760px); overflow: auto; }
   .comms-list li { padding: .7rem .85rem; border-top: 1px solid var(--border-subtle); }
   .comms-list li:first-child { border-top: 0; }

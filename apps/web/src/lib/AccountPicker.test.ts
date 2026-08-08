@@ -29,6 +29,7 @@ const importedView: SessionView = {
 
 beforeEach(() => {
   store.profiles = []
+  store.projects = []
   store.settingsOpen = false
 })
 
@@ -67,5 +68,44 @@ describe('AccountPicker first run', () => {
     expect(screen.queryByText('claude-other')).toBeNull()
     expect(useAccount).not.toHaveBeenCalled()
     useAccount.mockRestore()
+  })
+
+  it('shows a remote account name and hub label instead of its fleet transport id', async () => {
+    const siteId = 'qgn6mgozk2d52l2ftnxmchyoaz6oubynxsnvwjwzueckpy5gj27g'
+    store.profiles = [{
+      id: `${siteId}:codex-b`,
+      provider: 'codex',
+      siteId,
+      siteLabel: 'gdual',
+    }]
+    store.projects = [{
+      id: `${siteId}:project-1`,
+      name: 'Remote Project',
+      path: 'C:/remote/project',
+      createdAt: '2026-08-08T12:00:00.000Z',
+      siteId,
+      siteLabel: 'gdual',
+    }]
+    const remoteView: SessionView = {
+      ...importedView,
+      record: {
+        ...importedView.record,
+        id: `${siteId}:session-1`,
+        profileId: `${siteId}:codex-b`,
+        provider: 'codex',
+        projectId: `${siteId}:project-1`,
+        siteId,
+        siteLabel: 'gdual',
+      },
+    }
+
+    render(AccountPicker, { props: { view: remoteView } })
+
+    const trigger = screen.getByRole('button', { name: /codex-b/i })
+    expect(trigger.textContent).toContain('codex-b')
+    expect(trigger.textContent).not.toContain(siteId)
+
+    await fireEvent.click(trigger)
+    expect(screen.getByText('codex · gdual')).toBeTruthy()
   })
 })

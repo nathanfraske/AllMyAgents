@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -51,6 +51,46 @@ export class WorkspaceManager {
       ['--distribution', distro, '--cd', cwd, '--exec', program, ...args],
       { encoding: 'utf8', windowsHide: true },
     ).trim()
+  }
+
+  private execFileAsync(command: string, args: string[], timeoutMs = 10 * 60_000): Promise<string> {
+    return new Promise((resolve, reject) => {
+      execFile(
+        command,
+        args,
+        {
+          encoding: 'utf8',
+          windowsHide: true,
+          timeout: timeoutMs,
+          maxBuffer: 16 * 1024 * 1024,
+        },
+        (error, stdout) => {
+          if (error) reject(error)
+          else resolve(stdout.trim())
+        },
+      )
+    })
+  }
+
+  private gitAsync(repo: string, args: string[]): Promise<string> {
+    return this.execFileAsync('git', ['-C', repo, ...args])
+  }
+
+  private wslExecAsync(
+    distro: string,
+    cwd: string,
+    program: string,
+    args: string[],
+  ): Promise<string> {
+    return this.execFileAsync('wsl.exe', [
+      '--distribution',
+      distro,
+      '--cd',
+      cwd,
+      '--exec',
+      program,
+      ...args,
+    ])
   }
 
   private projectGit(
@@ -198,7 +238,7 @@ export class WorkspaceManager {
    * before reaching this method. Worktrees are unregistered first while their repository still exists;
    * the project directory is removed last.
    */
-  removeProjectFiles(
+  async removeProjectFiles(
     projectPath: string,
     projectWorktrees: ReadonlyArray<{
       repo?: string
@@ -206,9 +246,9 @@ export class WorkspaceManager {
       execution?: WslWorktreeExecution
     }>,
     projectLocation?: WslProjectLocation,
-  ): void {
+  ): Promise<void> {
     if (projectLocation) {
-      const home = this.wslExec(projectLocation.distro, '/', 'sh', [
+      const home = await this.wslExecAsync(projectLocation.distro, '/', 'sh', [
         '-lc',
         'printf %s "$HOME"',
       ])
@@ -227,7 +267,7 @@ export class WorkspaceManager {
           )
         }
         try {
-          this.wslExec(execution.distro, execution.repoPath, 'git', [
+          await this.wslExecAsync(execution.distro, execution.repoPath, 'git', [
             '-C',
             execution.repoPath,
             'worktree',
@@ -236,10 +276,10 @@ export class WorkspaceManager {
             execution.worktreePath,
           ])
         } catch {
-          this.wslExec(execution.distro, '/', 'rm', ['-rf', execution.worktreePath])
+          await this.wslExecAsync(execution.distro, '/', 'rm', ['-rf', execution.worktreePath])
         }
       }
-      this.wslExec(projectLocation.distro, '/', 'rm', ['-rf', resolvedProject])
+      await this.wslExecAsync(projectLocation.distro, '/', 'rm', ['-rf', resolvedProject])
       return
     }
     const resolvedProject = path.resolve(projectPath)
@@ -264,16 +304,16 @@ export class WorkspaceManager {
       if (!fs.existsSync(resolvedWorktree)) continue
       if (item.repo && fs.existsSync(item.repo)) {
         try {
-          this.git(item.repo, ['worktree', 'remove', '--force', resolvedWorktree])
+          await this.gitAsync(item.repo, ['worktree', 'remove', '--force', resolvedWorktree])
           continue
         } catch {
           // The checkout may already be unregistered. Removing the exact recorded worktree remains
           // within the explicitly-confirmed project scope.
         }
       }
-      fs.rmSync(resolvedWorktree, { recursive: true, force: true })
+      await fs.promises.rm(resolvedWorktree, { recursive: true, force: true })
     }
-    fs.rmSync(resolvedProject, { recursive: true, force: true })
+    await fs.promises.rm(resolvedProject, { recursive: true, force: true })
   }
 
   /**

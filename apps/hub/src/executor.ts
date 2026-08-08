@@ -442,6 +442,14 @@ export class InProcessExecutor implements Executor {
         spec.profileDir,
         spec.cwd,
         (kind, payload) => {
+          if (kind === 'session/vendor-session-observed') {
+            const vendorSessionId = (payload as { vendorSessionId?: unknown } | null)?.vendorSessionId
+            if (typeof vendorSessionId === 'string' && vendorSessionId) {
+              // Store first, then journal. If the process dies between those operations the resumable id
+              // is already safe; the audit event may be re-emitted, but conversation continuity is intact.
+              this.h.persistVendorSessionId(spec.sessionId, vendorSessionId)
+            }
+          }
           this.h.journal(spec.sessionId, kind, payload)
           if (kind === 'claude/rate_limit_event') {
             const info = (payload as { rate_limit_info?: ClaudeLimitInfo }).rate_limit_info

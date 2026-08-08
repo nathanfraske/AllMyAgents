@@ -128,7 +128,7 @@ describe('Sidebar with folder state', () => {
     expect(el.querySelector('.manager-role svg')).not.toBeNull()
   })
 
-  it('keeps a retired child visible and labels its preserved lifecycle state', () => {
+  it('removes a retired child from the working catalog while preserving its session record', () => {
     store.sessions.s1!.record.isProjectManager = true
     store.sessions.s2!.record.parentSessionId = 's1'
     store.sessions.s2!.record.status = 'stopped'
@@ -136,10 +136,9 @@ describe('Sidebar with folder state', () => {
     store.sessions.s2!.record.managerRetiredReason = 'replaced after context exhaustion'
 
     const { container } = render(Sidebar)
-    const retired = (container as HTMLElement).querySelector('.row.managedchild .retired-child')
-    expect(retired?.textContent).toBe('retired')
-    expect(retired?.getAttribute('title')).toMatch(/chat and workspace are preserved/i)
-    expect(labels(container as HTMLElement)).toContain('two')
+    expect(labels(container as HTMLElement)).not.toContain('two')
+    expect(store.sessions.s2?.record.managerRetiredReason).toBe('replaced after context exhaustion')
+    expect((container as HTMLElement).querySelector('.manager-role')?.textContent).toMatch(/0 agents/i)
   })
 
   it('nests a worker-created one-shot agent beneath its scientist parent', () => {

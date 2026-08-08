@@ -335,7 +335,13 @@ export class ClaudeDriver {
           clearTimeout(resultCloseTimer)
           resultCloseTimer = undefined
         }
-        if (typeof m.session_id === 'string') this.vendorSessionId = m.session_id
+        if (typeof m.session_id === 'string' && m.session_id !== this.vendorSessionId) {
+          this.vendorSessionId = m.session_id
+          // A first Claude turn can remain open for hours and wait in AskUserQuestion. Persist its resume
+          // identity at the first init/message boundary instead of waiting for turn completion: a hub or
+          // worker restart in that interval must resume this conversation, not create an amnesiac one.
+          this.onEvent('session/vendor-session-observed', { vendorSessionId: m.session_id })
+        }
         this.onEvent(`claude/${m.type}`, message)
         // Surface token usage to the UI's live counter as the turn streams. Assistant messages
         // carry usage under `.message.usage` (the Anthropic API message); the final `result`

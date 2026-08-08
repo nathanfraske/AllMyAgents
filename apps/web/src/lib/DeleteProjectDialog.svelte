@@ -23,15 +23,33 @@
   let actionError = $state('')
   let deleting = $state(false)
   let destructiveAcknowledged = $state(false)
+  const INSPECTION_TIMEOUT_MS = 25_000
 
   onMount(() => {
-    void api.inspectProjectDeletion(project.id)
+    const controller = new AbortController()
+    let mounted = true
+    let timedOut = false
+    const timeout = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, INSPECTION_TIMEOUT_MS)
+    void api.inspectProjectDeletion(project.id, controller.signal)
       .then((result) => {
+        if (!mounted) return
         inspection = result
       })
       .catch((error) => {
-        loadError = error instanceof Error ? error.message : 'Deletion details could not be loaded.'
+        if (!mounted) return
+        loadError = timedOut
+          ? 'Inspection took longer than 25 seconds. The project record can still be removed safely; file deletion remains disabled.'
+          : error instanceof Error ? error.message : 'Deletion details could not be loaded.'
       })
+      .finally(() => clearTimeout(timeout))
+    return () => {
+      mounted = false
+      clearTimeout(timeout)
+      controller.abort()
+    }
   })
 
   function onKey(event: KeyboardEvent): void {
@@ -41,10 +59,15 @@
   async function remove(deleteFiles: boolean): Promise<void> {
     deleting = true
     actionError = ''
-    const result = await ondelete(deleteFiles)
-    deleting = false
-    if (result.ok) onclose()
-    else actionError = result.error
+    try {
+      const result = await ondelete(deleteFiles)
+      deleting = false
+      if (result.ok) onclose()
+      else actionError = result.error
+    } catch (error) {
+      deleting = false
+      actionError = error instanceof Error ? error.message : 'The deletion request failed.'
+    }
   }
 </script>
 
@@ -91,7 +114,7 @@
             <p>Review these exact paths before choosing the destructive option.</p>
           </div>
           <span class="count">
-            {inspection.changes.length} file{inspection.changes.length === 1 ? '' : 's'} ·
+            {inspection.changeCount ?? inspection.changes.length} file{(inspection.changeCount ?? inspection.changes.length) === 1 ? '' : 's'} ·
             {inspection.localCommits.length} local commit{inspection.localCommits.length === 1 ? '' : 's'} ·
             {inspection.worktrees.length} worktree{inspection.worktrees.length === 1 ? '' : 's'}
           </span>
@@ -108,6 +131,9 @@
                 </li>
               {/each}
             </ul>
+            {#if inspection.changesTruncated}
+              <p class="truncated">Showing the first {inspection.changes.length} paths. The full directory remains covered by the project-path warning below.</p>
+            {/if}
           </div>
         {/if}
 

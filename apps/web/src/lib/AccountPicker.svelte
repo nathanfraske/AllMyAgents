@@ -80,7 +80,7 @@
           <button class="row" class:sel={p.id === view.record.profileId} onclick={() => pick(p.id)}>
             <ProviderLogo provider={p.provider} size={13} />
             <span class="id" title={profileOptionLabel(p)}>{profileLabel(p)}</span>
-            <span class="prov dim">{p.provider}</span>
+            <span class="prov dim">{p.provider}{p.siteLabel ? ` · ${p.siteLabel}` : ''}</span>
             {#if p.id === view.record.profileId}<span class="tick"><Icon name="check" size={13} /></span>{/if}
           </button>
         {/each}

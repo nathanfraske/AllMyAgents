@@ -181,11 +181,20 @@ describe('application Overseer authority', () => {
     h.seed({ id: 'project-a-agent', title: 'Ada', projectId: 'project-a', role: 'Reviewer' })
     h.seed({ id: 'project-b-agent', title: 'Turing', projectId: 'project-b', status: 'stopped' })
     h.seed({ id: 'project-a-peer', title: 'Hopper', projectId: 'project-a' })
+    h.seed({
+      id: 'retired-agent',
+      title: 'Archived',
+      projectId: 'project-a',
+      status: 'stopped',
+      parentSessionId: 'project-a-agent',
+      managerRetiredAt: '2026-08-08T12:00:00.000Z',
+    })
 
     expect(h.sessions.busRoster('overseer')).toEqual(expect.arrayContaining([
       expect.objectContaining({ sessionId: 'project-a-agent', label: 'Ada', projectId: 'project-a', role: 'Reviewer' }),
       expect.objectContaining({ sessionId: 'project-b-agent', label: 'Turing', projectId: 'project-b', status: 'stopped' }),
     ]))
+    expect(h.sessions.busRoster('overseer').map((record) => record.sessionId)).not.toContain('retired-agent')
     expect(h.sessions.busRoster('project-a-agent').map((record) => record.sessionId)).toEqual(['project-a-peer'])
 
     expect(h.sessions.busPeek('overseer', 'project-b-agent', { view: 'activity' })).toMatchObject({

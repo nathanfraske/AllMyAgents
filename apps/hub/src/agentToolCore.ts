@@ -360,7 +360,7 @@ function resolveWriteScope(id: SessionIdentity, kind: 'account' | 'project' | un
 const listAgents = defineTool({
   name: 'list_agents',
   description:
-    'List the other agents in your allowed scope. Ordinary agents see same-project teammates; the application Overseer sees the complete local fleet, including stopped chats. Returns session ids (use one verbatim as `to_session`), project, role, provider, and current status.',
+    'List the other agents in your active catalog. Ordinary agents see same-project teammates; the application Overseer sees the complete local fleet, including stopped chats that have not been retired. Retired manager children remain durable records in child_status and can be reactivated by their manager. Returns session ids (use one verbatim as `to_session`), project, role, provider, and current status.',
   schema: {},
   run: async (_args, { identity, services }) => {
     const roster = await services.roster(identity.sessionId)
@@ -1069,6 +1069,31 @@ const remoteWriteFile = defineTool({
   },
 })
 
+const remoteCreateDirectory = defineTool({
+  name: 'remote_create_directory',
+  description:
+    'Create one directory (and, by default, missing parent directories) beneath an explicitly granted remote write root. This is the directory half of a folder transfer; existing files, links, and paths outside the root are never overwritten or followed.',
+  schema: {
+    device_id: z.string().min(1).max(256),
+    root_id: z.string().min(1).max(128),
+    path: z.string().min(1).max(4096),
+    recursive: z.boolean().optional().describe('create missing parents; defaults to true'),
+  },
+  run: async (args, { identity, services }) => {
+    const denied = remoteBusDenied(identity, services)
+    if (denied) return denied
+    const result = await services.remoteExecute(identity.sessionId, args.device_id, {
+      op: 'mkdir',
+      rootId: args.root_id,
+      path: args.path,
+      recursive: args.recursive !== false,
+    })
+    return result.ok
+      ? `${result.created ? 'Created' : 'Already present'} remote directory ${args.path}. ${remoteTelemetry(result)}`
+      : `Remote directory creation failed: ${result.error ?? 'unknown error'} ${remoteTelemetry(result)}`
+  },
+})
+
 const remoteExec = defineTool({
   name: 'remote_exec',
   description:
@@ -1312,6 +1337,7 @@ export const AGENT_TOOLS: readonly AgentToolSpec[] = [
   remoteInspectEnvironment,
   remoteListFiles,
   remoteReadFile,
+  remoteCreateDirectory,
   remoteWriteFile,
   remoteExec,
   overseerControl,

@@ -53,6 +53,29 @@ describe('WorkspaceManager', () => {
     expect(workspace.inspect(repo, created.worktree)).toEqual({ ok: true, dirty: false })
   })
 
+  it('removes a large project without blocking the hub event loop', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-workspace-'))
+    roots.push(root)
+    const workspace = new WorkspaceManager(path.join(root, 'worktrees'))
+    const project = path.join(root, 'large-project')
+    for (let directory = 0; directory < 25; directory += 1) {
+      const target = path.join(project, `directory-${directory}`)
+      fs.mkdirSync(target, { recursive: true })
+      for (let file = 0; file < 40; file += 1) {
+        fs.writeFileSync(path.join(target, `file-${file}.txt`), 'build output\n')
+      }
+    }
+    let eventLoopAdvanced = false
+    setTimeout(() => {
+      eventLoopAdvanced = true
+    }, 0)
+
+    await workspace.removeProjectFiles(project, [])
+
+    expect(eventLoopAdvanced).toBe(true)
+    expect(fs.existsSync(project)).toBe(false)
+  })
+
   describe('reapOrphanWorktrees', () => {
     // Builds a repo plus three worktrees so each test can choose which are "live".
     function scenario() {

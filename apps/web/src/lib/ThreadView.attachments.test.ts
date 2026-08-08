@@ -335,7 +335,7 @@ describe('attachment composer front door', () => {
     expect(apiMock.send).toHaveBeenCalledWith(
       's1',
       'inspect',
-      { attachments: ['att-steer.png'] },
+      { attachments: ['att-steer.png'], requestId: expect.any(String) },
     )
   })
 

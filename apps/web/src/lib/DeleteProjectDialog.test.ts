@@ -30,6 +30,8 @@ const inspection: ProjectDeletionInspection = {
       cwd: 'C:/worktrees/bose',
     },
   ],
+  changeCount: 2,
+  changesTruncated: false,
   changes: [
     {
       kind: 'uncommitted',
@@ -98,5 +100,32 @@ describe('DeleteProjectDialog', () => {
     expect(await screen.findByText(/agent is still shutting down/i)).toBeTruthy()
     expect(screen.getByRole('dialog')).toBeTruthy()
     expect(ondelete).toHaveBeenCalledWith(true)
+  })
+
+  it('times out a stalled inventory without trapping record-only deletion or the close control', async () => {
+    vi.useFakeTimers()
+    apiMock.inspectProjectDeletion.mockImplementation((_projectId: string, signal?: AbortSignal) =>
+      new Promise((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+      })
+    )
+    try {
+      const onclose = vi.fn()
+      const ondelete = vi.fn(async () => ({ ok: true as const }))
+      render(DeleteProjectDialog, { project, onclose, ondelete })
+      await Promise.resolve()
+
+      await vi.advanceTimersByTimeAsync(25_000)
+      await Promise.resolve()
+
+      expect(screen.getByText(/inspection took longer than 25 seconds/i)).toBeTruthy()
+      const recordOnly = screen.getByRole('button', { name: 'Remove from AllMyAgents' }) as HTMLButtonElement
+      expect(recordOnly.disabled).toBe(false)
+      await fireEvent.click(recordOnly)
+      await Promise.resolve()
+      expect(ondelete).toHaveBeenCalledWith(false)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
