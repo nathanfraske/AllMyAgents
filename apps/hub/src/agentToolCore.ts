@@ -39,6 +39,7 @@ export interface OverseerControlInput {
     | 'set_mode'
     | 'set_session_config'
     | 'configure_manager'
+    | 'reassign_manager_account'
     | 'list_team_presets'
     | 'save_team_preset'
     | 'delete_team_preset'
@@ -1158,11 +1159,11 @@ const overseerPreset = z.object({
 const overseerControl = defineTool({
   name: 'overseer_control',
   description:
-    'Application Overseer only: explain how AllMyAgents works; inspect fleet failures and live account usage; configure durable Standard, Tokenmaxxing, or Eco operating modes; configure projects, managers, reusable team presets, chats, accounts, remote-device grants, narrow GitHub automation policies/imports, mesh pairing, direct peer-Overseer messages, and safe hub restarts. GitHub automation can be granted to one exact session or every chat attached to one project, and covers only the explicitly listed PR/workflow/push capabilities. Elevated commands require a configured project policy, blast-radius analysis, a separate explicit operator approval, and (on Windows) UAC. Mutations are denied on teammate-caused turns; a remote Overseer turn may only reply to the same authenticated peer.',
+    'Application Overseer only: explain how AllMyAgents works; inspect fleet failures and live account usage; configure projects, managers, manager account handoffs, reusable team presets, chats, accounts, remote-device grants, narrow GitHub automation policies/imports, mesh pairing, direct peer-Overseer messages, and safe hub restarts; and configure durable Standard, Tokenmaxxing, or Eco operating modes. GitHub automation can be granted to one exact session or every chat attached to one project, and covers only the explicitly listed PR/workflow/push capabilities. Elevated commands require a configured project policy, blast-radius analysis, a separate explicit operator approval, and (on Windows) UAC. Mutations are denied on teammate-caused turns; a remote Overseer turn may only reply to the same authenticated peer.',
   schema: {
     operation: z.enum([
       'status', 'guide', 'ui_catalog', 'highlight_ui', 'failure_context', 'get_operating_mode', 'set_operating_mode', 'create_project', 'create_chat', 'send_chat', 'stop_chat',
-      'reopen_chat', 'approve', 'set_mode', 'set_session_config', 'configure_manager',
+      'reopen_chat', 'approve', 'set_mode', 'set_session_config', 'configure_manager', 'reassign_manager_account',
       'list_team_presets', 'save_team_preset', 'delete_team_preset', 'launch_team',
       'remote_catalog', 'set_remote_grants', 'list_overseer_peers', 'send_overseer_message',
       'start_account_login', 'github_repositories',

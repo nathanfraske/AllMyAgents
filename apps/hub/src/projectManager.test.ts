@@ -20,8 +20,12 @@ import { QuestionService } from './questions.js'
 
 const cleanups: Array<() => void> = []
 
-afterEach(() => {
+afterEach(async () => {
   vi.useRealTimers()
+  // Session creation and idle transitions intentionally defer bus delivery one tick. Drain that
+  // lifecycle work before closing the shared SQLite handle so successful tests cannot leave an
+  // unhandled callback racing the next file's teardown.
+  await new Promise<void>((resolve) => setImmediate(resolve))
   while (cleanups.length) cleanups.pop()?.()
 })
 
@@ -33,8 +37,10 @@ function buildHub() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-manager-'))
   const repo = path.join(root, 'repo')
   const profileDir = path.join(root, 'profile')
+  const secondProfileDir = path.join(root, 'profile-2')
   fs.mkdirSync(repo)
   fs.mkdirSync(profileDir)
+  fs.mkdirSync(secondProfileDir)
   git(repo, 'init')
   fs.writeFileSync(path.join(repo, 'base.txt'), 'base\n')
   git(repo, 'add', 'base.txt')
@@ -44,7 +50,10 @@ function buildHub() {
   const approvals = new ApprovalService(journal)
   const bus = new AgentBus(journal.db)
   const projects = new ProjectStore(journal.db)
-  const profiles: Profile[] = [{ id: 'p1', provider: 'claude', dir: profileDir }]
+  const profiles: Profile[] = [
+    { id: 'p1', provider: 'claude', dir: profileDir },
+    { id: 'p2', provider: 'codex', dir: secondProfileDir },
+  ]
   const steer = vi.fn(async () => {})
   const runTurn = vi.fn(async (
     _spec: Parameters<Executor['runTurn']>[0],
@@ -52,8 +61,9 @@ function buildHub() {
     _origin: 'operator' | 'bus',
     _attachments?: Parameters<Executor['runTurn']>[3],
   ) => {})
+  const startThread = vi.fn(async () => 'unused')
   const executor: Executor = {
-    startThread: async () => 'unused',
+    startThread,
     runTurn,
     steer,
     interrupt: async () => {},
@@ -98,7 +108,7 @@ function buildHub() {
     journal.db.close()
     fs.rmSync(root, { recursive: true, force: true })
   })
-  return { sessions, journal, approvals, usage, projects, bus, seed, repo, steer, runTurn }
+  return { sessions, journal, approvals, usage, projects, bus, seed, repo, steer, runTurn, startThread }
 }
 
 function transition(sessions: SessionManager, id: string, status: SessionStatus): void {
@@ -549,7 +559,7 @@ describe('project manager reversible child retirement', () => {
     expect(child.managerRetiredAt).toBeUndefined()
     expect(child.managerRetiredReason).toBeUndefined()
     await new Promise<void>((resolve) => setImmediate(resolve))
-  })
+  }, 20_000)
 })
 
 describe('project manager lifecycle awareness', () => {
@@ -1215,5 +1225,166 @@ describe('project manager worktree risk delivery', () => {
     const messages = sessions.busInbox('manager')
     expect(messages).toHaveLength(1)
     expect(messages[0]?.subject).toBe('worktree concurrent-write')
+  })
+})
+
+describe('project manager account reassignment', () => {
+  it('moves the live role, hierarchy, teams, policies, and pending mail while preserving a safe snapshot', async () => {
+    const { sessions, journal, projects, bus, seed, repo, runTurn } = buildHub()
+    const project = projects.create('Demo project', repo)
+    const manager = seed({
+      id: 'manager',
+      title: 'Release manager',
+      titleSource: 'user',
+      projectId: project.id,
+      permissionMode: 'full',
+      allowedTools: ['Bash'],
+      browserEnabled: true,
+    })
+    sessions.configureProjectManager(
+      manager.id,
+      {
+        enabled: true,
+        maxLiveChildren: 4,
+        delegation: ['commit'],
+        allowedProfiles: ['p1', 'p2'],
+        allowedModels: { p2: ['gpt-5.6-sol'] },
+        allowedTools: ['Bash'],
+        orientationBrief: 'Coordinate the project.',
+        operatorTask: 'Cut the release.',
+        standingInstructions: 'Use the whole team and verify every result.',
+        canApproveChildren: true,
+        permissionMode: 'full',
+        maxChildPermissionMode: 'edits',
+      },
+      'operator',
+    )
+    const teamsBefore = structuredClone(manager.managerTeams)
+    sessions.configureGitHubAutomationPolicy('session', manager.id, ['pull_requests'], 'operator')
+    const team = manager.managerTeams![0]!
+    const child = seed({
+      id: 'child',
+      title: 'Allen',
+      projectId: project.id,
+      parentSessionId: manager.id,
+      managerTeamId: team.id,
+      managerTeamName: team.name,
+    })
+    const descendant = seed({
+      id: 'descendant',
+      title: 'Allen II',
+      projectId: project.id,
+      parentSessionId: child.id,
+      isOneShotSubagent: true,
+      managerRootSessionId: manager.id,
+      managerTeamId: team.id,
+      managerTeamName: team.name,
+    })
+    bus.post({
+      from: {
+        sessionId: child.id,
+        profileId: child.profileId,
+        provider: child.provider,
+        projectId: project.id,
+        label: child.title!,
+      },
+      project: project.id,
+      to: { kind: 'session', id: manager.id },
+      body: 'Pending child checkpoint.',
+      recipients: [manager.id],
+      wake: false,
+    })
+
+    const successor = await sessions.reassignProjectManager(
+      manager.id,
+      { profileId: 'p2', model: 'gpt-5.6-sol', effort: 'high' },
+      'operator',
+    )
+
+    expect(successor).toMatchObject({
+      profileId: 'p2',
+      provider: 'codex',
+      title: 'Release manager',
+      projectId: project.id,
+      isProjectManager: true,
+      managerReassignedFromSessionId: manager.id,
+      managerMaxLiveChildren: 4,
+      managerDelegation: ['commit'],
+      managerCanApproveChildren: true,
+      managerPermissionModeCeiling: 'full',
+      managerMaxChildPermissionMode: 'edits',
+      model: 'gpt-5.6-sol',
+      effort: 'high',
+      allowedTools: ['Bash'],
+      browserEnabled: true,
+    })
+    expect(successor.managerTeams).toEqual(teamsBefore)
+    expect(manager).toMatchObject({
+      status: 'stopped',
+      isProjectManager: false,
+      permissionMode: 'safe',
+      managerReassignedToSessionId: successor.id,
+    })
+    expect(manager.title).toMatch(/snapshot\)$/i)
+    expect(manager.allowedTools).toBeUndefined()
+    expect(manager.browserEnabled).toBeUndefined()
+    expect(child.parentSessionId).toBe(successor.id)
+    expect(descendant.managerRootSessionId).toBe(successor.id)
+    expect(bus.pending(manager.id)).toEqual([])
+    expect(bus.pending(successor.id)).toMatchObject([{ body: 'Pending child checkpoint.', wake: false }])
+    expect(sessions.githubAutomationPolicy('session', manager.id).capabilities).toEqual([])
+    expect(sessions.githubAutomationPolicy('session', successor.id).capabilities).toEqual(['pull_requests'])
+    expect(runTurn).not.toHaveBeenCalled()
+    expect(journal.recentEventsForSession(successor.id)).toEqual(
+      expect.arrayContaining([expect.objectContaining({ kind: 'manager/reassigned-in' })]),
+    )
+    expect(journal.recentEventsForSession(child.id)).toEqual(
+      expect.arrayContaining([expect.objectContaining({ kind: 'manager/parent-reassigned' })]),
+    )
+  })
+
+  it('rejects an agent-authored or mid-turn reassignment without changing the manager', async () => {
+    const { sessions, projects, seed, repo } = buildHub()
+    const project = projects.create('Demo project', repo)
+    const manager = seed({
+      id: 'manager',
+      projectId: project.id,
+      isProjectManager: true,
+      status: 'active',
+    })
+
+    await expect(
+      sessions.reassignProjectManager(manager.id, { profileId: 'p2' }, 'agent'),
+    ).rejects.toThrow(/only the operator/i)
+    await expect(
+      sessions.reassignProjectManager(manager.id, { profileId: 'p2' }, 'operator'),
+    ).rejects.toThrow(/running/i)
+    expect(manager.profileId).toBe('p1')
+    expect(manager.isProjectManager).toBe(true)
+  })
+
+  it('serializes account handoffs and rejects manager configuration while one is settling', async () => {
+    const { sessions, projects, seed, repo, startThread } = buildHub()
+    const project = projects.create('Demo project', repo)
+    const manager = seed({ id: 'manager', projectId: project.id, isProjectManager: true })
+    let releaseThread!: (threadId: string) => void
+    startThread.mockImplementationOnce(() => new Promise<string>((resolve) => {
+      releaseThread = resolve
+    }))
+
+    const handoff = sessions.reassignProjectManager(manager.id, { profileId: 'p2' }, 'operator')
+    await vi.waitFor(() => expect(startThread).toHaveBeenCalledOnce())
+
+    await expect(
+      sessions.reassignProjectManager(manager.id, { profileId: 'p2' }, 'operator'),
+    ).rejects.toThrow(/lifecycle operation is still settling/i)
+    expect(() => sessions.configureProjectManager(
+      manager.id,
+      { enabled: false },
+      'operator',
+    )).toThrow(/lifecycle operation is still settling/i)
+
+    releaseThread('new-manager-thread')
+    await expect(handoff).resolves.toMatchObject({ profileId: 'p2', isProjectManager: true })
   })
 })

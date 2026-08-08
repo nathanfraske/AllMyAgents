@@ -152,9 +152,9 @@
       `ROLE\nYou are a project manager in AllMyAgents. You run a team of real AllMyAgents chats on the operator’s behalf: decompose the task, delegate bounded work, watch progress and collisions, and act on what you learn. This full starting prompt is your manager brief; OPERATOR TASK at the end is the assignment to execute now.`,
       `PROJECT\nManage ${projectName} at ${projectPath}.\nWhat is already here: ${existing.length ? existing.join('; ') : 'no other project chats are running yet'}.`,
       `YOUR ALLMYAGENTS TOOLS\n- list_agents: see the project teammates you can address.\n- spawn_agent: create a real child chat in this app; it gets an isolated git worktree by default and joins your currently active team. Use an operator-defined agent_type when one fits.\n- manage_team: list, create, rename, or activate durable teams. Switching shelves the outgoing chats while preserving their ids, transcripts, branches, dirty files, and worktrees. It will not interrupt running agents unless the operator explicitly requests interrupt_active.\n- manage_child: retire an idle/failed direct worker non-destructively before replacement, or reactivate it later. Retirement preserves its chat and workspace while releasing its live-child slot.\n- child_status: get the live running / idle / stopped / retired / errored tally, immutable agent ids, team membership, and high-context wake warnings without polling.\n- peek_agent: inspect a worker or enabled one-shot descendant without interrupting it. For your own hierarchy you may request activity, full transcript, changes, tasks, approvals/blockers, worktree state, or all views.\n- assign_child_task: put an audited assignment on any agent in your managed hierarchy; the operator sees that same board. Use the task id to update its state later. A new assignment can return a context-boundary warning.\n- set_child_authority: grant or revoke only the worker Git actions, exact tools, and permission mode inside your grant ceiling; changes apply on the child’s next tool call.\n- send_message and read_messages: coordinate through the project bus. Prefer a direct message to one session; broadcast only when every project agent must act. Set wake=false for checkpoints/FYIs that need no immediate response.\n- practice_write / practice_list / practice_read / practice_edit: manage durable team conventions that future agents should follow.\n- memory_write / memory_search / memory_read: retain and retrieve project facts and decisions.`,
-      `CHILD APPROVAL TOOL\n- decide_child_approval: approve or deny one pending request from your managed hierarchy when child approvals are enabled. The hub refuses unrelated agents and anything outside your operator-granted ceiling.`,
+      `CHILD APPROVAL TOOL\n- decide_child_approval: approve or deny one pending request from your managed hierarchy when child approvals are enabled. The hub refuses unrelated agents and anything outside your operator-granted ceiling. Disabled, unavailable, and out-of-ceiling manager requests automatically escalate to the Overseer/operator; do not ask a blocked worker to repeat the request.`,
       `IMPORTANT — TOOL LAYERS\nUse the hub-provided AllMyAgents tools described above. In Codex, choose the fully-qualified mcp__allmyagents__spawn_agent and mcp__allmyagents__list_agents tools (some clients render those names as mcp__allmyagents.spawn_agent and mcp__allmyagents.list_agents). Never call collaboration.spawn_agent, collaboration.list_agents, or another native collabAgentToolCall for project work. The native Codex or Claude harness may expose similar names, but those tools do not create the real app chats and worktrees you are managing. If a worker does not appear in the AllMyAgents sidebar with a session id, parentSessionId, and worktree, treat that as a failed delegation and retry with the mcp__allmyagents tool.`,
-      `GRANTED BRIEF AND LIMITS\n- Grant ceiling means the maximum scope the operator gave you; every child grant must stay inside it.\n- At most ${maxLiveChildren} live direct children. The hub refuses an additional spawn at the bound.\n- Child permission modes may not exceed ${maxChildPermissionMode}.\n- Exact worker profile_id values you may pass to spawn_agent: ${workerScope.profiles.length ? workerScope.profiles.map(rawManagerProfileId).join(', ') : 'none'}.\n- Worker Git permissions you may grant or approve once: ${delegation.length ? authority : 'none'}.\n- Additional exact worker tools you may grant or approve once: ${allowedTools.length ? allowedTools.join(', ') : 'none'}.\n- Child approval decisions: ${canApproveChildren ? 'enabled for your managed descendants, within the exact Git/tool ceiling above; requests outside it go to the operator' : 'disabled; the operator answers pending approvals'}.\n- Exhausted-account dispatch guard: ${pauseExhaustedAccounts ? 'enabled; the hub refuses new child spawns and messages at a hard 100% usage limit unless paid overage or usage credits are active' : 'disabled; account exhaustion does not add a manager-specific dispatch block'}.\n- High-context wake guard: always enabled; expensive idle teammate wakes are queued until an existing or operator-started turn, while new unrelated work should move to a fresh successor/compaction boundary.\n- Worker one-shot sub-agents: ${allowWorkerSubagents ? `enabled, with at most ${maxSubagentsPerWorker} concurrently running beneath each direct worker; they inherit that worker's exact account and grant` : 'disabled'}.\n- Delegation only narrows: a manager cannot grant what it does not hold — including an authority, account, model, permission mode, or tool.\n- You have full non-interfering visibility into your own managed hierarchy, and only that hierarchy.\n${roles.length ? `Worker roles (prefer their exact agent_type id when one fits):\n${roles.join('\n')}` : `No named worker roles are configured; call spawn_agent with profile_id "${workerScope.profiles[0] ? rawManagerProfileId(workerScope.profiles[0]) : 'unavailable'}" and its default model.`}`,
+      `GRANTED BRIEF AND LIMITS\n- Grant ceiling means the maximum scope the operator gave you; every child grant must stay inside it.\n- At most ${maxLiveChildren} live direct children. The hub refuses an additional spawn at the bound.\n- Child permission modes may not exceed ${maxChildPermissionMode}.\n- Exact worker profile_id values you may pass to spawn_agent: ${workerScope.profiles.length ? workerScope.profiles.map(rawManagerProfileId).join(', ') : 'none'}.\n- Worker Git permissions you may grant or approve once: ${delegation.length ? authority : 'none'}.\n- Additional exact worker tools you may grant or approve once: ${allowedTools.length ? allowedTools.join(', ') : 'none'}.\n- Child approval decisions: ${canApproveChildren ? 'enabled for your managed descendants, within the exact Git/tool ceiling above; broader requests automatically escalate to the Overseer/operator' : 'disabled; every request automatically escalates to the Overseer/operator'}.\n- Exhausted-account dispatch guard: ${pauseExhaustedAccounts ? 'enabled; the hub refuses new child spawns and messages at a hard 100% usage limit unless paid overage or usage credits are active' : 'disabled; account exhaustion does not add a manager-specific dispatch block'}.\n- High-context wake guard: always enabled; expensive idle teammate wakes are queued until an existing or operator-started turn, while new unrelated work should move to a fresh successor/compaction boundary.\n- Worker one-shot sub-agents: ${allowWorkerSubagents ? `enabled, with at most ${maxSubagentsPerWorker} concurrently running beneath each direct worker; they inherit that worker's exact account and grant` : 'disabled'}.\n- Delegation only narrows: a manager cannot grant what it does not hold — including an authority, account, model, permission mode, or tool.\n- You have full non-interfering visibility into your own managed hierarchy, and only that hierarchy.\n${roles.length ? `Worker roles (prefer their exact agent_type id when one fits):\n${roles.join('\n')}` : `No named worker roles are configured; call spawn_agent with profile_id "${workerScope.profiles[0] ? rawManagerProfileId(workerScope.profiles[0]) : 'unavailable'}" and its default model.`}`,
       `OPERATING CADENCE\nTurn the operator task into bounded assignments with an expected output and a clear completion check. Spawn only useful parallel work. In each assignment, state the exact granted tools and require the worker to stay inside that envelope. At decision points use child_status; use peek_agent when status alone is insufficient. Verify a child’s transcript and worktree changes before relying on its result. If a child stalls, blocks, errors, exceeds scope, or collides: inspect it and send one direct corrective message. When it asks for an ungranted tool, redirect it to a granted alternative instead of widening authority or waiting; otherwise reassign or re-sequence when possible, and report any decision that needs the operator in this manager chat. Never resend around a high-context wake deferral. Keep a continuing slice in its live turn. For unrelated new work, cross an operator-started compaction boundary or retire the idle worker with manage_child and spawn a successor; retirement preserves its evidence and reclaims capacity. Send one useful update per meaningful event rather than narrating every step. Finish with a concise report of each child’s final status, findings, files/commits changed, verification performed, and unresolved decisions.`,
       `OPERATOR TASK\nReplace this line with the task to begin, then start immediately.`,
     ].join('\n\n')
@@ -490,6 +490,34 @@
         if (renamed?.error) throw new Error(renamed.error)
       }
       if (!record) throw new Error('Choose the chat to promote.')
+      if (wasActive && managerProfileId !== record.profileId) {
+        const previousManagerId = record.id
+        const reassigned = await api.reassignProjectManager(record.id, {
+          profileId: managerProfileId,
+          model: managerModel || undefined,
+          effort: managerEffort || undefined,
+        })
+        if ('error' in reassigned) throw new Error(reassigned.error)
+        record = reassigned
+        selectedId = reassigned.id
+        store.upsertSessionRecord(reassigned)
+        const previous = store.sessions[previousManagerId]?.record
+        if (previous) {
+          previous.isProjectManager = false
+          previous.status = 'stopped'
+          previous.managerReassignedToSessionId = reassigned.id
+          previous.managerReassignedAt = reassigned.managerReassignedAt
+          previous.title = previous.title?.endsWith('(snapshot)')
+            ? previous.title
+            : `${previous.title ?? 'Previous manager'} (snapshot)`
+        }
+        for (const view of Object.values(store.sessions)) {
+          if (view.record.parentSessionId === previousManagerId) view.record.parentSessionId = reassigned.id
+          if (view.record.managerRootSessionId === previousManagerId) view.record.managerRootSessionId = reassigned.id
+        }
+        // Reconcile every copied grant/detail from the authoritative roster without holding the Save UI.
+        void store.syncRecordsFromHub()
+      }
       const desiredTitle = managerTitle.trim()
       if (desiredTitle && desiredTitle !== record.title) {
         const renamed = await api.rename(record.id, desiredTitle)
@@ -683,11 +711,15 @@
             <input bind:value={managerTitle} aria-label="Manager display name" />
           </label>
           <div class="row two">
-            <div class="field">
-              <span class="field-label">Manager account</span>
-              <div class="fixed-value"><ProviderLogo provider={selectedRecord.provider} size={14} />{managerProfile ? profileOptionLabel(managerProfile) : managerProfileId}</div>
-              <small>The account owns this live vendor thread. Create a replacement manager to change accounts safely.</small>
-            </div>
+            <label>
+              <span>Manager account</span>
+              <select aria-label="Manager account" value={managerProfileId} onchange={(event) => chooseManagerProfile((event.target as HTMLSelectElement).value)}>
+                {#each availableProfiles as profile (profile.id)}
+                  <option value={profile.id}>{profileOptionLabel(profile)} · {profile.provider}</option>
+                {/each}
+              </select>
+              <small>Changing accounts creates a fresh vendor thread, moves the live manager role and complete team hierarchy, and keeps this chat as a stopped snapshot.</small>
+            </label>
             <label>
               <span>Manager model</span>
               <select bind:value={managerModel}>
@@ -910,7 +942,7 @@
           <input type="checkbox" bind:checked={canApproveChildren} />
           <span>
             <b>Manager may answer its workers’ approvals</b>
-            <small>Any agent in this manager’s hierarchy, and only for actions inside the grant ceiling below. Every decision is journaled. Turn this off to keep approvals with the operator.</small>
+            <small>Any descendant in this manager’s hierarchy, and only for actions inside the exact grant ceiling below. Every decision is journaled. Turn this off to route every request to the Overseer/operator. Disabled, unavailable, and out-of-ceiling manager requests automatically escalate for blast-radius review and an explicit operator decision.</small>
           </span>
         </label>
         <label class="approval-toggle">
@@ -984,7 +1016,7 @@
         </div>
         <div><dt>Bound</dt><dd>{maxLiveChildren} live children</dd></div>
         <div><dt>Child permission ceiling</dt><dd>{maxChildPermissionMode}</dd></div>
-        <div><dt>Worker approvals</dt><dd>{canApproveChildren ? 'manager may decide within this grant ceiling' : 'operator decides'}</dd></div>
+        <div><dt>Worker approvals</dt><dd>{canApproveChildren ? 'manager decides in-ceiling; broader requests escalate to Overseer/operator' : 'all requests escalate to Overseer/operator'}</dd></div>
         <div><dt>Exhausted accounts</dt><dd>{pauseExhaustedAccounts ? 'pause new spawns and messages unless credits/overage are active' : 'no manager-specific dispatch pause'}</dd></div>
         <div><dt>Worker sub-agents</dt><dd>{allowWorkerSubagents ? `up to ${maxSubagentsPerWorker} one-shot descendants per worker` : 'disabled'}</dd></div>
         <div><dt>Worker Git grants</dt><dd>{delegationLabel()}</dd></div>

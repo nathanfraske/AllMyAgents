@@ -190,6 +190,20 @@ export class AgentBus {
     return (this.pendingStmt.all(sessionId) as Row[]).map(hydrate)
   }
 
+  /** Move only undelivered mail during an operator-owned session handoff. Delivered/read history stays
+   *  attached to the predecessor transcript; direct-address metadata follows the successor too. */
+  retargetPending(fromSessionId: string, toSessionId: string): number {
+    if (!fromSessionId || !toSessionId || fromSessionId === toSessionId) return 0
+    return this.db
+      .prepare(
+        `UPDATE bus_messages
+         SET toSession = ?,
+             toId = CASE WHEN toKind = 'session' AND toId = ? THEN ? ELSE toId END
+         WHERE toSession = ? AND delivered = 0`,
+      )
+      .run(toSessionId, fromSessionId, toSessionId, fromSessionId).changes
+  }
+
   /** One query for the whole roster's undelivered counts. Callers join this map in memory; never issue
    *  pending(sessionId) once per session on a UI polling path. */
   pendingCounts(): Map<string, number> {

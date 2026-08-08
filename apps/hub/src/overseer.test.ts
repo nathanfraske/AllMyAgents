@@ -31,11 +31,16 @@ afterEach(async () => {
 function harness() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-overseer-'))
   const profileDir = path.join(root, 'profile')
+  const secondProfileDir = path.join(root, 'profile-2')
   fs.mkdirSync(profileDir)
+  fs.mkdirSync(secondProfileDir)
   const journal = new Journal(path.join(root, 'hub.db'))
   const store = new SessionStore(journal.db)
   const approvals = new ApprovalService(journal)
-  const profiles: Profile[] = [{ id: 'p1', provider: 'claude', dir: profileDir }]
+  const profiles: Profile[] = [
+    { id: 'p1', provider: 'claude', dir: profileDir },
+    { id: 'p2', provider: 'codex', dir: secondProfileDir },
+  ]
   const executor: Executor = {
     startThread: async () => 'unused',
     runTurn: vi.fn(async () => {}),
@@ -98,27 +103,27 @@ describe('application Overseer authority', () => {
       status: 'idle',
       createdAt: '2026-07-01T00:00:00.000Z',
       isOverseer: true,
-      overseerCapabilityVersion: 5,
+      overseerCapabilityVersion: 6,
       permissionMode: 'safe',
     })
 
     h.sessions.loadRecords()
     const loadedLegacy = h.store.all().find((record) => record.id === 'legacy-overseer')
     expect(loadedLegacy).toMatchObject({ permissionMode: 'safe' })
-    expect(loadedLegacy?.overseerCapabilityVersion).toBe(5)
+    expect(loadedLegacy?.overseerCapabilityVersion).toBe(6)
     expect(h.journal.recentEventsForSession('legacy-overseer', 20)).toEqual([])
 
     h.sessions.reconcileStale()
 
     expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
       isOverseer: true,
-      overseerCapabilityVersion: 6,
+      overseerCapabilityVersion: 7,
       permissionMode: 'full',
       permissionModeOperatorOverride: true,
       role: 'Application Overseer',
     })
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
-      'Overseer capability manifest version 6',
+      'Overseer capability manifest version 7',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'mcp__allmyagents__overseer_control',
@@ -127,14 +132,20 @@ describe('application Overseer authority', () => {
       'configure_github_automation',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
+      'explicitly ask whether the manager may decide descendant approvals',
+    )
+    expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
+      'reassign_manager_account',
+    )
+    expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'Do not use the vendor-native list_agents or peek_agent',
     )
     const upgrades = () => h.journal.recentEventsForSession('legacy-overseer', 20)
       .filter((event) => event.kind === 'overseer/capabilities-upgraded')
     expect(upgrades()).toHaveLength(1)
     expect(upgrades()[0]?.payload).toMatchObject({
-      fromVersion: 5,
-      toVersion: 6,
+      fromVersion: 6,
+      toVersion: 7,
       conversationPreserved: true,
       tools: expect.arrayContaining(['overseer_control', 'remote_exec', 'browser_navigate']),
     })
@@ -337,6 +348,53 @@ describe('application Overseer authority', () => {
     h.sessions.setRestartSignal(restart)
     await expect(h.sessions.overseerControl('overseer', { operation: 'restart_hub' })).resolves.toMatchObject({ ok: true })
     expect(restart).toHaveBeenCalledWith('overseer', 'overseer')
+  })
+
+  it('forces an explicit manager approval choice and can hand the manager to another account', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.markOperator('overseer')
+    const project = h.projects.create('Manager handoff', h.root)
+    h.seed({ id: 'manager', title: 'Project manager', projectId: project.id })
+
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'configure_manager',
+      sessionId: 'manager',
+      managerConfig: { enabled: true },
+    })).resolves.toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/ask whether the manager may decide descendant approvals/u),
+    })
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'configure_manager',
+      sessionId: 'manager',
+      managerConfig: { enabled: true, canApproveChildren: false },
+    })).resolves.toMatchObject({
+      ok: true,
+      data: expect.objectContaining({ isProjectManager: true, managerCanApproveChildren: false }),
+    })
+
+    const moved = await h.sessions.overseerControl('overseer', {
+      operation: 'reassign_manager_account',
+      sessionId: 'manager',
+      profileId: 'p2',
+      model: 'gpt-5.6-sol',
+      effort: 'high',
+    })
+    expect(moved).toMatchObject({
+      ok: true,
+      data: expect.objectContaining({
+        profileId: 'p2',
+        provider: 'codex',
+        isProjectManager: true,
+        managerReassignedFromSessionId: 'manager',
+      }),
+    })
+    expect(h.sessions.list().find((record) => record.id === 'manager')).toMatchObject({
+      isProjectManager: false,
+      status: 'stopped',
+      managerReassignedToSessionId: expect.any(String),
+    })
   })
 
   it('saves and launches a real manager team with operator-origin startup messages', async () => {

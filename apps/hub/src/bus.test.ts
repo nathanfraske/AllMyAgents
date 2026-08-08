@@ -74,6 +74,44 @@ describe('AgentBus external delivery receipts', () => {
     expect(bus.pending('local-overseer')).toHaveLength(1)
   })
 
+  it('retargets only pending mail and preserves direct-address semantics during a session handoff', () => {
+    const { db, bus, from } = harness()
+    const [direct] = bus.post({
+      from,
+      project: 'project',
+      to: { kind: 'session', id: 'old-manager' },
+      body: 'pending direct note',
+      recipients: ['old-manager'],
+    })
+    const [broadcast] = bus.post({
+      from,
+      project: 'project',
+      to: { kind: 'project', id: 'project' },
+      body: 'pending project note',
+      recipients: ['old-manager'],
+      wake: false,
+    })
+    const [delivered] = bus.post({
+      from,
+      project: 'project',
+      to: { kind: 'session', id: 'old-manager' },
+      body: 'already delivered',
+      recipients: ['old-manager'],
+    })
+    bus.markDelivered([delivered!.id])
+
+    expect(bus.retargetPending('old-manager', 'new-manager')).toBe(2)
+    expect(bus.pending('old-manager')).toEqual([])
+    expect(bus.pending('new-manager')).toMatchObject([
+      { id: direct!.id, toKind: 'session', toId: 'new-manager', wake: true },
+      { id: broadcast!.id, toKind: 'project', toId: 'project', wake: false },
+    ])
+    expect(db.prepare('SELECT toSession, toId FROM bus_messages WHERE id = ?').get(delivered!.id)).toEqual({
+      toSession: 'old-manager',
+      toId: 'old-manager',
+    })
+  })
+
   it('rolls the receipt claim back when message insertion fails', () => {
     const { db, bus, from } = harness()
     db.exec(`CREATE TRIGGER reject_external_message BEFORE INSERT ON bus_messages

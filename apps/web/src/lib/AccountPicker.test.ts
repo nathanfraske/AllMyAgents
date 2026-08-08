@@ -63,7 +63,7 @@ describe('AccountPicker first run', () => {
     await fireEvent.click(screen.getByRole('button', { name: /claude-default/i }))
 
     expect(screen.getByText('Account locked')).toBeTruthy()
-    expect(screen.getByText(/bound to its live vendor thread and operator grant/i)).toBeTruthy()
+    expect(screen.getByText(/transfer its live role and team.*preserving this vendor thread as a snapshot/i)).toBeTruthy()
     expect(screen.queryByText('claude-other')).toBeNull()
     expect(useAccount).not.toHaveBeenCalled()
     useAccount.mockRestore()
