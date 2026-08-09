@@ -2,10 +2,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte'
 import ProjectView from './ProjectView.svelte'
 import { store, type SessionView, type ThreadItem } from './store.svelte'
-import type { ProjectInfo, SessionRecord, WorktreeProjectActivity } from './api'
+import type { ProjectInfo, ProjectReplicaInfo, SessionRecord, WorktreeProjectActivity } from './api'
 
 const apiMock = vi.hoisted(() => ({
   projectActivity: vi.fn(),
+  projectReplicas: vi.fn(),
+  projectTestbedRuns: vi.fn(),
+  projectReplicaCatalog: vi.fn(),
+  addProjectReplica: vi.fn(),
+  removeProjectReplica: vi.fn(),
   send: vi.fn(),
   updateProject: vi.fn(),
 }))
@@ -27,6 +32,18 @@ const project: ProjectInfo = {
   name: 'Alpha',
   path: 'C:/work/alpha',
   createdAt: now,
+}
+
+const localReplica: ProjectReplicaInfo = {
+  id: 'replica-local',
+  projectId: project.id,
+  kind: 'local',
+  environment: { id: 'host', kind: 'host' },
+  path: project.path,
+  isPrimary: true,
+  state: 'ready',
+  createdAt: now,
+  updatedAt: now,
 }
 
 function session(
@@ -108,6 +125,11 @@ const activity: WorktreeProjectActivity = {
 beforeEach(() => {
   localStorage.clear()
   apiMock.projectActivity.mockReset().mockResolvedValue(activity)
+  apiMock.projectReplicas.mockReset().mockResolvedValue([localReplica])
+  apiMock.projectTestbedRuns.mockReset().mockResolvedValue([])
+  apiMock.projectReplicaCatalog.mockReset().mockResolvedValue([])
+  apiMock.addProjectReplica.mockReset()
+  apiMock.removeProjectReplica.mockReset().mockResolvedValue({ ok: true })
   apiMock.send.mockReset().mockResolvedValue({ ok: true })
   apiMock.updateProject.mockReset().mockImplementation(async (_id: string, patch: { name: string }) => ({
     ...project,
@@ -200,6 +222,62 @@ beforeEach(() => {
 afterEach(cleanup)
 
 describe('ProjectView', () => {
+  it('shows explicit project locations, attributed runs, and attaches an advertised testbed root', async () => {
+    apiMock.projectTestbedRuns.mockResolvedValue([{
+      id: 'run-12345678',
+      projectId: project.id,
+      replicaId: 'replica-laptop',
+      sessionId: 'worker',
+      agentId: 'worker',
+      profileId: 'worker-profile',
+      operation: 'exec',
+      state: 'succeeded',
+      commandSummary: 'pnpm test',
+      commandSha256: 'a'.repeat(64),
+      createdAt: now,
+      startedAt: now,
+      completedAt: now,
+      exitCode: 0,
+      telemetry: { roundTripMs: 1250 },
+    }])
+    apiMock.projectReplicaCatalog.mockResolvedValue([{
+      siteId: 'laptop',
+      label: 'Nathan Beefy Laptop',
+      paired: true,
+      updatedAt: now,
+      connected: true,
+      capabilities: {
+        enabled: true,
+        platform: 'win32',
+        arch: 'x64',
+        hostname: 'laptop',
+        roots: [{ id: 'root-project', label: 'Project checkout', path: 'C:/work/alpha', read: true, write: true, terminal: true }],
+      },
+    }])
+    const remoteReplica: ProjectReplicaInfo = {
+      ...localReplica,
+      id: 'replica-laptop',
+      kind: 'remote',
+      siteId: 'laptop',
+      siteLabel: 'Nathan Beefy Laptop',
+      rootId: 'root-project',
+      isPrimary: false,
+      state: 'registered',
+    }
+    apiMock.addProjectReplica.mockResolvedValue(remoteReplica)
+
+    render(ProjectView, { props: { projectId: project.id } })
+
+    expect(await screen.findByText('This hub')).toBeTruthy()
+    expect(await screen.findByText('pnpm test')).toBeTruthy()
+    expect(screen.getByText(/Bose.*1\.3 s.*exit 0/)).toBeTruthy()
+    await fireEvent.click(screen.getByRole('button', { name: /add testbed location/i }))
+    expect(await screen.findByText('Nathan Beefy Laptop')).toBeTruthy()
+    await fireEvent.click(screen.getByRole('button', { name: /Project checkout/ }))
+    await waitFor(() => expect(apiMock.addProjectReplica).toHaveBeenCalledWith(project.id, 'laptop', 'root-project'))
+    expect(await screen.findByText('Nathan Beefy Laptop')).toBeTruthy()
+  })
+
   it('shows lifecycle status, manager grouping, files, taskboards, collisions, and project bus traffic', async () => {
     render(ProjectView, { props: { projectId: project.id } })
 

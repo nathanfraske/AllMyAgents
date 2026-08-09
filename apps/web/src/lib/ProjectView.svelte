@@ -1,6 +1,12 @@
 <script lang="ts">
   import { onDestroy } from 'svelte'
-  import { api, type WorktreeProjectActivity } from './api'
+  import {
+    api,
+    type ProjectReplicaInfo,
+    type RemoteDeviceCatalogEntry,
+    type TestbedRunInfo,
+    type WorktreeProjectActivity,
+  } from './api'
   import { store, type SessionView, type ThreadItem } from './store.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
   import AgentPurposeInfo from './AgentPurposeInfo.svelte'
@@ -23,6 +29,13 @@
   let activity = $state<WorktreeProjectActivity | null>(null)
   let activityError = $state(false)
   let activityTimer: ReturnType<typeof setInterval> | null = null
+  let topologyTimer: ReturnType<typeof setInterval> | null = null
+  let replicas = $state<ProjectReplicaInfo[]>([])
+  let testbedRuns = $state<TestbedRunInfo[]>([])
+  let replicaCatalog = $state<RemoteDeviceCatalogEntry[]>([])
+  let topologyError = $state('')
+  let locationPickerOpen = $state(false)
+  let attachingLocation = $state('')
   let selectedMode = $state<ProjectViewMode>('overview')
   let peekOpen = $state(true)
   let modeProjectId = $state('')
@@ -81,6 +94,28 @@
     if (mode === 'manager' && manager) void store.ensureHistory(manager.record.id)
   })
 
+  $effect(() => {
+    const id = projectId
+    let current = true
+    const refresh = async (): Promise<void> => {
+      const [nextReplicas, nextRuns] = await Promise.all([
+        api.projectReplicas(id).catch(() => null),
+        api.projectTestbedRuns(id, 20).catch(() => null),
+      ])
+      if (!current) return
+      if (nextReplicas && !('error' in nextReplicas)) replicas = nextReplicas
+      if (nextRuns && !('error' in nextRuns)) testbedRuns = nextRuns
+      topologyError = nextReplicas && nextRuns ? '' : 'Project locations could not be refreshed.'
+    }
+    void refresh()
+    topologyTimer = setInterval(() => void refresh(), 5_000)
+    return () => {
+      current = false
+      if (topologyTimer) clearInterval(topologyTimer)
+      topologyTimer = null
+    }
+  })
+
   function toggleTranscriptPeek(): void {
     peekOpen = !peekOpen
     saveProjectTranscriptPeek(projectId, peekOpen)
@@ -110,7 +145,54 @@
 
   onDestroy(() => {
     if (activityTimer) clearInterval(activityTimer)
+    if (topologyTimer) clearInterval(topologyTimer)
   })
+
+  const availableReplicaRoots = $derived.by(() => {
+    const attached = new Set(
+      replicas
+        .filter((replica) => replica.kind === 'remote')
+        .map((replica) => `${replica.siteId}:${replica.rootId}`),
+    )
+    return replicaCatalog.flatMap((device) =>
+      (device.capabilities?.roots ?? []).map((root) => ({ device, root })),
+    ).filter(({ device, root }) => !attached.has(`${device.siteId}:${root.id}`))
+  })
+
+  async function toggleLocationPicker(): Promise<void> {
+    locationPickerOpen = !locationPickerOpen
+    if (!locationPickerOpen) return
+    topologyError = ''
+    const catalog = await api.projectReplicaCatalog(projectId).catch(() => null)
+    if (!catalog || !Array.isArray(catalog)) {
+      topologyError = catalog && typeof catalog.error === 'string' ? catalog.error : 'Remote devices could not be loaded.'
+      return
+    }
+    replicaCatalog = catalog
+  }
+
+  async function attachLocation(siteId: string, rootId: string): Promise<void> {
+    const key = `${siteId}:${rootId}`
+    attachingLocation = key
+    topologyError = ''
+    const added = await api.addProjectReplica(projectId, siteId, rootId).catch(() => null)
+    attachingLocation = ''
+    if (!added || 'error' in added) {
+      topologyError = added && 'error' in added ? added.error : 'The project location could not be attached.'
+      return
+    }
+    replicas = [...replicas.filter((replica) => replica.id !== added.id), added]
+  }
+
+  async function detachLocation(replica: ProjectReplicaInfo): Promise<void> {
+    topologyError = ''
+    const result = await api.removeProjectReplica(projectId, replica.id).catch(() => null)
+    if (!result || !('ok' in result) || !result.ok) {
+      topologyError = result?.error ?? 'The project location could not be removed.'
+      return
+    }
+    replicas = replicas.filter((candidate) => candidate.id !== replica.id)
+  }
 
   type ProjectStatus = 'working' | 'idle' | 'done' | 'failed' | 'blocked'
   interface AgentRow {
@@ -341,6 +423,20 @@
       ? ''
       : parsed.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   }
+
+  function runAgent(run: TestbedRunInfo): string {
+    return label(store.sessions[run.agentId], shortAgentId(run.agentId))
+  }
+
+  function runDuration(run: TestbedRunInfo): string {
+    if (run.telemetry?.roundTripMs !== undefined) {
+      return run.telemetry.roundTripMs < 1_000
+        ? `${Math.round(run.telemetry.roundTripMs)} ms`
+        : `${(run.telemetry.roundTripMs / 1_000).toFixed(1)} s`
+    }
+    if (!run.completedAt) return 'running'
+    return `${Math.max(0, Math.round((Date.parse(run.completedAt) - Date.parse(run.startedAt)) / 1_000))} s`
+  }
 </script>
 
 <section
@@ -447,6 +543,82 @@
         {/each}
       </section>
     {/if}
+
+    <div class="topology-grid">
+      <section class="card locations" aria-label="Project locations">
+        <div class="section-head">
+          <div>
+            <h2>Locations</h2>
+            <p>Explicit checkouts that share this project identity</p>
+          </div>
+          <button class="location-add" aria-expanded={locationPickerOpen} onclick={toggleLocationPicker}>
+            {locationPickerOpen ? 'Close' : '+ Add testbed location'}
+          </button>
+        </div>
+        {#if topologyError}<div class="topology-error">{topologyError}</div>{/if}
+        <div class="location-list">
+          {#each replicas as replica (replica.id)}
+            <article class="location-row">
+              <span class="location-state {replica.state}" title={replica.state}></span>
+              <span class="location-copy">
+                <strong>{replica.kind === 'local' ? 'This hub' : replica.siteLabel || replica.siteId}</strong>
+                <small>{replica.environment.label || replica.environment.kind} · {replica.path}</small>
+              </span>
+              {#if replica.isPrimary}<span class="location-badge">primary</span>{/if}
+              {#if !replica.isPrimary}
+                <button class="location-remove" aria-label={`Remove ${replica.siteLabel || replica.path}`} onclick={() => detachLocation(replica)}>Remove</button>
+              {/if}
+            </article>
+          {:else}
+            <div class="empty compact"><span>Loading project locations…</span></div>
+          {/each}
+        </div>
+        {#if locationPickerOpen}
+          <div class="location-picker">
+            {#each availableReplicaRoots as target (`${target.device.siteId}:${target.root.id}`)}
+              {@const key = `${target.device.siteId}:${target.root.id}`}
+              <button disabled={attachingLocation !== ''} onclick={() => attachLocation(target.device.siteId, target.root.id)}>
+                <span><strong>{target.device.label}</strong> · {target.root.label}</span>
+                <small>{target.root.environment?.kind === 'wsl' ? `${target.root.environment.distro} · ` : ''}{target.root.path}</small>
+                <em>{attachingLocation === key ? 'Attaching…' : 'Attach'}</em>
+              </button>
+            {:else}
+              <div class="empty compact">
+                <span>No unattached enabled roots are available. Enable a root in Devices first.</span>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </section>
+
+      <section class="card testbed-runs" aria-label="Recent testbed runs">
+        <div class="section-head">
+          <div>
+            <h2>Testbed runs</h2>
+            <p>Agent-attributed commands on attached locations</p>
+          </div>
+        </div>
+        {#if testbedRuns.length}
+          <ol class="run-list">
+            {#each testbedRuns as run (run.id)}
+              <li>
+                <span class="run-state {run.state}">{run.state}</span>
+                <span class="run-copy">
+                  <strong>{run.commandSummary || 'remote command'}</strong>
+                  <small>{runAgent(run)} · {timeOf(run.createdAt)} · {runDuration(run)}{run.exitCode === undefined ? '' : ` · exit ${run.exitCode ?? '—'}`}</small>
+                </span>
+                <code title={`Run ID: ${run.id}`}>{shortAgentId(run.id)}</code>
+              </li>
+            {/each}
+          </ol>
+        {:else}
+          <div class="empty compact">
+            <strong>No attributed runs yet</strong>
+            <span>Remote terminal work appears here after an agent targets an attached location.</span>
+          </div>
+        {/if}
+      </section>
+    </div>
 
     <div class="dashboard-grid">
       <section class="card team">
@@ -704,12 +876,57 @@
   .risk-detail { color: var(--muted); font-size: var(--text-xs); }
   .dashboard-grid { max-width: 1400px; margin: 0 auto; display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(300px, .85fr);
     align-items: start; gap: 1rem; }
+  .topology-grid { max-width: 1400px; margin: 0 auto 1rem; display: grid;
+    grid-template-columns: minmax(0, 1.2fr) minmax(300px, .8fr); align-items: start; gap: 1rem; }
   .card { min-width: 0; border: 1px solid var(--border); border-radius: var(--r-xl); background: var(--surface);
     box-shadow: var(--edge-hi); overflow: hidden; }
   .section-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem;
     padding: .8rem 1rem; border-bottom: 1px solid var(--border-subtle); }
   h2 { margin: 0; font-size: var(--text-md); }
   .section-head p { margin: .15rem 0 0; color: var(--muted); font-size: var(--text-xs); }
+  .location-add { flex: none; padding: .36rem .58rem; border: 1px solid var(--border);
+    border-radius: var(--r-md); color: var(--accent); font-size: var(--text-2xs); }
+  .location-add:hover { border-color: var(--accent); }
+  .topology-error { padding: .55rem .8rem; border-bottom: 1px solid color-mix(in srgb, var(--red) 35%, var(--border));
+    color: var(--red); background: color-mix(in srgb, var(--red) 7%, var(--surface)); font-size: var(--text-xs); }
+  .location-list, .location-picker { display: grid; }
+  .location-row { display: flex; align-items: center; gap: .55rem; min-width: 0; padding: .65rem .8rem;
+    border-top: 1px solid var(--border-subtle); }
+  .location-row:first-child { border-top: 0; }
+  .location-state { width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--dim); }
+  .location-state.ready { background: var(--green, #2e9e63); }
+  .location-state.registered { background: var(--accent); }
+  .location-state.unavailable { background: var(--red); }
+  .location-copy { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: .1rem; }
+  .location-copy strong { font-size: var(--text-xs); }
+  .location-copy small { overflow: hidden; color: var(--muted); font-family: var(--mono);
+    font-size: var(--text-2xs); text-overflow: ellipsis; white-space: nowrap; }
+  .location-badge { padding: .18rem .4rem; border: 1px solid var(--border); border-radius: var(--r-pill);
+    color: var(--muted); font-size: var(--text-2xs); }
+  .location-remove { color: var(--dim); font-size: var(--text-2xs); }
+  .location-remove:hover { color: var(--red); }
+  .location-picker { max-height: 260px; overflow: auto; border-top: 1px solid var(--border); background: var(--surface-2); }
+  .location-picker > button { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .15rem .6rem;
+    padding: .6rem .8rem; border-top: 1px solid var(--border-subtle); color: var(--text); text-align: left; }
+  .location-picker > button:first-child { border-top: 0; }
+  .location-picker > button:hover { background: var(--surface); }
+  .location-picker > button:disabled { opacity: .6; }
+  .location-picker span, .location-picker small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .location-picker span { font-size: var(--text-xs); }
+  .location-picker small { grid-column: 1; color: var(--muted); font-family: var(--mono); font-size: var(--text-2xs); }
+  .location-picker em { grid-column: 2; grid-row: 1 / 3; align-self: center; color: var(--accent); font-size: var(--text-2xs); font-style: normal; }
+  .run-list { list-style: none; margin: 0; padding: 0; max-height: 320px; overflow: auto; }
+  .run-list li { display: flex; align-items: center; gap: .55rem; padding: .62rem .8rem; border-top: 1px solid var(--border-subtle); }
+  .run-list li:first-child { border-top: 0; }
+  .run-state { flex: none; min-width: 4.2rem; color: var(--muted); font-size: var(--text-2xs); text-transform: uppercase; }
+  .run-state.running { color: var(--accent); }
+  .run-state.succeeded { color: var(--green, #2e9e63); }
+  .run-state.failed, .run-state.cancelled { color: var(--red); }
+  .run-copy { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: .12rem; }
+  .run-copy strong { overflow: hidden; font-family: var(--mono); font-size: var(--text-xs); text-overflow: ellipsis; white-space: nowrap; }
+  .run-copy small { color: var(--muted); font-size: var(--text-2xs); }
+  .run-list code { color: var(--dim); font-family: var(--mono); font-size: var(--text-2xs); }
+  .empty.compact { min-height: 82px; padding: 1rem; }
   .monitor-error { color: var(--red); font-size: var(--text-2xs); }
   .monitor-note { max-width: 270px; color: var(--dim); font-size: var(--text-2xs); text-align: right; }
   .agent-list { display: flex; flex-direction: column; }
@@ -785,7 +1002,7 @@
   .hero { height: 100%; }
   .hero h1, .hero p { margin: 0; }
   @media (max-width: 900px) {
-    .dashboard-grid { grid-template-columns: 1fr; }
+    .dashboard-grid, .topology-grid { grid-template-columns: 1fr; }
     .project-head { align-items: flex-start; flex-direction: column; }
     .head-actions { align-items: flex-start; }
     .summary { justify-content: flex-start; }

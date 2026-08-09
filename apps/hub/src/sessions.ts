@@ -81,6 +81,7 @@ import type { DangerFlags, HubPrefs } from './types.js'
 import { InProcessExecutor, type Executor, type InProcessExecutorHubHooks } from './executor.js'
 import type { BrowserBroker } from './browserBroker.js'
 import type { NotificationService, NotificationSourceRole } from './notifications.js'
+import type { TestbedRunStore } from './testbedRuns.js'
 import {
   decideBrowserGate,
   isLiteralLocalAddress,
@@ -606,6 +607,8 @@ export class SessionManager {
   private codexBridge: { bridgePath: string; hubUrl: string; secret: string; nodePath?: string; nodeArgs?: string[] } | null = null
   /** Installed after mesh construction. Null means remote device execution is unavailable and fails closed. */
   private remoteDeviceController: RemoteDeviceController | null = null
+  /** Source-hub run ledger. Installed at boot beside the remote controller. */
+  private testbedRuns: TestbedRunStore | null = null
   private readonly teamPresets: TeamPresetStore
   private readonly elevationPolicies: ProjectElevationPolicyStore
   private readonly githubAutomationPolicies: GitHubAutomationPolicyStore
@@ -1407,6 +1410,10 @@ export class SessionManager {
     this.remoteDeviceController = controller
   }
 
+  setTestbedRunStore(store: TestbedRunStore): void {
+    this.testbedRuns = store
+  }
+
   /** Server-owned integrations are installed after their coordinators are constructed. Keeping them
    * callback-only prevents the execution worker (and ordinary agent tools) from holding those authorities. */
   setOverseerRuntime(services: OverseerRuntimeServices): void {
@@ -1504,14 +1511,65 @@ export class SessionManager {
         : action.op === 'read' || action.op === 'list' || action.op === 'mkdir'
           ? { op: action.op, rootId: action.rootId, path: action.path }
           : { op: action.op, rootId: action.rootId }
-    this.journal.append(sessionId, 'remote-device/requested', { siteId, ...audit })
+    const replica = record.projectId
+      ? this.projects.findRemoteReplica(record.projectId, siteId, action.rootId)
+      : undefined
+    let runId: string | undefined
+    if (action.op === 'exec' && replica && this.testbedRuns && record.projectId) {
+      this.journal.atomic(() => {
+        const run = this.testbedRuns!.start({
+          projectId: record.projectId!,
+          replicaId: replica.id,
+          sessionId,
+          agentId: record.id,
+          profileId: record.profileId,
+          command: action.command,
+          baseCommit: record.baseCommit,
+        })
+        runId = run.id
+        this.journal.append(sessionId, 'testbed-run/started', {
+          runId,
+          projectId: record.projectId,
+          replicaId: replica.id,
+          agentId: record.id,
+          profileId: record.profileId,
+          baseCommit: record.baseCommit ?? null,
+          commandSummary: run.commandSummary,
+          commandSha256: run.commandSha256,
+        })
+      })
+    }
+    this.journal.append(sessionId, 'remote-device/requested', { siteId, runId: runId ?? null, ...audit })
     const result: RemoteDeviceActionResult = await this.remoteDeviceController.execute(siteId, action, {
       sessionId,
       profileId: record.profileId,
+      ...(runId && record.projectId && replica ? {
+        runId,
+        projectId: record.projectId,
+        replicaId: replica.id,
+        agentId: record.id,
+        ...(record.baseCommit ? { baseCommit: record.baseCommit } : {}),
+      } : {}),
     }).catch((error): RemoteDeviceActionResult => ({
       ok: false,
       error: error instanceof Error ? error.message : String(error),
     }))
+    if (runId && this.testbedRuns) {
+      this.journal.atomic(() => {
+        const completed = this.testbedRuns!.finish(runId!, result)
+        this.journal.append(sessionId, result.ok ? 'testbed-run/completed' : 'testbed-run/failed', {
+          runId,
+          projectId: record.projectId,
+          replicaId: replica?.id,
+          agentId: record.id,
+          state: completed?.state ?? (result.ok ? 'succeeded' : 'failed'),
+          exitCode: result.exitCode ?? null,
+          failure: result.failure,
+          error: result.error,
+          telemetry: result.telemetry,
+        })
+      })
+    }
     this.journal.append(sessionId, 'remote-device/completed', {
       siteId,
       op: action.op,
@@ -1524,7 +1582,7 @@ export class SessionManager {
       failure: result.failure,
       telemetry: result.telemetry,
     })
-    return result
+    return runId ? { ...result, runId } : result
   }
 
   /**
@@ -3182,7 +3240,10 @@ export class SessionManager {
     if (this.workerMode) {
       // A normal/cold hub already owns the public role; a booting green passes reconcile:false and must
       // remain read-only until promote() calls reconcileStale after winning the listener handoff.
-      if (opts?.reconcile !== false) this.upgradeDurableSessionCapabilities()
+      if (opts?.reconcile !== false) {
+        this.upgradeDurableSessionCapabilities()
+        this.reconcileInterruptedTestbedRuns()
+      }
       return
     }
     // A booting GREEN hub (blue-green restart) passes reconcile:false and defers reconcileStale() to
@@ -3209,6 +3270,38 @@ export class SessionManager {
   private upgradeDurableSessionCapabilities(): void {
     this.upgradeOverseerSessions()
     this.upgradeManagerTeamSessions()
+    this.upgradeProjectReplicaSessions()
+  }
+
+  private upgradeProjectReplicaSessions(): void {
+    for (const record of this.sessions.values()) {
+      if (!record.projectId || record.projectReplicaId) continue
+      const primary = this.projects.primaryReplica(record.projectId)
+      if (!primary) continue
+      record.projectReplicaId = primary.id
+      this.persist(record)
+      this.journal.append(record.id, 'session/project-replica-upgraded', {
+        projectId: record.projectId,
+        projectReplicaId: primary.id,
+      })
+    }
+  }
+
+  private reconcileInterruptedTestbedRuns(): void {
+    if (!this.testbedRuns) return
+    this.journal.atomic(() => {
+      for (const run of this.testbedRuns!.reconcileInterrupted()) {
+        this.journal.append(run.sessionId, 'testbed-run/interrupted', {
+          runId: run.id,
+          projectId: run.projectId,
+          replicaId: run.replicaId,
+          agentId: run.agentId,
+          state: run.state,
+          failureStage: run.failureStage,
+          error: run.error,
+        })
+      }
+    })
   }
 
   /**
@@ -3252,6 +3345,7 @@ export class SessionManager {
     // This method runs only for the current public owner: at ordinary boot, or synchronously after a
     // green hub wins promote(). Keep all versioned Overseer writes on this side of the ownership fence.
     this.upgradeDurableSessionCapabilities()
+    this.reconcileInterruptedTestbedRuns()
     if (this.workerMode) {
       void this.attachWorker().catch((err) => console.warn(`[hub] attachWorker (reconcileStale) failed: ${err instanceof Error ? err.message : String(err)}`))
       return
@@ -3840,6 +3934,7 @@ export class SessionManager {
 
     for (const record of projectSessions) {
       record.projectId = undefined
+      record.projectReplicaId = undefined
       this.persist(record)
       this.journal.append(record.id, 'session/project-detached', {
         projectId,
@@ -5946,6 +6041,7 @@ export class SessionManager {
       isOverseer: opts.isOverseer === true ? true : undefined,
       overseerCapabilityVersion: opts.isOverseer === true ? OVERSEER_CAPABILITY_VERSION : undefined,
       projectId: opts.projectId,
+      projectReplicaId: opts.projectId ? this.projects.primaryReplica(opts.projectId)?.id : undefined,
       cwd,
       repo,
       worktree,
@@ -6163,6 +6259,7 @@ export class SessionManager {
       profileId: chat.profileId,
       provider: chat.provider,
       projectId,
+      projectReplicaId: projectId ? this.projects.primaryReplica(projectId)?.id : undefined,
       cwd: chat.cwd,
       status: 'idle',
       vendorSessionId: chat.vendorSessionId,

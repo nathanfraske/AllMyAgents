@@ -70,6 +70,7 @@ const remoteSession = (site: FleetSite, session: SessionRecord): SessionRecord =
   id: fleetId(site.siteId, session.id),
   profileId: fleetId(site.siteId, session.profileId),
   projectId: session.projectId ? fleetId(site.siteId, session.projectId) : undefined,
+  projectReplicaId: session.projectReplicaId ? fleetId(site.siteId, session.projectReplicaId) : undefined,
   parentSessionId: session.parentSessionId ? fleetId(site.siteId, session.parentSessionId) : undefined,
   managerTeams: session.managerTeams?.map((team) => ({ ...team, id: fleetId(site.siteId, team.id) })),
   managerActiveTeamId: session.managerActiveTeamId

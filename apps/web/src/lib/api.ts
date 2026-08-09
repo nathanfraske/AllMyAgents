@@ -204,6 +204,7 @@ export interface SessionRecord {
   isOverseer?: boolean
   overseerCapabilityVersion?: number
   projectId?: string
+  projectReplicaId?: string
   cwd: string
   repo?: string
   worktree?: string
@@ -798,6 +799,7 @@ function namespaceSessionResult(target: HubResourceTarget, value: SessionRecord 
     id: `${target.site.siteId}:${value.id}`,
     profileId: `${target.site.siteId}:${value.profileId}`,
     projectId: value.projectId ? `${target.site.siteId}:${value.projectId}` : undefined,
+    projectReplicaId: value.projectReplicaId ? `${target.site.siteId}:${value.projectReplicaId}` : undefined,
     parentSessionId: value.parentSessionId ? `${target.site.siteId}:${value.parentSessionId}` : undefined,
     managerAllowedProfiles: value.managerAllowedProfiles?.map((id) => `${target.site!.siteId}:${id}`),
     managerAllowedModels: value.managerAllowedModels
@@ -906,6 +908,58 @@ export interface DayStat {
   turns: number
   apiEquivalentCostUsd: number
   projects: Record<string, { turns: number; apiEquivalentCostUsd: number }>
+}
+
+export interface ProjectReplicaInfo {
+  id: string
+  projectId: string
+  kind: 'local' | 'remote'
+  siteId?: string
+  siteLabel?: string
+  rootId?: string
+  environment: {
+    id: string
+    kind: 'host' | 'wsl'
+    label?: string
+    distro?: string
+  }
+  path: string
+  isPrimary: boolean
+  state: 'ready' | 'registered' | 'unavailable'
+  headCommit?: string
+  headRef?: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface TestbedRunInfo {
+  id: string
+  projectId: string
+  replicaId: string
+  sessionId: string
+  agentId: string
+  profileId: string
+  operation: 'exec'
+  state: 'running' | 'succeeded' | 'failed' | 'cancelled'
+  commandSummary: string
+  commandSha256: string
+  baseCommit?: string
+  createdAt: string
+  startedAt: string
+  completedAt?: string
+  exitCode?: number | null
+  failureStage?: string
+  error?: string
+  telemetry?: {
+    routeMs?: number
+    networkMs?: number
+    roundTripMs?: number
+    targetMs?: number
+    bytesSent?: number
+    bytesReceived?: number
+    transferBytes?: number
+    transferBytesPerSecond?: number
+  }
 }
 export interface StatsResult {
   days: DayStat[]
@@ -1253,6 +1307,65 @@ export const api = {
       })),
       risks: value.risks.map((risk) => ({ ...risk, sessionIds: risk.sessionIds.map(prefix) })),
     }
+  },
+  projectReplicas: async (projectId: string) => {
+    const target = resolveHubResource(projectId)
+    const value = await routedGet<ProjectReplicaInfo[]>(
+      projectId,
+      (id) => `/api/projects/${encodeURIComponent(id)}/replicas`,
+    )
+    if (!target.site) return value
+    const prefix = (id: string): string => `${target.site!.siteId}:${id}`
+    return value.map((replica) => ({
+      ...replica,
+      id: prefix(replica.id),
+      projectId: prefix(replica.projectId),
+    }))
+  },
+  projectTestbedRuns: async (projectId: string, limit = 50) => {
+    const target = resolveHubResource(projectId)
+    const value = await routedGet<TestbedRunInfo[]>(
+      projectId,
+      (id) => `/api/projects/${encodeURIComponent(id)}/testbed-runs?limit=${Math.max(1, Math.min(limit, 200))}`,
+    )
+    if (!target.site) return value
+    const prefix = (id: string): string => `${target.site!.siteId}:${id}`
+    return value.map((run) => ({
+      ...run,
+      id: prefix(run.id),
+      projectId: prefix(run.projectId),
+      replicaId: prefix(run.replicaId),
+      sessionId: prefix(run.sessionId),
+      agentId: prefix(run.agentId),
+      profileId: prefix(run.profileId),
+    }))
+  },
+  projectReplicaCatalog: (projectId: string) =>
+    routedGet<RemoteDeviceCatalogEntry[] | ApiError>(projectId, () => '/api/project-replicas/catalog'),
+  addProjectReplica: async (projectId: string, siteId: string, rootId: string) => {
+    const target = resolveHubResource(projectId)
+    const value = await routedPost<ProjectReplicaInfo | ApiError>(
+      projectId,
+      (id) => `/api/projects/${encodeURIComponent(id)}/replicas`,
+      { siteId, rootId },
+    )
+    if (!target.site || 'error' in value) return value
+    return {
+      ...value,
+      id: `${target.site.siteId}:${value.id}`,
+      projectId: `${target.site.siteId}:${value.projectId}`,
+    }
+  },
+  removeProjectReplica: (projectId: string, replicaId: string) => {
+    const target = resolveHubResource(projectId)
+    const replicaTarget = resolveHubResource(replicaId)
+    if (target.site?.siteId !== replicaTarget.site?.siteId) {
+      return Promise.resolve({ error: 'project location belongs to a different hub' })
+    }
+    return routedDelete<{ ok?: boolean; error?: string }>(
+      projectId,
+      (id) => `/api/projects/${encodeURIComponent(id)}/replicas/${encodeURIComponent(replicaTarget.id)}`,
+    )
   },
   inspectProjectDeletion: async (projectId: string, signal?: AbortSignal) => {
     const target = resolveHubResource(projectId)

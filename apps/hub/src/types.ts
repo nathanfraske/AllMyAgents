@@ -31,6 +31,32 @@ export interface Project {
   createdAt: string
 }
 
+/** One explicit filesystem/execution location for a fleet-global project identity. */
+export interface ProjectReplica {
+  id: string
+  projectId: string
+  kind: 'local' | 'remote'
+  /** Present only for a remote replica. The id is the paired hub identity, never a display label. */
+  siteId?: string
+  siteLabel?: string
+  /** Stable root id advertised by the target hub. Absolute remote paths are never caller supplied. */
+  rootId?: string
+  environment: {
+    id: string
+    kind: 'host' | 'wsl'
+    label?: string
+    distro?: string
+  }
+  /** Host path for local projects and target-advertised path for remote replicas. */
+  path: string
+  isPrimary: boolean
+  state: 'ready' | 'registered' | 'unavailable'
+  headCommit?: string
+  headRef?: string
+  createdAt: string
+  updatedAt: string
+}
+
 export type SessionStatus = 'starting' | 'active' | 'idle' | 'stopped' | 'error'
 export type DelegatedAuthority = 'commit' | 'push'
 export type RemoteDeviceCapability = 'read' | 'write' | 'terminal'
@@ -91,6 +117,8 @@ export interface SessionRecord {
   /** Version of the app-level Overseer contract last materialized for this durable conversation. */
   overseerCapabilityVersion?: number
   projectId?: string
+  /** Stable project location used by this chat. Legacy sessions are backfilled to the local primary. */
+  projectReplicaId?: string
   cwd: string
   repo?: string
   worktree?: string

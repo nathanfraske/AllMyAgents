@@ -19,7 +19,10 @@ the mapped Site/HTTP route only as a compatibility fallback.
    compatibility with an older peer and are never returned by a connection-list API or agent tool.
 4. In a chat, open **Devices**, select the exact target roots and operations, and save. This is a durable
    per-chat operator grant. Fleet pairing and the chat's Safe/Edits/Full mode do not imply it.
-5. The agent can discover only its granted device/root labels and opaque IDs, then use:
+5. In **Project Overview / Locations**, attach an advertised root when it represents a checkout or test
+   environment for that logical project. This is project topology, not an authority grant: the session still
+   needs the per-chat grant from step 4 before it can use the root.
+6. The agent can discover only its granted device/root labels and opaque IDs, then use:
    `remote_ping`, `remote_inspect_environment`, `remote_list_files`, `remote_read_file`,
    `remote_create_directory`, `remote_write_file`, and `remote_exec`. A folder transfer mirrors its
    directory tree with `remote_create_directory` before writing the contained files; empty directories
@@ -27,6 +30,31 @@ the mapped Site/HTTP route only as a compatibility fallback.
 
 Revoking a chat grant takes effect on its next tool call. Disabling the target policy, deleting a root, or
 removing a root capability also fails closed immediately, even if a source chat still has an older grant.
+
+## Project locations and attributed runs
+
+Every existing project is upgraded in place with one deterministic primary local location. WSL projects keep
+their distro-native path and concrete distro as part of that identity. Attaching a remote location accepts only
+a paired `siteId` and a stable root id; the hub resolves the label, path, and environment from the target's live
+capability response, so a browser cannot manufacture a remote path or claim capabilities the target did not
+advertise. Removing a project also removes its location registry, while removing the primary local location is
+refused.
+
+A `remote_exec` call receives a durable run id only when all three facts agree: the chat belongs to a project,
+the target site/root is explicitly attached to that project, and the same chat separately has a terminal grant
+for that root. The source hub records the project, replica, immutable agent/session id, account id, command hash,
+bounded command summary, base commit when known, result, failure stage, exit code, and telemetry. The target hub
+records the authenticated source hub and source-supplied correlation ids; those fields are audit metadata and do
+not grant target-side authority. Project Overview polls the durable registry and run ledger, so topology changes
+made outside that browser and completed remote runs converge without a reload.
+
+If the source hub restarts before it observes a remote result, the active hub owner closes that run as
+`cancelled` at the `source-restart` stage instead of inventing a success or failure. A standby hub never
+reconciles those rows while the active owner may still be running them.
+
+This first runner slice deliberately does not imply source synchronization, reservations, streamed output,
+resource isolation, or Git admission. Those remain later protocol layers; a registered location is an honest
+placement fact, not a claim that its checkout is current.
 
 ## Security boundary
 

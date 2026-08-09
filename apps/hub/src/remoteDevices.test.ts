@@ -160,7 +160,20 @@ describe('RemoteDeviceController', () => {
         token: localToken,
       })
       if (envelope.operation === 'device_capabilities') return capabilities
-      if (envelope.operation === 'device_action') return { ok: true, bytes: 512, content: 'remote data' }
+      if (envelope.operation === 'device_action') {
+        expect(envelope.payload).toMatchObject({
+          actor: {
+            sessionId: 'session-a',
+            profileId: 'profile-a',
+            runId: 'run-a',
+            projectId: 'project-a',
+            replicaId: 'replica-a',
+            agentId: 'agent-a',
+            baseCommit: 'abc123',
+          },
+        })
+        return { ok: true, bytes: 512, content: 'remote data' }
+      }
       throw new Error(`unexpected operation ${envelope.operation}`)
     })
     const bridge = {
@@ -181,7 +194,15 @@ describe('RemoteDeviceController', () => {
     }])
     await expect(controller.execute('peerhub', {
       op: 'read', rootId: 'root-one', path: 'fixture.txt',
-    }, { sessionId: 'session-a', profileId: 'profile-a' })).resolves.toMatchObject({
+    }, {
+      sessionId: 'session-a',
+      profileId: 'profile-a',
+      runId: 'run-a',
+      projectId: 'project-a',
+      replicaId: 'replica-a',
+      agentId: 'agent-a',
+      baseCommit: 'abc123',
+    })).resolves.toMatchObject({
       ok: true,
       content: 'remote data',
       telemetry: { routeMs: 0, roundTripMs: expect.any(Number), transferBytes: 512 },

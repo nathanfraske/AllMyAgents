@@ -131,6 +131,13 @@ Replica  { replicaId, projectId, siteId, environmentId, path, head, syncState }
 Run      { runId, projectId, replicaId, agentId, sessionId, baseCommit, grantId }
 ```
 
+Implementation status (2026-08-08): the first compatibility slice now exists. Each legacy/current project has
+a deterministic primary local replica, operators can attach paired target roots as explicit remote replicas,
+and remote terminal calls on an attached root produce a durable `runId` tied to project, replica, immutable
+agent/session, account, base commit, result, and transport telemetry. Project Overview exposes Locations and
+recent Testbed runs. Registration does not yet synchronize Git, reserve a node, transfer dirty state, or admit
+results; those remain the next slices below.
+
 - The control hub owns the project/team/task/policy graph. Git remains the normal source of truth for code.
 - Every execution device keeps its own native clone and per-run worktree. Do not put an active Git worktree
   on SMB, Syncthing, or another multi-writer shared filesystem; network latency, file locking, WSL path

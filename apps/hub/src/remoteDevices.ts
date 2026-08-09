@@ -227,6 +227,8 @@ export type RemoteDeviceAction =
 
 export interface RemoteDeviceActionResult {
   ok: boolean
+  /** Source-hub durable run identity when this action targeted an attached project replica. */
+  runId?: string
   error?: string
   failure?: RemoteDeviceFailure
   telemetry?: RemoteDeviceTelemetry
@@ -242,6 +244,16 @@ export interface RemoteDeviceActionResult {
   exitCode?: number | null
   signal?: string | null
   timedOut?: boolean
+}
+
+export interface RemoteDeviceActor {
+  sessionId: string
+  profileId: string
+  runId?: string
+  projectId?: string
+  replicaId?: string
+  agentId?: string
+  baseCommit?: string
 }
 
 function inside(root: string, target: string): boolean {
@@ -922,7 +934,7 @@ export class RemoteDeviceController {
     return this.request<DeviceExecutorCapabilities>(siteId, '/api/device-executor', 'GET')
   }
 
-  async execute(siteId: string, action: RemoteDeviceAction, actor: { sessionId: string; profileId: string }): Promise<RemoteDeviceActionResult> {
+  async execute(siteId: string, action: RemoteDeviceAction, actor: RemoteDeviceActor): Promise<RemoteDeviceActionResult> {
     const timeout = action.op === 'exec'
       ? Math.min(Number(action.timeoutMs) || 30_000, MAX_COMMAND_TIMEOUT_MS) + 10_000
       : 15_000
