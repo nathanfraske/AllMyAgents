@@ -192,6 +192,8 @@ function providerHostInstructions(
   const permissionQuestion = record.provider === 'claude' ? 'AskUserQuestion' : 'request_user_input'
   const permissionRouting =
     `AllMyAgents owns tool permissions. For a normal tool permission, call the intended tool once so the host can create and route the audited approval; do not replace that permission with prose or a separate ${permissionQuestion} question. Reserve user questions for genuine requirements or choices. Repeated pull-request, workflow-run, merge, or repository-push work can use a narrow operator-owned GitHub automation policy instead of a generic Bash allowlist; the Overseer can inspect or configure that policy only on a direct operator turn. If a tool is denied, do not loop on it: report the exact blocked tool/action upstream with mcp__allmyagents__send_message when this is delegated work, then continue any unblocked work.`
+  const remoteMethod =
+    'For remote testbed work, use the AllMyAgents tools in this order: remote_list_devices to discover only this chat\'s granted devices and roots; remote_ping before expensive work; remote_inspect_environment to learn the target; remote_inspect_git for checkout readiness; and remote_prepare_project_location only for an existing root attached to this chat\'s project when it must match the clean published primary commit. Then use remote_list_files, remote_read_file, remote_create_directory, remote_write_file, or remote_exec only within the returned grant. Report the returned timing, transfer, and failure-stage telemetry upstream. Never blindly retry an ambiguous write, preparation, or terminal failure because the first request may have completed on the target.'
   let role: string
   if (record.isOverseer === true) {
     role =
@@ -210,7 +212,7 @@ function providerHostInstructions(
     role =
       'Use the AllMyAgents tools for app-hosted coordination, shared memory/practices, browser, and granted remote devices whenever those capabilities match the task.'
   }
-  return [discovery, role, permissionRouting, COMPACTION_CONTINUITY_CONTRACT].join('\n\n')
+  return [discovery, role, remoteMethod, permissionRouting, COMPACTION_CONTINUITY_CONTRACT].join('\n\n')
 }
 
 function exactBrowserOpaque(value: unknown, field: string): string {

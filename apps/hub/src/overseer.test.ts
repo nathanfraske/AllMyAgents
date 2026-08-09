@@ -533,16 +533,20 @@ describe('application Overseer authority', () => {
       expect(spec.claudeSystemPrompt).toMatch(/mcp__allmyagents__overseer_control/u)
       expect(spec.claudeSystemPrompt).toMatch(/fleet-wide/u)
       expect(spec.claudeSystemPrompt).toMatch(/AskUserQuestion/u)
+      expect(spec.claudeSystemPrompt).toMatch(/remote_list_devices.*remote_ping.*remote_inspect_environment.*remote_inspect_git.*remote_prepare_project_location/su)
+      expect(spec.claudeSystemPrompt).toMatch(/Never blindly retry an ambiguous write, preparation, or terminal failure/u)
       expect(spec.claudeSystemPrompt).toMatch(/COMPACTION CONTINUITY CONTRACT/u)
       expect(spec.claudeSystemPrompt).toMatch(/active objective.*current project.*current slice/su)
       expect(spec.claudeSystemPrompt).toMatch(/exact next useful action/u)
     }
-    expect(calls.find(([, prompt]) => prompt === 'check the team')?.[0].claudeSystemPrompt).toMatch(
-      /decide_child_approval/u,
-    )
-    expect(calls.find(([, prompt]) => prompt === 'report status')?.[0].claudeSystemPrompt).toMatch(
-      /report a real scope or permission block upstream/u,
-    )
+    const managerPrompt = calls.find(([, prompt]) => prompt === 'check the team')?.[0].claudeSystemPrompt
+    const childPrompt = calls.find(([, prompt]) => prompt === 'report status')?.[0].claudeSystemPrompt
+    expect(managerPrompt).toMatch(/decide_child_approval/u)
+    expect(childPrompt).toMatch(/report a real scope or permission block upstream/u)
+    for (const prompt of [managerPrompt, childPrompt]) {
+      expect(prompt).toMatch(/remote_list_devices.*remote_ping.*remote_inspect_environment.*remote_inspect_git.*remote_prepare_project_location/su)
+      expect(prompt).toMatch(/Report the returned timing, transfer, and failure-stage telemetry upstream/u)
+    }
   })
 
   it('gives Codex live developer instructions with bounded fleet/team topology and provider discipline', async () => {
@@ -584,6 +588,7 @@ describe('application Overseer authority', () => {
     const overseerSpec = calls.find(([, prompt]) => prompt === 'Check Project Alpha and tell me its exact status.')?.[0]
     expect(managerSpec?.claudeSystemPrompt).toBeUndefined()
     expect(managerSpec?.codexDeveloperInstructions).toMatch(/Codex-manager discipline/u)
+    expect(managerSpec?.codexDeveloperInstructions).toMatch(/remote_list_devices.*remote_prepare_project_location/su)
     expect(managerSpec?.codexDeveloperInstructions).toMatch(/COMPACTION CONTINUITY CONTRACT/u)
     expect(managerSpec?.codexDeveloperInstructions).toMatch(/"activeTeamId":"team-live"/u)
     expect(managerSpec?.codexDeveloperInstructions).toMatch(/"id":"team-old".*"state":"stashed"/u)
