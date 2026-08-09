@@ -20,6 +20,8 @@ and closes two Windows-only release-path races found by the exact-tag durability
   AllMyAgents process and no desktop log exist. A real application/bootstrap failure is never retried or masked.
 - Windows P0 artifacts now retain shortcut resolution, installed-process/port state, and the current desktop log
   even when health never arrives, so a failed clean-install launch remains diagnosable.
+- Windows remote-device tests now terminate the exact Git child tree they spawn. They no longer leak
+  `git-daemon.exe` listeners or leave an otherwise green release preflight waiting forever on an inherited pipe.
 
 ## v0.1.23-alpha.26 — 2026-08-09
 

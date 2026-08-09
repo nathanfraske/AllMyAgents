@@ -30,7 +30,20 @@ afterEach(async () => {
   vi.unstubAllGlobals()
   for (const child of children.splice(0)) {
     if (child.exitCode === null) {
-      try { child.kill() } catch { /* already exited */ }
+      try {
+        if (process.platform === 'win32' && child.pid) {
+          // Git for Windows starts git-daemon.exe beneath the git.exe wrapper. `child.kill()` only
+          // terminates that wrapper, leaving the daemon alive with the test runner's inherited pipe.
+          // Vitest then prints a green summary but never exits, so release preflight hangs forever and
+          // each run leaks another listener. Kill the exact spawned tree while its parent relationship
+          // is still intact; this command never targets a discovered or name-matched process.
+          execFileSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' })
+        } else {
+          child.kill()
+        }
+      } catch {
+        /* already exited */
+      }
       await Promise.race([
         new Promise<void>((resolve) => child.once('close', () => resolve())),
         new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
