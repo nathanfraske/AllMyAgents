@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { once } from 'node:events'
+import { execFileSync } from 'node:child_process'
 import Database from 'better-sqlite3'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ProjectStore } from './projects.js'
@@ -20,6 +21,15 @@ describe('project replica API', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-project-replica-api-'))
     const projectDir = path.join(root, 'project')
     fs.mkdirSync(projectDir)
+    execFileSync('git', ['-C', projectDir, 'init'])
+    execFileSync('git', ['-C', projectDir, 'config', 'user.email', 'test@example.invalid'])
+    execFileSync('git', ['-C', projectDir, 'config', 'user.name', 'Test'])
+    execFileSync('git', ['-C', projectDir, 'checkout', '-b', 'main'])
+    execFileSync('git', ['-C', projectDir, 'remote', 'add', 'origin', 'https://github.com/acme/fleet-project.git'])
+    fs.writeFileSync(path.join(projectDir, 'tracked.txt'), 'primary')
+    execFileSync('git', ['-C', projectDir, 'add', 'tracked.txt'])
+    execFileSync('git', ['-C', projectDir, 'commit', '-m', 'fixture'])
+    const primaryHead = execFileSync('git', ['-C', projectDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
     const db = new Database(path.join(root, 'hub.db'))
     const projects = new ProjectStore(db)
     const project = projects.create('Fleet project', projectDir)
@@ -42,7 +52,7 @@ describe('project replica API', () => {
       environments: [{ id: 'host', kind: 'host' as const, label: 'host', platform: 'linux', shell: '/bin/sh' }],
       roots: [{ id: 'root-a', label: 'Checkout', path: '/srv/project', read: true, write: true, terminal: true }],
     }))
-    const execute = vi.fn(async () => ({
+    const execute = vi.fn(async (_siteId: string, action: { op: string; headCommit?: string; repository?: string }) => ({
       ok: true,
       git: {
         status: 'ready' as const,
@@ -50,9 +60,10 @@ describe('project replica API', () => {
         isRepository: true,
         complete: true,
         clean: true,
-        detached: false,
-        headCommit: 'a'.repeat(40),
-        headRef: 'main',
+        detached: action.op === 'git_sync',
+        headCommit: action.headCommit ?? 'a'.repeat(40),
+        ...(action.op === 'git_sync' ? {} : { headRef: 'main' }),
+        repository: action.repository ?? 'github.com/acme/fleet-project',
         trackedChanges: 0,
         untrackedFiles: 0,
         observedAt: new Date().toISOString(),
@@ -69,7 +80,7 @@ describe('project replica API', () => {
       port: 0,
       defaultCwd: root,
       profilesDir: root,
-      journal: { append: vi.fn() } as never,
+      journal: { append: vi.fn(), atomic: <T>(fn: () => T) => fn() } as never,
       sessions: { list: () => [], listProfiles: () => [] } as never,
       profiles: [],
       approvals: {} as never,
@@ -94,7 +105,7 @@ describe('project replica API', () => {
       configPath: path.join(root, 'config.json'),
       remoteDevices,
     } satisfies ServerOptions)
-    if (!server.listening) await once(server, 'listening')
+    if (!server.address()) await once(server, 'listening')
     const port = (server.address() as { port: number }).port
     const base = `http://127.0.0.1:${port}`
     cleanups.push(async () => {
@@ -180,5 +191,42 @@ describe('project replica API', () => {
     })
     expect(removeReserved.status).toBe(409)
     expect(await removeReserved.json()).toMatchObject({ error: expect.stringContaining('reserved by agent') })
+
+    const prepareReserved = await fetch(`${base}/api/projects/${project.id}/replicas/${remoteReplica.id}/prepare`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${deviceToken}`, 'content-type': 'application/json' },
+    })
+    expect(prepareReserved.status).toBe(409)
+    expect(await prepareReserved.json()).toMatchObject({ error: expect.stringContaining('reserved by agent') })
+
+    testbedReservations.release(reservation.id, 'test-finished')
+    const prepared = await fetch(`${base}/api/projects/${project.id}/replicas/${remoteReplica.id}/prepare`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${deviceToken}`, 'content-type': 'application/json' },
+    })
+    expect(prepared.status).toBe(200)
+    expect(await prepared.json()).toMatchObject({
+      id: remoteReplica.id,
+      state: 'ready',
+      headCommit: primaryHead,
+      readiness: {
+        status: 'ready',
+        clean: true,
+        detached: true,
+        repository: 'github.com/acme/fleet-project',
+      },
+    })
+    expect(execute).toHaveBeenCalledWith(
+      'site-a',
+      {
+        op: 'git_sync',
+        rootId: 'root-a',
+        repository: 'github.com/acme/fleet-project',
+        headRef: 'main',
+        headCommit: primaryHead,
+      },
+      expect.objectContaining({ projectId: project.id, replicaId: remoteReplica.id, agentId: 'operator' }),
+    )
+    expect(testbedReservations.active(remoteReplica.id)).toBeUndefined()
   })
 })

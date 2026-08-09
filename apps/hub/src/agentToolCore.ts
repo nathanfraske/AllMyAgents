@@ -1090,7 +1090,7 @@ const remoteInspectGit = defineTool({
     return [
       `Git ${git.status}; repository=${git.isRepository ? 'yes' : 'no'}; complete=${git.complete ? 'yes' : 'no'}`,
       git.isRepository
-        ? `HEAD ${git.headCommit ?? 'unborn/unknown'}; ref ${git.headRef ?? '(detached or unknown)'}; tracked changes ${git.trackedChanges ?? 'unknown'}; untracked files ${git.untrackedFiles ?? 'unknown'}`
+        ? `repository ${git.repository ?? '(safe origin unavailable)'}; HEAD ${git.headCommit ?? 'unborn/unknown'}; ref ${git.headRef ?? '(detached or unknown)'}; tracked changes ${git.trackedChanges ?? 'unknown'}; untracked files ${git.untrackedFiles ?? 'unknown'}`
         : `Git available=${git.gitAvailable ? 'yes' : 'no'}`,
       ...(git.error ? [`note: ${git.error}`] : []),
       remoteTelemetry(result),

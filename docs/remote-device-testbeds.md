@@ -62,13 +62,28 @@ reported as an unknown outcome rather than assumed stopped.
 
 Project Overview can run a fixed-argument Git readiness probe against local or remote locations. Agents with
 an explicit read grant can use the same probe through `remote_inspect_git`. It records HEAD/ref and a bounded
-clean/dirty count without granting terminal access, taking a Git lock, fetching, checking out, resetting, or
-copying files. A timed-out or truncated inspection is reported as incomplete and is never treated as clean.
+clean/dirty count plus a credential-free origin identity without granting terminal access, taking a Git lock,
+fetching, checking out, resetting, or copying files. Raw remote URLs are never stored or returned. A timed-out
+or truncated inspection is reported as incomplete and is never treated as clean.
 
-This runner slice deliberately does not imply source synchronization, streamed output, resource isolation,
-or Git admission. Readiness and exclusive execution now exist, but clone/fetch/checkout, dirty-work handling,
-and accepting results remain later protocol layers; a registered location is an honest placement fact, not a
-claim that its checkout is current.
+For an existing attached remote checkout, **Prepare** selects the primary location's current clean HEAD, proves
+that both locations have the same sanitized origin identity, fetches only the primary's named branch, proves
+that branch advertises the exact selected commit, and checks the target out detached at that commit. Preparation
+holds the same durable location lease as an attributed run and is idempotent when the target already matches.
+It refuses dirty/incomplete trees, detached primaries, missing or unsafe origins, mismatched repositories,
+unpublished commits, active runs, and failed post-checkout verification. It never resets, cleans, stashes,
+updates submodules, or accepts caller-supplied Git arguments.
+
+Preparation requires the target root's **terminal** capability. Git checkout can invoke configured credential
+helpers or content filters even when AllMyAgents supplies only fixed argv; classifying it as a mere file write
+would create an authority escalation. Repository hooks and external remote helpers are explicitly disabled as
+additional defense. The operator-facing Project Overview is the only preparation caller in this slice; a later
+agent tool will derive the same immutable preparation request from project topology rather than accepting a
+model-selected repository/ref/commit.
+
+This runner slice still does not clone an absent checkout, transmit uncommitted work, stream command output,
+isolate CPU/GPU/memory, or accept results back into the primary. Those remain later protocol layers; a
+registered location is an honest placement fact, not a claim that its checkout is current.
 
 ## Security boundary
 

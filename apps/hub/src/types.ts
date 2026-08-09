@@ -39,6 +39,8 @@ export interface ProjectReplicaReadiness {
   complete: boolean
   clean?: boolean
   detached?: boolean
+  /** Credential-free origin identity (host/path), when one can be derived safely. */
+  repository?: string
   trackedChanges?: number
   untrackedFiles?: number
   checkedAt: string

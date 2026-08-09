@@ -1,7 +1,8 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
+import net from 'node:net'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { verifyDirectHubEnvelope } from './directHubProtocol.js'
 import type { MyOwnMeshRpcBridge } from './myOwnMeshRpc.js'
@@ -9,6 +10,7 @@ import {
   DeviceExecutor,
   FleetConnectionStore,
   RemoteDeviceController,
+  normalizeGitRemoteIdentity,
   parseRemoteWslEnvironments,
   remoteCapabilityForAction,
   wslUncPath,
@@ -16,6 +18,7 @@ import {
 } from './remoteDevices.js'
 
 const tempDirs: string[] = []
+const children: ChildProcess[] = []
 
 function tempDir(): string {
   const value = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-remote-device-'))
@@ -23,10 +26,43 @@ function tempDir(): string {
   return value
 }
 
-afterEach(() => {
+afterEach(async () => {
   vi.unstubAllGlobals()
+  for (const child of children.splice(0)) {
+    if (child.exitCode === null) {
+      try { child.kill() } catch { /* already exited */ }
+      await Promise.race([
+        new Promise<void>((resolve) => child.once('close', () => resolve())),
+        new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
+      ])
+    }
+  }
   for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true })
 })
+
+async function unusedPort(): Promise<number> {
+  const server = net.createServer()
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => resolve())
+  })
+  const address = server.address()
+  const port = typeof address === 'object' && address ? address.port : 0
+  await new Promise<void>((resolve) => server.close(() => resolve()))
+  return port
+}
+
+async function waitForGitRemote(url: string): Promise<void> {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    try {
+      execFileSync('git', ['ls-remote', url], { stdio: 'ignore', timeout: 2_000 })
+      return
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+  }
+  throw new Error('git daemon did not become ready')
+}
 
 describe('DeviceExecutor target policy', () => {
   it('classifies directory creation as a write at every grant boundary', () => {
@@ -34,6 +70,9 @@ describe('DeviceExecutor target policy', () => {
     expect(remoteCapabilityForAction({ op: 'write', rootId: 'root', path: 'file', content: '' })).toBe('write')
     expect(remoteCapabilityForAction({ op: 'list', rootId: 'root' })).toBe('read')
     expect(remoteCapabilityForAction({ op: 'git_inspect', rootId: 'root' })).toBe('read')
+    expect(remoteCapabilityForAction({
+      op: 'git_sync', rootId: 'root', repository: 'example.test/acme/repo', headRef: 'main', headCommit: 'a'.repeat(40),
+    })).toBe('terminal')
     expect(remoteCapabilityForAction({ op: 'exec', rootId: 'root', command: 'true' })).toBe('terminal')
   })
 
@@ -178,6 +217,78 @@ describe('DeviceExecutor target policy', () => {
       ok: false,
       error: 'terminal access is not enabled for this root.',
     })
+  })
+
+  it('prepares a clean matching checkout at the exact commit advertised by the primary branch', async () => {
+    const dir = tempDir()
+    const origin = path.join(dir, 'origin.git')
+    const source = path.join(dir, 'source')
+    const target = path.join(dir, 'target')
+    execFileSync('git', ['init', '--bare', origin])
+    execFileSync('git', ['clone', origin, source])
+    execFileSync('git', ['-C', source, 'config', 'user.email', 'test@example.invalid'])
+    execFileSync('git', ['-C', source, 'config', 'user.name', 'Test'])
+    execFileSync('git', ['-C', source, 'checkout', '-b', 'main'])
+    fs.writeFileSync(path.join(source, 'tracked.txt'), 'one')
+    execFileSync('git', ['-C', source, 'add', 'tracked.txt'])
+    execFileSync('git', ['-C', source, 'commit', '-m', 'first'])
+    execFileSync('git', ['-C', source, 'push', '-u', 'origin', 'main'])
+    execFileSync('git', ['--git-dir', origin, 'symbolic-ref', 'HEAD', 'refs/heads/main'])
+
+    const port = await unusedPort()
+    const daemon = spawn('git', [
+      'daemon', '--reuseaddr', '--export-all', '--listen=127.0.0.1', `--port=${port}`,
+      `--base-path=${dir}`, dir,
+    ], { windowsHide: true, stdio: 'ignore' })
+    children.push(daemon)
+    const remoteUrl = `git://127.0.0.1:${port}/origin.git`
+    await waitForGitRemote(remoteUrl)
+    execFileSync('git', ['clone', remoteUrl, target])
+    const oldHead = execFileSync('git', ['-C', target, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+
+    fs.writeFileSync(path.join(source, 'tracked.txt'), 'two')
+    execFileSync('git', ['-C', source, 'add', 'tracked.txt'])
+    execFileSync('git', ['-C', source, 'commit', '-m', 'second'])
+    execFileSync('git', ['-C', source, 'push', 'origin', 'main'])
+    execFileSync('git', ['-C', source, 'remote', 'set-url', 'origin', remoteUrl])
+    const headCommit = execFileSync('git', ['-C', source, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+    const repository = normalizeGitRemoteIdentity(remoteUrl)!
+
+    const executor = new DeviceExecutor(path.join(dir, 'policy.json'))
+    const policy = executor.update({
+      enabled: true,
+      roots: [{ id: '', label: 'repository', path: target, read: false, write: false, terminal: true }],
+    })
+    const rootId = policy.roots[0]!.id
+    await expect(executor.execute({
+      op: 'git_sync', rootId, repository: 'github.com/other/repository', headRef: 'main', headCommit,
+    })).resolves.toMatchObject({ ok: false, failure: { code: 'REPOSITORY_MISMATCH' } })
+    fs.writeFileSync(path.join(target, 'untracked.txt'), 'keep me')
+    await expect(executor.execute({
+      op: 'git_sync', rootId, repository, headRef: 'main', headCommit,
+    })).resolves.toMatchObject({ ok: false, failure: { code: 'DIRTY_CHECKOUT' } })
+    fs.unlinkSync(path.join(target, 'untracked.txt'))
+    await expect(executor.execute({
+      op: 'git_sync', rootId, repository, headRef: 'main', headCommit: oldHead,
+    })).resolves.toMatchObject({ ok: false, failure: { code: 'SOURCE_REVISION_NOT_PUBLISHED' } })
+    await expect(executor.execute({
+      op: 'git_sync', rootId, repository, headRef: 'main', headCommit: 'b'.repeat(40),
+    })).resolves.toMatchObject({ ok: false, failure: { code: 'SOURCE_REVISION_NOT_PUBLISHED' } })
+    const result = await executor.execute({
+      op: 'git_sync', rootId, repository, headRef: 'main', headCommit,
+    })
+    expect(result).toMatchObject({
+      ok: true,
+      git: { status: 'ready', clean: true, detached: true, headCommit, repository },
+    })
+    expect(fs.readFileSync(path.join(target, 'tracked.txt'), 'utf8')).toBe('two')
+  }, 45_000)
+
+  it('never exposes credentials while comparing remote repository identities', () => {
+    expect(normalizeGitRemoteIdentity('https://secret-user:secret-pass@GitHub.com/Acme/Repo.git'))
+      .toBe('github.com/Acme/Repo')
+    expect(normalizeGitRemoteIdentity('git@github.com:Acme/Repo.git')).toBe('github.com/Acme/Repo')
+    expect(normalizeGitRemoteIdentity('file:///tmp/repo.git')).toBeUndefined()
   })
 })
 

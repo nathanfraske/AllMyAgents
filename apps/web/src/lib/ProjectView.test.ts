@@ -13,6 +13,7 @@ const apiMock = vi.hoisted(() => ({
   addProjectReplica: vi.fn(),
   removeProjectReplica: vi.fn(),
   inspectProjectReplica: vi.fn(),
+  prepareProjectReplica: vi.fn(),
   send: vi.fn(),
   updateProject: vi.fn(),
 }))
@@ -142,6 +143,7 @@ beforeEach(() => {
       status: 'ready', gitAvailable: true, isRepository: true, complete: true, clean: true, checkedAt: now,
     },
   }))
+  apiMock.prepareProjectReplica.mockReset()
   apiMock.send.mockReset().mockResolvedValue({ ok: true })
   apiMock.updateProject.mockReset().mockImplementation(async (_id: string, patch: { name: string }) => ({
     ...project,
@@ -234,6 +236,47 @@ beforeEach(() => {
 afterEach(cleanup)
 
 describe('ProjectView', () => {
+  it('prepares a remote location at the primary revision and shows convergence', async () => {
+    const primary: ProjectReplicaInfo = {
+      ...localReplica,
+      headCommit: 'a'.repeat(40),
+      headRef: 'main',
+      readiness: {
+        status: 'ready', gitAvailable: true, isRepository: true, complete: true, clean: true,
+        repository: 'github.com/acme/alpha', checkedAt: now,
+      },
+    }
+    const remote: ProjectReplicaInfo = {
+      ...localReplica,
+      id: 'replica-remote',
+      kind: 'remote',
+      siteId: 'laptop',
+      siteLabel: 'Laptop',
+      rootId: 'root-project',
+      isPrimary: false,
+      headCommit: 'b'.repeat(40),
+      headRef: 'main',
+      readiness: {
+        status: 'ready', gitAvailable: true, isRepository: true, complete: true, clean: true,
+        repository: 'github.com/acme/alpha', checkedAt: now,
+      },
+    }
+    apiMock.projectReplicas.mockResolvedValue([primary, remote])
+    apiMock.prepareProjectReplica.mockResolvedValue({
+      ...remote,
+      headCommit: primary.headCommit,
+      headRef: undefined,
+      readiness: { ...remote.readiness!, detached: true, checkedAt: now },
+    })
+
+    render(ProjectView, { props: { projectId: project.id } })
+
+    expect(await screen.findByText(/Different revision.*bbbbbbbb/)).toBeTruthy()
+    await fireEvent.click(screen.getByRole('button', { name: /Prepare Laptop at the primary revision/i }))
+    await waitFor(() => expect(apiMock.prepareProjectReplica).toHaveBeenCalledWith(project.id, remote.id))
+    expect(await screen.findByText(/Matches primary.*aaaaaaaa/)).toBeTruthy()
+  })
+
   it('shows explicit project locations, attributed runs, and attaches an advertised testbed root', async () => {
     apiMock.projectTestbedRuns.mockResolvedValue([{
       id: 'run-12345678',

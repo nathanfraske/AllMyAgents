@@ -19,7 +19,7 @@ import {
 } from './journal.js'
 import type { ProjectStore } from './projects.js'
 import type { TestbedRunStore } from './testbedRuns.js'
-import type { TestbedReservationStore } from './testbedReservations.js'
+import { TestbedReservationConflictError, type TestbedReservationStore } from './testbedReservations.js'
 import type { SessionManager } from './sessions.js'
 import type { UsageMonitor } from './usage.js'
 import type { MeshSite } from './meshSite.js'
@@ -549,6 +549,7 @@ function storedReplicaReadiness(
     complete: git.complete,
     ...(git.clean === undefined ? {} : { clean: git.clean }),
     ...(git.detached === undefined ? {} : { detached: git.detached }),
+    ...(git.repository ? { repository: git.repository } : {}),
     ...(git.trackedChanges === undefined ? {} : { trackedChanges: git.trackedChanges }),
     ...(git.untrackedFiles === undefined ? {} : { untrackedFiles: git.untrackedFiles }),
     checkedAt: git.observedAt,
@@ -687,7 +688,7 @@ export function startServer(opts: ServerOptions): http.Server {
         throw new Error('action must be an object')
       }
       const action = content.action as RemoteDeviceAction
-      if (!['probe', 'inspect', 'git_inspect', 'list', 'read', 'mkdir', 'write', 'exec'].includes(action.op)) throw new Error('unknown remote device operation')
+      if (!['probe', 'inspect', 'git_inspect', 'git_sync', 'list', 'read', 'mkdir', 'write', 'exec'].includes(action.op)) throw new Error('unknown remote device operation')
       const actor = content.actor && typeof content.actor === 'object' && !Array.isArray(content.actor)
         ? content.actor as Record<string, unknown>
         : {}
@@ -1319,6 +1320,170 @@ export function startServer(opts: ServerOptions): http.Server {
           }
         }
         json(res, projects.updateReplicaReadiness(projectId, replicaId, storedReplicaReadiness(git)))
+        return
+      }
+      const projectReplicaPrepareMatch = /^\/api\/projects\/([^/]+)\/replicas\/([^/]+)\/prepare$/.exec(url.pathname)
+      if (method === 'POST' && projectReplicaPrepareMatch) {
+        if (!authed) {
+          json(res, { error: 'operator device token required' }, 403)
+          return
+        }
+        const projectId = decodeURIComponent(projectReplicaPrepareMatch[1] as string)
+        const replicaId = decodeURIComponent(projectReplicaPrepareMatch[2] as string)
+        const project = projects.get(projectId)
+        const replica = projects.getReplica(replicaId)
+        const primary = projects.primaryReplica(projectId)
+        if (!project || !replica || replica.projectId !== projectId || !primary) {
+          json(res, { error: 'project location not found' }, 404)
+          return
+        }
+        if (replica.kind !== 'remote' || !replica.siteId || !replica.rootId) {
+          json(res, { error: 'Only an attached remote project location can be prepared.' }, 409)
+          return
+        }
+        if (!remoteDevices || !testbedReservations) {
+          json(res, { error: 'remote project preparation is unavailable' }, 503)
+          return
+        }
+        let reservationId: string
+        try {
+          reservationId = journal.atomic(() => {
+            const acquired = testbedReservations.acquire({
+              projectId,
+              replicaId,
+              sessionId: 'operator:project-location',
+              agentId: 'operator',
+              ttlMs: 15 * 60_000,
+            })
+            for (const expired of acquired.expired) {
+              journal.append(expired.sessionId, 'testbed-reservation/expired', {
+                reservationId: expired.id,
+                projectId: expired.projectId,
+                replicaId: expired.replicaId,
+                agentId: expired.agentId,
+              })
+            }
+            journal.append(null, 'testbed-reservation/acquired', {
+              reservationId: acquired.reservation.id,
+              projectId,
+              replicaId,
+              agentId: 'operator',
+              operation: 'git-sync',
+              expiresAt: acquired.reservation.expiresAt,
+            })
+            journal.append(null, 'project/replica-prepare-started', {
+              projectId,
+              replicaId,
+              reservationId: acquired.reservation.id,
+              actor: 'operator',
+            })
+            return acquired.reservation.id
+          })
+        } catch (error) {
+          if (error instanceof TestbedReservationConflictError) {
+            json(res, { error: error.message }, 409)
+            return
+          }
+          throw error
+        }
+
+        let response: unknown
+        let responseStatus = 200
+        try {
+          const primaryGit = await inspectGitCheckout({
+            path: primary.path,
+            ...(primary.environment.kind === 'wsl' && primary.environment.distro
+              ? { environment: { kind: 'wsl' as const, distro: primary.environment.distro } }
+              : {}),
+          })
+          projects.updateReplicaReadiness(projectId, primary.id, storedReplicaReadiness(primaryGit))
+          if (
+            primaryGit.status !== 'ready' || primaryGit.clean !== true || !primaryGit.complete ||
+            !primaryGit.repository || !primaryGit.headRef || !primaryGit.headCommit
+          ) {
+            journal.append(null, 'project/replica-prepare-failed', {
+              projectId,
+              replicaId,
+              reservationId,
+              code: 'PRIMARY_NOT_READY',
+              error: 'Primary location is not a complete clean checkout with a published branch identity.',
+            })
+            response = {
+              error: 'The primary location must be a complete clean checkout on a named branch with a credential-free origin identity.',
+            }
+            responseStatus = 409
+          } else {
+            const prepared = await remoteDevices.execute(replica.siteId, {
+              op: 'git_sync',
+              rootId: replica.rootId,
+              repository: primaryGit.repository,
+              headRef: primaryGit.headRef,
+              headCommit: primaryGit.headCommit,
+            }, {
+              sessionId: 'operator:project-location',
+              profileId: 'operator',
+              projectId,
+              replicaId,
+              agentId: 'operator',
+              baseCommit: primaryGit.headCommit,
+            })
+            const targetGit = prepared.git ?? {
+              status: 'unavailable' as const,
+              gitAvailable: false,
+              isRepository: false,
+              complete: false,
+              observedAt: new Date().toISOString(),
+              error: (prepared.error ?? 'Remote Git preparation could not be verified.').slice(0, 1_000),
+            }
+            const updated = projects.updateReplicaReadiness(projectId, replicaId, storedReplicaReadiness(targetGit))
+            if (prepared.ok) {
+              journal.append(null, 'project/replica-prepare-completed', {
+                projectId,
+                replicaId,
+                reservationId,
+                repository: primaryGit.repository,
+                headRef: primaryGit.headRef,
+                headCommit: primaryGit.headCommit,
+              })
+              response = updated
+            } else {
+              journal.append(null, 'project/replica-prepare-failed', {
+                projectId,
+                replicaId,
+                reservationId,
+                code: prepared.failure?.code ?? null,
+                error: prepared.error ?? 'unknown preparation failure',
+              })
+              response = { error: prepared.error ?? 'The remote location could not be prepared.', replica: updated }
+              responseStatus = prepared.failure?.stage === 'admission' || prepared.failure?.stage === 'target' ? 409 : 502
+            }
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          journal.append(null, 'project/replica-prepare-failed', {
+            projectId,
+            replicaId,
+            reservationId,
+            error: message.slice(0, 1_000),
+          })
+          response = { error: message }
+          responseStatus = 500
+        } finally {
+          journal.atomic(() => {
+            const released = testbedReservations.release(reservationId, 'project-prepare-finished')
+            if (released) {
+              journal.append(null, 'testbed-reservation/released', {
+                reservationId: released.id,
+                projectId,
+                replicaId,
+                agentId: 'operator',
+                operation: 'git-sync',
+                reason: released.reason,
+              })
+            }
+          })
+        }
+        json(res, response, responseStatus)
         return
       }
       const projectReplicaDeleteMatch = /^\/api\/projects\/([^/]+)\/replicas\/([^/]+)$/.exec(url.pathname)
@@ -2106,7 +2271,7 @@ export function startServer(opts: ServerOptions): http.Server {
           return
         }
         const action = body.action as RemoteDeviceAction
-        if (!['probe', 'inspect', 'git_inspect', 'list', 'read', 'mkdir', 'write', 'exec'].includes(action.op)) {
+        if (!['probe', 'inspect', 'git_inspect', 'git_sync', 'list', 'read', 'mkdir', 'write', 'exec'].includes(action.op)) {
           json(res, { error: 'unknown remote device operation' }, 400)
           return
         }

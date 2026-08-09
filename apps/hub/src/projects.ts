@@ -419,6 +419,7 @@ export class ProjectStore {
       complete: readiness.complete,
       ...(readiness.clean === undefined ? {} : { clean: readiness.clean }),
       ...(readiness.detached === undefined ? {} : { detached: readiness.detached }),
+      ...(readiness.repository ? { repository: readiness.repository.slice(0, 500) } : {}),
       ...(readiness.trackedChanges === undefined ? {} : { trackedChanges: readiness.trackedChanges }),
       ...(readiness.untrackedFiles === undefined ? {} : { untrackedFiles: readiness.untrackedFiles }),
       checkedAt: readiness.checkedAt,

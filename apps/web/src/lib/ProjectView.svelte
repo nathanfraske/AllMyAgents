@@ -39,6 +39,7 @@
   let locationPickerOpen = $state(false)
   let attachingLocation = $state('')
   let inspectingLocation = $state('')
+  let preparingLocation = $state('')
   let selectedMode = $state<ProjectViewMode>('overview')
   let peekOpen = $state(true)
   let modeProjectId = $state('')
@@ -169,6 +170,7 @@
       .filter((reservation) => reservation.state === 'active' && Date.parse(reservation.expiresAt) > Date.now())
       .map((reservation) => [reservation.replicaId, reservation]),
   ))
+  const primaryReplica = $derived(replicas.find((replica) => replica.isPrimary))
 
   async function toggleLocationPicker(): Promise<void> {
     locationPickerOpen = !locationPickerOpen
@@ -217,6 +219,18 @@
     replicas = replicas.map((candidate) => candidate.id === inspected.id ? inspected : candidate)
   }
 
+  async function prepareLocation(replica: ProjectReplicaInfo): Promise<void> {
+    preparingLocation = replica.id
+    topologyError = ''
+    const prepared = await api.prepareProjectReplica(projectId, replica.id).catch(() => null)
+    preparingLocation = ''
+    if (!prepared || 'error' in prepared) {
+      topologyError = prepared && 'error' in prepared ? prepared.error : 'The project location could not be prepared.'
+      return
+    }
+    replicas = replicas.map((candidate) => candidate.id === prepared.id ? prepared : candidate)
+  }
+
   function readinessLabel(replica: ProjectReplicaInfo): string {
     const readiness = replica.readiness
     if (!readiness) return 'Git readiness not checked'
@@ -228,6 +242,13 @@
     if (readiness.status === 'not-repository') return 'Not a Git checkout'
     if (readiness.status === 'unavailable') return 'Git unavailable'
     return 'Git readiness unknown'
+  }
+
+  function revisionLabel(replica: ProjectReplicaInfo): string {
+    if (replica.isPrimary || !replica.headCommit || !primaryReplica?.headCommit) return ''
+    return replica.headCommit === primaryReplica.headCommit
+      ? `Matches primary Â· ${replica.headCommit.slice(0, 8)}`
+      : `Different revision Â· ${replica.headCommit.slice(0, 8)}`
   }
 
   function reservationAgent(reservation: TestbedReservationInfo): string {
@@ -606,6 +627,7 @@
                 <strong>{replica.kind === 'local' ? 'This hub' : replica.siteLabel || replica.siteId}</strong>
                 <small>{replica.environment.label || replica.environment.kind} · {replica.path}</small>
                 <small class="git-readiness {replica.readiness?.status ?? 'unknown'}">{readinessLabel(replica)}</small>
+                {#if revisionLabel(replica)}<small class="revision-match">{revisionLabel(replica)}</small>{/if}
                 {#if reservation}
                   <small class="reservation">Reserved by {reservationAgent(reservation)} until {timeOf(reservation.expiresAt)}</small>
                 {/if}
@@ -613,11 +635,18 @@
               {#if replica.isPrimary}<span class="location-badge">primary</span>{/if}
               <button
                 class="location-inspect"
-                disabled={inspectingLocation !== ''}
+                disabled={inspectingLocation !== '' || preparingLocation !== ''}
                 aria-label={`Inspect Git readiness for ${replica.siteLabel || replica.path}`}
                 onclick={() => inspectLocation(replica)}
               >{inspectingLocation === replica.id ? 'Checking…' : 'Check Git'}</button>
               {#if !replica.isPrimary}
+                <button
+                  class="location-prepare"
+                  disabled={inspectingLocation !== '' || preparingLocation !== '' || Boolean(reservation)}
+                  aria-label={`Prepare ${replica.siteLabel || replica.path} at the primary revision`}
+                  title="Requires a clean existing checkout with the same origin and target terminal access"
+                  onclick={() => prepareLocation(replica)}
+                >{preparingLocation === replica.id ? 'Preparing...' : 'Prepare'}</button>
                 <button class="location-remove" aria-label={`Remove ${replica.siteLabel || replica.path}`} onclick={() => detachLocation(replica)}>Remove</button>
               {/if}
             </article>
@@ -959,10 +988,11 @@
   .location-copy .reservation { color: var(--accent); }
   .location-badge { padding: .18rem .4rem; border: 1px solid var(--border); border-radius: var(--r-pill);
     color: var(--muted); font-size: var(--text-2xs); }
-  .location-inspect, .location-remove { flex: none; color: var(--dim); font-size: var(--text-2xs); }
-  .location-inspect:hover { color: var(--accent); }
-  .location-inspect:disabled { opacity: .55; }
+  .location-inspect, .location-prepare, .location-remove { flex: none; color: var(--dim); font-size: var(--text-2xs); }
+  .location-inspect:hover, .location-prepare:hover { color: var(--accent); }
+  .location-inspect:disabled, .location-prepare:disabled { opacity: .55; }
   .location-remove:hover { color: var(--red); }
+  .location-copy .revision-match { color: var(--dim); }
   .location-picker { max-height: 260px; overflow: auto; border-top: 1px solid var(--border); background: var(--surface-2); }
   .location-picker > button { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .15rem .6rem;
     padding: .6rem .8rem; border-top: 1px solid var(--border-subtle); color: var(--text); text-align: left; }

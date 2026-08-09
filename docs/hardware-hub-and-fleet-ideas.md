@@ -135,7 +135,8 @@ Implementation status (2026-08-08): the first execution-control slices now exist
 has a deterministic primary local replica, operators can attach paired target roots as explicit remote
 replicas, inspect their bounded Git readiness, and see attributed terminal runs. Runs carry durable expiring
 source leases, while the target independently fences each physical root across source hubs. Project Overview
-exposes Locations, readiness, active reservations, and recent runs. Registration does not yet synchronize Git,
+exposes Locations, readiness, active reservations, recent runs, and bounded preparation of an existing clean
+checkout at the primary's exact published revision. Registration does not yet provision an absent checkout,
 transfer dirty state, stream logs, schedule from resource pressure, or admit results; those remain the next
 slices below.
 

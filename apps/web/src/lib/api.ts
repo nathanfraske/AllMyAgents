@@ -935,6 +935,7 @@ export interface ProjectReplicaInfo {
     complete: boolean
     clean?: boolean
     detached?: boolean
+    repository?: string
     trackedChanges?: number
     untrackedFiles?: number
     checkedAt: string
@@ -1422,6 +1423,35 @@ export const api = {
       (id) => `/api/projects/${encodeURIComponent(id)}/replicas/${encodeURIComponent(replicaTarget.id)}/inspect`,
     )
     if (!target.site || 'error' in value) return value
+    return {
+      ...value,
+      id: `${target.site.siteId}:${value.id}`,
+      projectId: `${target.site.siteId}:${value.projectId}`,
+    }
+  },
+  prepareProjectReplica: async (projectId: string, replicaId: string) => {
+    const target = resolveHubResource(projectId)
+    const replicaTarget = resolveHubResource(replicaId)
+    if (target.site?.siteId !== replicaTarget.site?.siteId) {
+      return { error: 'project location belongs to a different hub' } as ApiError
+    }
+    const value = await routedPost<ProjectReplicaInfo | (ApiError & { replica?: ProjectReplicaInfo })>(
+      projectId,
+      (id) => `/api/projects/${encodeURIComponent(id)}/replicas/${encodeURIComponent(replicaTarget.id)}/prepare`,
+    )
+    if (!target.site) return value
+    if ('error' in value) {
+      return {
+        ...value,
+        ...(value.replica ? {
+          replica: {
+            ...value.replica,
+            id: `${target.site.siteId}:${value.replica.id}`,
+            projectId: `${target.site.siteId}:${value.replica.projectId}`,
+          },
+        } : {}),
+      }
+    }
     return {
       ...value,
       id: `${target.site.siteId}:${value.id}`,
