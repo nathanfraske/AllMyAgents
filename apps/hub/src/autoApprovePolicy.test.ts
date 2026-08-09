@@ -748,6 +748,7 @@ describe('project-manager delegated authority security boundary', () => {
       input: {
         profileId?: string
         agentType?: string
+        role?: string
         prompt: string
         model?: string
         permissionMode?: 'safe' | 'edits' | 'full'
@@ -1340,7 +1341,8 @@ describe('project-manager delegated authority security boundary', () => {
       },
       'operator',
     )
-    expect(configured.managerStandingInstructions).toBe(standing)
+    expect(configured.managerStandingInstructions).toContain(standing)
+    expect(configured.managerStandingInstructions).toMatch(/Hub-enforced roster continuity.*durable role.*New retirement is disabled/is)
 
     // Simulate the first message no longer being available after compaction. The durable instruction
     // scope and native instruction file must still carry the manager rules on a later turn.

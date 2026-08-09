@@ -2902,7 +2902,10 @@ export class HubStore {
           reason?: string
         }
         const child = p.childSessionId ? this.sessions[p.childSessionId] : undefined
-        if (child && p.retiredAt) {
+        const manager = p.managerSessionId ? this.sessions[p.managerSessionId] : undefined
+        // Lazy history may deliver an old retirement event after capability v2 has already restored
+        // the worker. Historical timeline rows must never roll current roster state backward.
+        if (child && p.retiredAt && (manager?.record.managerTeamCapabilityVersion ?? 0) < 2) {
           child.record.managerRetiredAt = p.retiredAt
           child.record.managerRetiredBySessionId = p.managerSessionId
           child.record.managerRetiredReason = p.reason
@@ -2915,15 +2918,32 @@ export class HubStore {
         break
       }
       case 'manager/child-retirement-cleared':
-      case 'manager/child-reactivated': {
+      case 'manager/child-reactivated':
+      case 'manager/child-retirement-migrated':
+      case 'manager/child-resumed': {
         const p = payload as { childSessionId?: string }
         const child = p.childSessionId ? this.sessions[p.childSessionId] : undefined
         if (child) {
           child.record.managerRetiredAt = undefined
           child.record.managerRetiredBySessionId = undefined
           child.record.managerRetiredReason = undefined
+          if (kind === 'manager/child-retirement-migrated') child.record.status = 'stopped'
+          if (kind === 'manager/child-resumed') child.record.status = 'idle'
         }
-        this.push(view, { kind: 'note', ts, text: 'retired child reactivated with its preserved workspace' })
+        this.push(view, {
+          kind: 'note',
+          ts,
+          text: kind === 'manager/child-retirement-migrated'
+            ? 'legacy retired child restored to the durable roster'
+            : 'stopped child resumed with its preserved identity and workspace',
+        })
+        break
+      }
+      case 'manager/child-role-upgraded':
+      case 'manager/child-role-changed': {
+        const p = payload as { childSessionId?: string; role?: string }
+        const child = p.childSessionId ? this.sessions[p.childSessionId] : undefined
+        if (child && p.role) child.record.role = p.role
         break
       }
       case 'session/agent-stop-requested': {

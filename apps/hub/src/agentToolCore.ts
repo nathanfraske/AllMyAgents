@@ -244,13 +244,14 @@ export interface AgentServices {
       interruptActive?: boolean
     }
   ): Awaitable<ManagerTeamControlResult>
-  /** Reversibly retire or reactivate one direct child without deleting its history or workspace. */
+  /** Resume a direct child or refine its durable role; legacy retirement remains restore-only. */
   manageChild?(
     managerSessionId: string,
     input: {
-      operation: 'retire' | 'reactivate'
+      operation: 'resume' | 'set_role' | 'reactivate' | 'retire'
       childSessionId: string
       reason?: string
+      role?: string
     }
   ): Awaitable<ManagerTeamControlResult>
   /** Project-manager-only spawn. The hub derives the caller from the bound session identity. */
@@ -259,6 +260,7 @@ export interface AgentServices {
     input: {
       profileId?: string
       agentType?: string
+      role?: string
       prompt: string
       model?: string
       effort?: string
@@ -367,7 +369,7 @@ function resolveWriteScope(id: SessionIdentity, kind: 'account' | 'project' | un
 const listAgents = defineTool({
   name: 'list_agents',
   description:
-    'List the other agents in your active catalog. Ordinary agents see same-project teammates; the application Overseer sees the complete local fleet, including stopped chats that have not been retired. Retired manager children remain durable records in child_status and can be reactivated by their manager. Returns session ids (use one verbatim as `to_session`), project, role, provider, and current status.',
+    'List the other agents in your active catalog. Ordinary agents see same-project teammates; the application Overseer sees the complete local fleet, including stopped durable workers. Returns session ids (use one verbatim as `to_session`), project, role, provider, and current status.',
   schema: {},
   run: async (_args, { identity, services }) => {
     const roster = await services.roster(identity.sessionId)
@@ -528,18 +530,20 @@ const manageTeam = defineTool({
 const manageChild = defineTool({
   name: 'manage_child',
   description:
-    'Project managers only: reversibly retire or reactivate one direct child. Retiring stops an idle, errored, or already-stopped child, preserves its chat, transcript, branch, dirty files, and worktree, prevents team activation from reopening it, and immediately releases its live-child slot. Running children cannot be retired by this tool. Reactivation is bounded by the same live-child limit.',
+    'Project managers only: resume a stopped/errored direct worker or set its durable team role. The legacy reactivate operation is an alias for resume and also restores old retired records. New retirement is disabled: reuse or compact a worker whose durable role still fits, and create/activate a different stashed team when the work needs a genuinely different role lineup.',
   schema: {
-    operation: z.enum(['retire', 'reactivate']),
+    operation: z.enum(['resume', 'set_role', 'reactivate', 'retire']),
     child_session: z.string().min(1).describe('direct child session id from child_status'),
-    reason: z.string().max(500).optional().describe('short audit reason, especially for a context-boundary replacement'),
+    reason: z.string().max(500).optional().describe('short audit reason for resuming or changing the role'),
+    role: z.string().min(1).max(500).optional().describe('required for set_role; a durable responsibility, not the current task'),
   },
   run: async (args, { identity, services }) => {
-    if (!services.manageChild) return 'Child lifecycle operation unavailable: this hub does not support reversible retirement.'
+    if (!services.manageChild) return 'Child lifecycle operation unavailable: this hub cannot resume or update managed workers.'
     const result = await services.manageChild(identity.sessionId, {
       operation: args.operation,
       childSessionId: args.child_session,
       reason: args.reason,
+      role: args.role,
     })
     return result.ok
       ? result.summary ?? 'Child lifecycle operation completed.'
@@ -550,10 +554,11 @@ const manageChild = defineTool({
 const spawnAgent = defineTool({
   name: 'spawn_agent',
   description:
-    'Project managers: create a child AllMyAgents session in your project, isolated in its own git worktree by default. A direct worker may also call this only when its manager grant enables bounded one-shot sub-agents; those inherit the worker account/model/grant and appear as Name II, Name III, and so on. Managers may use agent_type or profile_id; enabled workers normally supply only prompt and use_worktree. The hub enforces every live limit and delegation ceiling.',
+    'Project managers: create a durable child AllMyAgents worker in the active team, isolated in its own git worktree by default. Every manager-created worker must use an operator-defined agent_type or provide a durable role distinct from its current task; profile_id selects an account, not an identity. A direct worker may also call this only for bounded one-shot descendants, which inherit the parent role/account/model/grant and appear as Name II, Name III, and so on. The hub enforces every live limit and delegation ceiling.',
   schema: {
     profile_id: z.string().optional().describe('installed AllMyAgents profile id; omit when using agent_type'),
     agent_type: z.string().optional().describe('operator-defined agent type id or name from the manager brief'),
+    role: z.string().min(1).max(500).optional().describe('durable worker responsibility; required when agent_type is omitted and must not merely repeat the current task'),
     prompt: z.string().min(1).describe('the child agent task'),
     model: z.string().optional(),
     effort: z.string().optional(),
@@ -573,6 +578,7 @@ const spawnAgent = defineTool({
     const result = await services.spawnAgent(identity.sessionId, {
       profileId: args.profile_id,
       agentType: args.agent_type,
+      role: args.role,
       prompt: args.prompt,
       model: args.model,
       effort: args.effort,

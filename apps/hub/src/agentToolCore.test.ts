@@ -330,17 +330,27 @@ describe('manage_team (durable manager lineups)', () => {
   })
 })
 
-describe('manage_child (reversible manager retirement)', () => {
-  it('returns the hub-authored preservation and capacity result', async () => {
-    const summary = 'Retired Corbato and released one live-child slot; workspace preserved.'
+describe('manage_child (durable manager identity)', () => {
+  it('forwards role repair and returns the hub-authored continuity result', async () => {
+    const summary = 'Updated Corbato durable role to journal continuity specialist.'
     const h = makeHarness({ manageChild: { ok: true, summary } })
     expect(
       await runAgentTool(
         'manage_child',
-        { operation: 'retire', child_session: 'child-1', reason: 'context exhausted' },
+        {
+          operation: 'set_role',
+          child_session: 'child-1',
+          role: 'journal continuity specialist',
+          reason: 'repair a legacy general role',
+        },
         { identity: idA, services: h.services },
       ),
     ).toBe(summary)
+  })
+
+  it('keeps the legacy retire verb model-readable but describes it as disabled', () => {
+    const tool = AGENT_TOOLS.find((candidate) => candidate.name === 'manage_child')!
+    expect(tool.description).toMatch(/legacy.*retired records.*New retirement is disabled/is)
   })
 })
 

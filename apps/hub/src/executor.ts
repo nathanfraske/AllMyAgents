@@ -221,6 +221,7 @@ export interface InProcessExecutorHubHooks {
     input: {
       profileId?: string
       agentType?: string
+      role?: string
       prompt: string
       model?: string
       effort?: string

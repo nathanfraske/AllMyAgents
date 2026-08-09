@@ -246,8 +246,8 @@ export interface SessionRecord {
   managerTeamId?: string
   /** Denormalized historical label so an orphaned child still explains which team owned it. */
   managerTeamName?: string
-  /** Reversible, non-destructive manager retirement. The chat, transcript, branch, dirty files, and
-   *  worktree remain available, but the child no longer consumes live capacity or reopens with its team. */
+  /** Legacy reversible-retirement metadata. Capability v2 migrates these records back into the durable
+   *  stopped roster and new manager retirement is disabled. Retained only for recovery compatibility. */
   managerRetiredAt?: string
   managerRetiredBySessionId?: string
   managerRetiredReason?: string
