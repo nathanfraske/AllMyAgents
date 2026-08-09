@@ -11,6 +11,7 @@ export interface TeamPresetManager {
   permissionMode: TeamPermissionMode
   maxChildPermissionMode: TeamPermissionMode
   maxLiveChildren: number
+  parallelismTarget?: number
   canApproveChildren: boolean
   pauseExhaustedAccounts?: boolean
   allowWorkerSubagents?: boolean
@@ -112,6 +113,7 @@ export function normalizeTeamPreset(value: unknown, existing?: TeamPreset): Team
     permissionMode: mode(rawManager.permissionMode, 'preset.manager.permissionMode'),
     maxChildPermissionMode: mode(rawManager.maxChildPermissionMode, 'preset.manager.maxChildPermissionMode'),
     maxLiveChildren: Number(rawManager.maxLiveChildren),
+    parallelismTarget: Number(rawManager.parallelismTarget ?? Math.min(3, Number(rawManager.maxLiveChildren))),
     canApproveChildren: rawManager.canApproveChildren === true,
     pauseExhaustedAccounts: rawManager.pauseExhaustedAccounts === true,
     allowWorkerSubagents: rawManager.allowWorkerSubagents === true,
@@ -127,6 +129,9 @@ export function normalizeTeamPreset(value: unknown, existing?: TeamPreset): Team
   }
   if (!Number.isInteger(manager.maxLiveChildren) || manager.maxLiveChildren < raw.agents.length || manager.maxLiveChildren > 16) {
     throw new Error('preset.manager.maxLiveChildren must be a whole number from the agent count through 16')
+  }
+  if (!Number.isInteger(manager.parallelismTarget) || manager.parallelismTarget! < 1 || manager.parallelismTarget! > manager.maxLiveChildren) {
+    throw new Error('preset.manager.parallelismTarget must be a whole number from 1 through maxLiveChildren')
   }
   if (!Number.isInteger(manager.maxSubagentsPerWorker) || manager.maxSubagentsPerWorker! < 1 || manager.maxSubagentsPerWorker! > 8) {
     throw new Error('preset.manager.maxSubagentsPerWorker must be a whole number from 1 to 8')

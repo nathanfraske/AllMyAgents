@@ -116,6 +116,27 @@ function transition(sessions: SessionManager, id: string, status: SessionStatus)
 }
 
 describe('project manager permission ceiling', () => {
+  it('persists a bounded parallel staffing target and refuses one above the live-child ceiling', () => {
+    const { sessions, journal, seed } = buildHub()
+    const manager = seed({ id: 'manager' })
+
+    expect(() => sessions.configureProjectManager(
+      manager.id,
+      { enabled: true, maxLiveChildren: 2, parallelismTarget: 3, allowedProfiles: ['p1'] },
+      'operator',
+    )).toThrow(/parallelismTarget must be a whole number from 1 through maxLiveChildren/u)
+    expect(manager.isProjectManager).not.toBe(true)
+
+    sessions.configureProjectManager(
+      manager.id,
+      { enabled: true, maxLiveChildren: 4, parallelismTarget: 3, allowedProfiles: ['p1'] },
+      'operator',
+    )
+    expect(manager.managerParallelismTarget).toBe(3)
+    const persisted = journal.db.prepare('SELECT record FROM sessions WHERE id = ?').get(manager.id) as { record: string }
+    expect(JSON.parse(persisted.record)).toMatchObject({ managerMaxLiveChildren: 4, managerParallelismTarget: 3 })
+  })
+
   it('keeps the operator-selected Safe mode when promoting a Full chat', () => {
     const { sessions, journal, seed } = buildHub()
     const manager = seed({ id: 'manager', permissionMode: 'full' })
@@ -369,6 +390,39 @@ describe('high-context teammate wake guard', () => {
     }))
   })
 
+  it('wakes a high-context manager exactly once for hub-minted action-required mail', () => {
+    const { sessions, journal, bus, seed, runTurn } = buildHub()
+    const manager = seed({ id: 'manager', projectId: 'project-1', isProjectManager: true })
+    const child = seed({ id: 'child', projectId: 'project-1', parentSessionId: manager.id })
+    journal.append(manager.id, 'session/tokens', { scope: 'request', contextUsed: 750_000 })
+    bus.post({
+      from: {
+        sessionId: child.id,
+        profileId: child.profileId,
+        provider: child.provider,
+        projectId: child.projectId,
+        label: 'Child',
+      },
+      project: 'project-1',
+      to: { kind: 'session', id: manager.id },
+      subject: 'child approval pending',
+      body: 'Approval ap_1 requires a manager decision.',
+      recipients: [manager.id],
+      attentionRequired: true,
+    })
+
+    const deliver = (sessions as unknown as { deliverBus(sessionId: string): void }).deliverBus.bind(sessions)
+    deliver(manager.id)
+    deliver(manager.id)
+
+    expect(runTurn).toHaveBeenCalledOnce()
+    expect(runTurn.mock.calls[0]?.[1]).toContain('Approval ap_1 requires a manager decision.')
+    expect(bus.pending(manager.id)).toEqual([])
+    expect(journal.recentEventsForSession(manager.id)).not.toContainEqual(expect.objectContaining({
+      kind: 'bus/context-wake-held',
+    }))
+  })
+
   it('applies the same guard to Codex from its reported context-window occupancy', () => {
     const { sessions, journal, bus, seed, runTurn } = buildHub()
     seed({ id: 'manager', projectId: 'project-1', isProjectManager: true })
@@ -439,7 +493,31 @@ describe('high-context teammate wake guard', () => {
     expect(bus.pending('child')).toEqual([])
   })
 
-  it('warns a manager to cross a compaction/successor boundary before a new high-context task', () => {
+  it('directly wakes a configured active-team worker so provider compaction can preserve continuity', async () => {
+    const { sessions, journal, seed, runTurn } = buildHub()
+    const manager = seed({ id: 'manager', projectId: 'project-1' })
+    const child = seed({ id: 'child', projectId: 'project-1', parentSessionId: 'manager', role: 'Parser maintainer' })
+    sessions.configureProjectManager(
+      manager.id,
+      { enabled: true, maxLiveChildren: 2, allowedProfiles: ['p1'] },
+      'operator',
+    )
+    journal.append(child.id, 'session/tokens', { scope: 'request', contextUsed: 700_000 })
+
+    expect(sessions.busSend(
+      manager.id,
+      { kind: 'session', id: child.id },
+      'continue parser ownership',
+      'Take the next parser task within your durable role.',
+    )).toEqual({ ok: true, delivered: 1 })
+    await vi.waitFor(() => expect(runTurn).toHaveBeenCalledOnce())
+    expect(journal.recentEventsForSession(manager.id)).toContainEqual(expect.objectContaining({
+      kind: 'manager/context-continuity-wake',
+      payload: expect.objectContaining({ recipients: [expect.objectContaining({ sessionId: child.id })] }),
+    }))
+  })
+
+  it('directs a high-context assignment through continuity rather than a successor', () => {
     const { sessions, journal, seed } = buildHub()
     seed({ id: 'manager', projectId: 'project-1', isProjectManager: true })
     seed({ id: 'child', projectId: 'project-1', parentSessionId: 'manager' })
@@ -454,15 +532,16 @@ describe('high-context teammate wake guard', () => {
     })
 
     expect(result).toMatchObject({ ok: true, taskId: expect.any(String) })
-    expect(result.warning).toMatch(/Context boundary required.*manage_child.*spawn_agent.*auto-compact/is)
+    expect(result.warning).toMatch(/Context continuity boundary.*direct manager message.*auto-compact.*Do not retire or replace.*another team/is)
   })
 })
 
-describe('project manager reversible child retirement', () => {
+describe('project manager durable child identity', () => {
   type ChildInput = {
-    operation: 'retire' | 'reactivate'
+    operation: 'resume' | 'set_role' | 'reactivate' | 'retire'
     childSessionId: string
     reason?: string
+    role?: string
   }
   const manageChild = (
     sessions: SessionManager,
@@ -476,84 +555,111 @@ describe('project manager reversible child retirement', () => {
       ): Promise<{ ok: boolean; summary?: string; error?: string }>
     }).managerManageChild(managerSessionId, input)
 
-  it('preserves the old child, releases its bounded slot, and permits a successor spawn', async () => {
-    const { sessions, journal, seed } = buildHub()
+  it('requires a durable role for new workers and refuses identity retirement', async () => {
+    const { sessions, seed } = buildHub()
     const manager = seed({ id: 'manager' })
-    const child = seed({ id: 'child', title: 'Corbato', parentSessionId: manager.id })
+    const child = seed({ id: 'child', title: 'Corbato', parentSessionId: manager.id, role: 'Journal continuity specialist' })
     sessions.configureProjectManager(
       manager.id,
-      { enabled: true, maxLiveChildren: 1, allowedProfiles: ['p1'] },
+      { enabled: true, maxLiveChildren: 2, allowedProfiles: ['p1'] },
       'operator',
     )
-    const spawn = (input: { profileId: string; prompt: string; useWorktree: boolean }) =>
+    const spawn = (input: { profileId: string; role?: string; prompt: string; useWorktree: boolean }) =>
       (sessions as unknown as {
         managerSpawn(
           managerId: string,
-          input: { profileId: string; prompt: string; useWorktree: boolean },
+          input: { profileId: string; role?: string; prompt: string; useWorktree: boolean },
         ): Promise<{ ok: boolean; sessionId?: string; error?: string }>
       }).managerSpawn(manager.id, input)
 
-    await expect(spawn({ profileId: 'p1', prompt: 'Replacement before retirement.', useWorktree: false }))
-      .resolves.toMatchObject({ ok: false, error: expect.stringMatching(/live child limit.*manage_child/i) })
+    await expect(spawn({ profileId: 'p1', prompt: 'Review the next journal batch.', useWorktree: false }))
+      .resolves.toMatchObject({ ok: false, error: expect.stringMatching(/agent_type or role is required/i) })
 
-    const retired = await manageChild(sessions, manager.id, {
+    await expect(spawn({
+      profileId: 'p1',
+      role: 'Review the next journal batch.',
+      prompt: 'Review the next journal batch.',
+      useWorktree: false,
+    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/durable responsibility.*not repeat/i) })
+
+    await expect(spawn({
+      profileId: 'p1',
+      role: 'Independent journal recovery verifier',
+      prompt: 'Review the next journal batch.',
+      useWorktree: false,
+    })).resolves.toMatchObject({ ok: true, sessionId: expect.any(String) })
+
+    const retirement = await manageChild(sessions, manager.id, {
       operation: 'retire',
       childSessionId: child.id,
-      reason: 'context compaction unavailable',
+      reason: 'task finished',
     })
 
-    expect(retired).toMatchObject({ ok: true, summary: expect.stringMatching(/released one live-child slot/i) })
-    expect(child).toMatchObject({
-      status: 'stopped',
-      managerRetiredAt: expect.any(String),
-      managerRetiredBySessionId: manager.id,
-      managerRetiredReason: 'context compaction unavailable',
+    expect(retirement).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/retirement is disabled.*create or activate another team/is),
     })
-    expect(sessions.list().find((record) => record.id === child.id)).toBe(child)
-    expect(journal.recentEventsForSession(child.id)).toContainEqual(expect.objectContaining({
-      kind: 'manager/child-retired',
-      payload: expect.objectContaining({ managerSessionId: manager.id, reason: 'context compaction unavailable' }),
-    }))
-    expect(journal.recentEventsForSession(child.id).some((event) => event.kind === 'session/deleted')).toBe(false)
-    expect(sessions.managerChildStatus(manager.id).summary).toMatch(/Retired records: 1.*Retired records.*Corbato.*retired/is)
-
-    await expect(spawn({ profileId: 'p1', prompt: 'Continue in a fresh bounded context.', useWorktree: false }))
-      .resolves.toMatchObject({ ok: true, sessionId: expect.any(String) })
+    expect(child.status).toBe('idle')
+    expect(child.managerRetiredAt).toBeUndefined()
     await new Promise<void>((resolve) => setImmediate(resolve))
   })
 
-  it('refuses to retire a running child and bounds reversible reactivation by live capacity', async () => {
+  it('repairs roles and bounds resume while restoring a legacy retired record', async () => {
     const { sessions, seed } = buildHub()
     const manager = seed({ id: 'manager' })
-    const child = seed({ id: 'child', title: 'Worker', parentSessionId: manager.id, status: 'active' })
     sessions.configureProjectManager(
       manager.id,
       { enabled: true, maxLiveChildren: 1, allowedProfiles: ['p1'] },
       'operator',
     )
+    const child = seed({
+      id: 'child',
+      title: 'Worker',
+      parentSessionId: manager.id,
+      managerTeamId: manager.managerActiveTeamId,
+      managerTeamName: manager.managerTeams?.[0]?.name,
+      status: 'stopped',
+      managerRetiredAt: new Date().toISOString(),
+    })
+    const replacement = seed({
+      id: 'replacement',
+      parentSessionId: manager.id,
+      managerTeamId: manager.managerActiveTeamId,
+      managerTeamName: manager.managerTeams?.[0]?.name,
+      status: 'idle',
+    })
 
     await expect(manageChild(sessions, manager.id, {
-      operation: 'retire',
+      operation: 'set_role',
       childSessionId: child.id,
-    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/while it is running/i) })
-    expect(child.status).toBe('active')
+      role: 'Windows packaging specialist',
+    })).resolves.toMatchObject({ ok: true, summary: expect.stringMatching(/Windows packaging specialist/) })
+    expect(child.role).toBe('Windows packaging specialist')
 
-    transition(sessions, child.id, 'idle')
+    child.agentTypeId = 'operator-verifier'
+    child.agentTypeName = 'Operator verifier'
     await expect(manageChild(sessions, manager.id, {
-      operation: 'retire',
+      operation: 'set_role',
       childSessionId: child.id,
-    })).resolves.toMatchObject({ ok: true })
-    const replacement = seed({ id: 'replacement', parentSessionId: manager.id, status: 'idle' })
+      role: 'A manager-defined replacement role',
+    })).resolves.toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/operator-defined agent type Operator verifier fixes.*durable role/i),
+    })
+    expect(child.role).toBe('Windows packaging specialist')
+    delete child.agentTypeId
+    delete child.agentTypeName
+
     await expect(manageChild(sessions, manager.id, {
-      operation: 'reactivate',
+      operation: 'resume',
       childSessionId: child.id,
     })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/live child limit/i) })
 
     replacement.status = 'stopped'
     await expect(manageChild(sessions, manager.id, {
-      operation: 'reactivate',
+      operation: 'resume',
       childSessionId: child.id,
-      reason: 'operator wants the preserved context back',
+      reason: 'continue the packaging area with preserved context',
     })).resolves.toMatchObject({ ok: true })
     expect(child.status).toBe('idle')
     expect(child.managerRetiredAt).toBeUndefined()
@@ -611,7 +717,7 @@ describe('project manager lifecycle awareness', () => {
 
     const result = sessions.managerChildStatus('manager')
     expect(result.ok).toBe(true)
-    expect(result.summary).toContain('Active children: 2 running, 1 idle, 1 stopped, 1 errored. Retired records: 0.')
+    expect(result.summary).toContain('Durable children: 2 running, 1 idle, 1 stopped, 1 errored. New retirement is disabled.')
     expect(result.summary).toContain('(starting): starting')
     expect(result.summary).toContain('(active): active')
     expect(result.summary).not.toContain('grandchild')
@@ -747,35 +853,47 @@ describe('project manager durable teams', () => {
     await new Promise<void>((resolve) => setImmediate(resolve))
   })
 
-  it('does not silently reactivate a retired child when its team becomes active', async () => {
-    const { sessions, seed } = buildHub()
+  it('migrates a legacy retired child into the durable roster and reopens it with its team', async () => {
+    const { sessions, journal, seed } = buildHub()
     const manager = seed({ id: 'manager', projectId: 'project' })
     sessions.configureProjectManager(manager.id, { enabled: true, allowedProfiles: ['p1'] }, 'operator')
     const firstTeam = manager.managerTeams![0]!
-    await manageTeam(sessions, manager.id, { operation: 'create', name: 'Retired team' })
-    const retiredTeam = manager.managerTeams!.find((team) => team.name === 'Retired team')!
+    await manageTeam(sessions, manager.id, { operation: 'create', name: 'Preserved team' })
+    const preservedTeam = manager.managerTeams!.find((team) => team.name === 'Preserved team')!
     const retired = seed({
       id: 'retired-child',
       parentSessionId: manager.id,
-      managerTeamId: retiredTeam.id,
-      managerTeamName: retiredTeam.name,
+      managerTeamId: preservedTeam.id,
+      managerTeamName: preservedTeam.name,
       projectId: 'project',
       status: 'stopped',
       managerRetiredAt: new Date().toISOString(),
       managerRetiredBySessionId: manager.id,
       managerRetiredReason: 'replaced after context exhaustion',
     })
+    manager.managerTeamCapabilityVersion = 1
+
+    const status = sessions.managerChildStatus(manager.id)
+
+    expect(status.summary).toMatch(/retired-child.*role: General project contributor for Preserved team/is)
+    expect(retired.managerRetiredAt).toBeUndefined()
+    expect(retired.role).toMatch(/General project contributor for Preserved team/)
+    expect(journal.recentEventsForSession(retired.id)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'manager/child-role-upgraded' }),
+      expect.objectContaining({ kind: 'manager/child-retirement-migrated' }),
+    ]))
 
     const activated = await manageTeam(sessions, manager.id, {
       operation: 'activate',
-      teamId: retiredTeam.id,
+      teamId: preservedTeam.id,
     })
 
     expect(activated.ok).toBe(true)
-    expect(manager.managerActiveTeamId).toBe(retiredTeam.id)
+    expect(manager.managerActiveTeamId).toBe(preservedTeam.id)
     expect(manager.managerTeams?.find((team) => team.id === firstTeam.id)?.stashedAt).toBeTruthy()
-    expect(retired.status).toBe('stopped')
-    expect(retired.managerRetiredAt).toBeTruthy()
+    expect(retired.status).toBe('idle')
+    expect(retired.managerRetiredAt).toBeUndefined()
+    await new Promise<void>((resolve) => setImmediate(resolve))
   })
 
   it('rejects a parallel mutation while an activation is awaiting the outgoing stop', async () => {
@@ -821,12 +939,13 @@ describe('project manager durable teams', () => {
 describe('project manager durable live roster', () => {
   it('rebuilds the managed-agent roster and bounded operator provenance after compaction', async () => {
     const { sessions, journal, seed, repo } = buildHub()
-    seed({ id: 'manager', projectId: 'project' })
+    const manager = seed({ id: 'manager', projectId: 'project' })
     sessions.configureProjectManager(
       'manager',
       {
         enabled: true,
         maxLiveChildren: 4,
+        parallelismTarget: 3,
         allowedProfiles: ['p1'],
         standingInstructions: 'Your sole purpose is to coordinate the operator-granted project team.',
       },
@@ -836,6 +955,8 @@ describe('project manager durable live roster', () => {
       id: 'reviewer-child',
       title: 'Hopper',
       parentSessionId: 'manager',
+      managerTeamId: manager.managerActiveTeamId,
+      managerTeamName: manager.managerTeams?.[0]?.name,
       projectId: 'project',
       status: 'active',
       role: 'Reviewer',
@@ -864,10 +985,12 @@ describe('project manager durable live roster', () => {
     const instructions = fs.readFileSync(path.join(repo, 'CLAUDE.md'), 'utf8')
     expect(instructions).toContain('Your sole purpose is to coordinate')
     expect(instructions).toContain('LIVE MANAGED-AGENT ROSTER')
+    expect(instructions).toMatch(/Parallel staffing target: 3 useful direct worker lanes; active team currently has 1 running/u)
+    expect(instructions).toMatch(/Below target: reuse idle workers or spawn independent implementation\/reproduction\/research\/cross-check lanes/u)
     expect(instructions).toMatch(/operator configured this manager’s team and permission bounds/i)
     expect(instructions).toContain('Hopper')
     expect(instructions).toContain('reviewer-child')
-    expect(instructions).toContain('agent type: Reviewer')
+    expect(instructions).toContain('durable role: Reviewer')
     expect(instructions).toContain('p1 / claude-sonnet')
     expect(instructions).toContain(repo)
     expect(instructions).toContain('agent/reviewer')

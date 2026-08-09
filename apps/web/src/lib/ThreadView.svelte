@@ -1350,7 +1350,14 @@
       </button>
     {/if}
     {#if !composerOnly && view.historyLoadError}
-      <span class="history-error" role="alert">{view.historyLoadError}</span>
+      <div class="history-error" role="alert">
+        <span>{view.historyLoadError}</span>
+        <button
+          class="ghost tiny"
+          disabled={view.loadingHistory}
+          onclick={() => void store.ensureHistory(view.record.id)}
+        >Retry history</button>
+      </div>
     {/if}
     <!-- Items produced INSIDE a spawned sub-agent are excluded here and rendered in the agent panel
          instead: a background agent's tool spam would otherwise bury the conversation you are actually
@@ -1734,7 +1741,7 @@
   .hbtn:disabled { opacity: 0.4; cursor: default; }
   .stream { flex: 1; display: flex; flex-direction: column; gap: 0.55rem; padding: 1rem 1.1rem; max-width: 900px; width: 100%; margin: 0 auto; container-type: inline-size; }
   .history-page { align-self: center; max-width: 18rem; }
-  .history-error { align-self: center; max-width: 34rem; color: var(--danger); font-size: 0.78rem; text-align: center; }
+  .history-error { align-self: center; max-width: 34rem; color: var(--danger); font-size: 0.78rem; text-align: center; display: flex; align-items: center; gap: 0.55rem; }
   .stream.replay-rebuild { visibility: hidden; }
   .stream-node { min-width: 0; }
   @media (prefers-reduced-motion: no-preference) {

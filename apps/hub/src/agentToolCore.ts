@@ -55,6 +55,9 @@ export interface OverseerControlInput {
     | 'get_github_automation_policy'
     | 'configure_github_automation'
     | 'issue_pairing_code'
+    | 'list_testbed_targets'
+    | 'inspect_testbed_target'
+    | 'deploy_testbed_node'
     | 'get_elevation_policy'
     | 'configure_elevation'
     | 'analyze_elevated_command'
@@ -83,6 +86,7 @@ export interface OverseerControlInput {
   managerConfig?: {
     enabled: boolean
     maxLiveChildren?: number
+    parallelismTarget?: number
     delegation?: DelegatedAuthority[]
     allowedProfiles?: string[]
     allowedModels?: Record<string, string[]>
@@ -110,6 +114,7 @@ export interface OverseerControlInput {
   shell?: ElevatedShell
   timeoutMs?: number
   siteId?: string
+  testbedProfile?: 'elevated-machine' | 'linux-sudo-machine'
   subject?: string
   uiTarget?:
     | 'home'
@@ -239,13 +244,14 @@ export interface AgentServices {
       interruptActive?: boolean
     }
   ): Awaitable<ManagerTeamControlResult>
-  /** Reversibly retire or reactivate one direct child without deleting its history or workspace. */
+  /** Resume a direct child or refine its durable role; legacy retirement remains restore-only. */
   manageChild?(
     managerSessionId: string,
     input: {
-      operation: 'retire' | 'reactivate'
+      operation: 'resume' | 'set_role' | 'reactivate' | 'retire'
       childSessionId: string
       reason?: string
+      role?: string
     }
   ): Awaitable<ManagerTeamControlResult>
   /** Project-manager-only spawn. The hub derives the caller from the bound session identity. */
@@ -254,6 +260,7 @@ export interface AgentServices {
     input: {
       profileId?: string
       agentType?: string
+      role?: string
       prompt: string
       model?: string
       effort?: string
@@ -275,8 +282,9 @@ export interface AgentServices {
   decideChildApproval?(
     managerSessionId: string,
     approvalId: string,
-    approve: boolean
-  ): Awaitable<{ ok: boolean; error?: string }>
+    approve: boolean,
+    remember?: boolean,
+  ): Awaitable<{ ok: boolean; remembered?: boolean; warning?: string; error?: string }>
   /** Create or update one audited task on a direct child's shared task board. */
   assignChildTask?(
     managerSessionId: string,
@@ -304,6 +312,8 @@ export interface AgentServices {
   remoteDevices(sessionId: string): Awaitable<RemoteDeviceView[]>
   /** Execute one already-scoped remote file/terminal operation; the hub rechecks the durable grant. */
   remoteExecute(sessionId: string, siteId: string, action: RemoteDeviceAction): Awaitable<RemoteDeviceActionResult>
+  /** Prepare an attached project replica from the live primary checkout; callers never choose Git inputs. */
+  remotePrepareProjectLocation(sessionId: string, siteId: string, rootId: string): Awaitable<RemoteDeviceActionResult>
   /** App-wide control plane. The hub rechecks that the caller is its minted Overseer on a direct operator turn. */
   overseerControl(sessionId: string, input: OverseerControlInput): Awaitable<OverseerControlResult>
   memory: MemoryServices
@@ -360,7 +370,7 @@ function resolveWriteScope(id: SessionIdentity, kind: 'account' | 'project' | un
 const listAgents = defineTool({
   name: 'list_agents',
   description:
-    'List the other agents in your active catalog. Ordinary agents see same-project teammates; the application Overseer sees the complete local fleet, including stopped chats that have not been retired. Retired manager children remain durable records in child_status and can be reactivated by their manager. Returns session ids (use one verbatim as `to_session`), project, role, provider, and current status.',
+    'List the other agents in your active catalog. Ordinary agents see same-project teammates; the application Overseer sees the complete local fleet, including stopped durable workers. Returns session ids (use one verbatim as `to_session`), project, role, provider, and current status.',
   schema: {},
   run: async (_args, { identity, services }) => {
     const roster = await services.roster(identity.sessionId)
@@ -521,18 +531,20 @@ const manageTeam = defineTool({
 const manageChild = defineTool({
   name: 'manage_child',
   description:
-    'Project managers only: reversibly retire or reactivate one direct child. Retiring stops an idle, errored, or already-stopped child, preserves its chat, transcript, branch, dirty files, and worktree, prevents team activation from reopening it, and immediately releases its live-child slot. Running children cannot be retired by this tool. Reactivation is bounded by the same live-child limit.',
+    'Project managers only: resume a stopped/errored direct worker or set its durable team role. The legacy reactivate operation is an alias for resume and also restores old retired records. New retirement is disabled: reuse or compact a worker whose durable role still fits, and create/activate a different stashed team when the work needs a genuinely different role lineup.',
   schema: {
-    operation: z.enum(['retire', 'reactivate']),
+    operation: z.enum(['resume', 'set_role', 'reactivate', 'retire']),
     child_session: z.string().min(1).describe('direct child session id from child_status'),
-    reason: z.string().max(500).optional().describe('short audit reason, especially for a context-boundary replacement'),
+    reason: z.string().max(500).optional().describe('short audit reason for resuming or changing the role'),
+    role: z.string().min(1).max(500).optional().describe('required for set_role; a durable responsibility, not the current task'),
   },
   run: async (args, { identity, services }) => {
-    if (!services.manageChild) return 'Child lifecycle operation unavailable: this hub does not support reversible retirement.'
+    if (!services.manageChild) return 'Child lifecycle operation unavailable: this hub cannot resume or update managed workers.'
     const result = await services.manageChild(identity.sessionId, {
       operation: args.operation,
       childSessionId: args.child_session,
       reason: args.reason,
+      role: args.role,
     })
     return result.ok
       ? result.summary ?? 'Child lifecycle operation completed.'
@@ -543,10 +555,11 @@ const manageChild = defineTool({
 const spawnAgent = defineTool({
   name: 'spawn_agent',
   description:
-    'Project managers: create a child AllMyAgents session in your project, isolated in its own git worktree by default. A direct worker may also call this only when its manager grant enables bounded one-shot sub-agents; those inherit the worker account/model/grant and appear as Name II, Name III, and so on. Managers may use agent_type or profile_id; enabled workers normally supply only prompt and use_worktree. The hub enforces every live limit and delegation ceiling.',
+    'Project managers: create a durable child AllMyAgents worker in the active team, isolated in its own git worktree by default. Every manager-created worker must use an operator-defined agent_type or provide a durable role distinct from its current task; profile_id selects an account, not an identity. A direct worker may also call this only for bounded one-shot descendants, which inherit the parent role/account/model/grant and appear as Name II, Name III, and so on. The hub enforces every live limit and delegation ceiling.',
   schema: {
     profile_id: z.string().optional().describe('installed AllMyAgents profile id; omit when using agent_type'),
     agent_type: z.string().optional().describe('operator-defined agent type id or name from the manager brief'),
+    role: z.string().min(1).max(500).optional().describe('durable worker responsibility; required when agent_type is omitted and must not merely repeat the current task'),
     prompt: z.string().min(1).describe('the child agent task'),
     model: z.string().optional(),
     effort: z.string().optional(),
@@ -566,6 +579,7 @@ const spawnAgent = defineTool({
     const result = await services.spawnAgent(identity.sessionId, {
       profileId: args.profile_id,
       agentType: args.agent_type,
+      role: args.role,
       prompt: args.prompt,
       model: args.model,
       effort: args.effort,
@@ -620,17 +634,30 @@ const setChildAuthority = defineTool({
 const decideChildApproval = defineTool({
   name: 'decide_child_approval',
   description:
-    'Project managers only: approve or deny one pending approval for an agent in your own managed hierarchy. The hub enforces the operator toggle, validated lineage, and your live Git/tool ceiling; every decision is journaled.',
+    'Project managers only: approve or deny one pending approval for an agent in your own managed hierarchy. Set remember=true with an approval to durably grant that exact ordinary tool or Git action class to the direct worker, so future matching requests auto-approve without manager micromanagement. The hub enforces the operator toggle, validated lineage, and live Git/tool ceiling; the grant remains revocable through set_child_authority and every decision/use is journaled.',
   schema: {
     approval_id: z.string().describe('pending approval id shown by a child report or peek_agent'),
     approve: z.boolean().describe('true to approve once; false to deny'),
+    remember: z
+      .boolean()
+      .optional()
+      .describe('with approve=true, remember this action class for this direct worker; defaults to false'),
   },
   run: async (args, { identity, services }) => {
     if (!services.decideChildApproval) return 'Not decided: this hub does not support manager approval decisions.'
-    const result = await services.decideChildApproval(identity.sessionId, args.approval_id, args.approve)
-    return result.ok
-      ? `${args.approve ? 'Approved' : 'Denied'} child approval ${args.approval_id}.`
-      : `Not decided: ${result.error ?? 'unknown error'}`
+    const result = await services.decideChildApproval(
+      identity.sessionId,
+      args.approval_id,
+      args.approve,
+      args.remember === true,
+    )
+    if (!result.ok) return `Not decided: ${result.error ?? 'unknown error'}`
+    const remembered = result.remembered
+      ? ' Matching future requests from this worker will auto-approve until revoked with set_child_authority.'
+      : ''
+    return `${args.approve ? 'Approved' : 'Denied'} child approval ${args.approval_id}.${remembered}${
+      result.warning ? ` Warning: ${result.warning}` : ''
+    }`
   },
 })
 
@@ -1069,6 +1096,58 @@ const remoteWriteFile = defineTool({
   },
 })
 
+const remoteInspectGit = defineTool({
+  name: 'remote_inspect_git',
+  description:
+    'Inspect the Git identity and bounded dirty/clean state of an explicitly granted remote root without receiving arbitrary terminal authority or mutating the checkout.',
+  schema: {
+    device_id: z.string().min(1).max(256),
+    root_id: z.string().min(1).max(128),
+  },
+  run: async (args, { identity, services }) => {
+    const denied = remoteBusDenied(identity, services)
+    if (denied) return denied
+    const result = await services.remoteExecute(identity.sessionId, args.device_id, {
+      op: 'git_inspect', rootId: args.root_id,
+    })
+    if (!result.ok || !result.git) {
+      return `Remote Git inspection failed: ${result.error ?? 'unknown error'} ${remoteTelemetry(result)}`
+    }
+    const git = result.git
+    return [
+      `Git ${git.status}; repository=${git.isRepository ? 'yes' : 'no'}; complete=${git.complete ? 'yes' : 'no'}`,
+      git.isRepository
+        ? `repository ${git.repository ?? '(safe origin unavailable)'}; HEAD ${git.headCommit ?? 'unborn/unknown'}; ref ${git.headRef ?? '(detached or unknown)'}; tracked changes ${git.trackedChanges ?? 'unknown'}; untracked files ${git.untrackedFiles ?? 'unknown'}`
+        : `Git available=${git.gitAvailable ? 'yes' : 'no'}`,
+      ...(git.error ? [`note: ${git.error}`] : []),
+      remoteTelemetry(result),
+    ].join('\n')
+  },
+})
+
+const remotePrepareProjectLocation = defineTool({
+  name: 'remote_prepare_project_location',
+  description:
+    'Prepare an existing attached remote checkout at this project primary location\'s exact clean published commit. The hub derives repository, branch, and commit; this tool never accepts Git arguments and requires a terminal grant.',
+  schema: {
+    device_id: z.string().min(1).max(256),
+    root_id: z.string().min(1).max(128),
+  },
+  run: async (args, { identity, services }) => {
+    const denied = remoteBusDenied(identity, services)
+    if (denied) return denied
+    const result = await services.remotePrepareProjectLocation(identity.sessionId, args.device_id, args.root_id)
+    if (!result.ok || !result.git) {
+      return `Remote project preparation failed: ${result.error ?? 'unknown error'} ${remoteTelemetry(result)}`
+    }
+    return [
+      `Remote project location prepared at ${result.git.headCommit ?? 'an unknown revision'}.`,
+      `repository ${result.git.repository ?? '(safe origin unavailable)'}; checkout ${result.git.clean ? 'clean' : 'not proven clean'}; ${result.git.detached ? 'detached exact revision' : `ref ${result.git.headRef ?? 'unknown'}`}`,
+      remoteTelemetry(result),
+    ].join('\n')
+  },
+})
+
 const remoteCreateDirectory = defineTool({
   name: 'remote_create_directory',
   description:
@@ -1130,6 +1209,7 @@ const overseerAgentType = z.object({
 const overseerManagerConfig = z.object({
   enabled: z.boolean(),
   maxLiveChildren: z.number().int().min(1).max(16).optional(),
+  parallelismTarget: z.number().int().min(1).max(16).optional(),
   delegation: z.array(z.enum(['commit', 'push'])).max(2).optional(),
   allowedProfiles: z.array(z.string().min(1).max(256)).max(32).optional(),
   allowedModels: z.record(z.string(), z.array(z.string().min(1).max(256)).max(64)).optional(),
@@ -1157,6 +1237,7 @@ const overseerPreset = z.object({
     permissionMode: overseerPermissionMode,
     maxChildPermissionMode: overseerPermissionMode,
     maxLiveChildren: z.number().int().min(1).max(16),
+    parallelismTarget: z.number().int().min(1).max(16).optional(),
     canApproveChildren: z.boolean(),
     pauseExhaustedAccounts: z.boolean().optional(),
     allowWorkerSubagents: z.boolean().optional(),
@@ -1184,7 +1265,7 @@ const overseerPreset = z.object({
 const overseerControl = defineTool({
   name: 'overseer_control',
   description:
-    'Application Overseer only: explain how AllMyAgents works; inspect fleet failures and live account usage; configure projects, managers, manager account handoffs, reusable team presets, chats, accounts, remote-device grants, narrow GitHub automation policies/imports, mesh pairing, direct peer-Overseer messages, and safe hub restarts; and configure durable Standard, Tokenmaxxing, or Eco operating modes. GitHub automation can be granted to one exact session or every chat attached to one project, and covers only the explicitly listed PR/workflow/push capabilities. Elevated commands require a configured project policy, blast-radius analysis, a separate explicit operator approval, and (on Windows) UAC. Mutations are denied on teammate-caused turns; a remote Overseer turn may only reply to the same authenticated peer.',
+    'Application Overseer only: explain how AllMyAgents works; inspect fleet failures and live account usage; configure projects, managers, manager account handoffs, reusable team presets, chats, accounts, remote-device grants, narrow GitHub automation policies/imports, mesh pairing, lightweight testbed deployment, direct peer-Overseer messages, and safe hub restarts; and configure durable Standard, Tokenmaxxing, or Eco operating modes. GitHub automation can be granted to one exact session or every chat attached to one project, and covers only the explicitly listed PR/workflow/push capabilities. Lightweight testbed deployment uses the signed-fleet AllMyStuff file and terminal planes and requires an explicit elevated profile plus blast-radius reason. Elevated commands require a configured project policy, blast-radius analysis, a separate explicit operator approval, and (on Windows) UAC. Mutations are denied on teammate-caused turns; a remote Overseer turn may only reply to the same authenticated peer.',
   schema: {
     operation: z.enum([
       'status', 'guide', 'ui_catalog', 'highlight_ui', 'failure_context', 'get_operating_mode', 'set_operating_mode', 'create_project', 'create_chat', 'send_chat', 'stop_chat',
@@ -1194,6 +1275,8 @@ const overseerControl = defineTool({
       'start_account_login', 'github_repositories',
       'clone_github_repository', 'github_clone_status',
       'get_github_automation_policy', 'configure_github_automation', 'issue_pairing_code',
+      'list_testbed_targets', 'inspect_testbed_target',
+      'deploy_testbed_node',
       'get_elevation_policy', 'configure_elevation', 'analyze_elevated_command',
       'run_elevated_command', 'restart_hub',
     ]),
@@ -1235,6 +1318,7 @@ const overseerControl = defineTool({
     shell: z.enum(['powershell', 'bash']).optional(),
     timeout_ms: z.number().int().min(1_000).max(15 * 60 * 1_000).optional(),
     site_id: z.string().min(1).max(256).optional(),
+    testbed_profile: z.enum(['elevated-machine', 'linux-sudo-machine']).optional(),
     subject: z.string().max(300).optional(),
     ui_target: z.enum([
       'home', 'new_project', 'project_overview', 'overseer', 'accounts', 'chat_defaults',
@@ -1283,6 +1367,7 @@ const overseerControl = defineTool({
       shell: args.shell,
       timeoutMs: args.timeout_ms,
       siteId: args.site_id,
+      testbedProfile: args.testbed_profile,
       subject: args.subject,
       uiTarget: args.ui_target,
       uiMessage: args.ui_message,
@@ -1335,6 +1420,8 @@ export const AGENT_TOOLS: readonly AgentToolSpec[] = [
   remoteListDevices,
   remotePing,
   remoteInspectEnvironment,
+  remoteInspectGit,
+  remotePrepareProjectLocation,
   remoteListFiles,
   remoteReadFile,
   remoteCreateDirectory,

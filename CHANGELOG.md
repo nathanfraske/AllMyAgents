@@ -5,6 +5,32 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.23-alpha.26 — 2026-08-09
+
+This release makes remote devices first-class project testbeds, adds deployable vendor-free fleet nodes, preserves
+durable manager teams with bounded parallel staffing, lets managers remember exact in-ceiling child approvals,
+and fixes blank transcripts caused by large-journal maintenance pauses.
+
+[Full v0.1.23-alpha.26 release notes](docs/releases/v0.1.23-alpha.26.md)
+
+- Projects now have canonical local/remote locations, bounded Git readiness, exact published-revision
+  preparation, exclusive reservations, and immutable agent/session attribution for remote terminal runs.
+- The Overseer can deploy a checksum-verified lightweight testbed node over existing signed-fleet AllMyStuff file
+  and terminal planes. Explicit Windows LocalSystem, Linux root, and Linux passwordless-sudo profiles are
+  available without installing vendor accounts, a journal, or a target Overseer.
+- Every agent role receives the exact remote-testbed workflow after compaction, including environment discovery,
+  WSL-aware operation, transfer telemetry, and ambiguous-failure handling.
+- Managers retain role-bearing workers and stash/activate durable teams instead of cycling through retired
+  identities. A bounded parallel staffing target encourages useful independent lanes without invented work.
+- Managers can approve once or remember the exact ordinary tool/Git action class for a direct worker. Remembered
+  grants survive restart, remain bounded by the live operator ceiling, are fully audited, and revoke immediately.
+- Hub-minted approval, stall/error, fleet-failure, and worktree-risk notices now bypass the high-context FYI
+  guard, waking an idle manager or Overseer exactly once without letting agents self-assign message priority.
+- Condensation shortens its writer transaction, full snapshot/verification runs outside the hub event loop, and
+  transient history timeouts retry recoverably with an explicit manual retry path.
+- Dashboard heatmap intensity is relative, costs are labeled as Claude API-equivalent estimates, usage reset
+  labels switch between absolute date/time and under-24-hour countdowns, and archived agents do not inflate caps.
+
 ## v0.1.22-alpha.25 — 2026-08-08
 
 This release prevents healthy direct mesh routes from flickering offline, makes remote sends/steers idempotent

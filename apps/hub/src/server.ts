@@ -18,6 +18,8 @@ import {
   type Journal,
 } from './journal.js'
 import type { ProjectStore } from './projects.js'
+import type { TestbedRunStore } from './testbedRuns.js'
+import { TestbedReservationConflictError, type TestbedReservationStore } from './testbedReservations.js'
 import type { SessionManager } from './sessions.js'
 import type { UsageMonitor } from './usage.js'
 import type { MeshSite } from './meshSite.js'
@@ -36,7 +38,7 @@ import { readProjectConfig } from './importScan.js'
 import { pickableProfiles, setClaudeConnectorPolicy } from './profiles.js'
 import type { ProfileOwnership } from './profileOwnership.js'
 import { asFileWriteDiffDensity } from './types.js'
-import type { DangerFlags, HubPrefs, ManagerAgentType, Profile, Provider } from './types.js'
+import type { DangerFlags, HubPrefs, ManagerAgentType, Profile, ProjectReplicaReadiness, Provider } from './types.js'
 import type { Executor } from './executor.js'
 import type { WorktreeProjectActivity } from './worktreeCollisionDetector.js'
 import type { WorkspaceManager } from './workspace.js'
@@ -52,10 +54,12 @@ import {
 } from './journalRecovery.js'
 import { attachReplayStream, ReplayPrincipalBudget } from './replayStream.js'
 import { durableReplaySessions } from './replayBaseline.js'
-import type {
-  DeviceExecutor,
-  RemoteDeviceAction,
-  RemoteDeviceController,
+import {
+  inspectGitCheckout,
+  type RemoteGitInspection,
+  type DeviceExecutor,
+  type RemoteDeviceAction,
+  type RemoteDeviceController,
 } from './remoteDevices.js'
 import type { OverseerConfig, RemoteDeviceCapability, RemoteDeviceGrant } from './types.js'
 import {
@@ -64,6 +68,7 @@ import {
   type OverseerModeUpdate,
 } from './overseerMode.js'
 import type { MyOwnMeshRpcBridge } from './myOwnMeshRpc.js'
+import type { TestbedDeploymentService } from './testbedDeployment.js'
 import {
   EphemeralNotificationService,
   NotificationService,
@@ -431,6 +436,8 @@ export interface ServerOptions {
   notifications?: NotificationCenter
   usage: UsageMonitor
   projects: ProjectStore
+  testbedRuns?: TestbedRunStore
+  testbedReservations?: TestbedReservationStore
   workspace: WorkspaceManager
   instructions: InstructionStore
   bus: AgentBus
@@ -467,6 +474,8 @@ export interface ServerOptions {
   remoteDevices?: RemoteDeviceController
   /** Site-free authenticated hub transport over the existing MyOwnMesh app-data lane. */
   directMesh?: MyOwnMeshRpcBridge
+  /** Optional platform-matched payload bootstrap over AllMyStuff's existing privileged planes. */
+  testbedDeployment?: TestbedDeploymentService
   overseer?: OverseerConfig
   overseerCwd?: string
 }
@@ -533,8 +542,28 @@ export function persistPrefs(
   if (err) journal.append(null, 'config/prefs-persist-failed', { path: configPath, message: err })
 }
 
+function storedReplicaReadiness(
+  git: RemoteGitInspection,
+): ProjectReplicaReadiness & { headCommit?: string; headRef?: string } {
+  return {
+    status: git.status,
+    gitAvailable: git.gitAvailable,
+    isRepository: git.isRepository,
+    complete: git.complete,
+    ...(git.clean === undefined ? {} : { clean: git.clean }),
+    ...(git.detached === undefined ? {} : { detached: git.detached }),
+    ...(git.repository ? { repository: git.repository } : {}),
+    ...(git.trackedChanges === undefined ? {} : { trackedChanges: git.trackedChanges }),
+    ...(git.untrackedFiles === undefined ? {} : { untrackedFiles: git.untrackedFiles }),
+    checkedAt: git.observedAt,
+    ...(git.error ? { error: git.error } : {}),
+    ...(git.headCommit ? { headCommit: git.headCommit } : {}),
+    ...(git.headRef ? { headRef: git.headRef } : {}),
+  }
+}
+
 export function startServer(opts: ServerOptions): http.Server {
-  const { port, defaultCwd, profilesDir, profileNames = {}, journal, sessions, profiles, approvals, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity, deviceExecutor, remoteDevices, directMesh } = opts
+  const { port, defaultCwd, profilesDir, profileNames = {}, journal, sessions, profiles, approvals, usage, projects, testbedRuns, testbedReservations, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity, deviceExecutor, remoteDevices, directMesh } = opts
   const notifications = opts.notifications ?? (journal.db
     ? new NotificationService(journal.db)
     : new EphemeralNotificationService())
@@ -581,6 +610,16 @@ export function startServer(opts: ServerOptions): http.Server {
       github.start(repository, distro ? { kind: 'wsl', distro } : { kind: 'local' }),
     githubCloneStatus: (jobId) => github.job(jobId),
     issuePairingCode: () => pairingCodes.issue(),
+    ...(opts.testbedDeployment
+      ? {
+          deployTestbedNode: (
+            siteId: string,
+            profile: 'elevated-machine' | 'linux-sudo-machine',
+          ) => opts.testbedDeployment!.deploy(siteId, profile),
+          listTestbedTargets: () => opts.testbedDeployment!.targets(),
+          inspectTestbedTarget: (siteId: string) => opts.testbedDeployment!.inspect(siteId),
+        }
+      : {}),
   })
 
   // Preferred cross-hub control plane: authenticated MyOwnMesh RPC, not a mapped localhost Site.
@@ -662,13 +701,25 @@ export function startServer(opts: ServerOptions): http.Server {
         throw new Error('action must be an object')
       }
       const action = content.action as RemoteDeviceAction
-      if (!['probe', 'inspect', 'list', 'read', 'mkdir', 'write', 'exec'].includes(action.op)) throw new Error('unknown remote device operation')
+      if (!['probe', 'inspect', 'git_inspect', 'git_sync', 'list', 'read', 'mkdir', 'write', 'exec'].includes(action.op)) throw new Error('unknown remote device operation')
+      const actor = content.actor && typeof content.actor === 'object' && !Array.isArray(content.actor)
+        ? content.actor as Record<string, unknown>
+        : {}
       const result = await deviceExecutor.execute(action)
       journal.append(null, 'device-executor/action', {
         op: action.op,
         rootId: (str(action.rootId) ?? '').slice(0, 128),
         sourceSiteId: envelope.sourceSiteId,
         transport: 'myownmesh-rpc',
+        // Source-supplied correlation only. The authenticated peer proves which hub sent this; these
+        // fields support cross-hub audit joins but never confer authority on the target.
+        sourceRunId: (str(actor.runId) ?? '').slice(0, 128),
+        sourceProjectId: (str(actor.projectId) ?? '').slice(0, 256),
+        sourceReplicaId: (str(actor.replicaId) ?? '').slice(0, 128),
+        sourceAgentId: (str(actor.agentId) ?? '').slice(0, 256),
+        sourceSessionId: (str(actor.sessionId) ?? '').slice(0, 256),
+        sourceProfileId: (str(actor.profileId) ?? '').slice(0, 256),
+        sourceBaseCommit: (str(actor.baseCommit) ?? '').slice(0, 128),
         ok: result.ok,
         error: result.error,
         bytes: result.bytes,
@@ -1115,6 +1166,11 @@ export function startServer(opts: ServerOptions): http.Server {
         )
         return
       }
+      if (method === 'GET' && url.pathname === '/api/project-replicas/catalog') {
+        if (!remoteDevices) { json(res, { error: 'remote device controller unavailable' }, 503); return }
+        json(res, await remoteDevices.catalog())
+        return
+      }
       if (method === 'POST' && url.pathname === '/api/projects/validate') {
         const body = await readBody(req)
         const name = String(body.name ?? '').trim()
@@ -1162,6 +1218,328 @@ export function startServer(opts: ServerOptions): http.Server {
           return
         }
         json(res, await inspection)
+        return
+      }
+      const projectReplicasMatch = /^\/api\/projects\/([^/]+)\/replicas$/.exec(url.pathname)
+      if ((method === 'GET' || method === 'POST') && projectReplicasMatch) {
+        const projectId = decodeURIComponent(projectReplicasMatch[1] as string)
+        if (!projects.get(projectId)) {
+          json(res, { error: `unknown project: ${projectId}` }, 404)
+          return
+        }
+        if (method === 'GET') {
+          json(res, projects.listReplicas(projectId))
+          return
+        }
+        if (!authed) {
+          json(res, { error: 'operator device token required' }, 403)
+          return
+        }
+        if (!remoteDevices) { json(res, { error: 'remote device controller unavailable' }, 503); return }
+        const body = await readBody(req)
+        const siteId = str(body.siteId)
+        const rootId = str(body.rootId)
+        if (!siteId || !rootId) {
+          json(res, { error: 'siteId and rootId are required' }, 400)
+          return
+        }
+        const connection = remoteDevices.listConnections().find((item) => item.siteId === siteId)
+        if (!connection) {
+          json(res, { error: 'remote device is not paired with this hub' }, 404)
+          return
+        }
+        const capabilities = await remoteDevices.capabilities(siteId)
+        if (!capabilities.enabled) {
+          json(res, { error: 'testbed access is disabled on the remote device' }, 409)
+          return
+        }
+        const root = capabilities.roots.find((item) => item.id === rootId)
+        if (!root) {
+          json(res, { error: 'the remote device no longer advertises that root' }, 404)
+          return
+        }
+        let replica = projects.addRemoteReplica({
+          projectId,
+          siteId,
+          siteLabel: connection.label,
+          rootId,
+          path: root.path,
+          ...(root.environment?.kind === 'wsl' ? { environment: root.environment } : {}),
+        })
+        if (root.read) {
+          const inspected = await remoteDevices.execute(siteId, { op: 'git_inspect', rootId }, {
+            sessionId: 'operator:project-location',
+            profileId: 'operator',
+            projectId,
+            replicaId: replica.id,
+            agentId: 'operator',
+          })
+          const git = inspected.git ?? {
+            status: 'unavailable' as const,
+            gitAvailable: false,
+            isRepository: false,
+            complete: false,
+            observedAt: new Date().toISOString(),
+            error: (inspected.error ?? 'Remote Git readiness could not be inspected.').slice(0, 1_000),
+          }
+          replica = projects.updateReplicaReadiness(projectId, replica.id, storedReplicaReadiness(git))
+        }
+        json(res, replica)
+        return
+      }
+      const projectReplicaInspectMatch = /^\/api\/projects\/([^/]+)\/replicas\/([^/]+)\/inspect$/.exec(url.pathname)
+      if (method === 'POST' && projectReplicaInspectMatch) {
+        if (!authed) {
+          json(res, { error: 'operator device token required' }, 403)
+          return
+        }
+        const projectId = decodeURIComponent(projectReplicaInspectMatch[1] as string)
+        const replicaId = decodeURIComponent(projectReplicaInspectMatch[2] as string)
+        const replica = projects.getReplica(replicaId)
+        if (!replica || replica.projectId !== projectId) {
+          json(res, { error: 'project location not found' }, 404)
+          return
+        }
+        let git: RemoteGitInspection
+        if (replica.kind === 'local') {
+          git = await inspectGitCheckout({
+            path: replica.path,
+            ...(replica.environment.kind === 'wsl' && replica.environment.distro
+              ? { environment: { kind: 'wsl' as const, distro: replica.environment.distro } }
+              : {}),
+          })
+        } else {
+          if (!remoteDevices || !replica.siteId || !replica.rootId) {
+            json(res, { error: 'remote device controller unavailable' }, 503)
+            return
+          }
+          const inspected = await remoteDevices.execute(replica.siteId, {
+            op: 'git_inspect',
+            rootId: replica.rootId,
+          }, {
+            sessionId: 'operator:project-location',
+            profileId: 'operator',
+            projectId,
+            replicaId,
+            agentId: 'operator',
+          })
+          git = inspected.git ?? {
+            status: 'unavailable',
+            gitAvailable: false,
+            isRepository: false,
+            complete: false,
+            observedAt: new Date().toISOString(),
+            error: (inspected.error ?? 'Remote Git readiness could not be inspected.').slice(0, 1_000),
+          }
+        }
+        json(res, projects.updateReplicaReadiness(projectId, replicaId, storedReplicaReadiness(git)))
+        return
+      }
+      const projectReplicaPrepareMatch = /^\/api\/projects\/([^/]+)\/replicas\/([^/]+)\/prepare$/.exec(url.pathname)
+      if (method === 'POST' && projectReplicaPrepareMatch) {
+        if (!authed) {
+          json(res, { error: 'operator device token required' }, 403)
+          return
+        }
+        const projectId = decodeURIComponent(projectReplicaPrepareMatch[1] as string)
+        const replicaId = decodeURIComponent(projectReplicaPrepareMatch[2] as string)
+        const project = projects.get(projectId)
+        const replica = projects.getReplica(replicaId)
+        const primary = projects.primaryReplica(projectId)
+        if (!project || !replica || replica.projectId !== projectId || !primary) {
+          json(res, { error: 'project location not found' }, 404)
+          return
+        }
+        if (replica.kind !== 'remote' || !replica.siteId || !replica.rootId) {
+          json(res, { error: 'Only an attached remote project location can be prepared.' }, 409)
+          return
+        }
+        if (!remoteDevices || !testbedReservations) {
+          json(res, { error: 'remote project preparation is unavailable' }, 503)
+          return
+        }
+        let reservationId: string
+        try {
+          reservationId = journal.atomic(() => {
+            const acquired = testbedReservations.acquire({
+              projectId,
+              replicaId,
+              sessionId: 'operator:project-location',
+              agentId: 'operator',
+              ttlMs: 15 * 60_000,
+            })
+            for (const expired of acquired.expired) {
+              journal.append(expired.sessionId, 'testbed-reservation/expired', {
+                reservationId: expired.id,
+                projectId: expired.projectId,
+                replicaId: expired.replicaId,
+                agentId: expired.agentId,
+              })
+            }
+            journal.append(null, 'testbed-reservation/acquired', {
+              reservationId: acquired.reservation.id,
+              projectId,
+              replicaId,
+              agentId: 'operator',
+              operation: 'git-sync',
+              expiresAt: acquired.reservation.expiresAt,
+            })
+            journal.append(null, 'project/replica-prepare-started', {
+              projectId,
+              replicaId,
+              reservationId: acquired.reservation.id,
+              actor: 'operator',
+            })
+            return acquired.reservation.id
+          })
+        } catch (error) {
+          if (error instanceof TestbedReservationConflictError) {
+            json(res, { error: error.message }, 409)
+            return
+          }
+          throw error
+        }
+
+        let response: unknown
+        let responseStatus = 200
+        try {
+          const primaryGit = await inspectGitCheckout({
+            path: primary.path,
+            ...(primary.environment.kind === 'wsl' && primary.environment.distro
+              ? { environment: { kind: 'wsl' as const, distro: primary.environment.distro } }
+              : {}),
+          })
+          projects.updateReplicaReadiness(projectId, primary.id, storedReplicaReadiness(primaryGit))
+          if (
+            primaryGit.status !== 'ready' || primaryGit.clean !== true || !primaryGit.complete ||
+            !primaryGit.repository || !primaryGit.headRef || !primaryGit.headCommit
+          ) {
+            journal.append(null, 'project/replica-prepare-failed', {
+              projectId,
+              replicaId,
+              reservationId,
+              code: 'PRIMARY_NOT_READY',
+              error: 'Primary location is not a complete clean checkout with a published branch identity.',
+            })
+            response = {
+              error: 'The primary location must be a complete clean checkout on a named branch with a credential-free origin identity.',
+            }
+            responseStatus = 409
+          } else {
+            const prepared = await remoteDevices.execute(replica.siteId, {
+              op: 'git_sync',
+              rootId: replica.rootId,
+              repository: primaryGit.repository,
+              headRef: primaryGit.headRef,
+              headCommit: primaryGit.headCommit,
+            }, {
+              sessionId: 'operator:project-location',
+              profileId: 'operator',
+              projectId,
+              replicaId,
+              agentId: 'operator',
+              baseCommit: primaryGit.headCommit,
+            })
+            const targetGit = prepared.git ?? {
+              status: 'unavailable' as const,
+              gitAvailable: false,
+              isRepository: false,
+              complete: false,
+              observedAt: new Date().toISOString(),
+              error: (prepared.error ?? 'Remote Git preparation could not be verified.').slice(0, 1_000),
+            }
+            const updated = projects.updateReplicaReadiness(projectId, replicaId, storedReplicaReadiness(targetGit))
+            if (prepared.ok) {
+              journal.append(null, 'project/replica-prepare-completed', {
+                projectId,
+                replicaId,
+                reservationId,
+                repository: primaryGit.repository,
+                headRef: primaryGit.headRef,
+                headCommit: primaryGit.headCommit,
+              })
+              response = updated
+            } else {
+              journal.append(null, 'project/replica-prepare-failed', {
+                projectId,
+                replicaId,
+                reservationId,
+                code: prepared.failure?.code ?? null,
+                error: prepared.error ?? 'unknown preparation failure',
+              })
+              response = { error: prepared.error ?? 'The remote location could not be prepared.', replica: updated }
+              responseStatus = prepared.failure?.stage === 'admission' || prepared.failure?.stage === 'target' ? 409 : 502
+            }
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          journal.append(null, 'project/replica-prepare-failed', {
+            projectId,
+            replicaId,
+            reservationId,
+            error: message.slice(0, 1_000),
+          })
+          response = { error: message }
+          responseStatus = 500
+        } finally {
+          journal.atomic(() => {
+            const released = testbedReservations.release(reservationId, 'project-prepare-finished')
+            if (released) {
+              journal.append(null, 'testbed-reservation/released', {
+                reservationId: released.id,
+                projectId,
+                replicaId,
+                agentId: 'operator',
+                operation: 'git-sync',
+                reason: released.reason,
+              })
+            }
+          })
+        }
+        json(res, response, responseStatus)
+        return
+      }
+      const projectReplicaDeleteMatch = /^\/api\/projects\/([^/]+)\/replicas\/([^/]+)$/.exec(url.pathname)
+      if (method === 'DELETE' && projectReplicaDeleteMatch) {
+        if (!authed) {
+          json(res, { error: 'operator device token required' }, 403)
+          return
+        }
+        const projectId = decodeURIComponent(projectReplicaDeleteMatch[1] as string)
+        const replicaId = decodeURIComponent(projectReplicaDeleteMatch[2] as string)
+        const activeReservation = testbedReservations?.active(replicaId)
+        if (activeReservation) {
+          json(res, {
+            error: `The location is reserved by agent ${activeReservation.agentId} until ${activeReservation.expiresAt}.`,
+          }, 409)
+          return
+        }
+        try {
+          const removed = projects.removeReplica(projectId, replicaId)
+          json(res, removed ? { ok: true } : { error: 'project location not found' }, removed ? 200 : 404)
+        } catch (error) {
+          json(res, { error: error instanceof Error ? error.message : String(error) }, 409)
+        }
+        return
+      }
+      const projectRunsMatch = /^\/api\/projects\/([^/]+)\/testbed-runs$/.exec(url.pathname)
+      if (method === 'GET' && projectRunsMatch) {
+        const projectId = decodeURIComponent(projectRunsMatch[1] as string)
+        if (!projects.get(projectId)) {
+          json(res, { error: `unknown project: ${projectId}` }, 404)
+          return
+        }
+        json(res, testbedRuns?.listProject(projectId, Number(url.searchParams.get('limit') ?? 50)) ?? [])
+        return
+      }
+      const projectReservationsMatch = /^\/api\/projects\/([^/]+)\/testbed-reservations$/.exec(url.pathname)
+      if (method === 'GET' && projectReservationsMatch) {
+        const projectId = decodeURIComponent(projectReservationsMatch[1] as string)
+        if (!projects.get(projectId)) {
+          json(res, { error: `unknown project: ${projectId}` }, 404)
+          return
+        }
+        json(res, testbedReservations?.listProject(projectId, Number(url.searchParams.get('limit') ?? 50)) ?? [])
         return
       }
       const deleteProjectMatch = /^\/api\/projects\/([^/]+)$/.exec(url.pathname)
@@ -1906,7 +2284,7 @@ export function startServer(opts: ServerOptions): http.Server {
           return
         }
         const action = body.action as RemoteDeviceAction
-        if (!['probe', 'inspect', 'list', 'read', 'mkdir', 'write', 'exec'].includes(action.op)) {
+        if (!['probe', 'inspect', 'git_inspect', 'git_sync', 'list', 'read', 'mkdir', 'write', 'exec'].includes(action.op)) {
           json(res, { error: 'unknown remote device operation' }, 400)
           return
         }
@@ -1921,6 +2299,11 @@ export function startServer(opts: ServerOptions): http.Server {
           command: action.op === 'exec' ? (str(action.command) ?? '').slice(0, 500) : undefined,
           actorSessionId: (str(actor.sessionId) ?? '').slice(0, 256),
           actorProfileId: (str(actor.profileId) ?? '').slice(0, 256),
+          sourceRunId: (str(actor.runId) ?? '').slice(0, 128),
+          sourceProjectId: (str(actor.projectId) ?? '').slice(0, 256),
+          sourceReplicaId: (str(actor.replicaId) ?? '').slice(0, 128),
+          sourceAgentId: (str(actor.agentId) ?? '').slice(0, 256),
+          sourceBaseCommit: (str(actor.baseCommit) ?? '').slice(0, 128),
           ok: result.ok,
           error: result.error,
           bytes: result.bytes,
@@ -2399,11 +2782,25 @@ export function startServer(opts: ServerOptions): http.Server {
           json(res, { error: 'maxLiveChildren must be a whole number from 1 to 16' }, 400)
           return
         }
+        const parallelismTarget =
+          body.parallelismTarget === undefined ? undefined : Number(body.parallelismTarget)
+        if (
+          parallelismTarget !== undefined &&
+          (!Number.isInteger(parallelismTarget) || parallelismTarget < 1 || parallelismTarget > 16)
+        ) {
+          json(res, { error: 'parallelismTarget must be a whole number from 1 to 16' }, 400)
+          return
+        }
+        if (parallelismTarget !== undefined && max !== undefined && parallelismTarget > max) {
+          json(res, { error: 'parallelismTarget cannot exceed maxLiveChildren' }, 400)
+          return
+        }
         const record = sessions.configureProjectManager(
           managerMatch[1] as string,
           {
             enabled: body.enabled,
             maxLiveChildren: max,
+            parallelismTarget,
             delegation: rawDelegation as Array<'commit' | 'push'>,
             allowedProfiles,
             allowedModels,

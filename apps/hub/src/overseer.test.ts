@@ -117,13 +117,13 @@ describe('application Overseer authority', () => {
 
     expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
       isOverseer: true,
-      overseerCapabilityVersion: 7,
+      overseerCapabilityVersion: 13,
       permissionMode: 'full',
       permissionModeOperatorOverride: true,
       role: 'Application Overseer',
     })
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
-      'Overseer capability manifest version 7',
+      'Overseer capability manifest version 13',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'mcp__allmyagents__overseer_control',
@@ -132,10 +132,19 @@ describe('application Overseer authority', () => {
       'configure_github_automation',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
-      'explicitly ask whether the manager may decide descendant approvals',
+      'explicitly ask both whether the manager may decide descendant approvals',
+    )
+    expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toMatch(
+      /durable worker roles.*retain identity.*team.*stash/is,
+    )
+    expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
+      'how many useful direct worker lanes it should target in parallel',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'reassign_manager_account',
+    )
+    expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
+      'deploy_testbed_node',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'Do not use the vendor-native list_agents or peek_agent',
@@ -145,7 +154,7 @@ describe('application Overseer authority', () => {
     expect(upgrades()).toHaveLength(1)
     expect(upgrades()[0]?.payload).toMatchObject({
       fromVersion: 6,
-      toVersion: 7,
+      toVersion: 13,
       conversationPreserved: true,
       tools: expect.arrayContaining(['overseer_control', 'remote_exec', 'browser_navigate']),
     })
@@ -173,6 +182,46 @@ describe('application Overseer authority', () => {
     await expect(h.sessions.overseerControl('overseer', {
       operation: 'set_mode', sessionId: 'ordinary', permissionMode: 'full',
     })).resolves.toMatchObject({ ok: false })
+  })
+
+  it('deploys a lightweight node only from a direct operator turn with an explicit elevated profile and reason', async () => {
+    const h = harness()
+    const deployTestbedNode = vi.fn(async (siteId: string, profile: string) => ({
+      siteId,
+      profile,
+      verified: true,
+    }))
+    h.sessions.setOverseerRuntime({ deployTestbedNode })
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'deploy_testbed_node',
+      siteId: 'fleet-device',
+      testbedProfile: 'elevated-machine',
+      reason: 'Install a full-machine Windows test target for the requested hardware validation.',
+    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/direct operator turn/u) })
+
+    h.markOperator('overseer')
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'deploy_testbed_node',
+      siteId: 'fleet-device',
+      testbedProfile: 'elevated-machine',
+    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/reason is required/u) })
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'deploy_testbed_node',
+      siteId: 'fleet-device',
+      testbedProfile: 'elevated-machine',
+      reason: 'Install a full-machine Windows test target for the requested hardware validation.',
+    })).resolves.toMatchObject({
+      ok: true,
+      data: { siteId: 'fleet-device', profile: 'elevated-machine', verified: true },
+    })
+    expect(deployTestbedNode).toHaveBeenCalledOnce()
+    expect(deployTestbedNode).toHaveBeenCalledWith('fleet-device', 'elevated-machine')
+    expect(h.journal.recentEventsForSession('overseer')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'overseer/testbed-deployment-requested' }),
+      expect.objectContaining({ kind: 'overseer/testbed-deployment-verified' }),
+    ]))
   })
 
   it('gives the Overseer a complete read-only fleet view without widening ordinary agent ACLs', () => {
@@ -379,8 +428,20 @@ describe('application Overseer authority', () => {
       sessionId: 'manager',
       managerConfig: { enabled: true, canApproveChildren: false },
     })).resolves.toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/how many useful direct worker lanes/u),
+    })
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'configure_manager',
+      sessionId: 'manager',
+      managerConfig: { enabled: true, canApproveChildren: false, parallelismTarget: 2 },
+    })).resolves.toMatchObject({
       ok: true,
-      data: expect.objectContaining({ isProjectManager: true, managerCanApproveChildren: false }),
+      data: expect.objectContaining({
+        isProjectManager: true,
+        managerCanApproveChildren: false,
+        managerParallelismTarget: 2,
+      }),
     })
 
     const moved = await h.sessions.overseerControl('overseer', {
@@ -396,6 +457,7 @@ describe('application Overseer authority', () => {
         profileId: 'p2',
         provider: 'codex',
         isProjectManager: true,
+        managerParallelismTarget: 2,
         managerReassignedFromSessionId: 'manager',
       }),
     })
@@ -419,7 +481,7 @@ describe('application Overseer authority', () => {
         description: 'One manager and one reviewer.',
         manager: {
           profileId: 'p1', permissionMode: 'full', maxChildPermissionMode: 'edits', maxLiveChildren: 2,
-          canApproveChildren: true, delegation: ['commit'], allowedTools: ['Read', 'Edit'],
+          parallelismTarget: 2, canApproveChildren: true, delegation: ['commit'], allowedTools: ['Read', 'Edit'],
         },
         agents: [{
           id: 'reviewer', name: 'Reviewer', purpose: 'Review the project.', prompt: 'Inspect the project and report.',
@@ -436,6 +498,7 @@ describe('application Overseer authority', () => {
     expect(h.sessions.list().find((record) => record.id === data.manager.id)).toMatchObject({
       isProjectManager: true,
       managerMaxChildPermissionMode: 'edits',
+      managerParallelismTarget: 2,
       permissionMode: 'full',
     })
     expect(h.sessions.list().find((record) => record.id === data.children[0]!.id)).toMatchObject({
@@ -533,16 +596,20 @@ describe('application Overseer authority', () => {
       expect(spec.claudeSystemPrompt).toMatch(/mcp__allmyagents__overseer_control/u)
       expect(spec.claudeSystemPrompt).toMatch(/fleet-wide/u)
       expect(spec.claudeSystemPrompt).toMatch(/AskUserQuestion/u)
+      expect(spec.claudeSystemPrompt).toMatch(/remote_list_devices.*remote_ping.*remote_inspect_environment.*remote_inspect_git.*remote_prepare_project_location/su)
+      expect(spec.claudeSystemPrompt).toMatch(/Never blindly retry an ambiguous write, preparation, or terminal failure/u)
       expect(spec.claudeSystemPrompt).toMatch(/COMPACTION CONTINUITY CONTRACT/u)
       expect(spec.claudeSystemPrompt).toMatch(/active objective.*current project.*current slice/su)
       expect(spec.claudeSystemPrompt).toMatch(/exact next useful action/u)
     }
-    expect(calls.find(([, prompt]) => prompt === 'check the team')?.[0].claudeSystemPrompt).toMatch(
-      /decide_child_approval/u,
-    )
-    expect(calls.find(([, prompt]) => prompt === 'report status')?.[0].claudeSystemPrompt).toMatch(
-      /report a real scope or permission block upstream/u,
-    )
+    const managerPrompt = calls.find(([, prompt]) => prompt === 'check the team')?.[0].claudeSystemPrompt
+    const childPrompt = calls.find(([, prompt]) => prompt === 'report status')?.[0].claudeSystemPrompt
+    expect(managerPrompt).toMatch(/decide_child_approval/u)
+    expect(childPrompt).toMatch(/report a real scope or permission block upstream/u)
+    for (const prompt of [managerPrompt, childPrompt]) {
+      expect(prompt).toMatch(/remote_list_devices.*remote_ping.*remote_inspect_environment.*remote_inspect_git.*remote_prepare_project_location/su)
+      expect(prompt).toMatch(/Report the returned timing, transfer, and failure-stage telemetry upstream/u)
+    }
   })
 
   it('gives Codex live developer instructions with bounded fleet/team topology and provider discipline', async () => {
@@ -584,6 +651,7 @@ describe('application Overseer authority', () => {
     const overseerSpec = calls.find(([, prompt]) => prompt === 'Check Project Alpha and tell me its exact status.')?.[0]
     expect(managerSpec?.claudeSystemPrompt).toBeUndefined()
     expect(managerSpec?.codexDeveloperInstructions).toMatch(/Codex-manager discipline/u)
+    expect(managerSpec?.codexDeveloperInstructions).toMatch(/remote_list_devices.*remote_prepare_project_location/su)
     expect(managerSpec?.codexDeveloperInstructions).toMatch(/COMPACTION CONTINUITY CONTRACT/u)
     expect(managerSpec?.codexDeveloperInstructions).toMatch(/"activeTeamId":"team-live"/u)
     expect(managerSpec?.codexDeveloperInstructions).toMatch(/"id":"team-old".*"state":"stashed"/u)
@@ -602,6 +670,7 @@ describe('application Overseer authority', () => {
       managerAllowedTools: ['commandExecution'], projectId: 'project-a', status: 'idle',
     })
     h.seed({ id: 'child', title: 'Worker', parentSessionId: 'manager', projectId: 'project-a', status: 'active' })
+    h.journal.append('manager', 'session/tokens', { scope: 'request', contextUsed: 750_000 })
 
     const decision = h.approvals.request('child', 'codex/item/commandExecution/requestApproval', {
       toolName: 'commandExecution', command: 'git status',
@@ -611,9 +680,12 @@ describe('application Overseer authority', () => {
     expect(h.bus.inbox('manager')).toEqual(expect.arrayContaining([
       expect.objectContaining({
         subject: 'child approval pending',
+        attentionRequired: true,
         body: expect.stringMatching(new RegExp(`${pending.id}.*commandExecution: git status`, 'su')),
       }),
     ]))
+    expect(h.executor.runTurn).toHaveBeenCalledOnce()
+    expect(vi.mocked(h.executor.runTurn).mock.calls[0]?.[1]).toContain(pending.id)
     expect(h.bus.inbox('overseer')).toHaveLength(0)
     expect(h.journal.recentEventsForSession('child', 20)).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: 'manager/child-approval-reported' }),
@@ -675,6 +747,7 @@ describe('application Overseer authority', () => {
       managerAllowedTools: ['browser'], projectId: 'project-a', status: 'idle',
     })
     h.seed({ id: 'child', title: 'Worker', parentSessionId: 'manager', projectId: 'project-a', status: 'active' })
+    h.journal.append('overseer', 'session/tokens', { scope: 'request', contextUsed: 750_000 })
 
     const decision = h.approvals.request('child', 'claude/tool', {
       toolName: 'PowerShell', input: { command: 'Get-Content README.md' },
@@ -685,11 +758,14 @@ describe('application Overseer authority', () => {
     expect(h.bus.inbox('overseer')).toEqual(expect.arrayContaining([
       expect.objectContaining({
         subject: 'approval awaiting operator',
+        attentionRequired: true,
         body: expect.stringMatching(
           new RegExp(`${pending.id}.*PowerShell.*Manager cannot approve this request: PowerShell is outside.*direct operator turn`, 'su'),
         ),
       }),
     ]))
+    expect(h.executor.runTurn).toHaveBeenCalledOnce()
+    expect(vi.mocked(h.executor.runTurn).mock.calls[0]?.[1]).toContain(pending.id)
     expect(h.journal.recentEventsForSession('child', 20)).toEqual(expect.arrayContaining([
       expect.objectContaining({
         kind: 'manager/child-approval-outside-ceiling',

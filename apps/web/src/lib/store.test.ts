@@ -575,6 +575,58 @@ describe('apply()', () => {
     expect(store.sessions.st1?.record.status).toBe('idle')
   })
 
+  it('applies durable-role and legacy-retirement migration events to the visible child record', () => {
+    seed('manager', { isProjectManager: true, managerTeamCapabilityVersion: 2 })
+    seed('child', {
+      parentSessionId: 'manager',
+      status: 'idle',
+      managerRetiredAt: '2026-01-01T00:00:00.000Z',
+      managerRetiredBySessionId: 'manager',
+      managerRetiredReason: 'legacy context churn',
+    })
+
+    apply(evt({
+      seq: 1,
+      kind: 'manager/child-role-upgraded',
+      sessionId: 'manager',
+      payload: { childSessionId: 'child', role: 'Durable parser maintainer' },
+    }))
+    apply(evt({
+      seq: 2,
+      kind: 'manager/child-retirement-migrated',
+      sessionId: 'manager',
+      payload: { childSessionId: 'child' },
+    }))
+
+    expect(store.sessions.child?.record).toMatchObject({
+      role: 'Durable parser maintainer',
+      status: 'stopped',
+    })
+    expect(store.sessions.child?.record.managerRetiredAt).toBeUndefined()
+    expect(store.sessions.child?.record.managerRetiredBySessionId).toBeUndefined()
+    expect(store.sessions.child?.record.managerRetiredReason).toBeUndefined()
+  })
+
+  it('does not let lazy historical retirement events roll a capability-v2 roster backward', () => {
+    seed('manager', { isProjectManager: true, managerTeamCapabilityVersion: 2 })
+    seed('child', { parentSessionId: 'manager', status: 'stopped', role: 'Durable verifier' })
+
+    apply(evt({
+      seq: 1,
+      kind: 'manager/child-retired',
+      sessionId: 'manager',
+      payload: {
+        managerSessionId: 'manager',
+        childSessionId: 'child',
+        retiredAt: '2026-01-01T00:00:00.000Z',
+        reason: 'historical context churn',
+      },
+    }))
+
+    expect(store.sessions.child?.record.managerRetiredAt).toBeUndefined()
+    expect(store.sessions.child?.record.status).toBe('stopped')
+  })
+
   it('shows an accepted optimistic turn as working before the status event arrives', () => {
     seed('optimistic-status')
 
@@ -1578,6 +1630,52 @@ describe('bounded cold baseline and global maintenance status', () => {
       'restored transcript',
     )
     expect(api.history).toHaveBeenCalledTimes(2)
+  })
+
+  it('automatically retries latest history after a transient hub event-loop timeout', async () => {
+    vi.useFakeTimers()
+    const cold = new HubStore()
+    const install = cold as unknown as {
+      installReplayBaseline(baseline: Awaited<ReturnType<typeof api.replayBaseline>>): void
+    }
+    install.installReplayBaseline({
+      version: 1,
+      generation: 7,
+      highWaterSeq: 500,
+      resetFloorSeq: 0,
+      sessions: [rec('s1')],
+      projects: [],
+      journalCompaction: null,
+    })
+    vi.mocked(api.journalHistory)
+      .mockImplementationOnce((_id, _generation, _before, signal) =>
+        new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
+        })
+      )
+      .mockResolvedValueOnce({
+        events: [
+          evt({
+            seq: 490,
+            kind: 'codex/item/completed',
+            sessionId: 's1',
+            payload: { item: { id: 'reply', type: 'agentMessage', text: 'history survived' } },
+          }),
+        ],
+        olderCursor: null,
+        hasOlder: false,
+        encodedBytes: 100,
+        checkpointGeneration: 7,
+      })
+
+    const loading = cold.ensureHistory('s1')
+    await vi.advanceTimersByTimeAsync(8_000)
+    await loading
+    vi.useRealTimers()
+
+    expect(api.journalHistory).toHaveBeenCalledTimes(2)
+    expect(cold.sessions.s1?.historyLoadError).toBeUndefined()
+    expect(cold.sessions.s1?.items.map((item) => item.text)).toContain('history survived')
   })
 
   it('keeps every lazily loaded page and live item when scrolling or tabbing away and back', async () => {

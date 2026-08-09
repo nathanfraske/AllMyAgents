@@ -2,10 +2,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte'
 import ProjectView from './ProjectView.svelte'
 import { store, type SessionView, type ThreadItem } from './store.svelte'
-import type { ProjectInfo, SessionRecord, WorktreeProjectActivity } from './api'
+import type { ProjectInfo, ProjectReplicaInfo, SessionRecord, WorktreeProjectActivity } from './api'
 
 const apiMock = vi.hoisted(() => ({
   projectActivity: vi.fn(),
+  projectReplicas: vi.fn(),
+  projectTestbedRuns: vi.fn(),
+  projectTestbedReservations: vi.fn(),
+  projectReplicaCatalog: vi.fn(),
+  addProjectReplica: vi.fn(),
+  removeProjectReplica: vi.fn(),
+  inspectProjectReplica: vi.fn(),
+  prepareProjectReplica: vi.fn(),
   send: vi.fn(),
   updateProject: vi.fn(),
 }))
@@ -27,6 +35,18 @@ const project: ProjectInfo = {
   name: 'Alpha',
   path: 'C:/work/alpha',
   createdAt: now,
+}
+
+const localReplica: ProjectReplicaInfo = {
+  id: 'replica-local',
+  projectId: project.id,
+  kind: 'local',
+  environment: { id: 'host', kind: 'host' },
+  path: project.path,
+  isPrimary: true,
+  state: 'ready',
+  createdAt: now,
+  updatedAt: now,
 }
 
 function session(
@@ -108,6 +128,22 @@ const activity: WorktreeProjectActivity = {
 beforeEach(() => {
   localStorage.clear()
   apiMock.projectActivity.mockReset().mockResolvedValue(activity)
+  apiMock.projectReplicas.mockReset().mockResolvedValue([localReplica])
+  apiMock.projectTestbedRuns.mockReset().mockResolvedValue([])
+  apiMock.projectTestbedReservations.mockReset().mockResolvedValue([])
+  apiMock.projectReplicaCatalog.mockReset().mockResolvedValue([])
+  apiMock.addProjectReplica.mockReset()
+  apiMock.removeProjectReplica.mockReset().mockResolvedValue({ ok: true })
+  apiMock.inspectProjectReplica.mockReset().mockImplementation(async (_projectId: string, replicaId: string) => ({
+    ...localReplica,
+    id: replicaId,
+    headCommit: 'a'.repeat(40),
+    headRef: 'main',
+    readiness: {
+      status: 'ready', gitAvailable: true, isRepository: true, complete: true, clean: true, checkedAt: now,
+    },
+  }))
+  apiMock.prepareProjectReplica.mockReset()
   apiMock.send.mockReset().mockResolvedValue({ ok: true })
   apiMock.updateProject.mockReset().mockImplementation(async (_id: string, patch: { name: string }) => ({
     ...project,
@@ -200,6 +236,126 @@ beforeEach(() => {
 afterEach(cleanup)
 
 describe('ProjectView', () => {
+  it('prepares a remote location at the primary revision and shows convergence', async () => {
+    const primary: ProjectReplicaInfo = {
+      ...localReplica,
+      headCommit: 'a'.repeat(40),
+      headRef: 'main',
+      readiness: {
+        status: 'ready', gitAvailable: true, isRepository: true, complete: true, clean: true,
+        repository: 'github.com/acme/alpha', checkedAt: now,
+      },
+    }
+    const remote: ProjectReplicaInfo = {
+      ...localReplica,
+      id: 'replica-remote',
+      kind: 'remote',
+      siteId: 'laptop',
+      siteLabel: 'Laptop',
+      rootId: 'root-project',
+      isPrimary: false,
+      headCommit: 'b'.repeat(40),
+      headRef: 'main',
+      readiness: {
+        status: 'ready', gitAvailable: true, isRepository: true, complete: true, clean: true,
+        repository: 'github.com/acme/alpha', checkedAt: now,
+      },
+    }
+    apiMock.projectReplicas.mockResolvedValue([primary, remote])
+    apiMock.prepareProjectReplica.mockResolvedValue({
+      ...remote,
+      headCommit: primary.headCommit,
+      headRef: undefined,
+      readiness: { ...remote.readiness!, detached: true, checkedAt: now },
+    })
+
+    render(ProjectView, { props: { projectId: project.id } })
+
+    expect(await screen.findByText(/Different revision.*bbbbbbbb/)).toBeTruthy()
+    await fireEvent.click(screen.getByRole('button', { name: /Prepare Laptop at the primary revision/i }))
+    await waitFor(() => expect(apiMock.prepareProjectReplica).toHaveBeenCalledWith(project.id, remote.id))
+    expect(await screen.findByText(/Matches primary.*aaaaaaaa/)).toBeTruthy()
+  })
+
+  it('shows explicit project locations, attributed runs, and attaches an advertised testbed root', async () => {
+    apiMock.projectTestbedRuns.mockResolvedValue([{
+      id: 'run-12345678',
+      projectId: project.id,
+      replicaId: 'replica-laptop',
+      sessionId: 'worker',
+      agentId: 'worker',
+      profileId: 'worker-profile',
+      operation: 'exec',
+      state: 'succeeded',
+      commandSummary: 'pnpm test',
+      commandSha256: 'a'.repeat(64),
+      createdAt: now,
+      startedAt: now,
+      completedAt: now,
+      exitCode: 0,
+      telemetry: { roundTripMs: 1250 },
+    }])
+    apiMock.projectReplicaCatalog.mockResolvedValue([{
+      siteId: 'laptop',
+      label: 'Nathan Beefy Laptop',
+      paired: true,
+      updatedAt: now,
+      connected: true,
+      capabilities: {
+        enabled: true,
+        platform: 'win32',
+        arch: 'x64',
+        hostname: 'laptop',
+        roots: [{ id: 'root-project', label: 'Project checkout', path: 'C:/work/alpha', read: true, write: true, terminal: true }],
+      },
+    }])
+    apiMock.projectTestbedReservations.mockResolvedValue([{
+      id: 'reservation-1',
+      projectId: project.id,
+      replicaId: 'replica-laptop',
+      sessionId: 'worker',
+      agentId: 'worker',
+      state: 'active',
+      acquiredAt: now,
+      expiresAt: '2099-01-01T00:00:00.000Z',
+    }])
+    const remoteReplica: ProjectReplicaInfo = {
+      ...localReplica,
+      id: 'replica-laptop',
+      kind: 'remote',
+      siteId: 'laptop',
+      siteLabel: 'Nathan Beefy Laptop',
+      rootId: 'root-project',
+      isPrimary: false,
+      state: 'registered',
+    }
+    apiMock.addProjectReplica.mockResolvedValue(remoteReplica)
+    apiMock.inspectProjectReplica.mockResolvedValue({
+      ...remoteReplica,
+      state: 'ready',
+      headCommit: 'a'.repeat(40),
+      headRef: 'main',
+      readiness: {
+        status: 'ready', gitAvailable: true, isRepository: true, complete: true, clean: true, checkedAt: now,
+      },
+    })
+
+    render(ProjectView, { props: { projectId: project.id } })
+
+    expect(await screen.findByText('This hub')).toBeTruthy()
+    expect(await screen.findByText('pnpm test')).toBeTruthy()
+    expect(screen.getByText(/Bose.*1\.3 s.*exit 0/)).toBeTruthy()
+    await fireEvent.click(screen.getByRole('button', { name: /add testbed location/i }))
+    expect(await screen.findByText('Nathan Beefy Laptop')).toBeTruthy()
+    await fireEvent.click(screen.getByRole('button', { name: /Project checkout/ }))
+    await waitFor(() => expect(apiMock.addProjectReplica).toHaveBeenCalledWith(project.id, 'laptop', 'root-project'))
+    expect(await screen.findByText('Nathan Beefy Laptop')).toBeTruthy()
+    expect(screen.getByText(/Reserved by Bose/)).toBeTruthy()
+    await fireEvent.click(screen.getByRole('button', { name: /Inspect Git readiness for Nathan Beefy Laptop/i }))
+    await waitFor(() => expect(apiMock.inspectProjectReplica).toHaveBeenCalledWith(project.id, 'replica-laptop'))
+    expect(screen.getByText(/Git clean.*main/)).toBeTruthy()
+  })
+
   it('shows lifecycle status, manager grouping, files, taskboards, collisions, and project bus traffic', async () => {
     render(ProjectView, { props: { projectId: project.id } })
 
@@ -319,7 +475,7 @@ describe('ProjectView', () => {
   })
 
   it('keeps retired children out of the live team and exposes them as preserved records', async () => {
-    store.sessions.retired = session('retired', 'Corbato', 'stopped', {
+    store.sessions.retired = session('retired', 'Corbato', 'active', {
       parentSessionId: 'manager',
       managerTeamId: 'team-a',
       managerTeamName: 'Core team',
@@ -329,6 +485,7 @@ describe('ProjectView', () => {
 
     const { container } = render(ProjectView, { props: { projectId: project.id } })
 
+    expect(screen.getByLabelText('Team status summary').textContent).toMatch(/5 agents/)
     expect([...container.querySelectorAll('.agent-list .name')].map((node) => node.textContent)).not.toContain('Corbato')
     expect(screen.getByText('1 retired agent record')).toBeTruthy()
     expect(screen.getByText(/Archived agents are absent from the working catalog/)).toBeTruthy()

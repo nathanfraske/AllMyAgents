@@ -1904,6 +1904,33 @@ export class Journal extends EventEmitter {
     }
     selectCandidates()
 
+    // This diagnostic walks the bounded transient projection, but on a multi-million-row journal it can
+    // still take seconds. It is deliberately outside the write transaction: holding SQLite's single writer
+    // lock during a read-only count made the live hub's next synchronous append wait in native code, freezing
+    // HTTP/WebSocket handling even though maintenance itself runs in a child process.
+    const oversizedTransientRowsRetained = this.db
+      .prepare(
+        `SELECT COUNT(*)
+         FROM journal_transient_event_index
+         WHERE seq <= ?
+           AND kind IN (
+             'codex/item/commandExecution/outputDelta',
+             'codex/item/agentMessage/delta',
+             'codex/turn/diff/updated',
+             'codex/item/started'
+           )
+           AND payload_bytes > ?`
+      )
+      .pluck()
+      .get(maxPrunableSeq, transientByteLimit)
+    if (
+      typeof oversizedTransientRowsRetained !== 'number' ||
+      !Number.isSafeInteger(oversizedTransientRowsRetained) ||
+      oversizedTransientRowsRetained < 0
+    ) {
+      throw new Error('journal condensation oversized-row count is invalid')
+    }
+
     const applyDeletes = this.db.transaction(
       (): Pick<
         JournalCondenseResult,
@@ -1947,56 +1974,42 @@ export class Journal extends EventEmitter {
         ) {
           throw new Error('journal condensation selected an invalid payload-byte batch')
         }
-        const oversizedTransientRowsRetained = this.db
+        // Count the already-bounded selection through its compact projection, then delete by the events
+        // INTEGER PRIMARY KEY in one statement. Four kind-filtered DELETEs previously made SQLite revisit
+        // the payload-heavy events table four times while holding the writer lock. On the operator's 1.7 GB
+        // journal that blocked the hub for longer than the renderer's eight-second history deadline.
+        const selectedKinds = this.db
           .prepare(
-            `SELECT COUNT(*)
-             FROM journal_transient_event_index
-             WHERE seq <= ?
-               AND kind IN (
-                 'codex/item/commandExecution/outputDelta',
-                 'codex/item/agentMessage/delta',
-                 'codex/turn/diff/updated',
-                 'codex/item/started'
-               )
-               AND payload_bytes > ?`
+            `SELECT candidate.kind, COUNT(*) AS count
+             FROM journal_condense_delete AS selected
+             JOIN journal_transient_event_index AS candidate ON candidate.seq = selected.seq
+             GROUP BY candidate.kind`
           )
-          .pluck()
-          .get(maxPrunableSeq, transientByteLimit)
-        if (
-          typeof oversizedTransientRowsRetained !== 'number' ||
-          !Number.isSafeInteger(oversizedTransientRowsRetained) ||
-          oversizedTransientRowsRetained < 0
-        ) {
-          throw new Error('journal condensation oversized-row count is invalid')
+          .all() as Array<{ kind: string; count: number }>
+        const selectedCount = (kind: string): number =>
+          selectedKinds.find((row) => row.kind === kind)?.count ?? 0
+        const commandOutputDeltasDeleted = selectedCount(
+          'codex/item/commandExecution/outputDelta'
+        )
+        const agentMessageDeltasDeleted = selectedCount('codex/item/agentMessage/delta')
+        const diffSnapshotsDeleted = selectedCount('codex/turn/diff/updated')
+        const itemStartedDeleted = selectedCount('codex/item/started')
+        const expectedDeletes =
+          commandOutputDeltasDeleted +
+          agentMessageDeltasDeleted +
+          diffSnapshotsDeleted +
+          itemStartedDeleted
+        const deleted = this.db
+          .prepare(
+            `DELETE FROM events
+             WHERE seq IN (SELECT seq FROM journal_condense_delete)`
+          )
+          .run().changes
+        if (deleted !== expectedDeletes) {
+          throw new Error(
+            `journal condensation deleted ${deleted} rows from a ${expectedDeletes}-row selection`
+          )
         }
-        const commandOutputDeltasDeleted = this.db
-          .prepare(
-            `DELETE FROM events
-             WHERE kind = 'codex/item/commandExecution/outputDelta'
-               AND seq IN (SELECT seq FROM journal_condense_delete)`
-          )
-          .run().changes
-        const agentMessageDeltasDeleted = this.db
-          .prepare(
-            `DELETE FROM events
-             WHERE kind = 'codex/item/agentMessage/delta'
-               AND seq IN (SELECT seq FROM journal_condense_delete)`
-          )
-          .run().changes
-        const diffSnapshotsDeleted = this.db
-          .prepare(
-            `DELETE FROM events
-             WHERE kind = 'codex/turn/diff/updated'
-               AND seq IN (SELECT seq FROM journal_condense_delete)`
-          )
-          .run().changes
-        const itemStartedDeleted = this.db
-          .prepare(
-            `DELETE FROM events
-             WHERE kind = 'codex/item/started'
-               AND seq IN (SELECT seq FROM journal_condense_delete)`
-          )
-          .run().changes
         if (
           commandOutputDeltasDeleted > 0 ||
           agentMessageDeltasDeleted > 0 ||

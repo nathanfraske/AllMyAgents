@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import pathModule from 'node:path'
 import type Database from 'better-sqlite3'
 import { readProjectConfig } from './importScan.js'
-import type { Project } from './types.js'
+import type { Project, ProjectReplica, ProjectReplicaReadiness } from './types.js'
 
 type ProjectLocation = NonNullable<Project['location']>
 
@@ -19,6 +19,75 @@ interface ProjectRow {
   wslDistro: string | null
   linuxPath: string | null
   createdAt: string
+}
+
+interface ProjectReplicaRow {
+  id: string
+  projectId: string
+  kind: 'local' | 'remote'
+  siteId: string | null
+  siteLabel: string | null
+  rootId: string | null
+  environmentId: string
+  environmentKind: 'host' | 'wsl'
+  environmentLabel: string | null
+  distro: string | null
+  path: string
+  isPrimary: number
+  state: 'ready' | 'registered' | 'unavailable'
+  headCommit: string | null
+  headRef: string | null
+  readinessJson: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+function replicaFromRow(row: ProjectReplicaRow | undefined): ProjectReplica | undefined {
+  if (!row) return undefined
+  let readiness: ProjectReplicaReadiness | undefined
+  try {
+    const parsed = row.readinessJson ? JSON.parse(row.readinessJson) as Partial<ProjectReplicaReadiness> : undefined
+    if (
+      parsed &&
+      ['unknown', 'ready', 'dirty', 'not-repository', 'unavailable'].includes(parsed.status ?? '') &&
+      typeof parsed.gitAvailable === 'boolean' &&
+      typeof parsed.isRepository === 'boolean' &&
+      typeof parsed.complete === 'boolean' &&
+      typeof parsed.checkedAt === 'string'
+    ) readiness = parsed as ProjectReplicaReadiness
+  } catch {
+    readiness = undefined
+  }
+  return {
+    id: row.id,
+    projectId: row.projectId,
+    kind: row.kind,
+    ...(row.siteId ? { siteId: row.siteId } : {}),
+    ...(row.siteLabel ? { siteLabel: row.siteLabel } : {}),
+    ...(row.rootId ? { rootId: row.rootId } : {}),
+    environment: {
+      id: row.environmentId,
+      kind: row.environmentKind,
+      ...(row.environmentLabel ? { label: row.environmentLabel } : {}),
+      ...(row.distro ? { distro: row.distro } : {}),
+    },
+    path: row.path,
+    isPrimary: row.isPrimary === 1,
+    state: row.state,
+    ...(row.headCommit ? { headCommit: row.headCommit } : {}),
+    ...(row.headRef ? { headRef: row.headRef } : {}),
+    ...(readiness ? { readiness } : {}),
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  }
+}
+
+function localReplicaId(projectId: string): string {
+  return `replica_${crypto.createHash('sha256').update(`local:${projectId}`).digest('hex').slice(0, 24)}`
+}
+
+function remoteReplicaId(projectId: string, siteId: string, rootId: string): string {
+  return `replica_${crypto.createHash('sha256').update(`remote:${projectId}:${siteId}:${rootId}`).digest('hex').slice(0, 24)}`
 }
 
 function fromRow(row: ProjectRow | undefined): Project | undefined {
@@ -57,6 +126,12 @@ export class ProjectStore {
   private readonly trustGetStmt: Database.Statement
   private readonly trustUpsertStmt: Database.Statement
   private readonly trustDelStmt: Database.Statement
+  private readonly replicaInsertStmt: Database.Statement
+  private readonly replicaAllStmt: Database.Statement
+  private readonly replicaGetStmt: Database.Statement
+  private readonly replicaDeleteStmt: Database.Statement
+  private readonly replicaDeleteProjectStmt: Database.Statement
+  private readonly replicaReadinessStmt: Database.Statement
 
   constructor(
     private readonly db: Database.Database,
@@ -84,6 +159,35 @@ export class ProjectStore {
     db.exec(
       'CREATE TABLE IF NOT EXISTS project_config_trust (projectId TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, approvedAt TEXT NOT NULL)'
     )
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS project_replicas (
+        id TEXT PRIMARY KEY,
+        projectId TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('local', 'remote')),
+        siteId TEXT,
+        siteLabel TEXT,
+        rootId TEXT,
+        environmentId TEXT NOT NULL,
+        environmentKind TEXT NOT NULL CHECK (environmentKind IN ('host', 'wsl')),
+        environmentLabel TEXT,
+        distro TEXT,
+        path TEXT NOT NULL,
+        isPrimary INTEGER NOT NULL DEFAULT 0,
+        state TEXT NOT NULL CHECK (state IN ('ready', 'registered', 'unavailable')),
+        headCommit TEXT,
+        headRef TEXT,
+        readinessJson TEXT,
+        createdAt TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS project_replicas_project_idx ON project_replicas(projectId, isPrimary DESC, createdAt ASC);
+      CREATE UNIQUE INDEX IF NOT EXISTS project_replicas_remote_identity_idx
+        ON project_replicas(projectId, siteId, rootId) WHERE kind = 'remote';
+    `)
+    const replicaColumns = new Set(
+      (db.prepare('PRAGMA table_info(project_replicas)').all() as Array<{ name: string }>).map((column) => column.name),
+    )
+    if (!replicaColumns.has('readinessJson')) db.exec('ALTER TABLE project_replicas ADD COLUMN readinessJson TEXT')
     this.insertStmt = db.prepare(
       'INSERT INTO projects (id, name, path, wslDistro, linuxPath, createdAt) VALUES (?, ?, ?, ?, ?, ?)',
     )
@@ -100,6 +204,67 @@ export class ProjectStore {
       'INSERT INTO project_config_trust (projectId, fingerprint, approvedAt) VALUES (?, ?, ?) ON CONFLICT(projectId) DO UPDATE SET fingerprint = excluded.fingerprint, approvedAt = excluded.approvedAt'
     )
     this.trustDelStmt = db.prepare('DELETE FROM project_config_trust WHERE projectId = ?')
+    this.replicaInsertStmt = db.prepare(`
+      INSERT INTO project_replicas (
+        id, projectId, kind, siteId, siteLabel, rootId, environmentId, environmentKind,
+        environmentLabel, distro, path, isPrimary, state, headCommit, headRef, readinessJson, createdAt, updatedAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO NOTHING
+    `)
+    this.replicaAllStmt = db.prepare('SELECT * FROM project_replicas WHERE projectId = ? ORDER BY isPrimary DESC, createdAt ASC')
+    this.replicaGetStmt = db.prepare('SELECT * FROM project_replicas WHERE id = ?')
+    this.replicaDeleteStmt = db.prepare("DELETE FROM project_replicas WHERE id = ? AND isPrimary = 0")
+    this.replicaDeleteProjectStmt = db.prepare('DELETE FROM project_replicas WHERE projectId = ?')
+    this.replicaReadinessStmt = db.prepare(`
+      UPDATE project_replicas
+      SET state = ?, headCommit = ?, headRef = ?, readinessJson = ?, updatedAt = ?
+      WHERE id = ? AND projectId = ?
+    `)
+    // Existing projects predate explicit replicas. Materialize their one known local location without
+    // manufacturing lifecycle events: this is a deterministic schema upgrade, not a new operator action.
+    for (const project of this.list()) this.insertLocalReplica(project)
+  }
+
+  private insertReplica(replica: ProjectReplica): void {
+    this.replicaInsertStmt.run(
+      replica.id,
+      replica.projectId,
+      replica.kind,
+      replica.siteId ?? null,
+      replica.siteLabel ?? null,
+      replica.rootId ?? null,
+      replica.environment.id,
+      replica.environment.kind,
+      replica.environment.label ?? null,
+      replica.environment.distro ?? null,
+      replica.path,
+      replica.isPrimary ? 1 : 0,
+      replica.state,
+      replica.headCommit ?? null,
+      replica.headRef ?? null,
+      replica.readiness ? JSON.stringify(replica.readiness) : null,
+      replica.createdAt,
+      replica.updatedAt,
+    )
+  }
+
+  private insertLocalReplica(project: Project): ProjectReplica {
+    const now = project.createdAt
+    const replica: ProjectReplica = {
+      id: localReplicaId(project.id),
+      projectId: project.id,
+      kind: 'local',
+      environment: project.location?.kind === 'wsl'
+        ? { id: `wsl:${project.location.distro}`, kind: 'wsl', label: `${project.location.distro} (WSL)`, distro: project.location.distro }
+        : { id: 'host', kind: 'host' },
+      path: project.location?.kind === 'wsl' ? project.location.linuxPath : project.path,
+      isPrimary: true,
+      state: 'ready',
+      createdAt: now,
+      updatedAt: now,
+    }
+    this.insertReplica(replica)
+    return this.getReplica(replica.id)!
   }
 
   list(): Project[] {
@@ -135,6 +300,7 @@ export class ProjectStore {
         project.location?.linuxPath ?? null,
         project.createdAt,
       )
+      this.insertLocalReplica(project)
       this.lifecycle?.append(null, 'project/created', { project })
     }
     // A project must not become visible in the durable registry without the lifecycle row that makes
@@ -155,8 +321,132 @@ export class ProjectStore {
   }
 
   remove(id: string): void {
-    this.delStmt.run(id)
-    this.trustDelStmt.run(id) // approval is meaningless once the project is gone
+    const remove = (): void => {
+      this.replicaDeleteProjectStmt.run(id)
+      this.delStmt.run(id)
+      this.trustDelStmt.run(id) // approval is meaningless once the project is gone
+    }
+    if (this.lifecycle) this.lifecycle.atomic(remove)
+    else remove()
+  }
+
+  listReplicas(projectId: string): ProjectReplica[] {
+    return (this.replicaAllStmt.all(projectId) as ProjectReplicaRow[]).map((row) => replicaFromRow(row)!)
+  }
+
+  getReplica(id: string): ProjectReplica | undefined {
+    return replicaFromRow(this.replicaGetStmt.get(id) as ProjectReplicaRow | undefined)
+  }
+
+  primaryReplica(projectId: string): ProjectReplica | undefined {
+    return this.listReplicas(projectId).find((replica) => replica.isPrimary)
+  }
+
+  findRemoteReplica(projectId: string, siteId: string, rootId: string): ProjectReplica | undefined {
+    return this.listReplicas(projectId).find(
+      (replica) => replica.kind === 'remote' && replica.siteId === siteId && replica.rootId === rootId,
+    )
+  }
+
+  addRemoteReplica(input: {
+    projectId: string
+    siteId: string
+    siteLabel: string
+    rootId: string
+    path: string
+    environment?: { kind: 'wsl'; distro: string }
+  }): ProjectReplica {
+    if (!this.get(input.projectId)) throw new Error(`unknown project: ${input.projectId}`)
+    const existing = this.findRemoteReplica(input.projectId, input.siteId, input.rootId)
+    if (existing) return existing
+    const now = new Date().toISOString()
+    const replica: ProjectReplica = {
+      id: remoteReplicaId(input.projectId, input.siteId, input.rootId),
+      projectId: input.projectId,
+      kind: 'remote',
+      siteId: input.siteId,
+      siteLabel: input.siteLabel,
+      rootId: input.rootId,
+      environment: input.environment
+        ? { id: `wsl:${input.environment.distro}`, kind: 'wsl', label: `${input.environment.distro} (WSL)`, distro: input.environment.distro }
+        : { id: 'host', kind: 'host' },
+      path: input.path,
+      isPrimary: false,
+      state: 'registered',
+      createdAt: now,
+      updatedAt: now,
+    }
+    const insert = (): void => {
+      this.insertReplica(replica)
+      this.lifecycle?.append(null, 'project/replica-added', { projectId: input.projectId, replica })
+    }
+    if (this.lifecycle) this.lifecycle.atomic(insert)
+    else insert()
+    return this.getReplica(replica.id)!
+  }
+
+  removeReplica(projectId: string, replicaId: string): boolean {
+    const replica = this.getReplica(replicaId)
+    if (!replica || replica.projectId !== projectId) return false
+    if (replica.isPrimary) throw new Error('The primary local project location cannot be removed.')
+    let removed = false
+    const remove = (): void => {
+      removed = this.replicaDeleteStmt.run(replicaId).changes > 0
+      if (removed) this.lifecycle?.append(null, 'project/replica-removed', { projectId, replicaId })
+    }
+    if (this.lifecycle) this.lifecycle.atomic(remove)
+    else remove()
+    return removed
+  }
+
+  updateReplicaReadiness(
+    projectId: string,
+    replicaId: string,
+    readiness: ProjectReplicaReadiness & { headCommit?: string; headRef?: string },
+  ): ProjectReplica {
+    const replica = this.getReplica(replicaId)
+    if (!replica || replica.projectId !== projectId) throw new Error('project location not found')
+    const updatedAt = new Date().toISOString()
+    const state = readiness.status === 'ready'
+      ? 'ready'
+      : readiness.status === 'unavailable'
+        ? 'unavailable'
+        : 'registered'
+    const normalized: ProjectReplicaReadiness = {
+      status: readiness.status,
+      gitAvailable: readiness.gitAvailable,
+      isRepository: readiness.isRepository,
+      complete: readiness.complete,
+      ...(readiness.clean === undefined ? {} : { clean: readiness.clean }),
+      ...(readiness.detached === undefined ? {} : { detached: readiness.detached }),
+      ...(readiness.repository ? { repository: readiness.repository.slice(0, 500) } : {}),
+      ...(readiness.trackedChanges === undefined ? {} : { trackedChanges: readiness.trackedChanges }),
+      ...(readiness.untrackedFiles === undefined ? {} : { untrackedFiles: readiness.untrackedFiles }),
+      checkedAt: readiness.checkedAt,
+      ...(readiness.error ? { error: readiness.error.slice(0, 1_000) } : {}),
+    }
+    const update = (): void => {
+      this.replicaReadinessStmt.run(
+        state,
+        readiness.headCommit ?? null,
+        readiness.headRef ?? null,
+        JSON.stringify(normalized),
+        updatedAt,
+        replicaId,
+        projectId,
+      )
+      this.lifecycle?.append(null, 'project/replica-inspected', {
+        projectId,
+        replicaId,
+        state,
+        headCommit: readiness.headCommit ?? null,
+        headRef: readiness.headRef ?? null,
+        readiness: normalized,
+      })
+    }
+    if (this.lifecycle) this.lifecycle.atomic(update)
+    else update()
+    return this.getReplica(replicaId)!
   }
 
   /**

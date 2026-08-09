@@ -748,6 +748,7 @@ describe('project-manager delegated authority security boundary', () => {
       input: {
         profileId?: string
         agentType?: string
+        role?: string
         prompt: string
         model?: string
         permissionMode?: 'safe' | 'edits' | 'full'
@@ -756,8 +757,9 @@ describe('project-manager delegated authority security boundary', () => {
     decideChildApproval(
       managerSessionId: string,
       approvalId: string,
-      approve: boolean
-    ): { ok: boolean; error?: string }
+      approve: boolean,
+      remember?: boolean,
+    ): { ok: boolean; remembered?: boolean; warning?: string; error?: string }
   }
 
   function controls(sessions: SessionManager): ManagerControls {
@@ -1122,6 +1124,96 @@ describe('project-manager delegated authority security boundary', () => {
     }))
   })
 
+  it('a manager may remember an exact child tool class and later revoke it', async () => {
+    const { sessions, seed, journal } = makeSessions()
+    seed({
+      isProjectManager: true,
+      status: 'stopped',
+      managerCanApproveChildren: true,
+      managerAllowedTools: ['Bash'],
+    } as Partial<SessionRecord>)
+    const child = seed({
+      id: 'child',
+      parentSessionId: 's1',
+      permissionMode: 'safe',
+    } as Partial<SessionRecord>)
+    const approvals = (sessions as unknown as { approvals: ApprovalService }).approvals
+    const pending = approvals.request('child', 'claude/tool', {
+      toolName: 'Bash',
+      input: { command: 'pnpm test' },
+    })
+    const approvalId = approvals.pending()[0]!.id
+
+    expect(controls(sessions).decideChildApproval('s1', approvalId, true, true)).toEqual({
+      ok: true,
+      remembered: true,
+    })
+    await expect(pending).resolves.toBe(true)
+    expect(child.delegatedTools).toEqual(['Bash'])
+    expect(new SessionStore(journal.db).all()).toContainEqual(expect.objectContaining({
+      id: 'child',
+      delegatedTools: ['Bash'],
+    }))
+    expect(sessions.isAutoApproved('child', 'claude/tool', {
+      toolName: 'Bash',
+      input: { command: 'pnpm test -- --runInBand' },
+    })).toBe(true)
+    expect(journal.replay(0)).toContainEqual(expect.objectContaining({
+      sessionId: 's1',
+      kind: 'manager/child-auto-approval-remembered',
+      payload: expect.objectContaining({
+        childSessionId: 'child',
+        approvalId,
+        toolName: 'Bash',
+      }),
+    }))
+
+    controls(sessions).setChildDelegation('s1', 'child', [], [])
+    expect(sessions.isAutoApproved('child', 'claude/tool', {
+      toolName: 'Bash',
+      input: { command: 'pnpm test' },
+    })).toBe(false)
+  })
+
+  it('does not turn a remembered denial or one-shot approval into a standing grant', async () => {
+    const { sessions, seed } = makeSessions()
+    seed({
+      isProjectManager: true,
+      status: 'stopped',
+      managerCanApproveChildren: true,
+      managerAllowedTools: ['Bash'],
+    } as Partial<SessionRecord>)
+    seed({ id: 'child', parentSessionId: 's1', permissionMode: 'safe' } as Partial<SessionRecord>)
+    seed({
+      id: 'child-ii',
+      parentSessionId: 'child',
+      managerRootSessionId: 's1',
+      isOneShotSubagent: true,
+      permissionMode: 'safe',
+    } as Partial<SessionRecord>)
+    const approvals = (sessions as unknown as { approvals: ApprovalService }).approvals
+
+    const deniedPending = approvals.request('child', 'claude/tool', { toolName: 'Bash' })
+    const deniedId = approvals.pending()[0]!.id
+    expect(controls(sessions).decideChildApproval('s1', deniedId, false, true)).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/only valid when approving/i),
+    })
+    expect(approvals.pending()).toHaveLength(1)
+    approvals.resolve(deniedId, false)
+    await expect(deniedPending).resolves.toBe(false)
+
+    const nestedPending = approvals.request('child-ii', 'claude/tool', { toolName: 'Bash' })
+    const nestedId = approvals.pending()[0]!.id
+    expect(controls(sessions).decideChildApproval('s1', nestedId, true, true)).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/one-shot.*direct worker/i),
+    })
+    expect(approvals.pending()).toHaveLength(1)
+    approvals.resolve(nestedId, false)
+    await expect(nestedPending).resolves.toBe(false)
+  })
+
   it('recognizes the exact inner Git command from a Codex PowerShell approval envelope', async () => {
     const { sessions, seed } = makeSessions()
     const manager = seed({
@@ -1340,7 +1432,8 @@ describe('project-manager delegated authority security boundary', () => {
       },
       'operator',
     )
-    expect(configured.managerStandingInstructions).toBe(standing)
+    expect(configured.managerStandingInstructions).toContain(standing)
+    expect(configured.managerStandingInstructions).toMatch(/Hub-enforced roster continuity.*durable role.*New retirement is disabled/is)
 
     // Simulate the first message no longer being available after compaction. The durable instruction
     // scope and native instruction file must still carry the manager rules on a later turn.

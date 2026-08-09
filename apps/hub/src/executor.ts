@@ -221,6 +221,7 @@ export interface InProcessExecutorHubHooks {
     input: {
       profileId?: string
       agentType?: string
+      role?: string
       prompt: string
       model?: string
       effort?: string
@@ -240,8 +241,9 @@ export interface InProcessExecutorHubHooks {
   managerDecideChildApproval(
     managerSessionId: string,
     approvalId: string,
-    approve: boolean
-  ): { ok: boolean; error?: string }
+    approve: boolean,
+    remember?: boolean,
+  ): { ok: boolean; remembered?: boolean; warning?: string; error?: string }
   managerAssignChildTask(
     managerSessionId: string,
     childSessionId: string,
@@ -262,6 +264,11 @@ export interface InProcessExecutorHubHooks {
     siteId: string,
     action: Parameters<AgentServices['remoteExecute']>[2],
   ): ReturnType<AgentServices['remoteExecute']>
+  remotePrepareProjectLocation(
+    sessionId: string,
+    siteId: string,
+    rootId: string,
+  ): ReturnType<AgentServices['remotePrepareProjectLocation']>
   overseerControl(
     sessionId: string,
     input: Parameters<AgentServices['overseerControl']>[1],
@@ -326,13 +333,15 @@ export class InProcessExecutor implements Executor {
           tools,
           permissionMode,
         ),
-      decideChildApproval: (managerSessionId, approvalId, approve) =>
-        this.h.managerDecideChildApproval(managerSessionId, approvalId, approve),
+      decideChildApproval: (managerSessionId, approvalId, approve, remember) =>
+        this.h.managerDecideChildApproval(managerSessionId, approvalId, approve, remember),
       assignChildTask: (managerSessionId, childSessionId, input) =>
         this.h.managerAssignChildTask(managerSessionId, childSessionId, input),
       browser: (sessionId, operation, args) => this.h.browser(sessionId, operation, args),
       remoteDevices: (sessionId) => this.h.remoteDevices(sessionId),
       remoteExecute: (sessionId, siteId, action) => this.h.remoteExecute(sessionId, siteId, action),
+      remotePrepareProjectLocation: (sessionId, siteId, rootId) =>
+        this.h.remotePrepareProjectLocation(sessionId, siteId, rootId),
       overseerControl: (sessionId, input) => this.h.overseerControl(sessionId, input),
       memory: this.services.memory,
       practices: this.services.practices,

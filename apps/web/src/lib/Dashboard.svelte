@@ -4,6 +4,8 @@
   import { settings } from './settings.svelte'
   import { relativeTime } from './time'
   import { api, type StatsResult, type DayStat, type WorktreeProjectActivity } from './api'
+  import { heatmapColor, heatmapRelativePercent } from './dashboardUsage'
+  import { apiEquivalentCostAmount } from './usageDisplay'
   import ProviderLogo from './ProviderLogo.svelte'
   import Icon from './Icon.svelte'
 
@@ -28,11 +30,13 @@
   })
 
   const sessions = $derived(store.sessionList)
-  const totalSessions = $derived(sessions.length)
-  const claudeCount = $derived(sessions.filter((s) => s.record.provider === 'claude').length)
-  const codexCount = $derived(sessions.filter((s) => s.record.provider === 'codex').length)
+  const catalogSessions = $derived(sessions.filter((session) => !session.record.managerRetiredAt))
+  const totalSessions = $derived(catalogSessions.length)
+  const claudeCount = $derived(catalogSessions.filter((s) => s.record.provider === 'claude').length)
+  const codexCount = $derived(catalogSessions.filter((s) => s.record.provider === 'codex').length)
 
   const days = $derived(stats?.days ?? [])
+  const busiestDayTurns = $derived(days.reduce((max, day) => Math.max(max, day.turns), 0))
   // Group the days into calendar MONTHS. Each renders as its own 7-row heatmap block (weeks =
   // columns) with the month name on top and its first day padded to the right weekday; a gap
   // separates the blocks so it reads like a proper calendar, and navigation is per-month (pageMonth).
@@ -84,12 +88,10 @@
     (selectedDate ? days.find((d) => d.date === selectedDate) : null) ?? days[days.length - 1] ?? null
   )
 
-  // GitHub-style intensity: fixed turns/day thresholds so the heatmap visibly SCALES with usage even
-  // on sparse days (relative-to-max washed every low-activity day to one shade). 0 → faint empty tile.
+  // Scale every non-empty day against the busiest day in the visible window. A visible floor keeps
+  // low-activity days legible without making a 10-turn day indistinguishable from a 300-turn day.
   function shade(turns: number): string {
-    if (turns <= 0) return 'color-mix(in srgb, var(--accent) 6%, var(--surface-2))'
-    const pct = turns >= 10 ? 100 : turns >= 6 ? 74 : turns >= 3 ? 50 : 28
-    return `color-mix(in srgb, var(--accent) ${pct}%, var(--surface-2))`
+    return heatmapColor(turns, busiestDayTurns)
   }
   function monthLabel(date: string): string {
     return new Date(date + 'T00:00:00Z').toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
@@ -137,7 +139,7 @@
   }
   const projectRows = $derived.by(() => {
     const byProject = new Map<string, SessionView[]>()
-    for (const s of sessions) {
+    for (const s of catalogSessions) {
       if (!s.record.projectId) continue
       const projectSessions = byProject.get(s.record.projectId) ?? []
       projectSessions.push(s)
@@ -284,7 +286,7 @@
     tipX = e.clientX
     tipY = e.clientY
   }
-  function topProjects(d: DayStat): Array<[string, { turns: number; cost: number }]> {
+  function topProjects(d: DayStat): Array<[string, { turns: number; apiEquivalentCostUsd: number }]> {
     return Object.entries(d.projects).sort((a, b) => b[1].turns - a[1].turns)
   }
 </script>
@@ -354,7 +356,12 @@
         <div class="tile"><div class="num">{totalSessions}</div><div class="lbl dim">sessions</div></div>
         <div class="tile"><div class="num">{projectRows.length}</div><div class="lbl dim">projects</div></div>
         <div class="tile"><div class="num">{stats?.totalTurns ?? '—'}</div><div class="lbl dim">turns (past yr)</div></div>
-        <div class="tile"><div class="num">${(stats?.totalCost ?? 0).toFixed(2)}</div><div class="lbl dim">spend (past yr)</div></div>
+        {#if settings.showSpend}
+          <div class="tile" title="Claude SDK token-price estimate; not a provider bill or subscription-plan charge">
+            <div class="num">{apiEquivalentCostAmount(stats?.totalApiEquivalentCostUsd ?? 0)}</div>
+            <div class="lbl dim">API-equivalent (past yr)</div>
+          </div>
+        {/if}
         <div class="tile split">
           <div class="prov"><ProviderLogo provider="claude" size={13} /> {claudeCount}</div>
           <div class="prov"><ProviderLogo provider="codex" size={13} /> {codexCount}</div>
@@ -385,7 +392,7 @@
                     {#each Array(mo.pad) as _, i (i)}<div class="cell pad"></div>{/each}
                     {#each mo.days as d (d.date)}
                       <button type="button" class="cell" class:selected={selectedDay?.date === d.date} style="background: {shade(d.turns)}"
-                        aria-label="{d.date}: {d.turns} turns" aria-pressed={selectedDay?.date === d.date}
+                        aria-label="{d.date}: {d.turns} turns, {heatmapRelativePercent(d.turns, busiestDayTurns)}% of busiest day" aria-pressed={selectedDay?.date === d.date}
                         onmouseenter={(e) => onEnter(d, e)} onmousemove={(e) => onEnter(d, e)} onmouseleave={() => (hovered = null)}
                         onclick={() => (selectedDate = d.date)}></button>
                     {/each}
@@ -396,10 +403,10 @@
           </div>
           <div class="legend dim"><span>less</span>
             <span class="k" style="background: {shade(0)}"></span>
-            <span class="k" style="background: {shade(1)}"></span>
-            <span class="k" style="background: {shade(3)}"></span>
-            <span class="k" style="background: {shade(6)}"></span>
-            <span class="k" style="background: {shade(10)}"></span>
+            <span class="k" style="background: {shade(busiestDayTurns * 0.25)}"></span>
+            <span class="k" style="background: {shade(busiestDayTurns * 0.5)}"></span>
+            <span class="k" style="background: {shade(busiestDayTurns * 0.75)}"></span>
+            <span class="k" style="background: {shade(busiestDayTurns)}"></span>
             <span>more</span></div>
         {/if}
       </section>
@@ -459,7 +466,9 @@
           <div class="dhead">{fullDate(selectedDay.date)}</div>
           <div class="dstats">
             <div class="dstat"><div class="num">{selectedDay.turns}</div><div class="lbl dim">turns</div></div>
-            <div class="dstat"><div class="num">${selectedDay.cost.toFixed(2)}</div><div class="lbl dim">spend</div></div>
+            {#if settings.showSpend}
+              <div class="dstat"><div class="num">{apiEquivalentCostAmount(selectedDay.apiEquivalentCostUsd)}</div><div class="lbl dim">API-equivalent</div></div>
+            {/if}
           </div>
           {#if selectedDay.turns === 0}
             <div class="dim empty2">No activity on this day.</div>
@@ -469,7 +478,7 @@
               {#each topProjects(selectedDay) as [name, p] (name)}
                 <div class="drow">
                   <span class="dn">{name}</span>
-                  <span class="dv">{p.turns} turn{p.turns === 1 ? '' : 's'}{#if p.cost > 0} · ${p.cost.toFixed(2)}{/if}</span>
+                  <span class="dv">{p.turns} turn{p.turns === 1 ? '' : 's'}{#if settings.showSpend && p.apiEquivalentCostUsd > 0} · {apiEquivalentCostAmount(p.apiEquivalentCostUsd)}{/if}</span>
                 </div>
               {/each}
             </div>
@@ -484,12 +493,12 @@
 
 {#if hovered}
   <div class="tip" style="left: {tipX + 14}px; top: {tipY + 14}px">
-    <div class="tiphead">{monthLabel(hovered.date)} · {hovered.turns} turns{#if hovered.cost > 0} · ${hovered.cost.toFixed(2)}{/if}</div>
+    <div class="tiphead">{monthLabel(hovered.date)} · {hovered.turns} turns{#if settings.showSpend && hovered.apiEquivalentCostUsd > 0} · {apiEquivalentCostAmount(hovered.apiEquivalentCostUsd)}{/if}</div>
     {#if hovered.turns === 0}
       <div class="dim">no activity</div>
     {:else}
       {#each topProjects(hovered) as [name, p] (name)}
-        <div class="tiprow"><span class="tn">{name}</span><span class="tv dim">{p.turns}{#if p.cost > 0} · ${p.cost.toFixed(2)}{/if}</span></div>
+        <div class="tiprow"><span class="tn">{name}</span><span class="tv dim">{p.turns}{#if settings.showSpend && p.apiEquivalentCostUsd > 0} · {apiEquivalentCostAmount(p.apiEquivalentCostUsd)}{/if}</span></div>
       {/each}
     {/if}
   </div>

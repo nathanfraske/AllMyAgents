@@ -119,6 +119,86 @@ support it does not have. The Overseer may recommend and configure this flow onl
 - Conversation mutations carry stable request ids, journal sequence identity, and source-hub provenance so
   retries are idempotent and transcript order is journal order rather than wall-clock order.
 
+## Unified projects across devices
+
+A project should be one fleet-global logical identity with zero or more device-local replicas, not a path
+owned by whichever hub first created it. Paths and display names are mutable presentation/placement facts;
+they must never merge two projects or transfer authority.
+
+```text
+Project  { projectId, name, repositoryOrigin, defaultRef, policy }
+Replica  { replicaId, projectId, siteId, environmentId, path, head, syncState }
+Run      { runId, projectId, replicaId, agentId, sessionId, baseCommit, grantId }
+```
+
+Implementation status (2026-08-08): the first execution-control slices now exist. Each legacy/current project
+has a deterministic primary local replica, operators can attach paired target roots as explicit remote
+replicas, inspect their bounded Git readiness, and see attributed terminal runs. Runs carry durable expiring
+source leases, while the target independently fences each physical root across source hubs. Project Overview
+exposes Locations, readiness, active reservations, recent runs, and bounded preparation of an existing clean
+checkout at the primary's exact published revision. Registration does not yet provision an absent checkout,
+transfer dirty state, stream logs, schedule from resource pressure, or admit results; those remain the next
+slices below.
+
+- The control hub owns the project/team/task/policy graph. Git remains the normal source of truth for code.
+- Every execution device keeps its own native clone and per-run worktree. Do not put an active Git worktree
+  on SMB, Syncthing, or another multi-writer shared filesystem; network latency, file locking, WSL path
+  translation, and partial synchronization make that an avoidable corruption boundary.
+- Placement selects a compatible replica or prepares one at an exact commit. A run produces an attributed
+  branch, signed change bundle, and artifact manifest. Integration updates the logical project only through
+  an explicit merge/admission result.
+- Dirty or uncommitted work moves as a content-addressed, checksummed change bundle with a declared base,
+  never by pretending two live directories are one. Large build outputs live in the artifact broker rather
+  than Git or the event journal.
+- The UI presents one project row with expandable **Locations**: device/environment, online state, head,
+  ahead/behind/dirty state, active agents, current reservations, and last successful synchronization.
+- A single-machine compatibility mode maps an existing local project to one local replica automatically.
+  Later federation can reconcile duplicate imports by repository identity plus an explicit operator merge;
+  it must not guess from equal names or paths.
+
+The useful delivery order is Git-backed replicas first, resumable dirty-state bundles second, and optional
+artifact/cache replication third. A permanently shared filesystem is not a recommended project-unification
+mechanism.
+
+## Remote testbed platform plan
+
+The current bounded remote file/terminal/WSL actions are the bootstrap, not the final runner protocol.
+The first headless deployment slice is implemented: a direct-operator Overseer can transfer a
+platform/architecture-matched vendor-free node through the signed fleet's existing AllMyStuff file and
+terminal planes, install it as Windows LocalSystem, Linux root, or a dedicated Linux passwordless-sudo service,
+verify checksums and live registration, and then keep every agent's device/root grant explicit. It carries no
+vendor account, project journal, or Overseer. Cross-architecture release assets, uninstall/update orchestration,
+durable jobs, isolation, and resource attribution remain below.
+
+1. **Durable node runner.** Add capability inventory, target reservation, idempotent job ids, queued starts,
+   progress heartbeats, cancellation, reconnect/resume, deadlines, and durable result manifests. The runner
+   makes an outbound authenticated fleet connection; it does not expose a general inbound admin shell.
+2. **Transfer and artifact plane.** Promote individual file operations into checksummed, chunked, resumable
+   directory and artifact transfer with deduplication, progress/ETA, bandwidth limits, and explicit partial-
+   failure reporting. Store blobs outside the journal; journal references and bounded summaries only.
+3. **Measured resource envelopes.** Attribute CPU, memory, disk I/O, network I/O, process trees, and supported
+   GPU metrics to each run. Use Windows Job Objects/ETW/PDH and Linux/WSL cgroups plus `/proc`; clearly label
+   host-wide measurements when process attribution is unavailable. Raw high-frequency telemetry belongs in a
+   rotating time-series store, not the event journal.
+4. **Privilege and isolation.** Run the ordinary worker unprivileged. Put elevation behind a small local
+   broker that accepts short-lived signed grants containing exact command/action, project, device, expiry,
+   expected blast radius, and rollback evidence. Prefer disposable VM/container snapshots for destructive or
+   untrusted tests; never equate Full Access with an unbounded fleet-wide administrator credential.
+5. **Interactive desktop lane.** Add a session helper for screenshots, accessibility/UI trees, bounded input,
+   and PTY/ConPTY streaming. Windows UAC/secure desktop, macOS Accessibility/Screen Recording consent, and
+   Wayland compositor restrictions remain explicit platform boundaries rather than hidden fallbacks.
+6. **Scheduler and lab UX.** Match jobs to OS/architecture/GPU/toolchain/WSL/load/latency/grants, reserve a
+   target, show the live run and utilization in the project, collect evidence, then release or restore it.
+   Test matrices fan out from one logical project and report results against the exact replica and commit.
+7. **CEC Support convergence.** Reuse the same installed device runtime and AllMyStuff transport for a later
+   client-support profile. Its diagnostic/repair engine remains a loopback sidecar with signed plans and
+   consent gates. Testbed mode can be unattended only inside an operator-owned policy; client-support mode
+   adds client-visible consent, privacy/redaction, session recording, and stricter revocation. They share
+   transport, inventory, telemetry, evidence, and elevation primitives—not authority defaults.
+
+This architecture works with today’s PCs and an N100-class coordinator. An always-on hardware hub improves
+availability, scheduling, artifact caching, and recovery, but is not a prerequisite for distributed testing.
+
 ## Small delight: deterministic pixel pets
 
 Give each agent a tiny seed-derived pixel companion shown beside its sidebar row and chat header. The seed

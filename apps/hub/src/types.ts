@@ -31,6 +31,49 @@ export interface Project {
   createdAt: string
 }
 
+export interface ProjectReplicaReadiness {
+  status: 'unknown' | 'ready' | 'dirty' | 'not-repository' | 'unavailable'
+  gitAvailable: boolean
+  isRepository: boolean
+  /** False means the bounded status probe could not prove the complete working-tree state. */
+  complete: boolean
+  clean?: boolean
+  detached?: boolean
+  /** Credential-free origin identity (host/path), when one can be derived safely. */
+  repository?: string
+  trackedChanges?: number
+  untrackedFiles?: number
+  checkedAt: string
+  error?: string
+}
+
+/** One explicit filesystem/execution location for a fleet-global project identity. */
+export interface ProjectReplica {
+  id: string
+  projectId: string
+  kind: 'local' | 'remote'
+  /** Present only for a remote replica. The id is the paired hub identity, never a display label. */
+  siteId?: string
+  siteLabel?: string
+  /** Stable root id advertised by the target hub. Absolute remote paths are never caller supplied. */
+  rootId?: string
+  environment: {
+    id: string
+    kind: 'host' | 'wsl'
+    label?: string
+    distro?: string
+  }
+  /** Host path for local projects and target-advertised path for remote replicas. */
+  path: string
+  isPrimary: boolean
+  state: 'ready' | 'registered' | 'unavailable'
+  headCommit?: string
+  headRef?: string
+  readiness?: ProjectReplicaReadiness
+  createdAt: string
+  updatedAt: string
+}
+
 export type SessionStatus = 'starting' | 'active' | 'idle' | 'stopped' | 'error'
 export type DelegatedAuthority = 'commit' | 'push'
 export type RemoteDeviceCapability = 'read' | 'write' | 'terminal'
@@ -91,6 +134,8 @@ export interface SessionRecord {
   /** Version of the app-level Overseer contract last materialized for this durable conversation. */
   overseerCapabilityVersion?: number
   projectId?: string
+  /** Stable project location used by this chat. Legacy sessions are backfilled to the local primary. */
+  projectReplicaId?: string
   cwd: string
   repo?: string
   worktree?: string
@@ -150,6 +195,9 @@ export interface SessionRecord {
   managerReassignedAt?: string
   /** Bounded direct-child capacity for a manager. Absent is never interpreted as unlimited. */
   managerMaxLiveChildren?: number
+  /** Operator-selected number of useful worker lanes the manager should try to keep active for a
+   *  parallelizable task. This is a staffing target, never authority to invent or duplicate work. */
+  managerParallelismTarget?: number
   /** The operator's ceiling: authorities this manager may grant inside its own managed hierarchy. */
   managerDelegation?: DelegatedAuthority[]
   /** Profiles (agent/account types) this manager may choose for children. Empty/absent means none. */
@@ -198,8 +246,8 @@ export interface SessionRecord {
   managerTeamId?: string
   /** Denormalized historical label so an orphaned child still explains which team owned it. */
   managerTeamName?: string
-  /** Reversible, non-destructive manager retirement. The chat, transcript, branch, dirty files, and
-   *  worktree remain available, but the child no longer consumes live capacity or reopens with its team. */
+  /** Legacy reversible-retirement metadata. Capability v2 migrates these records back into the durable
+   *  stopped roster and new manager retirement is disabled. Retained only for recovery compatibility. */
   managerRetiredAt?: string
   managerRetiredBySessionId?: string
   managerRetiredReason?: string

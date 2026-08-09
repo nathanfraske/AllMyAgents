@@ -70,6 +70,7 @@ const remoteSession = (site: FleetSite, session: SessionRecord): SessionRecord =
   id: fleetId(site.siteId, session.id),
   profileId: fleetId(site.siteId, session.profileId),
   projectId: session.projectId ? fleetId(site.siteId, session.projectId) : undefined,
+  projectReplicaId: session.projectReplicaId ? fleetId(site.siteId, session.projectReplicaId) : undefined,
   parentSessionId: session.parentSessionId ? fleetId(site.siteId, session.parentSessionId) : undefined,
   managerTeams: session.managerTeams?.map((team) => ({ ...team, id: fleetId(site.siteId, team.id) })),
   managerActiveTeamId: session.managerActiveTeamId
@@ -128,23 +129,51 @@ function utf8Bytes(value: string): number {
   return new TextEncoder().encode(value).byteLength
 }
 const HUB_READ_TIMEOUT_MS = 8_000
+const HISTORY_READ_RETRY_TIMEOUT_MS = 20_000
+
+class HubReadTimeoutError extends Error {
+  constructor(
+    label: string,
+    readonly timeoutMs: number,
+  ) {
+    super(`${label} timed out after ${timeoutMs / 1_000} seconds.`)
+    this.name = 'HubReadTimeoutError'
+  }
+}
 
 async function boundedHubRead<T>(
   label: string,
   read: (signal: AbortSignal) => Promise<T>,
+  timeoutMs = HUB_READ_TIMEOUT_MS,
 ): Promise<T> {
   const controller = new AbortController()
   let timeout: ReturnType<typeof setTimeout> | undefined
   const deadline = new Promise<never>((_resolve, reject) => {
     timeout = setTimeout(() => {
+      reject(new HubReadTimeoutError(label, timeoutMs))
       controller.abort()
-      reject(new Error(`${label} timed out after ${HUB_READ_TIMEOUT_MS / 1_000} seconds.`))
-    }, HUB_READ_TIMEOUT_MS)
+    }, timeoutMs)
   })
   try {
     return await Promise.race([read(controller.signal), deadline])
   } finally {
     if (timeout) clearTimeout(timeout)
+  }
+}
+
+async function resilientHistoryRead<T>(
+  label: string,
+  read: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  try {
+    return await boundedHubRead(label, read)
+  } catch (error) {
+    // A periodic journal task once held SQLite's writer lock long enough to pause the entire hub event
+    // loop. The first HTTP request was still valid; the renderer's fixed eight-second deadline simply won
+    // the race. Retry once with a fresh AbortSignal so a transient hub pause cannot permanently replace an
+    // agent's transcript with an empty pane. Real HTTP failures remain immediate and visible.
+    if (!(error instanceof HubReadTimeoutError)) throw error
+    return await boundedHubRead(label, read, HISTORY_READ_RETRY_TIMEOUT_MS)
   }
 }
 
@@ -903,6 +932,7 @@ export class HubStore {
         v.record.managerReassignedToSessionId = rec.managerReassignedToSessionId
         v.record.managerReassignedAt = rec.managerReassignedAt
         v.record.managerMaxLiveChildren = rec.managerMaxLiveChildren
+        v.record.managerParallelismTarget = rec.managerParallelismTarget
         v.record.managerPermissionModeCeiling = rec.managerPermissionModeCeiling
         v.record.managerMaxChildPermissionMode = rec.managerMaxChildPermissionMode
         v.record.managerDelegation = rec.managerDelegation
@@ -2900,7 +2930,10 @@ export class HubStore {
           reason?: string
         }
         const child = p.childSessionId ? this.sessions[p.childSessionId] : undefined
-        if (child && p.retiredAt) {
+        const manager = p.managerSessionId ? this.sessions[p.managerSessionId] : undefined
+        // Lazy history may deliver an old retirement event after capability v2 has already restored
+        // the worker. Historical timeline rows must never roll current roster state backward.
+        if (child && p.retiredAt && (manager?.record.managerTeamCapabilityVersion ?? 0) < 2) {
           child.record.managerRetiredAt = p.retiredAt
           child.record.managerRetiredBySessionId = p.managerSessionId
           child.record.managerRetiredReason = p.reason
@@ -2913,15 +2946,32 @@ export class HubStore {
         break
       }
       case 'manager/child-retirement-cleared':
-      case 'manager/child-reactivated': {
+      case 'manager/child-reactivated':
+      case 'manager/child-retirement-migrated':
+      case 'manager/child-resumed': {
         const p = payload as { childSessionId?: string }
         const child = p.childSessionId ? this.sessions[p.childSessionId] : undefined
         if (child) {
           child.record.managerRetiredAt = undefined
           child.record.managerRetiredBySessionId = undefined
           child.record.managerRetiredReason = undefined
+          if (kind === 'manager/child-retirement-migrated') child.record.status = 'stopped'
+          if (kind === 'manager/child-resumed') child.record.status = 'idle'
         }
-        this.push(view, { kind: 'note', ts, text: 'retired child reactivated with its preserved workspace' })
+        this.push(view, {
+          kind: 'note',
+          ts,
+          text: kind === 'manager/child-retirement-migrated'
+            ? 'legacy retired child restored to the durable roster'
+            : 'stopped child resumed with its preserved identity and workspace',
+        })
+        break
+      }
+      case 'manager/child-role-upgraded':
+      case 'manager/child-role-changed': {
+        const p = payload as { childSessionId?: string; role?: string }
+        const child = p.childSessionId ? this.sessions[p.childSessionId] : undefined
+        if (child && p.role) child.record.role = p.role
         break
       }
       case 'session/agent-stop-requested': {
@@ -3925,7 +3975,7 @@ export class HubStore {
       const requestedGeneration = remote?.generation ?? this.replayGeneration
       const beforeSeq = (remote?.baselineSeq ?? this.replayBaselineSeq) + 1
       try {
-        page = await boundedHubRead('Latest journal history', (signal) =>
+        page = await resilientHistoryRead('Latest journal history', (signal) =>
           api.journalHistory(
             id,
             requestedGeneration,
@@ -3937,7 +3987,7 @@ export class HubStore {
         const actualGeneration = changedJournalHistoryGeneration(error)
         if (actualGeneration !== undefined && actualGeneration !== requestedGeneration) {
           try {
-            page = await boundedHubRead('Latest journal history', (signal) =>
+            page = await resilientHistoryRead('Latest journal history', (signal) =>
               api.journalHistory(id, actualGeneration, beforeSeq, signal),
             )
           } catch (retryError) {
@@ -3980,7 +4030,7 @@ export class HubStore {
     view.historyLoadError = undefined
     let page: HistoryPage | null = null
     try {
-      page = await boundedHubRead('Imported chat history', (signal) =>
+      page = await resilientHistoryRead('Imported chat history', (signal) =>
         api.history(id, undefined, signal),
       )
     } catch (error) {
@@ -4019,7 +4069,7 @@ export class HubStore {
       view.loadingHistory = true
       let page: JournalHistoryPage | null = null
       try {
-        page = await boundedHubRead('Older journal history', (signal) =>
+        page = await resilientHistoryRead('Older journal history', (signal) =>
           api.journalHistory(
             id,
             requestedGeneration,
@@ -4031,7 +4081,7 @@ export class HubStore {
         const actualGeneration = changedJournalHistoryGeneration(error)
         if (actualGeneration !== undefined && actualGeneration !== requestedGeneration) {
           try {
-            page = await boundedHubRead('Older journal history', (signal) =>
+            page = await resilientHistoryRead('Older journal history', (signal) =>
               api.journalHistory(id, actualGeneration, cursor, signal),
             )
           } catch (retryError) {
@@ -4065,7 +4115,7 @@ export class HubStore {
     view.loadingHistory = true
     let page: HistoryPage | null = null
     try {
-      page = await boundedHubRead('Older imported history', (signal) =>
+      page = await resilientHistoryRead('Older imported history', (signal) =>
         api.history(id, cursor, signal),
       )
     } catch (error) {

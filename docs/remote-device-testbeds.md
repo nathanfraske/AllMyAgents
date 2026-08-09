@@ -19,14 +19,112 @@ the mapped Site/HTTP route only as a compatibility fallback.
    compatibility with an older peer and are never returned by a connection-list API or agent tool.
 4. In a chat, open **Devices**, select the exact target roots and operations, and save. This is a durable
    per-chat operator grant. Fleet pairing and the chat's Safe/Edits/Full mode do not imply it.
-5. The agent can discover only its granted device/root labels and opaque IDs, then use:
-   `remote_ping`, `remote_inspect_environment`, `remote_list_files`, `remote_read_file`,
-   `remote_create_directory`, `remote_write_file`, and `remote_exec`. A folder transfer mirrors its
+5. In **Project Overview / Locations**, attach an advertised root when it represents a checkout or test
+   environment for that logical project. This is project topology, not an authority grant: the session still
+   needs the per-chat grant from step 4 before it can use the root.
+6. The agent can discover only its granted device/root labels and opaque IDs, then use:
+   `remote_ping`, `remote_inspect_environment`, `remote_inspect_git`, `remote_prepare_project_location`,
+   `remote_list_files`, `remote_read_file`, `remote_create_directory`, `remote_write_file`, and `remote_exec`.
+   Project preparation is available only when the root is attached to the chat's project. A folder transfer mirrors its
    directory tree with `remote_create_directory` before writing the contained files; empty directories
    are therefore preserved too.
 
 Revoking a chat grant takes effect on its next tool call. Disabling the target policy, deleting a root, or
 removing a root capability also fails closed immediately, even if a source chat still has an older grant.
+
+## Lightweight headless node
+
+A target does not need the full AllMyAgents desktop app, a local hub journal, an Overseer, or any Claude or
+Codex account. If it already runs AllMyStuff/MyOwnMesh and belongs to the same signed owned-device fleet, the
+source Overseer can bootstrap the release's vendor-free testbed payload through the remote planes AllMyStuff
+already exposes:
+
+1. The Overseer calls `list_testbed_targets` to discover signed-fleet AllMyStuff peers and
+   `inspect_testbed_target` for the chosen peer's observed OS and architecture. These are diagnostic reads
+   and do not require the target to be paired as an AllMyAgents hub. On a direct operator turn, it explains
+   the requested privilege profile and blast radius.
+2. `overseer_control` operation `deploy_testbed_node` names the exact `site_id`, a `testbed_profile`, and a
+   human-readable `reason`. Automatic deployment supports `elevated-machine` on Windows or Linux and
+   `linux-sudo-machine` on Linux.
+3. The source opens the target's existing AllMyStuff `files` and `terminal` routes. It transfers a bundled
+   Node runtime plus five compiled, dependency-free AllMyAgents modules in bounded chunks, preserving the
+   directory tree and reporting files, bytes, elapsed time, and throughput.
+4. The target verifies every transferred file against `SHA256SUMS` before executing the installer. The
+   payload is the platform/architecture-matched artifact carried by the installed release; a mismatch is
+   refused rather than downloading or executing an unpinned runtime.
+5. Windows installs a highest-privilege LocalSystem startup task. Linux `elevated-machine` installs a root
+   systemd service. Linux `linux-sudo-machine` creates a dedicated system account, validates a narrowly named
+   sudoers file with `visudo`, and grants that account `NOPASSWD: ALL` so agent terminal requests can cross
+   the elevation boundary. The latter is deliberately machine-admin authority, not a sandbox.
+6. The source waits for the new node to register, authorizes it through the signed fleet roster, probes its
+   live capabilities, removes the unique bootstrap directory after verified success, and records a bounded
+   deployment lifecycle. It never retries an ambiguously completed install command. A cleanup failure is
+   reported as pending without falsely failing the already verified installation; an ambiguous installer
+   outcome retains its staging directory so recovery evidence and a possibly running installer are not erased.
+
+The lightweight node accepts only pairing and the existing remote-device capability/action protocol. It has
+no project/chat/account APIs and cannot host or inherit an Overseer. Same-fleet trust admits the source hub to
+the node, but does not grant any worker: every agent still needs an explicit durable device/root/capability
+grant from its own hub. A full hub already answering the application route is detected and never displaced.
+
+The portable bundle can also be configured locally with `testbedNode configure --profile scoped` for an
+unprivileged, explicit-root node. Automatic cross-OS deployment currently requires a matching release payload;
+a Windows/x64 desktop release cannot pretend its bundled Node executable is a Linux/ARM64 artifact. Release
+matrix assets or a target-native package repository are the next step for cross-architecture bootstrap.
+
+## Project locations and attributed runs
+
+Every existing project is upgraded in place with one deterministic primary local location. WSL projects keep
+their distro-native path and concrete distro as part of that identity. Attaching a remote location accepts only
+a paired `siteId` and a stable root id; the hub resolves the label, path, and environment from the target's live
+capability response, so a browser cannot manufacture a remote path or claim capabilities the target did not
+advertise. Removing a project also removes its location registry, while removing the primary local location is
+refused.
+
+A `remote_exec` call receives a durable run id only when all three facts agree: the chat belongs to a project,
+the target site/root is explicitly attached to that project, and the same chat separately has a terminal grant
+for that root. The source hub records the project, replica, immutable agent/session id, account id, command hash,
+bounded command summary, base commit when known, result, failure stage, exit code, and telemetry. The target hub
+records the authenticated source hub and source-supplied correlation ids; those fields are audit metadata and do
+not grant target-side authority. Project Overview polls the durable registry and run ledger, so topology changes
+made outside that browser and completed remote runs converge without a reload.
+
+If the source hub restarts before it observes a remote result, the active hub owner closes that run as
+`cancelled` at the `source-restart` stage instead of inventing a success or failure. A standby hub never
+reconciles those rows while the active owner may still be running them.
+
+Attributed terminal runs acquire a durable, expiring source-hub lease before the command is sent. A second
+agent on that hub is rejected at admission while the location is leased. Writes and directory mutations are
+also refused during that lease. The target executor independently allows only one terminal command per
+physical root and refuses mutations while it runs, so a second paired hub cannot bypass the live-process
+fence. Both fences are released on a normally observed result; owner restart reconciliation records
+interrupted leases. A crash-surviving process tree requires the later durable runner/job-object layer and is
+reported as an unknown outcome rather than assumed stopped.
+
+Project Overview can run a fixed-argument Git readiness probe against local or remote locations. Agents with
+an explicit read grant can use the same probe through `remote_inspect_git`. It records HEAD/ref and a bounded
+clean/dirty count plus a credential-free origin identity without granting terminal access, taking a Git lock,
+fetching, checking out, resetting, or copying files. Raw remote URLs are never stored or returned. A timed-out
+or truncated inspection is reported as incomplete and is never treated as clean.
+
+For an existing attached remote checkout, **Prepare** selects the primary location's current clean HEAD, proves
+that both locations have the same sanitized origin identity, fetches only the primary's named branch, proves
+that branch advertises the exact selected commit, and checks the target out detached at that commit. Preparation
+holds the same durable location lease as an attributed run and is idempotent when the target already matches.
+It refuses dirty/incomplete trees, detached primaries, missing or unsafe origins, mismatched repositories,
+unpublished commits, active runs, and failed post-checkout verification. It never resets, cleans, stashes,
+updates submodules, or accepts caller-supplied Git arguments.
+
+Preparation requires the target root's **terminal** capability. Git checkout can invoke configured credential
+helpers or content filters even when AllMyAgents supplies only fixed argv; classifying it as a mere file write
+would create an authority escalation. Repository hooks and external remote helpers are explicitly disabled as
+additional defense. The operator can prepare from Project Overview; a project agent with the same explicit
+terminal grant can call `remote_prepare_project_location`. The tool accepts only device/root identity and the
+hub derives the immutable repository/ref/commit request from current project topology.
+
+This runner slice still does not clone an absent checkout, transmit uncommitted work, stream command output,
+isolate CPU/GPU/memory, or accept results back into the primary. Those remain later protocol layers; a
+registered location is an honest placement fact, not a claim that its checkout is current.
 
 ## Security boundary
 
@@ -50,6 +148,9 @@ removing a root capability also fails closed immediately, even if a source chat 
 - Source and target hubs journal requests and outcomes without journaling file contents or full command
   output. The source journal is authoritative for chat/profile attribution; the target records the caller's
   supplied attribution as part of its device-token-authenticated request.
+- The headless node keeps a bounded rotating local audit of operation type, authenticated source, opaque
+  message id, root id, result/failure stage, timing, and byte count. It never records file contents, command
+  text, full output, a pairing code, or the peer device token.
 - The long-lived local hub/worker socket now uses a supervisor-minted, mutually authenticated HMAC
   handshake with a fresh replay-checked nonce. The secret is deleted from the hub and worker environment
   before either process can launch a vendor child. An unauthenticated process cannot replace the hub with a
@@ -64,6 +165,12 @@ grant `terminal` only when whole-account shell authority is intended.
 
 Windows targets use non-interactive PowerShell. macOS and Linux targets use `/bin/sh -lc`. The control
 channel, browser bridge, and agent-tool credentials are removed from the command environment.
+
+An `elevated-machine` node intentionally changes the terminal semantics: its process account is LocalSystem
+or root, so a terminal-capable root is effectively machine-administrator command access. A
+`linux-sudo-machine` node performs ordinary file-plane operations as its dedicated account but allows terminal
+commands to invoke passwordless sudo. These profiles are opt-in installation choices and remain separate from
+chat Full Access; a chat without the explicit device/root terminal grant cannot reach them.
 
 ### Windows Subsystem for Linux
 
@@ -100,7 +207,8 @@ run on the target from being executed twice.
 
 ## Platform and topology
 
-The executor is platform-neutral across Windows, macOS, and Linux hubs. A phone or appliance without a
-local AllMyAgents hub and shell cannot itself be a terminal target. An off-machine browser still requires
+The full-hub executor is platform-neutral across Windows, macOS, and Linux. The first automatic headless
+installer supports Windows and Linux, with a release artifact matching the target OS and architecture. A phone
+or appliance without an AllMyStuff transport and usable local shell cannot itself be a terminal target. An off-machine browser still requires
 the local-hub gateway described in `cross-machine-bridges.md`, because AllMyStuff mappings are loopback
 ports on the hub machine.

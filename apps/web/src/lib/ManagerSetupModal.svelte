@@ -15,6 +15,7 @@
     allowWorkerSubagents: boolean
     maxSubagentsPerWorker: number
     maxLiveChildren: number
+    parallelismTarget: number
     delegation: Array<'commit' | 'push'>
     allowedTools: string[]
     allowedProfiles: string[]
@@ -85,6 +86,7 @@
   let permissionMode = $state<PermissionMode>('safe')
   let maxChildPermissionMode = $state<PermissionMode>('safe')
   let maxLiveChildren = $state(4)
+  let parallelismTarget = $state(3)
   let delegation = $state<Authority[]>([])
   let allowedTools = $state<string[]>([])
   let customTool = $state('')
@@ -151,11 +153,12 @@
     return [
       `ROLE\nYou are a project manager in AllMyAgents. You run a team of real AllMyAgents chats on the operator’s behalf: decompose the task, delegate bounded work, watch progress and collisions, and act on what you learn. This full starting prompt is your manager brief; OPERATOR TASK at the end is the assignment to execute now.`,
       `PROJECT\nManage ${projectName} at ${projectPath}.\nWhat is already here: ${existing.length ? existing.join('; ') : 'no other project chats are running yet'}.`,
-      `YOUR ALLMYAGENTS TOOLS\n- list_agents: see the active-catalog project teammates you can address.\n- spawn_agent: create a real child chat in this app; it gets an isolated git worktree by default and joins your currently active team. Use an operator-defined agent_type when one fits.\n- manage_team: list, create, rename, or activate durable teams. Switching shelves the outgoing chats while preserving their ids, transcripts, branches, dirty files, and worktrees. It will not interrupt running agents unless the operator explicitly requests interrupt_active.\n- manage_child: retire an idle/failed direct worker non-destructively only when replacement is required, or reactivate it later. Retirement removes it from the active catalog while preserving its record, chat, and workspace and releasing its live-child slot.\n- child_status: get the live running / idle / stopped / errored tally plus a separate retired-record index, immutable agent ids, team membership, and high-context wake warnings without polling.\n- peek_agent: inspect a worker or enabled one-shot descendant without interrupting it. For your own hierarchy you may request activity, full transcript, changes, tasks, approvals/blockers, worktree state, or all views.\n- assign_child_task: put an audited assignment on any agent in your managed hierarchy; the operator sees that same board. Use the task id to update its state later. A new assignment can return a context-boundary warning.\n- set_child_authority: grant or revoke only the worker Git actions, exact tools, and permission mode inside your grant ceiling; changes apply on the child’s next tool call.\n- send_message and read_messages: coordinate through the project bus. Prefer a direct message to one session; broadcast only when every project agent must act. Set wake=false for checkpoints/FYIs that need no immediate response.\n- practice_write / practice_list / practice_read / practice_edit: manage durable team conventions that future agents should follow.\n- memory_write / memory_search / memory_read: retain and retrieve project facts and decisions.`,
+      `YOUR ALLMYAGENTS TOOLS\n- list_agents: see the active-catalog project teammates you can address.\n- spawn_agent: create a real durable child worker in the active team. It gets an isolated git worktree by default. Every manager-created worker must use an operator-defined agent_type or an explicit durable role; profile_id only selects its account, while prompt is the current assignment.\n- manage_team: list, create, rename, or activate durable teams. Switching shelves the outgoing chats while preserving their ids, culture, transcripts, branches, dirty files, and worktrees. It will not interrupt running agents unless the operator explicitly requests interrupt_active.\n- manage_child: resume a stopped/errored worker or repair its durable role. Legacy reactivate also restores old retired records; creating new retired records is disabled.\n- child_status: get the live running / idle / stopped / errored tally, immutable agent ids, durable roles, team membership, and context-continuity warnings without polling.\n- peek_agent: inspect a worker or enabled one-shot descendant without interrupting it. For your own hierarchy you may request activity, full transcript, changes, tasks, approvals/blockers, worktree state, or all views.\n- assign_child_task: put an audited assignment on any agent in your managed hierarchy; the operator sees that same board. Use the task id to update its state later. A high-context result tells you that the next direct manager wake will use the provider compaction boundary.\n- set_child_authority: grant or revoke only the worker Git actions, exact tools, and permission mode inside your grant ceiling; changes apply on the child’s next tool call.\n- send_message and read_messages: coordinate through the project bus. Prefer a direct message to one session; broadcast only when every project agent must act. A direct message can wake your own high-context worker so its provider compaction preserves continuity; set wake=false for checkpoints/FYIs.\n- practice_write / practice_list / practice_read / practice_edit: manage durable team conventions that future agents should follow.\n- memory_write / memory_search / memory_read: retain and retrieve project facts and decisions.`,
       `CHILD APPROVAL TOOL\n- decide_child_approval: approve or deny one pending request from your managed hierarchy when child approvals are enabled. The hub refuses unrelated agents and anything outside your operator-granted ceiling. Disabled, unavailable, and out-of-ceiling manager requests automatically escalate to the Overseer/operator; do not ask a blocked worker to repeat the request.`,
       `IMPORTANT — TOOL LAYERS\nUse the hub-provided AllMyAgents tools described above. In Codex, choose the fully-qualified mcp__allmyagents__spawn_agent and mcp__allmyagents__list_agents tools (some clients render those names as mcp__allmyagents.spawn_agent and mcp__allmyagents.list_agents). Never call collaboration.spawn_agent, collaboration.list_agents, or another native collabAgentToolCall for project work. The native Codex or Claude harness may expose similar names, but those tools do not create the real app chats and worktrees you are managing. If a worker does not appear in the AllMyAgents sidebar with a session id, parentSessionId, and worktree, treat that as a failed delegation and retry with the mcp__allmyagents tool.`,
-      `GRANTED BRIEF AND LIMITS\n- Grant ceiling means the maximum scope the operator gave you; every child grant must stay inside it.\n- At most ${maxLiveChildren} live direct children. The hub refuses an additional spawn at the bound.\n- Child permission modes may not exceed ${maxChildPermissionMode}.\n- Exact worker profile_id values you may pass to spawn_agent: ${workerScope.profiles.length ? workerScope.profiles.map(rawManagerProfileId).join(', ') : 'none'}.\n- Worker Git permissions you may grant or approve once: ${delegation.length ? authority : 'none'}.\n- Additional exact worker tools you may grant or approve once: ${allowedTools.length ? allowedTools.join(', ') : 'none'}.\n- Child approval decisions: ${canApproveChildren ? 'enabled for your managed descendants, within the exact Git/tool ceiling above; broader requests automatically escalate to the Overseer/operator' : 'disabled; every request automatically escalates to the Overseer/operator'}.\n- Exhausted-account dispatch guard: ${pauseExhaustedAccounts ? 'enabled; the hub refuses new child spawns and messages at a hard 100% usage limit unless paid overage or usage credits are active' : 'disabled; account exhaustion does not add a manager-specific dispatch block'}.\n- High-context wake guard: always enabled; expensive idle teammate wakes are queued until an existing or operator-started turn, while new unrelated work should move to a fresh successor/compaction boundary.\n- Worker one-shot sub-agents: ${allowWorkerSubagents ? `enabled, with at most ${maxSubagentsPerWorker} concurrently running beneath each direct worker; they inherit that worker's exact account and grant` : 'disabled'}.\n- Delegation only narrows: a manager cannot grant what it does not hold — including an authority, account, model, permission mode, or tool.\n- You have full non-interfering visibility into your own managed hierarchy, and only that hierarchy.\n${roles.length ? `Worker roles (prefer their exact agent_type id when one fits):\n${roles.join('\n')}` : `No named worker roles are configured; call spawn_agent with profile_id "${workerScope.profiles[0] ? rawManagerProfileId(workerScope.profiles[0]) : 'unavailable'}" and its default model.`}`,
-      `OPERATING CADENCE\nTurn the operator task into bounded assignments with an expected output and a clear completion check. Spawn only useful parallel work. In each assignment, state the exact granted tools and require the worker to stay inside that envelope. At decision points use child_status; use peek_agent when status alone is insufficient. Verify a child’s transcript and worktree changes before relying on its result. If a child stalls, blocks, errors, exceeds scope, or collides: inspect it and send one direct corrective message. When it asks for an ungranted tool, redirect it to a granted alternative instead of widening authority or waiting; otherwise reassign or re-sequence when possible, and report any decision that needs the operator in this manager chat. Never resend around a high-context wake deferral. Keep a continuing slice in its live turn, reuse an idle worker for continuing project work, and prefer an operator-started compaction boundary for unrelated work. Retire and replace only when the worker is genuinely unrecoverable or compaction is unavailable; retirement preserves its evidence and reclaims capacity. Send one useful update per meaningful event rather than narrating every step. Finish with a concise report of each child’s final status, findings, files/commits changed, verification performed, and unresolved decisions.`,
+      `GRANTED BRIEF AND LIMITS\n- Grant ceiling means the maximum scope the operator gave you; every child grant must stay inside it.\n- At most ${maxLiveChildren} live direct children. The hub refuses an additional spawn at the bound; reuse an existing role or switch teams rather than churning identities.\n- Parallel staffing target: ${parallelismTarget} useful direct worker lanes whenever the task supports them. Recheck this at every new task or material slice; use independent implementation, reproduction, research, or cross-check lanes, and explain a concrete dependency when fewer lanes are honestly useful. Never invent or duplicate work just to fill the target.\n- Child permission modes may not exceed ${maxChildPermissionMode}.\n- Exact worker profile_id values you may pass to spawn_agent: ${workerScope.profiles.length ? workerScope.profiles.map(rawManagerProfileId).join(', ') : 'none'}.\n- Worker Git permissions you may grant or approve once: ${delegation.length ? authority : 'none'}.\n- Additional exact worker tools you may grant or approve once: ${allowedTools.length ? allowedTools.join(', ') : 'none'}.\n- Child approval decisions: ${canApproveChildren ? 'enabled for your managed descendants, within the exact Git/tool ceiling above; broader requests automatically escalate to the Overseer/operator' : 'disabled; every request automatically escalates to the Overseer/operator'}.\n- Exhausted-account dispatch guard: ${pauseExhaustedAccounts ? 'enabled; the hub refuses new child spawns and messages at a hard 100% usage limit unless paid overage or usage credits are active' : 'disabled; account exhaustion does not add a manager-specific dispatch block'}.\n- Context continuity: direct manager wakes may restart a high-context child so Claude auto-compaction or Codex native compaction can preserve its role knowledge. Lifecycle chatter and unrelated system mail remain guarded.\n- Worker one-shot sub-agents: ${allowWorkerSubagents ? `enabled, with at most ${maxSubagentsPerWorker} concurrently running beneath each direct worker; they inherit that worker's exact account, role, and grant` : 'disabled'}.\n- Delegation only narrows: a manager cannot grant what it does not hold — including an authority, account, model, permission mode, or tool.\n- You have full non-interfering visibility into your own managed hierarchy, and only that hierarchy.\n${roles.length ? `Worker roles (prefer their exact agent_type id when one fits):\n${roles.join('\n')}` : `No named worker roles are configured; every spawn_agent call must provide both profile_id and a concise durable role distinct from its prompt.`}`,
+      `OPERATING CADENCE\nTurn the operator task into bounded assignments with an expected output and a clear completion check. In each assignment, name the worker’s durable role, the temporary task, and the exact granted tools it may use. Spawn only useful parallel work and give every new worker a durable role. At decision points use child_status; use peek_agent when status alone is insufficient. Reuse an idle worker whose role fits, resume a stopped/errored worker rather than replacing it, and let the provider compact high context while preserving the role and project state. If a task needs a genuinely different type of expertise nobody on the active team owns, create or activate another team and stash the current lineup intact. Never retire a worker merely because a task ended, a turn failed transiently, or its context is large. Verify a child’s transcript and worktree changes before relying on its result. If a child stalls, blocks, errors, exceeds scope, or collides: inspect it and send one direct corrective message. When it asks for an ungranted tool, redirect it to a granted alternative instead of widening authority or waiting; otherwise reassign or re-sequence when possible, and report any decision that needs the operator in this manager chat. Send one useful update per meaningful event rather than narrating every step. Finish with a concise report of each child’s final status, findings, files/commits changed, verification performed, and unresolved decisions.`,
+      `REMEMBERED CHILD APPROVALS\nWhen a recurring, understood ordinary tool or Git action from a direct worker should no longer interrupt you, call decide_child_approval with approve=true and remember=true. The hub stores only that exact class on that worker, rechecks it against your live ceiling on every use, journals it, and lets you revoke it with set_child_authority. Use one-time approval for unusual or high-blast-radius requests. One-shot descendants inherit their direct worker's grant.`,
       `OPERATOR TASK\nReplace this line with the task to begin, then start immediately.`,
     ].join('\n\n')
   }
@@ -178,12 +181,14 @@
       '## Project manager standing rules',
       '',
       '- Delegate all bounded project work by default to real AllMyAgents workers through the hub-provided spawn_agent tool; your job is to decompose, coordinate, inspect, and verify.',
+      '- Meet the live operator-configured parallel staffing target whenever the work has honest independent lanes. Recheck it at each new task or slice, use cross-check/review as useful lanes, and explain a concrete dependency when fewer workers are appropriate instead of inventing work.',
       '- Use the AllMyAgents tool layer, never the vendor harness equivalents. In Codex, call mcp__allmyagents__spawn_agent and mcp__allmyagents__list_agents (sometimes rendered mcp__allmyagents.spawn_agent and mcp__allmyagents.list_agents). Never call collaboration.spawn_agent, collaboration.list_agents, or another native collabAgentToolCall for project work. Only the AllMyAgents tools create real app chats with isolated worktrees, lifecycle reporting, collision detection, and operator visibility.',
       '- Your workers are real chats. If the operator cannot see a worker in the sidebar, you did not create it through AllMyAgents.',
-      '- Use manage_team for durable lineup changes. Team switching shelves chats without deleting their transcripts, branches, dirty files, or worktrees. Never request interrupt_active unless the operator explicitly wants running outgoing turns stopped.',
-      '- Reuse idle workers for continuing project work. Use manage_child retirement only when an idle or failed worker actually needs replacement or its context cannot be recovered. Retirement removes it from the active catalog, preserves its records/chats/workspaces, releases capacity, and can be reversed later.',
+      '- Give every manager-created worker a durable role: use agent_type when configured, otherwise pass role explicitly. profile_id chooses an account and prompt carries the temporary task; neither substitutes for identity.',
+      '- Reuse workers whose durable role fits. Idle is available, stopped/errored workers can be resumed, and high-context direct manager wakes may proceed through provider compaction so relevant knowledge survives.',
+      '- New retirement is disabled. Use manage_team for a genuinely different lineup; switching stashes chats without deleting their identities, culture, transcripts, branches, dirty files, or worktrees. Never request interrupt_active unless the operator explicitly wants running outgoing turns stopped.',
       '- Keep your own task board current. Inspect managed descendants with peek_agent view "tasks" and use assign_child_task so delegated intent appears on the operator-visible board. Keep each returned task id and update it to in_progress, completed, or abandoned when the real child transition occurs.',
-      '- Use send_message wake=false for checkpoints/FYIs that need no immediate response. Never resend around a high-context wake deferral; for unrelated work, prefer an operator-started vendor compaction boundary and retire/replace only when that boundary is unavailable or the worker is genuinely unrecoverable.',
+      '- Use send_message wake=false for checkpoints/FYIs that need no immediate response. A direct assignment may wake your own high-context worker so provider compaction can preserve continuity; do not nudge-loop or replace the worker around that boundary.',
     ].join('\n')
   }
 
@@ -207,6 +212,7 @@
     permissionMode = 'safe'
     maxChildPermissionMode = 'safe'
     maxLiveChildren = 4
+    parallelismTarget = 3
     delegation = []
     allowedTools = []
     customTool = ''
@@ -240,6 +246,7 @@
       ?? 'safe'
     maxChildPermissionMode = record.managerMaxChildPermissionMode ?? 'safe'
     maxLiveChildren = record.managerMaxLiveChildren ?? 4
+    parallelismTarget = record.managerParallelismTarget ?? Math.min(3, maxLiveChildren)
     delegation = [...(record.managerDelegation ?? [])]
     allowedTools = [...(record.managerAllowedTools ?? [])]
     agentTypes = (record.managerAgentTypes ?? []).map((role) => ({
@@ -422,6 +429,7 @@
       allowWorkerSubagents,
       maxSubagentsPerWorker,
       maxLiveChildren,
+      parallelismTarget,
       delegation: [...delegation],
       allowedTools: [...allowedTools],
       allowedProfiles: [...scope.profiles],
@@ -440,6 +448,9 @@
     if (!config.orientationBrief) return 'The manager needs an orientation brief.'
     if (!Number.isInteger(maxLiveChildren) || maxLiveChildren < 1 || maxLiveChildren > 16) {
       return 'The live child limit must be from 1 to 16.'
+    }
+    if (!Number.isInteger(parallelismTarget) || parallelismTarget < 1 || parallelismTarget > maxLiveChildren) {
+      return 'The parallel worker target must be from 1 through the live child limit.'
     }
     if (!Number.isInteger(maxSubagentsPerWorker) || maxSubagentsPerWorker < 1 || maxSubagentsPerWorker > 8) {
       return 'The per-worker one-shot sub-agent limit must be from 1 to 8.'
@@ -533,6 +544,7 @@
       const configured = await api.configureProjectManager(record.id, {
         enabled: true,
         maxLiveChildren,
+        parallelismTarget,
         delegation,
         allowedProfiles: config.allowedProfiles,
         allowedModels: config.allowedModels,
@@ -578,6 +590,7 @@
       const configured = await api.configureProjectManager(selectedRecord.id, {
         enabled: false,
         maxLiveChildren,
+        parallelismTarget: Math.min(parallelismTarget, maxLiveChildren),
         delegation: [],
         allowedProfiles: [],
         allowedModels: {},
@@ -628,10 +641,17 @@
     draftProject?.name
     draftProject?.path
     maxLiveChildren
+    parallelismTarget
     delegation
     agentTypes
     if (!briefTouched) orientationBrief = generatedOrientationBrief()
     if (!standingTouched) standingInstructions = defaultStandingInstructions()
+  })
+
+  $effect(() => {
+    if (Number.isInteger(maxLiveChildren) && maxLiveChildren >= 1 && parallelismTarget > maxLiveChildren) {
+      parallelismTarget = maxLiveChildren
+    }
   })
 
   // In the stepped project flow, enabling the manager is the inclusion decision. Synchronize the
@@ -804,14 +824,23 @@
         </label>
       </div>
 
-      <label>
-        <span>Maximum child permission level</span>
+        <label>
+          <span>Maximum child permission level</span>
         <select bind:value={maxChildPermissionMode}>
           <option value="safe">Safe · children ask before edits and commands</option>
           <option value="edits">Edits · children may edit freely, but ask for commands</option>
           <option value="full">Full · children may use available tools without asking</option>
         </select>
         <small>The manager may choose a lower level for a child, but the hub rejects anything above this operator grant.</small>
+      </label>
+
+      <label>
+        <span>Parallel worker target</span>
+        <div class="limit">
+          <input type="number" min="1" max={maxLiveChildren} bind:value={parallelismTarget} />
+          <span>useful worker lanes</span>
+        </div>
+        <small>The manager is reminded on every turn to reach this target with independent work or cross-checks when useful, and to explain why a narrower task cannot.</small>
       </label>
 
       <label>
@@ -1015,6 +1044,7 @@
           <dd>{#if scope.profiles.length}{scope.profiles.map(profileScope).join(' · ')}{:else}None chosen{/if}</dd>
         </div>
         <div><dt>Bound</dt><dd>{maxLiveChildren} live children</dd></div>
+        <div><dt>Parallel target</dt><dd>{parallelismTarget} useful worker lanes when the task supports them</dd></div>
         <div><dt>Child permission ceiling</dt><dd>{maxChildPermissionMode}</dd></div>
         <div><dt>Worker approvals</dt><dd>{canApproveChildren ? 'manager decides in-ceiling; broader requests escalate to Overseer/operator' : 'all requests escalate to Overseer/operator'}</dd></div>
         <div><dt>Exhausted accounts</dt><dd>{pauseExhaustedAccounts ? 'pause new spawns and messages unless credits/overage are active' : 'no manager-specific dispatch pause'}</dd></div>

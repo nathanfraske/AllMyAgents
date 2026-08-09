@@ -57,6 +57,7 @@ function makeHarness(opts: {
     },
     remoteDevices: async () => [],
     remoteExecute: async () => ({ ok: false, error: 'remote device unavailable in test' }),
+    remotePrepareProjectLocation: async () => ({ ok: false, error: 'remote project preparation unavailable in test' }),
     overseerControl: async () => ({ ok: false, error: 'not the overseer in test' }),
     memory,
     practices,
@@ -106,6 +107,8 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
       'remote_list_devices',
       'remote_ping',
       'remote_inspect_environment',
+      'remote_inspect_git',
+      'remote_prepare_project_location',
       'remote_list_files',
       'remote_read_file',
       'remote_create_directory',
@@ -210,6 +213,49 @@ describe('remote testbed tools', () => {
     expect(out).toMatch(/unavailable on a teammate-caused turn/u)
     expect(called).toBe(false)
   })
+
+  it('renders bounded Git readiness from the fixed remote inspection action', async () => {
+    const h = makeHarness()
+    h.services.remoteExecute = async (_sessionId, _siteId, action) => {
+      expect(action).toEqual({ op: 'git_inspect', rootId: 'root-a' })
+      return {
+        ok: true,
+        git: {
+          status: 'dirty', gitAvailable: true, isRepository: true, complete: true, clean: false,
+          headCommit: 'a'.repeat(40), headRef: 'main', trackedChanges: 2, untrackedFiles: 1,
+          observedAt: new Date().toISOString(),
+        },
+      }
+    }
+    const out = await runAgentTool('remote_inspect_git', {
+      device_id: 'site-a', root_id: 'root-a',
+    }, { identity: idA, services: h.services })
+    expect(out).toContain('Git dirty')
+    expect(out).toContain('tracked changes 2')
+    expect(out).toContain('untracked files 1')
+  })
+
+  it('derives project preparation through the hub instead of accepting model-selected Git inputs', async () => {
+    const h = makeHarness()
+    h.services.remotePrepareProjectLocation = async (sessionId, siteId, rootId) => {
+      expect({ sessionId, siteId, rootId }).toEqual({ sessionId: idA.sessionId, siteId: 'site-a', rootId: 'root-a' })
+      return {
+        ok: true,
+        git: {
+          status: 'ready', gitAvailable: true, isRepository: true, complete: true, clean: true,
+          detached: true, headCommit: 'a'.repeat(40), repository: 'github.com/acme/repo',
+          observedAt: new Date().toISOString(),
+        },
+      }
+    }
+    const tool = AGENT_TOOLS.find((candidate) => candidate.name === 'remote_prepare_project_location')!
+    expect(Object.keys(tool.schema)).toEqual(['device_id', 'root_id'])
+    const out = await runAgentTool('remote_prepare_project_location', {
+      device_id: 'site-a', root_id: 'root-a',
+    }, { identity: idA, services: h.services })
+    expect(out).toContain(`prepared at ${'a'.repeat(40)}`)
+    expect(out).toContain('github.com/acme/repo')
+  })
 })
 
 describe('list_agents / read_messages', () => {
@@ -284,17 +330,27 @@ describe('manage_team (durable manager lineups)', () => {
   })
 })
 
-describe('manage_child (reversible manager retirement)', () => {
-  it('returns the hub-authored preservation and capacity result', async () => {
-    const summary = 'Retired Corbato and released one live-child slot; workspace preserved.'
+describe('manage_child (durable manager identity)', () => {
+  it('forwards role repair and returns the hub-authored continuity result', async () => {
+    const summary = 'Updated Corbato durable role to journal continuity specialist.'
     const h = makeHarness({ manageChild: { ok: true, summary } })
     expect(
       await runAgentTool(
         'manage_child',
-        { operation: 'retire', child_session: 'child-1', reason: 'context exhausted' },
+        {
+          operation: 'set_role',
+          child_session: 'child-1',
+          role: 'journal continuity specialist',
+          reason: 'repair a legacy general role',
+        },
         { identity: idA, services: h.services },
       ),
     ).toBe(summary)
+  })
+
+  it('keeps the legacy retire verb model-readable but describes it as disabled', () => {
+    const tool = AGENT_TOOLS.find((candidate) => candidate.name === 'manage_child')!
+    expect(tool.description).toMatch(/legacy.*retired records.*New retirement is disabled/is)
   })
 })
 

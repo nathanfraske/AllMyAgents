@@ -71,6 +71,8 @@ describe('Manager setup', () => {
     expect(getAllByText('Project')).toHaveLength(2)
     expect(getByText('Worker accounts & models')).toBeTruthy()
     expect(getByText('Live child limit')).toBeTruthy()
+    expect(getByText('Parallel worker target')).toBeTruthy()
+    expect(getByText(/reminded on every turn to reach this target/i)).toBeTruthy()
     expect(getByText(/disabled, unavailable, and out-of-ceiling manager requests automatically escalate/i)).toBeTruthy()
     expect(getByText(/its own managed hierarchy, and only that hierarchy/i)).toBeTruthy()
   })
@@ -86,6 +88,7 @@ describe('Manager setup', () => {
       ...store.sessions.existing!.record,
       isProjectManager: true,
       managerMaxLiveChildren: 3,
+      managerParallelismTarget: 2,
       managerAllowedProfiles: ['codex-a'],
       managerAllowedModels: { 'codex-a': ['gpt-5.6-sol'] },
       managerDelegation: ['commit'],
@@ -97,6 +100,7 @@ describe('Manager setup', () => {
     })
     const { getByText, getByRole } = render(ManagerSetupModal, { onclose: vi.fn() })
     expect(getByText(/3 live children/i)).toBeTruthy()
+    expect(getByText(/2 useful worker lanes/i)).toBeTruthy()
     expect(getByText(/commit only/i)).toBeTruthy()
     expect(getByRole('button', { name: /revoke manager role/i })).toBeTruthy()
     await fireEvent.click(getByRole('button', { name: /revoke manager role/i }))
@@ -197,7 +201,10 @@ describe('Manager setup', () => {
     expect(prompt).toContain('Demo project')
     expect(prompt).toContain('C:/repo')
     expect(prompt).toMatch(/spawn_agent.*isolated.*worktree/is)
-    expect(prompt).toMatch(/manage_child.*retire.*preserv.*live-child slot/is)
+    expect(prompt).toMatch(/spawn_agent.*durable role.*profile_id.*account.*prompt.*current assignment/is)
+    expect(prompt).toMatch(/manage_child.*resume.*repair.*durable role.*retired records.*disabled/is)
+    expect(prompt).toMatch(/manage_team.*shelves.*ids.*culture.*transcripts.*worktrees/is)
+    expect(prompt).toMatch(/direct manager wake.*provider compaction.*continuity/is)
     expect(prompt).toMatch(/child_status.*peek_agent.*set_child_authority.*decide_child_approval/is)
     expect(prompt).toMatch(/send_message.*direct.*broadcast/is)
     expect(prompt).toMatch(/practice.*memory/is)
@@ -207,14 +214,17 @@ describe('Manager setup', () => {
     expect(prompt).toMatch(/cannot grant.*does not hold/i)
     expect(prompt).toMatch(/profile_id.*codex-a/i)
     expect(prompt).toMatch(/stalls.*blocks.*errors/is)
+    expect(prompt).toMatch(/durable role.*temporary task.*exact granted tools/is)
     expect(prompt).toMatch(/verify.*transcript.*worktree/is)
-    expect(prompt).toMatch(/state.*exact granted tools.*redirect.*granted alternative/is)
+    expect(prompt).toMatch(/ungranted tool.*redirect.*granted alternative/is)
     expect(prompt).toMatch(/final status.*files.*commits/is)
 
     const standing = (getByLabelText(/standing manager rules/i) as HTMLTextAreaElement).value
     expect(standing).toMatch(/mcp__allmyagents(?:__|\.)spawn_agent/i)
     expect(standing).toMatch(/never.*collaboration\.spawn_agent/is)
-    expect(standing).toMatch(/manage_child.*retire.*releases capacity/is)
+    expect(standing).toMatch(/durable role.*agent_type.*role.*profile_id.*prompt/is)
+    expect(standing).toMatch(/reuse workers.*provider compaction/is)
+    expect(standing).toMatch(/retirement is disabled.*manage_team.*stashes chats/is)
   })
 
   it('offers Lane O project creation inline and returns a deferred embedded launch config', async () => {
@@ -259,6 +269,7 @@ describe('Manager setup', () => {
       permissionModeOperatorOverrideCeiling: 'full',
       managerPermissionModeCeiling: 'safe',
       managerMaxChildPermissionMode: 'edits',
+      managerParallelismTarget: 3,
       managerAllowedProfiles: ['codex-a'],
       managerAllowedModels: { 'codex-a': ['gpt-5.6-terra'] },
     }
@@ -287,7 +298,11 @@ describe('Manager setup', () => {
     expect(rename).toHaveBeenCalledWith('existing', 'Release manager')
     expect(configureProjectManager).toHaveBeenCalledWith(
       'existing',
-      expect.objectContaining({ permissionMode: 'safe', maxChildPermissionMode: 'edits' }),
+      expect.objectContaining({
+        permissionMode: 'safe',
+        maxChildPermissionMode: 'edits',
+        parallelismTarget: 3,
+      }),
     )
     expect(onSaved).toHaveBeenCalledWith(expect.objectContaining({ id: 'existing' }))
     expect(store.projectViewId).toBe('project-1')

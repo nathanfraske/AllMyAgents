@@ -75,7 +75,12 @@ function activity(projectId: string, risks = 0): WorktreeProjectActivity {
 }
 
 beforeEach(() => {
-  apiMock.stats.mockReset().mockResolvedValue({ days: [], totalTurns: 0, totalCost: 0 })
+  apiMock.stats.mockReset().mockResolvedValue({
+    days: [],
+    totalTurns: 0,
+    totalApiEquivalentCostUsd: 0,
+    totalSessions: 0,
+  })
   apiMock.projectActivity.mockReset().mockImplementation((projectId: string) =>
     Promise.resolve(activity(projectId, projectId === 'risk' ? 2 : 0)),
   )
@@ -97,23 +102,62 @@ beforeEach(() => {
   store.profiles = [{ id: 'claude-main', provider: 'claude' }]
   store.lastProfileId = null
   settings.detachedDefaultProjectId = null
+  settings.showSpend = false
 })
 
 afterEach(() => {
   cleanup()
   settings.detachedDefaultProjectId = null
+  settings.showSpend = false
 })
 
 describe('Dashboard project launchpad', () => {
+  it('uses relative heat intensity and only shows clearly-labelled API-equivalent estimates when enabled', async () => {
+    settings.showSpend = true
+    apiMock.stats.mockResolvedValue({
+      days: [
+        {
+          date: '2026-07-26',
+          turns: 5,
+          apiEquivalentCostUsd: 1.25,
+          projects: { 'Quiet project': { turns: 5, apiEquivalentCostUsd: 1.25 } },
+        },
+        {
+          date: '2026-07-27',
+          turns: 20,
+          apiEquivalentCostUsd: 12.5,
+          projects: { 'Risk project': { turns: 20, apiEquivalentCostUsd: 12.5 } },
+        },
+      ],
+      totalTurns: 25,
+      totalApiEquivalentCostUsd: 13.75,
+      totalSessions: 4,
+    })
+
+    render(Dashboard, { onnewproject: vi.fn() })
+
+    expect(await screen.findByText('API-equivalent (past yr)')).toBeTruthy()
+    expect(screen.getByText('~$13.8')).toBeTruthy()
+    expect(screen.queryByText('spend (past yr)')).toBeNull()
+    expect(screen.getByRole('button', { name: '2026-07-26: 5 turns, 25% of busiest day' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: '2026-07-27: 20 turns, 100% of busiest day' })).toBeTruthy()
+  })
+
   it('shows every project, opens ProjectView in one click, and summarizes the cheap roster signals', async () => {
+    const retired = session('retired', 'risk', 'active', '2026-07-27T11:59:00.000Z')
+    retired.record.managerRetiredAt = '2026-07-27T12:00:00.000Z'
+    store.sessions.retired = retired
     const { container } = render(Dashboard, { onnewproject: vi.fn() })
 
+    expect(container.querySelector('.tiles .tile .num')?.textContent).toBe('4')
     const quiet = screen.getByRole('button', { name: 'Open Quiet project project' })
     expect(within(quiet).getByText('2 agents')).toBeTruthy()
     expect(within(quiet).getByText('1 working')).toBeTruthy()
     expect(within(quiet).getByText(/ago$/)).toBeTruthy()
 
     const risk = screen.getByRole('button', { name: 'Open Risk project project' })
+    expect(within(risk).getByText('2 agents')).toBeTruthy()
+    expect(within(risk).queryByText(/working$/)).toBeNull()
     expect(within(risk).getByText('1 needs approval')).toBeTruthy()
     expect(within(risk).getByText('1 failed')).toBeTruthy()
 

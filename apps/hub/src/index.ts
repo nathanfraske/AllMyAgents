@@ -18,6 +18,8 @@ import {
   type JournalCondenseResult,
 } from './journal.js'
 import { ProjectStore } from './projects.js'
+import { TestbedRunStore } from './testbedRuns.js'
+import { TestbedReservationStore } from './testbedReservations.js'
 import { profileAuthEvidence, scanProfiles, setClaudeConnectorPolicy } from './profiles.js'
 import { ProfileOwnership } from './profileOwnership.js'
 import { ProfileRuntime } from './profileRuntime.js'
@@ -26,6 +28,7 @@ import {
   ProfileLoginRegistry,
 } from './profileLoginCoordinator.js'
 import { createJournalBackupSupervisor } from './journalBackup.js'
+import { createJournalSnapshotChildTask } from './journalBackupProcess.js'
 import {
   JournalProgressReporter,
   sizeAwareJournalMaintenanceBudgetMs,
@@ -57,6 +60,7 @@ import {
   FleetConnectionStore,
   RemoteDeviceController,
 } from './remoteDevices.js'
+import { TestbedDeploymentService } from './testbedDeployment.js'
 import { asChatNamePool } from './title.js'
 import { asFileWriteDiffDensity } from './types.js'
 import type { DangerFlags, HubConfig, HubPrefs } from './types.js'
@@ -389,7 +393,7 @@ const journalBackups = createJournalBackupSupervisor(journal.db, {
       })
     }
   },
-})
+}, createJournalSnapshotChildTask(journalPath))
 process.once('exit', () => recoveryLease.release())
 const store = new SessionStore(journal.db)
 const profiles: ReturnType<typeof scanProfiles> = []
@@ -412,6 +416,8 @@ const questions = new QuestionService(journal)
 const usage = new UsageMonitor(journal, profiles, config)
 const workspace = new WorkspaceManager(path.join(dataDir, 'worktrees'), path.join(dataDir, 'workspaces'))
 const projects = new ProjectStore(journal.db, journal)
+const testbedRuns = new TestbedRunStore(journal.db)
+const testbedReservations = new TestbedReservationStore(journal.db)
 const instructions = new InstructionStore(journal.db)
 const bus = new AgentBus(journal.db)
 const memory = new MemoryStore(journal.db)
@@ -520,6 +526,8 @@ const executor: Executor = workerSocket
     })
   : new InProcessExecutor({ approvals, questions, usage, danger, memory, practices })
 sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, dataDir, questions, executor, prefs, browserBroker, notifications)
+sessions.setTestbedRunStore(testbedRuns)
+sessions.setTestbedReservationStore(testbedReservations)
 const profileLoginCoordinator = new ProfileLoginCoordinator({
   profilesDir,
   registry: new ProfileLoginRegistry(path.join(dataDir, 'profile-logins.json')),
@@ -693,6 +701,7 @@ function runJournalMaintenance(): void {
         itemStartedDeleted,
         transientPayloadBytesDeleted,
         cursorCheckpointsWritten,
+        writerLockMs,
       } = msg.result
       if (
         commandOutputDeltasDeleted ||
@@ -703,7 +712,8 @@ function runJournalMaintenance(): void {
       ) {
         console.log(
           `[journal] condensed ${commandOutputDeltasDeleted} command deltas + ${agentMessageDeltasDeleted} message deltas + ${diffSnapshotsDeleted} diff snapshots + ${itemStartedDeleted} completed-item start rows (${transientPayloadBytesDeleted} payload bytes)` +
-            (cursorCheckpointsWritten ? `; wrote ${cursorCheckpointsWritten} wseq checkpoint(s)` : '')
+            (cursorCheckpointsWritten ? `; wrote ${cursorCheckpointsWritten} wseq checkpoint(s)` : '') +
+            `; writer lock ${writerLockMs.toFixed(1)}ms`
         )
       }
     })
@@ -997,8 +1007,25 @@ const remoteDevices = new RemoteDeviceController(fleetConnections, async (siteId
 }, { bridge: directMesh, localDeviceToken: deviceToken, enabled: () => mesh.status().enabled })
 sessions.setRemoteDeviceController(remoteDevices)
 
+// Desktop releases carry one platform/architecture-matched, vendor-free node payload. Development
+// builds may opt into the same path by running `pnpm testbed:bundle`; an absent payload simply leaves
+// remote bootstrap unavailable rather than manufacturing an unverified runtime at request time.
+const configuredTestbedBundle = process.env.ALLMYAGENTS_TESTBED_BUNDLE_DIR?.trim()
+const testbedBundleDir = configuredTestbedBundle
+  ? path.resolve(configuredTestbedBundle)
+  : path.join(repoRoot, 'apps', 'desktop', 'src-tauri', 'testbed-runtime')
+const testbedDeployment = fs.existsSync(path.join(testbedBundleDir, 'manifest.json'))
+  ? new TestbedDeploymentService({
+      bundleDir: testbedBundleDir,
+      directMesh,
+      remoteDevices,
+      ownedRoster: () => mesh.ownedRoster(),
+      emit: (event) => journal.append(null, `testbed/deployment-${event.stage}`, event),
+    })
+  : undefined
+
 // Listen on the BOOT port (0 → ephemeral for a green); the server reports its actual port back.
-const server = startServer({ port: bootPort, defaultCwd: dataDir, profilesDir, profileNames, profileOwnership, profileLoginCoordinator, journal, sessions, profiles, approvals, questions, notifications, usage, projects, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity: (projectId) => worktreeCollisions.projectActivity(projectId), deviceExecutor, remoteDevices, directMesh, overseer, overseerCwd: repoRoot })
+const server = startServer({ port: bootPort, defaultCwd: dataDir, profilesDir, profileNames, profileOwnership, profileLoginCoordinator, journal, sessions, profiles, approvals, questions, notifications, usage, projects, testbedRuns, testbedReservations, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity: (projectId) => worktreeCollisions.projectActivity(projectId), deviceExecutor, remoteDevices, directMesh, testbedDeployment, overseer, overseerCwd: repoRoot })
 
 // Register the mesh advert — factored so a promoted green can (re)register once it owns the port.
 function registerMesh(): void {

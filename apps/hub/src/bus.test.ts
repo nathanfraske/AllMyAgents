@@ -25,7 +25,7 @@ function harness(): { db: Database.Database; bus: AgentBus; from: SessionIdentit
 }
 
 describe('AgentBus external delivery receipts', () => {
-  it('migrates legacy mail and durably records no-wake delivery intent', () => {
+  it('migrates legacy mail and durably records wake and hub-attention delivery intent', () => {
     const db = new Database(':memory:')
     databases.push(db)
     db.exec(`CREATE TABLE bus_messages (
@@ -50,10 +50,22 @@ describe('AgentBus external delivery receipts', () => {
       recipients: ['child'],
       wake: false,
     })
+    bus.post({
+      from,
+      project: 'project',
+      to: { kind: 'session', id: 'manager' },
+      body: 'approval requires a decision',
+      recipients: ['manager'],
+      attentionRequired: true,
+    })
 
-    expect(bus.pending('child')).toMatchObject([{ wake: false }])
+    expect(bus.pending('child')).toMatchObject([{ wake: false, attentionRequired: false }])
+    expect(bus.pending('manager')).toMatchObject([{ wake: true, attentionRequired: true }])
     expect(
       db.prepare("SELECT 1 FROM pragma_table_info('bus_messages') WHERE name = 'wake'").get(),
+    ).toBeTruthy()
+    expect(
+      db.prepare("SELECT 1 FROM pragma_table_info('bus_messages') WHERE name = 'attentionRequired'").get(),
     ).toBeTruthy()
   })
 
