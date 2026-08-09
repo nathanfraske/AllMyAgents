@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { execFileSync } from 'node:child_process'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ApprovalService } from './approvals.js'
 import { AgentBus } from './bus.js'
@@ -31,6 +32,14 @@ function build() {
   const profileDir = path.join(root, 'profile')
   fs.mkdirSync(projectDir)
   fs.mkdirSync(profileDir)
+  execFileSync('git', ['-C', projectDir, 'init'])
+  execFileSync('git', ['-C', projectDir, 'config', 'user.email', 'test@example.invalid'])
+  execFileSync('git', ['-C', projectDir, 'config', 'user.name', 'Test'])
+  execFileSync('git', ['-C', projectDir, 'checkout', '-b', 'main'])
+  execFileSync('git', ['-C', projectDir, 'remote', 'add', 'origin', 'https://github.com/acme/testbed-project.git'])
+  fs.writeFileSync(path.join(projectDir, 'tracked.txt'), 'primary')
+  execFileSync('git', ['-C', projectDir, 'add', 'tracked.txt'])
+  execFileSync('git', ['-C', projectDir, 'commit', '-m', 'fixture'])
   const journal = new Journal(path.join(root, 'hub.db'))
   const projects = new ProjectStore(journal.db, journal)
   const project = projects.create('Testbed project', projectDir)
@@ -102,6 +111,74 @@ function build() {
 }
 
 describe('remote testbed attribution', () => {
+  it('lets a granted project agent prepare an attached location without choosing Git inputs', async () => {
+    const hub = build()
+    const primaryHead = execFileSync('git', ['-C', hub.projects.get(hub.project.id)!.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+    const execute = vi.fn(async (
+      siteId: string,
+      action: RemoteDeviceAction,
+      actor: Record<string, unknown>,
+    ): Promise<RemoteDeviceActionResult> => {
+      expect(siteId).toBe('site-a')
+      expect(action).toEqual({
+        op: 'git_sync',
+        rootId: 'root-a',
+        repository: 'github.com/acme/testbed-project',
+        headRef: 'main',
+        headCommit: primaryHead,
+      })
+      expect(actor).toMatchObject({
+        sessionId: 'agent-a', projectId: hub.project.id, replicaId: hub.replica.id, agentId: 'agent-a',
+      })
+      return {
+        ok: true,
+        git: {
+          status: 'ready', gitAvailable: true, isRepository: true, complete: true, clean: true,
+          detached: true, headCommit: primaryHead, repository: 'github.com/acme/testbed-project',
+          observedAt: new Date().toISOString(),
+        },
+      }
+    })
+    hub.sessions.setRemoteDeviceController({ execute } as unknown as RemoteDeviceController)
+    const privateApi = hub.sessions as unknown as {
+      remotePrepareProjectLocation(sessionId: string, siteId: string, rootId: string): Promise<RemoteDeviceActionResult>
+    }
+
+    await expect(privateApi.remotePrepareProjectLocation('agent-a', 'site-a', 'root-a')).resolves.toMatchObject({
+      ok: true,
+      git: { headCommit: primaryHead, detached: true },
+    })
+    expect(hub.reservations.active(hub.replica.id)).toBeUndefined()
+    expect(hub.reservations.listProject(hub.project.id)).toEqual([
+      expect.objectContaining({ agentId: 'agent-a', state: 'released', reason: 'project-prepare-finished' }),
+    ])
+    expect(hub.journal.eventsForSession('agent-a').events.map((event) => event.kind)).toEqual(
+      expect.arrayContaining([
+        'project/replica-prepare-started',
+        'project/replica-prepare-completed',
+        'testbed-reservation/released',
+      ]),
+    )
+  })
+
+  it('refuses preparation without an exact terminal grant before reserving or contacting the device', async () => {
+    const hub = build()
+    const record = hub.sessions.list().find((candidate) => candidate.id === 'agent-a')!
+    record.remoteDeviceGrants = [{ siteId: 'site-a', rootIds: ['root-a'], capabilities: ['write'] }]
+    const execute = vi.fn()
+    hub.sessions.setRemoteDeviceController({ execute } as unknown as RemoteDeviceController)
+    const privateApi = hub.sessions as unknown as {
+      remotePrepareProjectLocation(sessionId: string, siteId: string, rootId: string): Promise<RemoteDeviceActionResult>
+    }
+
+    await expect(privateApi.remotePrepareProjectLocation('agent-a', 'site-a', 'root-a')).resolves.toMatchObject({
+      ok: false,
+      failure: { stage: 'admission', code: 'GRANT_REQUIRED' },
+    })
+    expect(execute).not.toHaveBeenCalled()
+    expect(hub.reservations.listProject(hub.project.id)).toEqual([])
+  })
+
   it('creates and completes one durable run only for an explicitly attached project root', async () => {
     const hub = build()
     expect(hub.sessions.list().find((record) => record.id === 'agent-a')?.projectReplicaId).toBe(

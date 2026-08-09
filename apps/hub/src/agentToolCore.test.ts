@@ -57,6 +57,7 @@ function makeHarness(opts: {
     },
     remoteDevices: async () => [],
     remoteExecute: async () => ({ ok: false, error: 'remote device unavailable in test' }),
+    remotePrepareProjectLocation: async () => ({ ok: false, error: 'remote project preparation unavailable in test' }),
     overseerControl: async () => ({ ok: false, error: 'not the overseer in test' }),
     memory,
     practices,
@@ -107,6 +108,7 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
       'remote_ping',
       'remote_inspect_environment',
       'remote_inspect_git',
+      'remote_prepare_project_location',
       'remote_list_files',
       'remote_read_file',
       'remote_create_directory',
@@ -231,6 +233,28 @@ describe('remote testbed tools', () => {
     expect(out).toContain('Git dirty')
     expect(out).toContain('tracked changes 2')
     expect(out).toContain('untracked files 1')
+  })
+
+  it('derives project preparation through the hub instead of accepting model-selected Git inputs', async () => {
+    const h = makeHarness()
+    h.services.remotePrepareProjectLocation = async (sessionId, siteId, rootId) => {
+      expect({ sessionId, siteId, rootId }).toEqual({ sessionId: idA.sessionId, siteId: 'site-a', rootId: 'root-a' })
+      return {
+        ok: true,
+        git: {
+          status: 'ready', gitAvailable: true, isRepository: true, complete: true, clean: true,
+          detached: true, headCommit: 'a'.repeat(40), repository: 'github.com/acme/repo',
+          observedAt: new Date().toISOString(),
+        },
+      }
+    }
+    const tool = AGENT_TOOLS.find((candidate) => candidate.name === 'remote_prepare_project_location')!
+    expect(Object.keys(tool.schema)).toEqual(['device_id', 'root_id'])
+    const out = await runAgentTool('remote_prepare_project_location', {
+      device_id: 'site-a', root_id: 'root-a',
+    }, { identity: idA, services: h.services })
+    expect(out).toContain(`prepared at ${'a'.repeat(40)}`)
+    expect(out).toContain('github.com/acme/repo')
   })
 })
 

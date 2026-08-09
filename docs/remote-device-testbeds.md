@@ -23,8 +23,9 @@ the mapped Site/HTTP route only as a compatibility fallback.
    environment for that logical project. This is project topology, not an authority grant: the session still
    needs the per-chat grant from step 4 before it can use the root.
 6. The agent can discover only its granted device/root labels and opaque IDs, then use:
-   `remote_ping`, `remote_inspect_environment`, `remote_inspect_git`, `remote_list_files`, `remote_read_file`,
-   `remote_create_directory`, `remote_write_file`, and `remote_exec`. A folder transfer mirrors its
+   `remote_ping`, `remote_inspect_environment`, `remote_inspect_git`, `remote_prepare_project_location`,
+   `remote_list_files`, `remote_read_file`, `remote_create_directory`, `remote_write_file`, and `remote_exec`.
+   Project preparation is available only when the root is attached to the chat's project. A folder transfer mirrors its
    directory tree with `remote_create_directory` before writing the contained files; empty directories
    are therefore preserved too.
 
@@ -77,9 +78,9 @@ updates submodules, or accepts caller-supplied Git arguments.
 Preparation requires the target root's **terminal** capability. Git checkout can invoke configured credential
 helpers or content filters even when AllMyAgents supplies only fixed argv; classifying it as a mere file write
 would create an authority escalation. Repository hooks and external remote helpers are explicitly disabled as
-additional defense. The operator-facing Project Overview is the only preparation caller in this slice; a later
-agent tool will derive the same immutable preparation request from project topology rather than accepting a
-model-selected repository/ref/commit.
+additional defense. The operator can prepare from Project Overview; a project agent with the same explicit
+terminal grant can call `remote_prepare_project_location`. The tool accepts only device/root identity and the
+hub derives the immutable repository/ref/commit request from current project topology.
 
 This runner slice still does not clone an absent checkout, transmit uncommitted work, stream command output,
 isolate CPU/GPU/memory, or accept results back into the primary. Those remain later protocol layers; a

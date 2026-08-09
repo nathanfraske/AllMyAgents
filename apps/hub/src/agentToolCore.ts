@@ -304,6 +304,8 @@ export interface AgentServices {
   remoteDevices(sessionId: string): Awaitable<RemoteDeviceView[]>
   /** Execute one already-scoped remote file/terminal operation; the hub rechecks the durable grant. */
   remoteExecute(sessionId: string, siteId: string, action: RemoteDeviceAction): Awaitable<RemoteDeviceActionResult>
+  /** Prepare an attached project replica from the live primary checkout; callers never choose Git inputs. */
+  remotePrepareProjectLocation(sessionId: string, siteId: string, rootId: string): Awaitable<RemoteDeviceActionResult>
   /** App-wide control plane. The hub rechecks that the caller is its minted Overseer on a direct operator turn. */
   overseerControl(sessionId: string, input: OverseerControlInput): Awaitable<OverseerControlResult>
   memory: MemoryServices
@@ -1098,6 +1100,29 @@ const remoteInspectGit = defineTool({
   },
 })
 
+const remotePrepareProjectLocation = defineTool({
+  name: 'remote_prepare_project_location',
+  description:
+    'Prepare an existing attached remote checkout at this project primary location\'s exact clean published commit. The hub derives repository, branch, and commit; this tool never accepts Git arguments and requires a terminal grant.',
+  schema: {
+    device_id: z.string().min(1).max(256),
+    root_id: z.string().min(1).max(128),
+  },
+  run: async (args, { identity, services }) => {
+    const denied = remoteBusDenied(identity, services)
+    if (denied) return denied
+    const result = await services.remotePrepareProjectLocation(identity.sessionId, args.device_id, args.root_id)
+    if (!result.ok || !result.git) {
+      return `Remote project preparation failed: ${result.error ?? 'unknown error'} ${remoteTelemetry(result)}`
+    }
+    return [
+      `Remote project location prepared at ${result.git.headCommit ?? 'an unknown revision'}.`,
+      `repository ${result.git.repository ?? '(safe origin unavailable)'}; checkout ${result.git.clean ? 'clean' : 'not proven clean'}; ${result.git.detached ? 'detached exact revision' : `ref ${result.git.headRef ?? 'unknown'}`}`,
+      remoteTelemetry(result),
+    ].join('\n')
+  },
+})
+
 const remoteCreateDirectory = defineTool({
   name: 'remote_create_directory',
   description:
@@ -1365,6 +1390,7 @@ export const AGENT_TOOLS: readonly AgentToolSpec[] = [
   remotePing,
   remoteInspectEnvironment,
   remoteInspectGit,
+  remotePrepareProjectLocation,
   remoteListFiles,
   remoteReadFile,
   remoteCreateDirectory,

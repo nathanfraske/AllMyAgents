@@ -125,6 +125,7 @@ export type RelayMethod =
   | 'browser.execute'
   | 'remote.list'
   | 'remote.execute'
+  | 'remote.prepareProjectLocation'
   | 'overseer.control'
   | 'questions.request'
   | 'questions.abort'

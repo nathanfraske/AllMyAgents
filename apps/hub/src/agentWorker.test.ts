@@ -82,6 +82,17 @@ describe('buildWorkerAgentServices — proxy shapes (the exact relay args the hu
     ])
   })
 
+  it('remote project preparation relays only the caller and attached location identity', async () => {
+    const h = withRecorder()
+    await h.services.remotePrepareProjectLocation('s1', 'site-a', 'root-a')
+    expect(h.rpcCalls).toEqual([
+      {
+        method: 'remote.prepareProjectLocation',
+        args: { sessionId: 's1', siteId: 'site-a', rootId: 'root-a' },
+      },
+    ])
+  })
+
   it('memory.{write,search,get} → rpc(memory.*) with the store-shaped args', async () => {
     const h = withRecorder()
     const input = { scope: 'account:p1', title: 't', body: 'b', tags: ['x'], fromSession: 's1', fromProfile: 'p1' }

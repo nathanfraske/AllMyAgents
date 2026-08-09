@@ -262,6 +262,11 @@ export interface InProcessExecutorHubHooks {
     siteId: string,
     action: Parameters<AgentServices['remoteExecute']>[2],
   ): ReturnType<AgentServices['remoteExecute']>
+  remotePrepareProjectLocation(
+    sessionId: string,
+    siteId: string,
+    rootId: string,
+  ): ReturnType<AgentServices['remotePrepareProjectLocation']>
   overseerControl(
     sessionId: string,
     input: Parameters<AgentServices['overseerControl']>[1],
@@ -333,6 +338,8 @@ export class InProcessExecutor implements Executor {
       browser: (sessionId, operation, args) => this.h.browser(sessionId, operation, args),
       remoteDevices: (sessionId) => this.h.remoteDevices(sessionId),
       remoteExecute: (sessionId, siteId, action) => this.h.remoteExecute(sessionId, siteId, action),
+      remotePrepareProjectLocation: (sessionId, siteId, rootId) =>
+        this.h.remotePrepareProjectLocation(sessionId, siteId, rootId),
       overseerControl: (sessionId, input) => this.h.overseerControl(sessionId, input),
       memory: this.services.memory,
       practices: this.services.practices,

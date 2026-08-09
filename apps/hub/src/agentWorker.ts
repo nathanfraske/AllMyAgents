@@ -208,6 +208,8 @@ export function buildWorkerAgentServices(deps: WorkerAgentServiceDeps): AgentSer
       deps.relayRpc('remote.list', { sessionId }) as ReturnType<AgentServices['remoteDevices']>,
     remoteExecute: (sessionId, siteId, action) =>
       deps.relayRpc('remote.execute', { sessionId, siteId, action }) as ReturnType<AgentServices['remoteExecute']>,
+    remotePrepareProjectLocation: (sessionId, siteId, rootId) =>
+      deps.relayRpc('remote.prepareProjectLocation', { sessionId, siteId, rootId }) as ReturnType<AgentServices['remotePrepareProjectLocation']>,
     overseerControl: (sessionId, input) =>
       deps.relayRpc('overseer.control', { sessionId, input }) as ReturnType<AgentServices['overseerControl']>,
     memory: {
