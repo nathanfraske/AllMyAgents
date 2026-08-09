@@ -28,6 +28,7 @@ import {
   ProfileLoginRegistry,
 } from './profileLoginCoordinator.js'
 import { createJournalBackupSupervisor } from './journalBackup.js'
+import { createJournalSnapshotChildTask } from './journalBackupProcess.js'
 import {
   JournalProgressReporter,
   sizeAwareJournalMaintenanceBudgetMs,
@@ -392,7 +393,7 @@ const journalBackups = createJournalBackupSupervisor(journal.db, {
       })
     }
   },
-})
+}, createJournalSnapshotChildTask(journalPath))
 process.once('exit', () => recoveryLease.release())
 const store = new SessionStore(journal.db)
 const profiles: ReturnType<typeof scanProfiles> = []
@@ -700,6 +701,7 @@ function runJournalMaintenance(): void {
         itemStartedDeleted,
         transientPayloadBytesDeleted,
         cursorCheckpointsWritten,
+        writerLockMs,
       } = msg.result
       if (
         commandOutputDeltasDeleted ||
@@ -710,7 +712,8 @@ function runJournalMaintenance(): void {
       ) {
         console.log(
           `[journal] condensed ${commandOutputDeltasDeleted} command deltas + ${agentMessageDeltasDeleted} message deltas + ${diffSnapshotsDeleted} diff snapshots + ${itemStartedDeleted} completed-item start rows (${transientPayloadBytesDeleted} payload bytes)` +
-            (cursorCheckpointsWritten ? `; wrote ${cursorCheckpointsWritten} wseq checkpoint(s)` : '')
+            (cursorCheckpointsWritten ? `; wrote ${cursorCheckpointsWritten} wseq checkpoint(s)` : '') +
+            `; writer lock ${writerLockMs.toFixed(1)}ms`
         )
       }
     })

@@ -217,10 +217,12 @@ function providerHostInstructions(
     const parallelismTarget = effectiveManagerParallelismTarget(record)
     const common =
       `You are an operator-configured project manager. Use the AllMyAgents child_status, manage_team, manage_child, spawn_agent, set_child_authority, decide_child_approval, assign_child_task, list_agents, peek_agent, send_message, and read_messages tools for the real app team. Every direct worker must have a durable role: pass an operator-defined agent_type or an explicit role to spawn_agent, and keep the current task in prompt/assign_child_task rather than confusing a temporary assignment with identity. Only when the operator enabled child approval decisions are in-ceiling requests from your hierarchy routed to you; decide a request that reaches you with decide_child_approval. Disabled, unavailable, and out-of-ceiling manager requests route to the Overseer/operator instead, so do not claim a missing request is waiting in your chat or ask a child to loop on it. When the live roster reports an operator steer, approval decision, or permission override, treat that bounded fact as authoritative provenance that the operator deliberately intervened; do not misclassify the affected agent as acting autonomously or off the rails. Use send_message wake=false for checkpoints/FYIs that need no immediate response. Reuse workers whose durable role fits: accumulated project context is an asset, an idle worker is not spent, and a high-context direct manager wake is allowed so provider compaction can preserve continuity before the next task. New retirement is disabled. Use manage_child resume for stopped/errored workers and set_role to repair a legacy/general role. If a genuinely different kind of work needs a lineup the active team cannot cover, create or activate another team; manage_team stashes the original roster without deleting its culture, identities, transcripts, branches, or worktrees. The operator's parallel staffing target is ${parallelismTarget} useful direct worker lanes whenever the task can support them. At every new task or materially new slice, call child_status, decompose independent implementation, research, reproduction, or cross-check lanes, and wake idle workers or spawn within your grant until the target is met. Do not invent, duplicate, or prolong work merely to fill the target; when fewer lanes are genuinely useful, state the concrete dependency or reason in your next operator update. Each management cycle must dispatch, decide, inspect bounded evidence, integrate, or report one exact blocker. The topology snapshot below is bounded orientation data, not a substitute for child_status or peek_agent.`
+    const rememberedApprovalDiscipline =
+      'For a recurring, understood ordinary tool or Git action from a direct worker, decide_child_approval may use approve=true and remember=true. That stores only the exact class on that worker, remains bounded by your live operator ceiling, is audited on grant and use, and is revocable with set_child_authority. Approve unusual or high-blast-radius requests only once. One-shot descendants inherit their direct worker grant.'
     const providerDiscipline = record.provider === 'claude'
       ? 'Claude-manager discipline: resist meandering or passive idle loops. Keep the critical path moving, check running children at sensible boundaries rather than polling endlessly, integrate completed work promptly, and finish or escalate once the requested outcome is actually resolved.'
       : 'Codex-manager discipline: keep investigation and token use bounded. Reproduce and rank a suspected issue before assigning work, ignore benign noise once disproven, do not expand scope merely because capacity remains, and stop when the operator\'s acceptance criteria are verified instead of continuing until context is exhausted.'
-    role = `${common}\n\n${providerDiscipline}`
+    role = `${common}\n\n${rememberedApprovalDiscipline}\n\n${providerDiscipline}`
   } else if (record.parentSessionId) {
     role =
       `You are a managed child of session ${record.parentSessionId}. Your durable team role is: ${record.role?.trim() || 'legacy general project contributor; ask the manager to refine it with manage_child set_role'}. Preserve and build on relevant project context across assignments and compaction; a completed task does not end your identity. Use the AllMyAgents bus tools for upstream reports and coordination. Your manager assignment is authorized work inside the persisted grant; report a real scope or permission block upstream rather than silently waiting for the operator in chat.`
@@ -782,8 +784,8 @@ export class SessionManager {
           tools,
           permissionMode,
         ),
-      managerDecideChildApproval: (managerSessionId, approvalId, approve) =>
-        this.decideChildApproval(managerSessionId, approvalId, approve),
+      managerDecideChildApproval: (managerSessionId, approvalId, approve, remember) =>
+        this.decideChildApproval(managerSessionId, approvalId, approve, remember),
       managerAssignChildTask: (managerSessionId, childSessionId, input) =>
         this.managerAssignChildTask(managerSessionId, childSessionId, input),
       browser: (sessionId, operation, args) => this.browserExecute(sessionId, operation, args),
@@ -1121,8 +1123,13 @@ export class SessionManager {
         )
       }
       case 'manager.decideChildApproval': {
-        const a = args as { managerSessionId: string; approvalId: string; approve: boolean }
-        return this.decideChildApproval(a.managerSessionId, a.approvalId, a.approve)
+        const a = args as {
+          managerSessionId: string
+          approvalId: string
+          approve: boolean
+          remember?: boolean
+        }
+        return this.decideChildApproval(a.managerSessionId, a.approvalId, a.approve, a.remember)
       }
       case 'manager.assignChildTask': {
         const a = args as {
@@ -2816,8 +2823,8 @@ export class SessionManager {
           tools,
           permissionMode,
         ),
-      decideChildApproval: (managerSessionId, approvalId, approve) =>
-        this.decideChildApproval(managerSessionId, approvalId, approve),
+      decideChildApproval: (managerSessionId, approvalId, approve, remember) =>
+        this.decideChildApproval(managerSessionId, approvalId, approve, remember),
       assignChildTask: (managerSessionId, childSessionId, input) =>
         this.managerAssignChildTask(managerSessionId, childSessionId, input),
       browser: (sessionId, operation, args) => this.browserExecute(sessionId, operation, args),
@@ -6299,7 +6306,7 @@ export class SessionManager {
     const requested = this.approvalRequestSummary(approval, child)
     const body =
       `${label} is waiting on approval ${approval.id} for ${requested}. ` +
-      'Inspect the request if needed, then call decide_child_approval. The hub will enforce your managed-hierarchy scope and grant ceiling.'
+      'Inspect the request if needed, then call decide_child_approval. Approve once for a one-off action, or set remember=true for a recurring, understood action class from this direct worker. The hub will enforce your managed-hierarchy scope and live grant ceiling; remembered grants remain revocable with set_child_authority.'
     const messages = this.bus.post({
       from: identityOf(child),
       project: child.projectId ?? null,
@@ -8341,8 +8348,9 @@ export class SessionManager {
   decideChildApproval(
     managerSessionId: string,
     approvalId: string,
-    approve: boolean
-  ): { ok: boolean; error?: string } {
+    approve: boolean,
+    remember = false,
+  ): { ok: boolean; remembered?: boolean; warning?: string; error?: string } {
     const manager = this.sessions.get(managerSessionId)
     if (!manager?.isProjectManager) {
       return { ok: false, error: 'caller is not an operator-marked project manager' }
@@ -8354,6 +8362,17 @@ export class SessionManager {
     if (!approval) return { ok: false, error: 'approval is not pending' }
     const relation = this.managerManagedAgent(manager.id, approval.sessionId)
     if (!relation) return { ok: false, error: 'approval does not belong to this manager’s hierarchy' }
+
+    if (remember && !approve) {
+      return { ok: false, error: 'remember is only valid when approving a request' }
+    }
+    if (remember && relation.child.isOneShotSubagent === true) {
+      return {
+        ok: false,
+        error:
+          'one-shot sub-agents inherit their direct worker grant; approve once or remember the action on the direct worker with set_child_authority',
+      }
+    }
 
     let authority: DelegatedAuthority | undefined
     let toolName: string | undefined
@@ -8367,6 +8386,38 @@ export class SessionManager {
     if (!this.approvals.resolve(approval.id, approve)) {
       return { ok: false, error: 'approval is no longer pending' }
     }
+    let remembered = false
+    let warning: string | undefined
+    if (approve && remember) {
+      try {
+        const authorities = normalizeAuthorities([
+          ...(relation.child.delegatedAuthorities ?? []),
+          ...(authority ? [authority] : []),
+        ])
+        const tools = normalizeNames([
+          ...(relation.child.delegatedTools ?? []),
+          ...(toolName ? [toolName] : []),
+        ])
+        this.setChildDelegation(manager.id, relation.child.id, authorities, tools)
+        remembered = true
+        this.journal.atomic(() => {
+          const payload = {
+            managerSessionId: manager.id,
+            childSessionId: relation.child.id,
+            approvalId: approval.id,
+            kind: approval.kind,
+            authority: authority ?? null,
+            toolName: toolName ?? null,
+          }
+          this.journal.append(relation.child.id, 'manager/child-auto-approval-remembered', payload)
+          this.journal.append(manager.id, 'manager/child-auto-approval-remembered', payload)
+        })
+      } catch (error) {
+        warning =
+          'the request was approved once, but the reusable grant could not be saved: ' +
+          (error instanceof Error ? error.message : String(error))
+      }
+    }
     this.journal.append(manager.id, 'manager/child-approval-decided', {
       managerSessionId: manager.id,
       childSessionId: relation.child.id,
@@ -8375,9 +8426,16 @@ export class SessionManager {
       kind: approval.kind,
       authority: authority ?? null,
       toolName: toolName ?? null,
+      rememberRequested: remember,
+      remembered,
+      warning: warning ?? null,
       decidedAt: new Date().toISOString(),
     })
-    return { ok: true }
+    return {
+      ok: true,
+      ...(remembered ? { remembered: true } : {}),
+      ...(warning ? { warning } : {}),
+    }
   }
 
   managerChildStatus(managerSessionId: string): { ok: boolean; summary?: string; error?: string } {

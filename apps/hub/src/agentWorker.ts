@@ -190,12 +190,13 @@ export function buildWorkerAgentServices(deps: WorkerAgentServiceDeps): AgentSer
         tools,
         permissionMode,
       }) as Promise<{ ok: boolean; error?: string }>,
-    decideChildApproval: (managerSessionId, approvalId, approve) =>
+    decideChildApproval: (managerSessionId, approvalId, approve, remember) =>
       deps.relayRpc('manager.decideChildApproval', {
         managerSessionId,
         approvalId,
         approve,
-      }) as Promise<{ ok: boolean; error?: string }>,
+        remember,
+      }) as Promise<{ ok: boolean; remembered?: boolean; warning?: string; error?: string }>,
     assignChildTask: (managerSessionId, childSessionId, input) =>
       deps.relayRpc('manager.assignChildTask', {
         managerSessionId,

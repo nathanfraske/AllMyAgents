@@ -215,6 +215,7 @@ describe('project-manager durability and honest isolation', () => {
 
     const response = await sessions.execAgentTool('p1', manager.cwd, 'spawn_agent', {
       profile_id: 'p1',
+      role: 'Plain-project implementation worker',
       prompt: 'work on the plain project',
       use_worktree: true,
     })

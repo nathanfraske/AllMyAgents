@@ -1632,6 +1632,52 @@ describe('bounded cold baseline and global maintenance status', () => {
     expect(api.history).toHaveBeenCalledTimes(2)
   })
 
+  it('automatically retries latest history after a transient hub event-loop timeout', async () => {
+    vi.useFakeTimers()
+    const cold = new HubStore()
+    const install = cold as unknown as {
+      installReplayBaseline(baseline: Awaited<ReturnType<typeof api.replayBaseline>>): void
+    }
+    install.installReplayBaseline({
+      version: 1,
+      generation: 7,
+      highWaterSeq: 500,
+      resetFloorSeq: 0,
+      sessions: [rec('s1')],
+      projects: [],
+      journalCompaction: null,
+    })
+    vi.mocked(api.journalHistory)
+      .mockImplementationOnce((_id, _generation, _before, signal) =>
+        new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
+        })
+      )
+      .mockResolvedValueOnce({
+        events: [
+          evt({
+            seq: 490,
+            kind: 'codex/item/completed',
+            sessionId: 's1',
+            payload: { item: { id: 'reply', type: 'agentMessage', text: 'history survived' } },
+          }),
+        ],
+        olderCursor: null,
+        hasOlder: false,
+        encodedBytes: 100,
+        checkpointGeneration: 7,
+      })
+
+    const loading = cold.ensureHistory('s1')
+    await vi.advanceTimersByTimeAsync(8_000)
+    await loading
+    vi.useRealTimers()
+
+    expect(api.journalHistory).toHaveBeenCalledTimes(2)
+    expect(cold.sessions.s1?.historyLoadError).toBeUndefined()
+    expect(cold.sessions.s1?.items.map((item) => item.text)).toContain('history survived')
+  })
+
   it('keeps every lazily loaded page and live item when scrolling or tabbing away and back', async () => {
     const cold = new HubStore()
     const install = cold as unknown as {

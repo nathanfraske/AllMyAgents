@@ -282,8 +282,9 @@ export interface AgentServices {
   decideChildApproval?(
     managerSessionId: string,
     approvalId: string,
-    approve: boolean
-  ): Awaitable<{ ok: boolean; error?: string }>
+    approve: boolean,
+    remember?: boolean,
+  ): Awaitable<{ ok: boolean; remembered?: boolean; warning?: string; error?: string }>
   /** Create or update one audited task on a direct child's shared task board. */
   assignChildTask?(
     managerSessionId: string,
@@ -633,17 +634,30 @@ const setChildAuthority = defineTool({
 const decideChildApproval = defineTool({
   name: 'decide_child_approval',
   description:
-    'Project managers only: approve or deny one pending approval for an agent in your own managed hierarchy. The hub enforces the operator toggle, validated lineage, and your live Git/tool ceiling; every decision is journaled.',
+    'Project managers only: approve or deny one pending approval for an agent in your own managed hierarchy. Set remember=true with an approval to durably grant that exact ordinary tool or Git action class to the direct worker, so future matching requests auto-approve without manager micromanagement. The hub enforces the operator toggle, validated lineage, and live Git/tool ceiling; the grant remains revocable through set_child_authority and every decision/use is journaled.',
   schema: {
     approval_id: z.string().describe('pending approval id shown by a child report or peek_agent'),
     approve: z.boolean().describe('true to approve once; false to deny'),
+    remember: z
+      .boolean()
+      .optional()
+      .describe('with approve=true, remember this action class for this direct worker; defaults to false'),
   },
   run: async (args, { identity, services }) => {
     if (!services.decideChildApproval) return 'Not decided: this hub does not support manager approval decisions.'
-    const result = await services.decideChildApproval(identity.sessionId, args.approval_id, args.approve)
-    return result.ok
-      ? `${args.approve ? 'Approved' : 'Denied'} child approval ${args.approval_id}.`
-      : `Not decided: ${result.error ?? 'unknown error'}`
+    const result = await services.decideChildApproval(
+      identity.sessionId,
+      args.approval_id,
+      args.approve,
+      args.remember === true,
+    )
+    if (!result.ok) return `Not decided: ${result.error ?? 'unknown error'}`
+    const remembered = result.remembered
+      ? ' Matching future requests from this worker will auto-approve until revoked with set_child_authority.'
+      : ''
+    return `${args.approve ? 'Approved' : 'Denied'} child approval ${args.approval_id}.${remembered}${
+      result.warning ? ` Warning: ${result.warning}` : ''
+    }`
   },
 })
 

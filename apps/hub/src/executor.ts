@@ -241,8 +241,9 @@ export interface InProcessExecutorHubHooks {
   managerDecideChildApproval(
     managerSessionId: string,
     approvalId: string,
-    approve: boolean
-  ): { ok: boolean; error?: string }
+    approve: boolean,
+    remember?: boolean,
+  ): { ok: boolean; remembered?: boolean; warning?: string; error?: string }
   managerAssignChildTask(
     managerSessionId: string,
     childSessionId: string,
@@ -332,8 +333,8 @@ export class InProcessExecutor implements Executor {
           tools,
           permissionMode,
         ),
-      decideChildApproval: (managerSessionId, approvalId, approve) =>
-        this.h.managerDecideChildApproval(managerSessionId, approvalId, approve),
+      decideChildApproval: (managerSessionId, approvalId, approve, remember) =>
+        this.h.managerDecideChildApproval(managerSessionId, approvalId, approve, remember),
       assignChildTask: (managerSessionId, childSessionId, input) =>
         this.h.managerAssignChildTask(managerSessionId, childSessionId, input),
       browser: (sessionId, operation, args) => this.h.browser(sessionId, operation, args),
