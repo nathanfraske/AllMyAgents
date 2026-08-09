@@ -116,6 +116,27 @@ function transition(sessions: SessionManager, id: string, status: SessionStatus)
 }
 
 describe('project manager permission ceiling', () => {
+  it('persists a bounded parallel staffing target and refuses one above the live-child ceiling', () => {
+    const { sessions, journal, seed } = buildHub()
+    const manager = seed({ id: 'manager' })
+
+    expect(() => sessions.configureProjectManager(
+      manager.id,
+      { enabled: true, maxLiveChildren: 2, parallelismTarget: 3, allowedProfiles: ['p1'] },
+      'operator',
+    )).toThrow(/parallelismTarget must be a whole number from 1 through maxLiveChildren/u)
+    expect(manager.isProjectManager).not.toBe(true)
+
+    sessions.configureProjectManager(
+      manager.id,
+      { enabled: true, maxLiveChildren: 4, parallelismTarget: 3, allowedProfiles: ['p1'] },
+      'operator',
+    )
+    expect(manager.managerParallelismTarget).toBe(3)
+    const persisted = journal.db.prepare('SELECT record FROM sessions WHERE id = ?').get(manager.id) as { record: string }
+    expect(JSON.parse(persisted.record)).toMatchObject({ managerMaxLiveChildren: 4, managerParallelismTarget: 3 })
+  })
+
   it('keeps the operator-selected Safe mode when promoting a Full chat', () => {
     const { sessions, journal, seed } = buildHub()
     const manager = seed({ id: 'manager', permissionMode: 'full' })
@@ -824,12 +845,13 @@ describe('project manager durable teams', () => {
 describe('project manager durable live roster', () => {
   it('rebuilds the managed-agent roster and bounded operator provenance after compaction', async () => {
     const { sessions, journal, seed, repo } = buildHub()
-    seed({ id: 'manager', projectId: 'project' })
+    const manager = seed({ id: 'manager', projectId: 'project' })
     sessions.configureProjectManager(
       'manager',
       {
         enabled: true,
         maxLiveChildren: 4,
+        parallelismTarget: 3,
         allowedProfiles: ['p1'],
         standingInstructions: 'Your sole purpose is to coordinate the operator-granted project team.',
       },
@@ -839,6 +861,8 @@ describe('project manager durable live roster', () => {
       id: 'reviewer-child',
       title: 'Hopper',
       parentSessionId: 'manager',
+      managerTeamId: manager.managerActiveTeamId,
+      managerTeamName: manager.managerTeams?.[0]?.name,
       projectId: 'project',
       status: 'active',
       role: 'Reviewer',
@@ -867,6 +891,8 @@ describe('project manager durable live roster', () => {
     const instructions = fs.readFileSync(path.join(repo, 'CLAUDE.md'), 'utf8')
     expect(instructions).toContain('Your sole purpose is to coordinate')
     expect(instructions).toContain('LIVE MANAGED-AGENT ROSTER')
+    expect(instructions).toMatch(/Parallel staffing target: 3 useful direct worker lanes; active team currently has 1 running/u)
+    expect(instructions).toMatch(/Below target: reuse idle workers or spawn independent implementation\/reproduction\/research\/cross-check lanes/u)
     expect(instructions).toMatch(/operator configured this manager’s team and permission bounds/i)
     expect(instructions).toContain('Hopper')
     expect(instructions).toContain('reviewer-child')

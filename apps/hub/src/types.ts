@@ -195,6 +195,9 @@ export interface SessionRecord {
   managerReassignedAt?: string
   /** Bounded direct-child capacity for a manager. Absent is never interpreted as unlimited. */
   managerMaxLiveChildren?: number
+  /** Operator-selected number of useful worker lanes the manager should try to keep active for a
+   *  parallelizable task. This is a staffing target, never authority to invent or duplicate work. */
+  managerParallelismTarget?: number
   /** The operator's ceiling: authorities this manager may grant inside its own managed hierarchy. */
   managerDelegation?: DelegatedAuthority[]
   /** Profiles (agent/account types) this manager may choose for children. Empty/absent means none. */

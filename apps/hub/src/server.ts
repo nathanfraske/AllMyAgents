@@ -2769,11 +2769,25 @@ export function startServer(opts: ServerOptions): http.Server {
           json(res, { error: 'maxLiveChildren must be a whole number from 1 to 16' }, 400)
           return
         }
+        const parallelismTarget =
+          body.parallelismTarget === undefined ? undefined : Number(body.parallelismTarget)
+        if (
+          parallelismTarget !== undefined &&
+          (!Number.isInteger(parallelismTarget) || parallelismTarget < 1 || parallelismTarget > 16)
+        ) {
+          json(res, { error: 'parallelismTarget must be a whole number from 1 to 16' }, 400)
+          return
+        }
+        if (parallelismTarget !== undefined && max !== undefined && parallelismTarget > max) {
+          json(res, { error: 'parallelismTarget cannot exceed maxLiveChildren' }, 400)
+          return
+        }
         const record = sessions.configureProjectManager(
           managerMatch[1] as string,
           {
             enabled: body.enabled,
             maxLiveChildren: max,
+            parallelismTarget,
             delegation: rawDelegation as Array<'commit' | 'push'>,
             allowedProfiles,
             allowedModels,

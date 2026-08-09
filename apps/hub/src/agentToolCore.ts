@@ -83,6 +83,7 @@ export interface OverseerControlInput {
   managerConfig?: {
     enabled: boolean
     maxLiveChildren?: number
+    parallelismTarget?: number
     delegation?: DelegatedAuthority[]
     allowedProfiles?: string[]
     allowedModels?: Record<string, string[]>
@@ -1184,6 +1185,7 @@ const overseerAgentType = z.object({
 const overseerManagerConfig = z.object({
   enabled: z.boolean(),
   maxLiveChildren: z.number().int().min(1).max(16).optional(),
+  parallelismTarget: z.number().int().min(1).max(16).optional(),
   delegation: z.array(z.enum(['commit', 'push'])).max(2).optional(),
   allowedProfiles: z.array(z.string().min(1).max(256)).max(32).optional(),
   allowedModels: z.record(z.string(), z.array(z.string().min(1).max(256)).max(64)).optional(),
@@ -1211,6 +1213,7 @@ const overseerPreset = z.object({
     permissionMode: overseerPermissionMode,
     maxChildPermissionMode: overseerPermissionMode,
     maxLiveChildren: z.number().int().min(1).max(16),
+    parallelismTarget: z.number().int().min(1).max(16).optional(),
     canApproveChildren: z.boolean(),
     pauseExhaustedAccounts: z.boolean().optional(),
     allowWorkerSubagents: z.boolean().optional(),

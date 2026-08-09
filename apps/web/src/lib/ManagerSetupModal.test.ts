@@ -71,6 +71,8 @@ describe('Manager setup', () => {
     expect(getAllByText('Project')).toHaveLength(2)
     expect(getByText('Worker accounts & models')).toBeTruthy()
     expect(getByText('Live child limit')).toBeTruthy()
+    expect(getByText('Parallel worker target')).toBeTruthy()
+    expect(getByText(/reminded on every turn to reach this target/i)).toBeTruthy()
     expect(getByText(/disabled, unavailable, and out-of-ceiling manager requests automatically escalate/i)).toBeTruthy()
     expect(getByText(/its own managed hierarchy, and only that hierarchy/i)).toBeTruthy()
   })
@@ -86,6 +88,7 @@ describe('Manager setup', () => {
       ...store.sessions.existing!.record,
       isProjectManager: true,
       managerMaxLiveChildren: 3,
+      managerParallelismTarget: 2,
       managerAllowedProfiles: ['codex-a'],
       managerAllowedModels: { 'codex-a': ['gpt-5.6-sol'] },
       managerDelegation: ['commit'],
@@ -97,6 +100,7 @@ describe('Manager setup', () => {
     })
     const { getByText, getByRole } = render(ManagerSetupModal, { onclose: vi.fn() })
     expect(getByText(/3 live children/i)).toBeTruthy()
+    expect(getByText(/2 useful worker lanes/i)).toBeTruthy()
     expect(getByText(/commit only/i)).toBeTruthy()
     expect(getByRole('button', { name: /revoke manager role/i })).toBeTruthy()
     await fireEvent.click(getByRole('button', { name: /revoke manager role/i }))
@@ -259,6 +263,7 @@ describe('Manager setup', () => {
       permissionModeOperatorOverrideCeiling: 'full',
       managerPermissionModeCeiling: 'safe',
       managerMaxChildPermissionMode: 'edits',
+      managerParallelismTarget: 3,
       managerAllowedProfiles: ['codex-a'],
       managerAllowedModels: { 'codex-a': ['gpt-5.6-terra'] },
     }
@@ -287,7 +292,11 @@ describe('Manager setup', () => {
     expect(rename).toHaveBeenCalledWith('existing', 'Release manager')
     expect(configureProjectManager).toHaveBeenCalledWith(
       'existing',
-      expect.objectContaining({ permissionMode: 'safe', maxChildPermissionMode: 'edits' }),
+      expect.objectContaining({
+        permissionMode: 'safe',
+        maxChildPermissionMode: 'edits',
+        parallelismTarget: 3,
+      }),
     )
     expect(onSaved).toHaveBeenCalledWith(expect.objectContaining({ id: 'existing' }))
     expect(store.projectViewId).toBe('project-1')

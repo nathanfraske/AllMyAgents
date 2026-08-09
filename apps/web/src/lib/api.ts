@@ -240,6 +240,7 @@ export interface SessionRecord {
   managerReassignedToSessionId?: string
   managerReassignedAt?: string
   managerMaxLiveChildren?: number
+  managerParallelismTarget?: number
   managerDelegation?: Array<'commit' | 'push'>
   managerAllowedProfiles?: string[]
   managerAllowedModels?: Record<string, string[]>
@@ -1752,6 +1753,7 @@ export const api = {
     config: {
       enabled: boolean
       maxLiveChildren?: number
+      parallelismTarget?: number
       delegation?: Array<'commit' | 'push'>
       allowedProfiles?: string[]
       allowedModels?: Record<string, string[]>

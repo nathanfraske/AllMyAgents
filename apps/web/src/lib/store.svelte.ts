@@ -904,6 +904,7 @@ export class HubStore {
         v.record.managerReassignedToSessionId = rec.managerReassignedToSessionId
         v.record.managerReassignedAt = rec.managerReassignedAt
         v.record.managerMaxLiveChildren = rec.managerMaxLiveChildren
+        v.record.managerParallelismTarget = rec.managerParallelismTarget
         v.record.managerPermissionModeCeiling = rec.managerPermissionModeCeiling
         v.record.managerMaxChildPermissionMode = rec.managerMaxChildPermissionMode
         v.record.managerDelegation = rec.managerDelegation

@@ -214,6 +214,7 @@
             <div><dt>Account</dt><dd>{managerProfile ? profileOptionLabel(managerProfile) : manager.record.profileId}</dd></div>
             <div><dt>Model</dt><dd>{manager.record.model || 'account default'}</dd></div>
             <div><dt>Live children</dt><dd>up to {manager.record.managerMaxLiveChildren ?? 4}</dd></div>
+            <div><dt>Parallel target</dt><dd>{manager.record.managerParallelismTarget ?? Math.min(3, manager.record.managerMaxLiveChildren ?? 4)} useful worker lanes</dd></div>
             <div><dt>Child ceiling</dt><dd>{manager.record.managerMaxChildPermissionMode ?? 'safe'}</dd></div>
           </dl>
           <button class="secondary" onclick={() => (tab = 'manager')}>Edit manager settings</button>

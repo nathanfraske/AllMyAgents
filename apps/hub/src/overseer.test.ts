@@ -117,13 +117,13 @@ describe('application Overseer authority', () => {
 
     expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
       isOverseer: true,
-      overseerCapabilityVersion: 10,
+      overseerCapabilityVersion: 11,
       permissionMode: 'full',
       permissionModeOperatorOverride: true,
       role: 'Application Overseer',
     })
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
-      'Overseer capability manifest version 10',
+      'Overseer capability manifest version 11',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'mcp__allmyagents__overseer_control',
@@ -132,7 +132,10 @@ describe('application Overseer authority', () => {
       'configure_github_automation',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
-      'explicitly ask whether the manager may decide descendant approvals',
+      'explicitly ask both whether the manager may decide descendant approvals',
+    )
+    expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
+      'how many useful direct worker lanes it should target in parallel',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'reassign_manager_account',
@@ -145,7 +148,7 @@ describe('application Overseer authority', () => {
     expect(upgrades()).toHaveLength(1)
     expect(upgrades()[0]?.payload).toMatchObject({
       fromVersion: 6,
-      toVersion: 10,
+      toVersion: 11,
       conversationPreserved: true,
       tools: expect.arrayContaining(['overseer_control', 'remote_exec', 'browser_navigate']),
     })
@@ -379,8 +382,20 @@ describe('application Overseer authority', () => {
       sessionId: 'manager',
       managerConfig: { enabled: true, canApproveChildren: false },
     })).resolves.toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/how many useful direct worker lanes/u),
+    })
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'configure_manager',
+      sessionId: 'manager',
+      managerConfig: { enabled: true, canApproveChildren: false, parallelismTarget: 2 },
+    })).resolves.toMatchObject({
       ok: true,
-      data: expect.objectContaining({ isProjectManager: true, managerCanApproveChildren: false }),
+      data: expect.objectContaining({
+        isProjectManager: true,
+        managerCanApproveChildren: false,
+        managerParallelismTarget: 2,
+      }),
     })
 
     const moved = await h.sessions.overseerControl('overseer', {
@@ -396,6 +411,7 @@ describe('application Overseer authority', () => {
         profileId: 'p2',
         provider: 'codex',
         isProjectManager: true,
+        managerParallelismTarget: 2,
         managerReassignedFromSessionId: 'manager',
       }),
     })
@@ -419,7 +435,7 @@ describe('application Overseer authority', () => {
         description: 'One manager and one reviewer.',
         manager: {
           profileId: 'p1', permissionMode: 'full', maxChildPermissionMode: 'edits', maxLiveChildren: 2,
-          canApproveChildren: true, delegation: ['commit'], allowedTools: ['Read', 'Edit'],
+          parallelismTarget: 2, canApproveChildren: true, delegation: ['commit'], allowedTools: ['Read', 'Edit'],
         },
         agents: [{
           id: 'reviewer', name: 'Reviewer', purpose: 'Review the project.', prompt: 'Inspect the project and report.',
@@ -436,6 +452,7 @@ describe('application Overseer authority', () => {
     expect(h.sessions.list().find((record) => record.id === data.manager.id)).toMatchObject({
       isProjectManager: true,
       managerMaxChildPermissionMode: 'edits',
+      managerParallelismTarget: 2,
       permissionMode: 'full',
     })
     expect(h.sessions.list().find((record) => record.id === data.children[0]!.id)).toMatchObject({

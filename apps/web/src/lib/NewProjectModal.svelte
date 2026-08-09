@@ -179,6 +179,7 @@
       allowWorkerSubagents: false,
       maxSubagentsPerWorker: 2,
       maxLiveChildren: 4,
+      parallelismTarget: 3,
       delegation: [],
       allowedTools: [],
       allowedProfiles: profileId ? [profileId] : [],
@@ -606,6 +607,7 @@
       const configured = await api.configureProjectManager(record.id, {
         enabled: true,
         maxLiveChildren: config.maxLiveChildren,
+        parallelismTarget: config.parallelismTarget,
         delegation: config.delegation,
         allowedProfiles: config.allowedProfiles,
         allowedModels: config.allowedModels,
@@ -1206,7 +1208,7 @@
                     <b>Project manager · {accountName(managerConfig.managerProfileId)}</b>
                     <small>
                       {managerConfig.agentTypes.length} child role{managerConfig.agentTypes.length === 1 ? '' : 's'} defined ·
-                      {managerConfig.maxLiveChildren} live children · {managerConfig.permissionMode} permission
+                      {managerConfig.maxLiveChildren} live children · {managerConfig.parallelismTarget} parallel target · {managerConfig.permissionMode} permission
                     </small>
                   </span>
                   <em class:ok={managerStatus === 'started'} class:bad={managerStatus === 'failed'}>
