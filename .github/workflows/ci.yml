@@ -114,6 +114,11 @@ jobs:
       - name: Bundle — stage the real hub payload (runs the audit for real)
         run: pnpm run hub:bundle
 
+      # The release also carries a platform-native, vendor-free testbed node. Build and checksum it on
+      # every JS matrix host so Windows, macOS, and the Linux canary all prove their own payload shape.
+      - name: Bundle — stage the lightweight testbed payload
+        run: pnpm run testbed:bundle
+
       # 3. Prove the graph a USER actually gets works — not the one this repo develops against.
       #
       # The repo resolves dependencies with pnpm; the installed app runs plain `npm install` against the
@@ -199,6 +204,11 @@ jobs:
       # and a missing resource dir is a config-validation failure at build.rs time.
       - name: Stage the hub payload (tauri resource)
         run: pnpm run hub:bundle
+
+      # This is a separate Tauri resource glob. The JS matrix cannot satisfy it for this job because
+      # GitHub Actions jobs have isolated workspaces; stage it here before build.rs validates the config.
+      - name: Stage the lightweight testbed payload (tauri resource)
+        run: pnpm run testbed:bundle
 
       - name: cargo check
         working-directory: apps/desktop/src-tauri
