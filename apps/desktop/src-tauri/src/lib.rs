@@ -1412,6 +1412,11 @@ fn release_boot(
         hub_data_dir.display(),
         hub_profiles_dir.display()
     ));
+    let testbed_bundle_dir = app
+        .path()
+        .resource_dir()
+        .ok()
+        .map(|root| root.join("testbed-runtime"));
 
     // Spawn the hub with the bundled Node. PATH carries the hub's own .bin (so the
     // codex adapter's `codex app-server` shell lookup resolves) and the bundled
@@ -1431,6 +1436,9 @@ fn release_boot(
         .env("HUB_PROFILES_DIR", &hub_profiles_dir)
         .env("AMA_DESKTOP_BROWSER_SECRET", &browser_secret)
         .env("AMA_DESKTOP_BROWSER_ADDR", &browser_address);
+    if let Some(bundle_dir) = testbed_bundle_dir.filter(|candidate| candidate.is_dir()) {
+        cmd.env("ALLMYAGENTS_TESTBED_BUNDLE_DIR", plain(&bundle_dir));
+    }
     set_own_group(&mut cmd); // POSIX: own process group so kill_hub can group-signal the whole tree
     hide_console(&mut cmd); // Windows: no stray black console window in front of the app
     capture_hub_output(&mut cmd);

@@ -9,6 +9,7 @@ profiles/
 # Generated portable-hub payload (Node runtime + compiled hub) — rebuilt by
 # scripts/bundle-hub.mjs during `tauri build`; never commit the shipped binaries.
 /apps/desktop/src-tauri/hub-runtime/
+/apps/desktop/src-tauri/testbed-runtime/
 
 # Ephemeral parallel-agent git worktrees (isolated checkouts full of node_modules/build
 # artifacts). The branches live as refs (worktree-agent-*), so the work is safe; the

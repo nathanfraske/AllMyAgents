@@ -55,6 +55,9 @@ export interface OverseerControlInput {
     | 'get_github_automation_policy'
     | 'configure_github_automation'
     | 'issue_pairing_code'
+    | 'list_testbed_targets'
+    | 'inspect_testbed_target'
+    | 'deploy_testbed_node'
     | 'get_elevation_policy'
     | 'configure_elevation'
     | 'analyze_elevated_command'
@@ -111,6 +114,7 @@ export interface OverseerControlInput {
   shell?: ElevatedShell
   timeoutMs?: number
   siteId?: string
+  testbedProfile?: 'elevated-machine' | 'linux-sudo-machine'
   subject?: string
   uiTarget?:
     | 'home'
@@ -1241,7 +1245,7 @@ const overseerPreset = z.object({
 const overseerControl = defineTool({
   name: 'overseer_control',
   description:
-    'Application Overseer only: explain how AllMyAgents works; inspect fleet failures and live account usage; configure projects, managers, manager account handoffs, reusable team presets, chats, accounts, remote-device grants, narrow GitHub automation policies/imports, mesh pairing, direct peer-Overseer messages, and safe hub restarts; and configure durable Standard, Tokenmaxxing, or Eco operating modes. GitHub automation can be granted to one exact session or every chat attached to one project, and covers only the explicitly listed PR/workflow/push capabilities. Elevated commands require a configured project policy, blast-radius analysis, a separate explicit operator approval, and (on Windows) UAC. Mutations are denied on teammate-caused turns; a remote Overseer turn may only reply to the same authenticated peer.',
+    'Application Overseer only: explain how AllMyAgents works; inspect fleet failures and live account usage; configure projects, managers, manager account handoffs, reusable team presets, chats, accounts, remote-device grants, narrow GitHub automation policies/imports, mesh pairing, lightweight testbed deployment, direct peer-Overseer messages, and safe hub restarts; and configure durable Standard, Tokenmaxxing, or Eco operating modes. GitHub automation can be granted to one exact session or every chat attached to one project, and covers only the explicitly listed PR/workflow/push capabilities. Lightweight testbed deployment uses the signed-fleet AllMyStuff file and terminal planes and requires an explicit elevated profile plus blast-radius reason. Elevated commands require a configured project policy, blast-radius analysis, a separate explicit operator approval, and (on Windows) UAC. Mutations are denied on teammate-caused turns; a remote Overseer turn may only reply to the same authenticated peer.',
   schema: {
     operation: z.enum([
       'status', 'guide', 'ui_catalog', 'highlight_ui', 'failure_context', 'get_operating_mode', 'set_operating_mode', 'create_project', 'create_chat', 'send_chat', 'stop_chat',
@@ -1251,6 +1255,8 @@ const overseerControl = defineTool({
       'start_account_login', 'github_repositories',
       'clone_github_repository', 'github_clone_status',
       'get_github_automation_policy', 'configure_github_automation', 'issue_pairing_code',
+      'list_testbed_targets', 'inspect_testbed_target',
+      'deploy_testbed_node',
       'get_elevation_policy', 'configure_elevation', 'analyze_elevated_command',
       'run_elevated_command', 'restart_hub',
     ]),
@@ -1292,6 +1298,7 @@ const overseerControl = defineTool({
     shell: z.enum(['powershell', 'bash']).optional(),
     timeout_ms: z.number().int().min(1_000).max(15 * 60 * 1_000).optional(),
     site_id: z.string().min(1).max(256).optional(),
+    testbed_profile: z.enum(['elevated-machine', 'linux-sudo-machine']).optional(),
     subject: z.string().max(300).optional(),
     ui_target: z.enum([
       'home', 'new_project', 'project_overview', 'overseer', 'accounts', 'chat_defaults',
@@ -1340,6 +1347,7 @@ const overseerControl = defineTool({
       shell: args.shell,
       timeoutMs: args.timeout_ms,
       siteId: args.site_id,
+      testbedProfile: args.testbed_profile,
       subject: args.subject,
       uiTarget: args.ui_target,
       uiMessage: args.ui_message,

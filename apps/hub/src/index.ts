@@ -59,6 +59,7 @@ import {
   FleetConnectionStore,
   RemoteDeviceController,
 } from './remoteDevices.js'
+import { TestbedDeploymentService } from './testbedDeployment.js'
 import { asChatNamePool } from './title.js'
 import { asFileWriteDiffDensity } from './types.js'
 import type { DangerFlags, HubConfig, HubPrefs } from './types.js'
@@ -1003,8 +1004,25 @@ const remoteDevices = new RemoteDeviceController(fleetConnections, async (siteId
 }, { bridge: directMesh, localDeviceToken: deviceToken, enabled: () => mesh.status().enabled })
 sessions.setRemoteDeviceController(remoteDevices)
 
+// Desktop releases carry one platform/architecture-matched, vendor-free node payload. Development
+// builds may opt into the same path by running `pnpm testbed:bundle`; an absent payload simply leaves
+// remote bootstrap unavailable rather than manufacturing an unverified runtime at request time.
+const configuredTestbedBundle = process.env.ALLMYAGENTS_TESTBED_BUNDLE_DIR?.trim()
+const testbedBundleDir = configuredTestbedBundle
+  ? path.resolve(configuredTestbedBundle)
+  : path.join(repoRoot, 'apps', 'desktop', 'src-tauri', 'testbed-runtime')
+const testbedDeployment = fs.existsSync(path.join(testbedBundleDir, 'manifest.json'))
+  ? new TestbedDeploymentService({
+      bundleDir: testbedBundleDir,
+      directMesh,
+      remoteDevices,
+      ownedRoster: () => mesh.ownedRoster(),
+      emit: (event) => journal.append(null, `testbed/deployment-${event.stage}`, event),
+    })
+  : undefined
+
 // Listen on the BOOT port (0 → ephemeral for a green); the server reports its actual port back.
-const server = startServer({ port: bootPort, defaultCwd: dataDir, profilesDir, profileNames, profileOwnership, profileLoginCoordinator, journal, sessions, profiles, approvals, questions, notifications, usage, projects, testbedRuns, testbedReservations, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity: (projectId) => worktreeCollisions.projectActivity(projectId), deviceExecutor, remoteDevices, directMesh, overseer, overseerCwd: repoRoot })
+const server = startServer({ port: bootPort, defaultCwd: dataDir, profilesDir, profileNames, profileOwnership, profileLoginCoordinator, journal, sessions, profiles, approvals, questions, notifications, usage, projects, testbedRuns, testbedReservations, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity: (projectId) => worktreeCollisions.projectActivity(projectId), deviceExecutor, remoteDevices, directMesh, testbedDeployment, overseer, overseerCwd: repoRoot })
 
 // Register the mesh advert — factored so a promoted green can (re)register once it owns the port.
 function registerMesh(): void {

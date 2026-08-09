@@ -1064,6 +1064,9 @@ export interface DeviceExecutorCapabilities {
   platform: string
   arch: string
   hostname: string
+  nodeKind?: 'hub' | 'lightweight-testbed'
+  deploymentProfile?: 'scoped' | 'full-machine' | 'elevated-machine' | 'linux-sudo-machine'
+  elevated?: boolean
   /** Added after the host-only executor shipped; absent on an older peer capability response. */
   environments?: RemoteExecutionEnvironment[]
   roots: DeviceRootPolicy[]

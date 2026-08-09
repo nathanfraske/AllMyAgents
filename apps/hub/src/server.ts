@@ -68,6 +68,7 @@ import {
   type OverseerModeUpdate,
 } from './overseerMode.js'
 import type { MyOwnMeshRpcBridge } from './myOwnMeshRpc.js'
+import type { TestbedDeploymentService } from './testbedDeployment.js'
 import {
   EphemeralNotificationService,
   NotificationService,
@@ -473,6 +474,8 @@ export interface ServerOptions {
   remoteDevices?: RemoteDeviceController
   /** Site-free authenticated hub transport over the existing MyOwnMesh app-data lane. */
   directMesh?: MyOwnMeshRpcBridge
+  /** Optional platform-matched payload bootstrap over AllMyStuff's existing privileged planes. */
+  testbedDeployment?: TestbedDeploymentService
   overseer?: OverseerConfig
   overseerCwd?: string
 }
@@ -607,6 +610,16 @@ export function startServer(opts: ServerOptions): http.Server {
       github.start(repository, distro ? { kind: 'wsl', distro } : { kind: 'local' }),
     githubCloneStatus: (jobId) => github.job(jobId),
     issuePairingCode: () => pairingCodes.issue(),
+    ...(opts.testbedDeployment
+      ? {
+          deployTestbedNode: (
+            siteId: string,
+            profile: 'elevated-machine' | 'linux-sudo-machine',
+          ) => opts.testbedDeployment!.deploy(siteId, profile),
+          listTestbedTargets: () => opts.testbedDeployment!.targets(),
+          inspectTestbedTarget: (siteId: string) => opts.testbedDeployment!.inspect(siteId),
+        }
+      : {}),
   })
 
   // Preferred cross-hub control plane: authenticated MyOwnMesh RPC, not a mapped localhost Site.

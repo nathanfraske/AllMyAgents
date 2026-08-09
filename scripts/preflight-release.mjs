@@ -212,6 +212,17 @@ check('real payload stages and passes the audit', () => {
   const m = expectOutput('pnpm run hub:bundle 2>&1', /credential audit passed: (\d+) payload files/, 'hub bundle')
   return `${m[1]} files audited`
 })
+check('lightweight testbed payload stages and verifies', () => {
+  const m = expectOutput(
+    'pnpm run testbed:bundle 2>&1',
+    /\[bundle-testbed\] built (.+) for ([a-z0-9]+)\/([a-z0-9]+)/,
+    'testbed bundle',
+  )
+  if (!fs.existsSync('apps/desktop/src-tauri/testbed-runtime/SHA256SUMS')) {
+    throw new Error('testbed checksum manifest absent after bundle')
+  }
+  return `${m[2]}/${m[3]} payload checksummed`
+})
 
 // The 0.1.6 cut tagged a commit whose Rust shell did not lint. Every JS gate above was green, so the
 // preflight said "safe to tag" — it had simply never compiled the native crate. `cargo clippy -D warnings`
@@ -223,7 +234,7 @@ check('real payload stages and passes the audit', () => {
 // Order and working directory mirror the ci.yml `tauri shell` job deliberately. tauri-build validates
 // tauri.conf.json at build.rs time, and that config points `frontendDist` at apps/web/dist and declares
 // hub-runtime as a resource, so BOTH must be staged before cargo touches the crate or this fails on config
-// validation rather than on the code. hub:bundle already ran in Packaging above; the web build has not.
+// validation rather than on the code. Both resource bundles already ran in Packaging above; the web build has not.
 console.log('\nNative shell (mirrors the ci.yml tauri job)')
 check('web dist staged for tauri-build', () => {
   run('pnpm --filter web build 2>&1')

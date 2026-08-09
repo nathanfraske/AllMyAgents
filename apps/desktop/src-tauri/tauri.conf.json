@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "pnpm --filter web dev",
     "devUrl": "http://localhost:5273",
-    "beforeBuildCommand": "pnpm --filter web build && pnpm -w run hub:bundle",
+    "beforeBuildCommand": "pnpm --filter web build && pnpm -w run hub:bundle && pnpm -w run testbed:bundle",
     "frontendDist": "../../web/dist"
   },
   "app": {
@@ -44,7 +44,8 @@
     "shortDescription": "Run and supervise a fleet of Claude and Codex agents locally.",
     "longDescription": "AllMyAgents is a local-first desktop hub for running, supervising and coordinating multiple Claude Code and Codex agents against your own projects. It owns the agents' lifecycle, journals every turn, and keeps working across hub restarts.",
     "resources": [
-      "hub-runtime/**/*"
+      "hub-runtime/**/*",
+      "testbed-runtime/**/*"
     ],
     "icon": [
       "icons/32x32.png",

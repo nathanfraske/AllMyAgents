@@ -165,6 +165,11 @@ export interface DeviceExecutorCapabilities {
   platform: NodeJS.Platform
   arch: string
   hostname: string
+  /** Present when the executor is the vendor-free service rather than a full AllMyAgents hub. */
+  nodeKind?: 'hub' | 'lightweight-testbed'
+  /** Operator-selected install profile; descriptive only and never an authority token. */
+  deploymentProfile?: 'scoped' | 'full-machine' | 'elevated-machine' | 'linux-sudo-machine'
+  elevated?: boolean
   environments: RemoteExecutionEnvironment[]
   roots: DeviceRootPolicy[]
 }

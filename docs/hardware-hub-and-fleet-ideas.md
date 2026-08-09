@@ -163,6 +163,12 @@ mechanism.
 ## Remote testbed platform plan
 
 The current bounded remote file/terminal/WSL actions are the bootstrap, not the final runner protocol.
+The first headless deployment slice is implemented: a direct-operator Overseer can transfer a
+platform/architecture-matched vendor-free node through the signed fleet's existing AllMyStuff file and
+terminal planes, install it as Windows LocalSystem, Linux root, or a dedicated Linux passwordless-sudo service,
+verify checksums and live registration, and then keep every agent's device/root grant explicit. It carries no
+vendor account, project journal, or Overseer. Cross-architecture release assets, uninstall/update orchestration,
+durable jobs, isolation, and resource attribution remain below.
 
 1. **Durable node runner.** Add capability inventory, target reservation, idempotent job ids, queued starts,
    progress heartbeats, cancellation, reconnect/resume, deadlines, and durable result manifests. The runner

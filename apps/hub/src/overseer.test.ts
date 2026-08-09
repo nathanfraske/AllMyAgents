@@ -117,13 +117,13 @@ describe('application Overseer authority', () => {
 
     expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
       isOverseer: true,
-      overseerCapabilityVersion: 11,
+      overseerCapabilityVersion: 12,
       permissionMode: 'full',
       permissionModeOperatorOverride: true,
       role: 'Application Overseer',
     })
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
-      'Overseer capability manifest version 11',
+      'Overseer capability manifest version 12',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'mcp__allmyagents__overseer_control',
@@ -141,6 +141,9 @@ describe('application Overseer authority', () => {
       'reassign_manager_account',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
+      'deploy_testbed_node',
+    )
+    expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'Do not use the vendor-native list_agents or peek_agent',
     )
     const upgrades = () => h.journal.recentEventsForSession('legacy-overseer', 20)
@@ -148,7 +151,7 @@ describe('application Overseer authority', () => {
     expect(upgrades()).toHaveLength(1)
     expect(upgrades()[0]?.payload).toMatchObject({
       fromVersion: 6,
-      toVersion: 11,
+      toVersion: 12,
       conversationPreserved: true,
       tools: expect.arrayContaining(['overseer_control', 'remote_exec', 'browser_navigate']),
     })
@@ -176,6 +179,46 @@ describe('application Overseer authority', () => {
     await expect(h.sessions.overseerControl('overseer', {
       operation: 'set_mode', sessionId: 'ordinary', permissionMode: 'full',
     })).resolves.toMatchObject({ ok: false })
+  })
+
+  it('deploys a lightweight node only from a direct operator turn with an explicit elevated profile and reason', async () => {
+    const h = harness()
+    const deployTestbedNode = vi.fn(async (siteId: string, profile: string) => ({
+      siteId,
+      profile,
+      verified: true,
+    }))
+    h.sessions.setOverseerRuntime({ deployTestbedNode })
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'deploy_testbed_node',
+      siteId: 'fleet-device',
+      testbedProfile: 'elevated-machine',
+      reason: 'Install a full-machine Windows test target for the requested hardware validation.',
+    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/direct operator turn/u) })
+
+    h.markOperator('overseer')
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'deploy_testbed_node',
+      siteId: 'fleet-device',
+      testbedProfile: 'elevated-machine',
+    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/reason is required/u) })
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'deploy_testbed_node',
+      siteId: 'fleet-device',
+      testbedProfile: 'elevated-machine',
+      reason: 'Install a full-machine Windows test target for the requested hardware validation.',
+    })).resolves.toMatchObject({
+      ok: true,
+      data: { siteId: 'fleet-device', profile: 'elevated-machine', verified: true },
+    })
+    expect(deployTestbedNode).toHaveBeenCalledOnce()
+    expect(deployTestbedNode).toHaveBeenCalledWith('fleet-device', 'elevated-machine')
+    expect(h.journal.recentEventsForSession('overseer')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'overseer/testbed-deployment-requested' }),
+      expect.objectContaining({ kind: 'overseer/testbed-deployment-verified' }),
+    ]))
   })
 
   it('gives the Overseer a complete read-only fleet view without widening ordinary agent ACLs', () => {

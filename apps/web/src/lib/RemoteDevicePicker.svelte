@@ -116,7 +116,15 @@
         <div class="devices">
           {#each catalog as device (device.siteId)}
             <div class="device">
-              <div class="device-head"><span>{device.label}</span><span class:online={device.connected} class="state">{device.connected ? 'online' : 'unavailable'}</span></div>
+              <div class="device-head">
+                <span>
+                  {device.label}
+                  {#if device.capabilities?.nodeKind === 'lightweight-testbed'}
+                    <small>{device.capabilities.elevated ? 'elevated node' : 'testbed node'}</small>
+                  {/if}
+                </span>
+                <span class:online={device.connected} class="state">{device.connected ? 'online' : 'unavailable'}</span>
+              </div>
               {#if device.error}<div class="device-error">{device.error}</div>{/if}
               {#each device.capabilities?.roots ?? [] as root (root.id)}
                 <div class="root">
@@ -159,6 +167,8 @@
   .devices { display: grid; gap: var(--space-3); }
   .device { border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden; }
   .device-head { display: flex; justify-content: space-between; gap: var(--space-2); padding: var(--space-2) var(--space-3); background: var(--surface-3); font-size: var(--text-sm); }
+  .device-head > span:first-child { display: flex; align-items: center; gap: var(--space-2); min-width: 0; }
+  .device-head small { color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 1px 5px; font-size: var(--text-2xs); white-space: nowrap; }
   .state { color: var(--muted); font-size: var(--text-2xs); }
   .state.online { color: var(--ok); }
   .device-error, .error { color: var(--bad-text); font-size: var(--text-xs); padding: var(--space-2) var(--space-3); }

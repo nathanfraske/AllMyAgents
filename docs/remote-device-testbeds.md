@@ -32,6 +32,46 @@ the mapped Site/HTTP route only as a compatibility fallback.
 Revoking a chat grant takes effect on its next tool call. Disabling the target policy, deleting a root, or
 removing a root capability also fails closed immediately, even if a source chat still has an older grant.
 
+## Lightweight headless node
+
+A target does not need the full AllMyAgents desktop app, a local hub journal, an Overseer, or any Claude or
+Codex account. If it already runs AllMyStuff/MyOwnMesh and belongs to the same signed owned-device fleet, the
+source Overseer can bootstrap the release's vendor-free testbed payload through the remote planes AllMyStuff
+already exposes:
+
+1. The Overseer calls `list_testbed_targets` to discover signed-fleet AllMyStuff peers and
+   `inspect_testbed_target` for the chosen peer's observed OS and architecture. These are diagnostic reads
+   and do not require the target to be paired as an AllMyAgents hub. On a direct operator turn, it explains
+   the requested privilege profile and blast radius.
+2. `overseer_control` operation `deploy_testbed_node` names the exact `site_id`, a `testbed_profile`, and a
+   human-readable `reason`. Automatic deployment supports `elevated-machine` on Windows or Linux and
+   `linux-sudo-machine` on Linux.
+3. The source opens the target's existing AllMyStuff `files` and `terminal` routes. It transfers a bundled
+   Node runtime plus five compiled, dependency-free AllMyAgents modules in bounded chunks, preserving the
+   directory tree and reporting files, bytes, elapsed time, and throughput.
+4. The target verifies every transferred file against `SHA256SUMS` before executing the installer. The
+   payload is the platform/architecture-matched artifact carried by the installed release; a mismatch is
+   refused rather than downloading or executing an unpinned runtime.
+5. Windows installs a highest-privilege LocalSystem startup task. Linux `elevated-machine` installs a root
+   systemd service. Linux `linux-sudo-machine` creates a dedicated system account, validates a narrowly named
+   sudoers file with `visudo`, and grants that account `NOPASSWD: ALL` so agent terminal requests can cross
+   the elevation boundary. The latter is deliberately machine-admin authority, not a sandbox.
+6. The source waits for the new node to register, authorizes it through the signed fleet roster, probes its
+   live capabilities, removes the unique bootstrap directory after verified success, and records a bounded
+   deployment lifecycle. It never retries an ambiguously completed install command. A cleanup failure is
+   reported as pending without falsely failing the already verified installation; an ambiguous installer
+   outcome retains its staging directory so recovery evidence and a possibly running installer are not erased.
+
+The lightweight node accepts only pairing and the existing remote-device capability/action protocol. It has
+no project/chat/account APIs and cannot host or inherit an Overseer. Same-fleet trust admits the source hub to
+the node, but does not grant any worker: every agent still needs an explicit durable device/root/capability
+grant from its own hub. A full hub already answering the application route is detected and never displaced.
+
+The portable bundle can also be configured locally with `testbedNode configure --profile scoped` for an
+unprivileged, explicit-root node. Automatic cross-OS deployment currently requires a matching release payload;
+a Windows/x64 desktop release cannot pretend its bundled Node executable is a Linux/ARM64 artifact. Release
+matrix assets or a target-native package repository are the next step for cross-architecture bootstrap.
+
 ## Project locations and attributed runs
 
 Every existing project is upgraded in place with one deterministic primary local location. WSL projects keep
@@ -108,6 +148,9 @@ registered location is an honest placement fact, not a claim that its checkout i
 - Source and target hubs journal requests and outcomes without journaling file contents or full command
   output. The source journal is authoritative for chat/profile attribution; the target records the caller's
   supplied attribution as part of its device-token-authenticated request.
+- The headless node keeps a bounded rotating local audit of operation type, authenticated source, opaque
+  message id, root id, result/failure stage, timing, and byte count. It never records file contents, command
+  text, full output, a pairing code, or the peer device token.
 - The long-lived local hub/worker socket now uses a supervisor-minted, mutually authenticated HMAC
   handshake with a fresh replay-checked nonce. The secret is deleted from the hub and worker environment
   before either process can launch a vendor child. An unauthenticated process cannot replace the hub with a
@@ -122,6 +165,12 @@ grant `terminal` only when whole-account shell authority is intended.
 
 Windows targets use non-interactive PowerShell. macOS and Linux targets use `/bin/sh -lc`. The control
 channel, browser bridge, and agent-tool credentials are removed from the command environment.
+
+An `elevated-machine` node intentionally changes the terminal semantics: its process account is LocalSystem
+or root, so a terminal-capable root is effectively machine-administrator command access. A
+`linux-sudo-machine` node performs ordinary file-plane operations as its dedicated account but allows terminal
+commands to invoke passwordless sudo. These profiles are opt-in installation choices and remain separate from
+chat Full Access; a chat without the explicit device/root terminal grant cannot reach them.
 
 ### Windows Subsystem for Linux
 
@@ -158,7 +207,8 @@ run on the target from being executed twice.
 
 ## Platform and topology
 
-The executor is platform-neutral across Windows, macOS, and Linux hubs. A phone or appliance without a
-local AllMyAgents hub and shell cannot itself be a terminal target. An off-machine browser still requires
+The full-hub executor is platform-neutral across Windows, macOS, and Linux. The first automatic headless
+installer supports Windows and Linux, with a release artifact matching the target OS and architecture. A phone
+or appliance without an AllMyStuff transport and usable local shell cannot itself be a terminal target. An off-machine browser still requires
 the local-hub gateway described in `cross-machine-bridges.md`, because AllMyStuff mappings are loopback
 ports on the hub machine.
