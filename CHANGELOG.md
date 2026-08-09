@@ -24,6 +24,8 @@ and fixes blank transcripts caused by large-journal maintenance pauses.
   identities. A bounded parallel staffing target encourages useful independent lanes without invented work.
 - Managers can approve once or remember the exact ordinary tool/Git action class for a direct worker. Remembered
   grants survive restart, remain bounded by the live operator ceiling, are fully audited, and revoke immediately.
+- Hub-minted approval, stall/error, fleet-failure, and worktree-risk notices now bypass the high-context FYI
+  guard, waking an idle manager or Overseer exactly once without letting agents self-assign message priority.
 - Condensation shortens its writer transaction, full snapshot/verification runs outside the hub event loop, and
   transient history timeouts retry recoverably with an explicit manual retry path.
 - Dashboard heatmap intensity is relative, costs are labeled as Claude API-equivalent estimates, usage reset

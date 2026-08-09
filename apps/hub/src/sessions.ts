@@ -5865,6 +5865,7 @@ export class SessionManager {
       subject: `child ${outcome}`,
       body,
       recipients: [manager.id],
+      attentionRequired: outcome === 'stalled' || outcome === 'errored',
     })
     this.journal.append(child.id, 'manager/child-reported', {
       managerSessionId: manager.id,
@@ -5978,6 +5979,7 @@ export class SessionManager {
       subject: 'fleet failure',
       body,
       recipients: [overseer.id],
+      attentionRequired: true,
     })
     this.journal.append(failed.id, 'overseer/failure-alerted', {
       overseerSessionId: overseer.id,
@@ -6314,6 +6316,7 @@ export class SessionManager {
       subject: 'child approval pending',
       body,
       recipients: [manager.id],
+      attentionRequired: true,
     })
     this.journal.append(child.id, 'manager/child-approval-reported', {
       managerSessionId: manager.id,
@@ -6384,6 +6387,7 @@ export class SessionManager {
       subject: 'approval awaiting operator',
       body,
       recipients: [overseer.id],
+      attentionRequired: true,
     })
     this.journal.append(requester.id, 'overseer/approval-reported', {
       overseerSessionId: overseer.id,
@@ -7080,6 +7084,7 @@ export class SessionManager {
         subject: `worktree ${risk.risk}`,
         body: framed,
         recipients: [manager.id],
+        attentionRequired: true,
       })
       this.journal.append(manager.id, 'manager/worktree-risk-queued', {
         participantSessionIds,
@@ -8858,6 +8863,7 @@ export class SessionManager {
     // case) cannot be relaunched by child chatter, and persist the decision across a hub restart.
     const wakeable = pending.filter((message) => message.wake)
     const guardedWakeable = wakeable.filter((message) => {
+      if (message.attentionRequired) return false
       const sender = this.sessions.get(message.fromSession)
       return !this.isManagerContinuityWake(sender, record)
     })

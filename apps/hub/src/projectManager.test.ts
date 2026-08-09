@@ -390,6 +390,39 @@ describe('high-context teammate wake guard', () => {
     }))
   })
 
+  it('wakes a high-context manager exactly once for hub-minted action-required mail', () => {
+    const { sessions, journal, bus, seed, runTurn } = buildHub()
+    const manager = seed({ id: 'manager', projectId: 'project-1', isProjectManager: true })
+    const child = seed({ id: 'child', projectId: 'project-1', parentSessionId: manager.id })
+    journal.append(manager.id, 'session/tokens', { scope: 'request', contextUsed: 750_000 })
+    bus.post({
+      from: {
+        sessionId: child.id,
+        profileId: child.profileId,
+        provider: child.provider,
+        projectId: child.projectId,
+        label: 'Child',
+      },
+      project: 'project-1',
+      to: { kind: 'session', id: manager.id },
+      subject: 'child approval pending',
+      body: 'Approval ap_1 requires a manager decision.',
+      recipients: [manager.id],
+      attentionRequired: true,
+    })
+
+    const deliver = (sessions as unknown as { deliverBus(sessionId: string): void }).deliverBus.bind(sessions)
+    deliver(manager.id)
+    deliver(manager.id)
+
+    expect(runTurn).toHaveBeenCalledOnce()
+    expect(runTurn.mock.calls[0]?.[1]).toContain('Approval ap_1 requires a manager decision.')
+    expect(bus.pending(manager.id)).toEqual([])
+    expect(journal.recentEventsForSession(manager.id)).not.toContainEqual(expect.objectContaining({
+      kind: 'bus/context-wake-held',
+    }))
+  })
+
   it('applies the same guard to Codex from its reported context-window occupancy', () => {
     const { sessions, journal, bus, seed, runTurn } = buildHub()
     seed({ id: 'manager', projectId: 'project-1', isProjectManager: true })

@@ -30,19 +30,26 @@ export interface BusMessage {
    *  create a new recipient turn on its own. This is durable so a hub restart cannot turn a held
    *  high-context note back into an expensive wake-up. */
   wake: boolean
+  /** Hub-minted action-required mail (for example a pending approval or failure alert) bypasses the
+   *  high-context FYI wake guard. Agent-authored send_message calls cannot set this bit. */
+  attentionRequired: boolean
   delivered: boolean
   readAt: string | null
 }
 
-interface Row extends Omit<BusMessage, 'wake' | 'delivered' | 'readAt'> {
+interface Row extends Omit<BusMessage, 'wake' | 'attentionRequired' | 'delivered' | 'readAt'> {
   wake: number
+  attentionRequired: number
   delivered: number
   readAt: string | null
 }
 
 // The subset written on insert (delivered/readAt default in SQL); keys must match the @named params.
 // SQLite binds the durable boolean as 0/1 and hydrate restores the public boolean shape.
-type InsertRow = Omit<BusMessage, 'wake' | 'delivered' | 'readAt'> & { wake: number }
+type InsertRow = Omit<BusMessage, 'wake' | 'attentionRequired' | 'delivered' | 'readAt'> & {
+  wake: number
+  attentionRequired: number
+}
 
 export class AgentBus {
   private readonly db: Database.Database
@@ -62,6 +69,7 @@ export class AgentBus {
         fromSession TEXT NOT NULL, fromProfile TEXT NOT NULL, fromLabel TEXT NOT NULL,
         project TEXT, toKind TEXT NOT NULL, toId TEXT NOT NULL, toSession TEXT NOT NULL,
         subject TEXT, body TEXT NOT NULL, wake INTEGER NOT NULL DEFAULT 1,
+        attentionRequired INTEGER NOT NULL DEFAULT 0,
         delivered INTEGER NOT NULL DEFAULT 0, readAt TEXT)`
     )
     // Additive migration for journals created before wake policy was durable. Existing mail keeps its
@@ -70,6 +78,16 @@ export class AgentBus {
     if (!hasWake) {
       try {
         db.exec('ALTER TABLE bus_messages ADD COLUMN wake INTEGER NOT NULL DEFAULT 1')
+      } catch (error) {
+        if (!/duplicate column/i.test(error instanceof Error ? error.message : String(error))) throw error
+      }
+    }
+    const hasAttentionRequired = db
+      .prepare("SELECT 1 FROM pragma_table_info('bus_messages') WHERE name = 'attentionRequired'")
+      .get()
+    if (!hasAttentionRequired) {
+      try {
+        db.exec('ALTER TABLE bus_messages ADD COLUMN attentionRequired INTEGER NOT NULL DEFAULT 0')
       } catch (error) {
         if (!/duplicate column/i.test(error instanceof Error ? error.message : String(error))) throw error
       }
@@ -85,8 +103,8 @@ export class AgentBus {
       )`
     )
     this.insertStmt = db.prepare(
-      `INSERT INTO bus_messages (id, groupId, ts, fromSession, fromProfile, fromLabel, project, toKind, toId, toSession, subject, body, wake)
-       VALUES (@id, @groupId, @ts, @fromSession, @fromProfile, @fromLabel, @project, @toKind, @toId, @toSession, @subject, @body, @wake)`
+      `INSERT INTO bus_messages (id, groupId, ts, fromSession, fromProfile, fromLabel, project, toKind, toId, toSession, subject, body, wake, attentionRequired)
+       VALUES (@id, @groupId, @ts, @fromSession, @fromProfile, @fromLabel, @project, @toKind, @toId, @toSession, @subject, @body, @wake, @attentionRequired)`
     )
     this.pendingStmt = db.prepare('SELECT * FROM bus_messages WHERE toSession = ? AND delivered = 0 ORDER BY ts ASC')
     this.pendingCountsStmt = db.prepare(
@@ -115,6 +133,9 @@ export class AgentBus {
     wake?: boolean
     /** Per-recipient automatic deferrals (for example the high-context wake guard). */
     noWakeRecipients?: readonly string[]
+    /** Reserved for hub-owned control-plane mail that requires a response. Public agent sends never
+     *  expose this input, so semi-trusted peers cannot manufacture priority. */
+    attentionRequired?: boolean
   }): InsertRow[] {
     const groupId = crypto.randomUUID()
     const ts = new Date().toISOString()
@@ -133,6 +154,7 @@ export class AgentBus {
       subject: input.subject ?? null,
       body: input.body,
       wake: input.wake !== false && !noWake.has(rid) ? 1 : 0,
+      attentionRequired: input.attentionRequired === true ? 1 : 0,
     }))
   }
 
@@ -146,13 +168,20 @@ export class AgentBus {
     recipients: string[]
     wake?: boolean
     noWakeRecipients?: readonly string[]
+    attentionRequired?: boolean
   }): BusMessage[] {
     const rows = this.rowsFor(input)
     const insertMany = this.db.transaction((rs: InsertRow[]) => {
       for (const r of rs) this.insertStmt.run(r)
     })
     insertMany(rows)
-    return rows.map((r) => ({ ...r, wake: !!r.wake, delivered: false, readAt: null }))
+    return rows.map((r) => ({
+      ...r,
+      wake: !!r.wake,
+      attentionRequired: !!r.attentionRequired,
+      delivered: false,
+      readAt: null,
+    }))
   }
 
   /**
@@ -170,6 +199,7 @@ export class AgentBus {
     recipients: string[]
     wake?: boolean
     noWakeRecipients?: readonly string[]
+    attentionRequired?: boolean
   }): { accepted: boolean; messages: BusMessage[] } {
     const rows = this.rowsFor(input)
     const accepted = this.db.transaction(() => {
@@ -181,7 +211,15 @@ export class AgentBus {
     })()
     return {
       accepted,
-      messages: accepted ? rows.map((row) => ({ ...row, wake: !!row.wake, delivered: false, readAt: null })) : [],
+      messages: accepted
+        ? rows.map((row) => ({
+            ...row,
+            wake: !!row.wake,
+            attentionRequired: !!row.attentionRequired,
+            delivered: false,
+            readAt: null,
+          }))
+        : [],
     }
   }
 
@@ -267,5 +305,11 @@ export class AgentBus {
 }
 
 function hydrate(r: Row): BusMessage {
-  return { ...r, wake: !!r.wake, delivered: !!r.delivered, readAt: r.readAt }
+  return {
+    ...r,
+    wake: !!r.wake,
+    attentionRequired: !!r.attentionRequired,
+    delivered: !!r.delivered,
+    readAt: r.readAt,
+  }
 }

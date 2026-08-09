@@ -1234,6 +1234,7 @@ export interface BusMessage {
   subject: string | null
   body: string
   wake: boolean
+  attentionRequired: boolean
   delivered: boolean
   readAt: string | null
 }

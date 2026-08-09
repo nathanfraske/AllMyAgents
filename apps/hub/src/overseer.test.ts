@@ -670,6 +670,7 @@ describe('application Overseer authority', () => {
       managerAllowedTools: ['commandExecution'], projectId: 'project-a', status: 'idle',
     })
     h.seed({ id: 'child', title: 'Worker', parentSessionId: 'manager', projectId: 'project-a', status: 'active' })
+    h.journal.append('manager', 'session/tokens', { scope: 'request', contextUsed: 750_000 })
 
     const decision = h.approvals.request('child', 'codex/item/commandExecution/requestApproval', {
       toolName: 'commandExecution', command: 'git status',
@@ -679,9 +680,12 @@ describe('application Overseer authority', () => {
     expect(h.bus.inbox('manager')).toEqual(expect.arrayContaining([
       expect.objectContaining({
         subject: 'child approval pending',
+        attentionRequired: true,
         body: expect.stringMatching(new RegExp(`${pending.id}.*commandExecution: git status`, 'su')),
       }),
     ]))
+    expect(h.executor.runTurn).toHaveBeenCalledOnce()
+    expect(vi.mocked(h.executor.runTurn).mock.calls[0]?.[1]).toContain(pending.id)
     expect(h.bus.inbox('overseer')).toHaveLength(0)
     expect(h.journal.recentEventsForSession('child', 20)).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: 'manager/child-approval-reported' }),
@@ -743,6 +747,7 @@ describe('application Overseer authority', () => {
       managerAllowedTools: ['browser'], projectId: 'project-a', status: 'idle',
     })
     h.seed({ id: 'child', title: 'Worker', parentSessionId: 'manager', projectId: 'project-a', status: 'active' })
+    h.journal.append('overseer', 'session/tokens', { scope: 'request', contextUsed: 750_000 })
 
     const decision = h.approvals.request('child', 'claude/tool', {
       toolName: 'PowerShell', input: { command: 'Get-Content README.md' },
@@ -753,11 +758,14 @@ describe('application Overseer authority', () => {
     expect(h.bus.inbox('overseer')).toEqual(expect.arrayContaining([
       expect.objectContaining({
         subject: 'approval awaiting operator',
+        attentionRequired: true,
         body: expect.stringMatching(
           new RegExp(`${pending.id}.*PowerShell.*Manager cannot approve this request: PowerShell is outside.*direct operator turn`, 'su'),
         ),
       }),
     ]))
+    expect(h.executor.runTurn).toHaveBeenCalledOnce()
+    expect(vi.mocked(h.executor.runTurn).mock.calls[0]?.[1]).toContain(pending.id)
     expect(h.journal.recentEventsForSession('child', 20)).toEqual(expect.arrayContaining([
       expect.objectContaining({
         kind: 'manager/child-approval-outside-ceiling',
