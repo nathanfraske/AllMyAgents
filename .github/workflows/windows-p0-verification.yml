@@ -100,9 +100,11 @@ jobs:
           $machinePath = [Environment]::GetEnvironmentVariable('PATH', 'Machine')
           $userPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
           $env:PATH = "$machinePath;$userPath"
-          Start-Process -FilePath $env:AMA_SHORTCUT
+          $launch = Start-Process -FilePath $env:AMA_SHORTCUT -PassThru
+          Write-Host "shortcut launch returned pid $($launch.Id)"
 
           $healthy = $false
+          $retriedShellLaunch = $false
           foreach ($attempt in 1..180) {
             try {
               Invoke-WebRequest http://127.0.0.1:7777/api/health -UseBasicParsing `
@@ -110,6 +112,21 @@ jobs:
               $healthy = $true
               break
             } catch {
+              # Hosted Windows occasionally accepts ShellExecute for a .lnk without creating the
+              # target process. This is not an application failure: setup() never runs and therefore
+              # no desktop log exists. Retry the same installed shortcut once, but only for that exact
+              # no-process/no-log shape. If AllMyAgents started at all, preserve the original failure.
+              if ($attempt -eq 8 -and -not $retriedShellLaunch) {
+                $processName = [IO.Path]::GetFileNameWithoutExtension($env:AMA_INSTALLED_EXE)
+                $desktopLog = "$env:LOCALAPPDATA\direct.cec.allmyagents\logs\desktop.log"
+                $running = Get-Process -Name $processName -ErrorAction SilentlyContinue
+                if (-not $running -and -not (Test-Path $desktopLog)) {
+                  Write-Host 'ShellExecute produced no process or desktop log; retrying the installed shortcut once'
+                  $retry = Start-Process -FilePath $env:AMA_SHORTCUT -PassThru
+                  Write-Host "shortcut retry returned pid $($retry.Id)"
+                  $retriedShellLaunch = $true
+                }
+              }
               Start-Sleep -Seconds 2
             }
           }
@@ -201,6 +218,49 @@ jobs:
           Copy-Item $env:AMA_DESKTOP_LOG "$env:RUNNER_TEMP\desktop-repaired.log"
           Get-Content "$env:RUNNER_TEMP\health-repaired.json"
 
+      - name: Collect startup evidence even when health never arrives
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $evidence = "$env:RUNNER_TEMP\startup-diagnostics.txt"
+          "installed executable: $env:AMA_INSTALLED_EXE" | Set-Content $evidence -Encoding utf8
+          "installed shortcut: $env:AMA_SHORTCUT" | Add-Content $evidence -Encoding utf8
+          if ($env:AMA_SHORTCUT -and (Test-Path $env:AMA_SHORTCUT)) {
+            $shell = New-Object -ComObject WScript.Shell
+            $shortcut = $shell.CreateShortcut($env:AMA_SHORTCUT)
+            "shortcut target: $($shortcut.TargetPath)" | Add-Content $evidence -Encoding utf8
+            "shortcut arguments: $($shortcut.Arguments)" | Add-Content $evidence -Encoding utf8
+            "shortcut working directory: $($shortcut.WorkingDirectory)" | Add-Content $evidence -Encoding utf8
+          }
+          if ($env:AMA_INSTALLED_EXE) {
+            $processName = [IO.Path]::GetFileNameWithoutExtension($env:AMA_INSTALLED_EXE)
+            Get-Process -Name $processName -ErrorAction SilentlyContinue |
+              Format-List Id,ProcessName,Path,StartTime |
+              Out-String | Add-Content $evidence -Encoding utf8
+          }
+          Get-NetTCPConnection -LocalPort 7777 -ErrorAction SilentlyContinue |
+            Format-List LocalAddress,LocalPort,State,OwningProcess |
+            Out-String | Add-Content $evidence -Encoding utf8
+
+          $logCandidates = @("$env:LOCALAPPDATA\direct.cec.allmyagents\logs\desktop.log")
+          if (Test-Path "$env:LOCALAPPDATA\Packages") {
+            $logCandidates += Get-ChildItem "$env:LOCALAPPDATA\Packages" -Directory |
+              ForEach-Object {
+                Join-Path $_.FullName 'LocalCache\Local\direct.cec.allmyagents\logs\desktop.log'
+              }
+          }
+          $log = $logCandidates | Where-Object { Test-Path $_ } |
+            ForEach-Object { Get-Item $_ } | Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+          if ($log) {
+            "desktop log: $($log.FullName)" | Add-Content $evidence -Encoding utf8
+            Copy-Item $log.FullName "$env:RUNNER_TEMP\desktop-current.log"
+          } else {
+            'desktop log: none found (the application did not reach setup)' |
+              Add-Content $evidence -Encoding utf8
+          }
+
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -210,6 +270,8 @@ jobs:
             ${{ runner.temp }}\allmyagents-msi.log
             ${{ runner.temp }}\desktop-first.log
             ${{ runner.temp }}\desktop-repaired.log
+            ${{ runner.temp }}\desktop-current.log
+            ${{ runner.temp }}\startup-diagnostics.txt
             ${{ runner.temp }}\health-first.json
             ${{ runner.temp }}\health-repaired.json
           if-no-files-found: warn
