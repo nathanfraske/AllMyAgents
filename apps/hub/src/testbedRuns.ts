@@ -11,6 +11,7 @@ export interface TestbedRun {
   sessionId: string
   agentId: string
   profileId: string
+  reservationId?: string
   operation: 'exec'
   state: TestbedRunState
   commandSummary: string
@@ -32,6 +33,7 @@ interface TestbedRunRow {
   sessionId: string
   agentId: string
   profileId: string
+  reservationId: string | null
   operation: 'exec'
   state: TestbedRunState
   commandSummary: string
@@ -60,6 +62,7 @@ function fromRow(row: TestbedRunRow): TestbedRun {
     sessionId: row.sessionId,
     agentId: row.agentId,
     profileId: row.profileId,
+    ...(row.reservationId ? { reservationId: row.reservationId } : {}),
     operation: row.operation,
     state: row.state,
     commandSummary: row.commandSummary,
@@ -93,6 +96,7 @@ export class TestbedRunStore {
         sessionId TEXT NOT NULL,
         agentId TEXT NOT NULL,
         profileId TEXT NOT NULL,
+        reservationId TEXT,
         operation TEXT NOT NULL CHECK (operation = 'exec'),
         state TEXT NOT NULL CHECK (state IN ('running', 'succeeded', 'failed', 'cancelled')),
         commandSummary TEXT NOT NULL,
@@ -109,11 +113,15 @@ export class TestbedRunStore {
       CREATE INDEX IF NOT EXISTS testbed_runs_project_idx ON testbed_runs(projectId, createdAt DESC);
       CREATE INDEX IF NOT EXISTS testbed_runs_agent_idx ON testbed_runs(agentId, createdAt DESC);
     `)
+    const columns = new Set(
+      (db.prepare('PRAGMA table_info(testbed_runs)').all() as Array<{ name: string }>).map((column) => column.name),
+    )
+    if (!columns.has('reservationId')) db.exec('ALTER TABLE testbed_runs ADD COLUMN reservationId TEXT')
     this.insertStmt = db.prepare(`
       INSERT INTO testbed_runs (
-        id, projectId, replicaId, sessionId, agentId, profileId, operation, state,
+        id, projectId, replicaId, sessionId, agentId, profileId, reservationId, operation, state,
         commandSummary, commandSha256, baseCommit, createdAt, startedAt
-      ) VALUES (?, ?, ?, ?, ?, ?, 'exec', 'running', ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'exec', 'running', ?, ?, ?, ?, ?)
     `)
     this.finishStmt = db.prepare(`
       UPDATE testbed_runs
@@ -136,6 +144,7 @@ export class TestbedRunStore {
     sessionId: string
     agentId: string
     profileId: string
+    reservationId?: string
     command: string
     baseCommit?: string
   }): TestbedRun {
@@ -150,6 +159,7 @@ export class TestbedRunStore {
       input.sessionId,
       input.agentId,
       input.profileId,
+      input.reservationId ?? null,
       commandSummary,
       commandSha256,
       input.baseCommit ?? null,

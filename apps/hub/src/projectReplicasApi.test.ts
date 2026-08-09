@@ -8,6 +8,7 @@ import { ProjectStore } from './projects.js'
 import type { RemoteDeviceController } from './remoteDevices.js'
 import { startServer, type ServerOptions } from './server.js'
 import { TestbedRunStore } from './testbedRuns.js'
+import { TestbedReservationStore } from './testbedReservations.js'
 
 const cleanups: Array<() => void | Promise<void>> = []
 afterEach(async () => {
@@ -23,6 +24,7 @@ describe('project replica API', () => {
     const projects = new ProjectStore(db)
     const project = projects.create('Fleet project', projectDir)
     const testbedRuns = new TestbedRunStore(db)
+    const testbedReservations = new TestbedReservationStore(db)
     const run = testbedRuns.start({
       projectId: project.id,
       replicaId: 'future-replica',
@@ -40,10 +42,27 @@ describe('project replica API', () => {
       environments: [{ id: 'host', kind: 'host' as const, label: 'host', platform: 'linux', shell: '/bin/sh' }],
       roots: [{ id: 'root-a', label: 'Checkout', path: '/srv/project', read: true, write: true, terminal: true }],
     }))
+    const execute = vi.fn(async () => ({
+      ok: true,
+      git: {
+        status: 'ready' as const,
+        gitAvailable: true,
+        isRepository: true,
+        complete: true,
+        clean: true,
+        detached: false,
+        headCommit: 'a'.repeat(40),
+        headRef: 'main',
+        trackedChanges: 0,
+        untrackedFiles: 0,
+        observedAt: new Date().toISOString(),
+      },
+    }))
     const remoteDevices = {
       listConnections: vi.fn(() => [{ siteId: 'site-a', label: 'Laptop', paired: true, updatedAt: new Date().toISOString() }]),
       catalog: vi.fn(async () => []),
       capabilities,
+      execute,
     } as unknown as RemoteDeviceController
     const deviceToken = 'project-replica-test-device-token-at-least-32-characters'
     const server = startServer({
@@ -58,6 +77,7 @@ describe('project replica API', () => {
       usage: {} as never,
       projects,
       testbedRuns,
+      testbedReservations,
       workspace: {} as never,
       instructions: {} as never,
       bus: {} as never,
@@ -107,8 +127,17 @@ describe('project replica API', () => {
       siteLabel: 'Laptop',
       rootId: 'root-a',
       path: '/srv/project',
+      state: 'ready',
+      headCommit: 'a'.repeat(40),
+      headRef: 'main',
+      readiness: { status: 'ready', clean: true },
     })
     expect(capabilities).toHaveBeenCalledWith('site-a')
+    expect(execute).toHaveBeenCalledWith(
+      'site-a',
+      { op: 'git_inspect', rootId: 'root-a' },
+      expect.objectContaining({ projectId: project.id, agentId: 'operator' }),
+    )
 
     const listed = await fetch(`${base}/api/projects/${project.id}/replicas`, {
       headers: { authorization: `Bearer ${deviceToken}` },
@@ -124,5 +153,32 @@ describe('project replica API', () => {
     expect(await runs.json()).toEqual([
       expect.objectContaining({ id: run.id, agentId: 'agent-a', state: 'succeeded' }),
     ])
+
+    const remoteReplica = projects.findRemoteReplica(project.id, 'site-a', 'root-a')!
+    const reservation = testbedReservations.acquire({
+      projectId: project.id,
+      replicaId: remoteReplica.id,
+      sessionId: 'session-a',
+      agentId: 'agent-a',
+    }).reservation
+    const refreshed = await fetch(`${base}/api/projects/${project.id}/replicas/${remoteReplica.id}/inspect`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${deviceToken}`, 'content-type': 'application/json' },
+    })
+    expect(await refreshed.json()).toMatchObject({ id: remoteReplica.id, readiness: { status: 'ready' } })
+
+    const reservations = await fetch(`${base}/api/projects/${project.id}/testbed-reservations`, {
+      headers: { authorization: `Bearer ${deviceToken}` },
+    })
+    expect(await reservations.json()).toEqual([
+      expect.objectContaining({ id: reservation.id, replicaId: remoteReplica.id, state: 'active' }),
+    ])
+
+    const removeReserved = await fetch(`${base}/api/projects/${project.id}/replicas/${remoteReplica.id}`, {
+      method: 'DELETE',
+      headers: { authorization: `Bearer ${deviceToken}` },
+    })
+    expect(removeReserved.status).toBe(409)
+    expect(await removeReserved.json()).toMatchObject({ error: expect.stringContaining('reserved by agent') })
   })
 })

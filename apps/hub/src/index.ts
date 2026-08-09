@@ -19,6 +19,7 @@ import {
 } from './journal.js'
 import { ProjectStore } from './projects.js'
 import { TestbedRunStore } from './testbedRuns.js'
+import { TestbedReservationStore } from './testbedReservations.js'
 import { profileAuthEvidence, scanProfiles, setClaudeConnectorPolicy } from './profiles.js'
 import { ProfileOwnership } from './profileOwnership.js'
 import { ProfileRuntime } from './profileRuntime.js'
@@ -414,6 +415,7 @@ const usage = new UsageMonitor(journal, profiles, config)
 const workspace = new WorkspaceManager(path.join(dataDir, 'worktrees'), path.join(dataDir, 'workspaces'))
 const projects = new ProjectStore(journal.db, journal)
 const testbedRuns = new TestbedRunStore(journal.db)
+const testbedReservations = new TestbedReservationStore(journal.db)
 const instructions = new InstructionStore(journal.db)
 const bus = new AgentBus(journal.db)
 const memory = new MemoryStore(journal.db)
@@ -523,6 +525,7 @@ const executor: Executor = workerSocket
   : new InProcessExecutor({ approvals, questions, usage, danger, memory, practices })
 sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, dataDir, questions, executor, prefs, browserBroker, notifications)
 sessions.setTestbedRunStore(testbedRuns)
+sessions.setTestbedReservationStore(testbedReservations)
 const profileLoginCoordinator = new ProfileLoginCoordinator({
   profilesDir,
   registry: new ProfileLoginRegistry(path.join(dataDir, 'profile-logins.json')),
@@ -1001,7 +1004,7 @@ const remoteDevices = new RemoteDeviceController(fleetConnections, async (siteId
 sessions.setRemoteDeviceController(remoteDevices)
 
 // Listen on the BOOT port (0 → ephemeral for a green); the server reports its actual port back.
-const server = startServer({ port: bootPort, defaultCwd: dataDir, profilesDir, profileNames, profileOwnership, profileLoginCoordinator, journal, sessions, profiles, approvals, questions, notifications, usage, projects, testbedRuns, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity: (projectId) => worktreeCollisions.projectActivity(projectId), deviceExecutor, remoteDevices, directMesh, overseer, overseerCwd: repoRoot })
+const server = startServer({ port: bootPort, defaultCwd: dataDir, profilesDir, profileNames, profileOwnership, profileLoginCoordinator, journal, sessions, profiles, approvals, questions, notifications, usage, projects, testbedRuns, testbedReservations, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity: (projectId) => worktreeCollisions.projectActivity(projectId), deviceExecutor, remoteDevices, directMesh, overseer, overseerCwd: repoRoot })
 
 // Register the mesh advert — factored so a promoted green can (re)register once it owns the port.
 function registerMesh(): void {

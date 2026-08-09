@@ -19,6 +19,7 @@ import {
 } from './journal.js'
 import type { ProjectStore } from './projects.js'
 import type { TestbedRunStore } from './testbedRuns.js'
+import type { TestbedReservationStore } from './testbedReservations.js'
 import type { SessionManager } from './sessions.js'
 import type { UsageMonitor } from './usage.js'
 import type { MeshSite } from './meshSite.js'
@@ -37,7 +38,7 @@ import { readProjectConfig } from './importScan.js'
 import { pickableProfiles, setClaudeConnectorPolicy } from './profiles.js'
 import type { ProfileOwnership } from './profileOwnership.js'
 import { asFileWriteDiffDensity } from './types.js'
-import type { DangerFlags, HubPrefs, ManagerAgentType, Profile, Provider } from './types.js'
+import type { DangerFlags, HubPrefs, ManagerAgentType, Profile, ProjectReplicaReadiness, Provider } from './types.js'
 import type { Executor } from './executor.js'
 import type { WorktreeProjectActivity } from './worktreeCollisionDetector.js'
 import type { WorkspaceManager } from './workspace.js'
@@ -53,10 +54,12 @@ import {
 } from './journalRecovery.js'
 import { attachReplayStream, ReplayPrincipalBudget } from './replayStream.js'
 import { durableReplaySessions } from './replayBaseline.js'
-import type {
-  DeviceExecutor,
-  RemoteDeviceAction,
-  RemoteDeviceController,
+import {
+  inspectGitCheckout,
+  type RemoteGitInspection,
+  type DeviceExecutor,
+  type RemoteDeviceAction,
+  type RemoteDeviceController,
 } from './remoteDevices.js'
 import type { OverseerConfig, RemoteDeviceCapability, RemoteDeviceGrant } from './types.js'
 import {
@@ -433,6 +436,7 @@ export interface ServerOptions {
   usage: UsageMonitor
   projects: ProjectStore
   testbedRuns?: TestbedRunStore
+  testbedReservations?: TestbedReservationStore
   workspace: WorkspaceManager
   instructions: InstructionStore
   bus: AgentBus
@@ -535,8 +539,27 @@ export function persistPrefs(
   if (err) journal.append(null, 'config/prefs-persist-failed', { path: configPath, message: err })
 }
 
+function storedReplicaReadiness(
+  git: RemoteGitInspection,
+): ProjectReplicaReadiness & { headCommit?: string; headRef?: string } {
+  return {
+    status: git.status,
+    gitAvailable: git.gitAvailable,
+    isRepository: git.isRepository,
+    complete: git.complete,
+    ...(git.clean === undefined ? {} : { clean: git.clean }),
+    ...(git.detached === undefined ? {} : { detached: git.detached }),
+    ...(git.trackedChanges === undefined ? {} : { trackedChanges: git.trackedChanges }),
+    ...(git.untrackedFiles === undefined ? {} : { untrackedFiles: git.untrackedFiles }),
+    checkedAt: git.observedAt,
+    ...(git.error ? { error: git.error } : {}),
+    ...(git.headCommit ? { headCommit: git.headCommit } : {}),
+    ...(git.headRef ? { headRef: git.headRef } : {}),
+  }
+}
+
 export function startServer(opts: ServerOptions): http.Server {
-  const { port, defaultCwd, profilesDir, profileNames = {}, journal, sessions, profiles, approvals, usage, projects, testbedRuns, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity, deviceExecutor, remoteDevices, directMesh } = opts
+  const { port, defaultCwd, profilesDir, profileNames = {}, journal, sessions, profiles, approvals, usage, projects, testbedRuns, testbedReservations, workspace, instructions, bus, memory, practices, danger, prefs, rescanProfiles, mesh, deviceToken, requireToken, meshPeerPorts, agentToolSecret, restartState, executor, configPath, projectActivity, deviceExecutor, remoteDevices, directMesh } = opts
   const notifications = opts.notifications ?? (journal.db
     ? new NotificationService(journal.db)
     : new EphemeralNotificationService())
@@ -664,7 +687,7 @@ export function startServer(opts: ServerOptions): http.Server {
         throw new Error('action must be an object')
       }
       const action = content.action as RemoteDeviceAction
-      if (!['probe', 'inspect', 'list', 'read', 'mkdir', 'write', 'exec'].includes(action.op)) throw new Error('unknown remote device operation')
+      if (!['probe', 'inspect', 'git_inspect', 'list', 'read', 'mkdir', 'write', 'exec'].includes(action.op)) throw new Error('unknown remote device operation')
       const actor = content.actor && typeof content.actor === 'object' && !Array.isArray(content.actor)
         ? content.actor as Record<string, unknown>
         : {}
@@ -1221,14 +1244,81 @@ export function startServer(opts: ServerOptions): http.Server {
           json(res, { error: 'the remote device no longer advertises that root' }, 404)
           return
         }
-        json(res, projects.addRemoteReplica({
+        let replica = projects.addRemoteReplica({
           projectId,
           siteId,
           siteLabel: connection.label,
           rootId,
           path: root.path,
           ...(root.environment?.kind === 'wsl' ? { environment: root.environment } : {}),
-        }))
+        })
+        if (root.read) {
+          const inspected = await remoteDevices.execute(siteId, { op: 'git_inspect', rootId }, {
+            sessionId: 'operator:project-location',
+            profileId: 'operator',
+            projectId,
+            replicaId: replica.id,
+            agentId: 'operator',
+          })
+          const git = inspected.git ?? {
+            status: 'unavailable' as const,
+            gitAvailable: false,
+            isRepository: false,
+            complete: false,
+            observedAt: new Date().toISOString(),
+            error: (inspected.error ?? 'Remote Git readiness could not be inspected.').slice(0, 1_000),
+          }
+          replica = projects.updateReplicaReadiness(projectId, replica.id, storedReplicaReadiness(git))
+        }
+        json(res, replica)
+        return
+      }
+      const projectReplicaInspectMatch = /^\/api\/projects\/([^/]+)\/replicas\/([^/]+)\/inspect$/.exec(url.pathname)
+      if (method === 'POST' && projectReplicaInspectMatch) {
+        if (!authed) {
+          json(res, { error: 'operator device token required' }, 403)
+          return
+        }
+        const projectId = decodeURIComponent(projectReplicaInspectMatch[1] as string)
+        const replicaId = decodeURIComponent(projectReplicaInspectMatch[2] as string)
+        const replica = projects.getReplica(replicaId)
+        if (!replica || replica.projectId !== projectId) {
+          json(res, { error: 'project location not found' }, 404)
+          return
+        }
+        let git: RemoteGitInspection
+        if (replica.kind === 'local') {
+          git = await inspectGitCheckout({
+            path: replica.path,
+            ...(replica.environment.kind === 'wsl' && replica.environment.distro
+              ? { environment: { kind: 'wsl' as const, distro: replica.environment.distro } }
+              : {}),
+          })
+        } else {
+          if (!remoteDevices || !replica.siteId || !replica.rootId) {
+            json(res, { error: 'remote device controller unavailable' }, 503)
+            return
+          }
+          const inspected = await remoteDevices.execute(replica.siteId, {
+            op: 'git_inspect',
+            rootId: replica.rootId,
+          }, {
+            sessionId: 'operator:project-location',
+            profileId: 'operator',
+            projectId,
+            replicaId,
+            agentId: 'operator',
+          })
+          git = inspected.git ?? {
+            status: 'unavailable',
+            gitAvailable: false,
+            isRepository: false,
+            complete: false,
+            observedAt: new Date().toISOString(),
+            error: (inspected.error ?? 'Remote Git readiness could not be inspected.').slice(0, 1_000),
+          }
+        }
+        json(res, projects.updateReplicaReadiness(projectId, replicaId, storedReplicaReadiness(git)))
         return
       }
       const projectReplicaDeleteMatch = /^\/api\/projects\/([^/]+)\/replicas\/([^/]+)$/.exec(url.pathname)
@@ -1239,6 +1329,13 @@ export function startServer(opts: ServerOptions): http.Server {
         }
         const projectId = decodeURIComponent(projectReplicaDeleteMatch[1] as string)
         const replicaId = decodeURIComponent(projectReplicaDeleteMatch[2] as string)
+        const activeReservation = testbedReservations?.active(replicaId)
+        if (activeReservation) {
+          json(res, {
+            error: `The location is reserved by agent ${activeReservation.agentId} until ${activeReservation.expiresAt}.`,
+          }, 409)
+          return
+        }
         try {
           const removed = projects.removeReplica(projectId, replicaId)
           json(res, removed ? { ok: true } : { error: 'project location not found' }, removed ? 200 : 404)
@@ -1255,6 +1352,16 @@ export function startServer(opts: ServerOptions): http.Server {
           return
         }
         json(res, testbedRuns?.listProject(projectId, Number(url.searchParams.get('limit') ?? 50)) ?? [])
+        return
+      }
+      const projectReservationsMatch = /^\/api\/projects\/([^/]+)\/testbed-reservations$/.exec(url.pathname)
+      if (method === 'GET' && projectReservationsMatch) {
+        const projectId = decodeURIComponent(projectReservationsMatch[1] as string)
+        if (!projects.get(projectId)) {
+          json(res, { error: `unknown project: ${projectId}` }, 404)
+          return
+        }
+        json(res, testbedReservations?.listProject(projectId, Number(url.searchParams.get('limit') ?? 50)) ?? [])
         return
       }
       const deleteProjectMatch = /^\/api\/projects\/([^/]+)$/.exec(url.pathname)
@@ -1999,7 +2106,7 @@ export function startServer(opts: ServerOptions): http.Server {
           return
         }
         const action = body.action as RemoteDeviceAction
-        if (!['probe', 'inspect', 'list', 'read', 'mkdir', 'write', 'exec'].includes(action.op)) {
+        if (!['probe', 'inspect', 'git_inspect', 'list', 'read', 'mkdir', 'write', 'exec'].includes(action.op)) {
           json(res, { error: 'unknown remote device operation' }, 400)
           return
         }

@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { execFileSync } from 'node:child_process'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { verifyDirectHubEnvelope } from './directHubProtocol.js'
 import type { MyOwnMeshRpcBridge } from './myOwnMeshRpc.js'
@@ -32,6 +33,7 @@ describe('DeviceExecutor target policy', () => {
     expect(remoteCapabilityForAction({ op: 'mkdir', rootId: 'root', path: 'nested' })).toBe('write')
     expect(remoteCapabilityForAction({ op: 'write', rootId: 'root', path: 'file', content: '' })).toBe('write')
     expect(remoteCapabilityForAction({ op: 'list', rootId: 'root' })).toBe('read')
+    expect(remoteCapabilityForAction({ op: 'git_inspect', rootId: 'root' })).toBe('read')
     expect(remoteCapabilityForAction({ op: 'exec', rootId: 'root', command: 'true' })).toBe('terminal')
   })
 
@@ -112,6 +114,71 @@ describe('DeviceExecutor target policy', () => {
     expect(result).toMatchObject({ ok: true, exitCode: 0, timedOut: false })
     expect(result.stdout).toContain('remote-ok')
   }, 75_000)
+
+  it('admits only one terminal command per physical root across source hubs', async () => {
+    const dir = tempDir()
+    const root = path.join(dir, 'root')
+    fs.mkdirSync(root)
+    const executor = new DeviceExecutor(path.join(dir, 'policy.json'))
+    const policy = executor.update({
+      enabled: true,
+      roots: [{ id: '', label: 'shared testbed', path: root, read: false, write: true, terminal: true }],
+    })
+    const rootId = policy.roots[0]!.id
+    const command = process.platform === 'win32'
+      ? 'Start-Sleep -Milliseconds 750; Write-Output first'
+      : 'sleep 0.75; printf first'
+    const first = executor.execute({ op: 'exec', rootId, command, timeoutMs: 30_000 })
+    await expect(executor.execute({ op: 'exec', rootId, command: 'echo second' })).resolves.toMatchObject({
+      ok: false,
+      failure: { stage: 'admission', code: 'ROOT_BUSY' },
+    })
+    await expect(executor.execute({ op: 'write', rootId, path: 'raced.txt', content: 'unsafe' })).resolves.toMatchObject({
+      ok: false,
+      failure: { stage: 'admission', code: 'ROOT_BUSY' },
+    })
+    expect(fs.existsSync(path.join(root, 'raced.txt'))).toBe(false)
+    await expect(first).resolves.toMatchObject({ ok: true, exitCode: 0 })
+  }, 45_000)
+
+  it('reports bounded Git readiness without granting arbitrary terminal execution', async () => {
+    const dir = tempDir()
+    const root = path.join(dir, 'root')
+    fs.mkdirSync(root)
+    execFileSync('git', ['-C', root, 'init'])
+    execFileSync('git', ['-C', root, 'config', 'user.email', 'test@example.invalid'])
+    execFileSync('git', ['-C', root, 'config', 'user.name', 'Test'])
+    fs.writeFileSync(path.join(root, 'tracked.txt'), 'clean')
+    execFileSync('git', ['-C', root, 'add', 'tracked.txt'])
+    execFileSync('git', ['-C', root, 'commit', '-m', 'fixture'])
+    const executor = new DeviceExecutor(path.join(dir, 'policy.json'))
+    const policy = executor.update({
+      enabled: true,
+      roots: [{ id: '', label: 'repository', path: root, read: true, write: false, terminal: false }],
+    })
+    const rootId = policy.roots[0]!.id
+
+    await expect(executor.execute({ op: 'git_inspect', rootId })).resolves.toMatchObject({
+      ok: true,
+      git: {
+        status: 'ready',
+        gitAvailable: true,
+        isRepository: true,
+        clean: true,
+        complete: true,
+        headCommit: expect.stringMatching(/^[0-9a-f]{40}$/u),
+      },
+    })
+    fs.writeFileSync(path.join(root, 'untracked.txt'), 'dirty')
+    await expect(executor.execute({ op: 'git_inspect', rootId })).resolves.toMatchObject({
+      ok: true,
+      git: { status: 'dirty', clean: false, untrackedFiles: 1 },
+    })
+    await expect(executor.execute({ op: 'exec', rootId, command: 'git status' })).resolves.toMatchObject({
+      ok: false,
+      error: 'terminal access is not enabled for this root.',
+    })
+  })
 })
 
 describe('FleetConnectionStore', () => {

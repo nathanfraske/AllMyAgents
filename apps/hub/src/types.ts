@@ -31,6 +31,20 @@ export interface Project {
   createdAt: string
 }
 
+export interface ProjectReplicaReadiness {
+  status: 'unknown' | 'ready' | 'dirty' | 'not-repository' | 'unavailable'
+  gitAvailable: boolean
+  isRepository: boolean
+  /** False means the bounded status probe could not prove the complete working-tree state. */
+  complete: boolean
+  clean?: boolean
+  detached?: boolean
+  trackedChanges?: number
+  untrackedFiles?: number
+  checkedAt: string
+  error?: string
+}
+
 /** One explicit filesystem/execution location for a fleet-global project identity. */
 export interface ProjectReplica {
   id: string
@@ -53,6 +67,7 @@ export interface ProjectReplica {
   state: 'ready' | 'registered' | 'unavailable'
   headCommit?: string
   headRef?: string
+  readiness?: ProjectReplicaReadiness
   createdAt: string
   updatedAt: string
 }

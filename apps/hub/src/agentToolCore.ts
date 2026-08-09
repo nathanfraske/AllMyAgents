@@ -1069,6 +1069,35 @@ const remoteWriteFile = defineTool({
   },
 })
 
+const remoteInspectGit = defineTool({
+  name: 'remote_inspect_git',
+  description:
+    'Inspect the Git identity and bounded dirty/clean state of an explicitly granted remote root without receiving arbitrary terminal authority or mutating the checkout.',
+  schema: {
+    device_id: z.string().min(1).max(256),
+    root_id: z.string().min(1).max(128),
+  },
+  run: async (args, { identity, services }) => {
+    const denied = remoteBusDenied(identity, services)
+    if (denied) return denied
+    const result = await services.remoteExecute(identity.sessionId, args.device_id, {
+      op: 'git_inspect', rootId: args.root_id,
+    })
+    if (!result.ok || !result.git) {
+      return `Remote Git inspection failed: ${result.error ?? 'unknown error'} ${remoteTelemetry(result)}`
+    }
+    const git = result.git
+    return [
+      `Git ${git.status}; repository=${git.isRepository ? 'yes' : 'no'}; complete=${git.complete ? 'yes' : 'no'}`,
+      git.isRepository
+        ? `HEAD ${git.headCommit ?? 'unborn/unknown'}; ref ${git.headRef ?? '(detached or unknown)'}; tracked changes ${git.trackedChanges ?? 'unknown'}; untracked files ${git.untrackedFiles ?? 'unknown'}`
+        : `Git available=${git.gitAvailable ? 'yes' : 'no'}`,
+      ...(git.error ? [`note: ${git.error}`] : []),
+      remoteTelemetry(result),
+    ].join('\n')
+  },
+})
+
 const remoteCreateDirectory = defineTool({
   name: 'remote_create_directory',
   description:
@@ -1335,6 +1364,7 @@ export const AGENT_TOOLS: readonly AgentToolSpec[] = [
   remoteListDevices,
   remotePing,
   remoteInspectEnvironment,
+  remoteInspectGit,
   remoteListFiles,
   remoteReadFile,
   remoteCreateDirectory,

@@ -106,6 +106,7 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
       'remote_list_devices',
       'remote_ping',
       'remote_inspect_environment',
+      'remote_inspect_git',
       'remote_list_files',
       'remote_read_file',
       'remote_create_directory',
@@ -209,6 +210,27 @@ describe('remote testbed tools', () => {
     }, { identity: idA, services: h.services })
     expect(out).toMatch(/unavailable on a teammate-caused turn/u)
     expect(called).toBe(false)
+  })
+
+  it('renders bounded Git readiness from the fixed remote inspection action', async () => {
+    const h = makeHarness()
+    h.services.remoteExecute = async (_sessionId, _siteId, action) => {
+      expect(action).toEqual({ op: 'git_inspect', rootId: 'root-a' })
+      return {
+        ok: true,
+        git: {
+          status: 'dirty', gitAvailable: true, isRepository: true, complete: true, clean: false,
+          headCommit: 'a'.repeat(40), headRef: 'main', trackedChanges: 2, untrackedFiles: 1,
+          observedAt: new Date().toISOString(),
+        },
+      }
+    }
+    const out = await runAgentTool('remote_inspect_git', {
+      device_id: 'site-a', root_id: 'root-a',
+    }, { identity: idA, services: h.services })
+    expect(out).toContain('Git dirty')
+    expect(out).toContain('tracked changes 2')
+    expect(out).toContain('untracked files 1')
   })
 })
 

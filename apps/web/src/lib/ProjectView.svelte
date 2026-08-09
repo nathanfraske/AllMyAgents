@@ -4,6 +4,7 @@
     api,
     type ProjectReplicaInfo,
     type RemoteDeviceCatalogEntry,
+    type TestbedReservationInfo,
     type TestbedRunInfo,
     type WorktreeProjectActivity,
   } from './api'
@@ -32,10 +33,12 @@
   let topologyTimer: ReturnType<typeof setInterval> | null = null
   let replicas = $state<ProjectReplicaInfo[]>([])
   let testbedRuns = $state<TestbedRunInfo[]>([])
+  let testbedReservations = $state<TestbedReservationInfo[]>([])
   let replicaCatalog = $state<RemoteDeviceCatalogEntry[]>([])
   let topologyError = $state('')
   let locationPickerOpen = $state(false)
   let attachingLocation = $state('')
+  let inspectingLocation = $state('')
   let selectedMode = $state<ProjectViewMode>('overview')
   let peekOpen = $state(true)
   let modeProjectId = $state('')
@@ -98,14 +101,16 @@
     const id = projectId
     let current = true
     const refresh = async (): Promise<void> => {
-      const [nextReplicas, nextRuns] = await Promise.all([
+      const [nextReplicas, nextRuns, nextReservations] = await Promise.all([
         api.projectReplicas(id).catch(() => null),
         api.projectTestbedRuns(id, 20).catch(() => null),
+        api.projectTestbedReservations(id, 20).catch(() => null),
       ])
       if (!current) return
       if (nextReplicas && !('error' in nextReplicas)) replicas = nextReplicas
       if (nextRuns && !('error' in nextRuns)) testbedRuns = nextRuns
-      topologyError = nextReplicas && nextRuns ? '' : 'Project locations could not be refreshed.'
+      if (nextReservations && !('error' in nextReservations)) testbedReservations = nextReservations
+      topologyError = nextReplicas && nextRuns && nextReservations ? '' : 'Project locations could not be refreshed.'
     }
     void refresh()
     topologyTimer = setInterval(() => void refresh(), 5_000)
@@ -159,6 +164,12 @@
     ).filter(({ device, root }) => !attached.has(`${device.siteId}:${root.id}`))
   })
 
+  const activeReservationByReplica = $derived.by(() => new Map(
+    testbedReservations
+      .filter((reservation) => reservation.state === 'active' && Date.parse(reservation.expiresAt) > Date.now())
+      .map((reservation) => [reservation.replicaId, reservation]),
+  ))
+
   async function toggleLocationPicker(): Promise<void> {
     locationPickerOpen = !locationPickerOpen
     if (!locationPickerOpen) return
@@ -192,6 +203,36 @@
       return
     }
     replicas = replicas.filter((candidate) => candidate.id !== replica.id)
+  }
+
+  async function inspectLocation(replica: ProjectReplicaInfo): Promise<void> {
+    inspectingLocation = replica.id
+    topologyError = ''
+    const inspected = await api.inspectProjectReplica(projectId, replica.id).catch(() => null)
+    inspectingLocation = ''
+    if (!inspected || 'error' in inspected) {
+      topologyError = inspected && 'error' in inspected ? inspected.error : 'Git readiness could not be inspected.'
+      return
+    }
+    replicas = replicas.map((candidate) => candidate.id === inspected.id ? inspected : candidate)
+  }
+
+  function readinessLabel(replica: ProjectReplicaInfo): string {
+    const readiness = replica.readiness
+    if (!readiness) return 'Git readiness not checked'
+    if (readiness.status === 'ready') return `Git clean${replica.headRef ? ` · ${replica.headRef}` : ''}`
+    if (readiness.status === 'dirty') {
+      const changes = (readiness.trackedChanges ?? 0) + (readiness.untrackedFiles ?? 0)
+      return `Git dirty · ${changes}${readiness.complete ? '' : '+'} change${changes === 1 ? '' : 's'}`
+    }
+    if (readiness.status === 'not-repository') return 'Not a Git checkout'
+    if (readiness.status === 'unavailable') return 'Git unavailable'
+    return 'Git readiness unknown'
+  }
+
+  function reservationAgent(reservation: TestbedReservationInfo): string {
+    const view = store.sessions[reservation.agentId]
+    return view ? agentName(view) : `agent ${shortAgentId(reservation.agentId)}`
   }
 
   type ProjectStatus = 'working' | 'idle' | 'done' | 'failed' | 'blocked'
@@ -558,13 +599,24 @@
         {#if topologyError}<div class="topology-error">{topologyError}</div>{/if}
         <div class="location-list">
           {#each replicas as replica (replica.id)}
+            {@const reservation = activeReservationByReplica.get(replica.id)}
             <article class="location-row">
               <span class="location-state {replica.state}" title={replica.state}></span>
               <span class="location-copy">
                 <strong>{replica.kind === 'local' ? 'This hub' : replica.siteLabel || replica.siteId}</strong>
                 <small>{replica.environment.label || replica.environment.kind} · {replica.path}</small>
+                <small class="git-readiness {replica.readiness?.status ?? 'unknown'}">{readinessLabel(replica)}</small>
+                {#if reservation}
+                  <small class="reservation">Reserved by {reservationAgent(reservation)} until {timeOf(reservation.expiresAt)}</small>
+                {/if}
               </span>
               {#if replica.isPrimary}<span class="location-badge">primary</span>{/if}
+              <button
+                class="location-inspect"
+                disabled={inspectingLocation !== ''}
+                aria-label={`Inspect Git readiness for ${replica.siteLabel || replica.path}`}
+                onclick={() => inspectLocation(replica)}
+              >{inspectingLocation === replica.id ? 'Checking…' : 'Check Git'}</button>
               {#if !replica.isPrimary}
                 <button class="location-remove" aria-label={`Remove ${replica.siteLabel || replica.path}`} onclick={() => detachLocation(replica)}>Remove</button>
               {/if}
@@ -901,9 +953,15 @@
   .location-copy strong { font-size: var(--text-xs); }
   .location-copy small { overflow: hidden; color: var(--muted); font-family: var(--mono);
     font-size: var(--text-2xs); text-overflow: ellipsis; white-space: nowrap; }
+  .location-copy .git-readiness.ready { color: var(--green, #2e9e63); }
+  .location-copy .git-readiness.dirty { color: var(--warn, #d99a32); }
+  .location-copy .git-readiness.unavailable { color: var(--red); }
+  .location-copy .reservation { color: var(--accent); }
   .location-badge { padding: .18rem .4rem; border: 1px solid var(--border); border-radius: var(--r-pill);
     color: var(--muted); font-size: var(--text-2xs); }
-  .location-remove { color: var(--dim); font-size: var(--text-2xs); }
+  .location-inspect, .location-remove { flex: none; color: var(--dim); font-size: var(--text-2xs); }
+  .location-inspect:hover { color: var(--accent); }
+  .location-inspect:disabled { opacity: .55; }
   .location-remove:hover { color: var(--red); }
   .location-picker { max-height: 260px; overflow: auto; border-top: 1px solid var(--border); background: var(--surface-2); }
   .location-picker > button { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .15rem .6rem;

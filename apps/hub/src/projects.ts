@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import pathModule from 'node:path'
 import type Database from 'better-sqlite3'
 import { readProjectConfig } from './importScan.js'
-import type { Project, ProjectReplica } from './types.js'
+import type { Project, ProjectReplica, ProjectReplicaReadiness } from './types.js'
 
 type ProjectLocation = NonNullable<Project['location']>
 
@@ -37,12 +37,27 @@ interface ProjectReplicaRow {
   state: 'ready' | 'registered' | 'unavailable'
   headCommit: string | null
   headRef: string | null
+  readinessJson: string | null
   createdAt: string
   updatedAt: string
 }
 
 function replicaFromRow(row: ProjectReplicaRow | undefined): ProjectReplica | undefined {
   if (!row) return undefined
+  let readiness: ProjectReplicaReadiness | undefined
+  try {
+    const parsed = row.readinessJson ? JSON.parse(row.readinessJson) as Partial<ProjectReplicaReadiness> : undefined
+    if (
+      parsed &&
+      ['unknown', 'ready', 'dirty', 'not-repository', 'unavailable'].includes(parsed.status ?? '') &&
+      typeof parsed.gitAvailable === 'boolean' &&
+      typeof parsed.isRepository === 'boolean' &&
+      typeof parsed.complete === 'boolean' &&
+      typeof parsed.checkedAt === 'string'
+    ) readiness = parsed as ProjectReplicaReadiness
+  } catch {
+    readiness = undefined
+  }
   return {
     id: row.id,
     projectId: row.projectId,
@@ -61,6 +76,7 @@ function replicaFromRow(row: ProjectReplicaRow | undefined): ProjectReplica | un
     state: row.state,
     ...(row.headCommit ? { headCommit: row.headCommit } : {}),
     ...(row.headRef ? { headRef: row.headRef } : {}),
+    ...(readiness ? { readiness } : {}),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   }
@@ -115,6 +131,7 @@ export class ProjectStore {
   private readonly replicaGetStmt: Database.Statement
   private readonly replicaDeleteStmt: Database.Statement
   private readonly replicaDeleteProjectStmt: Database.Statement
+  private readonly replicaReadinessStmt: Database.Statement
 
   constructor(
     private readonly db: Database.Database,
@@ -159,6 +176,7 @@ export class ProjectStore {
         state TEXT NOT NULL CHECK (state IN ('ready', 'registered', 'unavailable')),
         headCommit TEXT,
         headRef TEXT,
+        readinessJson TEXT,
         createdAt TEXT NOT NULL,
         updatedAt TEXT NOT NULL
       );
@@ -166,6 +184,10 @@ export class ProjectStore {
       CREATE UNIQUE INDEX IF NOT EXISTS project_replicas_remote_identity_idx
         ON project_replicas(projectId, siteId, rootId) WHERE kind = 'remote';
     `)
+    const replicaColumns = new Set(
+      (db.prepare('PRAGMA table_info(project_replicas)').all() as Array<{ name: string }>).map((column) => column.name),
+    )
+    if (!replicaColumns.has('readinessJson')) db.exec('ALTER TABLE project_replicas ADD COLUMN readinessJson TEXT')
     this.insertStmt = db.prepare(
       'INSERT INTO projects (id, name, path, wslDistro, linuxPath, createdAt) VALUES (?, ?, ?, ?, ?, ?)',
     )
@@ -185,14 +207,19 @@ export class ProjectStore {
     this.replicaInsertStmt = db.prepare(`
       INSERT INTO project_replicas (
         id, projectId, kind, siteId, siteLabel, rootId, environmentId, environmentKind,
-        environmentLabel, distro, path, isPrimary, state, headCommit, headRef, createdAt, updatedAt
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        environmentLabel, distro, path, isPrimary, state, headCommit, headRef, readinessJson, createdAt, updatedAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO NOTHING
     `)
     this.replicaAllStmt = db.prepare('SELECT * FROM project_replicas WHERE projectId = ? ORDER BY isPrimary DESC, createdAt ASC')
     this.replicaGetStmt = db.prepare('SELECT * FROM project_replicas WHERE id = ?')
     this.replicaDeleteStmt = db.prepare("DELETE FROM project_replicas WHERE id = ? AND isPrimary = 0")
     this.replicaDeleteProjectStmt = db.prepare('DELETE FROM project_replicas WHERE projectId = ?')
+    this.replicaReadinessStmt = db.prepare(`
+      UPDATE project_replicas
+      SET state = ?, headCommit = ?, headRef = ?, readinessJson = ?, updatedAt = ?
+      WHERE id = ? AND projectId = ?
+    `)
     // Existing projects predate explicit replicas. Materialize their one known local location without
     // manufacturing lifecycle events: this is a deterministic schema upgrade, not a new operator action.
     for (const project of this.list()) this.insertLocalReplica(project)
@@ -215,6 +242,7 @@ export class ProjectStore {
       replica.state,
       replica.headCommit ?? null,
       replica.headRef ?? null,
+      replica.readiness ? JSON.stringify(replica.readiness) : null,
       replica.createdAt,
       replica.updatedAt,
     )
@@ -369,6 +397,55 @@ export class ProjectStore {
     if (this.lifecycle) this.lifecycle.atomic(remove)
     else remove()
     return removed
+  }
+
+  updateReplicaReadiness(
+    projectId: string,
+    replicaId: string,
+    readiness: ProjectReplicaReadiness & { headCommit?: string; headRef?: string },
+  ): ProjectReplica {
+    const replica = this.getReplica(replicaId)
+    if (!replica || replica.projectId !== projectId) throw new Error('project location not found')
+    const updatedAt = new Date().toISOString()
+    const state = readiness.status === 'ready'
+      ? 'ready'
+      : readiness.status === 'unavailable'
+        ? 'unavailable'
+        : 'registered'
+    const normalized: ProjectReplicaReadiness = {
+      status: readiness.status,
+      gitAvailable: readiness.gitAvailable,
+      isRepository: readiness.isRepository,
+      complete: readiness.complete,
+      ...(readiness.clean === undefined ? {} : { clean: readiness.clean }),
+      ...(readiness.detached === undefined ? {} : { detached: readiness.detached }),
+      ...(readiness.trackedChanges === undefined ? {} : { trackedChanges: readiness.trackedChanges }),
+      ...(readiness.untrackedFiles === undefined ? {} : { untrackedFiles: readiness.untrackedFiles }),
+      checkedAt: readiness.checkedAt,
+      ...(readiness.error ? { error: readiness.error.slice(0, 1_000) } : {}),
+    }
+    const update = (): void => {
+      this.replicaReadinessStmt.run(
+        state,
+        readiness.headCommit ?? null,
+        readiness.headRef ?? null,
+        JSON.stringify(normalized),
+        updatedAt,
+        replicaId,
+        projectId,
+      )
+      this.lifecycle?.append(null, 'project/replica-inspected', {
+        projectId,
+        replicaId,
+        state,
+        headCommit: readiness.headCommit ?? null,
+        headRef: readiness.headRef ?? null,
+        readiness: normalized,
+      })
+    }
+    if (this.lifecycle) this.lifecycle.atomic(update)
+    else update()
+    return this.getReplica(replicaId)!
   }
 
   /**

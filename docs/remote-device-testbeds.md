@@ -23,7 +23,7 @@ the mapped Site/HTTP route only as a compatibility fallback.
    environment for that logical project. This is project topology, not an authority grant: the session still
    needs the per-chat grant from step 4 before it can use the root.
 6. The agent can discover only its granted device/root labels and opaque IDs, then use:
-   `remote_ping`, `remote_inspect_environment`, `remote_list_files`, `remote_read_file`,
+   `remote_ping`, `remote_inspect_environment`, `remote_inspect_git`, `remote_list_files`, `remote_read_file`,
    `remote_create_directory`, `remote_write_file`, and `remote_exec`. A folder transfer mirrors its
    directory tree with `remote_create_directory` before writing the contained files; empty directories
    are therefore preserved too.
@@ -52,9 +52,23 @@ If the source hub restarts before it observes a remote result, the active hub ow
 `cancelled` at the `source-restart` stage instead of inventing a success or failure. A standby hub never
 reconciles those rows while the active owner may still be running them.
 
-This first runner slice deliberately does not imply source synchronization, reservations, streamed output,
-resource isolation, or Git admission. Those remain later protocol layers; a registered location is an honest
-placement fact, not a claim that its checkout is current.
+Attributed terminal runs acquire a durable, expiring source-hub lease before the command is sent. A second
+agent on that hub is rejected at admission while the location is leased. Writes and directory mutations are
+also refused during that lease. The target executor independently allows only one terminal command per
+physical root and refuses mutations while it runs, so a second paired hub cannot bypass the live-process
+fence. Both fences are released on a normally observed result; owner restart reconciliation records
+interrupted leases. A crash-surviving process tree requires the later durable runner/job-object layer and is
+reported as an unknown outcome rather than assumed stopped.
+
+Project Overview can run a fixed-argument Git readiness probe against local or remote locations. Agents with
+an explicit read grant can use the same probe through `remote_inspect_git`. It records HEAD/ref and a bounded
+clean/dirty count without granting terminal access, taking a Git lock, fetching, checking out, resetting, or
+copying files. A timed-out or truncated inspection is reported as incomplete and is never treated as clean.
+
+This runner slice deliberately does not imply source synchronization, streamed output, resource isolation,
+or Git admission. Readiness and exclusive execution now exist, but clone/fetch/checkout, dirty-work handling,
+and accepting results remain later protocol layers; a registered location is an honest placement fact, not a
+claim that its checkout is current.
 
 ## Security boundary
 

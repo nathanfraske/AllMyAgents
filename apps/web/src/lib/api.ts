@@ -928,6 +928,18 @@ export interface ProjectReplicaInfo {
   state: 'ready' | 'registered' | 'unavailable'
   headCommit?: string
   headRef?: string
+  readiness?: {
+    status: 'unknown' | 'ready' | 'dirty' | 'not-repository' | 'unavailable'
+    gitAvailable: boolean
+    isRepository: boolean
+    complete: boolean
+    clean?: boolean
+    detached?: boolean
+    trackedChanges?: number
+    untrackedFiles?: number
+    checkedAt: string
+    error?: string
+  }
   createdAt: string
   updatedAt: string
 }
@@ -939,6 +951,7 @@ export interface TestbedRunInfo {
   sessionId: string
   agentId: string
   profileId: string
+  reservationId?: string
   operation: 'exec'
   state: 'running' | 'succeeded' | 'failed' | 'cancelled'
   commandSummary: string
@@ -960,6 +973,19 @@ export interface TestbedRunInfo {
     transferBytes?: number
     transferBytesPerSecond?: number
   }
+}
+
+export interface TestbedReservationInfo {
+  id: string
+  projectId: string
+  replicaId: string
+  sessionId: string
+  agentId: string
+  state: 'active' | 'released' | 'expired' | 'interrupted'
+  acquiredAt: string
+  expiresAt: string
+  releasedAt?: string
+  reason?: string
 }
 export interface StatsResult {
   days: DayStat[]
@@ -1338,6 +1364,24 @@ export const api = {
       sessionId: prefix(run.sessionId),
       agentId: prefix(run.agentId),
       profileId: prefix(run.profileId),
+      ...(run.reservationId ? { reservationId: prefix(run.reservationId) } : {}),
+    }))
+  },
+  projectTestbedReservations: async (projectId: string, limit = 50) => {
+    const target = resolveHubResource(projectId)
+    const value = await routedGet<TestbedReservationInfo[]>(
+      projectId,
+      (id) => `/api/projects/${encodeURIComponent(id)}/testbed-reservations?limit=${Math.max(1, Math.min(limit, 200))}`,
+    )
+    if (!target.site) return value
+    const prefix = (id: string): string => `${target.site!.siteId}:${id}`
+    return value.map((reservation) => ({
+      ...reservation,
+      id: prefix(reservation.id),
+      projectId: prefix(reservation.projectId),
+      replicaId: prefix(reservation.replicaId),
+      sessionId: prefix(reservation.sessionId),
+      agentId: prefix(reservation.agentId),
     }))
   },
   projectReplicaCatalog: (projectId: string) =>
@@ -1366,6 +1410,23 @@ export const api = {
       projectId,
       (id) => `/api/projects/${encodeURIComponent(id)}/replicas/${encodeURIComponent(replicaTarget.id)}`,
     )
+  },
+  inspectProjectReplica: async (projectId: string, replicaId: string) => {
+    const target = resolveHubResource(projectId)
+    const replicaTarget = resolveHubResource(replicaId)
+    if (target.site?.siteId !== replicaTarget.site?.siteId) {
+      return { error: 'project location belongs to a different hub' } as ApiError
+    }
+    const value = await routedPost<ProjectReplicaInfo | ApiError>(
+      projectId,
+      (id) => `/api/projects/${encodeURIComponent(id)}/replicas/${encodeURIComponent(replicaTarget.id)}/inspect`,
+    )
+    if (!target.site || 'error' in value) return value
+    return {
+      ...value,
+      id: `${target.site.siteId}:${value.id}`,
+      projectId: `${target.site.siteId}:${value.projectId}`,
+    }
   },
   inspectProjectDeletion: async (projectId: string, signal?: AbortSignal) => {
     const target = resolveHubResource(projectId)

@@ -15,6 +15,7 @@ import type { RemoteDeviceAction, RemoteDeviceActionResult, RemoteDeviceControll
 import { SessionManager } from './sessions.js'
 import { SessionStore } from './store.js'
 import { TestbedRunStore } from './testbedRuns.js'
+import { TestbedReservationStore } from './testbedReservations.js'
 import type { Profile, SessionRecord } from './types.js'
 import { UsageMonitor } from './usage.js'
 import { WorkspaceManager } from './workspace.js'
@@ -50,7 +51,7 @@ function build() {
     baseCommit: 'abc123',
     status: 'idle',
     permissionMode: 'full',
-    remoteDeviceGrants: [{ siteId: 'site-a', rootIds: ['root-a'], capabilities: ['terminal'] }],
+    remoteDeviceGrants: [{ siteId: 'site-a', rootIds: ['root-a'], capabilities: ['write', 'terminal'] }],
     createdAt: new Date().toISOString(),
   }
   const sessionStore = new SessionStore(journal.db)
@@ -85,7 +86,9 @@ function build() {
     executor,
   )
   const runs = new TestbedRunStore(journal.db)
+  const reservations = new TestbedReservationStore(journal.db)
   sessions.setTestbedRunStore(runs)
+  sessions.setTestbedReservationStore(reservations)
   const previousIsolated = process.env.HUB_ISOLATED_PROFILES
   process.env.HUB_ISOLATED_PROFILES = '1'
   sessions.boot()
@@ -95,7 +98,7 @@ function build() {
     journal.db.close()
     fs.rmSync(root, { recursive: true, force: true })
   })
-  return { journal, project, projects, replica, runs, sessions }
+  return { journal, project, projects, replica, reservations, runs, sessions }
 }
 
 describe('remote testbed attribution', () => {
@@ -142,8 +145,57 @@ describe('remote testbed attribution', () => {
         exitCode: 0,
       }),
     ])
+    expect(hub.reservations.listProject(hub.project.id)).toEqual([
+      expect.objectContaining({
+        replicaId: hub.replica.id,
+        agentId: 'agent-a',
+        state: 'released',
+        reason: 'run-finished',
+      }),
+    ])
     expect(hub.journal.eventsForSession('agent-a').events.map((event) => event.kind)).toEqual(
-      expect.arrayContaining(['testbed-run/started', 'testbed-run/completed']),
+      expect.arrayContaining([
+        'testbed-reservation/acquired',
+        'testbed-run/started',
+        'testbed-reservation/released',
+        'testbed-run/completed',
+      ]),
     )
+  })
+
+  it('rejects a concurrent command on the same location before it reaches the target', async () => {
+    const hub = build()
+    let finishFirst!: (value: RemoteDeviceActionResult) => void
+    const execute = vi.fn(() => new Promise<RemoteDeviceActionResult>((resolve) => { finishFirst = resolve }))
+    hub.sessions.setRemoteDeviceController({ execute } as unknown as RemoteDeviceController)
+    const privateApi = hub.sessions as unknown as {
+      remoteDeviceExecute(sessionId: string, siteId: string, action: RemoteDeviceAction): Promise<RemoteDeviceActionResult>
+    }
+    const action: RemoteDeviceAction = { op: 'exec', rootId: 'root-a', command: 'pnpm test' }
+
+    const first = privateApi.remoteDeviceExecute('agent-a', 'site-a', action)
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(1))
+    const second = await privateApi.remoteDeviceExecute('agent-a', 'site-a', action)
+    expect(second).toMatchObject({
+      ok: false,
+      failure: { stage: 'admission', code: 'REPLICA_RESERVED' },
+      error: expect.stringContaining('reserved by agent'),
+    })
+    const mutation = await privateApi.remoteDeviceExecute('agent-a', 'site-a', {
+      op: 'write', rootId: 'root-a', path: 'raced.txt', content: 'unsafe',
+    })
+    expect(mutation).toMatchObject({
+      ok: false,
+      failure: { stage: 'admission', code: 'REPLICA_RESERVED' },
+    })
+    await expect(hub.sessions.deleteProject(hub.project.id)).resolves.toMatchObject({
+      ok: false,
+      error: expect.stringContaining('testbed run is still active'),
+    })
+    expect(hub.projects.get(hub.project.id)).toBeTruthy()
+    expect(execute).toHaveBeenCalledTimes(1)
+
+    finishFirst({ ok: true, exitCode: 0 })
+    await expect(first).resolves.toMatchObject({ ok: true })
   })
 })

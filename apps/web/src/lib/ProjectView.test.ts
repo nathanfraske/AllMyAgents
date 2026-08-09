@@ -8,9 +8,11 @@ const apiMock = vi.hoisted(() => ({
   projectActivity: vi.fn(),
   projectReplicas: vi.fn(),
   projectTestbedRuns: vi.fn(),
+  projectTestbedReservations: vi.fn(),
   projectReplicaCatalog: vi.fn(),
   addProjectReplica: vi.fn(),
   removeProjectReplica: vi.fn(),
+  inspectProjectReplica: vi.fn(),
   send: vi.fn(),
   updateProject: vi.fn(),
 }))
@@ -127,9 +129,19 @@ beforeEach(() => {
   apiMock.projectActivity.mockReset().mockResolvedValue(activity)
   apiMock.projectReplicas.mockReset().mockResolvedValue([localReplica])
   apiMock.projectTestbedRuns.mockReset().mockResolvedValue([])
+  apiMock.projectTestbedReservations.mockReset().mockResolvedValue([])
   apiMock.projectReplicaCatalog.mockReset().mockResolvedValue([])
   apiMock.addProjectReplica.mockReset()
   apiMock.removeProjectReplica.mockReset().mockResolvedValue({ ok: true })
+  apiMock.inspectProjectReplica.mockReset().mockImplementation(async (_projectId: string, replicaId: string) => ({
+    ...localReplica,
+    id: replicaId,
+    headCommit: 'a'.repeat(40),
+    headRef: 'main',
+    readiness: {
+      status: 'ready', gitAvailable: true, isRepository: true, complete: true, clean: true, checkedAt: now,
+    },
+  }))
   apiMock.send.mockReset().mockResolvedValue({ ok: true })
   apiMock.updateProject.mockReset().mockImplementation(async (_id: string, patch: { name: string }) => ({
     ...project,
@@ -254,6 +266,16 @@ describe('ProjectView', () => {
         roots: [{ id: 'root-project', label: 'Project checkout', path: 'C:/work/alpha', read: true, write: true, terminal: true }],
       },
     }])
+    apiMock.projectTestbedReservations.mockResolvedValue([{
+      id: 'reservation-1',
+      projectId: project.id,
+      replicaId: 'replica-laptop',
+      sessionId: 'worker',
+      agentId: 'worker',
+      state: 'active',
+      acquiredAt: now,
+      expiresAt: '2099-01-01T00:00:00.000Z',
+    }])
     const remoteReplica: ProjectReplicaInfo = {
       ...localReplica,
       id: 'replica-laptop',
@@ -265,6 +287,15 @@ describe('ProjectView', () => {
       state: 'registered',
     }
     apiMock.addProjectReplica.mockResolvedValue(remoteReplica)
+    apiMock.inspectProjectReplica.mockResolvedValue({
+      ...remoteReplica,
+      state: 'ready',
+      headCommit: 'a'.repeat(40),
+      headRef: 'main',
+      readiness: {
+        status: 'ready', gitAvailable: true, isRepository: true, complete: true, clean: true, checkedAt: now,
+      },
+    })
 
     render(ProjectView, { props: { projectId: project.id } })
 
@@ -276,6 +307,10 @@ describe('ProjectView', () => {
     await fireEvent.click(screen.getByRole('button', { name: /Project checkout/ }))
     await waitFor(() => expect(apiMock.addProjectReplica).toHaveBeenCalledWith(project.id, 'laptop', 'root-project'))
     expect(await screen.findByText('Nathan Beefy Laptop')).toBeTruthy()
+    expect(screen.getByText(/Reserved by Bose/)).toBeTruthy()
+    await fireEvent.click(screen.getByRole('button', { name: /Inspect Git readiness for Nathan Beefy Laptop/i }))
+    await waitFor(() => expect(apiMock.inspectProjectReplica).toHaveBeenCalledWith(project.id, 'replica-laptop'))
+    expect(screen.getByText(/Git clean.*main/)).toBeTruthy()
   })
 
   it('shows lifecycle status, manager grouping, files, taskboards, collisions, and project bus traffic', async () => {

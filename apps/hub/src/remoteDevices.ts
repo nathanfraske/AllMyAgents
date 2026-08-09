@@ -212,13 +212,29 @@ export interface RemoteDeviceTelemetry {
 }
 
 export interface RemoteDeviceFailure {
-  stage: 'pairing' | 'route' | 'transport' | 'timeout' | 'protocol' | 'target'
+  stage: 'admission' | 'pairing' | 'route' | 'transport' | 'timeout' | 'protocol' | 'target'
   code?: string
+}
+
+export interface RemoteGitInspection {
+  status: 'unknown' | 'ready' | 'dirty' | 'not-repository' | 'unavailable'
+  gitAvailable: boolean
+  isRepository: boolean
+  complete: boolean
+  clean?: boolean
+  detached?: boolean
+  headCommit?: string
+  headRef?: string
+  trackedChanges?: number
+  untrackedFiles?: number
+  observedAt: string
+  error?: string
 }
 
 export type RemoteDeviceAction =
   | { op: 'probe'; rootId: string }
   | { op: 'inspect'; rootId: string }
+  | { op: 'git_inspect'; rootId: string }
   | { op: 'list'; rootId: string; path?: string }
   | { op: 'read'; rootId: string; path: string; encoding?: 'utf8' | 'base64'; maxBytes?: number }
   | { op: 'mkdir'; rootId: string; path: string; recursive?: boolean }
@@ -233,6 +249,7 @@ export interface RemoteDeviceActionResult {
   failure?: RemoteDeviceFailure
   telemetry?: RemoteDeviceTelemetry
   environment?: RemoteEnvironmentInspection
+  git?: RemoteGitInspection
   entries?: Array<{ name: string; kind: 'file' | 'directory' | 'other'; size?: number }>
   content?: string
   encoding?: 'utf8' | 'base64'
@@ -378,10 +395,156 @@ export function remoteCapabilityForAction(action: RemoteDeviceAction): RemoteDev
   return 'read'
 }
 
+interface BoundedProcessResult {
+  status: number | null
+  stdout: string
+  stderr: string
+  timedOut: boolean
+  truncated: boolean
+  error?: string
+}
+
+function runBoundedProcess(program: string, args: string[], timeoutMs = 5_000): Promise<BoundedProcessResult> {
+  return new Promise((resolve) => {
+    let settled = false
+    let child: ChildProcess
+    try {
+      child = spawn(program, args, {
+        env: {
+          ...Object.fromEntries(
+            Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith('GIT_')),
+          ),
+          GIT_OPTIONAL_LOCKS: '0',
+          GIT_TERMINAL_PROMPT: '0',
+          LC_ALL: 'C',
+        },
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+    } catch (error) {
+      resolve({ status: null, stdout: '', stderr: '', timedOut: false, truncated: false, error: error instanceof Error ? error.message : String(error) })
+      return
+    }
+    const stdout: Buffer[] = []
+    const stderr: Buffer[] = []
+    let bytes = 0
+    let truncated = false
+    let timedOut = false
+    const collect = (target: Buffer[], chunk: Buffer): void => {
+      const remaining = 256 * 1024 - bytes
+      if (remaining <= 0) { truncated = true; return }
+      target.push(chunk.length > remaining ? chunk.subarray(0, remaining) : chunk)
+      bytes += Math.min(chunk.length, remaining)
+      if (chunk.length > remaining) truncated = true
+    }
+    child.stdout?.on('data', (chunk: Buffer) => collect(stdout, chunk))
+    child.stderr?.on('data', (chunk: Buffer) => collect(stderr, chunk))
+    const finish = (result: BoundedProcessResult): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(result)
+    }
+    child.once('error', (error) => finish({
+      status: null,
+      stdout: Buffer.concat(stdout).toString('utf8'),
+      stderr: Buffer.concat(stderr).toString('utf8'),
+      timedOut,
+      truncated,
+      error: error.message,
+    }))
+    child.once('close', (status) => finish({
+      status,
+      stdout: Buffer.concat(stdout).toString('utf8'),
+      stderr: Buffer.concat(stderr).toString('utf8'),
+      timedOut,
+      truncated,
+    }))
+    const timer = setTimeout(() => {
+      timedOut = true
+      try { child.kill('SIGKILL') } catch { /* already gone */ }
+    }, timeoutMs)
+    timer.unref?.()
+  })
+}
+
+/** Fixed-argv, read-only repository probe used by both local and remote project locations. */
+export async function inspectGitCheckout(input: {
+  path: string
+  environment?: { kind: 'wsl'; distro: string }
+}): Promise<RemoteGitInspection> {
+  const observedAt = new Date().toISOString()
+  const invoke = (args: string[]): Promise<BoundedProcessResult> => input.environment?.kind === 'wsl'
+    ? runBoundedProcess('wsl.exe', [
+        '--distribution', input.environment.distro, '--cd', input.path, '--exec',
+        '/usr/bin/env', 'GIT_OPTIONAL_LOCKS=0', 'GIT_TERMINAL_PROMPT=0', 'LC_ALL=C', 'git', ...args,
+      ])
+    : runBoundedProcess('git', ['-C', input.path, ...args])
+  const repository = await invoke(['rev-parse', '--is-inside-work-tree'])
+  if (repository.timedOut) {
+    return { status: 'unknown', gitAvailable: true, isRepository: false, complete: false, observedAt, error: 'Git repository probe timed out.' }
+  }
+  if (repository.error || repository.status === 127) {
+    return { status: 'unavailable', gitAvailable: false, isRepository: false, complete: true, observedAt, error: 'Git is unavailable in this environment.' }
+  }
+  if (repository.status !== 0 || repository.stdout.trim() !== 'true') {
+    return { status: 'not-repository', gitAvailable: true, isRepository: false, complete: true, observedAt }
+  }
+
+  const [head, ref, status] = await Promise.all([
+    invoke(['rev-parse', '--verify', 'HEAD']),
+    invoke(['symbolic-ref', '--quiet', '--short', 'HEAD']),
+    invoke(['status', '--porcelain=v1', '-z', '--untracked-files=normal']),
+  ])
+  const headCommit = head.status === 0 && /^[0-9a-f]{40,64}$/iu.test(head.stdout.trim())
+    ? head.stdout.trim().toLowerCase()
+    : undefined
+  const headRef = ref.status === 0 ? ref.stdout.trim().slice(0, 500) : undefined
+  if (status.timedOut || status.error || status.status !== 0) {
+    return {
+      status: 'unknown', gitAvailable: true, isRepository: true, complete: false,
+      ...(headCommit ? { headCommit } : {}),
+      ...(headRef ? { headRef } : {}),
+      detached: !headRef,
+      observedAt,
+      error: status.timedOut ? 'Git status timed out.' : 'Git status could not be read completely.',
+    }
+  }
+  const entries = status.stdout.split('\0').filter(Boolean)
+  let trackedChanges = 0
+  let untrackedFiles = 0
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index]!
+    if (entry.startsWith('??')) untrackedFiles += 1
+    else {
+      trackedChanges += 1
+      // Porcelain -z emits a second path field for a rename/copy. It is evidence for the same change.
+      if (/[RC]/u.test(entry.slice(0, 2))) index += 1
+    }
+  }
+  const dirty = trackedChanges + untrackedFiles > 0 || status.truncated
+  return {
+    status: dirty ? 'dirty' : 'ready',
+    gitAvailable: true,
+    isRepository: true,
+    complete: !status.truncated,
+    clean: !dirty,
+    detached: !headRef,
+    ...(headCommit ? { headCommit } : {}),
+    ...(headRef ? { headRef } : {}),
+    trackedChanges,
+    untrackedFiles,
+    observedAt,
+    ...(status.truncated ? { error: 'Git status exceeded the bounded output window; the checkout is dirty.' } : {}),
+  }
+}
+
 /** Target-side execution boundary. Disabled with zero roots until the operator configures it. */
 export class DeviceExecutor {
   private policy: DeviceExecutorPolicy = { enabled: false, roots: [] }
   private activeCommands = 0
+  /** Target-authoritative fence across every paired source hub for this physical root. */
+  private readonly activeCommandRoots = new Set<string>()
 
   constructor(private readonly file: string) {
     try {
@@ -423,8 +586,18 @@ export class DeviceExecutor {
     const needed = remoteCapabilityForAction(action)
     if (!root[needed]) return finish({ ok: false, error: `${needed} access is not enabled for this root.` })
     try {
+      if (this.activeCommandRoots.has(root.id) && ['mkdir', 'write', 'exec'].includes(action.op)) {
+        return finish({
+          ok: false,
+          error: 'This testbed root already has an active terminal command.',
+          failure: { stage: 'admission', code: 'ROOT_BUSY' },
+        })
+      }
       if (action.op === 'probe') return finish({ ok: true })
       if (action.op === 'inspect') return finish(await this.inspect(root))
+      if (action.op === 'git_inspect') {
+        return finish({ ok: true, git: await inspectGitCheckout({ path: root.path, environment: root.environment }) })
+      }
       if (action.op === 'list') return finish(this.list(root, action.path))
       if (action.op === 'read') return finish(this.read(root, action))
       if (action.op === 'mkdir') return finish(this.mkdir(root, action))
@@ -433,10 +606,12 @@ export class DeviceExecutor {
         return finish({ ok: false, error: `remote terminal concurrency limit (${MAX_CONCURRENT_COMMANDS}) reached` })
       }
       this.activeCommands += 1
+      this.activeCommandRoots.add(root.id)
       try {
         return finish(await this.exec(root, action))
       } finally {
         this.activeCommands -= 1
+        this.activeCommandRoots.delete(root.id)
       }
     } catch (error) {
       return finish({ ok: false, error: this.safeError(error, root.path) })
@@ -937,6 +1112,8 @@ export class RemoteDeviceController {
   async execute(siteId: string, action: RemoteDeviceAction, actor: RemoteDeviceActor): Promise<RemoteDeviceActionResult> {
     const timeout = action.op === 'exec'
       ? Math.min(Number(action.timeoutMs) || 30_000, MAX_COMMAND_TIMEOUT_MS) + 10_000
+      : action.op === 'git_inspect'
+        ? 25_000
       : 15_000
     const body = { action, actor }
     const directStarted = performance.now()

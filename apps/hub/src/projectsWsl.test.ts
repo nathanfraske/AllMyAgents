@@ -140,6 +140,23 @@ describe('ProjectStore WSL identity', () => {
 
     expect(repeated.id).toBe(first.id)
     expect(store.listReplicas(project.id)).toHaveLength(2)
+    expect(store.updateReplicaReadiness(project.id, first.id, {
+      status: 'dirty',
+      gitAvailable: true,
+      isRepository: true,
+      complete: true,
+      clean: false,
+      trackedChanges: 2,
+      untrackedFiles: 1,
+      checkedAt: '2026-08-08T12:00:00.000Z',
+      headCommit: 'a'.repeat(40),
+      headRef: 'main',
+    })).toMatchObject({
+      state: 'registered',
+      headCommit: 'a'.repeat(40),
+      headRef: 'main',
+      readiness: { status: 'dirty', trackedChanges: 2, untrackedFiles: 1 },
+    })
     expect(store.primaryReplica(project.id)?.kind).toBe('local')
     expect(() => store.removeReplica(project.id, store.primaryReplica(project.id)!.id)).toThrow('primary')
     expect(store.removeReplica(project.id, first.id)).toBe(true)
