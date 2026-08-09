@@ -5,6 +5,22 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.23-alpha.27 — 2026-08-09
+
+This release supersedes the gate-failed `v0.1.23-alpha.26` tag. It contains the complete alpha.26 feature set,
+prevents action-required approval/stall/failure mail from being stranded behind the high-context wake guard,
+and closes two Windows-only release-path races found by the exact-tag durability gate.
+
+[Full v0.1.23-alpha.27 release notes](docs/releases/v0.1.23-alpha.27.md)
+
+- Journal backup workers now use an explicit terminal-result acknowledgement. A verified snapshot and published
+  recovery generation can no longer be falsely reported as failed because Windows delivered child exit before
+  the final IPC message.
+- The Windows installed-launch gate retries an accepted-but-unexecuted Start Menu ShellExecute once only when no
+  AllMyAgents process and no desktop log exist. A real application/bootstrap failure is never retried or masked.
+- Windows P0 artifacts now retain shortcut resolution, installed-process/port state, and the current desktop log
+  even when health never arrives, so a failed clean-install launch remains diagnosable.
+
 ## v0.1.23-alpha.26 — 2026-08-09
 
 This release makes remote devices first-class project testbeds, adds deployable vendor-free fleet nodes, preserves

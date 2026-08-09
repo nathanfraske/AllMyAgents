@@ -98,6 +98,16 @@ export function createJournalSnapshotChildTask(journalPath: string): JournalSnap
         } else if (message?.type === 'journal-backup-progress') {
           options.onProgress?.(message.progress)
         } else if (message?.type === 'journal-backup-result') {
+          // A send callback in the worker does not mean this handler has run yet. Acknowledge the
+          // terminal frame before allowing the child to exit so Windows cannot deliver `exit` first
+          // and turn a successful, published snapshot into a false maintenance failure.
+          if (child.connected) {
+            try {
+              child.send({ type: 'journal-backup-result-ack' }, () => {})
+            } catch {
+              /* the result is already durable in this process; child teardown is best effort */
+            }
+          }
           finish(message.result)
         }
       })
