@@ -25,6 +25,46 @@ function harness(): { db: Database.Database; bus: AgentBus; from: SessionIdentit
 }
 
 describe('AgentBus external delivery receipts', () => {
+  it('pages a scoped team view by stable cursor without consuming or reading mail', () => {
+    const { bus, from } = harness()
+    const first = bus.post({
+      from,
+      project: 'project',
+      to: { kind: 'session', id: 'child-a' },
+      body: 'first',
+      recipients: ['child-a'],
+    })[0]!
+    const second = bus.post({
+      from: { ...from, sessionId: 'child-b', label: 'Child B' },
+      project: 'project',
+      to: { kind: 'session', id: 'manager' },
+      body: 'second',
+      recipients: ['manager'],
+    })[0]!
+    bus.post({
+      from,
+      project: 'other-project',
+      to: { kind: 'session', id: 'outsider' },
+      body: 'outside scope',
+      recipients: ['outsider'],
+    })
+
+    const page1 = bus.query({ visibleSessionIds: ['child-a', 'manager'], limit: 1 })
+    expect(page1).toMatchObject({ hasMore: true, items: [{ message: { id: first.id, body: 'first' } }] })
+    const page2 = bus.query({
+      visibleSessionIds: ['child-a', 'manager'],
+      fromSessionIds: ['child-b'],
+      afterCursor: page1.nextCursor,
+      unreadOnly: true,
+      limit: 10,
+    })
+    expect(page2).toMatchObject({ hasMore: false, items: [{ message: { id: second.id, body: 'second' } }] })
+    expect(bus.pending('child-a')).toHaveLength(1)
+    expect(bus.pending('manager')).toHaveLength(1)
+    expect(bus.get(first.id)?.readAt).toBeNull()
+    expect(bus.get(second.id)?.readAt).toBeNull()
+  })
+
   it('migrates legacy mail and durably records wake and hub-attention delivery intent', () => {
     const db = new Database(':memory:')
     databases.push(db)

@@ -5,6 +5,29 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.24-alpha.28 — 2026-08-10
+
+This release adds a provider-neutral durable job control plane for local and remote builds, tests, and other
+long-running work; one bounded manager/Overseer query across operational state; and the corresponding Claude and
+Codex operating contracts. It also includes every fix landed on `main` since alpha.27.
+
+[Full v0.1.24-alpha.28 release notes](docs/releases/v0.1.24-alpha.28.md)
+
+- `start_run`, `inspect_runs`, and `control_run` give managers and the Overseer stable run IDs, resource leases,
+  bounded cursor-paged logs, exact terminal state, source/environment provenance, remote telemetry, and explicit
+  `outcome_unknown` recovery instead of unsafe blind retries.
+- Independent checkouts, device roots, GPUs, ports, or fixtures can run concurrently; shared resource names
+  serialize work. The same scheduler can therefore portion a build/test matrix across granted remote devices.
+- `query_team` returns scoped, cursor-bounded messages, task boards, approvals, and durable runs without consuming
+  mail or reconstructing the entire journal. Managers remain limited to their hierarchy; the Overseer must select
+  sessions explicitly when the active catalog is large.
+- Existing Claude and Codex managers/Overseers receive the new methodology through versioned, idempotent
+  rematerialization without being woken into a reminder loop.
+- Manager task accounting now requires provider-native planning plus exact `assign_child_task` ownership and
+  reconciliation. Retired records remain archived instead of reappearing in the active catalog or counts.
+- Hub connection state now tolerates brief health/reconnect gaps without flickering every agent into error, and
+  periodic mesh upkeep no longer rewrites an already-correct exposure map every 30 seconds.
+
 ## v0.1.23-alpha.27 — 2026-08-09
 
 This release supersedes the gate-failed `v0.1.23-alpha.26` tag. It contains the complete alpha.26 feature set,

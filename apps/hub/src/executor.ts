@@ -253,6 +253,23 @@ export interface InProcessExecutorHubHooks {
       status?: 'pending' | 'in_progress' | 'completed' | 'abandoned'
     },
   ): { ok: boolean; taskId?: string; warning?: string; error?: string }
+  managerStartRun(
+    callerSessionId: string,
+    input: Parameters<NonNullable<AgentServices['startRun']>>[1],
+  ): ReturnType<NonNullable<AgentServices['startRun']>>
+  managerInspectRuns(
+    callerSessionId: string,
+    input: Parameters<NonNullable<AgentServices['inspectRuns']>>[1],
+  ): ReturnType<NonNullable<AgentServices['inspectRuns']>>
+  managerControlRun(
+    callerSessionId: string,
+    runId: string,
+    operation: 'cancel',
+  ): ReturnType<NonNullable<AgentServices['controlRun']>>
+  managerQueryTeam(
+    callerSessionId: string,
+    input: Parameters<NonNullable<AgentServices['queryTeam']>>[1],
+  ): ReturnType<NonNullable<AgentServices['queryTeam']>>
   browser(
     sessionId: string,
     operation: Parameters<AgentServices['browser']>[1],
@@ -337,6 +354,10 @@ export class InProcessExecutor implements Executor {
         this.h.managerDecideChildApproval(managerSessionId, approvalId, approve, remember),
       assignChildTask: (managerSessionId, childSessionId, input) =>
         this.h.managerAssignChildTask(managerSessionId, childSessionId, input),
+      startRun: (callerSessionId, input) => this.h.managerStartRun(callerSessionId, input),
+      inspectRuns: (callerSessionId, input) => this.h.managerInspectRuns(callerSessionId, input),
+      controlRun: (callerSessionId, runId, operation) => this.h.managerControlRun(callerSessionId, runId, operation),
+      queryTeam: (callerSessionId, input) => this.h.managerQueryTeam(callerSessionId, input),
       browser: (sessionId, operation, args) => this.h.browser(sessionId, operation, args),
       remoteDevices: (sessionId) => this.h.remoteDevices(sessionId),
       remoteExecute: (sessionId, siteId, action) => this.h.remoteExecute(sessionId, siteId, action),

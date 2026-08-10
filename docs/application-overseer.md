@@ -27,6 +27,10 @@ The Overseer control tool can:
 - explain accounts, projects, chats, managers, worktrees, presets, access, approvals, elevation, Browser,
   remote testbeds, history, hub status, journal maintenance, recovery, and its own authority boundary;
 - inspect projects, chats, profiles, pending approvals, saved team presets, and bounded failure evidence;
+- query bounded current messages, task boards, approvals, and durable runs across selected local agents without
+  consuming mail or scanning the full journal;
+- schedule resource-leased local or granted-remote builds/tests with stable ids, provenance, cursor-paged logs,
+  exact terminal state, and parallel placement across independent checkouts, device roots, GPUs, or fixtures;
 - create host or WSL projects, import GitHub repositories, and create projectless or project-bound chats;
 - run an interactive project-team setup, save the result as a durable preset, and materialize that preset
   as a real project manager plus visible direct-child chats with live ceilings;

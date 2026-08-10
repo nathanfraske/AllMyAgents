@@ -109,6 +109,26 @@ describe('SessionManager.isAutoApproved — full access is not a blanket yes', (
     expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(true)
   })
 
+  it('treats the provider-neutral durable-run gate as ordinary execution only on a direct Full Access turn', () => {
+    const { sessions, seed } = makeSessions()
+    seed({ permissionMode: 'full' })
+    markOperatorTurn(sessions, 's1')
+    expect(sessions.isAutoApproved('s1', 'allmyagents/run', {
+      toolName: 'start_run',
+      kind: 'test',
+      executable: 'npm',
+      args: ['test'],
+    })).toBe(true)
+
+    markBusTurn(sessions, 's1')
+    expect(sessions.isAutoApproved('s1', 'allmyagents/run', {
+      toolName: 'start_run',
+      kind: 'test',
+      executable: 'npm',
+      args: ['test'],
+    })).toBe(false)
+  })
+
   it('does NOT auto-approve a teammate-caused (bus) turn, even on a full-access chat', () => {
     const { sessions, seed } = makeSessions()
     seed({ permissionMode: 'full' })

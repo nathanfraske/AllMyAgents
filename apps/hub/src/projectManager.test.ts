@@ -17,6 +17,7 @@ import type { Profile, SessionRecord, SessionStatus } from './types.js'
 import { UsageMonitor } from './usage.js'
 import { WorkspaceManager } from './workspace.js'
 import { QuestionService } from './questions.js'
+import { DurableRunController, DurableRunStore } from './durableRuns.js'
 
 const cleanups: Array<() => void> = []
 
@@ -929,7 +930,7 @@ describe('project manager durable teams', () => {
 
     const status = sessions.managerChildStatus(manager.id)
 
-    expect(manager.managerTeamCapabilityVersion).toBe(3)
+    expect(manager.managerTeamCapabilityVersion).toBe(4)
     expect(child).toMatchObject({
       status: 'stopped',
       managerRetiredAt: retiredAt,
@@ -1264,6 +1265,92 @@ describe('operator-enabled worker one-shot sub-agents', () => {
 })
 
 describe('project manager visibility into its own workers', () => {
+  it('starts and inspects a resource-leased run only inside its managed project scope', async () => {
+    const { sessions, journal, projects, seed, repo } = buildHub()
+    const project = projects.create('Run project', repo)
+    const manager = seed({ id: 'manager', projectId: project.id, isProjectManager: true })
+    const child = seed({ id: 'child', projectId: project.id, parentSessionId: manager.id, role: 'Build verifier' })
+    const outsider = seed({ id: 'outsider', projectId: project.id, role: 'Unmanaged peer' })
+    const controller = new DurableRunController(
+      new DurableRunStore(journal.db),
+      journal,
+      path.join(path.dirname(repo), 'run-logs'),
+    )
+    sessions.setDurableRunController(controller)
+    controller.activate()
+    cleanups.push(() => controller.shutdown())
+
+    const result = await sessions.managerStartRun(manager.id, {
+      targetSessionId: child.id,
+      kind: 'test',
+      executable: process.execPath,
+      args: ['-e', 'console.log("managed run")'],
+    })
+    expect(result).toMatchObject({ ok: true, run: { targetSessionId: child.id } })
+    await vi.waitFor(() => {
+      expect(controller.store.get(result.run!.id)?.state).toBe('succeeded')
+    })
+    expect(sessions.managerInspectRuns(manager.id, { runId: result.run!.id })).toMatchObject({
+      ok: true,
+      runs: [expect.objectContaining({ state: 'succeeded', exitCode: 0 })],
+      logs: { stdout: expect.stringContaining('managed run') },
+    })
+    await expect(sessions.managerStartRun(manager.id, {
+      targetSessionId: outsider.id,
+      kind: 'test',
+      executable: process.execPath,
+      args: ['-e', 'process.exit(0)'],
+    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/outside your live managed scope/i) })
+  })
+
+  it('queries scoped messages and task projections without exposing another hierarchy', () => {
+    const { sessions, journal, bus, seed } = buildHub()
+    const manager = seed({ id: 'manager', projectId: 'project', isProjectManager: true })
+    const child = seed({ id: 'child', projectId: 'project', parentSessionId: manager.id, role: 'Build verifier' })
+    const outsider = seed({ id: 'outsider', projectId: 'other-project', isProjectManager: true })
+    bus.post({
+      from: { sessionId: child.id, profileId: child.profileId, provider: child.provider, projectId: child.projectId, label: 'Child' },
+      project: child.projectId!,
+      to: { kind: 'session', id: manager.id },
+      body: 'verification ready',
+      recipients: [manager.id],
+    })
+    bus.post({
+      from: { sessionId: outsider.id, profileId: outsider.profileId, provider: outsider.provider, projectId: outsider.projectId, label: 'Outsider' },
+      project: outsider.projectId!,
+      to: { kind: 'session', id: outsider.id },
+      body: 'outside hierarchy',
+      recipients: [outsider.id],
+    })
+    journal.append(child.id, 'manager/task-assigned', {
+      id: 'task-1',
+      title: 'Verify durable run output',
+      status: 'in_progress',
+      managerSessionId: manager.id,
+      managerLabel: 'Manager',
+      childSessionId: child.id,
+      assignedAt: new Date().toISOString(),
+    })
+
+    const result = sessions.managerQueryTeam(manager.id, {
+      entities: ['messages', 'tasks'],
+      sessionIds: [manager.id, child.id],
+      statuses: ['in_progress'],
+      limit: 20,
+    })
+    expect(result.ok).toBe(true)
+    expect(result.data).toMatchObject({
+      messages: [expect.objectContaining({ body: 'verification ready', fromSession: child.id })],
+      tasks: [expect.objectContaining({ sessionId: child.id, id: 'task-1', status: 'in_progress' })],
+      messageCursor: { hasMore: false },
+    })
+    expect(JSON.stringify(result.data)).not.toContain('outside hierarchy')
+    expect(sessions.managerQueryTeam(manager.id, { sessionIds: [outsider.id] })).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/outside your managed scope/i),
+    })
+  })
+
   it('fails closed when a manager requests deep data for another manager’s child', () => {
     const { sessions, seed } = buildHub()
     seed({ id: 'manager-a', isProjectManager: true, projectId: 'project' })

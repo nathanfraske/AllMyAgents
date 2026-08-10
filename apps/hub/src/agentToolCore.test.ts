@@ -86,6 +86,10 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
       'set_child_authority',
       'decide_child_approval',
       'assign_child_task',
+      'start_run',
+      'inspect_runs',
+      'control_run',
+      'query_team',
       'memory_write',
       'memory_search',
       'memory_read',
@@ -121,6 +125,83 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
       expect(typeof t.schema).toBe('object')
       expect(typeof t.run).toBe('function')
     }
+  })
+
+  it('self-gates a remote durable run and forwards the exact target after approval', async () => {
+    const h = makeHarness({ approve: true })
+    let received: Parameters<NonNullable<AgentServices['startRun']>>[1] | undefined
+    h.services.startRun = async (_callerSessionId, input) => {
+      received = input
+      return {
+        ok: true,
+        run: {
+          id: 'run-1',
+          projectId: 'p1',
+          sessionId: 's1',
+          actorSessionId: 's1',
+          actorLabel: 'alpha',
+          targetSessionId: 's1',
+          executionTarget: { kind: 'remote', siteId: 'site-a', rootId: 'root-a', command: 'npm test' },
+          kind: 'test',
+          state: 'queued',
+          executable: '(remote shell)',
+          args: [],
+          cwd: '.',
+          commandSummary: 'npm test',
+          commandSha256: 'hash',
+          resources: ['remote-root'],
+          provenance: {
+            version: 1,
+            capturedAt: new Date(0).toISOString(),
+            platform: 'win32',
+            architecture: 'x64',
+            cwd: '.',
+            commandSha256: 'hash',
+            environmentScope: 'source-hub',
+            environmentSha256: 'env-hash',
+            environmentKeys: [],
+            lockfiles: [],
+          },
+          createdAt: new Date(0).toISOString(),
+          timeoutMs: 1_000,
+          cancelRequested: false,
+          stdoutBytes: 0,
+          stderrBytes: 0,
+          logsTruncated: false,
+        },
+      }
+    }
+    const out = await runAgentTool('start_run', {
+      kind: 'test',
+      remote_device_id: 'site-a',
+      remote_root_id: 'root-a',
+      remote_command: 'npm test',
+      resources: ['gpu-0'],
+    }, { identity: idA, services: h.services })
+
+    expect(out).toContain('run-1')
+    expect(h.approvals).toMatchObject([{ kind: 'allmyagents/run', payload: { toolName: 'start_run' } }])
+    expect(received).toMatchObject({
+      kind: 'test',
+      resources: ['gpu-0'],
+      remote: { deviceId: 'site-a', rootId: 'root-a', command: 'npm test' },
+    })
+  })
+
+  it('does not let a teammate-caused turn launch a durable run', async () => {
+    const h = makeHarness({ isBusTurn: true, approve: true })
+    let called = false
+    h.services.startRun = async () => {
+      called = true
+      return { ok: false }
+    }
+    const out = await runAgentTool('start_run', {
+      kind: 'test',
+      executable: process.execPath,
+    }, { identity: idA, services: h.services })
+    expect(out).toMatch(/teammate-caused turn/i)
+    expect(called).toBe(false)
+    expect(h.approvals).toEqual([])
   })
 
   it('does not expose any tool that can grant or revoke the project-manager role', () => {

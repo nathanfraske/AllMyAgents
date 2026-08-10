@@ -117,13 +117,13 @@ describe('application Overseer authority', () => {
 
     expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
       isOverseer: true,
-      overseerCapabilityVersion: 13,
+      overseerCapabilityVersion: 14,
       permissionMode: 'full',
       permissionModeOperatorOverride: true,
       role: 'Application Overseer',
     })
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
-      'Overseer capability manifest version 13',
+      'Overseer capability manifest version 14',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'mcp__allmyagents__overseer_control',
@@ -154,9 +154,16 @@ describe('application Overseer authority', () => {
     expect(upgrades()).toHaveLength(1)
     expect(upgrades()[0]?.payload).toMatchObject({
       fromVersion: 6,
-      toVersion: 13,
+      toVersion: 14,
       conversationPreserved: true,
-      tools: expect.arrayContaining(['overseer_control', 'remote_exec', 'browser_navigate']),
+      tools: expect.arrayContaining([
+        'overseer_control',
+        'remote_exec',
+        'browser_navigate',
+        'start_run',
+        'inspect_runs',
+        'query_team',
+      ]),
     })
 
     h.sessions.reconcileStale()
