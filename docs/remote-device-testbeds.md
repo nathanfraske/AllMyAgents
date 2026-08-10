@@ -28,6 +28,11 @@ the mapped Site/HTTP route only as a compatibility fallback.
    Project preparation is available only when the root is attached to the chat's project. A folder transfer mirrors its
    directory tree with `remote_create_directory` before writing the contained files; empty directories
    are therefore preserved too.
+7. Project managers and the Overseer use `start_run` for important remote builds, tests, lints, benchmarks,
+   deploys, or other long-running commands. It uses the same explicit device/root grant but adds a generic
+   durable run id, source/environment provenance, retained cursor-paged logs, exact terminal state, and
+   resource leases. Independent roots or named resources can run concurrently; a shared root/GPU/port queues.
+   See [durable runs and scoped team queries](durable-runs-and-team-query.md).
 
 Revoking a chat grant takes effect on its next tool call. Disabling the target policy, deleting a root, or
 removing a root capability also fails closed immediately, even if a source chat still has an older grant.
@@ -98,8 +103,10 @@ agent on that hub is rejected at admission while the location is leased. Writes 
 also refused during that lease. The target executor independently allows only one terminal command per
 physical root and refuses mutations while it runs, so a second paired hub cannot bypass the live-process
 fence. Both fences are released on a normally observed result; owner restart reconciliation records
-interrupted leases. A crash-surviving process tree requires the later durable runner/job-object layer and is
-reported as an unknown outcome rather than assumed stopped.
+interrupted leases. The generic durable-run coordinator now owns stable handles, retained logs, resource
+scheduling, and stale-owner reconciliation for both local and remote work. Its process tree is still hub-owned
+rather than detached: a run whose owner disappears is reported as `outcome_unknown`, never assumed stopped or
+blindly retried.
 
 Project Overview can run a fixed-argument Git readiness probe against local or remote locations. Agents with
 an explicit read grant can use the same probe through `remote_inspect_git`. It records HEAD/ref and a bounded

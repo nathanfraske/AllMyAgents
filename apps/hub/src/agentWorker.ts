@@ -203,6 +203,22 @@ export function buildWorkerAgentServices(deps: WorkerAgentServiceDeps): AgentSer
         childSessionId,
         input,
       }) as Promise<{ ok: boolean; taskId?: string; warning?: string; error?: string }>,
+    startRun: (callerSessionId, input) =>
+      deps.relayRpc('manager.startRun', { callerSessionId, input }) as ReturnType<
+        NonNullable<AgentServices['startRun']>
+      >,
+    inspectRuns: (callerSessionId, input) =>
+      deps.relayRpc('manager.inspectRuns', { callerSessionId, input }) as ReturnType<
+        NonNullable<AgentServices['inspectRuns']>
+      >,
+    controlRun: (callerSessionId, runId, operation) =>
+      deps.relayRpc('manager.controlRun', { callerSessionId, runId, operation }) as ReturnType<
+        NonNullable<AgentServices['controlRun']>
+      >,
+    queryTeam: (callerSessionId, input) =>
+      deps.relayRpc('manager.queryTeam', { callerSessionId, input }) as ReturnType<
+        NonNullable<AgentServices['queryTeam']>
+      >,
     browser: (sessionId, operation, args) =>
       deps.relayRpc('browser.execute', { sessionId, operation, args }) as ReturnType<AgentServices['browser']>,
     remoteDevices: (sessionId) =>

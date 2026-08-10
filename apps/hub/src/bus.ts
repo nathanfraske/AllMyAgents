@@ -37,6 +37,11 @@ export interface BusMessage {
   readAt: string | null
 }
 
+export interface BusMessageCursorItem {
+  cursor: number
+  message: BusMessage
+}
+
 interface Row extends Omit<BusMessage, 'wake' | 'attentionRequired' | 'delivered' | 'readAt'> {
   wake: number
   attentionRequired: number
@@ -252,6 +257,43 @@ export class AgentBus {
   /** Recent messages addressed to a session (for the read_messages tool / UI). */
   inbox(sessionId: string, limit = 50): BusMessage[] {
     return (this.inboxStmt.all(sessionId, limit) as Row[]).map(hydrate)
+  }
+
+  /**
+   * Stable, non-destructive message page for manager/Overseer queries. Scope is supplied by
+   * SessionManager from authenticated lineage; callers never pass arbitrary SQL identities directly.
+   * SQLite rowid is append-only for this table and therefore forms a compact cursor independent of
+   * timestamp ties or UUID ordering. Reading this view never marks delivery/read state.
+   */
+  query(input: {
+    visibleSessionIds: string[]
+    fromSessionIds?: string[]
+    unreadOnly?: boolean
+    afterCursor?: number
+    limit?: number
+  }): { items: BusMessageCursorItem[]; nextCursor: number; hasMore: boolean } {
+    const visible = [...new Set(input.visibleSessionIds.filter(Boolean))]
+    if (!visible.length) return { items: [], nextCursor: Math.max(0, Math.trunc(input.afterCursor ?? 0)), hasMore: false }
+    const where = [`toSession IN (${visible.map(() => '?').join(',')})`, 'rowid > ?']
+    const params: unknown[] = [...visible, Math.max(0, Math.trunc(input.afterCursor ?? 0))]
+    const from = [...new Set((input.fromSessionIds ?? []).filter(Boolean))]
+    if (from.length) {
+      where.push(`fromSession IN (${from.map(() => '?').join(',')})`)
+      params.push(...from)
+    }
+    if (input.unreadOnly === true) where.push('readAt IS NULL')
+    const limit = Math.max(1, Math.min(Math.trunc(input.limit ?? 50), 200))
+    params.push(limit + 1)
+    const rows = this.db
+      .prepare(`SELECT rowid AS cursor, * FROM bus_messages WHERE ${where.join(' AND ')} ORDER BY rowid ASC LIMIT ?`)
+      .all(...params) as Array<Row & { cursor: number }>
+    const hasMore = rows.length > limit
+    const page = hasMore ? rows.slice(0, limit) : rows
+    return {
+      items: page.map(({ cursor, ...row }) => ({ cursor, message: hydrate(row) })),
+      nextCursor: page.at(-1)?.cursor ?? Math.max(0, Math.trunc(input.afterCursor ?? 0)),
+      hasMore,
+    }
   }
 
   markDelivered(ids: string[]): void {

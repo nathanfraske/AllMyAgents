@@ -20,6 +20,7 @@ import {
 import { ProjectStore } from './projects.js'
 import { TestbedRunStore } from './testbedRuns.js'
 import { TestbedReservationStore } from './testbedReservations.js'
+import { DurableRunController, DurableRunStore } from './durableRuns.js'
 import { profileAuthEvidence, scanProfiles, setClaudeConnectorPolicy } from './profiles.js'
 import { ProfileOwnership } from './profileOwnership.js'
 import { ProfileRuntime } from './profileRuntime.js'
@@ -418,6 +419,11 @@ const workspace = new WorkspaceManager(path.join(dataDir, 'worktrees'), path.joi
 const projects = new ProjectStore(journal.db, journal)
 const testbedRuns = new TestbedRunStore(journal.db)
 const testbedReservations = new TestbedReservationStore(journal.db)
+const durableRuns = new DurableRunController(
+  new DurableRunStore(journal.db),
+  journal,
+  path.join(dataDir, 'runs'),
+)
 const instructions = new InstructionStore(journal.db)
 const bus = new AgentBus(journal.db)
 const memory = new MemoryStore(journal.db)
@@ -528,6 +534,7 @@ const executor: Executor = workerSocket
 sessions = new SessionManager(journal, store, profileMap, approvals, usage, workspace, projects, instructions, bus, memory, practices, danger, autoMemoryRecall, dataDir, questions, executor, prefs, browserBroker, notifications)
 sessions.setTestbedRunStore(testbedRuns)
 sessions.setTestbedReservationStore(testbedReservations)
+sessions.setDurableRunController(durableRuns)
 const profileLoginCoordinator = new ProfileLoginCoordinator({
   profilesDir,
   registry: new ProfileLoginRegistry(path.join(dataDir, 'profile-logins.json')),
