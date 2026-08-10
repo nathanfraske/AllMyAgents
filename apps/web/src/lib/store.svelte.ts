@@ -667,6 +667,15 @@ export class HubStore {
   }
 
   private ws: WebSocket | null = null
+  /**
+   * There may be a short overlap between sockets while a generation reset replaces the transport.
+   * Keep exactly one retry timer and let only the currently-owned socket mutate global connection
+   * state. Without that ownership fence, the old socket's delayed `close` event could arrive after the
+   * replacement had opened, flip the green Hub indicator back to Reconnecting, and start yet another
+   * socket. Repeated maintenance generations then turned that race into visible status flicker and
+   * duplicate streams.
+   */
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
 
   get sessionList(): SessionView[] {
     // Drafts are local-only until they materialize — keep them out of the sidebar + dashboard.
@@ -2230,6 +2239,7 @@ export class HubStore {
   }
 
   private markConnected(): void {
+    this.cancelReconnectTimer()
     this.connected = true
     this.everConnected = true
     this.hubConnectionPhase = 'connected'
@@ -2249,28 +2259,66 @@ export class HubStore {
     this.startHubWaitClock()
   }
 
+  private cancelReconnectTimer(): void {
+    if (!this.reconnectTimer) return
+    clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = null
+  }
+
+  private scheduleReconnect(): void {
+    if (this.baselineRefreshing || this.reconnectTimer) return
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      this.reconnect()
+    }, 1500)
+  }
+
+  /** Make `next` the sole connection-state owner before retiring its predecessor. */
+  private installSocket(next: WebSocket): void {
+    this.cancelReconnectTimer()
+    const previous = this.ws
+    this.ws = next
+    if (previous && previous !== next && previous.readyState < 2) {
+      try {
+        previous.close(1000, 'superseded')
+      } catch {
+        // The replacement already owns state; a concurrently-closing predecessor is harmless.
+      }
+    }
+  }
+
   private connect(): void {
     vlog(`ws: connecting (bounded tail from seq ${this.lastSeq}, generation ${this.replayGeneration})`)
     this.beginReplayPresentation()
     const ws = new WebSocket(this.wsUrl(this.lastSeq, this.replayGeneration))
-    this.ws = ws
+    this.installSocket(ws)
     ws.onopen = () => {
+      if (this.ws !== ws) {
+        try { ws.close(1000, 'superseded') } catch { /* already terminal */ }
+        return
+      }
       vlog('ws: open')
       this.markConnected()
       if (this.replayPresentationActive) this.scheduleReplayIdleFallback()
     }
     ws.onmessage = (e) => {
+      if (this.ws !== ws) return
       try {
         this.ingest(JSON.parse(e.data as string) as HubStreamMessage)
       } catch {
         ws.close()
       }
     }
-    ws.onclose = () => {
+    ws.onclose = (event) => {
+      if (this.ws !== ws) {
+        vlog(`ws: ignored stale close (${event.code}${event.reason ? ` ${event.reason}` : ''})`)
+        return
+      }
+      this.ws = null
       vlog('ws: closed — reconnecting in 1.5s')
       this.finishReplayPresentation()
       this.markDisconnected()
-      if (!this.baselineRefreshing) setTimeout(() => this.reconnect(), 1500)
+      this.scheduleReconnect()
     }
   }
 
@@ -2359,7 +2407,7 @@ export class HubStore {
         if (ready) this.connect()
         else {
           this.replayGeneration = 0
-          setTimeout(() => this.reconnect(), 1500)
+          this.scheduleReconnect()
         }
       })
       return
@@ -2522,7 +2570,7 @@ export class HubStore {
         if (ready) this.connect()
         else {
           this.replayGeneration = 0
-          setTimeout(() => this.reconnect(), 1500)
+          this.scheduleReconnect()
         }
       })
       return
@@ -2530,25 +2578,35 @@ export class HubStore {
     vlog(`ws: reconnecting (replay from seq ${this.lastSeq})`)
     this.beginReplayPresentation()
     const ws = new WebSocket(this.wsUrl(this.lastSeq, this.replayGeneration))
-    this.ws = ws
+    this.installSocket(ws)
     ws.onopen = () => {
+      if (this.ws !== ws) {
+        try { ws.close(1000, 'superseded') } catch { /* already terminal */ }
+        return
+      }
       vlog('ws: reopened')
       this.markConnected()
       if (this.replayPresentationActive) this.scheduleReplayIdleFallback()
     }
     ws.onmessage = (e) => {
+      if (this.ws !== ws) return
       try {
         this.ingest(JSON.parse(e.data as string) as HubStreamMessage)
       } catch {
         ws.close()
       }
     }
-    ws.onclose = () => {
+    ws.onclose = (event) => {
+      if (this.ws !== ws) {
+        vlog(`ws: ignored stale close (${event.code}${event.reason ? ` ${event.reason}` : ''})`)
+        return
+      }
+      this.ws = null
       this.finishReplayPresentation()
       this.markDisconnected()
       this.stagedTail = null
       this.stagedTailBytes = 0
-      if (!this.baselineRefreshing) setTimeout(() => this.reconnect(), 1500)
+      this.scheduleReconnect()
     }
   }
 

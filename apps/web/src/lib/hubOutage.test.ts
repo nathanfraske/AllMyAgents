@@ -15,12 +15,58 @@ function priv(store: HubStore): { markConnected: () => void; markDisconnected: (
   return store as unknown as { markConnected: () => void; markDisconnected: () => void }
 }
 
+interface SocketHarness {
+  replayGeneration: number
+  connect(): void
+}
+
+class DeferredCloseWebSocket {
+  static readonly CONNECTING = 0
+  static readonly OPEN = 1
+  static readonly CLOSING = 2
+  static readonly CLOSED = 3
+
+  readonly url: string
+  readyState = DeferredCloseWebSocket.CONNECTING
+  onopen: ((event: Event) => void) | null = null
+  onmessage: ((event: MessageEvent) => void) | null = null
+  onclose: ((event: CloseEvent) => void) | null = null
+  private closeCode = 1000
+  private closeReason = ''
+
+  constructor(url: string | URL) {
+    this.url = String(url)
+    sockets.push(this)
+  }
+
+  open(): void {
+    this.readyState = DeferredCloseWebSocket.OPEN
+    this.onopen?.(new Event('open'))
+  }
+
+  close(code = 1000, reason = ''): void {
+    this.readyState = DeferredCloseWebSocket.CLOSING
+    this.closeCode = code
+    this.closeReason = reason
+  }
+
+  /** Deliberately separate from close(): browsers deliver this event asynchronously. */
+  emitClose(): void {
+    this.readyState = DeferredCloseWebSocket.CLOSED
+    this.onclose?.({ code: this.closeCode, reason: this.closeReason } as CloseEvent)
+  }
+}
+
+let sockets: DeferredCloseWebSocket[] = []
+
 let store: HubStore
 beforeEach(() => {
   vi.useFakeTimers()
+  sockets = []
   store = new HubStore()
 })
 afterEach(() => {
+  vi.unstubAllGlobals()
   vi.useRealTimers()
 })
 
@@ -95,5 +141,34 @@ describe('hub outage clock', () => {
     priv(store).markDisconnected()
     vi.advanceTimersByTime(4_000)
     expect(store.hubDownSeconds).toBeGreaterThanOrEqual(4)
+  })
+
+  it('ignores a superseded socket close and schedules only one reconnect for the owner', () => {
+    vi.stubGlobal('WebSocket', DeferredCloseWebSocket)
+    const transport = store as unknown as SocketHarness
+    transport.replayGeneration = 1
+
+    transport.connect()
+    const first = sockets[0] as DeferredCloseWebSocket
+    first.open()
+    expect(store.hubConnectionPhase).toBe('connected')
+
+    // A baseline/generation replacement can open before the browser delivers the old close event.
+    transport.connect()
+    const replacement = sockets[1] as DeferredCloseWebSocket
+    replacement.open()
+    first.emitClose()
+
+    expect(store.connected).toBe(true)
+    expect(store.hubConnectionPhase).toBe('connected')
+    vi.advanceTimersByTime(1_500)
+    expect(sockets).toHaveLength(2)
+
+    // Even a duplicate terminal callback from the current socket cannot arm two retry loops.
+    replacement.emitClose()
+    replacement.emitClose()
+    expect(store.hubConnectionPhase).toBe('reconnecting')
+    vi.advanceTimersByTime(1_500)
+    expect(sockets).toHaveLength(3)
   })
 })
