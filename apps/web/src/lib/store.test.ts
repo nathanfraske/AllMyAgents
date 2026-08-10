@@ -595,7 +595,7 @@ describe('apply()', () => {
       seq: 2,
       kind: 'manager/child-retirement-migrated',
       sessionId: 'manager',
-      payload: { childSessionId: 'child' },
+      payload: { managerSessionId: 'manager', childSessionId: 'child' },
     }))
 
     expect(store.sessions.child?.record).toMatchObject({
@@ -605,6 +605,56 @@ describe('apply()', () => {
     expect(store.sessions.child?.record.managerRetiredAt).toBeUndefined()
     expect(store.sessions.child?.record.managerRetiredBySessionId).toBeUndefined()
     expect(store.sessions.child?.record.managerRetiredReason).toBeUndefined()
+  })
+
+  it('keeps a capability-v3 archive authoritative over lazy v2 migration history', () => {
+    seed('manager', { isProjectManager: true, managerTeamCapabilityVersion: 3 })
+    seed('child', {
+      parentSessionId: 'manager',
+      status: 'stopped',
+      managerRetiredAt: '2026-01-01T00:00:00.000Z',
+      managerRetiredBySessionId: 'manager',
+      managerRetiredReason: 'historical completed assignment',
+    })
+
+    apply(evt({
+      seq: 1,
+      kind: 'manager/child-retirement-migrated',
+      sessionId: 'manager',
+      payload: { managerSessionId: 'manager', childSessionId: 'child' },
+    }))
+
+    expect(store.sessions.child?.record).toMatchObject({
+      status: 'stopped',
+      managerRetiredAt: '2026-01-01T00:00:00.000Z',
+      managerRetiredBySessionId: 'manager',
+      managerRetiredReason: 'historical completed assignment',
+    })
+  })
+
+  it('applies the v3 corrective re-archive event immediately', () => {
+    seed('manager', { isProjectManager: true, managerTeamCapabilityVersion: 2 })
+    seed('child', { parentSessionId: 'manager', status: 'idle' })
+
+    apply(evt({
+      seq: 1,
+      kind: 'manager/child-retirement-rearchived',
+      sessionId: 'manager',
+      payload: {
+        managerSessionId: 'manager',
+        childSessionId: 'child',
+        retiredAt: '2026-01-01T00:00:00.000Z',
+        retiredBySessionId: 'manager',
+        reason: 'historical completed assignment',
+      },
+    }))
+
+    expect(store.sessions.child?.record).toMatchObject({
+      status: 'stopped',
+      managerRetiredAt: '2026-01-01T00:00:00.000Z',
+      managerRetiredBySessionId: 'manager',
+      managerRetiredReason: 'historical completed assignment',
+    })
   })
 
   it('does not let lazy historical retirement events roll a capability-v2 roster backward', () => {

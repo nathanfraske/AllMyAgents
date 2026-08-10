@@ -717,7 +717,7 @@ describe('project manager lifecycle awareness', () => {
 
     const result = sessions.managerChildStatus('manager')
     expect(result.ok).toBe(true)
-    expect(result.summary).toContain('Durable children: 2 running, 1 idle, 1 stopped, 1 errored. New retirement is disabled.')
+    expect(result.summary).toContain('Durable children: 2 running, 1 idle, 1 stopped, 1 errored. 0 archived record(s) excluded from roster and capacity. New retirement is disabled.')
     expect(result.summary).toContain('(starting): starting')
     expect(result.summary).toContain('(active): active')
     expect(result.summary).not.toContain('grandchild')
@@ -853,7 +853,7 @@ describe('project manager durable teams', () => {
     await new Promise<void>((resolve) => setImmediate(resolve))
   })
 
-  it('migrates a legacy retired child into the durable roster and reopens it with its team', async () => {
+  it('keeps a legacy retired child archived while upgrading its durable role and team', async () => {
     const { sessions, journal, seed } = buildHub()
     const manager = seed({ id: 'manager', projectId: 'project' })
     sessions.configureProjectManager(manager.id, { enabled: true, allowedProfiles: ['p1'] }, 'operator')
@@ -875,13 +875,14 @@ describe('project manager durable teams', () => {
 
     const status = sessions.managerChildStatus(manager.id)
 
-    expect(status.summary).toMatch(/retired-child.*role: General project contributor for Preserved team/is)
-    expect(retired.managerRetiredAt).toBeUndefined()
+    expect(status.summary).toMatch(/1 archived record\(s\) excluded from roster and capacity/i)
+    expect(status.summary).not.toContain('retired-child')
+    expect(retired.managerRetiredAt).toBeTruthy()
     expect(retired.role).toMatch(/General project contributor for Preserved team/)
     expect(journal.recentEventsForSession(retired.id)).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: 'manager/child-role-upgraded' }),
-      expect.objectContaining({ kind: 'manager/child-retirement-migrated' }),
     ]))
+    expect(journal.recentEventsForSession(retired.id).some((event) => event.kind === 'manager/child-retirement-migrated')).toBe(false)
 
     const activated = await manageTeam(sessions, manager.id, {
       operation: 'activate',
@@ -891,9 +892,85 @@ describe('project manager durable teams', () => {
     expect(activated.ok).toBe(true)
     expect(manager.managerActiveTeamId).toBe(preservedTeam.id)
     expect(manager.managerTeams?.find((team) => team.id === firstTeam.id)?.stashedAt).toBeTruthy()
-    expect(retired.status).toBe('idle')
-    expect(retired.managerRetiredAt).toBeUndefined()
+    expect(retired.status).toBe('stopped')
+    expect(retired.managerRetiredAt).toBeTruthy()
     await new Promise<void>((resolve) => setImmediate(resolve))
+  })
+
+  it('re-archives untouched records that capability v2 accidentally restored', () => {
+    const { sessions, journal, seed } = buildHub()
+    const manager = seed({ id: 'manager', projectId: 'project' })
+    sessions.configureProjectManager(manager.id, { enabled: true, allowedProfiles: ['p1'] }, 'operator')
+    manager.managerTeamCapabilityVersion = 2
+    const team = manager.managerTeams![0]!
+    const child = seed({
+      id: 'v2-restored-child',
+      title: 'Archived Corbato',
+      parentSessionId: manager.id,
+      managerTeamId: team.id,
+      managerTeamName: team.name,
+      projectId: 'project',
+      status: 'stopped',
+      role: 'Historical verifier',
+    })
+    const retiredAt = '2026-08-01T12:00:00.000Z'
+    journal.append(child.id, 'manager/child-retired', {
+      managerSessionId: manager.id,
+      childSessionId: child.id,
+      retiredAt,
+      reason: 'legacy completed assignment',
+    })
+    journal.append(child.id, 'manager/child-retirement-migrated', {
+      managerSessionId: manager.id,
+      childSessionId: child.id,
+      priorRetiredAt: retiredAt,
+      status: 'stopped',
+    })
+
+    const status = sessions.managerChildStatus(manager.id)
+
+    expect(manager.managerTeamCapabilityVersion).toBe(3)
+    expect(child).toMatchObject({
+      status: 'stopped',
+      managerRetiredAt: retiredAt,
+      managerRetiredBySessionId: manager.id,
+      managerRetiredReason: 'legacy completed assignment',
+    })
+    expect(status.summary).toMatch(/0 running, 0 idle, 0 stopped, 0 errored.*1 archived record/is)
+    expect(status.summary).not.toContain('Archived Corbato')
+    expect(journal.latestEventForSessionKind(child.id, 'manager/child-retirement-rearchived')).toMatchObject({
+      payload: expect.objectContaining({ childSessionId: child.id, retiredAt }),
+    })
+    expect(sessions.managerAssignChildTask(manager.id, child.id, { title: 'Should not dispatch' }))
+      .toMatchObject({ ok: false, error: expect.stringMatching(/archived record.*restore/i) })
+  })
+
+  it('does not re-archive a capability-v2 record used after the bad migration', () => {
+    const { sessions, journal, seed } = buildHub()
+    const manager = seed({ id: 'manager', projectId: 'project' })
+    sessions.configureProjectManager(manager.id, { enabled: true, allowedProfiles: ['p1'] }, 'operator')
+    manager.managerTeamCapabilityVersion = 2
+    const team = manager.managerTeams![0]!
+    const child = seed({
+      id: 'used-after-v2',
+      parentSessionId: manager.id,
+      managerTeamId: team.id,
+      managerTeamName: team.name,
+      projectId: 'project',
+      status: 'stopped',
+      role: 'Actively restored verifier',
+    })
+    journal.append(child.id, 'manager/child-retirement-migrated', {
+      managerSessionId: manager.id,
+      childSessionId: child.id,
+      priorRetiredAt: '2026-08-01T12:00:00.000Z',
+    })
+    journal.append(child.id, 'session/status', { status: 'idle' })
+
+    sessions.managerChildStatus(manager.id)
+
+    expect(child.managerRetiredAt).toBeUndefined()
+    expect(journal.latestEventForSessionKind(child.id, 'manager/child-retirement-rearchived')).toBeUndefined()
   })
 
   it('rejects a parallel mutation while an activation is awaiting the outgoing stop', async () => {
@@ -964,6 +1041,17 @@ describe('project manager durable live roster', () => {
       worktree: repo,
       branch: 'agent/reviewer',
     })
+    seed({
+      id: 'archived-child',
+      title: 'Archived Shannon',
+      parentSessionId: 'manager',
+      managerTeamId: manager.managerActiveTeamId,
+      managerTeamName: manager.managerTeams?.[0]?.name,
+      projectId: 'project',
+      status: 'stopped',
+      role: 'Historical parser worker',
+      managerRetiredAt: '2026-08-01T12:00:00.000Z',
+    })
     fs.writeFileSync(path.join(repo, 'owned-parser.ts'), 'export const owned = true\n')
     journal.append(child.id, 'session/steered', {
       source: 'operator',
@@ -992,6 +1080,8 @@ describe('project manager durable live roster', () => {
     expect(instructions).toContain('Before every progress or completion report')
     expect(instructions).toMatch(/operator configured this manager’s team and permission bounds/i)
     expect(instructions).toContain('Hopper')
+    expect(instructions).toContain('1 archived record(s) are excluded')
+    expect(instructions).not.toContain('Archived Shannon')
     expect(instructions).toContain('reviewer-child')
     expect(instructions).toContain('durable role: Reviewer')
     expect(instructions).toContain('p1 / claude-sonnet')
@@ -1008,6 +1098,8 @@ describe('project manager durable live roster', () => {
     expect(runtime).toContain('create or update your own provider-native task/plan entry')
     expect(runtime).toContain('runningWithoutReportedTasks')
     expect(runtime).toContain('reviewer-child')
+    expect(runtime).toContain('"archivedRecords":1')
+    expect(runtime).not.toContain('Archived Shannon')
   })
 
   it('injects the current task contract into prior-created managers and workers without self-waking', async () => {

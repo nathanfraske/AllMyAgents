@@ -3005,7 +3005,6 @@ export class HubStore {
       }
       case 'manager/child-retirement-cleared':
       case 'manager/child-reactivated':
-      case 'manager/child-retirement-migrated':
       case 'manager/child-resumed': {
         const p = payload as { childSessionId?: string }
         const child = p.childSessionId ? this.sessions[p.childSessionId] : undefined
@@ -3013,16 +3012,45 @@ export class HubStore {
           child.record.managerRetiredAt = undefined
           child.record.managerRetiredBySessionId = undefined
           child.record.managerRetiredReason = undefined
-          if (kind === 'manager/child-retirement-migrated') child.record.status = 'stopped'
           if (kind === 'manager/child-resumed') child.record.status = 'idle'
         }
         this.push(view, {
           kind: 'note',
           ts,
-          text: kind === 'manager/child-retirement-migrated'
-            ? 'legacy retired child restored to the durable roster'
-            : 'stopped child resumed with its preserved identity and workspace',
+          text: 'stopped child resumed with its preserved identity and workspace',
         })
+        break
+      }
+      case 'manager/child-retirement-migrated': {
+        const p = payload as { managerSessionId?: string; childSessionId?: string }
+        const child = p.childSessionId ? this.sessions[p.childSessionId] : undefined
+        const manager = p.managerSessionId ? this.sessions[p.managerSessionId] : undefined
+        // Capability v3 corrected v2's accidental archive resurrection. An old lazy-history migration
+        // row may still render as a timeline note, but it must never clear the current archived marker.
+        if (child && (manager?.record.managerTeamCapabilityVersion ?? 0) === 2) {
+          child.record.managerRetiredAt = undefined
+          child.record.managerRetiredBySessionId = undefined
+          child.record.managerRetiredReason = undefined
+          child.record.status = 'stopped'
+        }
+        this.push(view, { kind: 'note', ts, text: 'legacy retirement migration recorded by an older hub version' })
+        break
+      }
+      case 'manager/child-retirement-rearchived': {
+        const p = payload as {
+          childSessionId?: string
+          retiredAt?: string
+          retiredBySessionId?: string
+          reason?: string
+        }
+        const child = p.childSessionId ? this.sessions[p.childSessionId] : undefined
+        if (child && p.retiredAt) {
+          child.record.managerRetiredAt = p.retiredAt
+          child.record.managerRetiredBySessionId = p.retiredBySessionId
+          child.record.managerRetiredReason = p.reason
+          child.record.status = 'stopped'
+        }
+        this.push(view, { kind: 'note', ts, text: 'historical retired record returned to the archive' })
         break
       }
       case 'manager/child-role-upgraded':

@@ -167,7 +167,7 @@ import {
 /** Bump whenever an existing Overseer conversation must receive a new app/tool operating contract. */
 export const OVERSEER_CAPABILITY_VERSION = 13
 /** Bump when existing manager conversations need a rematerialized team-management contract. */
-export const MANAGER_TEAM_CAPABILITY_VERSION = 2
+export const MANAGER_TEAM_CAPABILITY_VERSION = 3
 const MAX_MANAGER_TEAMS = 32
 const RUNTIME_TOPOLOGY_RECENT_MS = 7 * 24 * 60 * 60 * 1000
 const RUNTIME_TOPOLOGY_AGENT_LIMIT = 48
@@ -1381,7 +1381,8 @@ export class SessionManager {
     }
 
     if (record.isProjectManager === true) {
-      const children = this.managerChildren(record.id).sort(ordered)
+      const managed = this.managerChildren(record.id).sort(ordered)
+      const children = managed.filter((candidate) => !candidate.managerRetiredAt)
       const agents = children.slice(0, RUNTIME_TOPOLOGY_AGENT_LIMIT)
       const activeDirectWorkers = children.filter((candidate) =>
         candidate.parentSessionId === record.id &&
@@ -1424,6 +1425,7 @@ export class SessionManager {
       })
       return frame(`manager ${record.id}: all teams and up to ${RUNTIME_TOPOLOGY_AGENT_LIMIT} managed descendants`, {
         activeTeamId: record.managerActiveTeamId ?? null,
+        archivedRecords: managed.length - children.length,
         staffing: {
           targetUsefulParallelWorkers: parallelismTarget,
           runningDirectWorkers,
@@ -1454,6 +1456,7 @@ export class SessionManager {
       const siblings = allSessions
         .filter((candidate) =>
           this.managerManagedAgent(manager.id, candidate.id) !== undefined &&
+          !candidate.managerRetiredAt &&
           candidate.managerTeamId === record.managerTeamId,
         )
         .sort(ordered)
@@ -4625,7 +4628,7 @@ export class SessionManager {
       '## LIVE MANAGED-AGENT ROSTER (hub-generated for this turn)',
       '',
       'This is a fresh hub snapshot, not conversation memory. Unknown means unknown; do not infer idle from silence.',
-      `Durable roster: ${counts.running} running, ${counts.idle} idle, ${counts.stopped} stopped, ${counts.errored} errored.${retiredChildren.length ? ` ${retiredChildren.length} legacy retired record(s) still need restoration.` : ''}`,
+      `Durable roster: ${counts.running} running, ${counts.idle} idle, ${counts.stopped} stopped, ${counts.errored} errored.${retiredChildren.length ? ` ${retiredChildren.length} archived record(s) are excluded from this roster, team counts, and capacity; do not restore them automatically.` : ''}`,
       `Parallel staffing target: ${parallelismTarget} useful direct worker lanes; active team currently has ${runningDirectWorkers} running and ${activeDirectWorkers.filter((child) => child.status === 'idle').length} idle direct workers, with ${Math.max(0, (manager?.managerMaxLiveChildren ?? 4) - liveSlotWorkers)} live-child slots available. ${runningDirectWorkers < parallelismTarget ? 'Below target: reuse idle workers or spawn independent implementation/reproduction/research/cross-check lanes when useful; otherwise explain the concrete dependency that keeps this task narrower.' : 'Target is currently met; do not invent or duplicate work.'}`,
       `Task accountability: your manager board reports ${managerTaskSummary.total} task(s) (${managerTaskSummary.active} in progress, ${managerTaskSummary.pending} pending, ${managerTaskSummary.done} done); ${activeTeamTaskFacts.filter(({ summary }) => summary.total > 0).length}/${activeTeamAgents.length} active-team agents have reported tasks. Running without a reported task: ${runningWithoutTasks.join(', ') || 'none'}. Idle with no reported task history: ${idleWithoutTasks.join(', ') || 'none'}. Before every progress/completion report, reconcile every assignment and name each owner, state, blocker, and material result; never treat "no tasks reported" as proof that no work exists.`,
       `Teams: ${teams.length}; active: ${teams.find((team) => team.id === manager?.managerActiveTeamId)?.name ?? 'unknown'}. Use manage_team to list exact stable ids or switch teams safely.`,
@@ -4684,22 +4687,6 @@ export class SessionManager {
           .slice(MANAGER_ROSTER_DETAIL_LIMIT)
           .map((child) => `- ${this.rosterLine(child.title ?? identityOf(child).label)} (${child.id}): ${child.status}`),
       )
-    }
-    if (retiredChildren.length) {
-      lines.push(
-        '',
-        `Legacy retired records (${retiredChildren.length}; restore with manage_child resume — new retirement is disabled):`,
-        ...retiredChildren
-          .slice(0, MANAGER_ROSTER_DETAIL_LIMIT)
-          .map((child) =>
-            `- ${this.rosterLine(child.title ?? identityOf(child).label)} (${child.id}): retired at ${child.managerRetiredAt}` +
-            `${child.managerTeamName ? `; team ${this.rosterLine(child.managerTeamName)}` : ''}` +
-            `${child.managerRetiredReason ? `; reason ${this.rosterLine(child.managerRetiredReason, 300)}` : ''}`
-          ),
-      )
-      if (retiredChildren.length > MANAGER_ROSTER_DETAIL_LIMIT) {
-        lines.push(`- ${retiredChildren.length - MANAGER_ROSTER_DETAIL_LIMIT} more legacy record(s); use child_status for the complete index.`)
-      }
     }
     return lines.join('\n').slice(0, MANAGER_ROSTER_MAX_CHARS)
   }
@@ -7864,6 +7851,37 @@ export class SessionManager {
   }
 
   /**
+   * Capability v2 accidentally converted every archived legacy child into a stopped roster member. Undo
+   * that migration only when its migration row is still the child's newest event: any later event means
+   * the operator or manager actually interacted with the restored chat, so v3 leaves it alone rather than
+   * guessing. Both lookups use the per-session journal side index and stay proportional to one chat.
+   */
+  private legacyRetirementToRearchive(child: SessionRecord): {
+    retiredAt: string
+    retiredBySessionId?: string
+    reason?: string
+  } | undefined {
+    if (child.managerRetiredAt || child.status !== 'stopped') return undefined
+    const last = this.journal.lastEventForSession(child.id)
+    if (!last || last.kind !== 'manager/child-retirement-migrated') return undefined
+    const migration = this.journal.latestEventForSessionKind(child.id, 'manager/child-retirement-migrated')
+    if (!migration || last.seq !== migration.seq) return undefined
+    const payload = migration.payload as { priorRetiredAt?: unknown; managerSessionId?: unknown }
+    if (typeof payload.priorRetiredAt !== 'string' || !payload.priorRetiredAt) return undefined
+    const original = this.journal.latestEventForSessionKind(child.id, 'manager/child-retired')
+    const originalPayload = original?.payload as { retiredAt?: unknown; reason?: unknown; managerSessionId?: unknown } | undefined
+    return {
+      retiredAt: payload.priorRetiredAt,
+      ...(typeof originalPayload?.managerSessionId === 'string'
+        ? { retiredBySessionId: originalPayload.managerSessionId }
+        : typeof payload.managerSessionId === 'string'
+          ? { retiredBySessionId: payload.managerSessionId }
+          : {}),
+      ...(typeof originalPayload?.reason === 'string' ? { reason: originalPayload.reason } : {}),
+    }
+  }
+
+  /**
    * Upgrade legacy managers/children onto the durable team-generation model. This is deliberately
    * idempotent: boot may call it repeatedly, but it writes only when a manager or child actually needs
    * migration. Existing session ids, vendor conversations, worktrees, and branches never change.
@@ -7938,10 +7956,9 @@ export class SessionManager {
         this.persist(child)
         changed = true
       }
-      if (fromVersion < 2 && child.parentSessionId === manager.id && child.isOneShotSubagent !== true) {
-        const priorRetiredAt = child.managerRetiredAt
+      if (fromVersion < 3 && child.parentSessionId === manager.id && child.isOneShotSubagent !== true) {
         let childChanged = false
-        if (!child.role?.trim()) {
+        if (fromVersion < 2 && !child.role?.trim()) {
           const configuredRole = (manager.managerAgentTypes ?? []).find((candidate) => candidate.id === child.agentTypeId)
           child.role = configuredRole?.purpose ?? `General project contributor for ${childTeam.name}; preserve project continuity and accept bounded assignments within this team.`
           childChanged = true
@@ -7952,23 +7969,25 @@ export class SessionManager {
             source: configuredRole ? 'agent-type' : 'legacy-general-role',
           })
         }
-        if (priorRetiredAt) {
-          delete child.managerRetiredAt
-          delete child.managerRetiredBySessionId
-          delete child.managerRetiredReason
-          child.status = 'stopped'
+        const rearchive = this.legacyRetirementToRearchive(child)
+        if (rearchive) {
+          child.managerRetiredAt = rearchive.retiredAt
+          child.managerRetiredBySessionId = rearchive.retiredBySessionId ?? manager.id
+          child.managerRetiredReason = rearchive.reason ?? 'historical retired record re-archived after capability-v2 roster regression'
           childChanged = true
           const payload = {
             managerSessionId: manager.id,
             childSessionId: child.id,
-            priorRetiredAt,
-            restoredAt: now,
+            retiredAt: child.managerRetiredAt,
+            retiredBySessionId: child.managerRetiredBySessionId,
+            reason: child.managerRetiredReason,
+            rearchivedAt: now,
             teamId: childTeam.id,
             teamName: childTeam.name,
             status: 'stopped',
           }
-          this.journal.append(child.id, 'manager/child-retirement-migrated', payload)
-          this.journal.append(manager.id, 'manager/child-retirement-migrated', payload)
+          this.journal.append(child.id, 'manager/child-retirement-rearchived', payload)
+          this.journal.append(manager.id, 'manager/child-retirement-rearchived', payload)
         }
         if (childChanged) {
           this.persist(child)
@@ -8002,7 +8021,7 @@ export class SessionManager {
     detail: Record<string, unknown>,
   ): void {
     const teams = manager.managerTeams ?? []
-    const assignments = this.managerChildren(manager.id).map((child) => ({
+    const assignments = this.managerChildren(manager.id).filter((child) => !child.managerRetiredAt).map((child) => ({
       sessionId: child.id,
       teamId: child.managerTeamId ?? null,
       teamName: child.managerTeamName ?? null,
@@ -8278,7 +8297,9 @@ export class SessionManager {
     if (current.id === target.id) {
       return { ok: true, summary: `${target.name} is already active.\n${this.managerTeamSummary(manager)}` }
     }
-    const outgoing = this.managerChildren(manager.id).filter((child) => child.managerTeamId === current.id)
+    const outgoing = this.managerChildren(manager.id).filter(
+      (child) => child.managerTeamId === current.id && !child.managerRetiredAt,
+    )
     const running = outgoing.filter((child) => child.status === 'starting' || child.status === 'active')
     if (running.length && !interruptActive) {
       return {
@@ -8502,7 +8523,9 @@ export class SessionManager {
     const manager = this.sessions.get(managerSessionId)
     if (!manager?.isProjectManager) return { ok: false, error: 'caller is not an operator-marked project manager' }
     this.ensureManagerTeams(manager, 'Team 1', undefined, 'tool')
-    const children = this.managerChildren(manager.id)
+    const managed = this.managerChildren(manager.id)
+    const children = managed.filter((child) => !child.managerRetiredAt)
+    const archived = managed.length - children.length
     const counts = { running: 0, idle: 0, stopped: 0, errored: 0 }
     for (const child of children) {
       if (child.status === 'starting' || child.status === 'active') counts.running += 1
@@ -8527,7 +8550,7 @@ export class SessionManager {
     return {
       ok: true,
       summary: [
-        `Durable children: ${counts.running} running, ${counts.idle} idle, ${counts.stopped} stopped, ${counts.errored} errored. New retirement is disabled.`,
+        `Durable children: ${counts.running} running, ${counts.idle} idle, ${counts.stopped} stopped, ${counts.errored} errored. ${archived} archived record(s) excluded from roster and capacity. New retirement is disabled.`,
         this.managerTeamSummary(manager),
         ...(activeRows.length ? ['Roster:', ...activeRows] : ['No managed agents.']),
       ].join('\n'),
@@ -8545,6 +8568,9 @@ export class SessionManager {
   ): { ok: boolean; taskId?: string; warning?: string; error?: string } {
     const relation = this.managerManagedAgent(managerSessionId, childSessionId)
     if (!relation) return { ok: false, error: 'target is not in this manager’s hierarchy' }
+    if (relation.child.managerRetiredAt) {
+      return { ok: false, error: 'target is an archived record; explicitly restore it with manage_child resume before assigning work' }
+    }
     const title = input.title.trim()
     if (!title || title.length > 500) return { ok: false, error: 'title must be 1–500 characters' }
     const status = input.status ?? 'pending'

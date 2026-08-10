@@ -3049,11 +3049,47 @@ export class Journal extends EventEmitter {
     return row?.kind === 'bus/pending-notice-attempted'
   }
 
-  lastEventForSession(sessionId: string): { kind: string; ts: string } | undefined {
+  lastEventForSession(sessionId: string): { seq: number; kind: string; ts: string } | undefined {
     const row = this.db
-      .prepare('SELECT kind, ts FROM events WHERE session = ? ORDER BY seq DESC LIMIT 1')
-      .get(sessionId) as { kind: string; ts: string } | undefined
+      .prepare(
+        `SELECT event.seq, event.kind, event.ts
+         FROM journal_session_event_index AS session_event
+         JOIN events AS event ON event.seq = session_event.seq
+         WHERE session_event.session = ?
+         ORDER BY session_event.seq DESC
+         LIMIT 1`
+      )
+      .get(sessionId) as { seq: number; kind: string; ts: string } | undefined
     return row ?? undefined
+  }
+
+  /** Latest exact event of one kind for a session, using the bounded per-session side index. */
+  latestEventForSessionKind(sessionId: string, kind: string): HubEvent | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT event.seq, event.ts, event.session, event.kind, event.payload
+         FROM journal_session_event_index AS session_event
+         JOIN events AS event ON event.seq = session_event.seq
+         WHERE session_event.session = ? AND event.kind = ?
+         ORDER BY session_event.seq DESC
+         LIMIT 1`
+      )
+      .get(sessionId, kind) as {
+        seq: number
+        ts: string
+        session: string | null
+        kind: string
+        payload: string
+      } | undefined
+    return row
+      ? {
+          seq: row.seq,
+          ts: row.ts,
+          sessionId: row.session,
+          kind: row.kind,
+          payload: parsePayload(row.payload, row.seq),
+        }
+      : undefined
   }
 
   /**
