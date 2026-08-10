@@ -6,6 +6,87 @@ afterEach(() => {
 })
 
 describe('MeshSite registration', () => {
+  it('keeps an already-correct exposure read-only across repeated registrations', async () => {
+    let reads = 0
+    let setCalls = 0
+    const request: MeshControlRequest = async (cmd) => {
+      if (cmd === 'site_exposed') {
+        reads += 1
+        return { ok: true, result: { 'tcp:7777': 'AllMyAgents' } }
+      }
+      if (cmd === 'site_set_exposed') {
+        setCalls += 1
+        return { ok: true, result: { 'tcp:7777': 'AllMyAgents' } }
+      }
+      throw new Error(`unexpected command ${cmd}`)
+    }
+    const mesh = new MeshSite({ port: 7777, enable: true, controlRequest: request })
+
+    await expect(mesh.register()).resolves.toMatchObject({ nodePresent: true, exposed: true })
+    await expect(mesh.register()).resolves.toMatchObject({ nodePresent: true, exposed: true })
+
+    expect(reads).toBe(2)
+    expect(setCalls).toBe(0)
+  })
+
+  it('shares one registration attempt across overlapping callers', async () => {
+    let releaseRead: ((value: { ok: true; result: Record<string, string> }) => void) | undefined
+    const read = new Promise<{ ok: true; result: Record<string, string> }>((resolve) => {
+      releaseRead = resolve
+    })
+    let reads = 0
+    let setCalls = 0
+    const request: MeshControlRequest = async (cmd, args) => {
+      if (cmd === 'site_exposed') {
+        reads += 1
+        return read
+      }
+      if (cmd === 'site_set_exposed') {
+        setCalls += 1
+        return { ok: true, result: (args as { exposed: Record<string, string> }).exposed }
+      }
+      throw new Error(`unexpected command ${cmd}`)
+    }
+    const mesh = new MeshSite({ port: 7777, enable: true, controlRequest: request })
+
+    const registrations = [mesh.register(), mesh.register(), mesh.register()]
+    releaseRead?.({ ok: true, result: {} })
+    const statuses = await Promise.all(registrations)
+
+    expect(statuses).toHaveLength(3)
+    expect(statuses.every((status) => status.nodePresent && status.exposed)).toBe(true)
+    expect(reads).toBe(1)
+    expect(setCalls).toBe(1)
+  })
+
+  it('does not restamp a correct exposure during automatic presence checks', async () => {
+    vi.useFakeTimers()
+    let reads = 0
+    let setCalls = 0
+    const request: MeshControlRequest = async (cmd) => {
+      if (cmd === 'site_exposed') {
+        reads += 1
+        return { ok: true, result: { 'tcp:7777': 'AllMyAgents' } }
+      }
+      if (cmd === 'site_set_exposed') {
+        setCalls += 1
+        return { ok: true, result: { 'tcp:7777': 'AllMyAgents' } }
+      }
+      if (cmd === 'owned_roster') return { ok: true, result: { members: [] } }
+      if (cmd === 'session_snapshot') return { ok: true, result: { peers: [] } }
+      throw new Error(`unexpected command ${cmd}`)
+    }
+    const mesh = new MeshSite({ port: 7777, enable: true, controlRequest: request })
+
+    await mesh.register()
+    mesh.startAutoRegister(30_000)
+    await vi.advanceTimersByTimeAsync(90_001)
+    mesh.stopAutoRegister()
+
+    expect(reads).toBeGreaterThanOrEqual(4)
+    expect(setCalls).toBe(0)
+  })
+
   it('confirms a timed-out set from the authoritative exposed map instead of retrying a write that landed', async () => {
     vi.useFakeTimers()
     let exposed: Record<string, string> = { 'tcp:7777': 'AllMyAgents' }

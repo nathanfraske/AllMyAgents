@@ -186,6 +186,8 @@ export class MeshSite {
   private readonly siteRecoveryInFlight = new Map<string, Promise<number | null>>()
   /** Automatic mapping is idempotent, but never let overlapping upkeep ticks multiply IPC work. */
   private routeWarmupInFlight: Promise<number> | null = null
+  /** Registration may cross a slow node inventory/restamp boundary; every caller shares one attempt. */
+  private registerInFlight: Promise<MeshStatus> | null = null
 
   constructor(opts: {
     port: number
@@ -240,7 +242,20 @@ export class MeshSite {
    * No-ops cleanly (nodePresent:false) when no node socket is reachable.
    */
   async register(): Promise<MeshStatus> {
+    if (this.registerInFlight) return this.registerInFlight
+    const pending = this.registerOnce()
+    this.registerInFlight = pending
+    try {
+      return await pending
+    } finally {
+      if (this.registerInFlight === pending) this.registerInFlight = null
+    }
+  }
+
+  private async registerOnce(): Promise<MeshStatus> {
     if (!this.enabled) return this.update({ nodePresent: false, exposed: false, error: 'mesh exposure disabled' })
+    const siteId = this.siteId()
+    const desiredLabel = this.advertisedLabel()
     // Retry with backoff: a freshly-started hub can be busy enough (restoring sessions, spawning
     // vendor children) that the first control-socket round-trip times out even though the node is
     // healthy — the pipe answers in ~1ms once the hub settles. A few attempts with a generous
@@ -254,7 +269,13 @@ export class MeshSite {
           break // the node answered but refused — retrying won't help
         }
         const exposed: Record<string, string> = { ...((cur.result as Record<string, string>) ?? {}) }
-        exposed[this.siteId()] = this.advertisedLabel()
+        // `site_set_exposed` is not a cheap idempotent setter: AllMyStuff persists the map, restamps
+        // its profile, and refreshes backend inventory even when every byte is unchanged. The 30-second
+        // presence check therefore MUST stop here in steady state. Write only on an actual transition.
+        if (exposed[siteId] === desiredLabel) {
+          return this.update({ nodePresent: true, exposed: true, error: undefined })
+        }
+        exposed[siteId] = desiredLabel
         const set = await this.request('site_set_exposed', { exposed }, 10000)
         if (!set.ok) {
           lastErr = set.error ?? 'site_set_exposed failed'
@@ -276,7 +297,7 @@ export class MeshSite {
         try {
           const confirm = await this.request('site_exposed', {}, 2000)
           const confirmed = (confirm.result as Record<string, string> | undefined) ?? {}
-          if (confirm.ok && confirmed[this.siteId()] === this.advertisedLabel()) {
+          if (confirm.ok && confirmed[siteId] === desiredLabel) {
             return this.update({ nodePresent: true, exposed: true, error: undefined })
           }
         } catch {
