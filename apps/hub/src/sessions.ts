@@ -176,6 +176,22 @@ const RUNTIME_TOPOLOGY_TEAM_LIMIT = 32
 
 const DEFAULT_MANAGER_PARALLELISM_TARGET = 3
 
+// These rules live in both the provider-native per-turn contract and the managed instruction file.
+// That makes them effective for old durable sessions on their next real turn without sending migration
+// mail, waking an idle agent, or appending a self-triggering reminder event. Do not copy them into the
+// editable standing-instruction record as well: that would spend context on a third identical layer.
+const MANAGER_TASK_ACCOUNTABILITY_RULES = [
+  'At the start of each operator task or material slice, create or update your own provider-native task/plan entry for the coordination, integration, and verification work you personally own.',
+  'Before or with every worker dispatch, call the AllMyAgents assign_child_task tool for that exact worker and bounded outcome. Preserve the returned task id and update that same assignment to in_progress, completed, or abandoned only when the real transition occurs; prose-only bus messages are not task accounting.',
+  'Before every progress or completion report, inspect the task view for every managed agent involved in the slice, reconcile every manager-owned assignment, and report each owner, current state, blocker, and material result. "No tasks reported" means accounting is missing, not that no work exists.',
+  'Update boards at real dispatch, status, result, and integration boundaries. Do not poll, wake, or nudge agents merely to refresh a task board, and never create duplicate tasks to manufacture activity.',
+]
+
+const WORKER_TASK_ACCOUNTABILITY_RULES = [
+  'Keep your provider-native task/plan board current for the work you actually own, especially multi-step assignments. Update it only at real pending, in-progress, completed, or abandoned transitions and never mark unfinished work complete.',
+  'Report the assigned outcome, blocker, and material evidence upstream once at useful boundaries. Do not nudge-loop or create duplicate task entries merely to look active; the manager owns the audited assign_child_task record for your assignment.',
+]
+
 function effectiveManagerParallelismTarget(
   record: Pick<SessionRecord, 'managerMaxLiveChildren' | 'managerParallelismTarget'>,
 ): number {
@@ -222,10 +238,11 @@ function providerHostInstructions(
     const providerDiscipline = record.provider === 'claude'
       ? 'Claude-manager discipline: resist meandering or passive idle loops. Keep the critical path moving, check running children at sensible boundaries rather than polling endlessly, integrate completed work promptly, and finish or escalate once the requested outcome is actually resolved.'
       : 'Codex-manager discipline: keep investigation and token use bounded. Reproduce and rank a suspected issue before assigning work, ignore benign noise once disproven, do not expand scope merely because capacity remains, and stop when the operator\'s acceptance criteria are verified instead of continuing until context is exhausted.'
-    role = `${common}\n\n${rememberedApprovalDiscipline}\n\n${providerDiscipline}`
+    const taskAccountability = `Task accountability contract: ${MANAGER_TASK_ACCOUNTABILITY_RULES.join(' ')}`
+    role = `${common}\n\n${taskAccountability}\n\n${rememberedApprovalDiscipline}\n\n${providerDiscipline}`
   } else if (record.parentSessionId) {
     role =
-      `You are a managed child of session ${record.parentSessionId}. Your durable team role is: ${record.role?.trim() || 'legacy general project contributor; ask the manager to refine it with manage_child set_role'}. Preserve and build on relevant project context across assignments and compaction; a completed task does not end your identity. Use the AllMyAgents bus tools for upstream reports and coordination. Your manager assignment is authorized work inside the persisted grant; report a real scope or permission block upstream rather than silently waiting for the operator in chat.`
+      `You are a managed child of session ${record.parentSessionId}. Your durable team role is: ${record.role?.trim() || 'legacy general project contributor; ask the manager to refine it with manage_child set_role'}. Preserve and build on relevant project context across assignments and compaction; a completed task does not end your identity. Use the AllMyAgents bus tools for upstream reports and coordination. Your manager assignment is authorized work inside the persisted grant; report a real scope or permission block upstream rather than silently waiting for the operator in chat. Task accountability contract: ${WORKER_TASK_ACCOUNTABILITY_RULES.join(' ')}`
   } else {
     role =
       'Use the AllMyAgents tools for app-hosted coordination, shared memory/practices, browser, and granted remote devices whenever those capabilities match the task.'
@@ -337,7 +354,6 @@ const DEFAULT_MANAGER_STANDING_INSTRUCTIONS = [
   '- Every direct worker needs a durable responsibility. Use an operator-defined agent_type when it fits; otherwise pass an explicit role to spawn_agent. The role is stable identity and expertise, while prompt and assign_child_task carry the temporary assignment.',
   '- Reuse a worker whenever its durable role fits. Accumulated project knowledge is culture, not disposable context. Idle means available, stopped/errored workers can be resumed with manage_child, and high-context manager wakes are allowed so provider compaction can preserve continuity.',
   '- New retirement is disabled. Never churn workers merely because a task ended or context is large. If the work requires a genuinely different role lineup that the current team cannot cover, use manage_team to create or activate another durable team; switching stashes the outgoing chats without deleting identities, transcripts, branches, dirty files, or worktrees. Never request interrupt_active unless the operator explicitly wants currently running outgoing turns stopped.',
-  '- Keep your task board current, inspect managed descendants with peek_agent view "tasks", and use assign_child_task so the operator-visible board records what you delegated.',
   '- Use send_message with wake=false for checkpoints, FYIs, freeze/standby notices, and anything that needs no immediate response. A direct manager assignment may wake its own high-context worker; the provider compaction policy owns the continuity boundary. Do not nudge-loop or spawn a replacement around that boundary.',
   '- The hub-generated roster may report bounded operator steers, approvals, and permission overrides. Treat those facts as deliberate operator intervention, not as evidence that the child acted independently; the hub intentionally omits private message bodies.',
   // Learned from the operator, who has recovered more of these by hand than anyone. The instinct on
@@ -1379,6 +1395,22 @@ export class SessionManager {
         (candidate) => candidate.status === 'active' || candidate.status === 'starting' || candidate.status === 'idle',
       ).length
       const parallelismTarget = effectiveManagerParallelismTarget(record)
+      const activeTeamAgents = children.filter((candidate) =>
+        candidate.managerTeamId === record.managerActiveTeamId && !candidate.managerRetiredAt,
+      )
+      const taskFacts = activeTeamAgents.map((candidate) => ({
+        candidate,
+        summary: summarizeBoard(this.taskBoardForSession(candidate.id)),
+      }))
+      const managerTaskSummary = summarizeBoard(this.taskBoardForSession(record.id))
+      const runningWithoutReportedTasks = taskFacts
+        .filter(({ candidate, summary }) =>
+          (candidate.status === 'active' || candidate.status === 'starting') && summary.total === 0,
+        )
+        .map(({ candidate }) => ({ id: candidate.id, name: this.rosterLine(candidate.title ?? identityOf(candidate).label, 80) }))
+      const idleWithoutReportedTasks = taskFacts
+        .filter(({ candidate, summary }) => candidate.status === 'idle' && summary.total === 0)
+        .map(({ candidate }) => ({ id: candidate.id, name: this.rosterLine(candidate.title ?? identityOf(candidate).label, 80) }))
       const teams = (record.managerTeams ?? []).slice(0, RUNTIME_TOPOLOGY_TEAM_LIMIT).map((team) => {
         const members = children.filter((candidate) => candidate.managerTeamId === team.id)
         return {
@@ -1400,6 +1432,14 @@ export class SessionManager {
           reminder: runningDirectWorkers < parallelismTarget
             ? 'Below target: reuse idle workers or spawn useful independent/cross-check lanes; if the task cannot support the target, explain the concrete dependency.'
             : 'Target currently met; do not create duplicate or unnecessary work.',
+        },
+        taskAccountability: {
+          managerBoard: managerTaskSummary,
+          activeTeamAgents: activeTeamAgents.length,
+          agentsWithReportedTasks: taskFacts.filter(({ summary }) => summary.total > 0).length,
+          runningWithoutReportedTasks,
+          idleWithoutReportedTasks,
+          reminder: 'Before each progress/completion report, reconcile the manager-owned coordination task and every dispatched assignment; report every owner, state, blocker, and material result. Do not wake or poll solely to refresh boards.',
         },
         teams,
         agents: agents.map(agentRow),
@@ -4419,10 +4459,10 @@ export class SessionManager {
         ? [
             '## Durable task-board habit',
             '',
-            record.isProjectManager
-              ? 'Keep your own task board current and inspect each managed descendant with peek_agent view "tasks"; assign explicit child tasks instead of relying only on prose. Keep every returned task id, then use assign_child_task to mark that assignment in_progress, completed, or abandoned when the real child transition occurs.'
-              : 'Keep your task board current with your native task tool whenever work starts, finishes, or is abandoned. A blank board means "no tasks reported", not "no work".',
-            'Update status at real transitions; never mark unfinished work complete.',
+            ...(record.isProjectManager
+              ? MANAGER_TASK_ACCOUNTABILITY_RULES
+              : WORKER_TASK_ACCOUNTABILITY_RULES
+            ).map((rule) => `- ${rule}`),
           ].join('\n')
         : ''
     const overseerText = record.isOverseer
@@ -4567,12 +4607,27 @@ export class SessionManager {
       else if (child.status === 'stopped') counts.stopped += 1
       else counts.errored += 1
     }
+    const managerTaskSummary = summarizeBoard(this.taskBoardForSession(managerSessionId))
+    const activeTeamAgents = activeChildren.filter((child) => child.managerTeamId === manager?.managerActiveTeamId)
+    const activeTeamTaskFacts = activeTeamAgents.map((child) => ({
+      child,
+      summary: summarizeBoard(this.taskBoardForSession(child.id)),
+    }))
+    const runningWithoutTasks = activeTeamTaskFacts
+      .filter(({ child, summary }) =>
+        (child.status === 'active' || child.status === 'starting') && summary.total === 0,
+      )
+      .map(({ child }) => `${this.rosterLine(child.title ?? identityOf(child).label, 80)} (${child.id})`)
+    const idleWithoutTasks = activeTeamTaskFacts
+      .filter(({ child, summary }) => child.status === 'idle' && summary.total === 0)
+      .map(({ child }) => `${this.rosterLine(child.title ?? identityOf(child).label, 80)} (${child.id})`)
     const lines = [
       '## LIVE MANAGED-AGENT ROSTER (hub-generated for this turn)',
       '',
       'This is a fresh hub snapshot, not conversation memory. Unknown means unknown; do not infer idle from silence.',
       `Durable roster: ${counts.running} running, ${counts.idle} idle, ${counts.stopped} stopped, ${counts.errored} errored.${retiredChildren.length ? ` ${retiredChildren.length} legacy retired record(s) still need restoration.` : ''}`,
       `Parallel staffing target: ${parallelismTarget} useful direct worker lanes; active team currently has ${runningDirectWorkers} running and ${activeDirectWorkers.filter((child) => child.status === 'idle').length} idle direct workers, with ${Math.max(0, (manager?.managerMaxLiveChildren ?? 4) - liveSlotWorkers)} live-child slots available. ${runningDirectWorkers < parallelismTarget ? 'Below target: reuse idle workers or spawn independent implementation/reproduction/research/cross-check lanes when useful; otherwise explain the concrete dependency that keeps this task narrower.' : 'Target is currently met; do not invent or duplicate work.'}`,
+      `Task accountability: your manager board reports ${managerTaskSummary.total} task(s) (${managerTaskSummary.active} in progress, ${managerTaskSummary.pending} pending, ${managerTaskSummary.done} done); ${activeTeamTaskFacts.filter(({ summary }) => summary.total > 0).length}/${activeTeamAgents.length} active-team agents have reported tasks. Running without a reported task: ${runningWithoutTasks.join(', ') || 'none'}. Idle with no reported task history: ${idleWithoutTasks.join(', ') || 'none'}. Before every progress/completion report, reconcile every assignment and name each owner, state, blocker, and material result; never treat "no tasks reported" as proof that no work exists.`,
       `Teams: ${teams.length}; active: ${teams.find((team) => team.id === manager?.managerActiveTeamId)?.name ?? 'unknown'}. Use manage_team to list exact stable ids or switch teams safely.`,
       `Operator guidance/audit for this manager: ${manager ? this.operatorInterventions(manager.id).join('; ') || 'no recent manual manager configuration, steer, permission override, or approval decision recorded' : 'manager unavailable'}.`,
       `Exhausted-account dispatch guard: ${manager?.managerPauseExhaustedAccounts === true ? 'ON — the hub refuses new child spawns/messages at a hard 100% limit unless paid overage/credits are active' : 'OFF — usage limits do not add a manager-specific dispatch block'}.`,

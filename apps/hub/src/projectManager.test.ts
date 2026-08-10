@@ -938,7 +938,7 @@ describe('project manager durable teams', () => {
 
 describe('project manager durable live roster', () => {
   it('rebuilds the managed-agent roster and bounded operator provenance after compaction', async () => {
-    const { sessions, journal, seed, repo } = buildHub()
+    const { sessions, journal, seed, repo, runTurn } = buildHub()
     const manager = seed({ id: 'manager', projectId: 'project' })
     sessions.configureProjectManager(
       'manager',
@@ -987,6 +987,9 @@ describe('project manager durable live roster', () => {
     expect(instructions).toContain('LIVE MANAGED-AGENT ROSTER')
     expect(instructions).toMatch(/Parallel staffing target: 3 useful direct worker lanes; active team currently has 1 running/u)
     expect(instructions).toMatch(/Below target: reuse idle workers or spawn independent implementation\/reproduction\/research\/cross-check lanes/u)
+    expect(instructions).toMatch(/Task accountability: your manager board reports 0 task\(s\)/u)
+    expect(instructions).toMatch(/Running without a reported task: Hopper \(reviewer-child\)/u)
+    expect(instructions).toContain('Before every progress or completion report')
     expect(instructions).toMatch(/operator configured this manager’s team and permission bounds/i)
     expect(instructions).toContain('Hopper')
     expect(instructions).toContain('reviewer-child')
@@ -998,7 +1001,69 @@ describe('project manager durable live roster', () => {
     expect(instructions).toContain('pnpm --filter hub test')
     expect(instructions).toMatch(/operator steered the active turn/i)
     expect(instructions).not.toContain('private operator steer body')
-    expect(instructions).toContain('use assign_child_task to mark that assignment')
+    expect(instructions).toContain('call the AllMyAgents assign_child_task tool')
+
+    const runtime = runTurn.mock.calls[0]?.[0].claudeSystemPrompt ?? ''
+    expect(runtime).toContain('Task accountability contract:')
+    expect(runtime).toContain('create or update your own provider-native task/plan entry')
+    expect(runtime).toContain('runningWithoutReportedTasks')
+    expect(runtime).toContain('reviewer-child')
+  })
+
+  it('injects the current task contract into prior-created managers and workers without self-waking', async () => {
+    const { sessions, seed, runTurn, bus } = buildHub()
+    const manager = seed({
+      id: 'legacy-manager',
+      projectId: 'project',
+      isProjectManager: true,
+      managerMaxLiveChildren: 4,
+      // Deliberately no capability-version field: this represents a durable pre-upgrade chat.
+    })
+    seed({
+      id: 'legacy-worker',
+      projectId: 'project',
+      parentSessionId: manager.id,
+      role: 'Durable verification worker',
+    })
+    const codexManager = seed({
+      id: 'legacy-codex-manager',
+      profileId: 'p2',
+      provider: 'codex',
+      projectId: 'project',
+      isProjectManager: true,
+      managerMaxLiveChildren: 4,
+    })
+    seed({
+      id: 'legacy-codex-worker',
+      profileId: 'p2',
+      provider: 'codex',
+      projectId: 'project',
+      parentSessionId: codexManager.id,
+      role: 'Durable implementation worker',
+    })
+
+    await sessions.send(manager.id, 'Report the current slice.')
+    await sessions.send('legacy-worker', 'Continue the assigned verification.')
+    await sessions.send(codexManager.id, 'Report the current slice.')
+    await sessions.send('legacy-codex-worker', 'Continue the assigned implementation.')
+
+    const managerRuntime = runTurn.mock.calls[0]?.[0].claudeSystemPrompt ?? ''
+    const workerRuntime = runTurn.mock.calls[1]?.[0].claudeSystemPrompt ?? ''
+    const codexManagerRuntime = runTurn.mock.calls[2]?.[0].codexDeveloperInstructions ?? ''
+    const codexWorkerRuntime = runTurn.mock.calls[3]?.[0].codexDeveloperInstructions ?? ''
+    expect(managerRuntime).toContain('Before or with every worker dispatch')
+    expect(managerRuntime).toContain('Before every progress or completion report')
+    expect(workerRuntime).toContain('Keep your provider-native task/plan board current')
+    expect(workerRuntime).toContain('the manager owns the audited assign_child_task record')
+    expect(codexManagerRuntime).toContain('Before or with every worker dispatch')
+    expect(codexManagerRuntime).toContain('Before every progress or completion report')
+    expect(codexWorkerRuntime).toContain('Keep your provider-native task/plan board current')
+    expect(codexWorkerRuntime).toContain('the manager owns the audited assign_child_task record')
+    expect(runTurn).toHaveBeenCalledTimes(4)
+    expect(bus.pending(manager.id)).toHaveLength(0)
+    expect(bus.pending('legacy-worker')).toHaveLength(0)
+    expect(bus.pending(codexManager.id)).toHaveLength(0)
+    expect(bus.pending('legacy-codex-worker')).toHaveLength(0)
   })
 
   it('does not add a manager roster to an ordinary chat turn', async () => {
