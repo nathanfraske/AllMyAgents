@@ -36,6 +36,25 @@ export class InstructionStore {
     return this.allStmt.all() as Instruction[]
   }
 
+  /** Applicable durable operator records in precedence order, general to specific. Keeping the scope
+   * labels available lets provider-native runtime injection preserve provenance instead of flattening
+   * trusted operator text into an indistinguishable prompt blob. */
+  applicable(opts: {
+    provider: 'claude' | 'codex'
+    projectId?: string
+    profileId: string
+    sessionId?: string
+  }): Instruction[] {
+    const order = ['global', `vendor:${opts.provider}`]
+    if (opts.projectId) order.push(`project:${opts.projectId}`)
+    order.push(`account:${opts.profileId}`)
+    if (opts.sessionId) order.push(`session:${opts.sessionId}`)
+    const byScope = new Map(this.list().map((record) => [record.scope, record]))
+    return order
+      .map((scope) => byScope.get(scope))
+      .filter((record): record is Instruction => Boolean(record?.content.trim()))
+  }
+
   /** Set a scope's instructions, or clear it when the content is blank. */
   set(scope: string, content: string): void {
     if (content.trim()) this.upsertStmt.run(scope, content, new Date().toISOString())
@@ -49,17 +68,7 @@ export class InstructionStore {
     profileId: string
     sessionId?: string
   }): string {
-    const order = ['global', `vendor:${opts.provider}`]
-    if (opts.projectId) order.push(`project:${opts.projectId}`)
-    order.push(`account:${opts.profileId}`)
-    if (opts.sessionId) order.push(`session:${opts.sessionId}`)
-    const byScope = new Map(this.list().map((r) => [r.scope, r.content]))
-    const parts: string[] = []
-    for (const scope of order) {
-      const c = byScope.get(scope)?.trim()
-      if (c) parts.push(c)
-    }
-    return parts.join('\n\n')
+    return this.applicable(opts).map((record) => record.content.trim()).join('\n\n')
   }
 }
 

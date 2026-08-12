@@ -5,6 +5,26 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.25-alpha.29 — 2026-08-11
+
+This release makes every AllMyAgents tool call readable in the chat timeline, wakes project managers when a worker
+finishes, and reinforces live Claude/Codex instructions without allowing saved rules or large team rosters to poison
+the model context.
+
+[Full v0.1.25-alpha.29 release notes](docs/releases/v0.1.25-alpha.29.md)
+
+- All current AllMyAgents coordination, memory, browser, remote-device, run, and Overseer tools have concise
+  argument-aware timeline labels. The exact protocol name, inputs, result, and error remain available on expansion.
+- Collapsed remote-command rows deliberately omit command arguments so secrets and one-use codes do not leak into
+  the ordinary transcript surface.
+- A worker entering idle now wakes its project manager exactly once for result collection or reassignment, including
+  above the normal high-context FYI guard.
+- Scoped operator instructions are reasserted on every Claude and Codex turn in general-to-specific order, including
+  after compaction, rather than depending on a provider to rediscover a changed native instruction file.
+- Operator instructions and live topology each have an independent 8,000-character automatic-context ceiling.
+  Oversized content is explicitly hashed and pruned without invalid JSON, silent semantic summaries, or fabricated
+  completeness; the full operator record remains editable in AllMyAgents Settings.
+
 ## v0.1.24-alpha.28 — 2026-08-10
 
 This release adds a provider-neutral durable job control plane for local and remote builds, tests, and other
