@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  ALLMYAGENTS_TOOL_NAMES,
   agentActivity,
   basename,
   parseBusFrame,
@@ -128,8 +129,8 @@ describe('toolBlurb — Codex tools', () => {
     expect(b?.title).toBe('apps/web/src/lib/store.svelte.ts')
   })
 
-  it('lets an mcp:* tool fall back to its own name (the name is the subject)', () => {
-    expect(toolBlurb(tool('mcp:search', { q: 'x' }))).toBeUndefined()
+  it('uses the readable custom-tool action in collapsed summaries too', () => {
+    expect(toolBlurb(tool('mcp:search', { q: 'x' }))?.label).toBe('searched')
   })
 })
 
@@ -187,9 +188,34 @@ describe('agentActivity — hub agent tools', () => {
     expect(agentActivity(t('mcp:send_message', { to_session: 's1', body: 'x' }), resolve)).toEqual({ label: 'message sent to Wilkes', dir: 'out', counterpartyId: 's1' })
   })
 
-  it('is undefined for a non-hub tool (falls back to the generic card)', () => {
+  it('is undefined for a non-hub tool and humanizes a future custom tool', () => {
     expect(agentActivity(t('Bash', { command: 'ls' }))).toBeUndefined()
-    expect(agentActivity(t('mcp__allmyagents__future_tool', {}))).toBeUndefined()
+    expect(agentActivity(t('mcp__allmyagents__generate_report', {}))?.label).toBe('used generate report')
+  })
+
+  it('gives every current AllMyAgents tool a code-free inline label for both vendors', () => {
+    for (const name of ALLMYAGENTS_TOOL_NAMES) {
+      for (const prefix of ['mcp__allmyagents__', 'mcp:']) {
+        const activity = agentActivity(t(`${prefix}${name}`, {}))
+        expect(activity, `${prefix}${name}`).toBeDefined()
+        expect(activity?.label, `${prefix}${name}`).not.toMatch(/mcp|__|_/i)
+      }
+    }
+  })
+
+  it('uses arguments to explain coordination, run, remote, browser, and Overseer calls', () => {
+    expect(agentActivity(t('mcp:query_team', { arguments: { entities: ['tasks', 'approvals'] } }))?.label)
+      .toBe('checked team tasks, approvals')
+    expect(agentActivity(t('mcp:start_run', { arguments: { kind: 'test', remote_device_id: 'dev-1' } }))?.label)
+      .toBe('started a test run on a remote device')
+    expect(agentActivity(t('mcp:remote_read_file', { arguments: { path: 'src/deep/file.ts' } }))?.label)
+      .toBe('read remote file file.ts')
+    expect(agentActivity(t('mcp:remote_exec', { arguments: { command: 'deploy --token secret-value' } }))?.label)
+      .toBe('ran a remote command')
+    expect(agentActivity(t('mcp:browser_navigate', { arguments: { url: 'https://example.com/docs' } }))?.label)
+      .toBe('opened example.com')
+    expect(agentActivity(t('mcp:overseer_control', { arguments: { operation: 'restart_hub' } }))?.label)
+      .toBe('restarted the hub')
   })
 })
 

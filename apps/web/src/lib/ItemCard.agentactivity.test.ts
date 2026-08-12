@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { render, cleanup, screen } from '@testing-library/svelte'
+import { render, cleanup, fireEvent, screen } from '@testing-library/svelte'
 import ItemCard from './ItemCard.svelte'
 import { store, type ThreadItem } from './store.svelte'
 import type { SessionRecord } from './api'
@@ -163,5 +163,25 @@ describe("teammate vendor logo in the blurb", () => {
 
     expect(screen.getByText('message sent to 02575b81')).toBeTruthy()
     expect(screen.queryByRole('img', { name: /Codex|Claude/ })).toBeNull()
+  })
+})
+
+describe('custom tool readability', () => {
+  it('shows a descriptive action inline and keeps the protocol name in expanded audit detail', async () => {
+    const item: ThreadItem = {
+      key: 'team-query',
+      kind: 'tool',
+      ts: '',
+      toolName: 'mcp:query_team',
+      toolInput: { type: 'mcpToolCall', tool: 'query_team', arguments: { entities: ['tasks', 'approvals'] } },
+    }
+
+    render(ItemCard, { props: { item, sessionId: 's1' } })
+
+    const action = screen.getByRole('button', { name: /checked team tasks, approvals/i })
+    expect(screen.queryByText('mcp:query_team')).toBeNull()
+
+    await fireEvent.click(action)
+    expect(screen.getByText('mcp:query_team')).toBeTruthy()
   })
 })

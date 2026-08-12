@@ -75,6 +75,7 @@ function buildHub() {
     isBusy: () => false,
   }
   const usage = new UsageMonitor(journal, profiles, {})
+  const instructions = new InstructionStore(journal.db)
   const sessions = new SessionManager(
     journal,
     new SessionStore(journal.db),
@@ -83,7 +84,7 @@ function buildHub() {
     usage,
     new WorkspaceManager(path.join(root, 'worktrees')),
     projects,
-    new InstructionStore(journal.db),
+    instructions,
     bus,
     new MemoryStore(journal.db),
     new PracticeStore(journal.db),
@@ -109,7 +110,7 @@ function buildHub() {
     journal.db.close()
     fs.rmSync(root, { recursive: true, force: true })
   })
-  return { sessions, journal, approvals, usage, projects, bus, seed, repo, steer, runTurn, startThread }
+  return { sessions, journal, approvals, usage, projects, instructions, bus, seed, repo, steer, runTurn, startThread }
 }
 
 function transition(sessions: SessionManager, id: string, status: SessionStatus): void {
@@ -361,7 +362,7 @@ describe('high-context teammate wake guard', () => {
     }))
   })
 
-  it('also holds hub-generated child reports that bypass the public send_message path', () => {
+  it('also holds non-actionable hub-generated child reports that bypass the public send_message path', () => {
     const { sessions, journal, bus, seed, runTurn } = buildHub()
     const manager = seed({ id: 'manager', projectId: 'project-1', isProjectManager: true })
     const child = seed({ id: 'child', projectId: 'project-1', parentSessionId: 'manager' })
@@ -376,7 +377,7 @@ describe('high-context teammate wake guard', () => {
       },
       project: 'project-1',
       to: { kind: 'session', id: manager.id },
-      subject: 'child idle',
+      subject: 'child started',
       body: 'Hub-generated lifecycle report.',
       recipients: [manager.id],
     })
@@ -388,6 +389,32 @@ describe('high-context teammate wake guard', () => {
     expect(journal.recentEventsForSession(manager.id)).toContainEqual(expect.objectContaining({
       kind: 'bus/context-wake-held',
       payload: expect.objectContaining({ count: 1 }),
+    }))
+  })
+
+  it('wakes a high-context idle manager exactly once when a worker finishes', () => {
+    const { sessions, journal, bus, seed, runTurn } = buildHub()
+    const manager = seed({ id: 'manager', projectId: 'project-1', isProjectManager: true })
+    seed({
+      id: 'child',
+      projectId: 'project-1',
+      parentSessionId: manager.id,
+      status: 'active',
+      title: 'Worker',
+    })
+    journal.append(manager.id, 'session/tokens', { scope: 'request', contextUsed: 750_000 })
+
+    transition(sessions, 'child', 'idle')
+    ;(sessions as unknown as { deliverBus(sessionId: string): void }).deliverBus(manager.id)
+
+    expect(runTurn).toHaveBeenCalledOnce()
+    expect(runTurn.mock.calls[0]?.[1]).toContain('Worker is idle and ready for review or another task.')
+    expect(bus.pending(manager.id)).toEqual([])
+    expect(sessions.busInbox(manager.id)).toMatchObject([
+      { subject: 'child idle', wake: true, attentionRequired: true, delivered: true },
+    ])
+    expect(journal.recentEventsForSession(manager.id)).not.toContainEqual(expect.objectContaining({
+      kind: 'bus/context-wake-held',
     }))
   })
 
@@ -1015,6 +1042,109 @@ describe('project manager durable teams', () => {
 })
 
 describe('project manager durable live roster', () => {
+  it('hard-bounds serialized topology and reports pruned collections instead of slicing JSON', async () => {
+    const { sessions, seed, runTurn } = buildHub()
+    seed({
+      id: 'manager',
+      isProjectManager: true,
+      managerTeams: Array.from({ length: 32 }, (_, index) => ({
+        id: `team-${index}-${'t'.repeat(80)}`,
+        name: `Long lived team ${index} ${'n'.repeat(120)}`,
+        createdAt: new Date().toISOString(),
+        activatedAt: new Date().toISOString(),
+      })),
+    })
+    for (let index = 0; index < 48; index += 1) {
+      seed({
+        id: `child-${index}-${'i'.repeat(80)}`,
+        parentSessionId: 'manager',
+        managerRootSessionId: 'manager',
+        managerTeamId: `team-${index % 32}-${'t'.repeat(80)}`,
+        managerTeamName: `Long lived team ${index % 32} ${'n'.repeat(120)}`,
+        title: `Durable specialist ${index} ${'x'.repeat(200)}`,
+      })
+    }
+
+    await sessions.send('manager', 'review the current team')
+
+    const runtime = runTurn.mock.calls[0]?.[0].claudeSystemPrompt ?? ''
+    const start = runtime.indexOf('## BOUNDED LIVE TOPOLOGY')
+    expect(start).toBeGreaterThanOrEqual(0)
+    const topology = runtime.slice(start)
+    expect(topology.length).toBeLessThanOrEqual(8_000)
+    const payload = JSON.parse(topology.split('\n').at(-1)!) as {
+      lengthGuard?: { truncated?: boolean; removedRowsByCollection?: Record<string, number> }
+    }
+    expect(payload.lengthGuard?.truncated).toBe(true)
+    expect(Object.values(payload.lengthGuard?.removedRowsByCollection ?? {}).reduce((sum, value) => sum + value, 0)).toBeGreaterThan(0)
+  })
+
+  it('reasserts changed scoped operator instructions through both providers protected turn boundary', async () => {
+    const { sessions, instructions, seed, runTurn } = buildHub()
+    instructions.set('global', 'global invariant')
+    instructions.set('project:project-1', 'project invariant')
+    const cases = [
+      { id: 'claude-chat', provider: 'claude' as const, profileId: 'p1', field: 'claudeSystemPrompt' as const },
+      { id: 'codex-chat', provider: 'codex' as const, profileId: 'p2', field: 'codexDeveloperInstructions' as const },
+    ]
+
+    for (const entry of cases) {
+      instructions.set(`vendor:${entry.provider}`, `${entry.provider} invariant`)
+      instructions.set(`account:${entry.profileId}`, `${entry.profileId} invariant`)
+      instructions.set(`session:${entry.id}`, `${entry.id} invariant v1`)
+      seed({
+        id: entry.id,
+        provider: entry.provider,
+        profileId: entry.profileId,
+        projectId: 'project-1',
+      })
+
+      await sessions.send(entry.id, 'first operator turn')
+      const first = runTurn.mock.calls.at(-1)?.[0][entry.field] ?? ''
+      expect(first).toContain('## LIVE SCOPED OPERATOR INSTRUCTIONS')
+      const ordered = [
+        '### global',
+        `### vendor:${entry.provider}`,
+        '### project:project-1',
+        `### account:${entry.profileId}`,
+        `### session:${entry.id}`,
+      ].map((heading) => first.indexOf(heading))
+      expect(ordered.every((position) => position >= 0)).toBe(true)
+      expect(ordered).toEqual([...ordered].sort((left, right) => left - right))
+      expect(first).toContain(`${entry.id} invariant v1`)
+
+      instructions.set(`session:${entry.id}`, `${entry.id} invariant v2`)
+      await sessions.send(entry.id, 'second operator turn')
+      const second = runTurn.mock.calls.at(-1)?.[0][entry.field] ?? ''
+      expect(second).toContain(`${entry.id} invariant v2`)
+      expect(second).not.toContain(`${entry.id} invariant v1`)
+    }
+  })
+
+  it('bounds oversized operator instructions in total without silently dropping the scope or its end', async () => {
+    const { sessions, instructions, seed, runTurn, repo } = buildHub()
+    const manager = seed({ id: 'manager', isProjectManager: true })
+    instructions.set('session:manager', `BEGIN-${'x'.repeat(9_000)}-END`)
+
+    await sessions.send('manager', 'inspect the current slice')
+
+    const runtime = runTurn.mock.calls[0]?.[0].claudeSystemPrompt ?? ''
+    const protectedBlock = (sessions as unknown as {
+      runtimeOperatorInstructions(record: SessionRecord): string
+    }).runtimeOperatorInstructions(manager)
+    expect(runtime).toContain('BEGIN-')
+    expect(runtime).toContain('-END')
+    expect(runtime).toContain('session:manager sha256:')
+    expect(runtime).toContain('middle bytes are omitted here')
+    expect(runtime).toContain('complete record remains in AllMyAgents Settings')
+    expect(protectedBlock.length).toBeLessThanOrEqual(8_000)
+    const native = fs.readFileSync(path.join(repo, 'CLAUDE.md'), 'utf8')
+    expect(native).not.toContain(`BEGIN-${'x'.repeat(9_000)}-END`)
+    expect(native).toContain('middle bytes are omitted here')
+    expect(instructions.materialize({ provider: 'claude', profileId: manager.profileId, sessionId: manager.id }))
+      .toContain(`BEGIN-${'x'.repeat(9_000)}-END`)
+  })
+
   it('rebuilds the managed-agent roster and bounded operator provenance after compaction', async () => {
     const { sessions, journal, seed, repo, runTurn } = buildHub()
     const manager = seed({ id: 'manager', projectId: 'project' })

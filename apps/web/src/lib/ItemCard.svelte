@@ -147,6 +147,7 @@
         {#if fmtTime(item.ts)}<span class="ts" title={new Date(item.ts).toLocaleString()}>{fmtTime(item.ts)}</span>{/if}
       </button>
       {#if detailOpen}
+        <div class="atechnical">Technical tool: <code>{item.toolName}</code></div>
         <pre class="araw">{JSON.stringify(item.toolInput, null, 2)}</pre>
         {#if item.toolResult}<pre class="araw out" class:fail={item.toolError}>{item.toolResult.slice(0, 2000)}</pre>{/if}
       {/if}
@@ -228,6 +229,7 @@
   .ahd { display: flex; align-items: baseline; gap: 0.4rem; width: 100%; text-align: left; background: none; border: none; cursor: pointer; font-size: 0.8rem; color: var(--secondary); }
   .ahd:hover .alabel { color: var(--text); }
   .aarrow { flex: none; font-weight: 700; }
+  .atechnical { color: var(--dim); font-size: 0.68rem; margin: 0.25rem 0 0.1rem; }
   .alabel { color: var(--secondary); }
   .alogo { flex: none; display: inline-flex; align-items: center; }
   .asubj { color: var(--muted); font-size: 0.74rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
