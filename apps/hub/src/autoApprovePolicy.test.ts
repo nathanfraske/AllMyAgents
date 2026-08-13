@@ -1169,10 +1169,10 @@ describe('project-manager delegated authority security boundary', () => {
       remembered: true,
     })
     await expect(pending).resolves.toBe(true)
-    expect(child.delegatedTools).toEqual(['Bash'])
+    expect(child.delegatedTools).toEqual(['shell'])
     expect(new SessionStore(journal.db).all()).toContainEqual(expect.objectContaining({
       id: 'child',
-      delegatedTools: ['Bash'],
+      delegatedTools: ['shell'],
     }))
     expect(sessions.isAutoApproved('child', 'claude/tool', {
       toolName: 'Bash',
@@ -1193,6 +1193,44 @@ describe('project-manager delegated authority security boundary', () => {
       toolName: 'Bash',
       input: { command: 'pnpm test' },
     })).toBe(false)
+  })
+
+  it('applies one provider-neutral manager grant identically to Claude and Codex workers', () => {
+    const { sessions, seed } = makeSessions()
+    seed({
+      isProjectManager: true,
+      status: 'stopped',
+      managerCanApproveChildren: true,
+      // Legacy provider names are accepted during migration and interpreted as semantic capabilities.
+      managerAllowedTools: ['Bash', 'Write'],
+    } as Partial<SessionRecord>)
+    seed({
+      id: 'claude-child',
+      provider: 'claude',
+      parentSessionId: 's1',
+      delegatedTools: ['Bash', 'Write'],
+      permissionMode: 'safe',
+    } as Partial<SessionRecord>)
+    seed({
+      id: 'codex-child',
+      provider: 'codex',
+      parentSessionId: 's1',
+      delegatedTools: ['Bash', 'Write'],
+      permissionMode: 'safe',
+    } as Partial<SessionRecord>)
+
+    expect(sessions.isAutoApproved('claude-child', 'claude/tool', { toolName: 'Bash' })).toBe(true)
+    expect(sessions.isAutoApproved('claude-child', 'claude/tool', { toolName: 'Write' })).toBe(true)
+    expect(sessions.isAutoApproved(
+      'codex-child',
+      'codex/item/commandExecution/requestApproval',
+      { toolName: 'commandExecution' },
+    )).toBe(true)
+    expect(sessions.isAutoApproved(
+      'codex-child',
+      'codex/item/fileChange/requestApproval',
+      { toolName: 'fileChange' },
+    )).toBe(true)
   })
 
   it('does not turn a remembered denial or one-shot approval into a standing grant', async () => {
@@ -1472,7 +1510,7 @@ describe('project-manager delegated authority security boundary', () => {
   })
 
   it('resolves a usage-aware agent type to an unblocked profile before spawning', async () => {
-    const { sessions, seed } = makeSessions()
+    const { sessions, seed, journal } = makeSessions()
     seed({
       isProjectManager: true,
       managerMaxLiveChildren: 2,
@@ -1503,6 +1541,70 @@ describe('project-manager delegated authority security boundary', () => {
       agentType: 'general',
       prompt: 'Implement the scoped task',
     })).resolves.toMatchObject({ ok: true, sessionId: 'child' })
+    expect(chosenProfile).toBe('p2')
+    expect(journal.replay(0)).toContainEqual(expect.objectContaining({
+      sessionId: 's1',
+      kind: 'manager/child-spawned',
+      payload: expect.objectContaining({
+        childSessionId: 'child',
+        profileId: 'p2',
+        profileSelectionReason: expect.stringMatching(/usage-aware.*headroom/i),
+      }),
+    }))
+  })
+
+  it('keeps usage-aware reviewers account-independent from implementers even when that account has more headroom', async () => {
+    const { sessions, seed } = makeSessions()
+    seed({
+      isProjectManager: true,
+      managerMaxLiveChildren: 3,
+      managerAllowedProfiles: ['p1', 'p2'],
+      managerActiveTeamId: 'team-1',
+      managerAgentTypes: [
+        {
+          id: 'implementer',
+          name: 'Implementer',
+          purpose: 'Implement the scoped change',
+          selection: 'fixed',
+          profileId: 'p1',
+          independenceGroup: 'implementation-review',
+        },
+        {
+          id: 'reviewer',
+          name: 'Reviewer',
+          purpose: 'Independently review the implementation',
+          selection: 'usage-aware',
+          profileIds: ['p1', 'p2'],
+          independenceGroup: 'implementation-review',
+        },
+      ],
+    })
+    seed({
+      id: 'implementer-child',
+      parentSessionId: 's1',
+      profileId: 'p1',
+      agentTypeId: 'implementer',
+      managerTeamId: 'team-1',
+      status: 'idle',
+    })
+    const internals = sessions as unknown as {
+      usage: { list(): unknown[] }
+      create(profileId: string, options: unknown): Promise<SessionRecord>
+    }
+    internals.usage.list = () => [
+      { profileId: 'p1', blocked: false, headroom: 1 },
+      { profileId: 'p2', blocked: false, headroom: 0.25 },
+    ]
+    let chosenProfile = ''
+    internals.create = async (profileId) => {
+      chosenProfile = profileId
+      return seed({ id: 'reviewer-child', profileId, parentSessionId: 's1', status: 'starting' })
+    }
+
+    await expect(controls(sessions).managerSpawn('s1', {
+      agentType: 'reviewer',
+      prompt: 'Review the implementation independently',
+    })).resolves.toMatchObject({ ok: true, sessionId: 'reviewer-child' })
     expect(chosenProfile).toBe('p2')
   })
 })

@@ -1,6 +1,7 @@
 import crypto from 'node:crypto'
 import type Database from 'better-sqlite3'
 import type { DelegatedAuthority } from './types.js'
+import { managerToolGrantCovers, normalizeManagerToolGrants } from './managerCapabilities.js'
 
 export type TeamPermissionMode = 'safe' | 'edits' | 'full'
 
@@ -119,7 +120,7 @@ export function normalizeTeamPreset(value: unknown, existing?: TeamPreset): Team
     allowWorkerSubagents: rawManager.allowWorkerSubagents === true,
     maxSubagentsPerWorker: Number(rawManager.maxSubagentsPerWorker ?? 2),
     delegation: authorities(rawManager.delegation ?? [], 'preset.manager.delegation'),
-    allowedTools: names(rawManager.allowedTools ?? [], 'preset.manager.allowedTools'),
+    allowedTools: normalizeManagerToolGrants(names(rawManager.allowedTools ?? [], 'preset.manager.allowedTools')),
     ...(text(rawManager.orientationBrief, 'preset.manager.orientationBrief', 20_000, false)
       ? { orientationBrief: text(rawManager.orientationBrief, 'preset.manager.orientationBrief', 20_000, false) }
       : {}),
@@ -145,11 +146,11 @@ export function normalizeTeamPreset(value: unknown, existing?: TeamPreset): Team
     }
     ids.add(id.toLowerCase())
     const requestedAuthorities = authorities(agent.authorities ?? [], `preset.agents[${index}].authorities`)
-    const requestedTools = names(agent.tools ?? [], `preset.agents[${index}].tools`)
+    const requestedTools = normalizeManagerToolGrants(names(agent.tools ?? [], `preset.agents[${index}].tools`))
     if (requestedAuthorities.some((authority) => !manager.delegation.includes(authority))) {
       throw new Error(`preset.agents[${index}] requests authority outside the manager ceiling`)
     }
-    if (requestedTools.some((tool) => !manager.allowedTools.includes(tool))) {
+    if (requestedTools.some((tool) => !managerToolGrantCovers(manager.allowedTools, tool))) {
       throw new Error(`preset.agents[${index}] requests a tool outside the manager ceiling`)
     }
     return {

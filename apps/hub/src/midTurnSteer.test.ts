@@ -496,6 +496,22 @@ describe('SessionManager mid-turn steering', () => {
     expect([...journal.replay(0)].some((event) => event.kind === 'session/input' && (event.payload as { text?: string }).text === 'correct the instruction')).toBe(true)
   })
 
+  it('visibly preserves the authority boundary when operator guidance steers a non-operator turn', async () => {
+    const { sessions, journal, steer } = build()
+    ;(sessions as unknown as { busTurnSessions: Set<string> }).busTurnSessions.add('s1')
+
+    await sessions.send('s1', 'configure the manager now')
+
+    expect(steer).toHaveBeenCalledOnce()
+    expect(steer.mock.calls[0]![1]).toContain('configure the manager now')
+    expect(steer.mock.calls[0]![1]).toContain('does not confer operator mutation or approval authority')
+    expect(journal.since(0)).toContainEqual(expect.objectContaining({
+      sessionId: 's1',
+      kind: 'session/operator-authority-not-conferred',
+    }))
+    expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(false)
+  })
+
   it('steers a framed bus message into a live turn without reclassifying that turn as bus-origin', async () => {
     const { sessions, journal, bus, steer } = build()
     ;(sessions as unknown as { operatorTurnSessions: Set<string> }).operatorTurnSessions.add('s1')

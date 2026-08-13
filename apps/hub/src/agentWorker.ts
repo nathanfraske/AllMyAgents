@@ -58,6 +58,7 @@ import {
 import type { SessionIdentity } from './identity.js'
 import type { DangerFlags } from './types.js'
 import {
+  APPROVAL_EXPIRED_TEXT,
   CLAUDE_PERMISSION_DENIED_TEXT,
   HUB_UNAVAILABLE_TEXT,
   HubUnavailableError,
@@ -832,17 +833,17 @@ export class AgentWorker {
     // The generic operator gate: RELAY to the hub (step 4). In-process this is
     // `approvals.request(sessionId, 'claude/tool', {toolName, input})`; here it crosses the socket.
     try {
-      const approved = await this.relayApproval(spec.sessionId, 'claude/tool', {
+      const decision = await this.relayApprovalDetailed(spec.sessionId, 'claude/tool', {
         toolName,
         input,
         // Carried so the hub's auto-approve policy can honour a user-configured ask rule.
         matchedAskRule: context?.matchedAskRule,
       })
-      return approved
+      return decision.approved
         ? { behavior: 'allow', updatedInput: input }
         : {
             behavior: 'deny',
-            message: CLAUDE_PERMISSION_DENIED_TEXT,
+            message: decision.status === 'timeout' ? APPROVAL_EXPIRED_TEXT : CLAUDE_PERMISSION_DENIED_TEXT,
           }
     } catch (err) {
       // A hub gone past the transient bound (HubUnavailableError): canUseTool has no retryable-text channel
@@ -954,10 +955,21 @@ export class AgentWorker {
    *  the successor's idempotent approvals.request, §7.2/§8.2) and resolve true/false. PROPAGATES
    *  HubUnavailableError past the bound — it NEVER returns false on a gap (that would read as "denied"). */
   private async relayApproval(sessionId: string, kind: string, payload: unknown): Promise<boolean> {
+    return (await this.relayApprovalDetailed(sessionId, kind, payload)).approved
+  }
+
+  private async relayApprovalDetailed(
+    sessionId: string,
+    kind: string,
+    payload: unknown,
+  ): Promise<{ approved: boolean; status: 'approved' | 'denied' | 'timeout' }> {
     const approvalId = stableApprovalId(sessionId, kind, payload)
     const reply = await this.server.relay({ t: 'approvalRequest', approvalId, sessionId, kind, payload })
     if (reply.t !== 'approvalResolved') throw new Error(`approval ${kind}: unexpected reply ${reply.t}`)
-    return reply.approved
+    return {
+      approved: reply.approved,
+      status: reply.status ?? (reply.approved ? 'approved' : 'denied'),
+    }
   }
 
   /** Relay one interactive question under vendor per-invocation identity. The request is inserted before

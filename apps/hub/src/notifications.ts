@@ -5,6 +5,7 @@ export type NotificationKind =
   | 'session-completed'
   | 'session-error'
   | 'approval-required'
+  | 'question-required'
   | 'session-stalled'
   | 'journal-pressure'
   | 'hub-warning'
@@ -19,6 +20,7 @@ export interface NotificationPreferences {
   agentCompletions: boolean
   errors: boolean
   approvals: boolean
+  questions: boolean
   stalls: boolean
   journalPressure: boolean
   desktopEnabled: boolean
@@ -32,6 +34,7 @@ export const DEFAULT_NOTIFICATION_PREFERENCES: NotificationPreferences = {
   agentCompletions: false,
   errors: true,
   approvals: true,
+  questions: true,
   stalls: true,
   journalPressure: true,
   // Browser/OS permission must be requested by an explicit click in Settings. The durable in-app inbox
@@ -73,6 +76,7 @@ export interface NotificationCenter {
   getPreferences(): NotificationPreferences
   setPreferences(patch: Partial<NotificationPreferences>): NotificationPreferences
   publish(input: PublishNotification): NotificationRecord | undefined
+  resolveDedupe(dedupeKey: string, status: string): number
   list(limit?: number): NotificationRecord[]
   unreadCount(): number
   markRead(ids?: readonly string[]): number
@@ -100,6 +104,7 @@ function resolvedPreferences(value: unknown): NotificationPreferences {
     agentCompletions: bool(raw.agentCompletions, DEFAULT_NOTIFICATION_PREFERENCES.agentCompletions),
     errors: bool(raw.errors, DEFAULT_NOTIFICATION_PREFERENCES.errors),
     approvals: bool(raw.approvals, DEFAULT_NOTIFICATION_PREFERENCES.approvals),
+    questions: bool(raw.questions, DEFAULT_NOTIFICATION_PREFERENCES.questions),
     stalls: bool(raw.stalls, DEFAULT_NOTIFICATION_PREFERENCES.stalls),
     journalPressure: bool(raw.journalPressure, DEFAULT_NOTIFICATION_PREFERENCES.journalPressure),
     desktopEnabled: bool(raw.desktopEnabled, DEFAULT_NOTIFICATION_PREFERENCES.desktopEnabled),
@@ -139,6 +144,7 @@ function notificationEnabled(
           : preferences.agentCompletions
     case 'session-error': return preferences.errors
     case 'approval-required': return preferences.approvals
+    case 'question-required': return preferences.questions
     case 'session-stalled': return preferences.stalls
     case 'journal-pressure': return preferences.journalPressure
     case 'hub-warning': return true
@@ -250,6 +256,19 @@ export class NotificationService implements NotificationCenter {
     return row ? rowToRecord(row) : undefined
   }
 
+  resolveDedupe(dedupeKey: string, status: string): number {
+    const key = text(dedupeKey, 300)
+    if (!key) return 0
+    const now = new Date().toISOString()
+    return this.db
+      .prepare(
+        `UPDATE notification_inbox
+         SET read_at = COALESCE(read_at, ?), body = body || ?
+         WHERE dedupe_key = ?`,
+      )
+      .run(now, `\nCurrent status: ${text(status, 80)}.`, key).changes
+  }
+
   list(limit = 100): NotificationRecord[] {
     const bounded = Math.max(1, Math.min(250, Math.trunc(limit)))
     return (this.db
@@ -351,6 +370,14 @@ export class EphemeralNotificationService implements NotificationCenter {
     this.records = this.records.slice(0, MAX_NOTIFICATIONS)
     if (input.dedupeKey) this.dedupe.set(text(input.dedupeKey, 300), record)
     return { ...record }
+  }
+
+  resolveDedupe(dedupeKey: string, status: string): number {
+    const record = this.dedupe.get(text(dedupeKey, 300))
+    if (!record) return 0
+    record.readAt ??= new Date().toISOString()
+    record.body = `${record.body}\nCurrent status: ${text(status, 80)}.`
+    return 1
   }
 
   list(limit = 100): NotificationRecord[] {

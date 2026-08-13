@@ -175,14 +175,14 @@ describe('compact system status indicators', () => {
     render(Sidebar)
 
     const localEntry = screen.getByRole('button', { name: /Open Overseer.*not set up/i })
-    expect(screen.getByText('Overseer @ Remote Hub')).toBeTruthy()
+    expect(screen.queryByText('Overseer @ Remote Hub')).toBeNull()
 
     await fireEvent.click(localEntry)
     expect(store.selectedId).toBeNull()
     expect(store.settingsOpen).toBe(true)
   })
 
-  it('opens the local Overseer while leaving a peer Overseer in the remote roster', async () => {
+  it('opens the local Overseer while keeping a peer Overseer out of the local chat catalog', async () => {
     store.sessions = {
       local: {
         record: {
@@ -206,6 +206,6 @@ describe('compact system status indicators', () => {
     await fireEvent.click(screen.getByRole('button', { name: /Open Overseer.*idle/i }))
 
     expect(store.selectedId).toBe('local')
-    expect(screen.getByText('Overseer @ Remote Hub')).toBeTruthy()
+    expect(screen.queryByText('Overseer @ Remote Hub')).toBeNull()
   })
 })

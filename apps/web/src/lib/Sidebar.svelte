@@ -73,6 +73,17 @@
         return { key: 'idle', label: 'idle' }
     }
   })
+  const overseerSubtitle = $derived.by(() => {
+    switch (overseerLifecycle.key) {
+      case 'attention': return 'Needs your response'
+      case 'thinking': return 'Working across the app'
+      case 'error': return 'Open to review the problem'
+      case 'unavailable': return 'Account or session unavailable'
+      case 'stopped': return 'Stopped — open to restart'
+      case 'setup': return 'Set up application control'
+      default: return 'Ready to help'
+    }
+  })
 
   $effect(() => {
     if (!store.connected) return
@@ -93,7 +104,7 @@
       store.select(sessionId)
       return
     }
-    saveSettingsTab('system')
+    saveSettingsTab('overseer')
     store.settingsOpen = true
   }
 
@@ -384,9 +395,9 @@
     }
     const byProject = new Map<string, SessionView[]>()
     for (const s of store.sessionList) {
-      // The dedicated entry replaces only THIS hub's Overseer row. A peer Overseer remains visible in
-      // its remote roster and can be opened as a conversation without becoming local app control.
-      if (s.record.isOverseer && !s.record.siteId) continue
+      // Overseer authority is hub-local. Remote hubs remain visible in Devices, but their application
+      // Overseers must never fall into Unfiled or look like ordinary local chats.
+      if (s.record.isOverseer) continue
       // Retirement is an archive boundary, not another live lifecycle state. Keep the SessionView in
       // the store so transcripts, worktrees, attribution, and manager reactivation remain available,
       // but do not leave the archived row in the working chat catalog forever.
@@ -982,12 +993,14 @@
     class="overseer-entry"
     data-overseer-anchor="overseer"
     class:configured={!!(liveOverseer || overseerSessionId)}
+    class:attention={overseerLifecycle.key === 'attention'}
+    class:problem={overseerLifecycle.key === 'error' || overseerLifecycle.key === 'unavailable'}
     aria-label={`Open Overseer — ${overseerLifecycle.label}`}
     title={`Overseer status: ${overseerLifecycle.label}`}
     onclick={openOverseer}
   >
     <span class="overseer-mark"><Icon name="activity" size={14} /></span>
-    <span class="overseer-copy"><b>Overseer</b><small>{liveOverseer || overseerSessionId ? 'Application control' : 'Set up application control'}</small></span>
+    <span class="overseer-copy"><b>Overseer</b><small>{overseerSubtitle}</small></span>
     <span class="overseer-tail">
       <span class="overseer-state {overseerLifecycle.key}">
         <i class="overseer-state-dot" aria-hidden="true"></i>
@@ -1029,7 +1042,18 @@
             <span class="grip" aria-hidden="true">{@render gripIcon()}</span>
           {/if}
           <button class="folder" title={isCollapsed ? 'expand' : 'collapse'} onclick={() => toggleCollapse(g.id)}><Icon name={isCollapsed ? 'chevron-right' : 'chevron-down'} size={12} /></button>
-          <span class="gname">{g.name}</span>
+          {#if reorderable}
+            <button
+              class="gname project-link"
+              title={`Open ${g.name} project overview`}
+              onclick={(event) => {
+                event.stopPropagation()
+                store.openProjectView(g.id)
+              }}
+            >{g.name}</button>
+          {:else}
+            <span class="gname">{g.name}</span>
+          {/if}
           {#if g.wslDistro}
             <span
               class="wslbadge"
@@ -1318,6 +1342,9 @@
   .search { position: relative; padding: 0 var(--space-4) var(--space-3); }
   .overseer-entry { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: var(--space-2); margin: 0 var(--space-3) var(--space-3); padding: var(--space-2) var(--space-3); border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface); color: var(--text); text-align: left; }
   .overseer-entry:hover, .overseer-entry.configured { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+  .overseer-entry.attention { border-color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, var(--surface)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--warn) 12%, transparent); }
+  .overseer-entry.attention .overseer-copy b, .overseer-entry.attention .overseer-copy small { color: var(--warn); }
+  .overseer-entry.problem { border-color: color-mix(in srgb, var(--bad) 65%, var(--border)); }
   .overseer-copy { display: flex; min-width: 0; flex-direction: column; }
   .overseer-entry b { font-size: var(--text-xs); font-weight: var(--fw-semibold); }
   .overseer-entry small { color: var(--muted); font-size: var(--text-2xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1334,7 +1361,9 @@
   .overseer-state.stopped, .overseer-state.setup { color: var(--dim); }
   @media (prefers-reduced-motion: no-preference) {
     .overseer-state.thinking .overseer-state-dot { animation: overseer-thinking-pulse 1.2s ease-in-out infinite; }
+    .overseer-entry.attention .overseer-state-dot { animation: overseer-attention-pulse 1s ease-in-out infinite; }
     @keyframes overseer-thinking-pulse { 0%, 100% { opacity: 0.35; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1.2); } }
+    @keyframes overseer-attention-pulse { 0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--warn) 45%, transparent); } 50% { box-shadow: 0 0 0 4px transparent; } }
   }
   .sicon { position: absolute; left: 1.15rem; top: calc(50% - 0.25rem); transform: translateY(-50%); color: var(--dim); display: grid; }
   .search input { width: 100%; padding-left: 1.9rem; }
@@ -1359,6 +1388,8 @@
   .sc.done { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
   .sc.stalled { color: var(--bad-text); background: color-mix(in srgb, var(--bad-text) 14%, transparent); }
   .gname { font-weight: var(--fw-medium); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .project-link { min-width: 0; padding: 0; color: inherit; text-align: left; }
+  .project-link:hover { color: var(--text); text-decoration: underline; text-decoration-color: color-mix(in srgb, var(--accent) 70%, transparent); text-underline-offset: .18rem; }
   .wslbadge { flex: none; max-width: 7.5rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent);
     border-radius: var(--r-pill); padding: 0.08rem 0.35rem; font-size: var(--text-2xs); font-weight: var(--fw-medium); }

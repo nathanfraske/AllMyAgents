@@ -1,10 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { Journal } from './journal.js'
-import { ApprovalService } from './approvals.js'
+import { ApprovalService, DEFAULT_APPROVAL_TIMEOUT_MS } from './approvals.js'
 import type { HubEvent, ApprovalStatus } from './types.js'
-
-// The fail-closed window (mirrors APPROVAL_TIMEOUT_MS in approvals.ts — not exported, kept in sync here).
-const APPROVAL_TIMEOUT_MS = 10 * 60 * 1000
 
 // Track opened in-memory journals so their sqlite handles are released after each test.
 const opened: Journal[] = []
@@ -61,10 +58,39 @@ describe('ApprovalService — existing new-request paths (regression)', () => {
       outcome = v
     })
     expect(outcome).toBeUndefined() // still pending before the window elapses
-    await vi.advanceTimersByTimeAsync(APPROVAL_TIMEOUT_MS)
+    await vi.advanceTimersByTimeAsync(DEFAULT_APPROVAL_TIMEOUT_MS)
     expect(outcome).toBe(false) // fail-closed
     expect(approvals.pending()).toHaveLength(0)
     expect(statusOf('approval/resolved')).toBe('timeout')
+  })
+
+  it('uses an explicit timeout override without changing the safer one-hour default', async () => {
+    vi.useFakeTimers()
+    const journal = new Journal(':memory:')
+    opened.push(journal)
+    const approvals = new ApprovalService(journal, { timeoutMs: 2_000 })
+    const pending = approvals.request('s1', 'claude/tool', {})
+    await vi.advanceTimersByTimeAsync(1_999)
+    expect(approvals.pending()).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(1)
+    await expect(pending).resolves.toBe(false)
+  })
+
+  it('deterministically releases all affected pending requests after a policy widening', async () => {
+    const { approvals, events } = fresh()
+    let allowed = false
+    approvals.setAutoApprove((sessionId, _kind, payload) =>
+      allowed && sessionId === 'child' && (payload as { toolName?: string }).toolName === 'fileChange',
+    )
+    const first = approvals.request('child', 'codex/item/fileChange/requestApproval', { toolName: 'fileChange' })
+    const second = approvals.request('child', 'codex/item/fileChange/requestApproval', { toolName: 'fileChange' })
+    void approvals.request('other', 'codex/item/fileChange/requestApproval', { toolName: 'fileChange' })
+    allowed = true
+    expect(approvals.recheckPending({ sessionIds: ['child'], reason: 'manager-grant-change' })).toBe(2)
+    await expect(first).resolves.toBe(true)
+    await expect(second).resolves.toBe(true)
+    expect(approvals.pending().map((entry) => entry.sessionId)).toEqual(['other'])
+    expect(events.filter((event) => event.kind === 'approval/re-evaluated')).toHaveLength(2)
   })
 })
 
@@ -125,7 +151,7 @@ describe('ApprovalService — idempotent + re-issuable (agent detachment §2.5)'
     const { approvals, count } = fresh()
     const p = approvals.request('s1', 'claude/tool', {}, 'id-timeout')
     void p.then(() => {})
-    await vi.advanceTimersByTimeAsync(APPROVAL_TIMEOUT_MS)
+    await vi.advanceTimersByTimeAsync(DEFAULT_APPROVAL_TIMEOUT_MS)
     await expect(p).resolves.toBe(false)
 
     // A late operator click on an id the timeout already retired must not throw or re-journal.
@@ -177,7 +203,7 @@ describe('ApprovalService — resolved-before-crash recovery across a hub restar
     const { approvals, journal } = fresh()
     const p = approvals.request('s1', 'claude/tool', {}, 'stable-timeout')
     void p.then(() => {})
-    await vi.advanceTimersByTimeAsync(APPROVAL_TIMEOUT_MS)
+    await vi.advanceTimersByTimeAsync(DEFAULT_APPROVAL_TIMEOUT_MS)
     await expect(p).resolves.toBe(false)
 
     const successor = new ApprovalService(journal)

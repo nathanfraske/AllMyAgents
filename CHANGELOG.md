@@ -5,6 +5,30 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.26-alpha.30 — 2026-08-13
+
+This release consolidates settings, project management, and remote-device visibility; replaces provider-shaped
+manager permissions with semantic capabilities; makes approvals and account capacity durable and actionable; and
+regenerates live manager truth after compaction instead of trusting stale prose.
+
+[Full v0.1.26-alpha.30 release notes](docs/releases/v0.1.26-alpha.30.md)
+
+- Settings and project controls are task-oriented, persist visibly, and include one hub/testbed device overview.
+- Manager `shell`, `file_write`, `file_read`, `web`, `browser`, and `runs` grants work consistently across Claude and
+  Codex, migrate legacy grants, and revoke immediately when narrowed.
+- Approvals last long enough for a human, distinguish expiry from denial, re-evaluate deterministically after grant
+  changes, and stop delivering stale already-resolved alerts.
+- Persistent entitlement, rate-limit, reset, and headroom state drives fail-fast team preflight and usage-aware,
+  independence-constrained account selection.
+- Managers receive bounded live generated grants and rosters on every turn and after compaction; existing sessions
+  upgrade in place to capability manifest v5 without losing identity, culture, teams, or transcripts.
+- Operator mid-turn authority loss and unconfirmed worker handoffs are visible and truthful rather than silent denials
+  or fabricated agent failures.
+- Direct MyOwnMesh RPC now reports daemon, ACL, network-discovery, and control failures explicitly. The separate daemon
+  still owns the underlying Windows pipe ACL repair.
+- Versioned notes now populate the GitHub Release body directly, so the feature/fix log is no longer only a repository
+  document behind a generic release description.
+
 ## v0.1.25-alpha.29 — 2026-08-11
 
 This release makes every AllMyAgents tool call readable in the chat timeline, wakes project managers when a worker

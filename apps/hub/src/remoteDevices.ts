@@ -165,6 +165,9 @@ export interface DeviceExecutorCapabilities {
   platform: NodeJS.Platform
   arch: string
   hostname: string
+  /** Bounded inventory facts for the operator's device overview. Optional on older paired nodes. */
+  cpuCount?: number
+  totalMemoryBytes?: number
   /** Present when the executor is the vendor-free service rather than a full AllMyAgents hub. */
   nodeKind?: 'hub' | 'lightweight-testbed'
   /** Operator-selected install profile; descriptive only and never an authority token. */
@@ -728,6 +731,8 @@ export class DeviceExecutor {
       platform: process.platform,
       arch: process.arch,
       hostname: os.hostname(),
+      cpuCount: os.cpus().length,
+      totalMemoryBytes: os.totalmem(),
       environments: discoverExecutionEnvironments(),
       roots: this.policy.roots.map((root) => ({ ...root })),
     }

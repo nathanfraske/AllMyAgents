@@ -62,7 +62,14 @@
   type Authority = 'commit' | 'push'
   type PermissionMode = 'safe' | 'edits' | 'full'
 
-  const COMMON_TOOLS = ['Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash', 'PowerShell', 'WebFetch', 'WebSearch']
+  const COMMON_CAPABILITIES = [
+    { id: 'shell', label: 'Shell commands', detail: 'Claude Bash/PowerShell and Codex command execution' },
+    { id: 'file_write', label: 'Write files', detail: 'Claude Edit/Write and Codex file changes' },
+    { id: 'file_read', label: 'Read files', detail: 'Read, search, glob, and grep' },
+    { id: 'web', label: 'Web research', detail: 'Web search and fetch' },
+    { id: 'browser', label: 'Browser', detail: 'Granted interactive browser operations' },
+    { id: 'runs', label: 'Durable runs', detail: 'Start, inspect, and control local or remote runs' },
+  ] as const
 
   const eligibleChats = $derived(
     store.sessionList.filter(
@@ -119,6 +126,17 @@
         : undefined),
   )
   const isActiveManager = $derived(selectedRecord?.isProjectManager === true)
+  const operatorTaskStale = $derived.by(() => {
+    if (!selectedRecord?.managerOperatorTask || !selectedRecord.managerOperatorTaskUpdatedAt) return false
+    const reviewedAt = Date.parse(selectedRecord.managerOperatorTaskUpdatedAt)
+    return Number.isFinite(reviewedAt) && Date.now() - reviewedAt > 7 * 24 * 60 * 60 * 1000
+  })
+  const proseProfileReferences = $derived.by(() => {
+    const prose = [operatorTask, orientationBrief, standingInstructions].join('\n').toLocaleLowerCase()
+    return availableProfiles
+      .map((profile) => profile.id)
+      .filter((profileId) => prose.includes(profileId.toLocaleLowerCase()))
+  })
   const managerProfile = $derived(availableProfiles.find((profile) => profile.id === managerProfileId))
   const managerModels = $derived(managerProfile ? modelsFor(managerProfile.provider) : [])
   const managerEffortOptions = $derived(
@@ -155,7 +173,7 @@
       `PROJECT\nManage ${projectName} at ${projectPath}.\nWhat is already here: ${existing.length ? existing.join('; ') : 'no other project chats are running yet'}.`,
       `YOUR ALLMYAGENTS TOOLS\n- list_agents: see the active-catalog project teammates you can address.\n- spawn_agent: create a real durable child worker in the active team. It gets an isolated git worktree by default. Every manager-created worker must use an operator-defined agent_type or an explicit durable role; profile_id only selects its account, while prompt is the current assignment.\n- manage_team: list, create, rename, or activate durable teams. Switching shelves the outgoing chats while preserving their ids, culture, transcripts, branches, dirty files, and worktrees. It will not interrupt running agents unless the operator explicitly requests interrupt_active.\n- manage_child: resume a stopped/errored worker or repair its durable role. Legacy reactivate also restores old retired records; creating new retired records is disabled.\n- child_status: get the live running / idle / stopped / errored tally, immutable agent ids, durable roles, team membership, and context-continuity warnings without polling.\n- peek_agent: inspect a worker or enabled one-shot descendant without interrupting it. For your own hierarchy you may request activity, full transcript, changes, tasks, approvals/blockers, worktree state, or all views.\n- assign_child_task: put an audited assignment on any agent in your managed hierarchy; the operator sees that same board. Use the task id to update its state later. A high-context result tells you that the next direct manager wake will use the provider compaction boundary.\n- set_child_authority: grant or revoke only the worker Git actions, exact tools, and permission mode inside your grant ceiling; changes apply on the child’s next tool call.\n- send_message and read_messages: coordinate through the project bus. Prefer a direct message to one session; broadcast only when every project agent must act. A direct message can wake your own high-context worker so its provider compaction preserves continuity; set wake=false for checkpoints/FYIs.\n- practice_write / practice_list / practice_read / practice_edit: manage durable team conventions that future agents should follow.\n- memory_write / memory_search / memory_read: retain and retrieve project facts and decisions.`,
       `CHILD APPROVAL TOOL\n- decide_child_approval: approve or deny one pending request from your managed hierarchy when child approvals are enabled. The hub refuses unrelated agents and anything outside your operator-granted ceiling. Disabled, unavailable, and out-of-ceiling manager requests automatically escalate to the Overseer/operator; do not ask a blocked worker to repeat the request.`,
-      `IMPORTANT — TOOL LAYERS\nUse the hub-provided AllMyAgents tools described above. In Codex, choose the fully-qualified mcp__allmyagents__spawn_agent and mcp__allmyagents__list_agents tools (some clients render those names as mcp__allmyagents.spawn_agent and mcp__allmyagents.list_agents). Never call collaboration.spawn_agent, collaboration.list_agents, or another native collabAgentToolCall for project work. The native Codex or Claude harness may expose similar names, but those tools do not create the real app chats and worktrees you are managing. If a worker does not appear in the AllMyAgents sidebar with a session id, parentSessionId, and worktree, treat that as a failed delegation and retry with the mcp__allmyagents tool.`,
+      `IMPORTANT — TOOL LAYERS\nUse the hub-provided AllMyAgents tools described above. Native spawn_agent is not an AllMyAgents project tool. In Codex, choose the fully-qualified mcp__allmyagents__spawn_agent and mcp__allmyagents__list_agents tools (some clients render those names as mcp__allmyagents.spawn_agent and mcp__allmyagents.list_agents). Never call collaboration.spawn_agent, collaboration.list_agents, or another native collabAgentToolCall for project work. The native Codex or Claude harness may expose similar names, but those tools do not create the real app chats and worktrees you are managing. If a worker does not appear in the AllMyAgents sidebar with a session id, parentSessionId, and worktree, treat that as a failed delegation and retry with the mcp__allmyagents tool.`,
       `GRANTED BRIEF AND LIMITS\n- Grant ceiling means the maximum scope the operator gave you; every child grant must stay inside it.\n- At most ${maxLiveChildren} live direct children. The hub refuses an additional spawn at the bound; reuse an existing role or switch teams rather than churning identities.\n- Parallel staffing target: ${parallelismTarget} useful direct worker lanes whenever the task supports them. Recheck this at every new task or material slice; use independent implementation, reproduction, research, or cross-check lanes, and explain a concrete dependency when fewer lanes are honestly useful. Never invent or duplicate work just to fill the target.\n- Child permission modes may not exceed ${maxChildPermissionMode}.\n- Exact worker profile_id values you may pass to spawn_agent: ${workerScope.profiles.length ? workerScope.profiles.map(rawManagerProfileId).join(', ') : 'none'}.\n- Worker Git permissions you may grant or approve once: ${delegation.length ? authority : 'none'}.\n- Additional exact worker tools you may grant or approve once: ${allowedTools.length ? allowedTools.join(', ') : 'none'}.\n- Child approval decisions: ${canApproveChildren ? 'enabled for your managed descendants, within the exact Git/tool ceiling above; broader requests automatically escalate to the Overseer/operator' : 'disabled; every request automatically escalates to the Overseer/operator'}.\n- Exhausted-account dispatch guard: ${pauseExhaustedAccounts ? 'enabled; the hub refuses new child spawns and messages at a hard 100% usage limit unless paid overage or usage credits are active' : 'disabled; account exhaustion does not add a manager-specific dispatch block'}.\n- Context continuity: direct manager wakes may restart a high-context child so Claude auto-compaction or Codex native compaction can preserve its role knowledge. Lifecycle chatter and unrelated system mail remain guarded.\n- Worker one-shot sub-agents: ${allowWorkerSubagents ? `enabled, with at most ${maxSubagentsPerWorker} concurrently running beneath each direct worker; they inherit that worker's exact account, role, and grant` : 'disabled'}.\n- Delegation only narrows: a manager cannot grant what it does not hold — including an authority, account, model, permission mode, or tool.\n- You have full non-interfering visibility into your own managed hierarchy, and only that hierarchy.\n${roles.length ? `Worker roles (prefer their exact agent_type id when one fits):\n${roles.join('\n')}` : `No named worker roles are configured; every spawn_agent call must provide both profile_id and a concise durable role distinct from its prompt.`}`,
       `OPERATING CADENCE\nTurn the operator task into bounded assignments with an expected output and a clear completion check. In each assignment, name the worker’s durable role, the temporary task, and the exact granted tools it may use. Spawn only useful parallel work and give every new worker a durable role. At decision points use child_status; use peek_agent when status alone is insufficient. Reuse an idle worker whose role fits, resume a stopped/errored worker rather than replacing it, and let the provider compact high context while preserving the role and project state. If a task needs a genuinely different type of expertise nobody on the active team owns, create or activate another team and stash the current lineup intact. Never retire a worker merely because a task ended, a turn failed transiently, or its context is large. Verify a child’s transcript and worktree changes before relying on its result. If a child stalls, blocks, errors, exceeds scope, or collides: inspect it and send one direct corrective message. When it asks for an ungranted tool, redirect it to a granted alternative instead of widening authority or waiting; otherwise reassign or re-sequence when possible, and report any decision that needs the operator in this manager chat. Send one useful update per meaningful event rather than narrating every step. Finish with a concise report of each child’s final status, findings, files/commits changed, verification performed, and unresolved decisions.`,
       `REMEMBERED CHILD APPROVALS\nWhen a recurring, understood ordinary tool or Git action from a direct worker should no longer interrupt you, call decide_child_approval with approve=true and remember=true. The hub stores only that exact class on that worker, rechecks it against your live ceiling on every use, journals it, and lets you revoke it with set_child_authority. Use one-time approval for unusual or high-blast-radius requests. One-shot descendants inherit their direct worker's grant.`,
@@ -170,8 +188,12 @@
         'This full starting prompt is your manager brief; OPERATOR TASK at the end is the assignment to execute now.',
         'The operator task is appended to this orientation when the manager launches.',
       )
+    const withoutConfigurationSnapshot = withoutTask.replace(
+      /\n\nGRANTED BRIEF AND LIMITS\n[\s\S]*?(?=\n\nOPERATING CADENCE)/,
+      '\n\nLIVE GRANT\nAccounts, models, role assignments, usage headroom, capabilities, Git actions, approval scope, and concurrency are generated from live hub state at every turn. That generated block is authoritative; do not preserve or infer those values from prose.',
+    )
     return [
-      withoutTask,
+      withoutConfigurationSnapshot,
       'DELEGATION DEFAULT\nDelegate all bounded project work by default to real AllMyAgents workers. Keep decomposition, coordination, inspection, and verification yourself; do not perform worker tasks in the native vendor harness.',
     ].join('\n\n')
   }
@@ -373,7 +395,9 @@
   function usageLabel(profileId: string): string {
     const snapshot = store.usage.find((item) => item.profileId === profileId)
     if (!snapshot) return 'usage not reported'
+    if (snapshot.entitlement === 'denied') return `not entitled${snapshot.entitlementReason ? `: ${snapshot.entitlementReason}` : ''}`
     if (snapshot.blocked) return `blocked${snapshot.blockedReason ? `: ${snapshot.blockedReason}` : ''}`
+    if (typeof snapshot.headroom === 'number') return `${Math.round(snapshot.headroom * 100)}% headroom`
     const used = snapshot.codex?.usedPercent ??
       (snapshot.claudeUsage?.length ? Math.max(...snapshot.claudeUsage.map((line) => line.percent)) : undefined)
     return typeof used === 'number' ? `${Math.round(used)}% used` : 'available'
@@ -550,7 +574,9 @@
         allowedModels: config.allowedModels,
         allowedTools,
         agentTypes,
-        startingPrompt: config.startingPrompt,
+        // The composed launch message is sent once below. Persisting a second copy beside orientation
+        // and operatorTask made stale account/layout claims survive forever in three different fields.
+        startingPrompt: '',
         orientationBrief: config.orientationBrief,
         operatorTask: config.operatorTask,
         standingInstructions: config.standingInstructions,
@@ -855,11 +881,17 @@
           placeholder="What should this manager and its workers accomplish?"
         ></textarea>
         <small>Leave blank to launch a readiness check: the manager verifies its AllMyAgents tools, reports, then stops and asks you for a task.</small>
+        {#if operatorTaskStale}
+          <small class="warning">This task has not been reviewed for over seven days. Confirm or replace it before relying on it after compaction or restart.</small>
+        {/if}
       </label>
 
       <details class="brief-editor">
         <summary>Edit the full brief and standing rules</summary>
         <p>The orientation is sent at launch. Standing rules are reapplied through the manager's instruction scope on later turns, including after compaction.</p>
+        {#if proseProfileReferences.length}
+          <p class="warning">Account names ({proseProfileReferences.join(', ')}) appear in editable prose. Live account, model, role, and capability configuration is rendered automatically and overrides this text; remove those references so the brief cannot go stale.</p>
+        {/if}
         <label>
           <span>Manager orientation brief</span>
           <textarea
@@ -916,6 +948,11 @@
               <button class:active={role.selection === 'fixed'} type="button" onclick={() => setAgentTypeSelection(index, 'fixed')}>Use this model</button>
               <button class:active={role.selection === 'usage-aware'} type="button" onclick={() => setAgentTypeSelection(index, 'usage-aware')}>Let manager choose using usage limits</button>
             </div>
+            <label class="isolation-group">
+              <span>Account isolation group <em>optional</em></span>
+              <input value={role.independenceGroup ?? ''} placeholder="e.g. implementation-review" oninput={(event) => updateAgentType(index, { independenceGroup: (event.target as HTMLInputElement).value || undefined })} />
+              <small>Roles with the same group are kept on different accounts in the active team, preserving reviewer/implementer independence.</small>
+            </label>
             {#if role.selection === 'fixed'}
               <div class="row three">
                 <label>
@@ -1008,11 +1045,11 @@
       </fieldset>
 
       <fieldset>
-        <legend>Other tools the manager may grant or approve once <em>optional</em></legend>
-        <p>Requests outside this exact list go to the operator or Overseer. Choose common tools below, or add the exact tool name shown in a worker’s tool list or approval card.</p>
+        <legend>Capabilities the manager may grant or approve once <em>optional</em></legend>
+        <p>Capabilities work across Claude and Codex. Requests outside this list go to the operator or Overseer. Exact custom MCP/plugin tools can still be added below.</p>
         <div class="tool-grid">
-          {#each COMMON_TOOLS as tool}
-            <label><input type="checkbox" checked={allowedTools.includes(tool)} onchange={(event) => toggleTool(tool, (event.target as HTMLInputElement).checked)} /> {tool}</label>
+          {#each COMMON_CAPABILITIES as capability}
+            <label title={capability.detail}><input type="checkbox" checked={allowedTools.includes(capability.id)} onchange={(event) => toggleTool(capability.id, (event.target as HTMLInputElement).checked)} /> {capability.label}</label>
           {/each}
         </div>
         <div class="custom-tool">

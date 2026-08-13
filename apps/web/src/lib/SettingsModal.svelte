@@ -1,7 +1,8 @@
 <script lang="ts">
   import { store } from './store.svelte'
   import { settings } from './settings.svelte'
-  import { api, getFleetSiteToken, type DeviceExecutorCapabilities, type DeviceRootPolicy, type MeshStatus, type Instruction, type Practice, type DangerFlags, type HubPrefs, type LoginAuthMode, type OverseerStatus, type NotificationPreferences, type ElevationBrokerStatus } from './api'
+  import { api, getFleetSiteToken, type DeviceExecutorCapabilities, type DeviceRootPolicy, type MeshStatus, type RemoteDeviceCatalogEntry, type Instruction, type Practice, type DangerFlags, type HubPrefs, type LoginAuthMode, type OverseerStatus, type NotificationPreferences, type ElevationBrokerStatus } from './api'
+  import DeviceOverview from './DeviceOverview.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
   import Icon from './Icon.svelte'
   import PairingCodeInput from './PairingCodeInput.svelte'
@@ -44,6 +45,7 @@
   } = $props()
   let writeError = $state('')
   let activeTab = $state<SettingsTabId>(loadSettingsTab())
+  const activeTabInfo = $derived(SETTINGS_TABS.find((tab) => tab.id === activeTab) ?? SETTINGS_TABS[0])
   const localProfiles = $derived(store.profiles.filter((profile) => !profile.siteId))
   const localProjects = $derived(store.projects.filter((project) => !project.siteId))
   const updateLiveTurns = $derived(countLiveUpdateTurns(store.sessions))
@@ -65,6 +67,7 @@
     agentCompletions: false,
     errors: true,
     approvals: true,
+    questions: true,
     stalls: true,
     journalPressure: true,
     desktopEnabled: false,
@@ -210,8 +213,14 @@
   let fleetRefreshBusy = $state(false)
   let fleetRefreshError = $state('')
   let fleetRefreshedAt = $state('')
+  let remoteDeviceInventory = $state<RemoteDeviceCatalogEntry[]>([])
+  let deviceInventoryLoading = $state(true)
   $effect(() => {
     void api.mesh().then((m) => (mesh = m))
+    void api.remoteDeviceInventory()
+      .then((devices) => (remoteDeviceInventory = devices))
+      .catch((error) => (fleetRefreshError = error instanceof Error ? error.message : String(error)))
+      .finally(() => (deviceInventoryLoading = false))
   })
   async function toggleMesh(on: boolean): Promise<void> {
     meshBusy = true
@@ -230,13 +239,23 @@
     fleetRefreshBusy = true
     fleetRefreshError = ''
     try {
-      const [, status] = await Promise.all([store.refreshFleet(true), api.mesh()])
+      const [, status, executor, devices] = await Promise.all([
+        store.refreshFleet(true),
+        api.mesh(),
+        api.deviceExecutor(),
+        api.remoteDeviceInventory(),
+      ])
       mesh = status
+      deviceExecutor = executor
+      deviceEnabled = executor.enabled
+      deviceRoots = executor.roots
+      remoteDeviceInventory = devices
       fleetRefreshedAt = new Date().toISOString()
     } catch (error) {
       fleetRefreshError = error instanceof Error ? error.message : String(error)
     } finally {
       fleetRefreshBusy = false
+      deviceInventoryLoading = false
     }
   }
   let fleetTokenDrafts = $state<Record<string, string>>({})
@@ -858,11 +877,30 @@
           aria-selected={activeTab === tab.id}
           aria-controls="settings-pane"
           onclick={() => selectTab(tab.id)}
-        >{tab.label}</button>
+        >
+          <span>{tab.label}</span>
+          <small>{tab.description}</small>
+        </button>
       {/each}
     </div>
 
     <div class="body" id="settings-pane" role="tabpanel">
+    <div class="pane-intro">
+      <div>
+        <h3>{activeTabInfo.label}</h3>
+        <p>{activeTabInfo.description}</p>
+      </div>
+      <span class="save-state {settings.syncState}" role={settings.syncState === 'error' ? 'alert' : 'status'}>
+        {settings.syncState === 'saving'
+          ? 'Saving…'
+          : settings.syncState === 'saved'
+            ? 'Saved to this hub'
+            : settings.syncState === 'error'
+              ? 'Save failed'
+              : 'Saved on this device'}
+      </span>
+    </div>
+    {#if settings.syncError}<p class="status error write-error">{settings.syncError}</p>{/if}
     {#if writeError}<p class="status error write-error">{writeError}</p>{/if}
     <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Accounts')} data-overseer-anchor="accounts">
       <h3>Accounts</h3>
@@ -961,6 +999,14 @@
 
     <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Defaults for new chats')} data-overseer-anchor="chat_defaults">
       <h3>Defaults for new chats</h3>
+      <label class="opt row2">Your name
+        <input
+          value={settings.ownerName}
+          maxlength="120"
+          placeholder="Used in the home greeting"
+          onchange={(e) => settings.set('ownerName', (e.target as HTMLInputElement).value.trim())}
+        />
+      </label>
       <label class="opt row2">Account
         <select value={settings.defaultAccount} onchange={(e) => settings.set('defaultAccount', (e.target as HTMLSelectElement).value)}>
           <option value="">last used</option>
@@ -968,7 +1014,7 @@
         </select>
       </label>
       <label class="opt row2">Permission mode
-        <select value={settings.defaultPermissionMode} onchange={(e) => settings.set('defaultPermissionMode', (e.target as HTMLSelectElement).value)}>
+        <select value={settings.defaultPermissionMode} onchange={(e) => settings.set('defaultPermissionMode', (e.target as HTMLSelectElement).value as 'safe' | 'edits' | 'full')}>
           <option value="safe">Safe (ask)</option>
           <option value="edits">Edits free</option>
           <option value="full">Full access</option>
@@ -1054,7 +1100,10 @@
 
     <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Remote access')} data-overseer-anchor="remote_access">
       <div class="remote-heading">
-        <h3>Remote access (mesh)</h3>
+        <div>
+          <h3>Devices</h3>
+          <p class="hint dim">Every connected AllMyAgents Hub and authorized lightweight testbed, in one place.</p>
+        </div>
         <div class="remote-refresh">
           {#if fleetRefreshedAt}<span class="hint dim">checked {new Date(fleetRefreshedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })}</span>{/if}
           <button class="btn" disabled={fleetRefreshBusy} onclick={refreshRemoteAccess}>
@@ -1063,9 +1112,35 @@
         </div>
       </div>
       {#if fleetRefreshError}<p class="hint warn" role="alert">{fleetRefreshError}</p>{/if}
-      {#if mesh}
+      <DeviceOverview
+        fleet={store.fleetSites}
+        localCapabilities={deviceExecutor}
+        remoteCatalog={remoteDeviceInventory}
+        loading={deviceInventoryLoading || fleetRefreshBusy}
+      />
+
+      <details class="remote-setup">
+        <summary>
+          <span><strong>Connection &amp; pairing</strong><small>Expose this Hub, link fleet peers, or use a recovery code.</small></span>
+        </summary>
+        <div class="setup-body">
+        {#if mesh}
         <label class="opt"><input type="checkbox" checked={mesh.enabled} disabled={meshBusy} onchange={(e) => toggleMesh((e.target as HTMLInputElement).checked)} /> Expose this hub to my AllMyStuff fleet</label>
         <div class="mesh-status">
+          {#if mesh.directRpc?.available}
+            <span class="mstate on">Direct hub link active across {mesh.directRpc.networkIds?.length ?? 1} fleet {mesh.directRpc.networkIds?.length === 1 ? 'network' : 'networks'}.</span>
+          {:else if mesh.directRpc?.reason === 'permission-denied'}
+            <span class="mstate warn" role="alert">Direct hub link blocked by MyOwnMesh permissions.</span>
+            <span class="hint dim">{mesh.directRpc.error}</span>
+          {:else if mesh.directRpc?.reason === 'no-daemon'}
+            <span class="mstate off">MyOwnMesh is not running, so direct hub linking is unavailable.</span>
+          {:else if mesh.directRpc?.reason === 'no-networks'}
+            <span class="mstate warn">MyOwnMesh is running, but no eligible AllMyStuff fleet network is active.</span>
+          {:else if mesh.directRpc?.reason === 'control-error'}
+            <span class="mstate warn">Direct hub link could not start{mesh.directRpc.error ? ` — ${mesh.directRpc.error}` : ''}.</span>
+          {:else if mesh.enabled}
+            <span class="dim">Direct hub link is connecting…</span>
+          {/if}
           {#if !mesh.nodePresent && mesh.enabled}
             <span class="mstate off">No AllMyStuff node detected on this PC — hub stays local-only.</span>
           {:else if mesh.exposed}
@@ -1077,7 +1152,7 @@
             <span class="dim">Off — your hub stays bound to 127.0.0.1 only.</span>
           {/if}
         </div>
-        <p class="hint dim">Rides your AllMyStuff mesh as a "site" (no Tailscale). The hub always stays on loopback — the local node tunnels it to your own devices, which need no grant.</p>
+        <p class="hint dim">Direct fleet RPC is preferred. The loopback Site route remains as a compatibility fallback for remote chat streaming.</p>
         <div class="token-row pairing-code-row">
           <span class="tlabel dim">Pairing code</span>
           <code class="cmd pairing-code">{pairingCode || '••••-••••'}</code>
@@ -1161,20 +1236,26 @@
             {/each}
           </div>
         {/if}
-      {:else}
-        <p class="dim">Checking mesh…</p>
-      {/if}
+        {:else}
+          <p class="dim">Checking mesh…</p>
+        {/if}
+        </div>
+      </details>
 
-      <div class="testbed-policy">
+      <details class="testbed-policy">
+        <summary>
+          <span><strong>Local testbed policy</strong><small>{deviceEnabled ? `${deviceRoots.length} authorized ${deviceRoots.length === 1 ? 'root' : 'roots'}` : 'Disabled'}</small></span>
+        </summary>
+        <div class="testbed-body">
         <div class="testbed-head">
           <div>
-            <h4>Authorize this machine as a testbed</h4>
+            <h4>What remote agents may use</h4>
             <p class="hint dim">Off by default. Only the roots and operations below can be granted to individual chats on another paired hub.</p>
           </div>
           <label class="switch-label"><input type="checkbox" bind:checked={deviceEnabled} /> enabled</label>
         </div>
         {#if deviceExecutor}
-          <p class="hint dim">{deviceExecutor.hostname} Â· {deviceExecutor.platform}/{deviceExecutor.arch}</p>
+          <p class="hint dim">{deviceExecutor.hostname} · {deviceExecutor.platform}/{deviceExecutor.arch}</p>
         {/if}
         <div class="device-roots">
           {#each deviceRoots as root, index (`${root.id}:${root.environment?.kind === 'wsl' ? root.environment.distro : 'host'}:${root.path}`)}
@@ -1194,7 +1275,7 @@
         </div>
         <div class="testbed-actions">
           <button class="btn" onclick={addDeviceRoot}>Add approved host folder</button>
-          <button class="btn btn-primary" disabled={deviceBusy} onclick={saveDevicePolicy}>{deviceBusy ? 'savingâ€¦' : deviceSaved ? 'Saved âœ“' : 'Save testbed policy'}</button>
+          <button class="btn btn-primary" disabled={deviceBusy} onclick={saveDevicePolicy}>{deviceBusy ? 'saving…' : deviceSaved ? 'Saved ✓' : 'Save testbed policy'}</button>
         </div>
         {#if deviceExecutor?.environments?.some((environment) => environment.kind === 'wsl')}
           <div class="wsl-root-add">
@@ -1209,7 +1290,8 @@
         {/if}
         {#if deviceError}<p class="hint warn" role="alert">{deviceError}</p>{/if}
         <p class="hint dim">Terminal commands start in the selected root with bounded time and output, but the shell retains this OS account's normal machine access. Pairing a machine or selecting Full access in a chat does not grant this authority.</p>
-      </div>
+        </div>
+      </details>
     </section>
 
     <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Operator profile & instructions')}>
@@ -1331,6 +1413,7 @@
       <label class="opt"><input type="checkbox" checked={notificationPrefs.agentCompletions} onchange={(event) => setNotificationPreferences({ agentCompletions: (event.target as HTMLInputElement).checked })} /> Every agent turn completion</label>
       <label class="opt"><input type="checkbox" checked={notificationPrefs.errors} onchange={(event) => setNotificationPreferences({ errors: (event.target as HTMLInputElement).checked })} /> Agent and manager errors</label>
       <label class="opt"><input type="checkbox" checked={notificationPrefs.approvals} onchange={(event) => setNotificationPreferences({ approvals: (event.target as HTMLInputElement).checked })} /> Permission and elevated-command approvals</label>
+      <label class="opt"><input type="checkbox" checked={notificationPrefs.questions} onchange={(event) => setNotificationPreferences({ questions: (event.target as HTMLInputElement).checked })} /> Questions and decisions that need your response</label>
       <label class="opt"><input type="checkbox" checked={notificationPrefs.stalls} onchange={(event) => setNotificationPreferences({ stalls: (event.target as HTMLInputElement).checked })} /> Stalled child detection</label>
       <label class="opt"><input type="checkbox" checked={notificationPrefs.journalPressure} onchange={(event) => setNotificationPreferences({ journalPressure: (event.target as HTMLInputElement).checked })} /> Journal and recovery storage pressure</label>
       <label class="opt"><input type="checkbox" checked={notificationPrefs.desktopEnabled} onchange={(event) => toggleDesktopNotifications((event.target as HTMLInputElement).checked)} /> Also show eligible alerts as desktop notifications</label>
@@ -1457,12 +1540,22 @@
   }
   .head { display: flex; align-items: center; justify-content: space-between; padding: var(--space-4) var(--space-5); border-bottom: 1px solid var(--border); }
   h2 { margin: 0; font-size: var(--text-lg); }
-  .settings-layout { min-height: 0; flex: 1; display: grid; grid-template-columns: calc(var(--space-8) + var(--space-8) + var(--space-8) + var(--space-8) + var(--space-8)) minmax(0, 1fr); }
+  .settings-layout { min-height: 0; flex: 1; display: grid; grid-template-columns: minmax(13.5rem, 15.5rem) minmax(0, 1fr); }
   .tabs { display: flex; flex-direction: column; gap: var(--space-1); padding: var(--space-4) var(--space-3); background: var(--surface-2); border-right: 1px solid var(--border); }
-  .tab { width: 100%; padding: var(--space-3) var(--space-4); border: 0; border-left: var(--space-1) solid transparent; border-radius: var(--r-md); background: transparent; color: var(--muted); font-size: var(--text-sm); text-align: left; }
+  .tab { display: flex; width: 100%; flex-direction: column; gap: .16rem; padding: var(--space-3) var(--space-4); border: 0; border-left: var(--space-1) solid transparent; border-radius: var(--r-md); background: transparent; color: var(--muted); text-align: left; }
+  .tab > span { color: inherit; font-size: var(--text-sm); font-weight: var(--fw-medium); }
+  .tab > small { color: var(--dim); font-size: var(--text-2xs); line-height: 1.3; }
   .tab:hover { background: var(--surface-3); color: var(--text); }
   .tab.active { border-left-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--surface-3)); color: var(--text); }
-  .body { min-width: 0; overflow-y: auto; padding: var(--space-5) var(--space-5) var(--space-6); display: flex; flex-direction: column; gap: var(--space-7); }
+  .body { min-width: 0; overflow-y: auto; padding: 0 var(--space-5) var(--space-6); display: flex; flex-direction: column; gap: var(--space-4); }
+  .pane-intro { position: sticky; z-index: 3; top: 0; display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); margin: 0 calc(-1 * var(--space-5)); padding: var(--space-4) var(--space-5); border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--surface) 94%, transparent); backdrop-filter: blur(10px); }
+  .pane-intro h3 { margin: 0; color: var(--text); font-size: var(--text-md); letter-spacing: normal; text-transform: none; }
+  .pane-intro p { margin: .15rem 0 0; color: var(--muted); font-size: var(--text-xs); }
+  .save-state { flex: none; padding: .25rem .5rem; border: 1px solid var(--border); border-radius: var(--r-pill); color: var(--muted); font-size: var(--text-2xs); white-space: nowrap; }
+  .save-state.saving { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
+  .save-state.saved { color: var(--ok); }
+  .save-state.error { color: var(--bad-text); border-color: var(--bad); }
+  .body > section:not(.tab-hidden) { padding: var(--space-4); border: 1px solid var(--border-subtle); border-radius: var(--r-lg); background: color-mix(in srgb, var(--surface-2) 38%, transparent); box-shadow: var(--edge-hi); }
   .tab-hidden { display: none; }
   section h3 { margin: 0 0 var(--space-3); font-size: var(--text-2xs); text-transform: uppercase; letter-spacing: var(--ls-label); color: var(--dim); }
   .accounts { display: flex; flex-direction: column; gap: var(--space-2); margin-bottom: var(--space-4); }
@@ -1498,6 +1591,15 @@
   .opt { display: flex; align-items: center; gap: var(--space-3); margin-bottom: var(--space-3); }
   .opt.row2 { justify-content: space-between; }
   .opt.row2 select { min-width: 11rem; }
+  .opt.row2 input:not([type='checkbox']) { min-width: 11rem; }
+  @media (max-width: 760px) {
+    .modal { width: min(96vw, 64rem); height: min(92vh, 48rem); }
+    .settings-layout { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
+    .tabs { flex-direction: row; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--border); }
+    .tab { min-width: 9rem; border-left: 0; border-bottom: var(--space-1) solid transparent; }
+    .tab.active { border-bottom-color: var(--accent); }
+    .tab > small { display: none; }
+  }
   .hint { font-size: var(--text-xs); line-height: 1.5; }
   .upd-row { display: flex; gap: var(--space-3); flex-wrap: wrap; margin: var(--space-3) 0 var(--space-2); }
   .upd-err { color: var(--bad); }
@@ -1506,6 +1608,7 @@
   .mesh-status { display: flex; flex-direction: column; gap: var(--space-3); margin-bottom: var(--space-3); }
   .remote-heading { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-3); }
   .remote-heading h3 { margin: 0; }
+  .remote-heading p { margin: var(--space-1) 0 0; }
   .remote-refresh { display: flex; align-items: center; gap: var(--space-2); }
   .remote-refresh .btn { display: inline-flex; align-items: center; gap: var(--space-1); }
   .mstate { font-size: var(--text-xs); line-height: 1.45; }
@@ -1524,7 +1627,17 @@
   .fleet-peer { border: 1px solid var(--border-subtle); border-radius: var(--r-md); padding: var(--space-3); background: var(--surface-1); }
   .fleet-peer-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-2); font-size: var(--text-sm); }
   .fleet-peer .hint { margin: 0; }
-  .testbed-policy { margin-top: var(--space-5); padding-top: var(--space-5); border-top: 1px solid var(--border); }
+  .remote-setup, .testbed-policy { margin-top: var(--space-4); border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--surface-1); }
+  .remote-setup > summary, .testbed-policy > summary { cursor: pointer; list-style: none; padding: var(--space-3) var(--space-4); }
+  .remote-setup > summary::-webkit-details-marker, .testbed-policy > summary::-webkit-details-marker { display: none; }
+  .remote-setup > summary::after, .testbed-policy > summary::after { content: '+'; float: right; color: var(--muted); font-size: var(--text-lg); line-height: 1; }
+  .remote-setup[open] > summary::after, .testbed-policy[open] > summary::after { content: '−'; }
+  .remote-setup > summary span, .testbed-policy > summary span { display: inline-flex; flex-direction: column; gap: var(--space-1); }
+  .remote-setup > summary strong, .testbed-policy > summary strong { font-size: var(--text-sm); }
+  .remote-setup > summary small, .testbed-policy > summary small { color: var(--muted); font-size: var(--text-xs); }
+  .setup-body, .testbed-body { padding: 0 var(--space-4) var(--space-4); border-top: 1px solid var(--border-subtle); }
+  .setup-body { padding-top: var(--space-4); }
+  .testbed-body { padding-top: var(--space-3); }
   .testbed-head { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--space-4); }
   .testbed-head h4 { margin: 0 0 var(--space-1); font-size: var(--text-sm); }
   .testbed-head p { margin: 0; }

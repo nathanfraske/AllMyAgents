@@ -150,9 +150,9 @@
   const guideSettingsTab = $derived.by(() => {
     switch (store.overseerUiGuide?.target) {
       case 'accounts': return 'accounts' as const
-      case 'chat_defaults': return 'chats' as const
+      case 'chat_defaults': return 'general' as const
       case 'remote_access': return 'remote' as const
-      case 'safety': return 'safety' as const
+      case 'safety': return 'advanced' as const
       default: return undefined
     }
   })
@@ -501,7 +501,7 @@
       ? tutorials.firstRunPhase === 'accounts'
         ? 'accounts'
         : tutorials.firstRunPhase === 'overseer'
-          ? 'system'
+          ? 'overseer'
           : undefined
       : guideSettingsTab}
     onloginstate={loginStateChanged}

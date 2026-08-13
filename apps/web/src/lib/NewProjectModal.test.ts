@@ -328,7 +328,8 @@ describe('New project pipeline', () => {
       expect.objectContaining({
         enabled: true,
         permissionMode: 'safe',
-        startingPrompt: expect.stringMatching(/Control room/i),
+        startingPrompt: '',
+        orientationBrief: expect.stringMatching(/Control room/i),
       }),
     )
     expect(apiMock.setMode).not.toHaveBeenCalled()

@@ -50,6 +50,24 @@ describe('NotificationService', () => {
     expect(notifications.unreadCount()).toBe(2)
   })
 
+  it('keeps operator questions visible and independently configurable', () => {
+    const notifications = service()
+    expect(notifications.publish({
+      kind: 'question-required',
+      sourceRole: 'overseer',
+      title: 'Overseer needs your response',
+      body: 'Choose the project location.',
+      dedupeKey: 'question:one',
+    })?.severity).toBe('info')
+    notifications.setPreferences({ questions: false })
+    expect(notifications.publish({
+      kind: 'question-required',
+      sourceRole: 'manager',
+      title: 'Manager needs your response',
+      body: 'Choose the rollout scope.',
+    })).toBeUndefined()
+  })
+
   it('persists preferences and never retroactively turns old inbox rows into desktop alerts', () => {
     const notifications = service()
     const before = notifications.publish({

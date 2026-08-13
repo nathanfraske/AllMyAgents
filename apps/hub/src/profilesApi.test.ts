@@ -87,6 +87,7 @@ describe('profile account API contract', () => {
       ownerPort: 7999,
       authStatus: 'signed_out',
       authError: 'test credential expired',
+      entitlementStatus: 'unknown',
     }])
 
     const originalDir = profile.dir

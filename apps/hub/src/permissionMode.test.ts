@@ -27,16 +27,20 @@ interface WorkerCanUseToolInternals {
     toolName: string,
     input: unknown
   ): Promise<{ behavior: 'allow'; updatedInput: unknown } | { behavior: 'deny'; message: string }>
-  relayApproval(sessionId: string, kind: string, payload: unknown): Promise<boolean>
+  relayApprovalDetailed(
+    sessionId: string,
+    kind: string,
+    payload: unknown,
+  ): Promise<{ approved: boolean; status: 'approved' | 'denied' | 'timeout' }>
 }
 
 /** An AgentWorker with no listener bound (never started), with the approval relay swapped for a counter. */
 function makeGate(): { worker: WorkerCanUseToolInternals; relayed: () => number } {
   const w = new AgentWorker('\\\\.\\pipe\\ama-perm-never-bound') as unknown as WorkerCanUseToolInternals
   let count = 0
-  w.relayApproval = async () => {
+  w.relayApprovalDetailed = async () => {
     count++
-    return true // approve, so a failure shows up as "prompted" rather than as "denied"
+    return { approved: true, status: 'approved' }
   }
   return { worker: w, relayed: () => count }
 }
@@ -84,7 +88,7 @@ describe('AgentWorker.canUseTool — the hub owns the decision, in every mode', 
   /** A denial from the hub is honoured whatever the chat's mode says — the hub is the authority. */
   it('denies when the hub denies, even on a full-access chat', async () => {
     const { worker } = makeGate()
-    ;(worker as unknown as { relayApproval: () => Promise<boolean> }).relayApproval = async () => false
+    worker.relayApprovalDetailed = async () => ({ approved: false, status: 'denied' })
     const res = await worker.canUseTool(specWith('full'), 'Bash', { command: 'ls' })
     expect(res.behavior).toBe('deny')
   })

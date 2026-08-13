@@ -38,7 +38,7 @@ import { readProjectConfig } from './importScan.js'
 import { pickableProfiles, setClaudeConnectorPolicy } from './profiles.js'
 import type { ProfileOwnership } from './profileOwnership.js'
 import { asFileWriteDiffDensity } from './types.js'
-import type { DangerFlags, HubPrefs, ManagerAgentType, Profile, ProjectReplicaReadiness, Provider } from './types.js'
+import { asUiPreferences, type DangerFlags, type HubPrefs, type ManagerAgentType, type Profile, type ProjectReplicaReadiness, type Provider } from './types.js'
 import type { Executor } from './executor.js'
 import type { WorktreeProjectActivity } from './worktreeCollisionDetector.js'
 import type { WorkspaceManager } from './workspace.js'
@@ -532,14 +532,15 @@ export function persistDanger(configPath: string, danger: DangerFlags, journal: 
   if (err) journal.append(null, 'config/danger-persist-failed', { path: configPath, message: err })
 }
 
-/** Persist the owner preferences. Same path, same best-effort contract, its own journal kind. */
+/** Persist owner preferences and return any failure so the settings UI never claims false durability. */
 export function persistPrefs(
   configPath: string,
-  prefs: Pick<HubPrefs, 'chatNamePool' | 'steerMessagesAtToolBoundary'> & Partial<Pick<HubPrefs, 'fileWriteDiffDensity'>>,
+  prefs: HubPrefs,
   journal: Journal
-): void {
+): string | null {
   const err = patchConfig(configPath, 'prefs', { ...prefs })
   if (err) journal.append(null, 'config/prefs-persist-failed', { path: configPath, message: err })
+  return err
 }
 
 function storedReplicaReadiness(
@@ -1974,21 +1975,31 @@ export function startServer(opts: ServerOptions): http.Server {
       }
       if (method === 'POST' && url.pathname === '/api/config/prefs') {
         const body = await readBody(req)
+        const next: HubPrefs = { ...prefs }
         // Same shape check the danger route does on its booleans: a value the generator does not
         // understand is IGNORED, not coerced. Coercing would let a malformed or version-skewed request
         // quietly reset a pool the owner did choose, back through the default, to 'everyone'.
-        if (body.chatNamePool === 'women' || body.chatNamePool === 'everyone') prefs.chatNamePool = body.chatNamePool
+        if (body.chatNamePool === 'women' || body.chatNamePool === 'everyone') next.chatNamePool = body.chatNamePool
         if (typeof body.steerMessagesAtToolBoundary === 'boolean') {
-          prefs.steerMessagesAtToolBoundary = body.steerMessagesAtToolBoundary
+          next.steerMessagesAtToolBoundary = body.steerMessagesAtToolBoundary
         }
         if (
           body.fileWriteDiffDensity === 'minimal'
           || body.fileWriteDiffDensity === 'summary'
           || body.fileWriteDiffDensity === 'verbose'
         ) {
-          prefs.fileWriteDiffDensity = asFileWriteDiffDensity(body.fileWriteDiffDensity)
+          next.fileWriteDiffDensity = asFileWriteDiffDensity(body.fileWriteDiffDensity)
         }
-        persistPrefs(configPath, prefs, journal)
+        if (body.ui && typeof body.ui === 'object' && !Array.isArray(body.ui)) {
+          const ui = asUiPreferences(body.ui, prefs.ui)
+          if (ui) next.ui = ui
+        }
+        const persistError = persistPrefs(configPath, next, journal)
+        if (persistError) {
+          json(res, { error: `Settings could not be saved: ${persistError}` }, 500)
+          return
+        }
+        Object.assign(prefs, next)
         journal.append(null, 'config/prefs', { ...prefs })
         json(res, { ...prefs })
         return
@@ -2088,6 +2099,7 @@ export function startServer(opts: ServerOptions): http.Server {
           'agentCompletions',
           'errors',
           'approvals',
+          'questions',
           'stalls',
           'journalPressure',
           'desktopEnabled',
@@ -2163,7 +2175,7 @@ export function startServer(opts: ServerOptions): http.Server {
       // Mesh status never carries the device capability. Pairing disclosure is a separate,
       // authenticated POST initiated by an operator click in Settings.
       if (method === 'GET' && url.pathname === '/api/mesh') {
-        json(res, { ...mesh.status(), requireToken: true })
+        json(res, { ...mesh.status(), requireToken: true, directRpc: directMesh?.status() })
         return
       }
       if (method === 'POST' && url.pathname === '/api/pairing-code') {
@@ -2254,6 +2266,14 @@ export function startServer(opts: ServerOptions): http.Server {
       if (method === 'GET' && url.pathname === '/api/device-executor') {
         if (!deviceExecutor) { json(res, { error: 'device executor unavailable' }, 503); return }
         json(res, deviceExecutor.capabilities())
+        return
+      }
+      // Operator inventory of every paired executor. This reports target-advertised capability and
+      // hardware metadata, never credentials or per-chat grants. Settings uses it to merge full hubs
+      // and lightweight nodes into one device overview.
+      if (method === 'GET' && url.pathname === '/api/remote-devices') {
+        if (!remoteDevices) { json(res, { error: 'remote device controller unavailable' }, 503); return }
+        json(res, await remoteDevices.catalog())
         return
       }
       if (method === 'POST' && url.pathname === '/api/device-executor') {
@@ -2366,7 +2386,7 @@ export function startServer(opts: ServerOptions): http.Server {
           journal.append(null, 'mesh/direct-rpc', directMesh.status())
         }
         journal.append(null, 'mesh/site', status)
-        json(res, status)
+        json(res, { ...status, directRpc: directMesh?.status() })
         return
       }
       if (method === 'POST' && url.pathname === '/api/usage/refresh') {

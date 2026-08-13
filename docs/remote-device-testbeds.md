@@ -7,14 +7,19 @@ the mapped Site/HTTP route only as a compatibility fallback.
 
 ## Operator flow
 
-1. On each target machine, open **Settings / Remote access** and enable **Authorize this machine as a
-   testbed**.
-2. Add one or more local folders. Enable `read`, `write`, and/or `terminal` separately for each folder and
-   save. The safe default is disabled with no roots.
-3. Devices already admitted to the same signed AllMyStuff fleet link automatically over their authenticated
+1. Open **Settings / Devices & remote** for the consolidated inventory. Each machine appears once and is
+   explicitly badged as a **Hub**, **Testbed**, or both. Reachability, route latency when available,
+   platform/architecture, logical CPU count, memory, host/WSL environments, and authorized-root count are
+   reported from live target capabilities. Pairing and executor policy live in separate expandable setup
+   panels beneath the inventory.
+2. On each full-hub target machine, expand **Local testbed policy**, enable it, and add one or more local
+   folders. Enable `read`, `write`, and/or `terminal` separately for each folder and save. The safe default
+   is disabled with no roots.
+3. Expand **Connection & pairing** only when exposing this Hub or linking a peer. Devices already admitted
+   to the same signed AllMyStuff fleet link automatically over their authenticated
    mesh identities; a sighted peer or a machine that merely shares some other mesh does not qualify. For a
    peer outside that fleet, create one short-lived one-use pairing code on either hub and enter its eight
-   characters in the other hub's Remote access settings. Either path exchanges the two hub capabilities
+   characters under **Connection & pairing** on the other Hub. Either path exchanges the two hub capabilities
    reciprocally, so there is no second reverse-pairing ceremony. Long device tokens remain available only for
    compatibility with an older peer and are never returned by a connection-list API or agent tool.
 4. In a chat, open **Devices**, select the exact target roots and operations, and save. This is a durable

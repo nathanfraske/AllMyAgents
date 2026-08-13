@@ -6,7 +6,7 @@
  * tool-handler relays (worker→hub, callId/approvalId-correlated) + one hub→worker push (dangerUpdate).
  */
 import crypto from 'node:crypto'
-import type { DangerFlags } from './types.js'
+import type { ApprovalStatus, DangerFlags } from './types.js'
 import type { AttachmentMeta } from './attachments.js'
 
 /** The subset of a SessionRecord the worker's driver needs — the worker holds no record + never opens the store. */
@@ -65,7 +65,12 @@ export type HubToWorker =
   // flip (RestartController.abort) un-drains so the held relays flow again instead of wrongly timing out
   // (the M2 correctness item). Absent/true = start draining.
   | { t: 'draining'; on?: boolean }
-  | { t: 'approvalResolved'; approvalId: string; approved: boolean }
+  | {
+      t: 'approvalResolved'
+      approvalId: string
+      approved: boolean
+      status?: Extract<ApprovalStatus, 'approved' | 'denied' | 'timeout'>
+    }
   | { t: 'rpcResult'; callId: string; ok: boolean; value?: unknown; error?: string }
 
 /** Worker → hub. */
@@ -154,6 +159,9 @@ export const HUB_UNAVAILABLE_TEXT =
 /** Shared Claude denial guidance so in-process and detached-worker execution cannot drift. */
 export const CLAUDE_PERMISSION_DENIED_TEXT =
   'Denied by the AllMyAgents hub. Do not replace this tool permission with a prose or AskUserQuestion request. If this was delegated work, report the exact blocked tool and action upstream with mcp__allmyagents__send_message, then continue any unblocked work.'
+
+export const APPROVAL_EXPIRED_TEXT =
+  'The AllMyAgents approval expired before anyone decided it; this was not an operator denial. Report the blocked tool and action upstream once so it can be reissued or granted, then continue any unblocked work.'
 
 export class HubUnavailableError extends Error {
   readonly retryable = true

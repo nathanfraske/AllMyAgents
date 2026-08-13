@@ -55,6 +55,23 @@ export interface DirectMeshInbound {
 
 export type DirectMeshHandler = (input: DirectMeshInbound) => Promise<unknown>
 
+export type DirectMeshUnavailableReason =
+  | 'not-started'
+  | 'connecting'
+  | 'no-daemon'
+  | 'permission-denied'
+  | 'no-networks'
+  | 'control-error'
+
+export interface DirectMeshStatus {
+  available: boolean
+  networkId?: string
+  networkIds?: string[]
+  method: string
+  reason?: DirectMeshUnavailableReason
+  error?: string
+}
+
 function canonicalDevice(value: string): string {
   return value.split('-', 1)[0]!.trim().toLowerCase()
 }
@@ -230,6 +247,8 @@ export class MyOwnMeshRpcBridge {
   private stopped = true
   private reconnectTimer: NodeJS.Timeout | null = null
   private reconnectAttempt = 0
+  private unavailableReason: DirectMeshUnavailableReason = 'not-started'
+  private unavailableError: string | undefined
 
   constructor(
     private readonly request: MyOwnMeshControlRequest = myOwnMeshControlRequest,
@@ -237,7 +256,7 @@ export class MyOwnMeshRpcBridge {
     private readonly method = DEFAULT_METHOD,
   ) {}
 
-  status(): { available: boolean; networkId?: string; networkIds?: string[]; method: string } {
+  status(): DirectMeshStatus {
     const networkIds = [...this.eventSockets.entries()]
       .filter(([, socket]) => !socket.destroyed)
       .map(([network]) => network)
@@ -245,6 +264,10 @@ export class MyOwnMeshRpcBridge {
       available: networkIds.length > 0,
       ...(networkIds[0] ? { networkId: networkIds[0], networkIds } : {}),
       method: this.method,
+      ...(networkIds.length === 0 ? {
+        reason: this.unavailableReason,
+        ...(this.unavailableError ? { error: this.unavailableError } : {}),
+      } : {}),
     }
   }
 
@@ -279,6 +302,8 @@ export class MyOwnMeshRpcBridge {
     if (handler) this.handler = handler
     if (!this.handler) throw new Error('A direct mesh RPC handler must be configured before start.')
     this.stopped = false
+    this.unavailableReason = 'connecting'
+    this.unavailableError = undefined
     await this.connectInbound()
   }
 
@@ -291,6 +316,8 @@ export class MyOwnMeshRpcBridge {
     this.eventSockets.clear()
     this.connectingNetworks.clear()
     this.connectingSockets.clear()
+    this.unavailableReason = 'not-started'
+    this.unavailableError = undefined
   }
 
   async call(peer: string, payload: unknown, timeoutMs = 20_000): Promise<unknown> {
@@ -326,8 +353,18 @@ export class MyOwnMeshRpcBridge {
       return this.networks
     }
     const preferred = process.env.ALLMYAGENTS_MESH_NETWORK?.trim()
-    const listed = await this.request<{ networks?: MyOwnMeshNetworkCandidate[] }>({ op: 'networks_list' }, 5_000).catch(() => null)
-    if (!listed?.ok) return this.networks
+    let listed: MyOwnMeshControlResponse<{ networks?: MyOwnMeshNetworkCandidate[] }>
+    try {
+      listed = await this.request<{ networks?: MyOwnMeshNetworkCandidate[] }>({ op: 'networks_list' }, 5_000)
+    } catch (error) {
+      this.recordControlFailure(error)
+      return this.networks
+    }
+    if (!listed.ok) {
+      this.unavailableReason = 'control-error'
+      this.unavailableError = (listed.error || 'MyOwnMesh refused network discovery').slice(0, MAX_ERROR_CHARS)
+      return this.networks
+    }
     const candidates = await Promise.all((listed.data?.networks ?? []).map(async (candidate) => ({
       ...candidate,
       peers: await this.readPeers(candidate.config_id),
@@ -336,6 +373,13 @@ export class MyOwnMeshRpcBridge {
       ? candidates.filter((candidate) => candidate.config_id === preferred || candidate.network_id === preferred)
       : selectFleetNetworks(candidates)
     this.networkDiscoveredAt = Date.now()
+    if (this.networks.length === 0) {
+      this.unavailableReason = 'no-networks'
+      this.unavailableError = 'MyOwnMesh answered, but no eligible active AllMyStuff fleet network was found.'
+    } else if (this.eventSockets.size === 0) {
+      this.unavailableReason = 'connecting'
+      this.unavailableError = undefined
+    }
     return this.networks
   }
 
@@ -372,13 +416,15 @@ export class MyOwnMeshRpcBridge {
     this.connectingNetworks.set(network, connection)
     try {
       await connection
+      this.unavailableError = undefined
     } finally {
       if (this.connectingNetworks.get(network) === connection) this.connectingNetworks.delete(network)
     }
   }
 
   private async openInboundNetwork(network: string): Promise<void> {
-    await new Promise<void>((resolve, reject) => {
+    try {
+      await new Promise<void>((resolve, reject) => {
       const socket = net.createConnection(this.socketPath)
       this.connectingSockets.set(network, socket)
       let buffer = ''
@@ -452,7 +498,12 @@ export class MyOwnMeshRpcBridge {
           : 'MyOwnMesh event socket closed before subscription'))
         this.scheduleReconnect()
       })
-    })
+      })
+      this.unavailableError = undefined
+    } catch (error) {
+      this.recordControlFailure(error)
+      throw error
+    }
   }
 
   private async registerHandler(clientId: string, network: string): Promise<void> {
@@ -492,5 +543,26 @@ export class MyOwnMeshRpcBridge {
       void this.connectInbound()
     }, delay)
     this.reconnectTimer.unref?.()
+  }
+
+  private recordControlFailure(error: unknown): void {
+    const code = typeof error === 'object' && error !== null && 'code' in error
+      ? String((error as { code?: unknown }).code ?? '')
+      : ''
+    const message = (error instanceof Error ? error.message : String(error)).slice(0, MAX_ERROR_CHARS)
+    if (code === 'ENOENT') {
+      this.unavailableReason = 'no-daemon'
+      this.unavailableError = 'MyOwnMesh control socket was not found. Start or repair MyOwnMesh on this machine.'
+      return
+    }
+    if (code === 'EPERM' || code === 'EACCES' || /access.*denied|permission/i.test(message)) {
+      this.unavailableReason = 'permission-denied'
+      this.unavailableError = process.platform === 'win32'
+        ? 'MyOwnMesh is running, but this user cannot open its control pipe for read/write access. Repair the pipe ACL so the interactive user has full duplex access.'
+        : 'MyOwnMesh is running, but this user cannot read and write its control socket. Repair the socket ownership or permissions.'
+      return
+    }
+    this.unavailableReason = 'control-error'
+    this.unavailableError = message || 'MyOwnMesh control request failed.'
   }
 }

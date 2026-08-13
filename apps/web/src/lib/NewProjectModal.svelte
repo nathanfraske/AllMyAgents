@@ -613,7 +613,8 @@
         allowedModels: config.allowedModels,
         allowedTools: config.allowedTools,
         agentTypes: config.agentTypes,
-        startingPrompt: config.startingPrompt,
+        // Keep the composed launch message ephemeral; orientation and operatorTask are its durable sources.
+        startingPrompt: '',
         orientationBrief: config.orientationBrief,
         operatorTask: config.operatorTask,
         standingInstructions: config.standingInstructions,

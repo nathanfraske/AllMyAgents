@@ -776,7 +776,10 @@ export class HubStore {
     if (projects) this.projects = projects
     else failed = true
     const prefs = await api.prefs().catch(() => null)
-    if (prefs) this.prefs = prefs
+    if (prefs) {
+      this.prefs = prefs
+      void settings.syncWithHub(prefs.ui)
+    }
     else failed = true
     await this.refreshSideData().catch(() => {
       failed = true
@@ -952,6 +955,7 @@ export class HubStore {
         v.record.managerStartingPrompt = rec.managerStartingPrompt
         v.record.managerOrientationBrief = rec.managerOrientationBrief
         v.record.managerOperatorTask = rec.managerOperatorTask
+        v.record.managerOperatorTaskUpdatedAt = rec.managerOperatorTaskUpdatedAt
         v.record.managerStandingInstructions = rec.managerStandingInstructions
         v.record.managerCanApproveChildren = rec.managerCanApproveChildren
         v.record.managerPauseExhaustedAccounts = rec.managerPauseExhaustedAccounts
@@ -2845,6 +2849,25 @@ export class HubStore {
           text:
             message ??
             'A prior answer could not be verified after recovery. The agent was told to ask again if needed.',
+        })
+        break
+      }
+      case 'session/operator-authority-not-conferred': {
+        this.push(view, {
+          kind: 'note',
+          ts,
+          text:
+            (payload as { message?: string }).message ??
+            'This mid-turn message guided the running turn but did not grant operator-only mutation authority. Resend it after the turn becomes idle if that authority is required.',
+        })
+        break
+      }
+      case 'session/infrastructure-interruption': {
+        this.push(view, {
+          kind: 'note',
+          ts,
+          text:
+            'The worker transport was briefly unavailable and this turn was not confirmed. It was not retried automatically because the outcome is unknown; retry once if the requested work is still needed.',
         })
         break
       }

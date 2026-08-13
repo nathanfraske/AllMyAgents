@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -7,7 +7,7 @@ import { WorkerServer } from './workerTransport.js'
 import { HUB_UNAVAILABLE_TEXT, HubUnavailableError, stableApprovalId, type RelayMethod } from './workerProtocol.js'
 import { buildAgentMcpServer, type AgentServices } from './agentTools.js'
 import type { SessionIdentity } from './identity.js'
-import type { DangerFlags } from './types.js'
+import type { DangerFlags, SessionRecord } from './types.js'
 import { Journal } from './journal.js'
 import { SessionStore } from './store.js'
 import { ProjectStore } from './projects.js'
@@ -241,8 +241,14 @@ describe('SessionManager.runRelay — hub-side dispatch (mirrors InProcessExecut
     const bus = new AgentBus(journal.db)
     const memory = new MemoryStore(journal.db)
     const practices = new PracticeStore(journal.db)
-    const sessions = new SessionManager(journal, store, new Map(), approvals, usage, workspace, projects, instructions, bus, memory, practices, SAFE, false, tmp, new QuestionService(journal))
-    return { sessions }
+    const questions = new QuestionService(journal)
+    const notifications = { publish: vi.fn() }
+    const sessions = new SessionManager(
+      journal, store, new Map(), approvals, usage, workspace, projects, instructions, bus, memory,
+      practices, SAFE, false, tmp, questions, undefined,
+      { chatNamePool: 'everyone', steerMessagesAtToolBoundary: true }, undefined, notifications,
+    )
+    return { sessions, questions, notifications }
   }
   afterEach(() => {
     for (const j of opened) j.db.close()
@@ -268,6 +274,47 @@ describe('SessionManager.runRelay — hub-side dispatch (mirrors InProcessExecut
     expect(sessions.runRelay('practices.list', { scopes: ['project:proj1'] })).toHaveLength(1)
     expect((sessions.runRelay('practices.edit', { id: p.id, patch: { title: 'Style v2' } }) as { title: string }).title).toBe('Style v2')
     expect((sessions.runRelay('practices.get', { id: p.id, scopes: ['project:proj1'] }) as { title: string }).title).toBe('Style v2')
+  })
+
+  it('turn questions create one durable operator-attention notification', () => {
+    const { sessions, questions, notifications } = build()
+    questions.activatePublicOwner()
+    ;(sessions as unknown as { sessions: Map<string, SessionRecord> }).sessions.set('overseer-1', {
+      id: 'overseer-1',
+      profileId: 'p1',
+      provider: 'claude',
+      cwd: tmp,
+      status: 'active',
+      createdAt: new Date().toISOString(),
+      title: 'Overseer',
+      isOverseer: true,
+    })
+    void sessions.runRelay('questions.request', {
+      id: 'question-1',
+      sessionId: 'overseer-1',
+      toolUseId: 'tool-1',
+      requestId: 'request-1',
+      input: {
+        questions: [{
+          question: 'Which project should I create?',
+          header: 'Project',
+          options: [
+            { label: 'Alpha', description: 'Create Alpha.' },
+            { label: 'Beta', description: 'Create Beta.' },
+          ],
+          multiSelect: false,
+        }],
+      },
+    })
+    expect(notifications.publish).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'question-required',
+      sourceRole: 'overseer',
+      route: 'operator',
+      title: 'Overseer needs your response',
+      body: 'Which project should I create?',
+      dedupeKey: 'question-required:question-1',
+    }))
+    questions.cancel('question-1')
   })
 
   it('bus.* routes to busSend/busInbox/busRoster (proven by the no-session results)', () => {

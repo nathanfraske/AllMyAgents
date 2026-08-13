@@ -11,7 +11,7 @@ import { Journal } from './journal.js'
 import { MemoryStore } from './memory.js'
 import { PracticeStore } from './practices.js'
 import { ProjectStore } from './projects.js'
-import { MANAGER_STALL_MS, SessionManager } from './sessions.js'
+import { MANAGER_STALL_MS, MANAGER_TEAM_CAPABILITY_VERSION, SessionManager } from './sessions.js'
 import { SessionStore } from './store.js'
 import type { Profile, SessionRecord, SessionStatus } from './types.js'
 import { UsageMonitor } from './usage.js'
@@ -265,7 +265,7 @@ describe('project manager permission ceiling', () => {
 
     const instructions = fs.readFileSync(path.join(repo, 'CLAUDE.md'), 'utf8')
     expect(instructions).toContain('Permission mode: edits')
-    expect(instructions).toContain('Delegated tools: WebFetch')
+    expect(instructions).toContain('Delegated tools: web')
     expect(instructions).toContain('Delegated Git actions: commit')
   })
 })
@@ -957,7 +957,7 @@ describe('project manager durable teams', () => {
 
     const status = sessions.managerChildStatus(manager.id)
 
-    expect(manager.managerTeamCapabilityVersion).toBe(4)
+    expect(manager.managerTeamCapabilityVersion).toBe(MANAGER_TEAM_CAPABILITY_VERSION)
     expect(child).toMatchObject({
       status: 'stopped',
       managerRetiredAt: retiredAt,
@@ -1155,6 +1155,15 @@ describe('project manager durable live roster', () => {
         maxLiveChildren: 4,
         parallelismTarget: 3,
         allowedProfiles: ['p1'],
+        allowedTools: ['shell', 'file_read'],
+        agentTypes: [{
+          id: 'reviewer',
+          name: 'Reviewer',
+          purpose: 'Independently review the implementation',
+          selection: 'fixed',
+          profileId: 'p1',
+        }],
+        orientationBrief: 'Legacy prose incorrectly says every reviewer must use p2.',
         standingInstructions: 'Your sole purpose is to coordinate the operator-granted project team.',
       },
       'operator',
@@ -1223,6 +1232,13 @@ describe('project manager durable live roster', () => {
     expect(instructions).toMatch(/operator steered the active turn/i)
     expect(instructions).not.toContain('private operator steer body')
     expect(instructions).toContain('call the AllMyAgents assign_child_task tool')
+    expect(instructions).toContain('Live grant authority: accounts [p1], capabilities [shell, file_read]')
+    expect(instructions).toContain('Effective account health (generated from live state)')
+    expect(instructions).toContain('Reviewer (reviewer): p1 / provider default / default effort')
+    expect(journal.recentEventsForSession('manager', 100)).toContainEqual(expect.objectContaining({
+      kind: 'manager/prose-config-reference-warning',
+      payload: expect.objectContaining({ profileIds: ['p2'] }),
+    }))
 
     const runtime = runTurn.mock.calls[0]?.[0].claudeSystemPrompt ?? ''
     expect(runtime).toContain('Task accountability contract:')

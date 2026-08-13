@@ -9,9 +9,17 @@
   import { store } from './store.svelte'
   import { profileOptionLabel } from './profileLabel'
 
-  let { projectId, onclose }: { projectId: string; onclose: () => void } = $props()
+  let {
+    projectId,
+    onclose,
+    ondelete,
+  }: {
+    projectId: string
+    onclose: () => void
+    ondelete?: () => void
+  } = $props()
 
-  let tab = $state<'project' | 'manager'>('project')
+  let tab = $state<'general' | 'team' | 'automation'>('general')
   let name = $state('')
   let loadedProjectId = $state('')
   let saving = $state(false)
@@ -128,26 +136,27 @@
 
 <svelte:window onkeydown={onKey} />
 <button class="backdrop" aria-label="Close project settings" onclick={onclose}></button>
-<div class="modal" role="dialog" aria-modal="true" aria-label="Edit project and manager">
+<div class="modal" role="dialog" aria-modal="true" aria-label="Manage project">
   <header>
     <div>
       <span class="eyebrow">PROJECT CONTROL</span>
-      <h2>Edit project &amp; manager</h2>
+      <h2>Manage project</h2>
       <p>{project?.name ?? 'Project unavailable'}</p>
     </div>
     <button class="close" aria-label="Close project settings" onclick={onclose}><Icon name="x" size={18} /></button>
   </header>
 
   <nav aria-label="Project settings sections">
-    <button class:active={tab === 'project'} onclick={() => (tab = 'project')}>Project</button>
-    <button class:active={tab === 'manager'} onclick={() => (tab = 'manager')}>
-      {manager ? 'Manager' : 'Add manager'}
+    <button class:active={tab === 'general'} onclick={() => (tab = 'general')}>General</button>
+    <button class:active={tab === 'team'} onclick={() => (tab = 'team')}>
+      {manager ? 'Team &amp; manager' : 'Add manager'}
     </button>
+    <button class:active={tab === 'automation'} onclick={() => (tab = 'automation')}>Automation</button>
   </nav>
 
   {#if !project}
     <div class="missing">This project is no longer available.</div>
-  {:else if tab === 'project'}
+  {:else if tab === 'general'}
     <div class="project-form">
       <section>
         <label>
@@ -165,45 +174,20 @@
             <div class="fixed-path">WSL · {project.location.distro} · {project.location.linuxPath}</div>
           </div>
         {/if}
-        <div class="github-policy">
-          <div>
-            <span class="field-title">GitHub automation</span>
-            <small>
-              Always allow only these recognized operations for every chat attached to this project,
-              including manager-driven turns. Commands remain confined to this project's live GitHub
-              remote. Generic Bash, <code>gh api</code>, auth/secrets, repository administration,
-              composed shell commands, and force/delete pushes still ask.
-            </small>
-          </div>
-          {#if githubLoading}
-            <div class="policy-loading">Loading policyâ€¦</div>
-          {:else}
-            <div class="policy-options">
-              {#each GITHUB_CAPABILITIES as capability (capability.id)}
-                <label class="policy-option">
-                  <input
-                    type="checkbox"
-                    checked={githubCapabilities.includes(capability.id)}
-                    onchange={() => toggleGitHubCapability(capability.id)}
-                  />
-                  <span><b>{capability.label}</b><small>{capability.description}</small></span>
-                </label>
-              {/each}
-            </div>
-            <button
-              class="secondary"
-              disabled={githubSaving || sameGitHubCapabilities()}
-              onclick={saveGitHubPolicy}
-            >
-              {githubSaving ? 'Savingâ€¦' : 'Save GitHub automation'}
-            </button>
-          {/if}
-        </div>
         {#if error}<p class="error" role="alert">{error}</p>{/if}
         {#if saved}<p class="saved" role="status">{saved}</p>{/if}
         <button class="primary" disabled={saving || name.trim() === project.name} onclick={saveProject}>
           {saving ? 'Saving…' : 'Save project settings'}
         </button>
+        {#if ondelete}
+          <div class="danger-row">
+            <div>
+              <b>Remove this project</b>
+              <small>Review local work before choosing whether files should also be deleted.</small>
+            </div>
+            <button class="danger-action" onclick={ondelete}>Delete project…</button>
+          </div>
+        {/if}
       </section>
 
       <aside>
@@ -217,15 +201,15 @@
             <div><dt>Parallel target</dt><dd>{manager.record.managerParallelismTarget ?? Math.min(3, manager.record.managerMaxLiveChildren ?? 4)} useful worker lanes</dd></div>
             <div><dt>Child ceiling</dt><dd>{manager.record.managerMaxChildPermissionMode ?? 'safe'}</dd></div>
           </dl>
-          <button class="secondary" onclick={() => (tab = 'manager')}>Edit manager settings</button>
+          <button class="secondary" onclick={() => (tab = 'team')}>Edit team &amp; manager</button>
         {:else}
           <h3>No manager configured</h3>
           <p>Add a manager here without leaving the project overview.</p>
-          <button class="secondary" onclick={() => (tab = 'manager')}>Configure manager</button>
+          <button class="secondary" onclick={() => (tab = 'team')}>Configure manager</button>
         {/if}
       </aside>
     </div>
-  {:else}
+  {:else if tab === 'team'}
     <div class="manager-form">
       <ManagerSetupModal
         embedded
@@ -235,6 +219,44 @@
         onSaved={managerSaved}
       />
       {#if saved}<p class="manager-saved" role="status">{saved}</p>{/if}
+    </div>
+  {:else}
+    <div class="automation-form">
+      <section class="github-policy">
+        <div>
+          <span class="field-title">GitHub automation</span>
+          <small>
+            Remember narrow, project-scoped permission for common GitHub work. Generic shell commands,
+            authentication and secrets, repository administration, composed commands, and force or
+            delete pushes still require a separate decision.
+          </small>
+        </div>
+        {#if githubLoading}
+          <div class="policy-loading">Loading policy…</div>
+        {:else}
+          <div class="policy-options">
+            {#each GITHUB_CAPABILITIES as capability (capability.id)}
+              <label class="policy-option">
+                <input
+                  type="checkbox"
+                  checked={githubCapabilities.includes(capability.id)}
+                  onchange={() => toggleGitHubCapability(capability.id)}
+                />
+                <span><b>{capability.label}</b><small>{capability.description}</small></span>
+              </label>
+            {/each}
+          </div>
+          <button
+            class="secondary"
+            disabled={githubSaving || sameGitHubCapabilities()}
+            onclick={saveGitHubPolicy}
+          >
+            {githubSaving ? 'Saving…' : 'Save GitHub automation'}
+          </button>
+        {/if}
+        {#if error}<p class="error" role="alert">{error}</p>{/if}
+        {#if saved}<p class="saved" role="status">{saved}</p>{/if}
+      </section>
     </div>
   {/if}
 </div>
@@ -250,7 +272,7 @@
   header p { margin: 0; color: var(--dim); font-size: var(--text-sm); }
   .eyebrow { color: var(--accent); font-size: .65rem; font-weight: var(--fw-semibold); letter-spacing: .12em; }
   .close { color: var(--dim); padding: .35rem; }
-  nav { display: grid; grid-template-columns: 1fr 1fr; border-block: 1px solid var(--border); }
+  nav { display: grid; grid-template-columns: repeat(3, 1fr); border-block: 1px solid var(--border); }
   nav button { padding: .78rem; color: var(--dim); background: var(--surface-2); font-weight: var(--fw-medium); }
   nav button.active { color: var(--text); background: var(--surface-1); box-shadow: inset 0 -2px var(--accent); }
   .project-form { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(270px, .7fr); }
@@ -272,10 +294,15 @@
   .primary:disabled { opacity: .45; }
   .secondary { color: var(--text); border: 1px solid var(--border); background: var(--surface-2); }
   .secondary:disabled { opacity: .45; }
+  .danger-row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-top: .35rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+  .danger-row > div { display: grid; gap: .2rem; }
+  .danger-row b { font-size: var(--text-xs); }
+  .danger-action { flex: none; padding: .52rem .7rem; border: 1px solid color-mix(in srgb, var(--danger) 65%, var(--border)); border-radius: var(--r-md); color: var(--danger); }
+  .danger-action:hover { background: color-mix(in srgb, var(--danger) 10%, transparent); }
+  .automation-form { max-width: 780px; margin: 0 auto; padding: 1.5rem; }
   .github-policy { display: grid; gap: .7rem; padding: .85rem; border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--surface-2); }
   .github-policy > div:first-child { display: grid; gap: .35rem; }
   .field-title { font-size: var(--text-xs); font-weight: var(--fw-semibold); }
-  .github-policy code { color: var(--text-dim); font-family: var(--mono); }
   .policy-options { display: grid; gap: .45rem; }
   .policy-option { display: grid; grid-template-columns: auto 1fr; align-items: start; gap: .58rem; padding: .55rem; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-1); cursor: pointer; }
   .policy-option input { width: auto; margin-top: .15rem; accent-color: var(--accent); }
