@@ -64,7 +64,7 @@ import {
 import { TestbedDeploymentService } from './testbedDeployment.js'
 import { asChatNamePool } from './title.js'
 import { asFileWriteDiffDensity } from './types.js'
-import type { DangerFlags, HubConfig, HubPrefs } from './types.js'
+import { asUiPreferences, type DangerFlags, type HubConfig, type HubPrefs } from './types.js'
 import { RestartController, type RestartState } from './restartController.js'
 import {
   parseProfileGenerationEnvironment,
@@ -412,9 +412,27 @@ const profileOwnership = new ProfileOwnership({
   publicEpoch: profileGeneration.publicEpoch,
 })
 const profileMap = new Map(profiles.map((p) => [p.id, p]))
-const approvals = new ApprovalService(journal)
+const configuredApprovalMinutes = config.approvals?.timeoutMinutes
+const approvalTimeoutMs = typeof configuredApprovalMinutes === 'number' && Number.isFinite(configuredApprovalMinutes)
+  ? Math.min(24 * 60, Math.max(1, Math.floor(configuredApprovalMinutes))) * 60_000
+  : undefined
+const approvals = new ApprovalService(journal, approvalTimeoutMs ? { timeoutMs: approvalTimeoutMs } : {})
 const questions = new QuestionService(journal)
 const usage = new UsageMonitor(journal, profiles, config)
+usage.setAlertListener((alert) => {
+  const reset = alert.resetsAt ? new Date(alert.resetsAt * 1000).toISOString() : 'unknown reset'
+  notifications.publish({
+    kind: 'hub-warning',
+    severity: alert.kind === 'headroom-low' ? 'warning' : 'error',
+    sourceRole: 'system',
+    route: 'operator',
+    title: alert.kind === 'entitlement-denied'
+      ? `${profileNames[alert.profileId] ?? alert.profileId} cannot run agents`
+      : `${profileNames[alert.profileId] ?? alert.profileId} usage ${alert.kind === 'rejected' ? 'is exhausted' : 'is running low'}`,
+    body: `${alert.reason}${alert.resetsAt ? `; resets ${reset}` : ''}`,
+    dedupeKey: `account-usage:${alert.profileId}:${alert.kind}:${alert.resetsAt ?? 'none'}`,
+  })
+})
 const workspace = new WorkspaceManager(path.join(dataDir, 'worktrees'), path.join(dataDir, 'workspaces'))
 const projects = new ProjectStore(journal.db, journal)
 const testbedRuns = new TestbedRunStore(journal.db)
@@ -456,11 +474,13 @@ const danger: DangerFlags = {
 // SessionManager and the server for the same reason: POST /api/config/prefs mutates this object, so the
 // next chat is named from the newly chosen pool without a restart. asChatNamePool tolerates a hand-edited
 // config.json holding nonsense (or the removed men-only value) by falling back to the default.
+const persistedUiPreferences = asUiPreferences(config.prefs?.ui)
 const prefs: HubPrefs = {
   chatNamePool: asChatNamePool(config.prefs?.chatNamePool),
   // Opt-out so configs written before the preference existed get the operator-requested default ON.
   steerMessagesAtToolBoundary: config.prefs?.steerMessagesAtToolBoundary !== false,
   fileWriteDiffDensity: asFileWriteDiffDensity(config.prefs?.fileWriteDiffDensity),
+  ...(persistedUiPreferences ? { ui: persistedUiPreferences } : {}),
 }
 let profileBootstrapComplete = false
 const profileRuntime = new ProfileRuntime({
@@ -474,7 +494,10 @@ const profileRuntime = new ProfileRuntime({
     ...profile,
     ...(profileNames[profile.id] ? { displayName: profileNames[profile.id] } : {}),
   })),
-  refreshAuth: refreshProfileAuth,
+  refreshAuth: (profile) => {
+    refreshProfileAuth(profile)
+    usage.noteProfileAuth(profile)
+  },
   onAdded: (profile) => {
     usage.addProfile(profile)
     if (profileBootstrapComplete) {
@@ -525,7 +548,8 @@ const executor: Executor = workerSocket
       // bus/memory/practices the in-process executor uses; an `approvalRequest` goes to the operator via
       // the idempotent approvals.request(id) so a re-issue across a restart dedups (§7.2).
       runRelay: (method, args) => sessions.runRelay(method, args),
-      resolveApproval: (approvalId, sessionId, kind, payload) => approvals.request(sessionId, kind, payload, approvalId),
+      resolveApproval: (approvalId, sessionId, kind, payload) =>
+        approvals.requestDetailed(sessionId, kind, payload, approvalId),
       // Step 5 (§6, §7.1): on every WorkerClient (re)connect, re-attach to the still-running worker and
       // replay the in-flight turn's event gap gap-free + exactly-once — so a mid-turn survives a hub restart.
       attachWorker: () => sessions.attachWorker(),
@@ -1041,7 +1065,10 @@ function registerMesh(): void {
     if (status.available) {
       console.log(`[mesh] direct hub RPC active on ${status.networkId ?? 'unknown fleet'}`)
     } else {
-      console.log('[mesh] direct hub RPC is not active yet — background discovery will keep retrying')
+      console.log(
+        `[mesh] direct hub RPC unavailable (${status.reason ?? 'unknown'})` +
+        `${status.error ? ` — ${status.error}` : ''}; background discovery will keep retrying`,
+      )
     }
     journal.append(null, 'mesh/direct-rpc', status)
   }).catch((error) => {

@@ -2,7 +2,8 @@ import crypto from 'node:crypto'
 import type { Journal } from './journal.js'
 import type { ApprovalRecord } from './types.js'
 
-const APPROVAL_TIMEOUT_MS = 10 * 60 * 1000
+/** A human-facing approval should survive an ordinary meeting, break, or unattended build. */
+export const DEFAULT_APPROVAL_TIMEOUT_MS = 60 * 60 * 1000
 
 /**
  * How long after hub startup a durable approval decision may still be applied to a re-issued id.
@@ -26,16 +27,32 @@ interface PendingEntry {
 /** Decides whether a request may skip the operator entirely. `true` → auto-approve; anything else → ask. */
 export type AutoApprovePolicy = (sessionId: string, kind: string, payload: unknown) => boolean
 
+export interface ApprovalServiceOptions {
+  timeoutMs?: number
+}
+
+export interface ApprovalDecision {
+  approved: boolean
+  status: Extract<ApprovalRecord['status'], 'approved' | 'denied' | 'timeout'>
+}
+
 export class ApprovalService {
   private readonly pendingMap = new Map<string, PendingEntry>()
   private autoApprove: AutoApprovePolicy | undefined
   private pendingListener: ((record: ApprovalRecord) => void) | undefined
+  private resolvedListener: ((record: ApprovalRecord) => void) | undefined
   /** When this hub process started, bounding the resolved-before-crash recovery (see {@link request}). */
   private readonly bootAt = Date.now()
   /** Ids already served from a durable decision, so one recovery never becomes a standing grant. */
   private readonly recoveredIds = new Set<string>()
+  private readonly timeoutMs: number
 
-  constructor(private readonly journal: Journal) {}
+  constructor(private readonly journal: Journal, options: ApprovalServiceOptions = {}) {
+    const requested = options.timeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS
+    this.timeoutMs = Number.isFinite(requested) && requested >= 1_000
+      ? Math.floor(requested)
+      : DEFAULT_APPROVAL_TIMEOUT_MS
+  }
 
   /**
    * Install the policy that lets a request bypass the operator prompt (see {@link request}).
@@ -57,8 +74,35 @@ export class ApprovalService {
     this.pendingListener = listener
   }
 
+  setResolvedListener(listener: (record: ApprovalRecord) => void): void {
+    this.resolvedListener = listener
+  }
+
   pending(): ApprovalRecord[] {
     return [...this.pendingMap.values()].map((e) => e.record)
+  }
+
+  /**
+   * Re-run the live auto-approval policy after an operator changes a grant or automation policy.
+   * This is deliberately explicit instead of a polling loop: every affected pending request is evaluated
+   * exactly once against the new policy and receives a durable audit row before it is released.
+   */
+  recheckPending(options: { sessionIds?: Iterable<string>; reason: string }): number {
+    if (!this.autoApprove) return 0
+    const allowedSessions = options.sessionIds ? new Set(options.sessionIds) : undefined
+    let released = 0
+    for (const entry of [...this.pendingMap.values()]) {
+      if (allowedSessions && !allowedSessions.has(entry.record.sessionId)) continue
+      if (this.autoApprove(entry.record.sessionId, entry.record.kind, entry.record.payload) !== true) continue
+      this.journal.append(entry.record.sessionId, 'approval/re-evaluated', {
+        id: entry.record.id,
+        kind: entry.record.kind,
+        reason: options.reason,
+        decision: 'approved',
+      })
+      if (this.finish(entry.record.id, true, 'approved')) released += 1
+    }
+    return released
   }
 
   /**
@@ -136,7 +180,7 @@ export class ApprovalService {
     })
     const timer = setTimeout(() => {
       this.finish(record.id, false, 'timeout')
-    }, APPROVAL_TIMEOUT_MS)
+    }, this.timeoutMs)
     this.pendingMap.set(record.id, { record, resolve, timer, promise })
     try {
       this.pendingListener?.(record)
@@ -147,6 +191,15 @@ export class ApprovalService {
       })
     }
     return promise
+  }
+
+  /** The same request with a terminal reason, for callers that must distinguish expiry from denial. */
+  async requestDetailed(sessionId: string, kind: string, payload: unknown, id?: string): Promise<ApprovalDecision> {
+    const decisionId = id ?? crypto.randomUUID()
+    const approved = await this.request(sessionId, kind, payload, decisionId)
+    if (approved) return { approved: true, status: 'approved' }
+    const status = this.journal.resolvedApproval(decisionId)
+    return { approved: false, status: status === 'timeout' ? 'timeout' : 'denied' }
   }
 
   /**
@@ -172,6 +225,14 @@ export class ApprovalService {
       kind: entry.record.kind,
     })
     entry.resolve(approved)
+    try {
+      this.resolvedListener?.(entry.record)
+    } catch (error) {
+      this.journal.append(entry.record.sessionId, 'approval/resolved-listener-error', {
+        id: entry.record.id,
+        message: error instanceof Error ? error.message : String(error),
+      })
+    }
     return true
   }
 }

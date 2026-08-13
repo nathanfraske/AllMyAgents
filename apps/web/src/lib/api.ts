@@ -30,6 +30,9 @@ export interface ProfileInfo {
   ownerPort?: number
   authStatus?: 'signed_in' | 'signed_out'
   authError?: string
+  entitlementStatus?: 'unknown' | 'entitled' | 'denied'
+  entitlementReason?: string
+  entitlementCheckedAt?: string
   siteId?: string
   siteLabel?: string
   siteOnline?: boolean
@@ -252,6 +255,7 @@ export interface SessionRecord {
   managerStartingPrompt?: string
   managerOrientationBrief?: string
   managerOperatorTask?: string
+  managerOperatorTaskUpdatedAt?: string
   managerStandingInstructions?: string
   managerCanApproveChildren?: boolean
   managerPauseExhaustedAccounts?: boolean
@@ -317,6 +321,7 @@ export interface ManagerAgentType {
   profileIds?: string[]
   model?: string
   effort?: string
+  independenceGroup?: string
 }
 
 // One existing Claude/Codex conversation found on disk that can be adopted under a project.
@@ -447,6 +452,14 @@ export interface UsageSnapshot {
   totalCostUsd?: number
   blocked: boolean
   blockedReason?: string
+  authenticated?: boolean
+  entitlement: 'unknown' | 'entitled' | 'denied'
+  entitlementReason?: string
+  entitlementCheckedAt?: string
+  headroom: number
+  limitStatus?: string
+  windowType?: string
+  resetsAt?: number
 }
 
 export interface HubEvent {
@@ -1008,6 +1021,14 @@ export interface MeshStatus {
   error?: string
   checkedAt?: string
   requireToken?: boolean
+  directRpc?: {
+    available: boolean
+    networkId?: string
+    networkIds?: string[]
+    method: string
+    reason?: 'not-started' | 'connecting' | 'no-daemon' | 'permission-denied' | 'no-networks' | 'control-error'
+    error?: string
+  }
 }
 
 // One machine in the unified fleet view (GET /api/fleet). `local:true` is THIS hub. For a remote
@@ -1064,6 +1085,8 @@ export interface DeviceExecutorCapabilities {
   platform: string
   arch: string
   hostname: string
+  cpuCount?: number
+  totalMemoryBytes?: number
   nodeKind?: 'hub' | 'lightweight-testbed'
   deploymentProfile?: 'scoped' | 'full-machine' | 'elevated-machine' | 'linux-sudo-machine'
   elevated?: boolean
@@ -1119,6 +1142,25 @@ export interface Practice {
 export type ChatNamePool = 'women' | 'everyone'
 export type FileWriteDiffDensity = 'minimal' | 'summary' | 'verbose'
 
+export interface UiPreferences {
+  showSpend: boolean
+  planBudgetUsd: number | null
+  showTokenEstimate: boolean
+  combineQueued: boolean
+  defaultAccount: string
+  defaultPermissionMode: 'safe' | 'edits' | 'full'
+  defaultClaudeModel: string
+  defaultCodexModel: string
+  defaultUseWorktree: boolean
+  ownerName: string
+  detachedDefaultProjectId: string | null
+  detachedDefaultMode: 'safe' | 'edits' | 'full'
+  autoSwitchToNewChat: boolean
+  autoReopenLastChats: boolean
+  autoCheckUpdates: boolean
+  pasteAsTextThreshold: number
+}
+
 /**
  * Owner preferences — plain settings with no safety dimension, so they live outside the Danger Zone.
  *
@@ -1131,6 +1173,7 @@ export interface HubPrefs {
   steerMessagesAtToolBoundary: boolean
   /** Optional while bootstrap is using its pre-fetch fallback; the hub always returns a resolved value. */
   fileWriteDiffDensity?: FileWriteDiffDensity
+  ui?: UiPreferences
 }
 
 export interface NotificationPreferences {
@@ -1139,6 +1182,7 @@ export interface NotificationPreferences {
   agentCompletions: boolean
   errors: boolean
   approvals: boolean
+  questions: boolean
   stalls: boolean
   journalPressure: boolean
   desktopEnabled: boolean
@@ -1146,7 +1190,7 @@ export interface NotificationPreferences {
 
 export interface NotificationRecord {
   id: string
-  kind: 'session-completed' | 'session-error' | 'approval-required' | 'session-stalled' | 'journal-pressure' | 'hub-warning'
+  kind: 'session-completed' | 'session-error' | 'approval-required' | 'question-required' | 'session-stalled' | 'journal-pressure' | 'hub-warning'
   severity: 'info' | 'warning' | 'error'
   title: string
   body: string
@@ -1823,6 +1867,8 @@ export const api = {
     ),
   remoteDeviceCatalog: (id: string) =>
     routedGet<RemoteDeviceCatalogEntry[]>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/remote-devices`),
+  /** Operator-wide paired-device inventory; unlike a chat catalog this carries no grants. */
+  remoteDeviceInventory: () => jget<RemoteDeviceCatalogEntry[]>('/api/remote-devices'),
   setRemoteDeviceGrants: (id: string, grants: RemoteDeviceGrant[]) =>
     routedSessionPost(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/remote-devices`, { grants }),
   /** Persist a per-chat model / thinking effort / service tier immediately (survives reload + restart). */

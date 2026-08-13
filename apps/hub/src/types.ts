@@ -13,6 +13,10 @@ export interface Profile {
   ownerPort?: number
   authStatus?: 'signed_in' | 'signed_out'
   authError?: string
+  /** Authentication proves a credential exists; entitlement proves the provider accepts agent work. */
+  entitlementStatus?: 'unknown' | 'entitled' | 'denied'
+  entitlementReason?: string
+  entitlementCheckedAt?: string
 }
 
 export interface Project {
@@ -109,6 +113,8 @@ export interface ManagerAgentType {
   profileIds?: string[]
   model?: string
   effort?: string
+  /** Roles sharing a non-empty group must run on different accounts within the active team. */
+  independenceGroup?: string
 }
 
 /**
@@ -204,7 +210,7 @@ export interface SessionRecord {
   managerAllowedProfiles?: string[]
   /** Explicit model slugs the manager may request per child profile. Omitted models use that profile's default. */
   managerAllowedModels?: Record<string, string[]>
-  /** Exact executable tool names this manager may grant to children (for example Bash or WebFetch). */
+  /** Provider-neutral capabilities (shell/file_write/etc.) or exact custom tool names the manager may grant. */
   managerAllowedTools?: string[]
   /** Operator-defined worker briefs the manager may request by name. */
   managerAgentTypes?: ManagerAgentType[]
@@ -218,6 +224,8 @@ export interface SessionRecord {
   managerOrientationBrief?: string
   /** The task the operator assigned at launch. Blank means acknowledge, self-test tooling, and halt. */
   managerOperatorTask?: string
+  /** Last direct-operator review of the manager task; used to surface stale launch briefs. */
+  managerOperatorTaskUpdatedAt?: string
   /** Session-scoped operator instructions rematerialized into CLAUDE.md/AGENTS.md for every later turn. */
   managerStandingInstructions?: string
   /** Operator grant allowing this manager to decide pending approvals inside its own managed hierarchy. */
@@ -353,6 +361,15 @@ export interface UsageSnapshot {
   totalCostUsd?: number
   blocked: boolean
   blockedReason?: string
+  authenticated?: boolean
+  entitlement: 'unknown' | 'entitled' | 'denied'
+  entitlementReason?: string
+  entitlementCheckedAt?: string
+  /** Effective normalized capacity after auth, entitlement, rate-limit, and reset state. */
+  headroom: number
+  limitStatus?: string
+  windowType?: string
+  resetsAt?: number
 }
 
 export type OveragePolicy = 'block' | 'warn' | 'allow'
@@ -413,12 +430,99 @@ export interface PrefsConfig {
   steerMessagesAtToolBoundary?: boolean
   /** Default presentation for file writes and diffs. Absent or invalid means minimal. */
   fileWriteDiffDensity?: FileWriteDiffDensity
+  /**
+   * Renderer preferences that must survive a webview-origin reset or desktop update. The webview keeps
+   * an offline cache, but this hub-owned copy is authoritative once it exists.
+   */
+  ui?: Partial<UiPreferences>
 }
 
 export type FileWriteDiffDensity = 'minimal' | 'summary' | 'verbose'
 
 export function asFileWriteDiffDensity(value: unknown): FileWriteDiffDensity {
   return value === 'summary' || value === 'verbose' ? value : 'minimal'
+}
+
+export interface UiPreferences {
+  showSpend: boolean
+  planBudgetUsd: number | null
+  showTokenEstimate: boolean
+  combineQueued: boolean
+  defaultAccount: string
+  defaultPermissionMode: 'safe' | 'edits' | 'full'
+  defaultClaudeModel: string
+  defaultCodexModel: string
+  defaultUseWorktree: boolean
+  ownerName: string
+  detachedDefaultProjectId: string | null
+  detachedDefaultMode: 'safe' | 'edits' | 'full'
+  autoSwitchToNewChat: boolean
+  autoReopenLastChats: boolean
+  autoCheckUpdates: boolean
+  pasteAsTextThreshold: number
+}
+
+export const DEFAULT_UI_PREFERENCES: UiPreferences = {
+  showSpend: false,
+  planBudgetUsd: null,
+  showTokenEstimate: true,
+  combineQueued: true,
+  defaultAccount: '',
+  defaultPermissionMode: 'safe',
+  defaultClaudeModel: '',
+  defaultCodexModel: '',
+  defaultUseWorktree: true,
+  ownerName: '',
+  detachedDefaultProjectId: null,
+  detachedDefaultMode: 'safe',
+  autoSwitchToNewChat: true,
+  autoReopenLastChats: false,
+  autoCheckUpdates: true,
+  pasteAsTextThreshold: 10_000,
+}
+
+function boundedString(value: unknown, fallback: string, max: number): string {
+  return typeof value === 'string' ? value.slice(0, max) : fallback
+}
+
+function permissionMode(value: unknown, fallback: UiPreferences['defaultPermissionMode']): UiPreferences['defaultPermissionMode'] {
+  return value === 'safe' || value === 'edits' || value === 'full' ? value : fallback
+}
+
+/** Resolve only recognized, bounded UI fields. Unknown or malformed values cannot poison startup. */
+export function asUiPreferences(value: unknown, fallback = DEFAULT_UI_PREFERENCES): UiPreferences | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const raw = value as Record<string, unknown>
+  const finiteBudget = typeof raw.planBudgetUsd === 'number' && Number.isFinite(raw.planBudgetUsd)
+    ? Math.max(0, Math.min(1_000_000_000, raw.planBudgetUsd))
+    : raw.planBudgetUsd === null
+      ? null
+      : fallback.planBudgetUsd
+  const threshold = typeof raw.pasteAsTextThreshold === 'number' && Number.isFinite(raw.pasteAsTextThreshold)
+    ? Math.max(0, Math.min(1_000_000, Math.round(raw.pasteAsTextThreshold)))
+    : fallback.pasteAsTextThreshold
+  const boolean = (key: keyof UiPreferences): boolean =>
+    typeof raw[key] === 'boolean' ? raw[key] as boolean : fallback[key] as boolean
+  return {
+    showSpend: boolean('showSpend'),
+    planBudgetUsd: finiteBudget,
+    showTokenEstimate: boolean('showTokenEstimate'),
+    combineQueued: boolean('combineQueued'),
+    defaultAccount: boundedString(raw.defaultAccount, fallback.defaultAccount, 256),
+    defaultPermissionMode: permissionMode(raw.defaultPermissionMode, fallback.defaultPermissionMode),
+    defaultClaudeModel: boundedString(raw.defaultClaudeModel, fallback.defaultClaudeModel, 160),
+    defaultCodexModel: boundedString(raw.defaultCodexModel, fallback.defaultCodexModel, 160),
+    defaultUseWorktree: boolean('defaultUseWorktree'),
+    ownerName: boundedString(raw.ownerName, fallback.ownerName, 120),
+    detachedDefaultProjectId: raw.detachedDefaultProjectId === null
+      ? null
+      : boundedString(raw.detachedDefaultProjectId, fallback.detachedDefaultProjectId ?? '', 256) || null,
+    detachedDefaultMode: permissionMode(raw.detachedDefaultMode, fallback.detachedDefaultMode),
+    autoSwitchToNewChat: boolean('autoSwitchToNewChat'),
+    autoReopenLastChats: boolean('autoReopenLastChats'),
+    autoCheckUpdates: boolean('autoCheckUpdates'),
+    pasteAsTextThreshold: threshold,
+  }
 }
 
 /** Resolved owner preferences (always present; index.ts fills defaults from PrefsConfig). */
@@ -428,6 +532,8 @@ export interface HubPrefs {
   // index.ts always resolves this; optional only so SessionManager's untouched legacy fallback literal
   // remains source-compatible when constructed directly by tests or embedders.
   fileWriteDiffDensity?: FileWriteDiffDensity
+  /** Absent only until an older install's renderer cache is migrated into the hub. */
+  ui?: UiPreferences
 }
 
 /**
@@ -507,6 +613,10 @@ export interface HubConfig {
   features?: FeaturesConfig
   prefs?: PrefsConfig
   danger?: DangerConfig
+  approvals?: {
+    /** Human-facing pending lifetime. Defaults to 60 minutes; bounded to 1 minute–24 hours at boot. */
+    timeoutMinutes?: number
+  }
   /** Durable outside the journal so the designated account remains knowable during DB preflight failure. */
   overseer?: OverseerConfig
 }

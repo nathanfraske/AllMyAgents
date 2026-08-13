@@ -90,6 +90,38 @@ describe('site-free MyOwnMesh RPC network selection', () => {
     })
   })
 
+  it('surfaces a present daemon whose control pipe denies full-duplex access', async () => {
+    const denied = Object.assign(new Error('Access to the path is denied.'), { code: 'EPERM' })
+    const bridge = new MyOwnMeshRpcBridge((async () => { throw denied }) as MyOwnMeshControlRequest)
+    bridge.setHandler(async () => ({ ok: true }))
+
+    await bridge.start()
+    expect(bridge.status()).toMatchObject({
+      available: false,
+      reason: 'permission-denied',
+      error: expect.stringMatching(/control pipe.*full duplex|control socket/i),
+    })
+    bridge.stop()
+  })
+
+  it('distinguishes a missing daemon from a daemon with no eligible fleet networks', async () => {
+    const missing = Object.assign(new Error('socket not found'), { code: 'ENOENT' })
+    const absentBridge = new MyOwnMeshRpcBridge((async () => { throw missing }) as MyOwnMeshControlRequest)
+    absentBridge.setHandler(async () => ({ ok: true }))
+    await absentBridge.start()
+    expect(absentBridge.status()).toMatchObject({ available: false, reason: 'no-daemon' })
+    absentBridge.stop()
+
+    const emptyBridge = new MyOwnMeshRpcBridge((async (input: Record<string, unknown>) => {
+      if (input.op === 'networks_list') return { ok: true, data: { networks: [] } }
+      return { ok: false, error: 'unexpected request' }
+    }) as MyOwnMeshControlRequest)
+    emptyBridge.setHandler(async () => ({ ok: true }))
+    await emptyBridge.start()
+    expect(emptyBridge.status()).toMatchObject({ available: false, reason: 'no-networks' })
+    emptyBridge.stop()
+  })
+
   it('registers its inbound Hub method on every eligible shared mesh', async () => {
     const socketPath = process.platform === 'win32'
       ? `\\\\.\\pipe\\allmyagents-mesh-test-${process.pid}-${Date.now()}`

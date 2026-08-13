@@ -25,6 +25,7 @@ import type { PracticeStore } from './practices.js'
 import type { BusAddress, BusMessage } from './bus.js'
 import type { ClaudeLimitInfo, DangerFlags, SessionStatus } from './types.js'
 import {
+  APPROVAL_EXPIRED_TEXT,
   CLAUDE_PERMISSION_DENIED_TEXT,
   InvalidQuestionCorrelationError,
   stableQuestionId,
@@ -580,17 +581,17 @@ export class InProcessExecutor implements Executor {
           // bus-origin clamp, eligible-kind whitelist) and would freeze the mode at turn start, so
           // tightening a live chat Full → Safe would be cosmetic. ApprovalService.request consults the
           // policy and returns immediately for an auto-approved call, so this costs no prompt.
-          const approved = await this.services.approvals.request(spec.sessionId, 'claude/tool', {
+          const decision = await this.services.approvals.requestDetailed(spec.sessionId, 'claude/tool', {
             toolName,
             input,
             // Carried so the hub's auto-approve policy can honour a user-configured ask rule.
             matchedAskRule: context?.matchedAskRule,
           })
-          return approved
+          return decision.approved
             ? { behavior: 'allow', updatedInput: input }
             : {
                 behavior: 'deny',
-                message: CLAUDE_PERMISSION_DENIED_TEXT,
+                message: decision.status === 'timeout' ? APPROVAL_EXPIRED_TEXT : CLAUDE_PERMISSION_DENIED_TEXT,
               }
         },
         // Per-session in-process MCP server: the inter-agent bus + shared-memory tools, bound to this

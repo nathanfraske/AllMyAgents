@@ -110,14 +110,14 @@ describe('Manager setup', () => {
     )
   })
 
-  it('makes worker Git delegation and exact approval/tool ceilings unambiguous on Windows too', () => {
+  it('makes worker Git delegation and provider-neutral capability ceilings unambiguous on Windows too', () => {
     const { getByText, getAllByText, getByLabelText } = render(ManagerSetupModal, { onclose: vi.fn() })
     expect(getByText('Git actions the manager may grant or approve once')).toBeTruthy()
     expect(getByText(/no worker can be granted commit or push/i)).toBeTruthy()
-    expect(getByText(/requests outside this exact list go to the operator or overseer/i)).toBeTruthy()
-    expect(getByText(/choose common tools below/i)).toBeTruthy()
-    expect(getAllByText('Read').length).toBeGreaterThan(0)
-    expect(getAllByText('PowerShell').length).toBeGreaterThan(0)
+    expect(getByText(/requests outside this list go to the operator or overseer/i)).toBeTruthy()
+    expect(getByText(/capabilities work across claude and codex/i)).toBeTruthy()
+    expect(getAllByText('Read files').length).toBeGreaterThan(0)
+    expect(getAllByText('Shell commands').length).toBeGreaterThan(0)
     expect(getByLabelText(/custom exact tool name/i)).toBeTruthy()
   })
 
@@ -211,8 +211,8 @@ describe('Manager setup', () => {
     expect(prompt).toMatch(/native.*spawn_agent.*not.*AllMyAgents/is)
     expect(prompt).toMatch(/mcp__allmyagents(?:__|\.)spawn_agent/i)
     expect(prompt).toMatch(/never.*collaboration\.spawn_agent/is)
-    expect(prompt).toMatch(/cannot grant.*does not hold/i)
-    expect(prompt).toMatch(/profile_id.*codex-a/i)
+    expect(prompt).toMatch(/live grant.*generated from live hub state.*authoritative/is)
+    expect(prompt).toMatch(/do not preserve or infer.*prose/is)
     expect(prompt).toMatch(/stalls.*blocks.*errors/is)
     expect(prompt).toMatch(/durable role.*temporary task.*exact granted tools/is)
     expect(prompt).toMatch(/verify.*transcript.*worktree/is)

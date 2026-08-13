@@ -550,8 +550,7 @@
           {#if statusCounts.failed}<span class="failed">{statusCounts.failed} failed</span>{/if}
         </div>
         {#if !project.siteId}
-          <button class="edit-project" onclick={() => (projectSettingsOpen = true)}>Edit project &amp; manager…</button>
-          <button class="delete-project" onclick={() => (deleteDialogOpen = true)}>Delete project…</button>
+          <button class="edit-project manage-project" onclick={() => (projectSettingsOpen = true)}>Manage project</button>
         {/if}
       </div>
     </header>
@@ -884,7 +883,14 @@
 </section>
 
 {#if projectSettingsOpen}
-  <ProjectSettingsModal projectId={projectId} onclose={() => (projectSettingsOpen = false)} />
+  <ProjectSettingsModal
+    projectId={projectId}
+    onclose={() => (projectSettingsOpen = false)}
+    ondelete={() => {
+      projectSettingsOpen = false
+      deleteDialogOpen = true
+    }}
+  />
 {/if}
 
 {#if project && deleteDialogOpen}
@@ -914,10 +920,9 @@
   .summary { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: .4rem; color: var(--muted);
     font-size: var(--text-xs); }
   .head-actions { display: flex; flex-direction: column; align-items: flex-end; gap: .55rem; }
-  .edit-project, .delete-project { color: var(--dim); font-size: var(--text-2xs); text-decoration: underline;
-    text-underline-offset: .18rem; }
-  .edit-project:hover { color: var(--accent); }
-  .delete-project:hover { color: var(--bad-text); }
+  .manage-project { padding: .48rem .72rem; border: 1px solid var(--border-strong); border-radius: var(--r-md);
+    color: var(--text); background: var(--surface-2); font-size: var(--text-xs); font-weight: var(--fw-medium); box-shadow: var(--edge-hi); }
+  .manage-project:hover { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 48%, var(--border)); background: color-mix(in srgb, var(--accent) 8%, var(--surface-2)); }
   .view-toggle { display: grid; grid-template-columns: 1fr 1fr; padding: 3px; border: 1px solid var(--border);
     border-radius: var(--r-lg); background: var(--surface-2); box-shadow: var(--edge-hi); }
   .view-toggle button { min-width: 7rem; padding: .42rem .75rem; border-radius: calc(var(--r-lg) - 3px);

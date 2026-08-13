@@ -162,6 +162,25 @@ export function reduceJournalHistory(events: readonly HubEvent[]): ThreadItem[] 
       })
       continue
     }
+    if (kind === 'session/operator-authority-not-conferred') {
+      push({
+        kind: 'note',
+        ts,
+        text:
+          (payload as { message?: string }).message ??
+          'This mid-turn message guided the running turn but did not grant operator-only mutation authority. Resend it after the turn becomes idle if that authority is required.',
+      })
+      continue
+    }
+    if (kind === 'session/infrastructure-interruption') {
+      push({
+        kind: 'note',
+        ts,
+        text:
+          'The worker transport was briefly unavailable and this turn was not confirmed. It was not retried automatically because the outcome is unknown; retry once if the requested work is still needed.',
+      })
+      continue
+    }
     if (kind === 'question/restart-interrupted') {
       const p = payload as {
         phase?: 'planned' | 'crash'

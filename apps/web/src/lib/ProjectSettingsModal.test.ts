@@ -41,10 +41,11 @@ afterEach(cleanup)
 describe('project GitHub automation settings', () => {
   it('shows the inherited team-wide policy and persists an explicit capability change', async () => {
     render(ProjectSettingsModal, { props: { projectId: 'project-1', onclose: vi.fn() } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Automation' }))
 
     const pullRequests = await screen.findByRole('checkbox', { name: /Pull-request work/i })
     expect((pullRequests as HTMLInputElement).checked).toBe(true)
-    expect(screen.getByText(/Generic Bash/)).toBeTruthy()
+    expect(screen.getByText(/Generic shell commands/)).toBeTruthy()
 
     const workflows = screen.getByRole('checkbox', { name: /GitHub Actions runs/i })
     await fireEvent.click(workflows)

@@ -90,7 +90,7 @@
   }
 
   function openSettings(): void {
-    saveSettingsTab('system')
+    saveSettingsTab('overseer')
     store.settingsOpen = true
     open = false
   }

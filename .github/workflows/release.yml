@@ -169,6 +169,10 @@ jobs:
       - name: Credential-firewall self-test
         run: pnpm run bundle:audit
 
+      - name: Load the versioned feature and fix log
+        id: release_notes
+        run: node scripts/release-notes-output.mjs "${{ github.ref_name }}"
+
       # A release whose installers carry no updater artifacts cannot ever auto-update the fleet, and
       # that is silent otherwise — you only find out when alpha.2 never reaches anyone. Warn loudly
       # (not fatal: an operator may deliberately cut an unsigned smoke-test build).
@@ -339,40 +343,7 @@ jobs:
           projectPath: apps/desktop
           tagName: ${{ github.ref_name }}
           releaseName: 'AllMyAgents ${{ github.ref_name }}'
-          releaseBody: |
-            AllMyAgents ${{ github.ref_name }} — alpha pre-release.
-
-            Prerequisites: a working internet connection on FIRST run (the app fetches its runtime
-            dependencies and the vendor CLIs from npm then). See the README.
-
-            Installers below. Later releases auto-update via the bundled Tauri updater, provided the
-            app version increases — see the note on that in apps/desktop/src-tauri/Cargo.toml.
-
-            This is alpha software. It is published as a normal (non-prerelease) release only so the
-            updater can find it; see the comment on `prerelease:` in .github/workflows/release.yml.
-
-            **macOS — install with one command.** Paste this into Terminal:
-
-            ```
-            curl -fsSL https://raw.githubusercontent.com/nathanfraske/AllMyAgents/main/scripts/install-macos.sh | bash
-            ```
-
-            It picks the right build for your Mac, installs it to /Applications, and the app then opens
-            normally — no Gatekeeper dialog and no extra steps.
-
-            Why a command rather than the DMG: this build is signed only ad-hoc, not notarized (that
-            needs a paid Apple Developer ID). Gatekeeper checks apps that were downloaded by a
-            *browser* — that is what writes the `com.apple.quarantine` flag — so a browser download of
-            the DMG below gets blocked, while a `curl` download never carries the flag and is not
-            checked. Nothing is disabled and no signature is faked; the installer just fetches the same
-            file a different way. Read it first if you like — the URL above is the script.
-
-            If you would rather use the DMG directly, drag the app to Applications and then run
-            `xattr -dr com.apple.quarantine /Applications/AllMyAgents.app`. Don't bother right-clicking
-            and choosing Open — Apple removed that override in macOS 15 Sequoia, so the advice in older
-            instructions does nothing. Pick `aarch64` for Apple Silicon, `x64` for Intel.
-
-            Windows: SmartScreen will warn on first run (no Authenticode certificate yet).
+          releaseBody: ${{ steps.release_notes.outputs.body }}
           # NOT a prerelease, deliberately, even though these are alphas.
           #
           # tauri.conf.json points the updater at

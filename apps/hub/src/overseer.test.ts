@@ -512,10 +512,54 @@ describe('application Overseer authority', () => {
       parentSessionId: data.manager.id,
       permissionMode: 'edits',
       delegatedAuthorities: ['commit'],
-      delegatedTools: ['Read'],
+      delegatedTools: ['file_read'],
     })
     expect(h.journal.lastTurnOrigin(data.manager.id)).toBe('operator')
     expect(h.journal.lastTurnOrigin(data.children[0]!.id)).toBe('operator')
+
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'launch_team', projectId, presetId, text: 'Launch the same lineup again.',
+    })).resolves.toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/already has a manager.*will not create a duplicate manager/u),
+    })
+    expect(h.sessions.list().filter((record) => record.projectId === projectId && record.isProjectManager)).toHaveLength(1)
+  })
+
+  it('fails team launch once, before spawning anything, when an eligible account is exhausted', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.markOperator('overseer')
+    const project = await h.sessions.overseerControl('overseer', { operation: 'create_project', name: 'Blocked Lab' })
+    const projectId = (project.data as { id: string }).id
+    const saved = await h.sessions.overseerControl('overseer', {
+      operation: 'save_team_preset',
+      preset: {
+        name: 'Blocked pair',
+        manager: {
+          profileId: 'p1', permissionMode: 'safe', maxChildPermissionMode: 'safe', maxLiveChildren: 1,
+          canApproveChildren: false, delegation: [], allowedTools: [],
+        },
+        agents: [{
+          id: 'worker', name: 'Worker', purpose: 'Run the task.', prompt: 'Run the task.',
+          profileId: 'p1', permissionMode: 'safe', useWorktree: false, authorities: [], tools: [],
+        }],
+      },
+    })
+    expect(saved).toMatchObject({ ok: true, data: { id: expect.any(String) } })
+    const usage = (h.sessions as unknown as { usage: UsageMonitor }).usage
+    usage.noteClaude('p1', { status: 'rejected', resetsAt: Math.floor(Date.now() / 1000) + 3_600 })
+
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'launch_team',
+      projectId,
+      presetId: (saved.data as { id: string }).id,
+      text: 'Do not partially launch.',
+    })).resolves.toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/p1 cannot accept.*rate limit|cannot launch.*p1.*rate limit/i),
+    })
+    expect(h.sessions.list().filter((record) => record.projectId === projectId)).toHaveLength(0)
   })
 
   it('allows diagnostic reads on failure-alert turns but keeps mutations operator-bound', async () => {
@@ -544,16 +588,16 @@ describe('application Overseer authority', () => {
     )
 
     expect(h.profiles[0]).toMatchObject({
-      authStatus: 'signed_out',
-      authError: expect.stringMatching(/organization that rejected Claude Code subscription access/u),
+      entitlementStatus: 'denied',
+      entitlementReason: expect.stringMatching(/organization that rejected Claude Code subscription access/u),
     })
     expect(h.journal.since(0)).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        kind: 'profile/auth',
+        kind: 'profile/entitlement',
         sessionId: null,
         payload: expect.objectContaining({
           profileId: 'p1',
-          status: 'signed_out',
+          status: 'denied',
           message: expect.stringMatching(/Re-authenticate it from Settings/u),
         }),
       }),
@@ -578,6 +622,23 @@ describe('application Overseer authority', () => {
     expect(h.executor.steer).not.toHaveBeenCalled()
     expect(h.bus.pending('overseer')).toHaveLength(1)
     expect(h.bus.pending('overseer')[0]?.subject).toBe('fleet failure')
+  })
+
+  it('classifies an unconfirmed worker handoff as one informational interruption instead of a fleet failure', () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full', status: 'idle' })
+    h.seed({ id: 'failed', status: 'active', title: 'Interrupted worker' })
+
+    h.sessions.failTurn(
+      'failed',
+      'agent worker unavailable — the turn was not confirmed and may not have started (The hub is briefly unavailable (it is restarting). Nothing was lost — retry this tool call in a moment.)',
+    )
+
+    expect(h.sessions.list().find((record) => record.id === 'failed')?.status).toBe('idle')
+    const events = h.journal.recentEventsForSession('failed', 20)
+    expect(events.map((event) => event.kind)).toContain('session/infrastructure-interruption')
+    expect(events.map((event) => event.kind)).not.toContain('session/error')
+    expect(events.map((event) => event.kind)).not.toContain('overseer/failure-alerted')
   })
 
   it('reinjects role-specific Claude app tools after a compacted conversation resumes', async () => {

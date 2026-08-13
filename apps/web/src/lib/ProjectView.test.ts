@@ -519,9 +519,9 @@ describe('ProjectView', () => {
   it('opens project-local project and manager editing without entering the manager chat', async () => {
     render(ProjectView, { props: { projectId: project.id } })
 
-    await fireEvent.click(screen.getByRole('button', { name: /edit project & manager/i }))
-    expect(screen.getByRole('dialog', { name: 'Edit project and manager' })).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Edit manager settings' })).toBeTruthy()
+    await fireEvent.click(screen.getByRole('button', { name: 'Manage project' }))
+    expect(screen.getByRole('dialog', { name: 'Manage project' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Edit team & manager' })).toBeTruthy()
 
     const name = screen.getByRole('textbox', { name: 'Project name' })
     await fireEvent.input(name, { target: { value: 'Alpha renamed' } })

@@ -625,7 +625,7 @@ const spawnAgent = defineTool({
     tools: z
       .array(z.string())
       .optional()
-      .describe('optional exact tool names, limited by the operator-granted manager tool ceiling'),
+      .describe('optional provider-neutral capabilities or custom tool names, limited by the operator-granted manager ceiling'),
   },
   run: async (args, { identity, services }) => {
     if (!services.spawnAgent) return 'Not spawned: this hub does not support manager spawning.'
@@ -657,7 +657,7 @@ const spawnAgent = defineTool({
 const setChildAuthority = defineTool({
   name: 'set_child_authority',
   description:
-    'Project managers only: replace a direct child agent\'s delegated Git authority and optionally its exact tool grant or permission mode. Every value remains bounded by the operator-granted manager ceiling and applies on the child\'s next tool call.',
+    'Project managers only: replace a direct child agent\'s delegated Git authority and optionally its provider-neutral capability/custom-tool grant or permission mode. Every value remains bounded by the operator-granted manager ceiling and applies on the child\'s next tool call.',
   schema: {
     child_session: z.string().describe('direct child session id'),
     authorities: z.array(z.enum(['commit', 'push'])).describe('the complete replacement grant; [] revokes all'),

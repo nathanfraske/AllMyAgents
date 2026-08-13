@@ -3,6 +3,7 @@ import type { WorkerClient } from './workerTransport.js'
 import type { DangerFlags } from './types.js'
 import { nextReqId, type HubToWorker, type LiveSession, type RelayMethod, type WorkerSessionSpec, type WorkerToHub } from './workerProtocol.js'
 import type { AttachmentMeta } from './attachments.js'
+import type { ApprovalDecision } from './approvals.js'
 
 function errText(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
@@ -51,7 +52,12 @@ export interface WorkerExecutorHubCallbacks {
   recall(sessionId: string, prompt: string): string
   requestRestart(reason: string, bySession?: string): void
   runRelay(method: RelayMethod, args: unknown): unknown | Promise<unknown>
-  resolveApproval(approvalId: string, sessionId: string, kind: string, payload: unknown): Promise<boolean>
+  resolveApproval(
+    approvalId: string,
+    sessionId: string,
+    kind: string,
+    payload: unknown,
+  ): Promise<boolean | ApprovalDecision>
   attachWorker(): Promise<void>
 }
 
@@ -370,7 +376,16 @@ export class WorkerExecutor implements Executor {
   private dispatchApproval(msg: Extract<WorkerToHub, { t: 'approvalRequest' }>): void {
     this.hub
       .resolveApproval(msg.approvalId, msg.sessionId, msg.kind, msg.payload)
-      .then((approved) => this.client.send({ t: 'approvalResolved', approvalId: msg.approvalId, approved }))
+      .then((decision) => {
+        const approved = typeof decision === 'boolean' ? decision : decision.approved
+        const status = typeof decision === 'boolean' ? undefined : decision.status
+        this.client.send({
+          t: 'approvalResolved',
+          approvalId: msg.approvalId,
+          approved,
+          ...(status ? { status } : {}),
+        })
+      })
       .catch((err) => {
         console.warn(`[worker-executor] approval resolve failed for ${msg.approvalId}: ${errText(err)}`)
         this.client.send({ t: 'approvalResolved', approvalId: msg.approvalId, approved: false })

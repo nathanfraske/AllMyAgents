@@ -303,6 +303,28 @@ export class AgentBus {
       .run(...ids)
   }
 
+  /**
+   * Retire queued hub-minted approval mail once the underlying request is no longer pending. The UUID is
+   * present in both manager and Overseer messages; matching the two reserved subjects prevents arbitrary
+   * user mail containing that UUID from being consumed. Delivered history remains available for audit.
+   */
+  settleApproval(approvalId: string, status: 'approved' | 'denied' | 'timeout'): number {
+    const now = new Date().toISOString()
+    return this.db
+      .prepare(
+        `UPDATE bus_messages
+         SET delivered = 1,
+             wake = 0,
+             attentionRequired = 0,
+             readAt = COALESCE(readAt, ?),
+             body = body || ?
+         WHERE delivered = 0
+           AND subject IN ('child approval pending', 'approval awaiting operator')
+           AND instr(body, ?) > 0`,
+      )
+      .run(now, `\nCurrent status: ${status}. This request is no longer pending.`, approvalId).changes
+  }
+
   /** Atomically downgrade queued mail so it cannot create an idle turn after this hub exits. */
   holdWake(ids: string[]): void {
     if (!ids.length) return

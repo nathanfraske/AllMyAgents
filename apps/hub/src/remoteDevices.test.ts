@@ -92,7 +92,15 @@ describe('DeviceExecutor target policy', () => {
   it('is disabled with no roots until the operator explicitly configures it', async () => {
     const dir = tempDir()
     const executor = new DeviceExecutor(path.join(dir, 'policy.json'))
-    expect(executor.capabilities()).toMatchObject({ enabled: false, roots: [] })
+    expect(executor.capabilities()).toMatchObject({
+      enabled: false,
+      hostname: expect.any(String),
+      platform: process.platform,
+      arch: process.arch,
+      cpuCount: expect.any(Number),
+      totalMemoryBytes: expect.any(Number),
+      roots: [],
+    })
     await expect(executor.execute({ op: 'list', rootId: 'anything' })).resolves.toMatchObject({
       ok: false,
       error: 'Remote device execution is disabled on this machine.',

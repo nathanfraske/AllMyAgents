@@ -1,16 +1,6 @@
-interface Settings {
-  showSpend: boolean
-  planBudgetUsd: number | null
-  showTokenEstimate: boolean
-  combineQueued: boolean
-  defaultAccount: string
-  defaultPermissionMode: string
-  defaultClaudeModel: string
-  defaultCodexModel: string
-  defaultUseWorktree: boolean
-  ownerName: string
-  detachedDefaultProjectId: string | null
-  detachedDefaultMode: 'safe' | 'edits' | 'full'
+import { api, type UiPreferences } from './api'
+
+interface Settings extends UiPreferences {
   // On the first send in a new chat, switch the active pane to the freshly-spawned session (so you land
   // on the chat you just started instead of staying on the previous one). Default on.
   autoSwitchToNewChat: boolean
@@ -87,7 +77,7 @@ class SettingsStore {
   showTokenEstimate = $state(true)
   combineQueued = $state(true)
   defaultAccount = $state('')
-  defaultPermissionMode = $state('safe')
+  defaultPermissionMode = $state<'safe' | 'edits' | 'full'>('safe')
   defaultClaudeModel = $state('')
   defaultCodexModel = $state('')
   defaultUseWorktree = $state(true)
@@ -98,6 +88,13 @@ class SettingsStore {
   autoReopenLastChats = $state(false)
   autoCheckUpdates = $state(true)
   pasteAsTextThreshold = $state(10000)
+  /** Visible save truth: local cache is immediate; hub sync is the update/restart durability boundary. */
+  syncState = $state<'local' | 'saving' | 'saved' | 'error'>('local')
+  syncError = $state('')
+  private hubReady = false
+  private dirtyBeforeHub = false
+  private syncTimer: ReturnType<typeof setTimeout> | null = null
+  private syncGeneration = 0
 
   constructor() {
     const s = load()
@@ -119,33 +116,122 @@ class SettingsStore {
     this.pasteAsTextThreshold = s.pasteAsTextThreshold
   }
 
-  save(): void {
+  private snapshot(): UiPreferences {
+    return {
+      showSpend: this.showSpend,
+      planBudgetUsd: this.planBudgetUsd,
+      showTokenEstimate: this.showTokenEstimate,
+      combineQueued: this.combineQueued,
+      defaultAccount: this.defaultAccount,
+      defaultPermissionMode: this.defaultPermissionMode,
+      defaultClaudeModel: this.defaultClaudeModel,
+      defaultCodexModel: this.defaultCodexModel,
+      defaultUseWorktree: this.defaultUseWorktree,
+      ownerName: this.ownerName,
+      detachedDefaultProjectId: this.detachedDefaultProjectId,
+      detachedDefaultMode: this.detachedDefaultMode,
+      autoSwitchToNewChat: this.autoSwitchToNewChat,
+      autoReopenLastChats: this.autoReopenLastChats,
+      autoCheckUpdates: this.autoCheckUpdates,
+      pasteAsTextThreshold: this.pasteAsTextThreshold,
+    }
+  }
+
+  private apply(value: UiPreferences): void {
+    this.showSpend = value.showSpend
+    this.planBudgetUsd = value.planBudgetUsd
+    this.showTokenEstimate = value.showTokenEstimate
+    this.combineQueued = value.combineQueued
+    this.defaultAccount = value.defaultAccount
+    this.defaultPermissionMode = value.defaultPermissionMode
+    this.defaultClaudeModel = value.defaultClaudeModel
+    this.defaultCodexModel = value.defaultCodexModel
+    this.defaultUseWorktree = value.defaultUseWorktree
+    this.ownerName = value.ownerName
+    this.detachedDefaultProjectId = value.detachedDefaultProjectId
+    this.detachedDefaultMode = value.detachedDefaultMode
+    this.autoSwitchToNewChat = value.autoSwitchToNewChat
+    this.autoReopenLastChats = value.autoReopenLastChats
+    this.autoCheckUpdates = value.autoCheckUpdates
+    this.pasteAsTextThreshold = value.pasteAsTextThreshold
+  }
+
+  private saveLocal(): boolean {
     try {
       localStorage.setItem(
         KEY,
         JSON.stringify({
-          showSpend: this.showSpend,
-          planBudgetUsd: this.planBudgetUsd,
-          showTokenEstimate: this.showTokenEstimate,
-          combineQueued: this.combineQueued,
-          defaultAccount: this.defaultAccount,
-          defaultPermissionMode: this.defaultPermissionMode,
-          defaultClaudeModel: this.defaultClaudeModel,
-          defaultCodexModel: this.defaultCodexModel,
-          defaultUseWorktree: this.defaultUseWorktree,
-          ownerName: this.ownerName,
-          detachedDefaultProjectId: this.detachedDefaultProjectId,
-          detachedDefaultMode: this.detachedDefaultMode,
-          autoSwitchToNewChat: this.autoSwitchToNewChat,
-          autoReopenLastChats: this.autoReopenLastChats,
+          ...this.snapshot(),
           _v: SETTINGS_VERSION, // so a future default change can migrate this install (see load)
-          autoCheckUpdates: this.autoCheckUpdates,
-          pasteAsTextThreshold: this.pasteAsTextThreshold,
         })
       )
+      return true
     } catch {
-      /* ignore */
+      this.syncState = 'error'
+      this.syncError = 'Settings could not be cached on this device.'
+      return false
     }
+  }
+
+  private async pushToHub(): Promise<void> {
+    const generation = ++this.syncGeneration
+    this.syncState = 'saving'
+    this.syncError = ''
+    try {
+      const result = await api.setPrefs({ ui: this.snapshot() })
+      if (generation !== this.syncGeneration) return
+      if ('error' in result) throw new Error(result.error)
+      if (!result.ui) throw new Error('The connected hub did not accept durable UI settings.')
+      this.apply(result.ui)
+      if (!this.saveLocal()) return
+      this.syncState = 'saved'
+      this.dirtyBeforeHub = false
+    } catch (error) {
+      if (generation !== this.syncGeneration) return
+      this.syncState = 'error'
+      this.syncError = error instanceof Error ? error.message : String(error)
+      this.dirtyBeforeHub = true
+    }
+  }
+
+  private queueHubSave(): void {
+    this.dirtyBeforeHub = true
+    if (!this.hubReady) {
+      this.syncState = 'local'
+      return
+    }
+    if (this.syncTimer) clearTimeout(this.syncTimer)
+    this.syncState = 'saving'
+    this.syncTimer = setTimeout(() => {
+      this.syncTimer = null
+      void this.pushToHub()
+    }, 180)
+  }
+
+  save(): void {
+    if (!this.saveLocal()) return
+    this.queueHubSave()
+  }
+
+  /**
+   * Reconcile the durable hub copy with the renderer cache once bootstrap connects.
+   * Existing installs migrate local -> hub exactly once; later installs/restarts load hub -> local.
+   * A setting changed while disconnected wins over the older hub copy rather than being erased.
+   */
+  async syncWithHub(remote?: UiPreferences): Promise<void> {
+    this.hubReady = true
+    if (this.syncTimer) {
+      clearTimeout(this.syncTimer)
+      this.syncTimer = null
+    }
+    if (this.dirtyBeforeHub || !remote) {
+      await this.pushToHub()
+      return
+    }
+    this.apply(remote)
+    if (!this.saveLocal()) return
+    this.syncState = 'saved'
+    this.syncError = ''
   }
 
   toggleSpend(): void {

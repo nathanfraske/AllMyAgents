@@ -120,7 +120,7 @@ describe('tutorial account waiting integration', () => {
         },
       },
     })
-    render(SettingsModal, { props: { onclose: () => {}, initialTab: 'system' } })
+    render(SettingsModal, { props: { onclose: () => {}, initialTab: 'overseer' } })
 
     const modeGroup = await screen.findByRole('group', { name: 'Operating mode' })
     await fireEvent.change(within(modeGroup).getByLabelText('Mode'), { target: { value: 'tokenmaxxing' } })
@@ -555,7 +555,7 @@ describe('tutorial account waiting integration', () => {
     render(SettingsModal, {
       props: {
         onclose: () => {},
-        initialTab: 'system',
+        initialTab: 'advanced',
         onreplayfirst: replayFirst,
         onreplayapptour: replayApp,
         onreplayproject: replayProject,
@@ -586,7 +586,7 @@ describe('tutorial account waiting integration', () => {
     render(SettingsModal, {
       props: {
         onclose: close,
-        initialTab: 'system',
+        initialTab: 'overseer',
         onoverseerconfigured: configured,
       },
     })
