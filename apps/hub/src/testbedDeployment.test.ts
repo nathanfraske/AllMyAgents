@@ -80,7 +80,7 @@ describe('lightweight testbed deployment orchestration', () => {
       return { siteId: 'target', label: 'Target', token: 'token', paired: true }
     })
     const capabilities = vi.fn(async () => lightweightCapabilities())
-    const remoteDevices = { pairDirect, capabilities } as unknown as RemoteDeviceController
+    const remoteDevices = { pairDirect, capabilities, listConnections: () => [] } as unknown as RemoteDeviceController
     const commands: string[] = []
     const planes = {
       connectFiles: vi.fn(async () => 'files-route'),
@@ -96,6 +96,7 @@ describe('lightweight testbed deployment orchestration', () => {
         commands.push(command)
         if (commands.length === 1) return { ok: true, exitCode: 0, output: 'X64', elapsedMs: 2 }
         if (commands.length === 3) installed = true
+        if (commands.length === 4) return { ok: true, exitCode: 0, output: 'ABCD-EFGH', elapsedMs: 3 }
         return { ok: true, exitCode: 0, output: 'ok', elapsedMs: 3 }
       }),
     } as unknown as AllMyStuffPlanes
@@ -121,9 +122,11 @@ describe('lightweight testbed deployment orchestration', () => {
       bytes: 8,
       verified: true,
     })
-    expect(commands).toHaveLength(3)
+    expect(commands).toHaveLength(4)
     expect(commands[2]).toMatch(/install-elevated --profile elevated-machine/u)
-    expect(pairDirect).toHaveBeenCalledTimes(2)
+    expect(commands[3]).toMatch(/pair-code/u)
+    expect(pairDirect).toHaveBeenCalledOnce()
+    expect(pairDirect).toHaveBeenCalledWith('target', 'ABCD-EFGH')
     expect(events.map((event) => event.stage)).toEqual([
       'requested', 'preflight', 'transferring', 'installing', 'pairing', 'cleaning', 'verified',
     ])
@@ -135,6 +138,7 @@ describe('lightweight testbed deployment orchestration', () => {
     const remoteDevices = {
       pairDirect: vi.fn(async () => ({ siteId: 'target', label: 'Target', token: 'token', paired: true })),
       capabilities: vi.fn(async () => ({ ...lightweightCapabilities(), nodeKind: 'hub' })),
+      listConnections: () => [{ siteId: 'target', label: 'Target' }],
     } as unknown as RemoteDeviceController
     const service = new TestbedDeploymentService({
       bundleDir: root,
