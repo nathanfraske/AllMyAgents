@@ -12,7 +12,7 @@ running command; the hub refuses to claim live remote cancellation until the tar
 
 Each run records:
 
-- immutable actor and target session ids, project, kind, local/remote execution target, bounded command
+- immutable actor and target session ids, scope, kind, local/remote execution target, bounded command
   summary, command digest, creation/start/heartbeat/completion times, exact exit code or signal, and terminal
   state;
 - the local source checkout's Git HEAD/ref plus exact content hashes for changed and untracked inputs, with an
@@ -24,8 +24,8 @@ Each run records:
 - bounded stdout/stderr files outside the journal, byte counts, truncation state, and cursor-paged reads; and
 - remote route/network/target timing, transfer counts, failure stage, and target correlation id when present.
 
-Resources are durable string leases. The target checkout or remote device/root is always included. Callers may
-also name project-scoped resources such as `gpu-0`, `port-8080`, or a hardware fixture. Runs with disjoint
+Resources are durable string leases. The target checkout, application working directory, or remote device/root
+is always included. Callers may also name scope-owned resources such as `gpu-0`, `port-8080`, or a hardware fixture. Runs with disjoint
 resources can execute concurrently on different local checkouts or remote devices; a shared resource queues
 instead of requiring agents to invent lockfiles. Terminal outcomes release their claims.
 
@@ -41,6 +41,12 @@ remote command field because the remote root advertises its shell environment. I
 requires the target session's exact device/root terminal grant. `start_run` is an ordinary execution approval
 class: direct Full Access and an exact operator "always allow start_run" grant can approve it, while a
 teammate-caused turn remains denied by default.
+
+A project manager always runs against a visible project checkout. The application Overseer may additionally
+start local ad-hoc work by supplying an explicit absolute `working_directory`, or use a granted remote root
+without inventing a project association. The hub resolves and records the canonical local directory, leases it
+under a reserved application scope, and exposes those runs only through the Overseer's normal managed-scope
+query. Relative or missing directories fail before a process starts.
 
 The older project-replica testbed run/reservation ledger remains active for callers still using `remote_exec`
 during the compatibility period. A generic remote run does not manufacture a duplicate legacy run: its generic

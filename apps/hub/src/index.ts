@@ -14,6 +14,7 @@ import {
   JOURNAL_CONDENSE_MAX_COMMAND_DELTAS,
   JOURNAL_CONDENSE_MAX_DIFF_SNAPSHOTS,
   JOURNAL_CONDENSE_MAX_TRANSIENT_BYTES,
+  JOURNAL_SQLITE_TARGET_BYTES,
   Journal,
   type JournalCondenseResult,
 } from './journal.js'
@@ -28,7 +29,11 @@ import {
   ProfileLoginCoordinator,
   ProfileLoginRegistry,
 } from './profileLoginCoordinator.js'
-import { createJournalBackupSupervisor } from './journalBackup.js'
+import {
+  createJournalBackupSupervisor,
+  JOURNAL_BACKUP_KEEP_DEFAULT,
+  JOURNAL_BACKUP_MAX_RETAINED_BYTES_DEFAULT,
+} from './journalBackup.js'
 import { createJournalSnapshotChildTask } from './journalBackupProcess.js'
 import {
   JournalProgressReporter,
@@ -74,6 +79,7 @@ import {
 } from './restartHandshake.js'
 import {
   PREFLIGHT_EXIT_CODE,
+  journalPreflightIdentity,
   recordExistingSchemaVersion,
   recordSchemaVersion,
   runHubPreflight,
@@ -113,10 +119,39 @@ function reportHubStartupPhase(phase: string, detail = ''): void {
 }
 
 const repoRoot = path.resolve(import.meta.dirname, '..', '..', '..')
+function configuredInteger(
+  raw: string | undefined,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+): number {
+  const parsed = Number(raw)
+  return Number.isSafeInteger(parsed) && parsed >= minimum && parsed <= maximum
+    ? parsed
+    : fallback
+}
 const supervised = process.env.HUB_SUPERVISED === '1' && typeof process.send === 'function'
 const bootPort = Number(process.env.HUB_PORT ?? 7777)
 const publicPort = supervised ? Number(process.env.HUB_FIXED_PORT ?? 7777) : bootPort
 const isGreen = supervised && bootPort === 0
+const journalSqliteTargetBytes = configuredInteger(
+  process.env.AMA_JOURNAL_SQLITE_TARGET_BYTES,
+  JOURNAL_SQLITE_TARGET_BYTES,
+  128 * 1024 * 1024,
+  64 * 1024 * 1024 * 1024,
+)
+const journalSnapshotKeep = configuredInteger(
+  process.env.AMA_JOURNAL_SNAPSHOT_KEEP,
+  JOURNAL_BACKUP_KEEP_DEFAULT,
+  1,
+  16,
+)
+const journalSnapshotMaxBytes = configuredInteger(
+  process.env.AMA_JOURNAL_SNAPSHOT_MAX_BYTES,
+  JOURNAL_BACKUP_MAX_RETAINED_BYTES_DEFAULT,
+  128 * 1024 * 1024,
+  64 * 1024 * 1024 * 1024,
+)
 function sendSupervisorMessage(message: unknown): void {
   if (!process.connected || !process.send) return
   try {
@@ -240,12 +275,19 @@ try {
 }
 const preflight = await (async () => {
   try {
+    const currentIdentity = journalPreflightIdentity(dataDir, journalPath)
+    const reuseVerifiedIdentity =
+      supervised &&
+      typeof currentIdentity === 'string' &&
+      /^[0-9a-f]{64}$/u.test(process.env.HUB_PREFLIGHT_CACHE_ID ?? '') &&
+      process.env.HUB_PREFLIGHT_CACHE_ID === currentIdentity
     return supervised
       ? await runHubPreflightInWorker({
           dataDir,
           journalPath,
           schemaVersion: SCHEMA_VERSION,
           onLiveness: () => {},
+          reuseVerifiedIdentity,
         })
       : runHubPreflight({ dataDir, journalPath, schemaVersion: SCHEMA_VERSION })
   } catch (error) {
@@ -332,6 +374,16 @@ if (consumedRecoveryReceipts > 0) {
   )
 }
 reportHubStartupPhase('journal opened')
+if (supervised && validPreflightAttempt) {
+  const identity = journalPreflightIdentity(dataDir, journalPath)
+  if (identity) {
+    sendSupervisorMessage({
+      type: 'preflight-cacheable',
+      attemptId: preflightAttemptId,
+      identity,
+    })
+  }
+}
 // Each live WebSocket (pane / device / reconnect) attaches a journal 'event' listener, removed on
 // close — legitimately more than the EventEmitter default of 10 for a multi-pane/fleet hub. Raise
 // the cap so a healthy number of connections doesn't emit a spurious MaxListeners leak warning.
@@ -352,8 +404,8 @@ const restartState: RestartState = {
 // The operator's journal was corrupted twice in two days; the second time it was truncated to an empty
 // schema, and the only reason fourteen hours of history survived at all was a backup a human happened to
 // take by hand. Nothing in the product was protecting it. This is that protection: a consistent online
-// snapshot on boot and every 30 minutes, each one integrity-checked before it is kept, six generations
-// retained so one bad snapshot cannot erase the safety net.
+// size-aware snapshots after readiness, each one integrity-checked before it is kept. Two independently
+// verified generations preserve rollback depth without multiplying a multi-gigabyte journal by six.
 //
 // The supervisor is constructed here but does NO work until the server's listening callback declares
 // readiness below. A large initial snapshot must never sit on the port-bind/readiness critical path.
@@ -362,6 +414,9 @@ const restartState: RestartState = {
 // snapshotting would double the IO for no benefit, and green is the one that will survive.
 const journalBackupsDir = path.join(dataDir, 'backups')
 const notifications = new NotificationService(journal.db)
+let journalBackupWorkActive = false
+let journalMaintenanceDeferredForBackup = false
+let journalMaintenanceChild: ChildProcess | undefined
 const journalProgress = new JournalProgressReporter(
   dataDir,
   process.pid,
@@ -373,13 +428,31 @@ const journalProgress = new JournalProgressReporter(
       }`
     )
 )
+const journalSnapshotChildTask = createJournalSnapshotChildTask(journalPath)
 const journalBackups = createJournalBackupSupervisor(journal.db, {
   dir: journalBackupsDir,
   recoveryDataDir: dataDir,
-  recoveryKeep: 6,
-  onProgress: (progress) => journalProgress.report(progress),
+  keep: journalSnapshotKeep,
+  maxRetainedBytes: journalSnapshotMaxBytes,
+  recoveryKeep: journalSnapshotKeep,
+  recoveryMaxRetainedBytes: journalSnapshotMaxBytes,
+  onProgress: (progress) => {
+    journalBackupWorkActive = progress.active
+    journalProgress.report(progress)
+    if (!progress.active && journalMaintenanceDeferredForBackup) {
+      journalMaintenanceDeferredForBackup = false
+      setImmediate(runJournalMaintenance).unref?.()
+    }
+  },
   log: (message) => console.log(message),
   onStateChange: (state) => {
+    // State transitions occur after the snapshot task settles, including worker crashes that cannot send
+    // a terminal progress frame. Never strand deferred storage maintenance behind a stale active bit.
+    journalBackupWorkActive = false
+    if (journalMaintenanceDeferredForBackup) {
+      journalMaintenanceDeferredForBackup = false
+      setImmediate(runJournalMaintenance).unref?.()
+    }
     if (state.status !== 'inactive') restartState.journalBackupRequired = true
     restartState.journalBackup = state
     if (state.status === 'degraded') {
@@ -394,7 +467,13 @@ const journalBackups = createJournalBackupSupervisor(journal.db, {
       })
     }
   },
-}, createJournalSnapshotChildTask(journalPath))
+}, async (db, options) => {
+  if (journalMaintenanceChild) {
+    options.log?.('[journal-backup] snapshot deferred while exclusive storage maintenance is active')
+    return { ok: true, skipped: true }
+  }
+  return await journalSnapshotChildTask(db, options)
+})
 process.once('exit', () => recoveryLease.release())
 const store = new SessionStore(journal.db)
 const profiles: ReturnType<typeof scanProfiles> = []
@@ -634,14 +713,18 @@ type JournalMaintenanceMessage =
       phase: string
       rowsCompleted: number
       bytesCompleted: number
+      suspendWatchdog?: boolean
     }
 
 let journalMaintenanceTimer: NodeJS.Timeout | undefined
 let journalMaintenanceImmediate: NodeJS.Immediate | undefined
-let journalMaintenanceChild: ChildProcess | undefined
 
 function runJournalMaintenance(): void {
   if (journalMaintenanceChild) return // a slow disk gets one job, never an accumulating process queue
+  if (journalBackupWorkActive) {
+    journalMaintenanceDeferredForBackup = true
+    return
+  }
   const operationId = crypto.randomUUID()
   try {
     journal.recordCompactionLifecycle(operationId, 'started', {
@@ -674,6 +757,9 @@ function runJournalMaintenance(): void {
         String(JOURNAL_CONDENSE_MAX_DIFF_SNAPSHOTS),
         String(JOURNAL_CONDENSE_MAX_TRANSIENT_BYTES),
         String(workBudgetMs),
+        String(journalSqliteTargetBytes),
+        String(journalSnapshotKeep),
+        String(journalSnapshotMaxBytes),
       ],
       {
         execArgv,
@@ -683,7 +769,9 @@ function runJournalMaintenance(): void {
     journalMaintenanceChild = child
     let terminalReported = false
     let lastProgressAt = Date.now()
+    let progressWatchdogSuspended = false
     const guard = setInterval(() => {
+      if (progressWatchdogSuspended) return
       if (Date.now() - lastProgressAt < noProgressMs) return
       if (!terminalReported) {
         terminalReported = true
@@ -711,6 +799,7 @@ function runJournalMaintenance(): void {
       if (msg?.operationId !== operationId) return
       if (msg?.type === 'journal-condense-progress') {
         lastProgressAt = Date.now()
+        progressWatchdogSuspended = msg.suspendWatchdog === true
         return
       }
       if (msg?.type === 'journal-condense-error') {
@@ -872,6 +961,23 @@ if (agentBridge) {
 
 sessions.boot({ reconcile: !isGreen }) // green defers stale-reconcile to promote (it doesn't own the port yet)
 reportHubStartupPhase('sessions restored', `${sessions.list().length} session(s)`)
+let durableCapabilityUpgradeImmediate: NodeJS.Immediate | undefined
+function scheduleDurableCapabilityUpgrade(): void {
+  if (durableCapabilityUpgradeImmediate) return
+  durableCapabilityUpgradeImmediate = setImmediate(() => {
+    durableCapabilityUpgradeImmediate = undefined
+    void sessions.upgradeDurableSessionCapabilitiesPostReady().catch((error) => {
+      console.error(
+        `[hub] post-ready durable capability upgrade failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      )
+    })
+  })
+}
+process.once('exit', () => {
+  if (durableCapabilityUpgradeImmediate) clearImmediate(durableCapabilityUpgradeImmediate)
+})
 if (!isGreen) usage.startPolling() //     green starts polling only once it owns the port (on promote)
 // Reclaim agent worktrees no session owns only AFTER the listener is ready, in a one-shot child. This used
 // to run synchronously between sessions.boot() and startServer(), and a setImmediate version could still
@@ -1144,6 +1250,7 @@ server.once('listening', () => {
   }
   // Blue / standalone own the port at boot → advertise now. Green defers mesh to promote.
   if (!isGreen) {
+    scheduleDurableCapabilityUpgrade()
     scheduleWorkspaceHousekeeping()
     registerMesh()
     startJournalMaintenance()
@@ -1167,6 +1274,7 @@ if (supervised && process.send) {
     send,
     onPromoted: () => {
       usage.startPolling()
+      scheduleDurableCapabilityUpgrade()
       scheduleWorkspaceHousekeeping()
       registerMesh()
       startJournalMaintenance()

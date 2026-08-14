@@ -75,6 +75,7 @@ function normalizeArch(value: string): string {
   const lower = value.toLowerCase()
   if (/\b(?:x64|x86_64|amd64)\b/u.test(lower)) return 'x64'
   if (/\b(?:arm64|aarch64)\b/u.test(lower)) return 'arm64'
+  if (/\b(?:riscv64|riscv64gc|rv64|rv64gc)\b/u.test(lower)) return 'riscv64'
   if (/\b(?:arm|armv7|armv7l)\b/u.test(lower)) return 'arm'
   if (/\b(?:ia32|x86|i686)\b/u.test(lower)) return 'ia32'
   return lower.trim().slice(0, 50)
@@ -185,6 +186,21 @@ function remoteInstallCommand(platform: NodeJS.Platform, stage: string, profile:
   return `sudo -n ${shellLiteral(allMyStuffRemotePathJoin(stage, 'node'))} ${shellLiteral(allMyStuffRemotePathJoin(stage, 'dist', 'testbedNode.js'))} install-elevated --profile ${profile}`
 }
 
+function remotePairCodeCommand(platform: NodeJS.Platform): string {
+  if (platform === 'win32') {
+    const installRoot = 'C:\\ProgramData\\AllMyAgents\\TestbedNode'
+    return `& ${powerShellLiteral(path.win32.join(installRoot, 'node.exe'))} ${powerShellLiteral(path.win32.join(installRoot, 'dist', 'testbedNode.js'))} pair-code --data-dir ${powerShellLiteral(path.win32.join(installRoot, 'data'))}`
+  }
+  return `sudo -n /opt/allmyagents-testbed/node /opt/allmyagents-testbed/dist/testbedNode.js pair-code --data-dir /var/lib/allmyagents-testbed`
+}
+
+function parsePairingCode(output: string): string {
+  const matches = output.toUpperCase().match(/[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}/gu)
+  const code = matches?.at(-1)
+  if (!code) throw new Error('the installed testbed did not return a valid one-use pairing code')
+  return code
+}
+
 export class TestbedDeploymentService {
   private readonly planes: AllMyStuffPlanes
 
@@ -270,11 +286,12 @@ export class TestbedDeploymentService {
       const manifest = verifyTestbedBundle(this.deps.bundleDir)
       this.event({ ...baseEvent, stage: 'preflight', detail: { bundlePlatform: manifest.platform, bundleArch: manifest.arch } })
 
-      // If an executor already owns the application RPC method, never displace it with a second node.
-      let existingPaired = false
-      try {
-        await this.deps.remoteDevices.pairDirect(siteId)
-        existingPaired = true
+      // If this hub already holds a reciprocal connection, inspect it without issuing another pairing
+      // mutation. Fleet membership alone is deliberately not execution authority.
+      const existingConnection = this.deps.remoteDevices.listConnections()
+        .find((connection) => canonical(connection.siteId) === siteId)
+      if (existingConnection) {
+        try {
         const existing = await this.deps.remoteDevices.capabilities(siteId)
         if (existing.nodeKind === 'lightweight-testbed') {
           if (existing.deploymentProfile !== profile || existing.elevated !== true) {
@@ -300,14 +317,12 @@ export class TestbedDeploymentService {
           return result
         }
         throw new Error('the target already runs a full AllMyAgents hub; use its built-in executor instead of installing a competing lightweight node')
-      } catch (error) {
+        } catch (error) {
         if (error instanceof Error && /already runs a full|use its built-in|lightweight/u.test(error.message)) throw error
-        if (existingPaired) {
-          throw new Error(
-            `the target already answers the AllMyAgents route but its capabilities could not be inspected; refusing to replace it: ${error instanceof Error ? error.message : String(error)}`,
-          )
+        throw new Error(
+          `the target is already paired but its capabilities could not be inspected; refusing to replace it: ${error instanceof Error ? error.message : String(error)}`,
+        )
         }
-        // No allmyagents.hub.v1 handler is the expected pre-bootstrap state.
       }
 
       filesRoute = await this.planes.connectFiles(identity.siteId, siteId)
@@ -368,21 +383,48 @@ export class TestbedDeploymentService {
       if (!installed.ok) throw new Error(`the elevated target installer failed with exit ${installed.exitCode}`)
 
       this.event({ ...baseEvent, stage: 'pairing' })
+      const pairingCodeResult = await this.planes.runCommand(
+        terminalRoute,
+        platform === 'win32' ? 'windows' : 'unix',
+        remotePairCodeCommand(platform),
+        30_000,
+      )
+      if (!pairingCodeResult.ok) {
+        throw new Error(`the installed testbed could not issue a one-use pairing code (exit ${pairingCodeResult.exitCode})`)
+      }
+      const pairingCode = parsePairingCode(pairingCodeResult.output)
       let capabilities: Awaited<ReturnType<RemoteDeviceController['capabilities']>> | undefined
       const pairingDeadline = Date.now() + 45_000
-      let lastPairError: unknown
+      let advertised = false
+      while (Date.now() < pairingDeadline) {
+        const peerNow = (await this.deps.directMesh.peers(true)).find((candidate) => candidate.siteId === siteId)
+        if (peerNow?.online) {
+          advertised = true
+          break
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500))
+      }
+      if (!advertised) throw new Error('the installed testbed never advertised its authenticated MyOwnMesh route')
+      // This is a one-use mutation. Call it exactly once: an ambiguous transport outcome may have paired
+      // the device already, and blindly retrying would consume a second intent or misreport success.
+      try {
+        await this.deps.remoteDevices.pairDirect(siteId, pairingCode)
+      } catch (error) {
+        throw new Error(
+          `the one-use pairing exchange did not return a confirmed result; inspect the connection before issuing another code: ${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
       while (Date.now() < pairingDeadline) {
         try {
-          await this.deps.remoteDevices.pairDirect(siteId)
           capabilities = await this.deps.remoteDevices.capabilities(siteId)
           if (capabilities.nodeKind === 'lightweight-testbed') break
-        } catch (error) {
-          lastPairError = error
+        } catch {
+          // Read-only capability discovery is safe to retry after the single confirmed pairing mutation.
         }
         await new Promise((resolve) => setTimeout(resolve, 500))
       }
       if (capabilities?.nodeKind !== 'lightweight-testbed') {
-        throw new Error(`the testbed service was installed but did not become reachable${lastPairError instanceof Error ? `: ${lastPairError.message}` : ''}`)
+        throw new Error('the paired testbed service did not return its capabilities before the deadline')
       }
       if (capabilities.deploymentProfile !== profile || capabilities.elevated !== true) {
         throw new Error(

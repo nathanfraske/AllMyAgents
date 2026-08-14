@@ -1,8 +1,11 @@
 import { describe, it, expect, afterAll } from 'vitest'
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import Database from 'better-sqlite3'
 import { Journal } from './journal.js'
+import { JOURNAL_BLOB_KEY } from './journalBlobStore.js'
 
 describe('journal wseq — Phase 2 additions', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-jrnl-'))
@@ -95,8 +98,9 @@ describe('journal payload bulk defense', () => {
     }
   })
 
-  it('leaves ordinary large textual transcript fields byte-for-byte intact', () => {
+  it('externalizes ordinary large transcript text losslessly and rehydrates it after reopen', () => {
     const j = new Journal(path.join(tmp, 'large-text.db'))
+    const file = path.join(tmp, 'large-text.db')
     try {
       const output = 'ordinary textual command output: build step completed successfully\n'.repeat(16_384)
       const event = j.append('s', 'codex/item/completed', {
@@ -108,11 +112,125 @@ describe('journal payload bulk defense', () => {
       const stored = j.db.prepare('SELECT payload FROM events WHERE seq = ?').get(event.seq) as {
         payload: string
       }
-      expect((JSON.parse(stored.payload) as { item: { aggregatedOutput: string } }).item.aggregatedOutput).toBe(
-        output
-      )
+      const persisted = JSON.parse(stored.payload) as {
+        item: { aggregatedOutput: Record<string, unknown> }
+      }
+      expect(persisted.item.aggregatedOutput).toHaveProperty(JOURNAL_BLOB_KEY)
+      expect(stored.payload).not.toContain(output.slice(0, 1024))
       expect((event.payload as { item: { aggregatedOutput: string } }).item.aggregatedOutput).toBe(output)
       expect(stored.payload).not.toContain('__allmyagentsJournalTruncated')
+      expect((j.since(0)[0]?.payload as { item: { aggregatedOutput: string } }).item.aggregatedOutput).toBe(output)
+    } finally {
+      j.db.close()
+    }
+    const reopened = new Journal(file)
+    try {
+      expect((reopened.since(0)[0]?.payload as { item: { aggregatedOutput: string } }).item.aggregatedOutput).toBe(
+        'ordinary textual command output: build step completed successfully\n'.repeat(16_384),
+      )
+    } finally {
+      reopened.db.close()
+    }
+  })
+
+  it('keeps SQLite bounded under many oversized payloads and deduplicates identical bytes', () => {
+    const file = path.join(tmp, 'bounded-large-text.db')
+    const j = new Journal(file)
+    const output = `stable tool result ${'x'.repeat(1024 * 1024)}`
+    try {
+      for (let index = 0; index < 24; index += 1) {
+        j.append('session', 'claude/user', { message: { role: 'user', content: output } })
+      }
+      j.db.pragma('wal_checkpoint(TRUNCATE)')
+      expect(fs.statSync(file).size).toBeLessThan(2 * 1024 * 1024)
+      const blobs = fs.readdirSync(path.join(tmp, 'journal-blobs', 'sha256'), { recursive: true })
+        .filter((entry) => /^[0-9a-f]{64}$/u.test(path.basename(String(entry))))
+      const digest = crypto.createHash('sha256').update(output, 'utf8').digest('hex')
+      expect(blobs.filter((entry) => path.basename(String(entry)) === digest)).toHaveLength(1)
+      expect((j.since(0, 1)[0]?.payload as { message: { content: string } }).message.content).toBe(output)
+    } finally {
+      j.db.close()
+    }
+  })
+
+  it('ordinary bounded enforcement converges an oversized legacy root and is a no-op once compliant', () => {
+    const file = path.join(tmp, 'legacy-large-text.db')
+    // Simulate a pre-upgrade journal. New Journal databases start in incremental-vacuum mode and should
+    // never need the one-time full rewrite.
+    const legacy = new Database(file)
+    legacy.exec(
+      'CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, session TEXT, kind TEXT NOT NULL, payload TEXT NOT NULL)',
+    )
+    legacy.close()
+    const j = new Journal(file)
+    const insert = j.db.prepare(
+      'INSERT INTO events (ts, session, kind, payload) VALUES (?, ?, ?, ?)',
+    )
+    try {
+      for (let index = 0; index < 12; index += 1) {
+        const output = `${index}:${String.fromCharCode(65 + index).repeat(256 * 1024)}`
+        insert.run(
+          new Date(2026, 0, 1, 0, 0, index).toISOString(),
+          'legacy',
+          'claude/user',
+          JSON.stringify({ message: { content: output } }),
+        )
+      }
+      j.db.pragma('wal_checkpoint(TRUNCATE)')
+      const before = fs.statSync(file).size
+      let complete = false
+      for (let attempts = 0; attempts < 20 && !complete; attempts += 1) {
+        complete = j.externalizeLegacyPayloads(3, 1024 * 1024).complete
+      }
+      expect(complete).toBe(true)
+      expect(j.since(0)).toHaveLength(12)
+      // Ordinary maintenance records compact lifecycle rows after the migration cursor reaches its
+      // target. Those small rows must not manufacture a false "projection incomplete" refusal.
+      j.append(null, 'journal/compaction-progress', { detail: 'payload projection current' })
+      const enforcement = j.enforceStorageCeiling(before - 1)
+      expect(enforcement).toMatchObject({ action: 'full-vacuum', withinTarget: true })
+      expect(j.enforceStorageCeiling(before - 1)).toMatchObject({
+        action: 'none',
+        withinTarget: true,
+      })
+      j.db.pragma('wal_checkpoint(TRUNCATE)')
+      expect(fs.statSync(file).size).toBeLessThan(before / 2)
+      expect(j.db.pragma('auto_vacuum', { simple: true })).toBe(2)
+      expect((j.since(0, 1)[0]?.payload as { message: { content: string } }).message.content.length)
+        .toBeGreaterThan(256 * 1024)
+    } finally {
+      j.db.close()
+    }
+  })
+
+  it('reclaims an incremental database in bounded ordinary cycles', () => {
+    const file = path.join(tmp, 'incremental-ceiling.db')
+    const j = new Journal(file)
+    try {
+      j.db.exec('CREATE TABLE storage_pressure (id INTEGER PRIMARY KEY, payload BLOB)')
+      const insert = j.db.prepare('INSERT INTO storage_pressure (payload) VALUES (?)')
+      const fill = j.db.transaction(() => {
+        for (let index = 0; index < 1_600; index += 1) insert.run(Buffer.alloc(8 * 1024, index % 251))
+      })
+      fill.immediate()
+      j.db.exec('DELETE FROM storage_pressure')
+      const beforePages = Number(j.db.pragma('page_count', { simple: true }))
+      const first = j.enforceStorageCeiling(1024 * 1024, 64)
+      const afterFirstPages = Number(j.db.pragma('page_count', { simple: true }))
+      expect(first).toMatchObject({ action: 'incremental-vacuum', withinTarget: false })
+      expect(beforePages - afterFirstPages).toBeGreaterThan(0)
+      expect(beforePages - afterFirstPages).toBeLessThanOrEqual(64)
+
+      let cycles = 1
+      let result = first
+      while (!result.withinTarget && cycles < 100) {
+        result = j.enforceStorageCeiling(1024 * 1024, 64)
+        cycles += 1
+      }
+      expect(result.withinTarget).toBe(true)
+      expect(cycles).toBeGreaterThan(1)
+      expect(cycles).toBeLessThan(100)
+      expect(j.enforceStorageCeiling(1024 * 1024, 64)).toMatchObject({ action: 'none' })
     } finally {
       j.db.close()
     }

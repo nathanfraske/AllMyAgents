@@ -6,6 +6,9 @@ import type Database from 'better-sqlite3'
 import type { RemoteDeviceActionResult } from './remoteDevices.js'
 
 export type DurableRunKind = 'build' | 'test' | 'lint' | 'benchmark' | 'deploy' | 'custom'
+/** SQLite keeps one non-null scope key for every run. Application-scoped Overseer runs use this reserved
+ * value rather than inventing a project association for ad-hoc diagnostics and host maintenance. */
+export const APPLICATION_RUN_SCOPE_ID = '__allmyagents_application__'
 export type DurableRunState =
   | 'queued'
   | 'running'

@@ -9,11 +9,17 @@ import path from 'node:path'
 import {
   isTransientSqliteContention,
   Journal,
+  JOURNAL_SQLITE_TARGET_BYTES,
   TransientHistoryIndexingError,
   type JournalCondenseResult,
 } from './journal.js'
 import { verifyRecentCompactionSnapshot } from './journalCompactionGate.js'
-import { verifyStrongRecoverySnapshotCoverage } from './journalRecovery.js'
+import {
+  JOURNAL_BACKUP_KEEP_DEFAULT,
+  JOURNAL_BACKUP_MAX_RETAINED_BYTES_DEFAULT,
+  pruneJournalBackupGenerations,
+} from './journalBackup.js'
+import { pruneRecoveryGenerations, verifyStrongRecoverySnapshotCoverage } from './journalRecovery.js'
 import { reserveReplicationPruneGate } from './journalReplication.js'
 import { SCHEMA_VERSION } from './restartHandshake.js'
 
@@ -40,6 +46,9 @@ const [
   diffLimitRaw,
   byteLimitRaw,
   workBudgetRaw,
+  sqliteTargetBytesRaw,
+  snapshotKeepRaw,
+  snapshotMaxBytesRaw,
 ] = process.argv.slice(2)
 
 const PROJECTION_BATCH_ROWS = 5_000
@@ -54,6 +63,23 @@ const WORK_BUDGET_MS =
     ? parsedWorkBudgetMs
     : 4 * 60 * 1000
 const processStart = Date.now()
+const parsedSqliteTargetBytes = Number(sqliteTargetBytesRaw)
+const SQLITE_TARGET_BYTES =
+  Number.isSafeInteger(parsedSqliteTargetBytes) &&
+  parsedSqliteTargetBytes >= 128 * 1024 * 1024
+    ? parsedSqliteTargetBytes
+    : JOURNAL_SQLITE_TARGET_BYTES
+const parsedSnapshotKeep = Number(snapshotKeepRaw)
+const SNAPSHOT_KEEP =
+  Number.isSafeInteger(parsedSnapshotKeep) && parsedSnapshotKeep >= 1 && parsedSnapshotKeep <= 16
+    ? parsedSnapshotKeep
+    : JOURNAL_BACKUP_KEEP_DEFAULT
+const parsedSnapshotMaxBytes = Number(snapshotMaxBytesRaw)
+const SNAPSHOT_MAX_BYTES =
+  Number.isSafeInteger(parsedSnapshotMaxBytes) &&
+  parsedSnapshotMaxBytes >= 128 * 1024 * 1024
+    ? parsedSnapshotMaxBytes
+    : JOURNAL_BACKUP_MAX_RETAINED_BYTES_DEFAULT
 
 function nextTurn(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve))
@@ -68,7 +94,8 @@ function boundedMessage(error: unknown): string {
 function reportProgress(
   phase: string,
   rowsCompleted: number,
-  bytesCompleted: number
+  bytesCompleted: number,
+  suspendWatchdog = false,
 ): void {
   if (!process.send || !operationId) return
   try {
@@ -78,6 +105,7 @@ function reportProgress(
       phase,
       rowsCompleted: Math.max(0, Math.trunc(rowsCompleted)),
       bytesCompleted: Math.max(0, Math.trunc(bytesCompleted)),
+      suspendWatchdog,
     })
   } catch {
     // The durable lifecycle remains authoritative if the observation channel disappears.
@@ -101,6 +129,67 @@ async function main(): Promise<{ message: MaintenanceMessage; exitCode: number }
     journal.recordCompactionLifecycle(operationId, 'started', {
       detail: 'Bounded journal maintenance started.',
     })
+    // Retention is idempotent and metadata-only. Do it before generating any new evidence so an upgrade
+    // immediately stops the legacy N x multi-GB footprint from climbing, even if payload migration needs
+    // several later windows. Both policies retain the newest independently published generation.
+    pruneJournalBackupGenerations(backupDirectory, SNAPSHOT_KEEP, SNAPSHOT_MAX_BYTES)
+    pruneRecoveryGenerations(path.dirname(file), SNAPSHOT_KEEP, SNAPSHOT_MAX_BYTES)
+
+    let blobRowsRewritten = 0
+    let blobSqliteBytesReleased = 0
+    let blobMigrationComplete = false
+    while (Date.now() - processStart < WORK_BUDGET_MS) {
+      const migration = journal.externalizeLegacyPayloads()
+      blobRowsRewritten += migration.rowsRewritten
+      blobSqliteBytesReleased += migration.sqliteBytesReleased
+      reportProgress('externalizing-payloads', migration.scannedThrough, blobSqliteBytesReleased)
+      if (migration.rowsRewritten > 0 || migration.complete) {
+        journal.recordCompactionLifecycle(operationId, 'progress', {
+          rowsDeleted: 0,
+          payloadBytesDeleted: blobSqliteBytesReleased,
+          detail: migration.complete
+            ? `Lossless payload externalization is current (${blobRowsRewritten} row(s) rewritten).`
+            : `Losslessly externalized ${blobRowsRewritten} oversized row(s); migration will resume.`,
+        })
+      }
+      if (migration.complete) {
+        blobMigrationComplete = true
+        break
+      }
+      await nextTurn()
+    }
+    if (!blobMigrationComplete) {
+      const reason =
+        `lossless payload externalization paused at its size-aware work budget ` +
+        `(${blobRowsRewritten} row(s), ${blobSqliteBytesReleased} SQLite payload bytes released)`
+      journal.recordCompactionLifecycle(operationId, 'unobservable', {
+        payloadBytesDeleted: blobSqliteBytesReleased,
+        detail: reason,
+      })
+      return {
+        message: { type: 'journal-condense-deferred', operationId, reason },
+        exitCode: 0,
+      }
+    }
+
+    reportProgress('enforcing-storage-ceiling', blobRowsRewritten, blobSqliteBytesReleased)
+    journal.recordCompactionLifecycle(operationId, 'progress', {
+      payloadBytesDeleted: blobSqliteBytesReleased,
+      detail:
+        `Lossless payload projection is current; enforcing the ordinary ` +
+        `${SQLITE_TARGET_BYTES}-byte resident SQLite ceiling.`,
+    })
+    const storage = journal.enforceStorageCeiling(SQLITE_TARGET_BYTES)
+    reportProgress('storage-ceiling-enforced', blobRowsRewritten, blobSqliteBytesReleased)
+    if (storage.action !== 'none' || !storage.withinTarget) {
+      journal.recordCompactionLifecycle(operationId, 'progress', {
+        payloadBytesDeleted: blobSqliteBytesReleased,
+        detail:
+          `Resident SQLite enforcement ${storage.action} (${storage.bytesBefore} -> ` +
+          `${storage.bytesAfter} bytes; target ${storage.targetBytes}; ` +
+          `${storage.withinTarget ? 'within target' : 'more bounded cycles or retention work required'}).`,
+      })
+    }
 
     let lastProjectionProgress = 0
     while (Date.now() - processStart < WORK_BUDGET_MS) {
@@ -291,10 +380,15 @@ async function main(): Promise<{ message: MaintenanceMessage; exitCode: number }
       await nextTurn()
     }
     if (!aggregate) throw new Error('journal maintenance produced no bounded result')
+    const reclaimed = journal.reclaimFreelistPages()
     const detail =
       Date.now() - processStart >= WORK_BUDGET_MS
         ? 'Bounded cleanup paused at its time budget and will continue in a later operation.'
-        : 'Bounded journal cleanup completed.'
+        : `Bounded journal cleanup completed${
+            reclaimed.supported
+              ? `; incremental vacuum reclaimed ${Math.max(0, reclaimed.before - reclaimed.after)} page(s).`
+              : '; a one-time full VACUUM is still required to enable incremental reclaim on this legacy journal.'
+          }`
     journal.recordCompactionLifecycle(operationId, 'completed', {
       rowsDeleted,
       payloadBytesDeleted,

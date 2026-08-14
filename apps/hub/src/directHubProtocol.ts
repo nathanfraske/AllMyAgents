@@ -14,8 +14,28 @@ export interface DirectHubEnvelope {
   signature: string
 }
 
+/**
+ * Canonical JSON for signing.
+ *
+ * MyOwnMesh relays an envelope by deserializing and re-serializing it, and its map emits keys in
+ * sorted order — so an HMAC taken over insertion-ordered JSON cannot survive the round trip. Only an
+ * empty payload was order-free, which is why `device_capabilities` authenticated while every
+ * populated operation was rejected; hubs that still hold an AllMyStuff Site route masked that by
+ * silently falling back to it. Normalizing through JSON first reproduces exactly what crosses the
+ * wire (toJSON, dropped undefined, array holes), and emitting keys in sorted order then makes signer
+ * and verifier hash identical bytes however the relay chose to order them.
+ */
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null'
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  return `{${Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+    .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
+    .join(',')}}`
+}
+
 function unsigned(envelope: Omit<DirectHubEnvelope, 'signature'>): string {
-  return JSON.stringify({
+  return canonicalJson(JSON.parse(JSON.stringify({
     version: envelope.version,
     messageId: envelope.messageId,
     sourceSiteId: envelope.sourceSiteId,
@@ -23,7 +43,7 @@ function unsigned(envelope: Omit<DirectHubEnvelope, 'signature'>): string {
     sentAt: envelope.sentAt,
     operation: envelope.operation,
     payload: envelope.payload,
-  })
+  })))
 }
 
 export function signDirectHubEnvelope(

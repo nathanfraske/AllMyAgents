@@ -2,10 +2,12 @@ import { fork, type ChildProcess } from 'node:child_process'
 import path from 'node:path'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
-import type {
-  JournalBackupOptions,
-  JournalSnapshotTask,
-  SnapshotResult,
+import {
+  cleanupJournalBackupPartials,
+  journalBackupCopyWallMs,
+  type JournalBackupOptions,
+  type JournalSnapshotTask,
+  type SnapshotResult,
 } from './journalBackup.js'
 import type { JournalProgressUpdate } from './journalProgress.js'
 
@@ -15,6 +17,10 @@ type SerializableBackupOptions = Pick<
   | 'keep'
   | 'maxRetainedBytes'
   | 'minimumFreeBytes'
+  | 'minimumSnapshotAgeMs'
+  | 'maxCopyWallMs'
+  | 'maxCopyWorkRatio'
+  | 'maxCopyRestarts'
   | 'recoveryDataDir'
   | 'recoveryKeep'
   | 'recoveryMaxRetainedBytes'
@@ -34,6 +40,16 @@ function serializableOptions(options: JournalBackupOptions): SerializableBackupO
       : {}),
     ...(options.minimumFreeBytes !== undefined
       ? { minimumFreeBytes: options.minimumFreeBytes }
+      : {}),
+    ...(options.minimumSnapshotAgeMs !== undefined
+      ? { minimumSnapshotAgeMs: options.minimumSnapshotAgeMs }
+      : {}),
+    ...(options.maxCopyWallMs !== undefined ? { maxCopyWallMs: options.maxCopyWallMs } : {}),
+    ...(options.maxCopyWorkRatio !== undefined
+      ? { maxCopyWorkRatio: options.maxCopyWorkRatio }
+      : {}),
+    ...(options.maxCopyRestarts !== undefined
+      ? { maxCopyRestarts: options.maxCopyRestarts }
       : {}),
     ...(options.recoveryDataDir !== undefined
       ? { recoveryDataDir: options.recoveryDataDir }
@@ -86,9 +102,16 @@ export function createJournalSnapshotChildTask(journalPath: string): JournalSnap
       )
       children.add(child)
       let settled = false
+      let copyDeadline: NodeJS.Timeout | undefined
+      let forcedCopyFailure: string | undefined
+      const clearCopyDeadline = (): void => {
+        if (copyDeadline) clearTimeout(copyDeadline)
+        copyDeadline = undefined
+      }
       const finish = (result: SnapshotResult): void => {
         if (settled) return
         settled = true
+        clearCopyDeadline()
         resolve(result)
       }
       child.on('message', (raw: unknown) => {
@@ -96,6 +119,20 @@ export function createJournalSnapshotChildTask(journalPath: string): JournalSnap
         if (message?.type === 'journal-backup-log') {
           options.log?.(message.message)
         } else if (message?.type === 'journal-backup-progress') {
+          if (message.progress.active && message.progress.phase === 'copying') {
+            copyDeadline ??= setTimeout(() => {
+              forcedCopyFailure =
+                `journal snapshot copy exceeded its ${journalBackupCopyWallMs(options.maxCopyWallMs)}ms ` +
+                `out-of-process wall-clock budget and was terminated`
+              try {
+                child.kill('SIGKILL')
+              } catch {
+                /* exit handling below owns the terminal result */
+              }
+            }, journalBackupCopyWallMs(options.maxCopyWallMs) + 1_000)
+          } else {
+            clearCopyDeadline()
+          }
           options.onProgress?.(message.progress)
         } else if (message?.type === 'journal-backup-result') {
           // A send callback in the worker does not mean this handler has run yet. Acknowledge the
@@ -114,12 +151,19 @@ export function createJournalSnapshotChildTask(journalPath: string): JournalSnap
       child.once('error', (error) => {
         if (settled) return
         settled = true
+        clearCopyDeadline()
         reject(error)
       })
       child.once('exit', (code, signal) => {
         children.delete(child)
         if (settled) return
+        if (forcedCopyFailure) {
+          cleanupJournalBackupPartials(options.dir, options.log)
+          finish({ ok: false, error: forcedCopyFailure })
+          return
+        }
         settled = true
+        clearCopyDeadline()
         reject(
           new Error(
             `journal backup worker exited without a result (${

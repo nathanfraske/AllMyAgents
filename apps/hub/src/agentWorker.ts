@@ -141,13 +141,14 @@ export interface WorkerAgentServiceDeps {
  */
 export function buildWorkerAgentServices(deps: WorkerAgentServiceDeps): AgentServices {
   return {
-    send: (from, to, subject, body, wake) =>
+    send: (from, to, subject, body, wake, attentionRequired) =>
       deps.relayRpc('bus.send', {
         fromSessionId: from.sessionId,
         to,
         subject,
         body,
         ...(wake === undefined ? {} : { wake }),
+        ...(attentionRequired === undefined ? {} : { attentionRequired }),
       }) as Promise<{
         ok: boolean
         delivered: number

@@ -2080,6 +2080,21 @@ function rotateRecoveryGenerations(
   }
 }
 
+/**
+ * Post-ready, idempotent retention for upgrade cleanup. This examines only signed manifest metadata;
+ * it deliberately does not hash or integrity-check each multi-gigabyte snapshot merely to remove an
+ * older superseded generation. The newest published generation is always retained.
+ */
+export function pruneRecoveryGenerations(
+  dataDir: string,
+  keep = 2,
+  maxRetainedBytes = 4 * 1024 * 1024 * 1024,
+): void {
+  const paths = recoveryPaths(dataDir)
+  if (!fs.existsSync(paths.generations)) return
+  rotateRecoveryGenerations(dataDir, keep, 0, maxRetainedBytes)
+}
+
 export class JournalRecoveryLease {
   private readonly paths: RecoveryPaths
   private db: Database.Database | undefined

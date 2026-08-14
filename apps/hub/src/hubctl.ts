@@ -33,6 +33,7 @@ import {
   type HubMsg,
   type ProfileGenerationAuthority,
 } from './restartHandshake.js'
+import { journalPreflightIdentity } from './preflight.js'
 import { defaultWorkerSocket } from './workerTransport.js'
 import { JournalBackupOwnershipProtocol } from './journalBackupOwnership.js'
 import {
@@ -71,6 +72,9 @@ const profilePublicEpochs = new ProfilePublicEpochSequence()
 const dataDir = process.env.HUB_DATA_DIR
   ? path.resolve(process.env.HUB_DATA_DIR)
   : path.resolve(import.meta.dirname, '..', '..', '..', 'data')
+const journalPath = path.join(dataDir, 'hub.db')
+// Process-local only. A desktop/supervisor restart deliberately forgets the receipt and verifies again.
+let preflightCacheIdentity: string | undefined
 const workerEnabled = !!process.env.HUB_WORKER_SOCKET || process.env.HUB_WORKER === '1'
 const workerSocket: string | undefined = workerEnabled ? defaultWorkerSocket(dataDir) : undefined
 // Process-lifetime channel credential shared only with blue, green, and the worker. Each child captures
@@ -245,6 +249,7 @@ function spawnHub(
       HUB_PORT: String(port),
       HUB_SUPERVISED: '1',
       HUB_PREFLIGHT_ATTEMPT_ID: preflightAttemptId,
+      ...(preflightCacheIdentity ? { HUB_PREFLIGHT_CACHE_ID: preflightCacheIdentity } : {}),
       ...(workerSocket && workerSecret
         ? { HUB_WORKER_SOCKET: workerSocket, HUB_WORKER_SECRET: workerSecret }
         : {}),
@@ -262,6 +267,17 @@ function spawnHub(
   }
   overseerStatus('booting', `Booting ${color} hub`, { hubPid: child.pid, port })
   children.add(child)
+  child.on('message', (raw: unknown) => {
+    const message = raw as Partial<HubMsg>
+    if (
+      message.type !== 'preflight-cacheable' ||
+      message.attemptId !== preflightAttemptId ||
+      typeof message.identity !== 'string' ||
+      !/^[0-9a-f]{64}$/u.test(message.identity)
+    ) return
+    const current = journalPreflightIdentity(dataDir, journalPath)
+    if (current === message.identity) preflightCacheIdentity = current
+  })
   child.on('error', (err) => log(`hub(${color}) failed to spawn: ${String(err)}`))
   child.on('exit', (code, signal) => {
     children.delete(child)

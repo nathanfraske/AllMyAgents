@@ -45,7 +45,7 @@ describe('AgentMcpServer (the real stdio MCP server codex loads for the Codex pa
     // send_message's schema advertises the expected args (body required; routing/wake controls optional).
     const send = tools.find((t) => t.name === 'send_message')!
     const props = send.inputSchema.properties as Record<string, unknown>
-    expect(Object.keys(props).sort()).toEqual(['body', 'subject', 'to_session', 'wake'])
+    expect(Object.keys(props).sort()).toEqual(['attention_required', 'body', 'subject', 'to_session', 'wake'])
     expect(send.inputSchema.required).toEqual(['body'])
   })
 

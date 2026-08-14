@@ -189,6 +189,7 @@ export interface InProcessExecutorHubHooks {
     subject: string | undefined,
     body: string,
     wake?: boolean,
+    attentionRequired?: boolean,
   ): { ok: boolean; delivered: number; deferred?: number; error?: string }
   busInbox(sessionId: string): BusMessage[]
   busRoster(sessionId: string): Array<{
@@ -335,7 +336,8 @@ export class InProcessExecutor implements Executor {
   //      services; isBusTurn is executor-local. -----------------------------------------------------
   private agentServices(): AgentServices {
     return {
-      send: (from, to, subject, body, wake) => this.h.busSend(from.sessionId, to, subject, body, wake),
+      send: (from, to, subject, body, wake, attentionRequired) =>
+        this.h.busSend(from.sessionId, to, subject, body, wake, attentionRequired),
       inbox: (sessionId) => this.h.busInbox(sessionId),
       roster: (sessionId) => this.h.busRoster(sessionId),
       peek: (caller, target, options) => this.h.busPeek(caller, target, options),

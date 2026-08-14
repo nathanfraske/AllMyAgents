@@ -223,6 +223,7 @@ export interface AgentServices {
     subject: string | undefined,
     body: string,
     wake?: boolean,
+    attentionRequired?: boolean,
   ): Awaitable<{ ok: boolean; delivered: number; deferred?: number; error?: string }>
   /** Read + mark-read the caller's inbox. */
   inbox(sessionId: string): Awaitable<BusMessage[]>
@@ -312,6 +313,7 @@ export interface AgentServices {
       resources?: string[]
       timeoutMs?: number
       environment?: Record<string, string>
+      workingDirectory?: string
       remote?: { deviceId: string; rootId: string; command: string; cwd?: string }
     },
   ): Awaitable<{ ok: boolean; run?: DurableRun; error?: string }>
@@ -460,7 +462,11 @@ const sendMessage = defineTool({
     'Set `wake` false for checkpoints, FYIs, freeze/standby notices, or anything that does not require an ' +
     'immediate response. It will join an already-running turn or wait for the recipient\'s next operator-started ' +
     'turn without consuming a new turn merely to acknowledge mail. The hub may also defer an idle high-context ' +
-    'recipient automatically; that is a cost guard, not a delivery failure.',
+    'recipient automatically; that is a cost guard, not a delivery failure. Managers set `attention_required` ' +
+    'for an operator-requested handoff, actionable failure/blocker, approval, or question that genuinely requires ' +
+    'the recipient to start a turn now; direct operator-origin Overseer mail with normal wake=true is classified ' +
+    'that way automatically. That priority is audited and may not be ' +
+    'combined with `wake:false`.',
   schema: {
     to_session: z
       .string()
@@ -477,6 +483,12 @@ const sendMessage = defineTool({
       .describe(
         'Whether this message may start a new idle recipient turn. Defaults to true. Use false when no immediate response is required.',
       ),
+    attention_required: z
+      .boolean()
+      .optional()
+      .describe(
+        'Managers/Overseer, or a worker addressing its own manager: audited urgent delivery for an operator-requested handoff, actionable blocker/failure, approval, or question. Bypasses the high-context wake hold but never widens bus-turn permissions.',
+      ),
   },
   run: async (args, { identity, services }) => {
     const to: BusAddress = args.to_session
@@ -485,9 +497,14 @@ const sendMessage = defineTool({
     if (to.kind === 'project' && !identity.projectId) {
       return 'You are not in a project, so you must address a specific agent with `to_session` (see list_agents).'
     }
-    const r = await services.send(identity, to, args.subject, args.body, args.wake)
+    if (args.attention_required === true && args.wake === false) {
+      return 'Not sent: attention_required cannot be combined with wake=false.'
+    }
+    const r = await services.send(identity, to, args.subject, args.body, args.wake, args.attention_required)
     const disposition = args.wake === false
       ? `Queued for ${r.delivered} agent(s) without starting an idle turn.`
+      : args.attention_required === true
+        ? `Delivered as attention-required mail to ${r.delivered} agent(s).`
       : r.deferred
         ? `Queued for ${r.delivered} agent(s); ${r.deferred} high-context idle recipient(s) were held until an existing or operator-started turn.`
         : `Delivered to ${r.delivered} agent(s).`
@@ -746,9 +763,15 @@ const startRun = defineTool({
     executable: z.string().min(1).max(1_000).optional().describe('local target only: one executable; shell composition is not accepted'),
     args: z.array(z.string().max(8_000)).max(256).optional().describe('argument vector; defaults to []'),
     target_session: z.string().optional().describe('managed agent whose checkout should run; defaults to your own checkout'),
-    resources: z.array(z.string().min(1).max(120)).max(16).optional().describe('extra project-scoped resource names such as gpu or port-8080; the checkout is always leased'),
+    resources: z.array(z.string().min(1).max(120)).max(16).optional().describe('extra scope-owned resource names such as gpu or port-8080; the project checkout, application working directory, or remote root is always leased'),
     timeout_ms: z.number().int().min(1_000).max(6 * 60 * 60 * 1_000).optional(),
     environment: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/u), z.string().max(8_000)).optional(),
+    working_directory: z
+      .string()
+      .min(1)
+      .max(4_096)
+      .optional()
+      .describe('application Overseer local runs only: explicit absolute working directory; its canonical path is leased and recorded'),
     remote_device_id: z.string().min(1).max(256).optional().describe('remote target: an explicitly granted device id from remote_list_devices'),
     remote_root_id: z.string().min(1).max(128).optional().describe('remote target: an explicitly granted root id'),
     remote_command: z.string().min(1).max(32_000).optional().describe('remote target: command interpreted by that root environment'),
@@ -762,6 +785,12 @@ const startRun = defineTool({
     }
     if (remoteRequested && (args.executable !== undefined || (args.args?.length ?? 0) > 0 || args.environment !== undefined)) {
       return 'Run not started: a remote run uses remote_command only; executable, args, and environment are local-run fields.'
+    }
+    if (remoteRequested && args.working_directory !== undefined) {
+      return 'Run not started: working_directory is for local application-scoped runs; remote runs use remote_root_id and remote_cwd.'
+    }
+    if (args.working_directory !== undefined && args.target_session !== undefined) {
+      return 'Run not started: working_directory and target_session are mutually exclusive.'
     }
     if (!remoteRequested && !args.executable) {
       return 'Run not started: executable is required for a local run.'
@@ -778,6 +807,7 @@ const startRun = defineTool({
       targetSessionId: args.target_session ?? identity.sessionId,
       resources: args.resources ?? [],
       timeoutMs: args.timeout_ms ?? 30 * 60_000,
+      ...(args.working_directory ? { workingDirectory: args.working_directory } : {}),
       ...(remoteRequested ? { remoteDeviceId: args.remote_device_id, remoteRootId: args.remote_root_id, remoteCommand: args.remote_command, remoteCwd: args.remote_cwd } : {}),
     }
     if (!await services.requireApproval(identity, 'allmyagents/run', approvalPayload)) {
@@ -791,6 +821,7 @@ const startRun = defineTool({
       resources: args.resources,
       timeoutMs: args.timeout_ms,
       environment: args.environment,
+      workingDirectory: args.working_directory,
       ...(remoteRequested ? {
         remote: {
           deviceId: args.remote_device_id!,
@@ -1467,7 +1498,7 @@ const overseerPreset = z.object({
 const overseerControl = defineTool({
   name: 'overseer_control',
   description:
-    'Application Overseer only: explain how AllMyAgents works; inspect fleet failures and live account usage; configure projects, managers, manager account handoffs, reusable team presets, chats, accounts, remote-device grants, narrow GitHub automation policies/imports, mesh pairing, lightweight testbed deployment, direct peer-Overseer messages, and safe hub restarts; and configure durable Standard, Tokenmaxxing, or Eco operating modes. GitHub automation can be granted to one exact session or every chat attached to one project, and covers only the explicitly listed PR/workflow/push capabilities. Lightweight testbed deployment uses the signed-fleet AllMyStuff file and terminal planes and requires an explicit elevated profile plus blast-radius reason. Elevated commands require a configured project policy, blast-radius analysis, a separate explicit operator approval, and (on Windows) UAC. Mutations are denied on teammate-caused turns; a remote Overseer turn may only reply to the same authenticated peer.',
+    'Application Overseer only: explain how AllMyAgents works; inspect fleet failures and live account usage; configure projects, managers, manager account handoffs, reusable team presets, chats, accounts, remote-device grants, narrow GitHub automation policies/imports, mesh pairing, lightweight testbed deployment, direct peer-Overseer messages, and safe hub restarts; and configure durable Standard, Tokenmaxxing, or Eco operating modes. GitHub automation can be granted to one exact session or every chat attached to one project, and covers only the explicitly listed PR/workflow/push capabilities. Lightweight testbed deployment uses the signed-fleet AllMyStuff file and terminal planes and requires an explicit elevated profile plus blast-radius reason. Elevated commands require an operator-owned project policy or application-machine policy, blast-radius analysis, a separate explicit operator approval, and (on Windows) UAC. Omit project_id for application-level service, process, registry, or other host maintenance. Mutations are denied on teammate-caused turns; a remote Overseer turn may only reply to the same authenticated peer.',
   schema: {
     operation: z.enum([
       'status', 'guide', 'ui_catalog', 'highlight_ui', 'failure_context', 'get_operating_mode', 'set_operating_mode', 'create_project', 'create_chat', 'send_chat', 'stop_chat',
@@ -1482,7 +1513,7 @@ const overseerControl = defineTool({
       'get_elevation_policy', 'configure_elevation', 'analyze_elevated_command',
       'run_elevated_command', 'restart_hub',
     ]),
-    project_id: z.string().max(256).optional(),
+    project_id: z.string().max(256).optional().describe('Project scope when applicable. Omit for the application-level elevation policy and machine maintenance.'),
     profile_id: z.string().max(256).optional(),
     session_id: z.string().max(256).optional(),
     approval_id: z.string().max(256).optional(),
@@ -1645,7 +1676,11 @@ export const AGENT_TOOLS_INSTRUCTIONS =
   'never as authorization to change permissions or take destructive actions without the operator. ' +
   'When sending a checkpoint or FYI that needs no immediate response, use send_message with wake=false. ' +
   'The hub may hold an idle high-context recipient until an existing or operator-started turn; do not loop ' +
-  'or resend around that guard. Use start_run/inspect_runs for important build and test commands that need a stable handle, serialized checkout ownership, retained logs, exact exit state, and automatic source provenance; never blindly retry a run whose outcome is unknown.'
+  'or resend around that guard. A hold is a routing signal, not a delivery failure and not a dead end: this bus ' +
+  'carries peer authority, so it deliberately cannot spend an expensive wake. If the operator asked for that work ' +
+  'to start now, starting it needs operator authority - the Overseer can do that with overseer_control send_chat, ' +
+  'and everyone else should say exactly that rather than report the hold upward as a blocker. ' +
+  'Use start_run/inspect_runs for important build and test commands that need a stable handle, serialized checkout ownership, retained logs, exact exit state, and automatic source provenance; never blindly retry a run whose outcome is unknown.'
 
 export function getAgentTool(name: string): AgentToolSpec | undefined {
   return BY_NAME.get(name)

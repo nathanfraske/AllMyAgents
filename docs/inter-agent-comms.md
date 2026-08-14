@@ -140,6 +140,14 @@ and `ApprovalService.request` for approvals.
 
 ### 3.2 The delivery path (queue vs interrupt — D7's "queues until turn end, or interrupts, per policy")
 
+**Current implementation note.** `send_message wake:false` durably holds routine checkpoints/FYIs until an
+existing or operator-started turn. Idle recipients at the configured context threshold are also held to avoid
+an expensive new turn. Managers and the application Overseer can mark one direct operator-requested handoff,
+actionable blocker/failure, approval, or question as `attention_required:true`; a worker can do so only to its
+own manager. A direct message from an operator-origin Overseer turn with normal `wake:true` receives the same
+classification automatically. That audited urgency bypasses only the context hold. It cannot be broadcast, cannot be combined
+with `wake:false`, and the injected turn still follows the permission clamp in section 3.3.
+
 Delivery timing is a per-message **delivery policy**, defaulted by kind and overridable by the sender's scope:
 
 | Session state at delivery | Default policy | Behavior |

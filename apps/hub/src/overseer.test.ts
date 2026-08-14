@@ -6,6 +6,7 @@ import { ApprovalService } from './approvals.js'
 import { AgentBus } from './bus.js'
 import type { Executor } from './executor.js'
 import type { ElevatedCommandResult } from './elevatedCommand.js'
+import { APPLICATION_RUN_SCOPE_ID, DurableRunController, DurableRunStore } from './durableRuns.js'
 import { InstructionStore } from './instructions.js'
 import { Journal } from './journal.js'
 import { MemoryStore } from './memory.js'
@@ -93,7 +94,7 @@ function harness() {
 }
 
 describe('application Overseer authority', () => {
-  it('upgrades an existing durable Overseer in place exactly once', () => {
+  it('upgrades an existing durable Overseer in place exactly once after readiness', async () => {
     const h = harness()
     h.store.upsert({
       id: 'legacy-overseer',
@@ -114,16 +115,21 @@ describe('application Overseer authority', () => {
     expect(h.journal.recentEventsForSession('legacy-overseer', 20)).toEqual([])
 
     h.sessions.reconcileStale()
+    expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
+      overseerCapabilityVersion: 6,
+      permissionMode: 'safe',
+    })
+    await h.sessions.upgradeDurableSessionCapabilitiesPostReady()
 
     expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
       isOverseer: true,
-      overseerCapabilityVersion: 14,
+      overseerCapabilityVersion: 17,
       permissionMode: 'full',
       permissionModeOperatorOverride: true,
       role: 'Application Overseer',
     })
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
-      'Overseer capability manifest version 14',
+      'Overseer capability manifest version 17',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'mcp__allmyagents__overseer_control',
@@ -149,12 +155,15 @@ describe('application Overseer authority', () => {
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'Do not use the vendor-native list_agents or peek_agent',
     )
+    expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
+      'Shipping code remains the owning agent\'s responsibility',
+    )
     const upgrades = () => h.journal.recentEventsForSession('legacy-overseer', 20)
       .filter((event) => event.kind === 'overseer/capabilities-upgraded')
     expect(upgrades()).toHaveLength(1)
     expect(upgrades()[0]?.payload).toMatchObject({
       fromVersion: 6,
-      toVersion: 14,
+      toVersion: 17,
       conversationPreserved: true,
       tools: expect.arrayContaining([
         'overseer_control',
@@ -167,6 +176,7 @@ describe('application Overseer authority', () => {
     })
 
     h.sessions.reconcileStale()
+    await h.sessions.upgradeDurableSessionCapabilitiesPostReady()
     expect(upgrades()).toHaveLength(1)
   })
 
@@ -971,5 +981,137 @@ describe('application Overseer authority', () => {
     expect(h.journal.recentEventsForSession('overseer', 40).map((event) => event.kind)).toContain(
       'overseer/elevated-command-completed',
     )
+  })
+
+  it('runs and inspects application-scoped durable work from an explicit absolute directory', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'ordinary', isProjectManager: true, permissionMode: 'full' })
+    const controller = new DurableRunController(
+      new DurableRunStore(h.journal.db),
+      h.journal,
+      path.join(h.root, 'application-run-logs'),
+    )
+    h.sessions.setDurableRunController(controller)
+    controller.activate()
+    cleanups.push(() => controller.shutdown())
+
+    await expect(h.sessions.managerStartRun('ordinary', {
+      kind: 'test',
+      executable: process.execPath,
+      args: ['-e', 'process.exit(0)'],
+      workingDirectory: h.root,
+    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/application Overseer/i) })
+    await expect(h.sessions.managerStartRun('overseer', {
+      kind: 'test',
+      executable: process.execPath,
+      args: ['-e', 'process.exit(0)'],
+      workingDirectory: 'relative-directory',
+    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/absolute working_directory/i) })
+
+    const started = await h.sessions.managerStartRun('overseer', {
+      kind: 'test',
+      executable: process.execPath,
+      args: ['-e', 'console.log("application durable run")'],
+      workingDirectory: h.root,
+      resources: ['compiler'],
+    })
+    expect(started).toMatchObject({
+      ok: true,
+      run: {
+        projectId: APPLICATION_RUN_SCOPE_ID,
+        targetSessionId: 'overseer',
+        resources: expect.arrayContaining([expect.stringMatching(/^application:/u)]),
+      },
+    })
+    await vi.waitFor(() => expect(controller.store.get(started.run!.id)?.state).toBe('succeeded'))
+    expect(h.sessions.managerInspectRuns('overseer', {})).toMatchObject({
+      ok: true,
+      runs: [expect.objectContaining({ id: started.run!.id, projectId: APPLICATION_RUN_SCOPE_ID })],
+    })
+    expect(h.sessions.managerInspectRuns('overseer', { runId: started.run!.id })).toMatchObject({
+      ok: true,
+      logs: { stdout: expect.stringContaining('application durable run') },
+    })
+  })
+
+  it('wakes a high-context cross-project recipient for an audited Overseer handoff without widening the bus turn', () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'target', projectId: 'project-b', permissionMode: 'full', status: 'idle' })
+    h.journal.append('target', 'session/tokens', { scope: 'request', contextUsed: 750_000 })
+    h.markOperator('overseer')
+
+    expect(h.sessions.busSend(
+      'overseer',
+      { kind: 'session', id: 'target' },
+      'operator-requested handoff',
+      'The operator asked that this work continue now.',
+    )).toEqual({ ok: true, delivered: 1 })
+
+    expect(h.executor.runTurn).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: 'target', permissionMode: 'edits' }),
+      expect.stringContaining('The operator asked that this work continue now.'),
+      'bus',
+    )
+    expect(h.journal.recentEventsForSession('target', 20)).toContainEqual(expect.objectContaining({
+      kind: 'session/turn-origin',
+      payload: { origin: 'bus' },
+    }))
+    expect(h.journal.recentEventsForSession('target', 20)).not.toContainEqual(expect.objectContaining({
+      kind: 'bus/context-wake-held',
+    }))
+    expect(h.journal.recentEventsForSession('overseer', 20)).toContainEqual(expect.objectContaining({
+      kind: 'bus/sent',
+      payload: expect.objectContaining({
+        attentionRequired: true,
+        attentionSource: 'operator-overseer',
+      }),
+    }))
+  })
+
+  it('keeps application machine elevation separate from every project policy', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.markOperator('overseer')
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'get_elevation_policy',
+    })).resolves.toMatchObject({
+      ok: true,
+      data: { subject: 'application', scope: 'disabled', allowedRoots: [] },
+    })
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'configure_elevation', elevationScope: 'machine',
+    })).resolves.toMatchObject({
+      ok: true,
+      data: { subject: 'application', scope: 'machine', allowedRoots: [] },
+    })
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'analyze_elevated_command', command: 'Stop-Service AllMyStuff', path: h.root,
+    })).resolves.toMatchObject({
+      ok: true,
+      data: { mayProceed: true, filesystemScope: 'no-filesystem-path-detected' },
+    })
+
+    const executed: ElevatedCommandResult = {
+      ok: true, exitCode: 0, stdout: 'stopped', stderr: '', timedOut: false, truncated: false,
+      durationMs: 5, elevation: 'windows-uac',
+    }
+    const runner = { execute: vi.fn(async () => executed) }
+    h.sessions.setOverseerRuntime({ elevatedRunner: runner })
+    const pending = h.sessions.overseerControl('overseer', {
+      operation: 'run_elevated_command', command: 'Stop-Service AllMyStuff',
+      reason: 'Operator-authorized host service maintenance.', path: h.root, shell: 'powershell',
+    })
+    await vi.waitFor(() => expect(h.approvals.pending()).toHaveLength(1))
+    const approval = h.approvals.pending()[0]!
+    expect(approval.payload).toMatchObject({
+      scopeTarget: 'application',
+      projectId: null,
+      projectName: null,
+    })
+    h.approvals.resolve(approval.id, true)
+    await expect(pending).resolves.toMatchObject({ ok: true, data: { result: { stdout: 'stopped' } } })
+    expect(runner.execute).toHaveBeenCalledWith(expect.objectContaining({ cwd: h.root }))
   })
 })

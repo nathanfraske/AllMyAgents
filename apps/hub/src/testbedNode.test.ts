@@ -55,6 +55,26 @@ describe('lightweight testbed node configuration', () => {
     expect(policy.roots[0]?.id).toMatch(/^root_[0-9a-f]{20}$/u)
   })
 
+  it('keeps automatic fleet trust off unless the operator explicitly enables it', () => {
+    const dataDir = temporaryRoot()
+    const approved = path.join(dataDir, 'approved')
+    fs.mkdirSync(approved)
+    const safe = configureTestbedNode({
+      dataDir,
+      profile: 'scoped',
+      roots: [{ label: 'Build sandbox', path: approved, read: true, write: false, terminal: false }],
+    })
+    expect(safe.fleetTrustExchange).toBeUndefined()
+    const optedIn = configureTestbedNode({
+      dataDir,
+      profile: 'scoped',
+      fleetTrustExchange: true,
+      roots: [{ label: 'Build sandbox', path: approved, read: true, write: false, terminal: false }],
+    })
+    expect(readTestbedNodeConfig(dataDir).fleetTrustExchange).toBe(true)
+    expect(optedIn.fleetTrustExchange).toBe(true)
+  })
+
   it('describes a whole Linux host and does not pretend WSL is a Linux-host environment', () => {
     expect(machineRoots('linux', [{
       id: 'wsl:Ubuntu',

@@ -3,6 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
+  defaultMyOwnMeshSocketPath,
   mergeFleetPeers,
   MyOwnMeshRpcBridge,
   selectFleetNetwork,
@@ -19,6 +20,32 @@ const allMyStuffPeer = (device_id: string, status = 'active') => ({
 })
 
 describe('site-free MyOwnMesh RPC network selection', () => {
+  it('uses MYOWNMESH_HOME as the directory containing daemon.sock exactly once', () => {
+    expect(defaultMyOwnMeshSocketPath(
+      { MYOWNMESH_HOME: '/var/lib/myownmesh' },
+      'linux',
+      '/home/operator',
+    )).toBe(path.join('/var/lib/myownmesh', 'daemon.sock'))
+    expect(defaultMyOwnMeshSocketPath({}, 'linux', '/home/operator')).toBe(
+      path.join('/home/operator', '.myownmesh', 'daemon.sock'),
+    )
+  })
+
+  it('discovers lightweight testbeds without pretending they are AllMyStuff sites', () => {
+    const testbed = {
+      device_id: 'k3',
+      status: 'active',
+      capabilities: { tags: ['allmyagents-testbed', 'terminal'] },
+    }
+    const candidates: MyOwnMeshNetworkCandidate[] = [
+      { config_id: 'testbeds', phase: 'active', peers: [testbed] },
+    ]
+    expect(selectFleetNetwork(candidates)?.config_id).toBe('testbeds')
+    expect(mergeFleetPeers(candidates)).toContainEqual(expect.objectContaining({
+      siteId: 'k3',
+      online: true,
+    }))
+  })
   it('selects the active AllMyStuff fleet instead of claim and support networks', () => {
     const candidates: MyOwnMeshNetworkCandidate[] = [
       { config_id: 'claim', label: 'Local claiming (this LAN)', phase: 'active', peers: [allMyStuffPeer('claim-peer')] },
@@ -120,6 +147,14 @@ describe('site-free MyOwnMesh RPC network selection', () => {
     await emptyBridge.start()
     expect(emptyBridge.status()).toMatchObject({ available: false, reason: 'no-networks' })
     emptyBridge.stop()
+  })
+
+  it('lets hubs retry in the background but makes a connection mandatory for a testbed process', async () => {
+    const missing = Object.assign(new Error('socket not found'), { code: 'ENOENT' })
+    const bridge = new MyOwnMeshRpcBridge((async () => { throw missing }) as MyOwnMeshControlRequest)
+    bridge.setHandler(async () => ({ ok: true }))
+    await expect(bridge.start(undefined, { requireConnection: true })).rejects.toThrow(/not found|MyOwnMesh/u)
+    expect(bridge.status()).toMatchObject({ available: false, reason: 'not-started' })
   })
 
   it('registers its inbound Hub method on every eligible shared mesh', async () => {

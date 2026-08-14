@@ -7,6 +7,11 @@ import {
   reserveReplicationPruneGate,
   type ReplicationPruneGate,
 } from './journalReplication.js'
+import {
+  JOURNAL_BLOB_INLINE_LIMIT_BYTES,
+  JOURNAL_BLOB_KEY,
+  JournalBlobStore,
+} from './journalBlobStore.js'
 import { sanitizeJournalPayload } from './journalPayload.js'
 import { redactedJson } from './redact.js'
 import type { ApprovalStatus, HubEvent } from './types.js'
@@ -79,6 +84,10 @@ export const JOURNAL_CONDENSE_MAX_DIFF_SNAPSHOTS = 5_000
 export const JOURNAL_CONDENSE_MAX_ITEM_STARTED = 5_000
 export const JOURNAL_CONDENSE_MAX_DELETE_ROWS = 3_500
 export const JOURNAL_CONDENSE_MAX_TRANSIENT_BYTES = 8 * 1024 * 1024
+/** Resident SQLite target. Exact oversized transcript bytes live in the lossless content-addressed store. */
+export const JOURNAL_SQLITE_TARGET_BYTES = 2 * 1024 * 1024 * 1024
+/** At 4 KiB pages this reclaims at most 64 MiB per ordinary maintenance cycle. */
+export const JOURNAL_STORAGE_MAX_INCREMENTAL_VACUUM_PAGES = 16_384
 export const JOURNAL_REPLAY_PROTOCOL_VERSION = 1 as const
 export const JOURNAL_HISTORY_PAGE_MAX_ROWS = 80
 export const JOURNAL_HISTORY_PAGE_MAX_BYTES = 512 * 1024
@@ -177,6 +186,27 @@ export interface SessionHistoryPage {
   checkpointGeneration: number
 }
 
+export interface JournalBlobMigrationResult {
+  rowsScanned: number
+  rowsRewritten: number
+  sourceBytesScanned: number
+  sqliteBytesReleased: number
+  bytesExternalized: number
+  scannedThrough: number
+  target: number
+  complete: boolean
+}
+
+export interface JournalStorageEnforcementResult {
+  targetBytes: number
+  bytesBefore: number
+  bytesAfter: number
+  freelistPagesBefore: number
+  freelistPagesAfter: number
+  action: 'none' | 'incremental-vacuum' | 'full-vacuum'
+  withinTarget: boolean
+}
+
 export interface BoundedReplayPage {
   checkpoint: ReplayCheckpoint
   events: HubEvent[]
@@ -249,6 +279,7 @@ export function isTransientSqliteContention(error: unknown): boolean {
 
 export class Journal extends EventEmitter {
   readonly db: Database.Database
+  private readonly payloadBlobs: JournalBlobStore | undefined
   private readonly atomicEventBuffers: HubEvent[][] = []
   private transientMaintenanceIndexesReady = false
   private readonly insertStmt: Database.Statement
@@ -268,7 +299,17 @@ export class Journal extends EventEmitter {
       throw new Error('journal busy timeout must be a whole number from 0 to 60000 milliseconds')
     }
     fs.mkdirSync(path.dirname(file), { recursive: true })
+    this.payloadBlobs = file === ':memory:'
+      ? undefined
+      : new JournalBlobStore(path.join(path.dirname(path.resolve(file)), 'journal-blobs'))
     this.db = new Database(file)
+    const freshDatabase = Number(
+      this.db.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'").pluck().get(),
+    ) === 0
+    // New journals can reclaim bounded maintenance deletes incrementally. Existing journals retain their
+    // mode until the one-time operator VACUUM that physically removes legacy inline payload pages; that
+    // VACUUM may then opt them into the same steady-state policy without a second full rewrite.
+    if (freshDatabase) this.db.pragma('auto_vacuum = INCREMENTAL')
     this.db.pragma('journal_mode = WAL')
     // Two hub processes briefly share this DB during a blue-green restart (docs/agent-detachment-impl.md
     // §4.3). WAL allows many readers + one writer, but with NO busy_timeout a concurrent writer throws
@@ -449,6 +490,16 @@ export class Journal extends EventEmitter {
       CREATE TABLE IF NOT EXISTS journal_migrations (
         name TEXT PRIMARY KEY
       );
+      CREATE TABLE IF NOT EXISTS journal_blob_migration_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        scanned_through INTEGER NOT NULL CHECK (scanned_through >= 0),
+        bytes_externalized INTEGER NOT NULL DEFAULT 0 CHECK (bytes_externalized >= 0),
+        rows_rewritten INTEGER NOT NULL DEFAULT 0 CHECK (rows_rewritten >= 0),
+        updated_at TEXT NOT NULL
+      );
+      INSERT OR IGNORE INTO journal_blob_migration_state
+        (singleton, scanned_through, bytes_externalized, rows_rewritten, updated_at)
+      VALUES (1, 0, 0, 0, '1970-01-01T00:00:00.000Z');
       CREATE TABLE IF NOT EXISTS journal_compaction_runs (
         operation_id TEXT PRIMARY KEY,
         phase TEXT NOT NULL CHECK (
@@ -563,11 +614,23 @@ export class Journal extends EventEmitter {
               AND (
                 (
                   json_extract(NEW.payload, '$.item.type') = 'commandExecution'
-                  AND typeof(json_extract(NEW.payload, '$.item.aggregatedOutput')) = 'text'
+                  AND (
+                    typeof(json_extract(NEW.payload, '$.item.aggregatedOutput')) = 'text'
+                    OR json_type(
+                      NEW.payload,
+                      '$.item.aggregatedOutput.${JOURNAL_BLOB_KEY}.sha256'
+                    ) = 'text'
+                  )
                 )
                 OR (
                   json_extract(NEW.payload, '$.item.type') = 'agentMessage'
-                  AND typeof(json_extract(NEW.payload, '$.item.text')) = 'text'
+                  AND (
+                    typeof(json_extract(NEW.payload, '$.item.text')) = 'text'
+                    OR json_type(
+                      NEW.payload,
+                      '$.item.text.${JOURNAL_BLOB_KEY}.sha256'
+                    ) = 'text'
+                  )
                 )
               )
             THEN 1
@@ -700,14 +763,15 @@ export class Journal extends EventEmitter {
 
   append(sessionId: string | null, kind: string, payload: unknown): HubEvent {
     const ts = new Date().toISOString()
-    const clean = redactedJson(sanitizeJournalPayload(payload))
-    const info = this.insertStmt.run(ts, sessionId, kind, clean)
+    const clean = JSON.parse(redactedJson(sanitizeJournalPayload(payload))) as unknown
+    const stored = JSON.stringify(this.payloadBlobs?.encode(clean).stored ?? clean)
+    const info = this.insertStmt.run(ts, sessionId, kind, stored)
     const event: HubEvent = {
       seq: Number(info.lastInsertRowid),
       ts,
       sessionId,
       kind,
-      payload: JSON.parse(clean) as unknown,
+      payload: clean,
     }
     this.publish(event)
     return event
@@ -720,9 +784,10 @@ export class Journal extends EventEmitter {
    */
   appendWorker(sessionId: string, kind: string, payload: unknown, wseq: number): HubEvent {
     const ts = new Date().toISOString()
-    const clean = redactedJson(sanitizeJournalPayload(payload))
-    const info = this.insertWorkerStmt.run(ts, sessionId, kind, clean, wseq)
-    const event: HubEvent = { seq: Number(info.lastInsertRowid), ts, sessionId, kind, payload: JSON.parse(clean) as unknown }
+    const clean = JSON.parse(redactedJson(sanitizeJournalPayload(payload))) as unknown
+    const stored = JSON.stringify(this.payloadBlobs?.encode(clean).stored ?? clean)
+    const info = this.insertWorkerStmt.run(ts, sessionId, kind, stored, wseq)
+    const event: HubEvent = { seq: Number(info.lastInsertRowid), ts, sessionId, kind, payload: clean }
     this.publish(event)
     return event
   }
@@ -1099,11 +1164,23 @@ export class Journal extends EventEmitter {
             ts: row.ts,
             sessionId: row.session,
             kind: row.kind,
-            payload: parsePayload(row.payload, row.seq),
+            payload: parsePayload(row.payload, row.seq, this.payloadBlobs),
           }
           bytes = Buffer.byteLength(JSON.stringify(event))
           if (bytes > maxBytes) {
-            throw new Error('journal history payload changed while building its bounded page')
+            event = {
+              seq: row.seq,
+              ts: row.ts,
+              sessionId: row.session,
+              kind: 'journal/history-event-oversized',
+              payload: {
+                originalKind: row.kind,
+                originalPayloadBytes: bytes,
+                message:
+                  'This retained history event is larger than the bounded history page and was not transferred.',
+              },
+            }
+            bytes = Buffer.byteLength(JSON.stringify(event))
           }
         }
         if (encodedBytes + bytes > maxBytes) {
@@ -1233,11 +1310,23 @@ export class Journal extends EventEmitter {
                  AND (
                    (
                      json_extract(payload, '$.item.type') = 'commandExecution'
-                     AND typeof(json_extract(payload, '$.item.aggregatedOutput')) = 'text'
+                     AND (
+                       typeof(json_extract(payload, '$.item.aggregatedOutput')) = 'text'
+                       OR json_type(
+                         payload,
+                         '$.item.aggregatedOutput.${JOURNAL_BLOB_KEY}.sha256'
+                       ) = 'text'
+                     )
                    )
                    OR (
                      json_extract(payload, '$.item.type') = 'agentMessage'
-                     AND typeof(json_extract(payload, '$.item.text')) = 'text'
+                     AND (
+                       typeof(json_extract(payload, '$.item.text')) = 'text'
+                       OR json_type(
+                         payload,
+                         '$.item.text.${JOURNAL_BLOB_KEY}.sha256'
+                       ) = 'text'
+                     )
                    )
                  )
                THEN 1
@@ -1402,7 +1491,7 @@ export class Journal extends EventEmitter {
           ts: row.ts,
           sessionId: row.session,
           kind: row.kind,
-          payload: parsePayload(row.payload, row.seq),
+          payload: parsePayload(row.payload, row.seq, this.payloadBlobs),
         }
         const bytes = Buffer.byteLength(JSON.stringify(event))
         if (bytes > options.maxFrameBytes) {
@@ -1606,11 +1695,10 @@ export class Journal extends EventEmitter {
    * multi-second hub stall. Production invokes it in a one-shot child process as a second defense, keeping
    * JSON scans off the hub event loop and bounding the SQLite writer-lock/WAL burst.
    *
-   * This intentionally does NOT VACUUM. SQLite will reuse the pages freed by both stages, stopping retained
-   * history from growing the file after its window reaches steady state, but shrinking an existing DB is a
-   * separate operator maintenance action: full VACUUM takes an exclusive rewrite plus roughly one database
-   * of free disk, while changing an existing DB to auto_vacuum=INCREMENTAL itself requires that same one-time
-   * full VACUUM.
+   * This delete transaction intentionally does NOT VACUUM. The same ordinary post-ready maintenance sequence
+   * enforces the configured resident-SQLite ceiling: incremental databases release a bounded page
+   * batch, while an oversized legacy database is crash-atomically converted once its payload projection is
+   * current. Physical reclaim therefore never lengthens the delete writer-lock boundary or the boot path.
    */
   condenseCompletedCodex(options: JournalCondenseOptions = {}): JournalCondenseResult {
     this.ensureTransientMaintenanceIndexes()
@@ -2913,7 +3001,10 @@ export class Journal extends EventEmitter {
     return {
       sourceSeq: interrupted.seq,
       questionCount,
-      events: rows.map((row) => ({ ...row, payload: JSON.parse(row.payload) as unknown })),
+      events: rows.map((row) => ({
+        ...row,
+        payload: parsePayload(row.payload, row.seq, this.payloadBlobs),
+      })),
     }
   }
 
@@ -3009,7 +3100,7 @@ export class Journal extends EventEmitter {
       // threw and the app crash-looped on startup until the row was repaired by hand. The write side is
       // fixed now, but a durable store outlives the bug that wrote into it: a row we cannot read is a gap
       // to surface, not a reason to stop serving the other three hundred thousand.
-      payload: parsePayload(r.payload, r.seq),
+      payload: parsePayload(r.payload, r.seq, this.payloadBlobs),
     }))
   }
 
@@ -3063,6 +3154,234 @@ export class Journal extends EventEmitter {
     return row ?? undefined
   }
 
+  /**
+   * Losslessly externalize large strings from legacy event rows in bounded, crash-resumable batches.
+   *
+   * Blob publication happens before each compare-and-swap row rewrite. The durable cursor advances in
+   * the same SQLite transaction as the rewrite, so a kill either retries an already-published immutable
+   * blob or resumes after a fully committed pointer. No transcript bytes are truncated or summarized.
+   */
+  externalizeLegacyPayloads(
+    maxRows = 64,
+    maxSourceBytes = 16 * 1024 * 1024,
+  ): JournalBlobMigrationResult {
+    if (!Number.isSafeInteger(maxRows) || maxRows < 1 || maxRows > 1_000) {
+      throw new Error('journal blob migration row batch is outside the supported bound')
+    }
+    if (
+      !Number.isSafeInteger(maxSourceBytes) ||
+      maxSourceBytes < JOURNAL_BLOB_INLINE_LIMIT_BYTES ||
+      maxSourceBytes > 256 * 1024 * 1024
+    ) {
+      throw new Error('journal blob migration byte batch is outside the supported bound')
+    }
+    const state = this.db.prepare(
+      `SELECT scanned_through AS scannedThrough
+       FROM journal_blob_migration_state WHERE singleton = 1`,
+    ).get() as { scannedThrough: number }
+    const target = Number(
+      this.db.prepare('SELECT COALESCE(MAX(seq), 0) FROM events').pluck().get(),
+    )
+    if (!this.payloadBlobs || state.scannedThrough >= target) {
+      return {
+        rowsScanned: 0,
+        rowsRewritten: 0,
+        sourceBytesScanned: 0,
+        sqliteBytesReleased: 0,
+        bytesExternalized: 0,
+        scannedThrough: Math.max(state.scannedThrough, target),
+        target,
+        complete: true,
+      }
+    }
+    const candidates = this.db.prepare(
+      `SELECT seq, payload, length(CAST(payload AS BLOB)) AS payloadBytes
+       FROM events
+       WHERE seq > ? AND length(CAST(payload AS BLOB)) >= ?
+       ORDER BY seq
+       LIMIT ?`,
+    ).all(state.scannedThrough, JOURNAL_BLOB_INLINE_LIMIT_BYTES, maxRows) as Array<{
+      seq: number
+      payload: string
+      payloadBytes: number
+    }>
+    let rowsScanned = 0
+    let rowsRewritten = 0
+    let sourceBytesScanned = 0
+    let sqliteBytesReleased = 0
+    let bytesExternalized = 0
+    let scannedThrough = state.scannedThrough
+    for (const row of candidates) {
+      if (rowsScanned > 0 && sourceBytesScanned + row.payloadBytes > maxSourceBytes) break
+      const parsed = JSON.parse(row.payload) as unknown
+      const encoded = this.payloadBlobs.encode(parsed)
+      const stored = JSON.stringify(encoded.stored)
+      let rewritten = 0
+      if (stored !== row.payload && Buffer.byteLength(stored) < row.payloadBytes) {
+        rewritten = this.db.transaction(() => {
+          const changed = this.db.prepare(
+            'UPDATE events SET payload = ? WHERE seq = ? AND payload = ?',
+          ).run(stored, row.seq, row.payload).changes
+          if (changed > 0) {
+            this.db.prepare(
+              `UPDATE journal_transient_event_index
+               SET payload_bytes = length(CAST(? AS BLOB)),
+                   canonical_terminal = CASE
+                     WHEN kind = 'codex/item/completed' AND (
+                       json_type(?, '$.item.aggregatedOutput') = 'text'
+                       OR json_type(?, '$.item.aggregatedOutput.${JOURNAL_BLOB_KEY}.sha256') = 'text'
+                       OR json_type(?, '$.item.text') = 'text'
+                       OR json_type(?, '$.item.text.${JOURNAL_BLOB_KEY}.sha256') = 'text'
+                     ) THEN 1 ELSE canonical_terminal END
+               WHERE seq = ?`,
+            ).run(stored, stored, stored, stored, stored, row.seq)
+          }
+          this.db.prepare(
+            `UPDATE journal_blob_migration_state
+             SET scanned_through = MAX(scanned_through, ?),
+                 bytes_externalized = bytes_externalized + ?,
+                 rows_rewritten = rows_rewritten + ?,
+                 updated_at = ?
+             WHERE singleton = 1`,
+          ).run(row.seq, encoded.bytesExternalized, changed, new Date().toISOString())
+          return changed
+        }).immediate()
+      } else {
+        this.db.prepare(
+          `UPDATE journal_blob_migration_state
+           SET scanned_through = MAX(scanned_through, ?), updated_at = ?
+           WHERE singleton = 1`,
+        ).run(row.seq, new Date().toISOString())
+      }
+      rowsScanned += 1
+      rowsRewritten += rewritten
+      sourceBytesScanned += row.payloadBytes
+      bytesExternalized += rewritten > 0 ? encoded.bytesExternalized : 0
+      sqliteBytesReleased += rewritten > 0 ? row.payloadBytes - Buffer.byteLength(stored) : 0
+      scannedThrough = row.seq
+    }
+    const exhaustedCandidates = rowsScanned === candidates.length && candidates.length < maxRows
+    if (candidates.length === 0 || exhaustedCandidates) {
+      scannedThrough = target
+      this.db.prepare(
+        `UPDATE journal_blob_migration_state
+         SET scanned_through = MAX(scanned_through, ?), updated_at = ? WHERE singleton = 1`,
+      ).run(target, new Date().toISOString())
+    }
+    return {
+      rowsScanned,
+      rowsRewritten,
+      sourceBytesScanned,
+      sqliteBytesReleased,
+      bytesExternalized,
+      scannedThrough,
+      target,
+      complete: scannedThrough >= target,
+    }
+  }
+
+  reclaimFreelistPages(maxPages = 2_048): { supported: boolean; before: number; after: number } {
+    if (!Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > 16_384) {
+      throw new Error('journal incremental vacuum page batch is outside the supported bound')
+    }
+    const mode = Number(this.db.pragma('auto_vacuum', { simple: true }))
+    const before = Number(this.db.pragma('freelist_count', { simple: true }))
+    if (mode !== 2 || before <= 0) return { supported: mode === 2, before, after: before }
+    this.db.pragma(`incremental_vacuum(${Math.min(before, maxPages)})`)
+    const after = Number(this.db.pragma('freelist_count', { simple: true }))
+    return { supported: true, before, after }
+  }
+
+  /**
+   * Enforce the same explicit resident-SQLite ceiling on every maintenance cycle.
+   *
+   * There is deliberately no migration flag or operator-only cleanup command. A compliant root does
+   * nothing. An oversized legacy root first externalizes exact large strings through the ordinary bounded
+   * cursor, then this path performs SQLite's crash-atomic conversion to incremental auto-vacuum. Later
+   * cycles reclaim only a bounded page batch. If retained live state itself exceeds the target, the result
+   * says so honestly; this method never destroys the only copy of transcript data to manufacture success.
+   */
+  enforceStorageCeiling(
+    targetBytes = JOURNAL_SQLITE_TARGET_BYTES,
+    maxIncrementalPages = JOURNAL_STORAGE_MAX_INCREMENTAL_VACUUM_PAGES,
+  ): JournalStorageEnforcementResult {
+    if (!Number.isSafeInteger(targetBytes) || targetBytes < 1024 * 1024) {
+      throw new Error('journal SQLite target must be a safe integer of at least 1 MiB')
+    }
+    if (
+      !Number.isSafeInteger(maxIncrementalPages) ||
+      maxIncrementalPages < 1 ||
+      maxIncrementalPages > JOURNAL_STORAGE_MAX_INCREMENTAL_VACUUM_PAGES
+    ) {
+      throw new Error('journal storage reclaim page batch is outside the supported bound')
+    }
+    const cursor = Number(this.db.prepare(
+      'SELECT scanned_through FROM journal_blob_migration_state WHERE singleton = 1',
+    ).pluck().get())
+    const pendingOversizedSeq = this.db.prepare(
+      `SELECT seq
+       FROM events
+       WHERE seq > ? AND length(CAST(payload AS BLOB)) >= ?
+       ORDER BY seq
+       LIMIT 1`,
+    ).pluck().get(cursor, JOURNAL_BLOB_INLINE_LIMIT_BYTES)
+    if (
+      !Number.isSafeInteger(cursor) ||
+      (pendingOversizedSeq !== undefined &&
+        (!Number.isSafeInteger(pendingOversizedSeq) || Number(pendingOversizedSeq) <= cursor))
+    ) {
+      throw new Error('journal payload projection state is invalid')
+    }
+    if (pendingOversizedSeq !== undefined) {
+      throw new Error(
+        `journal storage enforcement found an oversized payload at ${String(pendingOversizedSeq)} ` +
+        `after projection cursor ${cursor}`,
+      )
+    }
+    const bytesBefore = this.databasePageBytes()
+    const freelistPagesBefore = Number(this.db.pragma('freelist_count', { simple: true }))
+    let action: JournalStorageEnforcementResult['action'] = 'none'
+    if (bytesBefore > targetBytes && freelistPagesBefore > 0) {
+      const mode = Number(this.db.pragma('auto_vacuum', { simple: true }))
+      if (mode === 2) {
+        this.db.pragma(
+          `incremental_vacuum(${Math.min(freelistPagesBefore, maxIncrementalPages)})`,
+        )
+        action = 'incremental-vacuum'
+      } else {
+        // This is not a one-off upgrade branch: it is the regular response whenever an oversized root
+        // predates incremental auto-vacuum. VACUUM is crash-atomic, runs post-ready in the maintenance
+        // child, and remains under that child's size-aware no-progress deadline.
+        this.db.pragma('auto_vacuum = INCREMENTAL')
+        this.db.exec('VACUUM')
+        action = 'full-vacuum'
+      }
+      const findings = (this.db.pragma('quick_check') as Array<Record<string, unknown>>)
+        .flatMap((row) => Object.values(row).map(String))
+      if (findings.length !== 1 || findings[0]?.toLowerCase() !== 'ok') {
+        throw new Error(`journal storage enforcement quick_check failed: ${findings.slice(0, 3).join('; ')}`)
+      }
+    }
+    const bytesAfter = this.databasePageBytes()
+    const freelistPagesAfter = Number(this.db.pragma('freelist_count', { simple: true }))
+    return {
+      targetBytes,
+      bytesBefore,
+      bytesAfter,
+      freelistPagesBefore,
+      freelistPagesAfter,
+      action,
+      withinTarget: bytesAfter <= targetBytes,
+    }
+  }
+
+  private databasePageBytes(): number {
+    const pageCount = Number(this.db.pragma('page_count', { simple: true }))
+    const pageSize = Number(this.db.pragma('page_size', { simple: true }))
+    if (!Number.isSafeInteger(pageCount) || !Number.isSafeInteger(pageSize)) return 0
+    return pageCount * pageSize
+  }
+
   /** Latest exact event of one kind for a session, using the bounded per-session side index. */
   latestEventForSessionKind(sessionId: string, kind: string): HubEvent | undefined {
     const row = this.db
@@ -3087,7 +3406,7 @@ export class Journal extends EventEmitter {
           ts: row.ts,
           sessionId: row.session,
           kind: row.kind,
-          payload: parsePayload(row.payload, row.seq),
+          payload: parsePayload(row.payload, row.seq, this.payloadBlobs),
         }
       : undefined
   }
@@ -3115,7 +3434,7 @@ export class Journal extends EventEmitter {
       ts: row.ts,
       sessionId: row.session,
       kind: row.kind,
-      payload: parsePayload(row.payload, row.seq),
+      payload: parsePayload(row.payload, row.seq, this.payloadBlobs),
     }))
   }
 
@@ -3148,7 +3467,7 @@ export class Journal extends EventEmitter {
     const row = select(true) ?? select(false)
     if (!row) return undefined
     try {
-      return { ts: row.ts, payload: JSON.parse(row.payload) as unknown }
+      return { ts: row.ts, payload: parsePayload(row.payload, 0, this.payloadBlobs) }
     } catch {
       return undefined
     }
@@ -3182,7 +3501,7 @@ export class Journal extends EventEmitter {
       ts: row.ts,
       sessionId: row.session,
       kind: row.kind,
-      payload: parsePayload(row.payload, row.seq),
+      payload: parsePayload(row.payload, row.seq, this.payloadBlobs),
     }))
     return {
       events,
@@ -3232,9 +3551,10 @@ export class Journal extends EventEmitter {
  * the operator sees that something was unreadable instead of the hub silently skipping it or dying.
  * Sequence values need not be contiguous after intentional journal condensation; cursors are `seq > ?`.
  */
-function parsePayload(raw: string, seq: number): unknown {
+function parsePayload(raw: string, seq: number, blobs?: JournalBlobStore): unknown {
   try {
-    return JSON.parse(raw) as unknown
+    const parsed = JSON.parse(raw) as unknown
+    return blobs?.decode(parsed) ?? parsed
   } catch (err) {
     return { __unreadable: true, seq, reason: err instanceof Error ? err.message : String(err) }
   }
