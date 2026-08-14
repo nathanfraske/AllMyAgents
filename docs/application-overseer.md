@@ -30,7 +30,8 @@ The Overseer control tool can:
 - query bounded current messages, task boards, approvals, and durable runs across selected local agents without
   consuming mail or scanning the full journal;
 - schedule resource-leased local or granted-remote builds/tests with stable ids, provenance, cursor-paged logs,
-  exact terminal state, and parallel placement across independent checkouts, device roots, GPUs, or fixtures;
+  exact terminal state, and parallel placement across independent checkouts, explicit application working
+  directories, device roots, GPUs, or fixtures;
 - create host or WSL projects, import GitHub repositories, and create projectless or project-bound chats;
 - run an interactive project-team setup, save the result as a durable preset, and materialize that preset
   as a real project manager plus visible direct-child chats with live ceilings;
@@ -94,11 +95,20 @@ so it cannot approve, reconfigure, restart, or elevate anything unless the opera
 ## Elevated-shell escape hatch
 
 Full access removes ordinary per-tool prompts within the hub policy; it does not create administrator/root
-rights. Elevation has a separate, deny-by-default project policy:
+rights. Elevation has two separate deny-by-default policy subjects: one policy per project, and one application
+machine policy owned by the operator. The application policy exists for services, processes, the registry, and
+other host maintenance that would be falsely attributed if it were attached to an arbitrary project.
+
+Project policies support:
 
 - `disabled`: no elevated command may be proposed;
 - `project`: the working directory and detected literal paths must remain within operator-configured roots;
 - `machine`: machine-wide effects may be proposed, but still require per-command approval.
+
+The application policy supports only `disabled` and `machine`; it has no implicit repository root. The Overseer
+omits `project_id` to inspect, configure, analyze, or run against that policy. Analysis explicitly distinguishes
+project-root paths, machine-wide filesystem effects, and commands such as service control that contain no
+detected filesystem path. This classification is descriptive, never an operating-system sandbox.
 
 The Overseer first produces a blast-radius report covering destructive filesystem operations, services and
 persistence, networking/availability, identities/permissions, network transfer, nested shells, dynamic
@@ -106,13 +116,25 @@ paths, and obvious scope escapes. This analysis is deliberately honest: an arbit
 not an OS sandbox, so literal-path checks cannot prove containment against a command that constructs paths
 dynamically.
 
-Execution requires all of the following: a direct operator Overseer turn, an enabled project policy, a
+Execution requires all of the following: a direct operator Overseer turn, an enabled policy for the exact
+project or application subject, a
 successful preflight, a dedicated `overseer/elevated-command` approval that Full access cannot auto-approve,
 and the host elevation mechanism. The Windows implementation launches a one-shot UAC PowerShell child,
 bounds runtime and returned output, terminates the child process tree on timeout, removes its temporary
 request files, and journals proposal/decision/start/completion or failure without journaling output. Linux
 and macOS currently have no interactive root broker in this build and fail closed; no password or resident
 root helper is stored by AllMyAgents.
+
+## Actionable teammate mail
+
+Routine checkpoints and FYIs use `send_message` with `wake:false` and wait for an existing or operator-started
+turn. An operator-requested handoff, actionable blocker/failure, approval, or question can be marked
+`attention_required:true` by a manager or the application Overseer; a worker may use it only to reach its own
+manager. A normal `wake:true` direct message from an operator-origin Overseer turn is classified this way
+automatically, so the operator's delegated handoff cannot be silently downgraded by the context-cost guard.
+This audited intent bypasses the high-context wake hold for one direct recipient, but changes no trust
+property: the resulting turn is still bus-originated, permission-clamped, and unable to exercise direct-operator
+Overseer mutations. Broadcast urgency and `attention_required:true` combined with `wake:false` are rejected.
 
 ## Database-offline boundary
 

@@ -30,6 +30,19 @@ describe('project elevation policy and blast-radius analysis', () => {
       allowedRoots: [path.resolve(project), path.resolve(cache)],
     })
     expect(store.get('p1', project)).toMatchObject({ scope: 'project' })
+
+    expect(store.getApplication()).toMatchObject({
+      projectId: '__allmyagents_application__',
+      subject: 'application',
+      scope: 'disabled',
+      allowedRoots: [],
+    })
+    expect(store.setApplication('machine')).toMatchObject({
+      subject: 'application',
+      scope: 'machine',
+      allowedRoots: [],
+    })
+    expect(store.getApplication()).toMatchObject({ subject: 'application', scope: 'machine' })
   })
 
   it('blocks an obvious project-scope escape and explains machine-wide risk', () => {
@@ -40,6 +53,7 @@ describe('project elevation policy and blast-radius analysis', () => {
     cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }))
     const base = {
       projectId: 'p1',
+      subject: 'project' as const,
       scope: 'project' as const,
       allowedRoots: [project],
       updatedAt: new Date().toISOString(),
@@ -58,6 +72,19 @@ describe('project elevation policy and blast-radius analysis', () => {
     )
     expect(machine.mayProceed).toBe(true)
     expect(machine.risk).toBe('critical')
+    expect(machine.filesystemScope).toBe('machine-wide')
     expect(machine.findings).toContainEqual(expect.objectContaining({ code: 'destructive-filesystem' }))
+
+    const service = analyzeElevatedCommand(
+      'Stop-Service AllMyStuff',
+      { ...base, subject: 'application', scope: 'machine', allowedRoots: [] },
+      project,
+    )
+    expect(service).toMatchObject({
+      mayProceed: true,
+      filesystemScope: 'no-filesystem-path-detected',
+      outsideAllowedRoots: [],
+    })
+    expect(service.findings).not.toContainEqual(expect.objectContaining({ code: 'cwd-outside-scope' }))
   })
 })

@@ -9,8 +9,11 @@ export type ElevationScope = 'disabled' | 'project' | 'machine'
 export type ElevatedShell = 'powershell' | 'bash'
 export type ElevatedRisk = 'moderate' | 'high' | 'critical'
 
+export const APPLICATION_ELEVATION_POLICY_ID = '__allmyagents_application__'
+
 export interface ProjectElevationPolicy {
   projectId: string
+  subject: 'project' | 'application'
   scope: ElevationScope
   allowedRoots: string[]
   updatedAt: string
@@ -37,6 +40,7 @@ export interface ElevatedCommandAnalysis {
   allowedRoots: string[]
   literalPaths: string[]
   outsideAllowedRoots: string[]
+  filesystemScope: 'project-roots' | 'machine-wide' | 'no-filesystem-path-detected'
   findings: ElevatedCommandFinding[]
   blastRadius: string[]
   scopeEnforcement: string
@@ -76,9 +80,9 @@ function within(root: string, candidate: string): boolean {
   return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`))
 }
 
-function boundedRoots(projectPath: string, roots: readonly string[]): string[] {
+function boundedRoots(requiredRoot: string | undefined, roots: readonly string[]): string[] {
   const result: string[] = []
-  for (const raw of [projectPath, ...roots]) {
+  for (const raw of [...(requiredRoot ? [requiredRoot] : []), ...roots]) {
     if (typeof raw !== 'string' || !raw.trim() || raw.length > 4_096 || !path.isAbsolute(raw)) {
       throw new Error('elevation allowed roots must be absolute bounded paths')
     }
@@ -113,7 +117,13 @@ export class ProjectElevationPolicyStore {
   get(projectId: string, projectPath: string): ProjectElevationPolicy {
     const row = this.getStmt.get(projectId) as ElevationPolicyRow | undefined
     if (!row) {
-      return { projectId, scope: 'disabled', allowedRoots: [path.resolve(projectPath)], updatedAt: '' }
+      return {
+        projectId,
+        subject: 'project',
+        scope: 'disabled',
+        allowedRoots: [path.resolve(projectPath)],
+        updatedAt: '',
+      }
     }
     let parsed: unknown
     try {
@@ -124,6 +134,7 @@ export class ProjectElevationPolicyStore {
     const roots = Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : []
     return {
       projectId,
+      subject: 'project',
       scope: row.scope === 'project' || row.scope === 'machine' ? row.scope : 'disabled',
       allowedRoots: boundedRoots(projectPath, roots),
       updatedAt: row.updatedAt,
@@ -133,7 +144,56 @@ export class ProjectElevationPolicyStore {
   set(projectId: string, projectPath: string, scope: ElevationScope, extraRoots: readonly string[] = []): ProjectElevationPolicy {
     if (scope !== 'disabled' && scope !== 'project' && scope !== 'machine') throw new Error('invalid elevation scope')
     const allowedRoots = boundedRoots(projectPath, scope === 'project' ? extraRoots : [])
-    const policy = { projectId, scope, allowedRoots, updatedAt: new Date().toISOString() }
+    const policy = { projectId, subject: 'project' as const, scope, allowedRoots, updatedAt: new Date().toISOString() }
+    this.upsertStmt.run({ ...policy, allowedRoots: JSON.stringify(allowedRoots) })
+    return policy
+  }
+
+  /** Application-scoped machine policy used only by the hub-minted Overseer. It deliberately has no
+   * implicit project root: service, process, and registry operations must not be falsely attributed to a
+   * repository merely to satisfy the persistence shape. */
+  getApplication(): ProjectElevationPolicy {
+    const row = this.getStmt.get(APPLICATION_ELEVATION_POLICY_ID) as ElevationPolicyRow | undefined
+    if (!row) {
+      return {
+        projectId: APPLICATION_ELEVATION_POLICY_ID,
+        subject: 'application',
+        scope: 'disabled',
+        allowedRoots: [],
+        updatedAt: '',
+      }
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(row.allowedRoots)
+    } catch {
+      parsed = []
+    }
+    const roots = Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : []
+    return {
+      projectId: APPLICATION_ELEVATION_POLICY_ID,
+      subject: 'application',
+      scope: row.scope === 'machine' ? 'machine' : 'disabled',
+      allowedRoots: boundedRoots(undefined, roots),
+      updatedAt: row.updatedAt,
+    }
+  }
+
+  setApplication(scope: Extract<ElevationScope, 'disabled' | 'machine'>, roots: readonly string[] = []): ProjectElevationPolicy {
+    if (scope !== 'disabled' && scope !== 'machine') {
+      throw new Error('application elevation scope must be disabled or machine')
+    }
+    if (roots.length) {
+      throw new Error('application machine elevation does not accept allowed paths; use a project policy for root-bounded work')
+    }
+    const allowedRoots: string[] = []
+    const policy = {
+      projectId: APPLICATION_ELEVATION_POLICY_ID,
+      subject: 'application' as const,
+      scope,
+      allowedRoots,
+      updatedAt: new Date().toISOString(),
+    }
     this.upsertStmt.run({ ...policy, allowedRoots: JSON.stringify(allowedRoots) })
     return policy
   }
@@ -164,14 +224,14 @@ export function analyzeElevatedCommand(
     throw new Error('elevated command must be 1 to 8,000 printable characters')
   }
   const literalPaths = extractLiteralPaths(normalized)
-  const outsideAllowedRoots = literalPaths.filter(
-    (candidate) => !policy.allowedRoots.some((root) => within(root, candidate)),
-  )
+  const outsideAllowedRoots = policy.scope === 'project'
+    ? literalPaths.filter((candidate) => !policy.allowedRoots.some((root) => within(root, candidate)))
+    : []
   const findings: ElevatedCommandFinding[] = []
   const add = (code: string, severity: 'warning' | 'danger', detail: string): void => {
     if (!findings.some((item) => item.code === code)) findings.push({ code, severity, detail })
   }
-  if (!policy.allowedRoots.some((root) => within(root, cwd))) {
+  if (policy.scope === 'project' && !policy.allowedRoots.some((root) => within(root, cwd))) {
     add('cwd-outside-scope', 'danger', 'The requested working directory is outside every configured project root.')
   }
   if (outsideAllowedRoots.length) {
@@ -201,6 +261,11 @@ export function analyzeElevatedCommand(
 
   const dangerCount = findings.filter((item) => item.severity === 'danger').length
   const risk: ElevatedRisk = dangerCount > 0 ? 'critical' : findings.length > 0 ? 'high' : 'moderate'
+  const filesystemScope = policy.scope === 'project'
+    ? 'project-roots'
+    : literalPaths.length > 0 || findings.some((item) => item.code === 'destructive-filesystem' || item.code === 'dynamic-path')
+      ? 'machine-wide'
+      : 'no-filesystem-path-detected'
   const blastRadius = [
     policy.scope === 'machine'
       ? 'The configured policy permits machine-wide effects after operator approval.'
@@ -219,10 +284,14 @@ export function analyzeElevatedCommand(
     allowedRoots: [...policy.allowedRoots],
     literalPaths,
     outsideAllowedRoots,
+    filesystemScope,
     findings,
     blastRadius,
-    scopeEnforcement:
-      'Policy checks the working directory and literal paths before execution, but an arbitrary elevated shell is not an OS sandbox. The operator must treat the command itself as the final authority boundary.',
+    scopeEnforcement: policy.scope === 'project'
+      ? 'Policy checks the working directory and literal paths before execution, but an arbitrary elevated shell is not an OS sandbox. The operator must treat the command itself as the final authority boundary.'
+      : policy.scope === 'machine'
+        ? 'Machine scope does not pretend that a repository root contains service, process, registry, or other host-wide effects. The explicit operator approval and command text are the authority boundary.'
+        : 'Elevation is disabled until the operator configures an explicit project or application-machine policy.',
     mayProceed: policy.scope !== 'disabled' && (policy.scope === 'machine' || !scopeViolation),
   }
 }

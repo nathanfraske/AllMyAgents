@@ -16,7 +16,7 @@ interface Harness {
   services: AgentServices
   memory: MemoryStore
   practices: PracticeStore
-  sent: { to: BusAddress; subject?: string; body: string; wake?: boolean }[]
+  sent: { to: BusAddress; subject?: string; body: string; wake?: boolean; attentionRequired?: boolean }[]
   journaled: { kind: string; payload: unknown }[]
   approvals: { kind: string; payload: unknown }[]
   browserCalls: { sessionId: string; operation: string; args: Record<string, unknown> }[]
@@ -41,8 +41,8 @@ function makeHarness(opts: {
   const approvals: Harness['approvals'] = []
   const browserCalls: Harness['browserCalls'] = []
   const services: AgentServices = {
-    send: (_from, to, subject, body, wake) => {
-      sent.push({ to, subject, body, wake })
+    send: (_from, to, subject, body, wake, attentionRequired) => {
+      sent.push({ to, subject, body, wake, attentionRequired })
       return opts.sendResult ?? { ok: true, delivered: 1 }
     },
     inbox: () => (opts.inbox ?? []) as never,
@@ -460,6 +460,28 @@ describe('send_message (bus addressing)', () => {
     )
     expect(out).toBe('Queued for 1 agent(s) without starting an idle turn.')
     expect(h.sent[0]?.wake).toBe(false)
+  })
+
+  it('marks an actionable direct handoff as audited attention-required mail', async () => {
+    const h = makeHarness({ sendResult: { ok: true, delivered: 1 } })
+    const out = await runAgentTool(
+      'send_message',
+      { to_session: 'peer99', body: 'Operator-requested handoff.', attention_required: true },
+      { identity: idA, services: h.services },
+    )
+    expect(out).toBe('Delivered as attention-required mail to 1 agent(s).')
+    expect(h.sent[0]?.attentionRequired).toBe(true)
+  })
+
+  it('rejects the contradictory attention-required plus wake=false combination before sending', async () => {
+    const h = makeHarness()
+    const out = await runAgentTool(
+      'send_message',
+      { to_session: 'peer99', body: 'Contradictory delivery.', wake: false, attention_required: true },
+      { identity: idA, services: h.services },
+    )
+    expect(out).toMatch(/cannot be combined/u)
+    expect(h.sent).toHaveLength(0)
   })
 
   it('reports automatic high-context deferral as queued rather than failed', async () => {

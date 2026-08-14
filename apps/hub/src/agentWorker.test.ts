@@ -71,6 +71,30 @@ describe('buildWorkerAgentServices — proxy shapes (the exact relay args the hu
     expect(r).toEqual({ ok: true, delivered: 2 })
   })
 
+  it('preserves wake and audited attention intent across the worker relay', async () => {
+    const h = withRecorder()
+    h.setRpcReturn({ ok: true, delivered: 1 })
+    await h.services.send(
+      IDENTITY,
+      { kind: 'session', id: 'manager' },
+      'blocked',
+      'The manager needs to resolve this.',
+      true,
+      true,
+    )
+    expect(h.rpcCalls).toEqual([{
+      method: 'bus.send',
+      args: {
+        fromSessionId: 's1',
+        to: { kind: 'session', id: 'manager' },
+        subject: 'blocked',
+        body: 'The manager needs to resolve this.',
+        wake: true,
+        attentionRequired: true,
+      },
+    }])
+  })
+
   it('inbox/roster → rpc(bus.inbox|bus.roster, {sessionId})', async () => {
     const h = withRecorder()
     h.setRpcReturn([])

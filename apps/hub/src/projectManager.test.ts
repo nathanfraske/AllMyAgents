@@ -451,6 +451,66 @@ describe('high-context teammate wake guard', () => {
     }))
   })
 
+  it('lets a manager send one audited attention-required handoff through the high-context hold', () => {
+    const { sessions, journal, bus, seed, runTurn } = buildHub()
+    const manager = seed({ id: 'manager', projectId: 'project-1', isProjectManager: true })
+    const child = seed({ id: 'child', projectId: 'project-1', parentSessionId: manager.id })
+    journal.append(child.id, 'session/tokens', { scope: 'request', contextUsed: 750_000 })
+
+    expect(sessions.busSend(
+      manager.id,
+      { kind: 'session', id: child.id },
+      'operator-requested handoff',
+      'This concrete handoff needs a turn now.',
+      true,
+      true,
+    )).toEqual({ ok: true, delivered: 1 })
+
+    expect(runTurn).toHaveBeenCalledOnce()
+    expect(bus.pending(child.id)).toEqual([])
+    expect(sessions.busInbox(child.id)).toMatchObject([
+      { attentionRequired: true, wake: true, delivered: true },
+    ])
+    expect(journal.recentEventsForSession(manager.id)).toContainEqual(expect.objectContaining({
+      kind: 'bus/sent',
+      payload: expect.objectContaining({ attentionRequired: true, deferred: 0 }),
+    }))
+  })
+
+  it('limits attention-required delivery to hierarchy escalation and rejects contradictory wake=false', () => {
+    const { sessions, seed } = buildHub()
+    const manager = seed({ id: 'manager', projectId: 'project-1', isProjectManager: true })
+    const child = seed({ id: 'child', projectId: 'project-1', parentSessionId: manager.id })
+    const sibling = seed({ id: 'sibling', projectId: 'project-1', parentSessionId: manager.id })
+
+    expect(sessions.busSend(
+      child.id,
+      { kind: 'session', id: sibling.id },
+      'not an escalation',
+      'Do not wake a sibling urgently.',
+      true,
+      true,
+    )).toMatchObject({ ok: false, error: expect.stringMatching(/own manager/i) })
+
+    expect(sessions.busSend(
+      child.id,
+      { kind: 'session', id: manager.id },
+      'blocked',
+      'The manager needs to resolve this blocker.',
+      true,
+      true,
+    )).toMatchObject({ ok: true, delivered: 1 })
+
+    expect(sessions.busSend(
+      manager.id,
+      { kind: 'session', id: child.id },
+      'contradictory',
+      'Cannot be urgent and held.',
+      false,
+      true,
+    )).toMatchObject({ ok: false, error: expect.stringMatching(/wakeable/i) })
+  })
+
   it('applies the same guard to Codex from its reported context-window occupancy', () => {
     const { sessions, journal, bus, seed, runTurn } = buildHub()
     seed({ id: 'manager', projectId: 'project-1', isProjectManager: true })
