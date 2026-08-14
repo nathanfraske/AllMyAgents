@@ -3946,6 +3946,13 @@ export class SessionManager {
     // process is spawned against the home only when the user explicitly resumes an imported chat.
     if (process.env.HUB_ISOLATED_PROFILES !== '1') this.registerDefaultHomes()
     this.loadRecords()
+    // Replica attribution is an admission invariant, not instruction maintenance: a restored project
+    // session may be asked to start a local or remote durable run as soon as the public hub is ready.
+    // Preserve the prior synchronous upgrade for the owning blue/standalone process so that first action
+    // cannot lose its replica id. A booting green remains read-only and will perform this after promotion.
+    if (opts?.reconcile !== false) {
+      for (const record of this.sessions.values()) this.upgradeProjectReplicaSession(record)
+    }
     // WORKER MODE: the smart re-attach (attachWorker) decides each restored session's fate against the
     // still-running worker, and is driven ASYNCHRONOUSLY off the WorkerClient's 'attached' event — not
     // here. The blunt reconcileStale() must NOT pre-empt it (it would flip a live mid-turn session to idle
@@ -4102,7 +4109,9 @@ export class SessionManager {
    *  FLAG-OFF (in-process) is byte-identical: the blunt sweep below runs exactly as it always has. */
   reconcileStale(): void {
     // This method runs only for the current public owner: at ordinary boot, or synchronously after a
-    // green hub wins promote(). Versioned instruction/config writes run separately after readiness.
+    // green hub wins promote(). Replica identity is required before admitting work; the heavier versioned
+    // instruction/config writes run separately after readiness.
+    for (const record of this.sessions.values()) this.upgradeProjectReplicaSession(record)
     this.reconcileInterruptedTestbedRuns()
     if (this.workerMode) {
       void this.attachWorker().catch((err) => console.warn(`[hub] attachWorker (reconcileStale) failed: ${err instanceof Error ? err.message : String(err)}`))
