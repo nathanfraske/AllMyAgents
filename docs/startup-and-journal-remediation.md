@@ -285,3 +285,24 @@ something, not by reading tool output.
 
 Do not test only against a small database — every bug here is invisible at small scale.
 That is precisely why this shipped.
+
+## 6. Production-scale verification
+
+The release candidate was exercised against a separate copy of the operator's verified 2026-08-14 snapshot,
+not the live data root:
+
+- baseline: 3,207,106,560-byte `hub.db`, 994,617 events, 54 sessions, `quick_check: ok`, 782,985 pages,
+  no freelist, and legacy `auto_vacuum=NONE`;
+- ordinary maintenance cycle 1 externalized 5,241 rows and 1,492,584,196 logical bytes into
+  1,375,634,521 unique content-addressed blob bytes;
+- ordinary cycle 2 used SQLite's crash-atomic reclaim boundary and reduced the resident database to
+  1,509,273,600 bytes with `auto_vacuum=INCREMENTAL` and `quick_check: ok`;
+- ordinary cycle 3, against the now-compliant root, completed in 5.5 seconds with identical database bytes,
+  page count, freelist, and storage-enforcement event count — no repeat rewrite;
+- all 54 sessions remained present after convergence;
+- isolated worker preflight completed on the 1.51 GB result in 6.5 seconds while renewing its liveness lease
+  seven times; an unchanged same-supervisor retry reused the exact identity receipt and completed in 0.21 seconds
+  without another content scan.
+
+The copied test roots were deleted after verification. The operator's live journal, backups, recovery root, and
+the deliberately-running reproduction worker were not modified or terminated by this test.

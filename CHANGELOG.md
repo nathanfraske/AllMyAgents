@@ -5,6 +5,27 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.27-alpha.31 — 2026-08-14
+
+This release fixes the multi-gigabyte journal startup and backup failure at its storage boundary, restores
+direct-only MyOwnMesh testbeds, and makes application-scoped Overseer runs, elevation, and actionable handoffs
+usable without inventing a project association.
+
+[Full v0.1.27-alpha.31 release notes](docs/releases/v0.1.27-alpha.31.md)
+
+- Large event strings move losslessly into crash-safe, content-addressed blobs. Ordinary bounded maintenance
+  projects existing rows, enforces a configurable resident SQLite target, and is a no-op once compliant.
+- A hot backup pins one immutable WAL generation and is bounded by restart, physical-page-work, child wall-clock,
+  and parent-process deadlines. Backup and exclusive maintenance cannot overlap.
+- Boot uses `quick_check`, reuses one exact journal-identity proof across supervisor respawns, and moves heavy
+  capability rematerialization post-ready without delaying replica attribution required for durable runs.
+- Recursive canonical JSON fixes direct-lane signatures across MyOwnMesh map reserialization. Lightweight nodes
+  retain their event loop, advertise the correct capabilities, and complete reciprocal one-use pairing.
+- The Overseer can own durable runs from an explicit absolute directory and use a separate audited machine-level
+  elevation policy; actionable manager/Overseer mail wakes the intended recipient without changing authority.
+- Existing Overseers upgrade in place to capability contract v17 with explicit delegation, messaging-path,
+  evidence-strength, task-accountability, and compaction-continuity methodology.
+
 ## v0.1.26-alpha.30 — 2026-08-13
 
 This release consolidates settings, project management, and remote-device visibility; replaces provider-shaped
