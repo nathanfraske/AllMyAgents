@@ -69,6 +69,39 @@ function elapsed(started: number): number {
   return Math.round((performance.now() - started) * 10) / 10
 }
 
+/** Exact, bounded family identity used only to reuse a pass inside one still-running supervisor. */
+export function journalPreflightIdentity(dataDir: string, journalPath: string): string | undefined {
+  const describe = (file: string): Record<string, string> => {
+    try {
+      const stat = fs.lstatSync(file, { bigint: true })
+      if (!stat.isFile() || stat.isSymbolicLink()) return { state: 'invalid' }
+      return {
+        state: 'file',
+        dev: String(stat.dev),
+        ino: String(stat.ino),
+        size: String(stat.size),
+        mtimeNs: String(stat.mtimeNs),
+        ctimeNs: String(stat.ctimeNs),
+      }
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') return { state: 'missing' }
+      throw error
+    }
+  }
+  try {
+    const files = [
+      journalPath,
+      `${journalPath}-wal`,
+      `${journalPath}-shm`,
+      `${journalPath}-journal`,
+      path.join(path.resolve(dataDir), 'journal-recovery', 'root.json'),
+    ].map((file) => [path.resolve(file), describe(file)] as const)
+    return crypto.createHash('sha256').update(JSON.stringify(files)).digest('hex')
+  } catch {
+    return undefined
+  }
+}
+
 function writeFailure(error: unknown, dataDir: string): PreflightFailure | undefined {
   const code = errorCode(error)
   if (!code || !WRITE_FAILURE_CODES.has(code)) return undefined
@@ -259,6 +292,8 @@ export function runHubPreflight(options: {
   lstat?: typeof fs.lstatSync
   /** Only an exclusive supervisor classifier may interpret stable raw sidecar bytes. */
   stableFamily?: boolean
+  /** Exact unchanged-family receipt from this supervisor boot; skips repeated database content scans. */
+  reuseVerifiedIdentity?: boolean
 }): HubPreflightResult {
   const { dataDir, journalPath, schemaVersion } = options
   const checks: PreflightCheck[] = []
@@ -552,7 +587,17 @@ export function runHubPreflight(options: {
       }
     } else {
       const integrityStarted = performance.now()
-      const rows = db.pragma('integrity_check') as Array<Record<string, unknown>>
+      if (options.reuseVerifiedIdentity) {
+        checks.push({
+          name: 'database-integrity',
+          status: 'skipped',
+          detail: 'unchanged journal family already passed preflight during this supervisor boot',
+          durationMs: elapsed(integrityStarted),
+        })
+        result = { ok: true, checks }
+      } else {
+      const integrityPragma = options.stableFamily ? 'integrity_check' : 'quick_check'
+      const rows = db.pragma(integrityPragma) as Array<Record<string, unknown>>
       const findings = rows.flatMap((row) => Object.values(row).map(String))
       if (findings.length !== 1 || findings[0]?.toLowerCase() !== 'ok') {
         result = {
@@ -560,7 +605,7 @@ export function runHubPreflight(options: {
           checks,
           failure: {
             code: 'database-corrupt',
-            message: `The journal failed PRAGMA integrity_check: ${findings.join('; ') || 'SQLite returned no result'}`,
+            message: `The journal failed PRAGMA ${integrityPragma}: ${findings.join('; ') || 'SQLite returned no result'}`,
             recovery:
               'Keep the damaged SQLite family for evidence. AllMyAgents may restore only an identity-bound verified recovery generation; otherwise it stays offline.',
             recoveryCause: 'sqlite-corruption',
@@ -586,11 +631,12 @@ export function runHubPreflight(options: {
           checks.push({
             name: 'database-integrity',
             status: 'passed',
-            detail: 'ok; event payload JSON is valid',
+            detail: `${integrityPragma} ok; event payload JSON is valid`,
             durationMs: elapsed(integrityStarted),
           })
           result = { ok: true, checks }
         }
+      }
       }
     }
   } catch (error) {
@@ -689,6 +735,7 @@ type PreflightWorkerRequest = {
   dataDir: string
   journalPath: string
   schemaVersion: number
+  reuseVerifiedIdentity?: boolean
 }
 
 type PreflightWorkerResponse =
@@ -700,6 +747,7 @@ export function runHubPreflightInWorker(options: {
   journalPath: string
   schemaVersion: number
   onLiveness: () => void
+  reuseVerifiedIdentity?: boolean
 }): Promise<HubPreflightResult> {
   if (!isMainThread) {
     return Promise.reject(new Error('nested preflight workers are forbidden'))
@@ -721,6 +769,7 @@ export function runHubPreflightInWorker(options: {
         dataDir: options.dataDir,
         journalPath: options.journalPath,
         schemaVersion: options.schemaVersion,
+        ...(options.reuseVerifiedIdentity ? { reuseVerifiedIdentity: true } : {}),
       } satisfies PreflightWorkerRequest,
     })
     let settled = false
@@ -797,6 +846,7 @@ if (workerRequest?.kind === 'hub-preflight-v1') {
       dataDir: workerRequest.dataDir,
       journalPath: workerRequest.journalPath,
       schemaVersion: Number(workerRequest.schemaVersion),
+      reuseVerifiedIdentity: workerRequest.reuseVerifiedIdentity === true,
     })
     parentPort?.postMessage({ kind: 'result', result } satisfies PreflightWorkerResponse)
   } catch (error) {

@@ -132,7 +132,7 @@ describe('hub preflight', () => {
     expect(result.failure).toMatchObject({ code: 'database-validation-unavailable' })
   })
 
-  it('runs the full integrity check for a healthy existing journal', () => {
+  it('uses quick_check on the ordinary boot path', () => {
     const dataDir = tempDataDir()
     const journalPath = validJournal(dataDir)
 
@@ -143,12 +143,12 @@ describe('hub preflight', () => {
       expect.objectContaining({
         name: 'database-integrity',
         status: 'passed',
-        detail: 'ok; event payload JSON is valid',
+        detail: 'quick_check ok; event payload JSON is valid',
       })
     )
   })
 
-  it('runs the same full integrity proof while the hub maintains a liveness lease', async () => {
+  it('runs the same bounded boot proof while the hub maintains a liveness lease', async () => {
     const dataDir = tempDataDir()
     const journalPath = validJournal(dataDir)
     let livenessRenewals = 0
@@ -168,9 +168,42 @@ describe('hub preflight', () => {
       expect.objectContaining({
         name: 'database-integrity',
         status: 'passed',
-        detail: 'ok; event payload JSON is valid',
+        detail: 'quick_check ok; event payload JSON is valid',
       })
     )
+  })
+
+  it('keeps full integrity_check on the isolated suspicion classifier', () => {
+    const dataDir = tempDataDir()
+    const journalPath = validJournal(dataDir)
+    const result = runHubPreflight({
+      dataDir,
+      journalPath,
+      schemaVersion: SCHEMA_VERSION,
+      stableFamily: true,
+    })
+    expect(result.ok).toBe(true)
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: 'database-integrity',
+      detail: 'integrity_check ok; event payload JSON is valid',
+    }))
+  })
+
+  it('reuses an unchanged pass within one supervisor boot without another content scan', () => {
+    const dataDir = tempDataDir()
+    const journalPath = validJournal(dataDir)
+    const result = runHubPreflight({
+      dataDir,
+      journalPath,
+      schemaVersion: SCHEMA_VERSION,
+      reuseVerifiedIdentity: true,
+    })
+    expect(result.ok).toBe(true)
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: 'database-integrity',
+      status: 'skipped',
+      detail: expect.stringMatching(/already passed.*supervisor boot/u),
+    }))
   })
 
   it('fails closed on an unknown data-root write-probe error', () => {
@@ -555,15 +588,15 @@ describe('hub preflight', () => {
   })
 
   it.each([
-    ['healthy', [{ integrity_check: 'ok' }]],
-    ['corrupt', [{ integrity_check: 'malformed page' }]],
+    ['healthy', [{ quick_check: 'ok' }]],
+    ['corrupt', [{ quick_check: 'malformed page' }]],
   ])('revokes a %s validation result when the readonly handle cannot close', (_kind, integrity) => {
     const dataDir = tempDataDir()
     const journalPath = validJournal(dataDir)
     const fake = {
       pragma(statement: string, options?: { simple?: boolean }) {
         if (statement === 'user_version' && options?.simple) return 0
-        if (statement === 'integrity_check') return integrity
+        if (statement === 'quick_check') return integrity
         return undefined
       },
       close() {

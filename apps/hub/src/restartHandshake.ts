@@ -143,6 +143,11 @@ export type HubMsg =
     } // after boot() + listening
   | PreflightLiveness
   | {
+      type: 'preflight-cacheable'
+      attemptId: string
+      identity: string
+    }
+  | {
       type: 'released'
       questionTurns: { settled: number; outcomeUnknown: number }
       loginAttempts: { settled: number; outcomeUnknown: number }
