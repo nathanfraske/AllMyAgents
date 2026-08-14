@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import { performance } from 'node:perf_hooks'
 import Database from 'better-sqlite3'
 import type {
   JournalBackupControlCommand,
@@ -49,6 +50,14 @@ export interface JournalBackupOptions {
   dir: string
   /** How often to snapshot. */
   intervalMs?: number
+  /** Internal/advanced: reuse a recently published verified generation instead of copying at activation. */
+  minimumSnapshotAgeMs?: number
+  /** Hard wall-clock bound for the online-copy phase. Verification/publication have separate watchdog semantics. */
+  maxCopyWallMs?: number
+  /** Abort if SQLite physically transfers more than this multiple of the source page count. */
+  maxCopyWorkRatio?: number
+  /** Abort after this many observed online-backup restarts. */
+  maxCopyRestarts?: number
   /** How many verified generations to keep. */
   keep?: number
   /** Total compatibility-snapshot budget. The newest verified generation is always retained. */
@@ -79,11 +88,14 @@ export interface JournalBackupOptions {
 }
 
 const DEFAULT_INTERVAL_MS = 30 * 60 * 1000
-const DEFAULT_KEEP = 6
-const DEFAULT_MAX_RETAINED_BYTES = 8 * 1024 * 1024 * 1024
+export const JOURNAL_BACKUP_KEEP_DEFAULT = 2
+export const JOURNAL_BACKUP_MAX_RETAINED_BYTES_DEFAULT = 4 * 1024 * 1024 * 1024
 const DEFAULT_MINIMUM_FREE_BYTES = 256 * 1024 * 1024
 const DEFAULT_ACTIVATION_RETRY_MS = [250, 1_000, 5_000, 10_000, 30_000] as const
 const DEFAULT_SHUTDOWN_WAIT_MS = 2_000
+const DEFAULT_MAX_COPY_WALL_MS = 10 * 60 * 1000
+const DEFAULT_MAX_COPY_WORK_RATIO = 3
+const DEFAULT_MAX_COPY_RESTARTS = 2
 const PREFIX = 'hub-'
 const SUFFIX = '.db'
 const PARTIAL_SUFFIX = `${SUFFIX}.partial`
@@ -92,10 +104,35 @@ const SIDECAR_SUFFIXES = ['-wal', '-shm'] as const
 
 export interface SnapshotResult {
   ok: boolean
+  skipped?: boolean
   file?: string
   bytes?: number
   error?: string
   recoveryGeneration?: string
+  copyTelemetry?: JournalBackupCopyTelemetry
+}
+
+export interface JournalBackupCopyTelemetry {
+  elapsedMs: number
+  totalPages: number
+  pagesTransferred: number
+  restarts: number
+  stableReadSnapshot: boolean
+}
+
+/** Public so the child-process watchdog and tests use the exact production deadline. */
+export function journalBackupCopyWallMs(value?: number): number {
+  if (value === undefined) return DEFAULT_MAX_COPY_WALL_MS
+  if (!Number.isFinite(value) || value <= 0) return DEFAULT_MAX_COPY_WALL_MS
+  return Math.max(1, Math.trunc(value))
+}
+
+/** Large journals are expensive enough that a fixed 30-minute full-snapshot cadence becomes a disk DoS. */
+export function sizeAwareJournalBackupIntervalMs(databaseBytes: number): number {
+  if (!Number.isFinite(databaseBytes) || databaseBytes < 0) return DEFAULT_INTERVAL_MS
+  if (databaseBytes <= 512 * 1024 * 1024) return DEFAULT_INTERVAL_MS
+  if (databaseBytes <= 2 * 1024 * 1024 * 1024) return 2 * 60 * 60 * 1000
+  return 6 * 60 * 60 * 1000
 }
 
 export type JournalBackupRuntimeState =
@@ -134,6 +171,7 @@ export async function snapshotJournal(
   let progressCompleted = false
   let sourceBytes = 0n
   let bytesCompleted = 0
+  let copyTelemetry: JournalBackupCopyTelemetry | undefined
   const reportProgress = (
     phase: string,
     active: boolean,
@@ -160,10 +198,10 @@ export async function snapshotJournal(
   }
   fs.mkdirSync(options.dir, { recursive: true })
   reportProgress('preparing', true)
-  const keep = Math.max(1, Math.trunc(options.keep ?? DEFAULT_KEEP))
+  const keep = Math.max(1, Math.trunc(options.keep ?? JOURNAL_BACKUP_KEEP_DEFAULT))
   const maxRetainedBytes = positiveByteLimit(
     options.maxRetainedBytes,
-    DEFAULT_MAX_RETAINED_BYTES
+    JOURNAL_BACKUP_MAX_RETAINED_BYTES_DEFAULT
   )
   const rotateSnapshots = (): void =>
     rotate(options.dir, keep, maxRetainedBytes, log)
@@ -173,6 +211,15 @@ export async function snapshotJournal(
   // failures must not allow a legacy pile to grow forever.
   rotateSnapshots()
   try {
+    const minimumAgeMs = Math.max(0, Math.trunc(options.minimumSnapshotAgeMs ?? 0))
+    const recent = minimumAgeMs > 0
+      ? newestPublishedSnapshot(options.dir, options.recoveryDataDir)
+      : undefined
+    if (recent && now().getTime() - recent.mtimeMs < minimumAgeMs) {
+      progressCompleted = true
+      log(`[journal-backup] initial snapshot SKIPPED: verified generation is ${Math.max(0, Math.round((now().getTime() - recent.mtimeMs) / 1_000))}s old`)
+      return { ok: true, skipped: true, file: recent.file, bytes: recent.bytes }
+    }
     sourceBytes = estimateSourceBytes(db)
     if (sourceBytes > 0n) {
       const reserveBytes = BigInt(
@@ -226,19 +273,81 @@ export async function snapshotJournal(
       }
     }
 
+    let stableSource: StableBackupSource | undefined
     try {
-      // Online backup: consistent even while the hub is mid-turn.
+      // Pin a read snapshot on a dedicated source connection before invoking SQLite's online backup API.
+      // In WAL mode writers continue normally, while the backup sees one immutable database generation.
+      // Without the explicit transaction SQLite follows the moving source and restarts from page zero on
+      // every write; once this journal reached 3 GB one attempt transferred 180x the database and never
+      // finished. The budgets below remain a hard backstop if the invariant ever regresses.
+      stableSource = openStableBackupSource(db)
       reportProgress('copying', true)
-      await db.backup(partial, {
+      const copyStartedAt = performance.now()
+      const maxWallMs = journalBackupCopyWallMs(options.maxCopyWallMs)
+      const maxWorkRatio = positiveRatio(options.maxCopyWorkRatio, DEFAULT_MAX_COPY_WORK_RATIO)
+      const maxRestarts = nonNegativeInteger(options.maxCopyRestarts, DEFAULT_MAX_COPY_RESTARTS)
+      let observedTotalPages = 0
+      let previousCopiedPages = 0
+      let pagesTransferred = 0
+      let restarts = 0
+      await stableSource.db.backup(partial, {
         progress: ({ totalPages, remainingPages }) => {
           const copiedPages = Math.max(0, totalPages - remainingPages)
+          observedTotalPages = Math.max(observedTotalPages, totalPages)
+          if (copiedPages < previousCopiedPages) restarts += 1
+          pagesTransferred += copiedPages >= previousCopiedPages
+            ? copiedPages - previousCopiedPages
+            : copiedPages
+          previousCopiedPages = copiedPages
+          const elapsedMs = performance.now() - copyStartedAt
+          copyTelemetry = {
+            elapsedMs: Math.round(elapsedMs),
+            totalPages: observedTotalPages,
+            pagesTransferred,
+            restarts,
+            stableReadSnapshot: stableSource?.pinned === true,
+          }
+          if (elapsedMs > maxWallMs) {
+            throw new Error(
+              `journal snapshot copy exceeded its ${maxWallMs}ms wall-clock budget ` +
+              `(${pagesTransferred} page(s) transferred, ${restarts} restart(s))`,
+            )
+          }
+          if (restarts > maxRestarts) {
+            throw new Error(
+              `journal snapshot copy exceeded its ${maxRestarts}-restart budget ` +
+              `(${pagesTransferred} page(s) transferred)`,
+            )
+          }
+          const workLimit = Math.max(
+            observedTotalPages,
+            Math.ceil(observedTotalPages * maxWorkRatio),
+          )
+          if (observedTotalPages > 0 && pagesTransferred > workLimit) {
+            throw new Error(
+              `journal snapshot copy exceeded its ${maxWorkRatio.toFixed(2)}x page-work budget ` +
+              `(${pagesTransferred}/${observedTotalPages} page(s), ${restarts} restart(s))`,
+            )
+          }
           bytesCompleted = totalPages > 0
             ? Number((sourceBytes * BigInt(copiedPages)) / BigInt(totalPages))
             : 0
-          reportProgress('copying', true, false, `${copiedPages}/${totalPages} SQLite pages copied`)
+          reportProgress(
+            'copying',
+            true,
+            false,
+            `${copiedPages}/${totalPages} SQLite pages copied; ${pagesTransferred} physically transferred; ${restarts} restart(s)`,
+          )
           return 1_000
         },
       })
+      copyTelemetry = {
+        elapsedMs: Math.round(performance.now() - copyStartedAt),
+        totalPages: copyTelemetry?.totalPages ?? observedTotalPages,
+        pagesTransferred: copyTelemetry?.pagesTransferred ?? pagesTransferred,
+        restarts: copyTelemetry?.restarts ?? restarts,
+        stableReadSnapshot: stableSource.pinned,
+      }
       bytesCompleted = fs.statSync(partial).size
       // SQLite online backup preserves the source's WAL journal-mode header. A standalone snapshot has
       // no live WAL to replay, and opening that header read-only on Windows manufactures `-wal`/`-shm`
@@ -253,7 +362,9 @@ export async function snapshotJournal(
       } catch {
         /* nothing to clean up */
       }
-      return { ok: false, error: message }
+      return { ok: false, error: message, ...(copyTelemetry ? { copyTelemetry } : {}) }
+    } finally {
+      stableSource?.release()
     }
 
     let verified = false
@@ -309,10 +420,10 @@ export async function snapshotJournal(
           dataDir: options.recoveryDataDir,
           snapshotFile: target,
           maxSchemaVersion: SCHEMA_VERSION,
-          keep: options.recoveryKeep ?? options.keep ?? DEFAULT_KEEP,
+          keep: options.recoveryKeep ?? options.keep ?? JOURNAL_BACKUP_KEEP_DEFAULT,
           maxRetainedBytes: positiveByteLimit(
             options.recoveryMaxRetainedBytes ?? options.maxRetainedBytes,
-            DEFAULT_MAX_RETAINED_BYTES,
+            JOURNAL_BACKUP_MAX_RETAINED_BYTES_DEFAULT,
           ),
         })
         recoveryGeneration = generation.manifest.generation
@@ -325,11 +436,23 @@ export async function snapshotJournal(
         // The compatibility flat file remains operator evidence, but it is intentionally NOT recovery
         // eligible. Keep it inside the same bounded retention budget rather than accumulating a second,
         // unbounded failure stream, and surface degraded state so self-heal is never silently assumed.
-        return { ok: false, file: target, bytes, error: message }
+        return {
+          ok: false,
+          file: target,
+          bytes,
+          error: message,
+          ...(copyTelemetry ? { copyTelemetry } : {}),
+        }
       }
     }
     progressCompleted = true
-    return { ok: true, file: target, bytes, ...(recoveryGeneration ? { recoveryGeneration } : {}) }
+    return {
+      ok: true,
+      file: target,
+      bytes,
+      ...(recoveryGeneration ? { recoveryGeneration } : {}),
+      ...(copyTelemetry ? { copyTelemetry } : {}),
+    }
   } finally {
     reportProgress(
       progressCompleted ? 'completed' : 'failed',
@@ -338,6 +461,63 @@ export async function snapshotJournal(
       progressCompleted ? 'Verified snapshot and lineage publication completed.' : 'Snapshot did not complete.'
     )
     rotateSnapshots()
+  }
+}
+
+interface StableBackupSource {
+  db: Database.Database
+  pinned: boolean
+  release(): void
+}
+
+/**
+ * Hold one WAL read snapshot for the entire online backup without borrowing the hub's writer connection.
+ * A file-backed database gets a dedicated read-only handle. Test doubles retain their existing behavior.
+ */
+function openStableBackupSource(db: Database.Database): StableBackupSource {
+  const sourceName = typeof db.name === 'string' ? db.name.trim() : ''
+  const fileBacked = sourceName.length > 0 && sourceName !== ':memory:'
+  const source = fileBacked
+    ? new Database(sourceName, { readonly: true, fileMustExist: true })
+    : db
+  const ownsSource = source !== db
+  let pinned = false
+  try {
+    if (typeof source.exec === 'function' && source.inTransaction !== true) {
+      source.exec('BEGIN')
+      // A deferred BEGIN alone has no snapshot yet. This read fixes the source generation before backup().
+      source.prepare('SELECT rootpage FROM sqlite_schema LIMIT 1').get()
+      pinned = true
+    }
+    return {
+      db: source,
+      pinned,
+      release: () => {
+        try {
+          if (pinned && source.inTransaction) source.exec('ROLLBACK')
+        } finally {
+          if (ownsSource) source.close()
+        }
+      },
+    }
+  } catch (error) {
+    try {
+      if (source.inTransaction) source.exec('ROLLBACK')
+    } catch {
+      /* preserve the original snapshot-pinning failure */
+    }
+    if (ownsSource) {
+      try {
+        source.close()
+      } catch {
+        /* preserve the original snapshot-pinning failure */
+      }
+    }
+    throw new Error(
+      `journal snapshot could not pin a stable source generation: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    )
   }
 }
 
@@ -466,11 +646,82 @@ function rotate(
   }
 }
 
+function positiveRatio(value: number | undefined, fallback: number): number {
+  if (value === undefined || !Number.isFinite(value) || value < 1) return fallback
+  return value
+}
+
+function nonNegativeInteger(value: number | undefined, fallback: number): number {
+  if (value === undefined || !Number.isFinite(value) || value < 0) return fallback
+  return Math.trunc(value)
+}
+
+/** Idempotent retention pass used by the post-ready storage upgrade before it creates more work. */
+export function pruneJournalBackupGenerations(
+  dir: string,
+  keep = JOURNAL_BACKUP_KEEP_DEFAULT,
+  maxRetainedBytes = JOURNAL_BACKUP_MAX_RETAINED_BYTES_DEFAULT,
+  log: (message: string) => void = () => {},
+): void {
+  fs.mkdirSync(dir, { recursive: true })
+  rotate(
+    dir,
+    Math.max(1, Math.trunc(keep)),
+    positiveByteLimit(maxRetainedBytes, JOURNAL_BACKUP_MAX_RETAINED_BYTES_DEFAULT),
+    log,
+  )
+}
+
+function newestPublishedSnapshot(
+  dir: string,
+  recoveryDataDir?: string,
+): { file: string; bytes: number; mtimeMs: number } | undefined {
+  let candidates: Array<{ file: string; bytes: number; mtimeMs: number; dev: bigint; ino: bigint }>
+  try {
+    candidates = fs.readdirSync(dir)
+      .filter((name) => name.startsWith(PREFIX) && name.endsWith(SUFFIX))
+      .map((name) => {
+        const file = path.join(dir, name)
+        const stat = fs.statSync(file, { bigint: true })
+        return {
+          file,
+          bytes: Number(stat.size),
+          mtimeMs: Number(stat.mtimeMs),
+          dev: stat.dev,
+          ino: stat.ino,
+        }
+      })
+      .sort((left, right) => right.mtimeMs - left.mtimeMs)
+  } catch {
+    return undefined
+  }
+  if (!recoveryDataDir) return candidates[0]
+  const generationRoot = path.join(recoveryDataDir, 'journal-recovery', 'generations')
+  let recoveryIdentities = new Set<string>()
+  try {
+    recoveryIdentities = new Set(fs.readdirSync(generationRoot).flatMap((entry) => {
+      const snapshot = path.join(generationRoot, entry, 'snapshot.db')
+      try {
+        const stat = fs.statSync(snapshot, { bigint: true })
+        return [`${stat.dev}:${stat.ino}`]
+      } catch {
+        return []
+      }
+    }))
+  } catch {
+    return undefined
+  }
+  return candidates.find((candidate) => recoveryIdentities.has(`${candidate.dev}:${candidate.ino}`))
+}
+
 /**
  * Ownership makes every recognized partial stale: this runs only as an inactive supervisor becomes the
  * exclusive owner. Rotation never sees these names, so a crash cannot evict a verified generation.
  */
-function cleanupStalePartials(dir: string, log: (m: string) => void): void {
+export function cleanupJournalBackupPartials(
+  dir: string,
+  log: (message: string) => void = () => {},
+): void {
   let entries: string[]
   try {
     entries = fs
@@ -514,7 +765,7 @@ export function createJournalBackupSupervisor(
   options: JournalBackupOptions,
   takeSnapshot: JournalSnapshotTask = snapshotJournal
 ): JournalBackupSupervisor {
-  const intervalMs = options.intervalMs ?? DEFAULT_INTERVAL_MS
+  const intervalMs = (): number => options.intervalMs ?? sizeAwareJournalBackupIntervalMs(Number(estimateSourceBytes(db)))
   const log = options.log ?? (() => {})
   const activationRetryMs =
     options.activationRetryMs?.length ? options.activationRetryMs : DEFAULT_ACTIVATION_RETRY_MS
@@ -550,7 +801,7 @@ export function createJournalBackupSupervisor(
     periodicTimer = setTimeout(() => {
       periodicTimer = undefined
       launch('snapshot')
-    }, intervalMs)
+    }, intervalMs())
     periodicTimer.unref?.()
   }
 
@@ -559,10 +810,12 @@ export function createJournalBackupSupervisor(
     runWhenIdle = false
     if (cleanupPending) {
       cleanupPending = false
-      cleanupStalePartials(options.dir, log)
+      cleanupJournalBackupPartials(options.dir, log)
     }
     const task = Promise.resolve()
-      .then(() => takeSnapshot(db, options))
+      .then(() => takeSnapshot(db, label === 'initial snapshot'
+        ? { ...options, minimumSnapshotAgeMs: options.minimumSnapshotAgeMs ?? intervalMs() }
+        : options))
       .then((result) => {
         if (!result.ok) {
           const error = result.error ?? 'snapshot returned an unknown failure'

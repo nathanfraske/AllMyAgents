@@ -84,6 +84,10 @@ export const JOURNAL_CONDENSE_MAX_DIFF_SNAPSHOTS = 5_000
 export const JOURNAL_CONDENSE_MAX_ITEM_STARTED = 5_000
 export const JOURNAL_CONDENSE_MAX_DELETE_ROWS = 3_500
 export const JOURNAL_CONDENSE_MAX_TRANSIENT_BYTES = 8 * 1024 * 1024
+/** Resident SQLite target. Exact oversized transcript bytes live in the lossless content-addressed store. */
+export const JOURNAL_SQLITE_TARGET_BYTES = 2 * 1024 * 1024 * 1024
+/** At 4 KiB pages this reclaims at most 64 MiB per ordinary maintenance cycle. */
+export const JOURNAL_STORAGE_MAX_INCREMENTAL_VACUUM_PAGES = 16_384
 export const JOURNAL_REPLAY_PROTOCOL_VERSION = 1 as const
 export const JOURNAL_HISTORY_PAGE_MAX_ROWS = 80
 export const JOURNAL_HISTORY_PAGE_MAX_BYTES = 512 * 1024
@@ -191,6 +195,16 @@ export interface JournalBlobMigrationResult {
   scannedThrough: number
   target: number
   complete: boolean
+}
+
+export interface JournalStorageEnforcementResult {
+  targetBytes: number
+  bytesBefore: number
+  bytesAfter: number
+  freelistPagesBefore: number
+  freelistPagesAfter: number
+  action: 'none' | 'incremental-vacuum' | 'full-vacuum'
+  withinTarget: boolean
 }
 
 export interface BoundedReplayPage {
@@ -486,15 +500,6 @@ export class Journal extends EventEmitter {
       INSERT OR IGNORE INTO journal_blob_migration_state
         (singleton, scanned_through, bytes_externalized, rows_rewritten, updated_at)
       VALUES (1, 0, 0, 0, '1970-01-01T00:00:00.000Z');
-      CREATE TABLE IF NOT EXISTS journal_storage_upgrade_state (
-        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-        vacuum_completed_at TEXT,
-        bytes_before INTEGER CHECK (bytes_before IS NULL OR bytes_before >= 0),
-        bytes_after INTEGER CHECK (bytes_after IS NULL OR bytes_after >= 0)
-      );
-      INSERT OR IGNORE INTO journal_storage_upgrade_state
-        (singleton, vacuum_completed_at, bytes_before, bytes_after)
-      VALUES (1, NULL, NULL, NULL);
       CREATE TABLE IF NOT EXISTS journal_compaction_runs (
         operation_id TEXT PRIMARY KEY,
         phase TEXT NOT NULL CHECK (
@@ -1690,11 +1695,10 @@ export class Journal extends EventEmitter {
    * multi-second hub stall. Production invokes it in a one-shot child process as a second defense, keeping
    * JSON scans off the hub event loop and bounding the SQLite writer-lock/WAL burst.
    *
-   * This intentionally does NOT VACUUM. SQLite will reuse the pages freed by both stages, stopping retained
-   * history from growing the file after its window reaches steady state, but shrinking an existing DB is a
-   * separate operator maintenance action: full VACUUM takes an exclusive rewrite plus roughly one database
-   * of free disk, while changing an existing DB to auto_vacuum=INCREMENTAL itself requires that same one-time
-   * full VACUUM.
+   * This delete transaction intentionally does NOT VACUUM. The same ordinary post-ready maintenance sequence
+   * enforces the configured resident-SQLite ceiling: incremental databases release a bounded page
+   * batch, while an oversized legacy database is crash-atomically converted once its payload projection is
+   * current. Physical reclaim therefore never lengthens the delete writer-lock boundary or the boot path.
    */
   condenseCompletedCodex(options: JournalCondenseOptions = {}): JournalCondenseResult {
     this.ensureTransientMaintenanceIndexes()
@@ -3289,60 +3293,72 @@ export class Journal extends EventEmitter {
   }
 
   /**
-   * One-time physical reclaim for journals created before incremental auto-vacuum was enabled.
+   * Enforce the same explicit resident-SQLite ceiling on every maintenance cycle.
    *
-   * The post-ready maintenance child calls this only after the lossless legacy-payload cursor reaches
-   * the current event high-water. SQLite VACUUM is itself crash-atomic: interruption leaves the original
-   * database authoritative. The completion receipt is written only after a clean quick_check, so a kill
-   * between VACUUM and the receipt safely repeats work instead of falsely claiming the upgrade landed.
+   * There is deliberately no migration flag or operator-only cleanup command. A compliant root does
+   * nothing. An oversized legacy root first externalizes exact large strings through the ordinary bounded
+   * cursor, then this path performs SQLite's crash-atomic conversion to incremental auto-vacuum. Later
+   * cycles reclaim only a bounded page batch. If retained live state itself exceeds the target, the result
+   * says so honestly; this method never destroys the only copy of transcript data to manufacture success.
    */
-  completeLegacyStorageUpgrade(): {
-    alreadyComplete: boolean
-    vacuumRan: boolean
-    bytesBefore: number
-    bytesAfter: number
-  } {
-    const receipt = this.db.prepare(
-      `SELECT vacuum_completed_at AS completedAt,
-              bytes_before AS bytesBefore,
-              bytes_after AS bytesAfter
-       FROM journal_storage_upgrade_state WHERE singleton = 1`,
-    ).get() as { completedAt: string | null; bytesBefore: number | null; bytesAfter: number | null }
-    if (receipt.completedAt) {
-      return {
-        alreadyComplete: true,
-        vacuumRan: false,
-        bytesBefore: receipt.bytesBefore ?? this.databasePageBytes(),
-        bytesAfter: receipt.bytesAfter ?? this.databasePageBytes(),
-      }
+  enforceStorageCeiling(
+    targetBytes = JOURNAL_SQLITE_TARGET_BYTES,
+    maxIncrementalPages = JOURNAL_STORAGE_MAX_INCREMENTAL_VACUUM_PAGES,
+  ): JournalStorageEnforcementResult {
+    if (!Number.isSafeInteger(targetBytes) || targetBytes < 1024 * 1024) {
+      throw new Error('journal SQLite target must be a safe integer of at least 1 MiB')
+    }
+    if (
+      !Number.isSafeInteger(maxIncrementalPages) ||
+      maxIncrementalPages < 1 ||
+      maxIncrementalPages > JOURNAL_STORAGE_MAX_INCREMENTAL_VACUUM_PAGES
+    ) {
+      throw new Error('journal storage reclaim page batch is outside the supported bound')
     }
     const cursor = Number(this.db.prepare(
       'SELECT scanned_through FROM journal_blob_migration_state WHERE singleton = 1',
     ).pluck().get())
-    const target = Number(this.db.prepare('SELECT COALESCE(MAX(seq), 0) FROM events').pluck().get())
-    if (!Number.isSafeInteger(cursor) || !Number.isSafeInteger(target) || cursor < target) {
-      throw new Error(`journal storage upgrade requires payload migration through ${target}; reached ${cursor}`)
+    const highWater = Number(this.db.prepare('SELECT COALESCE(MAX(seq), 0) FROM events').pluck().get())
+    if (!Number.isSafeInteger(cursor) || !Number.isSafeInteger(highWater) || cursor < highWater) {
+      throw new Error(
+        `journal storage enforcement requires payload projection through ${highWater}; reached ${cursor}`,
+      )
     }
     const bytesBefore = this.databasePageBytes()
-    const mode = Number(this.db.pragma('auto_vacuum', { simple: true }))
-    let vacuumRan = false
-    if (mode !== 2) {
-      this.db.pragma('auto_vacuum = INCREMENTAL')
-      this.db.exec('VACUUM')
-      vacuumRan = true
-    }
-    const findings = (this.db.pragma('quick_check') as Array<Record<string, unknown>>)
-      .flatMap((row) => Object.values(row).map(String))
-    if (findings.length !== 1 || findings[0]?.toLowerCase() !== 'ok') {
-      throw new Error(`journal storage upgrade quick_check failed: ${findings.slice(0, 3).join('; ')}`)
+    const freelistPagesBefore = Number(this.db.pragma('freelist_count', { simple: true }))
+    let action: JournalStorageEnforcementResult['action'] = 'none'
+    if (bytesBefore > targetBytes && freelistPagesBefore > 0) {
+      const mode = Number(this.db.pragma('auto_vacuum', { simple: true }))
+      if (mode === 2) {
+        this.db.pragma(
+          `incremental_vacuum(${Math.min(freelistPagesBefore, maxIncrementalPages)})`,
+        )
+        action = 'incremental-vacuum'
+      } else {
+        // This is not a one-off upgrade branch: it is the regular response whenever an oversized root
+        // predates incremental auto-vacuum. VACUUM is crash-atomic, runs post-ready in the maintenance
+        // child, and remains under that child's size-aware no-progress deadline.
+        this.db.pragma('auto_vacuum = INCREMENTAL')
+        this.db.exec('VACUUM')
+        action = 'full-vacuum'
+      }
+      const findings = (this.db.pragma('quick_check') as Array<Record<string, unknown>>)
+        .flatMap((row) => Object.values(row).map(String))
+      if (findings.length !== 1 || findings[0]?.toLowerCase() !== 'ok') {
+        throw new Error(`journal storage enforcement quick_check failed: ${findings.slice(0, 3).join('; ')}`)
+      }
     }
     const bytesAfter = this.databasePageBytes()
-    this.db.prepare(
-      `UPDATE journal_storage_upgrade_state
-       SET vacuum_completed_at = ?, bytes_before = ?, bytes_after = ?
-       WHERE singleton = 1`,
-    ).run(new Date().toISOString(), bytesBefore, bytesAfter)
-    return { alreadyComplete: false, vacuumRan, bytesBefore, bytesAfter }
+    const freelistPagesAfter = Number(this.db.pragma('freelist_count', { simple: true }))
+    return {
+      targetBytes,
+      bytesBefore,
+      bytesAfter,
+      freelistPagesBefore,
+      freelistPagesAfter,
+      action,
+      withinTarget: bytesAfter <= targetBytes,
+    }
   }
 
   private databasePageBytes(): number {

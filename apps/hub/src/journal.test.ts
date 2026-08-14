@@ -153,7 +153,7 @@ describe('journal payload bulk defense', () => {
     }
   })
 
-  it('migrates legacy oversized rows resumably and VACUUM reclaims their SQLite pages', () => {
+  it('ordinary bounded enforcement converges an oversized legacy root and is a no-op once compliant', () => {
     const file = path.join(tmp, 'legacy-large-text.db')
     // Simulate a pre-upgrade journal. New Journal databases start in incremental-vacuum mode and should
     // never need the one-time full rewrite.
@@ -184,14 +184,50 @@ describe('journal payload bulk defense', () => {
       }
       expect(complete).toBe(true)
       expect(j.since(0)).toHaveLength(12)
-      const upgrade = j.completeLegacyStorageUpgrade()
-      expect(upgrade).toMatchObject({ alreadyComplete: false, vacuumRan: true })
-      expect(j.completeLegacyStorageUpgrade()).toMatchObject({ alreadyComplete: true, vacuumRan: false })
+      const enforcement = j.enforceStorageCeiling(before - 1)
+      expect(enforcement).toMatchObject({ action: 'full-vacuum', withinTarget: true })
+      expect(j.enforceStorageCeiling(before - 1)).toMatchObject({
+        action: 'none',
+        withinTarget: true,
+      })
       j.db.pragma('wal_checkpoint(TRUNCATE)')
       expect(fs.statSync(file).size).toBeLessThan(before / 2)
       expect(j.db.pragma('auto_vacuum', { simple: true })).toBe(2)
       expect((j.since(0, 1)[0]?.payload as { message: { content: string } }).message.content.length)
         .toBeGreaterThan(256 * 1024)
+    } finally {
+      j.db.close()
+    }
+  })
+
+  it('reclaims an incremental database in bounded ordinary cycles', () => {
+    const file = path.join(tmp, 'incremental-ceiling.db')
+    const j = new Journal(file)
+    try {
+      j.db.exec('CREATE TABLE storage_pressure (id INTEGER PRIMARY KEY, payload BLOB)')
+      const insert = j.db.prepare('INSERT INTO storage_pressure (payload) VALUES (?)')
+      const fill = j.db.transaction(() => {
+        for (let index = 0; index < 1_600; index += 1) insert.run(Buffer.alloc(8 * 1024, index % 251))
+      })
+      fill.immediate()
+      j.db.exec('DELETE FROM storage_pressure')
+      const beforePages = Number(j.db.pragma('page_count', { simple: true }))
+      const first = j.enforceStorageCeiling(1024 * 1024, 64)
+      const afterFirstPages = Number(j.db.pragma('page_count', { simple: true }))
+      expect(first).toMatchObject({ action: 'incremental-vacuum', withinTarget: false })
+      expect(beforePages - afterFirstPages).toBeGreaterThan(0)
+      expect(beforePages - afterFirstPages).toBeLessThanOrEqual(64)
+
+      let cycles = 1
+      let result = first
+      while (!result.withinTarget && cycles < 100) {
+        result = j.enforceStorageCeiling(1024 * 1024, 64)
+        cycles += 1
+      }
+      expect(result.withinTarget).toBe(true)
+      expect(cycles).toBeGreaterThan(1)
+      expect(cycles).toBeLessThan(100)
+      expect(j.enforceStorageCeiling(1024 * 1024, 64)).toMatchObject({ action: 'none' })
     } finally {
       j.db.close()
     }

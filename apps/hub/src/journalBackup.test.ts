@@ -9,7 +9,13 @@ import { performance } from 'node:perf_hooks'
 import { pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Journal } from './journal.js'
-import { createJournalBackupSupervisor, snapshotJournal, type SnapshotResult } from './journalBackup.js'
+import {
+  createJournalBackupSupervisor,
+  pruneJournalBackupGenerations,
+  sizeAwareJournalBackupIntervalMs,
+  snapshotJournal,
+  type SnapshotResult,
+} from './journalBackup.js'
 
 /**
  * The operator's journal was corrupted twice in two days and truncated once, and the only copy that saved
@@ -411,6 +417,47 @@ async function interruptSnapshotInChild(backups: string): Promise<string> {
 }
 
 describe('journal snapshots', () => {
+  it('uses a size-aware cadence instead of copying a multi-gigabyte journal every 30 minutes', () => {
+    expect(sizeAwareJournalBackupIntervalMs(128 * 1024 * 1024)).toBe(30 * 60 * 1000)
+    expect(sizeAwareJournalBackupIntervalMs(1024 * 1024 * 1024)).toBe(2 * 60 * 60 * 1000)
+    expect(sizeAwareJournalBackupIntervalMs(3 * 1024 * 1024 * 1024)).toBe(6 * 60 * 60 * 1000)
+  })
+
+  it('reuses a recent verified lineage generation on activation', async () => {
+    const root = tmp()
+    const journal = makeJournal(root, 5)
+    const backups = path.join(root, 'backups')
+    const first = await snapshotJournal(journal.db, { dir: backups, recoveryDataDir: root })
+    const second = await snapshotJournal(journal.db, {
+      dir: backups,
+      recoveryDataDir: root,
+      minimumSnapshotAgeMs: 60_000,
+    })
+
+    expect(first).toMatchObject({ ok: true })
+    expect(second).toMatchObject({ ok: true, skipped: true, file: first.file })
+    expect(fs.readdirSync(backups).filter((name) => name.endsWith('.db'))).toHaveLength(1)
+  })
+
+  it('prunes a legacy backup pile idempotently without touching the newest evidence', () => {
+    const root = tmp()
+    const backups = path.join(root, 'backups')
+    fs.mkdirSync(backups, { recursive: true })
+    for (const stamp of ['01', '02', '03', '04']) {
+      const name = `hub-2026-08-14T00-00-${stamp}.db`
+      fs.writeFileSync(path.join(backups, name), Buffer.alloc(12))
+      fs.writeFileSync(path.join(backups, `${name}-wal`), Buffer.alloc(0))
+    }
+
+    pruneJournalBackupGenerations(backups, 2, 1024)
+    pruneJournalBackupGenerations(backups, 2, 1024)
+    expect(fs.readdirSync(backups).filter((name) => name.endsWith('.db')).sort()).toEqual([
+      'hub-2026-08-14T00-00-03.db',
+      'hub-2026-08-14T00-00-04.db',
+    ])
+    expect(fs.readdirSync(backups).some((name) => name.includes('01.db'))).toBe(false)
+  })
+
   it('writes a verified snapshot containing the journal contents', async () => {
     const root = tmp()
     const journal = makeJournal(root, 40)
@@ -495,6 +542,9 @@ describe('journal snapshots', () => {
     const root = tmp()
     const journal = makeJournal(root, 10)
     const backups = path.join(root, 'backups')
+    for (let i = 0; i < 256; i++) {
+      journal.append('busy', 'test/large-event', { i, payload: 'x'.repeat(32 * 1024) })
+    }
 
     const writing = setInterval(() => journal.append('busy', 'test/event', { t: Date.now() }), 1)
     let result
@@ -504,11 +554,83 @@ describe('journal snapshots', () => {
       clearInterval(writing)
     }
     expect(result.ok).toBe(true)
+    expect(result.copyTelemetry).toMatchObject({
+      stableReadSnapshot: true,
+      restarts: 0,
+      totalPages: expect.any(Number),
+      pagesTransferred: expect.any(Number),
+    })
+    expect(result.copyTelemetry?.pagesTransferred).toBeLessThanOrEqual(
+      result.copyTelemetry?.totalPages ?? 0,
+    )
 
     const Database = (await import('better-sqlite3')).default
     const copy = new Database(result.file as string, { readonly: true })
     expect(copy.pragma('quick_check')).toEqual([{ quick_check: 'ok' }])
     copy.close()
+  })
+
+  it('aborts and cleans a copy that repeatedly restarts instead of transferring without a bound', async () => {
+    const root = tmp()
+    const journal = makeJournal(root, 1)
+    const backups = path.join(root, 'backups')
+    const restartLoop = {
+      prepare: (sql: string) => journal.db.prepare(sql),
+      backup: async (
+        target: string,
+        options: { progress: (state: { totalPages: number; remainingPages: number }) => number },
+      ) => {
+        fs.writeFileSync(target, 'incomplete')
+        for (const remainingPages of [50, 90, 40, 95]) {
+          options.progress({ totalPages: 100, remainingPages })
+        }
+      },
+    } as unknown as typeof journal.db
+
+    const result = await snapshotJournal(restartLoop, {
+      dir: backups,
+      maxCopyRestarts: 1,
+      maxCopyWorkRatio: 3,
+    })
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/restart budget/i),
+      copyTelemetry: {
+        totalPages: 100,
+        restarts: 2,
+        stableReadSnapshot: false,
+      },
+    })
+    expect(fs.readdirSync(backups).filter((name) => name.includes('.partial'))).toEqual([])
+  })
+
+  it('aborts and cleans a copy that exceeds its wall-clock budget', async () => {
+    const root = tmp()
+    const journal = makeJournal(root, 1)
+    const backups = path.join(root, 'backups')
+    const stalledCopy = {
+      prepare: (sql: string) => journal.db.prepare(sql),
+      backup: async (
+        target: string,
+        options: { progress: (state: { totalPages: number; remainingPages: number }) => number },
+      ) => {
+        fs.writeFileSync(target, 'incomplete')
+        const until = performance.now() + 5
+        while (performance.now() < until) {
+          // Deliberately consume the tiny test budget before the next native progress callback.
+        }
+        options.progress({ totalPages: 100, remainingPages: 90 })
+      },
+    } as unknown as typeof journal.db
+
+    const result = await snapshotJournal(stalledCopy, { dir: backups, maxCopyWallMs: 1 })
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/wall-clock budget/i),
+    })
+    expect(fs.readdirSync(backups).filter((name) => name.includes('.partial'))).toEqual([])
   })
 
   it('DISCARDS a snapshot that fails verification instead of keeping it', async () => {

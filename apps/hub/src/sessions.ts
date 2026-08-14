@@ -177,7 +177,7 @@ import {
 } from './attachments.js'
 
 /** Bump whenever an existing Overseer conversation must receive a new app/tool operating contract. */
-export const OVERSEER_CAPABILITY_VERSION = 16
+export const OVERSEER_CAPABILITY_VERSION = 17
 /** Bump when existing manager conversations need a rematerialized team-management contract. */
 export const MANAGER_TEAM_CAPABILITY_VERSION = 6
 const MAX_MANAGER_TEAMS = 32
@@ -634,6 +634,7 @@ function commandOutputDelta(payload: unknown): PendingCommandOutputDelta['payloa
 
 export class SessionManager {
   private readonly sessions = new Map<string, SessionRecord>()
+  private durableCapabilityUpgrade: Promise<void> | undefined
   /** Browser-imported attachment ids visible to browser_download_read during this hub lifetime. */
   private readonly browserDownloadAttachments = new Map<string, Set<string>>()
   // Per-session set of memory ids already auto-recalled into context, so the same memory isn't
@@ -3955,7 +3956,6 @@ export class SessionManager {
       // A normal/cold hub already owns the public role; a booting green passes reconcile:false and must
       // remain read-only until promote() calls reconcileStale after winning the listener handoff.
       if (opts?.reconcile !== false) {
-        this.upgradeDurableSessionCapabilities()
         this.reconcileInterruptedTestbedRuns()
       }
       return
@@ -3971,56 +3971,66 @@ export class SessionManager {
     for (const record of this.store.all()) this.sessions.set(record.id, record)
   }
 
-  private upgradeOverseerSessions(): void {
-    for (const record of this.sessions.values()) this.upgradeOverseerCapabilities(record)
+  private async upgradeManagerTeamSession(record: SessionRecord): Promise<void> {
+    if (record.isProjectManager !== true) return
+    this.ensureManagerTeams(record, 'Team 1', undefined, 'upgrade')
+    const managerTools = normalizeManagerToolGrants(record.managerAllowedTools ?? [])
+    let changed = JSON.stringify(managerTools) !== JSON.stringify(record.managerAllowedTools ?? [])
+    record.managerAllowedTools = managerTools.length ? managerTools : undefined
+    const migratedChildren: string[] = []
+    for (const child of this.managerChildren(record.id)) {
+      const childTools = normalizeManagerToolGrants(child.delegatedTools ?? [])
+      if (JSON.stringify(childTools) === JSON.stringify(child.delegatedTools ?? [])) continue
+      child.delegatedTools = childTools.length ? childTools : undefined
+      this.persist(child)
+      this.materializeSessionInstructions(child)
+      migratedChildren.push(child.id)
+      changed = true
+      await new Promise<void>((resolve) => setImmediate(resolve))
+    }
+    if (!changed) return
+    this.persist(record)
+    this.materializeSessionInstructions(record)
+    this.journal.append(record.id, 'manager/capability-grants-migrated', {
+      managerSessionId: record.id,
+      managerCapabilities: record.managerAllowedTools ?? [],
+      migratedChildSessionIds: migratedChildren,
+    })
   }
 
-  private upgradeManagerTeamSessions(): void {
-    for (const record of this.sessions.values()) {
-      if (record.isProjectManager !== true) continue
-      this.ensureManagerTeams(record, 'Team 1', undefined, 'upgrade')
-      const managerTools = normalizeManagerToolGrants(record.managerAllowedTools ?? [])
-      let changed = JSON.stringify(managerTools) !== JSON.stringify(record.managerAllowedTools ?? [])
-      record.managerAllowedTools = managerTools.length ? managerTools : undefined
-      const migratedChildren: string[] = []
-      for (const child of this.managerChildren(record.id)) {
-        const childTools = normalizeManagerToolGrants(child.delegatedTools ?? [])
-        if (JSON.stringify(childTools) === JSON.stringify(child.delegatedTools ?? [])) continue
-        child.delegatedTools = childTools.length ? childTools : undefined
-        this.persist(child)
-        this.materializeSessionInstructions(child)
-        migratedChildren.push(child.id)
-        changed = true
+  /**
+   * Versioned instruction/config migrations are durable maintenance, not a listener-readiness gate.
+   * Running the former all-session sweep synchronously inside boot repeatedly starved the 1s supervisor
+   * liveness lease on a multi-GB journal; each killed attempt landed a few more upgrades until one finally
+   * finished. Work one session at a time after readiness and yield between each durable unit.
+   */
+  upgradeDurableSessionCapabilitiesPostReady(): Promise<void> {
+    if (this.durableCapabilityUpgrade) return this.durableCapabilityUpgrade
+    const task = (async () => {
+      for (const record of [...this.sessions.values()]) {
+        this.upgradeOverseerCapabilities(record)
+        await this.upgradeManagerTeamSession(record)
+        this.upgradeProjectReplicaSession(record)
+        await new Promise<void>((resolve) => setImmediate(resolve))
       }
-      if (!changed) continue
-      this.persist(record)
-      this.materializeSessionInstructions(record)
-      this.journal.append(record.id, 'manager/capability-grants-migrated', {
-        managerSessionId: record.id,
-        managerCapabilities: record.managerAllowedTools ?? [],
-        migratedChildSessionIds: migratedChildren,
-      })
-    }
+    })()
+    const settled = task.finally(() => {
+      if (this.durableCapabilityUpgrade === settled) this.durableCapabilityUpgrade = undefined
+    })
+    this.durableCapabilityUpgrade = settled
+    return this.durableCapabilityUpgrade
   }
 
-  private upgradeDurableSessionCapabilities(): void {
-    this.upgradeOverseerSessions()
-    this.upgradeManagerTeamSessions()
-    this.upgradeProjectReplicaSessions()
-  }
-
-  private upgradeProjectReplicaSessions(): void {
-    for (const record of this.sessions.values()) {
-      if (!record.projectId || record.projectReplicaId) continue
-      const primary = this.projects.primaryReplica(record.projectId)
-      if (!primary) continue
-      record.projectReplicaId = primary.id
-      this.persist(record)
-      this.journal.append(record.id, 'session/project-replica-upgraded', {
-        projectId: record.projectId,
-        projectReplicaId: primary.id,
-      })
-    }
+  private upgradeProjectReplicaSession(record: SessionRecord): void {
+    if (!record.projectId || record.projectReplicaId) return
+    const primary = this.projects.primaryReplica(record.projectId)
+    if (!primary) return
+    record.projectReplicaId = primary.id
+    this.persist(record)
+    this.journal.append(record.id, 'session/project-replica-upgraded', {
+      projectId: record.projectId,
+      projectReplicaId: primary.id,
+    })
   }
 
   private reconcileInterruptedTestbedRuns(): void {
@@ -4092,8 +4102,7 @@ export class SessionManager {
    *  FLAG-OFF (in-process) is byte-identical: the blunt sweep below runs exactly as it always has. */
   reconcileStale(): void {
     // This method runs only for the current public owner: at ordinary boot, or synchronously after a
-    // green hub wins promote(). Keep all versioned Overseer writes on this side of the ownership fence.
-    this.upgradeDurableSessionCapabilities()
+    // green hub wins promote(). Versioned instruction/config writes run separately after readiness.
     this.reconcileInterruptedTestbedRuns()
     if (this.workerMode) {
       void this.attachWorker().catch((err) => console.warn(`[hub] attachWorker (reconcileStale) failed: ${err instanceof Error ? err.message : String(err)}`))
@@ -4780,6 +4789,7 @@ export class SessionManager {
           '',
           'You are the operator-designated AllMyAgents Overseer. You are attached to the application rather than one project.',
           `Overseer capability manifest version ${record.overseerCapabilityVersion ?? OVERSEER_CAPABILITY_VERSION}. The current hub injects the current AllMyAgents tool surface on each new turn; preserve this conversation and use the live tool schema rather than relying on an older remembered list.`,
+          'Delegate bounded implementation work to the real AllMyAgents agent that owns the relevant project or subsystem; your role is to decompose, route, coordinate, inspect, verify, and report across the application. Shipping code remains the owning agent\'s responsibility even when you have already diagnosed the defect and could write the patch faster. Use your own shell and control-plane authority for application-level diagnosis, recovery, and operator-requested administration, not to create concurrent unowned edits in another agent\'s checkout.',
           'Use mcp__allmyagents__overseer_control as your primary application control plane. For the fleet, call operation "status"; for any agent in any project, call operation "failure_context" with its session id. For a quick read-only check, mcp__allmyagents__list_agents and mcp__allmyagents__peek_agent are fleet-wide for you, including stopped and cross-project chats. Do not use the vendor-native list_agents or peek_agent tools for the AllMyAgents fleet: those describe vendor subagents and remain project/subagent-scoped.',
           'For operational coordination, call mcp__allmyagents__query_team for a bounded non-destructive view of the selected sessions\' messages, tasks, pending approvals, and durable runs. Use filters and the returned message cursor rather than scanning the whole journal. Run important local or granted-remote builds, tests, lints, benchmarks, and deploys through mcp__allmyagents__start_run; for application-level local work, supply an explicit absolute working_directory instead of inventing a project association. Retain its run id and read bounded log pages with mcp__allmyagents__inspect_runs. Distinct checkout/root/GPU/port resource keys can run concurrently; shared keys serialize. Never blindly retry outcome_unknown because the prior command may have completed.',
           'You have two ways to reach another chat and they are not interchangeable. mcp__allmyagents__send_message is the teammate bus: it carries peer authority, so the hub may hold it for an idle high-context recipient rather than spend an expensive wake. overseer_control operation "send_chat" is the operator-origin path and starts an idle chat\'s turn immediately. Choose by whose authority the message carries, not by the verb the two tools share. When the operator has told you to hand work to a named agent, a held bus message is not a blocker and must never be reported to the operator as one: start the turn with "send_chat" on that same direct operator turn. If the recipient is near its context ceiling, write the durable detail to a file it can read after compaction and keep the message itself short.',

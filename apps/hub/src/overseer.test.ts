@@ -94,7 +94,7 @@ function harness() {
 }
 
 describe('application Overseer authority', () => {
-  it('upgrades an existing durable Overseer in place exactly once', () => {
+  it('upgrades an existing durable Overseer in place exactly once after readiness', async () => {
     const h = harness()
     h.store.upsert({
       id: 'legacy-overseer',
@@ -115,16 +115,21 @@ describe('application Overseer authority', () => {
     expect(h.journal.recentEventsForSession('legacy-overseer', 20)).toEqual([])
 
     h.sessions.reconcileStale()
+    expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
+      overseerCapabilityVersion: 6,
+      permissionMode: 'safe',
+    })
+    await h.sessions.upgradeDurableSessionCapabilitiesPostReady()
 
     expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
       isOverseer: true,
-      overseerCapabilityVersion: 16,
+      overseerCapabilityVersion: 17,
       permissionMode: 'full',
       permissionModeOperatorOverride: true,
       role: 'Application Overseer',
     })
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
-      'Overseer capability manifest version 16',
+      'Overseer capability manifest version 17',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'mcp__allmyagents__overseer_control',
@@ -150,12 +155,15 @@ describe('application Overseer authority', () => {
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'Do not use the vendor-native list_agents or peek_agent',
     )
+    expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
+      'Shipping code remains the owning agent\'s responsibility',
+    )
     const upgrades = () => h.journal.recentEventsForSession('legacy-overseer', 20)
       .filter((event) => event.kind === 'overseer/capabilities-upgraded')
     expect(upgrades()).toHaveLength(1)
     expect(upgrades()[0]?.payload).toMatchObject({
       fromVersion: 6,
-      toVersion: 16,
+      toVersion: 17,
       conversationPreserved: true,
       tools: expect.arrayContaining([
         'overseer_control',
@@ -168,6 +176,7 @@ describe('application Overseer authority', () => {
     })
 
     h.sessions.reconcileStale()
+    await h.sessions.upgradeDurableSessionCapabilitiesPostReady()
     expect(upgrades()).toHaveLength(1)
   })
 
