@@ -184,6 +184,9 @@ describe('journal payload bulk defense', () => {
       }
       expect(complete).toBe(true)
       expect(j.since(0)).toHaveLength(12)
+      // Ordinary maintenance records compact lifecycle rows after the migration cursor reaches its
+      // target. Those small rows must not manufacture a false "projection incomplete" refusal.
+      j.append(null, 'journal/compaction-progress', { detail: 'payload projection current' })
       const enforcement = j.enforceStorageCeiling(before - 1)
       expect(enforcement).toMatchObject({ action: 'full-vacuum', withinTarget: true })
       expect(j.enforceStorageCeiling(before - 1)).toMatchObject({

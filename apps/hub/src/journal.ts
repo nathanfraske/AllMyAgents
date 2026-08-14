@@ -3318,10 +3318,24 @@ export class Journal extends EventEmitter {
     const cursor = Number(this.db.prepare(
       'SELECT scanned_through FROM journal_blob_migration_state WHERE singleton = 1',
     ).pluck().get())
-    const highWater = Number(this.db.prepare('SELECT COALESCE(MAX(seq), 0) FROM events').pluck().get())
-    if (!Number.isSafeInteger(cursor) || !Number.isSafeInteger(highWater) || cursor < highWater) {
+    const pendingOversizedSeq = this.db.prepare(
+      `SELECT seq
+       FROM events
+       WHERE seq > ? AND length(CAST(payload AS BLOB)) >= ?
+       ORDER BY seq
+       LIMIT 1`,
+    ).pluck().get(cursor, JOURNAL_BLOB_INLINE_LIMIT_BYTES)
+    if (
+      !Number.isSafeInteger(cursor) ||
+      (pendingOversizedSeq !== undefined &&
+        (!Number.isSafeInteger(pendingOversizedSeq) || Number(pendingOversizedSeq) <= cursor))
+    ) {
+      throw new Error('journal payload projection state is invalid')
+    }
+    if (pendingOversizedSeq !== undefined) {
       throw new Error(
-        `journal storage enforcement requires payload projection through ${highWater}; reached ${cursor}`,
+        `journal storage enforcement found an oversized payload at ${String(pendingOversizedSeq)} ` +
+        `after projection cursor ${cursor}`,
       )
     }
     const bytesBefore = this.databasePageBytes()
