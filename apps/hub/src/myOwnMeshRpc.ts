@@ -81,11 +81,17 @@ function safeLabel(value: unknown, fallback: string): string {
   return label && label.length <= 200 && !/[\u0000-\u001f\u007f]/u.test(label) ? label : fallback
 }
 
-function defaultSocketPath(): string {
-  if (process.env.MYOWNMESH_CONTROL_SOCKET?.trim()) return process.env.MYOWNMESH_CONTROL_SOCKET.trim()
-  if (process.platform === 'win32') return '\\\\.\\pipe\\myownmesh.sock'
-  const home = process.env.MYOWNMESH_HOME?.trim() || os.homedir()
-  return path.join(home, process.env.MYOWNMESH_HOME?.trim() ? 'daemon.sock' : '.myownmesh', 'daemon.sock')
+export function defaultMyOwnMeshSocketPath(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+  homeDirectory = os.homedir(),
+): string {
+  if (env.MYOWNMESH_CONTROL_SOCKET?.trim()) return env.MYOWNMESH_CONTROL_SOCKET.trim()
+  if (platform === 'win32') return '\\\\.\\pipe\\myownmesh.sock'
+  const configuredHome = env.MYOWNMESH_HOME?.trim()
+  return configuredHome
+    ? path.join(configuredHome, 'daemon.sock')
+    : path.join(homeDirectory, '.myownmesh', 'daemon.sock')
 }
 
 function responseError(response: MyOwnMeshControlResponse, operation: string): Error {
@@ -96,7 +102,7 @@ function responseError(response: MyOwnMeshControlResponse, operation: string): E
 export function myOwnMeshControlRequest<T = unknown>(
   request: Record<string, unknown>,
   timeoutMs = 10_000,
-  socketPath = defaultSocketPath(),
+  socketPath = defaultMyOwnMeshSocketPath(),
 ): Promise<MyOwnMeshControlResponse<T>> {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(socketPath)
@@ -136,9 +142,13 @@ export function myOwnMeshControlRequest<T = unknown>(
   })
 }
 
-function allMyStuffPeer(peer: MyOwnMeshPeer): boolean {
+function applicationPeer(peer: MyOwnMeshPeer): boolean {
   const tags = peer.capabilities?.tags
-  return Array.isArray(tags) && tags.some((tag) => typeof tag === 'string' && tag.toLowerCase() === 'allmystuff')
+  return Array.isArray(tags) && tags.some((tag) => {
+    if (typeof tag !== 'string') return false
+    const normalized = tag.toLowerCase()
+    return normalized === 'allmystuff' || normalized === 'allmyagents-testbed'
+  })
 }
 
 function helperNetwork(candidate: MyOwnMeshNetworkCandidate): boolean {
@@ -152,10 +162,10 @@ function fleetNetworkScore(candidate: MyOwnMeshNetworkCandidate): number {
   let score = candidate.phase === 'active' ? 10 : 0
   if (label.includes('fleet')) score += 100
   if (label.includes('allmystuff')) score += 30
-  score += peers.filter(allMyStuffPeer).length * 25
+  score += peers.filter(applicationPeer).length * 25
   // Reachability is more important than a cosmetic network name. In particular, a network named
   // "Fleet" must not win when the requested machine is pending there but active on another owned mesh.
-  score += peers.filter((peer) => allMyStuffPeer(peer) && peer.status === 'active').length * 100
+  score += peers.filter((peer) => applicationPeer(peer) && peer.status === 'active').length * 100
   return score
 }
 
@@ -166,7 +176,7 @@ function fleetNetworkScore(candidate: MyOwnMeshNetworkCandidate): number {
  */
 export function selectFleetNetworks(candidates: MyOwnMeshNetworkCandidate[]): MyOwnMeshNetworkCandidate[] {
   return candidates
-    .filter((candidate) => !helperNetwork(candidate) && (candidate.peers ?? []).some(allMyStuffPeer))
+    .filter((candidate) => !helperNetwork(candidate) && (candidate.peers ?? []).some(applicationPeer))
     .map((candidate) => ({ candidate, score: fleetNetworkScore(candidate) }))
     .sort((left, right) => right.score - left.score)
     .map(({ candidate }) => candidate)
@@ -190,7 +200,7 @@ export function mergeFleetPeers(candidates: MyOwnMeshNetworkCandidate[]): Direct
   const merged = new Map<string, MyOwnMeshPeer>()
   for (const candidate of candidates) {
     for (const peer of candidate.peers ?? []) {
-      if (!allMyStuffPeer(peer)) continue
+      if (!applicationPeer(peer)) continue
       const siteId = canonicalDevice(peer.device_id)
       if (!siteId) continue
       const current = merged.get(siteId)
@@ -222,7 +232,7 @@ export function selectPeerNetwork(
     .map((candidate, order) => ({
       candidate,
       order,
-      peer: (candidate.peers ?? []).find((peer) => allMyStuffPeer(peer) && canonicalDevice(peer.device_id) === wanted),
+      peer: (candidate.peers ?? []).find((peer) => applicationPeer(peer) && canonicalDevice(peer.device_id) === wanted),
     }))
     .filter((entry) => entry.peer?.status === 'active')
     .sort((left, right) => {
@@ -252,7 +262,7 @@ export class MyOwnMeshRpcBridge {
 
   constructor(
     private readonly request: MyOwnMeshControlRequest = myOwnMeshControlRequest,
-    private readonly socketPath = defaultSocketPath(),
+    private readonly socketPath = defaultMyOwnMeshSocketPath(),
     private readonly method = DEFAULT_METHOD,
   ) {}
 
@@ -298,13 +308,24 @@ export class MyOwnMeshRpcBridge {
     this.handler = handler
   }
 
-  async start(handler?: DirectMeshHandler): Promise<void> {
+  async start(
+    handler?: DirectMeshHandler,
+    options: { requireConnection?: boolean } = {},
+  ): Promise<void> {
     if (handler) this.handler = handler
     if (!this.handler) throw new Error('A direct mesh RPC handler must be configured before start.')
     this.stopped = false
     this.unavailableReason = 'connecting'
     this.unavailableError = undefined
     await this.connectInbound()
+    if (options.requireConnection && this.eventSockets.size === 0) {
+      const status = this.status()
+      this.stop()
+      throw new Error(
+        status.error ||
+          `MyOwnMesh direct RPC did not open an inbound route (${status.reason ?? 'unavailable'}).`,
+      )
+    }
   }
 
   stop(): void {
@@ -405,7 +426,11 @@ export class MyOwnMeshRpcBridge {
     for (const [network, socket] of this.eventSockets) {
       if (!desired.has(network)) socket.destroy()
     }
-    await Promise.allSettled(networks.map((network) => this.connectInboundNetwork(network.config_id)))
+    const results = await Promise.allSettled(
+      networks.map((network) => this.connectInboundNetwork(network.config_id)),
+    )
+    // Each failed socket records a typed unavailable reason. The hub remains fail-soft and retries in
+    // the background; callers that require a live lane (the lightweight node) use requireConnection.
   }
 
   private async connectInboundNetwork(network: string): Promise<void> {

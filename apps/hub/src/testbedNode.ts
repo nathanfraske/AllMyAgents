@@ -21,12 +21,12 @@ export interface TestbedNodeConfig {
   version: 1
   profile: TestbedNodeProfile
   configuredAt: string
+  /** Opt-in only: fleet roster membership must never silently become machine execution authority. */
+  fleetTrustExchange?: boolean
   roots: Array<Pick<DeviceRootPolicy, 'label' | 'path' | 'environment' | 'read' | 'write' | 'terminal'>>
 }
 
-interface FleetRosterMember {
-  device: string
-}
+interface FleetRosterMember { device: string }
 
 const SERVICE_NAME = 'AllMyAgentsTestbed'
 const AUDIT_MAX_BYTES = 5 * 1024 * 1024
@@ -185,6 +185,7 @@ function normalizeProfile(value: unknown): TestbedNodeProfile {
 export function configureTestbedNode(input: {
   dataDir: string
   profile: TestbedNodeProfile
+  fleetTrustExchange?: boolean
   roots?: Array<Pick<DeviceRootPolicy, 'label' | 'path' | 'environment' | 'read' | 'write' | 'terminal'>>
 }): TestbedNodeConfig {
   const dataDir = path.resolve(input.dataDir)
@@ -200,6 +201,7 @@ export function configureTestbedNode(input: {
     version: 1,
     profile,
     configuredAt: new Date().toISOString(),
+    ...(input.fleetTrustExchange === true ? { fleetTrustExchange: true } : {}),
     roots: capabilities.roots.map(({ id: _id, ...root }) => root),
   }
   atomicJson(configFile(dataDir), config)
@@ -214,7 +216,13 @@ export function readTestbedNodeConfig(dataDir: string): TestbedNodeConfig {
   const value = JSON.parse(fs.readFileSync(configFile(path.resolve(dataDir)), 'utf8')) as Partial<TestbedNodeConfig>
   const profile = normalizeProfile(value.profile)
   if (value.version !== 1 || !Array.isArray(value.roots)) throw new Error('testbed node configuration is invalid')
-  return { version: 1, profile, configuredAt: boundedString(value.configuredAt, 'configuredAt', 100), roots: value.roots }
+  return {
+    version: 1,
+    profile,
+    configuredAt: boundedString(value.configuredAt, 'configuredAt', 100),
+    ...(value.fleetTrustExchange === true ? { fleetTrustExchange: true } : {}),
+    roots: value.roots,
+  }
 }
 
 function pairingClaimFile(dataDir: string): string {
@@ -255,13 +263,42 @@ function redeemPairingCode(dataDir: string, supplied: string, now = new Date()):
 }
 
 async function ownedRoster(): Promise<FleetRosterMember[]> {
-  const response = await myOwnMeshControlRequest<{ members?: unknown }>({ op: 'owned_roster' }, 5_000).catch(() => null)
-  const members = response?.ok ? response.data?.members : undefined
+  const response = await myOwnMeshControlRequest<{ members?: unknown; roster?: unknown }>({
+    op: 'roster_list',
+  }, 5_000).catch(() => null)
+  const members = response?.ok ? (response.data?.members ?? response.data?.roster) : undefined
   if (!Array.isArray(members)) return []
   return members.flatMap((raw) => {
-    const device = (raw as { device?: unknown }).device
+    const candidate = raw as { device?: unknown; device_id?: unknown; id?: unknown }
+    const device = candidate.device ?? candidate.device_id ?? candidate.id
     return typeof device === 'string' && device ? [{ device }] : []
   })
+}
+
+async function advertiseTestbedCapabilities(): Promise<void> {
+  const listed = await myOwnMeshControlRequest<{
+    networks?: Array<{ config_id?: unknown; phase?: unknown }>
+  }>({ op: 'networks_list' }, 5_000)
+  if (!listed.ok) throw new Error(listed.error || 'MyOwnMesh network discovery failed')
+  const networks = (listed.data?.networks ?? []).flatMap((network) =>
+    typeof network.config_id === 'string' && network.config_id
+      ? [network.config_id]
+      : [],
+  )
+  if (networks.length === 0) throw new Error('MyOwnMesh has no network on which to advertise the testbed')
+  const outcomes = await Promise.all(networks.map((network) =>
+    myOwnMeshControlRequest({
+      op: 'capabilities_set',
+      network,
+      capabilities: {
+        app_version: 'allmyagents-testbed/1',
+        tags: ['allmyagents-testbed', 'terminal'],
+      },
+    }, 5_000).catch((error) => ({ ok: false, error: error instanceof Error ? error.message : String(error) })),
+  ))
+  if (!outcomes.some((outcome) => outcome.ok)) {
+    throw new Error(outcomes.map((outcome) => outcome.error).find(Boolean) || 'MyOwnMesh refused testbed capability advertisement')
+  }
 }
 
 function rosterContains(roster: readonly FleetRosterMember[], device: string): boolean {
@@ -291,6 +328,7 @@ export async function startTestbedNode(dataDirInput: string): Promise<{ stop: ()
     recentMessageIds.set(id, now)
   }
 
+  await advertiseTestbedCapabilities()
   await bridge.start(async ({ from, payload }) => {
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('direct testbed request is malformed')
     const request = payload as Record<string, unknown>
@@ -305,10 +343,10 @@ export async function startTestbedNode(dataDirInput: string): Promise<{ stop: ()
         throw new Error('pair exchange identity does not match the authenticated mesh peer')
       }
       const trust = request.kind === 'fleet_trust_exchange'
-        ? rosterContains(await ownedRoster(), from)
+        ? config.fleetTrustExchange === true && rosterContains(await ownedRoster(), from)
         : redeemPairingCode(dataDir, boundedString(request.code, 'pairing code', 16))
       if (!trust) throw new Error(request.kind === 'fleet_trust_exchange'
-        ? 'automatic testbed trust requires membership in the signed AllMyStuff fleet roster'
+        ? 'automatic fleet trust is disabled or the peer is not in the signed MyOwnMesh roster; use a one-use pairing code'
         : 'pairing code is invalid, expired, or already used')
       const identity = await bridge.identity()
       if (!identity) throw new Error('testbed node could not resolve its MyOwnMesh identity')
@@ -358,7 +396,7 @@ export async function startTestbedNode(dataDirInput: string): Promise<{ stop: ()
       bytes: result.bytes,
     })
     return result
-  })
+  }, { requireConnection: true })
   appendTestbedAudit(dataDir, 'node/started', { profile: config.profile, pid: process.pid })
   return {
     stop: () => {
@@ -506,7 +544,12 @@ export async function runTestbedNodeCli(args = process.argv.slice(2)): Promise<n
   const dataDir = path.resolve(cliValue(args, '--data-dir') ?? defaultDataDir())
   if (command === 'configure') {
     const profile = normalizeProfile(cliValue(args, '--profile') ?? 'scoped')
-    const config = configureTestbedNode({ dataDir, profile, roots: parseScopedRoots(args) })
+    const config = configureTestbedNode({
+      dataDir,
+      profile,
+      roots: parseScopedRoots(args),
+      fleetTrustExchange: args.includes('--trust-fleet'),
+    })
     process.stdout.write(`${JSON.stringify({ ok: true, dataDir, profile: config.profile, roots: config.roots.length })}\n`)
     return 0
   }
@@ -522,11 +565,22 @@ export async function runTestbedNodeCli(args = process.argv.slice(2)): Promise<n
   }
   if (command === 'run') {
     const runtime = await startTestbedNode(dataDir)
-    const stop = (): void => { runtime.stop(); process.exitCode = 0 }
-    process.once('SIGINT', stop)
-    process.once('SIGTERM', stop)
     process.stdout.write(`${JSON.stringify({ ok: true, status: 'running', dataDir, pid: process.pid })}\n`)
-    return await new Promise<number>(() => { /* Kept alive by the MyOwnMesh event socket. */ })
+    return await new Promise<number>((resolve) => {
+      // A pending Promise is not an event-loop resource. Keep an explicit referenced lease so a future
+      // bridge regression cannot print "running" and then let the process exit cleanly underneath it.
+      const lease = setInterval(() => {}, 60_000)
+      let stopped = false
+      const stop = (): void => {
+        if (stopped) return
+        stopped = true
+        clearInterval(lease)
+        runtime.stop()
+        resolve(0)
+      }
+      process.once('SIGINT', stop)
+      process.once('SIGTERM', stop)
+    })
   }
   process.stderr.write('Usage: testbedNode <configure|pair-code|install-elevated|run> [--data-dir PATH] [--profile PROFILE] [--root PATH] [--read] [--write] [--terminal]\n')
   return 2
