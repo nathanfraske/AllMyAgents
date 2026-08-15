@@ -496,20 +496,92 @@ describe('SessionManager mid-turn steering', () => {
     expect([...journal.replay(0)].some((event) => event.kind === 'session/input' && (event.payload as { text?: string }).text === 'correct the instruction')).toBe(true)
   })
 
-  it('visibly preserves the authority boundary when operator guidance steers a non-operator turn', async () => {
-    const { sessions, journal, steer } = build()
+  it('keeps the live bus turn clamped and executes deferred operator authority once on a fresh turn', async () => {
+    let busy = true
+    let sessionsUnderTest: SessionManager | undefined
+    const mutationResults: Array<Awaited<ReturnType<SessionManager['overseerControl']>>> = []
+    const { sessions, journal, store, record, steer, runTurn } = build({
+      isBusy: () => busy,
+      runTurn: async (_spec, text, origin) => {
+        expect(origin).toBe('operator')
+        expect(text).toBe('configure the manager now')
+        mutationResults.push(await sessionsUnderTest!.overseerControl('s1', {
+          operation: 'configure_github_automation',
+          githubScope: 'session',
+          sessionId: 's1',
+          githubCapabilities: ['pull_requests'],
+        }))
+      },
+    })
+    sessionsUnderTest = sessions
+    record.isOverseer = true
+    store.upsert(record)
     ;(sessions as unknown as { busTurnSessions: Set<string> }).busTurnSessions.add('s1')
 
+    const deniedDuringBusTurn = await sessions.overseerControl('s1', {
+      operation: 'configure_github_automation',
+      githubScope: 'session',
+      sessionId: 's1',
+      githubCapabilities: ['pull_requests'],
+    })
+    expect(deniedDuringBusTurn).toMatchObject({ ok: false })
     await sessions.send('s1', 'configure the manager now')
 
     expect(steer).toHaveBeenCalledOnce()
     expect(steer.mock.calls[0]![1]).toContain('configure the manager now')
-    expect(steer.mock.calls[0]![1]).toContain('does not confer operator mutation or approval authority')
     expect(journal.since(0)).toContainEqual(expect.objectContaining({
       sessionId: 's1',
-      kind: 'session/operator-authority-not-conferred',
+      kind: 'session/operator-turn-deferred',
     }))
+    expect(store.all().find((candidate) => candidate.id === 's1')?.deferredOperatorTurns).toHaveLength(1)
     expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(false)
+
+    busy = false
+    sessions.applyLifecycle({ t: 'turnCompleted', sessionId: 's1', wseq: 1 })
+    await vi.waitFor(() => expect(runTurn).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(mutationResults).toEqual([expect.objectContaining({ ok: true })]))
+
+    expect(
+      journal.since(0).filter((event) =>
+        event.kind === 'session/input' &&
+        (event.payload as { text?: string }).text === 'configure the manager now'
+      ),
+    ).toHaveLength(1)
+    expect(
+      journal.since(0).filter((event) => event.kind === 'github-automation/policy-configured'),
+    ).toHaveLength(1)
+    expect(journal.lastTurnOrigin('s1')).toBe('operator')
+    expect(record.deferredOperatorTurns).toBeUndefined()
+  })
+
+  it('never retries an authorized deferred turn whose prior dispatch outcome is unknown', async () => {
+    const { sessions, journal, store, record, runTurn } = build({ isBusy: () => false })
+    record.status = 'idle'
+    record.deferredOperatorTurns = [{
+      id: 'deferred-crossing-restart',
+      text: 'perform the authorized mutation once',
+      attachmentIds: [],
+      override: {},
+      queuedAt: '2026-08-15T00:00:00.000Z',
+      state: 'dispatching',
+      dispatchStartedAt: '2026-08-15T00:00:01.000Z',
+    }]
+    store.upsert(record)
+
+    ;(sessions as unknown as { deliverBus(sessionId: string): void }).deliverBus('s1')
+    await settle()
+
+    expect(runTurn).not.toHaveBeenCalled()
+    expect(record.deferredOperatorTurns).toBeUndefined()
+    expect(record.status).toBe('error')
+    expect(journal.since(0)).toContainEqual(expect.objectContaining({
+      sessionId: 's1',
+      kind: 'session/operator-turn-dispatch-settled',
+      payload: expect.objectContaining({
+        deferredOperatorTurnId: 'deferred-crossing-restart',
+        outcome: 'outcome_unknown',
+      }),
+    }))
   })
 
   it('steers a framed bus message into a live turn without reclassifying that turn as bus-origin', async () => {

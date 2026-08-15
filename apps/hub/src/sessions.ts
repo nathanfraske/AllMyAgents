@@ -18,6 +18,7 @@ import type { WorkspaceManager } from './workspace.js'
 import type {
   ClaudeLimitInfo,
   ApprovalRecord,
+  DeferredOperatorTurn,
   DelegatedAuthority,
   HubEvent,
   ManagerAgentType,
@@ -610,6 +611,7 @@ export const MANAGER_STALL_MS = 5 * 60 * 1000
  *  cache rebuilds; Codex supplies a context window and is additionally protected near compaction. */
 export const BUS_WAKE_CONTEXT_TOKEN_LIMIT = 500_000
 export const BUS_WAKE_CONTEXT_RATIO_LIMIT = 0.8
+const MAX_DEFERRED_OPERATOR_TURNS = 32
 const MANAGER_ROSTER_DETAIL_LIMIT = 8
 const MANAGER_ROSTER_PATH_LIMIT = 12
 const MANAGER_ROSTER_MAX_CHARS = 8_000
@@ -734,6 +736,8 @@ export class SessionManager {
   private readonly operatorTurnSessions = new Set<string>()
   /** Bounded exactly-once admission for renderer/remote transport retries of operator input. */
   private readonly operatorInputRequests = new Map<string, { signature: string; promise: Promise<void> }>()
+  /** Process-local exclusion around the durable deferred-turn state machine. */
+  private readonly deferredOperatorDispatches = new Set<string>()
   // Planned restart freezes every NEW turn before unanswered Ask callbacks are settled. Existing turns may
   // continue to their exact captured terminal promise; queued operator/bus input remains durable and is
   // delivered only after rollback or by the promoted process.
@@ -1126,6 +1130,7 @@ export class SessionManager {
         this.setStatusById(msg.sessionId, 'active', replay)
         return
       case 'turnCompleted':
+        this.settleDeferredOperatorDispatch(msg.sessionId, 'completed')
         // The vendor thread id is still worth keeping even for a stopped chat: it is invisible state that
         // lets a later reopen resume the same conversation, not a claim about how the turn ended.
         if (msg.vendorSessionId) this.persistVendorSessionIdById(msg.sessionId, msg.vendorSessionId)
@@ -1133,6 +1138,7 @@ export class SessionManager {
         if (!replay) this.maybeFireDeferredRestart() // a turn boundary (§8.4): flip a deferred restart if idle
         return
       case 'turnError':
+        this.settleDeferredOperatorDispatch(msg.sessionId, 'failed')
         if (!replay) this.failTurn(msg.sessionId, msg.message)
         else if (!stopped) this.setStatusById(msg.sessionId, 'error', replay)
         // Still a turn boundary even when stopped — the turn really did end, so a deferred restart may go.
@@ -4259,6 +4265,11 @@ export class SessionManager {
         this.setStatus(record, 'idle')
       }
     }
+    for (const record of this.sessions.values()) {
+      if (record.status === 'idle' && record.deferredOperatorTurns?.length) {
+        setImmediate(() => this.deliverBus(record.id))
+      }
+    }
   }
 
   /** The durable exactly-once re-attach cursor for a session: the highest worker `wseq` already journaled,
@@ -4376,6 +4387,11 @@ export class SessionManager {
       if (liveSession.status !== 'idle' || record?.status !== 'idle') continue
       this.busNoticeTurns.delete(liveSession.sessionId) // the noticed turn is now conclusively over
       setImmediate(() => this.deliverBus(liveSession.sessionId))
+    }
+    for (const record of this.sessions.values()) {
+      if (record.status === 'idle' && record.deferredOperatorTurns?.length) {
+        setImmediate(() => this.deliverBus(record.id))
+      }
     }
   }
 
@@ -7487,29 +7503,73 @@ export class SessionManager {
       if (!this.steerMessagesAtToolBoundary()) throw new Error('a turn is already in progress')
       const attachments = this.attachmentsFor(record, attachmentIds)
       const carriesOperatorAuthority = this.operatorTurnSessions.has(sessionId)
-      const authorityNotice = carriesOperatorAuthority
-        ? ''
-        : '\n\n<<ALLMYAGENTS-AUTHORITY-NOTICE>>\nThis authenticated operator message arrived during an already-running non-operator turn. It is guidance, but it does not confer operator mutation or approval authority on this turn. If the requested action requires direct operator authority, say so clearly and ask the operator to resend after this turn becomes idle.\n<<END ALLMYAGENTS-AUTHORITY-NOTICE>>'
-      const steeredText = `${text}${authorityNotice}`
+      if (!carriesOperatorAuthority) {
+        const deferred = record.deferredOperatorTurns ?? []
+        if (deferred.length >= MAX_DEFERRED_OPERATOR_TURNS) {
+          throw new Error('too many operator turns are already queued for this session')
+        }
+        const queued: DeferredOperatorTurn = {
+          id: crypto.randomUUID(),
+          text,
+          attachmentIds: [...attachmentIds],
+          override: { ...override },
+          queuedAt: new Date().toISOString(),
+          state: 'pending',
+        }
+        record.deferredOperatorTurns = [...deferred, queued]
+        this.persist(record)
+        this.journal.append(sessionId, 'session/input', {
+          text,
+          attachments,
+          deferredOperatorTurnId: queued.id,
+        })
+        this.journal.append(sessionId, 'session/operator-turn-deferred', {
+          deferredOperatorTurnId: queued.id,
+          reason: 'operator input arrived during a non-operator turn',
+          queuedAt: queued.queuedAt,
+        })
+        this.journal.append(sessionId, 'session/operator-authority-not-conferred', {
+          deferredOperatorTurnId: queued.id,
+          message:
+            'The running non-operator turn kept its original authority. This authenticated input was queued automatically as a fresh operator-origin turn.',
+        })
+        this.autoTitle(record, text)
+        const authorityNotice =
+          '\n\n<<ALLMYAGENTS-AUTHORITY-NOTICE>>\nThis authenticated operator message does not widen the already-running non-operator turn. The hub has durably queued the exact input as a fresh operator-origin turn that will start automatically when this turn becomes idle. You may use it as guidance now, but operator-only mutations must wait for that fresh turn; do not ask the operator to resend it.\n<<END ALLMYAGENTS-AUTHORITY-NOTICE>>'
+        try {
+          if (attachments.length) await this.executor.steer(sessionId, `${text}${authorityNotice}`, attachments)
+          else await this.executor.steer(sessionId, `${text}${authorityNotice}`)
+          this.journal.append(sessionId, 'session/steered', {
+            text,
+            attachments,
+            source: 'operator',
+            authority: 'deferred',
+            deferredOperatorTurnId: queued.id,
+          })
+        } catch (error) {
+          // The durable fresh turn is the acceptance boundary. A live steer is only a best-effort preview;
+          // the current turn may have ended in the race, which must not make the operator retype anything.
+          this.journal.append(sessionId, 'session/operator-steer-not-accepted', {
+            deferredOperatorTurnId: queued.id,
+            message: error instanceof Error ? error.message : String(error),
+          })
+          setImmediate(() => this.deliverBus(sessionId))
+        }
+        return
+      }
       // Acceptance comes BEFORE transcript side effects for the same reason as a fresh send below: if the
       // turn ended in the race to the executor, the web queue receives a rejection and can keep/retry the
       // message. A phantom session/input would falsely claim the model saw text that never crossed.
       admission.markDispatched()
-      if (attachments.length) await this.executor.steer(sessionId, steeredText, attachments)
-      else await this.executor.steer(sessionId, steeredText)
+      if (attachments.length) await this.executor.steer(sessionId, text, attachments)
+      else await this.executor.steer(sessionId, text)
       this.journal.append(sessionId, 'session/input', { text, attachments })
       this.journal.append(sessionId, 'session/steered', {
         text,
         attachments,
         source: 'operator',
-        authority: carriesOperatorAuthority ? 'retained' : 'not-conferred',
+        authority: 'retained',
       })
-      if (!carriesOperatorAuthority) {
-        this.journal.append(sessionId, 'session/operator-authority-not-conferred', {
-          message:
-            'This message arrived during an already-running non-operator turn. It guided that turn but did not grant operator-only mutation authority. Resend after the turn becomes idle if the requested action requires it.',
-        })
-      }
       this.autoTitle(record, text)
       // This is additional input to the CURRENT turn, not a new turn. In particular, do not touch either
       // provenance set or journal a new session/turn-origin: doing so could relabel a bus turn as operator
@@ -7565,6 +7625,114 @@ export class SessionManager {
         if (!accepted && this.bus.pending(sessionId).length) setImmediate(() => this.deliverBus(sessionId))
       }
     }
+  }
+
+  private settleDeferredOperatorDispatch(
+    sessionId: string,
+    outcome: 'accepted' | 'completed' | 'failed' | 'outcome_unknown',
+    message?: string,
+  ): void {
+    const record = this.sessions.get(sessionId)
+    if (!record?.deferredOperatorTurns?.some((turn) => turn.state === 'dispatching')) return
+    const settled = record.deferredOperatorTurns.filter((turn) => turn.state === 'dispatching')
+    const remaining = record.deferredOperatorTurns.filter((turn) => turn.state !== 'dispatching')
+    record.deferredOperatorTurns = remaining.length ? remaining : undefined
+    this.persist(record)
+    for (const turn of settled) {
+      this.journal.append(sessionId, 'session/operator-turn-dispatch-settled', {
+        deferredOperatorTurnId: turn.id,
+        outcome,
+        ...(message ? { message } : {}),
+      })
+    }
+  }
+
+  /**
+   * Start the oldest queued operator input at a genuinely new turn boundary. The durable state changes to
+   * `dispatching` before the executor handoff. A successor may observe a surviving worker complete that
+   * turn, but an idle orphaned handoff becomes outcome_unknown rather than being submitted twice.
+   */
+  private dispatchDeferredOperatorTurn(sessionId: string): void {
+    if (this.restartTurnAdmissionFrozen || this.deferredOperatorDispatches.has(sessionId)) return
+    const record = this.sessions.get(sessionId)
+    if (!record || record.status !== 'idle') return
+    if (this.profileTurnAdmission.get(record.profileId)?.frozen) return
+    if (this.executor.isBusy(sessionId)) return
+    const queued = record.deferredOperatorTurns?.[0]
+    if (!queued) return
+    if (queued.state === 'dispatching') {
+      const message =
+        'A queued operator-authority turn crossed a prior hub handoff, but no live target turn can confirm its outcome. It was not retried because its mutation may already have completed.'
+      this.settleDeferredOperatorDispatch(sessionId, 'outcome_unknown', message)
+      this.failTurn(sessionId, message)
+      return
+    }
+
+    let admission: ProfileAdmissionLease
+    try {
+      this.usage.assertNotBlocked(record.profileId)
+      this.profileOf(record)
+      // Revalidate immutable attachment ids before changing the durable dispatch state.
+      this.attachmentsFor(record, queued.attachmentIds)
+      admission = this.beginProfileAdmission(record.profileId)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      record.deferredOperatorTurns = record.deferredOperatorTurns?.filter((turn) => turn.id !== queued.id)
+      if (!record.deferredOperatorTurns?.length) record.deferredOperatorTurns = undefined
+      this.persist(record)
+      this.journal.append(sessionId, 'session/operator-turn-dispatch-rejected', {
+        deferredOperatorTurnId: queued.id,
+        message,
+      })
+      this.failTurn(sessionId, `Queued operator turn could not start: ${message}`)
+      return
+    }
+
+    queued.state = 'dispatching'
+    queued.dispatchStartedAt = new Date().toISOString()
+    this.persist(record)
+    this.deferredOperatorDispatches.add(sessionId)
+
+    void (async () => {
+      const attachments = this.attachmentsFor(record, queued.attachmentIds)
+      try {
+        if (queued.override.model) record.model = queued.override.model
+        if (queued.override.effort !== undefined) record.effort = queued.override.effort
+        if (queued.override.serviceTier !== undefined) record.serviceTier = queued.override.serviceTier
+        this.persist(record)
+
+        // This is the new boundary. The prior bus turn has already ended, so nothing it started gains this
+        // provenance retroactively; only the exact queued input and work that follows it may use it.
+        this.operatorTurnSessions.add(sessionId)
+        this.journal.append(sessionId, 'session/turn-origin', {
+          origin: 'operator',
+          deferredOperatorTurnId: queued.id,
+        })
+        this.materializeSessionInstructions(record)
+        // Do not bundle pending teammate mail into this turn. The operator input must cross the boundary
+        // verbatim, and semi-trusted bus text must not inherit the authority this fresh turn establishes.
+        admission.markDispatched()
+        this.markTurnDispatched(sessionId)
+        if (attachments.length) {
+          await this.executor.runTurn(this.specOf(record, queued.text), queued.text, 'operator', attachments)
+        } else {
+          await this.executor.runTurn(this.specOf(record, queued.text), queued.text, 'operator')
+        }
+        this.settleDeferredOperatorDispatch(sessionId, 'accepted')
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        // Executor rejection is an ambiguous external boundary: never re-submit an operator-authorized
+        // mutation merely because its acknowledgement was lost.
+        this.settleDeferredOperatorDispatch(sessionId, 'outcome_unknown', message)
+        this.failTurn(
+          sessionId,
+          `Queued operator turn was not confirmed and was not retried automatically: ${message}`,
+        )
+      } finally {
+        this.deferredOperatorDispatches.delete(sessionId)
+        admission.release()
+      }
+    })()
   }
 
   async steer(
@@ -9958,10 +10126,17 @@ export class SessionManager {
     if (!record) return
     if (this.operatorBusDeliveryInFlight.has(sessionId)) return
     if (this.profileTurnAdmission.get(record.profileId)?.frozen) return
+    // Authenticated operator input outranks queued teammate mail, but only after the current turn is truly
+    // idle. The helper creates a fresh operator-origin turn; it never widens an active bus turn.
+    if (record.status === 'idle' && record.deferredOperatorTurns?.length) {
+      this.dispatchDeferredOperatorTurn(sessionId)
+      return
+    }
     // operatorTurnSessions is minted immediately before the executor handoff, while the provider's
     // turnStarted lifecycle can arrive later. Do not let system mail exploit that short idle-looking
     // window to launch a bus turn and contaminate the Overseer's direct-operator provenance.
     if (record.isOverseer === true && this.operatorTurnSessions.has(sessionId)) return
+    if (record.status === 'idle' && this.operatorTurnSessions.has(sessionId)) return
     if (record.status === 'active' || record.status === 'starting') {
       // The Overseer is the one session whose operator provenance carries app-wide mutation authority.
       // Teammate/system mail must therefore wait for a fresh bus-origin turn instead of being steered into

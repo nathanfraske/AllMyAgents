@@ -131,6 +131,27 @@ export interface ManagerTeam {
   presetId?: string
 }
 
+/**
+ * An authenticated operator message accepted while a non-operator turn was already running.
+ *
+ * The current turn is never relabelled. Instead, the hub persists this input and starts it as a fresh
+ * operator-origin turn once the session is idle. `dispatching` is a crash fence: a successor may observe
+ * or settle that handoff, but must never blindly submit the authorized mutation a second time.
+ */
+export interface DeferredOperatorTurn {
+  id: string
+  text: string
+  attachmentIds: string[]
+  override: {
+    model?: string
+    effort?: string
+    serviceTier?: string
+  }
+  queuedAt: string
+  state: 'pending' | 'dispatching'
+  dispatchStartedAt?: string
+}
+
 export interface SessionRecord {
   id: string
   profileId: string
@@ -180,6 +201,8 @@ export interface SessionRecord {
   allowedTools?: string[]
   /** Exact remote machines/roots this chat may use through the AllMyAgents device tools. */
   remoteDeviceGrants?: RemoteDeviceGrant[]
+  /** Operator input accepted mid-turn and waiting for its own non-escalating operator-origin boundary. */
+  deferredOperatorTurns?: DeferredOperatorTurn[]
   /** App-owned browser capability. Safe default is OFF when absent. The profile remains session-keyed. */
   browserEnabled?: boolean
   /** Public http(s) origins approved for this exact session. Values are canonical URL origins. */
