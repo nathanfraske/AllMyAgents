@@ -123,13 +123,13 @@ describe('application Overseer authority', () => {
 
     expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
       isOverseer: true,
-      overseerCapabilityVersion: 17,
+      overseerCapabilityVersion: 18,
       permissionMode: 'full',
       permissionModeOperatorOverride: true,
       role: 'Application Overseer',
     })
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
-      'Overseer capability manifest version 17',
+      'Overseer capability manifest version 18',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'mcp__allmyagents__overseer_control',
@@ -153,6 +153,9 @@ describe('application Overseer authority', () => {
       'deploy_testbed_node',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
+      'configure_approval_policy',
+    )
+    expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'Do not use the vendor-native list_agents or peek_agent',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
@@ -163,7 +166,7 @@ describe('application Overseer authority', () => {
     expect(upgrades()).toHaveLength(1)
     expect(upgrades()[0]?.payload).toMatchObject({
       fromVersion: 6,
-      toVersion: 17,
+      toVersion: 18,
       conversationPreserved: true,
       tools: expect.arrayContaining([
         'overseer_control',
@@ -199,6 +202,89 @@ describe('application Overseer authority', () => {
     await expect(h.sessions.overseerControl('overseer', {
       operation: 'set_mode', sessionId: 'ordinary', permissionMode: 'full',
     })).resolves.toMatchObject({ ok: false })
+  })
+
+  it('allows only the exact alert-bound request inside an operator-configured risk ceiling', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'target', title: 'Target worker', permissionMode: 'safe' })
+    h.sessions.setOverseerRuntime({
+      overseerConfig: () => ({
+        approvalPolicy: { enabled: true, maxRisk: 'low', updatedAt: '2026-08-15T00:00:00.000Z' },
+      }),
+    })
+
+    const low = h.approvals.request('target', 'claude/tool', {
+      toolName: 'Read',
+      input: { file_path: path.join(h.root, 'README.md') },
+    })
+    const lowId = h.approvals.pending()[0]!.id
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'approve', approvalId: lowId, approve: true,
+    })).resolves.toMatchObject({ ok: true, data: { approvalId: lowId, approved: true } })
+    await expect(low).resolves.toBe(true)
+    expect(h.journal.recentEventsForSession('overseer', 20)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'overseer/approval-decided',
+        payload: expect.objectContaining({
+          origin: 'standing-alert-policy',
+          risk: 'low',
+          riskReason: expect.stringMatching(/read-only tool Read/u),
+        }),
+      }),
+    ]))
+
+    // End the first alert turn, then prove the same standing policy cannot widen to a medium mutation.
+    ;(h.sessions as unknown as { setStatus(record: SessionRecord, status: 'idle'): void })
+      .setStatus(h.sessions.list().find((record) => record.id === 'overseer')!, 'idle')
+    const medium = h.approvals.request('target', 'claude/tool', {
+      toolName: 'Write',
+      input: { file_path: path.join(h.root, 'README.md'), content: 'change' },
+    })
+    const mediumId = h.approvals.pending()[0]!.id
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'approve', approvalId: mediumId, approve: true,
+    })).resolves.toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/outside.*risk ceiling.*medium/iu),
+    })
+    h.approvals.resolve(mediumId, false)
+    await expect(medium).resolves.toBe(false)
+  })
+
+  it('does not derive standing approval authority from teammate-authored alert text', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'manager', isProjectManager: true, permissionMode: 'full' })
+    h.seed({ id: 'target', title: 'Target worker', permissionMode: 'safe' })
+    h.sessions.setOverseerRuntime({
+      overseerConfig: () => ({ approvalPolicy: { enabled: true, maxRisk: 'low' } }),
+    })
+
+    const pending = h.approvals.request('target', 'claude/tool', {
+      toolName: 'Read',
+      input: { file_path: path.join(h.root, 'README.md') },
+    })
+    const approvalId = h.approvals.pending()[0]!.id
+    ;(h.sessions as unknown as { setStatus(record: SessionRecord, status: 'idle'): void })
+      .setStatus(h.sessions.list().find((record) => record.id === 'overseer')!, 'idle')
+    expect(h.sessions.busSend(
+      'manager',
+      { kind: 'session', id: 'overseer' },
+      'approval awaiting operator',
+      `Target worker (target) is waiting on approval ${approvalId} for Read. Current status: pending.`,
+      true,
+      true,
+    )).toMatchObject({ ok: true })
+
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'approve', approvalId, approve: true,
+    })).resolves.toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/direct operator turn/u),
+    })
+    h.approvals.resolve(approvalId, false)
+    await expect(pending).resolves.toBe(false)
   })
 
   it('deploys a lightweight node only from a direct operator turn with an explicit elevated profile and reason', async () => {

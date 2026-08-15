@@ -627,6 +627,17 @@ export interface OverseerConfig {
   updatedAt?: string
   operatingMode?: OverseerOperatingMode
   modePolicies?: Partial<Record<Exclude<OverseerOperatingMode, 'standard'>, OverseerModePolicy>>
+  /** Standing, operator-owned exception for deciding the exact approval that woke an alert turn. */
+  approvalPolicy?: OverseerApprovalPolicy
+}
+
+export type OverseerApprovalRisk = 'low' | 'medium'
+
+export interface OverseerApprovalPolicy {
+  enabled: boolean
+  /** Unknown/high-risk requests are never eligible, so the ceiling cannot be configured to high. */
+  maxRisk: OverseerApprovalRisk
+  updatedAt?: string
 }
 
 export type OverseerOperatingMode = 'standard' | 'tokenmaxxing' | 'eco'

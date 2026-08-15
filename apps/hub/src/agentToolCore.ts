@@ -42,6 +42,8 @@ export interface OverseerControlInput {
     | 'stop_chat'
     | 'reopen_chat'
     | 'approve'
+    | 'get_approval_policy'
+    | 'configure_approval_policy'
     | 'set_mode'
     | 'set_session_config'
     | 'configure_manager'
@@ -84,6 +86,8 @@ export interface OverseerControlInput {
   serviceTier?: string
   role?: string
   approve?: boolean
+  approvalPolicyEnabled?: boolean
+  approvalRiskCeiling?: 'low' | 'medium'
   reauth?: boolean
   provider?: Provider
   permissionMode?: 'safe' | 'edits' | 'full'
@@ -1498,11 +1502,11 @@ const overseerPreset = z.object({
 const overseerControl = defineTool({
   name: 'overseer_control',
   description:
-    'Application Overseer only: explain how AllMyAgents works; inspect fleet failures and live account usage; configure projects, managers, manager account handoffs, reusable team presets, chats, accounts, remote-device grants, narrow GitHub automation policies/imports, mesh pairing, lightweight testbed deployment, direct peer-Overseer messages, and safe hub restarts; and configure durable Standard, Tokenmaxxing, or Eco operating modes. GitHub automation can be granted to one exact session or every chat attached to one project, and covers only the explicitly listed PR/workflow/push capabilities. Lightweight testbed deployment uses the signed-fleet AllMyStuff file and terminal planes and requires an explicit elevated profile plus blast-radius reason. Elevated commands require an operator-owned project policy or application-machine policy, blast-radius analysis, a separate explicit operator approval, and (on Windows) UAC. Omit project_id for application-level service, process, registry, or other host maintenance. Mutations are denied on teammate-caused turns; a remote Overseer turn may only reply to the same authenticated peer.',
+    'Application Overseer only: explain how AllMyAgents works; inspect fleet failures and live account usage; configure projects, managers, manager account handoffs, reusable team presets, chats, accounts, remote-device grants, narrow GitHub automation policies/imports, mesh pairing, lightweight testbed deployment, direct peer-Overseer messages, and safe hub restarts; and configure durable Standard, Tokenmaxxing, or Eco operating modes. GitHub automation can be granted to one exact session or every chat attached to one project, and covers only the explicitly listed PR/workflow/push capabilities. Lightweight testbed deployment uses the signed-fleet AllMyStuff file and terminal planes and requires an explicit elevated profile plus blast-radius reason. Elevated commands require an operator-owned project policy or application-machine policy, blast-radius analysis, a separate explicit operator approval, and (on Windows) UAC. Omit project_id for application-level service, process, registry, or other host maintenance. Mutations are denied on teammate-caused turns except an operator-configured, risk-bounded decision on the exact approval alert that started the turn; a remote Overseer turn may only reply to the same authenticated peer.',
   schema: {
     operation: z.enum([
       'status', 'guide', 'ui_catalog', 'highlight_ui', 'failure_context', 'get_operating_mode', 'set_operating_mode', 'create_project', 'create_chat', 'send_chat', 'stop_chat',
-      'reopen_chat', 'approve', 'set_mode', 'set_session_config', 'configure_manager', 'reassign_manager_account',
+      'reopen_chat', 'approve', 'get_approval_policy', 'configure_approval_policy', 'set_mode', 'set_session_config', 'configure_manager', 'reassign_manager_account',
       'list_team_presets', 'save_team_preset', 'delete_team_preset', 'launch_team',
       'remote_catalog', 'set_remote_grants', 'list_overseer_peers', 'send_overseer_message',
       'start_account_login', 'github_repositories',
@@ -1528,6 +1532,8 @@ const overseerControl = defineTool({
     service_tier: z.string().max(64).optional(),
     role: z.string().max(2_000).optional(),
     approve: z.boolean().optional(),
+    approval_policy_enabled: z.boolean().optional(),
+    approval_risk_ceiling: z.enum(['low', 'medium']).optional(),
     reauth: z.boolean().optional(),
     provider: z.enum(['claude', 'codex']).optional(),
     permission_mode: overseerPermissionMode.optional(),
@@ -1583,6 +1589,8 @@ const overseerControl = defineTool({
       serviceTier: args.service_tier,
       role: args.role,
       approve: args.approve,
+      approvalPolicyEnabled: args.approval_policy_enabled,
+      approvalRiskCeiling: args.approval_risk_ceiling,
       reauth: args.reauth,
       provider: args.provider,
       permissionMode: args.permission_mode,

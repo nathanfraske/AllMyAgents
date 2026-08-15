@@ -610,6 +610,7 @@ function rotate(
   maxRetainedBytes: number,
   log: (m: string) => void
 ): void {
+  cleanupOrphanedBackupSidecars(dir, log)
   let entries: Array<{ name: string; bytes: bigint }>
   try {
     entries = fs
@@ -642,6 +643,46 @@ function rotate(
       // Preserve oldest-first semantics: if this victim cannot be removed, do not sacrifice newer
       // verified generations to pretend the retention target was met.
       break
+    }
+  }
+}
+
+/**
+ * Remove sidecars whose published snapshot no longer exists.
+ *
+ * Older rotation code deleted only the `.db`, leaving `-wal`/`-shm` files that no later pass could
+ * see because the generation list is intentionally keyed by published main files. Treating this as
+ * ordinary retention (rather than a one-shot migration) makes the invariant self-healing on every
+ * install and safe to run repeatedly. Names come directly from readdir, and symlinks are never
+ * followed or removed.
+ */
+function cleanupOrphanedBackupSidecars(
+  dir: string,
+  log: (message: string) => void,
+): void {
+  let entries: string[]
+  try {
+    entries = fs.readdirSync(dir)
+  } catch {
+    return
+  }
+  for (const name of entries) {
+    const sidecar = SIDECAR_SUFFIXES.find((suffix) => name.endsWith(`${SUFFIX}${suffix}`))
+    if (!sidecar || !name.startsWith(PREFIX)) continue
+    const baseName = name.slice(0, -sidecar.length)
+    if (!baseName.endsWith(SUFFIX) || fs.existsSync(path.join(dir, baseName))) continue
+    const file = path.join(dir, name)
+    try {
+      const stat = fs.lstatSync(file)
+      if (stat.isSymbolicLink() || !stat.isFile()) continue
+      fs.rmSync(file, { force: true })
+      log(`[journal-backup] removed orphaned sidecar ${name}`)
+    } catch (error) {
+      log(
+        `[journal-backup] orphaned sidecar cleanup FAILED for ${name}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      )
     }
   }
 }

@@ -35,7 +35,7 @@ mod browser;
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -48,6 +48,113 @@ use tauri::{AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindow, WebviewWind
 
 /// Where the desktop shell's diagnostics land, once `init_log` has run.
 static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
+static PROCESS_STARTED_AT: OnceLock<Instant> = OnceLock::new();
+
+#[derive(serde::Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct DesktopStartupStatus {
+    phase: String,
+    detail: String,
+    elapsed_ms: u64,
+}
+
+fn startup_elapsed_ms() -> u64 {
+    PROCESS_STARTED_AT
+        .get()
+        .map(|started| started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn parse_startup_status(log: &str, elapsed_ms: u64) -> DesktopStartupStatus {
+    let current = log
+        .rfind("=== AllMyAgents ")
+        .map(|start| &log[start..])
+        .unwrap_or(log);
+    let lines = current.lines().collect::<Vec<_>>();
+    if lines
+        .iter()
+        .any(|line| line.contains("[hub-startup] listener ready:"))
+    {
+        return DesktopStartupStatus {
+            phase: "ready".to_string(),
+            detail: "The local hub is ready.".to_string(),
+            elapsed_ms,
+        };
+    }
+    if let Some(line) = lines
+        .iter()
+        .rev()
+        .find(|line| line.contains("preflight phase:"))
+    {
+        let raw = line
+            .split_once("preflight phase:")
+            .map(|(_, value)| value.trim())
+            .unwrap_or("starting")
+            .split(" elapsedMs=")
+            .next()
+            .unwrap_or("starting")
+            .trim();
+        let phase = raw.split_whitespace().next().unwrap_or("starting");
+        let detail = match phase {
+            "integrity-check" => "Checking the journal structure and recovery identity.",
+            "booting" => "Restoring accounts, projects, and conversations.",
+            "starting" => "Starting the journal preflight worker.",
+            _ => "The hub supervisor is completing startup checks.",
+        };
+        return DesktopStartupStatus {
+            phase: phase.to_string(),
+            detail: detail.to_string(),
+            elapsed_ms,
+        };
+    }
+    let detail = if lines
+        .iter()
+        .any(|line| line.contains("installing hub dependencies"))
+    {
+        "Installing and verifying bundled hub dependencies."
+    } else if lines
+        .iter()
+        .any(|line| line.contains("spawned bundled hub"))
+    {
+        "The hub process is starting."
+    } else {
+        "Preparing the local hub."
+    };
+    DesktopStartupStatus {
+        phase: "starting".to_string(),
+        detail: detail.to_string(),
+        elapsed_ms,
+    }
+}
+
+fn read_log_tail(path: &Path, max_bytes: u64) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(max_bytes)))
+        .ok()?;
+    let mut bytes = Vec::with_capacity(len.min(max_bytes) as usize);
+    file.take(max_bytes).read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+fn desktop_startup_status(app: AppHandle) -> DesktopStartupStatus {
+    let log = log_path(&app)
+        .and_then(|path| read_log_tail(&path, 64 * 1024))
+        .unwrap_or_default();
+    parse_startup_status(&log, startup_elapsed_ms())
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+fn renderer_first_paint(web_elapsed_ms: f64) {
+    logln(&format!(
+        "[desktop] renderer first painted frame: nativeElapsedMs={} webElapsedMs={:.1}",
+        startup_elapsed_ms(),
+        web_elapsed_ms.max(0.0),
+    ));
+}
 
 /// `<app_local_data_dir>/logs/desktop.log` — beside the hub home, on the local (never-roaming) disk.
 pub fn log_path(app: &AppHandle) -> Option<PathBuf> {
@@ -2054,6 +2161,7 @@ fn kill_hub(child: &mut Child) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let _ = PROCESS_STARTED_AT.set(Instant::now());
     let builder = tauri::Builder::default()
         // Native OS file/folder dialogs and opening external links in the browser.
         .plugin(tauri_plugin_dialog::init())
@@ -2070,6 +2178,8 @@ pub fn run() {
             uninstall_macos,
             hub_device_token,
             overseer_diagnostics,
+            desktop_startup_status,
+            renderer_first_paint,
             reveal_local_path
         ]);
 
@@ -2152,6 +2262,31 @@ pub fn run() {
 #[cfg(test)]
 mod dependency_repair_tests {
     use super::*;
+
+    #[test]
+    fn startup_status_uses_only_the_current_boot_and_exposes_preflight_progress() {
+        let log = "=== AllMyAgents old starting ===\n[hub-startup] listener ready: 1ms\n\
+=== AllMyAgents new starting ===\n[desktop] spawned bundled hub (pid 7)\n\
+[hubctl] hub(blue) preflight phase: integrity-check — integrity verification still running elapsedMs=10484\n";
+        assert_eq!(
+            parse_startup_status(log, 10_900),
+            DesktopStartupStatus {
+                phase: "integrity-check".to_string(),
+                detail: "Checking the journal structure and recovery identity.".to_string(),
+                elapsed_ms: 10_900,
+            },
+        );
+    }
+
+    #[test]
+    fn startup_status_reports_listener_readiness() {
+        let status = parse_startup_status(
+            "=== AllMyAgents new starting ===\n[hub-startup] listener ready: 144ms\n",
+            13_135,
+        );
+        assert_eq!(status.phase, "ready");
+        assert_eq!(status.elapsed_ms, 13_135);
+    }
 
     #[test]
     fn two_failed_repairs_block_another_install_and_name_recovery_paths() {

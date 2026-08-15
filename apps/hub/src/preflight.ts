@@ -612,9 +612,17 @@ export function runHubPreflight(options: {
           },
         }
       } else {
-        const invalidPayload = db
-          .prepare('SELECT seq FROM events WHERE json_valid(payload) = 0 ORDER BY seq LIMIT 1')
-          .get() as { seq?: unknown } | undefined
+        // A stable-family recovery classification is deliberately exhaustive: it is deciding whether
+        // bytes are safe enough to restore, so content validity belongs on that path. Ordinary startup
+        // only proves SQLite structure here. Scanning every payload in a multi-GB journal took over ten
+        // seconds on the operator's production data in addition to the required structural check,
+        // leaving the window apparently blank for still longer. The same content proof runs in the isolated post-ready
+        // maintenance child, where it cannot delay the listener or starve the hub's liveness lease.
+        const invalidPayload = options.stableFamily
+          ? db
+              .prepare('SELECT seq FROM events WHERE json_valid(payload) = 0 ORDER BY seq LIMIT 1')
+              .get() as { seq?: unknown } | undefined
+          : undefined
         if (invalidPayload) {
           result = {
             ok: false,
@@ -631,7 +639,9 @@ export function runHubPreflight(options: {
           checks.push({
             name: 'database-integrity',
             status: 'passed',
-            detail: `${integrityPragma} ok; event payload JSON is valid`,
+            detail: options.stableFamily
+              ? `${integrityPragma} ok; event payload JSON is valid`
+              : `${integrityPragma} ok; payload validation deferred to post-ready maintenance`,
             durationMs: elapsed(integrityStarted),
           })
           result = { ok: true, checks }

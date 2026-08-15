@@ -143,7 +143,7 @@ describe('hub preflight', () => {
       expect.objectContaining({
         name: 'database-integrity',
         status: 'passed',
-        detail: 'quick_check ok; event payload JSON is valid',
+        detail: 'quick_check ok; payload validation deferred to post-ready maintenance',
       })
     )
   })
@@ -168,7 +168,7 @@ describe('hub preflight', () => {
       expect.objectContaining({
         name: 'database-integrity',
         status: 'passed',
-        detail: 'quick_check ok; event payload JSON is valid',
+        detail: 'quick_check ok; payload validation deferred to post-ready maintenance',
       })
     )
   })
@@ -229,6 +229,13 @@ describe('hub preflight', () => {
     const db = new Database(journalPath)
     db.prepare('UPDATE events SET payload = ? WHERE seq = 1').run('secret-like-not-json')
     db.close()
+
+    const ordinary = runHubPreflight({ dataDir, journalPath, schemaVersion: SCHEMA_VERSION })
+    expect(ordinary.ok).toBe(true)
+    expect(ordinary.checks).toContainEqual(expect.objectContaining({
+      name: 'database-integrity',
+      detail: 'quick_check ok; payload validation deferred to post-ready maintenance',
+    }))
 
     const result = runHubPreflight({
       dataDir,

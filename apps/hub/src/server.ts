@@ -578,6 +578,25 @@ export function startServer(opts: ServerOptions): http.Server {
     sessions.refreshOverseerInstructions()
     return next
   }
+  const configureOverseerApprovalPolicy = (input: {
+    enabled: boolean
+    maxRisk: 'low' | 'medium'
+  }): OverseerConfig => {
+    const next: OverseerConfig = {
+      ...overseer,
+      approvalPolicy: {
+        enabled: input.enabled,
+        maxRisk: input.maxRisk,
+        updatedAt: new Date().toISOString(),
+      },
+      updatedAt: new Date().toISOString(),
+    }
+    const persistError = patchConfig(configPath, 'overseer', next)
+    if (persistError) throw new Error(`Overseer approval policy could not be persisted: ${persistError}`)
+    Object.assign(overseer, next)
+    sessions.refreshOverseerInstructions()
+    return next
+  }
   const replayPrincipalBudget = new ReplayPrincipalBudget()
   const pairingCodes = new PairingCodeBroker(deviceToken)
   const questions = opts.questions
@@ -592,6 +611,7 @@ export function startServer(opts: ServerOptions): http.Server {
   sessions.setOverseerRuntime?.({
     overseerConfig: () => structuredClone(overseer),
     configureOverseerMode,
+    configureOverseerApprovalPolicy,
     createProject: async (name, rawPath, distro) => {
       const location = await resolveProjectPath(rawPath, distro)
       if (location.kind === 'unavailable') throw new Error(location.reason)

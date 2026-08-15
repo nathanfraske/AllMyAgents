@@ -66,7 +66,7 @@ describe('compact system status indicators', () => {
     expect(trigger.textContent).toContain('Starting hub… 7s')
     await fireEvent.click(trigger)
     expect(screen.getByRole('dialog', { name: 'Hub connection' }).textContent).toContain(
-      'waiting for the local hub to finish startup',
+      'Preparing the local hub.',
     )
   })
 

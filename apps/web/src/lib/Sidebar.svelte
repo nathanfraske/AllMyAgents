@@ -933,16 +933,16 @@
           {#if store.hubConnectionPhase === 'connected'}
             <p>The live connection to the local hub is active.</p>
           {:else if store.hubConnectionPhase === 'starting' && store.hubDownSeconds >= 20}
-            <p>The local hub is still starting. Its supervisor is checking startup and retrying automatically.</p>
+            <p>{store.hubStartupDetail} The supervisor will retry automatically if startup fails.</p>
           {:else if store.hubConnectionPhase === 'starting'}
-            <p>The desktop app is waiting for the local hub to finish startup.</p>
+            <p>{store.hubStartupDetail}</p>
           {:else if store.hubDownSeconds >= 20}
             <p>The hub is being restarted automatically. Retry intervals can back off to 30 seconds.</p>
           {:else}
             <p>The live connection was interrupted and the app is reconnecting.</p>
           {/if}
           {#if !store.connected && store.hubDownSeconds > 0}
-            <div class="status-metric"><span>{store.hubConnectionPhase === 'starting' ? 'Starting for' : 'Disconnected for'}</span><b>{store.hubDownSeconds}s</b></div>
+            <div class="status-metric"><span>{store.hubConnectionPhase === 'starting' ? 'Starting for' : 'Disconnected for'}</span><b>{store.hubConnectionPhase === 'starting' && store.hubStartupElapsedMs > 0 ? Math.round(store.hubStartupElapsedMs / 1000) : store.hubDownSeconds}s</b></div>
           {/if}
           {#if !store.connected && supervisorDiagnostics?.status}
             <div class="supervisor-diagnostic">
