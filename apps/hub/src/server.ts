@@ -3037,7 +3037,7 @@ export function startServer(opts: ServerOptions): http.Server {
         try {
           json(
             res,
-            journal.sessionHistoryPage(journalHistoryMatch[1] as string, {
+            await journal.sessionHistoryPage(journalHistoryMatch[1] as string, {
               beforeSeq,
               expectedGeneration: generation,
               maxRows: JOURNAL_HISTORY_PAGE_MAX_ROWS,

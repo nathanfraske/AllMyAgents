@@ -4125,13 +4125,16 @@ export class HubStore {
         view.loadingHistory = false
       }
       if (!page || !Array.isArray(page.events)) {
+        if (page) view.historyLoadError = 'Latest journal history returned an invalid response.'
         this.historyPulled.delete(id)
         return
       }
       let historyItems: ThreadItem[]
       try {
         historyItems = reduceJournalHistory(page.events)
-      } catch {
+      } catch (error) {
+        view.historyLoadError =
+          error instanceof Error ? error.message : 'Latest journal history could not be decoded.'
         this.historyPulled.delete(id)
         return
       }
