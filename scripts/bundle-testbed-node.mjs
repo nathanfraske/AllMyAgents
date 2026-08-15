@@ -12,6 +12,13 @@ const output = path.join(root, 'apps', 'desktop', 'src-tauri', 'testbed-runtime'
 const distOutput = path.join(output, 'dist')
 const runtimeName = process.platform === 'win32' ? 'node.exe' : 'node'
 const modules = ['testbedNode.js', 'deviceToken.js', 'remoteDevices.js', 'directHubProtocol.js', 'myOwnMeshRpc.js']
+const tauriConfig = JSON.parse(fs.readFileSync(path.join(root, 'apps', 'desktop', 'src-tauri', 'tauri.conf.json'), 'utf8'))
+let sourceCommit
+try {
+  sourceCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim()
+} catch {
+  sourceCommit = undefined
+}
 
 execFileSync(process.execPath, [
   path.join(hub, 'node_modules', 'typescript', 'bin', 'tsc'),
@@ -34,6 +41,11 @@ if (process.platform !== 'win32') fs.chmodSync(path.join(output, runtimeName), 0
 fs.writeFileSync(path.join(output, 'package.json'), `${JSON.stringify({
   private: true,
   type: 'module',
+}, null, 2)}\n`)
+fs.writeFileSync(path.join(output, 'build.json'), `${JSON.stringify({
+  version: 1,
+  appVersion: typeof tauriConfig.version === 'string' ? tauriConfig.version : undefined,
+  ...(sourceCommit ? { sourceCommit } : {}),
 }, null, 2)}\n`)
 
 const launch = process.platform === 'win32'
@@ -64,9 +76,11 @@ fs.writeFileSync(path.join(output, 'manifest.json'), JSON.stringify({
   platform: process.platform,
   arch: process.arch,
   protocol: 1,
+  appVersion: typeof tauriConfig.version === 'string' ? tauriConfig.version : undefined,
+  ...(sourceCommit ? { sourceCommit } : {}),
 }, null, 2))
 
-const files = [runtimeName, 'README.txt', 'manifest.json', 'package.json', ...modules.map((name) => `dist/${name}`)]
+const files = [runtimeName, 'README.txt', 'manifest.json', 'package.json', 'build.json', ...modules.map((name) => `dist/${name}`)]
 const sums = files.map((relative) => {
   const digest = crypto.createHash('sha256').update(fs.readFileSync(path.join(output, relative))).digest('hex')
   return `${digest}  ${relative.replaceAll('\\', '/')}`
@@ -74,6 +88,6 @@ const sums = files.map((relative) => {
 fs.writeFileSync(path.join(output, 'SHA256SUMS'), `${sums.join('\n')}\n`)
 
 const actual = fs.readdirSync(output).sort()
-const expected = ['README.txt', 'SHA256SUMS', 'manifest.json', 'package.json', 'dist', runtimeName].sort()
+const expected = ['README.txt', 'SHA256SUMS', 'manifest.json', 'package.json', 'build.json', 'dist', runtimeName].sort()
 if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error('testbed payload contains an unexpected top-level file')
 process.stdout.write(`[bundle-testbed] built ${output} for ${process.platform}/${process.arch}\n`)

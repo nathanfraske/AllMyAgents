@@ -91,7 +91,21 @@
               {/if}
               <span>{capabilities.roots?.length ?? 0} authorized {(capabilities.roots?.length ?? 0) === 1 ? 'root' : 'roots'}</span>
               <span>{environmentSummary(capabilities)}</span>
+              {#if capabilities.activeTransport}
+                <span>{capabilities.activeTransport === 'myownmesh-rpc' ? 'Direct MyOwnMesh' : 'AllMyStuff Site'} transport</span>
+              {/if}
+              {#if capabilities.testbedBuild}
+                <span title={capabilities.testbedBuild.codePayloadId}>Build {capabilities.testbedBuild.appVersion ?? capabilities.testbedBuild.codePayloadId.slice(0, 10)}</span>
+              {/if}
             </div>
+            {#if capabilities.sshHostKeyFingerprints?.length}
+              <details class="host-keys">
+                <summary>Mesh-attested SSH host keys</summary>
+                {#each capabilities.sshHostKeyFingerprints as fingerprint}
+                  <code>{fingerprint}</code>
+                {/each}
+              </details>
+            {/if}
           {:else if device.roles.includes('hub') && !device.local}
             <div class="availability"><span>Link this Hub to inspect its testbed hardware and policy.</span></div>
           {/if}
@@ -132,6 +146,9 @@
   .facts span:not(:last-child)::after { content: '·'; margin-left: var(--space-2); color: var(--muted); }
   .availability { margin-top: var(--space-2); color: var(--muted); font-size: var(--text-2xs); line-height: 1.45; }
   .availability .available { color: var(--ok); }
+  .host-keys { margin-top: var(--space-2); color: var(--muted); font-size: var(--text-2xs); }
+  .host-keys summary { cursor: pointer; }
+  .host-keys code { display: block; margin-top: var(--space-1); overflow-wrap: anywhere; color: var(--text); }
   .device-error { margin: var(--space-2) 0 0; color: var(--bad-text); font-size: var(--text-2xs); line-height: 1.4; }
   .empty { padding: var(--space-4); border: 1px dashed var(--border); border-radius: var(--r-lg); color: var(--muted); font-size: var(--text-xs); text-align: center; }
   @media (max-width: 560px) {

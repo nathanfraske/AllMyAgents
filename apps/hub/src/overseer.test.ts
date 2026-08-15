@@ -123,13 +123,13 @@ describe('application Overseer authority', () => {
 
     expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
       isOverseer: true,
-      overseerCapabilityVersion: 18,
+      overseerCapabilityVersion: 19,
       permissionMode: 'full',
       permissionModeOperatorOverride: true,
       role: 'Application Overseer',
     })
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
-      'Overseer capability manifest version 18',
+      'Overseer capability manifest version 19',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'mcp__allmyagents__overseer_control',
@@ -166,7 +166,7 @@ describe('application Overseer authority', () => {
     expect(upgrades()).toHaveLength(1)
     expect(upgrades()[0]?.payload).toMatchObject({
       fromVersion: 6,
-      toVersion: 18,
+      toVersion: 19,
       conversationPreserved: true,
       tools: expect.arrayContaining([
         'overseer_control',
@@ -324,6 +324,27 @@ describe('application Overseer authority', () => {
     expect(h.journal.recentEventsForSession('overseer')).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: 'overseer/testbed-deployment-requested' }),
       expect.objectContaining({ kind: 'overseer/testbed-deployment-verified' }),
+    ]))
+  })
+
+  it('syncs an existing testbed only from a direct operator turn and journals the verified result', async () => {
+    const h = harness()
+    const syncTestbedNode = vi.fn(async (siteId: string, actor: { sessionId: string; profileId: string }) => ({
+      siteId, actor, payloadId: 'f'.repeat(64), changedFiles: ['dist/testbedNode.js'], verified: true,
+    }))
+    h.sessions.setOverseerRuntime({ syncTestbedNode })
+    h.seed({ id: 'overseer', isOverseer: true, profileId: 'codex-b', permissionMode: 'full' })
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'sync_testbed_node', siteId: 'frask-risk-box', reason: 'Apply the operator-requested testbed update.',
+    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/direct operator turn/u) })
+    h.markOperator('overseer')
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'sync_testbed_node', siteId: 'frask-risk-box', reason: 'Apply the operator-requested testbed update.',
+    })).resolves.toMatchObject({ ok: true, data: { verified: true } })
+    expect(syncTestbedNode).toHaveBeenCalledWith('frask-risk-box', { sessionId: 'overseer', profileId: 'codex-b' })
+    expect(h.journal.recentEventsForSession('overseer')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'overseer/testbed-sync-requested' }),
+      expect.objectContaining({ kind: 'overseer/testbed-sync-verified' }),
     ]))
   })
 
@@ -761,7 +782,7 @@ describe('application Overseer authority', () => {
       expect(spec.claudeSystemPrompt).toMatch(/fleet-wide/u)
       expect(spec.claudeSystemPrompt).toMatch(/AskUserQuestion/u)
       expect(spec.claudeSystemPrompt).toMatch(/remote_list_devices.*remote_ping.*remote_inspect_environment.*remote_inspect_git.*remote_prepare_project_location/su)
-      expect(spec.claudeSystemPrompt).toMatch(/Never blindly retry an ambiguous write, preparation, or terminal failure/u)
+      expect(spec.claudeSystemPrompt).toMatch(/Never blindly retry an ambiguous write, preparation, payload sync, restart, or terminal failure/u)
       expect(spec.claudeSystemPrompt).toMatch(/COMPACTION CONTINUITY CONTRACT/u)
       expect(spec.claudeSystemPrompt).toMatch(/active objective.*current project.*current slice/su)
       expect(spec.claudeSystemPrompt).toMatch(/exact next useful action/u)
@@ -772,7 +793,7 @@ describe('application Overseer authority', () => {
     expect(childPrompt).toMatch(/report a real scope or permission block upstream/u)
     for (const prompt of [managerPrompt, childPrompt]) {
       expect(prompt).toMatch(/remote_list_devices.*remote_ping.*remote_inspect_environment.*remote_inspect_git.*remote_prepare_project_location/su)
-      expect(prompt).toMatch(/Report the returned timing, transfer, and failure-stage telemetry upstream/u)
+      expect(prompt).toMatch(/Report the returned timing, active transport, transfer, build identity, and failure-stage telemetry upstream/u)
     }
   })
 

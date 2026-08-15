@@ -1090,6 +1090,16 @@ export interface DeviceExecutorCapabilities {
   nodeKind?: 'hub' | 'lightweight-testbed'
   deploymentProfile?: 'scoped' | 'full-machine' | 'elevated-machine' | 'linux-sudo-machine'
   elevated?: boolean
+  activeTransport?: 'myownmesh-rpc' | 'site'
+  testbedBuild?: {
+    payloadId: string
+    codePayloadId: string
+    appVersion?: string
+    sourceCommit?: string
+    protocol: number
+    files: Array<{ path: string; sha256: string; bytes: number }>
+  }
+  sshHostKeyFingerprints?: string[]
   /** Added after the host-only executor shipped; absent on an older peer capability response. */
   environments?: RemoteExecutionEnvironment[]
   roots: DeviceRootPolicy[]

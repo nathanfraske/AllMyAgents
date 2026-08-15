@@ -637,6 +637,10 @@ export function startServer(opts: ServerOptions): http.Server {
             siteId: string,
             profile: 'elevated-machine' | 'linux-sudo-machine',
           ) => opts.testbedDeployment!.deploy(siteId, profile),
+          syncTestbedNode: (
+            siteId: string,
+            actor: { sessionId: string; profileId: string },
+          ) => opts.testbedDeployment!.sync(siteId, actor),
           listTestbedTargets: () => opts.testbedDeployment!.targets(),
           inspectTestbedTarget: (siteId: string) => opts.testbedDeployment!.inspect(siteId),
         }
