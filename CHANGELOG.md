@@ -5,6 +5,29 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.28-alpha.32 — 2026-08-15
+
+This release makes cold conversation history responsive and truthful, keeps long remote durable jobs alive for
+their declared budget, preserves operator authority across mid-turn guidance, and connects narrow GitHub grants to
+the Codex connector approval path that previously ignored them.
+
+[Full v0.1.28-alpha.32 release notes](docs/releases/v0.1.28-alpha.32.md)
+
+- Journal history plans a bounded page before hydrating blobs, reads immutable blobs asynchronously with shared
+  bounded concurrency, and shows load errors with retry instead of impersonating an empty conversation.
+- Remote durable runs honor their recorded timeout up to six hours and record the target platform, architecture,
+  checkout, transport, and telemetry rather than the source hub's environment.
+- Authenticated operator input arriving during a bus turn is durably queued exactly once as a new operator-origin
+  turn. The running bus turn remains permission-clamped and gains no retroactive authority.
+- Exact project/session GitHub automation grants satisfy only matching Codex GitHub connector elicitations. Merge,
+  push, workflow, repository, and unknown operations remain distinct; resolved decisions stay queryable.
+- Existing Linux lightweight testbeds can synchronize only changed portable modules, verify hashes, schedule a
+  detached restart, retain rollback files, and report explicit build identity and transport.
+- The desktop renders live startup phase/elapsed telemetry while the hub starts; exhaustive payload validation is
+  post-ready, orphaned backup sidecars self-heal, and stale worktree probes no longer spam every boot.
+- Overseer contract v21 adds risk-bounded standing approvals, connector persistence only on direct operator turns,
+  current methodology, and automatic in-place upgrade for existing Overseer conversations.
+
 ## v0.1.27-alpha.31 — 2026-08-14
 
 This release fixes the multi-gigabyte journal startup and backup failure at its storage boundary, restores
