@@ -170,6 +170,21 @@ describe('DurableRunController', () => {
         command: 'npm test',
         cwd: 'checkout-a',
       },
+      executionEnvironment: {
+        platform: 'linux',
+        architecture: 'riscv64',
+        cwd: '/home/runner/checkout-a',
+        environmentId: 'host',
+        observedAt: '2026-08-15T00:00:00.000Z',
+        fingerprintSha256: 'a'.repeat(64),
+        hostname: 'Frask-Risk-Box',
+        shell: '/bin/sh',
+        cpuCount: 8,
+        totalMemoryBytes: 15 * 1024 * 1024 * 1024,
+        transport: 'myownmesh-rpc',
+        nodeKind: 'lightweight-testbed',
+        buildId: 'payload-1',
+      },
     }
 
     const run = await controller.start(remoteInput)
@@ -180,6 +195,23 @@ describe('DurableRunController', () => {
       commandSummary: 'npm test',
       executionTarget: { kind: 'remote', siteId: 'site-a', rootId: 'root-a' },
       result: { telemetry: { roundTripMs: 44, transferBytes: 128 } },
+      provenance: {
+        platform: 'linux',
+        architecture: 'riscv64',
+        cwd: '/home/runner/checkout-a',
+        environmentScope: 'execution',
+        environmentSha256: 'a'.repeat(64),
+        execution: {
+          environmentId: 'host',
+          hostname: 'Frask-Risk-Box',
+          transport: 'myownmesh-rpc',
+        },
+        source: {
+          platform: process.platform,
+          architecture: process.arch,
+          cwd,
+        },
+      },
     })
     expect(inspected.logs?.stdout).toContain('remote build complete')
   })

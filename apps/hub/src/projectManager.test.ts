@@ -1303,6 +1303,7 @@ describe('project manager durable live roster', () => {
     const runtime = runTurn.mock.calls[0]?.[0].claudeSystemPrompt ?? ''
     expect(runtime).toContain('Task accountability contract:')
     expect(runtime).toContain('create or update your own provider-native task/plan entry')
+    expect(runtime).toContain('project\'s reviewed setup recipe')
     expect(runtime).toContain('runningWithoutReportedTasks')
     expect(runtime).toContain('reviewer-child')
     expect(runtime).toContain('"archivedRecords":1')

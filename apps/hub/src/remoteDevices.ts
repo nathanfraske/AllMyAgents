@@ -14,7 +14,11 @@ const MAX_DIRECTORY_ENTRIES = 500
 const MAX_COMMAND_CHARS = 16 * 1024
 const MAX_COMMAND_OUTPUT_BYTES = 512 * 1024
 const MAX_REMOTE_RESPONSE_BYTES = 2 * 1024 * 1024
-const MAX_COMMAND_TIMEOUT_MS = 120_000
+/** Ad-hoc remote shells stay deliberately short. Durable runs have their own audited handle, lease,
+ * retained terminal state, and explicit timeout, so they may use the same six-hour ceiling exposed by
+ * start_run without silently inheriting this interactive limit. */
+export const MAX_INTERACTIVE_COMMAND_TIMEOUT_MS = 120_000
+export const MAX_DURABLE_COMMAND_TIMEOUT_MS = 6 * 60 * 60_000
 const MAX_DEVICE_ROOTS = 128
 const MAX_FLEET_CONNECTIONS = 256
 const MAX_CONCURRENT_COMMANDS = 8
@@ -167,6 +171,8 @@ export interface DeviceExecutorCapabilities {
   hostname: string
   /** Bounded inventory facts for the operator's device overview. Optional on older paired nodes. */
   cpuCount?: number
+  /** CPUs available to this process after affinity/cgroup constraints; use this for build parallelism. */
+  availableCpuCount?: number
   totalMemoryBytes?: number
   /** Present when the executor is the vendor-free service rather than a full AllMyAgents hub. */
   nodeKind?: 'hub' | 'lightweight-testbed'
@@ -300,6 +306,17 @@ export interface RemoteDeviceActor {
   replicaId?: string
   agentId?: string
   baseCommit?: string
+  /** Hub-authenticated execution class. This widens only the command duration; grants and root policy
+   * are still checked independently on both hubs. */
+  durableRunId?: string
+}
+
+export function effectiveRemoteCommandTimeout(
+  requested: number | undefined,
+  actor?: Pick<RemoteDeviceActor, 'durableRunId'>,
+): number {
+  const maximum = actor?.durableRunId ? MAX_DURABLE_COMMAND_TIMEOUT_MS : MAX_INTERACTIVE_COMMAND_TIMEOUT_MS
+  return Math.max(1_000, Math.min(Number(requested) || 30_000, maximum))
 }
 
 function inside(root: string, target: string): boolean {
@@ -700,7 +717,7 @@ export async function syncGitCheckout(input: {
   const trackingRef = `refs/remotes/origin/${headRef}`
   const fetched = await invoke([
     'fetch', '--no-tags', 'origin', `+refs/heads/${headRef}:${trackingRef}`,
-  ], MAX_COMMAND_TIMEOUT_MS)
+  ], MAX_INTERACTIVE_COMMAND_TIMEOUT_MS)
   if (fetched.timedOut) return fail('Git fetch timed out; the checkout was not switched.', 'FETCH_TIMEOUT', before)
   if (fetched.error || fetched.status !== 0 || fetched.truncated) {
     return fail('Git could not fetch the requested branch non-interactively.', 'FETCH_FAILED', before)
@@ -758,6 +775,7 @@ export class DeviceExecutor {
       arch: process.arch,
       hostname: os.hostname(),
       cpuCount: os.cpus().length,
+      availableCpuCount: typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length,
       totalMemoryBytes: os.totalmem(),
       environments: discoverExecutionEnvironments(),
       roots: this.policy.roots.map((root) => ({ ...root })),
@@ -771,11 +789,15 @@ export class DeviceExecutor {
     return this.capabilities()
   }
 
-  async execute(action: RemoteDeviceAction): Promise<RemoteDeviceActionResult> {
+  async execute(action: RemoteDeviceAction, actor?: Pick<RemoteDeviceActor, 'durableRunId'>): Promise<RemoteDeviceActionResult> {
     const started = performance.now()
     const finish = (result: RemoteDeviceActionResult): RemoteDeviceActionResult => ({
       ...result,
-      failure: result.ok ? undefined : (result.failure ?? { stage: 'target' }),
+      failure: result.ok
+        ? undefined
+        : (result.failure ?? (result.timedOut
+            ? { stage: 'timeout', code: 'COMMAND_TIMEOUT' }
+            : { stage: 'target' })),
       telemetry: { ...result.telemetry, targetMs: Math.max(0, Math.round((performance.now() - started) * 10) / 10) },
     })
     if (!this.policy.enabled) return finish({ ok: false, error: 'Remote device execution is disabled on this machine.' })
@@ -825,7 +847,7 @@ export class DeviceExecutor {
       this.activeCommands += 1
       this.activeCommandRoots.add(root.id)
       try {
-        return finish(await this.exec(root, action))
+        return finish(await this.exec(root, action, actor))
       } finally {
         this.activeCommands -= 1
         this.activeCommandRoots.delete(root.id)
@@ -1023,12 +1045,13 @@ export class DeviceExecutor {
   private exec(
     root: DeviceRootPolicy,
     action: Extract<RemoteDeviceAction, { op: 'exec' }>,
+    actor?: Pick<RemoteDeviceActor, 'durableRunId'>,
   ): Promise<RemoteDeviceActionResult> {
     if (typeof action.command !== 'string' || action.command.length === 0 || action.command.length > MAX_COMMAND_CHARS || action.command.includes('\0')) {
       throw new Error('command must be a non-empty bounded string')
     }
     const cwd = this.resolveExisting(root, action.cwd, 'cwd', true)
-    const timeoutMs = Math.max(1000, Math.min(Number(action.timeoutMs) || 30_000, MAX_COMMAND_TIMEOUT_MS))
+    const timeoutMs = effectiveRemoteCommandTimeout(action.timeoutMs, actor)
     const allowedEnvironment = new Set([
       'PATH', 'PATHEXT', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP', 'HOME', 'USERPROFILE',
       'LANG', 'LC_ALL', 'TERM',
@@ -1166,7 +1189,7 @@ export class DeviceExecutor {
           hostname: os.hostname(),
           release: os.release(),
           shell: process.platform === 'win32' ? 'PowerShell' : '/bin/sh',
-          cpuCount: os.cpus().length,
+          cpuCount: typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length,
           totalMemoryBytes: os.totalmem(),
           tools,
         },
@@ -1177,7 +1200,7 @@ export class DeviceExecutor {
       'printf "HOST\\t%s\\n" "$(hostname)"',
       'printf "ARCH\\t%s\\n" "$(uname -m)"',
       'printf "RELEASE\\t%s\\n" "$(uname -sr)"',
-      'printf "CPU\\t%s\\n" "$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || printf 0)"',
+      'printf "CPU\\t%s\\n" "$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf 0)"',
       'printf "MEM\\t%s\\n" "$(awk \'/MemTotal/{print $2 * 1024}\' /proc/meminfo 2>/dev/null || printf 0)"',
       ...toolNames.map((tool) => `command -v ${tool} >/dev/null 2>&1 && printf "TOOL\\t${tool}\\t1\\n" || printf "TOOL\\t${tool}\\t0\\n"`),
     ].join('; ')
@@ -1357,9 +1380,9 @@ export class RemoteDeviceController {
 
   async execute(siteId: string, action: RemoteDeviceAction, actor: RemoteDeviceActor): Promise<RemoteDeviceActionResult> {
     const timeout = action.op === 'exec'
-      ? Math.min(Number(action.timeoutMs) || 30_000, MAX_COMMAND_TIMEOUT_MS) + 10_000
+      ? effectiveRemoteCommandTimeout(action.timeoutMs, actor) + 10_000
       : action.op === 'git_sync'
-        ? MAX_COMMAND_TIMEOUT_MS + 30_000
+        ? MAX_INTERACTIVE_COMMAND_TIMEOUT_MS + 30_000
       : action.op === 'git_inspect'
         ? 25_000
       : 15_000

@@ -18,7 +18,7 @@ export type DurableRunState =
   | 'outcome_unknown'
 
 export interface DurableRunProvenance {
-  version: 1
+  version: 1 | 2
   capturedAt: string
   platform: string
   architecture: string
@@ -37,6 +37,36 @@ export interface DurableRunProvenance {
     error?: string
   }
   lockfiles: Array<{ path: string; sha256: string }>
+  /** Present for remote execution. Top-level platform/architecture/cwd describe the target; this block
+   * preserves the source checkout identity separately so a cross-architecture result does not claim
+   * that the source hub was the machine under test. */
+  source?: {
+    platform: string
+    architecture: string
+    cwd: string
+    environmentSha256: string
+    environmentKeys: string[]
+    git?: DurableRunProvenance['git']
+    lockfiles: Array<{ path: string; sha256: string }>
+  }
+  execution?: DurableRunExecutionEnvironment
+}
+
+export interface DurableRunExecutionEnvironment {
+  platform: string
+  architecture: string
+  cwd: string
+  environmentId: string
+  observedAt: string
+  fingerprintSha256: string
+  hostname?: string
+  shell?: string
+  cpuCount?: number
+  availableCpuCount?: number
+  totalMemoryBytes?: number
+  transport?: 'myownmesh-rpc' | 'site'
+  nodeKind?: 'hub' | 'lightweight-testbed'
+  buildId?: string
 }
 
 export type DurableRunExecutionTarget =
@@ -98,6 +128,8 @@ export interface DurableRunStartInput {
   timeoutMs: number
   environment?: Record<string, string>
   executionTarget?: DurableRunExecutionTarget
+  /** Hub-observed target identity, never agent-authored. */
+  executionEnvironment?: DurableRunExecutionEnvironment
 }
 
 interface RunRow {
@@ -285,6 +317,7 @@ export async function captureRunProvenance(input: {
   cwd: string
   executionTarget?: DurableRunExecutionTarget
   environment?: Record<string, string>
+  executionEnvironment?: DurableRunExecutionEnvironment
 }): Promise<DurableRunProvenance> {
   const cwd = path.resolve(input.cwd)
   const environment = safeEnvironment(input.environment)
@@ -297,7 +330,7 @@ export async function captureRunProvenance(input: {
     input.args,
     cwd,
     input.executionTarget ?? { kind: 'local' },
-    environmentSha256,
+    input.executionEnvironment?.fingerprintSha256 ?? environmentSha256,
   )
   const provenance: DurableRunProvenance = {
     version: 1,
@@ -378,6 +411,25 @@ export async function captureRunProvenance(input: {
       complete: false,
       error: boundedText(error instanceof Error ? error.message : String(error), 500),
     }
+  }
+  if (input.executionEnvironment) {
+    provenance.version = 2
+    provenance.source = {
+      platform: provenance.platform,
+      architecture: provenance.architecture,
+      cwd: provenance.cwd,
+      environmentSha256: provenance.environmentSha256,
+      environmentKeys: [...provenance.environmentKeys],
+      ...(provenance.git ? { git: { ...provenance.git } } : {}),
+      lockfiles: provenance.lockfiles.map((item) => ({ ...item })),
+    }
+    provenance.platform = input.executionEnvironment.platform
+    provenance.architecture = input.executionEnvironment.architecture
+    provenance.cwd = input.executionEnvironment.cwd
+    provenance.environmentScope = 'execution'
+    provenance.environmentSha256 = input.executionEnvironment.fingerprintSha256
+    provenance.environmentKeys = []
+    provenance.execution = { ...input.executionEnvironment }
   }
   return provenance
 }

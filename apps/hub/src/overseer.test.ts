@@ -123,13 +123,13 @@ describe('application Overseer authority', () => {
 
     expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
       isOverseer: true,
-      overseerCapabilityVersion: 19,
+      overseerCapabilityVersion: 20,
       permissionMode: 'full',
       permissionModeOperatorOverride: true,
       role: 'Application Overseer',
     })
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
-      'Overseer capability manifest version 19',
+      'Overseer capability manifest version 20',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'mcp__allmyagents__overseer_control',
@@ -156,6 +156,9 @@ describe('application Overseer authority', () => {
       'configure_approval_policy',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
+      'project\'s reviewed setup recipe',
+    )
+    expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'Do not use the vendor-native list_agents or peek_agent',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
@@ -166,7 +169,7 @@ describe('application Overseer authority', () => {
     expect(upgrades()).toHaveLength(1)
     expect(upgrades()[0]?.payload).toMatchObject({
       fromVersion: 6,
-      toVersion: 19,
+      toVersion: 20,
       conversationPreserved: true,
       tools: expect.arrayContaining([
         'overseer_control',
@@ -1139,6 +1142,97 @@ describe('application Overseer authority', () => {
     expect(h.sessions.managerInspectRuns('overseer', { runId: started.run!.id })).toMatchObject({
       ok: true,
       logs: { stdout: expect.stringContaining('application durable run') },
+    })
+  })
+
+  it('preserves a long remote timeout and records the target rather than the source hub as execution', async () => {
+    const h = harness()
+    h.seed({
+      id: 'overseer',
+      isOverseer: true,
+      permissionMode: 'full',
+      remoteDeviceGrants: [{
+        siteId: 'risk-box',
+        rootIds: ['root-home'],
+        capabilities: ['terminal'],
+      }],
+    })
+    const execute = vi.fn(async () => ({
+      ok: true,
+      stdout: 'riscv build complete',
+      exitCode: 0,
+      timedOut: false,
+      telemetry: { transport: 'myownmesh-rpc' as const, targetMs: 123_000 },
+    }))
+    h.sessions.setRemoteDeviceController({
+      capabilities: vi.fn(async () => ({
+        enabled: true,
+        platform: 'linux',
+        arch: 'riscv64',
+        hostname: 'Frask-Risk-Box',
+        cpuCount: 16,
+        availableCpuCount: 8,
+        totalMemoryBytes: 15 * 1024 * 1024 * 1024,
+        activeTransport: 'myownmesh-rpc',
+        nodeKind: 'lightweight-testbed',
+        testbedBuild: {
+          payloadId: 'payload-1', codePayloadId: 'code-1', protocol: 1, files: [],
+        },
+        environments: [{
+          id: 'host', kind: 'host', label: 'RISC-V host', platform: 'linux', arch: 'riscv64', shell: '/bin/sh',
+        }],
+        roots: [{
+          id: 'root-home', label: 'Home', path: '/home/admini', read: true, write: true, terminal: true,
+        }],
+      })),
+      execute,
+    } as unknown as RemoteDeviceController)
+    const controller = new DurableRunController(
+      new DurableRunStore(h.journal.db),
+      h.journal,
+      path.join(h.root, 'remote-run-logs'),
+    )
+    h.sessions.setDurableRunController(controller)
+    controller.activate()
+    cleanups.push(() => controller.shutdown())
+
+    const started = await h.sessions.managerStartRun('overseer', {
+      kind: 'build',
+      executable: '(remote shell)',
+      args: [],
+      timeoutMs: 3_600_000,
+      remote: {
+        deviceId: 'risk-box', rootId: 'root-home', cwd: 'checkout', command: 'just build',
+      },
+    })
+    expect(started.ok).toBe(true)
+    await vi.waitFor(() => expect(controller.store.get(started.run!.id)?.state).toBe('succeeded'))
+    expect(execute).toHaveBeenCalledWith(
+      'risk-box',
+      expect.objectContaining({ op: 'exec', timeoutMs: 3_600_000 }),
+      expect.objectContaining({ durableRunId: started.run!.id }),
+    )
+    expect(controller.store.get(started.run!.id)).toMatchObject({
+      timeoutMs: 3_600_000,
+      provenance: {
+        version: 2,
+        platform: 'linux',
+        architecture: 'riscv64',
+        cwd: '/home/admini/checkout',
+        environmentScope: 'execution',
+        execution: {
+          hostname: 'Frask-Risk-Box',
+          cpuCount: 16,
+          availableCpuCount: 8,
+          transport: 'myownmesh-rpc',
+          nodeKind: 'lightweight-testbed',
+          buildId: 'payload-1',
+        },
+        source: {
+          platform: process.platform,
+          architecture: process.arch,
+        },
+      },
     })
   })
 

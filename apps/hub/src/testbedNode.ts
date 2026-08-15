@@ -467,12 +467,19 @@ export async function startTestbedNode(dataDirInput: string): Promise<{ stop: ()
     if (!['probe', 'inspect', 'git_inspect', 'git_sync', 'list', 'read', 'mkdir', 'write', 'exec'].includes(action.op)) {
       throw new Error('unknown remote device operation')
     }
-    const result = await executor.execute(action)
+    const actor = content.actor && typeof content.actor === 'object' && !Array.isArray(content.actor)
+      ? content.actor as Record<string, unknown>
+      : {}
+    const durableRunId = typeof actor.durableRunId === 'string'
+      ? actor.durableRunId.slice(0, 128)
+      : undefined
+    const result = await executor.execute(action, { durableRunId })
     appendTestbedAudit(dataDir, 'device/action', {
       sourceSiteId: envelope.sourceSiteId,
       messageId: envelope.messageId,
       profile: config.profile,
       op: action.op,
+      durableRunId,
       rootId: typeof action.rootId === 'string' ? action.rootId.slice(0, 128) : '',
       ok: result.ok,
       failure: result.failure?.stage,

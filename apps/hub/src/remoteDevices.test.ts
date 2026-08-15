@@ -8,14 +8,26 @@ import { verifyDirectHubEnvelope } from './directHubProtocol.js'
 import type { MyOwnMeshRpcBridge } from './myOwnMeshRpc.js'
 import {
   DeviceExecutor,
+  MAX_DURABLE_COMMAND_TIMEOUT_MS,
+  MAX_INTERACTIVE_COMMAND_TIMEOUT_MS,
   FleetConnectionStore,
   RemoteDeviceController,
   normalizeGitRemoteIdentity,
+  effectiveRemoteCommandTimeout,
   parseRemoteWslEnvironments,
   remoteCapabilityForAction,
   wslUncPath,
   type DeviceExecutorCapabilities,
 } from './remoteDevices.js'
+
+describe('remote command timeout policy', () => {
+  it('keeps ad-hoc shells bounded while honoring the durable run ceiling', () => {
+    expect(effectiveRemoteCommandTimeout(3_600_000)).toBe(MAX_INTERACTIVE_COMMAND_TIMEOUT_MS)
+    expect(effectiveRemoteCommandTimeout(3_600_000, { durableRunId: 'run-1' })).toBe(3_600_000)
+    expect(effectiveRemoteCommandTimeout(24 * 60 * 60_000, { durableRunId: 'run-1' }))
+      .toBe(MAX_DURABLE_COMMAND_TIMEOUT_MS)
+  })
+})
 
 const tempDirs: string[] = []
 const children: ChildProcess[] = []
@@ -174,6 +186,28 @@ describe('DeviceExecutor target policy', () => {
     expect(result).toMatchObject({ ok: true, exitCode: 0, timedOut: false })
     expect(result.stdout).toContain('remote-ok')
   }, 75_000)
+
+  it('classifies a command deadline as a timeout rather than a target failure', async () => {
+    const dir = tempDir()
+    const root = path.join(dir, 'root')
+    fs.mkdirSync(root)
+    const executor = new DeviceExecutor(path.join(dir, 'policy.json'))
+    const policy = executor.update({
+      enabled: true,
+      roots: [{ id: '', label: 'terminal', path: root, read: false, write: false, terminal: true }],
+    })
+    const command = process.platform === 'win32'
+      ? 'Start-Sleep -Seconds 3'
+      : 'sleep 3'
+    await expect(executor.execute({
+      op: 'exec', rootId: policy.roots[0]!.id, command, timeoutMs: 1_000,
+    })).resolves.toMatchObject({
+      ok: false,
+      timedOut: true,
+      failure: { stage: 'timeout', code: 'COMMAND_TIMEOUT' },
+      error: 'command timed out after 1000ms',
+    })
+  }, 15_000)
 
   it('admits only one terminal command per physical root across source hubs', async () => {
     const dir = tempDir()
@@ -408,6 +442,42 @@ describe('RemoteDeviceController', () => {
     })
     expect(resolveRoute).not.toHaveBeenCalled()
     expect(call).toHaveBeenCalledTimes(2)
+  })
+
+  it('carries the durable identity and full timeout through the direct transport', async () => {
+    const dir = tempDir()
+    const connections = new FleetConnectionStore(path.join(dir, 'connections.json'))
+    const remoteToken = 'r'.repeat(64)
+    const localToken = 'l'.repeat(64)
+    connections.upsert({ siteId: 'peerhub', label: 'Peer Hub', token: remoteToken })
+    const call = vi.fn(async (_peer: string, value: unknown, timeoutMs?: number) => {
+      const request = value as { envelope?: unknown }
+      const envelope = verifyDirectHubEnvelope(request.envelope, {
+        fromPeer: 'localhub-session',
+        token: localToken,
+      })
+      expect(envelope.payload).toMatchObject({
+        action: { op: 'exec', timeoutMs: 3_600_000 },
+        actor: { durableRunId: 'durable-1' },
+      })
+      expect(timeoutMs).toBe(3_610_000)
+      return { ok: true, stdout: 'built', exitCode: 0 }
+    })
+    const bridge = {
+      identity: vi.fn(async () => ({ siteId: 'localhub', label: 'Local Hub' })),
+      peers: vi.fn(async () => [{ siteId: 'peerhub', label: 'Peer Hub', online: true, status: 'active' }]),
+      call,
+    } as unknown as MyOwnMeshRpcBridge
+    const controller = new RemoteDeviceController(connections, async () => null, {
+      bridge,
+      localDeviceToken: localToken,
+    })
+
+    await expect(controller.execute('peerhub', {
+      op: 'exec', rootId: 'root-one', command: 'build', timeoutMs: 3_600_000,
+    }, {
+      sessionId: 'session-a', profileId: 'profile-a', durableRunId: 'durable-1',
+    })).resolves.toMatchObject({ ok: true, stdout: 'built' })
   })
 
   it('pairs reciprocally over direct RPC without a Site route', async () => {

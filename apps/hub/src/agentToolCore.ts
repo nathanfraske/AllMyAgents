@@ -1689,7 +1689,8 @@ export const AGENT_TOOLS_INSTRUCTIONS =
   'carries peer authority, so it deliberately cannot spend an expensive wake. If the operator asked for that work ' +
   'to start now, starting it needs operator authority - the Overseer can do that with overseer_control send_chat, ' +
   'and everyone else should say exactly that rather than report the hold upward as a blocker. ' +
-  'Use start_run/inspect_runs for important build and test commands that need a stable handle, serialized checkout ownership, retained logs, exact exit state, and automatic source provenance; never blindly retry a run whose outcome is unknown.'
+  'Use start_run/inspect_runs for important build and test commands that need a stable handle, serialized checkout ownership, retained logs, exact exit state, and automatic source provenance; never blindly retry a run whose outcome is unknown. ' +
+  'For remote provisioning, run the project\'s reviewed setup recipe as its own durable run under the same remote-root lease before the build. Do not infer packages from source, mutate a machine implicitly, or invent a second dependency manifest beside the project\'s own recipes.'
 
 export function getAgentTool(name: string): AgentToolSpec | undefined {
   return BY_NAME.get(name)

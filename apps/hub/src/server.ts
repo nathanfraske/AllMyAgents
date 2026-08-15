@@ -730,7 +730,9 @@ export function startServer(opts: ServerOptions): http.Server {
       const actor = content.actor && typeof content.actor === 'object' && !Array.isArray(content.actor)
         ? content.actor as Record<string, unknown>
         : {}
-      const result = await deviceExecutor.execute(action)
+      const result = await deviceExecutor.execute(action, {
+        durableRunId: (str(actor.durableRunId) ?? '').slice(0, 128) || undefined,
+      })
       journal.append(null, 'device-executor/action', {
         op: action.op,
         rootId: (str(action.rootId) ?? '').slice(0, 128),
@@ -739,6 +741,7 @@ export function startServer(opts: ServerOptions): http.Server {
         // Source-supplied correlation only. The authenticated peer proves which hub sent this; these
         // fields support cross-hub audit joins but never confer authority on the target.
         sourceRunId: (str(actor.runId) ?? '').slice(0, 128),
+        sourceDurableRunId: (str(actor.durableRunId) ?? '').slice(0, 128),
         sourceProjectId: (str(actor.projectId) ?? '').slice(0, 256),
         sourceReplicaId: (str(actor.replicaId) ?? '').slice(0, 128),
         sourceAgentId: (str(actor.agentId) ?? '').slice(0, 256),
@@ -2335,7 +2338,9 @@ export function startServer(opts: ServerOptions): http.Server {
         const actor = body.actor && typeof body.actor === 'object' && !Array.isArray(body.actor)
           ? body.actor as Record<string, unknown>
           : {}
-        const result = await deviceExecutor.execute(action)
+        const result = await deviceExecutor.execute(action, {
+          durableRunId: (str(actor.durableRunId) ?? '').slice(0, 128) || undefined,
+        })
         journal.append(null, 'device-executor/action', {
           op: action.op,
           rootId: (str(action.rootId) ?? '').slice(0, 128),
@@ -2344,6 +2349,7 @@ export function startServer(opts: ServerOptions): http.Server {
           actorSessionId: (str(actor.sessionId) ?? '').slice(0, 256),
           actorProfileId: (str(actor.profileId) ?? '').slice(0, 256),
           sourceRunId: (str(actor.runId) ?? '').slice(0, 128),
+          sourceDurableRunId: (str(actor.durableRunId) ?? '').slice(0, 128),
           sourceProjectId: (str(actor.projectId) ?? '').slice(0, 256),
           sourceReplicaId: (str(actor.replicaId) ?? '').slice(0, 128),
           sourceAgentId: (str(actor.agentId) ?? '').slice(0, 256),
