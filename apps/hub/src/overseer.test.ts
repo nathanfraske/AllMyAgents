@@ -253,6 +253,51 @@ describe('application Overseer authority', () => {
     })
     h.approvals.resolve(mediumId, false)
     await expect(medium).resolves.toBe(false)
+
+    // A Codex connector labels the same bounded operation through its own elicitation envelope. The
+    // transport prefix must not make an operator-configured medium ceiling inert, while the closed
+    // GitHub classifier still keeps merges, pushes, workflows, and unknown connector tools out.
+    ;(h.sessions as unknown as { setStatus(record: SessionRecord, status: 'idle'): void })
+      .setStatus(h.sessions.list().find((record) => record.id === 'overseer')!, 'idle')
+    h.sessions.setOverseerRuntime({
+      overseerConfig: () => ({
+        approvalPolicy: { enabled: true, maxRisk: 'medium', updatedAt: '2026-08-15T00:01:00.000Z' },
+      }),
+    })
+    const connector = h.approvals.request('target', 'codex/mcpServer/elicitation/request', {
+      serverName: 'codex_apps',
+      mode: 'form',
+      requestedSchema: { type: 'object', properties: {} },
+      _meta: {
+        source: 'connector',
+        connector_name: 'GitHub',
+        codex_approval_kind: 'mcp_tool_call',
+        tool_title: 'update_pull_request',
+        tool_params: {
+          repository_full_name: 'nathanfraske/AllMyAgents',
+          pr_number: 31,
+          body: 'bounded body update',
+        },
+      },
+    })
+    const connectorId = h.approvals.pending()[0]!.id
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'approve', approvalId: connectorId, approve: true,
+    })).resolves.toMatchObject({
+      ok: true,
+      data: { approvalId: connectorId, approved: true },
+    })
+    await expect(connector).resolves.toBe(true)
+    expect(h.journal.recentEventsForSession('overseer', 20)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'overseer/approval-decided',
+        payload: expect.objectContaining({
+          origin: 'standing-alert-policy',
+          risk: 'medium',
+          riskReason: expect.stringMatching(/update_pull_request/u),
+        }),
+      }),
+    ]))
   })
 
   it('persists a connector approval only on a direct operator turn and only within advertised scopes', async () => {

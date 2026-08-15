@@ -10899,8 +10899,9 @@ const LOW_RISK_GITHUB_OPERATIONS = new Set([
   'get_pull_request_reviews', 'list_pull_requests', 'get_workflow_run', 'list_workflow_runs',
 ])
 const MEDIUM_RISK_GITHUB_OPERATIONS = new Set([
-  'add_comment_to_pull_request', 'create_pull_request', 'create_pull_request_review',
-  'request_pull_request_review', 'update_pull_request',
+  'add_comment_to_issue', 'add_comment_to_pull_request', 'create_pull_request',
+  'create_pull_request_review', 'request_pull_request_review', 'update_issue_comment',
+  'update_pull_request',
 ])
 
 /** Fail-closed semantic risk classification for the standing Overseer approval exception. */
@@ -10909,11 +10910,14 @@ function classifyOverseerApprovalRisk(
 ): { level: 'low' | 'medium'; reason: string } | undefined {
   const github = classifyGitHubAutomationApproval(approval.kind, approval.payload)
   if (github) {
-    if (LOW_RISK_GITHUB_OPERATIONS.has(github.operation)) {
-      return { level: 'low', reason: `read-only GitHub operation ${github.operation}` }
+    const operation = github.operation.startsWith('GitHub connector ')
+      ? github.operation.slice('GitHub connector '.length)
+      : github.operation
+    if (LOW_RISK_GITHUB_OPERATIONS.has(operation)) {
+      return { level: 'low', reason: `read-only GitHub operation ${operation}` }
     }
-    if (MEDIUM_RISK_GITHUB_OPERATIONS.has(github.operation)) {
-      return { level: 'medium', reason: `bounded GitHub collaboration operation ${github.operation}` }
+    if (MEDIUM_RISK_GITHUB_OPERATIONS.has(operation)) {
+      return { level: 'medium', reason: `bounded GitHub collaboration operation ${operation}` }
     }
     return undefined
   }

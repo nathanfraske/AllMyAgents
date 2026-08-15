@@ -55,7 +55,7 @@ fs.writeFileSync(path.join(output, 'README.txt'), [
   'AllMyAgents lightweight testbed node',
   '',
   'This payload contains no vendor CLI, account, journal, project, or operator credential.',
-  'It requires a running AllMyStuff/MyOwnMesh node on the target machine.',
+  'It requires a running MyOwnMesh daemon on the target machine; AllMyStuff is optional bootstrap convenience.',
   '',
   `Scoped: ${launch} configure --profile scoped --root <path> --read --write --terminal`,
   `Run:    ${launch} run`,
@@ -65,7 +65,7 @@ fs.writeFileSync(path.join(output, 'README.txt'), [
     ? [`Dedicated service user with passwordless sudo: ${launch} install-elevated --profile linux-sudo-machine`]
     : []),
   '',
-  'Same signed-fleet peers can authorize over the authenticated fleet roster without a pairing code.',
+  'Automatic signed-fleet trust is off by default; pair with a one-use code unless it was explicitly enabled.',
   'An agent still needs an explicit per-chat device/root grant from its source AllMyAgents hub.',
   '',
 ].join('\n'))
