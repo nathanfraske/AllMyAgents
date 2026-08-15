@@ -46,6 +46,7 @@ afterEach(() => {
 
 function makeSessions(danger: DangerFlags = SAFE): {
   sessions: SessionManager
+  approvals: ApprovalService
   projects: ProjectStore
   dir: string
   journal: Journal
@@ -57,11 +58,12 @@ function makeSessions(danger: DangerFlags = SAFE): {
   opened.push(journal)
   const store = new SessionStore(journal.db)
   const projects = new ProjectStore(journal.db)
+  const approvals = new ApprovalService(journal)
   const sessions = new SessionManager(
     journal,
     store,
     new Map(),
-    new ApprovalService(journal),
+    approvals,
     new UsageMonitor(journal, [], {}),
     new WorkspaceManager(path.join(dir, 'wt')),
     projects,
@@ -88,7 +90,7 @@ function makeSessions(danger: DangerFlags = SAFE): {
     ;(sessions as unknown as { sessions: Map<string, SessionRecord> }).sessions.set(record.id, record)
     return record
   }
-  return { sessions, projects, dir, journal, seed }
+  return { sessions, approvals, projects, dir, journal, seed }
 }
 
 /** Establish operator provenance for the in-flight turn, exactly as send() does. */
@@ -448,6 +450,64 @@ describe('operator-owned GitHub automation policy', () => {
         commandActions: [{ command: 'gh pr comment 42 --body tested && gh repo delete acme/widget' }],
       }),
     ).toBe(false)
+  })
+
+  it('satisfies only exact GitHub connector elicitations covered by the scoped grant', async () => {
+    const { sessions, approvals, project, journal } = createGitHubProject()
+    sessions.configureGitHubAutomationPolicy('project', project.id, ['pull_requests'], 'operator')
+    markBusTurn(sessions, 's1')
+    approvals.setAutoApprove((sessionId, kind, payload) => sessions.isAutoApproved(sessionId, kind, payload))
+    const connector = (toolName: string, toolParams: Record<string, unknown>) => ({
+      serverName: 'codex_apps',
+      mode: 'form',
+      toolName,
+      requestedSchema: { type: 'object', properties: {} },
+      _meta: {
+        source: 'connector',
+        connector_name: 'GitHub',
+        codex_approval_kind: 'mcp_tool_call',
+        tool_title: toolName,
+        tool_params: toolParams,
+        persist: ['session', 'always'],
+      },
+    })
+
+    await expect(approvals.requestDetailed(
+      's1',
+      'codex/mcpServer/elicitation/request',
+      connector('update_pull_request', {
+        repository_full_name: 'acme/widget', pull_number: 31, body: 'New body',
+      }),
+      'connector-auto-approved',
+    )).resolves.toEqual({ approved: true, status: 'approved' })
+    expect(approvals.pending()).toEqual([])
+    expect(approvals.recentResolved(['s1'])).toEqual([
+      expect.objectContaining({
+        id: 'connector-auto-approved', status: 'approved', decider: 'policy:auto-approve',
+      }),
+    ])
+    expect(sessions.isAutoApproved('s1', 'codex/mcpServer/elicitation/request', connector(
+      'merge_pull_request',
+      { repository_full_name: 'acme/widget', pull_number: 31 },
+    ))).toBe(false)
+    expect(sessions.isAutoApproved('s1', 'codex/mcpServer/elicitation/request', connector(
+      'update_pull_request',
+      { repository_full_name: 'other/repository', pull_number: 31, body: 'Wrong repo' },
+    ))).toBe(false)
+
+    const audit = [...journal.replay(0)].find((event) => event.kind === 'github-automation/auto-approved')
+    expect(audit?.payload).toMatchObject({
+      capability: 'pull_requests',
+      operation: 'GitHub connector update_pull_request',
+      transport: 'mcp',
+      repository: 'acme/widget',
+      policyScopes: ['project'],
+      parameterSummary: {
+        pull_number: 31,
+        body: { chars: 8, sha256: expect.stringMatching(/^[a-f0-9]{64}$/u) },
+      },
+    })
+    expect(JSON.stringify([...journal.replay(0)])).not.toContain('New body')
   })
 
   it('keeps an Overseer grant direct-operator-only so peer/diagnostic turns cannot mutate GitHub', () => {

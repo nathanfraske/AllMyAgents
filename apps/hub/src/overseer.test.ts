@@ -123,13 +123,13 @@ describe('application Overseer authority', () => {
 
     expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
       isOverseer: true,
-      overseerCapabilityVersion: 20,
+      overseerCapabilityVersion: 21,
       permissionMode: 'full',
       permissionModeOperatorOverride: true,
       role: 'Application Overseer',
     })
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
-      'Overseer capability manifest version 20',
+      'Overseer capability manifest version 21',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'mcp__allmyagents__overseer_control',
@@ -169,7 +169,7 @@ describe('application Overseer authority', () => {
     expect(upgrades()).toHaveLength(1)
     expect(upgrades()[0]?.payload).toMatchObject({
       fromVersion: 6,
-      toVersion: 20,
+      toVersion: 21,
       conversationPreserved: true,
       tools: expect.arrayContaining([
         'overseer_control',
@@ -253,6 +253,50 @@ describe('application Overseer authority', () => {
     })
     h.approvals.resolve(mediumId, false)
     await expect(medium).resolves.toBe(false)
+  })
+
+  it('persists a connector approval only on a direct operator turn and only within advertised scopes', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'target', profileId: 'p2', provider: 'codex', permissionMode: 'safe' })
+    h.markOperator('overseer')
+    const request = (id: string, advertised: unknown) => h.approvals.requestDetailed(
+      'target',
+      'codex/mcpServer/elicitation/request',
+      {
+        serverName: 'codex_apps',
+        toolName: 'update_pull_request',
+        _meta: { persist: advertised },
+      },
+      id,
+    )
+
+    const persisted = request('persist-me', ['session', 'always'])
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'approve', approvalId: 'persist-me', approve: true, persist: 'always',
+    })).resolves.toMatchObject({
+      ok: true,
+      data: { approvalId: 'persist-me', approved: true, persist: 'always' },
+    })
+    await expect(persisted).resolves.toEqual({ approved: true, status: 'approved', persist: 'always' })
+
+    const unsupported = request('unsupported-persist', ['session'])
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'approve', approvalId: 'unsupported-persist', approve: true, persist: 'always',
+    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/did not advertise/u) })
+    h.approvals.resolve('unsupported-persist', false)
+    await expect(unsupported).resolves.toMatchObject({ approved: false, status: 'denied' })
+
+    const alertOnly = request('alert-persist', ['always'])
+    ;(h.sessions as unknown as { operatorTurnSessions: Set<string> }).operatorTurnSessions.delete('overseer')
+    h.markBus('overseer')
+    ;(h.sessions as unknown as { overseerApprovalTurnIds: Map<string, Set<string>> })
+      .overseerApprovalTurnIds.set('overseer', new Set(['alert-persist']))
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'approve', approvalId: 'alert-persist', approve: true, persist: 'always',
+    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/direct operator turn/u) })
+    h.approvals.resolve('alert-persist', false)
+    await expect(alertOnly).resolves.toMatchObject({ approved: false, status: 'denied' })
   })
 
   it('does not derive standing approval authority from teammate-authored alert text', async () => {

@@ -243,3 +243,43 @@ describe('ApprovalService — resolved-before-crash recovery across a hub restar
     expect(successor.pending().map((r) => r.id)).toEqual(['id-never'])
   })
 })
+
+describe('ApprovalService durable decision audit and persistence', () => {
+  it('returns explicit connector persistence and keeps the disposition queryable across restart', async () => {
+    const { approvals, journal } = fresh()
+    const pending = approvals.requestDetailed(
+      'codex-session',
+      'codex/mcpServer/elicitation/request',
+      { toolName: 'update_pull_request' },
+      'persisted-approval',
+    )
+    expect(approvals.resolve('persisted-approval', true, {
+      decider: 'overseer:application',
+      persist: 'session',
+    })).toBe(true)
+    await expect(pending).resolves.toEqual({ approved: true, status: 'approved', persist: 'session' })
+
+    const successor = new ApprovalService(journal)
+    expect(successor.recentResolved(['codex-session'])).toEqual([
+      expect.objectContaining({
+        id: 'persisted-approval',
+        sessionId: 'codex-session',
+        status: 'approved',
+        decider: 'overseer:application',
+        persist: 'session',
+      }),
+    ])
+  })
+
+  it('never records persistence on a denial', async () => {
+    const { approvals } = fresh()
+    const pending = approvals.requestDetailed('s1', 'codex/mcpServer/elicitation/request', {}, 'denied-persist')
+    approvals.resolve('denied-persist', false, { decider: 'operator:api', persist: 'always' })
+    await expect(pending).resolves.toEqual({ approved: false, status: 'denied' })
+    const decisions = approvals.recentResolved(['s1'])
+    expect(decisions).toEqual([
+      expect.objectContaining({ id: 'denied-persist', status: 'denied', decider: 'operator:api' }),
+    ])
+    expect(decisions[0]).not.toHaveProperty('persist')
+  })
+})

@@ -1,6 +1,11 @@
 import crypto from 'node:crypto'
+import type Database from 'better-sqlite3'
 import type { Journal } from './journal.js'
-import type { ApprovalRecord } from './types.js'
+import type {
+  ApprovalDecisionRecord,
+  ApprovalPersistence,
+  ApprovalRecord,
+} from './types.js'
 
 /** A human-facing approval should survive an ordinary meeting, break, or unattended build. */
 export const DEFAULT_APPROVAL_TIMEOUT_MS = 60 * 60 * 1000
@@ -34,6 +39,41 @@ export interface ApprovalServiceOptions {
 export interface ApprovalDecision {
   approved: boolean
   status: Extract<ApprovalRecord['status'], 'approved' | 'denied' | 'timeout'>
+  persist?: ApprovalPersistence
+}
+
+export interface ApprovalResolutionOptions {
+  decider?: string
+  persist?: ApprovalPersistence
+}
+
+/** Connector bodies can be very large; the policy-specific event carries their bounded digest summary. */
+function boundedAutoApprovalAuditPayload(kind: string, payload: unknown): unknown {
+  if (kind !== 'codex/mcpServer/elicitation/request') return payload
+  const p = payload as {
+    serverName?: unknown
+    mode?: unknown
+    toolName?: unknown
+    _meta?: {
+      source?: unknown
+      connector_name?: unknown
+      codex_approval_kind?: unknown
+      tool_title?: unknown
+    }
+  } | null
+  if (p?.serverName !== 'codex_apps' || p._meta?.source !== 'connector') return payload
+  return {
+    serverName: p.serverName,
+    mode: p.mode,
+    toolName: p.toolName,
+    _meta: {
+      source: p._meta.source,
+      connector_name: p._meta.connector_name,
+      codex_approval_kind: p._meta.codex_approval_kind,
+      tool_title: p._meta.tool_title,
+      tool_params: '[recorded as bounded github-automation/auto-approved parameterSummary]',
+    },
+  }
 }
 
 export class ApprovalService {
@@ -46,12 +86,43 @@ export class ApprovalService {
   /** Ids already served from a durable decision, so one recovery never becomes a standing grant. */
   private readonly recoveredIds = new Set<string>()
   private readonly timeoutMs: number
+  private readonly insertDecisionStmt: Database.Statement
+  private readonly latestDecisionStmt: Database.Statement
 
   constructor(private readonly journal: Journal, options: ApprovalServiceOptions = {}) {
     const requested = options.timeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS
     this.timeoutMs = Number.isFinite(requested) && requested >= 1_000
       ? Math.floor(requested)
       : DEFAULT_APPROVAL_TIMEOUT_MS
+    journal.db.exec(`
+      CREATE TABLE IF NOT EXISTS approval_decisions (
+        decision_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        approval_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('approved', 'denied', 'timeout')),
+        created_at TEXT NOT NULL,
+        resolved_at TEXT NOT NULL,
+        decider TEXT NOT NULL,
+        persist TEXT CHECK (persist IS NULL OR persist IN ('session', 'always'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_approval_decisions_session_recent
+        ON approval_decisions(session_id, decision_seq DESC);
+      CREATE INDEX IF NOT EXISTS idx_approval_decisions_id_recent
+        ON approval_decisions(approval_id, decision_seq DESC);
+    `)
+    this.insertDecisionStmt = journal.db.prepare(`
+      INSERT INTO approval_decisions
+        (approval_id, session_id, kind, status, created_at, resolved_at, decider, persist)
+      VALUES
+        (@id, @sessionId, @kind, @status, @createdAt, @resolvedAt, @decider, @persist)
+    `)
+    this.latestDecisionStmt = journal.db.prepare(`
+      SELECT persist FROM approval_decisions
+      WHERE approval_id = ?
+      ORDER BY decision_seq DESC
+      LIMIT 1
+    `)
   }
 
   /**
@@ -100,7 +171,7 @@ export class ApprovalService {
         reason: options.reason,
         decision: 'approved',
       })
-      if (this.finish(entry.record.id, true, 'approved')) released += 1
+      if (this.finish(entry.record.id, true, 'approved', { decider: `policy:${options.reason}` })) released += 1
     }
     return released
   }
@@ -162,7 +233,25 @@ export class ApprovalService {
     // privileged tools with no audit trail would be strictly worse than prompting. The operator can see
     // everything that ran on their behalf without having been asked.
     if (this.autoApprove?.(sessionId, kind, payload) === true) {
-      this.journal.append(sessionId, 'approval/auto-approved', { id: id ?? null, kind, payload })
+      const decisionId = id ?? crypto.randomUUID()
+      const decidedAt = new Date().toISOString()
+      this.journal.atomic(() => {
+        this.journal.append(sessionId, 'approval/auto-approved', {
+          id: decisionId,
+          kind,
+          payload: boundedAutoApprovalAuditPayload(kind, payload),
+        })
+        this.insertDecisionStmt.run({
+          id: decisionId,
+          sessionId,
+          kind,
+          status: 'approved',
+          createdAt: decidedAt,
+          resolvedAt: decidedAt,
+          decider: 'policy:auto-approve',
+          persist: null,
+        })
+      })
       return Promise.resolve(true)
     }
     const record: ApprovalRecord = {
@@ -179,7 +268,7 @@ export class ApprovalService {
       resolve = res
     })
     const timer = setTimeout(() => {
-      this.finish(record.id, false, 'timeout')
+      this.finish(record.id, false, 'timeout', { decider: 'system:timeout' })
     }, this.timeoutMs)
     this.pendingMap.set(record.id, { record, resolve, timer, promise })
     try {
@@ -197,9 +286,45 @@ export class ApprovalService {
   async requestDetailed(sessionId: string, kind: string, payload: unknown, id?: string): Promise<ApprovalDecision> {
     const decisionId = id ?? crypto.randomUUID()
     const approved = await this.request(sessionId, kind, payload, decisionId)
-    if (approved) return { approved: true, status: 'approved' }
+    const row = this.latestDecisionStmt.get(decisionId) as { persist?: ApprovalPersistence | null } | undefined
+    if (approved) {
+      return {
+        approved: true,
+        status: 'approved',
+        ...(row?.persist ? { persist: row.persist } : {}),
+      }
+    }
     const status = this.journal.resolvedApproval(decisionId)
     return { approved: false, status: status === 'timeout' ? 'timeout' : 'denied' }
+  }
+
+  /** Recent durable dispositions remain queryable after they leave the pending queue and across restarts. */
+  recentResolved(sessionIds?: readonly string[], limit = 50): ApprovalDecisionRecord[] {
+    const bounded = Math.max(1, Math.min(Math.trunc(limit), 200))
+    if (sessionIds && sessionIds.length === 0) return []
+    const where = sessionIds
+      ? `WHERE session_id IN (${sessionIds.map(() => '?').join(', ')})`
+      : ''
+    const rows = this.journal.db.prepare(`
+      SELECT
+        decision_seq AS decisionSeq,
+        approval_id AS id,
+        session_id AS sessionId,
+        kind,
+        status,
+        created_at AS createdAt,
+        resolved_at AS resolvedAt,
+        decider,
+        persist
+      FROM approval_decisions
+      ${where}
+      ORDER BY decision_seq DESC
+      LIMIT ?
+    `).all(...(sessionIds ?? []), bounded) as Array<ApprovalDecisionRecord & { persist: ApprovalPersistence | null }>
+    return rows.map((row) => {
+      const { persist, ...rest } = row
+      return { ...rest, ...(persist ? { persist } : {}) }
+    })
   }
 
   /**
@@ -209,21 +334,51 @@ export class ApprovalService {
    * one that actually settled a pending entry. (Kept as a boolean so the `/api/approvals/:id` route's
    * `found ? 200 : 404` contract is preserved.)
    */
-  resolve(id: string, approved: boolean): boolean {
-    return this.finish(id, approved, approved ? 'approved' : 'denied')
+  resolve(id: string, approved: boolean, options: ApprovalResolutionOptions = {}): boolean {
+    return this.finish(id, approved, approved ? 'approved' : 'denied', options)
   }
 
-  private finish(id: string, approved: boolean, status: ApprovalRecord['status']): boolean {
+  private finish(
+    id: string,
+    approved: boolean,
+    status: ApprovalRecord['status'],
+    options: ApprovalResolutionOptions = {},
+  ): boolean {
     const entry = this.pendingMap.get(id)
     if (!entry) return false // idempotent no-op: unknown or already-resolved/timed-out id
+    const terminalStatus = status === 'approved' || status === 'denied' || status === 'timeout'
+      ? status
+      : approved ? 'approved' : 'denied'
+    const resolvedAt = new Date().toISOString()
+    const decider = options.decider?.trim() || 'operator:unspecified'
+    const persist = approved ? options.persist : undefined
+    this.journal.atomic(() => {
+      this.journal.append(entry.record.sessionId, 'approval/resolved', {
+        id: entry.record.id,
+        status: terminalStatus,
+        kind: entry.record.kind,
+        createdAt: entry.record.createdAt,
+        resolvedAt,
+        decider,
+        persist: persist ?? null,
+      })
+      this.insertDecisionStmt.run({
+        id: entry.record.id,
+        sessionId: entry.record.sessionId,
+        kind: entry.record.kind,
+        status: terminalStatus,
+        createdAt: entry.record.createdAt,
+        resolvedAt,
+        decider,
+        persist: persist ?? null,
+      })
+    })
     this.pendingMap.delete(id)
     clearTimeout(entry.timer)
-    entry.record.status = status
-    this.journal.append(entry.record.sessionId, 'approval/resolved', {
-      id: entry.record.id,
-      status,
-      kind: entry.record.kind,
-    })
+    entry.record.status = terminalStatus
+    entry.record.resolvedAt = resolvedAt
+    entry.record.decider = decider
+    if (persist) entry.record.persist = persist
     entry.resolve(approved)
     try {
       this.resolvedListener?.(entry.record)

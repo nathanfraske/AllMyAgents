@@ -338,6 +338,7 @@ export interface ReplayComplete {
 }
 
 export type ApprovalStatus = 'pending' | 'approved' | 'denied' | 'timeout'
+export type ApprovalPersistence = 'session' | 'always'
 
 export interface ApprovalRecord {
   id: string
@@ -346,6 +347,21 @@ export interface ApprovalRecord {
   payload: unknown
   status: ApprovalStatus
   createdAt: string
+  resolvedAt?: string
+  decider?: string
+  persist?: ApprovalPersistence
+}
+
+export interface ApprovalDecisionRecord {
+  decisionSeq: number
+  id: string
+  sessionId: string
+  kind: string
+  status: Extract<ApprovalStatus, 'approved' | 'denied' | 'timeout'>
+  createdAt: string
+  resolvedAt: string
+  decider: string
+  persist?: ApprovalPersistence
 }
 
 export interface ClaudeLimitInfo {

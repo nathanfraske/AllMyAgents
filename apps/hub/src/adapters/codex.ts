@@ -129,9 +129,15 @@ export function codexRequestResult(
   method: string,
   approved: boolean,
   params?: unknown,
+  persist?: import('../types.js').ApprovalPersistence,
 ): Record<string, unknown> {
   if (method === CODEX_ELICITATION_METHOD) {
-    return { action: approved ? 'accept' : 'decline' }
+    if (!approved) return { action: 'decline', content: null }
+    return {
+      action: 'accept',
+      content: {},
+      ...(persist ? { _meta: { persist } } : {}),
+    }
   }
   if (method === CODEX_PERMISSIONS_APPROVAL_METHOD) {
     const requested = (params as { permissions?: unknown } | null)?.permissions

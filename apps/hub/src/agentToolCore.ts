@@ -9,6 +9,7 @@ import type {
   DangerFlags,
   DelegatedAuthority,
   ManagerAgentType,
+  ApprovalPersistence,
   Provider,
   RemoteDeviceGrant,
 } from './types.js'
@@ -87,6 +88,7 @@ export interface OverseerControlInput {
   serviceTier?: string
   role?: string
   approve?: boolean
+  persist?: ApprovalPersistence
   approvalPolicyEnabled?: boolean
   approvalRiskCeiling?: 'low' | 'medium'
   reauth?: boolean
@@ -894,7 +896,7 @@ const controlRun = defineTool({
 const queryTeam = defineTool({
   name: 'query_team',
   description:
-    'Project managers and the application Overseer: one bounded, non-destructive query across team messages, task boards, pending approvals, and durable runs. Filters are applied inside your live managed scope. Message pages use a stable cursor and never mark mail read; task/approval/run facets are current projections.',
+    'Project managers and the application Overseer: one bounded, non-destructive query across team messages, task boards, pending approvals plus recent durable approval decisions, and durable runs. Filters are applied inside your live managed scope. Message pages use a stable cursor and never mark mail read; task/approval/run facets are current projections.',
   schema: {
     entities: z.array(z.enum(['messages', 'tasks', 'approvals', 'runs'])).max(4).optional(),
     session_ids: z.array(z.string()).max(64).optional(),
@@ -1503,7 +1505,7 @@ const overseerPreset = z.object({
 const overseerControl = defineTool({
   name: 'overseer_control',
   description:
-    'Application Overseer only: explain how AllMyAgents works; inspect fleet failures and live account usage; configure projects, managers, manager account handoffs, reusable team presets, chats, accounts, remote-device grants, narrow GitHub automation policies/imports, mesh pairing, lightweight testbed deployment/update, direct peer-Overseer messages, and safe hub restarts; and configure durable Standard, Tokenmaxxing, or Eco operating modes. GitHub automation can be granted to one exact session or every chat attached to one project, and covers only the explicitly listed PR/workflow/push capabilities. Lightweight testbed deployment uses the signed-fleet AllMyStuff file and terminal planes and requires an explicit elevated profile plus blast-radius reason. sync_testbed_node reconciles an already-paired Linux node over its authenticated device lane, stages only changed portable modules, schedules a detached restart, and verifies the new build without replaying an ambiguous mutation. Elevated commands require an operator-owned project policy or application-machine policy, blast-radius analysis, a separate explicit operator approval, and (on Windows) UAC. Omit project_id for application-level service, process, registry, or other host maintenance. Mutations are denied on teammate-caused turns except an operator-configured, risk-bounded decision on the exact approval alert that started the turn; a remote Overseer turn may only reply to the same authenticated peer.',
+    'Application Overseer only: explain how AllMyAgents works; inspect fleet failures and live account usage; configure projects, managers, manager account handoffs, reusable team presets, chats, accounts, remote-device grants, narrow GitHub automation policies/imports, mesh pairing, lightweight testbed deployment/update, direct peer-Overseer messages, and safe hub restarts; and configure durable Standard, Tokenmaxxing, or Eco operating modes. GitHub automation can be granted to one exact session or every chat attached to one project, and covers only the explicitly listed PR/workflow/push capabilities, including strict matching Codex GitHub connector elicitations. approve is one-shot by default; persist=session or persist=always is allowed only on a direct operator turn and only when that exact connector request advertised it. Lightweight testbed deployment uses the signed-fleet AllMyStuff file and terminal planes and requires an explicit elevated profile plus blast-radius reason. sync_testbed_node reconciles an already-paired Linux node over its authenticated device lane, stages only changed portable modules, schedules a detached restart, and verifies the new build without replaying an ambiguous mutation. Elevated commands require an operator-owned project policy or application-machine policy, blast-radius analysis, a separate explicit operator approval, and (on Windows) UAC. Omit project_id for application-level service, process, registry, or other host maintenance. Mutations are denied on teammate-caused turns except an operator-configured, risk-bounded one-shot decision on the exact approval alert that started the turn; a remote Overseer turn may only reply to the same authenticated peer.',
   schema: {
     operation: z.enum([
       'status', 'guide', 'ui_catalog', 'highlight_ui', 'failure_context', 'get_operating_mode', 'set_operating_mode', 'create_project', 'create_chat', 'send_chat', 'stop_chat',
@@ -1533,6 +1535,10 @@ const overseerControl = defineTool({
     service_tier: z.string().max(64).optional(),
     role: z.string().max(2_000).optional(),
     approve: z.boolean().optional(),
+    persist: z
+      .enum(['session', 'always'])
+      .optional()
+      .describe('approve only: explicitly persist a Codex connector elicitation for this vendor session or always; omitted means one-shot'),
     approval_policy_enabled: z.boolean().optional(),
     approval_risk_ceiling: z.enum(['low', 'medium']).optional(),
     reauth: z.boolean().optional(),
@@ -1590,6 +1596,7 @@ const overseerControl = defineTool({
       serviceTier: args.service_tier,
       role: args.role,
       approve: args.approve,
+      persist: args.persist,
       approvalPolicyEnabled: args.approval_policy_enabled,
       approvalRiskCeiling: args.approval_risk_ceiling,
       reauth: args.reauth,

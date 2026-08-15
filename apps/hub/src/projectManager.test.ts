@@ -1510,8 +1510,8 @@ describe('project manager visibility into its own workers', () => {
     })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/outside your live managed scope/i) })
   })
 
-  it('queries scoped messages and task projections without exposing another hierarchy', () => {
-    const { sessions, journal, bus, seed } = buildHub()
+  it('queries scoped messages, tasks, and durable approval dispositions without exposing another hierarchy', async () => {
+    const { sessions, journal, bus, approvals, seed } = buildHub()
     const manager = seed({ id: 'manager', projectId: 'project', isProjectManager: true })
     const child = seed({ id: 'child', projectId: 'project', parentSessionId: manager.id, role: 'Build verifier' })
     const outsider = seed({ id: 'outsider', projectId: 'other-project', isProjectManager: true })
@@ -1552,6 +1552,26 @@ describe('project manager visibility into its own workers', () => {
       messageCursor: { hasMore: false },
     })
     expect(JSON.stringify(result.data)).not.toContain('outside hierarchy')
+
+    const decided = approvals.request(child.id, 'claude/tool', { toolName: 'Read' }, 'decided-approval')
+    approvals.resolve('decided-approval', true, { decider: `manager:${manager.id}` })
+    await expect(decided).resolves.toBe(true)
+    const stillPending = approvals.request(child.id, 'claude/tool', { toolName: 'Write' }, 'pending-approval')
+    const approvalResult = sessions.managerQueryTeam(manager.id, {
+      entities: ['approvals'],
+      sessionIds: [child.id],
+      statuses: ['pending', 'approved'],
+      limit: 20,
+    })
+    expect(approvalResult.data).toMatchObject({
+      approvals: [expect.objectContaining({ id: 'pending-approval', status: 'pending' })],
+      approvalDecisions: [expect.objectContaining({
+        id: 'decided-approval', status: 'approved', decider: `manager:${manager.id}`,
+      })],
+    })
+    approvals.resolve('pending-approval', false, { decider: `manager:${manager.id}` })
+    await expect(stillPending).resolves.toBe(false)
+
     expect(sessions.managerQueryTeam(manager.id, { sessionIds: [outsider.id] })).toMatchObject({
       ok: false,
       error: expect.stringMatching(/outside your managed scope/i),

@@ -2570,7 +2570,9 @@ export function startServer(opts: ServerOptions): http.Server {
       if (method === 'POST' && approvalMatch) {
         const body = await readBody(req)
         const pending = approvals.pending().find((candidate) => candidate.id === approvalMatch[1])
-        const found = approvals.resolve(approvalMatch[1] as string, body.approve === true)
+        const found = approvals.resolve(approvalMatch[1] as string, body.approve === true, {
+          decider: 'operator:api',
+        })
         if (found && pending) {
           journal.append(pending.sessionId, 'operator/approval-decided', {
             approvalId: pending.id,

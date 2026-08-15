@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { WorkerExecutor, type WorkerExecutorHubCallbacks } from './workerExecutor.js'
 import { HubUnavailableError } from './workerProtocol.js'
 import type { WorkerClient } from './workerTransport.js'
@@ -227,5 +227,41 @@ describe('WorkerExecutor targeted sub-agent interrupt', () => {
         targetId: 'task-1',
       }),
     ])
+  })
+})
+
+describe('WorkerExecutor approval relay', () => {
+  it('carries an explicit Codex persistence decision back to the supervised worker', async () => {
+    let onRelay: ((message: Extract<WorkerToHub, { t: 'approvalRequest' }>) => void) | undefined
+    const sent: unknown[] = []
+    const client = {
+      onEvent: () => {},
+      onTurnLifecycle: () => {},
+      onRestartRequest: () => {},
+      onRelay: (handler: typeof onRelay) => { onRelay = handler },
+      onWelcome: () => {},
+      on: () => {},
+      connect: () => {},
+      call: async () => { throw new Error('unused') },
+      send: (message: unknown) => { sent.push(message) },
+    } as unknown as WorkerClient
+    const hub = recordingHub().hub
+    hub.resolveApproval = async () => ({ approved: true, status: 'approved', persist: 'always' })
+    new WorkerExecutor(client, hub)
+
+    onRelay?.({
+      t: 'approvalRequest',
+      approvalId: 'ap-persist',
+      sessionId: 's1',
+      kind: 'codex/mcpServer/elicitation/request',
+      payload: {},
+    })
+    await vi.waitFor(() => expect(sent).toContainEqual({
+      t: 'approvalResolved',
+      approvalId: 'ap-persist',
+      approved: true,
+      status: 'approved',
+      persist: 'always',
+    }))
   })
 })
