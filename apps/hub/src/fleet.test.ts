@@ -106,6 +106,7 @@ describe('buildFleet (unified-across-mesh roster, first cut)', () => {
       local: false,
       baseUrl: 'http://localhost:43000',
       online: false,
+      routeCode: 'route-error',
       routeError: expect.stringMatching(/advertises an AllMyAgents hub.*health did not answer/u),
     })
   })
@@ -230,6 +231,49 @@ describe('buildFleet (unified-across-mesh roster, first cut)', () => {
     )
     expect(mapped).toEqual([7888, 7999])
     expect(out[1]).toMatchObject({ baseUrl: 'http://localhost:47004', online: true })
+  })
+
+  it('uses the well-known fallback only for the exact paired target when its presence advert is missing', async () => {
+    const mapped: Array<[string, number]> = []
+    const out = await buildFleet(deps({
+      roster: async () => [member('paired', 'Paired rig'), member('unrelated', 'Unrelated rig')],
+      peerSites: async () => [advertised('unrelated', 8123)],
+      targetDeviceId: 'paired-session-suffix',
+      hubPort: 7777,
+      siteMap: async (node, port) => {
+        mapped.push([node, port])
+        return 47_006
+      },
+      probeHealth: async () => true,
+    }))
+
+    expect(mapped).toEqual([['paired', 7777]])
+    expect(out[1]).toMatchObject({ siteId: 'paired', baseUrl: 'http://localhost:47006', online: true })
+    expect(out.some((site) => site.siteId === 'unrelated')).toBe(false)
+  })
+
+  it('distinguishes an unhealthy hub response from a mapped port with no listener', async () => {
+    const unhealthy = await buildFleet(deps({
+      roster: async () => [member('laptop')],
+      peerSites: async () => [advertised('laptop', 7777)],
+      siteMap: async () => 47_007,
+      probeRoute: async () => ({ online: false, failure: 'http-error', statusCode: 503 }),
+    }))
+    expect(unhealthy[1]).toMatchObject({
+      routeCode: 'hub-unhealthy',
+      routeError: expect.stringMatching(/HTTP 503.*unhealthy/u),
+    })
+
+    const absent = await buildFleet(deps({
+      roster: async () => [member('testbed')],
+      peerSites: async () => [advertised('testbed', 7777)],
+      siteMap: async () => 47_008,
+      probeRoute: async () => ({ online: false, failure: 'connection-refused', error: 'ECONNREFUSED' }),
+    }))
+    expect(absent[1]).toMatchObject({
+      routeCode: 'hub-unreachable',
+      routeError: expect.stringMatching(/nothing is listening/u),
+    })
   })
 
   it('discovers more than two hubs independently from their own adverts', async () => {

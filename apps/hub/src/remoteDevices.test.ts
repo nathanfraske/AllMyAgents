@@ -371,6 +371,33 @@ describe('RemoteDeviceController', () => {
     expect(controller.saveConnection({ siteId: 'peer', label: 'Renamed', token }).changed).toBe(true)
   })
 
+  it('surfaces the exact route diagnosis and code instead of collapsing every failure to offline', async () => {
+    const dir = tempDir()
+    const connections = new FleetConnectionStore(path.join(dir, 'connections.json'))
+    connections.upsert({ siteId: 'peer', label: 'Peer', token: 'r'.repeat(64) })
+    const controller = new RemoteDeviceController(connections, async () => ({
+      siteId: 'peer',
+      label: 'Peer',
+      baseUrl: '',
+      online: false,
+      failureCode: 'hub-unhealthy',
+      error: 'The mapped peer hub answered /api/health with HTTP 503, so the hub is unhealthy.',
+    }))
+
+    await expect(controller.catalog()).resolves.toMatchObject([{
+      siteId: 'peer',
+      connected: false,
+      error: expect.stringMatching(/HTTP 503.*unhealthy/u),
+    }])
+    await expect(controller.execute('peer', {
+      op: 'probe', rootId: 'root-one',
+    }, { sessionId: 'session-a', profileId: 'profile-a' })).resolves.toMatchObject({
+      ok: false,
+      failure: { stage: 'route', code: 'hub-unhealthy' },
+      error: expect.stringMatching(/HTTP 503.*unhealthy/u),
+    })
+  })
+
   it('uses the authenticated Site-free RPC lane for granted capabilities and actions', async () => {
     const dir = tempDir()
     const connections = new FleetConnectionStore(path.join(dir, 'connections.json'))

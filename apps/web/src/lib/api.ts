@@ -1041,6 +1041,7 @@ export interface FleetSite {
   baseUrl: string
   online: boolean
   routeError?: string
+  routeCode?: 'site-map-unavailable' | 'hub-unreachable' | 'hub-unhealthy' | 'route-timeout' | 'route-error'
   directOnline?: boolean
   directStatus?: string
   directRttMs?: number

@@ -28,6 +28,8 @@ export interface FleetSite {
   online: boolean
   /** Bounded operator-facing diagnosis when presence/mapping succeeded but hub health did not. */
   routeError?: string
+  /** Machine-readable companion to routeError for remote-device callers and UI policy. */
+  routeCode?: 'site-map-unavailable' | 'hub-unreachable' | 'hub-unhealthy' | 'route-timeout' | 'route-error'
   /** A site-free MyOwnMesh RPC control lane is active even if the TCP Site tunnel is not. */
   directOnline?: boolean
   directStatus?: string
@@ -52,16 +54,27 @@ export interface BuildFleetDeps {
   siteMap: (node: string, port: number) => Promise<number | null>
   /** Replace a mapped-but-unresponsive route (explicit unmap/remap), with rate limiting in the caller. */
   recoverSiteMap?: (node: string, port: number) => Promise<number | null>
-  /** `GET <baseUrl>/api/health` → true when a hub answered. */
-  probeHealth: (baseUrl: string) => Promise<boolean>
+  /** `GET <baseUrl>/api/health` → true when a hub answered. Kept as the small compatibility seam. */
+  probeHealth?: (baseUrl: string) => Promise<boolean>
+  /** Detailed health evidence for operator-facing route diagnosis. Production supplies this seam. */
+  probeRoute?: (baseUrl: string) => Promise<HubHealthProbe>
   /** Explicit legacy candidate, when a caller has one. Omitted by the automatic path. */
   hubPort?: number
+  /** Restrict fallback-port probing to one already-paired device instead of sweeping the roster. */
+  targetDeviceId?: string
   /**
    * Operator-configured fallback ports. These remain useful for an old/mislabelled peer that does not
    * advertise an identifiable AllMyAgents site. Unlike the default path, explicit overrides are tried
    * across roster members because the operator deliberately named them.
    */
   extraPorts?: readonly number[]
+}
+
+export interface HubHealthProbe {
+  online: boolean
+  statusCode?: number
+  failure?: 'http-error' | 'connection-refused' | 'timeout' | 'transport-error' | 'invalid-url'
+  error?: string
 }
 
 function canonicalDevice(id: string): string {
@@ -122,21 +135,39 @@ export async function buildFleet(deps: BuildFleetDeps): Promise<FleetSite[]> {
     ...(deps.hubPort == null ? [] : [deps.hubPort]),
     ...(deps.extraPorts ?? []),
   ].filter(validPort)
+  const targetDevice = deps.targetDeviceId ? canonicalDevice(deps.targetDeviceId) : undefined
+  const routeMembers = targetDevice === undefined
+    ? members
+    : members.filter((member) => canonicalDevice(member.device) === targetDevice)
 
   const remotes = await Promise.all(
-    members.map(async (m): Promise<FleetSite | null> => {
+    routeMembers.map(async (m): Promise<FleetSite | null> => {
       // Presence is exact and quiet: only a peer that explicitly advertises an AllMyAgents-labelled
       // allow-list entry gets mapped. Explicit peerPorts remain the opt-in escape hatch for old peers.
-      const ports = [...new Set([...(discovered.get(canonicalDevice(m.device)) ?? []), ...overridePorts])]
+      const canonicalMember = canonicalDevice(m.device)
+      const targetedFallback = targetDevice === undefined || targetDevice === canonicalMember
+      const ports = [...new Set([
+        ...(discovered.get(canonicalMember) ?? []),
+        ...(targetedFallback ? overridePorts : []),
+      ])]
       if (ports.length === 0) return null
       let firstMapped: string | null = null
+      let lastProbe: HubHealthProbe | undefined
       for (const port of ports) {
         const localPort = await deps.siteMap(m.device, port).catch(() => null)
         // No map = the node refused (this very device), the peer is offline, or there's no node.
         if (localPort == null) continue
         const baseUrl = `http://localhost:${localPort}`
         if (firstMapped === null) firstMapped = baseUrl
-        let online = await deps.probeHealth(baseUrl).catch(() => false)
+        let probe = deps.probeRoute
+          ? await deps.probeRoute(baseUrl).catch((error): HubHealthProbe => ({
+              online: false,
+              failure: 'transport-error',
+              error: error instanceof Error ? error.message : String(error),
+            }))
+          : { online: await deps.probeHealth?.(baseUrl).catch(() => false) ?? false }
+        lastProbe = probe
+        let online = probe.online
         let recoveredBaseUrl = baseUrl
         // A site mapping may remain marked active while its byte path is dead. `site_map` alone is
         // idempotent and hands back that same listener, so replace it once before declaring the hub
@@ -146,7 +177,15 @@ export async function buildFleet(deps: BuildFleetDeps): Promise<FleetSite[]> {
           if (recoveredPort != null) {
             recoveredBaseUrl = `http://localhost:${recoveredPort}`
             if (firstMapped === baseUrl) firstMapped = recoveredBaseUrl
-            online = await deps.probeHealth(recoveredBaseUrl).catch(() => false)
+            probe = deps.probeRoute
+              ? await deps.probeRoute(recoveredBaseUrl).catch((error): HubHealthProbe => ({
+                  online: false,
+                  failure: 'transport-error',
+                  error: error instanceof Error ? error.message : String(error),
+                }))
+              : { online: await deps.probeHealth?.(recoveredBaseUrl).catch(() => false) ?? false }
+            lastProbe = probe
+            online = probe.online
           }
         }
         // A HUB ANSWERED — stop here. Keep probing on failure, because a mapped-but-silent port proves
@@ -159,15 +198,40 @@ export async function buildFleet(deps: BuildFleetDeps): Promise<FleetSite[]> {
       // co-owned machine the node can reach, just without a hub we could find — and a peer that silently
       // vanishes from the roster is indistinguishable from one that was never paired, which is the more
       // confusing failure. Dropping only the unmappable ones preserves the previous behaviour for those.
-      if (firstMapped === null) return null
+      if (firstMapped === null) {
+        if (targetDevice !== canonicalMember) return null
+        return {
+          siteId: m.device,
+          label: m.label || m.device.slice(0, 8),
+          local: false,
+          baseUrl: '',
+          online: false,
+          routeCode: 'site-map-unavailable',
+          routeError: 'This device is in the signed fleet roster, but AllMyStuff could not map a local Site route to its hub.',
+        }
+      }
+      const routeCode: NonNullable<FleetSite['routeCode']> = lastProbe?.failure === 'http-error'
+        ? 'hub-unhealthy'
+        : lastProbe?.failure === 'connection-refused'
+          ? 'hub-unreachable'
+          : lastProbe?.failure === 'timeout'
+            ? 'route-timeout'
+            : 'route-error'
+      const routeError = lastProbe?.failure === 'http-error'
+        ? `The mapped peer hub answered /api/health with HTTP ${lastProbe.statusCode ?? 'error'}, so the hub is unhealthy.`
+        : lastProbe?.failure === 'connection-refused'
+          ? 'The Site route mapped successfully, but nothing is listening on the peer hub port.'
+          : lastProbe?.failure === 'timeout'
+            ? 'The Site route mapped successfully, but the peer hub health check timed out.'
+            : 'The peer advertises an AllMyAgents hub and a local mesh tunnel was mapped, but /api/health did not answer.'
       return {
         siteId: m.device,
         label: m.label || m.device.slice(0, 8),
         local: false,
         baseUrl: firstMapped,
         online: false,
-        routeError:
-          'This peer advertises an AllMyAgents hub and a local mesh tunnel was mapped, but /api/health did not answer after route recovery.',
+        routeCode,
+        routeError,
       }
     })
   )
@@ -182,27 +246,42 @@ export async function buildFleet(deps: BuildFleetDeps): Promise<FleetSite[]> {
  * (docs/mesh-unified-fleet.md §1, sites.rs:12-16 host-side per-connection allow-list re-check.)
  */
 export function probeHubHealth(baseUrl: string, timeoutMs = 1500): Promise<boolean> {
+  return probeHubRoute(baseUrl, timeoutMs).then((probe) => probe.online)
+}
+
+/** Detailed companion to probeHubHealth for surfaces that must distinguish 503 from no listener. */
+export function probeHubRoute(baseUrl: string, timeoutMs = 1500): Promise<HubHealthProbe> {
   return new Promise((resolve) => {
     let done = false
-    const finish = (ok: boolean): void => {
+    const finish = (result: HubHealthProbe): void => {
       if (done) return
       done = true
-      resolve(ok)
+      resolve(result)
     }
     try {
       const u = new URL('/api/health', baseUrl)
       const req = http.get(u, { timeout: timeoutMs }, (res) => {
         const ok = typeof res.statusCode === 'number' && res.statusCode >= 200 && res.statusCode < 300
         res.resume() // drain so the socket frees
-        finish(ok)
+        finish(ok
+          ? { online: true, statusCode: res.statusCode }
+          : { online: false, statusCode: res.statusCode, failure: 'http-error' })
       })
       req.on('timeout', () => {
         req.destroy()
-        finish(false)
+        finish({ online: false, failure: 'timeout' })
       })
-      req.on('error', () => finish(false))
-    } catch {
-      finish(false)
+      req.on('error', (error: NodeJS.ErrnoException) => finish({
+        online: false,
+        failure: error.code === 'ECONNREFUSED' ? 'connection-refused' : 'transport-error',
+        ...(error.code ? { error: error.code } : {}),
+      }))
+    } catch (error) {
+      finish({
+        online: false,
+        failure: 'invalid-url',
+        error: error instanceof Error ? error.message : String(error),
+      })
     }
   })
 }

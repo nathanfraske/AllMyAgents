@@ -1268,6 +1268,9 @@ export interface RemoteDeviceRoute {
   label: string
   baseUrl: string
   online: boolean
+  /** Bounded diagnosis from signed-roster, Site-map, and health-probe resolution. */
+  error?: string
+  failureCode?: string
 }
 
 async function boundedJson(response: Response, onBytes?: (bytes: number) => void): Promise<unknown> {
@@ -1517,7 +1520,7 @@ export class RemoteDeviceController {
         ...connection,
         online: route?.online === true,
         transport: 'site' as const,
-        ...(!route?.online ? { error: 'No live direct RPC peer or Site route.' } : {}),
+        ...(!route?.online ? { error: route?.error ?? 'No live direct RPC peer or Site route.' } : {}),
       }
     }))
   }
@@ -1591,7 +1594,11 @@ export class RemoteDeviceController {
     telemetry.routeMs = Math.round((performance.now() - routeStarted) * 10) / 10
     if (!route?.online) {
       telemetry.roundTripMs = Math.round((performance.now() - started) * 10) / 10
-      throw new RemoteRequestError('The remote device route is offline.', { stage: 'route' }, telemetry)
+      throw new RemoteRequestError(
+        route?.error ?? 'The remote device route is offline.',
+        { stage: 'route', ...(route?.failureCode ? { code: route.failureCode } : {}) },
+        telemetry,
+      )
     }
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)

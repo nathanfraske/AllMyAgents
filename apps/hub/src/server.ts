@@ -31,7 +31,7 @@ import { tokenMatches } from './deviceToken.js'
 import { PairingCodeBroker } from './pairingCode.js'
 import { pickFolder } from './native.js'
 import { computeStats } from './stats.js'
-import { buildFleet, probeHubHealth, rosterAuthorizesDevice } from './fleet.js'
+import { buildFleet, probeHubRoute, rosterAuthorizesDevice } from './fleet.js'
 import { credentialsExist, type LoginAuthMode } from './loginLauncher.js'
 import type { ProfileLoginCoordinator } from './profileLoginCoordinator.js'
 import { readProjectConfig } from './importScan.js'
@@ -2257,7 +2257,7 @@ export function startServer(opts: ServerOptions): http.Server {
             : {}),
           // A fresh route still has to negotiate before its first bytes flow. A short ordinary HTTP
           // timeout falsely marked WAN peers offline while the tunnel was healthy but settling.
-          probeHealth: (baseUrl) => probeHubHealth(baseUrl, 5000),
+          probeRoute: (baseUrl) => probeHubRoute(baseUrl, 5000),
           extraPorts: meshPeerPorts,
         })
         const directPeers = m.enabled

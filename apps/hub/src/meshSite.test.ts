@@ -150,6 +150,18 @@ describe('MeshSite registration', () => {
     expect(status.error).toContain('local-only')
     expect(calls).toBe(1)
   })
+
+  it('preserves a control-pipe permission failure for authority-sensitive roster callers', async () => {
+    const request: MeshControlRequest = async () => {
+      const error = new Error('connect EPERM') as NodeJS.ErrnoException
+      error.code = 'EPERM'
+      throw error
+    }
+    const mesh = new MeshSite({ port: 7777, enable: true, controlRequest: request })
+
+    await expect(mesh.ownedRoster()).resolves.toEqual([])
+    await expect(mesh.ownedRosterRequired()).rejects.toThrow(/interactive console user.*full-duplex/u)
+  })
 })
 
 describe('MeshSite route recovery', () => {

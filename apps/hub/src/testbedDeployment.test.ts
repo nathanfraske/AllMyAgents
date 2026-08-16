@@ -193,6 +193,25 @@ describe('lightweight testbed deployment orchestration', () => {
     expect(disconnect).toHaveBeenCalledTimes(2)
   })
 
+  it('reports degraded direct discovery instead of returning an indistinguishable empty target list', async () => {
+    const service = new TestbedDeploymentService({
+      bundleDir: bundle(),
+      directMesh: {
+        peers: vi.fn(async () => []),
+        status: vi.fn(() => ({
+          available: false,
+          method: 'allmyagents.hub.v1',
+          reason: 'permission-denied',
+          error: 'control pipe access denied',
+        })),
+      } as unknown as MyOwnMeshRpcBridge,
+      remoteDevices: { listConnections: () => [] } as unknown as RemoteDeviceController,
+      ownedRoster: async () => [{ device: 'target' }],
+    })
+
+    await expect(service.targets()).rejects.toThrow(/degraded, not empty.*full-duplex/u)
+  })
+
   it('syncs only changed portable files, treats a severed restart response as ambiguous, and verifies before success', async () => {
     const root = bundle()
     const desiredCode = codePayloadId(root)
