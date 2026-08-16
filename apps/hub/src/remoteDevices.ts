@@ -14,7 +14,11 @@ const MAX_DIRECTORY_ENTRIES = 500
 const MAX_COMMAND_CHARS = 16 * 1024
 const MAX_COMMAND_OUTPUT_BYTES = 512 * 1024
 const MAX_REMOTE_RESPONSE_BYTES = 2 * 1024 * 1024
-const MAX_COMMAND_TIMEOUT_MS = 120_000
+/** Ad-hoc remote shells stay deliberately short. Durable runs have their own audited handle, lease,
+ * retained terminal state, and explicit timeout, so they may use the same six-hour ceiling exposed by
+ * start_run without silently inheriting this interactive limit. */
+export const MAX_INTERACTIVE_COMMAND_TIMEOUT_MS = 120_000
+export const MAX_DURABLE_COMMAND_TIMEOUT_MS = 6 * 60 * 60_000
 const MAX_DEVICE_ROOTS = 128
 const MAX_FLEET_CONNECTIONS = 256
 const MAX_CONCURRENT_COMMANDS = 8
@@ -167,14 +171,32 @@ export interface DeviceExecutorCapabilities {
   hostname: string
   /** Bounded inventory facts for the operator's device overview. Optional on older paired nodes. */
   cpuCount?: number
+  /** CPUs available to this process after affinity/cgroup constraints; use this for build parallelism. */
+  availableCpuCount?: number
   totalMemoryBytes?: number
   /** Present when the executor is the vendor-free service rather than a full AllMyAgents hub. */
   nodeKind?: 'hub' | 'lightweight-testbed'
   /** Operator-selected install profile; descriptive only and never an authority token. */
   deploymentProfile?: 'scoped' | 'full-machine' | 'elevated-machine' | 'linux-sudo-machine'
   elevated?: boolean
+  /** The route that actually answered this capability probe. Source-hub observed, never target asserted. */
+  activeTransport?: 'myownmesh-rpc' | 'site'
+  /** Credential-free release identity reported by lightweight nodes. Optional on pre-update nodes. */
+  testbedBuild?: TestbedBuildIdentity
+  /** Public SSH host-key fingerprints observed locally and carried over the authenticated mesh lane. */
+  sshHostKeyFingerprints?: string[]
   environments: RemoteExecutionEnvironment[]
   roots: DeviceRootPolicy[]
+}
+
+export interface TestbedBuildIdentity {
+  payloadId: string
+  /** Architecture-independent application modules, used to reconcile mixed-architecture nodes. */
+  codePayloadId: string
+  appVersion?: string
+  sourceCommit?: string
+  protocol: number
+  files: Array<{ path: string; sha256: string; bytes: number }>
 }
 
 export interface RemoteExecutionEnvironment {
@@ -205,6 +227,8 @@ export interface RemoteEnvironmentInspection {
 }
 
 export interface RemoteDeviceTelemetry {
+  /** The route that carried this exact action. */
+  transport?: 'myownmesh-rpc' | 'site'
   /** Time spent locating/refreshing the AllMyStuff route on the source hub. */
   routeMs?: number
   /** HTTP request/response time after the route was resolved. */
@@ -282,6 +306,17 @@ export interface RemoteDeviceActor {
   replicaId?: string
   agentId?: string
   baseCommit?: string
+  /** Hub-authenticated execution class. This widens only the command duration; grants and root policy
+   * are still checked independently on both hubs. */
+  durableRunId?: string
+}
+
+export function effectiveRemoteCommandTimeout(
+  requested: number | undefined,
+  actor?: Pick<RemoteDeviceActor, 'durableRunId'>,
+): number {
+  const maximum = actor?.durableRunId ? MAX_DURABLE_COMMAND_TIMEOUT_MS : MAX_INTERACTIVE_COMMAND_TIMEOUT_MS
+  return Math.max(1_000, Math.min(Number(requested) || 30_000, maximum))
 }
 
 function inside(root: string, target: string): boolean {
@@ -682,7 +717,7 @@ export async function syncGitCheckout(input: {
   const trackingRef = `refs/remotes/origin/${headRef}`
   const fetched = await invoke([
     'fetch', '--no-tags', 'origin', `+refs/heads/${headRef}:${trackingRef}`,
-  ], MAX_COMMAND_TIMEOUT_MS)
+  ], MAX_INTERACTIVE_COMMAND_TIMEOUT_MS)
   if (fetched.timedOut) return fail('Git fetch timed out; the checkout was not switched.', 'FETCH_TIMEOUT', before)
   if (fetched.error || fetched.status !== 0 || fetched.truncated) {
     return fail('Git could not fetch the requested branch non-interactively.', 'FETCH_FAILED', before)
@@ -710,13 +745,21 @@ export async function syncGitCheckout(input: {
 }
 
 /** Target-side execution boundary. Disabled with zero roots until the operator configures it. */
+export interface DeviceExecutorOptions {
+  /** Put Linux commands in their own transient systemd unit so child logging cannot bury the node unit. */
+  isolateLinuxCommands?: boolean
+}
+
 export class DeviceExecutor {
   private policy: DeviceExecutorPolicy = { enabled: false, roots: [] }
   private activeCommands = 0
   /** Target-authoritative fence across every paired source hub for this physical root. */
   private readonly activeCommandRoots = new Set<string>()
 
-  constructor(private readonly file: string) {
+  constructor(
+    private readonly file: string,
+    private readonly options: DeviceExecutorOptions = {},
+  ) {
     try {
       const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as DeviceExecutorPolicy
       this.policy = this.normalizePolicy(parsed)
@@ -732,6 +775,7 @@ export class DeviceExecutor {
       arch: process.arch,
       hostname: os.hostname(),
       cpuCount: os.cpus().length,
+      availableCpuCount: typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length,
       totalMemoryBytes: os.totalmem(),
       environments: discoverExecutionEnvironments(),
       roots: this.policy.roots.map((root) => ({ ...root })),
@@ -745,11 +789,15 @@ export class DeviceExecutor {
     return this.capabilities()
   }
 
-  async execute(action: RemoteDeviceAction): Promise<RemoteDeviceActionResult> {
+  async execute(action: RemoteDeviceAction, actor?: Pick<RemoteDeviceActor, 'durableRunId'>): Promise<RemoteDeviceActionResult> {
     const started = performance.now()
     const finish = (result: RemoteDeviceActionResult): RemoteDeviceActionResult => ({
       ...result,
-      failure: result.ok ? undefined : (result.failure ?? { stage: 'target' }),
+      failure: result.ok
+        ? undefined
+        : (result.failure ?? (result.timedOut
+            ? { stage: 'timeout', code: 'COMMAND_TIMEOUT' }
+            : { stage: 'target' })),
       telemetry: { ...result.telemetry, targetMs: Math.max(0, Math.round((performance.now() - started) * 10) / 10) },
     })
     if (!this.policy.enabled) return finish({ ok: false, error: 'Remote device execution is disabled on this machine.' })
@@ -799,7 +847,7 @@ export class DeviceExecutor {
       this.activeCommands += 1
       this.activeCommandRoots.add(root.id)
       try {
-        return finish(await this.exec(root, action))
+        return finish(await this.exec(root, action, actor))
       } finally {
         this.activeCommands -= 1
         this.activeCommandRoots.delete(root.id)
@@ -997,12 +1045,13 @@ export class DeviceExecutor {
   private exec(
     root: DeviceRootPolicy,
     action: Extract<RemoteDeviceAction, { op: 'exec' }>,
+    actor?: Pick<RemoteDeviceActor, 'durableRunId'>,
   ): Promise<RemoteDeviceActionResult> {
     if (typeof action.command !== 'string' || action.command.length === 0 || action.command.length > MAX_COMMAND_CHARS || action.command.includes('\0')) {
       throw new Error('command must be a non-empty bounded string')
     }
     const cwd = this.resolveExisting(root, action.cwd, 'cwd', true)
-    const timeoutMs = Math.max(1000, Math.min(Number(action.timeoutMs) || 30_000, MAX_COMMAND_TIMEOUT_MS))
+    const timeoutMs = effectiveRemoteCommandTimeout(action.timeoutMs, actor)
     const allowedEnvironment = new Set([
       'PATH', 'PATHEXT', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP', 'HOME', 'USERPROFILE',
       'LANG', 'LC_ALL', 'TERM',
@@ -1018,12 +1067,35 @@ export class DeviceExecutor {
     // Prefer the maintained PowerShell runtime when present. Windows PowerShell 5.1 can spend
     // an unbounded-looking amount of time in cold CLR/AMSI initialization on a loaded host;
     // PowerShell 7 is also the shell GitHub's current Windows runners execute reliably.
-    const program = wsl ? 'wsl.exe' : process.platform === 'win32' ? windowsPowerShell().program : '/bin/sh'
-    const args = wsl
-      ? ['--distribution', wsl.distro, '--cd', linuxCwd!, '--exec', '/usr/bin/env', 'ALLMYAGENTS_REMOTE_TESTBED=1', '/bin/sh', '-lc', action.command]
+    let program = wsl ? 'wsl.exe' : process.platform === 'win32' ? windowsPowerShell().program : '/bin/sh'
+    let isolatedUnit: string | undefined
+    let isolatedViaSudo = false
+    let args = wsl
+      ? ['--distribution', wsl.distro, '--cd', linuxCwd!, '--exec', '/usr/bin/env', 'ALLMYAGENTS_REMOTE_TESTBED=1', '/bin/sh', '-c', action.command]
       : process.platform === 'win32'
         ? ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', action.command]
-        : ['-lc', action.command]
+        : ['-c', action.command]
+    if (!wsl && process.platform === 'linux' && this.options.isolateLinuxCommands === true) {
+      const unit = `allmyagents-testbed-exec-${crypto.randomBytes(8).toString('hex')}`
+      isolatedUnit = `${unit}.service`
+      const systemdArgs = [
+        '--quiet', '--wait', '--pipe', '--collect', `--unit=${unit}`,
+        `--working-directory=${cwd}`, '--setenv=ALLMYAGENTS_REMOTE_TESTBED=1',
+        `--property=RuntimeMaxSec=${Math.max(1, Math.ceil(timeoutMs / 1000))}s`,
+        '--property=TimeoutStopSec=5s',
+      ]
+      const uid = typeof process.getuid === 'function' ? process.getuid() : 0
+      if (uid === 0) {
+        program = 'systemd-run'
+        args = [...systemdArgs, '/bin/sh', '-c', action.command]
+      } else {
+        // linux-sudo-machine deliberately grants this service account passwordless sudo. Keep the
+        // command under the same uid while moving it into a distinct systemd unit/cgroup.
+        program = 'sudo'
+        isolatedViaSudo = true
+        args = ['-n', 'systemd-run', ...systemdArgs, `--uid=${uid}`, '/bin/sh', '-c', action.command]
+      }
+    }
     return new Promise((resolve) => {
       let child: ChildProcess
       try {
@@ -1062,6 +1134,11 @@ export class DeviceExecutor {
         try {
           if (process.platform === 'win32') {
             spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore', timeout: 5000 })
+          } else if (isolatedUnit) {
+            const control = isolatedViaSudo ? 'sudo' : 'systemctl'
+            const prefix = isolatedViaSudo ? ['-n', 'systemctl'] : []
+            spawnSync(control, [...prefix, 'kill', '--kill-who=all', isolatedUnit], { stdio: 'ignore', timeout: 5000 })
+            spawnSync(control, [...prefix, 'stop', isolatedUnit], { stdio: 'ignore', timeout: 5000 })
           } else {
             process.kill(-child.pid, 'SIGKILL')
           }
@@ -1098,7 +1175,7 @@ export class DeviceExecutor {
       const tools = Object.fromEntries(toolNames.map((tool) => {
         const checked = process.platform === 'win32'
           ? spawnSync(program, [tool], { windowsHide: true, stdio: 'ignore', timeout: 2_000 })
-          : spawnSync(program, ['-lc', `command -v ${tool}`], { windowsHide: true, stdio: 'ignore', timeout: 2_000 })
+          : spawnSync(program, ['-c', `command -v ${tool}`], { windowsHide: true, stdio: 'ignore', timeout: 2_000 })
         return [tool, checked.status === 0]
       }))
       return {
@@ -1112,7 +1189,7 @@ export class DeviceExecutor {
           hostname: os.hostname(),
           release: os.release(),
           shell: process.platform === 'win32' ? 'PowerShell' : '/bin/sh',
-          cpuCount: os.cpus().length,
+          cpuCount: typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length,
           totalMemoryBytes: os.totalmem(),
           tools,
         },
@@ -1123,11 +1200,11 @@ export class DeviceExecutor {
       'printf "HOST\\t%s\\n" "$(hostname)"',
       'printf "ARCH\\t%s\\n" "$(uname -m)"',
       'printf "RELEASE\\t%s\\n" "$(uname -sr)"',
-      'printf "CPU\\t%s\\n" "$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || printf 0)"',
+      'printf "CPU\\t%s\\n" "$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf 0)"',
       'printf "MEM\\t%s\\n" "$(awk \'/MemTotal/{print $2 * 1024}\' /proc/meminfo 2>/dev/null || printf 0)"',
       ...toolNames.map((tool) => `command -v ${tool} >/dev/null 2>&1 && printf "TOOL\\t${tool}\\t1\\n" || printf "TOOL\\t${tool}\\t0\\n"`),
     ].join('; ')
-    const result = spawnSync('wsl.exe', ['--distribution', distro, '--exec', '/bin/sh', '-lc', script], {
+    const result = spawnSync('wsl.exe', ['--distribution', distro, '--exec', '/bin/sh', '-c', script], {
       windowsHide: true,
       encoding: 'utf8',
       timeout: 10_000,
@@ -1296,15 +1373,16 @@ export class RemoteDeviceController {
 
   async capabilities(siteId: string): Promise<DeviceExecutorCapabilities> {
     const direct = await this.directCall<DeviceExecutorCapabilities>(siteId, 'device_capabilities', {}).catch(() => null)
-    if (direct) return direct
-    return this.request<DeviceExecutorCapabilities>(siteId, '/api/device-executor', 'GET')
+    if (direct) return { ...direct, activeTransport: 'myownmesh-rpc' }
+    const site = await this.request<DeviceExecutorCapabilities>(siteId, '/api/device-executor', 'GET')
+    return { ...site, activeTransport: 'site' }
   }
 
   async execute(siteId: string, action: RemoteDeviceAction, actor: RemoteDeviceActor): Promise<RemoteDeviceActionResult> {
     const timeout = action.op === 'exec'
-      ? Math.min(Number(action.timeoutMs) || 30_000, MAX_COMMAND_TIMEOUT_MS) + 10_000
+      ? effectiveRemoteCommandTimeout(action.timeoutMs, actor) + 10_000
       : action.op === 'git_sync'
-        ? MAX_COMMAND_TIMEOUT_MS + 30_000
+        ? MAX_INTERACTIVE_COMMAND_TIMEOUT_MS + 30_000
       : action.op === 'git_inspect'
         ? 25_000
       : 15_000
@@ -1331,6 +1409,7 @@ export class RemoteDeviceController {
         failure: directResult.ok ? undefined : (directResult.failure ?? { stage: 'target' }),
         telemetry: {
           ...directResult.telemetry,
+          transport: 'myownmesh-rpc',
           routeMs: 0,
           ...(targetMs === undefined ? {} : { networkMs: Math.max(0, Math.round((roundTripMs - targetMs) * 10) / 10) }),
           roundTripMs,
@@ -1350,6 +1429,7 @@ export class RemoteDeviceController {
         failure: result.ok ? undefined : (result.failure ?? { stage: 'target' }),
         telemetry: {
           ...telemetry,
+          transport: 'site',
           ...(transferBytes === undefined ? {} : {
             transferBytes,
             transferBytesPerSecond: Math.round(transferBytes / Math.max((telemetry.roundTripMs ?? 1) / 1000, 0.001)),

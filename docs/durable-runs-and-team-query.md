@@ -60,7 +60,7 @@ scheduler can now be mechanical rather than creating a third job system.
 
 - bus messages addressed to sessions in the caller's live managed hierarchy;
 - current provider/manager task boards;
-- pending approvals; and
+- pending approvals plus recent durable decisions (status, decider, resolution time, and explicit vendor persistence); and
 - durable runs.
 
 The hub derives visible session ids from authenticated hierarchy. Project managers see themselves and their
@@ -68,8 +68,10 @@ managed descendants; the Overseer sees non-retired local records, and must provi
 fleet-wide request would exceed 64 records. A caller cannot widen scope by supplying ids.
 
 Message filtering happens in SQLite before results are returned. Pages are ordered by append-only row id,
-return a stable `next` cursor and `hasMore`, and never mark messages delivered or read. Task, approval, and run
-facets are current projections rather than consumable inbox entries. `session_ids`, `from_session_ids`,
+return a stable `next` cursor and `hasMore`, and never mark messages delivered or read. Pending approvals remain
+in `approvals`; bounded resolved dispositions remain separately available in `approvalDecisions`, including after
+hub restart, without scanning the event journal. Task, approval, and run facets are current projections rather
+than consumable inbox entries. `session_ids`, `from_session_ids`,
 `statuses`, `kinds`, `unread_only`, and `limit` keep a manager from reconstructing state by polling every child
 or loading an unbounded transcript.
 
@@ -78,3 +80,18 @@ own provider-native plan, assign every worker through `assign_child_task`, dispa
 the configured target, and run important verification through the durable scheduler. Existing manager and
 Overseer sessions receive this contract through versioned, idempotent instruction rematerialization on the next
 public-owner boot; it does not wake idle sessions or append recurring reminder mail.
+
+## GitHub connector approval policy
+
+The operator-owned GitHub automation policy is also the authority source for Codex GitHub connector
+elicitations. The hub accepts only the exact `codex_apps` GitHub approval envelope, an explicit unambiguous
+`owner/repository`, and a closed operation-to-capability mapping. `pull_requests`, `pull_request_merges`,
+`workflow_runs`, and `repository_pushes` remain independent grants; one never implies another. Unknown tools,
+schemas, repositories, connectors, and operation names fail closed and continue to prompt. Each policy-driven
+decision journals the operation, repository, granting scope, and a bounded parameter summary; free-form bodies
+are represented by character count and SHA-256 rather than duplicated into the journal.
+
+An Overseer `approve` response remains one-shot unless the operator explicitly supplies `persist=session` or
+`persist=always` on a direct operator turn. Persistence is accepted only when that exact Codex elicitation
+advertised the requested option and is returned using the vendor protocol's response metadata. Standing
+alert-turn approval authority can never persist a vendor decision.

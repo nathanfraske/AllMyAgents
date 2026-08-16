@@ -12,8 +12,9 @@ import {
   type DeviceRootPolicy,
   type RemoteDeviceAction,
   type RemoteExecutionEnvironment,
+  type TestbedBuildIdentity,
 } from './remoteDevices.js'
-import { MyOwnMeshRpcBridge, myOwnMeshControlRequest } from './myOwnMeshRpc.js'
+import { defaultMyOwnMeshSocketPath, MyOwnMeshRpcBridge, myOwnMeshControlRequest } from './myOwnMeshRpc.js'
 
 export type TestbedNodeProfile = 'scoped' | 'full-machine' | 'elevated-machine' | 'linux-sudo-machine'
 
@@ -34,6 +35,8 @@ const AUDIT_GENERATIONS = 4
 const PAIR_CODE_TTL_MS = 10 * 60 * 1000
 const MESSAGE_REPLAY_TTL_MS = 10 * 60 * 1000
 const PAIR_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+const TESTBED_MODULES = ['testbedNode.js', 'deviceToken.js', 'remoteDevices.js', 'directHubProtocol.js', 'myOwnMeshRpc.js'] as const
+const TESTBED_SERVICE = 'allmyagents-testbed.service'
 
 function atomicJson(file: string, value: unknown): void {
   fs.mkdirSync(path.dirname(file), { recursive: true })
@@ -56,6 +59,84 @@ function boundedString(value: unknown, label: string, max = 256): string {
   const out = value.trim()
   if (!out || out.length > max || /[\u0000-\u001f\u007f]/u.test(out)) throw new Error(`${label} is malformed`)
   return out
+}
+
+function sha256File(file: string): string {
+  return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
+}
+
+function payloadRoot(): string {
+  return path.dirname(currentDistDir())
+}
+
+/** Build identity is descriptive and checksum-backed. It carries no pairing or execution authority. */
+export function readTestbedBuildIdentity(root = payloadRoot()): TestbedBuildIdentity {
+  const sumsFile = path.join(root, 'SHA256SUMS')
+  const files: TestbedBuildIdentity['files'] = []
+  if (fs.existsSync(sumsFile)) {
+    for (const line of fs.readFileSync(sumsFile, 'utf8').split(/\r?\n/u).filter(Boolean)) {
+      const match = /^([0-9a-f]{64})  ([A-Za-z0-9._/-]+)$/u.exec(line)
+      if (!match) continue
+      const absolute = path.resolve(root, ...match[2]!.split('/'))
+      const relation = path.relative(root, absolute)
+      if (relation.startsWith('..') || path.isAbsolute(relation) || !fs.existsSync(absolute)) continue
+      files.push({ path: match[2]!, sha256: sha256File(absolute), bytes: fs.statSync(absolute).size })
+    }
+  }
+  // Pre-observability payloads did not install their manifest/checksum files. Still identify their
+  // exact code so the first sync can compare rather than assuming that an old node is current.
+  if (files.length === 0) {
+    for (const name of TESTBED_MODULES) {
+      const absolute = path.join(root, 'dist', name)
+      if (fs.existsSync(absolute)) files.push({ path: `dist/${name}`, sha256: sha256File(absolute), bytes: fs.statSync(absolute).size })
+    }
+    const runtime = process.platform === 'win32' ? 'node.exe' : 'node'
+    const runtimePath = path.join(root, runtime)
+    if (fs.existsSync(runtimePath)) files.push({ path: runtime, sha256: sha256File(runtimePath), bytes: fs.statSync(runtimePath).size })
+  }
+  let manifest: { protocol?: unknown; appVersion?: unknown; sourceCommit?: unknown } = {}
+  try { manifest = JSON.parse(fs.readFileSync(path.join(root, 'manifest.json'), 'utf8')) as typeof manifest } catch { /* legacy node */ }
+  try {
+    const build = JSON.parse(fs.readFileSync(path.join(root, 'build.json'), 'utf8')) as typeof manifest
+    manifest = { ...manifest, ...build }
+  } catch { /* legacy node */ }
+  const normalized = files.sort((left, right) => left.path.localeCompare(right.path))
+  const payloadId = crypto.createHash('sha256')
+    .update(normalized.map((file) => `${file.sha256}  ${file.path}\n`).join(''))
+    .digest('hex')
+  const codePayloadId = crypto.createHash('sha256')
+    .update(normalized.filter((file) => file.path.startsWith('dist/'))
+      .map((file) => `${file.sha256}  ${file.path}\n`).join(''))
+    .digest('hex')
+  return {
+    payloadId,
+    codePayloadId,
+    protocol: typeof manifest.protocol === 'number' ? manifest.protocol : 1,
+    ...(typeof manifest.appVersion === 'string' ? { appVersion: manifest.appVersion } : {}),
+    ...(typeof manifest.sourceCommit === 'string' ? { sourceCommit: manifest.sourceCommit } : {}),
+    files: normalized,
+  }
+}
+
+/** Public host keys are safe to expose through the already-authenticated mesh lane for SSH pinning. */
+export function sshHostKeyFingerprints(directory = '/etc/ssh'): string[] {
+  if (process.platform === 'win32' && directory === '/etc/ssh') return []
+  let names: string[]
+  try { names = fs.readdirSync(directory) } catch { return [] }
+  return names
+    .filter((name) => /^ssh_host_[A-Za-z0-9_-]+_key\.pub$/u.test(name))
+    .sort()
+    .flatMap((name) => {
+      try {
+        const fields = fs.readFileSync(path.join(directory, name), 'utf8').trim().split(/\s+/u)
+        if (fields.length < 2 || !/^[A-Za-z0-9+/]+={0,2}$/u.test(fields[1]!)) return []
+        const bytes = Buffer.from(fields[1]!, 'base64')
+        if (bytes.length === 0) return []
+        const digest = crypto.createHash('sha256').update(bytes).digest('base64').replace(/=+$/u, '')
+        return [`${fields[0]} SHA256:${digest}`]
+      } catch { return [] }
+    })
+    .slice(0, 16)
 }
 
 function defaultDataDir(): string {
@@ -316,7 +397,12 @@ export async function startTestbedNode(dataDirInput: string): Promise<{ stop: ()
     async () => null,
     { bridge, localDeviceToken: token },
   )
-  const executor = new DeviceExecutor(policyFile(dataDir))
+  const executor = new DeviceExecutor(policyFile(dataDir), {
+    isolateLinuxCommands: process.platform === 'linux' &&
+      (config.profile === 'elevated-machine' || config.profile === 'linux-sudo-machine'),
+  })
+  const runningBuild = readTestbedBuildIdentity()
+  const hostKeyFingerprints = sshHostKeyFingerprints()
   const recentMessageIds = admittedMessageIds(dataDir)
   const admitMessage = (id: string, sourceSiteId: string, operation: string): void => {
     const now = Date.now()
@@ -368,6 +454,8 @@ export async function startTestbedNode(dataDirInput: string): Promise<{ stop: ()
         nodeKind: 'lightweight-testbed' as const,
         deploymentProfile: config.profile,
         elevated: config.profile === 'elevated-machine' || config.profile === 'linux-sudo-machine',
+        testbedBuild: runningBuild,
+        sshHostKeyFingerprints: hostKeyFingerprints,
       }
     }
     if (envelope.operation !== 'device_action') throw new Error('lightweight nodes accept only testbed operations')
@@ -379,12 +467,19 @@ export async function startTestbedNode(dataDirInput: string): Promise<{ stop: ()
     if (!['probe', 'inspect', 'git_inspect', 'git_sync', 'list', 'read', 'mkdir', 'write', 'exec'].includes(action.op)) {
       throw new Error('unknown remote device operation')
     }
-    const result = await executor.execute(action)
+    const actor = content.actor && typeof content.actor === 'object' && !Array.isArray(content.actor)
+      ? content.actor as Record<string, unknown>
+      : {}
+    const durableRunId = typeof actor.durableRunId === 'string'
+      ? actor.durableRunId.slice(0, 128)
+      : undefined
+    const result = await executor.execute(action, { durableRunId })
     appendTestbedAudit(dataDir, 'device/action', {
       sourceSiteId: envelope.sourceSiteId,
       messageId: envelope.messageId,
       profile: config.profile,
       op: action.op,
+      durableRunId,
       rootId: typeof action.rootId === 'string' ? action.rootId.slice(0, 128) : '',
       ok: result.ok,
       failure: result.failure?.stage,
@@ -413,14 +508,19 @@ function currentDistDir(): string {
 function installFiles(installRoot: string): void {
   const dist = path.join(installRoot, 'dist')
   fs.mkdirSync(dist, { recursive: true })
-  for (const name of ['testbedNode.js', 'deviceToken.js', 'remoteDevices.js', 'directHubProtocol.js', 'myOwnMeshRpc.js']) {
+  for (const name of TESTBED_MODULES) {
     const source = path.join(currentDistDir(), name)
     if (!fs.existsSync(source)) throw new Error(`testbed payload is missing ${name}; run the hub production build first`)
     fs.copyFileSync(source, path.join(dist, name))
   }
   fs.copyFileSync(process.execPath, path.join(installRoot, process.platform === 'win32' ? 'node.exe' : 'node'))
   if (process.platform !== 'win32') fs.chmodSync(path.join(installRoot, 'node'), 0o755)
-  fs.writeFileSync(path.join(installRoot, 'package.json'), '{\n  "private": true,\n  "type": "module"\n}\n', { mode: 0o644 })
+  const sourceRoot = payloadRoot()
+  for (const name of ['package.json', 'README.txt', 'manifest.json', 'build.json', 'SHA256SUMS']) {
+    const source = path.join(sourceRoot, name)
+    if (!fs.existsSync(source)) throw new Error(`testbed payload is missing ${name}; rebuild the portable payload`)
+    fs.copyFileSync(source, path.join(installRoot, name))
+  }
 }
 
 function installWindowsElevated(profile: TestbedNodeProfile): { installRoot: string; dataDir: string; launcher: string } {
@@ -453,6 +553,83 @@ function systemdEscape(value: string): string {
   return `\"${value.replaceAll('\\', '\\\\').replaceAll('\"', '\\\"')}\"`
 }
 
+function isUnixSocket(candidate: string): boolean {
+  try { return fs.statSync(candidate).isSocket() } catch { return false }
+}
+
+export function detectMyOwnMeshSocketPath(
+  env: NodeJS.ProcessEnv = process.env,
+  home = os.homedir(),
+  probe: (candidate: string) => boolean = isUnixSocket,
+): string {
+  const configured = env.MYOWNMESH_CONTROL_SOCKET?.trim()
+  const candidates = [
+    configured,
+    defaultMyOwnMeshSocketPath(env, 'linux', home),
+    '/var/lib/myownmesh/daemon.sock',
+    '/run/myownmesh/daemon.sock',
+    '/run/myownmesh.sock',
+    path.join(home, '.myownmesh', 'daemon.sock'),
+  ].filter((candidate): candidate is string => Boolean(candidate))
+  return [...new Set(candidates)].find(probe) ?? candidates[0]!
+}
+
+function linuxServiceUser(profile: TestbedNodeProfile): string {
+  return profile === 'linux-sudo-machine' ? 'allmyagents-testbed' : 'root'
+}
+
+export function writeLinuxTestbedService(input: {
+  installRoot: string
+  dataDir: string
+  profile: TestbedNodeProfile
+  socketPath?: string
+}): string {
+  const socketPath = input.socketPath ?? detectMyOwnMeshSocketPath()
+  fs.mkdirSync('/etc/systemd/system', { recursive: true })
+  const serviceFile = `/etc/systemd/system/${TESTBED_SERVICE}`
+  fs.writeFileSync(serviceFile, renderLinuxTestbedService({ ...input, socketPath }), { mode: 0o644 })
+  return serviceFile
+}
+
+export function renderLinuxTestbedService(input: {
+  installRoot: string
+  dataDir: string
+  profile: TestbedNodeProfile
+  socketPath: string
+}): string {
+  const serviceUser = linuxServiceUser(input.profile)
+  return [
+    '[Unit]',
+    'Description=AllMyAgents lightweight remote testbed',
+    'After=network-online.target myownmesh.service',
+    'Wants=network-online.target',
+    '',
+    '[Service]',
+    'Type=simple',
+    `User=${serviceUser}`,
+    `Environment=${systemdEscape(`MYOWNMESH_CONTROL_SOCKET=${input.socketPath}`)}`,
+    `ExecStart=${systemdEscape(path.join(input.installRoot, 'node'))} ${systemdEscape(path.join(input.installRoot, 'dist', 'testbedNode.js'))} run --data-dir ${systemdEscape(input.dataDir)}`,
+    'Restart=on-failure',
+    'RestartSec=3',
+    'NoNewPrivileges=false',
+    '',
+    '[Install]',
+    'WantedBy=multi-user.target',
+    '',
+  ].join('\n')
+}
+
+export function repairLinuxTestbedService(dataDir: string, installRoot = payloadRoot()): { serviceFile: string; socketPath: string } {
+  if (process.platform !== 'linux') throw new Error('service repair is available only on Linux')
+  if (typeof process.getuid === 'function' && process.getuid() !== 0) throw new Error('service repair must be run as root')
+  const config = readTestbedNodeConfig(dataDir)
+  const socketPath = detectMyOwnMeshSocketPath()
+  const serviceFile = writeLinuxTestbedService({ installRoot, dataDir, profile: config.profile, socketPath })
+  execFileSync('systemctl', ['daemon-reload'], { stdio: 'pipe' })
+  appendTestbedAudit(dataDir, 'deployment/service-repaired', { serviceFile, socketPath })
+  return { serviceFile, socketPath }
+}
+
 function installLinuxElevated(profile: TestbedNodeProfile): { installRoot: string; dataDir: string; launcher: string } {
   if (profile !== 'elevated-machine' && profile !== 'linux-sudo-machine') {
     throw new Error('Linux system installation requires elevated-machine or linux-sudo-machine')
@@ -460,7 +637,7 @@ function installLinuxElevated(profile: TestbedNodeProfile): { installRoot: strin
   if (typeof process.getuid === 'function' && process.getuid() !== 0) throw new Error('Linux system installation must be run as root')
   const installRoot = '/opt/allmyagents-testbed'
   const dataDir = '/var/lib/allmyagents-testbed'
-  const serviceUser = profile === 'linux-sudo-machine' ? 'allmyagents-testbed' : 'root'
+  const serviceUser = linuxServiceUser(profile)
   if (profile === 'linux-sudo-machine') {
     try {
       execFileSync('id', ['-u', serviceUser], { stdio: 'ignore' })
@@ -482,25 +659,7 @@ function installLinuxElevated(profile: TestbedNodeProfile): { installRoot: strin
       try { fs.unlinkSync(temporary) } catch { /* Rename consumed the validated file. */ }
     }
   }
-  fs.mkdirSync('/etc/systemd/system', { recursive: true })
-  fs.writeFileSync('/etc/systemd/system/allmyagents-testbed.service', [
-    '[Unit]',
-    'Description=AllMyAgents lightweight remote testbed',
-    'After=network-online.target',
-    'Wants=network-online.target',
-    '',
-    '[Service]',
-    'Type=simple',
-    `User=${serviceUser}`,
-    `ExecStart=${systemdEscape(path.join(installRoot, 'node'))} ${systemdEscape(path.join(installRoot, 'dist', 'testbedNode.js'))} run --data-dir ${systemdEscape(dataDir)}`,
-    'Restart=on-failure',
-    'RestartSec=3',
-    'NoNewPrivileges=false',
-    '',
-    '[Install]',
-    'WantedBy=multi-user.target',
-    '',
-  ].join('\n'), { mode: 0o644 })
+  writeLinuxTestbedService({ installRoot, dataDir, profile })
   if (profile === 'linux-sudo-machine') {
     execFileSync('chown', ['-R', `${serviceUser}:${serviceUser}`, dataDir], { stdio: 'pipe' })
   }
@@ -563,6 +722,11 @@ export async function runTestbedNodeCli(args = process.argv.slice(2)): Promise<n
     process.stdout.write(`${JSON.stringify({ ok: true, profile, ...installed })}\n`)
     return 0
   }
+  if (command === 'repair-service') {
+    const repaired = repairLinuxTestbedService(dataDir)
+    process.stdout.write(`${JSON.stringify({ ok: true, ...repaired })}\n`)
+    return 0
+  }
   if (command === 'run') {
     const runtime = await startTestbedNode(dataDir)
     process.stdout.write(`${JSON.stringify({ ok: true, status: 'running', dataDir, pid: process.pid })}\n`)
@@ -582,7 +746,7 @@ export async function runTestbedNodeCli(args = process.argv.slice(2)): Promise<n
       process.once('SIGTERM', stop)
     })
   }
-  process.stderr.write('Usage: testbedNode <configure|pair-code|install-elevated|run> [--data-dir PATH] [--profile PROFILE] [--root PATH] [--read] [--write] [--terminal]\n')
+  process.stderr.write('Usage: testbedNode <configure|pair-code|install-elevated|repair-service|run> [--data-dir PATH] [--profile PROFILE] [--root PATH] [--read] [--write] [--terminal]\n')
   return 2
 }
 

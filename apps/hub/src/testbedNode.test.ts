@@ -1,3 +1,4 @@
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -5,9 +6,13 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   appendTestbedAudit,
   configureTestbedNode,
+  detectMyOwnMeshSocketPath,
   issueTestbedPairingCode,
   machineRoots,
   readTestbedNodeConfig,
+  readTestbedBuildIdentity,
+  renderLinuxTestbedService,
+  sshHostKeyFingerprints,
 } from './testbedNode.js'
 
 const roots: string[] = []
@@ -101,5 +106,44 @@ describe('lightweight testbed node configuration', () => {
     const event = JSON.parse(fs.readFileSync(path.join(dataDir, 'audit.jsonl'), 'utf8')) as Record<string, unknown>
     expect(event).toMatchObject({ kind: 'device/action', op: 'exec', ok: true, targetMs: 14 })
     expect(event).not.toHaveProperty('command')
+  })
+
+  it('reports a checksum-backed portable build identity and mesh-attested public SSH fingerprints', () => {
+    const root = temporaryRoot()
+    fs.mkdirSync(path.join(root, 'dist'))
+    fs.writeFileSync(path.join(root, 'dist', 'testbedNode.js'), 'node-v2')
+    fs.writeFileSync(path.join(root, 'dist', 'remoteDevices.js'), 'remote-v2')
+    fs.writeFileSync(path.join(root, 'build.json'), JSON.stringify({ appVersion: '0.1.28', sourceCommit: 'a'.repeat(40) }))
+    const files = ['dist/testbedNode.js', 'dist/remoteDevices.js']
+    fs.writeFileSync(path.join(root, 'SHA256SUMS'), `${files.map((relative) =>
+      `${crypto.createHash('sha256').update(fs.readFileSync(path.join(root, relative))).digest('hex')}  ${relative}`).join('\n')}\n`)
+    expect(readTestbedBuildIdentity(root)).toMatchObject({
+      appVersion: '0.1.28',
+      sourceCommit: 'a'.repeat(40),
+      payloadId: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      codePayloadId: expect.stringMatching(/^[0-9a-f]{64}$/u),
+    })
+
+    const ssh = path.join(root, 'ssh')
+    fs.mkdirSync(ssh)
+    fs.writeFileSync(path.join(ssh, 'ssh_host_ed25519_key.pub'), `ssh-ed25519 ${Buffer.from('public-key-fixture').toString('base64')} host\n`)
+    expect(sshHostKeyFingerprints(ssh)).toEqual([expect.stringMatching(/^ssh-ed25519 SHA256:/u)])
+  })
+
+  it('pins the observed mesh socket and orders the testbed after MyOwnMesh without coupling lifetimes', () => {
+    expect(detectMyOwnMeshSocketPath(
+      { MYOWNMESH_HOME: '/ignored' },
+      '/home/testbed',
+      (candidate) => candidate === '/var/lib/myownmesh/daemon.sock',
+    )).toBe('/var/lib/myownmesh/daemon.sock')
+    const unit = renderLinuxTestbedService({
+      installRoot: '/home/admini/amt',
+      dataDir: '/home/admini/amt/data',
+      profile: 'elevated-machine',
+      socketPath: '/var/lib/myownmesh/daemon.sock',
+    })
+    expect(unit).toContain('After=network-online.target myownmesh.service')
+    expect(unit).not.toContain('Requires=myownmesh.service')
+    expect(unit).toContain('MYOWNMESH_CONTROL_SOCKET=/var/lib/myownmesh/daemon.sock')
   })
 })

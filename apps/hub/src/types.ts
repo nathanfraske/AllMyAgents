@@ -131,6 +131,27 @@ export interface ManagerTeam {
   presetId?: string
 }
 
+/**
+ * An authenticated operator message accepted while a non-operator turn was already running.
+ *
+ * The current turn is never relabelled. Instead, the hub persists this input and starts it as a fresh
+ * operator-origin turn once the session is idle. `dispatching` is a crash fence: a successor may observe
+ * or settle that handoff, but must never blindly submit the authorized mutation a second time.
+ */
+export interface DeferredOperatorTurn {
+  id: string
+  text: string
+  attachmentIds: string[]
+  override: {
+    model?: string
+    effort?: string
+    serviceTier?: string
+  }
+  queuedAt: string
+  state: 'pending' | 'dispatching'
+  dispatchStartedAt?: string
+}
+
 export interface SessionRecord {
   id: string
   profileId: string
@@ -180,6 +201,8 @@ export interface SessionRecord {
   allowedTools?: string[]
   /** Exact remote machines/roots this chat may use through the AllMyAgents device tools. */
   remoteDeviceGrants?: RemoteDeviceGrant[]
+  /** Operator input accepted mid-turn and waiting for its own non-escalating operator-origin boundary. */
+  deferredOperatorTurns?: DeferredOperatorTurn[]
   /** App-owned browser capability. Safe default is OFF when absent. The profile remains session-keyed. */
   browserEnabled?: boolean
   /** Public http(s) origins approved for this exact session. Values are canonical URL origins. */
@@ -315,6 +338,7 @@ export interface ReplayComplete {
 }
 
 export type ApprovalStatus = 'pending' | 'approved' | 'denied' | 'timeout'
+export type ApprovalPersistence = 'session' | 'always'
 
 export interface ApprovalRecord {
   id: string
@@ -323,6 +347,21 @@ export interface ApprovalRecord {
   payload: unknown
   status: ApprovalStatus
   createdAt: string
+  resolvedAt?: string
+  decider?: string
+  persist?: ApprovalPersistence
+}
+
+export interface ApprovalDecisionRecord {
+  decisionSeq: number
+  id: string
+  sessionId: string
+  kind: string
+  status: Extract<ApprovalStatus, 'approved' | 'denied' | 'timeout'>
+  createdAt: string
+  resolvedAt: string
+  decider: string
+  persist?: ApprovalPersistence
 }
 
 export interface ClaudeLimitInfo {
@@ -627,6 +666,17 @@ export interface OverseerConfig {
   updatedAt?: string
   operatingMode?: OverseerOperatingMode
   modePolicies?: Partial<Record<Exclude<OverseerOperatingMode, 'standard'>, OverseerModePolicy>>
+  /** Standing, operator-owned exception for deciding the exact approval that woke an alert turn. */
+  approvalPolicy?: OverseerApprovalPolicy
+}
+
+export type OverseerApprovalRisk = 'low' | 'medium'
+
+export interface OverseerApprovalPolicy {
+  enabled: boolean
+  /** Unknown/high-risk requests are never eligible, so the ceiling cannot be configured to high. */
+  maxRisk: OverseerApprovalRisk
+  updatedAt?: string
 }
 
 export type OverseerOperatingMode = 'standard' | 'tokenmaxxing' | 'eco'

@@ -126,8 +126,25 @@ async function main(): Promise<{ message: MaintenanceMessage; exitCode: number }
     // process and can wait longer for its bounded write transaction without blocking the renderer,
     // HTTP, WebSocket, or worker-ingestion loops.
     journal = new Journal(file, { busyTimeoutMs: MAINTENANCE_BUSY_TIMEOUT_MS })
+    // Content validation is intentionally post-ready. It used to share the ordinary preflight step
+    // with quick_check, turning a full table scan into a 10+ second cold-start gate on a multi-GB
+    // journal. Keep the proof (and keep recovery classification fail-closed), but isolate this scan in
+    // the maintenance child so the UI, HTTP listener, WebSocket, and liveness heartbeat remain live.
+    reportProgress('validating-payloads', 0, 0)
+    const invalidPayload = journal.db
+      .prepare('SELECT seq FROM events WHERE json_valid(payload) = 0 ORDER BY seq LIMIT 1')
+      .get() as { seq?: unknown } | undefined
+    if (invalidPayload) {
+      throw new Error(
+        `journal contains invalid JSON in event sequence ${String(invalidPayload.seq)}; ` +
+          'maintenance refused to mutate it',
+      )
+    }
     journal.recordCompactionLifecycle(operationId, 'started', {
-      detail: 'Bounded journal maintenance started.',
+      detail: 'Bounded journal maintenance started after payload validation.',
+    })
+    journal.recordCompactionLifecycle(operationId, 'progress', {
+      detail: 'Post-ready event payload JSON validation passed.',
     })
     // Retention is idempotent and metadata-only. Do it before generating any new evidence so an upgrade
     // immediately stops the legacy N x multi-GB footprint from climbing, even if payload migration needs

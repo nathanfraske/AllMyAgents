@@ -26,6 +26,7 @@ import { isChatBusy, nextOrderKey, orderChats, type ChatOrderFacts } from './cha
 import { extractCodexReasoning } from './codexGroup'
 import { reduceJournalHistory } from './journalHistoryReducer'
 import { attachmentsFromPayload, type AttachmentMeta } from './attachments'
+import { readDesktopStartupStatus } from './desktopStartup'
 import type { AgentOutcome } from './agentTree'
 import type { ApprovalRecord, FleetSite, HistoryItem, HistoryPage, HubEvent, HubPrefs, HubStreamMessage, JournalCompactionStatus, JournalHistoryPage, ProfileInfo, ProjectInfo, QuestionRecord, RecoveryNotice, ReplayBaseline, ReplayComplete, ReplayResetRequired, ReplayStart, ScanResult, SessionRecord, UsageSnapshot } from './api'
 
@@ -486,6 +487,8 @@ export class HubStore {
   prefs = $state<HubPrefs>({ chatNamePool: 'everyone', steerMessagesAtToolBoundary: true })
   connected = $state(false)
   hubConnectionPhase = $state<'starting' | 'connected' | 'reconnecting'>('starting')
+  hubStartupDetail = $state('Preparing the local hub.')
+  hubStartupElapsedMs = $state(0)
   private everConnected = false
   needsPairing = $state(false)
   selectedId = $state<string | null>(null)
@@ -2228,11 +2231,20 @@ export class HubStore {
 
   private startHubWaitClock(): void {
     if (this.downSince === null) this.downSince = Date.now()
+    if (!this.everConnected) void this.refreshDesktopStartupStatus()
     if (!this.downTicker) {
       this.downTicker = setInterval(() => {
         if (this.downSince !== null) this.hubDownSeconds = Math.round((Date.now() - this.downSince) / 1000)
+        if (!this.everConnected) void this.refreshDesktopStartupStatus()
       }, 1000)
     }
+  }
+
+  private async refreshDesktopStartupStatus(): Promise<void> {
+    const status = await readDesktopStartupStatus()
+    if (!status || this.everConnected) return
+    this.hubStartupDetail = status.detail
+    this.hubStartupElapsedMs = status.elapsedMs
   }
 
   private markStarting(): void {
@@ -4113,13 +4125,16 @@ export class HubStore {
         view.loadingHistory = false
       }
       if (!page || !Array.isArray(page.events)) {
+        if (page) view.historyLoadError = 'Latest journal history returned an invalid response.'
         this.historyPulled.delete(id)
         return
       }
       let historyItems: ThreadItem[]
       try {
         historyItems = reduceJournalHistory(page.events)
-      } catch {
+      } catch (error) {
+        view.historyLoadError =
+          error instanceof Error ? error.message : 'Latest journal history could not be decoded.'
         this.historyPulled.delete(id)
         return
       }

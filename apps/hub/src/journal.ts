@@ -1034,7 +1034,7 @@ export class Journal extends EventEmitter {
    * side-effect-free transcript reducer can consume it directly; `olderCursor` is exclusive on the next
    * request. A single row larger than the page budget is explicit rather than an infinite retry loop.
    */
-  sessionHistoryPage(
+  async sessionHistoryPage(
     sessionId: string,
     options: {
       beforeSeq?: number
@@ -1042,7 +1042,7 @@ export class Journal extends EventEmitter {
       maxBytes?: number
       expectedGeneration?: number
     } = {}
-  ): SessionHistoryPage {
+  ): Promise<SessionHistoryPage> {
     if (!sessionId || sessionId.length > 256) throw new Error('invalid session id')
     const maxRows = options.maxRows ?? JOURNAL_HISTORY_PAGE_MAX_ROWS
     const maxBytes = options.maxBytes ?? JOURNAL_HISTORY_PAGE_MAX_BYTES
@@ -1054,7 +1054,7 @@ export class Journal extends EventEmitter {
         throw new Error(`${name} is outside the supported history-page bound`)
       }
     }
-    return this.readReplaySnapshot((checkpoint) => {
+    const snapshot = this.readReplaySnapshot((checkpoint) => {
       if (
         options.expectedGeneration !== undefined &&
         options.expectedGeneration !== checkpoint.generation
@@ -1126,79 +1126,110 @@ export class Journal extends EventEmitter {
         payload: string | null
         payload_bytes: number
       }>
-      const selected: HubEvent[] = []
-      let encodedBytes = 0
-      let hasOlder = rows.length > maxRows
-      for (const row of rows.slice(0, maxRows)) {
-        const envelopeBytes =
-          Buffer.byteLength(
-            JSON.stringify({
-              seq: row.seq,
-              ts: row.ts,
-              sessionId: row.session,
-              kind: row.kind,
-              payload: null,
-            })
-          ) -
-          Buffer.byteLength('null') +
-          row.payload_bytes
-        let event: HubEvent
-        let bytes: number
-        if (envelopeBytes > maxBytes || row.payload === null) {
-          event = {
-            seq: row.seq,
-            ts: row.ts,
-            sessionId: row.session,
-            kind: 'journal/history-event-oversized',
-            payload: {
-              originalKind: row.kind,
-              originalPayloadBytes: row.payload_bytes,
-              message:
-                'This retained history event is larger than the bounded history page and was not transferred.',
-            },
-          }
-          bytes = Buffer.byteLength(JSON.stringify(event))
-        } else {
-          event = {
+      return { checkpoint, rows }
+    })
+
+    type HistoryRow = (typeof snapshot.rows)[number]
+    type PlannedHistoryEvent = {
+      row: HistoryRow
+      stored?: unknown
+      event?: HubEvent
+      estimatedBytes: number
+    }
+    const oversizedEvent = (row: HistoryRow, originalPayloadBytes: number): HubEvent => ({
+      seq: row.seq,
+      ts: row.ts,
+      sessionId: row.session,
+      kind: 'journal/history-event-oversized',
+      payload: {
+        originalKind: row.kind,
+        originalPayloadBytes,
+        message:
+          'This retained history event is larger than the bounded history page and was not transferred.',
+      },
+    })
+
+    // Plan from the immutable content-addressed references first. The previous path hydrated every row
+    // synchronously and only then discovered that most of those bytes could not fit in the 512 KiB page.
+    // Releasing the SQLite snapshot before asynchronous file I/O also prevents a slow disk from pinning WAL.
+    const planned: PlannedHistoryEvent[] = []
+    let estimatedPageBytes = 0
+    let hasOlder = snapshot.rows.length > maxRows
+    for (const row of snapshot.rows.slice(0, maxRows)) {
+      const envelopeWithoutPayload =
+        Buffer.byteLength(
+          JSON.stringify({
             seq: row.seq,
             ts: row.ts,
             sessionId: row.session,
             kind: row.kind,
-            payload: parsePayload(row.payload, row.seq, this.payloadBlobs),
-          }
-          bytes = Buffer.byteLength(JSON.stringify(event))
-          if (bytes > maxBytes) {
-            event = {
-              seq: row.seq,
-              ts: row.ts,
-              sessionId: row.session,
-              kind: 'journal/history-event-oversized',
-              payload: {
-                originalKind: row.kind,
-                originalPayloadBytes: bytes,
-                message:
-                  'This retained history event is larger than the bounded history page and was not transferred.',
-              },
-            }
-            bytes = Buffer.byteLength(JSON.stringify(event))
-          }
+            payload: null,
+          }),
+        ) - Buffer.byteLength('null')
+      let candidate: PlannedHistoryEvent
+      if (row.payload === null) {
+        const event = oversizedEvent(row, row.payload_bytes)
+        candidate = { row, event, estimatedBytes: Buffer.byteLength(JSON.stringify(event)) }
+      } else {
+        const stored = parseStoredPayload(row.payload, row.seq)
+        const payloadEstimate = this.payloadBlobs
+          ? this.payloadBlobs.estimateDecodedJsonBytes(stored)
+          : Buffer.byteLength(JSON.stringify(stored))
+        const estimatedBytes = envelopeWithoutPayload + payloadEstimate
+        if (estimatedBytes > maxBytes) {
+          const event = oversizedEvent(row, Math.max(row.payload_bytes, payloadEstimate))
+          candidate = { row, event, estimatedBytes: Buffer.byteLength(JSON.stringify(event)) }
+        } else {
+          candidate = { row, stored, estimatedBytes }
         }
-        if (encodedBytes + bytes > maxBytes) {
-          hasOlder = true
-          break
+      }
+      if (estimatedPageBytes + candidate.estimatedBytes > maxBytes) {
+        hasOlder = true
+        break
+      }
+      planned.push(candidate)
+      estimatedPageBytes += candidate.estimatedBytes
+    }
+
+    const stored = planned.filter((candidate) => candidate.stored !== undefined)
+    const hydrated = this.payloadBlobs
+      ? await this.payloadBlobs.decodeManyAsync(stored.map((candidate) => candidate.stored))
+      : stored.map((candidate) => candidate.stored)
+    let hydratedIndex = 0
+    const selected: HubEvent[] = []
+    let encodedBytes = 0
+    for (const candidate of planned) {
+      let event = candidate.event
+      if (!event) {
+        event = {
+          seq: candidate.row.seq,
+          ts: candidate.row.ts,
+          sessionId: candidate.row.session,
+          kind: candidate.row.kind,
+          payload: hydrated[hydratedIndex],
         }
-        selected.push(event)
-        encodedBytes += bytes
+        hydratedIndex += 1
       }
-      selected.reverse()
-      return {
-        events: selected,
-        olderCursor: hasOlder ? (selected[0]?.seq ?? null) : null,
-        hasOlder,
-        encodedBytes,
-        checkpointGeneration: checkpoint.generation,
+      let bytes = Buffer.byteLength(JSON.stringify(event))
+      if (bytes > maxBytes) {
+        event = oversizedEvent(candidate.row, bytes)
+        bytes = Buffer.byteLength(JSON.stringify(event))
       }
-    })
+      if (encodedBytes + bytes > maxBytes) {
+        hasOlder = true
+        break
+      }
+      selected.push(event)
+      encodedBytes += bytes
+    }
+    selected.reverse()
+    return {
+      events: selected,
+      olderCursor: hasOlder ? (selected[0]?.seq ?? null) : null,
+      hasOlder,
+      encodedBytes,
+      checkpointGeneration: snapshot.checkpoint.generation,
+    }
   }
 
   /**
@@ -3552,9 +3583,13 @@ export class Journal extends EventEmitter {
  * Sequence values need not be contiguous after intentional journal condensation; cursors are `seq > ?`.
  */
 function parsePayload(raw: string, seq: number, blobs?: JournalBlobStore): unknown {
+  const parsed = parseStoredPayload(raw, seq)
+  return blobs?.decode(parsed) ?? parsed
+}
+
+function parseStoredPayload(raw: string, seq: number): unknown {
   try {
-    const parsed = JSON.parse(raw) as unknown
-    return blobs?.decode(parsed) ?? parsed
+    return JSON.parse(raw) as unknown
   } catch (err) {
     return { __unreadable: true, seq, reason: err instanceof Error ? err.message : String(err) }
   }

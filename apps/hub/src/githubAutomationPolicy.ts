@@ -1,3 +1,4 @@
+import crypto from 'node:crypto'
 import type Database from 'better-sqlite3'
 
 export type GitHubAutomationCapability =
@@ -28,6 +29,8 @@ export interface GitHubAutomationApproval {
   operation: string
   /** Explicit owner/repository selector, when the request carries one. */
   repository?: string
+  /** Bounded audit data. Free-form PR bodies/comments are represented by length + digest, never copied. */
+  parameterSummary?: Record<string, string | number | boolean | null | { chars: number; sha256: string }>
 }
 
 export const GITHUB_AUTOMATION_CAPABILITIES: readonly GitHubAutomationCapability[] = [
@@ -452,6 +455,123 @@ function classifyMcp(payload: unknown): GitHubAutomationApproval | undefined {
   return undefined
 }
 
+const CONNECTOR_PULL_REQUEST_OPERATIONS = new Set([
+  'add_comment_to_issue',
+  'add_comment_to_pull_request',
+  'close_pull_request',
+  'create_pull_request',
+  'create_pull_request_review',
+  'mark_pull_request_ready_for_review',
+  'reopen_pull_request',
+  'request_pull_request_review',
+  'update_issue_comment',
+  'update_pull_request',
+])
+const CONNECTOR_WORKFLOW_OPERATIONS = new Set([
+  'cancel_workflow_run',
+  'rerun_workflow',
+  'run_workflow',
+  'trigger_workflow',
+])
+const CONNECTOR_REPOSITORY_PUSH_OPERATIONS = new Set([
+  'create_or_update_file',
+  'push_files',
+])
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function repositoryFromConnectorParams(input: Record<string, unknown>): string | undefined | null {
+  const candidates: string[] = []
+  const add = (value: unknown): boolean => {
+    if (typeof value !== 'string') return true
+    const normalized = normalizedRepository(value)
+    if (!normalized) return false
+    candidates.push(normalized)
+    return true
+  }
+  for (const key of ['repository_full_name', 'repo_full_name', 'repository', 'nameWithOwner']) {
+    if (!add(input[key])) return null
+  }
+  if (typeof input.owner === 'string' || typeof input.repo === 'string') {
+    if (typeof input.owner !== 'string' || typeof input.repo !== 'string') return null
+    if (!add(`${input.owner}/${input.repo}`)) return null
+  }
+  return new Set(candidates).size > 1 ? null : candidates[0]
+}
+
+function connectorParameterSummary(
+  input: Record<string, unknown>,
+  repository: string,
+): NonNullable<GitHubAutomationApproval['parameterSummary']> {
+  const summary: NonNullable<GitHubAutomationApproval['parameterSummary']> = { repository }
+  const scalarKeys = [
+    'pr_number', 'pull_number', 'issue_number', 'comment_id', 'run_id', 'workflow_id',
+    'base_branch', 'head_branch', 'branch', 'ref', 'draft', 'maintainer_can_modify',
+  ]
+  for (const key of scalarKeys) {
+    const value = input[key]
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean' || value === null) {
+      summary[key] = value
+    }
+  }
+  for (const key of ['title', 'body', 'comment']) {
+    const value = input[key]
+    if (typeof value !== 'string') continue
+    summary[key] = {
+      chars: value.length,
+      sha256: crypto.createHash('sha256').update(value).digest('hex'),
+    }
+  }
+  return summary
+}
+
+/**
+ * Codex apps use an MCP form elicitation for connector approvals. This is intentionally stricter than
+ * the generic MCP classifier: only the trusted GitHub connector, its empty approval form, one explicit
+ * repository, and a closed operation grammar can consume an operator's standing GitHub grant.
+ */
+function classifyCodexConnectorElicitation(payload: unknown): GitHubAutomationApproval | undefined {
+  if (!isPlainObject(payload)) return undefined
+  if (payload.serverName !== 'codex_apps' || payload.mode !== 'form') return undefined
+  const schema = payload.requestedSchema
+  if (!isPlainObject(schema) || schema.type !== 'object' || !isPlainObject(schema.properties)) return undefined
+  if (Object.keys(schema.properties).length !== 0) return undefined
+  const meta = payload._meta
+  if (!isPlainObject(meta)) return undefined
+  if (
+    meta.source !== 'connector' ||
+    meta.connector_name !== 'GitHub' ||
+    meta.codex_approval_kind !== 'mcp_tool_call'
+  ) {
+    return undefined
+  }
+  if (meta.request_type !== undefined && meta.request_type !== 'approval_request') return undefined
+  const named = [meta.tool_name, meta.tool_title]
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    .map((value) => value.trim().toLowerCase())
+  if (named.length === 0 || new Set(named).size !== 1) return undefined
+  const operation = named[0]!
+  if (!/^[a-z][a-z0-9_]{0,127}$/u.test(operation)) return undefined
+  if (!isPlainObject(meta.tool_params)) return undefined
+  const repository = repositoryFromConnectorParams(meta.tool_params)
+  // Connector standing grants never infer a repository from cwd. A project/session policy must be bound
+  // to the exact repository named in the signed provider request.
+  if (!repository) return undefined
+  const base = {
+    transport: 'mcp' as const,
+    operation: `GitHub connector ${operation}`,
+    repository,
+    parameterSummary: connectorParameterSummary(meta.tool_params, repository),
+  }
+  if (operation === 'merge_pull_request') return { ...base, capability: 'pull_request_merges' }
+  if (CONNECTOR_PULL_REQUEST_OPERATIONS.has(operation)) return { ...base, capability: 'pull_requests' }
+  if (CONNECTOR_WORKFLOW_OPERATIONS.has(operation)) return { ...base, capability: 'workflow_runs' }
+  if (CONNECTOR_REPOSITORY_PUSH_OPERATIONS.has(operation)) return { ...base, capability: 'repository_pushes' }
+  return undefined
+}
+
 /**
  * Recognize a bounded GitHub operation. Unknown tools/verbs and any composed shell request ask the operator.
  * `gh api`, auth/secrets/config/repository administration, release deletion, and force/delete pushes are
@@ -476,6 +596,9 @@ export function classifyGitHubAutomationApproval(
   ) {
     const tokens = commandTokens(payload)
     return tokens ? (classifyGh(tokens) ?? classifyGitPush(tokens)) : undefined
+  }
+  if (kind === 'codex/mcpServer/elicitation/request') {
+    return classifyCodexConnectorElicitation(payload)
   }
   return undefined
 }

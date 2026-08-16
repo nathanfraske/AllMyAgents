@@ -578,6 +578,25 @@ export function startServer(opts: ServerOptions): http.Server {
     sessions.refreshOverseerInstructions()
     return next
   }
+  const configureOverseerApprovalPolicy = (input: {
+    enabled: boolean
+    maxRisk: 'low' | 'medium'
+  }): OverseerConfig => {
+    const next: OverseerConfig = {
+      ...overseer,
+      approvalPolicy: {
+        enabled: input.enabled,
+        maxRisk: input.maxRisk,
+        updatedAt: new Date().toISOString(),
+      },
+      updatedAt: new Date().toISOString(),
+    }
+    const persistError = patchConfig(configPath, 'overseer', next)
+    if (persistError) throw new Error(`Overseer approval policy could not be persisted: ${persistError}`)
+    Object.assign(overseer, next)
+    sessions.refreshOverseerInstructions()
+    return next
+  }
   const replayPrincipalBudget = new ReplayPrincipalBudget()
   const pairingCodes = new PairingCodeBroker(deviceToken)
   const questions = opts.questions
@@ -592,6 +611,7 @@ export function startServer(opts: ServerOptions): http.Server {
   sessions.setOverseerRuntime?.({
     overseerConfig: () => structuredClone(overseer),
     configureOverseerMode,
+    configureOverseerApprovalPolicy,
     createProject: async (name, rawPath, distro) => {
       const location = await resolveProjectPath(rawPath, distro)
       if (location.kind === 'unavailable') throw new Error(location.reason)
@@ -617,6 +637,10 @@ export function startServer(opts: ServerOptions): http.Server {
             siteId: string,
             profile: 'elevated-machine' | 'linux-sudo-machine',
           ) => opts.testbedDeployment!.deploy(siteId, profile),
+          syncTestbedNode: (
+            siteId: string,
+            actor: { sessionId: string; profileId: string },
+          ) => opts.testbedDeployment!.sync(siteId, actor),
           listTestbedTargets: () => opts.testbedDeployment!.targets(),
           inspectTestbedTarget: (siteId: string) => opts.testbedDeployment!.inspect(siteId),
         }
@@ -706,7 +730,9 @@ export function startServer(opts: ServerOptions): http.Server {
       const actor = content.actor && typeof content.actor === 'object' && !Array.isArray(content.actor)
         ? content.actor as Record<string, unknown>
         : {}
-      const result = await deviceExecutor.execute(action)
+      const result = await deviceExecutor.execute(action, {
+        durableRunId: (str(actor.durableRunId) ?? '').slice(0, 128) || undefined,
+      })
       journal.append(null, 'device-executor/action', {
         op: action.op,
         rootId: (str(action.rootId) ?? '').slice(0, 128),
@@ -715,6 +741,7 @@ export function startServer(opts: ServerOptions): http.Server {
         // Source-supplied correlation only. The authenticated peer proves which hub sent this; these
         // fields support cross-hub audit joins but never confer authority on the target.
         sourceRunId: (str(actor.runId) ?? '').slice(0, 128),
+        sourceDurableRunId: (str(actor.durableRunId) ?? '').slice(0, 128),
         sourceProjectId: (str(actor.projectId) ?? '').slice(0, 256),
         sourceReplicaId: (str(actor.replicaId) ?? '').slice(0, 128),
         sourceAgentId: (str(actor.agentId) ?? '').slice(0, 256),
@@ -2311,7 +2338,9 @@ export function startServer(opts: ServerOptions): http.Server {
         const actor = body.actor && typeof body.actor === 'object' && !Array.isArray(body.actor)
           ? body.actor as Record<string, unknown>
           : {}
-        const result = await deviceExecutor.execute(action)
+        const result = await deviceExecutor.execute(action, {
+          durableRunId: (str(actor.durableRunId) ?? '').slice(0, 128) || undefined,
+        })
         journal.append(null, 'device-executor/action', {
           op: action.op,
           rootId: (str(action.rootId) ?? '').slice(0, 128),
@@ -2320,6 +2349,7 @@ export function startServer(opts: ServerOptions): http.Server {
           actorSessionId: (str(actor.sessionId) ?? '').slice(0, 256),
           actorProfileId: (str(actor.profileId) ?? '').slice(0, 256),
           sourceRunId: (str(actor.runId) ?? '').slice(0, 128),
+          sourceDurableRunId: (str(actor.durableRunId) ?? '').slice(0, 128),
           sourceProjectId: (str(actor.projectId) ?? '').slice(0, 256),
           sourceReplicaId: (str(actor.replicaId) ?? '').slice(0, 128),
           sourceAgentId: (str(actor.agentId) ?? '').slice(0, 256),
@@ -2540,7 +2570,9 @@ export function startServer(opts: ServerOptions): http.Server {
       if (method === 'POST' && approvalMatch) {
         const body = await readBody(req)
         const pending = approvals.pending().find((candidate) => candidate.id === approvalMatch[1])
-        const found = approvals.resolve(approvalMatch[1] as string, body.approve === true)
+        const found = approvals.resolve(approvalMatch[1] as string, body.approve === true, {
+          decider: 'operator:api',
+        })
         if (found && pending) {
           journal.append(pending.sessionId, 'operator/approval-decided', {
             approvalId: pending.id,
@@ -3013,7 +3045,7 @@ export function startServer(opts: ServerOptions): http.Server {
         try {
           json(
             res,
-            journal.sessionHistoryPage(journalHistoryMatch[1] as string, {
+            await journal.sessionHistoryPage(journalHistoryMatch[1] as string, {
               beforeSeq,
               expectedGeneration: generation,
               maxRows: JOURNAL_HISTORY_PAGE_MAX_ROWS,

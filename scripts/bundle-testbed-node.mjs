@@ -12,6 +12,13 @@ const output = path.join(root, 'apps', 'desktop', 'src-tauri', 'testbed-runtime'
 const distOutput = path.join(output, 'dist')
 const runtimeName = process.platform === 'win32' ? 'node.exe' : 'node'
 const modules = ['testbedNode.js', 'deviceToken.js', 'remoteDevices.js', 'directHubProtocol.js', 'myOwnMeshRpc.js']
+const tauriConfig = JSON.parse(fs.readFileSync(path.join(root, 'apps', 'desktop', 'src-tauri', 'tauri.conf.json'), 'utf8'))
+let sourceCommit
+try {
+  sourceCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim()
+} catch {
+  sourceCommit = undefined
+}
 
 execFileSync(process.execPath, [
   path.join(hub, 'node_modules', 'typescript', 'bin', 'tsc'),
@@ -35,6 +42,11 @@ fs.writeFileSync(path.join(output, 'package.json'), `${JSON.stringify({
   private: true,
   type: 'module',
 }, null, 2)}\n`)
+fs.writeFileSync(path.join(output, 'build.json'), `${JSON.stringify({
+  version: 1,
+  appVersion: typeof tauriConfig.version === 'string' ? tauriConfig.version : undefined,
+  ...(sourceCommit ? { sourceCommit } : {}),
+}, null, 2)}\n`)
 
 const launch = process.platform === 'win32'
   ? '.\\node.exe .\\dist\\testbedNode.js'
@@ -43,7 +55,7 @@ fs.writeFileSync(path.join(output, 'README.txt'), [
   'AllMyAgents lightweight testbed node',
   '',
   'This payload contains no vendor CLI, account, journal, project, or operator credential.',
-  'It requires a running AllMyStuff/MyOwnMesh node on the target machine.',
+  'It requires a running MyOwnMesh daemon on the target machine; AllMyStuff is optional bootstrap convenience.',
   '',
   `Scoped: ${launch} configure --profile scoped --root <path> --read --write --terminal`,
   `Run:    ${launch} run`,
@@ -53,7 +65,7 @@ fs.writeFileSync(path.join(output, 'README.txt'), [
     ? [`Dedicated service user with passwordless sudo: ${launch} install-elevated --profile linux-sudo-machine`]
     : []),
   '',
-  'Same signed-fleet peers can authorize over the authenticated fleet roster without a pairing code.',
+  'Automatic signed-fleet trust is off by default; pair with a one-use code unless it was explicitly enabled.',
   'An agent still needs an explicit per-chat device/root grant from its source AllMyAgents hub.',
   '',
 ].join('\n'))
@@ -64,9 +76,11 @@ fs.writeFileSync(path.join(output, 'manifest.json'), JSON.stringify({
   platform: process.platform,
   arch: process.arch,
   protocol: 1,
+  appVersion: typeof tauriConfig.version === 'string' ? tauriConfig.version : undefined,
+  ...(sourceCommit ? { sourceCommit } : {}),
 }, null, 2))
 
-const files = [runtimeName, 'README.txt', 'manifest.json', 'package.json', ...modules.map((name) => `dist/${name}`)]
+const files = [runtimeName, 'README.txt', 'manifest.json', 'package.json', 'build.json', ...modules.map((name) => `dist/${name}`)]
 const sums = files.map((relative) => {
   const digest = crypto.createHash('sha256').update(fs.readFileSync(path.join(output, relative))).digest('hex')
   return `${digest}  ${relative.replaceAll('\\', '/')}`
@@ -74,6 +88,6 @@ const sums = files.map((relative) => {
 fs.writeFileSync(path.join(output, 'SHA256SUMS'), `${sums.join('\n')}\n`)
 
 const actual = fs.readdirSync(output).sort()
-const expected = ['README.txt', 'SHA256SUMS', 'manifest.json', 'package.json', 'dist', runtimeName].sort()
+const expected = ['README.txt', 'SHA256SUMS', 'manifest.json', 'package.json', 'build.json', 'dist', runtimeName].sort()
 if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error('testbed payload contains an unexpected top-level file')
 process.stdout.write(`[bundle-testbed] built ${output} for ${process.platform}/${process.arch}\n`)

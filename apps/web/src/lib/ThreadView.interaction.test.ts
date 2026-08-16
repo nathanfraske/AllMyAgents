@@ -95,6 +95,18 @@ describe('transcript interaction boundaries', () => {
     await fireEvent.click(rendered.getByRole('button', { name: 'Retry history' }))
 
     expect(retry).toHaveBeenCalledWith('interaction-session')
+    expect(rendered.queryByText('no activity yet — send a message below')).toBeNull()
+  })
+
+  it('shows history progress instead of the new-chat empty state during a cold load', () => {
+    const view = seed()
+    view.loadingHistory = true
+    vi.spyOn(store, 'ensureHistory').mockImplementation(() => new Promise(() => {}))
+
+    const rendered = render(ThreadView, { props: { sessionId: 'interaction-session' } })
+
+    expect(rendered.getByRole('status').textContent).toContain('Loading conversation history')
+    expect(rendered.queryByText('no activity yet — send a message below')).toBeNull()
   })
 
   it('opens Browser as the same mutually-exclusive in-flow side panel used by Agents', async () => {

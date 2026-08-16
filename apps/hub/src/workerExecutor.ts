@@ -379,11 +379,13 @@ export class WorkerExecutor implements Executor {
       .then((decision) => {
         const approved = typeof decision === 'boolean' ? decision : decision.approved
         const status = typeof decision === 'boolean' ? undefined : decision.status
+        const persist = typeof decision === 'boolean' ? undefined : decision.persist
         this.client.send({
           t: 'approvalResolved',
           approvalId: msg.approvalId,
           approved,
           ...(status ? { status } : {}),
+          ...(persist ? { persist } : {}),
         })
       })
       .catch((err) => {

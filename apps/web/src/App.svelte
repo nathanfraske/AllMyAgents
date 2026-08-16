@@ -417,16 +417,16 @@
   <div class="hubdown" role="status">
     <span class="spin"></span>
     {#if store.hubConnectionPhase === 'starting' && store.hubDownSeconds < 20}
-      Starting the local hub…
+      {store.hubStartupDetail}
     {:else if store.hubConnectionPhase === 'starting'}
-      The local hub is still starting. Its supervisor is checking startup and retrying automatically.
+      {store.hubStartupDetail} The supervisor will retry automatically if startup fails.
     {:else if store.hubDownSeconds < 20}
       Lost connection to the hub — reconnecting…
     {:else}
       The hub stopped. It's being restarted automatically — retries back off to 30s, so this can take a
       moment. Your agents' work is unaffected; they run in a separate process.
     {/if}
-    {#if store.hubDownSeconds > 0}<span class="elapsed">{store.hubDownSeconds}s</span>{/if}
+    {#if store.hubDownSeconds > 0}<span class="elapsed">{store.hubConnectionPhase === 'starting' && store.hubStartupElapsedMs > 0 ? Math.round(store.hubStartupElapsedMs / 1000) : store.hubDownSeconds}s</span>{/if}
   </div>
 {/if}
 <RecoveryNoticeBanner />

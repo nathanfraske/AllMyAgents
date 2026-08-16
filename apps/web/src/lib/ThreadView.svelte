@@ -1376,7 +1376,12 @@
       {/if}
     {/each}
     {#if mainItems.length === 0 && !thinking}
-      {#if showFirstChatGuide}
+      {#if view.loadingHistory}
+        <div class="dim pad" role="status">Loading conversation history…</div>
+      {:else if view.historyLoadError}
+        <!-- The alert and retry affordance above are the truthful empty-pane state. Never make a failed
+             read look like a genuinely new conversation. -->
+      {:else if showFirstChatGuide}
         <FirstChatGuide
           provider={view.record.provider}
           projectName={workingContext.projectName}

@@ -6,7 +6,7 @@
  * tool-handler relays (worker→hub, callId/approvalId-correlated) + one hub→worker push (dangerUpdate).
  */
 import crypto from 'node:crypto'
-import type { ApprovalStatus, DangerFlags } from './types.js'
+import type { ApprovalPersistence, ApprovalStatus, DangerFlags } from './types.js'
 import type { AttachmentMeta } from './attachments.js'
 
 /** The subset of a SessionRecord the worker's driver needs — the worker holds no record + never opens the store. */
@@ -70,6 +70,7 @@ export type HubToWorker =
       approvalId: string
       approved: boolean
       status?: Extract<ApprovalStatus, 'approved' | 'denied' | 'timeout'>
+      persist?: ApprovalPersistence
     }
   | { t: 'rpcResult'; callId: string; ok: boolean; value?: unknown; error?: string }
 

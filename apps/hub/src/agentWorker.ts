@@ -737,8 +737,8 @@ export class AgentWorker {
       // Give the payload the same `toolName` shape a Claude approval has, so the card title, the
       // "Always allow" button and the hub's allowlist all work for Codex without a second code path.
       const approvalPayload = { ...(params as Record<string, unknown> | null), toolName: codexGrantKey(method) }
-      const approved = await this.relayApproval(sessionId ?? 'unattributed', `codex/${method}`, approvalPayload)
-      return codexRequestResult(method, approved, params)
+      const decision = await this.relayApprovalDetailed(sessionId ?? 'unattributed', `codex/${method}`, approvalPayload)
+      return codexRequestResult(method, decision.approved, params, decision.persist)
     } catch {
       // TODO(step 6): a codex approval in flight across a hub restart is re-flushed by the transport +
       // deduped by the idempotent approvals.request(id); this decline is only the TRUE >45s-orphan terminal.
@@ -963,13 +963,18 @@ export class AgentWorker {
     sessionId: string,
     kind: string,
     payload: unknown,
-  ): Promise<{ approved: boolean; status: 'approved' | 'denied' | 'timeout' }> {
+  ): Promise<{
+    approved: boolean
+    status: 'approved' | 'denied' | 'timeout'
+    persist?: import('./types.js').ApprovalPersistence
+  }> {
     const approvalId = stableApprovalId(sessionId, kind, payload)
     const reply = await this.server.relay({ t: 'approvalRequest', approvalId, sessionId, kind, payload })
     if (reply.t !== 'approvalResolved') throw new Error(`approval ${kind}: unexpected reply ${reply.t}`)
     return {
       approved: reply.approved,
       status: reply.status ?? (reply.approved ? 'approved' : 'denied'),
+      ...(reply.persist ? { persist: reply.persist } : {}),
     }
   }
 

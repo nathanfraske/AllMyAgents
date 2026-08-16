@@ -47,4 +47,70 @@ describe('GitHub automation approval classifier', () => {
       toolName: 'Bash', input: { command: './gh pr view 42' },
     })).toBeUndefined()
   })
+
+  const connector = (operation: string, params: Record<string, unknown>, overrides: Record<string, unknown> = {}) => ({
+    serverName: 'codex_apps',
+    mode: 'form',
+    requestedSchema: { type: 'object', properties: {} },
+    _meta: {
+      source: 'connector',
+      connector_name: 'GitHub',
+      codex_approval_kind: 'mcp_tool_call',
+      tool_title: operation,
+      tool_params: params,
+    },
+    ...overrides,
+  })
+
+  it('maps exact Codex GitHub connector operations to the narrow granted capability', () => {
+    expect(classifyGitHubAutomationApproval(
+      'codex/mcpServer/elicitation/request',
+      connector('update_pull_request', {
+        repository_full_name: 'OpenAI/Codex', pr_number: 31, body: 'new body',
+      }),
+    )).toMatchObject({
+      capability: 'pull_requests',
+      transport: 'mcp',
+      repository: 'openai/codex',
+      parameterSummary: {
+        repository: 'openai/codex',
+        pr_number: 31,
+        body: { chars: 8, sha256: expect.stringMatching(/^[a-f0-9]{64}$/u) },
+      },
+    })
+    expect(classifyGitHubAutomationApproval(
+      'codex/mcpServer/elicitation/request',
+      connector('merge_pull_request', { repository_full_name: 'openai/codex', pr_number: 31 }),
+    )).toMatchObject({ capability: 'pull_request_merges' })
+    expect(classifyGitHubAutomationApproval(
+      'codex/mcpServer/elicitation/request',
+      connector('run_workflow', { repo_full_name: 'openai/codex', workflow_id: 'ci.yml' }),
+    )).toMatchObject({ capability: 'workflow_runs' })
+  })
+
+  it('fails closed for generic forms, other connectors, ambiguous repositories, and unknown operations', () => {
+    expect(classifyGitHubAutomationApproval('codex/mcpServer/elicitation/request', {
+      serverName: 'codex_apps', mode: 'form', requestedSchema: { type: 'object', properties: {} },
+      _meta: { source: 'connector', connector_name: 'GitHub', codex_approval_kind: 'question' },
+    })).toBeUndefined()
+    expect(classifyGitHubAutomationApproval(
+      'codex/mcpServer/elicitation/request',
+      connector('update_pull_request', { repository_full_name: 'openai/codex' }, {
+        _meta: {
+          source: 'connector', connector_name: 'Linear', codex_approval_kind: 'mcp_tool_call',
+          tool_title: 'update_pull_request', tool_params: { repository_full_name: 'openai/codex' },
+        },
+      }),
+    )).toBeUndefined()
+    expect(classifyGitHubAutomationApproval(
+      'codex/mcpServer/elicitation/request',
+      connector('update_pull_request', {
+        repository_full_name: 'openai/codex', repo_full_name: 'attacker/elsewhere',
+      }),
+    )).toBeUndefined()
+    expect(classifyGitHubAutomationApproval(
+      'codex/mcpServer/elicitation/request',
+      connector('delete_repository', { repository_full_name: 'openai/codex' }),
+    )).toBeUndefined()
+  })
 })

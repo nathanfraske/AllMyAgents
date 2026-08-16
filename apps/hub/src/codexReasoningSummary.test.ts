@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
+  CODEX_ELICITATION_METHOD,
   CODEX_PERMISSIONS_APPROVAL_METHOD,
   CodexClient,
   codexRequestResult,
@@ -142,6 +143,22 @@ describe('Codex host contract', () => {
     })
     expect(codexRequestResult('item/commandExecution/requestApproval', true, {})).toEqual({
       decision: 'accept',
+    })
+  })
+
+  it('answers connector elicitations with protocol-shaped one-shot or explicit persisted decisions', () => {
+    expect(codexRequestResult(CODEX_ELICITATION_METHOD, false, {})).toEqual({
+      action: 'decline',
+      content: null,
+    })
+    expect(codexRequestResult(CODEX_ELICITATION_METHOD, true, {})).toEqual({
+      action: 'accept',
+      content: {},
+    })
+    expect(codexRequestResult(CODEX_ELICITATION_METHOD, true, {}, 'always')).toEqual({
+      action: 'accept',
+      content: {},
+      _meta: { persist: 'always' },
     })
   })
 

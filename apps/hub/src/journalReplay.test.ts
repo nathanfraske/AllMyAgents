@@ -26,7 +26,7 @@ describe('bounded replay checkpoints and journal history', () => {
   afterEach(() => vi.useRealTimers())
   afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }))
 
-  it('serves a versioned current cursor and a latest-first bounded session page', () => {
+  it('serves a versioned current cursor and a latest-first bounded session page', async () => {
     const journal = new Journal(path.join(tmp, 'checkpoint.db'))
     try {
       expect(journal.replayCheckpoint()).toEqual({
@@ -47,9 +47,9 @@ describe('bounded replay checkpoints and journal history', () => {
         cursor: 13,
         resetFloorSeq: 0,
       })
-      expect(journal.sessionHistoryPage('s').events).toHaveLength(12)
+      expect((await journal.sessionHistoryPage('s')).events).toHaveLength(12)
       indexAll(journal)
-      const page = journal.sessionHistoryPage('s', {
+      const page = await journal.sessionHistoryPage('s', {
         beforeSeq: checkpoint.cursor + 1,
         maxRows: 5,
         maxBytes: 8 * 1024,
@@ -66,7 +66,7 @@ describe('bounded replay checkpoints and journal history', () => {
       expect(page.olderCursor).toBe(page.events[0]?.seq)
       expect(page.checkpointGeneration).toBe(1)
 
-      const older = journal.sessionHistoryPage('s', {
+      const older = await journal.sessionHistoryPage('s', {
         beforeSeq: page.olderCursor!,
         maxRows: 5,
         maxBytes: 8 * 1024,
@@ -84,7 +84,7 @@ describe('bounded replay checkpoints and journal history', () => {
     }
   })
 
-  it('pages transcript semantics instead of letting streaming deltas hide completed replies', () => {
+  it('pages transcript semantics instead of letting streaming deltas hide completed replies', async () => {
     const journal = new Journal(path.join(tmp, 'semantic-history.db'))
     try {
       journal.append('s', 'session/input', { text: 'operator prompt' })
@@ -107,7 +107,7 @@ describe('bounded replay checkpoints and journal history', () => {
       }
       indexAll(journal)
 
-      const page = journal.sessionHistoryPage('s', { maxRows: 5, maxBytes: 64 * 1024 })
+      const page = await journal.sessionHistoryPage('s', { maxRows: 5, maxBytes: 64 * 1024 })
       expect(page.events.map((event) => event.kind)).toEqual([
         'session/input',
         'codex/item/completed',
@@ -124,13 +124,13 @@ describe('bounded replay checkpoints and journal history', () => {
     }
   })
 
-  it('never exceeds the page byte budget and progresses past an individually oversized row', () => {
+  it('never exceeds the page byte budget and progresses past an individually oversized row', async () => {
     const journal = new Journal(path.join(tmp, 'bytes.db'))
     try {
       journal.append('s', 'session/input', { text: 'a'.repeat(700) })
       journal.append('s', 'session/input', { text: 'b'.repeat(700) })
       indexAll(journal)
-      const page = journal.sessionHistoryPage('s', {
+      const page = await journal.sessionHistoryPage('s', {
         maxRows: 80,
         maxBytes: 1_024,
       })
@@ -142,7 +142,7 @@ describe('bounded replay checkpoints and journal history', () => {
         .prepare('INSERT INTO events (ts, session, kind, payload) VALUES (?, ?, ?, ?)')
         .run(OLD.toISOString(), 's', 'session/input', `{"unparseable":"${'x'.repeat(2 * 1024 * 1024)}`)
       indexAll(journal)
-      const oversized = journal.sessionHistoryPage('s', {
+      const oversized = await journal.sessionHistoryPage('s', {
         maxRows: 80,
         maxBytes: 1_024,
       })
@@ -156,7 +156,7 @@ describe('bounded replay checkpoints and journal history', () => {
         }),
       ])
       expect(oversized.olderCursor).toBe(oversized.events[0]?.seq)
-      const progressed = journal.sessionHistoryPage('s', {
+      const progressed = await journal.sessionHistoryPage('s', {
         beforeSeq: oversized.olderCursor!,
         maxRows: 80,
         maxBytes: 1_024,
@@ -167,21 +167,72 @@ describe('bounded replay checkpoints and journal history', () => {
     }
   })
 
-  it('keeps a completed projection frontier complete across appends, deletes, and reopen', () => {
+  it('does not read a blob body that metadata proves cannot fit in a history page', async () => {
+    const journal = new Journal(path.join(tmp, 'blob-page-budget.db'))
+    try {
+      journal.append('s', 'codex/item/completed', {
+        item: {
+          id: 'large-command',
+          type: 'commandExecution',
+          aggregatedOutput: 'cold output\n'.repeat(64 * 1024),
+        },
+      })
+      indexAll(journal)
+      const read = vi.spyOn(fs.promises, 'readFile')
+
+      const page = await journal.sessionHistoryPage('s', {
+        maxRows: 80,
+        maxBytes: 512 * 1024,
+      })
+
+      expect(page.events).toEqual([
+        expect.objectContaining({ kind: 'journal/history-event-oversized' }),
+      ])
+      expect(read).not.toHaveBeenCalled()
+    } finally {
+      journal.db.close()
+    }
+  })
+
+  it('hydrates only the cold blob working set that can fit in one page', async () => {
+    const journal = new Journal(path.join(tmp, 'blob-working-set.db'))
+    try {
+      for (let index = 0; index < 12; index += 1) {
+        journal.append('s', 'session/input', {
+          text: `${index}:` + String.fromCharCode(65 + index).repeat(70 * 1024),
+        })
+      }
+      indexAll(journal)
+      const read = vi.spyOn(fs.promises, 'readFile')
+
+      const page = await journal.sessionHistoryPage('s', {
+        maxRows: 80,
+        maxBytes: 256 * 1024,
+      })
+
+      expect(page.events).toHaveLength(3)
+      expect(page.hasOlder).toBe(true)
+      expect(read).toHaveBeenCalledTimes(3)
+    } finally {
+      journal.db.close()
+    }
+  })
+
+  it('keeps a completed projection frontier complete across appends, deletes, and reopen', async () => {
     const file = path.join(tmp, 'frontier.db')
     let journal = new Journal(file)
     try {
       journal.append('s', 'session/input', { text: 'first' })
       indexAll(journal)
       journal.append('s', 'session/input', { text: 'second' })
-      expect(journal.sessionHistoryPage('s').events).toHaveLength(2)
+      expect((await journal.sessionHistoryPage('s')).events).toHaveLength(2)
       journal.db.prepare('DELETE FROM events WHERE seq = 2').run()
-      expect(journal.sessionHistoryPage('s').events).toHaveLength(1)
+      expect((await journal.sessionHistoryPage('s')).events).toHaveLength(1)
       journal.db.close()
 
       journal = new Journal(file)
       journal.append('s', 'session/input', { text: 'after restart' })
-      expect(journal.sessionHistoryPage('s').events.map((row) => row.seq)).toEqual([1, 3])
+      expect((await journal.sessionHistoryPage('s')).events.map((row) => row.seq)).toEqual([1, 3])
     } finally {
       if (journal.db.open) journal.db.close()
     }
@@ -207,7 +258,7 @@ describe('bounded replay checkpoints and journal history', () => {
     }
   })
 
-  it('uses the bounded session projection instead of scanning the payload-heavy event tree', () => {
+  it('uses the bounded session projection instead of scanning the payload-heavy event tree', async () => {
     const journal = new Journal(path.join(tmp, 'sparse.db'))
     try {
       for (let index = 0; index < 300; index += 1) {
@@ -228,7 +279,7 @@ describe('bounded replay checkpoints and journal history', () => {
         )
         .all('needle', Number.MAX_SAFE_INTEGER, 80) as Array<{ detail: string }>
       expect(plan.map((row) => row.detail).join('\n')).toMatch(/PRIMARY KEY \(session=\? AND seq<\?\)/i)
-      expect(journal.sessionHistoryPage('needle').events).toHaveLength(3)
+      expect((await journal.sessionHistoryPage('needle')).events).toHaveLength(3)
     } finally {
       journal.db.close()
     }

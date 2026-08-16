@@ -13,6 +13,16 @@ type BlobReference = {
   }
 }
 
+type CacheEntry = {
+  text: string
+  bytes: number
+}
+
+export interface JournalBlobStoreOptions {
+  cacheMaxBytes?: number
+  maxConcurrentReads?: number
+}
+
 export interface JournalBlobEncoding {
   stored: unknown
   blobsWritten: number
@@ -20,7 +30,8 @@ export interface JournalBlobEncoding {
 }
 
 const SHA256 = /^[0-9a-f]{64}$/u
-const CACHE_MAX_BYTES = 16 * 1024 * 1024
+const DEFAULT_CACHE_MAX_BYTES = 128 * 1024 * 1024
+const DEFAULT_MAX_CONCURRENT_READS = 16
 
 function blobReference(value: unknown): value is BlobReference {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
@@ -48,10 +59,28 @@ function blobReference(value: unknown): value is BlobReference {
  * deduplicate repeated tool results across turns and, unlike truncation, preserve exact replay/history.
  */
 export class JournalBlobStore {
-  private readonly cache = new Map<string, string>()
+  private readonly cache = new Map<string, CacheEntry>()
+  private readonly pendingReads = new Map<string, Promise<string>>()
+  private readonly readWaiters: Array<() => void> = []
   private cacheBytes = 0
+  private activeReads = 0
+  private readonly cacheMaxBytes: number
+  private readonly maxConcurrentReads: number
 
-  constructor(readonly root: string) {}
+  constructor(readonly root: string, options: JournalBlobStoreOptions = {}) {
+    this.cacheMaxBytes = options.cacheMaxBytes ?? DEFAULT_CACHE_MAX_BYTES
+    this.maxConcurrentReads = options.maxConcurrentReads ?? DEFAULT_MAX_CONCURRENT_READS
+    if (!Number.isSafeInteger(this.cacheMaxBytes) || this.cacheMaxBytes < 0) {
+      throw new Error('journal blob cache bound must be a non-negative whole number')
+    }
+    if (
+      !Number.isSafeInteger(this.maxConcurrentReads) ||
+      this.maxConcurrentReads < 1 ||
+      this.maxConcurrentReads > 64
+    ) {
+      throw new Error('journal blob read concurrency must be a whole number from 1 to 64')
+    }
+  }
 
   encode(value: unknown): JournalBlobEncoding {
     let blobsWritten = 0
@@ -101,6 +130,85 @@ export class JournalBlobStore {
     return visit(value)
   }
 
+  /**
+   * Resolve a bounded history working set without blocking the hub's event loop on one synchronous file
+   * read per blob. The semaphore is store-wide, so several panes opening together cannot multiply the
+   * configured I/O pressure; immutable digest reads are also coalesced across concurrent requests.
+   */
+  async decodeManyAsync(values: readonly unknown[]): Promise<unknown[]> {
+    const references = new Map<string, { digest: string; bytes: number }>()
+    const collect = (candidate: unknown): void => {
+      if (blobReference(candidate)) {
+        const ref = candidate[JOURNAL_BLOB_KEY]
+        references.set(`${ref.sha256}:${ref.bytes}`, { digest: ref.sha256, bytes: ref.bytes })
+        return
+      }
+      if (Array.isArray(candidate)) {
+        for (const item of candidate) collect(item)
+        return
+      }
+      if (!candidate || typeof candidate !== 'object') return
+      for (const item of Object.values(candidate as Record<string, unknown>)) collect(item)
+    }
+    for (const value of values) collect(value)
+
+    const resolved = new Map<string, unknown>()
+    await Promise.all(
+      [...references.entries()].map(async ([key, ref]) => {
+        try {
+          resolved.set(key, await this.readAsync(ref.digest, ref.bytes))
+        } catch (error) {
+          resolved.set(key, {
+            __allmyagentsJournalBlobUnreadable: {
+              sha256: ref.digest,
+              bytes: ref.bytes,
+              reason: error instanceof Error ? error.message : String(error),
+            },
+          })
+        }
+      }),
+    )
+
+    const replace = (candidate: unknown): unknown => {
+      if (blobReference(candidate)) {
+        const ref = candidate[JOURNAL_BLOB_KEY]
+        return resolved.get(`${ref.sha256}:${ref.bytes}`)
+      }
+      if (Array.isArray(candidate)) return candidate.map(replace)
+      if (!candidate || typeof candidate !== 'object') return candidate
+      return Object.fromEntries(
+        Object.entries(candidate as Record<string, unknown>).map(([key, item]) => [key, replace(item)]),
+      )
+    }
+    return values.map(replace)
+  }
+
+  /**
+   * Estimate the JSON envelope cost from blob metadata, without reading blob bodies. It is exact for
+   * inline parsed JSON and intentionally approximate for an external string (escaping can make the final
+   * JSON larger); the caller still enforces the exact encoded bound after hydration.
+   */
+  estimateDecodedJsonBytes(value: unknown): number {
+    const estimate = (candidate: unknown): number => {
+      if (blobReference(candidate)) return candidate[JOURNAL_BLOB_KEY].bytes + 2
+      if (typeof candidate === 'string') return Buffer.byteLength(JSON.stringify(candidate))
+      if (candidate === null || typeof candidate !== 'object') {
+        return Buffer.byteLength(JSON.stringify(candidate) ?? 'null')
+      }
+      if (Array.isArray(candidate)) {
+        return 2 + candidate.reduce((total, item, index) => total + (index > 0 ? 1 : 0) + estimate(item), 0)
+      }
+      let total = 2
+      let index = 0
+      for (const [key, item] of Object.entries(candidate as Record<string, unknown>)) {
+        total += (index > 0 ? 1 : 0) + Buffer.byteLength(JSON.stringify(key)) + 1 + estimate(item)
+        index += 1
+      }
+      return total
+    }
+    return estimate(value)
+  }
+
   private file(digest: string): string {
     return path.join(this.root, 'sha256', digest.slice(0, 2), digest)
   }
@@ -143,12 +251,8 @@ export class JournalBlobStore {
   }
 
   private read(digest: string, expectedBytes: number): string {
-    const cached = this.cache.get(digest)
-    if (cached !== undefined) {
-      this.cache.delete(digest)
-      this.cache.set(digest, cached)
-      return cached
-    }
+    const cached = this.cached(digest, expectedBytes)
+    if (cached !== undefined) return cached
     const bytes = fs.readFileSync(this.file(digest))
     if (bytes.byteLength !== expectedBytes) {
       throw new Error(`expected ${expectedBytes} bytes; found ${bytes.byteLength}`)
@@ -156,17 +260,81 @@ export class JournalBlobStore {
     const actual = crypto.createHash('sha256').update(bytes).digest('hex')
     if (actual !== digest) throw new Error('content hash does not match its journal reference')
     const text = bytes.toString('utf8')
-    if (bytes.byteLength <= CACHE_MAX_BYTES) {
-      while (this.cacheBytes + bytes.byteLength > CACHE_MAX_BYTES && this.cache.size > 0) {
-        const oldest = this.cache.entries().next().value as [string, string] | undefined
-        if (!oldest) break
-        this.cache.delete(oldest[0])
-        this.cacheBytes -= Buffer.byteLength(oldest[1])
-      }
-      this.cache.set(digest, text)
-      this.cacheBytes += bytes.byteLength
-    }
+    this.remember(digest, text, bytes.byteLength)
     return text
+  }
+
+  private async readAsync(digest: string, expectedBytes: number): Promise<string> {
+    const cached = this.cached(digest, expectedBytes)
+    if (cached !== undefined) return cached
+    const pendingKey = `${digest}:${expectedBytes}`
+    const inFlight = this.pendingReads.get(pendingKey)
+    if (inFlight) return inFlight
+    const pending = (async () => {
+      await this.acquireReadSlot()
+      try {
+        const bytes = await fs.promises.readFile(this.file(digest))
+        if (bytes.byteLength !== expectedBytes) {
+          throw new Error(`expected ${expectedBytes} bytes; found ${bytes.byteLength}`)
+        }
+        const actual = crypto.createHash('sha256').update(bytes).digest('hex')
+        if (actual !== digest) throw new Error('content hash does not match its journal reference')
+        const text = bytes.toString('utf8')
+        this.remember(digest, text, bytes.byteLength)
+        return text
+      } finally {
+        this.releaseReadSlot()
+      }
+    })()
+    this.pendingReads.set(pendingKey, pending)
+    try {
+      return await pending
+    } finally {
+      if (this.pendingReads.get(pendingKey) === pending) this.pendingReads.delete(pendingKey)
+    }
+  }
+
+  private cached(digest: string, expectedBytes: number): string | undefined {
+    const cached = this.cache.get(digest)
+    if (!cached) return undefined
+    if (cached.bytes !== expectedBytes) {
+      throw new Error(`expected ${expectedBytes} bytes; found ${cached.bytes}`)
+    }
+    this.cache.delete(digest)
+    this.cache.set(digest, cached)
+    return cached.text
+  }
+
+  private remember(digest: string, text: string, bytes: number): void {
+    if (bytes > this.cacheMaxBytes) return
+    const previous = this.cache.get(digest)
+    if (previous) {
+      this.cache.delete(digest)
+      this.cacheBytes -= previous.bytes
+    }
+    while (this.cacheBytes + bytes > this.cacheMaxBytes && this.cache.size > 0) {
+      const oldest = this.cache.entries().next().value as [string, CacheEntry] | undefined
+      if (!oldest) break
+      this.cache.delete(oldest[0])
+      this.cacheBytes -= oldest[1].bytes
+    }
+    if (bytes > this.cacheMaxBytes) return
+    this.cache.set(digest, { text, bytes })
+    this.cacheBytes += bytes
+  }
+
+  private async acquireReadSlot(): Promise<void> {
+    if (this.activeReads < this.maxConcurrentReads) {
+      this.activeReads += 1
+      return
+    }
+    await new Promise<void>((resolve) => this.readWaiters.push(resolve))
+    this.activeReads += 1
+  }
+
+  private releaseReadSlot(): void {
+    this.activeReads -= 1
+    this.readWaiters.shift()?.()
   }
 
   private fsyncDirectory(directory: string): void {

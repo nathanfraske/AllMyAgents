@@ -458,8 +458,12 @@ export class InProcessExecutor implements Executor {
           // Same normalisation as the worker path: Codex approvals carry no toolName, and every
           // downstream consumer (card title, Always allow, allowlist policy) keys on one.
           const approvalPayload = { ...(params as Record<string, unknown> | null), toolName: codexGrantKey(method) }
-          const approved = await this.services.approvals.request(sessionId ?? 'unattributed', `codex/${method}`, approvalPayload)
-          return codexRequestResult(method, approved, params)
+          const decision = await this.services.approvals.requestDetailed(
+            sessionId ?? 'unattributed',
+            `codex/${method}`,
+            approvalPayload,
+          )
+          return codexRequestResult(method, decision.approved, params, decision.persist)
         },
         wsl,
       )

@@ -123,13 +123,13 @@ describe('application Overseer authority', () => {
 
     expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
       isOverseer: true,
-      overseerCapabilityVersion: 17,
+      overseerCapabilityVersion: 21,
       permissionMode: 'full',
       permissionModeOperatorOverride: true,
       role: 'Application Overseer',
     })
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
-      'Overseer capability manifest version 17',
+      'Overseer capability manifest version 21',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'mcp__allmyagents__overseer_control',
@@ -153,6 +153,12 @@ describe('application Overseer authority', () => {
       'deploy_testbed_node',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
+      'configure_approval_policy',
+    )
+    expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
+      'project\'s reviewed setup recipe',
+    )
+    expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'Do not use the vendor-native list_agents or peek_agent',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
@@ -163,7 +169,7 @@ describe('application Overseer authority', () => {
     expect(upgrades()).toHaveLength(1)
     expect(upgrades()[0]?.payload).toMatchObject({
       fromVersion: 6,
-      toVersion: 17,
+      toVersion: 21,
       conversationPreserved: true,
       tools: expect.arrayContaining([
         'overseer_control',
@@ -199,6 +205,178 @@ describe('application Overseer authority', () => {
     await expect(h.sessions.overseerControl('overseer', {
       operation: 'set_mode', sessionId: 'ordinary', permissionMode: 'full',
     })).resolves.toMatchObject({ ok: false })
+  })
+
+  it('allows only the exact alert-bound request inside an operator-configured risk ceiling', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'target', title: 'Target worker', permissionMode: 'safe' })
+    h.sessions.setOverseerRuntime({
+      overseerConfig: () => ({
+        approvalPolicy: { enabled: true, maxRisk: 'low', updatedAt: '2026-08-15T00:00:00.000Z' },
+      }),
+    })
+
+    const low = h.approvals.request('target', 'claude/tool', {
+      toolName: 'Read',
+      input: { file_path: path.join(h.root, 'README.md') },
+    })
+    const lowId = h.approvals.pending()[0]!.id
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'approve', approvalId: lowId, approve: true,
+    })).resolves.toMatchObject({ ok: true, data: { approvalId: lowId, approved: true } })
+    await expect(low).resolves.toBe(true)
+    expect(h.journal.recentEventsForSession('overseer', 20)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'overseer/approval-decided',
+        payload: expect.objectContaining({
+          origin: 'standing-alert-policy',
+          risk: 'low',
+          riskReason: expect.stringMatching(/read-only tool Read/u),
+        }),
+      }),
+    ]))
+
+    // End the first alert turn, then prove the same standing policy cannot widen to a medium mutation.
+    ;(h.sessions as unknown as { setStatus(record: SessionRecord, status: 'idle'): void })
+      .setStatus(h.sessions.list().find((record) => record.id === 'overseer')!, 'idle')
+    const medium = h.approvals.request('target', 'claude/tool', {
+      toolName: 'Write',
+      input: { file_path: path.join(h.root, 'README.md'), content: 'change' },
+    })
+    const mediumId = h.approvals.pending()[0]!.id
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'approve', approvalId: mediumId, approve: true,
+    })).resolves.toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/outside.*risk ceiling.*medium/iu),
+    })
+    h.approvals.resolve(mediumId, false)
+    await expect(medium).resolves.toBe(false)
+
+    // A Codex connector labels the same bounded operation through its own elicitation envelope. The
+    // transport prefix must not make an operator-configured medium ceiling inert, while the closed
+    // GitHub classifier still keeps merges, pushes, workflows, and unknown connector tools out.
+    ;(h.sessions as unknown as { setStatus(record: SessionRecord, status: 'idle'): void })
+      .setStatus(h.sessions.list().find((record) => record.id === 'overseer')!, 'idle')
+    h.sessions.setOverseerRuntime({
+      overseerConfig: () => ({
+        approvalPolicy: { enabled: true, maxRisk: 'medium', updatedAt: '2026-08-15T00:01:00.000Z' },
+      }),
+    })
+    const connector = h.approvals.request('target', 'codex/mcpServer/elicitation/request', {
+      serverName: 'codex_apps',
+      mode: 'form',
+      requestedSchema: { type: 'object', properties: {} },
+      _meta: {
+        source: 'connector',
+        connector_name: 'GitHub',
+        codex_approval_kind: 'mcp_tool_call',
+        tool_title: 'update_pull_request',
+        tool_params: {
+          repository_full_name: 'nathanfraske/AllMyAgents',
+          pr_number: 31,
+          body: 'bounded body update',
+        },
+      },
+    })
+    const connectorId = h.approvals.pending()[0]!.id
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'approve', approvalId: connectorId, approve: true,
+    })).resolves.toMatchObject({
+      ok: true,
+      data: { approvalId: connectorId, approved: true },
+    })
+    await expect(connector).resolves.toBe(true)
+    expect(h.journal.recentEventsForSession('overseer', 20)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'overseer/approval-decided',
+        payload: expect.objectContaining({
+          origin: 'standing-alert-policy',
+          risk: 'medium',
+          riskReason: expect.stringMatching(/update_pull_request/u),
+        }),
+      }),
+    ]))
+  })
+
+  it('persists a connector approval only on a direct operator turn and only within advertised scopes', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'target', profileId: 'p2', provider: 'codex', permissionMode: 'safe' })
+    h.markOperator('overseer')
+    const request = (id: string, advertised: unknown) => h.approvals.requestDetailed(
+      'target',
+      'codex/mcpServer/elicitation/request',
+      {
+        serverName: 'codex_apps',
+        toolName: 'update_pull_request',
+        _meta: { persist: advertised },
+      },
+      id,
+    )
+
+    const persisted = request('persist-me', ['session', 'always'])
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'approve', approvalId: 'persist-me', approve: true, persist: 'always',
+    })).resolves.toMatchObject({
+      ok: true,
+      data: { approvalId: 'persist-me', approved: true, persist: 'always' },
+    })
+    await expect(persisted).resolves.toEqual({ approved: true, status: 'approved', persist: 'always' })
+
+    const unsupported = request('unsupported-persist', ['session'])
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'approve', approvalId: 'unsupported-persist', approve: true, persist: 'always',
+    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/did not advertise/u) })
+    h.approvals.resolve('unsupported-persist', false)
+    await expect(unsupported).resolves.toMatchObject({ approved: false, status: 'denied' })
+
+    const alertOnly = request('alert-persist', ['always'])
+    ;(h.sessions as unknown as { operatorTurnSessions: Set<string> }).operatorTurnSessions.delete('overseer')
+    h.markBus('overseer')
+    ;(h.sessions as unknown as { overseerApprovalTurnIds: Map<string, Set<string>> })
+      .overseerApprovalTurnIds.set('overseer', new Set(['alert-persist']))
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'approve', approvalId: 'alert-persist', approve: true, persist: 'always',
+    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/direct operator turn/u) })
+    h.approvals.resolve('alert-persist', false)
+    await expect(alertOnly).resolves.toMatchObject({ approved: false, status: 'denied' })
+  })
+
+  it('does not derive standing approval authority from teammate-authored alert text', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'manager', isProjectManager: true, permissionMode: 'full' })
+    h.seed({ id: 'target', title: 'Target worker', permissionMode: 'safe' })
+    h.sessions.setOverseerRuntime({
+      overseerConfig: () => ({ approvalPolicy: { enabled: true, maxRisk: 'low' } }),
+    })
+
+    const pending = h.approvals.request('target', 'claude/tool', {
+      toolName: 'Read',
+      input: { file_path: path.join(h.root, 'README.md') },
+    })
+    const approvalId = h.approvals.pending()[0]!.id
+    ;(h.sessions as unknown as { setStatus(record: SessionRecord, status: 'idle'): void })
+      .setStatus(h.sessions.list().find((record) => record.id === 'overseer')!, 'idle')
+    expect(h.sessions.busSend(
+      'manager',
+      { kind: 'session', id: 'overseer' },
+      'approval awaiting operator',
+      `Target worker (target) is waiting on approval ${approvalId} for Read. Current status: pending.`,
+      true,
+      true,
+    )).toMatchObject({ ok: true })
+
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'approve', approvalId, approve: true,
+    })).resolves.toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/direct operator turn/u),
+    })
+    h.approvals.resolve(approvalId, false)
+    await expect(pending).resolves.toBe(false)
   })
 
   it('deploys a lightweight node only from a direct operator turn with an explicit elevated profile and reason', async () => {
@@ -238,6 +416,27 @@ describe('application Overseer authority', () => {
     expect(h.journal.recentEventsForSession('overseer')).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: 'overseer/testbed-deployment-requested' }),
       expect.objectContaining({ kind: 'overseer/testbed-deployment-verified' }),
+    ]))
+  })
+
+  it('syncs an existing testbed only from a direct operator turn and journals the verified result', async () => {
+    const h = harness()
+    const syncTestbedNode = vi.fn(async (siteId: string, actor: { sessionId: string; profileId: string }) => ({
+      siteId, actor, payloadId: 'f'.repeat(64), changedFiles: ['dist/testbedNode.js'], verified: true,
+    }))
+    h.sessions.setOverseerRuntime({ syncTestbedNode })
+    h.seed({ id: 'overseer', isOverseer: true, profileId: 'codex-b', permissionMode: 'full' })
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'sync_testbed_node', siteId: 'frask-risk-box', reason: 'Apply the operator-requested testbed update.',
+    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/direct operator turn/u) })
+    h.markOperator('overseer')
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'sync_testbed_node', siteId: 'frask-risk-box', reason: 'Apply the operator-requested testbed update.',
+    })).resolves.toMatchObject({ ok: true, data: { verified: true } })
+    expect(syncTestbedNode).toHaveBeenCalledWith('frask-risk-box', { sessionId: 'overseer', profileId: 'codex-b' })
+    expect(h.journal.recentEventsForSession('overseer')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'overseer/testbed-sync-requested' }),
+      expect.objectContaining({ kind: 'overseer/testbed-sync-verified' }),
     ]))
   })
 
@@ -675,7 +874,7 @@ describe('application Overseer authority', () => {
       expect(spec.claudeSystemPrompt).toMatch(/fleet-wide/u)
       expect(spec.claudeSystemPrompt).toMatch(/AskUserQuestion/u)
       expect(spec.claudeSystemPrompt).toMatch(/remote_list_devices.*remote_ping.*remote_inspect_environment.*remote_inspect_git.*remote_prepare_project_location/su)
-      expect(spec.claudeSystemPrompt).toMatch(/Never blindly retry an ambiguous write, preparation, or terminal failure/u)
+      expect(spec.claudeSystemPrompt).toMatch(/Never blindly retry an ambiguous write, preparation, payload sync, restart, or terminal failure/u)
       expect(spec.claudeSystemPrompt).toMatch(/COMPACTION CONTINUITY CONTRACT/u)
       expect(spec.claudeSystemPrompt).toMatch(/active objective.*current project.*current slice/su)
       expect(spec.claudeSystemPrompt).toMatch(/exact next useful action/u)
@@ -686,7 +885,7 @@ describe('application Overseer authority', () => {
     expect(childPrompt).toMatch(/report a real scope or permission block upstream/u)
     for (const prompt of [managerPrompt, childPrompt]) {
       expect(prompt).toMatch(/remote_list_devices.*remote_ping.*remote_inspect_environment.*remote_inspect_git.*remote_prepare_project_location/su)
-      expect(prompt).toMatch(/Report the returned timing, transfer, and failure-stage telemetry upstream/u)
+      expect(prompt).toMatch(/Report the returned timing, active transport, transfer, build identity, and failure-stage telemetry upstream/u)
     }
   })
 
@@ -1032,6 +1231,97 @@ describe('application Overseer authority', () => {
     expect(h.sessions.managerInspectRuns('overseer', { runId: started.run!.id })).toMatchObject({
       ok: true,
       logs: { stdout: expect.stringContaining('application durable run') },
+    })
+  })
+
+  it('preserves a long remote timeout and records the target rather than the source hub as execution', async () => {
+    const h = harness()
+    h.seed({
+      id: 'overseer',
+      isOverseer: true,
+      permissionMode: 'full',
+      remoteDeviceGrants: [{
+        siteId: 'risk-box',
+        rootIds: ['root-home'],
+        capabilities: ['terminal'],
+      }],
+    })
+    const execute = vi.fn(async () => ({
+      ok: true,
+      stdout: 'riscv build complete',
+      exitCode: 0,
+      timedOut: false,
+      telemetry: { transport: 'myownmesh-rpc' as const, targetMs: 123_000 },
+    }))
+    h.sessions.setRemoteDeviceController({
+      capabilities: vi.fn(async () => ({
+        enabled: true,
+        platform: 'linux',
+        arch: 'riscv64',
+        hostname: 'Frask-Risk-Box',
+        cpuCount: 16,
+        availableCpuCount: 8,
+        totalMemoryBytes: 15 * 1024 * 1024 * 1024,
+        activeTransport: 'myownmesh-rpc',
+        nodeKind: 'lightweight-testbed',
+        testbedBuild: {
+          payloadId: 'payload-1', codePayloadId: 'code-1', protocol: 1, files: [],
+        },
+        environments: [{
+          id: 'host', kind: 'host', label: 'RISC-V host', platform: 'linux', arch: 'riscv64', shell: '/bin/sh',
+        }],
+        roots: [{
+          id: 'root-home', label: 'Home', path: '/home/admini', read: true, write: true, terminal: true,
+        }],
+      })),
+      execute,
+    } as unknown as RemoteDeviceController)
+    const controller = new DurableRunController(
+      new DurableRunStore(h.journal.db),
+      h.journal,
+      path.join(h.root, 'remote-run-logs'),
+    )
+    h.sessions.setDurableRunController(controller)
+    controller.activate()
+    cleanups.push(() => controller.shutdown())
+
+    const started = await h.sessions.managerStartRun('overseer', {
+      kind: 'build',
+      executable: '(remote shell)',
+      args: [],
+      timeoutMs: 3_600_000,
+      remote: {
+        deviceId: 'risk-box', rootId: 'root-home', cwd: 'checkout', command: 'just build',
+      },
+    })
+    expect(started.ok).toBe(true)
+    await vi.waitFor(() => expect(controller.store.get(started.run!.id)?.state).toBe('succeeded'))
+    expect(execute).toHaveBeenCalledWith(
+      'risk-box',
+      expect.objectContaining({ op: 'exec', timeoutMs: 3_600_000 }),
+      expect.objectContaining({ durableRunId: started.run!.id }),
+    )
+    expect(controller.store.get(started.run!.id)).toMatchObject({
+      timeoutMs: 3_600_000,
+      provenance: {
+        version: 2,
+        platform: 'linux',
+        architecture: 'riscv64',
+        cwd: '/home/admini/checkout',
+        environmentScope: 'execution',
+        execution: {
+          hostname: 'Frask-Risk-Box',
+          cpuCount: 16,
+          availableCpuCount: 8,
+          transport: 'myownmesh-rpc',
+          nodeKind: 'lightweight-testbed',
+          buildId: 'payload-1',
+        },
+        source: {
+          platform: process.platform,
+          architecture: process.arch,
+        },
+      },
     })
   })
 

@@ -66,7 +66,7 @@ already exposes:
    systemd service. Linux `linux-sudo-machine` creates a dedicated system account, validates a narrowly named
    sudoers file with `visudo`, and grants that account `NOPASSWD: ALL` so agent terminal requests can cross
    the elevation boundary. The latter is deliberately machine-admin authority, not a sandbox.
-6. The source waits for the new node to register, authorizes it through the signed fleet roster, probes its
+6. The source waits for the new node to register, completes the one-use pairing exchange, probes its
    live capabilities, removes the unique bootstrap directory after verified success, and records a bounded
    deployment lifecycle. It never retries an ambiguously completed install command. A cleanup failure is
    reported as pending without falsely failing the already verified installation; an ambiguous installer
@@ -81,6 +81,31 @@ The portable bundle can also be configured locally with `testbedNode configure -
 unprivileged, explicit-root node. Automatic cross-OS deployment currently requires a matching release payload;
 a Windows/x64 desktop release cannot pretend its bundled Node executable is a Linux/ARM64 artifact. Release
 matrix assets or a target-native package repository are the next step for cross-architecture bootstrap.
+
+### Updating an installed node
+
+`overseer_control` operation `sync_testbed_node` is the idempotent update path for an already-paired Linux
+systemd node. It works with nodes that predate the updater because it uses the existing authenticated
+device read/write/terminal protocol rather than a new bootstrap RPC:
+
+1. Read the live build identity and service layout over the authenticated lane. The node reports both its
+   architecture-specific full-payload checksum and its architecture-independent code checksum, along with
+   the route that actually answered (`myownmesh-rpc` or `site`).
+2. Compare the five dependency-free JavaScript modules plus `build.json`; a Windows/x64 hub may therefore
+   update the application code on a Linux/riscv64 node without pretending its Node executable is portable.
+   A runtime replacement still requires a matching full bootstrap artifact.
+3. Stage only differing files beneath the existing install root, verify every staged SHA-256, retain one
+   bounded rollback generation, and apply via same-filesystem atomic renames.
+4. Repair the unit with `After=myownmesh.service` (not `Requires=`) and an explicit, detected
+   `MYOWNMESH_CONTROL_SOCKET`, then ask systemd to restart the service from a detached timer after the
+   caller has received the commit response.
+5. Never replay an ambiguous commit/restart. Resolve it with read-only capability probes and report success
+   only when the new code checksum is observed. Results include changed files, bytes, transfer/restart time,
+   active transport, and the rollback path.
+
+The authenticated capability response also includes the target's public SSH host-key fingerprints. If SSH
+is used for an out-of-band bootstrap, pin a fingerprint obtained through this mesh-authenticated channel;
+never use blind host-key acceptance or trust-on-first-use when an independent authenticated path exists.
 
 ## Project locations and attributed runs
 
@@ -175,8 +200,11 @@ runs as the target hub's operating-system account and therefore retains that acc
 is stated in both operator and agent UI. Use read/write-only roots when directory containment is required;
 grant `terminal` only when whole-account shell authority is intended.
 
-Windows targets use non-interactive PowerShell. macOS and Linux targets use `/bin/sh -lc`. The control
-channel, browser bridge, and agent-tool credentials are removed from the command environment.
+Windows targets use non-interactive PowerShell. macOS and Linux targets use non-login `/bin/sh -c`; WSL
+does the same inside the selected distribution. The control channel, browser bridge, agent-tool credentials,
+and login-profile side effects are removed from the command environment. Elevated Linux testbed commands run
+in a bounded transient systemd unit with their own cgroup/journal identity, so a child shell cannot bury the
+testbed service's own logs. Timeout handling stops that unit rather than merely abandoning its client process.
 
 An `elevated-machine` node intentionally changes the terminal semantics: its process account is LocalSystem
 or root, so a terminal-capable root is effectively machine-administrator command access. A
@@ -204,7 +232,7 @@ filesystem provider even though commands inside WSL can see it.
 
 ## Telemetry and failure feedback
 
-Every operation returns route lookup, network, full round-trip, and—when observable—target execution time,
+Every operation returns the active transport, route lookup, network, full round-trip, and—when observable—target execution time,
 plus request/response byte counts. File transfers additionally report transferred bytes, elapsed transfer
 time, and measured throughput. `remote_ping` provides a lightweight round-trip probe before expensive work.
 

@@ -458,6 +458,27 @@ describe('journal snapshots', () => {
     expect(fs.readdirSync(backups).some((name) => name.includes('01.db'))).toBe(false)
   })
 
+  it('removes orphaned backup sidecars on every retention pass', () => {
+    const root = tmp()
+    const backups = path.join(root, 'backups')
+    fs.mkdirSync(backups, { recursive: true })
+    const live = 'hub-2026-08-14T00-00-04.db'
+    const orphan = 'hub-2026-08-01T00-00-01.db'
+    fs.writeFileSync(path.join(backups, live), Buffer.alloc(12))
+    fs.writeFileSync(path.join(backups, `${live}-wal`), Buffer.alloc(0))
+    fs.writeFileSync(path.join(backups, `${orphan}-wal`), Buffer.alloc(0))
+    fs.writeFileSync(path.join(backups, `${orphan}-shm`), Buffer.alloc(12))
+    fs.writeFileSync(path.join(backups, 'unrelated.db-wal'), Buffer.alloc(12))
+
+    pruneJournalBackupGenerations(backups, 2, 1024)
+    pruneJournalBackupGenerations(backups, 2, 1024)
+
+    expect(fs.existsSync(path.join(backups, `${live}-wal`))).toBe(true)
+    expect(fs.existsSync(path.join(backups, `${orphan}-wal`))).toBe(false)
+    expect(fs.existsSync(path.join(backups, `${orphan}-shm`))).toBe(false)
+    expect(fs.existsSync(path.join(backups, 'unrelated.db-wal'))).toBe(true)
+  })
+
   it('writes a verified snapshot containing the journal contents', async () => {
     const root = tmp()
     const journal = makeJournal(root, 40)
