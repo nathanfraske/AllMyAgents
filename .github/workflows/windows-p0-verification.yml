@@ -163,7 +163,17 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $processName = [IO.Path]::GetFileNameWithoutExtension($env:AMA_INSTALLED_EXE)
           Get-Process -Name $processName -ErrorAction SilentlyContinue |
-            ForEach-Object { & taskkill.exe /PID $_.Id /T /F | Out-Host }
+            ForEach-Object {
+              # Children exit concurrently while taskkill walks the tree, so "no running instance"
+              # is an expected teardown race rather than a failed corruption proof.  GitHub's pwsh
+              # wrapper otherwise returns the last native exit code even after every assertion below
+              # succeeds, which made this gate report red after it had already emptied the module.
+              & taskkill.exe /PID $_.Id /T /F | Out-Host
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host "taskkill raced an already-exited process tree; continuing with health verification"
+              }
+            }
+          $global:LASTEXITCODE = 0
           foreach ($attempt in 1..30) {
             try {
               Invoke-WebRequest http://127.0.0.1:7777/api/health -UseBasicParsing -TimeoutSec 1 |
@@ -285,7 +295,11 @@ jobs:
           }
           if ($processName) {
             Get-Process -Name $processName -ErrorAction SilentlyContinue |
-              ForEach-Object { & taskkill.exe /PID $_.Id /T /F | Out-Host }
+              ForEach-Object {
+                & taskkill.exe /PID $_.Id /T /F | Out-Host
+              }
+            # Cleanup is best-effort and may observe the same concurrent process-tree teardown race.
+            $global:LASTEXITCODE = 0
           }
 
   # The updater used to launch its installer while its managed hub (and detached workers) still had the
