@@ -11,6 +11,7 @@ import {
   machineRoots,
   readTestbedNodeConfig,
   readTestbedBuildIdentity,
+  renderLinuxToolchainProfile,
   renderLinuxTestbedService,
   sshHostKeyFingerprints,
 } from './testbedNode.js'
@@ -145,5 +146,22 @@ describe('lightweight testbed node configuration', () => {
     expect(unit).toContain('After=network-online.target myownmesh.service')
     expect(unit).not.toContain('Requires=myownmesh.service')
     expect(unit).toContain('MYOWNMESH_CONTROL_SOCKET=/var/lib/myownmesh/daemon.sock')
+    expect(unit).toContain('ALLMYAGENTS_TOOLCHAIN_HOME=/opt/allmyagents-toolchains')
+    expect(unit).toContain('RUSTUP_HOME=/opt/allmyagents-toolchains/rustup')
+    expect(unit).toContain('CARGO_INSTALL_ROOT=/opt/allmyagents-toolchains')
+    expect(unit).toContain('/root/.cargo/bin')
+    expect(unit).not.toContain('CARGO_HOME=')
+    expect(unit).toContain('UMask=0022')
+  })
+
+  it('makes shared compilers visible to ordinary logins without sharing their writable Cargo cache', () => {
+    const profile = renderLinuxToolchainProfile({
+      toolchainHome: '/opt/allmyagents-toolchains',
+      rustupHome: '/opt/rust',
+    })
+    expect(profile).toContain("export RUSTUP_HOME='/opt/rust'")
+    expect(profile).toContain('"$RUSTUP_HOME"/toolchains/*/bin')
+    expect(profile).toContain('export PATH')
+    expect(profile).not.toContain('CARGO_HOME')
   })
 })

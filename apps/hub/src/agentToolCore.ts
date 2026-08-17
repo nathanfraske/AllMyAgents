@@ -1264,7 +1264,10 @@ const remoteInspectEnvironment = defineTool({
     const result = await services.remoteExecute(identity.sessionId, args.device_id, { op: 'inspect', rootId: args.root_id })
     if (!result.ok || !result.environment) return `Remote environment inspection failed: ${result.error ?? 'unknown error'} ${remoteTelemetry(result)}`
     const environment = result.environment
-    const tools = Object.entries(environment.tools).map(([tool, available]) => `${tool}=${available ? 'yes' : 'no'}`).join(', ')
+    const tools = Object.entries(environment.tools).map(([tool, available]) => {
+      const detail = environment.toolDetails?.[tool]
+      return `${tool}=${available ? 'yes' : 'no'}${detail?.path ? ` (${detail.path}; ${detail.source})` : ''}`
+    }).join(', ')
     return [
       `${environment.label} — ${environment.platform}/${environment.arch}; ${environment.release}`,
       `hostname ${environment.hostname}; shell ${environment.shell}; ${environment.cpuCount} CPUs; ${environment.totalMemoryBytes} memory bytes`,
