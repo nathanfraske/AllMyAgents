@@ -1605,6 +1605,11 @@ export const api = {
       '/api/fleet/pair-direct',
       { siteId, ...(code ? { code } : {}) },
     ),
+  pairFleetSiteSite: (siteId: string, code?: string) =>
+    jpost<{ siteId?: string; label?: string; token?: string; paired?: boolean; error?: string }>(
+      '/api/fleet/pair-site',
+      { siteId, ...(code ? { code } : {}) },
+    ),
   // Authenticate, bootstrap, and refresh an arbitrary mapped fleet hub with its own paired token.
   authFrom: (site: FleetSite) =>
     jget<{ requireToken: boolean; authed: boolean }>('/api/auth', site.baseUrl, undefined, getFleetSiteToken(site.siteId)),

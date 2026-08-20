@@ -635,6 +635,52 @@ describe('RemoteDeviceController', () => {
     expect(connections.get('peerhub')?.token).toBe(remoteToken)
   })
 
+  it('pairs reciprocally through a healthy Site route when the direct pipe is unavailable', async () => {
+    const dir = tempDir()
+    const connections = new FleetConnectionStore(path.join(dir, 'connections.json'))
+    const localToken = 'l'.repeat(64)
+    const remoteToken = 'r'.repeat(64)
+    const resolveRoute = vi.fn(async () => ({
+      siteId: 'peerhub-SESSION', label: 'Peer Hub', baseUrl: 'http://127.0.0.1:48123', online: true,
+    }))
+    const fetchMock = vi.fn(async (_url: URL | RequestInfo, init?: RequestInit) => {
+      expect(init).toMatchObject({ method: 'POST' })
+      expect(JSON.parse(String(init?.body))).toEqual({
+        trust: 'signed-fleet-roster',
+        source: { siteId: 'localhub-SESSION', label: 'Local Hub', token: localToken },
+      })
+      return new Response(JSON.stringify({
+        siteId: 'peerhub-SESSION', label: 'Peer Hub', token: remoteToken,
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const controller = new RemoteDeviceController(connections, resolveRoute)
+
+    await expect(controller.pairSite('peerhub-OLD', {
+      siteId: 'localhub-SESSION', label: 'Local Hub', token: localToken,
+    })).resolves.toMatchObject({ siteId: 'peerhub-SESSION', label: 'Peer Hub', paired: true })
+    expect(connections.get('peerhub-SESSION')?.token).toBe(remoteToken)
+    expect(resolveRoute).toHaveBeenCalledWith('peerhub-OLD')
+  })
+
+  it('keeps one-use code recovery compatible with a pre-reciprocal Site peer', async () => {
+    const dir = tempDir()
+    const connections = new FleetConnectionStore(path.join(dir, 'connections.json'))
+    const remoteToken = 'r'.repeat(64)
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ token: remoteToken }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })))
+    const controller = new RemoteDeviceController(connections, async () => ({
+      siteId: 'legacy-peer', label: 'Legacy Peer', baseUrl: 'http://127.0.0.1:48124', online: true,
+    }))
+
+    await expect(controller.pairSite('legacy-peer', {
+      siteId: 'localhub', label: 'Local Hub', token: 'l'.repeat(64),
+    }, 'ABCD-EFGH')).resolves.toMatchObject({ siteId: 'legacy-peer', label: 'Legacy Peer', paired: true })
+    expect(connections.get('legacy-peer')?.token).toBe(remoteToken)
+  })
+
   it('does not use or pair through the direct lane while mesh exposure is disabled', async () => {
     const dir = tempDir()
     const connections = new FleetConnectionStore(path.join(dir, 'connections.json'))

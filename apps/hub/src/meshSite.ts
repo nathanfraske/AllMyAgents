@@ -30,6 +30,12 @@ export interface WireResponse {
   error?: string
 }
 
+export interface MeshIdentity {
+  /** Canonical device id used by the signed AllMyStuff fleet roster. */
+  siteId: string
+  label: string
+}
+
 export type MeshControlRequest = (cmd: string, args: unknown, timeoutMs: number) => Promise<WireResponse>
 
 /**
@@ -428,6 +434,53 @@ export class MeshSite {
 
   async ownedRoster(timeoutMs = 4000): Promise<FleetMember[]> {
     return this.ownedRosterRequired(timeoutMs).catch(() => [])
+  }
+
+  /**
+   * Resolve this machine's mesh identity through the AllMyStuff control plane. This deliberately does
+   * not use the direct MyOwnMesh pipe: service installs may expose a healthy Site transport while that
+   * lower-level pipe's ACL denies the interactive desktop process. Reciprocal Site pairing needs the
+   * machine identity even in exactly that degraded (but still routable) state.
+   */
+  async meshIdentityRequired(timeoutMs = 4000): Promise<MeshIdentity> {
+    let r: WireResponse
+    try {
+      r = await this.request('mesh_identity', {}, timeoutMs)
+    } catch (error) {
+      throw new Error(`AllMyStuff mesh identity is unavailable: ${describe(error)}`, { cause: error })
+    }
+    if (!r.ok) {
+      throw new Error(`AllMyStuff refused the mesh identity request: ${(r.error ?? 'unknown error').slice(0, 2_000)}`)
+    }
+    const value = (r.result ?? {}) as {
+      device_id?: unknown
+      deviceId?: unknown
+      pubkey?: unknown
+      label?: unknown
+    }
+    // `device_id` may carry an ephemeral session suffix while the signed roster, presence peers,
+    // connection store, and direct RPC lane all key the stable public identity. Prefer `pubkey` so a
+    // reciprocal credential remains addressable after a daemon reconnect or transport change.
+    const siteId = typeof value.pubkey === 'string' && value.pubkey.trim()
+      ? value.pubkey.trim()
+      : typeof value.device_id === 'string' && value.device_id.trim()
+        ? value.device_id.trim()
+        : typeof value.deviceId === 'string' && value.deviceId.trim()
+          ? value.deviceId.trim()
+          : ''
+    if (!siteId || siteId.length > 256 || /[\u0000-\u001f\u007f]/u.test(siteId)) {
+      throw new Error('AllMyStuff returned an invalid mesh device identity.')
+    }
+    let label = typeof value.label === 'string' && value.label.trim()
+      ? value.label.trim().slice(0, 200)
+      : ''
+    if (!label) {
+      const canonical = (id: string): string => id.split('-', 1)[0]!.toLowerCase()
+      const localMember = (await this.ownedRosterRequired(timeoutMs).catch(() => []))
+        .find((member) => canonical(member.device) === canonical(siteId))
+      label = localMember?.label.trim().slice(0, 200) || (this.label === 'AllMyAgents' ? os.hostname() : this.label)
+    }
+    return { siteId, label }
   }
 
   /**

@@ -1219,11 +1219,11 @@
                   </div>
                 {:else}
                   <div class="token-row">
-                    {#if site.directOnline}
-                      <span class="hint dim">Same-fleet trust links with no code. If that is refused, enter this peer's one-use code.</span>
+                    {#if site.directOnline || site.online}
+                      <span class="hint dim">Same-fleet trust links with no code over the healthiest available lane. If that is refused, enter this peer's one-use code.</span>
                     {/if}
                     <PairingCodeInput
-                      label={`Pairing code for ${site.label}${site.directOnline ? ' (optional)' : ''}`}
+                      label={`Pairing code for ${site.label}${site.directOnline || site.online ? ' (optional)' : ''}`}
                       value={fleetTokenDrafts[site.siteId] ?? ''}
                       onchange={(value) => (fleetTokenDrafts = { ...fleetTokenDrafts, [site.siteId]: value })}
                       onenter={() => pairFleetSite(site.siteId)}
@@ -1234,11 +1234,11 @@
                       disabled={
                         fleetPairBusy === site.siteId ||
                         (!site.online && !site.directOnline) ||
-                        (!site.directOnline && (fleetTokenDrafts[site.siteId] ?? '').replace(/-/gu, '').length !== 8)
+                        ((!site.directOnline && !site.online) && (fleetTokenDrafts[site.siteId] ?? '').replace(/-/gu, '').length !== 8)
                       }
                       onclick={() => pairFleetSite(site.siteId)}
                     >
-                      {fleetPairBusy === site.siteId ? 'linking…' : site.directOnline ? 'link' : 'pair'}
+                      {fleetPairBusy === site.siteId ? 'linking…' : site.directOnline || site.online ? 'link' : 'pair'}
                     </button>
                   </div>
                 {/if}

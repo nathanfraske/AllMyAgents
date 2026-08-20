@@ -59,6 +59,7 @@ vi.mock('./api', () => {
       })),
       spawn: vi.fn(async () => rec('spawned')),
       pairFleetSiteDirect: vi.fn(async () => ({ siteId: 'peer', label: 'Peer', token: 't'.repeat(64), paired: true })),
+      pairFleetSiteSite: vi.fn(async () => ({ siteId: 'peer', label: 'Peer', token: 's'.repeat(64), paired: true })),
       send: vi.fn(ok),
       stop: vi.fn(ok),
       deleteSession: vi.fn(ok),
@@ -836,6 +837,26 @@ describe('automatic signed-fleet trust', () => {
 
     expect(api.pairFleetSiteDirect).toHaveBeenCalledWith('peer')
     expect(localStorage.getItem('test.fleet.peer')).toBe('t'.repeat(64))
+    expect(site.authState).toBe('paired')
+  })
+
+  it('links a same-fleet hub over its healthy Site when the direct control pipe is unavailable', async () => {
+    const site = {
+      siteId: 'site-peer',
+      label: 'Site Peer',
+      local: false,
+      baseUrl: 'http://localhost:48123',
+      online: true,
+      directOnline: false,
+      authState: 'pairing-required' as const,
+    }
+    store.fleetSites = [site]
+
+    await (store as unknown as { autoTrustFleetSite(site: unknown): Promise<void> }).autoTrustFleetSite(site)
+
+    expect(api.pairFleetSiteDirect).not.toHaveBeenCalledWith('site-peer')
+    expect(api.pairFleetSiteSite).toHaveBeenCalledWith('site-peer')
+    expect(localStorage.getItem('test.fleet.site-peer')).toBe('s'.repeat(64))
     expect(site.authState).toBe('paired')
   })
 })

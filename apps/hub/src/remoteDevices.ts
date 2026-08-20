@@ -1696,6 +1696,76 @@ export class RemoteDeviceController {
     return { siteId: saved.siteId, label: saved.label, token: response.token, paired: true }
   }
 
+  /**
+   * Reciprocal pairing over an already-authenticated AllMyStuff Site tunnel. This is the fallback for
+   * service installs whose direct MyOwnMesh control pipe is not readable by the desktop user. The
+   * target independently validates signed-fleet membership and calls this hub's `/api/auth` with the
+   * supplied source capability before it accepts a code-free exchange; merely claiming a fleet id is
+   * therefore insufficient.
+   */
+  async pairSite(
+    siteId: string,
+    source: { siteId: string; label: string; token: string },
+    code?: string,
+  ): Promise<DirectPairResult> {
+    const route = await this.resolveRoute(siteId)
+    if (!route?.online || !route.baseUrl) {
+      throw new Error(route?.error ?? 'No healthy AllMyStuff Site route reaches that hub.')
+    }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 15_000)
+    timer.unref?.()
+    try {
+      const response = await fetch(new URL('/api/pair', route.baseUrl), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          ...(code ? { code } : { trust: 'signed-fleet-roster' }),
+          source,
+        }),
+        signal: controller.signal,
+      })
+      const result = await boundedJson(response) as {
+        siteId?: unknown
+        label?: unknown
+        token?: unknown
+        error?: unknown
+      }
+      if (!response.ok) {
+        throw new Error(typeof result?.error === 'string' ? result.error : `remote hub returned HTTP ${response.status}`)
+      }
+      // Pre-reciprocal peers return only `{ token }` for a one-use code. Keep that recovery path
+      // functional during rolling upgrades; code-free fleet trust still requires the complete,
+      // challenge-verified reciprocal response.
+      if (
+        code &&
+        typeof result?.token === 'string' &&
+        typeof result?.siteId !== 'string' &&
+        typeof result?.label !== 'string'
+      ) {
+        const saved = this.connections.upsert({ siteId, label: route.label, token: result.token })
+        return { siteId: saved.siteId, label: saved.label, token: result.token, paired: true }
+      }
+      if (
+        typeof result?.siteId !== 'string' ||
+        typeof result?.label !== 'string' ||
+        typeof result?.token !== 'string'
+      ) {
+        throw new Error('The remote hub returned an invalid reciprocal Site pairing response.')
+      }
+      if (result.siteId.split('-', 1)[0]!.toLowerCase() !== siteId.split('-', 1)[0]!.toLowerCase()) {
+        throw new Error('The Site pairing response identity did not match the requested fleet peer.')
+      }
+      const saved = this.connections.upsert({ siteId: result.siteId, label: result.label, token: result.token })
+      return { siteId: saved.siteId, label: saved.label, token: result.token, paired: true }
+    } catch (error) {
+      if (controller.signal.aborted) throw new Error('Reciprocal Site pairing timed out after 15000ms.')
+      throw error
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
   async overseerPeers(): Promise<OverseerPeerStatus[]> {
     const directPeers = new Map(
       (this.direct?.enabled?.() === false ? [] : await this.direct?.bridge.peers(true).catch(() => []) ?? [])

@@ -1534,12 +1534,22 @@ export class HubStore {
   }
 
   private async autoTrustFleetSite(site: FleetSite): Promise<void> {
-    if (!site.directOnline || getFleetSiteToken(site.siteId)) return
+    if ((!site.directOnline && !site.online) || getFleetSiteToken(site.siteId)) return
     const now = Date.now()
     if ((this.fleetAutoTrustRetryAt.get(site.siteId) ?? 0) > now) return
-    const result = await api.pairFleetSiteDirect(site.siteId).catch((error) => ({
-      error: error instanceof Error ? error.message : 'Automatic same-fleet trust failed.',
-    }))
+    let result = site.directOnline
+      ? await api.pairFleetSiteDirect(site.siteId).catch((error) => ({
+          error: error instanceof Error ? error.message : 'Automatic same-fleet trust failed.',
+        }))
+      : { error: 'The direct MyOwnMesh lane is unavailable.' }
+    // A service-owned MyOwnMesh daemon may deny the desktop direct-pipe access while its authenticated
+    // AllMyStuff Site tunnel remains healthy. Reciprocal Site pairing is challenge-verified by the hub,
+    // so use it as a real trust lane rather than misreporting the entire fleet as offline.
+    if (!('token' in result) && site.online) {
+      result = await api.pairFleetSiteSite(site.siteId).catch((error) => ({
+        error: error instanceof Error ? error.message : 'Automatic same-fleet Site trust failed.',
+      }))
+    }
     const credential = ('token' in result ? result.token : undefined)?.trim() ?? ''
     if (!credential) {
       // Discovery runs repeatedly; bound a version-skewed or non-fleet peer to one quiet attempt per
@@ -1556,23 +1566,30 @@ export class HubStore {
   /** Pair (or replace) one remote hub credential, then retry discovery immediately. */
   async pairFleetSite(siteId: string, token: string): Promise<boolean> {
     const site = this.fleetSites.find((candidate) => candidate.siteId === siteId && !candidate.local)
-    if (!site || (!token.trim() && !site.directOnline)) return false
+    if (!site || (!token.trim() && !site.directOnline && !site.online)) return false
     const supplied = token.trim()
-    if (!site.online && !looksLikePairingCode(supplied)) {
+    if (!site.online && !site.directOnline && !looksLikePairingCode(supplied)) {
       site.authState = 'error'
       site.authError = 'A direct-only peer must be paired with its eight-character one-use code.'
       this.fleetSites = [...this.fleetSites]
       return false
     }
     let credential = supplied
-    if (!supplied && site.directOnline) {
-      const direct = await api.pairFleetSiteDirect(site.siteId).catch((error) => ({
-        error: error instanceof Error ? error.message : 'Automatic same-fleet trust failed.',
-      }))
-      credential = ('token' in direct ? direct.token : undefined)?.trim() ?? ''
+    if (!supplied && (site.directOnline || site.online)) {
+      let paired = site.directOnline
+        ? await api.pairFleetSiteDirect(site.siteId).catch((error) => ({
+            error: error instanceof Error ? error.message : 'Automatic same-fleet trust failed.',
+          }))
+        : { error: 'The direct MyOwnMesh lane is unavailable.' }
+      if (!('token' in paired) && site.online) {
+        paired = await api.pairFleetSiteSite(site.siteId).catch((error) => ({
+          error: error instanceof Error ? error.message : 'Automatic same-fleet Site trust failed.',
+        }))
+      }
+      credential = ('token' in paired ? paired.token : undefined)?.trim() ?? ''
       if (!credential) {
         site.authState = 'error'
-        site.authError = direct.error ?? 'This peer is not in the signed AllMyStuff fleet roster; use a one-use code.'
+        site.authError = paired.error ?? 'This peer is not in the signed AllMyStuff fleet roster; use a one-use code.'
         this.fleetSites = [...this.fleetSites]
         return false
       }
@@ -1583,13 +1600,13 @@ export class HubStore {
           error: error instanceof Error ? error.message : 'Direct mesh pairing failed.',
         }))
         exchanged = { token: 'token' in direct ? direct.token : undefined, error: direct.error }
-        // An upgraded peer uses the Site-free channel. A mixed-version peer may not have registered
-        // the RPC method yet, so retain the old HTTP exchange as a compatibility fallback when its Site works.
+        // An upgraded peer prefers the Site-free channel. The reciprocal Site route is the compatibility
+        // fallback and fixes the old one-way HTTP exchange that required pairing both hubs separately.
         if (!exchanged.token && site.online && site.baseUrl) {
-          exchanged = await api.exchangePairingCode(supplied, site.baseUrl)
+          exchanged = await api.pairFleetSiteSite(site.siteId, supplied)
         }
       } else if (site.online && site.baseUrl) {
-        exchanged = await api.exchangePairingCode(supplied, site.baseUrl)
+        exchanged = await api.pairFleetSiteSite(site.siteId, supplied)
       } else {
         exchanged = { error: site.routeError ?? 'No live direct channel or Site route reaches that hub.' }
       }
