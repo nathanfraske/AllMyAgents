@@ -623,13 +623,22 @@ export function resolveHubResource(id: string): HubResourceTarget {
   return { id, baseUrl: HUB_HTTP, token: hubToken }
 }
 
-export function fleetWebSocketUrl(site: FleetSite, since: number, generation: number): string {
+export function fleetWebSocketUrl(
+  site: FleetSite,
+  since: number,
+  generation: number,
+  visibleSessionIds: readonly string[] = [],
+): string {
   const base = new URL(site.baseUrl)
   base.protocol = base.protocol === 'https:' ? 'wss:' : 'ws:'
   base.pathname = '/ws'
   base.search = ''
   base.searchParams.set('since', String(since))
   base.searchParams.set('generation', String(generation))
+  base.searchParams.set('view', 'fleet')
+  for (const sessionId of visibleSessionIds.slice(0, 16)) {
+    if (sessionId.length > 0 && sessionId.length <= 256) base.searchParams.append('session', sessionId)
+  }
   const token = getFleetSiteToken(site.siteId)
   if (token) base.searchParams.set('token', token)
   return base.toString()
@@ -1882,6 +1891,13 @@ export const api = {
   remoteDeviceInventory: () => jget<RemoteDeviceCatalogEntry[]>('/api/remote-devices'),
   setRemoteDeviceGrants: (id: string, grants: RemoteDeviceGrant[]) =>
     routedSessionPost(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/remote-devices`, { grants }),
+  /** One-click standing authority: grant every capability exposed by this exact testbed. */
+  authorizeRemoteDevice: (id: string, siteId: string) =>
+    routedSessionPost(
+      id,
+      (raw) => `/api/sessions/${encodeURIComponent(raw)}/remote-devices/${encodeURIComponent(siteId)}/authorize`,
+      {},
+    ),
   /** Persist a per-chat model / thinking effort / service tier immediately (survives reload + restart). */
   setSettings: (id: string, patch: { model?: string; effort?: string; serviceTier?: string }) =>
     routedSessionPost(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/settings`, patch),
@@ -1908,6 +1924,9 @@ export const api = {
   deviceExecutor: () => jget<DeviceExecutorCapabilities>('/api/device-executor'),
   setDeviceExecutor: (enabled: boolean, roots: Array<Omit<DeviceRootPolicy, 'id'> & { id?: string }>) =>
     jpost<DeviceExecutorCapabilities | ApiError>('/api/device-executor', { enabled, roots }),
+  /** One explicit operator action: expose every host/WSL filesystem visible to this service account. */
+  authorizeDeviceExecutor: () =>
+    jpost<DeviceExecutorCapabilities | ApiError>('/api/device-executor', { enabled: true, authorizeMachine: true }),
   revealDeviceToken: () => jpost<{ token?: string; error?: string }>('/api/device-token/reveal'),
   issuePairingCode: () =>
     jpost<{ code?: string; expiresAt?: string; error?: string }>('/api/pairing-code'),

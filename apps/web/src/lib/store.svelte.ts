@@ -38,6 +38,7 @@ interface RemoteStream {
   lastSeq: number
   reconnectTimer: ReturnType<typeof setTimeout> | null
   failures: number
+  subscriptionKey: string
 }
 
 function looksLikePairingCode(value: string): boolean {
@@ -1771,6 +1772,7 @@ export class HubStore {
       lastSeq: baseline.highWaterSeq,
       reconnectTimer: null,
       failures: 0,
+      subscriptionKey: this.remoteSubscriptionKey(site.siteId),
     }
     this.remoteStreams.set(site.siteId, stream)
     this.openRemoteSocket(stream)
@@ -1786,7 +1788,11 @@ export class HubStore {
 
   private openRemoteSocket(stream: RemoteStream): void {
     if (stream.socket) return
-    const socket = new WebSocket(fleetWebSocketUrl(stream.site, stream.lastSeq, stream.generation))
+    const visibleSessionIds = this.visibleRemoteSessionIds(stream.site.siteId)
+    stream.subscriptionKey = visibleSessionIds.join('\n')
+    const socket = new WebSocket(
+      fleetWebSocketUrl(stream.site, stream.lastSeq, stream.generation, visibleSessionIds),
+    )
     stream.socket = socket
     socket.onopen = () => {
       stream.failures = 0
@@ -1842,6 +1848,35 @@ export class HubStore {
     const socket = stream.socket
     stream.socket = null
     socket?.close()
+  }
+
+  private visibleRemoteSessionIds(siteId: string): string[] {
+    const prefix = `${siteId}:`
+    return [...new Set(this.basePanes().flat())]
+      .filter((id) => id.startsWith(prefix))
+      .map((id) => id.slice(prefix.length))
+      .filter((id) => id.length > 0 && id.length <= 256)
+      .sort()
+      .slice(0, 16)
+  }
+
+  private remoteSubscriptionKey(siteId: string): string {
+    return this.visibleRemoteSessionIds(siteId).join('\n')
+  }
+
+  /** Reopen only streams whose visible transcript set changed; fleet state continues on every stream. */
+  private refreshRemoteStreamSubscriptions(): void {
+    for (const stream of this.remoteStreams.values()) {
+      const nextKey = this.remoteSubscriptionKey(stream.site.siteId)
+      if (nextKey === stream.subscriptionKey) continue
+      stream.subscriptionKey = nextKey
+      if (stream.reconnectTimer) clearTimeout(stream.reconnectTimer)
+      stream.reconnectTimer = null
+      const socket = stream.socket
+      stream.socket = null
+      socket?.close()
+      this.openRemoteSocket(stream)
+    }
   }
 
   private stopRemovedRemoteStreams(knownSiteIds: Set<string>): void {
@@ -4267,7 +4302,6 @@ export class HubStore {
     this.projectViewId = null
     const prev = this.selectedId
     this.selectedId = id
-    void this.ensureHistory(id)
     // In split mode, selecting from the sidebar drives the first (primary) pane (row 0, col 0).
     if (this.splitPanes.length) {
       const rows = this.splitPanes.map((r) => [...r])
@@ -4275,6 +4309,8 @@ export class HubStore {
       else rows.unshift([id])
       this.splitPanes = rows
     }
+    this.refreshRemoteStreamSubscriptions()
+    void this.ensureHistory(id)
     // Navigating away from an unsent draft that is no longer shown anywhere discards it (nothing
     // to clean up on the hub). Keeps repeated "new chat" from leaking unreachable drafts.
     if (prev && prev !== id && this.sessions[prev]?.draft && !this.basePanes().flat().includes(prev)) {
@@ -4309,6 +4345,7 @@ export class HubStore {
     this.selectedId = null
     this.splitPanes = []
     this.projectViewId = null
+    this.refreshRemoteStreamSubscriptions()
   }
 
   /**
@@ -4323,6 +4360,7 @@ export class HubStore {
     this.splitPanes = []
     this.projectViewMode = mode ?? loadProjectViewMode(projectId)
     this.projectViewId = projectId
+    this.refreshRemoteStreamSubscriptions()
   }
 
   goBack(): void {
@@ -4331,6 +4369,7 @@ export class HubStore {
     this.selectedId = this.lastLayout.selectedId
     this.splitPanes = this.lastLayout.splitPanes.map((r) => [...r])
     this.lastLayout = null
+    this.refreshRemoteStreamSubscriptions()
   }
 
   // --- Cross-restart layout persistence --------------------------------------------------------
@@ -4373,6 +4412,7 @@ export class HubStore {
     } else {
       return // nothing survived the restart — stay on the home screen
     }
+    this.refreshRemoteStreamSubscriptions()
     for (const id of this.basePanes().flat()) void this.ensureHistory(id)
   }
 
@@ -4452,6 +4492,7 @@ export class HubStore {
       this.splitPanes = cleaned
       this.selectedId = cleaned[0]?.[0] ?? this.selectedId
     }
+    this.refreshRemoteStreamSubscriptions()
   }
 
   // Place a dragged chat according to the computed drop zone.
@@ -4462,6 +4503,7 @@ export class HubStore {
       // From the dashboard there is nothing to split — just open the chat.
       this.selectedId = id
       this.splitPanes = []
+      this.refreshRemoteStreamSubscriptions()
       return
     }
 

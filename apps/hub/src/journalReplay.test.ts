@@ -258,6 +258,28 @@ describe('bounded replay checkpoints and journal history', () => {
     }
   })
 
+  it('skips an unobserved oversized row without hydrating it and advances the durable cursor', () => {
+    const journal = new Journal(path.join(tmp, 'filtered-raw-replay.db'))
+    try {
+      journal.db
+        .prepare('INSERT INTO events (ts, session, kind, payload) VALUES (?, ?, ?, ?)')
+        .run(OLD.toISOString(), 'hidden', 'session/input', `{"secret":"${'z'.repeat(2 * 1024 * 1024)}`)
+      const checkpoint = journal.replayCheckpoint()
+      const page = journal.boundedReplayPage(0, checkpoint.cursor, {
+        maxRows: 10,
+        maxBytes: 512 * 1024,
+        maxFrameBytes: 128 * 1024,
+        eventFilter: ({ sessionId }) => sessionId === 'visible',
+      })
+      expect(page.events).toEqual([])
+      expect(page.tooLarge).toBeUndefined()
+      expect(page.lastSeq).toBe(checkpoint.cursor)
+      expect(page.hasMore).toBe(false)
+    } finally {
+      journal.db.close()
+    }
+  })
+
   it('uses the bounded session projection instead of scanning the payload-heavy event tree', async () => {
     const journal = new Journal(path.join(tmp, 'sparse.db'))
     try {

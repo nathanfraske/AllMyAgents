@@ -38,7 +38,7 @@ import { readProjectConfig } from './importScan.js'
 import { pickableProfiles, setClaudeConnectorPolicy } from './profiles.js'
 import type { ProfileOwnership } from './profileOwnership.js'
 import { asFileWriteDiffDensity } from './types.js'
-import { asUiPreferences, type DangerFlags, type HubPrefs, type ManagerAgentType, type Profile, type ProjectReplicaReadiness, type Provider } from './types.js'
+import { asUiPreferences, type DangerFlags, type HubPrefs, type ManagerAgentType, type Profile, type ProjectReplica, type ProjectReplicaReadiness, type Provider } from './types.js'
 import type { Executor } from './executor.js'
 import type { WorktreeProjectActivity } from './worktreeCollisionDetector.js'
 import type { WorkspaceManager } from './workspace.js'
@@ -56,6 +56,7 @@ import { attachReplayStream, ReplayPrincipalBudget } from './replayStream.js'
 import { durableReplaySessions } from './replayBaseline.js'
 import {
   inspectGitCheckout,
+  type DeviceExecutorCapabilities,
   type RemoteGitInspection,
   type DeviceExecutor,
   type RemoteDeviceAction,
@@ -80,6 +81,44 @@ const REPLAY_BASELINE_MAX_BYTES = 2 * 1024 * 1024
 const REPLAY_BASELINE_MAX_SESSIONS = 5_000
 const REPLAY_BASELINE_MAX_PROJECTS = 1_000
 const ATTACHMENT_READ_PATH = /^\/api\/sessions\/([^/]+)\/attachments\/([^/]+)$/
+
+// A fleet renderer needs immediate topology/control state for every remote session, but transcript/tool
+// payloads only for chats it is actually displaying. Streaming every Claude/Codex event from every peer
+// turned an idle remote sidebar into a multi-megabit journal mirror. The 20-second bounded baseline remains
+// the reconciliation authority; this allow-list is only the low-latency state lane between baselines.
+const FLEET_STREAM_SESSION_STATE_KINDS = new Set([
+  'session/created',
+  'session/deleted',
+  'session/titled',
+  'session/activity',
+  'session/status',
+  'session/mode',
+  'session/settings',
+  'session/project-detached',
+  'session/error',
+  'session/worktree-created',
+  'session/workspace-pressure',
+  'session/workspace-pressure-cleared',
+  'session/tokens',
+])
+const FLEET_STREAM_GLOBAL_PREFIXES = [
+  'project/',
+  'manager/',
+  'approval/',
+  'question/',
+  'notification/',
+  'profile/',
+  'usage/',
+]
+
+export function fleetStreamEventVisible(
+  event: { sessionId: string | null; kind: string },
+  visibleSessions: ReadonlySet<string>,
+): boolean {
+  if (event.sessionId && visibleSessions.has(event.sessionId)) return true
+  if (FLEET_STREAM_SESSION_STATE_KINDS.has(event.kind)) return true
+  return FLEET_STREAM_GLOBAL_PREFIXES.some((prefix) => event.kind.startsWith(prefix))
+}
 
 const PAGE = `<!doctype html>
 <html>
@@ -561,6 +600,21 @@ function storedReplicaReadiness(
     ...(git.headCommit ? { headCommit: git.headCommit } : {}),
     ...(git.headRef ? { headRef: git.headRef } : {}),
   }
+}
+
+function remoteReplicaCheckoutPath(
+  capabilities: DeviceExecutorCapabilities,
+  replica: ProjectReplica,
+): string | undefined {
+  const root = capabilities.roots.find((candidate) => candidate.id === replica.rootId)
+  if (!root || replica.path === root.path) return undefined
+  const separator = root.environment?.kind === 'wsl' || capabilities.platform !== 'win32'
+    ? path.posix
+    : path.win32
+  const relative = separator.relative(root.path, replica.path)
+  return relative && relative !== '..' && !relative.startsWith(`..${separator.sep}`)
+    ? relative.split(separator.sep).join('/')
+    : undefined
 }
 
 export function startServer(opts: ServerOptions): http.Server {
@@ -1341,9 +1395,12 @@ export function startServer(opts: ServerOptions): http.Server {
             json(res, { error: 'remote device controller unavailable' }, 503)
             return
           }
+          const capabilities = await remoteDevices.capabilities(replica.siteId)
+          const checkoutPath = remoteReplicaCheckoutPath(capabilities, replica)
           const inspected = await remoteDevices.execute(replica.siteId, {
             op: 'git_inspect',
             rootId: replica.rootId,
+            ...(checkoutPath ? { checkoutPath } : {}),
           }, {
             sessionId: 'operator:project-location',
             profileId: 'operator',
@@ -1454,9 +1511,12 @@ export function startServer(opts: ServerOptions): http.Server {
             }
             responseStatus = 409
           } else {
+            const capabilities = await remoteDevices.capabilities(replica.siteId)
+            const checkoutPath = remoteReplicaCheckoutPath(capabilities, replica)
             const prepared = await remoteDevices.execute(replica.siteId, {
               op: 'git_sync',
               rootId: replica.rootId,
+              ...(checkoutPath ? { checkoutPath, createIfMissing: true } : {}),
               repository: primaryGit.repository,
               headRef: primaryGit.headRef,
               headCommit: primaryGit.headCommit,
@@ -2306,7 +2366,11 @@ export function startServer(opts: ServerOptions): http.Server {
       if (method === 'POST' && url.pathname === '/api/device-executor') {
         if (!deviceExecutor) { json(res, { error: 'device executor unavailable' }, 503); return }
         const body = await readBody(req)
-        const capabilities = deviceExecutor.update({ enabled: body.enabled, roots: body.roots })
+        const capabilities = deviceExecutor.update({
+          enabled: body.enabled,
+          roots: body.roots,
+          authorizeMachine: body.authorizeMachine,
+        })
         journal.append(null, 'device-executor/configured', {
           enabled: capabilities.enabled,
           roots: capabilities.roots.map((root) => ({
@@ -2918,6 +2982,16 @@ export function startServer(opts: ServerOptions): http.Server {
       }
       // Remote-machine authority is deliberately separate from permission mode and tool allowlists.
       // Only this authenticated operator route can create/revoke it; agent MCP handlers can only consume it.
+      const remoteAuthorizeMatch = /^\/api\/sessions\/([^/]+)\/remote-devices\/([^/]+)\/authorize$/.exec(url.pathname)
+      if (method === 'POST' && remoteAuthorizeMatch) {
+        const result = await sessions.authorizeRemoteTestbed(
+          decodeURIComponent(remoteAuthorizeMatch[1] as string),
+          decodeURIComponent(remoteAuthorizeMatch[2] as string),
+          false,
+        )
+        json(res, result.record)
+        return
+      }
       const remoteGrantMatch = /^\/api\/sessions\/([^/]+)\/remote-devices$/.exec(url.pathname)
       if (method === 'GET' && remoteGrantMatch) {
         json(res, await sessions.remoteDeviceCatalog(remoteGrantMatch[1] as string))
@@ -3189,8 +3263,19 @@ export function startServer(opts: ServerOptions): http.Server {
     const since = Number(url.searchParams.get('since'))
     const generationValue = url.searchParams.get('generation')
     const generation = generationValue === null ? undefined : Number(generationValue)
+    const fleetView = url.searchParams.get('view') === 'fleet'
+    const visibleSessions = new Set(
+      url.searchParams.getAll('session')
+        .filter((value) => value.length > 0 && value.length <= 256)
+        .slice(0, 16),
+    )
     try {
-      attachReplayStream(ws, journal, { since, generation, principalBudget: replayPrincipalBudget })
+      attachReplayStream(ws, journal, {
+        since,
+        generation,
+        principalBudget: replayPrincipalBudget,
+        ...(fleetView ? { eventFilter: (event) => fleetStreamEventVisible(event, visibleSessions) } : {}),
+      })
     } catch {
       ws.close(1011, 'journal replay unavailable')
     }

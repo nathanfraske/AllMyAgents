@@ -13,6 +13,7 @@ import {
   FleetConnectionStore,
   RemoteDeviceController,
   normalizeGitRemoteIdentity,
+  machineRoots,
   effectiveRemoteCommandTimeout,
   parseRemoteWslEnvironments,
   remoteCapabilityForAction,
@@ -128,6 +129,25 @@ async function waitForGitRemote(url: string): Promise<void> {
 }
 
 describe('DeviceExecutor target policy', () => {
+  it('expands one full-testbed choice to the host and every usable WSL2 environment', () => {
+    expect(machineRoots('linux')).toEqual([{
+      id: '', label: 'Host filesystem', path: '/', read: true, write: true, terminal: true,
+    }])
+    const windows = machineRoots('win32', [
+      { id: 'host', kind: 'host', label: 'Windows', platform: 'win32', shell: 'powershell' },
+      { id: 'wsl:Ubuntu', kind: 'wsl', label: 'Ubuntu', platform: 'linux', shell: '/bin/sh', distro: 'Ubuntu', version: 2 },
+      { id: 'wsl:Legacy', kind: 'wsl', label: 'Legacy', platform: 'linux', shell: '/bin/sh', distro: 'Legacy', version: 1 },
+    ])
+    expect(windows).toEqual(expect.arrayContaining([{
+      id: '', label: 'Ubuntu filesystem', path: '/', environment: { kind: 'wsl', distro: 'Ubuntu' },
+      read: true, write: true, terminal: true,
+    }]))
+    expect(windows.some((root) => root.environment?.distro === 'Legacy')).toBe(false)
+    expect(windows.filter((root) => !root.environment).every((root) =>
+      root.read && root.write && root.terminal && /^[A-Z]:\\$/u.test(root.path),
+    )).toBe(true)
+  })
+
   it('classifies directory creation as a write at every grant boundary', () => {
     expect(remoteCapabilityForAction({ op: 'mkdir', rootId: 'root', path: 'nested' })).toBe('write')
     expect(remoteCapabilityForAction({ op: 'write', rootId: 'root', path: 'file', content: '' })).toBe('write')
@@ -265,7 +285,7 @@ describe('DeviceExecutor target policy', () => {
     })
   }, 15_000)
 
-  it('admits only one terminal command per physical root across source hubs', async () => {
+  it('honors a terminal grant with concurrent commands and file mutations on the same root', async () => {
     const dir = tempDir()
     const root = path.join(dir, 'root')
     fs.mkdirSync(root)
@@ -280,14 +300,15 @@ describe('DeviceExecutor target policy', () => {
       : 'sleep 0.75; printf first'
     const first = executor.execute({ op: 'exec', rootId, command, timeoutMs: 30_000 })
     await expect(executor.execute({ op: 'exec', rootId, command: 'echo second' })).resolves.toMatchObject({
-      ok: false,
-      failure: { stage: 'admission', code: 'ROOT_BUSY' },
+      ok: true,
+      exitCode: 0,
+      stdout: expect.stringContaining('second'),
     })
     await expect(executor.execute({ op: 'write', rootId, path: 'raced.txt', content: 'unsafe' })).resolves.toMatchObject({
-      ok: false,
-      failure: { stage: 'admission', code: 'ROOT_BUSY' },
+      ok: true,
+      bytes: 6,
     })
-    expect(fs.existsSync(path.join(root, 'raced.txt'))).toBe(false)
+    expect(fs.readFileSync(path.join(root, 'raced.txt'), 'utf8')).toBe('unsafe')
     await expect(first).resolves.toMatchObject({ ok: true, exitCode: 0 })
   }, 45_000)
 

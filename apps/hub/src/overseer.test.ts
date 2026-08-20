@@ -123,13 +123,13 @@ describe('application Overseer authority', () => {
 
     expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
       isOverseer: true,
-      overseerCapabilityVersion: 21,
+      overseerCapabilityVersion: 23,
       permissionMode: 'full',
       permissionModeOperatorOverride: true,
       role: 'Application Overseer',
     })
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
-      'Overseer capability manifest version 21',
+      'Overseer capability manifest version 23',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'mcp__allmyagents__overseer_control',
@@ -169,7 +169,7 @@ describe('application Overseer authority', () => {
     expect(upgrades()).toHaveLength(1)
     expect(upgrades()[0]?.payload).toMatchObject({
       fromVersion: 6,
-      toVersion: 21,
+      toVersion: 23,
       conversationPreserved: true,
       tools: expect.arrayContaining([
         'overseer_control',
@@ -1151,6 +1151,49 @@ describe('application Overseer authority', () => {
     ]))
   })
 
+  it('lets a direct operator assign an entire advertised testbed to one manager in one action', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'manager', isProjectManager: true, permissionMode: 'full' })
+    h.sessions.setRemoteDeviceController({
+      capabilities: vi.fn(async () => ({
+        enabled: true,
+        platform: 'win32',
+        arch: 'x64',
+        hostname: 'Build rig',
+        environments: [],
+        roots: [
+          { id: 'windows', label: 'C drive', path: 'C:\\', read: true, write: true, terminal: true },
+          { id: 'wsl', label: 'Ubuntu filesystem', path: '/', read: true, write: true, terminal: true,
+            environment: { kind: 'wsl', distro: 'Ubuntu' } },
+          { id: 'readonly', label: 'Evidence', path: 'D:\\evidence', read: true, write: false, terminal: false },
+        ],
+      })),
+    } as unknown as RemoteDeviceController)
+
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'authorize_remote_testbed', sessionId: 'manager', siteId: 'build-rig',
+    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/direct operator turn/u) })
+
+    h.markOperator('overseer')
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'authorize_remote_testbed', sessionId: 'manager', siteId: 'build-rig',
+    })).resolves.toMatchObject({
+      ok: true,
+      data: {
+        grants: expect.arrayContaining([
+          { siteId: 'build-rig', rootIds: ['windows', 'wsl'], capabilities: ['read', 'write', 'terminal'] },
+          { siteId: 'build-rig', rootIds: ['readonly'], capabilities: ['read'] },
+        ]),
+      },
+    })
+    expect(h.store.all().find((record) => record.id === 'manager')?.remoteDeviceGrants).toHaveLength(2)
+    expect(h.journal.recentEventsForSession('overseer', 20)).toContainEqual(expect.objectContaining({
+      kind: 'overseer/remote-testbed-authorized',
+      payload: expect.objectContaining({ sessionId: 'manager', siteId: 'build-rig' }),
+    }))
+  })
+
   it('requires configured scope, a separate operator approval, and the elevation runner', async () => {
     const h = harness()
     h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
@@ -1295,6 +1338,7 @@ describe('application Overseer authority', () => {
       },
     })
     expect(started.ok).toBe(true)
+    expect(started.run?.resources).toEqual([])
     await vi.waitFor(() => expect(controller.store.get(started.run!.id)?.state).toBe('succeeded'))
     expect(execute).toHaveBeenCalledWith(
       'risk-box',

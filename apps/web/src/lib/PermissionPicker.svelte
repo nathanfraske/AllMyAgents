@@ -35,7 +35,7 @@
   let githubLoaded = $state(false)
   let githubLoadedFor = $state('')
   let githubStateSessionId = $state('')
-  let githubBusy = $state<GitHubAutomationCapability | null>(null)
+  let githubBusy = $state<GitHubAutomationCapability | 'all' | null>(null)
   let githubError = $state<string | null>(null)
 
   const GITHUB_CAPABILITIES: Array<{ id: GitHubAutomationCapability; label: string }> = [
@@ -44,6 +44,10 @@
     { id: 'workflow_runs', label: 'Actions runs' },
     { id: 'repository_pushes', label: 'Non-force pushes' },
   ]
+  const ALL_GITHUB_CAPABILITIES = GITHUB_CAPABILITIES.map((capability) => capability.id)
+  const allGitHubEnabled = $derived(
+    ALL_GITHUB_CAPABILITIES.every((capability) => githubCapabilities.includes(capability)),
+  )
 
   const MODES = [
     { id: 'safe', icon: 'lock', label: 'Safe', desc: 'ask before every tool' },
@@ -113,15 +117,15 @@
     if (open && (!githubLoaded || githubLoadedFor !== sessionId)) void loadGitHubPolicy()
   })
 
-  async function toggleGitHub(capability: GitHubAutomationCapability): Promise<void> {
+  async function saveGitHubCapabilities(
+    next: GitHubAutomationCapability[],
+    busy: GitHubAutomationCapability | 'all',
+  ): Promise<void> {
     if (githubBusy) return
     const targetSessionId = sessionId
     const previous = [...githubCapabilities]
-    const next = previous.includes(capability)
-      ? previous.filter((item) => item !== capability)
-      : [...previous, capability]
     githubCapabilities = next
-    githubBusy = capability
+    githubBusy = busy
     githubError = null
     try {
       const policy = await api.setSessionGitHubAutomation(targetSessionId, next)
@@ -135,6 +139,17 @@
     } finally {
       if (sessionId === targetSessionId) githubBusy = null
     }
+  }
+
+  async function toggleGitHub(capability: GitHubAutomationCapability): Promise<void> {
+    const next = githubCapabilities.includes(capability)
+      ? githubCapabilities.filter((item) => item !== capability)
+      : [...githubCapabilities, capability]
+    await saveGitHubCapabilities(next, capability)
+  }
+
+  async function toggleAllGitHub(): Promise<void> {
+    await saveGitHubCapabilities(allGitHubEnabled ? [] : [...ALL_GITHUB_CAPABILITIES], 'all')
   }
 
   /** Revoke an "always allow" grant so the tool prompts again. Surfaces failure instead of silently
@@ -182,10 +197,18 @@
       {/if}
       <div class="sep"></div>
       <div class="grouphead dim">GitHub automation Â· this chat only</div>
-      <div class="policy-note dim">Narrow standing grants; project chats stay bound to their remote. Overseer use remains direct-operator only.</div>
+      <div class="policy-note dim">Durable across restarts and account changes. Claude GitHub CLI/MCP and the Codex GitHub connector use the same grant; project chats stay bound to their remote. Overseer use remains direct-operator only.</div>
       {#if !githubLoaded && !githubError}
         <div class="policy-note dim">Loadingâ€¦</div>
       {:else}
+        <button
+          class="github-all"
+          disabled={githubBusy !== null}
+          aria-label={allGitHubEnabled ? 'Revoke all GitHub automation' : 'Allow all GitHub automation'}
+          onclick={() => void toggleAllGitHub()}
+        >
+          {allGitHubEnabled ? 'Revoke all GitHub automation' : 'Allow all GitHub automation'}
+        </button>
         {#each GITHUB_CAPABILITIES as capability (capability.id)}
           <label class="github-grant">
             <input
@@ -208,6 +231,7 @@
   .pill-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .pill-btn.full { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, transparent); }
   .pill-btn.full .lead { color: var(--warn); }
+  .github-all { width: 100%; margin: .25rem 0 .4rem; padding: .42rem .5rem; color: var(--text); border: 1px solid var(--border-accent); border-radius: var(--r-sm); background: var(--surface-2); font-size: var(--text-xs); font-weight: var(--fw-semibold); }
   .override-mark { flex: none; padding: 0 .3rem; border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
     border-radius: var(--r-pill); color: var(--warn); font-size: .58rem; line-height: 1.45; text-transform: uppercase; }
   .lead { display: inline-grid; color: var(--muted); }

@@ -21,7 +21,6 @@ export const MAX_INTERACTIVE_COMMAND_TIMEOUT_MS = 120_000
 export const MAX_DURABLE_COMMAND_TIMEOUT_MS = 6 * 60 * 60_000
 const MAX_DEVICE_ROOTS = 128
 const MAX_FLEET_CONNECTIONS = 256
-const MAX_CONCURRENT_COMMANDS = 8
 
 export interface FleetConnection {
   siteId: string
@@ -274,8 +273,18 @@ export interface RemoteGitInspection {
 export type RemoteDeviceAction =
   | { op: 'probe'; rootId: string }
   | { op: 'inspect'; rootId: string }
-  | { op: 'git_inspect'; rootId: string }
-  | { op: 'git_sync'; rootId: string; repository: string; headRef: string; headCommit: string }
+  | { op: 'git_inspect'; rootId: string; checkoutPath?: string }
+  | {
+      op: 'git_sync'
+      rootId: string
+      repository: string
+      headRef: string
+      headCommit: string
+      /** App-owned relative checkout beneath the granted machine root. Empty keeps legacy behavior. */
+      checkoutPath?: string
+      /** Explicitly permits creating a missing checkout. Existing non-repositories are never overwritten. */
+      createIfMissing?: boolean
+    }
   | { op: 'list'; rootId: string; path?: string }
   | { op: 'read'; rootId: string; path: string; encoding?: 'utf8' | 'base64'; maxBytes?: number }
   | { op: 'mkdir'; rootId: string; path: string; recursive?: boolean }
@@ -291,6 +300,8 @@ export interface RemoteDeviceActionResult {
   telemetry?: RemoteDeviceTelemetry
   environment?: RemoteEnvironmentInspection
   git?: RemoteGitInspection
+  /** Source-hub project attachment produced by an automatic checkout preparation. */
+  projectLocation?: { replicaId: string; rootId: string; path: string; cwd: string }
   entries?: Array<{ name: string; kind: 'file' | 'directory' | 'other'; size?: number }>
   content?: string
   encoding?: 'utf8' | 'base64'
@@ -423,6 +434,40 @@ function discoverExecutionEnvironments(): RemoteExecutionEnvironment[] {
   return listed.status === 0 ? [host, ...parseRemoteWslEnvironments(listed.stdout)] : [host]
 }
 
+/** One explicit full-testbed choice expands to every host filesystem and WSL environment this
+ * service account can actually see. This is intentionally invoked only by the operator's one-click
+ * authorization or a full-machine lightweight-node profile; pairing alone still grants nothing. */
+export function machineRoots(
+  platform: NodeJS.Platform,
+  environments: readonly RemoteExecutionEnvironment[] = [],
+): DeviceRootPolicy[] {
+  const roots: DeviceRootPolicy[] = []
+  if (platform === 'win32') {
+    for (let code = 65; code <= 90; code += 1) {
+      const drive = `${String.fromCharCode(code)}:\\`
+      try {
+        if (fs.statSync(drive).isDirectory()) {
+          roots.push({ id: '', label: `${drive.slice(0, 2)} drive`, path: drive, read: true, write: true, terminal: true })
+        }
+      } catch { /* Drive is absent or not ready. */ }
+    }
+    for (const environment of environments) {
+      if (environment.kind !== 'wsl' || !environment.distro || environment.version === 1) continue
+      roots.push({
+        id: '',
+        label: `${environment.distro} filesystem`,
+        path: '/',
+        environment: { kind: 'wsl', distro: environment.distro },
+        read: true,
+        write: true,
+        terminal: true,
+      })
+    }
+    return roots
+  }
+  return [{ id: '', label: 'Host filesystem', path: '/', read: true, write: true, terminal: true }]
+}
+
 function validateLinuxAbsolutePath(value: unknown, field: string): string {
   if (typeof value !== 'string' || !value.startsWith('/') || value.length > 4096 || value.includes('\0')) {
     throw new Error(`${field} must be a bounded absolute Linux path`)
@@ -532,6 +577,19 @@ function runBoundedProcess(program: string, args: string[], timeoutMs = 5_000): 
 }
 
 function gitCheckoutInvocation(
+  input: { path: string; environment?: { kind: 'wsl'; distro: string } },
+  args: string[],
+  timeoutMs = 5_000,
+): Promise<BoundedProcessResult> {
+  return input.environment?.kind === 'wsl'
+    ? runBoundedProcess('wsl.exe', [
+        '--distribution', input.environment.distro, '--cd', input.path, '--exec',
+        '/usr/bin/env', 'GIT_OPTIONAL_LOCKS=0', 'GIT_TERMINAL_PROMPT=0', 'LC_ALL=C', 'git', ...args,
+      ], timeoutMs)
+    : runBoundedProcess('git', ['-C', input.path, ...args], timeoutMs)
+}
+
+function gitParentInvocation(
   input: { path: string; environment?: { kind: 'wsl'; distro: string } },
   args: string[],
   timeoutMs = 5_000,
@@ -685,6 +743,7 @@ export async function syncGitCheckout(input: {
   repository: string
   headRef: string
   headCommit: string
+  createIfMissing?: boolean
 }): Promise<RemoteDeviceActionResult> {
   const repository = boundedRepositoryIdentity(input.repository)
   const headRef = boundedGitHeadRef(input.headRef)
@@ -701,7 +760,41 @@ export async function syncGitCheckout(input: {
   })
   let before = await inspectGitCheckout(checkout)
   if (!before.gitAvailable || !before.isRepository) {
-    return fail('The target location is not an existing Git checkout.', 'NOT_REPOSITORY', before)
+    if (!input.createIfMissing || !before.gitAvailable) {
+      return fail('The target location is not an existing Git checkout.', 'NOT_REPOSITORY', before)
+    }
+    const cloneParent = input.environment?.kind === 'wsl'
+      ? path.posix.dirname(input.path)
+      : path.dirname(input.path)
+    const cloneName = input.environment?.kind === 'wsl'
+      ? path.posix.basename(input.path)
+      : path.basename(input.path)
+    if (!cloneName || cloneName === '.' || cloneName === '..') {
+      return fail('The app-owned checkout destination is invalid.', 'CLONE_DESTINATION_INVALID', before)
+    }
+    const cloned = await gitParentInvocation({
+      path: cloneParent,
+      ...(input.environment ? { environment: input.environment } : {}),
+    }, [
+      '-c', 'core.hooksPath=/dev/null',
+      '-c', 'protocol.allow=never',
+      '-c', 'protocol.http.allow=always',
+      '-c', 'protocol.https.allow=always',
+      '-c', 'protocol.ext.allow=never',
+      'clone', '--no-checkout', '--no-tags', '--origin', 'origin', '--', `https://${repository}.git`, cloneName,
+    ], MAX_INTERACTIVE_COMMAND_TIMEOUT_MS)
+    if (cloned.timedOut) return fail('Git clone timed out before the project checkout was ready.', 'CLONE_TIMEOUT', before)
+    if (cloned.error || cloned.status !== 0 || cloned.truncated) {
+      return fail(
+        'Git could not create the project checkout non-interactively. Confirm that this testbed account can read the repository.',
+        'CLONE_FAILED',
+        before,
+      )
+    }
+    before = await inspectGitCheckout(checkout)
+    if (!before.gitAvailable || !before.isRepository || before.repository !== repository) {
+      return fail('The cloned project checkout could not be verified.', 'CLONE_VERIFY_FAILED', before)
+    }
   }
   if (!before.complete || before.clean !== true) {
     return fail('The target checkout is dirty or could not be inspected completely.', 'DIRTY_CHECKOUT', before)
@@ -758,9 +851,6 @@ export interface DeviceExecutorOptions {
 
 export class DeviceExecutor {
   private policy: DeviceExecutorPolicy = { enabled: false, roots: [] }
-  private activeCommands = 0
-  /** Target-authoritative fence across every paired source hub for this physical root. */
-  private readonly activeCommandRoots = new Set<string>()
 
   constructor(
     private readonly file: string,
@@ -788,8 +878,10 @@ export class DeviceExecutor {
     }
   }
 
-  update(input: { enabled?: unknown; roots?: unknown }): DeviceExecutorCapabilities {
-    const roots = Array.isArray(input.roots) ? input.roots : this.policy.roots
+  update(input: { enabled?: unknown; roots?: unknown; authorizeMachine?: unknown }): DeviceExecutorCapabilities {
+    const roots = input.authorizeMachine === true
+      ? machineRoots(process.platform, discoverExecutionEnvironments())
+      : Array.isArray(input.roots) ? input.roots : this.policy.roots
     this.policy = this.normalizePolicy({ enabled: input.enabled === true, roots: roots as DeviceRootPolicy[] })
     atomicPrivateJson(this.file, { version: 1, ...this.policy })
     return this.capabilities()
@@ -812,52 +904,26 @@ export class DeviceExecutor {
     const needed = remoteCapabilityForAction(action)
     if (!root[needed]) return finish({ ok: false, error: `${needed} access is not enabled for this root.` })
     try {
-      if (this.activeCommandRoots.has(root.id) && ['mkdir', 'write', 'git_sync', 'exec'].includes(action.op)) {
-        return finish({
-          ok: false,
-          error: 'This testbed root already has an active terminal command.',
-          failure: { stage: 'admission', code: 'ROOT_BUSY' },
-        })
-      }
       if (action.op === 'probe') return finish({ ok: true })
       if (action.op === 'inspect') return finish(await this.inspect(root))
       if (action.op === 'git_inspect') {
-        return finish({ ok: true, git: await inspectGitCheckout({ path: root.path, environment: root.environment }) })
+        return finish({ ok: true, git: await inspectGitCheckout(this.projectCheckout(root, action.checkoutPath, false)) })
       }
       if (action.op === 'git_sync') {
-        if (this.activeCommands >= MAX_CONCURRENT_COMMANDS) {
-          return finish({ ok: false, error: `remote operation concurrency limit (${MAX_CONCURRENT_COMMANDS}) reached` })
-        }
-        this.activeCommands += 1
-        this.activeCommandRoots.add(root.id)
-        try {
-          return finish(await syncGitCheckout({
-            path: root.path,
-            ...(root.environment ? { environment: root.environment } : {}),
-            repository: action.repository,
-            headRef: action.headRef,
-            headCommit: action.headCommit,
-          }))
-        } finally {
-          this.activeCommands -= 1
-          this.activeCommandRoots.delete(root.id)
-        }
+        const checkout = this.projectCheckout(root, action.checkoutPath, action.createIfMissing === true)
+        return finish(await syncGitCheckout({
+          ...checkout,
+          repository: action.repository,
+          headRef: action.headRef,
+          headCommit: action.headCommit,
+          createIfMissing: action.createIfMissing === true,
+        }))
       }
       if (action.op === 'list') return finish(this.list(root, action.path))
       if (action.op === 'read') return finish(this.read(root, action))
       if (action.op === 'mkdir') return finish(this.mkdir(root, action))
       if (action.op === 'write') return finish(this.write(root, action))
-      if (this.activeCommands >= MAX_CONCURRENT_COMMANDS) {
-        return finish({ ok: false, error: `remote terminal concurrency limit (${MAX_CONCURRENT_COMMANDS}) reached` })
-      }
-      this.activeCommands += 1
-      this.activeCommandRoots.add(root.id)
-      try {
-        return finish(await this.exec(root, action, actor))
-      } finally {
-        this.activeCommands -= 1
-        this.activeCommandRoots.delete(root.id)
-      }
+      return finish(await this.exec(root, action, actor))
     } catch (error) {
       return finish({ ok: false, error: this.safeError(error, root.path) })
     }
@@ -920,6 +986,37 @@ export class DeviceExecutor {
     return root.environment?.kind === 'wsl'
       ? wslUncPath(root.environment.distro, root.path)
       : root.path
+  }
+
+  private projectCheckout(
+    root: DeviceRootPolicy,
+    requested: unknown,
+    createParent: boolean,
+  ): { path: string; environment?: { kind: 'wsl'; distro: string } } {
+    const rel = relativePath(requested, 'checkoutPath', true)
+    if (!rel) return { path: root.path, ...(root.environment ? { environment: root.environment } : {}) }
+    const base = this.filesystemRoot(root)
+    const target = path.resolve(base, rel)
+    if (!inside(base, target)) throw new Error('checkoutPath escapes the approved root')
+    if (createParent) {
+      const parentRel = path.dirname(rel)
+      if (parentRel && parentRel !== '.') {
+        this.mkdir(root, { op: 'mkdir', rootId: root.id, path: parentRel, recursive: true })
+      }
+    }
+    const realParent = fs.realpathSync.native(path.dirname(target))
+    if (!inside(base, realParent)) throw new Error('checkoutPath resolves outside the approved root')
+    try {
+      const stat = fs.lstatSync(target)
+      if (stat.isSymbolicLink()) throw new Error('refusing to use a symbolic-link project checkout')
+      const real = fs.realpathSync.native(target)
+      if (!inside(base, real) || !stat.isDirectory()) throw new Error('project checkout is not a directory inside the approved root')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    if (!root.environment) return { path: target }
+    const parts = path.relative(base, target).split(path.sep).filter(Boolean)
+    return { path: path.posix.join(root.path, ...parts), environment: root.environment }
   }
 
   private resolveExisting(root: DeviceRootPolicy, requested: unknown, field: string, directory = false): string {
@@ -1354,6 +1451,7 @@ export function testbedToolchainSearchPaths(
       try { if (fs.statSync(bin).isDirectory()) candidates.push(bin) } catch { /* incomplete toolchain */ }
     }
   }
+
   return [...new Set(candidates)]
 }
 

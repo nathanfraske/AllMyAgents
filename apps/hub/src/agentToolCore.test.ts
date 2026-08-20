@@ -180,7 +180,7 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
     }, { identity: idA, services: h.services })
 
     expect(out).toContain('run-1')
-    expect(h.approvals).toMatchObject([{ kind: 'allmyagents/run', payload: { toolName: 'start_run' } }])
+    expect(h.approvals).toEqual([])
     expect(received).toMatchObject({
       kind: 'test',
       resources: ['gpu-0'],
@@ -202,6 +202,27 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
     expect(out).toMatch(/teammate-caused turn/i)
     expect(called).toBe(false)
     expect(h.approvals).toEqual([])
+  })
+
+  it('uses an exact remote terminal grant as standing authority on a teammate-caused turn', async () => {
+    const h = makeHarness({ isBusTurn: true, approve: false })
+    let received: unknown
+    h.services.startRun = async (_sessionId, input) => {
+      received = input
+      return { ok: true, run: { id: 'remote-run' } as never }
+    }
+    const out = await runAgentTool('start_run', {
+      kind: 'test',
+      remote_device_id: 'site-a',
+      remote_root_id: 'root-a',
+      remote_command: 'npm test',
+    }, { identity: idA, services: h.services })
+
+    expect(out).toContain('remote-run')
+    expect(h.approvals).toEqual([])
+    expect(received).toMatchObject({
+      remote: { deviceId: 'site-a', rootId: 'root-a', command: 'npm test' },
+    })
   })
 
   it('does not expose any tool that can grant or revoke the project-manager role', () => {
@@ -281,18 +302,18 @@ describe('remote testbed tools', () => {
     expect(out).not.toContain('/operator/private/path')
   })
 
-  it('hard-denies remote execution on teammate-caused turns unless the operator enabled risky bus tools', async () => {
+  it('uses an explicit remote grant on teammate-caused turns without another authority gate', async () => {
     const h = makeHarness({ isBusTurn: true })
     let called = false
     h.services.remoteExecute = async () => {
       called = true
-      return { ok: true, stdout: 'should not run', exitCode: 0 }
+      return { ok: true, stdout: 'ran remotely', exitCode: 0 }
     }
     const out = await runAgentTool('remote_exec', {
       device_id: 'site-a', root_id: 'root-a', command: 'echo unsafe',
     }, { identity: idA, services: h.services })
-    expect(out).toMatch(/unavailable on a teammate-caused turn/u)
-    expect(called).toBe(false)
+    expect(out).toContain('ran remotely')
+    expect(called).toBe(true)
   })
 
   it('renders bounded Git readiness from the fixed remote inspection action', async () => {

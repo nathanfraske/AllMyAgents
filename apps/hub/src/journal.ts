@@ -1450,6 +1450,7 @@ export class Journal extends EventEmitter {
       maxRows: number
       maxBytes: number
       maxFrameBytes: number
+      eventFilter?: (event: { seq: number; sessionId: string | null; kind: string }) => boolean
     }
   ): BoundedReplayPage {
     for (const [name, value, maximum] of [
@@ -1493,7 +1494,14 @@ export class Journal extends EventEmitter {
       }>
       const events: HubEvent[] = []
       let encodedBytes = 0
+      let lastSeq = afterSeq
       for (const row of rows.slice(0, options.maxRows)) {
+        if (options.eventFilter && !options.eventFilter({ seq: row.seq, sessionId: row.session, kind: row.kind })) {
+          // A filtered fleet stream still advances its durable cursor. Otherwise one noisy, unrelated
+          // agent would be scanned forever even though none of its transcript bytes are transmitted.
+          lastSeq = row.seq
+          continue
+        }
         const envelopeBytes =
           Buffer.byteLength(
             JSON.stringify({
@@ -1510,7 +1518,7 @@ export class Journal extends EventEmitter {
           return {
             checkpoint,
             events,
-            lastSeq: events.at(-1)?.seq ?? afterSeq,
+            lastSeq,
             hasMore: true,
             encodedBytes,
             tooLarge: { seq: row.seq, encodedBytes: envelopeBytes },
@@ -1529,7 +1537,7 @@ export class Journal extends EventEmitter {
           return {
             checkpoint,
             events,
-            lastSeq: events.at(-1)?.seq ?? afterSeq,
+            lastSeq,
             hasMore: true,
             encodedBytes,
             tooLarge: { seq: row.seq, encodedBytes: bytes },
@@ -1538,8 +1546,8 @@ export class Journal extends EventEmitter {
         if (encodedBytes + bytes > options.maxBytes) break
         events.push(event)
         encodedBytes += bytes
+        lastSeq = row.seq
       }
-      const lastSeq = events.at(-1)?.seq ?? afterSeq
       return {
         checkpoint,
         events,

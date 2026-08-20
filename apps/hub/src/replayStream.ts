@@ -60,7 +60,12 @@ interface ReplayJournal {
   boundedReplayPage(
     afterSeq: number,
     throughSeq: number,
-    options: { maxRows: number; maxBytes: number; maxFrameBytes: number }
+    options: {
+      maxRows: number
+      maxBytes: number
+      maxFrameBytes: number
+      eventFilter?: (event: { seq: number; sessionId: string | null; kind: string }) => boolean
+    }
   ): BoundedReplayPage
   on(event: 'event', listener: (event: HubEvent) => void): unknown
   off(event: 'event', listener: (event: HubEvent) => void): unknown
@@ -79,6 +84,8 @@ export interface ReplayStreamOptions {
   setIntervalFn?: typeof setInterval
   clearIntervalFn?: typeof clearInterval
   principalBudget?: ReplayPrincipalBudget
+  /** Optional durable metadata filter. Skipped rows still advance the stream cursor. */
+  eventFilter?: (event: { seq: number; sessionId: string | null; kind: string }) => boolean
 }
 
 export interface ReplayStreamController {
@@ -189,6 +196,7 @@ export function attachReplayStream(
       if (!sendEncoded(encoded, Buffer.byteLength(encoded))) return false
       cursor = event.seq
     }
+    cursor = Math.max(cursor, page.lastSeq)
     return true
   }
   const resetForGeneration = (checkpoint: ReplayCheckpoint): void => {
@@ -216,6 +224,7 @@ export function attachReplayStream(
         maxRows: maxQueuedFrames,
         maxBytes: Math.min(REPLAY_TAIL_MAX_BYTES, bufferCloseBytes),
         maxFrameBytes,
+        ...(options.eventFilter ? { eventFilter: options.eventFilter } : {}),
       })
       if (page.checkpoint.generation !== generation) {
         if (cursor < page.checkpoint.resetFloorSeq) {
@@ -296,6 +305,7 @@ export function attachReplayStream(
     maxRows: boundedTailEvents,
     maxBytes,
     maxFrameBytes,
+    ...(options.eventFilter ? { eventFilter: options.eventFilter } : {}),
   })
   if (page.checkpoint.generation !== checkpoint.generation) {
     if (options.since < page.checkpoint.resetFloorSeq) {

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { buildFleet, rosterAuthorizesDevice, type BuildFleetDeps } from './fleet.js'
 import type { FleetMember } from './meshSite.js'
 
@@ -336,5 +336,23 @@ describe('buildFleet (unified-across-mesh roster, first cut)', () => {
     expect(recovered).toEqual([['peer', 7777]])
     expect(probes).toEqual(['http://localhost:47020', 'http://localhost:47021'])
     expect(out[1]).toMatchObject({ baseUrl: 'http://localhost:47021', online: true })
+  })
+
+  it('does not tear down a mapped route when the peer hub answers HTTP 503', async () => {
+    const recoverSiteMap = vi.fn(async () => 47021)
+    const out = await buildFleet(deps({
+      roster: async () => [member('peer', 'Remote PC')],
+      peerSites: async () => [advertised('peer-AAAA', 7777)],
+      siteMap: async () => 47020,
+      recoverSiteMap,
+      probeRoute: async () => ({ online: false, statusCode: 503, failure: 'http-error' }),
+    }))
+
+    expect(recoverSiteMap).not.toHaveBeenCalled()
+    expect(out[1]).toMatchObject({
+      baseUrl: 'http://localhost:47020',
+      online: false,
+      routeCode: 'hub-unhealthy',
+    })
   })
 })

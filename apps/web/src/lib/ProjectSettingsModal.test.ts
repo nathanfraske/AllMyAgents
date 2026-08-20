@@ -57,4 +57,22 @@ describe('project GitHub automation settings', () => {
     )
     expect(await screen.findByText('GitHub automation policy saved.')).toBeTruthy()
   })
+
+  it('grants every supported GitHub operation to the whole project team in one choice', async () => {
+    apiMock.projectGitHubAutomation.mockResolvedValue({
+      scope: 'project', targetId: 'project-1', capabilities: [], updatedAt: '',
+    })
+    render(ProjectSettingsModal, { props: { projectId: 'project-1', onclose: vi.fn() } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Automation' }))
+
+    await fireEvent.click(await screen.findByRole('checkbox', { name: /All GitHub automation/i }))
+    await fireEvent.click(screen.getByRole('button', { name: 'Save GitHub automation' }))
+
+    expect(apiMock.setProjectGitHubAutomation).toHaveBeenCalledWith('project-1', [
+      'pull_requests',
+      'pull_request_merges',
+      'workflow_runs',
+      'repository_pushes',
+    ])
+  })
 })

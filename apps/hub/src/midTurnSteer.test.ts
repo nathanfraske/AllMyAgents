@@ -42,6 +42,7 @@ function build(
     runTurn?: Executor['runTurn']
     interrupt?: (sessionId: string) => Promise<void>
     isBusy?: (sessionId: string) => boolean
+    listLive?: Executor['listLive']
   } = {}
 ) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-steer-'))
@@ -61,7 +62,7 @@ function build(
     interrupt,
     stopSession: async () => {},
     readCodexLimits: async () => ({}),
-    listLive: async () => [],
+    listLive: opts.listLive ?? (async () => []),
     attach: async () => {},
     isBusy: opts.isBusy ?? (() => true),
   }
@@ -96,7 +97,7 @@ function build(
   const record: SessionRecord = {
     id: 's1',
     profileId: 'p1',
-    provider: 'claude',
+    provider: opts.provider ?? 'claude',
     cwd: dir,
     projectId: 'proj1',
     status: 'active',
@@ -661,6 +662,32 @@ describe('SessionManager mid-turn steering', () => {
     expect(steer).toHaveBeenCalledOnce()
     expect(bus.pending('s1')).toHaveLength(1)
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('left queued'))
+  })
+
+  it('starts one fresh bus turn when a failed steer confirms the provider already became idle', async () => {
+    const failure = new Error('no active Codex turn to steer')
+    const { sessions, bus, steer, runTurn, record } = build({
+      provider: 'codex',
+      steer: async () => Promise.reject(failure),
+      listLive: async () => [{ sessionId: 's1', status: 'idle', lastWseq: 17 }],
+    })
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    bus.post({
+      from: { sessionId: 's2', profileId: 'p2', provider: 'claude', projectId: 'proj1', label: 'Teammate' },
+      project: 'proj1',
+      to: { kind: 'session', id: 's1' },
+      body: 'Start the queued follow-up',
+      recipients: ['s1'],
+    })
+
+    ;(sessions as unknown as { deliverBus(sessionId: string): void }).deliverBus('s1')
+    await vi.waitFor(() => expect(runTurn).toHaveBeenCalledOnce())
+
+    expect(steer).toHaveBeenCalledOnce()
+    expect(runTurn.mock.calls[0]?.[2]).toBe('bus')
+    expect(runTurn.mock.calls[0]?.[1]).toContain('Start the queued follow-up')
+    expect(bus.pending('s1')).toHaveLength(0)
+    expect(record.status).toBe('idle')
   })
 
   it('with full-message steering off, injects one durable notice per turn without delivering the mail', async () => {

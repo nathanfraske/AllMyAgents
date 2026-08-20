@@ -313,6 +313,26 @@
   function patchDeviceRoot(index: number, patch: Partial<DeviceRootPolicy>): void {
     deviceRoots = deviceRoots.map((root, rootIndex) => rootIndex === index ? { ...root, ...patch } : root)
   }
+  async function authorizeWholeDevice(): Promise<void> {
+    deviceBusy = true
+    deviceError = ''
+    try {
+      const value = await api.authorizeDeviceExecutor()
+      if ('error' in value) {
+        deviceError = value.error
+        return
+      }
+      deviceExecutor = value
+      deviceEnabled = value.enabled
+      deviceRoots = value.roots
+      deviceSaved = true
+      setTimeout(() => (deviceSaved = false), 1400)
+    } catch (error) {
+      deviceError = error instanceof Error ? error.message : String(error)
+    } finally {
+      deviceBusy = false
+    }
+  }
   async function saveDevicePolicy(): Promise<void> {
     deviceBusy = true
     deviceError = ''
@@ -1250,7 +1270,7 @@
         <div class="testbed-head">
           <div>
             <h4>What remote agents may use</h4>
-            <p class="hint dim">Off by default. Only the roots and operations below can be granted to individual chats on another paired hub.</p>
+            <p class="hint dim">Authorize once to expose every host drive and WSL filesystem visible to this service account. Pairing alone still grants nothing.</p>
           </div>
           <label class="switch-label"><input type="checkbox" bind:checked={deviceEnabled} /> enabled</label>
         </div>
@@ -1274,8 +1294,9 @@
           {/each}
         </div>
         <div class="testbed-actions">
-          <button class="btn" onclick={addDeviceRoot}>Add approved host folder</button>
-          <button class="btn btn-primary" disabled={deviceBusy} onclick={saveDevicePolicy}>{deviceBusy ? 'saving…' : deviceSaved ? 'Saved ✓' : 'Save testbed policy'}</button>
+          <button class="btn btn-primary" disabled={deviceBusy} onclick={authorizeWholeDevice}>{deviceBusy ? 'authorizing…' : deviceSaved ? 'Authorized ✓' : 'Authorize this whole device as a testbed'}</button>
+          <button class="btn" onclick={addDeviceRoot}>Add host folder</button>
+          <button class="btn" disabled={deviceBusy} onclick={saveDevicePolicy}>Save advanced policy</button>
         </div>
         {#if deviceExecutor?.environments?.some((environment) => environment.kind === 'wsl')}
           <div class="wsl-root-add">
@@ -1289,7 +1310,7 @@
           </div>
         {/if}
         {#if deviceError}<p class="hint warn" role="alert">{deviceError}</p>{/if}
-        <p class="hint dim">Terminal commands start in the selected root with bounded time and output, but the shell retains this OS account's normal machine access. Pairing a machine or selecting Full access in a chat does not grant this authority.</p>
+        <p class="hint dim">Advanced controls can narrow the one-click policy. Terminal commands run as this service account and retain that account's normal machine access; authorizing a chat is a separate durable assignment.</p>
         </div>
       </details>
     </section>

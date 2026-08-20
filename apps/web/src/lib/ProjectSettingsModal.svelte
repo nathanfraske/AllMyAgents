@@ -40,6 +40,10 @@
     { id: 'workflow_runs', label: 'GitHub Actions runs', description: 'Dispatch, inspect, rerun, or cancel workflow runs.' },
     { id: 'repository_pushes', label: 'Repository pushes', description: 'Allow each single non-force push to origin; force/delete pushes and active hooks still ask.' },
   ]
+  const ALL_GITHUB_CAPABILITIES = GITHUB_CAPABILITIES.map((capability) => capability.id)
+  const allGitHubEnabled = $derived(
+    ALL_GITHUB_CAPABILITIES.every((capability) => githubCapabilities.includes(capability)),
+  )
 
   const project = $derived(store.projects.find((item) => item.id === projectId))
   const manager = $derived(
@@ -75,6 +79,10 @@
     githubCapabilities = githubCapabilities.includes(capability)
       ? githubCapabilities.filter((item) => item !== capability)
       : [...githubCapabilities, capability]
+  }
+
+  function toggleAllGitHubCapabilities(): void {
+    githubCapabilities = allGitHubEnabled ? [] : [...ALL_GITHUB_CAPABILITIES]
   }
 
   function sameGitHubCapabilities(): boolean {
@@ -226,7 +234,8 @@
         <div>
           <span class="field-title">GitHub automation</span>
           <small>
-            Remember narrow, project-scoped permission for common GitHub work. Generic shell commands,
+            Remember project-scoped permission for common GitHub work across the manager and every project agent.
+            Claude GitHub CLI/MCP and the Codex GitHub connector use the same durable grant. Generic shell commands,
             authentication and secrets, repository administration, composed commands, and force or
             delete pushes still require a separate decision.
           </small>
@@ -235,6 +244,14 @@
           <div class="policy-loading">Loading policy…</div>
         {:else}
           <div class="policy-options">
+            <label class="policy-option policy-all">
+              <input
+                type="checkbox"
+                checked={allGitHubEnabled}
+                onchange={toggleAllGitHubCapabilities}
+              />
+              <span><b>All GitHub automation</b><small>PR work, merges, Actions runs, and non-force pushes for this project's exact repository.</small></span>
+            </label>
             {#each GITHUB_CAPABILITIES as capability (capability.id)}
               <label class="policy-option">
                 <input
