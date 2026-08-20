@@ -1,5 +1,4 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
-import readline from 'node:readline'
 import fs from 'node:fs'
 import path from 'node:path'
 import { createRequire } from 'node:module'
@@ -8,6 +7,7 @@ import { windowsPathToWsl } from '../workspaceLocation.js'
 import { nativeWslExecutable, spawnInWsl } from '../wslProcess.js'
 import { repairCodexRolloutPaths } from '../codexRolloutRelocation.js'
 import { CODEX_COMPACTION_PROMPT } from '../compactionContinuity.js'
+import { consumeBoundedLines } from '../boundedLineStream.js'
 import {
   documentTextBlock,
   isPdfAttachment,
@@ -55,6 +55,8 @@ export type CodexApprovalHandler = (method: string, params: unknown) => Promise<
  *  exec/patch approvals. Codex raises one the first time a thread uses a given MCP server's tool. */
 export const CODEX_ELICITATION_METHOD = 'mcpServer/elicitation/request'
 export const CODEX_PERMISSIONS_APPROVAL_METHOD = 'item/permissions/requestApproval'
+export const CODEX_APP_SERVER_MAX_LINE_BYTES = 64 * 1024 * 1024
+export const CODEX_INITIALIZE_CAPABILITIES = { experimentalApi: true } as const
 
 /**
  * Build the JSON-RPC result codex expects for a server request. THE SHAPES DIFFER and getting it wrong is
@@ -311,6 +313,7 @@ interface Pending {
 
 export class CodexClient {
   private child: ChildProcess | undefined
+  private stopReadingStdout: (() => void) | undefined
   private nextId = 1
   private readonly pending = new Map<number, Pending>()
   /**
@@ -395,11 +398,30 @@ export class CodexClient {
     }
     this.child = child
     if (child.stdout) {
-      const rl = readline.createInterface({ input: child.stdout })
-      rl.on('line', (line) => this.onLine(line))
+      this.stopReadingStdout = consumeBoundedLines(child.stdout, {
+        maxLineBytes: CODEX_APP_SERVER_MAX_LINE_BYTES,
+        onLine: (line) => {
+          try {
+            this.onLine(line)
+          } catch (error) {
+            this.failProtocol(child, error instanceof Error ? error : new Error(String(error)))
+          }
+        },
+        onOverflow: ({ maxLineBytes, observedBytes }) => {
+          this.failProtocol(
+            child,
+            new Error(
+              `codex app-server JSON frame exceeded ${maxLineBytes} bytes ` +
+              `(observed at least ${observedBytes}); the provider process was restarted safely`,
+            ),
+          )
+        },
+      })
     }
     child.stderr?.on('data', (d: Buffer) => this.onEvent('codex/stderr', d.toString()))
     child.on('exit', (code) => {
+      this.stopReadingStdout?.()
+      this.stopReadingStdout = undefined
       this.onEvent('codex/exited', { code })
       const err = new Error(`codex app-server exited (${code})`)
       for (const p of this.pending.values()) p.reject(err)
@@ -409,8 +431,29 @@ export class CodexClient {
     })
     await this.request('initialize', {
       clientInfo: { name: 'allmyagents-hub', title: 'AllMyAgents hub', version: '0.0.1' },
+      // Codex 0.145 otherwise makes thread/resume return every persisted turn and item in one JSON
+      // line. A long-lived manager produced a >V8-string response and crashed the shared worker.
+      // Negotiating the API lets resume request metadata/live state without replaying that history;
+      // AllMyAgents already owns its lossless, paged timeline in the journal.
+      capabilities: CODEX_INITIALIZE_CAPABILITIES,
     })
     this.send({ method: 'initialized' })
+  }
+
+  private failProtocol(child: ChildProcess, error: Error): void {
+    if (this.child !== child) return
+    this.stopReadingStdout?.()
+    this.stopReadingStdout = undefined
+    this.onEvent('codex/protocol-error', {
+      message: error.message.slice(0, 2_000),
+      action: 'provider-process-restart',
+    })
+    for (const pending of this.pending.values()) pending.reject(error)
+    this.pending.clear()
+    // A frame cannot be truncated and parsed without changing its meaning. Restart only this provider
+    // process so the shared AllMyAgents worker and unrelated turns remain available.
+    child.stdin?.destroy()
+    if (!child.killed) child.kill()
   }
 
   private onLine(line: string): void {
@@ -509,6 +552,9 @@ export class CodexClient {
     const normalized = developerInstructions?.trim()
     const params: Record<string, unknown> = {
       threadId,
+      // `thread/resume` populates thread.turns by default, regardless of whether this client reads it.
+      // Keep provider continuity loaded while preventing an unbounded duplicate transcript frame.
+      excludeTurns: true,
       // Reassert the compaction contract when joining an existing thread, including threads created by
       // an older AllMyAgents cut. This upgrades current sessions without requiring recreation.
       config: { compact_prompt: CODEX_COMPACTION_PROMPT },

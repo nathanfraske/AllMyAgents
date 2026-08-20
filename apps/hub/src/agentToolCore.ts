@@ -1371,7 +1371,7 @@ const remoteInspectGit = defineTool({
 const remotePrepareProjectLocation = defineTool({
   name: 'remote_prepare_project_location',
   description:
-    'Prepare an existing attached remote checkout at this project primary location\'s exact clean published commit. The hub derives repository, branch, and commit; this tool never accepts Git arguments and requires a terminal grant.',
+    'Prepare a granted remote root that already contains a clean checkout of this project at the primary location\'s exact published commit. A matching checkout is attached to the project automatically; a generic machine root remains usable for remote runs but is never mislabeled as project source. The hub derives every Git input and requires a terminal grant.',
   schema: {
     device_id: z.string().min(1).max(256),
     root_id: z.string().min(1).max(128),
