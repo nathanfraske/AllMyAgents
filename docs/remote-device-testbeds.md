@@ -128,15 +128,28 @@ If the source hub restarts before it observes a remote result, the active hub ow
 `cancelled` at the `source-restart` stage instead of inventing a success or failure. A standby hub never
 reconciles those rows while the active owner may still be running them.
 
-Attributed terminal runs acquire a durable, expiring source-hub lease before the command is sent. A second
-agent on that hub is rejected at admission while the location is leased. Writes and directory mutations are
-also refused during that lease. The target executor independently allows only one terminal command per
-physical root and refuses mutations while it runs, so a second paired hub cannot bypass the live-process
-fence. Both fences are released on a normally observed result; owner restart reconciliation records
-interrupted leases. The generic durable-run coordinator now owns stable handles, retained logs, resource
-scheduling, and stale-owner reconciliation for both local and remote work. Its process tree is still hub-owned
+An exact device/root grant is standing operator authority for the named read, write, or terminal capabilities.
+It remains valid on direct and teammate-triggered turns; the hub does not ask for a second per-command approval.
+Remote terminal commands and file mutations use the target account's normal concurrency. Generic durable remote
+runs therefore start concurrently unless callers name the same explicit resource (for example a package manager,
+GPU, port, or deployment lane) to serialize them. Project preparation retains its narrow transaction boundary
+because it deliberately changes a checkout to a published commit. The durable-run coordinator owns stable handles,
+retained logs, explicit resource scheduling, and stale-owner reconciliation. Its process tree is still hub-owned
 rather than detached: a run whose owner disappears is reported as `outcome_unknown`, never assumed stopped or
 blindly retried.
+
+The ordinary authorization path is one action: **Authorize this testbed**. On the target it enables the
+advertised Windows drives, WSL distributions, or Linux root with their usable read/write/terminal capabilities;
+on the selected manager or chat it grants those capabilities together. The per-root checkboxes remain an
+advanced narrowing surface, not a required setup ceremony.
+
+For a project chat, authorization immediately attempts to prepare the preferred build environment. If the
+granted root is already the project's clean matching checkout, the hub attaches it. Otherwise the hub creates a
+deterministic `.allmyagents/projects/<project>-<id>` checkout beneath that broad machine root. Before every
+important remote project run it reconciles that checkout to the primary location's credential-free repository,
+named branch, and exact published commit. It never overwrites a dirty or different repository. A broad `/home`,
+drive, or WSL root remains usable machine authority even when preparation fails; the failure is reported as
+project-source readiness rather than falsely revoking the device grant.
 
 Project Overview can run a fixed-argument Git readiness probe against local or remote locations. Agents with
 an explicit read grant can use the same probe through `remote_inspect_git`. It records HEAD/ref and a bounded

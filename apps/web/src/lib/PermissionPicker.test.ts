@@ -109,4 +109,21 @@ describe('managed permission boundaries', () => {
     expect(screen.getByText(/project chats stay bound to their remote/i)).toBeTruthy()
     expect(screen.getByText(/Overseer use remains direct-operator only/i)).toBeTruthy()
   })
+
+  it('persists every exact-chat GitHub capability with one provider-neutral action', async () => {
+    render(PermissionPicker, {
+      props: { sessionId: 'manager', mode: 'full' },
+    })
+
+    await fireEvent.click(screen.getByTitle('Permission mode: Full access'))
+    await fireEvent.click(await screen.findByRole('button', { name: 'Allow all GitHub automation' }))
+
+    expect(apiMock.setSessionGitHubAutomation).toHaveBeenCalledWith('manager', [
+      'pull_requests',
+      'pull_request_merges',
+      'workflow_runs',
+      'repository_pushes',
+    ])
+    expect(apiMock.allowTool).not.toHaveBeenCalled()
+  })
 })

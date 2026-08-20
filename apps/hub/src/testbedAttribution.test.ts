@@ -139,12 +139,24 @@ describe('remote testbed attribution', () => {
         },
       }
     })
-    hub.sessions.setRemoteDeviceController({ execute } as unknown as RemoteDeviceController)
+    hub.sessions.setRemoteDeviceController({
+      capabilities: async () => ({
+        enabled: true,
+        platform: 'linux',
+        arch: 'x64',
+        hostname: 'device-a',
+        environments: [],
+        roots: [{ id: 'root-a', label: 'Project checkout', path: '/srv/project', read: true, write: true, terminal: true }],
+      }),
+      execute,
+    } as unknown as RemoteDeviceController)
     const privateApi = hub.sessions as unknown as {
       remotePrepareProjectLocation(sessionId: string, siteId: string, rootId: string): Promise<RemoteDeviceActionResult>
     }
 
-    await expect(privateApi.remotePrepareProjectLocation('agent-a', 'site-a', 'root-a')).resolves.toMatchObject({
+    const prepared = await privateApi.remotePrepareProjectLocation('agent-a', 'site-a', 'root-a')
+    expect(prepared.ok, JSON.stringify(prepared)).toBe(true)
+    expect(prepared).toMatchObject({
       ok: true,
       git: { headCommit: primaryHead, detached: true },
     })
@@ -216,7 +228,9 @@ describe('remote testbed attribution', () => {
       remotePrepareProjectLocation(sessionId: string, siteId: string, rootId: string): Promise<RemoteDeviceActionResult>
     }
 
-    await expect(privateApi.remotePrepareProjectLocation('agent-a', 'site-a', 'root-a')).resolves.toMatchObject({
+    const prepared = await privateApi.remotePrepareProjectLocation('agent-a', 'site-a', 'root-a')
+    expect(prepared.ok, JSON.stringify(prepared)).toBe(true)
+    expect(prepared).toMatchObject({
       ok: true,
       git: { headCommit: primaryHead },
     })
@@ -227,16 +241,34 @@ describe('remote testbed attribution', () => {
     )
   })
 
-  it('keeps a granted generic machine root usable without mislabelling it as project source', async () => {
+  it('creates an app-owned project checkout beneath a granted generic machine root', async () => {
     const hub = build()
     expect(hub.projects.removeReplica(hub.project.id, hub.replica.id)).toBe(true)
-    const execute = vi.fn(async (): Promise<RemoteDeviceActionResult> => ({
-      ok: true,
-      git: {
-        status: 'not-repository', gitAvailable: true, isRepository: false, complete: true,
-        observedAt: new Date().toISOString(),
-      },
-    }))
+    const primaryHead = execFileSync('git', ['-C', hub.projects.get(hub.project.id)!.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+    const checkoutPath = `.allmyagents/projects/Testbed-project-${hub.project.id.slice(0, 8)}`
+    const execute = vi.fn(async (_siteId: string, action: RemoteDeviceAction): Promise<RemoteDeviceActionResult> => {
+      if (action.op === 'git_inspect') {
+        return {
+          ok: true,
+          git: {
+            status: 'not-repository', gitAvailable: true, isRepository: false, complete: true,
+            observedAt: new Date().toISOString(),
+          },
+        }
+      }
+      expect(action).toMatchObject({
+        op: 'git_sync', rootId: 'root-a', checkoutPath, createIfMissing: true,
+        repository: 'github.com/acme/testbed-project', headRef: 'main', headCommit: primaryHead,
+      })
+      return {
+        ok: true,
+        git: {
+          status: 'ready', gitAvailable: true, isRepository: true, complete: true, clean: true,
+          detached: true, headCommit: primaryHead, repository: 'github.com/acme/testbed-project',
+          observedAt: new Date().toISOString(),
+        },
+      }
+    })
     hub.sessions.setRemoteDeviceController({
       capabilities: async () => ({
         enabled: true,
@@ -256,13 +288,21 @@ describe('remote testbed attribution', () => {
       remotePrepareProjectLocation(sessionId: string, siteId: string, rootId: string): Promise<RemoteDeviceActionResult>
     }
 
-    await expect(privateApi.remotePrepareProjectLocation('agent-a', 'site-a', 'root-a')).resolves.toMatchObject({
-      ok: false,
-      failure: { stage: 'admission', code: 'PROJECT_CHECKOUT_REQUIRED' },
-      error: expect.stringContaining('Remote access is granted'),
+    const prepared = await privateApi.remotePrepareProjectLocation('agent-a', 'site-a', 'root-a')
+    expect(prepared.ok, JSON.stringify(prepared)).toBe(true)
+    expect(prepared).toMatchObject({
+      ok: true,
+      git: { headCommit: primaryHead },
+      projectLocation: {
+        rootId: 'root-a',
+        path: `/home/${checkoutPath}`,
+        cwd: checkoutPath,
+      },
     })
-    expect(hub.projects.findRemoteReplica(hub.project.id, 'site-a', 'root-a')).toBeUndefined()
-    expect(execute).toHaveBeenCalledOnce()
+    expect(hub.projects.findRemoteReplica(hub.project.id, 'site-a', 'root-a')).toMatchObject({
+      path: `/home/${checkoutPath}`,
+    })
+    expect(execute).toHaveBeenCalledTimes(2)
   })
 
   it('creates and completes one durable run only for an explicitly attached project root', async () => {
@@ -308,55 +348,52 @@ describe('remote testbed attribution', () => {
         exitCode: 0,
       }),
     ])
-    expect(hub.reservations.listProject(hub.project.id)).toEqual([
-      expect.objectContaining({
-        replicaId: hub.replica.id,
-        agentId: 'agent-a',
-        state: 'released',
-        reason: 'run-finished',
-      }),
-    ])
+    expect(hub.reservations.listProject(hub.project.id)).toEqual([])
     expect(hub.journal.eventsForSession('agent-a').events.map((event) => event.kind)).toEqual(
       expect.arrayContaining([
-        'testbed-reservation/acquired',
         'testbed-run/started',
-        'testbed-reservation/released',
         'testbed-run/completed',
       ]),
     )
   })
 
-  it('rejects a concurrent command on the same location before it reaches the target', async () => {
+  it('lets an exactly granted teammate turn run concurrent commands and mutations on one location', async () => {
     const hub = build()
     let finishFirst!: (value: RemoteDeviceActionResult) => void
-    const execute = vi.fn(() => new Promise<RemoteDeviceActionResult>((resolve) => { finishFirst = resolve }))
-    hub.sessions.setRemoteDeviceController({ execute } as unknown as RemoteDeviceController)
+    let call = 0
+    const execute = vi.fn(() => {
+      call += 1
+      if (call === 1) return new Promise<RemoteDeviceActionResult>((resolve) => { finishFirst = resolve })
+      return Promise.resolve<RemoteDeviceActionResult>({ ok: true, exitCode: 0 })
+    })
+    hub.sessions.setRemoteDeviceController({
+      capabilities: async () => ({
+        enabled: true,
+        platform: 'linux',
+        arch: 'x64',
+        hostname: 'device-a',
+        environments: [],
+        roots: [{ id: 'root-a', label: 'Project checkout', path: '/srv/project', read: true, write: true, terminal: true }],
+      }),
+      execute,
+    } as unknown as RemoteDeviceController)
     const privateApi = hub.sessions as unknown as {
+      busTurnSessions: Set<string>
       remoteDeviceExecute(sessionId: string, siteId: string, action: RemoteDeviceAction): Promise<RemoteDeviceActionResult>
     }
+    privateApi.busTurnSessions.add('agent-a')
     const action: RemoteDeviceAction = { op: 'exec', rootId: 'root-a', command: 'pnpm test' }
 
     const first = privateApi.remoteDeviceExecute('agent-a', 'site-a', action)
     await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(1))
     const second = await privateApi.remoteDeviceExecute('agent-a', 'site-a', action)
-    expect(second).toMatchObject({
-      ok: false,
-      failure: { stage: 'admission', code: 'REPLICA_RESERVED' },
-      error: expect.stringContaining('reserved by agent'),
-    })
+    expect(second).toMatchObject({ ok: true, exitCode: 0, runId: expect.any(String) })
     const mutation = await privateApi.remoteDeviceExecute('agent-a', 'site-a', {
       op: 'write', rootId: 'root-a', path: 'raced.txt', content: 'unsafe',
     })
-    expect(mutation).toMatchObject({
-      ok: false,
-      failure: { stage: 'admission', code: 'REPLICA_RESERVED' },
-    })
-    await expect(hub.sessions.deleteProject(hub.project.id)).resolves.toMatchObject({
-      ok: false,
-      error: expect.stringContaining('testbed run is still active'),
-    })
-    expect(hub.projects.get(hub.project.id)).toBeTruthy()
-    expect(execute).toHaveBeenCalledTimes(1)
+    expect(mutation).toMatchObject({ ok: true })
+    expect(execute).toHaveBeenCalledTimes(3)
+    expect(hub.reservations.listProject(hub.project.id)).toEqual([])
 
     finishFirst({ ok: true, exitCode: 0 })
     await expect(first).resolves.toMatchObject({ ok: true })

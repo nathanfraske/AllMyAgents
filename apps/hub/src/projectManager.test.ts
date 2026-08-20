@@ -1207,7 +1207,15 @@ describe('project manager durable live roster', () => {
 
   it('rebuilds the managed-agent roster and bounded operator provenance after compaction', async () => {
     const { sessions, journal, seed, repo, runTurn } = buildHub()
-    const manager = seed({ id: 'manager', projectId: 'project' })
+    const manager = seed({
+      id: 'manager',
+      projectId: 'project',
+      remoteDeviceGrants: [{
+        siteId: 'fleet-device-a',
+        rootIds: ['windows-root', 'wsl-root'],
+        capabilities: ['read', 'write', 'terminal'],
+      }],
+    })
     sessions.configureProjectManager(
       'manager',
       {
@@ -1293,6 +1301,9 @@ describe('project manager durable live roster', () => {
     expect(instructions).not.toContain('private operator steer body')
     expect(instructions).toContain('call the AllMyAgents assign_child_task tool')
     expect(instructions).toContain('Live grant authority: accounts [p1], capabilities [shell, file_read]')
+    expect(instructions).toContain('device fleet-device-a: roots [windows-root, wsl-root]')
+    expect(instructions).toContain('Those grants are complete standing authority')
+    expect(instructions).toContain('the first project durable run prepares one automatically')
     expect(instructions).toContain('Effective account health (generated from live state)')
     expect(instructions).toContain('Reviewer (reviewer): p1 / provider default / default effort')
     expect(journal.recentEventsForSession('manager', 100)).toContainEqual(expect.objectContaining({

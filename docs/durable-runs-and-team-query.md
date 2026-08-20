@@ -38,9 +38,9 @@ that every command survives process replacement.
 
 Local commands use an executable plus argv with `shell:false`; shell composition belongs only in the explicit
 remote command field because the remote root advertises its shell environment. Important remote work still
-requires the target session's exact device/root terminal grant. `start_run` is an ordinary execution approval
-class: direct Full Access and an exact operator "always allow start_run" grant can approve it, while a
-teammate-caused turn remains denied by default.
+requires the target session's exact device/root terminal grant. That grant is standing operator authority for
+the remote capability, including on a teammate-triggered turn, so `start_run` does not ask for another execution
+approval. Local host runs keep their normal execution-approval and bus-turn boundaries.
 
 A project manager always runs against a visible project checkout. The application Overseer may additionally
 start local ad-hoc work by supplying an explicit absolute `working_directory`, or use a granted remote root
@@ -48,11 +48,12 @@ without inventing a project association. The hub resolves and records the canoni
 under a reserved application scope, and exposes those runs only through the Overseer's normal managed-scope
 query. Relative or missing directories fail before a process starts.
 
-The older project-replica testbed run/reservation ledger remains active for callers still using `remote_exec`
-during the compatibility period. A generic remote run does not manufacture a duplicate legacy run: its generic
-id is forwarded as the target correlation id, while the target's independent physical-root fence remains the
-second admission boundary. Migrating the remaining legacy ledger and GitHub-import jobs onto the generic
-scheduler can now be mechanical rather than creating a third job system.
+The older project-replica testbed run ledger remains active for attributed callers still using `remote_exec`
+during the compatibility period, but it is observational rather than an exclusive lock. A generic remote run
+does not manufacture a duplicate legacy run: its generic id is forwarded as the target correlation id. Remote
+commands run concurrently by default and serialize only on an explicitly shared durable resource. Migrating the
+remaining legacy ledger and GitHub-import jobs onto the generic scheduler can now be mechanical rather than
+creating a third job system.
 
 ## Scoped team query
 

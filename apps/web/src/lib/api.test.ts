@@ -75,6 +75,24 @@ describe('HUB base URL derivation (inTauri)', () => {
   })
 })
 
+describe('fleet websocket subscriptions', () => {
+  it('requests fleet state plus only the visible remote transcript ids', async () => {
+    vi.stubGlobal('localStorage', { getItem: () => 'remote-secret', setItem: vi.fn(), removeItem: vi.fn() })
+    const { fleetWebSocketUrl } = await loadApi()
+    const url = new URL(fleetWebSocketUrl(
+      { siteId: 'peer', label: 'Remote', local: false, baseUrl: 'http://localhost:45678', online: true },
+      41,
+      7,
+      ['open-a', 'open-b'],
+    ))
+    expect(url.protocol).toBe('ws:')
+    expect(url.searchParams.get('view')).toBe('fleet')
+    expect(url.searchParams.getAll('session')).toEqual(['open-a', 'open-b'])
+    expect(url.searchParams.get('since')).toBe('41')
+    expect(url.searchParams.get('generation')).toBe('7')
+  })
+})
+
 // The transport contract: a response that is not usable data must never be handed back AS data. GET
 // throws so the store's existing per-call `.catch()` guards fire (a token-gated peer's 401 used to be
 // iterated as an array); POST returns `{error}` in the shape its callers already render (a 404 on an

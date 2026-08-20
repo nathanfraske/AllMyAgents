@@ -42,13 +42,21 @@ class FakeJournal extends EventEmitter {
     hook?.()
     const accepted: HubEvent[] = []
     let encodedBytes = 0
+    let lastSeq = afterSeq
     for (const row of rows) {
+      const filter = (options as typeof options & {
+        eventFilter?: (event: { seq: number; sessionId: string | null; kind: string }) => boolean
+      }).eventFilter
+      if (filter && !filter({ seq: row.seq, sessionId: row.sessionId, kind: row.kind })) {
+        lastSeq = row.seq
+        continue
+      }
       const bytes = Buffer.byteLength(JSON.stringify(row))
       if (bytes > options.maxFrameBytes) {
         return {
           checkpoint: this.replayCheckpoint(),
           events: accepted,
-          lastSeq: accepted.at(-1)?.seq ?? afterSeq,
+          lastSeq,
           hasMore: true,
           encodedBytes,
           tooLarge: { seq: row.seq, encodedBytes: bytes },
@@ -56,9 +64,9 @@ class FakeJournal extends EventEmitter {
       }
       if (encodedBytes + bytes > options.maxBytes) break
       accepted.push(row)
+      lastSeq = row.seq
       encodedBytes += bytes
     }
-    const lastSeq = accepted.at(-1)?.seq ?? afterSeq
     return {
       checkpoint: this.replayCheckpoint(),
       events: accepted,
@@ -162,6 +170,33 @@ describe('bounded replay to live join', () => {
     expect(journal.listenerCount('event')).toBe(1)
     socket.close(1000, 'test complete')
     expect(journal.listenerCount('event')).toBe(0)
+  })
+
+  it('advances past filtered durable rows without sending their transcript payloads', () => {
+    const journal = new FakeJournal()
+    journal.events = [event(1), event(2, 'hidden transcript'), event(3, 'also hidden')]
+    const socket = new FakeSocket()
+    const controller = attachReplayStream(socket, journal, {
+      since: 1,
+      generation: 4,
+      eventFilter: ({ seq }) => seq >= 4,
+    })
+
+    expect(socket.messages().map((message) => message.type ?? message.seq)).toEqual([
+      'replay-start',
+      'replay-complete',
+    ])
+    expect(socket.messages().at(-1)).toMatchObject({ lastSeq: 3 })
+
+    const visible = event(4, 'visible transcript')
+    journal.events.push(visible)
+    controller.pollNow()
+    expect(socket.messages().map((message) => message.type ?? message.seq)).toEqual([
+      'replay-start',
+      'replay-complete',
+      4,
+    ])
+    socket.close(1000, 'test complete')
   })
 
   it('durably polls a second-process append that did not emit on this Journal instance', () => {

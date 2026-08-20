@@ -172,7 +172,12 @@ export async function buildFleet(deps: BuildFleetDeps): Promise<FleetSite[]> {
         // A site mapping may remain marked active while its byte path is dead. `site_map` alone is
         // idempotent and hands back that same listener, so replace it once before declaring the hub
         // offline. MeshSite owns the cooldown/single-flight guard for genuinely absent peers.
-        if (!online && deps.recoverSiteMap) {
+        // An HTTP response, including 503, proves the byte route is alive; replacing that mapping only
+        // severs a healthy remote WebSocket while the peer hub is booting or overloaded. A timeout is
+        // likewise not evidence that the mapping identity is stale. Repair only a route that could not
+        // establish a transport connection at all.
+        const routeMayBeStale = !deps.probeRoute || probe.failure === 'connection-refused' || probe.failure === 'transport-error'
+        if (!online && routeMayBeStale && deps.recoverSiteMap) {
           const recoveredPort = await deps.recoverSiteMap(m.device, port).catch(() => null)
           if (recoveredPort != null) {
             recoveredBaseUrl = `http://localhost:${recoveredPort}`

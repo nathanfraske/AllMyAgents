@@ -55,6 +55,7 @@ export interface OverseerControlInput {
     | 'launch_team'
     | 'remote_catalog'
     | 'set_remote_grants'
+    | 'authorize_remote_testbed'
     | 'list_overseer_peers'
     | 'send_overseer_message'
     | 'start_account_login'
@@ -764,13 +765,13 @@ const assignChildTask = defineTool({
 const startRun = defineTool({
   name: 'start_run',
   description:
-    'Project managers and the application Overseer: start a durable local or granted-remote build/test/lint/benchmark/deploy/custom run. The hub captures source provenance, queues conflicting checkout/resources instead of using model-managed lockfiles, returns a stable run id, retains bounded logs and exact terminal state, and never blindly retries an outcome-unknown command. Give independent jobs different resource names or remote roots to run them in parallel; jobs sharing a checkout, device root, GPU, port, or other named resource serialize.',
+    'Project managers and the application Overseer: start a durable local or explicitly granted remote build/test/lint/benchmark/deploy/custom run. The hub captures source provenance, returns a stable run id, retains bounded logs and exact terminal state, and never blindly retries an outcome-unknown command. Local runs serialize on their checkout or working directory. Granted remote runs are concurrent by default; give only commands that must serialize the same explicit resource name (for example gpu or port-8080).',
   schema: {
     kind: z.enum(['build', 'test', 'lint', 'benchmark', 'deploy', 'custom']),
     executable: z.string().min(1).max(1_000).optional().describe('local target only: one executable; shell composition is not accepted'),
     args: z.array(z.string().max(8_000)).max(256).optional().describe('argument vector; defaults to []'),
     target_session: z.string().optional().describe('managed agent whose checkout should run; defaults to your own checkout'),
-    resources: z.array(z.string().min(1).max(120)).max(16).optional().describe('extra scope-owned resource names such as gpu or port-8080; the project checkout, application working directory, or remote root is always leased'),
+    resources: z.array(z.string().min(1).max(120)).max(16).optional().describe('scope-owned resource names such as gpu or port-8080; local checkout/working-directory leases are automatic, while remote runs serialize only on explicitly shared names'),
     timeout_ms: z.number().int().min(1_000).max(6 * 60 * 60 * 1_000).optional(),
     environment: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/u), z.string().max(8_000)).optional(),
     working_directory: z
@@ -802,7 +803,7 @@ const startRun = defineTool({
     if (!remoteRequested && !args.executable) {
       return 'Run not started: executable is required for a local run.'
     }
-    if (services.isBusTurn(identity.sessionId) && services.danger().busCanUseRiskyTools !== true) {
+    if (!remoteRequested && services.isBusTurn(identity.sessionId) && services.danger().busCanUseRiskyTools !== true) {
       services.journal(identity.sessionId, 'approval/auto-denied-bus', { toolName: 'start_run', kind: args.kind })
       return 'Run not started: a teammate-caused turn cannot launch host commands. Ask the operator to start or explicitly authorize this work.'
     }
@@ -817,7 +818,9 @@ const startRun = defineTool({
       ...(args.working_directory ? { workingDirectory: args.working_directory } : {}),
       ...(remoteRequested ? { remoteDeviceId: args.remote_device_id, remoteRootId: args.remote_root_id, remoteCommand: args.remote_command, remoteCwd: args.remote_cwd } : {}),
     }
-    if (!await services.requireApproval(identity, 'allmyagents/run', approvalPayload)) {
+    // An exact remote device/root terminal grant is standing operator authority. Session-side admission
+    // checks that grant again; asking for a second per-command approval makes a granted testbed unusable.
+    if (!remoteRequested && !await services.requireApproval(identity, 'allmyagents/run', approvalPayload)) {
       return 'Run not started: the operator declined the durable command (or the request timed out).'
     }
     const result = await services.startRun(identity.sessionId, {
@@ -1191,13 +1194,6 @@ const browserStatus = defineTool({
     services.browser(identity.sessionId, 'status', {}),
 })
 
-function remoteBusDenied(identity: SessionIdentity, services: AgentServices): string | null {
-  if (services.isBusTurn(identity.sessionId) && services.danger().busCanUseRiskyTools !== true) {
-    return 'Remote device access is unavailable on a teammate-caused turn. The operator can run this turn directly or explicitly enable risky bus-turn tools.'
-  }
-  return null
-}
-
 function remoteTelemetry(result: RemoteDeviceActionResult): string {
   const telemetry = result.telemetry
   const parts: string[] = []
@@ -1244,8 +1240,6 @@ const remotePing = defineTool({
     root_id: z.string().min(1).max(128),
   },
   run: async (args, { identity, services }) => {
-    const denied = remoteBusDenied(identity, services)
-    if (denied) return denied
     const result = await services.remoteExecute(identity.sessionId, args.device_id, { op: 'probe', rootId: args.root_id })
     return `${result.ok ? 'Remote testbed is reachable.' : `Remote ping failed: ${result.error ?? 'unknown error'}`} ${remoteTelemetry(result)}`
   },
@@ -1259,8 +1253,6 @@ const remoteInspectEnvironment = defineTool({
     root_id: z.string().min(1).max(128),
   },
   run: async (args, { identity, services }) => {
-    const denied = remoteBusDenied(identity, services)
-    if (denied) return denied
     const result = await services.remoteExecute(identity.sessionId, args.device_id, { op: 'inspect', rootId: args.root_id })
     if (!result.ok || !result.environment) return `Remote environment inspection failed: ${result.error ?? 'unknown error'} ${remoteTelemetry(result)}`
     const environment = result.environment
@@ -1286,8 +1278,6 @@ const remoteListFiles = defineTool({
     path: z.string().max(4096).optional().describe('relative directory; omit for the root'),
   },
   run: async (args, { identity, services }) => {
-    const denied = remoteBusDenied(identity, services)
-    if (denied) return denied
     const result = await services.remoteExecute(identity.sessionId, args.device_id, {
       op: 'list', rootId: args.root_id, path: args.path,
     })
@@ -1307,8 +1297,6 @@ const remoteReadFile = defineTool({
     max_bytes: z.number().int().positive().max(1024 * 1024).optional(),
   },
   run: async (args, { identity, services }) => {
-    const denied = remoteBusDenied(identity, services)
-    if (denied) return denied
     const result = await services.remoteExecute(identity.sessionId, args.device_id, {
       op: 'read', rootId: args.root_id, path: args.path, encoding: args.encoding, maxBytes: args.max_bytes,
     })
@@ -1328,8 +1316,6 @@ const remoteWriteFile = defineTool({
     encoding: z.enum(['utf8', 'base64']).optional(),
   },
   run: async (args, { identity, services }) => {
-    const denied = remoteBusDenied(identity, services)
-    if (denied) return denied
     const result = await services.remoteExecute(identity.sessionId, args.device_id, {
       op: 'write', rootId: args.root_id, path: args.path, content: args.content, encoding: args.encoding,
     })
@@ -1348,8 +1334,6 @@ const remoteInspectGit = defineTool({
     root_id: z.string().min(1).max(128),
   },
   run: async (args, { identity, services }) => {
-    const denied = remoteBusDenied(identity, services)
-    if (denied) return denied
     const result = await services.remoteExecute(identity.sessionId, args.device_id, {
       op: 'git_inspect', rootId: args.root_id,
     })
@@ -1371,14 +1355,12 @@ const remoteInspectGit = defineTool({
 const remotePrepareProjectLocation = defineTool({
   name: 'remote_prepare_project_location',
   description:
-    'Prepare a granted remote root that already contains a clean checkout of this project at the primary location\'s exact published commit. A matching checkout is attached to the project automatically; a generic machine root remains usable for remote runs but is never mislabeled as project source. The hub derives every Git input and requires a terminal grant.',
+    'Prepare this project on an explicitly granted remote testbed at the primary location\'s exact published commit. The hub reuses a matching clean checkout or creates a deterministic app-owned checkout beneath a broad machine root; the broad root remains generic machine authority and is never relabeled as project source. All Git inputs are hub-derived.',
   schema: {
     device_id: z.string().min(1).max(256),
     root_id: z.string().min(1).max(128),
   },
   run: async (args, { identity, services }) => {
-    const denied = remoteBusDenied(identity, services)
-    if (denied) return denied
     const result = await services.remotePrepareProjectLocation(identity.sessionId, args.device_id, args.root_id)
     if (!result.ok || !result.git) {
       return `Remote project preparation failed: ${result.error ?? 'unknown error'} ${remoteTelemetry(result)}`
@@ -1402,8 +1384,6 @@ const remoteCreateDirectory = defineTool({
     recursive: z.boolean().optional().describe('create missing parents; defaults to true'),
   },
   run: async (args, { identity, services }) => {
-    const denied = remoteBusDenied(identity, services)
-    if (denied) return denied
     const result = await services.remoteExecute(identity.sessionId, args.device_id, {
       op: 'mkdir',
       rootId: args.root_id,
@@ -1419,7 +1399,7 @@ const remoteCreateDirectory = defineTool({
 const remoteExec = defineTool({
   name: 'remote_exec',
   description:
-    'Run one bounded shell command on an explicitly granted remote terminal target. The root selects the starting directory; the shell retains that target OS account\'s normal machine access. Windows uses non-interactive PowerShell; macOS/Linux uses /bin/sh. The target bounds time and output.',
+    'Run one bounded shell command on an explicitly granted remote terminal target. The grant is standing authority and concurrent commands are allowed; use durable start_run plus an explicit shared resource only when commands intentionally must serialize. The root selects the starting directory, while the shell retains that target OS account\'s normal machine access. Windows uses non-interactive PowerShell; macOS/Linux uses /bin/sh. The target bounds time and output.',
   schema: {
     device_id: z.string().min(1).max(256),
     root_id: z.string().min(1).max(128),
@@ -1428,8 +1408,6 @@ const remoteExec = defineTool({
     timeout_ms: z.number().int().min(1000).max(120_000).optional(),
   },
   run: async (args, { identity, services }) => {
-    const denied = remoteBusDenied(identity, services)
-    if (denied) return denied
     const result = await services.remoteExecute(identity.sessionId, args.device_id, {
       op: 'exec', rootId: args.root_id, command: args.command, cwd: args.cwd, timeoutMs: args.timeout_ms,
     })
@@ -1514,7 +1492,7 @@ const overseerControl = defineTool({
       'status', 'guide', 'ui_catalog', 'highlight_ui', 'failure_context', 'get_operating_mode', 'set_operating_mode', 'create_project', 'create_chat', 'send_chat', 'stop_chat',
       'reopen_chat', 'approve', 'get_approval_policy', 'configure_approval_policy', 'set_mode', 'set_session_config', 'configure_manager', 'reassign_manager_account',
       'list_team_presets', 'save_team_preset', 'delete_team_preset', 'launch_team',
-      'remote_catalog', 'set_remote_grants', 'list_overseer_peers', 'send_overseer_message',
+      'remote_catalog', 'set_remote_grants', 'authorize_remote_testbed', 'list_overseer_peers', 'send_overseer_message',
       'start_account_login', 'github_repositories',
       'clone_github_repository', 'github_clone_status',
       'get_github_automation_policy', 'configure_github_automation', 'issue_pairing_code',
@@ -1700,7 +1678,7 @@ export const AGENT_TOOLS_INSTRUCTIONS =
   'to start now, starting it needs operator authority - the Overseer can do that with overseer_control send_chat, ' +
   'and everyone else should say exactly that rather than report the hold upward as a blocker. ' +
   'Use start_run/inspect_runs for important build and test commands that need a stable handle, serialized checkout ownership, retained logs, exact exit state, and automatic source provenance; never blindly retry a run whose outcome is unknown. ' +
-  'For remote provisioning, run the project\'s reviewed setup recipe as its own durable run under the same remote-root lease before the build. Do not infer packages from source, mutate a machine implicitly, or invent a second dependency manifest beside the project\'s own recipes.'
+  'An operator-authorized whole testbed grant is standing authority for every advertised root and capability: do not request another approval, serialize unrelated commands, or claim that a broad machine root is unusable because it is not yet project-attached. Project durable runs automatically prepare an app-owned checkout beneath that root at the primary published commit. For remote provisioning, run the project\'s reviewed setup recipe as its own durable run before the build; use the same named resource for provisioning and building only when they intentionally must serialize. Do not infer packages from source, mutate a machine implicitly, or invent a second dependency manifest beside the project\'s own recipes.'
 
 export function getAgentTool(name: string): AgentToolSpec | undefined {
   return BY_NAME.get(name)

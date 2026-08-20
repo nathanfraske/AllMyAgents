@@ -13,7 +13,7 @@ import { Journal } from './journal.js'
 import { MemoryStore } from './memory.js'
 import { PracticeStore } from './practices.js'
 import { ProjectStore } from './projects.js'
-import { startServer, type ServerOptions } from './server.js'
+import { fleetStreamEventVisible, startServer, type ServerOptions } from './server.js'
 import { SessionManager } from './sessions.js'
 import { SessionStore } from './store.js'
 import { UsageMonitor } from './usage.js'
@@ -24,6 +24,16 @@ import { QuestionService } from './questions.js'
 import { waitForPortRelease } from './restartRollback.js'
 
 const cleanups: Array<() => void | Promise<void>> = []
+
+describe('fleet websocket event filtering', () => {
+  it('keeps fleet state global while limiting transcript payloads to visible sessions', () => {
+    const visible = new Set(['open-chat'])
+    expect(fleetStreamEventVisible({ sessionId: 'open-chat', kind: 'claude/user' }, visible)).toBe(true)
+    expect(fleetStreamEventVisible({ sessionId: 'hidden-chat', kind: 'claude/user' }, visible)).toBe(false)
+    expect(fleetStreamEventVisible({ sessionId: 'hidden-chat', kind: 'session/status' }, visible)).toBe(true)
+    expect(fleetStreamEventVisible({ sessionId: null, kind: 'project/updated' }, visible)).toBe(true)
+  })
+})
 
 afterEach(async () => {
   while (cleanups.length) await cleanups.pop()?.()

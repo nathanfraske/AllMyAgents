@@ -8,14 +8,16 @@ import { getOrCreateDeviceToken } from './deviceToken.js'
 import {
   DeviceExecutor,
   FleetConnectionStore,
+  machineRoots,
   RemoteDeviceController,
   testbedToolchainSearchPaths,
   type DeviceRootPolicy,
   type RemoteDeviceAction,
-  type RemoteExecutionEnvironment,
   type TestbedBuildIdentity,
 } from './remoteDevices.js'
 import { defaultMyOwnMeshSocketPath, MyOwnMeshRpcBridge, myOwnMeshControlRequest } from './myOwnMeshRpc.js'
+
+export { machineRoots } from './remoteDevices.js'
 
 export type TestbedNodeProfile = 'scoped' | 'full-machine' | 'elevated-machine' | 'linux-sudo-machine'
 
@@ -216,44 +218,6 @@ function admittedMessageIds(dataDir: string, now = Date.now()): Map<string, numb
     }
   }
   return recent
-}
-
-function hostMachineRoots(platform: NodeJS.Platform): DeviceRootPolicy[] {
-  if (platform !== 'win32') {
-    return [{ id: '', label: 'Host filesystem', path: '/', read: true, write: true, terminal: true }]
-  }
-  const roots: DeviceRootPolicy[] = []
-  for (let code = 65; code <= 90; code += 1) {
-    const drive = `${String.fromCharCode(code)}:\\`
-    try {
-      if (fs.statSync(drive).isDirectory()) {
-        roots.push({ id: '', label: `${drive.slice(0, 2)} drive`, path: drive, read: true, write: true, terminal: true })
-      }
-    } catch { /* Drive is absent or not ready. */ }
-  }
-  return roots
-}
-
-export function machineRoots(
-  platform: NodeJS.Platform,
-  environments: readonly RemoteExecutionEnvironment[] = [],
-): DeviceRootPolicy[] {
-  const roots = hostMachineRoots(platform)
-  if (platform === 'win32') {
-    for (const environment of environments) {
-      if (environment.kind !== 'wsl' || !environment.distro) continue
-      roots.push({
-        id: '',
-        label: `${environment.distro} filesystem`,
-        path: '/',
-        environment: { kind: 'wsl', distro: environment.distro },
-        read: true,
-        write: true,
-        terminal: true,
-      })
-    }
-  }
-  return roots
 }
 
 function normalizeProfile(value: unknown): TestbedNodeProfile {
