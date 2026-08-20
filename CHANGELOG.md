@@ -5,6 +5,28 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.30-alpha.34 — 2026-08-20
+
+This release turns an explicit device authorization into usable manager authority, keeps remote routes stable and
+quiet while chats are open, prepares project checkouts automatically, and makes broad GitHub automation grants
+durable across both Claude and Codex managers.
+
+[Full v0.1.30-alpha.34 release notes](docs/releases/v0.1.30-alpha.34.md)
+
+- **Authorize testbed** grants every capability and Windows, WSL2, Linux, or macOS root the target advertises in
+  one operator action. The exact chat/device grant is standing authority: managers no longer need a second project
+  attachment, per-command approval, or single-terminal-command lease.
+- Project chats automatically reuse a clean matching checkout or create an app-owned checkout beneath a broad
+  machine root. Durable remote runs re-establish the exact published primary revision before building or testing.
+- Fleet polling no longer remaps a byte-healthy route after HTTP 503 or a timeout, and a live authenticated remote
+  WebSocket remains stronger evidence than a transient health probe. Transcript streaming is limited to visible
+  remote panes instead of relaying every agent's full output while the UI is idle.
+- A failed mid-turn steer that confirms the provider is already idle starts exactly one fresh queued turn, closing
+  the stale-active window that could leave manager and worker messages waiting indefinitely.
+- Project and chat settings expose one-click **Allow all GitHub automation** controls. The same scoped policy covers
+  Claude GitHub commands and strictly classified Codex GitHub connector elicitations while keeping merge, push,
+  workflow, and pull-request capabilities independently revocable.
+
 ## v0.1.29-alpha.33 — 2026-08-20
 
 This release keeps long-lived Codex managers from crashing the shared worker, makes granted remote checkouts usable
