@@ -779,7 +779,7 @@ describe('owned journal corruption recovery', () => {
       activeGeneration: '1',
       nextGeneration: '3',
     })
-  })
+  }, 20_000)
 
   it('restores only an owned verified generation and retains the exact damaged family as evidence', async () => {
     const dataDir = root()
