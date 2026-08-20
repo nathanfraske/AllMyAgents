@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   CODEX_ELICITATION_METHOD,
+  CODEX_INITIALIZE_CAPABILITIES,
   CODEX_PERMISSIONS_APPROVAL_METHOD,
   CodexClient,
   codexRequestResult,
@@ -86,6 +87,7 @@ describe('Codex host contract', () => {
 
     expect(request).toHaveBeenCalledWith('thread/resume', {
       threadId,
+      excludeTurns: true,
       config: { compact_prompt: CODEX_COMPACTION_PROMPT },
       developerInstructions: instructions,
     })
@@ -119,9 +121,14 @@ describe('Codex host contract', () => {
 
     expect(request).toHaveBeenCalledWith('thread/resume', {
       threadId,
+      excludeTurns: true,
       config: { compact_prompt: CODEX_COMPACTION_PROMPT },
       developerInstructions: 'topology changed before turn one',
     })
+  })
+
+  it('negotiates metadata-only resume support instead of replaying provider history into one frame', () => {
+    expect(CODEX_INITIALIZE_CAPABILITIES).toEqual({ experimentalApi: true })
   })
 
   it('answers request_permissions with the documented granted subset instead of an exec decision', () => {

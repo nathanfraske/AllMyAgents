@@ -166,7 +166,7 @@ function describe(e: unknown): string {
   // what to change, and it cost a long diagnosis once — the hub looked simply un-exposed, and the actual
   // cause was one word in an error string nobody surfaced.
   if (code === 'EPERM' || code === 'EACCES') {
-    return 'the AllMyStuff node refused this hub permission to connect (EPERM). On Windows the node control pipe is ACL-protected — this usually means the node and AllMyAgents are running at different privilege levels. Run both elevated, or both as your normal user.'
+    return 'the AllMyStuff node control pipe denied this user read/write access (EPERM). The service owner must grant the interactive console user full-duplex access to the pipe; running AllMyAgents elevated is not a durable repair.'
   }
   return e instanceof Error ? e.message : String(e)
 }
@@ -390,37 +390,44 @@ export class MeshSite {
   // --- Fleet discovery + routing ---------------------------------------------------------------
   // These call the SAME node control socket + framing `register()` uses, just pointed at the
   // directory/routing commands the node already exposes (docs/mesh-unified-fleet.md §1). All are
-  // fail-soft: no node here, or any error, yields empty/null — never a throw into the request path,
-  // so a single-machine hub with no node behaves exactly as before (owned_roster fails fast with
-  // ENOENT/ECONNREFUSED → []).
+  // Ordinary fleet discovery remains fail-soft: no node here, or any error, yields empty/null so a
+  // single-machine hub behaves exactly as before. Authority-sensitive remote/testbed callers use
+  // ownedRosterRequired() so a degraded control plane is not misreported as an empty fleet.
 
   /**
    * The fleet directory: every co-owned machine (node id + label) as `owned_roster` reports it
    * (node_control.rs:1668 → mesh.rs `fleet_roster_value` :9667; reply envelope `{ ok, result }` per
    * node_control.rs `WireResponse::ok` :642). `result.members` is `[{ device, label, role }]`, or
-   * absent/`[]` when this node isn't in a fleet (`empty_owned()` mesh.rs:17586). Returns [] on any
-   * error or when no node is running here.
+   * absent/`[]` when this node isn't in a fleet (`empty_owned()` mesh.rs:17586). The required form
+   * preserves control-plane failures; ownedRoster() remains the fail-soft discovery wrapper.
    */
-  async ownedRoster(timeoutMs = 4000): Promise<FleetMember[]> {
+  async ownedRosterRequired(timeoutMs = 4000): Promise<FleetMember[]> {
+    let r: WireResponse
     try {
-      const r = await this.request('owned_roster', {}, timeoutMs)
-      if (!r.ok) return []
-      const members = (r.result as { members?: unknown } | undefined)?.members
-      if (!Array.isArray(members)) return []
-      const out: FleetMember[] = []
-      for (const raw of members) {
-        const m = raw as { device?: unknown; label?: unknown; role?: unknown }
-        if (typeof m.device !== 'string' || m.device.length === 0) continue
-        out.push({
-          device: m.device,
-          label: typeof m.label === 'string' ? m.label : '',
-          role: typeof m.role === 'string' ? m.role : undefined,
-        })
-      }
-      return out
-    } catch {
-      return []
+      r = await this.request('owned_roster', {}, timeoutMs)
+    } catch (error) {
+      throw new Error(`AllMyStuff fleet roster is unavailable: ${describe(error)}`, { cause: error })
     }
+    if (!r.ok) {
+      throw new Error(`AllMyStuff refused the fleet roster request: ${(r.error ?? 'unknown error').slice(0, 2_000)}`)
+    }
+    const members = (r.result as { members?: unknown } | undefined)?.members
+    if (!Array.isArray(members)) return []
+    const out: FleetMember[] = []
+    for (const raw of members) {
+      const m = raw as { device?: unknown; label?: unknown; role?: unknown }
+      if (typeof m.device !== 'string' || m.device.length === 0) continue
+      out.push({
+        device: m.device,
+        label: typeof m.label === 'string' ? m.label : '',
+        role: typeof m.role === 'string' ? m.role : undefined,
+      })
+    }
+    return out
+  }
+
+  async ownedRoster(timeoutMs = 4000): Promise<FleetMember[]> {
+    return this.ownedRosterRequired(timeoutMs).catch(() => [])
   }
 
   /**

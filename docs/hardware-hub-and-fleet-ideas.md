@@ -173,6 +173,9 @@ durable jobs, isolation, and resource attribution remain below.
 1. **Durable node runner.** Add capability inventory, target reservation, idempotent job ids, queued starts,
    progress heartbeats, cancellation, reconnect/resume, deadlines, and durable result manifests. The runner
    makes an outbound authenticated fleet connection; it does not expose a general inbound admin shell.
+   Project-owned setup recipes install reusable compiler payloads into the runner's shared read-only
+   toolchain prefix, while each OS user retains separate writable package caches. Environment inventory must
+   report provisioned paths even when a caller's original login PATH did not contain them.
 2. **Transfer and artifact plane.** Promote individual file operations into checksummed, chunked, resumable
    directory and artifact transfer with deduplication, progress/ETA, bandwidth limits, and explicit partial-
    failure reporting. Store blobs outside the journal; journal references and bounded summaries only.

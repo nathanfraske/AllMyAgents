@@ -60,7 +60,7 @@ import { NotificationService } from './notifications.js'
 import { InProcessExecutor, type Executor } from './executor.js'
 import { WorkerExecutor } from './workerExecutor.js'
 import { WorkerClient } from './workerTransport.js'
-import { buildFleet, probeHubHealth } from './fleet.js'
+import { buildFleet, probeHubRoute } from './fleet.js'
 import {
   DeviceExecutor,
   FleetConnectionStore,
@@ -1125,22 +1125,75 @@ const fleetConnections = new FleetConnectionStore(path.join(dataDir, 'fleet-conn
 // Keep the bridge allocated so a runtime enable can start it, but never register while mesh is disabled.
 const directMesh = new MyOwnMeshRpcBridge()
 const remoteDevices = new RemoteDeviceController(fleetConnections, async (siteId) => {
+  const canonical = (value: string): string => value.split('-', 1)[0]!.toLowerCase()
+  const wanted = canonical(siteId)
+  const directStatus = directMesh.status()
+  const directDiagnostic = directStatus.available
+    ? undefined
+    : directStatus.reason === 'permission-denied'
+      ? 'The direct MyOwnMesh lane is also unavailable because its control pipe denied this user read/write access; the MyOwnMesh/AllMyStuff service owner must grant the interactive console user full duplex access.'
+      : directStatus.reason === 'control-error'
+        ? `The direct MyOwnMesh lane is also unavailable: ${directStatus.error ?? 'control request failed'}`
+        : undefined
+  const withDirectDiagnostic = (message: string): string => directDiagnostic ? `${message} ${directDiagnostic}` : message
   const local = mesh.status()
+  let roster
+  try {
+    roster = await mesh.ownedRosterRequired()
+  } catch (error) {
+    return {
+      siteId,
+      label: fleetConnections.get(siteId)?.label ?? siteId.slice(0, 8),
+      baseUrl: '',
+      online: false,
+      failureCode: 'fleet-control-unavailable',
+      error: withDirectDiagnostic(error instanceof Error ? error.message : String(error)),
+    }
+  }
+  const member = roster.find((candidate) => canonical(candidate.device) === wanted)
+  if (!member) {
+    return {
+      siteId,
+      label: fleetConnections.get(siteId)?.label ?? siteId.slice(0, 8),
+      baseUrl: '',
+      online: false,
+      failureCode: 'not-in-fleet-roster',
+      error: withDirectDiagnostic('This paired device is not present in the signed AllMyStuff fleet roster.'),
+    }
+  }
   const fleet = await buildFleet({
     localSiteId: local.siteId,
     localLabel: local.label,
     localBaseUrl: `http://127.0.0.1:${local.port}`,
-    roster: () => mesh.ownedRoster(),
+    roster: async () => roster,
     peerSites: () => mesh.peerSites(),
     siteMap: (node, port) => mesh.siteMap(node, port),
     recoverSiteMap: (node, port) => mesh.recoverSiteMap(node, port),
-    probeHealth: (baseUrl) => probeHubHealth(baseUrl, 5000),
+    probeRoute: (baseUrl) => probeHubRoute(baseUrl, 5000),
+    // A paired device is already an exact target, so its well-known hub port is a safe compatibility
+    // fallback when presence has temporarily lost the site advert. Never apply this across the roster.
+    hubPort: 7777,
+    targetDeviceId: siteId,
     extraPorts: meshPeerPorts,
   })
-  const route = fleet.find((site) => !site.local && site.siteId === siteId)
+  const route = fleet.find((site) => !site.local && canonical(site.siteId) === wanted)
   return route
-    ? { siteId: route.siteId, label: route.label, baseUrl: route.baseUrl, online: route.online }
-    : null
+    ? {
+        siteId: route.siteId,
+        label: route.label,
+        baseUrl: route.baseUrl,
+        online: route.online,
+        ...(route.routeCode ? { failureCode: route.routeCode } : {}),
+        ...(!route.online && route.routeError ? { error: withDirectDiagnostic(route.routeError) } : {}),
+      }
+    : {
+        siteId: member.device,
+        label: member.label || fleetConnections.get(siteId)?.label || siteId.slice(0, 8),
+        baseUrl: '',
+        online: false,
+        failureCode: 'site-route-unavailable',
+        error: withDirectDiagnostic('The signed fleet member has no usable advertised or well-known AllMyAgents Site route.'),
+      }
 }, { bridge: directMesh, localDeviceToken: deviceToken, enabled: () => mesh.status().enabled })
 sessions.setRemoteDeviceController(remoteDevices)
 
@@ -1156,7 +1209,7 @@ const testbedDeployment = fs.existsSync(path.join(testbedBundleDir, 'manifest.js
       bundleDir: testbedBundleDir,
       directMesh,
       remoteDevices,
-      ownedRoster: () => mesh.ownedRoster(),
+      ownedRoster: () => mesh.ownedRosterRequired(),
       emit: (event) => journal.append(null, `testbed/deployment-${event.stage}`, event),
     })
   : undefined

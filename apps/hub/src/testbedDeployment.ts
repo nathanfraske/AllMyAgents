@@ -340,6 +340,19 @@ export class TestbedDeploymentService {
       this.deps.ownedRoster(),
       this.deps.directMesh.peers(true),
     ])
+    const directStatus = typeof this.deps.directMesh.status === 'function'
+      ? this.deps.directMesh.status()
+      : undefined
+    if (
+      peers.length === 0 &&
+      directStatus?.available === false &&
+      (directStatus.reason === 'permission-denied' || directStatus.reason === 'control-error')
+    ) {
+      const explanation = directStatus.reason === 'permission-denied'
+        ? 'the MyOwnMesh control pipe denied the interactive user read/write access; its service owner must grant that user full-duplex access'
+        : directStatus.error ?? 'the MyOwnMesh control request failed'
+      throw new Error(`Testbed target discovery is degraded, not empty: ${explanation}.`)
+    }
     const owned = new Set(roster.map((member) => canonical(member.device)).filter(Boolean))
     const paired = new Set(this.deps.remoteDevices.listConnections().map((connection) => canonical(connection.siteId)))
     return peers

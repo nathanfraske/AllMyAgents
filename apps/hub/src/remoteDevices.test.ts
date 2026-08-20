@@ -16,6 +16,8 @@ import {
   effectiveRemoteCommandTimeout,
   parseRemoteWslEnvironments,
   remoteCapabilityForAction,
+  testbedCommandEnvironment,
+  testbedToolchainSearchPaths,
   wslUncPath,
   type DeviceExecutorCapabilities,
 } from './remoteDevices.js'
@@ -26,6 +28,42 @@ describe('remote command timeout policy', () => {
     expect(effectiveRemoteCommandTimeout(3_600_000, { durableRunId: 'run-1' })).toBe(3_600_000)
     expect(effectiveRemoteCommandTimeout(24 * 60 * 60_000, { durableRunId: 'run-1' }))
       .toBe(MAX_DURABLE_COMMAND_TIMEOUT_MS)
+  })
+})
+
+describe('shared testbed toolchain environment', () => {
+  it('shares compiler payloads without sharing writable Cargo state', () => {
+    const env = testbedCommandEnvironment({
+      ALLMYAGENTS_REMOTE_TESTBED: '1',
+      PATH: '/usr/bin:/bin',
+      CARGO_HOME: '/home/runner/.cargo',
+    }, 'linux', '/home/runner')
+    expect(env.ALLMYAGENTS_TOOLCHAIN_HOME).toBe('/opt/allmyagents-toolchains')
+    expect(env.RUSTUP_HOME).toBe('/opt/allmyagents-toolchains/rustup')
+    expect(env.CARGO_HOME).toBe('/home/runner/.cargo')
+    expect(env.CARGO_INSTALL_ROOT).toBe('/opt/allmyagents-toolchains')
+    expect(env.PATH?.split(':')).toEqual(expect.arrayContaining([
+      '/opt/allmyagents-toolchains/bin',
+      '/home/runner/.cargo/bin',
+      '/usr/bin',
+      '/bin',
+    ]))
+  })
+
+  it('keeps the verified legacy RISC-V shared prefix discoverable', () => {
+    const search = testbedToolchainSearchPaths({
+      ALLMYAGENTS_REMOTE_TESTBED: '1',
+      RUSTUP_HOME: '/opt/rust',
+    }, '/root', 'linux')
+    expect(search).toEqual(expect.arrayContaining([
+      '/opt/allmyagents-toolchains/bin',
+      '/root/.cargo/bin',
+    ]))
+    expect(testbedCommandEnvironment({
+      ALLMYAGENTS_REMOTE_TESTBED: '1',
+      RUSTUP_HOME: '/opt/rust',
+      PATH: '/usr/bin',
+    }, 'linux', '/root').RUSTUP_HOME).toBe('/opt/rust')
   })
 })
 
@@ -186,6 +224,24 @@ describe('DeviceExecutor target policy', () => {
     expect(result).toMatchObject({ ok: true, exitCode: 0, timedOut: false })
     expect(result.stdout).toContain('remote-ok')
   }, 75_000)
+
+  it('reports executable paths and provenance instead of only shell booleans', async () => {
+    const dir = tempDir()
+    const root = path.join(dir, 'root')
+    fs.mkdirSync(root)
+    const executor = new DeviceExecutor(path.join(dir, 'policy.json'))
+    const policy = executor.update({
+      enabled: true,
+      roots: [{ id: '', label: 'inventory', path: root, read: true, write: false, terminal: false }],
+    })
+    await expect(executor.execute({ op: 'inspect', rootId: policy.roots[0]!.id })).resolves.toMatchObject({
+      ok: true,
+      environment: {
+        tools: { node: true },
+        toolDetails: { node: { available: true, path: expect.any(String), source: expect.any(String) } },
+      },
+    })
+  })
 
   it('classifies a command deadline as a timeout rather than a target failure', async () => {
     const dir = tempDir()
@@ -369,6 +425,33 @@ describe('RemoteDeviceController', () => {
     expect(controller.saveConnection({ siteId: 'peer', label: 'Peer', token }).changed).toBe(true)
     expect(controller.saveConnection({ siteId: 'peer', label: 'Peer', token }).changed).toBe(false)
     expect(controller.saveConnection({ siteId: 'peer', label: 'Renamed', token }).changed).toBe(true)
+  })
+
+  it('surfaces the exact route diagnosis and code instead of collapsing every failure to offline', async () => {
+    const dir = tempDir()
+    const connections = new FleetConnectionStore(path.join(dir, 'connections.json'))
+    connections.upsert({ siteId: 'peer', label: 'Peer', token: 'r'.repeat(64) })
+    const controller = new RemoteDeviceController(connections, async () => ({
+      siteId: 'peer',
+      label: 'Peer',
+      baseUrl: '',
+      online: false,
+      failureCode: 'hub-unhealthy',
+      error: 'The mapped peer hub answered /api/health with HTTP 503, so the hub is unhealthy.',
+    }))
+
+    await expect(controller.catalog()).resolves.toMatchObject([{
+      siteId: 'peer',
+      connected: false,
+      error: expect.stringMatching(/HTTP 503.*unhealthy/u),
+    }])
+    await expect(controller.execute('peer', {
+      op: 'probe', rootId: 'root-one',
+    }, { sessionId: 'session-a', profileId: 'profile-a' })).resolves.toMatchObject({
+      ok: false,
+      failure: { stage: 'route', code: 'hub-unhealthy' },
+      error: expect.stringMatching(/HTTP 503.*unhealthy/u),
+    })
   })
 
   it('uses the authenticated Site-free RPC lane for granted capabilities and actions', async () => {

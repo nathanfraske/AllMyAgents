@@ -179,6 +179,92 @@ describe('remote testbed attribution', () => {
     expect(hub.reservations.listProject(hub.project.id)).toEqual([])
   })
 
+  it('attaches a granted matching checkout on first preparation without a second operator mutation', async () => {
+    const hub = build()
+    expect(hub.projects.removeReplica(hub.project.id, hub.replica.id)).toBe(true)
+    const primaryHead = execFileSync('git', ['-C', hub.projects.get(hub.project.id)!.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+    const targetGit = {
+      status: 'ready' as const,
+      gitAvailable: true,
+      isRepository: true,
+      complete: true,
+      clean: true,
+      detached: false,
+      headCommit: primaryHead,
+      headRef: 'main',
+      repository: 'github.com/acme/testbed-project',
+      observedAt: new Date().toISOString(),
+    }
+    const execute = vi.fn(async (_siteId: string, action: RemoteDeviceAction): Promise<RemoteDeviceActionResult> => {
+      if (action.op === 'git_inspect') return { ok: true, git: targetGit }
+      expect(action).toMatchObject({ op: 'git_sync', rootId: 'root-a', headCommit: primaryHead })
+      return { ok: true, git: { ...targetGit, detached: true } }
+    })
+    hub.sessions.setRemoteDeviceController({
+      capabilities: async () => ({
+        enabled: true,
+        platform: 'linux',
+        arch: 'x64',
+        hostname: 'device-a',
+        environments: [],
+        roots: [{ id: 'root-a', label: 'Project checkout', path: '/srv/project', read: true, write: true, terminal: true }],
+      }),
+      listConnections: () => [{ siteId: 'site-a', label: 'Device A', token: 'redacted', pairedAt: new Date().toISOString() }],
+      execute,
+    } as unknown as RemoteDeviceController)
+    const privateApi = hub.sessions as unknown as {
+      remotePrepareProjectLocation(sessionId: string, siteId: string, rootId: string): Promise<RemoteDeviceActionResult>
+    }
+
+    await expect(privateApi.remotePrepareProjectLocation('agent-a', 'site-a', 'root-a')).resolves.toMatchObject({
+      ok: true,
+      git: { headCommit: primaryHead },
+    })
+    expect(execute.mock.calls.map((call) => call[1].op)).toEqual(['git_inspect', 'git_sync'])
+    expect(hub.projects.findRemoteReplica(hub.project.id, 'site-a', 'root-a')).toMatchObject({ path: '/srv/project' })
+    expect(hub.journal.eventsForSession('agent-a').events.map((event) => event.kind)).toContain(
+      'project/replica-attached-from-grant',
+    )
+  })
+
+  it('keeps a granted generic machine root usable without mislabelling it as project source', async () => {
+    const hub = build()
+    expect(hub.projects.removeReplica(hub.project.id, hub.replica.id)).toBe(true)
+    const execute = vi.fn(async (): Promise<RemoteDeviceActionResult> => ({
+      ok: true,
+      git: {
+        status: 'not-repository', gitAvailable: true, isRepository: false, complete: true,
+        observedAt: new Date().toISOString(),
+      },
+    }))
+    hub.sessions.setRemoteDeviceController({
+      capabilities: async () => ({
+        enabled: true,
+        platform: 'win32',
+        arch: 'x64',
+        hostname: 'laptop',
+        environments: [],
+        roots: [{
+          id: 'root-a', label: 'home (Ubuntu-24.04)', path: '/home',
+          environment: { kind: 'wsl', distro: 'Ubuntu-24.04' }, read: true, write: true, terminal: true,
+        }],
+      }),
+      listConnections: () => [{ siteId: 'site-a', label: 'Laptop', token: 'redacted', pairedAt: new Date().toISOString() }],
+      execute,
+    } as unknown as RemoteDeviceController)
+    const privateApi = hub.sessions as unknown as {
+      remotePrepareProjectLocation(sessionId: string, siteId: string, rootId: string): Promise<RemoteDeviceActionResult>
+    }
+
+    await expect(privateApi.remotePrepareProjectLocation('agent-a', 'site-a', 'root-a')).resolves.toMatchObject({
+      ok: false,
+      failure: { stage: 'admission', code: 'PROJECT_CHECKOUT_REQUIRED' },
+      error: expect.stringContaining('Remote access is granted'),
+    })
+    expect(hub.projects.findRemoteReplica(hub.project.id, 'site-a', 'root-a')).toBeUndefined()
+    expect(execute).toHaveBeenCalledOnce()
+  })
+
   it('creates and completes one durable run only for an explicitly attached project root', async () => {
     const hub = build()
     expect(hub.sessions.list().find((record) => record.id === 'agent-a')?.projectReplicaId).toBe(

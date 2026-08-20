@@ -9,6 +9,7 @@ import {
   DeviceExecutor,
   FleetConnectionStore,
   RemoteDeviceController,
+  testbedToolchainSearchPaths,
   type DeviceRootPolicy,
   type RemoteDeviceAction,
   type RemoteExecutionEnvironment,
@@ -37,6 +38,8 @@ const MESSAGE_REPLAY_TTL_MS = 10 * 60 * 1000
 const PAIR_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
 const TESTBED_MODULES = ['testbedNode.js', 'deviceToken.js', 'remoteDevices.js', 'directHubProtocol.js', 'myOwnMeshRpc.js'] as const
 const TESTBED_SERVICE = 'allmyagents-testbed.service'
+const LINUX_SHARED_TOOLCHAIN_HOME = '/opt/allmyagents-toolchains'
+const LINUX_TOOLCHAIN_PROFILE = '/etc/profile.d/allmyagents-toolchains.sh'
 
 function atomicJson(file: string, value: unknown): void {
   fs.mkdirSync(path.dirname(file), { recursive: true })
@@ -578,6 +581,108 @@ function linuxServiceUser(profile: TestbedNodeProfile): string {
   return profile === 'linux-sudo-machine' ? 'allmyagents-testbed' : 'root'
 }
 
+function linuxServiceHome(profile: TestbedNodeProfile, dataDir: string): string {
+  return profile === 'linux-sudo-machine' ? dataDir : '/root'
+}
+
+function populatedRustupHome(candidate: string): boolean {
+  try { return fs.statSync(path.posix.join(candidate, 'toolchains')).isDirectory() } catch { return false }
+}
+
+function reconcilePrivateRustupHome(serviceHome: string, preferred: string): void {
+  const privateHome = path.posix.join(serviceHome, '.rustup')
+  if (!populatedRustupHome(privateHome) || fs.lstatSync(privateHome).isSymbolicLink()) return
+  try {
+    if (fs.existsSync(preferred) && fs.readdirSync(preferred).length === 0) fs.rmdirSync(preferred)
+    fs.mkdirSync(path.posix.dirname(preferred), { recursive: true, mode: 0o755 })
+    fs.renameSync(privateHome, preferred)
+    try { fs.symlinkSync(preferred, privateHome, 'dir') } catch { /* Explicit service/profile state still points at the durable copy. */ }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EXDEV') throw error
+    // A separately-mounted /opt cannot accept an atomic rename. Copy and verify the complete toolchain,
+    // then leave the private original untouched as a rollback rather than deleting it speculatively.
+    fs.cpSync(privateHome, preferred, { recursive: true, errorOnExist: true, preserveTimestamps: true })
+    if (!populatedRustupHome(preferred)) throw new Error('shared Rust toolchain copy did not contain a toolchains directory')
+  }
+}
+
+function detectLinuxRustupHome(serviceHome: string): string {
+  const preferred = path.posix.join(LINUX_SHARED_TOOLCHAIN_HOME, 'rustup')
+  if (populatedRustupHome(preferred)) return preferred
+  // Compatibility with the first RISC-V testbed repair. Do not strand its verified compiler by
+  // switching RUSTUP_HOME to a newly-created empty directory during a payload/service update.
+  if (populatedRustupHome('/opt/rust')) return '/opt/rust'
+  reconcilePrivateRustupHome(serviceHome, preferred)
+  return preferred
+}
+
+export function renderLinuxToolchainProfile(input: { toolchainHome: string; rustupHome: string }): string {
+  const shellValue = (value: string): string => {
+    if (/\r|\n|\0/u.test(value)) throw new Error('toolchain path contains control characters')
+    return `'${value.replaceAll("'", `'\"'\"'`)}'`
+  }
+  const toolchainHome = shellValue(input.toolchainHome)
+  const rustupHome = shellValue(input.rustupHome)
+  return [
+    '# AllMyAgents testbed: shared compiler payload; writable package caches remain per user.',
+    `export ALLMYAGENTS_TOOLCHAIN_HOME=${toolchainHome}`,
+    `export RUSTUP_HOME=${rustupHome}`,
+    'ama_toolchain_path="$ALLMYAGENTS_TOOLCHAIN_HOME/bin"',
+    'for ama_toolchain_bin in "$RUSTUP_HOME"/toolchains/*/bin; do',
+    '  [ -d "$ama_toolchain_bin" ] && ama_toolchain_path="$ama_toolchain_path:$ama_toolchain_bin"',
+    'done',
+    'PATH="$ama_toolchain_path:$PATH"',
+    'export PATH',
+    'unset ama_toolchain_path ama_toolchain_bin',
+    '',
+  ].join('\n')
+}
+
+function ensureLinuxToolchainEnvironment(profile: TestbedNodeProfile, dataDir: string): {
+  toolchainHome: string
+  rustupHome: string
+  commandPath: string
+} {
+  const home = linuxServiceHome(profile, dataDir)
+  const rustupHome = detectLinuxRustupHome(home)
+  fs.mkdirSync(path.posix.join(LINUX_SHARED_TOOLCHAIN_HOME, 'bin'), { recursive: true, mode: 0o755 })
+  fs.mkdirSync(rustupHome, { recursive: true, mode: 0o755 })
+  fs.chmodSync(LINUX_SHARED_TOOLCHAIN_HOME, 0o755)
+  fs.chmodSync(path.posix.join(LINUX_SHARED_TOOLCHAIN_HOME, 'bin'), 0o755)
+  fs.chmodSync(rustupHome, 0o755)
+  const readabilityMarker = path.posix.join(rustupHome, '.allmyagents-shared-readable-v1')
+  if (!fs.existsSync(readabilityMarker)) {
+    execFileSync('chmod', ['-R', 'a+rX', rustupHome], { stdio: 'pipe' })
+    fs.writeFileSync(readabilityMarker, 'Shared compiler payload; writable package caches remain per user.\n', { mode: 0o644 })
+  }
+  fs.mkdirSync(path.posix.dirname(LINUX_TOOLCHAIN_PROFILE), { recursive: true })
+  fs.writeFileSync(LINUX_TOOLCHAIN_PROFILE, renderLinuxToolchainProfile({
+    toolchainHome: LINUX_SHARED_TOOLCHAIN_HOME,
+    rustupHome,
+  }), { mode: 0o644 })
+  fs.chmodSync(LINUX_TOOLCHAIN_PROFILE, 0o644)
+  const serviceUser = linuxServiceUser(profile)
+  if (profile === 'linux-sudo-machine' && rustupHome.startsWith(`${LINUX_SHARED_TOOLCHAIN_HOME}/`)) {
+    execFileSync('chown', [
+      `${serviceUser}:${serviceUser}`,
+      LINUX_SHARED_TOOLCHAIN_HOME,
+      path.posix.join(LINUX_SHARED_TOOLCHAIN_HOME, 'bin'),
+      rustupHome,
+    ], { stdio: 'pipe' })
+  }
+  const search = testbedToolchainSearchPaths({
+    ALLMYAGENTS_REMOTE_TESTBED: '1',
+    ALLMYAGENTS_TOOLCHAIN_HOME: LINUX_SHARED_TOOLCHAIN_HOME,
+    RUSTUP_HOME: rustupHome,
+  }, home, 'linux')
+  const standard = ['/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin']
+  return {
+    toolchainHome: LINUX_SHARED_TOOLCHAIN_HOME,
+    rustupHome,
+    commandPath: [...search, ...standard].filter((value, index, all) => all.indexOf(value) === index).join(':'),
+  }
+}
+
 export function writeLinuxTestbedService(input: {
   installRoot: string
   dataDir: string
@@ -585,9 +690,10 @@ export function writeLinuxTestbedService(input: {
   socketPath?: string
 }): string {
   const socketPath = input.socketPath ?? detectMyOwnMeshSocketPath()
+  const toolchains = ensureLinuxToolchainEnvironment(input.profile, input.dataDir)
   fs.mkdirSync('/etc/systemd/system', { recursive: true })
   const serviceFile = `/etc/systemd/system/${TESTBED_SERVICE}`
-  fs.writeFileSync(serviceFile, renderLinuxTestbedService({ ...input, socketPath }), { mode: 0o644 })
+  fs.writeFileSync(serviceFile, renderLinuxTestbedService({ ...input, socketPath, ...toolchains }), { mode: 0o644 })
   return serviceFile
 }
 
@@ -596,8 +702,18 @@ export function renderLinuxTestbedService(input: {
   dataDir: string
   profile: TestbedNodeProfile
   socketPath: string
+  toolchainHome?: string
+  rustupHome?: string
+  commandPath?: string
 }): string {
   const serviceUser = linuxServiceUser(input.profile)
+  const toolchainHome = input.toolchainHome ?? LINUX_SHARED_TOOLCHAIN_HOME
+  const rustupHome = input.rustupHome ?? path.posix.join(toolchainHome, 'rustup')
+  const commandPath = input.commandPath ?? [
+    path.posix.join(toolchainHome, 'bin'),
+    path.posix.join(linuxServiceHome(input.profile, input.dataDir), '.cargo', 'bin'),
+    '/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin',
+  ].join(':')
   return [
     '[Unit]',
     'Description=AllMyAgents lightweight remote testbed',
@@ -608,7 +724,12 @@ export function renderLinuxTestbedService(input: {
     'Type=simple',
     `User=${serviceUser}`,
     `Environment=${systemdEscape(`MYOWNMESH_CONTROL_SOCKET=${input.socketPath}`)}`,
+    `Environment=${systemdEscape(`ALLMYAGENTS_TOOLCHAIN_HOME=${toolchainHome}`)}`,
+    `Environment=${systemdEscape(`RUSTUP_HOME=${rustupHome}`)}`,
+    `Environment=${systemdEscape(`CARGO_INSTALL_ROOT=${toolchainHome}`)}`,
+    `Environment=${systemdEscape(`PATH=${commandPath}`)}`,
     `ExecStart=${systemdEscape(path.join(input.installRoot, 'node'))} ${systemdEscape(path.join(input.installRoot, 'dist', 'testbedNode.js'))} run --data-dir ${systemdEscape(input.dataDir)}`,
+    'UMask=0022',
     'Restart=on-failure',
     'RestartSec=3',
     'NoNewPrivileges=false',

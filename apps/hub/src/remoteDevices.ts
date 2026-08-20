@@ -224,6 +224,12 @@ export interface RemoteEnvironmentInspection {
   cpuCount: number
   totalMemoryBytes: number
   tools: Record<string, boolean>
+  /** Bounded executable provenance. `tools` remains for compatibility with pre-inventory nodes. */
+  toolDetails?: Record<string, {
+    available: boolean
+    path?: string
+    source: 'shell' | 'shared-toolchain' | 'service-account'
+  }>
 }
 
 export interface RemoteDeviceTelemetry {
@@ -1052,12 +1058,13 @@ export class DeviceExecutor {
     }
     const cwd = this.resolveExisting(root, action.cwd, 'cwd', true)
     const timeoutMs = effectiveRemoteCommandTimeout(action.timeoutMs, actor)
+    const sourceEnvironment = testbedCommandEnvironment(process.env)
     const allowedEnvironment = new Set([
       'PATH', 'PATHEXT', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP', 'HOME', 'USERPROFILE',
-      'LANG', 'LC_ALL', 'TERM',
+      'LANG', 'LC_ALL', 'TERM', 'ALLMYAGENTS_TOOLCHAIN_HOME', 'RUSTUP_HOME', 'CARGO_INSTALL_ROOT',
     ])
     const env: NodeJS.ProcessEnv = {}
-    for (const [key, value] of Object.entries(process.env)) {
+    for (const [key, value] of Object.entries(sourceEnvironment)) {
       if (allowedEnvironment.has(key.toUpperCase())) env[key] = value
     }
     env.ALLMYAGENTS_REMOTE_TESTBED = '1'
@@ -1081,8 +1088,11 @@ export class DeviceExecutor {
       const systemdArgs = [
         '--quiet', '--wait', '--pipe', '--collect', `--unit=${unit}`,
         `--working-directory=${cwd}`, '--setenv=ALLMYAGENTS_REMOTE_TESTBED=1',
+        ...['PATH', 'ALLMYAGENTS_TOOLCHAIN_HOME', 'RUSTUP_HOME', 'CARGO_INSTALL_ROOT']
+          .flatMap((key) => env[key] ? [`--setenv=${key}=${env[key]}`] : []),
         `--property=RuntimeMaxSec=${Math.max(1, Math.ceil(timeoutMs / 1000))}s`,
         '--property=TimeoutStopSec=5s',
+        '--property=UMask=0022',
       ]
       const uid = typeof process.getuid === 'function' ? process.getuid() : 0
       if (uid === 0) {
@@ -1169,15 +1179,33 @@ export class DeviceExecutor {
   }
 
   private async inspect(root: DeviceRootPolicy): Promise<RemoteDeviceActionResult> {
-    const toolNames = ['git', 'node', 'npm', 'python3', 'docker', 'gcc', 'make'] as const
+    const toolNames = ['git', 'node', 'npm', 'python3', 'docker', 'gcc', 'make', 'rustc', 'cargo', 'rustup', 'just', 'pnpm', 'zig', 'cmake'] as const
     if (root.environment?.kind !== 'wsl') {
       const program = process.platform === 'win32' ? 'where.exe' : '/bin/sh'
-      const tools = Object.fromEntries(toolNames.map((tool) => {
+      const searchPaths = testbedToolchainSearchPaths()
+      const toolDetails = Object.fromEntries(toolNames.map((tool) => {
         const checked = process.platform === 'win32'
-          ? spawnSync(program, [tool], { windowsHide: true, stdio: 'ignore', timeout: 2_000 })
-          : spawnSync(program, ['-c', `command -v ${tool}`], { windowsHide: true, stdio: 'ignore', timeout: 2_000 })
-        return [tool, checked.status === 0]
+          ? spawnSync(program, [tool], { windowsHide: true, encoding: 'utf8', timeout: 2_000 })
+          : spawnSync(program, ['-c', `command -v ${tool}`], { windowsHide: true, encoding: 'utf8', timeout: 2_000 })
+        let executable = checked.status === 0 ? decodeProcessOutput(checked.stdout).split(/\r?\n/u)[0]?.trim() : undefined
+        let source: 'shell' | 'shared-toolchain' | 'service-account' = 'shell'
+        if (!executable && process.platform === 'linux') {
+          executable = searchPaths.map((directory) => path.posix.join(directory, tool)).find((candidate) => {
+            try { fs.accessSync(candidate, fs.constants.R_OK | fs.constants.X_OK); return fs.statSync(candidate).isFile() } catch { return false }
+          })
+        }
+        if (executable && process.platform === 'linux') {
+          const normalized = path.posix.normalize(executable)
+          if (normalized.startsWith('/opt/allmyagents-toolchains/') || normalized.startsWith('/opt/rust/')) source = 'shared-toolchain'
+          else if (normalized.startsWith(`${path.posix.normalize(os.homedir())}/.cargo/`)) source = 'service-account'
+        }
+        return [tool, {
+          available: Boolean(executable),
+          ...(executable ? { path: executable } : {}),
+          source,
+        }]
       }))
+      const tools = Object.fromEntries(Object.entries(toolDetails).map(([tool, detail]) => [tool, detail.available]))
       return {
         ok: true,
         environment: {
@@ -1192,6 +1220,7 @@ export class DeviceExecutor {
           cpuCount: typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length,
           totalMemoryBytes: os.totalmem(),
           tools,
+          toolDetails,
         },
       }
     }
@@ -1202,7 +1231,7 @@ export class DeviceExecutor {
       'printf "RELEASE\\t%s\\n" "$(uname -sr)"',
       'printf "CPU\\t%s\\n" "$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf 0)"',
       'printf "MEM\\t%s\\n" "$(awk \'/MemTotal/{print $2 * 1024}\' /proc/meminfo 2>/dev/null || printf 0)"',
-      ...toolNames.map((tool) => `command -v ${tool} >/dev/null 2>&1 && printf "TOOL\\t${tool}\\t1\\n" || printf "TOOL\\t${tool}\\t0\\n"`),
+      ...toolNames.map((tool) => `ama_tool="$(command -v ${tool} 2>/dev/null || true)"; if [ -n "$ama_tool" ]; then printf "TOOL\\t${tool}\\t1\\t%s\\n" "$ama_tool"; else printf "TOOL\\t${tool}\\t0\\t\\n"; fi`),
     ].join('; ')
     const result = spawnSync('wsl.exe', ['--distribution', distro, '--exec', '/bin/sh', '-c', script], {
       windowsHide: true,
@@ -1215,9 +1244,13 @@ export class DeviceExecutor {
     }
     const values = new Map<string, string>()
     const tools: Record<string, boolean> = {}
+    const toolDetails: NonNullable<RemoteEnvironmentInspection['toolDetails']> = {}
     for (const line of decodeProcessOutput(result.stdout).split(/\r?\n/u)) {
-      const [key, name, value] = line.split('\t')
-      if (key === 'TOOL' && name) tools[name] = value === '1'
+      const [key, name, value, executable] = line.split('\t')
+      if (key === 'TOOL' && name) {
+        tools[name] = value === '1'
+        toolDetails[name] = { available: value === '1', ...(executable ? { path: executable } : {}), source: 'shell' }
+      }
       else if (key && name !== undefined) values.set(key, name)
     }
     return {
@@ -1234,6 +1267,7 @@ export class DeviceExecutor {
         cpuCount: Number(values.get('CPU')) || 0,
         totalMemoryBytes: Number(values.get('MEM')) || 0,
         tools,
+        toolDetails,
       },
     }
   }
@@ -1268,6 +1302,81 @@ export interface RemoteDeviceRoute {
   label: string
   baseUrl: string
   online: boolean
+  /** Bounded diagnosis from signed-roster, Site-map, and health-probe resolution. */
+  error?: string
+  failureCode?: string
+}
+
+const DEFAULT_TESTBED_TOOLCHAIN_HOME = '/opt/allmyagents-toolchains'
+
+function boundedAbsoluteLinuxPath(value: string | undefined): string | undefined {
+  const candidate = value?.trim()
+  if (!candidate || candidate.length > 4096 || !path.posix.isAbsolute(candidate) || /[\r\n\0]/u.test(candidate)) return undefined
+  return path.posix.normalize(candidate)
+}
+
+/**
+ * Return executable directories owned by the lightweight runner contract. The shared compiler payload is
+ * deliberately separate from writable per-user package caches such as CARGO_HOME. `/opt/rust` is retained
+ * as a compatibility location for nodes repaired before the shared-prefix contract shipped.
+ */
+export function testbedToolchainSearchPaths(
+  env: NodeJS.ProcessEnv = process.env,
+  home = os.homedir(),
+  platform: NodeJS.Platform = process.platform,
+): string[] {
+  if (platform !== 'linux') return []
+  const configured = boundedAbsoluteLinuxPath(env.ALLMYAGENTS_TOOLCHAIN_HOME)
+  const enabled = env.ALLMYAGENTS_REMOTE_TESTBED === '1' || configured !== undefined
+  const sharedHome = configured ?? (enabled ? DEFAULT_TESTBED_TOOLCHAIN_HOME : undefined)
+  const rustupHomes = [
+    boundedAbsoluteLinuxPath(env.RUSTUP_HOME),
+    sharedHome ? path.posix.join(sharedHome, 'rustup') : undefined,
+    '/opt/rust',
+  ].filter((value): value is string => Boolean(value))
+  const candidates = [
+    ...(sharedHome ? [path.posix.join(sharedHome, 'bin')] : []),
+    ...(enabled ? [path.posix.join(home, '.cargo', 'bin')] : []),
+  ]
+  for (const rustupHome of [...new Set(rustupHomes)]) {
+    const toolchains = path.posix.join(rustupHome, 'toolchains')
+    let names: string[] = []
+    try { names = fs.readdirSync(toolchains).sort((left, right) => right.localeCompare(left)) } catch { /* not provisioned */ }
+    for (const name of names) {
+      if (!name || name === '.' || name === '..' || name.includes('/') || name.includes('\\')) continue
+      const bin = path.posix.join(toolchains, name, 'bin')
+      try { if (fs.statSync(bin).isDirectory()) candidates.push(bin) } catch { /* incomplete toolchain */ }
+    }
+  }
+  return [...new Set(candidates)]
+}
+
+/** Environment inherited by remote commands. It never sets CARGO_HOME, npm caches, or registry paths. */
+export function testbedCommandEnvironment(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+  home = os.homedir(),
+): NodeJS.ProcessEnv {
+  if (platform !== 'linux') return { ...env }
+  const configured = boundedAbsoluteLinuxPath(env.ALLMYAGENTS_TOOLCHAIN_HOME)
+  const enabled = env.ALLMYAGENTS_REMOTE_TESTBED === '1' || configured !== undefined
+  if (!enabled) return { ...env }
+  const sharedHome = configured ?? DEFAULT_TESTBED_TOOLCHAIN_HOME
+  const rustupHome = boundedAbsoluteLinuxPath(env.RUSTUP_HOME) ?? path.posix.join(sharedHome, 'rustup')
+  const paths = testbedToolchainSearchPaths(
+    { ...env, ALLMYAGENTS_TOOLCHAIN_HOME: sharedHome, RUSTUP_HOME: rustupHome },
+    home,
+    platform,
+  )
+  const existingPath = env.PATH ?? '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+  return {
+    ...env,
+    ALLMYAGENTS_TOOLCHAIN_HOME: sharedHome,
+    RUSTUP_HOME: rustupHome,
+    // Reusable CLI binaries are shared; Cargo registries, source caches, and credentials are not.
+    CARGO_INSTALL_ROOT: sharedHome,
+    PATH: [...paths, ...existingPath.split(':')].filter(Boolean).filter((value, index, all) => all.indexOf(value) === index).join(':'),
+  }
 }
 
 async function boundedJson(response: Response, onBytes?: (bytes: number) => void): Promise<unknown> {
@@ -1517,7 +1626,7 @@ export class RemoteDeviceController {
         ...connection,
         online: route?.online === true,
         transport: 'site' as const,
-        ...(!route?.online ? { error: 'No live direct RPC peer or Site route.' } : {}),
+        ...(!route?.online ? { error: route?.error ?? 'No live direct RPC peer or Site route.' } : {}),
       }
     }))
   }
@@ -1591,7 +1700,11 @@ export class RemoteDeviceController {
     telemetry.routeMs = Math.round((performance.now() - routeStarted) * 10) / 10
     if (!route?.online) {
       telemetry.roundTripMs = Math.round((performance.now() - started) * 10) / 10
-      throw new RemoteRequestError('The remote device route is offline.', { stage: 'route' }, telemetry)
+      throw new RemoteRequestError(
+        route?.error ?? 'The remote device route is offline.',
+        { stage: 'route', ...(route?.failureCode ? { code: route.failureCode } : {}) },
+        telemetry,
+      )
     }
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)

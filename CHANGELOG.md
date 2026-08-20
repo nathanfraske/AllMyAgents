@@ -5,6 +5,25 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.29-alpha.33 — 2026-08-20
+
+This release keeps long-lived Codex managers from crashing the shared worker, makes granted remote checkouts usable
+without a second hidden project mutation, restores healthy paired Site routes, and makes testbed toolchains visible
+to both the service and ordinary device logins.
+
+[Full v0.1.29-alpha.33 release notes](docs/releases/v0.1.29-alpha.33.md)
+
+- Codex resumes no longer serialize the provider's duplicate full turn history into one unbounded line. A bounded
+  byte-framed reader contains malformed or oversized provider output to that provider process instead of killing
+  the shared worker and interrupting unrelated turns.
+- An exact manager/device grant can automatically register an already-clean matching project checkout on first
+  preparation. Generic roots such as WSL `/home` remain immediately valid run targets and are no longer described
+  as missing grants, but they are never mislabeled as source checkouts.
+- Signed-fleet Site discovery probes the mapped `/api/health` route, repairs a stale mapping once, and preserves
+  distinct roster, mapping, listener, unhealthy-hub, timeout, and control-plane diagnostics.
+- Linux testbeds expose shared compiler payloads under a stable system prefix while retaining writable user caches
+  per account; environment inspection reports each tool's resolved path and source.
+
 ## v0.1.28-alpha.32 — 2026-08-15
 
 This release makes cold conversation history responsive and truthful, keeps long remote durable jobs alive for

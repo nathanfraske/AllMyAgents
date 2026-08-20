@@ -222,7 +222,13 @@ in two distributions is never treated as the same authority.
 
 Agents see host and WSL environments as separate execution targets. Inspection runs inside the selected
 environment, allowing the agent to learn that environment's distribution release, architecture, shell,
-resources, and installed toolchain before choosing a command. WSL terminal grants carry the same warning
+resources, and installed toolchain before choosing a command. Lightweight Linux nodes report the resolved
+path and source of each developer tool as well as its availability. System-installed testbeds reserve
+`/opt/allmyagents-toolchains` for shared, world-readable compiler payloads and expose it to ordinary logins;
+Rust uses a shared `RUSTUP_HOME`, while `CARGO_HOME`, registries, package caches, and other writable state
+remain per-user. Runner-owned `cargo install` recipes publish reusable CLI binaries through the separate
+shared `CARGO_INSTALL_ROOT`. Service repair recognizes the earlier `/opt/rust` layout so an update cannot hide an
+already-verified RISC-V compiler. WSL terminal grants carry the same warning
 as host terminal grants: the child process has the target operating-system account's normal authority and
 is not confined to the selected starting directory.
 
