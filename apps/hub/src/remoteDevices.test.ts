@@ -238,7 +238,7 @@ describe('DeviceExecutor target policy', () => {
       ok: true,
       environment: {
         tools: { node: true },
-        toolDetails: { node: { available: true, path: expect.any(String), source: expect.any(String) } },
+        toolDetails: { node: { available: true, path: process.execPath, source: 'runtime' } },
       },
     })
   })

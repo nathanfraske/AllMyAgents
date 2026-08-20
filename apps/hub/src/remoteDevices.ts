@@ -228,7 +228,7 @@ export interface RemoteEnvironmentInspection {
   toolDetails?: Record<string, {
     available: boolean
     path?: string
-    source: 'shell' | 'shared-toolchain' | 'service-account'
+    source: 'runtime' | 'shell' | 'shared-toolchain' | 'service-account'
   }>
 }
 
@@ -1184,11 +1184,17 @@ export class DeviceExecutor {
       const program = process.platform === 'win32' ? 'where.exe' : '/bin/sh'
       const searchPaths = testbedToolchainSearchPaths()
       const toolDetails = Object.fromEntries(toolNames.map((tool) => {
-        const checked = process.platform === 'win32'
-          ? spawnSync(program, [tool], { windowsHide: true, encoding: 'utf8', timeout: 2_000 })
-          : spawnSync(program, ['-c', `command -v ${tool}`], { windowsHide: true, encoding: 'utf8', timeout: 2_000 })
-        let executable = checked.status === 0 ? decodeProcessOutput(checked.stdout).split(/\r?\n/u)[0]?.trim() : undefined
-        let source: 'shell' | 'shared-toolchain' | 'service-account' = 'shell'
+        // This process proves that its own Node executable is usable even when a
+        // service manager or CI launcher did not put that executable on PATH.
+        // Report that exact runtime instead of incorrectly saying Node is absent.
+        let executable = tool === 'node' ? process.execPath : undefined
+        let source: 'runtime' | 'shell' | 'shared-toolchain' | 'service-account' = tool === 'node' ? 'runtime' : 'shell'
+        if (!executable) {
+          const checked = process.platform === 'win32'
+            ? spawnSync(program, [tool], { windowsHide: true, encoding: 'utf8', timeout: 2_000 })
+            : spawnSync(program, ['-c', `command -v ${tool}`], { windowsHide: true, encoding: 'utf8', timeout: 2_000 })
+          executable = checked.status === 0 ? decodeProcessOutput(checked.stdout).split(/\r?\n/u)[0]?.trim() : undefined
+        }
         if (!executable && process.platform === 'linux') {
           executable = searchPaths.map((directory) => path.posix.join(directory, tool)).find((candidate) => {
             try { fs.accessSync(candidate, fs.constants.R_OK | fs.constants.X_OK); return fs.statSync(candidate).isFile() } catch { return false }

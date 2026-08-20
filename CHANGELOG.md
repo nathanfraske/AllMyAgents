@@ -22,7 +22,8 @@ to both the service and ordinary device logins.
 - Signed-fleet Site discovery probes the mapped `/api/health` route, repairs a stale mapping once, and preserves
   distinct roster, mapping, listener, unhealthy-hub, timeout, and control-plane diagnostics.
 - Linux testbeds expose shared compiler payloads under a stable system prefix while retaining writable user caches
-  per account; environment inspection reports each tool's resolved path and source.
+  per account; environment inspection reports each tool's resolved path and source, including the node's own runtime
+  when a service launcher intentionally omits Node from `PATH`.
 
 ## v0.1.28-alpha.32 — 2026-08-15
 
