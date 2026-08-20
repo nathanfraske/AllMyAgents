@@ -5,6 +5,23 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.31-alpha.35 — 2026-08-20
+
+This release repairs asymmetric fleet discovery and pairing when the direct MyOwnMesh control pipe is unavailable
+but the authenticated AllMyStuff Site tunnel is healthy.
+
+[Full v0.1.31-alpha.35 release notes](docs/releases/v0.1.31-alpha.35.md)
+
+- Same-fleet hubs now establish reciprocal credentials in one action over either the direct RPC lane or a healthy
+  Site route. The Site fallback requires signed-roster membership and proves the claimed source capability by
+  calling back to that exact fleet member before saving anything.
+- Automatic trust no longer equates a denied direct-pipe ACL with an offline fleet. One-use codes retain
+  rolling-upgrade compatibility with older peers.
+- An explicit **Refresh** may probe the conventional hub port for signed-roster peers that lost their presence
+  advert. Background polling stays advert-only, so the repair does not reintroduce route churn or idle bandwidth.
+- Reciprocal connections use the stable mesh public identity rather than an ephemeral session-suffixed id, and
+  fall back to the machine hostname when the mesh daemon has no display label.
+
 ## v0.1.30-alpha.34 — 2026-08-20
 
 This release turns an explicit device authorization into usable manager authority, keeps remote routes stable and

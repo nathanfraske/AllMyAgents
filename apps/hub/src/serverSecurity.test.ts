@@ -39,7 +39,7 @@ afterEach(async () => {
   while (cleanups.length) await cleanups.pop()?.()
 })
 
-async function build() {
+async function build(overrides: Partial<Pick<ServerOptions, 'mesh' | 'meshPeerPorts' | 'remoteDevices'>> = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-server-security-'))
   const journal = new Journal(path.join(root, 'hub.db'))
   const projects = new ProjectStore(journal.db)
@@ -121,7 +121,7 @@ async function build() {
     danger,
     prefs: { chatNamePool: 'everyone', steerMessagesAtToolBoundary: true },
     rescanProfiles: () => [profile],
-    mesh: {
+    mesh: overrides.mesh ?? {
       status: () => ({
         enabled: false,
         nodePresent: false,
@@ -133,6 +133,8 @@ async function build() {
         peerUrl: '',
       }),
     } as never,
+    ...(overrides.meshPeerPorts ? { meshPeerPorts: overrides.meshPeerPorts } : {}),
+    ...(overrides.remoteDevices ? { remoteDevices: overrides.remoteDevices } : {}),
     deviceToken,
     // The old control plane failed open in precisely this configuration.
     requireToken: false,
@@ -581,6 +583,85 @@ describe('device-authenticated control plane', () => {
     })
     expect(replay.status).toBe(401)
     await expect(replay.json()).resolves.not.toHaveProperty('token')
+  })
+
+  it('challenge-verifies and saves a reciprocal same-fleet pairing over a Site route', async () => {
+    const sourceToken = 'source-device-token-that-is-at-least-thirty-two-characters'
+    const sourceServer = http.createServer((req, res) => {
+      if (req.url === '/api/health') {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ boot: 'complete' }))
+        return
+      }
+      if (req.url === '/api/auth') {
+        const authed = req.headers.authorization === `Bearer ${sourceToken}`
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ requireToken: true, authed }))
+        return
+      }
+      res.writeHead(404).end()
+    })
+    sourceServer.listen(0, '127.0.0.1')
+    await once(sourceServer, 'listening')
+    const sourcePort = (sourceServer.address() as { port: number }).port
+    cleanups.push(async () => {
+      if (!sourceServer.listening) return
+      const closed = new Promise<void>((resolve) => sourceServer.close(() => resolve()))
+      sourceServer.closeAllConnections()
+      await closed
+    })
+    const saveConnection = vi.fn(() => ({
+      siteId: 'source-device-SESSION',
+      label: 'Source Hub',
+      updatedAt: new Date(0).toISOString(),
+      paired: true as const,
+      changed: true,
+    }))
+    const mesh = {
+      status: () => ({
+        enabled: true, nodePresent: true, exposed: true, port: 7777, label: 'Target Hub',
+        siteId: 'tcp:7777', socketPath: '', peerUrl: 'http://localhost:7777',
+      }),
+      ownedRosterRequired: vi.fn(async () => [
+        { device: 'source-device-SESSION', label: 'Source Hub', role: 'controller' },
+      ]),
+      peerSites: vi.fn(async () => []),
+      siteMap: vi.fn(async (node: string, port: number) => {
+        expect(node).toBe('source-device-SESSION')
+        expect(port).toBe(7777)
+        return sourcePort
+      }),
+      meshIdentityRequired: vi.fn(async () => ({ siteId: 'target-device-SESSION', label: 'Target Hub' })),
+    } as unknown as ServerOptions['mesh']
+    const remoteDevices = { saveConnection } as unknown as NonNullable<ServerOptions['remoteDevices']>
+    const { base, deviceToken } = await build({ mesh, remoteDevices })
+
+    const rejected = await fetch(`${base}/api/pair`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        trust: 'signed-fleet-roster',
+        source: { siteId: 'source-device-SESSION', label: 'Source Hub', token: 'x'.repeat(64) },
+      }),
+    })
+    expect(rejected.status).toBe(401)
+    expect(saveConnection).not.toHaveBeenCalled()
+
+    const paired = await fetch(`${base}/api/pair`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        trust: 'signed-fleet-roster',
+        source: { siteId: 'source-device-SESSION', label: 'Source Hub', token: sourceToken },
+      }),
+    })
+    expect(paired.status).toBe(200)
+    await expect(paired.json()).resolves.toEqual({
+      siteId: 'target-device-SESSION', label: 'Target Hub', token: deviceToken,
+    })
+    expect(saveConnection).toHaveBeenCalledWith({
+      siteId: 'source-device-SESSION', label: 'Source Hub', token: sourceToken,
+    })
   })
 
   it('authenticates recovery notices and validates idempotent exact-id dismissal', async () => {

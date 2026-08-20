@@ -162,6 +162,40 @@ describe('MeshSite registration', () => {
     await expect(mesh.ownedRoster()).resolves.toEqual([])
     await expect(mesh.ownedRosterRequired()).rejects.toThrow(/interactive console user.*full-duplex/u)
   })
+
+  it('resolves the local mesh identity through the healthy AllMyStuff control plane', async () => {
+    const request: MeshControlRequest = async (cmd) => {
+      expect(cmd).toBe('mesh_identity')
+      return {
+        ok: true,
+        result: { device_id: 'local-device-SESSION', pubkey: 'local-device', label: 'Desktop' },
+      }
+    }
+    const mesh = new MeshSite({ port: 7777, label: 'Fallback label', enable: true, controlRequest: request })
+
+    await expect(mesh.meshIdentityRequired()).resolves.toEqual({
+      siteId: 'local-device',
+      label: 'Desktop',
+    })
+  })
+
+  it('uses the signed roster machine label when the daemon identity label is empty', async () => {
+    const request: MeshControlRequest = async (cmd) => {
+      if (cmd === 'mesh_identity') {
+        return { ok: true, result: { device_id: 'local-device-SESSION', pubkey: 'local-device', label: '' } }
+      }
+      if (cmd === 'owned_roster') {
+        return { ok: true, result: { members: [{ device: 'local-device-OTHER', label: 'Nathan Desktop' }] } }
+      }
+      throw new Error(`unexpected command ${cmd}`)
+    }
+    const mesh = new MeshSite({ port: 7777, label: 'AllMyAgents', enable: true, controlRequest: request })
+
+    await expect(mesh.meshIdentityRequired()).resolves.toEqual({
+      siteId: 'local-device',
+      label: 'Nathan Desktop',
+    })
+  })
 })
 
 describe('MeshSite route recovery', () => {

@@ -920,12 +920,133 @@ export function startServer(opts: ServerOptions): http.Server {
       // A successful exchange returns the long device capability once; the short code is then dead.
       if (method === 'POST' && url.pathname === '/api/pair') {
         const body = await readBody(req)
-        const result = pairingCodes.redeem(str(body.code) ?? '')
-        if (!result.ok) {
-          json(res, { error: 'pairing code is invalid, expired, or already used' }, 401)
+        const source = body.source && typeof body.source === 'object' && !Array.isArray(body.source)
+          ? body.source as Record<string, unknown>
+          : undefined
+        // Preserve the legacy one-way code exchange byte-for-byte for mixed-version peers. New peers
+        // include their own identity/capability and receive a reciprocal credential in one operation.
+        if (!source) {
+          const result = pairingCodes.redeem(str(body.code) ?? '')
+          if (!result.ok) {
+            json(res, { error: 'pairing code is invalid, expired, or already used' }, 401)
+            return
+          }
+          json(res, { token: result.token })
           return
         }
-        json(res, { token: result.token })
+        if (!remoteDevices) {
+          json(res, { error: 'remote device controller is unavailable' }, 503)
+          return
+        }
+        const sourceSiteId = str(source.siteId)
+        const sourceLabel = str(source.label)
+        const sourceToken = str(source.token)
+        const code = str(body.code)
+        if (
+          !sourceSiteId || !sourceLabel || !sourceToken ||
+          sourceSiteId.length > 256 ||
+          sourceLabel.length > 200 ||
+          /[\u0000-\u001f\u007f]/u.test(sourceSiteId) ||
+          /[\u0000-\u001f\u007f]/u.test(sourceLabel) ||
+          sourceToken.length < 32 ||
+          sourceToken.length > 512
+        ) {
+          json(res, { error: 'pair exchange identity is malformed' }, 400)
+          return
+        }
+        let targetToken: string
+        let trust: 'one-use-code' | 'signed-fleet-roster'
+        if (code) {
+          const redeemed = pairingCodes.redeem(code)
+          if (!redeemed.ok) {
+            json(res, { error: 'pairing code is invalid, expired, or already used' }, 401)
+            return
+          }
+          targetToken = redeemed.token
+          trust = 'one-use-code'
+        } else {
+          if (body.trust !== 'signed-fleet-roster') {
+            json(res, { error: 'automatic pairing requires signed fleet trust' }, 401)
+            return
+          }
+          let owned
+          try {
+            owned = await mesh.ownedRosterRequired()
+          } catch (error) {
+            json(res, { error: error instanceof Error ? error.message : String(error) }, 503)
+            return
+          }
+          if (!rosterAuthorizesDevice(owned, sourceSiteId)) {
+            json(res, { error: 'automatic hub trust requires membership in the signed AllMyStuff fleet roster' }, 403)
+            return
+          }
+          // A Site HTTP request does not expose the cryptographic mesh peer id to the application.
+          // Bind the claimed source by routing back to that exact signed-roster member and proving its
+          // supplied device capability against `/api/auth`. This prevents an arbitrary local/web caller
+          // from poisoning another member's reciprocal credential merely by naming its fleet id.
+          const local = mesh.status()
+          const sourceFleet = await buildFleet({
+            localSiteId: local.siteId,
+            localLabel: local.label,
+            localBaseUrl: `http://127.0.0.1:${local.port}`,
+            roster: async () => owned,
+            peerSites: () => mesh.peerSites(),
+            siteMap: (node, peerPort) => mesh.siteMap(node, peerPort),
+            probeRoute: (baseUrl) => probeHubRoute(baseUrl, 5000),
+            hubPort: 7777,
+            targetDeviceId: sourceSiteId,
+            extraPorts: meshPeerPorts,
+          })
+          const canonical = (value: string): string => value.split('-', 1)[0]!.toLowerCase()
+          const sourceRoute = sourceFleet.find((site) => !site.local && canonical(site.siteId) === canonical(sourceSiteId))
+          if (!sourceRoute?.online || !sourceRoute.baseUrl) {
+            json(res, { error: sourceRoute?.routeError ?? 'The claimed fleet source hub is not reachable for trust verification.' }, 503)
+            return
+          }
+          const verifyController = new AbortController()
+          const verifyTimer = setTimeout(() => verifyController.abort(), 7500)
+          verifyTimer.unref?.()
+          try {
+            const verification = await fetch(new URL('/api/auth', sourceRoute.baseUrl), {
+              headers: { authorization: `Bearer ${sourceToken}` },
+              signal: verifyController.signal,
+            })
+            const verificationBody = await verification.json().catch(() => null) as { authed?: unknown } | null
+            if (!verification.ok || verificationBody?.authed !== true) {
+              json(res, { error: 'The claimed source hub rejected its reciprocal device capability.' }, 401)
+              return
+            }
+          } catch (error) {
+            json(res, {
+              error: verifyController.signal.aborted
+                ? 'The claimed source hub capability check timed out.'
+                : `The claimed source hub capability could not be verified: ${error instanceof Error ? error.message : String(error)}`,
+            }, 503)
+            return
+          } finally {
+            clearTimeout(verifyTimer)
+          }
+          targetToken = deviceToken
+          trust = 'signed-fleet-roster'
+        }
+        let identity
+        try {
+          identity = await mesh.meshIdentityRequired()
+        } catch (error) {
+          json(res, { error: error instanceof Error ? error.message : String(error) }, 503)
+          return
+        }
+        const reciprocal = remoteDevices.saveConnection({ siteId: sourceSiteId, label: sourceLabel, token: sourceToken })
+        if (reciprocal.changed) {
+          journal.append(null, 'fleet/connection-paired', {
+            siteId: sourceSiteId,
+            label: sourceLabel,
+            transport: 'site',
+            reciprocal: true,
+            trust,
+          })
+        }
+        json(res, { siteId: identity.siteId, label: identity.label, token: targetToken })
         return
       }
       // Public health probe — the supervisor health-checks a booting green hub with this before any
@@ -2289,6 +2410,31 @@ export function startServer(opts: ServerOptions): http.Server {
         json(res, paired)
         return
       }
+      if (method === 'POST' && url.pathname === '/api/fleet/pair-site') {
+        if (!remoteDevices || !mesh.status().enabled) {
+          json(res, { error: 'AllMyStuff Site pairing is unavailable or disabled' }, 503)
+          return
+        }
+        const body = await readBody(req)
+        const siteId = str(body.siteId)
+        const code = str(body.code)
+        if (!siteId) { json(res, { error: 'siteId is required' }, 400); return }
+        const identity = await mesh.meshIdentityRequired()
+        const paired = await remoteDevices.pairSite(siteId, {
+          siteId: identity.siteId,
+          label: identity.label,
+          token: deviceToken,
+        }, code)
+        journal.append(null, 'fleet/connection-paired', {
+          siteId: paired.siteId,
+          label: paired.label,
+          transport: 'site',
+          reciprocal: true,
+          trust: code ? 'one-use-code' : 'signed-fleet-roster',
+        })
+        json(res, paired)
+        return
+      }
       if (method === 'POST' && url.pathname === '/api/device-token/reveal') {
         json(res, { token: deviceToken })
         return
@@ -2313,7 +2459,13 @@ export function startServer(opts: ServerOptions): http.Server {
           // alive, which made every remote agent flicker offline together. Route mutation is reserved for
           // the operator's explicit Refresh action (or an actual remote operation in index.ts).
           ...(forceRouteRecovery
-            ? { recoverSiteMap: (node: string, p: number) => mesh.recoverSiteMap(node, p, 0) }
+            ? {
+                recoverSiteMap: (node: string, p: number) => mesh.recoverSiteMap(node, p, 0),
+                // Refresh is an explicit operator action, so it may probe the conventional hub port
+                // for signed-roster peers whose presence advert was lost. Background polls remain
+                // advert-only and cannot recreate the old bandwidth/route-churn problem.
+                hubPort: 7777,
+              }
             : {}),
           // A fresh route still has to negotiate before its first bytes flow. A short ordinary HTTP
           // timeout falsely marked WAN peers offline while the tunnel was healthy but settling.
