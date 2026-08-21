@@ -9,7 +9,9 @@ import {
   CLAUDE_DEFAULT_ID,
   CODEX_DEFAULT_ID,
   profileAuthEvidence,
+  profileAccountIdentity,
   readCodexProfileModelCatalog,
+  scanProfiles,
 } from './profiles.js'
 import type { Profile } from './types.js'
 
@@ -102,6 +104,58 @@ describe('profileAuthEvidence', () => {
     expect(profileAuthEvidence({ id: `${provider}-refreshable`, provider, dir }, 1_000_000)).toEqual({})
 
     fs.rmSync(dir, { recursive: true, force: true })
+  })
+})
+
+describe('profileAccountIdentity', () => {
+  const jwt = (claims: Record<string, unknown>): string =>
+    `header.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.signature`
+
+  it('projects only Claude account identity metadata and never credential material', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-claude-identity-'))
+    const dir = path.join(root, 'claude-work')
+    fs.mkdirSync(dir)
+    fs.writeFileSync(path.join(dir, '.credentials.json'), JSON.stringify({
+      claudeAiOauth: { accessToken: 'never-project-this-token', expiresAt: 4_000_000 },
+    }))
+    fs.writeFileSync(path.join(dir, '.claude.json'), JSON.stringify({
+      oauthAccount: { emailAddress: 'Owner@Example.com', accountUuid: 'account-claude-1' },
+      organization: { name: 'also-private' },
+    }))
+
+    const profiles = scanProfiles(root)
+    expect(profiles).toEqual([expect.objectContaining({
+      id: 'claude-work',
+      provider: 'claude',
+      accountEmail: 'Owner@Example.com',
+      providerAccountId: 'account-claude-1',
+    })])
+    expect(JSON.stringify(profiles)).not.toContain('never-project-this-token')
+    expect(JSON.stringify(profiles)).not.toContain('also-private')
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+
+  it('reads the Codex email from the provider token while exposing no token bytes', () => {
+    const profile = tmpProfile('codex-owner', 'codex')
+    const token = jwt({ email: 'owner@example.com', account_id: 'claim-account-id', exp: 4_000 })
+    fs.writeFileSync(path.join(profile.dir, 'auth.json'), JSON.stringify({
+      tokens: { id_token: token, access_token: 'never-project-this-access-token', account_id: 'codex-account-7' },
+    }))
+
+    const identity = profileAccountIdentity(profile)
+    expect(identity).toEqual({ accountEmail: 'owner@example.com', providerAccountId: 'codex-account-7' })
+    expect(JSON.stringify(identity)).not.toContain(token)
+    expect(JSON.stringify(identity)).not.toContain('never-project-this-access-token')
+    fs.rmSync(profile.dir, { recursive: true, force: true })
+  })
+
+  it('rejects malformed email and whitespace-bearing account identifiers', () => {
+    const profile = tmpProfile('claude-invalid', 'claude')
+    fs.writeFileSync(path.join(profile.dir, '.claude.json'), JSON.stringify({
+      oauthAccount: { emailAddress: 'not-an-email', accountUuid: 'not an opaque id' },
+    }))
+    expect(profileAccountIdentity(profile)).toEqual({})
+    fs.rmSync(profile.dir, { recursive: true, force: true })
   })
 })
 

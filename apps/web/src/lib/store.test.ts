@@ -1165,6 +1165,30 @@ describe('event batching (replay does not render frame-by-frame)', () => {
     expect(texts).toEqual(['first', 'second']) // strict FIFO, no reordering, nothing dropped
   })
 
+  it('advances past presentation-inert Codex deltas without waking reactive session activity', () => {
+    ingest(evt({ seq: 1, kind: 'session/created', sessionId: 's1', payload: rec('s1') }))
+    ingest(evt({
+      seq: 2,
+      kind: 'codex/item/commandExecution/outputDelta',
+      sessionId: 's1',
+      payload: { itemId: 'command-1', delta: 'high-rate output' },
+      ts: '2026-01-01T00:00:06.000Z',
+    }))
+    ingest(evt({
+      seq: 3,
+      kind: 'codex/item/reasoning/summaryTextDelta',
+      sessionId: 's1',
+      payload: { itemId: 'reasoning-1', delta: 'high-rate reasoning' },
+      ts: '2026-01-01T00:00:07.000Z',
+    }))
+
+    flush()
+
+    expect(store.lastSeq).toBe(3)
+    expect(store.sessions.s1?.lastActivity).toBe(rec('s1').createdAt)
+    expect(store.sessions.s1?.items).toEqual([])
+  })
+
   it('one throwing event cannot swallow the events behind it in the same batch', () => {
     ingest(evt({ seq: 1, kind: 'session/created', sessionId: 's1', payload: rec('s1') }))
     // A payload shape the handler will choke on, sandwiched between two good events.

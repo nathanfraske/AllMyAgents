@@ -17,6 +17,10 @@ export interface Profile {
   id: string
   /** Operator-facing alias. The immutable id remains the credential/session ownership key. */
   displayName?: string
+  /** Bounded, non-secret identity projected from provider-maintained account metadata. */
+  accountEmail?: string
+  /** Opaque provider account id used only to correlate the same account across trusted fleet hubs. */
+  providerAccountId?: string
   provider: Provider
   dir: string
   available?: boolean

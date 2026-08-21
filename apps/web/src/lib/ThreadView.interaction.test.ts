@@ -169,6 +169,24 @@ describe('transcript interaction boundaries', () => {
     await waitFor(() => expect(load).toHaveBeenCalledWith('interaction-session'))
   })
 
+  it('groups only the bounded live tail while older history has not been requested', () => {
+    const view = seed()
+    view.record.provider = 'claude'
+    view.journalHistoryOlderCursor = null
+    view.items = Array.from({ length: 200 }, (_, index) => ({
+      key: `live-${index}`,
+      kind: 'assistant' as const,
+      ts: `2026-07-31T00:${String(Math.floor(index / 60)).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}.000Z`,
+      text: index === 0 ? 'prefix outside the live window' : index === 199 ? 'latest live reply' : `live reply ${index}`,
+    }))
+
+    const rendered = render(ThreadView, { props: { sessionId: 'interaction-session' } })
+
+    expect(rendered.queryByText('prefix outside the live window')).toBeNull()
+    expect(rendered.getByText('latest live reply')).toBeTruthy()
+    expect(rendered.container.querySelectorAll('.stream-node')).toHaveLength(120)
+  })
+
   it('keeps the live tail rendered after older history has been reached', () => {
     const view = seed()
     view.record.provider = 'claude'

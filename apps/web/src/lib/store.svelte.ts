@@ -280,6 +280,37 @@ export interface ThreadItem {
   attachments?: AttachmentMeta[]
 }
 
+/**
+ * Find the newest matching presentation item without walking an ever-growing transcript from its
+ * oldest edge. Streaming vendor updates almost always target the item currently being produced, so a
+ * reverse scan is effectively constant-time even after a long-running app process has retained many
+ * lazy-history pages and live turns. It also prefers the current representation if a malformed legacy
+ * journal ever contains a duplicate key.
+ */
+function newestThreadItem(
+  items: readonly ThreadItem[],
+  predicate: (item: ThreadItem) => boolean,
+): ThreadItem | undefined {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index] as ThreadItem
+    if (predicate(item)) return item
+  }
+  return undefined
+}
+
+// These high-rate transport fragments are deliberately not rendered. Their corresponding completed
+// item contains the durable command/reasoning result, while agent-message deltas remain live-rendered.
+// Advancing the replay cursor still happens before this set is consulted; skipping only the reactive
+// session touch prevents invisible output streams from waking every sidebar/main-area subscriber.
+const PRESENTATION_INERT_EVENT_KINDS = new Set([
+  'codex/item/commandExecution/outputDelta',
+  'codex/subagent/item/commandExecution/outputDelta',
+  'codex/item/reasoning/summaryTextDelta',
+  'codex/subagent/item/reasoning/summaryTextDelta',
+  'codex/item/reasoning/summaryPartAdded',
+  'codex/subagent/item/reasoning/summaryPartAdded',
+])
+
 export interface SessionView {
   record: SessionRecord
   items: ThreadItem[]
@@ -2716,6 +2747,8 @@ export class HubStore {
     }
     const { seq, sessionId, kind, ts, payload } = event
 
+    if (PRESENTATION_INERT_EVENT_KINDS.has(kind)) return
+
     // Approvals + usage are re-fetched, but COALESCED: a journal replay surfaces hundreds of
     // usage/approval events in one burst, and firing refreshSideData() per event stormed the hub with
     // 500+ requests and saturated the browser's ~6-connection pool, so the roster never populated and
@@ -2747,6 +2780,8 @@ export class HubStore {
         id?: string
         provider?: 'claude' | 'codex'
         displayName?: unknown
+        accountEmail?: unknown
+        providerAccountId?: unknown
       }
       if (
         added.id &&
@@ -2761,6 +2796,12 @@ export class HubStore {
           provider: added.provider,
           ...(typeof added.displayName === 'string' && added.displayName.trim()
             ? { displayName: added.displayName }
+            : {}),
+          ...(typeof added.accountEmail === 'string' && added.accountEmail.trim()
+            ? { accountEmail: added.accountEmail }
+            : {}),
+          ...(typeof added.providerAccountId === 'string' && added.providerAccountId.trim()
+            ? { providerAccountId: added.providerAccountId }
             : {}),
         }]
       }
@@ -2891,7 +2932,7 @@ export class HubStore {
         const optimisticKey = pending?.shift()
         if (pending && pending.length === 0) delete this.suppressNextUserMsg[sessionId]
         const optimistic = optimisticKey
-          ? view.items.find((item) => item.key === optimisticKey)
+          ? newestThreadItem(view.items, (item) => item.key === optimisticKey)
           : undefined
         if (optimistic) {
           // Adopt the canonical journal identity instead of merely suppressing the echo. A later lazy
@@ -3597,7 +3638,7 @@ export class HubStore {
     if (!Array.isArray(content)) return
     for (const block of content) {
       if (block.type === 'tool_result') {
-        const item = view.items.find((i) => i.key === `tool:${block.tool_use_id}`)
+        const item = newestThreadItem(view.items, (candidate) => candidate.key === `tool:${block.tool_use_id}`)
         if (item) {
           item.toolResult = asText(block.content)
           item.toolError = block.is_error === true
@@ -3630,7 +3671,10 @@ export class HubStore {
    * belongs to a Bash tool item and agentTree only ever reads these fields off an Agent/Task spawn.
    */
   private activeCompaction(view: SessionView): ThreadItem | undefined {
-    return [...view.items].reverse().find((item) => item.kind === 'compaction' && item.status === 'started')
+    return newestThreadItem(
+      view.items,
+      (item) => item.kind === 'compaction' && item.status === 'started',
+    )
   }
 
   /**
@@ -3649,10 +3693,10 @@ export class HubStore {
     operationId?: string,
   ): ThreadItem {
     const key = operationId ? `compaction:${provider}:${operationId}` : undefined
-    let item = key ? view.items.find((candidate) => candidate.key === key) : undefined
+    let item = key ? newestThreadItem(view.items, (candidate) => candidate.key === key) : undefined
     item ??= this.activeCompaction(view)
     if (!item && status !== 'started') {
-      const latest = [...view.items].reverse().find((candidate) => candidate.kind === 'compaction')
+      const latest = newestThreadItem(view.items, (candidate) => candidate.kind === 'compaction')
       const distance = latest ? Math.abs(Date.parse(ts) - Date.parse(latest.ts)) : Number.POSITIVE_INFINITY
       if (latest && Number.isFinite(distance) && distance <= 5_000) {
         if (latest.status === status) return latest
@@ -3761,8 +3805,12 @@ export class HubStore {
     // and a handful of `stopped` notifications omit it, so the task id learned from an earlier row is the
     // fallback. Without it, a killed agent would never lose its "running" dot.
     const item =
-      (p.tool_use_id ? view.items.find((i) => i.key === `tool:${p.tool_use_id}`) : undefined) ??
-      (p.task_id ? view.items.find((i) => i.agentTaskId === p.task_id) : undefined)
+      (p.tool_use_id
+        ? newestThreadItem(view.items, (candidate) => candidate.key === `tool:${p.tool_use_id}`)
+        : undefined) ??
+      (p.task_id
+        ? newestThreadItem(view.items, (candidate) => candidate.agentTaskId === p.task_id)
+        : undefined)
     if (!item) return
 
     if (p.task_id) item.agentTaskId = p.task_id
@@ -3802,7 +3850,7 @@ export class HubStore {
     subagentType: string | undefined
   ): ThreadItem {
     const key = `tool:${agentThreadId}`
-    let spawn = view.items.find((item) => item.key === key)
+    let spawn = newestThreadItem(view.items, (item) => item.key === key)
     const currentInput =
       spawn?.toolInput && typeof spawn.toolInput === 'object'
         ? (spawn.toolInput as Record<string, unknown>)
@@ -3868,7 +3916,10 @@ export class HubStore {
         value && typeof value === 'object' && typeof (value as { status?: unknown }).status === 'string'
           ? (value as { status: string }).status
           : undefined
-      const spawn = view.items.find((candidate) => candidate.key === `tool:${agentThreadId}`)
+      const spawn = newestThreadItem(
+        view.items,
+        (candidate) => candidate.key === `tool:${agentThreadId}`,
+      )
       if (!spawn || !state) continue
       if (state === 'pendingInit' || state === 'running') {
         spawn.agentOutcome = undefined
@@ -3904,7 +3955,10 @@ export class HubStore {
   private applyCodexSubagentThreadStatus(view: SessionView, ts: string, payload: unknown): void {
     const p = payload as { agentThreadId?: string; status?: { type?: string } }
     if (!p.agentThreadId) return
-    const spawn = view.items.find((item) => item.key === `tool:${p.agentThreadId}`)
+    const spawn = newestThreadItem(
+      view.items,
+      (item) => item.key === `tool:${p.agentThreadId}`,
+    )
     if (!spawn) return
     if (p.status?.type === 'active') {
       spawn.agentOutcome = undefined
@@ -4096,7 +4150,7 @@ export class HubStore {
     agentId?: string
   ): void {
     const key = `codex:${itemId}`
-    const item = view.items.find((i) => i.key === key)
+    const item = newestThreadItem(view.items, (candidate) => candidate.key === key)
     if (item) {
       item.text = append ? (item.text ?? '') + text : text
       if (agentId) item.agentId = agentId

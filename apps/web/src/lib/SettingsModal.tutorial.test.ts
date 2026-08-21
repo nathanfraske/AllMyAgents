@@ -74,6 +74,7 @@ afterEach(() => {
   vi.useRealTimers()
   cleanup()
   store.profiles = []
+  store.fleetSites = []
   loginMocks.login.mockReset()
   loginMocks.login.mockImplementation(() => new Promise(() => {}))
   loginMocks.loginStatus.mockReset()
@@ -222,6 +223,57 @@ describe('tutorial account waiting integration', () => {
       'claude',
       'claude-signed-out',
       true,
+      expect.any(String),
+      'browser',
+      expect.anything(),
+    )
+  })
+
+  it('consolidates provider identities across devices and prepopulates a safe local login slot', async () => {
+    store.profiles = [
+      {
+        id: 'codex-local',
+        provider: 'codex',
+        available: true,
+        authStatus: 'signed_in',
+        accountEmail: 'shared@example.com',
+        providerAccountId: 'shared-account',
+      },
+      {
+        id: 'remote-hub:codex-shared',
+        provider: 'codex',
+        available: true,
+        authStatus: 'signed_in',
+        accountEmail: 'shared@example.com',
+        providerAccountId: 'shared-account',
+        siteId: 'remote-hub',
+        siteLabel: 'Nathan Beefy Laptop',
+        siteOnline: true,
+      },
+      {
+        id: 'remote-hub:claude-research',
+        provider: 'claude',
+        available: true,
+        authStatus: 'signed_in',
+        accountEmail: 'research@example.com',
+        providerAccountId: 'research-account',
+        siteId: 'remote-hub',
+        siteLabel: 'Nathan Beefy Laptop',
+        siteOnline: true,
+      },
+    ]
+    render(SettingsModal, { props: { onclose: () => {}, initialTab: 'accounts' } })
+
+    expect(screen.getAllByText('shared@example.com')).toHaveLength(1)
+    const sharedDevices = screen.getByLabelText('Devices with shared@example.com')
+    expect(within(sharedDevices).getByText('This device')).toBeTruthy()
+    expect(within(sharedDevices).getByText('Nathan Beefy Laptop')).toBeTruthy()
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Log in research@example.com on this device' }))
+    expect(loginMocks.login).toHaveBeenCalledWith(
+      'claude',
+      'claude-research',
+      false,
       expect.any(String),
       'browser',
       expect.anything(),
