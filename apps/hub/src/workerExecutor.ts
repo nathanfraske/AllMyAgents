@@ -4,6 +4,7 @@ import type { DangerFlags } from './types.js'
 import { nextReqId, type HubToWorker, type LiveSession, type RelayMethod, type WorkerSessionSpec, type WorkerToHub } from './workerProtocol.js'
 import type { AttachmentMeta } from './attachments.js'
 import type { ApprovalDecision } from './approvals.js'
+import type { ApprovalHelperEvaluation, ApprovalHelperEvaluationInput } from './approvalHelper.js'
 
 function errText(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
@@ -149,6 +150,16 @@ export class WorkerExecutor implements Executor {
       spec,
     })
     return reply.threadId
+  }
+
+  async evaluateApproval(input: ApprovalHelperEvaluationInput): Promise<ApprovalHelperEvaluation> {
+    const reply = await this.client.call<Extract<WorkerToHub, { t: 'approvalEvaluation' }>>({
+      t: 'evaluateApproval',
+      reqId: nextReqId(),
+      input,
+    })
+    if (!reply.ok || !reply.value) throw new Error(reply.error ?? 'approval helper evaluation failed')
+    return reply.value
   }
 
   async runTurn(

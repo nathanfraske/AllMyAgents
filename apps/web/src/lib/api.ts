@@ -33,9 +33,30 @@ export interface ProfileInfo {
   entitlementStatus?: 'unknown' | 'entitled' | 'denied'
   entitlementReason?: string
   entitlementCheckedAt?: string
+  /** Models advertised by this exact provider account; private preview access is never shared globally. */
+  availableModels?: ProfileModelInfo[]
+  modelCatalogUpdatedAt?: string
   siteId?: string
   siteLabel?: string
   siteOnline?: boolean
+}
+
+export interface ProfileModelInfo {
+  slug: string
+  name: string
+  description?: string
+  supportedEfforts: string[]
+  defaultEffort?: string
+  serviceTiers: Array<{ id: string; name: string }>
+  isDefault?: boolean
+}
+
+export interface ManagerApprovalHelperConfig {
+  enabled: boolean
+  profileId: string
+  model?: string
+  effort?: string
+  maxRisk: 'low' | 'medium'
 }
 
 export interface ProjectInfo {
@@ -258,6 +279,7 @@ export interface SessionRecord {
   managerOperatorTaskUpdatedAt?: string
   managerStandingInstructions?: string
   managerCanApproveChildren?: boolean
+  managerApprovalHelper?: ManagerApprovalHelperConfig
   managerPauseExhaustedAccounts?: boolean
   managerAllowWorkerSubagents?: boolean
   managerMaxSubagentsPerWorker?: number
@@ -1837,6 +1859,7 @@ export const api = {
       operatorTask?: string
       standingInstructions?: string
       canApproveChildren?: boolean
+      approvalHelper?: ManagerApprovalHelperConfig
       pauseExhaustedAccounts?: boolean
       allowWorkerSubagents?: boolean
       maxSubagentsPerWorker?: number
@@ -1851,6 +1874,9 @@ export const api = {
     }
     return routedSessionPost(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/project-manager`, {
       ...config,
+      approvalHelper: config.approvalHelper
+        ? { ...config.approvalHelper, profileId: stripProfile(config.approvalHelper.profileId) }
+        : undefined,
       allowedProfiles: config.allowedProfiles?.map(stripProfile),
       allowedModels: config.allowedModels
         ? Object.fromEntries(Object.entries(config.allowedModels).map(([profileId, models]) => [stripProfile(profileId), models]))

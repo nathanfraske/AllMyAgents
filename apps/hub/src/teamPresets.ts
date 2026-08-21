@@ -1,6 +1,6 @@
 import crypto from 'node:crypto'
 import type Database from 'better-sqlite3'
-import type { DelegatedAuthority } from './types.js'
+import type { DelegatedAuthority, ManagerApprovalHelperConfig } from './types.js'
 import { managerToolGrantCovers, normalizeManagerToolGrants } from './managerCapabilities.js'
 
 export type TeamPermissionMode = 'safe' | 'edits' | 'full'
@@ -14,6 +14,7 @@ export interface TeamPresetManager {
   maxLiveChildren: number
   parallelismTarget?: number
   canApproveChildren: boolean
+  approvalHelper?: ManagerApprovalHelperConfig
   pauseExhaustedAccounts?: boolean
   allowWorkerSubagents?: boolean
   maxSubagentsPerWorker?: number
@@ -99,6 +100,28 @@ function object(value: unknown, field: string): Record<string, unknown> {
   return value as Record<string, unknown>
 }
 
+function approvalHelper(value: unknown): ManagerApprovalHelperConfig {
+  const helper = object(value, 'preset.manager.approvalHelper')
+  if (typeof helper.enabled !== 'boolean') {
+    throw new Error('preset.manager.approvalHelper.enabled must be boolean')
+  }
+  const maxRisk = helper.maxRisk
+  if (maxRisk !== 'low' && maxRisk !== 'medium') {
+    throw new Error('preset.manager.approvalHelper.maxRisk must be low or medium')
+  }
+  return {
+    enabled: helper.enabled,
+    profileId: text(helper.profileId, 'preset.manager.approvalHelper.profileId', 256)!,
+    maxRisk,
+    ...(text(helper.model, 'preset.manager.approvalHelper.model', 160, false)
+      ? { model: text(helper.model, 'preset.manager.approvalHelper.model', 160, false) }
+      : {}),
+    ...(text(helper.effort, 'preset.manager.approvalHelper.effort', 80, false)
+      ? { effort: text(helper.effort, 'preset.manager.approvalHelper.effort', 80, false) }
+      : {}),
+  }
+}
+
 /** Strict normalization is shared by the MCP boundary, persistence, and launch path. */
 export function normalizeTeamPreset(value: unknown, existing?: TeamPreset): TeamPreset {
   const raw = object(value, 'preset')
@@ -116,6 +139,9 @@ export function normalizeTeamPreset(value: unknown, existing?: TeamPreset): Team
     maxLiveChildren: Number(rawManager.maxLiveChildren),
     parallelismTarget: Number(rawManager.parallelismTarget ?? Math.min(3, Number(rawManager.maxLiveChildren))),
     canApproveChildren: rawManager.canApproveChildren === true,
+    ...(rawManager.approvalHelper === undefined
+      ? {}
+      : { approvalHelper: approvalHelper(rawManager.approvalHelper) }),
     pauseExhaustedAccounts: rawManager.pauseExhaustedAccounts === true,
     allowWorkerSubagents: rawManager.allowWorkerSubagents === true,
     maxSubagentsPerWorker: Number(rawManager.maxSubagentsPerWorker ?? 2),

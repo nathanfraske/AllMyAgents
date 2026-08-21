@@ -608,7 +608,7 @@ export class WorkerServer {
 /** A hub→worker command carries a `reqId`; `call()` accepts exactly these and resolves on the reply. */
 type HubCommand = Extract<HubToWorker, { reqId: string }>
 /** The worker→hub replies that resolve a {@link HubCommand}, matched by `reqId`. */
-type CommandReply = Extract<WorkerToHub, { t: 'ack' | 'threadStarted' | 'codexLimits' | 'live' }>
+type CommandReply = Extract<WorkerToHub, { t: 'ack' | 'threadStarted' | 'codexLimits' | 'approvalEvaluation' | 'live' }>
 
 export interface WorkerClientOptions {
   /**
@@ -821,6 +821,7 @@ export class WorkerClient extends EventEmitter {
       case 'ack':
       case 'threadStarted':
       case 'codexLimits':
+      case 'approvalEvaluation':
       case 'live':
         this.resolveCall(msg)
         return

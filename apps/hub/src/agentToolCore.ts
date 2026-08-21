@@ -9,6 +9,7 @@ import type {
   DangerFlags,
   DelegatedAuthority,
   ManagerAgentType,
+  ManagerApprovalHelperConfig,
   ApprovalPersistence,
   Provider,
   RemoteDeviceGrant,
@@ -111,6 +112,7 @@ export interface OverseerControlInput {
     operatorTask?: string
     standingInstructions?: string
     canApproveChildren?: boolean
+    approvalHelper?: ManagerApprovalHelperConfig
     pauseExhaustedAccounts?: boolean
     allowWorkerSubagents?: boolean
     maxSubagentsPerWorker?: number
@@ -1441,6 +1443,13 @@ const overseerManagerConfig = z.object({
   operatorTask: z.string().max(20_000).optional(),
   standingInstructions: z.string().max(20_000).optional(),
   canApproveChildren: z.boolean().optional(),
+  approvalHelper: z.object({
+    enabled: z.boolean(),
+    profileId: z.string().min(1).max(256),
+    model: z.string().min(1).max(160).optional(),
+    effort: z.string().min(1).max(80).optional(),
+    maxRisk: z.enum(['low', 'medium']),
+  }).strict().optional(),
   pauseExhaustedAccounts: z.boolean().optional(),
   allowWorkerSubagents: z.boolean().optional(),
   maxSubagentsPerWorker: z.number().int().min(1).max(8).optional(),
@@ -1460,6 +1469,13 @@ const overseerPreset = z.object({
     maxLiveChildren: z.number().int().min(1).max(16),
     parallelismTarget: z.number().int().min(1).max(16).optional(),
     canApproveChildren: z.boolean(),
+    approvalHelper: z.object({
+      enabled: z.boolean(),
+      profileId: z.string().min(1).max(256),
+      model: z.string().min(1).max(160).optional(),
+      effort: z.string().min(1).max(80).optional(),
+      maxRisk: z.enum(['low', 'medium']),
+    }).strict().optional(),
     pauseExhaustedAccounts: z.boolean().optional(),
     allowWorkerSubagents: z.boolean().optional(),
     maxSubagentsPerWorker: z.number().int().min(1).max(8).optional(),

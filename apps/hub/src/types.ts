@@ -2,6 +2,17 @@ import type { ChatNamePool } from './title.js'
 
 export type Provider = 'claude' | 'codex'
 
+/** Bounded, picker-safe projection of one model the provider advertises to this exact account. */
+export interface ProfileAvailableModel {
+  slug: string
+  name: string
+  description?: string
+  supportedEfforts: string[]
+  defaultEffort?: string
+  serviceTiers: Array<{ id: string; name: string }>
+  isDefault?: boolean
+}
+
 export interface Profile {
   id: string
   /** Operator-facing alias. The immutable id remains the credential/session ownership key. */
@@ -17,6 +28,9 @@ export interface Profile {
   entitlementStatus?: 'unknown' | 'entitled' | 'denied'
   entitlementReason?: string
   entitlementCheckedAt?: string
+  /** Account-scoped provider catalog. A model appearing here is not assumed available to any peer account. */
+  availableModels?: ProfileAvailableModel[]
+  modelCatalogUpdatedAt?: string
 }
 
 export interface Project {
@@ -81,6 +95,17 @@ export interface ProjectReplica {
 export type SessionStatus = 'starting' | 'active' | 'idle' | 'stopped' | 'error'
 export type DelegatedAuthority = 'commit' | 'push'
 export type RemoteDeviceCapability = 'read' | 'write' | 'terminal'
+export type ApprovalRiskLevel = 'low' | 'medium' | 'high' | 'critical'
+
+/** Operator-owned policy for a hidden, stateless manager approval evaluator. */
+export interface ManagerApprovalHelperConfig {
+  enabled: boolean
+  profileId: string
+  model?: string
+  effort?: string
+  /** The helper may decide only at or below this risk. Anything higher wakes the manager. */
+  maxRisk: Extract<ApprovalRiskLevel, 'low' | 'medium'>
+}
 
 /** Operator-owned capability grant for one chat. Device pairing alone never creates one. */
 export interface RemoteDeviceGrant {
@@ -253,6 +278,8 @@ export interface SessionRecord {
   managerStandingInstructions?: string
   /** Operator grant allowing this manager to decide pending approvals inside its own managed hierarchy. */
   managerCanApproveChildren?: boolean
+  /** Optional fast, non-interactive evaluator for in-ceiling child approvals. It has no chat or tools. */
+  managerApprovalHelper?: ManagerApprovalHelperConfig
   /** When enabled, the hub refuses new dispatch to managed agents whose account is at a hard usage
    *  limit, unless the provider reports active paid overage/credits. Missing legacy grants are off. */
   managerPauseExhaustedAccounts?: boolean

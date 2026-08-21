@@ -419,12 +419,18 @@
         : tailRenderNodes(renderNodes, 120),
   )
   const model = $derived(view?.record.model ?? '')
+  const modelProfile = $derived(
+    store.profiles.find((profile) => profile.id === view?.record.profileId),
+  )
   const options = $derived<Record<string, string>>({
     ...(view?.record.effort ? { effort: view.record.effort } : {}),
     ...(view?.record.serviceTier ? { serviceTier: view.record.serviceTier } : {}),
   })
   const modelDef = $derived(
-    view ? (findModel(model) ?? defaultModelFor(view.record.provider)) : undefined
+    view
+      ? (findModel(model, modelProfile?.availableModels)
+        ?? defaultModelFor(view.record.provider, modelProfile?.availableModels))
+      : undefined
   )
   const active = $derived(view?.record.status === 'active' || view?.record.status === 'starting')
   // A stopped chat is otherwise a dead end — stop() had no inverse, so the composer bounced every send
@@ -1527,7 +1533,7 @@
           onclick={() => attachmentInput?.click()}
         ><Icon name="paperclip" size={15} /></button>
         <div class="ccontrol c-account" title={`Account: ${view.record.profileId}`}><AccountPicker {view} /></div>
-        <div class="ccontrol c-model" title={`Model: ${modelDef?.name ?? model ?? view.record.provider}`}><ModelPicker provider={view.record.provider} {model} onselect={setModel} /></div>
+        <div class="ccontrol c-model" title={`Model: ${modelDef?.name ?? model ?? view.record.provider}`}><ModelPicker provider={view.record.provider} {model} availableModels={modelProfile?.availableModels} onselect={setModel} /></div>
         {#if modelDef}<div class="ccontrol c-traits" title="Model effort and options"><TraitsControl descriptors={modelDef.descriptors} values={options} onchange={setOption} /></div>{/if}
         {#if isDraft}
           <div class="dperm ccontrol" data-overseer-anchor="permissions" title={`Permission mode: ${draftModeDef.label}`}>

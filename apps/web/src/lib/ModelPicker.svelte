@@ -1,14 +1,20 @@
 <script lang="ts">
   import { modelsFor, findModel, type Provider } from './catalog'
+  import type { ProfileModelInfo } from './api'
   import Icon from './Icon.svelte'
 
-  let { provider, model, onselect }: { provider: Provider; model?: string; onselect: (slug: string) => void } = $props()
+  let { provider, model, availableModels, onselect }: {
+    provider: Provider
+    model?: string
+    availableModels?: ProfileModelInfo[]
+    onselect: (slug: string) => void
+  } = $props()
 
   let open = $state(false)
   let filter = $state('')
 
-  const models = $derived(modelsFor(provider))
-  const current = $derived(findModel(model) ?? models.find((m) => m.isDefault) ?? models[0])
+  const models = $derived(modelsFor(provider, availableModels))
+  const current = $derived(findModel(model, availableModels) ?? models.find((m) => m.isDefault) ?? models[0])
   const shown = $derived(
     filter ? models.filter((m) => m.name.toLowerCase().includes(filter.toLowerCase())) : models
   )

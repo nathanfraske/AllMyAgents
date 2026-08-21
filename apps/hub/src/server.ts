@@ -3000,6 +3000,47 @@ export function startServer(opts: ServerOptions): http.Server {
           json(res, { error: 'canApproveChildren must be boolean' }, 400)
           return
         }
+        let approvalHelper: {
+          enabled: boolean
+          profileId: string
+          model?: string
+          effort?: string
+          maxRisk: 'low' | 'medium'
+        } | undefined
+        if (body.approvalHelper !== undefined) {
+          const raw = body.approvalHelper
+          if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+            json(res, { error: 'approvalHelper must be an object' }, 400)
+            return
+          }
+          const helper = raw as Record<string, unknown>
+          const profileId = str(helper.profileId)
+          const model = helper.model === undefined ? undefined : str(helper.model)
+          const effort = helper.effort === undefined ? undefined : str(helper.effort)
+          if (typeof helper.enabled !== 'boolean' || !profileId) {
+            json(res, { error: 'approvalHelper requires enabled and profileId' }, 400)
+            return
+          }
+          if (helper.maxRisk !== 'low' && helper.maxRisk !== 'medium') {
+            json(res, { error: 'approvalHelper.maxRisk must be low or medium' }, 400)
+            return
+          }
+          if (helper.model !== undefined && !model) {
+            json(res, { error: 'approvalHelper.model must be text' }, 400)
+            return
+          }
+          if (helper.effort !== undefined && !effort) {
+            json(res, { error: 'approvalHelper.effort must be text' }, 400)
+            return
+          }
+          approvalHelper = {
+            enabled: helper.enabled,
+            profileId,
+            maxRisk: helper.maxRisk,
+            ...(model ? { model } : {}),
+            ...(effort ? { effort } : {}),
+          }
+        }
         if (body.pauseExhaustedAccounts !== undefined && typeof body.pauseExhaustedAccounts !== 'boolean') {
           json(res, { error: 'pauseExhaustedAccounts must be boolean' }, 400)
           return
@@ -3079,6 +3120,7 @@ export function startServer(opts: ServerOptions): http.Server {
             operatorTask: body.operatorTask as string | undefined,
             standingInstructions: body.standingInstructions as string | undefined,
             canApproveChildren: body.canApproveChildren as boolean | undefined,
+            approvalHelper,
             pauseExhaustedAccounts: body.pauseExhaustedAccounts as boolean | undefined,
             allowWorkerSubagents: body.allowWorkerSubagents as boolean | undefined,
             maxSubagentsPerWorker,

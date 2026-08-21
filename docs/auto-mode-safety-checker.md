@@ -1,83 +1,69 @@
-# Auto mode — an isolated AI safety cross-checker (roadmap, not implemented)
+# Manager Helper — isolated, risk-bounded child approvals
 
-**Idea (requested 2026-07-25).** A new permission tier **`auto`**, sitting between `edits` and `full`, where a
-dedicated, **user-chosen, ISOLATED cross-checker agent** evaluates each of the working agent's risky actions
-and decides allow / deny **by risk level** and **by whether the action is within what the user actually
-requested** — replacing per-action human approval without going fully ungated. Scoped here for the roadmap;
-**not built.**
+The first production slice of the automated safety-checker idea is implemented as the optional **Manager
+Helper**. It removes routine permission micromanagement from large project teams without creating another
+chat, worker identity, or broad permission grant.
 
-## The gap it fills
+This is deliberately narrower than a global `auto` permission mode. It decides only a project manager's
+already-delegable descendant approvals, inside the exact tool/Git ceiling the operator gave that manager.
+Everything outside that ceiling follows the existing escalation path unchanged.
 
-Today's `permissionMode` is `safe | edits | full`:
-- **safe / edits** — every risky tool call blocks on **operator** approval (`canUseTool` → `approvals.request`).
-  Safe but high-friction: the human is the per-action bottleneck.
-- **full** — `bypassPermissions`: `canUseTool` is skipped **entirely**, no checks. Fast but ungated.
+## Operator configuration
 
-**`auto` is the missing middle:** autonomous like `full`, but every action passes an **automated** safety
-gate — an AI reviewer standing in for the human, escalating only the genuinely risky or off-task.
+Project Manager settings expose:
 
-## The cross-checker agent
+- enable/disable (default off);
+- the exact helper account, model, and effort;
+- a maximum automatic risk of `low` or `medium`.
 
-- **User-chosen + hub-attached.** The operator designates one of their agents/profiles (ideally a strong
-  model) as the checker; it runs **on the hub** as a dedicated isolated agent — local to the fleet, no vendor
-  relay. Configurable per-project or globally.
-- **Isolated by construction — the security crux.** The checker has **NO bus tools** (cannot message or be
-  messaged), **no shared-memory / practice writes**, and a **clean context per evaluation**. It cannot be
-  influenced by — or influence — the working agents or the fleet: a neutral arbiter. The working agent's
-  request + output are **DATA** to the checker, never instructions. Prompt-injection resistance is
-  load-bearing — the entire value is a reviewer that **can't be talked out of a deny**.
-- **Input per evaluation:** the requesting agent's identity + the tool call (name + input / the diff / the
-  Bash command) + the **session goal** (the user's original prompt, so it can judge "was this requested?") +
-  the worktree/scope.
-- **Output (structured verdict):** `{ riskLevel: none|low|medium|high|critical, requested: yes|inferred|no,
-  decision: allow|deny|escalate, reason }`, journaled as `auto/verdict` for operator review + tuning.
+The picker prefers Codex Spark (then a mini/default Codex model) or Claude Sonnet 5 at the lowest supported
+effort. The operator can choose another advertised model, including account-specific preview models.
+Reusable team presets retain the helper policy.
 
-## The policy — risk × requested
+## Decision flow
 
-Operator-configurable thresholds; a sane default:
+1. A child requests permission through the normal provider approval path.
+2. The hub proves the child belongs to exactly one configured manager and that the action is inside that
+   manager's live operator-owned ceiling.
+3. A deterministic classifier establishes a risk floor. Unknown classes, elevation, destructive shell
+   primitives, pushes, merges, and other broad effects cannot be talked down by the model.
+4. Requests above the configured helper ceiling skip the model and wake the manager.
+5. Eligible requests enter one serialized helper queue per manager. The isolated evaluator returns
+   `allow`, `deny`, or `escalate`, plus `riskLevel`, `requested`, and a bounded reason.
+6. Before resolving, the hub rechecks that the approval is still pending and the hierarchy and ceiling have
+   not changed. Any uncertainty, provider failure, timeout, parse failure, or changed grant wakes the manager.
 
-| | **requested** | **unrequested / tangential** |
-|---|---|---|
-| **low** | allow | allow |
-| **medium** | allow | escalate |
-| **high** | escalate | deny |
-| **critical** | deny | deny |
+The helper never creates a remembered grant. Managers may still explicitly remember a well-understood
+action class through the ordinary audited manager decision path.
 
-- **"requested"** = the action plausibly serves the user's stated task (the checker infers alignment from the
-  session goal). Unrequested/tangential actions are held to a higher bar — the "did the user actually ask for
-  this?" axis the idea calls for.
-- **`escalate`** falls back to the existing **operator** approval (the safe/edits path). So `auto` degrades to
-  human-in-the-loop for the ambiguous middle — **strictly safer than `full`**, never fail-open.
+## Isolation boundary
 
-## Where it plugs in (concrete against today's code)
+Each evaluation uses a fresh temporary workspace and a fresh provider home containing only the credential
+material required to authenticate. It receives no AllMyAgents MCP server, bus, memory, practices, project
+files, plugins, skills, hooks, browser, shell, sub-agents, or durable transcript. Claude tools are denied;
+Codex runs read-only with approvals disabled and its effect-bearing native features disabled. The untrusted
+request payload is labelled as data in a fixed system contract.
 
-- New `permissionMode: 'auto'` alongside `safe|edits|full` (`types.ts` `SessionRecord.permissionMode`, the
-  composer mode pills, `clampMode`).
-- The gate: `executor.ts` `claudeDriverFor`'s `canUseTool` (and the codex `onApproval`) — when mode is `auto`,
-  route the request to the **checker** instead of straight to `approvals.request`. **Fast-path** the obviously
-  safe (reads, `AUTO_ALLOW_TOOLS`) with no checker call; only Write/Edit/NotebookEdit/Bash/destructive +
-  unclassified tools invoke it (latency + cost control).
-- In **worker mode**, the checker call is another **relay** (like the step-4 approval relay): the worker asks
-  the hub, the hub drives the checker agent, returns the verdict. Composes with the built relay lane.
-- Checker **unavailable / errors → escalate to operator** (fail-safe; a checker fault denies-or-escalates,
-  never allows).
+The temporary evaluator is deleted after the one response. Provider failure is fail-safe: the approval stays
+pending and is escalated instead of guessed.
 
-## Open questions / decisions
+## Audit and UI
 
-- **Latency + cost.** Every gated action is a checker LLM call. Fast-path aggressively; consider a cheap-model
-  first pass that escalates to a strong model only on ambiguity; batch a turn's actions where feasible.
-- **"requested"-signal quality.** Inferring alignment from the session goal is fuzzy — over/under-flagging is
-  the main risk. Tune via the risk table + operator-adjustable thresholds (Danger-Zone-style).
-- **Which checker model/profile.** The operator designates it; a strong model is worth the cost for the
-  arbiter role. (A mesh/remote-hub checker is a possible later option; the default is local + hub-hosted.)
-- **Isolation enforcement.** Guarantee the checker session spawns with bus/memory/practice tools DISABLED (a
-  profile flag or spawn option) and no shared context; audit that no injection path exists.
-- **Enablement gate.** `auto` delegates approval to an AI — a deliberate capability. Gate turning it on behind
-  an explicit toggle + the checker-agent choice (safe-default OFF, per the danger-zone philosophy).
+Every outcome is journaled on the requesting worker as `manager/approval-helper-decision`, including the
+manager, helper account/model/effort, deterministic/effective risk, action summary, decision, and reason.
+The worker transcript renders a compact approved/denied/escalated card; expanding it shows the explanation.
+There is intentionally no helper tab and no surface for chatting with it directly.
 
-## Why it's compelling
+## Account-scoped Codex catalogs
 
-It turns the operator from a per-action bottleneck into a **policy-setter**: pick a trusted checker, set the
-risk thresholds, and let agents run near-`full` speed while an isolated, uninfluenceable reviewer catches the
-dangerous and the off-task. It's the natural autonomy tier for the "I want to dogfood, not babysit" workflow —
-and the isolation + risk×requested framing is what makes it more than a second rubber-stamp.
+Codex model availability is discovered from each managed profile's provider-maintained model catalog. The
+hub projects only bounded picker metadata; provider instructions remain private to the profile. A preview
+model is offered only on accounts whose own catalog advertises it. This is how Cyber access such as
+`gpt-daybreak-blue-latest` (Daybreak Blue) can appear on one Codex account without being assumed available
+on every Codex account.
+
+## Still roadmap
+
+A fleet-wide `auto` permission mode for ordinary operator chats is not part of this slice. It would have a
+larger authority boundary than manager-descendant approvals and needs its own explicit policy and UX rather
+than silently reusing the Manager Helper grant.

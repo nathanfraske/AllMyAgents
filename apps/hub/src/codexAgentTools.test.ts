@@ -48,7 +48,7 @@ function setup() {
     db.close()
     fs.rmSync(tmp, { recursive: true, force: true })
   }
-  return { sessions, bus, memory, practices, inject, cleanup }
+  return { sessions, approvals, journal, bus, memory, practices, inject, cleanup }
 }
 
 function codexRec(id: string, cwd: string, opts: { projectId?: string; status?: SessionStatus } = {}): SessionRecord {
@@ -161,6 +161,51 @@ describe('SessionManager.execAgentTool — the Codex agent-tool path (cwd → se
       ])
       const denied = await sessions.execAgentTool('codex-a', '/work/shared', 'list_agents', {})
       expect(denied).toMatch(/Not attributed/)
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('uses a pending approval id to attribute only its owning manager when manager and child share Codex cwd', async () => {
+    const { sessions, approvals, journal, inject, cleanup } = setup()
+    try {
+      inject([
+        {
+          ...codexRec('manager', '/work/shared', { projectId: 'proj1', status: 'active' }),
+          isProjectManager: true,
+          managerCanApproveChildren: true,
+          managerAllowedTools: ['shell'],
+        },
+        {
+          ...codexRec('child', '/work/shared', { projectId: 'proj1', status: 'active' }),
+          parentSessionId: 'manager',
+          permissionMode: 'safe',
+        },
+      ])
+      const pending = approvals.request('child', 'codex/item/commandExecution/requestApproval', {
+        toolName: 'commandExecution',
+        command: 'git status --short',
+      })
+      const approvalId = approvals.pending()[0]!.id
+
+      const decided = await sessions.execAgentTool(
+        'codex-a',
+        '/work/shared',
+        'decide_child_approval',
+        { approval_id: approvalId, approve: true },
+      )
+
+      expect(decided).toMatch(`Approved child approval ${approvalId}`)
+      await expect(pending).resolves.toBe(true)
+      expect(journal.replay(0)).toContainEqual(expect.objectContaining({
+        sessionId: 'manager',
+        kind: 'manager/child-approval-decided',
+        payload: expect.objectContaining({ approvalId, childSessionId: 'child' }),
+      }))
+
+      // The approval handle narrows only this exact decision. No other ambiguous tool call is re-attributed.
+      const unrelated = await sessions.execAgentTool('codex-a', '/work/shared', 'list_agents', {})
+      expect(unrelated).toMatch(/Not attributed/)
     } finally {
       cleanup()
     }
