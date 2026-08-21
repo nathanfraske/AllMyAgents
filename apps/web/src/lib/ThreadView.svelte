@@ -1,12 +1,12 @@
 <script lang="ts">
   import { api } from './api'
-  import { store } from './store.svelte'
+  import { store, type ThreadItem } from './store.svelte'
   import ItemCard from './ItemCard.svelte'
   import CodexActivityGroup from './CodexActivityGroup.svelte'
   import { groupCodexItems, type CodexRenderNode } from './codexGroup'
   import { classifyDecideOutcome } from './approvals'
   import { approvalBlurb } from './approvalBlurb'
-  import { distanceFromBottom, shouldShowJumpToBottom, newItemsBelow } from './transcriptScroll'
+  import { distanceFromBottom, shouldShowJumpToBottom } from './transcriptScroll'
   import PastedTextChip from './PastedTextChip.svelte'
   import { shouldPromotePaste, composeWithPastes, type PastedText } from './pastePromote'
   import AttachmentPreview from './AttachmentPreview.svelte'
@@ -374,49 +374,65 @@
   // draft record, a real session's are persisted hub-side (setModel/setOption write through). One source
   // of truth means the pills always show what the next turn will actually use, for either vendor.
   const isDraft = $derived(!!view?.draft)
-  // The main transcript shows only the MAIN thread; sub-agent output lives in the agent panel.
-  const mainItems = $derived((view?.items ?? []).filter((i) => !i.agentId && !i.taskBoardOnly))
-  // Codex turns emit long reasoning→command→reasoning churn before they say anything; fold consecutive
-  // activity into a single live group the way the Codex app does (see codexGroup.ts). Claude renders its
-  // own way (tool cards, sub-agent panel), so its transcript stays item-per-item, untouched.
-  const renderNodes = $derived<CodexRenderNode[]>(
-    view?.record.provider === 'codex'
-      ? groupCodexItems(mainItems)
-      : mainItems.map((item) => ({ type: 'item', id: item.key, item }))
-  )
-  function tailRenderNodes(nodes: CodexRenderNode[], limit: number): CodexRenderNode[] {
-    let remaining = Math.max(0, limit)
-    const tail: CodexRenderNode[] = []
-    for (let index = nodes.length - 1; index >= 0 && remaining > 0; index--) {
-      const node = nodes[index] as CodexRenderNode
-      if (node.type === 'item') {
-        tail.unshift(node)
-        remaining--
-        continue
-      }
-      const items = node.items.slice(-remaining)
-      if (items.length) {
-        tail.unshift({
-          type: 'group',
-          id: `${node.id}:peek:${items[0]?.key ?? ''}`,
-          items,
-        })
-        remaining -= items.length
-      }
+  const LATEST_RENDER_ITEM_LIMIT = 120
+
+  /**
+   * Select main-thread items from the newest edge. The ordinary view has always shown a 120-item tail,
+   * but previously filtered and grouped the entire retained transcript before throwing the prefix away.
+   * On a long-lived chat that turned every new tool/message into an O(history) renderer update. Walking
+   * backwards stops as soon as the visible tail is complete; explicitly reached older history remains
+   * contiguous and lossless by omitting the limit.
+   */
+  function selectMainItems(items: readonly ThreadItem[], limit?: number): ThreadItem[] {
+    const selected: ThreadItem[] = []
+    let remaining = limit === undefined ? Number.POSITIVE_INFINITY : Math.max(0, limit)
+    for (let index = items.length - 1; index >= 0 && remaining > 0; index -= 1) {
+      const item = items[index]!
+      if (item.agentId || item.taskBoardOnly) continue
+      selected.push(item)
+      remaining -= 1
     }
-    return tail
+    selected.reverse()
+    return selected
   }
-  const displayedRenderNodes = $derived(
-    composerOnly && peekItems > 0
-      ? tailRenderNodes(renderNodes, peekItems)
-      : view?.historyViewingOlder
-        // Older pages are fetched only when the operator reaches them, and the store retains exactly
-        // those fetched pages. Keep that reached history CONTIGUOUS with the live tail. Rendering only
-        // the first 120 nodes here made the bottom of the scrollbox an artificial cutoff: after one
-        // upward history load, scrolling back down could never reach the latest reply. The normal
-        // unopened-chat path remains a bounded 120-node tail; only explicitly reached history expands.
-        ? renderNodes
-        : tailRenderNodes(renderNodes, 120),
+
+  function latestMainItemKey(items: readonly ThreadItem[]): string | null {
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = items[index]!
+      if (!item.agentId && !item.taskBoardOnly) return item.key
+    }
+    return null
+  }
+
+  function mainItemsBelow(items: readonly ThreadItem[], anchor: string | null): number {
+    if (!anchor) return 0
+    let below = 0
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = items[index]!
+      if (item.agentId || item.taskBoardOnly) continue
+      if (item.key === anchor) return below
+      below += 1
+    }
+    return 0
+  }
+
+  const displayedMainItems = $derived(
+    selectMainItems(
+      view?.items ?? [],
+      composerOnly
+        ? Math.max(0, peekItems)
+        : view?.historyViewingOlder
+          ? undefined
+          : LATEST_RENDER_ITEM_LIMIT,
+    ),
+  )
+  // Codex turns emit long reasoning→command→reasoning churn before they say anything; fold consecutive
+  // activity into a single live group the way the Codex app does (see codexGroup.ts). Group only the
+  // selected presentation window so hidden retained history cannot tax every live item.
+  const displayedRenderNodes = $derived<CodexRenderNode[]>(
+    view?.record.provider === 'codex'
+      ? groupCodexItems(displayedMainItems)
+      : displayedMainItems.map((item) => ({ type: 'item', id: item.key, item })),
   )
   const model = $derived(view?.record.model ?? '')
   const modelProfile = $derived(
@@ -656,7 +672,9 @@
   let now = $state(Date.now())
   $effect(() => {
     if (!thinking) return
-    const iv = setInterval(() => (now = Date.now()), 250)
+    // The elapsed label has one-second precision. Updating four times per second never changed a visible
+    // character, but it did repeatedly invalidate the busiest component while a turn was streaming.
+    const iv = setInterval(() => (now = Date.now()), 1_000)
     return () => clearInterval(iv)
   })
   const elapsedMs = $derived(thinking && view?.turnStartedAt ? Math.max(0, now - view.turnStartedAt) : 0)
@@ -717,7 +735,7 @@
     // Track rendered content as well as cursors. A latest page can be shorter than the viewport, in
     // which case there is no scrollbar and therefore no scroll event to request the next page. Fill only
     // until the pane gains real scroll range; ordinary top-scroll loading takes over from there.
-    mainItems.length
+    displayedMainItems.length
     if (!currentId || !hasOlder || loading || composerOnly) return
     void tick().then(() => {
       if (
@@ -739,10 +757,10 @@
     jumpAway = away
     // Anchor the "new" count to the last item the moment you scroll away; clear it once you're back down.
     if (!away) anchorKey = null
-    else if (anchorKey === null) anchorKey = mainItems[mainItems.length - 1]?.key ?? null
+    else if (anchorKey === null) anchorKey = latestMainItemKey(view?.items ?? [])
     if (m.scrollTop <= 96) void loadOlderAtTop()
   }
-  const newBelow = $derived(newItemsBelow(mainItems.map((i) => i.key), anchorKey))
+  const newBelow = $derived(mainItemsBelow(view?.items ?? [], anchorKey))
   function jumpToBottom(): void {
     if (!scroller) return
     const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false
@@ -1381,7 +1399,7 @@
         </div>
       {/if}
     {/each}
-    {#if mainItems.length === 0 && !thinking}
+    {#if displayedMainItems.length === 0 && !thinking}
       {#if view.loadingHistory}
         <div class="dim pad" role="status">Loading conversation history…</div>
       {:else if view.historyLoadError}
@@ -1754,7 +1772,13 @@
   .history-page { align-self: center; max-width: 18rem; }
   .history-error { align-self: center; max-width: 34rem; color: var(--danger); font-size: 0.78rem; text-align: center; display: flex; align-items: center; gap: 0.55rem; }
   .stream.replay-rebuild { visibility: hidden; }
-  .stream-node { min-width: 0; }
+  .stream-node {
+    min-width: 0;
+    /* Older pages remain in the semantic DOM and keep their measured height/scroll anchor, while the
+       embedded Chromium renderer skips layout and paint for rows far outside the pane. */
+    content-visibility: auto;
+    contain-intrinsic-size: auto 96px;
+  }
   @media (prefers-reduced-motion: no-preference) {
     .stream > :global(*:not(.stream-node)), .stream > .stream-node.animate-in { animation: fade-in 0.22s var(--ease); }
   }

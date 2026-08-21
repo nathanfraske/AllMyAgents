@@ -584,6 +584,8 @@ const profileRuntime = new ProfileRuntime({
         id: profile.id,
         provider: profile.provider,
         ...(profile.displayName ? { displayName: profile.displayName } : {}),
+        ...(profile.accountEmail ? { accountEmail: profile.accountEmail } : {}),
+        ...(profile.providerAccountId ? { providerAccountId: profile.providerAccountId } : {}),
       })
     }
   },

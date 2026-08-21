@@ -38,6 +38,10 @@ export function reconcileProfileRegistry(options: ReconcileProfileRegistryOption
     if (latest) {
       existing.provider = latest.provider
       existing.dir = latest.dir
+      if (latest.accountEmail) existing.accountEmail = latest.accountEmail
+      else delete existing.accountEmail
+      if (latest.providerAccountId) existing.providerAccountId = latest.providerAccountId
+      else delete existing.providerAccountId
       scannedById.delete(existing.id)
     }
     reconcileOne(existing, claim, refreshAuth, log)

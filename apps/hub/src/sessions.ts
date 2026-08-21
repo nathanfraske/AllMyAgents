@@ -6586,6 +6586,8 @@ export class SessionManager {
   listProfiles(): Array<{
     id: string
     displayName?: string
+    accountEmail?: string
+    providerAccountId?: string
     provider: Provider
     available: boolean
     unavailableReason?: string
@@ -6603,6 +6605,8 @@ export class SessionManager {
       return {
         id: p.id,
         ...(p.displayName ? { displayName: p.displayName } : {}),
+        ...(p.accountEmail ? { accountEmail: p.accountEmail } : {}),
+        ...(p.providerAccountId ? { providerAccountId: p.providerAccountId } : {}),
         provider: p.provider,
         available: p.available !== false,
         ...(p.unavailableReason ? { unavailableReason: p.unavailableReason } : {}),

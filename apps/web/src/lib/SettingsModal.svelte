@@ -19,6 +19,11 @@
   import type { AccountLoginView } from './tutorialState.svelte'
   import { profileLabel, profileOptionLabel } from './profileLabel'
   import {
+    buildFleetAccountCatalog,
+    suggestedLocalProfileId,
+    type FleetAccountCatalogEntry,
+  } from './accountCatalog'
+  import {
     loadSettingsTab,
     saveSettingsTab,
     settingsTabHasSection,
@@ -47,6 +52,10 @@
   let activeTab = $state<SettingsTabId>(loadSettingsTab())
   const activeTabInfo = $derived(SETTINGS_TABS.find((tab) => tab.id === activeTab) ?? SETTINGS_TABS[0])
   const localProfiles = $derived(store.profiles.filter((profile) => !profile.siteId))
+  const localDeviceLabel = $derived(
+    store.fleetSites.find((site) => site.local)?.label?.trim() || 'This device',
+  )
+  const fleetAccounts = $derived(buildFleetAccountCatalog(store.profiles, localDeviceLabel))
   const localProjects = $derived(store.projects.filter((project) => !project.siteId))
   const updateLiveTurns = $derived(countLiveUpdateTurns(store.sessions))
   let waitForUpdateIdle = $state(false)
@@ -583,6 +592,7 @@
   let loginUrl = $state('')
   let loginCode = $state('')
   let loginCodeCopied = $state(false)
+  let loginExpectedEmail = $state('')
   let codexLoginMode = $state<LoginAuthMode>('browser')
   let loginStartedAt = $state<number | undefined>()
   let loginRequestCancelled = false
@@ -665,14 +675,15 @@
             openExternalUrl(result.url, target),
             delay(3_000).then(() => false),
           ])
+    const accountHint = loginExpectedEmail ? ` Sign in as ${loginExpectedEmail}.` : ''
     if (result.code) {
       loginMsg = opened
-        ? 'Enter the displayed code on the Codex sign-in page. The code is not entered in a terminal or chat.'
-        : 'Open the sign-in page below and enter the displayed code there. The code is not entered in a terminal or chat.'
+        ? `Enter the displayed code on the Codex sign-in page.${accountHint} The code is not entered in a terminal or chat.`
+        : `Open the sign-in page below and enter the displayed code there.${accountHint} The code is not entered in a terminal or chat.`
     } else {
       loginMsg = opened
-        ? 'Waiting for you to finish in the browser…'
-        : 'The browser could not be opened automatically. Use “Open sign-in page” below, then finish there.'
+        ? `Waiting for you to finish in the browser…${accountHint}`
+        : `The browser could not be opened automatically. Use “Open sign-in page” below, then finish there.${accountHint}`
     }
   }
 
@@ -711,6 +722,7 @@
         loginMsg = 'Sign-in timed out and cancellation was requested. Retry when you are ready.'
         loginId = ''
         loginRequestKey = ''
+        loginExpectedEmail = ''
         return
       }
       // Cancellation is a lifecycle transition, not a property of the provider's current branch.
@@ -753,9 +765,13 @@
         // successful login into an endless spinner or a false "signed out" state. Complete the modal
         // FIRST and refresh in the background: the old awaited rescan left the blocking account UI in
         // "waiting" even after the provider and hub had both finished successfully.
+        const expectedEmail = loginExpectedEmail
+        const addedProfileId = result.added ?? name
         loginState = 'done'
         loginStartedAt = undefined
-        loginMsg = `Added ${result.added ?? name}. It now appears in your accounts.`
+        loginMsg = expectedEmail
+          ? `Signed in locally. Verifying that the provider returned ${expectedEmail}…`
+          : `Added ${addedProfileId}. It now appears in your accounts.`
         loginId = ''
         loginRequestKey = ''
         loginUrl = ''
@@ -766,10 +782,28 @@
         queueMicrotask(() => {
           void store.rescanProfiles().then((scan) => {
             if (scan.error) {
-              loginMsg = `Added ${result.added ?? name}. The account list will refresh automatically.`
+              loginMsg = `Added ${addedProfileId}. The account list will refresh automatically.`
+              loginExpectedEmail = ''
+              return
             }
+            const actualEmail = store.profiles.find(
+              (profile) => !profile.siteId && profile.id === addedProfileId,
+            )?.accountEmail
+            if (
+              expectedEmail &&
+              actualEmail &&
+              actualEmail.toLocaleLowerCase() !== expectedEmail.toLocaleLowerCase()
+            ) {
+              loginMsg = `Signed in as ${actualEmail}, not ${expectedEmail}. The catalog now shows the account the provider actually authenticated; ${expectedEmail} is still not logged in on this device.`
+            } else if (expectedEmail && actualEmail) {
+              loginMsg = `${actualEmail} is now logged in on this device.`
+            } else if (expectedEmail) {
+              loginMsg = `Added ${addedProfileId}. The provider did not expose an email to verify against ${expectedEmail}; the account list will refresh when it does.`
+            }
+            loginExpectedEmail = ''
           }).catch(() => {
-            loginMsg = `Added ${result.added ?? name}. The account list will refresh automatically.`
+            loginMsg = `Added ${addedProfileId}. The account list will refresh automatically.`
+            loginExpectedEmail = ''
           })
         })
         return
@@ -783,6 +817,7 @@
           : 'Sign-in ended before the account was added. Retry or use Rescan accounts.')
       loginId = ''
       loginRequestKey = ''
+      loginExpectedEmail = ''
       closePreparedTarget(target)
       return
     }
@@ -790,7 +825,7 @@
 
   // The hub captures OAuth while the desktop shell owns opening the browser. A plain browser reserves
   // a tab synchronously so popup blocking cannot turn the delayed URL handoff into a silent no-op.
-  async function login(reauth = false): Promise<void> {
+  async function login(reauth = false, expectedEmail?: string): Promise<void> {
     const name = addName.trim()
     if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
       loginState = 'error'
@@ -798,6 +833,7 @@
       return
     }
     const target = prepareExternalTarget()
+    loginExpectedEmail = expectedEmail?.trim() ?? ''
     loginRequestCancelled = false
     loginCancelSent = false
     loginAttemptController?.abort()
@@ -824,6 +860,7 @@
         loginMsg =
           r.error ??
           'The hub could not confirm a durable sign-in attempt. No successful sign-in was assumed.'
+        loginExpectedEmail = ''
         return
       }
       await finishLogin(r, name, loginRequestKey, target, signal)
@@ -836,17 +873,41 @@
           ? e.message
           : 'Sign-in status could not be verified. No successful sign-in or cancellation was assumed.'
       loginId = ''
+      loginExpectedEmail = ''
     }
   }
 
-  function reauthenticate(profile: (typeof store.profiles)[number]): void {
+  function reauthenticate(
+    profile: (typeof store.profiles)[number],
+    expectedEmail = profile.accountEmail,
+  ): void {
     addProvider = profile.provider
     addName = profile.id
     // Re-authentication is a one-click local desktop action. Do not silently reuse a prior device-code
     // selection from the add-account form: the documented/default Codex flow is browser OAuth, while
     // device auth is an explicit remote/headless fallback that may be disabled in ChatGPT settings.
     if (profile.provider === 'codex') codexLoginMode = 'browser'
-    void login(true)
+    void login(true, expectedEmail)
+  }
+
+  function preferredLocalProfile(
+    account: FleetAccountCatalogEntry,
+  ): (typeof store.profiles)[number] | undefined {
+    return account.localProfiles.find((profile) => profile.authStatus === 'signed_in')
+      ?? account.localProfiles.find((profile) => profile.authStatus !== 'signed_out')
+      ?? account.localProfiles[0]
+  }
+
+  function loginCatalogAccount(account: FleetAccountCatalogEntry): void {
+    const local = preferredLocalProfile(account)
+    if (local) {
+      reauthenticate(local, account.email)
+      return
+    }
+    addProvider = account.provider
+    addName = suggestedLocalProfileId(account, store.profiles)
+    if (account.provider === 'codex') codexLoginMode = 'browser'
+    void login(false, account.email)
   }
 
   async function cancelActiveLogin(): Promise<void> {
@@ -924,34 +985,65 @@
     {#if writeError}<p class="status error write-error">{writeError}</p>{/if}
     <section class:tab-hidden={!settingsTabHasSection(activeTab, 'Accounts')} data-overseer-anchor="accounts">
       <h3>Accounts</h3>
+      <p class="hint dim account-catalog-intro">One account row across your fleet. Device badges show where that provider identity is logged in; logging in here creates or reuses only this device’s credential slot.</p>
       <div class="accounts">
-        {#each localProfiles as p (p.id)}
+        {#each fleetAccounts as account (account.key)}
+          {@const p = preferredLocalProfile(account)}
           <div class="account-wrap">
-            <div class="acct" class:signed-out={p.authStatus === 'signed_out'} class:unavailable={p.available === false}>
-              <ProviderLogo provider={p.provider} size={14} />
+            <div class="acct" class:signed-out={!p || p.authStatus === 'signed_out'} class:unavailable={p?.available === false}>
+              <ProviderLogo provider={account.provider} size={14} />
               <span class="account-identity">
-                <span class="aid">{profileLabel(p)}</span>
-                {#if p.displayName}<span class="profile-id dim">ID: {p.id}</span>{/if}
+                <span class="aid">{account.label}</span>
+                {#if account.email && account.label.toLocaleLowerCase() !== account.email.toLocaleLowerCase()}
+                  <span class="account-email">{account.email}</span>
+                {/if}
+                {#if p?.displayName}<span class="profile-id dim">ID: {p.id}</span>{/if}
               </span>
-              <span class="aprov dim">{p.provider}</span>
-              {#if p.authStatus === 'signed_out'}
-                <span class="status error" title={p.authError}>Signed out</span>
-              {/if}
-              {#if p.available === false}
+              <span class="aprov dim">{account.provider}</span>
+              <span class="local-login" class:logged-in={p?.authStatus === 'signed_in'}>
+                {p?.authStatus === 'signed_in'
+                  ? 'Logged in locally'
+                  : p && p.authStatus !== 'signed_out'
+                    ? 'Local login unknown'
+                    : 'Not logged in locally'}
+              </span>
+              <span class="account-devices" aria-label={`Devices with ${account.label}`}>
+                {#each account.devices as device (device.key)}
+                  <span
+                    class="account-device"
+                    class:offline={!device.online}
+                    class:signed-in={device.status === 'signed_in'}
+                    title={`${device.label}: ${device.status === 'signed_in' ? 'logged in' : device.status === 'signed_out' ? 'signed out' : 'login state unknown'}${device.online ? '' : ' · device offline'}`}
+                  >
+                    <Icon name={device.local ? 'monitor' : 'server'} size={12} />
+                    <span>{device.local ? 'This device' : device.label}</span>
+                  </span>
+                {/each}
+              </span>
+              {#if p?.available === false}
                 <span class="status error" title={p.unavailableReason}>
                   In use by another hub{p.ownerPort ? ` (port ${p.ownerPort})` : ''}
                 </span>
               {/if}
-              <button class="btn" aria-label={`Rename ${profileLabel(p)}`} onclick={() => beginProfileRename(p.id)}>Rename</button>
-              <button
-                class="btn"
-                class:btn-primary={p.authStatus === 'signed_out'}
-                aria-label={p.authStatus === 'signed_out' ? 'Sign in again' : `Re-authenticate ${profileLabel(p)}`}
-                onclick={() => reauthenticate(p)}
-                disabled={loginActive()}
-              >{p.authStatus === 'signed_out' ? 'Sign in again' : 'Re-authenticate'}</button>
+              {#if p}
+                <button class="btn" aria-label={`Rename ${profileLabel(p)}`} onclick={() => beginProfileRename(p.id)}>Rename</button>
+                <button
+                  class="btn"
+                  class:btn-primary={p.authStatus === 'signed_out'}
+                  aria-label={p.authStatus === 'signed_out' ? 'Sign in again' : `Re-authenticate ${profileLabel(p)}`}
+                  onclick={() => reauthenticate(p, account.email)}
+                  disabled={loginActive()}
+                >{p.authStatus === 'signed_out' ? 'Sign in again' : 'Re-authenticate'}</button>
+              {:else}
+                <button
+                  class="btn btn-primary"
+                  aria-label={`Log in ${account.email ?? account.label} on this device`}
+                  onclick={() => loginCatalogAccount(account)}
+                  disabled={loginActive()}
+                >Log in here</button>
+              {/if}
             </div>
-            {#if renamingProfileId === p.id}
+            {#if p && renamingProfileId === p.id}
               <div class="rename-account">
                 <label>
                   <span>Account display name</span>
@@ -966,8 +1058,12 @@
             {/if}
           </div>
         {/each}
+        {#if fleetAccounts.length === 0}
+          <p class="hint dim">No fleet accounts are known yet. Add the first account below.</p>
+        {/if}
       </div>
       <div class="add" data-tutorial-anchor="account-sign-in">
+        <strong class="add-heading">Add a new account</strong>
         <div class="add-row">
           <select aria-label="Account provider" bind:value={addProvider} disabled={loginActive()}>
             <option value="claude">Claude</option>
@@ -1579,18 +1675,28 @@
   .body > section:not(.tab-hidden) { padding: var(--space-4); border: 1px solid var(--border-subtle); border-radius: var(--r-lg); background: color-mix(in srgb, var(--surface-2) 38%, transparent); box-shadow: var(--edge-hi); }
   .tab-hidden { display: none; }
   section h3 { margin: 0 0 var(--space-3); font-size: var(--text-2xs); text-transform: uppercase; letter-spacing: var(--ls-label); color: var(--dim); }
+  .account-catalog-intro { margin: calc(-1 * var(--space-1)) 0 var(--space-3); }
   .accounts { display: flex; flex-direction: column; gap: var(--space-2); margin-bottom: var(--space-4); }
   .account-wrap { display: flex; flex-direction: column; gap: var(--space-1); }
   .acct { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; padding: var(--space-2) var(--space-3); background: var(--surface-2); border-radius: var(--r-md); box-shadow: var(--edge-hi); }
   .account-identity { display: flex; flex-direction: column; min-width: 0; }
   .aid { font-weight: var(--fw-medium); }
+  .account-email { color: var(--text); font-family: var(--mono); font-size: var(--text-2xs); overflow-wrap: anywhere; }
   .profile-id { font-size: 0.66rem; }
   .aprov { font-size: var(--text-xs); margin-left: auto; }
+  .local-login { color: var(--muted); font-size: var(--text-2xs); }
+  .local-login.logged-in { color: var(--ok); }
+  .account-devices { display: flex; flex: 1 1 100%; gap: var(--space-1); flex-wrap: wrap; }
+  .account-device { display: inline-flex; align-items: center; gap: .28rem; max-width: 15rem; padding: .12rem .42rem; border: 1px solid var(--border); border-radius: var(--r-pill); color: var(--muted); font-size: var(--text-2xs); }
+  .account-device.signed-in { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 35%, var(--border)); }
+  .account-device.offline { opacity: .62; }
+  .account-device span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .rename-account { display: flex; align-items: end; gap: var(--space-2); flex-wrap: wrap; padding: var(--space-3); border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-1); }
   .rename-account label { display: grid; gap: var(--space-1); flex: 1 1 240px; font-size: var(--text-xs); }
   .rename-account input { width: 100%; }
   .rename-account .hint, .rename-account .status { flex-basis: 100%; margin: 0; }
   .add { display: flex; flex-direction: column; gap: var(--space-3); }
+  .add-heading { font-size: var(--text-xs); }
   .add > .btn { align-self: flex-start; }
   .add-row { display: flex; gap: var(--space-2); }
   .add-row select { flex: none; }

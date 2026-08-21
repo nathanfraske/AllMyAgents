@@ -47,4 +47,10 @@ describe('narrow-pane layout contracts', () => {
   it('keeps journal maintenance out of the full-width app banner lane', () => {
     expect(app).not.toMatch(/class="journal-maintenance"/)
   })
+
+  it('lets Chromium skip offscreen transcript layout and does not over-tick the seconds-only clock', () => {
+    expect(thread).toMatch(/\.stream-node\s*\{[^}]*content-visibility:\s*auto;[^}]*contain-intrinsic-size:/s)
+    expect(thread).toMatch(/setInterval\(\(\)\s*=>\s*\(now = Date\.now\(\)\),\s*1_000\)/)
+    expect(thread).not.toMatch(/setInterval\(\(\)\s*=>\s*\(now = Date\.now\(\)\),\s*250\)/)
+  })
 })

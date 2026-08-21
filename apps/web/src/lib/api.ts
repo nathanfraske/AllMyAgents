@@ -24,6 +24,10 @@ export interface ProfileInfo {
   id: string
   /** Editable operator-facing alias; id remains the immutable account key. */
   displayName?: string
+  /** Provider-confirmed account identity, projected without exposing credentials. */
+  accountEmail?: string
+  /** Opaque provider id used only to correlate this account across paired hubs. */
+  providerAccountId?: string
   provider: 'claude' | 'codex'
   available?: boolean
   unavailableReason?: string

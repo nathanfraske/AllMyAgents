@@ -8,6 +8,11 @@ export interface ProfileAuthEvidence {
   authError?: string
 }
 
+export interface ProfileAccountIdentity {
+  accountEmail?: string
+  providerAccountId?: string
+}
+
 interface CodexCatalogCacheEntry {
   signature: string
   value?: { models: ProfileAvailableModel[]; updatedAt: string }
@@ -175,6 +180,69 @@ export function profileAuthEvidence(
   return { authStatus: 'signed_in' }
 }
 
+/**
+ * Project the account identity that the vendor already persists beside a managed credential.
+ *
+ * This intentionally returns only an email address and an opaque account id. Tokens, organization
+ * metadata, entitlements, and the rest of the provider files never cross the hub API. Claude records
+ * this in `.claude.json`; Codex records the account id plus an email-bearing ID token in `auth.json`.
+ * Missing or concurrently-replaced metadata is ordinary and returns an empty identity.
+ */
+export function profileAccountIdentity(
+  profile: Pick<Profile, 'provider' | 'dir'>,
+): ProfileAccountIdentity {
+  try {
+    if (profile.provider === 'claude') {
+      const root = readJsonRecord(path.join(profile.dir, '.claude.json'))
+      const account = asRecord(root?.oauthAccount)
+      return compactAccountIdentity(
+        accountEmail(account?.emailAddress ?? account?.email),
+        providerAccountId(account?.accountUuid ?? account?.account_id),
+      )
+    }
+
+    const root = readJsonRecord(path.join(profile.dir, 'auth.json'))
+    const tokens = asRecord(root?.tokens)
+    const claims = jwtClaims(
+      stringValue(tokens?.id_token) ??
+        stringValue(tokens?.idToken) ??
+        stringValue(tokens?.access_token) ??
+        stringValue(tokens?.accessToken),
+    )
+    return compactAccountIdentity(
+      accountEmail(claims?.email ?? claims?.preferred_username ?? claims?.upn),
+      providerAccountId(tokens?.account_id ?? tokens?.accountId ?? claims?.account_id),
+    )
+  } catch {
+    return {}
+  }
+}
+
+function compactAccountIdentity(
+  email: string | undefined,
+  accountId: string | undefined,
+): ProfileAccountIdentity {
+  return {
+    ...(email ? { accountEmail: email } : {}),
+    ...(accountId ? { providerAccountId: accountId } : {}),
+  }
+}
+
+function accountEmail(value: unknown): string | undefined {
+  const clean = stringValue(value)?.slice(0, 320)
+  return clean && /^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(clean) ? clean : undefined
+}
+
+function providerAccountId(value: unknown): string | undefined {
+  const clean = stringValue(value)?.slice(0, 200)
+  return clean && !/\s/u.test(clean) ? clean : undefined
+}
+
+function readJsonRecord(file: string): Record<string, unknown> | undefined {
+  const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown
+  return asRecord(parsed)
+}
+
 function signedOut(authError: string): ProfileAuthEvidence {
   return { authStatus: 'signed_out', authError }
 }
@@ -201,13 +269,16 @@ function claudeExpiryMs(value: unknown): number | undefined {
 }
 
 function jwtExpiryMs(token: string): number | undefined {
-  const payload = token.split('.')[1]
+  const exp = jwtClaims(token)?.exp
+  const seconds = typeof exp === 'string' ? Number(exp) : exp
+  return typeof seconds === 'number' && Number.isFinite(seconds) ? seconds * 1000 : undefined
+}
+
+function jwtClaims(token: string | undefined): Record<string, unknown> | undefined {
+  const payload = token?.split('.')[1]
   if (!payload) return undefined
   try {
-    const decoded = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as unknown
-    const exp = asRecord(decoded)?.exp
-    const seconds = typeof exp === 'string' ? Number(exp) : exp
-    return typeof seconds === 'number' && Number.isFinite(seconds) ? seconds * 1000 : undefined
+    return asRecord(JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as unknown)
   } catch {
     return undefined
   }
@@ -220,9 +291,11 @@ export function scanProfiles(profilesDir: string): Profile[] {
     const dir = path.join(profilesDir, name)
     if (!fs.statSync(dir).isDirectory()) continue
     if (fs.existsSync(path.join(dir, 'auth.json'))) {
-      out.push({ id: name, provider: 'codex', dir })
+      const profile: Profile = { id: name, provider: 'codex', dir }
+      out.push({ ...profile, ...profileAccountIdentity(profile) })
     } else if (fs.existsSync(path.join(dir, '.credentials.json'))) {
-      out.push({ id: name, provider: 'claude', dir })
+      const profile: Profile = { id: name, provider: 'claude', dir }
+      out.push({ ...profile, ...profileAccountIdentity(profile) })
     }
   }
   return out

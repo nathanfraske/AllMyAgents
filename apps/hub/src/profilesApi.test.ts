@@ -27,6 +27,8 @@ describe('profile account API contract', () => {
       ownerPort: 7999,
       authStatus: 'signed_out',
       authError: 'test credential expired',
+      accountEmail: 'owner@example.com',
+      providerAccountId: 'codex-account-7',
     }
     const sessionState = { profiles: new Map([[profile.id, profile]]) }
     const profileNames: Record<string, string> = { [profile.id]: 'Work Codex' }
@@ -87,6 +89,8 @@ describe('profile account API contract', () => {
       ownerPort: 7999,
       authStatus: 'signed_out',
       authError: 'test credential expired',
+      accountEmail: 'owner@example.com',
+      providerAccountId: 'codex-account-7',
       entitlementStatus: 'unknown',
     }])
 

@@ -5,6 +5,22 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.33-alpha.37 — 2026-08-21
+
+This release keeps long conversations responsive and turns the Accounts tab into a fleet-wide identity catalog
+without moving or sharing provider credentials between machines.
+
+[Full v0.1.33-alpha.37 release notes](docs/releases/v0.1.33-alpha.37.md)
+
+- High-rate Codex command/reasoning fragments that have no visible presentation no longer invalidate the entire
+  app, live transcript work is bounded to the visible tail, older reached history uses offscreen rendering
+  containment, and the seconds-only activity clock updates once per second.
+- Claude and Codex profiles project only their provider-confirmed email and opaque account id. The Accounts tab
+  consolidates that identity across paired hubs and shows each device's online and local login state.
+- A fleet account that is not present locally offers **Log in here**, safely reusing an available local profile id
+  or deriving a collision-free one. The browser flow names the expected email and verifies the account the
+  provider actually returned rather than attaching the wrong identity silently.
+
 ## v0.1.32-alpha.36 — 2026-08-20
 
 This release removes a false Codex manager-attribution block, adds a hidden risk-bounded Manager Helper for

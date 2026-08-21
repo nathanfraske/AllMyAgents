@@ -46,6 +46,33 @@ describe('profile registry ownership refresh', () => {
     expect(existing.unavailableReason).toBeUndefined()
   })
 
+  it('refreshes and clears provider identity on the shared long-lived profile object', () => {
+    const existing: Profile = {
+      id: 'codex-a',
+      provider: 'codex',
+      dir: 'C:/profiles/codex-a',
+      accountEmail: 'old@example.com',
+      providerAccountId: 'old-account',
+    }
+    const options = {
+      profiles: [existing],
+      profileMap: new Map([[existing.id, existing]]),
+      claim: () => ({ owned: true, owner: owner('hub', 7777) }) as ClaimResult,
+      refreshAuth: vi.fn(),
+      onAdded: vi.fn(),
+    }
+
+    reconcileProfileRegistry({
+      ...options,
+      scanned: [{ ...existing, accountEmail: 'new@example.com', providerAccountId: 'new-account' }],
+    })
+    expect(existing).toMatchObject({ accountEmail: 'new@example.com', providerAccountId: 'new-account' })
+
+    reconcileProfileRegistry({ ...options, scanned: [{ id: existing.id, provider: 'codex', dir: existing.dir }] })
+    expect(existing.accountEmail).toBeUndefined()
+    expect(existing.providerAccountId).toBeUndefined()
+  })
+
   it('keeps an existing profile unavailable when its fresh claim is still foreign', () => {
     const existing: Profile = {
       id: 'codex-a',
