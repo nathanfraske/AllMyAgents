@@ -93,6 +93,22 @@
     <span>{item.text ?? `Context compaction ${item.status ?? 'completed'}.`}</span>
     <span class="compaction-line" aria-hidden="true"></span>
   </div>
+{:else if item.kind === 'note' && item.approvalDecision}
+  <div class="helper-decision {item.approvalDecision.decision}">
+    <button class="helper-head" onclick={() => (detailOpen = !detailOpen)} aria-expanded={detailOpen}>
+      <span class="helper-mark" aria-hidden="true">{item.approvalDecision.decision === 'approved' ? '✓' : item.approvalDecision.decision === 'denied' ? '×' : '↑'}</span>
+      <b>Manager Helper {item.approvalDecision.decision}</b>
+      <span class="risk {item.approvalDecision.risk}">{item.approvalDecision.risk} risk</span>
+      {#if fmtTime(item.ts)}<span class="ts" title={new Date(item.ts).toLocaleString()}>{fmtTime(item.ts)}</span>{/if}
+    </button>
+    {#if detailOpen}
+      <div class="helper-detail">
+        {#if item.approvalDecision.requestedAction}<p><strong>Action:</strong> {item.approvalDecision.requestedAction}</p>{/if}
+        <p>{item.approvalDecision.reason}</p>
+        <small>Approval {item.approvalDecision.approvalId}{item.approvalDecision.helperModel ? ` · ${item.approvalDecision.helperModel}` : ''}</small>
+      </div>
+    {/if}
+  </div>
 {:else if item.kind === 'note'}
   <div class="note dim">{item.text}</div>
 {:else if item.kind === 'error'}
@@ -193,6 +209,18 @@
   .compaction.active .compaction-line { background: color-mix(in srgb, var(--accent) 55%, var(--border-strong)); }
   .compaction.failed .compaction-line { background: color-mix(in srgb, var(--bad-text) 55%, var(--border-strong)); }
   .note { font-size: 0.72rem; font-family: var(--mono); }
+  .helper-decision { border: 1px solid var(--border); border-left: 3px solid var(--warn); border-radius: 7px; background: var(--surface); overflow: hidden; }
+  .helper-decision.approved { border-left-color: var(--ok); }
+  .helper-decision.denied { border-left-color: var(--bad); }
+  .helper-head { display: flex; align-items: center; gap: .45rem; width: 100%; padding: .42rem .55rem; color: var(--text); text-align: left; background: none; }
+  .helper-head .ts { margin-left: auto; color: var(--dim); font-size: .68rem; }
+  .helper-mark { width: 1rem; text-align: center; font-weight: 800; }
+  .risk { padding: .08rem .35rem; border-radius: 999px; color: var(--dim); background: var(--surface-2); font-size: .66rem; }
+  .risk.low { color: var(--ok); }
+  .risk.high, .risk.critical { color: var(--bad); }
+  .helper-detail { padding: .15rem .65rem .6rem 2rem; color: var(--muted); font-size: .76rem; line-height: 1.4; }
+  .helper-detail p { margin: .25rem 0; }
+  .helper-detail small { color: var(--dim); font-family: var(--mono); }
   .err { color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); border: 1px solid var(--bad); border-radius: 6px; padding: 0.4rem 0.6rem; font-size: 0.8rem; }
   .msg { border-radius: 8px; padding: 0.5rem 0.7rem; }
   .msg.assistant { background: var(--surface); border: 1px solid var(--border); }

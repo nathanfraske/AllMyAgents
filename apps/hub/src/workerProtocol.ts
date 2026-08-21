@@ -8,6 +8,7 @@
 import crypto from 'node:crypto'
 import type { ApprovalPersistence, ApprovalStatus, DangerFlags } from './types.js'
 import type { AttachmentMeta } from './attachments.js'
+import type { ApprovalHelperEvaluation, ApprovalHelperEvaluationInput } from './approvalHelper.js'
 
 /** The subset of a SessionRecord the worker's driver needs — the worker holds no record + never opens the store. */
 export interface WorkerSessionSpec {
@@ -59,6 +60,7 @@ export type HubToWorker =
   | { t: 'listLive'; reqId: string }
   | { t: 'attach'; reqId: string; since: Record<string, number> }
   | { t: 'readCodexLimits'; reqId: string; profileId: string; profileDir: string }
+  | { t: 'evaluateApproval'; reqId: string; input: ApprovalHelperEvaluationInput }
   // pushes (no reqId):
   | { t: 'dangerUpdate'; danger: DangerFlags }
   // pre-flip: hold new relays before the socket drops (§8.4). `on:false` is the RELEASE — a rolled-back
@@ -101,6 +103,7 @@ export type WorkerToHub =
   | { t: 'ack'; reqId: string; ok: boolean; error?: string }
   | { t: 'threadStarted'; reqId: string; threadId: string }
   | { t: 'codexLimits'; reqId: string; ok: boolean; value?: unknown; error?: string }
+  | { t: 'approvalEvaluation'; reqId: string; ok: boolean; value?: ApprovalHelperEvaluation; error?: string }
   | { t: 'live'; reqId: string; sessions: LiveSession[] }
 
 export interface LiveSession {

@@ -1,4 +1,4 @@
-import { describe, expect, it, afterEach } from 'vitest'
+import { describe, expect, it, afterEach, vi } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -1202,6 +1202,213 @@ describe('project-manager delegated authority security boundary', () => {
         toolName: 'Bash',
       }),
     }))
+  })
+
+  it('a hidden Manager Helper decides a bounded read-only child approval without waking the manager', async () => {
+    const { sessions, approvals, seed, journal, dir } = makeSessions()
+    const manager = seed({
+      isProjectManager: true,
+      status: 'idle',
+      managerCanApproveChildren: true,
+      managerAllowedTools: ['shell'],
+      managerOperatorTask: 'Audit the repository without changing it.',
+      managerApprovalHelper: {
+        enabled: true,
+        profileId: 'helper',
+        model: 'fast-model',
+        effort: 'low',
+        maxRisk: 'low',
+      },
+    } as Partial<SessionRecord>)
+    seed({
+      id: 'child',
+      parentSessionId: manager.id,
+      status: 'active',
+      permissionMode: 'safe',
+      role: 'Read-only repository auditor',
+    } as Partial<SessionRecord>)
+    const internals = sessions as unknown as {
+      profiles: Map<string, unknown>
+      executor: { evaluateApproval: ReturnType<typeof vi.fn> }
+    }
+    internals.profiles.set('helper', {
+      id: 'helper',
+      provider: 'codex',
+      dir: path.join(dir, 'helper'),
+      available: true,
+      authStatus: 'signed_in',
+    })
+    internals.executor.evaluateApproval = vi.fn().mockResolvedValue({
+      riskLevel: 'low',
+      requested: 'yes',
+      decision: 'allow',
+      reason: 'The command only enumerates running processes for the assigned read-only audit.',
+    })
+
+    const outcome = approvals.request('child', 'claude/tool', {
+      toolName: 'PowerShell',
+      input: { command: 'Get-Process' },
+    })
+
+    await expect(outcome).resolves.toBe(true)
+    expect(internals.executor.evaluateApproval).toHaveBeenCalledWith(expect.objectContaining({
+      provider: 'codex',
+      model: 'fast-model',
+      effort: 'low',
+      riskFloor: 'low',
+    }))
+    expect(journal.replay(0)).toContainEqual(expect.objectContaining({
+      sessionId: 'child',
+      kind: 'manager/approval-helper-decision',
+      payload: expect.objectContaining({
+        decision: 'approved',
+        risk: 'low',
+        helperProfileId: 'helper',
+      }),
+    }))
+  })
+
+  it('escalates above-ceiling risk without consulting the model and keeps the approval pending', async () => {
+    const { sessions, approvals, seed, journal } = makeSessions()
+    const manager = seed({
+      isProjectManager: true,
+      status: 'active',
+      managerCanApproveChildren: true,
+      managerAllowedTools: ['file_write'],
+      managerApprovalHelper: {
+        enabled: true,
+        profileId: 'helper',
+        model: 'fast-model',
+        maxRisk: 'low',
+      },
+    } as Partial<SessionRecord>)
+    seed({ id: 'child', parentSessionId: manager.id, status: 'active', permissionMode: 'safe' })
+    const evaluator = vi.fn()
+    const internals = sessions as unknown as {
+      executor: { evaluateApproval: typeof evaluator }
+      bus: AgentBus
+    }
+    internals.executor.evaluateApproval = evaluator
+
+    const outcome = approvals.request('child', 'claude/tool', {
+      toolName: 'Write',
+      input: { file_path: 'src/result.ts', content: 'export const result = true' },
+    })
+    await vi.waitFor(() => expect(journal.replay(0)).toContainEqual(expect.objectContaining({
+      sessionId: 'child',
+      kind: 'manager/approval-helper-decision',
+      payload: expect.objectContaining({ decision: 'escalated', risk: 'medium' }),
+    })))
+
+    expect(evaluator).not.toHaveBeenCalled()
+    expect(approvals.pending()).toHaveLength(1)
+    expect(internals.bus.inbox(manager.id)).toContainEqual(expect.objectContaining({
+      subject: 'child approval pending',
+      attentionRequired: true,
+    }))
+    approvals.resolve(approvals.pending()[0]!.id, false)
+    await expect(outcome).resolves.toBe(false)
+  })
+
+  it('escalates a provider failure instead of guessing or losing the pending approval', async () => {
+    const { sessions, approvals, seed, journal, dir } = makeSessions()
+    const manager = seed({
+      isProjectManager: true,
+      status: 'active',
+      managerCanApproveChildren: true,
+      managerAllowedTools: ['shell'],
+      managerApprovalHelper: {
+        enabled: true,
+        profileId: 'helper',
+        model: 'fast-model',
+        maxRisk: 'low',
+      },
+    } as Partial<SessionRecord>)
+    seed({ id: 'child', parentSessionId: manager.id, status: 'active', permissionMode: 'safe' })
+    const internals = sessions as unknown as {
+      profiles: Map<string, unknown>
+      executor: { evaluateApproval: ReturnType<typeof vi.fn> }
+      bus: AgentBus
+    }
+    internals.profiles.set('helper', {
+      id: 'helper', provider: 'codex', dir: path.join(dir, 'helper'), available: true, authStatus: 'signed_in',
+    })
+    internals.executor.evaluateApproval = vi.fn().mockRejectedValue(new Error('provider unavailable'))
+
+    const outcome = approvals.request('child', 'claude/tool', {
+      toolName: 'PowerShell',
+      input: { command: 'Get-Process' },
+    })
+    await vi.waitFor(() => expect(journal.replay(0)).toContainEqual(expect.objectContaining({
+      sessionId: 'child',
+      kind: 'manager/approval-helper-decision',
+      payload: expect.objectContaining({
+        decision: 'escalated',
+        error: 'provider unavailable',
+      }),
+    })))
+
+    expect(approvals.pending()).toHaveLength(1)
+    expect(internals.bus.inbox(manager.id)).toContainEqual(expect.objectContaining({
+      subject: 'child approval pending',
+    }))
+    approvals.resolve(approvals.pending()[0]!.id, false)
+    await expect(outcome).resolves.toBe(false)
+  })
+
+  it('does not invoke a helper account whose provider entitlement was revoked after configuration', async () => {
+    const { sessions, approvals, seed, journal, dir } = makeSessions()
+    const manager = seed({
+      isProjectManager: true,
+      status: 'active',
+      managerCanApproveChildren: true,
+      managerAllowedTools: ['shell'],
+      managerApprovalHelper: {
+        enabled: true,
+        profileId: 'helper',
+        model: 'fast-model',
+        maxRisk: 'low',
+      },
+    } as Partial<SessionRecord>)
+    seed({ id: 'child', parentSessionId: manager.id, status: 'active', permissionMode: 'safe' })
+    const evaluator = vi.fn()
+    const internals = sessions as unknown as {
+      profiles: Map<string, unknown>
+      executor: { evaluateApproval: typeof evaluator }
+      bus: AgentBus
+    }
+    internals.profiles.set('helper', {
+      id: 'helper',
+      provider: 'codex',
+      dir: path.join(dir, 'helper'),
+      available: true,
+      authStatus: 'signed_in',
+      entitlementStatus: 'denied',
+      entitlementReason: 'Cyber workspace access is temporarily unavailable.',
+    })
+    internals.executor.evaluateApproval = evaluator
+
+    const outcome = approvals.request('child', 'claude/tool', {
+      toolName: 'PowerShell',
+      input: { command: 'Get-Process' },
+    })
+    await vi.waitFor(() => expect(journal.replay(0)).toContainEqual(expect.objectContaining({
+      sessionId: 'child',
+      kind: 'manager/approval-helper-decision',
+      payload: expect.objectContaining({
+        decision: 'escalated',
+        reason: 'Cyber workspace access is temporarily unavailable.',
+      }),
+    })))
+
+    expect(evaluator).not.toHaveBeenCalled()
+    expect(approvals.pending()).toHaveLength(1)
+    expect(internals.bus.inbox(manager.id)).toContainEqual(expect.objectContaining({
+      subject: 'child approval pending',
+      attentionRequired: true,
+    }))
+    approvals.resolve(approvals.pending()[0]!.id, false)
+    await expect(outcome).resolves.toBe(false)
   })
 
   it('a manager may remember an exact child tool class and later revoke it', async () => {

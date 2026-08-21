@@ -11,6 +11,7 @@
     operatorTask: string
     standingInstructions: string
     canApproveChildren: boolean
+    approvalHelper?: import('./api').ManagerApprovalHelperConfig
     pauseExhaustedAccounts: boolean
     allowWorkerSubagents: boolean
     maxSubagentsPerWorker: number
@@ -25,7 +26,7 @@
 </script>
 
 <script lang="ts">
-  import { api, type ManagerAgentType, type ProjectInfo, type SessionRecord } from './api'
+  import { api, type ManagerAgentType, type ProfileInfo, type ProjectInfo, type SessionRecord } from './api'
   import { defaultModelFor, findModel, modelsFor } from './catalog'
   import Icon from './Icon.svelte'
   import ProviderLogo from './ProviderLogo.svelte'
@@ -102,6 +103,11 @@
   let operatorTask = $state('')
   let standingInstructions = $state('')
   let canApproveChildren = $state(true)
+  let approvalHelperEnabled = $state(false)
+  let approvalHelperProfileId = $state('')
+  let approvalHelperModel = $state('')
+  let approvalHelperEffort = $state('')
+  let approvalHelperMaxRisk = $state<'low' | 'medium'>('low')
   let pauseExhaustedAccounts = $state(true)
   let allowWorkerSubagents = $state(false)
   let maxSubagentsPerWorker = $state(2)
@@ -138,12 +144,38 @@
       .filter((profileId) => prose.includes(profileId.toLocaleLowerCase()))
   })
   const managerProfile = $derived(availableProfiles.find((profile) => profile.id === managerProfileId))
-  const managerModels = $derived(managerProfile ? modelsFor(managerProfile.provider) : [])
+  const managerModels = $derived(managerProfile ? modelsFor(managerProfile.provider, managerProfile.availableModels) : [])
   const managerEffortOptions = $derived(
-    (findModel(managerModel) ?? (managerProfile ? defaultModelFor(managerProfile.provider) : undefined))
+    (findModel(managerModel, managerProfile?.availableModels)
+      ?? (managerProfile ? defaultModelFor(managerProfile.provider, managerProfile.availableModels) : undefined))
+      ?.descriptors.find((descriptor) => descriptor.id === 'effort')?.options ?? [],
+  )
+  const approvalHelperProfile = $derived(
+    availableProfiles.find((profile) => profile.id === approvalHelperProfileId),
+  )
+  const approvalHelperModels = $derived(
+    approvalHelperProfile ? modelsFor(approvalHelperProfile.provider, approvalHelperProfile.availableModels) : [],
+  )
+  const approvalHelperEffortOptions = $derived(
+    (findModel(approvalHelperModel, approvalHelperProfile?.availableModels)
+      ?? (approvalHelperProfile ? defaultModelFor(approvalHelperProfile.provider, approvalHelperProfile.availableModels) : undefined))
       ?.descriptors.find((descriptor) => descriptor.id === 'effort')?.options ?? [],
   )
   const scope = $derived(scopeFromAgentTypes())
+
+  function approvalHelperDefaultModel(profile: ProfileInfo | undefined) {
+    if (!profile) return undefined
+    const models = modelsFor(profile.provider, profile.availableModels)
+    return profile.provider === 'codex'
+      ? (models.find((model) => model.slug.includes('codex-spark'))
+        ?? models.find((model) => model.slug.includes('mini'))
+        ?? models.find((model) => model.isDefault)
+        ?? models[0])
+      : (models.find((model) => model.slug.includes('sonnet-5'))
+        ?? models.find((model) => model.slug.includes('haiku'))
+        ?? models.find((model) => model.isDefault)
+        ?? models[0])
+  }
 
   function rawManagerProfileId(id: string): string {
     const prefix = project?.siteId ? `${project.siteId}:` : ''
@@ -229,7 +261,7 @@
   function resetGrantDefaults(): void {
     const profile = availableProfiles.find((candidate) => candidate.id === managerProfileId)
     managerTitle = ''
-    managerModel = profile ? defaultModelFor(profile.provider)?.slug ?? '' : ''
+    managerModel = profile ? defaultModelFor(profile.provider, profile.availableModels)?.slug ?? '' : ''
     managerEffort = ''
     permissionMode = 'safe'
     maxChildPermissionMode = 'safe'
@@ -243,6 +275,13 @@
     orientationBrief = ''
     standingInstructions = ''
     canApproveChildren = true
+    approvalHelperEnabled = false
+    approvalHelperProfileId = managerProfileId
+    const helperModel = approvalHelperDefaultModel(profile)
+    approvalHelperModel = helperModel?.slug ?? ''
+    approvalHelperEffort = helperModel?.descriptors.find((descriptor) => descriptor.id === 'effort')
+      ?.options?.find((option) => option.value === 'low')?.value ?? ''
+    approvalHelperMaxRisk = 'low'
     pauseExhaustedAccounts = true
     allowWorkerSubagents = false
     maxSubagentsPerWorker = 2
@@ -259,7 +298,10 @@
     projectId = record.projectId ?? ''
     managerProfileId = record.profileId
     managerTitle = record.title ?? chatLabel(record)
-    managerModel = record.model ?? defaultModelFor(record.provider)?.slug ?? ''
+    const recordProfile = availableProfiles.find((candidate) => candidate.id === record.profileId)
+    managerModel = record.model
+      ?? defaultModelFor(record.provider, recordProfile?.availableModels)?.slug
+      ?? ''
     managerEffort = record.effort ?? ''
     // An explicit one-chat operator override is not the manager's reusable grant. Editing the manager
     // must start from the persisted grant ceiling or merely pressing Save would silently widen it.
@@ -279,6 +321,14 @@
     operatorTask = record.managerOperatorTask ?? ''
     standingInstructions = record.managerStandingInstructions ?? defaultStandingInstructions()
     canApproveChildren = record.managerCanApproveChildren ?? true
+    approvalHelperEnabled = record.managerApprovalHelper?.enabled ?? false
+    approvalHelperProfileId = record.managerApprovalHelper?.profileId ?? record.profileId
+    const helperProfile = availableProfiles.find((candidate) => candidate.id === approvalHelperProfileId)
+    approvalHelperModel = record.managerApprovalHelper?.model
+      ?? approvalHelperDefaultModel(helperProfile)?.slug
+      ?? ''
+    approvalHelperEffort = record.managerApprovalHelper?.effort ?? ''
+    approvalHelperMaxRisk = record.managerApprovalHelper?.maxRisk ?? 'low'
     pauseExhaustedAccounts = record.managerPauseExhaustedAccounts ?? false
     allowWorkerSubagents = record.managerAllowWorkerSubagents ?? false
     maxSubagentsPerWorker = record.managerMaxSubagentsPerWorker ?? 2
@@ -303,8 +353,21 @@
   function chooseManagerProfile(profileId: string): void {
     managerProfileId = profileId
     const profile = availableProfiles.find((candidate) => candidate.id === profileId)
-    managerModel = profile ? defaultModelFor(profile.provider)?.slug ?? '' : ''
+    managerModel = profile ? defaultModelFor(profile.provider, profile.availableModels)?.slug ?? '' : ''
     managerEffort = ''
+    if (!approvalHelperProfileId) chooseApprovalHelperProfile(profileId)
+  }
+
+  function chooseApprovalHelperProfile(profileId: string): void {
+    approvalHelperProfileId = profileId
+    const profile = availableProfiles.find((candidate) => candidate.id === profileId)
+    const model = approvalHelperDefaultModel(profile)
+    approvalHelperModel = model?.slug ?? ''
+    approvalHelperEffort = model?.descriptors.find((descriptor) => descriptor.id === 'effort')
+      ?.options?.find((option) => option.value === 'low')?.value
+      ?? model?.descriptors.find((descriptor) => descriptor.id === 'effort')
+        ?.options?.find((option) => option.isDefault)?.value
+      ?? ''
   }
 
   function toggleAuthority(authority: Authority, enabled: boolean): void {
@@ -325,7 +388,7 @@
 
   function addAgentType(): void {
     const profile = availableProfiles[0]
-    const model = profile ? defaultModelFor(profile.provider) : undefined
+    const model = profile ? defaultModelFor(profile.provider, profile.availableModels) : undefined
     agentTypes = [
       ...agentTypes,
       {
@@ -366,13 +429,13 @@
       selection,
       profileId: profile?.id,
       profileIds: undefined,
-      model: profile ? defaultModelFor(profile.provider)?.slug : undefined,
+      model: profile ? defaultModelFor(profile.provider, profile.availableModels)?.slug : undefined,
     })
   }
 
   function chooseRoleProfile(index: number, profileId: string): void {
     const profile = availableProfiles.find((candidate) => candidate.id === profileId)
-    const model = profile ? defaultModelFor(profile.provider) : undefined
+    const model = profile ? defaultModelFor(profile.provider, profile.availableModels) : undefined
     updateAgentType(index, {
       profileId,
       model: model?.slug,
@@ -389,7 +452,8 @@
   }
 
   function roleEffortOptions(role: ManagerAgentType) {
-    return findModel(role.model)?.descriptors.find((descriptor) => descriptor.id === 'effort')?.options ?? []
+    const profile = availableProfiles.find((candidate) => candidate.id === role.profileId)
+    return findModel(role.model, profile?.availableModels)?.descriptors.find((descriptor) => descriptor.id === 'effort')?.options ?? []
   }
 
   function usageLabel(profileId: string): string {
@@ -449,6 +513,15 @@
       operatorTask: operatorTask.trim(),
       standingInstructions: standingInstructions.trim(),
       canApproveChildren,
+      approvalHelper: canApproveChildren
+        ? {
+            enabled: approvalHelperEnabled,
+            profileId: approvalHelperProfileId,
+            model: approvalHelperModel || undefined,
+            effort: approvalHelperEffort || undefined,
+            maxRisk: approvalHelperMaxRisk,
+          }
+        : undefined,
       pauseExhaustedAccounts,
       allowWorkerSubagents,
       maxSubagentsPerWorker,
@@ -470,6 +543,9 @@
     if (!managerProfileId) return 'Choose the account that will run the manager.'
     if (!config.allowedProfiles.length) return 'Choose at least one worker account.'
     if (!config.orientationBrief) return 'The manager needs an orientation brief.'
+    if (config.approvalHelper?.enabled && !config.approvalHelper.profileId) {
+      return 'Choose an account for the Manager Helper.'
+    }
     if (!Number.isInteger(maxLiveChildren) || maxLiveChildren < 1 || maxLiveChildren > 16) {
       return 'The live child limit must be from 1 to 16.'
     }
@@ -581,6 +657,7 @@
         operatorTask: config.operatorTask,
         standingInstructions: config.standingInstructions,
         canApproveChildren: config.canApproveChildren,
+        approvalHelper: config.approvalHelper,
         pauseExhaustedAccounts: config.pauseExhaustedAccounts,
         allowWorkerSubagents: config.allowWorkerSubagents,
         maxSubagentsPerWorker: config.maxSubagentsPerWorker,
@@ -954,6 +1031,7 @@
               <small>Roles with the same group are kept on different accounts in the active team, preserving reviewer/implementer independence.</small>
             </label>
             {#if role.selection === 'fixed'}
+              {@const roleProfile = availableProfiles.find((profile) => profile.id === role.profileId)}
               <div class="row three">
                 <label>
                   <span>Worker account</span>
@@ -966,7 +1044,7 @@
                 <label>
                   <span>Worker model</span>
                   <select value={role.model} onchange={(event) => updateAgentType(index, { model: (event.target as HTMLSelectElement).value })}>
-                    {#each modelsFor(availableProfiles.find((profile) => profile.id === role.profileId)?.provider ?? 'codex') as model (model.slug)}
+                    {#each modelsFor(roleProfile?.provider ?? 'codex', roleProfile?.availableModels) as model (model.slug)}
                       <option value={model.slug}>{model.name}</option>
                     {/each}
                   </select>
@@ -1011,6 +1089,50 @@
             <small>Any descendant in this manager’s hierarchy, and only for actions inside the exact grant ceiling below. Every decision is journaled. Turn this off to route every request to the Overseer/operator. Disabled, unavailable, and out-of-ceiling manager requests automatically escalate for blast-radius review and an explicit operator decision.</small>
           </span>
         </label>
+        {#if canApproveChildren}
+          <label class="approval-toggle">
+            <input type="checkbox" bind:checked={approvalHelperEnabled} />
+            <span>
+              <b>Use a fast Manager Helper</b>
+              <small>Runs one hidden, stateless model review for each in-ceiling request. It has no chat or tools, cannot lower the hubâ€™s risk floor, and wakes the manager whenever it is uncertain or the risk exceeds this policy.</small>
+            </span>
+          </label>
+          {#if approvalHelperEnabled}
+            <div class="helper-grid">
+              <label>
+                <span>Helper account</span>
+                <select value={approvalHelperProfileId} onchange={(event) => chooseApprovalHelperProfile((event.target as HTMLSelectElement).value)}>
+                  {#each availableProfiles as profile (profile.id)}
+                    <option value={profile.id}>{profileOptionLabel(profile)}</option>
+                  {/each}
+                </select>
+              </label>
+              <label>
+                <span>Fast model</span>
+                <select bind:value={approvalHelperModel}>
+                  {#each approvalHelperModels as model (model.slug)}<option value={model.slug}>{model.name}</option>{/each}
+                </select>
+              </label>
+              {#if approvalHelperEffortOptions.length}
+                <label>
+                  <span>Effort</span>
+                  <select bind:value={approvalHelperEffort}>
+                    {#each approvalHelperEffortOptions as option (option.value)}
+                      <option value={option.value}>{option.label}</option>
+                    {/each}
+                  </select>
+                </label>
+              {/if}
+              <label>
+                <span>May decide through</span>
+                <select bind:value={approvalHelperMaxRisk}>
+                  <option value="low">Low risk only</option>
+                  <option value="medium">Low and medium risk</option>
+                </select>
+              </label>
+            </div>
+          {/if}
+        {/if}
         <label class="approval-toggle">
           <input type="checkbox" bind:checked={pauseExhaustedAccounts} />
           <span>
@@ -1084,6 +1206,9 @@
         <div><dt>Parallel target</dt><dd>{parallelismTarget} useful worker lanes when the task supports them</dd></div>
         <div><dt>Child permission ceiling</dt><dd>{maxChildPermissionMode}</dd></div>
         <div><dt>Worker approvals</dt><dd>{canApproveChildren ? 'manager decides in-ceiling; broader requests escalate to Overseer/operator' : 'all requests escalate to Overseer/operator'}</dd></div>
+        {#if canApproveChildren && approvalHelperEnabled}
+          <div><dt>Manager Helper</dt><dd>{approvalHelperProfileId} · {approvalHelperModel || 'default model'} · through {approvalHelperMaxRisk} risk; uncertainty wakes manager</dd></div>
+        {/if}
         <div><dt>Exhausted accounts</dt><dd>{pauseExhaustedAccounts ? 'pause new spawns and messages unless credits/overage are active' : 'no manager-specific dispatch pause'}</dd></div>
         <div><dt>Worker sub-agents</dt><dd>{allowWorkerSubagents ? `up to ${maxSubagentsPerWorker} one-shot descendants per worker` : 'disabled'}</dd></div>
         <div><dt>Worker Git grants</dt><dd>{delegationLabel()}</dd></div>
@@ -1186,6 +1311,7 @@
   .grant-state b { font-size: .75rem; }
   .grant-state span { color: var(--dim); font-size: .7rem; }
   .choices, .tool-grid { display: flex; flex-wrap: wrap; gap: .5rem .8rem; }
+  .helper-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .55rem; margin: .65rem 0 .8rem 1.55rem; padding: .7rem; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-2); }
   .choices label, .tool-grid label { flex-direction: row; align-items: center; gap: .35rem; font-size: .72rem; }
   .tool-grid { padding: .2rem 0 .75rem; }
   .custom-tool { display: grid; grid-template-columns: 1fr auto; align-items: end; gap: .5rem; }
@@ -1207,7 +1333,7 @@
   .error, .empty { color: var(--danger); font-size: var(--text-xs); line-height: 1.4; }
   @media (max-width: 800px) {
     .manager-modal { inset: 1rem; }
-    .body, .row.two, .row.three { grid-template-columns: 1fr; }
+    .body, .row.two, .row.three, .helper-grid { grid-template-columns: 1fr; }
     .setup { border-right: 0; border-bottom: 1px solid var(--border); }
     aside { position: static; }
     .project-choice, .custom-tool { grid-template-columns: 1fr; flex-direction: column; }

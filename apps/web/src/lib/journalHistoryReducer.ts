@@ -172,6 +172,31 @@ export function reduceJournalHistory(events: readonly HubEvent[]): ThreadItem[] 
       })
       continue
     }
+    if (kind === 'manager/approval-helper-decision') {
+      const p = payload as {
+        approvalId?: string
+        decision?: 'approved' | 'denied' | 'escalated'
+        risk?: 'low' | 'medium' | 'high' | 'critical'
+        requestedAction?: string
+        reason?: string
+        helperModel?: string | null
+      }
+      if (p.approvalId && p.decision && p.risk && p.reason) {
+        push({
+          kind: 'note',
+          ts,
+          approvalDecision: {
+            approvalId: p.approvalId,
+            decision: p.decision,
+            risk: p.risk,
+            requestedAction: p.requestedAction,
+            reason: p.reason,
+            helperModel: p.helperModel ?? undefined,
+          },
+        })
+      }
+      continue
+    }
     if (kind === 'session/infrastructure-interruption') {
       push({
         kind: 'note',

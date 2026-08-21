@@ -111,9 +111,9 @@
     if (!profile) return { model: '', effort: '' }
     const model =
       (profile.provider === 'codex' ? settings.defaultCodexModel : settings.defaultClaudeModel) ||
-      defaultModelFor(profile.provider)?.slug ||
+      defaultModelFor(profile.provider, profile.availableModels)?.slug ||
       ''
-    const effortDescriptor = findModel(model)?.descriptors.find((item) => item.id === 'effort')
+    const effortDescriptor = findModel(model, profile.availableModels)?.descriptors.find((item) => item.id === 'effort')
     return {
       model,
       effort: effortDescriptor?.options?.find((item) => item.isDefault)?.value ?? '',
@@ -266,7 +266,8 @@
   }
 
   function changeModel(agent: StartingAgent, model: string): void {
-    const effortDescriptor = findModel(model)?.descriptors.find((item) => item.id === 'effort')
+    const profile = store.profiles.find((item) => item.id === agent.profileId)
+    const effortDescriptor = findModel(model, profile?.availableModels)?.descriptors.find((item) => item.id === 'effort')
     updateAgent(agent.id, {
       model,
       effort: effortDescriptor?.options?.find((item) => item.isDefault)?.value ?? '',
@@ -619,6 +620,7 @@
         operatorTask: config.operatorTask,
         standingInstructions: config.standingInstructions,
         canApproveChildren: config.canApproveChildren,
+        approvalHelper: config.approvalHelper,
         pauseExhaustedAccounts: config.pauseExhaustedAccounts,
         allowWorkerSubagents: config.allowWorkerSubagents,
         maxSubagentsPerWorker: config.maxSubagentsPerWorker,
@@ -1108,7 +1110,8 @@
             </div>
           <div class="agents">
             {#each agents as agent, index (agent.id)}
-              {@const effort = findModel(agent.model)?.descriptors.find((item) => item.id === 'effort')}
+              {@const agentProfile = store.profiles.find((item) => item.id === agent.profileId)}
+              {@const effort = findModel(agent.model, agentProfile?.availableModels)?.descriptors.find((item) => item.id === 'effort')}
               <article class="agent">
                 <div class="agent-head">
                   <div><span class="agent-number">{index + 1}</span><b>Starting agent</b></div>
@@ -1129,7 +1132,7 @@
                   <label>
                     <span>Model</span>
                     <select value={agent.model} onchange={(event) => changeModel(agent, (event.target as HTMLSelectElement).value)}>
-                      {#each modelsFor(store.profiles.find((item) => item.id === agent.profileId)?.provider ?? 'claude') as model (model.slug)}
+                      {#each modelsFor(agentProfile?.provider ?? 'claude', agentProfile?.availableModels) as model (model.slug)}
                         <option value={model.slug}>{model.name}</option>
                       {/each}
                     </select>

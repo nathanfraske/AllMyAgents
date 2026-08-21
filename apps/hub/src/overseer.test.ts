@@ -698,6 +698,9 @@ describe('application Overseer authority', () => {
         manager: {
           profileId: 'p1', permissionMode: 'full', maxChildPermissionMode: 'edits', maxLiveChildren: 2,
           parallelismTarget: 2, canApproveChildren: true, delegation: ['commit'], allowedTools: ['Read', 'Edit'],
+          approvalHelper: {
+            enabled: true, profileId: 'p2', model: 'gpt-5.4-mini', effort: 'low', maxRisk: 'low',
+          },
         },
         agents: [{
           id: 'reviewer', name: 'Reviewer', purpose: 'Review the project.', prompt: 'Inspect the project and report.',
@@ -715,6 +718,13 @@ describe('application Overseer authority', () => {
       isProjectManager: true,
       managerMaxChildPermissionMode: 'edits',
       managerParallelismTarget: 2,
+      managerApprovalHelper: {
+        enabled: true,
+        profileId: 'p2',
+        model: 'gpt-5.4-mini',
+        effort: 'low',
+        maxRisk: 'low',
+      },
       permissionMode: 'full',
     })
     expect(h.sessions.list().find((record) => record.id === data.children[0]!.id)).toMatchObject({

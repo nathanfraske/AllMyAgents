@@ -65,6 +65,34 @@ describe('pure bounded journal history reducer', () => {
     ])
   })
 
+  it('reconstructs an audited Manager Helper decision as an inline expandable note', () => {
+    const items = reduceJournalHistory([
+      event(1, 'manager/approval-helper-decision', {
+        approvalId: 'ap_read_only',
+        decision: 'approved',
+        risk: 'low',
+        requestedAction: 'PowerShell: Get-Process',
+        reason: 'The command only inspects running processes.',
+        helperModel: 'gpt-5.3-codex-spark',
+      }),
+    ])
+
+    expect(items).toHaveLength(1)
+    expect(items[0]).toMatchObject({
+      kind: 'note',
+      historical: true,
+      replayed: true,
+      approvalDecision: {
+        approvalId: 'ap_read_only',
+        decision: 'approved',
+        risk: 'low',
+        requestedAction: 'PowerShell: Get-Process',
+        reason: 'The command only inspects running processes.',
+        helperModel: 'gpt-5.3-codex-spark',
+      },
+    })
+  })
+
   it('reconstructs Claude and Codex compaction lifecycle rows from bounded journal history', () => {
     const claude = reduceJournalHistory([
       event(1, 'claude/system', {

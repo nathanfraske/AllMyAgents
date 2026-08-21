@@ -1,5 +1,7 @@
 // Plain-TS port of t3code's model/option-descriptor contract (no Effect).
 // Codex models + params are from the live `codex app-server` model/list (codex 0.145).
+import type { ProfileModelInfo } from './api'
+
 export type Provider = 'claude' | 'codex'
 
 export interface OptionChoice {
@@ -88,16 +90,49 @@ export const MODELS: ModelDef[] = [
   { slug: 'gpt-5.3-codex-spark', name: 'GPT-5.3 Codex Spark', shortName: '5.3 Codex Spark', provider: 'codex', descriptors: [effort(BASE_EFFORT, 'high')] },
 ]
 
-export function modelsFor(provider: Provider): ModelDef[] {
+function accountModel(model: ProfileModelInfo): ModelDef {
+  const baseline = MODELS.find((item) => item.provider === 'codex' && item.slug === model.slug)
+  const descriptors: OptionDescriptor[] = []
+  if (model.supportedEfforts.length > 0) {
+    descriptors.push(effort(model.supportedEfforts, model.defaultEffort ?? model.supportedEfforts[0] ?? 'medium'))
+  }
+  if (model.serviceTiers.length > 0) {
+    descriptors.push({
+      id: 'serviceTier',
+      label: 'Speed',
+      type: 'select',
+      options: [
+        { value: '', label: 'Standard', isDefault: true },
+        ...model.serviceTiers.map((tier) => ({ value: tier.id, label: tier.name })),
+      ],
+    })
+  }
+  return {
+    slug: model.slug,
+    name: model.name,
+    shortName: baseline?.shortName ?? model.name,
+    provider: 'codex',
+    isDefault: model.isDefault ?? baseline?.isDefault,
+    isNew: baseline?.isNew,
+    descriptors,
+  }
+}
+
+/** Account models replace the global Codex baseline when present: preview access is profile-scoped. */
+export function modelsFor(provider: Provider, availableModels?: readonly ProfileModelInfo[]): ModelDef[] {
+  if (provider === 'codex' && availableModels?.length) return availableModels.map(accountModel)
   return MODELS.filter((m) => m.provider === provider)
 }
 
-export function findModel(slug?: string): ModelDef | undefined {
-  return slug ? MODELS.find((m) => m.slug === slug) : undefined
+export function findModel(slug?: string, availableModels?: readonly ProfileModelInfo[]): ModelDef | undefined {
+  if (!slug) return undefined
+  const account = availableModels?.find((item) => item.slug === slug)
+  return account ? accountModel(account) : MODELS.find((m) => m.slug === slug)
 }
 
-export function defaultModelFor(provider: Provider): ModelDef | undefined {
-  return modelsFor(provider).find((m) => m.isDefault) ?? modelsFor(provider)[0]
+export function defaultModelFor(provider: Provider, availableModels?: readonly ProfileModelInfo[]): ModelDef | undefined {
+  const models = modelsFor(provider, availableModels)
+  return models.find((m) => m.isDefault) ?? models[0]
 }
 
 export function descriptorLabel(d: OptionDescriptor, value: string | undefined): string {

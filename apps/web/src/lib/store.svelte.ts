@@ -214,6 +214,14 @@ export interface ThreadItem {
   kind: ItemKind
   ts: string
   text?: string
+  approvalDecision?: {
+    approvalId: string
+    decision: 'approved' | 'denied' | 'escalated'
+    risk: 'low' | 'medium' | 'high' | 'critical'
+    requestedAction?: string
+    reason: string
+    helperModel?: string
+  }
   toolName?: string
   toolInput?: unknown
   toolResult?: string
@@ -962,6 +970,7 @@ export class HubStore {
         v.record.managerOperatorTaskUpdatedAt = rec.managerOperatorTaskUpdatedAt
         v.record.managerStandingInstructions = rec.managerStandingInstructions
         v.record.managerCanApproveChildren = rec.managerCanApproveChildren
+        v.record.managerApprovalHelper = rec.managerApprovalHelper
         v.record.managerPauseExhaustedAccounts = rec.managerPauseExhaustedAccounts
         v.record.managerAllowWorkerSubagents = rec.managerAllowWorkerSubagents
         v.record.managerMaxSubagentsPerWorker = rec.managerMaxSubagentsPerWorker
@@ -3275,6 +3284,31 @@ export class HubStore {
           text: `⚠ bus-turn guard denied ${(payload as { toolName?: string }).toolName ?? 'a risky tool'} — a teammate-message turn can't write practices`,
         })
         break
+      case 'manager/approval-helper-decision': {
+        const p = payload as {
+          approvalId?: string
+          decision?: 'approved' | 'denied' | 'escalated'
+          risk?: 'low' | 'medium' | 'high' | 'critical'
+          requestedAction?: string
+          reason?: string
+          helperModel?: string | null
+        }
+        if (p.approvalId && p.decision && p.risk && p.reason) {
+          this.push(view, {
+            kind: 'note',
+            ts,
+            approvalDecision: {
+              approvalId: p.approvalId,
+              decision: p.decision,
+              risk: p.risk,
+              requestedAction: p.requestedAction,
+              reason: p.reason,
+              helperModel: p.helperModel ?? undefined,
+            },
+          })
+        }
+        break
+      }
       case 'practice/wrote':
       case 'practice/edited': {
         const p = payload as { scope?: string; title?: string }

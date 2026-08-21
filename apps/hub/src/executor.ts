@@ -35,6 +35,11 @@ import {
 import { checkWriteScope } from './writeScope.js'
 import type { AttachmentMeta } from './attachments.js'
 import { ASK_RESTART_INTERRUPT_MARGIN_MS } from './restartHandshake.js'
+import {
+  evaluateApprovalWithProvider,
+  type ApprovalHelperEvaluation,
+  type ApprovalHelperEvaluationInput,
+} from './approvalHelper.js'
 
 /**
  * The Executor seam (docs/agent-worker-impl.md §4.1). Agent execution — the ClaudeDriver / CodexClient
@@ -63,6 +68,8 @@ export interface Executor {
   /** Drop the driver/thread for a stopped/deleted session from the executor. */
   stopSession(sessionId: string): Promise<void>
   readCodexLimits(profileId: string, profileDir: string): Promise<unknown>
+  /** Hidden stateless approval evaluator. It owns no session, transcript, tools, or durable identity. */
+  evaluateApproval?(input: ApprovalHelperEvaluationInput): Promise<ApprovalHelperEvaluation>
   /** The sessions the executor is still driving (for hub re-attach; a no-op-ish query in-process). */
   listLive(): Promise<LiveSession[]>
   /** Replay per-session events with wseq > since[sid] (a no-op in-process — the hub IS the executor). */
@@ -319,6 +326,10 @@ export class InProcessExecutor implements Executor {
   private hub: InProcessExecutorHubHooks | undefined
 
   constructor(private readonly services: InProcessExecutorServices) {}
+
+  evaluateApproval(input: ApprovalHelperEvaluationInput): Promise<ApprovalHelperEvaluation> {
+    return evaluateApprovalWithProvider(input)
+  }
 
   /** Bind the hub-half side effects. Called once by the hub before any turn runs (mirrors the existing
    *  setRestartSignal late-binding), which breaks the hub↔executor construction cycle. */

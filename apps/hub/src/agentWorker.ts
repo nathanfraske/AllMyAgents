@@ -57,6 +57,7 @@ import {
 } from './questions.js'
 import type { SessionIdentity } from './identity.js'
 import type { DangerFlags } from './types.js'
+import { evaluateApprovalWithProvider } from './approvalHelper.js'
 import {
   APPROVAL_EXPIRED_TEXT,
   CLAUDE_PERMISSION_DENIED_TEXT,
@@ -414,6 +415,21 @@ export class AgentWorker {
         this.readCodexLimits(msg.profileId, msg.profileDir)
           .then((value) => this.server.send({ t: 'codexLimits', reqId: msg.reqId, ok: true, value }))
           .catch((err) => this.server.send({ t: 'codexLimits', reqId: msg.reqId, ok: false, error: errMessage(err) }))
+        return
+      case 'evaluateApproval':
+        evaluateApprovalWithProvider(msg.input)
+          .then((value) => this.server.send({
+            t: 'approvalEvaluation',
+            reqId: msg.reqId,
+            ok: true,
+            value,
+          }))
+          .catch((err) => this.server.send({
+            t: 'approvalEvaluation',
+            reqId: msg.reqId,
+            ok: false,
+            error: errMessage(err),
+          }))
         return
       case 'dangerUpdate':
         this.danger = msg.danger // cached for the STEP 4 MCP-gate danger(); unused today

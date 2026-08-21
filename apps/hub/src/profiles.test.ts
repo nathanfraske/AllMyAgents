@@ -9,6 +9,7 @@ import {
   CLAUDE_DEFAULT_ID,
   CODEX_DEFAULT_ID,
   profileAuthEvidence,
+  readCodexProfileModelCatalog,
 } from './profiles.js'
 import type { Profile } from './types.js'
 
@@ -101,6 +102,76 @@ describe('profileAuthEvidence', () => {
     expect(profileAuthEvidence({ id: `${provider}-refreshable`, provider, dir }, 1_000_000)).toEqual({})
 
     fs.rmSync(dir, { recursive: true, force: true })
+  })
+})
+
+describe('readCodexProfileModelCatalog', () => {
+  it('projects preview access per account without exposing hidden models or provider instructions', () => {
+    const profileA = tmpProfile('codex-a', 'codex')
+    const profileB = tmpProfile('codex-b', 'codex')
+    fs.writeFileSync(path.join(profileA.dir, 'models_cache.json'), JSON.stringify({
+      fetched_at: '2026-08-20T12:34:56.000Z',
+      models: [
+        {
+          slug: 'gpt-daybreak-blue-latest',
+          display_name: 'Daybreak Blue',
+          description: 'Defensive cybersecurity work.',
+          visibility: 'list',
+          default_reasoning_level: 'low',
+          supported_reasoning_levels: [{ effort: 'low' }, { effort: 'ultra' }],
+          service_tiers: [{ id: 'priority', name: 'Fast' }],
+          base_instructions: 'must never leave the provider profile',
+        },
+        { slug: 'codex-auto-review', display_name: 'Auto Review', visibility: 'hide' },
+      ],
+    }))
+    fs.writeFileSync(path.join(profileB.dir, 'models_cache.json'), JSON.stringify({
+      models: [{ slug: 'gpt-5.6-sol', display_name: 'GPT-5.6 Sol', visibility: 'list' }],
+    }))
+
+    expect(readCodexProfileModelCatalog(profileA.dir)).toEqual({
+      updatedAt: '2026-08-20T12:34:56.000Z',
+      models: [{
+        slug: 'gpt-daybreak-blue-latest',
+        name: 'Daybreak Blue',
+        description: 'Defensive cybersecurity work.',
+        supportedEfforts: ['low', 'ultra'],
+        defaultEffort: 'low',
+        serviceTiers: [{ id: 'priority', name: 'Fast' }],
+      }],
+    })
+    expect(readCodexProfileModelCatalog(profileB.dir)?.models.map((model) => model.slug)).toEqual([
+      'gpt-5.6-sol',
+    ])
+    expect(JSON.stringify(readCodexProfileModelCatalog(profileA.dir))).not.toContain('provider profile')
+
+    fs.rmSync(profileA.dir, { recursive: true, force: true })
+    fs.rmSync(profileB.dir, { recursive: true, force: true })
+  })
+
+  it('accepts the live app-server model/list camelCase shape', () => {
+    const profile = tmpProfile('codex-preview', 'codex')
+    fs.writeFileSync(path.join(profile.dir, 'models_cache.json'), JSON.stringify({
+      data: [{
+        id: 'preview-model',
+        displayName: 'Preview Model',
+        hidden: false,
+        defaultReasoningEffort: 'high',
+        supportedReasoningEfforts: [{ reasoningEffort: 'medium' }, { reasoningEffort: 'high' }],
+        serviceTiers: [{ id: 'priority', name: 'Fast' }],
+        isDefault: true,
+      }],
+    }))
+
+    expect(readCodexProfileModelCatalog(profile.dir)?.models).toEqual([{
+      slug: 'preview-model',
+      name: 'Preview Model',
+      supportedEfforts: ['medium', 'high'],
+      defaultEffort: 'high',
+      serviceTiers: [{ id: 'priority', name: 'Fast' }],
+      isDefault: true,
+    }])
+    fs.rmSync(profile.dir, { recursive: true, force: true })
   })
 })
 

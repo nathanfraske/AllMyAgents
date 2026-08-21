@@ -4,6 +4,7 @@ import { HubUnavailableError } from './workerProtocol.js'
 import type { WorkerClient } from './workerTransport.js'
 import type { WorkerSessionSpec, WorkerToHub } from './workerProtocol.js'
 import type { AttachmentMeta } from './attachments.js'
+import type { ApprovalHelperEvaluationInput } from './approvalHelper.js'
 
 /**
  * A WorkerClient whose `call()` always rejects the way the real one does when the worker is not
@@ -263,5 +264,55 @@ describe('WorkerExecutor approval relay', () => {
       status: 'approved',
       persist: 'always',
     }))
+  })
+})
+
+describe('WorkerExecutor approval helper RPC', () => {
+  it('carries the isolated evaluation request to the worker and returns its bounded decision', async () => {
+    const calls: unknown[] = []
+    const client = {
+      onEvent: () => {},
+      onTurnLifecycle: () => {},
+      onRestartRequest: () => {},
+      onRelay: () => {},
+      onWelcome: () => {},
+      on: () => {},
+      connect: () => {},
+      send: () => {},
+      call: async (msg: { t: string; reqId: string; input?: ApprovalHelperEvaluationInput }) => {
+        calls.push(msg)
+        return {
+          t: 'approvalEvaluation',
+          reqId: msg.reqId,
+          ok: true,
+          value: {
+            riskLevel: 'low',
+            requested: 'yes',
+            decision: 'allow',
+            reason: 'Read-only inspection is within the stated task.',
+          },
+        }
+      },
+    } as unknown as WorkerClient
+    const exec = new WorkerExecutor(client, recordingHub().hub)
+    const input: ApprovalHelperEvaluationInput = {
+      profileId: 'codex-a',
+      profileDir: '/tmp/codex-a',
+      provider: 'codex',
+      model: 'gpt-5.3-codex-spark',
+      effort: 'low',
+      prompt: 'Review one request.',
+      riskFloor: 'low',
+    }
+
+    await expect(exec.evaluateApproval(input)).resolves.toEqual({
+      riskLevel: 'low',
+      requested: 'yes',
+      decision: 'allow',
+      reason: 'Read-only inspection is within the stated task.',
+    })
+    expect(calls).toEqual([
+      expect.objectContaining({ t: 'evaluateApproval', input }),
+    ])
   })
 })
