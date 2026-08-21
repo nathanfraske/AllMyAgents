@@ -5,6 +5,26 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.32-alpha.36 — 2026-08-20
+
+This release removes a false Codex manager-attribution block, adds a hidden risk-bounded Manager Helper for
+routine child approvals, and discovers preview/Cyber models from each exact Codex account instead of assuming
+that every signed-in account has the same catalog.
+
+[Full v0.1.32-alpha.36 release notes](docs/releases/v0.1.32-alpha.36.md)
+
+- `decide_child_approval` can now attribute the one manager that owns an exact pending request even when a Codex
+  manager and child intentionally share an account and checkout. Every unrelated ambiguous tool call remains
+  fail-closed.
+- Managers can optionally use a hidden, stateless fast-model helper for low- or medium-risk approvals. A
+  deterministic risk floor, the live manager hierarchy, and the operator's exact capability ceiling are checked
+  before and after evaluation; uncertainty, provider failure, entitlement loss, or broader risk wakes the manager.
+- Helper decisions are fully journaled and shown as compact expandable cards in the requesting agent's timeline.
+  The helper has no chat, project tools, MCP servers, hooks, plugins, memories, or writable workspace.
+- Codex model choices now come from the provider-maintained catalog for the selected account. Preview/Cyber access
+  such as Daybreak Blue appears only on accounts that advertise it, with the provider's supported effort and speed
+  options, and never leaks into another account's picker or the global default.
+
 ## v0.1.31-alpha.35 — 2026-08-20
 
 This release repairs asymmetric fleet discovery and pairing when the direct MyOwnMesh control pipe is unavailable
