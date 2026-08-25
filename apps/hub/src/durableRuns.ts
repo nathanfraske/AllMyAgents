@@ -163,6 +163,7 @@ interface RunRow {
   stderrBytes: number
   logsTruncated: number
   resultJson: string | null
+  continuationAt: string | null
 }
 
 interface DurableRunJournal {
@@ -494,7 +495,8 @@ export class DurableRunStore {
         stdoutBytes INTEGER NOT NULL DEFAULT 0,
         stderrBytes INTEGER NOT NULL DEFAULT 0,
         logsTruncated INTEGER NOT NULL DEFAULT 0,
-        resultJson TEXT
+        resultJson TEXT,
+        continuationAt TEXT
       );
       CREATE INDEX IF NOT EXISTS durable_runs_project_created_idx ON durable_runs(projectId, createdAt DESC, id DESC);
       CREATE INDEX IF NOT EXISTS durable_runs_state_created_idx ON durable_runs(state, createdAt ASC, id ASC);
@@ -513,6 +515,15 @@ export class DurableRunStore {
       db.exec(`ALTER TABLE durable_runs ADD COLUMN executionTargetJson TEXT NOT NULL DEFAULT '{"kind":"local"}'`)
     }
     if (!columns.has('resultJson')) db.exec('ALTER TABLE durable_runs ADD COLUMN resultJson TEXT')
+    if (!columns.has('continuationAt')) {
+      // Runs terminal before this capability existed must not wake their owners en masse on upgrade.
+      db.exec('ALTER TABLE durable_runs ADD COLUMN continuationAt TEXT')
+      db.exec(`
+        UPDATE durable_runs
+        SET continuationAt = COALESCE(completedAt, createdAt)
+        WHERE state IN ('succeeded','failed','cancelled','outcome_unknown')
+      `)
+    }
     this.createTx = db.transaction((row) => {
       db.prepare(`INSERT INTO durable_runs (
         id, projectId, sessionId, actorSessionId, actorLabel, targetSessionId, executionTargetJson, kind, state,
@@ -623,6 +634,7 @@ export class DurableRunStore {
       stderrBytes: 0,
       logsTruncated: 0,
       resultJson: null,
+      continuationAt: null,
     } satisfies RunRow
     this.createTx(row)
     return this.get(id)!
@@ -683,6 +695,26 @@ export class DurableRunStore {
 
   get(id: string): DurableRun | undefined {
     return fromRow(this.db.prepare('SELECT * FROM durable_runs WHERE id = ?').get(id) as RunRow | undefined)
+  }
+
+  pendingContinuations(limit = 200): DurableRun[] {
+    return (this.db.prepare(`
+      SELECT * FROM durable_runs
+      WHERE continuationAt IS NULL
+        AND state IN ('succeeded','failed','cancelled','outcome_unknown')
+      ORDER BY completedAt ASC, id ASC
+      LIMIT ?
+    `).all(Math.max(1, Math.min(Math.trunc(limit), 1_000))) as RunRow[]).map((row) => fromRow(row)!)
+  }
+
+  markContinuationNotified(id: string): boolean {
+    return this.db.prepare(`
+      UPDATE durable_runs
+      SET continuationAt = ?
+      WHERE id = ?
+        AND continuationAt IS NULL
+        AND state IN ('succeeded','failed','cancelled','outcome_unknown')
+    `).run(new Date().toISOString(), id).changes === 1
   }
 
   queued(): DurableRun[] {
@@ -773,9 +805,11 @@ export class DurableRunController {
   private active = false
   private pumping = false
   private monitor: NodeJS.Timeout | undefined
+  private readonly reportedContinuationFailures = new Set<string>()
   private remoteExecutor:
     | ((run: DurableRun, target: Extract<DurableRunExecutionTarget, { kind: 'remote' }>) => Promise<RemoteDeviceActionResult>)
     | undefined
+  private terminalListener: ((run: DurableRun) => void) | undefined
 
   constructor(
     readonly store: DurableRunStore,
@@ -791,12 +825,65 @@ export class DurableRunController {
     this.remoteExecutor = executor
   }
 
+  /**
+   * Publish the one durable terminal boundary to the session coordinator. The listener is deliberately
+   * installed by SessionManager rather than passed through the constructor: the run store is created
+   * before sessions during hub boot, while interrupted-run reconciliation starts only after both exist.
+   */
+  setTerminalListener(listener: (run: DurableRun) => void): void {
+    this.terminalListener = listener
+  }
+
+  private notifyTerminal(run: DurableRun): void {
+    if (!this.terminalListener) return
+    this.terminalListener(run)
+    this.store.markContinuationNotified(run.id)
+    this.reportedContinuationFailures.delete(run.id)
+  }
+
+  private notifyPendingContinuations(): void {
+    for (const run of this.store.pendingContinuations()) {
+      try {
+        this.notifyTerminal(run)
+      } catch (error) {
+        if (this.reportedContinuationFailures.has(run.id)) continue
+        this.reportedContinuationFailures.add(run.id)
+        const message = boundedText(error instanceof Error ? error.message : String(error), 1_000)
+        console.error(`[runs] could not notify ${run.actorSessionId} about terminal run ${run.id}: ${message}`)
+      }
+    }
+  }
+
+  private recordTerminal(run: DurableRun): void {
+    this.journal.append(run.sessionId, `run/${run.state.replace('_', '-')}`, this.lifecyclePayload(run))
+    try {
+      this.notifyTerminal(run)
+    } catch (error) {
+      // The run's exact terminal state is already durable. A notification failure must not escape a child
+      // process close handler or make the queue pump confuse a completed command with a launch failure.
+      const message = boundedText(error instanceof Error ? error.message : String(error), 1_000)
+      this.reportedContinuationFailures.add(run.id)
+      try {
+        this.journal.append(run.sessionId, 'run/continuation-notification-failed', {
+          runId: run.id,
+          actorSessionId: run.actorSessionId,
+          state: run.state,
+          error: message,
+        })
+      } catch {
+        console.error(`[runs] could not notify ${run.actorSessionId} about terminal run ${run.id}: ${message}`)
+      }
+    }
+  }
+
   activate(): DurableRun[] {
     if (this.active) return []
     this.active = true
     const interrupted = this.reconcileStaleOwners()
+    this.notifyPendingContinuations()
     this.monitor = setInterval(() => {
       this.reconcileStaleOwners()
+      this.notifyPendingContinuations()
       void this.pump()
     }, 5_000)
     this.monitor.unref?.()
@@ -822,7 +909,7 @@ export class DurableRunController {
       excludeRunIds,
     })
     for (const run of interrupted) {
-      this.journal.append(run.sessionId, 'run/outcome-unknown', this.lifecyclePayload(run))
+      this.recordTerminal(run)
     }
     return interrupted
   }
@@ -866,7 +953,7 @@ export class DurableRunController {
     const child = this.children.get(runId)
     if (child) terminateTree(child)
     if (before.state === 'queued' && updated?.state === 'cancelled') {
-      this.journal.append(updated.sessionId, 'run/cancelled', this.lifecyclePayload(updated))
+      this.recordTerminal(updated)
       void this.pump()
     }
     return updated
@@ -905,7 +992,7 @@ export class DurableRunController {
       state: 'failed',
       error: boundedText(error instanceof Error ? error.message : String(error), 2_000),
     })
-    if (final) this.journal.append(final.sessionId, 'run/failed', this.lifecyclePayload(final))
+    if (final) this.recordTerminal(final)
     void this.pump()
   }
 
@@ -981,7 +1068,7 @@ export class DurableRunController {
         stderrBytes,
         logsTruncated,
       })
-      if (final) this.journal.append(final.sessionId, `run/${final.state.replace('_', '-')}`, this.lifecyclePayload(final))
+      if (final) this.recordTerminal(final)
       void this.pump()
     }
     child.once('error', (error) => settle(127, null, error))
@@ -1035,7 +1122,7 @@ export class DurableRunController {
         remoteRunId: result.runId,
       },
     })
-    if (final) this.journal.append(final.sessionId, `run/${final.state.replace('_', '-')}`, this.lifecyclePayload(final))
+    if (final) this.recordTerminal(final)
     void this.pump()
   }
 

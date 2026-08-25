@@ -760,6 +760,13 @@
     else if (anchorKey === null) anchorKey = latestMainItemKey(view?.items ?? [])
     if (m.scrollTop <= 96) void loadOlderAtTop()
   }
+
+  function onScrollIntent(): void {
+    // WebView can deliver the scroll event after a streamed item has already changed layout. Treat the
+    // wheel/touch gesture itself as the operator taking control so that intervening manager output cannot
+    // use a stale `stick=true` value to yank the transcript back to the live edge.
+    stick = false
+  }
   const newBelow = $derived(mainItemsBelow(view?.items ?? [], anchorKey))
   function jumpToBottom(): void {
     if (!scroller) return
@@ -1115,7 +1122,14 @@
           if (out.error) fail(out.error)
           else succeed()
         } else {
-          store.enqueue(sid0, body, upload.meta)
+          store.enqueue(
+            sid0,
+            body,
+            upload.meta,
+            view.record.status === 'starting' && store.prefs.steerMessagesAtToolBoundary
+              ? 'when-active'
+              : 'after-turn',
+          )
           succeed()
         }
         return
@@ -1365,8 +1379,12 @@
     data-overseer-anchor="history"
     class:peek-stream={composerOnly}
     class:replay-rebuild={store.replayPresentationActive}
+    role="log"
+    aria-label="Conversation transcript"
     bind:this={scroller}
     onscroll={onScroll}
+    onwheel={onScrollIntent}
+    ontouchmove={onScrollIntent}
   >
     {#if !composerOnly && (view.journalHistoryOlderCursor != null || view.historyOlderCursor != null)}
       <button

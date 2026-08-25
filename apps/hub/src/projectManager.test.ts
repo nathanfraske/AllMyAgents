@@ -1560,6 +1560,74 @@ describe('operator-enabled worker one-shot sub-agents', () => {
 })
 
 describe('project manager visibility into its own workers', () => {
+  it('wakes the run owner exactly once after a terminal durable result', async () => {
+    const { sessions, journal, bus, projects, seed, repo, runTurn } = buildHub()
+    const project = projects.create('Run continuation project', repo)
+    const manager = seed({ id: 'manager', projectId: project.id, isProjectManager: true, status: 'idle' })
+    const controller = new DurableRunController(
+      new DurableRunStore(journal.db),
+      journal,
+      path.join(path.dirname(repo), 'continuation-run-logs'),
+    )
+    sessions.setDurableRunController(controller)
+    controller.activate()
+    cleanups.push(() => controller.shutdown())
+
+    const result = await sessions.managerStartRun(manager.id, {
+      kind: 'test',
+      executable: process.execPath,
+      args: ['-e', 'process.stderr.write("compile failed\\n"); process.exit(19)'],
+    })
+    expect(result.ok).toBe(true)
+    await vi.waitFor(() => expect(controller.store.get(result.run!.id)?.state).toBe('failed'))
+    await vi.waitFor(() => expect(runTurn).toHaveBeenCalledOnce())
+
+    expect(runTurn.mock.calls[0]?.[1]).toContain(`Durable test run ${result.run!.id}`)
+    expect(runTurn.mock.calls[0]?.[1]).toContain('failed (exit 19)')
+    expect(runTurn.mock.calls[0]?.[1]).toContain(`Inspect run ${result.run!.id}`)
+    expect(bus.pending(manager.id)).toEqual([])
+    expect(sessions.busInbox(manager.id)).toMatchObject([
+      { subject: 'durable run failed', wake: true, attentionRequired: true, delivered: true },
+    ])
+    expect(journal.recentEventsForSession(manager.id)).toContainEqual(expect.objectContaining({
+      kind: 'run/continuation-enqueued',
+      payload: expect.objectContaining({ runId: result.run!.id, state: 'failed', ownerStatus: 'idle' }),
+    }))
+  })
+
+  it('queues a terminal durable result during an active turn and starts one follow-up after idle', async () => {
+    const { sessions, journal, bus, projects, seed, repo, runTurn } = buildHub()
+    const project = projects.create('Deferred run continuation project', repo)
+    const manager = seed({ id: 'manager', projectId: project.id, isProjectManager: true, status: 'active' })
+    const controller = new DurableRunController(
+      new DurableRunStore(journal.db),
+      journal,
+      path.join(path.dirname(repo), 'deferred-continuation-run-logs'),
+    )
+    sessions.setDurableRunController(controller)
+    controller.activate()
+    cleanups.push(() => controller.shutdown())
+
+    const result = await sessions.managerStartRun(manager.id, {
+      kind: 'build',
+      executable: process.execPath,
+      args: ['-e', 'process.exit(0)'],
+    })
+    expect(result.ok).toBe(true)
+    await vi.waitFor(() => expect(controller.store.get(result.run!.id)?.state).toBe('succeeded'))
+    await new Promise<void>((resolve) => setImmediate(resolve))
+
+    expect(runTurn).not.toHaveBeenCalled()
+    expect(bus.pending(manager.id)).toMatchObject([
+      { subject: 'durable run succeeded', wake: true, attentionRequired: true, delivered: false },
+    ])
+
+    transition(sessions, manager.id, 'idle')
+    await vi.waitFor(() => expect(runTurn).toHaveBeenCalledOnce())
+    expect(runTurn.mock.calls[0]?.[1]).toContain(`Durable build run ${result.run!.id}`)
+    expect(bus.pending(manager.id)).toEqual([])
+  })
+
   it('starts and inspects a resource-leased run only inside its managed project scope', async () => {
     const { sessions, journal, projects, seed, repo } = buildHub()
     const project = projects.create('Run project', repo)

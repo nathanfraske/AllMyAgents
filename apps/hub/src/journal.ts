@@ -91,6 +91,10 @@ export const JOURNAL_STORAGE_MAX_INCREMENTAL_VACUUM_PAGES = 16_384
 export const JOURNAL_REPLAY_PROTOCOL_VERSION = 1 as const
 export const JOURNAL_HISTORY_PAGE_MAX_ROWS = 80
 export const JOURNAL_HISTORY_PAGE_MAX_BYTES = 512 * 1024
+// A UI page seeds one viewport; it is not a transcript dump. The wider constants above remain the hard
+// API/test ceiling, while normal panes use the smaller working set and page older history losslessly.
+export const JOURNAL_HISTORY_VIEW_ROWS = 40
+export const JOURNAL_HISTORY_VIEW_BYTES = 256 * 1024
 
 // A history page is a transcript projection, not a second copy of the raw worker protocol. Codex
 // streams one journal row for almost every text/output fragment, so selecting the latest 80 raw rows

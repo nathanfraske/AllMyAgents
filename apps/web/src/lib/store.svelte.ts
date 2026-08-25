@@ -131,7 +131,6 @@ function utf8Bytes(value: string): number {
   return new TextEncoder().encode(value).byteLength
 }
 const HUB_READ_TIMEOUT_MS = 8_000
-const HISTORY_READ_RETRY_TIMEOUT_MS = 20_000
 
 class HubReadTimeoutError extends Error {
   constructor(
@@ -167,16 +166,11 @@ async function resilientHistoryRead<T>(
   label: string,
   read: (signal: AbortSignal) => Promise<T>,
 ): Promise<T> {
-  try {
-    return await boundedHubRead(label, read)
-  } catch (error) {
-    // A periodic journal task once held SQLite's writer lock long enough to pause the entire hub event
-    // loop. The first HTTP request was still valid; the renderer's fixed eight-second deadline simply won
-    // the race. Retry once with a fresh AbortSignal so a transient hub pause cannot permanently replace an
-    // agent's transcript with an empty pane. Real HTTP failures remain immediate and visible.
-    if (!(error instanceof HubReadTimeoutError)) throw error
-    return await boundedHubRead(label, read, HISTORY_READ_RETRY_TIMEOUT_MS)
-  }
+  // Journal maintenance and blob hydration no longer block the hub event loop. The old compatibility
+  // retry silently extended one eight-second timeout into a 28-second blank pane, which now hides a real
+  // fault rather than healing it. Fail visibly at the bound; the transcript keeps an explicit Retry
+  // affordance and the next attempt receives a fresh signal without pretending the conversation is empty.
+  return await boundedHubRead(label, read)
 }
 
 function changedJournalHistoryGeneration(error: unknown): number | undefined {
@@ -599,8 +593,19 @@ export class HubStore {
     return (this.queues[sessionId] ?? []).map((q) => (typeof q === 'string' ? q : q.text))
   }
 
-  enqueue(sessionId: string, text: string, attachments: AttachmentMeta[] = []): void {
-    const entry: QueuedEntry = attachments.length ? { text, attachments } : text
+  enqueue(
+    sessionId: string,
+    text: string,
+    attachments: AttachmentMeta[] = [],
+    delivery: 'after-turn' | 'when-active' = 'after-turn',
+  ): void {
+    const entry: QueuedEntry = attachments.length || delivery === 'when-active'
+      ? {
+          text,
+          ...(attachments.length ? { attachments } : {}),
+          ...(delivery === 'when-active' ? { delivery } : {}),
+        }
+      : text
     const q = [...(this.queues[sessionId] ?? []), entry]
     this.queues = { ...this.queues, [sessionId]: q }
     saveQueues(this.queues)
@@ -645,7 +650,14 @@ export class HubStore {
     setTimeout(() => {
       this.pendingFlush.delete(sessionId)
       const view = this.sessions[sessionId]
-      if (!view || view.record.status !== 'idle') return
+      if (!view) return
+      const first = this.queues[sessionId]?.[0]
+      const activeSteer =
+        view.record.status === 'active' &&
+        this.prefs.steerMessagesAtToolBoundary &&
+        typeof first !== 'string' &&
+        first?.delivery === 'when-active'
+      if (view.record.status !== 'idle' && !activeSteer) return
       // Require a turn that actually SUCCEEDED, not merely a session that is idle. `idle` is reached by
       // several paths that are not "the previous turn finished and the next one should start": a reopen,
       // a stale-session reconcile after a worker loss, and the unwind of an operator interrupt all land
@@ -663,8 +675,8 @@ export class HubStore {
       // never reaches here at all: its status is 'stopped', not 'idle', so the guard above already
       // excludes the dangerous case this rule originally existed for (Stop removes the worktree, so
       // auto-restarting would run against a directory that no longer exists).
-      if (view.lastTurnOk === false) return
-      void this.flushQueue(sessionId)
+      if (!activeSteer && view.lastTurnOk === false) return
+      void this.flushQueue(sessionId, activeSteer ? 'when-active' : 'after-turn')
     }, 0)
   }
 
@@ -678,12 +690,28 @@ export class HubStore {
    * claiming it had been sent. A reload then removed the bubble too, and the message had never existed
    * anywhere. That is the same divergence ThreadView.send() already handles correctly for direct sends.
    */
-  private async flushQueue(sessionId: string): Promise<void> {
+  private async flushQueue(
+    sessionId: string,
+    delivery: 'after-turn' | 'when-active' = 'after-turn',
+  ): Promise<void> {
     const q = this.queues[sessionId]
     if (!q || q.length === 0) return
     let chosen: QueuedEntry[]
     let rest: QueuedEntry[]
-    if (settings.combineQueued) {
+    if (delivery === 'when-active') {
+      const boundary = q.findIndex(
+        (entry) => typeof entry === 'string' || entry.delivery !== 'when-active',
+      )
+      const eligible = boundary < 0 ? q : q.slice(0, boundary)
+      if (eligible.length === 0) return
+      if (settings.combineQueued) {
+        chosen = eligible
+        rest = q.slice(eligible.length)
+      } else {
+        chosen = [eligible[0] as QueuedEntry]
+        rest = q.slice(1)
+      }
+    } else if (settings.combineQueued) {
       chosen = q
       rest = []
     } else {
@@ -700,11 +728,20 @@ export class HubStore {
     const res = (await (attachments.length
       ? api.send(sessionId, toSend, { attachments: attachments.map((a) => a.id) })
       : api.send(sessionId, toSend))) as { error?: string } | undefined
-    if (!res?.error) return
+    if (!res?.error) {
+      if (delivery === 'when-active') this.scheduleQueueFlush(sessionId)
+      return
+    }
     // Put it back at the HEAD so ordering survives, withdraw the echo (which also clears the suppress
     // flag and the thinking spinner), and say so — a queued message must never disappear silently.
     const current = this.queues[sessionId] ?? []
-    const restored: QueuedEntry = attachments.length ? { text: toSend, attachments } : toSend
+    const restored: QueuedEntry = attachments.length || delivery === 'when-active'
+      ? {
+          text: toSend,
+          ...(attachments.length ? { attachments } : {}),
+          ...(delivery === 'when-active' ? { delivery } : {}),
+        }
+      : toSend
     this.queues = { ...this.queues, [sessionId]: [restored, ...current] }
     saveQueues(this.queues)
     this.removeItem(sessionId, key)
@@ -3096,7 +3133,7 @@ export class HubStore {
         // unavailable, each send produced another error status, which flushed the next message, and so on
         // until the queue drained into a dead worker. An error boundary should surface the queue for the
         // operator to retry, not spend it. The text stays queued and goes on the next real completion.
-        if (status === 'idle') this.scheduleQueueFlush(sessionId)
+        if (status === 'idle' || status === 'active') this.scheduleQueueFlush(sessionId)
         break
       }
       case 'manager/teams-updated': {

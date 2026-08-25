@@ -189,13 +189,15 @@ const QUEUES_KEY = 'allmyagents.ui.queuedMessages'
 export interface QueuedMessage {
   text: string
   attachments?: AttachmentMeta[]
+  /** Deliver this startup-window message as soon as the vendor turn becomes steerable. */
+  delivery?: 'when-active'
 }
 export type QueuedEntry = string | QueuedMessage
 
 function queuedEntry(value: unknown): QueuedEntry | null {
   if (typeof value === 'string') return value
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
-  const raw = value as { text?: unknown; attachments?: unknown }
+  const raw = value as { text?: unknown; attachments?: unknown; delivery?: unknown }
   if (typeof raw.text !== 'string') return null
   const attachments = Array.isArray(raw.attachments)
     ? raw.attachments.filter((a): a is AttachmentMeta => {
@@ -210,7 +212,11 @@ function queuedEntry(value: unknown): QueuedEntry | null {
         )
       })
     : undefined
-  return { text: raw.text, ...(attachments?.length ? { attachments } : {}) }
+  return {
+    text: raw.text,
+    ...(attachments?.length ? { attachments } : {}),
+    ...(raw.delivery === 'when-active' ? { delivery: 'when-active' as const } : {}),
+  }
 }
 
 export function loadQueues(): Record<string, QueuedEntry[]> {

@@ -788,6 +788,25 @@ describe('apply()', () => {
     expect(store.queueFor('st2')).toEqual([])
   })
 
+  it('promotes a startup-window message to a live steer when the turn becomes active', async () => {
+    seed('starting-steer')
+    store.sessions['starting-steer']!.record.status = 'starting'
+    store.enqueue('starting-steer', 'correct the running manager', [], 'when-active')
+
+    apply(
+      evt({
+        seq: 1,
+        kind: 'session/status',
+        sessionId: 'starting-steer',
+        payload: { status: 'active' },
+      }),
+    )
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(api.send).toHaveBeenCalledWith('starting-steer', 'correct the running manager')
+    expect(store.queueFor('starting-steer')).toEqual([])
+  })
+
   it('ignores events whose seq is <= lastSeq (dedup / replay guard)', () => {
     store.lastSeq = 5
     apply(evt({ seq: 5, kind: 'session/created', sessionId: 'old', payload: rec('old') }))
@@ -1754,7 +1773,7 @@ describe('bounded cold baseline and global maintenance status', () => {
     expect(api.history).toHaveBeenCalledTimes(2)
   })
 
-  it('automatically retries latest history after a transient hub event-loop timeout', async () => {
+  it('surfaces the bounded history timeout and succeeds on an explicit retry', async () => {
     vi.useFakeTimers()
     const cold = new HubStore()
     const install = cold as unknown as {
@@ -1793,6 +1812,11 @@ describe('bounded cold baseline and global maintenance status', () => {
     const loading = cold.ensureHistory('s1')
     await vi.advanceTimersByTimeAsync(8_000)
     await loading
+
+    expect(api.journalHistory).toHaveBeenCalledTimes(1)
+    expect(cold.sessions.s1?.historyLoadError).toContain('timed out after 8 seconds')
+
+    await cold.ensureHistory('s1')
     vi.useRealTimers()
 
     expect(api.journalHistory).toHaveBeenCalledTimes(2)
