@@ -954,6 +954,7 @@ describe('application Overseer authority', () => {
     h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
     h.seed({
       id: 'manager', title: 'Manager', isProjectManager: true, managerCanApproveChildren: true,
+      managerApprovalHelper: { enabled: false, profileId: 'p1', maxRisk: 'low' },
       managerAllowedTools: ['commandExecution'], projectId: 'project-a', status: 'idle',
     })
     h.seed({ id: 'child', title: 'Worker', parentSessionId: 'manager', projectId: 'project-a', status: 'active' })
