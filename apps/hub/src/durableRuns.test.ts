@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   DurableRunController,
   DurableRunStore,
@@ -124,6 +124,8 @@ describe('DurableRunController', () => {
       path.join(tempDir(), 'logs'),
     )
     controllers.push(controller)
+    const terminal = vi.fn()
+    controller.setTerminalListener(terminal)
     controller.activate()
 
     const run = await controller.start(input(cwd))
@@ -140,6 +142,32 @@ describe('DurableRunController', () => {
     expect(events.map((event) => event.kind)).toEqual(
       expect.arrayContaining(['run/queued', 'run/started', 'run/succeeded']),
     )
+    expect(terminal).toHaveBeenCalledOnce()
+    expect(terminal).toHaveBeenCalledWith(expect.objectContaining({ id: run.id, state: 'succeeded' }))
+    expect(store.pendingContinuations()).toEqual([])
+  })
+
+  it('replays an unacknowledged terminal continuation once after controller ownership changes', async () => {
+    const { db, store, cwd } = harness()
+    const runInput = input(cwd)
+    const run = store.create(runInput, await captureRunProvenance(runInput))
+    expect(store.tryClaim(run.id)).toBe(true)
+    expect(store.finish(run.id, { state: 'failed', exitCode: 7 })).toMatchObject({ state: 'failed' })
+    expect(store.pendingContinuations()).toMatchObject([{ id: run.id, state: 'failed' }])
+
+    const terminal = vi.fn()
+    const controller = new DurableRunController(
+      store,
+      { db, append: () => undefined },
+      path.join(tempDir(), 'logs'),
+    )
+    controllers.push(controller)
+    controller.setTerminalListener(terminal)
+    controller.activate()
+
+    expect(terminal).toHaveBeenCalledOnce()
+    expect(terminal).toHaveBeenCalledWith(expect.objectContaining({ id: run.id, state: 'failed' }))
+    expect(store.pendingContinuations()).toEqual([])
   })
 
   it('uses the same leased run handle for a remote target and retains transfer telemetry', async () => {

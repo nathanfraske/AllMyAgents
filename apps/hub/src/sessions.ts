@@ -88,6 +88,7 @@ import type { BrowserBroker } from './browserBroker.js'
 import type { NotificationService, NotificationSourceRole } from './notifications.js'
 import type { TestbedRunStore } from './testbedRuns.js'
 import type {
+  DurableRun,
   DurableRunController,
   DurableRunExecutionEnvironment,
   DurableRunKind,
@@ -1894,6 +1895,7 @@ export class SessionManager {
 
   setDurableRunController(controller: DurableRunController): void {
     this.durableRuns = controller
+    controller.setTerminalListener((run) => this.reportDurableRunTerminal(run))
     controller.setRemoteExecutor(async (run, target) => {
       let cwd = target.cwd
       const record = this.sessions.get(run.targetSessionId)
@@ -1910,6 +1912,79 @@ export class SessionManager {
         timeoutMs: run.timeoutMs,
       }, { durableRunId: run.id })
     })
+  }
+
+  /**
+   * A run handle is intentionally non-blocking, but its owner still needs a continuation when the exact
+   * outcome becomes known. Persist one action-required inbox item at the controller's terminal boundary.
+   * If the owner is already turning, leave it queued: the normal active -> idle delivery starts a fresh
+   * bus-origin turn instead of racing a late steer into work that is already finishing.
+   */
+  private reportDurableRunTerminal(run: DurableRun): void {
+    const owner = this.sessions.get(run.actorSessionId)
+    if (!owner) {
+      this.journal.append(run.sessionId, 'run/continuation-orphaned', {
+        runId: run.id,
+        actorSessionId: run.actorSessionId,
+        state: run.state,
+      })
+      return
+    }
+    const target = this.sessions.get(run.targetSessionId)
+    const targetLabel = target?.title ?? (target ? identityOf(target).label : run.targetSessionId)
+    const exit = run.exitCode === undefined || run.exitCode === null ? '' : ` (exit ${run.exitCode})`
+    const signal = run.signal ? `, signal ${run.signal}` : ''
+    const outcome = run.state === 'succeeded'
+      ? `succeeded${exit}`
+      : run.state === 'failed'
+        ? `failed${exit}${signal}`
+        : run.state === 'cancelled'
+          ? `was cancelled${exit}${signal}`
+          : 'ended with an unknown outcome because hub ownership changed before completion was observed'
+    const error = run.error?.replace(/\s+/gu, ' ').trim().slice(0, 500)
+    const next = run.state === 'outcome_unknown'
+      ? `Inspect run ${run.id} before deciding what happened. Do not retry it blindly because it may have completed on the target.`
+      : `Inspect run ${run.id} for retained logs and exact evidence, then continue the task from this terminal state.`
+    const body = [
+      `Durable ${run.kind} run ${run.id} for ${targetLabel} ${outcome}.`,
+      `Command: ${run.commandSummary}`,
+      ...(error ? [`Bounded failure detail: ${error}`] : []),
+      next,
+    ].join('\n')
+    const posted = this.bus.postExternal({
+      receiptKey: `durable-run-terminal:${run.id}`,
+      from: target && target.id !== owner.id
+        ? identityOf(target)
+        : {
+            sessionId: `durable-run:${run.id}`,
+            profileId: owner.profileId,
+            provider: owner.provider,
+            projectId: owner.projectId,
+            label: 'Durable run service',
+          },
+      project: run.projectId === APPLICATION_RUN_SCOPE_ID ? null : run.projectId,
+      to: { kind: 'session', id: owner.id },
+      subject: `durable run ${run.state.replace('_', ' ')}`,
+      body,
+      recipients: [owner.id],
+      wake: true,
+      attentionRequired: true,
+    })
+    if (posted.accepted) {
+      this.journal.append(owner.id, 'run/continuation-enqueued', {
+        runId: run.id,
+        actorSessionId: owner.id,
+        targetSessionId: run.targetSessionId,
+        state: run.state,
+        messageIds: posted.messages.map((message) => message.id),
+        ownerStatus: owner.status,
+      })
+    }
+    if (owner.status === 'idle') {
+      setImmediate(() => {
+        if (this.sessions.get(owner.id)?.status === 'idle') this.deliverBus(owner.id)
+      })
+    }
   }
 
   /** Server-owned integrations are installed after their coordinators are constructed. Keeping them
