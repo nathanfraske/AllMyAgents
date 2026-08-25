@@ -97,7 +97,7 @@
   <div class="helper-decision {item.approvalDecision.decision}">
     <button class="helper-head" onclick={() => (detailOpen = !detailOpen)} aria-expanded={detailOpen}>
       <span class="helper-mark" aria-hidden="true">{item.approvalDecision.decision === 'approved' ? '✓' : item.approvalDecision.decision === 'denied' ? '×' : '↑'}</span>
-      <b>Manager Helper {item.approvalDecision.decision}</b>
+      <b>Manager Assistant {item.approvalDecision.decision}</b>
       <span class="risk {item.approvalDecision.risk}">{item.approvalDecision.risk} risk</span>
       {#if fmtTime(item.ts)}<span class="ts" title={new Date(item.ts).toLocaleString()}>{fmtTime(item.ts)}</span>{/if}
     </button>

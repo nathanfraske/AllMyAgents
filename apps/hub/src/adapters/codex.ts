@@ -236,10 +236,14 @@ export function codexTurnPolicy(spec: {
 /** Normalized token usage forwarded to the UI as a `session/tokens` event (all fields optional). */
 export interface TokenUsage {
   input?: number
+  cachedInput?: number
   output?: number
+  reasoningOutput?: number
   total?: number
   contextUsed?: number
   contextWindow?: number
+  /** Cumulative counters in the modern Codex envelope cover the complete provider thread. */
+  usageScope?: 'thread'
   /** Context occupancy is for the latest model request, not an aggregate app turn. */
   scope?: 'request'
 }
@@ -268,6 +272,9 @@ export function mapCodexTokenUsage(params: unknown): TokenUsage | undefined {
   const last = codexUsage?.last && typeof codexUsage.last === 'object'
     ? codexUsage.last as Record<string, unknown>
     : undefined
+  const cumulative = codexUsage?.total && typeof codexUsage.total === 'object'
+    ? codexUsage.total as Record<string, unknown>
+    : undefined
   const pick = (...keys: string[]): number | undefined => {
     for (const src of [nested, p]) {
       if (!src) continue
@@ -278,9 +285,17 @@ export function mapCodexTokenUsage(params: unknown): TokenUsage | undefined {
     }
     return undefined
   }
-  const input = pick('input_tokens', 'inputTokens', 'input', 'prompt_tokens', 'promptTokens')
-  const output = pick('output_tokens', 'outputTokens', 'output', 'completion_tokens', 'completionTokens')
+  const input = numField(cumulative?.inputTokens) ??
+    numField(cumulative?.input_tokens) ??
+    pick('input_tokens', 'inputTokens', 'input', 'prompt_tokens', 'promptTokens')
+  const cachedInput = numField(cumulative?.cachedInputTokens) ?? numField(cumulative?.cached_input_tokens)
+  const output = numField(cumulative?.outputTokens) ??
+    numField(cumulative?.output_tokens) ??
+    pick('output_tokens', 'outputTokens', 'output', 'completion_tokens', 'completionTokens')
+  const reasoningOutput = numField(cumulative?.reasoningOutputTokens) ??
+    numField(cumulative?.reasoning_output_tokens)
   let total = pick('total_tokens', 'totalTokens', 'total', 'total_token_usage', 'totalTokenUsage')
+  total = numField(cumulative?.totalTokens) ?? numField(cumulative?.total_tokens) ?? total
   if (total === undefined && input !== undefined && output !== undefined) total = input + output
   const genericContext = pick(
     'context_window',
@@ -295,8 +310,11 @@ export function mapCodexTokenUsage(params: unknown): TokenUsage | undefined {
   const contextWindow = numField(codexUsage?.modelContextWindow) ?? pick('model_context_window')
   const out: TokenUsage = {}
   if (input !== undefined) out.input = input
+  if (cachedInput !== undefined) out.cachedInput = cachedInput
   if (output !== undefined) out.output = output
+  if (reasoningOutput !== undefined) out.reasoningOutput = reasoningOutput
   if (total !== undefined) out.total = total
+  if (cumulative) out.usageScope = 'thread'
   if (contextUsed !== undefined) {
     out.contextUsed = contextUsed
     out.scope = 'request'

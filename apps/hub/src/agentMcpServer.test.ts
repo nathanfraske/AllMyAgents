@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { AgentMcpServer, inputSchemaFor, type AgentToolExecutor } from './agentMcpServer.js'
-import { AGENT_TOOLS, getAgentTool } from './agentToolCore.js'
+import { AGENT_TOOLS, AGENT_TOOLS_INSTRUCTIONS, getAgentTool } from './agentToolCore.js'
 
 // Drive the server the way the codex app-server does (verified line shapes against codex 0.145):
 // initialize (protocolVersion 2025-06-18) → notifications/initialized → tools/list → tools/call.
@@ -25,6 +25,9 @@ describe('AgentMcpServer (the real stdio MCP server codex loads for the Codex pa
     expect(r.result.serverInfo.name).toBe('allmyagents')
     expect(r.result.capabilities).toEqual({ tools: {} })
     expect(r.result.instructions).toMatch(/semi-trusted/)
+    // Codex may prepend server instructions to every tool description. Keep the common text bounded;
+    // complete methodology belongs in the once-per-turn provider contract.
+    expect(AGENT_TOOLS_INSTRUCTIONS.length).toBeLessThan(500)
   })
 
   it('notifications/initialized gets no reply (it has no id)', async () => {

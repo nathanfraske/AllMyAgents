@@ -214,6 +214,7 @@ export interface InProcessExecutorHubHooks {
     options?: {
       view?: 'summary' | 'activity' | 'transcript' | 'changes' | 'tasks' | 'all'
       afterSeq?: number
+      limit?: number
     }
   ): { found: boolean; summary?: string }
   managerChildStatus(managerSessionId: string): { ok: boolean; summary?: string; error?: string }
