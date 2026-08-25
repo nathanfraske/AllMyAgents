@@ -263,7 +263,7 @@ import {
 /** Bump whenever an existing Overseer conversation must receive a new app/tool operating contract. */
 export const OVERSEER_CAPABILITY_VERSION = 23
 /** Bump when existing manager conversations need a rematerialized team-management contract. */
-export const MANAGER_TEAM_CAPABILITY_VERSION = 9
+export const MANAGER_TEAM_CAPABILITY_VERSION = 10
 const MAX_MANAGER_TEAMS = 32
 const RUNTIME_TOPOLOGY_RECENT_MS = 7 * 24 * 60 * 60 * 1000
 const RUNTIME_TOPOLOGY_AGENT_LIMIT = 48
@@ -341,11 +341,13 @@ function providerHostInstructions(
       `You are an operator-configured project manager. Use the AllMyAgents query_team, child_status, manage_team, manage_child, spawn_agent, set_child_authority, decide_child_approval, assign_child_task, start_run, inspect_runs, control_run, list_agents, peek_agent, send_message, and read_messages tools for the real app team. At each new task or material slice, query_team gives one bounded current projection of messages, assignments, approvals, and runs; use filters and cursors rather than polling each child or rereading an unbounded backlog. Important build/test/lint/benchmark/deploy commands belong in start_run: retain the run id and inspect cursor-paged logs and exact terminal state. Local checkouts serialize automatically; granted remote jobs run concurrently by default, and use the same explicit GPU/port/package-manager/deployment resource key only when they intentionally must serialize. A remote machine is provisioned only through this project\'s reviewed setup recipe as its own durable run; do not infer packages, mutate the target implicitly, or invent another dependency manifest. The operator\'s exact remote capabilities are standing authority even on a teammate-triggered manager turn, so do not ask for a duplicate approval or claim an ordinary granted root must first be attached as project source. Never replace this with ad-hoc lockfiles and never blindly retry outcome_unknown. Every direct worker must have a durable role: pass an operator-defined agent_type or an explicit role to spawn_agent, and keep the current task in prompt/assign_child_task rather than confusing a temporary assignment with identity. Only when the operator enabled child approval decisions are in-ceiling requests from your hierarchy routed to you; decide a request that reaches you with decide_child_approval. If the live grant enables a Manager Helper, it silently handles bounded low-risk requests and wakes you only for uncertainty or broader risk; its decisions are already audited, so do not duplicate them. Disabled, unavailable, and out-of-ceiling manager requests route to the Overseer/operator instead, so do not claim a missing request is waiting in your chat or ask a child to loop on it. When the live roster reports an operator steer, approval decision, or permission override, treat that bounded fact as authoritative provenance that the operator deliberately intervened; do not misclassify the affected agent as acting autonomously or off the rails. Use send_message wake=false for checkpoints/FYIs that need no immediate response. Reuse workers whose durable role fits: accumulated project context is an asset, an idle worker is not spent, and a high-context direct manager wake is allowed so provider compaction can preserve continuity before the next task. New retirement is disabled. Use manage_child resume for stopped/errored workers and set_role to repair a legacy/general role. If a genuinely different kind of work needs a lineup the active team cannot cover, create or activate another team; manage_team stashes the original roster without deleting its culture, identities, transcripts, branches, or worktrees. The operator's parallel staffing target is ${parallelismTarget} useful direct worker lanes whenever the task can support them. At every new task or materially new slice, call child_status, decompose independent implementation, research, reproduction, or cross-check lanes, and wake idle workers or spawn within your grant until the target is met. Do not invent, duplicate, or prolong work merely to fill the target; when fewer lanes are genuinely useful, state the concrete dependency or reason in your next operator update. Each management cycle must dispatch, decide, inspect bounded evidence, integrate, or report one exact blocker. The topology snapshot below is bounded orientation data, not a substitute for child_status or peek_agent.`
     const rememberedApprovalDiscipline =
       'For a recurring, understood ordinary tool or Git action from a direct worker, decide_child_approval may use approve=true and remember=true. That stores only the exact class on that worker, remains bounded by your live operator ceiling, is audited on grant and use, and is revocable with set_child_authority. Approve unusual or high-blast-radius requests only once. One-shot descendants inherit their direct worker grant.'
+    const managerAssistantDiscipline =
+      'Manager Assistant discipline: the hidden cheap evaluator owns routine in-ceiling approval triage, and the hub coalesces sibling lifecycle changes into one actionable pulse. Do not duplicate its decisions, poll the same child/run without a new cursor or state change, or use provider wait/sleep loops to keep a turn alive. When no dispatch, decision, bounded inspection, integration, or exact blocker report is possible now, end the turn; the hub will wake you on the next actionable pulse. After a pulse, call query_team once with the narrow entities/statuses you need, then inspect only the exceptional child or run.'
     const providerDiscipline = record.provider === 'claude'
       ? 'Claude-manager discipline: resist meandering or passive idle loops. Keep the critical path moving, check running children at sensible boundaries rather than polling endlessly, integrate completed work promptly, and finish or escalate once the requested outcome is actually resolved.'
       : 'Codex-manager discipline: keep investigation and token use bounded. Reproduce and rank a suspected issue before assigning work, ignore benign noise once disproven, do not expand scope merely because capacity remains, and stop when the operator\'s acceptance criteria are verified instead of continuing until context is exhausted.'
     const taskAccountability = `Task accountability contract: ${MANAGER_TASK_ACCOUNTABILITY_RULES.join(' ')}`
-    role = `${common}\n\n${taskAccountability}\n\n${rememberedApprovalDiscipline}\n\n${providerDiscipline}`
+    role = `${common}\n\n${taskAccountability}\n\n${managerAssistantDiscipline}\n\n${rememberedApprovalDiscipline}\n\n${providerDiscipline}`
   } else if (record.parentSessionId) {
     role =
       `You are a managed child of session ${record.parentSessionId}. Your durable team role is: ${record.role?.trim() || 'legacy general project contributor; ask the manager to refine it with manage_child set_role'}. Preserve and build on relevant project context across assignments and compaction; a completed task does not end your identity. Use the AllMyAgents bus tools for upstream reports and coordination. Your manager assignment is authorized work inside the persisted grant; report a real scope or permission block upstream rather than silently waiting for the operator in chat. Task accountability contract: ${WORKER_TASK_ACCOUNTABILITY_RULES.join(' ')}`
@@ -640,6 +642,9 @@ export type WorktreeIntegrationCheck =
 // the restart-survival acceptance test shrinks it to force a squarely-mid-turn flip; unset → 120s as before.
 export const RESTART_MAX_DEFER_MS = Number(process.env.HUB_RESTART_MAX_DEFER_MS ?? 120_000)
 export const MANAGER_STALL_MS = 5 * 60 * 1000
+/** Briefly collect sibling lifecycle transitions so a ten-worker team produces one manager pulse instead
+ *  of ten provider steers/turns. The underlying bus rows remain individual, durable, and auditable. */
+export const MANAGER_ASSISTANT_PULSE_MS = 750
 /** An idle teammate message may not wake a context at or above either bound. Claude currently does not
  *  expose its model window in usage events, so the absolute bound protects its measured large-context
  *  cache rebuilds; Codex supplies a context window and is additionally protected near compaction. */
@@ -808,6 +813,8 @@ export class SessionManager {
   private readonly managerTeamOperations = new Set<string>()
   /** One hidden evaluator at a time per manager; approval bursts queue instead of spawning a model swarm. */
   private readonly managerApprovalHelperQueues = new Map<string, Promise<void>>()
+  /** One delivery timer per manager. Routine child starts/stops remain queued until an actionable pulse. */
+  private readonly managerAssistantPulseTimers = new Map<string, NodeJS.Timeout>()
   // Codex profiles whose config.toml `[mcp_servers.allmyagents]` we've already (re)written this boot —
   // so the lazy per-profile materialization (ensureCodexMcpConfig, driven from specOf/readCodexLimits) is
   // written once before the app-server starts, not re-read+rewritten on every turn.
@@ -1219,6 +1226,7 @@ export class SessionManager {
           options?: {
             view?: 'summary' | 'activity' | 'transcript' | 'changes' | 'tasks' | 'all'
             afterSeq?: number
+            limit?: number
           }
         }
         return this.busPeek(a.caller, a.target, a.options)
@@ -5350,7 +5358,7 @@ export class SessionManager {
       `Teams: ${teams.length}; active: ${teams.find((team) => team.id === manager?.managerActiveTeamId)?.name ?? 'unknown'}. Use manage_team to list exact stable ids or switch teams safely.`,
       `Operator guidance/audit for this manager: ${manager ? this.operatorInterventions(manager.id).join('; ') || 'no recent manual manager configuration, steer, permission override, or approval decision recorded' : 'manager unavailable'}.`,
       `Exhausted-account dispatch guard: ${manager?.managerPauseExhaustedAccounts === true ? 'ON — the hub refuses new child spawns/messages at a hard 100% limit unless paid overage/credits are active' : 'OFF — usage limits do not add a manager-specific dispatch block'}.`,
-      `Manager Helper: ${manager?.managerApprovalHelper?.enabled === true ? `ON — hidden stateless evaluator ${manager.managerApprovalHelper.profileId}/${manager.managerApprovalHelper.model ?? 'provider default'} may decide through ${manager.managerApprovalHelper.maxRisk} risk; uncertainty and broader risk wake you` : 'OFF — every in-ceiling child approval wakes you directly'}. The helper has no chat or tools, and its decision cards appear in the requesting worker transcript.`,
+      `Manager Assistant: ${manager?.managerApprovalHelper?.enabled === true ? `ON — hidden stateless evaluator ${manager.managerApprovalHelper.profileId}/${manager.managerApprovalHelper.model ?? 'provider default'} may decide through ${manager.managerApprovalHelper.maxRisk} risk; uncertainty and broader risk wake you` : 'OFF — every in-ceiling child approval wakes you directly'}. The model helper has no chat or tools; the hub also batches routine lifecycle changes into one pulse, and approval decision cards appear in the requesting worker transcript.`,
       `Context continuity: lifecycle chatter still cannot relaunch an idle agent above ${Math.round(BUS_WAKE_CONTEXT_TOKEN_LIMIT / 1_000)}k tokens or ${Math.round(BUS_WAKE_CONTEXT_RATIO_LIMIT * 100)}% of its reported window, but your direct assignment may wake your own worker so provider compaction can preserve its culture and task state. Never retire or replace an agent merely to cross this boundary.`,
       `Worker one-shot sub-agents: ${manager?.managerAllowWorkerSubagents === true ? `ON — each direct worker may run up to ${manager.managerMaxSubagentsPerWorker ?? 2} bounded descendants at once` : 'OFF — only the manager may spawn project agents'}.`,
     ]
@@ -5488,6 +5496,57 @@ export class SessionManager {
   }
 
   /**
+   * Choose the inexpensive stateless reviewer for a manager that has approval authority but predates the
+   * Manager Assistant setting. Absence means "legacy/unconfigured"; an explicit { enabled:false } remains
+   * an operator opt-out and is never overwritten by the capability upgrader.
+   */
+  private defaultManagerApprovalHelper(record: SessionRecord): ManagerApprovalHelperConfig | undefined {
+    const candidateIds = [
+      record.profileId,
+      ...(record.managerAllowedProfiles ?? []).filter((profileId) => profileId !== record.profileId),
+    ]
+    const profile = candidateIds
+      .map((profileId) => this.profiles.get(profileId))
+      .find((candidate): candidate is Profile => Boolean(
+        candidate &&
+        candidate.available !== false &&
+        candidate.authStatus !== 'signed_out' &&
+        candidate.entitlementStatus !== 'denied'
+      ))
+    if (!profile) return undefined
+
+    if (profile.provider === 'codex') {
+      const models = readCodexProfileModelCatalog(profile.dir)?.models ?? profile.availableModels ?? []
+      const model =
+        models.find((candidate) => candidate.slug.includes('codex-spark')) ??
+        models.find((candidate) => candidate.slug.includes('mini')) ??
+        models.find((candidate) => candidate.slug.includes('luna')) ??
+        models.find((candidate) => candidate.isDefault) ??
+        models[0]
+      const effort = model?.supportedEfforts.includes('low')
+        ? 'low'
+        : model?.defaultEffort ?? model?.supportedEfforts[0]
+      return {
+        enabled: true,
+        profileId: profile.id,
+        maxRisk: 'low',
+        ...(model ? { model: model.slug } : {}),
+        ...(effort ? { effort } : {}),
+      }
+    }
+
+    // Claude's account catalog is static today. Sonnet is the intended quick semantic reviewer; the
+    // helper still has no tools, no durable chat, a read-only sandbox, and a deterministic risk floor.
+    return {
+      enabled: true,
+      profileId: profile.id,
+      model: 'claude-sonnet-5',
+      effort: 'low',
+      maxRisk: 'low',
+    }
+  }
+
+  /**
    * Operator-only role boundary. No agent tool calls this method; the HTTP control route supplies the
    * literal `operator` actor. Keeping the actor check here as well means a future caller cannot
    * accidentally turn the route into a model capability by reusing the method without the boundary.
@@ -5596,7 +5655,11 @@ export class SessionManager {
     if (!isPermissionMode(maxChildPermissionMode)) {
       throw new Error('maxChildPermissionMode must be safe, edits, or full')
     }
-    const approvalHelper = config.approvalHelper ?? record.managerApprovalHelper
+    const canApproveChildren = config.enabled
+      ? (config.canApproveChildren ?? record.managerCanApproveChildren ?? true)
+      : false
+    const approvalHelper = config.approvalHelper ?? record.managerApprovalHelper ??
+      (canApproveChildren ? this.defaultManagerApprovalHelper(record) : undefined)
     if (approvalHelper) {
       if (typeof approvalHelper.enabled !== 'boolean') {
         throw new Error('approvalHelper.enabled must be boolean')
@@ -5669,9 +5732,7 @@ export class SessionManager {
             ? record.managerOperatorTaskUpdatedAt
             : undefined
         record.managerStandingInstructions = config.enabled ? standingInstructions : undefined
-        record.managerCanApproveChildren = config.enabled
-          ? (config.canApproveChildren ?? record.managerCanApproveChildren ?? true)
-          : undefined
+        record.managerCanApproveChildren = config.enabled ? canApproveChildren : undefined
         record.managerApprovalHelper = config.enabled && record.managerCanApproveChildren === true && approvalHelper
           ? {
               enabled: approvalHelper.enabled,
@@ -6746,6 +6807,39 @@ export class SessionManager {
     this.managerStallTimers.set(sessionId, timer)
   }
 
+  /**
+   * Child transitions are individually durable but manager attention is not. A broad parallel slice can
+   * settle many workers in the same scheduler tick; debounce delivery so the provider sees one bus frame
+   * and performs one bounded query instead of receiving a steer/turn for every sibling.
+   */
+  private scheduleManagerAssistantPulse(managerSessionId: string, actionable: boolean): void {
+    const existing = this.managerAssistantPulseTimers.get(managerSessionId)
+    if (existing && !actionable) return
+    if (existing) clearTimeout(existing)
+    const timer = setTimeout(() => {
+      this.managerAssistantPulseTimers.delete(managerSessionId)
+      if (!this.sessions.has(managerSessionId)) return
+      let pending: BusMessage[]
+      try {
+        pending = this.bus.pending(managerSessionId)
+      } catch {
+        // Process/test teardown may close the shared SQLite handle before an unref'd debounce fires.
+        return
+      }
+      const lifecycle = pending.filter((message) => message.subject?.startsWith('child '))
+      if (lifecycle.length) {
+        this.journal.append(managerSessionId, 'manager/assistant-pulse', {
+          lifecycleCount: lifecycle.length,
+          actionableCount: lifecycle.filter((message) => message.attentionRequired).length,
+          childSessionIds: [...new Set(lifecycle.map((message) => message.fromSession))].slice(0, 64),
+        })
+      }
+      this.deliverBus(managerSessionId)
+    }, actionable ? 100 : MANAGER_ASSISTANT_PULSE_MS)
+    timer.unref()
+    this.managerAssistantPulseTimers.set(managerSessionId, timer)
+  }
+
   private reportChildEvent(
     child: SessionRecord,
     outcome: 'started' | 'idle' | 'errored' | 'stopped' | 'stalled'
@@ -6797,6 +6891,7 @@ export class SessionManager {
       // high-context manager is woken exactly once instead of leaving the report queued until the next
       // operator message. Started/stopped notices remain ordinary lifecycle FYIs and still respect the
       // context wake guard.
+      wake: outcome === 'idle' || outcome === 'stalled' || outcome === 'errored',
       attentionRequired: outcome === 'idle' || outcome === 'stalled' || outcome === 'errored',
     })
     this.journal.append(child.id, 'manager/child-reported', {
@@ -6804,30 +6899,11 @@ export class SessionManager {
       childSessionId: child.id,
       outcome,
     })
-    if (manager.status === 'active' || manager.status === 'starting') {
-      // Lifecycle facts use the same unconditional high-priority steer primitive as worktree risks.
-      // Keep the bus row pending until the executor accepts it, so a turn-boundary race loses nothing.
-      void this.executor
-        .steer(manager.id, body)
-        .then(() => {
-          this.markBusDelivered(manager.id, messages)
-          this.journal.append(child.id, 'manager/child-report-steered', {
-            managerSessionId: manager.id,
-            childSessionId: child.id,
-            outcome,
-          })
-        })
-        .catch((error: unknown) => {
-          this.journal.append(child.id, 'manager/child-report-steer-failed', {
-            managerSessionId: manager.id,
-            childSessionId: child.id,
-            outcome,
-            error: error instanceof Error ? error.message : String(error),
-          })
-        })
-      return
-    }
-    this.deliverBus(manager.id)
+    if (manager.status === 'stopped' || manager.status === 'error') return
+    this.scheduleManagerAssistantPulse(
+      manager.id,
+      messages.some((message) => message.attentionRequired),
+    )
   }
 
   /** Alert the one hub-minted Overseer without copying model/vendor error text into an authorizing prompt.
@@ -6940,6 +7016,22 @@ export class SessionManager {
       ? this.managerApprovalCapability(availableManager, requester, approval)
       : undefined
     const capableManager = managerCapability?.ok ? availableManager : undefined
+    if (capableManager && capableManager.managerApprovalHelper === undefined) {
+      const helper = this.defaultManagerApprovalHelper(capableManager)
+      if (helper) {
+        capableManager.managerApprovalHelper = helper
+        this.persist(capableManager)
+        this.materializeSessionInstructions(capableManager)
+        this.journal.append(capableManager.id, 'manager/approval-helper-activated', {
+          managerSessionId: capableManager.id,
+          profileId: helper.profileId,
+          model: helper.model ?? null,
+          effort: helper.effort ?? null,
+          maxRisk: helper.maxRisk,
+          reason: 'approval authority was enabled without an explicit Manager Assistant setting',
+        })
+      }
+    }
     if (availableManager && managerCapability && !managerCapability.ok) {
       this.journal.append(requester.id, 'manager/child-approval-outside-ceiling', {
         managerSessionId: availableManager.id,
@@ -9358,6 +9450,25 @@ export class SessionManager {
         }
       }
     }
+    if (
+      fromVersion < 10 &&
+      manager.managerCanApproveChildren === true &&
+      manager.managerApprovalHelper === undefined
+    ) {
+      const helper = this.defaultManagerApprovalHelper(manager)
+      if (helper) {
+        manager.managerApprovalHelper = helper
+        this.journal.append(manager.id, 'manager/approval-helper-upgraded', {
+          managerSessionId: manager.id,
+          profileId: helper.profileId,
+          model: helper.model ?? null,
+          effort: helper.effort ?? null,
+          maxRisk: helper.maxRisk,
+          reason: 'legacy manager had approval authority but no explicit Manager Assistant setting',
+        })
+        changed = true
+      }
+    }
     if (fromVersion < MANAGER_TEAM_CAPABILITY_VERSION) {
       manager.managerTeamCapabilityVersion = MANAGER_TEAM_CAPABILITY_VERSION
       const upgradedStanding = enforceManagerContinuityInstructions(
@@ -10278,7 +10389,7 @@ export class SessionManager {
     const kinds = new Set(input.kinds ?? [])
     const statusAllowed = (status: string): boolean => !statuses.size || statuses.has(status)
     const kindAllowed = (kind: string): boolean => !kinds.size || kinds.has(kind)
-    const limit = Math.max(1, Math.min(Math.trunc(input.limit ?? 50), 200))
+    const limit = Math.max(1, Math.min(Math.trunc(input.limit ?? 20), 100))
     const data: Record<string, unknown> = {
       agents: selection.sessions.map((record) => ({
         sessionId: record.id,
@@ -10340,6 +10451,7 @@ export class SessionManager {
     options: {
       view?: 'summary' | 'activity' | 'transcript' | 'changes' | 'tasks' | 'all'
       afterSeq?: number
+      limit?: number
     } = {}
   ): { found: boolean; summary?: string } {
     const caller = this.sessions.get(callerSessionId)
@@ -10358,7 +10470,7 @@ export class SessionManager {
       if (!overseerInspection && !this.managerManagedAgent(caller.id, t.id)) return { found: false }
       const activity = (): string => this.managerChildActivity(t)
       const transcript = (): string => {
-        const page = this.journal.eventsForSession(t.id, options.afterSeq ?? 0)
+        const page = this.journal.eventsForSession(t.id, options.afterSeq ?? 0, options.limit ?? 40)
         return `Transcript page (exact journal events):\n${JSON.stringify(page, null, 2)}`
       }
       const changes = (): string => this.managerChildChanges(t)
@@ -10632,6 +10744,11 @@ export class SessionManager {
    * historical path: a new bus-origin turn with full access clamped unless fullAccessAnyOrigin lifts it.
    */
   private deliverBus(sessionId: string): void {
+    // Another actionable route may explicitly deliver before the short lifecycle debounce expires.
+    // Cancel that redundant timer so it cannot touch a closed test/store or emit a second empty pulse.
+    const assistantPulse = this.managerAssistantPulseTimers.get(sessionId)
+    if (assistantPulse) clearTimeout(assistantPulse)
+    this.managerAssistantPulseTimers.delete(sessionId)
     if (this.restartTurnAdmissionFrozen) return
     const record = this.sessions.get(sessionId)
     if (!record) return
@@ -10662,6 +10779,10 @@ export class SessionManager {
       if (this.busSteerInFlight.has(sessionId)) return
       const pending = this.bus.pending(sessionId)
       if (!pending.length) return
+      // A manager's routine FYIs are intentionally collected for the next actionable pulse. Steering
+      // every child-start/checkpoint into an already-expensive turn was the largest avoidable source of
+      // coordination token growth in measured large-team sessions.
+      if (record.isProjectManager === true && !pending.some((message) => message.wake)) return
       // This is input to the EXISTING turn, so do not add busTurnSessions or remove
       // operatorTurnSessions. Reclassifying an operator turn here would silently revoke its current
       // auto-approval policy mid-flight; leaving the sets untouched also means fullAccessAnyOrigin keeps
@@ -11000,6 +11121,9 @@ export class SessionManager {
     this.flushCommandOutputDelta(sessionId)
     this.sessions.delete(sessionId)
     this.clearManagerStallCheck(sessionId)
+    const assistantPulse = this.managerAssistantPulseTimers.get(sessionId)
+    if (assistantPulse) clearTimeout(assistantPulse)
+    this.managerAssistantPulseTimers.delete(sessionId)
     this.ingestedWseq.delete(sessionId) // drop the exactly-once cursor — the worker forgets its wseq buffer too (a no-op in-process)
     await this.executor.stopSession(sessionId)
     // 4. Remove it from the persisted snapshot so a hub restart doesn't resurrect it.

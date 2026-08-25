@@ -333,6 +333,15 @@ export interface SessionView {
   turnStartedAt?: number
   // Latest token usage the provider reported for the running turn (realtime counter).
   liveTokens?: { input?: number; output?: number; total?: number }
+  // Provider-thread cumulative counters (Codex modern tokenUsage.total). Kept separate from request
+  // context occupancy so the UI never presents a 9B-token lifetime counter as one model request.
+  cumulativeTokens?: {
+    input?: number
+    cachedInput?: number
+    output?: number
+    reasoningOutput?: number
+    total?: number
+  }
   // A local-only DRAFT chat: opened by "new chat" but NOT yet spawned on the hub (no session,
   // no worktree). Excluded from `sessionList`, so it never shows in the sidebar/dashboard; it is
   // reached only as the open pane via `sessions[id]`. It materializes into a real session on the
@@ -3526,9 +3535,28 @@ export class HubStore {
         break
       }
       case 'session/tokens': {
-        const p = payload as { input?: number; output?: number; total?: number; contextUsed?: number; contextWindow?: number }
+        const p = payload as {
+          input?: number
+          cachedInput?: number
+          output?: number
+          reasoningOutput?: number
+          total?: number
+          usageScope?: 'thread'
+          contextUsed?: number
+          contextWindow?: number
+        }
         const sum = (p.input ?? 0) + (p.output ?? 0)
-        view.liveTokens = { input: p.input, output: p.output, total: p.total ?? (sum > 0 ? sum : undefined) }
+        if (p.usageScope === 'thread') {
+          view.cumulativeTokens = {
+            input: p.input,
+            cachedInput: p.cachedInput,
+            output: p.output,
+            reasoningOutput: p.reasoningOutput,
+            total: p.total ?? (sum > 0 ? sum : undefined),
+          }
+        } else {
+          view.liveTokens = { input: p.input, output: p.output, total: p.total ?? (sum > 0 ? sum : undefined) }
+        }
         if (typeof p.contextUsed === 'number') view.contextUsed = p.contextUsed
         if (typeof p.contextWindow === 'number') view.contextWindow = p.contextWindow
         break

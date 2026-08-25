@@ -878,6 +878,14 @@
     if (view.contextUsed && view.contextWindow) {
       parts.push(`context ${Math.round((view.contextUsed / view.contextWindow) * 100)}% (${fmtTokens(view.contextUsed)}/${fmtTokens(view.contextWindow)})`)
     }
+    if (view.cumulativeTokens?.total) {
+      const cached = view.cumulativeTokens.cachedInput
+      const input = view.cumulativeTokens.input
+      const cacheLabel = cached && input
+        ? `, ${Math.round((cached / input) * 100)}% cached input`
+        : ''
+      parts.push(`provider thread ${fmtTokens(view.cumulativeTokens.total)} tokens${cacheLabel}`)
+    }
     if (view.costUsd) parts.push(apiEquivalentCostLabel(view.costUsd, 'this session'))
     else if (typeof u?.totalCostUsd === 'number') parts.push(apiEquivalentCostLabel(u.totalCostUsd))
     return parts.length ? `usage · ${parts.join(' · ')}` : 'no usage data yet'

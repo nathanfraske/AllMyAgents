@@ -103,7 +103,7 @@
   let operatorTask = $state('')
   let standingInstructions = $state('')
   let canApproveChildren = $state(true)
-  let approvalHelperEnabled = $state(false)
+  let approvalHelperEnabled = $state(true)
   let approvalHelperProfileId = $state('')
   let approvalHelperModel = $state('')
   let approvalHelperEffort = $state('')
@@ -275,7 +275,7 @@
     orientationBrief = ''
     standingInstructions = ''
     canApproveChildren = true
-    approvalHelperEnabled = false
+    approvalHelperEnabled = true
     approvalHelperProfileId = managerProfileId
     const helperModel = approvalHelperDefaultModel(profile)
     approvalHelperModel = helperModel?.slug ?? ''
@@ -321,7 +321,9 @@
     operatorTask = record.managerOperatorTask ?? ''
     standingInstructions = record.managerStandingInstructions ?? defaultStandingInstructions()
     canApproveChildren = record.managerCanApproveChildren ?? true
-    approvalHelperEnabled = record.managerApprovalHelper?.enabled ?? false
+    // Legacy managers predate the setting. Absence adopts the safe default; explicit false remains the
+    // durable operator opt-out across edits and releases.
+    approvalHelperEnabled = record.managerApprovalHelper?.enabled ?? true
     approvalHelperProfileId = record.managerApprovalHelper?.profileId ?? record.profileId
     const helperProfile = availableProfiles.find((candidate) => candidate.id === approvalHelperProfileId)
     approvalHelperModel = record.managerApprovalHelper?.model
@@ -544,7 +546,7 @@
     if (!config.allowedProfiles.length) return 'Choose at least one worker account.'
     if (!config.orientationBrief) return 'The manager needs an orientation brief.'
     if (config.approvalHelper?.enabled && !config.approvalHelper.profileId) {
-      return 'Choose an account for the Manager Helper.'
+      return 'Choose an account for the Manager Assistant.'
     }
     if (!Number.isInteger(maxLiveChildren) || maxLiveChildren < 1 || maxLiveChildren > 16) {
       return 'The live child limit must be from 1 to 16.'
@@ -1093,8 +1095,8 @@
           <label class="approval-toggle">
             <input type="checkbox" bind:checked={approvalHelperEnabled} />
             <span>
-              <b>Use a fast Manager Helper</b>
-              <small>Runs one hidden, stateless model review for each in-ceiling request. It has no chat or tools, cannot lower the hubâ€™s risk floor, and wakes the manager whenever it is uncertain or the risk exceeds this policy.</small>
+              <b>Use the fast Manager Assistant</b>
+              <small>Recommended. It handles routine in-ceiling approvals with one hidden, stateless model review while the hub batches lifecycle updates. It has no chat or tools, cannot lower the hubâ€™s risk floor, and wakes the manager whenever it is uncertain or the risk exceeds this policy.</small>
             </span>
           </label>
           {#if approvalHelperEnabled}
@@ -1207,7 +1209,7 @@
         <div><dt>Child permission ceiling</dt><dd>{maxChildPermissionMode}</dd></div>
         <div><dt>Worker approvals</dt><dd>{canApproveChildren ? 'manager decides in-ceiling; broader requests escalate to Overseer/operator' : 'all requests escalate to Overseer/operator'}</dd></div>
         {#if canApproveChildren && approvalHelperEnabled}
-          <div><dt>Manager Helper</dt><dd>{approvalHelperProfileId} · {approvalHelperModel || 'default model'} · through {approvalHelperMaxRisk} risk; uncertainty wakes manager</dd></div>
+          <div><dt>Manager Assistant</dt><dd>{approvalHelperProfileId} · {approvalHelperModel || 'default model'} · through {approvalHelperMaxRisk} risk; uncertainty wakes manager</dd></div>
         {/if}
         <div><dt>Exhausted accounts</dt><dd>{pauseExhaustedAccounts ? 'pause new spawns and messages unless credits/overage are active' : 'no manager-specific dispatch pause'}</dd></div>
         <div><dt>Worker sub-agents</dt><dd>{allowWorkerSubagents ? `up to ${maxSubagentsPerWorker} one-shot descendants per worker` : 'disabled'}</dd></div>

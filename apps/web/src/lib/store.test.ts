@@ -563,6 +563,33 @@ describe('apply()', () => {
     expect(store.sessions['t-context']).toMatchObject({ contextUsed: 42_000, contextWindow: 258_000 })
   })
 
+  it('keeps Codex provider-thread totals separate from one-request live counters', () => {
+    seed('t-cumulative', { provider: 'codex' })
+    apply(evt({
+      seq: 1,
+      kind: 'session/tokens',
+      sessionId: 't-cumulative',
+      payload: {
+        usageScope: 'thread',
+        input: 1_000,
+        cachedInput: 900,
+        output: 50,
+        reasoningOutput: 20,
+        total: 1_050,
+        contextUsed: 42,
+      },
+    }))
+    expect(store.sessions['t-cumulative']?.cumulativeTokens).toEqual({
+      input: 1_000,
+      cachedInput: 900,
+      output: 50,
+      reasoningOutput: 20,
+      total: 1_050,
+    })
+    expect(store.sessions['t-cumulative']?.liveTokens).toBeUndefined()
+    expect(store.sessions['t-cumulative']?.contextUsed).toBe(42)
+  })
+
   it('session/status sets turnStartedAt while active and clears it when idle', () => {
     seed('st1')
     expect(store.sessions.st1?.turnStartedAt).toBeUndefined()

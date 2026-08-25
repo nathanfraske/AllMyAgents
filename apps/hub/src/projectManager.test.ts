@@ -11,7 +11,12 @@ import { Journal } from './journal.js'
 import { MemoryStore } from './memory.js'
 import { PracticeStore } from './practices.js'
 import { ProjectStore } from './projects.js'
-import { MANAGER_STALL_MS, MANAGER_TEAM_CAPABILITY_VERSION, SessionManager } from './sessions.js'
+import {
+  MANAGER_ASSISTANT_PULSE_MS,
+  MANAGER_STALL_MS,
+  MANAGER_TEAM_CAPABILITY_VERSION,
+  SessionManager,
+} from './sessions.js'
 import { SessionStore } from './store.js'
 import type { Profile, SessionRecord, SessionStatus } from './types.js'
 import { UsageMonitor } from './usage.js'
@@ -757,6 +762,38 @@ describe('project manager durable child identity', () => {
 })
 
 describe('project manager lifecycle awareness', () => {
+  it('batches simultaneous actionable child transitions into one manager steer', async () => {
+    vi.useFakeTimers()
+    const { sessions, bus, seed, steer } = buildHub()
+    seed({ id: 'manager', isProjectManager: true, status: 'active' })
+    seed({ id: 'child-a', parentSessionId: 'manager', status: 'active', title: 'Alpha' })
+    seed({ id: 'child-b', parentSessionId: 'manager', status: 'active', title: 'Beta' })
+
+    transition(sessions, 'child-a', 'idle')
+    transition(sessions, 'child-b', 'idle')
+    expect(steer).not.toHaveBeenCalled()
+
+    await vi.advanceTimersByTimeAsync(100)
+    expect(steer).toHaveBeenCalledOnce()
+    const framed = (steer.mock.calls as unknown as Array<[string, string]>)[0]?.[1]
+    expect(framed).toContain('Alpha is idle')
+    expect(framed).toContain('Beta is idle')
+    expect(bus.pending('manager')).toEqual([])
+  })
+
+  it('collects routine child starts without interrupting an active manager turn', async () => {
+    vi.useFakeTimers()
+    const { sessions, bus, seed, steer } = buildHub()
+    seed({ id: 'manager', isProjectManager: true, status: 'active' })
+    seed({ id: 'child', parentSessionId: 'manager', status: 'starting', title: 'Worker' })
+
+    transition(sessions, 'child', 'active')
+    await vi.advanceTimersByTimeAsync(MANAGER_ASSISTANT_PULSE_MS)
+
+    expect(steer).not.toHaveBeenCalled()
+    expect(bus.pending('manager')).toMatchObject([{ subject: 'child started', wake: false }])
+  })
+
   it('pushes one report for each real start, idle, stop, and error transition', () => {
     const { sessions, seed } = buildHub()
     seed({ id: 'manager', isProjectManager: true, status: 'stopped' })
@@ -832,6 +869,45 @@ describe('project manager durable teams', () => {
         input: TeamInput,
       ): Promise<{ ok: boolean; summary?: string; error?: string }>
     }).managerManageTeam(managerSessionId, input)
+
+  it('enables the inexpensive Manager Assistant for legacy approval-capable managers only when unset', async () => {
+    const { sessions, seed } = buildHub()
+    const profiles = (sessions as unknown as { profiles: Map<string, Profile> }).profiles
+    const codex = profiles.get('p2')!
+    fs.writeFileSync(path.join(codex.dir, 'models_cache.json'), JSON.stringify({
+      models: [
+        { slug: 'gpt-5.6-sol', display_name: 'Sol', supported_reasoning_levels: ['low', 'high'] },
+        { slug: 'gpt-5.3-codex-spark', display_name: 'Spark', supported_reasoning_levels: ['low', 'high'] },
+      ],
+    }))
+    const legacy = seed({
+      id: 'legacy-manager',
+      profileId: 'p2',
+      provider: 'codex',
+      isProjectManager: true,
+      managerCanApproveChildren: true,
+      managerTeamCapabilityVersion: 9,
+    })
+    const optedOut = seed({
+      id: 'opted-out-manager',
+      isProjectManager: true,
+      managerCanApproveChildren: true,
+      managerApprovalHelper: { enabled: false, profileId: 'p1', maxRisk: 'low' },
+      managerTeamCapabilityVersion: 9,
+    })
+
+    await sessions.upgradeDurableSessionCapabilitiesPostReady()
+
+    expect(legacy.managerApprovalHelper).toEqual({
+      enabled: true,
+      profileId: 'p2',
+      model: 'gpt-5.3-codex-spark',
+      effort: 'low',
+      maxRisk: 'low',
+    })
+    expect(optedOut.managerApprovalHelper?.enabled).toBe(false)
+    expect(legacy.managerTeamCapabilityVersion).toBe(MANAGER_TEAM_CAPABILITY_VERSION)
+  })
 
   it('migrates legacy children into one stable initial team', () => {
     const { sessions, journal, seed } = buildHub()
@@ -1406,6 +1482,7 @@ describe('operator-enabled worker one-shot sub-agents', () => {
         permissionMode: 'full',
         maxChildPermissionMode: 'full',
         canApproveChildren: true,
+        approvalHelper: { enabled: false, profileId: 'p1', maxRisk: 'low' },
         allowWorkerSubagents: true,
         maxSubagentsPerWorker: 2,
       },
