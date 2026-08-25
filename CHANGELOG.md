@@ -7,8 +7,8 @@ feature and fix log used on the corresponding GitHub release.
 
 ## v0.1.35-alpha.39 — 2026-08-25
 
-This release makes durable run completion a reliable manager continuation boundary, so a manager cannot go idle
-forever after a build, test, lint, benchmark, or deployment reaches its final state.
+This release makes durable run completion a reliable manager continuation boundary and tightens long-conversation
+loading, scrolling, and startup-window steering.
 
 [Full v0.1.35-alpha.39 release notes](docs/releases/v0.1.35-alpha.39.md)
 
@@ -20,6 +20,10 @@ forever after a build, test, lint, benchmark, or deployment reaches its final st
   the terminal state cannot silently lose the wake or duplicate it after restart.
 - Existing historical terminal runs are acknowledged during the additive schema upgrade without waking managers
   for an old backlog, and retry diagnostics are bounded so a delivery problem cannot create another journal storm.
+- Conversation history opens with a 40-event / 256 KiB viewport seed, then loads older pages losslessly on demand.
+  A failed read is shown after eight seconds with Retry instead of hiding behind another twenty-second attempt.
+- Messages typed while a manager turn is starting are delivered as soon as that turn becomes actively steerable,
+  rather than waiting until it ends, and wheel/touch intent prevents streaming output from stealing scroll position.
 
 ## v0.1.34-alpha.38 — 2026-08-24
 

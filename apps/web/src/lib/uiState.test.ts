@@ -100,10 +100,20 @@ describe('queued-message persistence', () => {
       size: 123,
       kind: 'image' as const,
     }
-    saveQueues({ s1: ['plain', { text: 'with file', attachments: [attachment] }] })
+    saveQueues({
+      s1: [
+        'plain',
+        { text: 'with file', attachments: [attachment] },
+        { text: 'steer after startup', delivery: 'when-active' },
+      ],
+    })
 
     expect(loadQueues()).toEqual({
-      s1: ['plain', { text: 'with file', attachments: [attachment] }],
+      s1: [
+        'plain',
+        { text: 'with file', attachments: [attachment] },
+        { text: 'steer after startup', delivery: 'when-active' },
+      ],
     })
   })
 })

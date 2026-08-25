@@ -169,6 +169,36 @@ describe('transcript interaction boundaries', () => {
     await waitFor(() => expect(load).toHaveBeenCalledWith('interaction-session'))
   })
 
+  it('honors scroll intent before the delayed scroll event while new manager output lands', async () => {
+    const view = seed()
+    view.record.isProjectManager = true
+    const { container } = render(ThreadView, { props: { sessionId: 'interaction-session' } })
+    const transcript = container.querySelector('.stream.scroll') as HTMLDivElement
+    let scrollTop = 240
+    Object.defineProperties(transcript, {
+      scrollTop: {
+        get: () => scrollTop,
+        set: (value: number) => { scrollTop = value },
+        configurable: true,
+      },
+      scrollHeight: { value: 2_000, configurable: true },
+      clientHeight: { value: 500, configurable: true },
+    })
+
+    await fireEvent.wheel(transcript, { deltaY: -120 })
+    store.sessions['interaction-session']!.items = [...store.sessions['interaction-session']!.items, {
+      key: 'manager-update',
+      kind: 'assistant',
+      ts: '2026-07-31T00:00:02.000Z',
+      text: 'New output must not steal the viewport.',
+    }]
+    await waitFor(() =>
+      expect(container.textContent).toContain('New output must not steal the viewport.'),
+    )
+
+    expect(scrollTop).toBe(240)
+  })
+
   it('groups only the bounded live tail while older history has not been requested', () => {
     const view = seed()
     view.record.provider = 'claude'

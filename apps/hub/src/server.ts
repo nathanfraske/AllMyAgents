@@ -11,8 +11,8 @@ import {
 } from './questions.js'
 import type { QuestionService } from './questions.js'
 import {
-  JOURNAL_HISTORY_PAGE_MAX_BYTES,
-  JOURNAL_HISTORY_PAGE_MAX_ROWS,
+  JOURNAL_HISTORY_VIEW_BYTES,
+  JOURNAL_HISTORY_VIEW_ROWS,
   ReplayGenerationChangedError,
   SessionHistoryIndexingError,
   type Journal,
@@ -3316,8 +3316,8 @@ export function startServer(opts: ServerOptions): http.Server {
             await journal.sessionHistoryPage(journalHistoryMatch[1] as string, {
               beforeSeq,
               expectedGeneration: generation,
-              maxRows: JOURNAL_HISTORY_PAGE_MAX_ROWS,
-              maxBytes: JOURNAL_HISTORY_PAGE_MAX_BYTES,
+              maxRows: JOURNAL_HISTORY_VIEW_ROWS,
+              maxBytes: JOURNAL_HISTORY_VIEW_BYTES,
             })
           )
         } catch (error) {
