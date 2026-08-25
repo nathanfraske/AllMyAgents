@@ -5,6 +5,24 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.34-alpha.38 — 2026-08-24
+
+This release turns the dormant Manager Helper into a default-on Manager Assistant for approval-capable project
+managers and removes several measured sources of coordination-token growth.
+
+[Full v0.1.34-alpha.38 release notes](docs/releases/v0.1.34-alpha.38.md)
+
+- Legacy managers that already have child-approval authority receive a low-risk, inexpensive assistant
+  automatically. A saved explicit opt-out remains off, and uncertain or broader-risk decisions still escalate.
+- Simultaneous worker lifecycle changes are retained individually for audit but delivered to the manager as one
+  actionable pulse. Routine starts and stops no longer interrupt an expensive active manager turn.
+- Manager guidance now requires cursor-based inspection and yielding when no action is available instead of
+  provider wait loops, repeated child polling, or duplicate assistant decisions.
+- Team projections and transcript peeks use smaller bounded pages, and the shared MCP instruction header is no
+  longer repeated at full methodology length across every exposed tool.
+- Modern Codex cumulative token counters, including cached input, are preserved separately from request-context
+  occupancy and shown by `/usage` without mislabeling thread-lifetime totals as one model request.
+
 ## v0.1.33-alpha.37 — 2026-08-21
 
 This release keeps long conversations responsive and turns the Accounts tab into a fleet-wide identity catalog
