@@ -6,7 +6,11 @@
   import { groupCodexItems, type CodexRenderNode } from './codexGroup'
   import { classifyDecideOutcome } from './approvals'
   import { approvalBlurb } from './approvalBlurb'
-  import { distanceFromBottom, shouldShowJumpToBottom } from './transcriptScroll'
+  import {
+    distanceFromBottom,
+    shouldShowJumpToBottom,
+    shouldStickAfterScrollIntent,
+  } from './transcriptScroll'
   import PastedTextChip from './PastedTextChip.svelte'
   import { shouldPromotePaste, composeWithPastes, type PastedText } from './pastePromote'
   import AttachmentPreview from './AttachmentPreview.svelte'
@@ -310,6 +314,7 @@
   let sendErr = $state('')
   let scroller = $state<HTMLDivElement | null>(null)
   let stick = $state(true)
+  let lastTouchClientY: number | null = null
   // Jump-to-bottom affordance: `jumpAway` is whether the reader has scrolled meaningfully off the live
   // end (a larger gate than `stick` — see transcriptScroll.ts); `anchorKey` is the last item present at
   // the moment they scrolled away, so "N new" counts only what arrived below since (and survives older-
@@ -761,11 +766,42 @@
     if (m.scrollTop <= 96) void loadOlderAtTop()
   }
 
-  function onScrollIntent(): void {
-    // WebView can deliver the scroll event after a streamed item has already changed layout. Treat the
-    // wheel/touch gesture itself as the operator taking control so that intervening manager output cannot
-    // use a stale `stick=true` value to yank the transcript back to the live edge.
-    stick = false
+  function applyScrollIntent(deltaY: number): void {
+    if (!scroller || !Number.isFinite(deltaY)) return
+    const m = {
+      scrollTop: scroller.scrollTop,
+      scrollHeight: scroller.scrollHeight,
+      clientHeight: scroller.clientHeight,
+    }
+    // WebView can deliver `scroll` after streamed output has already changed layout. Project the gesture
+    // now so an upward move that leaves the live edge detaches immediately, while a downward wheel at the
+    // bottom remains pinned even though the scroll boundary produces no later event to restore it.
+    stick = shouldStickAfterScrollIntent(m, deltaY)
+  }
+
+  function onWheelIntent(event: WheelEvent): void {
+    if (!scroller) return
+    const unit = event.deltaMode === WheelEvent.DOM_DELTA_LINE
+      ? 16
+      : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+        ? scroller.clientHeight
+        : 1
+    applyScrollIntent(event.deltaY * unit)
+  }
+
+  function onTouchStart(event: TouchEvent): void {
+    lastTouchClientY = event.touches[0]?.clientY ?? null
+  }
+
+  function onTouchMove(event: TouchEvent): void {
+    const clientY = event.touches[0]?.clientY
+    if (clientY == null) return
+    if (lastTouchClientY != null) applyScrollIntent(lastTouchClientY - clientY)
+    lastTouchClientY = clientY
+  }
+
+  function onTouchEnd(): void {
+    lastTouchClientY = null
   }
   const newBelow = $derived(mainItemsBelow(view?.items ?? [], anchorKey))
   function jumpToBottom(): void {
@@ -1383,8 +1419,11 @@
     aria-label="Conversation transcript"
     bind:this={scroller}
     onscroll={onScroll}
-    onwheel={onScrollIntent}
-    ontouchmove={onScrollIntent}
+    onwheel={onWheelIntent}
+    ontouchstart={onTouchStart}
+    ontouchmove={onTouchMove}
+    ontouchend={onTouchEnd}
+    ontouchcancel={onTouchEnd}
   >
     {#if !composerOnly && (view.journalHistoryOlderCursor != null || view.historyOlderCursor != null)}
       <button

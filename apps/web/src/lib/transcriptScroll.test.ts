@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { distanceFromBottom, newItemsBelow, shouldShowJumpToBottom } from './transcriptScroll'
+import {
+  distanceFromBottom,
+  newItemsBelow,
+  shouldShowJumpToBottom,
+  shouldStickAfterScrollIntent,
+} from './transcriptScroll'
 
 // New module → old-vs-new is hollow; each assertion was confirmed to fail under a deliberate mutation
 // of the function it covers (documented in the report), so it discriminates behaviour.
@@ -11,6 +16,23 @@ describe('distanceFromBottom', () => {
   })
   it('measures the content left below the viewport', () => {
     expect(distanceFromBottom({ scrollTop: 200, scrollHeight: 1000, clientHeight: 100 })).toBe(700)
+  })
+})
+
+describe('shouldStickAfterScrollIntent', () => {
+  const bottom = { scrollTop: 1_500, scrollHeight: 2_000, clientHeight: 500 }
+
+  it('keeps the live-edge pin for a downward wheel at the bottom', () => {
+    expect(shouldStickAfterScrollIntent(bottom, 120)).toBe(true)
+  })
+
+  it('detaches only when an upward gesture would leave the near-bottom zone', () => {
+    expect(shouldStickAfterScrollIntent(bottom, -40)).toBe(true)
+    expect(shouldStickAfterScrollIntent(bottom, -120)).toBe(false)
+  })
+
+  it('reattaches when a downward gesture returns a detached viewport near the end', () => {
+    expect(shouldStickAfterScrollIntent({ ...bottom, scrollTop: 1_350 }, 120)).toBe(true)
   })
 })
 
