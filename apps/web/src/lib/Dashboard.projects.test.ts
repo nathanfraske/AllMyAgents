@@ -33,6 +33,7 @@ window.matchMedia = ((query: string) => ({
 })) as unknown as typeof window.matchMedia
 
 const now = '2026-07-27T12:00:00.000Z'
+const recentIso = (minutesAgo: number): string => new Date(Date.now() - minutesAgo * 60_000).toISOString()
 const projects: ProjectInfo[] = [
   { id: 'quiet', name: 'Quiet project', path: 'C:/quiet', createdAt: now },
   { id: 'risk', name: 'Risk project', path: 'C:/risk', createdAt: now },
@@ -86,10 +87,10 @@ beforeEach(() => {
   )
   store.projects = projects
   store.sessions = {
-    quiet1: session('quiet1', 'quiet', 'active', '2026-07-27T11:55:00.000Z'),
-    quiet2: session('quiet2', 'quiet', 'idle', '2026-07-27T11:54:00.000Z', true),
-    risk1: session('risk1', 'risk', 'error', '2026-07-27T10:00:00.000Z', false),
-    risk2: session('risk2', 'risk', 'idle', '2026-07-27T09:00:00.000Z'),
+    quiet1: session('quiet1', 'quiet', 'active', recentIso(5)),
+    quiet2: session('quiet2', 'quiet', 'idle', recentIso(6), true),
+    risk1: session('risk1', 'risk', 'error', recentIso(120), false),
+    risk2: session('risk2', 'risk', 'idle', recentIso(180)),
   }
   store.approvals = [
     { id: 'approval-1', sessionId: 'risk2', kind: 'claude/tool', payload: {}, status: 'pending', createdAt: now },
@@ -144,8 +145,8 @@ describe('Dashboard project launchpad', () => {
   })
 
   it('shows every project, opens ProjectView in one click, and summarizes the cheap roster signals', async () => {
-    const retired = session('retired', 'risk', 'active', '2026-07-27T11:59:00.000Z')
-    retired.record.managerRetiredAt = '2026-07-27T12:00:00.000Z'
+    const retired = session('retired', 'risk', 'active', recentIso(1))
+    retired.record.managerRetiredAt = recentIso(1)
     store.sessions.retired = retired
     const { container } = render(Dashboard, { onnewproject: vi.fn() })
 
