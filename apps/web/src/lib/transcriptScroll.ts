@@ -19,6 +19,25 @@ export function distanceFromBottom(m: ScrollMetrics): number {
 }
 
 /**
+ * Whether a pending wheel/touch gesture will leave the viewport inside the live-edge pin zone.
+ *
+ * The browser can deliver `scroll` after streamed content has already changed layout, so the gesture
+ * handler must update the pin before that event. It cannot simply clear the pin, though: a downward
+ * wheel at the bottom produces no scroll event at the boundary and would leave autoscroll disabled
+ * forever. Projecting the gesture preserves the early intent guard while making direction and the
+ * existing near-bottom threshold authoritative.
+ */
+export function shouldStickAfterScrollIntent(
+  m: ScrollMetrics,
+  deltaY: number,
+  threshold = 60,
+): boolean {
+  const maxScrollTop = Math.max(0, m.scrollHeight - m.clientHeight)
+  const projectedScrollTop = Math.min(maxScrollTop, Math.max(0, m.scrollTop + deltaY))
+  return distanceFromBottom({ ...m, scrollTop: projectedScrollTop }) < threshold
+}
+
+/**
  * Whether the jump-to-bottom control should show.
  *
  * Threshold: half a viewport, floored at 200px. Rationale — the control must appear only when it is
