@@ -278,9 +278,10 @@ describe('device-authenticated control plane', () => {
 
     const response = await fetch(`${base}/api/health`)
 
-    expect(response.status).toBe(503)
+    expect(response.status).toBe(200)
     expect(await response.json()).toMatchObject({
-      boot: 'degraded',
+      boot: 'complete',
+      protectionDegraded: true,
       journalBackup: {
         status: 'degraded',
         error: 'journal backup lease is unavailable',
@@ -295,9 +296,10 @@ describe('device-authenticated control plane', () => {
 
     const response = await fetch(`${base}/api/health`)
 
-    expect(response.status).toBe(503)
+    expect(response.status).toBe(200)
     expect(await response.json()).toMatchObject({
-      boot: 'degraded',
+      boot: 'complete',
+      protectionDegraded: true,
       journalBackup: {
         status: 'degraded',
         error: expect.stringMatching(/required.*inactive/i),

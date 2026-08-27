@@ -527,7 +527,11 @@ export class AgentWorker {
 
   private async startThread(spec: WorkerSessionSpec): Promise<string> {
     const client = this.codexClientFor(spec.profileId, spec.profileDir, spec.wsl)
-    const threadId = await client.startThread(spec.cwd, spec.codexDeveloperInstructions)
+    const threadId = await client.startThread(
+      spec.cwd,
+      spec.codexDeveloperInstructions,
+      spec.codexAgentMcpServer,
+    )
     this.codexThreads.set(spec.sessionId, threadId)
     this.codexSessionClients.set(spec.sessionId, client)
     return threadId
@@ -539,14 +543,22 @@ export class AgentWorker {
     let threadId = this.codexThreads.get(spec.sessionId)
     if (!threadId) {
       if (!spec.vendorSessionId) throw new Error('codex session has no persisted thread id')
-      await client.resumeThread(spec.vendorSessionId, spec.codexDeveloperInstructions)
+      await client.resumeThread(
+        spec.vendorSessionId,
+        spec.codexDeveloperInstructions,
+        spec.codexAgentMcpServer,
+      )
       threadId = spec.vendorSessionId
       this.codexThreads.set(spec.sessionId, threadId)
       // In-process journals session/thread-resumed here (a hub side effect); in the worker it is emitted
       // into the wseq'd event stream so the hub journals it identically (§3.2).
       this.emitEvent(spec.sessionId, 'session/thread-resumed', { threadId })
     }
-    await client.ensureDeveloperInstructions(threadId, spec.codexDeveloperInstructions)
+    await client.ensureDeveloperInstructions(
+      threadId,
+      spec.codexDeveloperInstructions,
+      spec.codexAgentMcpServer,
+    )
     return { client, threadId }
   }
 

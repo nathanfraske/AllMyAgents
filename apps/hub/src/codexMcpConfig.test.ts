@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {
+  codexAgentMcpServerConfig,
   renderCodexAgentMcpBlock,
   stripCodexAgentMcpBlock,
   upsertCodexFileCredentialStore,
@@ -20,6 +21,19 @@ const OPTS: CodexAgentMcpOptions = {
 }
 
 describe('renderCodexAgentMcpBlock', () => {
+  it('builds an exact thread binding without persisting it into shared profile config', () => {
+    expect(codexAgentMcpServerConfig(OPTS, { AMA_SESSION_ID: 'manager-1' })).toEqual({
+      command: 'node',
+      args: ['C:/Users/Admin/hub/agentBridge.js'],
+      env: {
+        AMA_HUB_URL: 'http://127.0.0.1:7777',
+        AMA_HUB_SECRET: 'sekret',
+        AMA_PROFILE_ID: 'codex-a',
+        AMA_SESSION_ID: 'manager-1',
+      },
+    })
+    expect(renderCodexAgentMcpBlock(OPTS)).not.toContain('AMA_SESSION_ID')
+  })
   it('renders a stdio server table + env sub-table codex 0.145 accepts', () => {
     const toml = renderCodexAgentMcpBlock(OPTS)
     expect(toml).toContain('[mcp_servers.allmyagents]')

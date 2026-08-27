@@ -210,4 +210,28 @@ describe('SessionManager.execAgentTool — the Codex agent-tool path (cwd → se
       cleanup()
     }
   })
+
+  it('uses an exact bridge binding when manager and workers intentionally share account and checkout', async () => {
+    const { sessions, memory, inject, cleanup } = setup()
+    try {
+      inject([
+        { ...codexRec('manager', '/work/shared', { projectId: 'proj1', status: 'active' }), isProjectManager: true },
+        { ...codexRec('worker', '/work/shared', { projectId: 'proj1', status: 'active' }), parentSessionId: 'manager' },
+      ])
+      const result = await sessions.execAgentTool(
+        'codex-a',
+        '/work/shared',
+        'memory_write',
+        { title: 'manager-bound', body: 'exact', scope: 'account' },
+        'manager',
+      )
+      expect(result).toMatch(/Saved to/)
+      expect(memory.list({ scopes: ['account:codex-a'] })[0]!.fromSession).toBe('manager')
+
+      const rejected = await sessions.execAgentTool('codex-a', '/work/other', 'list_agents', {}, 'manager')
+      expect(rejected).toMatch(/binding does not match/)
+    } finally {
+      cleanup()
+    }
+  })
 })

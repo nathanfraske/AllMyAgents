@@ -1065,14 +1065,17 @@ export function startServer(opts: ServerOptions): http.Server {
           reportedBackupState.status === 'degraded' ||
           (restartState.journalBackupRequired &&
             reportedBackupState.status !== 'active')
+        // Backup protection is a durable warning, not listener liveness. Returning 503 here made one
+        // failed or settling snapshot turn an otherwise responsive hub yellow/unavailable, and every
+        // peer consequently dropped its routes and agents. Promotion still gates ownership through the
+        // explicit supervisor protocol; once booted, keep the control plane reachable so it can report
+        // and recover the protection fault.
+        const listenerReady = restartState.booted
         json(
           res,
           {
-            boot: backupDegraded
-              ? 'degraded'
-              : restartState.booted
-                ? 'complete'
-                : 'booting',
+            boot: listenerReady ? 'complete' : 'booting',
+            protectionDegraded: backupDegraded,
             restoredSessions: sessions.list().length,
             schemaVersion: SCHEMA_VERSION,
             pid: process.pid,
@@ -1083,7 +1086,7 @@ export function startServer(opts: ServerOptions): http.Server {
             // plan — observed live on a promoted green). Falls back to the boot port before the listener is up.
             port: (server.address() as { port?: number } | null)?.port ?? port,
           },
-          backupDegraded ? 503 : 200
+          listenerReady ? 200 : 503
         )
         return
       }
@@ -1099,13 +1102,14 @@ export function startServer(opts: ServerOptions): http.Server {
         }
         const body = await readBody(req)
         const profileId = str(body.profileId)
+        const sessionId = str(body.sessionId)
         const cwd = str(body.cwd)
         const toolName = str(body.tool)
         if (!profileId || !cwd || !toolName) {
           json(res, { error: 'missing profileId, cwd, or tool' }, 400)
           return
         }
-        const result = await sessions.execAgentTool(profileId, cwd, toolName, body.args)
+        const result = await sessions.execAgentTool(profileId, cwd, toolName, body.args, sessionId || undefined)
         json(res, typeof result === 'string' ? { text: result } : { result })
         return
       }

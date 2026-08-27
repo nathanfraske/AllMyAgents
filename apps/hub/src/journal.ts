@@ -1149,7 +1149,7 @@ export class Journal extends EventEmitter {
         originalKind: row.kind,
         originalPayloadBytes,
         message:
-          'This retained history event is larger than the bounded history page and was not transferred.',
+          'One large retained event was kept out of this bounded view; the surrounding conversation loaded normally.',
       },
     })
 
@@ -1506,7 +1506,7 @@ export class Journal extends EventEmitter {
           lastSeq = row.seq
           continue
         }
-        const envelopeBytes =
+        const envelopeWithoutPayload =
           Buffer.byteLength(
             JSON.stringify({
               seq: row.seq,
@@ -1516,25 +1516,43 @@ export class Journal extends EventEmitter {
               payload: null,
             })
           ) -
-          Buffer.byteLength('null') +
-          row.payload_bytes
-        if (envelopeBytes > options.maxFrameBytes || row.payload === null) {
+          Buffer.byteLength('null')
+        if (row.payload === null) {
           return {
             checkpoint,
             events,
             lastSeq,
             hasMore: true,
             encodedBytes,
-            tooLarge: { seq: row.seq, encodedBytes: envelopeBytes },
+            tooLarge: { seq: row.seq, encodedBytes: envelopeWithoutPayload + row.payload_bytes },
           }
         }
-        if (encodedBytes + envelopeBytes > options.maxBytes) break
+        const storedPayload = parseStoredPayload(row.payload, row.seq)
+        // Externalized rows are tiny SQLite pointers whose decoded strings may be megabytes. Budgeting
+        // the pointer bytes made a reconnect synchronously read and hash thousands of cold blob files on
+        // the hub thread before discovering the frames could not fit. Metadata is enough to reject or
+        // stop planning first; only the bounded working set below is hydrated.
+        const estimatedPayloadBytes = this.payloadBlobs
+          ? this.payloadBlobs.estimateDecodedJsonBytes(storedPayload)
+          : Buffer.byteLength(JSON.stringify(storedPayload))
+        const estimatedEnvelopeBytes = envelopeWithoutPayload + estimatedPayloadBytes
+        if (estimatedEnvelopeBytes > options.maxFrameBytes) {
+          return {
+            checkpoint,
+            events,
+            lastSeq,
+            hasMore: true,
+            encodedBytes,
+            tooLarge: { seq: row.seq, encodedBytes: estimatedEnvelopeBytes },
+          }
+        }
+        if (encodedBytes + estimatedEnvelopeBytes > options.maxBytes) break
         const event: HubEvent = {
           seq: row.seq,
           ts: row.ts,
           sessionId: row.session,
           kind: row.kind,
-          payload: parsePayload(row.payload, row.seq, this.payloadBlobs),
+          payload: this.payloadBlobs?.decode(storedPayload) ?? storedPayload,
         }
         const bytes = Buffer.byteLength(JSON.stringify(event))
         if (bytes > options.maxFrameBytes) {

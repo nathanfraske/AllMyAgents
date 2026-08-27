@@ -1208,8 +1208,6 @@
                   >
                     <Icon name={collapsed.has(`manager:${s.record.id}`) ? 'chevron-right' : 'chevron-down'} size={11} />
                   </button>
-                {:else if en.managerDepth > 0}
-                  <span class="manager-branch" aria-hidden="true"><Icon name="corner-down-right" size={10} /></span>
                 {:else if en.orphanedManager}
                   <span class="manager-orphan" title="delegated child · manager is no longer available" aria-label="manager is no longer available">
                     <Icon name="flag" size={11} />
@@ -1449,7 +1447,23 @@
     background: color-mix(in srgb, var(--accent) 13%, var(--surface-2));
     box-shadow: inset 3px 0 0 var(--accent), inset 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent);
   }
-  .row.managedchild { margin-left: calc(var(--manager-depth) * 0.85rem); width: calc(100% - (var(--manager-depth) * 0.85rem)); }
+  /* Child ownership reads as a real tree instead of a repeated corner-arrow glyph. Every child row
+     continues the manager rail through its full height and joins it to the row with a short branch.
+     The rail remains legible when status/provider/badge density is high because it consumes no inline
+     slot. Deeper one-shot descendants move the same visual one level farther inward. */
+  .row.managedchild {
+    margin-left: calc(var(--manager-depth) * 0.9rem);
+    width: calc(100% - (var(--manager-depth) * 0.9rem));
+    padding-left: calc(var(--space-6) + var(--space-2));
+  }
+  .row.managedchild::before {
+    content: ''; position: absolute; z-index: 0; left: 0; top: -1px; bottom: -1px; width: 1px;
+    background: color-mix(in srgb, var(--accent) 42%, var(--border)); pointer-events: none;
+  }
+  .row.managedchild::after {
+    content: ''; position: absolute; z-index: 0; left: 0; top: 50%; width: var(--space-4); height: 1px;
+    background: color-mix(in srgb, var(--accent) 42%, var(--border)); pointer-events: none;
+  }
   .manager-team-head {
     display: flex; align-items: center; gap: var(--space-2); min-width: 0;
     margin-left: 0.85rem; padding: 0.28rem var(--space-3) 0.18rem var(--space-4);
@@ -1464,7 +1478,7 @@
   .manager-team-state { flex: none; opacity: 0.78; }
   .manager-team-count { flex: none; margin-left: auto; min-width: 1.25rem; text-align: center; padding: 0.02rem 0.28rem;
     border: 1px solid currentColor; border-radius: var(--r-pill); opacity: 0.76; }
-  .manager-toggle, .manager-branch { flex: none; display: grid; place-items: center; width: 12px; color: var(--dim); }
+  .manager-toggle { flex: none; display: grid; place-items: center; width: 12px; color: var(--dim); }
   .manager-toggle { color: var(--accent); }
   .manager-toggle:hover { color: var(--text); }
   .manager-identity { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 0.12rem; }
@@ -1479,7 +1493,7 @@
   .manager-orphan { flex: none; display: grid; place-items: center; width: 12px; color: var(--warn); opacity: 0.9; }
   .row.orphanedchild { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--warn) 55%, transparent); }
   .row.attentionchild { background: color-mix(in srgb, var(--warn) 6%, transparent); }
-  .row.attentionchild .manager-branch { color: var(--warn); }
+  .row.attentionchild::before, .row.attentionchild::after { background: var(--warn); }
   .row:hover { background: var(--surface-2); }
   .row.sel { background: var(--surface-2); box-shadow: inset 2px 0 0 var(--accent); }
   /* Drag hint: a faint grip rail on the left, revealed on hover, signalling the whole ROW/HEADER is
