@@ -20,6 +20,8 @@ export interface BridgeEnv {
   hubUrl: string
   secret: string
   profileId: string
+  /** Hub-issued thread binding. Absent only for older threads during a rolling upgrade. */
+  sessionId?: string
   cwd: string
 }
 
@@ -27,7 +29,8 @@ export function readBridgeEnv(env: NodeJS.ProcessEnv = process.env, cwd = proces
   const hubUrl = env.AMA_HUB_URL ?? ''
   const secret = env.AMA_HUB_SECRET ?? ''
   const profileId = env.AMA_PROFILE_ID ?? ''
-  return { hubUrl, secret, profileId, cwd }
+  const sessionId = env.AMA_SESSION_ID?.trim() || undefined
+  return { hubUrl, secret, profileId, ...(sessionId ? { sessionId } : {}), cwd }
 }
 
 /**
@@ -44,7 +47,13 @@ export function makeHubExecutor(cfg: BridgeEnv, fetchImpl: typeof fetch = fetch)
       const res = await fetchImpl(`${cfg.hubUrl.replace(/\/$/, '')}/internal/agent-tool`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${cfg.secret}` },
-        body: JSON.stringify({ profileId: cfg.profileId, cwd: cfg.cwd, tool: name, args: args ?? {} }),
+        body: JSON.stringify({
+          profileId: cfg.profileId,
+          sessionId: cfg.sessionId,
+          cwd: cfg.cwd,
+          tool: name,
+          args: args ?? {},
+        }),
       })
       const data = (await res.json().catch(() => ({}))) as {
         text?: string

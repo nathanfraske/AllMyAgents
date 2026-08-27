@@ -126,6 +126,7 @@ describe('Sidebar with folder state', () => {
     expect(el.querySelector('.row.manager .rlabel')?.textContent).toBe('one')
     expect(el.querySelector('.manager-role')?.textContent).toMatch(/open project overview.*1 agent/i)
     expect(el.querySelector('.manager-role svg')).not.toBeNull()
+    expect(el.querySelector('.manager-branch')).toBeNull()
   })
 
   it('removes a retired child from the working catalog while preserving its session record', () => {

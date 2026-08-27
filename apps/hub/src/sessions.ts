@@ -76,6 +76,7 @@ import {
   type OverseerControlResult,
 } from './agentToolCore.js'
 import {
+  codexAgentMcpServerConfig,
   stripCodexAgentMcpBlock,
   writeCodexAgentMcpConfig,
 } from './codexMcpConfig.js'
@@ -1852,6 +1853,22 @@ export class SessionManager {
         : (this.ensureCodexMcpConfig(profile), profile.dir)
     }
     const runtimeInstructions = this.runtimeHostInstructions(record, directOperatorPrompt)
+    const codexAgentMcpServer = record.provider === 'codex' && this.codexBridge
+      ? codexAgentMcpServerConfig(
+          {
+            ...this.codexBridge,
+            profileId: record.profileId,
+            ...(record.wslDistro
+              ? {
+                  bridgePath: windowsPathToWsl(this.codexBridge.bridgePath),
+                  nodePath: nativeWslExecutable(record.wslDistro, 'node'),
+                  nodeArgs: this.codexBridge.nodeArgs?.map(windowsPathToWsl),
+                }
+              : {}),
+          },
+          { AMA_SESSION_ID: record.id },
+        )
+      : undefined
     return {
       sessionId: record.id,
       provider: record.provider,
@@ -1868,6 +1885,7 @@ export class SessionManager {
       permissionMode: this.effectivePermissionMode(record),
       claudeSystemPrompt: record.provider === 'claude' ? runtimeInstructions : undefined,
       codexDeveloperInstructions: record.provider === 'codex' ? runtimeInstructions : undefined,
+      codexAgentMcpServer,
       trustProjectConfig,
       vendorSessionId: record.vendorSessionId,
     }
@@ -3605,8 +3623,26 @@ export class SessionManager {
    * hard-deny, since the body reads isBusTurn) are enforced identically. Never throws: attribution
    * failures + tool errors come back as a model-readable string.
    */
-  async execAgentTool(profileId: string, cwd: string, tool: string, args: unknown): Promise<AgentToolOutput> {
-    const identity = this.resolveCodexIdentity(profileId, cwd) ??
+  async execAgentTool(
+    profileId: string,
+    cwd: string,
+    tool: string,
+    args: unknown,
+    sessionId?: string,
+  ): Promise<AgentToolOutput> {
+    const explicitlyBound = sessionId ? this.sessions.get(sessionId) : undefined
+    const explicitMatch = explicitlyBound &&
+      explicitlyBound.provider === 'codex' &&
+      explicitlyBound.profileId === profileId &&
+      explicitlyBound.status !== 'stopped' &&
+      this.matchingCodexSessions(profileId, cwd).some((candidate) => candidate.id === explicitlyBound.id)
+      ? identityOf(explicitlyBound)
+      : undefined
+    if (sessionId && !explicitMatch) {
+      this.journal.append(null, 'codex/agent-tool-binding-rejected', { profileId, sessionId, cwd, tool })
+      return 'Not attributed — this Codex tool bridge session binding does not match the live account and working directory.'
+    }
+    const identity = explicitMatch ?? this.resolveCodexIdentity(profileId, cwd) ??
       (tool === 'decide_child_approval'
         ? this.resolveCodexApprovalDecisionIdentity(profileId, cwd, args)
         : undefined)

@@ -39,6 +39,13 @@ export interface CodexAgentMcpOptions {
 export const AGENT_MCP_SERVER_NAME = 'allmyagents'
 const FILE_CREDENTIAL_STORE = 'cli_auth_credentials_store = "file"'
 
+/** Raw thread-scoped MCP config accepted by Codex's `thread/start` / `thread/resume` config override. */
+export interface CodexAgentMcpServerConfig {
+  command: string
+  args: string[]
+  env: Record<string, string>
+}
+
 /** Encode a string as a TOML basic string (escaping backslashes + quotes). */
 function tomlStr(s: string): string {
   return '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'
@@ -49,20 +56,35 @@ function fwd(p: string): string {
   return p.replace(/\\/g, '/')
 }
 
+/** Build the executable MCP config shared by durable TOML and exact per-thread overrides. */
+export function codexAgentMcpServerConfig(
+  opts: CodexAgentMcpOptions,
+  extraEnv: Record<string, string> = {},
+): CodexAgentMcpServerConfig {
+  return {
+    command: opts.nodePath ?? 'node',
+    args: [...(opts.nodeArgs ?? []), fwd(opts.bridgePath)],
+    env: {
+      AMA_HUB_URL: opts.hubUrl,
+      AMA_HUB_SECRET: opts.secret,
+      AMA_PROFILE_ID: opts.profileId,
+      ...extraEnv,
+    },
+  }
+}
+
 /** Render just the `[mcp_servers.<name>]` + `[mcp_servers.<name>.env]` tables for these options. */
 export function renderCodexAgentMcpBlock(opts: CodexAgentMcpOptions): string {
   const name = opts.serverName ?? AGENT_MCP_SERVER_NAME
-  const node = opts.nodePath ?? 'node'
+  const server = codexAgentMcpServerConfig(opts)
   const lines = [
     `[mcp_servers.${name}]`,
-    `command = ${tomlStr(node)}`,
+    `command = ${tomlStr(server.command)}`,
     // node args (dev tsx loader, if any) come first, then the bridge entry itself.
-    `args = [${[...(opts.nodeArgs ?? []), fwd(opts.bridgePath)].map(tomlStr).join(', ')}]`,
+    `args = [${server.args.map(tomlStr).join(', ')}]`,
     '',
     `[mcp_servers.${name}.env]`,
-    `AMA_HUB_URL = ${tomlStr(opts.hubUrl)}`,
-    `AMA_HUB_SECRET = ${tomlStr(opts.secret)}`,
-    `AMA_PROFILE_ID = ${tomlStr(opts.profileId)}`,
+    ...Object.entries(server.env).map(([key, value]) => `${key} = ${tomlStr(value)}`),
   ]
   return lines.join('\n')
 }

@@ -2,7 +2,7 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { createRequire } from 'node:module'
-import { AGENT_MCP_SERVER_NAME } from '../codexMcpConfig.js'
+import { AGENT_MCP_SERVER_NAME, type CodexAgentMcpServerConfig } from '../codexMcpConfig.js'
 import { windowsPathToWsl } from '../workspaceLocation.js'
 import { nativeWslExecutable, spawnInWsl } from '../wslProcess.js'
 import { repairCodexRolloutPaths } from '../codexRolloutRelocation.js'
@@ -349,6 +349,7 @@ export class CodexClient {
   private readonly activeTurns = new Map<string, string>()
   /** Last developer-instruction bytes applied to each root thread. Invalidated after compaction. */
   private readonly developerInstructionsByThread = new Map<string, string>()
+  private readonly agentMcpConfigByThread = new Map<string, string>()
   /**
    * `thread/start` allocates an id before app-server has written a rollout. `thread/resume` rejects that
    * id until the first turn starts, even on the same live connection. Keep the short pristine window
@@ -530,6 +531,7 @@ export class CodexClient {
         // app/topology bytes through thread/resume instead of trusting that invariant indefinitely.
         // This does NOT clear the vendor thread, its new continuity summary, or any conversation state.
         this.developerInstructionsByThread.delete(p.threadId)
+        this.agentMcpConfigByThread.delete(p.threadId)
       }
     }
     const method = msg.method as string
@@ -542,7 +544,11 @@ export class CodexClient {
     this.onEvent(routed.isSubagent ? `codex/subagent/${method}` : `codex/${method}`, routed.payload)
   }
 
-  async startThread(cwd: string, developerInstructions?: string): Promise<string> {
+  async startThread(
+    cwd: string,
+    developerInstructions?: string,
+    agentMcpServer?: CodexAgentMcpServerConfig,
+  ): Promise<string> {
     await this.ensureStarted()
     const normalized = developerInstructions?.trim()
     const params: Record<string, unknown> = {
@@ -550,7 +556,10 @@ export class CodexClient {
       // Installed app-server 0.145 exposes thread-scoped config overrides on thread/start. The official
       // Codex config key is snake_case; unlike developerInstructions, this controls the summary request
       // itself. CODEX_COMPACTION_PROMPT is deliberately a complete replacement prompt.
-      config: { compact_prompt: CODEX_COMPACTION_PROMPT },
+      config: {
+        compact_prompt: CODEX_COMPACTION_PROMPT,
+        ...(agentMcpServer ? { mcp_servers: { [AGENT_MCP_SERVER_NAME]: agentMcpServer } } : {}),
+      },
     }
     if (normalized) params.developerInstructions = normalized
     const result = await this.request<{
@@ -562,10 +571,15 @@ export class CodexClient {
     this.threadParents.set(threadId, result.thread?.parentThreadId ?? null)
     this.pristineThreads.add(threadId)
     if (normalized) this.developerInstructionsByThread.set(threadId, normalized)
+    if (agentMcpServer) this.agentMcpConfigByThread.set(threadId, JSON.stringify(agentMcpServer))
     return threadId
   }
 
-  async resumeThread(threadId: string, developerInstructions?: string): Promise<void> {
+  async resumeThread(
+    threadId: string,
+    developerInstructions?: string,
+    agentMcpServer?: CodexAgentMcpServerConfig,
+  ): Promise<void> {
     await this.ensureStarted()
     const normalized = developerInstructions?.trim()
     const params: Record<string, unknown> = {
@@ -575,7 +589,10 @@ export class CodexClient {
       excludeTurns: true,
       // Reassert the compaction contract when joining an existing thread, including threads created by
       // an older AllMyAgents cut. This upgrades current sessions without requiring recreation.
-      config: { compact_prompt: CODEX_COMPACTION_PROMPT },
+      config: {
+        compact_prompt: CODEX_COMPACTION_PROMPT,
+        ...(agentMcpServer ? { mcp_servers: { [AGENT_MCP_SERVER_NAME]: agentMcpServer } } : {}),
+      },
     }
     if (normalized) params.developerInstructions = normalized
     const result = await this.request<{ thread?: { id?: string; parentThreadId?: string | null } }>(
@@ -587,12 +604,20 @@ export class CodexClient {
     this.pristineThreads.delete(threadId)
     this.pristineThreads.delete(resumedId)
     if (normalized) this.developerInstructionsByThread.set(resumedId, normalized)
+    if (agentMcpServer) this.agentMcpConfigByThread.set(resumedId, JSON.stringify(agentMcpServer))
   }
 
   /** Refresh changed app/topology instructions on an already-loaded thread without adding a fake turn. */
-  async ensureDeveloperInstructions(threadId: string, developerInstructions?: string): Promise<void> {
+  async ensureDeveloperInstructions(
+    threadId: string,
+    developerInstructions?: string,
+    agentMcpServer?: CodexAgentMcpServerConfig,
+  ): Promise<void> {
     const normalized = developerInstructions?.trim()
-    if (!normalized || this.developerInstructionsByThread.get(threadId) === normalized) return
+    const instructionsCurrent = !normalized || this.developerInstructionsByThread.get(threadId) === normalized
+    const mcpCurrent = !agentMcpServer ||
+      this.agentMcpConfigByThread.get(threadId) === JSON.stringify(agentMcpServer)
+    if (instructionsCurrent && mcpCurrent) return
     // The initial developer contract is already installed on this in-memory thread. App-server does not
     // expose an in-place pre-turn mutation seam, and thread/resume cannot address it until a rollout
     // exists. Keep the safe initial bytes for turn one; after turn/started clears this marker, the next
@@ -600,7 +625,7 @@ export class CodexClient {
     if (this.pristineThreads.has(threadId)) return
     // The generated 0.145 protocol exposes developerInstructions on thread/start and thread/resume,
     // not as an arbitrary turn/start field. Rejoining a running thread is the supported update seam.
-    await this.resumeThread(threadId, normalized)
+    await this.resumeThread(threadId, normalized, agentMcpServer)
   }
 
   /**

@@ -1833,7 +1833,7 @@
   .hbtn { font-size: 0.76rem; color: var(--muted); border: 1px solid var(--border); border-radius: 7px; padding: 0.22rem 0.5rem; }
   .hbtn:hover:not(:disabled) { border-color: var(--border-strong); color: var(--text); }
   .hbtn:disabled { opacity: 0.4; cursor: default; }
-  .stream { flex: 1; display: flex; flex-direction: column; gap: 0.55rem; padding: 1rem 1.1rem; max-width: 900px; width: 100%; margin: 0 auto; container-type: inline-size; }
+  .stream { flex: 1; display: flex; flex-direction: column; gap: 0.55rem; padding: 1rem 1.1rem; max-width: 960px; width: 100%; margin: 0 auto; container-type: inline-size; }
   .history-page { align-self: center; max-width: 18rem; }
   .history-error { align-self: center; max-width: 34rem; color: var(--danger); font-size: 0.78rem; text-align: center; display: flex; align-items: center; gap: 0.55rem; }
   .stream.replay-rebuild { visibility: hidden; }
@@ -1859,7 +1859,7 @@
     .thinking .dots i:nth-child(3) { animation-delay: 0.3s; }
     @keyframes tbounce { 0%, 60%, 100% { opacity: 0.35; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-3px); } }
   }
-  .composer-wrap { position: relative; padding: 0.5rem 1rem 0.7rem; max-width: 900px; width: 100%; margin: 0 auto; }
+  .composer-wrap { position: relative; padding: 0.5rem 1rem 0.7rem; max-width: 960px; width: 100%; margin: 0 auto; }
   /* Floats just above the composer-wrap's top edge (= the transcript's lower edge), centered — clear of
      the composer and the action-error slot, both of which live lower inside this wrap. */
   .jumpbtn { position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%); margin-bottom: 8px; z-index: 12;

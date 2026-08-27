@@ -9,6 +9,7 @@ import crypto from 'node:crypto'
 import type { ApprovalPersistence, ApprovalStatus, DangerFlags } from './types.js'
 import type { AttachmentMeta } from './attachments.js'
 import type { ApprovalHelperEvaluation, ApprovalHelperEvaluationInput } from './approvalHelper.js'
+import type { CodexAgentMcpServerConfig } from './codexMcpConfig.js'
 
 /** The subset of a SessionRecord the worker's driver needs — the worker holds no record + never opens the store. */
 export interface WorkerSessionSpec {
@@ -36,6 +37,8 @@ export interface WorkerSessionSpec {
    * refreshed on an already-running/resumed thread and remains part of the prefix across compaction.
    */
   codexDeveloperInstructions?: string
+  /** Exact per-session binding for the Codex AllMyAgents MCP bridge. */
+  codexAgentMcpServer?: CodexAgentMcpServerConfig
   /** True only when the operator approved this project's executable MCP/hook config. */
   trustProjectConfig?: boolean
   vendorSessionId?: string // claude --resume id / codex threadId to resume

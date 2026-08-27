@@ -115,6 +115,10 @@
     if (last.kind === 'thinking') return 'thinking…'
     return (last.text ?? '').replace(/\s+/g, ' ').slice(0, 120)
   }
+
+  function parentLabel(r: AgentRun<ThreadItem>): string {
+    return runs.find((candidate) => candidate.id === r.parentId)?.description ?? 'another worker'
+  }
 </script>
 
 {#if runs.length}
@@ -144,6 +148,12 @@
                compile error rather than a runtime one — so it takes the whole dev server down. -->
           {@const tools = r.toolCount || r.toolUses || 0}
           <div class="run" class:nested={!!r.parentId}>
+            {#if r.parentId}
+              <div class="lineage" title={`Spawned by ${parentLabel(r)}`}>
+                <span>under</span>
+                <strong>{parentLabel(r)}</strong>
+              </div>
+            {/if}
             <button class="rhead" onclick={() => (expanded = expanded === r.id ? null : r.id)}>
               <span class="dot {dot(r.status)}"></span>
               <span class="rdesc" title={r.description}>{r.description}</span>
@@ -239,8 +249,21 @@
   .x { background: none; border: none; color: inherit; cursor: pointer; opacity: 0.7; padding: 0 0.2rem; }
   .x:hover { opacity: 1; }
   .plist { flex: 1; overflow-y: auto; padding: 0.4rem; display: flex; flex-direction: column; gap: 0.35rem; }
-  .run { border: 1px solid var(--border); border-radius: 10px; padding: 0.4rem 0.5rem; background: var(--bg, transparent); }
-  .run.nested { margin-left: 0.75rem; border-left: 2px solid var(--border-strong); }
+  .run { position: relative; border: 1px solid var(--border); border-radius: 10px; padding: 0.4rem 0.5rem; background: var(--bg, transparent); }
+  .run.nested { margin-left: 1rem; }
+  .run.nested::before {
+    content: ''; position: absolute; left: -0.72rem; top: -0.36rem; bottom: -0.36rem; width: 1px;
+    background: color-mix(in srgb, var(--accent) 45%, var(--border));
+  }
+  .run.nested::after {
+    content: ''; position: absolute; left: -0.72rem; top: 1rem; width: 0.7rem; height: 1px;
+    background: color-mix(in srgb, var(--accent) 45%, var(--border));
+  }
+  .lineage {
+    display: flex; align-items: center; gap: 0.25rem; min-width: 0; margin: -0.08rem 0 0.28rem;
+    color: var(--dim); font-size: 0.62rem; line-height: 1; text-transform: uppercase; letter-spacing: 0.045em;
+  }
+  .lineage strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-weight: var(--fw-semibold); text-transform: none; letter-spacing: normal; }
   .rhead { display: flex; align-items: center; gap: 0.45rem; width: 100%; background: none; border: none; color: inherit; cursor: pointer; padding: 0; text-align: left; }
   .rdesc { flex: 1; font-size: 0.78rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .rmeta { font-size: 0.7rem; flex: none; }

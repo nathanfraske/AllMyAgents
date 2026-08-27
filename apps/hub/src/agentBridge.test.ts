@@ -11,6 +11,16 @@ describe('readBridgeEnv', () => {
       cwd: '/work/a',
     })
   })
+
+  it('carries the hub-issued exact session binding when present', () => {
+    const env = {
+      AMA_HUB_URL: 'http://127.0.0.1:7777',
+      AMA_HUB_SECRET: 's',
+      AMA_PROFILE_ID: 'codex-a',
+      AMA_SESSION_ID: 'manager-1',
+    }
+    expect(readBridgeEnv(env, '/work/shared')).toMatchObject({ sessionId: 'manager-1' })
+  })
 })
 
 describe('makeHubExecutor (the bridge → hub forward)', () => {
@@ -39,6 +49,16 @@ describe('makeHubExecutor (the bridge → hub forward)', () => {
     const fakeFetch = (async () => ({ ok: false, status: 403, json: async () => ({ error: 'forbidden' }) })) as unknown as typeof fetch
     const out = await makeHubExecutor(cfg, fakeFetch)('list_agents', {})
     expect(out).toBe('Tool error: forbidden')
+  })
+
+  it('forwards the exact session binding separately from tool arguments', async () => {
+    let body: Record<string, unknown> = {}
+    const fakeFetch = (async (_url: string, init: RequestInit) => {
+      body = JSON.parse(init.body as string) as Record<string, unknown>
+      return { ok: true, status: 200, json: async () => ({ text: 'ok' }) }
+    }) as unknown as typeof fetch
+    await makeHubExecutor({ ...cfg, sessionId: 'manager-1' }, fakeFetch)('query_team', {})
+    expect(body).toMatchObject({ profileId: 'codex-a', sessionId: 'manager-1', cwd: '/work/a' })
   })
 
   it('never throws on a transport failure — returns an unreachable-hub message', async () => {

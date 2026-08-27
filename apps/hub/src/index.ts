@@ -806,16 +806,19 @@ function runJournalMaintenance(): void {
       }
       if (msg?.type === 'journal-condense-error') {
         terminalReported = true
+        clearInterval(guard)
         console.error(`[journal] condensation failed: ${msg.error}`)
         return
       }
       if (msg?.type === 'journal-condense-deferred') {
         terminalReported = true
+        clearInterval(guard)
         console.warn(`[journal] condensation deferred without deletion: ${msg.reason}`)
         return
       }
       if (msg?.type !== 'journal-condensed') return
       terminalReported = true
+      clearInterval(guard)
       const {
         commandOutputDeltasDeleted,
         agentMessageDeltasDeleted,

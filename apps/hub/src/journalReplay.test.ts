@@ -258,6 +258,25 @@ describe('bounded replay checkpoints and journal history', () => {
     }
   })
 
+  it('does not synchronously hydrate an external blob that metadata proves cannot fit a replay frame', () => {
+    const journal = new Journal(path.join(tmp, 'blob-replay-budget.db'))
+    try {
+      journal.append('s', 'session/input', { text: 'z'.repeat(700 * 1024) })
+      const read = vi.spyOn(fs, 'readFileSync')
+      const checkpoint = journal.replayCheckpoint()
+      const page = journal.boundedReplayPage(0, checkpoint.cursor, {
+        maxRows: 10,
+        maxBytes: 2 * 1024 * 1024,
+        maxFrameBytes: 128 * 1024,
+      })
+      expect(page.events).toEqual([])
+      expect(page.tooLarge).toEqual(expect.objectContaining({ seq: 1 }))
+      expect(read).not.toHaveBeenCalled()
+    } finally {
+      journal.db.close()
+    }
+  })
+
   it('skips an unobserved oversized row without hydrating it and advances the durable cursor', () => {
     const journal = new Journal(path.join(tmp, 'filtered-raw-replay.db'))
     try {

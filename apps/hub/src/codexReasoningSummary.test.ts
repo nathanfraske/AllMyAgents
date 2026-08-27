@@ -47,6 +47,30 @@ describe('Codex reasoning summaries', () => {
 })
 
 describe('Codex host contract', () => {
+  it('installs and preserves the exact AllMyAgents MCP session binding at thread boundaries', async () => {
+    const client = new CodexClient('unused', vi.fn())
+    vi.spyOn(client, 'ensureStarted').mockResolvedValue()
+    const request = vi.spyOn(client, 'request').mockImplementation(async (method) => {
+      if (method === 'thread/start') return { thread: { id: 'thread-bound', parentThreadId: null } }
+      if (method === 'thread/resume') return { thread: { id: 'thread-bound', parentThreadId: null } }
+      return undefined
+    })
+    const mcp = {
+      command: 'node',
+      args: ['C:/hub/agentBridge.js'],
+      env: { AMA_HUB_URL: 'http://127.0.0.1:7777', AMA_SESSION_ID: 'manager-1' },
+    }
+    const threadId = await client.startThread('C:/repo', 'contract', mcp)
+    expect(request).toHaveBeenCalledWith('thread/start', expect.objectContaining({
+      config: {
+        compact_prompt: CODEX_COMPACTION_PROMPT,
+        mcp_servers: { allmyagents: mcp },
+      },
+    }))
+    await client.ensureDeveloperInstructions(threadId, 'contract', mcp)
+    expect(request.mock.calls.filter(([method]) => method === 'thread/resume')).toHaveLength(0)
+  })
+
   it('sets developer instructions through the supported thread seams and reasserts them after compaction', async () => {
     const client = new CodexClient('unused', vi.fn())
     vi.spyOn(client, 'ensureStarted').mockResolvedValue()

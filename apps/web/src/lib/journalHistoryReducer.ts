@@ -114,7 +114,7 @@ export function reduceJournalHistory(events: readonly HubEvent[]): ThreadItem[] 
         ts,
         text:
           (payload as { message?: string }).message ??
-          'One retained history event was too large for this bounded page.',
+          'One large retained event was kept out of this bounded view; the surrounding conversation loaded normally.',
       })
       continue
     }
