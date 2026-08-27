@@ -5,6 +5,26 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.36-alpha.40 — 2026-08-27
+
+This release restores reliable manager-to-worker control when a Codex team shares one account and checkout, keeps
+large retained conversations responsive, and makes project/team hierarchy easier to read.
+
+[Full v0.1.36-alpha.40 release notes](docs/releases/v0.1.36-alpha.40.md)
+
+- Every Codex thread receives an exact hub-issued session binding for AllMyAgents tools. Managers and workers may
+  share an account and checkout without `Not attributed` blocking messages, tasks, approvals, or run inspection.
+- Replay budgets now account for the decoded size of external journal blobs before reading them from disk. A cold
+  reconnect cannot synchronously hydrate an unbounded blob set and starve hub health or conversation history.
+- Backup-protection warnings remain visible but no longer turn a responsive, fully booted hub into HTTP 503 or make
+  paired devices discard healthy routes.
+- Oversized retained events show one precise bounded-view marker while the surrounding conversation loads, and a
+  finished maintenance child can no longer be killed later by its stale progress watchdog.
+- Live-edge scrolling follows new output only while the operator is actually at the bottom; scrolling upward stays
+  detached, while a pane already at the bottom continues following the newest message.
+- Nested managers, workers, and one-shot descendants use continuous rails and explicit parent labels instead of
+  repeated corner arrows, and conversation/composer width increases slightly for better use of larger panes.
+
 ## v0.1.35-alpha.39 — 2026-08-25
 
 This release makes durable run completion a reliable manager continuation boundary and tightens long-conversation
