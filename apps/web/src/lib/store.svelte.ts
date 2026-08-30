@@ -1322,6 +1322,25 @@ export class HubStore {
       return
     }
     if (cur.record.profileId === profileId) return
+    if (cur.record.isOverseer === true) {
+      if (cur.record.siteId) {
+        void alertDialog('Change a remote hub\'s Overseer account from that hub.')
+        return
+      }
+      const out = await api.configureOverseer(profileId)
+      if ('error' in out) {
+        void alertDialog(out.error)
+        return
+      }
+      if (!out.session || !out.sessionId) {
+        void alertDialog('The hub changed the Overseer account but did not return its successor chat.')
+        return
+      }
+      this.upsertSessionRecord(out.session)
+      this.lastProfileId = profileId
+      this.select(out.sessionId)
+      return
+    }
     // A DRAFT has no hub session yet — reconfigure it in place (no re-spawn, no port). Reset the
     // model/traits to the new provider's defaults, since the old slug is invalid cross-provider.
     if (cur.draft) {
@@ -4282,6 +4301,25 @@ export class HubStore {
     if (!viewIsBusy(view)) view.orderKey = newestTs
   }
 
+  private async readJournalHistoryPage(
+    id: string,
+    label: string,
+    requestedGeneration: number,
+    beforeSeq: number,
+  ): Promise<JournalHistoryPage> {
+    try {
+      return await resilientHistoryRead(label, (signal) =>
+        api.journalHistory(id, requestedGeneration, beforeSeq, signal),
+      )
+    } catch (error) {
+      const actualGeneration = changedJournalHistoryGeneration(error)
+      if (actualGeneration === undefined || actualGeneration === requestedGeneration) throw error
+      return await resilientHistoryRead(label, (signal) =>
+        api.journalHistory(id, actualGeneration, beforeSeq, signal),
+      )
+    }
+  }
+
   // Lazily pull an IMPORTED chat's on-disk transcript the first time it's opened and prepend it above
   // any live turns — so the thread shows real history instead of an empty pane. Hub-native chats skip
   // this (their history already replays over the WS). Never clobbers a thread that already has content.
@@ -4297,56 +4335,51 @@ export class HubStore {
       this.historyPulled.add(id)
       view.loadingHistory = true
       view.historyLoadError = undefined
-      let page: JournalHistoryPage | null = null
+      let installedLatest = false
       const requestedGeneration = remote?.generation ?? this.replayGeneration
       const beforeSeq = (remote?.baselineSeq ?? this.replayBaselineSeq) + 1
       try {
-        page = await resilientHistoryRead('Latest journal history', (signal) =>
-          api.journalHistory(
-            id,
-            requestedGeneration,
-            beforeSeq,
-            signal,
-          ),
+        const page = await this.readJournalHistoryPage(
+          id,
+          'Latest journal history',
+          requestedGeneration,
+          beforeSeq,
         )
-      } catch (error) {
-        const actualGeneration = changedJournalHistoryGeneration(error)
-        if (actualGeneration !== undefined && actualGeneration !== requestedGeneration) {
-          try {
-            page = await resilientHistoryRead('Latest journal history', (signal) =>
-              api.journalHistory(id, actualGeneration, beforeSeq, signal),
-            )
-          } catch (retryError) {
-            view.historyLoadError =
-              retryError instanceof Error
-                ? retryError.message
-                : 'Latest journal history could not be loaded.'
-          }
-        } else {
-          view.historyLoadError =
-            error instanceof Error ? error.message : 'Latest journal history could not be loaded.'
+        if (!Array.isArray(page.events)) throw new Error('Latest journal history returned an invalid response.')
+        const historyItems = reduceJournalHistory(page.events)
+        this.installJournalHistoryWindow(view, historyItems)
+        this.reconcileNativeHistoryActivity(view, historyItems)
+        view.journalHistoryGeneration = page.checkpointGeneration
+        view.journalHistoryOlderCursor = page.hasOlder ? page.olderCursor : null
+        installedLatest = true
+
+        // A busy manager can spend most of a 40-row page on tool/lifecycle events, leaving only two or
+        // three actual conversation messages. Fetch at most one additional bounded page when that
+        // happens. This preserves the server's per-request limits while making a cold-opened active chat
+        // useful without requiring the operator to notice and click "Load older history" immediately.
+        const conversationItems = historyItems.filter(
+          (item) => item.kind === 'user' || item.kind === 'assistant',
+        ).length
+        if (conversationItems < 6 && page.hasOlder && page.olderCursor != null) {
+          const olderPage = await this.readJournalHistoryPage(
+            id,
+            'Earlier journal history',
+            page.checkpointGeneration,
+            page.olderCursor,
+          )
+          if (!Array.isArray(olderPage.events)) throw new Error('Earlier journal history returned an invalid response.')
+          const olderItems = reduceJournalHistory(olderPage.events)
+          this.installJournalHistoryWindow(view, olderItems)
+          view.journalHistoryGeneration = olderPage.checkpointGeneration
+          view.journalHistoryOlderCursor = olderPage.hasOlder ? olderPage.olderCursor : null
         }
+      } catch (error) {
+        view.historyLoadError =
+          error instanceof Error ? error.message : 'Latest journal history could not be loaded.'
+        if (!installedLatest) this.historyPulled.delete(id)
       } finally {
         view.loadingHistory = false
       }
-      if (!page || !Array.isArray(page.events)) {
-        if (page) view.historyLoadError = 'Latest journal history returned an invalid response.'
-        this.historyPulled.delete(id)
-        return
-      }
-      let historyItems: ThreadItem[]
-      try {
-        historyItems = reduceJournalHistory(page.events)
-      } catch (error) {
-        view.historyLoadError =
-          error instanceof Error ? error.message : 'Latest journal history could not be decoded.'
-        this.historyPulled.delete(id)
-        return
-      }
-      this.installJournalHistoryWindow(view, historyItems)
-      this.reconcileNativeHistoryActivity(view, historyItems)
-      view.journalHistoryGeneration = page.checkpointGeneration
-      view.journalHistoryOlderCursor = page.hasOlder ? page.olderCursor : null
       return
     }
     // Already has real turns (live session, or history loaded) — nothing to backfill.
@@ -4398,29 +4431,15 @@ export class HubStore {
       view.loadingHistory = true
       let page: JournalHistoryPage | null = null
       try {
-        page = await resilientHistoryRead('Older journal history', (signal) =>
-          api.journalHistory(
-            id,
-            requestedGeneration,
-            cursor,
-            signal,
-          ),
+        page = await this.readJournalHistoryPage(
+          id,
+          'Older journal history',
+          requestedGeneration,
+          cursor,
         )
       } catch (error) {
-        const actualGeneration = changedJournalHistoryGeneration(error)
-        if (actualGeneration !== undefined && actualGeneration !== requestedGeneration) {
-          try {
-            page = await resilientHistoryRead('Older journal history', (signal) =>
-              api.journalHistory(id, actualGeneration, cursor, signal),
-            )
-          } catch (retryError) {
-            view.historyLoadError =
-              retryError instanceof Error ? retryError.message : 'Older history could not be loaded.'
-          }
-        } else {
-          view.historyLoadError =
-            error instanceof Error ? error.message : 'Older history could not be loaded.'
-        }
+        view.historyLoadError =
+          error instanceof Error ? error.message : 'Older history could not be loaded.'
       } finally {
         view.loadingHistory = false
       }
@@ -4459,6 +4478,17 @@ export class HubStore {
     view.historyOlderCursor = page.hasOlder ? page.olderCursor : null
     view.historyViewingOlder = true
     return true
+  }
+
+  async retryHistory(id: string): Promise<void> {
+    const view = this.sessions[id]
+    if (!view || view.loadingHistory) return
+    if (view.journalHistoryOlderCursor != null || view.historyOlderCursor != null) {
+      await this.loadOlderHistory(id)
+      return
+    }
+    this.historyPulled.delete(id)
+    await this.ensureHistory(id)
   }
 
   showLatestHistory(id: string): void {

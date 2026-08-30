@@ -772,6 +772,15 @@ function runJournalMaintenance(): void {
     let terminalReported = false
     let lastProgressAt = Date.now()
     let progressWatchdogSuspended = false
+    const childRecordedTerminalLifecycle = (): boolean => {
+      try {
+        const status = journal.latestCompactionLifecycle()
+        return status?.operationId === operationId &&
+          ['completed', 'deferred', 'failed', 'unobservable'].includes(status.phase)
+      } catch {
+        return false
+      }
+    }
     const guard = setInterval(() => {
       if (progressWatchdogSuspended) return
       if (Date.now() - lastProgressAt < noProgressMs) return
@@ -860,6 +869,10 @@ function runJournalMaintenance(): void {
     child.once('exit', (code, signal) => {
       clearInterval(guard)
       if (journalMaintenanceChild === child) journalMaintenanceChild = undefined
+      // IPC delivery and process exit can race on Windows. The child commits its terminal lifecycle
+      // before sending the summary, so consult that durable truth before fabricating an observation-loss
+      // terminal. This removes the noisy "already terminal" loop without weakening crash detection.
+      if (!terminalReported && childRecordedTerminalLifecycle()) terminalReported = true
       if (!terminalReported) {
         terminalReported = true
         try {

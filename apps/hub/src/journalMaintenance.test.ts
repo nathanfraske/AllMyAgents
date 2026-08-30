@@ -5,6 +5,7 @@ import { fork } from 'node:child_process'
 import { afterEach, describe, expect, it } from 'vitest'
 import Database from 'better-sqlite3'
 import { Journal } from './journal.js'
+import { snapshotJournal } from './journalBackup.js'
 
 const cleanup: string[] = []
 
@@ -104,5 +105,68 @@ describe('journal maintenance steady state', () => {
       operationId,
       error: expect.stringMatching(/invalid JSON.*maintenance refused/iu),
     })
+  })
+
+  it('deletes the eligible prefix covered by the newest recovery generation while retaining newer candidates', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-maintenance-covered-prefix-'))
+    cleanup.push(directory)
+    const journalFile = path.join(directory, 'hub.db')
+    const backups = path.join(directory, 'backups')
+    const journal = new Journal(journalFile)
+    journal.append('session-a', 'codex/item/completed', {
+      threadId: 'thread-a',
+      turnId: 'turn-a',
+      item: {
+        type: 'commandExecution', id: 'command-a', command: 'echo test',
+        aggregatedOutput: 'test\n', exitCode: 0,
+      },
+    })
+    const covered = journal.append('session-a', 'codex/item/commandExecution/outputDelta', {
+      threadId: 'thread-a', turnId: 'turn-a', itemId: 'command-a', delta: 'covered',
+    }).seq
+    const snapshot = await snapshotJournal(journal.db, {
+      dir: backups,
+      recoveryDataDir: directory,
+      recoveryKeep: 2,
+      now: () => new Date('2026-08-30T12:00:00.000Z'),
+    })
+    if (!snapshot.ok) throw new Error(`strong snapshot failed: ${snapshot.error}`)
+    const newer = journal.append('session-a', 'codex/item/commandExecution/outputDelta', {
+      threadId: 'thread-a', turnId: 'turn-a', itemId: 'command-a', delta: 'not covered yet',
+    }).seq
+    journal.db.close()
+
+    const operationId = '33333333-3333-4333-8333-333333333333'
+    const child = fork(
+      new URL('./journalMaintenance.ts', import.meta.url),
+      [
+        journalFile, backups, operationId, '0',
+        '1000', '1000', '1000', String(1024 * 1024), '60000',
+      ],
+      { execArgv: ['--import', 'tsx'], stdio: ['ignore', 'ignore', 'pipe', 'ipc'] },
+    )
+    const message = await new Promise<Record<string, unknown>>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        child.kill()
+        reject(new Error('journal maintenance child did not finish'))
+      }, 30_000)
+      child.on('message', (value) => {
+        const candidate = value as Record<string, unknown>
+        if (!['journal-condensed', 'journal-condense-deferred', 'journal-condense-error'].includes(String(candidate.type))) return
+        clearTimeout(timeout)
+        resolve(candidate)
+      })
+      child.once('error', reject)
+    })
+
+    expect(message).toMatchObject({
+      type: 'journal-condensed',
+      operationId,
+      result: { commandOutputDeltasDeleted: 1 },
+    })
+    const raw = new Database(journalFile, { readonly: true })
+    expect(raw.prepare('SELECT seq FROM events WHERE seq = ?').get(covered)).toBeUndefined()
+    expect(raw.prepare('SELECT seq FROM events WHERE seq = ?').get(newer)).toEqual({ seq: newer })
+    raw.close()
   })
 })

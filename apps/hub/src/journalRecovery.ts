@@ -1303,6 +1303,50 @@ export type StrongRecoverySnapshotCoverage = {
   deleteThroughSeq: string
 }
 
+export type StrongRecoverySnapshotClaim = {
+  rootId: string
+  journalId: string
+  generation: string
+  snapshotMaxSeq: string
+  snapshotEventHighWater: string
+}
+
+/**
+ * Cheap, read-only upper-bound hint from the newest canonical recovery manifest. This is deliberately a
+ * CLAIM, not deletion authority: maintenance may use it only to avoid hashing a multi-gigabyte generation
+ * when no eligible row falls beneath the claimed frontier. Any actual delete still goes through
+ * {@link verifyStrongRecoverySnapshotCoverage}, which verifies the snapshot bytes and logical contents.
+ */
+export function newestStrongRecoverySnapshotClaim(options: {
+  dataDir: string
+  journalPath: string
+}): StrongRecoverySnapshotClaim {
+  const dataDir = path.resolve(options.dataDir)
+  const journalPath = path.resolve(options.journalPath)
+  if (path.dirname(journalPath) !== dataDir || path.basename(journalPath) !== 'hub.db') {
+    throw new Error('strong recovery claim requires the exact data-root hub.db path')
+  }
+  const binding = parseRootBinding(recoveryPaths(dataDir).rootBinding)
+  const newest = scanRecoveryCandidates(dataDir)[0]
+  if (!newest) throw new Error('no strong recovery generation covers compaction')
+  if (BigInt(newest.manifest.generation) >= BigInt(binding.nextGeneration)) {
+    throw new Error('newest recovery generation exceeds reserved generation authority')
+  }
+  if (
+    newest.manifest.rootId !== binding.rootId ||
+    newest.manifest.journalId !== binding.activeJournalId
+  ) {
+    throw new Error('newest recovery generation does not belong to the active journal')
+  }
+  return {
+    rootId: binding.rootId,
+    journalId: binding.activeJournalId,
+    generation: newest.manifest.generation,
+    snapshotMaxSeq: newest.manifest.maxSeq,
+    snapshotEventHighWater: newest.manifest.eventHighWater,
+  }
+}
+
 /**
  * Read-only compaction gate. Only the newest canonical strong generation may cover deletion; an
  * invalid newest generation fails closed instead of falling back. Legacy flat backups, filenames,

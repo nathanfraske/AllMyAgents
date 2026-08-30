@@ -89,7 +89,7 @@ describe('transcript interaction boundaries', () => {
   it('offers an explicit retry when latest history could not be loaded', async () => {
     const view = seed()
     view.historyLoadError = 'Latest journal history is temporarily unavailable.'
-    const retry = vi.spyOn(store, 'ensureHistory').mockResolvedValue()
+    const retry = vi.spyOn(store, 'retryHistory').mockResolvedValue()
     const rendered = render(ThreadView, { props: { sessionId: 'interaction-session' } })
     retry.mockClear()
 

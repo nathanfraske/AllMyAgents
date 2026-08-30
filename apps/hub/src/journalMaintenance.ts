@@ -19,7 +19,11 @@ import {
   JOURNAL_BACKUP_MAX_RETAINED_BYTES_DEFAULT,
   pruneJournalBackupGenerations,
 } from './journalBackup.js'
-import { pruneRecoveryGenerations, verifyStrongRecoverySnapshotCoverage } from './journalRecovery.js'
+import {
+  newestStrongRecoverySnapshotClaim,
+  pruneRecoveryGenerations,
+  verifyStrongRecoverySnapshotCoverage,
+} from './journalRecovery.js'
 import { reserveReplicationPruneGate } from './journalReplication.js'
 import { SCHEMA_VERSION } from './restartHandshake.js'
 
@@ -179,7 +183,7 @@ async function main(): Promise<{ message: MaintenanceMessage; exitCode: number }
       const reason =
         `lossless payload externalization paused at its size-aware work budget ` +
         `(${blobRowsRewritten} row(s), ${blobSqliteBytesReleased} SQLite payload bytes released)`
-      journal.recordCompactionLifecycle(operationId, 'unobservable', {
+      journal.recordCompactionLifecycle(operationId, 'deferred', {
         payloadBytesDeleted: blobSqliteBytesReleased,
         detail: reason,
       })
@@ -236,7 +240,7 @@ async function main(): Promise<{ message: MaintenanceMessage; exitCode: number }
     const transientProjection = journal.backfillTransientEventIndex(1)
     if (!sessionProjection.complete || !transientProjection.complete) {
       const reason = 'bounded projection time budget elapsed; deletion was not attempted'
-      journal.recordCompactionLifecycle(operationId, 'unobservable', {
+      journal.recordCompactionLifecycle(operationId, 'deferred', {
         rowsDeleted,
         payloadBytesDeleted,
         detail: reason,
@@ -248,7 +252,7 @@ async function main(): Promise<{ message: MaintenanceMessage; exitCode: number }
     }
 
     const maintenanceNow = Date.now()
-    const candidateFrontier = journal.condensationCandidateFrontier({
+    let candidateFrontier = journal.condensationCandidateFrontier({
       nowMs: maintenanceNow,
       graceMs: Number(graceRaw),
       maxTransientPayloadBytes: Number(byteLimitRaw),
@@ -284,6 +288,58 @@ async function main(): Promise<{ message: MaintenanceMessage; exitCode: number }
         exitCode: 0,
       }
     }
+    // A recovery generation is a point-in-time snapshot, while superseded rows keep aging into the
+    // candidate set. Requiring that snapshot to cover the NEWEST candidate rejected the entire pass as
+    // soon as one later row became eligible, even though a large older prefix remained safely covered.
+    // Read only the manifest claim first (never deletion authority) to constrain candidate discovery. If
+    // nothing remains below it, skip the multi-GB hash/integrity pass and wait cheaply for the next backup.
+    let snapshotClaim: ReturnType<typeof newestStrongRecoverySnapshotClaim>
+    try {
+      snapshotClaim = newestStrongRecoverySnapshotClaim({
+        dataDir: path.dirname(file),
+        journalPath: file,
+      })
+    } catch (error) {
+      const reason = boundedMessage(error)
+      journal.recordCompactionLifecycle(operationId, 'deferred', {
+        detail: `Deletion deferred: ${reason}`,
+      })
+      return {
+        message: { type: 'journal-condense-deferred', operationId, reason },
+        exitCode: 0,
+      }
+    }
+    const claimedFrontierBig = BigInt(snapshotClaim.snapshotMaxSeq) < BigInt(snapshotClaim.snapshotEventHighWater)
+      ? BigInt(snapshotClaim.snapshotMaxSeq)
+      : BigInt(snapshotClaim.snapshotEventHighWater)
+    const claimedFrontier = Number(claimedFrontierBig)
+    if (!Number.isSafeInteger(claimedFrontier) || claimedFrontier < 0) {
+      const reason = 'newest strong recovery generation has an unsupported event frontier'
+      journal.recordCompactionLifecycle(operationId, 'deferred', { detail: `Deletion deferred: ${reason}` })
+      return {
+        message: { type: 'journal-condense-deferred', operationId, reason },
+        exitCode: 0,
+      }
+    }
+    if (candidateFrontier > claimedFrontier) {
+      candidateFrontier = journal.condensationCandidateFrontier({
+        nowMs: maintenanceNow,
+        graceMs: Number(graceRaw),
+        maxTransientPayloadBytes: Number(byteLimitRaw),
+        maxSeq: claimedFrontier,
+      })
+    }
+    if (candidateFrontier === 0) {
+      const reason =
+        `Journal cleanup is current through recovery generation ${snapshotClaim.generation}; ` +
+        'newer superseded rows are waiting for the next verified snapshot.'
+      journal.recordCompactionLifecycle(operationId, 'deferred', { detail: reason })
+      reportProgress('deferred', lastProjectionProgress, payloadBytesDeleted)
+      return {
+        message: { type: 'journal-condense-deferred', operationId, reason },
+        exitCode: 0,
+      }
+    }
     reportProgress('verifying-snapshot-coverage', lastProjectionProgress, payloadBytesDeleted)
     const snapshot = verifyRecentCompactionSnapshot(
       backupDirectory,
@@ -314,7 +370,7 @@ async function main(): Promise<{ message: MaintenanceMessage; exitCode: number }
       }
     )
     if (!snapshot.ok) {
-      journal.recordCompactionLifecycle(operationId, 'unobservable', {
+      journal.recordCompactionLifecycle(operationId, 'deferred', {
         detail: `Deletion deferred: ${snapshot.reason}`,
       })
       return {
@@ -426,7 +482,7 @@ async function main(): Promise<{ message: MaintenanceMessage; exitCode: number }
       const reason = `transient SQLite writer contention; retrying at the next maintenance interval (${message})`
       try {
         if (journal && operationId) {
-          journal.recordCompactionLifecycle(operationId, 'unobservable', {
+          journal.recordCompactionLifecycle(operationId, 'deferred', {
             rowsDeleted,
             payloadBytesDeleted,
             detail: reason,

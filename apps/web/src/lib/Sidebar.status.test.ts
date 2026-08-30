@@ -118,6 +118,26 @@ describe('compact system status indicators', () => {
     )
   })
 
+  it('presents ordinary snapshot lag as deferred maintenance rather than unavailable status', async () => {
+    store.journalCompaction = {
+      operationId: 'maintenance-deferred',
+      phase: 'deferred',
+      startedAt: '2026-08-30T12:00:00.000Z',
+      updatedAt: '2026-08-30T12:00:01.000Z',
+      rowsDeleted: 0,
+      payloadBytesDeleted: 0,
+      detail: 'Journal cleanup is current through recovery generation 12; newer rows are waiting for the next verified snapshot.',
+    }
+    render(Sidebar)
+
+    const trigger = screen.getByRole('button', { name: 'Journal maintenance: waiting for snapshot' })
+    await fireEvent.click(trigger)
+
+    const popout = screen.getByRole('dialog', { name: 'Journal maintenance' })
+    expect(popout.textContent).toContain('current through recovery generation 12')
+    expect(popout.textContent).not.toContain('status unavailable')
+  })
+
   it.each([
     ['active', 'thinking'],
     ['starting', 'thinking'],

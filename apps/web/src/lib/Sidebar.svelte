@@ -114,6 +114,7 @@
       case 'started': return 'starting'
       case 'progress': return 'working'
       case 'completed': return 'completed'
+      case 'deferred': return 'waiting for snapshot'
       case 'failed': return 'failed'
       case 'unobservable': return 'status unavailable'
       default: return 'idle'
@@ -892,7 +893,7 @@
         class:working={journalPhase === 'started' || journalPhase === 'progress'}
         class:ok={journalPhase === 'completed'}
         class:bad={journalPhase === 'failed'}
-        class:warn={journalPhase === 'unobservable'}
+        class:warn={journalPhase === 'deferred' || journalPhase === 'unobservable'}
         type="button"
         aria-haspopup="dialog"
         aria-expanded={statusPopover === 'journal'}
@@ -907,7 +908,7 @@
           class:working={journalPhase === 'started' || journalPhase === 'progress'}
           class:ok={journalPhase === 'completed'}
           class:bad={journalPhase === 'failed'}
-          class:warn={journalPhase === 'unobservable'}
+          class:warn={journalPhase === 'deferred' || journalPhase === 'unobservable'}
         ></span>
       </button>
       <NotificationCenter />
@@ -961,7 +962,7 @@
             <span
               class="status-state"
               class:working={journalPhase === 'started' || journalPhase === 'progress'}
-              class:problem={journalPhase === 'failed' || journalPhase === 'unobservable'}
+              class:problem={journalPhase === 'deferred' || journalPhase === 'failed' || journalPhase === 'unobservable'}
             >{journalLabel}</span>
           </div>
           {#if store.journalCompaction}

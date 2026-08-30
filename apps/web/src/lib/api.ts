@@ -540,7 +540,7 @@ export interface ReplayBaseline {
 
 export interface JournalCompactionStatus {
   operationId: string
-  phase: 'started' | 'progress' | 'completed' | 'failed' | 'unobservable'
+  phase: 'started' | 'progress' | 'completed' | 'deferred' | 'failed' | 'unobservable'
   startedAt: string
   updatedAt: string
   rowsDeleted: number

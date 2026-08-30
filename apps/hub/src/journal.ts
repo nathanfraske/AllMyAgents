@@ -227,6 +227,7 @@ export type JournalCompactionPhase =
   | 'started'
   | 'progress'
   | 'completed'
+  | 'deferred'
   | 'failed'
   | 'unobservable'
 
@@ -507,7 +508,7 @@ export class Journal extends EventEmitter {
       CREATE TABLE IF NOT EXISTS journal_compaction_runs (
         operation_id TEXT PRIMARY KEY,
         phase TEXT NOT NULL CHECK (
-          phase IN ('started', 'progress', 'completed', 'failed', 'unobservable')
+          phase IN ('started', 'progress', 'completed', 'deferred', 'failed', 'unobservable')
         ),
         started_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
@@ -661,6 +662,42 @@ export class Journal extends EventEmitter {
           );
       END;
     `)
+    const compactionLifecycleSql = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'journal_compaction_runs'")
+      .pluck()
+      .get()
+    if (typeof compactionLifecycleSql === 'string' && !compactionLifecycleSql.includes("'deferred'")) {
+      const widenCompactionLifecycle = this.db.transaction(() => {
+        const currentSql = this.db
+          .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'journal_compaction_runs'")
+          .pluck()
+          .get()
+        if (typeof currentSql === 'string' && currentSql.includes("'deferred'")) return
+        this.db.exec(`
+          DROP INDEX IF EXISTS idx_journal_compaction_runs_updated;
+          ALTER TABLE journal_compaction_runs RENAME TO journal_compaction_runs_before_deferred;
+          CREATE TABLE journal_compaction_runs (
+            operation_id TEXT PRIMARY KEY,
+            phase TEXT NOT NULL CHECK (
+              phase IN ('started', 'progress', 'completed', 'deferred', 'failed', 'unobservable')
+            ),
+            started_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            rows_deleted INTEGER NOT NULL CHECK (rows_deleted >= 0),
+            payload_bytes_deleted INTEGER NOT NULL CHECK (payload_bytes_deleted >= 0),
+            detail TEXT NOT NULL CHECK (length(detail) <= 512)
+          );
+          INSERT INTO journal_compaction_runs
+            (operation_id, phase, started_at, updated_at, rows_deleted, payload_bytes_deleted, detail)
+          SELECT operation_id, phase, started_at, updated_at, rows_deleted, payload_bytes_deleted, detail
+          FROM journal_compaction_runs_before_deferred;
+          DROP TABLE journal_compaction_runs_before_deferred;
+          CREATE INDEX idx_journal_compaction_runs_updated
+            ON journal_compaction_runs(updated_at DESC, operation_id DESC);
+        `)
+      })
+      widenCompactionLifecycle.immediate()
+    }
     const hasResetFloor =
       (this.db
         .prepare(
@@ -859,7 +896,7 @@ export class Journal extends EventEmitter {
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(operationId)) {
       throw new Error('journal compaction operation id is invalid')
     }
-    if (!['started', 'progress', 'completed', 'failed', 'unobservable'].includes(phase)) {
+    if (!['started', 'progress', 'completed', 'deferred', 'failed', 'unobservable'].includes(phase)) {
       throw new Error('journal compaction phase is invalid')
     }
     const rowsDeleted = values.rowsDeleted ?? 0
@@ -896,7 +933,7 @@ export class Journal extends EventEmitter {
         throw new Error('journal compaction lifecycle has no started boundary')
       }
       if (existing) {
-        const terminal = ['completed', 'failed', 'unobservable'].includes(existing.phase)
+        const terminal = ['completed', 'deferred', 'failed', 'unobservable'].includes(existing.phase)
         if (terminal) {
           if (
             existing.phase === phase &&
@@ -942,7 +979,7 @@ export class Journal extends EventEmitter {
           detail
         )
       this.append(null, `journal/compaction-${phase}`, result)
-      if (phase === 'completed' || phase === 'failed' || phase === 'unobservable') {
+      if (phase === 'completed' || phase === 'deferred' || phase === 'failed' || phase === 'unobservable') {
         this.db
           .prepare(
             `DELETE FROM journal_compaction_runs
@@ -1610,7 +1647,7 @@ export class Journal extends EventEmitter {
     options: Pick<
       JournalCondenseOptions,
       'nowMs' | 'graceMs' | 'maxTransientPayloadBytes'
-    > = {}
+    > & { maxSeq?: number } = {}
   ): number {
     // These indexes are deliberately lazy. Production calls this method only from the post-ready
     // maintenance child; building them in Journal's constructor would put a one-time 700k-row index
@@ -1624,15 +1661,18 @@ export class Journal extends EventEmitter {
     const graceMs = options.graceMs ?? JOURNAL_CONDENSE_GRACE_MS
     const maxTransientPayloadBytes =
       options.maxTransientPayloadBytes ?? JOURNAL_CONDENSE_MAX_TRANSIENT_BYTES
+    const maxSeq = options.maxSeq ?? Number.MAX_SAFE_INTEGER
     for (const [name, value] of [
       ['nowMs', nowMs],
       ['graceMs', graceMs],
       ['maxTransientPayloadBytes', maxTransientPayloadBytes],
+      ['maxSeq', maxSeq],
     ] as const) {
       if (!Number.isFinite(value) || value < 0) {
         throw new Error(`${name} must be a finite non-negative number`)
       }
     }
+    if (!Number.isSafeInteger(maxSeq)) throw new Error('maxSeq must be a safe integer')
     const indexedThrough = this.db
       .prepare('SELECT scanned_through FROM journal_transient_index_state WHERE singleton = 1')
       .pluck()
@@ -1653,6 +1693,7 @@ export class Journal extends EventEmitter {
         `SELECT COALESCE(MAX(candidate.seq), 0) AS frontier
          FROM journal_transient_event_index AS candidate
          WHERE candidate.ts <= ?
+           AND candidate.seq <= ?
            AND candidate.payload_bytes <= ?
            AND (
              (
@@ -1728,6 +1769,7 @@ export class Journal extends EventEmitter {
       )
       .get(
         cutoff,
+        maxSeq,
         Math.floor(maxTransientPayloadBytes),
         cutoff,
         cutoff,

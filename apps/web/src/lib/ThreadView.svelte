@@ -1534,7 +1534,7 @@
         <button
           class="ghost tiny"
           disabled={view.loadingHistory}
-          onclick={() => void store.ensureHistory(view.record.id)}
+          onclick={() => void store.retryHistory(view.record.id)}
         >Retry history</button>
       </div>
     {/if}
