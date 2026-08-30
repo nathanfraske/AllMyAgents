@@ -44,6 +44,12 @@ removing a root capability also fails closed immediately, even if a source chat 
 
 ## Lightweight headless node
 
+The automatic bootstrap below currently depends on AllMyStuff's authenticated file and terminal planes.
+A peer that runs only MyOwnMesh is a distinct, fail-closed product seam; its required upstream protocol and
+no-reboot qualification plan are captured in
+[the MyOwnMesh-native testbed contract](myownmesh-native-testbed-contract.md). LAN discovery is never
+bootstrap authority, and manual SSH copy is not substituted for that missing product contract.
+
 A target does not need the full AllMyAgents desktop app, a local hub journal, an Overseer, or any Claude or
 Codex account. If it already runs AllMyStuff/MyOwnMesh and belongs to the same signed owned-device fleet, the
 source Overseer can bootstrap the release's vendor-free testbed payload through the remote planes AllMyStuff
