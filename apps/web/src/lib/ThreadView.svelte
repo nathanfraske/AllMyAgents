@@ -1,3 +1,10 @@
+<script module lang="ts">
+  // A chat can unmount while the operator opens another chat/project tab. Remember only whether that
+  // exact live SessionView was attached to its live edge: returning to an attached chat must catch up,
+  // while returning to one deliberately scrolled into history must not yank the reader away.
+  const returnToLiveEdge = new WeakMap<object, boolean>()
+</script>
+
 <script lang="ts">
   import { api } from './api'
   import { store, type ThreadItem } from './store.svelte'
@@ -313,7 +320,9 @@
   })
   let sendErr = $state('')
   let scroller = $state<HTMLDivElement | null>(null)
+  let streamContent = $state<HTMLDivElement | null>(null)
   let stick = $state(true)
+  let liveEdgeFrame: number | null = null
   let lastTouchClientY: number | null = null
   // Jump-to-bottom affordance: `jumpAway` is whether the reader has scrolled meaningfully off the live
   // end (a larger gate than `stick` — see transcriptScroll.ts); `anchorKey` is the last item present at
@@ -691,6 +700,61 @@
     return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
   }
 
+  function snapToLiveEdge(force = false): void {
+    const target = scroller
+    if (!target || (!force && !stick)) return
+    // Assigning scrollHeight is intentional: browsers clamp it to the exact maximum scrollTop. Using
+    // a cached `scrollHeight - clientHeight` would be stale as soon as streamed markdown wrapped again.
+    target.scrollTop = target.scrollHeight
+    jumpAway = false
+    anchorKey = null
+  }
+
+  function scheduleLiveEdgeSnap(): void {
+    if (!stick || !scroller) return
+    if (liveEdgeFrame != null) window.cancelAnimationFrame(liveEdgeFrame)
+    liveEdgeFrame = window.requestAnimationFrame(() => {
+      liveEdgeFrame = null
+      snapToLiveEdge()
+    })
+  }
+
+  // Token streaming commonly grows the LAST rendered row in place, so `items.length` never changes.
+  // Observe the measured content box as the source of truth and follow every layout growth while the
+  // reader is attached to the live edge. This also catches delayed markdown/code layout and expanded
+  // tool output without polling or invalidating the whole ThreadView on every token.
+  $effect(() => {
+    const content = streamContent
+    if (!content || typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(() => scheduleLiveEdgeSnap())
+    observer.observe(content)
+    scheduleLiveEdgeSnap()
+    return () => {
+      observer.disconnect()
+      if (liveEdgeFrame != null) {
+        window.cancelAnimationFrame(liveEdgeFrame)
+        liveEdgeFrame = null
+      }
+    }
+  })
+
+  // WebView/browser tabs can throttle ResizeObserver while hidden. Reassert the live edge when the app
+  // becomes visible or focused again, but only for a chat that never detached by scrolling upward.
+  $effect(() => {
+    if (composerOnly) return
+    const restoreVisibleLiveEdge = () => {
+      if (document.visibilityState === 'hidden' || !stick) return
+      snapToLiveEdge()
+      scheduleLiveEdgeSnap()
+    }
+    window.addEventListener('focus', restoreVisibleLiveEdge)
+    document.addEventListener('visibilitychange', restoreVisibleLiveEdge)
+    return () => {
+      window.removeEventListener('focus', restoreVisibleLiveEdge)
+      document.removeEventListener('visibilitychange', restoreVisibleLiveEdge)
+    }
+  })
+
   $effect(() => {
     view?.items.length
     void thinking // also keep pinned to bottom when the thinking row appears
@@ -698,7 +762,11 @@
       // A fresh draft contains the first-chat guide, whose beginning is the useful part. The normal
       // transcript rule (open at the live end) would mount this taller-than-a-short-pane guide halfway
       // down and hide its explanation above the viewport.
-      scroller.scrollTop = isDraft && view?.items.length === 0 ? 0 : scroller.scrollHeight
+      if (isDraft && view?.items.length === 0) scroller.scrollTop = 0
+      else {
+        snapToLiveEdge()
+        scheduleLiveEdgeSnap()
+      }
     }
   })
 
@@ -758,6 +826,7 @@
     if (!scroller) return
     const m = { scrollTop: scroller.scrollTop, scrollHeight: scroller.scrollHeight, clientHeight: scroller.clientHeight }
     stick = distanceFromBottom(m) < 60 // unchanged 60px autoscroll gate
+    if (view && !composerOnly) returnToLiveEdge.set(view, stick)
     const away = shouldShowJumpToBottom(m)
     jumpAway = away
     // Anchor the "new" count to the last item the moment you scroll away; clear it once you're back down.
@@ -806,11 +875,16 @@
   const newBelow = $derived(mainItemsBelow(view?.items ?? [], anchorKey))
   function jumpToBottom(): void {
     if (!scroller) return
-    const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false
-    scroller.scrollTo({ top: scroller.scrollHeight, behavior: reduce ? 'auto' : 'smooth' })
+    // Smooth scrolling emits intermediate `scroll` events that correctly look "away from bottom" and
+    // therefore detach the live-edge latch. Worse, output can grow beyond the animation's cached target.
+    // A jump is an explicit request for the live edge, so make it exact now and once more post-render.
     stick = true
-    jumpAway = false
-    anchorKey = null
+    snapToLiveEdge(true)
+    void tick().then(() => {
+      if (!stick) return
+      snapToLiveEdge(true)
+      scheduleLiveEdgeSnap()
+    })
   }
 
   // --- Per-control action errors ----------------------------------------------------------------
@@ -826,26 +900,41 @@
     actionErr = { ...actionErr, [key]: out?.error ? `${label} failed: ${out.error}` : '' }
     return !out?.error
   }
-  // Switching the pane to another chat resets per-chat scroll/error UI: drop stale action errors, hide
-  // the jump affordance, and re-pin to the bottom so the incoming chat opens at its live end rather than
-  // inheriting the previous chat's scroll position.
+  // Switching the pane to another chat resets per-chat action state and restores that chat's own
+  // live-edge intent. The post-layout snap must re-check `stick`: a real wheel/scroll can arrive before
+  // this tick resolves, and that newer operator intent always wins over the mount-time restoration.
   $effect(() => {
     const currentSid = sid
+    const currentView = view
+    const restoreAttached = !composerOnly && currentView
+      ? (returnToLiveEdge.get(currentView) ?? true)
+      : true
     actionErr = {}
-    jumpAway = false
+    jumpAway = !restoreAttached
     anchorKey = null
     olderLoadRetryAt = 0
     olderLoadInFlight = false
-    stick = true
+    stick = restoreAttached
+    void tick().then(() => {
+      if (sid !== currentSid || !restoreAttached || !stick) return
+      snapToLiveEdge(true)
+      scheduleLiveEdgeSnap()
+    })
+    const rememberReturnState = () => {
+      if (!composerOnly && currentView) returnToLiveEdge.set(currentView, stick)
+    }
     // draft id → real id is the same composer. Keep text chips/files the operator staged while the
     // first-turn request was pending; ordinary chat navigation still resets those chat-local controls.
     if (preserveComposerResetFor === currentSid) {
       preserveComposerResetFor = ''
-      return
+      return rememberReturnState
     }
     pastes = [] // promoted pastes belong to the chat they were pasted into
     untrack(clearAttachments) // staged files belong to the chat they were attached to
-    return () => untrack(clearAttachments)
+    return () => {
+      rememberReturnState()
+      untrack(clearAttachments)
+    }
   })
 
   // Model / thinking-effort / tier picks WRITE THROUGH to the hub immediately for a real session, so the
@@ -1425,6 +1514,7 @@
     ontouchend={onTouchEnd}
     ontouchcancel={onTouchEnd}
   >
+    <div class="stream-content" bind:this={streamContent}>
     {#if !composerOnly && (view.journalHistoryOlderCursor != null || view.historyOlderCursor != null)}
       <button
         class="history-page"
@@ -1490,6 +1580,7 @@
         <span class="tmeta">{elapsedLabel}{#if liveTok?.total}{elapsedLabel ? ' · ' : ''}{fmtTokens(liveTok.total)} tokens{/if}</span>
       </div>
     {/if}
+    </div>
   </div>
   {/if}
 
@@ -1833,7 +1924,8 @@
   .hbtn { font-size: 0.76rem; color: var(--muted); border: 1px solid var(--border); border-radius: 7px; padding: 0.22rem 0.5rem; }
   .hbtn:hover:not(:disabled) { border-color: var(--border-strong); color: var(--text); }
   .hbtn:disabled { opacity: 0.4; cursor: default; }
-  .stream { flex: 1; display: flex; flex-direction: column; gap: 0.55rem; padding: 1rem 1.1rem; max-width: 960px; width: 100%; margin: 0 auto; container-type: inline-size; }
+  .stream { flex: 1; padding: 1rem 1.1rem; max-width: 960px; width: 100%; margin: 0 auto; container-type: inline-size; }
+  .stream-content { display: flex; flex-direction: column; gap: 0.55rem; min-width: 0; }
   .history-page { align-self: center; max-width: 18rem; }
   .history-error { align-self: center; max-width: 34rem; color: var(--danger); font-size: 0.78rem; text-align: center; display: flex; align-items: center; gap: 0.55rem; }
   .stream.replay-rebuild { visibility: hidden; }
@@ -1845,7 +1937,7 @@
     contain-intrinsic-size: auto 96px;
   }
   @media (prefers-reduced-motion: no-preference) {
-    .stream > :global(*:not(.stream-node)), .stream > .stream-node.animate-in { animation: fade-in 0.22s var(--ease); }
+    .stream-content > :global(*:not(.stream-node)), .stream-content > .stream-node.animate-in { animation: fade-in 0.22s var(--ease); }
   }
   .pad { padding: 1rem 0; }
   .thinking { display: flex; align-items: center; gap: 0.5rem; padding: 0.2rem 0.15rem; }
