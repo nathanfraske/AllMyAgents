@@ -130,6 +130,7 @@ export type RelayMethod =
   | 'manager.startRun'
   | 'manager.inspectRuns'
   | 'manager.controlRun'
+  | 'manager.manageCiMonitor'
   | 'manager.queryTeam'
   | 'memory.write'
   | 'memory.search'

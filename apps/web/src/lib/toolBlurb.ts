@@ -93,6 +93,14 @@ function firstString(obj: Record<string, unknown> | undefined, keys: string[]): 
   return undefined
 }
 
+function firstNumber(obj: Record<string, unknown> | undefined, keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = obj?.[key]
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+  }
+  return undefined
+}
+
 /**
  * Derive a subject line for a tool call. Returns `undefined` for anything it does not recognise — the
  * caller then shows the plain tool name, so an unknown/new vendor tool degrades gracefully rather than
@@ -180,7 +188,7 @@ const AGENT_TOOL_PREFIXES = ['mcp__allmyagents__', 'mcp:']
 export const ALLMYAGENTS_TOOL_NAMES = [
   'list_agents', 'send_message', 'read_messages', 'peek_agent', 'child_status', 'manage_team',
   'manage_child', 'spawn_agent', 'set_child_authority', 'decide_child_approval', 'assign_child_task',
-  'start_run', 'inspect_runs', 'control_run', 'query_team', 'memory_write', 'memory_search',
+  'start_run', 'inspect_runs', 'control_run', 'monitor_ci', 'query_team', 'memory_write', 'memory_search',
   'memory_read', 'practice_write', 'practice_edit', 'practice_read', 'practice_list', 'browser_navigate',
   'browser_read_page', 'browser_click', 'browser_tabs', 'browser_open_tab', 'browser_switch_tab',
   'browser_close_tab', 'browser_download', 'browser_download_read', 'browser_screenshot', 'browser_status',
@@ -401,6 +409,16 @@ export function agentActivity(
     }
     case 'control_run':
       return { label: `cancelled run ${shortId(firstString(obj, ['run_id']))}`, dir: 'none' }
+    case 'monitor_ci': {
+      const operation = firstString(obj, ['operation']) ?? 'list'
+      const pr = firstNumber(obj, ['pull_request'])
+      const run = firstNumber(obj, ['workflow_run_id'])
+      if (operation === 'cancel') return { label: 'cancelled a CI watch', dir: 'none' }
+      if (operation === 'watch') {
+        return { label: pr ? `watched CI for PR #${pr}` : run ? `watched workflow run ${run}` : 'watched GitHub CI', dir: 'none' }
+      }
+      return { label: 'checked CI watches', dir: 'none' }
+    }
     case 'query_team': {
       const entities = Array.isArray(obj?.entities)
         ? obj.entities.filter((value): value is string => typeof value === 'string')

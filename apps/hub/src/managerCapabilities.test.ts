@@ -21,6 +21,7 @@ describe('manager semantic capabilities', () => {
 
   it('maps browser and durable-run MCP names while preserving unknown exact tools', () => {
     expect(managerCapabilityForTool('mcp__allmyagents__start_run')).toBe('runs')
+    expect(managerCapabilityForTool('mcp__allmyagents__monitor_ci')).toBe('runs')
     expect(managerCapabilityForTool('browser_navigate')).toBe('browser')
     expect(normalizeManagerToolGrants(['mcp__github__create_issue'])).toEqual(['mcp__github__create_issue'])
     expect(managerToolGrantCovers(['mcp__github__create_issue'], 'mcp__github__create_issue')).toBe(true)

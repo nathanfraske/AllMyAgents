@@ -57,7 +57,7 @@ export function managerCapabilityForTool(value: string): ManagerCapability | und
   const direct = TOOL_CAPABILITIES.get(name)
   if (direct) return direct
   if (/^browser(?:_|$)/i.test(name)) return 'browser'
-  if (/^(?:start_run|inspect_runs|control_run)$/.test(name)) return 'runs'
+  if (/^(?:start_run|inspect_runs|control_run|monitor_ci)$/.test(name)) return 'runs'
   return undefined
 }
 

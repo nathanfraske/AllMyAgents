@@ -13,7 +13,14 @@ function errText(err: unknown): string {
 /** The relay `rpc` methods that MUTATE durable state — a re-flushed one (same stable callId) must return the
  *  first result instead of writing a second row (§8.2). Reads are naturally idempotent, so they are not
  *  cached (a re-flushed read just re-runs and returns fresh data). Exactly the doc's list. */
-const WRITE_RELAY_METHODS = new Set<RelayMethod>(['memory.write', 'practices.write', 'bus.send'])
+const WRITE_RELAY_METHODS = new Set<RelayMethod>([
+  'memory.write',
+  'practices.write',
+  'bus.send',
+  // watch and cancel mutate the durable monitor table. Caching list for the short reconnect window is
+  // harmless and keeps one multiplexed method from duplicating a watch when its first reply is lost.
+  'manager.manageCiMonitor',
+])
 /** How long a served write's result stays cached for a possible re-flush. Comfortably above the transient
  *  bound (HUB_RELAY_TIMEOUT_MS = 45s, past which a relay is terminal and never re-flushed) so every legitimate
  *  re-flush hits, while keeping the cache short-lived (§8.2). */

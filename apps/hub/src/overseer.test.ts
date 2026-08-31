@@ -94,6 +94,42 @@ function harness() {
 }
 
 describe('application Overseer authority', () => {
+  it('wakes an idle manager exactly once for one terminal GitHub CI result', async () => {
+    const h = harness()
+    h.seed({ id: 'manager', isProjectManager: true, projectId: 'project-1', title: 'Build manager' })
+    const notification = {
+      outcome: 'failure' as const,
+      monitor: {
+        id: 'monitor-1',
+        sessionId: 'manager',
+        projectId: 'project-1',
+        repository: 'acme/widget',
+        target: { kind: 'pull-request' as const, number: 42 },
+        wakeOn: ['failure' as const, 'success' as const],
+        state: 'failed' as const,
+        headSha: 'a'.repeat(40),
+        summary: 'Failed checks: js gates',
+        url: 'https://github.com/acme/widget/pull/42',
+        createdAt: '2026-08-30T00:00:00.000Z',
+        updatedAt: '2026-08-30T00:01:00.000Z',
+        nextPollAt: '2026-08-30T00:01:00.000Z',
+        consecutiveErrors: 0,
+        successObservations: 0,
+        notificationPending: true,
+      },
+    }
+    expect(h.sessions.notifyGitHubCi(notification)).toBe(true)
+    expect(h.sessions.notifyGitHubCi(notification)).toBe(true)
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(h.executor.runTurn).toHaveBeenCalledTimes(1)
+    expect(h.executor.runTurn).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: 'manager' }),
+      expect.stringContaining('GitHub CI failure'),
+      'bus',
+    )
+    expect(h.bus.inbox('manager').filter((message) => message.subject === 'GitHub CI failure')).toHaveLength(1)
+  })
+
   it('upgrades an existing durable Overseer in place exactly once after readiness', async () => {
     const h = harness()
     h.store.upsert({
@@ -123,13 +159,13 @@ describe('application Overseer authority', () => {
 
     expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
       isOverseer: true,
-      overseerCapabilityVersion: 23,
+      overseerCapabilityVersion: 24,
       permissionMode: 'full',
       permissionModeOperatorOverride: true,
       role: 'Application Overseer',
     })
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
-      'Overseer capability manifest version 23',
+      'Overseer capability manifest version 24',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'mcp__allmyagents__overseer_control',
@@ -169,7 +205,7 @@ describe('application Overseer authority', () => {
     expect(upgrades()).toHaveLength(1)
     expect(upgrades()[0]?.payload).toMatchObject({
       fromVersion: 6,
-      toVersion: 23,
+      toVersion: 24,
       conversationPreserved: true,
       tools: expect.arrayContaining([
         'overseer_control',
@@ -177,6 +213,7 @@ describe('application Overseer authority', () => {
         'browser_navigate',
         'start_run',
         'inspect_runs',
+        'monitor_ci',
         'query_team',
       ]),
     })

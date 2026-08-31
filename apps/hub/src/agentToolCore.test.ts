@@ -89,6 +89,7 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
       'start_run',
       'inspect_runs',
       'control_run',
+      'monitor_ci',
       'query_team',
       'memory_write',
       'memory_search',

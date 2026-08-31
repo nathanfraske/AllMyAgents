@@ -16,6 +16,7 @@ import { MemoryStore } from './memory.js'
 import { PracticeStore } from './practices.js'
 import type { DangerFlags, ManagerAgentType, SessionRecord } from './types.js'
 import { QuestionService } from './questions.js'
+import { GitHubCiMonitor } from './githubCiMonitor.js'
 
 /**
  * SECURITY REGRESSION — the hub-side auto-approve policy must not become a blanket "full ⇒ yes".
@@ -406,6 +407,34 @@ describe('operator-owned GitHub automation policy', () => {
     })
     return { ...harness, project, record }
   }
+
+  it('confines durable CI watches to the exact workflow grant and project origin', () => {
+    const { sessions, project, record, journal } = createGitHubProject()
+    const monitor = new GitHubCiMonitor(journal.db, journal, async () => ({
+      state: 'pending', summary: 'still running', observation: 'pending',
+    }))
+    sessions.setGitHubCiMonitor(monitor)
+
+    expect(sessions.manageGitHubCiMonitor(record.id, {
+      operation: 'watch', repository: 'acme/widget', pullRequest: 42,
+    })).toMatchObject({ ok: false, error: expect.stringMatching(/workflow_runs/u) })
+
+    sessions.configureGitHubAutomationPolicy('project', project.id, ['workflow_runs'], 'operator')
+    expect(sessions.manageGitHubCiMonitor(record.id, {
+      operation: 'watch', repository: 'acme/other', pullRequest: 42,
+    })).toMatchObject({ ok: false, error: expect.stringMatching(/safe GitHub origin/u) })
+
+    const watched = sessions.manageGitHubCiMonitor(record.id, {
+      operation: 'watch', repository: 'ACME/WIDGET', pullRequest: 42, wakeOn: ['failure', 'success'],
+    })
+    expect(watched).toMatchObject({
+      ok: true,
+      monitor: { sessionId: record.id, projectId: project.id, repository: 'acme/widget' },
+    })
+    expect(sessions.manageGitHubCiMonitor(record.id, { operation: 'list' })).toMatchObject({
+      ok: true, monitors: [expect.objectContaining({ id: watched.monitor?.id })],
+    })
+  })
 
   it('lets an exact manager session perform granted PR work on a manager-driven turn', () => {
     const { sessions, seed, journal } = makeSessions()

@@ -92,6 +92,10 @@ schemas, repositories, connectors, and operation names fail closed and continue 
 decision journals the operation, repository, granting scope, and a bounded parameter summary; free-form bodies
 are represented by character count and SHA-256 rather than duplicated into the journal.
 
+The same exact `workflow_runs` grant authorizes the hub-owned [`monitor_ci`](github-ci-monitor.md) watch.
+Unlike `gh run watch`, it does not occupy a model turn or shell: it persists across hub restarts and wakes the
+watching chat once on the requested terminal failure and/or success through the permission-clamped bus.
+
 An Overseer `approve` response remains one-shot unless the operator explicitly supplies `persist=session` or
 `persist=always` on a direct operator turn. Persistence is accepted only when that exact Codex elicitation
 advertised the requested option and is returned using the vendor protocol's response metadata. Standing

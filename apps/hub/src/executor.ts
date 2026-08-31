@@ -127,6 +127,9 @@ export const AUTO_ALLOW_TOOLS = new Set([
   'mcp__allmyagents__set_child_authority',
   'mcp__allmyagents__decide_child_approval',
   'mcp__allmyagents__assign_child_task',
+  // The handler independently requires the exact workflow_runs policy and project repository match.
+  // Auto-allowing the transport avoids a redundant generic prompt without granting a GitHub action.
+  'mcp__allmyagents__monitor_ci',
   'mcp__allmyagents__memory_write',
   'mcp__allmyagents__memory_search',
   'mcp__allmyagents__memory_read',
@@ -276,6 +279,10 @@ export interface InProcessExecutorHubHooks {
     runId: string,
     operation: 'cancel',
   ): ReturnType<NonNullable<AgentServices['controlRun']>>
+  managerManageCiMonitor(
+    callerSessionId: string,
+    input: Parameters<NonNullable<AgentServices['manageCiMonitor']>>[1],
+  ): ReturnType<NonNullable<AgentServices['manageCiMonitor']>>
   managerQueryTeam(
     callerSessionId: string,
     input: Parameters<NonNullable<AgentServices['queryTeam']>>[1],
@@ -372,6 +379,7 @@ export class InProcessExecutor implements Executor {
       startRun: (callerSessionId, input) => this.h.managerStartRun(callerSessionId, input),
       inspectRuns: (callerSessionId, input) => this.h.managerInspectRuns(callerSessionId, input),
       controlRun: (callerSessionId, runId, operation) => this.h.managerControlRun(callerSessionId, runId, operation),
+      manageCiMonitor: (callerSessionId, input) => this.h.managerManageCiMonitor(callerSessionId, input),
       queryTeam: (callerSessionId, input) => this.h.managerQueryTeam(callerSessionId, input),
       browser: (sessionId, operation, args) => this.h.browser(sessionId, operation, args),
       remoteDevices: (sessionId) => this.h.remoteDevices(sessionId),
