@@ -52,6 +52,13 @@ vi.mock('./api', () => {
         checkpointGeneration: 1,
       })),
       fleet: vi.fn(async () => []),
+      configureOverseer: vi.fn(async () => ({
+        configured: true,
+        profileId: 'p1',
+        sessionId: 'overseer',
+        session: rec('overseer', { isOverseer: true }),
+        available: true,
+      })),
       authFrom: vi.fn(async () => ({ requireToken: true, authed: true })),
       replayBaselineFrom: vi.fn(async () => null),
       saveFleetConnection: vi.fn(async () => ({
@@ -85,6 +92,47 @@ describe('owner preferences', () => {
 
     expect(store.prefs.steerMessagesAtToolBoundary).toBe(false)
     expect(api.setPrefs).toHaveBeenCalledWith({ steerMessagesAtToolBoundary: false })
+  })
+})
+
+describe('Overseer account handoff', () => {
+  it('uses the singleton Overseer configuration path instead of creating an Unfiled chat', async () => {
+    const cold = new HubStore()
+    cold.sessions.overseer = {
+      record: rec('overseer', {
+        profileId: 'p1',
+        provider: 'claude',
+        isOverseer: true,
+      }),
+      items: [{ key: 'old', kind: 'assistant', ts: '2026-01-01T00:00:00.000Z', text: 'existing control chat' }],
+      lastActivity: '2026-01-01T00:00:00.000Z',
+      sawReasoning: false,
+    }
+    cold.selectedId = 'overseer'
+    vi.mocked(api.configureOverseer).mockResolvedValueOnce({
+      configured: true,
+      profileId: 'p2',
+      sessionId: 'overseer-successor',
+      session: rec('overseer-successor', {
+        profileId: 'p2',
+        provider: 'codex',
+        isOverseer: true,
+        title: 'Overseer',
+      }),
+      available: true,
+    })
+
+    await cold.useAccount('p2')
+
+    expect(api.configureOverseer).toHaveBeenCalledWith('p2')
+    expect(api.spawn).not.toHaveBeenCalled()
+    expect(api.stop).not.toHaveBeenCalled()
+    expect(cold.selectedId).toBe('overseer-successor')
+    expect(cold.sessions['overseer-successor']?.record).toMatchObject({
+      profileId: 'p2',
+      isOverseer: true,
+    })
+    expect(cold.sessions['overseer-successor']?.record.projectId).toBeUndefined()
   })
 })
 
@@ -1678,8 +1726,8 @@ describe('bounded cold baseline and global maintenance status', () => {
         evt({ seq: 10, kind: 'approval/requested', sessionId: 's1', payload: { id: 'old' } }),
         evt({ seq: 11, kind: 'session/input', sessionId: 's1', payload: { text: 'old prompt' } }),
       ],
-      olderCursor: 10,
-      hasOlder: true,
+      olderCursor: null,
+      hasOlder: false,
       encodedBytes: 200,
       checkpointGeneration: 3,
     })
@@ -1687,11 +1735,111 @@ describe('bounded cold baseline and global maintenance status', () => {
     await cold.ensureHistory('s1')
 
     expect(cold.sessions.s1?.items.map((item) => item.text)).toEqual(['old prompt'])
-    expect(cold.sessions.s1?.journalHistoryOlderCursor).toBe(10)
+    expect(cold.sessions.s1?.journalHistoryOlderCursor).toBeNull()
     expect(cold.sessions.s1?.lastActivity).toBe('2026-01-01T00:00:05.000Z')
     expect(cold.sessions.s1?.record.lastActivity).toBe('2026-01-01T00:00:05.000Z')
     expect(api.approvals).not.toHaveBeenCalled()
     expect(api.journalHistory).toHaveBeenCalledWith('s1', 3, 51, expect.anything())
+  })
+
+  it('prefetches one earlier bounded page when a busy latest page contains only a few conversation messages', async () => {
+    const cold = new HubStore()
+    const install = cold as unknown as {
+      installReplayBaseline(baseline: Awaited<ReturnType<typeof api.replayBaseline>>): void
+    }
+    install.installReplayBaseline({
+      version: 1,
+      generation: 6,
+      highWaterSeq: 1_000,
+      resetFloorSeq: 0,
+      sessions: [rec('s1')],
+      projects: [],
+      journalCompaction: null,
+    })
+    vi.mocked(api.journalHistory)
+      .mockResolvedValueOnce({
+        events: [
+          evt({ seq: 990, kind: 'session/input', sessionId: 's1', payload: { text: 'latest prompt' } }),
+          evt({
+            seq: 991,
+            kind: 'codex/item/completed',
+            sessionId: 's1',
+            payload: { item: { id: 'latest', type: 'agentMessage', text: 'latest reply' } },
+          }),
+        ],
+        olderCursor: 990,
+        hasOlder: true,
+        encodedBytes: 200,
+        checkpointGeneration: 6,
+      })
+      .mockResolvedValueOnce({
+        events: [
+          evt({ seq: 900, kind: 'session/input', sessionId: 's1', payload: { text: 'earlier prompt' } }),
+          evt({
+            seq: 901,
+            kind: 'codex/item/completed',
+            sessionId: 's1',
+            payload: { item: { id: 'earlier', type: 'agentMessage', text: 'earlier reply' } },
+          }),
+        ],
+        olderCursor: 900,
+        hasOlder: true,
+        encodedBytes: 200,
+        checkpointGeneration: 6,
+      })
+
+    await cold.ensureHistory('s1')
+
+    expect(api.journalHistory).toHaveBeenNthCalledWith(1, 's1', 6, 1_001, expect.anything())
+    expect(api.journalHistory).toHaveBeenNthCalledWith(2, 's1', 6, 990, expect.anything())
+    expect(cold.sessions.s1?.items.map((item) => item.text)).toEqual([
+      'earlier prompt', 'earlier reply', 'latest prompt', 'latest reply',
+    ])
+    expect(cold.sessions.s1?.journalHistoryOlderCursor).toBe(900)
+  })
+
+  it('retries the failed older page instead of no-oping after the latest page already loaded', async () => {
+    const cold = new HubStore()
+    const install = cold as unknown as {
+      installReplayBaseline(baseline: Awaited<ReturnType<typeof api.replayBaseline>>): void
+    }
+    install.installReplayBaseline({
+      version: 1,
+      generation: 6,
+      highWaterSeq: 1_000,
+      resetFloorSeq: 0,
+      sessions: [rec('s1')],
+      projects: [],
+      journalCompaction: null,
+    })
+    vi.mocked(api.journalHistory)
+      .mockResolvedValueOnce({
+        events: [evt({ seq: 990, kind: 'session/input', sessionId: 's1', payload: { text: 'latest prompt' } })],
+        olderCursor: 990,
+        hasOlder: true,
+        encodedBytes: 100,
+        checkpointGeneration: 6,
+      })
+      .mockRejectedValueOnce(new Error('temporary older-page outage'))
+      .mockResolvedValueOnce({
+        events: [evt({ seq: 900, kind: 'session/input', sessionId: 's1', payload: { text: 'recovered earlier prompt' } })],
+        olderCursor: null,
+        hasOlder: false,
+        encodedBytes: 100,
+        checkpointGeneration: 6,
+      })
+
+    await cold.ensureHistory('s1')
+    expect(cold.sessions.s1?.historyLoadError).toContain('temporary older-page outage')
+    expect(cold.sessions.s1?.items.map((item) => item.text)).toEqual(['latest prompt'])
+
+    await cold.retryHistory('s1')
+
+    expect(api.journalHistory).toHaveBeenCalledTimes(3)
+    expect(cold.sessions.s1?.historyLoadError).toBeUndefined()
+    expect(cold.sessions.s1?.items.map((item) => item.text)).toEqual([
+      'recovered earlier prompt', 'latest prompt',
+    ])
   })
 
   it('rehydrates every open native pane after a required baseline reset', async () => {
@@ -1899,14 +2047,20 @@ describe('bounded cold baseline and global maintenance status', () => {
       journalCompaction: null,
     })
     vi.mocked(api.journalHistory).mockResolvedValueOnce({
-      events: [
+      events: Array.from({ length: 6 }, (_, index) =>
         evt({
-          seq: 9_100,
+          seq: 9_100 + index,
           kind: 'codex/item/completed',
           sessionId: 's1',
-          payload: { item: { id: 'latest', type: 'agentMessage', text: 'latest retained' } },
+          payload: {
+            item: {
+              id: `latest-${index}`,
+              type: 'agentMessage',
+              text: index === 0 ? 'latest retained' : `latest filler ${index}`,
+            },
+          },
         }),
-      ],
+      ),
       olderCursor: 9_100,
       hasOlder: true,
       encodedBytes: 200,

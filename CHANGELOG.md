@@ -5,6 +5,29 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.37-alpha.41 — 2026-08-30
+
+This release adds durable GitHub CI completion monitoring, repairs cold-history and journal-maintenance recovery,
+and makes live transcript following reliable across streaming output and chat switches.
+
+[Full v0.1.37-alpha.41 release notes](docs/releases/v0.1.37-alpha.41.md)
+
+- Managers and the Overseer can monitor an exact pull request or workflow run and receive one durable wake when
+  GitHub CI succeeds or fails. Watches survive restarts, coalesce duplicate polling, and require the existing
+  operator-granted `workflow_runs` capability for the exact repository scope.
+- Pull-request success waits for the same complete check/status set and head SHA on two polls, while failures wake
+  immediately. Poll outages back off and remain distinct from CI failures.
+- Live-edge following now stays attached while the operator is at the bottom, including streamed growth, explicit
+  jump-to-latest, and returning to a chat; deliberate scrollback remains detached.
+- Cold active chats load a second bounded page when lifecycle/tool traffic leaves the first page with too few
+  conversational messages. History generation changes retry safely and failures retain a real Retry path.
+- Journal cleanup can reclaim the recovery-covered eligible prefix even when newer rows are awaiting a later
+  snapshot, and intentional maintenance waits are reported as deferred rather than unavailable.
+- Changing the local application Overseer's account now uses the singleton successor path instead of creating an
+  ordinary Unfiled conversation.
+- The MyOwnMesh-native testbed contract records the fail-closed upstream enrollment seam and no-reboot
+  qualification sequence; it is design documentation, not a claim of live K3 deployment support in this release.
+
 ## v0.1.36-alpha.40 — 2026-08-27
 
 This release restores reliable manager-to-worker control when a Codex team shares one account and checkout, keeps

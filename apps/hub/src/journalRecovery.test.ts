@@ -20,6 +20,7 @@ import {
   inspectKnownGoodJournal,
   listRecoveryGenerations,
   listRecoveryNotices,
+  newestStrongRecoverySnapshotClaim,
   publishRecoveryGeneration,
   recoveryPaths,
   validateRecoveryReceiptsBeforeWritableOpen,
@@ -282,6 +283,18 @@ describe('owned journal corruption recovery', () => {
     journal.append('s1', 'session/input', { text: 'covered-one' })
     journal.append('s1', 'session/input', { text: 'covered-two' })
     await strongSnapshot(dataDir, journal, new Date('2026-07-29T00:00:00.000Z'))
+
+    const claim = newestStrongRecoverySnapshotClaim({
+      dataDir,
+      journalPath: path.join(dataDir, 'hub.db'),
+    })
+    expect(claim).toMatchObject({
+      generation: '1',
+      snapshotMaxSeq: '2',
+      snapshotEventHighWater: '2',
+    })
+    expect(claim.rootId).toMatch(/^[0-9a-f-]{36}$/i)
+    expect(claim.journalId).toMatch(/^[0-9a-f-]{36}$/i)
 
     const coverage = verifyStrongRecoverySnapshotCoverage({
       dataDir,

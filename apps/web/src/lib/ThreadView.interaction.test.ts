@@ -81,6 +81,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
   cleanup()
 })
 
@@ -88,7 +89,7 @@ describe('transcript interaction boundaries', () => {
   it('offers an explicit retry when latest history could not be loaded', async () => {
     const view = seed()
     view.historyLoadError = 'Latest journal history is temporarily unavailable.'
-    const retry = vi.spyOn(store, 'ensureHistory').mockResolvedValue()
+    const retry = vi.spyOn(store, 'retryHistory').mockResolvedValue()
     const rendered = render(ThreadView, { props: { sessionId: 'interaction-session' } })
     retry.mockClear()
 
@@ -228,6 +229,184 @@ describe('transcript interaction boundaries', () => {
     )
 
     expect(scrollTop).toBe(2_000)
+  })
+
+  it('keeps following when streaming grows an existing row without changing the item count', async () => {
+    let resize: ResizeObserverCallback | undefined
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) { resize = callback }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver)
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      callback(0)
+      return 1
+    })
+    vi.stubGlobal('cancelAnimationFrame', () => {})
+
+    const view = seed()
+    view.items = [{
+      key: 'streaming-assistant-row',
+      kind: 'assistant',
+      ts: '2026-07-31T00:00:03.000Z',
+      text: 'A short partial response.',
+    }]
+    const { container } = render(ThreadView, { props: { sessionId: 'interaction-session' } })
+    const transcript = container.querySelector('.stream.scroll') as HTMLDivElement
+    let scrollTop = 1_500
+    let scrollHeight = 2_000
+    Object.defineProperties(transcript, {
+      scrollTop: {
+        get: () => scrollTop,
+        set: (value: number) => { scrollTop = value },
+        configurable: true,
+      },
+      scrollHeight: { get: () => scrollHeight, configurable: true },
+      clientHeight: { value: 500, configurable: true },
+    })
+
+    await waitFor(() => expect(resize).toBeTypeOf('function'))
+    scrollHeight = 2_600
+    view.items[0]!.text = 'A much longer partial response that wrapped onto enough lines to grow the existing row.'
+    resize!([], {} as ResizeObserver)
+
+    expect(scrollTop).toBe(2_600)
+  })
+
+  it('jumps to the exact live edge instead of detaching during a smooth animation', async () => {
+    const view = seed()
+    view.items = [{
+      key: 'latest-row',
+      kind: 'assistant',
+      ts: '2026-07-31T00:00:03.000Z',
+      text: 'Latest visible response.',
+    }]
+    const { container, getByRole } = render(ThreadView, { props: { sessionId: 'interaction-session' } })
+    const transcript = container.querySelector('.stream.scroll') as HTMLDivElement
+    let scrollTop = 200
+    Object.defineProperties(transcript, {
+      scrollTop: {
+        get: () => scrollTop,
+        set: (value: number) => { scrollTop = value },
+        configurable: true,
+      },
+      scrollHeight: { value: 2_000, configurable: true },
+      clientHeight: { value: 500, configurable: true },
+    })
+
+    await fireEvent.scroll(transcript)
+    await fireEvent.click(getByRole('button', { name: 'Jump to latest' }))
+
+    expect(scrollTop).toBe(2_000)
+  })
+
+  it('catches up when an attached chat is tabbed out and mounted again', async () => {
+    let resize: ResizeObserverCallback | undefined
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) { resize = callback }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver)
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      callback(0)
+      return 1
+    })
+    vi.stubGlobal('cancelAnimationFrame', () => {})
+
+    const view = seed()
+    view.items = [{
+      key: 'before-tab-away',
+      kind: 'assistant',
+      ts: '2026-07-31T00:00:03.000Z',
+      text: 'Visible before changing tabs.',
+    }]
+    const first = render(ThreadView, { props: { sessionId: 'interaction-session' } })
+    const firstTranscript = first.container.querySelector('.stream.scroll') as HTMLDivElement
+    Object.defineProperties(firstTranscript, {
+      scrollTop: { value: 1_500, writable: true, configurable: true },
+      scrollHeight: { value: 2_000, configurable: true },
+      clientHeight: { value: 500, configurable: true },
+    })
+    await fireEvent.scroll(firstTranscript)
+    first.unmount()
+
+    view.items = [...view.items, {
+      key: 'while-tabbed-away',
+      kind: 'assistant',
+      ts: '2026-07-31T00:00:04.000Z',
+      text: 'Arrived while another chat was open.',
+    }]
+    const second = render(ThreadView, { props: { sessionId: 'interaction-session' } })
+    const secondTranscript = second.container.querySelector('.stream.scroll') as HTMLDivElement
+    let returnedScrollTop = 0
+    Object.defineProperties(secondTranscript, {
+      scrollTop: {
+        get: () => returnedScrollTop,
+        set: (value: number) => { returnedScrollTop = value },
+        configurable: true,
+      },
+      scrollHeight: { value: 2_600, configurable: true },
+      clientHeight: { value: 500, configurable: true },
+    })
+    await waitFor(() => expect(resize).toBeTypeOf('function'))
+    resize!([], {} as ResizeObserver)
+
+    expect(returnedScrollTop).toBe(2_600)
+  })
+
+  it('does not yank a deliberately detached chat to the bottom after tabbing away', async () => {
+    let resize: ResizeObserverCallback | undefined
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) { resize = callback }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver)
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      callback(0)
+      return 1
+    })
+    vi.stubGlobal('cancelAnimationFrame', () => {})
+
+    const view = seed()
+    view.items = [{
+      key: 'read-history-row',
+      kind: 'assistant',
+      ts: '2026-07-31T00:00:03.000Z',
+      text: 'History the operator is reading.',
+    }]
+    const first = render(ThreadView, { props: { sessionId: 'interaction-session' } })
+    const firstTranscript = first.container.querySelector('.stream.scroll') as HTMLDivElement
+    Object.defineProperties(firstTranscript, {
+      scrollTop: { value: 200, writable: true, configurable: true },
+      scrollHeight: { value: 2_000, configurable: true },
+      clientHeight: { value: 500, configurable: true },
+    })
+    await fireEvent.scroll(firstTranscript)
+    first.unmount()
+
+    const second = render(ThreadView, { props: { sessionId: 'interaction-session' } })
+    const secondTranscript = second.container.querySelector('.stream.scroll') as HTMLDivElement
+    let returnedScrollTop = 200
+    Object.defineProperties(secondTranscript, {
+      scrollTop: {
+        get: () => returnedScrollTop,
+        set: (value: number) => { returnedScrollTop = value },
+        configurable: true,
+      },
+      scrollHeight: { value: 2_600, configurable: true },
+      clientHeight: { value: 500, configurable: true },
+    })
+    await waitFor(() => expect(resize).toBeTypeOf('function'))
+    resize!([], {} as ResizeObserver)
+
+    expect(returnedScrollTop).toBe(200)
+    expect(second.getByRole('button', { name: 'Jump to latest' })).toBeTruthy()
   })
 
   it('groups only the bounded live tail while older history has not been requested', () => {

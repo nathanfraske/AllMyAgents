@@ -22,6 +22,7 @@ import { ProjectStore } from './projects.js'
 import { TestbedRunStore } from './testbedRuns.js'
 import { TestbedReservationStore } from './testbedReservations.js'
 import { DurableRunController, DurableRunStore } from './durableRuns.js'
+import { GitHubCiMonitor } from './githubCiMonitor.js'
 import { profileAuthEvidence, scanProfiles, setClaudeConnectorPolicy } from './profiles.js'
 import { ProfileOwnership } from './profileOwnership.js'
 import { ProfileRuntime } from './profileRuntime.js'
@@ -640,6 +641,10 @@ sessions = new SessionManager(journal, store, profileMap, approvals, usage, work
 sessions.setTestbedRunStore(testbedRuns)
 sessions.setTestbedReservationStore(testbedReservations)
 sessions.setDurableRunController(durableRuns)
+const githubCiMonitor = new GitHubCiMonitor(journal.db, journal)
+githubCiMonitor.setNotifier((notification) => sessions.notifyGitHubCi(notification))
+sessions.setGitHubCiMonitor(githubCiMonitor)
+process.once('exit', () => githubCiMonitor.stop())
 const profileLoginCoordinator = new ProfileLoginCoordinator({
   profilesDir,
   registry: new ProfileLoginRegistry(path.join(dataDir, 'profile-logins.json')),
@@ -772,6 +777,15 @@ function runJournalMaintenance(): void {
     let terminalReported = false
     let lastProgressAt = Date.now()
     let progressWatchdogSuspended = false
+    const childRecordedTerminalLifecycle = (): boolean => {
+      try {
+        const status = journal.latestCompactionLifecycle()
+        return status?.operationId === operationId &&
+          ['completed', 'deferred', 'failed', 'unobservable'].includes(status.phase)
+      } catch {
+        return false
+      }
+    }
     const guard = setInterval(() => {
       if (progressWatchdogSuspended) return
       if (Date.now() - lastProgressAt < noProgressMs) return
@@ -860,6 +874,10 @@ function runJournalMaintenance(): void {
     child.once('exit', (code, signal) => {
       clearInterval(guard)
       if (journalMaintenanceChild === child) journalMaintenanceChild = undefined
+      // IPC delivery and process exit can race on Windows. The child commits its terminal lifecycle
+      // before sending the summary, so consult that durable truth before fabricating an observation-loss
+      // terminal. This removes the noisy "already terminal" loop without weakening crash detection.
+      if (!terminalReported && childRecordedTerminalLifecycle()) terminalReported = true
       if (!terminalReported) {
         terminalReported = true
         try {
@@ -1315,6 +1333,7 @@ server.once('listening', () => {
     worktreeCollisions.start()
     workspacePressure.start()
     journalPressure.start()
+    githubCiMonitor.start()
   }
 })
 
@@ -1339,10 +1358,14 @@ if (supervised && process.send) {
       worktreeCollisions.start()
       workspacePressure.start()
       journalPressure.start()
+      githubCiMonitor.start()
     },
     // The direct RPC method is process-local. Release it only once BLUE has actually surrendered the
     // public listener, so GREEN can register the stable method without two hub generations competing.
-    onDrained: () => directMesh.stop(),
+    onDrained: () => {
+      directMesh.stop()
+      githubCiMonitor.stop()
+    },
     stopJournalBackups: () => journalBackups.stop(),
     profileRuntime,
     // §8.4: drain() signals the worker to hold relays before blue's socket drops; abort() un-drains a
@@ -1372,7 +1395,10 @@ if (supervised && process.send) {
           .abort(msg.error, msg.profilePublicEpoch)
           .then(() => {
             // A drained BLUE that reclaims the public listener must reclaim its RPC method too.
-            if (!restartState.draining && mesh.status().enabled) void directMesh.start()
+            if (!restartState.draining) {
+              githubCiMonitor.start()
+              if (mesh.status().enabled) void directMesh.start()
+            }
           })
           .catch((error: unknown) => {
             const message = error instanceof Error ? error.message : String(error)
@@ -1446,6 +1472,7 @@ function shutdown(signal: string): void {
   worktreeCollisions.stop()
   workspacePressure.stop()
   journalPressure.stop()
+  githubCiMonitor.stop()
   const done = (): void => process.exit(0)
   // Cap the cleanup so a hung socket or child can't wedge shutdown.
   const guard = setTimeout(done, 2500)

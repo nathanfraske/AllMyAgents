@@ -218,6 +218,10 @@ export function buildWorkerAgentServices(deps: WorkerAgentServiceDeps): AgentSer
       deps.relayRpc('manager.controlRun', { callerSessionId, runId, operation }) as ReturnType<
         NonNullable<AgentServices['controlRun']>
       >,
+    manageCiMonitor: (callerSessionId, input) =>
+      deps.relayRpc('manager.manageCiMonitor', { callerSessionId, input }) as ReturnType<
+        NonNullable<AgentServices['manageCiMonitor']>
+      >,
     queryTeam: (callerSessionId, input) =>
       deps.relayRpc('manager.queryTeam', { callerSessionId, input }) as ReturnType<
         NonNullable<AgentServices['queryTeam']>

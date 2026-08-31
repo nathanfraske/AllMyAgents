@@ -351,6 +351,21 @@ describe('completed Codex journal condensation', () => {
       while (!journal.backfillTransientEventIndex(5).complete) {
         // catch up without changing the operation's immutable deletion frontier
       }
+      expect(journal.condensationCandidateFrontier({ nowMs: NOW, graceMs: HOUR })).toBe(laterCandidate)
+      expect(
+        journal.condensationCandidateFrontier({
+          nowMs: NOW,
+          graceMs: HOUR,
+          maxSeq: firstCandidate,
+        })
+      ).toBe(firstCandidate)
+      expect(
+        journal.condensationCandidateFrontier({
+          nowMs: NOW,
+          graceMs: HOUR,
+          maxSeq: firstCandidate - 1,
+        })
+      ).toBe(0)
       const result = (journal as CondensableJournal).condenseCompletedCodex({
         nowMs: NOW,
         graceMs: HOUR,

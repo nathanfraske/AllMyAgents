@@ -39,9 +39,12 @@
     if (profileId === view.record.profileId) return
     if (hasHistory) {
       const target = store.profiles.find((profile) => profile.id === profileId)
+      const isOverseer = view.record.isOverseer === true
       const ok = await confirmDialog(
-        `Move this chat to "${target ? profileLabel(target) : profileId}"?\n\nThe conversation context and working files are ported to a new chat on that account (auth can't be swapped mid-conversation, so the work is moved, not the login). The original chat is kept as a snapshot.`,
-        { confirmLabel: 'Move chat' }
+        isOverseer
+          ? `Move the application Overseer to "${target ? profileLabel(target) : profileId}"?\n\nA successor Overseer will take over on that account. The current vendor thread remains available as a snapshot, but no ordinary Unfiled chat is created.`
+          : `Move this chat to "${target ? profileLabel(target) : profileId}"?\n\nThe conversation context and working files are ported to a new chat on that account (auth can't be swapped mid-conversation, so the work is moved, not the login). The original chat is kept as a snapshot.`,
+        { confirmLabel: isOverseer ? 'Move Overseer' : 'Move chat' }
       )
       if (!ok) return
     }
@@ -55,7 +58,7 @@
 </script>
 
 <div class="wrap">
-  <button class="pill-btn" class:open class:locked={!!lockReason} onclick={() => (open = !open)} title={lockReason || `Account: ${buttonLabel} (swap opens a fresh chat once this one has history)`}>
+  <button class="pill-btn" class:open class:locked={!!lockReason} onclick={() => (open = !open)} title={lockReason || (view.record.isOverseer ? `Overseer account: ${buttonLabel}` : `Account: ${buttonLabel} (swap opens a fresh chat once this one has history)`)}>
     {#if current}<ProviderLogo provider={current.provider} size={12} />{/if}
     <span class="pill-label">{buttonLabel}</span>
     <span class="chev"><Icon name="chevron-down" size={12} /></span>
@@ -75,7 +78,13 @@
           </button>
         </div>
       {:else}
-        {#if hasHistory}<div class="note dim">switching ports this chat's context + files to that account</div>{/if}
+        {#if hasHistory}
+          <div class="note dim">
+            {view.record.isOverseer
+              ? 'switching creates the successor application Overseer on that account'
+              : "switching ports this chat's context + files to that account"}
+          </div>
+        {/if}
         {#each available as p (p.id)}
           <button class="row" class:sel={p.id === view.record.profileId} onclick={() => pick(p.id)}>
             <ProviderLogo provider={p.provider} size={13} />

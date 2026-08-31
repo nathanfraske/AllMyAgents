@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import Database from 'better-sqlite3'
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest'
 import { Journal } from './journal.js'
 
@@ -503,6 +504,44 @@ describe('bounded replay checkpoints and journal history', () => {
         'journal/compaction-progress',
         'journal/compaction-completed',
       ])
+    } finally {
+      journal.db.close()
+    }
+  })
+
+  it('widens the persisted maintenance lifecycle schema before recording an intentional deferral', () => {
+    const file = path.join(tmp, 'compaction-deferred-migration.db')
+    const initial = new Journal(file)
+    initial.db.close()
+    const legacy = new Database(file)
+    legacy.exec(`
+      DROP INDEX idx_journal_compaction_runs_updated;
+      DROP TABLE journal_compaction_runs;
+      CREATE TABLE journal_compaction_runs (
+        operation_id TEXT PRIMARY KEY,
+        phase TEXT NOT NULL CHECK (
+          phase IN ('started', 'progress', 'completed', 'failed', 'unobservable')
+        ),
+        started_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        rows_deleted INTEGER NOT NULL CHECK (rows_deleted >= 0),
+        payload_bytes_deleted INTEGER NOT NULL CHECK (payload_bytes_deleted >= 0),
+        detail TEXT NOT NULL CHECK (length(detail) <= 512)
+      );
+      CREATE INDEX idx_journal_compaction_runs_updated
+        ON journal_compaction_runs(updated_at DESC, operation_id DESC);
+    `)
+    legacy.close()
+
+    const journal = new Journal(file)
+    try {
+      const operationId = '22222222-2222-4222-8222-222222222222'
+      journal.recordCompactionLifecycle(operationId, 'started', { detail: 'started' })
+      const deferred = journal.recordCompactionLifecycle(operationId, 'deferred', {
+        detail: 'waiting for the next verified recovery snapshot',
+      })
+      expect(deferred.phase).toBe('deferred')
+      expect(journal.latestCompactionLifecycle()).toEqual(deferred)
     } finally {
       journal.db.close()
     }
