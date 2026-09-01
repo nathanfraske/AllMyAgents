@@ -39,6 +39,8 @@
   import Icon from './Icon.svelte'
   import AgentPanel from './AgentPanel.svelte'
   import BrowserPanel from './BrowserPanel.svelte'
+  import DiffPanel from './DiffPanel.svelte'
+  import RunsPanel from './RunsPanel.svelte'
   import TaskStrip from './TaskStrip.svelte'
   import QuestionCard from './QuestionCard.svelte'
   import { findModel, defaultModelFor } from './catalog'
@@ -1816,6 +1818,20 @@
              initialEnabled={view.record.browserEnabled === true}
              open={sidePanel === 'browser'}
              onopen={() => setSidePanel('browser')}
+             onclose={() => setSidePanel(null)}
+           />
+           {#if view.record.repo || view.record.worktree}
+             <DiffPanel
+               sessionId={view.record.id}
+               open={sidePanel === 'diff'}
+               onopen={() => setSidePanel('diff')}
+               onclose={() => setSidePanel(null)}
+             />
+           {/if}
+           <RunsPanel
+             sessionId={view.record.id}
+             open={sidePanel === 'runs'}
+             onopen={() => setSidePanel('runs')}
              onclose={() => setSidePanel(null)}
            />
          {/if}

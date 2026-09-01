@@ -62,6 +62,15 @@
       'M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0z',
       'M18 9a9 9 0 0 1-9 9',
     ],
+    'git-compare': [
+      'M18 3v12',
+      'm15 6 3-3 3 3',
+      'M6 21V9',
+      'm3 18-3 3-3-3',
+      'M6 9a3 3 0 0 1 3-3h6',
+      'M18 15a3 3 0 0 1-3 3H9',
+    ],
+    terminal: ['M4 17 10 11 4 5', 'M12 19h8'],
     // Machine/site badge for the unified fleet view (two stacked racks + status dots; path-only so it
     // works with this component's <path>-only renderer).
     server: [

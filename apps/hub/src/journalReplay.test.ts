@@ -19,6 +19,9 @@ function indexAll(journal: Journal): void {
   while (!journal.backfillSessionEventIndex(10).complete) {
     // Deliberately small batches exercise the resumable cursor.
   }
+  while (!journal.backfillSessionHistoryEventIndex(10).complete) {
+    // Transcript projection advances independently of the general per-session projection.
+  }
 }
 
 describe('bounded replay checkpoints and journal history', () => {
@@ -300,7 +303,7 @@ describe('bounded replay checkpoints and journal history', () => {
     }
   })
 
-  it('uses the bounded session projection instead of scanning the payload-heavy event tree', async () => {
+  it('uses the transcript-only projection instead of scanning streaming session deltas', async () => {
     const journal = new Journal(path.join(tmp, 'sparse.db'))
     try {
       for (let index = 0; index < 300; index += 1) {
@@ -313,7 +316,7 @@ describe('bounded replay checkpoints and journal history', () => {
         .prepare(
           `EXPLAIN QUERY PLAN
            SELECT event.seq
-           FROM journal_session_event_index AS session_event
+           FROM journal_session_history_event_index AS session_event
            JOIN events AS event ON event.seq = session_event.seq
            WHERE session_event.session = ? AND session_event.seq < ?
            ORDER BY session_event.seq DESC
@@ -322,6 +325,35 @@ describe('bounded replay checkpoints and journal history', () => {
         .all('needle', Number.MAX_SAFE_INTEGER, 80) as Array<{ detail: string }>
       expect(plan.map((row) => row.detail).join('\n')).toMatch(/PRIMARY KEY \(session=\? AND seq<\?\)/i)
       expect((await journal.sessionHistoryPage('needle')).events).toHaveLength(3)
+    } finally {
+      journal.db.close()
+    }
+  })
+
+  it('keeps irrelevant high-volume deltas out of the transcript projection', async () => {
+    const journal = new Journal(path.join(tmp, 'transcript-only.db'))
+    try {
+      journal.append('s', 'session/input', { text: 'before the noisy run' })
+      for (let index = 0; index < 1_000; index += 1) {
+        journal.append('s', 'codex/item/commandExecution/outputDelta', {
+          itemId: 'build',
+          delta: `line-${index}\n`,
+        })
+      }
+      journal.append('s', 'codex/item/completed', {
+        item: { id: 'build', type: 'commandExecution', aggregatedOutput: 'done' },
+      })
+      indexAll(journal)
+
+      const projected = journal.db
+        .prepare('SELECT COUNT(*) FROM journal_session_history_event_index WHERE session = ?')
+        .pluck()
+        .get('s')
+      expect(projected).toBe(2)
+      expect((await journal.sessionHistoryPage('s')).events.map((event) => event.kind)).toEqual([
+        'session/input',
+        'codex/item/completed',
+      ])
     } finally {
       journal.db.close()
     }

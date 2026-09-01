@@ -10,6 +10,7 @@ import { readHistoryPage, locateTranscript, type HistoryPage } from './transcrip
 import type { ApprovalService } from './approvals.js'
 import { QuestionService } from './questions.js'
 import { WSEQ_RESET_KIND, type Journal } from './journal.js'
+import { inspectWorkspaceDiff, type WorkspaceDiffResult } from './workspaceDiff.js'
 import { renderRestartContinuity } from './restartContinuity.js'
 import type { ProjectStore } from './projects.js'
 import type { SessionStore } from './store.js'
@@ -4952,6 +4953,12 @@ export class SessionManager {
 
   list(): SessionRecord[] {
     return [...this.sessions.values()]
+  }
+
+  async workspaceDiff(sessionId: string, base?: string): Promise<WorkspaceDiffResult> {
+    const record = this.sessions.get(sessionId)
+    if (!record) throw new Error('session is unavailable')
+    return inspectWorkspaceDiff(record, base)
   }
 
   revokeOverseer(sessionId: string): void {
@@ -10403,6 +10410,31 @@ export class SessionManager {
     return { error: 'caller is neither a project manager nor the application Overseer' }
   }
 
+  /** Read authority is deliberately wider than run-control authority. Every live project member may
+   * inspect the project's retained run state and logs for coordination, while start/cancel continue to
+   * use the manager/Overseer operational scope above. */
+  private runInspectionScope(callerSessionId: string):
+    | { caller: SessionRecord; visible: SessionRecord[] }
+    | { error: string } {
+    const caller = this.sessions.get(callerSessionId)
+    if (!caller) return { error: 'caller session is unavailable' }
+    if (caller.isOverseer === true) {
+      return {
+        caller,
+        visible: [...this.sessions.values()].filter((record) => !record.managerRetiredAt),
+      }
+    }
+    if (!caller.projectId) {
+      return { caller, visible: [caller] }
+    }
+    return {
+      caller,
+      visible: [...this.sessions.values()].filter(
+        (record) => record.projectId === caller.projectId && !record.managerRetiredAt,
+      ),
+    }
+  }
+
   private selectOperationalSessions(
     callerSessionId: string,
     requested?: string[],
@@ -10595,19 +10627,20 @@ export class SessionManager {
     },
   ): { ok: boolean; runs?: import('./durableRuns.js').DurableRun[]; logs?: import('./durableRuns.js').DurableRunLogPage; error?: string } {
     if (!this.durableRuns) return { ok: false, error: 'durable run service is unavailable' }
+    const scope = this.runInspectionScope(callerSessionId)
+    if ('error' in scope) return { ok: false, error: scope.error }
+    const byId = new Map(scope.visible.map((record) => [record.id, record]))
+    const requestedIds = input.sessionIds?.length ? [...new Set(input.sessionIds)] : undefined
+    const denied = requestedIds?.find((id) => !byId.has(id))
+    if (denied) return { ok: false, error: `session is outside your project run scope: ${denied}` }
+    const visibleIds = requestedIds ?? scope.visible.map((record) => record.id)
     if (input.runId) {
-      const scope = this.operationalQueryScope(callerSessionId)
-      if ('error' in scope) return { ok: false, error: scope.error }
-      const requested = input.sessionIds?.length
-        ? this.selectOperationalSessions(callerSessionId, input.sessionIds)
-        : undefined
-      if (requested?.error) return { ok: false, error: requested.error }
       const run = this.durableRuns.store.get(input.runId)
       if (
         !run ||
-        !scope.visible.some((record) => record.id === run.targetSessionId) ||
-        (requested?.sessions && !requested.sessions.some((record) => record.id === run.targetSessionId))
-      ) return { ok: false, error: 'run is outside your managed scope' }
+        !byId.has(run.targetSessionId) ||
+        !visibleIds.includes(run.targetSessionId)
+      ) return { ok: false, error: 'run is outside your project run scope' }
       const inspected = this.durableRuns.inspect({
         projectId: run.projectId,
         runId: run.id,
@@ -10617,12 +10650,10 @@ export class SessionManager {
       })
       return { ok: true, ...inspected }
     }
-    const selection = this.selectOperationalSessions(callerSessionId, input.sessionIds)
-    if (selection.error || !selection.sessions) return { ok: false, error: selection.error ?? 'managed scope unavailable' }
-    const visibleIds = selection.sessions.map((record) => record.id)
-    const projectIds = [...new Set(selection.sessions.flatMap((record) => record.projectId
+    const selected = visibleIds.map((id) => byId.get(id)!)
+    const projectIds = [...new Set(selected.flatMap((record) => record.projectId
       ? [record.projectId]
-      : selection.caller?.isOverseer === true
+      : scope.caller.isOverseer === true
         ? [APPLICATION_RUN_SCOPE_ID]
         : []))]
     const runs = projectIds.flatMap((projectId) => this.durableRuns!.store.list({

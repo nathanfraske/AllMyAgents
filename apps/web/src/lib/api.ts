@@ -1025,6 +1025,57 @@ export interface TestbedRunInfo {
   }
 }
 
+export type DurableRunState = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'outcome_unknown'
+export type DurableRunKind = 'build' | 'test' | 'lint' | 'benchmark' | 'deploy' | 'custom'
+
+export interface DurableRunInfo {
+  id: string
+  projectId: string
+  sessionId: string
+  actorSessionId: string
+  actorLabel: string
+  targetSessionId: string
+  executionTarget: { kind: 'local' } | { kind: 'remote'; siteId: string; rootId: string; command: string; cwd?: string }
+  kind: DurableRunKind
+  state: DurableRunState
+  commandSummary: string
+  createdAt: string
+  startedAt?: string
+  heartbeatAt?: string
+  completedAt?: string
+  exitCode?: number | null
+  signal?: string
+  error?: string
+  timeoutMs: number
+  stdoutBytes: number
+  stderrBytes: number
+  logsTruncated: boolean
+}
+
+export interface DurableRunLogPage {
+  stdout: string
+  stderr: string
+  nextStdoutCursor: number
+  nextStderrCursor: number
+  stdoutComplete: boolean
+  stderrComplete: boolean
+}
+
+export interface WorkspaceDiffInfo {
+  baseRef: string
+  baseCommit: string
+  headCommit: string
+  branch?: string
+  files: Array<{ status: string; path: string }>
+  untracked: string[]
+  patch: string
+  truncated: boolean
+  repositoryUrl?: string
+  headUrl?: string
+  baseUrl?: string
+  compareUrl?: string
+}
+
 export interface TestbedReservationInfo {
   id: string
   projectId: string
@@ -1721,6 +1772,29 @@ export const api = {
       )
     }
     return result.data as JournalHistoryPage
+  },
+  durableRuns: (id: string, options: { states?: DurableRunState[]; limit?: number } = {}) => {
+    const query = new URLSearchParams({ limit: String(options.limit ?? 50) })
+    for (const state of options.states ?? []) query.append('state', state)
+    return routedGet<{ ok: true; runs: DurableRunInfo[] }>(
+      id,
+      (raw) => `/api/sessions/${encodeURIComponent(raw)}/runs?${query.toString()}`,
+    )
+  },
+  durableRun: (id: string, runId: string, stdoutAfter = 0, stderrAfter = 0) => {
+    const query = new URLSearchParams({ stdoutAfter: String(stdoutAfter), stderrAfter: String(stderrAfter) })
+    return routedGet<{ ok: true; runs: DurableRunInfo[]; logs: DurableRunLogPage }>(
+      id,
+      (raw) => `/api/sessions/${encodeURIComponent(raw)}/runs/${encodeURIComponent(runId)}?${query.toString()}`,
+    )
+  },
+  workspaceDiff: (id: string, base?: string) => {
+    const query = new URLSearchParams()
+    if (base?.trim()) query.set('base', base.trim())
+    return routedGet<WorkspaceDiffInfo>(
+      id,
+      (raw) => `/api/sessions/${encodeURIComponent(raw)}/workspace-diff${query.size ? `?${query.toString()}` : ''}`,
+    )
   },
   approvals: () => jget<ApprovalRecord[]>('/api/approvals'),
   questions: () => jget<QuestionRecord[]>('/api/questions'),

@@ -122,6 +122,10 @@ const JOURNAL_HISTORY_EVENT_KINDS = [
   'codex/item/completed',
   'codex/subagent/item/completed',
 ] as const
+const JOURNAL_HISTORY_EVENT_KIND_SET = new Set<string>(JOURNAL_HISTORY_EVENT_KINDS)
+const JOURNAL_HISTORY_EVENT_KINDS_SQL = JOURNAL_HISTORY_EVENT_KINDS
+  .map((kind) => `'${kind.replaceAll("'", "''")}'`)
+  .join(', ')
 // These horizons describe a possible opt-in history policy, but both lossy batch limits stay ZERO until a
 // future explicit operator control enables it. The distinction is load-bearing: the one-hour condensation
 // above removes only SUPERSEDED rows (an intermediate diff, or a delta whose completed item durably contains
@@ -472,6 +476,17 @@ export class Journal extends EventEmitter {
         scanned_through INTEGER NOT NULL CHECK (scanned_through >= 0)
       );
       INSERT OR IGNORE INTO journal_session_index_state (singleton, scanned_through) VALUES (1, 0);
+      CREATE TABLE IF NOT EXISTS journal_session_history_event_index (
+        session TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        PRIMARY KEY (session, seq)
+      ) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS journal_session_history_index_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        scanned_through INTEGER NOT NULL CHECK (scanned_through >= 0)
+      );
+      INSERT OR IGNORE INTO journal_session_history_index_state (singleton, scanned_through)
+      VALUES (1, 0);
       CREATE TABLE IF NOT EXISTS journal_transient_event_index (
         seq INTEGER PRIMARY KEY,
         kind TEXT NOT NULL,
@@ -560,6 +575,41 @@ export class Journal extends EventEmitter {
       AFTER INSERT ON events
       BEGIN
         UPDATE journal_session_index_state
+        SET scanned_through = NEW.seq
+        WHERE singleton = 1
+          AND scanned_through >= COALESCE(
+            (SELECT MAX(seq) FROM events WHERE seq < NEW.seq),
+            0
+          );
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS events_session_history_index_insert
+      AFTER INSERT ON events
+      WHEN NEW.session IS NOT NULL
+        AND (
+          NEW.kind IN (${JOURNAL_HISTORY_EVENT_KINDS_SQL})
+          OR (
+            NEW.kind = 'codex/item/started'
+            AND json_valid(NEW.payload)
+            AND json_extract(NEW.payload, '$.item.type') = 'contextCompaction'
+          )
+        )
+      BEGIN
+        INSERT OR IGNORE INTO journal_session_history_event_index (session, seq)
+        VALUES (NEW.session, NEW.seq);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS events_session_history_index_delete
+      AFTER DELETE ON events
+      WHEN OLD.session IS NOT NULL
+      BEGIN
+        DELETE FROM journal_session_history_event_index WHERE session = OLD.session AND seq = OLD.seq;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS events_session_history_index_frontier
+      AFTER INSERT ON events
+      BEGIN
+        UPDATE journal_session_history_index_state
         SET scanned_through = NEW.seq
         WHERE singleton = 1
           AND scanned_through >= COALESCE(
@@ -1103,7 +1153,7 @@ export class Journal extends EventEmitter {
         throw new ReplayGenerationChangedError(options.expectedGeneration, checkpoint.generation)
       }
       const indexedThrough = this.db
-        .prepare('SELECT scanned_through FROM journal_session_index_state WHERE singleton = 1')
+        .prepare('SELECT scanned_through FROM journal_session_history_index_state WHERE singleton = 1')
         .pluck()
         .get()
       if (
@@ -1122,7 +1172,6 @@ export class Journal extends EventEmitter {
       if (!Number.isSafeInteger(beforeSeq) || beforeSeq < 1) {
         throw new Error('beforeSeq is outside the supported history-page bound')
       }
-      const historyKindPlaceholders = JOURNAL_HISTORY_EVENT_KINDS.map(() => '?').join(', ')
       const rows = this.db
         .prepare(
           `SELECT
@@ -1135,21 +1184,10 @@ export class Journal extends EventEmitter {
                ELSE NULL
              END AS payload,
              length(CAST(event.payload AS BLOB)) AS payload_bytes
-           FROM journal_session_event_index AS session_event
+           FROM journal_session_history_event_index AS session_event
            JOIN events AS event ON event.seq = session_event.seq
            WHERE session_event.session = ?
              AND session_event.seq < ?
-             AND (
-               event.kind IN (${historyKindPlaceholders})
-               OR (
-                 event.kind = 'codex/item/started'
-                 AND CASE
-                   WHEN json_valid(event.payload)
-                   THEN json_extract(event.payload, '$.item.type')
-                   ELSE NULL
-                 END = 'contextCompaction'
-               )
-             )
            ORDER BY session_event.seq DESC
            LIMIT ?`
         )
@@ -1157,7 +1195,6 @@ export class Journal extends EventEmitter {
           maxBytes,
           sessionId,
           beforeSeq,
-          ...JOURNAL_HISTORY_EVENT_KINDS,
           maxRows + 1
         ) as Array<{
         seq: number
@@ -1319,6 +1356,83 @@ export class Journal extends EventEmitter {
       this.db
         .prepare(
           'UPDATE journal_session_index_state SET scanned_through = ? WHERE singleton = 1'
+        )
+        .run(scannedThrough)
+      return {
+        rowsIndexed,
+        scannedThrough,
+        target,
+        complete: scannedThrough >= target,
+      }
+    }).immediate()
+  }
+
+  /**
+   * Crash-resumable transcript-only projection. The general session index is intentionally retained for
+   * lifecycle and recovery queries, but a chat viewport must not walk through hundreds of thousands of
+   * streaming deltas to find forty renderable events. Existing journals are scanned in bounded post-ready
+   * batches; triggers keep a completed frontier exact without putting migration work back on boot.
+   */
+  backfillSessionHistoryEventIndex(maxRows = 5_000): {
+    rowsIndexed: number
+    scannedThrough: number
+    target: number
+    complete: boolean
+  } {
+    if (!Number.isSafeInteger(maxRows) || maxRows < 1 || maxRows > 50_000) {
+      throw new Error('session transcript index batch is outside the supported bound')
+    }
+    return this.db.transaction(() => {
+      const scanned = this.db
+        .prepare('SELECT scanned_through FROM journal_session_history_index_state WHERE singleton = 1')
+        .pluck()
+        .get()
+      if (typeof scanned !== 'number' || !Number.isSafeInteger(scanned) || scanned < 0) {
+        throw new Error('journal session transcript index state is invalid')
+      }
+      const target = this.db.prepare('SELECT COALESCE(MAX(seq), 0) FROM events').pluck().get()
+      if (typeof target !== 'number' || !Number.isSafeInteger(target) || target < 0) {
+        throw new Error('journal session transcript index target is invalid')
+      }
+      const rows = this.db
+        .prepare(
+          `SELECT
+             seq,
+             session,
+             kind,
+             CASE
+               WHEN kind = 'codex/item/started' AND json_valid(payload)
+               THEN json_extract(payload, '$.item.type')
+               ELSE NULL
+             END AS item_type
+           FROM events
+           WHERE seq > ?
+           ORDER BY seq
+           LIMIT ?`
+        )
+        .all(scanned, maxRows) as Array<{
+        seq: number
+        session: string | null
+        kind: string
+        item_type: string | null
+      }>
+      const insert = this.db.prepare(
+        'INSERT OR IGNORE INTO journal_session_history_event_index (session, seq) VALUES (?, ?)'
+      )
+      let rowsIndexed = 0
+      for (const row of rows) {
+        if (
+          row.session !== null &&
+          (JOURNAL_HISTORY_EVENT_KIND_SET.has(row.kind) ||
+            (row.kind === 'codex/item/started' && row.item_type === 'contextCompaction'))
+        ) {
+          rowsIndexed += insert.run(row.session, row.seq).changes
+        }
+      }
+      const scannedThrough = Math.max(scanned, rows.at(-1)?.seq ?? target)
+      this.db
+        .prepare(
+          'UPDATE journal_session_history_index_state SET scanned_through = ? WHERE singleton = 1'
         )
         .run(scannedThrough)
       return {

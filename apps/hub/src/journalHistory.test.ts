@@ -51,6 +51,9 @@ function condense(
   while (!journal.backfillSessionEventIndex(5_000).complete) {
     // Production advances both projections in bounded post-ready batches before history deletion.
   }
+  while (!journal.backfillSessionHistoryEventIndex(5_000).complete) {
+    // Keep transcript paging current before maintenance can delete source rows.
+  }
   while (!journal.backfillTransientEventIndex(5_000).complete) {
     // Keep this helper on the same terminal-discovery contract as journal maintenance.
   }

@@ -5,6 +5,24 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.39-alpha.43 — 2026-09-01
+
+This release makes long-lived chat history bounded at the database query itself and adds checkout/run visibility
+directly beside each conversation.
+
+[Full v0.1.39-alpha.43 release notes](docs/releases/v0.1.39-alpha.43.md)
+
+- History paging uses a crash-resumable transcript-only projection, so thousands of streaming deltas no longer
+  turn a 40-event viewport request into a multi-second reverse scan.
+- A new Diff drawer compares the live checkout against `main`, the recorded base, or another operator-selected Git
+  revision and links exact commits/comparisons to GitHub.
+- A new Runs drawer shows active durable commands, retained output, elapsed time, ownership, target, and a compact
+  collapsible Completed section.
+- Every project member can inspect project run logs for coordination, including runs started by its manager;
+  start and cancel authority remains restricted to managers and the Overseer.
+- History-index upgrades remain bounded and post-ready. Existing multi-gigabyte journals do not regain a boot-time
+  migration scan.
+
 ## v0.1.38-alpha.42 — 2026-08-31
 
 This release fixes duplicate semantic delivery of operator messages sent while a teammate-origin manager turn is

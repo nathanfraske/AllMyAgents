@@ -874,7 +874,7 @@ const startRun = defineTool({
 const inspectRuns = defineTool({
   name: 'inspect_runs',
   description:
-    'Project managers and the application Overseer: query durable runs in your managed scope. With run_id, returns that run plus at most 64 KiB from each log stream after the supplied byte cursors; use returned cursors to continue without rereading an enormous log.',
+    'Project members: read durable runs and retained logs across your project for coordination. Managers and the application Overseer retain start/control authority separately. With run_id, returns that run plus at most 64 KiB from each log stream after the supplied byte cursors; use returned cursors to continue without rereading an enormous log.',
   schema: {
     run_id: z.string().optional(),
     session_ids: z.array(z.string()).max(64).optional(),
