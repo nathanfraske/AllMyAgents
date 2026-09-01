@@ -564,6 +564,40 @@ describe('SessionManager mid-turn steering', () => {
     expect(record.deferredOperatorTurns).toBeUndefined()
   })
 
+  it('coalesces rapid deferred corrections into one chronological operator turn', async () => {
+    let busy = true
+    const { sessions, journal, store, record, steer, runTurn } = build({ isBusy: () => busy })
+    ;(sessions as unknown as { busTurnSessions: Set<string> }).busTurnSessions.add('s1')
+
+    await sessions.send('s1', 'Continue the old target.')
+    await sessions.send('s1', 'Correction: stop the old target and implement the cutover.')
+
+    expect(steer).not.toHaveBeenCalled()
+    expect(store.all().find((candidate) => candidate.id === 's1')?.deferredOperatorTurns).toHaveLength(2)
+    const deferredIds = record.deferredOperatorTurns!.map((turn) => turn.id)
+    busy = false
+    sessions.applyLifecycle({ t: 'turnCompleted', sessionId: 's1', wseq: 1 })
+    await vi.waitFor(() => expect(runTurn).toHaveBeenCalledOnce())
+
+    const delivered = runTurn.mock.calls[0]![1]
+    expect(delivered).toContain('OPERATOR INPUT BATCH — CHRONOLOGICAL')
+    expect(delivered.indexOf('Continue the old target.')).toBeLessThan(
+      delivered.indexOf('Correction: stop the old target and implement the cutover.'),
+    )
+    expect(delivered.match(/Continue the old target\./gu)).toHaveLength(1)
+    expect(delivered.match(/Correction: stop the old target and implement the cutover\./gu)).toHaveLength(1)
+    expect(
+      journal.since(0).filter((event) => event.kind === 'session/turn-origin'),
+    ).toContainEqual(expect.objectContaining({
+      payload: expect.objectContaining({
+        origin: 'operator',
+        batchedOperatorInputs: 2,
+        deferredOperatorTurnIds: deferredIds,
+      }),
+    }))
+    await vi.waitFor(() => expect(record.deferredOperatorTurns).toBeUndefined())
+  })
+
   it('never retries an authorized deferred turn whose prior dispatch outcome is unknown', async () => {
     const { sessions, journal, store, record, runTurn } = build({ isBusy: () => false })
     record.status = 'idle'
