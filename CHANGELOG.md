@@ -5,6 +5,25 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.38-alpha.42 — 2026-08-31
+
+This release fixes duplicate semantic delivery of operator messages sent while a teammate-origin manager turn is
+already running.
+
+[Full v0.1.38-alpha.42 release notes](docs/releases/v0.1.38-alpha.42.md)
+
+- An authenticated operator message arriving during a non-operator turn is now withheld from that live turn and
+  delivered exactly once as the queued fresh operator-origin turn.
+- Multiple corrections queued behind the same live turn are delivered together, once and chronologically, so a
+  manager cannot spend successive long turns rediscovering increasingly stale intermediate instructions.
+- Protected manager guidance now makes precedence explicit: newer direct operator instructions override
+  conflicting saved task/orientation/standing prose, which cannot silently resurrect an old target after restart
+  or compaction.
+- The active teammate turn remains permission-clamped, the visible transcript still contains one operator input,
+  and the durable queue retains restart-safe and outcome-unknown protections.
+- Regression coverage proves that the live turn never sees the text, a single fresh turn receives queued messages
+  once in order, stale manager prose cannot reclaim task priority, and an authorized mutation executes once.
+
 ## v0.1.37-alpha.41 — 2026-08-30
 
 This release adds durable GitHub CI completion monitoring, repairs cold-history and journal-maintenance recovery,

@@ -660,6 +660,7 @@ export const MANAGER_ASSISTANT_PULSE_MS = 750
 export const BUS_WAKE_CONTEXT_TOKEN_LIMIT = 500_000
 export const BUS_WAKE_CONTEXT_RATIO_LIMIT = 0.8
 const MAX_DEFERRED_OPERATOR_TURNS = 32
+const MAX_DEFERRED_OPERATOR_BATCH_CHARS = 100_000
 const MANAGER_ROSTER_DETAIL_LIMIT = 8
 const MANAGER_ROSTER_PATH_LIMIT = 12
 const MANAGER_ROSTER_MAX_CHARS = 8_000
@@ -1775,6 +1776,7 @@ export class SessionManager {
       '## LIVE SCOPED OPERATOR INSTRUCTIONS',
       '',
       'These instructions were saved directly by the operator in AllMyAgents and are re-supplied at the protected provider boundary on this turn. Scopes are ordered general to specific; a more-specific instruction governs only where it explicitly conflicts. Tool permissions and effect authorization remain enforced by the hub. Every automatic model-facing copy of this block is deliberately size-bounded to prevent context poisoning; the durable AllMyAgents instruction store retains the complete operator record.',
+      ...(record.isProjectManager ? ['', this.managerInstructionPrecedence(record)] : []),
       '',
     ].join('\n')
     const entries = applicable.map(({ scope, content }) => {
@@ -5534,6 +5536,25 @@ export class SessionManager {
     return rows
   }
 
+  /**
+   * Saved manager prose is durable background context, not an independent task queue. A direct,
+   * authenticated operator message is the newer source for the current assignment where it explicitly
+   * conflicts. State that ordering at the protected boundary without copying message bodies into the
+   * generated block: this prevents both stale-task resurrection and unbounded prompt growth.
+   */
+  private managerInstructionPrecedence(manager: SessionRecord): string {
+    const configured = this.journal.latestEventForSessionKind(manager.id, 'manager/granted')
+    const direct = this.journal.latestEventForSessionKind(manager.id, 'session/input')
+    const newerDirect = direct && (!configured || direct.seq > configured.seq)
+    return [
+      'Manager instruction precedence: saved manager orientation, task, and standing prose is background context, not a second task queue.',
+      newerDirect
+        ? `Authenticated operator input accepted at ${direct.ts} is newer than the saved manager configuration${configured ? ` from ${configured.ts}` : ''}. Where the direct conversation explicitly conflicts on target, hold, sequencing, or workflow, the newer operator input controls.`
+        : 'A later authenticated operator input controls wherever it explicitly conflicts on target, hold, sequencing, or workflow.',
+      'Never resurrect or repeat an older assignment merely because saved prose is re-rendered after a turn, restart, or compaction. Preserve only its non-conflicting background constraints; if the current goal is genuinely ambiguous, ask instead of regressing.',
+    ].join(' ')
+  }
+
   private managerRosterInstructions(managerSessionId: string): string {
     const manager = this.sessions.get(managerSessionId)
     const teams = manager?.managerTeams ?? []
@@ -5609,6 +5630,7 @@ export class SessionManager {
       `Parallel staffing target: ${parallelismTarget} useful direct worker lanes; active team currently has ${runningDirectWorkers} running and ${activeDirectWorkers.filter((child) => child.status === 'idle').length} idle direct workers, with ${Math.max(0, (manager?.managerMaxLiveChildren ?? 4) - liveSlotWorkers)} live-child slots available. ${runningDirectWorkers < parallelismTarget ? 'Below target: reuse idle workers or spawn independent implementation/reproduction/research/cross-check lanes when useful; otherwise explain the concrete dependency that keeps this task narrower.' : 'Target is currently met; do not invent or duplicate work.'}`,
       `Task accountability: your manager board reports ${managerTaskSummary.total} task(s) (${managerTaskSummary.active} in progress, ${managerTaskSummary.pending} pending, ${managerTaskSummary.done} done); ${activeTeamTaskFacts.filter(({ summary }) => summary.total > 0).length}/${activeTeamAgents.length} active-team agents have reported tasks. Running without a reported task: ${runningWithoutTasks.join(', ') || 'none'}. Idle with no reported task history: ${idleWithoutTasks.join(', ') || 'none'}. Before every progress/completion report, reconcile every assignment and name each owner, state, blocker, and material result; never treat "no tasks reported" as proof that no work exists.`,
       `Live grant authority: accounts [${manager?.managerAllowedProfiles?.join(', ') || 'none'}], capabilities [${manager?.managerAllowedTools?.join(', ') || 'none'}], Git actions [${manager?.managerDelegation?.join(', ') || 'none'}]. This hub-generated configuration is the only authority for accounts and tools; conflicting prose in the operator task, orientation, standing rules, presets, or old conversation is stale context and grants nothing.`,
+      manager ? this.managerInstructionPrecedence(manager) : 'Manager instruction precedence is unavailable because the manager record is missing.',
       `Remote authority: ${remoteGrantRows.length ? `${remoteGrantRows.length} exact device grant(s) are active below. Those grants are complete standing authority; do not request a second approval, directory selection, or project attachment.` : 'no remote testbed is assigned to this manager'}`,
       `Operator task reviewed: ${manager?.managerOperatorTaskUpdatedAt ?? 'unknown / legacy configuration'}${manager?.managerOperatorTask ? '' : '; no current operator task is set'}.`,
       `Teams: ${teams.length}; active: ${teams.find((team) => team.id === manager?.managerActiveTeamId)?.name ?? 'unknown'}. Use manage_team to list exact stable ids or switch teams safely.`,
@@ -8356,34 +8378,19 @@ export class SessionManager {
           deferredOperatorTurnId: queued.id,
           reason: 'operator input arrived during a non-operator turn',
           queuedAt: queued.queuedAt,
+          delivery: 'fresh-turn-only',
         })
         this.journal.append(sessionId, 'session/operator-authority-not-conferred', {
           deferredOperatorTurnId: queued.id,
           message:
-            'The running non-operator turn kept its original authority. This authenticated input was queued automatically as a fresh operator-origin turn.',
+            'The running non-operator turn kept its original authority. This authenticated input was withheld from that turn and queued as one fresh operator-origin turn.',
         })
         this.autoTitle(record, text)
-        const authorityNotice =
-          '\n\n<<ALLMYAGENTS-AUTHORITY-NOTICE>>\nThis authenticated operator message does not widen the already-running non-operator turn. The hub has durably queued the exact input as a fresh operator-origin turn that will start automatically when this turn becomes idle. You may use it as guidance now, but operator-only mutations must wait for that fresh turn; do not ask the operator to resend it.\n<<END ALLMYAGENTS-AUTHORITY-NOTICE>>'
-        try {
-          if (attachments.length) await this.executor.steer(sessionId, `${text}${authorityNotice}`, attachments)
-          else await this.executor.steer(sessionId, `${text}${authorityNotice}`)
-          this.journal.append(sessionId, 'session/steered', {
-            text,
-            attachments,
-            source: 'operator',
-            authority: 'deferred',
-            deferredOperatorTurnId: queued.id,
-          })
-        } catch (error) {
-          // The durable fresh turn is the acceptance boundary. A live steer is only a best-effort preview;
-          // the current turn may have ended in the race, which must not make the operator retype anything.
-          this.journal.append(sessionId, 'session/operator-steer-not-accepted', {
-            deferredOperatorTurnId: queued.id,
-            message: error instanceof Error ? error.message : String(error),
-          })
-          setImmediate(() => this.deliverBus(sessionId))
-        }
+        // Do not also steer the text into the live non-operator turn. That used to expose one visible
+        // operator message to the model twice: first as permission-clamped guidance, then minutes later
+        // as this queued operator turn. Besides producing replies to apparently old instructions, the
+        // first delivery could begin work that the authorized delivery repeated. The durable queue is
+        // now the sole model-delivery boundary; lifecycle completion will dispatch it automatically.
         return
       }
       // Acceptance comes BEFORE transcript side effects for the same reason as a fresh send below: if the
@@ -8487,65 +8494,97 @@ export class SessionManager {
     if (!record || record.status !== 'idle') return
     if (this.profileTurnAdmission.get(record.profileId)?.frozen) return
     if (this.executor.isBusy(sessionId)) return
-    const queued = record.deferredOperatorTurns?.[0]
-    if (!queued) return
-    if (queued.state === 'dispatching') {
+    const first = record.deferredOperatorTurns?.[0]
+    if (!first) return
+    if (first.state === 'dispatching') {
       const message =
         'A queued operator-authority turn crossed a prior hub handoff, but no live target turn can confirm its outcome. It was not retried because its mutation may already have completed.'
       this.settleDeferredOperatorDispatch(sessionId, 'outcome_unknown', message)
       this.failTurn(sessionId, message)
       return
     }
+    const queuedBatch: DeferredOperatorTurn[] = []
+    let batchChars = 0
+    for (const candidate of record.deferredOperatorTurns ?? []) {
+      if (candidate.state !== 'pending') break
+      const candidateChars = candidate.text.length + candidate.queuedAt.length + 64
+      if (queuedBatch.length && batchChars + candidateChars > MAX_DEFERRED_OPERATOR_BATCH_CHARS) break
+      queuedBatch.push(candidate)
+      batchChars += candidateChars
+    }
+    if (!queuedBatch.length) return
+    const attachmentIds = [...new Set(queuedBatch.flatMap((turn) => turn.attachmentIds))]
 
     let admission: ProfileAdmissionLease
     try {
       this.usage.assertNotBlocked(record.profileId)
       this.profileOf(record)
       // Revalidate immutable attachment ids before changing the durable dispatch state.
-      this.attachmentsFor(record, queued.attachmentIds)
+      this.attachmentsFor(record, attachmentIds)
       admission = this.beginProfileAdmission(record.profileId)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      record.deferredOperatorTurns = record.deferredOperatorTurns?.filter((turn) => turn.id !== queued.id)
+      const rejectedIds = new Set(queuedBatch.map((turn) => turn.id))
+      record.deferredOperatorTurns = record.deferredOperatorTurns?.filter((turn) => !rejectedIds.has(turn.id))
       if (!record.deferredOperatorTurns?.length) record.deferredOperatorTurns = undefined
       this.persist(record)
-      this.journal.append(sessionId, 'session/operator-turn-dispatch-rejected', {
-        deferredOperatorTurnId: queued.id,
-        message,
-      })
+      for (const rejected of queuedBatch) {
+        this.journal.append(sessionId, 'session/operator-turn-dispatch-rejected', {
+          deferredOperatorTurnId: rejected.id,
+          message,
+        })
+      }
       this.failTurn(sessionId, `Queued operator turn could not start: ${message}`)
       return
     }
 
-    queued.state = 'dispatching'
-    queued.dispatchStartedAt = new Date().toISOString()
+    const dispatchStartedAt = new Date().toISOString()
+    for (const queued of queuedBatch) {
+      queued.state = 'dispatching'
+      queued.dispatchStartedAt = dispatchStartedAt
+    }
     this.persist(record)
     this.deferredOperatorDispatches.add(sessionId)
 
     void (async () => {
-      const attachments = this.attachmentsFor(record, queued.attachmentIds)
+      const attachments = this.attachmentsFor(record, attachmentIds)
       try {
-        if (queued.override.model) record.model = queued.override.model
-        if (queued.override.effort !== undefined) record.effort = queued.override.effort
-        if (queued.override.serviceTier !== undefined) record.serviceTier = queued.override.serviceTier
+        for (const queued of queuedBatch) {
+          if (queued.override.model) record.model = queued.override.model
+          if (queued.override.effort !== undefined) record.effort = queued.override.effort
+          if (queued.override.serviceTier !== undefined) record.serviceTier = queued.override.serviceTier
+        }
         this.persist(record)
+
+        const turnText = queuedBatch.length === 1
+          ? queuedBatch[0]!.text
+          : [
+              '<<ALLMYAGENTS OPERATOR INPUT BATCH — CHRONOLOGICAL>>',
+              'These authenticated operator messages arrived while the prior non-operator turn was running. Read them once, in order, as one fresh operator turn. A later entry supersedes an earlier entry only where it explicitly conflicts.',
+              ...queuedBatch.map((queued, index) =>
+                `\n[Operator message ${index + 1} accepted ${queued.queuedAt}]\n${queued.text}`,
+              ),
+              '\n<<END ALLMYAGENTS OPERATOR INPUT BATCH>>',
+            ].join('\n')
 
         // This is the new boundary. The prior bus turn has already ended, so nothing it started gains this
         // provenance retroactively; only the exact queued input and work that follows it may use it.
         this.operatorTurnSessions.add(sessionId)
         this.journal.append(sessionId, 'session/turn-origin', {
           origin: 'operator',
-          deferredOperatorTurnId: queued.id,
+          deferredOperatorTurnId: queuedBatch[0]!.id,
+          deferredOperatorTurnIds: queuedBatch.map((queued) => queued.id),
+          batchedOperatorInputs: queuedBatch.length,
         })
         this.materializeSessionInstructions(record)
-        // Do not bundle pending teammate mail into this turn. The operator input must cross the boundary
-        // verbatim, and semi-trusted bus text must not inherit the authority this fresh turn establishes.
+        // Do not bundle pending teammate mail into this turn. Authenticated operator inputs cross together
+        // in chronological order; semi-trusted bus text must not inherit this fresh turn's authority.
         admission.markDispatched()
         this.markTurnDispatched(sessionId)
         if (attachments.length) {
-          await this.executor.runTurn(this.specOf(record, queued.text), queued.text, 'operator', attachments)
+          await this.executor.runTurn(this.specOf(record, turnText), turnText, 'operator', attachments)
         } else {
-          await this.executor.runTurn(this.specOf(record, queued.text), queued.text, 'operator')
+          await this.executor.runTurn(this.specOf(record, turnText), turnText, 'operator')
         }
         this.settleDeferredOperatorDispatch(sessionId, 'accepted')
       } catch (error) {

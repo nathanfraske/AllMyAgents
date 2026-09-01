@@ -1377,6 +1377,9 @@ describe('project manager durable live roster', () => {
     expect(instructions).not.toContain('private operator steer body')
     expect(instructions).toContain('call the AllMyAgents assign_child_task tool')
     expect(instructions).toContain('Live grant authority: accounts [p1], capabilities [shell, file_read]')
+    expect(instructions).toContain('saved manager orientation, task, and standing prose is background context, not a second task queue')
+    expect(instructions).toContain('Authenticated operator input accepted at')
+    expect(instructions).toContain('Never resurrect or repeat an older assignment')
     expect(instructions).toContain('device fleet-device-a: roots [windows-root, wsl-root]')
     expect(instructions).toContain('Those grants are complete standing authority')
     expect(instructions).toContain('the first project durable run prepares one automatically')
@@ -1389,6 +1392,8 @@ describe('project manager durable live roster', () => {
 
     const runtime = runTurn.mock.calls[0]?.[0].claudeSystemPrompt ?? ''
     expect(runtime).toContain('Task accountability contract:')
+    expect(runtime).toContain('saved manager orientation, task, and standing prose is background context, not a second task queue')
+    expect(runtime).toContain('Never resurrect or repeat an older assignment')
     expect(runtime).toContain('create or update your own provider-native task/plan entry')
     expect(runtime).toContain('project\'s reviewed setup recipe')
     expect(runtime).toContain('runningWithoutReportedTasks')
