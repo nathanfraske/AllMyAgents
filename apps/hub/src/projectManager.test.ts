@@ -1663,6 +1663,15 @@ describe('project manager visibility into its own workers', () => {
       runs: [expect.objectContaining({ state: 'succeeded', exitCode: 0 })],
       logs: { stdout: expect.stringContaining('managed run') },
     })
+    expect(sessions.managerInspectRuns(outsider.id, { runId: result.run!.id })).toMatchObject({
+      ok: true,
+      runs: [expect.objectContaining({ actorSessionId: manager.id, targetSessionId: child.id })],
+      logs: { stdout: expect.stringContaining('managed run') },
+    })
+    expect(sessions.managerControlRun(outsider.id, result.run!.id, 'cancel')).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/neither a project manager nor the application Overseer/i),
+    })
     await expect(sessions.managerStartRun(manager.id, {
       targetSessionId: outsider.id,
       kind: 'test',

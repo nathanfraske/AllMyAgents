@@ -215,30 +215,32 @@ async function main(): Promise<{ message: MaintenanceMessage; exitCode: number }
     let lastProjectionProgress = 0
     while (Date.now() - processStart < WORK_BUDGET_MS) {
       const session = journal.backfillSessionEventIndex(PROJECTION_BATCH_ROWS)
+      const history = journal.backfillSessionHistoryEventIndex(PROJECTION_BATCH_ROWS)
       const transient = journal.backfillTransientEventIndex(PROJECTION_BATCH_ROWS)
-      const progress = Math.min(session.scannedThrough, transient.scannedThrough)
+      const progress = Math.min(session.scannedThrough, history.scannedThrough, transient.scannedThrough)
       reportProgress('projecting', progress, payloadBytesDeleted)
       if (
         progress - lastProjectionProgress >= PROJECTION_PROGRESS_ROWS ||
-        (session.complete && transient.complete)
+        (session.complete && history.complete && transient.complete)
       ) {
         lastProjectionProgress = progress
         journal.recordCompactionLifecycle(operationId, 'progress', {
           rowsDeleted,
           payloadBytesDeleted,
           detail:
-            session.complete && transient.complete
+            session.complete && history.complete && transient.complete
               ? 'Bounded journal projections are current.'
               : `Bounded journal projection advanced through event ${progress}.`,
         })
       }
-      if (session.complete && transient.complete) break
+      if (session.complete && history.complete && transient.complete) break
       await nextTurn()
     }
 
     const sessionProjection = journal.backfillSessionEventIndex(1)
+    const historyProjection = journal.backfillSessionHistoryEventIndex(1)
     const transientProjection = journal.backfillTransientEventIndex(1)
-    if (!sessionProjection.complete || !transientProjection.complete) {
+    if (!sessionProjection.complete || !historyProjection.complete || !transientProjection.complete) {
       const reason = 'bounded projection time budget elapsed; deletion was not attempted'
       journal.recordCompactionLifecycle(operationId, 'deferred', {
         rowsDeleted,

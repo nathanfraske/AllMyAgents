@@ -292,7 +292,7 @@ export function saveOpenAgentPanels(ids: string[]): void {
   }
 }
 
-export type ThreadSidePanel = 'agents' | 'browser'
+export type ThreadSidePanel = 'agents' | 'browser' | 'diff' | 'runs'
 
 /** One in-flow side panel per chat. This prevents Browser + Agents from jointly crushing a split pane. */
 export function loadThreadSidePanel(sessionId: string): ThreadSidePanel | null {
@@ -300,7 +300,12 @@ export function loadThreadSidePanel(sessionId: string): ThreadSidePanel | null {
     const raw = localStorage.getItem(THREAD_SIDE_PANELS_KEY)
     if (raw) {
       const value = JSON.parse(raw) as Record<string, unknown>
-      if (value?.[sessionId] === 'agents' || value?.[sessionId] === 'browser') {
+      if (
+        value?.[sessionId] === 'agents' ||
+        value?.[sessionId] === 'browser' ||
+        value?.[sessionId] === 'diff' ||
+        value?.[sessionId] === 'runs'
+      ) {
         return value[sessionId]
       }
     }

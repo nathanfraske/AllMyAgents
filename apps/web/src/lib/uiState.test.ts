@@ -126,6 +126,12 @@ describe('thread side-panel persistence', () => {
     saveThreadSidePanel('s1', 'agents')
     expect(loadThreadSidePanel('s1')).toBe('agents')
 
+    saveThreadSidePanel('s1', 'diff')
+    expect(loadThreadSidePanel('s1')).toBe('diff')
+
+    saveThreadSidePanel('s1', 'runs')
+    expect(loadThreadSidePanel('s1')).toBe('runs')
+
     saveThreadSidePanel('s1', null)
     expect(loadThreadSidePanel('s1')).toBeNull()
   })

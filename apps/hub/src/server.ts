@@ -42,6 +42,7 @@ import { asUiPreferences, type DangerFlags, type HubPrefs, type ManagerAgentType
 import type { Executor } from './executor.js'
 import type { WorktreeProjectActivity } from './worktreeCollisionDetector.js'
 import type { WorkspaceManager } from './workspace.js'
+import type { DurableRunKind, DurableRunState } from './durableRuns.js'
 import type { RestartState } from './restartController.js'
 import { SCHEMA_VERSION } from './restartHandshake.js'
 import { AttachmentInputError, attachmentLimitForMime, isClaudeImageMime } from './attachments.js'
@@ -3352,6 +3353,60 @@ export function startServer(opts: ServerOptions): http.Server {
             return
           }
           throw error
+        }
+        return
+      }
+      const durableRunsMatch = /^\/api\/sessions\/([^/]+)\/runs(?:\/([^/]+))?$/.exec(url.pathname)
+      if (method === 'GET' && durableRunsMatch) {
+        const states = url.searchParams.getAll('state')
+        const kinds = url.searchParams.getAll('kind')
+        const allowedStates = new Set<DurableRunState>([
+          'queued', 'running', 'succeeded', 'failed', 'cancelled', 'outcome_unknown',
+        ])
+        const allowedKinds = new Set<DurableRunKind>([
+          'build', 'test', 'lint', 'benchmark', 'deploy', 'custom',
+        ])
+        if (states.some((state) => !allowedStates.has(state as DurableRunState))) {
+          throw new BadRequestError('invalid durable run state')
+        }
+        if (kinds.some((kind) => !allowedKinds.has(kind as DurableRunKind))) {
+          throw new BadRequestError('invalid durable run kind')
+        }
+        const limitRaw = url.searchParams.get('limit')
+        const limit = limitRaw == null ? 50 : Number(limitRaw)
+        const stdoutAfterRaw = url.searchParams.get('stdoutAfter')
+        const stderrAfterRaw = url.searchParams.get('stderrAfter')
+        const stdoutAfter = stdoutAfterRaw == null ? undefined : Number(stdoutAfterRaw)
+        const stderrAfter = stderrAfterRaw == null ? undefined : Number(stderrAfterRaw)
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+          throw new BadRequestError('invalid durable run limit')
+        }
+        if (stdoutAfter !== undefined && (!Number.isSafeInteger(stdoutAfter) || stdoutAfter < 0)) {
+          throw new BadRequestError('invalid stdout cursor')
+        }
+        if (stderrAfter !== undefined && (!Number.isSafeInteger(stderrAfter) || stderrAfter < 0)) {
+          throw new BadRequestError('invalid stderr cursor')
+        }
+        const result = sessions.managerInspectRuns(durableRunsMatch[1] as string, {
+          runId: durableRunsMatch[2],
+          states: states as DurableRunState[],
+          kinds: kinds as DurableRunKind[],
+          limit,
+          stdoutAfter,
+          stderrAfter,
+        })
+        json(res, result, result.ok ? 200 : 403)
+        return
+      }
+      const workspaceDiffMatch = /^\/api\/sessions\/([^/]+)\/workspace-diff$/.exec(url.pathname)
+      if (method === 'GET' && workspaceDiffMatch) {
+        try {
+          json(res, await sessions.workspaceDiff(
+            workspaceDiffMatch[1] as string,
+            url.searchParams.get('base') ?? undefined,
+          ))
+        } catch (error) {
+          json(res, { error: error instanceof Error ? error.message : 'workspace diff failed' }, 400)
         }
         return
       }
