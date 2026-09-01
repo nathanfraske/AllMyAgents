@@ -8356,34 +8356,19 @@ export class SessionManager {
           deferredOperatorTurnId: queued.id,
           reason: 'operator input arrived during a non-operator turn',
           queuedAt: queued.queuedAt,
+          delivery: 'fresh-turn-only',
         })
         this.journal.append(sessionId, 'session/operator-authority-not-conferred', {
           deferredOperatorTurnId: queued.id,
           message:
-            'The running non-operator turn kept its original authority. This authenticated input was queued automatically as a fresh operator-origin turn.',
+            'The running non-operator turn kept its original authority. This authenticated input was withheld from that turn and queued as one fresh operator-origin turn.',
         })
         this.autoTitle(record, text)
-        const authorityNotice =
-          '\n\n<<ALLMYAGENTS-AUTHORITY-NOTICE>>\nThis authenticated operator message does not widen the already-running non-operator turn. The hub has durably queued the exact input as a fresh operator-origin turn that will start automatically when this turn becomes idle. You may use it as guidance now, but operator-only mutations must wait for that fresh turn; do not ask the operator to resend it.\n<<END ALLMYAGENTS-AUTHORITY-NOTICE>>'
-        try {
-          if (attachments.length) await this.executor.steer(sessionId, `${text}${authorityNotice}`, attachments)
-          else await this.executor.steer(sessionId, `${text}${authorityNotice}`)
-          this.journal.append(sessionId, 'session/steered', {
-            text,
-            attachments,
-            source: 'operator',
-            authority: 'deferred',
-            deferredOperatorTurnId: queued.id,
-          })
-        } catch (error) {
-          // The durable fresh turn is the acceptance boundary. A live steer is only a best-effort preview;
-          // the current turn may have ended in the race, which must not make the operator retype anything.
-          this.journal.append(sessionId, 'session/operator-steer-not-accepted', {
-            deferredOperatorTurnId: queued.id,
-            message: error instanceof Error ? error.message : String(error),
-          })
-          setImmediate(() => this.deliverBus(sessionId))
-        }
+        // Do not also steer the text into the live non-operator turn. That used to expose one visible
+        // operator message to the model twice: first as permission-clamped guidance, then minutes later
+        // as this queued operator turn. Besides producing replies to apparently old instructions, the
+        // first delivery could begin work that the authorized delivery repeated. The durable queue is
+        // now the sole model-delivery boundary; lifecycle completion will dispatch it automatically.
         return
       }
       // Acceptance comes BEFORE transcript side effects for the same reason as a fresh send below: if the

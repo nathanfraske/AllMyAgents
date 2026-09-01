@@ -119,6 +119,7 @@ describe('SessionManager mid-turn steering', () => {
     let release!: () => void
     const steering = new Promise<void>((resolve) => { release = resolve })
     const { sessions, journal, steer } = build({ steer: async () => steering })
+    ;(sessions as unknown as { operatorTurnSessions: Set<string> }).operatorTurnSessions.add('s1')
 
     const first = sessions.send('s1', 'one remote correction', {}, [], 'remote-request-1')
     const retry = sessions.send('s1', 'one remote correction', {}, [], 'remote-request-1')
@@ -383,6 +384,7 @@ describe('SessionManager mid-turn steering', () => {
       steer: () => steerAccepted,
       isBusy: () => busy,
     })
+    ;(sessions as unknown as { operatorTurnSessions: Set<string> }).operatorTurnSessions.add('s1')
 
     const sending = sessions.send('s1', 'raced with credential freeze')
     await vi.waitFor(() => expect(steer).toHaveBeenCalledOnce())
@@ -497,7 +499,7 @@ describe('SessionManager mid-turn steering', () => {
     expect([...journal.replay(0)].some((event) => event.kind === 'session/input' && (event.payload as { text?: string }).text === 'correct the instruction')).toBe(true)
   })
 
-  it('keeps the live bus turn clamped and executes deferred operator authority once on a fresh turn', async () => {
+  it('withholds operator text from a live bus turn and delivers it exactly once on a fresh turn', async () => {
     let busy = true
     let sessionsUnderTest: SessionManager | undefined
     const mutationResults: Array<Awaited<ReturnType<SessionManager['overseerControl']>>> = []
@@ -528,12 +530,18 @@ describe('SessionManager mid-turn steering', () => {
     expect(deniedDuringBusTurn).toMatchObject({ ok: false })
     await sessions.send('s1', 'configure the manager now')
 
-    expect(steer).toHaveBeenCalledOnce()
-    expect(steer.mock.calls[0]![1]).toContain('configure the manager now')
+    expect(steer).not.toHaveBeenCalled()
     expect(journal.since(0)).toContainEqual(expect.objectContaining({
       sessionId: 's1',
       kind: 'session/operator-turn-deferred',
+      payload: expect.objectContaining({ delivery: 'fresh-turn-only' }),
     }))
+    expect(
+      journal.since(0).filter((event) =>
+        event.kind === 'session/steered' &&
+        (event.payload as { text?: string }).text === 'configure the manager now'
+      ),
+    ).toHaveLength(0)
     expect(store.all().find((candidate) => candidate.id === 's1')?.deferredOperatorTurns).toHaveLength(1)
     expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(false)
 
@@ -541,6 +549,7 @@ describe('SessionManager mid-turn steering', () => {
     sessions.applyLifecycle({ t: 'turnCompleted', sessionId: 's1', wseq: 1 })
     await vi.waitFor(() => expect(runTurn).toHaveBeenCalledOnce())
     await vi.waitFor(() => expect(mutationResults).toEqual([expect.objectContaining({ ok: true })]))
+    expect(runTurn.mock.calls[0]![1]).toBe('configure the manager now')
 
     expect(
       journal.since(0).filter((event) =>
