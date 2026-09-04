@@ -776,6 +776,39 @@ describe('apply()', () => {
     expect(store.status(store.sessions['reconciled-status']!)).toMatchObject({ key: 'working' })
   })
 
+  it('reconciles an account model catalog that the provider refreshed after bootstrap', async () => {
+    store.profiles = [{
+      id: 'codex-b',
+      provider: 'codex',
+      availableModels: [{
+        slug: 'gpt-5.6-sol',
+        name: 'GPT-5.6-Sol',
+        supportedEfforts: ['low'],
+        serviceTiers: [],
+      }],
+    }]
+    vi.mocked(api.profiles).mockResolvedValueOnce([{
+      id: 'codex-b',
+      provider: 'codex',
+      modelCatalogUpdatedAt: '2026-09-04T20:48:52.056Z',
+      availableModels: [{
+        slug: 'gpt-6-astra',
+        name: 'GPT-6-Astra',
+        supportedEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+        defaultEffort: 'medium',
+        serviceTiers: [{ id: 'priority', name: 'Fast' }],
+      }],
+    }])
+
+    await store.syncRecordsFromHub()
+
+    expect(store.profiles).toEqual([expect.objectContaining({
+      id: 'codex-b',
+      modelCatalogUpdatedAt: '2026-09-04T20:48:52.056Z',
+      availableModels: [expect.objectContaining({ slug: 'gpt-6-astra' })],
+    })])
+  })
+
   it('does not let a slow roster response overwrite a newer streamed status', async () => {
     seed('status-race')
     let resolveRoster!: (records: SessionRecord[]) => void

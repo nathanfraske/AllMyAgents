@@ -1408,7 +1408,7 @@ export interface BrowserStatus {
 
 export const api = {
   replayBaseline: () => jget<ReplayBaseline>('/api/replay-baseline'),
-  profiles: () => jget<ProfileInfo[]>('/api/profiles'),
+  profiles: (signal?: AbortSignal) => jget<ProfileInfo[]>('/api/profiles', HUB_HTTP, signal),
   stats: () => jget<StatsResult>('/api/stats'),
   // Account refresh is part of the login lifecycle, so it obeys the same transport bound as every
   // login/status/cancel request. The optional outer signal also lets the whole-attempt deadline stop it.
