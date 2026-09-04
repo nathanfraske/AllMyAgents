@@ -71,7 +71,7 @@ export interface DurableRunExecutionEnvironment {
 
 export type DurableRunExecutionTarget =
   | { kind: 'local' }
-  | { kind: 'remote'; siteId: string; rootId: string; command: string; cwd?: string }
+  | { kind: 'remote'; siteId: string; rootId: string; command: string; cwd?: string; requiredTools?: string[] }
 
 export interface DurableRun {
   id: string
@@ -80,6 +80,8 @@ export interface DurableRun {
   actorSessionId: string
   actorLabel: string
   targetSessionId: string
+  /** An earlier durable setup/check run that must succeed before this run may claim resources. */
+  dependsOnRunId?: string
   executionTarget: DurableRunExecutionTarget
   kind: DurableRunKind
   state: DurableRunState
@@ -120,6 +122,7 @@ export interface DurableRunStartInput {
   actorSessionId: string
   actorLabel: string
   targetSessionId: string
+  dependsOnRunId?: string
   kind: DurableRunKind
   executable: string
   args: string[]
@@ -139,6 +142,7 @@ interface RunRow {
   actorSessionId: string
   actorLabel: string
   targetSessionId: string
+  dependsOnRunId: string | null
   executionTargetJson: string
   kind: DurableRunKind
   state: DurableRunState
@@ -224,6 +228,7 @@ function fromRow(row: RunRow | undefined): DurableRun | undefined {
     actorSessionId: row.actorSessionId,
     actorLabel: row.actorLabel,
     targetSessionId: row.targetSessionId,
+    ...(row.dependsOnRunId ? { dependsOnRunId: row.dependsOnRunId } : {}),
     executionTarget: (() => {
       try {
         return JSON.parse(row.executionTargetJson) as DurableRunExecutionTarget
@@ -472,6 +477,7 @@ export class DurableRunStore {
         actorSessionId TEXT NOT NULL,
         actorLabel TEXT NOT NULL,
         targetSessionId TEXT NOT NULL,
+        dependsOnRunId TEXT,
         executionTargetJson TEXT NOT NULL DEFAULT '{"kind":"local"}',
         kind TEXT NOT NULL CHECK (kind IN ('build','test','lint','benchmark','deploy','custom')),
         state TEXT NOT NULL CHECK (state IN ('queued','running','succeeded','failed','cancelled','outcome_unknown')),
@@ -514,6 +520,10 @@ export class DurableRunStore {
     if (!columns.has('executionTargetJson')) {
       db.exec(`ALTER TABLE durable_runs ADD COLUMN executionTargetJson TEXT NOT NULL DEFAULT '{"kind":"local"}'`)
     }
+    if (!columns.has('dependsOnRunId')) {
+      db.exec('ALTER TABLE durable_runs ADD COLUMN dependsOnRunId TEXT')
+    }
+    db.exec('CREATE INDEX IF NOT EXISTS durable_runs_dependency_idx ON durable_runs(dependsOnRunId, state, createdAt ASC)')
     if (!columns.has('resultJson')) db.exec('ALTER TABLE durable_runs ADD COLUMN resultJson TEXT')
     if (!columns.has('continuationAt')) {
       // Runs terminal before this capability existed must not wake their owners en masse on upgrade.
@@ -526,11 +536,11 @@ export class DurableRunStore {
     }
     this.createTx = db.transaction((row) => {
       db.prepare(`INSERT INTO durable_runs (
-        id, projectId, sessionId, actorSessionId, actorLabel, targetSessionId, executionTargetJson, kind, state,
+        id, projectId, sessionId, actorSessionId, actorLabel, targetSessionId, dependsOnRunId, executionTargetJson, kind, state,
         executable, argsJson, cwd, commandSummary, commandSha256, resourcesJson, provenanceJson,
         environmentJson, createdAt, timeoutMs
       ) VALUES (
-        @id, @projectId, @sessionId, @actorSessionId, @actorLabel, @targetSessionId, @executionTargetJson, @kind, 'queued',
+        @id, @projectId, @sessionId, @actorSessionId, @actorLabel, @targetSessionId, @dependsOnRunId, @executionTargetJson, @kind, 'queued',
         @executable, @argsJson, @cwd, @commandSummary, @commandSha256, @resourcesJson, @provenanceJson,
         @environmentJson, @createdAt, @timeoutMs
       )`).run(row)
@@ -608,6 +618,7 @@ export class DurableRunStore {
       actorSessionId: input.actorSessionId,
       actorLabel: boundedText(input.actorLabel, 200),
       targetSessionId: input.targetSessionId,
+      dependsOnRunId: input.dependsOnRunId ?? null,
       executionTargetJson: JSON.stringify(input.executionTarget ?? { kind: 'local' }),
       kind: input.kind,
       state: 'queued' as const,
@@ -720,6 +731,16 @@ export class DurableRunStore {
   queued(): DurableRun[] {
     return (this.db.prepare("SELECT * FROM durable_runs WHERE state = 'queued' ORDER BY createdAt ASC, id ASC").all() as RunRow[])
       .map((row) => fromRow(row)!)
+  }
+
+  failQueued(id: string, error: string): DurableRun | undefined {
+    const now = new Date().toISOString()
+    const updated = this.db.prepare(`
+      UPDATE durable_runs
+      SET state = 'failed', completedAt = ?, heartbeatAt = ?, error = ?, exitCode = NULL
+      WHERE id = ? AND state = 'queued'
+    `).run(now, now, boundedText(error, 2_000), id)
+    return updated.changes === 1 ? this.get(id) : undefined
   }
 
   list(input: {
@@ -916,6 +937,12 @@ export class DurableRunController {
 
   async start(input: DurableRunStartInput): Promise<DurableRun> {
     if (!this.active) throw new Error('durable run execution is not active on this hub instance')
+    if (input.dependsOnRunId) {
+      const dependency = this.store.get(input.dependsOnRunId)
+      if (!dependency || dependency.projectId !== input.projectId) {
+        throw new Error('durable run dependency is unavailable outside this project run scope')
+      }
+    }
     const provenance = await captureRunProvenance(input)
     const run = this.store.create(input, provenance)
     this.journal.append(run.sessionId, 'run/queued', this.lifecyclePayload(run))
@@ -964,6 +991,20 @@ export class DurableRunController {
     this.pumping = true
     try {
       for (const queued of this.store.queued()) {
+        if (queued.dependsOnRunId) {
+          const dependency = this.store.get(queued.dependsOnRunId)
+          if (!dependency || ['failed', 'cancelled', 'outcome_unknown'].includes(dependency.state)) {
+            const blocked = this.store.failQueued(
+              queued.id,
+              dependency
+                ? `Prerequisite run ${dependency.id} ended ${dependency.state}; this command was not started.`
+                : `Prerequisite run ${queued.dependsOnRunId} is unavailable; this command was not started.`,
+            )
+            if (blocked) this.recordTerminal(blocked)
+            continue
+          }
+          if (dependency.state !== 'succeeded') continue
+        }
         if (!this.store.tryClaim(queued.id)) continue
         const claimed = this.store.get(queued.id)
         if (claimed) this.launch(claimed)
@@ -1168,6 +1209,7 @@ export class DurableRunController {
       projectId: run.projectId,
       actorSessionId: run.actorSessionId,
       targetSessionId: run.targetSessionId,
+      dependsOnRunId: run.dependsOnRunId ?? null,
       kind: run.kind,
       state: run.state,
       commandSummary: run.commandSummary,

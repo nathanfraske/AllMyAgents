@@ -163,9 +163,10 @@ export interface ManagerTeam {
 /**
  * An authenticated operator message accepted while a non-operator turn was already running.
  *
- * The current turn is never relabelled. Instead, the hub persists this input and starts it as a fresh
- * operator-origin turn once the session is idle. `dispatching` is a crash fence: a successor may observe
- * or settle that handoff, but must never blindly submit the authorized mutation a second time.
+ * The hub persists this before attempting the provider's immediate steer boundary. A successful steer
+ * removes it and promotes only subsequent work in that live turn to operator provenance. If the provider
+ * rejects the boundary because the turn ended in the race, the record starts as one fresh operator turn
+ * once the session is idle. `dispatching` is a crash fence around that fallback handoff.
  */
 export interface DeferredOperatorTurn {
   id: string

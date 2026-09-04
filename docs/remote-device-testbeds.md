@@ -37,6 +37,11 @@ the mapped Site/HTTP route only as a compatibility fallback.
    deploys, or other long-running commands. It uses the same explicit device/root grant but adds a generic
    durable run id, source/environment provenance, retained cursor-paged logs, exact terminal state, and
    resource leases. Independent roots or named resources can run concurrently; a shared root/GPU/port queues.
+   Declare common prerequisites with `required_tools`. If inspection finds any missing, provide the project's
+   exact reviewed bootstrap or setup recipe as `setup_command`; the hub runs it as a separate durable
+   prerequisite, then rechecks the target before starting the requested command. A setup failure or a still-
+   missing tool fails closed without starting the build. The hub never guesses packages or invents a parallel
+   dependency manifest.
    See [durable runs and scoped team queries](durable-runs-and-team-query.md).
 
 Revoking a chat grant takes effect on its next tool call. Disabling the target policy, deleting a root, or
