@@ -243,4 +243,80 @@ describe('DurableRunController', () => {
     })
     expect(inspected.logs?.stdout).toContain('remote build complete')
   })
+
+  it('keeps a dependent run queued until its durable prerequisite succeeds', async () => {
+    const { db, store, cwd } = harness()
+    const controller = new DurableRunController(
+      store,
+      { db, append: () => undefined },
+      path.join(tempDir(), 'logs'),
+    )
+    controllers.push(controller)
+    controller.activate()
+
+    const prerequisiteInput = {
+      ...input(cwd, '-setup'),
+      args: ['-e', 'setTimeout(() => process.exit(0), 200)'],
+      resources: ['setup-lane'],
+    }
+    const prerequisite = await controller.start(prerequisiteInput)
+    const dependentInput = {
+      ...input(cwd, '-build'),
+      resources: ['independent-build-lane'],
+      dependsOnRunId: prerequisite.id,
+    }
+    const dependent = await controller.start(dependentInput)
+
+    expect(store.get(dependent.id)?.state).toBe('queued')
+    await waitForTerminal(store, prerequisite.id)
+    await waitForTerminal(store, dependent.id)
+    expect(store.get(prerequisite.id)?.state).toBe('succeeded')
+    expect(store.get(dependent.id)).toMatchObject({
+      state: 'succeeded',
+      dependsOnRunId: prerequisite.id,
+    })
+  })
+
+  it('fails a dependent run without executing it when its prerequisite fails', async () => {
+    const { db, store, cwd } = harness()
+    const events: Array<{ kind: string; payload: unknown }> = []
+    const controller = new DurableRunController(
+      store,
+      { db, append: (_sessionId, kind, payload) => events.push({ kind, payload }) },
+      path.join(tempDir(), 'logs'),
+    )
+    controllers.push(controller)
+    controller.activate()
+    const marker = path.join(cwd, 'dependent-ran.txt')
+
+    const prerequisiteInput = {
+      ...input(cwd, '-setup-fail'),
+      args: ['-e', 'process.exit(9)'],
+      resources: ['setup-lane'],
+    }
+    const prerequisite = await controller.start(prerequisiteInput)
+    const dependentInput = {
+      ...input(cwd, '-blocked-build'),
+      args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`],
+      resources: ['independent-build-lane'],
+      dependsOnRunId: prerequisite.id,
+    }
+    const dependent = await controller.start(dependentInput)
+
+    await waitForTerminal(store, prerequisite.id)
+    await waitForTerminal(store, dependent.id)
+    expect(store.get(prerequisite.id)?.state).toBe('failed')
+    expect(store.get(dependent.id)).toMatchObject({
+      state: 'failed',
+      error: expect.stringMatching(/prerequisite run .* ended failed.*not started/i),
+    })
+    expect(fs.existsSync(marker)).toBe(false)
+    expect(events).toContainEqual(expect.objectContaining({
+      kind: 'run/failed',
+      payload: expect.objectContaining({
+        runId: dependent.id,
+        dependsOnRunId: prerequisite.id,
+      }),
+    }))
+  })
 })

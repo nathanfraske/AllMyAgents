@@ -499,24 +499,11 @@ describe('SessionManager mid-turn steering', () => {
     expect([...journal.replay(0)].some((event) => event.kind === 'session/input' && (event.payload as { text?: string }).text === 'correct the instruction')).toBe(true)
   })
 
-  it('withholds operator text from a live bus turn and delivers it exactly once on a fresh turn', async () => {
+  it('steers operator text into a live bus turn and promotes only work after the accepted provider boundary', async () => {
     let busy = true
-    let sessionsUnderTest: SessionManager | undefined
-    const mutationResults: Array<Awaited<ReturnType<SessionManager['overseerControl']>>> = []
     const { sessions, journal, store, record, steer, runTurn } = build({
       isBusy: () => busy,
-      runTurn: async (_spec, text, origin) => {
-        expect(origin).toBe('operator')
-        expect(text).toBe('configure the manager now')
-        mutationResults.push(await sessionsUnderTest!.overseerControl('s1', {
-          operation: 'configure_github_automation',
-          githubScope: 'session',
-          sessionId: 's1',
-          githubCapabilities: ['pull_requests'],
-        }))
-      },
     })
-    sessionsUnderTest = sessions
     record.isOverseer = true
     store.upsert(record)
     ;(sessions as unknown as { busTurnSessions: Set<string> }).busTurnSessions.add('s1')
@@ -530,26 +517,33 @@ describe('SessionManager mid-turn steering', () => {
     expect(deniedDuringBusTurn).toMatchObject({ ok: false })
     await sessions.send('s1', 'configure the manager now')
 
-    expect(steer).not.toHaveBeenCalled()
+    expect(steer).toHaveBeenCalledOnce()
+    expect(steer).toHaveBeenCalledWith('s1', 'configure the manager now')
     expect(journal.since(0)).toContainEqual(expect.objectContaining({
       sessionId: 's1',
-      kind: 'session/operator-turn-deferred',
-      payload: expect.objectContaining({ delivery: 'fresh-turn-only' }),
+      kind: 'session/turn-origin',
+      payload: expect.objectContaining({
+        origin: 'operator',
+        priorOrigin: 'bus',
+        authorityBoundary: 'provider-steer-accepted',
+      }),
     }))
     expect(
       journal.since(0).filter((event) =>
         event.kind === 'session/steered' &&
         (event.payload as { text?: string }).text === 'configure the manager now'
       ),
-    ).toHaveLength(0)
-    expect(store.all().find((candidate) => candidate.id === 's1')?.deferredOperatorTurns).toHaveLength(1)
-    expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(false)
+    ).toHaveLength(1)
+    expect(store.all().find((candidate) => candidate.id === 's1')?.deferredOperatorTurns).toBeUndefined()
+    expect(sessions.isAutoApproved('s1', 'claude/tool', { toolName: 'Bash' })).toBe(true)
 
-    busy = false
-    sessions.applyLifecycle({ t: 'turnCompleted', sessionId: 's1', wseq: 1 })
-    await vi.waitFor(() => expect(runTurn).toHaveBeenCalledOnce())
-    await vi.waitFor(() => expect(mutationResults).toEqual([expect.objectContaining({ ok: true })]))
-    expect(runTurn.mock.calls[0]![1]).toBe('configure the manager now')
+    const acceptedAfterBoundary = await sessions.overseerControl('s1', {
+      operation: 'configure_github_automation',
+      githubScope: 'session',
+      sessionId: 's1',
+      githubCapabilities: ['pull_requests'],
+    })
+    expect(acceptedAfterBoundary).toMatchObject({ ok: true })
 
     expect(
       journal.since(0).filter((event) =>
@@ -561,19 +555,26 @@ describe('SessionManager mid-turn steering', () => {
       journal.since(0).filter((event) => event.kind === 'github-automation/policy-configured'),
     ).toHaveLength(1)
     expect(journal.lastTurnOrigin('s1')).toBe('operator')
-    expect(record.deferredOperatorTurns).toBeUndefined()
+    busy = false
+    sessions.applyLifecycle({ t: 'turnCompleted', sessionId: 's1', wseq: 1 })
+    await settle()
+    expect(runTurn).not.toHaveBeenCalled()
   })
 
-  it('coalesces rapid deferred corrections into one chronological operator turn', async () => {
+  it('coalesces rapid corrections into one fresh operator turn when provider steering loses the idle race', async () => {
     let busy = true
-    const { sessions, journal, store, record, steer, runTurn } = build({ isBusy: () => busy })
+    const { sessions, journal, store, record, steer, runTurn } = build({
+      isBusy: () => busy,
+      steer: async () => { throw new Error('no active turn to steer') },
+    })
     ;(sessions as unknown as { busTurnSessions: Set<string> }).busTurnSessions.add('s1')
 
     await sessions.send('s1', 'Continue the old target.')
     await sessions.send('s1', 'Correction: stop the old target and implement the cutover.')
 
-    expect(steer).not.toHaveBeenCalled()
+    expect(steer).toHaveBeenCalledTimes(2)
     expect(store.all().find((candidate) => candidate.id === 's1')?.deferredOperatorTurns).toHaveLength(2)
+    expect(journal.since(0).filter((event) => event.kind === 'session/operator-turn-deferred')).toHaveLength(2)
     const deferredIds = record.deferredOperatorTurns!.map((turn) => turn.id)
     busy = false
     sessions.applyLifecycle({ t: 'turnCompleted', sessionId: 's1', wseq: 1 })

@@ -60,7 +60,8 @@ Codex model availability is discovered from each managed profile's provider-main
 hub projects only bounded picker metadata; provider instructions remain private to the profile. A preview
 model is offered only on accounts whose own catalog advertises it. This is how Cyber access such as
 `gpt-daybreak-blue-latest` (Daybreak Blue) can appear on one Codex account without being assumed available
-on every Codex account.
+on every Codex account. The same boundary applies to rollout-gated `gpt-6-astra`: an updated Codex client
+can expose GPT-6 Astra on an entitled account without placing it in the fallback catalog for other accounts.
 
 ## Still roadmap
 

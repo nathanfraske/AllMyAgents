@@ -5,6 +5,24 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.40-alpha.44 — 2026-09-04
+
+This release adds account-scoped GPT-6 Astra support, lets direct operator guidance steer an active manager turn
+without losing its authority, and makes remote build prerequisites explicit, durable, and reusable.
+
+[Full v0.1.40-alpha.44 release notes](docs/releases/v0.1.40-alpha.44.md)
+
+- The bundled Codex client moves to 0.153.3 and exposes `gpt-6-astra` only when that exact signed-in account's
+  provider catalog advertises it; accounts outside the rollout do not receive a synthetic model option.
+- Astra uses the live account catalog's default, effort, and speed metadata and remains compatible with other
+  account-only models such as Daybreak Blue.
+- Authenticated operator input now steers an in-flight teammate-origin turn immediately. Operator authority begins
+  only after the provider accepts that steer; an idle-boundary race falls back to one durable fresh operator turn.
+- Remote `start_run` accepts reviewed `required_tools` and `setup_command` declarations. Missing dependencies run
+  as a separate durable prerequisite with their own logs and terminal state before the original command begins.
+- Failed setup or a still-missing dependency prevents the requested build from starting, while successful setup is
+  re-inspected and recorded through the ordinary run plane rather than hidden as a side effect.
+
 ## v0.1.39-alpha.43 — 2026-09-01
 
 This release makes long-lived chat history bounded at the database query itself and adds checkout/run visibility

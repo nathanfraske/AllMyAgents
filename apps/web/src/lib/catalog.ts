@@ -1,5 +1,5 @@
 // Plain-TS port of t3code's model/option-descriptor contract (no Effect).
-// Codex models + params are from the live `codex app-server` model/list (codex 0.145).
+// Codex models + params are from the live `codex app-server` model/list (Codex 0.153.3).
 import type { ProfileModelInfo } from './api'
 
 export type Provider = 'claude' | 'codex'
@@ -90,8 +90,16 @@ export const MODELS: ModelDef[] = [
   { slug: 'gpt-5.3-codex-spark', name: 'GPT-5.3 Codex Spark', shortName: '5.3 Codex Spark', provider: 'codex', descriptors: [effort(BASE_EFFORT, 'high')] },
 ]
 
+// Rollout-gated models deliberately do not live in MODELS: that array is the fallback shown when a
+// profile has no provider catalog, so putting Astra there would falsely grant it to every Codex account.
+// This metadata is applied only after the account's own model/list cache advertises the exact slug.
+const ACCOUNT_SCOPED_CODEX_MODEL_METADATA: ModelDef[] = [
+  { slug: 'gpt-6-astra', name: 'GPT-6 Astra', shortName: '6 Astra', provider: 'codex', isNew: true, descriptors: [effort(FULL_EFFORT, 'medium'), SPEED] },
+]
+
 function accountModel(model: ProfileModelInfo): ModelDef {
-  const baseline = MODELS.find((item) => item.provider === 'codex' && item.slug === model.slug)
+  const baseline = [...MODELS, ...ACCOUNT_SCOPED_CODEX_MODEL_METADATA]
+    .find((item) => item.provider === 'codex' && item.slug === model.slug)
   const descriptors: OptionDescriptor[] = []
   if (model.supportedEfforts.length > 0) {
     descriptors.push(effort(model.supportedEfforts, model.defaultEffort ?? model.supportedEfforts[0] ?? 'medium'))

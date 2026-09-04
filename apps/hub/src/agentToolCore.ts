@@ -326,7 +326,8 @@ export interface AgentServices {
       timeoutMs?: number
       environment?: Record<string, string>
       workingDirectory?: string
-      remote?: { deviceId: string; rootId: string; command: string; cwd?: string }
+      dependsOnRunId?: string
+      remote?: { deviceId: string; rootId: string; command: string; cwd?: string; requiredTools?: string[] }
     },
   ): Awaitable<{ ok: boolean; run?: DurableRun; error?: string }>
   /** Inspect scoped durable runs and optionally read bounded stdout/stderr pages. */
@@ -786,10 +787,14 @@ const assignChildTask = defineTool({
   },
 })
 
+const REMOTE_DEVELOPER_TOOLS = [
+  'git', 'node', 'npm', 'python3', 'docker', 'gcc', 'make', 'rustc', 'cargo', 'rustup', 'just', 'pnpm', 'zig', 'cmake',
+] as const
+
 const startRun = defineTool({
   name: 'start_run',
   description:
-    'Project managers and the application Overseer: start a durable local or explicitly granted remote build/test/lint/benchmark/deploy/custom run. The hub captures source provenance, returns a stable run id, retains bounded logs and exact terminal state, and never blindly retries an outcome-unknown command. Local runs serialize on their checkout or working directory. Granted remote runs are concurrent by default; give only commands that must serialize the same explicit resource name (for example gpu or port-8080).',
+    'Project managers and the application Overseer: start a durable local or explicitly granted remote build/test/lint/benchmark/deploy/custom run. For remote work, name required_tools. The hub checks them before launch; when any are absent, provide the project\'s exact reviewed setup_command and the hub records that setup as its own durable prerequisite, then automatically queues the requested run behind its successful completion and verifies the tools again. Missing dependencies are therefore an action to provision, not a blocker to merely report. The hub captures source provenance, returns stable run ids, retains bounded logs and exact terminal state, and never blindly retries an outcome-unknown command. Local runs serialize on their checkout or working directory. Granted remote runs are concurrent by default; give only commands that must serialize the same explicit resource name (for example gpu or port-8080).',
   schema: {
     kind: z.enum(['build', 'test', 'lint', 'benchmark', 'deploy', 'custom']),
     executable: z.string().min(1).max(1_000).optional().describe('local target only: one executable; shell composition is not accepted'),
@@ -808,6 +813,11 @@ const startRun = defineTool({
     remote_root_id: z.string().min(1).max(128).optional().describe('remote target: an explicitly granted root id'),
     remote_command: z.string().min(1).max(32_000).optional().describe('remote target: command interpreted by that root environment'),
     remote_cwd: z.string().max(4_096).optional().describe('remote target: relative directory beneath the granted root'),
+    required_tools: z.array(z.enum(REMOTE_DEVELOPER_TOOLS)).max(15).optional()
+      .describe('remote target: developer commands that must exist before the requested command starts'),
+    setup_command: z.string().min(1).max(32_000).optional()
+      .describe('remote target: exact reviewed project setup recipe; used only when required_tools are missing and recorded as a separate durable prerequisite run'),
+    setup_timeout_ms: z.number().int().min(1_000).max(6 * 60 * 60 * 1_000).optional(),
   },
   run: async (args, { identity, services }) => {
     if (!services.startRun) return 'Run not started: this hub does not support durable runs.'
@@ -823,6 +833,12 @@ const startRun = defineTool({
     }
     if (args.working_directory !== undefined && args.target_session !== undefined) {
       return 'Run not started: working_directory and target_session are mutually exclusive.'
+    }
+    if (!remoteRequested && (args.required_tools?.length || args.setup_command || args.setup_timeout_ms)) {
+      return 'Run not started: required_tools, setup_command, and setup_timeout_ms are remote-run fields.'
+    }
+    if (args.setup_command && !args.required_tools?.length) {
+      return 'Run not started: setup_command requires at least one required_tools entry so provisioning has an explicit postcondition.'
     }
     if (!remoteRequested && !args.executable) {
       return 'Run not started: executable is required for a local run.'
@@ -847,6 +863,47 @@ const startRun = defineTool({
     if (!remoteRequested && !await services.requireApproval(identity, 'allmyagents/run', approvalPayload)) {
       return 'Run not started: the operator declined the durable command (or the request timed out).'
     }
+    const requiredTools = [...new Set(args.required_tools ?? [])]
+    let missingTools: string[] = []
+    let prerequisiteRun: DurableRun | undefined
+    if (remoteRequested && requiredTools.length) {
+      const inspection = await services.remoteExecute(identity.sessionId, args.remote_device_id!, {
+        op: 'inspect',
+        rootId: args.remote_root_id!,
+      })
+      if (!inspection.ok || !inspection.environment) {
+        return `Run not started: dependency preflight could not inspect the remote environment: ${inspection.error ?? 'unknown error'}. ${remoteTelemetry(inspection)}`
+      }
+      missingTools = requiredTools.filter((tool) => inspection.environment?.tools[tool] !== true)
+      if (missingTools.length && !args.setup_command) {
+        return [
+          `Run not started: remote dependencies are missing: ${missingTools.join(', ')}.`,
+          'Do not report this inventory result as the project blocker. Find the project\'s reviewed setup recipe (or reviewed bootstrap recipe) and call start_run again with that exact setup_command; the hub will provision it durably, queue this run behind it, and verify the tools before launch.',
+          remoteTelemetry(inspection),
+        ].join(' ')
+      }
+      if (missingTools.length) {
+        const setup = await services.startRun(identity.sessionId, {
+          targetSessionId: args.target_session,
+          kind: 'custom',
+          executable: '(remote shell)',
+          args: [],
+          resources: ['dependency-provisioning'],
+          timeoutMs: args.setup_timeout_ms,
+          remote: {
+            deviceId: args.remote_device_id!,
+            rootId: args.remote_root_id!,
+            command: args.setup_command!,
+            cwd: args.remote_cwd,
+          },
+        })
+        if (!setup.ok || !setup.run) {
+          return `Run not started: dependencies are missing (${missingTools.join(', ')}) and the durable setup recipe could not start: ${setup.error ?? 'unknown error'}`
+        }
+        prerequisiteRun = setup.run
+      }
+    }
+
     const result = await services.startRun(identity.sessionId, {
       targetSessionId: args.target_session,
       kind: args.kind,
@@ -856,15 +913,27 @@ const startRun = defineTool({
       timeoutMs: args.timeout_ms,
       environment: args.environment,
       workingDirectory: args.working_directory,
+      ...(prerequisiteRun ? { dependsOnRunId: prerequisiteRun.id } : {}),
       ...(remoteRequested ? {
         remote: {
           deviceId: args.remote_device_id!,
           rootId: args.remote_root_id!,
           command: args.remote_command!,
           cwd: args.remote_cwd,
+          ...(requiredTools.length ? { requiredTools } : {}),
         },
       } : {}),
     })
+    if (prerequisiteRun && (!result.ok || !result.run)) {
+      return `Dependency setup run ${prerequisiteRun.id} started, but the requested dependent run could not be queued: ${result.error ?? 'unknown error'}`
+    }
+    if (prerequisiteRun && result.run) {
+      return JSON.stringify({
+        dependencyPreflight: { required: requiredTools, missing: missingTools },
+        provisioningRun: prerequisiteRun,
+        run: result.run,
+      }, null, 2)
+    }
     return result.ok && result.run
       ? JSON.stringify(result.run, null, 2)
       : `Run not started: ${result.error ?? 'unknown error'}`
@@ -1298,10 +1367,11 @@ const remotePing = defineTool({
 
 const remoteInspectEnvironment = defineTool({
   name: 'remote_inspect_environment',
-  description: 'Inspect bounded non-secret facts about the host or WSL environment behind an explicitly granted remote root, including OS, CPU, memory, shell, and common developer tools.',
+  description: 'Inspect bounded non-secret facts about the host or WSL environment behind an explicitly granted remote root, including OS, CPU, memory, shell, and common developer tools. Supply required_tools for a build-oriented dependency verdict and an actionable durable-provisioning instruction.',
   schema: {
     device_id: z.string().min(1).max(256),
     root_id: z.string().min(1).max(128),
+    required_tools: z.array(z.enum(REMOTE_DEVELOPER_TOOLS)).max(15).optional(),
   },
   run: async (args, { identity, services }) => {
     const result = await services.remoteExecute(identity.sessionId, args.device_id, { op: 'inspect', rootId: args.root_id })
@@ -1311,10 +1381,18 @@ const remoteInspectEnvironment = defineTool({
       const detail = environment.toolDetails?.[tool]
       return `${tool}=${available ? 'yes' : 'no'}${detail?.path ? ` (${detail.path}; ${detail.source})` : ''}`
     }).join(', ')
+    const requiredTools = [...new Set(args.required_tools ?? [])]
+    const missingTools = requiredTools.filter((tool) => environment.tools[tool] !== true)
+    const dependencyVerdict = requiredTools.length
+      ? missingTools.length
+        ? `dependency preflight: missing ${missingTools.join(', ')}. This is provisionable, not a terminal blocker: pass required_tools and the project\'s exact reviewed setup_command to start_run so setup is durable and the requested run waits for it.`
+        : `dependency preflight: ready; all required tools are available (${requiredTools.join(', ')})`
+      : undefined
     return [
       `${environment.label} — ${environment.platform}/${environment.arch}; ${environment.release}`,
       `hostname ${environment.hostname}; shell ${environment.shell}; ${environment.cpuCount} CPUs; ${environment.totalMemoryBytes} memory bytes`,
       `tools: ${tools || 'none detected'}`,
+      ...(dependencyVerdict ? [dependencyVerdict] : []),
       remoteTelemetry(result),
     ].join('\n')
   },

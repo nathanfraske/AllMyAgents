@@ -42,6 +42,19 @@ requires the target session's exact device/root terminal grant. That grant is st
 the remote capability, including on a teammate-triggered turn, so `start_run` does not ask for another execution
 approval. Local host runs keep their normal execution-approval and bus-turn boundaries.
 
+Remote callers can declare the command's common prerequisites with `required_tools`. The hub inspects the
+selected environment before admitting the run. When tools are missing, it returns the exact missing set and an
+actionable request for the project's reviewed setup recipe instead of letting a manager turn inventory into a
+terminal blocker. Supplying that exact recipe as `setup_command` creates a separate durable provisioning run,
+queues the requested run behind it, and records both ids. The dependent command starts only after provisioning
+succeeds and a second target-side inspection proves every declared tool is available. Failed provisioning or a
+failed postcondition terminates the dependent run without executing its command.
+
+This is intentionally not an implicit package installer. Projects remain the authority for versions and setup
+semantics through their checked-in bootstrap script, Justfile, or equivalent reviewed recipe; AllMyAgents owns
+the lease, logs, ordering, timeout, and evidence. `setup_timeout_ms` controls that prerequisite independently,
+and the reserved `dependency-provisioning` resource prevents package-manager races on the same remote root.
+
 A project manager always runs against a visible project checkout. The application Overseer may additionally
 start local ad-hoc work by supplying an explicit absolute `working_directory`, or use a granted remote root
 without inventing a project association. The hub resolves and records the canonical local directory, leases it

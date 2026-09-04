@@ -207,8 +207,9 @@ describe('readCodexProfileModelCatalog', () => {
     const profile = tmpProfile('codex-preview', 'codex')
     fs.writeFileSync(path.join(profile.dir, 'models_cache.json'), JSON.stringify({
       data: [{
-        id: 'preview-model',
-        displayName: 'Preview Model',
+        id: 'gpt-6-astra',
+        model: 'gpt-6-astra',
+        displayName: 'GPT-6-Astra',
         hidden: false,
         defaultReasoningEffort: 'high',
         supportedReasoningEfforts: [{ reasoningEffort: 'medium' }, { reasoningEffort: 'high' }],
@@ -218,8 +219,8 @@ describe('readCodexProfileModelCatalog', () => {
     }))
 
     expect(readCodexProfileModelCatalog(profile.dir)?.models).toEqual([{
-      slug: 'preview-model',
-      name: 'Preview Model',
+      slug: 'gpt-6-astra',
+      name: 'GPT-6-Astra',
       supportedEfforts: ['medium', 'high'],
       defaultEffort: 'high',
       serviceTiers: [{ id: 'priority', name: 'Fast' }],

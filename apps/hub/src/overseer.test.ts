@@ -159,13 +159,13 @@ describe('application Overseer authority', () => {
 
     expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
       isOverseer: true,
-      overseerCapabilityVersion: 24,
+      overseerCapabilityVersion: 25,
       permissionMode: 'full',
       permissionModeOperatorOverride: true,
       role: 'Application Overseer',
     })
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
-      'Overseer capability manifest version 24',
+      'Overseer capability manifest version 25',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'mcp__allmyagents__overseer_control',
@@ -205,7 +205,7 @@ describe('application Overseer authority', () => {
     expect(upgrades()).toHaveLength(1)
     expect(upgrades()[0]?.payload).toMatchObject({
       fromVersion: 6,
-      toVersion: 24,
+      toVersion: 25,
       conversationPreserved: true,
       tools: expect.arrayContaining([
         'overseer_control',
@@ -1414,6 +1414,90 @@ describe('application Overseer authority', () => {
           architecture: process.arch,
         },
       },
+    })
+  })
+
+  it('does not execute a remote durable command when its declared tools are still missing', async () => {
+    const h = harness()
+    h.seed({
+      id: 'overseer',
+      isOverseer: true,
+      permissionMode: 'full',
+      remoteDeviceGrants: [{
+        siteId: 'risk-box',
+        rootIds: ['root-home'],
+        capabilities: ['read', 'terminal'],
+      }],
+    })
+    const execute = vi.fn(async (_siteId: string, action: { op: string }) => {
+      if (action.op === 'inspect') {
+        return {
+          ok: true,
+          environment: {
+            environmentId: 'host',
+            kind: 'host' as const,
+            label: 'RISC-V host',
+            platform: 'linux',
+            arch: 'riscv64',
+            hostname: 'Frask-Risk-Box',
+            release: 'Bianbu 4.0.1',
+            shell: '/bin/sh',
+            cpuCount: 16,
+            totalMemoryBytes: 15 * 1024 * 1024 * 1024,
+            tools: { git: true, cargo: false, rustc: false },
+          },
+        }
+      }
+      return { ok: true, stdout: 'must not execute', exitCode: 0 }
+    })
+    h.sessions.setRemoteDeviceController({
+      capabilities: vi.fn(async () => ({
+        enabled: true,
+        platform: 'linux',
+        arch: 'riscv64',
+        hostname: 'Frask-Risk-Box',
+        activeTransport: 'myownmesh-rpc',
+        environments: [{
+          id: 'host', kind: 'host', label: 'RISC-V host', platform: 'linux', arch: 'riscv64', shell: '/bin/sh',
+        }],
+        roots: [{
+          id: 'root-home', label: 'Home', path: '/home/admini', read: true, write: true, terminal: true,
+        }],
+      })),
+      execute,
+    } as unknown as RemoteDeviceController)
+    const controller = new DurableRunController(
+      new DurableRunStore(h.journal.db),
+      h.journal,
+      path.join(h.root, 'remote-dependency-run-logs'),
+    )
+    h.sessions.setDurableRunController(controller)
+    controller.activate()
+    cleanups.push(() => controller.shutdown())
+
+    const started = await h.sessions.managerStartRun('overseer', {
+      kind: 'build',
+      executable: '(remote shell)',
+      args: [],
+      remote: {
+        deviceId: 'risk-box',
+        rootId: 'root-home',
+        command: 'cargo build --release',
+        requiredTools: ['git', 'cargo', 'rustc'],
+      },
+    })
+
+    expect(started.ok).toBe(true)
+    await vi.waitFor(() => expect(controller.store.get(started.run!.id)?.state).toBe('failed'))
+    expect(execute).toHaveBeenCalledTimes(1)
+    expect(execute).toHaveBeenCalledWith(
+      'risk-box',
+      expect.objectContaining({ op: 'inspect', rootId: 'root-home' }),
+      expect.objectContaining({ durableRunId: started.run!.id }),
+    )
+    expect(controller.store.get(started.run!.id)).toMatchObject({
+      state: 'failed',
+      error: expect.stringMatching(/still unavailable after preflight: cargo, rustc/u),
     })
   })
 

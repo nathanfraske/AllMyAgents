@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { MemoryStore } from './memory.js'
 import { PracticeStore } from './practices.js'
@@ -33,6 +33,7 @@ function makeHarness(opts: {
   childStatus?: { ok: boolean; summary?: string; error?: string }
   manageTeam?: { ok: boolean; summary?: string; error?: string }
   manageChild?: { ok: boolean; summary?: string; error?: string }
+  remoteExecute?: NonNullable<AgentServices['remoteExecute']>
 } = {}): Harness {
   const memory = new MemoryStore(new Database(':memory:'))
   const practices = new PracticeStore(new Database(':memory:'))
@@ -56,7 +57,7 @@ function makeHarness(opts: {
       return [{ type: 'text', text: 'browser unavailable in test' }]
     },
     remoteDevices: async () => [],
-    remoteExecute: async () => ({ ok: false, error: 'remote device unavailable in test' }),
+    remoteExecute: opts.remoteExecute ?? (async () => ({ ok: false, error: 'remote device unavailable in test' })),
     remotePrepareProjectLocation: async () => ({ ok: false, error: 'remote project preparation unavailable in test' }),
     overseerControl: async () => ({ ok: false, error: 'not the overseer in test' }),
     memory,
@@ -223,6 +224,102 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
     expect(h.approvals).toEqual([])
     expect(received).toMatchObject({
       remote: { deviceId: 'site-a', rootId: 'root-a', command: 'npm test' },
+    })
+  })
+
+  it('turns a missing remote dependency into an actionable reviewed-setup instruction', async () => {
+    const h = makeHarness({
+      remoteExecute: async () => ({
+        ok: true,
+        environment: {
+          environmentId: 'host',
+          kind: 'host',
+          label: 'testbed',
+          platform: 'linux',
+          arch: 'riscv64',
+          hostname: 'runner',
+          release: 'test',
+          shell: '/bin/sh',
+          cpuCount: 8,
+          totalMemoryBytes: 1024,
+          tools: { git: true, cargo: false },
+        },
+      }),
+    })
+    const startRun = vi.fn(async () => ({ ok: true, run: { id: 'unexpected' } as never }))
+    h.services.startRun = startRun
+
+    const out = await runAgentTool('start_run', {
+      kind: 'build',
+      remote_device_id: 'site-a',
+      remote_root_id: 'root-a',
+      remote_command: 'cargo build',
+      required_tools: ['git', 'cargo'],
+    }, { identity: idA, services: h.services })
+
+    expect(out).toMatch(/remote dependencies are missing: cargo/i)
+    expect(out).toMatch(/setup_command/i)
+    expect(out).toMatch(/do not report this inventory result as the project blocker/i)
+    expect(startRun).not.toHaveBeenCalled()
+  })
+
+  it('queues a remote build behind its durable reviewed setup recipe and carries the postcondition', async () => {
+    const h = makeHarness({
+      remoteExecute: async () => ({
+        ok: true,
+        environment: {
+          environmentId: 'host',
+          kind: 'host',
+          label: 'testbed',
+          platform: 'linux',
+          arch: 'riscv64',
+          hostname: 'runner',
+          release: 'test',
+          shell: '/bin/sh',
+          cpuCount: 8,
+          totalMemoryBytes: 1024,
+          tools: { git: true, cargo: false, rustc: false },
+        },
+      }),
+    })
+    const inputs: Parameters<NonNullable<AgentServices['startRun']>>[1][] = []
+    h.services.startRun = async (_sessionId, input) => {
+      inputs.push(input)
+      return { ok: true, run: { id: inputs.length === 1 ? 'setup-run' : 'build-run' } as never }
+    }
+
+    const out = await runAgentTool('start_run', {
+      kind: 'build',
+      remote_device_id: 'site-a',
+      remote_root_id: 'root-a',
+      remote_command: 'cargo build --release',
+      required_tools: ['git', 'cargo', 'rustc'],
+      setup_command: './scripts/bootstrap-headless.sh',
+      setup_timeout_ms: 3_600_000,
+    }, { identity: idA, services: h.services })
+
+    expect(out).toContain('setup-run')
+    expect(out).toContain('build-run')
+    expect(inputs).toHaveLength(2)
+    expect(inputs[0]).toMatchObject({
+      kind: 'custom',
+      resources: ['dependency-provisioning'],
+      timeoutMs: 3_600_000,
+      remote: {
+        deviceId: 'site-a',
+        rootId: 'root-a',
+        command: './scripts/bootstrap-headless.sh',
+      },
+    })
+    expect(inputs[1]).toMatchObject({
+      kind: 'build',
+      dependsOnRunId: 'setup-run',
+      remote: {
+        deviceId: 'site-a',
+        rootId: 'root-a',
+        command: 'cargo build --release',
+        requiredTools: ['git', 'cargo', 'rustc'],
+      },
     })
   })
 
