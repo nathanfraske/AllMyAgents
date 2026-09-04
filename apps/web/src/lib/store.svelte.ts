@@ -1007,17 +1007,22 @@ export class HubStore {
    * turn), so re-reading /api/sessions is the honest fix rather than trusting event reconstruction.
    *
    * Status is also reconciled because a renderer/socket gap must not leave an active hub session labelled
-   * Ready indefinitely. The request-start sequence fence below prevents a slow HTTP response from
-   * overwriting a newer status event that arrived while the request was in flight.
+   * Ready indefinitely. Account-scoped model catalogs are reconciled in the same bounded pass: Codex may
+   * refresh models_cache.json only after its first turn, which can happen after the one-time bootstrap
+   * profile read. Without this overlay, newly entitled rollout models stay invisible until a page reload.
+   * The request-start sequence fence below prevents a slow HTTP response from overwriting a newer status
+   * event that arrived while the request was in flight.
    */
   async syncRecordsFromHub(): Promise<void> {
     if (this.statusReconcileInFlight) return
     this.statusReconcileInFlight = true
     const requestStartedAtSeq = this.lastSeq
     try {
-      const rows = await boundedHubRead('Hub status refresh', (signal) =>
-        api.sessions(signal),
-      ).catch(() => null)
+      const [rows, profiles] = await Promise.all([
+        boundedHubRead('Hub status refresh', (signal) => api.sessions(signal)).catch(() => null),
+        boundedHubRead('Account catalog refresh', (signal) => api.profiles(signal)).catch(() => null),
+      ])
+      if (Array.isArray(profiles)) this.replaceLocalProfiles(profiles)
       if (!Array.isArray(rows)) return
       for (const rec of rows) {
         const v = this.sessions[rec.id]
