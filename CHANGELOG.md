@@ -5,6 +5,19 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.41-alpha.45 — 2026-09-04
+
+This hotfix makes newly discovered account-scoped models appear without reloading the application.
+
+[Full v0.1.41-alpha.45 release notes](docs/releases/v0.1.41-alpha.45.md)
+
+- Local account catalogs now refresh alongside the existing authoritative session reconciliation pass.
+- A Codex account whose provider writes `gpt-6-astra` after the UI has already started receives GPT-6 Astra in
+  its model picker within the normal bounded refresh interval rather than only after a full page reload.
+- Catalog refresh remains account-scoped: models discovered for one account are not copied into other accounts.
+- Catalog and roster reads run concurrently and retain independent timeout/failure handling, so model discovery
+  cannot delay or erase live session-status reconciliation.
+
 ## v0.1.40-alpha.44 — 2026-09-04
 
 This release adds account-scoped GPT-6 Astra support, lets direct operator guidance steer an active manager turn
