@@ -56,6 +56,7 @@ import {
   type QuestionOutcome,
 } from './questions.js'
 import type { SessionIdentity } from './identity.js'
+import { answerCodexQuestion, isCodexUserInputRequest, type CodexQuestionContext } from './codexQuestions.js'
 import type { DangerFlags } from './types.js'
 import { evaluateApprovalWithProvider } from './approvalHelper.js'
 import {
@@ -747,7 +748,7 @@ export class AgentWorker {
         // fail-closed decline. Mirrors InProcessExecutor's codex approval (executor.ts): attribute by
         // threadId→sessionId, request `codex/<method>`, accept/decline on the operator's decision. Under
         // `full` (approvalPolicy 'never') the app-server won't ask, so this only fires under safe/edits.
-        (method, params) => this.codexApproval(method, params),
+        (method, params, context) => this.codexApproval(method, params, context),
         wsl,
       )
       client = created
@@ -760,7 +761,16 @@ export class AgentWorker {
    *  in-process does), relays an operator approval, and maps the decision. A HubUnavailableError past the
    *  transient bound declines (safe terminal — the codex approval protocol has no retryable-text channel;
    *  the agent can retry the action). */
-  private async codexApproval(method: string, params: unknown): Promise<Record<string, unknown>> {
+  private async codexApproval(method: string, params: unknown, context?: CodexQuestionContext): Promise<Record<string, unknown>> {
+    if (isCodexUserInputRequest(method)) {
+      const threadId = (params as { threadId?: string } | null)?.threadId
+      const sessionId = threadId ? this.sessionForThread(threadId) : undefined
+      return answerCodexQuestion(sessionId, params, context, {
+        request: async request => await this.relayRpc('questions.request', request) as QuestionOutcome,
+        abort: (id, sessionId) => this.relayRpc('questions.abort', { id, sessionId }),
+        rejected: () => { if (sessionId) this.emitEvent(sessionId, 'question/rejected', { provider: 'codex', code: 'invalid-or-unavailable-question' }) },
+      })
+    }
     // Our own agent MCP server needs no prompt (parity with the Claude AUTO_ALLOW set).
     if (isOwnAgentServerRequest(method, params)) return codexRequestResult(method, true, params)
     const threadId = (params as { threadId?: string } | null)?.threadId

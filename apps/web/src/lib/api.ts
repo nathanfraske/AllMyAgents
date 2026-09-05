@@ -437,6 +437,9 @@ export interface QuestionOption {
 }
 
 export interface QuestionPrompt {
+  id?: string
+  allowFreeText?: boolean
+  isSecret?: boolean
   question: string
   header: string
   options: QuestionOption[]
@@ -444,6 +447,8 @@ export interface QuestionPrompt {
 }
 
 export interface QuestionRecord {
+  provider?: 'claude' | 'codex'
+  blocking?: boolean
   id: string
   sessionId: string
   questions: QuestionPrompt[]

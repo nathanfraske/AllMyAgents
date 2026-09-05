@@ -10,6 +10,7 @@
     open = false,
     onopen = () => {},
     onclose = () => {},
+    showTab = true,
   }: {
     sessionId: string
     agentLabel: string
@@ -17,6 +18,7 @@
     open?: boolean
     onopen?: () => void
     onclose?: () => void
+    showTab?: boolean
   } = $props()
 
   let enabled = $state(false)
@@ -163,6 +165,7 @@
 </script>
 
 {#if !open}
+  {#if showTab}
   <button
     class="tab"
     data-overseer-anchor="browser"
@@ -174,6 +177,7 @@
     <span class="tab-icon"><Icon name="globe" size={13} /></span>
     <span class="tab-label">Browser {enabled ? 'on' : 'off'}</span>
   </button>
+  {/if}
 {:else}
   <aside class="panel" data-overseer-anchor="browser" aria-label="Browser">
     <header>

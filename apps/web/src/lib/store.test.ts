@@ -1490,6 +1490,22 @@ describe('provider context compaction lifecycle', () => {
     })
   })
 
+  it('shows native Codex browsing immediately and updates one attributed row on completion', () => {
+    seed('codex-chat', { provider: 'codex' })
+    const item = { id: 'browse-1', type: 'webSearch', query: '', action: { type: 'openPage', url: 'https://example.com/docs' } }
+    apply(evt({ seq: 1, sessionId: 'codex-chat', kind: 'codex/item/started', payload: { item } }))
+    expect(store.sessions['codex-chat']!.items).toMatchObject([
+      { toolName: 'webSearch', status: 'started', toolInput: item.action },
+    ])
+    apply(evt({ seq: 2, sessionId: 'codex-chat', kind: 'codex/item/completed', payload: { item } }))
+    expect(store.sessions['codex-chat']!.items).toHaveLength(1)
+    expect(store.sessions['codex-chat']!.items[0]?.status).toBe('completed')
+    apply(evt({ seq: 3, sessionId: 'codex-chat', kind: 'codex/subagent/item/started', payload: { item, agentThreadId: 'child' } }))
+    apply(evt({ seq: 4, sessionId: 'codex-chat', kind: 'codex/subagent/item/completed', payload: { item, agentThreadId: 'child' } }))
+    expect(store.sessions['codex-chat']!.items.filter(row => row.toolName === 'webSearch')).toHaveLength(2)
+    expect(store.sessions['codex-chat']!.items.find(row => row.agentId === 'child')).toMatchObject({ status: 'completed', toolInput: item.action })
+  })
+
   it('shows Codex contextCompaction from item start through completion without duplicating the deprecated notification', () => {
     seed('codex-chat', { provider: 'codex' })
     apply(evt({

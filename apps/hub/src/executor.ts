@@ -33,6 +33,7 @@ import {
   type WorkerSessionSpec,
 } from './workerProtocol.js'
 import { checkWriteScope } from './writeScope.js'
+import { answerCodexQuestion, isCodexUserInputRequest } from './codexQuestions.js'
 import type { AttachmentMeta } from './attachments.js'
 import { ASK_RESTART_INTERRUPT_MARGIN_MS } from './restartHandshake.js'
 import {
@@ -470,7 +471,16 @@ export class InProcessExecutor implements Executor {
             this.h.failTurn(sessionId, codexTurnErrorMessage(payload))
           }
         },
-        async (method, params) => {
+        async (method, params, context) => {
+          if (isCodexUserInputRequest(method)) {
+            const threadId = (params as { threadId?: string } | null)?.threadId
+            const sessionId = threadId ? this.sessionIdForThread(threadId) : undefined
+            return answerCodexQuestion(sessionId, params, context, {
+              request: request => this.services.questions.request(request),
+              abort: (id, sessionId) => this.services.questions.abort(id, sessionId),
+              rejected: () => this.h.journal(sessionId ?? null, 'question/rejected', { provider: 'codex', code: 'invalid-or-unavailable-question' }),
+            })
+          }
           // Our own agent MCP server needs no prompt (parity with the Claude AUTO_ALLOW set).
           if (isOwnAgentServerRequest(method, params)) return codexRequestResult(method, true, params)
           const threadId = (params as { threadId?: string } | null)?.threadId

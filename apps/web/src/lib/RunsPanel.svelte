@@ -1,12 +1,15 @@
 <script lang="ts">
   import { api, type DurableRunInfo, type DurableRunLogPage } from './api'
   import Icon from './Icon.svelte'
+  import { store } from './store.svelte'
 
-  let { sessionId, open = false, onopen = () => {}, onclose = () => {} }: {
+  let { sessionId, open = false, onopen = () => {}, onclose = () => {}, showTab = true, onactivecount = () => {} }: {
     sessionId: string
     open?: boolean
     onopen?: () => void
     onclose?: () => void
+    showTab?: boolean
+    onactivecount?: (count: number) => void
   } = $props()
 
   let runs = $state<DurableRunInfo[]>([])
@@ -15,10 +18,30 @@
   let completedOpen = $state(false)
   let error = $state('')
   let now = $state(Date.now())
+  let refreshGeneration = 0
 
   const active = $derived(runs.filter((run) => run.state === 'queued' || run.state === 'running'))
   const completed = $derived(runs.filter((run) => run.state !== 'queued' && run.state !== 'running'))
   const selectedRun = $derived(runs.find((run) => run.id === selected) ?? null)
+  const activeGroups = $derived.by(() => {
+    const groups = new Map<string, DurableRunInfo[]>()
+    for (const run of active) {
+      const list = groups.get(run.projectId) ?? []
+      list.push(run)
+      groups.set(run.projectId, list)
+    }
+    return [...groups].map(([projectId, runs]) => ({ projectId, name: projectName(projectId), runs }))
+      .sort((a, b) => a.name.localeCompare(b.name))
+  })
+  $effect(() => { onactivecount(active.length) })
+
+  function projectName(id: string): string {
+    return store.projects.find(project => project.id === id)?.name ?? (id === '__allmyagents_application__' ? 'Application' : id)
+  }
+
+  function owner(run: DurableRunInfo): string {
+    return run.actorLabel || store.sessions[run.actorSessionId]?.record.title || run.actorSessionId.slice(0, 8)
+  }
 
   $effect(() => {
     const id = sessionId
@@ -34,30 +57,37 @@
   })
 
   $effect(() => {
-    if (!open && !active.length) return
+    if (!open) return
     const timer = setInterval(() => { now = Date.now() }, 1_000)
     return () => clearInterval(timer)
   })
 
   async function refresh(id = sessionId): Promise<void> {
+    const generation = ++refreshGeneration
     try {
-      const result = await api.durableRuns(id, { limit: 50 })
-      if (id !== sessionId) return
-      runs = Array.isArray(result?.runs) ? result.runs : []
+      // A long-running build must not disappear behind 50 newer completed commands.
+      const [live, recent] = await Promise.all([
+        api.durableRuns(id, { states: ['queued', 'running'], limit: 200 }),
+        api.durableRuns(id, { states: ['succeeded', 'failed', 'cancelled', 'outcome_unknown'], limit: 50 }),
+      ])
+      if (id !== sessionId || generation !== refreshGeneration) return
+      // Terminal state wins if completion fell between the two bounded snapshots.
+      runs = [...new Map([...(live.runs ?? []), ...(recent.runs ?? [])].map(run => [run.id, run])).values()]
       error = ''
       if (selected && !runs.some((run) => run.id === selected)) selected = ''
       if (selected && (selectedRun?.state === 'queued' || selectedRun?.state === 'running')) void loadLogs(selected)
     } catch (cause) {
-      if (id === sessionId) error = cause instanceof Error ? cause.message : 'Could not load project runs.'
+      if (id === sessionId && generation === refreshGeneration) error = cause instanceof Error ? cause.message : 'Could not load project runs.'
     }
   }
 
   async function loadLogs(runId: string): Promise<void> {
+    const id = sessionId
     try {
-      const result = await api.durableRun(sessionId, runId)
-      if (selected === runId) logs = result.logs
+      const result = await api.durableRun(id, runId)
+      if (id === sessionId && selected === runId) logs = result.logs
     } catch (cause) {
-      error = cause instanceof Error ? cause.message : 'Could not load retained logs.'
+      if (id === sessionId && selected === runId) error = cause instanceof Error ? cause.message : 'Could not load retained logs.'
     }
   }
 
@@ -77,9 +107,11 @@
 </script>
 
 {#if !open}
+  {#if showTab}
   <button class="tab" class:hot={active.length > 0} onclick={onopen} title="Open project runs" aria-label="Open project runs">
-    <Icon name="terminal" size={13} /><span>Runs{active.length ? ` · ${active.length}` : ''}</span>
+    <Icon name="terminal" size={13} />{#if active.length}<span>{active.length}</span>{/if}
   </button>
+  {/if}
 {:else}
   <aside class="panel" aria-label="Project runs">
     <header>
@@ -90,13 +122,18 @@
     {#if error}<p class="error" role="alert">{error}</p>{/if}
     <div class="list">
       {#if !active.length}<p class="empty">No commands are running.</p>{/if}
-      {#each active as run (run.id)}
+      {#each activeGroups as group (group.projectId)}
+      <section class="project-group" aria-label={group.name}>
+      <h3>{group.name} <span>{group.runs.length} active</span></h3>
+      {#each group.runs as run (run.id)}
         <button class="run active" onclick={() => choose(run)}>
           <span class="runhead"><b>{run.kind}</b><span>{run.state} · {elapsed(run)}</span></span>
           <span class="command">{run.commandSummary}</span>
-          <span class="owner">{run.actorLabel} · {run.executionTarget.kind}</span>
+          <span class="owner" title={run.actorSessionId}>{owner(run)} · {run.executionTarget.kind}</span>
         </button>
         {#if selected === run.id}<div class="detail"><pre>{logs ? `${logs.stdout}${logs.stderr}` : 'Loading retained output…'}</pre></div>{/if}
+      {/each}
+      </section>
       {/each}
       <button class="completed-toggle" onclick={() => (completedOpen = !completedOpen)}>
         <Icon name={completedOpen ? 'chevron-down' : 'chevron-right'} size={12} /> Completed · {completed.length}
@@ -106,7 +143,7 @@
           <button class="run" class:bad={run.state === 'failed' || run.state === 'outcome_unknown'} onclick={() => choose(run)}>
             <span class="runhead"><b>{run.kind}</b><span>{run.state} · {elapsed(run)}</span></span>
             <span class="command">{run.commandSummary}</span>
-            <span class="owner">{run.actorLabel}{run.exitCode != null ? ` · exit ${run.exitCode}` : ''}</span>
+            <span class="owner" title={run.actorSessionId}>{projectName(run.projectId)} · {owner(run)}{run.exitCode != null ? ` · exit ${run.exitCode}` : ''}</span>
           </button>
           {#if selected === run.id}<div class="detail"><pre>{logs ? `${logs.stdout}${logs.stderr}` : 'Loading retained output…'}</pre></div>{/if}
         {/each}
@@ -128,6 +165,9 @@
   .count { margin-left: auto; color: var(--muted); font-size: .7rem; }
   .close { padding: 0 .2rem; color: inherit; opacity: .7; }
   .list { flex: 1; min-height: 0; overflow: auto; padding: .5rem; }
+  .project-group + .project-group { margin-top: .8rem; }
+  h3 { display: flex; justify-content: space-between; gap: .5rem; margin: .3rem 0 .4rem; font-size: .76rem; }
+  h3 span { flex: none; color: var(--muted); font-size: .68rem; font-weight: 400; }
   .run { width: 100%; display: flex; flex-direction: column; gap: .18rem; margin-bottom: .35rem; padding: .48rem;
     text-align: left; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-2); }
   .run.active { border-color: color-mix(in srgb, var(--good) 45%, var(--border)); }

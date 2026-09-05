@@ -46,6 +46,7 @@
   import { findModel, defaultModelFor } from './catalog'
   import { settings } from './settings.svelte'
   import { onDestroy, tick, untrack } from 'svelte'
+  import { on } from 'svelte/events'
   import { composerAutoGrow } from './composerAutoGrow'
   import {
     loadComposerDrafts,
@@ -356,6 +357,20 @@
   }
   let sidePanelFor = $state('')
   let sidePanel = $state<ThreadSidePanel | null>(null)
+  let panelAgentCounts = $state({ total: 0, running: 0, failed: 0, stalled: 0 })
+  let panelActiveRuns = $state(0)
+  const panelTabs = $derived([
+    ...(panelAgentCounts.total ? [{ id: 'agents' as const, icon: 'users', label: 'Agents',
+      title: 'Show the agents this chat spawned', count: panelAgentCounts.running,
+      warning: panelAgentCounts.failed > 0 || panelAgentCounts.stalled > 0 }] : []),
+    ...(!view?.draft ? [
+      { id: 'browser' as const, icon: 'globe', label: 'Browser', title: 'Open isolated browser controls', count: 0, warning: false },
+      // cwd-only checkouts (including normal in-project managers) need GitHub/diff access too. The
+      // endpoint validates whether this is a git checkout and reports a useful error when it is not.
+      { id: 'diff' as const, icon: 'git-compare', label: 'GitHub / Diff', title: 'Open GitHub and working diff', count: 0, warning: false },
+      { id: 'runs' as const, icon: 'terminal', label: 'Runs', title: 'Open project runs', count: panelActiveRuns, warning: false },
+    ] : []),
+  ])
   $effect(() => {
     if (!sid || sid === sidePanelFor) return
     sidePanelFor = sid
@@ -551,6 +566,8 @@
   $effect(() => {
     const currentSession = view?.record.id
     const currentIds = questions.map((question) => question.id)
+    const providers = new Set(questions.map(question => question.provider === 'codex' ? 'Codex' : 'Claude'))
+    const questionProvider = providers.size === 1 ? [...providers][0] : 'agents'
     if (currentSession !== questionArrivalSession) {
       questionArrivalSession = currentSession
       if (currentIds.length === 0) {
@@ -558,8 +575,8 @@
       } else {
         announceQuestionArrival(
           currentIds.length === 1
-            ? 'One pending question from Claude.'
-            : `${currentIds.length} pending questions from Claude.`
+            ? `One pending question from ${questionProvider}.`
+            : `${currentIds.length} pending questions from ${questionProvider}.`
         )
       }
     } else {
@@ -571,8 +588,8 @@
       if (arrived > 0) {
         announceQuestionArrival(
           arrived === 1
-            ? `New question from Claude. ${currentIds.length} pending.`
-            : `${arrived} new questions from Claude. ${currentIds.length} pending.`
+            ? `New question from ${questionProvider}. ${currentIds.length} pending.`
+            : `${arrived} new questions from ${questionProvider}. ${currentIds.length} pending.`
         )
       } else if (currentIds.length < previousQuestionIds.length) {
         // Removal is not an arrival. Clear stale count text without replacing it with another message.
@@ -838,7 +855,9 @@
   }
 
   function applyScrollIntent(deltaY: number): void {
-    if (!scroller || !Number.isFinite(deltaY)) return
+    // Once detached, the actual scroll event reattaches at the bottom. Do not force layout on every
+    // wheel/touch sample while reading older history (a touchpad can emit many samples per frame).
+    if (!scroller || !stick || !Number.isFinite(deltaY) || deltaY === 0) return
     const m = {
       scrollTop: scroller.scrollTop,
       scrollHeight: scroller.scrollHeight,
@@ -859,6 +878,15 @@
         : 1
     applyScrollIntent(event.deltaY * unit)
   }
+
+  $effect(() => {
+    if (!scroller) return
+    // Svelte's declarative onwheel is non-passive (unlike its touch handlers). We only observe intent,
+    // never cancel scrolling. A blocking listener makes Chromium wait for the UI thread before moving
+    // the viewport, so history/render work delays every wheel gesture while native scrollbar drags work.
+    // Keep the early live-edge guard, but let the compositor scroll without waiting for cancellation.
+    return on(scroller, 'wheel', onWheelIntent, { passive: true })
+  })
 
   function onTouchStart(event: TouchEvent): void {
     lastTouchClientY = event.touches[0]?.clientY ?? null
@@ -1500,6 +1528,19 @@
   <div class="thread-container" class:composer-only={composerOnly}>
     <div class="thread-body">
       <div class="conversation" data-composer-height-container>
+  {#if !composerOnly}
+    <nav class="panel-tabs" aria-label="Chat side panels">
+      {#each panelTabs as tab (tab.id)}
+        <button class="panel-tab" class:hot={tab.count > 0} class:warning={tab.warning}
+          class:selected={sidePanel === tab.id} title={tab.title} aria-label={tab.title}
+          aria-expanded={sidePanel === tab.id} onclick={() => setSidePanel(sidePanel === tab.id ? null : tab.id)}>
+          <Icon name={tab.icon} size={14} />
+          {#if tab.count}<span class="panel-tab-count">{tab.count}</span>{/if}
+          <span class="panel-tab-label">{tab.label}</span>
+        </button>
+      {/each}
+    </nav>
+  {/if}
   {#if !composerOnly || peekItems > 0}
   <div
     class="stream scroll"
@@ -1510,7 +1551,6 @@
     aria-label="Conversation transcript"
     bind:this={scroller}
     onscroll={onScroll}
-    onwheel={onWheelIntent}
     ontouchstart={onTouchStart}
     ontouchmove={onTouchMove}
     ontouchend={onTouchEnd}
@@ -1804,6 +1844,8 @@
            transcript. The narrow-pane container query stacks the panel below this conversation. -->
        {#if !composerOnly}
          <AgentPanel
+           showTab={false}
+           oncounts={(counts) => { panelAgentCounts = counts }}
            items={view.items}
            sessionId={view.record.id}
            provider={view.record.provider}
@@ -1813,6 +1855,7 @@
          />
          {#if !isDraft}
            <BrowserPanel
+             showTab={false}
              sessionId={view.record.id}
              agentLabel={browserAgentLabel}
              initialEnabled={view.record.browserEnabled === true}
@@ -1820,15 +1863,16 @@
              onopen={() => setSidePanel('browser')}
              onclose={() => setSidePanel(null)}
            />
-           {#if view.record.repo || view.record.worktree}
              <DiffPanel
+               showTab={false}
                sessionId={view.record.id}
                open={sidePanel === 'diff'}
                onopen={() => setSidePanel('diff')}
                onclose={() => setSidePanel(null)}
              />
-           {/if}
            <RunsPanel
+             showTab={false}
+             onactivecount={(count) => { panelActiveRuns = count }}
              sessionId={view.record.id}
              open={sidePanel === 'runs'}
              onopen={() => setSidePanel('runs')}
@@ -1900,7 +1944,20 @@
     padding: .7rem .8rem; overflow: hidden auto; border-bottom: 1px solid var(--border-subtle);
     background: var(--surface-2); }
   .thread-body { display: flex; width: 100%; height: 100%; min-width: 0; min-height: 0; }
-  .conversation { flex: 1 1 0; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .conversation { position: relative; flex: 1 1 0; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  /* One rail, attached to the conversation rather than the outer pane. Opening any drawer moves this
+     edge automatically, and absent tabs consume no slot. No panel-width arithmetic or resize polling. */
+  .panel-tabs { position: absolute; top: .65rem; right: 0; z-index: 5; display: flex;
+    flex-direction: column; align-items: flex-end; gap: .25rem; }
+  .panel-tab { display: flex; align-items: center; gap: .35rem; padding: .32rem .5rem; min-height: 1.8rem;
+    color: var(--muted); background: var(--surface); border: 1px solid var(--border-strong); border-right: 0;
+    border-radius: 999px 0 0 999px; font-size: .72rem; }
+  .panel-tab:hover, .panel-tab:focus-visible, .panel-tab.selected { color: var(--text); border-color: var(--accent); }
+  .panel-tab.hot { color: var(--ok); }
+  .panel-tab.warning { color: var(--warn); }
+  .panel-tab-label { max-width: 0; overflow: hidden; opacity: 0; white-space: nowrap; }
+  .panel-tab:hover .panel-tab-label, .panel-tab:focus-visible .panel-tab-label { max-width: 8rem; opacity: 1; }
+  .panel-tab-count { font-variant-numeric: tabular-nums; }
   /* Beside the transcript above this width, below it beneath: a 240px useful panel plus a 380px useful
      transcript is the smallest honest side-by-side split. It never overlays the conversation. */
   @container thread-body (max-width: 620px) {

@@ -7,6 +7,7 @@ import type { SessionRecord } from './api'
 const apiMock = vi.hoisted(() => ({
   send: vi.fn(),
   browserStatus: vi.fn(),
+  workspaceDiff: vi.fn(),
 }))
 
 vi.mock('./api', async (original) => {
@@ -61,6 +62,9 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
 
 beforeEach(() => {
   apiMock.send.mockReset().mockResolvedValue({ ok: true })
+  apiMock.workspaceDiff.mockReset().mockResolvedValue({
+    baseRef: 'main', baseCommit: 'base', headCommit: 'head', files: [], untracked: [], patch: '', truncated: false,
+  })
   apiMock.browserStatus.mockReset().mockResolvedValue({
     enabled: false,
     available: true,
@@ -200,6 +204,42 @@ describe('transcript interaction boundaries', () => {
     expect(scrollTop).toBe(240)
   })
 
+  it('keeps Browser, GitHub and Runs in one rail for a cwd-only checkout', async () => {
+    seed()
+    const rendered = render(ThreadView, { props: { sessionId: 'interaction-session' } })
+    const rail = rendered.getByRole('navigation', { name: 'Chat side panels' })
+    expect([...rail.querySelectorAll('button')].map(button => button.getAttribute('aria-label'))).toEqual([
+      'Open isolated browser controls', 'Open GitHub and working diff', 'Open project runs',
+    ])
+    expect(rail.closest('.conversation')).toBeTruthy()
+    await fireEvent.click(rendered.getByRole('button', { name: 'Open GitHub and working diff' }))
+    expect(await rendered.findByRole('complementary', { name: 'Working diff' })).toBeTruthy()
+    expect(rail.querySelectorAll('button')).toHaveLength(3)
+    await fireEvent.click(rendered.getByRole('button', { name: 'Open project runs' }))
+    expect(await rendered.findByRole('complementary', { name: 'Project runs' })).toBeTruthy()
+    expect(rendered.queryByRole('complementary', { name: 'Working diff' })).toBeNull()
+  })
+
+  it('observes wheel intent passively and removes the listener when the pane unmounts', async () => {
+    seed()
+    const add = vi.spyOn(HTMLElement.prototype, 'addEventListener')
+    const remove = vi.spyOn(HTMLElement.prototype, 'removeEventListener')
+    const rendered = render(ThreadView, { props: { sessionId: 'interaction-session' } })
+    const transcript = rendered.getByRole('log', { name: 'Conversation transcript' })
+    await waitFor(() => expect(add.mock.calls.some((args, i) =>
+      add.mock.contexts[i] === transcript && args[0] === 'wheel',
+    )).toBe(true))
+    const calls = add.mock.calls.filter((args, i) => add.mock.contexts[i] === transcript && args[0] === 'wheel')
+    expect(calls).toHaveLength(1)
+    const [, handler, options] = calls[0]!
+    expect(options).toMatchObject({ passive: true })
+    const wheel = new WheelEvent('wheel', { deltaY: -120, cancelable: true, bubbles: true })
+    transcript.dispatchEvent(wheel)
+    expect(wheel.defaultPrevented).toBe(false)
+    rendered.unmount()
+    expect(remove).toHaveBeenCalledWith('wheel', handler, options)
+  })
+
   it('keeps following output when a downward wheel hits the live-edge boundary', async () => {
     const view = seed()
     view.record.isProjectManager = true
@@ -229,6 +269,31 @@ describe('transcript interaction boundaries', () => {
     )
 
     expect(scrollTop).toBe(2_000)
+  })
+
+  it('does not repeatedly measure layout for wheel samples while reading scrollback', async () => {
+    seed()
+    const rendered = render(ThreadView, { props: { sessionId: 'interaction-session' } })
+    const transcript = rendered.getByRole('log')
+    const height = vi.fn(() => 2_000)
+    Object.defineProperties(transcript, {
+      scrollTop: { value: 240, writable: true, configurable: true },
+      scrollHeight: { get: height, configurable: true },
+      clientHeight: { value: 500, configurable: true },
+    })
+    await fireEvent.scroll(transcript)
+    height.mockClear()
+    for (let i = 0; i < 100; i++) {
+      transcript.dispatchEvent(new WheelEvent('wheel', { deltaY: i % 2 ? -10 : 10 }))
+    }
+    expect(height).not.toHaveBeenCalled()
+    // Returning via real native scrolling, not guessed wheel deltas, restores the live-edge latch.
+    transcript.scrollTop = 1_500
+    await fireEvent.scroll(transcript)
+    store.sessions['interaction-session']!.items.push({
+      key: 'after-scrollback', kind: 'assistant', ts: '2026-09-05T00:00:00.000Z', text: 'Latest.',
+    })
+    await waitFor(() => expect(transcript.scrollTop).toBe(2_000))
   })
 
   it('keeps following when streaming grows an existing row without changing the item count', async () => {

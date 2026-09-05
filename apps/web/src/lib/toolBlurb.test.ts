@@ -43,6 +43,16 @@ describe('truncateMiddle', () => {
 })
 
 describe('toolBlurb — Claude tools', () => {
+  it('names native Codex searches and the pages it opens or searches within', () => {
+    expect(toolBlurb(tool('webSearch', { type: 'search', queries: ['first query', 'second query'] }))?.label)
+      .toBe('Search first query · second query')
+    expect(toolBlurb(tool('webSearch', { type: 'openPage', url: 'https://example.com/docs' }))?.title)
+      .toBe('Open https://example.com/docs')
+    expect(toolBlurb(tool('webSearch', { type: 'findInPage', url: 'https://example.com/docs', pattern: 'protocol' }))?.title)
+      .toBe('Find protocol in https://example.com/docs')
+    expect(toolBlurb(tool('mcp:browser_navigate', { arguments: { url: 'https://example.com' } }))?.title)
+      .toBe('https://example.com')
+  })
   it('reads a file by BASENAME, with the full path on hover', () => {
     const b = toolBlurb(tool('Read', { file_path: '/Users/x/proj/apps/web/src/lib/ThreadView.svelte' }))
     expect(b?.label).toBe('ThreadView.svelte')

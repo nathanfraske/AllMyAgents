@@ -33,6 +33,39 @@ const record: QuestionRecord = {
 afterEach(() => cleanup())
 
 describe('QuestionCard', () => {
+  it('renders nonblocking Codex free-text/secret questions and submits ids, not duplicate prompt text', async () => {
+    const onsubmit = vi.fn(async (_answers: Record<string, string>) => {})
+    render(QuestionCard, { props: {
+      record: { ...record, provider: 'codex', blocking: false, questions: [
+        { id: 'mode', question: 'Choose', header: 'Mode', multiSelect: false, allowFreeText: false,
+          options: [{ label: 'Fast', description: '' }] },
+        { id: 'secret', question: 'Choose', header: 'Key', multiSelect: false, allowFreeText: true,
+          isSecret: true, options: [] },
+      ] }, onsubmit, oncancel: vi.fn(),
+    } })
+    expect(screen.getByRole('form', { name: 'Question from Codex 1 of 1' })).toBeTruthy()
+    expect(screen.getByText('Agent can continue while you answer')).toBeTruthy()
+    expect(screen.queryByLabelText('Other')).toBeNull()
+    expect(screen.getByLabelText('Answer')).toHaveProperty('type', 'password')
+    expect(screen.getByLabelText('Fast')).toHaveProperty('checked', false)
+    await fireEvent.click(screen.getByLabelText('Fast'))
+    await fireEvent.input(screen.getByLabelText('Answer'), { target: { value: ' secret with spaces ' } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Submit answers' }))
+    expect(onsubmit).toHaveBeenCalledExactlyOnceWith({ mode: 'Fast', secret: ' secret with spaces ' })
+  })
+
+  it('offers Codex custom input only when that question permits it', async () => {
+    const onsubmit = vi.fn(async (_answers: Record<string, string>) => {})
+    render(QuestionCard, { props: {
+      record: { ...record, provider: 'codex', questions: [{ ...record.questions[0]!, id: 'custom', allowFreeText: true }] },
+      onsubmit, oncancel: vi.fn(),
+    } })
+    await fireEvent.click(screen.getByLabelText('Other'))
+    await fireEvent.input(screen.getByLabelText('Other answer'), { target: { value: 'Custom format' } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Submit answers' }))
+    expect(onsubmit).toHaveBeenCalledWith({ custom: 'Custom format' })
+  })
+
   it('renders a distinct answer form with automatic Other and no permission/grant controls', () => {
     render(QuestionCard, { props: { record, onsubmit: vi.fn(), oncancel: vi.fn() } })
 

@@ -1386,6 +1386,7 @@ export class SessionManager {
       }
       case 'questions.request': {
         const a = args as {
+          provider?: 'claude' | 'codex'
           id: string
           sessionId: string
           toolUseId: string
@@ -1402,14 +1403,16 @@ export class SessionManager {
               ? 'manager'
               : 'agent'
           const label = record.title ?? identityOf(record).label
-          const prompt = pending.questions[0]?.question
+          const prompt = pending.provider === 'codex' ? undefined : pending.questions[0]?.question
+          const canContinue = pending.blocking === false
           this.notifications?.publish({
             kind: 'question-required',
             severity: 'warning',
             sourceRole,
             route: 'operator',
-            title: `${label} needs your response`,
-            body: pending.questions.length > 1
+            title: canContinue ? `${label} has a question` : `${label} needs your response`,
+            body: canContinue ? `${label} asked ${pending.questions.length} question(s) and can continue while you answer.`
+              : pending.questions.length > 1
               ? `${label} is waiting for answers to ${pending.questions.length} questions.`
               : prompt || `${label} is waiting for your answer.`,
             sessionId: record.id,
@@ -1972,8 +1975,8 @@ export class SessionManager {
   /**
    * A run handle is intentionally non-blocking, but its owner still needs a continuation when the exact
    * outcome becomes known. Persist one action-required inbox item at the controller's terminal boundary.
-   * If the owner is already turning, leave it queued: the normal active -> idle delivery starts a fresh
-   * bus-origin turn instead of racing a late steer into work that is already finishing.
+   * Offer it to the ordinary live inbox delivery path immediately. That path steers an active turn and
+   * marks delivery only after acknowledgement; if the turn ends first it keeps the notice for idle.
    */
   private reportDurableRunTerminal(run: DurableRun): void {
     const owner = this.sessions.get(run.actorSessionId)
@@ -2035,11 +2038,10 @@ export class SessionManager {
         ownerStatus: owner.status,
       })
     }
-    if (owner.status === 'idle') {
-      setImmediate(() => {
-        if (this.sessions.get(owner.id)?.status === 'idle') this.deliverBus(owner.id)
-      })
-    }
+    // Do not wait for idle before even attempting delivery. A manager can spend an hour doing other
+    // work after starting this run; withholding the outcome creates a stale decision window and then
+    // an unnecessary burst of continuation turns. deliverBus owns origin, preference and race guards.
+    setImmediate(() => this.deliverBus(owner.id))
   }
 
   /** Server-owned integrations are installed after their coordinators are constructed. Keeping them

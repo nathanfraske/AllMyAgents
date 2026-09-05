@@ -92,6 +92,19 @@ beforeEach(() => {
 afterEach(() => cleanup())
 
 describe('ThreadView question lifecycle', () => {
+  it('announces Codex questions with the correct provider and keeps id-keyed answers through submission', async () => {
+    apiMock.answerQuestion.mockResolvedValue({ ok: true })
+    seed()
+    store.questions = [{ ...question, provider: 'codex', blocking: false,
+      questions: [{ ...question.questions[0]!, id: 'format', allowFreeText: false }] }]
+    const { container } = render(ThreadView, { props: { sessionId: 's1' } })
+    expect(container.querySelector('.question-arrival')?.textContent).toBe('One pending question from Codex.')
+    await fireEvent.click(screen.getByLabelText('Summary'))
+    await fireEvent.click(screen.getByRole('button', { name: 'Submit answers' }))
+    expect(apiMock.answerQuestion).toHaveBeenCalledWith('q1', { format: 'Summary' })
+    await waitFor(() => expect(store.questions).toHaveLength(0))
+  })
+
   it('removes a successfully answered card locally without waiting for a WebSocket refresh', async () => {
     apiMock.answerQuestion.mockResolvedValue({ ok: true })
     const view = seed()
