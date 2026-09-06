@@ -121,11 +121,25 @@ export function toolBlurb(item: ThreadItem): ToolBlurb | undefined {
     const p = firstString(objOf(input), ['path', 'file', 'filename'])
     return p ? { label: `edit ${truncateMiddle(basename(p))}`, title: p } : undefined
   }
+  if (name === 'webSearch') {
+    const action = objOf(input)
+    const url = firstString(action, ['url'])
+    const queries = Array.isArray(action?.queries) ? action.queries.filter((q): q is string => typeof q === 'string').slice(0, 8) : []
+    const query = queries.length ? queries.join(' · ') : firstString(action, ['query'])
+    const pattern = firstString(action, ['pattern'])
+    const description = action?.type === 'openPage' ? `Open ${url ?? 'web page'}`
+      : action?.type === 'findInPage' ? `Find ${pattern ?? 'text'} in ${url ?? 'web page'}`
+        : query ? `Search ${query}` : 'Researching the web'
+    return { label: clipEnd(description), title: description }
+  }
   // Codex prefixes AllMyAgents calls with `mcp:`. Keep collapsed step summaries readable instead of
   // treating a protocol identifier as a useful subject line.
   if (name.startsWith('mcp:')) {
     const activity = agentActivity(item)
-    return activity ? { label: activity.label, title: name } : undefined
+    const args = objOf(objOf(input)?.arguments) ?? objOf(input)
+    const subject = firstString(args, ['url', 'query'])
+    if (activity) return { label: activity.label, title: subject ?? name }
+    return subject ? { label: clipEnd(subject), title: subject } : undefined
   }
 
   const obj = objOf(input)

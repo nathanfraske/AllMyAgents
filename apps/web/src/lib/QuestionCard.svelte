@@ -18,16 +18,21 @@
   } = $props()
 
   const OTHER = -1
+  const codex = $derived(record.provider === 'codex')
+  const providerLabel = $derived(codex ? 'Codex' : 'Claude')
   const valid = $derived(
     record.status === 'pending' &&
       record.questions.length >= 1 &&
-      record.questions.length <= 4 &&
+      record.questions.length <= (codex ? 8 : 4) &&
+      new Set(record.questions.map(question => question.id ?? question.question)).size === record.questions.length &&
       record.questions.every(
         (question) =>
           question.question.length > 0 &&
           question.header.length > 0 &&
-          question.options.length >= 2 &&
-          question.options.length <= 4
+          (codex
+            ? Boolean(question.id) && question.options.length <= 12 &&
+              (question.options.length > 0 || question.allowFreeText === true)
+            : question.options.length >= 2 && question.options.length <= 4)
       )
   )
   let choices = $state<number[][]>([])
@@ -90,7 +95,7 @@
     const entries: Array<[string, string]> = []
     for (let questionIndex = 0; questionIndex < record.questions.length; questionIndex += 1) {
       const question = record.questions[questionIndex]!
-      const selectedOptions = choices[questionIndex] ?? []
+      const selectedOptions = question.options.length === 0 ? [OTHER] : choices[questionIndex] ?? []
       if (selectedOptions.length === 0) {
         localError = 'Answer every question before submitting.'
         return
@@ -98,8 +103,9 @@
       const values: string[] = []
       for (const optionIndex of selectedOptions) {
         if (optionIndex === OTHER) {
-          const custom = otherText[questionIndex]?.trim() ?? ''
-          if (!custom) {
+          const raw = otherText[questionIndex] ?? ''
+          const custom = question.isSecret ? raw : raw.trim()
+          if (!custom.trim()) {
             localError = 'Enter an Other answer before submitting.'
             return
           }
@@ -113,7 +119,7 @@
           values.push(label)
         }
       }
-      entries.push([question.question, values.join(', ')])
+      entries.push([question.id ?? question.question, values.join(', ')])
     }
 
     busy = true
@@ -150,11 +156,12 @@
   <form
     class="question-card"
     onsubmit={submit}
-    aria-label={`Question from Claude ${ordinal} of ${total}`}
+    aria-label={`Question from ${providerLabel} ${ordinal} of ${total}`}
   >
     <div class="question-top">
-      <span class="question-label">QUESTION FROM CLAUDE</span>
+      <span class="question-label">QUESTION FROM {providerLabel.toUpperCase()}</span>
       <span class="question-count">{record.questions.length} {record.questions.length === 1 ? 'question' : 'questions'}</span>
+      {#if codex && record.blocking === false}<span class="question-count">Agent can continue while you answer</span>{/if}
     </div>
 
     {#each record.questions as question, questionIndex}
@@ -186,6 +193,7 @@
               </span>
             </label>
           {/each}
+          {#if question.allowFreeText !== false && question.options.length > 0}
           <label class:selected={selected(questionIndex, OTHER)} class="option">
             <input
               type={question.multiSelect ? 'checkbox' : 'radio'}
@@ -197,10 +205,12 @@
             />
             <span><strong>Other</strong><small id={descriptionId(questionIndex, OTHER)}>Enter a different answer.</small></span>
           </label>
-          {#if selected(questionIndex, OTHER)}
+          {/if}
+          {#if selected(questionIndex, OTHER) || question.options.length === 0}
             <input
               class="other"
-              aria-label="Other answer"
+              type={question.isSecret ? 'password' : 'text'}
+              aria-label={question.options.length === 0 ? 'Answer' : 'Other answer'}
               value={otherText[questionIndex] ?? ''}
               oninput={(event) =>
                 setOther(questionIndex, (event.currentTarget as HTMLInputElement).value)}

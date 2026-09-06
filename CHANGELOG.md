@@ -5,6 +5,23 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.42-alpha.46 — 2026-09-06
+
+This release improves transcript scrolling, keeps side-panel tabs together, and surfaces agent activity during
+ongoing work instead of deferring it until the next turn.
+
+[Full v0.1.42-alpha.46 release notes](docs/releases/v0.1.42-alpha.46.md)
+
+- Transcript wheel listeners are passive, and detached scrolling avoids repeated synchronous layout reads.
+- Browser, GitHub/Diff, Runs and native-agent tabs share a rail that follows the edge of the open drawer.
+- Runs use a compact icon with an active count, group active work by project, and identify the owning agent.
+- Durable run completions attempt delivery during active turns, retaining exactly-once receipts and idle fallback.
+- Codex web research activity shows queries and destinations, including work performed by native sub-agents.
+- Codex questions use their native id-keyed protocol, including free text, secret and nonblocking questions;
+  Claude retains its separate question and answer format.
+- SQLite can release spare WAL allocation after a safe reset; active snapshots and durable history are preserved.
+- The intermittent history-load timeout remains under investigation and is not claimed fixed by this release.
+
 ## v0.1.41-alpha.45 — 2026-09-04
 
 This hotfix makes newly discovered account-scoped models appear without reloading the application.

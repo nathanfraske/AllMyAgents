@@ -3579,6 +3579,7 @@ export class HubStore {
         this.applyCodexSubagentTurnCompleted(view, ts, payload)
         break
       case 'codex/subagent/item/started':
+        this.applyCodexWebActivity(view, ts, payload, 'started', (payload as { agentThreadId?: string }).agentThreadId)
         // A nested spawn must appear as soon as Codex announces it. Other in-progress child items wait
         // for item/completed, matching the root transcript's existing non-streaming tool-card behavior.
         this.applyCodexSpawnItem(view, ts, payload)
@@ -3623,6 +3624,7 @@ export class HubStore {
         break
       }
       case 'codex/item/started':
+        if (this.applyCodexWebActivity(view, ts, payload, 'started')) break
         if (this.applyCodexCompaction(view, ts, payload, 'started')) break
         // A completed collab spawn call only means Codex launched the child. It is never treated as the
         // child completing; real child lifecycle arrives on codex/subagent/turn/* or agentsStates.
@@ -4116,6 +4118,7 @@ export class HubStore {
     const item = (payload as { item?: Record<string, unknown> }).item
     if (!item) return
     const type = item.type as string
+    if (this.applyCodexWebActivity(view, ts, payload, 'completed', agentId)) return
     if (type === 'contextCompaction') {
       this.applyCodexCompaction(view, ts, payload, 'completed')
       return
@@ -4169,6 +4172,22 @@ export class HubStore {
         agentId,
       })
     }
+  }
+
+  private applyCodexWebActivity(view: SessionView, ts: string, payload: unknown, phase: 'started' | 'completed', agentId?: string): boolean {
+    const item = (payload as { item?: Record<string, unknown> }).item
+    if (item?.type !== 'webSearch') return false
+    const key = typeof item.id === 'string' ? `codex:web:${agentId ?? 'root'}:${item.id}` : undefined
+    const fields = {
+      kind: 'tool' as const, ts, toolName: 'webSearch', agentId, key,
+      toolInput: item.action ?? { type: 'search', query: item.query },
+      toolResult: phase === 'completed' && item.results != null ? asText(item.results) : undefined,
+      status: typeof item.status === 'string' ? item.status : phase,
+    }
+    const existing = key ? newestThreadItem(view.items, candidate => candidate.key === key) : undefined
+    if (existing) Object.assign(existing, fields)
+    else this.push(view, fields)
+    return true
   }
 
   private applyCodexCompaction(

@@ -86,6 +86,8 @@ export const JOURNAL_CONDENSE_MAX_DELETE_ROWS = 3_500
 export const JOURNAL_CONDENSE_MAX_TRANSIENT_BYTES = 8 * 1024 * 1024
 /** Resident SQLite target. Exact oversized transcript bytes live in the lossless content-addressed store. */
 export const JOURNAL_SQLITE_TARGET_BYTES = 2 * 1024 * 1024 * 1024
+/** Spare WAL allocation retained after SQLite can safely reset it, not a cap on a live read snapshot. */
+export const JOURNAL_WAL_RETAINED_BYTES = 64 * 1024 * 1024
 /** At 4 KiB pages this reclaims at most 64 MiB per ordinary maintenance cycle. */
 export const JOURNAL_STORAGE_MAX_INCREMENTAL_VACUUM_PAGES = 16_384
 export const JOURNAL_REPLAY_PROTOCOL_VERSION = 1 as const
@@ -301,11 +303,15 @@ export class Journal extends EventEmitter {
   private resolvedApprovalStmt: Database.Statement | undefined
   private questionRecoveryUnknownStmt: Database.Statement | undefined
 
-  constructor(file: string, options: { busyTimeoutMs?: number } = {}) {
+  constructor(file: string, options: { busyTimeoutMs?: number; walRetainedBytes?: number } = {}) {
     super()
     const requestedBusyTimeoutMs = options.busyTimeoutMs ?? 5_000
     if (!Number.isSafeInteger(requestedBusyTimeoutMs) || requestedBusyTimeoutMs < 0 || requestedBusyTimeoutMs > 60_000) {
       throw new Error('journal busy timeout must be a whole number from 0 to 60000 milliseconds')
+    }
+    const walRetainedBytes = options.walRetainedBytes ?? JOURNAL_WAL_RETAINED_BYTES
+    if (!Number.isSafeInteger(walRetainedBytes) || walRetainedBytes < 1024 * 1024 || walRetainedBytes > 1024 * 1024 * 1024) {
+      throw new Error('retained journal WAL allocation must be between 1 MiB and 1 GiB')
     }
     fs.mkdirSync(path.dirname(file), { recursive: true })
     this.payloadBlobs = file === ':memory:'
@@ -342,6 +348,10 @@ export class Journal extends EventEmitter {
     // window of work to lose and a large surface to corrupt. Checkpointing more eagerly keeps the base file
     // close to current, so a damaged WAL costs minutes rather than hours.
     this.db.pragma('wal_autocheckpoint = 256')
+    // SQLite otherwise retains the largest historical WAL forever, even after checkpoint/reset.
+    // Let SQLite trim only reusable space during an ordinary reset; no blocking TRUNCATE checkpoint,
+    // forced reader eviction, extra maintenance worker or loss of an in-flight backup snapshot.
+    this.db.pragma(`journal_size_limit = ${walRetainedBytes}`)
     this.db.exec(
       'CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, session TEXT, kind TEXT NOT NULL, payload TEXT NOT NULL)'
     )

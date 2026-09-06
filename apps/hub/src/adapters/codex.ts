@@ -1,5 +1,7 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { isCodexUserInputRequest, type CodexQuestionContext } from '../codexQuestions.js'
 import path from 'node:path'
 import { createRequire } from 'node:module'
 import { AGENT_MCP_SERVER_NAME, type CodexAgentMcpServerConfig } from '../codexMcpConfig.js'
@@ -49,7 +51,7 @@ function codexEntry(): string | null {
 
 type EventSink = (kind: string, payload: unknown) => void
 
-export type CodexApprovalHandler = (method: string, params: unknown) => Promise<unknown>
+export type CodexApprovalHandler = (method: string, params: unknown, context?: CodexQuestionContext) => Promise<unknown>
 
 /** Codex server-request method for an MCP **elicitation** (a server asking the user), as opposed to the
  *  exec/patch approvals. Codex raises one the first time a thread uses a given MCP server's tool. */
@@ -133,6 +135,8 @@ export function codexRequestResult(
   params?: unknown,
   persist?: import('../types.js').ApprovalPersistence,
 ): Record<string, unknown> {
+  // A permission decision is never an answer to an operator question.
+  if (isCodexUserInputRequest(method)) return { answers: {} }
   if (method === CODEX_ELICITATION_METHOD) {
     if (!approved) return { action: 'decline', content: null }
     return {
@@ -347,6 +351,8 @@ export class CodexClient {
   private readonly subagentSubscriptions = new Set<string>()
   // threadId -> id of the turn currently running on that thread (for steer's expectedTurnId)
   private readonly activeTurns = new Map<string, string>()
+  private questionGeneration = randomUUID()
+  private readonly questionRequests = new Map<number | string, { threadId: unknown; abort: AbortController }>()
   /** Last developer-instruction bytes applied to each root thread. Invalidated after compaction. */
   private readonly developerInstructionsByThread = new Map<string, string>()
   private readonly agentMcpConfigByThread = new Map<string, string>()
@@ -383,6 +389,8 @@ export class CodexClient {
   }
 
   private async startInner(): Promise<void> {
+    // JSON-RPC request ids can be reused by a replacement app-server process.
+    this.questionGeneration = randomUUID()
     // Codex indexes each rollout by absolute path in state_N.sqlite. A profile first used from a Windows
     // packaged app can later appear at the normal Roaming root while that index still points into the
     // package's vanished LocalCache virtualization tree. Repair only exact, contained root relocations
@@ -445,6 +453,8 @@ export class CodexClient {
       const err = new Error(`codex app-server exited (${code})`)
       for (const p of this.pending.values()) p.reject(err)
       this.pending.clear()
+      for (const request of this.questionRequests.values()) request.abort.abort()
+      this.questionRequests.clear()
       this.child = undefined
       this.initPromise = undefined
     })
@@ -477,7 +487,7 @@ export class CodexClient {
 
   private onLine(line: string): void {
     if (!line.trim()) return
-    let msg: { id?: number; method?: string; params?: unknown; result?: unknown; error?: unknown }
+    let msg: { id?: number | string; method?: string; params?: unknown; result?: unknown; error?: unknown }
     try {
       msg = JSON.parse(line) as typeof msg
     } catch {
@@ -495,12 +505,34 @@ export class CodexClient {
       return
     }
     if (isServerRequest) {
-      const id = msg.id as number
+      const id = msg.id as number | string
       const method = msg.method as string
       // Approval requests made inside a sub-agent carry its child thread id too. Route the card through
       // the root chat, but retain `agentThreadId` so the request is still attributable. The response is
       // keyed by JSON-RPC id, so replacing threadId in this local copy does not alter Codex's decision.
       const routed = this.routeThreadPayload(msg.params ?? null)
+      if (isCodexUserInputRequest(method)) {
+        const correlation = (routed.payload ?? {}) as Record<string, unknown>
+        this.onEvent(`codex/request/${method}`, {
+          threadId: correlation.threadId, agentThreadId: correlation.agentThreadId,
+          turnId: correlation.turnId, itemId: correlation.itemId,
+        })
+        // Duplicate JSON-RPC ids are a provider protocol error; don't orphan the first card or
+        // silently replace its response correlation with a new question.
+        if (this.questionRequests.has(id)) return
+        const abort = new AbortController()
+        const threadId = (msg.params as { threadId?: unknown } | null)?.threadId
+        this.questionRequests.set(id, { threadId, abort })
+        const context = { requestId: `${this.questionGeneration}:${typeof id}:${String(id)}`, signal: abort.signal }
+        void Promise.resolve().then(() => this.onApproval?.(method, routed.payload, context) ?? { answers: {} })
+          .catch(() => ({ answers: {} }))
+          .then(result => {
+            if (this.questionRequests.get(id)?.abort !== abort) return
+            this.questionRequests.delete(id)
+            this.send({ id, result })
+          })
+        return
+      }
       this.onEvent(`codex/request/${method}`, routed.payload)
       if (this.onApproval) {
         void this.onApproval(method, routed.payload)
@@ -510,6 +542,14 @@ export class CodexClient {
         this.send({ id, result: codexRequestResult(method, false, msg.params) })
       }
       return
+    }
+    if (msg.method === 'serverRequest/resolved') {
+      const params = msg.params as { requestId?: number | string; threadId?: string } | undefined
+      const request = params?.requestId === undefined ? undefined : this.questionRequests.get(params.requestId)
+      if (request && request.threadId === params?.threadId) {
+        this.questionRequests.delete(params!.requestId!)
+        request.abort.abort()
+      }
     }
     // Track the active turn per thread so steer can target it: turn/started carries the
     // new turn's id (params.turn.id); turn/completed and turn/error end that turn.

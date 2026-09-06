@@ -17,6 +17,8 @@
     open: controlledOpen,
     onopen = () => {},
     onclose = () => {},
+    showTab = true,
+    oncounts = () => {},
   }: {
     items: ThreadItem[]
     sessionId: string
@@ -24,6 +26,8 @@
     open?: boolean
     onopen?: () => void
     onclose?: () => void
+    showTab?: boolean
+    oncounts?: (counts: { total: number; running: number; failed: number; stalled: number }) => void
   } = $props()
 
   let openIds = $state(new Set(loadOpenAgentPanels()))
@@ -49,6 +53,7 @@
   // frozen clock a wedged agent would keep reading "running" until some unrelated event re-rendered it.
   const runs = $derived(buildAgentRuns(items, now))
   const summary = $derived(summarizeRuns(runs))
+  $effect(() => { oncounts(summary) })
   // Newest first: a live agent is what you opened the panel for.
   const ordered = $derived([...runs].reverse())
 
@@ -123,12 +128,14 @@
 
 {#if runs.length}
   {#if !open}
+    {#if showTab}
     <button class="tab" class:live={summary.running > 0} onclick={() => setOpen(true)} title="Show the agents this chat spawned">
       <!-- Worst-status-wins on the collapsed badge: a failure must not be hidden behind a green dot just
            because something else is still running. -->
       <span class="dot {summary.failed ? 'fail' : summary.stalled ? 'stall' : summary.running ? 'run' : 'ok'}"></span>
       {summary.running ? `${summary.running} running` : `${summary.total} agent${summary.total === 1 ? '' : 's'}`}
     </button>
+    {/if}
   {:else}
     <aside class="panel" aria-label="Agents">
       <header class="phead">

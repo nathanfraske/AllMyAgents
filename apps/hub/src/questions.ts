@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import { parseCodexQuestionInput } from './codexQuestions.js'
 import type {
   Journal,
   ResolvedQuestion,
@@ -27,6 +28,10 @@ export interface AskUserQuestionOption {
 }
 
 export interface AskUserQuestion {
+  /** Codex uses ids, not question text, as answer keys. Absent on Claude's strict SDK input. */
+  id?: string
+  allowFreeText?: boolean
+  isSecret?: boolean
   question: string
   header: string
   options: AskUserQuestionOption[]
@@ -70,6 +75,8 @@ export type QuestionStatus =
   | 'interrupted'
 
 export interface QuestionRecord {
+  provider?: 'claude' | 'codex'
+  blocking?: boolean
   id: string
   sessionId: string
   questions: AskUserQuestion[]
@@ -78,6 +85,7 @@ export interface QuestionRecord {
 }
 
 export interface QuestionRequest {
+  provider?: 'claude' | 'codex'
   id: string
   sessionId: string
   toolUseId: string
@@ -231,16 +239,20 @@ export function parseQuestionAnswers(
   value: unknown
 ): QuestionAnswers {
   const answers = object(value, 'answers')
-  const expected = new Set(questions.map((question) => question.question))
+  const expected = new Set(questions.map((question) => question.id ?? question.question))
   const actual = Object.keys(answers)
   if (actual.length !== expected.size || actual.some((question) => !expected.has(question))) {
     throw new QuestionInputError('answers must contain exactly one entry for every question')
   }
   return Object.fromEntries(
-    questions.map((question) => [
-      question.question,
-      boundedString(answers[question.question], `answers[${JSON.stringify(question.question)}]`, MAX_ANSWER),
-    ])
+    questions.map((question) => {
+      const key = question.id ?? question.question
+      const value = boundedString(answers[key], 'question answer', MAX_ANSWER)
+      if (question.allowFreeText === false && !question.options.some(option => option.label === value)) {
+        throw new QuestionInputError('This question requires one of the offered choices')
+      }
+      return [key, value]
+    })
   )
 }
 
@@ -432,7 +444,8 @@ export class QuestionService {
     const sessionId = correlation(request.sessionId, 'session id')
     const toolUseId = correlation(request.toolUseId, 'toolUseID')
     const requestId = correlation(request.requestId, 'requestId')
-    const input = parseAskUserQuestionInput(request.input)
+    const codexInput = request.provider === 'codex' ? parseCodexQuestionInput(request.input) : undefined
+    const input = codexInput ?? parseAskUserQuestionInput(request.input)
     const digest = questionDigest(input)
     const correlationDigest = questionCorrelationDigest(sessionId, toolUseId, requestId)
     const existing = this.pendingMap.get(id)
@@ -473,6 +486,7 @@ export class QuestionService {
       questions: input.questions,
       status: 'pending',
       createdAt: new Date().toISOString(),
+      ...(codexInput ? { provider: 'codex' as const, blocking: codexInput.blocking } : {}),
     }
     let resolve!: (outcome: QuestionOutcome) => void
     const promise = new Promise<QuestionOutcome>((settle) => {

@@ -4,12 +4,43 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
-import { Journal } from './journal.js'
+import { Journal, JOURNAL_WAL_RETAINED_BYTES } from './journal.js'
 import { JOURNAL_BLOB_KEY } from './journalBlobStore.js'
 
 describe('journal wseq — Phase 2 additions', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-jrnl-'))
   afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }))
+
+  it('bounds reusable WAL allocation without breaking pinned readers or removing durable events', () => {
+    const file = path.join(tmp, 'bounded-wal.db')
+    const bound = 1024 * 1024
+    const journal = new Journal(file, { walRetainedBytes: bound })
+    const reader = new Database(file, { readonly: true })
+    try {
+      expect(journal.db.pragma('journal_size_limit', { simple: true })).toBe(bound)
+      journal.append('s', 'session/input', { text: 'before snapshot' })
+      reader.exec('BEGIN')
+      expect(reader.prepare('SELECT COUNT(*) FROM events').pluck().get()).toBe(1)
+      journal.db.transaction(() => {
+        for (let i = 0; i < 128; i++) journal.append('s', 'session/input', { text: `${i}:` + 'x'.repeat(32_000) })
+      })()
+      expect(fs.statSync(`${file}-wal`).size).toBeGreaterThan(bound)
+      expect(reader.prepare('SELECT COUNT(*) FROM events').pluck().get()).toBe(1)
+      reader.exec('COMMIT')
+      // Ordinary passive checkpoint and subsequent append reset the WAL once no snapshot needs it.
+      journal.db.pragma('wal_checkpoint(PASSIVE)')
+      journal.append('s', 'session/input', { text: 'after snapshot' })
+      expect(fs.statSync(`${file}-wal`).size).toBeLessThanOrEqual(bound)
+      expect(reader.prepare('SELECT COUNT(*) FROM events').pluck().get()).toBe(130)
+      expect(journal.db.pragma('quick_check', { simple: true })).toBe('ok')
+    } finally {
+      reader.close()
+      journal.db.close()
+    }
+    const reopened = new Journal(file)
+    expect(reopened.db.pragma('journal_size_limit', { simple: true })).toBe(JOURNAL_WAL_RETAINED_BYTES)
+    reopened.db.close()
+  })
 
   it('appendWorker tags wseq; lastJournaledWseq returns the per-session max (0 when none)', () => {
     const j = new Journal(path.join(tmp, 'a.db'))

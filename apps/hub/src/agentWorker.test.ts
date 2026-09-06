@@ -348,6 +348,26 @@ describe('SessionManager.runRelay — hub-side dispatch (mirrors InProcessExecut
     expect(sessions.runRelay('bus.send', { fromSessionId: 'nope', to: { kind: 'session', id: 'x' }, subject: undefined, body: 'hi' })).toEqual({ ok: false, delivered: 0, error: 'unknown sender' })
   })
 
+  it('does not call a nonblocking Codex question a stopped turn or put its private prompt in notifications', () => {
+    const { sessions, questions, notifications } = build()
+    questions.activatePublicOwner()
+    ;(sessions as unknown as { sessions: Map<string, SessionRecord> }).sessions.set('codex-1', {
+      id: 'codex-1', profileId: 'p1', provider: 'codex', cwd: tmp, status: 'active',
+      createdAt: new Date().toISOString(), title: 'Codex agent',
+    })
+    void sessions.runRelay('questions.request', {
+      provider: 'codex', id: 'codex-question', sessionId: 'codex-1', toolUseId: 'item', requestId: 'rpc',
+      input: { threadId: 'thread', turnId: 'turn', itemId: 'item', isBlocking: false,
+        questions: [{ id: 'key', header: 'Key', question: 'Private prompt', isSecret: true }] },
+    })
+    expect(notifications.publish).toHaveBeenCalledWith(expect.objectContaining({
+      title: 'Codex agent has a question',
+      body: 'Codex agent asked 1 question(s) and can continue while you answer.',
+    }))
+    expect(JSON.stringify(notifications.publish.mock.calls)).not.toContain('Private prompt')
+    questions.cancel('codex-question')
+  })
+
   it('an unknown relay method throws (surfaced to the worker as rpcResult.ok:false)', () => {
     const { sessions } = build()
     expect(() => sessions.runRelay('nope.method' as RelayMethod, {})).toThrow(/unknown relay method/)

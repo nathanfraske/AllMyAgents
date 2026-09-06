@@ -1600,8 +1600,9 @@ describe('project manager visibility into its own workers', () => {
     }))
   })
 
-  it('queues a terminal durable result during an active turn and starts one follow-up after idle', async () => {
-    const { sessions, journal, bus, projects, seed, repo, runTurn } = buildHub()
+  it.each([false, true])('delivers an active run outcome exactly once, including a rejected-steer race=%s', async (rejectSteer) => {
+    const { sessions, journal, bus, projects, seed, repo, runTurn, steer } = buildHub()
+    if (rejectSteer) steer.mockRejectedValue(new Error('turn ended before steer admission'))
     const project = projects.create('Deferred run continuation project', repo)
     const manager = seed({ id: 'manager', projectId: project.id, isProjectManager: true, status: 'active' })
     const controller = new DurableRunController(
@@ -1620,17 +1621,23 @@ describe('project manager visibility into its own workers', () => {
     })
     expect(result.ok).toBe(true)
     await vi.waitFor(() => expect(controller.store.get(result.run!.id)?.state).toBe('succeeded'))
+    await vi.waitFor(() => expect(steer).toHaveBeenCalledOnce())
     await new Promise<void>((resolve) => setImmediate(resolve))
 
     expect(runTurn).not.toHaveBeenCalled()
-    expect(bus.pending(manager.id)).toMatchObject([
-      { subject: 'durable run succeeded', wake: true, attentionRequired: true, delivered: false },
-    ])
+    expect(steer.mock.calls[0]).toEqual([manager.id, expect.stringContaining(`Durable build run ${result.run!.id}`)])
+    expect(bus.pending(manager.id)).toHaveLength(rejectSteer ? 1 : 0)
 
     transition(sessions, manager.id, 'idle')
-    await vi.waitFor(() => expect(runTurn).toHaveBeenCalledOnce())
-    expect(runTurn.mock.calls[0]?.[1]).toContain(`Durable build run ${result.run!.id}`)
+    if (rejectSteer) {
+      await vi.waitFor(() => expect(runTurn).toHaveBeenCalledOnce())
+      expect(runTurn.mock.calls[0]?.[1]).toContain(`Durable build run ${result.run!.id}`)
+    } else {
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      expect(runTurn).not.toHaveBeenCalled()
+    }
     expect(bus.pending(manager.id)).toEqual([])
+    expect(sessions.busInbox(manager.id)).toHaveLength(1)
   })
 
   it('starts and inspects a resource-leased run only inside its managed project scope', async () => {

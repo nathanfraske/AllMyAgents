@@ -8,11 +8,13 @@
     open = false,
     onopen = () => {},
     onclose = () => {},
+    showTab = true,
   }: {
     sessionId: string
     open?: boolean
     onopen?: () => void
     onclose?: () => void
+    showTab?: boolean
   } = $props()
 
   let base = $state('')
@@ -55,9 +57,11 @@
 </script>
 
 {#if !open}
+  {#if showTab}
   <button class="tab" onclick={onopen} title="Open working diff" aria-label="Open working diff">
     <Icon name="git-compare" size={13} /><span>Diff</span>
   </button>
+  {/if}
 {:else}
   <aside class="panel" aria-label="Working diff">
     <header>
