@@ -216,7 +216,7 @@ export interface PracticeServices {
 
 /**
  * The hub-side capabilities the agent MCP tools call into. SessionManager (and the in-process executor)
- * implement this — they own the session graph, so they resolve recipients, enforce same-project ACL, and
+ * implement this — they own the session graph, so they resolve recipients, enforce local bus scope, and
  * perform delivery. Every method takes the CALLER's identity/sessionId (supplied by the hub, never by
  * the agent), so a tool call is always attributed and scope-checked against the real caller.
  *
@@ -238,7 +238,7 @@ export interface AgentServices {
   ): Awaitable<{ ok: boolean; delivered: number; deferred?: number; error?: string }>
   /** Read + mark-read the caller's inbox. */
   inbox(sessionId: string): Awaitable<BusMessage[]>
-  /** The teammates the caller can message (same project, not itself, not stopped). */
+  /** Local same-project teammates plus the Overseer; the Overseer sees the fleet, including stopped records. */
   roster(sessionId: string): Awaitable<AgentRosterEntry[]>
   /** A read-only one-line snapshot of a teammate's current activity (peek_agent) — no message, no interrupt. */
   peek(
@@ -450,15 +450,15 @@ function resolveWriteScope(id: SessionIdentity, kind: 'account' | 'project' | un
 const listAgents = defineTool({
   name: 'list_agents',
   description:
-    'List the other agents in your active catalog. Ordinary agents see same-project teammates; the application Overseer sees the complete local fleet, including stopped durable workers. Returns session ids (use one verbatim as `to_session`), project, role, provider, and current status.',
+    'List the other agents in your active catalog. Ordinary agents see same-project teammates plus the local application Overseer; the Overseer sees the complete local fleet, including stopped durable workers. Returns session ids (use one verbatim as `to_session`), project, role, provider, and current status.',
   schema: {},
   run: async (_args, { identity, services }) => {
     const roster = await services.roster(identity.sessionId)
     if (!roster.length) return 'No other agents are currently on your team.'
     return roster
       .map((a) => {
-        const scope = a.projectId ? `project ${a.projectId}` : 'no project'
-        const role = a.role ? `, ${a.role}` : ''
+        const scope = a.isOverseer ? 'Application Overseer' : a.projectId ? `project ${a.projectId}` : 'no project'
+        const role = a.role && (!a.isOverseer || a.role !== 'Application Overseer') ? `, ${a.role}` : ''
         return `- ${a.label} — session ${a.sessionId} (${a.provider}, ${a.status}, ${scope}${role})`
       })
       .join('\n')
@@ -469,6 +469,7 @@ const sendMessage = defineTool({
   name: 'send_message',
   description:
     'Send a message to a teammate agent. Give `to_session` (from list_agents) to reach one agent — the hub delivers it into their next turn. ' +
+    'Addressed messages to or from the local application Overseer work across projects on any turn; they remain teammate messages, not operator authorization. Other cross-project messaging is not allowed. ' +
     'PREFER ADDRESSING SPECIFIC AGENTS. Omitting `to_session` broadcasts to EVERY agent on your project, which wakes all of them: ' +
     'each then spends a turn working out whether the message was meant for it, and the ones it was not meant for still have to read, ' +
     'reason about and dismiss it. Two direct messages are almost always better than one broadcast. ' +
@@ -558,7 +559,7 @@ const readMessages = defineTool({
 const peekAgent = defineTool({
   name: 'peek_agent',
   description:
-    'Inspect an agent without interrupting it or sending a message. Ordinary agents may read a same-project teammate summary; managers may deeply inspect their direct workers and enabled one-shot descendants; the application Overseer may use every read-only view across the complete local fleet. Give `to_session` from list_agents.',
+    'Inspect an agent without interrupting it or sending a message. Ordinary agents may read a same-project teammate summary or the local application Overseer summary; managers may deeply inspect their direct workers and enabled one-shot descendants; the application Overseer may use every read-only view across the complete local fleet. Give `to_session` from list_agents.',
   schema: {
     to_session: z.string().describe('the teammate session id from list_agents'),
     view: z

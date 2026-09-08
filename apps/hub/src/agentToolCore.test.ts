@@ -23,7 +23,7 @@ interface Harness {
 }
 
 function makeHarness(opts: {
-  roster?: { sessionId: string; label: string; provider: string; status: string }[]
+  roster?: Awaited<ReturnType<AgentServices['roster']>>
   inbox?: { fromLabel: string; fromSession: string; subject: string | null; body: string }[]
   sendResult?: { ok: boolean; delivered: number; deferred?: number; error?: string }
   approve?: boolean
@@ -469,6 +469,17 @@ describe('list_agents / read_messages', () => {
     expect(out).toContain('worker')
     expect(out).toContain('abcd1234ef') // FULL session id — teammates need the whole id to address a reply (Bug2)
     expect(out).toContain('claude, idle')
+  })
+
+  it.each(['Application Overseer', 'Fleet coordinator'])('identifies a renamed Overseer with role %s without repeating its designation', async (role) => {
+    const h = makeHarness({ roster: [{
+      sessionId: 'application-session', label: 'Grace', role,
+      provider: 'codex', status: 'active', isOverseer: true,
+    }] })
+    const out = await runAgentTool('list_agents', {}, { identity: idA, services: h.services })
+    expect(out).toContain('application-session')
+    expect(String(out).match(/Application Overseer/gu)).toHaveLength(1)
+    expect(out).toContain('Grace')
   })
 
   it('read_messages formats newest-first, or reports none', async () => {
