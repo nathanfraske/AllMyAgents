@@ -944,7 +944,7 @@ const startRun = defineTool({
 const inspectRuns = defineTool({
   name: 'inspect_runs',
   description:
-    'Project members: read durable runs and retained logs across your project for coordination. Managers and the application Overseer retain start/control authority separately. With run_id, returns that run plus at most 64 KiB from each log stream after the supplied byte cursors; use returned cursors to continue without rereading an enormous log.',
+    'Project members: read durable run summaries and retained logs across your project. With run_id, reads at most 64 KiB per stream after the byte cursors. Use returned cursors; detail=full retrieves exact command/provenance when auditing. Completion is automatically delivered to the starting agent, including during an active turn: do other useful work or yield instead of repeatedly polling unchanged cursors. EOF means caught up with current output, not that the run completed; state is authoritative. Start/control permissions remain separate.',
   schema: {
     run_id: z.string().optional(),
     session_ids: z.array(z.string()).max(64).optional(),
@@ -953,6 +953,7 @@ const inspectRuns = defineTool({
     limit: z.number().int().min(1).max(200).optional(),
     stdout_after: z.number().int().nonnegative().optional(),
     stderr_after: z.number().int().nonnegative().optional(),
+    detail: z.enum(['summary', 'full']).optional().describe('Defaults to compact summary; full returns the exact retained command, provenance and result.'),
   },
   run: async (args, { identity, services }) => {
     if (!services.inspectRuns) return 'Run inspection unavailable: this hub does not support durable runs.'
@@ -965,8 +966,36 @@ const inspectRuns = defineTool({
       stdoutAfter: args.stdout_after,
       stderrAfter: args.stderr_after,
     })
-    return result.ok ? JSON.stringify({ runs: result.runs ?? [], ...(result.logs ? { logs: result.logs } : {}) }, null, 2) :
-      `Run inspection unavailable: ${result.error ?? 'unknown error'}`
+    if (!result.ok) return `Run inspection unavailable: ${result.error ?? 'unknown error'}`
+    const runs = result.runs ?? []
+    const waitingForOutput = !!args.run_id && !!result.logs &&
+      !result.logs.stdout && !result.logs.stderr &&
+      runs.some((run) => run.state === 'queued' || run.state === 'running')
+    return JSON.stringify({
+      runs: args.detail === 'full' ? runs : runs.map((run) => ({
+        id: run.id, projectId: run.projectId, actorSessionId: run.actorSessionId,
+        actorLabel: run.actorLabel, targetSessionId: run.targetSessionId,
+        state: run.state, kind: run.kind, dependsOnRunId: run.dependsOnRunId,
+        startedAt: run.startedAt, completedAt: run.completedAt, timeoutMs: run.timeoutMs,
+        exitCode: run.exitCode, signal: run.signal,
+        error: run.state === 'succeeded' ? undefined : run.error,
+        logsTruncated: run.logsTruncated,
+        ...(!waitingForOutput ? {
+          commandSummary: run.commandSummary, commandSha256: run.commandSha256,
+          executionTarget: run.executionTarget.kind === 'remote'
+            ? { kind: 'remote', siteId: run.executionTarget.siteId, rootId: run.executionTarget.rootId }
+            : { kind: 'local' },
+          platform: run.provenance.platform, architecture: run.provenance.architecture,
+          gitHead: run.provenance.git?.head,
+          sourceManifestSha256: run.provenance.git?.sourceManifestSha256,
+        } : {}),
+      })),
+      ...(result.logs ? { logs: result.logs } : {}),
+      ...(waitingForOutput ? {
+        waitingForOutput: true,
+        nextAction: 'No new output at these cursors. Completion is delivered automatically to the starting agent; do other work or yield rather than poll. Use detail=full for retained provenance.',
+      } : {}),
+    })
   },
 })
 

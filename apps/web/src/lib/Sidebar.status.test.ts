@@ -131,11 +131,22 @@ describe('compact system status indicators', () => {
     render(Sidebar)
 
     const trigger = screen.getByRole('button', { name: 'Journal maintenance: waiting for snapshot' })
+    expect(trigger.classList.contains('warn')).toBe(false)
     await fireEvent.click(trigger)
 
     const popout = screen.getByRole('dialog', { name: 'Journal maintenance' })
     expect(popout.textContent).toContain('current through recovery generation 12')
     expect(popout.textContent).not.toContain('status unavailable')
+  })
+
+  it('does not disguise a missing snapshot or lost worker as an ordinary snapshot wait', async () => {
+    store.journalCompaction = {
+      operationId: 'missing-snapshot', phase: 'deferred', startedAt: '2026-09-09T00:00:00Z',
+      updatedAt: '2026-09-09T00:00:01Z', rowsDeleted: 0, payloadBytesDeleted: 0,
+      detail: 'Deletion deferred: no strong recovery generation covers compaction',
+    }
+    render(Sidebar)
+    expect(screen.getByRole('button', { name: 'Journal maintenance: deferred' }).classList.contains('warn')).toBe(true)
   })
 
   it.each([

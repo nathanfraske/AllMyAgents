@@ -1146,6 +1146,35 @@ describe('journal backup lifecycle', () => {
     }
   })
 
+  it('retries maintenance deferral promptly without falsely clearing degraded protection', async () => {
+    vi.useFakeTimers()
+    const journal = makeJournal(tmp(), 5)
+    const states: unknown[] = []
+    const takeSnapshot = vi.fn()
+      .mockResolvedValueOnce({ ok: false, error: 'verification failed' })
+      .mockResolvedValueOnce({ ok: true, deferred: true })
+      .mockResolvedValueOnce({ ok: true, deferred: true })
+      .mockResolvedValue({ ok: true })
+    const backups = createJournalBackupSupervisor(journal.db, {
+      dir: path.join(tmp(), 'backups'), intervalMs: 6 * 60 * 60_000, deferredRetryMs: 60_000,
+      onStateChange: (state) => states.push(state),
+    }, takeSnapshot)
+    backups.activateStandalone()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(states.at(-1)).toEqual({ status: 'degraded', error: 'verification failed' })
+    await vi.advanceTimersByTimeAsync(6 * 60 * 60_000)
+    expect(takeSnapshot).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(takeSnapshot).toHaveBeenCalledTimes(3)
+    expect(states.at(-1)).toEqual({ status: 'degraded', error: 'verification failed' })
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(takeSnapshot).toHaveBeenCalledTimes(4)
+    expect(states.at(-1)).toEqual({ status: 'active' })
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(takeSnapshot).toHaveBeenCalledTimes(4)
+    await backups.stop()
+  })
+
   it('never overlaps periodic snapshots and clears pending schedule state on stop', async () => {
     vi.useFakeTimers()
     const root = tmp()

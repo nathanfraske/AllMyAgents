@@ -6,11 +6,53 @@ import { AGENT_TOOLS, runAgentTool, type AgentServices } from './agentToolCore.j
 import type { SessionIdentity } from './identity.js'
 import type { BusAddress } from './bus.js'
 import type { DangerFlags } from './types.js'
+import type { DurableRun } from './durableRuns.js'
 
 const SAFE: DangerFlags = { busCanUseRiskyTools: false, autoApprovePractices: false }
 
 const idA: SessionIdentity = { sessionId: 's1', profileId: 'a1', provider: 'codex', projectId: 'p1', label: 'alpha' }
 const idNoProject: SessionIdentity = { sessionId: 's2', profileId: 'a2', provider: 'codex', label: 'beta' }
+
+describe('compact durable run inspection', () => {
+  const run: DurableRun = {
+    id: 'run-1', projectId: 'p1', sessionId: 's1', actorSessionId: 's1', actorLabel: 'manager',
+    targetSessionId: 's1', kind: 'test', state: 'running', executionTarget: { kind: 'local' },
+    executable: 'node', args: ['test'], cwd: 'checkout', commandSummary: 'node test', commandSha256: 'command-hash',
+    resources: ['checkout'], createdAt: '2026-09-09T00:00:00Z', startedAt: '2026-09-09T00:00:01Z',
+    timeoutMs: 600_000, cancelRequested: false, stdoutBytes: 100, stderrBytes: 0, logsTruncated: false,
+    provenance: { version: 1, capturedAt: '2026-09-09T00:00:00Z', platform: 'win32', architecture: 'x64',
+      cwd: 'checkout', commandSha256: 'command-hash', environmentScope: 'execution', environmentSha256: 'env-hash',
+      environmentKeys: ['PATH'], lockfiles: [{ path: 'lockfile', sha256: 'lock-hash' }] },
+  }
+  const logs = { stdout: '', stderr: '', nextStdoutCursor: 100, nextStderrCursor: 0, stdoutComplete: true, stderrComplete: true }
+  it('returns exact cursors/state and automatic-completion guidance without repeating immutable provenance', async () => {
+    const h = makeHarness()
+    h.services.inspectRuns = vi.fn(() => ({ ok: true, runs: [run], logs }))
+    const result = JSON.parse(String(await runAgentTool('inspect_runs', { run_id: run.id, stdout_after: 100 }, { identity: idA, services: h.services })))
+    expect(result.runs[0]).toMatchObject({ id: run.id, state: 'running', timeoutMs: 600_000, projectId: 'p1', actorSessionId: 's1' })
+    expect(result.runs[0]).not.toHaveProperty('provenance')
+    expect(result.logs).toEqual(logs)
+    expect(result.waitingForOutput).toBe(true)
+    expect(result.nextAction).toContain('automatically to the starting agent')
+    expect(h.services.inspectRuns).toHaveBeenCalledWith('s1', expect.objectContaining({ runId: 'run-1', stdoutAfter: 100 }))
+  })
+  it('keeps the complete audit record available explicitly and preserves failure outcomes in summaries', async () => {
+    const h = makeHarness()
+    const failed = { ...run, state: 'outcome_unknown' as const, exitCode: null, error: 'target disconnected', signal: 'SIGTERM' }
+    h.services.inspectRuns = () => ({ ok: true, runs: [failed], logs: { ...logs, stderr: 'last log line' } })
+    const full = JSON.parse(String(await runAgentTool('inspect_runs', { run_id: run.id, detail: 'full' }, { identity: idA, services: h.services })))
+    expect(full.runs).toEqual([failed])
+    const summary = JSON.parse(String(await runAgentTool('inspect_runs', { run_id: run.id }, { identity: idA, services: h.services })))
+    expect(summary.runs[0]).toMatchObject({ state: 'outcome_unknown', exitCode: null, error: 'target disconnected', signal: 'SIGTERM', platform: 'win32' })
+    expect(summary.logs.stderr).toBe('last log line')
+    expect(summary.waitingForOutput).toBeUndefined()
+  })
+  it('does not turn an out-of-project refusal into a summary', async () => {
+    const h = makeHarness()
+    h.services.inspectRuns = () => ({ ok: false, error: 'outside your project run scope' })
+    expect(await runAgentTool('inspect_runs', { run_id: run.id }, { identity: idA, services: h.services })).toContain('outside your project run scope')
+  })
+})
 
 interface Harness {
   services: AgentServices

@@ -203,6 +203,16 @@ export type ItemKind =
   | 'bus'
   | 'compaction'
 
+/** Keep the last painted transcript until a replacement history page succeeds. Live items win by
+ * stable key; the fallback never enters the reducer or supplies status/permissions/cursors. */
+export function displayedThreadItems(view: Pick<SessionView, 'items' | 'historyRefreshFallback'>): ThreadItem[] {
+  if (!view.historyRefreshFallback?.length) return view.items
+  const live = new Map(view.items.map((item) => [item.key, item]))
+  const displayed = view.historyRefreshFallback.map((item) => live.get(item.key) ?? item)
+  const keys = new Set(displayed.map((item) => item.key))
+  return [...displayed, ...view.items.filter((item) => !keys.has(item.key))]
+}
+
 export interface ThreadItem {
   key: string
   kind: ItemKind
@@ -308,6 +318,8 @@ const PRESENTATION_INERT_EVENT_KINDS = new Set([
 export interface SessionView {
   record: SessionRecord
   items: ThreadItem[]
+  /** Presentation-only last frame during a baseline/history refresh; never replay or session authority. */
+  historyRefreshFallback?: ThreadItem[]
   /** Live recency: the timestamp of the most recent event, whatever it was. Drives the row's clock. */
   lastActivity: string
   /**
@@ -888,11 +900,20 @@ export class HubStore {
   }
 
   private installReplayBaseline(baseline: ReplayBaseline): void {
+    const previous = this.sessions
+    const sameHistory = baseline.generation === this.replayGeneration && baseline.highWaterSeq >= this.lastSeq
+    const present = new Set(baseline.sessions.map((record) => record.id))
     const retained = Object.fromEntries(
-      Object.entries(this.sessions).filter(([, view]) => view.draft || view.record.siteId),
+      Object.entries(this.sessions).filter(([id, view]) => view.draft || view.record.siteId || (sameHistory && present.has(id))),
     )
     this.sessions = retained
-    for (const record of baseline.sessions) this.ensure(record)
+    for (const record of baseline.sessions) {
+      const view = this.ensure(record)
+      const old = previous[record.id]
+      if (old && old !== view) {
+        view.historyRefreshFallback = displayedThreadItems(old)
+      }
+    }
     const remoteProjects = this.projects.filter((project) => project.siteId)
     this.projects = [...baseline.projects, ...remoteProjects]
     this.journalCompaction = baseline.journalCompaction
@@ -2493,7 +2514,7 @@ export class HubStore {
         return
       }
       this.ws = null
-      vlog('ws: closed — reconnecting in 1.5s')
+      vlog(`ws: closed (${event.code}${event.reason ? ` ${event.reason.slice(0, 160)}` : ''}) — reconnecting in 1.5s`)
       this.finishReplayPresentation()
       this.markDisconnected()
       this.scheduleReconnect()
@@ -4283,7 +4304,7 @@ export class HubStore {
     return { key, kind: h.kind, ts: h.ts ?? fallbackTs, text: h.text, toolName: h.toolName, toolInput: h.toolInput, toolResult: h.toolResult, toolError: h.toolError, historical: true }
   }
 
-  private installJournalHistoryWindow(view: SessionView, history: ThreadItem[]): void {
+  private installJournalHistoryWindow(view: SessionView, history: ThreadItem[], latest = false): void {
     // The hub bounds every page by row count and encoded bytes. Once a page reaches the renderer, however,
     // it is visible operator state: replacing it on the next upward scroll or evicting its prefix when a
     // live item arrives makes the transcript appear to lose history. Accumulate only the pages the
@@ -4299,6 +4320,9 @@ export class HubStore {
       // already carry a tool result or lifecycle enrichment that the page reducer did not see.
       combined.push(currentByKey.get(item.key) ?? item)
     }
+    // A same-generation catch-up retains loaded older pages AND the live tail. Its newest page belongs
+    // between those, not unconditionally before the old scrollback. Stable sort keeps equal-time order.
+    if (latest) combined.sort((left, right) => Date.parse(left.ts) - Date.parse(right.ts))
     view.items = combined
   }
 
@@ -4369,9 +4393,11 @@ export class HubStore {
           requestedGeneration,
           beforeSeq,
         )
+        if (this.sessions[id] !== view) return
         if (!Array.isArray(page.events)) throw new Error('Latest journal history returned an invalid response.')
         const historyItems = reduceJournalHistory(page.events)
-        this.installJournalHistoryWindow(view, historyItems)
+        this.installJournalHistoryWindow(view, historyItems, true)
+        view.historyRefreshFallback = undefined
         this.reconcileNativeHistoryActivity(view, historyItems)
         view.journalHistoryGeneration = page.checkpointGeneration
         view.journalHistoryOlderCursor = page.hasOlder ? page.olderCursor : null
@@ -4400,7 +4426,7 @@ export class HubStore {
       } catch (error) {
         view.historyLoadError =
           error instanceof Error ? error.message : 'Latest journal history could not be loaded.'
-        if (!installedLatest) this.historyPulled.delete(id)
+        if (!installedLatest && this.sessions[id] === view) this.historyPulled.delete(id)
       } finally {
         view.loadingHistory = false
       }
@@ -4426,9 +4452,11 @@ export class HubStore {
       view.loadingHistory = false
     }
     if (!page) {
-      this.historyPulled.delete(id)
+      if (this.sessions[id] === view) this.historyPulled.delete(id)
       return
     }
+    if (this.sessions[id] !== view) return
+    view.historyRefreshFallback = undefined
     if (!page.items.length) return
     const ts = view.record.createdAt
     const hist = page.items.map((h, i) => this.toThreadItem(h, `hist:${i}`, ts))

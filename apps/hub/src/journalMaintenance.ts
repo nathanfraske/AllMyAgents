@@ -26,6 +26,7 @@ import {
 } from './journalRecovery.js'
 import { reserveReplicationPruneGate } from './journalReplication.js'
 import { SCHEMA_VERSION } from './restartHandshake.js'
+import { validateJournalPayloadBatch } from './journalPayloadValidation.js'
 
 type MaintenanceMessage =
   | {
@@ -134,15 +135,18 @@ async function main(): Promise<{ message: MaintenanceMessage; exitCode: number }
     // with quick_check, turning a full table scan into a 10+ second cold-start gate on a multi-GB
     // journal. Keep the proof (and keep recovery classification fail-closed), but isolate this scan in
     // the maintenance child so the UI, HTTP listener, WebSocket, and liveness heartbeat remain live.
-    reportProgress('validating-payloads', 0, 0)
-    const invalidPayload = journal.db
-      .prepare('SELECT seq FROM events WHERE json_valid(payload) = 0 ORDER BY seq LIMIT 1')
-      .get() as { seq?: unknown } | undefined
-    if (invalidPayload) {
-      throw new Error(
-        `journal contains invalid JSON in event sequence ${String(invalidPayload.seq)}; ` +
-          'maintenance refused to mutate it',
-      )
+    let validated = false
+    while (Date.now() - processStart < WORK_BUDGET_MS) {
+      const batch = validateJournalPayloadBatch(journal.db)
+      reportProgress('validating-payloads', batch.scannedThrough, 0)
+      if (batch.complete) { validated = true; break }
+      await nextTurn()
+    }
+    if (!validated) {
+      const reason = 'Payload validation paused at its work budget; it will resume before cleanup.'
+      journal.recordCompactionLifecycle(operationId, 'started', { detail: reason })
+      journal.recordCompactionLifecycle(operationId, 'deferred', { detail: reason })
+      return { message: { type: 'journal-condense-deferred', operationId, reason }, exitCode: 0 }
     }
     journal.recordCompactionLifecycle(operationId, 'started', {
       detail: 'Bounded journal maintenance started after payload validation.',

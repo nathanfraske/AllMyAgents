@@ -471,7 +471,7 @@ const journalBackups = createJournalBackupSupervisor(journal.db, {
 }, async (db, options) => {
   if (journalMaintenanceChild) {
     options.log?.('[journal-backup] snapshot deferred while exclusive storage maintenance is active')
-    return { ok: true, skipped: true }
+    return { ok: true, deferred: true }
   }
   return await journalSnapshotChildTask(db, options)
 })

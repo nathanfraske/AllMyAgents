@@ -50,6 +50,8 @@ export interface JournalBackupOptions {
   dir: string
   /** How often to snapshot. */
   intervalMs?: number
+  /** Retry a postponed (not attempted) snapshot without waiting a full snapshot interval. */
+  deferredRetryMs?: number
   /** Internal/advanced: reuse a recently published verified generation instead of copying at activation. */
   minimumSnapshotAgeMs?: number
   /** Hard wall-clock bound for the online-copy phase. Verification/publication have separate watchdog semantics. */
@@ -104,6 +106,8 @@ const SIDECAR_SUFFIXES = ['-wal', '-shm'] as const
 
 export interface SnapshotResult {
   ok: boolean
+  /** Exclusive maintenance prevented an attempt; this is not a verified/reused snapshot. */
+  deferred?: boolean
   skipped?: boolean
   file?: string
   bytes?: number
@@ -819,6 +823,7 @@ export function createJournalBackupSupervisor(
   let activationRetryAttempt = 0
   let initialTask: NodeJS.Immediate | undefined
   let periodicTimer: NodeJS.Timeout | undefined
+  let deferredAttempt = false
   let inFlight: Promise<void> | undefined
   let runWhenIdle = false
   let cleanupPending = false
@@ -842,7 +847,9 @@ export function createJournalBackupSupervisor(
     periodicTimer = setTimeout(() => {
       periodicTimer = undefined
       launch('snapshot')
-    }, intervalMs())
+    }, deferredAttempt
+      ? Math.min(intervalMs(), Math.max(1, Math.min(300_000, options.deferredRetryMs ?? 60_000)))
+      : intervalMs())
     periodicTimer.unref?.()
   }
 
@@ -858,6 +865,8 @@ export function createJournalBackupSupervisor(
         ? { ...options, minimumSnapshotAgeMs: options.minimumSnapshotAgeMs ?? intervalMs() }
         : options))
       .then((result) => {
+        deferredAttempt = result.deferred === true
+        if (deferredAttempt) return // Do not report success or clear a real degraded state.
         if (!result.ok) {
           const error = result.error ?? 'snapshot returned an unknown failure'
           onStateChange({ status: 'degraded', error })
@@ -867,6 +876,7 @@ export function createJournalBackupSupervisor(
         if (active && !stopped) onStateChange({ status: 'active' })
       })
       .catch((error: unknown) => {
+        deferredAttempt = false
         const message = error instanceof Error ? error.message : String(error)
         onStateChange({ status: 'degraded', error: message })
         log(`[journal-backup] ${label} failed: ${message}`)

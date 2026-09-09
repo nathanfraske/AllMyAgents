@@ -90,6 +90,18 @@ afterEach(() => {
 })
 
 describe('transcript interaction boundaries', () => {
+  it('keeps history visible during refresh and alongside a failed-refresh retry', async () => {
+    const view = seed()
+    view.historyRefreshFallback = [{ key: 'previous', kind: 'assistant', ts: '2026-09-09T00:00:00Z', text: 'Previously visible transcript' }]
+    view.loadingHistory = true
+    const rendered = render(ThreadView, { props: { sessionId: 'interaction-session' } })
+    expect(rendered.getByText('Previously visible transcript')).toBeTruthy()
+    store.sessions['interaction-session']!.loadingHistory = false
+    store.sessions['interaction-session']!.historyLoadError = 'History refresh failed'
+    await waitFor(() => expect(rendered.getByRole('button', { name: 'Retry history' })).toBeTruthy())
+    expect(rendered.getByText('Previously visible transcript')).toBeTruthy()
+  })
+
   it('offers an explicit retry when latest history could not be loaded', async () => {
     const view = seed()
     view.historyLoadError = 'Latest journal history is temporarily unavailable.'
