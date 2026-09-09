@@ -12,6 +12,8 @@ export interface SessionIdentity {
   projectId?: string
   /** Human-facing label (worktree/repo/cwd basename today; the session title once auto-naming lands). */
   label: string
+  /** Hub-minted role for discovery only; tool execution rechecks the live session. */
+  isOverseer?: boolean
 }
 
 export function identityOf(record: SessionRecord): SessionIdentity {
@@ -23,6 +25,7 @@ export function identityOf(record: SessionRecord): SessionIdentity {
     provider: record.provider,
     projectId: record.projectId,
     label,
+    ...(record.isOverseer === true ? { isOverseer: true } : {}),
   }
 }
 

@@ -1,6 +1,6 @@
 import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk'
 import type { SessionIdentity } from './identity.js'
-import { AGENT_TOOLS, AGENT_TOOLS_INSTRUCTIONS, type AgentServices, type AgentToolContext, type AgentToolOutput } from './agentToolCore.js'
+import { agentToolsForIdentity, AGENT_TOOLS_INSTRUCTIONS, type AgentServices, type AgentToolContext, type AgentToolOutput } from './agentToolCore.js'
 
 // Re-export the service interfaces from the shared core so existing importers (executor.ts,
 // agentWorker.ts, sessions.ts, the worker tests) keep resolving them from agentTools.ts unchanged.
@@ -37,7 +37,7 @@ export function buildAgentMcpServer(identity: SessionIdentity, services: AgentSe
     name: 'allmyagents',
     version: '0.1.0',
     instructions: AGENT_TOOLS_INSTRUCTIONS,
-    tools: AGENT_TOOLS.map((spec) =>
+    tools: agentToolsForIdentity(identity).map((spec) =>
       tool(spec.name, spec.description, spec.schema, async (args: unknown) => toolResult(await spec.run(args as never, ctx)))
     ),
   })

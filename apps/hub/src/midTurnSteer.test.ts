@@ -75,12 +75,13 @@ function build(
     chatNamePool: 'everyone',
     ...(opts.pref === undefined ? {} : { steerMessagesAtToolBoundary: opts.pref }),
   }
+  const usage = new UsageMonitor(journal, [profile], {})
   const sessions = new SessionManager(
     journal,
     store,
     new Map([['p1', profile]]),
     new ApprovalService(journal),
-    new UsageMonitor(journal, [], {}),
+    usage,
     new WorkspaceManager(path.join(dir, 'wt')),
     new ProjectStore(journal.db),
     new InstructionStore(journal.db),
@@ -106,7 +107,7 @@ function build(
   }
   ;(sessions as unknown as { sessions: Map<string, SessionRecord> }).sessions.set(record.id, record)
   store.upsert(record)
-  return { sessions, journal, store, bus, record, steer, startThread, runTurn, interrupt }
+  return { sessions, journal, store, bus, record, steer, startThread, runTurn, interrupt, usage }
 }
 
 async function settle(): Promise<void> {
@@ -115,6 +116,53 @@ async function settle(): Promise<void> {
 }
 
 describe('SessionManager mid-turn steering', () => {
+  it('refreshes a cached Codex rejection and sends the operator message exactly once after recovery', async () => {
+    const { sessions, journal, record, runTurn, usage } = build({ provider: 'codex', isBusy: () => false })
+    record.status = 'idle'
+    usage.noteCodex('p1', { usedPercent: 100, rateLimitReachedType: 'requests' })
+    const read = vi.fn(async () => ({ rateLimits: { primary: { usedPercent: 0 } } }))
+    usage.setCodexReader(read)
+    await sessions.send('s1', 'continue after my quota reset')
+    expect(read).toHaveBeenCalledTimes(1)
+    expect(runTurn).toHaveBeenCalledTimes(1)
+    expect(runTurn).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 's1' }), 'continue after my quota reset', 'operator')
+    expect(journal.recentEventsForSession('s1', 20).filter((event) => event.kind === 'session/input')).toHaveLength(1)
+  })
+
+  it('does not journal or dispatch a message when a fresh Codex snapshot still rejects work', async () => {
+    const { sessions, journal, record, runTurn, usage } = build({ provider: 'codex', isBusy: () => false })
+    record.status = 'idle'
+    usage.noteCodex('p1', { usedPercent: 100, rateLimitReachedType: 'requests' })
+    usage.setCodexReader(async () => ({ rateLimits: { primary: { usedPercent: 100 }, rateLimitReachedType: 'requests' } }))
+    await expect(sessions.send('s1', 'still limited')).rejects.toThrow(/usage limit/)
+    expect(runTurn).not.toHaveBeenCalled()
+    expect(journal.recentEventsForSession('s1', 20).filter((event) => event.kind === 'session/input')).toHaveLength(0)
+  })
+
+  it('refreshes a cached rejection before creating a new Codex conversation', async () => {
+    const { sessions, record, runTurn, usage } = build({ provider: 'codex', isBusy: () => false })
+    usage.noteCodex('p1', { usedPercent: 100, rateLimitReachedType: 'requests' })
+    usage.setCodexReader(async () => ({ rateLimits: { primary: { usedPercent: 0 } } }))
+    const created = await sessions.create('p1', { cwd: record.cwd, useWorktree: false, prompt: 'new conversation after reset' })
+    expect(runTurn).toHaveBeenCalledTimes(1)
+    expect(runTurn).toHaveBeenCalledWith(expect.objectContaining({ sessionId: created.id }), 'new conversation after reset', 'operator')
+  })
+
+  it('rechecks credential admission after a usage refresh yields', async () => {
+    const { sessions, journal, record, runTurn, usage } = build({ provider: 'codex', isBusy: () => false })
+    record.status = 'idle'
+    usage.noteCodex('p1', { usedPercent: 100, rateLimitReachedType: 'requests' })
+    let finish!: (value: unknown) => void
+    usage.setCodexReader(() => new Promise((resolve) => { finish = resolve }))
+    const sending = sessions.send('s1', 'do not cross an account handoff')
+    const rejected = expect(sending).rejects.toThrow(/credentials change/)
+    sessions.freezeProfileTurnAdmission('p1', 22, 'test-generation')
+    finish({ rateLimits: { primary: { usedPercent: 0 } } })
+    await rejected
+    expect(runTurn).not.toHaveBeenCalled()
+    expect(journal.recentEventsForSession('s1', 20).filter((event) => event.kind === 'session/input')).toHaveLength(0)
+  })
+
   it('delivers a retried remote steer request exactly once', async () => {
     let release!: () => void
     const steering = new Promise<void>((resolve) => { release = resolve })

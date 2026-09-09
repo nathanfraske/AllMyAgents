@@ -7,7 +7,7 @@
 
 <script lang="ts">
   import { api } from './api'
-  import { store, type ThreadItem } from './store.svelte'
+  import { store, displayedThreadItems, type ThreadItem } from './store.svelte'
   import ItemCard from './ItemCard.svelte'
   import CodexActivityGroup from './CodexActivityGroup.svelte'
   import { groupCodexItems, type CodexRenderNode } from './codexGroup'
@@ -344,6 +344,7 @@
 
   const activeId = $derived(sessionId ?? store.selectedId ?? null)
   const view = $derived(activeId ? (store.sessions[activeId] ?? null) : null)
+  const transcriptItems = $derived(view ? displayedThreadItems(view) : [])
   const sid = $derived(view?.record.id ?? '')
   const browserAgentLabel = $derived.by(() => {
     if (!view) return 'this agent'
@@ -449,7 +450,7 @@
 
   const displayedMainItems = $derived(
     selectMainItems(
-      view?.items ?? [],
+      transcriptItems,
       composerOnly
         ? Math.max(0, peekItems)
         : view?.historyViewingOlder
@@ -775,13 +776,13 @@
   })
 
   $effect(() => {
-    view?.items.length
+    transcriptItems.length
     void thinking // also keep pinned to bottom when the thinking row appears
     if (stick && scroller) {
       // A fresh draft contains the first-chat guide, whose beginning is the useful part. The normal
       // transcript rule (open at the live end) would mount this taller-than-a-short-pane guide halfway
       // down and hide its explanation above the viewport.
-      if (isDraft && view?.items.length === 0) scroller.scrollTop = 0
+      if (isDraft && transcriptItems.length === 0) scroller.scrollTop = 0
       else {
         snapToLiveEdge()
         scheduleLiveEdgeSnap()
@@ -850,7 +851,7 @@
     jumpAway = away
     // Anchor the "new" count to the last item the moment you scroll away; clear it once you're back down.
     if (!away) anchorKey = null
-    else if (anchorKey === null) anchorKey = latestMainItemKey(view?.items ?? [])
+    else if (anchorKey === null) anchorKey = latestMainItemKey(transcriptItems)
     if (m.scrollTop <= 96) void loadOlderAtTop()
   }
 
@@ -902,7 +903,7 @@
   function onTouchEnd(): void {
     lastTouchClientY = null
   }
-  const newBelow = $derived(mainItemsBelow(view?.items ?? [], anchorKey))
+  const newBelow = $derived(mainItemsBelow(transcriptItems, anchorKey))
   function jumpToBottom(): void {
     if (!scroller) return
     // Smooth scrolling emits intermediate `scroll` events that correctly look "away from bottom" and
@@ -1641,7 +1642,7 @@
       </button>
     {/if}
     <!-- The agent's task board, directly above the chatbar. -->
-    {#if !composerOnly}<TaskStrip items={view.items} />{/if}
+    {#if !composerOnly}<TaskStrip items={transcriptItems} />{/if}
 
     {#if questions.length > 0}
       <div class="question-stack" role="region" aria-label="Pending questions">
@@ -1846,7 +1847,7 @@
          <AgentPanel
            showTab={false}
            oncounts={(counts) => { panelAgentCounts = counts }}
-           items={view.items}
+           items={transcriptItems}
            sessionId={view.record.id}
            provider={view.record.provider}
            open={sidePanel === 'agents'}

@@ -9,8 +9,12 @@ import type {
   UsageSnapshot,
 } from './types.js'
 
-const CODEX_POLL_MS = 15 * 60 * 1000
+const CODEX_POLL_MS = 30 * 1000
+const CODEX_HEALTHY_POLL_MS = 5 * 60 * 1000
+const CODEX_READ_TIMEOUT_MS = 5 * 1000
+const CODEX_SEND_RECHECK_MS = 5 * 1000
 const CLAUDE_POLL_MS = 20 * 60 * 1000
+type CodexRefreshResult = { ok: true } | { ok: false; error: string }
 
 export interface ProfileUsageAuthority {
   readonly profileId: string
@@ -35,6 +39,8 @@ export class UsageMonitor {
   private claudeReader = readClaudeUsage
   private pollTimer: NodeJS.Timeout | undefined
   private claudeTimer: NodeJS.Timeout | undefined
+  private readonly codexPolls = new Map<string, Promise<CodexRefreshResult>>()
+  private readonly codexLastAttempt = new Map<string, number>()
   private readonly profileAuthorities = new Map<
     string,
     { publicEpoch: number; active: boolean; nonce: number }
@@ -190,6 +196,9 @@ export class UsageMonitor {
       active,
       nonce: (current?.nonce ?? 0) + 1,
     })
+    // A reader belonging to the former credential owner must not pin the new owner's refresh slot.
+    this.codexPolls.delete(profileId)
+    this.codexLastAttempt.delete(profileId)
   }
 
   captureProfileAuthority(profileId: string): ProfileUsageAuthority | undefined {
@@ -304,7 +313,8 @@ export class UsageMonitor {
       (claudeStatus && claudeStatus !== 'allowed' && claudeStatus !== 'allowed_warning') ||
       (codexActive && snap.codex?.rateLimitReachedType),
     )
-    if (!this.activeResetWindow(snap.resetsAt) && snap.blocked) {
+    const currentReset = snap.provider === 'claude' ? snap.claude?.resetsAt : snap.codex?.resetsAt
+    if (!this.activeResetWindow(currentReset) && snap.blocked) {
       snap.blocked = false
       snap.blockedReason = undefined
     }
@@ -317,7 +327,7 @@ export class UsageMonitor {
     snap.headroom = snap.authenticated === false || snap.entitlement === 'denied' || rejected || snap.blocked
       ? 0
       : Math.max(0, Math.min(1, 1 - used / 100))
-    snap.limitStatus = claudeStatus ?? (snap.codex?.rateLimitReachedType ? 'rejected' : 'allowed')
+    snap.limitStatus = claudeStatus ?? (codexActive && snap.codex?.rateLimitReachedType ? 'rejected' : 'allowed')
     snap.windowType = snap.claude?.rateLimitType ??
       (snap.codex?.windowDurationMins ? `${snap.codex.windowDurationMins}-minute` : undefined)
     snap.resetsAt = snap.provider === 'claude'
@@ -348,6 +358,7 @@ export class UsageMonitor {
 
   assertNotBlocked(profileId: string): void {
     const snap = this.snapshot(profileId)
+    if (snap) this.refreshDerived(snap)
     if (snap?.blocked) {
       throw new Error(
         `profile ${profileId} is at its usage limit (${snap.blockedReason ?? 'limited'}); overage is blocked by settings`
@@ -382,15 +393,60 @@ export class UsageMonitor {
     }
   }
 
-  async pollCodexOnce(): Promise<void> {
-    if (!this.codexReader) return
-    for (const p of this.profiles.filter((x) => x.provider === 'codex' && x.available !== false && x.authStatus !== 'signed_out')) {
-      const authority = this.captureProfileAuthority(p.id)
-      if (this.profileAuthorities.has(p.id) && !authority) continue
+  /** Refresh only an apparently exhausted account before refusing operator input. Healthy sends stay synchronous. */
+  refreshCodexBeforeDispatch(profileId: string): Promise<void> | undefined {
+    const snap = this.snapshot(profileId)
+    if (!snap || snap.provider !== 'codex' || !this.codexNeedsRecovery(snap, 100)) return undefined
+    const pending = this.codexPolls.get(profileId)
+    if (pending) return pending.then(() => {})
+    const lastAttempt = this.codexLastAttempt.get(profileId)
+    if (lastAttempt !== undefined && Date.now() - lastAttempt < CODEX_SEND_RECHECK_MS) return undefined
+    return this.pollCodexProfile(profileId).then(() => {})
+  }
+
+  private codexNeedsRecovery(snap: UsageSnapshot, threshold = 90): boolean {
+    return snap.blocked || Boolean(snap.codex?.rateLimitReachedType) || snap.codex?.spendControlReached === true ||
+      (snap.codex?.usedPercent ?? 0) >= threshold
+  }
+
+  private pollCodexProfile(profileId: string): Promise<CodexRefreshResult> {
+    const pending = this.codexPolls.get(profileId)
+    if (pending) return pending
+    const p = this.profiles.find((profile) => profile.id === profileId)
+    const reader = this.codexReader
+    if (!reader || !p || p.provider !== 'codex' || p.available === false || p.authStatus === 'signed_out') {
+      return Promise.resolve({ ok: false, error: 'Codex usage reader is unavailable for this account' })
+    }
+    const authority = this.captureProfileAuthority(profileId)
+    if (this.profileAuthorities.has(profileId) && !authority) {
+      return Promise.resolve({ ok: false, error: 'Account credentials are changing; usage refresh is deferred' })
+    }
+    this.codexLastAttempt.set(profileId, Date.now())
+    let settle!: (result: CodexRefreshResult) => void
+    const result = new Promise<CodexRefreshResult>((resolve) => { settle = resolve })
+    this.codexPolls.set(profileId, result)
+    let expired = false
+    const failed = (error: string): void => {
+      if (this.canPublish(profileId, authority)) this.journal.append(null, 'usage/poll-error', { profileId, message: error })
+      settle({ ok: false, error })
+    }
+    const timer = setTimeout(() => {
+      expired = true
+      failed(`Codex usage refresh timed out after ${CODEX_READ_TIMEOUT_MS}ms; retaining the last known limits`)
+    }, CODEX_READ_TIMEOUT_MS)
+    timer.unref()
+    // The caller has a deadline, but a stuck native reader keeps its single-flight slot until it
+    // settles. Never pile up polling requests or publish a late, timed-out result over newer state.
+    void (async () => {
       try {
-        const raw = (await this.codexReader(p.id)) as { rateLimits?: CodexLimitInfo & { primary?: CodexLimitInfo } }
+        const raw = (await reader(p.id)) as { rateLimits?: CodexLimitInfo & { primary?: CodexLimitInfo } }
+        if (expired) return
+        if (!this.canPublish(p.id, authority)) {
+          settle({ ok: false, error: 'Account usage authority changed during refresh' })
+          return
+        }
         const limits = raw?.rateLimits
-        if (!limits) continue
+        if (!limits || typeof limits !== 'object') throw new Error('Codex returned no rate-limit snapshot; retaining the last known limits')
         const flat: CodexLimitInfo = {
           ...limits.primary,
           credits: (limits as CodexLimitInfo).credits,
@@ -398,22 +454,35 @@ export class UsageMonitor {
           rateLimitReachedType: (limits as CodexLimitInfo).rateLimitReachedType,
           planType: (limits as CodexLimitInfo).planType,
         }
-        if (!this.canPublish(p.id, authority)) continue
         this.noteCodex(p.id, flat, authority)
         this.journal.append(null, 'usage/snapshot', { profileId: p.id, codex: flat })
+        settle({ ok: true })
       } catch (err) {
-        if (!this.canPublish(p.id, authority)) continue
-        this.journal.append(null, 'usage/poll-error', {
-          profileId: p.id,
-          message: err instanceof Error ? err.message : String(err),
-        })
+        if (!expired) failed(err instanceof Error ? err.message : String(err))
+      } finally {
+        clearTimeout(timer)
+        if (this.codexPolls.get(profileId) === result) this.codexPolls.delete(profileId)
       }
+    })()
+    return result
+  }
+
+  async pollCodexOnce(): Promise<void> {
+    await Promise.all(this.profiles.filter((p) => p.provider === 'codex').map((p) => this.pollCodexProfile(p.id)))
+  }
+
+  private pollCodexDue(): void {
+    for (const p of this.profiles.filter((profile) => profile.provider === 'codex')) {
+      const snap = this.snapshot(p.id)
+      const interval = snap && this.codexNeedsRecovery(snap) ? CODEX_POLL_MS : CODEX_HEALTHY_POLL_MS
+      const last = this.codexLastAttempt.get(p.id)
+      if (last === undefined || Date.now() - last >= interval) void this.pollCodexProfile(p.id)
     }
   }
 
   startPolling(): void {
     void this.pollCodexOnce()
-    this.pollTimer = setInterval(() => void this.pollCodexOnce(), CODEX_POLL_MS)
+    this.pollTimer = setInterval(() => this.pollCodexDue(), CODEX_POLL_MS)
     this.pollTimer.unref()
     // Claude usage via periodic `/usage` scrape; delay first run so startup isn't blocked.
     setTimeout(() => void this.pollClaudeOnce(), 3000).unref()

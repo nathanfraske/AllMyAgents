@@ -960,7 +960,11 @@ describe('owned journal corruption recovery', () => {
       },
     })
     boot.lease.release()
-  })
+  // Two durable snapshots plus crash/recovery publication perform real fsyncs. On the
+  // hosted Windows disk, the default 5s fixture deadline can fire between snapshots
+  // and race cleanup against the pending backup. This is not a recovery-latency test;
+  // retain every corruption/lineage assertion and the bounded multi-snapshot budget.
+  }, 15_000)
 
   it('self-heals a verified published generation whose activation pointer was not advanced', async () => {
     const dataDir = root()

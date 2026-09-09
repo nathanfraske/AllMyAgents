@@ -276,6 +276,16 @@ describe('project manager permission ceiling', () => {
 })
 
 describe('project manager exhausted-account dispatch guard', () => {
+  it('ignores an expired Codex rejection when dispatching to a worker', () => {
+    const { sessions, usage, seed } = buildHub()
+    seed({ id: 'manager', projectId: 'project-1', isProjectManager: true, managerPauseExhaustedAccounts: true })
+    seed({ id: 'child', profileId: 'p2', provider: 'codex', projectId: 'project-1', parentSessionId: 'manager' })
+    // Dispatch reads the account's derived state, rather than re-blocking on a raw historical flag.
+    usage.noteCodex('p2', { usedPercent: 100, rateLimitReachedType: 'requests', resetsAt: Date.now() / 1000 - 1 })
+    expect(sessions.busSend('manager', { kind: 'session', id: 'child' }, 'continue', 'The quota window has reset.', false))
+      .toEqual({ ok: true, delivered: 1 })
+  })
+
   it('pauses direct-child messages at 100% but permits them when paid overage is active', () => {
     const { sessions, journal, usage, seed } = buildHub()
     const manager = seed({ id: 'manager', projectId: 'project-1' })
@@ -847,6 +857,26 @@ describe('project manager lifecycle awareness', () => {
     expect(result.summary).toContain('(active): active')
     expect(result.summary).not.toContain('grandchild')
     expect(result.summary).not.toContain('unrelated')
+  })
+
+  it('groups exact child identities once under active and stashed team headings', () => {
+    const { sessions, seed } = buildHub()
+    const manager = seed({ id: 'manager', isProjectManager: true })
+    sessions.managerChildStatus(manager.id)
+    const active = manager.managerTeams![0]!
+    const stashed = { ...active, id: 'team-stashed', name: 'Review' }
+    manager.managerTeams!.push(stashed)
+    for (const [id, team] of [['worker-a', active], ['worker-b', active], ['reviewer', stashed]] as const) {
+      seed({ id, parentSessionId: manager.id, managerTeamId: team.id, managerTeamName: team.name, status: 'idle', role: `role-${id}` })
+    }
+    const roster = sessions.managerChildStatus(manager.id).summary!.split('Roster:\n')[1]!
+    expect(roster.split(`Team ${active.name} (${active.id}) [ACTIVE]`)).toHaveLength(2)
+    expect(roster.split('Team Review (team-stashed) [STASHED]')).toHaveLength(2)
+    for (const id of ['worker-a', 'worker-b', 'reviewer']) {
+      expect(roster.split(`(${id}): idle; role: role-${id}`)).toHaveLength(2)
+    }
+    expect(roster.indexOf('(worker-b)')).toBeLessThan(roster.indexOf('[STASHED]'))
+    expect(roster.indexOf('(reviewer)')).toBeGreaterThan(roster.indexOf('[STASHED]'))
   })
 })
 

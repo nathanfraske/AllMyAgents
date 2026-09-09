@@ -6,11 +6,91 @@ import { AGENT_TOOLS, runAgentTool, type AgentServices } from './agentToolCore.j
 import type { SessionIdentity } from './identity.js'
 import type { BusAddress } from './bus.js'
 import type { DangerFlags } from './types.js'
+import type { DurableRun } from './durableRuns.js'
 
 const SAFE: DangerFlags = { busCanUseRiskyTools: false, autoApprovePractices: false }
 
 const idA: SessionIdentity = { sessionId: 's1', profileId: 'a1', provider: 'codex', projectId: 'p1', label: 'alpha' }
 const idNoProject: SessionIdentity = { sessionId: 's2', profileId: 'a2', provider: 'codex', label: 'beta' }
+
+describe('compact durable run inspection', () => {
+  const run: DurableRun = {
+    id: 'run-1', projectId: 'p1', sessionId: 's1', actorSessionId: 's1', actorLabel: 'manager',
+    targetSessionId: 's1', kind: 'test', state: 'running', executionTarget: { kind: 'local' },
+    executable: 'node', args: ['test'], cwd: 'checkout', commandSummary: 'node test', commandSha256: 'command-hash',
+    resources: ['checkout'], createdAt: '2026-09-09T00:00:00Z', startedAt: '2026-09-09T00:00:01Z',
+    timeoutMs: 600_000, cancelRequested: false, stdoutBytes: 100, stderrBytes: 0, logsTruncated: false,
+    provenance: { version: 1, capturedAt: '2026-09-09T00:00:00Z', platform: 'win32', architecture: 'x64',
+      cwd: 'checkout', commandSha256: 'command-hash', environmentScope: 'execution', environmentSha256: 'env-hash',
+      environmentKeys: ['PATH'], lockfiles: [{ path: 'lockfile', sha256: 'lock-hash' }] },
+  }
+  const logs = { stdout: '', stderr: '', nextStdoutCursor: 100, nextStderrCursor: 0, stdoutComplete: true, stderrComplete: true }
+  it('returns exact cursors/state and automatic-completion guidance without repeating immutable provenance', async () => {
+    const h = makeHarness()
+    h.services.inspectRuns = vi.fn(() => ({ ok: true, runs: [run], logs }))
+    const result = JSON.parse(String(await runAgentTool('inspect_runs', { run_id: run.id, stdout_after: 100 }, { identity: idA, services: h.services })))
+    expect(result.runs[0]).toMatchObject({ id: run.id, state: 'running', timeoutMs: 600_000, projectId: 'p1', actorSessionId: 's1' })
+    expect(result.runs[0]).not.toHaveProperty('provenance')
+    expect(result.logs).toEqual(logs)
+    expect(result.waitingForOutput).toBe(true)
+    expect(result.nextAction).toContain('automatically to the starting agent')
+    expect(h.services.inspectRuns).toHaveBeenCalledWith('s1', expect.objectContaining({ runId: 'run-1', stdoutAfter: 100 }))
+  })
+  it('keeps the complete audit record available explicitly and preserves failure outcomes in summaries', async () => {
+    const h = makeHarness()
+    const failed = { ...run, state: 'outcome_unknown' as const, exitCode: null, error: 'target disconnected', signal: 'SIGTERM' }
+    h.services.inspectRuns = () => ({ ok: true, runs: [failed], logs: { ...logs, stderr: 'last log line' } })
+    const full = JSON.parse(String(await runAgentTool('inspect_runs', { run_id: run.id, detail: 'full' }, { identity: idA, services: h.services })))
+    expect(full.runs).toEqual([failed])
+    const summary = JSON.parse(String(await runAgentTool('inspect_runs', { run_id: run.id }, { identity: idA, services: h.services })))
+    expect(summary.runs[0]).toMatchObject({ state: 'outcome_unknown', exitCode: null, error: 'target disconnected', signal: 'SIGTERM', platform: 'win32' })
+    expect(summary.logs.stderr).toBe('last log line')
+    expect(summary.waitingForOutput).toBeUndefined()
+  })
+  it('does not turn an out-of-project refusal into a summary', async () => {
+    const h = makeHarness()
+    h.services.inspectRuns = () => ({ ok: false, error: 'outside your project run scope' })
+    expect(await runAgentTool('inspect_runs', { run_id: run.id }, { identity: idA, services: h.services })).toContain('outside your project run scope')
+  })
+  it.each(['codex', 'claude'] as const)('shares compact acknowledgements and full detail for %s without changing the durable record', async (provider) => {
+    const h = makeHarness()
+    const identity = { ...idA, provider }
+    h.services.startRun = vi.fn(() => ({ ok: true, run }))
+    const cancelled = { ...run, state: 'cancelled' as const, cancelRequested: true, signal: 'SIGTERM' }
+    h.services.controlRun = vi.fn(() => ({ ok: true, run: cancelled }))
+    const before = JSON.stringify(run)
+    const start = JSON.parse(String(await runAgentTool('start_run', { kind: 'test', executable: 'node', timeout_ms: 1_000 }, { identity, services: h.services })))
+    expect(start).toMatchObject({ id: run.id, state: run.state, timeoutMs: run.timeoutMs,
+      executionTarget: run.executionTarget, actorSessionId: run.actorSessionId, cwd: run.cwd })
+    expect(start).not.toHaveProperty('provenance')
+    const full = JSON.parse(String(await runAgentTool('start_run', { kind: 'test', executable: 'node', detail: 'full' }, { identity, services: h.services })))
+    expect(full).toEqual(run)
+    const cancel = JSON.parse(String(await runAgentTool('control_run', { run_id: run.id, operation: 'cancel' }, { identity, services: h.services })))
+    expect(cancel).toMatchObject({ state: 'cancelled', cancelRequested: true, signal: 'SIGTERM' })
+    const fullCancel = JSON.parse(String(await runAgentTool('control_run', { run_id: run.id, operation: 'cancel', detail: 'full' }, { identity, services: h.services })))
+    expect(fullCancel).toEqual(cancelled)
+    expect(JSON.stringify(run)).toBe(before)
+  })
+  it('summarizes only the run facet and keeps remote identity, unknown outcome, and failure stage', async () => {
+    const h = makeHarness()
+    const remote = { ...run, state: 'outcome_unknown' as const, error: 'disconnected',
+      executionTarget: { kind: 'remote' as const, siteId: 'peer', rootId: 'root', command: 'long command', cwd: 'project' },
+      result: { failure: { stage: 'transport', code: 'CONNECTION_LOST' }, transport: 'myownmesh-rpc', stdout: 'large logs stay retained' } }
+    const data = { agents: [{ sessionId: 'worker', projectId: 'p1' }], tasks: [{ id: 'task' }],
+      messageCursor: { next: 45, hasMore: true }, messages: [{ body: 'exact message' }],
+      approvalDecisions: [{ id: 'approval', status: 'denied' }], runs: [remote] }
+    h.services.queryTeam = () => ({ ok: true, data })
+    const summary = JSON.parse(String(await runAgentTool('query_team', {}, { identity: idA, services: h.services })))
+    expect(summary).toMatchObject({ ...data, runs: [expect.objectContaining({
+      state: 'outcome_unknown', executionTarget: { kind: 'remote', siteId: 'peer', rootId: 'root', cwd: 'project' },
+      failure: { stage: 'transport', code: 'CONNECTION_LOST' }, transport: 'myownmesh-rpc', error: 'disconnected',
+    })] })
+    expect(summary.runs[0]).not.toHaveProperty('result')
+    expect(summary.runs[0].executionTarget).not.toHaveProperty('command')
+    const full = JSON.parse(String(await runAgentTool('query_team', { detail: 'full' }, { identity: idA, services: h.services })))
+    expect(full).toEqual(data)
+  })
+})
 
 interface Harness {
   services: AgentServices
@@ -23,7 +103,7 @@ interface Harness {
 }
 
 function makeHarness(opts: {
-  roster?: { sessionId: string; label: string; provider: string; status: string }[]
+  roster?: Awaited<ReturnType<AgentServices['roster']>>
   inbox?: { fromLabel: string; fromSession: string; subject: string | null; body: string }[]
   sendResult?: { ok: boolean; delivered: number; deferred?: number; error?: string }
   approve?: boolean
@@ -459,6 +539,22 @@ describe('remote testbed tools', () => {
 })
 
 describe('list_agents / read_messages', () => {
+  it('groups exact identities once per project and keeps projectless/Overseer scopes distinct', async () => {
+    const roster = [
+      { sessionId: 'worker-a', label: 'A', provider: 'claude' as const, status: 'idle', projectId: 'project-one', role: 'audit' },
+      { sessionId: 'worker-b', label: 'B', provider: 'codex' as const, status: 'active', projectId: 'project-two' },
+      { sessionId: 'worker-c', label: 'C', provider: 'codex' as const, status: 'idle', projectId: 'project-one' },
+      { sessionId: 'unfiled', label: 'D', provider: 'codex' as const, status: 'idle' },
+      { sessionId: 'overseer', label: 'E', provider: 'claude' as const, status: 'idle', isOverseer: true },
+    ]
+    const h = makeHarness({ roster })
+    const text = String(await runAgentTool('list_agents', {}, { identity: idA, services: h.services }))
+    expect(text.match(/project-one/g)).toHaveLength(1)
+    expect(text).toContain('project project-one\n- A — session worker-a (claude, idle, audit)\n- C — session worker-c (codex, idle)')
+    expect(text).toContain('no project\n- D — session unfiled')
+    expect(text).toContain('Application Overseer\n- E — session overseer')
+    expect(roster.map(agent => agent.sessionId)).toEqual(['worker-a', 'worker-b', 'worker-c', 'unfiled', 'overseer'])
+  })
   it('list_agents renders the roster, or a friendly empty message', async () => {
     const empty = makeHarness({ roster: [] })
     expect(await runAgentTool('list_agents', {}, { identity: idA, services: empty.services })).toBe(
@@ -469,6 +565,17 @@ describe('list_agents / read_messages', () => {
     expect(out).toContain('worker')
     expect(out).toContain('abcd1234ef') // FULL session id — teammates need the whole id to address a reply (Bug2)
     expect(out).toContain('claude, idle')
+  })
+
+  it.each(['Application Overseer', 'Fleet coordinator'])('identifies a renamed Overseer with role %s without repeating its designation', async (role) => {
+    const h = makeHarness({ roster: [{
+      sessionId: 'application-session', label: 'Grace', role,
+      provider: 'codex', status: 'active', isOverseer: true,
+    }] })
+    const out = await runAgentTool('list_agents', {}, { identity: idA, services: h.services })
+    expect(out).toContain('application-session')
+    expect(String(out).match(/Application Overseer/gu)).toHaveLength(1)
+    expect(out).toContain('Grace')
   })
 
   it('read_messages formats newest-first, or reports none', async () => {

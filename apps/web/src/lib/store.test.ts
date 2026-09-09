@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from './api'
-import { HubStore, store } from './store.svelte'
+import { HubStore, store, displayedThreadItems } from './store.svelte'
 import { settings } from './settings.svelte'
 import { loadLastLayout, saveLastLayout } from './uiState'
 import { buildAgentRuns } from './agentTree'
@@ -1934,6 +1934,75 @@ describe('bounded cold baseline and global maintenance status', () => {
 
     expect(recovering.sessions.s1?.items.map((item) => item.text)).not.toContain('stale cutoff')
     expect(api.journalHistory).toHaveBeenCalledWith('s1', 9, 101, expect.anything())
+  })
+
+  it('keeps the last painted history across a slow or failed reset, without retaining old authority', async () => {
+    const recovering = new HubStore()
+    recovering.sessions.s1 = {
+      record: rec('s1', { status: 'active' }),
+      items: [{ key: 'old', kind: 'assistant', ts: '2026-01-01T00:00:00Z', text: 'visible before reset' }],
+      lastActivity: '2026-01-01T00:00:00Z', sawReasoning: false,
+    }
+    const install = recovering as unknown as { installReplayBaseline(b: Awaited<ReturnType<typeof api.replayBaseline>>): void }
+    install.installReplayBaseline({ version: 1, generation: 9, highWaterSeq: 100, resetFloorSeq: 80,
+      sessions: [rec('s1', { status: 'idle' })], projects: [], journalCompaction: null })
+    const view = recovering.sessions.s1!
+    expect(view.record.status).toBe('idle')
+    expect(view.items).toEqual([]) // fallback is not input to replay or authority
+    let fail!: (error: Error) => void
+    vi.mocked(api.journalHistory).mockImplementationOnce(() => new Promise((_, reject) => { fail = reject }))
+    const loading = recovering.ensureHistory('s1')
+    expect(displayedThreadItems(view).map(i => i.text)).toEqual(['visible before reset'])
+    fail(new Error('history unavailable'))
+    await loading
+    expect(view.historyLoadError).toContain('history unavailable')
+    expect(displayedThreadItems(view).map(i => i.text)).toEqual(['visible before reset'])
+    view.items.push({ key: 'live', kind: 'assistant', ts: '2026-01-01T00:01:00Z', text: 'new live tail' })
+    vi.mocked(api.journalHistory).mockResolvedValueOnce({ events: [], hasOlder: false, olderCursor: null, encodedBytes: 0, checkpointGeneration: 9 })
+    await recovering.retryHistory('s1')
+    expect(view.historyRefreshFallback).toBeUndefined()
+    expect(displayedThreadItems(view).map(i => i.text)).toEqual(['new live tail'])
+  })
+
+  it('keeps already loaded scrollback on a same-generation catch-up reset but refreshes session records', async () => {
+    const recovering = new HubStore()
+    const transport = recovering as unknown as { installReplayBaseline(b: Awaited<ReturnType<typeof api.replayBaseline>>): void }
+    const baseline = { version: 1 as const, generation: 9, highWaterSeq: 100, resetFloorSeq: 80,
+      sessions: [rec('s1', { status: 'active' })], projects: [], journalCompaction: null }
+    transport.installReplayBaseline(baseline)
+    const view = recovering.sessions.s1!
+    view.items.push({ key: 'older-page', kind: 'assistant', ts: '2026-01-01T00:00:00Z', text: 'already loaded older page' })
+    transport.installReplayBaseline({ ...baseline, highWaterSeq: 200, sessions: [rec('s1', { status: 'idle' })] })
+    expect(recovering.sessions.s1).toBe(view)
+    expect(view.record.status).toBe('idle')
+    expect(displayedThreadItems(view).map(i => i.text)).toEqual(['already loaded older page'])
+    view.items.push({ key: 'live', kind: 'assistant', ts: '2026-01-01T00:02:00Z', text: 'live tail' })
+    vi.mocked(api.journalHistory).mockResolvedValueOnce({ events: [evt({ seq: 199, kind: 'session/input', sessionId: 's1', ts: '2026-01-01T00:01:00Z', payload: { text: 'missed during reconnect' } })], hasOlder: false, olderCursor: null, encodedBytes: 200, checkpointGeneration: 9 })
+    await recovering.ensureHistory('s1')
+    expect(view.items.map(i => i.text)).toEqual(['already loaded older page', 'missed during reconnect', 'live tail'])
+  })
+
+  it('does not let a superseded history request clear the replacement load marker', async () => {
+    const recovering = new HubStore()
+    const transport = recovering as unknown as { installReplayBaseline(b: Awaited<ReturnType<typeof api.replayBaseline>>): void }
+    const baseline = { version: 1 as const, generation: 1, highWaterSeq: 100, resetFloorSeq: 0,
+      sessions: [rec('s1')], projects: [], journalCompaction: null }
+    transport.installReplayBaseline(baseline)
+    let rejectOld!: (error: Error) => void
+    let resolveNew!: (page: Awaited<ReturnType<typeof api.journalHistory>>) => void
+    vi.mocked(api.journalHistory)
+      .mockImplementationOnce(() => new Promise((_, reject) => { rejectOld = reject }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveNew = resolve }))
+    const old = recovering.ensureHistory('s1')
+    transport.installReplayBaseline({ ...baseline, generation: 2 })
+    const latest = recovering.ensureHistory('s1')
+    rejectOld(new Error('superseded request failed'))
+    await old
+    await recovering.ensureHistory('s1')
+    expect(api.journalHistory).toHaveBeenCalledTimes(2)
+    resolveNew({ events: [], hasOlder: false, olderCursor: null, encodedBytes: 0, checkpointGeneration: 2 })
+    await latest
+    expect(recovering.sessions.s1?.historyLoadError).toBeUndefined()
   })
 
   it('retries an imported transcript after a bounded first-load failure', async () => {

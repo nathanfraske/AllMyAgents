@@ -1,5 +1,6 @@
 import { fileURLToPath } from 'node:url'
 import { runStdioAgentMcpServer, type AgentToolExecutor } from './agentMcpServer.js'
+import { AGENT_TOOLS, AGENT_TOOL_CATALOG_OPERATION, type AgentToolSpec } from './agentToolCore.js'
 
 /**
  * The thin MCP bridge `codex app-server` spawns per Codex thread (declared in the profile's
@@ -70,11 +71,32 @@ export function makeHubExecutor(cfg: BridgeEnv, fetchImpl: typeof fetch = fetch)
   }
 }
 
+/** No role comes from MCP arguments or cwd guessing here: the hub resolves the live binding.
+ * Old/unreachable hubs retain the pre-upgrade catalog, never a cached role or new execution grant.
+ * The deadline keeps discovery from wedging startup during a hub restart.
+ */
+export function makeHubToolCatalog(cfg: BridgeEnv, fetchImpl: typeof fetch = fetch) {
+  const execute = makeHubExecutor(cfg, ((url, init) => fetchImpl(url, {
+    ...init, signal: AbortSignal.timeout(3_000),
+  })) as typeof fetch)
+  return async (): Promise<readonly AgentToolSpec[]> => {
+    const result = await execute(AGENT_TOOL_CATALOG_OPERATION, {})
+    try {
+      if (typeof result !== 'string') return AGENT_TOOLS
+      const data = JSON.parse(result) as { version?: unknown; tools?: unknown }
+      if (data.version !== 1 || !Array.isArray(data.tools) || !data.tools.every((name) => typeof name === 'string')) return AGENT_TOOLS
+      const names = new Set(data.tools)
+      return AGENT_TOOLS.filter((tool) => names.has(tool.name))
+    } catch { return AGENT_TOOLS }
+  }
+}
+
 /** Start the stdio MCP server on this process's stdin/stdout. Runs until stdin closes. */
 export function startBridge(): void {
   const cfg = readBridgeEnv()
   runStdioAgentMcpServer({
     execute: makeHubExecutor(cfg),
+    listTools: makeHubToolCatalog(cfg),
     // Never write logs to stdout — that channel is the MCP JSON-RPC transport. Use stderr.
     onLog: (m) => process.stderr.write(`[allmyagents-bridge] ${m}\n`),
   })

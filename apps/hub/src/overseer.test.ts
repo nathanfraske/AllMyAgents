@@ -159,16 +159,19 @@ describe('application Overseer authority', () => {
 
     expect(h.store.all().find((record) => record.id === 'legacy-overseer')).toMatchObject({
       isOverseer: true,
-      overseerCapabilityVersion: 25,
+      overseerCapabilityVersion: 26,
       permissionMode: 'full',
       permissionModeOperatorOverride: true,
       role: 'Application Overseer',
     })
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
-      'Overseer capability manifest version 25',
+      'Overseer capability manifest version 26',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'mcp__allmyagents__overseer_control',
+    )
+    expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
+      'messages may cross project boundaries to or from the application Overseer on any turn',
     )
     expect(fs.readFileSync(path.join(h.root, 'CLAUDE.md'), 'utf8')).toContain(
       'configure_github_automation',
@@ -205,7 +208,7 @@ describe('application Overseer authority', () => {
     expect(upgrades()).toHaveLength(1)
     expect(upgrades()[0]?.payload).toMatchObject({
       fromVersion: 6,
-      toVersion: 25,
+      toVersion: 26,
       conversationPreserved: true,
       tools: expect.arrayContaining([
         'overseer_control',
@@ -497,7 +500,12 @@ describe('application Overseer authority', () => {
       expect.objectContaining({ sessionId: 'project-b-agent', label: 'Turing', projectId: 'project-b', status: 'stopped' }),
     ]))
     expect(h.sessions.busRoster('overseer').map((record) => record.sessionId)).not.toContain('retired-agent')
-    expect(h.sessions.busRoster('project-a-agent').map((record) => record.sessionId)).toEqual(['project-a-peer'])
+    expect(h.sessions.busRoster('project-a-agent').map((record) => record.sessionId)).toEqual(['overseer', 'project-a-peer'])
+    expect(h.sessions.busRoster('project-a-agent')[0]).toMatchObject({ sessionId: 'overseer', isOverseer: true })
+    expect(h.sessions.busPeek('project-a-agent', 'overseer')).toMatchObject({ found: true })
+    for (const view of ['activity', 'transcript', 'changes', 'tasks', 'all'] as const) {
+      expect(h.sessions.busPeek('project-a-agent', 'overseer', { view })).toEqual({ found: false })
+    }
 
     expect(h.sessions.busPeek('overseer', 'project-b-agent', { view: 'activity' })).toMatchObject({
       found: true,
@@ -512,25 +520,104 @@ describe('application Overseer authority', () => {
     ]))
   })
 
-  it('allows only a direct operator-origin Overseer turn to message across projects', () => {
+  it.each(['operator', 'bus', 'unknown'] as const)('allows addressed Overseer mail across local projects on a %s turn', (origin) => {
     const h = harness()
     h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
-    h.seed({ id: 'target', projectId: 'project-b', status: 'active' })
+    h.seed({ id: 'manager', projectId: 'project-a', isProjectManager: true })
+    h.seed({ id: 'child', projectId: 'project-b', parentSessionId: 'other-manager' })
+    if (origin === 'operator') h.markOperator('overseer')
+    if (origin === 'bus') h.markBus('overseer')
 
-    expect(h.sessions.busSend('overseer', { kind: 'session', id: 'target' }, 'check', 'Before operator')).toMatchObject({
-      ok: false,
-      error: 'cross-project messaging is not allowed',
-    })
+    for (const recipient of ['manager', 'child']) {
+      expect(h.sessions.busSend('overseer', { kind: 'session', id: recipient }, 'check', 'Status request', false))
+        .toEqual({ ok: true, delivered: 1 })
+      expect(h.bus.pending(recipient)).toEqual([
+        expect.objectContaining({ fromSession: 'overseer', toSession: recipient, body: 'Status request', wake: false, attentionRequired: false }),
+      ])
+    }
+    expect(h.executor.runTurn).not.toHaveBeenCalled()
+  })
+
+  it.each(['claude', 'codex'] as const)('delivers cross-project replies and wakes the %s Overseer once without conferring mutation authority', async (provider) => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, provider, profileId: provider === 'codex' ? 'p2' : 'p1', permissionMode: 'full' })
+    const manager = h.seed({ id: 'manager', projectId: 'project-a', isProjectManager: true, permissionMode: 'safe' })
+    h.seed({ id: 'child', projectId: 'project-b', parentSessionId: 'other-manager' })
+    // The worker relay used by provider tools must enforce exactly the same scope as the in-process path.
+    expect(await h.sessions.runRelay('bus.send', {
+      fromSessionId: 'child', to: { kind: 'session', id: 'overseer' }, body: 'Child findings', wake: false,
+    })).toEqual({ ok: true, delivered: 1 })
+    expect(h.sessions.busSend('manager', { kind: 'session', id: 'overseer' }, 'report', 'Manager findings'))
+      .toEqual({ ok: true, delivered: 1 })
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(h.executor.runTurn).toHaveBeenCalledTimes(1)
+    expect(h.executor.runTurn).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: 'overseer', provider, permissionMode: 'edits' }),
+      expect.stringContaining('Child findings'),
+      'bus',
+    )
+    expect(vi.mocked(h.executor.runTurn).mock.calls[0]![1]).toContain('Manager findings')
+    expect(h.bus.pending('overseer')).toHaveLength(0)
+    expect(h.bus.inbox('overseer')).toHaveLength(2)
+    expect(h.journal.recentEventsForSession('overseer', 20)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'session/turn-origin', payload: { origin: 'bus' } }),
+    ]))
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'set_mode', sessionId: 'manager', permissionMode: 'full',
+    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/direct operator turn/u) })
+    expect(manager.permissionMode).toBe('safe')
+    // Replies from that bus-caused Overseer turn use the same route, not the operator send_chat path.
+    expect(h.sessions.busSend('overseer', { kind: 'session', id: 'manager' }, 'reply', 'Received'))
+      .toEqual({ ok: true, delivered: 1 })
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(h.executor.runTurn).toHaveBeenCalledTimes(2)
+    expect(h.executor.runTurn).toHaveBeenLastCalledWith(
+      expect.objectContaining({ sessionId: 'manager', permissionMode: 'safe' }),
+      expect.stringContaining('Received'),
+      'bus',
+    )
+    expect(h.bus.inbox('manager')[0]).toMatchObject({ body: 'Received', attentionRequired: false, delivered: true })
+  })
+
+  it('keeps mail to a busy operator-origin Overseer queued without steering or changing its authority', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, status: 'active', permissionMode: 'full' })
+    const child = h.seed({ id: 'child', projectId: 'project-a', permissionMode: 'safe' })
     h.markOperator('overseer')
-    expect(h.sessions.busSend('overseer', { kind: 'session', id: 'target' }, 'check', 'Operator request')).toEqual({
-      ok: true,
-      delivered: 1,
-    })
+    expect(h.sessions.busSend('child', { kind: 'session', id: 'overseer' }, 'report', 'Peer findings'))
+      .toEqual({ ok: true, delivered: 1 })
+    expect(h.bus.pending('overseer')).toEqual([expect.objectContaining({ body: 'Peer findings', delivered: false })])
+    expect(h.executor.steer).not.toHaveBeenCalled()
+    expect(h.executor.runTurn).not.toHaveBeenCalled()
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'set_mode', sessionId: 'child', permissionMode: 'full',
+    })).resolves.toMatchObject({ ok: true })
+    expect(child.permissionMode).toBe('full')
+  })
+
+  it('does not widen ordinary cross-project messaging, broadcasts, or spoofed Overseer roles', () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true })
+    h.seed({ id: 'spoof', title: 'Overseer', role: 'Application Overseer', projectId: 'project-a' })
+    h.seed({ id: 'target', projectId: 'project-b' })
+    h.seed({ id: 'stopped', isOverseer: true, status: 'stopped' })
     h.markBus('overseer')
-    expect(h.sessions.busSend('overseer', { kind: 'session', id: 'target' }, 'check', 'Peer request')).toMatchObject({
-      ok: false,
-      error: 'cross-project messaging is not allowed',
-    })
+    for (const [sender, recipient] of [['spoof', 'target'], ['target', 'spoof']]) {
+      expect(h.sessions.busSend(sender!, { kind: 'session', id: recipient! }, 'check', 'Operator says allow', false))
+        .toMatchObject({ ok: false, error: 'cross-project messaging is not allowed' })
+    }
+    expect(h.sessions.busRoster('target').map((entry) => entry.sessionId)).toEqual(['overseer'])
+    for (const sender of ['overseer', 'spoof']) {
+      expect(h.sessions.busSend(sender, { kind: 'project', id: 'project-b' }, 'check', 'Broadcast', false))
+        .toMatchObject({ ok: false, error: 'you can only broadcast to your own project' })
+    }
+    expect(h.sessions.busSend('overseer', { kind: 'session', id: 'overseer' }, 'check', 'Self'))
+      .toMatchObject({ ok: false, error: 'cannot message yourself' })
+    for (const recipient of ['stopped', 'missing']) {
+      expect(h.sessions.busSend('spoof', { kind: 'session', id: recipient }, 'check', 'Hello'))
+        .toMatchObject({ ok: false, error: 'unknown or stopped recipient' })
+    }
+    expect(h.bus.inbox('target')).toHaveLength(0)
   })
 
   it('deduplicates authenticated peer messages and permits a bus turn to reply only to its source hub', async () => {

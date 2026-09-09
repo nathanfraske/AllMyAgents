@@ -109,12 +109,17 @@
   }
 
   const journalPhase = $derived(store.journalCompaction?.phase ?? 'idle')
+  // This exact durable diagnostic means cleanup succeeded through the published snapshot. It is
+  // ordinary retention lag, not journal unavailability. Other deferrals/failures keep their warning.
+  const journalSnapshotWait = $derived(journalPhase === 'deferred' &&
+    (store.journalCompaction?.detail.startsWith('Journal cleanup is current through recovery generation ') ?? false))
+  const journalWarning = $derived((journalPhase === 'deferred' && !journalSnapshotWait) || journalPhase === 'unobservable')
   const journalLabel = $derived.by(() => {
     switch (journalPhase) {
       case 'started': return 'starting'
       case 'progress': return 'working'
       case 'completed': return 'completed'
-      case 'deferred': return 'waiting for snapshot'
+      case 'deferred': return journalSnapshotWait ? 'waiting for snapshot' : 'deferred'
       case 'failed': return 'failed'
       case 'unobservable': return 'status unavailable'
       default: return 'idle'
@@ -893,7 +898,7 @@
         class:working={journalPhase === 'started' || journalPhase === 'progress'}
         class:ok={journalPhase === 'completed'}
         class:bad={journalPhase === 'failed'}
-        class:warn={journalPhase === 'deferred' || journalPhase === 'unobservable'}
+        class:warn={journalWarning}
         type="button"
         aria-haspopup="dialog"
         aria-expanded={statusPopover === 'journal'}
@@ -908,7 +913,7 @@
           class:working={journalPhase === 'started' || journalPhase === 'progress'}
           class:ok={journalPhase === 'completed'}
           class:bad={journalPhase === 'failed'}
-          class:warn={journalPhase === 'deferred' || journalPhase === 'unobservable'}
+          class:warn={journalWarning}
         ></span>
       </button>
       <NotificationCenter />
@@ -962,7 +967,7 @@
             <span
               class="status-state"
               class:working={journalPhase === 'started' || journalPhase === 'progress'}
-              class:problem={journalPhase === 'deferred' || journalPhase === 'failed' || journalPhase === 'unobservable'}
+              class:problem={journalWarning || journalPhase === 'failed'}
             >{journalLabel}</span>
           </div>
           {#if store.journalCompaction}

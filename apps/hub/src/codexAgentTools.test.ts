@@ -16,6 +16,7 @@ import { PracticeStore } from './practices.js'
 import { SessionManager } from './sessions.js'
 import type { Profile, SessionRecord, SessionStatus } from './types.js'
 import { QuestionService } from './questions.js'
+import { AGENT_TOOL_CATALOG_OPERATION } from './agentToolCore.js'
 
 // Build a SessionManager on an in-memory DB (real hub plumbing; no vendor processes / network), plus
 // the store + stores we assert against. The Codex agent-tool path (execAgentTool) is exercised WITHOUT
@@ -64,6 +65,20 @@ function codexRec(id: string, cwd: string, opts: { projectId?: string; status?: 
 }
 
 describe('SessionManager.execAgentTool — the Codex agent-tool path (cwd → session attribution)', () => {
+  it('derives discovery from the exact live role, never claimed args, even for shared account/cwd', async () => {
+    const { sessions, inject, cleanup } = setup()
+    try {
+      inject([codexRec('worker', '/work/shared'), { ...codexRec('overseer', '/work/shared'), isOverseer: true }])
+      const catalog = async (id: string) => JSON.parse(String(await sessions.execAgentTool(
+        'codex-a', '/work/shared', AGENT_TOOL_CATALOG_OPERATION, { isOverseer: true }, id,
+      ))) as { tools: string[] }
+      expect((await catalog('worker')).tools).not.toContain('overseer_control')
+      expect((await catalog('overseer')).tools).toContain('overseer_control')
+      expect(await sessions.execAgentTool('codex-a', '/work/shared', 'overseer_control', { operation: 'status' }, 'worker')).toContain('not the application Overseer')
+      expect(await sessions.execAgentTool('codex-a', '/wrong', AGENT_TOOL_CATALOG_OPERATION, {}, 'overseer')).toContain('Not attributed')
+      expect(await sessions.execAgentTool('codex-a', '/work/shared', AGENT_TOOL_CATALOG_OPERATION, {})).toContain('Not attributed')
+    } finally { cleanup() }
+  })
   it('attributes a call to the Codex session whose cwd matches (provenance = that session)', async () => {
     const { sessions, memory, inject, cleanup } = setup()
     try {

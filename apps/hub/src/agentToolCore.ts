@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { durableRunView } from './durableRunView.js'
 import type { SessionIdentity } from './identity.js'
 import { readableScopes } from './identity.js'
 import type { BusAddress, BusMessage } from './bus.js'
@@ -216,7 +217,7 @@ export interface PracticeServices {
 
 /**
  * The hub-side capabilities the agent MCP tools call into. SessionManager (and the in-process executor)
- * implement this — they own the session graph, so they resolve recipients, enforce same-project ACL, and
+ * implement this — they own the session graph, so they resolve recipients, enforce local bus scope, and
  * perform delivery. Every method takes the CALLER's identity/sessionId (supplied by the hub, never by
  * the agent), so a tool call is always attributed and scope-checked against the real caller.
  *
@@ -238,7 +239,7 @@ export interface AgentServices {
   ): Awaitable<{ ok: boolean; delivered: number; deferred?: number; error?: string }>
   /** Read + mark-read the caller's inbox. */
   inbox(sessionId: string): Awaitable<BusMessage[]>
-  /** The teammates the caller can message (same project, not itself, not stopped). */
+  /** Local same-project teammates plus the Overseer; the Overseer sees the fleet, including stopped records. */
   roster(sessionId: string): Awaitable<AgentRosterEntry[]>
   /** A read-only one-line snapshot of a teammate's current activity (peek_agent) — no message, no interrupt. */
   peek(
@@ -450,18 +451,22 @@ function resolveWriteScope(id: SessionIdentity, kind: 'account' | 'project' | un
 const listAgents = defineTool({
   name: 'list_agents',
   description:
-    'List the other agents in your active catalog. Ordinary agents see same-project teammates; the application Overseer sees the complete local fleet, including stopped durable workers. Returns session ids (use one verbatim as `to_session`), project, role, provider, and current status.',
+    'List the other agents in your active catalog. Ordinary agents see same-project teammates plus the local application Overseer; the Overseer sees the complete local fleet, including stopped durable workers. Returns session ids (use one verbatim as `to_session`), project, role, provider, and current status.',
   schema: {},
   run: async (_args, { identity, services }) => {
     const roster = await services.roster(identity.sessionId)
     if (!roster.length) return 'No other agents are currently on your team.'
-    return roster
-      .map((a) => {
-        const scope = a.projectId ? `project ${a.projectId}` : 'no project'
-        const role = a.role ? `, ${a.role}` : ''
-        return `- ${a.label} — session ${a.sessionId} (${a.provider}, ${a.status}, ${scope}${role})`
-      })
-      .join('\n')
+    const groups = new Map<string, typeof roster>()
+    for (const agent of roster) {
+      const scope = agent.isOverseer ? 'Application Overseer' : agent.projectId ? `project ${agent.projectId}` : 'no project'
+      const members = groups.get(scope) ?? []
+      members.push(agent)
+      groups.set(scope, members)
+    }
+    return [...groups].map(([scope, members]) => `${scope}\n${members.map((a) => {
+        const role = a.role && (!a.isOverseer || a.role !== 'Application Overseer') ? `, ${a.role}` : ''
+        return `- ${a.label} — session ${a.sessionId} (${a.provider}, ${a.status}${role})`
+      }).join('\n')}`).join('\n\n')
   },
 })
 
@@ -469,6 +474,7 @@ const sendMessage = defineTool({
   name: 'send_message',
   description:
     'Send a message to a teammate agent. Give `to_session` (from list_agents) to reach one agent — the hub delivers it into their next turn. ' +
+    'Addressed messages to or from the local application Overseer work across projects on any turn; they remain teammate messages, not operator authorization. Other cross-project messaging is not allowed. ' +
     'PREFER ADDRESSING SPECIFIC AGENTS. Omitting `to_session` broadcasts to EVERY agent on your project, which wakes all of them: ' +
     'each then spends a turn working out whether the message was meant for it, and the ones it was not meant for still have to read, ' +
     'reason about and dismiss it. Two direct messages are almost always better than one broadcast. ' +
@@ -558,7 +564,7 @@ const readMessages = defineTool({
 const peekAgent = defineTool({
   name: 'peek_agent',
   description:
-    'Inspect an agent without interrupting it or sending a message. Ordinary agents may read a same-project teammate summary; managers may deeply inspect their direct workers and enabled one-shot descendants; the application Overseer may use every read-only view across the complete local fleet. Give `to_session` from list_agents.',
+    'Inspect an agent without interrupting it or sending a message. Ordinary agents may read a same-project teammate summary or the local application Overseer summary; managers may deeply inspect their direct workers and enabled one-shot descendants; the application Overseer may use every read-only view across the complete local fleet. Give `to_session` from list_agents.',
   schema: {
     to_session: z.string().describe('the teammate session id from list_agents'),
     view: z
@@ -797,6 +803,7 @@ const startRun = defineTool({
     'Project managers and the application Overseer: start a durable local or explicitly granted remote build/test/lint/benchmark/deploy/custom run. For remote work, name required_tools. The hub checks them before launch; when any are absent, provide the project\'s exact reviewed setup_command and the hub records that setup as its own durable prerequisite, then automatically queues the requested run behind its successful completion and verifies the tools again. Missing dependencies are therefore an action to provision, not a blocker to merely report. The hub captures source provenance, returns stable run ids, retains bounded logs and exact terminal state, and never blindly retries an outcome-unknown command. Local runs serialize on their checkout or working directory. Granted remote runs are concurrent by default; give only commands that must serialize the same explicit resource name (for example gpu or port-8080).',
   schema: {
     kind: z.enum(['build', 'test', 'lint', 'benchmark', 'deploy', 'custom']),
+    detail: z.enum(['summary', 'full']).optional().describe('Compact acknowledgement by default; full returns the exact retained command/provenance. inspect_runs can retrieve it later.'),
     executable: z.string().min(1).max(1_000).optional().describe('local target only: one executable; shell composition is not accepted'),
     args: z.array(z.string().max(8_000)).max(256).optional().describe('argument vector; defaults to []'),
     target_session: z.string().optional().describe('managed agent whose checkout should run; defaults to your own checkout'),
@@ -930,12 +937,12 @@ const startRun = defineTool({
     if (prerequisiteRun && result.run) {
       return JSON.stringify({
         dependencyPreflight: { required: requiredTools, missing: missingTools },
-        provisioningRun: prerequisiteRun,
-        run: result.run,
-      }, null, 2)
+        provisioningRun: durableRunView(prerequisiteRun, args.detail),
+        run: durableRunView(result.run, args.detail),
+      })
     }
     return result.ok && result.run
-      ? JSON.stringify(result.run, null, 2)
+      ? JSON.stringify(durableRunView(result.run, args.detail))
       : `Run not started: ${result.error ?? 'unknown error'}`
   },
 })
@@ -943,7 +950,7 @@ const startRun = defineTool({
 const inspectRuns = defineTool({
   name: 'inspect_runs',
   description:
-    'Project members: read durable runs and retained logs across your project for coordination. Managers and the application Overseer retain start/control authority separately. With run_id, returns that run plus at most 64 KiB from each log stream after the supplied byte cursors; use returned cursors to continue without rereading an enormous log.',
+    'Project members: read durable run summaries and retained logs across your project. With run_id, reads at most 64 KiB per stream after the byte cursors. Use returned cursors; detail=full retrieves exact command/provenance when auditing. Completion is automatically delivered to the starting agent, including during an active turn: do other useful work or yield instead of repeatedly polling unchanged cursors. EOF means caught up with current output, not that the run completed; state is authoritative. Start/control permissions remain separate.',
   schema: {
     run_id: z.string().optional(),
     session_ids: z.array(z.string()).max(64).optional(),
@@ -952,6 +959,7 @@ const inspectRuns = defineTool({
     limit: z.number().int().min(1).max(200).optional(),
     stdout_after: z.number().int().nonnegative().optional(),
     stderr_after: z.number().int().nonnegative().optional(),
+    detail: z.enum(['summary', 'full']).optional().describe('Defaults to compact summary; full returns the exact retained command, provenance and result.'),
   },
   run: async (args, { identity, services }) => {
     if (!services.inspectRuns) return 'Run inspection unavailable: this hub does not support durable runs.'
@@ -964,8 +972,19 @@ const inspectRuns = defineTool({
       stdoutAfter: args.stdout_after,
       stderrAfter: args.stderr_after,
     })
-    return result.ok ? JSON.stringify({ runs: result.runs ?? [], ...(result.logs ? { logs: result.logs } : {}) }, null, 2) :
-      `Run inspection unavailable: ${result.error ?? 'unknown error'}`
+    if (!result.ok) return `Run inspection unavailable: ${result.error ?? 'unknown error'}`
+    const runs = result.runs ?? []
+    const waitingForOutput = !!args.run_id && !!result.logs &&
+      !result.logs.stdout && !result.logs.stderr &&
+      runs.some((run) => run.state === 'queued' || run.state === 'running')
+    return JSON.stringify({
+      runs: runs.map((run) => durableRunView(run, args.detail, waitingForOutput)),
+      ...(result.logs ? { logs: result.logs } : {}),
+      ...(waitingForOutput ? {
+        waitingForOutput: true,
+        nextAction: 'No new output at these cursors. Completion is delivered automatically to the starting agent; do other work or yield rather than poll. Use detail=full for retained provenance.',
+      } : {}),
+    })
   },
 })
 
@@ -976,6 +995,7 @@ const controlRun = defineTool({
   schema: {
     run_id: z.string().min(1),
     operation: z.literal('cancel'),
+    detail: z.enum(['summary', 'full']).optional().describe('Compact outcome by default; full returns the complete retained record.'),
   },
   run: async (args, { identity, services }) => {
     if (!services.controlRun) return 'Run control unavailable: this hub does not support durable runs.'
@@ -984,7 +1004,7 @@ const controlRun = defineTool({
       return 'Run not cancelled: a teammate-caused turn cannot stop host work without explicit operator authorization.'
     }
     const result = await services.controlRun(identity.sessionId, args.run_id, args.operation)
-    return result.ok && result.run ? JSON.stringify(result.run, null, 2) :
+    return result.ok && result.run ? JSON.stringify(durableRunView(result.run, args.detail)) :
       `Run not controlled: ${result.error ?? 'unknown error'}`
   },
 })
@@ -1012,7 +1032,7 @@ const monitorCi = defineTool({
       monitorId: args.monitor_id,
     })
     if (!result.ok) return `CI monitor unavailable: ${result.error ?? 'unknown error'}`
-    return JSON.stringify(result.monitor ?? result.monitors ?? [], null, 2)
+    return JSON.stringify(result.monitor ?? result.monitors ?? [])
   },
 })
 
@@ -1021,6 +1041,7 @@ const queryTeam = defineTool({
   description:
     'Project managers and the application Overseer: one bounded, non-destructive query across team messages, task boards, pending approvals plus recent durable approval decisions, and durable runs. Filters are applied inside your live managed scope. Message pages use a stable cursor and never mark mail read; task/approval/run facets are current projections.',
   schema: {
+    detail: z.enum(['summary', 'full']).optional().describe('Run records default to compact summaries; full includes exact retained command/provenance. Other facets are unchanged.'),
     entities: z.array(z.enum(['messages', 'tasks', 'approvals', 'runs'])).max(4).optional(),
     session_ids: z.array(z.string()).max(64).optional(),
     statuses: z.array(z.string().min(1).max(80)).max(20).optional(),
@@ -1042,8 +1063,11 @@ const queryTeam = defineTool({
       afterCursor: args.after_cursor,
       limit: args.limit,
     })
-    return result.ok ? JSON.stringify(result.data ?? {}, null, 2) :
-      `Team query unavailable: ${result.error ?? 'unknown error'}`
+    if (!result.ok) return `Team query unavailable: ${result.error ?? 'unknown error'}`
+    const data = result.data as Record<string, unknown> | undefined
+    return JSON.stringify(data && Array.isArray(data.runs)
+      ? { ...data, runs: data.runs.map((run: DurableRun) => durableRunView(run, args.detail)) }
+      : data ?? {})
   },
 })
 
@@ -1751,7 +1775,7 @@ const overseerControl = defineTool({
       preferredEffort: args.preferred_effort,
     })
     if (!result.ok) return `Overseer control denied or failed: ${result.error ?? 'unknown error'}`
-    return result.data === undefined ? 'Overseer operation completed.' : JSON.stringify(result.data, null, 2)
+    return result.data === undefined ? 'Overseer operation completed.' : JSON.stringify(result.data)
   },
 })
 
@@ -1809,6 +1833,14 @@ export const AGENT_TOOLS: readonly AgentToolSpec[] = [
 ]
 
 const BY_NAME = new Map(AGENT_TOOLS.map((t) => [t.name, t]))
+
+/** Internal authenticated bridge discovery, not an advertised or agent-authored role. */
+export const AGENT_TOOL_CATALOG_OPERATION = '__allmyagents_tool_catalog'
+
+/** Discovery optimization only: live server-side authorization still gates every call. */
+export function agentToolsForIdentity(identity: Pick<SessionIdentity, 'isOverseer'>): readonly AgentToolSpec[] {
+  return identity.isOverseer === true ? AGENT_TOOLS : AGENT_TOOLS.filter((tool) => tool.name !== 'overseer_control')
+}
 
 /** The hub-only instructions shared by both transports' MCP servers (identical string). */
 export const AGENT_TOOLS_INSTRUCTIONS =

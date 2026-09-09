@@ -104,6 +104,7 @@ function identityFromSpec(spec: WorkerSessionSpec): SessionIdentity {
     provider: spec.provider,
     projectId: spec.projectId,
     label: spec.label,
+    ...(spec.isOverseer === true ? { isOverseer: true } : {}),
   }
 }
 
