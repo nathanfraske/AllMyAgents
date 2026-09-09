@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest'
 import { AgentMcpServer, inputSchemaFor, type AgentToolExecutor } from './agentMcpServer.js'
-import { AGENT_TOOLS, AGENT_TOOLS_INSTRUCTIONS, getAgentTool } from './agentToolCore.js'
+import { AGENT_TOOLS, AGENT_TOOLS_INSTRUCTIONS, agentToolsForIdentity, getAgentTool, type AgentServices } from './agentToolCore.js'
+import { buildAgentMcpServer } from './agentTools.js'
+import type { SessionIdentity } from './identity.js'
 
 // Drive the server the way the codex app-server does (verified line shapes against codex 0.145):
 // initialize (protocolVersion 2025-06-18) → notifications/initialized → tools/list → tools/call.
@@ -61,6 +63,31 @@ describe('AgentMcpServer (the real stdio MCP server codex loads for the Codex pa
     expect(r.result.isError).toBeUndefined()
     expect(r.result.content[0]!.type).toBe('text')
     expect(r.result.content[0]!.text).toBe('ran list_agents with {}')
+  })
+
+  it('refreshes bound-role discovery and matches Claude without replacing execution authorization', async () => {
+    let isOverseer = false
+    const out: any[] = []
+    const calls: string[] = []
+    const server = new AgentMcpServer({
+      execute: async (name) => { calls.push(name); return 'live authorization refused' },
+      listTools: async () => agentToolsForIdentity({ isOverseer }),
+      write: (message) => out.push(message),
+    })
+    for (const role of [false, true, false]) {
+      isOverseer = role
+      await server.handleLine(JSON.stringify({ jsonrpc: '2.0', id: out.length, method: 'tools/list' }))
+      const identity: SessionIdentity = { sessionId: 's1', profileId: 'p1', provider: 'claude', label: 'agent', isOverseer }
+      const claude = buildAgentMcpServer(identity, {} as AgentServices) as unknown as {
+        instance: { _registeredTools: Record<string, unknown> }
+      }
+      const names = out.at(-1).result.tools.map((tool: { name: string }) => tool.name)
+      expect(names).toEqual(Object.keys(claude.instance._registeredTools))
+      expect(names.includes('overseer_control')).toBe(role)
+    }
+    await server.handleLine(JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'overseer_control', arguments: { operation: 'status' } } }))
+    expect(calls).toEqual(['overseer_control'])
+    expect(out.at(-1).result.content[0].text).toBe('live authorization refused')
   })
 
   it('preserves a browser PNG as an MCP image block for Codex', async () => {

@@ -858,6 +858,26 @@ describe('project manager lifecycle awareness', () => {
     expect(result.summary).not.toContain('grandchild')
     expect(result.summary).not.toContain('unrelated')
   })
+
+  it('groups exact child identities once under active and stashed team headings', () => {
+    const { sessions, seed } = buildHub()
+    const manager = seed({ id: 'manager', isProjectManager: true })
+    sessions.managerChildStatus(manager.id)
+    const active = manager.managerTeams![0]!
+    const stashed = { ...active, id: 'team-stashed', name: 'Review' }
+    manager.managerTeams!.push(stashed)
+    for (const [id, team] of [['worker-a', active], ['worker-b', active], ['reviewer', stashed]] as const) {
+      seed({ id, parentSessionId: manager.id, managerTeamId: team.id, managerTeamName: team.name, status: 'idle', role: `role-${id}` })
+    }
+    const roster = sessions.managerChildStatus(manager.id).summary!.split('Roster:\n')[1]!
+    expect(roster.split(`Team ${active.name} (${active.id}) [ACTIVE]`)).toHaveLength(2)
+    expect(roster.split('Team Review (team-stashed) [STASHED]')).toHaveLength(2)
+    for (const id of ['worker-a', 'worker-b', 'reviewer']) {
+      expect(roster.split(`(${id}): idle; role: role-${id}`)).toHaveLength(2)
+    }
+    expect(roster.indexOf('(worker-b)')).toBeLessThan(roster.indexOf('[STASHED]'))
+    expect(roster.indexOf('(reviewer)')).toBeGreaterThan(roster.indexOf('[STASHED]'))
+  })
 })
 
 describe('project manager durable teams', () => {

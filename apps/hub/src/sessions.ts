@@ -77,6 +77,8 @@ import type { InstructionStore } from './instructions.js'
 import { identityOf, readableScopes, type SessionIdentity } from './identity.js'
 import {
   AGENT_TOOLS,
+  AGENT_TOOL_CATALOG_OPERATION,
+  agentToolsForIdentity,
   runAgentTool,
   type AgentServices,
   type ManagerSpawnResult,
@@ -1905,6 +1907,7 @@ export class SessionManager {
       ...(record.wslDistro ? { wsl: { distro: record.wslDistro } } : {}),
       projectId: record.projectId,
       label: identityOf(record).label,
+      ...(record.isOverseer === true ? { isOverseer: true } : {}),
       model: record.model,
       effort: record.effort,
       serviceTier: record.serviceTier,
@@ -3819,6 +3822,9 @@ export class SessionManager {
       return `Not attributed — the hub could not tell which of your Codex sessions is calling (no unique live session for this working directory on profile ${profileId}).`
     }
     try {
+      if (tool === AGENT_TOOL_CATALOG_OPERATION) {
+        return JSON.stringify({ version: 1, tools: agentToolsForIdentity(identity).map((spec) => spec.name) })
+      }
       return await runAgentTool(tool, args, { identity, services: this.agentServices() })
     } catch (err) {
       return `Tool error: ${err instanceof Error ? err.message : String(err)}`
@@ -10372,20 +10378,22 @@ export class SessionManager {
       else if (child.status === 'stopped') counts.stopped += 1
       else counts.errored += 1
     }
-    const activeRows = children
-      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
-      .map(
-        (child) => {
-          const context = this.contextWakeDeferral(child)
-          return (
-          `- ${child.title ?? identityOf(child).label} (${child.id}): ${child.status}; ` +
-          `team ${child.managerTeamName ?? 'unknown'} (${child.managerTeamId ?? 'unknown id'})` +
-          `${child.managerTeamId === manager.managerActiveTeamId ? ' [ACTIVE]' : ' [STASHED]'}` +
-          `; role: ${this.rosterLine(child.role ?? 'legacy general project contributor; repair with manage_child set_role')}` +
-          `${context ? `; CONTEXT BOUNDARY: direct manager wake permitted so provider compaction can preserve continuity (${context})` : ''}`
-          )
-        },
+    const teams = new Map<string, SessionRecord[]>()
+    for (const child of children.sort((left, right) => left.createdAt.localeCompare(right.createdAt))) {
+      const heading = `Team ${child.managerTeamName ?? 'unknown'} (${child.managerTeamId ?? 'unknown id'})` +
+        `${child.managerTeamId === manager.managerActiveTeamId ? ' [ACTIVE]' : ' [STASHED]'}`
+      const members = teams.get(heading) ?? []
+      members.push(child)
+      teams.set(heading, members)
+    }
+    const activeRows = [...teams].flatMap(([heading, members]) => [heading, ...members.map((child) => {
+      const context = this.contextWakeDeferral(child)
+      return (
+        `- ${child.title ?? identityOf(child).label} (${child.id}): ${child.status}; ` +
+        `role: ${this.rosterLine(child.role ?? 'legacy general project contributor; repair with manage_child set_role')}` +
+        `${context ? `; CONTEXT BOUNDARY: direct manager wake permitted so provider compaction can preserve continuity (${context})` : ''}`
       )
+    })])
     return {
       ok: true,
       summary: [

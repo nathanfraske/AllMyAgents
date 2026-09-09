@@ -22,6 +22,8 @@ export interface AgentMcpServerOptions {
   execute: AgentToolExecutor
   write: (msg: unknown) => void
   tools?: readonly AgentToolSpec[]
+  /** Hub-authenticated discovery, refreshed on each tools/list. Calls still go through the hub gate. */
+  listTools?: () => Promise<readonly AgentToolSpec[]>
   instructions?: string
   serverInfo?: { name: string; version: string }
   onLog?: (msg: string) => void
@@ -100,7 +102,7 @@ export class AgentMcpServer {
         return
       case 'tools/list':
         this.reply(id, {
-          tools: this.tools.map((spec) => ({
+          tools: (this.opts.listTools ? await this.opts.listTools() : this.tools).map((spec) => ({
             name: spec.name,
             description: spec.description,
             inputSchema: inputSchemaFor(spec),
@@ -142,6 +144,7 @@ export class AgentMcpServer {
  */
 export function runStdioAgentMcpServer(opts: {
   execute: AgentToolExecutor
+  listTools?: AgentMcpServerOptions['listTools']
   input?: NodeJS.ReadableStream
   output?: NodeJS.WritableStream
   instructions?: string
@@ -151,6 +154,7 @@ export function runStdioAgentMcpServer(opts: {
   const output = opts.output ?? process.stdout
   const server = new AgentMcpServer({
     execute: opts.execute,
+    listTools: opts.listTools,
     instructions: opts.instructions,
     serverInfo: opts.serverInfo,
     onLog: opts.onLog,

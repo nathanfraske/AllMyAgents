@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
-import { readBridgeEnv, makeHubExecutor } from './agentBridge.js'
+import { readBridgeEnv, makeHubExecutor, makeHubToolCatalog } from './agentBridge.js'
+import { AGENT_TOOLS, AGENT_TOOL_CATALOG_OPERATION } from './agentToolCore.js'
 
 describe('readBridgeEnv', () => {
   it('reads the hub URL / secret / profile from env and the cwd from the process', () => {
@@ -72,5 +73,31 @@ describe('makeHubExecutor (the bridge → hub forward)', () => {
   it('refuses cleanly when unconfigured (no hub URL/secret)', async () => {
     const out = await makeHubExecutor({ hubUrl: '', secret: '', profileId: '', cwd: '/x' })('list_agents', {})
     expect(out).toMatch(/not configured/)
+  })
+})
+
+describe('hub-authenticated tool discovery', () => {
+  const cfg = { hubUrl: 'http://127.0.0.1:7777', secret: 'test', profileId: 'codex-a', sessionId: 'bound', cwd: '/work' }
+  it('queries the exact binding and refreshes discovery rather than caching a stale role', async () => {
+    let names = ['list_agents']
+    const fake = (async (_url: string, init: RequestInit) => {
+      expect(JSON.parse(String(init.body))).toMatchObject({ tool: AGENT_TOOL_CATALOG_OPERATION, sessionId: 'bound', args: {} })
+      expect(init.signal).toBeInstanceOf(AbortSignal)
+      return { ok: true, json: async () => ({ text: JSON.stringify({ version: 1, tools: names }) }) }
+    }) as unknown as typeof fetch
+    const list = makeHubToolCatalog(cfg, fake)
+    expect((await list()).map(t => t.name)).toEqual(['list_agents'])
+    names = ['list_agents', 'overseer_control', 'invented_tool']
+    expect((await list()).map(t => t.name)).toEqual(['list_agents', 'overseer_control'])
+    names = ['list_agents']
+    expect((await list()).map(t => t.name)).toEqual(['list_agents'])
+  })
+  it.each(['old hub', '{"version":2,"tools":[]}', '{"version":1,"tools":[3]}'])('keeps rolling-upgrade discovery compatible on %s', async text => {
+    const fake = (async () => ({ ok: true, json: async () => ({ text }) })) as unknown as typeof fetch
+    expect(await makeHubToolCatalog(cfg, fake)()).toEqual(AGENT_TOOLS)
+  })
+  it('does not wedge or cache an incomplete catalog when the hub is unreachable', async () => {
+    const fake = (async () => { throw new Error('ECONNREFUSED') }) as unknown as typeof fetch
+    expect(await makeHubToolCatalog(cfg, fake)()).toEqual(AGENT_TOOLS)
   })
 })

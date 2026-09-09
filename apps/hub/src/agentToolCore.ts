@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { durableRunView } from './durableRunView.js'
 import type { SessionIdentity } from './identity.js'
 import { readableScopes } from './identity.js'
 import type { BusAddress, BusMessage } from './bus.js'
@@ -455,13 +456,17 @@ const listAgents = defineTool({
   run: async (_args, { identity, services }) => {
     const roster = await services.roster(identity.sessionId)
     if (!roster.length) return 'No other agents are currently on your team.'
-    return roster
-      .map((a) => {
-        const scope = a.isOverseer ? 'Application Overseer' : a.projectId ? `project ${a.projectId}` : 'no project'
+    const groups = new Map<string, typeof roster>()
+    for (const agent of roster) {
+      const scope = agent.isOverseer ? 'Application Overseer' : agent.projectId ? `project ${agent.projectId}` : 'no project'
+      const members = groups.get(scope) ?? []
+      members.push(agent)
+      groups.set(scope, members)
+    }
+    return [...groups].map(([scope, members]) => `${scope}\n${members.map((a) => {
         const role = a.role && (!a.isOverseer || a.role !== 'Application Overseer') ? `, ${a.role}` : ''
-        return `- ${a.label} — session ${a.sessionId} (${a.provider}, ${a.status}, ${scope}${role})`
-      })
-      .join('\n')
+        return `- ${a.label} — session ${a.sessionId} (${a.provider}, ${a.status}${role})`
+      }).join('\n')}`).join('\n\n')
   },
 })
 
@@ -798,6 +803,7 @@ const startRun = defineTool({
     'Project managers and the application Overseer: start a durable local or explicitly granted remote build/test/lint/benchmark/deploy/custom run. For remote work, name required_tools. The hub checks them before launch; when any are absent, provide the project\'s exact reviewed setup_command and the hub records that setup as its own durable prerequisite, then automatically queues the requested run behind its successful completion and verifies the tools again. Missing dependencies are therefore an action to provision, not a blocker to merely report. The hub captures source provenance, returns stable run ids, retains bounded logs and exact terminal state, and never blindly retries an outcome-unknown command. Local runs serialize on their checkout or working directory. Granted remote runs are concurrent by default; give only commands that must serialize the same explicit resource name (for example gpu or port-8080).',
   schema: {
     kind: z.enum(['build', 'test', 'lint', 'benchmark', 'deploy', 'custom']),
+    detail: z.enum(['summary', 'full']).optional().describe('Compact acknowledgement by default; full returns the exact retained command/provenance. inspect_runs can retrieve it later.'),
     executable: z.string().min(1).max(1_000).optional().describe('local target only: one executable; shell composition is not accepted'),
     args: z.array(z.string().max(8_000)).max(256).optional().describe('argument vector; defaults to []'),
     target_session: z.string().optional().describe('managed agent whose checkout should run; defaults to your own checkout'),
@@ -931,12 +937,12 @@ const startRun = defineTool({
     if (prerequisiteRun && result.run) {
       return JSON.stringify({
         dependencyPreflight: { required: requiredTools, missing: missingTools },
-        provisioningRun: prerequisiteRun,
-        run: result.run,
-      }, null, 2)
+        provisioningRun: durableRunView(prerequisiteRun, args.detail),
+        run: durableRunView(result.run, args.detail),
+      })
     }
     return result.ok && result.run
-      ? JSON.stringify(result.run, null, 2)
+      ? JSON.stringify(durableRunView(result.run, args.detail))
       : `Run not started: ${result.error ?? 'unknown error'}`
   },
 })
@@ -972,24 +978,7 @@ const inspectRuns = defineTool({
       !result.logs.stdout && !result.logs.stderr &&
       runs.some((run) => run.state === 'queued' || run.state === 'running')
     return JSON.stringify({
-      runs: args.detail === 'full' ? runs : runs.map((run) => ({
-        id: run.id, projectId: run.projectId, actorSessionId: run.actorSessionId,
-        actorLabel: run.actorLabel, targetSessionId: run.targetSessionId,
-        state: run.state, kind: run.kind, dependsOnRunId: run.dependsOnRunId,
-        startedAt: run.startedAt, completedAt: run.completedAt, timeoutMs: run.timeoutMs,
-        exitCode: run.exitCode, signal: run.signal,
-        error: run.state === 'succeeded' ? undefined : run.error,
-        logsTruncated: run.logsTruncated,
-        ...(!waitingForOutput ? {
-          commandSummary: run.commandSummary, commandSha256: run.commandSha256,
-          executionTarget: run.executionTarget.kind === 'remote'
-            ? { kind: 'remote', siteId: run.executionTarget.siteId, rootId: run.executionTarget.rootId }
-            : { kind: 'local' },
-          platform: run.provenance.platform, architecture: run.provenance.architecture,
-          gitHead: run.provenance.git?.head,
-          sourceManifestSha256: run.provenance.git?.sourceManifestSha256,
-        } : {}),
-      })),
+      runs: runs.map((run) => durableRunView(run, args.detail, waitingForOutput)),
       ...(result.logs ? { logs: result.logs } : {}),
       ...(waitingForOutput ? {
         waitingForOutput: true,
@@ -1006,6 +995,7 @@ const controlRun = defineTool({
   schema: {
     run_id: z.string().min(1),
     operation: z.literal('cancel'),
+    detail: z.enum(['summary', 'full']).optional().describe('Compact outcome by default; full returns the complete retained record.'),
   },
   run: async (args, { identity, services }) => {
     if (!services.controlRun) return 'Run control unavailable: this hub does not support durable runs.'
@@ -1014,7 +1004,7 @@ const controlRun = defineTool({
       return 'Run not cancelled: a teammate-caused turn cannot stop host work without explicit operator authorization.'
     }
     const result = await services.controlRun(identity.sessionId, args.run_id, args.operation)
-    return result.ok && result.run ? JSON.stringify(result.run, null, 2) :
+    return result.ok && result.run ? JSON.stringify(durableRunView(result.run, args.detail)) :
       `Run not controlled: ${result.error ?? 'unknown error'}`
   },
 })
@@ -1042,7 +1032,7 @@ const monitorCi = defineTool({
       monitorId: args.monitor_id,
     })
     if (!result.ok) return `CI monitor unavailable: ${result.error ?? 'unknown error'}`
-    return JSON.stringify(result.monitor ?? result.monitors ?? [], null, 2)
+    return JSON.stringify(result.monitor ?? result.monitors ?? [])
   },
 })
 
@@ -1051,6 +1041,7 @@ const queryTeam = defineTool({
   description:
     'Project managers and the application Overseer: one bounded, non-destructive query across team messages, task boards, pending approvals plus recent durable approval decisions, and durable runs. Filters are applied inside your live managed scope. Message pages use a stable cursor and never mark mail read; task/approval/run facets are current projections.',
   schema: {
+    detail: z.enum(['summary', 'full']).optional().describe('Run records default to compact summaries; full includes exact retained command/provenance. Other facets are unchanged.'),
     entities: z.array(z.enum(['messages', 'tasks', 'approvals', 'runs'])).max(4).optional(),
     session_ids: z.array(z.string()).max(64).optional(),
     statuses: z.array(z.string().min(1).max(80)).max(20).optional(),
@@ -1072,8 +1063,11 @@ const queryTeam = defineTool({
       afterCursor: args.after_cursor,
       limit: args.limit,
     })
-    return result.ok ? JSON.stringify(result.data ?? {}, null, 2) :
-      `Team query unavailable: ${result.error ?? 'unknown error'}`
+    if (!result.ok) return `Team query unavailable: ${result.error ?? 'unknown error'}`
+    const data = result.data as Record<string, unknown> | undefined
+    return JSON.stringify(data && Array.isArray(data.runs)
+      ? { ...data, runs: data.runs.map((run: DurableRun) => durableRunView(run, args.detail)) }
+      : data ?? {})
   },
 })
 
@@ -1781,7 +1775,7 @@ const overseerControl = defineTool({
       preferredEffort: args.preferred_effort,
     })
     if (!result.ok) return `Overseer control denied or failed: ${result.error ?? 'unknown error'}`
-    return result.data === undefined ? 'Overseer operation completed.' : JSON.stringify(result.data, null, 2)
+    return result.data === undefined ? 'Overseer operation completed.' : JSON.stringify(result.data)
   },
 })
 
@@ -1839,6 +1833,14 @@ export const AGENT_TOOLS: readonly AgentToolSpec[] = [
 ]
 
 const BY_NAME = new Map(AGENT_TOOLS.map((t) => [t.name, t]))
+
+/** Internal authenticated bridge discovery, not an advertised or agent-authored role. */
+export const AGENT_TOOL_CATALOG_OPERATION = '__allmyagents_tool_catalog'
+
+/** Discovery optimization only: live server-side authorization still gates every call. */
+export function agentToolsForIdentity(identity: Pick<SessionIdentity, 'isOverseer'>): readonly AgentToolSpec[] {
+  return identity.isOverseer === true ? AGENT_TOOLS : AGENT_TOOLS.filter((tool) => tool.name !== 'overseer_control')
+}
 
 /** The hub-only instructions shared by both transports' MCP servers (identical string). */
 export const AGENT_TOOLS_INSTRUCTIONS =

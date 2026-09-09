@@ -406,6 +406,7 @@ export class InProcessExecutor implements Executor {
       provider: spec.provider,
       projectId: spec.projectId,
       label: spec.label,
+      ...(spec.isOverseer === true ? { isOverseer: true } : {}),
     }
   }
 

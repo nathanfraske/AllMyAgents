@@ -23,6 +23,8 @@ export interface WorkerSessionSpec {
   wsl?: { distro: string }
   projectId?: string
   label: string
+  /** Hub-minted role for provider tool discovery, never execution authority. */
+  isOverseer?: boolean
   model?: string
   effort?: string
   serviceTier?: string
