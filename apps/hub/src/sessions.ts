@@ -7964,6 +7964,11 @@ export class SessionManager {
 
   async create(profileId: string, opts: CreateOptions): Promise<SessionRecord> {
     this.assertTurnAdmissionOpen()
+    const usageRefresh = this.usage.refreshCodexBeforeDispatch(profileId)
+    if (usageRefresh) {
+      await usageRefresh
+      this.assertTurnAdmissionOpen()
+    }
     const admission = this.beginProfileAdmission(profileId)
     try {
       return await this.createAdmitted(profileId, opts, admission)
@@ -8349,6 +8354,12 @@ export class SessionManager {
     this.assertTurnAdmissionOpen()
     const record = this.sessions.get(sessionId)
     if (!record) throw new Error(`unknown session: ${sessionId}`)
+    const usageRefresh = record.status !== 'stopped' ? this.usage.refreshCodexBeforeDispatch(record.profileId) : undefined
+    if (usageRefresh) {
+      await usageRefresh
+      this.assertTurnAdmissionOpen()
+      if (this.sessions.get(sessionId) !== record) throw new Error('session changed while refreshing account usage')
+    }
     const admission = this.beginProfileAdmission(record.profileId)
     try {
       await this.sendAdmitted(record, text, override, attachmentIds, admission)
@@ -11858,7 +11869,7 @@ function usageDispatchBlock(
     return `${fullClaudeLine.label} is ${fullClaudeLine.percent}% used${resetSuffix(fullClaudeLine.resetsAt)}`
   }
   if (snapshot.codex?.spendControlReached === true) return 'Codex spend control has been reached'
-  if (snapshot.codex?.rateLimitReachedType) {
+  if (snapshot.codex?.rateLimitReachedType && activeWindow(snapshot.codex.resetsAt)) {
     return `Codex rate limit reached: ${snapshot.codex.rateLimitReachedType}`
   }
   if (

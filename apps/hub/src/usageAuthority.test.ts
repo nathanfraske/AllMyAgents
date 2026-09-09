@@ -88,6 +88,30 @@ describe('profile-scoped usage publication authority', () => {
     expect(usage.list()[0]?.codex).toMatchObject({ rateLimitReachedType: 'current' })
   })
 
+  it('lets a new credential owner refresh without waiting for the old reader, which cannot release the new slot', async () => {
+    const { usage } = monitor()
+    let oldRead!: (value: unknown) => void
+    let newRead!: (value: unknown) => void
+    const reader = vi.fn()
+      .mockImplementationOnce(() => new Promise((resolve) => { oldRead = resolve }))
+      .mockImplementationOnce(() => new Promise((resolve) => { newRead = resolve }))
+    usage.setCodexReader(reader)
+    usage.setProfileAuthority('codex-a', 30, true)
+    const oldPoll = usage.pollCodexOnce()
+    usage.setProfileAuthority('codex-a', 30, false)
+    usage.setProfileAuthority('codex-a', 31, true)
+    const newPoll = usage.pollCodexOnce()
+    expect(reader).toHaveBeenCalledTimes(2)
+    oldRead({ rateLimits: { primary: { usedPercent: 100 } } })
+    await oldPoll
+    const coalesced = usage.pollCodexOnce()
+    expect(reader).toHaveBeenCalledTimes(2)
+    expect(usage.list()[0]?.codex).toBeUndefined()
+    newRead({ rateLimits: { primary: { usedPercent: 3 } } })
+    await Promise.all([newPoll, coalesced])
+    expect(usage.list()[0]?.codex?.usedPercent).toBe(3)
+  })
+
   it('rejects backward authority epochs', () => {
     const { usage } = monitor()
     usage.setProfileAuthority('codex-a', 9, true)

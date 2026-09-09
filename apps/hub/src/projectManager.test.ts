@@ -276,6 +276,16 @@ describe('project manager permission ceiling', () => {
 })
 
 describe('project manager exhausted-account dispatch guard', () => {
+  it('ignores an expired Codex rejection when dispatching to a worker', () => {
+    const { sessions, usage, seed } = buildHub()
+    seed({ id: 'manager', projectId: 'project-1', isProjectManager: true, managerPauseExhaustedAccounts: true })
+    seed({ id: 'child', profileId: 'p2', provider: 'codex', projectId: 'project-1', parentSessionId: 'manager' })
+    // Dispatch reads the account's derived state, rather than re-blocking on a raw historical flag.
+    usage.noteCodex('p2', { usedPercent: 100, rateLimitReachedType: 'requests', resetsAt: Date.now() / 1000 - 1 })
+    expect(sessions.busSend('manager', { kind: 'session', id: 'child' }, 'continue', 'The quota window has reset.', false))
+      .toEqual({ ok: true, delivered: 1 })
+  })
+
   it('pauses direct-child messages at 100% but permits them when paid overage is active', () => {
     const { sessions, journal, usage, seed } = buildHub()
     const manager = seed({ id: 'manager', projectId: 'project-1' })
