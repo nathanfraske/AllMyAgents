@@ -5,6 +5,17 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.43-alpha.47 — 2026-09-09
+
+[Full v0.1.43-alpha.47 release notes](docs/releases/v0.1.43-alpha.47.md)
+
+- Compact shared run summaries and project/team-grouped rosters reduce repeated model context.
+- Codex and Claude discover the Overseer control tool only for Overseer identities, without changing authorization.
+- Exhausted Codex quota observations refresh before blocking work and soon after reset boundaries.
+- Addressed local Overseer/project messaging works across project boundaries; unrelated project routing remains scoped.
+- Journal validation resumes in bounded batches; postponed snapshots retry promptly, and ordinary coverage waits no longer look like journal failure.
+- Loaded transcript history survives baseline refresh and failed replacement loads instead of disappearing.
+
 ## v0.1.42-alpha.46 — 2026-09-06
 
 This release improves transcript scrolling, keeps side-panel tabs together, and surfaces agent activity during
