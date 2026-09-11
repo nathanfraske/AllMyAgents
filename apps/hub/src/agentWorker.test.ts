@@ -20,6 +20,31 @@ import { MemoryStore } from './memory.js'
 import { PracticeStore } from './practices.js'
 import { SessionManager } from './sessions.js'
 import { QuestionService } from './questions.js'
+import type { HubToWorker } from './workerProtocol.js'
+import { InProcessExecutor } from './executor.js'
+
+describe('native goal wait executor parity', () => {
+  it.each([false, true])('parks only the bound root and propagates acknowledgement failure=%s', async fail => {
+    const pauseAutonomousGoal = fail ? vi.fn().mockRejectedValue(new Error('native pause unconfirmed')) : vi.fn().mockResolvedValue(undefined)
+    const maps = {
+      codexSessionClients: new Map([['owner', { pauseAutonomousGoal }]]),
+      codexThreads: new Map([['owner', 'exact-provider-thread']]),
+    }
+    const sent = vi.fn()
+    const worker = Object.assign(Object.create(AgentWorker.prototype), maps, { server: { send: sent } }) as { onCommand(msg: HubToWorker): void }
+    worker.onCommand({ t: 'pauseAutonomousGoal', reqId: 'wait-1', sessionId: 'owner' })
+    await vi.waitFor(() => expect(sent).toHaveBeenCalledWith(expect.objectContaining({ t: 'ack', reqId: 'wait-1', ok: !fail })))
+    expect(pauseAutonomousGoal).toHaveBeenCalledWith('exact-provider-thread')
+    worker.onCommand({ t: 'pauseAutonomousGoal', reqId: 'wrong-owner', sessionId: 'other' })
+    await vi.waitFor(() => expect(sent).toHaveBeenCalledWith(expect.objectContaining({ t: 'ack', reqId: 'wrong-owner', ok: false })))
+    expect(pauseAutonomousGoal).toHaveBeenCalledTimes(1)
+    const local = Object.assign(Object.create(InProcessExecutor.prototype), maps) as InProcessExecutor
+    if (fail) await expect(local.pauseAutonomousGoal('owner')).rejects.toThrow('unconfirmed')
+    else await local.pauseAutonomousGoal('owner')
+    await expect(local.pauseAutonomousGoal('other')).rejects.toThrow('No bound Codex thread')
+    expect(pauseAutonomousGoal).toHaveBeenCalledTimes(2)
+  })
+})
 
 // STEP 4 round-trips (docs/agent-worker-impl.md §3.3): the worker's MCP tool handlers relay bus/memory/
 // practices/approval back to hub-owned services. These two halves must agree on the wire shape, so they

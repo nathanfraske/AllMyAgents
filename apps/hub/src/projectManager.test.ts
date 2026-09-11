@@ -68,11 +68,13 @@ function buildHub() {
     _attachments?: Parameters<Executor['runTurn']>[3],
   ) => {})
   const startThread = vi.fn(async () => 'unused')
+  const pauseAutonomousGoal = vi.fn(async (_sessionId: string) => {})
   const executor: Executor = {
     startThread,
     runTurn,
     steer,
     interrupt: async () => {},
+    pauseAutonomousGoal,
     stopSession: async () => {},
     readCodexLimits: async () => ({}),
     listLive: async () => [],
@@ -115,7 +117,7 @@ function buildHub() {
     journal.db.close()
     fs.rmSync(root, { recursive: true, force: true })
   })
-  return { sessions, journal, approvals, usage, projects, instructions, bus, seed, repo, steer, runTurn, startThread }
+  return { sessions, journal, approvals, usage, projects, instructions, bus, seed, repo, steer, runTurn, startThread, pauseAutonomousGoal }
 }
 
 function transition(sessions: SessionManager, id: string, status: SessionStatus): void {
@@ -1481,6 +1483,13 @@ describe('project manager durable live roster', () => {
     expect(codexManagerRuntime).toContain('Before every progress or completion report')
     expect(codexWorkerRuntime).toContain('Keep your provider-native task/plan board current')
     expect(codexWorkerRuntime).toContain('the manager owns the audited assign_child_task record')
+    for (const runtime of [managerRuntime, codexManagerRuntime]) {
+      expect(runtime).toContain('control_run(run_id, operation="wait")')
+      expect(runtime).toContain('failed parking is not a confirmed wait')
+    }
+    for (const runtime of [workerRuntime, codexWorkerRuntime]) {
+      expect(runtime).not.toContain('Durable-run wait discipline:')
+    }
     expect(runTurn).toHaveBeenCalledTimes(4)
     expect(bus.pending(manager.id)).toHaveLength(0)
     expect(bus.pending('legacy-worker')).toHaveLength(0)
@@ -1595,6 +1604,79 @@ describe('operator-enabled worker one-shot sub-agents', () => {
 })
 
 describe('project manager visibility into its own workers', () => {
+  it.each(['codex', 'claude'] as const)('parks only the %s caller while preserving the run and exactly-once completion wake', async provider => {
+    const { sessions, journal, bus, projects, seed, repo, runTurn, pauseAutonomousGoal } = buildHub()
+    const project = projects.create('Parked run project', repo)
+    const manager = seed({ id: 'manager', profileId: provider === 'codex' ? 'p2' : 'p1', provider, projectId: project.id, isProjectManager: true })
+    const controller = new DurableRunController(new DurableRunStore(journal.db), journal, path.join(path.dirname(repo), 'parked-logs'))
+    sessions.setDurableRunController(controller)
+    cleanups.push(() => controller.shutdown())
+    // Accept work but hold execution to make the queued boundary deterministic.
+    const queue = controller as unknown as { pump(): Promise<void> }
+    const heldPump = vi.spyOn(queue, 'pump').mockResolvedValue()
+    controller.activate()
+    const started = await sessions.managerStartRun(manager.id, { kind: 'test', executable: process.execPath, args: ['-e', 'process.exit(0)'] })
+    expect(started.ok).toBe(true)
+    const before = structuredClone(controller.store.get(started.run!.id))
+    await expect(sessions.managerControlRun(manager.id, started.run!.id, 'wait')).resolves.toMatchObject({ ok: true, waiting: true, run: { state: 'queued', cancelRequested: false } })
+    expect(controller.store.get(started.run!.id)).toEqual(before)
+    expect(pauseAutonomousGoal).toHaveBeenCalledTimes(provider === 'codex' ? 1 : 0)
+    if (provider === 'codex') expect(pauseAutonomousGoal).toHaveBeenCalledWith(manager.id)
+    expect(runTurn).not.toHaveBeenCalled()
+    expect(journal.recentEventsForSession(manager.id)).toContainEqual(expect.objectContaining({ kind: 'run/wait-armed' }))
+    heldPump.mockRestore()
+    await queue.pump()
+    await vi.waitFor(() => expect(controller.store.get(started.run!.id)?.state).toBe('succeeded'))
+    await vi.waitFor(() => expect(runTurn).toHaveBeenCalledOnce())
+    expect(runTurn.mock.calls[0]![2]).toBe('bus')
+    expect(bus.pending(manager.id)).toEqual([])
+    expect(sessions.busInbox(manager.id)).toHaveLength(1)
+    expect(sessions.managerControlRun(manager.id, started.run!.id, 'wait')).toMatchObject({ ok: true, waiting: false })
+  })
+
+  it('refuses waiting on another actor or project and preserves all work when native parking fails', async () => {
+    const { sessions, journal, projects, seed, repo, pauseAutonomousGoal } = buildHub()
+    const project = projects.create('Wait ownership', repo)
+    const manager = seed({ id: 'manager', provider: 'codex', profileId: 'p2', projectId: project.id, isProjectManager: true })
+    const peer = seed({ id: 'peer', projectId: project.id, isProjectManager: true })
+    const other = seed({ id: 'other', projectId: 'other-project', isProjectManager: true })
+    const controller = new DurableRunController(new DurableRunStore(journal.db), journal, path.join(path.dirname(repo), 'wait-owner-logs'))
+    sessions.setDurableRunController(controller)
+    cleanups.push(() => controller.shutdown())
+    vi.spyOn(controller as unknown as { pump(): Promise<void> }, 'pump').mockResolvedValue()
+    controller.activate()
+    const started = await sessions.managerStartRun(manager.id, { kind: 'test', executable: process.execPath, args: ['-e', 'process.exit(0)'] })
+    const before = structuredClone(controller.store.get(started.run!.id))
+    expect(sessions.managerControlRun(peer.id, started.run!.id, 'wait')).toMatchObject({ ok: false })
+    expect(sessions.managerControlRun(other.id, started.run!.id, 'wait')).toMatchObject({ ok: false })
+    expect(pauseAutonomousGoal).not.toHaveBeenCalled()
+    pauseAutonomousGoal.mockRejectedValueOnce(new Error('native pause timed out; outcome unconfirmed'))
+    await expect(sessions.managerControlRun(manager.id, started.run!.id, 'wait')).resolves.toMatchObject({ ok: false, error: expect.stringContaining('Wait not confirmed') })
+    expect(controller.store.get(started.run!.id)).toEqual(before)
+    expect(journal.recentEventsForSession(manager.id)).not.toContainEqual(expect.objectContaining({ kind: 'run/wait-armed' }))
+    expect(journal.recentEventsForSession(manager.id)).toContainEqual(expect.objectContaining({ kind: 'run/wait-not-confirmed' }))
+  })
+
+  it('rechecks a terminal transition during native parking instead of hiding the completion', async () => {
+    const { sessions, journal, projects, seed, repo, pauseAutonomousGoal, runTurn } = buildHub()
+    const project = projects.create('Wait race', repo)
+    const manager = seed({ id: 'manager', provider: 'codex', profileId: 'p2', projectId: project.id, isProjectManager: true })
+    const controller = new DurableRunController(new DurableRunStore(journal.db), journal, path.join(path.dirname(repo), 'wait-race-logs'))
+    sessions.setDurableRunController(controller)
+    cleanups.push(() => controller.shutdown())
+    const queue = controller as unknown as { pump(): Promise<void> }
+    const heldPump = vi.spyOn(queue, 'pump').mockResolvedValue()
+    controller.activate()
+    const started = await sessions.managerStartRun(manager.id, { kind: 'test', executable: process.execPath, args: ['-e', 'process.exit(0)'] })
+    pauseAutonomousGoal.mockImplementationOnce(async () => {
+      heldPump.mockRestore()
+      await queue.pump()
+      await vi.waitFor(() => expect(controller.store.get(started.run!.id)?.state).toBe('succeeded'))
+    })
+    await expect(sessions.managerControlRun(manager.id, started.run!.id, 'wait')).resolves.toMatchObject({ ok: true, waiting: false, run: { state: 'succeeded' } })
+    await vi.waitFor(() => expect(runTurn).toHaveBeenCalledOnce())
+  })
+
   it('wakes the run owner exactly once after a terminal durable result', async () => {
     const { sessions, journal, bus, projects, seed, repo, runTurn } = buildHub()
     const project = projects.create('Run continuation project', repo)

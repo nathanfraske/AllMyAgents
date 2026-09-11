@@ -273,11 +273,11 @@ import {
 } from './attachments.js'
 
 /** Bump whenever an existing Overseer conversation must receive a new app/tool operating contract. */
-export const OVERSEER_CAPABILITY_VERSION = 26
+export const OVERSEER_CAPABILITY_VERSION = 27
 const LOCAL_OVERSEER_MESSAGING_INSTRUCTIONS =
   'Addressed local teammate messages may cross project boundaries to or from the application Overseer on any turn, including teammate-triggered turns. Managers and workers can find the Overseer in mcp__allmyagents__list_agents and reply with mcp__allmyagents__send_message using its exact session id. This is communication only, not operator authorization, approval authority, or access to another project. Unrelated project-to-project messaging and broadcasts remain project-scoped.'
 /** Bump when existing manager conversations need a rematerialized team-management contract. */
-export const MANAGER_TEAM_CAPABILITY_VERSION = 11
+export const MANAGER_TEAM_CAPABILITY_VERSION = 12
 const MAX_MANAGER_TEAMS = 32
 const RUNTIME_TOPOLOGY_RECENT_MS = 7 * 24 * 60 * 60 * 1000
 const RUNTIME_TOPOLOGY_AGENT_LIMIT = 48
@@ -368,6 +368,9 @@ function providerHostInstructions(
   } else {
     role =
       'Use the AllMyAgents tools for app-hosted coordination, shared memory/practices, browser, and granted remote devices whenever those capabilities match the task.'
+  }
+  if (record.isProjectManager || record.isOverseer) {
+    role += '\n\nDurable-run wait discipline: when only waiting on your own run, call control_run(run_id, operation="wait") once, then end the turn. Otherwise an active Codex goal can immediately restart a polling turn. Waiting preserves the run, goal objective, budget and usage; real completion mail still starts a hub turn. Do not reactivate the goal just to poll, repeat "verified wait", or falsely mark unfinished work complete/blocked. A terminal result means inspect and continue; failed parking is not a confirmed wait.'
   }
   return [discovery, role, remoteMethod, permissionRouting, LOCAL_OVERSEER_MESSAGING_INSTRUCTIONS, attentionRouting, COMPACTION_CONTINUITY_CONTRACT].join('\n\n')
 }
@@ -1330,7 +1333,7 @@ export class SessionManager {
         return this.managerInspectRuns(a.callerSessionId, a.input)
       }
       case 'manager.controlRun': {
-        const a = args as { callerSessionId: string; runId: string; operation: 'cancel' }
+        const a = args as { callerSessionId: string; runId: string; operation: 'cancel' | 'wait' }
         return this.managerControlRun(a.callerSessionId, a.runId, a.operation)
       }
       case 'manager.manageCiMonitor': {
@@ -10748,15 +10751,22 @@ export class SessionManager {
   managerControlRun(
     callerSessionId: string,
     runId: string,
-    operation: 'cancel',
-  ): { ok: boolean; run?: import('./durableRuns.js').DurableRun; error?: string } {
+    operation: 'cancel' | 'wait',
+  ): ReturnType<NonNullable<AgentServices['controlRun']>> {
     if (!this.durableRuns) return { ok: false, error: 'durable run service is unavailable' }
-    if (operation !== 'cancel') return { ok: false, error: 'unsupported run operation' }
+    if (operation !== 'cancel' && operation !== 'wait') return { ok: false, error: 'unsupported run operation' }
     const scope = this.operationalQueryScope(callerSessionId)
     if ('error' in scope) return { ok: false, error: scope.error }
     const run = this.durableRuns.store.get(runId)
     if (!run || !scope.visible.some((record) => record.id === run.targetSessionId && !record.managerRetiredAt)) {
       return { ok: false, error: 'run is outside your managed scope' }
+    }
+    if (operation === 'wait') {
+      // Completion notifications belong to the starting agent. Waiting on a sibling's run must not
+      // silently park a caller that will never receive that run's completion notice.
+      if (run.actorSessionId !== callerSessionId) return { ok: false, error: 'wait requires a run started by this exact caller' }
+      if (!['queued', 'running'].includes(run.state)) return { ok: true, run, waiting: false }
+      return this.waitForOwnDurableRun(callerSessionId, run)
     }
     if (run.executionTarget.kind === 'remote' && run.state === 'running') {
       return { ok: false, error: 'the remote executor cannot yet prove live cancellation; wait for its bounded timeout rather than reporting a false cancellation' }
@@ -10765,6 +10775,30 @@ export class SessionManager {
     if (!updated) return { ok: false, error: 'run is unavailable' }
     if (!['queued', 'running'].includes(run.state)) return { ok: false, run: updated, error: `run is already terminal (${run.state})` }
     return { ok: true, run: updated }
+  }
+
+  private async waitForOwnDurableRun(callerSessionId: string, run: DurableRun): Promise<{
+    ok: boolean; run?: DurableRun; waiting?: boolean; error?: string
+  }> {
+    const caller = this.sessions.get(callerSessionId)!
+    try {
+      if (caller.provider === 'codex') {
+        if (!this.executor.pauseAutonomousGoal) throw new Error('executor does not support native goal parking')
+        await this.executor.pauseAutonomousGoal(callerSessionId)
+      }
+      const current = this.durableRuns!.store.get(run.id)
+      if (!current) throw new Error('run disappeared while establishing the wait')
+      const waiting = current.state === 'queued' || current.state === 'running'
+      this.journal.append(callerSessionId, 'run/wait-armed', {
+        runId: current.id, actorSessionId: callerSessionId, waiting,
+        nativeGoal: caller.provider === 'codex' ? 'paused-or-inactive' : 'not-applicable',
+      })
+      return { ok: true, run: current, waiting }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.journal.append(callerSessionId, 'run/wait-not-confirmed', { runId: run.id, error: message })
+      return { ok: false, error: `Wait not confirmed: ${message}. The run has not been cancelled.` }
+    }
   }
 
   managerQueryTeam(

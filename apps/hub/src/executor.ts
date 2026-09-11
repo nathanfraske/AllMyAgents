@@ -64,6 +64,8 @@ export interface Executor {
   steer(sessionId: string, text: string, attachments?: readonly AttachmentMeta[]): Promise<void>
   /** Interrupt the in-flight parent turn (claude query / codex turn). */
   interrupt(sessionId: string): Promise<void>
+  /** Stop only native goal auto-continuations while waiting for hub-owned work. Never cancels a run. */
+  pauseAutonomousGoal?(sessionId: string): Promise<void>
   /** Interrupt one vendor sub-agent, preserving the parent turn, sibling agents, and all files on disk. */
   interruptAgent?(sessionId: string, targetId: string): Promise<void>
   /** Drop the driver/thread for a stopped/deleted session from the executor. */
@@ -278,7 +280,7 @@ export interface InProcessExecutorHubHooks {
   managerControlRun(
     callerSessionId: string,
     runId: string,
-    operation: 'cancel',
+    operation: 'cancel' | 'wait',
   ): ReturnType<NonNullable<AgentServices['controlRun']>>
   managerManageCiMonitor(
     callerSessionId: string,
@@ -860,6 +862,13 @@ export class InProcessExecutor implements Executor {
       const client = this.codexSessionClients.get(sessionId)
       if (client) await client.interrupt(threadId)
     }
+  }
+
+  async pauseAutonomousGoal(sessionId: string): Promise<void> {
+    const client = this.codexSessionClients.get(sessionId)
+    const threadId = this.codexThreads.get(sessionId)
+    if (!client || !threadId) throw new Error('No bound Codex thread; native goal wait was not confirmed')
+    await client.pauseAutonomousGoal(threadId)
   }
 
   async interruptAgent(sessionId: string, targetId: string): Promise<void> {

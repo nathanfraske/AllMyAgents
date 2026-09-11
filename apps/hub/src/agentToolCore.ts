@@ -344,12 +344,12 @@ export interface AgentServices {
       stderrAfter?: number
     },
   ): Awaitable<{ ok: boolean; runs?: DurableRun[]; logs?: DurableRunLogPage; error?: string }>
-  /** Cancel one queued/running durable run in the caller's managed scope. */
+  /** Cancel managed work, or park the caller's native goal while awaiting its own run. */
   controlRun?(
     callerSessionId: string,
     runId: string,
-    operation: 'cancel',
-  ): Awaitable<{ ok: boolean; run?: DurableRun; error?: string }>
+    operation: 'cancel' | 'wait',
+  ): Awaitable<{ ok: boolean; run?: DurableRun; waiting?: boolean; error?: string }>
   /** Create/list/cancel a persisted GitHub CI watch scoped by the existing workflow_runs grant. */
   manageCiMonitor?(
     callerSessionId: string,
@@ -982,7 +982,7 @@ const inspectRuns = defineTool({
       ...(result.logs ? { logs: result.logs } : {}),
       ...(waitingForOutput ? {
         waitingForOutput: true,
-        nextAction: 'No new output at these cursors. Completion is delivered automatically to the starting agent; do other work or yield rather than poll. Use detail=full for retained provenance.',
+        nextAction: 'No new output at these cursors. Do other useful work. If only waiting on your own run, call control_run with operation=wait once, then end the turn: this parks native goal auto-continuations; real completion mail still starts a new hub turn. Do not poll or emit repeated waiting messages. Use detail=full for retained provenance.',
       } : {}),
     })
   },
@@ -991,19 +991,27 @@ const inspectRuns = defineTool({
 const controlRun = defineTool({
   name: 'control_run',
   description:
-    'Project managers and the application Overseer: cancel one queued run or one running local run in your managed scope. Cancellation is recorded as a terminal run outcome and releases its resource claims; completed and outcome-unknown runs are immutable. A running remote request is intentionally not reported cancelled until the remote protocol can prove that outcome.',
+    'Project managers and the application Overseer: operation=wait parks only your own native goal auto-continuations while awaiting a run you started; the run, logs, resources and task remain intact. Then end the turn. Real completion mail still wakes you; do not reactivate the goal merely to check again. This is allowed on teammate turns. operation=cancel instead cancels managed local/queued work, requires operator-origin authority, and records a terminal outcome. Running remote work cannot be falsely reported cancelled; terminal and outcome-unknown records remain immutable.',
   schema: {
     run_id: z.string().min(1),
-    operation: z.literal('cancel'),
+    operation: z.enum(['cancel', 'wait']),
     detail: z.enum(['summary', 'full']).optional().describe('Compact outcome by default; full returns the complete retained record.'),
   },
   run: async (args, { identity, services }) => {
     if (!services.controlRun) return 'Run control unavailable: this hub does not support durable runs.'
-    if (services.isBusTurn(identity.sessionId) && services.danger().busCanUseRiskyTools !== true) {
+    if (args.operation === 'cancel' && services.isBusTurn(identity.sessionId) && services.danger().busCanUseRiskyTools !== true) {
       services.journal(identity.sessionId, 'approval/auto-denied-bus', { toolName: 'control_run', runId: args.run_id })
       return 'Run not cancelled: a teammate-caused turn cannot stop host work without explicit operator authorization.'
     }
     const result = await services.controlRun(identity.sessionId, args.run_id, args.operation)
+    if (args.operation === 'wait' && result.ok && result.run) {
+      return JSON.stringify({
+        run: durableRunView(result.run, args.detail), waiting: result.waiting === true,
+        nextAction: result.waiting
+          ? 'Native goal is paused or inactive. End this turn now; do not sleep, poll or post repeated waiting updates. The hub will deliver the terminal result and start a new turn. The run was not cancelled; its goal objective and usage are preserved.'
+          : 'The run is already terminal. Inspect its exact outcome and continue; no waiting is needed.',
+      })
+    }
     return result.ok && result.run ? JSON.stringify(durableRunView(result.run, args.detail)) :
       `Run not controlled: ${result.error ?? 'unknown error'}`
   },

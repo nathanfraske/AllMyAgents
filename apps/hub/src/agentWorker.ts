@@ -393,6 +393,11 @@ export class AgentWorker {
           .then(() => this.ack(msg.reqId, true))
           .catch((err) => this.ack(msg.reqId, false, errMessage(err)))
         return
+      case 'pauseAutonomousGoal':
+        this.pauseAutonomousGoal(msg.sessionId)
+          .then(() => this.ack(msg.reqId, true))
+          .catch((err) => this.ack(msg.reqId, false, errMessage(err)))
+        return
       case 'interruptAgent':
         this.interruptAgent(msg.sessionId, msg.targetId)
           .then(() => this.ack(msg.reqId, true))
@@ -593,6 +598,13 @@ export class AgentWorker {
       const client = this.codexSessionClients.get(sessionId)
       if (client) await client.interrupt(threadId)
     }
+  }
+
+  private async pauseAutonomousGoal(sessionId: string): Promise<void> {
+    const client = this.codexSessionClients.get(sessionId)
+    const threadId = this.codexThreads.get(sessionId)
+    if (!client || !threadId) throw new Error('No bound Codex thread; native goal wait was not confirmed')
+    await client.pauseAutonomousGoal(threadId)
   }
 
   private async interruptAgent(sessionId: string, targetId: string): Promise<void> {
