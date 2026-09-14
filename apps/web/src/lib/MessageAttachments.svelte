@@ -55,7 +55,7 @@
 </div>
 
 <style>
-  .atts { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.4rem; }
+  .atts { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 0.5rem; margin-top: 0.4rem; }
   .image-card { display: flex; flex-direction: column; gap: 0.3rem; min-width: 0; max-width: 100%; }
   .image-card.wide { width: 100%; }
   .image-meta { display: flex; gap: 0.7rem; justify-content: space-between; font-size: 0.7rem; color: var(--muted); }
