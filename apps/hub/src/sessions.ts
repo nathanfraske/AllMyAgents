@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import { ChatArtifacts, type PublishArtifactInput, type PublishedArtifact } from './chatArtifacts.js'
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -375,7 +376,8 @@ function providerHostInstructions(
   if (record.isProjectManager || record.isOverseer || (record.canStartRuns && record.projectId)) {
     role += '\n\nDurable-run wait discipline: when only waiting on your own run, call control_run(run_id, operation="wait") once, then end the turn. Otherwise an active Codex goal can immediately restart a polling turn. Waiting preserves the run, goal objective, budget and usage; real completion mail still starts a hub turn. Do not reactivate the goal just to poll, repeat "verified wait", or falsely mark unfinished work complete/blocked. A terminal result means inspect and continue; failed parking is not a confirmed wait.'
   }
-  return [discovery, role, remoteMethod, permissionRouting, LOCAL_OVERSEER_MESSAGING_INSTRUCTIONS, attentionRouting, COMPACTION_CONTINUITY_CONTRACT].join('\n\n')
+  const artifactDisplay = 'To show the operator an image/render or share a generated file, call mcp__allmyagents__publish_artifact with its finished workspace path and an optional caption. Both Codex and Claude use this display tool. Reading/viewing an image yourself or emitting Markdown image syntax does not display it in AllMyAgents. Published raster images expand inline; other artifacts download. Do not publish secrets or repeat image bytes in text.'
+  return [discovery, role, remoteMethod, permissionRouting, artifactDisplay, LOCAL_OVERSEER_MESSAGING_INSTRUCTIONS, attentionRouting, COMPACTION_CONTINUITY_CONTRACT].join('\n\n')
 }
 
 function exactBrowserOpaque(value: unknown, field: string): string {
@@ -863,6 +865,7 @@ export class SessionManager {
   /** Hub-owned durable GitHub Actions monitor. Installed after construction so it can wake sessions
    * through the ordinary, permission-clamped bus without entering the vendor worker. */
   private githubCiMonitor: GitHubCiMonitor | null = null
+  private readonly chatArtifacts: ChatArtifacts
   private overseerRuntime: OverseerRuntimeServices = {}
 
   constructor(
@@ -900,6 +903,10 @@ export class SessionManager {
       Partial<Pick<NotificationService, 'resolveDedupe'>>
   ) {
     this.teamPresets = new TeamPresetStore(this.journal.db)
+    this.chatArtifacts = new ChatArtifacts(journal, path.join(
+      journal.db.name === ':memory:' ? path.join(defaultCwd, '.allmyagents') : path.dirname(path.resolve(journal.db.name)),
+      'chat-artifacts',
+    ))
     this.elevationPolicies = new ProjectElevationPolicyStore(this.journal.db)
     this.githubAutomationPolicies = new GitHubAutomationPolicyStore(this.journal.db)
     this.executor =
@@ -1403,6 +1410,10 @@ export class SessionManager {
           args: Record<string, unknown>
         }
         return this.browserExecute(a.sessionId, a.operation, a.args)
+      }
+      case 'artifact.publish': {
+        const a = args as { sessionId: string; input: PublishArtifactInput }
+        return this.publishArtifact(a.sessionId, a.input)
       }
       case 'remote.list':
         return this.remoteDeviceViews((args as { sessionId: string }).sessionId)
@@ -3777,6 +3788,7 @@ export class SessionManager {
       manageCiMonitor: (callerSessionId, input) => this.manageGitHubCiMonitor(callerSessionId, input),
       queryTeam: (callerSessionId, input) => this.managerQueryTeam(callerSessionId, input),
       browser: (sessionId, operation, args) => this.browserExecute(sessionId, operation, args),
+      publishArtifact: (sessionId, input) => this.publishArtifact(sessionId, input),
       remoteDevices: (sessionId) => this.remoteDeviceViews(sessionId),
       remoteExecute: (sessionId, siteId, action) => this.remoteDeviceExecute(sessionId, siteId, action),
       remotePrepareProjectLocation: (sessionId, siteId, rootId) => this.remotePrepareProjectLocation(sessionId, siteId, rootId),
@@ -6926,7 +6938,13 @@ export class SessionManager {
   /** Resolve one download id only within its owning session's cwd. */
   attachment(sessionId: string, attachmentId: string): AttachmentMeta | undefined {
     const record = this.sessions.get(sessionId)
-    return record ? loadAttachment(sessionId, record.cwd, attachmentId) : undefined
+    return record ? this.chatArtifacts.get(sessionId, attachmentId) ?? loadAttachment(sessionId, record.cwd, attachmentId) : undefined
+  }
+
+  async publishArtifact(sessionId: string, input: PublishArtifactInput): Promise<PublishedArtifact> {
+    const record = this.sessions.get(sessionId)
+    if (!record || record.status === 'stopped') throw new Error('Artifact publication requires a live chat.')
+    return this.chatArtifacts.publish(record, input)
   }
 
   private attachmentsFor(record: SessionRecord, ids: readonly string[] = []): AttachmentMeta[] {

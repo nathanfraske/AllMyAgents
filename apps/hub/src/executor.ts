@@ -152,6 +152,8 @@ export const AUTO_ALLOW_TOOLS = new Set([
   'mcp__allmyagents__browser_download_read',
   'mcp__allmyagents__browser_screenshot',
   'mcp__allmyagents__browser_status',
+  // Same-chat display only: the handler bounds/validates a workspace snapshot, not arbitrary file reads.
+  'mcp__allmyagents__publish_artifact',
 ])
 export const SELF_GATING_TOOLS = new Set([
   'mcp__allmyagents__practice_write',

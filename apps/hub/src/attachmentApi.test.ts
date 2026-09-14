@@ -278,6 +278,33 @@ async function build(provider: 'claude' | 'codex' = 'claude') {
 }
 
 describe('session attachment API', () => {
+  it.each(['codex', 'claude'] as const)('publishes %s outputs through the shared tool and existing authenticated attachment route', async provider => {
+    const h = await build(provider)
+    const image = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64')
+    fs.writeFileSync(path.join(h.tmp, 'output.png'), image)
+    const input = { path: 'output.png', caption: 'Assembly preview' }
+    const result = provider === 'codex'
+      ? JSON.parse(String(await h.sessions.execAgentTool(h.profile.id, h.tmp, 'publish_artifact', input, h.record.id)))
+      : { ...(await h.sessions.runRelay('artifact.publish', { sessionId: h.record.id, input })) as object }
+    const attachment = result.attachment as AttachmentMeta
+    expect(attachment).toMatchObject({ name: 'output.png', mime: 'image/png' })
+    expect(attachment).not.toHaveProperty('path')
+    const url = `${h.base}/api/sessions/${h.record.id}/attachments/${attachment.id}`
+    const response = await fetch(url)
+    expect(response.status).toBe(200)
+    expect(response.headers.get('content-type')).toBe('image/png')
+    expect(response.headers.get('content-disposition')).toBe('inline')
+    expect(Buffer.from(await response.arrayBuffer())).toEqual(image)
+    expect((await nativeFetch(url)).status).toBe(401)
+    expect((await fetch(`${h.base}/api/sessions/not-the-owner/attachments/${attachment.id}`)).status).toBe(404)
+    fs.writeFileSync(path.join(h.tmp, 'assembly.step'), 'ISO-10303-21;END-ISO-10303-21;')
+    const file = await h.sessions.publishArtifact(h.record.id, { path: 'assembly.step' })
+    const download = await fetch(`${h.base}/api/sessions/${h.record.id}/attachments/${file.attachment.id}`)
+    expect(download.headers.get('content-disposition')).toContain('attachment;')
+    expect(download.headers.get('content-type')).toBe('application/octet-stream')
+    expect(await download.text()).toContain('ISO-10303-21')
+  })
+
   it('counts streamed bytes even when content-length understates the body', async () => {
     const stream = Readable.from([Buffer.from('123'), Buffer.from('456')]) as http.IncomingMessage
     stream.headers = { 'content-length': '1' }
