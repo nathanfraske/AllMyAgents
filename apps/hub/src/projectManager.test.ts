@@ -1653,6 +1653,18 @@ describe('project manager visibility into its own workers', () => {
     expect(() => sessions.configureDurableRuns('ordinary', true, 'operator')).toThrow('live local project')
     expect(sessions.hasOwnRunGrant('retired')).toBe(false)
   })
+  it.each([false, true])('keeps grant and audit atomic when changing an existing enabled=%s grant', enabled => {
+    const { sessions, journal, projects, seed, repo } = buildHub()
+    const project = projects.create('Atomic run grant', repo)
+    const worker = seed({ id: 'worker', projectId: project.id, canStartRuns: enabled })
+    new SessionStore(journal.db).upsert(worker)
+    const append = vi.spyOn(journal, 'append').mockImplementationOnce(() => { throw new Error('audit write failed') })
+    expect(() => sessions.configureDurableRuns(worker.id, !enabled, 'operator')).toThrow('audit write failed')
+    expect(sessions.hasOwnRunGrant(worker.id)).toBe(enabled)
+    expect(JSON.parse((journal.db.prepare('SELECT record FROM sessions WHERE id=?').get(worker.id) as { record: string }).record).canStartRuns).toBe(enabled)
+    append.mockRestore()
+    expect([...journal.replay(0)].filter(event => event.kind === 'session/durable-run-access')).toHaveLength(0)
+  })
   it.each(['codex', 'claude'] as const)('parks only the %s caller while preserving the run and exactly-once completion wake', async provider => {
     const { sessions, journal, bus, projects, seed, repo, runTurn, pauseAutonomousGoal } = buildHub()
     const project = projects.create('Parked run project', repo)

@@ -10494,9 +10494,12 @@ export class SessionManager {
     }
     if (record.isProjectManager || record.isOverseer) throw new Error('This role already has durable-run access')
     if (record.canStartRuns === enabled) return record
+    // Authority and its audit must commit together. Keep the live object unchanged on disk failure.
+    this.journal.atomic(() => {
+      this.persist({ ...record, canStartRuns: enabled })
+      this.journal.append(sessionId, 'session/durable-run-access', { enabled, source, projectId: record.projectId })
+    })
     record.canStartRuns = enabled
-    this.persist(record)
-    this.journal.append(sessionId, 'session/durable-run-access', { enabled, source, projectId: record.projectId })
     return record
   }
 
