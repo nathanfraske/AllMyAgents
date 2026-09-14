@@ -180,6 +180,22 @@ function auth(token: string): HeadersInit {
 }
 
 describe('device-authenticated control plane', () => {
+  it('requires the operator token for worker run grants even when broad API auth is disabled', async () => {
+    const h = await build()
+    const project = h.projects.create('Worker run permission', h.record.cwd)
+    h.record.projectId = project.id
+    const grant = (enabled: unknown, token?: string) => fetch(`${h.base}/api/sessions/${h.record.id}/durable-runs`, {
+      method: 'POST', headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify({ enabled }),
+    })
+    expect((await grant(true)).status).toBe(401)
+    expect((await grant(true, 'test-agent-bridge-secret-at-least-32-characters')).status).toBe(401)
+    expect((await grant('true', h.deviceToken)).status).toBe(400)
+    expect((await grant(true, h.deviceToken)).status).toBe(200)
+    expect(h.sessions.hasOwnRunGrant(h.record.id)).toBe(true)
+    expect((await grant(false, h.deviceToken)).status).toBe(200)
+    expect(h.sessions.hasOwnRunGrant(h.record.id)).toBe(false)
+  })
   it('serves durable notification preferences and the non-resident elevation broker status', async () => {
     const { base, deviceToken, journal } = await build()
     const headers = { ...auth(deviceToken), 'content-type': 'application/json' }

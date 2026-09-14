@@ -1604,6 +1604,55 @@ describe('operator-enabled worker one-shot sub-agents', () => {
 })
 
 describe('project manager visibility into its own workers', () => {
+  it.each(['claude', 'codex'] as const)('lets an operator-granted %s worker run without creating a manager, and revokes immediately', async provider => {
+    const { sessions, journal, projects, seed, repo, runTurn } = buildHub()
+    const project = projects.create('No manager needed', repo)
+    const worker = seed({ id: 'worker', provider, profileId: provider === 'codex' ? 'p2' : 'p1', projectId: project.id })
+    seed({ id: 'sibling', projectId: project.id })
+    const controller = new DurableRunController(new DurableRunStore(journal.db), journal, path.join(path.dirname(repo), 'worker-run-logs'))
+    sessions.setDurableRunController(controller)
+    cleanups.push(() => controller.shutdown())
+    vi.spyOn(controller as unknown as { pump(): Promise<void> }, 'pump').mockResolvedValue()
+    controller.activate()
+    const input = { kind: 'test' as const, executable: process.execPath, args: ['-e', 'process.exit(0)'] }
+    expect(await sessions.managerStartRun(worker.id, input)).toMatchObject({ ok: false, error: expect.stringContaining('Allow durable runs') })
+    expect(() => sessions.configureDurableRuns(worker.id, true, 'bus' as never)).toThrow('Only the operator')
+    sessions.configureDurableRuns(worker.id, true, 'operator')
+    expect(sessions.hasOwnRunGrant(worker.id)).toBe(true)
+    expect(JSON.parse((journal.db.prepare('SELECT record FROM sessions WHERE id=?').get(worker.id) as {record: string}).record).canStartRuns).toBe(true)
+    expect(worker.isProjectManager).not.toBe(true)
+    const started = await sessions.managerStartRun(worker.id, input)
+    expect(started).toMatchObject({ ok: true, run: { actorSessionId: worker.id, targetSessionId: worker.id, state: 'queued' } })
+    expect(await sessions.managerStartRun(worker.id, { ...input, targetSessionId: 'sibling' })).toMatchObject({ ok: false })
+    expect(await sessions.managerStartRun(worker.id, { ...input, remote: {deviceId: 'ungranted', rootId: 'root', command: 'echo test'} })).toMatchObject({ ok: false, error: expect.stringContaining('no terminal grant') })
+    expect(sessions.managerQueryTeam(worker.id, {})).toMatchObject({ ok: false })
+    // A grant to this worker must not acquire control over another agent's work, even when the
+    // other agent chose this worker's checkout as its execution target.
+    const manager = seed({ id: 'manager', projectId: project.id, isProjectManager: true })
+    worker.parentSessionId = manager.id
+    const managed = await sessions.managerStartRun(manager.id, { ...input, targetSessionId: worker.id })
+    expect(managed.ok).toBe(true)
+    expect(sessions.managerControlRun(worker.id, managed.run!.id, 'cancel')).toMatchObject({ ok: false, error: expect.stringContaining('only runs it started') })
+    const cancellable = await sessions.managerStartRun(worker.id, input)
+    expect(sessions.managerControlRun(worker.id, cancellable.run!.id, 'cancel')).toMatchObject({ ok: true, run: { state: 'cancelled' } })
+    await sessions.send(worker.id, 'Continue with the granted run tools.')
+    const spec = runTurn.mock.calls[0]![0]
+    expect(spec.codexDeveloperInstructions ?? spec.claudeSystemPrompt).toContain('operator granted durable runs')
+    sessions.configureDurableRuns(worker.id, false, 'operator')
+    expect(sessions.hasOwnRunGrant(worker.id)).toBe(false)
+    expect(await sessions.managerStartRun(worker.id, input)).toMatchObject({ ok: false })
+    expect(sessions.managerControlRun(worker.id, started.run!.id, 'cancel')).toMatchObject({ ok: false })
+    expect(controller.store.get(started.run!.id)?.state).toBe('queued')
+    expect(sessions.managerInspectRuns(worker.id, { runId: started.run!.id })).toMatchObject({ ok: true })
+  })
+
+  it('does not turn an ordinary or retired chat into a run operator', () => {
+    const { sessions, seed } = buildHub()
+    seed({ id: 'ordinary' })
+    seed({ id: 'retired', projectId: 'project', managerRetiredAt: new Date().toISOString(), canStartRuns: true })
+    expect(() => sessions.configureDurableRuns('ordinary', true, 'operator')).toThrow('live local project')
+    expect(sessions.hasOwnRunGrant('retired')).toBe(false)
+  })
   it.each(['codex', 'claude'] as const)('parks only the %s caller while preserving the run and exactly-once completion wake', async provider => {
     const { sessions, journal, bus, projects, seed, repo, runTurn, pauseAutonomousGoal } = buildHub()
     const project = projects.create('Parked run project', repo)
@@ -1789,7 +1838,7 @@ describe('project manager visibility into its own workers', () => {
     })
     expect(sessions.managerControlRun(outsider.id, result.run!.id, 'cancel')).toMatchObject({
       ok: false,
-      error: expect.stringMatching(/neither a project manager nor the application Overseer/i),
+      error: expect.stringMatching(/Allow durable runs/i),
     })
     await expect(sessions.managerStartRun(manager.id, {
       targetSessionId: outsider.id,

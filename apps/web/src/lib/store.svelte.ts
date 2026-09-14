@@ -1073,6 +1073,7 @@ export class HubStore {
         v.record.managerOperatorTaskUpdatedAt = rec.managerOperatorTaskUpdatedAt
         v.record.managerStandingInstructions = rec.managerStandingInstructions
         v.record.managerCanApproveChildren = rec.managerCanApproveChildren
+        v.record.canStartRuns = rec.canStartRuns
         v.record.managerApprovalHelper = rec.managerApprovalHelper
         v.record.managerPauseExhaustedAccounts = rec.managerPauseExhaustedAccounts
         v.record.managerAllowWorkerSubagents = rec.managerAllowWorkerSubagents
@@ -3370,6 +3371,11 @@ export class HubStore {
         if (p.model !== undefined) view.record.model = p.model ?? undefined
         if (p.effort !== undefined) view.record.effort = p.effort ?? undefined
         if (p.serviceTier !== undefined) view.record.serviceTier = p.serviceTier ?? undefined
+        break
+      }
+      case 'session/durable-run-access': {
+        const p = payload as { enabled?: boolean }
+        if (typeof p.enabled === 'boolean') view.record.canStartRuns = p.enabled
         break
       }
       case 'session/project-detached':

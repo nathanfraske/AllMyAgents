@@ -283,6 +283,8 @@ export interface SessionRecord {
   managerStandingInstructions?: string
   /** Operator grant allowing this manager to decide pending approvals inside its own managed hierarchy. */
   managerCanApproveChildren?: boolean
+  /** Operator-owned standing authority to start/control this worker's own project runs. */
+  canStartRuns?: boolean
   /** Optional fast, non-interactive evaluator for in-ceiling child approvals. It has no chat or tools. */
   managerApprovalHelper?: ManagerApprovalHelperConfig
   /** When enabled, the hub refuses new dispatch to managed agents whose account is at a hard usage

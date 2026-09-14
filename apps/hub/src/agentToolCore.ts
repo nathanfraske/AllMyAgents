@@ -228,6 +228,8 @@ export interface PracticeServices {
  * how the hub attributes the call to an identity.
  */
 export interface AgentServices {
+  /** Live operator-owned own-project run authority, not an agent-supplied role. */
+  hasOwnRunGrant?(sessionId: string): Awaitable<boolean>
   /** Send a bus message from `from` to a teammate (session) or the whole project. */
   send(
     from: SessionIdentity,
@@ -800,7 +802,7 @@ const REMOTE_DEVELOPER_TOOLS = [
 const startRun = defineTool({
   name: 'start_run',
   description:
-    'Project managers and the application Overseer: start a durable local or explicitly granted remote build/test/lint/benchmark/deploy/custom run. For remote work, name required_tools. The hub checks them before launch; when any are absent, provide the project\'s exact reviewed setup_command and the hub records that setup as its own durable prerequisite, then automatically queues the requested run behind its successful completion and verifies the tools again. Missing dependencies are therefore an action to provision, not a blocker to merely report. The hub captures source provenance, returns stable run ids, retains bounded logs and exact terminal state, and never blindly retries an outcome-unknown command. Local runs serialize on their checkout or working directory. Granted remote runs are concurrent by default; give only commands that must serialize the same explicit resource name (for example gpu or port-8080).',
+    'Project managers, the application Overseer, and operator-granted project workers (own runs only): start a durable local or explicitly granted remote build/test/lint/benchmark/deploy/custom run. For remote work, name required_tools. The hub checks them before launch; when any are absent, provide the project\'s exact reviewed setup_command and the hub records that setup as its own durable prerequisite, then automatically queues the requested run behind its successful completion and verifies the tools again. Missing dependencies are therefore an action to provision, not a blocker to merely report. The hub captures source provenance, returns stable run ids, retains bounded logs and exact terminal state, and never blindly retries an outcome-unknown command. Local runs serialize on their checkout or working directory. Granted remote runs are concurrent by default; give only commands that must serialize the same explicit resource name (for example gpu or port-8080).',
   schema: {
     kind: z.enum(['build', 'test', 'lint', 'benchmark', 'deploy', 'custom']),
     detail: z.enum(['summary', 'full']).optional().describe('Compact acknowledgement by default; full returns the exact retained command/provenance. inspect_runs can retrieve it later.'),
@@ -850,7 +852,9 @@ const startRun = defineTool({
     if (!remoteRequested && !args.executable) {
       return 'Run not started: executable is required for a local run.'
     }
-    if (!remoteRequested && services.isBusTurn(identity.sessionId) && services.danger().busCanUseRiskyTools !== true) {
+    const ownRunGrant = (args.target_session === undefined || args.target_session === identity.sessionId) &&
+      args.working_directory === undefined && await services.hasOwnRunGrant?.(identity.sessionId) === true
+    if (!remoteRequested && !ownRunGrant && services.isBusTurn(identity.sessionId) && services.danger().busCanUseRiskyTools !== true) {
       services.journal(identity.sessionId, 'approval/auto-denied-bus', { toolName: 'start_run', kind: args.kind })
       return 'Run not started: a teammate-caused turn cannot launch host commands. Ask the operator to start or explicitly authorize this work.'
     }
@@ -867,7 +871,7 @@ const startRun = defineTool({
     }
     // An exact remote device/root terminal grant is standing operator authority. Session-side admission
     // checks that grant again; asking for a second per-command approval makes a granted testbed unusable.
-    if (!remoteRequested && !await services.requireApproval(identity, 'allmyagents/run', approvalPayload)) {
+    if (!remoteRequested && !ownRunGrant && !await services.requireApproval(identity, 'allmyagents/run', approvalPayload)) {
       return 'Run not started: the operator declined the durable command (or the request timed out).'
     }
     const requiredTools = [...new Set(args.required_tools ?? [])]
@@ -991,7 +995,7 @@ const inspectRuns = defineTool({
 const controlRun = defineTool({
   name: 'control_run',
   description:
-    'Project managers and the application Overseer: operation=wait parks only your own native goal auto-continuations while awaiting a run you started; the run, logs, resources and task remain intact. Then end the turn. Real completion mail still wakes you; do not reactivate the goal merely to check again. This is allowed on teammate turns. operation=cancel instead cancels managed local/queued work, requires operator-origin authority, and records a terminal outcome. Running remote work cannot be falsely reported cancelled; terminal and outcome-unknown records remain immutable.',
+    'Project managers, the application Overseer, and operator-granted project workers (own runs only): operation=wait parks only your own native goal auto-continuations while awaiting a run you started; the run, logs, resources and task remain intact. Then end the turn. Real completion mail still wakes you; do not reactivate the goal merely to check again. This is allowed on teammate turns. operation=cancel instead cancels managed local/queued work, requires operator-origin authority or an explicit own-run worker grant, and records a terminal outcome. Running remote work cannot be falsely reported cancelled; terminal and outcome-unknown records remain immutable.',
   schema: {
     run_id: z.string().min(1),
     operation: z.enum(['cancel', 'wait']),
@@ -999,7 +1003,8 @@ const controlRun = defineTool({
   },
   run: async (args, { identity, services }) => {
     if (!services.controlRun) return 'Run control unavailable: this hub does not support durable runs.'
-    if (args.operation === 'cancel' && services.isBusTurn(identity.sessionId) && services.danger().busCanUseRiskyTools !== true) {
+    if (args.operation === 'cancel' && services.isBusTurn(identity.sessionId) && services.danger().busCanUseRiskyTools !== true &&
+      await services.hasOwnRunGrant?.(identity.sessionId) !== true) {
       services.journal(identity.sessionId, 'approval/auto-denied-bus', { toolName: 'control_run', runId: args.run_id })
       return 'Run not cancelled: a teammate-caused turn cannot stop host work without explicit operator authorization.'
     }

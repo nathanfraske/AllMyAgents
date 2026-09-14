@@ -131,6 +131,7 @@ export type RelayMethod =
   | 'manager.decideChildApproval'
   | 'manager.assignChildTask'
   | 'manager.startRun'
+  | 'runs.hasOwnGrant'
   | 'manager.inspectRuns'
   | 'manager.controlRun'
   | 'manager.manageCiMonitor'

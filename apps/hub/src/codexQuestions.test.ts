@@ -16,7 +16,7 @@ const input = {
   ],
 }
 const journals: Journal[] = []
-afterEach(() => { while (journals.length) journals.pop()!.db.close() })
+afterEach(() => { vi.useRealTimers(); while (journals.length) journals.pop()!.db.close() })
 function service() {
   const journal = new Journal(':memory:')
   journals.push(journal)
@@ -34,6 +34,57 @@ function protocol(callback?: ConstructorParameters<typeof CodexClient>[2]) {
 }
 
 describe('Codex questions, distinct from Claude questions and tool permissions', () => {
+  it('expires a provider deadline once, even without a browser, and never submits a default answer', async () => {
+    vi.useFakeTimers()
+    const { journal, questions } = service()
+    const pendingNotice = vi.fn(), resolvedNotice = vi.fn()
+    questions.setPendingListener(pendingNotice)
+    questions.setResolvedListener(resolvedNotice)
+    const request = { id: 'ttl', sessionId: 's1', toolUseId: 'item', requestId: 'rpc', provider: 'codex' as const, input: { ...input, autoResolutionMs: 5000 } }
+    const pending = questions.request(request)
+    const deadline = questions.pending()[0]!.expiresAt
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(questions.request(request)).toBe(pending)
+    expect(questions.pending()[0]!.expiresAt).toBe(deadline)
+    await vi.advanceTimersByTimeAsync(2000)
+    await expect(pending).resolves.toEqual({ kind: 'cancelled', reason: 'auto-skipped' })
+    expect(questions.pending()).toEqual([])
+    expect(pendingNotice).toHaveBeenCalledTimes(1)
+    expect(resolvedNotice).toHaveBeenCalledTimes(1)
+    expect(questions.answer('ttl', { mode: 'Quick', secret: 'late' })).toBe(false)
+    expect(journal.resolvedQuestion('ttl')).toMatchObject({ status: 'aborted', reason: 'auto-skipped' })
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('uses a two-minute host deadline only for optional Codex requests, and clears it after an answer', async () => {
+    vi.useFakeTimers()
+    const { questions } = service()
+    const args = { id: 'optional', sessionId: 's1', toolUseId: 'item', requestId: 'rpc', provider: 'codex' as const, input }
+    const optional = questions.request(args)
+    expect(Date.parse(questions.pending()[0]!.expiresAt!) - Date.now()).toBe(120_000)
+    questions.answer('optional', { mode: 'Deep', secret: 'user answer' })
+    await expect(optional).resolves.toMatchObject({ kind: 'answered' })
+    const blocking = questions.request({ ...args, id: 'blocking', requestId: 'blocking', input: { ...input, isBlocking: true, autoResolutionMs: null } })
+    expect(questions.pending()[0]!.expiresAt).toBeUndefined()
+    expect(vi.getTimerCount()).toBe(0)
+    await vi.advanceTimersByTimeAsync(200_000)
+    expect(questions.pending()).toHaveLength(1)
+    questions.abort('blocking')
+    await blocking
+  })
+
+  it('rejects malformed timers and rejects an answer arriving after a suspended event-loop deadline', async () => {
+    vi.useFakeTimers()
+    for (const autoResolutionMs of [-1, 0.5, '1000', NaN, Infinity, 2_147_483_648]) {
+      expect(() => parseCodexQuestionInput({ ...input, autoResolutionMs })).toThrow('deadline')
+    }
+    const { questions } = service()
+    const pending = questions.request({ id: 'late', sessionId: 's1', toolUseId: 'item', requestId: 'rpc', provider: 'codex', input: { ...input, autoResolutionMs: 10 } })
+    vi.setSystemTime(Date.now() + 11)
+    expect(questions.answer('late', { mode: 'Quick', secret: 'late' })).toBe(false)
+    await expect(pending).resolves.toMatchObject({ kind: 'cancelled', reason: 'auto-skipped' })
+    expect(vi.getTimerCount()).toBe(0)
+  })
   it('keys answers by stable id, supports free text and preserves secret bytes without persisting them', async () => {
     const { journal, questions } = service()
     const events: unknown[] = []

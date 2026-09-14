@@ -25,6 +25,22 @@ describe('compact durable run inspection', () => {
       environmentKeys: ['PATH'], lockfiles: [{ path: 'lockfile', sha256: 'lock-hash' }] },
   }
   const logs = { stdout: '', stderr: '', nextStdoutCursor: 100, nextStderrCursor: 0, stdoutComplete: true, stderrComplete: true }
+  it.each(['codex', 'claude'] as const)('uses the live own-run grant on %s bus turns, without widening target scope', async provider => {
+    const h = makeHarness({ isBusTurn: true })
+    const identity = { ...idA, provider }
+    h.services.hasOwnRunGrant = vi.fn(async () => true)
+    h.services.requireApproval = vi.fn(async () => false)
+    h.services.startRun = vi.fn(() => ({ ok: true, run }))
+    const args = { kind: 'test', executable: 'node' }
+    expect(JSON.parse(String(await runAgentTool('start_run', args, { identity, services: h.services })))).toMatchObject({ id: run.id })
+    expect(h.services.hasOwnRunGrant).toHaveBeenCalledWith('s1')
+    expect(h.services.requireApproval).not.toHaveBeenCalled()
+    expect(await runAgentTool('start_run', { ...args, target_session: 'other' }, { identity, services: h.services })).toContain('teammate-caused')
+    expect(h.services.startRun).toHaveBeenCalledTimes(1)
+    h.services.hasOwnRunGrant = async () => false
+    expect(await runAgentTool('start_run', args, { identity, services: h.services })).toContain('teammate-caused')
+    expect(h.services.startRun).toHaveBeenCalledTimes(1)
+  })
   it('returns exact cursors/state and automatic-completion guidance without repeating immutable provenance', async () => {
     const h = makeHarness()
     h.services.inspectRuns = vi.fn(() => ({ ok: true, runs: [run], logs }))

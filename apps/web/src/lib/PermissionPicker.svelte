@@ -16,6 +16,8 @@
     managedBy,
     operatorOverrideActive = false,
     operatorOverrideCeiling,
+    runAccess,
+    onrunchange,
     onchange,
   }: {
     sessionId: string
@@ -26,11 +28,30 @@
     managedBy?: string
     operatorOverrideActive?: boolean
     operatorOverrideCeiling?: PermissionMode
+    runAccess?: boolean
+    onrunchange?: (enabled: boolean) => void
     onchange?: (mode: PermissionMode, operatorOverride: boolean) => void
   } = $props()
   let open = $state(false)
   let revokeError = $state<string | null>(null)
   let modeError = $state<string | null>(null)
+  let runBusy = $state(false)
+  let runError = $state('')
+  async function toggleRuns(): Promise<void> {
+    if (runBusy || runAccess === undefined) return
+    const id = sessionId
+    const enabled = !runAccess
+    runBusy = true
+    runError = ''
+    try {
+      const result = await api.configureDurableRuns(id, enabled)
+      if (id !== sessionId) return
+      if ('error' in result) throw new Error(result.error)
+      onrunchange?.(result.canStartRuns === true)
+    } catch (cause) {
+      if (id === sessionId) runError = cause instanceof Error ? cause.message : String(cause)
+    } finally { runBusy = false }
+  }
   let githubCapabilities = $state<GitHubAutomationCapability[]>([])
   let githubLoaded = $state(false)
   let githubLoadedFor = $state('')
@@ -184,6 +205,15 @@
         </button>
       {/each}
       {#if modeError}<div class="gerr" role="alert">Permission change failed: {modeError}</div>{/if}
+      {#if runAccess !== undefined}
+        <div class="sep"></div>
+        <label class="github-grant">
+          <input type="checkbox" checked={runAccess} disabled={runBusy} onchange={() => void toggleRuns()} />
+          <span>Allow durable runs</span>
+        </label>
+        <div class="policy-note dim">This worker may start and control its own project commands without a manager or repeated approval, including on teammate turns. Existing remote grants and OS privileges still apply. Revoking does not kill running work.</div>
+        {#if runError}<div class="gerr" role="alert">Run permission failed: {runError}</div>{/if}
+      {/if}
       {#if allowedTools.length}
         <div class="sep"></div>
         <div class="grouphead dim">Always allowed in this chat</div>

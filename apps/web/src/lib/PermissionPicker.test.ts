@@ -7,6 +7,7 @@ const apiMock = vi.hoisted(() => ({
   allowTool: vi.fn(),
   sessionGitHubAutomation: vi.fn(),
   setSessionGitHubAutomation: vi.fn(),
+  configureDurableRuns: vi.fn(),
 }))
 
 vi.mock('./api', async (original) => {
@@ -15,6 +16,7 @@ vi.mock('./api', async (original) => {
 })
 
 beforeEach(() => {
+  apiMock.configureDurableRuns.mockReset().mockResolvedValue({ canStartRuns: true })
   apiMock.setMode.mockReset().mockResolvedValue({ ok: true })
   apiMock.allowTool.mockReset().mockResolvedValue({ ok: true })
   apiMock.sessionGitHubAutomation.mockReset().mockResolvedValue({
@@ -36,6 +38,18 @@ beforeEach(() => {
 afterEach(cleanup)
 
 describe('managed permission boundaries', () => {
+  it('lets the operator grant runs without promoting a worker, and reports failed saves', async () => {
+    const onrunchange = vi.fn()
+    render(PermissionPicker, { props: { sessionId: 'worker', mode: 'safe', runAccess: false, onrunchange } })
+    await fireEvent.click(screen.getByTitle('Permission mode: Safe'))
+    await fireEvent.click(screen.getByRole('checkbox', { name: 'Allow durable runs' }))
+    expect(apiMock.configureDurableRuns).toHaveBeenCalledWith('worker', true)
+    expect(onrunchange).toHaveBeenCalledWith(true)
+    apiMock.configureDurableRuns.mockResolvedValue({ error: 'operator device token required' })
+    await fireEvent.click(screen.getByRole('checkbox', { name: 'Allow durable runs' }))
+    expect((await screen.findByRole('alert')).textContent).toContain('Run permission failed')
+    expect(onrunchange).toHaveBeenCalledTimes(1)
+  })
   it('explains a child ceiling and makes crossing it an explicit operator override', async () => {
     const onchange = vi.fn()
     render(PermissionPicker, {

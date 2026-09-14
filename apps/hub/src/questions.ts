@@ -15,6 +15,8 @@ const MAX_ANSWER = 4_000
 const MAX_CORRELATION = 512
 export const MAX_PENDING_QUESTIONS_PER_SESSION = 4
 export const MAX_PENDING_QUESTIONS_GLOBAL = 32
+/** Host default for optional Codex questions; never applied to Claude or blocking requests. */
+export const CODEX_NONBLOCKING_AUTO_SKIP_MS = 120_000
 export const ASK_INTERRUPTED_BY_RESTART_MESSAGE =
   'ALLMYAGENTS_ASK_INTERRUPTED_BY_RESTART_V1 — SYSTEM INTERRUPTION — NOT A USER RESPONSE. No answer, decline, cancellation, choice, or preference was supplied by the user. Do not infer any preference or refusal from this event. Continue the current turn now without an answer; do not wait for the user and do not treat this event as a choice. If the missing information is still essential, state that clearly; a future turn may ask again after restart.'
 export const ASK_UNAVAILABLE_MESSAGE =
@@ -64,6 +66,7 @@ export type QuestionOutcome =
         | 'recovery-unknown'
         | 'rejected'
         | 'unavailable'
+        | 'auto-skipped'
       message?: string
     }
 
@@ -82,6 +85,8 @@ export interface QuestionRecord {
   questions: AskUserQuestion[]
   status: QuestionStatus
   createdAt: string
+  /** Provider deadline or host optional-question timeout. Expiration submits no answer or default. */
+  expiresAt?: string
 }
 
 export interface QuestionRequest {
@@ -104,6 +109,7 @@ interface PendingEntry {
   resolve: (outcome: QuestionOutcome) => void
   promise: Promise<QuestionOutcome>
   removeAbort?: () => void
+  timer?: ReturnType<typeof setTimeout>
 }
 
 export class QuestionInputError extends Error {
@@ -311,6 +317,7 @@ function recoveredOutcome(
     // not recover its exact bytes, so it truthfully fails closed and lets Claude ask again if still needed.
     return { kind: 'cancelled', reason: 'recovery-unknown' }
   }
+  if (durable.reason === 'auto-skipped') return { kind: 'cancelled', reason: 'auto-skipped' }
   if (durable.status === 'interrupted') {
     return {
       kind: 'interrupted',
@@ -354,12 +361,17 @@ export class QuestionService {
   private readonly pendingMap = new Map<string, PendingEntry>()
   private readonly ownerEpoch = crypto.randomUUID()
   private publicOwnerActive = false
+  private onPending?: (record: QuestionRecord) => void
+  private onResolved?: (record: QuestionRecord) => void
+
+  setPendingListener(listener: (record: QuestionRecord) => void): void { this.onPending = listener }
+  setResolvedListener(listener: (record: QuestionRecord) => void): void { this.onResolved = listener }
 
   constructor(private readonly journal: Journal) {}
 
   pending(): QuestionRecord[] {
     this.requirePublicOwner()
-    for (const entry of [...this.pendingMap.values()]) this.reconcile(entry)
+    for (const entry of [...this.pendingMap.values()]) { if (!this.reconcile(entry)) this.expire(entry) }
     return [...this.pendingMap.values()].map((entry) => entry.record)
   }
 
@@ -445,6 +457,7 @@ export class QuestionService {
     const toolUseId = correlation(request.toolUseId, 'toolUseID')
     const requestId = correlation(request.requestId, 'requestId')
     const codexInput = request.provider === 'codex' ? parseCodexQuestionInput(request.input) : undefined
+    const autoSkipMs = codexInput?.autoResolutionMs ?? (codexInput?.blocking === false ? CODEX_NONBLOCKING_AUTO_SKIP_MS : undefined)
     const input = codexInput ?? parseAskUserQuestionInput(request.input)
     const digest = questionDigest(input)
     const correlationDigest = questionCorrelationDigest(sessionId, toolUseId, requestId)
@@ -487,6 +500,7 @@ export class QuestionService {
       status: 'pending',
       createdAt: new Date().toISOString(),
       ...(codexInput ? { provider: 'codex' as const, blocking: codexInput.blocking } : {}),
+      ...(autoSkipMs !== undefined ? { expiresAt: new Date(Date.now() + autoSkipMs).toISOString() } : {}),
     }
     let resolve!: (outcome: QuestionOutcome) => void
     const promise = new Promise<QuestionOutcome>((settle) => {
@@ -549,6 +563,14 @@ export class QuestionService {
     // The durable request and bounded active body exist before local retention. If the transaction fails,
     // no quota slot or promise remains; post-commit subscriber failures are contained by Journal.atomic().
     this.pendingMap.set(id, entry)
+    // Both execution modes enter here. A retry of the same request neither republishes nor resets TTL.
+    try { this.onPending?.(record) } catch { /* Notification failure must not discard a live callback. */ }
+    if (autoSkipMs !== undefined) {
+      entry.timer = setTimeout(() => {
+        try { this.expire(entry) } catch { /* A failed durable write is retried by the next pending/answer read. */ }
+      }, autoSkipMs)
+      entry.timer.unref()
+    }
     if (request.signal) {
       const abort = () => this.abort(id)
       if (request.signal.aborted) abort()
@@ -564,7 +586,7 @@ export class QuestionService {
     this.requirePublicOwner()
     const entry = this.pendingMap.get(id)
     if (!entry) return false
-    if (this.reconcile(entry)) return false
+    if (this.reconcile(entry) || this.expire(entry)) return false
     const answers = parseQuestionAnswers(entry.record.questions, rawAnswers)
     const updatedInput = { questions: entry.record.questions, answers }
     return this.finish(entry, 'answered', { kind: 'answered', updatedInput })
@@ -623,7 +645,7 @@ export class QuestionService {
     entry: PendingEntry,
     status: Exclude<QuestionStatus, 'pending'>,
     outcome: QuestionOutcome,
-    reason?: 'hub-restarted' | 'worker-restarted'
+    reason?: 'hub-restarted' | 'worker-restarted' | 'auto-skipped'
   ): boolean {
     if (this.pendingMap.get(entry.record.id) !== entry) return false
     const terminal = this.journal.resolveQuestion(
@@ -664,6 +686,11 @@ export class QuestionService {
     return true
   }
 
+  private expire(entry: PendingEntry): boolean {
+    if (!entry.record.expiresAt || Date.now() < Date.parse(entry.record.expiresAt)) return false
+    return this.finish(entry, 'aborted', { kind: 'cancelled', reason: 'auto-skipped' }, 'auto-skipped')
+  }
+
   private settle(
     entry: PendingEntry,
     outcome: QuestionOutcome,
@@ -672,8 +699,10 @@ export class QuestionService {
     if (this.pendingMap.get(entry.record.id) !== entry) return
     this.pendingMap.delete(entry.record.id)
     entry.removeAbort?.()
+    clearTimeout(entry.timer)
     entry.record.status = status
     entry.resolve(outcome)
+    try { this.onResolved?.(entry.record) } catch { /* Resolution remains durable even if a notification fails. */ }
   }
 
   private assertDurableCorrelation(

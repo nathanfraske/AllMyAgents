@@ -366,6 +366,24 @@ describe('SessionManager.runRelay — hub-side dispatch (mirrors InProcessExecut
     questions.cancel('question-1')
   })
 
+  it('publishes in-process Codex questions through the same service, once per request', async () => {
+    const { sessions, questions, notifications } = build()
+    questions.activatePublicOwner()
+    ;(sessions as unknown as { sessions: Map<string, SessionRecord> }).sessions.set('direct', {
+      id: 'direct', profileId: 'p1', provider: 'codex', cwd: tmp, status: 'active', createdAt: new Date().toISOString(), title: 'Direct Codex',
+    })
+    const request = { id: 'direct-q', sessionId: 'direct', toolUseId: 'item', requestId: 'rpc', provider: 'codex' as const,
+      input: { threadId: 'thread', turnId: 'turn', itemId: 'item', isBlocking: false,
+        questions: [{ id: 'q', header: 'Q', question: 'Private choice?', options: null }] } }
+    const pending = questions.request(request)
+    expect(questions.request(request)).toBe(pending)
+    expect(notifications.publish).toHaveBeenCalledTimes(1)
+    expect(notifications.publish).toHaveBeenCalledWith(expect.objectContaining({ title: 'Direct Codex has a question', dedupeKey: 'question-required:direct-q' }))
+    expect(JSON.stringify(notifications.publish.mock.calls)).not.toContain('Private choice')
+    questions.cancel('direct-q')
+    await pending
+  })
+
   it('bus.* routes to busSend/busInbox/busRoster (proven by the no-session results)', () => {
     const { sessions } = build()
     expect(sessions.runRelay('bus.roster', { sessionId: 'nope' })).toEqual([])

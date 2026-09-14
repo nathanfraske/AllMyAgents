@@ -273,6 +273,7 @@ export interface InProcessExecutorHubHooks {
     callerSessionId: string,
     input: Parameters<NonNullable<AgentServices['startRun']>>[1],
   ): ReturnType<NonNullable<AgentServices['startRun']>>
+  hasOwnRunGrant(sessionId: string): boolean
   managerInspectRuns(
     callerSessionId: string,
     input: Parameters<NonNullable<AgentServices['inspectRuns']>>[1],
@@ -380,6 +381,7 @@ export class InProcessExecutor implements Executor {
       assignChildTask: (managerSessionId, childSessionId, input) =>
         this.h.managerAssignChildTask(managerSessionId, childSessionId, input),
       startRun: (callerSessionId, input) => this.h.managerStartRun(callerSessionId, input),
+      hasOwnRunGrant: (sessionId) => this.h.hasOwnRunGrant(sessionId),
       inspectRuns: (callerSessionId, input) => this.h.managerInspectRuns(callerSessionId, input),
       controlRun: (callerSessionId, runId, operation) => this.h.managerControlRun(callerSessionId, runId, operation),
       manageCiMonitor: (callerSessionId, input) => this.h.managerManageCiMonitor(callerSessionId, input),

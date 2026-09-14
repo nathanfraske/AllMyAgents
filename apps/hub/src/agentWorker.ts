@@ -208,6 +208,7 @@ export function buildWorkerAgentServices(deps: WorkerAgentServiceDeps): AgentSer
         childSessionId,
         input,
       }) as Promise<{ ok: boolean; taskId?: string; warning?: string; error?: string }>,
+    hasOwnRunGrant: (callerSessionId) => deps.relayRpc('runs.hasOwnGrant', { callerSessionId }) as Promise<boolean>,
     startRun: (callerSessionId, input) =>
       deps.relayRpc('manager.startRun', { callerSessionId, input }) as ReturnType<
         NonNullable<AgentServices['startRun']>

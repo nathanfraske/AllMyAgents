@@ -4,6 +4,7 @@
   import { store } from './store.svelte'
   import { relativeTime } from './time'
   import { saveSettingsTab } from './settingsSections'
+  import QuestionAttention from './QuestionAttention.svelte'
 
   let open = $state(false)
   let root = $state<HTMLDivElement | null>(null)
@@ -60,6 +61,11 @@
     }
   })
 
+  $effect(() => {
+    const pendingIds = store.questions.map(q => q.id).join(',')
+    if (store.connected && pendingIds) void refresh()
+  })
+
   function closeOutside(event: PointerEvent): void {
     if (open && !root?.contains(event.target as Node)) open = false
   }
@@ -97,6 +103,7 @@
 </script>
 
 <svelte:window onpointerdown={closeOutside} onkeydown={(event) => { if (event.key === 'Escape') open = false }} />
+<QuestionAttention />
 
 <div class="notification-center" bind:this={root}>
   <button

@@ -1781,6 +1781,8 @@
               managedBy={permissionBoundary?.managedBy}
               operatorOverrideActive={view.record.permissionModeOperatorOverride === true}
               operatorOverrideCeiling={view.record.permissionModeOperatorOverrideCeiling}
+              runAccess={view.record.projectId && !view.record.isProjectManager && !view.record.isOverseer ? view.record.canStartRuns === true : undefined}
+              onrunchange={(enabled) => { if (view) view.record.canStartRuns = enabled }}
               onchange={(next, operatorOverride) => {
                 view.record.permissionMode = next
                 view.record.permissionModeOperatorOverride = operatorOverride || undefined
