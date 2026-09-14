@@ -118,9 +118,9 @@ export function reduceJournalHistory(events: readonly HubEvent[]): ThreadItem[] 
       })
       continue
     }
-    if (kind === 'session/input') {
+    if (kind === 'session/input' || kind === 'session/artifact') {
       push({
-        kind: 'user',
+        kind: kind === 'session/artifact' ? 'assistant' : 'user',
         ts,
         text: (payload as { text?: string }).text ?? '',
         attachments: attachmentsFromPayload(payload),

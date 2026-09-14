@@ -107,6 +107,7 @@ export const JOURNAL_HISTORY_VIEW_BYTES = 256 * 1024
 // use the per-session sequence index and skip transient rows before applying the row/byte page bounds.
 const JOURNAL_HISTORY_EVENT_KINDS = [
   'session/input',
+  'session/artifact',
   'bus/sent',
   'bus/delivered',
   'question/recovery-unknown',

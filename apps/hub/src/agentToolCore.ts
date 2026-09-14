@@ -30,6 +30,7 @@ import type {
   DurableRunState,
 } from './durableRuns.js'
 import type { GitHubCiMonitorRecord, GitHubCiWakeOutcome } from './githubCiMonitor.js'
+import type { PublishArtifactInput, PublishedArtifact } from './chatArtifacts.js'
 
 export interface OverseerControlInput {
   operation:
@@ -228,6 +229,8 @@ export interface PracticeServices {
  * how the hub attributes the call to an identity.
  */
 export interface AgentServices {
+  /** Publish a bounded workspace output to this exact chat; never a message to another agent. */
+  publishArtifact?(sessionId: string, input: PublishArtifactInput): Awaitable<PublishedArtifact>
   /** Live operator-owned own-project run authority, not an agent-supplied role. */
   hasOwnRunGrant?(sessionId: string): Awaitable<boolean>
   /** Send a bus message from `from` to a teammate (session) or the whole project. */
@@ -1333,6 +1336,21 @@ const browserDownloadRead = defineTool({
     }),
 })
 
+const publishArtifact = defineTool({
+  name: 'publish_artifact',
+  description:
+    'Show a finished local image or downloadable output in this chat for the operator. Use this when asked to preview/show an image, diagram, render, or share a generated file: inspecting an image yourself or writing a Markdown image does not display it. PNG/JPEG/GIF/WebP render as expandable previews; other files (including STEP/STL/ZIP/PDF/SVG) download without executing. The path must be in your own workspace, including WSL; no URLs or other chats. Immutable snapshot, metadata-only history, idempotent for identical bytes/name/caption. Limits: 5 MiB images, 32 MiB files, 256 files/256 MiB per chat. Do not publish credentials.',
+  schema: {
+    path: z.string().min(1).max(4096).describe('absolute or workspace-relative path to the finished local file'),
+    caption: z.string().max(1000).optional().describe('optional short caption shown beside the preview/download'),
+  },
+  run: async (args, { identity, services }) => {
+    if (!services.publishArtifact) return 'Artifact display is unavailable on this hub version.'
+    const result = await services.publishArtifact(identity.sessionId, args)
+    return JSON.stringify({ ...result, displayed: true, message: 'Visible in this chat. Do not embed local paths or repeat the image bytes in your response.' })
+  },
+})
+
 const browserScreenshot = defineTool({
   name: 'browser_screenshot',
   description:
@@ -1830,6 +1848,7 @@ export const AGENT_TOOLS: readonly AgentToolSpec[] = [
   browserCloseTab,
   browserDownload,
   browserDownloadRead,
+  publishArtifact,
   browserScreenshot,
   browserStatus,
   remoteListDevices,

@@ -231,6 +231,7 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
       'browser_close_tab',
       'browser_download',
       'browser_download_read',
+      'publish_artifact',
       'browser_screenshot',
       'browser_status',
       'remote_list_devices',

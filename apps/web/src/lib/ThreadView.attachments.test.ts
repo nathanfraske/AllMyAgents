@@ -296,7 +296,8 @@ describe('attachment composer front door', () => {
     await fireEvent.click(screen.getByTitle('send'))
     await waitFor(() => expect(apiMock.send).toHaveBeenCalledTimes(1))
     expect(screen.queryByRole('alert')).toBeNull()
-    expect(screen.queryByText('kept.png')).toBeNull()
+    // The sent image now shows its filename in history; only the composer's staged entry must clear.
+    expect(screen.queryByRole('button', { name: 'Remove kept.png' })).toBeNull()
     expect(textarea.value).toBe('')
   })
 

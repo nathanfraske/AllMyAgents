@@ -231,6 +231,8 @@ export function buildWorkerAgentServices(deps: WorkerAgentServiceDeps): AgentSer
       >,
     browser: (sessionId, operation, args) =>
       deps.relayRpc('browser.execute', { sessionId, operation, args }) as ReturnType<AgentServices['browser']>,
+    publishArtifact: (sessionId, input) =>
+      deps.relayRpc('artifact.publish', { sessionId, input }) as ReturnType<NonNullable<AgentServices['publishArtifact']>>,
     remoteDevices: (sessionId) =>
       deps.relayRpc('remote.list', { sessionId }) as ReturnType<AgentServices['remoteDevices']>,
     remoteExecute: (sessionId, siteId, action) =>

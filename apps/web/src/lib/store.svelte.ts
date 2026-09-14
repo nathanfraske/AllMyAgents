@@ -3016,6 +3016,14 @@ export class HubStore {
     }
 
     switch (kind) {
+      case 'session/artifact': {
+        this.push(view, {
+          kind: 'assistant', ts, key: `journal:${seq}:0`,
+          text: (payload as { text?: string }).text ?? '',
+          attachments: attachmentsFromPayload(payload),
+        })
+        break
+      }
       case 'session/input': {
         // The canonical user message (journaled by the hub, so it replays + is timestamped).
         // Skip if we already rendered it optimistically this turn. Attachments are METADATA the hub
