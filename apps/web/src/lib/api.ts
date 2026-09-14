@@ -283,6 +283,7 @@ export interface SessionRecord {
   managerOperatorTaskUpdatedAt?: string
   managerStandingInstructions?: string
   managerCanApproveChildren?: boolean
+  canStartRuns?: boolean
   managerApprovalHelper?: ManagerApprovalHelperConfig
   managerPauseExhaustedAccounts?: boolean
   managerAllowWorkerSubagents?: boolean
@@ -454,6 +455,7 @@ export interface QuestionRecord {
   questions: QuestionPrompt[]
   status: 'pending' | 'answered' | 'cancelled' | 'aborted'
   createdAt: string
+  expiresAt?: string
 }
 
 export interface ClaudeUsageLine {
@@ -1926,6 +1928,8 @@ export const api = {
     routedPost<{ ok?: boolean; error?: string }>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/browser/show`),
   clearBrowser: (id: string) =>
     routedPost<{ ok?: boolean; error?: string }>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/browser/clear`),
+  configureDurableRuns: (id: string, enabled: boolean) =>
+    routedPost<SessionRecord | ApiError>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/durable-runs`, { enabled }),
   configureProjectManager: (
     id: string,
     config: {

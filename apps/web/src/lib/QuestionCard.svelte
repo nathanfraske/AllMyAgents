@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { QuestionRecord } from './api'
+  import QuestionDeadline from './QuestionDeadline.svelte'
 
   let {
     record,
@@ -222,8 +223,9 @@
     {/each}
 
     <div class="actions">
+      <QuestionDeadline expiresAt={record.expiresAt} />
       <button class="submit" type="submit" disabled={busy}>Submit answers</button>
-      <button type="button" disabled={busy} onclick={cancel}>Cancel question</button>
+      <button type="button" disabled={busy} onclick={cancel}>{codex ? 'Skip question' : 'Cancel question'}</button>
     </div>
     {#if localError || error}
       <div class="error" role="alert">{localError || error}</div>

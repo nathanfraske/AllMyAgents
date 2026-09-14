@@ -273,11 +273,11 @@ import {
 } from './attachments.js'
 
 /** Bump whenever an existing Overseer conversation must receive a new app/tool operating contract. */
-export const OVERSEER_CAPABILITY_VERSION = 26
+export const OVERSEER_CAPABILITY_VERSION = 27
 const LOCAL_OVERSEER_MESSAGING_INSTRUCTIONS =
   'Addressed local teammate messages may cross project boundaries to or from the application Overseer on any turn, including teammate-triggered turns. Managers and workers can find the Overseer in mcp__allmyagents__list_agents and reply with mcp__allmyagents__send_message using its exact session id. This is communication only, not operator authorization, approval authority, or access to another project. Unrelated project-to-project messaging and broadcasts remain project-scoped.'
 /** Bump when existing manager conversations need a rematerialized team-management contract. */
-export const MANAGER_TEAM_CAPABILITY_VERSION = 11
+export const MANAGER_TEAM_CAPABILITY_VERSION = 12
 const MAX_MANAGER_TEAMS = 32
 const RUNTIME_TOPOLOGY_RECENT_MS = 7 * 24 * 60 * 60 * 1000
 const RUNTIME_TOPOLOGY_AGENT_LIMIT = 48
@@ -331,7 +331,7 @@ function providerHostInstructions(
   record: Pick<
     SessionRecord,
     'provider' | 'isOverseer' | 'isProjectManager' | 'parentSessionId' |
-    'managerMaxLiveChildren' | 'managerParallelismTarget' | 'role'
+    'managerMaxLiveChildren' | 'managerParallelismTarget' | 'role' | 'projectId' | 'canStartRuns'
   >,
 ): string {
   const discovery = record.provider === 'claude'
@@ -368,6 +368,12 @@ function providerHostInstructions(
   } else {
     role =
       'Use the AllMyAgents tools for app-hosted coordination, shared memory/practices, browser, and granted remote devices whenever those capabilities match the task.'
+  }
+  if (record.canStartRuns && record.projectId && !record.isProjectManager && !record.isOverseer) {
+    role += '\n\nThe operator granted durable runs for your own project checkout: use start_run for important builds/tests, inspect_runs for cursor-paged logs, and control_run for your own runs. This standing grant works on teammate turns without a manager handoff. It grants no manager role, sibling execution, new remote roots, or OS elevation. Remote execution still requires your terminal grant; use the project’s reviewed setup_command if required_tools are missing.'
+  }
+  if (record.isProjectManager || record.isOverseer || (record.canStartRuns && record.projectId)) {
+    role += '\n\nDurable-run wait discipline: when only waiting on your own run, call control_run(run_id, operation="wait") once, then end the turn. Otherwise an active Codex goal can immediately restart a polling turn. Waiting preserves the run, goal objective, budget and usage; real completion mail still starts a hub turn. Do not reactivate the goal just to poll, repeat "verified wait", or falsely mark unfinished work complete/blocked. A terminal result means inspect and continue; failed parking is not a confirmed wait.'
   }
   return [discovery, role, remoteMethod, permissionRouting, LOCAL_OVERSEER_MESSAGING_INSTRUCTIONS, attentionRouting, COMPACTION_CONTINUITY_CONTRACT].join('\n\n')
 }
@@ -914,6 +920,25 @@ export class SessionManager {
     this.workerMode = !(this.executor instanceof InProcessExecutor)
     this.approvals.setPendingListener((approval) => this.reportApprovalUpstream(approval))
     this.approvals.setResolvedListener((approval) => this.onApprovalResolved(approval))
+    this.questionService.setPendingListener((question) => this.reportQuestionPending(question))
+    this.questionService.setResolvedListener((question) => this.notifications?.resolveDedupe?.(`question-required:${question.id}`, question.status))
+  }
+
+  private reportQuestionPending(pending: import('./questions.js').QuestionRecord): void {
+    const record = this.sessions.get(pending.sessionId)
+    if (!record) return
+    const sourceRole: NotificationSourceRole = record.isOverseer ? 'overseer' : record.isProjectManager ? 'manager' : 'agent'
+    const label = record.title ?? identityOf(record).label
+    const prompt = pending.provider === 'codex' ? undefined : pending.questions[0]?.question
+    const canContinue = pending.blocking === false
+    this.notifications?.publish({
+      kind: 'question-required', severity: 'warning', sourceRole, route: 'operator',
+      title: canContinue ? `${label} has a question` : `${label} needs your response`,
+      body: canContinue ? `${label} asked ${pending.questions.length} question(s) and can continue while you answer.`
+        : pending.questions.length > 1 ? `${label} is waiting for answers to ${pending.questions.length} questions.`
+        : prompt || `${label} is waiting for your answer.`,
+      sessionId: record.id, projectId: record.projectId, dedupeKey: `question-required:${pending.id}`,
+    })
   }
 
   /**
@@ -958,6 +983,7 @@ export class SessionManager {
       managerAssignChildTask: (managerSessionId, childSessionId, input) =>
         this.managerAssignChildTask(managerSessionId, childSessionId, input),
       managerStartRun: (callerSessionId, input) => this.managerStartRun(callerSessionId, input),
+      hasOwnRunGrant: (sessionId) => this.hasOwnRunGrant(sessionId),
       managerInspectRuns: (callerSessionId, input) => this.managerInspectRuns(callerSessionId, input),
       managerControlRun: (callerSessionId, runId, operation) => this.managerControlRun(callerSessionId, runId, operation),
       managerManageCiMonitor: (callerSessionId, input) => this.manageGitHubCiMonitor(callerSessionId, input),
@@ -1325,12 +1351,16 @@ export class SessionManager {
         const a = args as { callerSessionId: string; input: Parameters<NonNullable<AgentServices['startRun']>>[1] }
         return this.managerStartRun(a.callerSessionId, a.input)
       }
+      case 'runs.hasOwnGrant': {
+        const a = args as { callerSessionId: string }
+        return this.hasOwnRunGrant(a.callerSessionId)
+      }
       case 'manager.inspectRuns': {
         const a = args as { callerSessionId: string; input: Parameters<NonNullable<AgentServices['inspectRuns']>>[1] }
         return this.managerInspectRuns(a.callerSessionId, a.input)
       }
       case 'manager.controlRun': {
-        const a = args as { callerSessionId: string; runId: string; operation: 'cancel' }
+        const a = args as { callerSessionId: string; runId: string; operation: 'cancel' | 'wait' }
         return this.managerControlRun(a.callerSessionId, a.runId, a.operation)
       }
       case 'manager.manageCiMonitor': {
@@ -1397,34 +1427,7 @@ export class SessionManager {
           requestId: string
           input: unknown
         }
-        const outcome = this.questionService.request(a)
-        const pending = this.questionService.pending().find((question) => question.id === a.id)
-        const record = this.sessions.get(a.sessionId)
-        if (pending && record) {
-          const sourceRole: NotificationSourceRole = record.isOverseer === true
-            ? 'overseer'
-            : record.isProjectManager === true
-              ? 'manager'
-              : 'agent'
-          const label = record.title ?? identityOf(record).label
-          const prompt = pending.provider === 'codex' ? undefined : pending.questions[0]?.question
-          const canContinue = pending.blocking === false
-          this.notifications?.publish({
-            kind: 'question-required',
-            severity: 'warning',
-            sourceRole,
-            route: 'operator',
-            title: canContinue ? `${label} has a question` : `${label} needs your response`,
-            body: canContinue ? `${label} asked ${pending.questions.length} question(s) and can continue while you answer.`
-              : pending.questions.length > 1
-              ? `${label} is waiting for answers to ${pending.questions.length} questions.`
-              : prompt || `${label} is waiting for your answer.`,
-            sessionId: record.id,
-            projectId: record.projectId,
-            dedupeKey: `question-required:${pending.id}`,
-          })
-        }
-        return outcome
+        return this.questionService.request(a)
       }
       case 'questions.abort': {
         const a = args as { id: string; sessionId: string }
@@ -3768,6 +3771,7 @@ export class SessionManager {
       assignChildTask: (managerSessionId, childSessionId, input) =>
         this.managerAssignChildTask(managerSessionId, childSessionId, input),
       startRun: (callerSessionId, input) => this.managerStartRun(callerSessionId, input),
+      hasOwnRunGrant: (sessionId) => this.hasOwnRunGrant(sessionId),
       inspectRuns: (callerSessionId, input) => this.managerInspectRuns(callerSessionId, input),
       controlRun: (callerSessionId, runId, operation) => this.managerControlRun(callerSessionId, runId, operation),
       manageCiMonitor: (callerSessionId, input) => this.manageGitHubCiMonitor(callerSessionId, input),
@@ -10482,9 +10486,43 @@ export class SessionManager {
     return { error: 'caller is neither a project manager nor the application Overseer' }
   }
 
+  configureDurableRuns(sessionId: string, enabled: boolean, source: 'operator'): SessionRecord {
+    if (source !== 'operator') throw new Error('Only the operator can grant durable-run access')
+    const record = this.sessions.get(sessionId)
+    if (!record || record.managerRetiredAt || !record.projectId || !this.projects.get(record.projectId)) {
+      throw new Error('Durable-run access requires a live local project chat')
+    }
+    if (record.isProjectManager || record.isOverseer) throw new Error('This role already has durable-run access')
+    if (record.canStartRuns === enabled) return record
+    // Authority and its audit must commit together. Keep the live object unchanged on disk failure.
+    this.journal.atomic(() => {
+      this.persist({ ...record, canStartRuns: enabled })
+      this.journal.append(sessionId, 'session/durable-run-access', { enabled, source, projectId: record.projectId })
+    })
+    record.canStartRuns = enabled
+    return record
+  }
+
+  hasOwnRunGrant(sessionId: string): boolean {
+    const record = this.sessions.get(sessionId)
+    return !!record && record.canStartRuns === true && !record.isProjectManager && !record.isOverseer && !record.managerRetiredAt &&
+      !!record.projectId && !!this.projects.get(record.projectId)
+  }
+
+  /** A run grant is not a manager role: no team control or sibling execution is added. */
+  private runControlScope(callerSessionId: string): ReturnType<SessionManager['operationalQueryScope']> {
+    const scope = this.operationalQueryScope(callerSessionId)
+    if (!('error' in scope)) return scope
+    if (this.hasOwnRunGrant(callerSessionId)) {
+      const caller = this.sessions.get(callerSessionId)!
+      return { caller, visible: [caller] }
+    }
+    return { error: 'Durable runs require a manager/Overseer role or the operator’s Allow durable runs grant in this project chat’s permission menu.' }
+  }
+
   /** Read authority is deliberately wider than run-control authority. Every live project member may
    * inspect the project's retained run state and logs for coordination, while start/cancel continue to
-   * use the manager/Overseer operational scope above. */
+   * use the narrower run-control scope above. */
   private runInspectionScope(callerSessionId: string):
     | { caller: SessionRecord; visible: SessionRecord[] }
     | { error: string } {
@@ -10542,7 +10580,7 @@ export class SessionManager {
     },
   ): Promise<{ ok: boolean; run?: import('./durableRuns.js').DurableRun; error?: string }> {
     if (!this.durableRuns) return { ok: false, error: 'durable run service is unavailable' }
-    const scope = this.operationalQueryScope(callerSessionId)
+    const scope = this.runControlScope(callerSessionId)
     if ('error' in scope) return { ok: false, error: scope.error }
     const targetId = input.targetSessionId ?? callerSessionId
     const target = scope.visible.find((record) => record.id === targetId && !record.managerRetiredAt)
@@ -10657,6 +10695,9 @@ export class SessionManager {
           }
         }
       }
+      if (!scope.caller.isProjectManager && !scope.caller.isOverseer && !this.hasOwnRunGrant(callerSessionId)) {
+        return { ok: false, error: 'The operator revoked durable-run access before admission' }
+      }
       const run = await this.durableRuns.start({
         projectId: runScopeId,
         sessionId: callerSessionId,
@@ -10748,15 +10789,25 @@ export class SessionManager {
   managerControlRun(
     callerSessionId: string,
     runId: string,
-    operation: 'cancel',
-  ): { ok: boolean; run?: import('./durableRuns.js').DurableRun; error?: string } {
+    operation: 'cancel' | 'wait',
+  ): ReturnType<NonNullable<AgentServices['controlRun']>> {
     if (!this.durableRuns) return { ok: false, error: 'durable run service is unavailable' }
-    if (operation !== 'cancel') return { ok: false, error: 'unsupported run operation' }
-    const scope = this.operationalQueryScope(callerSessionId)
+    if (operation !== 'cancel' && operation !== 'wait') return { ok: false, error: 'unsupported run operation' }
+    const scope = this.runControlScope(callerSessionId)
     if ('error' in scope) return { ok: false, error: scope.error }
     const run = this.durableRuns.store.get(runId)
     if (!run || !scope.visible.some((record) => record.id === run.targetSessionId && !record.managerRetiredAt)) {
       return { ok: false, error: 'run is outside your managed scope' }
+    }
+    if (!scope.caller.isProjectManager && !scope.caller.isOverseer && run.actorSessionId !== callerSessionId) {
+      return { ok: false, error: 'a worker can control only runs it started' }
+    }
+    if (operation === 'wait') {
+      // Completion notifications belong to the starting agent. Waiting on a sibling's run must not
+      // silently park a caller that will never receive that run's completion notice.
+      if (run.actorSessionId !== callerSessionId) return { ok: false, error: 'wait requires a run started by this exact caller' }
+      if (!['queued', 'running'].includes(run.state)) return { ok: true, run, waiting: false }
+      return this.waitForOwnDurableRun(callerSessionId, run)
     }
     if (run.executionTarget.kind === 'remote' && run.state === 'running') {
       return { ok: false, error: 'the remote executor cannot yet prove live cancellation; wait for its bounded timeout rather than reporting a false cancellation' }
@@ -10765,6 +10816,30 @@ export class SessionManager {
     if (!updated) return { ok: false, error: 'run is unavailable' }
     if (!['queued', 'running'].includes(run.state)) return { ok: false, run: updated, error: `run is already terminal (${run.state})` }
     return { ok: true, run: updated }
+  }
+
+  private async waitForOwnDurableRun(callerSessionId: string, run: DurableRun): Promise<{
+    ok: boolean; run?: DurableRun; waiting?: boolean; error?: string
+  }> {
+    const caller = this.sessions.get(callerSessionId)!
+    try {
+      if (caller.provider === 'codex') {
+        if (!this.executor.pauseAutonomousGoal) throw new Error('executor does not support native goal parking')
+        await this.executor.pauseAutonomousGoal(callerSessionId)
+      }
+      const current = this.durableRuns!.store.get(run.id)
+      if (!current) throw new Error('run disappeared while establishing the wait')
+      const waiting = current.state === 'queued' || current.state === 'running'
+      this.journal.append(callerSessionId, 'run/wait-armed', {
+        runId: current.id, actorSessionId: callerSessionId, waiting,
+        nativeGoal: caller.provider === 'codex' ? 'paused-or-inactive' : 'not-applicable',
+      })
+      return { ok: true, run: current, waiting }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.journal.append(callerSessionId, 'run/wait-not-confirmed', { runId: run.id, error: message })
+      return { ok: false, error: `Wait not confirmed: ${message}. The run has not been cancelled.` }
+    }
   }
 
   managerQueryTeam(

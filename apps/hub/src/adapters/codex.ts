@@ -375,12 +375,36 @@ export class CodexClient {
     this.child?.stdin?.write(JSON.stringify(msg) + '\n')
   }
 
-  request<T = unknown>(method: string, params?: unknown): Promise<T> {
+  request<T = unknown>(method: string, params?: unknown, timeoutMs?: number): Promise<T> {
     const id = this.nextId++
     return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { method, resolve: resolve as (v: unknown) => void, reject })
+      const timer = timeoutMs === undefined ? undefined : setTimeout(() => {
+        this.pending.delete(id)
+        reject(new Error(`${method}: response not confirmed within ${timeoutMs}ms; do not assume the operation failed or retry blindly`))
+      }, timeoutMs)
+      this.pending.set(id, {
+        method,
+        resolve: value => { clearTimeout(timer); resolve(value as T) },
+        reject: error => { clearTimeout(timer); reject(error) },
+      })
       this.send(params === undefined ? { id, method } : { id, method, params })
     })
+  }
+
+  /** Park native goal auto-continuations without issuing turn/interrupt or cancelling external work. A status-only
+   * update preserves the objective, budget and usage. Hub completion mail can still start a real turn;
+   * it must not automatically reactivate the polling loop or override an operator-paused goal. */
+  async pauseAutonomousGoal(threadId: string): Promise<void> {
+    const result = await this.request<{ goal: { status: string } | null }>('thread/goal/get', { threadId }, 5000)
+    if (result?.goal === null) return
+    const status = result?.goal?.status
+    if (['paused', 'blocked', 'usageLimited', 'budgetLimited', 'complete'].includes(status ?? '')) return
+    if (status !== 'active') throw new Error('Native goal state is unavailable; waiting was not confirmed')
+    const updated = await this.request<{ goal: { status: string } | null }>(
+      'thread/goal/set', { threadId, status: 'paused' }, 5000,
+    )
+    if (updated?.goal?.status !== 'paused') throw new Error('Native goal pause was not confirmed')
+    this.onEvent('codex/goal-wait-paused', { threadId, status: 'paused' })
   }
 
   async ensureStarted(): Promise<void> {

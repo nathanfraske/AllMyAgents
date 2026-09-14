@@ -21,7 +21,7 @@ export interface ResolvedQuestion {
   status: 'answered' | 'cancelled' | 'aborted' | 'interrupted'
   correlationDigest: string
   questionDigest: string
-  reason?: 'hub-restarted' | 'worker-restarted' | 'interrupted_by_restart'
+  reason?: 'hub-restarted' | 'worker-restarted' | 'interrupted_by_restart' | 'auto-skipped'
 }
 
 export interface DurableQuestion {

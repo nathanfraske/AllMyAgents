@@ -95,6 +95,7 @@ const FLEET_STREAM_SESSION_STATE_KINDS = new Set([
   'session/status',
   'session/mode',
   'session/settings',
+  'session/durable-run-access',
   'session/project-detached',
   'session/error',
   'session/worktree-created',
@@ -2913,6 +2914,14 @@ export function startServer(opts: ServerOptions): http.Server {
       // is the trust boundary that unlocks spawn_agent; models may consume it but can never promote a
       // session. Every grant/revoke is persisted on the session record and journaled by SessionManager.
       const managerReassignMatch = /^\/api\/sessions\/([^/]+)\/project-manager\/reassign$/.exec(url.pathname)
+      const runGrantMatch = /^\/api\/sessions\/([^/]+)\/durable-runs$/.exec(url.pathname)
+      if (method === 'POST' && runGrantMatch) {
+        if (!authed) { json(res, { error: 'operator device token required' }, 403); return }
+        const body = await readBody(req)
+        if (typeof body.enabled !== 'boolean') { json(res, { error: 'enabled must be boolean' }, 400); return }
+        json(res, sessions.configureDurableRuns(runGrantMatch[1]!, body.enabled, 'operator'))
+        return
+      }
       if (method === 'POST' && managerReassignMatch) {
         if (!authed) {
           json(res, { error: 'operator device token required' }, 403)

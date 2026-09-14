@@ -60,6 +60,7 @@ export type HubToWorker =
     }
   | { t: 'steer'; reqId: string; sessionId: string; text: string; attachments?: AttachmentMeta[] }
   | { t: 'interrupt'; reqId: string; sessionId: string }
+  | { t: 'pauseAutonomousGoal'; reqId: string; sessionId: string }
   | { t: 'interruptAgent'; reqId: string; sessionId: string; targetId: string }
   | { t: 'stopSession'; reqId: string; sessionId: string }
   | { t: 'listLive'; reqId: string }
@@ -130,6 +131,7 @@ export type RelayMethod =
   | 'manager.decideChildApproval'
   | 'manager.assignChildTask'
   | 'manager.startRun'
+  | 'runs.hasOwnGrant'
   | 'manager.inspectRuns'
   | 'manager.controlRun'
   | 'manager.manageCiMonitor'

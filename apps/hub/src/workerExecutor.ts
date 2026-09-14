@@ -233,6 +233,10 @@ export class WorkerExecutor implements Executor {
     await this.callAck({ t: 'interrupt', reqId: nextReqId(), sessionId })
   }
 
+  async pauseAutonomousGoal(sessionId: string): Promise<void> {
+    await this.callAck({ t: 'pauseAutonomousGoal', reqId: nextReqId(), sessionId })
+  }
+
   async interruptAgent(sessionId: string, targetId: string): Promise<void> {
     await this.callAck({ t: 'interruptAgent', reqId: nextReqId(), sessionId, targetId })
   }

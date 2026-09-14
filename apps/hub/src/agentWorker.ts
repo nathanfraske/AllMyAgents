@@ -208,6 +208,7 @@ export function buildWorkerAgentServices(deps: WorkerAgentServiceDeps): AgentSer
         childSessionId,
         input,
       }) as Promise<{ ok: boolean; taskId?: string; warning?: string; error?: string }>,
+    hasOwnRunGrant: (callerSessionId) => deps.relayRpc('runs.hasOwnGrant', { callerSessionId }) as Promise<boolean>,
     startRun: (callerSessionId, input) =>
       deps.relayRpc('manager.startRun', { callerSessionId, input }) as ReturnType<
         NonNullable<AgentServices['startRun']>
@@ -390,6 +391,11 @@ export class AgentWorker {
         return
       case 'interrupt':
         this.interrupt(msg.sessionId)
+          .then(() => this.ack(msg.reqId, true))
+          .catch((err) => this.ack(msg.reqId, false, errMessage(err)))
+        return
+      case 'pauseAutonomousGoal':
+        this.pauseAutonomousGoal(msg.sessionId)
           .then(() => this.ack(msg.reqId, true))
           .catch((err) => this.ack(msg.reqId, false, errMessage(err)))
         return
@@ -593,6 +599,13 @@ export class AgentWorker {
       const client = this.codexSessionClients.get(sessionId)
       if (client) await client.interrupt(threadId)
     }
+  }
+
+  private async pauseAutonomousGoal(sessionId: string): Promise<void> {
+    const client = this.codexSessionClients.get(sessionId)
+    const threadId = this.codexThreads.get(sessionId)
+    if (!client || !threadId) throw new Error('No bound Codex thread; native goal wait was not confirmed')
+    await client.pauseAutonomousGoal(threadId)
   }
 
   private async interruptAgent(sessionId: string, targetId: string): Promise<void> {

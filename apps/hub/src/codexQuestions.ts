@@ -30,12 +30,15 @@ function flag(value: unknown, fallback = false): boolean {
   return value
 }
 
-export function parseCodexQuestionInput(input: unknown): { questions: AskUserQuestion[]; blocking: boolean; itemId: string } {
+export function parseCodexQuestionInput(input: unknown): { questions: AskUserQuestion[]; blocking: boolean; itemId: string; autoResolutionMs?: number } {
   const raw = object(input)
   text(raw.threadId, 512)
   text(raw.turnId, 512)
   const itemId = text(raw.itemId, 512)
   if (typeof raw.isBlocking !== 'boolean') throw new Error('Codex question is missing its blocking contract')
+  if (raw.autoResolutionMs != null && (!Number.isSafeInteger(raw.autoResolutionMs) || (raw.autoResolutionMs as number) < 0 || (raw.autoResolutionMs as number) > 2_147_483_647)) {
+    throw new Error('Invalid question auto-resolution deadline')
+  }
   if (!Array.isArray(raw.questions) || !raw.questions.length || raw.questions.length > 8) throw new Error('Expected 1-8 bounded Codex questions')
   const ids = new Set<string>()
   const questions = raw.questions.map(value => {
@@ -58,7 +61,7 @@ export function parseCodexQuestionInput(input: unknown): { questions: AskUserQue
       multiSelect: false, allowFreeText: flag(q.isOther) || options.length === 0, isSecret: flag(q.isSecret),
     }
   })
-  return { questions, blocking: raw.isBlocking, itemId }
+  return { questions, blocking: raw.isBlocking, itemId, ...(raw.autoResolutionMs != null ? { autoResolutionMs: raw.autoResolutionMs as number } : {}) }
 }
 
 /** One request/abort seam shared by the in-process and worker executors. No answer is journaled or

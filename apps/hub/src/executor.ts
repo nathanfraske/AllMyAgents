@@ -64,6 +64,8 @@ export interface Executor {
   steer(sessionId: string, text: string, attachments?: readonly AttachmentMeta[]): Promise<void>
   /** Interrupt the in-flight parent turn (claude query / codex turn). */
   interrupt(sessionId: string): Promise<void>
+  /** Stop only native goal auto-continuations while waiting for hub-owned work. Never cancels a run. */
+  pauseAutonomousGoal?(sessionId: string): Promise<void>
   /** Interrupt one vendor sub-agent, preserving the parent turn, sibling agents, and all files on disk. */
   interruptAgent?(sessionId: string, targetId: string): Promise<void>
   /** Drop the driver/thread for a stopped/deleted session from the executor. */
@@ -271,6 +273,7 @@ export interface InProcessExecutorHubHooks {
     callerSessionId: string,
     input: Parameters<NonNullable<AgentServices['startRun']>>[1],
   ): ReturnType<NonNullable<AgentServices['startRun']>>
+  hasOwnRunGrant(sessionId: string): boolean
   managerInspectRuns(
     callerSessionId: string,
     input: Parameters<NonNullable<AgentServices['inspectRuns']>>[1],
@@ -278,7 +281,7 @@ export interface InProcessExecutorHubHooks {
   managerControlRun(
     callerSessionId: string,
     runId: string,
-    operation: 'cancel',
+    operation: 'cancel' | 'wait',
   ): ReturnType<NonNullable<AgentServices['controlRun']>>
   managerManageCiMonitor(
     callerSessionId: string,
@@ -378,6 +381,7 @@ export class InProcessExecutor implements Executor {
       assignChildTask: (managerSessionId, childSessionId, input) =>
         this.h.managerAssignChildTask(managerSessionId, childSessionId, input),
       startRun: (callerSessionId, input) => this.h.managerStartRun(callerSessionId, input),
+      hasOwnRunGrant: (sessionId) => this.h.hasOwnRunGrant(sessionId),
       inspectRuns: (callerSessionId, input) => this.h.managerInspectRuns(callerSessionId, input),
       controlRun: (callerSessionId, runId, operation) => this.h.managerControlRun(callerSessionId, runId, operation),
       manageCiMonitor: (callerSessionId, input) => this.h.managerManageCiMonitor(callerSessionId, input),
@@ -860,6 +864,13 @@ export class InProcessExecutor implements Executor {
       const client = this.codexSessionClients.get(sessionId)
       if (client) await client.interrupt(threadId)
     }
+  }
+
+  async pauseAutonomousGoal(sessionId: string): Promise<void> {
+    const client = this.codexSessionClients.get(sessionId)
+    const threadId = this.codexThreads.get(sessionId)
+    if (!client || !threadId) throw new Error('No bound Codex thread; native goal wait was not confirmed')
+    await client.pauseAutonomousGoal(threadId)
   }
 
   async interruptAgent(sessionId: string, targetId: string): Promise<void> {

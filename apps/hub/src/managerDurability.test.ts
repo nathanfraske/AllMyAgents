@@ -73,11 +73,17 @@ async function crashNarrowingAfter(write: number): Promise<{ records: SessionRec
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   })
   await new Promise<void>((resolve, reject) => {
+    let stderr = ''
+    child.stderr?.on('data', chunk => { stderr = (stderr + String(chunk)).slice(-4096) })
     const timer = setTimeout(() => {
       child.kill('SIGKILL')
-      reject(new Error(`crash harness did not reach write ${write}`))
+      reject(new Error(`crash harness did not reach write ${write}: ${stderr}`))
     }, 30_000)
-    child.once('error', reject)
+    child.once('error', error => { clearTimeout(timer); reject(error) })
+    child.once('exit', (code, signal) => {
+      clearTimeout(timer)
+      reject(new Error(`crash harness exited before write ${write} (${code ?? signal}): ${stderr}`))
+    })
     child.on('message', (message) => {
       if ((message as { type?: string }).type !== 'persistence-boundary') return
       clearTimeout(timer)

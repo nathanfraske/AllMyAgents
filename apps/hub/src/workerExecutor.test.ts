@@ -220,6 +220,7 @@ describe('WorkerExecutor targeted sub-agent interrupt', () => {
     const exec = new WorkerExecutor(client, recordingHub().hub)
 
     await exec.interruptAgent('parent-1', 'task-1')
+    await exec.pauseAutonomousGoal('parent-1')
 
     expect(calls).toEqual([
       expect.objectContaining({
@@ -227,6 +228,7 @@ describe('WorkerExecutor targeted sub-agent interrupt', () => {
         sessionId: 'parent-1',
         targetId: 'task-1',
       }),
+      expect.objectContaining({ t: 'pauseAutonomousGoal', sessionId: 'parent-1' }),
     ])
   })
 })

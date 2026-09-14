@@ -25,6 +25,22 @@ describe('compact durable run inspection', () => {
       environmentKeys: ['PATH'], lockfiles: [{ path: 'lockfile', sha256: 'lock-hash' }] },
   }
   const logs = { stdout: '', stderr: '', nextStdoutCursor: 100, nextStderrCursor: 0, stdoutComplete: true, stderrComplete: true }
+  it.each(['codex', 'claude'] as const)('uses the live own-run grant on %s bus turns, without widening target scope', async provider => {
+    const h = makeHarness({ isBusTurn: true })
+    const identity = { ...idA, provider }
+    h.services.hasOwnRunGrant = vi.fn(async () => true)
+    h.services.requireApproval = vi.fn(async () => false)
+    h.services.startRun = vi.fn(() => ({ ok: true, run }))
+    const args = { kind: 'test', executable: 'node' }
+    expect(JSON.parse(String(await runAgentTool('start_run', args, { identity, services: h.services })))).toMatchObject({ id: run.id })
+    expect(h.services.hasOwnRunGrant).toHaveBeenCalledWith('s1')
+    expect(h.services.requireApproval).not.toHaveBeenCalled()
+    expect(await runAgentTool('start_run', { ...args, target_session: 'other' }, { identity, services: h.services })).toContain('teammate-caused')
+    expect(h.services.startRun).toHaveBeenCalledTimes(1)
+    h.services.hasOwnRunGrant = async () => false
+    expect(await runAgentTool('start_run', args, { identity, services: h.services })).toContain('teammate-caused')
+    expect(h.services.startRun).toHaveBeenCalledTimes(1)
+  })
   it('returns exact cursors/state and automatic-completion guidance without repeating immutable provenance', async () => {
     const h = makeHarness()
     h.services.inspectRuns = vi.fn(() => ({ ok: true, runs: [run], logs }))
@@ -33,7 +49,8 @@ describe('compact durable run inspection', () => {
     expect(result.runs[0]).not.toHaveProperty('provenance')
     expect(result.logs).toEqual(logs)
     expect(result.waitingForOutput).toBe(true)
-    expect(result.nextAction).toContain('automatically to the starting agent')
+    expect(result.nextAction).toContain('control_run with operation=wait once')
+    expect(result.nextAction).toContain('Do not poll')
     expect(h.services.inspectRuns).toHaveBeenCalledWith('s1', expect.objectContaining({ runId: 'run-1', stdoutAfter: 100 }))
   })
   it('keeps the complete audit record available explicitly and preserves failure outcomes in summaries', async () => {
@@ -51,6 +68,32 @@ describe('compact durable run inspection', () => {
     const h = makeHarness()
     h.services.inspectRuns = () => ({ ok: false, error: 'outside your project run scope' })
     expect(await runAgentTool('inspect_runs', { run_id: run.id }, { identity: idA, services: h.services })).toContain('outside your project run scope')
+  })
+  it.each(['codex', 'claude'] as const)('allows self wait on a %s teammate turn without allowing cancellation', async provider => {
+    const h = makeHarness({ isBusTurn: true })
+    h.services.controlRun = vi.fn(async () => ({ ok: true, run, waiting: true }))
+    const identity = { ...idA, provider }
+    const before = JSON.stringify(run)
+    const result = JSON.parse(String(await runAgentTool('control_run', { run_id: run.id, operation: 'wait' }, { identity, services: h.services })))
+    expect(result).toMatchObject({ waiting: true, run: { state: 'running', cancelRequested: false } })
+    expect(h.services.controlRun).toHaveBeenCalledTimes(1)
+    expect(h.services.controlRun).toHaveBeenCalledWith('s1', run.id, 'wait')
+    expect(result.nextAction).toContain('End this turn now')
+    expect(await runAgentTool('control_run', { run_id: run.id, operation: 'cancel' }, { identity, services: h.services })).toContain('teammate-caused turn cannot stop host work')
+    expect(h.services.controlRun).toHaveBeenCalledTimes(1)
+    expect(JSON.stringify(run)).toBe(before)
+  })
+  it('does not report a failed pause as an armed wait', async () => {
+    const h = makeHarness()
+    h.services.controlRun = vi.fn(async () => ({ ok: false, error: 'native goal pause not confirmed' }))
+    expect(await runAgentTool('control_run', { run_id: run.id, operation: 'wait' }, { identity: idA, services: h.services })).toContain('not confirmed')
+  })
+  it('reports a completion race as terminal rather than directing the manager to wait', async () => {
+    const h = makeHarness()
+    h.services.controlRun = vi.fn(async () => ({ ok: true, run: { ...run, state: 'succeeded' as const }, waiting: false }))
+    const result = JSON.parse(String(await runAgentTool('control_run', { run_id: run.id, operation: 'wait' }, { identity: idA, services: h.services })))
+    expect(result).toMatchObject({ waiting: false, run: { state: 'succeeded' } })
+    expect(result.nextAction).toContain('already terminal')
   })
   it.each(['codex', 'claude'] as const)('shares compact acknowledgements and full detail for %s without changing the durable record', async (provider) => {
     const h = makeHarness()

@@ -8,6 +8,7 @@ import { Journal } from '../src/journal.js'
 import { MemoryStore } from '../src/memory.js'
 import { PracticeStore } from '../src/practices.js'
 import { ProjectStore } from '../src/projects.js'
+import { QuestionService } from '../src/questions.js'
 import { SessionManager } from '../src/sessions.js'
 import { SessionStore } from '../src/store.js'
 import type { Profile } from '../src/types.js'
@@ -51,6 +52,7 @@ const sessions = new SessionManager(
   { busCanUseRiskyTools: false, autoApprovePractices: false },
   false,
   root,
+  new QuestionService(journal),
   executor
 )
 sessions.loadRecords()
