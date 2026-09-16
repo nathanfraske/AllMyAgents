@@ -74,6 +74,9 @@
   .seg > :global(:last-child) { margin-bottom: 0; }
 
   .seg :global(p) { margin: 0.5rem 0; }
+  .seg :global(math) { font-family: math; font-size: 1.12em; overflow-wrap: normal; word-break: normal; }
+  .seg :global(math[display='block']) { display: block; max-width: 100%; overflow-x: auto; padding: 0.5rem 0; margin: 0.65rem 0; }
+  .seg :global(.math-source) { white-space: pre-wrap; }
 
   .seg :global(h1),
   .seg :global(h2),

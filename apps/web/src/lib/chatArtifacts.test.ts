@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/svelte'
 import { HubStore } from './store.svelte'
 import type { HubEvent, SessionRecord } from './api'
@@ -6,6 +6,11 @@ import { reduceJournalHistory } from './journalHistoryReducer'
 import ItemCard from './ItemCard.svelte'
 
 afterEach(cleanup)
+beforeEach(() => {
+  HTMLDialogElement.prototype.showModal = function () { this.open = true }
+  HTMLDialogElement.prototype.close = function () { this.open = false }
+})
+afterEach(() => vi.restoreAllMocks())
 const event: HubEvent = {
   seq: 42, sessionId: 'artifact-chat', ts: '2026-09-14T00:00:00Z', kind: 'session/artifact',
   payload: { text: 'Assembly preview', attachments: [{ id: 'preview-id', name: 'render.png', mime: 'image/png', size: 512 }], sha256: 'digest' },
@@ -25,12 +30,12 @@ describe('provider-neutral chat artifact display', () => {
     expect(container.querySelector('img')?.getAttribute('loading')).toBe('lazy')
   })
 
-  it('expands and shrinks inline, offers download, and visibly retries a failed preview', async () => {
+  it('opens a full-window modal, offers download, and visibly retries a failed preview', async () => {
     const { container } = render(ItemCard, { item: reduceJournalHistory([event])[0]!, sessionId: 'artifact-chat' })
-    await fireEvent.click(screen.getByRole('button', { name: 'Expand render.png' }))
-    expect(screen.getByRole('button', { name: 'Shrink render.png' }).getAttribute('aria-expanded')).toBe('true')
-    await fireEvent.click(screen.getByRole('button', { name: 'Shrink render.png' }))
-    expect(screen.getByRole('button', { name: 'Expand render.png' }).getAttribute('aria-expanded')).toBe('false')
+    await fireEvent.click(screen.getByRole('button', { name: 'Open render.png in image viewer' }))
+    expect(screen.getByRole('dialog', { name: 'Image viewer' }).parentElement).toBe(document.body)
+    await fireEvent.click(screen.getByRole('button', { name: 'Close image viewer' }))
+    expect(screen.queryByRole('dialog')).toBeNull()
     expect(screen.getByRole('link', { name: 'Download' }).getAttribute('download')).toBe('render.png')
     await fireEvent.error(container.querySelector('img')!)
     expect(screen.getByText(/Preview unavailable for render.png/)).toBeTruthy()

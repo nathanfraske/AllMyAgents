@@ -14,6 +14,7 @@ import { Marked } from 'marked'
 import type { Token, Tokens } from 'marked'
 import DOMPurify from 'dompurify'
 import hljs from 'highlight.js/lib/common'
+import { mathExtensions } from './markdownMath'
 
 // A rendered chunk of a message: a run of sanitized prose HTML, or one fenced code block
 // (raw `code` kept for the copy button; `html` is the highlighted, sanitized display form).
@@ -24,7 +25,8 @@ export type Segment =
 // Isolated marked instance so we never mutate marked's global singleton. GFM on (tables,
 // strikethrough, task lists, autolinks); breaks:true turns single newlines into <br>, which
 // matches how chat models format replies (closer to how ChatGPT/Claude render).
-const marked = new Marked({ gfm: true, breaks: true })
+const markdownOptions = { gfm: true, breaks: true }
+const proseMarked = new Marked(markdownOptions)
 
 // Install the link-hardening hook exactly once. The module-scope guard keeps Vite HMR from
 // stacking duplicate hooks across reloads.
@@ -161,6 +163,9 @@ function sanitizeProse(html: string): string {
     // zero-click exfil beacon / prompt-injection channel (auto-fetched on render).
     FORBID_TAGS: ['style', 'form', 'iframe', 'object', 'embed', 'link', 'meta', 'base', 'img'],
     FORBID_ATTR: ['style'],
+    // Inert TeX source carried by generated MathML for copying/accessibility.
+    ADD_TAGS: ['semantics', 'annotation'],
+    ADD_ATTR: ['encoding'],
   })
 }
 
@@ -201,6 +206,9 @@ export function renderMarkdown(src: string | undefined): Segment[] {
   const text = src ?? ''
   if (!text.trim()) return []
 
+  const marked = /\\[([]|\$/.test(text)
+    ? new Marked(markdownOptions, { extensions: mathExtensions() })
+    : proseMarked
   const tokens = marked.lexer(text)
   const segments: Segment[] = []
   let buffer: Token[] = []
