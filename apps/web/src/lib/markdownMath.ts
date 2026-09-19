@@ -36,9 +36,32 @@ function expression(src: string, block: boolean, scan: () => boolean) {
   }
 }
 
+/** Shared by delimiter math and explicit math/latex fences. Undefined means show escaped source. */
+export function renderLatex(math: string, display: boolean): string | undefined {
+  if (math.length > MAX_MATH_LENGTH) return undefined
+  const key = JSON.stringify([display, math])
+  const prior = cache.get(key)
+  if (prior) { cache.delete(key); cache.set(key, prior); return prior }
+  try {
+    const rendered = katex.renderToString(math, {
+      output: 'mathml', displayMode: display, trust: false, throwOnError: true,
+      strict: 'ignore', maxExpand: 100, maxSize: 10, macros: {},
+    })
+    const size = 2 * (key.length + rendered.length)
+    if (size <= CACHE_BYTES) {
+      cache.set(key, rendered); cacheBytes += size
+      while (cacheBytes > CACHE_BYTES || cache.size > 128) {
+        const oldest = cache.keys().next().value!
+        cacheBytes -= 2 * (oldest.length + cache.get(oldest)!.length)
+        cache.delete(oldest)
+      }
+    }
+    return rendered
+  } catch { return undefined }
+}
+
 /** Fresh budget per Markdown message, shared across its nested inline/block tokens. */
-export function mathExtensions(): TokenizerAndRendererExtension[] {
-  let count = 0
+export function mathExtensions(budget = { remaining: MAX_MESSAGE_MATH }): TokenizerAndRendererExtension[] {
   // Many unfinished opening delimiters must not cause repeated full-suffix scans.
   let scanBudget = 256 * 1024
   return (['block', 'inline'] as const).map(level => ({
@@ -56,27 +79,8 @@ export function mathExtensions(): TokenizerAndRendererExtension[] {
     },
     renderer(token) {
       const fallback = () => `<code class="math-source">${escape(token.raw)}</code>`
-      if (++count > MAX_MESSAGE_MATH || token.math.length > MAX_MATH_LENGTH) return fallback()
-      const key = JSON.stringify([token.display, token.math])
-      const prior = cache.get(key)
-      if (prior) { cache.delete(key); cache.set(key, prior); return prior }
-      try {
-        const rendered = katex.renderToString(token.math, {
-          output: 'mathml', displayMode: token.display, trust: false, throwOnError: true,
-          strict: 'ignore', maxExpand: 100, maxSize: 10, macros: {},
-        })
-        // Completed formulas in a streaming reply need not be parsed on every delta.
-        const size = 2 * (key.length + rendered.length)
-        if (size <= CACHE_BYTES) {
-          cache.set(key, rendered); cacheBytes += size
-          while (cacheBytes > CACHE_BYTES || cache.size > 128) {
-            const oldest = cache.keys().next().value!
-            cacheBytes -= 2 * (oldest.length + cache.get(oldest)!.length)
-            cache.delete(oldest)
-          }
-        }
-        return rendered
-      } catch { return fallback() }
+      if (budget.remaining-- <= 0 || token.math.length > MAX_MATH_LENGTH) return fallback()
+      return renderLatex(token.math, token.display) ?? fallback()
     },
   }))
 }

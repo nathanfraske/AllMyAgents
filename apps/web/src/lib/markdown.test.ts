@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseLocalFileHref, renderMarkdown } from './markdown'
+import { completedCodeFence, parseLocalFileHref, renderMarkdown } from './markdown'
 
 // renderMarkdown is the sole HTML-producing surface for chat message text. These tests pin the
 // two things that matter: (1) the sanitizer neutralizes hostile model output, and (2) ordinary
@@ -12,6 +12,24 @@ function html(src: string): string {
     .map((s) => s.html)
     .join('\n')
 }
+
+it('renders explicit math/latex fences and preserves unfinished/invalid source', () => {
+  expect(html('```math\nE=mc^2\n```')).toContain('<math')
+  expect(html('```latex\n\\frac{a}{b}\n```')).toContain('<mfrac>')
+  expect(renderMarkdown('```latex\n\\noSuchMacro{a}\n```')[0]?.type).toBe('code')
+  expect(renderMarkdown('```latex\nE=mc^2')[0]?.type).toBe('code')
+  const mixed = ('$x$ '.repeat(128)) + '\n\n```math\ny\n```'
+  expect((html(mixed).match(/<math[\s>]/g) ?? []).length).toBe(128)
+  expect(renderMarkdown(mixed).at(-1)?.type).toBe('code')
+})
+
+it('marks Mermaid fences complete only at their matching closing fence', () => {
+  expect(completedCodeFence('```mermaid\ngraph TD\n```')).toBe(true)
+  expect(completedCodeFence('~~~~mermaid\ngraph TD\n~~~~~\n')).toBe(true)
+  expect(completedCodeFence('````mermaid\ngraph TD\n```')).toBe(false)
+  expect(completedCodeFence('```mermaid\ngraph TD')).toBe(false)
+  expect(renderMarkdown('```mermaid\ngraph TD\n A-->B\n```')[0]).toMatchObject({ type: 'code', lang: 'mermaid', complete: true })
+})
 
 describe('renderMarkdown — XSS sanitization', () => {
   it('drops <script> entirely', () => {
