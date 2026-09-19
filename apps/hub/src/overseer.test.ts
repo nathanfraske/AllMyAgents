@@ -967,6 +967,37 @@ describe('application Overseer authority', () => {
     expect(h.bus.pending('overseer')[0]?.subject).toBe('fleet failure')
   })
 
+  it.each(['claude', 'codex'] as const)('suppresses same-account %s quota alerts but not other failures or reset accounts', provider => {
+    const h = harness()
+    const profileId = provider === 'claude' ? 'p1' : 'p2'
+    h.seed({ id: 'overseer', isOverseer: true, provider, profileId, status: 'active' })
+    h.markOperator('overseer')
+    h.seed({ id: 'failed', provider, profileId, status: 'active' })
+    const usage = (h.sessions as unknown as { usage: UsageMonitor }).usage
+    if (provider === 'claude') usage.noteClaude(profileId, { status: 'rejected', resetsAt: Date.now() / 1000 + 60 })
+    else usage.noteCodex(profileId, { rateLimitReachedType: 'requests', resetsAt: Date.now() / 1000 + 60 })
+    h.sessions.failTurn('failed', 'Usage limit reached')
+    expect(h.bus.pending('overseer')).toHaveLength(0)
+    expect(h.executor.runTurn).not.toHaveBeenCalled()
+    h.seed({ id: 'policy', provider, profileId, status: 'active' })
+    h.sessions.failTurn('policy', 'cyberPolicy: flagged for cybersecurity risk')
+    expect(h.bus.pending('overseer')).toHaveLength(1)
+    h.seed({ id: 'reset', provider, profileId, status: 'active' })
+    if (provider === 'claude') usage.noteClaude(profileId, { status: 'rejected', resetsAt: Date.now() / 1000 - 1 })
+    else usage.noteCodex(profileId, { rateLimitReachedType: 'requests', resetsAt: Date.now() / 1000 - 1 })
+    h.sessions.failTurn('reset', 'Usage limit reached')
+    expect(h.bus.pending('overseer')).toHaveLength(2)
+  })
+
+  it('keeps quota alerts to an Overseer on a different account', () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, provider: 'codex', profileId: 'p2', status: 'active' })
+    h.markOperator('overseer')
+    h.seed({ id: 'failed', provider: 'claude', profileId: 'p1', status: 'active' })
+    h.sessions.failTurn('failed', 'Usage limit reached')
+    expect(h.bus.pending('overseer')).toHaveLength(1)
+  })
+
   it('classifies an unconfirmed worker handoff as one informational interruption instead of a fleet failure', () => {
     const h = harness()
     h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full', status: 'idle' })

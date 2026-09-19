@@ -14,6 +14,7 @@ import {
 } from './journalBlobStore.js'
 import { sanitizeJournalPayload } from './journalPayload.js'
 import { redactedJson } from './redact.js'
+import { readTaskBoardEvents } from './journalTasks.js'
 import type { ApprovalStatus, HubEvent } from './types.js'
 
 export interface ResolvedQuestion {
@@ -3735,6 +3736,11 @@ export class Journal extends EventEmitter {
       events,
       nextAfterSeq: hasMore ? (events.at(-1)?.seq ?? null) : null,
     }
+  }
+
+  taskBoardEventsForSession(sessionId: string) {
+    return readTaskBoardEvents(this.db, sessionId,
+      (payload, seq) => parsePayload(payload, seq, this.payloadBlobs))
   }
 
   /**
