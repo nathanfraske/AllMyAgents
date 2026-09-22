@@ -2214,7 +2214,7 @@ describe('project manager worktree risk delivery', () => {
     seed({ id: 'child-b', parentSessionId: 'manager', projectId: 'project' })
     await sessions.reportWorktreeRiskToManagers({ ...event, files: [event.file, 'another.ts'], fileCount: 612 })
     expect(steer).toHaveBeenCalledOnce()
-    expect(steer.mock.calls[0]![1]).toContain('612 concurrent-write file risks. Sample:')
+    expect(steer).toHaveBeenCalledWith('manager', expect.stringContaining('612 concurrent-write file risks. Sample:'))
     await sessions.reportWorktreeRiskToManagers({ ...event, files: [event.file], fileCount: 0 })
     await sessions.reportWorktreeRiskToManagers({ ...event, files: Array(9).fill(event.file), fileCount: 20 })
     expect(steer).toHaveBeenCalledOnce()
