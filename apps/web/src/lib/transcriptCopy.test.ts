@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { transcriptClipboardPayload } from './transcriptCopy'
+import { renderMarkdown } from './markdown'
 
 function selectContents(root: HTMLElement): Selection {
   const range = document.createRange()
@@ -30,6 +31,10 @@ function selectTextBetween(first: Node, last: Node): Selection {
 }
 
 describe('transcript clipboard serialization', () => {
+  it('copies rendered equations as TeX once, not visual glyphs plus duplicate annotation', () => {
+    const { host, selection } = fixture(renderMarkdown(String.raw`Voltage \(V=IR\).`).map(part => part.html).join(''))
+    expect(transcriptClipboardPayload(host, selection)?.plain).toBe(String.raw`Voltage \(V=IR\).`)
+  })
   it('copies rendered prose as clean text in both clipboard flavours', () => {
     const { host, selection } = fixture(
       '<div class="seg"><p style="color:red">Hello <strong class="loud">clean</strong> world.</p></div>',

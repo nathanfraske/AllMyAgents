@@ -2037,6 +2037,42 @@ describe('project manager visibility into its own workers', () => {
     )
   })
 
+  it('reads assignments beyond 10,000 unrelated events and immediately updates them without losing older tasks', () => {
+    const { sessions, journal, seed } = buildHub()
+    seed({ id: 'manager', isProjectManager: true, projectId: 'project' })
+    seed({ id: 'child', parentSessionId: 'manager', projectId: 'project' })
+    const old = sessions.managerAssignChildTask('manager', 'child', { title: 'Old assignment' })
+    journal.db.transaction(() => {
+      for (let i = 0; i < 10_050; i++) journal.append('child', 'codex/item/agentMessage/delta', { delta: 'unrelated' })
+    })()
+    const recent = sessions.managerAssignChildTask('manager', 'child', { title: 'Recent assignment' })
+    for (const task of [old, recent]) {
+      expect(sessions.managerAssignChildTask('manager', 'child', { taskId: task.taskId, title: task === old ? 'Old complete' : 'Recent complete', status: 'completed' }).ok).toBe(true)
+    }
+    journal.append('child', 'codex/turn/plan/updated', { plan: [{ step: 'Vendor plan', status: 'in_progress' }] })
+    const board = sessions.busPeek('manager', 'child', { view: 'tasks' })
+    expect(board.summary).toContain('Old complete')
+    expect(board.summary).toContain('Recent complete')
+    expect(board.summary).toContain('Vendor plan')
+    expect(journal.taskBoardEventsForSession('child')).toHaveLength(5)
+    journal.append('child', 'manager/task-assigned', { id: 'manager:foreign', title: 'Foreign', managerSessionId: 'other', status: 'pending' })
+    expect(sessions.managerAssignChildTask('manager', 'child', { taskId: 'manager:foreign', title: 'Hijack' }))
+      .toEqual({ ok: false, error: 'task is not an assignment owned by this manager' })
+  })
+
+  it('does not alert a same-account manager for a quota failure, but preserves its operator-facing error', () => {
+    const { sessions, journal, usage, bus, seed, runTurn, steer } = buildHub()
+    seed({ id: 'manager', isProjectManager: true, status: 'idle', projectId: 'project' })
+    seed({ id: 'child', parentSessionId: 'manager', status: 'active', projectId: 'project' })
+    usage.noteClaude('p1', { status: 'rejected', resetsAt: Date.now() / 1000 + 3_600 })
+    sessions.failTurn('child', "You've hit your usage limit")
+    expect(bus.inbox('manager')).toHaveLength(0)
+    expect(runTurn).not.toHaveBeenCalled()
+    expect(steer).not.toHaveBeenCalled()
+    expect(journal.recentEventsForSession('child').map(e => e.kind)).toContain('session/error')
+    expect(journal.recentEventsForSession('child').map(e => e.kind)).toContain('session/usage-failure-alert-suppressed')
+  })
+
   it('rejects a task update owned by another manager without journaling', () => {
     const { sessions, journal, seed } = buildHub()
     seed({ id: 'manager', isProjectManager: true, projectId: 'project', title: 'Curie' })
@@ -2169,6 +2205,19 @@ describe('project manager worktree risk delivery', () => {
     const messages = sessions.busInbox('manager')
     expect(messages).toHaveLength(1)
     expect(messages[0]?.subject).toBe('worktree concurrent-write')
+  })
+
+  it('delivers bounded collision samples with an honest total and rejects malformed batches', async () => {
+    const { sessions, seed, steer } = buildHub()
+    seed({ id: 'manager', isProjectManager: true, projectId: 'project', status: 'active' })
+    seed({ id: 'child-a', parentSessionId: 'manager', projectId: 'project' })
+    seed({ id: 'child-b', parentSessionId: 'manager', projectId: 'project' })
+    await sessions.reportWorktreeRiskToManagers({ ...event, files: [event.file, 'another.ts'], fileCount: 612 })
+    expect(steer).toHaveBeenCalledOnce()
+    expect(steer).toHaveBeenCalledWith('manager', expect.stringContaining('612 concurrent-write file risks. Sample:'))
+    await sessions.reportWorktreeRiskToManagers({ ...event, files: [event.file], fileCount: 0 })
+    await sessions.reportWorktreeRiskToManagers({ ...event, files: Array(9).fill(event.file), fileCount: 20 })
+    expect(steer).toHaveBeenCalledOnce()
   })
 })
 

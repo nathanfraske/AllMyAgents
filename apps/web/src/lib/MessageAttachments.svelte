@@ -2,6 +2,8 @@
   import type { AttachmentMeta } from './attachments'
   import { formatBytes } from './attachments'
   import { attachmentUrl } from './attachmentUrl'
+  import ImageViewer from './ImageViewer.svelte'
+  import { conversationImages, registerChatImage, type GalleryImage } from './imageGallery'
 
   // Renders attachments that are PART OF A SENT MESSAGE, in the transcript. The source is always the hub
   // URL (attachmentUrl) — NEVER a composer object URL — so a message attached in a previous session still
@@ -9,8 +11,7 @@
   // from the composer's AttachmentPreview so the two source paths cannot silently converge.
   let { sessionId, attachments }: { sessionId: string; attachments: AttachmentMeta[] } = $props()
 
-  // Which image is expanded (by id). Per-message local state; images open larger inline, click to close.
-  let expanded = $state<string | null>(null)
+  let viewer = $state<{ images: GalleryImage[]; initialId: string } | null>(null)
   let failed = $state<Record<string, boolean>>({})
   let retries = $state<Record<string, number>>({})
   const src = (a: AttachmentMeta): string => {
@@ -22,7 +23,7 @@
 <div class="atts">
   {#each attachments as a (a.id)}
     {#if a.kind === 'image'}
-      <div class="image-card" class:wide={expanded === a.id}>
+      <div class="image-card">
       {#if failed[a.id]}
         <div class="preview-error" role="status">
           Preview unavailable for {a.name}.
@@ -31,11 +32,11 @@
       {:else}
       <button
         class="thumb"
-        class:expanded={expanded === a.id}
-        onclick={() => (expanded = expanded === a.id ? null : a.id)}
-        aria-expanded={expanded === a.id}
-        aria-label={`${expanded === a.id ? 'Shrink' : 'Expand'} ${a.name}`}
-        title={expanded === a.id ? 'Click to shrink' : `${a.name} — click to expand`}
+        use:registerChatImage={{ sessionId, attachment: a, src: src(a) }}
+        onclick={(event) => { viewer = { images: conversationImages(event.currentTarget), initialId: a.id } }}
+        aria-haspopup="dialog"
+        aria-label={`Open ${a.name} in image viewer`}
+        title={`${a.name} — open image viewer`}
       >
         <img src={src(a)} alt={a.name} loading="lazy" decoding="async" onerror={() => { failed[a.id] = true }} />
       </button>
@@ -54,10 +55,11 @@
   {/each}
 </div>
 
+{#if viewer}<ImageViewer images={viewer.images} initialId={viewer.initialId} onclose={() => { viewer = null }} />{/if}
+
 <style>
   .atts { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 0.5rem; margin-top: 0.4rem; }
   .image-card { display: flex; flex-direction: column; gap: 0.3rem; min-width: 0; max-width: 100%; }
-  .image-card.wide { width: 100%; }
   .image-meta { display: flex; gap: 0.7rem; justify-content: space-between; font-size: 0.7rem; color: var(--muted); }
   .image-meta span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px; }
   .image-meta a { color: var(--cyan); }
@@ -65,8 +67,6 @@
   .preview-error button { display: block; margin-top: 0.4rem; }
   .thumb { padding: 0; border: 1px solid var(--border-strong); border-radius: 8px; overflow: hidden; background: var(--surface-2); cursor: zoom-in; line-height: 0; }
   .thumb img { max-width: 220px; max-height: 160px; object-fit: cover; display: block; }
-  .thumb.expanded { cursor: zoom-out; }
-  .thumb.expanded img { max-width: min(100%, 720px); max-height: 80vh; object-fit: contain; }
   .chip { display: inline-flex; align-items: center; gap: 0.5rem; max-width: 280px; padding: 0.4rem 0.6rem;
     border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface-2); color: var(--text); text-decoration: none; }
   .chip:hover { border-color: var(--accent); }

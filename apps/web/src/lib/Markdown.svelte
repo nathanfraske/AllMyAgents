@@ -7,6 +7,7 @@
   import { renderMarkdown } from './markdown'
   import { revealLocalFile } from './localFile'
   import CodeBlock from './CodeBlock.svelte'
+  import MermaidBlock from './MermaidBlock.svelte'
   import { installTranscriptCopy } from './transcriptCopy'
 
   let { text }: { text: string } = $props()
@@ -49,7 +50,13 @@
 <div class="prose" data-transcript-copy bind:this={proseRoot}>
   {#each segments as seg (seg.key)}
     {#if seg.type === 'code'}
-      <div class="seg"><CodeBlock code={seg.code} lang={seg.lang} html={seg.html} /></div>
+      <div class="seg">
+        {#if seg.lang === 'mermaid'}
+          <MermaidBlock code={seg.code} html={seg.html} complete={seg.complete} />
+        {:else}
+          <CodeBlock code={seg.code} lang={seg.lang} html={seg.html} />
+        {/if}
+      </div>
     {:else}
       <!-- seg.html is DOMPurify-sanitized in markdown.ts before it ever reaches here -->
       <div class="seg">{@html seg.html}</div>
@@ -74,6 +81,9 @@
   .seg > :global(:last-child) { margin-bottom: 0; }
 
   .seg :global(p) { margin: 0.5rem 0; }
+  .seg :global(math) { font-family: math; font-size: 1.12em; overflow-wrap: normal; word-break: normal; }
+  .seg :global(math[display='block']) { display: block; max-width: 100%; overflow-x: auto; padding: 0.5rem 0; margin: 0.65rem 0; }
+  .seg :global(.math-source) { white-space: pre-wrap; }
 
   .seg :global(h1),
   .seg :global(h2),

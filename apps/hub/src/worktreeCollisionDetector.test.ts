@@ -81,6 +81,85 @@ function fixture(): {
 }
 
 describe('WorktreeCollisionDetector', () => {
+  it('excludes 612 inherited paths across four lanes without advancing protected main', async () => {
+    const { root, repo, knuth, hopper } = fixture()
+    const agents = [knuth, hopper]
+    for (const id of ['cori', 'simon']) {
+      const worktree = path.join(root, 'worktrees', id)
+      git(repo, 'worktree', 'add', '-b', `agent/${id}`, worktree)
+      agents.push({ ...knuth, id, title: id, worktree, cwd: worktree, branch: `agent/${id}` })
+    }
+    const protectedHead = git(repo, 'rev-parse', 'HEAD')
+    for (let i = 0; i < 612; i++) fs.writeFileSync(path.join(knuth.worktree!, `inherited-${i}.ts`), '// accepted\n')
+    git(knuth.worktree!, 'add', '.')
+    git(knuth.worktree!, 'commit', '-m', 'shared accepted baseline not yet on protected main')
+    const accepted = git(knuth.worktree!, 'rev-parse', 'HEAD')
+    for (const agent of agents.slice(1)) git(agent.worktree!, 'merge', '--ff-only', accepted)
+    git(knuth.worktree!, 'switch', '-c', 'agent/new-task')
+    for (const agent of agents) fs.writeFileSync(path.join(agent.worktree!, `${agent.id}-only.ts`), '// lane\n')
+    git(knuth.worktree!, 'add', 'knuth-only.ts')
+    git(knuth.worktree!, 'commit', '-m', 'one task-owned commit')
+    const steer = vi.fn(async () => true)
+    const report = vi.fn(async () => {})
+    const detector = new WorktreeCollisionDetector({ sessions: () => agents, steer, report })
+    await detector.poll()
+    await detector.poll()
+    expect(steer).not.toHaveBeenCalled()
+    expect(report).not.toHaveBeenCalled()
+    expect(detector.projectActivity('project-1').risks).toEqual([])
+    expect(detector.projectActivity('project-1').agents.find((a) => a.sessionId === 'knuth')?.branch).toBe('agent/new-task')
+    expect(git(repo, 'rev-parse', 'HEAD')).toBe(protectedHead)
+
+    // One dirty edit to a shared historical path is still just one writer.
+    fs.writeFileSync(path.join(hopper.worktree!, 'inherited-0.ts'), '// hopper\n')
+    await detector.poll()
+    expect(steer).not.toHaveBeenCalled()
+    fs.writeFileSync(path.join(knuth.worktree!, 'inherited-0.ts'), '// knuth\n')
+    await detector.poll()
+    expect(steer).toHaveBeenCalledOnce()
+    expect(report).toHaveBeenCalledOnce()
+    expect(detector.projectActivity('project-1').risks).toMatchObject([{ file: 'inherited-0.ts' }])
+  }, 90_000)
+
+  it('coalesces real path fan-out and re-notifies only after observed resolution', async () => {
+    const { knuth, hopper } = fixture()
+    for (let i = 0; i < 60; i++) {
+      for (const agent of [knuth, hopper]) fs.writeFileSync(path.join(agent.worktree!, `overlap-${i}.ts`), `// ${agent.id}\n`)
+    }
+    const steer = vi.fn(async (_id: string, _text: string) => true)
+    const report = vi.fn(async (_event: unknown) => {})
+    const detector = new WorktreeCollisionDetector({ sessions: () => [knuth, hopper], steer, report })
+    await detector.poll()
+    await detector.poll()
+    expect(steer).toHaveBeenCalledOnce()
+    expect(report).toHaveBeenCalledOnce()
+    expect(report.mock.calls[0]![0]).toMatchObject({ fileCount: 60, files: expect.any(Array) })
+    expect((report.mock.calls[0]![0] as { files: string[] }).files).toHaveLength(8)
+    expect(steer.mock.calls[0]![1].length).toBeLessThan(1_000)
+    expect(detector.projectActivity('project-1').risks).toHaveLength(60)
+    for (let i = 0; i < 60; i++) fs.unlinkSync(path.join(hopper.worktree!, `overlap-${i}.ts`))
+    await detector.poll()
+    expect(detector.projectActivity('project-1').risks).toEqual([])
+    fs.writeFileSync(path.join(hopper.worktree!, 'overlap-0.ts'), '// resumed\n')
+    await detector.poll()
+    expect(steer).toHaveBeenCalledTimes(2)
+    expect(report).toHaveBeenCalledTimes(2)
+  }, 30_000)
+
+  it('retains independent same-path committed edits even when their final blobs match', async () => {
+    const { knuth, hopper } = fixture()
+    for (const agent of [knuth, hopper]) {
+      fs.writeFileSync(path.join(agent.worktree!, 'shared.ts'), '// equal content, independent work\n')
+      git(agent.worktree!, 'add', 'shared.ts')
+      git(agent.worktree!, 'commit', '-m', `independent ${agent.id} change`)
+    }
+    const steer = vi.fn(async () => true)
+    const detector = new WorktreeCollisionDetector({ sessions: () => [knuth, hopper], steer })
+    await detector.poll()
+    expect(steer).toHaveBeenCalledOnce()
+    expect(detector.projectActivity('project-1').risks).toMatchObject([{ file: 'shared.ts' }])
+  }, 20_000)
+
   it('does not spawn or log a failing Git inspection every poll for a vanished worktree', async () => {
     const { knuth } = fixture()
     fs.rmSync(knuth.worktree!, { recursive: true, force: true })

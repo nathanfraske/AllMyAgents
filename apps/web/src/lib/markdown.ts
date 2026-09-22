@@ -14,17 +14,19 @@ import { Marked } from 'marked'
 import type { Token, Tokens } from 'marked'
 import DOMPurify from 'dompurify'
 import hljs from 'highlight.js/lib/common'
+import { mathExtensions, renderLatex } from './markdownMath'
 
 // A rendered chunk of a message: a run of sanitized prose HTML, or one fenced code block
 // (raw `code` kept for the copy button; `html` is the highlighted, sanitized display form).
 export type Segment =
   | { type: 'html'; key: string; html: string }
-  | { type: 'code'; key: string; lang: string; code: string; html: string }
+  | { type: 'code'; key: string; lang: string; code: string; html: string; complete?: boolean }
 
 // Isolated marked instance so we never mutate marked's global singleton. GFM on (tables,
 // strikethrough, task lists, autolinks); breaks:true turns single newlines into <br>, which
 // matches how chat models format replies (closer to how ChatGPT/Claude render).
-const marked = new Marked({ gfm: true, breaks: true })
+const markdownOptions = { gfm: true, breaks: true }
+const proseMarked = new Marked(markdownOptions)
 
 // Install the link-hardening hook exactly once. The module-scope guard keeps Vite HMR from
 // stacking duplicate hooks across reloads.
@@ -161,6 +163,9 @@ function sanitizeProse(html: string): string {
     // zero-click exfil beacon / prompt-injection channel (auto-fetched on render).
     FORBID_TAGS: ['style', 'form', 'iframe', 'object', 'embed', 'link', 'meta', 'base', 'img'],
     FORBID_ATTR: ['style'],
+    // Inert TeX source carried by generated MathML for copying/accessibility.
+    ADD_TAGS: ['semantics', 'annotation'],
+    ADD_ATTR: ['encoding'],
   })
 }
 
@@ -190,6 +195,13 @@ function langOf(info: string | undefined): string {
   return (info ?? '').trim().split(/\s+/)[0]?.toLowerCase() ?? ''
 }
 
+export function completedCodeFence(raw: string): boolean {
+  const opening = /^ {0,3}(`{3,}|~{3,})[^\n]*\n/.exec(raw)
+  if (!opening) return false
+  const fence = opening[1]!
+  return new RegExp(`(?:^|\\n) {0,3}${fence[0]}{${fence.length},}[ \\t]*(?:\\n)?$`).test(raw.slice(opening[0].length))
+}
+
 // Split message Markdown into renderable segments. Top-level fenced/indented code blocks
 // become `code` segments; everything else is grouped and rendered as sanitized prose.
 //
@@ -201,6 +213,10 @@ export function renderMarkdown(src: string | undefined): Segment[] {
   const text = src ?? ''
   if (!text.trim()) return []
 
+  const mathBudget = { remaining: 128 }
+  const marked = /\\[([]|\$/.test(text)
+    ? new Marked(markdownOptions, { extensions: mathExtensions(mathBudget) })
+    : proseMarked
   const tokens = marked.lexer(text)
   const segments: Segment[] = []
   let buffer: Token[] = []
@@ -219,6 +235,17 @@ export function renderMarkdown(src: string | undefined): Segment[] {
       const t = token as Tokens.Code
       const code = t.text ?? ''
       const lang = langOf(t.lang)
+      if ((lang === 'math' || lang === 'latex') && completedCodeFence(t.raw) && mathBudget.remaining-- > 0) {
+        const rendered = renderLatex(code, true)
+        if (rendered) {
+          segments.push({ type: 'html', key: `s${n++}`, html: sanitizeProse(rendered) })
+          continue
+        }
+      }
+      if (lang === 'mermaid') {
+        segments.push({ type: 'code', key: `s${n++}`, lang, code, html: escapeHtml(code), complete: completedCodeFence(t.raw) })
+        continue
+      }
       segments.push({ type: 'code', key: `s${n++}`, lang, code, html: highlight(code, lang) })
     } else {
       buffer.push(token)

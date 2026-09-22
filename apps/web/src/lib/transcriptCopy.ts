@@ -124,6 +124,13 @@ function serializeFragment(fragment: DocumentFragment): CopyPiece[] {
       prose += element.getAttribute('alt') ?? ''
       return
     }
+    if (tag.toLowerCase() === 'math') {
+      const tex = element.querySelector('annotation[encoding="application/x-tex"]')?.textContent
+      if (tex != null) {
+        prose += element.getAttribute('display') === 'block' ? `\n\n\\[${tex}\\]\n\n` : `\\(${tex}\\)`
+        return
+      }
+    }
 
     const isBlock = BLOCK_TAGS.has(tag)
     if (isBlock) prose += '\n\n'

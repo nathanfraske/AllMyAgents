@@ -8,6 +8,8 @@ import type { SessionRecord } from './types.js'
 export const WORKTREE_COLLISION_POLL_MS = 2_000
 const WORKTREE_SHELVED_ACTIVITY_POLL_MS = 5 * 60_000
 const WORKTREE_SHELVED_REFRESHES_PER_POLL = 2
+const MAX_NOTIFICATION_BATCHES_PER_POLL = 16
+const MAX_NOTIFICATION_FILES = 8
 
 export type WorktreeChangeKind = 'uncommitted' | 'committed' | 'both'
 type ChangeKind = WorktreeChangeKind
@@ -36,6 +38,9 @@ export interface WorktreeRiskEvent {
   repo: string
   projectId: string | null
   file: string
+  /** Optional bounded sample; fileCount includes every new risk in this pair/writer batch. */
+  files?: string[]
+  fileCount?: number
   detectedAt: string
   key: string
   sessions: WorktreeRiskSession[]
@@ -180,6 +185,7 @@ async function git(
   const { stdout } = await execFileAsync(program, commandArgs, {
     encoding: 'utf8',
     windowsHide: true,
+    timeout: 15_000,
   })
   return stdout
 }
@@ -229,7 +235,8 @@ async function uncommittedPaths(record: SessionRecord): Promise<Map<string, Chan
  */
 async function committedPaths(
   record: SessionRecord,
-  baseHead: string
+  baseHead: string,
+  head = 'HEAD',
 ): Promise<Map<string, ChangedPath>> {
   const changed = new Map<string, ChangedPath>()
   if (!record.worktree) return changed
@@ -238,18 +245,18 @@ async function committedPaths(
     '--name-only',
     '-z',
     '--no-renames',
-    `${baseHead}...HEAD`,
+    `${baseHead}...${head}`,
   ], record)
   for (const file of output.split('\0')) addChanged(changed, file, 'committed')
   return changed
 }
 
-async function changesFor(record: SessionRecord, baseHead: string): Promise<Map<string, ChangedPath>> {
+async function changesFor(record: SessionRecord, baseHead: string, head: string): Promise<Map<string, ChangedPath>> {
   const changed = new Map<string, ChangedPath>()
   if (!record.worktree) return changed
   const [uncommitted, committed] = await Promise.all([
     uncommittedPaths(record),
-    committedPaths(record, baseHead),
+    committedPaths(record, baseHead, head),
   ])
   for (const value of uncommitted.values()) addChanged(changed, value.display, 'uncommitted')
   for (const value of committed.values()) addChanged(changed, value.display, 'committed')
@@ -336,6 +343,7 @@ async function advanceCommitsForFile(
 
 interface SessionInspection {
   record: SessionRecord
+  head: string
   baseCommit: string
   mainCommit: string
   commitsBehind: number
@@ -368,10 +376,16 @@ async function agentCommits(record: SessionRecord, mainCommit: string): Promise<
 }
 
 async function inspectSession(record: SessionRecord): Promise<SessionInspection> {
+  const [head, branch] = await Promise.all([
+    resolvesToCommit(record.worktree!, 'HEAD', record),
+    git(record.worktree!, ['rev-parse', '--abbrev-ref', 'HEAD'], record),
+  ])
+  // A worker may legitimately switch task branches without recreating its session record.
+  record = { ...record, branch: branch.trim() }
   const mainCommit = await mainCommitFor(record)
   const baseCommit = await baseCommitFor(record, mainCommit)
   const [changes, commits] = await Promise.all([
-    changesFor(record, mainCommit),
+    changesFor(record, mainCommit, head),
     agentCommits(record, mainCommit),
   ])
   const diverged =
@@ -417,7 +431,10 @@ async function inspectSession(record: SessionRecord): Promise<SessionInspection>
       })
     }
   }
-  return { record, baseCommit, mainCommit, commitsBehind, diverged, changes, commits, staleFiles }
+  if (await resolvesToCommit(record.worktree!, 'HEAD', record) !== head) {
+    throw new Error('worktree HEAD changed during inspection; retry on next poll')
+  }
+  return { record, head, baseCommit, mainCommit, commitsBehind, diverged, changes, commits, staleFiles }
 }
 
 /**
@@ -499,6 +516,25 @@ export class WorktreeCollisionDetector {
   private readonly shelvedInspections = new Map<string, { inspectedAt: number; value: SessionInspection }>()
   /** Missing checkout paths are cheap-stat'd each poll, but logged only on the present→missing edge. */
   private readonly missingWorktrees = new Map<string, string>()
+  private readonly pairPaths = new Map<string, [Set<string>, Set<string>]>()
+
+  private async uniquePairPaths(a: SessionInspection, b: SessionInspection): Promise<[Set<string>, Set<string>]> {
+    if (a.head === b.head) return [new Set(), new Set()]
+    const key = `${worktreeRepoKey(a.record)}\0${a.head}\0${b.head}`
+    const cached = this.pairPaths.get(key)
+    if (cached) return cached
+    // Use the actual pair's shared ancestry, NOT protected main or the session's original base.
+    // Shared accepted commits are not two writers, even when main deliberately remains behind.
+    // Independent committed edits (including equal final blobs) still count on each unique branch.
+    const paths = await Promise.all([
+      committedPaths(a.record, b.head, a.head),
+      committedPaths(b.record, a.head, b.head),
+    ])
+    const result: [Set<string>, Set<string>] = [new Set(paths[0].keys()), new Set(paths[1].keys())]
+    if (this.pairPaths.size >= 64) this.pairPaths.delete(this.pairPaths.keys().next().value!)
+    this.pairPaths.set(key, result)
+    return result
+  }
 
   constructor(private readonly options: WorktreeCollisionDetectorOptions) {}
 
@@ -536,6 +572,22 @@ export class WorktreeCollisionDetector {
     this.polling = true
     try {
       const observedAt = new Date().toISOString()
+      let completeObservation = true
+      const currentRisks = new Set<string>()
+      const currentWriters = new Set<string>()
+      const pending = new Map<string, { event: WorktreeRiskEvent; keys: string[]; files: string[]; target: string; message: string }>()
+      const queue = (event: WorktreeRiskEvent, target: string, message: string): void => {
+        currentRisks.add(event.key)
+        if (this.notified.has(event.key)) return
+        const batchKey = `${event.risk}\0${event.sessions.map((s) => s.sessionId).sort().join('\0')}\0${target}`
+        const batch = pending.get(batchKey)
+        if (batch) {
+          batch.keys.push(event.key)
+          if (batch.files.length < MAX_NOTIFICATION_FILES) batch.files.push(event.file)
+        } else {
+          pending.set(batchKey, { event, target, message, keys: [event.key], files: [event.file] })
+        }
+      }
       const nextActivity = new Map<string, WorktreeProjectActivity>()
       const activityFor = (projectId: string): WorktreeProjectActivity => {
         let activity = nextActivity.get(projectId)
@@ -606,6 +658,7 @@ export class WorktreeCollisionDetector {
                 if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
               }
               if (!worktreePresent) {
+                if (live) completeObservation = false
                 if (this.missingWorktrees.get(record.id) !== record.worktree) {
                   this.missingWorktrees.set(record.id, record.worktree!)
                   console.warn(
@@ -630,6 +683,7 @@ export class WorktreeCollisionDetector {
               }
               return value
             } catch (error) {
+              if (live) completeObservation = false
               // A disappearing/broken worktree must not stop the hub or suppress checks for healthy peers.
               const missing = (error as NodeJS.ErrnoException).code === 'ENOENT'
               if (!missing || this.missingWorktrees.get(record.id) !== record.worktree) {
@@ -681,13 +735,7 @@ export class WorktreeCollisionDetector {
               commitsBehind: item.commitsBehind,
               mainAdvance: staleFile.commits,
             })
-            if (this.notified.has(riskKey)) continue
-            this.notified.add(riskKey)
-            const accepted = await this.options.steer(
-              item.record.id,
-              staleMessage(staleFile, item.baseCommit, item.mainCommit, item.commitsBehind)
-            )
-            await this.report({
+            queue({
               version: 1,
               risk: 'stale-base',
               repo: item.record.repo!,
@@ -700,8 +748,8 @@ export class WorktreeCollisionDetector {
               mainCommit: item.mainCommit,
               commitsBehind: item.commitsBehind,
               mainAdvance: staleFile.commits,
-              steeredSessionIds: accepted === false ? [] : [item.record.id],
-            })
+              steeredSessionIds: [],
+            }, item.record.id, staleMessage(staleFile, item.baseCommit, item.mainCommit, item.commitsBehind))
           }
         }
 
@@ -712,6 +760,7 @@ export class WorktreeCollisionDetector {
           const changes = item.changes
           for (const [fileKey, changedPath] of changes) {
             const seenKey = `${record.id}\0${fileKey}`
+            currentWriters.add(seenKey)
             let seen = this.firstSeen.get(seenKey)
             if (seen === undefined) {
               seen = this.nextSeen++
@@ -729,6 +778,18 @@ export class WorktreeCollisionDetector {
             for (let right = left + 1; right < writers.length; right++) {
               const a = writers[left]!
               const b = writers[right]!
+              const aInspection = activeHealthy.find((item) => item.record.id === a.record.id)!
+              const bInspection = activeHealthy.find((item) => item.record.id === b.record.id)!
+              if (a.path.kind === 'committed' || b.path.kind === 'committed') {
+                try {
+                  const [aUnique, bUnique] = await this.uniquePairPaths(aInspection, bInspection)
+                  if ((a.path.kind === 'committed' && !aUnique.has(fileKey)) ||
+                      (b.path.kind === 'committed' && !bUnique.has(fileKey))) continue
+                } catch (error) {
+                  completeObservation = false
+                  throw error // no shared-history guess or false resolution when Git cannot prove ancestry
+                }
+              }
               const ids = [a.record.id, b.record.id].sort()
               const collisionKey = `concurrent-write\0${ids[0]}\0${ids[1]}\0${fileKey}`
               const later = a.firstSeen > b.firstSeen ? a : b
@@ -741,16 +802,12 @@ export class WorktreeCollisionDetector {
                 commitsBehind: laterInspection.commitsBehind,
                 mainAdvance: [],
               })
-              if (this.notified.has(collisionKey)) continue
-              this.notified.add(collisionKey)
-
               const name = agentName(other.record)
               const file = later.path.display
               const message =
                 `Heads up: ${name} is also editing ${file} right now. ` +
                 detail(name, other.path.display, other.path.kind)
-              const accepted = await this.options.steer(later.record.id, message)
-              await this.report({
+              queue({
                 version: 1,
                 risk: 'concurrent-write',
                 repo: later.record.repo!,
@@ -766,8 +823,8 @@ export class WorktreeCollisionDetector {
                 mainCommit: laterInspection.mainCommit,
                 commitsBehind: laterInspection.commitsBehind,
                 mainAdvance: [],
-                steeredSessionIds: accepted === false ? [] : [later.record.id],
-              })
+                steeredSessionIds: [],
+              }, later.record.id, message)
             }
           }
         }
@@ -777,6 +834,33 @@ export class WorktreeCollisionDetector {
         activity.risks.sort(compareRiskSeverity)
       }
       this.activityByProject = nextActivity
+      // Resolve only from a complete observation. A transient failed inspection is not a resolution.
+      // A genuine resolve/reappearance must notify again, not disappear forever in a lifetime Set.
+      if (completeObservation) {
+        for (const key of this.notified) if (!currentRisks.has(key)) this.notified.delete(key)
+        for (const key of this.firstSeen.keys()) if (!currentWriters.has(key)) this.firstSeen.delete(key)
+      }
+      for (const batch of [...pending.values()].slice(0, MAX_NOTIFICATION_BATCHES_PER_POLL)) {
+        for (const key of batch.keys) this.notified.add(key)
+        const grouped = batch.keys.length > 1
+        const message = grouped
+          ? `Heads up: ${batch.keys.length} ${batch.event.risk} file risks for ${batch.event.sessions.map((s) => s.label).join(', ')}. ` +
+            `Sample: ${batch.files.join(', ')}. Full current risk list is in project activity. Coordinate before integrating.`
+          : batch.message
+        let accepted = false
+        try {
+          accepted = await this.options.steer(batch.target, message) !== false
+        } catch (error) {
+          console.warn('[worktree-collision] worker steer failed; retaining manager report', error)
+        }
+        await this.report({
+          ...batch.event,
+          ...(grouped ? { files: batch.files, fileCount: batch.keys.length } : {}),
+          steeredSessionIds: accepted ? [batch.target] : [],
+        })
+      }
+    } catch (error) {
+      console.warn('[worktree-collision] poll incomplete; retaining previous risk state', error)
     } finally {
       this.polling = false
     }

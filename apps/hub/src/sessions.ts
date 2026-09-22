@@ -16,6 +16,7 @@ import { renderRestartContinuity } from './restartContinuity.js'
 import type { ProjectStore } from './projects.js'
 import type { SessionStore } from './store.js'
 import type { UsageMonitor } from './usage.js'
+import { isUsageLimitFailure, sameProviderAccount, usageFailureStillApplies } from './usageFailureAlerts.js'
 import type { WorkspaceManager } from './workspace.js'
 import type {
   ClaudeLimitInfo,
@@ -5535,15 +5536,7 @@ export class SessionManager {
   }
 
   private taskBoardForSession(sessionId: string): TaskBoard {
-    const events: HubEvent[] = []
-    let afterSeq = 0
-    for (let pageNumber = 0; pageNumber < 20; pageNumber += 1) {
-      const page = this.journal.eventsForSession(sessionId, afterSeq, 500)
-      events.push(...page.events)
-      if (page.nextAfterSeq === null) break
-      afterSeq = page.nextAfterSeq
-    }
-    return buildTaskBoard(taskBoardItemsFromEvents(events))
+    return buildTaskBoard(taskBoardItemsFromEvents(this.journal.taskBoardEventsForSession(sessionId)))
   }
 
   /**
@@ -7190,6 +7183,7 @@ export class SessionManager {
       return
     }
     const childLabel = child.title ?? identityOf(child).label
+    if (outcome === 'errored' && this.suppressSameAccountUsageAlert(child, manager)) return
     const body =
       outcome === 'started'
         ? `${childLabel} started working.`
@@ -7307,6 +7301,7 @@ export class SessionManager {
   private reportOverseerFailure(failed: SessionRecord): void {
     const overseer = [...this.sessions.values()].find((record) => record.isOverseer === true)
     if (!overseer || overseer.id === failed.id || overseer.status === 'stopped') return
+    if (this.suppressSameAccountUsageAlert(failed, overseer)) return
     const label = failed.title ?? identityOf(failed).label
     const body = [
       `Fleet failure alert: ${label} (${failed.id}) entered an error state.`,
@@ -7331,6 +7326,28 @@ export class SessionManager {
     // pending makes the normal idle path start a distinct bus-origin turn, where overseerControl's
     // provenance check permits diagnostics but rejects every mutation.
     this.deliverBus(overseer.id)
+  }
+
+  private suppressSameAccountUsageAlert(failed: SessionRecord, recipient: SessionRecord): boolean {
+    const source = this.profiles.get(failed.profileId)
+    const target = this.profiles.get(recipient.profileId)
+    if (!source || !target || !sameProviderAccount(source, target)) return false
+    const error = this.journal.latestEventForSessionKind(failed.id, 'session/error')
+    const message = (error?.payload as { message?: unknown } | undefined)?.message
+    if (!error || typeof message !== 'string' || !isUsageLimitFailure(message)) return false
+    const snapshot = this.usage.list().filter(item => {
+      const profile = this.profiles.get(item.profileId)
+      return profile && sameProviderAccount(source, profile)
+    }).sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))[0]
+    if (!usageFailureStillApplies(snapshot, error.ts)) return false
+    this.journal.append(failed.id, 'session/usage-failure-alert-suppressed', {
+      recipientSessionId: recipient.id, failedSessionId: failed.id,
+      sourceProfileId: source.id, recipientProfileId: target.id,
+      failureSeq: error.seq, resetsAt: snapshot?.resetsAt,
+      reason: 'same-provider-account-usage-exhausted',
+    })
+    // Operator notification and durable failure remain. No doomed bus turn or later stale replay.
+    return true
   }
 
   private reportApprovalUpstream(approval: ApprovalRecord): void {
@@ -8846,7 +8863,9 @@ export class SessionManager {
         ? ` Main advanced through ${risk.mainAdvance.map((commit) => `${commit.commit.slice(0, 8)} ${commit.subject}`).join('; ')}.`
         : ''
     const text =
-      risk.risk === 'concurrent-write'
+      risk.files
+        ? `${names}: ${risk.fileCount} ${risk.risk} file risks. Sample: ${risk.files.join(', ')}. Full current risk list is in project activity.`
+        : risk.risk === 'concurrent-write'
         ? `${names} are concurrently changing ${risk.file}.`
         : `${names} is changing ${risk.file} from a stale base.${advance}`
     const framed = `High-priority child worktree risk detected by the hub.\n\n${text}`
@@ -11735,6 +11754,8 @@ interface WorktreeRiskEvent {
   repo: string
   projectId: string | null
   file: string
+  files?: string[]
+  fileCount?: number
   detectedAt: string
   key: string
   sessions: Array<{
@@ -11756,6 +11777,12 @@ function parseWorktreeRisk(value: unknown): WorktreeRiskEvent | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
   const row = value as Record<string, unknown>
   if (row.version !== 1 || (row.risk !== 'concurrent-write' && row.risk !== 'stale-base')) return undefined
+  if (row.files !== undefined || row.fileCount !== undefined) {
+    if (!Array.isArray(row.files) || row.files.length < 1 || row.files.length > 8 ||
+        row.files.some((file) => typeof file !== 'string' || !file) ||
+        !Number.isSafeInteger(row.fileCount) || (row.fileCount as number) < row.files.length ||
+        row.files[0] !== row.file) return undefined
+  }
   if (
     typeof row.repo !== 'string' ||
     (row.projectId !== null && typeof row.projectId !== 'string') ||
@@ -11810,6 +11837,7 @@ function parseWorktreeRisk(value: unknown): WorktreeRiskEvent | undefined {
     repo: row.repo,
     projectId: row.projectId,
     file: row.file,
+    ...(row.files ? { files: [...row.files as string[]], fileCount: row.fileCount as number } : {}),
     detectedAt: row.detectedAt,
     key: row.key,
     sessions,
