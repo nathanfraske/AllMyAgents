@@ -2206,6 +2206,19 @@ describe('project manager worktree risk delivery', () => {
     expect(messages).toHaveLength(1)
     expect(messages[0]?.subject).toBe('worktree concurrent-write')
   })
+
+  it('delivers bounded collision samples with an honest total and rejects malformed batches', async () => {
+    const { sessions, seed, steer } = buildHub()
+    seed({ id: 'manager', isProjectManager: true, projectId: 'project', status: 'active' })
+    seed({ id: 'child-a', parentSessionId: 'manager', projectId: 'project' })
+    seed({ id: 'child-b', parentSessionId: 'manager', projectId: 'project' })
+    await sessions.reportWorktreeRiskToManagers({ ...event, files: [event.file, 'another.ts'], fileCount: 612 })
+    expect(steer).toHaveBeenCalledOnce()
+    expect(steer.mock.calls[0]![1]).toContain('612 concurrent-write file risks. Sample:')
+    await sessions.reportWorktreeRiskToManagers({ ...event, files: [event.file], fileCount: 0 })
+    await sessions.reportWorktreeRiskToManagers({ ...event, files: Array(9).fill(event.file), fileCount: 20 })
+    expect(steer).toHaveBeenCalledOnce()
+  })
 })
 
 describe('project manager account reassignment', () => {

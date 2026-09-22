@@ -8863,7 +8863,9 @@ export class SessionManager {
         ? ` Main advanced through ${risk.mainAdvance.map((commit) => `${commit.commit.slice(0, 8)} ${commit.subject}`).join('; ')}.`
         : ''
     const text =
-      risk.risk === 'concurrent-write'
+      risk.files
+        ? `${names}: ${risk.fileCount} ${risk.risk} file risks. Sample: ${risk.files.join(', ')}. Full current risk list is in project activity.`
+        : risk.risk === 'concurrent-write'
         ? `${names} are concurrently changing ${risk.file}.`
         : `${names} is changing ${risk.file} from a stale base.${advance}`
     const framed = `High-priority child worktree risk detected by the hub.\n\n${text}`
@@ -11752,6 +11754,8 @@ interface WorktreeRiskEvent {
   repo: string
   projectId: string | null
   file: string
+  files?: string[]
+  fileCount?: number
   detectedAt: string
   key: string
   sessions: Array<{
@@ -11773,6 +11777,12 @@ function parseWorktreeRisk(value: unknown): WorktreeRiskEvent | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
   const row = value as Record<string, unknown>
   if (row.version !== 1 || (row.risk !== 'concurrent-write' && row.risk !== 'stale-base')) return undefined
+  if (row.files !== undefined || row.fileCount !== undefined) {
+    if (!Array.isArray(row.files) || row.files.length < 1 || row.files.length > 8 ||
+        row.files.some((file) => typeof file !== 'string' || !file) ||
+        !Number.isSafeInteger(row.fileCount) || (row.fileCount as number) < row.files.length ||
+        row.files[0] !== row.file) return undefined
+  }
   if (
     typeof row.repo !== 'string' ||
     (row.projectId !== null && typeof row.projectId !== 'string') ||
@@ -11827,6 +11837,7 @@ function parseWorktreeRisk(value: unknown): WorktreeRiskEvent | undefined {
     repo: row.repo,
     projectId: row.projectId,
     file: row.file,
+    ...(row.files ? { files: [...row.files as string[]], fileCount: row.fileCount as number } : {}),
     detectedAt: row.detectedAt,
     key: row.key,
     sessions,
