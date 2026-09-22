@@ -15,6 +15,7 @@ import {
 import { sanitizeJournalPayload } from './journalPayload.js'
 import { redactedJson } from './redact.js'
 import { readTaskBoardEvents } from './journalTasks.js'
+import { readSessionEventRows } from './journalSessionReads.js'
 import type { ApprovalStatus, HubEvent } from './types.js'
 
 export interface ResolvedQuestion {
@@ -3346,9 +3347,9 @@ export class Journal extends EventEmitter {
    * Reading it back from the journal makes provenance survive exactly as long as the turn does.
    */
   lastTurnOrigin(sessionId: string): 'operator' | 'bus' | undefined {
-    const row = this.db
-      .prepare("SELECT payload FROM events WHERE session = ? AND kind = 'session/turn-origin' ORDER BY seq DESC LIMIT 1")
-      .get(sessionId) as { payload: string } | undefined
+    const row = readSessionEventRows(this.db, sessionId, {
+      kind: 'session/turn-origin', descending: true, limit: 1,
+    })[0]
     if (!row) return undefined
     try {
       const origin = (JSON.parse(row.payload) as { origin?: unknown }).origin
@@ -3647,17 +3648,7 @@ export class Journal extends EventEmitter {
    */
   recentEventsForSession(sessionId: string, limit = 40): HubEvent[] {
     const bounded = Math.max(1, Math.min(100, Math.floor(limit)))
-    const rows = this.db
-      .prepare(
-        'SELECT seq, ts, session, kind, payload FROM events WHERE session = ? ORDER BY seq DESC LIMIT ?'
-      )
-      .all(sessionId, bounded) as Array<{
-        seq: number
-        ts: string
-        session: string | null
-        kind: string
-        payload: string
-      }>
+    const rows = readSessionEventRows(this.db, sessionId, { descending: true, limit: bounded })
     return rows.map((row) => ({
       seq: row.seq,
       ts: row.ts,
@@ -3712,17 +3703,9 @@ export class Journal extends EventEmitter {
     limit = 200
   ): { events: HubEvent[]; nextAfterSeq: number | null } {
     const bounded = Math.max(1, Math.min(500, Math.floor(limit)))
-    const rows = this.db
-      .prepare(
-        'SELECT seq, ts, session, kind, payload FROM events WHERE session = ? AND seq > ? ORDER BY seq ASC LIMIT ?'
-      )
-      .all(sessionId, Math.max(0, Math.floor(afterSeq)), bounded + 1) as Array<{
-        seq: number
-        ts: string
-        session: string | null
-        kind: string
-        payload: string
-      }>
+    const rows = readSessionEventRows(this.db, sessionId, {
+      afterSeq: Math.max(0, Math.floor(afterSeq)), limit: bounded + 1,
+    })
     const hasMore = rows.length > bounded
     const page = hasMore ? rows.slice(0, bounded) : rows
     const events = page.map((row) => ({
