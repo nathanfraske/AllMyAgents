@@ -476,7 +476,7 @@
   })
   const modelDef = $derived(
     view
-      ? (findModel(model, modelProfile?.availableModels)
+      ? (findModel(model, modelProfile?.availableModels, view.record.provider)
         ?? defaultModelFor(view.record.provider, modelProfile?.availableModels))
       : undefined
   )
@@ -1750,7 +1750,7 @@
           onclick={() => attachmentInput?.click()}
         ><Icon name="paperclip" size={15} /></button>
         <div class="ccontrol c-account" title={`Account: ${view.record.profileId}`}><AccountPicker {view} /></div>
-        <div class="ccontrol c-model" title={`Model: ${modelDef?.name ?? model ?? view.record.provider}`}><ModelPicker provider={view.record.provider} {model} availableModels={modelProfile?.availableModels} onselect={setModel} /></div>
+        <div class="ccontrol c-model" title={`Model: ${modelDef?.name ?? model ?? view.record.provider}`}><ModelPicker provider={view.record.provider} {model} availableModels={modelProfile?.availableModels} onselect={setModel} catalogKey={modelProfile?.id} updatedAt={modelProfile?.modelCatalogUpdatedAt} onrefresh={modelProfile ? () => store.refreshModels(modelProfile!.id) : undefined} /></div>
         {#if modelDef}<div class="ccontrol c-traits" title="Model effort and options"><TraitsControl descriptors={modelDef.descriptors} values={options} onchange={setOption} /></div>{/if}
         {#if isDraft}
           <div class="dperm ccontrol" data-overseer-anchor="permissions" title={`Permission mode: ${draftModeDef.label}`}>

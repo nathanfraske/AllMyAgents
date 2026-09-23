@@ -18,6 +18,25 @@ async function loadApi(): Promise<typeof import('./api')> {
 }
 
 describe('HUB base URL derivation (inTauri)', () => {
+  it('refreshes models on the owning remote hub using only its paired token', async () => {
+    const saved = new Map<string, string>()
+    vi.stubGlobal('window', {})
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => saved.get(key) ?? null,
+      setItem: (key: string, value: string) => saved.set(key, value),
+      removeItem: (key: string) => saved.delete(key),
+    })
+    const fetchMock = vi.fn(async () => ({ status: 200, ok: true,
+      text: async () => JSON.stringify({ models: [], updatedAt: '2026-09-23T00:00:00Z' }),
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const { api, configureFleetSites, setFleetSiteToken } = await loadApi()
+    configureFleetSites([{ siteId: 'peer:node', label: 'Peer', local: false, baseUrl: 'http://localhost:45678', online: true }])
+    setFleetSiteToken('peer:node', 'remote-secret')
+    await expect(api.refreshModels('peer:node:codex-a')).resolves.toMatchObject({ models: [] })
+    expect(fetchMock).toHaveBeenCalledWith('http://localhost:45678/api/profiles/codex-a/models/refresh',
+      expect.objectContaining({ method: 'POST', headers: expect.objectContaining({ authorization: 'Bearer remote-secret' }), signal: expect.any(AbortSignal) }))
+  })
   it('browser (no tauri globals present) -> empty base, so Vite proxies /api and /ws', async () => {
     vi.stubGlobal('window', {}) // a window with no Tauri internals = the dev browser
     const { HUB_HTTP, HUB_WS } = await loadApi()

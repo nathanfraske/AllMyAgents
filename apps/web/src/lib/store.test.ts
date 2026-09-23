@@ -20,6 +20,7 @@ vi.mock('./api', () => {
     HUB_WS: '',
     api: {
       profiles: vi.fn(async () => []),
+      refreshModels: vi.fn(),
       rescanProfiles: vi.fn(async () => []),
       projects: vi.fn(async () => []),
       prefs: vi.fn(async () => ({ chatNamePool: 'everyone', steerMessagesAtToolBoundary: true })),
@@ -85,6 +86,25 @@ vi.mock('./dialog.svelte', () => ({
 }))
 
 describe('owner preferences', () => {
+  it('refreshes the exact local or remote account without touching another account', async () => {
+    const local = new HubStore()
+    local.profiles = [
+      { id: 'local', provider: 'codex', providerAccountId: 'local-account' },
+      { id: 'peer:remote', provider: 'codex', providerAccountId: 'remote-account', siteId: 'peer', siteLabel: 'Peer' },
+    ]
+    vi.mocked(api.refreshModels).mockResolvedValueOnce({ models: [], updatedAt: '2026-09-23T00:00:00Z' })
+    await local.refreshModels('peer:remote')
+    expect(api.refreshModels).toHaveBeenLastCalledWith('peer:remote')
+    expect(local.profiles[0]?.availableModels).toBeUndefined()
+    expect(local.profiles[1]).toMatchObject({ id: 'peer:remote', siteId: 'peer', availableModels: [] })
+    let finish!: (value: { models: []; updatedAt: string }) => void
+    vi.mocked(api.refreshModels).mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    const pending = local.refreshModels('local')
+    local.profiles[0]!.providerAccountId = 'replacement-account'
+    finish({ models: [], updatedAt: '2026-09-23T00:00:00Z' })
+    await pending
+    expect(local.profiles[0]?.availableModels).toBeUndefined()
+  })
   it('defaults mid-turn steering on and applies a live preference update without restarting', async () => {
     expect(store.prefs.steerMessagesAtToolBoundary).toBe(true)
 

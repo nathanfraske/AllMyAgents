@@ -55,6 +55,22 @@ const SPEC: WorkerSessionSpec = {
   cwd: '/tmp',
 } as unknown as WorkerSessionSpec
 
+it('routes both provider catalogs through the owning worker without a turn command', async () => {
+  const { client, calls } = unattachedClient()
+  const call = vi.fn(async (msg: unknown) => {
+    calls.push(msg)
+    return { t: 'modelCatalog', ok: true, value: [] }
+  })
+  client.call = call as never
+  const executor = new WorkerExecutor(client, recordingHub().hub)
+  await expect(executor.readModels('codex', 'a', '/a')).resolves.toEqual([])
+  await expect(executor.readModels('claude', 'b', '/b')).resolves.toEqual([])
+  expect(calls).toEqual([
+    expect.objectContaining({ t: 'readModels', provider: 'codex', profileId: 'a', profileDir: '/a' }),
+    expect.objectContaining({ t: 'readModels', provider: 'claude', profileId: 'b', profileDir: '/b' }),
+  ])
+})
+
 /**
  * REGRESSION (worker-unavailable send is silently lost).
  *

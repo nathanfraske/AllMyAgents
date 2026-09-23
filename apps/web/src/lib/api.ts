@@ -53,6 +53,7 @@ export interface ProfileModelInfo {
   defaultEffort?: string
   serviceTiers: Array<{ id: string; name: string }>
   isDefault?: boolean
+  releasedAt?: string
 }
 
 export interface ManagerApprovalHelperConfig {
@@ -1416,6 +1417,18 @@ export interface BrowserStatus {
 export const api = {
   replayBaseline: () => jget<ReplayBaseline>('/api/replay-baseline'),
   profiles: (signal?: AbortSignal) => jget<ProfileInfo[]>('/api/profiles', HUB_HTTP, signal),
+  refreshModels: async (id: string): Promise<{ models: ProfileModelInfo[]; updatedAt: string } | ApiError> => {
+    const target = resolveHubResource(id)
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 50_000)
+    try {
+      const result = await request<{ models: ProfileModelInfo[]; updatedAt: string }>(
+        'POST', `/api/profiles/${encodeURIComponent(target.id)}/models/refresh`,
+        target.baseUrl, undefined, [], controller.signal, target.token,
+      )
+      return result.ok ? result.data : { error: controller.signal.aborted ? 'Model refresh timed out. Your previous list is unchanged.' : result.error }
+    } finally { clearTimeout(timer) }
+  },
   stats: () => jget<StatsResult>('/api/stats'),
   // Account refresh is part of the login lifecycle, so it obeys the same transport bound as every
   // login/status/cancel request. The optional outer signal also lets the whole-attempt deadline stop it.

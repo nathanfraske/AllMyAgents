@@ -892,6 +892,18 @@ export class HubStore {
     }
   }
 
+  async refreshModels(profileId: string): Promise<void> {
+    const before = this.profiles.find(profile => profile.id === profileId)
+    if (!before) throw new Error('Choose an account before refreshing models.')
+    const identity = JSON.stringify([before.provider, before.providerAccountId, before.accountEmail, before.authStatus])
+    const result = await api.refreshModels(profileId)
+    if ('error' in result) throw new Error(result.error)
+    // A login/account switch while discovery was in flight must not publish into its replacement.
+    this.profiles = this.profiles.map(profile => profile.id === profileId
+      && JSON.stringify([profile.provider, profile.providerAccountId, profile.accountEmail, profile.authStatus]) === identity
+      ? { ...profile, availableModels: result.models, modelCatalogUpdatedAt: result.updatedAt } : profile)
+  }
+
   private replaceLocalProfiles(local: ProfileInfo[]): void {
     this.profiles = [
       ...local.filter(isVisibleAccountProfile),

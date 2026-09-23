@@ -1128,6 +1128,7 @@ export function startServer(opts: ServerOptions): http.Server {
         return
       }
       if (method === 'GET' && url.pathname === '/api/profiles') {
+        sessions.refreshStaleModelCatalogs()
         // The manager also carries ~/.claude + ~/.codex as INTERNAL bindings so imported chats can
         // resume against their real vendor homes. They are not AllMyAgents accounts or spawn targets.
         json(res, pickableProfiles(sessions.listProfiles()))
@@ -1136,6 +1137,15 @@ export function startServer(opts: ServerOptions): http.Server {
       if (method === 'POST' && url.pathname === '/api/profiles/rescan') {
         rescanProfiles() // pick up any newly-added managed logins under profiles/*
         json(res, pickableProfiles(sessions.listProfiles()))
+        return
+      }
+      const modelRefreshMatch = /^\/api\/profiles\/([^/]+)\/models\/refresh$/.exec(url.pathname)
+      if (method === 'POST' && modelRefreshMatch) {
+        try {
+          json(res, await sessions.refreshModelCatalog(decodeURIComponent(modelRefreshMatch[1]!)))
+        } catch (error) {
+          json(res, { error: error instanceof Error ? error.message : 'Model discovery failed' }, 503)
+        }
         return
       }
       const profileNameMatch = /^\/api\/profiles\/([^/]+)\/name$/.exec(url.pathname)

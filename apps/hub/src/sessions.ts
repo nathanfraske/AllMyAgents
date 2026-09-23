@@ -5,6 +5,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { lookup } from 'node:dns/promises'
 import { defaultHomeProfiles, isManagedProfile, readCodexProfileModelCatalog } from './profiles.js'
+import { ModelCatalog } from './modelCatalog.js'
 import { mapCodexTokenUsage } from './adapters/codex.js'
 import { CLAUDE_AUTO_COMPACT_WINDOW } from './adapters/claude.js'
 import { readHistoryPage, locateTranscript, type HistoryPage } from './transcript.js'
@@ -868,6 +869,7 @@ export class SessionManager {
   private githubCiMonitor: GitHubCiMonitor | null = null
   private readonly chatArtifacts: ChatArtifacts
   private overseerRuntime: OverseerRuntimeServices = {}
+  private readonly modelCatalog = new ModelCatalog()
 
   constructor(
     private readonly journal: Journal,
@@ -6989,7 +6991,7 @@ export class SessionManager {
     modelCatalogUpdatedAt?: string
   }> {
     return [...this.profiles.values()].map((p) => {
-      const catalog = p.provider === 'codex' ? readCodexProfileModelCatalog(p.dir) : undefined
+      const catalog = this.modelCatalog.peek(p) ?? (p.provider === 'codex' ? readCodexProfileModelCatalog(p.dir) : undefined)
       return {
         id: p.id,
         ...(p.displayName ? { displayName: p.displayName } : {}),
@@ -11645,6 +11647,33 @@ export class SessionManager {
     // 4. Remove it from the persisted snapshot so a hub restart doesn't resurrect it.
     this.store.remove(sessionId)
     return { ok: true }
+  }
+
+  /** Called by the authenticated profiles endpoint, never on the boot/readiness path. */
+  refreshStaleModelCatalogs(): void {
+    if (!this.executor.readModels) return
+    for (const profile of this.profiles.values()) {
+      if (!isManagedProfile(profile.id) || profile.available === false || profile.authStatus !== 'signed_in') continue
+      void this.modelCatalog.refresh(profile, () => this.readProfileModels(profile.id))?.catch(() => {})
+    }
+  }
+
+  async refreshModelCatalog(profileId: string): Promise<import('./modelCatalog.js').ModelCatalogSnapshot> {
+    const profile = this.profiles.get(profileId)
+    if (!profile || !isManagedProfile(profile.id)) throw new Error(`Unknown managed account: ${profileId}`)
+    return (await this.modelCatalog.refresh(profile, () => this.readProfileModels(profileId), true))!
+  }
+
+  private async readProfileModels(profileId: string): Promise<import('./types.js').ProfileAvailableModel[]> {
+    const profile = this.profiles.get(profileId)
+    if (!profile || !this.executor.readModels) throw new Error('Model discovery is unavailable; update the hub and worker together.')
+    if (profile.available === false) throw new Error(profile.unavailableReason ?? 'Account is owned by another hub')
+    const admission = this.beginProfileAdmission(profileId)
+    try {
+      if (profile.provider === 'codex') this.ensureCodexMcpConfig(profile)
+      admission.markDispatched()
+      return await this.executor.readModels(profile.provider, profileId, profile.dir)
+    } finally { admission.release() }
   }
 
   readCodexLimits(profileId: string): Promise<unknown> {

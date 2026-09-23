@@ -265,6 +265,14 @@ export class WorkerExecutor implements Executor {
     return reply.value
   }
 
+  async readModels(provider: 'codex' | 'claude', profileId: string, profileDir: string): Promise<import('./types.js').ProfileAvailableModel[]> {
+    const reply = await this.client.call<Extract<WorkerToHub, { t: 'modelCatalog' }>>({
+      t: 'readModels', reqId: nextReqId(), provider, profileId, profileDir,
+    })
+    if (!reply.ok || !reply.value) throw new Error(reply.error ?? 'Model discovery failed in worker')
+    return reply.value
+  }
+
   async listLive(): Promise<LiveSession[]> {
     const versionsAtRequest = new Map(this.busyVersions)
     const busyAtRequest = new Set(this.busySessions)
