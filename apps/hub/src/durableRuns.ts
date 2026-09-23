@@ -71,7 +71,7 @@ export interface DurableRunExecutionEnvironment {
 
 export type DurableRunExecutionTarget =
   | { kind: 'local' }
-  | { kind: 'remote'; siteId: string; rootId: string; command: string; cwd?: string; requiredTools?: string[] }
+  | { kind: 'remote'; siteId: string; rootId: string; command: string; cwd?: string; requiredTools?: string[]; workspaceMode?: 'project' | 'machine' }
 
 export interface DurableRun {
   id: string
@@ -350,7 +350,8 @@ export async function captureRunProvenance(input: {
     environmentKeys,
     lockfiles: [],
   }
-  for (const name of LOCKFILE_NAMES) {
+  const captureSource = !(input.executionTarget?.kind === 'remote' && input.executionTarget.workspaceMode === 'machine')
+  for (const name of captureSource ? LOCKFILE_NAMES : []) {
     const file = path.join(cwd, name)
     try {
       if ((await fs.promises.stat(file)).isFile()) provenance.lockfiles.push({ path: name, sha256: await hashFile(file) })
@@ -358,7 +359,7 @@ export async function captureRunProvenance(input: {
       // An absent lockfile carries no identity. A present-but-unreadable source is reflected below by Git.
     }
   }
-  try {
+  if (captureSource) try {
     const head = (await git(cwd, ['rev-parse', '--verify', 'HEAD'])).trim()
     let ref: string | undefined
     try {
@@ -823,6 +824,7 @@ function terminateTree(child: ChildProcess): void {
 export class DurableRunController {
   private readonly children = new Map<string, ChildProcess>()
   private readonly remoteRuns = new Set<string>()
+  private readonly remoteHeartbeats = new Map<string, NodeJS.Timeout>()
   private active = false
   private pumping = false
   private monitor: NodeJS.Timeout | undefined
@@ -921,6 +923,8 @@ export class DurableRunController {
     // A remote request may have completed after this process lost its response. Its successor retains the
     // lease until the last heartbeat is stale, then records outcome_unknown. Never invent a cancellation.
     this.remoteRuns.clear()
+    for (const heartbeat of this.remoteHeartbeats.values()) clearInterval(heartbeat)
+    this.remoteHeartbeats.clear()
   }
 
   private reconcileStaleOwners(): DurableRun[] {
@@ -1080,11 +1084,11 @@ export class DurableRunController {
       append(stderrPath, chunk, 'stderr')
       errorText = (errorText + chunk.toString('utf8')).slice(-2_000)
     })
-    const timeout = setTimeout(() => {
+    const timeout = run.timeoutMs === 0 ? undefined : setTimeout(() => {
       errorText = `run exceeded its ${run.timeoutMs}ms timeout`
       terminateTree(child)
     }, run.timeoutMs)
-    timeout.unref?.()
+    timeout?.unref?.()
     const heartbeat = setInterval(() => this.store.heartbeat(run.id), 5_000)
     heartbeat.unref?.()
     const settle = (exitCode: number | null, signal: NodeJS.Signals | null, spawnError?: Error): void => {
@@ -1124,7 +1128,9 @@ export class DurableRunController {
     this.journal.append(run.sessionId, 'run/started', this.lifecyclePayload(this.store.get(run.id) ?? run))
     const heartbeat = setInterval(() => this.store.heartbeat(run.id), 5_000)
     heartbeat.unref?.()
+    this.remoteHeartbeats.set(run.id, heartbeat)
     let result: RemoteDeviceActionResult
+    let ownsResult = false
     try {
       if (!this.remoteExecutor) throw new Error('remote durable run executor is unavailable')
       result = await this.remoteExecutor(run, target)
@@ -1132,8 +1138,12 @@ export class DurableRunController {
       result = { ok: false, error: error instanceof Error ? error.message : String(error), failure: { stage: 'transport' } }
     } finally {
       clearInterval(heartbeat)
+      this.remoteHeartbeats.delete(run.id)
+      ownsResult = this.active && this.remoteRuns.has(run.id)
       this.remoteRuns.delete(run.id)
     }
+    // A successor owns reconciliation after shutdown. Do not write a late result into a closed DB.
+    if (!ownsResult) return
     const dir = path.join(this.logsDir, run.id)
     fs.mkdirSync(dir, { recursive: true })
     const stdout = Buffer.from(result.stdout ?? '', 'utf8')
@@ -1142,12 +1152,13 @@ export class DurableRunController {
     const stderrWritten = Math.min(stderr.length, MAX_LOG_BYTES_PER_STREAM)
     if (stdoutWritten) fs.writeFileSync(path.join(dir, 'stdout.log'), stdout.subarray(0, stdoutWritten))
     if (stderrWritten) fs.writeFileSync(path.join(dir, 'stderr.log'), stderr.subarray(0, stderrWritten))
-    const current = this.store.get(run.id)
-    const state: Exclude<DurableRunState, 'queued' | 'running'> = current?.cancelRequested
-      ? 'cancelled'
-      : result.ok
-        ? 'succeeded'
-        : 'failed'
+    const state: Exclude<DurableRunState, 'queued' | 'running'> = result.outcomeUnknown
+      ? 'outcome_unknown'
+      : result.cancelled === true
+        ? 'cancelled'
+        : result.ok
+          ? 'succeeded'
+          : 'failed'
     const final = this.store.finish(run.id, {
       state,
       exitCode: result.exitCode,

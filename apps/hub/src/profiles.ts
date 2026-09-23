@@ -57,59 +57,7 @@ export function readCodexProfileModelCatalog(
   try {
     const root = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>
     const rows = Array.isArray(root.models) ? root.models : Array.isArray(root.data) ? root.data : []
-    const models: ProfileAvailableModel[] = []
-    const seen = new Set<string>()
-    for (const raw of rows.slice(0, 200)) {
-      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
-      const row = raw as Record<string, unknown>
-      if (row.hidden === true || row.visibility === 'hide') continue
-      const slug = boundedString(row.slug ?? row.model ?? row.id, 160)
-      if (!slug || seen.has(slug)) continue
-      const name = boundedString(row.display_name ?? row.displayName, 160) ?? slug
-      const rawEfforts = Array.isArray(row.supported_reasoning_levels)
-        ? row.supported_reasoning_levels
-        : Array.isArray(row.supportedReasoningEfforts)
-          ? row.supportedReasoningEfforts
-          : []
-      const supportedEfforts = [...new Set(rawEfforts.map((entry) => {
-        if (typeof entry === 'string') return boundedString(entry, 40)
-        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return undefined
-        const value = entry as Record<string, unknown>
-        return boundedString(value.effort ?? value.reasoningEffort, 40)
-      }).filter((item): item is string => !!item))].slice(0, 12)
-      const rawTiers = Array.isArray(row.service_tiers)
-        ? row.service_tiers
-        : Array.isArray(row.serviceTiers)
-          ? row.serviceTiers
-          : []
-      const serviceTiers = rawTiers.map((entry) => {
-        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return undefined
-        const value = entry as Record<string, unknown>
-        const id = boundedString(value.id, 40)
-        if (!id) return undefined
-        return { id, name: boundedString(value.name, 80) ?? id }
-      }).filter((item): item is { id: string; name: string } => !!item).slice(0, 12)
-      // Older caches expose speed tier ids without the richer service-tier objects.
-      if (serviceTiers.length === 0) {
-        for (const id of catalogStringList(row.additional_speed_tiers ?? row.additionalSpeedTiers)) {
-          serviceTiers.push({ id: id === 'fast' ? 'priority' : id, name: id === 'fast' ? 'Fast' : id })
-        }
-      }
-      const defaultEffort = boundedString(
-        row.default_reasoning_level ?? row.defaultReasoningEffort,
-        40,
-      )
-      seen.add(slug)
-      models.push({
-        slug,
-        name,
-        ...(boundedString(row.description, 500) ? { description: boundedString(row.description, 500) } : {}),
-        supportedEfforts,
-        ...(defaultEffort ? { defaultEffort } : {}),
-        serviceTiers,
-        ...((row.is_default === true || row.isDefault === true) ? { isDefault: true } : {}),
-      })
-    }
+    const models = parseCodexModels(rows)
     const fetched = boundedString(root.fetched_at ?? root.fetchedAt, 80)
     const fetchedMs = fetched ? Date.parse(fetched) : Number.NaN
     const value = models.length > 0
@@ -118,11 +66,74 @@ export function readCodexProfileModelCatalog(
     codexCatalogCache.set(file, { signature, value })
     return value
   } catch {
-    // A provider refresh can briefly replace the cache. Keep this account's picker on the bounded static
-    // catalog until the next profile read rather than leaking a parse failure into app startup.
     codexCatalogCache.set(file, { signature, value: undefined })
     return undefined
   }
+}
+
+/** Shared allowlisted projection for the provider cache and live model/list responses. */
+export function parseCodexModels(rows: unknown[]): ProfileAvailableModel[] {
+  const models: ProfileAvailableModel[] = []
+  const seen = new Set<string>()
+  for (const raw of rows.slice(0, 200)) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
+    const row = raw as Record<string, unknown>
+    if (row.hidden === true || row.visibility === 'hide') continue
+    const slug = boundedString(row.slug ?? row.model ?? row.id, 160)
+    if (!slug || seen.has(slug)) continue
+    const name = boundedString(row.display_name ?? row.displayName, 160) ?? slug
+    const rawEfforts = Array.isArray(row.supported_reasoning_levels)
+      ? row.supported_reasoning_levels
+      : Array.isArray(row.supportedReasoningEfforts)
+        ? row.supportedReasoningEfforts
+        : []
+    const supportedEfforts = [...new Set(rawEfforts.map((entry) => {
+      if (typeof entry === 'string') return boundedString(entry, 40)
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return undefined
+      const value = entry as Record<string, unknown>
+      return boundedString(value.effort ?? value.reasoningEffort, 40)
+    }).filter((item): item is string => !!item))].slice(0, 12)
+    const rawTiers = Array.isArray(row.service_tiers)
+      ? row.service_tiers
+      : Array.isArray(row.serviceTiers)
+        ? row.serviceTiers
+        : []
+    const serviceTiers = rawTiers.map((entry) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return undefined
+      const value = entry as Record<string, unknown>
+      const id = boundedString(value.id, 40)
+      if (!id) return undefined
+      return { id, name: boundedString(value.name, 80) ?? id }
+    }).filter((item): item is { id: string; name: string } => !!item).slice(0, 12)
+    // Older caches expose speed tier ids without the richer service-tier objects.
+    if (serviceTiers.length === 0) {
+      for (const id of catalogStringList(row.additional_speed_tiers ?? row.additionalSpeedTiers)) {
+        serviceTiers.push({ id: id === 'fast' ? 'priority' : id, name: id === 'fast' ? 'Fast' : id })
+      }
+    }
+    const defaultEffort = boundedString(
+      row.default_reasoning_level ?? row.defaultReasoningEffort,
+      40,
+    )
+    seen.add(slug)
+    models.push({
+      slug,
+      name,
+      ...(boundedString(row.description, 500) ? { description: boundedString(row.description, 500) } : {}),
+      supportedEfforts,
+      ...(defaultEffort ? { defaultEffort } : {}),
+      serviceTiers,
+      ...(modelReleaseDate(row) ? { releasedAt: modelReleaseDate(row) } : {}),
+      ...((row.is_default === true || row.isDefault === true) ? { isDefault: true } : {}),
+    })
+  }
+  return models
+}
+
+export function modelReleaseDate(row: Record<string, unknown>): string | undefined {
+  const value = row.releasedAt ?? row.release_date ?? row.releaseDate
+  const ms = typeof value === 'string' ? Date.parse(value) : NaN
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : undefined
 }
 
 /**

@@ -842,6 +842,35 @@ export class CodexClient {
     return this.request('account/rateLimits/read', {})
   }
 
+  /** Supported discovery uses the provider's cache TTL. Never delete its cache or restart live turns. */
+  async listModels(): Promise<import('../types.js').ProfileAvailableModel[]> {
+    const { modelCatalogDeadline } = await import('../modelCatalog.js')
+    const { parseCodexModels } = await import('../profiles.js')
+    const deadline = Date.now() + 30_000
+    return modelCatalogDeadline((async () => {
+      await this.ensureStarted()
+      const rows: unknown[] = []
+      let cursor: string | undefined
+      const seen = new Set<string>()
+      for (let page = 0; page < 10; page++) {
+        if (Date.now() >= deadline) throw new Error('Model discovery timed out')
+        const result = await this.request<{ data: unknown[]; nextCursor?: string | null }>(
+          'model/list', { limit: 100, includeHidden: false, ...(cursor ? { cursor } : {}) }, 15_000,
+        )
+        if (!Array.isArray(result?.data)) throw new Error('Invalid provider model catalog')
+        rows.push(...result.data)
+        if (rows.length > 200) throw new Error('Provider model catalog exceeds the supported size')
+        if (result.nextCursor == null) return parseCodexModels(rows)
+        if (typeof result.nextCursor !== 'string' || !result.nextCursor || seen.has(result.nextCursor)) {
+          throw new Error('Invalid provider model catalog pagination')
+        }
+        cursor = result.nextCursor
+        seen.add(cursor)
+      }
+      throw new Error('Provider model catalog pagination did not finish')
+    })())
+  }
+
   stop(): void {
     const child = this.child
     if (!child) return

@@ -542,6 +542,15 @@
   let profileNameDraft = $state('')
   let profileNameBusy = $state(false)
   let profileNameError = $state('')
+  let modelRefreshes = $state<Record<string, boolean>>({})
+  let modelRefreshErrors = $state<Record<string, string>>({})
+  async function refreshAccountModels(profileId: string): Promise<void> {
+    modelRefreshes[profileId] = true
+    modelRefreshErrors[profileId] = ''
+    try { await store.refreshModels(profileId) }
+    catch (error) { modelRefreshErrors[profileId] = error instanceof Error ? error.message : 'Model discovery failed' }
+    finally { modelRefreshes[profileId] = false }
+  }
 
   function beginProfileRename(profileId: string): void {
     const profile = store.profiles.find((candidate) => candidate.id === profileId)
@@ -1026,6 +1035,12 @@
                 </span>
               {/if}
               {#if p}
+                <button class="btn" onclick={() => refreshAccountModels(p.id)}
+                  aria-label={`Refresh models for ${profileLabel(p)}`}
+                  title={p.modelCatalogUpdatedAt ? `Last discovery: ${new Date(p.modelCatalogUpdatedAt).toLocaleString()}` : 'Discover models for this account'}
+                  disabled={modelRefreshes[p.id] || p.available === false || p.authStatus === 'signed_out'}
+                >{modelRefreshes[p.id] ? 'Refreshing…' : 'Refresh models'}</button>
+                {#if modelRefreshErrors[p.id]}<span class="status error" role="alert">{modelRefreshErrors[p.id]}</span>{/if}
                 <button class="btn" aria-label={`Rename ${profileLabel(p)}`} onclick={() => beginProfileRename(p.id)}>Rename</button>
                 <button
                   class="btn"

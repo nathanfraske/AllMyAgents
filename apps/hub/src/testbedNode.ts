@@ -431,7 +431,7 @@ export async function startTestbedNode(dataDirInput: string): Promise<{ stop: ()
       : {}
     if (!content.action || typeof content.action !== 'object' || Array.isArray(content.action)) throw new Error('action must be an object')
     const action = content.action as RemoteDeviceAction
-    if (!['probe', 'inspect', 'git_inspect', 'git_sync', 'list', 'read', 'mkdir', 'write', 'exec'].includes(action.op)) {
+    if (!['probe', 'inspect', 'git_inspect', 'git_sync', 'list', 'read', 'mkdir', 'write', 'exec', 'exec_start', 'exec_status', 'exec_cancel'].includes(action.op)) {
       throw new Error('unknown remote device operation')
     }
     const actor = content.actor && typeof content.actor === 'object' && !Array.isArray(content.actor)
@@ -441,7 +441,7 @@ export async function startTestbedNode(dataDirInput: string): Promise<{ stop: ()
       ? actor.durableRunId.slice(0, 128)
       : undefined
     const result = await executor.execute(action, { durableRunId })
-    appendTestbedAudit(dataDir, 'device/action', {
+    if (action.op !== 'exec_status') appendTestbedAudit(dataDir, 'device/action', {
       sourceSiteId: envelope.sourceSiteId,
       messageId: envelope.messageId,
       profile: config.profile,
@@ -517,7 +517,39 @@ function installWindowsElevated(profile: TestbedNodeProfile): { installRoot: str
 
 function systemdEscape(value: string): string {
   if (/\r|\n|\0/u.test(value)) throw new Error('systemd path contains control characters')
-  return `\"${value.replaceAll('\\', '\\\\').replaceAll('\"', '\\\"')}\"`
+  return `\"${value.replaceAll('%', '%%').replaceAll('\\', '\\\\').replaceAll('\"', '\\\"')}\"`
+}
+
+export function renderLinuxUserTestbedService(input: {
+  installRoot: string; dataDir: string; socketPath: string; home: string; commandPath: string
+}): string {
+  return [
+    '[Unit]', 'Description=AllMyAgents remote testbed (current user)', 'After=network-online.target', '',
+    '[Service]', 'Type=simple',
+    `WorkingDirectory=${systemdEscape(input.home)}`,
+    `Environment=${systemdEscape(`MYOWNMESH_CONTROL_SOCKET=${input.socketPath}`)}`,
+    `Environment=${systemdEscape(`PATH=${input.commandPath}`)}`,
+    `ExecStart=${systemdEscape(path.posix.join(input.installRoot, 'node'))} ${systemdEscape(path.posix.join(input.installRoot, 'dist/testbedNode.js'))} run --data-dir ${systemdEscape(input.dataDir)}`,
+    'UMask=0077', 'Restart=on-failure', 'RestartSec=3', '', '[Install]', 'WantedBy=default.target', '',
+  ].join('\n')
+}
+
+function installLinuxUser(profile: TestbedNodeProfile, dataDir: string, roots: DeviceRootPolicy[]): void {
+  if (process.platform !== 'linux' || process.getuid?.() === 0) throw new Error('install-user requires an ordinary Linux user; for root use install-elevated with an explicit profile')
+  if (profile !== 'scoped' && profile !== 'full-machine') throw new Error('install-user accepts scoped or full-machine only')
+  // Do not silently broaden a previously scoped installation during an upgrade.
+  if (fs.existsSync(configFile(dataDir))) {
+    if (readTestbedNodeConfig(dataDir).profile !== profile) throw new Error('Existing profile differs; change it explicitly with configure before reinstalling the service')
+  } else configureTestbedNode({ dataDir, profile, roots })
+  const unitDir = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'systemd/user')
+  fs.mkdirSync(unitDir, { recursive: true })
+  fs.writeFileSync(path.join(unitDir, TESTBED_SERVICE), renderLinuxUserTestbedService({
+    installRoot: payloadRoot(), dataDir, home: os.homedir(), socketPath: detectMyOwnMeshSocketPath(),
+    commandPath: process.env.PATH || '/usr/local/bin:/usr/bin:/bin',
+  }), { mode: 0o600 })
+  execFileSync('systemctl', ['--user', 'daemon-reload'], { stdio: 'pipe' })
+  execFileSync('systemctl', ['--user', 'enable', '--now', TESTBED_SERVICE], { stdio: 'pipe' })
+  appendTestbedAudit(dataDir, 'deployment/installed', { profile, platform: 'linux', account: 'current-user', launcher: 'systemd-user' })
 }
 
 function isUnixSocket(candidate: string): boolean {
@@ -730,8 +762,10 @@ function installLinuxElevated(profile: TestbedNodeProfile): { installRoot: strin
       execFileSync('useradd', ['--system', '--home-dir', dataDir, '--create-home', '--shell', '/usr/sbin/nologin', serviceUser], { stdio: 'pipe' })
     }
   }
+  if (fs.existsSync(configFile(dataDir))) {
+    if (readTestbedNodeConfig(dataDir).profile !== profile) throw new Error('Existing testbed profile differs; change it explicitly before reinstalling')
+  } else configureTestbedNode({ dataDir, profile })
   installFiles(installRoot)
-  configureTestbedNode({ dataDir, profile })
   if (profile === 'linux-sudo-machine') {
     const sudoers = `/etc/sudoers.d/${SERVICE_NAME}`
     const temporary = `${sudoers}.${process.pid}.tmp`
@@ -786,6 +820,21 @@ function parseScopedRoots(args: string[]): DeviceRootPolicy[] {
 export async function runTestbedNodeCli(args = process.argv.slice(2)): Promise<number> {
   const command = args[0]
   const dataDir = path.resolve(cliValue(args, '--data-dir') ?? defaultDataDir())
+  if (command === 'install-user') {
+    const requested = cliValue(args, '--profile')
+    if (!requested) throw new Error('Choose --profile full-machine (your OS account) or scoped with explicit roots')
+    installLinuxUser(normalizeProfile(requested), dataDir, parseScopedRoots(args))
+    process.stdout.write(`Installed user service. Pair with: allmyagents-testbed pair-code --data-dir ${JSON.stringify(dataDir)}\nFor operation after logout, explicitly enable user lingering with loginctl enable-linger. No reboot is needed.\n`)
+    return 0
+  }
+  if (command === 'status') {
+    const config = readTestbedNodeConfig(dataDir)
+    const bridge = new MyOwnMeshRpcBridge()
+    const identity = await bridge.identity()
+    const peers = await bridge.peers(true)
+    process.stdout.write(`${JSON.stringify({ profile: config.profile, dataDir, identity, peers, mesh: bridge.status(), build: readTestbedBuildIdentity() })}\n`)
+    return identity ? 0 : 1
+  }
   if (command === 'configure') {
     const profile = normalizeProfile(cliValue(args, '--profile') ?? 'scoped')
     const config = configureTestbedNode({
@@ -802,7 +851,9 @@ export async function runTestbedNodeCli(args = process.argv.slice(2)): Promise<n
     return 0
   }
   if (command === 'install-elevated') {
-    const profile = normalizeProfile(cliValue(args, '--profile') ?? 'elevated-machine')
+    const requested = cliValue(args, '--profile')
+    if (!requested) throw new Error('Machine-admin installation requires an explicit --profile elevated-machine or linux-sudo-machine')
+    const profile = normalizeProfile(requested)
     const installed = installElevatedTestbedNode(profile)
     process.stdout.write(`${JSON.stringify({ ok: true, profile, ...installed })}\n`)
     return 0
@@ -831,8 +882,8 @@ export async function runTestbedNodeCli(args = process.argv.slice(2)): Promise<n
       process.once('SIGTERM', stop)
     })
   }
-  process.stderr.write('Usage: testbedNode <configure|pair-code|install-elevated|repair-service|run> [--data-dir PATH] [--profile PROFILE] [--root PATH] [--read] [--write] [--terminal]\n')
-  return 2
+  process.stdout.write('Usage: allmyagents-testbed <configure|install-user|install-elevated|pair-code|status|repair-service|run> [--data-dir PATH] [--profile PROFILE] [--root PATH] [--read] [--write] [--terminal]\nProfiles: scoped, full-machine (OS user), elevated-machine (root), linux-sudo-machine (passwordless sudo).\nMyOwnMesh must be installed, joined to your network, and its control socket accessible to this account.\n')
+  return command === '--help' || command === '-h' ? 0 : 2
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

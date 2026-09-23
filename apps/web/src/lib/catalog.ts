@@ -1,6 +1,7 @@
 // Plain-TS port of t3code's model/option-descriptor contract (no Effect).
 // Codex models + params are from the live `codex app-server` model/list (Codex 0.153.3).
 import type { ProfileModelInfo } from './api'
+import { isRecentlyReleased, modelReleaseDate } from './modelReleaseDates'
 
 export type Provider = 'claude' | 'codex'
 
@@ -24,6 +25,7 @@ export interface ModelDef {
   provider: Provider
   isDefault?: boolean
   isNew?: boolean
+  releasedAt?: string
   descriptors: OptionDescriptor[]
 }
 
@@ -75,15 +77,15 @@ const BASE_EFFORT = ['low', 'medium', 'high', 'xhigh']
 
 export const MODELS: ModelDef[] = [
   // Claude (Agent SDK)
-  { slug: 'claude-opus-5', name: 'Claude Opus 5', shortName: 'Opus 5', provider: 'claude', isDefault: true, isNew: true, descriptors: [THINKING] },
+  { slug: 'claude-opus-5', name: 'Claude Opus 5', shortName: 'Opus 5', provider: 'claude', isDefault: true, descriptors: [THINKING] },
   { slug: 'claude-opus-4-8', name: 'Claude Opus 4.8', shortName: 'Opus 4.8', provider: 'claude', descriptors: [THINKING] },
-  { slug: 'claude-fable-5', name: 'Claude Fable 5', shortName: 'Fable 5', provider: 'claude', isNew: true, descriptors: [THINKING] },
+  { slug: 'claude-fable-5', name: 'Claude Fable 5', shortName: 'Fable 5', provider: 'claude', descriptors: [THINKING] },
   { slug: 'claude-sonnet-5', name: 'Claude Sonnet 5', shortName: 'Sonnet 5', provider: 'claude', descriptors: [THINKING] },
   { slug: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', shortName: 'Haiku 4.5', provider: 'claude', descriptors: [] },
   // Codex (app-server) — slugs + effort/speed from live model/list
-  { slug: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', shortName: '5.6 Sol', provider: 'codex', isDefault: true, isNew: true, descriptors: [effort(FULL_EFFORT, 'low'), SPEED] },
-  { slug: 'gpt-5.6-terra', name: 'GPT-5.6 Terra', shortName: '5.6 Terra', provider: 'codex', isNew: true, descriptors: [effort(FULL_EFFORT, 'medium'), SPEED] },
-  { slug: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', shortName: '5.6 Luna', provider: 'codex', isNew: true, descriptors: [effort(NO_ULTRA, 'medium'), SPEED] },
+  { slug: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', shortName: '5.6 Sol', provider: 'codex', isDefault: true, descriptors: [effort(FULL_EFFORT, 'low'), SPEED] },
+  { slug: 'gpt-5.6-terra', name: 'GPT-5.6 Terra', shortName: '5.6 Terra', provider: 'codex', descriptors: [effort(FULL_EFFORT, 'medium'), SPEED] },
+  { slug: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', shortName: '5.6 Luna', provider: 'codex', descriptors: [effort(NO_ULTRA, 'medium'), SPEED] },
   { slug: 'gpt-5.5', name: 'GPT-5.5', shortName: '5.5', provider: 'codex', descriptors: [effort(BASE_EFFORT, 'medium'), SPEED] },
   { slug: 'gpt-5.4', name: 'GPT-5.4', shortName: '5.4', provider: 'codex', descriptors: [effort(BASE_EFFORT, 'medium'), SPEED] },
   { slug: 'gpt-5.4-mini', name: 'GPT-5.4 Mini', shortName: '5.4 Mini', provider: 'codex', descriptors: [effort(BASE_EFFORT, 'medium')] },
@@ -94,12 +96,12 @@ export const MODELS: ModelDef[] = [
 // profile has no provider catalog, so putting Astra there would falsely grant it to every Codex account.
 // This metadata is applied only after the account's own model/list cache advertises the exact slug.
 const ACCOUNT_SCOPED_CODEX_MODEL_METADATA: ModelDef[] = [
-  { slug: 'gpt-6-astra', name: 'GPT-6 Astra', shortName: '6 Astra', provider: 'codex', isNew: true, descriptors: [effort(FULL_EFFORT, 'medium'), SPEED] },
+  { slug: 'gpt-6-astra', name: 'GPT-6 Astra', shortName: '6 Astra', provider: 'codex', descriptors: [effort(FULL_EFFORT, 'medium'), SPEED] },
 ]
 
-function accountModel(model: ProfileModelInfo): ModelDef {
+function accountModel(model: ProfileModelInfo, provider: Provider, now = Date.now()): ModelDef {
   const baseline = [...MODELS, ...ACCOUNT_SCOPED_CODEX_MODEL_METADATA]
-    .find((item) => item.provider === 'codex' && item.slug === model.slug)
+    .find((item) => item.provider === provider && item.slug === model.slug)
   const descriptors: OptionDescriptor[] = []
   if (model.supportedEfforts.length > 0) {
     descriptors.push(effort(model.supportedEfforts, model.defaultEffort ?? model.supportedEfforts[0] ?? 'medium'))
@@ -115,27 +117,33 @@ function accountModel(model: ProfileModelInfo): ModelDef {
       ],
     })
   }
+  if (provider === 'claude' && !model.supportedEfforts.length) descriptors.push(...(baseline?.descriptors ?? [THINKING]))
   return {
     slug: model.slug,
     name: model.name,
     shortName: baseline?.shortName ?? model.name,
-    provider: 'codex',
-    isDefault: model.isDefault ?? baseline?.isDefault,
-    isNew: baseline?.isNew,
+    provider,
+    isDefault: model.isDefault,
+    releasedAt: modelReleaseDate(model.slug, model.releasedAt),
+    isNew: isRecentlyReleased(model.slug, model.releasedAt, now),
     descriptors,
   }
 }
 
-/** Account models replace the global Codex baseline when present: preview access is profile-scoped. */
-export function modelsFor(provider: Provider, availableModels?: readonly ProfileModelInfo[]): ModelDef[] {
-  if (provider === 'codex' && availableModels?.length) return availableModels.map(accountModel)
-  return MODELS.filter((m) => m.provider === provider)
+/** An authoritative empty list is empty, not permission to offer the static fallback. */
+export function modelsFor(provider: Provider, availableModels?: readonly ProfileModelInfo[], now = Date.now()): ModelDef[] {
+  if (availableModels) return availableModels.map(model => accountModel(model, provider, now))
+  return MODELS.filter(m => m.provider === provider).map(m => ({ ...m,
+    releasedAt: modelReleaseDate(m.slug), isNew: isRecentlyReleased(m.slug, undefined, now),
+  }))
 }
 
-export function findModel(slug?: string, availableModels?: readonly ProfileModelInfo[]): ModelDef | undefined {
+export function findModel(slug?: string, availableModels?: readonly ProfileModelInfo[], provider?: Provider): ModelDef | undefined {
   if (!slug) return undefined
   const account = availableModels?.find((item) => item.slug === slug)
-  return account ? accountModel(account) : MODELS.find((m) => m.slug === slug)
+  if (account) return accountModel(account, provider ?? (slug.startsWith('claude-') ? 'claude' : 'codex'))
+  const fallback = MODELS.find(m => m.slug === slug)
+  return fallback ? { ...fallback, releasedAt: modelReleaseDate(slug), isNew: isRecentlyReleased(slug) } : undefined
 }
 
 export function defaultModelFor(provider: Provider, availableModels?: readonly ProfileModelInfo[]): ModelDef | undefined {

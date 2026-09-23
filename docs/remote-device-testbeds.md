@@ -1,5 +1,10 @@
 # Remote device testbeds
 
+For the standalone Ubuntu package and non-Git machine operations, see
+[Ubuntu remote-node setup](ubuntu-remote-node.md). Current durable targets support `timeout_ms: 0`
+and start/status execution independent of RPC timeouts; older timeout notes below describe the legacy
+single-request path. Use `remote_workspace: "machine"` when project checkout parity is not wanted.
+
 Remote testbeds let an agent on one AllMyAgents hub use explicitly approved files or a terminal on another
 authorized fleet machine. Execution stays on the target machine. The preferred transport is AllMyStuff's
 authenticated application RPC lane, which needs no exposed TCP Site or second hub port; upgraded hubs retain

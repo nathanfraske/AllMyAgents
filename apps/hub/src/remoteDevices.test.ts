@@ -8,7 +8,6 @@ import { verifyDirectHubEnvelope } from './directHubProtocol.js'
 import type { MyOwnMeshRpcBridge } from './myOwnMeshRpc.js'
 import {
   DeviceExecutor,
-  MAX_DURABLE_COMMAND_TIMEOUT_MS,
   MAX_INTERACTIVE_COMMAND_TIMEOUT_MS,
   FleetConnectionStore,
   RemoteDeviceController,
@@ -24,11 +23,14 @@ import {
 } from './remoteDevices.js'
 
 describe('remote command timeout policy', () => {
-  it('keeps ad-hoc shells bounded while honoring the durable run ceiling', () => {
+  it('keeps ad-hoc shells bounded and honors explicit durable deadlines without clamping', () => {
     expect(effectiveRemoteCommandTimeout(3_600_000)).toBe(MAX_INTERACTIVE_COMMAND_TIMEOUT_MS)
     expect(effectiveRemoteCommandTimeout(3_600_000, { durableRunId: 'run-1' })).toBe(3_600_000)
     expect(effectiveRemoteCommandTimeout(24 * 60 * 60_000, { durableRunId: 'run-1' }))
-      .toBe(MAX_DURABLE_COMMAND_TIMEOUT_MS)
+      .toBe(24 * 60 * 60_000)
+    expect(effectiveRemoteCommandTimeout(0, { durableRunId: 'run-1' })).toBe(0)
+    expect(effectiveRemoteCommandTimeout(0)).toBe(30_000)
+    expect(() => effectiveRemoteCommandTimeout(-1, { durableRunId: 'run-1' })).toThrow(/timeout_ms/)
   })
 })
 
@@ -560,6 +562,7 @@ describe('RemoteDeviceController', () => {
         fromPeer: 'localhub-session',
         token: localToken,
       })
+      if (envelope.operation === 'device_capabilities') return { enabled: true }
       expect(envelope.payload).toMatchObject({
         action: { op: 'exec', timeoutMs: 3_600_000 },
         actor: { durableRunId: 'durable-1' },

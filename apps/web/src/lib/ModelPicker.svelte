@@ -3,18 +3,44 @@
   import type { ProfileModelInfo } from './api'
   import Icon from './Icon.svelte'
 
-  let { provider, model, availableModels, onselect }: {
+  let { provider, model, availableModels, onselect, onrefresh, catalogKey = '', updatedAt }: {
     provider: Provider
     model?: string
     availableModels?: ProfileModelInfo[]
     onselect: (slug: string) => void
+    onrefresh?: () => Promise<void>
+    catalogKey?: string
+    updatedAt?: string
   } = $props()
 
   let open = $state(false)
   let filter = $state('')
+  let refreshing = $state(false)
+  let error = $state('')
+  let now = $state(Date.now())
+  $effect(() => { catalogKey; refreshing = false; error = ''; filter = '' })
+  $effect(() => {
+    if (!open) return
+    now = Date.now()
+    const timer = setInterval(() => { now = Date.now() }, 60_000)
+    return () => clearInterval(timer)
+  })
+  async function refresh(): Promise<void> {
+    if (!onrefresh || refreshing) return
+    const key = catalogKey
+    refreshing = true
+    error = ''
+    try { await onrefresh() }
+    catch (e) { if (key === catalogKey) error = e instanceof Error ? e.message : 'Model refresh failed' }
+    finally { if (key === catalogKey) { refreshing = false; now = Date.now() } }
+  }
 
-  const models = $derived(modelsFor(provider, availableModels))
-  const current = $derived(findModel(model, availableModels) ?? models.find((m) => m.isDefault) ?? models[0])
+  const models = $derived(modelsFor(provider, availableModels, now))
+  // Refresh may remove a preview model from the offered catalog. Keep the actual selection visible;
+  // displaying the new default here would imply the running conversation had switched models.
+  const current = $derived(model
+    ? findModel(model, availableModels, provider) ?? { slug: model, name: model, shortName: model }
+    : models.find((m) => m.isDefault) ?? models[0])
   const shown = $derived(
     filter ? models.filter((m) => m.name.toLowerCase().includes(filter.toLowerCase())) : models
   )
@@ -35,13 +61,21 @@
   {#if open}
     <button class="scrim" onclick={() => (open = false)} aria-label="close"></button>
     <div class="menu">
+      {#if onrefresh}
+        <div class="refresh-row">
+          <button onclick={refresh} disabled={refreshing}>{refreshing ? 'Refreshing…' : 'Refresh models'}</button>
+          <span class="dim" title={updatedAt ? `Last discovery: ${new Date(updatedAt).toLocaleString()}` : 'No live discovery yet'}>{updatedAt ? 'Account catalog' : 'Fallback catalog'}</span>
+        </div>
+      {/if}
+      {#if error}<p class="refresh-error" role="alert">{error}</p>{/if}
+      {#if !models.length}<p class="dim">No models advertised by this account.</p>{/if}
       {#if models.length > 5}
         <input class="search" placeholder="Search models" bind:value={filter} />
       {/if}
       {#each shown as m (m.slug)}
         <button class="row" class:sel={m.slug === current?.slug} onclick={() => pick(m.slug)}>
           <span class="name">{m.name}</span>
-          {#if m.isNew}<span class="badge new">New</span>{/if}
+          {#if m.isNew}<span class="badge new" title={`Released ${m.releasedAt?.slice(0, 10)} · New for 90 days`}>New</span>{/if}
           {#if m.isDefault}<span class="badge def">Default</span>{/if}
           {#if m.slug === current?.slug}<span class="tick"><Icon name="check" size={13} /></span>{/if}
         </button>
@@ -52,6 +86,9 @@
 
 <style>
   .wrap { position: relative; min-width: 0; }
+  .refresh-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 6px; font-size: var(--text-xs); }
+  .refresh-error { color: var(--warn); max-width: 320px; font-size: var(--text-xs); padding: 6px; }
+  .menu { max-height: min(65vh, 480px); overflow-y: auto; overscroll-behavior: contain; }
   .pill-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .glyph { width: 9px; height: 9px; border-radius: var(--r-xs); background: var(--secondary); }
   .glyph.codex { background: var(--ok); }

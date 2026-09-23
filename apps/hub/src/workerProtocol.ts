@@ -66,6 +66,7 @@ export type HubToWorker =
   | { t: 'listLive'; reqId: string }
   | { t: 'attach'; reqId: string; since: Record<string, number> }
   | { t: 'readCodexLimits'; reqId: string; profileId: string; profileDir: string }
+  | { t: 'readModels'; reqId: string; provider: 'codex' | 'claude'; profileId: string; profileDir: string }
   | { t: 'evaluateApproval'; reqId: string; input: ApprovalHelperEvaluationInput }
   // pushes (no reqId):
   | { t: 'dangerUpdate'; danger: DangerFlags }
@@ -109,6 +110,7 @@ export type WorkerToHub =
   | { t: 'ack'; reqId: string; ok: boolean; error?: string }
   | { t: 'threadStarted'; reqId: string; threadId: string }
   | { t: 'codexLimits'; reqId: string; ok: boolean; value?: unknown; error?: string }
+  | { t: 'modelCatalog'; reqId: string; ok: boolean; value?: import('./types.js').ProfileAvailableModel[]; error?: string }
   | { t: 'approvalEvaluation'; reqId: string; ok: boolean; value?: ApprovalHelperEvaluation; error?: string }
   | { t: 'live'; reqId: string; sessions: LiveSession[] }
 

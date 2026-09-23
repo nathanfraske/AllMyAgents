@@ -14,11 +14,20 @@ const MAX_DIRECTORY_ENTRIES = 500
 const MAX_COMMAND_CHARS = 16 * 1024
 const MAX_COMMAND_OUTPUT_BYTES = 512 * 1024
 const MAX_REMOTE_RESPONSE_BYTES = 2 * 1024 * 1024
-/** Ad-hoc remote shells stay deliberately short. Durable runs have their own audited handle, lease,
- * retained terminal state, and explicit timeout, so they may use the same six-hour ceiling exposed by
- * start_run without silently inheriting this interactive limit. */
+/** Ad-hoc tools stay short; current durable targets use start/status with an independent deadline.
+ * The six-hour value is only the compatibility ceiling for old, single-RPC executors. */
 export const MAX_INTERACTIVE_COMMAND_TIMEOUT_MS = 120_000
 export const MAX_DURABLE_COMMAND_TIMEOUT_MS = 6 * 60 * 60_000
+/** Largest positive Node timer with transport headroom. Zero explicitly means no execution deadline. */
+export const MAX_RUN_TIMEOUT_MS = 2_147_000_000
+
+export function validateRunTimeout(requested: number | undefined): number {
+  const timeout = requested ?? 30 * 60_000
+  if (!Number.isSafeInteger(timeout) || (timeout !== 0 && (timeout < 1_000 || timeout > MAX_RUN_TIMEOUT_MS))) {
+    throw new Error(`timeout_ms must be 0 (no execution deadline) or 1000..${MAX_RUN_TIMEOUT_MS}`)
+  }
+  return timeout
+}
 const MAX_DEVICE_ROOTS = 128
 const MAX_FLEET_CONNECTIONS = 256
 
@@ -178,6 +187,8 @@ export interface DeviceExecutorCapabilities {
   /** Operator-selected install profile; descriptive only and never an authority token. */
   deploymentProfile?: 'scoped' | 'full-machine' | 'elevated-machine' | 'linux-sudo-machine'
   elevated?: boolean
+  /** Versioned start/status/cancel protocol: command lifetime is independent of an RPC request. */
+  durableCommands?: 1
   /** The route that actually answered this capability probe. Source-hub observed, never target asserted. */
   activeTransport?: 'myownmesh-rpc' | 'site'
   /** Credential-free release identity reported by lightweight nodes. Optional on pre-update nodes. */
@@ -290,9 +301,14 @@ export type RemoteDeviceAction =
   | { op: 'mkdir'; rootId: string; path: string; recursive?: boolean }
   | { op: 'write'; rootId: string; path: string; content: string; encoding?: 'utf8' | 'base64' }
   | { op: 'exec'; rootId: string; command: string; cwd?: string; timeoutMs?: number }
+  | { op: 'exec_start'; rootId: string; jobId: string; command: string; cwd?: string; timeoutMs?: number }
+  | { op: 'exec_status' | 'exec_cancel'; rootId: string; jobId: string }
 
 export interface RemoteDeviceActionResult {
   ok: boolean
+  jobState?: 'running' | 'completed' | 'outcome_unknown'
+  outcomeUnknown?: boolean
+  cancelled?: boolean
   /** Source-hub durable run identity when this action targeted an attached project replica. */
   runId?: string
   error?: string
@@ -332,8 +348,8 @@ export function effectiveRemoteCommandTimeout(
   requested: number | undefined,
   actor?: Pick<RemoteDeviceActor, 'durableRunId'>,
 ): number {
-  const maximum = actor?.durableRunId ? MAX_DURABLE_COMMAND_TIMEOUT_MS : MAX_INTERACTIVE_COMMAND_TIMEOUT_MS
-  return Math.max(1_000, Math.min(Number(requested) || 30_000, maximum))
+  if (actor?.durableRunId) return validateRunTimeout(requested)
+  return Math.max(1_000, Math.min(Number(requested) || 30_000, MAX_INTERACTIVE_COMMAND_TIMEOUT_MS))
 }
 
 function inside(root: string, target: string): boolean {
@@ -490,7 +506,7 @@ export function remoteCapabilityForAction(action: RemoteDeviceAction): RemoteDev
   if (action.op === 'write' || action.op === 'mkdir') return 'write'
   // A checkout can invoke configured credential helpers or content filters. Keep it behind the same
   // OS-account authority as a terminal even though callers can supply only bounded Git identities.
-  if (action.op === 'exec' || action.op === 'git_sync') return 'terminal'
+  if (action.op === 'exec' || action.op === 'exec_start' || action.op === 'exec_status' || action.op === 'exec_cancel' || action.op === 'git_sync') return 'terminal'
   return 'read'
 }
 
@@ -851,6 +867,7 @@ export interface DeviceExecutorOptions {
 
 export class DeviceExecutor {
   private policy: DeviceExecutorPolicy = { enabled: false, roots: [] }
+  private readonly jobs = new Map<string, { controller: AbortController; rootId: string }>()
 
   constructor(
     private readonly file: string,
@@ -867,6 +884,7 @@ export class DeviceExecutor {
   capabilities(): DeviceExecutorCapabilities {
     return {
       enabled: this.policy.enabled,
+      durableCommands: 1,
       platform: process.platform,
       arch: process.arch,
       hostname: os.hostname(),
@@ -896,7 +914,7 @@ export class DeviceExecutor {
         : (result.failure ?? (result.timedOut
             ? { stage: 'timeout', code: 'COMMAND_TIMEOUT' }
             : { stage: 'target' })),
-      telemetry: { ...result.telemetry, targetMs: Math.max(0, Math.round((performance.now() - started) * 10) / 10) },
+      telemetry: { ...result.telemetry, targetMs: result.telemetry?.targetMs ?? Math.max(0, Math.round((performance.now() - started) * 10) / 10) },
     })
     if (!this.policy.enabled) return finish({ ok: false, error: 'Remote device execution is disabled on this machine.' })
     const root = this.policy.roots.find((item) => item.id === action.rootId)
@@ -923,10 +941,71 @@ export class DeviceExecutor {
       if (action.op === 'read') return finish(this.read(root, action))
       if (action.op === 'mkdir') return finish(this.mkdir(root, action))
       if (action.op === 'write') return finish(this.write(root, action))
-      return finish(await this.exec(root, action, actor))
+      if (action.op === 'exec_start' || action.op === 'exec_status' || action.op === 'exec_cancel') {
+        return finish(this.durableCommand(root, action, actor))
+      }
+      if (action.op === 'exec') return finish(await this.exec(root, action, actor))
+      throw new Error('Unknown device operation')
     } catch (error) {
       return finish({ ok: false, error: this.safeError(error, root.path) })
     }
+  }
+
+  private durableCommand(
+    root: DeviceRootPolicy,
+    action: Extract<RemoteDeviceAction, { jobId: string }>,
+    actor?: Pick<RemoteDeviceActor, 'durableRunId'>,
+  ): RemoteDeviceActionResult {
+    if (!/^[a-f0-9-]{36}$/iu.test(action.jobId) || actor?.durableRunId !== action.jobId) {
+      throw new Error('Durable command requires its exact source run identity')
+    }
+    const dir = path.join(path.dirname(this.file), 'remote-command-results')
+    const file = path.join(dir, `${action.jobId}.json`)
+    if (action.op !== 'exec_start') {
+      const saved = JSON.parse(fs.readFileSync(file, 'utf8')) as { rootId: string; result: RemoteDeviceActionResult }
+      if (saved.rootId !== root.id) throw new Error('Run belongs to a different device root')
+      if (action.op === 'exec_cancel') this.jobs.get(action.jobId)?.controller.abort()
+      if (saved.result.jobState === 'running' && !this.jobs.has(action.jobId)) {
+        return { ok: false, jobState: 'outcome_unknown', outcomeUnknown: true,
+          error: 'The target executor restarted before recording a terminal result. Do not resubmit the command.' }
+      }
+      return saved.result
+    }
+    validateRunTimeout(action.timeoutMs)
+    if (typeof action.command !== 'string' || !action.command || action.command.length > MAX_COMMAND_CHARS || action.command.includes('\0')) {
+      throw new Error('command must be a non-empty bounded string')
+    }
+    this.resolveExisting(root, action.cwd, 'cwd', true)
+    // Exclusive durable receipt BEFORE spawn. A lost acknowledgement may be reconciled with status,
+    // but a duplicate start can never execute twice, including after a target restart.
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const running = { rootId: root.id, result: { ok: true, jobState: 'running' as const } }
+    let receipt: number
+    try { receipt = fs.openSync(file, 'wx', 0o600) }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') return {
+        ok: false, jobState: 'outcome_unknown', outcomeUnknown: true,
+        error: 'This run was already admitted. Read its original status; a duplicate start was not executed.',
+      }
+      throw error
+    }
+    try { fs.writeFileSync(receipt, JSON.stringify(running)); fs.fsyncSync(receipt) }
+    finally { fs.closeSync(receipt) }
+    const controller = new AbortController()
+    this.jobs.set(action.jobId, { controller, rootId: root.id })
+    const finish = (result: RemoteDeviceActionResult): void => {
+      try { atomicPrivateJson(file, { rootId: root.id, result: { ...result, jobState: 'completed' } }) }
+      finally { this.jobs.delete(action.jobId) }
+    }
+    const started = performance.now()
+    // This promise belongs to the executor, NOT to the request socket. Network loss does not kill it.
+    void Promise.resolve().then(() => this.exec(root, { ...action, op: 'exec' }, actor, controller.signal))
+      .then((result) => finish({ ...result, telemetry: { targetMs: Math.round(performance.now() - started) } }))
+      .catch((error) => {
+        try { finish({ ok: false, error: String(error), outcomeUnknown: true }) }
+        catch { this.jobs.delete(action.jobId) /* Admission receipt survives: next status is unknown. */ }
+      })
+    return running.result
   }
 
   private normalizePolicy(input: DeviceExecutorPolicy): DeviceExecutorPolicy {
@@ -1149,6 +1228,7 @@ export class DeviceExecutor {
     root: DeviceRootPolicy,
     action: Extract<RemoteDeviceAction, { op: 'exec' }>,
     actor?: Pick<RemoteDeviceActor, 'durableRunId'>,
+    abortSignal?: AbortSignal,
   ): Promise<RemoteDeviceActionResult> {
     if (typeof action.command !== 'string' || action.command.length === 0 || action.command.length > MAX_COMMAND_CHARS || action.command.includes('\0')) {
       throw new Error('command must be a non-empty bounded string')
@@ -1159,6 +1239,7 @@ export class DeviceExecutor {
     const allowedEnvironment = new Set([
       'PATH', 'PATHEXT', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP', 'HOME', 'USERPROFILE',
       'LANG', 'LC_ALL', 'TERM', 'ALLMYAGENTS_TOOLCHAIN_HOME', 'RUSTUP_HOME', 'CARGO_INSTALL_ROOT',
+      'KUBECONFIG', 'DOCKER_HOST', 'SSH_AUTH_SOCK',
     ])
     const env: NodeJS.ProcessEnv = {}
     for (const [key, value] of Object.entries(sourceEnvironment)) {
@@ -1185,9 +1266,9 @@ export class DeviceExecutor {
       const systemdArgs = [
         '--quiet', '--wait', '--pipe', '--collect', `--unit=${unit}`,
         `--working-directory=${cwd}`, '--setenv=ALLMYAGENTS_REMOTE_TESTBED=1',
-        ...['PATH', 'ALLMYAGENTS_TOOLCHAIN_HOME', 'RUSTUP_HOME', 'CARGO_INSTALL_ROOT']
+        ...['PATH', 'ALLMYAGENTS_TOOLCHAIN_HOME', 'RUSTUP_HOME', 'CARGO_INSTALL_ROOT', 'KUBECONFIG', 'DOCKER_HOST', 'SSH_AUTH_SOCK']
           .flatMap((key) => env[key] ? [`--setenv=${key}=${env[key]}`] : []),
-        `--property=RuntimeMaxSec=${Math.max(1, Math.ceil(timeoutMs / 1000))}s`,
+        `--property=RuntimeMaxSec=${timeoutMs === 0 ? 'infinity' : `${Math.ceil(timeoutMs / 1000)}s`}`,
         '--property=TimeoutStopSec=5s',
         '--property=UMask=0022',
       ]
@@ -1253,14 +1334,18 @@ export class DeviceExecutor {
           try { child.kill('SIGKILL') } catch { /* already exited */ }
         }
       }
-      const timer = setTimeout(() => { timedOut = true; killTree() }, timeoutMs)
-      timer.unref?.()
+      const timer = timeoutMs === 0 ? undefined : setTimeout(() => { timedOut = true; killTree() }, timeoutMs)
+      timer?.unref?.()
+      abortSignal?.addEventListener('abort', killTree, { once: true })
+      if (abortSignal?.aborted) killTree()
       child.once('error', (error) => {
         clearTimeout(timer)
+        abortSignal?.removeEventListener('abort', killTree)
         resolve({ ok: false, error: error.message })
       })
       child.once('close', (code, signal) => {
         clearTimeout(timer)
+        abortSignal?.removeEventListener('abort', killTree)
         resolve({
           ok: !timedOut && code === 0,
           ...(timedOut ? { error: `command timed out after ${timeoutMs}ms` } : {}),
@@ -1269,6 +1354,7 @@ export class DeviceExecutor {
           exitCode: code,
           signal,
           timedOut,
+          cancelled: abortSignal?.aborted === true && code !== 0,
           truncated,
         })
       })
@@ -1515,6 +1601,18 @@ class RemoteRequestError extends Error {
 
 /** Source-side client. It intersects target policy with one session's durable operator grant. */
 export class RemoteDeviceController {
+  private readonly activeDurableCommands = new Set<string>()
+  private observationGeneration = 0
+
+  /** Detach source-side observation on hub shutdown; never send a remote cancellation. */
+  stopObserving(): void {
+    this.observationGeneration++
+    this.activeDurableCommands.clear()
+  }
+
+  canCancelDurableCommand(siteId: string, runId: string): boolean {
+    return this.activeDurableCommands.has(`${siteId}:${runId}`)
+  }
   constructor(
     private readonly connections: FleetConnectionStore,
     private readonly resolveRoute: (siteId: string) => Promise<RemoteDeviceRoute | null>,
@@ -1591,7 +1689,16 @@ export class RemoteDeviceController {
     return { ...site, activeTransport: 'site' }
   }
 
-  async execute(siteId: string, action: RemoteDeviceAction, actor: RemoteDeviceActor): Promise<RemoteDeviceActionResult> {
+  async execute(siteId: string, action: RemoteDeviceAction, actor: RemoteDeviceActor, isCancelled?: () => boolean): Promise<RemoteDeviceActionResult> {
+    if (action.op === 'exec' && actor.durableRunId) {
+      const capabilities = await this.capabilities(siteId)
+      if (capabilities.durableCommands === 1) return this.executeDurable(siteId, action, actor, isCancelled)
+      const requested = effectiveRemoteCommandTimeout(action.timeoutMs, actor)
+      if (requested === 0 || requested > MAX_DURABLE_COMMAND_TIMEOUT_MS) return {
+        ok: false, error: 'Update the remote testbed/hub before using unlimited or longer-than-six-hour commands. Nothing was started.',
+        failure: { stage: 'admission', code: 'DURABLE_COMMAND_UPGRADE_REQUIRED' },
+      }
+    }
     const timeout = action.op === 'exec'
       ? effectiveRemoteCommandTimeout(action.timeoutMs, actor) + 10_000
       : action.op === 'git_sync'
@@ -1658,6 +1765,59 @@ export class RemoteDeviceController {
         error: error instanceof Error ? error.message : String(error),
         failure: { stage: 'transport' },
       }
+    }
+  }
+
+  private async executeDurable(
+    siteId: string,
+    action: Extract<RemoteDeviceAction, { op: 'exec' }>,
+    actor: RemoteDeviceActor,
+    isCancelled?: () => boolean,
+  ): Promise<RemoteDeviceActionResult> {
+    const key = `${siteId}:${actor.durableRunId!}`
+    this.activeDurableCommands.add(key)
+    try { return await this.monitorDurable(siteId, action, actor, isCancelled) }
+    finally { this.activeDurableCommands.delete(key) }
+  }
+
+  private async monitorDurable(
+    siteId: string,
+    action: Extract<RemoteDeviceAction, { op: 'exec' }>,
+    actor: RemoteDeviceActor,
+    isCancelled?: () => boolean,
+  ): Promise<RemoteDeviceActionResult> {
+    const jobId = actor.durableRunId!
+    const generation = this.observationGeneration
+    const started = performance.now()
+    let last = await this.execute(siteId, { ...action, op: 'exec_start', jobId }, actor)
+    // Never retry a start. If its acknowledgement was lost, read the receipt using the original id.
+    if (!last.ok && last.failure?.stage === 'target') return last
+    let disconnectedAt: number | undefined
+    let cancelSent = false
+    while (true) {
+      if (generation !== this.observationGeneration) return {
+        ok: false, outcomeUnknown: true,
+        error: 'Source observation stopped before the outcome was confirmed. The remote command was not cancelled.',
+      }
+      if (last.jobState === 'completed' || last.jobState === 'outcome_unknown') {
+        return { ...last, telemetry: { ...last.telemetry, roundTripMs: Math.round(performance.now() - started) } }
+      }
+      if (isCancelled?.() && !cancelSent) {
+        cancelSent = true
+        // Cancellation is also a write: one attempt, then observe the command's actual terminal state.
+        await this.execute(siteId, { op: 'exec_cancel', rootId: action.rootId, jobId }, actor)
+      }
+      last = await this.execute(siteId, { op: 'exec_status', rootId: action.rootId, jobId }, actor)
+      if (!last.jobState) {
+        disconnectedAt ??= Date.now()
+        if (Date.now() - disconnectedAt >= 60_000) return {
+          ...last, ok: false, outcomeUnknown: true,
+          error: `Cannot observe remote run ${jobId}: ${last.error ?? 'connection lost'}. The command may still be running; do not resubmit.`,
+        }
+      } else disconnectedAt = undefined
+      if (last.jobState !== 'running' && last.jobState) continue
+      // Read-only transport polling, not agent turns. No job lifetime is tied to this short request.
+      await new Promise<void>((resolve) => setTimeout(resolve, 5_000))
     }
   }
 

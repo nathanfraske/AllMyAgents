@@ -11,6 +11,8 @@ export interface ProfileAvailableModel {
   defaultEffort?: string
   serviceTiers: Array<{ id: string; name: string }>
   isDefault?: boolean
+  /** Provider release date, when supplied; never the local discovery/cache timestamp. */
+  releasedAt?: string
 }
 
 export interface Profile {

@@ -5,6 +5,7 @@ import { once } from 'node:events'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { startServer, type ServerOptions } from './server.js'
 import { SessionManager } from './sessions.js'
+import { ModelCatalog } from './modelCatalog.js'
 import type { Profile } from './types.js'
 
 const cleanups: Array<() => void | Promise<void>> = []
@@ -30,12 +31,13 @@ describe('profile account API contract', () => {
       accountEmail: 'owner@example.com',
       providerAccountId: 'codex-account-7',
     }
-    const sessionState = { profiles: new Map([[profile.id, profile]]) }
+    const sessionState = { profiles: new Map([[profile.id, profile]]), modelCatalog: new ModelCatalog() }
     const profileNames: Record<string, string> = { [profile.id]: 'Work Codex' }
     const append = vi.fn()
     const sessions = {
       list: () => [],
       listProfiles: SessionManager.prototype.listProfiles.bind(sessionState as never),
+      refreshStaleModelCatalogs: vi.fn(),
     }
     const server = startServer({
       port: 0,

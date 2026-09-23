@@ -101,6 +101,37 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  linux-testbed:
+    name: Ubuntu remote node (${{ matrix.platform }})
+    needs: launch-and-repair-gate
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ubuntu-22.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run testbed:bundle
+      - name: Package and qualify the installed Linux node
+        shell: bash
+        run: |
+          bash -n scripts/install-linux.sh
+          node --test scripts/install-linux.test.mjs
+          node scripts/package-testbed-linux.mjs
+          node scripts/test-linux-testbed.mjs target/linux-testbed/*.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-testbed-${{ matrix.platform }}
+          path: target/linux-testbed/*.deb*
+          if-no-files-found: error
+
   launch-and-repair-gate:
     name: installed launch-and-repair gate
     runs-on: ubuntu-latest
@@ -359,3 +390,18 @@ jobs:
           # If you ever set this back to true, change the updater endpoint in the same commit.
           prerelease: false
           includeUpdaterJson: true
+
+  publish-linux-testbed:
+    name: Publish qualified Linux remote-node packages
+    needs: [release, linux-testbed]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: linux-testbed-*
+          path: linux-testbed
+          merge-multiple: true
+      - name: Attach packages to the exact desktop release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" linux-testbed/*.deb* --repo "$GITHUB_REPOSITORY" --clobber

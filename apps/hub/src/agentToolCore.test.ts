@@ -447,6 +447,18 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
     })
   })
 
+  it('carries machine workspace and explicit unlimited execution through admission', async () => {
+    const h = makeHarness()
+    const start = vi.fn(async () => ({ ok: true, run: { id: 'machine-run' } as never }))
+    h.services.startRun = start
+    await runAgentTool('start_run', {
+      kind: 'custom', remote_device_id: 'cluster', remote_root_id: 'root', remote_workspace: 'machine',
+      remote_command: 'kubectl get pods', remote_cwd: 'home/operator', timeout_ms: 0,
+    }, { identity: idA, services: h.services })
+    expect(start).toHaveBeenCalledWith(idA.sessionId, expect.objectContaining({ timeoutMs: 0,
+      remote: expect.objectContaining({ workspaceMode: 'machine', command: 'kubectl get pods', cwd: 'home/operator' }) }))
+  })
+
   it('does not expose any tool that can grant or revoke the project-manager role', () => {
     expect(AGENT_TOOLS.map((t) => t.name)).not.toContain('set_project_manager')
     expect(AGENT_TOOLS.map((t) => t.name)).not.toContain('configure_project_manager')

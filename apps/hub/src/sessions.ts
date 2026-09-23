@@ -5,6 +5,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { lookup } from 'node:dns/promises'
 import { defaultHomeProfiles, isManagedProfile, readCodexProfileModelCatalog } from './profiles.js'
+import { ModelCatalog } from './modelCatalog.js'
 import { mapCodexTokenUsage } from './adapters/codex.js'
 import { CLAUDE_AUTO_COMPACT_WINDOW } from './adapters/claude.js'
 import { readHistoryPage, locateTranscript, type HistoryPage } from './transcript.js'
@@ -108,6 +109,7 @@ import type {
   DurableRunState,
 } from './durableRuns.js'
 import { APPLICATION_RUN_SCOPE_ID } from './durableRuns.js'
+import { validateRunTimeout } from './remoteDevices.js'
 import {
   TestbedReservationConflictError,
   type TestbedReservationStore,
@@ -345,6 +347,7 @@ function providerHostInstructions(
   const attentionRouting =
     'Use send_message with wake=false for routine progress, checkpoints, and FYIs. For an operator-requested handoff, actionable failure/blocker, approval, or question that genuinely requires the recipient to start a turn now, a manager sets attention_required=true; a worker may use it only when addressing its own manager. A direct operator-origin Overseer message with normal wake=true is automatically treated as such a handoff. Attention-required delivery is audited and bypasses only the high-context wake hold: the resulting turn remains teammate-originated and permission-clamped. Never mark routine chatter urgent or use it as a polling loop.'
   const remoteMethod =
+    'Remote machine operations (Kubernetes, host administration, non-Git directories, or intentionally dirty work) use start_run with remote_workspace="machine". Skip Git inspection/preparation in that mode; remote_cwd is relative to the granted root. Project mode remains the default for reproducible builds. For long commands, timeout_ms=0 explicitly disables the execution deadline on current targets; short status RPC deadlines do not kill the command. Never replace a failed/unknown acknowledgement with another start. ' +
     'For remote testbed work, use the AllMyAgents tools in this order: remote_list_devices to discover only this chat\'s granted devices and roots; remote_ping before expensive work; remote_inspect_environment with the build\'s required_tools to learn the target and dependency verdict; and remote_inspect_git for checkout readiness. An operator-authorized whole testbed grant is standing authority for every advertised root/capability on direct and teammate-triggered turns: do not ask for another approval, serialize unrelated commands, or call a generic machine root a missing project grant. For a project run, the hub automatically reuses a matching clean checkout or creates an app-owned checkout beneath the selected broad machine root, then verifies it at the primary location\'s exact published commit before execution; remote_prepare_project_location exposes the same operation explicitly when needed. Use remote_list_files, remote_read_file, remote_create_directory, or remote_write_file only within the returned grant. For an important build, test, lint, benchmark, deploy, or other long-running command, managers and the Overseer use start_run with the remote device/root and required_tools rather than an ephemeral remote_exec call. Missing tools are not by themselves a blocker to report: find the project\'s reviewed setup/bootstrap recipe and pass its exact command as setup_command. The hub records setup as a separate durable prerequisite, queues the requested run behind success, and verifies the tools again before executing it. Never infer packages or invent another dependency manifest. Independent remote jobs need no resource key, while operations that intentionally must serialize use the same explicit resource key. Preserve every returned run id and use inspect_runs cursors for logs and exact terminal state. Report the returned timing, active transport, transfer, build identity, and failure-stage telemetry upstream. Never blindly retry an ambiguous write, preparation, payload sync, restart, or terminal failure because the first request may have completed on the target. An outcome_unknown run is exactly such an ambiguous terminal boundary.'
   let role: string
   if (record.isOverseer === true) {
@@ -868,6 +871,7 @@ export class SessionManager {
   private githubCiMonitor: GitHubCiMonitor | null = null
   private readonly chatArtifacts: ChatArtifacts
   private overseerRuntime: OverseerRuntimeServices = {}
+  private readonly modelCatalog = new ModelCatalog()
 
   constructor(
     private readonly journal: Journal,
@@ -1961,7 +1965,7 @@ export class SessionManager {
     controller.setRemoteExecutor(async (run, target) => {
       let cwd = target.cwd
       const record = this.sessions.get(run.targetSessionId)
-      if (record?.projectId) {
+      if (record?.projectId && target.workspaceMode !== 'machine') {
         const prepared = await this.ensureRemoteProjectLocation(run.targetSessionId, target.siteId, target.rootId)
         if (!prepared.ok) return prepared
         cwd ??= prepared.projectLocation?.cwd
@@ -2018,7 +2022,7 @@ export class SessionManager {
         ? `failed${exit}${signal}`
         : run.state === 'cancelled'
           ? `was cancelled${exit}${signal}`
-          : 'ended with an unknown outcome because hub ownership changed before completion was observed'
+          : 'has an unknown outcome because completion could not be confirmed; it may still be running on the target'
     const error = run.error?.replace(/\s+/gu, ' ').trim().slice(0, 500)
     const next = run.state === 'outcome_unknown'
       ? `Inspect run ${run.id} before deciding what happened. Do not retry it blindly because it may have completed on the target.`
@@ -2631,7 +2635,7 @@ export class SessionManager {
         agentId: record.id,
         ...(record.baseCommit ? { baseCommit: record.baseCommit } : {}),
       } : {}),
-    }).catch((error): RemoteDeviceActionResult => ({
+    }, options?.durableRunId ? () => this.durableRuns?.store.get(options.durableRunId!)?.cancelRequested === true : undefined).catch((error): RemoteDeviceActionResult => ({
       ok: false,
       error: error instanceof Error ? error.message : String(error),
     }))
@@ -6989,7 +6993,7 @@ export class SessionManager {
     modelCatalogUpdatedAt?: string
   }> {
     return [...this.profiles.values()].map((p) => {
-      const catalog = p.provider === 'codex' ? readCodexProfileModelCatalog(p.dir) : undefined
+      const catalog = this.modelCatalog.peek(p) ?? (p.provider === 'codex' ? readCodexProfileModelCatalog(p.dir) : undefined)
       return {
         id: p.id,
         ...(p.displayName ? { displayName: p.displayName } : {}),
@@ -10613,12 +10617,15 @@ export class SessionManager {
       environment?: Record<string, string>
       workingDirectory?: string
       dependsOnRunId?: string
-      remote?: { deviceId: string; rootId: string; command: string; cwd?: string; requiredTools?: string[] }
+      remote?: { deviceId: string; rootId: string; command: string; cwd?: string; requiredTools?: string[]; workspaceMode?: 'project' | 'machine' }
     },
   ): Promise<{ ok: boolean; run?: import('./durableRuns.js').DurableRun; error?: string }> {
     if (!this.durableRuns) return { ok: false, error: 'durable run service is unavailable' }
     const scope = this.runControlScope(callerSessionId)
     if ('error' in scope) return { ok: false, error: scope.error }
+    let timeoutMs: number
+    try { timeoutMs = validateRunTimeout(input.timeoutMs) }
+    catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) } }
     const targetId = input.targetSessionId ?? callerSessionId
     const target = scope.visible.find((record) => record.id === targetId && !record.managerRetiredAt)
     if (!target) return { ok: false, error: 'target session is outside your live managed scope' }
@@ -10646,7 +10653,7 @@ export class SessionManager {
       if (!capability) return { ok: false, error: 'target session has no terminal grant for that remote root' }
     }
     let remoteCwd = input.remote?.cwd
-    if (input.remote && target.projectId) {
+    if (input.remote && input.remote.workspaceMode !== 'machine' && target.projectId) {
       const prepared = await this.ensureRemoteProjectLocation(target.id, input.remote.deviceId, input.remote.rootId)
       if (!prepared.ok) {
         return { ok: false, error: `remote project checkout is not ready: ${prepared.error ?? 'unknown preparation failure'}` }
@@ -10670,7 +10677,7 @@ export class SessionManager {
     } else {
       hostCwd = path.resolve(target.worktree ?? target.cwd)
     }
-    if (!fs.existsSync(hostCwd) || !fs.statSync(hostCwd).isDirectory()) {
+    if (!input.remote && (!fs.existsSync(hostCwd) || !fs.statSync(hostCwd).isDirectory())) {
       return {
         ok: false,
         error: applicationScope
@@ -10747,7 +10754,7 @@ export class SessionManager {
         args,
         cwd: hostCwd,
         resources,
-        timeoutMs: Math.max(1_000, Math.min(Math.trunc(input.timeoutMs ?? 30 * 60_000), 6 * 60 * 60_000)),
+        timeoutMs,
         ...(environment ? { environment } : {}),
         ...(executionEnvironment ? { executionEnvironment } : {}),
         ...(input.remote ? {
@@ -10756,6 +10763,7 @@ export class SessionManager {
             siteId: input.remote.deviceId,
             rootId: input.remote.rootId,
             command: input.remote.command,
+            workspaceMode: input.remote.workspaceMode ?? 'project',
             ...(remoteCwd ? { cwd: remoteCwd } : {}),
             ...(input.remote.requiredTools?.length
               ? { requiredTools: [...new Set(input.remote.requiredTools)].sort() }
@@ -10846,8 +10854,9 @@ export class SessionManager {
       if (!['queued', 'running'].includes(run.state)) return { ok: true, run, waiting: false }
       return this.waitForOwnDurableRun(callerSessionId, run)
     }
-    if (run.executionTarget.kind === 'remote' && run.state === 'running') {
-      return { ok: false, error: 'the remote executor cannot yet prove live cancellation; wait for its bounded timeout rather than reporting a false cancellation' }
+    if (run.executionTarget.kind === 'remote' && run.state === 'running' &&
+      !this.remoteDeviceController?.canCancelDurableCommand(run.executionTarget.siteId, run.id)) {
+      return { ok: false, error: 'This remote run is still preparing or uses an older executor without confirmed cancellation. No cancellation was claimed.' }
     }
     const updated = this.durableRuns.cancel(run.projectId, run.id)
     if (!updated) return { ok: false, error: 'run is unavailable' }
@@ -11647,6 +11656,33 @@ export class SessionManager {
     return { ok: true }
   }
 
+  /** Called by the authenticated profiles endpoint, never on the boot/readiness path. */
+  refreshStaleModelCatalogs(): void {
+    if (!this.executor.readModels) return
+    for (const profile of this.profiles.values()) {
+      if (!isManagedProfile(profile.id) || profile.available === false || profile.authStatus !== 'signed_in') continue
+      void this.modelCatalog.refresh(profile, () => this.readProfileModels(profile.id))?.catch(() => {})
+    }
+  }
+
+  async refreshModelCatalog(profileId: string): Promise<import('./modelCatalog.js').ModelCatalogSnapshot> {
+    const profile = this.profiles.get(profileId)
+    if (!profile || !isManagedProfile(profile.id)) throw new Error(`Unknown managed account: ${profileId}`)
+    return (await this.modelCatalog.refresh(profile, () => this.readProfileModels(profileId), true))!
+  }
+
+  private async readProfileModels(profileId: string): Promise<import('./types.js').ProfileAvailableModel[]> {
+    const profile = this.profiles.get(profileId)
+    if (!profile || !this.executor.readModels) throw new Error('Model discovery is unavailable; update the hub and worker together.')
+    if (profile.available === false) throw new Error(profile.unavailableReason ?? 'Account is owned by another hub')
+    const admission = this.beginProfileAdmission(profileId)
+    try {
+      if (profile.provider === 'codex') this.ensureCodexMcpConfig(profile)
+      admission.markDispatched()
+      return await this.executor.readModels(profile.provider, profileId, profile.dir)
+    } finally { admission.release() }
+  }
+
   readCodexLimits(profileId: string): Promise<unknown> {
     const profile = this.profiles.get(profileId)
     if (!profile) throw new Error(`unknown profile: ${profileId}`)
@@ -11678,6 +11714,7 @@ export class SessionManager {
   async shutdown(opts?: { graceful?: boolean }): Promise<void> {
     if (opts?.graceful) this.retiring = true
     this.durableRuns?.shutdown()
+    this.remoteDeviceController?.stopObserving?.()
     // A non-in-process executor keeps its vendor children alive across a hub stop by design (that is
     // the whole point of the worker), so there is nothing for the hub to tear down in that mode.
     if (this.executor instanceof InProcessExecutor) await this.executor.shutdownVendors()

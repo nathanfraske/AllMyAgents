@@ -782,14 +782,14 @@ export function startServer(opts: ServerOptions): http.Server {
         throw new Error('action must be an object')
       }
       const action = content.action as RemoteDeviceAction
-      if (!['probe', 'inspect', 'git_inspect', 'git_sync', 'list', 'read', 'mkdir', 'write', 'exec'].includes(action.op)) throw new Error('unknown remote device operation')
+      if (!['probe', 'inspect', 'git_inspect', 'git_sync', 'list', 'read', 'mkdir', 'write', 'exec', 'exec_start', 'exec_status', 'exec_cancel'].includes(action.op)) throw new Error('unknown remote device operation')
       const actor = content.actor && typeof content.actor === 'object' && !Array.isArray(content.actor)
         ? content.actor as Record<string, unknown>
         : {}
       const result = await deviceExecutor.execute(action, {
         durableRunId: (str(actor.durableRunId) ?? '').slice(0, 128) || undefined,
       })
-      journal.append(null, 'device-executor/action', {
+      if (action.op !== 'exec_status') journal.append(null, 'device-executor/action', {
         op: action.op,
         rootId: (str(action.rootId) ?? '').slice(0, 128),
         sourceSiteId: envelope.sourceSiteId,
@@ -1128,6 +1128,7 @@ export function startServer(opts: ServerOptions): http.Server {
         return
       }
       if (method === 'GET' && url.pathname === '/api/profiles') {
+        sessions.refreshStaleModelCatalogs()
         // The manager also carries ~/.claude + ~/.codex as INTERNAL bindings so imported chats can
         // resume against their real vendor homes. They are not AllMyAgents accounts or spawn targets.
         json(res, pickableProfiles(sessions.listProfiles()))
@@ -1136,6 +1137,15 @@ export function startServer(opts: ServerOptions): http.Server {
       if (method === 'POST' && url.pathname === '/api/profiles/rescan') {
         rescanProfiles() // pick up any newly-added managed logins under profiles/*
         json(res, pickableProfiles(sessions.listProfiles()))
+        return
+      }
+      const modelRefreshMatch = /^\/api\/profiles\/([^/]+)\/models\/refresh$/.exec(url.pathname)
+      if (method === 'POST' && modelRefreshMatch) {
+        try {
+          json(res, await sessions.refreshModelCatalog(decodeURIComponent(modelRefreshMatch[1]!)))
+        } catch (error) {
+          json(res, { error: error instanceof Error ? error.message : 'Model discovery failed' }, 503)
+        }
         return
       }
       const profileNameMatch = /^\/api\/profiles\/([^/]+)\/name$/.exec(url.pathname)
@@ -2553,7 +2563,7 @@ export function startServer(opts: ServerOptions): http.Server {
           return
         }
         const action = body.action as RemoteDeviceAction
-        if (!['probe', 'inspect', 'git_inspect', 'git_sync', 'list', 'read', 'mkdir', 'write', 'exec'].includes(action.op)) {
+        if (!['probe', 'inspect', 'git_inspect', 'git_sync', 'list', 'read', 'mkdir', 'write', 'exec', 'exec_start', 'exec_status', 'exec_cancel'].includes(action.op)) {
           json(res, { error: 'unknown remote device operation' }, 400)
           return
         }
@@ -2563,7 +2573,7 @@ export function startServer(opts: ServerOptions): http.Server {
         const result = await deviceExecutor.execute(action, {
           durableRunId: (str(actor.durableRunId) ?? '').slice(0, 128) || undefined,
         })
-        journal.append(null, 'device-executor/action', {
+        if (action.op !== 'exec_status') journal.append(null, 'device-executor/action', {
           op: action.op,
           rootId: (str(action.rootId) ?? '').slice(0, 128),
           path: (str(action.op === 'exec' ? action.cwd : action.op === 'read' || action.op === 'write' || action.op === 'list' ? action.path : undefined) ?? '').slice(0, 4096),

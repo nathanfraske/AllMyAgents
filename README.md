@@ -154,7 +154,11 @@ Prefer to click things? Download the `.msi` or `-setup.exe` from [Releases](http
 
 ### Linux
 
-Build from source (below). No packaged build yet.
+For Ubuntu **remote execution**, the Linux release pipeline builds a vendor-free testbed `.deb` for
+amd64 and arm64. Agents stay on your other PC and use the Ubuntu machine's granted files and shell;
+no AI account or Git checkout is required on the target. See [Ubuntu remote-node setup](docs/ubuntu-remote-node.md)
+for the CLI installer, full-machine/admin profiles, pairing, and long-running machine operations.
+Older releases do not contain this new package. The Linux desktop app still builds from source (below).
 
 ---
 

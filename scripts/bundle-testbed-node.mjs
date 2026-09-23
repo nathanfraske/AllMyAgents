@@ -20,7 +20,7 @@ try {
   sourceCommit = undefined
 }
 
-execFileSync(process.execPath, [
+if (!process.argv.includes('--compiled')) execFileSync(process.execPath, [
   path.join(hub, 'node_modules', 'typescript', 'bin', 'tsc'),
   '-p',
   path.join(hub, 'tsconfig.build.json'),
@@ -67,6 +67,8 @@ fs.writeFileSync(path.join(output, 'README.txt'), [
   '',
   'Automatic signed-fleet trust is off by default; pair with a one-use code unless it was explicitly enabled.',
   'An agent still needs an explicit per-chat device/root grant from its source AllMyAgents hub.',
+  ...(process.platform === 'linux' ? [`Full machine as your user: ${launch} install-user --profile full-machine`,
+    `Diagnostics: ${launch} status [--data-dir PATH]`] : []),
   '',
 ].join('\n'))
 

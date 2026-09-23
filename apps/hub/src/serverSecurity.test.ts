@@ -8,6 +8,7 @@ import WebSocket from 'ws'
 import { ApprovalService } from './approvals.js'
 import { AgentBus } from './bus.js'
 import type { Executor } from './executor.js'
+import type { Profile, ProfileAvailableModel } from './types.js'
 import { InstructionStore } from './instructions.js'
 import { Journal } from './journal.js'
 import { MemoryStore } from './memory.js'
@@ -24,6 +25,14 @@ import { QuestionService } from './questions.js'
 import { waitForPortRelease } from './restartRollback.js'
 
 const cleanups: Array<() => void | Promise<void>> = []
+// Match the attachment API harness: an OS-assigned ephemeral port can still be forbidden by Fetch.
+const FETCH_FORBIDDEN_PORTS = new Set([
+  1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95,
+  101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161,
+  179, 389, 427, 465, 512, 513, 514, 515, 526, 530, 531, 532, 540, 548, 554, 556, 563,
+  587, 601, 636, 989, 990, 993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060,
+  5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6697, 10080,
+])
 
 describe('fleet websocket event filtering', () => {
   it('keeps fleet state global while limiting transcript payloads to visible sessions', () => {
@@ -64,7 +73,7 @@ async function build(overrides: Partial<Pick<ServerOptions, 'mesh' | 'meshPeerPo
     attach: async () => {},
     isBusy: () => false,
   }
-  const profile = { id: 'claude-test', provider: 'claude' as const, dir: path.join(root, 'profile') }
+  const profile: Profile = { id: 'claude-test', provider: 'claude', dir: path.join(root, 'profile') }
   const danger = {
     busCanUseRiskyTools: false,
     autoApprovePractices: false,
@@ -147,13 +156,22 @@ async function build(overrides: Partial<Pick<ServerOptions, 'mesh' | 'meshPeerPo
     overseerCwd: root,
   } satisfies ServerOptions)
   if (!server.listening) await once(server, 'listening')
-  const address = server.address() as { port: number }
+  let address = server.address() as { port: number }
+  while (FETCH_FORBIDDEN_PORTS.has(address.port)) {
+    await new Promise<void>(resolve => server.close(() => resolve()))
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    address = server.address() as { port: number }
+  }
   cleanups.push(async () => {
     if (server.listening) {
       const closed = new Promise<void>((resolve) => server.close(() => resolve()))
       server.closeAllConnections()
       await closed
     }
+    // Session startup/settlement can schedule an idle bus-drain immediate. Let it run before
+    // closing the disposable journal, rather than racing teardown against an admitted operation.
+    await new Promise<void>(resolve => setImmediate(resolve))
     journal.db.close()
     fs.rmSync(root, { recursive: true, force: true })
   })
@@ -170,6 +188,7 @@ async function build(overrides: Partial<Pick<ServerOptions, 'mesh' | 'meshPeerPo
     configPath,
     overseer,
     projects,
+    profile,
     root,
     publicPort: address.port,
   }
@@ -178,6 +197,52 @@ async function build(overrides: Partial<Pick<ServerOptions, 'mesh' | 'meshPeerPo
 function auth(token: string): HeadersInit {
   return { authorization: `Bearer ${token}` }
 }
+
+describe('account model discovery', () => {
+  it('does not block profile reads on automatic discovery, and deduplicates manual refresh', async () => {
+    const f = await build()
+    f.profile.authStatus = 'signed_in'
+    let finish!: (models: ProfileAvailableModel[]) => void
+    f.executor.readModels = vi.fn(() => new Promise<ProfileAvailableModel[]>(resolve => { finish = resolve }))
+    const profiles = await fetch(`${f.base}/api/profiles`, { headers: auth(f.deviceToken) }).then(r => r.json())
+    expect(profiles[0].availableModels).toBeUndefined()
+    expect(f.executor.readModels).toHaveBeenCalledTimes(1)
+    const refresh = f.sessions.refreshModelCatalog(f.profile.id)
+    finish([])
+    await expect(refresh).resolves.toMatchObject({ models: [] })
+    f.sessions.refreshStaleModelCatalogs()
+    expect(f.executor.readModels).toHaveBeenCalledTimes(1)
+  })
+  it('does not start discovery for signed-out or externally-owned accounts', async () => {
+    const f = await build()
+    f.executor.readModels = vi.fn(async () => [])
+    f.profile.authStatus = 'signed_out'
+    f.sessions.refreshStaleModelCatalogs()
+    await expect(f.sessions.refreshModelCatalog(f.profile.id)).rejects.toThrow('signed out')
+    f.profile.authStatus = 'signed_in'
+    f.profile.available = false
+    f.sessions.refreshStaleModelCatalogs()
+    await expect(f.sessions.refreshModelCatalog(f.profile.id)).rejects.toThrow('owned')
+    expect(f.executor.readModels).not.toHaveBeenCalled()
+  })
+  it('requires operator authentication and returns the selected account catalog without a turn', async () => {
+    const f = await build()
+    const read = vi.fn(async () => [{ slug: 'new-model', name: 'New Model', supportedEfforts: [], serviceTiers: [] }])
+    f.executor.readModels = read
+    const route = `${f.base}/api/profiles/claude-test/models/refresh`
+    expect((await fetch(route, { method: 'POST' })).status).toBe(401)
+    expect(read).not.toHaveBeenCalled()
+    const response = await fetch(route, { method: 'POST', headers: auth(f.deviceToken) })
+    expect(response.status).toBe(200)
+    expect((await response.json()).models[0].slug).toBe('new-model')
+    expect(read).toHaveBeenCalledWith('claude', 'claude-test', path.join(f.root, 'profile'))
+    const profiles = await fetch(`${f.base}/api/profiles`, { headers: auth(f.deviceToken) }).then(r => r.json())
+    expect(profiles[0].availableModels[0].slug).toBe('new-model')
+    expect((await fetch(`${f.base}/api/profiles/not-an-account/models/refresh`, {
+      method: 'POST', headers: auth(f.deviceToken),
+    })).status).toBe(503)
+  })
+})
 
 describe('device-authenticated control plane', () => {
   it('requires the operator token for worker run grants even when broad API auth is disabled', async () => {

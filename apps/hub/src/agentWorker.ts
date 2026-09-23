@@ -425,6 +425,13 @@ export class AgentWorker {
           this.ack(msg.reqId, false, errMessage(err))
         }
         return
+      case 'readModels':
+        (msg.provider === 'codex'
+          ? this.codexClientFor(msg.profileId, msg.profileDir).listModels()
+          : import('./claudeModels.js').then(({ readClaudeModels }) => readClaudeModels(msg.profileDir)))
+          .then(value => this.server.send({ t: 'modelCatalog', reqId: msg.reqId, ok: true, value }))
+          .catch(err => this.server.send({ t: 'modelCatalog', reqId: msg.reqId, ok: false, error: errMessage(err) }))
+        return
       case 'readCodexLimits':
         this.readCodexLimits(msg.profileId, msg.profileDir)
           .then((value) => this.server.send({ t: 'codexLimits', reqId: msg.reqId, ok: true, value }))

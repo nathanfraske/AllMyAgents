@@ -15,6 +15,7 @@ const temporary: string[] = []
 const controllers: DurableRunController[] = []
 
 afterEach(() => {
+  vi.useRealTimers()
   for (const controller of controllers.splice(0)) controller.shutdown()
   for (const db of opened.splice(0)) db.close()
   for (const dir of temporary.splice(0)) fs.rmSync(dir, { recursive: true, force: true })
@@ -60,6 +61,52 @@ async function waitForTerminal(store: DurableRunStore, id: string): Promise<void
 }
 
 describe('DurableRunStore', () => {
+  it('stops remote heartbeats at shutdown and discards late results after the database closes', async () => {
+    const { store, cwd, db } = harness()
+    const journal = { append: vi.fn() }
+    const controller = new DurableRunController(store, journal as never, path.join(cwd, 'logs'))
+    controllers.push(controller)
+    let complete!: (value: { ok: boolean; exitCode: number }) => void
+    const remote = vi.fn(() => new Promise<{ ok: boolean; exitCode: number }>(resolve => { complete = resolve }))
+    controller.setRemoteExecutor(remote)
+    const runInput = { ...input(cwd), executionTarget: { kind: 'remote' as const, siteId: 'peer', rootId: 'root', command: 'work' } }
+    store.create(runInput, await captureRunProvenance(runInput))
+    vi.useFakeTimers()
+    controller.activate()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(remote).toHaveBeenCalledTimes(1)
+    controller.shutdown()
+    expect(vi.getTimerCount()).toBe(0)
+    opened.splice(opened.indexOf(db), 1)
+    db.close()
+    const events = journal.append.mock.calls.length
+    complete({ ok: true, exitCode: 0 })
+    await vi.advanceTimersByTimeAsync(15000)
+    expect(journal.append).toHaveBeenCalledTimes(events)
+  })
+
+  it('does not turn an unknown remote outcome into failure or an unconfirmed cancellation', async () => {
+    const { store, cwd } = harness()
+    const journal = { append: vi.fn() }
+    const controller = new DurableRunController(store, journal as never, path.join(cwd, 'logs'))
+    controllers.push(controller)
+    controller.setRemoteExecutor(async () => ({ ok: false, outcomeUnknown: true, error: 'connection lost; command may still be running' }))
+    controller.activate()
+    const run = await controller.start({ ...input(cwd), timeoutMs: 0,
+      executionTarget: { kind: 'remote', siteId: 'peer', rootId: 'root', command: 'sleep 60', workspaceMode: 'machine' } })
+    await waitForTerminal(store, run.id)
+    expect(store.get(run.id)).toMatchObject({ state: 'outcome_unknown', timeoutMs: 0 })
+  })
+
+  it('supports no execution deadline for a local command too', async () => {
+    const { store, cwd } = harness()
+    const controller = new DurableRunController(store, { append: vi.fn() } as never, path.join(cwd, 'logs'))
+    controllers.push(controller)
+    controller.activate()
+    const run = await controller.start({ ...input(cwd), timeoutMs: 0 })
+    await waitForTerminal(store, run.id)
+    expect(store.get(run.id)).toMatchObject({ state: 'succeeded', timeoutMs: 0, exitCode: 0 })
+  })
   it('serializes conflicting resources and releases the lease only at a terminal boundary', async () => {
     const { store, cwd } = harness()
     const firstInput = input(cwd, '-1')

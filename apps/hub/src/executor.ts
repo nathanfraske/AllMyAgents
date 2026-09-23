@@ -1,4 +1,5 @@
 import { ClaudeDriver } from './adapters/claude.js'
+import { readClaudeModels } from './claudeModels.js'
 import {
   CodexClient,
   mapCodexTokenUsage,
@@ -71,6 +72,7 @@ export interface Executor {
   /** Drop the driver/thread for a stopped/deleted session from the executor. */
   stopSession(sessionId: string): Promise<void>
   readCodexLimits(profileId: string, profileDir: string): Promise<unknown>
+  readModels?(provider: 'codex' | 'claude', profileId: string, profileDir: string): Promise<import('./types.js').ProfileAvailableModel[]>
   /** Hidden stateless approval evaluator. It owns no session, transcript, tools, or durable identity. */
   evaluateApproval?(input: ApprovalHelperEvaluationInput): Promise<ApprovalHelperEvaluation>
   /** The sessions the executor is still driving (for hub re-attach; a no-op-ish query in-process). */
@@ -907,6 +909,10 @@ export class InProcessExecutor implements Executor {
 
   readCodexLimits(profileId: string, profileDir: string): Promise<unknown> {
     return this.codexClientFor(profileId, profileDir).readRateLimits()
+  }
+
+  readModels(provider: 'codex' | 'claude', profileId: string, profileDir: string): Promise<import('./types.js').ProfileAvailableModel[]> {
+    return provider === 'codex' ? this.codexClientFor(profileId, profileDir).listModels() : readClaudeModels(profileDir)
   }
 
   async listLive(): Promise<LiveSession[]> {
