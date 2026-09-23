@@ -19,6 +19,7 @@ import type { ElevatedShell, ElevationScope } from './elevatedCommand.js'
 import type { TeamPresetDraft } from './teamPresets.js'
 import type { BrowserOperation, BrowserResultContent } from './browserProtocol.js'
 import type { RemoteDeviceAction, RemoteDeviceActionResult, RemoteDeviceView } from './remoteDevices.js'
+import { MAX_RUN_TIMEOUT_MS } from './remoteDevices.js'
 import type {
   GitHubAutomationCapability,
   GitHubAutomationPolicyScope,
@@ -333,7 +334,7 @@ export interface AgentServices {
       environment?: Record<string, string>
       workingDirectory?: string
       dependsOnRunId?: string
-      remote?: { deviceId: string; rootId: string; command: string; cwd?: string; requiredTools?: string[] }
+      remote?: { deviceId: string; rootId: string; command: string; cwd?: string; requiredTools?: string[]; workspaceMode?: 'project' | 'machine' }
     },
   ): Awaitable<{ ok: boolean; run?: DurableRun; error?: string }>
   /** Inspect scoped durable runs and optionally read bounded stdout/stderr pages. */
@@ -813,7 +814,8 @@ const startRun = defineTool({
     args: z.array(z.string().max(8_000)).max(256).optional().describe('argument vector; defaults to []'),
     target_session: z.string().optional().describe('managed agent whose checkout should run; defaults to your own checkout'),
     resources: z.array(z.string().min(1).max(120)).max(16).optional().describe('scope-owned resource names such as gpu or port-8080; local checkout/working-directory leases are automatic, while remote runs serialize only on explicitly shared names'),
-    timeout_ms: z.number().int().min(1_000).max(6 * 60 * 60 * 1_000).optional(),
+    timeout_ms: z.union([z.literal(0), z.number().int().min(1_000).max(MAX_RUN_TIMEOUT_MS)]).optional()
+      .describe('Execution deadline in milliseconds; 0 means no execution deadline. Default 30 minutes. Unlimited remote commands require a current target; old targets refuse rather than silently clamp.'),
     environment: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/u), z.string().max(8_000)).optional(),
     working_directory: z
       .string()
@@ -825,11 +827,13 @@ const startRun = defineTool({
     remote_root_id: z.string().min(1).max(128).optional().describe('remote target: an explicitly granted root id'),
     remote_command: z.string().min(1).max(32_000).optional().describe('remote target: command interpreted by that root environment'),
     remote_cwd: z.string().max(4_096).optional().describe('remote target: relative directory beneath the granted root'),
+    remote_workspace: z.enum(['project', 'machine']).optional()
+      .describe('Default project: prepare/verify the project checkout. Use machine for host administration, Kubernetes, or non-Git work: remote_cwd is relative to the granted root; no checkout preparation or clean-Git requirement.'),
     required_tools: z.array(z.enum(REMOTE_DEVELOPER_TOOLS)).max(15).optional()
       .describe('remote target: developer commands that must exist before the requested command starts'),
     setup_command: z.string().min(1).max(32_000).optional()
       .describe('remote target: exact reviewed project setup recipe; used only when required_tools are missing and recorded as a separate durable prerequisite run'),
-    setup_timeout_ms: z.number().int().min(1_000).max(6 * 60 * 60 * 1_000).optional(),
+    setup_timeout_ms: z.union([z.literal(0), z.number().int().min(1_000).max(MAX_RUN_TIMEOUT_MS)]).optional(),
   },
   run: async (args, { identity, services }) => {
     if (!services.startRun) return 'Run not started: this hub does not support durable runs.'
@@ -843,10 +847,11 @@ const startRun = defineTool({
     if (remoteRequested && args.working_directory !== undefined) {
       return 'Run not started: working_directory is for local application-scoped runs; remote runs use remote_root_id and remote_cwd.'
     }
+    if (!remoteRequested && args.remote_workspace !== undefined) return 'Run not started: remote_workspace requires a remote target.'
     if (args.working_directory !== undefined && args.target_session !== undefined) {
       return 'Run not started: working_directory and target_session are mutually exclusive.'
     }
-    if (!remoteRequested && (args.required_tools?.length || args.setup_command || args.setup_timeout_ms)) {
+    if (!remoteRequested && (args.required_tools?.length || args.setup_command || args.setup_timeout_ms !== undefined)) {
       return 'Run not started: required_tools, setup_command, and setup_timeout_ms are remote-run fields.'
     }
     if (args.setup_command && !args.required_tools?.length) {
@@ -909,6 +914,7 @@ const startRun = defineTool({
             rootId: args.remote_root_id!,
             command: args.setup_command!,
             cwd: args.remote_cwd,
+            workspaceMode: args.remote_workspace,
           },
         })
         if (!setup.ok || !setup.run) {
@@ -934,6 +940,7 @@ const startRun = defineTool({
           rootId: args.remote_root_id!,
           command: args.remote_command!,
           cwd: args.remote_cwd,
+          workspaceMode: args.remote_workspace,
           ...(requiredTools.length ? { requiredTools } : {}),
         },
       } : {}),

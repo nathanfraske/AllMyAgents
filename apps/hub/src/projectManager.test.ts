@@ -1604,6 +1604,31 @@ describe('operator-enabled worker one-shot sub-agents', () => {
 })
 
 describe('project manager visibility into its own workers', () => {
+  it('runs machine operations without preparing Git, even when the local checkout no longer exists', async () => {
+    const { sessions, journal, projects, seed, repo } = buildHub()
+    const project = projects.create('Cluster operations', repo)
+    const worker = seed({ id: 'worker', projectId: project.id, canStartRuns: true,
+      cwd: path.join(repo, 'nonexistent'), worktree: path.join(repo, 'nonexistent'),
+      remoteDeviceGrants: [{ siteId: 'cluster', rootIds: ['root'], capabilities: ['terminal'] }] })
+    const controller = new DurableRunController(new DurableRunStore(journal.db), journal, path.join(path.dirname(repo), 'machine-logs'))
+    sessions.setDurableRunController(controller)
+    cleanups.push(() => controller.shutdown())
+    vi.spyOn(controller as unknown as { pump(): Promise<void> }, 'pump').mockResolvedValue()
+    const prepare = vi.spyOn(sessions as unknown as { ensureRemoteProjectLocation(): Promise<never> }, 'ensureRemoteProjectLocation')
+      .mockRejectedValue(new Error('Git must not be touched for machine operations'))
+    controller.activate()
+    const result = await sessions.managerStartRun(worker.id, { kind: 'custom', executable: '(remote shell)', args: [], timeoutMs: 0,
+      remote: { deviceId: 'cluster', rootId: 'root', command: 'kubectl get pods', workspaceMode: 'machine' } })
+    expect(result).toMatchObject({ ok: true, run: { timeoutMs: 0, executionTarget: { workspaceMode: 'machine' } } })
+    expect(result.run?.provenance.git).toBeUndefined()
+    expect(await sessions.managerStartRun(worker.id, { kind: 'custom', executable: '(remote shell)', args: [], timeoutMs: -1,
+      remote: { deviceId: 'cluster', rootId: 'root', command: 'echo invalid' } }))
+      .toMatchObject({ ok: false, error: expect.stringContaining('timeout_ms') })
+    expect(prepare).not.toHaveBeenCalled()
+    expect(await sessions.managerStartRun(worker.id, { kind: 'custom', executable: '(remote shell)', args: [],
+      remote: { deviceId: 'ungranted', rootId: 'root', command: 'kubectl get pods', workspaceMode: 'machine' } }))
+      .toMatchObject({ ok: false, error: expect.stringContaining('no terminal grant') })
+  })
   it.each(['claude', 'codex'] as const)('lets an operator-granted %s worker run without creating a manager, and revokes immediately', async provider => {
     const { sessions, journal, projects, seed, repo, runTurn } = buildHub()
     const project = projects.create('No manager needed', repo)

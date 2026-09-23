@@ -1510,6 +1510,7 @@ describe('application Overseer authority', () => {
       'risk-box',
       expect.objectContaining({ op: 'exec', timeoutMs: 3_600_000 }),
       expect.objectContaining({ durableRunId: started.run!.id }),
+      expect.any(Function),
     )
     expect(controller.store.get(started.run!.id)).toMatchObject({
       timeoutMs: 3_600_000,
@@ -1612,6 +1613,7 @@ describe('application Overseer authority', () => {
       'risk-box',
       expect.objectContaining({ op: 'inspect', rootId: 'root-home' }),
       expect.objectContaining({ durableRunId: started.run!.id }),
+      expect.any(Function),
     )
     expect(controller.store.get(started.run!.id)).toMatchObject({
       state: 'failed',

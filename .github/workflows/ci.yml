@@ -119,6 +119,15 @@ jobs:
       - name: Bundle — stage the lightweight testbed payload
         run: pnpm run testbed:bundle
 
+      - name: Ubuntu remote-node package and installed command qualification
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          bash -n scripts/install-linux.sh
+          node --test scripts/install-linux.test.mjs
+          node scripts/package-testbed-linux.mjs
+          node scripts/test-linux-testbed.mjs target/linux-testbed/*.deb
+
       # 3. Prove the graph a USER actually gets works — not the one this repo develops against.
       #
       # The repo resolves dependencies with pnpm; the installed app runs plain `npm install` against the

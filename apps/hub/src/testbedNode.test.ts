@@ -13,6 +13,7 @@ import {
   readTestbedBuildIdentity,
   renderLinuxToolchainProfile,
   renderLinuxTestbedService,
+  renderLinuxUserTestbedService,
   sshHostKeyFingerprints,
 } from './testbedNode.js'
 
@@ -29,6 +30,17 @@ afterEach(() => {
 })
 
 describe('lightweight testbed node configuration', () => {
+  it('renders an unrestricted OS-user service without acquiring root or unsafe systemd specifiers', () => {
+    const unit = renderLinuxUserTestbedService({ installRoot: '/usr/lib/allmyagents-testbed',
+      dataDir: '/home/person/space %s', home: '/home/person', socketPath: '/run/myownmesh/daemon.sock', commandPath: '/usr/bin:/bin' })
+    expect(unit).toContain('space %%s')
+    expect(unit).toContain('Restart=on-failure')
+    expect(unit).not.toContain('User=root')
+    expect(unit).not.toContain('ReadOnlyPaths')
+    expect(unit).not.toContain('RuntimeMaxSec')
+    expect(unit).not.toContain('sudo')
+    expect(() => renderLinuxUserTestbedService({ installRoot: '/ok', dataDir: '/bad\nExecStart=bad', home: '/ok', socketPath: '/ok', commandPath: '/usr/bin' })).toThrow(/control characters/)
+  })
   it('fails closed when a scoped node has no explicit roots', () => {
     const dataDir = temporaryRoot()
     expect(() => configureTestbedNode({ dataDir, profile: 'scoped' })).toThrow(/at least one explicit root/u)
