@@ -968,6 +968,23 @@ describe('apply()', () => {
 })
 
 describe('automatic signed-fleet trust', () => {
+  it('never transmits a pairing code or automatically trusts a presence-only device', async () => {
+    const site = {
+      siteId: 'presence-only', label: 'cec-kub', local: false, baseUrl: '',
+      online: false, directOnline: false, discoveryOnly: true,
+      routeError: 'MyOwnMesh control denied access.',
+    }
+    const isolated = new HubStore()
+    isolated.fleetSites = [site]
+    await (isolated as unknown as { autoTrustFleetSite(site: unknown): Promise<void> }).autoTrustFleetSite(site)
+    expect(await isolated.pairFleetSite(site.siteId, 'ABCD1234')).toBe(false)
+    expect(api.pairFleetSiteDirect).not.toHaveBeenCalled()
+    expect(api.pairFleetSiteSite).not.toHaveBeenCalled()
+    expect(api.saveFleetConnection).not.toHaveBeenCalled()
+    expect(localStorage.getItem('test.fleet.presence-only')).toBeNull()
+    expect(isolated.fleetSites[0]?.authError).toBe(site.routeError)
+  })
+
   it('links a direct same-fleet hub with no pairing code and retains its reciprocal credential', async () => {
     const site = {
       siteId: 'peer',

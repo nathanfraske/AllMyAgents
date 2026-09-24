@@ -16,6 +16,35 @@ const localCaps: DeviceExecutorCapabilities = {
 }
 
 describe('device overview', () => {
+  it('shows shared presence as detected, not a confirmed hub or testbed, and clears recovery warnings', async () => {
+    const local: FleetSite = { siteId: 'local', label: 'Controller', local: true, baseUrl: '', online: true }
+    const detected: FleetSite = { siteId: 'ubuntu', label: 'cec-kub', local: false, baseUrl: '', online: false, discoveryOnly: true }
+    const { rerender } = render(DeviceOverview, { props: { fleet: [
+      { ...local, discoveryIssues: [{ source: 'myownmesh', code: 'permission-denied', message: 'MyOwnMesh control pipe denied access.' }] }, detected,
+    ] } })
+    expect(screen.getByRole('alert').textContent).toContain('MyOwnMesh control pipe denied access.')
+    expect(screen.getByText('cec-kub')).toBeTruthy()
+    expect(screen.getByText('detected')).toBeTruthy()
+    expect(screen.getByText('Not yet linked')).toBeTruthy()
+    expect(screen.getByText('1 hubs')).toBeTruthy()
+    expect(screen.getByText('0 testbeds')).toBeTruthy()
+    await rerender({ fleet: [local, { ...detected, discoveryOnly: false, directOnline: true }] })
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByText('detected')).toBeNull()
+    cleanup()
+  })
+
+  it('uses real lightweight capabilities rather than a cached discovery-only diagnosis after linking', () => {
+    const devices = buildDeviceOverview([
+      { siteId: 'riscv', label: 'Risk box', local: false, baseUrl: '', online: false, discoveryOnly: true, routeError: 'Application unconfirmed' },
+    ], null, [{
+      siteId: 'riscv', label: 'Risk box', paired: true, updatedAt: 'now', connected: true,
+      capabilities: { ...localCaps, platform: 'linux', arch: 'riscv64', nodeKind: 'lightweight-testbed' },
+    }])
+    expect(devices[0]).toMatchObject({ roles: ['testbed'], discoveryOnly: false, online: true })
+    expect(devices[0]?.error).toBeUndefined()
+  })
+
   it('merges a paired executor into its fleet hub while keeping lightweight nodes separate', () => {
     const fleet: FleetSite[] = [
       { siteId: 'local', label: 'Desktop', local: true, baseUrl: 'http://127.0.0.1:7777', online: true },

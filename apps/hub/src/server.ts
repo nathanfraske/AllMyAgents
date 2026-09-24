@@ -31,7 +31,8 @@ import { tokenMatches } from './deviceToken.js'
 import { PairingCodeBroker } from './pairingCode.js'
 import { pickFolder } from './native.js'
 import { computeStats } from './stats.js'
-import { buildFleet, probeHubRoute, rosterAuthorizesDevice } from './fleet.js'
+import { buildFleet, probeHubRoute, rosterAuthorizesDevice, type FleetDiscoveryIssue } from './fleet.js'
+import { addFleetDiscovery } from './fleetDiscovery.js'
 import { credentialsExist, type LoginAuthMode } from './loginLauncher.js'
 import type { ProfileLoginCoordinator } from './profileLoginCoordinator.js'
 import { readProjectConfig } from './importScan.js'
@@ -2463,12 +2464,24 @@ export function startServer(opts: ServerOptions): http.Server {
       if (method === 'GET' && url.pathname === '/api/fleet') {
         const m = mesh.status()
         const forceRouteRecovery = url.searchParams.get('refresh') === '1'
+        const discoveryIssues: FleetDiscoveryIssue[] = []
+        const issue = (code: string, error: unknown): void => {
+          discoveryIssues.push({ source: 'allmystuff', code, message: String(error instanceof Error ? error.message : error).slice(0, 2_000) })
+        }
+        const [roster, presence, directPeers] = m.enabled ? await Promise.all([
+          mesh.ownedRosterRequired().catch(error => { issue('roster-unavailable', error); return [] }),
+          mesh.peerSitesRequired().catch(error => { issue('presence-unavailable', error); return [] }),
+          directMesh?.peers(forceRouteRecovery).catch(error => {
+            discoveryIssues.push({ source: 'myownmesh', code: 'control-error', message: String(error).slice(0, 2_000) })
+            return []
+          }) ?? [],
+        ]) : [[], [], []]
         const sites = await buildFleet({
           localSiteId: m.siteId,
           localLabel: m.label,
           localBaseUrl: `http://127.0.0.1:${m.port}`,
-          roster: () => mesh.ownedRoster(),
-          peerSites: () => mesh.peerSites(),
+          roster: async () => roster,
+          peerSites: async () => presence,
           siteMap: (node, p) => mesh.siteMap(node, p),
           // A background roster poll is observational. Destroying and recreating the Site mapping after
           // one slow health response also kills the healthy remote WebSocket that was proving the route
@@ -2488,32 +2501,9 @@ export function startServer(opts: ServerOptions): http.Server {
           probeRoute: (baseUrl) => probeHubRoute(baseUrl, 5000),
           extraPorts: meshPeerPorts,
         })
-        const directPeers = m.enabled
-          ? await directMesh?.peers(forceRouteRecovery).catch(() => []) ?? []
-          : []
-        for (const peer of directPeers) {
-          const existing = sites.find((site) => !site.local && site.siteId === peer.siteId)
-          if (existing) {
-            existing.directOnline = peer.online
-            existing.directStatus = peer.status
-            if (peer.rttMs !== undefined) existing.directRttMs = peer.rttMs
-            continue
-          }
-          sites.push({
-            siteId: peer.siteId,
-            label: peer.label,
-            local: false,
-            baseUrl: '',
-            online: false,
-            directOnline: peer.online,
-            directStatus: peer.status,
-            ...(peer.rttMs === undefined ? {} : { directRttMs: peer.rttMs }),
-            routeError: peer.online
-              ? 'The site-free MyOwnMesh control channel is live, but this peer has no usable TCP Site route for the unified chat view.'
-              : `MyOwnMesh peer state is ${peer.status}; direct hub control is not active.`,
-          })
-        }
-        json(res, sites)
+        json(res, addFleetDiscovery(sites, presence, directPeers, m.enabled
+          ? directMesh?.status() ?? { available: false, method: 'allmyagents.hub.v1', reason: 'not-started' }
+          : undefined, discoveryIssues))
         return
       }
       // Target-side testbed boundary. Device authentication proves the operator paired this hub; the

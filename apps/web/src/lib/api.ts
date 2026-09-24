@@ -1135,7 +1135,9 @@ export interface FleetSite {
   baseUrl: string
   online: boolean
   routeError?: string
-  routeCode?: 'site-map-unavailable' | 'hub-unreachable' | 'hub-unhealthy' | 'route-timeout' | 'route-error'
+  routeCode?: 'site-map-unavailable' | 'hub-unreachable' | 'hub-unhealthy' | 'route-timeout' | 'route-error' | 'discovery-unavailable' | 'application-unconfirmed'
+  discoveryOnly?: boolean
+  discoveryIssues?: Array<{ source: 'allmystuff' | 'myownmesh'; code: string; message: string }>
   directOnline?: boolean
   directStatus?: string
   directRttMs?: number

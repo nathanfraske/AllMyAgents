@@ -198,6 +198,43 @@ describe('MeshSite registration', () => {
   })
 })
 
+describe('MeshSite diagnostic presence reads', () => {
+  it('retains bounded display labels but never maps shared presence', async () => {
+    const request = vi.fn(async () => ({ ok: true, result: { peers: [
+      null,
+      { node: 'ubuntu-SESSION', label: ' cec-kub ', sites: [null] },
+      { node: 'riscv-SESSION', hostname: 'Risk box', sites: [] },
+      { node: 'bad-SESSION', label: 'bad\nlabel', sites: [] },
+      { node: 'long-SESSION', label: 'x'.repeat(500), sites: [] },
+    ] } }))
+    const mesh = new MeshSite({ port: 7777, enable: true, controlRequest: request })
+    const peers = await mesh.peerSitesRequired()
+    expect(peers).toEqual([
+      { device: 'ubuntu-SESSION', label: 'cec-kub', sites: [] },
+      { device: 'riscv-SESSION', label: 'Risk box', sites: [] },
+      { device: 'bad-SESSION', sites: [] },
+      { device: 'long-SESSION', label: 'x'.repeat(200), sites: [] },
+    ])
+    expect(request).toHaveBeenCalledTimes(1)
+    expect(request).toHaveBeenCalledWith('session_snapshot', {}, 4000)
+  })
+
+  it('distinguishes failure and malformed responses from empty success while preserving fail-soft cached readers', async () => {
+    const request = vi.fn()
+      .mockResolvedValueOnce({ ok: true, result: { peers: [] } })
+      .mockResolvedValueOnce({ ok: true, result: { peers: [{ node: 'ubuntu-S', sites: [] }] } })
+      .mockResolvedValueOnce({ ok: false, error: 'control denied' })
+      .mockRejectedValueOnce(new Error('control denied'))
+      .mockResolvedValueOnce({ ok: true, result: {} })
+    const mesh = new MeshSite({ port: 7777, enable: true, controlRequest: request })
+    await expect(mesh.peerSitesRequired()).resolves.toEqual([])
+    await mesh.peerSitesRequired()
+    await expect(mesh.peerSitesRequired()).rejects.toThrow('control denied')
+    await expect(mesh.peerSites()).resolves.toEqual([{ device: 'ubuntu-S', sites: [] }])
+    await expect(mesh.peerSitesRequired()).rejects.toThrow('invalid peer directory')
+  })
+})
+
 describe('MeshSite route recovery', () => {
   it('automatically maps presence-advertised AllMyAgents hubs on owned devices', async () => {
     const mapped: Array<[string, number]> = []

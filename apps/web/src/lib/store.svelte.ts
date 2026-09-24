@@ -1678,7 +1678,7 @@ export class HubStore {
   }
 
   private async autoTrustFleetSite(site: FleetSite): Promise<void> {
-    if ((!site.directOnline && !site.online) || getFleetSiteToken(site.siteId)) return
+    if (site.discoveryOnly || (!site.directOnline && !site.online) || getFleetSiteToken(site.siteId)) return
     const now = Date.now()
     if ((this.fleetAutoTrustRetryAt.get(site.siteId) ?? 0) > now) return
     let result = site.directOnline
@@ -1710,6 +1710,12 @@ export class HubStore {
   /** Pair (or replace) one remote hub credential, then retry discovery immediately. */
   async pairFleetSite(siteId: string, token: string): Promise<boolean> {
     const site = this.fleetSites.find((candidate) => candidate.siteId === siteId && !candidate.local)
+    if (site?.discoveryOnly) {
+      site.authState = 'error'
+      site.authError = site.routeError ?? 'This device was detected, but has no confirmed AllMyAgents control route. Refresh after repairing discovery; no pairing code has been sent.'
+      this.fleetSites = [...this.fleetSites]
+      return false
+    }
     if (!site || (!token.trim() && !site.directOnline && !site.online)) return false
     const supplied = token.trim()
     if (!site.online && !site.directOnline && !looksLikePairingCode(supplied)) {

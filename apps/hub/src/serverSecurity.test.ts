@@ -48,7 +48,7 @@ afterEach(async () => {
   while (cleanups.length) await cleanups.pop()?.()
 })
 
-async function build(overrides: Partial<Pick<ServerOptions, 'mesh' | 'meshPeerPorts' | 'remoteDevices'>> = {}) {
+async function build(overrides: Partial<Pick<ServerOptions, 'mesh' | 'meshPeerPorts' | 'remoteDevices' | 'directMesh'>> = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-server-security-'))
   const journal = new Journal(path.join(root, 'hub.db'))
   const projects = new ProjectStore(journal.db)
@@ -144,6 +144,7 @@ async function build(overrides: Partial<Pick<ServerOptions, 'mesh' | 'meshPeerPo
     } as never,
     ...(overrides.meshPeerPorts ? { meshPeerPorts: overrides.meshPeerPorts } : {}),
     ...(overrides.remoteDevices ? { remoteDevices: overrides.remoteDevices } : {}),
+    ...(overrides.directMesh ? { directMesh: overrides.directMesh } : {}),
     deviceToken,
     // The old control plane failed open in precisely this configuration.
     requireToken: false,
@@ -197,6 +198,43 @@ async function build(overrides: Partial<Pick<ServerOptions, 'mesh' | 'meshPeerPo
 function auth(token: string): HeadersInit {
   return { authorization: `Bearer ${token}` }
 }
+
+describe('shared device discovery', () => {
+  it('reports a denied direct lane and shared presence without mapping, probing or pairing that peer', async () => {
+    const siteMap = vi.fn()
+    const recoverSiteMap = vi.fn()
+    const call = vi.fn()
+    const ownedRosterRequired = vi.fn(async () => [])
+    const peerSitesRequired = vi.fn(async () => [{ device: 'ubuntu-SESSION', label: 'cec-kub', sites: [{ id: 'tcp:7777', label: 'AllMyAgents', port: 7777 }] }])
+    const peers = vi.fn(async () => [])
+    const f = await build({
+      mesh: {
+        status: () => ({ enabled: true, siteId: 'local', label: 'Controller', port: 7777 }),
+        ownedRosterRequired, peerSitesRequired, siteMap, recoverSiteMap,
+      } as never,
+      directMesh: { peers, call, setHandler: vi.fn(), status: () => ({ available: false, method: 'allmyagents.hub.v1', reason: 'permission-denied' }) } as never,
+    })
+    const unauthenticated = await fetch(`${f.base}/api/fleet`)
+    expect(unauthenticated.status).toBe(401)
+    expect(ownedRosterRequired).not.toHaveBeenCalled()
+    const response = await fetch(`${f.base}/api/fleet?refresh=1`, { headers: auth(f.deviceToken) })
+    expect(response.status).toBe(200)
+    const sites = await response.json()
+    expect(sites).toHaveLength(2)
+    expect(sites[0].discoveryIssues).toEqual([expect.objectContaining({ source: 'myownmesh', code: 'permission-denied' })])
+    expect(sites[1]).toMatchObject({ siteId: 'ubuntu', label: 'cec-kub', baseUrl: '', discoveryOnly: true, online: false, directOnline: false })
+    expect(siteMap).not.toHaveBeenCalled()
+    expect(recoverSiteMap).not.toHaveBeenCalled()
+    expect(call).not.toHaveBeenCalled()
+    expect(peers).toHaveBeenCalledWith(true)
+
+    ownedRosterRequired.mockRejectedValueOnce(new Error('roster denied'))
+    peerSitesRequired.mockRejectedValueOnce(new Error('presence denied'))
+    const degraded = await fetch(`${f.base}/api/fleet`, { headers: auth(f.deviceToken) }).then(r => r.json())
+    expect(degraded).toHaveLength(1)
+    expect(degraded[0].discoveryIssues.map((issue: { code: string }) => issue.code).sort()).toEqual(['permission-denied', 'presence-unavailable', 'roster-unavailable'])
+  })
+})
 
 describe('account model discovery', () => {
   it('does not block profile reads on automatic discovery, and deduplicates manual refresh', async () => {
