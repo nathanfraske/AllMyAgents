@@ -1,0 +1,43 @@
+name: Fleet local release qualification
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux-package:
+    if: github.repository == 'nathanfraske/AllMyAgents' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, Linux, X64, test-fleet, linux-docker-x64]
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: f856ae5693db41dd7cbb02399fa80c01d4c95fd3
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.3'
+      - name: Verify native repository runner and persistent cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = nathanfraske/AllMyAgents
+          test "$(git rev-parse HEAD)" = f856ae5693db41dd7cbb02399fa80c01d4c95fd3
+          test "$RUNNER_TOOL_CACHE" = /var/cache/test-fleet/toolcache
+          test "$(cat /var/cache/test-fleet/cache-survival-marker)" = 0244d049-ffcd-4d14-8e8d-7ba774af9d18
+          printf 'Native repository=%s runner=%s cpus=%s\n' "$GITHUB_REPOSITORY" "$RUNNER_NAME" "$(nproc)"
+      - name: Qualify the original Linux release package
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm run testbed:bundle
+          bash -n scripts/install-linux.sh
+          node --test scripts/install-linux.test.mjs
+          node scripts/package-testbed-linux.mjs
+          node scripts/test-linux-testbed.mjs target/linux-testbed/*.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fleet-linux-x64-f856ae5
+          path: target/linux-testbed/*.deb*
+          if-no-files-found: error
