@@ -1360,6 +1360,94 @@ describe('application Overseer authority', () => {
     }))
   })
 
+  it('authorizes a new testbed without rechecking an unchanged offline device grant', async () => {
+    const h = harness()
+    const oldGrant = { siteId: 'offline-k3', rootIds: ['machine'], capabilities: ['read', 'write', 'terminal'] as const }
+    h.seed({ id: 'chat', remoteDeviceGrants: [{ ...oldGrant, capabilities: [...oldGrant.capabilities] }] })
+    const capabilities = vi.fn(async (siteId: string) => {
+      if (siteId === 'offline-k3') throw new Error('This paired device is not present in the signed AllMyStuff fleet roster.')
+      return { enabled: true, platform: 'linux', arch: 'x64', hostname: 'cec-kub',
+        roots: [{ id: 'machine', label: 'Machine', path: '/', read: true, write: true, terminal: true }] }
+    })
+    h.sessions.setRemoteDeviceController({ capabilities } as unknown as RemoteDeviceController)
+
+    const result = await h.sessions.authorizeRemoteTestbed('chat', 'cec-kub')
+
+    expect(result.record.remoteDeviceGrants).toEqual([
+      oldGrant, { siteId: 'cec-kub', rootIds: ['machine'], capabilities: ['read', 'write', 'terminal'] },
+    ])
+    expect(capabilities.mock.calls.map(([siteId]) => siteId)).not.toContain('offline-k3')
+    expect(h.store.all().find((record) => record.id === 'chat')?.remoteDeviceGrants).toEqual(result.record.remoteDeviceGrants)
+  })
+
+  it('can revoke one device and narrow another while both devices are offline', async () => {
+    const h = harness()
+    h.seed({ id: 'chat', remoteDeviceGrants: [
+      { siteId: 'keep', rootIds: ['a', 'b'], capabilities: ['read', 'write'] },
+      { siteId: 'remove', rootIds: ['a'], capabilities: ['read'] },
+    ] })
+    const capabilities = vi.fn(async () => { throw new Error('offline') })
+    h.sessions.setRemoteDeviceController({ capabilities } as unknown as RemoteDeviceController)
+    const narrowed = [{ siteId: 'keep', rootIds: ['a'], capabilities: ['read'] as const }]
+
+    await expect(h.sessions.configureRemoteDeviceGrants('chat', narrowed.map(grant => ({ ...grant, capabilities: [...grant.capabilities] }))))
+      .resolves.toMatchObject({ remoteDeviceGrants: narrowed })
+
+    expect(capabilities).not.toHaveBeenCalled()
+    expect(h.store.all().find(record => record.id === 'chat')?.remoteDeviceGrants).toEqual(narrowed)
+  })
+
+  it.each([
+    { siteId: 'new-device', rootIds: ['a'], capabilities: ['read'] },
+    { siteId: 'offline', rootIds: ['new-root'], capabilities: ['read'] },
+    { siteId: 'offline', rootIds: ['a'], capabilities: ['terminal'] },
+    // Capabilities held on a different root are not authority on this root.
+    { siteId: 'offline', rootIds: ['a', 'b'], capabilities: ['read', 'write'] },
+  ] as const)('requires a live target for expanded grants: %j', async (requested) => {
+    const h = harness()
+    const record = h.seed({ id: 'chat', remoteDeviceGrants: [
+      { siteId: 'offline', rootIds: ['a'], capabilities: ['read'] },
+      { siteId: 'offline', rootIds: ['b'], capabilities: ['write'] },
+    ] })
+    const before = structuredClone(record.remoteDeviceGrants)
+    const capabilities = vi.fn(async () => { throw new Error('offline: cannot admit new authority') })
+    h.sessions.setRemoteDeviceController({ capabilities } as unknown as RemoteDeviceController)
+
+    await expect(h.sessions.configureRemoteDeviceGrants('chat', [{
+      ...requested, rootIds: [...requested.rootIds], capabilities: [...requested.capabilities],
+    }])).rejects.toThrow('cannot admit new authority')
+
+    expect(capabilities).toHaveBeenCalledWith(requested.siteId)
+    expect(record.remoteDeviceGrants).toEqual(before)
+    expect(h.journal.recentEventsForSession('chat', 10).filter(event => event.kind === 'session/remote-device-grants')).toEqual([])
+  })
+
+  it('does not restore concurrently revoked grants after a slow capability check', async () => {
+    const h = harness()
+    h.seed({ id: 'chat', remoteDeviceGrants: [
+      { siteId: 'old', rootIds: ['a'], capabilities: ['read'] },
+    ] })
+    let finish!: () => void
+    const pending = new Promise<void>(resolve => { finish = resolve })
+    const capabilities = vi.fn(async () => {
+      await pending
+      return { enabled: true, platform: 'linux', arch: 'x64', hostname: 'new',
+        roots: [{ id: 'a', label: 'Root', path: '/', read: true, write: false, terminal: false }] }
+    })
+    h.sessions.setRemoteDeviceController({ capabilities } as unknown as RemoteDeviceController)
+    const saving = h.sessions.configureRemoteDeviceGrants('chat', [
+      { siteId: 'old', rootIds: ['a'], capabilities: ['read'] },
+      { siteId: 'new', rootIds: ['a'], capabilities: ['read'] },
+    ])
+    const rejected = expect(saving).rejects.toThrow('permissions changed while saving')
+
+    await h.sessions.configureRemoteDeviceGrants('chat', [])
+    finish()
+    await rejected
+
+    expect(h.store.all().find(record => record.id === 'chat')?.remoteDeviceGrants).toBeUndefined()
+  })
+
   it('requires configured scope, a separate operator approval, and the elevation runner', async () => {
     const h = harness()
     h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })

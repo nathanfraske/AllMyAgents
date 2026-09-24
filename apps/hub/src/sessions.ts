@@ -2226,11 +2226,36 @@ export class SessionManager {
     if (!record) throw new Error('session not found')
     if (!this.remoteDeviceController) throw new Error('remote device service is unavailable')
     if (!Array.isArray(requested) || requested.length > 32) throw new Error('remote device grants must be a bounded array')
+    const previousGrants = structuredClone(record.remoteDeviceGrants ?? [])
+    const previousSnapshot = JSON.stringify(previousGrants)
     const grants: RemoteDeviceGrant[] = []
     const capabilitiesBySite = new Map<string, DeviceExecutorCapabilities>()
     for (const raw of requested) {
       if (!raw || typeof raw.siteId !== 'string' || raw.siteId.length === 0 || raw.siteId.length > 256) {
         throw new Error('remote device grant has an invalid site id')
+      }
+      if (!Array.isArray(raw.rootIds) || !Array.isArray(raw.capabilities)) {
+        throw new Error('remote device grant roots and capabilities must be arrays')
+      }
+      const rootIds = [...new Set(raw.rootIds ?? [])]
+      if (!rootIds.length || rootIds.length > 64 || rootIds.some((id) => typeof id !== 'string' || !id)) {
+        throw new Error(`remote device ${raw.siteId} grant contains an unknown root`)
+      }
+      const requestedCapabilities = [...new Set(raw.capabilities ?? [])]
+      const allowedCapabilities = new Set<RemoteDeviceCapability>(['read', 'write', 'terminal'])
+      if (!requestedCapabilities.length || requestedCapabilities.some((capability) => !allowedCapabilities.has(capability))) {
+        throw new Error(`remote device ${raw.siteId} grant contains an invalid capability`)
+      }
+      // Retaining or narrowing saved authority needs no new target admission. Otherwise an unrelated
+      // offline device blocks every save, including removing another grant. Every new root/capability
+      // still requires live validation, and execution always intersects grants with target policy.
+      const retained = rootIds.every((rootId) => requestedCapabilities.every((capability) =>
+        previousGrants.some((grant) => grant.siteId === raw.siteId &&
+          grant.rootIds.includes(rootId) && grant.capabilities.includes(capability)),
+      ))
+      if (retained) {
+        grants.push({ siteId: raw.siteId, rootIds, capabilities: requestedCapabilities })
+        continue
       }
       let capabilities = capabilitiesBySite.get(raw.siteId)
       if (!capabilities) {
@@ -2239,14 +2264,8 @@ export class SessionManager {
       }
       if (!capabilities.enabled) throw new Error(`remote device ${raw.siteId} has testbed access disabled`)
       const validRoots = new Set(capabilities.roots.map((root) => root.id))
-      const rootIds = [...new Set(raw.rootIds ?? [])]
-      if (!rootIds.length || rootIds.length > 64 || rootIds.some((id) => !validRoots.has(id))) {
+      if (rootIds.some((id) => !validRoots.has(id))) {
         throw new Error(`remote device ${raw.siteId} grant contains an unknown root`)
-      }
-      const requestedCapabilities = [...new Set(raw.capabilities ?? [])]
-      const allowedCapabilities = new Set<RemoteDeviceCapability>(['read', 'write', 'terminal'])
-      if (!requestedCapabilities.length || requestedCapabilities.some((capability) => !allowedCapabilities.has(capability))) {
-        throw new Error(`remote device ${raw.siteId} grant contains an invalid capability`)
       }
       for (const rootId of rootIds) {
         const root = capabilities.roots.find((item) => item.id === rootId)!
@@ -2255,6 +2274,9 @@ export class SessionManager {
         }
       }
       grants.push({ siteId: raw.siteId, rootIds, capabilities: requestedCapabilities })
+    }
+    if (this.sessions.get(sessionId) !== record || JSON.stringify(record.remoteDeviceGrants ?? []) !== previousSnapshot) {
+      throw new Error('Remote device permissions changed while saving; refresh the chat permissions and try again.')
     }
     record.remoteDeviceGrants = grants.length ? grants : undefined
     this.persist(record)

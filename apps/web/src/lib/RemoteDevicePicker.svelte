@@ -17,6 +17,7 @@
   let saving = $state(false)
   let authorizing = $state('')
   let error = $state('')
+  let errorSiteId = $state('')
   let catalog = $state<RemoteDeviceCatalogEntry[]>([])
   let selected = $state<Record<string, RemoteDeviceCapability[]>>({})
 
@@ -49,6 +50,7 @@
     open = true
     loading = true
     error = ''
+    errorSiteId = ''
     catalog = []
     try {
       const value = await api.remoteDeviceCatalog(sessionId)
@@ -83,6 +85,7 @@
   async function authorize(device: RemoteDeviceCatalogEntry): Promise<void> {
     authorizing = device.siteId
     error = ''
+    errorSiteId = device.siteId
     try {
       const result = await api.authorizeRemoteDevice(sessionId, device.siteId)
       if ('error' in result) {
@@ -101,6 +104,7 @@
   async function revokeDevice(siteId: string): Promise<void> {
     saving = true
     error = ''
+    errorSiteId = siteId
     try {
       const result = await api.setRemoteDeviceGrants(sessionId, grants.filter((grant) => grant.siteId !== siteId))
       if ('error' in result) {
@@ -119,6 +123,7 @@
   async function save(clear = false): Promise<void> {
     saving = true
     error = ''
+    errorSiteId = ''
     const next: RemoteDeviceGrant[] = []
     if (!clear) {
       for (const device of catalog) {
@@ -189,6 +194,7 @@
                   </button>
                 {/if}
               </div>
+              {#if error && errorSiteId === device.siteId}<div class="error" role="alert">{error}</div>{/if}
               <details class="advanced">
                 <summary>Advanced root controls</summary>
                 {#each device.capabilities?.roots ?? [] as root (root.id)}
@@ -210,7 +216,7 @@
           {/each}
         </div>
       {/if}
-      {#if error}<div class="error" role="alert">{error}</div>{/if}
+      {#if error && !errorSiteId}<div class="error" role="alert">{error}</div>{/if}
       <div class="actions">
         {#if grants.length}<button class="revoke" disabled={saving || authorizing !== ''} onclick={() => save(true)}>Revoke all</button>{/if}
         <button class="save" disabled={saving || authorizing !== '' || loading || !catalog.length} onclick={() => save(false)}>{saving ? 'Saving...' : 'Save advanced changes'}</button>

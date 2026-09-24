@@ -74,6 +74,23 @@ describe('RemoteDevicePicker', () => {
     expect((screen.getByLabelText('terminal') as HTMLInputElement).disabled).toBe(true)
   })
 
+  it('shows an authorization failure beside the clicked device without pretending it saved', async () => {
+    apiMock.authorizeRemoteDevice.mockResolvedValue({ error: 'Old paired device is offline; permission save failed.' })
+    const onchange = vi.fn()
+    render(RemoteDevicePicker, { props: { sessionId: 'session-a', grants: [], onchange } })
+    await fireEvent.click(screen.getByTitle('Remote testbed access'))
+    await screen.findByText('Linux lab')
+    const button = screen.getByRole('button', { name: 'Authorize testbed' })
+    await fireEvent.click(button)
+
+    const error = await screen.findByRole('alert')
+    expect(error.textContent).toContain('permission save failed')
+    expect(error.closest('.device')).toBe(button.closest('.device'))
+    expect(onchange).not.toHaveBeenCalled()
+    expect(screen.queryByText('Full testbed access is saved for this chat.')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Authorize testbed' })).toBeTruthy()
+  })
+
   it('keeps unsaved checkbox edits when a chat refresh supplies equivalent grants', async () => {
     const existing: RemoteDeviceGrant = { siteId: 'device-a', rootIds: ['root-a'], capabilities: ['read'] }
     const { rerender } = render(RemoteDevicePicker, { props: { sessionId: 'session-a', grants: [existing] } })
