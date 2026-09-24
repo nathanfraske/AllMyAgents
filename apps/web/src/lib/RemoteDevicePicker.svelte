@@ -23,7 +23,10 @@
   const keyOf = (siteId: string, rootId: string): string => `${siteId}\u0000${rootId}`
   const grantCount = $derived(Object.values(selected).filter((capabilities) => capabilities.length > 0).length)
 
-  $effect(() => {
+  // Chat reconciliation replaces grant arrays every five seconds. Compare their effective content,
+  // not array identity, so a refresh cannot erase an operator's unsaved checkbox edits. Real saved
+  // grant changes (including revocation), and switching chats, must still replace the local draft.
+  const savedSelectionKey = $derived.by(() => {
     const next: Record<string, RemoteDeviceCapability[]> = {}
     for (const grant of grants) {
       for (const rootId of grant.rootIds) {
@@ -31,7 +34,15 @@
         next[key] = [...new Set([...(next[key] ?? []), ...grant.capabilities])]
       }
     }
-    selected = next
+    const entries = Object.entries(next)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, capabilities]) => [key, capabilities.sort()])
+    return JSON.stringify({ sessionId, entries })
+  })
+
+  $effect(() => {
+    const snapshot = JSON.parse(savedSelectionKey) as { entries: [string, RemoteDeviceCapability[]][] }
+    selected = Object.fromEntries(snapshot.entries)
   })
 
   async function show(): Promise<void> {
