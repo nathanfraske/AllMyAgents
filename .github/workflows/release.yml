@@ -168,7 +168,7 @@ jobs:
   release:
     name: build (${{ matrix.platform }})
     needs: launch-and-repair-gate
-    runs-on: ${{ matrix.platform }}
+    runs-on: ${{ matrix.platform == 'windows-latest' && fromJSON('["self-hosted","Windows","X64","test-fleet","windows-native-x64"]') || matrix.platform }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -190,6 +190,11 @@ jobs:
         platform: [macos-latest, macos-15-intel, windows-latest]
 
     steps:
+      - name: Prepare the reviewed local Windows release toolchain
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: '& C:\actions-runner\fleet\release-v1\setup_windows_release.ps1'
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -201,6 +206,15 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+
+      - name: Configure the local Windows build cache and concurrency
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $values=& node --input-type=module -e "import {currentBudget,jobEnvironment} from 'file:///C:/actions-runner/fleet/release-v1/resources_job.mjs';const b=currentBudget();for(const [k,v] of Object.entries(jobEnvironment(b)))console.log(k+'='+v)"
+          if($LASTEXITCODE -ne 0){throw 'Resource allocation failed'}
+          $values+='CARGO_TARGET_DIR=D:\TestFleetCache\release-targets\allmyagents'
+          foreach($line in $values){[IO.File]::AppendAllText($env:GITHUB_ENV,$line+[Environment]::NewLine,[Text.UTF8Encoding]::new($false))}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -384,6 +398,13 @@ jobs:
       # bundle.createUpdaterArtifacts is true and the signing key is present, also emits the SIGNED
       # updater artifacts and (with includeUpdaterJson) the latest.json manifest — all uploaded to a
       # GitHub pre-release.
+      - name: Place Windows bundling tools outside the SYSTEM profile
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $path=Join-Path $env:GITHUB_WORKSPACE 'apps/desktop/fleet-release-config.json'
+          [IO.File]::WriteAllText($path,'{"bundle":{"useLocalToolsDir":true}}',[Text.UTF8Encoding]::new($false))
+
       - name: Build, sign, and publish (tauri-action)
         uses: tauri-apps/tauri-action@v0
         env:
@@ -394,6 +415,7 @@ jobs:
           # would define it as an empty string again and resurrect the codesign failure described above.
         with:
           projectPath: apps/desktop
+          args: ${{ runner.os == 'Windows' && '--config fleet-release-config.json' || '' }}
           tagName: ${{ github.ref_name }}
           releaseName: 'AllMyAgents ${{ github.ref_name }}'
           releaseBody: ${{ steps.release_notes.outputs.body }}
