@@ -51,6 +51,11 @@ import {
 } from './elevatedCommand.js'
 import { TeamPresetStore, type TeamPreset } from './teamPresets.js'
 import {
+  applyOverseerApprovalPolicyUpdate,
+  approvalRequesterAllowed,
+  type OverseerApprovalPolicyUpdate,
+} from './overseerApprovalPolicy.js'
+import {
   classifyGitHubAutomationApproval,
   GitHubAutomationPolicyStore,
   normalizeGitHubAutomationCapabilities,
@@ -717,10 +722,7 @@ export interface OverseerRuntimeServices {
   elevatedRunner?: ElevatedCommandRunner
   overseerConfig?: () => OverseerConfig
   configureOverseerMode?: (update: OverseerModeUpdate) => OverseerConfig
-  configureOverseerApprovalPolicy?: (input: {
-    enabled: boolean
-    maxRisk: 'low' | 'medium'
-  }) => OverseerConfig
+  configureOverseerApprovalPolicy?: (input: OverseerApprovalPolicyUpdate) => OverseerConfig
 }
 
 interface ProfileAdmissionLease {
@@ -2819,10 +2821,18 @@ export class SessionManager {
           if (input.approvalPolicyEnabled === undefined) {
             throw new Error('approval_policy_enabled is required for configure_approval_policy')
           }
-          const config = this.overseerRuntime.configureOverseerApprovalPolicy({
+          const proposed = applyOverseerApprovalPolicyUpdate(this.overseerRuntime.overseerConfig?.() ?? {}, {
             enabled: input.approvalPolicyEnabled,
             maxRisk: input.approvalRiskCeiling ?? 'low',
+            requesterSessionIds: input.approvalRequesterSessionIds,
           })
+          for (const id of proposed.approvalPolicy?.enabled ? proposed.approvalPolicy.requesterSessionIds ?? [] : []) {
+            const requester = this.sessions.get(id)
+            if (!requester || requester.isOverseer === true) {
+              throw new Error(`approval requester scope requires an existing non-Overseer session: ${id}`)
+            }
+          }
+          const config = this.overseerRuntime.configureOverseerApprovalPolicy(proposed.approvalPolicy!)
           this.materializeSessionInstructions(overseer)
           this.journal.append(overseerSessionId, 'overseer/approval-policy-changed', {
             policy: config.approvalPolicy,
@@ -2991,10 +3001,17 @@ export class SessionManager {
             if (policy?.enabled !== true) {
               throw new Error('The operator has not enabled standing Overseer approval decisions.')
             }
+            if (!approvalRequesterAllowed(policy, pending.sessionId)) {
+              throw new Error('This requester is outside the operator-configured standing approval scope.')
+            }
             if (!risk || (risk.level === 'medium' && policy.maxRisk !== 'medium')) {
               throw new Error(
                 `This approval is outside the standing Overseer risk ceiling (${risk?.level ?? 'high-or-unknown'}).`,
               )
+            }
+            if (Object.hasOwn(policy, 'requesterSessionIds')) {
+              const error = this.scopedStandingApprovalError(pending)
+              if (error) throw new Error(error)
             }
           }
           if (!this.approvals.resolve(approvalId, input.approve === true, {
@@ -3010,6 +3027,9 @@ export class SessionManager {
             risk: risk?.level ?? 'high-or-unknown',
             riskReason: risk?.reason ?? 'request class was not eligible for standing approval',
             persist: persist ?? null,
+            ...(alertDecision ? {
+              requesterScope: this.overseerRuntime.overseerConfig?.()?.approvalPolicy?.requesterSessionIds ?? 'legacy-unscoped',
+            } : {}),
           })
           this.journal.append(pending.sessionId, 'operator/approval-decided', {
             approvalId,
@@ -7964,6 +7984,50 @@ export class SessionManager {
     if (manager.status === 'idle') this.deliverBus(manager.id)
   }
 
+  /** Requester-scoped delegation is a reviewer boundary, never a new tool/repo/device grant. */
+  private scopedStandingApprovalError(approval: ApprovalRecord): string | undefined {
+    const requester = this.sessions.get(approval.sessionId)
+    if (!requester || requester.status === 'stopped') return 'Approval requester is unavailable.'
+    const github = classifyGitHubAutomationApproval(approval.kind, approval.payload)
+    if (github) {
+      const project = requester.projectId ? this.projects.get(requester.projectId) : undefined
+      if (!project || !githubRequestMatchesProject(requester, project, github.repository, github.transport)) {
+        return 'GitHub request is outside the requester project repository boundary.'
+      }
+      const granted = this.githubAutomationPolicies.get('session', requester.id).capabilities.includes(github.capability) ||
+        this.githubAutomationPolicies.get('project', project.id).capabilities.includes(github.capability)
+      return granted ? undefined : 'GitHub request is outside the live requester automation capability ceiling.'
+    }
+    const tool = delegableToolName(approval.kind, approval.payload)
+    // A Write/Edit label is not proof that its body is non-destructive (workflows/scripts/config
+    // can execute later). This new narrow policy does not inherit that legacy risk shortcut.
+    if (!tool || !LOW_RISK_APPROVAL_TOOLS.has(tool)) {
+      return 'This request has no non-destructive scoped classification; file bodies require the operator.'
+    }
+    if (requester.isProjectManager && !managerToolGrantCovers(requester.managerAllowedTools, tool)) {
+      return 'This tool is outside the requester manager tool ceiling.'
+    }
+    const managerId = requester.managerRootSessionId ?? requester.parentSessionId
+    if (managerId) {
+      const manager = this.sessions.get(managerId)
+      if (!manager || manager.isProjectManager !== true || manager.projectId !== requester.projectId ||
+        !this.managerApprovalCapability(manager, requester, approval).ok ||
+        (requester.delegatedTools !== undefined && !managerToolGrantCovers(requester.delegatedTools, tool)) ||
+        (requester.isOneShotSubagent && !managerToolGrantCovers(this.sessions.get(requester.parentSessionId ?? '')?.delegatedTools, tool))) {
+        return 'This tool is outside the requester live delegated tool ceiling.'
+      }
+    }
+    if (tool.startsWith('remote_')) {
+      const input = (approval.payload as { input?: { device_id?: unknown; root_id?: unknown } })?.input
+      if (!input || typeof input.device_id !== 'string' || typeof input.root_id !== 'string' ||
+        !requester.remoteDeviceGrants?.some(grant => grant.siteId === input.device_id &&
+          grant.rootIds.includes(input.root_id as string) && grant.capabilities.includes('read'))) {
+        return 'Remote request is outside the requester live device/root/read grant.'
+      }
+    }
+    return undefined
+  }
+
   private reportApprovalToOverseer(
     approval: ApprovalRecord,
     requester: SessionRecord,
@@ -7993,9 +8057,9 @@ export class SessionManager {
         ? ' The requester is itself a project manager.'
         : ' No capable direct manager is available.'
     const standingPolicy = this.overseerRuntime.overseerConfig?.()?.approvalPolicy
-    const decisionGuidance = standingPolicy?.enabled === true
-      ? `This exact alert-bound request may be decided in this turn only if its classified risk is within the configured ${standingPolicy.maxRisk} ceiling; otherwise surface it to the operator.`
-      : 'Surface this pending request to the operator. Standing Overseer approval decisions are disabled, so only a direct operator turn may decide it.'
+    const decisionGuidance = approvalRequesterAllowed(standingPolicy, requester.id)
+      ? `This exact alert-bound request may be decided in this turn only if its classified risk is within the configured ${standingPolicy!.maxRisk} ceiling and its live tool/repository/device bounds; arbitrary file bodies and workflow changes remain operator-only under requester-scoped policy.`
+      : 'Surface this pending request to the operator. Standing decisions are disabled or this requester is outside their scope; only a direct operator turn may decide it.'
     const body =
       `${label} (${requester.id}) is waiting on approval ${approval.id} for ${requested}. Current status: pending.${managerReason} ` +
       decisionGuidance

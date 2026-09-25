@@ -71,6 +71,7 @@ import {
   type OverseerModeUpdate,
 } from './overseerMode.js'
 import type { MyOwnMeshRpcBridge } from './myOwnMeshRpc.js'
+import { applyOverseerApprovalPolicyUpdate, type OverseerApprovalPolicyUpdate } from './overseerApprovalPolicy.js'
 import type { TestbedDeploymentService } from './testbedDeployment.js'
 import {
   EphemeralNotificationService,
@@ -635,19 +636,8 @@ export function startServer(opts: ServerOptions): http.Server {
     sessions.refreshOverseerInstructions()
     return next
   }
-  const configureOverseerApprovalPolicy = (input: {
-    enabled: boolean
-    maxRisk: 'low' | 'medium'
-  }): OverseerConfig => {
-    const next: OverseerConfig = {
-      ...overseer,
-      approvalPolicy: {
-        enabled: input.enabled,
-        maxRisk: input.maxRisk,
-        updatedAt: new Date().toISOString(),
-      },
-      updatedAt: new Date().toISOString(),
-    }
+  const configureOverseerApprovalPolicy = (input: OverseerApprovalPolicyUpdate): OverseerConfig => {
+    const next = applyOverseerApprovalPolicyUpdate(overseer, input)
     const persistError = patchConfig(configPath, 'overseer', next)
     if (persistError) throw new Error(`Overseer approval policy could not be persisted: ${persistError}`)
     Object.assign(overseer, next)

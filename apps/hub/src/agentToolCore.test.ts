@@ -197,6 +197,17 @@ function makeHarness(opts: {
 }
 
 describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)', () => {
+  it('passes an exact requester scope through the provider-neutral Overseer control schema', async () => {
+    const h = makeHarness()
+    h.services.overseerControl = vi.fn(async () => ({ ok: true }))
+    await runAgentTool('overseer_control', {
+      operation: 'configure_approval_policy', approval_policy_enabled: true,
+      approval_risk_ceiling: 'medium', approval_requester_session_ids: ['arnold'],
+    }, { identity: idA, services: h.services })
+    expect(h.services.overseerControl).toHaveBeenCalledWith('s1', expect.objectContaining({
+      approvalPolicyEnabled: true, approvalRiskCeiling: 'medium', approvalRequesterSessionIds: ['arnold'],
+    }))
+  })
   it('exposes the manager tools alongside the existing provider-agnostic tools', () => {
     expect(AGENT_TOOLS.map((t) => t.name)).toEqual([
       'list_agents',

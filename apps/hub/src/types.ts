@@ -712,6 +712,8 @@ export interface OverseerApprovalPolicy {
   enabled: boolean
   /** Unknown/high-risk requests are never eligible, so the ceiling cannot be configured to high. */
   maxRisk: OverseerApprovalRisk
+  /** Exact requester sessions only. Empty means none; absent preserves a pre-existing legacy policy. */
+  requesterSessionIds?: string[]
   updatedAt?: string
 }
 

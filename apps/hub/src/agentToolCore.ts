@@ -97,6 +97,7 @@ export interface OverseerControlInput {
   persist?: ApprovalPersistence
   approvalPolicyEnabled?: boolean
   approvalRiskCeiling?: 'low' | 'medium'
+  approvalRequesterSessionIds?: string[]
   reauth?: boolean
   provider?: Provider
   permissionMode?: 'safe' | 'edits' | 'full'
@@ -1727,6 +1728,8 @@ const overseerControl = defineTool({
       .describe('approve only: explicitly persist a Codex connector elicitation for this vendor session or always; omitted means one-shot'),
     approval_policy_enabled: z.boolean().optional(),
     approval_risk_ceiling: z.enum(['low', 'medium']).optional(),
+    approval_requester_session_ids: z.array(z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/u)).max(32).optional()
+      .describe('configure_approval_policy: exact requester session allowlist, required on first enable; [] delegates nobody. Omission preserves an existing scoped list. No wildcard/global enable. Does not grant tools, repositories or devices.'),
     reauth: z.boolean().optional(),
     provider: z.enum(['claude', 'codex']).optional(),
     permission_mode: overseerPermissionMode.optional(),
@@ -1785,6 +1788,7 @@ const overseerControl = defineTool({
       persist: args.persist,
       approvalPolicyEnabled: args.approval_policy_enabled,
       approvalRiskCeiling: args.approval_risk_ceiling,
+      approvalRequesterSessionIds: args.approval_requester_session_ids,
       reauth: args.reauth,
       provider: args.provider,
       permissionMode: args.permission_mode,

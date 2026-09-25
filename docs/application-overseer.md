@@ -46,8 +46,66 @@ The Overseer control tool can:
 
 Every mutation is journaled. The hub checks the live role on every call and permits mutations only from a
 direct operator-originated turn. Teammate/bus turns can read status and bounded failure context so an
-automatic fleet-failure alert can produce a report, but they cannot mutate state. An Overseer cannot approve
+automatic fleet-failure alert can produce a report. The narrow standing-approval exception below applies
+only to an exact hub-minted approval alert, not arbitrary teammate instructions. An Overseer cannot approve
 its own request, and it cannot stop or message itself through the control tool.
+
+## Requester-scoped standing approvals
+
+On a direct operator turn, `overseer_control` can configure the fallback reviewer policy using
+`configure_approval_policy`, `approval_policy_enabled`, `approval_risk_ceiling` (`low` or `medium`),
+and `approval_requester_session_ids` (at most 32 exact local session IDs). It does not auto-click a tool:
+the Overseer must review and decide the exact pending request which caused the hub-authenticated alert.
+It cannot decide unrelated approvals, its own requests, or make persistent connector grants on that turn.
+
+The requester list is required on first enable; names, wildcards, unknown sessions and Overseer sessions
+are rejected. Omission preserves an existing scoped list. `[]` delegates nobody; setting enabled to false
+disables the policy while retaining its scope for a later explicit enable. The list is rechecked when a
+decision is made, so revocation after delivery takes effect immediately. A malformed stored list fails
+closed rather than reverting to global access. Old unscoped policies are left unchanged on load for
+compatibility; the new control cannot create or re-enable an unscoped policy. Unrelated GitHub policies,
+tool grants, device grants and permission modes are not rewritten.
+
+Supported scoped decisions are recognized read-only tool requests within live manager/delegated-tool
+and remote device/root/read ceilings, plus already-classified low/medium GitHub collaboration requests
+within the requester's existing automation capability and the exact GitHub origin of its project checkout.
+A request against another repository (including AllMyAgents from a test-fleet checkout), an ambiguous
+origin, or a projectless GitHub request remains operator-only. Target-side filesystem and device policy
+checks still apply at execution; this policy cannot grant a root or bypass an ask rule.
+
+Shell execution, elevation, destructive/unknown/high-risk operations, merges, pushes, workflow execution,
+and arbitrary file mutations are not supported by this scoped fallback. In particular GitHub connector
+`create_file`/`update_file` are deliberately **not** added to the automatic repository-push matcher:
+even an exact repository and `.github/workflows/` path do not prove a body is non-destructive. YAML may
+execute commands, publish artifacts, use secrets or elevated workflow permissions. `Write`, `Edit` and
+pathless Codex file-change approvals also cannot use this new scope to bypass content review. Existing
+separate explicit GitHub automation grants retain their prior behavior; this is not a revocation or a
+replacement of those grants.
+
+### Arnold setup integration (not a live grant)
+
+After this source is reviewed and deployed through a separately authorized integration, refresh the
+Overseer's tool schema, read `get_approval_policy`, and on a direct operator turn configure only:
+
+```json
+{
+  "operation": "configure_approval_policy",
+  "approval_policy_enabled": true,
+  "approval_risk_ceiling": "medium",
+  "approval_requester_session_ids": ["05ff2b80-21e6-4ca4-bdba-acc1786d99cd"]
+}
+```
+
+Verify the returned/persisted requester list and `overseer/approval-policy-changed` event, then qualify
+fresh low-risk Arnold and unrelated-agent requests in a disposable environment. Do not replay resolved
+approvals such as `ap_622c69361e397e6fc0382975`. Read the current policy before editing: the list is an
+explicit replacement, not an append operation. Do not silently drop another existing scoped requester.
+
+Unattended workflow-file creation/update still needs a separate reviewed contract binding an exact
+repository, branch, path, expected old blob and approved content/diff or template, with execution,
+secrets, token permissions and deployment effects assessed. This source change does not invent that
+authority, inspect signing secrets, enable away-state automation, or promise that "setup" makes arbitrary
+file bodies safe. Until such a contract exists, use one-shot operator review for these file requests.
 
 ## UI teaching and navigation
 

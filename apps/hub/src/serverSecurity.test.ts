@@ -570,6 +570,32 @@ describe('device-authenticated control plane', () => {
     await expect(repeat.json()).resolves.toMatchObject({ sessionId: configured.sessionId })
   })
 
+  it('persists requester-scoped approval policy through the real server callback without changing other config', async () => {
+    const { base, deviceToken, sessions, configPath, record } = await build()
+    const response = await fetch(`${base}/api/overseer`, {
+      method: 'POST', headers: { ...auth(deviceToken), 'content-type': 'application/json' },
+      body: JSON.stringify({ profileId: 'claude-test' }),
+    })
+    expect(response.status).toBe(200)
+    const { sessionId } = await response.json() as { sessionId: string }
+    const input = { operation: 'configure_approval_policy' as const, approvalPolicyEnabled: true,
+      approvalRiskCeiling: 'medium' as const, approvalRequesterSessionIds: [record.id] }
+    const before = JSON.parse(fs.readFileSync(configPath, 'utf8'))
+    await expect(sessions.overseerControl(sessionId, input)).resolves.toMatchObject({ ok: false })
+    expect(JSON.parse(fs.readFileSync(configPath, 'utf8'))).toEqual(before)
+    ;(sessions as unknown as { operatorTurnSessions: Set<string> }).operatorTurnSessions.add(sessionId)
+    await expect(sessions.overseerControl(sessionId, input)).resolves.toMatchObject({ ok: true })
+    const saved = JSON.parse(fs.readFileSync(configPath, 'utf8'))
+    expect(saved).toMatchObject({ ...before, overseer: { ...before.overseer, approvalPolicy: {
+      enabled: true, maxRisk: 'medium', requesterSessionIds: [record.id], updatedAt: expect.any(String),
+    }, updatedAt: expect.any(String) } })
+    await expect(sessions.overseerControl(sessionId, { operation: 'get_approval_policy' }))
+      .resolves.toMatchObject({ ok: true, data: saved.overseer.approvalPolicy })
+    await expect(sessions.overseerControl(sessionId, { ...input, approvalRequesterSessionIds: ['missing'] }))
+      .resolves.toMatchObject({ ok: false })
+    expect(JSON.parse(fs.readFileSync(configPath, 'utf8'))).toEqual(saved)
+  })
+
   it('accepts an authenticated WebSocket bearer header for the trusted dev proxy', async () => {
     const { base, deviceToken } = await build()
     const response = await fetch(`${base}/api/replay-baseline`, { headers: auth(deviceToken) })

@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { execFileSync } from 'node:child_process'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ApprovalService } from './approvals.js'
 import { AgentBus } from './bus.js'
@@ -14,6 +15,7 @@ import { PracticeStore } from './practices.js'
 import { ProjectStore } from './projects.js'
 import { QuestionService } from './questions.js'
 import { applyOverseerModeUpdate } from './overseerMode.js'
+import { applyOverseerApprovalPolicyUpdate } from './overseerApprovalPolicy.js'
 import type { RemoteDeviceController } from './remoteDevices.js'
 import { SessionManager } from './sessions.js'
 import { SessionStore } from './store.js'
@@ -338,6 +340,189 @@ describe('application Overseer authority', () => {
         }),
       }),
     ]))
+  })
+
+  it('limits standing decisions to the live requester allowlist, even for exact alert-bound requests', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'arnold', permissionMode: 'safe' })
+    h.seed({ id: 'other', permissionMode: 'safe' })
+    h.sessions.setOverseerRuntime({
+      overseerConfig: () => ({ approvalPolicy: { enabled: true, maxRisk: 'low', requesterSessionIds: ['arnold'] } }),
+    })
+    const pending = h.approvals.request('other', 'claude/tool', { toolName: 'Read', input: { file_path: 'README.md' } })
+    const approvalId = h.approvals.pending()[0]!.id
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'approve', approvalId, approve: true,
+    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/requester.*scope/iu) })
+    expect(h.approvals.pending().map(item => item.id)).toContain(approvalId)
+    h.approvals.resolve(approvalId, false)
+    await pending
+  })
+
+  it('rechecks requester allowlist revocation after an approval alert was delivered', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'arnold', permissionMode: 'safe' })
+    const policy = { enabled: true, maxRisk: 'low' as const, requesterSessionIds: ['arnold'] }
+    h.sessions.setOverseerRuntime({ overseerConfig: () => ({ approvalPolicy: policy }) })
+    const pending = h.approvals.request('arnold', 'claude/tool', { toolName: 'Read', input: { file_path: 'README.md' } })
+    const approvalId = h.approvals.pending()[0]!.id
+    policy.requesterSessionIds = []
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'approve', approvalId, approve: true,
+    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/requester.*scope/iu) })
+    expect(h.approvals.pending().map(item => item.id)).toContain(approvalId)
+    h.approvals.resolve(approvalId, false)
+    await pending
+  })
+
+  it('configures a requester allowlist only on a direct operator turn and persists/audits it', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'arnold' })
+    let config: OverseerConfig = { operatingMode: 'eco', approvalPolicy: { enabled: false, maxRisk: 'low' } }
+    const persist = vi.fn(input => { config = JSON.parse(JSON.stringify(applyOverseerApprovalPolicyUpdate(config, input))); return config })
+    h.sessions.setOverseerRuntime({ overseerConfig: () => config, configureOverseerApprovalPolicy: persist })
+    const input = { operation: 'configure_approval_policy' as const, approvalPolicyEnabled: true,
+      approvalRiskCeiling: 'medium' as const, approvalRequesterSessionIds: ['arnold'] }
+    await expect(h.sessions.overseerControl('overseer', input)).resolves.toMatchObject({ ok: false })
+    expect(persist).not.toHaveBeenCalled()
+    h.markOperator('overseer')
+    await expect(h.sessions.overseerControl('overseer', { ...input, approvalRequesterSessionIds: undefined }))
+      .resolves.toMatchObject({ ok: false, error: expect.stringContaining('required') })
+    for (const invalid of [['missing'], ['overseer'], ['*']]) {
+      await expect(h.sessions.overseerControl('overseer', { ...input, approvalRequesterSessionIds: invalid }))
+        .resolves.toMatchObject({ ok: false })
+    }
+    expect(persist).not.toHaveBeenCalled()
+    await expect(h.sessions.overseerControl('overseer', input)).resolves.toMatchObject({
+      ok: true, data: { requesterSessionIds: ['arnold'], maxRisk: 'medium' },
+    })
+    expect(config.operatingMode).toBe('eco')
+    expect(h.journal.recentEventsForSession('overseer', 30)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'overseer/approval-policy-changed', payload: expect.objectContaining({
+        actor: 'overseer', policy: expect.objectContaining({ requesterSessionIds: ['arnold'] }),
+      }) }),
+    ]))
+    await expect(h.sessions.overseerControl('overseer', { ...input, approvalRequesterSessionIds: [] }))
+      .resolves.toMatchObject({ ok: true, data: { requesterSessionIds: [] } })
+  })
+
+  it('allows the selected requester read once without changing its tool or GitHub grants', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    const arnold = h.seed({ id: 'arnold', permissionMode: 'safe' })
+    h.sessions.setOverseerRuntime({ overseerConfig: () => ({
+      approvalPolicy: { enabled: true, maxRisk: 'medium', requesterSessionIds: ['arnold'] },
+    }) })
+    const before = structuredClone(arnold)
+    const pending = h.approvals.request('arnold', 'claude/tool', { toolName: 'Read', input: { file_path: 'README.md' } })
+    const approvalId = h.approvals.pending()[0]!.id
+    await expect(h.sessions.overseerControl('overseer', { operation: 'approve', approvalId, approve: true }))
+      .resolves.toMatchObject({ ok: true })
+    await expect(pending).resolves.toBe(true)
+    expect(arnold).toEqual(before)
+    expect(h.sessions.githubAutomationPolicy('session', 'arnold').capabilities).toEqual([])
+    await expect(h.sessions.overseerControl('overseer', { operation: 'approve', approvalId, approve: true }))
+      .resolves.toMatchObject({ ok: false })
+    expect(h.journal.recentEventsForSession('overseer', 20)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'overseer/approval-decided', payload: expect.objectContaining({ requesterScope: ['arnold'] }) }),
+    ]))
+  })
+
+  const setupConnector = (operation: string, repository = 'nathanfraske/test-fleet') => ({
+    serverName: 'codex_apps', mode: 'form', requestedSchema: { type: 'object', properties: {} },
+    _meta: { source: 'connector', connector_name: 'GitHub', codex_approval_kind: 'mcp_tool_call',
+      tool_title: operation, tool_params: { repository_full_name: repository, path: '.github/workflows/setup.yml',
+        content: 'run: destructive-or-unknown-command', pr_number: 1, body: 'review update' } },
+  })
+
+  it.each([
+    ['claude/tool', { toolName: 'Bash', input: { command: 'rm -rf project' } }],
+    ['claude/tool', { toolName: 'Write', input: { file_path: 'setup.sh', content: 'rm -rf project' } }],
+    ['claude/tool', { toolName: 'Read', matchedAskRule: { source: 'operator' } }],
+    ['codex/item/fileChange/requestApproval', { toolName: 'fileChange', grantRoot: '/' }],
+    ...['create_file', 'update_file', 'create_or_update_file', 'delete_file', 'delete_repository', 'run_workflow', 'merge_pull_request']
+      .map((operation): [string, unknown] => ['codex/mcpServer/elicitation/request', setupConnector(operation)]),
+  ] as Array<[string, unknown]>)('keeps destructive, executable or unknown scoped requests operator-only: %s %j', async (kind, payload) => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'arnold', permissionMode: 'safe' })
+    h.sessions.setOverseerRuntime({ overseerConfig: () => ({
+      approvalPolicy: { enabled: true, maxRisk: 'medium', requesterSessionIds: ['arnold'] },
+    }) })
+    const pending = h.approvals.request('arnold', kind as string, payload)
+    const approvalId = h.approvals.pending()[0]!.id
+    for (const approve of [true, false]) {
+      await expect(h.sessions.overseerControl('overseer', { operation: 'approve', approvalId, approve }))
+        .resolves.toMatchObject({ ok: false })
+    }
+    expect(h.approvals.pending().map(item => item.id)).toContain(approvalId)
+    h.approvals.resolve(approvalId, false)
+    await pending
+  })
+
+  it('keeps self and unrelated approvals outside a requester-scoped alert turn', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'arnold' })
+    h.sessions.setOverseerRuntime({ overseerConfig: () => ({
+      approvalPolicy: { enabled: true, maxRisk: 'medium', requesterSessionIds: ['arnold', 'overseer'] },
+    }) })
+    h.markBus('overseer')
+    const pending = h.approvals.request('overseer', 'claude/tool', { toolName: 'Read' })
+    const approvalId = h.approvals.pending()[0]!.id
+    ;(h.sessions as unknown as { overseerApprovalTurnIds: Map<string, Set<string>> })
+      .overseerApprovalTurnIds.set('overseer', new Set([approvalId]))
+    await expect(h.sessions.overseerControl('overseer', { operation: 'approve', approvalId, approve: true }))
+      .resolves.toMatchObject({ ok: false, error: expect.stringContaining('own tool') })
+    h.approvals.resolve(approvalId, false)
+    await pending
+    const other = h.approvals.request('arnold', 'claude/tool', { toolName: 'Read' })
+    const otherId = h.approvals.pending()[0]!.id
+    ;(h.sessions as unknown as { overseerApprovalTurnIds: Map<string, Set<string>> })
+      .overseerApprovalTurnIds.set('overseer', new Set([approvalId]))
+    await expect(h.sessions.overseerControl('overseer', { operation: 'approve', approvalId: otherId, approve: true }))
+      .resolves.toMatchObject({ ok: false, error: expect.stringContaining('direct operator turn') })
+    h.approvals.resolve(otherId, false)
+    await other
+  })
+
+  it.each(['tool', 'device', 'repository', 'github-capability', 'revoked-manager', 'delegated-tool'] as const)('preserves the requester %s ceiling under scoped delegation', async boundary => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    const project = h.projects.create('Test Fleet', h.root)
+    const arnold = h.seed({ id: 'arnold', permissionMode: 'safe', projectId: project.id })
+    h.sessions.setOverseerRuntime({ overseerConfig: () => ({
+      approvalPolicy: { enabled: true, maxRisk: 'medium', requesterSessionIds: ['arnold'] },
+    }) })
+    if (boundary === 'tool') {
+      arnold.isProjectManager = true
+      arnold.managerAllowedTools = ['web']
+    }
+    if (boundary === 'revoked-manager' || boundary === 'delegated-tool') {
+      h.seed({ id: 'manager', projectId: project.id, isProjectManager: boundary !== 'revoked-manager', managerAllowedTools: ['file_read'] })
+      arnold.parentSessionId = 'manager'
+      arnold.managerRootSessionId = 'manager'
+      arnold.delegatedTools = boundary === 'delegated-tool' ? ['web'] : ['file_read']
+    }
+    if (boundary === 'repository' || boundary === 'github-capability') {
+      execFileSync('git', ['init', '--quiet'], { cwd: h.root })
+      execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/nathanfraske/test-fleet.git'], { cwd: h.root })
+      if (boundary === 'repository') h.sessions.configureGitHubAutomationPolicy('session', 'arnold', ['pull_requests'], 'operator')
+    }
+    const kind = boundary === 'repository' || boundary === 'github-capability' ? 'codex/mcpServer/elicitation/request' : 'claude/tool'
+    const payload = boundary === 'repository' ? setupConnector('update_pull_request', 'nathanfraske/AllMyAgents')
+      : boundary === 'github-capability' ? setupConnector('update_pull_request')
+      : boundary === 'device' ? { toolName: 'remote_read_file', input: { device_id: 'new-device', root_id: 'machine', path: 'config' } }
+      : { toolName: 'Read', input: { file_path: 'README.md' } }
+    const pending = h.approvals.request('arnold', kind, payload)
+    const approvalId = h.approvals.pending()[0]!.id
+    await expect(h.sessions.overseerControl('overseer', { operation: 'approve', approvalId, approve: true }))
+      .resolves.toMatchObject({ ok: false, error: expect.stringMatching(/ceiling|boundary|grant/u) })
+    h.approvals.resolve(approvalId, false)
+    await pending
   })
 
   it('persists a connector approval only on a direct operator turn and only within advertised scopes', async () => {
