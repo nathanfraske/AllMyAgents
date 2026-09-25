@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { approvalFileReviewSchema, type ApprovalFileReview } from './approvalReview.js'
 import { durableRunView } from './durableRunView.js'
 import type { SessionIdentity } from './identity.js'
 import { readableScopes } from './identity.js'
@@ -48,6 +49,7 @@ export interface OverseerControlInput {
     | 'stop_chat'
     | 'reopen_chat'
     | 'approve'
+    | 'inspect_approval'
     | 'get_approval_policy'
     | 'configure_approval_policy'
     | 'set_mode'
@@ -83,6 +85,7 @@ export interface OverseerControlInput {
   profileId?: string
   sessionId?: string
   approvalId?: string
+  approvalReviewToken?: string
   presetId?: string
   cloneJobId?: string
   name?: string
@@ -98,6 +101,7 @@ export interface OverseerControlInput {
   approvalPolicyEnabled?: boolean
   approvalRiskCeiling?: 'low' | 'medium'
   approvalRequesterSessionIds?: string[]
+  approvalFileReviews?: ApprovalFileReview[]
   reauth?: boolean
   provider?: Provider
   permissionMode?: 'safe' | 'edits' | 'full'
@@ -1696,7 +1700,7 @@ const overseerControl = defineTool({
   schema: {
     operation: z.enum([
       'status', 'guide', 'ui_catalog', 'highlight_ui', 'failure_context', 'get_operating_mode', 'set_operating_mode', 'create_project', 'create_chat', 'send_chat', 'stop_chat',
-      'reopen_chat', 'approve', 'get_approval_policy', 'configure_approval_policy', 'set_mode', 'set_session_config', 'configure_manager', 'reassign_manager_account',
+      'reopen_chat', 'approve', 'inspect_approval', 'get_approval_policy', 'configure_approval_policy', 'set_mode', 'set_session_config', 'configure_manager', 'reassign_manager_account',
       'list_team_presets', 'save_team_preset', 'delete_team_preset', 'launch_team',
       'remote_catalog', 'set_remote_grants', 'authorize_remote_testbed', 'list_overseer_peers', 'send_overseer_message',
       'start_account_login', 'github_repositories',
@@ -1711,6 +1715,7 @@ const overseerControl = defineTool({
     profile_id: z.string().max(256).optional(),
     session_id: z.string().max(256).optional(),
     approval_id: z.string().max(256).optional(),
+    approval_review_token: z.string().max(128).optional().describe('Scoped alert decision: token from inspect_approval for the exact pending invocation; expires after five minutes. Supply reason and explicit approve boolean.'),
     preset_id: z.string().max(256).optional(),
     clone_job_id: z.string().max(256).optional(),
     name: z.string().max(200).optional(),
@@ -1730,6 +1735,8 @@ const overseerControl = defineTool({
     approval_risk_ceiling: z.enum(['low', 'medium']).optional(),
     approval_requester_session_ids: z.array(z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/u)).max(32).optional()
       .describe('configure_approval_policy: exact requester session allowlist, required on first enable; [] delegates nobody. Omission preserves an existing scoped list. No wildcard/global enable. Does not grant tools, repositories or devices.'),
+    approval_file_reviews: z.array(approvalFileReviewSchema).max(16).optional()
+      .describe('Direct operator configuration only: exact previously reviewed no-execution/no-credential/repository-only file changes, expiring within 24h. No arbitrary workflow execution. [] revokes file contracts; omitted preserves them. These never auto-approve.'),
     reauth: z.boolean().optional(),
     provider: z.enum(['claude', 'codex']).optional(),
     permission_mode: overseerPermissionMode.optional(),
@@ -1774,6 +1781,7 @@ const overseerControl = defineTool({
       profileId: args.profile_id,
       sessionId: args.session_id,
       approvalId: args.approval_id,
+      approvalReviewToken: args.approval_review_token,
       presetId: args.preset_id,
       cloneJobId: args.clone_job_id,
       name: args.name,
@@ -1789,6 +1797,7 @@ const overseerControl = defineTool({
       approvalPolicyEnabled: args.approval_policy_enabled,
       approvalRiskCeiling: args.approval_risk_ceiling,
       approvalRequesterSessionIds: args.approval_requester_session_ids,
+      approvalFileReviews: args.approval_file_reviews,
       reauth: args.reauth,
       provider: args.provider,
       permissionMode: args.permission_mode,

@@ -197,6 +197,16 @@ function makeHarness(opts: {
 }
 
 describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)', () => {
+  it('passes inspect and one-shot review bindings through the shared Codex/Claude tool surface', async () => {
+    const h = makeHarness()
+    h.services.overseerControl = vi.fn(async () => ({ ok: true }))
+    await runAgentTool('overseer_control', { operation: 'inspect_approval', approval_id: 'request' }, { identity: idA, services: h.services })
+    await runAgentTool('overseer_control', { operation: 'approve', approval_id: 'request', approval_review_token: 'token',
+      approve: false, reason: 'Reviewed, not appropriate for this setup.' }, { identity: idA, services: h.services })
+    expect(h.services.overseerControl).toHaveBeenLastCalledWith('s1', expect.objectContaining({
+      operation: 'approve', approvalId: 'request', approvalReviewToken: 'token', approve: false, reason: 'Reviewed, not appropriate for this setup.',
+    }))
+  })
   it('passes an exact requester scope through the provider-neutral Overseer control schema', async () => {
     const h = makeHarness()
     h.services.overseerControl = vi.fn(async () => ({ ok: true }))

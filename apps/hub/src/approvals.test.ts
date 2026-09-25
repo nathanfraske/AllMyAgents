@@ -26,6 +26,44 @@ afterEach(() => {
 })
 
 describe('ApprovalService — existing new-request paths (regression)', () => {
+  it('binds inspection to an invocation and immutable input, not just a reusable approval id', async () => {
+    const { approvals } = fresh()
+    const payload = { toolName: 'Read' }
+    const first = approvals.request('a', 'claude/tool', payload, 'same')
+    const binding = approvals.inspectPending('same')!.binding
+    payload.toolName = 'Bash'
+    expect(approvals.inspectPending('same')!.record.payload).toEqual({ toolName: 'Read' })
+    await expect(approvals.request('a', 'claude/tool', payload, 'same')).resolves.toBe(false)
+    await expect(approvals.request('b', 'claude/tool', { toolName: 'Read' }, 'same')).resolves.toBe(false)
+    expect(approvals.inspectPending('same')!.binding).toBe(binding)
+    approvals.resolve('same', true)
+    await expect(first).resolves.toBe(true)
+    const second = approvals.request('a', 'claude/tool', { toolName: 'Read' }, 'same')
+    expect(approvals.inspectPending('same')!.binding).not.toBe(binding)
+    approvals.resolve('same', false)
+    await expect(second).resolves.toBe(false)
+  })
+
+  it('enforces wall-clock expiry even before a delayed timer callback runs', async () => {
+    vi.useFakeTimers()
+    const { approvals } = fresh()
+    const pending = approvals.request('s', 'claude/tool', {}, 'expires')
+    vi.setSystemTime(Date.now() + DEFAULT_APPROVAL_TIMEOUT_MS + 1)
+    expect(approvals.resolve('expires', true)).toBe(false)
+    expect(approvals.inspectPending('expires')).toBeUndefined()
+    await expect(pending).resolves.toBe(false)
+  })
+
+  it('never replays a scoped reviewer decision through the crash-recovery shortcut', async () => {
+    const { approvals, journal, count } = fresh()
+    const payload = { toolName: 'Read' }
+    const pending = approvals.request('s', 'claude/tool', payload, 'reviewed')
+    approvals.resolve('reviewed', true, { decider: 'overseer-reviewed:overseer' })
+    await expect(pending).resolves.toBe(true)
+    const successor = new ApprovalService(journal)
+    await expect(successor.request('s', 'claude/tool', payload, 'reviewed')).resolves.toBe(false)
+    expect(count('approval/review-recovery-refused')).toBe(1)
+  })
   it('new request → approve resolves true, auto-generates an id, journals requested + resolved(approved)', async () => {
     const { approvals, count, statusOf } = fresh()
     const p = approvals.request('s1', 'claude/tool', { toolName: 'bash' })

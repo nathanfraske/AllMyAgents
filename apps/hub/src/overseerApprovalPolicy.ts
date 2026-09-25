@@ -1,9 +1,11 @@
 import type { OverseerApprovalPolicy, OverseerConfig } from './types.js'
+import { approvalFileReviewSchema, type ApprovalFileReview } from './approvalReview.js'
 
 export interface OverseerApprovalPolicyUpdate {
   enabled: boolean
   maxRisk: 'low' | 'medium'
   requesterSessionIds?: string[]
+  fileReviews?: ApprovalFileReview[]
 }
 
 export function normalizeApprovalRequesterIds(value: unknown): string[] {
@@ -38,12 +40,24 @@ export function applyOverseerApprovalPolicyUpdate(
   if (input.enabled && !hasScope) {
     throw new Error('approval_requester_session_ids is required to enable standing decisions; global enablement is not supported')
   }
+  const fileReviews = input.fileReviews ?? previous?.fileReviews?.filter(r => requesterSessionIds?.includes(r.requesterSessionId))
+  if (fileReviews !== undefined) {
+    if (!Array.isArray(fileReviews) || fileReviews.length > 16) throw new Error('file reviews require at most 16 exact entries')
+    for (const raw of fileReviews) {
+      const r = approvalFileReviewSchema.parse(raw)
+      if (!requesterSessionIds?.includes(r.requesterSessionId)) throw new Error('file review requester must be in the exact requester scope')
+      if (input.enabled && input.fileReviews && Date.parse(r.expiresAt) > Date.now() + 24 * 60 * 60 * 1000) {
+        throw new Error('new file reviews must expire within 24 hours')
+      }
+    }
+  }
   const updatedAt = new Date().toISOString()
   return {
     ...current,
     approvalPolicy: {
       enabled: input.enabled, maxRisk: input.maxRisk,
       ...(hasScope ? { requesterSessionIds } : {}), updatedAt,
+      ...(fileReviews !== undefined ? { fileReviews: structuredClone(fileReviews) } : {}),
     },
     updatedAt,
   }

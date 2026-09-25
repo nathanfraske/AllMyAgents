@@ -57,6 +57,31 @@ On a direct operator turn, `overseer_control` can configure the fallback reviewe
 and `approval_requester_session_ids` (at most 32 exact local session IDs). It does not auto-click a tool:
 the Overseer must review and decide the exact pending request which caused the hub-authenticated alert.
 It cannot decide unrelated approvals, its own requests, or make persistent connector grants on that turn.
+This is the existing Overseer reviewing one request, not a new helper or a tool auto-approval policy.
+
+### Inspect, review, decide
+
+For each fresh hub-minted alert, call `inspect_approval` with its `approval_id`. The result includes the
+exact bounded pending payload (untrusted data), requester, invocation/payload binding, expiry, eligibility,
+risk and reason code. An eligible scoped request also returns a `reviewToken`. The Overseer reviews that
+payload and calls `approve` with `approval_id`, `approval_review_token`, an explicit `approve` boolean,
+and a nonempty `reason`. It does **not** ask the operator again for an eligible delegated decision.
+There is no `persist` on a delegated decision. An ineligible result must be escalated with its reason.
+
+Tokens expire after five minutes (or earlier request expiry) and bind the requester invocation, complete
+payload and policy. The decision rechecks live scope, risk, project origin and existing capabilities.
+Resolution, replacement, policy changes, revocation, turn end and expired tokens cannot reuse a review.
+Unrelated mailbox text cannot mint a hub alert binding. Duplicate pending IDs with different request
+bytes or requester are refused. Repeated decisions are no-ops. Wall-clock deadlines are enforced even
+if a stalled timer has not run. After hub restart, scoped-review decisions cannot take the old
+content-ID recovery shortcut: recovery is refused and audited, not blindly executed again. Do not retry
+an operation whose external outcome is ambiguous; reconcile it with the operator first.
+
+`unsupported` means evidence or an adapter/semantic classifier is missing; it does not assert that the
+operation is destructive. `high-risk` identifies blocking evidence such as credential/privileged-runner
+or destructive indicators. `requester-scope`, `authority-ceiling`, `risk-ceiling`, `disabled`,
+`not-alert-bound` and `not-pending` identify distinct reasons. Payloads over 128 KiB are omitted from this
+review surface and cannot receive a token. No truncated payload can be approved through it.
 
 The requester list is required on first enable; names, wildcards, unknown sessions and Overseer sessions
 are rejected. Omission preserves an existing scoped list. `[]` delegates nobody; setting enabled to false
@@ -73,7 +98,7 @@ A request against another repository (including AllMyAgents from a test-fleet ch
 origin, or a projectless GitHub request remains operator-only. Target-side filesystem and device policy
 checks still apply at execution; this policy cannot grant a root or bypass an ask rule.
 
-Shell execution, elevation, destructive/unknown/high-risk operations, merges, pushes, workflow execution,
+Shell execution, elevation, destructive/unknown/high-risk operations, merges, arbitrary pushes, workflow execution,
 and arbitrary file mutations are not supported by this scoped fallback. In particular GitHub connector
 `create_file`/`update_file` are deliberately **not** added to the automatic repository-push matcher:
 even an exact repository and `.github/workflows/` path do not prove a body is non-destructive. YAML may
@@ -101,11 +126,55 @@ fresh low-risk Arnold and unrelated-agent requests in a disposable environment. 
 approvals such as `ap_622c69361e397e6fc0382975`. Read the current policy before editing: the list is an
 explicit replacement, not an append operation. Do not silently drop another existing scoped requester.
 
-Unattended workflow-file creation/update still needs a separate reviewed contract binding an exact
-repository, branch, path, expected old blob and approved content/diff or template, with execution,
-secrets, token permissions and deployment effects assessed. This source change does not invent that
-authority, inspect signing secrets, enable away-state automation, or promise that "setup" makes arbitrary
-file bodies safe. Until such a contract exists, use one-shot operator review for these file requests.
+### Optional exact file-content review contract
+
+`approval_file_reviews` configures up to 16 **operator-reviewed** entries, separately from the requester
+list. Omission retains matching entries; `[]` revokes them; requester removal also removes inherited
+entries for that requester. Each entry names requesterSessionId, projectId, repository, branch, path,
+operation (`create_file` or `update_file`), expectedBlobSha (null for creation), contentSha256,
+parametersSha256, expiresAt (at most 24 hours out), and reviewReason. It must explicitly attest
+execution=`none`, credentials=`none`, publication=`repository-only`, destructive=`false` for the exact
+bytes **and their repository/branch context**, including push-triggered workflows, hooks and publication
+effects. These are trusted operator review statements, not statements the requesting agent can supply
+inside its payload. A matching entry never auto-approves: the existing Overseer still inspects and decides
+each fresh alert, under a medium ceiling and existing `repository_pushes` capability and origin boundary.
+
+The implemented connector grammar is deliberately closed: `codex_apps` GitHub empty-form elicitation,
+one unambiguous create_file/update_file name, with repository_full_name, explicit branch, path, UTF-8
+content, message, and (for update) exact `sha`; unknown aliases/extra parameters/encodings are unsupported.
+`parametersSha256` is SHA-256 of recursively key-sorted JSON; contentSha256 hashes the exact UTF-8
+content without newline normalization. Inspect returns the computed target/digests even when an entry
+is missing. New entries require a direct operator configuration turn; none are automatically generated.
+
+The no-execution contract covers exact reviewed `.md`/`.txt` documentation or blank/comment-only
+workflow placeholders, **not executable CI workflows**. Workflow YAML must be entirely blank/comment
+lines; quoted/escaped keys, anchors, tags and flow syntax do not pass through a denylist shortcut.
+`run`, `uses`, expressions and deployment environments remain unsupported even with an entry. Known
+credential/privileged/destructive indicators remain high-risk even with an entry. Absence of these
+indicators is not a safety proof: the exact prior operator content/context review is still mandatory.
+Encoded or missing bodies, missing old blobs, and unreviewed updates cannot borrow another entry.
+
+GitHub's [Contents API documentation](https://docs.github.com/en/rest/repos/contents#create-or-update-file-contents)
+requires an old blob SHA for updates and accepts Base64 content. That REST contract alone does **not**
+prove the Codex connector's plaintext adaptation or preservation of old-blob/creation preconditions.
+Before enabling file entries, qualify the exact connector schema/version and these semantics in a
+disposable repository. No live Arnold workflow payloads or connector writes were replayed in this source
+pass. If that adapter evidence is absent, keep file entries empty and use one-shot operator review.
+Executable workflows need a richer pinned execution/credential/publication contract and qualification;
+this implementation deliberately cannot enable them by relabeling arbitrary bodies low/medium.
+
+### Deployment boundary
+
+The installed disabled/low policy and missing requester fields are an installed/source mismatch, not
+evidence this source policy is enabled. Integrate this commit on top of `812cc84`, run the focused and
+release gates, then separately authorize deployment. Loading the new hub code requires a bounded hub
+process restart; refresh/reconnect the Overseer's provider tool schema afterward. No PC/OS reboot is
+required. Installation, restart and live policy changes are **not** part of this source handoff.
+After deployment, confirm `inspect_approval`, `approval_review_token` and requester fields exist in the
+live schema, configure only Arnold on a direct operator turn, and read back/audit the exact scope.
+Keep file reviews empty until their separate exact-content and adapter qualification is complete.
+Qualify new disposable eligible/denied requests, duplicate/expiry/revocation races and audit rows; do
+not replay previously resolved approvals (including e7cb... / decision 5858).
 
 ## UI teaching and navigation
 

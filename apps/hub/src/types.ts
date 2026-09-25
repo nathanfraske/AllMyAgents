@@ -714,6 +714,8 @@ export interface OverseerApprovalPolicy {
   maxRisk: OverseerApprovalRisk
   /** Exact requester sessions only. Empty means none; absent preserves a pre-existing legacy policy. */
   requesterSessionIds?: string[]
+  /** Optional exact operator-reviewed no-execution file contracts; never automatic approvals. */
+  fileReviews?: import('./approvalReview.js').ApprovalFileReview[]
   updatedAt?: string
 }
 
