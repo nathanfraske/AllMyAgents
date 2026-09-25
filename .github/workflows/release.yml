@@ -104,7 +104,7 @@ jobs:
   linux-testbed:
     name: Ubuntu remote node (${{ matrix.platform }})
     needs: launch-and-repair-gate
-    runs-on: ${{ matrix.platform }}
+    runs-on: ${{ matrix.platform == 'ubuntu-22.04' && fromJSON('["self-hosted","Linux","X64","test-fleet","linux-docker-x64"]') || matrix.platform }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -126,6 +126,28 @@ jobs:
           node --test scripts/install-linux.test.mjs
           node scripts/package-testbed-linux.mjs
           node scripts/test-linux-testbed.mjs target/linux-testbed/*.deb
+      - name: Verify x64 package compatibility with Ubuntu 22.04
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=(target/linux-testbed/*_amd64.deb)
+          test "${#packages[@]}" -eq 1
+          context="$RUNNER_TEMP/fleet-linux-runtime"
+          mkdir "$context"
+          cp "${packages[0]}" "$context/package.deb"
+          cp scripts/test-linux-testbed.mjs "$context/"
+          cat > "$context/Dockerfile" <<'DOCKERFILE'
+          FROM ubuntu:22.04
+          RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libstdc++6 ca-certificates && rm -rf /var/lib/apt/lists/*
+          COPY package.deb /qualification/package.deb
+          RUN dpkg -i /qualification/package.deb
+          COPY test-linux-testbed.mjs /qualification/test-linux-testbed.mjs
+          DOCKERFILE
+          docker pull ubuntu:22.04
+          docker image inspect ubuntu:22.04 --format '{{json .RepoDigests}}'
+          docker build --tag "test-fleet-release-runtime:$GITHUB_RUN_ID" "$context"
+          docker run --rm --network none --cpus "$(nproc)" "test-fleet-release-runtime:$GITHUB_RUN_ID" /usr/lib/allmyagents-testbed/node /qualification/test-linux-testbed.mjs /qualification/package.deb
       - uses: actions/upload-artifact@v4
         with:
           name: linux-testbed-${{ matrix.platform }}
