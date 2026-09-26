@@ -140,9 +140,9 @@ jobs:
           APPLE_SIGNING_IDENTITY: '-'
         run: |
           set -euo pipefail
-          pnpm --filter desktop exec tauri build \
+          pnpm --filter desktop exec tauri build --verbose \
             --bundles app,dmg \
-            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+            --config '{"bundle":{"createUpdaterArtifacts":false}}' 2>&1 | tee /tmp/ama-bundle.log
           mkdir -p artifacts
           cp apps/desktop/src-tauri/target/release/bundle/dmg/*.dmg artifacts/
 
@@ -168,9 +168,11 @@ jobs:
           [ -L /tmp/ama-mnt/Applications ] \
             || { echo "::error::the DMG has no /Applications symlink — drag-to-install has no target"; exit 1; }
 
-          APP="$(ls -d /tmp/ama-mnt/*.app | head -n1)"
-          DEST="/Applications/$(basename "$APP")"
-          rm -rf "$DEST"
+          APP=/tmp/ama-mnt/AllMyAgents.app
+          [ -d "$APP" ] && [ ! -L "$APP" ] \
+            || { echo "::error::the DMG has no regular AllMyAgents.app bundle"; exit 1; }
+          DEST=/Applications/AllMyAgents.app
+          rm -rf /Applications/AllMyAgents.app
           cp -R "$APP" /Applications/   # the exact gesture a user performs
           hdiutil detach /tmp/ama-mnt
           echo "app=$(basename "$APP")" >> "$GITHUB_OUTPUT"
@@ -320,6 +322,8 @@ jobs:
         with:
           name: macos-installability-${{ matrix.runner }}
           path: |
+            /tmp/ama-bundle.log
+            apps/desktop/src-tauri/target/release/bundle/dmg/bundle_dmg.sh
             /tmp/codesign-d.txt
             /tmp/codesign-verify.txt
             /tmp/spctl.txt
@@ -334,7 +338,9 @@ jobs:
           hdiutil detach /tmp/ama-mnt 2>/dev/null || true
           pkill -f allmyagents-desktop 2>/dev/null || true
           pkill -f hubctl 2>/dev/null || true
-          rm -rf "/Applications/${{ steps.install.outputs.app }}" 2>/dev/null || true
+          # Never derive a recursive-delete target from a possibly absent step output.
+          # Build failures happen before install outputs exist.
+          rm -rf /Applications/AllMyAgents.app 2>/dev/null || true
 
   # ---------------------------------------------------------------------------------------------
   # The SUPPORTED install path, and the one that has to keep working without an Apple Developer ID.
