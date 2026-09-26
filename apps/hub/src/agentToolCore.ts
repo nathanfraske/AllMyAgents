@@ -614,7 +614,7 @@ const peekAgent = defineTool({
 const childStatus = defineTool({
   name: 'child_status',
   description:
-    'Project managers only: get an exact current tally and per-agent status for your managed hierarchy, including enabled one-shot descendants. This reads live session records, not old messages.',
+    'Project managers only: get an exact current tally and per-agent status for your managed hierarchy, including enabled one-shot descendants. Includes hub-verified current turn origin, queued direct operator inputs and the last retained operator input receipt (no message body). Check this before treating changed work as rogue or retasking/stashing a worker: let active operator-directed work proceed within its existing permissions. Missing historical receipt means unknown, not no operator contact. This reads live session records, not teammate claims.',
   schema: {},
   run: async (_args, { identity, services }) => {
     if (!services.childStatus) return 'Status unavailable: this hub does not support manager child tallies.'
@@ -628,7 +628,7 @@ const childStatus = defineTool({
 const manageTeam = defineTool({
   name: 'manage_team',
   description:
-    'Project managers only: list, create, rename, or activate durable child teams. Activating a team shelves the outgoing team without deleting chats, transcripts, branches, dirty files, or worktrees, and reopens the selected team. Active outgoing turns are never interrupted unless interrupt_active is explicitly true.',
+    'Project managers only: list, create, rename, or activate durable child teams. Activating a team shelves the outgoing team without deleting chats, transcripts, branches, dirty files, or worktrees, and reopens the selected team. Active outgoing turns are never interrupted unless interrupt_active is explicitly true. Active/queued direct operator work cannot be shelved even with that flag; let it finish or ask the operator to stop it directly.',
   schema: {
     operation: z.enum(['list', 'create', 'activate', 'rename']),
     team_id: z.string().min(1).max(256).optional().describe('stable team id returned by list/create'),

@@ -237,6 +237,9 @@ export interface SessionRecord {
   remoteDeviceGrants?: RemoteDeviceGrant[]
   /** Operator input accepted mid-turn and waiting for its own non-escalating operator-origin boundary. */
   deferredOperatorTurns?: DeferredOperatorTurn[]
+  /** Hub-only receipt of direct operator input, not a message body or a permission grant. Legacy absent
+   * means no retained receipt, not proof that the operator never spoke to this chat. */
+  lastOperatorInput?: { seq: number; at: string }
   /** App-owned browser capability. Safe default is OFF when absent. The profile remains session-keyed. */
   browserEnabled?: boolean
   /** Public http(s) origins approved for this exact session. Values are canonical URL origins. */

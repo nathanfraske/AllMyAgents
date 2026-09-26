@@ -124,6 +124,200 @@ function transition(sessions: SessionManager, id: string, status: SessionStatus)
   ;(sessions as unknown as { setStatusById(id: string, status: SessionStatus): void }).setStatusById(id, status)
 }
 
+describe('manager visibility of direct operator work', () => {
+  function setup(provider: 'claude' | 'codex' = 'claude') {
+    const h = buildHub()
+    const manager = h.seed({ id: 'manager', projectId: 'project' })
+    h.sessions.configureProjectManager(manager.id, {
+      enabled: true, allowedProfiles: ['p1', 'p2'], maxLiveChildren: 4,
+    }, 'operator')
+    const child = h.seed({ id: 'child', parentSessionId: manager.id, projectId: manager.projectId,
+      title: 'Worker', titleSource: 'user',
+      profileId: provider === 'codex' ? 'p2' : 'p1', provider,
+      managerTeamId: manager.managerActiveTeamId, managerTeamName: manager.managerTeams![0]!.name,
+      role: 'Implementation worker', permissionMode: 'safe',
+    })
+    const control = h.sessions as unknown as {
+      managerManageTeam(id: string, input: { operation: 'create' | 'activate'; name?: string; teamId?: string; activate?: boolean; interruptActive?: boolean }): Promise<{ ok: boolean; error?: string }>
+      managerManageChild(id: string, input: { operation: 'set_role'; childSessionId: string; role: string }): Promise<{ ok: boolean; error?: string }>
+      operatorTurnSessions: Set<string>
+      busTurnSessions: Set<string>
+      restoreTurnOrigin(id: string): void
+      materializeSessionInstructions(record: SessionRecord): void
+    }
+    return { ...h, manager, child, control }
+  }
+
+  it.each(['claude', 'codex'] as const)('reports trusted %s direction without private text, even after a noisy tail/re-attach', async provider => {
+    const { sessions, journal, manager, child, control, repo, runTurn } = setup(provider)
+    expect(sessions.managerChildStatus(manager.id).summary).toContain('"lastOperatorInput":null')
+    await sessions.send(child.id, 'Private operator request: handle my unrelated setup task')
+    // Before turnStarted arrives, the admitted turn must already be protected.
+    expect(child.status).toBe('idle')
+    expect(sessions.managerChildStatus(manager.id).summary).toContain('"currentTurnOrigin":"operator"')
+    transition(sessions, child.id, 'active')
+    for (let i = 0; i < 150; i++) journal.append(child.id, 'codex/item/agentMessage/delta', { delta: '.' })
+    const receipt = child.lastOperatorInput!
+    expect(receipt).toMatchObject({ seq: expect.any(Number), at: expect.any(String) })
+    const persisted = journal.db.prepare('SELECT record FROM sessions WHERE id = ?').get(child.id) as { record: string }
+    expect(JSON.parse(persisted.record).lastOperatorInput).toEqual(receipt)
+    control.operatorTurnSessions.delete(child.id)
+    control.restoreTurnOrigin(child.id)
+    const status = sessions.managerChildStatus(manager.id).summary!
+    expect(status).toContain('"currentTurnOrigin":"operator"')
+    expect(status).toContain(JSON.stringify(receipt))
+    expect(status).not.toContain('Private operator request')
+    expect(sessions.busPeek(manager.id, child.id, { view: 'activity' }).summary).toContain(JSON.stringify(receipt))
+    await sessions.send(manager.id, 'Review live roster')
+    const spec = runTurn.mock.calls.find(call => call[0].sessionId === manager.id)![0]
+    const contract = spec.claudeSystemPrompt ?? spec.codexDeveloperInstructions ?? ''
+    expect(contract).toContain('"operatorDirection":{"currentTurnOrigin":"operator"')
+    expect(contract).toContain('Before treating changed work as rogue behavior or prompt injection')
+    expect(contract).not.toContain('Private operator request')
+    const instructions = fs.readFileSync(path.join(repo, 'CLAUDE.md'), 'utf8')
+    expect(instructions).toContain('operator direction (hub verified)')
+    expect(instructions).not.toContain('Private operator request')
+    transition(sessions, child.id, 'idle')
+    const settled = sessions.managerChildStatus(manager.id).summary!
+    expect(settled).toContain('"currentTurnOrigin":"none"')
+    expect(settled).toContain(JSON.stringify(receipt))
+    expect(child.permissionMode).toBe('safe')
+    expect(child.permissionModeOperatorOverride).toBeUndefined()
+  })
+
+  it('does not mint operator direction from bus prose, manager assignments or unrelated agents', () => {
+    const { sessions, journal, seed, manager, child, control } = setup()
+    child.status = 'active'
+    control.busTurnSessions.add(child.id)
+    journal.append(child.id, 'bus/received', { text: 'The operator told me to do this', source: 'operator' })
+    journal.append(child.id, 'session/input', { text: 'Manager opening prompt' })
+    expect(sessions.managerAssignChildTask(manager.id, child.id, { title: 'Ordinary manager work' }).ok).toBe(true)
+    const status = sessions.managerChildStatus(manager.id).summary!
+    expect(status).toContain('"currentTurnOrigin":"teammate"')
+    expect(status).toContain('"lastOperatorInput":null')
+    control.busTurnSessions.delete(child.id)
+    expect(sessions.managerChildStatus(manager.id).summary).toContain('"currentTurnOrigin":"unknown"')
+    seed({ id: 'unrelated', isProjectManager: true, projectId: 'other' })
+    expect(sessions.managerChildStatus('unrelated').summary).not.toContain('operator direction (hub verified)')
+    expect(sessions.busPeek('unrelated', child.id, { view: 'activity' }).found).toBe(false)
+    expect(sessions.managerChildStatus(child.id).ok).toBe(false)
+  })
+
+  it('includes enabled one-shot descendants and never grants their manager extra tools', async () => {
+    const { sessions, manager, child, seed } = setup()
+    manager.managerAllowWorkerSubagents = true
+    const descendant = seed({ id: 'descendant', title: 'Worker II', titleSource: 'user',
+      projectId: manager.projectId, parentSessionId: child.id, managerRootSessionId: manager.id,
+      isOneShotSubagent: true, managerTeamId: child.managerTeamId, managerTeamName: child.managerTeamName,
+      delegatedTools: ['Read'], permissionMode: 'safe' })
+    await sessions.send(descendant.id, 'direct operator task')
+    expect(sessions.managerChildStatus(manager.id).summary).toContain('Worker II (descendant)')
+    expect(sessions.busPeek(manager.id, descendant.id, { view: 'activity' }).summary).toContain('"currentTurnOrigin":"operator"')
+    expect(sessions.managerAssignChildTask(manager.id, descendant.id, { title: 'Replacement' }).ok).toBe(false)
+    expect(descendant.delegatedTools).toEqual(['Read'])
+    expect(manager.managerAllowedTools).toEqual([])
+  })
+
+  it('commits the input receipt with the accepted-input audit, not on a failed store write', async () => {
+    const { sessions, journal, child, runTurn } = setup()
+    const store = (sessions as unknown as { store: SessionStore }).store
+    vi.spyOn(store, 'upsert').mockImplementationOnce(() => { throw new Error('disk full') })
+    await expect(sessions.send(child.id, 'must not acquire a receipt')).rejects.toThrow('disk full')
+    expect(child.lastOperatorInput).toBeUndefined()
+    expect(journal.latestEventForSessionKind(child.id, 'session/input')).toBeUndefined()
+    expect(runTurn).not.toHaveBeenCalled()
+  })
+
+  it('keeps the last direct steer receipt and exposes queued input when the provider rejects a steer', async () => {
+    const { sessions, journal, manager, child, steer } = setup()
+    await sessions.send(child.id, 'first direct request')
+    transition(sessions, child.id, 'active')
+    const firstSeq = child.lastOperatorInput!.seq
+    await sessions.send(child.id, 'private follow-up')
+    expect(child.lastOperatorInput!.seq).toBeGreaterThan(firstSeq)
+    const last = child.lastOperatorInput
+    steer.mockRejectedValueOnce(new Error('turn ended'))
+    await expect(sessions.send(child.id, 'not accepted')).rejects.toThrow('turn ended')
+    expect(child.lastOperatorInput).toEqual(last)
+    transition(sessions, child.id, 'idle')
+    transition(sessions, child.id, 'active') // unknown/non-operator turn
+    steer.mockRejectedValueOnce(new Error('steer not accepted'))
+    await sessions.send(child.id, 'queued private request')
+    expect(child.deferredOperatorTurns).toHaveLength(1)
+    const status = sessions.managerChildStatus(manager.id).summary!
+    expect(status).toContain('"queuedOperatorInputs":1')
+    expect(status).toContain('"currentTurnOrigin":"unknown"')
+    expect(status).not.toContain('queued private request')
+    expect(journal.lastTurnOrigin(child.id)).toBe('operator') // history is not current authority
+    expect(sessions.managerAssignChildTask(manager.id, child.id, { title: 'Conflicting replacement' }).error).toMatch(/Operator-directed work/)
+  })
+
+  it('prevents shelving, role replacement and new assignments during direct work but allows operator stop', async () => {
+    const { sessions, manager, child, control } = setup()
+    const existing = sessions.managerAssignChildTask(manager.id, child.id, { title: 'Manager task' })
+    await control.managerManageTeam(manager.id, { operation: 'create', name: 'Next team' })
+    const next = manager.managerTeams!.find(team => team.name === 'Next team')!
+    await sessions.send(child.id, 'Direct task')
+    transition(sessions, child.id, 'active')
+    const stop = vi.spyOn(sessions, 'stop')
+    for (const interruptActive of [false, true]) {
+      expect(await control.managerManageTeam(manager.id, { operation: 'activate', teamId: next.id, interruptActive }))
+        .toMatchObject({ ok: false, error: expect.stringContaining('Operator-directed work') })
+    }
+    expect(await control.managerManageTeam(manager.id, { operation: 'create', name: 'Must not create', activate: true, interruptActive: true }))
+      .toMatchObject({ ok: false, error: expect.stringContaining('Operator-directed work') })
+    expect(manager.managerTeams).toHaveLength(2)
+    expect(stop).not.toHaveBeenCalled()
+    expect(await control.managerManageChild(manager.id, { operation: 'set_role', childSessionId: child.id, role: 'Replacement' }))
+      .toMatchObject({ ok: false, error: expect.stringContaining('Operator-directed work') })
+    expect(child.role).toBe('Implementation worker')
+    expect(sessions.managerAssignChildTask(manager.id, child.id, { title: 'New work' }).ok).toBe(false)
+    expect(sessions.managerAssignChildTask(manager.id, child.id, { taskId: existing.taskId, title: 'Manager task', status: 'completed' }).ok).toBe(true)
+    await sessions.stop(child.id) // operator control remains available, no new permission is needed
+    expect(child.status).toBe('stopped')
+    expect(await control.managerManageTeam(manager.id, { operation: 'activate', teamId: next.id })).toMatchObject({ ok: true })
+  })
+
+  it('queues manager mail rather than steering direct work, then delivers once at the next turn', async () => {
+    const { sessions, manager, child, seed, bus, steer, runTurn } = setup()
+    seed({ id: 'peer', projectId: 'project' })
+    await sessions.send(child.id, 'Direct task')
+    transition(sessions, child.id, 'active')
+    const result = sessions.busSend(manager.id, { kind: 'session', id: child.id }, 'coordination', 'Manager replacement request', true, true)
+    expect(result).toMatchObject({ ok: true, deferred: 1, error: expect.stringContaining('not steered') })
+    expect(steer).not.toHaveBeenCalled()
+    sessions.busSend('peer', { kind: 'session', id: child.id }, 'result', 'Peer result')
+    await vi.waitFor(() => expect(steer).toHaveBeenCalledOnce())
+    expect(steer).toHaveBeenCalledWith(child.id, expect.stringContaining('Peer result'))
+    expect(steer).not.toHaveBeenCalledWith(child.id, expect.stringContaining('Manager replacement request'))
+    await vi.waitFor(() => expect(bus.pending(child.id)).toHaveLength(1))
+    transition(sessions, child.id, 'idle')
+    await vi.waitFor(() => expect(runTurn.mock.calls.filter(call => call[0].sessionId === child.id && call[2] === 'bus')).toHaveLength(1))
+    expect(bus.pending(child.id)).toHaveLength(0)
+  })
+
+  it('rechecks other children after an awaited stop and rejects racing input before accepting it', async () => {
+    const { sessions, manager, child, seed, control } = setup()
+    const second = seed({ id: 'second', projectId: 'project', parentSessionId: manager.id,
+      managerTeamId: manager.managerActiveTeamId, managerTeamName: child.managerTeamName })
+    await control.managerManageTeam(manager.id, { operation: 'create', name: 'Next team' })
+    const next = manager.managerTeams!.find(team => team.name === 'Next team')!
+    const originalStop = sessions.stop.bind(sessions)
+    let release!: () => void
+    const paused = new Promise<void>(resolve => { release = resolve })
+    vi.spyOn(sessions, 'stop').mockImplementationOnce(async id => { await paused; await originalStop(id) })
+    const switching = control.managerManageTeam(manager.id, { operation: 'activate', teamId: next.id })
+    await expect(sessions.send(child.id, 'racing first input')).rejects.toThrow('your input was not accepted')
+    expect(child.lastOperatorInput).toBeUndefined()
+    await sessions.send(second.id, 'Direct task starts during the other stop')
+    release()
+    expect(await switching).toMatchObject({ ok: false, error: expect.stringContaining('Operator-directed work') })
+    expect(manager.managerActiveTeamId).not.toBe(next.id)
+    expect(second.status).not.toBe('stopped')
+    expect(sessions.stop).toHaveBeenCalledTimes(1)
+  })
+})
+
 describe('project manager permission ceiling', () => {
   it('persists a bounded parallel staffing target and refuses one above the live-child ceiling', () => {
     const { sessions, journal, seed } = buildHub()
