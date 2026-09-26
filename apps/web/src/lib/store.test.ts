@@ -115,6 +115,24 @@ describe('owner preferences', () => {
   })
 })
 
+describe('background whole-file transfers', () => {
+  it('updates one stable row without flicker, focus changes, or sidebar activity churn; history uses the same key', () => {
+    seed('s'); store.selectedId = 's'
+    const before = store.sessions.s!.lastActivity
+    const events: HubEvent[] = []
+    for (let i = 0; i < 10; i++) {
+      const event = evt({ seq: i + 1, sessionId: 's', ts: '2026-01-02T00:00:00Z', kind: i === 9 ? 'file-transfer/completed' : 'file-transfer/progress', payload: { id: 'x', direction: 'upload', localPath: 'bundle.zip', size: 9 * 1048576, transferred: i * 1048576 } })
+      events.push(event); apply(event)
+      if (i < 9) expect(store.sessions.s!.lastActivity).toBe(before)
+    }
+    expect(store.sessions.s!.items).toHaveLength(1)
+    expect(store.sessions.s!.items[0]).toMatchObject({ key: 'file-transfer:x', kind: 'note', text: expect.stringContaining('completed — 9.0/9.0 MiB') })
+    expect(store.selectedId).toBe('s')
+    expect(reduceJournalHistory(events)).toHaveLength(1)
+    expect(reduceJournalHistory(events)[0]!.key).toBe('file-transfer:x')
+  })
+})
+
 describe('Overseer account handoff', () => {
   it('uses the singleton Overseer configuration path instead of creating an Unfiled chat', async () => {
     const cold = new HubStore()

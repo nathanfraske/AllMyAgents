@@ -823,6 +823,7 @@ function terminateTree(child: ChildProcess): void {
 /** Process owner and queue pump. Resource conflicts queue rather than making agents poll or delete locks. */
 export class DurableRunController {
   private readonly children = new Map<string, ChildProcess>()
+  private readonly localTimerCleanups = new Map<string, () => void>()
   private readonly remoteRuns = new Set<string>()
   private readonly remoteHeartbeats = new Map<string, NodeJS.Timeout>()
   private active = false
@@ -918,6 +919,8 @@ export class DurableRunController {
     this.active = false
     if (this.monitor) clearInterval(this.monitor)
     this.monitor = undefined
+    for (const clearTimers of this.localTimerCleanups.values()) clearTimers()
+    this.localTimerCleanups.clear()
     for (const child of this.children.values()) terminateTree(child)
     this.children.clear()
     // A remote request may have completed after this process lost its response. Its successor retains the
@@ -1069,7 +1072,9 @@ export class DurableRunController {
     let logsTruncated = false
     let errorText = ''
     let settled = false
+    const ownsChild = (): boolean => this.active && this.children.get(run.id) === child
     const append = (file: string, chunk: Buffer, stream: 'stdout' | 'stderr'): void => {
+      if (!ownsChild()) return
       const current = stream === 'stdout' ? stdoutBytes : stderrBytes
       const remaining = MAX_LOG_BYTES_PER_STREAM - current
       const written = Math.max(0, Math.min(chunk.length, remaining))
@@ -1085,17 +1090,26 @@ export class DurableRunController {
       errorText = (errorText + chunk.toString('utf8')).slice(-2_000)
     })
     const timeout = run.timeoutMs === 0 ? undefined : setTimeout(() => {
+      if (!ownsChild()) return
       errorText = `run exceeded its ${run.timeoutMs}ms timeout`
       terminateTree(child)
     }, run.timeoutMs)
     timeout?.unref?.()
-    const heartbeat = setInterval(() => this.store.heartbeat(run.id), 5_000)
+    const heartbeat = setInterval(() => { if (ownsChild()) this.store.heartbeat(run.id) }, 5_000)
     heartbeat.unref?.()
+    const clearTimers = (): void => {
+      clearTimeout(timeout)
+      clearInterval(heartbeat)
+    }
+    this.localTimerCleanups.set(run.id, clearTimers)
     const settle = (exitCode: number | null, signal: NodeJS.Signals | null, spawnError?: Error): void => {
       if (settled) return
       settled = true
-      clearTimeout(timeout)
-      clearInterval(heartbeat)
+      clearTimers()
+      // Shutdown may close SQLite before the process emits close/error. The next owner reconciles
+      // the interrupted receipt; a late callback must neither write nor invent a terminal outcome.
+      if (!ownsChild()) return
+      this.localTimerCleanups.delete(run.id)
       this.children.delete(run.id)
       const current = this.store.get(run.id)
       const cancelled = current?.cancelRequested === true

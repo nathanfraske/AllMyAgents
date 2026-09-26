@@ -6,6 +6,7 @@ export interface OverseerApprovalPolicyUpdate {
   maxRisk: 'low' | 'medium'
   requesterSessionIds?: string[]
   fileReviews?: ApprovalFileReview[]
+  reviewGuidance?: string
 }
 
 export function normalizeApprovalRequesterIds(value: unknown): string[] {
@@ -32,6 +33,9 @@ export function applyOverseerApprovalPolicyUpdate(
     throw new Error('approval policy requires enabled and a low/medium risk ceiling')
   }
   const previous = current.approvalPolicy
+  if (input.reviewGuidance !== undefined && (typeof input.reviewGuidance !== 'string' || input.reviewGuidance.length > 4000 || input.reviewGuidance.includes('\0'))) {
+    throw new Error('approval review guidance must be plain text of at most 4000 characters')
+  }
   const supplied = input.requesterSessionIds !== undefined
   const hasScope = supplied || Boolean(previous && Object.hasOwn(previous, 'requesterSessionIds'))
   const requesterSessionIds = hasScope
@@ -58,6 +62,7 @@ export function applyOverseerApprovalPolicyUpdate(
       enabled: input.enabled, maxRisk: input.maxRisk,
       ...(hasScope ? { requesterSessionIds } : {}), updatedAt,
       ...(fileReviews !== undefined ? { fileReviews: structuredClone(fileReviews) } : {}),
+      ...((input.reviewGuidance ?? previous?.reviewGuidance) !== undefined ? { reviewGuidance: (input.reviewGuidance ?? previous?.reviewGuidance ?? '').trim() } : {}),
     },
     updatedAt,
   }

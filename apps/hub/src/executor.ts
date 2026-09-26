@@ -156,6 +156,8 @@ export const AUTO_ALLOW_TOOLS = new Set([
   'mcp__allmyagents__browser_status',
   // Same-chat display only: the handler bounds/validates a workspace snapshot, not arbitrary file reads.
   'mcp__allmyagents__publish_artifact',
+  // Handler exposes read-only inventory or a mandatory exact host-authored deletion approval.
+  'mcp__allmyagents__manage_artifacts',
 ])
 export const SELF_GATING_TOOLS = new Set([
   'mcp__allmyagents__practice_write',
@@ -301,6 +303,9 @@ export interface InProcessExecutorHubHooks {
     args: Record<string, unknown>
   ): ReturnType<AgentServices['browser']>
   remoteDevices(sessionId: string): ReturnType<AgentServices['remoteDevices']>
+  publishArtifact?: AgentServices['publishArtifact']
+  manageArtifacts?: AgentServices['manageArtifacts']
+  transferFile?: AgentServices['transferFile']
   remoteExecute(
     sessionId: string,
     siteId: string,
@@ -391,6 +396,20 @@ export class InProcessExecutor implements Executor {
       manageCiMonitor: (callerSessionId, input) => this.h.managerManageCiMonitor(callerSessionId, input),
       queryTeam: (callerSessionId, input) => this.h.managerQueryTeam(callerSessionId, input),
       browser: (sessionId, operation, args) => this.h.browser(sessionId, operation, args),
+      // Resolve optional capabilities at invocation, after bindHub. Constructing the SDK tool
+      // registry must not dereference unbound hooks or freeze a stale capability function.
+      publishArtifact: (sessionId, input) => {
+        if (!this.h.publishArtifact) throw new Error('Artifact publishing is unavailable on this hub.')
+        return this.h.publishArtifact(sessionId, input)
+      },
+      manageArtifacts: (sessionId, input) => {
+        if (!this.h.manageArtifacts) throw new Error('Artifact management is unavailable on this hub.')
+        return this.h.manageArtifacts(sessionId, input)
+      },
+      transferFile: (sessionId, input) => {
+        if (!this.h.transferFile) throw new Error('Whole-file transfers are unavailable on this hub.')
+        return this.h.transferFile(sessionId, input)
+      },
       remoteDevices: (sessionId) => this.h.remoteDevices(sessionId),
       remoteExecute: (sessionId, siteId, action) => this.h.remoteExecute(sessionId, siteId, action),
       remotePrepareProjectLocation: (sessionId, siteId, rootId) =>

@@ -423,6 +423,7 @@ export interface ImportResult {
 }
 
 export interface ApprovalRecord {
+  reviewSessionId?: string
   id: string
   sessionId: string
   kind: string

@@ -5,6 +5,15 @@ import {
 import type { OverseerApprovalPolicy, OverseerConfig } from './types.js'
 
 describe('requester-scoped Overseer approval policy', () => {
+  it('stores explicit operator review precedents without granting risk or requester authority', () => {
+    const next = applyOverseerApprovalPolicyUpdate({}, { enabled: true, maxRisk: 'low', requesterSessionIds: ['a'], reviewGuidance: ' Prefer routine read-only pagination within the already granted origin. ' })
+    expect(next.approvalPolicy?.reviewGuidance).toBe('Prefer routine read-only pagination within the already granted origin.')
+    expect(approvalRequesterAllowed(next.approvalPolicy, 'b')).toBe(false)
+    expect(next.approvalPolicy?.maxRisk).toBe('low')
+    expect(applyOverseerApprovalPolicyUpdate(next, { enabled: false, maxRisk: 'low' }).approvalPolicy?.reviewGuidance).toBe(next.approvalPolicy?.reviewGuidance)
+    expect(applyOverseerApprovalPolicyUpdate(next, { enabled: false, maxRisk: 'low', reviewGuidance: '' }).approvalPolicy?.reviewGuidance).toBe('')
+    expect(() => applyOverseerApprovalPolicyUpdate(next, { enabled: true, maxRisk: 'low', reviewGuidance: 'x'.repeat(4001) })).toThrow('4000')
+  })
   it('preserves unrelated config and survives JSON persistence without broadening the scope', () => {
     const original: OverseerConfig = { profileId: 'account', operatingMode: 'eco', approvalPolicy: { enabled: false, maxRisk: 'low' } }
     const next = applyOverseerApprovalPolicyUpdate(original, { enabled: true, maxRisk: 'medium', requesterSessionIds: ['arnold', 'arnold'] })

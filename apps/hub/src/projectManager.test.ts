@@ -1782,7 +1782,9 @@ describe('project manager visibility into its own workers', () => {
       args: ['-e', 'process.stderr.write("compile failed\\n"); process.exit(19)'],
     })
     expect(result.ok).toBe(true)
-    await vi.waitFor(() => expect(controller.store.get(result.run!.id)?.state).toBe('failed'))
+    // This waits for an actual OS child, whose startup can exceed Vitest's default one second
+    // under the full parallel suite. Keep the exact failed-state and once-only delivery assertions.
+    await vi.waitFor(() => expect(controller.store.get(result.run!.id)?.state).toBe('failed'), { timeout: 10_000 })
     await vi.waitFor(() => expect(runTurn).toHaveBeenCalledOnce())
 
     expect(runTurn.mock.calls[0]?.[1]).toContain(`Durable test run ${result.run!.id}`)
@@ -1796,7 +1798,7 @@ describe('project manager visibility into its own workers', () => {
       kind: 'run/continuation-enqueued',
       payload: expect.objectContaining({ runId: result.run!.id, state: 'failed', ownerStatus: 'idle' }),
     }))
-  })
+  }, 15_000)
 
   it.each([false, true])('delivers an active run outcome exactly once, including a rejected-steer race=%s', async (rejectSteer) => {
     const { sessions, journal, bus, projects, seed, repo, runTurn, steer } = buildHub()

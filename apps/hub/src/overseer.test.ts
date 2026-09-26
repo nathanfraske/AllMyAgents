@@ -97,6 +97,59 @@ function harness() {
 }
 
 describe('application Overseer authority', () => {
+  it('requires a host-authored exact destructive approval before freeing artifact storage', async () => {
+    const h = harness()
+    h.seed({ id: 'chat' })
+    fs.writeFileSync(path.join(h.root, 'report.txt'), 'report')
+    const artifact = await h.sessions.publishArtifact('chat', { path: 'report.txt' })
+    const denied = vi.spyOn(h.approvals, 'request').mockResolvedValueOnce(false)
+    expect(await h.sessions.manageArtifacts('chat', { operation: 'delete', attachment_ids: [artifact.attachment.id] })).toMatchObject({ removed: [] })
+    expect(denied).toHaveBeenCalledWith('chat', 'artifact/delete', expect.objectContaining({ destructive: true, recoverable: false, artifacts: [{ id: artifact.attachment.id, name: 'report.txt', bytes: 6 }] }))
+    expect(h.sessions.attachment('chat', artifact.attachment.id)).toBeDefined()
+    denied.mockResolvedValueOnce(true)
+    expect(await h.sessions.manageArtifacts('chat', { operation: 'delete', attachment_ids: [artifact.attachment.id] })).toMatchObject({ usage: { files: 0 } })
+    expect(h.sessions.attachment('chat', artifact.attachment.id)).toBeUndefined()
+    expect(fs.readFileSync(path.join(h.root, 'report.txt'), 'utf8')).toBe('report')
+  })
+  it('wakes once for new mail after a transient failure without replaying operator authority', async () => {
+    const h = harness()
+    const overseer = h.seed({ id: 'overseer', isOverseer: true, status: 'active', permissionMode: 'full' })
+    h.markOperator('overseer')
+    h.seed({ id: 'worker' })
+    h.sessions.failTurn('overseer', 'stream disconnected: connection reset')
+    expect(overseer).toMatchObject({ status: 'error', overseerErrorRecovery: 'ready' })
+    expect(h.sessions.busSend('worker', { kind: 'session', id: 'overseer' }, 'FYI', 'checkpoint', false).ok).toBe(true)
+    expect(h.executor.runTurn).not.toHaveBeenCalled()
+    expect(h.sessions.busSend('worker', { kind: 'session', id: 'overseer' }, 'new task', 'Please inspect new mail').ok).toBe(true)
+    expect(h.executor.runTurn).toHaveBeenCalledOnce()
+    expect(h.executor.runTurn).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'overseer', permissionMode: 'edits' }), expect.stringContaining('Please inspect new mail'), 'bus')
+    h.sessions.failTurn('overseer', 'stream disconnected: connection reset')
+    const retry = h.sessions.busSend('worker', { kind: 'session', id: 'overseer' }, 'followup', 'still waiting')
+    expect(retry).toMatchObject({ ok: true, deferred: 1, error: expect.stringContaining('operator recovery') })
+    expect(h.executor.runTurn).toHaveBeenCalledOnce()
+    expect(h.bus.pending('overseer')).toHaveLength(1)
+  })
+
+  it.each(['cyberPolicy: connection reset', 'usage limit reached', 'unknown failure', 'OAuth expired'])('does not wake an errored Overseer for %s', message => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, status: 'active' }); h.seed({ id: 'worker' })
+    h.sessions.failTurn('overseer', message)
+    expect(h.sessions.busSend('worker', { kind: 'session', id: 'overseer' }, 'help', 'new request')).toMatchObject({ deferred: 1 })
+    expect(h.executor.runTurn).not.toHaveBeenCalled()
+    expect(h.bus.pending('overseer')).toHaveLength(1)
+  })
+
+  it('keeps mail queued after a transient error while the account is exhausted', () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, status: 'active' }); h.seed({ id: 'worker' })
+    h.sessions.failTurn('overseer', 'fetch failed')
+    const usage = (h.sessions as unknown as { usage: UsageMonitor }).usage
+    usage.noteClaude('p1', { status: 'rejected', resetsAt: Date.now() / 1000 + 60 })
+    h.sessions.busSend('worker', { kind: 'session', id: 'overseer' }, 'help', 'new request')
+    expect(h.executor.runTurn).not.toHaveBeenCalled()
+    expect(h.bus.pending('overseer')).toHaveLength(1)
+  })
+
   it('allows a reviewed one-shot denial without another operator turn, but requires an explicit decision and reason', async () => {
     const h = harness()
     h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })

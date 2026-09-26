@@ -11,6 +11,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      qualify_local:
+        description: One-time fleet qualification (ordinary runs follow repository configuration)
+        type: boolean
+        default: false
 
 # Superseded runs on the same branch/PR are cancelled to save runner minutes.
 concurrency:
@@ -23,7 +29,7 @@ jobs:
   # ---------------------------------------------------------------------------------------------
   gates:
     name: js gates (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ (vars.TEST_FLEET_CI == 'enabled' || (github.event_name == 'workflow_dispatch' && inputs.qualify_local)) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && ((matrix.os == 'ubuntu-latest' && fromJSON('["self-hosted","Linux","X64","test-fleet","linux-docker-x64"]')) || (matrix.os == 'windows-latest' && fromJSON('["self-hosted","Windows","X64","test-fleet","windows-native-x64"]'))) || matrix.os }}
     timeout-minutes: 20
     strategy:
       # Never let one OS failing hide the result on the others.
@@ -32,6 +38,18 @@ jobs:
         os: [windows-latest, macos-latest, ubuntu-latest]
 
     steps:
+      - name: Prepare local Windows tools and resource budget
+        if: runner.environment == 'self-hosted' && runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          & C:\actions-runner\fleet\release-v1\setup_windows_release.ps1
+          $node=@('C:\actions-runner\externals\node24\bin\node.exe','C:\actions-runner\externals\node20\bin\node.exe') | Where-Object {Test-Path -LiteralPath $_} | Select-Object -First 1
+          if(-not $node){throw 'Actions runner Node runtime is missing'}
+          $values=& $node --input-type=module -e "import {currentBudget,jobEnvironment} from 'file:///C:/actions-runner/fleet/release-v1/resources_job.mjs';for(const [k,v] of Object.entries(jobEnvironment(currentBudget())))console.log(k+'='+v)"
+          if($LASTEXITCODE -ne 0){throw 'Resource budget could not be configured'}
+          foreach($line in $values){[IO.File]::AppendAllText($env:GITHUB_ENV,$line+[Environment]::NewLine,[Text.UTF8Encoding]::new($false))}
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -169,7 +187,7 @@ jobs:
   # ---------------------------------------------------------------------------------------------
   rust:
     name: tauri shell (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ (vars.TEST_FLEET_CI == 'enabled' || (github.event_name == 'workflow_dispatch' && inputs.qualify_local)) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && ((matrix.os == 'ubuntu-latest' && fromJSON('["self-hosted","Linux","X64","test-fleet","linux-docker-x64"]')) || (matrix.os == 'windows-latest' && fromJSON('["self-hosted","Windows","X64","test-fleet","windows-native-x64"]'))) || matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -177,6 +195,18 @@ jobs:
         os: [windows-latest, macos-latest]
 
     steps:
+      - name: Prepare local Windows tools and resource budget
+        if: runner.environment == 'self-hosted' && runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          & C:\actions-runner\fleet\release-v1\setup_windows_release.ps1
+          $node=@('C:\actions-runner\externals\node24\bin\node.exe','C:\actions-runner\externals\node20\bin\node.exe') | Where-Object {Test-Path -LiteralPath $_} | Select-Object -First 1
+          if(-not $node){throw 'Actions runner Node runtime is missing'}
+          $values=& $node --input-type=module -e "import {currentBudget,jobEnvironment} from 'file:///C:/actions-runner/fleet/release-v1/resources_job.mjs';for(const [k,v] of Object.entries(jobEnvironment(currentBudget())))console.log(k+'='+v)"
+          if($LASTEXITCODE -ne 0){throw 'Resource budget could not be configured'}
+          foreach($line in $values){[IO.File]::AppendAllText($env:GITHUB_ENV,$line+[Environment]::NewLine,[Text.UTF8Encoding]::new($false))}
+
       - name: Checkout
         uses: actions/checkout@v4
 

@@ -13,6 +13,15 @@ const SAFE: DangerFlags = { busCanUseRiskyTools: false, autoApprovePractices: fa
 const idA: SessionIdentity = { sessionId: 's1', profileId: 'a1', provider: 'codex', projectId: 'p1', label: 'alpha' }
 const idNoProject: SessionIdentity = { sessionId: 's2', profileId: 'a2', provider: 'codex', label: 'beta' }
 
+describe('whole-file transfer identity', () => {
+  it('binds transfer requests to the live requester and returns metadata rather than bytes', async () => {
+    const h = makeHarness()
+    h.services.transferFile = vi.fn(async () => ({ id: 'transfer', state: 'running' }))
+    expect(await runAgentTool('remote_transfer_file', { operation: 'upload', device_id: 'box', root_id: 'root', local_path: 'file', remote_path: 'out' }, { identity: idA, services: h.services })).toContain('transfer')
+    expect(h.services.transferFile).toHaveBeenCalledWith('s1', expect.objectContaining({ operation: 'upload', device_id: 'box' }))
+  })
+})
+
 describe('compact durable run inspection', () => {
   const run: DurableRun = {
     id: 'run-1', projectId: 'p1', sessionId: 's1', actorSessionId: 's1', actorLabel: 'manager',
@@ -253,6 +262,7 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
       'browser_download',
       'browser_download_read',
       'publish_artifact',
+      'manage_artifacts',
       'browser_screenshot',
       'browser_status',
       'remote_list_devices',
@@ -264,6 +274,7 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
       'remote_read_file',
       'remote_create_directory',
       'remote_write_file',
+      'remote_transfer_file',
       'remote_exec',
       'overseer_control',
     ])

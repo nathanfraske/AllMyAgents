@@ -192,12 +192,13 @@
         <span class="switch" aria-hidden="true"><span></span></span>
       </button>
       {#if enabled}
+        <p class="note">This chat’s Full Access mode allows browser navigation and interaction without per-action approval prompts on operator-started turns. Safe and Edits modes still ask. The separate grants below remain in effect.</p>
         <button class="capability" class:on={localNetworkEnabled} onclick={setLocalNetwork} disabled={busy}>
           <span><b>Local network &amp; dev servers</b><small>Loopback, private, and link-local sites</small></span>
           <span>{localNetworkEnabled ? 'on' : 'off'}</span>
         </button>
         <button class="capability" class:on={tabsEnabled} onclick={setTabs} disabled={busy}>
-          <span><b>Additional tabs</b><small>Each new tab needs a one-use operator approval</small></span>
+          <span><b>Additional tabs</b><small>Full Access skips per-tab prompts; Safe and Edits ask</small></span>
           <span>{tabsEnabled ? 'on' : 'off'}</span>
         </button>
         <button class="capability" class:on={downloadsEnabled} onclick={setDownloads} disabled={busy}>

@@ -11,7 +11,7 @@ const hub = path.join(root, 'apps', 'hub')
 const output = path.join(root, 'apps', 'desktop', 'src-tauri', 'testbed-runtime')
 const distOutput = path.join(output, 'dist')
 const runtimeName = process.platform === 'win32' ? 'node.exe' : 'node'
-const modules = ['testbedNode.js', 'deviceToken.js', 'remoteDevices.js', 'directHubProtocol.js', 'myOwnMeshRpc.js']
+const modules = ['testbedNode.js', 'deviceToken.js', 'remoteDevices.js', 'directHubProtocol.js', 'myOwnMeshRpc.js', 'fileTransfers.js']
 const tauriConfig = JSON.parse(fs.readFileSync(path.join(root, 'apps', 'desktop', 'src-tauri', 'tauri.conf.json'), 'utf8'))
 let sourceCommit
 try {

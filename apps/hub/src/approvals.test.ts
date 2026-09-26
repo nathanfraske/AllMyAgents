@@ -26,6 +26,21 @@ afterEach(() => {
 })
 
 describe('ApprovalService — existing new-request paths (regression)', () => {
+  it('routes pending attention without changing decision binding or making a decision', async () => {
+    const h = fresh()
+    const result = h.approvals.request('worker', 'browser/action', { target: 'next' }, 'pending')
+    const binding = h.approvals.inspectPending('pending')!.binding
+    h.approvals.routeForReview('pending', 'overseer')
+    h.approvals.routeForReview('pending', 'overseer')
+    expect(h.approvals.pending()[0]).toMatchObject({ sessionId: 'worker', reviewSessionId: 'overseer', status: 'pending' })
+    expect(h.approvals.inspectPending('pending')!.binding).toBe(binding)
+    expect(h.count('approval/review-routed')).toBe(1)
+    expect(h.count('approval/resolved')).toBe(0)
+    h.approvals.resolve('pending', false)
+    await expect(result).resolves.toBe(false)
+    h.approvals.routeForReview('pending', 'overseer')
+    expect(h.approvals.pending()).toEqual([])
+  })
   it('binds inspection to an invocation and immutable input, not just a reusable approval id', async () => {
     const { approvals } = fresh()
     const payload = { toolName: 'Read' }

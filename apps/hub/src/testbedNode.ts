@@ -38,7 +38,7 @@ const AUDIT_GENERATIONS = 4
 const PAIR_CODE_TTL_MS = 10 * 60 * 1000
 const MESSAGE_REPLAY_TTL_MS = 10 * 60 * 1000
 const PAIR_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-const TESTBED_MODULES = ['testbedNode.js', 'deviceToken.js', 'remoteDevices.js', 'directHubProtocol.js', 'myOwnMeshRpc.js'] as const
+const TESTBED_MODULES = ['testbedNode.js', 'deviceToken.js', 'remoteDevices.js', 'fileTransfers.js', 'directHubProtocol.js', 'myOwnMeshRpc.js'] as const
 const TESTBED_SERVICE = 'allmyagents-testbed.service'
 const LINUX_SHARED_TOOLCHAIN_HOME = '/opt/allmyagents-toolchains'
 const LINUX_TOOLCHAIN_PROFILE = '/etc/profile.d/allmyagents-toolchains.sh'
@@ -431,7 +431,7 @@ export async function startTestbedNode(dataDirInput: string): Promise<{ stop: ()
       : {}
     if (!content.action || typeof content.action !== 'object' || Array.isArray(content.action)) throw new Error('action must be an object')
     const action = content.action as RemoteDeviceAction
-    if (!['probe', 'inspect', 'git_inspect', 'git_sync', 'list', 'read', 'mkdir', 'write', 'exec', 'exec_start', 'exec_status', 'exec_cancel'].includes(action.op)) {
+    if (!['probe', 'inspect', 'git_inspect', 'git_sync', 'list', 'read', 'mkdir', 'write', 'exec', 'exec_start', 'exec_status', 'exec_cancel', 'file_transfer'].includes(action.op)) {
       throw new Error('unknown remote device operation')
     }
     const actor = content.actor && typeof content.actor === 'object' && !Array.isArray(content.actor)
@@ -440,8 +440,9 @@ export async function startTestbedNode(dataDirInput: string): Promise<{ stop: ()
     const durableRunId = typeof actor.durableRunId === 'string'
       ? actor.durableRunId.slice(0, 128)
       : undefined
-    const result = await executor.execute(action, { durableRunId })
-    if (action.op !== 'exec_status') appendTestbedAudit(dataDir, 'device/action', {
+    const result = await executor.execute(action, { durableRunId, transferOwner: `${envelope.sourceSiteId}:${String(actor.sessionId ?? '').slice(0, 256)}` })
+    if (action.op !== 'exec_status' && !(action.op === 'file_transfer' && ['chunk', 'status'].includes(action.transfer?.operation))) appendTestbedAudit(dataDir, 'device/action', {
+      ...(action.op === 'file_transfer' ? { transferId: action.transfer?.id?.slice(0, 128), transferOperation: action.transfer?.operation, transferSize: result.transfer?.size, transferSha256: result.transfer?.sha256 } : {}),
       sourceSiteId: envelope.sourceSiteId,
       messageId: envelope.messageId,
       profile: config.profile,

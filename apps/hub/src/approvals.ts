@@ -157,6 +157,14 @@ export class ApprovalService {
     return [...this.pendingMap.values()].map((e) => e.record)
   }
 
+  /** Display routing, authored only by the hub; doesn't modify payload or the decision binding. */
+  routeForReview(id: string, reviewerSessionId: string): void {
+    const entry = this.pendingMap.get(id)
+    if (!entry || entry.record.reviewSessionId === reviewerSessionId) return
+    entry.record.reviewSessionId = reviewerSessionId
+    this.journal.append(entry.record.sessionId, 'approval/review-routed', { id, reviewerSessionId })
+  }
+
   /** A fresh invocation + exact payload binding, not merely the reusable worker approval id. */
   inspectPending(id: string): { record: ApprovalRecord; binding: string; expiresAt: number } | undefined {
     const entry = this.pendingMap.get(id)

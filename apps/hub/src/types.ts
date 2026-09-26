@@ -185,6 +185,8 @@ export interface DeferredOperatorTurn {
 }
 
 export interface SessionRecord {
+  /** One fresh bus wake after a transient Overseer failure; never replay the failed turn. */
+  overseerErrorRecovery?: 'ready' | 'attempted' | 'blocked'
   id: string
   profileId: string
   provider: Provider
@@ -377,6 +379,8 @@ export type ApprovalStatus = 'pending' | 'approved' | 'denied' | 'timeout'
 export type ApprovalPersistence = 'session' | 'always'
 
 export interface ApprovalRecord {
+  /** UI routing only; never an approval capability or a substitute for a fresh review binding. */
+  reviewSessionId?: string
   id: string
   sessionId: string
   kind: string
@@ -716,6 +720,8 @@ export interface OverseerApprovalPolicy {
   requesterSessionIds?: string[]
   /** Optional exact operator-reviewed no-execution file contracts; never automatic approvals. */
   fileReviews?: import('./approvalReview.js').ApprovalFileReview[]
+  /** Explicit operator precedent for REVIEW, never a risk classification or a new grant. */
+  reviewGuidance?: string
   updatedAt?: string
 }
 

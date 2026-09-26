@@ -773,14 +773,16 @@ export function startServer(opts: ServerOptions): http.Server {
         throw new Error('action must be an object')
       }
       const action = content.action as RemoteDeviceAction
-      if (!['probe', 'inspect', 'git_inspect', 'git_sync', 'list', 'read', 'mkdir', 'write', 'exec', 'exec_start', 'exec_status', 'exec_cancel'].includes(action.op)) throw new Error('unknown remote device operation')
+      if (!['probe', 'inspect', 'git_inspect', 'git_sync', 'list', 'read', 'mkdir', 'write', 'exec', 'exec_start', 'exec_status', 'exec_cancel', 'file_transfer'].includes(action.op)) throw new Error('unknown remote device operation')
       const actor = content.actor && typeof content.actor === 'object' && !Array.isArray(content.actor)
         ? content.actor as Record<string, unknown>
         : {}
       const result = await deviceExecutor.execute(action, {
         durableRunId: (str(actor.durableRunId) ?? '').slice(0, 128) || undefined,
+        transferOwner: `${envelope.sourceSiteId}:${(str(actor.sessionId) ?? '').slice(0, 256)}`,
       })
-      if (action.op !== 'exec_status') journal.append(null, 'device-executor/action', {
+      if (action.op !== 'exec_status' && !(action.op === 'file_transfer' && ['chunk', 'status'].includes(action.transfer?.operation))) journal.append(null, 'device-executor/action', {
+        ...(action.op === 'file_transfer' ? { transferId: action.transfer?.id?.slice(0, 128), transferOperation: action.transfer?.operation, transferSize: result.transfer?.size, transferSha256: result.transfer?.sha256 } : {}),
         op: action.op,
         rootId: (str(action.rootId) ?? '').slice(0, 128),
         sourceSiteId: envelope.sourceSiteId,
@@ -2543,7 +2545,7 @@ export function startServer(opts: ServerOptions): http.Server {
           return
         }
         const action = body.action as RemoteDeviceAction
-        if (!['probe', 'inspect', 'git_inspect', 'git_sync', 'list', 'read', 'mkdir', 'write', 'exec', 'exec_start', 'exec_status', 'exec_cancel'].includes(action.op)) {
+        if (!['probe', 'inspect', 'git_inspect', 'git_sync', 'list', 'read', 'mkdir', 'write', 'exec', 'exec_start', 'exec_status', 'exec_cancel', 'file_transfer'].includes(action.op)) {
           json(res, { error: 'unknown remote device operation' }, 400)
           return
         }
@@ -2552,8 +2554,10 @@ export function startServer(opts: ServerOptions): http.Server {
           : {}
         const result = await deviceExecutor.execute(action, {
           durableRunId: (str(actor.durableRunId) ?? '').slice(0, 128) || undefined,
+          transferOwner: `site:${(str(actor.sessionId) ?? '').slice(0, 256)}`,
         })
-        if (action.op !== 'exec_status') journal.append(null, 'device-executor/action', {
+        if (action.op !== 'exec_status' && !(action.op === 'file_transfer' && ['chunk', 'status'].includes(action.transfer?.operation))) journal.append(null, 'device-executor/action', {
+          ...(action.op === 'file_transfer' ? { transferId: action.transfer?.id?.slice(0, 128), transferOperation: action.transfer?.operation, transferSize: result.transfer?.size, transferSha256: result.transfer?.sha256 } : {}),
           op: action.op,
           rootId: (str(action.rootId) ?? '').slice(0, 128),
           path: (str(action.op === 'exec' ? action.cwd : action.op === 'read' || action.op === 'write' || action.op === 'list' ? action.path : undefined) ?? '').slice(0, 4096),

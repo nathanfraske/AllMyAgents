@@ -1,6 +1,9 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import * as childProcess from 'node:child_process'
+import { EventEmitter } from 'node:events'
+import { PassThrough } from 'node:stream'
 import Database from 'better-sqlite3'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
@@ -9,6 +12,11 @@ import {
   captureRunProvenance,
   type DurableRunStartInput,
 } from './durableRuns.js'
+
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>()
+  return { ...actual, spawn: vi.fn(actual.spawn) }
+})
 
 const opened: Database.Database[] = []
 const temporary: string[] = []
@@ -61,6 +69,44 @@ async function waitForTerminal(store: DurableRunStore, id: string): Promise<void
 }
 
 describe('DurableRunStore', () => {
+  it('clears local timers and fences late child output and completion after shutdown', async () => {
+    const { store, cwd, db } = harness()
+    const journal = { append: vi.fn() }
+    const controller = new DurableRunController(store, journal as never, path.join(cwd, 'logs'))
+    controllers.push(controller)
+    const runInput = input(cwd)
+    const run = store.create(runInput, await captureRunProvenance(runInput))
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn(),
+    })
+    const spawned = vi.spyOn(childProcess, 'spawn').mockReturnValue(child as unknown as childProcess.ChildProcess)
+    try {
+      vi.useFakeTimers()
+      controller.activate()
+      expect(spawned).toHaveBeenCalledOnce()
+      expect(store.get(run.id)?.state).toBe('running')
+      controller.shutdown()
+      expect(vi.getTimerCount()).toBe(0)
+      // Shutdown is not a witnessed completion/cancellation. A successor reconciles this receipt.
+      expect(store.get(run.id)?.state).toBe('running')
+      opened.splice(opened.indexOf(db), 1)
+      db.close()
+      const events = journal.append.mock.calls.length
+      expect(() => {
+        child.stdout.emit('data', Buffer.from('late stdout'))
+        child.stderr.emit('data', Buffer.from('late stderr'))
+        child.emit('close', 0, null)
+        child.emit('error', new Error('late child error'))
+      }).not.toThrow()
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(journal.append).toHaveBeenCalledTimes(events)
+      expect(fs.existsSync(path.join(cwd, 'logs', run.id, 'stdout.log'))).toBe(false)
+      expect(fs.existsSync(path.join(cwd, 'logs', run.id, 'stderr.log'))).toBe(false)
+    } finally {
+      spawned.mockRestore()
+    }
+  })
+
   it('stops remote heartbeats at shutdown and discards late results after the database closes', async () => {
     const { store, cwd, db } = harness()
     const journal = { append: vi.fn() }

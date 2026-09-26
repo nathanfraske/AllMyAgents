@@ -179,7 +179,7 @@ function sanitizeValue(value: unknown, fieldName: string | undefined, ancestors:
   for (const [key, field] of Object.entries(source)) {
     // SDK image blocks commonly spell bytes `{type:"base64", data:"..."}`. `data` alone is far too
     // generic to classify globally, so only treat it as binary under that explicit discriminator.
-    const effectiveKey = base64Envelope && key === 'data' ? 'base64' : key
+    const effectiveKey = (base64Envelope && key === 'data') || (source.encoding === 'base64' && key === 'content') ? 'base64' : key
     clean[key] = sanitizeValue(field, effectiveKey, ancestors)
   }
   ancestors.delete(value)

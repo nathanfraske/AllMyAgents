@@ -25,6 +25,52 @@ function fixture() {
 }
 
 describe('chat artifact publication', () => {
+  it('lists bounded usage and removes only exact approved snapshots, retaining a tombstone and sources', async () => {
+    const h = fixture()
+    const a = await h.artifacts.publish(h.workspace, { path: 'render.png' })
+    const b = await h.artifacts.publish(h.workspace, { path: 'render.png', caption: 'keep' })
+    const other = await h.artifacts.publish({ ...h.workspace, id: 'other' }, { path: 'render.png' })
+    expect(h.artifacts.inventory(h.workspace.id)).toMatchObject({ usage: { files: 2, bytes: PNG.length * 2 }, nextOffset: null })
+    expect(() => h.artifacts.removalPlan(h.workspace.id, [other.attachment.id])).toThrow('not owned')
+    expect(() => h.artifacts.removalPlan(h.workspace.id, [a.attachment.id, a.attachment.id])).toThrow('unique')
+    const result = h.artifacts.removeApproved(h.workspace.id, h.artifacts.removalPlan(h.workspace.id, [a.attachment.id]))
+    expect(result).toMatchObject({ recoverable: false, usage: { files: 1, bytes: PNG.length } })
+    expect(new ChatArtifacts(h.journal, h.storage).get(h.workspace.id, a.attachment.id)).toBeUndefined()
+    expect(h.artifacts.get(h.workspace.id, b.attachment.id)).toBeDefined()
+    expect(h.artifacts.get('other', other.attachment.id)).toBeDefined()
+    expect(fs.readFileSync(path.join(h.cwd, 'render.png'))).toEqual(PNG)
+    expect(h.journal.db.prepare("SELECT COUNT(*) n FROM events WHERE kind='artifact/removed'").get()).toEqual({ n: 1 })
+    // Deleted IDs cannot accidentally delete a newer publication of identical bytes.
+    const again = await h.artifacts.publish(h.workspace, { path: 'render.png' })
+    expect(again.attachment.id).not.toBe(a.attachment.id)
+    expect(() => h.artifacts.removeApproved(h.workspace.id, result.removed)).toThrow('unavailable')
+  })
+
+  it('retains quota and a resumable removal intent after partial I/O failure', async () => {
+    const h = fixture()
+    const a = await h.artifacts.publish(h.workspace, { path: 'render.png' })
+    const plan = h.artifacts.removalPlan(h.workspace.id, [a.attachment.id])
+    const unlink = fs.unlinkSync.bind(fs)
+    vi.spyOn(fs, 'unlinkSync').mockImplementation(file => {
+      if (String(file).endsWith('.json')) throw new Error('disk error')
+      unlink(file)
+    })
+    expect(() => h.artifacts.removeApproved(h.workspace.id, plan)).toThrow('disk error')
+    expect(h.artifacts.inventory(h.workspace.id).usage.files).toBe(1)
+    expect(h.artifacts.get(h.workspace.id, a.attachment.id)).toBeUndefined()
+    vi.restoreAllMocks()
+    expect(new ChatArtifacts(h.journal, h.storage).removeApproved(h.workspace.id, plan).usage.files).toBe(0)
+  })
+
+  it('refuses a changed approval plan without removing anything', async () => {
+    const h = fixture()
+    const a = await h.artifacts.publish(h.workspace, { path: 'render.png' })
+    const plan = h.artifacts.removalPlan(h.workspace.id, [a.attachment.id])
+    plan[0]!.name = 'different.png'
+    expect(() => h.artifacts.removeApproved(h.workspace.id, plan)).toThrow('changed')
+    expect(h.artifacts.get(h.workspace.id, a.attachment.id)).toBeDefined()
+  })
+
   it('snapshots independently of the source and restores without embedding bytes in history', async () => {
     const h = fixture()
     const result = await h.artifacts.publish(h.workspace, { path: 'render.png', caption: 'Fit preview' })
@@ -123,6 +169,13 @@ describe('chat artifact publication', () => {
     expect(result.displayed).toBe(true)
     expect(AUTO_ALLOW_TOOLS.has('mcp__allmyagents__publish_artifact')).toBe(true)
     expect(relayRpc).toHaveBeenCalledWith('artifact.publish', { sessionId: h.workspace.id, input: { path: 'render.png' } })
+  })
+
+  it('relays artifact storage actions with the authenticated chat identity, not a caller-supplied id', async () => {
+    const relayRpc = vi.fn(async () => ({ usage: { files: 0, bytes: 0 } }))
+    const services = buildWorkerAgentServices({ relayRpc, relayApproval: async () => false, isBusTurn: () => true, danger: () => ({ busCanUseRiskyTools: false, autoApprovePractices: false }), journal: () => {} })
+    await runAgentTool('manage_artifacts', { operation: 'list', sessionId: 'forged' }, { identity: { sessionId: 'own', provider: 'codex', profileId: 'p', label: 'agent' }, services })
+    expect(relayRpc).toHaveBeenCalledWith('artifact.manage', { sessionId: 'own', input: { operation: 'list' } })
   })
 
   it('does not trust a file extension as proof of an inline image', () => {

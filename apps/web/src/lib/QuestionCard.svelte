@@ -7,6 +7,7 @@
     error,
     ordinal = 1,
     total = 1,
+    idPrefix = 'question',
     onsubmit,
     oncancel,
   }: {
@@ -14,6 +15,7 @@
     error?: string
     ordinal?: number
     total?: number
+    idPrefix?: string
     onsubmit: (answers: Record<string, string>) => Promise<void>
     oncancel: () => Promise<void>
   } = $props()
@@ -47,11 +49,11 @@
   }
 
   function descriptionId(questionIndex: number, optionIndex: number): string {
-    return `question-${record.id}-${questionIndex}-${optionIndex}-description`
+    return `${idPrefix}-${record.id}-${questionIndex}-${optionIndex}-description`
   }
 
   function previewId(questionIndex: number, optionIndex: number): string {
-    return `question-${record.id}-${questionIndex}-${optionIndex}-preview`
+    return `${idPrefix}-${record.id}-${questionIndex}-${optionIndex}-preview`
   }
 
   function choose(questionIndex: number, optionIndex: number, multiSelect: boolean): void {
@@ -182,7 +184,7 @@
                 type={question.multiSelect ? 'checkbox' : 'radio'}
                 aria-label={option.label}
                 aria-describedby={`${descriptionId(questionIndex, optionIndex)}${option.preview ? ` ${previewId(questionIndex, optionIndex)}` : ''}`}
-                name={`question-${record.id}-${questionIndex}`}
+                name={`${idPrefix}-${record.id}-${questionIndex}`}
                 checked={selected(questionIndex, optionIndex)}
                 onchange={() => choose(questionIndex, optionIndex, question.multiSelect)}
                 onfocus={() => activatePreview(questionIndex, optionIndex)}
@@ -200,7 +202,7 @@
               type={question.multiSelect ? 'checkbox' : 'radio'}
               aria-label="Other"
               aria-describedby={descriptionId(questionIndex, OTHER)}
-              name={`question-${record.id}-${questionIndex}`}
+              name={`${idPrefix}-${record.id}-${questionIndex}`}
               checked={selected(questionIndex, OTHER)}
               onchange={() => choose(questionIndex, OTHER, question.multiSelect)}
             />

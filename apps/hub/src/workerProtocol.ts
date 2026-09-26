@@ -147,6 +147,8 @@ export type RelayMethod =
   | 'practices.list'
   | 'browser.execute'
   | 'artifact.publish'
+  | 'artifact.manage'
+  | 'remote.transferFile'
   | 'remote.list'
   | 'remote.execute'
   | 'remote.prepareProjectLocation'
