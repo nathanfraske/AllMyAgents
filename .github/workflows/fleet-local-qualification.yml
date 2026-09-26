@@ -1,0 +1,107 @@
+name: Fleet local release qualification
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Platform to qualify
+        type: choice
+        options: [both, linux, windows]
+        default: both
+        required: true
+permissions:
+  contents: read
+jobs:
+  linux-package:
+    if: github.repository == 'nathanfraske/AllMyAgents' && github.ref == 'refs/heads/main' && inputs.profile != 'windows'
+    runs-on: [self-hosted, Linux, X64, test-fleet, linux-docker-x64]
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: f856ae5693db41dd7cbb02399fa80c01d4c95fd3
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.3'
+      - name: Verify native repository runner and persistent cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = nathanfraske/AllMyAgents
+          test "$(git rev-parse HEAD)" = f856ae5693db41dd7cbb02399fa80c01d4c95fd3
+          test "$RUNNER_TOOL_CACHE" = /var/cache/test-fleet/toolcache
+          test "$(cat /var/cache/test-fleet/cache-survival-marker)" = 0244d049-ffcd-4d14-8e8d-7ba774af9d18
+          printf 'Native repository=%s runner=%s cpus=%s\n' "$GITHUB_REPOSITORY" "$RUNNER_NAME" "$(nproc)"
+      - name: Qualify the original Linux release package
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm run testbed:bundle
+          bash -n scripts/install-linux.sh
+          node --test scripts/install-linux.test.mjs
+          node scripts/package-testbed-linux.mjs
+          node scripts/test-linux-testbed.mjs target/linux-testbed/*.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fleet-linux-x64-f856ae5
+          path: target/linux-testbed/*.deb*
+          if-no-files-found: error
+  windows-signed:
+    if: github.repository == 'nathanfraske/AllMyAgents' && github.ref == 'refs/heads/main' && inputs.profile != 'linux'
+    runs-on: [self-hosted, Windows, X64, test-fleet, windows-native-x64]
+    timeout-minutes: 180
+    steps:
+      - name: Require the existing updater signing key
+        shell: powershell
+        env:
+          HAS_UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+        run: |
+          if($env:HAS_UPDATER_KEY -ne 'true'){throw 'Existing updater signing key is required'}
+      - name: Prepare the reviewed release toolchain
+        shell: powershell
+        run: '& C:\actions-runner\fleet\release-v1\setup_windows_release.ps1'
+      - uses: actions/checkout@v4
+        with:
+          ref: f856ae5693db41dd7cbb02399fa80c01d4c95fd3
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.3'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Set memory-aware compiler concurrency
+        shell: pwsh
+        run: |
+          $values=& node --input-type=module -e "import {currentBudget,jobEnvironment} from 'file:///C:/actions-runner/fleet/release-v1/resources_job.mjs';const b=currentBudget();for(const [k,v] of Object.entries(jobEnvironment(b)))console.log(k+'='+v)"
+          if($LASTEXITCODE -ne 0){throw 'Resource allocation failed'}
+          foreach($line in $values){[IO.File]::AppendAllText($env:GITHUB_ENV,$line+[Environment]::NewLine,[Text.UTF8Encoding]::new($false))}
+      - name: Build signed updater installers without publishing
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: D:\TestFleetCache\release-targets\allmyagents
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $ErrorActionPreference='Stop'
+          if((git rev-parse HEAD) -ne 'f856ae5693db41dd7cbb02399fa80c01d4c95fd3'){throw 'Source commit mismatch'}
+          pnpm install --frozen-lockfile
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          pnpm run bundle:audit
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          $config=Join-Path $env:RUNNER_TEMP 'fleet-signed-qualification.json'
+          [IO.File]::WriteAllText($config,'{"bundle":{"useLocalToolsDir":true}}',[Text.UTF8Encoding]::new($false))
+          pnpm --filter desktop exec tauri build --config $config
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          $artifacts=@(Get-ChildItem -Path (Join-Path $env:CARGO_TARGET_DIR 'release/bundle/msi/*.msi'),(Join-Path $env:CARGO_TARGET_DIR 'release/bundle/nsis/*-setup.exe') -ErrorAction Stop)
+          if($artifacts.Count -lt 2){throw 'Expected MSI and NSIS outputs'}
+          foreach($artifact in $artifacts){if(-not(Test-Path -LiteralPath ($artifact.FullName+'.sig'))){throw 'Missing updater signature'}}
+          $artifacts|ForEach-Object {Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256|Select-Object Path,Hash}|ConvertTo-Json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fleet-windows-x64-updater-signed-f856ae5
+          path: |
+            D:/TestFleetCache/release-targets/allmyagents/release/bundle/msi/*.msi*
+            D:/TestFleetCache/release-targets/allmyagents/release/bundle/nsis/*-setup.exe*
+          if-no-files-found: error
