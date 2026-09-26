@@ -16,6 +16,7 @@
   } = $props()
 
   const devices = $derived(buildDeviceOverview(fleet, localCapabilities, remoteCatalog))
+  const discoveryIssues = $derived(fleet.filter(site => site.local).flatMap(site => site.discoveryIssues ?? []))
 
   function deploymentLabel(capabilities: DeviceExecutorCapabilities): string | null {
     if (capabilities.deploymentProfile === 'scoped') return 'Scoped node'
@@ -35,6 +36,13 @@
 </script>
 
 <div class="overview" aria-label="Connected device overview">
+  {#if discoveryIssues.length}
+    <div class="discovery-warning" role="alert">
+      <strong>Device discovery is incomplete</strong>
+      {#each discoveryIssues as issue}<p>{issue.message}</p>{/each}
+      <p>Detected devices below are not automatically paired or authorized. Resolve the connection issue and refresh; reinstalling the remote node or generating another pairing code will not repair a local control connection.</p>
+    </div>
+  {/if}
   <div class="overview-summary">
     <div>
       <strong>{devices.length} {devices.length === 1 ? 'device' : 'devices'}</strong>
@@ -64,14 +72,14 @@
               <strong>{device.label}</strong>
               <small>{device.local ? `This machine${capabilities?.hostname ? ` · ${capabilities.hostname}` : ''}` : capabilities?.hostname || device.siteId.slice(0, 12)}</small>
             </span>
-            <span class="reachability" class:online={device.online}>{device.online ? 'online' : 'offline'}</span>
+            <span class="reachability" class:online={device.online}>{device.online ? 'online' : device.discoveryOnly ? 'detected' : 'offline'}</span>
           </header>
 
           <div class="roles">
             {#each device.roles as role}
               <span class="role" class:testbed={role === 'testbed'}>{role === 'hub' ? 'Hub' : 'Testbed'}</span>
             {/each}
-            {#if device.roles.length === 0}<span class="role unknown">Role unavailable</span>{/if}
+            {#if device.roles.length === 0}<span class="role unknown">{device.discoveryOnly ? 'Not yet linked' : 'Role unavailable'}</span>{/if}
             {#if deployment}<span class="role elevated">{deployment}</span>{/if}
           </div>
 
@@ -119,6 +127,9 @@
 
 <style>
   .overview { display: grid; gap: var(--space-3); }
+  .discovery-warning { padding: var(--space-3); border: 1px solid var(--warn); border-radius: var(--r-md); color: var(--text); font-size: var(--text-xs); }
+  .discovery-warning strong { color: var(--warn); }
+  .discovery-warning p { margin: var(--space-2) 0 0; line-height: 1.5; }
   .overview-summary { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
   .overview-summary > div { display: flex; align-items: baseline; gap: var(--space-2); }
   .overview-summary strong { font-size: var(--text-sm); }

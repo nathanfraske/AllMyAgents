@@ -24,7 +24,7 @@ export function conversationImages(trigger: HTMLButtonElement): GalleryImage[] {
 
 /** Capture before document/composer/window-bubble shortcuts. A held Escape's repeats and
  * keyup remain consumed after the viewer unmounts, so one press cannot dismiss two layers. */
-export function captureViewerKeys(close: () => void, step: (delta: number) => void): () => void {
+export function captureViewerKeys(close: () => void, step?: (delta: number) => void): () => void {
   let active = true
   let escapeHeld = false
   const consume = (e: KeyboardEvent) => { e.preventDefault(); e.stopImmediatePropagation() }
@@ -40,14 +40,14 @@ export function captureViewerKeys(close: () => void, step: (delta: number) => vo
       return
     }
     if (e.key === 'Escape') { consume(e); escapeHeld = true; active = false; close() }
-    else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+    else if (step && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
       consume(e)
       step(e.key === 'ArrowLeft' ? -1 : 1)
     }
   }
   const up = (e: KeyboardEvent) => {
     if (e.key === 'Escape' && escapeHeld) { consume(e); escapeHeld = false; if (!active) remove() }
-    else if (active && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) consume(e)
+    else if (active && step && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) consume(e)
   }
   const blur = () => { escapeHeld = false; if (!active) remove() }
   window.addEventListener('keydown', down, true)

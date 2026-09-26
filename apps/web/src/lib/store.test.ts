@@ -115,6 +115,24 @@ describe('owner preferences', () => {
   })
 })
 
+describe('background whole-file transfers', () => {
+  it('updates one stable row without flicker, focus changes, or sidebar activity churn; history uses the same key', () => {
+    seed('s'); store.selectedId = 's'
+    const before = store.sessions.s!.lastActivity
+    const events: HubEvent[] = []
+    for (let i = 0; i < 10; i++) {
+      const event = evt({ seq: i + 1, sessionId: 's', ts: '2026-01-02T00:00:00Z', kind: i === 9 ? 'file-transfer/completed' : 'file-transfer/progress', payload: { id: 'x', direction: 'upload', localPath: 'bundle.zip', size: 9 * 1048576, transferred: i * 1048576 } })
+      events.push(event); apply(event)
+      if (i < 9) expect(store.sessions.s!.lastActivity).toBe(before)
+    }
+    expect(store.sessions.s!.items).toHaveLength(1)
+    expect(store.sessions.s!.items[0]).toMatchObject({ key: 'file-transfer:x', kind: 'note', text: expect.stringContaining('completed — 9.0/9.0 MiB') })
+    expect(store.selectedId).toBe('s')
+    expect(reduceJournalHistory(events)).toHaveLength(1)
+    expect(reduceJournalHistory(events)[0]!.key).toBe('file-transfer:x')
+  })
+})
+
 describe('Overseer account handoff', () => {
   it('uses the singleton Overseer configuration path instead of creating an Unfiled chat', async () => {
     const cold = new HubStore()
@@ -968,6 +986,23 @@ describe('apply()', () => {
 })
 
 describe('automatic signed-fleet trust', () => {
+  it('never transmits a pairing code or automatically trusts a presence-only device', async () => {
+    const site = {
+      siteId: 'presence-only', label: 'cec-kub', local: false, baseUrl: '',
+      online: false, directOnline: false, discoveryOnly: true,
+      routeError: 'MyOwnMesh control denied access.',
+    }
+    const isolated = new HubStore()
+    isolated.fleetSites = [site]
+    await (isolated as unknown as { autoTrustFleetSite(site: unknown): Promise<void> }).autoTrustFleetSite(site)
+    expect(await isolated.pairFleetSite(site.siteId, 'ABCD1234')).toBe(false)
+    expect(api.pairFleetSiteDirect).not.toHaveBeenCalled()
+    expect(api.pairFleetSiteSite).not.toHaveBeenCalled()
+    expect(api.saveFleetConnection).not.toHaveBeenCalled()
+    expect(localStorage.getItem('test.fleet.presence-only')).toBeNull()
+    expect(isolated.fleetSites[0]?.authError).toBe(site.routeError)
+  })
+
   it('links a direct same-fleet hub with no pairing code and retains its reciprocal credential', async () => {
     const site = {
       siteId: 'peer',

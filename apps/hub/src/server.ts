@@ -31,7 +31,8 @@ import { tokenMatches } from './deviceToken.js'
 import { PairingCodeBroker } from './pairingCode.js'
 import { pickFolder } from './native.js'
 import { computeStats } from './stats.js'
-import { buildFleet, probeHubRoute, rosterAuthorizesDevice } from './fleet.js'
+import { buildFleet, probeHubRoute, rosterAuthorizesDevice, type FleetDiscoveryIssue } from './fleet.js'
+import { addFleetDiscovery } from './fleetDiscovery.js'
 import { credentialsExist, type LoginAuthMode } from './loginLauncher.js'
 import type { ProfileLoginCoordinator } from './profileLoginCoordinator.js'
 import { readProjectConfig } from './importScan.js'
@@ -70,6 +71,7 @@ import {
   type OverseerModeUpdate,
 } from './overseerMode.js'
 import type { MyOwnMeshRpcBridge } from './myOwnMeshRpc.js'
+import { applyOverseerApprovalPolicyUpdate, type OverseerApprovalPolicyUpdate } from './overseerApprovalPolicy.js'
 import type { TestbedDeploymentService } from './testbedDeployment.js'
 import {
   EphemeralNotificationService,
@@ -634,19 +636,8 @@ export function startServer(opts: ServerOptions): http.Server {
     sessions.refreshOverseerInstructions()
     return next
   }
-  const configureOverseerApprovalPolicy = (input: {
-    enabled: boolean
-    maxRisk: 'low' | 'medium'
-  }): OverseerConfig => {
-    const next: OverseerConfig = {
-      ...overseer,
-      approvalPolicy: {
-        enabled: input.enabled,
-        maxRisk: input.maxRisk,
-        updatedAt: new Date().toISOString(),
-      },
-      updatedAt: new Date().toISOString(),
-    }
+  const configureOverseerApprovalPolicy = (input: OverseerApprovalPolicyUpdate): OverseerConfig => {
+    const next = applyOverseerApprovalPolicyUpdate(overseer, input)
     const persistError = patchConfig(configPath, 'overseer', next)
     if (persistError) throw new Error(`Overseer approval policy could not be persisted: ${persistError}`)
     Object.assign(overseer, next)
@@ -782,14 +773,16 @@ export function startServer(opts: ServerOptions): http.Server {
         throw new Error('action must be an object')
       }
       const action = content.action as RemoteDeviceAction
-      if (!['probe', 'inspect', 'git_inspect', 'git_sync', 'list', 'read', 'mkdir', 'write', 'exec', 'exec_start', 'exec_status', 'exec_cancel'].includes(action.op)) throw new Error('unknown remote device operation')
+      if (!['probe', 'inspect', 'git_inspect', 'git_sync', 'list', 'read', 'mkdir', 'write', 'exec', 'exec_start', 'exec_status', 'exec_cancel', 'file_transfer'].includes(action.op)) throw new Error('unknown remote device operation')
       const actor = content.actor && typeof content.actor === 'object' && !Array.isArray(content.actor)
         ? content.actor as Record<string, unknown>
         : {}
       const result = await deviceExecutor.execute(action, {
         durableRunId: (str(actor.durableRunId) ?? '').slice(0, 128) || undefined,
+        transferOwner: `${envelope.sourceSiteId}:${(str(actor.sessionId) ?? '').slice(0, 256)}`,
       })
-      if (action.op !== 'exec_status') journal.append(null, 'device-executor/action', {
+      if (action.op !== 'exec_status' && !(action.op === 'file_transfer' && ['chunk', 'status'].includes(action.transfer?.operation))) journal.append(null, 'device-executor/action', {
+        ...(action.op === 'file_transfer' ? { transferId: action.transfer?.id?.slice(0, 128), transferOperation: action.transfer?.operation, transferSize: result.transfer?.size, transferSha256: result.transfer?.sha256 } : {}),
         op: action.op,
         rootId: (str(action.rootId) ?? '').slice(0, 128),
         sourceSiteId: envelope.sourceSiteId,
@@ -2463,12 +2456,24 @@ export function startServer(opts: ServerOptions): http.Server {
       if (method === 'GET' && url.pathname === '/api/fleet') {
         const m = mesh.status()
         const forceRouteRecovery = url.searchParams.get('refresh') === '1'
+        const discoveryIssues: FleetDiscoveryIssue[] = []
+        const issue = (code: string, error: unknown): void => {
+          discoveryIssues.push({ source: 'allmystuff', code, message: String(error instanceof Error ? error.message : error).slice(0, 2_000) })
+        }
+        const [roster, presence, directPeers] = m.enabled ? await Promise.all([
+          mesh.ownedRosterRequired().catch(error => { issue('roster-unavailable', error); return [] }),
+          mesh.peerSitesRequired().catch(error => { issue('presence-unavailable', error); return [] }),
+          directMesh?.peers(forceRouteRecovery).catch(error => {
+            discoveryIssues.push({ source: 'myownmesh', code: 'control-error', message: String(error).slice(0, 2_000) })
+            return []
+          }) ?? [],
+        ]) : [[], [], []]
         const sites = await buildFleet({
           localSiteId: m.siteId,
           localLabel: m.label,
           localBaseUrl: `http://127.0.0.1:${m.port}`,
-          roster: () => mesh.ownedRoster(),
-          peerSites: () => mesh.peerSites(),
+          roster: async () => roster,
+          peerSites: async () => presence,
           siteMap: (node, p) => mesh.siteMap(node, p),
           // A background roster poll is observational. Destroying and recreating the Site mapping after
           // one slow health response also kills the healthy remote WebSocket that was proving the route
@@ -2488,32 +2493,9 @@ export function startServer(opts: ServerOptions): http.Server {
           probeRoute: (baseUrl) => probeHubRoute(baseUrl, 5000),
           extraPorts: meshPeerPorts,
         })
-        const directPeers = m.enabled
-          ? await directMesh?.peers(forceRouteRecovery).catch(() => []) ?? []
-          : []
-        for (const peer of directPeers) {
-          const existing = sites.find((site) => !site.local && site.siteId === peer.siteId)
-          if (existing) {
-            existing.directOnline = peer.online
-            existing.directStatus = peer.status
-            if (peer.rttMs !== undefined) existing.directRttMs = peer.rttMs
-            continue
-          }
-          sites.push({
-            siteId: peer.siteId,
-            label: peer.label,
-            local: false,
-            baseUrl: '',
-            online: false,
-            directOnline: peer.online,
-            directStatus: peer.status,
-            ...(peer.rttMs === undefined ? {} : { directRttMs: peer.rttMs }),
-            routeError: peer.online
-              ? 'The site-free MyOwnMesh control channel is live, but this peer has no usable TCP Site route for the unified chat view.'
-              : `MyOwnMesh peer state is ${peer.status}; direct hub control is not active.`,
-          })
-        }
-        json(res, sites)
+        json(res, addFleetDiscovery(sites, presence, directPeers, m.enabled
+          ? directMesh?.status() ?? { available: false, method: 'allmyagents.hub.v1', reason: 'not-started' }
+          : undefined, discoveryIssues))
         return
       }
       // Target-side testbed boundary. Device authentication proves the operator paired this hub; the
@@ -2563,7 +2545,7 @@ export function startServer(opts: ServerOptions): http.Server {
           return
         }
         const action = body.action as RemoteDeviceAction
-        if (!['probe', 'inspect', 'git_inspect', 'git_sync', 'list', 'read', 'mkdir', 'write', 'exec', 'exec_start', 'exec_status', 'exec_cancel'].includes(action.op)) {
+        if (!['probe', 'inspect', 'git_inspect', 'git_sync', 'list', 'read', 'mkdir', 'write', 'exec', 'exec_start', 'exec_status', 'exec_cancel', 'file_transfer'].includes(action.op)) {
           json(res, { error: 'unknown remote device operation' }, 400)
           return
         }
@@ -2572,8 +2554,10 @@ export function startServer(opts: ServerOptions): http.Server {
           : {}
         const result = await deviceExecutor.execute(action, {
           durableRunId: (str(actor.durableRunId) ?? '').slice(0, 128) || undefined,
+          transferOwner: `site:${(str(actor.sessionId) ?? '').slice(0, 256)}`,
         })
-        if (action.op !== 'exec_status') journal.append(null, 'device-executor/action', {
+        if (action.op !== 'exec_status' && !(action.op === 'file_transfer' && ['chunk', 'status'].includes(action.transfer?.operation))) journal.append(null, 'device-executor/action', {
+          ...(action.op === 'file_transfer' ? { transferId: action.transfer?.id?.slice(0, 128), transferOperation: action.transfer?.operation, transferSize: result.transfer?.size, transferSha256: result.transfer?.sha256 } : {}),
           op: action.op,
           rootId: (str(action.rootId) ?? '').slice(0, 128),
           path: (str(action.op === 'exec' ? action.cwd : action.op === 'read' || action.op === 'write' || action.op === 'list' ? action.path : undefined) ?? '').slice(0, 4096),

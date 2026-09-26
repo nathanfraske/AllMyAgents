@@ -1,4 +1,6 @@
 import fs from 'node:fs'
+import crypto from 'node:crypto'
+import { DeviceExecutor } from './remoteDevices.js'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
@@ -35,6 +37,32 @@ const FETCH_FORBIDDEN_PORTS = new Set([
 ])
 
 describe('fleet websocket event filtering', () => {
+  it('streams an authenticated whole file through the real API with no buffer bytes in audit events', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-transfer-api-'))
+    cleanups.push(async () => fs.rmSync(root, { recursive: true, force: true }))
+    const device = new DeviceExecutor(path.join(root, 'policy.json'))
+    const caps = device.update({ enabled: true, roots: [{ path: root, read: true, write: true, terminal: false }] })
+    const h = await build({ deviceExecutor: device })
+    const id = crypto.randomUUID(), data = Buffer.alloc(1024 * 1024 + 17, 171)
+    const digest = crypto.createHash('sha256').update(data).digest('hex')
+    const request = async (transfer: object, token = h.deviceToken, sessionId = 'chat') => fetch(`${h.base}/api/device-executor/action`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ action: { op: 'file_transfer', rootId: caps.roots[0]!.id, transfer: { id, mode: 'write', ...transfer } }, actor: { sessionId } }),
+    })
+    expect((await request({ operation: 'begin', path: 'output.bin', size: data.length }, 'bad-token')).status).toBe(401)
+    expect(await (await request({ operation: 'begin', path: 'output.bin', size: data.length })).json()).toMatchObject({ ok: true })
+    expect(await (await request({ operation: 'status' }, h.deviceToken, 'other-chat')).json()).toMatchObject({ ok: false })
+    for (let offset = 0; offset < data.length; offset += 512 * 1024) {
+      const content = data.subarray(offset, offset + 512 * 1024).toString('base64')
+      expect(await (await request({ operation: 'chunk', offset, content })).json()).toMatchObject({ ok: true })
+    }
+    expect(await (await request({ operation: 'finish', sha256: digest })).json()).toMatchObject({ ok: true, transfer: { state: 'completed', sha256: digest } })
+    expect(fs.readFileSync(path.join(root, 'output.bin')).equals(data)).toBe(true)
+    const audits = h.journal.since(0).filter(e => e.kind === 'device-executor/action')
+    expect(audits).toHaveLength(2)
+    expect(JSON.stringify(audits).length).toBeLessThan(3000)
+    expect(JSON.stringify(audits)).not.toContain(data.subarray(0, 1024).toString('base64'))
+  })
   it('keeps fleet state global while limiting transcript payloads to visible sessions', () => {
     const visible = new Set(['open-chat'])
     expect(fleetStreamEventVisible({ sessionId: 'open-chat', kind: 'claude/user' }, visible)).toBe(true)
@@ -48,7 +76,7 @@ afterEach(async () => {
   while (cleanups.length) await cleanups.pop()?.()
 })
 
-async function build(overrides: Partial<Pick<ServerOptions, 'mesh' | 'meshPeerPorts' | 'remoteDevices'>> = {}) {
+async function build(overrides: Partial<Pick<ServerOptions, 'mesh' | 'meshPeerPorts' | 'remoteDevices' | 'directMesh' | 'deviceExecutor'>> = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-server-security-'))
   const journal = new Journal(path.join(root, 'hub.db'))
   const projects = new ProjectStore(journal.db)
@@ -144,6 +172,8 @@ async function build(overrides: Partial<Pick<ServerOptions, 'mesh' | 'meshPeerPo
     } as never,
     ...(overrides.meshPeerPorts ? { meshPeerPorts: overrides.meshPeerPorts } : {}),
     ...(overrides.remoteDevices ? { remoteDevices: overrides.remoteDevices } : {}),
+    ...(overrides.deviceExecutor ? { deviceExecutor: overrides.deviceExecutor } : {}),
+    ...(overrides.directMesh ? { directMesh: overrides.directMesh } : {}),
     deviceToken,
     // The old control plane failed open in precisely this configuration.
     requireToken: false,
@@ -197,6 +227,43 @@ async function build(overrides: Partial<Pick<ServerOptions, 'mesh' | 'meshPeerPo
 function auth(token: string): HeadersInit {
   return { authorization: `Bearer ${token}` }
 }
+
+describe('shared device discovery', () => {
+  it('reports a denied direct lane and shared presence without mapping, probing or pairing that peer', async () => {
+    const siteMap = vi.fn()
+    const recoverSiteMap = vi.fn()
+    const call = vi.fn()
+    const ownedRosterRequired = vi.fn(async () => [])
+    const peerSitesRequired = vi.fn(async () => [{ device: 'ubuntu-SESSION', label: 'cec-kub', sites: [{ id: 'tcp:7777', label: 'AllMyAgents', port: 7777 }] }])
+    const peers = vi.fn(async () => [])
+    const f = await build({
+      mesh: {
+        status: () => ({ enabled: true, siteId: 'local', label: 'Controller', port: 7777 }),
+        ownedRosterRequired, peerSitesRequired, siteMap, recoverSiteMap,
+      } as never,
+      directMesh: { peers, call, setHandler: vi.fn(), status: () => ({ available: false, method: 'allmyagents.hub.v1', reason: 'permission-denied' }) } as never,
+    })
+    const unauthenticated = await fetch(`${f.base}/api/fleet`)
+    expect(unauthenticated.status).toBe(401)
+    expect(ownedRosterRequired).not.toHaveBeenCalled()
+    const response = await fetch(`${f.base}/api/fleet?refresh=1`, { headers: auth(f.deviceToken) })
+    expect(response.status).toBe(200)
+    const sites = await response.json()
+    expect(sites).toHaveLength(2)
+    expect(sites[0].discoveryIssues).toEqual([expect.objectContaining({ source: 'myownmesh', code: 'permission-denied' })])
+    expect(sites[1]).toMatchObject({ siteId: 'ubuntu', label: 'cec-kub', baseUrl: '', discoveryOnly: true, online: false, directOnline: false })
+    expect(siteMap).not.toHaveBeenCalled()
+    expect(recoverSiteMap).not.toHaveBeenCalled()
+    expect(call).not.toHaveBeenCalled()
+    expect(peers).toHaveBeenCalledWith(true)
+
+    ownedRosterRequired.mockRejectedValueOnce(new Error('roster denied'))
+    peerSitesRequired.mockRejectedValueOnce(new Error('presence denied'))
+    const degraded = await fetch(`${f.base}/api/fleet`, { headers: auth(f.deviceToken) }).then(r => r.json())
+    expect(degraded).toHaveLength(1)
+    expect(degraded[0].discoveryIssues.map((issue: { code: string }) => issue.code).sort()).toEqual(['permission-denied', 'presence-unavailable', 'roster-unavailable'])
+  })
+})
 
 describe('account model discovery', () => {
   it('does not block profile reads on automatic discovery, and deduplicates manual refresh', async () => {
@@ -530,6 +597,32 @@ describe('device-authenticated control plane', () => {
     })
     expect(repeat.status).toBe(200)
     await expect(repeat.json()).resolves.toMatchObject({ sessionId: configured.sessionId })
+  })
+
+  it('persists requester-scoped approval policy through the real server callback without changing other config', async () => {
+    const { base, deviceToken, sessions, configPath, record } = await build()
+    const response = await fetch(`${base}/api/overseer`, {
+      method: 'POST', headers: { ...auth(deviceToken), 'content-type': 'application/json' },
+      body: JSON.stringify({ profileId: 'claude-test' }),
+    })
+    expect(response.status).toBe(200)
+    const { sessionId } = await response.json() as { sessionId: string }
+    const input = { operation: 'configure_approval_policy' as const, approvalPolicyEnabled: true,
+      approvalRiskCeiling: 'medium' as const, approvalRequesterSessionIds: [record.id] }
+    const before = JSON.parse(fs.readFileSync(configPath, 'utf8'))
+    await expect(sessions.overseerControl(sessionId, input)).resolves.toMatchObject({ ok: false })
+    expect(JSON.parse(fs.readFileSync(configPath, 'utf8'))).toEqual(before)
+    ;(sessions as unknown as { operatorTurnSessions: Set<string> }).operatorTurnSessions.add(sessionId)
+    await expect(sessions.overseerControl(sessionId, input)).resolves.toMatchObject({ ok: true })
+    const saved = JSON.parse(fs.readFileSync(configPath, 'utf8'))
+    expect(saved).toMatchObject({ ...before, overseer: { ...before.overseer, approvalPolicy: {
+      enabled: true, maxRisk: 'medium', requesterSessionIds: [record.id], updatedAt: expect.any(String),
+    }, updatedAt: expect.any(String) } })
+    await expect(sessions.overseerControl(sessionId, { operation: 'get_approval_policy' }))
+      .resolves.toMatchObject({ ok: true, data: saved.overseer.approvalPolicy })
+    await expect(sessions.overseerControl(sessionId, { ...input, approvalRequesterSessionIds: ['missing'] }))
+      .resolves.toMatchObject({ ok: false })
+    expect(JSON.parse(fs.readFileSync(configPath, 'utf8'))).toEqual(saved)
   })
 
   it('accepts an authenticated WebSocket bearer header for the trusted dev proxy', async () => {

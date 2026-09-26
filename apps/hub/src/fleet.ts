@@ -1,6 +1,12 @@
 import http from 'node:http'
 import type { FleetMember, PeerSites } from './meshSite.js'
 
+export interface FleetDiscoveryIssue {
+  source: 'allmystuff' | 'myownmesh'
+  code: string
+  message: string
+}
+
 /**
  * Unified-across-mesh fleet discovery and route health.
  *
@@ -29,7 +35,11 @@ export interface FleetSite {
   /** Bounded operator-facing diagnosis when presence/mapping succeeded but hub health did not. */
   routeError?: string
   /** Machine-readable companion to routeError for remote-device callers and UI policy. */
-  routeCode?: 'site-map-unavailable' | 'hub-unreachable' | 'hub-unhealthy' | 'route-timeout' | 'route-error'
+  routeCode?: 'site-map-unavailable' | 'hub-unreachable' | 'hub-unhealthy' | 'route-timeout' | 'route-error' | 'discovery-unavailable' | 'application-unconfirmed'
+  /** Presence only: not an admitted hub/testbed and never an automatic pairing candidate. */
+  discoveryOnly?: boolean
+  /** Attached to the local entry to preserve the backwards-compatible array response. */
+  discoveryIssues?: FleetDiscoveryIssue[]
   /** A site-free MyOwnMesh RPC control lane is active even if the TCP Site tunnel is not. */
   directOnline?: boolean
   directStatus?: string

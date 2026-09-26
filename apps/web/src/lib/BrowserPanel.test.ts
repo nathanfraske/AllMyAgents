@@ -65,6 +65,8 @@ describe('BrowserPanel', () => {
     await fireEvent.click(screen.getByText('Off for this chat'))
     expect(api.setBrowserEnabled).toHaveBeenCalledWith('session-a', true)
     expect(await screen.findByText('Show browser window')).toBeTruthy()
+    expect(screen.getByText(/Full Access mode allows browser navigation and interaction/)).toBeTruthy()
+    expect(screen.getByText(/Full Access skips per-tab prompts/)).toBeTruthy()
 
     await fireEvent.click(screen.getByText('Show browser window'))
     expect(api.showBrowser).toHaveBeenCalledWith('session-a')

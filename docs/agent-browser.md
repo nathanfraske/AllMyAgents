@@ -1,5 +1,25 @@
 # Per-agent browser capability
 
+## September 2026 Full Access update (source implementation)
+
+With Browser enabled and this chat's effective permission mode set to **Full Access**, an
+operator-origin turn can navigate, click, open enabled tabs, and download enabled inert files
+without a per-action prompt. Each action still has a host-described, audited decision; native
+opaque refs, page generations, one-use tokens, and commit-time validation remain mandatory.
+Full Access revocation during approval is checked again before commit. This updates the older
+“every action asks” behavior described in the historical implementation notes below.
+
+Browser enablement, local-network access, additional tabs, and downloads remain separate grants.
+Safe/Edits modes still ask. Manager ceilings, cross-chat isolation, and the browser's operator-turn
+requirement remain enforced (including when the general any-origin Danger Zone switch is on).
+Full Access does not classify a scripted button as harmless or expand the available browser tool
+surface: raw JavaScript, arbitrary selectors, typing, uploads, and automatic file execution remain
+unsupported. Public origins accepted under Full Access are visible in the existing per-chat origin
+list and can be revoked there; changing the chat mode does not erase existing origin grants.
+
+This is source support until a build containing it is installed. It does not change any live chat's
+permission mode, install a build, or restart the hub.
+
 Research, security contract, and implementation status, revised 2026-07-30. The Windows/WebView2 implementation has
 passed its installed Edge/WebView2 Runtime 150 physical gate; non-Windows platforms remain explicitly unavailable.
 The capability stays off by default on every chat. This document distinguishes implemented Windows behavior from

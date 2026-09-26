@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { execFileSync } from 'node:child_process'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ApprovalService } from './approvals.js'
 import { AgentBus } from './bus.js'
@@ -14,6 +15,8 @@ import { PracticeStore } from './practices.js'
 import { ProjectStore } from './projects.js'
 import { QuestionService } from './questions.js'
 import { applyOverseerModeUpdate } from './overseerMode.js'
+import { applyOverseerApprovalPolicyUpdate } from './overseerApprovalPolicy.js'
+import { assessGitHubFileReview, type ApprovalFileReview } from './approvalReview.js'
 import type { RemoteDeviceController } from './remoteDevices.js'
 import { SessionManager } from './sessions.js'
 import { SessionStore } from './store.js'
@@ -94,6 +97,183 @@ function harness() {
 }
 
 describe('application Overseer authority', () => {
+  it('requires a host-authored exact destructive approval before freeing artifact storage', async () => {
+    const h = harness()
+    h.seed({ id: 'chat' })
+    fs.writeFileSync(path.join(h.root, 'report.txt'), 'report')
+    const artifact = await h.sessions.publishArtifact('chat', { path: 'report.txt' })
+    const denied = vi.spyOn(h.approvals, 'request').mockResolvedValueOnce(false)
+    expect(await h.sessions.manageArtifacts('chat', { operation: 'delete', attachment_ids: [artifact.attachment.id] })).toMatchObject({ removed: [] })
+    expect(denied).toHaveBeenCalledWith('chat', 'artifact/delete', expect.objectContaining({ destructive: true, recoverable: false, artifacts: [{ id: artifact.attachment.id, name: 'report.txt', bytes: 6 }] }))
+    expect(h.sessions.attachment('chat', artifact.attachment.id)).toBeDefined()
+    denied.mockResolvedValueOnce(true)
+    expect(await h.sessions.manageArtifacts('chat', { operation: 'delete', attachment_ids: [artifact.attachment.id] })).toMatchObject({ usage: { files: 0 } })
+    expect(h.sessions.attachment('chat', artifact.attachment.id)).toBeUndefined()
+    expect(fs.readFileSync(path.join(h.root, 'report.txt'), 'utf8')).toBe('report')
+  })
+  it('wakes once for new mail after a transient failure without replaying operator authority', async () => {
+    const h = harness()
+    const overseer = h.seed({ id: 'overseer', isOverseer: true, status: 'active', permissionMode: 'full' })
+    h.markOperator('overseer')
+    h.seed({ id: 'worker' })
+    h.sessions.failTurn('overseer', 'stream disconnected: connection reset')
+    expect(overseer).toMatchObject({ status: 'error', overseerErrorRecovery: 'ready' })
+    expect(h.sessions.busSend('worker', { kind: 'session', id: 'overseer' }, 'FYI', 'checkpoint', false).ok).toBe(true)
+    expect(h.executor.runTurn).not.toHaveBeenCalled()
+    expect(h.sessions.busSend('worker', { kind: 'session', id: 'overseer' }, 'new task', 'Please inspect new mail').ok).toBe(true)
+    expect(h.executor.runTurn).toHaveBeenCalledOnce()
+    expect(h.executor.runTurn).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'overseer', permissionMode: 'edits' }), expect.stringContaining('Please inspect new mail'), 'bus')
+    h.sessions.failTurn('overseer', 'stream disconnected: connection reset')
+    const retry = h.sessions.busSend('worker', { kind: 'session', id: 'overseer' }, 'followup', 'still waiting')
+    expect(retry).toMatchObject({ ok: true, deferred: 1, error: expect.stringContaining('operator recovery') })
+    expect(h.executor.runTurn).toHaveBeenCalledOnce()
+    expect(h.bus.pending('overseer')).toHaveLength(1)
+  })
+
+  it.each(['cyberPolicy: connection reset', 'usage limit reached', 'unknown failure', 'OAuth expired'])('does not wake an errored Overseer for %s', message => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, status: 'active' }); h.seed({ id: 'worker' })
+    h.sessions.failTurn('overseer', message)
+    expect(h.sessions.busSend('worker', { kind: 'session', id: 'overseer' }, 'help', 'new request')).toMatchObject({ deferred: 1 })
+    expect(h.executor.runTurn).not.toHaveBeenCalled()
+    expect(h.bus.pending('overseer')).toHaveLength(1)
+  })
+
+  it('keeps mail queued after a transient error while the account is exhausted', () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, status: 'active' }); h.seed({ id: 'worker' })
+    h.sessions.failTurn('overseer', 'fetch failed')
+    const usage = (h.sessions as unknown as { usage: UsageMonitor }).usage
+    usage.noteClaude('p1', { status: 'rejected', resetsAt: Date.now() / 1000 + 60 })
+    h.sessions.busSend('worker', { kind: 'session', id: 'overseer' }, 'help', 'new request')
+    expect(h.executor.runTurn).not.toHaveBeenCalled()
+    expect(h.bus.pending('overseer')).toHaveLength(1)
+  })
+
+  it('allows a reviewed one-shot denial without another operator turn, but requires an explicit decision and reason', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'arnold', permissionMode: 'safe' })
+    h.sessions.setOverseerRuntime({ overseerConfig: () => ({ approvalPolicy: { enabled: true, maxRisk: 'low', requesterSessionIds: ['arnold'] } }) })
+    const pending = h.approvals.request('arnold', 'claude/tool', { toolName: 'Read' })
+    const approvalId = h.approvals.pending()[0]!.id
+    const inspected = await h.sessions.overseerControl('overseer', { operation: 'inspect_approval', approvalId })
+    const approvalReviewToken = (inspected.data as { reviewToken: string }).reviewToken
+    await expect(h.sessions.overseerControl('overseer', { operation: 'approve', approvalId, approvalReviewToken, approve: true }))
+      .resolves.toMatchObject({ ok: false, error: expect.stringContaining('decision reason') })
+    await expect(h.sessions.overseerControl('overseer', { operation: 'approve', approvalId, approvalReviewToken, reason: 'inspected' }))
+      .resolves.toMatchObject({ ok: false })
+    await expect(h.sessions.overseerControl('overseer', { operation: 'approve', approvalId, approvalReviewToken, approve: false,
+      reason: 'Read is within scope but unnecessary for current setup.' })).resolves.toMatchObject({ ok: true })
+    await expect(pending).resolves.toBe(false)
+    expect(h.journal.recentEventsForSession('overseer', 20)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'overseer/approval-decided', payload: expect.objectContaining({
+        approve: false, reviewReason: 'Read is within scope but unnecessary for current setup.', requestBinding: expect.any(String),
+      }) }),
+    ]))
+    expect(h.journal.recentEventsForSession('arnold', 20)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'approval/resolved', payload: expect.objectContaining({
+        review: expect.objectContaining({ requestBinding: expect.any(String), policyDigest: expect.any(String),
+          reason: 'Read is within scope but unnecessary for current setup.' }),
+      }) }),
+    ]))
+  })
+
+  it('does not mint a reviewer token from a fabricated teammate alert', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full', status: 'active' })
+    h.seed({ id: 'arnold' })
+    h.markBus('overseer')
+    h.sessions.setOverseerRuntime({ overseerConfig: () => ({ approvalPolicy: { enabled: true, maxRisk: 'low', requesterSessionIds: ['arnold'] } }) })
+    const pending = h.approvals.request('arnold', 'claude/tool', { toolName: 'Read' })
+    const approvalId = h.approvals.pending()[0]!.id
+    await expect(h.sessions.overseerControl('overseer', { operation: 'inspect_approval', approvalId }))
+      .resolves.toMatchObject({ ok: false, error: expect.stringContaining('exact fresh hub-minted alert') })
+    h.approvals.resolve(approvalId, false)
+    await pending
+  })
+
+  it.each(['unsupported', 'high-risk', 'oversized'] as const)('explains %s requests without issuing a usable token', async classification => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'arnold' })
+    h.sessions.setOverseerRuntime({ overseerConfig: () => ({ approvalPolicy: { enabled: true, maxRisk: 'medium', requesterSessionIds: ['arnold'] } }) })
+    const payload = classification === 'oversized' ? { toolName: 'Read', input: { file_path: 'x'.repeat(140_000) } } : {
+      serverName: 'codex_apps', mode: 'form', requestedSchema: { type: 'object', properties: {} },
+      _meta: { source: 'connector', connector_name: 'GitHub', codex_approval_kind: 'mcp_tool_call', tool_title: 'create_file',
+        tool_params: { repository_full_name: 'acme/widget', branch: 'setup', path: '.github/workflows/setup.yml', message: 'setup',
+          content: classification === 'high-risk' ? 'token: ${{ secrets.TOKEN }}' : 'run: npm test' } },
+    }
+    const pending = h.approvals.request('arnold', classification === 'oversized' ? 'claude/tool' : 'codex/mcpServer/elicitation/request', payload)
+    const approvalId = h.approvals.pending()[0]!.id
+    const inspected = await h.sessions.overseerControl('overseer', { operation: 'inspect_approval', approvalId })
+    expect(inspected).toMatchObject({ ok: true, data: { eligible: false, code: classification === 'oversized' ? 'unsupported-size' : classification } })
+    expect(inspected.data).not.toHaveProperty('reviewToken')
+    if (classification === 'oversized') expect(inspected.data).toMatchObject({ payload: undefined, payloadOmitted: true })
+    h.approvals.resolve(approvalId, false)
+    await pending
+  })
+  it.each(['payload', 'policy', 'expiry', 'invocation', 'resolved'] as const)('fails closed when an inspected request changes: %s', async change => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'arnold', permissionMode: 'safe' })
+    const policy = { enabled: true, maxRisk: 'medium' as const, requesterSessionIds: ['arnold'] }
+    h.sessions.setOverseerRuntime({ overseerConfig: () => ({ approvalPolicy: policy }) })
+    const pending = h.approvals.request('arnold', 'claude/tool', { toolName: 'Read', input: { file_path: 'one' } }, 'same')
+    const inspected = await h.sessions.overseerControl('overseer', { operation: 'inspect_approval', approvalId: 'same' })
+    expect(inspected).toMatchObject({ ok: true, data: { eligible: true, reviewToken: expect.any(String), payload: { toolName: 'Read' } } })
+    const token = (inspected.data as { reviewToken: string }).reviewToken
+    let next: Promise<boolean> | undefined
+    if (change === 'payload') (h.approvals.pending()[0]!.payload as { input: { file_path: string } }).input.file_path = 'two'
+    if (change === 'policy') policy.requesterSessionIds = []
+    if (change === 'resolved' || change === 'invocation') {
+      h.approvals.resolve('same', false)
+      await pending
+      if (change === 'invocation') next = h.approvals.request('arnold', 'claude/tool', { toolName: 'Read', input: { file_path: 'one' } }, 'same')
+    }
+    const clock = change === 'expiry' ? vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 300_001) : undefined
+    try {
+      await expect(h.sessions.overseerControl('overseer', { operation: 'approve', approvalId: 'same', approve: true,
+        approvalReviewToken: token, reason: 'Reviewed the read-only target.' })).resolves.toMatchObject({ ok: false })
+    } finally { clock?.mockRestore() }
+    h.approvals.resolve('same', false)
+    await pending
+    await next
+  })
+
+  it.each(['create_file', 'update_file'] as const)('reviews an exact no-execution %s individually without widening auto-approval', async operation => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    const project = h.projects.create('Test Fleet', h.root)
+    h.seed({ id: 'arnold', permissionMode: 'safe', projectId: project.id })
+    execFileSync('git', ['init', '--quiet'], { cwd: h.root })
+    execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/acme/widget.git'], { cwd: h.root })
+    h.sessions.configureGitHubAutomationPolicy('session', 'arnold', ['repository_pushes'], 'operator')
+    const params = { repository_full_name: 'acme/widget', branch: 'setup', path: '.github/workflows/disabled.yml',
+      content: '# Disabled placeholder; no executable workflow\n', message: 'Reviewed placeholder',
+      ...(operation === 'update_file' ? { sha: 'a'.repeat(40) } : {}) }
+    const payload = { serverName: 'codex_apps', mode: 'form', requestedSchema: { type: 'object', properties: {} },
+      _meta: { source: 'connector', connector_name: 'GitHub', codex_approval_kind: 'mcp_tool_call', tool_title: operation, tool_params: params } }
+    const target = assessGitHubFileReview('codex/mcpServer/elicitation/request', payload, 'arnold', project.id)!.target!
+    const review: ApprovalFileReview = { ...target, operation, repository: 'acme/widget', requesterSessionId: 'arnold', projectId: project.id,
+      execution: 'none', credentials: 'none', publication: 'repository-only', destructive: false,
+      reviewReason: 'Exact bytes, branch effects and old blob reviewed by the operator; no execution hooks.',
+      expiresAt: new Date(Date.now() + 60_000).toISOString() }
+    const policy = { enabled: true, maxRisk: 'medium' as const, requesterSessionIds: ['arnold'], fileReviews: [review] }
+    h.sessions.setOverseerRuntime({ overseerConfig: () => ({ approvalPolicy: policy }) })
+    expect(h.sessions.isAutoApproved('arnold', 'codex/mcpServer/elicitation/request', payload)).toBe(false)
+    const pending = h.approvals.request('arnold', 'codex/mcpServer/elicitation/request', payload)
+    const approvalId = h.approvals.pending()[0]!.id
+    const inspected = await h.sessions.overseerControl('overseer', { operation: 'inspect_approval', approvalId })
+    expect(inspected).toMatchObject({ ok: true, data: { eligible: true, risk: 'medium', payload } })
+    const approvalReviewToken = (inspected.data as { reviewToken: string }).reviewToken
+    await expect(h.sessions.overseerControl('overseer', { operation: 'approve', approvalId, approve: true,
+      approvalReviewToken, reason: 'Exact inert placeholder within reviewed repository and existing push ceiling.' })).resolves.toMatchObject({ ok: true })
+    await expect(pending).resolves.toBe(true)
+    await expect(h.sessions.overseerControl('overseer', { operation: 'approve', approvalId, approve: true,
+      approvalReviewToken, reason: 'duplicate' })).resolves.toMatchObject({ ok: false })
+    expect(h.approvals.recentResolved()).toEqual([expect.objectContaining({ decider: 'overseer-reviewed:overseer' })])
+  })
   it('wakes an idle manager exactly once for one terminal GitHub CI result', async () => {
     const h = harness()
     h.seed({ id: 'manager', isProjectManager: true, projectId: 'project-1', title: 'Build manager' })
@@ -338,6 +518,194 @@ describe('application Overseer authority', () => {
         }),
       }),
     ]))
+  })
+
+  it('limits standing decisions to the live requester allowlist, even for exact alert-bound requests', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'arnold', permissionMode: 'safe' })
+    h.seed({ id: 'other', permissionMode: 'safe' })
+    h.sessions.setOverseerRuntime({
+      overseerConfig: () => ({ approvalPolicy: { enabled: true, maxRisk: 'low', requesterSessionIds: ['arnold'] } }),
+    })
+    const pending = h.approvals.request('other', 'claude/tool', { toolName: 'Read', input: { file_path: 'README.md' } })
+    const approvalId = h.approvals.pending()[0]!.id
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'approve', approvalId, approve: true,
+    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/requester.*scope/iu) })
+    expect(h.approvals.pending().map(item => item.id)).toContain(approvalId)
+    h.approvals.resolve(approvalId, false)
+    await pending
+  })
+
+  it('rechecks requester allowlist revocation after an approval alert was delivered', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'arnold', permissionMode: 'safe' })
+    const policy = { enabled: true, maxRisk: 'low' as const, requesterSessionIds: ['arnold'] }
+    h.sessions.setOverseerRuntime({ overseerConfig: () => ({ approvalPolicy: policy }) })
+    const pending = h.approvals.request('arnold', 'claude/tool', { toolName: 'Read', input: { file_path: 'README.md' } })
+    const approvalId = h.approvals.pending()[0]!.id
+    policy.requesterSessionIds = []
+    await expect(h.sessions.overseerControl('overseer', {
+      operation: 'approve', approvalId, approve: true,
+    })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/requester.*scope/iu) })
+    expect(h.approvals.pending().map(item => item.id)).toContain(approvalId)
+    h.approvals.resolve(approvalId, false)
+    await pending
+  })
+
+  it('configures a requester allowlist only on a direct operator turn and persists/audits it', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'arnold' })
+    let config: OverseerConfig = { operatingMode: 'eco', approvalPolicy: { enabled: false, maxRisk: 'low' } }
+    const persist = vi.fn(input => { config = JSON.parse(JSON.stringify(applyOverseerApprovalPolicyUpdate(config, input))); return config })
+    h.sessions.setOverseerRuntime({ overseerConfig: () => config, configureOverseerApprovalPolicy: persist })
+    const input = { operation: 'configure_approval_policy' as const, approvalPolicyEnabled: true,
+      approvalRiskCeiling: 'medium' as const, approvalRequesterSessionIds: ['arnold'] }
+    await expect(h.sessions.overseerControl('overseer', input)).resolves.toMatchObject({ ok: false })
+    expect(persist).not.toHaveBeenCalled()
+    h.markOperator('overseer')
+    await expect(h.sessions.overseerControl('overseer', { ...input, approvalRequesterSessionIds: undefined }))
+      .resolves.toMatchObject({ ok: false, error: expect.stringContaining('required') })
+    for (const invalid of [['missing'], ['overseer'], ['*']]) {
+      await expect(h.sessions.overseerControl('overseer', { ...input, approvalRequesterSessionIds: invalid }))
+        .resolves.toMatchObject({ ok: false })
+    }
+    expect(persist).not.toHaveBeenCalled()
+    await expect(h.sessions.overseerControl('overseer', input)).resolves.toMatchObject({
+      ok: true, data: { requesterSessionIds: ['arnold'], maxRisk: 'medium' },
+    })
+    expect(config.operatingMode).toBe('eco')
+    expect(h.journal.recentEventsForSession('overseer', 30)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'overseer/approval-policy-changed', payload: expect.objectContaining({
+        actor: 'overseer', policy: expect.objectContaining({ requesterSessionIds: ['arnold'] }),
+      }) }),
+    ]))
+    await expect(h.sessions.overseerControl('overseer', { ...input, approvalRequesterSessionIds: [] }))
+      .resolves.toMatchObject({ ok: true, data: { requesterSessionIds: [] } })
+  })
+
+  it('allows the selected requester read once without changing its tool or GitHub grants', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    const arnold = h.seed({ id: 'arnold', permissionMode: 'safe' })
+    h.sessions.setOverseerRuntime({ overseerConfig: () => ({
+      approvalPolicy: { enabled: true, maxRisk: 'medium', requesterSessionIds: ['arnold'] },
+    }) })
+    const before = structuredClone(arnold)
+    const pending = h.approvals.request('arnold', 'claude/tool', { toolName: 'Read', input: { file_path: 'README.md' } })
+    const approvalId = h.approvals.pending()[0]!.id
+    const inspected = await h.sessions.overseerControl('overseer', { operation: 'inspect_approval', approvalId })
+    const reviewToken = (inspected.data as { reviewToken: string }).reviewToken
+    await expect(h.sessions.overseerControl('overseer', { operation: 'approve', approvalId, approve: true }))
+      .resolves.toMatchObject({ ok: false, error: expect.stringContaining('review token') })
+    await expect(h.sessions.overseerControl('overseer', { operation: 'approve', approvalId, approve: true,
+      approvalReviewToken: reviewToken, reason: 'Read-only request within existing bounds.' }))
+      .resolves.toMatchObject({ ok: true })
+    await expect(pending).resolves.toBe(true)
+    expect(arnold).toEqual(before)
+    expect(h.sessions.githubAutomationPolicy('session', 'arnold').capabilities).toEqual([])
+    await expect(h.sessions.overseerControl('overseer', { operation: 'approve', approvalId, approve: true }))
+      .resolves.toMatchObject({ ok: false })
+    expect(h.journal.recentEventsForSession('overseer', 20)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'overseer/approval-decided', payload: expect.objectContaining({ requesterScope: ['arnold'] }) }),
+    ]))
+  })
+
+  const setupConnector = (operation: string, repository = 'nathanfraske/test-fleet') => ({
+    serverName: 'codex_apps', mode: 'form', requestedSchema: { type: 'object', properties: {} },
+    _meta: { source: 'connector', connector_name: 'GitHub', codex_approval_kind: 'mcp_tool_call',
+      tool_title: operation, tool_params: { repository_full_name: repository, path: '.github/workflows/setup.yml',
+        content: 'run: destructive-or-unknown-command', pr_number: 1, body: 'review update' } },
+  })
+
+  it.each([
+    ['claude/tool', { toolName: 'Bash', input: { command: 'rm -rf project' } }],
+    ['claude/tool', { toolName: 'Write', input: { file_path: 'setup.sh', content: 'rm -rf project' } }],
+    ['claude/tool', { toolName: 'Read', matchedAskRule: { source: 'operator' } }],
+    ['codex/item/fileChange/requestApproval', { toolName: 'fileChange', grantRoot: '/' }],
+    ...['create_file', 'update_file', 'create_or_update_file', 'delete_file', 'delete_repository', 'run_workflow', 'merge_pull_request']
+      .map((operation): [string, unknown] => ['codex/mcpServer/elicitation/request', setupConnector(operation)]),
+  ] as Array<[string, unknown]>)('keeps destructive, executable or unknown scoped requests operator-only: %s %j', async (kind, payload) => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'arnold', permissionMode: 'safe' })
+    h.sessions.setOverseerRuntime({ overseerConfig: () => ({
+      approvalPolicy: { enabled: true, maxRisk: 'medium', requesterSessionIds: ['arnold'] },
+    }) })
+    const pending = h.approvals.request('arnold', kind as string, payload)
+    const approvalId = h.approvals.pending()[0]!.id
+    for (const approve of [true, false]) {
+      await expect(h.sessions.overseerControl('overseer', { operation: 'approve', approvalId, approve }))
+        .resolves.toMatchObject({ ok: false })
+    }
+    expect(h.approvals.pending().map(item => item.id)).toContain(approvalId)
+    h.approvals.resolve(approvalId, false)
+    await pending
+  })
+
+  it('keeps self and unrelated approvals outside a requester-scoped alert turn', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'arnold' })
+    h.sessions.setOverseerRuntime({ overseerConfig: () => ({
+      approvalPolicy: { enabled: true, maxRisk: 'medium', requesterSessionIds: ['arnold', 'overseer'] },
+    }) })
+    h.markBus('overseer')
+    const pending = h.approvals.request('overseer', 'claude/tool', { toolName: 'Read' })
+    const approvalId = h.approvals.pending()[0]!.id
+    ;(h.sessions as unknown as { overseerApprovalTurnIds: Map<string, Set<string>> })
+      .overseerApprovalTurnIds.set('overseer', new Set([approvalId]))
+    await expect(h.sessions.overseerControl('overseer', { operation: 'approve', approvalId, approve: true }))
+      .resolves.toMatchObject({ ok: false, error: expect.stringContaining('own tool') })
+    h.approvals.resolve(approvalId, false)
+    await pending
+    const other = h.approvals.request('arnold', 'claude/tool', { toolName: 'Read' })
+    const otherId = h.approvals.pending()[0]!.id
+    ;(h.sessions as unknown as { overseerApprovalTurnIds: Map<string, Set<string>> })
+      .overseerApprovalTurnIds.set('overseer', new Set([approvalId]))
+    await expect(h.sessions.overseerControl('overseer', { operation: 'approve', approvalId: otherId, approve: true }))
+      .resolves.toMatchObject({ ok: false, error: expect.stringContaining('direct operator turn') })
+    h.approvals.resolve(otherId, false)
+    await other
+  })
+
+  it.each(['tool', 'device', 'repository', 'github-capability', 'revoked-manager', 'delegated-tool'] as const)('preserves the requester %s ceiling under scoped delegation', async boundary => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    const project = h.projects.create('Test Fleet', h.root)
+    const arnold = h.seed({ id: 'arnold', permissionMode: 'safe', projectId: project.id })
+    h.sessions.setOverseerRuntime({ overseerConfig: () => ({
+      approvalPolicy: { enabled: true, maxRisk: 'medium', requesterSessionIds: ['arnold'] },
+    }) })
+    if (boundary === 'tool') {
+      arnold.isProjectManager = true
+      arnold.managerAllowedTools = ['web']
+    }
+    if (boundary === 'revoked-manager' || boundary === 'delegated-tool') {
+      h.seed({ id: 'manager', projectId: project.id, isProjectManager: boundary !== 'revoked-manager', managerAllowedTools: ['file_read'] })
+      arnold.parentSessionId = 'manager'
+      arnold.managerRootSessionId = 'manager'
+      arnold.delegatedTools = boundary === 'delegated-tool' ? ['web'] : ['file_read']
+    }
+    if (boundary === 'repository' || boundary === 'github-capability') {
+      execFileSync('git', ['init', '--quiet'], { cwd: h.root })
+      execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/nathanfraske/test-fleet.git'], { cwd: h.root })
+      if (boundary === 'repository') h.sessions.configureGitHubAutomationPolicy('session', 'arnold', ['pull_requests'], 'operator')
+    }
+    const kind = boundary === 'repository' || boundary === 'github-capability' ? 'codex/mcpServer/elicitation/request' : 'claude/tool'
+    const payload = boundary === 'repository' ? setupConnector('update_pull_request', 'nathanfraske/AllMyAgents')
+      : boundary === 'github-capability' ? setupConnector('update_pull_request')
+      : boundary === 'device' ? { toolName: 'remote_read_file', input: { device_id: 'new-device', root_id: 'machine', path: 'config' } }
+      : { toolName: 'Read', input: { file_path: 'README.md' } }
+    const pending = h.approvals.request('arnold', kind, payload)
+    const approvalId = h.approvals.pending()[0]!.id
+    await expect(h.sessions.overseerControl('overseer', { operation: 'approve', approvalId, approve: true }))
+      .resolves.toMatchObject({ ok: false, error: expect.stringMatching(/ceiling|boundary|grant/u) })
+    h.approvals.resolve(approvalId, false)
+    await pending
   })
 
   it('persists a connector approval only on a direct operator turn and only within advertised scopes', async () => {
@@ -1358,6 +1726,94 @@ describe('application Overseer authority', () => {
       kind: 'overseer/remote-testbed-authorized',
       payload: expect.objectContaining({ sessionId: 'manager', siteId: 'build-rig' }),
     }))
+  })
+
+  it('authorizes a new testbed without rechecking an unchanged offline device grant', async () => {
+    const h = harness()
+    const oldGrant = { siteId: 'offline-k3', rootIds: ['machine'], capabilities: ['read', 'write', 'terminal'] as const }
+    h.seed({ id: 'chat', remoteDeviceGrants: [{ ...oldGrant, capabilities: [...oldGrant.capabilities] }] })
+    const capabilities = vi.fn(async (siteId: string) => {
+      if (siteId === 'offline-k3') throw new Error('This paired device is not present in the signed AllMyStuff fleet roster.')
+      return { enabled: true, platform: 'linux', arch: 'x64', hostname: 'cec-kub',
+        roots: [{ id: 'machine', label: 'Machine', path: '/', read: true, write: true, terminal: true }] }
+    })
+    h.sessions.setRemoteDeviceController({ capabilities } as unknown as RemoteDeviceController)
+
+    const result = await h.sessions.authorizeRemoteTestbed('chat', 'cec-kub')
+
+    expect(result.record.remoteDeviceGrants).toEqual([
+      oldGrant, { siteId: 'cec-kub', rootIds: ['machine'], capabilities: ['read', 'write', 'terminal'] },
+    ])
+    expect(capabilities.mock.calls.map(([siteId]) => siteId)).not.toContain('offline-k3')
+    expect(h.store.all().find((record) => record.id === 'chat')?.remoteDeviceGrants).toEqual(result.record.remoteDeviceGrants)
+  })
+
+  it('can revoke one device and narrow another while both devices are offline', async () => {
+    const h = harness()
+    h.seed({ id: 'chat', remoteDeviceGrants: [
+      { siteId: 'keep', rootIds: ['a', 'b'], capabilities: ['read', 'write'] },
+      { siteId: 'remove', rootIds: ['a'], capabilities: ['read'] },
+    ] })
+    const capabilities = vi.fn(async () => { throw new Error('offline') })
+    h.sessions.setRemoteDeviceController({ capabilities } as unknown as RemoteDeviceController)
+    const narrowed = [{ siteId: 'keep', rootIds: ['a'], capabilities: ['read'] as const }]
+
+    await expect(h.sessions.configureRemoteDeviceGrants('chat', narrowed.map(grant => ({ ...grant, capabilities: [...grant.capabilities] }))))
+      .resolves.toMatchObject({ remoteDeviceGrants: narrowed })
+
+    expect(capabilities).not.toHaveBeenCalled()
+    expect(h.store.all().find(record => record.id === 'chat')?.remoteDeviceGrants).toEqual(narrowed)
+  })
+
+  it.each([
+    { siteId: 'new-device', rootIds: ['a'], capabilities: ['read'] },
+    { siteId: 'offline', rootIds: ['new-root'], capabilities: ['read'] },
+    { siteId: 'offline', rootIds: ['a'], capabilities: ['terminal'] },
+    // Capabilities held on a different root are not authority on this root.
+    { siteId: 'offline', rootIds: ['a', 'b'], capabilities: ['read', 'write'] },
+  ] as const)('requires a live target for expanded grants: %j', async (requested) => {
+    const h = harness()
+    const record = h.seed({ id: 'chat', remoteDeviceGrants: [
+      { siteId: 'offline', rootIds: ['a'], capabilities: ['read'] },
+      { siteId: 'offline', rootIds: ['b'], capabilities: ['write'] },
+    ] })
+    const before = structuredClone(record.remoteDeviceGrants)
+    const capabilities = vi.fn(async () => { throw new Error('offline: cannot admit new authority') })
+    h.sessions.setRemoteDeviceController({ capabilities } as unknown as RemoteDeviceController)
+
+    await expect(h.sessions.configureRemoteDeviceGrants('chat', [{
+      ...requested, rootIds: [...requested.rootIds], capabilities: [...requested.capabilities],
+    }])).rejects.toThrow('cannot admit new authority')
+
+    expect(capabilities).toHaveBeenCalledWith(requested.siteId)
+    expect(record.remoteDeviceGrants).toEqual(before)
+    expect(h.journal.recentEventsForSession('chat', 10).filter(event => event.kind === 'session/remote-device-grants')).toEqual([])
+  })
+
+  it('does not restore concurrently revoked grants after a slow capability check', async () => {
+    const h = harness()
+    h.seed({ id: 'chat', remoteDeviceGrants: [
+      { siteId: 'old', rootIds: ['a'], capabilities: ['read'] },
+    ] })
+    let finish!: () => void
+    const pending = new Promise<void>(resolve => { finish = resolve })
+    const capabilities = vi.fn(async () => {
+      await pending
+      return { enabled: true, platform: 'linux', arch: 'x64', hostname: 'new',
+        roots: [{ id: 'a', label: 'Root', path: '/', read: true, write: false, terminal: false }] }
+    })
+    h.sessions.setRemoteDeviceController({ capabilities } as unknown as RemoteDeviceController)
+    const saving = h.sessions.configureRemoteDeviceGrants('chat', [
+      { siteId: 'old', rootIds: ['a'], capabilities: ['read'] },
+      { siteId: 'new', rootIds: ['a'], capabilities: ['read'] },
+    ])
+    const rejected = expect(saving).rejects.toThrow('permissions changed while saving')
+
+    await h.sessions.configureRemoteDeviceGrants('chat', [])
+    finish()
+    await rejected
+
+    expect(h.store.all().find(record => record.id === 'chat')?.remoteDeviceGrants).toBeUndefined()
   })
 
   it('requires configured scope, a separate operator approval, and the elevation runner', async () => {

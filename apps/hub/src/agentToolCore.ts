@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { approvalFileReviewSchema, type ApprovalFileReview } from './approvalReview.js'
 import { durableRunView } from './durableRunView.js'
 import type { SessionIdentity } from './identity.js'
 import { readableScopes } from './identity.js'
@@ -31,7 +32,7 @@ import type {
   DurableRunState,
 } from './durableRuns.js'
 import type { GitHubCiMonitorRecord, GitHubCiWakeOutcome } from './githubCiMonitor.js'
-import type { PublishArtifactInput, PublishedArtifact } from './chatArtifacts.js'
+import type { PublishArtifactInput, PublishedArtifact, ManageArtifactsInput } from './chatArtifacts.js'
 
 export interface OverseerControlInput {
   operation:
@@ -48,6 +49,7 @@ export interface OverseerControlInput {
     | 'stop_chat'
     | 'reopen_chat'
     | 'approve'
+    | 'inspect_approval'
     | 'get_approval_policy'
     | 'configure_approval_policy'
     | 'set_mode'
@@ -83,6 +85,7 @@ export interface OverseerControlInput {
   profileId?: string
   sessionId?: string
   approvalId?: string
+  approvalReviewToken?: string
   presetId?: string
   cloneJobId?: string
   name?: string
@@ -97,6 +100,9 @@ export interface OverseerControlInput {
   persist?: ApprovalPersistence
   approvalPolicyEnabled?: boolean
   approvalRiskCeiling?: 'low' | 'medium'
+  approvalRequesterSessionIds?: string[]
+  approvalFileReviews?: ApprovalFileReview[]
+  approvalReviewGuidance?: string
   reauth?: boolean
   provider?: Provider
   permissionMode?: 'safe' | 'edits' | 'full'
@@ -230,8 +236,10 @@ export interface PracticeServices {
  * how the hub attributes the call to an identity.
  */
 export interface AgentServices {
+  transferFile?(sessionId: string, input: import('./remoteFileTransfers.js').TransferFileInput): Awaitable<unknown>
   /** Publish a bounded workspace output to this exact chat; never a message to another agent. */
   publishArtifact?(sessionId: string, input: PublishArtifactInput): Awaitable<PublishedArtifact>
+  manageArtifacts?(sessionId: string, input: ManageArtifactsInput): Awaitable<unknown>
   /** Live operator-owned own-project run authority, not an agent-supplied role. */
   hasOwnRunGrant?(sessionId: string): Awaitable<boolean>
   /** Send a bus message from `from` to a teammate (session) or the whole project. */
@@ -1259,7 +1267,7 @@ const browserRead = defineTool({
 const browserClick = defineTool({
   name: 'browser_click',
   description:
-    'Click one semantic element from the most recent browser_read_page result. Requires its exact opaque ref and pageGeneration; raw selectors, JavaScript, coordinates, and guessed targets are not accepted. Every click is revalidated by the desktop host and requires operator approval.',
+    'Click one semantic element from the most recent browser_read_page result. Requires its exact opaque ref and pageGeneration; raw selectors, JavaScript, coordinates, and guessed targets are not accepted. Every click is revalidated by the desktop host. Full Access on an operator-origin turn permits interaction without per-click prompts; Safe/Edits still ask. Browser enablement and local-network grants remain separate.',
   schema: {
     ref: z.string().min(16).max(160).describe('opaque element ref returned by browser_read_page'),
     page_generation: z.string().min(16).max(160).describe('opaque pageGeneration returned by browser_read_page'),
@@ -1285,7 +1293,7 @@ const browserTabs = defineTool({
 const browserOpenTab = defineTool({
   name: 'browser_open_tab',
   description:
-    'Open one new session-owned tab at an absolute http(s) URL. The operator must enable tabs for this chat and approve the one-use tab creation token.',
+    'Open one new session-owned tab at an absolute http(s) URL. The operator must enable tabs for this chat. The host validates a one-use creation token; Full Access on an operator-origin turn skips the per-tab prompt, while Safe/Edits still ask.',
   schema: {
     url: z.string().url().describe('absolute http or https URL'),
     target_summary: z.string().trim().min(1).max(240).describe('short reason shown in the approval prompt'),
@@ -1316,7 +1324,7 @@ const browserCloseTab = defineTool({
 const browserDownload = defineTool({
   name: 'browser_download',
   description:
-    'Download one semantic link from the most recent browser_read_page result into this chat\'s inert, quota-bound native download area. Requires the exact opaque ref and pageGeneration plus operator approval. It cannot choose a path, execute, auto-open, or share the result.',
+    'Download one semantic link from the most recent browser_read_page result into this chat\'s inert, quota-bound native download area. Requires the exact opaque ref and pageGeneration plus the separate Downloads grant. Full Access on an operator-origin turn skips the per-download prompt; Safe/Edits still ask. It cannot choose a path, execute, auto-open, or share the result.',
   schema: {
     ref: z.string().min(16).max(160).describe('opaque download/link ref returned by browser_read_page'),
     page_generation: z.string().min(16).max(160).describe('opaque pageGeneration returned by browser_read_page'),
@@ -1355,6 +1363,20 @@ const publishArtifact = defineTool({
     if (!services.publishArtifact) return 'Artifact display is unavailable on this hub version.'
     const result = await services.publishArtifact(identity.sessionId, args)
     return JSON.stringify({ ...result, displayed: true, message: 'Visible in this chat. Do not embed local paths or repeat the image bytes in your response.' })
+  },
+})
+
+const manageArtifacts = defineTool({
+  name: 'manage_artifacts',
+  description: 'Inspect this chat’s published artifact usage and a bounded inventory. If full, select obsolete exact attachment_ids and request delete: the hub asks the operator once for those immutable snapshots. Permanent deletion breaks their historical previews; it never removes workspace sources, operator uploads, or other chats. No automatic cleanup or blanket folder deletion. A failed/partial cleanup can be inspected with list before requesting remaining IDs.',
+  schema: {
+    operation: z.enum(['list', 'delete']),
+    attachment_ids: z.array(z.string().uuid()).min(1).max(16).optional(),
+    offset: z.number().int().min(0).optional(),
+  },
+  run: async (args, { identity, services }) => {
+    if (!services.manageArtifacts) return 'Artifact storage management is unavailable on this hub version.'
+    return JSON.stringify(await services.manageArtifacts(identity.sessionId, args))
   },
 })
 
@@ -1493,6 +1515,23 @@ const remoteReadFile = defineTool({
     })
     if (!result.ok) return `Remote read failed: ${result.error ?? 'unknown error'} ${remoteTelemetry(result)}`
     return `Remote file (${result.bytes ?? 0} bytes, ${result.encoding ?? 'utf8'}${result.truncated ? ', truncated' : ''}):\n${result.content ?? ''}\n${remoteTelemetry(result)}`
+  },
+})
+
+const remoteTransferFile = defineTool({
+  name: 'remote_transfer_file',
+  description: 'Start one whole-file upload/download between your workspace and an explicitly granted remote root, or inspect/cancel your transfer by id. Bytes stay out of chat; the hub streams bounded buffers, verifies SHA-256, and atomically publishes a new file without overwriting. Returns immediately with a durable transfer id; completion mail arrives once. Parents must exist. Limit 256 MiB; target must advertise fileTransfers v1. Never restart an outcome_unknown transfer: inspect status/destination first. No shell, SSH, implicit install, or fallback to repeated model chunks.',
+  schema: {
+    operation: z.enum(['upload', 'download', 'status', 'cancel']),
+    transfer_id: z.string().uuid().optional(),
+    device_id: z.string().min(1).max(256).optional(),
+    root_id: z.string().min(1).max(128).optional(),
+    local_path: z.string().min(1).max(4096).optional(),
+    remote_path: z.string().min(1).max(4096).optional(),
+  },
+  run: async (args, { identity, services }) => {
+    if (!services.transferFile) return 'Whole-file transfers are unavailable on this hub version.'
+    return JSON.stringify(await services.transferFile(identity.sessionId, args))
   },
 })
 
@@ -1695,7 +1734,7 @@ const overseerControl = defineTool({
   schema: {
     operation: z.enum([
       'status', 'guide', 'ui_catalog', 'highlight_ui', 'failure_context', 'get_operating_mode', 'set_operating_mode', 'create_project', 'create_chat', 'send_chat', 'stop_chat',
-      'reopen_chat', 'approve', 'get_approval_policy', 'configure_approval_policy', 'set_mode', 'set_session_config', 'configure_manager', 'reassign_manager_account',
+      'reopen_chat', 'approve', 'inspect_approval', 'get_approval_policy', 'configure_approval_policy', 'set_mode', 'set_session_config', 'configure_manager', 'reassign_manager_account',
       'list_team_presets', 'save_team_preset', 'delete_team_preset', 'launch_team',
       'remote_catalog', 'set_remote_grants', 'authorize_remote_testbed', 'list_overseer_peers', 'send_overseer_message',
       'start_account_login', 'github_repositories',
@@ -1710,6 +1749,7 @@ const overseerControl = defineTool({
     profile_id: z.string().max(256).optional(),
     session_id: z.string().max(256).optional(),
     approval_id: z.string().max(256).optional(),
+    approval_review_token: z.string().max(128).optional().describe('Scoped alert decision: token from inspect_approval for the exact pending invocation; expires after five minutes. Supply reason and explicit approve boolean.'),
     preset_id: z.string().max(256).optional(),
     clone_job_id: z.string().max(256).optional(),
     name: z.string().max(200).optional(),
@@ -1727,6 +1767,12 @@ const overseerControl = defineTool({
       .describe('approve only: explicitly persist a Codex connector elicitation for this vendor session or always; omitted means one-shot'),
     approval_policy_enabled: z.boolean().optional(),
     approval_risk_ceiling: z.enum(['low', 'medium']).optional(),
+    approval_requester_session_ids: z.array(z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/u)).max(32).optional()
+      .describe('configure_approval_policy: exact requester session allowlist, required on first enable; [] delegates nobody. Omission preserves an existing scoped list. No wildcard/global enable. Does not grant tools, repositories or devices.'),
+    approval_file_reviews: z.array(approvalFileReviewSchema).max(16).optional()
+      .describe('Direct operator configuration only: exact previously reviewed no-execution/no-credential/repository-only file changes, expiring within 24h. No arbitrary workflow execution. [] revokes file contracts; omitted preserves them. These never auto-approve.'),
+    approval_review_guidance: z.string().max(4000).optional()
+      .describe('configure_approval_policy on a direct operator turn only: record the operator’s explicit review precedents. Empty clears; omitted preserves. Advisory within exact requester/risk/tool/repo/device ceilings, never permission to approve unknown or high-risk actions.'),
     reauth: z.boolean().optional(),
     provider: z.enum(['claude', 'codex']).optional(),
     permission_mode: overseerPermissionMode.optional(),
@@ -1771,6 +1817,7 @@ const overseerControl = defineTool({
       profileId: args.profile_id,
       sessionId: args.session_id,
       approvalId: args.approval_id,
+      approvalReviewToken: args.approval_review_token,
       presetId: args.preset_id,
       cloneJobId: args.clone_job_id,
       name: args.name,
@@ -1785,6 +1832,9 @@ const overseerControl = defineTool({
       persist: args.persist,
       approvalPolicyEnabled: args.approval_policy_enabled,
       approvalRiskCeiling: args.approval_risk_ceiling,
+      approvalRequesterSessionIds: args.approval_requester_session_ids,
+      approvalFileReviews: args.approval_file_reviews,
+      approvalReviewGuidance: args.approval_review_guidance,
       reauth: args.reauth,
       provider: args.provider,
       permissionMode: args.permission_mode,
@@ -1856,6 +1906,7 @@ export const AGENT_TOOLS: readonly AgentToolSpec[] = [
   browserDownload,
   browserDownloadRead,
   publishArtifact,
+  manageArtifacts,
   browserScreenshot,
   browserStatus,
   remoteListDevices,
@@ -1867,6 +1918,7 @@ export const AGENT_TOOLS: readonly AgentToolSpec[] = [
   remoteReadFile,
   remoteCreateDirectory,
   remoteWriteFile,
+  remoteTransferFile,
   remoteExec,
   overseerControl,
 ]

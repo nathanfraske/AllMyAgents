@@ -25,6 +25,7 @@ import { rowFate } from './fleetMerge'
 import { isChatBusy, nextOrderKey, orderChats, type ChatOrderFacts } from './chatOrder'
 import { extractCodexReasoning } from './codexGroup'
 import { reduceJournalHistory } from './journalHistoryReducer'
+import { fileTransferNote } from './fileTransferNote'
 import { attachmentsFromPayload, type AttachmentMeta } from './attachments'
 import { readDesktopStartupStatus } from './desktopStartup'
 import type { AgentOutcome } from './agentTree'
@@ -96,6 +97,7 @@ const remoteApproval = (site: FleetSite, approval: ApprovalRecord): ApprovalReco
   ...approval,
   id: fleetId(site.siteId, approval.id),
   sessionId: fleetId(site.siteId, approval.sessionId),
+  ...(approval.reviewSessionId ? { reviewSessionId: fleetId(site.siteId, approval.reviewSessionId) } : {}),
 })
 const remoteQuestion = (site: FleetSite, question: QuestionRecord): QuestionRecord => ({
   ...question,
@@ -1678,7 +1680,7 @@ export class HubStore {
   }
 
   private async autoTrustFleetSite(site: FleetSite): Promise<void> {
-    if ((!site.directOnline && !site.online) || getFleetSiteToken(site.siteId)) return
+    if (site.discoveryOnly || (!site.directOnline && !site.online) || getFleetSiteToken(site.siteId)) return
     const now = Date.now()
     if ((this.fleetAutoTrustRetryAt.get(site.siteId) ?? 0) > now) return
     let result = site.directOnline
@@ -1710,6 +1712,12 @@ export class HubStore {
   /** Pair (or replace) one remote hub credential, then retry discovery immediately. */
   async pairFleetSite(siteId: string, token: string): Promise<boolean> {
     const site = this.fleetSites.find((candidate) => candidate.siteId === siteId && !candidate.local)
+    if (site?.discoveryOnly) {
+      site.authState = 'error'
+      site.authError = site.routeError ?? 'This device was detected, but has no confirmed AllMyAgents control route. Refresh after repairing discovery; no pairing code has been sent.'
+      this.fleetSites = [...this.fleetSites]
+      return false
+    }
     if (!site || (!token.trim() && !site.directOnline && !site.online)) return false
     const supplied = token.trim()
     if (!site.online && !site.directOnline && !looksLikePairingCode(supplied)) {
@@ -2147,6 +2155,9 @@ export class HubStore {
     const pending = this.approvals.filter((a) => a.sessionId === view.record.id)
     if (pending.length > 0) {
       return { key: 'approval', label: 'needs approval' }
+    }
+    if (this.approvals.some(a => a.status === 'pending' && a.reviewSessionId === view.record.id)) {
+      return { key: 'approval', label: 'approval review pending' }
     }
     // `noteSent` is an accepted local turn-start fact and bridges the dispatch-to-status-event gap. It
     // must drive every visible badge too, not only the transcript's thinking row.
@@ -2859,6 +2870,7 @@ export class HubStore {
     // any new request (a project scan) stalled behind them. Debounced to a single refresh per burst.
     if (
       kind === 'approval/requested' ||
+      kind === 'approval/review-routed' ||
       kind === 'approval/resolved' ||
       kind === 'question/requested' ||
       kind === 'question/resolved' ||
@@ -3065,6 +3077,21 @@ export class HubStore {
             key: `journal:${seq}:0`,
             attachments: attachmentsFromPayload(payload),
           })
+        break
+      }
+      case 'file-transfer/progress':
+      case 'file-transfer/completed':
+      case 'file-transfer/failed':
+      case 'file-transfer/cancelled':
+      case 'file-transfer/outcome_unknown': {
+        const note = fileTransferNote(kind, payload)
+        if (note) {
+          const prior = view.items.find(item => item.key === note.key)
+          if (prior) prior.text = note.text
+          else this.push(view, { kind: 'note', ts, ...note })
+        }
+        // Background buffer progress must not reorder the sidebar or replace the active chat.
+        if (kind === 'file-transfer/progress') return
         break
       }
       case 'question/recovery-unknown': {

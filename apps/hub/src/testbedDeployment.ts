@@ -135,6 +135,7 @@ export function verifyTestbedBundle(bundleDir: string): TestbedBundleManifest {
     'dist/remoteDevices.js',
     'dist/directHubProtocol.js',
     'dist/myOwnMeshRpc.js',
+    'dist/fileTransfers.js',
   ])
   const actualFiles = new Set<string>()
   const walk = (directory: string, relative = ''): void => {

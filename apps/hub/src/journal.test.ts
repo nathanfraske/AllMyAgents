@@ -164,6 +164,20 @@ describe('journal payload bulk defense', () => {
     }
   })
 
+  it('does not journal remote transfer bytes under an explicit base64 content envelope', () => {
+    const j = new Journal(path.join(tmp, 'remote-binary.db'))
+    try {
+      const content = Buffer.alloc(1024 * 1024, 42).toString('base64')
+      const event = j.append('s', 'claude/assistant', { message: { content: [{ type: 'tool_use', name: 'remote_write_file', input: { path: 'build.zip', encoding: 'base64', content } }] } })
+      const stored = JSON.stringify(event.payload)
+      expect(stored).not.toContain(content.slice(0, 1024))
+      expect(stored).toContain('bulk-base64')
+      expect(stored.length).toBeLessThan(1000)
+      const text = j.append('s', 'ordinary/text', { content, encoding: 'utf8' })
+      expect((text.payload as { content: string }).content).toBe(content)
+    } finally { j.db.close() }
+  })
+
   it('keeps SQLite bounded under many oversized payloads and deduplicates identical bytes', () => {
     const file = path.join(tmp, 'bounded-large-text.db')
     const j = new Journal(file)

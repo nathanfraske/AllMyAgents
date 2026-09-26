@@ -34,7 +34,7 @@ the mapped Site/HTTP route only as a compatibility fallback.
    needs the per-chat grant from step 4 before it can use the root.
 6. The agent can discover only its granted device/root labels and opaque IDs, then use:
    `remote_ping`, `remote_inspect_environment`, `remote_inspect_git`, `remote_prepare_project_location`,
-   `remote_list_files`, `remote_read_file`, `remote_create_directory`, `remote_write_file`, and `remote_exec`.
+   `remote_list_files`, `remote_read_file`, `remote_create_directory`, `remote_write_file`, `remote_transfer_file`, and `remote_exec`.
    Project preparation is available only when the root is attached to the chat's project. A folder transfer mirrors its
    directory tree with `remote_create_directory` before writing the contained files; empty directories
    are therefore preserved too.
@@ -266,6 +266,44 @@ Linux filesystem; Windows may refuse to project a drive remounted under `/mnt/<d
 filesystem provider even though commands inside WSL can see it.
 
 ## Telemetry and failure feedback
+
+### Whole-file transfers
+
+Use `remote_transfer_file` with `operation: "upload"` or `"download"`, the granted `device_id` and
+`root_id`, `local_path` inside this chat's workspace, and `remote_path` relative to the remote root.
+The initial response returns immediately with a `transfer_id`. Keep it: completion mail is delivered
+once; `operation: "status"` reads its receipt and `operation: "cancel"` requests cancellation.
+Do not repeatedly send file bytes through model tool calls. The hub performs the byte loop itself with
+512 KiB buffers, asynchronous file I/O, and incremental SHA-256 verification. Progress updates at most
+once per second in one stable chat row. Journal and completion messages contain metadata, not file bytes.
+These transfers do not consume chat attachment storage. Publishing a finished download as a chat artifact
+is a separate, explicit operation with its own attachment quota.
+
+Version 1 requires both the source hub and target executor to include this implementation. Targets
+advertise `fileTransfers: 1`; older targets return an update-required message before copying. Updating
+the hub/target software is a separate operator-approved deployment; no automatic install or service
+restart is performed by this tool. Existing direct/Site authentication and chat/root read/write grants
+remain required and are rechecked throughout the transfer. Pairing alone is insufficient.
+
+Current limits: one regular file per request, 256 MiB per file, four active transfers per hub/target,
+and **new destination paths only**. Parents must exist. Use `remote_create_directory` for remote parents;
+directory trees can be explicitly archived first. Links, junctions, traversal, alternate data streams,
+private local configuration paths and overwriting an existing file are refused. Atomic publication uses
+a sibling staging file and an exclusive hard link, so the destination filesystem must support hard links
+(for example NTFS or ext4). No copy/delete fallback is used on unsupported filesystems.
+
+There is no whole-file execution deadline. Individual RPCs remain bounded; inactive target staging
+expires after five minutes while that target process remains running. The tool does not automatically
+resume or retry a failed write. An uncertain acknowledgement or interrupted hub restart yields
+`outcome_unknown`. Status can reconcile an uploaded file against the target's exact completed checksum
+receipt; a completed remote read alone does not prove a download was published locally. If a target
+process crashes, its partial staging and uncertain receipt are retained for inspection, not automatically
+deleted or replayed. Do not start a duplicate transfer until the retained state/destination is resolved.
+
+The narrow path checks protect the granted-root boundary; they are not an OS sandbox against another
+process with simultaneous write access to the same directories. Existing grants remain the authority
+boundary. Terminal transfer receipts are retained; automatic receipt retention/compaction is not part
+of v1.
 
 Every operation returns the active transport, route lookup, network, full round-trip, and—when observable—target execution time,
 plus request/response byte counts. File transfers additionally report transferred bytes, elapsed transfer

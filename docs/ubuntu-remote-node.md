@@ -40,6 +40,10 @@ For a daemon using a nondefault socket, supply `--mesh-socket /path/to/daemon.so
 The service retains that path. A socket ACL failure is a MyOwnMesh service configuration issue, not a
 reason to switch to unauthenticated LAN access, open permissions globally, or fall back to hidden SSH.
 
+Sharing a device through AllMyStuff does not make it an owned-roster member. The one-use code is the
+supported explicit pairing path for a shared, non-owned peer; there is no need to relabel it as owned.
+Both nodes still need a working authenticated MyOwnMesh route before a code can be exchanged.
+
 ### Machine-admin access
 
 Choose explicitly, only on a machine you intend agents to administer:
@@ -108,6 +112,53 @@ mode; no dependency manifest is inferred from arbitrary errors.
   Include them in data-directory backups; do not remove receipts for unresolved or running commands.
 
 ## Diagnostics, upgrades, and no-reboot qualification
+
+### Visible in AllMyStuff but missing or not linked here
+
+AllMyStuff sharing and AllMyAgents pairing are separate. An owned-roster member, a shared presence
+entry, and a reachable AllMyAgents testbed are not interchangeable. In **Settings → Devices**, shared
+presence now appears as **detected / Not yet linked** even when no AllMyAgents control route is
+confirmed. Presence may be cached; this is not a claim that the remote service is running. The
+**Device discovery is incomplete** warning distinguishes a failed local discovery connection from
+an empty fleet. Open **Connection & pairing** after the route is healthy to enter the one-use code.
+
+On Windows, AllMyStuff's `allmystuff-node` pipe and MyOwnMesh's `myownmesh.sock` pipe are separate.
+AllMyStuff can show a machine while the desktop hub cannot open the MyOwnMesh pipe. Its service's
+`--client-sid` setting is not by itself evidence that the MyOwnMesh pipe admits that user. A
+**permission-denied** diagnosis requires the service owner to configure supported designated-user
+access to MyOwnMesh, with exact caller and expected service identity checks. Do not grant Everyone
+access, run the whole desktop elevated, guess unsupported daemon flags, or reinstall Ubuntu to
+work around it. A new pairing code cannot repair this local failure.
+
+The service/desktop interoperability review found no designated-client/expected-service configuration
+in the inspected MyOwnMesh v0.3.21 source, or in its inspected same-user-only successor. This requires
+an upstream protocol/connector change, not an undocumented environment toggle. MyOwnMesh must supply
+verified service/client identity and appropriately scoped application/operation authority; AllMyStuff
+must persist and propagate the reviewed configuration; AllMyAgents must adopt the compatible verified
+connector. An account SID alone is not application identity or permission for arbitrary daemon control.
+Exact deployed binary compatibility must be checked separately; a displayed version is not proof of a
+particular source commit. Until that contract ships, a clear diagnostic is not a repaired connection.
+
+After the owner supplies the supported configuration, qualify in this order without rebooting:
+
+1. Retain current versions, exact service accounts, launcher configuration and discovery error. Verify
+   the service's designated client identity and the client's expected service identity. Negative tests
+   must reject a different user/service; shared discovery must not silently grant access.
+2. Separately approve any live configuration change and its **bounded service restart**. If daemon
+   configuration is inherited from a launcher, a daemon-only restart may retain the old environment;
+   the owner must identify the actual launcher/session-agent/daemon restart scope first.
+3. As the ordinary desktop user, verify read-only MyOwnMesh network enumeration and refresh Devices.
+   Confirm the exact Ubuntu DeviceId, not just its display name. Inspect the target service using the
+   commands below; a healthy desktop pipe does not prove the target installed or started correctly.
+4. Generate one code from the target's active node data directory, pair that exact device, then grant
+   its advertised roots to the intended chat. Check ordinary-user versus elevated profile explicitly.
+5. Run a harmless machine-mode command in a non-Git directory. Check reconnect, peer offline/return,
+   and service-before-hub / hub-before-service startup orders. A lost write acknowledgement is
+   `outcome_unknown`, not permission to repeat deployment, pairing, or command execution blindly.
+
+The UI diagnosis and automated tests do not certify live service ACLs or a two-machine connection.
+
+### Target service and upgrades
 
 Use `allmyagents-testbed status` (with the system data directory under sudo for elevated installs) to
 inspect identity, build, selected profile and MyOwnMesh control discovery. Inspect service liveness with

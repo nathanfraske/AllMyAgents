@@ -5,6 +5,7 @@
   import { relativeTime } from './time'
   import { saveSettingsTab } from './settingsSections'
   import QuestionAttention from './QuestionAttention.svelte'
+  import ApprovalAttention from './ApprovalAttention.svelte'
 
   let open = $state(false)
   let root = $state<HTMLDivElement | null>(null)
@@ -104,6 +105,7 @@
 
 <svelte:window onpointerdown={closeOutside} onkeydown={(event) => { if (event.key === 'Escape') open = false }} />
 <QuestionAttention />
+<ApprovalAttention />
 
 <div class="notification-center" bind:this={root}>
   <button

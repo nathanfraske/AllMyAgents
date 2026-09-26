@@ -63,6 +63,8 @@ export interface PeerSiteAdvert {
 /** The advertised site allow-list cached for one peer by the local node. */
 export interface PeerSites {
   device: string
+  /** Untrusted display metadata, never evidence of ownership or application readiness. */
+  label?: string
   sites: PeerSiteAdvert[]
 }
 
@@ -496,48 +498,57 @@ export class MeshSite {
    * while its machine sleeps; `owned_roster` remains the authority for whether it is still paired.
    */
   async peerSites(timeoutMs = 4000): Promise<PeerSites[]> {
-    try {
-      const r = await this.request('session_snapshot', {}, timeoutMs)
-      if (!r.ok) return [...this.peerSitesCache.values()]
-      const peers = (r.result as { peers?: unknown } | undefined)?.peers
-      if (!Array.isArray(peers)) return [...this.peerSitesCache.values()]
-      for (const raw of peers) {
-        const profile = raw as { node?: unknown; sites?: unknown }
-        if (typeof profile.node !== 'string' || profile.node.length === 0) continue
-        const sites: PeerSiteAdvert[] = []
-        if (Array.isArray(profile.sites)) {
-          for (const candidate of profile.sites) {
-            const site = candidate as {
-              id?: unknown
-              label?: unknown
-              port?: unknown
-              scheme?: unknown
-              loopback?: unknown
-            }
-            if (
-              typeof site.id !== 'string' ||
-              typeof site.label !== 'string' ||
-              typeof site.port !== 'number' ||
-              !Number.isInteger(site.port) ||
-              site.port <= 0 ||
-              site.port > 65_535
-            ) {
-              continue
-            }
-            sites.push({
-              id: site.id,
-              label: site.label,
-              port: site.port,
-              scheme: typeof site.scheme === 'string' ? site.scheme : undefined,
-              loopback: typeof site.loopback === 'boolean' ? site.loopback : undefined,
-            })
+    return this.peerSitesRequired(timeoutMs).catch(() => [...this.peerSitesCache.values()])
+  }
+
+  /** Diagnostic callers must distinguish a failed presence read from an empty peer directory. */
+  async peerSitesRequired(timeoutMs = 4000): Promise<PeerSites[]> {
+    const r = await this.request('session_snapshot', {}, timeoutMs)
+    if (!r.ok) throw new Error(`AllMyStuff peer discovery failed: ${(r.error ?? 'unknown error').slice(0, 2_000)}`)
+    const peers = (r.result as { peers?: unknown } | undefined)?.peers
+    if (!Array.isArray(peers)) throw new Error('AllMyStuff returned an invalid peer directory')
+    for (const raw of peers) {
+      if (!raw || typeof raw !== 'object') continue
+      const profile = raw as { node?: unknown; label?: unknown; hostname?: unknown; sites?: unknown }
+      if (typeof profile.node !== 'string' || profile.node.length === 0) continue
+      const sites: PeerSiteAdvert[] = []
+      if (Array.isArray(profile.sites)) {
+        for (const candidate of profile.sites) {
+          if (!candidate || typeof candidate !== 'object') continue
+          const site = candidate as {
+            id?: unknown
+            label?: unknown
+            port?: unknown
+            scheme?: unknown
+            loopback?: unknown
           }
+          if (
+            typeof site.id !== 'string' ||
+            typeof site.label !== 'string' ||
+            typeof site.port !== 'number' ||
+            !Number.isInteger(site.port) ||
+            site.port <= 0 ||
+            site.port > 65_535
+          ) {
+            continue
+          }
+          sites.push({
+            id: site.id,
+            label: site.label,
+            port: site.port,
+            scheme: typeof site.scheme === 'string' ? site.scheme : undefined,
+            loopback: typeof site.loopback === 'boolean' ? site.loopback : undefined,
+          })
         }
-        const canonical = profile.node.split('-', 1)[0]!.toLowerCase()
-        this.peerSitesCache.set(canonical, { device: profile.node, sites })
       }
-    } catch {
-      // A node restart or temporary socket loss must not make a known sleeping hub vanish.
+      const canonical = profile.node.split('-', 1)[0]!.toLowerCase()
+      const label = typeof profile.label === 'string' ? profile.label : profile.hostname
+      this.peerSitesCache.set(canonical, {
+        device: profile.node,
+        ...(typeof label === 'string' && label.trim() && !/[\u0000-\u001f\u007f]/u.test(label)
+          ? { label: label.trim().slice(0, 200) } : {}),
+        sites,
+      })
     }
     return [...this.peerSitesCache.values()]
   }

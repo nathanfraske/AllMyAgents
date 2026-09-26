@@ -1,4 +1,5 @@
 import { attachmentsFromPayload } from './attachments'
+import { fileTransferNote } from './fileTransferNote'
 import { extractCodexReasoning } from './codexGroup'
 import type { HubEvent } from './api'
 import type { ThreadItem } from './store.svelte'
@@ -160,6 +161,13 @@ export function reduceJournalHistory(events: readonly HubEvent[]): ThreadItem[] 
           (payload as { message?: string }).message ??
           'A prior answer could not be verified after recovery. The agent was told to ask again if needed.',
       })
+      continue
+    }
+    const transfer = fileTransferNote(kind, payload)
+    if (transfer) {
+      const prior = items.find(item => item.key === transfer.key)
+      if (prior) prior.text = transfer.text
+      else push({ kind: 'note', ts, ...transfer })
       continue
     }
     if (kind === 'session/operator-authority-not-conferred') {

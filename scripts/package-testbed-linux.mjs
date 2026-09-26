@@ -25,7 +25,7 @@ try {
   fs.mkdirSync(path.dirname(lib), { recursive: true })
   fs.cpSync(payload, lib, { recursive: true })
   const allowed = new Set(['node', 'README.txt', 'manifest.json', 'build.json', 'package.json', 'SHA256SUMS',
-    ...['testbedNode', 'deviceToken', 'remoteDevices', 'directHubProtocol', 'myOwnMeshRpc'].map(name => `dist/${name}.js`)])
+    ...['testbedNode', 'deviceToken', 'remoteDevices', 'directHubProtocol', 'myOwnMeshRpc', 'fileTransfers'].map(name => `dist/${name}.js`)])
   const normalize = (dir) => {
     fs.chmodSync(dir, 0o755)
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {

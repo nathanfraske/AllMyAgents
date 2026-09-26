@@ -96,7 +96,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Release durability gate policy
-        run: node --test scripts/wait-release-verification.test.mjs
+        run: node --test scripts/wait-release-verification.test.mjs scripts/macos-installability-policy.test.mjs
 
       # ---- Hub gate: apps/hub → vitest run + tsc --noEmit --------------------------------------------
       # (package.json scripts: test = "vitest run", typecheck = "tsc --noEmit")

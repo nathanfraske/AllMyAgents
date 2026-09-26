@@ -29,7 +29,7 @@ function bundle(): string {
   fs.writeFileSync(path.join(root, 'README.txt'), 'headless node')
   fs.writeFileSync(path.join(root, 'package.json'), '{"type":"module"}')
   fs.writeFileSync(path.join(root, 'build.json'), '{"version":1,"appVersion":"0.1.27"}')
-  const modules = ['testbedNode.js', 'deviceToken.js', 'remoteDevices.js', 'directHubProtocol.js', 'myOwnMeshRpc.js']
+  const modules = ['testbedNode.js', 'deviceToken.js', 'remoteDevices.js', 'directHubProtocol.js', 'myOwnMeshRpc.js', 'fileTransfers.js']
   for (const module of modules) fs.writeFileSync(path.join(root, 'dist', module), module)
   const files = [
     'manifest.json', 'node.exe', 'README.txt', 'package.json', 'build.json',
@@ -215,7 +215,7 @@ describe('lightweight testbed deployment orchestration', () => {
   it('syncs only changed portable files, treats a severed restart response as ambiguous, and verifies before success', async () => {
     const root = bundle()
     const desiredCode = codePayloadId(root)
-    const modules = ['testbedNode.js', 'deviceToken.js', 'remoteDevices.js', 'directHubProtocol.js', 'myOwnMeshRpc.js']
+    const modules = ['testbedNode.js', 'deviceToken.js', 'remoteDevices.js', 'directHubProtocol.js', 'myOwnMeshRpc.js', 'fileTransfers.js']
     const firstModule = `dist/${modules[0]}`
     const firstHash = crypto.createHash('sha256').update(fs.readFileSync(path.join(root, firstModule))).digest('hex')
     let committed = false

@@ -16,6 +16,7 @@ export interface DeviceOverviewEntry {
   directOnline?: boolean
   directRttMs?: number
   testbedOnline?: boolean
+  discoveryOnly?: boolean
   capabilities?: DeviceExecutorCapabilities
   error?: string
 }
@@ -40,7 +41,8 @@ export function buildDeviceOverview(
       siteId: site.siteId,
       label: site.label,
       local: site.local,
-      roles: ['hub'],
+      roles: site.discoveryOnly ? [] : ['hub'],
+      discoveryOnly: site.discoveryOnly,
       online: site.local || site.online || site.directOnline === true,
       hubOnline: site.local || site.online || site.directOnline === true,
       directOnline: site.directOnline,
@@ -83,7 +85,8 @@ export function buildDeviceOverview(
     const reachable = capabilities !== undefined
     const isLightweight = capabilities?.nodeKind === 'lightweight-testbed'
     let roles = current?.roles ?? []
-    if (!isLightweight) roles = addRole(roles, 'hub')
+    if (isLightweight) roles = roles.filter(role => role !== 'hub')
+    else if (reachable || !current?.discoveryOnly) roles = addRole(roles, 'hub')
     if (isLightweight || capabilities?.enabled || (capabilities?.roots?.length ?? 0) > 0) {
       roles = addRole(roles, 'testbed')
     }
@@ -97,10 +100,11 @@ export function buildDeviceOverview(
       directOnline: current?.directOnline,
       directRttMs: current?.directRttMs,
       testbedOnline: device.connected,
+      discoveryOnly: reachable ? false : current?.discoveryOnly,
       capabilities,
       // A successful capability response with execution disabled is policy state, not a connection
       // error. The card reports it as "Testbed disabled" instead of alarming the operator.
-      error: reachable ? current?.error : (device.error ?? current?.error),
+      error: reachable ? (current?.discoveryOnly ? undefined : current?.error) : (device.error ?? current?.error),
     })
   }
 

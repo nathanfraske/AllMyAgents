@@ -1233,7 +1233,7 @@
       <div class="remote-heading">
         <div>
           <h3>Devices</h3>
-          <p class="hint dim">Every connected AllMyAgents Hub and authorized lightweight testbed, in one place.</p>
+          <p class="hint dim">Connected hubs, authorized testbeds, and detected devices awaiting a usable control connection.</p>
         </div>
         <div class="remote-refresh">
           {#if fleetRefreshedAt}<span class="hint dim">checked {new Date(fleetRefreshedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })}</span>{/if}
@@ -1305,7 +1305,7 @@
         </details>
         {#if store.fleetSites.some((site) => !site.local)}
           <div class="fleet-pairing">
-            <span class="tlabel">Fleet machines</span>
+            <span class="tlabel">Fleet and detected machines</span>
             {#each store.fleetSites.filter((site) => !site.local) as site (site.siteId)}
               <div class="fleet-peer">
                 <div class="fleet-peer-head">
@@ -1316,14 +1316,17 @@
                     class:warn={(site.online || site.directOnline) && site.authState !== 'paired'}
                     class:off={!site.online && !site.directOnline}
                   >
-                    {site.online
+                    {site.discoveryOnly ? 'detected · connection unconfirmed' : site.online
                       ? site.authState === 'paired' ? 'paired · live' : 'pairing required'
                       : site.directOnline
                         ? `direct control live${site.directRttMs !== undefined ? ` · ${site.directRttMs} ms` : ''}`
                         : 'mesh offline'}
                   </span>
                 </div>
-                {#if site.authState === 'paired' && getFleetSiteToken(site.siteId)}
+                {#if site.discoveryOnly}
+                  <p class="hint warn">{site.routeError}</p>
+                  <p class="hint dim">No pairing code has been sent. Once this device has a live control route, refresh and enter its one-use code here. Being visible in AllMyStuff does not establish AllMyAgents access.</p>
+                {:else if site.authState === 'paired' && getFleetSiteToken(site.siteId)}
                   <div class="token-row">
                     <span class="hint dim">This browser can read and control that hub.</span>
                     <button class="btn" onclick={() => store.unpairFleetSite(site.siteId)}>forget token</button>
@@ -1356,7 +1359,7 @@
                 {#if fleetPairError[site.siteId] || site.authError}
                   <p class="hint warn">{fleetPairError[site.siteId] || site.authError}</p>
                 {/if}
-                {#if !site.online && site.routeError}
+                {#if !site.discoveryOnly && !site.online && site.routeError}
                   <p class="hint dim">
                     {site.directOnline
                       ? 'Pairing, remote testbeds, and Overseer messages use the direct channel. The unified remote-chat stream still needs a compatible Site route in this release.'

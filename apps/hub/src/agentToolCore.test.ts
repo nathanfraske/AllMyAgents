@@ -13,6 +13,15 @@ const SAFE: DangerFlags = { busCanUseRiskyTools: false, autoApprovePractices: fa
 const idA: SessionIdentity = { sessionId: 's1', profileId: 'a1', provider: 'codex', projectId: 'p1', label: 'alpha' }
 const idNoProject: SessionIdentity = { sessionId: 's2', profileId: 'a2', provider: 'codex', label: 'beta' }
 
+describe('whole-file transfer identity', () => {
+  it('binds transfer requests to the live requester and returns metadata rather than bytes', async () => {
+    const h = makeHarness()
+    h.services.transferFile = vi.fn(async () => ({ id: 'transfer', state: 'running' }))
+    expect(await runAgentTool('remote_transfer_file', { operation: 'upload', device_id: 'box', root_id: 'root', local_path: 'file', remote_path: 'out' }, { identity: idA, services: h.services })).toContain('transfer')
+    expect(h.services.transferFile).toHaveBeenCalledWith('s1', expect.objectContaining({ operation: 'upload', device_id: 'box' }))
+  })
+})
+
 describe('compact durable run inspection', () => {
   const run: DurableRun = {
     id: 'run-1', projectId: 'p1', sessionId: 's1', actorSessionId: 's1', actorLabel: 'manager',
@@ -197,6 +206,27 @@ function makeHarness(opts: {
 }
 
 describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)', () => {
+  it('passes inspect and one-shot review bindings through the shared Codex/Claude tool surface', async () => {
+    const h = makeHarness()
+    h.services.overseerControl = vi.fn(async () => ({ ok: true }))
+    await runAgentTool('overseer_control', { operation: 'inspect_approval', approval_id: 'request' }, { identity: idA, services: h.services })
+    await runAgentTool('overseer_control', { operation: 'approve', approval_id: 'request', approval_review_token: 'token',
+      approve: false, reason: 'Reviewed, not appropriate for this setup.' }, { identity: idA, services: h.services })
+    expect(h.services.overseerControl).toHaveBeenLastCalledWith('s1', expect.objectContaining({
+      operation: 'approve', approvalId: 'request', approvalReviewToken: 'token', approve: false, reason: 'Reviewed, not appropriate for this setup.',
+    }))
+  })
+  it('passes an exact requester scope through the provider-neutral Overseer control schema', async () => {
+    const h = makeHarness()
+    h.services.overseerControl = vi.fn(async () => ({ ok: true }))
+    await runAgentTool('overseer_control', {
+      operation: 'configure_approval_policy', approval_policy_enabled: true,
+      approval_risk_ceiling: 'medium', approval_requester_session_ids: ['arnold'],
+    }, { identity: idA, services: h.services })
+    expect(h.services.overseerControl).toHaveBeenCalledWith('s1', expect.objectContaining({
+      approvalPolicyEnabled: true, approvalRiskCeiling: 'medium', approvalRequesterSessionIds: ['arnold'],
+    }))
+  })
   it('exposes the manager tools alongside the existing provider-agnostic tools', () => {
     expect(AGENT_TOOLS.map((t) => t.name)).toEqual([
       'list_agents',
@@ -232,6 +262,7 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
       'browser_download',
       'browser_download_read',
       'publish_artifact',
+      'manage_artifacts',
       'browser_screenshot',
       'browser_status',
       'remote_list_devices',
@@ -243,6 +274,7 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
       'remote_read_file',
       'remote_create_directory',
       'remote_write_file',
+      'remote_transfer_file',
       'remote_exec',
       'overseer_control',
     ])

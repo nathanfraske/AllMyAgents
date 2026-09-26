@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import { reviewDigest } from './approvalReview.js'
 import type Database from 'better-sqlite3'
 import type { Journal } from './journal.js'
 import type {
@@ -22,6 +23,8 @@ const RESOLVED_RECOVERY_WINDOW_MS = 2 * 60 * 1000
 
 interface PendingEntry {
   record: ApprovalRecord
+  generation: string
+  expiresAt: number
   resolve: (approved: boolean) => void
   timer: NodeJS.Timeout
   // The Promise handed back to the original caller. Kept so a re-issue of the same still-pending id
@@ -45,6 +48,7 @@ export interface ApprovalDecision {
 export interface ApprovalResolutionOptions {
   decider?: string
   persist?: ApprovalPersistence
+  review?: { requestBinding: string; policyDigest: string; reason: string }
 }
 
 /** Connector bodies can be very large; the policy-specific event carries their bounded digest summary. */
@@ -118,7 +122,7 @@ export class ApprovalService {
         (@id, @sessionId, @kind, @status, @createdAt, @resolvedAt, @decider, @persist)
     `)
     this.latestDecisionStmt = journal.db.prepare(`
-      SELECT persist FROM approval_decisions
+      SELECT persist, decider FROM approval_decisions
       WHERE approval_id = ?
       ORDER BY decision_seq DESC
       LIMIT 1
@@ -151,6 +155,26 @@ export class ApprovalService {
 
   pending(): ApprovalRecord[] {
     return [...this.pendingMap.values()].map((e) => e.record)
+  }
+
+  /** Display routing, authored only by the hub; doesn't modify payload or the decision binding. */
+  routeForReview(id: string, reviewerSessionId: string): void {
+    const entry = this.pendingMap.get(id)
+    if (!entry || entry.record.reviewSessionId === reviewerSessionId) return
+    entry.record.reviewSessionId = reviewerSessionId
+    this.journal.append(entry.record.sessionId, 'approval/review-routed', { id, reviewerSessionId })
+  }
+
+  /** A fresh invocation + exact payload binding, not merely the reusable worker approval id. */
+  inspectPending(id: string): { record: ApprovalRecord; binding: string; expiresAt: number } | undefined {
+    const entry = this.pendingMap.get(id)
+    if (!entry) return undefined
+    if (Date.now() >= entry.expiresAt) {
+      this.finish(id, false, 'timeout', { decider: 'system:timeout' })
+      return undefined
+    }
+    return { record: structuredClone(entry.record), expiresAt: entry.expiresAt,
+      binding: reviewDigest([entry.generation, entry.record.id, entry.record.sessionId, entry.record.kind, entry.record.payload]) }
   }
 
   /**
@@ -196,7 +220,15 @@ export class ApprovalService {
   request(sessionId: string, kind: string, payload: unknown, id?: string): Promise<boolean> {
     if (id !== undefined) {
       const existing = this.pendingMap.get(id)
-      if (existing) return existing.promise // re-issue/dedup: same Promise, no duplicate entry, no re-journal
+      if (existing) {
+        if (existing.record.sessionId !== sessionId || existing.record.kind !== kind ||
+          reviewDigest(existing.record.payload) !== reviewDigest(payload)) {
+          this.journal.append(sessionId, 'approval/duplicate-mismatch', { id, kind })
+          return Promise.resolve(false)
+        }
+        this.inspectPending(id) // Enforce the wall-clock deadline even if its timer has not fired.
+        return existing.promise
+      }
       // Resolved-before-crash recovery (§7.2): this hub's in-memory map is empty (a restart), but the
       // operator's decision may be durable in the journal. Honor it immediately — do NOT re-prompt or
       // re-journal. In-process callers never supply an id, so this is worker-mode only (flag-off unchanged).
@@ -217,6 +249,13 @@ export class ApprovalService {
       // again. This is a containment measure, not the cure: the real fix is per-invocation identity at the
       // source (the SDK supplies toolUseID/requestId), after which this can key on a true request id.
       if (!this.recoveredIds.has(id) && Date.now() - this.bootAt <= RESOLVED_RECOVERY_WINDOW_MS) {
+        const decision = this.latestDecisionStmt.get(id) as { decider?: string } | undefined
+        if (decision?.decider?.startsWith('overseer-reviewed:')) {
+          this.recoveredIds.add(id)
+          this.journal.append(sessionId, 'approval/review-recovery-refused', { id, kind,
+            reason: 'A scoped reviewer decision cannot be replayed without fresh invocation evidence after restart.' })
+          return Promise.resolve(false)
+        }
         const resolved = this.journal.resolvedApproval(id)
         if (resolved !== undefined) {
           this.recoveredIds.add(id)
@@ -258,7 +297,7 @@ export class ApprovalService {
       id: id ?? crypto.randomUUID(),
       sessionId,
       kind,
-      payload,
+      payload: structuredClone(payload),
       status: 'pending',
       createdAt: new Date().toISOString(),
     }
@@ -270,7 +309,8 @@ export class ApprovalService {
     const timer = setTimeout(() => {
       this.finish(record.id, false, 'timeout', { decider: 'system:timeout' })
     }, this.timeoutMs)
-    this.pendingMap.set(record.id, { record, resolve, timer, promise })
+    this.pendingMap.set(record.id, { record, resolve, timer, promise,
+      generation: crypto.randomUUID(), expiresAt: Date.now() + this.timeoutMs })
     try {
       this.pendingListener?.(record)
     } catch (error) {
@@ -346,6 +386,10 @@ export class ApprovalService {
   ): boolean {
     const entry = this.pendingMap.get(id)
     if (!entry) return false // idempotent no-op: unknown or already-resolved/timed-out id
+    if (status !== 'timeout' && Date.now() >= entry.expiresAt) {
+      this.finish(id, false, 'timeout', { decider: 'system:timeout' })
+      return false
+    }
     const terminalStatus = status === 'approved' || status === 'denied' || status === 'timeout'
       ? status
       : approved ? 'approved' : 'denied'
@@ -361,6 +405,7 @@ export class ApprovalService {
         resolvedAt,
         decider,
         persist: persist ?? null,
+        ...(options.review ? { review: options.review } : {}),
       })
       this.insertDecisionStmt.run({
         id: entry.record.id,
@@ -374,6 +419,8 @@ export class ApprovalService {
       })
     })
     this.pendingMap.delete(id)
+    // A later invocation in this process is not crash recovery, even if its content-derived id repeats.
+    this.recoveredIds.add(id)
     clearTimeout(entry.timer)
     entry.record.status = terminalStatus
     entry.record.resolvedAt = resolvedAt

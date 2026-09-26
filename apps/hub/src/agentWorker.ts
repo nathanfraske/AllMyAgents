@@ -233,6 +233,8 @@ export function buildWorkerAgentServices(deps: WorkerAgentServiceDeps): AgentSer
       deps.relayRpc('browser.execute', { sessionId, operation, args }) as ReturnType<AgentServices['browser']>,
     publishArtifact: (sessionId, input) =>
       deps.relayRpc('artifact.publish', { sessionId, input }) as ReturnType<NonNullable<AgentServices['publishArtifact']>>,
+    manageArtifacts: (sessionId, input) => deps.relayRpc('artifact.manage', { sessionId, input }),
+    transferFile: (sessionId, input) => deps.relayRpc('remote.transferFile', { sessionId, input }),
     remoteDevices: (sessionId) =>
       deps.relayRpc('remote.list', { sessionId }) as ReturnType<AgentServices['remoteDevices']>,
     remoteExecute: (sessionId, siteId, action) =>

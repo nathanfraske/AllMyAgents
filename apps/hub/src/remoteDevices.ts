@@ -7,6 +7,7 @@ import type { RemoteDeviceCapability, RemoteDeviceGrant } from './types.js'
 import type { DirectHubEnvelope } from './directHubProtocol.js'
 import { signDirectHubEnvelope, verifyDirectHubEnvelope } from './directHubProtocol.js'
 import type { MyOwnMeshRpcBridge } from './myOwnMeshRpc.js'
+import { FileTransferTarget, type FileTransferRequest, type FileTransferReceipt } from './fileTransfers.js'
 
 const MAX_FILE_BYTES = 1024 * 1024
 const DEFAULT_READ_BYTES = 256 * 1024
@@ -189,6 +190,8 @@ export interface DeviceExecutorCapabilities {
   elevated?: boolean
   /** Versioned start/status/cancel protocol: command lifetime is independent of an RPC request. */
   durableCommands?: 1
+  /** Bounded whole-file staging, checksum verification and one-shot publication. */
+  fileTransfers?: 1
   /** The route that actually answered this capability probe. Source-hub observed, never target asserted. */
   activeTransport?: 'myownmesh-rpc' | 'site'
   /** Credential-free release identity reported by lightweight nodes. Optional on pre-update nodes. */
@@ -282,6 +285,7 @@ export interface RemoteGitInspection {
 }
 
 export type RemoteDeviceAction =
+  | { op: 'file_transfer'; rootId: string; transfer: FileTransferRequest }
   | { op: 'probe'; rootId: string }
   | { op: 'inspect'; rootId: string }
   | { op: 'git_inspect'; rootId: string; checkoutPath?: string }
@@ -306,6 +310,7 @@ export type RemoteDeviceAction =
 
 export interface RemoteDeviceActionResult {
   ok: boolean
+  transfer?: FileTransferReceipt
   jobState?: 'running' | 'completed' | 'outcome_unknown'
   outcomeUnknown?: boolean
   cancelled?: boolean
@@ -503,6 +508,7 @@ export function wslUncPath(distro: string, linuxPath: string): string {
 }
 
 export function remoteCapabilityForAction(action: RemoteDeviceAction): RemoteDeviceCapability {
+  if (action.op === 'file_transfer') return action.transfer?.mode === 'read' ? 'read' : 'write'
   if (action.op === 'write' || action.op === 'mkdir') return 'write'
   // A checkout can invoke configured credential helpers or content filters. Keep it behind the same
   // OS-account authority as a terminal even though callers can supply only bounded Git identities.
@@ -866,6 +872,7 @@ export interface DeviceExecutorOptions {
 }
 
 export class DeviceExecutor {
+  private readonly fileTransfers: FileTransferTarget
   private policy: DeviceExecutorPolicy = { enabled: false, roots: [] }
   private readonly jobs = new Map<string, { controller: AbortController; rootId: string }>()
 
@@ -873,6 +880,7 @@ export class DeviceExecutor {
     private readonly file: string,
     private readonly options: DeviceExecutorOptions = {},
   ) {
+    this.fileTransfers = new FileTransferTarget(path.join(path.dirname(file), 'file-transfer-receipts'))
     try {
       const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as DeviceExecutorPolicy
       this.policy = this.normalizePolicy(parsed)
@@ -885,6 +893,7 @@ export class DeviceExecutor {
     return {
       enabled: this.policy.enabled,
       durableCommands: 1,
+      fileTransfers: 1,
       platform: process.platform,
       arch: process.arch,
       hostname: os.hostname(),
@@ -905,7 +914,7 @@ export class DeviceExecutor {
     return this.capabilities()
   }
 
-  async execute(action: RemoteDeviceAction, actor?: Pick<RemoteDeviceActor, 'durableRunId'>): Promise<RemoteDeviceActionResult> {
+  async execute(action: RemoteDeviceAction, actor?: Pick<RemoteDeviceActor, 'durableRunId'> & { transferOwner?: string }): Promise<RemoteDeviceActionResult> {
     const started = performance.now()
     const finish = (result: RemoteDeviceActionResult): RemoteDeviceActionResult => ({
       ...result,
@@ -922,6 +931,13 @@ export class DeviceExecutor {
     const needed = remoteCapabilityForAction(action)
     if (!root[needed]) return finish({ ok: false, error: `${needed} access is not enabled for this root.` })
     try {
+      if (action.op === 'file_transfer') {
+        if (!actor?.transferOwner) throw new Error('File transfers require an authenticated owner.')
+        const transfer = await this.fileTransfers.execute(this.filesystemRoot(root), actor.transferOwner, action.transfer, () =>
+          this.policy.enabled && this.policy.roots.some(current => current.id === root.id && current[needed] &&
+            current.path === root.path && JSON.stringify(current.environment) === JSON.stringify(root.environment)))
+        return finish({ ok: true, transfer, bytes: action.transfer.operation === 'chunk' ? transfer.offset - (action.transfer.offset ?? 0) : undefined })
+      }
       if (action.op === 'probe') return finish({ ok: true })
       if (action.op === 'inspect') return finish(await this.inspect(root))
       if (action.op === 'git_inspect') {
@@ -1723,7 +1739,7 @@ export class RemoteDeviceController {
     if (directResult) {
       const roundTripMs = Math.round((performance.now() - directStarted) * 10) / 10
       const targetMs = directResult.telemetry?.targetMs
-      const transferBytes = action.op === 'read' || action.op === 'write' ? directResult.bytes : undefined
+      const transferBytes = action.op === 'read' || action.op === 'write' || action.op === 'file_transfer' ? directResult.bytes : undefined
       return {
         ...directResult,
         failure: directResult.ok ? undefined : (directResult.failure ?? { stage: 'target' }),
@@ -1743,7 +1759,7 @@ export class RemoteDeviceController {
     try {
       const result = await this.request<RemoteDeviceActionResult>(siteId, '/api/device-executor/action', 'POST', body, timeout, true)
       const telemetry = result.telemetry ?? {}
-      const transferBytes = action.op === 'read' || action.op === 'write' ? result.bytes : undefined
+      const transferBytes = action.op === 'read' || action.op === 'write' || action.op === 'file_transfer' ? result.bytes : undefined
       return {
         ...result,
         failure: result.ok ? undefined : (result.failure ?? { stage: 'target' }),

@@ -436,6 +436,24 @@ describe('operator-owned GitHub automation policy', () => {
     })
   })
 
+  it('does not auto-admit arbitrary create_file/update_file bodies even with all four GitHub capabilities', () => {
+    const { sessions } = createGitHubProject()
+    sessions.configureGitHubAutomationPolicy('session', 's1', [
+      'pull_requests', 'pull_request_merges', 'workflow_runs', 'repository_pushes',
+    ], 'operator')
+    markBusTurn(sessions, 's1')
+    for (const operation of ['create_file', 'update_file']) {
+      for (const repository of ['acme/widget', 'nathanfraske/AllMyAgents']) {
+        expect(sessions.isAutoApproved('s1', 'codex/mcpServer/elicitation/request', {
+          serverName: 'codex_apps', mode: 'form', requestedSchema: { type: 'object', properties: {} },
+          _meta: { source: 'connector', connector_name: 'GitHub', codex_approval_kind: 'mcp_tool_call',
+            tool_title: operation, tool_params: { repository_full_name: repository,
+              path: '.github/workflows/setup.yml', content: 'run: arbitrary-command' } },
+        })).toBe(false)
+      }
+    }
+  })
+
   it('lets an exact manager session perform granted PR work on a manager-driven turn', () => {
     const { sessions, seed, journal } = makeSessions()
     seed({ permissionMode: 'safe', isProjectManager: true })

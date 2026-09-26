@@ -113,4 +113,11 @@ describe('GitHub automation approval classifier', () => {
       connector('delete_repository', { repository_full_name: 'openai/codex' }),
     )).toBeUndefined()
   })
+
+  it.each(['create_file', 'update_file'])('does not infer non-destructive authority from the %s label', operation => {
+    expect(classifyGitHubAutomationApproval('codex/mcpServer/elicitation/request', connector(operation, {
+      repository_full_name: 'nathanfraske/test-fleet', path: '.github/workflows/setup.yml',
+      content: 'run: arbitrary-command',
+    }))).toBeUndefined()
+  })
 })
