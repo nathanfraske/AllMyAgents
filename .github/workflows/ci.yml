@@ -38,9 +38,17 @@ jobs:
         os: [windows-latest, macos-latest, ubuntu-latest]
 
     steps:
-      - name: Prepare local runner tools and resource budget
-        if: runner.environment == 'self-hosted'
-        uses: nathanfraske/test-fleet/.github/actions/setup-runner@cd72d852b922a2426c181566b503ebc75e0c4189
+      - name: Prepare local Windows tools and resource budget
+        if: runner.environment == 'self-hosted' && runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          & C:\actions-runner\fleet\release-v1\setup_windows_release.ps1
+          $node=@('C:\actions-runner\externals\node24\bin\node.exe','C:\actions-runner\externals\node20\bin\node.exe') | Where-Object {Test-Path -LiteralPath $_} | Select-Object -First 1
+          if(-not $node){throw 'Actions runner Node runtime is missing'}
+          $values=& $node --input-type=module -e "import {currentBudget,jobEnvironment} from 'file:///C:/actions-runner/fleet/release-v1/resources_job.mjs';for(const [k,v] of Object.entries(jobEnvironment(currentBudget())))console.log(k+'='+v)"
+          if($LASTEXITCODE -ne 0){throw 'Resource budget could not be configured'}
+          foreach($line in $values){[IO.File]::AppendAllText($env:GITHUB_ENV,$line+[Environment]::NewLine,[Text.UTF8Encoding]::new($false))}
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -187,9 +195,17 @@ jobs:
         os: [windows-latest, macos-latest]
 
     steps:
-      - name: Prepare local runner tools and resource budget
-        if: runner.environment == 'self-hosted'
-        uses: nathanfraske/test-fleet/.github/actions/setup-runner@cd72d852b922a2426c181566b503ebc75e0c4189
+      - name: Prepare local Windows tools and resource budget
+        if: runner.environment == 'self-hosted' && runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          & C:\actions-runner\fleet\release-v1\setup_windows_release.ps1
+          $node=@('C:\actions-runner\externals\node24\bin\node.exe','C:\actions-runner\externals\node20\bin\node.exe') | Where-Object {Test-Path -LiteralPath $_} | Select-Object -First 1
+          if(-not $node){throw 'Actions runner Node runtime is missing'}
+          $values=& $node --input-type=module -e "import {currentBudget,jobEnvironment} from 'file:///C:/actions-runner/fleet/release-v1/resources_job.mjs';for(const [k,v] of Object.entries(jobEnvironment(currentBudget())))console.log(k+'='+v)"
+          if($LASTEXITCODE -ne 0){throw 'Resource budget could not be configured'}
+          foreach($line in $values){[IO.File]::AppendAllText($env:GITHUB_ENV,$line+[Environment]::NewLine,[Text.UTF8Encoding]::new($false))}
 
       - name: Checkout
         uses: actions/checkout@v4
