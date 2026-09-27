@@ -227,6 +227,16 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
       approvalPolicyEnabled: true, approvalRiskCeiling: 'medium', approvalRequesterSessionIds: ['arnold'],
     }))
   })
+  it('exposes paged inspection, scoped high-risk controls and separate resource grants without tool-name auto-allow', async () => {
+    const h = makeHarness()
+    h.services.overseerControl = vi.fn(async () => ({ ok: true }))
+    await runAgentTool('overseer_control', { operation: 'inspect_approval', approval_id: 'fresh', approval_review_offset: 8192 }, { identity: idA, services: h.services })
+    expect(h.services.overseerControl).toHaveBeenLastCalledWith('s1', expect.objectContaining({ approvalReviewOffset: 8192 }))
+    await runAgentTool('overseer_control', { operation: 'configure_approval_policy', approval_policy_enabled: true, approval_requester_session_ids: ['arnold'], approval_risk_ceiling: 'high', approval_delegations: [] }, { identity: idA, services: h.services })
+    expect(h.services.overseerControl).toHaveBeenLastCalledWith('s1', expect.objectContaining({ approvalRiskCeiling: 'high', approvalDelegations: [] }))
+    await runAgentTool('overseer_control', { operation: 'configure_github_automation', github_scope: 'session', session_id: 'arnold', github_capabilities: ['repository_pushes'], github_review_repositories: ['acme/widget'] }, { identity: idA, services: h.services })
+    expect(h.services.overseerControl).toHaveBeenLastCalledWith('s1', expect.objectContaining({ githubReviewRepositories: ['acme/widget'] }))
+  })
   it('exposes the manager tools alongside the existing provider-agnostic tools', () => {
     expect(AGENT_TOOLS.map((t) => t.name)).toEqual([
       'list_agents',

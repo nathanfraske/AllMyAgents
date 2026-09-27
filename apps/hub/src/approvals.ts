@@ -48,7 +48,8 @@ export interface ApprovalDecision {
 export interface ApprovalResolutionOptions {
   decider?: string
   persist?: ApprovalPersistence
-  review?: { requestBinding: string; policyDigest: string; reason: string }
+  review?: { requestBinding: string; policyDigest: string; reason: string; evidenceDigest?: string; authorityDigest?: string;
+    ruleId?: string; risk?: string; effects?: string[] }
 }
 
 /** Connector bodies can be very large; the policy-specific event carries their bounded digest summary. */

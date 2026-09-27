@@ -713,16 +713,19 @@ export interface OverseerConfig {
   approvalPolicy?: OverseerApprovalPolicy
 }
 
-export type OverseerApprovalRisk = 'low' | 'medium'
+export type OverseerApprovalRisk = 'low' | 'medium' | 'high'
 
 export interface OverseerApprovalPolicy {
   enabled: boolean
-  /** Unknown/high-risk requests are never eligible, so the ceiling cannot be configured to high. */
+  /** Changes even for rapid revoke/re-enable cycles, invalidating old review tokens. */
+  revision?: string
+  /** High requires a supported effect adapter plus an explicit scoped delegation; never unknown. */
   maxRisk: OverseerApprovalRisk
   /** Exact requester sessions only. Empty means none; absent preserves a pre-existing legacy policy. */
   requesterSessionIds?: string[]
   /** Optional exact operator-reviewed no-execution file contracts; never automatic approvals. */
   fileReviews?: import('./approvalReview.js').ApprovalFileReview[]
+  delegations?: import('./githubApprovalReview.js').ApprovalDelegation[]
   /** Explicit operator precedent for REVIEW, never a risk classification or a new grant. */
   reviewGuidance?: string
   updatedAt?: string

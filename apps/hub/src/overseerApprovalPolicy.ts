@@ -1,11 +1,14 @@
+import crypto from 'node:crypto'
 import type { OverseerApprovalPolicy, OverseerConfig } from './types.js'
 import { approvalFileReviewSchema, type ApprovalFileReview } from './approvalReview.js'
+import { approvalDelegationSchema, type ApprovalDelegation } from './githubApprovalReview.js'
 
 export interface OverseerApprovalPolicyUpdate {
   enabled: boolean
-  maxRisk: 'low' | 'medium'
+  maxRisk: 'low' | 'medium' | 'high'
   requesterSessionIds?: string[]
   fileReviews?: ApprovalFileReview[]
+  delegations?: ApprovalDelegation[]
   reviewGuidance?: string
 }
 
@@ -18,7 +21,8 @@ export function normalizeApprovalRequesterIds(value: unknown): string[] {
 
 /** Absent scope retains legacy semantics; a present malformed/empty scope never widens to everyone. */
 export function approvalRequesterAllowed(policy: OverseerApprovalPolicy | undefined, requesterId: string): boolean {
-  if (policy?.enabled !== true || !['low', 'medium'].includes(policy.maxRisk)) return false
+  if (policy?.enabled !== true || !['low', 'medium', 'high'].includes(policy.maxRisk)) return false
+  if (policy.maxRisk === 'high' && !Object.hasOwn(policy, 'requesterSessionIds')) return false
   if (!Object.hasOwn(policy, 'requesterSessionIds')) return true
   try { return normalizeApprovalRequesterIds(policy.requesterSessionIds).includes(requesterId) }
   catch { return false }
@@ -29,8 +33,8 @@ export function applyOverseerApprovalPolicyUpdate(
   current: OverseerConfig,
   input: OverseerApprovalPolicyUpdate,
 ): OverseerConfig {
-  if (typeof input.enabled !== 'boolean' || !['low', 'medium'].includes(input.maxRisk)) {
-    throw new Error('approval policy requires enabled and a low/medium risk ceiling')
+  if (typeof input.enabled !== 'boolean' || !['low', 'medium', 'high'].includes(input.maxRisk)) {
+    throw new Error('approval policy requires enabled and a low/medium/high risk ceiling')
   }
   const previous = current.approvalPolicy
   if (input.reviewGuidance !== undefined && (typeof input.reviewGuidance !== 'string' || input.reviewGuidance.length > 4000 || input.reviewGuidance.includes('\0'))) {
@@ -56,12 +60,25 @@ export function applyOverseerApprovalPolicyUpdate(
     }
   }
   const updatedAt = new Date().toISOString()
+  const delegations = input.delegations ?? previous?.delegations?.filter(r => requesterSessionIds?.includes(r.requesterSessionId))
+  if (delegations !== undefined) {
+    if (!Array.isArray(delegations) || delegations.length > 32) throw new Error('At most 32 explicit delegations are supported')
+    const ids = new Set<string>()
+    for (const raw of delegations) {
+      const rule = approvalDelegationSchema.parse(raw)
+      if (ids.has(rule.id)) throw new Error('Delegation ids must be unique')
+      ids.add(rule.id)
+      if (!requesterSessionIds?.includes(rule.requesterSessionId)) throw new Error('Delegation requester must be in the exact requester scope')
+    }
+  }
   return {
     ...current,
     approvalPolicy: {
       enabled: input.enabled, maxRisk: input.maxRisk,
       ...(hasScope ? { requesterSessionIds } : {}), updatedAt,
+      revision: crypto.randomUUID(),
       ...(fileReviews !== undefined ? { fileReviews: structuredClone(fileReviews) } : {}),
+      ...(delegations !== undefined ? { delegations: structuredClone(delegations) } : {}),
       ...((input.reviewGuidance ?? previous?.reviewGuidance) !== undefined ? { reviewGuidance: (input.reviewGuidance ?? previous?.reviewGuidance ?? '').trim() } : {}),
     },
     updatedAt,

@@ -17,6 +17,7 @@ import { QuestionService } from './questions.js'
 import { applyOverseerModeUpdate } from './overseerMode.js'
 import { applyOverseerApprovalPolicyUpdate } from './overseerApprovalPolicy.js'
 import { assessGitHubFileReview, type ApprovalFileReview } from './approvalReview.js'
+import { gitBlobHash, reviewEffects, type ApprovalDelegation, type GitHubReviewApi } from './githubApprovalReview.js'
 import type { RemoteDeviceController } from './remoteDevices.js'
 import { SessionManager } from './sessions.js'
 import { SessionStore } from './store.js'
@@ -97,6 +98,109 @@ function harness() {
 }
 
 describe('application Overseer authority', () => {
+  it('allows only direct operator configuration of extended review authority and separate repository resource grants', async () => {
+    const h = harness()
+    h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+    h.seed({ id: 'arnold', projectId: h.projects.create('Fleet', h.root).id })
+    let config: OverseerConfig = {}
+    h.sessions.setOverseerRuntime({ overseerConfig: () => config, configureOverseerApprovalPolicy: input => config = applyOverseerApprovalPolicyUpdate(config, input) })
+    const policyInput = { operation: 'configure_approval_policy' as const, approvalPolicyEnabled: true,
+      approvalRiskCeiling: 'high' as const, approvalRequesterSessionIds: ['arnold'], approvalDelegations: [] }
+    const resourceInput = { operation: 'configure_github_automation' as const, githubScope: 'session' as const, sessionId: 'arnold',
+      githubCapabilities: ['repository_pushes'] as const, githubReviewRepositories: ['acme/widget'] }
+    expect(await h.sessions.overseerControl('overseer', policyInput)).toMatchObject({ ok: false })
+    expect(await h.sessions.overseerControl('overseer', { ...resourceInput, githubCapabilities: [...resourceInput.githubCapabilities] })).toMatchObject({ ok: false })
+    h.markOperator('overseer')
+    expect(await h.sessions.overseerControl('overseer', policyInput)).toMatchObject({ ok: true, data: { maxRisk: 'high', delegations: [], requesterSessionIds: ['arnold'] } })
+    expect(await h.sessions.overseerControl('overseer', { ...resourceInput, githubCapabilities: [...resourceInput.githubCapabilities] })).toMatchObject({ ok: true, data: { reviewRepositories: ['acme/widget'] } })
+    expect(h.sessions.githubAutomationPolicy('session', 'arnold').capabilities).toEqual(['repository_pushes'])
+    expect(h.journal.since(0).filter(e => e.kind === 'overseer/approval-policy-changed')).toHaveLength(1)
+  })
+  it.each(['approve', 'branch', 'rerun', 'policy', 'repository-grant', 'grant-cycle', 'capability', 'body', 'source', 'expiry', 'resolved', 'during-read'] as const)(
+    'enforces paged executable review and fresh one-shot binding: %s', async change => {
+      const h = harness()
+      h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
+      const project = h.projects.create('Fleet', h.root)
+      h.seed({ id: 'arnold', projectId: project.id, permissionMode: 'safe' })
+      const capability = change === 'rerun' ? 'workflow_runs' : 'repository_pushes'
+      const shouldApprove = ['approve', 'branch', 'rerun'].includes(change)
+      execFileSync('git', ['init', '--quiet'], { cwd: h.root })
+      execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/acme/fleet.git'], { cwd: h.root })
+      const head = 'a'.repeat(40), filePath = '.github/workflows/ci.yml'
+      let before = '# complete non-truncated evidence ' + 'x'.repeat(9000) + '\non: workflow_dispatch\npermissions: {}\njobs:\n  test:\n    runs-on: ubuntu-latest\n    timeout-minutes: 5\n    steps:\n      - run: echo test\n'
+      const rule: ApprovalDelegation = { id: 'setup', requesterSessionId: 'arnold', projectId: project.id, repository: 'acme/widget',
+        categories: ['github.workflow.edit', 'github.branch.create', 'github.job.rerun'], branches: ['fleet/test'], workflowPaths: [filePath], headShas: [head], jobIds: [108563413279],
+        maxRisk: 'high', allowedEffects: [...reviewEffects], expiresAt: new Date(Date.now() + 3600000).toISOString(),
+        disclosure: 'Individual review only; effects may execute code, spend resources or publish data. Resource grants and platform limits still apply.' }
+      const policy = { enabled: true, maxRisk: 'high' as const, requesterSessionIds: ['arnold'], delegations: [rule] }
+      let revokeOnRead = false
+      const api: GitHubReviewApi = vi.fn(async (_repo, endpoint) => {
+        if (revokeOnRead) policy.delegations = []
+        if (!endpoint) return { full_name: 'acme/widget', private: true, default_branch: 'main' }
+        if (change === 'branch' && endpoint === 'git/matching-refs/heads/fleet%2Ftest') return []
+        if (endpoint === 'actions/jobs/108563413279') return { id: 108563413279, run_id: 36299140037, run_attempt: 1, status: 'completed', conclusion: 'failure', name: 'test' }
+        if (endpoint === 'actions/runs/36299140037') return { id: 36299140037, run_attempt: 1, status: 'completed', repository: { full_name: 'acme/widget' },
+          head_repository: { full_name: 'acme/widget' }, head_sha: head, head_branch: 'fleet/test', actor: { login: 'original' }, triggering_actor: { login: 'retry' }, path: filePath, event: 'workflow_dispatch' }
+        if (endpoint.startsWith('git/matching-refs/heads/')) return [{ ref: `refs/heads/${decodeURIComponent(endpoint.split('/').at(-1)!)}`, object: { type: 'commit', sha: head } }]
+        if (endpoint.startsWith('git/commits/')) return { sha: head, tree: { sha: '1'.repeat(40) } }
+        if (endpoint === `git/trees/${'1'.repeat(40)}`) return { truncated: false, tree: [{ path: '.github', type: 'tree', sha: '2'.repeat(40) }] }
+        if (endpoint === `git/trees/${'2'.repeat(40)}`) return { truncated: false, tree: [{ path: 'workflows', type: 'tree', sha: '3'.repeat(40) }] }
+        if (endpoint === `git/trees/${'3'.repeat(40)}`) return { truncated: false, tree: [{ path: 'ci.yml', mode: '100644', type: 'blob', sha: gitBlobHash(before) }] }
+        return { sha: gitBlobHash(before), encoding: 'base64', size: Buffer.byteLength(before), content: Buffer.from(before).toString('base64') }
+      })
+      h.sessions.setOverseerRuntime({ overseerConfig: () => ({ approvalPolicy: policy }), githubReviewApi: api })
+      h.sessions.configureGitHubAutomationPolicy('session', 'arnold', [capability], 'operator')
+      const payload = { serverName: 'codex_apps', mode: 'form', requestedSchema: { type: 'object', properties: {} },
+        _meta: { source: 'connector', connector_name: 'GitHub', codex_approval_kind: 'mcp_tool_call', tool_title: 'update_file', tool_params: {
+          repository_full_name: 'acme/widget', branch: 'fleet/test', path: filePath, sha: gitBlobHash(before), content: before.replace('echo test', 'echo reviewed'), message: 'review' } } }
+      const requestPayload = change === 'branch' ? { ...payload, _meta: { ...payload._meta, tool_title: 'create_branch',
+        tool_params: { repository_full_name: 'acme/widget', branch_name: 'fleet/test', sha: head } } }
+        : change === 'rerun' ? { ...payload, _meta: { ...payload._meta, tool_title: 'rerun_workflow_job',
+          tool_params: { repo_full_name: 'acme/widget', job_id: 108563413279 } } } : payload
+      const pending = h.approvals.request('arnold', 'codex/mcpServer/elicitation/request', requestPayload)
+      const id = h.approvals.pending()[0]!.id
+      expect(await h.sessions.overseerControl('overseer', { operation: 'inspect_approval', approvalId: id })).toMatchObject({ ok: true, data: { eligible: false, code: 'authority-ceiling' } })
+      expect(api).not.toHaveBeenCalled()
+      h.sessions.configureGitHubAutomationPolicy('session', 'arnold', [capability], 'operator', ['acme/widget'])
+      expect(h.sessions.isAutoApproved('arnold', 'codex/mcpServer/elicitation/request', requestPayload)).toBe(false)
+      let inspected = await h.sessions.overseerControl('overseer', { operation: 'inspect_approval', approvalId: id })
+      expect(inspected).toMatchObject({ ok: true, data: { eligible: true, risk: 'high', evidence: { complete: false } } })
+      expect(inspected.data).not.toHaveProperty('reviewToken')
+      expect(await h.sessions.overseerControl('overseer', { operation: 'inspect_approval', approvalId: id, approvalReviewOffset: 16384 })).toMatchObject({ ok: false })
+      expect(await h.sessions.overseerControl('overseer', { operation: 'approve', approvalId: id, approve: true, reason: 'Unread evidence' })).toMatchObject({ ok: false })
+      const all: string[] = []
+      let data = inspected.data as { evidence: { text: string; nextOffset: number | null; complete: boolean }; reviewToken?: string }
+      all.push(data.evidence.text)
+      while (data.evidence.nextOffset !== null) {
+        inspected = await h.sessions.overseerControl('overseer', { operation: 'inspect_approval', approvalId: id, approvalReviewOffset: data.evidence.nextOffset })
+        expect(inspected.ok).toBe(true)
+        data = inspected.data as typeof data; all.push(data.evidence.text)
+      }
+      expect(JSON.parse(all.join('')).source.workflows[0].text).toBe(before)
+      if (change !== 'branch' && change !== 'rerun') expect(JSON.parse(all.join('')).change.before).toBe(before)
+      expect(data.reviewToken).toEqual(expect.any(String))
+      if (change === 'policy') policy.delegations = []
+      if (change === 'repository-grant') h.sessions.configureGitHubAutomationPolicy('session', 'arnold', ['repository_pushes'], 'operator', [])
+      if (change === 'grant-cycle') {
+        h.sessions.configureGitHubAutomationPolicy('session', 'arnold', ['repository_pushes'], 'operator', [])
+        h.sessions.configureGitHubAutomationPolicy('session', 'arnold', ['repository_pushes'], 'operator', ['acme/widget'])
+      }
+      if (change === 'capability') h.sessions.configureGitHubAutomationPolicy('session', 'arnold', [], 'operator', ['acme/widget'])
+      if (change === 'body') (h.approvals.pending()[0]!.payload as typeof payload)._meta.tool_params.content += '\n# changed'
+      if (change === 'source') before += '\n# changed'
+      if (change === 'resolved') h.approvals.resolve(id, false)
+      if (change === 'during-read') revokeOnRead = true
+      const clock = change === 'expiry' ? vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 300001) : undefined
+      try {
+        const decision = await h.sessions.overseerControl('overseer', { operation: 'approve', approvalId: id, approve: true, approvalReviewToken: data.reviewToken, reason: 'Reviewed all exact source/diff and explicit high-risk effects within operator delegation.' })
+        expect(decision.ok).toBe(shouldApprove)
+      } finally { clock?.mockRestore() }
+      if (shouldApprove) {
+        await expect(pending).resolves.toBe(true)
+        expect(h.approvals.recentResolved()[0]?.decider).toBe('overseer-reviewed:overseer')
+        expect(await h.sessions.overseerControl('overseer', { operation: 'approve', approvalId: id, approve: true, approvalReviewToken: data.reviewToken, reason: 'duplicate' })).toMatchObject({ ok: false })
+      } else { h.approvals.resolve(id, false); await pending }
+    })
   it('requires a host-authored exact destructive approval before freeing artifact storage', async () => {
     const h = harness()
     h.seed({ id: 'chat' })

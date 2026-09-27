@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { approvalFileReviewSchema, type ApprovalFileReview } from './approvalReview.js'
+import { approvalDelegationSchema, type ApprovalDelegation } from './githubApprovalReview.js'
 import { durableRunView } from './durableRunView.js'
 import type { SessionIdentity } from './identity.js'
 import { readableScopes } from './identity.js'
@@ -86,6 +87,7 @@ export interface OverseerControlInput {
   sessionId?: string
   approvalId?: string
   approvalReviewToken?: string
+  approvalReviewOffset?: number
   presetId?: string
   cloneJobId?: string
   name?: string
@@ -99,9 +101,10 @@ export interface OverseerControlInput {
   approve?: boolean
   persist?: ApprovalPersistence
   approvalPolicyEnabled?: boolean
-  approvalRiskCeiling?: 'low' | 'medium'
+  approvalRiskCeiling?: 'low' | 'medium' | 'high'
   approvalRequesterSessionIds?: string[]
   approvalFileReviews?: ApprovalFileReview[]
+  approvalDelegations?: ApprovalDelegation[]
   approvalReviewGuidance?: string
   reauth?: boolean
   provider?: Provider
@@ -133,6 +136,7 @@ export interface OverseerControlInput {
   repository?: string
   githubScope?: GitHubAutomationPolicyScope
   githubCapabilities?: GitHubAutomationCapability[]
+  githubReviewRepositories?: string[]
   distro?: string
   elevationScope?: ElevationScope
   allowedPaths?: string[]
@@ -1750,6 +1754,7 @@ const overseerControl = defineTool({
     session_id: z.string().max(256).optional(),
     approval_id: z.string().max(256).optional(),
     approval_review_token: z.string().max(128).optional().describe('Scoped alert decision: token from inspect_approval for the exact pending invocation; expires after five minutes. Supply reason and explicit approve boolean.'),
+    approval_review_offset: z.number().int().nonnegative().optional().describe('inspect_approval: exact nextOffset from prior evidence page. Read every page; only the final page issues a decision token.'),
     preset_id: z.string().max(256).optional(),
     clone_job_id: z.string().max(256).optional(),
     name: z.string().max(200).optional(),
@@ -1766,13 +1771,15 @@ const overseerControl = defineTool({
       .optional()
       .describe('approve only: explicitly persist a Codex connector elicitation for this vendor session or always; omitted means one-shot'),
     approval_policy_enabled: z.boolean().optional(),
-    approval_risk_ceiling: z.enum(['low', 'medium']).optional(),
+    approval_risk_ceiling: z.enum(['low', 'medium', 'high']).optional(),
     approval_requester_session_ids: z.array(z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/u)).max(32).optional()
       .describe('configure_approval_policy: exact requester session allowlist, required on first enable; [] delegates nobody. Omission preserves an existing scoped list. No wildcard/global enable. Does not grant tools, repositories or devices.'),
     approval_file_reviews: z.array(approvalFileReviewSchema).max(16).optional()
       .describe('Direct operator configuration only: exact previously reviewed no-execution/no-credential/repository-only file changes, expiring within 24h. No arbitrary workflow execution. [] revokes file contracts; omitted preserves them. These never auto-approve.'),
+    approval_delegations: z.array(approvalDelegationSchema).max(32).optional()
+      .describe('Operator-only review authority: explicit requester/project/repository/branch/category/risk/effects. [] revokes. Never a resource grant or automatic approval. High-risk execution requires explicit high ceiling plus all disclosed effects. Unknown semantics/platform/self limits cannot be delegated.'),
     approval_review_guidance: z.string().max(4000).optional()
-      .describe('configure_approval_policy on a direct operator turn only: record the operator’s explicit review precedents. Empty clears; omitted preserves. Advisory within exact requester/risk/tool/repo/device ceilings, never permission to approve unknown or high-risk actions.'),
+      .describe('configure_approval_policy on a direct operator turn only: advisory review precedents, not authority. Empty clears; omitted preserves. Unknown/platform/self limits remain enforced.'),
     reauth: z.boolean().optional(),
     provider: z.enum(['claude', 'codex']).optional(),
     permission_mode: overseerPermissionMode.optional(),
@@ -1789,6 +1796,8 @@ const overseerControl = defineTool({
     github_capabilities: z.array(z.enum([
       'pull_requests', 'pull_request_merges', 'workflow_runs', 'repository_pushes',
     ])).max(4).optional(),
+    github_review_repositories: z.array(z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u)).max(32).optional()
+      .describe('Separate operator resource grant for individual GitHub review ONLY. Additional exact repositories; [] revokes, omitted preserves. Does not widen auto-approval/CLI/monitoring, grant capabilities, or activate reviewer delegation.'),
     distro: z.string().max(256).optional(),
     elevation_scope: z.enum(['disabled', 'project', 'machine']).optional(),
     allowed_paths: z.array(z.string().min(1).max(4096)).max(15).optional(),
@@ -1818,6 +1827,7 @@ const overseerControl = defineTool({
       sessionId: args.session_id,
       approvalId: args.approval_id,
       approvalReviewToken: args.approval_review_token,
+      approvalReviewOffset: args.approval_review_offset,
       presetId: args.preset_id,
       cloneJobId: args.clone_job_id,
       name: args.name,
@@ -1834,6 +1844,7 @@ const overseerControl = defineTool({
       approvalRiskCeiling: args.approval_risk_ceiling,
       approvalRequesterSessionIds: args.approval_requester_session_ids,
       approvalFileReviews: args.approval_file_reviews,
+      approvalDelegations: args.approval_delegations,
       approvalReviewGuidance: args.approval_review_guidance,
       reauth: args.reauth,
       provider: args.provider,
@@ -1845,6 +1856,7 @@ const overseerControl = defineTool({
       repository: args.repository,
       githubScope: args.github_scope,
       githubCapabilities: args.github_capabilities,
+      githubReviewRepositories: args.github_review_repositories,
       distro: args.distro,
       elevationScope: args.elevation_scope,
       allowedPaths: args.allowed_paths,

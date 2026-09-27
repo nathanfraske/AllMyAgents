@@ -19,6 +19,7 @@
     "fflate": "0.8.2",
     "unpdf": "1.6.2",
     "ws": "8.21.1",
+    "yaml": "2.9.1",
     "zod": "4.4.3"
   },
   "devDependencies": {
