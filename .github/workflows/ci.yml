@@ -17,6 +17,11 @@ on:
         description: One-time fleet qualification (ordinary runs follow repository configuration)
         type: boolean
         default: false
+      stress_copies:
+        description: Copies of each complete OS matrix for fleet comparison
+        type: choice
+        options: ['1', '3']
+        default: '1'
 
 # Superseded runs on the same branch/PR are cancelled to save runner minutes.
 concurrency:
@@ -35,6 +40,7 @@ jobs:
       # Never let one OS failing hide the result on the others.
       fail-fast: false
       matrix:
+        repeat: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.stress_copies == '3') && '[1,2,3]' || '[1]') }}
         os: [windows-latest, macos-latest, ubuntu-latest]
 
     steps:
@@ -192,6 +198,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        repeat: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.stress_copies == '3') && '[1,2,3]' || '[1]') }}
         os: [windows-latest, macos-latest]
 
     steps:
