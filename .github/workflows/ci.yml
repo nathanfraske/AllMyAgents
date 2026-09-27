@@ -29,7 +29,7 @@ jobs:
   # ---------------------------------------------------------------------------------------------
   gates:
     name: js gates (${{ matrix.os }})
-    runs-on: ${{ (vars.TEST_FLEET_CI == 'enabled' || (github.event_name == 'workflow_dispatch' && inputs.qualify_local)) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && ((matrix.os == 'ubuntu-latest' && fromJSON('["self-hosted","Linux","X64","fleet-atc-linux"]')) || (matrix.os == 'windows-latest' && fromJSON('["self-hosted","Windows","X64","test-fleet","windows-native-x64"]'))) || matrix.os }}
+    runs-on: ${{ (vars.TEST_FLEET_CI == 'enabled' || (github.event_name == 'workflow_dispatch' && inputs.qualify_local)) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && ((matrix.os == 'ubuntu-latest' && fromJSON('["self-hosted","Linux","X64","fleet-atc-linux"]')) || (matrix.os == 'windows-latest' && fromJSON('["self-hosted","Windows","X64","fleet-atc-windows"]')) || (matrix.os == 'macos-latest' && fromJSON('["self-hosted","macOS","X64","fleet-atc-mac"]'))) || matrix.os }}
     timeout-minutes: 20
     strategy:
       # Never let one OS failing hide the result on the others.
@@ -187,7 +187,7 @@ jobs:
   # ---------------------------------------------------------------------------------------------
   rust:
     name: tauri shell (${{ matrix.os }})
-    runs-on: ${{ (vars.TEST_FLEET_CI == 'enabled' || (github.event_name == 'workflow_dispatch' && inputs.qualify_local)) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && ((matrix.os == 'ubuntu-latest' && fromJSON('["self-hosted","Linux","X64","fleet-atc-linux"]')) || (matrix.os == 'windows-latest' && fromJSON('["self-hosted","Windows","X64","test-fleet","windows-native-x64"]'))) || matrix.os }}
+    runs-on: ${{ (vars.TEST_FLEET_CI == 'enabled' || (github.event_name == 'workflow_dispatch' && inputs.qualify_local)) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && ((matrix.os == 'ubuntu-latest' && fromJSON('["self-hosted","Linux","X64","fleet-atc-linux"]')) || (matrix.os == 'windows-latest' && fromJSON('["self-hosted","Windows","X64","fleet-atc-windows"]')) || (matrix.os == 'macos-latest' && fromJSON('["self-hosted","macOS","X64","fleet-atc-mac"]'))) || matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
