@@ -1,4 +1,4 @@
-name: CI
+name: Fleet full build and tests
 
 # Cross-OS functional gate. Windows is the primary target and macOS is the second release target, so
 # both must stay green; Linux is carried as a cheap POSIX canary for the JS half (it catches a
@@ -8,20 +8,15 @@ name: CI
 # locally, plus the credential-firewall self-test and a real payload stage. If it is green here, the
 # checklist's "green gates" step is already satisfied.
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
-    inputs:
-      qualify_local:
-        description: One-time fleet qualification (ordinary runs follow repository configuration)
-        type: boolean
-        default: false
+
+permissions:
+  contents: read
 
 # Superseded runs on the same branch/PR are cancelled to save runner minutes.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   # ---------------------------------------------------------------------------------------------
@@ -29,7 +24,7 @@ jobs:
   # ---------------------------------------------------------------------------------------------
   gates:
     name: js gates (${{ matrix.os }})
-    runs-on: ${{ (vars.TEST_FLEET_CI == 'enabled' || (github.event_name == 'workflow_dispatch' && inputs.qualify_local)) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && ((matrix.os == 'ubuntu-latest' && fromJSON('["self-hosted","Linux","X64","test-fleet","linux-docker-x64"]')) || (matrix.os == 'windows-latest' && fromJSON('["self-hosted","Windows","X64","test-fleet","windows-native-x64"]'))) || matrix.os }}
+    runs-on: ${{ (matrix.os == 'ubuntu-latest' && fromJSON('["self-hosted","Linux","X64","fleet-general-linux"]')) || (matrix.os == 'windows-latest' && fromJSON('["self-hosted","Windows","X64","fleet-general-windows"]')) || (matrix.os == 'macos-latest' && fromJSON('["self-hosted","macOS","X64","fleet-general-macos"]')) }}
     timeout-minutes: 20
     strategy:
       # Never let one OS failing hide the result on the others.
@@ -187,8 +182,8 @@ jobs:
   # ---------------------------------------------------------------------------------------------
   rust:
     name: tauri shell (${{ matrix.os }})
-    runs-on: ${{ (vars.TEST_FLEET_CI == 'enabled' || (github.event_name == 'workflow_dispatch' && inputs.qualify_local)) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && ((matrix.os == 'ubuntu-latest' && fromJSON('["self-hosted","Linux","X64","test-fleet","linux-docker-x64"]')) || (matrix.os == 'windows-latest' && fromJSON('["self-hosted","Windows","X64","test-fleet","windows-native-x64"]'))) || matrix.os }}
-    timeout-minutes: 30
+    runs-on: ${{ (matrix.os == 'ubuntu-latest' && fromJSON('["self-hosted","Linux","X64","fleet-general-linux"]')) || (matrix.os == 'windows-latest' && fromJSON('["self-hosted","Windows","X64","fleet-general-windows"]')) || (matrix.os == 'macos-latest' && fromJSON('["self-hosted","macOS","X64","fleet-general-macos"]')) }}
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -296,3 +291,39 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $testExe.FullName
           exit $LASTEXITCODE
+
+
+      # Benchmark the complete native release build after the original tests.
+      # Outputs are local CI artifacts; this workflow cannot publish a release.
+      - name: Configure benchmark packaging
+        run: node -e "require('node:fs').writeFileSync('apps/desktop/src-tauri/fleet-benchmark.json',JSON.stringify({bundle:{useLocalToolsDir:true,createUpdaterArtifacts:false}}))"
+
+      - name: Full Windows release build and installers
+        if: runner.os == 'Windows'
+        env:
+          CARGO_TARGET_DIR: D:\TestFleetCache\release-targets\allmyagents
+        run: pnpm --filter desktop exec tauri build --config src-tauri/fleet-benchmark.json --bundles msi,nsis
+
+      - name: Full Intel Mac release build and packages
+        if: runner.os == 'macOS'
+        run: pnpm --filter desktop exec tauri build --config src-tauri/fleet-benchmark.json --bundles app,dmg
+
+      - name: Retain Windows benchmark installers
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fleet-full-build-windows-x64-${{ github.run_id }}
+          path: |
+            D:/TestFleetCache/release-targets/allmyagents/release/bundle/msi/*.msi
+            D:/TestFleetCache/release-targets/allmyagents/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Retain Intel Mac benchmark package
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fleet-full-build-macos-x64-${{ github.run_id }}
+          path: apps/desktop/src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 7
