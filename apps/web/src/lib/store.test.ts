@@ -497,6 +497,19 @@ describe('deleteSession / removeSessionLocal', () => {
 // roster (sidebar/dashboard) and only spawns for real via materializeDraft.
 
 describe('newSession (draft) + materializeDraft', () => {
+  it('carries Daybreak through draft creation and clears it on account change', async () => {
+    store.profiles = [{ id: 'codex-a', provider: 'codex' }, { id: 'codex-b', provider: 'codex' }]
+    await store.newSession('codex-a')
+    const id = store.selectedId!
+    store.updateDraft(id, { model: 'gpt-5.6-sol', cyberAccessProgram: 'daybreakBlue' })
+    await store.materializeDraft(id, 'daybreak fixture')
+    expect(vi.mocked(api.spawn).mock.calls.at(-1)?.[0]).toMatchObject({ cyberAccessProgram: 'daybreakBlue' })
+    await store.newSession('codex-a')
+    const second = store.selectedId!
+    store.updateDraft(second, { cyberAccessProgram: 'daybreakBlue' })
+    await store.useAccount('codex-b')
+    expect(store.sessions[second]?.record.cyberAccessProgram).toBeUndefined()
+  })
   it('creates a local draft (no hub spawn) and selects it', async () => {
     store.profiles = [{ id: 'p1', provider: 'claude' }]
     await store.newSession('p1')
@@ -805,12 +818,13 @@ describe('apply()', () => {
   it('repairs a missed active status from the authoritative hub roster', async () => {
     seed('reconciled-status')
     vi.mocked(api.sessions).mockResolvedValueOnce([
-      rec('reconciled-status', { status: 'active' }),
+      rec('reconciled-status', { status: 'active', cyberAccessProgram: 'daybreakBlue' }),
     ])
 
     await store.syncRecordsFromHub()
 
     expect(store.sessions['reconciled-status']?.record.status).toBe('active')
+    expect(store.sessions['reconciled-status']?.record.cyberAccessProgram).toBe('daybreakBlue')
     expect(store.status(store.sessions['reconciled-status']!)).toMatchObject({ key: 'working' })
   })
 

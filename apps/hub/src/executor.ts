@@ -843,6 +843,7 @@ export class InProcessExecutor implements Executor {
           model: spec.model,
           effort: spec.effort,
           serviceTier: spec.serviceTier,
+          cyberAccessProgram: spec.cyberAccessProgram,
           ...codexTurnPolicy(spec), // approval + sandbox together; see the note on codexTurnPolicy
         },
         attachments

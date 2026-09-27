@@ -20,7 +20,8 @@ import {
 import type { ProjectStore } from './projects.js'
 import type { TestbedRunStore } from './testbedRuns.js'
 import { TestbedReservationConflictError, type TestbedReservationStore } from './testbedReservations.js'
-import type { SessionManager } from './sessions.js'
+import type { SessionManager, TurnOverride } from './sessions.js'
+import { parseCyberAccessProgram } from './daybreak.js'
 import type { UsageMonitor } from './usage.js'
 import type { MeshSite } from './meshSite.js'
 import type { InstructionStore } from './instructions.js'
@@ -2724,6 +2725,7 @@ export function startServer(opts: ServerOptions): http.Server {
           model: str(body.model),
           effort: str(body.effort),
           serviceTier: str(body.serviceTier),
+          cyberAccessProgram: parseCyberAccessProgram(body.cyberAccessProgram),
           role: str(body.role),
           permissionMode: pm === 'safe' || pm === 'edits' || pm === 'full' ? pm : undefined,
           useWorktree: typeof body.useWorktree === 'boolean' ? body.useWorktree : undefined,
@@ -3234,10 +3236,11 @@ export function startServer(opts: ServerOptions): http.Server {
       const settingsMatch = /^\/api\/sessions\/([^/]+)\/settings$/.exec(url.pathname)
       if (method === 'POST' && settingsMatch) {
         const body = await readBody(req)
-        const patch: { model?: string; effort?: string; serviceTier?: string } = {}
+        const patch: TurnOverride = {}
         if (body.model !== undefined) patch.model = String(body.model ?? '')
         if (body.effort !== undefined) patch.effort = String(body.effort ?? '')
         if (body.serviceTier !== undefined) patch.serviceTier = String(body.serviceTier ?? '')
+        if (body.cyberAccessProgram !== undefined) patch.cyberAccessProgram = parseCyberAccessProgram(body.cyberAccessProgram)
         json(res, sessions.setSettings(settingsMatch[1] as string, patch))
         return
       }
@@ -3448,6 +3451,7 @@ export function startServer(opts: ServerOptions): http.Server {
               model: str(body.model),
               effort: body.effort === undefined ? undefined : String(body.effort),
               serviceTier: body.serviceTier === undefined ? undefined : String(body.serviceTier),
+              cyberAccessProgram: parseCyberAccessProgram(body.cyberAccessProgram),
             },
             stringArray(body.attachments, 'attachments'),
             requestId,

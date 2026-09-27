@@ -76,7 +76,7 @@ hub-runtime/
 ```
 
 The shipped `package.json` pins the prod deps to the versions the workspace currently resolves
-(`@anthropic-ai/claude-agent-sdk@0.3.220`, `@anthropic-ai/claude-code@2.1.220`, `@openai/codex@0.153.3`,
+(`@anthropic-ai/claude-agent-sdk@0.3.220`, `@anthropic-ai/claude-code@2.1.220`, `@openai/codex@0.156.1`,
 `better-sqlite3@12.11.1`, `ws@8.21.1`), so the first-run install reproduces the validated set instead of
 drifting to `latest`.
 

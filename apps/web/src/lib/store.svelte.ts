@@ -1068,6 +1068,7 @@ export class HubStore {
         v.record.model = rec.model
         v.record.effort = rec.effort
         v.record.serviceTier = rec.serviceTier
+        v.record.cyberAccessProgram = rec.cyberAccessProgram
         v.record.isProjectManager = rec.isProjectManager
         v.record.managerReassignedFromSessionId = rec.managerReassignedFromSessionId
         v.record.managerReassignedToSessionId = rec.managerReassignedToSessionId
@@ -1272,6 +1273,7 @@ export class HubStore {
     if (r.model) body.model = r.model
     if (r.effort) body.effort = r.effort
     if (r.serviceTier) body.serviceTier = r.serviceTier
+    if (r.cyberAccessProgram) body.cyberAccessProgram = r.cyberAccessProgram
     const out = await api.spawn(body)
     if (!out || 'error' in out) {
       return { error: (out as { error?: string } | null)?.error ?? 'failed to start the session' }
@@ -1392,6 +1394,7 @@ export class HubStore {
       cur.record.model = (profile.provider === 'codex' ? settings.defaultCodexModel : settings.defaultClaudeModel) || undefined
       cur.record.effort = undefined
       cur.record.serviceTier = undefined
+      cur.record.cyberAccessProgram = undefined
       this.lastProfileId = profileId
       return
     }
@@ -3414,10 +3417,11 @@ export class HubStore {
       // The hub confirming a per-chat model/effort/tier change. Replayed on reconnect too, so the pills
       // show the persisted truth after a reload or a hub restart — for either vendor.
       case 'session/settings': {
-        const p = payload as { model?: string | null; effort?: string | null; serviceTier?: string | null }
+        const p = payload as { model?: string | null; effort?: string | null; serviceTier?: string | null; cyberAccessProgram?: SessionRecord['cyberAccessProgram'] | null }
         if (p.model !== undefined) view.record.model = p.model ?? undefined
         if (p.effort !== undefined) view.record.effort = p.effort ?? undefined
         if (p.serviceTier !== undefined) view.record.serviceTier = p.serviceTier ?? undefined
+        if (p.cyberAccessProgram !== undefined) view.record.cyberAccessProgram = p.cyberAccessProgram ?? undefined
         break
       }
       case 'session/durable-run-access': {

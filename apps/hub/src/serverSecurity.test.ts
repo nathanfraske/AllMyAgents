@@ -228,6 +228,29 @@ function auth(token: string): HeadersInit {
   return { authorization: `Bearer ${token}` }
 }
 
+it('round-trips the Daybreak API field and rejects unsupported requests before session mutation', async () => {
+  const h = await build()
+  h.profile.provider = 'codex'
+  const model = { slug: 'gpt-5.6-sol', name: 'Sol', supportedEfforts: ['low'], serviceTiers: [] }
+  h.profile.availableModels = [model, { ...model, slug: 'gpt-daybreak-blue-latest' }]
+  const post = (url: string, body: object, token = h.deviceToken) => fetch(h.base + url, {
+    method: 'POST', headers: { ...auth(token), 'content-type': 'application/json' }, body: JSON.stringify(body),
+  })
+  const created = await post('/api/sessions', { profileId: h.profile.id, cwd: h.root, useWorktree: false,
+    model: model.slug, cyberAccessProgram: 'daybreakBlue' })
+  expect(created.status).toBe(200)
+  const record = await created.json() as { id: string; cyberAccessProgram: string }
+  expect(record.cyberAccessProgram).toBe('daybreakBlue')
+  const settingsPath = `/api/sessions/${record.id}/settings`
+  expect((await post(settingsPath, { cyberAccessProgram: 'standard' }, 'wrong-token')).status).toBe(401)
+  expect(await (await post(settingsPath, { cyberAccessProgram: 'daybreak_blue' })).json()).toMatchObject({ error: expect.stringMatching(/Invalid Daybreak/) })
+  expect(h.sessions.list().find(r => r.id === record.id)?.cyberAccessProgram).toBe('daybreakBlue')
+  expect(await (await post(settingsPath, { cyberAccessProgram: 'standard' })).json()).toMatchObject({ cyberAccessProgram: 'standard' })
+  const runTurn = vi.spyOn(h.executor, 'runTurn')
+  expect((await post(`/api/sessions/${record.id}/input`, { text: 'test mode', cyberAccessProgram: 'daybreakBlue' })).status).toBe(200)
+  expect(runTurn.mock.calls.at(-1)?.[0]).toMatchObject({ model: model.slug, cyberAccessProgram: 'daybreakBlue' })
+})
+
 describe('shared device discovery', () => {
   it('reports a denied direct lane and shared presence without mapping, probing or pairing that peer', async () => {
     const siteMap = vi.fn()

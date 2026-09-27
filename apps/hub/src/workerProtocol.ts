@@ -6,6 +6,7 @@
  * tool-handler relays (worker→hub, callId/approvalId-correlated) + one hub→worker push (dangerUpdate).
  */
 import crypto from 'node:crypto'
+import type { CyberAccessProgram } from './daybreak.js'
 import type { ApprovalPersistence, ApprovalStatus, DangerFlags } from './types.js'
 import type { AttachmentMeta } from './attachments.js'
 import type { ApprovalHelperEvaluation, ApprovalHelperEvaluationInput } from './approvalHelper.js'
@@ -28,6 +29,7 @@ export interface WorkerSessionSpec {
   model?: string
   effort?: string
   serviceTier?: string
+  cyberAccessProgram?: CyberAccessProgram
   permissionMode?: 'safe' | 'edits' | 'full'
   /**
    * Claude-only app-host contract appended to Claude Code's system prompt for every invocation. Unlike

@@ -4,6 +4,8 @@
  * which the hub does not send) — deliberately only what actually comes back. `id` is what send/steer
  * reference. The composer derives `kind` from `mime` itself (see attachments.ts) when it needs it.
  */
+export type CyberAccessProgram = 'standard' | 'daybreakBlue' | 'daybreakRed'
+
 export interface AttachmentRef {
   id: string
   name: string
@@ -52,6 +54,8 @@ export interface ProfileModelInfo {
   supportedEfforts: string[]
   defaultEffort?: string
   serviceTiers: Array<{ id: string; name: string }>
+  /** Caller-specific explicit programs; missing differs from an authoritative empty list. */
+  cyberAccessPrograms?: CyberAccessProgram[]
   isDefault?: boolean
   releasedAt?: string
 }
@@ -253,6 +257,7 @@ export interface SessionRecord {
   model?: string
   effort?: string
   serviceTier?: string
+  cyberAccessProgram?: CyberAccessProgram
   permissionMode?: string
   permissionModeOperatorOverride?: boolean
   permissionModeOperatorOverrideCeiling?: 'safe' | 'edits' | 'full'
@@ -1854,7 +1859,7 @@ export const api = {
   },
   // `attachments` is an array of attachment IDs (from uploadAttachment), NOT the metadata objects — the
   // hub resolves ids to the stored files (server.ts stringArray: "must be an array of ids").
-  send: (id: string, text: string, extra: { model?: string; effort?: string; serviceTier?: string; attachments?: string[]; requestId?: string } = {}) =>
+  send: (id: string, text: string, extra: { model?: string; effort?: string; serviceTier?: string; cyberAccessProgram?: CyberAccessProgram; attachments?: string[]; requestId?: string } = {}) =>
     routedPost<{ ok?: boolean; error?: string }>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/input`, { text, ...extra }),
   steer: (id: string, text: string, attachments?: string[], requestId?: string) =>
     routedPost<{ ok?: boolean; error?: string }>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/steer`, {
@@ -2033,7 +2038,7 @@ export const api = {
       {},
     ),
   /** Persist a per-chat model / thinking effort / service tier immediately (survives reload + restart). */
-  setSettings: (id: string, patch: { model?: string; effort?: string; serviceTier?: string }) =>
+  setSettings: (id: string, patch: { model?: string; effort?: string; serviceTier?: string; cyberAccessProgram?: CyberAccessProgram }) =>
     routedSessionPost(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/settings`, patch),
   /** Mandatory pre-push/pre-merge check; `ok:false` means main touched files this branch changes. */
   checkIntegration: (id: string) =>

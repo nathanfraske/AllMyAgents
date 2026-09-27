@@ -1,4 +1,5 @@
 import type { ChatNamePool } from './title.js'
+import type { CyberAccessProgram } from './daybreak.js'
 
 export type Provider = 'claude' | 'codex'
 
@@ -10,6 +11,8 @@ export interface ProfileAvailableModel {
   supportedEfforts: string[]
   defaultEffort?: string
   serviceTiers: Array<{ id: string; name: string }>
+  /** Caller-specific explicit programs; missing means older/unknown metadata, [] means none. */
+  cyberAccessPrograms?: CyberAccessProgram[]
   isDefault?: boolean
   /** Provider release date, when supplied; never the local discovery/cache timestamp. */
   releasedAt?: string
@@ -178,6 +181,7 @@ export interface DeferredOperatorTurn {
     model?: string
     effort?: string
     serviceTier?: string
+    cyberAccessProgram?: CyberAccessProgram
   }
   queuedAt: string
   state: 'pending' | 'dispatching'
@@ -221,6 +225,7 @@ export interface SessionRecord {
   model?: string
   effort?: string
   serviceTier?: string
+  cyberAccessProgram?: CyberAccessProgram
   permissionMode?: 'safe' | 'edits' | 'full'
   /** An authenticated, explicit operator choice for this one chat. It bypasses manager ceilings without
    *  silently widening the manager's reusable grant for every other child. */

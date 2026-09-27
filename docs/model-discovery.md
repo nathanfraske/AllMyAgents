@@ -24,6 +24,13 @@ account admission/ownership. An empty provider list stays empty rather than enab
   50 seconds. Failed or late responses do not erase a good list or cross an account-identity change.
   A newer model requiring a newer vendor runtime can still require an app/runtime update.
 
+The current source pins Codex **0.156.1**, the September 23 hotfix that adds GPT-6 Sol/Luna picker
+support. Refreshing the previous 0.153.3 runtime cannot upgrade it. Model entries are not filtered by
+a static known-model list: GPT-6 Sol/Luna flow through the same parser as future model slugs. The
+0.156.1 `availableAccessPrograms.cyber` metadata is retained per account/model for the Daybreak toggle;
+explicit exclusions are enforced, while omitted legacy metadata is visibly treated as unknown.
+See [Daybreak and error routing](daybreak-and-error-routing.md) for the compatibility boundary.
+
 ## Truthful New badges
 
 “New” means a **known release date less than 90 days ago**, excluding future dates. Refreshing, signing

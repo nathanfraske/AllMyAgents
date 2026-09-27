@@ -98,6 +98,30 @@ function harness() {
 }
 
 describe('application Overseer authority', () => {
+  it('persists Daybreak separately from model and revalidates the account before dispatch', async () => {
+    const h = harness()
+    const model = { slug: 'gpt-5.6-sol', name: 'Sol', supportedEfforts: ['low'], serviceTiers: [] }
+    h.profiles[1]!.availableModels = [model, { ...model, slug: 'gpt-daybreak-blue-latest' }]
+    h.seed({ id: 'daybreak', provider: 'codex', profileId: 'p2', model: model.slug })
+    h.sessions.setSettings('daybreak', { cyberAccessProgram: 'daybreakBlue' })
+    expect(h.store.all().find(r => r.id === 'daybreak')).toMatchObject({ model: model.slug, cyberAccessProgram: 'daybreakBlue' })
+    expect(h.journal.latestEventForSessionKind('daybreak', 'session/settings')?.payload).toMatchObject({ cyberAccessProgram: 'daybreakBlue' })
+    await h.sessions.send('daybreak', 'test program')
+    expect(vi.mocked(h.executor.runTurn).mock.calls[0]?.[0]).toMatchObject({ model: model.slug, cyberAccessProgram: 'daybreakBlue' })
+
+    h.seed({ id: 'revoked', provider: 'codex', profileId: 'p2', model: model.slug, cyberAccessProgram: 'daybreakBlue' })
+    h.profiles[1]!.availableModels = [model]
+    await expect(h.sessions.send('revoked', 'must not be accepted')).rejects.toThrow(/does not advertise/)
+    expect(h.journal.latestEventForSessionKind('revoked', 'session/input')).toBeUndefined()
+    expect(() => h.sessions.setSettings('revoked', { model: 'other' })).toThrow(/does not advertise/)
+    expect(h.sessions.list().find(r => r.id === 'revoked')?.model).toBe(model.slug)
+    h.sessions.setSettings('revoked', { cyberAccessProgram: 'standard' })
+    await h.sessions.send('revoked', 'standard is explicit')
+    expect(vi.mocked(h.executor.runTurn).mock.calls.at(-1)?.[0]).toMatchObject({ cyberAccessProgram: 'standard' })
+    h.seed({ id: 'claude', provider: 'claude', profileId: 'p1' })
+    expect(() => h.sessions.setSettings('claude', { cyberAccessProgram: 'daybreakBlue' })).toThrow(/Codex/)
+  })
+
   it('allows only direct operator configuration of extended review authority and separate repository resource grants', async () => {
     const h = harness()
     h.seed({ id: 'overseer', isOverseer: true, permissionMode: 'full' })
@@ -1461,12 +1485,21 @@ describe('application Overseer authority', () => {
     expect(h.bus.pending('overseer')).toHaveLength(2)
   })
 
-  it('keeps quota alerts to an Overseer on a different account', () => {
+  it('keeps different-account quota failures operator-visible without waking the Overseer', () => {
     const h = harness()
     h.seed({ id: 'overseer', isOverseer: true, provider: 'codex', profileId: 'p2', status: 'active' })
     h.markOperator('overseer')
     h.seed({ id: 'failed', provider: 'claude', profileId: 'p1', status: 'active' })
-    h.sessions.failTurn('failed', 'Usage limit reached')
+    const publish = vi.fn()
+    ;(h.sessions as unknown as { notifications: { publish: typeof publish } }).notifications = { publish }
+    h.sessions.failTurn('failed', 'Credits exhausted')
+    expect(h.bus.pending('overseer')).toHaveLength(0)
+    expect(h.executor.runTurn).not.toHaveBeenCalled()
+    expect(publish).toHaveBeenCalledWith(expect.objectContaining({ kind: 'session-error', sessionId: 'failed' }))
+    expect(h.journal.latestEventForSessionKind('failed', 'session/error')?.payload).toMatchObject({ message: 'Credits exhausted' })
+    expect(h.journal.latestEventForSessionKind('failed', 'session/usage-failure-alert-suppressed')?.payload).toMatchObject({ reason: 'operator-action-required-usage-exhausted' })
+    h.seed({ id: 'auth', provider: 'claude', profileId: 'p1', status: 'active' })
+    h.sessions.failTurn('auth', '401 Unauthorized during remote compaction')
     expect(h.bus.pending('overseer')).toHaveLength(1)
   })
 

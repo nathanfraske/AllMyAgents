@@ -7,6 +7,7 @@ import path from 'node:path'
 import { lookup } from 'node:dns/promises'
 import { defaultHomeProfiles, isManagedProfile, readCodexProfileModelCatalog } from './profiles.js'
 import { ModelCatalog } from './modelCatalog.js'
+import { codexCyberAccessProgram, daybreakAliasProgram, validateDaybreakSelection, type CyberAccessProgram } from './daybreak.js'
 import { mapCodexTokenUsage } from './adapters/codex.js'
 import { CLAUDE_AUTO_COMPACT_WINDOW } from './adapters/claude.js'
 import { readHistoryPage, locateTranscript, type HistoryPage } from './transcript.js'
@@ -635,6 +636,7 @@ export interface CreateOptions {
   model?: string
   effort?: string
   serviceTier?: string
+  cyberAccessProgram?: CyberAccessProgram
   /** Team role/description, deliberately separate from the generated scientist identity. */
   role?: string
   /** Manager-selected worker type, persisted for durable live-roster reconstruction. */
@@ -663,6 +665,7 @@ export interface TurnOverride {
   model?: string
   effort?: string
   serviceTier?: string
+  cyberAccessProgram?: CyberAccessProgram
 }
 
 export type SessionApiRecord = SessionRecord & {
@@ -1999,6 +2002,7 @@ export class SessionManager {
       model: record.model,
       effort: record.effort,
       serviceTier: record.serviceTier,
+      ...(record.provider === 'codex' ? { cyberAccessProgram: this.daybreakProgramFor(record) } : {}),
       permissionMode: this.effectivePermissionMode(record),
       claudeSystemPrompt: record.provider === 'claude' ? runtimeInstructions : undefined,
       codexDeveloperInstructions: record.provider === 'codex' ? runtimeInstructions : undefined,
@@ -2835,6 +2839,7 @@ export class SessionManager {
                 model: record.model,
                 effort: record.effort,
                 serviceTier: record.serviceTier,
+                cyberAccessProgram: record.cyberAccessProgram,
                 role: record.role,
                 parentSessionId: record.parentSessionId,
                 isProjectManager: record.isProjectManager === true,
@@ -6587,7 +6592,7 @@ export class SessionManager {
           cwd: predecessor.worktree ?? predecessor.cwd,
           useWorktree: false,
           permissionMode: predecessor.permissionMode,
-          model: input.model ?? (sameProvider ? predecessor.model : undefined),
+          model: input.model ?? (sameProvider && !daybreakAliasProgram(predecessor.model) ? predecessor.model : undefined),
           effort: input.effort ?? (sameProvider ? predecessor.effort : undefined),
           serviceTier: sameProvider ? predecessor.serviceTier : undefined,
         })
@@ -7621,7 +7626,7 @@ export class SessionManager {
   private reportOverseerFailure(failed: SessionRecord): void {
     const overseer = [...this.sessions.values()].find((record) => record.isOverseer === true)
     if (!overseer || overseer.id === failed.id || overseer.status === 'stopped') return
-    if (this.suppressSameAccountUsageAlert(failed, overseer)) return
+    if (this.suppressUsageAlert(failed, overseer, true)) return
     const label = failed.title ?? identityOf(failed).label
     const body = [
       `Fleet failure alert: ${label} (${failed.id}) entered an error state.`,
@@ -7649,9 +7654,13 @@ export class SessionManager {
   }
 
   private suppressSameAccountUsageAlert(failed: SessionRecord, recipient: SessionRecord): boolean {
+    return this.suppressUsageAlert(failed, recipient, false)
+  }
+
+  private suppressUsageAlert(failed: SessionRecord, recipient: SessionRecord, operatorOnlyQuota: boolean): boolean {
     const source = this.profiles.get(failed.profileId)
     const target = this.profiles.get(recipient.profileId)
-    if (!source || !target || !sameProviderAccount(source, target)) return false
+    if (!source || !target || (!operatorOnlyQuota && !sameProviderAccount(source, target))) return false
     const error = this.journal.latestEventForSessionKind(failed.id, 'session/error')
     const message = (error?.payload as { message?: unknown } | undefined)?.message
     if (!error || typeof message !== 'string' || !isUsageLimitFailure(message)) return false
@@ -7664,7 +7673,7 @@ export class SessionManager {
       recipientSessionId: recipient.id, failedSessionId: failed.id,
       sourceProfileId: source.id, recipientProfileId: target.id,
       failureSeq: error.seq, resetsAt: snapshot?.resetsAt,
-      reason: 'same-provider-account-usage-exhausted',
+      reason: operatorOnlyQuota ? 'operator-action-required-usage-exhausted' : 'same-provider-account-usage-exhausted',
     })
     // Operator notification and durable failure remain. No doomed bus turn or later stale replay.
     return true
@@ -8468,6 +8477,17 @@ export class SessionManager {
     return profile
   }
 
+  private assertDaybreakSelection(profile: Profile, model: string | undefined, program: CyberAccessProgram | undefined): void {
+    const models = this.modelCatalog.peek(profile)?.models ??
+      (profile.provider === 'codex' ? readCodexProfileModelCatalog(profile.dir)?.models : undefined) ?? profile.availableModels
+    validateDaybreakSelection(profile, models, model, program)
+  }
+
+  private daybreakProgramFor(record: SessionRecord): CyberAccessProgram {
+    this.assertDaybreakSelection(this.profileOf(record), record.model, record.cyberAccessProgram)
+    return codexCyberAccessProgram(record.model, record.cyberAccessProgram)
+  }
+
   async create(profileId: string, opts: CreateOptions): Promise<SessionRecord> {
     this.assertTurnAdmissionOpen()
     const usageRefresh = this.usage.refreshCodexBeforeDispatch(profileId)
@@ -8496,6 +8516,7 @@ export class SessionManager {
       throw new Error(profile.entitlementReason ?? `${profileId} is authenticated but not entitled to run agents`)
     }
     this.usage.assertNotBlocked(profileId)
+    this.assertDaybreakSelection(profile, opts.model, opts.cyberAccessProgram)
     const id = crypto.randomUUID()
     // Resolve a project (named folder) into a working directory / repo, if given.
     // An explicit cwd (e.g. a handoff/port reusing an existing worktree) wins over the
@@ -8589,6 +8610,7 @@ export class SessionManager {
       model: opts.model,
       effort: opts.effort,
       serviceTier: opts.serviceTier,
+      cyberAccessProgram: opts.cyberAccessProgram,
       role: opts.role ? sanitizeTitle(opts.role) || undefined : undefined,
       agentTypeId: opts.agentTypeId,
       agentTypeName: opts.agentTypeName ? sanitizeTitle(opts.agentTypeName) || undefined : undefined,
@@ -8994,14 +9016,16 @@ export class SessionManager {
     // Authentication and provider entitlement are distinct from usage capacity. Validate both before a
     // fresh accepted turn can journal a message. A steer into an already-running turn stays above this
     // check: it neither starts new provider work nor changes that turn's authority.
-    this.profileOf(record)
+    this.assertDaybreakSelection(this.profileOf(record), override.model ?? record.model,
+      override.cyberAccessProgram ?? record.cyberAccessProgram)
     // Resolve/validate every id before persisting overrides, journaling input, or changing provenance.
     // A missing or vendor-unsupported attachment is an admission failure, not a partial turn.
     const attachments = this.attachmentsFor(record, attachmentIds)
     if (override.model) record.model = override.model
     if (override.effort !== undefined) record.effort = override.effort
     if (override.serviceTier !== undefined) record.serviceTier = override.serviceTier
-    if (override.model || override.effort !== undefined || override.serviceTier !== undefined) this.persist(record)
+    if (override.cyberAccessProgram !== undefined) record.cyberAccessProgram = override.cyberAccessProgram
+    if (override.model || override.effort !== undefined || override.serviceTier !== undefined || override.cyberAccessProgram !== undefined) this.persist(record)
     // Journal the user's message so it's part of the replayable transcript (Claude never echoes
     // user text back as an event; without this the user's turns vanish on reload). Timestamped.
     this.recordOperatorInput(record, { text, attachments })
@@ -9132,6 +9156,7 @@ export class SessionManager {
           if (queued.override.model) record.model = queued.override.model
           if (queued.override.effort !== undefined) record.effort = queued.override.effort
           if (queued.override.serviceTier !== undefined) record.serviceTier = queued.override.serviceTier
+          if (queued.override.cyberAccessProgram !== undefined) record.cyberAccessProgram = queued.override.cyberAccessProgram
         }
         this.persist(record)
 
@@ -9923,17 +9948,23 @@ export class SessionManager {
    * Claude and Codex drivers, so the record is the single source of truth for either. An empty string
    * clears a field back to the profile/catalog default.
    */
-  setSettings(sessionId: string, patch: { model?: string; effort?: string; serviceTier?: string }): SessionRecord {
+  setSettings(sessionId: string, patch: TurnOverride): SessionRecord {
     const record = this.sessions.get(sessionId)
     if (!record) throw new Error(`unknown session: ${sessionId}`)
+    const profile = this.profiles.get(record.profileId)
+    if (!profile) throw new Error(`unknown profile: ${record.profileId}`)
+    this.assertDaybreakSelection(profile, patch.model === undefined ? record.model : patch.model || undefined,
+      patch.cyberAccessProgram ?? record.cyberAccessProgram)
     if (patch.model !== undefined) record.model = patch.model || undefined
     if (patch.effort !== undefined) record.effort = patch.effort || undefined
     if (patch.serviceTier !== undefined) record.serviceTier = patch.serviceTier || undefined
+    if (patch.cyberAccessProgram !== undefined) record.cyberAccessProgram = patch.cyberAccessProgram
     this.persist(record)
     this.journal.append(sessionId, 'session/settings', {
       model: record.model ?? null,
       effort: record.effort ?? null,
       serviceTier: record.serviceTier ?? null,
+      cyberAccessProgram: record.cyberAccessProgram ?? null,
     })
     return record
   }

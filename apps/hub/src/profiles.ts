@@ -116,6 +116,9 @@ export function parseCodexModels(rows: unknown[]): ProfileAvailableModel[] {
       40,
     )
     seen.add(slug)
+    const access = row.availableAccessPrograms ?? row.available_access_programs
+    const programs = access && typeof access === 'object' && !Array.isArray(access)
+      ? (access as Record<string, unknown>).cyber : undefined
     models.push({
       slug,
       name,
@@ -123,6 +126,11 @@ export function parseCodexModels(rows: unknown[]): ProfileAvailableModel[] {
       supportedEfforts,
       ...(defaultEffort ? { defaultEffort } : {}),
       serviceTiers,
+      // Null/omitted metadata remains unknown. Malformed or explicit empty metadata must not
+      // become a legacy alias grant; project only the native enum, never provider instructions.
+      ...(access != null ? { cyberAccessPrograms: Array.isArray(programs)
+        ? [...new Set(programs.filter((value): value is 'standard' | 'daybreakBlue' | 'daybreakRed' =>
+          value === 'standard' || value === 'daybreakBlue' || value === 'daybreakRed'))] : [] } : {}),
       ...(modelReleaseDate(row) ? { releasedAt: modelReleaseDate(row) } : {}),
       ...((row.is_default === true || row.isDefault === true) ? { isDefault: true } : {}),
     })

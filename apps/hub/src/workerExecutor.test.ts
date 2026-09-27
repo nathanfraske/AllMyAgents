@@ -87,6 +87,12 @@ it('routes both provider catalogs through the owning worker without a turn comma
  * applyLifecycle → journal `session/error` + status 'error'), so every client un-sticks identically.
  */
 describe('WorkerExecutor.runTurn — a turn the worker never accepted must not vanish', () => {
+  it('carries Daybreak independently of model to the worker', async () => {
+    const { client, calls } = unattachedClient()
+    const exec = new WorkerExecutor(client, recordingHub().hub)
+    await exec.runTurn({ ...SPEC, provider: 'codex', model: 'gpt-5.6-sol', cyberAccessProgram: 'daybreakBlue' }, 'test', 'operator')
+    expect(calls).toEqual([expect.objectContaining({ t: 'runTurn', spec: expect.objectContaining({ model: 'gpt-5.6-sol', cyberAccessProgram: 'daybreakBlue' }) })])
+  })
   it('carries attachment metadata through both worker commands', async () => {
     const { client, calls } = unattachedClient()
     const { hub } = recordingHub()

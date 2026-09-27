@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { isRecentlyReleased, MODEL_NEW_WINDOW_MS } from './modelReleaseDates'
 afterEach(() => vi.useRealTimers())
-import { findModel, modelsFor } from './catalog'
+import { daybreakPrograms, findModel, modelsFor, modelSupportsProgram } from './catalog'
 import type { ProfileModelInfo } from './api'
 
 const ordinary: ProfileModelInfo = {
@@ -31,6 +31,19 @@ const astra: ProfileModelInfo = {
 }
 
 describe('account-scoped Codex model catalogs', () => {
+  it('uses per-model programs, not hard-coded GPT-6 availability or retired Spark fallback', () => {
+    const sol: ProfileModelInfo = { ...ordinary, slug: 'gpt-6-sol', name: 'GPT-6 Sol', cyberAccessPrograms: ['standard', 'daybreakBlue'] }
+    const luna: ProfileModelInfo = { ...sol, slug: 'gpt-6-luna', name: 'GPT-6 Luna' }
+    expect(modelsFor('codex', [sol, luna]).map(m => m.shortName)).toEqual(['6 Sol', '6 Luna'])
+    expect(daybreakPrograms('codex', [sol, luna])).toEqual(['daybreakBlue'])
+    expect(daybreakPrograms('codex', [{ ...cyber, cyberAccessPrograms: [] }])).toEqual([])
+    expect(modelSupportsProgram(sol, 'daybreakBlue')).toBe(true)
+    expect(modelSupportsProgram(sol, 'daybreakRed')).toBe(false)
+    expect(modelSupportsProgram({ ...sol, cyberAccessPrograms: [] }, 'daybreakBlue')).toBe(false)
+    expect(modelsFor('codex').map(m => m.slug)).not.toContain('gpt-5.3-codex-spark')
+    expect(modelsFor('codex').map(m => m.slug)).not.toContain('gpt-6-sol')
+    expect(modelsFor('codex', [ordinary]).map(m => m.slug)).not.toContain('gpt-6-luna')
+  })
   it('offers a preview model only on the account that advertised it', () => {
     const codexA = modelsFor('codex', [astra, ordinary, cyber])
     const codexB = modelsFor('codex', [ordinary])
