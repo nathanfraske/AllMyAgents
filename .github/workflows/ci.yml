@@ -1,4 +1,4 @@
-name: Fleet cached full build and tests
+name: Fleet LAN cached full build and tests
 
 # Cross-OS functional gate. Windows is the primary target and macOS is the second release target, so
 # both must stay green; Linux is carried as a cheap POSIX canary for the JS half (it catches a
@@ -188,7 +188,199 @@ jobs:
           if (require.main === module) configure();
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        shell: node {0}
+        run: |
+          'use strict';
+          // Run the unchanged frozen pnpm install with an optional authenticated LAN layer.
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const os = require('node:os');
+          const https = require('node:https');
+          const {spawn} = require('node:child_process');
+          
+          function configPath(env, platform) {
+            const roots = {win32:'D:\\TestFleetCache', linux:'/var/cache/test-fleet', darwin:'/Volumes/TestFleetCache'};
+            const p = platform === 'win32' ? path.win32 : path.posix;
+            const root = roots[platform];
+            if (!root || p.normalize(env.RUNNER_TOOL_CACHE || '') !== p.join(root, 'toolcache')) {
+              throw new Error('Unqualified persistent cache');
+            }
+            return p.join(root, 'fleet-lan-cache', 'client.json');
+          }
+          
+          function loadConfig(filename) {
+            const folder = fs.realpathSync(path.dirname(filename));
+            const config = JSON.parse(fs.readFileSync(filename, 'utf8'));
+            if (config.version !== 1 || config.url !== 'https://192.168.88.198:8791') throw new Error('Unqualified LAN endpoint');
+            const files = {};
+            for (const key of ['ca_file','token_file']) {
+              if (!['ca.pem', 'reader.token'].includes(config[key])) throw new Error('Unexpected credential filename');
+              const file = fs.realpathSync(path.join(folder, config[key]));
+              if (path.dirname(file) !== folder) throw new Error('Credential escaped configuration directory');
+              files[key] = file;
+            }
+            const token = fs.readFileSync(files.token_file, 'utf8').trim();
+            if (!/^[A-Za-z0-9_-]{40,128}$/.test(token)) throw new Error('Malformed reader credential');
+            return {...config, ...files, token, ca:fs.readFileSync(files.ca_file)};
+          }
+          
+          function sourceDirectory(env, platform) {
+            const p = platform === 'win32' ? path.win32 : path.posix;
+            const temp = env.RUNNER_TEMP || '';
+            if (!p.isAbsolute(temp) || p.basename(temp) !== '_temp' || p.basename(p.dirname(temp)) !== '_work') {
+              throw new Error('Unqualified runner temporary directory');
+            }
+            return p.dirname(p.dirname(temp));
+          }
+          
+          function validateIssuedConfig(config) {
+            if (config.version !== 1 || config.url !== 'https://192.168.88.198:8791' ||
+                typeof config.ca !== 'string' || config.ca.length > 8192 || !config.ca.startsWith('-----BEGIN CERTIFICATE-----') ||
+                !/^[A-Za-z0-9_-]{40,128}$/.test(config.token || '')) throw new Error('Invalid issued package-cache configuration');
+            return {...config, ca:Buffer.from(config.ca)};
+          }
+          
+          function requestConfig(url, ca, token) {
+            return new Promise(resolve => {
+              let done = false;
+              const finish = value => {if (!done) {done = true; resolve(value);}};
+              const request = https.get(url, {ca, headers:{Authorization:'Bearer '+token}}, response => {
+                let body = '';
+                response.on('data', data => {body += data; if (body.length > 16384) {request.destroy(); finish(null);}});
+                response.on('end', () => {
+                  try {finish(response.statusCode === 200 ? validateIssuedConfig(JSON.parse(body)) : null);}
+                  catch {finish(null);}
+                });
+              });
+              const deadline = setTimeout(() => {request.destroy(); finish(null);}, 3000);
+              request.on('close', () => clearTimeout(deadline));
+              request.on('error', () => finish(null));
+            });
+          }
+          
+          async function runnerConfig(env) {
+            const root = sourceDirectory(env, process.platform);
+            const file = path.join(root, 'fleet-source.json');
+            if (!fs.existsSync(file)) return null;
+            const source = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
+            if (!['https://192.168.88.106:8790','https://192.168.88.106:8791'].includes(source.endpoint) ||
+                !/^[A-Za-z0-9_-]{40,128}$/.test(source.token || '')) throw new Error('Unqualified source broker');
+            return requestConfig(source.endpoint+'/package-cache', fs.readFileSync(path.join(root, 'fleet-source-ca.pem')), source.token);
+          }
+          
+          function probe(config) {
+            return new Promise(resolve => {
+              let done = false;
+              const finish = value => {if (!done) {done = true; resolve(value);}};
+              const request = https.get(config.url+'/health', {ca:config.ca,
+                headers:{Authorization:'Bearer '+config.token}, timeout:2500}, response => {
+                let body = '';
+                response.on('data', data => {body += data; if (body.length > 2048) {request.destroy(); finish(false);}});
+                response.on('end', () => {
+                  try {finish(response.statusCode === 200 && JSON.parse(body).service === 'test-fleet-package-cache');}
+                  catch {finish(false);}
+                });
+              });
+              request.on('timeout', () => {request.destroy(); finish(false);});
+              request.on('error', () => finish(false));
+            });
+          }
+          
+          function pnpmInstall(env) {
+            return new Promise((resolve, reject) => {
+              // Static command; no user-supplied data enters shell text (pnpm.cmd on Windows).
+              const child = spawn('pnpm install --frozen-lockfile', {shell:true, env, stdio:['ignore','pipe','pipe']});
+              let tail = '';
+              for (const [stream, output] of [[child.stdout, process.stdout], [child.stderr, process.stderr]]) {
+                stream.on('data', data => {output.write(data); tail = (tail+data.toString('utf8')).slice(-65536);});
+              }
+              child.on('error', reject);
+              child.on('close', (code, signal) => resolve({code:code === null ? 1 : code, signal, tail}));
+            });
+          }
+          
+          function fetchFailure(result) {
+            return result.code !== 0 && !result.signal &&
+              /ERR_PNPM_(?:META_FETCH_FAIL|FETCH_50[234]|FETCH_429)|\b(?:ETIMEDOUT|ECONNREFUSED|ECONNRESET|EAI_AGAIN)\b/.test(result.tail) &&
+              !/ERR_PNPM_TARBALL_INTEGRITY|ERR_PNPM_OUTDATED_LOCKFILE|ELIFECYCLE/.test(result.tail);
+          }
+          
+          async function main(env=process.env) {
+            if (env.GITHUB_REPOSITORY !== 'nathanfraske/AllMyAgents') throw new Error('Unqualified repository');
+            const filename = configPath(env, process.platform);
+            let config;
+            if (fs.existsSync(filename)) config = loadConfig(filename);
+            else config = await runnerConfig(env);
+            const ready = config && await probe(config);
+            const started = Date.now();
+            if (!ready) {
+              if (env.FLEET_REQUIRE_LAN_CACHE === '1') throw new Error('LAN cache qualification requires a reachable authenticated cache');
+              console.log(JSON.stringify({event:'lan-package-cache', mode:'upstream', reason:config?'unavailable':'not-configured'}));
+              const result = await pnpmInstall(env);
+              console.log(JSON.stringify({event:'lan-package-cache-result', mode:'upstream', elapsed_ms:Date.now()-started, exit:result.code}));
+              return result.code;
+            }
+            const temp = fs.mkdtempSync(path.join(env.RUNNER_TEMP || os.tmpdir(), 'fleet-npm-'));
+            try {
+              const npmrc = path.join(temp, 'npmrc');
+              const certificate = path.join(temp, 'ca.pem');
+              fs.writeFileSync(certificate, config.ca, {mode:0o600, flag:'wx'});
+              fs.writeFileSync(npmrc, 'registry='+config.url+'/npm/\nstrict-ssl=true\n'+
+                '//192.168.88.198:8791/npm/:_authToken='+config.token+'\n', {mode:0o600, flag:'wx'});
+              const lanEnv = {...env, npm_config_userconfig:npmrc, npm_config_registry:config.url+'/npm/',
+                NODE_EXTRA_CA_CERTS:certificate, npm_config_fetch_retries:'1', npm_config_fetch_timeout:'30000'};
+              console.log(JSON.stringify({event:'lan-package-cache', mode:'lan', endpoint:config.url}));
+              let result = await pnpmInstall(lanEnv);
+              const fallback = fetchFailure(result);
+              if (fallback) {
+                if (env.FLEET_REQUIRE_LAN_CACHE === '1') throw new Error('LAN cache qualification encountered a fetch failure');
+                console.log(JSON.stringify({event:'lan-package-cache-fallback', reason:'registry-fetch-error', previous_exit:result.code}));
+                result = await pnpmInstall(env);
+              }
+              console.log(JSON.stringify({event:'lan-package-cache-result', mode:fallback?'upstream-fallback':'lan', elapsed_ms:Date.now()-started, exit:result.code}));
+              return result.code;
+            } finally {
+              // Only this invocation's exact, freshly created temporary directory.
+              for (const name of ['npmrc','ca.pem']) {
+                const file = path.join(temp, name);
+                if (fs.existsSync(file)) fs.unlinkSync(file);
+              }
+              fs.rmdirSync(temp);
+            }
+          }
+          
+          module.exports = {configPath, loadConfig, sourceDirectory, validateIssuedConfig, requestConfig, runnerConfig, probe, fetchFailure, main};
+          
+          async function qualifyThenInstall() {
+            const project = process.cwd();
+            const fixture = fs.mkdtempSync(path.join(process.env.RUNNER_TEMP, 'fleet-lan-qualification-'));
+            const manifest = {private:true, name:'fleet-lan-cache-qualification', version:'1.0.0',
+              packageManager:'pnpm@10.14.0', dependencies:{'is-number':'7.0.0'}};
+            const integrity = 'sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==';
+            const lock = "lockfileVersion: '9.0'\nsettings:\n  autoInstallPeers: true\n  excludeLinksFromLockfile: false\n"+
+              "importers:\n  .:\n    dependencies:\n      is-number:\n        specifier: 7.0.0\n        version: 7.0.0\n"+
+              "packages:\n  is-number@7.0.0:\n    resolution: {integrity: "+integrity+"}\n"+
+              "snapshots:\n  is-number@7.0.0: {}\n";
+            fs.writeFileSync(path.join(fixture,'package.json'), JSON.stringify(manifest));
+            fs.writeFileSync(path.join(fixture,'pnpm-lock.yaml'),lock);
+            try {
+              process.chdir(fixture);
+              const result = await main({...process.env, FLEET_REQUIRE_LAN_CACHE:'1',
+                npm_config_store_dir:path.join(fixture,'empty-store'), npm_config_verify_store_integrity:'true'});
+              if (result !== 0) return result;
+              const number = require(path.join(fixture,'node_modules/is-number'));
+              if (!number(7) || number('not a number')) throw new Error('Installed qualification package failed');
+              console.log(JSON.stringify({event:'lan-package-cache-qualification', platform:process.platform,
+                runner:process.env.RUNNER_NAME, empty_local_store:true, integrity_verified:true, passed:true}));
+            } finally {
+              process.chdir(project);
+            }
+            // The original project install and all following build/test gates still run.
+            return main(process.env);
+          }
+          qualifyThenInstall().then(code => {process.exitCode=code;}, error => {
+            console.error('LAN install failed: '+error.message);process.exitCode=1;
+          });
 
       - name: Release durability gate policy
         run: node --test scripts/wait-release-verification.test.mjs scripts/macos-installability-policy.test.mjs
@@ -383,7 +575,199 @@ jobs:
           if (require.main === module) configure();
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        shell: node {0}
+        run: |
+          'use strict';
+          // Run the unchanged frozen pnpm install with an optional authenticated LAN layer.
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const os = require('node:os');
+          const https = require('node:https');
+          const {spawn} = require('node:child_process');
+          
+          function configPath(env, platform) {
+            const roots = {win32:'D:\\TestFleetCache', linux:'/var/cache/test-fleet', darwin:'/Volumes/TestFleetCache'};
+            const p = platform === 'win32' ? path.win32 : path.posix;
+            const root = roots[platform];
+            if (!root || p.normalize(env.RUNNER_TOOL_CACHE || '') !== p.join(root, 'toolcache')) {
+              throw new Error('Unqualified persistent cache');
+            }
+            return p.join(root, 'fleet-lan-cache', 'client.json');
+          }
+          
+          function loadConfig(filename) {
+            const folder = fs.realpathSync(path.dirname(filename));
+            const config = JSON.parse(fs.readFileSync(filename, 'utf8'));
+            if (config.version !== 1 || config.url !== 'https://192.168.88.198:8791') throw new Error('Unqualified LAN endpoint');
+            const files = {};
+            for (const key of ['ca_file','token_file']) {
+              if (!['ca.pem', 'reader.token'].includes(config[key])) throw new Error('Unexpected credential filename');
+              const file = fs.realpathSync(path.join(folder, config[key]));
+              if (path.dirname(file) !== folder) throw new Error('Credential escaped configuration directory');
+              files[key] = file;
+            }
+            const token = fs.readFileSync(files.token_file, 'utf8').trim();
+            if (!/^[A-Za-z0-9_-]{40,128}$/.test(token)) throw new Error('Malformed reader credential');
+            return {...config, ...files, token, ca:fs.readFileSync(files.ca_file)};
+          }
+          
+          function sourceDirectory(env, platform) {
+            const p = platform === 'win32' ? path.win32 : path.posix;
+            const temp = env.RUNNER_TEMP || '';
+            if (!p.isAbsolute(temp) || p.basename(temp) !== '_temp' || p.basename(p.dirname(temp)) !== '_work') {
+              throw new Error('Unqualified runner temporary directory');
+            }
+            return p.dirname(p.dirname(temp));
+          }
+          
+          function validateIssuedConfig(config) {
+            if (config.version !== 1 || config.url !== 'https://192.168.88.198:8791' ||
+                typeof config.ca !== 'string' || config.ca.length > 8192 || !config.ca.startsWith('-----BEGIN CERTIFICATE-----') ||
+                !/^[A-Za-z0-9_-]{40,128}$/.test(config.token || '')) throw new Error('Invalid issued package-cache configuration');
+            return {...config, ca:Buffer.from(config.ca)};
+          }
+          
+          function requestConfig(url, ca, token) {
+            return new Promise(resolve => {
+              let done = false;
+              const finish = value => {if (!done) {done = true; resolve(value);}};
+              const request = https.get(url, {ca, headers:{Authorization:'Bearer '+token}}, response => {
+                let body = '';
+                response.on('data', data => {body += data; if (body.length > 16384) {request.destroy(); finish(null);}});
+                response.on('end', () => {
+                  try {finish(response.statusCode === 200 ? validateIssuedConfig(JSON.parse(body)) : null);}
+                  catch {finish(null);}
+                });
+              });
+              const deadline = setTimeout(() => {request.destroy(); finish(null);}, 3000);
+              request.on('close', () => clearTimeout(deadline));
+              request.on('error', () => finish(null));
+            });
+          }
+          
+          async function runnerConfig(env) {
+            const root = sourceDirectory(env, process.platform);
+            const file = path.join(root, 'fleet-source.json');
+            if (!fs.existsSync(file)) return null;
+            const source = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
+            if (!['https://192.168.88.106:8790','https://192.168.88.106:8791'].includes(source.endpoint) ||
+                !/^[A-Za-z0-9_-]{40,128}$/.test(source.token || '')) throw new Error('Unqualified source broker');
+            return requestConfig(source.endpoint+'/package-cache', fs.readFileSync(path.join(root, 'fleet-source-ca.pem')), source.token);
+          }
+          
+          function probe(config) {
+            return new Promise(resolve => {
+              let done = false;
+              const finish = value => {if (!done) {done = true; resolve(value);}};
+              const request = https.get(config.url+'/health', {ca:config.ca,
+                headers:{Authorization:'Bearer '+config.token}, timeout:2500}, response => {
+                let body = '';
+                response.on('data', data => {body += data; if (body.length > 2048) {request.destroy(); finish(false);}});
+                response.on('end', () => {
+                  try {finish(response.statusCode === 200 && JSON.parse(body).service === 'test-fleet-package-cache');}
+                  catch {finish(false);}
+                });
+              });
+              request.on('timeout', () => {request.destroy(); finish(false);});
+              request.on('error', () => finish(false));
+            });
+          }
+          
+          function pnpmInstall(env) {
+            return new Promise((resolve, reject) => {
+              // Static command; no user-supplied data enters shell text (pnpm.cmd on Windows).
+              const child = spawn('pnpm install --frozen-lockfile', {shell:true, env, stdio:['ignore','pipe','pipe']});
+              let tail = '';
+              for (const [stream, output] of [[child.stdout, process.stdout], [child.stderr, process.stderr]]) {
+                stream.on('data', data => {output.write(data); tail = (tail+data.toString('utf8')).slice(-65536);});
+              }
+              child.on('error', reject);
+              child.on('close', (code, signal) => resolve({code:code === null ? 1 : code, signal, tail}));
+            });
+          }
+          
+          function fetchFailure(result) {
+            return result.code !== 0 && !result.signal &&
+              /ERR_PNPM_(?:META_FETCH_FAIL|FETCH_50[234]|FETCH_429)|\b(?:ETIMEDOUT|ECONNREFUSED|ECONNRESET|EAI_AGAIN)\b/.test(result.tail) &&
+              !/ERR_PNPM_TARBALL_INTEGRITY|ERR_PNPM_OUTDATED_LOCKFILE|ELIFECYCLE/.test(result.tail);
+          }
+          
+          async function main(env=process.env) {
+            if (env.GITHUB_REPOSITORY !== 'nathanfraske/AllMyAgents') throw new Error('Unqualified repository');
+            const filename = configPath(env, process.platform);
+            let config;
+            if (fs.existsSync(filename)) config = loadConfig(filename);
+            else config = await runnerConfig(env);
+            const ready = config && await probe(config);
+            const started = Date.now();
+            if (!ready) {
+              if (env.FLEET_REQUIRE_LAN_CACHE === '1') throw new Error('LAN cache qualification requires a reachable authenticated cache');
+              console.log(JSON.stringify({event:'lan-package-cache', mode:'upstream', reason:config?'unavailable':'not-configured'}));
+              const result = await pnpmInstall(env);
+              console.log(JSON.stringify({event:'lan-package-cache-result', mode:'upstream', elapsed_ms:Date.now()-started, exit:result.code}));
+              return result.code;
+            }
+            const temp = fs.mkdtempSync(path.join(env.RUNNER_TEMP || os.tmpdir(), 'fleet-npm-'));
+            try {
+              const npmrc = path.join(temp, 'npmrc');
+              const certificate = path.join(temp, 'ca.pem');
+              fs.writeFileSync(certificate, config.ca, {mode:0o600, flag:'wx'});
+              fs.writeFileSync(npmrc, 'registry='+config.url+'/npm/\nstrict-ssl=true\n'+
+                '//192.168.88.198:8791/npm/:_authToken='+config.token+'\n', {mode:0o600, flag:'wx'});
+              const lanEnv = {...env, npm_config_userconfig:npmrc, npm_config_registry:config.url+'/npm/',
+                NODE_EXTRA_CA_CERTS:certificate, npm_config_fetch_retries:'1', npm_config_fetch_timeout:'30000'};
+              console.log(JSON.stringify({event:'lan-package-cache', mode:'lan', endpoint:config.url}));
+              let result = await pnpmInstall(lanEnv);
+              const fallback = fetchFailure(result);
+              if (fallback) {
+                if (env.FLEET_REQUIRE_LAN_CACHE === '1') throw new Error('LAN cache qualification encountered a fetch failure');
+                console.log(JSON.stringify({event:'lan-package-cache-fallback', reason:'registry-fetch-error', previous_exit:result.code}));
+                result = await pnpmInstall(env);
+              }
+              console.log(JSON.stringify({event:'lan-package-cache-result', mode:fallback?'upstream-fallback':'lan', elapsed_ms:Date.now()-started, exit:result.code}));
+              return result.code;
+            } finally {
+              // Only this invocation's exact, freshly created temporary directory.
+              for (const name of ['npmrc','ca.pem']) {
+                const file = path.join(temp, name);
+                if (fs.existsSync(file)) fs.unlinkSync(file);
+              }
+              fs.rmdirSync(temp);
+            }
+          }
+          
+          module.exports = {configPath, loadConfig, sourceDirectory, validateIssuedConfig, requestConfig, runnerConfig, probe, fetchFailure, main};
+          
+          async function qualifyThenInstall() {
+            const project = process.cwd();
+            const fixture = fs.mkdtempSync(path.join(process.env.RUNNER_TEMP, 'fleet-lan-qualification-'));
+            const manifest = {private:true, name:'fleet-lan-cache-qualification', version:'1.0.0',
+              packageManager:'pnpm@10.14.0', dependencies:{'is-number':'7.0.0'}};
+            const integrity = 'sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==';
+            const lock = "lockfileVersion: '9.0'\nsettings:\n  autoInstallPeers: true\n  excludeLinksFromLockfile: false\n"+
+              "importers:\n  .:\n    dependencies:\n      is-number:\n        specifier: 7.0.0\n        version: 7.0.0\n"+
+              "packages:\n  is-number@7.0.0:\n    resolution: {integrity: "+integrity+"}\n"+
+              "snapshots:\n  is-number@7.0.0: {}\n";
+            fs.writeFileSync(path.join(fixture,'package.json'), JSON.stringify(manifest));
+            fs.writeFileSync(path.join(fixture,'pnpm-lock.yaml'),lock);
+            try {
+              process.chdir(fixture);
+              const result = await main({...process.env, FLEET_REQUIRE_LAN_CACHE:'1',
+                npm_config_store_dir:path.join(fixture,'empty-store'), npm_config_verify_store_integrity:'true'});
+              if (result !== 0) return result;
+              const number = require(path.join(fixture,'node_modules/is-number'));
+              if (!number(7) || number('not a number')) throw new Error('Installed qualification package failed');
+              console.log(JSON.stringify({event:'lan-package-cache-qualification', platform:process.platform,
+                runner:process.env.RUNNER_NAME, empty_local_store:true, integrity_verified:true, passed:true}));
+            } finally {
+              process.chdir(project);
+            }
+            // The original project install and all following build/test gates still run.
+            return main(process.env);
+          }
+          qualifyThenInstall().then(code => {process.exitCode=code;}, error => {
+            console.error('LAN install failed: '+error.message);process.exitCode=1;
+          });
 
       # tauri-build (the crate's build.rs) validates tauri.conf.json, and `frontendDist` points at
       # apps/web/dist — so the web build has to exist before cargo touches the crate.
