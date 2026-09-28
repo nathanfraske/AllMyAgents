@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { ApprovalService } from './approvals.js'
 import { AgentBus } from './bus.js'
 import type { Executor } from './executor.js'
@@ -39,18 +39,56 @@ function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', windowsHide: true }).trim()
 }
 
+// Each harness needs a real independent repo, but the identical initial commit need not run 81
+// times. Copy the immutable seed, including .git, without clone hardlinks or shared worktree state.
+let repositorySeed: string
+beforeAll(() => {
+  repositorySeed = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-manager-seed-'))
+  git(repositorySeed, 'init', '--quiet')
+  fs.writeFileSync(path.join(repositorySeed, 'base.txt'), 'base\n')
+  git(repositorySeed, 'add', 'base.txt')
+  git(repositorySeed, '-c', 'user.name=AllMyAgents Test', '-c', 'user.email=test@example.invalid', 'commit', '--quiet', '-m', 'base')
+})
+afterAll(() => {
+  if (repositorySeed) fs.rmSync(repositorySeed, { recursive: true, force: true })
+})
+function copyRepositoryFixture(repo: string): void {
+  fs.cpSync(repositorySeed, repo, { recursive: true, force: false, errorOnExist: true })
+}
+
+it('keeps copied Git fixtures independent in worktree, index, config, refs and objects', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-manager-isolation-'))
+  cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }))
+  const left = path.join(root, 'left')
+  const right = path.join(root, 'right')
+  copyRepositoryFixture(left)
+  copyRepositoryFixture(right)
+  const original = git(right, 'rev-parse', 'HEAD')
+  fs.writeFileSync(path.join(left, 'base.txt'), 'isolated\n')
+  git(left, 'config', '--local', 'user.name', 'Only the left fixture')
+  git(left, 'checkout', '-b', 'isolated')
+  git(left, 'add', 'base.txt')
+  git(left, '-c', 'user.email=test@example.invalid', 'commit', '-m', 'isolated')
+  const changed = git(left, 'rev-parse', 'HEAD')
+  expect(changed).not.toBe(original)
+  for (const untouched of [right, repositorySeed]) {
+    expect(git(untouched, 'status', '--porcelain')).toBe('')
+    expect(git(untouched, 'rev-parse', 'HEAD')).toBe(original)
+    expect(fs.readFileSync(path.join(untouched, 'base.txt'), 'utf8')).toBe('base\n')
+    expect(fs.readFileSync(path.join(untouched, '.git', 'config'), 'utf8')).not.toContain('Only the left fixture')
+    expect(fs.existsSync(path.join(untouched, '.git', 'refs', 'heads', 'isolated'))).toBe(false)
+    expect(fs.existsSync(path.join(untouched, '.git', 'objects', changed.slice(0, 2), changed.slice(2)))).toBe(false)
+  }
+})
+
 function buildHub() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-manager-'))
   const repo = path.join(root, 'repo')
   const profileDir = path.join(root, 'profile')
   const secondProfileDir = path.join(root, 'profile-2')
-  fs.mkdirSync(repo)
+  copyRepositoryFixture(repo)
   fs.mkdirSync(profileDir)
   fs.mkdirSync(secondProfileDir)
-  git(repo, 'init')
-  fs.writeFileSync(path.join(repo, 'base.txt'), 'base\n')
-  git(repo, 'add', 'base.txt')
-  git(repo, '-c', 'user.name=AllMyAgents Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'base')
 
   const journal = new Journal(path.join(root, 'hub.db'))
   const approvals = new ApprovalService(journal)

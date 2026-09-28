@@ -119,6 +119,7 @@ import type {
   DurableRunState,
 } from './durableRuns.js'
 import { APPLICATION_RUN_SCOPE_ID } from './durableRuns.js'
+import { durableRunTerminalNotice } from './durableRunView.js'
 import { validateRunTimeout } from './remoteDevices.js'
 import {
   TestbedReservationConflictError,
@@ -2087,25 +2088,7 @@ export class SessionManager {
     }
     const target = this.sessions.get(run.targetSessionId)
     const targetLabel = target?.title ?? (target ? identityOf(target).label : run.targetSessionId)
-    const exit = run.exitCode === undefined || run.exitCode === null ? '' : ` (exit ${run.exitCode})`
-    const signal = run.signal ? `, signal ${run.signal}` : ''
-    const outcome = run.state === 'succeeded'
-      ? `succeeded${exit}`
-      : run.state === 'failed'
-        ? `failed${exit}${signal}`
-        : run.state === 'cancelled'
-          ? `was cancelled${exit}${signal}`
-          : 'has an unknown outcome because completion could not be confirmed; it may still be running on the target'
-    const error = run.error?.replace(/\s+/gu, ' ').trim().slice(0, 500)
-    const next = run.state === 'outcome_unknown'
-      ? `Inspect run ${run.id} before deciding what happened. Do not retry it blindly because it may have completed on the target.`
-      : `Inspect run ${run.id} for retained logs and exact evidence, then continue the task from this terminal state.`
-    const body = [
-      `Durable ${run.kind} run ${run.id} for ${targetLabel} ${outcome}.`,
-      `Command: ${run.commandSummary}`,
-      ...(error ? [`Bounded failure detail: ${error}`] : []),
-      next,
-    ].join('\n')
+    const body = durableRunTerminalNotice(run, targetLabel)
     const posted = this.bus.postExternal({
       receiptKey: `durable-run-terminal:${run.id}`,
       from: target && target.id !== owner.id

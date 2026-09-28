@@ -1,19 +1,75 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { fork } from 'node:child_process'
+import { fork, type ChildProcess } from 'node:child_process'
+import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import Database from 'better-sqlite3'
 import { Journal } from './journal.js'
 import { snapshotJournal } from './journalBackup.js'
 
 const cleanup: string[] = []
+const children = new Map<ChildProcess, Promise<void>>()
+// Resolve relative to this package, not the shell's cwd (Vitest --root does not chdir).
+const tsxLoader = pathToFileURL(createRequire(import.meta.url).resolve('tsx')).href
 
-afterEach(() => {
+afterEach(async () => {
+  for (const [child, closed] of children) {
+    child.kill()
+    await closed
+  }
   for (const directory of cleanup.splice(0)) fs.rmSync(directory, { recursive: true, force: true })
 })
 
+function runMaintenance(args: string[], options: { cwd?: string; loader?: string } = {}): Promise<Record<string, unknown>> {
+  const child = fork(new URL('./journalMaintenance.ts', import.meta.url), args, {
+    cwd: options.cwd,
+    execArgv: ['--import', options.loader ?? tsxLoader],
+    stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+  })
+  children.set(child, new Promise(resolve => child.once('close', () => {
+    children.delete(child)
+    resolve()
+  })))
+  return new Promise((resolve, reject) => {
+    let message: Record<string, unknown> | undefined
+    let failure: Error | undefined
+    let stderr = ''
+    const timeout = setTimeout(() => {
+      failure = new Error('journal maintenance child did not finish')
+      child.kill()
+    }, 15_000)
+    child.stderr?.on('data', chunk => { stderr = (stderr + String(chunk)).slice(-4096) })
+    child.on('message', value => {
+      const candidate = value as Record<string, unknown>
+      if (['journal-condensed', 'journal-condense-deferred', 'journal-condense-error'].includes(String(candidate.type))) {
+        message = candidate
+      }
+    })
+    child.once('error', error => { failure = error })
+    // Wait for closed pipes/process before inspecting or deleting its database. An early loader
+    // failure must report its real error immediately, not masquerade as a 5-second test timeout.
+    child.once('close', (code, signal) => {
+      clearTimeout(timeout)
+      if (failure) return reject(failure)
+      if (!message) return reject(new Error(`maintenance exited before terminal IPC (exit ${code}, signal ${signal}): ${stderr}`))
+      const expectedCode = message.type === 'journal-condense-error' ? 1 : 0
+      if (code !== expectedCode) return reject(new Error(`maintenance IPC/exit mismatch: ${JSON.stringify(message)}; exit ${code}: ${stderr}`))
+      resolve(message)
+    })
+  })
+}
+
 describe('journal maintenance steady state', () => {
+  it('starts from an unrelated cwd and reports an early loader failure without waiting for timeout', async () => {
+    const message = await runMaintenance([], { cwd: os.tmpdir() })
+    expect(message).toMatchObject({ type: 'journal-condense-error', error: 'journal database path is required' })
+    await expect(runMaintenance([], { cwd: os.tmpdir(), loader: new URL('./not-present-tsx-loader.mjs', import.meta.url).href }))
+      .rejects.toThrow(/exited before terminal IPC.*[\s\S]*ERR_MODULE_NOT_FOUND/u)
+    expect(children.size).toBe(0)
+  })
+
   it('does not require or verify a recovery snapshot when there is no deletion candidate', async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-maintenance-noop-'))
     cleanup.push(directory)
@@ -22,8 +78,7 @@ describe('journal maintenance steady state', () => {
     journal.db.close()
 
     const operationId = '11111111-1111-4111-8111-111111111111'
-    const child = fork(
-      new URL('./journalMaintenance.ts', import.meta.url),
+    const message = await runMaintenance(
       [
         journalFile,
         path.join(directory, 'deliberately-missing-backups'),
@@ -35,23 +90,7 @@ describe('journal maintenance steady state', () => {
         String(1024 * 1024),
         '60000',
       ],
-      { execArgv: ['--import', 'tsx'], stdio: ['ignore', 'ignore', 'pipe', 'ipc'] },
     )
-    const message = await new Promise<Record<string, unknown>>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        child.kill()
-        reject(new Error('journal maintenance child did not finish'))
-      }, 15_000)
-      child.on('message', (value) => {
-        const candidate = value as Record<string, unknown>
-        if (!['journal-condensed', 'journal-condense-deferred', 'journal-condense-error'].includes(String(candidate.type))) {
-          return
-        }
-        clearTimeout(timeout)
-        resolve(candidate)
-      })
-      child.once('error', reject)
-    })
 
     if (message.type !== 'journal-condensed') {
       throw new Error(`maintenance returned ${JSON.stringify(message)}`)
@@ -79,27 +118,12 @@ describe('journal maintenance steady state', () => {
     raw.close()
 
     const operationId = '22222222-2222-4222-8222-222222222222'
-    const child = fork(
-      new URL('./journalMaintenance.ts', import.meta.url),
+    const message = await runMaintenance(
       [
         journalFile, path.join(directory, 'backups'), operationId, '3600000',
         '1000', '1000', '1000', String(1024 * 1024), '60000',
       ],
-      { execArgv: ['--import', 'tsx'], stdio: ['ignore', 'ignore', 'pipe', 'ipc'] },
     )
-    const message = await new Promise<Record<string, unknown>>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        child.kill()
-        reject(new Error('journal maintenance child did not finish'))
-      }, 15_000)
-      child.on('message', (value) => {
-        const candidate = value as Record<string, unknown>
-        if (candidate.type !== 'journal-condense-error') return
-        clearTimeout(timeout)
-        resolve(candidate)
-      })
-      child.once('error', reject)
-    })
     expect(message).toMatchObject({
       type: 'journal-condense-error',
       operationId,
@@ -137,27 +161,12 @@ describe('journal maintenance steady state', () => {
     journal.db.close()
 
     const operationId = '33333333-3333-4333-8333-333333333333'
-    const child = fork(
-      new URL('./journalMaintenance.ts', import.meta.url),
+    const message = await runMaintenance(
       [
         journalFile, backups, operationId, '0',
         '1000', '1000', '1000', String(1024 * 1024), '60000',
       ],
-      { execArgv: ['--import', 'tsx'], stdio: ['ignore', 'ignore', 'pipe', 'ipc'] },
     )
-    const message = await new Promise<Record<string, unknown>>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        child.kill()
-        reject(new Error('journal maintenance child did not finish'))
-      }, 30_000)
-      child.on('message', (value) => {
-        const candidate = value as Record<string, unknown>
-        if (!['journal-condensed', 'journal-condense-deferred', 'journal-condense-error'].includes(String(candidate.type))) return
-        clearTimeout(timeout)
-        resolve(candidate)
-      })
-      child.once('error', reject)
-    })
 
     expect(message).toMatchObject({
       type: 'journal-condensed',
