@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------------------------
-  # JS/TS gates â€” hub + web. Fast, no Rust toolchain, so it runs on all three OSes.
+  # JS/TS gates — hub + web. Fast, no Rust toolchain, so it runs on all three OSes.
   # ---------------------------------------------------------------------------------------------
   gates:
     name: js gates (${{ matrix.os }})
@@ -92,11 +92,11 @@ jobs:
       #
       # This is not hypothetical here. `apps/hub/src/adapters/claude.ts` was committed carrying
       # `<<<<<<< Updated upstream` / `>>>>>>> Stashed changes` while several agents were rebasing over each
-      # other in one working tree. It was removed only by accident â€” swept into an unrelated commit, which
+      # other in one working tree. It was removed only by accident — swept into an unrelated commit, which
       # was itself then dropped in another rebase. Two coincidences separated that file from a release.
       #
       # The consequence is severe and specific: conflict markers in claude.ts are a syntax error, the hub
-      # fails to load, and the app installs and then does nothing â€” the exact "hub never spawns" failure
+      # fails to load, and the app installs and then does nothing — the exact "hub never spawns" failure
       # that blocked an earlier cut and is miserable to diagnose from the outside, because the installer,
       # the update manifest and the signatures are all perfectly valid.
       #
@@ -119,7 +119,7 @@ jobs:
       - name: Install pnpm
         uses: pnpm/action-setup@v4
 
-      # setup-node's `cache: pnpm` keys the pnpm store on pnpm-lock.yaml â€” the pnpm cache the task asks
+      # setup-node's `cache: pnpm` keys the pnpm store on pnpm-lock.yaml — the pnpm cache the task asks
       # for. pnpm must already be on PATH (above) for this to resolve the store dir.
       - name: Install Node
         uses: actions/setup-node@v4
@@ -193,43 +193,43 @@ jobs:
       - name: Release durability gate policy
         run: node --test scripts/wait-release-verification.test.mjs scripts/macos-installability-policy.test.mjs
 
-      # ---- Hub gate: apps/hub â†’ vitest run + tsc --noEmit --------------------------------------------
+      # ---- Hub gate: apps/hub → vitest run + tsc --noEmit --------------------------------------------
       # (package.json scripts: test = "vitest run", typecheck = "tsc --noEmit")
-      - name: Hub â€” unit tests (vitest)
+      - name: Hub — unit tests (vitest)
         run: pnpm --filter hub test
 
-      - name: Hub â€” typecheck (tsc --noEmit)
+      - name: Hub — typecheck (tsc --noEmit)
         run: pnpm --filter hub typecheck
 
-      # ---- Web gate: apps/web â†’ svelte-check + vitest run + vite build --------------------------------
-      - name: Web â€” svelte-check
+      # ---- Web gate: apps/web → svelte-check + vitest run + vite build --------------------------------
+      - name: Web — svelte-check
         run: pnpm --filter web check
 
-      - name: Web â€” unit tests (vitest)
+      - name: Web — unit tests (vitest)
         run: pnpm --filter web test
 
       # The desktop bundle embeds this build via tauri.conf.json's `frontendDist`, so a broken Vite
       # build breaks the installer, not just the dev server. Cheap, and it also produces the
       # apps/web/dist that the Rust job's tauri-build step validates.
-      - name: Web â€” production build (vite)
+      - name: Web — production build (vite)
         run: pnpm --filter web build
 
       # ---- Packaging gates --------------------------------------------------------------------------
       # 1. Prove the credential firewall still FIRES (synthetic payload seeded with one leak of each
       #    class). Guards docs/alpha-release-plan.md "The landmine"; costs ~2s.
-      - name: Bundle â€” credential-firewall self-test
+      - name: Bundle — credential-firewall self-test
         run: pnpm run bundle:audit
 
       # 2. Stage the REAL payload. This is the per-OS packaging gate: it compiles the hub, locates the
-      #    platform's Node + npm (their layouts differ â€” npm sits next to node.exe on Windows but under
+      #    platform's Node + npm (their layouts differ — npm sits next to node.exe on Windows but under
       #    <prefix>/lib/node_modules on macOS/Linux), and runs the credential audit for real. A macOS
       #    packaging regression fails HERE rather than at release time.
-      - name: Bundle â€” stage the real hub payload (runs the audit for real)
+      - name: Bundle — stage the real hub payload (runs the audit for real)
         run: pnpm run hub:bundle
 
       # The release also carries a platform-native, vendor-free testbed node. Build and checksum it on
       # every JS matrix host so Windows, macOS, and the Linux canary all prove their own payload shape.
-      - name: Bundle â€” stage the lightweight testbed payload
+      - name: Bundle — stage the lightweight testbed payload
         run: pnpm run testbed:bundle
 
       - name: Ubuntu remote-node package and installed command qualification
@@ -241,23 +241,23 @@ jobs:
           node scripts/package-testbed-linux.mjs
           node scripts/test-linux-testbed.mjs target/linux-testbed/*.deb
 
-      # 3. Prove the graph a USER actually gets works â€” not the one this repo develops against.
+      # 3. Prove the graph a USER actually gets works — not the one this repo develops against.
       #
       # The repo resolves dependencies with pnpm; the installed app runs plain `npm install` against the
       # staged package.json + package-lock.json. Those two resolvers legitimately choose different
       # transitive peers (observed: Anthropic SDK 0.115.0 under npm vs 0.114.0 under pnpm), so every test
       # above can pass on a graph no user will ever run. That is the same shape as the bug this pinning
-      # work exists to fix â€” an untested dependency set reaching users â€” just one level down.
+      # work exists to fix — an untested dependency set reaching users — just one level down.
       #
       # So: install from the PAYLOAD exactly as first-run does, then import the two modules that are
       # loaded EAGERLY at hub startup. Both fail during module linking, before the hub can report
       # anything, which is why a broken one presents to a user as "the app just doesn't work".
-      - name: Bundle â€” the shipped npm graph installs and imports
+      - name: Bundle — the shipped npm graph installs and imports
         shell: bash
         run: |
           set -euo pipefail
           PAYLOAD="apps/desktop/src-tauri/hub-runtime/apps/hub"
-          test -f "$PAYLOAD/package-lock.json" || { echo "::error::no package-lock.json in the payload â€” the pin is cosmetic without it"; exit 1; }
+          test -f "$PAYLOAD/package-lock.json" || { echo "::error::no package-lock.json in the payload — the pin is cosmetic without it"; exit 1; }
           WORK="$(mktemp -d)"
           cp "$PAYLOAD/package.json" "$PAYLOAD/package-lock.json" "$WORK/"
           ( cd "$WORK" && npm install --omit=dev --no-audit --no-fund --loglevel=error )
@@ -266,7 +266,7 @@ jobs:
             const db = new sqlite(':memory:'); db.prepare('select 1 as x').get(); db.close()
             const sdk = await import('@anthropic-ai/claude-agent-sdk')
             if (typeof sdk.query !== 'function') throw new Error('claude-agent-sdk exports no query()')
-            console.log('shipped graph OK â€” native sqlite loaded, SDK imported')
+            console.log('shipped graph OK — native sqlite loaded, SDK imported')
           "
           # Importing the SDK does not prove the installed vendor launchers work. Exercise npm's real
           # per-platform shims too: POSIX relies on symlinks/shebang + executable bits; Windows resolves
@@ -275,7 +275,7 @@ jobs:
           cd "$WORK" && ./node_modules/.bin/codex --version
 
   # ---------------------------------------------------------------------------------------------
-  # Rust gate â€” the Tauri shell. Only on the two RELEASE targets: those are the platforms whose
+  # Rust gate — the Tauri shell. Only on the two RELEASE targets: those are the platforms whose
   # binaries we ship, and the shell's platform branches (taskkill vs. POSIX process groups) only exist
   # for them. Adding Linux would mean installing the whole libwebkit2gtk toolchain for a target we do
   # not release, so it is deliberately out.
@@ -386,7 +386,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # tauri-build (the crate's build.rs) validates tauri.conf.json, and `frontendDist` points at
-      # apps/web/dist â€” so the web build has to exist before cargo touches the crate.
+      # apps/web/dist — so the web build has to exist before cargo touches the crate.
       - name: Build the web UI (tauri-build validates frontendDist)
         run: pnpm --filter web build
 
@@ -406,7 +406,7 @@ jobs:
 
       # `-D warnings` makes clippy an actual gate. NOTE for maintainers: `stable` moves, so a toolchain
       # bump can introduce a brand-new lint and fail this step on untouched code. When that happens,
-      # fix the finding (preferred) or add a targeted `#[allow(...)]` with a reason â€” do not drop the
+      # fix the finding (preferred) or add a targeted `#[allow(...)]` with a reason — do not drop the
       # `-D`, which would silently turn the gate back into advice.
       - name: cargo clippy
         working-directory: apps/desktop/src-tauri
@@ -414,7 +414,7 @@ jobs:
 
       # `--all-targets` above COMPILES the test targets but never runs them, so the crate's unit tests
       # (path canonicalisation, browser profile isolation, navigation policy) were dead weight in CI. It
-      # also excludes doctests entirely â€” which is how a doc comment that could not compile sat on main
+      # also excludes doctests entirely — which is how a doc comment that could not compile sat on main
       # unnoticed: an indented block in a `///` comment is Rust code to rustdoc, and the Windows error
       # message quoted in it parsed as an unterminated character literal.
       - name: cargo test
