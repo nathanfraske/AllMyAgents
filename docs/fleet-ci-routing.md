@@ -16,15 +16,32 @@ input is an explicit diagnostic comparison; it runs every check. The legacy
 | CI Intel Mac JS and Rust | `self-hosted, macOS, X64, fleet-general-macos` |
 | CI Apple Silicon JS and Rust | GitHub-hosted `macos-latest` |
 | Release Windows installers | `self-hosted, Windows, X64, fleet-general-windows` |
+| Release Intel Mac installers | `self-hosted, macOS, X64, fleet-general-macos` |
 | Release Linux amd64 node | `self-hosted, Linux, X64, fleet-general-linux` |
 | Release Linux arm64 node | GitHub-hosted `ubuntu-24.04-arm` |
-| Release both Mac architectures, installed-app and launch/repair verification | Existing GitHub-hosted jobs |
+| Release Apple Silicon installers | GitHub-hosted `macos-latest` |
+| Installed-app and launch/repair verification | Existing GitHub-hosted jobs, pending local installed-app qualification |
+| Release dispatch/wait and Linux artifact publication coordinators | Existing GitHub-hosted `ubuntu-latest` jobs |
 
 Intel Mac CI is additive: no existing matrix entry, test, architecture, timeout or
-signing/publication gate was removed. The successful fleet full-build comparison is
-not evidence of installed-app, Gatekeeper or updater-signing qualification on local
-Macs. Those release gates therefore remain hosted. The Linux amd64 release still
+signing/publication gate was removed. The operator explicitly confirmed that Apple
+Silicon has no configured local fleet yet and should stay hosted. Linux arm64 is a
+separate existing hosted architecture; no local Linux arm64 pool is established by
+that clarification. The successful Intel Mac full-build/DMG comparison supports
+moving its build job, but is not evidence of installed-app, Gatekeeper or updater
+qualification. Those verification jobs remain hosted until their local equivalents
+are qualified. The Linux amd64 release still
 uses its Ubuntu 22.04 compatibility container and requires Docker on the runner.
+
+Remaining x64 migration is not silently complete: the installed-app jobs require
+real MSI/Start Menu/WebView2 behavior on Windows, and `/Applications` writes plus
+LaunchServices on Intel Mac. The inspected Mac fleet account is deliberately
+non-admin; a successful unsigned build alone establishes none of those facilities.
+Do not grant admin, change cleanup targets, omit checks or introduce a headless-only
+substitute to make these gates green. Coordinate the disposable guest prerequisites
+with the fleet owner. The release wait coordinator also must not occupy capacity
+needed by its own child verification jobs. Its existing dispatch is the only owner
+of that verification; do not start duplicate manual runs.
 
 The adapter contract comes from commit
 `303f79d4719ea39088cedf1f00a64ff321ed8bad`, branch
@@ -91,3 +108,13 @@ Local evidence: runner/cache plus release-policy tests passed 14/14 in durable r
 `751c4677-44d8-43e2-beef-928b8d5c0f76`; afterward all 297 tests across five complete
 manager/recovery/Overseer/worker suites passed in `4b29a953-cc8f-46e5-a95b-f62e1daafd89`,
 and typechecking passed in `a505f967-e4bf-41f4-b60f-03f3c481bcaa`.
+
+The follow-up Intel Mac release-build routing and explicit hosted Apple Silicon
+contract passed all 15 runner/cache/release-policy tests in durable run
+`039aae3e-903e-4b8b-b5ad-2e00ea78f252` (exit 0, 376.8 ms, no skips).
+This is source-contract qualification, not a completed release or local installed-app
+qualification. The earlier PR head `0c30b529` still has three local jobs rejected by
+the fleet's job-start hooks before checkout in run `36463059309`. Their PR merge/head
+SHA and reserved-versus-assigned job identity contracts require fleet-owner
+reconciliation. Do not spoof `GITHUB_SHA`, switch checkout to the unmerged head,
+disable the hook or replay those jobs as a project-side workaround.

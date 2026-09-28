@@ -62,16 +62,27 @@ test('forks, other repositories and explicit hosted diagnostics cannot enter the
   assert(!('pull_request_target' in ci.on))
 })
 
-test('release routes only the previously delegated local platforms and retains every architecture', () => {
+test('release builds use the x64 fleet and retain the hosted ARM architectures', () => {
   assert.deepEqual(runner(release.jobs['linux-testbed']['runs-on'], 'ubuntu-22.04'), ['self-hosted', 'Linux', 'X64', 'fleet-general-linux'])
   assert.equal(runner(release.jobs['linux-testbed']['runs-on'], 'ubuntu-24.04-arm'), 'ubuntu-24.04-arm')
   assert.deepEqual(runner(release.jobs.release['runs-on'], 'windows-latest'), ['self-hosted', 'Windows', 'X64', 'fleet-general-windows'])
-  for (const mac of ['macos-latest', 'macos-15-intel']) assert.equal(runner(release.jobs.release['runs-on'], mac), mac)
+  assert.deepEqual(runner(release.jobs.release['runs-on'], 'macos-15-intel'), ['self-hosted', 'macOS', 'X64', 'fleet-general-macos'])
+  assert.equal(runner(release.jobs.release['runs-on'], 'macos-latest'), 'macos-latest')
   assert.equal(release.jobs.release.needs, 'launch-and-repair-gate')
   assert.equal(release.jobs['linux-testbed'].needs, 'launch-and-repair-gate')
   assert.deepEqual(release.on.push.tags, ['v*'])
   assert.equal(release.concurrency['cancel-in-progress'], false)
   assert.doesNotMatch(read('release.yml'), /linux-docker-x64|windows-native-x64/)
+})
+
+test('Apple Silicon stays hosted in every existing macOS verification matrix', () => {
+  for (const filename of ['macos-p0-verification.yml', 'macos-installability.yml']) {
+    const workflow = parse(read(filename))
+    for (const job of Object.values(workflow.jobs)) {
+      assert(job.strategy.matrix.runner.includes('macos-latest'), `${filename}: Apple Silicon coverage missing`)
+      assert.equal(runner(job['runs-on'], 'macos-latest', { matrix: { runner: 'macos-latest' } }), 'macos-latest')
+    }
+  }
 })
 
 test('all original gate bodies, order and matrix entries remain; only setup/target plumbing changes', () => {

@@ -171,9 +171,9 @@ jobs:
   release:
     name: build (${{ matrix.platform }})
     needs: launch-and-repair-gate
-    # Windows already had a local signing/release grant. Keep both Mac release
-    # architectures hosted until the fleet's installed-app/signing path is qualified.
-    runs-on: ${{ matrix.platform == 'windows-latest' && fromJSON('["self-hosted","Windows","X64","fleet-general-windows"]') || matrix.platform }}
+    # Build on the local x64 pools. Apple Silicon has no configured local pool and
+    # deliberately stays hosted; the independent installed-app gates remain required.
+    runs-on: ${{ (matrix.platform == 'windows-latest' && fromJSON('["self-hosted","Windows","X64","fleet-general-windows"]')) || (matrix.platform == 'macos-15-intel' && fromJSON('["self-hosted","macOS","X64","fleet-general-macos"]')) || matrix.platform }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
