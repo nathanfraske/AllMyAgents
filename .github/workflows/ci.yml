@@ -1,4 +1,4 @@
-name: Fleet full build and tests
+name: Fleet cached full build and tests
 
 # Cross-OS functional gate. Windows is the primary target and macOS is the second release target, so
 # both must stay green; Linux is carried as a cheap POSIX canary for the JS half (it catches a
@@ -38,7 +38,47 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference='Stop'
-          & C:\actions-runner\fleet\release-v1\setup_windows_release.ps1
+          # Reviewed Windows release prerequisites, installed only inside the disposable VM.
+          # Sources: Tauri prerequisites; Microsoft VS2022 component/layout documentation;
+          # official Microsoft/PowerShell and cli/cli publisher assets. No signing keys.
+          $ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
+          if($env:COMPUTERNAME -notin @('LAB-WIN-01','ATC-WIN-01')){throw 'Expected disposable Windows guest'}
+          if((Get-Volume -DriveLetter D).FileSystemLabel -ne 'TestFleetCache'){throw 'Unexpected cache volume'}
+          & 'C:\actions-runner\fleet\release-v1\setup_windows_git.ps1'
+          $tools='D:\TestFleetCache\tools'
+          New-Item -ItemType Directory -Path $tools -Force|Out-Null
+          [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
+          function Get-VerifiedFile([string]$Uri,[string]$Path,[string]$SHA256) {
+           if(-not(Test-Path -LiteralPath $Path)) {
+            $partial=$Path+'.partial'
+            if(Test-Path -LiteralPath $partial){throw 'Prior download evidence exists; inspect before replay'}
+            Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $partial
+            if((Get-FileHash -LiteralPath $partial -Algorithm SHA256).Hash -ne $SHA256){throw 'Publisher checksum mismatch'}
+            Move-Item -LiteralPath $partial -Destination $Path
+           }
+           if((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ne $SHA256){throw 'Cached publisher checksum mismatch'}
+          }
+          function Install-Portable([string]$Name,[string]$Uri,[string]$SHA256,[string]$Exe) {
+           $archive=Join-Path $tools ($Name+'.zip');$destination=Join-Path $tools $Name
+           Get-VerifiedFile $Uri $archive $SHA256
+           $marker=Join-Path $destination '.fleet-archive-sha256'
+           if(Test-Path -LiteralPath $destination) {
+            if(-not(Test-Path -LiteralPath $marker) -or (Get-Content -LiteralPath $marker -Raw).Trim() -ne $SHA256){throw 'Partial portable tool extraction; inspect before replay'}
+           } else {
+            Expand-Archive -LiteralPath $archive -DestinationPath $destination
+            if(-not(Test-Path -LiteralPath (Join-Path $destination $Exe))){throw 'Portable executable missing'}
+            [IO.File]::WriteAllText($marker,$SHA256,[Text.UTF8Encoding]::new($false))
+           }
+           $folder=Split-Path -Parent (Join-Path $destination $Exe)
+           $env:Path=$folder+';'+$env:Path
+           if($env:GITHUB_PATH){[IO.File]::AppendAllText($env:GITHUB_PATH,$folder+[Environment]::NewLine,[Text.UTF8Encoding]::new($false))}
+          }
+          Install-Portable 'PowerShell-7.6.6' 'https://github.com/PowerShell/PowerShell/releases/download/v7.6.6/PowerShell-7.6.6-win-x64.zip' '02FE458BE20493FBDF43F61EA20610B811EE6C738AB1676C61B9CFCD1A33C860' 'pwsh.exe'
+          Install-Portable 'gh-2.101.0' 'https://github.com/cli/cli/releases/download/v2.101.0/gh_2.101.0_windows_amd64.zip' 'BC6C814367B193CD8E713611D61E36013C0EF843B8F516458FE3EDA039192794' 'bin\gh.exe'
+          $gitBin=Join-Path $tools 'PortableGit-2.55.0.5\bin'
+          $env:Path=$gitBin+';'+$env:Path
+          if($env:GITHUB_PATH){[IO.File]::AppendAllText($env:GITHUB_PATH,$gitBin+[Environment]::NewLine,[Text.UTF8Encoding]::new($false))}
+          
           $node=@('C:\actions-runner\externals\node24\bin\node.exe','C:\actions-runner\externals\node20\bin\node.exe') | Where-Object {Test-Path -LiteralPath $_} | Select-Object -First 1
           if(-not $node){throw 'Actions runner Node runtime is missing'}
           $values=& $node --input-type=module -e "import {currentBudget,jobEnvironment} from 'file:///C:/actions-runner/fleet/release-v1/resources_job.mjs';for(const [k,v] of Object.entries(jobEnvironment(currentBudget())))console.log(k+'='+v)"
@@ -85,7 +125,61 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
+
+      - name: Configure persistent fleet build cache
+        if: runner.environment == 'self-hosted'
+        shell: node {0}
+        run: |
+          'use strict';
+          // Persistent inputs and Cargo output; worktrees and test results remain per job.
+          const fs = require('node:fs');
+          const path = require('node:path');
+          
+          function cachePlan(env, platform, arch, packageManager) {
+            if (env.GITHUB_REPOSITORY !== 'nathanfraske/AllMyAgents' || arch !== 'x64') {
+              throw new Error('Unqualified repository or architecture for fleet cache');
+            }
+            const roots = {win32: 'D:\\TestFleetCache', linux: '/var/cache/test-fleet', darwin: '/Volumes/TestFleetCache'};
+            const root = roots[platform];
+            const p = platform === 'win32' ? path.win32 : path.posix;
+            if (!root || p.normalize(env.RUNNER_TOOL_CACHE || '') !== p.join(root, 'toolcache')) {
+              throw new Error('Runner does not advertise the qualified persistent cache');
+            }
+            if (!/^pnpm@\d+\.\d+\.\d+(?:\+sha(?:224|256|384|512)\.[a-f0-9]+)?$/.test(packageManager || '')) {
+              throw new Error('Expected a pinned pnpm packageManager');
+            }
+            const base = p.join(root, 'build-cache-v1', 'nathanfraske--AllMyAgents', `${platform}-${arch}`);
+            return {root, base, values: {
+              npm_config_store_dir: p.join(base, 'pnpm-store'),
+              npm_config_verify_store_integrity: 'true',
+              CARGO_TARGET_DIR: p.join(base, 'cargo-target'),
+              FLEET_CACHE_ROOT: base,
+            }};
+          }
+          
+          function configure() {
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            const plan = cachePlan(process.env, process.platform, process.arch, pkg.packageManager);
+            if (!fs.statSync(plan.root).isDirectory()) throw new Error('Cache disk is missing');
+            const realRoot = fs.realpathSync(plan.root);
+            for (const folder of [plan.base, plan.values.npm_config_store_dir, plan.values.CARGO_TARGET_DIR]) {
+              fs.mkdirSync(folder, {recursive: true});
+              const real = fs.realpathSync(folder);
+              const relative = path.relative(realRoot, real);
+              if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('Cache path escaped disk');
+            }
+            const space = fs.statfsSync(plan.base, {bigint: true});
+            const free = space.bavail * space.bsize;
+            if (free < 8n * 1024n ** 3n) throw new Error('Persistent cache needs at least 8 GiB free');
+            const lines = Object.entries(plan.values).map(([k, v]) => `${k}=${v}\n`).join('');
+            if (!process.env.GITHUB_ENV) throw new Error('Actions environment file missing');
+            fs.appendFileSync(process.env.GITHUB_ENV, lines, 'utf8');
+            console.log(JSON.stringify({event: 'persistent-build-cache', ...plan, packageManager: pkg.packageManager,
+              free_bytes: free.toString(), node: process.version, at: new Date().toISOString()}));
+          }
+          
+          module.exports = {cachePlan};
+          if (require.main === module) configure();
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -212,7 +306,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -221,10 +314,61 @@ jobs:
 
       # Caches ~/.cargo/registry, ~/.cargo/git and the crate's target/ dir, keyed on Cargo.lock + the
       # toolchain. `workspaces` points at the crate root because it is not at the repo root.
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: 'apps/desktop/src-tauri -> target'
+
+      - name: Configure persistent fleet build cache
+        if: runner.environment == 'self-hosted'
+        shell: node {0}
+        run: |
+          'use strict';
+          // Persistent inputs and Cargo output; worktrees and test results remain per job.
+          const fs = require('node:fs');
+          const path = require('node:path');
+          
+          function cachePlan(env, platform, arch, packageManager) {
+            if (env.GITHUB_REPOSITORY !== 'nathanfraske/AllMyAgents' || arch !== 'x64') {
+              throw new Error('Unqualified repository or architecture for fleet cache');
+            }
+            const roots = {win32: 'D:\\TestFleetCache', linux: '/var/cache/test-fleet', darwin: '/Volumes/TestFleetCache'};
+            const root = roots[platform];
+            const p = platform === 'win32' ? path.win32 : path.posix;
+            if (!root || p.normalize(env.RUNNER_TOOL_CACHE || '') !== p.join(root, 'toolcache')) {
+              throw new Error('Runner does not advertise the qualified persistent cache');
+            }
+            if (!/^pnpm@\d+\.\d+\.\d+(?:\+sha(?:224|256|384|512)\.[a-f0-9]+)?$/.test(packageManager || '')) {
+              throw new Error('Expected a pinned pnpm packageManager');
+            }
+            const base = p.join(root, 'build-cache-v1', 'nathanfraske--AllMyAgents', `${platform}-${arch}`);
+            return {root, base, values: {
+              npm_config_store_dir: p.join(base, 'pnpm-store'),
+              npm_config_verify_store_integrity: 'true',
+              CARGO_TARGET_DIR: p.join(base, 'cargo-target'),
+              FLEET_CACHE_ROOT: base,
+            }};
+          }
+          
+          function configure() {
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            const plan = cachePlan(process.env, process.platform, process.arch, pkg.packageManager);
+            if (!fs.statSync(plan.root).isDirectory()) throw new Error('Cache disk is missing');
+            const realRoot = fs.realpathSync(plan.root);
+            for (const folder of [plan.base, plan.values.npm_config_store_dir, plan.values.CARGO_TARGET_DIR]) {
+              fs.mkdirSync(folder, {recursive: true});
+              const real = fs.realpathSync(folder);
+              const relative = path.relative(realRoot, real);
+              if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('Cache path escaped disk');
+            }
+            const space = fs.statfsSync(plan.base, {bigint: true});
+            const free = space.bavail * space.bsize;
+            if (free < 8n * 1024n ** 3n) throw new Error('Persistent cache needs at least 8 GiB free');
+            const lines = Object.entries(plan.values).map(([k, v]) => `${k}=${v}\n`).join('');
+            if (!process.env.GITHUB_ENV) throw new Error('Actions environment file missing');
+            fs.appendFileSync(process.env.GITHUB_ENV, lines, 'utf8');
+            console.log(JSON.stringify({event: 'persistent-build-cache', ...plan, packageManager: pkg.packageManager,
+              free_bytes: free.toString(), node: process.version, at: new Date().toISOString()}));
+          }
+          
+          module.exports = {cachePlan};
+          if (require.main === module) configure();
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -276,12 +420,12 @@ jobs:
         shell: pwsh
         working-directory: apps/desktop/src-tauri
         run: |
-          cargo test --lib --no-run
+          $messages = @(cargo test --lib --no-run --message-format=json)
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $testExe = Get-ChildItem target/debug/deps/allmyagents_desktop_lib-*.exe |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
-          if (-not $testExe) { throw "Rust library test executable was not produced" }
+          $tests = @($messages | ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.executable })
+          if ($tests.Count -ne 1) { throw "Expected one exact Cargo library test executable" }
+          $testExe = Get-Item -LiteralPath $tests[0].executable
           $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter mt.exe |
             Where-Object { $_.FullName -match '\\x64\\mt\.exe$' } |
             Sort-Object FullName -Descending |
@@ -298,10 +442,23 @@ jobs:
       - name: Configure benchmark packaging
         run: node -e "require('node:fs').writeFileSync('apps/desktop/src-tauri/fleet-benchmark.json',JSON.stringify({bundle:{useLocalToolsDir:true,createUpdaterArtifacts:false}}))"
 
+      - name: Prepare fresh installer output inside the persistent target
+        shell: node {0}
+        run: |
+          const fs = require('node:fs'), path = require('node:path');
+          const root = process.env.FLEET_CACHE_ROOT;
+          if (!root || !path.isAbsolute(root)) throw new Error('Cache root is missing');
+          const expected = path.resolve(root, 'cargo-target', 'release', 'bundle');
+          const actual = path.resolve(process.env.CARGO_TARGET_DIR, 'release', 'bundle');
+          if (actual !== expected) throw new Error('Installer directory escaped cache target');
+          if (fs.existsSync(actual)) {
+            if (fs.realpathSync(actual) !== actual) throw new Error('Unexpected installer directory link');
+            fs.rmSync(actual, {recursive:true});
+          }
+          console.log('Fresh installer output; compiled dependencies retained');
+
       - name: Full Windows release build and installers
         if: runner.os == 'Windows'
-        env:
-          CARGO_TARGET_DIR: D:\TestFleetCache\release-targets\allmyagents
         run: pnpm --filter desktop exec tauri build --config src-tauri/fleet-benchmark.json --bundles msi,nsis
 
       - name: Full Intel Mac release build and packages
@@ -314,8 +471,8 @@ jobs:
         with:
           name: fleet-full-build-windows-x64-${{ github.run_id }}
           path: |
-            D:/TestFleetCache/release-targets/allmyagents/release/bundle/msi/*.msi
-            D:/TestFleetCache/release-targets/allmyagents/release/bundle/nsis/*-setup.exe
+            ${{ env.CARGO_TARGET_DIR }}/release/bundle/msi/*.msi
+            ${{ env.CARGO_TARGET_DIR }}/release/bundle/nsis/*-setup.exe
           if-no-files-found: error
           retention-days: 7
 
@@ -324,6 +481,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fleet-full-build-macos-x64-${{ github.run_id }}
-          path: apps/desktop/src-tauri/target/release/bundle/dmg/*.dmg
+          path: ${{ env.CARGO_TARGET_DIR }}/release/bundle/dmg/*.dmg
           if-no-files-found: error
           retention-days: 7
