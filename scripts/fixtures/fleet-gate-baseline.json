@@ -1,0 +1,595 @@
+{
+  "sourceCommit": "4040a0589d3adee13e9d34f6967e09453d8ae128",
+  "workflows": {
+    "ci.yml": {
+      "jobs": {
+        "gates": {
+          "matrix": {
+            "os": [
+              "windows-latest",
+              "macos-latest",
+              "ubuntu-latest"
+            ]
+          },
+          "steps": [
+            {
+              "label": "Prepare local Windows tools and resource budget",
+              "sha256": "d7751645b9157b071256fe2c8d233cf4a30cfa69af5c7cda84668a733dc2a3ae"
+            },
+            {
+              "label": "Checkout",
+              "sha256": "63392462dfd2b34100c5391fbd8a334152cff0576388fe13ac50d584638f100f"
+            },
+            {
+              "label": "Reject unresolved merge markers",
+              "sha256": "376049443a154a0687c192f8cbac9af4ad2edf4c5541b2c9fa76c4f3ee4f89d1"
+            },
+            {
+              "label": "Install pnpm",
+              "sha256": "796d1d490962bd73b2bea868df541a4fe93c6194d77dc918f160c7d26b2e8288"
+            },
+            {
+              "label": "Install dependencies",
+              "sha256": "f054d9bd7f8b12b581bf4e3941a903e986bbbd171d0291cb6ee8edeadfbb741a"
+            },
+            {
+              "label": "Hub — unit tests (vitest)",
+              "sha256": "39f3e81e4b5775adfaa6486751b4e44f5078aef71d4c85b70d03d607305cf583"
+            },
+            {
+              "label": "Hub — typecheck (tsc --noEmit)",
+              "sha256": "cb9930e5951bec3487fc294442278634fc619af4bb3ec95749f7601350b039e7"
+            },
+            {
+              "label": "Web — svelte-check",
+              "sha256": "91bb2d1aac031122af2376177bae1404800626d87dfecd10dd01004f5af1905c"
+            },
+            {
+              "label": "Web — unit tests (vitest)",
+              "sha256": "32de25a2527c341413397a571afe3f53491ec777adf98d3ad54a634ad81e04f9"
+            },
+            {
+              "label": "Web — production build (vite)",
+              "sha256": "28b495ce8a0f472372d589b43521bf88b0a82141f083f0c76d7ed96d35ee5e1c"
+            },
+            {
+              "label": "Bundle — credential-firewall self-test",
+              "sha256": "0e3e4a701936668dcff8730eb8c659ee40faecbf5c09947686a8fb91f248055f"
+            },
+            {
+              "label": "Bundle — stage the real hub payload (runs the audit for real)",
+              "sha256": "ec503be37cd5132141068b192f920dbb34cd9d543b7f5510c5b2831fe70cab2e"
+            },
+            {
+              "label": "Bundle — stage the lightweight testbed payload",
+              "sha256": "ca6ac6b24122bb9ff3e605f208be32d64dc64436d97a9c2c097c2707cb485ce7"
+            },
+            {
+              "label": "Ubuntu remote-node package and installed command qualification",
+              "sha256": "a79f1cabb948f7e6ac06c476d64296875a5d3e47bae4db13124758b0544e6c01"
+            },
+            {
+              "label": "Bundle — the shipped npm graph installs and imports",
+              "sha256": "e6f29604932331a0911cf11ee7fa8b960a1cd46ec7d782b4638662ed6d335a25"
+            }
+          ]
+        },
+        "rust": {
+          "matrix": {
+            "os": [
+              "windows-latest",
+              "macos-latest"
+            ]
+          },
+          "steps": [
+            {
+              "label": "Prepare local Windows tools and resource budget",
+              "sha256": "d7751645b9157b071256fe2c8d233cf4a30cfa69af5c7cda84668a733dc2a3ae"
+            },
+            {
+              "label": "Checkout",
+              "sha256": "63392462dfd2b34100c5391fbd8a334152cff0576388fe13ac50d584638f100f"
+            },
+            {
+              "label": "Install pnpm",
+              "sha256": "796d1d490962bd73b2bea868df541a4fe93c6194d77dc918f160c7d26b2e8288"
+            },
+            {
+              "label": "Install Rust",
+              "sha256": "acdf4e96c2ba3dd09414615daaff715994cdaf30b8a3fa8558ce03e1751072da"
+            },
+            {
+              "label": "Install dependencies",
+              "sha256": "f054d9bd7f8b12b581bf4e3941a903e986bbbd171d0291cb6ee8edeadfbb741a"
+            },
+            {
+              "label": "Build the web UI (tauri-build validates frontendDist)",
+              "sha256": "eae42414aba2e7d4a4473cabac78310fd8dd3ee54051c472197d95b4365c3b82"
+            },
+            {
+              "label": "Stage the hub payload (tauri resource)",
+              "sha256": "4119166717d6cec3cdb8f8ce56f6b6c3d6f7af154202d1a60f7ccd0e173b7ada"
+            },
+            {
+              "label": "Stage the lightweight testbed payload (tauri resource)",
+              "sha256": "c8f0b3de200057544cfdc3c03b392cacc8663f39b678b1934f40428a854899ce"
+            },
+            {
+              "label": "cargo check",
+              "sha256": "aa6831b22eb20ee326c767f6bbe240876fbf56d98dc5d56d6be37320ecf927c8"
+            },
+            {
+              "label": "cargo clippy",
+              "sha256": "2cf63002b6954b01ecd89826cb4b48be17549a8b05925f96e0fe89fc0c028f4f"
+            },
+            {
+              "label": "cargo test",
+              "sha256": "a9553dd7539669e1238adf4aad0d79d736eecfe3a44fe6932a2f0f2918919d0c"
+            }
+          ]
+        }
+      }
+    },
+    "release.yml": {
+      "jobs": {
+        "linux-testbed": {
+          "matrix": {
+            "platform": [
+              "ubuntu-22.04",
+              "ubuntu-24.04-arm"
+            ]
+          },
+          "steps": [
+            {
+              "label": "actions/checkout@v4",
+              "sha256": "dd0465395fff2eaf34fe466af3f46904442331f18fbcb4d67ae136cd3ae05d18"
+            },
+            {
+              "label": "pnpm/action-setup@v4",
+              "sha256": "996a2e37e2c05a282eca416a3aa92b9ef1bdbe874221e128476cd5650c591bc4"
+            },
+            {
+              "label": "pnpm install --frozen-lockfile",
+              "sha256": "952cb43c5c32dd9a47c40019ee68d303fdf7a63aaaed2e0efaaa7793d207df20"
+            },
+            {
+              "label": "pnpm run testbed:bundle",
+              "sha256": "4edaca6562068137861f87cfc4f863cc8433029ef1bd444d836b9c8b6022f52c"
+            },
+            {
+              "label": "Package and qualify the installed Linux node",
+              "sha256": "3c4d4f6fabd3601fa91589e3f3b675f5224131e4a92999412a6f0140964edcfb"
+            },
+            {
+              "label": "Verify x64 package compatibility with Ubuntu 22.04",
+              "sha256": "33d49cd795018b6a470988d51c095906e002451decd77556d75a2c9e579ee918"
+            },
+            {
+              "label": "actions/upload-artifact@v4",
+              "sha256": "b64b67ea9ed1170cfb12dd036748517ae12e124c2bc50320eba230d4b738349e"
+            }
+          ]
+        },
+        "launch-and-repair-gate": {
+          "matrix": null,
+          "steps": [
+            {
+              "label": "actions/checkout@v4",
+              "sha256": "dd0465395fff2eaf34fe466af3f46904442331f18fbcb4d67ae136cd3ae05d18"
+            },
+            {
+              "label": "Dispatch exact-tag durability verification and wait for both platforms",
+              "sha256": "e61144806aa1d9f53f628f21ab09cd0a58568171bfcb20a035188807848d897a"
+            }
+          ]
+        },
+        "release": {
+          "matrix": {
+            "platform": [
+              "macos-latest",
+              "macos-15-intel",
+              "windows-latest"
+            ]
+          },
+          "steps": [
+            {
+              "label": "Prepare the reviewed local Windows release toolchain",
+              "sha256": "02122a19172a154a170c44bbc354d784a44eef9271a8c26974caeeac81e200eb"
+            },
+            {
+              "label": "Checkout",
+              "sha256": "63392462dfd2b34100c5391fbd8a334152cff0576388fe13ac50d584638f100f"
+            },
+            {
+              "label": "Install pnpm",
+              "sha256": "796d1d490962bd73b2bea868df541a4fe93c6194d77dc918f160c7d26b2e8288"
+            },
+            {
+              "label": "Install Rust",
+              "sha256": "9ef68efe154fd2e1626409258b0ba0c850f354506697066ca2fa1e1e49fd9948"
+            },
+            {
+              "label": "Install dependencies",
+              "sha256": "f054d9bd7f8b12b581bf4e3941a903e986bbbd171d0291cb6ee8edeadfbb741a"
+            },
+            {
+              "label": "Credential-firewall self-test",
+              "sha256": "d615d5c895111a6f74336e96062f78909169d41cacdcf2902f65ef3f970c1629"
+            },
+            {
+              "label": "Load the versioned feature and fix log",
+              "sha256": "6a6baf9067184bfd61afa24223edcedd38a3c4dcd51cf081b04d79bd10409709"
+            },
+            {
+              "label": "Warn if the updater signing key is missing",
+              "sha256": "c188ba13f68b4bb70354d5d5ff7b74322777c065480c6b37d5401734ca72be9f"
+            },
+            {
+              "label": "Refuse a non-increasing app version",
+              "sha256": "582b4f6696081e110253b67b49c46a5b3d0c51e06d1e74f100feb174a1fdac4f"
+            },
+            {
+              "label": "Export signing secrets that are set",
+              "sha256": "03d7fd3cd5079f80c386aac6f05ff7508555d221e1ac24119f54ae5bd0676aa1"
+            },
+            {
+              "label": "Place Windows bundling tools outside the SYSTEM profile",
+              "sha256": "2efeb786dade7c6b217cc6bdd1c35d7ad2a8f1048b4404753add51355f13e8b1"
+            },
+            {
+              "label": "Build, sign, and publish (tauri-action)",
+              "sha256": "3396dbda68f6f6353bbd2e8435eb254255f64049c21c6b868cc7f370bad2ce92"
+            }
+          ]
+        },
+        "publish-linux-testbed": {
+          "matrix": null,
+          "steps": [
+            {
+              "label": "actions/download-artifact@v4",
+              "sha256": "4edd0677c8e20d18689cf2a43d8e8a186c88b69cdef76da31594d03cc7a6b715"
+            },
+            {
+              "label": "Attach packages to the exact desktop release",
+              "sha256": "23a1662b1005fad5c1c98d9b5b9343bd745edac57f33f073f2fe5c0e4b4e130c"
+            }
+          ]
+        }
+      }
+    },
+    "macos-p0-verification.yml": {
+      "jobs": {
+        "cli-installer-health": {
+          "matrix": {
+            "runner": [
+              "macos-latest",
+              "macos-15-intel"
+            ]
+          },
+          "steps": [
+            {
+              "label": "actions/checkout@v4",
+              "sha256": "dd0465395fff2eaf34fe466af3f46904442331f18fbcb4d67ae136cd3ae05d18"
+            },
+            {
+              "label": "Run the real CLI installer and require its health verdict",
+              "sha256": "0c69a40ab89b69d072d4bc358f5e8a3962c638bbb106f1103f05e601646d0cf7"
+            },
+            {
+              "label": "Cleanup",
+              "sha256": "d9d4906d566bfe7b234c465848398b4537b90bbd5e96c1ff3e859f4892895a97"
+            }
+          ]
+        },
+        "launch-and-repair": {
+          "matrix": {
+            "runner": [
+              "macos-latest",
+              "macos-15-intel"
+            ]
+          },
+          "steps": [
+            {
+              "label": "actions/checkout@v4",
+              "sha256": "dd0465395fff2eaf34fe466af3f46904442331f18fbcb4d67ae136cd3ae05d18"
+            },
+            {
+              "label": "pnpm/action-setup@v4",
+              "sha256": "996a2e37e2c05a282eca416a3aa92b9ef1bdbe874221e128476cd5650c591bc4"
+            },
+            {
+              "label": "dtolnay/rust-toolchain@stable",
+              "sha256": "de8511d9a58e04f4a6725c02161ced65969e3d1e2198f269f9c59c28069a8281"
+            },
+            {
+              "label": "swatinem/rust-cache@v2",
+              "sha256": "1ba1e46718f3c9020dc59eaa6ee98769ed56d977c3dd917b444ef8932a5441f2"
+            },
+            {
+              "label": "pnpm install --frozen-lockfile",
+              "sha256": "952cb43c5c32dd9a47c40019ee68d303fdf7a63aaaed2e0efaaa7793d207df20"
+            },
+            {
+              "label": "Build and install the app",
+              "sha256": "855eacf50b35903e01257e55451167470c79f4da9771303adf7b2e470c7dae5d"
+            },
+            {
+              "label": "Launch through LaunchServices and require a healthy hub",
+              "sha256": "a7930f79b4d3ba37d1999dbb5d7842cd05dc4c31ed998624918ea31814ae9246"
+            },
+            {
+              "label": "Corrupt a marker-matching native tree, then prove self-healing",
+              "sha256": "03eeadb27e33ad95b964548397684c5f2b903ffcef1358e8ac0c31b9cf4a180a"
+            },
+            {
+              "label": "Installer node guard fails loudly for a non-executable runtime",
+              "sha256": "c6d92091e03cc369a254da05c72a9dc1ad97fee8c1ba6f2ec8650cfb84d0f199"
+            },
+            {
+              "label": "Piped uninstall prompts on /dev/tty and --yes works headlessly",
+              "sha256": "f5eaffc65ccbcd852f047354295f96742cfa9ff25814bc958d109e3e1d19783c"
+            },
+            {
+              "label": "Preserve the current desktop log even when first health never arrives",
+              "sha256": "3d0398e91ee65f2ad67b1639996283a33d2609168189d0aeec92070bb2f4af27"
+            },
+            {
+              "label": "Upload evidence",
+              "sha256": "73f31a0814e51853303e9e1e51b6118dbb4f7ea5d5f6f6e0ad7cfac4cb5c10fd"
+            },
+            {
+              "label": "Cleanup",
+              "sha256": "d9d4906d566bfe7b234c465848398b4537b90bbd5e96c1ff3e859f4892895a97"
+            }
+          ]
+        }
+      }
+    },
+    "windows-p0-verification.yml": {
+      "jobs": {
+        "launch-and-repair": {
+          "matrix": null,
+          "steps": [
+            {
+              "label": "actions/checkout@v4",
+              "sha256": "dd0465395fff2eaf34fe466af3f46904442331f18fbcb4d67ae136cd3ae05d18"
+            },
+            {
+              "label": "pnpm/action-setup@v4",
+              "sha256": "996a2e37e2c05a282eca416a3aa92b9ef1bdbe874221e128476cd5650c591bc4"
+            },
+            {
+              "label": "dtolnay/rust-toolchain@stable",
+              "sha256": "de8511d9a58e04f4a6725c02161ced65969e3d1e2198f269f9c59c28069a8281"
+            },
+            {
+              "label": "swatinem/rust-cache@v2",
+              "sha256": "1ba1e46718f3c9020dc59eaa6ee98769ed56d977c3dd917b444ef8932a5441f2"
+            },
+            {
+              "label": "pnpm install --frozen-lockfile",
+              "sha256": "952cb43c5c32dd9a47c40019ee68d303fdf7a63aaaed2e0efaaa7793d207df20"
+            },
+            {
+              "label": "Build the real MSI",
+              "sha256": "a26e42fc8fc824745542dbfb5b0dc2500dada54f4116908c3e6a0f65acb2db37"
+            },
+            {
+              "label": "Install it the way a user does",
+              "sha256": "783949863d154f2df4676d945d3c016742c9c8f1cfe3b79fd5c7a8433bc17836"
+            },
+            {
+              "label": "Optional deliberate startup break",
+              "sha256": "9baa410e58eb2c5392a129e839139e049ece116a5e484d84610ea335fc4cee66"
+            },
+            {
+              "label": "Launch through the installed shortcut and require a healthy hub",
+              "sha256": "2af84901f61d516a18c6c093e1600b618a415b88ba668967d82f6c8e7dbbdceb"
+            },
+            {
+              "label": "Corrupt a marker-matching native tree",
+              "sha256": "c67b83669de8b482dd68be5967506519e5bd6305f67a3b8d0c4cfbb5692600b5"
+            },
+            {
+              "label": "Relaunch through the shortcut and prove detection and repair",
+              "sha256": "4bf12ff398302d1b974eec6c811928d0b35a47eec633e601409b82b5e90fd195"
+            },
+            {
+              "label": "Collect startup evidence even when health never arrives",
+              "sha256": "651de36098e14779bdc0c96c5c7015d6551ef515bc0b1b5987109decf1989102"
+            },
+            {
+              "label": "Upload evidence",
+              "sha256": "a598e710032a39c0e32e79f1ff558257ad22a8f8d83e683d6811c355236bcdea"
+            },
+            {
+              "label": "Cleanup",
+              "sha256": "d7f8db1d11f626a099b671ee364824d1ebb14c04c835ed99a3252de7baecd174"
+            }
+          ]
+        },
+        "live-updater-lock": {
+          "matrix": null,
+          "steps": [
+            {
+              "label": "actions/checkout@v4",
+              "sha256": "dd0465395fff2eaf34fe466af3f46904442331f18fbcb4d67ae136cd3ae05d18"
+            },
+            {
+              "label": "pnpm/action-setup@v4",
+              "sha256": "996a2e37e2c05a282eca416a3aa92b9ef1bdbe874221e128476cd5650c591bc4"
+            },
+            {
+              "label": "dtolnay/rust-toolchain@stable",
+              "sha256": "de8511d9a58e04f4a6725c02161ced65969e3d1e2198f269f9c59c28069a8281"
+            },
+            {
+              "label": "swatinem/rust-cache@v2",
+              "sha256": "1ba1e46718f3c9020dc59eaa6ee98769ed56d977c3dd917b444ef8932a5441f2"
+            },
+            {
+              "label": "pnpm install --frozen-lockfile",
+              "sha256": "952cb43c5c32dd9a47c40019ee68d303fdf7a63aaaed2e0efaaa7793d207df20"
+            },
+            {
+              "label": "Require the updater signing key",
+              "sha256": "fc90a0a6b7cef2bd2eeddf88c6967255e6a7687b7419a0d7a88ca57762d2d5fa"
+            },
+            {
+              "label": "Build a signed candidate and a lower-version source NSIS installer",
+              "sha256": "469e85680cf4918b7d4b5f04cfef23f310d2044c75b0f03fb646346daec856ce"
+            },
+            {
+              "label": "Install the lower-version NSIS source",
+              "sha256": "3438ad2d303edc38d2891da2d69ac2a1883b4cadd56b095773634b5c79df7568"
+            },
+            {
+              "label": "Launch source, hold its bundled Node open, and serve the signed candidate",
+              "sha256": "b99962aba3ebe7e52d1fb29b466ff3662fd418a2b7cd0d1adef14dbb3de066db"
+            },
+            {
+              "label": "Invoke the real updater and require replacement, relaunch, and health",
+              "sha256": "7c4ba8109ad4a9cd76f7834beafd1c01441598784cb9e429671ad8745be59d68"
+            },
+            {
+              "label": "Collect live-updater evidence",
+              "sha256": "525d62bceadefaa2f562485c80c24f8cae78f4f6fa2475fa2c70cdda30d59d6a"
+            },
+            {
+              "label": "Upload live-updater evidence",
+              "sha256": "4e313a5a7e2c0f2a623cf859077f8a895fe4fa1b1ad19d78f659f36e5ad2055c"
+            },
+            {
+              "label": "Cleanup live-updater fixture",
+              "sha256": "dc18c0e19982050cd5fd5e606bda7124c7b6bffb636c490e4230ff6e340d7303"
+            }
+          ]
+        }
+      }
+    },
+    "macos-installability.yml": {
+      "jobs": {
+        "installability": {
+          "matrix": {
+            "runner": [
+              "macos-latest",
+              "macos-15-intel"
+            ]
+          },
+          "steps": [
+            {
+              "label": "Checkout",
+              "sha256": "63392462dfd2b34100c5391fbd8a334152cff0576388fe13ac50d584638f100f"
+            },
+            {
+              "label": "Record the runner image",
+              "sha256": "2b6c5a25d363a1dc87b890cce9bedfa59d8dbe212a9c8ba17a195616671d2fb2"
+            },
+            {
+              "label": "Resolve what to verify",
+              "sha256": "69e8f145dd631343a83b65f0d47229bd7617b3ace337bc31097c4bb76b73a27e"
+            },
+            {
+              "label": "Download the published DMG for this architecture",
+              "sha256": "5d339d1a111fdbe1fc75a1e213750bcdf482bee075edee980c684d7419ebd28f"
+            },
+            {
+              "label": "Install pnpm",
+              "sha256": "aa9f8d8414be7045513e3a67ca5418479c545e3b027b45d4c6014259ec131f14"
+            },
+            {
+              "label": "Install Rust",
+              "sha256": "859c2e634589c52c36fcea323ad4734f6d1ef45ff2fa87d803216d2e69101764"
+            },
+            {
+              "label": "Install dependencies",
+              "sha256": "b2bafcbd75c090b9f57b708d164aed6e871ed02bc1dd818d9ba1860d0ad0ceb5"
+            },
+            {
+              "label": "Build the macOS bundle",
+              "sha256": "c02b1017c4a75f8a5211f19d0ea585032ce6b7cfa19a8257f187368fbdb59f11"
+            },
+            {
+              "label": "Simulate a browser download (stamp com.apple.quarantine)",
+              "sha256": "7f4346559606f0da0660d69759833d0030432c55051307bff25f294d7e7b4bf0"
+            },
+            {
+              "label": "Mount the DMG and install to /Applications",
+              "sha256": "e41af4e78a623decf742c104fa7b74ea39040a3772d6f61dc3f0ac4af51f3b55"
+            },
+            {
+              "label": "Bundle structure",
+              "sha256": "d6679729d27ce2add4f3e6d995806f1a3f10140f635f069901ececbd248fdd6b"
+            },
+            {
+              "label": "Signature detail (informational)",
+              "sha256": "b6590e0834239244a57050e193dba41bc5141fdcc2cff8848c35c140a837fb85"
+            },
+            {
+              "label": "GATE — codesign --verify matches EXPECT_CODESIGN",
+              "sha256": "f23ec9c29334e208eb02a3924022e52627211b55d3315ea7398455cda591b6ee"
+            },
+            {
+              "label": "GATE — Gatekeeper verdict matches EXPECT_SPCTL",
+              "sha256": "613d5bff9d8ae64e861591e7c1e23173ef1b135754a10eb10edceb86dd92f03a"
+            },
+            {
+              "label": "GATE — the documented xattr workaround clears quarantine",
+              "sha256": "81483db7e2e78b3b7898f32e1d150b133df0ffbd98ef9f10c8835ef180d661cd"
+            },
+            {
+              "label": "SMOKE — app launches and the bundled hub answers /api/health",
+              "sha256": "251a89997a6b0c3331f03756f1d4bad8e4a03761a3c486ec531751ecdd3b1299"
+            },
+            {
+              "label": "Report smoke outcome",
+              "sha256": "5a5ca0807026ab633f1111afb40398047bdedab6aca8875d7d5f4d3d838b1064"
+            },
+            {
+              "label": "Upload diagnostics",
+              "sha256": "4bf95483aa65ab38f4c3eff49edec80da252ae30b5a17dbf8c2aee93c449feb2"
+            },
+            {
+              "label": "Cleanup",
+              "sha256": "309bf1aac57fb73ea388899217947ec8ad39fb3ee65a0acf24bb71af7f77dd05"
+            }
+          ]
+        },
+        "curl-install": {
+          "matrix": {
+            "runner": [
+              "macos-latest",
+              "macos-15-intel"
+            ]
+          },
+          "steps": [
+            {
+              "label": "Checkout",
+              "sha256": "63392462dfd2b34100c5391fbd8a334152cff0576388fe13ac50d584638f100f"
+            },
+            {
+              "label": "Install via scripts/install-macos.sh",
+              "sha256": "b4efcf4aa02261141847b5ff1515f1729ebd1d3d2157c6bf26bd6ee38dbbe093"
+            },
+            {
+              "label": "GATE — the installed app is NOT quarantined",
+              "sha256": "8bcd9d2c3eb27b2c13b1a7776e99c3e83b899046b2c1ec52475b4923e3a748b6"
+            },
+            {
+              "label": "GATE — the updater manifest covers this architecture",
+              "sha256": "5e6a430ae53d045bac05730d6631d3191429905f1a7f1e5a49f611d291c2fc5f"
+            },
+            {
+              "label": "GATE — it launches and the hub answers, with no workaround",
+              "sha256": "583e3bf446a5c240cecf1f56f30f902e76a4223d4e3cdbd8cdda8a1d1f1b06f1"
+            },
+            {
+              "label": "Cleanup",
+              "sha256": "6e9bdf206eb728e0291584dfbc75f996bbde72a5a4f55c51b6b1d2090264bdd3"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -104,7 +104,7 @@ jobs:
   linux-testbed:
     name: Ubuntu remote node (${{ matrix.platform }})
     needs: launch-and-repair-gate
-    runs-on: ${{ matrix.platform == 'ubuntu-22.04' && fromJSON('["self-hosted","Linux","X64","test-fleet","linux-docker-x64"]') || matrix.platform }}
+    runs-on: ${{ matrix.platform == 'ubuntu-22.04' && fromJSON('["self-hosted","Linux","X64","fleet-general-linux"]') || matrix.platform }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -116,7 +116,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
+          cache: ${{ runner.environment != 'self-hosted' && 'pnpm' || '' }}
+      - name: Configure persistent fleet build cache
+        if: runner.environment == 'self-hosted'
+        run: node scripts/fleet-build-cache.cjs
       - run: pnpm install --frozen-lockfile
       - run: pnpm run testbed:bundle
       - name: Package and qualify the installed Linux node
@@ -168,7 +171,9 @@ jobs:
   release:
     name: build (${{ matrix.platform }})
     needs: launch-and-repair-gate
-    runs-on: ${{ matrix.platform == 'windows-latest' && fromJSON('["self-hosted","Windows","X64","test-fleet","windows-native-x64"]') || matrix.platform }}
+    # Windows already had a local signing/release grant. Keep both Mac release
+    # architectures hosted until the fleet's installed-app/signing path is qualified.
+    runs-on: ${{ matrix.platform == 'windows-latest' && fromJSON('["self-hosted","Windows","X64","fleet-general-windows"]') || matrix.platform }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -205,7 +210,11 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
+          cache: ${{ runner.environment != 'self-hosted' && 'pnpm' || '' }}
+
+      - name: Configure persistent fleet build cache
+        if: runner.environment == 'self-hosted'
+        run: node scripts/fleet-build-cache.cjs
 
       - name: Configure the local Windows build cache and concurrency
         if: runner.os == 'Windows'
@@ -213,7 +222,6 @@ jobs:
         run: |
           $values=& node --input-type=module -e "import {currentBudget,jobEnvironment} from 'file:///C:/actions-runner/fleet/release-v1/resources_job.mjs';const b=currentBudget();for(const [k,v] of Object.entries(jobEnvironment(b)))console.log(k+'='+v)"
           if($LASTEXITCODE -ne 0){throw 'Resource allocation failed'}
-          $values+='CARGO_TARGET_DIR=D:\TestFleetCache\release-targets\allmyagents'
           foreach($line in $values){[IO.File]::AppendAllText($env:GITHUB_ENV,$line+[Environment]::NewLine,[Text.UTF8Encoding]::new($false))}
 
       - name: Install Rust
@@ -221,6 +229,7 @@ jobs:
 
       # Cache the Rust build of the Tauri app (the crate lives under apps/desktop/src-tauri).
       - name: Rust cache
+        if: runner.environment != 'self-hosted'
         uses: swatinem/rust-cache@v2
         with:
           workspaces: 'apps/desktop/src-tauri -> target'
@@ -229,6 +238,10 @@ jobs:
       # `hub:bundle` (which stages this runner's Node + the compiled hub as Tauri resources).
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Prepare fresh installer output in the persistent target
+        if: runner.environment == 'self-hosted'
+        run: node scripts/fleet-build-cache.cjs --prepare-release
 
       # Prove the bundle's credential firewall still fires BEFORE we build anything. This is the
       # landmine guard from docs/alpha-release-plan.md; the real audit then runs inside hub:bundle
