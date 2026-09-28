@@ -24,7 +24,7 @@ import { WorkspaceManager } from './workspace.js'
 import { QuestionService } from './questions.js'
 import { DurableRunController, DurableRunStore } from './durableRuns.js'
 
-const cleanups: Array<() => void> = []
+const cleanups: Array<() => void | Promise<void>> = []
 
 afterEach(async () => {
   vi.useRealTimers()
@@ -32,7 +32,7 @@ afterEach(async () => {
   // lifecycle work before closing the shared SQLite handle so successful tests cannot leave an
   // unhandled callback racing the next file's teardown.
   await new Promise<void>((resolve) => setImmediate(resolve))
-  while (cleanups.length) cleanups.pop()?.()
+  while (cleanups.length) await cleanups.pop()?.()
 })
 
 function git(cwd: string, ...args: string[]): string {
@@ -151,8 +151,9 @@ function buildHub() {
     ;(sessions as unknown as { sessions: Map<string, SessionRecord> }).sessions.set(full.id, full)
     return full
   }
-  cleanups.push(() => {
-    journal.db.close()
+  cleanups.push(async () => {
+    await sessions.shutdown()
+    if (journal.db.open) journal.db.close()
     fs.rmSync(root, { recursive: true, force: true })
   })
   return { sessions, journal, approvals, usage, projects, instructions, bus, seed, repo, steer, runTurn, startThread, pauseAutonomousGoal }
@@ -1006,6 +1007,38 @@ describe('project manager durable child identity', () => {
 })
 
 describe('project manager lifecycle awareness', () => {
+  it.each([false, true])('retires manager timers before journal teardown (graceful=%s)', async graceful => {
+    vi.useFakeTimers()
+    const { sessions, journal, bus, seed } = buildHub()
+    seed({ id: 'manager', isProjectManager: true, status: 'active' })
+    seed({ id: 'child', parentSessionId: 'manager', status: 'starting' })
+    transition(sessions, 'child', 'active')
+    const observers = sessions as unknown as {
+      managerStallTimers: Map<string, NodeJS.Timeout>
+      managerAssistantPulseTimers: Map<string, NodeJS.Timeout>
+      scheduleManagerStallCheck(id: string): void
+      scheduleManagerAssistantPulse(id: string, actionable: boolean): void
+    }
+    expect(observers.managerStallTimers.size).toBe(1)
+    expect(observers.managerAssistantPulseTimers.size).toBe(1)
+    const stopped = sessions.shutdown({ graceful })
+    // Timer ownership must end synchronously, before async transfer/vendor teardown yields.
+    expect(observers.managerStallTimers.size).toBe(0)
+    expect(observers.managerAssistantPulseTimers.size).toBe(0)
+    await stopped
+    const read = vi.spyOn(journal, 'lastEventForSession')
+    const pending = vi.spyOn(bus, 'pending')
+    journal.db.close()
+    // A late lifecycle notification cannot re-arm a retired hub's watchdogs.
+    observers.scheduleManagerStallCheck('child')
+    observers.scheduleManagerAssistantPulse('manager', true)
+    await vi.advanceTimersByTimeAsync(2 * MANAGER_STALL_MS)
+    expect(read).not.toHaveBeenCalled()
+    expect(pending).not.toHaveBeenCalled()
+    expect(observers.managerStallTimers.size).toBe(0)
+    expect(observers.managerAssistantPulseTimers.size).toBe(0)
+  })
+
   it('batches simultaneous actionable child transitions into one manager steer', async () => {
     vi.useFakeTimers()
     const { sessions, bus, seed, steer } = buildHub()

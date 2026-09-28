@@ -860,6 +860,8 @@ export class SessionManager {
   >()
   /** One silence watchdog per active managed child; timers are unref'd and emit at most one stall report. */
   private readonly managerStallTimers = new Map<string, NodeJS.Timeout>()
+  /** Shutdown retires hub-owned observers even when vendor workers survive the hub. */
+  private managerObserversStopped = false
   /** Team activation crosses async executor boundaries; reject parallel mutations instead of interleaving them. */
   private readonly managerTeamOperations = new Set<string>()
   /** One hidden evaluator at a time per manager; approval bursts queue instead of spawning a model swarm. */
@@ -7420,7 +7422,9 @@ export class SessionManager {
 
   private scheduleManagerStallCheck(sessionId: string): void {
     this.clearManagerStallCheck(sessionId)
+    if (this.managerObserversStopped) return
     const check = (): void => {
+      if (this.managerObserversStopped) return
       const child = this.sessions.get(sessionId)
       if (!child || child.status !== 'active' || !child.parentSessionId) {
         this.managerStallTimers.delete(sessionId)
@@ -7448,12 +7452,13 @@ export class SessionManager {
    * and performs one bounded query instead of receiving a steer/turn for every sibling.
    */
   private scheduleManagerAssistantPulse(managerSessionId: string, actionable: boolean): void {
+    if (this.managerObserversStopped) return
     const existing = this.managerAssistantPulseTimers.get(managerSessionId)
     if (existing && !actionable) return
     if (existing) clearTimeout(existing)
     const timer = setTimeout(() => {
       this.managerAssistantPulseTimers.delete(managerSessionId)
-      if (!this.sessions.has(managerSessionId)) return
+      if (this.managerObserversStopped || !this.sessions.has(managerSessionId)) return
       let pending: BusMessage[]
       try {
         pending = this.bus.pending(managerSessionId)
@@ -12252,6 +12257,13 @@ export class SessionManager {
   private retiring = false
   async shutdown(opts?: { graceful?: boolean }): Promise<void> {
     if (opts?.graceful) this.retiring = true
+    // unref() only lets a process exit; it does not cancel callbacks when its journal closes.
+    // Retire observers before the first await, and prevent late lifecycle work from re-arming them.
+    this.managerObserversStopped = true
+    for (const timer of this.managerStallTimers.values()) clearTimeout(timer)
+    this.managerStallTimers.clear()
+    for (const timer of this.managerAssistantPulseTimers.values()) clearTimeout(timer)
+    this.managerAssistantPulseTimers.clear()
     this.durableRuns?.shutdown()
     await this.fileTransfers.shutdown()
     this.remoteDeviceController?.stopObserving?.()
