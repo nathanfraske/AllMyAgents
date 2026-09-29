@@ -1,7 +1,7 @@
 # Project-owned fleet CI and release routing
 
-The normal `CI` workflow uses the qualified local fleet for trusted, same-repository
-Windows x64, Linux x64 and Intel Mac jobs. It no longer depends on an unset
+The normal `CI` workflow targets the local fleet for trusted, same-repository
+Windows x64, Linux x64 and Intel Mac jobs, subject to the owner readiness gate below. It no longer depends on an unset
 `TEST_FLEET_CI` repository variable or the obsolete `test-fleet` runner labels.
 Fork pull requests stay on GitHub-hosted runners. The manual `runner_mode=hosted`
 input is an explicit diagnostic comparison; it runs every check. The legacy
@@ -11,13 +11,13 @@ input is an explicit diagnostic comparison; it runs every check. The legacy
 
 | Work | Runner |
 | --- | --- |
-| CI Windows JS and Rust | `self-hosted, Windows, X64, fleet-general-windows` |
-| CI Linux JS | `self-hosted, Linux, X64, fleet-general-linux` |
-| CI Intel Mac JS and Rust | `self-hosted, macOS, X64, fleet-general-macos` |
+| CI Windows JS and Rust | `fleet-v2-windows-<run>-<attempt>-gates` / `...-rust` |
+| CI Linux JS | `fleet-v2-linux-<run>-<attempt>-gates` |
+| CI Intel Mac JS and Rust | `fleet-v2-macos-<run>-<attempt>-gates` / `...-rust` |
 | CI Apple Silicon JS and Rust | GitHub-hosted `macos-latest` |
-| Release Windows installers | `self-hosted, Windows, X64, fleet-general-windows` |
-| Release Intel Mac installers | `self-hosted, macOS, X64, fleet-general-macos` |
-| Release Linux amd64 node | `self-hosted, Linux, X64, fleet-general-linux` |
+| Release Windows installers | `fleet-v2-windows-<run>-<attempt>-release` |
+| Release Intel Mac installers | `fleet-v2-macos-<run>-<attempt>-release` |
+| Release Linux amd64 node | `fleet-v2-linux-<run>-<attempt>-linux-testbed` |
 | Release Linux arm64 node | GitHub-hosted `ubuntu-24.04-arm` |
 | Release Apple Silicon installers | GitHub-hosted `macos-latest` |
 | Installed-app and launch/repair verification | Existing GitHub-hosted jobs, pending local installed-app qualification |
@@ -43,11 +43,27 @@ with the fleet owner. The release wait coordinator also must not occupy capacity
 needed by its own child verification jobs. Its existing dispatch is the only owner
 of that verification; do not start duplicate manual runs.
 
-The adapter contract comes from commit
+Each local `runs-on` is exactly one scalar label, built with `github.run_id`,
+`github.run_attempt` and the literal `jobs.<key>` suffix. There are no companion
+`self-hosted`, OS, architecture or general labels. Current matrices have one local
+row per platform/key; repeating rows requires a newly qualified disambiguation
+contract, not reuse of the same exclusive label. The normal checkout is unchanged:
+PR execution uses the verified merge identity, not a substituted unmerged head.
+
+Binding v2 is pinned to `nathanfraske/test-fleet` commit
+`708e230e173ac5a948dbe08c5706d5b78ddbcbcb`, documented in
+`docs/execution-binding-v2.md`, `controller/execution_contract.py` and
+`controller/native_routing.py`. Owner fixtures cover all eight mappings above for
+PR/main/tag events, actual numeric job assignment distinct from reservations and
+stale-attempt rejection. Project tests check expression outputs, uniqueness and
+unchanged checkouts; they do not substitute for provider-side binding enforcement.
+
+The earlier cache/full-build adapter contract comes from commit
 `303f79d4719ea39088cedf1f00a64ff321ed8bad`, branch
 `fleet/lan-cached-full-build-20260928-v1`. Its five full-check/full-build jobs passed
 in [qualification run 36379322016](https://github.com/nathanfraske/AllMyAgents/actions/runs/36379322016).
-This is source/runner contract evidence, not a promise of current spare capacity.
+This earlier run does not qualify v2 binding. Neither contract evidence nor prior
+full builds establish current spare capacity or physical release readiness.
 The fleet controller must admit the normal CI/release workflow and provision the
 exact labels above. Zero runners between jobs is not itself a failed qualification.
 No controller, resource grant, machine or credential setting is changed by these scripts.
@@ -113,8 +129,16 @@ The follow-up Intel Mac release-build routing and explicit hosted Apple Silicon
 contract passed all 15 runner/cache/release-policy tests in durable run
 `039aae3e-903e-4b8b-b5ad-2e00ea78f252` (exit 0, 376.8 ms, no skips).
 This is source-contract qualification, not a completed release or local installed-app
-qualification. The earlier PR head `0c30b529` still has three local jobs rejected by
+qualification. The earlier PR head `0c30b529` had three local jobs rejected by
 the fleet's job-start hooks before checkout in run `36463059309`. Their PR merge/head
 SHA and reserved-versus-assigned job identity contracts require fleet-owner
 reconciliation. Do not spoof `GITHUB_SHA`, switch checkout to the unmerged head,
 disable the hook or replay those jobs as a project-side workaround.
+
+At source preparation, v2 canary `36497905480` has Linux and two Intel Mac successes,
+but Windows `109181665579` remains prepare-held. Windows live bootstrap, full
+retirement/artifact receipts, Docker Ubuntu22 compatibility and fresh cache/capacity
+readiness are outstanding. Owner-generated Windows recipe hashes are not live
+execution proof. Arnold owns transport recovery and retained-receipt reconciliation;
+no duplicate preparation or canary is authorized by this document. Keep the next
+natural PR push coordinated until his explicit evidence-backed readiness handoff.

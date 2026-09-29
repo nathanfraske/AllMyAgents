@@ -22,29 +22,35 @@ const digest = value => createHash('sha256').update(JSON.stringify(value)).diges
 // contexts as GitHub. No input is interpolated into executable source.
 function runner(expression, osName, overrides = {}) {
   const context = {
-    github: { repository: 'nathanfraske/AllMyAgents', event_name: 'pull_request', event: {
+    github: { repository: 'nathanfraske/AllMyAgents', event_name: 'pull_request', run_id: '12345', run_attempt: '2', event: {
       pull_request: { head: { repo: { full_name: 'nathanfraske/AllMyAgents' } } },
     } },
-    inputs: {}, matrix: { os: osName, platform: osName }, fromJSON: JSON.parse,
+    inputs: {}, matrix: { os: osName, platform: osName },
+    format: (template, ...args) => template.replace(/\{(\d+)\}/g, (_, index) => String(args[Number(index)])),
     ...overrides,
   }
   const value = vm.runInNewContext(expression.slice(3, -2), context, { timeout: 1000 })
   return JSON.parse(JSON.stringify(value))
 }
 
-test('normal trusted CI uses current fleet labels without a missing repository variable', () => {
+test('normal trusted CI uses one exclusive run/attempt/literal-job label per local matrix row', () => {
   const expected = {
-    'windows-latest': ['self-hosted', 'Windows', 'X64', 'fleet-general-windows'],
-    'ubuntu-latest': ['self-hosted', 'Linux', 'X64', 'fleet-general-linux'],
-    'macos-15-intel': ['self-hosted', 'macOS', 'X64', 'fleet-general-macos'],
+    'windows-latest': 'fleet-v2-windows-12345-2-',
+    'ubuntu-latest': 'fleet-v2-linux-12345-2-',
+    'macos-15-intel': 'fleet-v2-macos-12345-2-',
     'macos-latest': 'macos-latest',
   }
-  for (const job of Object.values(ci.jobs)) {
-    for (const osName of job.strategy.matrix.os) assert.deepEqual(runner(job['runs-on'], osName), expected[osName])
+  const labels = new Set()
+  for (const [key, job] of Object.entries(ci.jobs)) {
+    for (const osName of job.strategy.matrix.os) {
+      const label = runner(job['runs-on'], osName)
+      assert.equal(label, osName === 'macos-latest' ? osName : expected[osName] + key)
+      if (label !== osName) { assert(!labels.has(label), `ambiguous matrix binding ${label}`); labels.add(label) }
+    }
   }
   assert.equal(ci.on.workflow_dispatch.inputs.runner_mode.default, 'fleet')
   assert.deepEqual(ci.permissions, { contents: 'read' })
-  assert.doesNotMatch(read('ci.yml'), /vars\.TEST_FLEET_CI|linux-docker-x64|windows-native-x64/)
+  assert.doesNotMatch(read('ci.yml'), /vars\.TEST_FLEET_CI|fleet-general-|linux-docker-x64|windows-native-x64/)
 })
 
 test('forks, other repositories and explicit hosted diagnostics cannot enter the fleet', () => {
@@ -63,16 +69,34 @@ test('forks, other repositories and explicit hosted diagnostics cannot enter the
 })
 
 test('release builds use the x64 fleet and retain the hosted ARM architectures', () => {
-  assert.deepEqual(runner(release.jobs['linux-testbed']['runs-on'], 'ubuntu-22.04'), ['self-hosted', 'Linux', 'X64', 'fleet-general-linux'])
+  assert.equal(runner(release.jobs['linux-testbed']['runs-on'], 'ubuntu-22.04'), 'fleet-v2-linux-12345-2-linux-testbed')
   assert.equal(runner(release.jobs['linux-testbed']['runs-on'], 'ubuntu-24.04-arm'), 'ubuntu-24.04-arm')
-  assert.deepEqual(runner(release.jobs.release['runs-on'], 'windows-latest'), ['self-hosted', 'Windows', 'X64', 'fleet-general-windows'])
-  assert.deepEqual(runner(release.jobs.release['runs-on'], 'macos-15-intel'), ['self-hosted', 'macOS', 'X64', 'fleet-general-macos'])
+  assert.equal(runner(release.jobs.release['runs-on'], 'windows-latest'), 'fleet-v2-windows-12345-2-release')
+  assert.equal(runner(release.jobs.release['runs-on'], 'macos-15-intel'), 'fleet-v2-macos-12345-2-release')
   assert.equal(runner(release.jobs.release['runs-on'], 'macos-latest'), 'macos-latest')
   assert.equal(release.jobs.release.needs, 'launch-and-repair-gate')
   assert.equal(release.jobs['linux-testbed'].needs, 'launch-and-repair-gate')
   assert.deepEqual(release.on.push.tags, ['v*'])
   assert.equal(release.concurrency['cancel-in-progress'], false)
-  assert.doesNotMatch(read('release.yml'), /linux-docker-x64|windows-native-x64/)
+  assert.doesNotMatch(read('release.yml'), /fleet-general-|linux-docker-x64|windows-native-x64/)
+})
+
+test('all eight local mappings change with the actual run and attempt, without altering checkout identity', () => {
+  const jobs = [ci.jobs.gates, ci.jobs.rust, release.jobs.release, release.jobs['linux-testbed']]
+  let mappings = 0
+  for (const job of jobs) for (const osName of job.strategy.matrix.os ?? job.strategy.matrix.platform) {
+    const first = runner(job['runs-on'], osName)
+    if (!first.startsWith('fleet-v2-')) continue
+    mappings++
+    for (const event_name of ['pull_request', 'push', 'workflow_dispatch']) {
+      const github = { repository: 'nathanfraske/AllMyAgents', event_name, run_id: '98765', run_attempt: '3',
+        event: { pull_request: { head: { repo: { full_name: 'nathanfraske/AllMyAgents' } } } } }
+      assert.equal(runner(job['runs-on'], osName, { github }), first.replace('-12345-2-', '-98765-3-'))
+    }
+    const checkout = job.steps.find(step => step.uses === 'actions/checkout@v4')
+    assert.equal(checkout.with?.ref, undefined, 'PR merge checkout must not be replaced by reviewed head')
+  }
+  assert.equal(mappings, 8)
 })
 
 test('Apple Silicon stays hosted in every existing macOS verification matrix', () => {

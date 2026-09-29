@@ -39,7 +39,7 @@ jobs:
     name: js gates (${{ matrix.os }})
     # Same-repository trusted code only. Fork PRs never touch persistent fleet caches.
     # Keep Apple Silicon hosted; the qualified local Mac pool is x64, not arm64.
-    runs-on: ${{ github.repository == 'nathanfraske/AllMyAgents' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && inputs.runner_mode != 'hosted' && ((matrix.os == 'ubuntu-latest' && fromJSON('["self-hosted","Linux","X64","fleet-general-linux"]')) || (matrix.os == 'windows-latest' && fromJSON('["self-hosted","Windows","X64","fleet-general-windows"]')) || (matrix.os == 'macos-15-intel' && fromJSON('["self-hosted","macOS","X64","fleet-general-macos"]'))) || matrix.os }}
+    runs-on: ${{ github.repository == 'nathanfraske/AllMyAgents' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && inputs.runner_mode != 'hosted' && ((matrix.os == 'ubuntu-latest' && format('fleet-v2-linux-{0}-{1}-gates', github.run_id, github.run_attempt)) || (matrix.os == 'windows-latest' && format('fleet-v2-windows-{0}-{1}-gates', github.run_id, github.run_attempt)) || (matrix.os == 'macos-15-intel' && format('fleet-v2-macos-{0}-{1}-gates', github.run_id, github.run_attempt))) || matrix.os }}
     timeout-minutes: 20
     strategy:
       # Never let one OS failing hide the result on the others.
@@ -201,7 +201,7 @@ jobs:
   # ---------------------------------------------------------------------------------------------
   rust:
     name: tauri shell (${{ matrix.os }})
-    runs-on: ${{ github.repository == 'nathanfraske/AllMyAgents' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && inputs.runner_mode != 'hosted' && ((matrix.os == 'ubuntu-latest' && fromJSON('["self-hosted","Linux","X64","fleet-general-linux"]')) || (matrix.os == 'windows-latest' && fromJSON('["self-hosted","Windows","X64","fleet-general-windows"]')) || (matrix.os == 'macos-15-intel' && fromJSON('["self-hosted","macOS","X64","fleet-general-macos"]'))) || matrix.os }}
+    runs-on: ${{ github.repository == 'nathanfraske/AllMyAgents' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && inputs.runner_mode != 'hosted' && ((matrix.os == 'ubuntu-latest' && format('fleet-v2-linux-{0}-{1}-rust', github.run_id, github.run_attempt)) || (matrix.os == 'windows-latest' && format('fleet-v2-windows-{0}-{1}-rust', github.run_id, github.run_attempt)) || (matrix.os == 'macos-15-intel' && format('fleet-v2-macos-{0}-{1}-rust', github.run_id, github.run_attempt))) || matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false

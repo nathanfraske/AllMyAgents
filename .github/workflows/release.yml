@@ -104,7 +104,7 @@ jobs:
   linux-testbed:
     name: Ubuntu remote node (${{ matrix.platform }})
     needs: launch-and-repair-gate
-    runs-on: ${{ matrix.platform == 'ubuntu-22.04' && fromJSON('["self-hosted","Linux","X64","fleet-general-linux"]') || matrix.platform }}
+    runs-on: ${{ matrix.platform == 'ubuntu-22.04' && format('fleet-v2-linux-{0}-{1}-linux-testbed', github.run_id, github.run_attempt) || matrix.platform }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -173,7 +173,7 @@ jobs:
     needs: launch-and-repair-gate
     # Build on the local x64 pools. Apple Silicon has no configured local pool and
     # deliberately stays hosted; the independent installed-app gates remain required.
-    runs-on: ${{ (matrix.platform == 'windows-latest' && fromJSON('["self-hosted","Windows","X64","fleet-general-windows"]')) || (matrix.platform == 'macos-15-intel' && fromJSON('["self-hosted","macOS","X64","fleet-general-macos"]')) || matrix.platform }}
+    runs-on: ${{ (matrix.platform == 'windows-latest' && format('fleet-v2-windows-{0}-{1}-release', github.run_id, github.run_attempt)) || (matrix.platform == 'macos-15-intel' && format('fleet-v2-macos-{0}-{1}-release', github.run_id, github.run_attempt)) || matrix.platform }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
