@@ -58,6 +58,25 @@ it.each(['upload', 'download'] as const)('copies a whole binary %s with one mode
   await expect(h.transfers.manage('other-chat', { operation: 'status', transfer_id: receipt.id })).rejects.toThrow(/not found/)
 })
 
+it('downloads a multi-megabyte file through bounded replies with the existing v1 caller', async () => {
+  const h = await fixture(), bytes = crypto.randomBytes(9_101_212)
+  await fs.writeFile(path.join(h.remote, 'source.bin'), bytes)
+  let largestReply = 0
+  h.setHook((_request, result) => {
+    const wireBytes = Buffer.byteLength(JSON.stringify(result))
+    largestReply = Math.max(largestReply, wireBytes)
+    // Synthetic reply budget, not a claim about a live Mesh transport limit.
+    return wireBytes <= 16 * 1024 ? result : {
+      ok: false, error: 'Synthetic transport rejected an oversized reply', failure: { stage: 'protocol' },
+    }
+  })
+  await h.transfers.manage('chat', { ...h.input, operation: 'download', local_path: 'output.bin', remote_path: 'source.bin' })
+  expect(await h.terminal).toMatchObject({ state: 'completed', transferred: bytes.length, size: bytes.length, sha256: crypto.createHash('sha256').update(bytes).digest('hex') })
+  expect(largestReply).toBeLessThanOrEqual(16 * 1024)
+  expect((await fs.readFile(path.join(h.local, 'output.bin'))).equals(bytes)).toBe(true)
+  expect(h.completed).toHaveBeenCalledTimes(1)
+})
+
 it('does not start bytes when the target lacks protocol support, or source is outside workspace/private config', async () => {
   const h = await fixture()
   await fs.writeFile(path.join(h.local, 'source.bin'), 'a')

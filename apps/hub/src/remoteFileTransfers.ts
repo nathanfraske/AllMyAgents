@@ -42,7 +42,8 @@ export class RemoteFileTransfers {
   private stopped = false
   private stopping = false
   constructor(private journal: Journal, directory: string, private services: Services) {
-    this.local = new FileTransferTarget(directory)
+    // Local reads do not traverse the RPC reply lane; retain bulk upload buffers.
+    this.local = new FileTransferTarget(directory, FILE_TRANSFER_CHUNK)
     journal.db.exec('CREATE TABLE IF NOT EXISTS remote_file_transfers (id TEXT PRIMARY KEY, session TEXT NOT NULL, state TEXT NOT NULL, record TEXT NOT NULL); CREATE INDEX IF NOT EXISTS remote_file_transfers_state ON remote_file_transfers(state)')
     const rows = journal.db.prepare("SELECT record FROM remote_file_transfers WHERE state='running'").all() as { record: string }[]
     // Never resume an ambiguous publication automatically after a hub restart.

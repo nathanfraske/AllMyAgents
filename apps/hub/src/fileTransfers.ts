@@ -5,6 +5,9 @@ import path from 'node:path'
 
 // These are transport buffers, not model/tool payload limits. The model sees only a receipt.
 export const FILE_TRANSFER_CHUNK = 512 * 1024
+// Reply delivery can fail independently of request delivery. Keep remote read replies conservative;
+// v1 callers already accept shorter chunks. This is not a claimed Mesh packet-size limit.
+export const FILE_TRANSFER_READ_CHUNK = 8 * 1024
 export const FILE_TRANSFER_MAX = 256 * 1024 * 1024
 export type FileTransferRequest = {
   id: string
@@ -81,7 +84,9 @@ type Active = { saved: Saved; handle: FileHandle; hash: crypto.Hash; stamp: Stam
 export class FileTransferTarget {
   private active = new Map<string, Active>()
   private busy = new Set<string>()
-  constructor(private directory: string) {}
+  constructor(private directory: string, private readonly readChunkBytes = FILE_TRANSFER_READ_CHUNK) {
+    if (!Number.isSafeInteger(readChunkBytes) || readChunkBytes < 1 || readChunkBytes > FILE_TRANSFER_CHUNK) throw new Error('Invalid transfer read buffer size.')
+  }
   private receiptFile(id: string) { return path.join(this.directory, `${id}.json`) }
   private async save(id: string, saved: Saved, exclusive = false) {
     await fs.mkdir(this.directory, { recursive: true, mode: 0o700 })
@@ -187,7 +192,7 @@ export class FileTransferTarget {
           entry.hash.update(bytes); saved.offset += bytes.length
         } else {
           if (!sameStamp(entry.stamp, await entry.handle.stat())) throw new Error('Source changed during transfer.')
-          const buffer = Buffer.alloc(Math.min(FILE_TRANSFER_CHUNK, remaining))
+          const buffer = Buffer.alloc(Math.min(this.readChunkBytes, remaining))
           const result = await entry.handle.read(buffer, 0, buffer.length, saved.offset)
           if (!result.bytesRead) throw new Error('Source ended before expected size.')
           const bytes = buffer.subarray(0, result.bytesRead)
