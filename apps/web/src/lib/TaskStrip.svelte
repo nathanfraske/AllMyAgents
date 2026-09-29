@@ -3,14 +3,35 @@
   // and the full history of how the board changed. Derived entirely from the agent's own task tool
   // calls (taskBoard.ts) — nothing is stored or invented here.
   import { buildTaskBoard, summarizeBoard, type TaskBoardItem } from './taskBoard'
+  import { api } from './api'
 
-  let { items }: { items: TaskBoardItem[] } = $props()
+  let { items, sessionId }: { items: TaskBoardItem[]; sessionId?: string } = $props()
 
   let open = $state(false)
   let showHistory = $state(false)
+  let editing = $state<{ sessionId: string; taskId: string; expectedRevision: number; title: string; status: 'pending' | 'in_progress' | 'completed' | 'abandoned'; changeReason: string } | null>(null)
+  let saving = $state(false)
+  let amendmentError = $state('')
+  let amendmentSaved = $state(false)
+
+  async function amend() {
+    if (!editing || saving) return
+    const { sessionId: target, ...input } = editing
+    saving = true
+    amendmentError = ''
+    try {
+      const result = await api.amendTask(target, input)
+      if ('error' in result) amendmentError = result.error
+      else { editing = null; amendmentSaved = true }
+    } catch (error) { amendmentError = error instanceof Error ? error.message : String(error) }
+    finally { saving = false }
+  }
+  function modal(node: HTMLDialogElement) { node.showModal(); return { destroy: () => node.close() } }
 
   const board = $derived(buildTaskBoard(items))
   const sum = $derived(summarizeBoard(board))
+  const priorCompletions = $derived((board.completedHistory ?? []).filter(t =>
+    !board.tasks.some(current => current.origin === t.origin && current.title === t.title && cls(current.status) === 'done')))
 
   function cls(status: string): string {
     if (status === 'completed' || status === 'done') return 'done'
@@ -47,6 +68,13 @@
                   {t.origin === 'manager' ? 'manager assigned' : 'agent reported'}
                 </span>
                 <span class="status dim">{t.status.replace('_', ' ')}</span>
+                {#if sessionId && t.origin === 'manager' && t.revision}
+                  <button class="hlink" onclick={() => {
+                    editing = { sessionId: sessionId!, taskId: t.id, expectedRevision: t.revision!, title: t.title,
+                      status: ['pending', 'in_progress', 'completed', 'abandoned'].includes(t.status) ? t.status as 'pending' | 'in_progress' | 'completed' | 'abandoned' : 'pending', changeReason: '' }
+                    amendmentError = ''; amendmentSaved = false
+                  }}>Revise assignment</button>
+                {/if}
               </li>
             {/each}
           </ul>
@@ -59,6 +87,14 @@
             {showHistory ? 'hide' : 'show'} history · {board.changes.length} change{board.changes.length === 1 ? '' : 's'}
           </button>
           {#if showHistory}
+            {#if priorCompletions.length}
+              <p class="none dim">Earlier completion reports — retained when the current plan changes, not independent verification:</p>
+              <ul class="hist" aria-label="Earlier completion reports">
+                {#each priorCompletions as t}
+                  <li><span class="htitle">{t.title}</span><span class="dim">{t.origin === 'manager' ? 'manager assigned' : 'agent reported'}</span></li>
+                {/each}
+              </ul>
+            {/if}
             <ol class="hist">
               {#each board.changes.slice(-60) as c, i (i)}
                 <li>
@@ -74,9 +110,30 @@
         {/if}
       </div>
     {/if}
+    {#if amendmentSaved}<p class="none" role="status">Assignment revised. This does not launch work; send a chat message when you want the agent to continue.</p>{/if}
 </div>
 
+{#if editing}
+  <dialog use:modal aria-label="Revise assignment" oncancel={() => { if (!saving) editing = null }}>
+    <h3>Revise assignment</h3>
+    <p>This operator-only action changes the durable outcome. It does not grant tool permissions or start an agent turn.</p>
+    <label>Outcome <input aria-label="Assignment outcome" bind:value={editing.title} maxlength="500" /></label>
+    <label>Status <select aria-label="Assignment status" bind:value={editing.status}>
+      <option value="pending">Pending</option><option value="in_progress">In progress</option>
+      <option value="completed">Completed</option><option value="abandoned">Abandoned</option>
+    </select></label>
+    <label>Reason <textarea aria-label="Amendment reason" bind:value={editing.changeReason} maxlength="500"></textarea></label>
+    {#if amendmentError}<p role="alert">{amendmentError}</p>{/if}
+    <button disabled={saving || !editing.title.trim() || !editing.changeReason.trim()} onclick={amend}>Save revision</button>
+    <button disabled={saving} onclick={() => { editing = null }}>Cancel</button>
+  </dialog>
+{/if}
+
 <style>
+  dialog { width: min(600px, calc(100vw - 40px)); max-height: 85vh; overflow: auto; padding: 20px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); color: var(--text); }
+  dialog::backdrop { background: #0008; }
+  dialog label { display: grid; gap: 5px; margin-bottom: 12px; }
+  dialog button { margin-right: 8px; }
   .strip { border: 1px solid var(--border); border-radius: 10px; background: var(--surface); margin-bottom: 0.5rem; overflow: hidden; }
   .shead { display: flex; align-items: center; gap: 0.45rem; width: 100%; background: none; border: none; color: inherit; cursor: pointer; padding: 0.35rem 0.55rem; text-align: left; font: inherit; }
   .shead:hover { background: color-mix(in srgb, var(--accent) 7%, transparent); }

@@ -124,6 +124,7 @@ export interface Executor {
 // behind it.
 export const AUTO_ALLOW_TOOLS = new Set([
   'mcp__allmyagents__list_agents',
+  'mcp__allmyagents__report_tool_failure',
   'mcp__allmyagents__send_message',
   'mcp__allmyagents__read_messages',
   'mcp__allmyagents__peek_agent',
@@ -273,6 +274,8 @@ export interface InProcessExecutorHubHooks {
       taskId?: string
       title: string
       status?: 'pending' | 'in_progress' | 'completed' | 'abandoned'
+      expectedRevision?: number
+      changeReason?: string
     },
   ): { ok: boolean; taskId?: string; warning?: string; error?: string }
   managerStartRun(
@@ -304,6 +307,7 @@ export interface InProcessExecutorHubHooks {
   ): ReturnType<AgentServices['browser']>
   remoteDevices(sessionId: string): ReturnType<AgentServices['remoteDevices']>
   publishArtifact?: AgentServices['publishArtifact']
+  toolAssistance?: AgentServices['toolAssistance']
   manageArtifacts?: AgentServices['manageArtifacts']
   transferFile?: AgentServices['transferFile']
   remoteExecute(
@@ -368,6 +372,7 @@ export class InProcessExecutor implements Executor {
   //      services; isBusTurn is executor-local. -----------------------------------------------------
   private agentServices(): AgentServices {
     return {
+      toolAssistance: (sessionId, input) => this.h.toolAssistance?.(sessionId, input) ?? { blocked: false },
       send: (from, to, subject, body, wake, attentionRequired) =>
         this.h.busSend(from.sessionId, to, subject, body, wake, attentionRequired),
       inbox: (sessionId) => this.h.busInbox(sessionId),

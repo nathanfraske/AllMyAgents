@@ -248,7 +248,7 @@ describe('application Overseer authority', () => {
     expect(overseer).toMatchObject({ status: 'error', overseerErrorRecovery: 'ready' })
     expect(h.sessions.busSend('worker', { kind: 'session', id: 'overseer' }, 'FYI', 'checkpoint', false).ok).toBe(true)
     expect(h.executor.runTurn).not.toHaveBeenCalled()
-    expect(h.sessions.busSend('worker', { kind: 'session', id: 'overseer' }, 'new task', 'Please inspect new mail').ok).toBe(true)
+    expect(h.sessions.busSend('worker', { kind: 'session', id: 'overseer' }, 'new task', 'Please inspect new mail', true).ok).toBe(true)
     expect(h.executor.runTurn).toHaveBeenCalledOnce()
     expect(h.executor.runTurn).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'overseer', permissionMode: 'edits' }), expect.stringContaining('Please inspect new mail'), 'bus')
     h.sessions.failTurn('overseer', 'stream disconnected: connection reset')
@@ -1043,7 +1043,7 @@ describe('application Overseer authority', () => {
     expect(await h.sessions.runRelay('bus.send', {
       fromSessionId: 'child', to: { kind: 'session', id: 'overseer' }, body: 'Child findings', wake: false,
     })).toEqual({ ok: true, delivered: 1 })
-    expect(h.sessions.busSend('manager', { kind: 'session', id: 'overseer' }, 'report', 'Manager findings'))
+    expect(h.sessions.busSend('manager', { kind: 'session', id: 'overseer' }, 'report', 'Manager findings', true))
       .toEqual({ ok: true, delivered: 1 })
     await new Promise<void>((resolve) => setImmediate(resolve))
     expect(h.executor.runTurn).toHaveBeenCalledTimes(1)
@@ -1063,7 +1063,7 @@ describe('application Overseer authority', () => {
     })).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/direct operator turn/u) })
     expect(manager.permissionMode).toBe('safe')
     // Replies from that bus-caused Overseer turn use the same route, not the operator send_chat path.
-    expect(h.sessions.busSend('overseer', { kind: 'session', id: 'manager' }, 'reply', 'Received'))
+    expect(h.sessions.busSend('overseer', { kind: 'session', id: 'manager' }, 'reply', 'Received', true))
       .toEqual({ ok: true, delivered: 1 })
     await new Promise<void>((resolve) => setImmediate(resolve))
     expect(h.executor.runTurn).toHaveBeenCalledTimes(2)

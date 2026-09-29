@@ -585,6 +585,64 @@ describe('project manager exhausted-account dispatch guard', () => {
 })
 
 describe('high-context teammate wake guard', () => {
+  it('defaults routine mail to quiet, coalesces exact pending copies, and preserves changed evidence and explicit action', async () => {
+    const h = buildHub()
+    h.seed({ id: 'manager', projectId: 'project', isProjectManager: true })
+    h.seed({ id: 'child', projectId: 'project', parentSessionId: 'manager' })
+    for (let n = 0; n < 100; n++) h.sessions.busSend('manager', { kind: 'session', id: 'child' }, 'FYI', 'same evidence')
+    expect(h.bus.pending('child')).toHaveLength(1)
+    expect(h.runTurn).not.toHaveBeenCalled()
+    h.sessions.busSend('manager', { kind: 'session', id: 'child' }, 'FYI', 'new evidence')
+    expect(h.bus.pending('child')).toHaveLength(2)
+    h.sessions.busSend('manager', { kind: 'session', id: 'child' }, 'Action', 'Apply the change', true, true)
+    await vi.waitFor(() => expect(h.runTurn).toHaveBeenCalledOnce())
+    expect(h.runTurn.mock.calls[0]![1]).toContain('same evidence')
+    expect(h.runTurn.mock.calls[0]![1]).toContain('new evidence')
+    expect(h.runTurn.mock.calls[0]![1]).toContain('Apply the change')
+    // recentEventsForSession intentionally caps at 100; count this exact fixture's audit kind instead.
+    expect(h.journal.since(0).filter(e => e.sessionId === 'manager' && e.kind === 'bus/coordination-saved')).toHaveLength(99)
+  })
+  it('stores receipt-only chatter without steering; explicit priority and opt-out remain available', () => {
+    const h = buildHub()
+    h.seed({ id: 'manager', projectId: 'project', isProjectManager: true })
+    h.seed({ id: 'child', projectId: 'project', parentSessionId: 'manager', status: 'active' })
+    expect(h.sessions.busSend('manager', { kind: 'session', id: 'child' }, 'ack', 'Thanks.', true)).toMatchObject({ error: expect.stringContaining('without waking or steering') })
+    expect(h.steer).not.toHaveBeenCalled()
+    expect(h.bus.pending('child')).toMatchObject([{ wake: false }])
+    const priority = h.sessions.busSend('manager', { kind: 'session', id: 'child' }, 'ack', 'Thanks.', true, true)
+    expect(priority.ok).toBe(true)
+    const old = buildHub()
+    ;(old.sessions as unknown as { prefs: { leanCoordination?: boolean } }).prefs.leanCoordination = false
+    old.seed({ id: 'manager', projectId: 'project', isProjectManager: true })
+    old.seed({ id: 'child', projectId: 'project', parentSessionId: 'manager' })
+    old.sessions.busSend('manager', { kind: 'session', id: 'child' }, 'ack', 'Thanks.')
+    expect(old.runTurn).toHaveBeenCalledOnce()
+  })
+  it('restores durable task evidence, deduplicates assignments and denies stale/silent scope rewrites', () => {
+    const h = buildHub()
+    h.seed({ id: 'manager', projectId: 'project', isProjectManager: true })
+    const child = h.seed({ id: 'child', projectId: 'project', parentSessionId: 'manager' })
+    const original = h.sessions.managerAssignChildTask('manager', 'child', { title: 'Fix parser' })
+    expect(h.sessions.managerAssignChildTask('manager', 'child', { title: 'Fix parser' }).taskId).toBe(original.taskId)
+    expect(h.journal.taskBoardEventsForSession('child')).toHaveLength(1)
+    expect(h.sessions.managerAssignChildTask('manager', 'child', { taskId: original.taskId, title: 'Rewrite compiler' }).ok).toBe(false)
+    expect(h.sessions.managerAssignChildTask('manager', 'child', { taskId: original.taskId, title: 'Fix parser', status: 'completed', expectedRevision: 1 }).ok).toBe(true)
+    expect(h.sessions.managerAssignChildTask('manager', 'child', { title: 'Fix parser' }).ok).toBe(false)
+    expect(h.sessions.managerAssignChildTask('manager', 'child', { taskId: original.taskId, title: 'Fix parser', expectedRevision: 1, changeReason: 'New bug' }).ok).toBe(false)
+    expect(h.sessions.managerAssignChildTask('manager', 'child', { taskId: original.taskId, title: 'Fix parser', expectedRevision: 2, changeReason: 'Operator reports a new failing grammar' }).ok).toBe(false)
+    expect(h.sessions.amendTaskByOperator('child', { taskId: original.taskId!, title: 'Fix parser', status: 'pending', expectedRevision: 2, changeReason: 'New failing grammar' }).ok).toBe(true)
+    expect(h.sessions.amendTaskByOperator('child', { taskId: original.taskId!, title: 'Rewrite compiler', status: 'pending', expectedRevision: 2, changeReason: 'Stale click' }).ok).toBe(false)
+    h.journal.append('child', 'codex/turn/plan/updated', { plan: [{ step: 'Existing verification', status: 'completed' }] })
+    h.journal.append('child', 'codex/turn/plan/updated', { plan: [{ step: 'Unrelated audit', status: 'pending' }] })
+    const own = h.sessions.busPeek('child', 'child', { view: 'tasks' })
+    expect(own.summary).toContain('Existing verification')
+    expect(own.summary).toContain('Fix parser')
+    expect(h.sessions.busPeek('child', 'manager', { view: 'tasks' }).found).toBe(false)
+    const protectedPrefix = (h.sessions as unknown as { runtimeHostInstructions(r: SessionRecord): string }).runtimeHostInstructions(child)
+    expect(protectedPrefix).toContain('Durable task checkpoint')
+    expect(protectedPrefix).toContain('Existing verification')
+    expect(protectedPrefix).toContain('Compaction does not start a new assignment')
+  })
   it('queues an idle Claude message without launching another giant resumed turn', () => {
     const { sessions, journal, bus, seed, runTurn } = buildHub()
     seed({ id: 'manager', projectId: 'project-1', isProjectManager: true })
@@ -601,6 +659,7 @@ describe('high-context teammate wake guard', () => {
       { kind: 'session', id: 'child' },
       'checkpoint',
       'Acknowledge the checkpoint.',
+      true,
     )).toMatchObject({ ok: true, delivered: 1, deferred: 1 })
     expect(runTurn).not.toHaveBeenCalled()
     expect(bus.pending('child')).toMatchObject([{ wake: false, delivered: false }])
@@ -781,6 +840,7 @@ describe('high-context teammate wake guard', () => {
       { kind: 'session', id: 'codex-child' },
       'review',
       'Please re-open the review.',
+      true,
     )).toMatchObject({ ok: true, delivered: 1, deferred: 1 })
     expect(runTurn).not.toHaveBeenCalled()
     expect(bus.pending('codex-child')[0]).toMatchObject({ wake: false })
@@ -847,6 +907,7 @@ describe('high-context teammate wake guard', () => {
       { kind: 'session', id: child.id },
       'continue parser ownership',
       'Take the next parser task within your durable role.',
+      true,
     )).toEqual({ ok: true, delivered: 1 })
     await vi.waitFor(() => expect(runTurn).toHaveBeenCalledOnce())
     expect(journal.recentEventsForSession(manager.id)).toContainEqual(expect.objectContaining({
@@ -1740,6 +1801,10 @@ describe('project manager durable live roster', () => {
     const workerRuntime = runTurn.mock.calls[1]?.[0].claudeSystemPrompt ?? ''
     const codexManagerRuntime = runTurn.mock.calls[2]?.[0].codexDeveloperInstructions ?? ''
     const codexWorkerRuntime = runTurn.mock.calls[3]?.[0].codexDeveloperInstructions ?? ''
+    for (const runtime of [managerRuntime, workerRuntime, codexManagerRuntime, codexWorkerRuntime]) {
+      expect(runtime).toContain('Lean coordination is ON')
+      expect(runtime).toContain('Broken-tool policy is ON')
+    }
     expect(managerRuntime).toContain('Before or with every worker dispatch')
     expect(managerRuntime).toContain('Before every progress or completion report')
     expect(workerRuntime).toContain('Keep your provider-native task/plan board current')
@@ -1760,6 +1825,35 @@ describe('project manager durable live roster', () => {
     expect(bus.pending('legacy-worker')).toHaveLength(0)
     expect(bus.pending(codexManager.id)).toHaveLength(0)
     expect(bus.pending('legacy-codex-worker')).toHaveLength(0)
+  })
+
+  it('applies defaults to old Overseer, ordinary and stashed records without waking them or rewriting old assignments', () => {
+    const { sessions, journal, seed, runTurn, bus } = buildHub()
+    const manager = seed({ id: 'old-manager', isProjectManager: true, projectId: 'project' })
+    const records = [
+      manager,
+      seed({ id: 'old-overseer', isOverseer: true }),
+      seed({ id: 'old-ordinary' }),
+      seed({ id: 'stashed-worker', parentSessionId: manager.id, projectId: 'project', status: 'stopped', managerTeamId: 'stashed-team' }),
+    ]
+    journal.append('stashed-worker', 'manager/task-assigned', {
+      id: 'manager:legacy', title: 'Existing finished outcome', status: 'completed', managerSessionId: manager.id,
+      // Written by an old build: no revision or new assistance fields.
+    })
+    const host = sessions as unknown as { runtimeHostInstructions(r: SessionRecord): string }
+    for (const record of records) {
+      const before = { id: record.id, status: record.status, parent: record.parentSessionId, mode: record.permissionMode }
+      expect(host.runtimeHostInstructions(record)).toContain('Lean coordination is ON')
+      expect(host.runtimeHostInstructions(record)).toContain('Broken-tool policy is ON')
+      expect({ id: record.id, status: record.status, parent: record.parentSessionId, mode: record.permissionMode }).toEqual(before)
+      expect(bus.pending(record.id)).toEqual([])
+    }
+    expect(host.runtimeHostInstructions(records[3]!)).toContain('Existing finished outcome')
+    expect(sessions.managerAssignChildTask(manager.id, 'stashed-worker', {
+      taskId: 'manager:legacy', title: 'Existing finished outcome', status: 'pending', expectedRevision: 1, changeReason: 'Compaction',
+    }).ok).toBe(false)
+    expect(journal.taskBoardEventsForSession('stashed-worker')).toHaveLength(1)
+    expect(runTurn).not.toHaveBeenCalled()
   })
 
   it('does not add a manager roster to an ordinary chat turn', async () => {
@@ -2339,7 +2433,7 @@ describe('project manager visibility into its own workers', () => {
     })()
     const recent = sessions.managerAssignChildTask('manager', 'child', { title: 'Recent assignment' })
     for (const task of [old, recent]) {
-      expect(sessions.managerAssignChildTask('manager', 'child', { taskId: task.taskId, title: task === old ? 'Old complete' : 'Recent complete', status: 'completed' }).ok).toBe(true)
+      expect(sessions.amendTaskByOperator('child', { taskId: task.taskId!, title: task === old ? 'Old complete' : 'Recent complete', status: 'completed', expectedRevision: 1, changeReason: 'Clarify the completed result' }).ok).toBe(true)
     }
     journal.append('child', 'codex/turn/plan/updated', { plan: [{ step: 'Vendor plan', status: 'in_progress' }] })
     const board = sessions.busPeek('manager', 'child', { view: 'tasks' })

@@ -1,9 +1,14 @@
-import { afterEach, describe, expect, it } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/svelte'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import TaskStrip from './TaskStrip.svelte'
+import { api } from './api'
 import type { TaskBoardItem } from './taskBoard'
 
-afterEach(cleanup)
+beforeEach(() => {
+  HTMLDialogElement.prototype.showModal = function () { this.setAttribute('open', '') }
+  HTMLDialogElement.prototype.close = function () { this.removeAttribute('open') }
+})
+afterEach(() => { cleanup(); vi.restoreAllMocks() })
 
 const item = (toolName: string, toolInput: unknown, ts = '2026-07-27T12:00:00.000Z'): TaskBoardItem => ({
   kind: 'tool',
@@ -89,4 +94,33 @@ describe('TaskStrip vendor plans', () => {
     expect(screen.getByText('State beta')).toBeTruthy()
     expect(screen.getByText('in progress')).toBeTruthy()
   })
+})
+
+it('retains earlier completion evidence when a later plan replaces completed steps', async () => {
+  render(TaskStrip, { items: [
+    { kind: 'tool', toolName: 'update_plan', ts: '2026-09-28T00:00:00Z', toolInput: { plan: [{ step: 'Verify parser', status: 'completed' }] } },
+    { kind: 'tool', toolName: 'update_plan', ts: '2026-09-28T00:01:00Z', toolInput: { plan: [{ step: 'Report result', status: 'pending' }] } },
+  ] })
+  await fireEvent.click(screen.getByText('Tasks'))
+  await fireEvent.click(screen.getByText(/show history/))
+  expect(screen.getByLabelText('Earlier completion reports').textContent).toContain('Verify parser')
+  expect(screen.getByText('Report result')).toBeTruthy()
+  expect(screen.getByText(/not independent verification/)).toBeTruthy()
+})
+
+it('pins operator amendments to the displayed assignment revision and does not automatically retry a stale change', async () => {
+  const amend = vi.spyOn(api, 'amendTask').mockResolvedValueOnce({ error: 'Stale task revision' }).mockResolvedValue({ ok: true })
+  render(TaskStrip, { sessionId: 'child', items: [{ kind: 'tool', toolName: 'ManagerTask', ts: '2026-09-28T00:00:00Z',
+    toolInput: { id: 'manager:1', title: 'Fix parser', status: 'completed', managerSessionId: 'manager', revision: 2 } }] })
+  await fireEvent.click(screen.getByText('Tasks'))
+  await fireEvent.click(screen.getByText('Revise assignment'))
+  expect((screen.getByText('Save revision') as HTMLButtonElement).disabled).toBe(true)
+  await fireEvent.input(screen.getByLabelText('Amendment reason'), { target: { value: 'New parser failure' } })
+  await fireEvent.change(screen.getByLabelText('Assignment status'), { target: { value: 'pending' } })
+  await fireEvent.click(screen.getByText('Save revision'))
+  expect(amend).toHaveBeenCalledTimes(1)
+  expect(amend).toHaveBeenCalledWith('child', { taskId: 'manager:1', expectedRevision: 2, title: 'Fix parser', status: 'pending', changeReason: 'New parser failure' })
+  expect(screen.getByRole('alert').textContent).toContain('Stale')
+  await fireEvent.click(screen.getByText('Cancel'))
+  expect(amend).toHaveBeenCalledTimes(1)
 })

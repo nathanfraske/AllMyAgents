@@ -123,6 +123,7 @@ export interface LiveSession {
 }
 
 export type RelayMethod =
+  | 'tools.assistance'
   | 'bus.send'
   | 'bus.inbox'
   | 'bus.roster'

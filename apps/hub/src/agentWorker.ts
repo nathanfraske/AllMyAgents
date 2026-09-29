@@ -144,6 +144,7 @@ export interface WorkerAgentServiceDeps {
  */
 export function buildWorkerAgentServices(deps: WorkerAgentServiceDeps): AgentServices {
   return {
+    toolAssistance: (sessionId, input) => deps.relayRpc('tools.assistance', { sessionId, input }) as ReturnType<NonNullable<AgentServices['toolAssistance']>>,
     send: (from, to, subject, body, wake, attentionRequired) =>
       deps.relayRpc('bus.send', {
         fromSessionId: from.sessionId,

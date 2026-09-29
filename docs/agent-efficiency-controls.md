@@ -1,0 +1,40 @@
+# Agent efficiency and task continuity
+
+## Research basis
+
+The [MAST study](https://arxiv.org/html/2503.13657v2) identifies step repetition, lost context, unclear termination and inter-agent misalignment among multi-agent failure modes. Its interventions also show why verification is sometimes useful: deleting all review would trade overhead for missed failures. Our application-level inference is to preserve outcomes and termination evidence, and require a real state change before reopening finished assignments.
+
+[AgentPrune](https://arxiv.org/abs/2410.02506) evaluates pruning redundant communication across agents and rounds. This supports investigating communication overhead, but its benchmark token reductions are not an estimate for AllMyAgents. The implementation here uses deterministic pending-message deduplication and quiet receipts, not learned graph pruning or suppression of substantive disagreement.
+
+Anthropic's [multi-agent research system report](https://www.anthropic.com/engineering/multi-agent-research-system) describes substantial multi-agent token overhead, the value of genuinely parallel independent work, and explicit scope/output/stop conditions. Its [context-engineering guidance](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents) favors high-signal context and durable notes over continually enlarging prompts. These are design evidence, not proof of savings in our workload.
+
+OpenAI's [evaluation guidance](https://developers.openai.com/api/docs/guides/evaluation-best-practices) treats handoffs and multi-agent complexity as additional evaluation surfaces. Its [model guidance](https://developers.openai.com/api/docs/guides/latest-model) calls for proportionate verification rather than repeatedly broadening unchanged passing tests. Required project gates and specific unresolved failure checks remain mandatory.
+
+## Local findings and implementation
+
+The relevant paths were `sessions.ts` (turn instructions, bus delivery, manager assignments), `bus.ts` (durable queued messages), `taskBoard.ts` (provider plan replacement), shared tool wrappers, and provider usage events. The controls below do not launch an additional model, judge, or review agent.
+
+| Area | Enforced by the application | Advisory or remaining boundary |
+| --- | --- | --- |
+| Coordination | Ordinary agent mail defaults to no idle wake. Identical undelivered non-priority messages coalesce; narrow receipt-only messages neither wake nor steer. Urgent/operator handoffs retain their path. | Semantically repeated but differently worded messages are not deduplicated. Explicit actionable wakes remain possible. |
+| Task outcomes | In Lean mode, manager-assigned outcomes cannot be renamed or reopened through agent tools. Exact duplicate assignments reuse the live task or reject recreation of a finished one. Operator amendments require the exact revision and a reason on the device-authenticated API. | This does not semantically validate every differently worded new task. Provider-native plans remain editable reports, not authority to expand scope. |
+| Compaction continuity | Manager tasks survive native plan replacement. A bounded recent completion history survives too and is visible in the task strip. Durable task data is injected into turn/resume instructions; own-task recovery requires no manager query. | No new provider-internal mid-turn compaction hook is claimed. The checkpoint is regenerated at host turn/resume boundaries, not a semantic lock on the provider's private plan. |
+| Broken tools | App tool wrappers permit one safely repeatable read retry, then hold that tool and notify the operator. Concurrent retries and late unrelated successes cannot clear the hold. Ambiguous writes, authentication and exhausted-credit failures do not acquire retry permission. | Native/external tools receive the instruction and can report through `report_tool_failure`; this patch does not intercept every provider-native tool. Ordinary failed tests, invalid arguments and approval denials are not automatically broken infrastructure. |
+| Token warnings | Default-on operator notifications at 100,000 reported non-cached input/output tokens per turn or 80% measured context occupancy. Deduplicated and persisted; cache reads shown separately. | No dollar estimate, universal provider billing claim, automatic termination, or extra Overseer turn. Missing provider counters cannot be manufactured. |
+| Reviews/tests/docs | Protected turn guidance says one useful review pass, new evidence to reopen, scoped regression plus required gates, and concise handoffs. | It is not a runtime semantic detector for every unnecessary test, audit or document. Do not describe this as one. |
+
+`leanCoordination`, `toolFailureEscalation` and `highTokenUsageWarnings` default on for existing configurations; each is operator-configurable in Settings. Warning thresholds are configurable. Disabling Lean mode restores legacy agent messaging/task-edit defaults, not additional resource grants. An agent-written reason is not an operator amendment, and new task text must not be used to bypass a rejected amendment.
+
+Existing chats are not grandfathered out: controls are resolved from current application preferences, and protected instructions are regenerated for existing Codex/Claude managers, workers, the Overseer and ordinary chats at their next host turn boundary. Stashed/stopped chats receive them on continuation. Historical assignments without a revision gain a deterministic read-time revision; their recorded outcomes are not rewritten. No agent recreation, artificial wake, new permission, or live deployment is part of this source migration. Explicit operator opt-outs remain respected.
+
+The operator's task-board revision control changes the durable assignment but deliberately does not wake an agent or launch work. A chat message can start continuation. A stale edit is rejected rather than overwriting a newer revision. The API is absent from agent relays and rejects agent-bridge credentials.
+
+The intended end-to-end lifecycle is operator request → durable scoped plan → role-appropriate assignment → execution and required verification → completion and stop. This patch protects existing task outcomes and recovery; it does **not yet** require creation of a task before every work tool or enforce a completion-time stop for an entire manager/Overseer objective. Those execution gates remain unfinished, including how to bind native provider tools and distinguish necessary substeps from unrelated work. A checklist alone is not that enforcement.
+
+Tool-help decisions offer a cleared hold, a five-minute diagnosis within existing authority, or skipping the affected work. They do not replay commands. The diagnosis time bound is checked on subsequent app tool calls; it is not a kill timer for external processes. If a saved decision's chat delivery fails, the UI reports that distinction rather than inviting a duplicate decision. All permissions, approval ceilings, uncertain-outcome handling and platform restrictions remain in force.
+
+## Verification and measurement
+
+Behavioral tests cover duplicate bursts, urgent handoffs, opt-out, protected task outcomes, exact operator amendments, stale revisions, plan replacement/reattach, bounded escaped checkpoint payloads, one retry and concurrent-retry exclusion, notification privacy, usage-counter resets/deduplication, and UI decisions. Worker and existing approval tests check integration boundaries. No tests or platform matrix steps were removed to obtain a faster result.
+
+The duplicate-message fixture measures avoided queued copies and idle turns, not inferred token savings. `bus/coordination-saved` records counts without copying message bodies. Task revisions, tool-help decisions and token warnings have durable audit events. A production before/after reduction in total tokens, review rounds or wall time has **not** been measured; source-only qualification cannot establish one. The published research percentages must not be reused as product claims.

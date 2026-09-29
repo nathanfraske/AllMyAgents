@@ -22,6 +22,7 @@ import type { TestbedRunStore } from './testbedRuns.js'
 import { TestbedReservationConflictError, type TestbedReservationStore } from './testbedReservations.js'
 import type { SessionManager, TurnOverride } from './sessions.js'
 import { parseCyberAccessProgram } from './daybreak.js'
+import { assistancePreferences } from './operatorAssistance.js'
 import type { UsageMonitor } from './usage.js'
 import type { MeshSite } from './meshSite.js'
 import type { InstructionStore } from './instructions.js'
@@ -2188,12 +2189,25 @@ export function startServer(opts: ServerOptions): http.Server {
       // Same shape as the danger routes otherwise — POST mutates the shared object in place, so the next
       // chat is named from the new pool without a restart, then persists it to the hub's real config.
       if (method === 'GET' && url.pathname === '/api/config/prefs') {
-        json(res, { ...prefs })
+        json(res, { ...prefs, ...assistancePreferences(prefs) })
         return
       }
       if (method === 'POST' && url.pathname === '/api/config/prefs') {
         const body = await readBody(req)
         const next: HubPrefs = { ...prefs }
+        for (const key of ['leanCoordination', 'toolFailureEscalation', 'highTokenUsageWarnings'] as const) {
+          if (typeof body[key] === 'boolean') next[key] = body[key]
+        }
+        for (const [key, min, max] of [
+          ['highTokenUsageThreshold', 1_000, 10_000_000], ['highContextUsagePercent', 10, 100],
+        ] as const) {
+          if (body[key] !== undefined) {
+            if (typeof body[key] !== 'number' || !Number.isSafeInteger(body[key]) || body[key] < min || body[key] > max) {
+              throw new BadRequestError(`${key} must be an integer between ${min} and ${max}`)
+            }
+            next[key] = body[key]
+          }
+        }
         // Same shape check the danger route does on its booleans: a value the generator does not
         // understand is IGNORED, not coerced. Coercing would let a malformed or version-skewed request
         // quietly reset a pool the owner did choose, back through the default, to 'everyone'.
@@ -2219,7 +2233,7 @@ export function startServer(opts: ServerOptions): http.Server {
         }
         Object.assign(prefs, next)
         journal.append(null, 'config/prefs', { ...prefs })
-        json(res, { ...prefs })
+        json(res, { ...prefs, ...assistancePreferences(prefs) })
         return
       }
       // Danger Zone toggles — safe-default guardrail switches the owner can flip (this is an MIT,
@@ -3432,6 +3446,28 @@ export function startServer(opts: ServerOptions): http.Server {
         if (!targetId) throw new BadRequestError('sub-agent targetId is required')
         await sessions.interruptAgent(agentInterrupt[1] as string, targetId, str(body.label))
         json(res, { ok: true })
+        return
+      }
+      const taskAmendment = /^\/api\/sessions\/([^/]+)\/task-amendments$/.exec(url.pathname)
+      if (method === 'POST' && taskAmendment) {
+        const body = await readBody(req)
+        if (typeof body.taskId !== 'string' || typeof body.title !== 'string' || body.title.length > 500 || !body.title.trim()
+          || typeof body.changeReason !== 'string' || !body.changeReason.trim() || body.changeReason.length > 500
+          || !Number.isSafeInteger(body.expectedRevision) || (body.expectedRevision as number) < 1
+          || typeof body.status !== 'string' || !['pending', 'in_progress', 'completed', 'abandoned'].includes(body.status)) throw new BadRequestError('Invalid task amendment')
+        const result = sessions.amendTaskByOperator(taskAmendment[1]!, {
+          taskId: body.taskId, title: body.title, status: body.status as 'pending' | 'in_progress' | 'completed' | 'abandoned',
+          expectedRevision: body.expectedRevision as number, changeReason: body.changeReason,
+        })
+        json(res, result, result.ok ? 200 : 409)
+        return
+      }
+      const toolHelpAction = /^\/api\/sessions\/([^/]+)\/tool-help\/([^/]+)$/.exec(url.pathname)
+      if (method === 'POST' && toolHelpAction) {
+        const body = await readBody(req)
+        if (body.action !== 'retry' && body.action !== 'diagnose' && body.action !== 'skip') throw new BadRequestError('Unknown tool-help decision')
+        const result = await sessions.resolveToolHelp(toolHelpAction[1]!, toolHelpAction[2]!, body.action)
+        json(res, { ok: true, ...result })
         return
       }
       const sessionAction = /^\/api\/sessions\/([^/]+)\/(input|interrupt|stop|reopen)$/.exec(url.pathname)

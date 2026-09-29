@@ -1653,7 +1653,7 @@
       </button>
     {/if}
     <!-- The agent's task board, directly above the chatbar. -->
-    {#if !composerOnly}<TaskStrip items={transcriptItems} />{/if}
+    {#if !composerOnly}<TaskStrip items={transcriptItems} sessionId={view?.record.siteId ? undefined : sid} />{/if}
 
     {#if questions.length > 0}
       <div class="question-stack" role="region" aria-label="Pending questions">

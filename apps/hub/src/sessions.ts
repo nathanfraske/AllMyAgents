@@ -110,6 +110,7 @@ import type { DangerFlags, HubPrefs } from './types.js'
 import { InProcessExecutor, type Executor, type InProcessExecutorHubHooks } from './executor.js'
 import type { BrowserBroker } from './browserBroker.js'
 import type { NotificationService, NotificationSourceRole } from './notifications.js'
+import { OperatorAssistance, assistancePreferences, type ToolAssistanceInput } from './operatorAssistance.js'
 import type { TestbedRunStore } from './testbedRuns.js'
 import type {
   DurableRun,
@@ -250,6 +251,7 @@ function publicRemoteRelativePath(
 }
 import {
   buildTaskBoard,
+  renderTaskCheckpoint,
   summarizeBoard,
   taskBoardItemsFromEvents,
   type TaskBoard,
@@ -773,6 +775,7 @@ function commandOutputDelta(payload: unknown): PendingCommandOutputDelta['payloa
 }
 
 export class SessionManager {
+  private readonly operatorAssistance: OperatorAssistance
   private readonly sessions = new Map<string, SessionRecord>()
   private durableCapabilityUpgrade: Promise<void> | undefined
   /** Browser-imported attachment ids visible to browser_download_read during this hub lifetime. */
@@ -934,6 +937,13 @@ export class SessionManager {
     private readonly notifications?: Pick<NotificationService, 'publish'> &
       Partial<Pick<NotificationService, 'resolveDedupe'>>
   ) {
+    this.operatorAssistance = new OperatorAssistance({
+      prefs: () => this.prefs,
+      record: id => this.sessions.get(id),
+      save: record => this.persist(record),
+      audit: (id, kind, payload) => { this.journal.append(id, kind, payload) },
+      notify: input => { this.notifications?.publish(input) },
+    })
     this.teamPresets = new TeamPresetStore(this.journal.db)
     this.chatArtifacts = new ChatArtifacts(journal, path.join(
       journal.db.name === ':memory:' ? path.join(defaultCwd, '.allmyagents') : path.dirname(path.resolve(journal.db.name)),
@@ -1038,6 +1048,7 @@ export class SessionManager {
       busSend: (fromSessionId, to, subject, body, wake, attentionRequired) =>
         this.busSend(fromSessionId, to, subject, body, wake, attentionRequired),
       busInbox: (sessionId) => this.busInbox(sessionId),
+      toolAssistance: (sessionId, input) => this.operatorAssistance.tool(sessionId, input),
       busRoster: (sessionId) => this.busRoster(sessionId),
       busPeek: (callerSessionId, targetSessionId, options) =>
         this.busPeek(callerSessionId, targetSessionId, options),
@@ -1327,6 +1338,10 @@ export class SessionManager {
    */
   runRelay(method: RelayMethod, args: unknown): unknown | Promise<unknown> {
     switch (method) {
+      case 'tools.assistance': {
+        const a = args as { sessionId: string; input: ToolAssistanceInput }
+        return this.operatorAssistance.tool(a.sessionId, a.input)
+      }
       case 'bus.send': {
         const a = args as {
           fromSessionId: string
@@ -1421,6 +1436,8 @@ export class SessionManager {
             taskId?: string
             title: string
             status?: 'pending' | 'in_progress' | 'completed' | 'abandoned'
+            expectedRevision?: number
+            changeReason?: string
           }
         }
         return this.managerAssignChildTask(a.managerSessionId, a.childSessionId, a.input)
@@ -1848,6 +1865,13 @@ export class SessionManager {
   private runtimeHostInstructions(record: SessionRecord, directOperatorPrompt?: string): string {
     return [
       providerHostInstructions(record),
+      assistancePreferences(this.prefs).leanCoordination ? renderTaskCheckpoint(this.taskBoardForSession(record.id), record.id) : '',
+      assistancePreferences(this.prefs).leanCoordination
+        ? 'Lean coordination is ON. Keep one owner for the outcome; delegate only independent work with a concrete deliverable, not a new layer of supervision. Send concise deltas and evidence references at material boundaries. Routine mail defaults to wake=false; set wake=true for a real request needing action now. Do not acknowledge acknowledgements, repeat status queries without new state, or review another review without a specific unresolved defect. Complete one review pass and verify fixes; reopen only for changed evidence, a failed criterion, or an operator request. Use existing run/commit evidence, targeted regression tests and the project-required gates; do not rerun unchanged passing suites or add tests that merely mirror trivial code. Keep one useful handoff/checkpoint instead of repeated reports. Once acceptance criteria are met, finish. If disagreement cannot be resolved with new evidence, ask the operator once. These efficiency defaults never waive approvals, safety checks, required tests, or operator instructions.'
+        : '',
+      assistancePreferences(this.prefs).toolFailureEscalation
+        ? 'Broken-tool policy is ON. For a genuine tool/infrastructure failure, retry once yourself only when the operation is safely repeatable. After that retry fails, call mcp__allmyagents__report_tool_failure with the exact tool and bounded error, then stop affected work and wait for the operator. Escalate uncertain writes, authentication and exhausted credits without replay. Do not switch tools to repeat an uncertain action, start a repair project, or wake another agent to repair it. Ordinary failed tests, bad arguments and denied permissions are not evidence a tool is broken. Continue independent work. Explicit operator troubleshooting is bounded to the scope/time they allow and does not grant new permissions.'
+        : 'Automatic broken-tool escalation is OFF by operator preference. Existing permissions and the prohibition on replaying uncertain writes still apply.',
       this.runtimeOperatorInstructions(record),
       this.workerSubagentInstructions(record),
       record.isOverseer === true
@@ -3968,6 +3992,7 @@ export class SessionManager {
    */
   private agentServices(): AgentServices {
     return {
+      toolAssistance: (sessionId, input) => this.operatorAssistance.tool(sessionId, input),
       send: (from, to, subject, body, wake, attentionRequired) =>
         this.busSend(from.sessionId, to, subject, body, wake, attentionRequired),
       inbox: (sessionId) => this.busInbox(sessionId),
@@ -5533,7 +5558,7 @@ export class SessionManager {
    *  in memory; never regress this into pending(id) per row on the UI's hot polling path. */
   listForApi(): SessionApiRecord[] {
     const pending = this.bus.pendingCounts()
-    return [...this.sessions.values()].map((record) => ({
+    return [...this.sessions.values()].map(({ tokenWarning: _privateTokenAccounting, ...record }) => ({
       ...record,
       unreadFromTeammates: pending.get(record.id) ?? 0,
     }))
@@ -7339,6 +7364,9 @@ export class SessionManager {
     options: { transientInfrastructure?: boolean } = {},
   ): void {
     const previous = record.status
+    if (status === 'active' && previous !== 'active') {
+      this.operatorAssistance.beginTurn(record, this.journal.latestSessionTokenUsage(record.id)?.payload)
+    }
     record.status = status
     // Status transitions are the durable turn boundaries shared by both providers. Persist their clock
     // on the canonical record so a cold baseline does not fall back to createdAt after the replay tail is
@@ -7934,8 +7962,26 @@ export class SessionManager {
   }
 
   private observeSessionContext(sessionId: string, payload: unknown, observedAt: string): void {
+    const record = this.sessions.get(sessionId)
+    if (record) this.operatorAssistance.tokens(record, payload)
     const pressure = this.tokenPressure(payload, observedAt)
     if (pressure) this.sessionContextPressure.set(sessionId, pressure)
+  }
+
+  async resolveToolHelp(sessionId: string, id: string, action: 'retry' | 'diagnose' | 'skip'): Promise<{ warning?: string }> {
+    const message = this.operatorAssistance.resolve(sessionId, id, action)
+    this.notifications?.resolveDedupe?.(`tool-help:${id}`, action)
+    // This method is exposed ONLY on the device-authenticated operator API, never agent relay/MCP.
+    // send() preserves the normal admission/steer and permission checks for the resulting direction.
+    try { await this.send(sessionId, message); return {} }
+    catch {
+      // The decision is durable already. A delivery failure must not encourage decision replay.
+      const warning = 'Your tool-help decision was saved, but its chat message could not be delivered. Open the chat to continue; do not resubmit the decision.'
+      this.journal.append(sessionId, 'tool-help/delivery-failed', { id, action })
+      this.notifications?.publish({ kind: 'tool-help-required', severity: 'warning', route: 'operator', sourceRole: 'agent',
+        sessionId, title: 'Tool-help decision saved; message not delivered', body: warning, dedupeKey: `tool-help-delivery:${id}` })
+      return { warning }
+    }
   }
 
   private contextPressureFor(
@@ -10032,13 +10078,13 @@ export class SessionManager {
     to: BusAddress,
     subject: string | undefined,
     body: string,
-    wake = true,
+    wake?: boolean,
     attentionRequired = false,
   ): { ok: boolean; delivered: number; deferred?: number; error?: string } {
     const sender = this.sessions.get(fromSessionId)
     if (!sender) return { ok: false, delivered: 0, error: 'unknown sender' }
     if (!body.trim()) return { ok: false, delivered: 0, error: 'empty message' }
-    if (attentionRequired && !wake) {
+    if (attentionRequired && wake === false) {
       return { ok: false, delivered: 0, error: 'attention-required mail must be wakeable' }
     }
     const senderProject = sender.projectId ?? null
@@ -10046,6 +10092,8 @@ export class SessionManager {
       sender.isOverseer === true &&
       this.operatorTurnSessions.has(sender.id) &&
       !this.busTurnSessions.has(sender.id)
+    const lean = assistancePreferences(this.prefs).leanCoordination
+    wake ??= attentionRequired || directOverseer || !lean
     // A direct operator-origin Overseer message is itself a handoff from the operator's control plane.
     // Treat the normal wake=true default as actionable so the context cost guard cannot silently turn it
     // into an FYI. The Overseer can still deliberately queue routine status with wake=false.
@@ -10107,6 +10155,20 @@ export class SessionManager {
       return { ok: false, delivered: 0, error: skipNote ?? 'no eligible recipients' }
     }
     const automaticDeferrals: Array<{ sessionId: string; reason: string }> = []
+    // Only unmistakable receipt-only messages qualify; decisions, identifiers, questions and
+    // substantive subjects retain ordinary routing. Explicit priority always wins.
+    const receiptOnly = lean && !effectiveAttentionRequired
+      && /^(?:|ack|acknowledg(?:e)?ment|thanks|received)[.! ]*$/i.test((subject ?? '').trim())
+      && /^(?:thanks|thank you|noted|received|acknowledged|understood)[.! ]*$/i.test(body.trim())
+    if (receiptOnly) wake = false
+    const coalesced = lean && !effectiveAttentionRequired
+      ? recipients.filter(id => this.bus.pendingDuplicate(sender.id, id, subject, body, wake!)) : []
+    recipients = recipients.filter(id => !coalesced.includes(id))
+    if (coalesced.length || receiptOnly) this.journal.append(fromSessionId, 'bus/coordination-saved', {
+      coalesced: coalesced.length, receiptOnly, recipients: recipients.length, requestedRecipient: to,
+      // No copied body and no model-estimated savings. Actual avoided deliveries are countable.
+    })
+    if (!recipients.length) return { ok: true, delivered: 0, error: 'Identical mail is already queued. No extra copy or wake was created; do not resend it.' }
     const operatorDirectedRecipients = recipients.filter(id => {
       const target = this.sessions.get(id)
       return target && this.managerMessageWaitsForOperator(sender.id, target)
@@ -10160,7 +10222,7 @@ export class SessionManager {
         compactionPolicy: 'provider-owned',
       })
     }
-    for (const rid of recipients) this.deliverBus(rid)
+    if (!receiptOnly) for (const rid of recipients) this.deliverBus(rid)
     const erroredRecipients = recipients.filter(id => this.sessions.get(id)?.status === 'error')
     const deferNote = automaticDeferrals.length
       ? `Held ${automaticDeferrals.length} expensive idle wake${automaticDeferrals.length === 1 ? '' : 's'}: ${automaticDeferrals.map((item) => `${item.sessionId} (${item.reason})`).join('; ')}.`
@@ -10171,7 +10233,9 @@ export class SessionManager {
     const operatorNote = operatorDirectedRecipients.length
       ? `Mail queued for ${operatorDirectedRecipients.join(', ')} until direct operator work settles; not steered into that work. Use child_status for hub-verified operator direction.`
       : undefined
-    const note = [skipNote, deferNote, errorNote, operatorNote].filter(Boolean).join(' ')
+    const efficiencyNote = receiptOnly ? 'Receipt saved without waking or steering the recipient. No acknowledgement is needed.' : undefined
+    const note = [skipNote, deferNote, errorNote, operatorNote, efficiencyNote,
+      coalesced.length ? `${coalesced.length} identical pending copies coalesced.` : undefined].filter(Boolean).join(' ')
     const deferredCount = new Set([...automaticDeferrals.map(row => row.sessionId), ...erroredRecipients, ...operatorDirectedRecipients]).size
     return {
       ok: true,
@@ -10977,11 +11041,33 @@ export class SessionManager {
   managerAssignChildTask(
     managerSessionId: string,
     childSessionId: string,
+    input: { taskId?: string; title: string; status?: 'pending' | 'in_progress' | 'completed' | 'abandoned'; expectedRevision?: number; changeReason?: string },
+  ): { ok: boolean; taskId?: string; warning?: string; error?: string } {
+    return this.applyChildTask(managerSessionId, childSessionId, input, false)
+  }
+
+  /** Device-authenticated operator API only. No agent tool/relay can mint this authority. */
+  amendTaskByOperator(
+    childSessionId: string,
+    input: { taskId: string; title: string; status: 'pending' | 'in_progress' | 'completed' | 'abandoned'; expectedRevision: number; changeReason: string },
+  ): { ok: boolean; taskId?: string; warning?: string; error?: string } {
+    const current = this.taskBoardForSession(childSessionId).tasks.find(t => t.id === input.taskId && t.origin === 'manager')
+    if (!current?.assignedBySessionId) return { ok: false, error: 'Manager assignment is unavailable' }
+    if (input.expectedRevision !== current.revision || !input.changeReason.trim()) return { ok: false, error: 'A current task revision and explicit operator reason are required' }
+    return this.applyChildTask(current.assignedBySessionId, childSessionId, input, true)
+  }
+
+  private applyChildTask(
+    managerSessionId: string,
+    childSessionId: string,
     input: {
       taskId?: string
       title: string
       status?: 'pending' | 'in_progress' | 'completed' | 'abandoned'
+      expectedRevision?: number
+      changeReason?: string
     },
+    operatorAmendment: boolean,
   ): { ok: boolean; taskId?: string; warning?: string; error?: string } {
     const relation = this.managerManagedAgent(managerSessionId, childSessionId)
     if (!relation) return { ok: false, error: 'target is not in this manager’s hierarchy' }
@@ -10997,6 +11083,8 @@ export class SessionManager {
     }
     const board = this.taskBoardForSession(childSessionId)
     let taskId = input.taskId
+    const lean = assistancePreferences(this.prefs).leanCoordination
+    const previous = taskId ? board.tasks.find(task => task.id === taskId) : undefined
     if (taskId) {
       const existing = board.tasks.find((task) => task.id === taskId)
       if (
@@ -11006,7 +11094,20 @@ export class SessionManager {
       ) {
         return { ok: false, error: 'task is not an assignment owned by this manager' }
       }
+      const changesOutcome = existing.title !== title ||
+        (['completed', 'abandoned', 'done'].includes(existing.status) && !['completed', 'abandoned', 'done'].includes(status))
+      if (input.expectedRevision !== undefined && input.expectedRevision !== existing.revision) {
+        return { ok: false, error: 'Stale task revision. Read this task once before applying your change; do not recreate it.' }
+      }
+      if (lean && changesOutcome && !operatorAmendment) {
+        return { ok: false, error: 'This assignment outcome is locked. Only the operator can revise or reopen it using Revise assignment in the task board. An agent-written reason or compaction is not authorization; do not create a replacement to bypass this hold.' }
+      }
+      if (existing.title === title && existing.status === status) return { ok: true, taskId, warning: 'Already recorded; no duplicate task update was written.' }
     } else {
+      const duplicate = lean && board.tasks.find(task => task.origin === 'manager' && task.assignedBySessionId === managerSessionId && task.title === title)
+      if (duplicate) return ['completed', 'abandoned', 'done'].includes(duplicate.status)
+        ? { ok: false, taskId: duplicate.id, error: 'This exact assignment already finished. Do not recreate it. Ask the operator to revise this assignment if new evidence requires reopening.' }
+        : { ok: true, taskId: duplicate.id, warning: 'Existing assignment reused; no duplicate task was created. Read its current state before updating.' }
       taskId = `manager:${crypto.randomUUID()}`
     }
     const assignedAt = new Date().toISOString()
@@ -11019,6 +11120,9 @@ export class SessionManager {
       managerLabel: relation.manager.title ?? identityOf(relation.manager).label,
       childSessionId,
       assignedAt,
+      revision: (previous?.revision ?? 0) + 1,
+      ...(operatorAmendment ? { amendedBy: 'operator' } : {}),
+      ...(input.changeReason ? { changeReason: input.changeReason.slice(0, 500) } : {}),
     }
     this.journal.atomic(() => {
       this.journal.append(childSessionId, 'manager/task-assigned', payload)
@@ -11512,6 +11616,9 @@ export class SessionManager {
     if (!caller) return { found: false }
     const t = this.sessions.get(targetSessionId)
     const overseerInspection = caller.isOverseer === true
+    if (t?.id === callerSessionId && options.view === 'tasks') {
+      return { found: true, summary: renderTaskCheckpoint(this.taskBoardForSession(caller.id), caller.id) || 'No durable tasks reported. This is not proof that no work is assigned.' }
+    }
     if (
       !t ||
       t.id === callerSessionId ||
@@ -11665,7 +11772,7 @@ export class SessionManager {
           task.origin === 'manager'
             ? `manager assigned by ${task.assignedByLabel ?? task.assignedBySessionId ?? 'unknown manager'}`
             : 'agent reported'
-        return `- [${task.status}] ${task.title} (${task.id}; ${origin})`
+        return `- [${task.status}] ${task.title} (${task.id}; ${origin}${task.revision ? `; revision ${task.revision}` : ''})`
       }),
     ].join('\n')
   }

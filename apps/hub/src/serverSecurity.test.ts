@@ -335,6 +335,48 @@ describe('account model discovery', () => {
 })
 
 describe('device-authenticated control plane', () => {
+  it('defaults assistance on, persists explicit opt-out and rejects malformed thresholds', async () => {
+    const h = await build()
+    const headers = { ...auth(h.deviceToken), 'content-type': 'application/json' }
+    expect(await (await fetch(`${h.base}/api/config/prefs`, { headers })).json()).toMatchObject({
+      leanCoordination: true, toolFailureEscalation: true, highTokenUsageWarnings: true, highTokenUsageThreshold: 100000, highContextUsagePercent: 80,
+    })
+    expect((await fetch(`${h.base}/api/config/prefs`, { method: 'POST', headers, body: JSON.stringify({ highTokenUsageThreshold: -1 }) })).status).toBe(400)
+    const changed = await fetch(`${h.base}/api/config/prefs`, { method: 'POST', headers, body: JSON.stringify({ leanCoordination: false, toolFailureEscalation: false, highTokenUsageWarnings: false }) })
+    expect(await changed.json()).toMatchObject({ leanCoordination: false, toolFailureEscalation: false, highTokenUsageWarnings: false })
+    expect((await fetch(`${h.base}/api/config/prefs`, { method: 'POST', body: '{}' })).status).toBe(401)
+  })
+  it('allows only the operator to resolve exact tool-help incidents and reports post-save delivery failure truthfully', async () => {
+    const h = await build()
+    h.sessions.runRelay('tools.assistance', { sessionId: h.record.id, input: { phase: 'report', tool: 'Bash', callId: 'report', summary: 'socket closed' } })
+    const id = h.record.toolHelp![0]!.id
+    const decide = (token?: string) => fetch(`${h.base}/api/sessions/${h.record.id}/tool-help/${id}`, {
+      method: 'POST', headers: { 'content-type': 'application/json', ...(token ? auth(token) : {}) }, body: JSON.stringify({ action: 'retry' }),
+    })
+    expect((await decide()).status).toBe(401)
+    expect((await decide('test-agent-bridge-secret-at-least-32-characters')).status).toBe(401)
+    vi.spyOn(h.sessions, 'send').mockRejectedValue(new Error('offline'))
+    expect(await (await decide(h.deviceToken)).json()).toMatchObject({ ok: true, warning: expect.stringContaining('was saved') })
+    expect(h.record.toolHelp).toEqual([])
+    expect((await decide(h.deviceToken)).status).not.toBe(200)
+    expect(h.journal.recentEventsForSession(h.record.id).some(e => e.kind === 'tool-help/delivery-failed')).toBe(true)
+  })
+  it('requires operator authentication for exact task amendments, rejects invalid input and preserves stale conflicts', async () => {
+    const h = await build()
+    const amend = vi.spyOn(h.sessions, 'amendTaskByOperator').mockReturnValueOnce({ ok: true, taskId: 'manager:1' }).mockReturnValue({ ok: false, error: 'Stale task revision' })
+    const input = { taskId: 'manager:1', title: 'Revised outcome', expectedRevision: 2, status: 'pending', changeReason: 'New operator requirement' }
+    const request = (token?: string, body = input) => fetch(`${h.base}/api/sessions/${h.record.id}/task-amendments`, {
+      method: 'POST', headers: { 'content-type': 'application/json', ...(token ? auth(token) : {}) }, body: JSON.stringify(body),
+    })
+    expect((await request()).status).toBe(401)
+    expect((await request('test-agent-bridge-secret-at-least-32-characters')).status).toBe(401)
+    expect((await request(h.deviceToken, { ...input, expectedRevision: 0 })).status).toBe(400)
+    expect((await request(h.deviceToken, { ...input, status: ['pending'] } as unknown as typeof input)).status).toBe(400)
+    expect(amend).not.toHaveBeenCalled()
+    expect((await request(h.deviceToken)).status).toBe(200)
+    expect(amend).toHaveBeenCalledWith(h.record.id, input)
+    expect((await request(h.deviceToken)).status).toBe(409)
+  })
   it('requires the operator token for worker run grants even when broad API auth is disabled', async () => {
     const h = await build()
     const project = h.projects.create('Worker run permission', h.record.cwd)

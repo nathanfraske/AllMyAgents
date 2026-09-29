@@ -324,7 +324,7 @@ export class ClaudeDriver {
           subtype?: string
           session_id?: string
           usage?: unknown
-          message?: { usage?: unknown }
+          message?: { usage?: unknown; id?: string }
           terminal_reason?: string
         }
         // A queued priority-next message really did become another SDK run. It commonly appears only a
@@ -346,7 +346,7 @@ export class ClaudeDriver {
         // Surface token usage to the UI's live counter as the turn streams. Assistant messages
         // carry usage under `.message.usage` (the Anthropic API message); the final `result`
         // message carries it at the top level. The SDK gives no total, so we derive it.
-        if (m.type === 'assistant') this.emitTokens(m.message?.usage, 'request')
+        if (m.type === 'assistant') this.emitTokens(m.message?.usage, 'request', m.message?.id)
         else if (m.type === 'result') {
           completedResults += 1
           this.emitTokens(m.usage, 'turn')
@@ -394,7 +394,7 @@ export class ClaudeDriver {
   //
   // Kept as separate fields as well as the total, so a reader can still distinguish fresh input from
   // cache reads — that distinction is the whole reason prompt caching is worth having.
-  private emitTokens(usage: unknown, scope: 'request' | 'turn'): void {
+  private emitTokens(usage: unknown, scope: 'request' | 'turn', requestId?: string): void {
     if (!usage || typeof usage !== 'object') return
     const u = usage as Record<string, unknown>
     const input = numField(u.input_tokens)
@@ -410,7 +410,9 @@ export class ClaudeDriver {
       total?: number
       contextUsed?: number
       scope: 'request' | 'turn'
+      requestId?: string
     } = { scope }
+    if (requestId) out.requestId = requestId
     if (input !== undefined) out.input = input
     if (cacheRead !== undefined) out.cacheRead = cacheRead
     if (cacheWrite !== undefined) out.cacheWrite = cacheWrite

@@ -189,6 +189,8 @@ export interface DeferredOperatorTurn {
 }
 
 export interface SessionRecord {
+  toolHelp?: import('./operatorAssistance.js').ToolHelpIncident[]
+  tokenWarning?: import('./operatorAssistance.js').TokenWarningState
   /** One fresh bus wake after a transient Overseer failure; never replay the failed turn. */
   overseerErrorRecovery?: 'ready' | 'attempted' | 'blocked'
   id: string
@@ -511,6 +513,11 @@ export interface FeaturesConfig {
  * runtime object index.ts fills defaults into and shares by reference.
  */
 export interface PrefsConfig {
+  leanCoordination?: boolean
+  toolFailureEscalation?: boolean
+  highTokenUsageWarnings?: boolean
+  highTokenUsageThreshold?: number
+  highContextUsagePercent?: number
   /** Which pool a new chat's name is drawn from. Absent → DEFAULT_CHAT_NAME_POOL. See title.ts. */
   chatNamePool?: ChatNamePool
   /** Deliver new operator/bus input into a running turn at its next tool boundary. Absent means ON. */
@@ -614,6 +621,11 @@ export function asUiPreferences(value: unknown, fallback = DEFAULT_UI_PREFERENCE
 
 /** Resolved owner preferences (always present; index.ts fills defaults from PrefsConfig). */
 export interface HubPrefs {
+  leanCoordination?: boolean
+  toolFailureEscalation?: boolean
+  highTokenUsageWarnings?: boolean
+  highTokenUsageThreshold?: number
+  highContextUsagePercent?: number
   chatNamePool: ChatNamePool
   steerMessagesAtToolBoundary: boolean
   // index.ts always resolves this; optional only so SessionManager's untouched legacy fallback literal

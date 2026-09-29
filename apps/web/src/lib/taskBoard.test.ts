@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { buildTaskBoard, summarizeBoard, type TaskBoardItem } from './taskBoard'
+import { buildTaskBoard, summarizeBoard, renderTaskCheckpoint, type TaskBoardItem } from './taskBoard'
 
 const tool = (toolName: string, toolInput: unknown, over: Partial<TaskBoardItem> = {}): TaskBoardItem => ({
   kind: 'tool',
@@ -10,6 +10,33 @@ const tool = (toolName: string, toolInput: unknown, over: Partial<TaskBoardItem>
 })
 
 describe('buildTaskBoard — TaskCreate / TaskUpdate (incremental)', () => {
+  it('retains completion evidence across replacement and makes resurrection visible without claiming new authority', () => {
+    const board = buildTaskBoard([
+      tool('update_plan', { plan: [{ step: 'Run scoped regression', status: 'completed' }] }),
+      tool('update_plan', { plan: [{ step: 'Run scoped regression', status: 'pending' }, { step: 'Another audit', status: 'pending' }] }),
+    ])
+    expect(board.tasks[0]!.status).toBe('pending') // truthful provider projection
+    expect(board.completedHistory).toMatchObject([{ title: 'Run scoped regression', status: 'completed' }])
+    const checkpoint = renderTaskCheckpoint(board)
+    expect(checkpoint).toContain('recentlyCompleted')
+    expect(checkpoint).toContain('A new plan is not new authority')
+    expect(checkpoint.length).toBeLessThan(4000)
+  })
+  it('keeps manager assignment outcomes immutable to native task tools', () => {
+    const board = buildTaskBoard([
+      tool('ManagerTask', { id: 'manager:1', title: 'Fix the parser', status: 'pending', managerSessionId: 'manager', revision: 3 }),
+      tool('TaskUpdate', { taskId: 'manager:1', subject: 'Start an unrelated rewrite', status: 'completed' }),
+      tool('update_plan', { plan: [] }),
+    ])
+    expect(board.tasks).toMatchObject([{ title: 'Fix the parser', status: 'pending', revision: 3, origin: 'manager' }])
+  })
+  it('bounds the encoded recovery checkpoint and discloses omitted rows', () => {
+    const board = buildTaskBoard([tool('update_plan', { plan: Array.from({ length: 30 }, (_, n) => ({ step: '\u0001'.repeat(150) + n, status: 'pending' })) })])
+    const checkpoint = renderTaskCheckpoint(board)
+    expect(checkpoint.length).toBeLessThan(4000)
+    expect(checkpoint).toContain('omittedActive')
+    expect(JSON.parse(checkpoint.split('\n')[1]!).active.length).toBeLessThan(6)
+  })
   it('creates tasks and applies a later status update', () => {
     const board = buildTaskBoard([
       tool('TaskCreate', { subject: 'Ship the panel', description: '…' }, { toolResult: 'Created task #1' }),

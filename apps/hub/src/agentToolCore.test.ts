@@ -7,6 +7,8 @@ import type { SessionIdentity } from './identity.js'
 import type { BusAddress } from './bus.js'
 import type { DangerFlags } from './types.js'
 import type { DurableRun } from './durableRuns.js'
+import { OperatorAssistance } from './operatorAssistance.js'
+import type { SessionRecord } from './types.js'
 
 const SAFE: DangerFlags = { busCanUseRiskyTools: false, autoApprovePractices: false }
 
@@ -14,6 +16,24 @@ const idA: SessionIdentity = { sessionId: 's1', profileId: 'a1', provider: 'code
 const idNoProject: SessionIdentity = { sessionId: 's2', profileId: 'a2', provider: 'codex', label: 'beta' }
 
 describe('whole-file transfer identity', () => {
+  it('enforces the tool hold before execution and binds external reporting to the caller', async () => {
+    const h = makeHarness()
+    const record = { id: 's1', provider: 'codex', profileId: 'p1', cwd: '.', status: 'active', createdAt: 'now' } as SessionRecord
+    const notify = vi.fn()
+    const helper = new OperatorAssistance({ prefs: () => ({}), record: id => id === record.id ? record : undefined,
+      save: vi.fn(), audit: vi.fn(), notify })
+    h.services.toolAssistance = vi.fn((id, input) => helper.tool(id, input))
+    h.services.roster = vi.fn(async () => { throw new Error('transport failed') })
+    const ctx = { identity: idA, services: h.services }
+    await expect(runAgentTool('list_agents', {}, ctx)).rejects.toThrow('once')
+    await expect(runAgentTool('list_agents', {}, ctx)).rejects.toThrow('Operator help requested')
+    expect(await runAgentTool('list_agents', {}, ctx)).toContain('Tool help required')
+    expect(h.services.roster).toHaveBeenCalledTimes(2)
+    expect(notify).toHaveBeenCalledTimes(1)
+    await runAgentTool('report_tool_failure', { tool_name: 'Read', summary: 'socket closed', retry_attempted: true, session_id: 'other' }, ctx)
+    expect(h.services.toolAssistance).toHaveBeenLastCalledWith('s1', expect.objectContaining({ phase: 'report', tool: 'Read' }))
+    expect(notify).toHaveBeenCalledTimes(2)
+  })
   it('binds transfer requests to the live requester and returns metadata rather than bytes', async () => {
     const h = makeHarness()
     h.services.transferFile = vi.fn(async () => ({ id: 'transfer', state: 'running' }))
@@ -239,6 +259,7 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
   })
   it('exposes the manager tools alongside the existing provider-agnostic tools', () => {
     expect(AGENT_TOOLS.map((t) => t.name)).toEqual([
+      'report_tool_failure',
       'list_agents',
       'send_message',
       'read_messages',
@@ -763,7 +784,7 @@ describe('send_message (bus addressing)', () => {
   it('addresses a specific teammate when to_session is given', async () => {
     const h = makeHarness({ sendResult: { ok: true, delivered: 1 } })
     const out = await runAgentTool('send_message', { to_session: 'peer99', body: 'hello' }, { identity: idA, services: h.services })
-    expect(out).toBe('Delivered to 1 agent(s).')
+    expect(out).toBe('Saved for 1 agent(s); automatic waking follows the configured coordination policy.')
     expect(h.sent[0]!.to).toEqual({ kind: 'session', id: 'peer99' })
     expect(h.sent[0]!.body).toBe('hello')
   })
@@ -771,7 +792,7 @@ describe('send_message (bus addressing)', () => {
   it('broadcasts to the project when to_session is omitted', async () => {
     const h = makeHarness({ sendResult: { ok: true, delivered: 3 } })
     const out = await runAgentTool('send_message', { body: 'team update' }, { identity: idA, services: h.services })
-    expect(out).toBe('Delivered to 3 agent(s).')
+    expect(out).toBe('Saved for 3 agent(s); automatic waking follows the configured coordination policy.')
     expect(h.sent[0]!.to).toEqual({ kind: 'project', id: 'p1' })
   })
 
