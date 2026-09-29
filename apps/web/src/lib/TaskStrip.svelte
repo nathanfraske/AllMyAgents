@@ -63,9 +63,9 @@
             {#each board.tasks as t (t.id)}
               <li class="task {cls(t.status)}">
                 <span class="mark" aria-hidden="true"></span>
-                <span class="title">{t.title}</span>
+                <span class="title" title={t.doneWhen ? `Done when: ${t.doneWhen}${t.evidence ? `\nEvidence: ${t.evidence}` : ''}` : undefined}>{t.title}</span>
                 <span class="origin" class:manager={t.origin === 'manager'}>
-                  {t.origin === 'manager' ? 'manager assigned' : 'agent reported'}
+                  {t.origin === 'contract' ? 'execution task' : t.origin === 'manager' ? 'manager assigned' : 'agent reported'}
                 </span>
                 <span class="status dim">{t.status.replace('_', ' ')}</span>
                 {#if sessionId && t.origin === 'manager' && t.revision}

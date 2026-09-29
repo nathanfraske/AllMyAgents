@@ -144,6 +144,8 @@ export interface WorkerAgentServiceDeps {
  */
 export function buildWorkerAgentServices(deps: WorkerAgentServiceDeps): AgentServices {
   return {
+    workPlan: (sessionId, input) => deps.relayRpc('tasks.plan', { sessionId, input }),
+    workGate: (sessionId, tool, args) => deps.relayRpc('tasks.gate', { sessionId, tool, args }) as Promise<string | undefined>,
     toolAssistance: (sessionId, input) => deps.relayRpc('tools.assistance', { sessionId, input }) as ReturnType<NonNullable<AgentServices['toolAssistance']>>,
     send: (from, to, subject, body, wake, attentionRequired) =>
       deps.relayRpc('bus.send', {
@@ -753,6 +755,7 @@ export class AgentWorker {
         (toolName, input, context) => this.canUseTool(spec, toolName, input, context),
         { allmyagents: mcp },
         spec.wsl,
+        (tool, args) => this.relayRpc('tasks.gate', { sessionId: spec.sessionId, tool, args }) as Promise<string | undefined>,
       )
       if (spec.vendorSessionId) driver.restore(spec.vendorSessionId)
       this.claudeDrivers.set(spec.sessionId, driver)
@@ -803,6 +806,8 @@ export class AgentWorker {
     const threadId = (params as { threadId?: string } | null)?.threadId
     const sessionId = threadId ? this.sessionForThread(threadId) : undefined
     try {
+      const hold = sessionId && await this.relayRpc('tasks.gate', { sessionId, tool: method, args: params })
+      if (hold) return codexRequestResult(method, false, params)
       // Give the payload the same `toolName` shape a Claude approval has, so the card title, the
       // "Always allow" button and the hub's allowlist all work for Codex without a second code path.
       const approvalPayload = { ...(params as Record<string, unknown> | null), toolName: codexGrantKey(method) }

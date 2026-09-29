@@ -124,6 +124,7 @@ export interface Executor {
 // behind it.
 export const AUTO_ALLOW_TOOLS = new Set([
   'mcp__allmyagents__list_agents',
+  'mcp__allmyagents__task_plan',
   'mcp__allmyagents__report_tool_failure',
   'mcp__allmyagents__send_message',
   'mcp__allmyagents__read_messages',
@@ -308,6 +309,8 @@ export interface InProcessExecutorHubHooks {
   remoteDevices(sessionId: string): ReturnType<AgentServices['remoteDevices']>
   publishArtifact?: AgentServices['publishArtifact']
   toolAssistance?: AgentServices['toolAssistance']
+  workPlan?: AgentServices['workPlan']
+  workGate?: AgentServices['workGate']
   manageArtifacts?: AgentServices['manageArtifacts']
   transferFile?: AgentServices['transferFile']
   remoteExecute(
@@ -372,6 +375,8 @@ export class InProcessExecutor implements Executor {
   //      services; isBusTurn is executor-local. -----------------------------------------------------
   private agentServices(): AgentServices {
     return {
+      workPlan: (sessionId, input) => this.h.workPlan?.(sessionId, input),
+      workGate: (sessionId, tool, args) => this.h.workGate?.(sessionId, tool, args),
       toolAssistance: (sessionId, input) => this.h.toolAssistance?.(sessionId, input) ?? { blocked: false },
       send: (from, to, subject, body, wake, attentionRequired) =>
         this.h.busSend(from.sessionId, to, subject, body, wake, attentionRequired),
@@ -520,6 +525,8 @@ export class InProcessExecutor implements Executor {
           const sessionId = threadId ? this.sessionIdForThread(threadId) : undefined
           // Same normalisation as the worker path: Codex approvals carry no toolName, and every
           // downstream consumer (card title, Always allow, allowlist policy) keys on one.
+          const hold = sessionId && await this.h.workGate?.(sessionId, method, params)
+          if (hold) return codexRequestResult(method, false, params)
           const approvalPayload = { ...(params as Record<string, unknown> | null), toolName: codexGrantKey(method) }
           const decision = await this.services.approvals.requestDetailed(
             sessionId ?? 'unattributed',
@@ -667,6 +674,7 @@ export class InProcessExecutor implements Executor {
         // session's identity so every call is attributed to the real caller.
         { allmyagents: buildAgentMcpServer(this.identityFromSpec(spec), this.agentServices()) },
         spec.wsl,
+        async (tool, args) => this.h.workGate?.(spec.sessionId, tool, args),
       )
       if (spec.vendorSessionId) driver.restore(spec.vendorSessionId)
       this.claudeDrivers.set(spec.sessionId, driver)

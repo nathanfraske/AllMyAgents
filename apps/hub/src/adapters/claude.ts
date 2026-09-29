@@ -197,6 +197,7 @@ export class ClaudeDriver {
     // server name; the SDK exposes their tools to the agent as `mcp__<name>__<tool>`.
     private readonly mcpServers?: Record<string, unknown>,
     private readonly wsl?: { distro: string },
+    private readonly workGate?: (tool: string, input: unknown) => Promise<string | undefined>,
   ) {}
 
   get sessionId(): string | undefined {
@@ -283,8 +284,20 @@ export class ClaudeDriver {
       // per-invocation identity AND `matchedAskRule` — so a user-configured permissions.ask rule, whose
       // entire purpose is to force a human prompt, was invisible to the hub's auto-approval and got
       // overridden by Full access.
-      options.canUseTool = async (toolName: string, input: unknown, context?: ClaudePermissionContext) =>
-        this.canUseTool!(toolName, input, context)
+      options.canUseTool = async (toolName: string, input: unknown, context?: ClaudePermissionContext) => {
+        const hold = await this.workGate?.(toolName, input)
+        return hold ? { behavior: 'deny', message: hold } : this.canUseTool!(toolName, input, context)
+      }
+    }
+    if (this.workGate) options.hooks = {
+      PreToolUse: [{ hooks: [async (event: { tool_name?: string; tool_input?: unknown }) => {
+        try {
+          const hold = await this.workGate!(event.tool_name ?? '', event.tool_input)
+          return hold ? { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: hold } } : {}
+        } catch {
+          return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'Task gate unavailable. Stop affected work and ask the operator; do not bypass the host.' } }
+        }
+      }] }],
     }
     if (this.mcpServers) options.mcpServers = this.mcpServers
     // SAFE DEFAULT — do not silently execute a project's own configuration. A project's `.mcp.json`

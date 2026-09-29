@@ -46,6 +46,7 @@ interface WorkerGateInternals {
 }
 
 interface InProcessGateInternals {
+  bindHub(hooks: Partial<import('./executor.js').InProcessExecutorHubHooks>): void
   claudeDriverFor(spec: WorkerSessionSpec): {
     send(prompt: string, options: { permissionMode: 'safe' | 'edits' | 'full' }): Promise<void>
   }
@@ -90,6 +91,8 @@ describe('assign_child_task auto-allow parity', () => {
           practices: new PracticeStore(journal.db),
         }) as unknown as InProcessGateInternals
 
+        // Permission classification is independent of the separately qualified task lifecycle.
+        executor.bindHub({ workGate: async () => undefined })
         const driver = executor.claudeDriverFor(specWith(mode))
         await driver.send('test', { permissionMode: mode })
         const canUseTool = capturedClaudeOptions[0]?.canUseTool as

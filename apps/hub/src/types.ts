@@ -189,6 +189,8 @@ export interface DeferredOperatorTurn {
 }
 
 export interface SessionRecord {
+  workPlan?: import('./workPlan.js').WorkPlan
+  workBinding?: import('./workPlan.js').WorkBinding
   toolHelp?: import('./operatorAssistance.js').ToolHelpIncident[]
   tokenWarning?: import('./operatorAssistance.js').TokenWarningState
   /** One fresh bus wake after a transient Overseer failure; never replay the failed turn. */

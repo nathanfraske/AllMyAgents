@@ -124,6 +124,8 @@ export interface LiveSession {
 
 export type RelayMethod =
   | 'tools.assistance'
+  | 'tasks.plan'
+  | 'tasks.gate'
   | 'bus.send'
   | 'bus.inbox'
   | 'bus.roster'

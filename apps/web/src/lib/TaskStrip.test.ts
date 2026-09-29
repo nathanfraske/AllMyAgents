@@ -18,6 +18,14 @@ const item = (toolName: string, toolInput: unknown, ts = '2026-07-27T12:00:00.00
 })
 
 describe('TaskStrip vendor plans', () => {
+  it('shows host execution outcomes and their exact completion evidence independently of provider checklists', async () => {
+    render(TaskStrip, { items: [item('WorkPlan', { revision: 2, steps: [{ id: 'work:1', title: 'Requested outcome',
+      status: 'completed', doneWhen: 'Exact regression passes', evidence: 'run-123 passed' }] }), item('update_plan', { plan: [] })] })
+    await fireEvent.click(screen.getByRole('button', { name: /Tasks/ }))
+    expect(screen.getByText('execution task')).toBeTruthy()
+    expect(screen.getByText('Requested outcome').getAttribute('title')).toBe('Done when: Exact regression passes\nEvidence: run-123 passed')
+  })
+
   it('states that an empty board means no tasks were reported', async () => {
     render(TaskStrip, { props: { items: [] } })
     expect(screen.getByText('No tasks reported')).toBeTruthy()

@@ -3609,6 +3609,10 @@ export class HubStore {
         })
         break
       }
+      case 'session/work-plan': {
+        this.push(view, { kind: 'tool', ts, toolName: 'WorkPlan', toolInput: payload, taskBoardOnly: true })
+        break
+      }
       case 'manager/task-assigned': {
         // Manager assignments are durable hub events on the child. Normalize them to the same pure
         // board reducer input as vendor task tools; taskBoardOnly keeps audit metadata out of chat prose.

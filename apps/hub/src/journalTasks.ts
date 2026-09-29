@@ -24,7 +24,7 @@ export function readTaskBoardEvents(
       WITH scoped AS NOT MATERIALIZED (
         SELECT e.seq, e.ts, e.kind, e.payload FROM ${source}
         WHERE ${session} = @session
-          AND e.kind IN ('manager/task-assigned', 'codex/turn/plan/updated', 'claude/assistant', 'claude/user')
+          AND e.kind IN ('session/work-plan', 'manager/task-assigned', 'codex/turn/plan/updated', 'claude/assistant', 'claude/user')
       ), calls AS MATERIALIZED (
         SELECT e.seq, e.ts, e.kind, b.key AS ordinal, b.value AS block,
           json_extract(b.value, '$.id') AS tool_id
@@ -35,7 +35,7 @@ export function readTaskBoardEvents(
           AND json_extract(b.value, '$.name') IN ('TaskCreate', 'TaskUpdate', 'TodoWrite', 'update_plan')
       )
       SELECT seq, ts, kind, 0 AS ordinal, payload FROM scoped
-      WHERE kind IN ('manager/task-assigned', 'codex/turn/plan/updated')
+      WHERE kind IN ('session/work-plan', 'manager/task-assigned', 'codex/turn/plan/updated')
       UNION ALL
       SELECT seq, ts, kind, ordinal,
         json_object('message', json_object('content', json_array(json(block)))) AS payload FROM calls

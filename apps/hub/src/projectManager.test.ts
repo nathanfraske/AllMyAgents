@@ -163,6 +163,69 @@ function transition(sessions: SessionManager, id: string, status: SessionStatus)
   ;(sessions as unknown as { setStatusById(id: string, status: SessionStatus): void }).setStatusById(id, status)
 }
 
+describe('host-enforced task lifecycle', () => {
+  it('rolls back a failed ledger audit and never mistakes Claude completion for a Codex goal', async () => {
+    const h = buildHub(), owner = h.seed({ id: 'owner', provider: 'claude', projectId: 'p' })
+    await h.sessions.send('owner', 'Implement the requested change')
+    const host = h.sessions as unknown as { changeWorkPlan(id: string, input: import('./workPlan.js').WorkPlanInput): Promise<{ plan: import('./workPlan.js').WorkPlan; warning?: string }> }
+    const append = h.journal.append.bind(h.journal)
+    const audit = vi.spyOn(h.journal, 'append').mockImplementation((sessionId, kind, payload) => {
+      if (kind === 'session/work-plan') throw new Error('fixture audit unavailable')
+      return append(sessionId, kind, payload)
+    })
+    const create = { operation: 'create' as const, steps: [{ title: 'Requested change', doneWhen: 'Regression verified' }] }
+    await expect(host.changeWorkPlan('owner', create)).rejects.toThrow('fixture audit')
+    expect(owner.workPlan).toBeUndefined()
+    expect(h.journal.taskBoardEventsForSession('owner')).toEqual([])
+    audit.mockRestore()
+    const p = (await host.changeWorkPlan('owner', create)).plan
+    const result = await host.changeWorkPlan('owner', { operation: 'update', planId: p.id, expectedRevision: p.revision, taskId: p.steps[0]!.id, status: 'completed', evidence: 'exact passing receipt' })
+    expect(result.warning).toBeUndefined()
+    expect(h.pauseAutonomousGoal).not.toHaveBeenCalled()
+  })
+
+  it('binds admitted input, worker relay, quiet completion and a fresh operator request on existing records', async () => {
+    const h = buildHub()
+    h.seed({ id: 'owner', provider: 'codex', profileId: 'p2', projectId: 'project' })
+    h.seed({ id: 'peer', projectId: 'project' })
+    const change = (input: import('./workPlan.js').WorkPlanInput) => h.sessions.runRelay('tasks.plan', { sessionId: 'owner', input }) as Promise<{ plan: import('./workPlan.js').WorkPlan; warning?: string }>
+    const gate = () => h.sessions.runRelay('tasks.gate', { sessionId: 'owner', tool: 'start_run', args: {} })
+    expect(gate()).toContain('Task-first')
+    await expect(change({ operation: 'create', steps: [{ title: 'No operator', doneWhen: 'Not authorized' }] })).rejects.toThrow('operator')
+    await h.sessions.send('owner', 'Implement the bounded change')
+    const first = await change({ operation: 'create', steps: [{ title: 'Bounded change', doneWhen: 'Regression passes' }] })
+    const active = await change({ operation: 'update', planId: first.plan.id, expectedRevision: first.plan.revision, taskId: first.plan.steps[0]!.id, status: 'in_progress' })
+    expect(gate()).toBeUndefined()
+    const done = await change({ operation: 'update', planId: active.plan.id, expectedRevision: active.plan.revision, taskId: active.plan.steps[0]!.id, status: 'completed', evidence: 'run verified' })
+    await change({ operation: 'finish', planId: done.plan.id, expectedRevision: done.plan.revision })
+    expect(h.pauseAutonomousGoal).toHaveBeenCalledTimes(1)
+    expect(gate()).toContain('complete')
+    transition(h.sessions, 'owner', 'idle')
+    h.runTurn.mockClear()
+    h.sessions.busSend('peer', { kind: 'session', id: 'owner' }, 'receipt', 'Review the same completed change again', true)
+    await new Promise<void>(r => setImmediate(r))
+    expect(h.runTurn).not.toHaveBeenCalled()
+    expect(h.bus.pending('owner')[0]?.wake).toBe(false)
+    await h.sessions.send('owner', 'Now implement a second change')
+    const next = await change({ operation: 'create', steps: [{ title: 'Second change', doneWhen: 'Second result' }] })
+    expect(next.plan.id).not.toBe(first.plan.id)
+  })
+
+  it('adopts legacy assignments once without rewriting them or waking stopped workers', () => {
+    const h = buildHub()
+    h.seed({ id: 'manager', isProjectManager: true, projectId: 'p' })
+    const child = h.seed({ id: 'child', parentSessionId: 'manager', projectId: 'p', status: 'stopped' })
+    h.journal.append('child', 'manager/task-assigned', { id: 'manager:original', title: 'Original outcome', status: 'in_progress', managerSessionId: 'manager' })
+    const host = h.sessions as unknown as { runtimeHostInstructions(r: SessionRecord): string }
+    expect(host.runtimeHostInstructions(child)).toContain('Task-first execution is ON')
+    host.runtimeHostInstructions(child)
+    expect(child.workPlan?.steps[0]).toMatchObject({ id: 'manager:original', title: 'Original outcome', status: 'in_progress' })
+    expect(h.journal.taskBoardEventsForSession('child').filter(e => e.kind === 'session/work-plan')).toHaveLength(1)
+    expect(child.status).toBe('stopped')
+    expect(h.runTurn).not.toHaveBeenCalled()
+  })
+})
+
 describe('manager visibility of direct operator work', () => {
   function setup(provider: 'claude' | 'codex' = 'claude') {
     const h = buildHub()
@@ -1852,7 +1915,8 @@ describe('project manager durable live roster', () => {
     expect(sessions.managerAssignChildTask(manager.id, 'stashed-worker', {
       taskId: 'manager:legacy', title: 'Existing finished outcome', status: 'pending', expectedRevision: 1, changeReason: 'Compaction',
     }).ok).toBe(false)
-    expect(journal.taskBoardEventsForSession('stashed-worker')).toHaveLength(1)
+    expect(journal.taskBoardEventsForSession('stashed-worker').filter(e => e.kind === 'manager/task-assigned')).toHaveLength(1)
+    expect(journal.taskBoardEventsForSession('stashed-worker').filter(e => e.kind === 'session/work-plan')).toHaveLength(1)
     expect(runTurn).not.toHaveBeenCalled()
   })
 

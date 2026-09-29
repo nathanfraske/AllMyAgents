@@ -889,7 +889,7 @@ describe('SessionManager.applyLifecycle — replayed markers do not re-journal o
     h.sessions.loadRecords()
 
     // Queue a teammate message for 's'. It is ACTIVE, so deliverBus can't flush it now → it stays pending.
-    expect(h.sessions.busSend('t', { kind: 'session', id: 's' }, 'hi', 'ping')).toEqual({ ok: true, delivered: 1 })
+    expect(h.sessions.busSend('t', { kind: 'session', id: 's' }, 'hi', 'ping', true)).toEqual({ ok: true, delivered: 1 })
 
     // A REPLAYED turnCompleted (idle) must NOT schedule deliverBus — else it could start a clamped bus turn on
     // a session the worker is still driving mid-turn (the ordering hazard F2 calls out).
@@ -914,7 +914,7 @@ describe('SessionManager.applyLifecycle — replayed markers do not re-journal o
     seedRecord(h.store, 's', 'active', 'claude', 'proj1')
     seedRecord(h.store, 't', 'idle', 'claude', 'proj1')
     h.sessions.loadRecords()
-    expect(h.sessions.busSend('t', { kind: 'session', id: 's' }, 'queued', 'survive the gap')).toEqual({
+    expect(h.sessions.busSend('t', { kind: 'session', id: 's' }, 'queued', 'survive the gap', true)).toEqual({
       ok: true,
       delivered: 1,
     })

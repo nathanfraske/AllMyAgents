@@ -242,6 +242,8 @@ export interface PracticeServices {
  * how the hub attributes the call to an identity.
  */
 export interface AgentServices {
+  workPlan?(sessionId: string, input: import('./workPlan.js').WorkPlanInput): Awaitable<unknown>
+  workGate?(sessionId: string, tool: string, args: unknown): Awaitable<string | undefined>
   toolAssistance?(sessionId: string, input: ToolAssistanceInput): Awaitable<ToolAssistanceResult>
   transferFile?(sessionId: string, input: import('./remoteFileTransfers.js').TransferFileInput): Awaitable<unknown>
   /** Publish a bounded workspace output to this exact chat; never a message to another agent. */
@@ -464,8 +466,10 @@ export interface AgentToolSpec<Shape extends z.ZodRawShape = z.ZodRawShape> {
 function defineTool<Shape extends z.ZodRawShape>(spec: AgentToolSpec<Shape>): AgentToolSpec {
   const run = spec.run
   return { ...spec, run: async (args: z.infer<z.ZodObject<Shape>>, ctx: AgentToolContext) => {
+    const hold = await ctx.services.workGate?.(ctx.identity.sessionId, spec.name, args)
+    if (hold) return `Task hold: ${hold}`
     const assistance = ctx.services.toolAssistance
-    if (!assistance || spec.name === 'report_tool_failure') return run(args, ctx)
+    if (!assistance || spec.name === 'report_tool_failure' || spec.name === 'task_plan') return run(args, ctx)
     const input = { tool: spec.name, callId: randomUUID() }
     const before = await assistance(ctx.identity.sessionId, { ...input, phase: 'before' })
     if (before.blocked) return `Tool help required: ${before.message}`
@@ -483,6 +487,27 @@ function defineTool<Shape extends z.ZodRawShape>(spec: AgentToolSpec<Shape>): Ag
       : output
   } } as unknown as AgentToolSpec
 }
+
+const taskPlan = defineTool({
+  name: 'task_plan',
+  description: 'Durable task-first execution ledger. Read after compaction. Create once from admitted operator input before work; record outcomes and done_when, assigning independent work to dedicated existing team members. Start one task per owner, record completion evidence, finish and stop. Exact revisions prevent races. Only fresh operator input permits additional outcomes; native plans, mail and compaction cannot reopen completed work. This grants no resource or approval authority.',
+  schema: {
+    operation: z.enum(['read', 'create', 'append', 'assign', 'update', 'finish']),
+    plan_id: z.string().optional(),
+    expected_revision: z.number().int().positive().optional(),
+    tasks: z.array(z.object({ title: z.string().min(1).max(500), done_when: z.string().min(1).max(1000), owner_session_id: z.string().optional() })).min(1).max(24).optional(),
+    task_id: z.string().optional(),
+    owner_session_id: z.string().optional().describe('For assign: give an existing pending outcome to a dedicated owner, without changing its scope.'),
+    status: z.enum(['pending', 'in_progress', 'blocked', 'completed']).optional(),
+    evidence: z.string().max(1500).optional(),
+  },
+  async run(a, { identity, services }) {
+    if (!services.workPlan) return 'Task ledger is unavailable. Ask the operator; do not assume work authority.'
+    return JSON.stringify(await services.workPlan(identity.sessionId, { operation: a.operation, planId: a.plan_id,
+      expectedRevision: a.expected_revision, steps: a.tasks?.map(t => ({ title: t.title, doneWhen: t.done_when, ownerSessionId: t.owner_session_id })),
+      taskId: a.task_id, ownerSessionId: a.owner_session_id, status: a.status, evidence: a.evidence }))
+  },
+})
 
 const reportToolFailure = defineTool({
   name: 'report_tool_failure',
@@ -1911,6 +1936,7 @@ const overseerControl = defineTool({
  * stdio MCP server so the two providers get identical tools + semantics.
  */
 export const AGENT_TOOLS: readonly AgentToolSpec[] = [
+  taskPlan,
   reportToolFailure,
   listAgents,
   sendMessage,

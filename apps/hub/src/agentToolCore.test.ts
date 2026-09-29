@@ -16,6 +16,16 @@ const idA: SessionIdentity = { sessionId: 's1', profileId: 'a1', provider: 'code
 const idNoProject: SessionIdentity = { sessionId: 's2', profileId: 'a2', provider: 'codex', label: 'beta' }
 
 describe('whole-file transfer identity', () => {
+  it('checks the durable task gate before assistance, permissions or tool side effects', async () => {
+    const h = makeHarness()
+    h.services.workGate = vi.fn(async () => 'Task-first')
+    h.services.toolAssistance = vi.fn(async () => ({ blocked: false }))
+    h.services.transferFile = vi.fn()
+    expect(await runAgentTool('remote_transfer_file', { operation: 'upload', device_id: 'box', root_id: 'root', local_path: 'file', remote_path: 'out' }, { identity: idA, services: h.services })).toContain('Task hold')
+    expect(h.services.workGate).toHaveBeenCalledWith('s1', 'remote_transfer_file', expect.objectContaining({ device_id: 'box' }))
+    expect(h.services.transferFile).not.toHaveBeenCalled()
+    expect(h.services.toolAssistance).not.toHaveBeenCalled()
+  })
   it('enforces the tool hold before execution and binds external reporting to the caller', async () => {
     const h = makeHarness()
     const record = { id: 's1', provider: 'codex', profileId: 'p1', cwd: '.', status: 'active', createdAt: 'now' } as SessionRecord
@@ -259,6 +269,7 @@ describe('AGENT_TOOLS surface (provider-agnostic core shared by Claude + Codex)'
   })
   it('exposes the manager tools alongside the existing provider-agnostic tools', () => {
     expect(AGENT_TOOLS.map((t) => t.name)).toEqual([
+      'task_plan',
       'report_tool_failure',
       'list_agents',
       'send_message',

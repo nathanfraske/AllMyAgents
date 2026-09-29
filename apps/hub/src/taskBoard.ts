@@ -29,7 +29,10 @@ export interface BoardTask {
   createdAt: string
   updatedAt: string
   /** Who put this item on the shared board. Agent-authored task tools remain the default. */
-  origin: 'agent' | 'manager'
+  origin: 'agent' | 'manager' | 'contract'
+  doneWhen?: string
+  evidence?: string
+  ownerSessionId?: string
   assignedBySessionId?: string
   assignedByLabel?: string
   revision?: number
@@ -118,12 +121,32 @@ export function buildTaskBoard(items: readonly TaskBoardItem[]): TaskBoard {
     if (it.kind !== 'tool' || !it.toolName) continue
     const input = (it.toolInput ?? {}) as Record<string, unknown>
 
+    if (it.toolName === 'WorkPlan') {
+      for (const [id, task] of tasks) if (task.origin === 'contract') { remember(task); tasks.delete(id) }
+      for (const row of records(input.steps)) {
+        const id = str(row.id), title = str(row.title)
+        if (!id || !title) continue
+        // Legacy assignments share their durable IDs with the adopted execution plan. Keep their
+        // manager identity/revision so an authenticated operator amendment still targets that row.
+        const assignment = tasks.get(id)?.origin === 'manager' ? tasks.get(id)! : undefined
+        const task: BoardTask = { ...assignment, id, title, status: str(row.status) ?? 'pending', origin: assignment ? 'manager' : 'contract',
+          createdAt: assignment?.createdAt ?? str(input.createdAt) ?? it.ts, updatedAt: it.ts,
+          revision: assignment?.revision ?? (typeof input.revision === 'number' ? input.revision : 1),
+          doneWhen: str(row.doneWhen), evidence: str(row.evidence), ownerSessionId: str(row.ownerSessionId) }
+        tasks.set(id, task)
+        remember(task)
+      }
+      source = 'mixed'
+      changes.push({ ts: it.ts, kind: 'snapshot' })
+      continue
+    }
+
     if (it.toolName === MANAGER_TASK_TOOL) {
       const id = str(input.id)
       const title = str(input.title)
       const status = str(input.status) ?? 'pending'
       if (!id || !title) continue
-      source = source === 'none' || source === 'manager' ? 'manager' : 'mixed'
+      source = [...tasks.values()].some(task => task.origin !== 'manager') ? 'mixed' : 'manager'
       const existing = tasks.get(id)
       tasks.set(id, {
         id,
@@ -190,7 +213,7 @@ export function buildTaskBoard(items: readonly TaskBoardItem[]): TaskBoard {
       if (!id) continue
       const existing = tasks.get(id)
       // A vendor task tool is a report, not the manager's assignment control plane.
-      if (existing?.origin === 'manager') continue
+      if (existing && existing.origin !== 'agent') continue
       if (existing) {
         if (status) existing.status = status
         if (str(input.subject)) existing.title = str(input.subject)!
@@ -236,6 +259,10 @@ export function taskBoardItemsFromEvents(events: readonly TaskBoardEvent[]): Tas
   const byToolUse = new Map<string, TaskBoardItem>()
   for (const event of events) {
     const payload = (event.payload ?? {}) as Record<string, unknown>
+    if (event.kind === 'session/work-plan') {
+      items.push({ kind: 'tool', ts: event.ts, toolName: 'WorkPlan', toolInput: event.payload })
+      continue
+    }
     if (event.kind === 'claude/assistant') {
       const message = payload.message as { content?: unknown[] } | undefined
       for (const raw of message?.content ?? []) {

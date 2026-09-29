@@ -111,6 +111,7 @@ import { InProcessExecutor, type Executor, type InProcessExecutorHubHooks } from
 import type { BrowserBroker } from './browserBroker.js'
 import type { NotificationService, NotificationSourceRole } from './notifications.js'
 import { OperatorAssistance, assistancePreferences, type ToolAssistanceInput } from './operatorAssistance.js'
+import { WorkPlans, type WorkPlanInput } from './workPlan.js'
 import type { TestbedRunStore } from './testbedRuns.js'
 import type {
   DurableRun,
@@ -775,6 +776,7 @@ function commandOutputDelta(payload: unknown): PendingCommandOutputDelta['payloa
 }
 
 export class SessionManager {
+  private readonly workPlans: WorkPlans
   private readonly operatorAssistance: OperatorAssistance
   private readonly sessions = new Map<string, SessionRecord>()
   private durableCapabilityUpgrade: Promise<void> | undefined
@@ -944,6 +946,19 @@ export class SessionManager {
       audit: (id, kind, payload) => { this.journal.append(id, kind, payload) },
       notify: input => { this.notifications?.publish(input) },
     })
+    this.workPlans = new WorkPlans({
+      enabled: () => assistancePreferences(this.prefs).leanCoordination,
+      record: id => this.sessions.get(id),
+      isOperatorTurn: id => this.operatorTurnSessions.has(id) && !this.busTurnSessions.has(id),
+      canAssign: (from, to) => {
+        const owner = this.sessions.get(from), target = this.sessions.get(to)
+        return !!target && !target.managerRetiredAt && !this.operatorDirectionHold(target) &&
+          (!!this.managerManagedAgent(from, to) || (owner?.isOverseer === true && target.isProjectManager === true))
+      },
+      save: record => this.persist(record as SessionRecord),
+      audit: (id, kind, payload) => { this.journal.append(id, kind, payload) },
+      outstanding: (id, since) => this.durableRuns?.store.hasOutstandingForSession(id, since) ?? false,
+    })
     this.teamPresets = new TeamPresetStore(this.journal.db)
     this.chatArtifacts = new ChatArtifacts(journal, path.join(
       journal.db.name === ':memory:' ? path.join(defaultCwd, '.allmyagents') : path.dirname(path.resolve(journal.db.name)),
@@ -1049,6 +1064,8 @@ export class SessionManager {
         this.busSend(fromSessionId, to, subject, body, wake, attentionRequired),
       busInbox: (sessionId) => this.busInbox(sessionId),
       toolAssistance: (sessionId, input) => this.operatorAssistance.tool(sessionId, input),
+      workPlan: (sessionId, input) => this.changeWorkPlan(sessionId, input),
+      workGate: (sessionId, tool, args) => this.workPlans.gate(sessionId, tool, args),
       busRoster: (sessionId) => this.busRoster(sessionId),
       busPeek: (callerSessionId, targetSessionId, options) =>
         this.busPeek(callerSessionId, targetSessionId, options),
@@ -1338,6 +1355,14 @@ export class SessionManager {
    */
   runRelay(method: RelayMethod, args: unknown): unknown | Promise<unknown> {
     switch (method) {
+      case 'tasks.plan': {
+        const a = args as { sessionId: string; input: WorkPlanInput }
+        return this.changeWorkPlan(a.sessionId, a.input)
+      }
+      case 'tasks.gate': {
+        const a = args as { sessionId: string; tool: string; args: unknown }
+        return this.workPlans.gate(a.sessionId, a.tool, a.args)
+      }
       case 'tools.assistance': {
         const a = args as { sessionId: string; input: ToolAssistanceInput }
         return this.operatorAssistance.tool(a.sessionId, a.input)
@@ -1863,8 +1888,10 @@ export class SessionManager {
   }
 
   private runtimeHostInstructions(record: SessionRecord, directOperatorPrompt?: string): string {
+    this.adoptLegacyWorkTasks(record)
     return [
       providerHostInstructions(record),
+      assistancePreferences(this.prefs).leanCoordination ? this.workPlanInstructions(record.id) : '',
       assistancePreferences(this.prefs).leanCoordination ? renderTaskCheckpoint(this.taskBoardForSession(record.id), record.id) : '',
       assistancePreferences(this.prefs).leanCoordination
         ? 'Lean coordination is ON. Keep one owner for the outcome; delegate only independent work with a concrete deliverable, not a new layer of supervision. Send concise deltas and evidence references at material boundaries. Routine mail defaults to wake=false; set wake=true for a real request needing action now. Do not acknowledge acknowledgements, repeat status queries without new state, or review another review without a specific unresolved defect. Complete one review pass and verify fixes; reopen only for changed evidence, a failed criterion, or an operator request. Use existing run/commit evidence, targeted regression tests and the project-required gates; do not rerun unchanged passing suites or add tests that merely mirror trivial code. Keep one useful handoff/checkpoint instead of repeated reports. Once acceptance criteria are met, finish. If disagreement cannot be resolved with new evidence, ask the operator once. These efficiency defaults never waive approvals, safety checks, required tests, or operator instructions.'
@@ -3992,6 +4019,8 @@ export class SessionManager {
    */
   private agentServices(): AgentServices {
     return {
+      workPlan: (sessionId, input) => this.changeWorkPlan(sessionId, input),
+      workGate: (sessionId, tool, args) => this.workPlans.gate(sessionId, tool, args),
       toolAssistance: (sessionId, input) => this.operatorAssistance.tool(sessionId, input),
       send: (from, to, subject, body, wake, attentionRequired) =>
         this.busSend(from.sessionId, to, subject, body, wake, attentionRequired),
@@ -5801,6 +5830,72 @@ export class SessionManager {
         managerRosterChars: managerRosterText.length,
       })
     }
+  }
+
+  private adoptLegacyWorkTasks(record: SessionRecord): void {
+    if (record.workPlan || record.workBinding || !assistancePreferences(this.prefs).leanCoordination) return
+    const tasks = this.taskBoardForSession(record.id).tasks.filter(task => task.origin === 'manager')
+    if (!tasks.length) return
+    if (tasks.length > 24) return // Never silently drop assignments to fit a migration budget.
+    // Freeze the existing assignment facts, not a newly inferred task or an expanded native plan.
+    const steps = tasks.map(task => ({ id: task.id, title: task.title,
+      doneWhen: `Complete the existing manager assignment ${task.id}; retain its original outcome.`,
+      ownerSessionId: record.id, status: (['completed', 'done', 'abandoned'].includes(task.status) ? 'completed'
+        : task.status === 'in_progress' ? 'in_progress' : 'pending') as import('./workPlan.js').WorkStatus }))
+    record.workPlan = { id: `legacy:${record.id}`, revision: 1, inputSeq: 0,
+      createdAt: tasks[0]!.createdAt, status: steps.every(s => s.status === 'completed') ? 'completed' : 'active', steps }
+    this.persist(record)
+    this.journal.append(record.id, 'session/work-plan', record.workPlan)
+  }
+
+  private workPlanInstructions(sessionId: string): string {
+    let checkpoint: unknown
+    try { checkpoint = this.workPlans.read(sessionId) } catch (e) { checkpoint = { hold: (e as Error).message } }
+    const encoded = JSON.stringify(checkpoint)
+    return 'Task-first execution is ON. Before doing work, use task_plan to record a small list of outcomes and done_when criteria from the operator request, with dedicated existing owners for independent work. Read-only questions/status need no invented project. Read the durable plan after compaction; native checklists are reports, not new authority. Start one assigned task, do only its implementation and necessary verification, record evidence, finish and stop. Do not add audits, reviews, documentation or new outcomes without a fresh operator request. Task assignment does not grant tools, repositories, devices or approval authority. Completed work is closed to further app dispatch. Native-provider coverage is not a universal sandbox.\nCurrent task checkpoint: ' + (encoded.length <= 7000 ? encoded : 'Task list exceeds the prompt budget. Use task_plan read for the exact complete list; do not reconstruct it from a partial snapshot.')
+  }
+
+  private async changeWorkPlan(sessionId: string, input: WorkPlanInput) {
+    const previous = new Map<string, boolean>()
+    if (input.operation !== 'read') {
+      try {
+        const current = this.workPlans.read(sessionId)
+        for (const id of new Set([sessionId, ...(current.plan?.steps.map(s => s.ownerSessionId) ?? [])])) previous.set(id, this.workPlans.closed(id))
+      } catch (error) {
+        if (input.operation !== 'create') throw error
+        // WorkPlans still checks fresh direct input; a revoked old manager cannot trap an operator's worker.
+      }
+    }
+    const ids = new Set([sessionId, this.sessions.get(sessionId)?.workBinding?.sessionId,
+      ...previous.keys(), input.ownerSessionId, ...(input.steps?.map(s => s.ownerSessionId) ?? [])].filter((id): id is string => !!id))
+    const saved = [...ids].map(id => ({ id, plan: structuredClone(this.sessions.get(id)?.workPlan), binding: structuredClone(this.sessions.get(id)?.workBinding) }))
+    let result: ReturnType<WorkPlans['read']>
+    try { result = this.journal.atomic(() => this.workPlans.change(sessionId, input)) }
+    catch (error) {
+      // Roll the in-memory ledger back with SQLite: a failed audit must not leave an unaudited grant.
+      for (const s of saved) {
+        const r = this.sessions.get(s.id)
+        if (r) { r.workPlan = s.plan; r.workBinding = s.binding }
+      }
+      throw error
+    }
+    const warnings: string[] = []
+    for (const [id, wasClosed] of previous) if (!wasClosed && this.workPlans.closed(id) && this.sessions.get(id)?.provider === 'codex') {
+      try {
+        if (!this.executor.pauseAutonomousGoal) throw new Error('executor does not support native goal parking')
+        await this.executor.pauseAutonomousGoal(id)
+      } catch (error) {
+        const warning = `Task work is closed, but native goal pause was not confirmed: ${(error as Error).message}`
+        this.journal.append(id, 'session/work-stop-warning', { warning })
+        warnings.push(warning)
+        this.notifications?.publish({ kind: 'hub-warning', severity: 'warning', sourceRole: 'system', route: 'operator',
+          sessionId: id, projectId: this.sessions.get(id)?.projectId,
+          title: 'Task finished; native stop needs attention',
+          body: 'New app work is held, but the provider goal pause was not confirmed. Check the chat before allowing further work; no external command was replayed or cancelled.',
+          dedupeKey: `work-stop:${id}:${result.plan?.id}:${result.plan?.revision}` })
+      }
+    }
+    return warnings.length ? { ...result, warning: warnings.join('\n') } : result
   }
 
   private taskBoardForSession(sessionId: string): TaskBoard {
@@ -11084,6 +11179,9 @@ export class SessionManager {
     const board = this.taskBoardForSession(childSessionId)
     let taskId = input.taskId
     const lean = assistancePreferences(this.prefs).leanCoordination
+    if (lean && relation.manager.workPlan && !taskId && !operatorAmendment) {
+      return { ok: false, error: 'Use task_plan assign on an existing pending outcome. Creating another legacy assignment must not bypass the locked task list.' }
+    }
     const previous = taskId ? board.tasks.find(task => task.id === taskId) : undefined
     if (taskId) {
       const existing = board.tasks.find((task) => task.id === taskId)
@@ -11127,6 +11225,20 @@ export class SessionManager {
     this.journal.atomic(() => {
       this.journal.append(childSessionId, 'manager/task-assigned', payload)
       this.journal.append(managerSessionId, 'manager/child-task-assigned', payload)
+      const legacy = relation.child.workPlan
+      if (operatorAmendment && legacy?.id === `legacy:${childSessionId}`) {
+        const next = structuredClone(legacy)
+        const task = next.steps.find(step => step.id === taskId)
+        if (task) {
+          task.title = title
+          task.status = status === 'abandoned' ? 'completed' : status
+          next.status = next.steps.every(step => step.status === 'completed') ? 'completed' : 'active'
+          next.revision++
+          this.persist({ ...relation.child, workPlan: next })
+          this.journal.append(childSessionId, 'session/work-plan', next)
+          relation.child.workPlan = next
+        }
+      }
     })
     const newLiveTask = !input.taskId && status !== 'completed' && status !== 'abandoned'
     const pressure = newLiveTask && relation.child.status === 'idle'
@@ -11921,6 +12033,13 @@ export class SessionManager {
     if (record.status === 'idle' && record.deferredOperatorTurns?.length) {
       this.dispatchDeferredOperatorTurn(sessionId)
       return
+    }
+    if (this.workPlans.closed(sessionId)) {
+      // Enforce at the common delivery boundary, for both active steers and idle starts. Keep genuine
+      // approval/help handoffs, but routine mail cannot restart a completed objective after re-attach.
+      const pending = this.bus.pending(sessionId)
+      this.bus.holdWake(pending.filter(message => message.wake && !message.attentionRequired).map(message => message.id))
+      if (!pending.some(message => message.wake && message.attentionRequired)) return
     }
     // operatorTurnSessions is minted immediately before the executor handoff, while the provider's
     // turnStarted lifecycle can arrive later. Do not let system mail exploit that short idle-looking
