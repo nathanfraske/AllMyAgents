@@ -4,9 +4,10 @@ import os from 'node:os'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import vm from 'node:vm'
 import test from 'node:test'
+import { testWorkerPool } from './test-worker-budget.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
 const require = createRequire(new URL('../apps/hub/package.json', import.meta.url))
@@ -17,6 +18,40 @@ const read = name => fs.readFileSync(path.join(root, '.github/workflows', name),
 const ci = parse(read('ci.yml'))
 const release = parse(read('release.yml'))
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
+
+test('the reviewed test-worker budget reduces concurrency without raising the normal cap', () => {
+  assert.deepEqual(testWorkerPool({}), { minWorkers: 1, maxWorkers: 4 })
+  for (const value of ['1', '2', '3', '4', '8']) {
+    assert.deepEqual(testWorkerPool({ FLEET_TEST_WORKERS: value }), {
+      minWorkers: 1, maxWorkers: Math.min(4, Number(value)),
+    })
+  }
+})
+
+test('malformed test-worker budgets fail explicitly instead of oversubscribing or omitting tests', () => {
+  for (const value of ['', '0', '-1', '1.5', '1e3', '4workers', ' 1 ', '9007199254740993']) {
+    assert.throws(() => testWorkerPool({ FLEET_TEST_WORKERS: value }), /FLEET_TEST_WORKERS must be a positive integer/)
+  }
+})
+
+test('both real Vitest configs honor the one-worker fleet fixture without CLI overrides', async t => {
+  const previous = process.env.FLEET_TEST_WORKERS
+  t.after(() => {
+    if (previous === undefined) delete process.env.FLEET_TEST_WORKERS
+    else process.env.FLEET_TEST_WORKERS = previous
+  })
+  process.env.FLEET_TEST_WORKERS = '1'
+  const webRequire = createRequire(new URL('../apps/web/package.json', import.meta.url))
+  const { loadConfigFromFile } = await import(pathToFileURL(webRequire.resolve('vite')).href)
+  for (const app of ['hub', 'web']) {
+    const dir = path.join(root, 'apps', app)
+    const loaded = await loadConfigFromFile({ command: 'serve', mode: 'test' }, path.join(dir, 'vitest.config.ts'), dir, 'silent')
+    assert(loaded, `${app}: real config did not load`)
+    assert.equal(loaded.config.test.minWorkers, 1, app)
+    assert.equal(loaded.config.test.maxWorkers, 1, app)
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).scripts.test, 'vitest run', app)
+  }
+})
 
 // Execute these deliberately simple checked-in &&/||/== expressions with the same
 // contexts as GitHub. No input is interpolated into executable source.

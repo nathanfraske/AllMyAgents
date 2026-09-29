@@ -91,6 +91,11 @@ Hosted jobs retain the existing Actions pnpm/Rust caches.
 Windows retains the fleet's reviewed `setup_windows_release.ps1` and
 `resources_job.mjs` resource-budget contract. Cargo's JSON compiler artifact selects
 the exact Windows test executable, including when `CARGO_TARGET_DIR` is external.
+Both project Vitest configs honor `FLEET_TEST_WORKERS`: a positive integer lowers
+the normal four-worker cap, and invalid values fail with an explicit configuration
+error. The ordinary package test commands use those configs; no fleet-only test
+recipe, skipped check, changed deadline or environment-specific test selection is
+introduced. A one-worker budget still runs every test.
 Before a local release build, `node scripts/fleet-build-cache.cjs --prepare-release`
 removes only the checked generated `cargo-target/release/bundle` directory. Compiled
 dependencies stay cached; stale installers cannot enter the new upload.

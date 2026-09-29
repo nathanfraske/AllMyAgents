@@ -1,6 +1,7 @@
 import { svelte } from '@sveltejs/vite-plugin-svelte'
 import { svelteTesting } from '@testing-library/svelte/vite'
 import { defineConfig } from 'vitest/config'
+import { testWorkerPool } from '../../scripts/test-worker-budget.mjs'
 
 // Vitest config for the web app. This is intentionally separate from vite.config.ts:
 // the app config carries the dev server + hub proxy, which the test runner doesn't need.
@@ -15,6 +16,7 @@ import { defineConfig } from 'vitest/config'
 export default defineConfig({
   plugins: [svelte(), svelteTesting()],
   test: {
+    ...testWorkerPool(),
     // jsdom gives us window / localStorage / WebSocket for the browser-facing modules under
     // test, and selects Vitest's web transform mode (required for reactive runes — see above).
     environment: 'jsdom',
