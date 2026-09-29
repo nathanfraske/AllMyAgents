@@ -13,6 +13,8 @@ export interface GitHubAutomationPolicy {
   scope: GitHubAutomationPolicyScope
   targetId: string
   capabilities: GitHubAutomationCapability[]
+  /** Separate resource scope for individual reviewer decisions; never used by auto-approval. */
+  reviewRepositories?: string[]
   updatedAt: string
 }
 
@@ -76,6 +78,7 @@ export class GitHubAutomationPolicyStore {
         PRIMARY KEY (scope, targetId)
       )`,
     )
+    db.exec('CREATE TABLE IF NOT EXISTS github_review_repositories (scope TEXT NOT NULL, targetId TEXT NOT NULL, repositories TEXT NOT NULL, PRIMARY KEY(scope,targetId))')
     this.getStmt = db.prepare(
       'SELECT scope, targetId, capabilities, updatedAt FROM github_automation_policy WHERE scope = ? AND targetId = ?',
     )
@@ -103,27 +106,47 @@ export class GitHubAutomationPolicyStore {
     } catch {
       // Unknown values from a newer or damaged row fail closed instead of being partially honored.
     }
-    return { scope, targetId, capabilities, updatedAt: row.updatedAt }
+    const extra = this.db.prepare('SELECT repositories FROM github_review_repositories WHERE scope=? AND targetId=?').get(scope, targetId) as { repositories: string } | undefined
+    let reviewRepositories: string[] | undefined
+    if (extra) {
+      try { reviewRepositories = normalizeReviewRepositories(JSON.parse(extra.repositories)) }
+      catch { reviewRepositories = [] }
+    }
+    return { scope, targetId, capabilities, updatedAt: row.updatedAt, ...(reviewRepositories ? { reviewRepositories } : {}) }
   }
 
   set(
     scope: GitHubAutomationPolicyScope,
     targetId: string,
     values: readonly unknown[],
+    reviewRepositories?: string[],
   ): GitHubAutomationPolicy {
     if (scope !== 'project' && scope !== 'session') throw new Error('invalid GitHub automation policy scope')
     const normalizedTarget = targetId.trim()
     if (!normalizedTarget || normalizedTarget.length > 256) throw new Error('invalid GitHub automation policy target')
     const capabilities = normalizeGitHubAutomationCapabilities(values)
+    const repositories = reviewRepositories === undefined ? this.get(scope, normalizedTarget).reviewRepositories : normalizeReviewRepositories(reviewRepositories)
+    const previousTimestamp = Date.parse(this.get(scope, normalizedTarget).updatedAt)
     const policy: GitHubAutomationPolicy = {
       scope,
       targetId: normalizedTarget,
       capabilities,
-      updatedAt: new Date().toISOString(),
+      ...(repositories ? { reviewRepositories: repositories } : {}),
+      // A same-millisecond revoke/re-grant must still invalidate an outstanding review digest.
+      updatedAt: new Date(Math.max(Date.now(), Number.isFinite(previousTimestamp) ? previousTimestamp + 1 : 0)).toISOString(),
     }
     this.upsertStmt.run({ ...policy, capabilities: JSON.stringify(capabilities) })
+    if (repositories) this.db.prepare('INSERT INTO github_review_repositories(scope,targetId,repositories) VALUES(?,?,?) ON CONFLICT(scope,targetId) DO UPDATE SET repositories=excluded.repositories')
+      .run(scope, normalizedTarget, JSON.stringify(repositories))
     return policy
   }
+}
+
+export function normalizeReviewRepositories(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > 32 || value.some(v => typeof v !== 'string' || v.length > 256 || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(v) || v.split('/').some(p => p === '.' || p === '..'))) {
+    throw new Error('Review repository grants require at most 32 exact owner/repository names')
+  }
+  return [...new Set((value as string[]).map(v => v.toLowerCase()))]
 }
 
 const PR_OPERATIONS = new Set([

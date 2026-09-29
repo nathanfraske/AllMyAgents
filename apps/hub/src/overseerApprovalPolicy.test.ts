@@ -55,8 +55,16 @@ describe('requester-scoped Overseer approval policy', () => {
     },
   )
 
-  it('rejects high or unknown risk configuration', () => {
-    expect(() => applyOverseerApprovalPolicyUpdate({}, { enabled: true, maxRisk: 'high', requesterSessionIds: ['arnold'] } as never)).toThrow('low/medium')
+  it('allows explicit scoped high ceilings, not unknown risks or legacy global high', () => {
+    expect(applyOverseerApprovalPolicyUpdate({}, { enabled: true, maxRisk: 'high', requesterSessionIds: ['arnold'] }).approvalPolicy?.maxRisk).toBe('high')
+    expect(() => applyOverseerApprovalPolicyUpdate({}, { enabled: true, maxRisk: 'unknown', requesterSessionIds: ['arnold'] } as never)).toThrow('risk ceiling')
     expect(approvalRequesterAllowed({ enabled: true, maxRisk: 'high' } as never, 'arnold')).toBe(false)
+  })
+  it('invalidates old review policy digests on identical and revoke/re-enable configuration', () => {
+    const input = { enabled: true, maxRisk: 'medium' as const, requesterSessionIds: ['arnold'] }
+    const original = applyOverseerApprovalPolicyUpdate({}, input)
+    const revoked = applyOverseerApprovalPolicyUpdate(original, { ...input, enabled: false })
+    const restored = applyOverseerApprovalPolicyUpdate(revoked, input)
+    expect(restored.approvalPolicy?.revision).not.toBe(original.approvalPolicy?.revision)
   })
 })

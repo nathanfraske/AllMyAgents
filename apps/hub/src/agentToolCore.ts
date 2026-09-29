@@ -1,5 +1,8 @@
 import { z } from 'zod'
+import { randomUUID } from 'node:crypto'
+import { agentToolFailure, type ToolAssistanceInput, type ToolAssistanceResult } from './operatorAssistance.js'
 import { approvalFileReviewSchema, type ApprovalFileReview } from './approvalReview.js'
+import { approvalDelegationSchema, type ApprovalDelegation } from './githubApprovalReview.js'
 import { durableRunView } from './durableRunView.js'
 import type { SessionIdentity } from './identity.js'
 import { readableScopes } from './identity.js'
@@ -86,6 +89,7 @@ export interface OverseerControlInput {
   sessionId?: string
   approvalId?: string
   approvalReviewToken?: string
+  approvalReviewOffset?: number
   presetId?: string
   cloneJobId?: string
   name?: string
@@ -99,9 +103,10 @@ export interface OverseerControlInput {
   approve?: boolean
   persist?: ApprovalPersistence
   approvalPolicyEnabled?: boolean
-  approvalRiskCeiling?: 'low' | 'medium'
+  approvalRiskCeiling?: 'low' | 'medium' | 'high'
   approvalRequesterSessionIds?: string[]
   approvalFileReviews?: ApprovalFileReview[]
+  approvalDelegations?: ApprovalDelegation[]
   approvalReviewGuidance?: string
   reauth?: boolean
   provider?: Provider
@@ -133,6 +138,7 @@ export interface OverseerControlInput {
   repository?: string
   githubScope?: GitHubAutomationPolicyScope
   githubCapabilities?: GitHubAutomationCapability[]
+  githubReviewRepositories?: string[]
   distro?: string
   elevationScope?: ElevationScope
   allowedPaths?: string[]
@@ -236,6 +242,9 @@ export interface PracticeServices {
  * how the hub attributes the call to an identity.
  */
 export interface AgentServices {
+  workPlan?(sessionId: string, input: import('./workPlan.js').WorkPlanInput): Awaitable<unknown>
+  workGate?(sessionId: string, tool: string, args: unknown): Awaitable<string | undefined>
+  toolAssistance?(sessionId: string, input: ToolAssistanceInput): Awaitable<ToolAssistanceResult>
   transferFile?(sessionId: string, input: import('./remoteFileTransfers.js').TransferFileInput): Awaitable<unknown>
   /** Publish a bounded workspace output to this exact chat; never a message to another agent. */
   publishArtifact?(sessionId: string, input: PublishArtifactInput): Awaitable<PublishedArtifact>
@@ -327,6 +336,8 @@ export interface AgentServices {
       taskId?: string
       title: string
       status?: 'pending' | 'in_progress' | 'completed' | 'abandoned'
+      expectedRevision?: number
+      changeReason?: string
     },
   ): Awaitable<{ ok: boolean; taskId?: string; warning?: string; error?: string }>
   /** Start one persisted, resource-leased local or granted-remote run. SessionManager derives scope/lineage. */
@@ -453,8 +464,67 @@ export interface AgentToolSpec<Shape extends z.ZodRawShape = z.ZodRawShape> {
 // Helper so the specs below are declared with full per-tool arg typing while `AGENT_TOOLS` stays a
 // homogeneous list the transports can iterate.
 function defineTool<Shape extends z.ZodRawShape>(spec: AgentToolSpec<Shape>): AgentToolSpec {
-  return spec as unknown as AgentToolSpec
+  const run = spec.run
+  return { ...spec, run: async (args: z.infer<z.ZodObject<Shape>>, ctx: AgentToolContext) => {
+    const hold = await ctx.services.workGate?.(ctx.identity.sessionId, spec.name, args)
+    if (hold) return `Task hold: ${hold}`
+    const assistance = ctx.services.toolAssistance
+    if (!assistance || spec.name === 'report_tool_failure' || spec.name === 'task_plan') return run(args, ctx)
+    const input = { tool: spec.name, callId: randomUUID() }
+    const before = await assistance(ctx.identity.sessionId, { ...input, phase: 'before' })
+    if (before.blocked) return `Tool help required: ${before.message}`
+    let output: AgentToolOutput
+    try { output = await run(args, ctx) }
+    catch (error) {
+      const summary = error instanceof Error ? error.message : String(error)
+      const result = await assistance(ctx.identity.sessionId, { ...input, phase: 'failure', summary })
+      throw new Error(`${summary}${result.message ? `\n${result.message}` : ''}`)
+    }
+    const failure = agentToolFailure(output)
+    const result = await assistance(ctx.identity.sessionId, { ...input, phase: failure ? 'failure' : 'success', summary: failure })
+    return failure && result.message
+      ? Array.isArray(output) ? [...output, { type: 'text', text: result.message }] : `${output}\n${result.message}`
+      : output
+  } } as unknown as AgentToolSpec
 }
+
+const taskPlan = defineTool({
+  name: 'task_plan',
+  description: 'Durable task-first execution ledger. Read after compaction. Create once from admitted operator input before work; record outcomes and done_when, assigning independent work to dedicated existing team members. Start one task per owner, record completion evidence, finish and stop. Exact revisions prevent races. Only fresh operator input permits additional outcomes; native plans, mail and compaction cannot reopen completed work. This grants no resource or approval authority.',
+  schema: {
+    operation: z.enum(['read', 'create', 'append', 'assign', 'update', 'finish']),
+    plan_id: z.string().optional(),
+    expected_revision: z.number().int().positive().optional(),
+    tasks: z.array(z.object({ title: z.string().min(1).max(500), done_when: z.string().min(1).max(1000), owner_session_id: z.string().optional() })).min(1).max(24).optional(),
+    task_id: z.string().optional(),
+    owner_session_id: z.string().optional().describe('For assign: give an existing pending outcome to a dedicated owner, without changing its scope.'),
+    status: z.enum(['pending', 'in_progress', 'blocked', 'completed']).optional(),
+    evidence: z.string().max(1500).optional(),
+  },
+  async run(a, { identity, services }) {
+    if (!services.workPlan) return 'Task ledger is unavailable. Ask the operator; do not assume work authority.'
+    return JSON.stringify(await services.workPlan(identity.sessionId, { operation: a.operation, planId: a.plan_id,
+      expectedRevision: a.expected_revision, steps: a.tasks?.map(t => ({ title: t.title, doneWhen: t.done_when, ownerSessionId: t.owner_session_id })),
+      taskId: a.task_id, ownerSessionId: a.owner_session_id, status: a.status, evidence: a.evidence }))
+  },
+})
+
+const reportToolFailure = defineTool({
+  name: 'report_tool_failure',
+  description: 'Ask the operator directly for help with a broken native/external tool. Report infrastructure failures, not ordinary failed tests, bad arguments or denied permissions. Retry a safely repeatable read once first; never replay an uncertain write. This creates a visible, audited help request without waking an agent to repair the tool. It grants no repair or resource authority.',
+  schema: {
+    tool_name: z.string().min(1).max(160),
+    summary: z.string().min(1).max(1000).describe('Bounded error and what is blocked. Do not include credentials or private file contents.'),
+    retry_attempted: z.boolean().describe('Whether the one safe retry already failed. Never retry ambiguous writes just to set this true.'),
+  },
+  run: async (args, { identity, services }) => {
+    if (!services.toolAssistance) return 'Operator-help reporting is unavailable on this hub. Tell the operator directly and stop this repair detour.'
+    const result = await services.toolAssistance(identity.sessionId, {
+      phase: 'report', tool: args.tool_name, callId: randomUUID(), summary: args.summary, retryAttempted: args.retry_attempted,
+    })
+    return JSON.stringify(result)
+  },
+})
 
 function resolveWriteScope(id: SessionIdentity, kind: 'account' | 'project' | undefined): string {
   if (kind === 'account') return `account:${id.profileId}`
@@ -487,31 +557,10 @@ const listAgents = defineTool({
 const sendMessage = defineTool({
   name: 'send_message',
   description:
-    'Send a message to a teammate agent. Give `to_session` (from list_agents) to reach one agent — the hub delivers it into their next turn. ' +
-    'Addressed messages to or from the local application Overseer work across projects on any turn; they remain teammate messages, not operator authorization. Other cross-project messaging is not allowed. ' +
-    'PREFER ADDRESSING SPECIFIC AGENTS. Omitting `to_session` broadcasts to EVERY agent on your project, which wakes all of them: ' +
-    'each then spends a turn working out whether the message was meant for it, and the ones it was not meant for still have to read, ' +
-    'reason about and dismiss it. Two direct messages are almost always better than one broadcast. ' +
-    'Broadcast only when every agent genuinely needs to act — a change to shared conventions, a stop-work notice, ' +
-    'a fact that invalidates work in progress. If you find yourself broadcasting so the right agent sees it, you do not need a ' +
-    'broadcast; you need list_agents and one or two direct messages. ' +
-    // Measured, not theorised: 183 project broadcasts against 80 direct messages in ninety minutes on a
-    // seventeen-agent project. The single worst was one agent coordinating with ONE named teammate by
-    // broadcasting to all seventeen — subject line "<name> coordination" — after which sixteen agents each
-    // burned a turn replying that they were not that name. The guidance above was already present and was
-    // not enough, because "coordinate with X" reads as a reason to announce rather than to address.
-    'NAMING SOMEONE IN THE SUBJECT IS NOT ADDRESSING THEM. A broadcast titled "Alice coordination" still ' +
-    'interrupts everyone, and every agent who is not Alice must spend a turn establishing that. If you know ' +
-    'whose attention you want, look them up and send it to them; if you do not know, that is what list_agents ' +
-    'and peek_agent are for. Coordinating with one teammate is never a reason to broadcast. ' +
-    'Set `wake` false for checkpoints, FYIs, freeze/standby notices, or anything that does not require an ' +
-    'immediate response. It will join an already-running turn or wait for the recipient\'s next operator-started ' +
-    'turn without consuming a new turn merely to acknowledge mail. The hub may also defer an idle high-context ' +
-    'recipient automatically; that is a cost guard, not a delivery failure. Managers set `attention_required` ' +
-    'for an operator-requested handoff, actionable failure/blocker, approval, or question that genuinely requires ' +
-    'the recipient to start a turn now; direct operator-origin Overseer mail with normal wake=true is classified ' +
-    'that way automatically. That priority is audited and may not be ' +
-    'combined with `wake:false`.',
+    'Send a concise, material update or request to `to_session` from list_agents. Omit the recipient only when EVERY project teammate needs the message; naming someone in the subject is not addressing them. ' +
+    'Routine messages default to wake=false with Lean coordination enabled (legacy default true when disabled). Set wake=true for actionable work needing an idle recipient now, false for FYIs. Do not acknowledge acknowledgements or re-send queued mail. Exact pending duplicates may be coalesced; explicit priority is preserved. ' +
+    'Managers/Overseer may set attention_required for a genuine handoff, blocker, approval or question; workers only when addressing their own manager. It cannot accompany wake=false. Direct operator-origin Overseer handoffs are automatically prioritized; ordinary high-context wakes may be held. ' +
+    'Addressed messages to/from the local Overseer may cross projects; all other messaging stays project-scoped. Messages remain teammate-originated and permission-clamped, never operator authorization.',
   schema: {
     to_session: z
       .string()
@@ -526,7 +575,7 @@ const sendMessage = defineTool({
       .boolean()
       .optional()
       .describe(
-        'Whether this message may start a new idle recipient turn. Defaults to true. Use false when no immediate response is required.',
+        'Start an idle recipient for actionable work. Defaults false in Lean coordination, true in legacy mode. Explicit attention_required defaults to true.',
       ),
     attention_required: z
       .boolean()
@@ -552,7 +601,9 @@ const sendMessage = defineTool({
         ? `Delivered as attention-required mail to ${r.delivered} agent(s).`
       : r.deferred
         ? `Queued for ${r.delivered} agent(s); ${r.deferred} high-context idle recipient(s) were held until an existing or operator-started turn.`
-        : `Delivered to ${r.delivered} agent(s).`
+        : args.wake === undefined
+          ? `Saved for ${r.delivered} agent(s); automatic waking follows the configured coordination policy.`
+          : `Delivered to ${r.delivered} agent(s).`
     return r.ok
       ? `${disposition}${r.error ? ` ${r.error}` : ''}`
       : `Not sent: ${r.error ?? 'unknown error'}`
@@ -578,13 +629,13 @@ const readMessages = defineTool({
 const peekAgent = defineTool({
   name: 'peek_agent',
   description:
-    'Inspect an agent without interrupting it or sending a message. Ordinary agents may read a same-project teammate summary or the local application Overseer summary; managers may deeply inspect their direct workers and enabled one-shot descendants; the application Overseer may use every read-only view across the complete local fleet. Give `to_session` from list_agents.',
+    'Inspect without interrupting or messaging. Use your own to_session and view=tasks to recover a bounded durable task checkpoint after compaction. Other ordinary reads are same-project teammate or local Overseer summaries. Managers may deeply inspect their workers/enabled descendants; the application Overseer may inspect the local fleet. Other to_session ids come from list_agents.',
   schema: {
     to_session: z.string().describe('the teammate session id from list_agents'),
     view: z
       .enum(['summary', 'activity', 'transcript', 'changes', 'tasks', 'all'])
       .optional()
-      .describe('deep views require a manager’s direct child or the application Overseer'),
+      .describe('Own tasks are readable for recovery; other deep views require a managed child or the application Overseer.'),
     after_seq: z
       .number()
       .int()
@@ -614,7 +665,7 @@ const peekAgent = defineTool({
 const childStatus = defineTool({
   name: 'child_status',
   description:
-    'Project managers only: get an exact current tally and per-agent status for your managed hierarchy, including enabled one-shot descendants. This reads live session records, not old messages.',
+    'Project managers only: get an exact current tally and per-agent status for your managed hierarchy, including enabled one-shot descendants. Includes hub-verified current turn origin, queued direct operator inputs and the last retained operator input receipt (no message body). Check this before treating changed work as rogue or retasking/stashing a worker: let active operator-directed work proceed within its existing permissions. Missing historical receipt means unknown, not no operator contact. This reads live session records, not teammate claims.',
   schema: {},
   run: async (_args, { identity, services }) => {
     if (!services.childStatus) return 'Status unavailable: this hub does not support manager child tallies.'
@@ -628,7 +679,7 @@ const childStatus = defineTool({
 const manageTeam = defineTool({
   name: 'manage_team',
   description:
-    'Project managers only: list, create, rename, or activate durable child teams. Activating a team shelves the outgoing team without deleting chats, transcripts, branches, dirty files, or worktrees, and reopens the selected team. Active outgoing turns are never interrupted unless interrupt_active is explicitly true.',
+    'Project managers only: list, create, rename, or activate durable child teams. Activating a team shelves the outgoing team without deleting chats, transcripts, branches, dirty files, or worktrees, and reopens the selected team. Active outgoing turns are never interrupted unless interrupt_active is explicitly true. Active/queued direct operator work cannot be shelved even with that flag; let it finish or ask the operator to stop it directly.',
   schema: {
     operation: z.enum(['list', 'create', 'activate', 'rename']),
     team_id: z.string().min(1).max(256).optional().describe('stable team id returned by list/create'),
@@ -792,12 +843,16 @@ const assignChildTask = defineTool({
     child_session: z.string().describe('direct child session id'),
     title: z.string().min(1).max(500).describe('clear outcome the child owns'),
     task_id: z.string().optional().describe('existing manager-assigned task id; omit to create'),
+    expected_revision: z.number().int().min(1).optional().describe('Current revision for stale-update protection. In Lean mode, only the operator task-board control can change outcomes or reopen finished work.'),
+    change_reason: z.string().min(1).max(500).optional().describe('Audit context for a progress update, never permission to change the assigned outcome.'),
     status: z.enum(['pending', 'in_progress', 'completed', 'abandoned']).optional(),
   },
   run: async (args, { identity, services }) => {
     if (!services.assignChildTask) return 'Not assigned: this hub does not support manager task assignment.'
     const result = await services.assignChildTask(identity.sessionId, args.child_session, {
       taskId: args.task_id,
+      expectedRevision: args.expected_revision,
+      changeReason: args.change_reason,
       title: args.title,
       status: args.status,
     })
@@ -1750,6 +1805,7 @@ const overseerControl = defineTool({
     session_id: z.string().max(256).optional(),
     approval_id: z.string().max(256).optional(),
     approval_review_token: z.string().max(128).optional().describe('Scoped alert decision: token from inspect_approval for the exact pending invocation; expires after five minutes. Supply reason and explicit approve boolean.'),
+    approval_review_offset: z.number().int().nonnegative().optional().describe('inspect_approval: exact nextOffset from prior evidence page. Read every page; only the final page issues a decision token.'),
     preset_id: z.string().max(256).optional(),
     clone_job_id: z.string().max(256).optional(),
     name: z.string().max(200).optional(),
@@ -1766,13 +1822,15 @@ const overseerControl = defineTool({
       .optional()
       .describe('approve only: explicitly persist a Codex connector elicitation for this vendor session or always; omitted means one-shot'),
     approval_policy_enabled: z.boolean().optional(),
-    approval_risk_ceiling: z.enum(['low', 'medium']).optional(),
+    approval_risk_ceiling: z.enum(['low', 'medium', 'high']).optional(),
     approval_requester_session_ids: z.array(z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/u)).max(32).optional()
       .describe('configure_approval_policy: exact requester session allowlist, required on first enable; [] delegates nobody. Omission preserves an existing scoped list. No wildcard/global enable. Does not grant tools, repositories or devices.'),
     approval_file_reviews: z.array(approvalFileReviewSchema).max(16).optional()
       .describe('Direct operator configuration only: exact previously reviewed no-execution/no-credential/repository-only file changes, expiring within 24h. No arbitrary workflow execution. [] revokes file contracts; omitted preserves them. These never auto-approve.'),
+    approval_delegations: z.array(approvalDelegationSchema).max(32).optional()
+      .describe('Operator-only review authority: explicit requester/project/repository/branch/category/risk/effects. [] revokes. Never a resource grant or automatic approval. High-risk execution requires explicit high ceiling plus all disclosed effects. Unknown semantics/platform/self limits cannot be delegated.'),
     approval_review_guidance: z.string().max(4000).optional()
-      .describe('configure_approval_policy on a direct operator turn only: record the operator’s explicit review precedents. Empty clears; omitted preserves. Advisory within exact requester/risk/tool/repo/device ceilings, never permission to approve unknown or high-risk actions.'),
+      .describe('configure_approval_policy on a direct operator turn only: advisory review precedents, not authority. Empty clears; omitted preserves. Unknown/platform/self limits remain enforced.'),
     reauth: z.boolean().optional(),
     provider: z.enum(['claude', 'codex']).optional(),
     permission_mode: overseerPermissionMode.optional(),
@@ -1789,6 +1847,8 @@ const overseerControl = defineTool({
     github_capabilities: z.array(z.enum([
       'pull_requests', 'pull_request_merges', 'workflow_runs', 'repository_pushes',
     ])).max(4).optional(),
+    github_review_repositories: z.array(z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u)).max(32).optional()
+      .describe('Separate operator resource grant for individual GitHub review ONLY. Additional exact repositories; [] revokes, omitted preserves. Does not widen auto-approval/CLI/monitoring, grant capabilities, or activate reviewer delegation.'),
     distro: z.string().max(256).optional(),
     elevation_scope: z.enum(['disabled', 'project', 'machine']).optional(),
     allowed_paths: z.array(z.string().min(1).max(4096)).max(15).optional(),
@@ -1818,6 +1878,7 @@ const overseerControl = defineTool({
       sessionId: args.session_id,
       approvalId: args.approval_id,
       approvalReviewToken: args.approval_review_token,
+      approvalReviewOffset: args.approval_review_offset,
       presetId: args.preset_id,
       cloneJobId: args.clone_job_id,
       name: args.name,
@@ -1834,6 +1895,7 @@ const overseerControl = defineTool({
       approvalRiskCeiling: args.approval_risk_ceiling,
       approvalRequesterSessionIds: args.approval_requester_session_ids,
       approvalFileReviews: args.approval_file_reviews,
+      approvalDelegations: args.approval_delegations,
       approvalReviewGuidance: args.approval_review_guidance,
       reauth: args.reauth,
       provider: args.provider,
@@ -1845,6 +1907,7 @@ const overseerControl = defineTool({
       repository: args.repository,
       githubScope: args.github_scope,
       githubCapabilities: args.github_capabilities,
+      githubReviewRepositories: args.github_review_repositories,
       distro: args.distro,
       elevationScope: args.elevation_scope,
       allowedPaths: args.allowed_paths,
@@ -1873,6 +1936,8 @@ const overseerControl = defineTool({
  * stdio MCP server so the two providers get identical tools + semantics.
  */
 export const AGENT_TOOLS: readonly AgentToolSpec[] = [
+  taskPlan,
+  reportToolFailure,
   listAgents,
   sendMessage,
   readMessages,

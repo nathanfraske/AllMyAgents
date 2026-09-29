@@ -58,6 +58,7 @@ import { MemoryStore } from './memory.js'
 import { PracticeStore } from './practices.js'
 import { BrowserBroker } from './browserBroker.js'
 import { NotificationService } from './notifications.js'
+import { assistancePreferences } from './operatorAssistance.js'
 import { InProcessExecutor, type Executor } from './executor.js'
 import { WorkerExecutor } from './workerExecutor.js'
 import { WorkerClient } from './workerTransport.js'
@@ -556,6 +557,7 @@ const danger: DangerFlags = {
 // config.json holding nonsense (or the removed men-only value) by falling back to the default.
 const persistedUiPreferences = asUiPreferences(config.prefs?.ui)
 const prefs: HubPrefs = {
+  ...assistancePreferences(config.prefs ?? {}),
   chatNamePool: asChatNamePool(config.prefs?.chatNamePool),
   // Opt-out so configs written before the preference existed get the operator-requested default ON.
   steerMessagesAtToolBoundary: config.prefs?.steerMessagesAtToolBoundary !== false,

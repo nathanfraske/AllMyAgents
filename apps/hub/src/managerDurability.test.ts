@@ -219,6 +219,8 @@ describe('project-manager durability and honest isolation', () => {
       managerAllowedProfiles: ['p1'],
     })
 
+    manager.workPlan = { id: 'fixture:spawn', inputSeq: 1, revision: 1, createdAt: new Date().toISOString(), status: 'active',
+      steps: [{ id: 'spawn', title: 'Delegate requested implementation', doneWhen: 'Honest isolation receipt', ownerSessionId: manager.id, status: 'in_progress' }] }
     const response = await sessions.execAgentTool('p1', manager.cwd, 'spawn_agent', {
       profile_id: 'p1',
       role: 'Plain-project implementation worker',

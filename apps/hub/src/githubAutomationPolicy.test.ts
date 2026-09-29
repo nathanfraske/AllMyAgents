@@ -10,6 +10,18 @@ afterEach(() => {
   while (databases.length) databases.pop()?.close()
 })
 describe('GitHubAutomationPolicyStore', () => {
+  it('stores separate explicit review repositories, preserves omission, revokes empty, fails closed on damaged rows', () => {
+    const db = new Database(':memory:'); databases.push(db)
+    const store = new GitHubAutomationPolicyStore(db)
+    store.set('session', 'arnold', ['repository_pushes'], ['Acme/Widget'])
+    expect(new GitHubAutomationPolicyStore(db).get('session', 'arnold').reviewRepositories).toEqual(['acme/widget'])
+    expect(store.set('session', 'arnold', []).reviewRepositories).toEqual(['acme/widget'])
+    expect(store.get('session', 'other').reviewRepositories).toBeUndefined()
+    expect(() => store.set('session', 'arnold', [], ['*'])).toThrow('exact')
+    expect(store.set('session', 'arnold', [], []).reviewRepositories).toEqual([])
+    db.prepare('UPDATE github_review_repositories SET repositories=?').run('["*"]')
+    expect(store.get('session', 'arnold').reviewRepositories).toEqual([])
+  })
   it('survives reconstruction and revokes with an explicit empty capability list', () => {
     const db = new Database(':memory:')
     databases.push(db)

@@ -1,9 +1,30 @@
 // Plain-TS port of t3code's model/option-descriptor contract (no Effect).
-// Codex models + params are from the live `codex app-server` model/list (Codex 0.153.3).
-import type { ProfileModelInfo } from './api'
+// Codex models + params are from the live `codex app-server` model/list (Codex 0.156.1).
+import type { ProfileModelInfo, CyberAccessProgram } from './api'
 import { isRecentlyReleased, modelReleaseDate } from './modelReleaseDates'
 
 export type Provider = 'claude' | 'codex'
+
+export function daybreakAliasProgram(slug?: string): CyberAccessProgram | undefined {
+  if (slug === 'gpt-daybreak-blue-latest') return 'daybreakBlue'
+  if (slug === 'gpt-daybreak-red-latest') return 'daybreakRed'
+  return undefined
+}
+
+/** Only the selected account's metadata (or older aliases) exposes this; never the fallback catalog. */
+export function daybreakPrograms(provider: Provider, models?: readonly ProfileModelInfo[]): CyberAccessProgram[] {
+  if (provider !== 'codex') return []
+  return [...new Set((models ?? []).flatMap(m => m.cyberAccessPrograms ?? daybreakAliasProgram(m.slug) ?? []))]
+    .filter(program => program !== 'standard')
+}
+
+/** Unknown legacy metadata is left to Codex; explicit exclusions are never overridden by an alias. */
+export function modelSupportsProgram(model: ProfileModelInfo | undefined, program: CyberAccessProgram): boolean {
+  if (!model) return false
+  if (model.cyberAccessPrograms !== undefined) return model.cyberAccessPrograms.includes(program)
+  const alias = daybreakAliasProgram(model.slug)
+  return !alias || alias === program
+}
 
 export interface OptionChoice {
   value: string
@@ -89,7 +110,6 @@ export const MODELS: ModelDef[] = [
   { slug: 'gpt-5.5', name: 'GPT-5.5', shortName: '5.5', provider: 'codex', descriptors: [effort(BASE_EFFORT, 'medium'), SPEED] },
   { slug: 'gpt-5.4', name: 'GPT-5.4', shortName: '5.4', provider: 'codex', descriptors: [effort(BASE_EFFORT, 'medium'), SPEED] },
   { slug: 'gpt-5.4-mini', name: 'GPT-5.4 Mini', shortName: '5.4 Mini', provider: 'codex', descriptors: [effort(BASE_EFFORT, 'medium')] },
-  { slug: 'gpt-5.3-codex-spark', name: 'GPT-5.3 Codex Spark', shortName: '5.3 Codex Spark', provider: 'codex', descriptors: [effort(BASE_EFFORT, 'high')] },
 ]
 
 // Rollout-gated models deliberately do not live in MODELS: that array is the fallback shown when a
@@ -97,6 +117,8 @@ export const MODELS: ModelDef[] = [
 // This metadata is applied only after the account's own model/list cache advertises the exact slug.
 const ACCOUNT_SCOPED_CODEX_MODEL_METADATA: ModelDef[] = [
   { slug: 'gpt-6-astra', name: 'GPT-6 Astra', shortName: '6 Astra', provider: 'codex', descriptors: [effort(FULL_EFFORT, 'medium'), SPEED] },
+  { slug: 'gpt-6-sol', name: 'GPT-6 Sol', shortName: '6 Sol', provider: 'codex', descriptors: [] },
+  { slug: 'gpt-6-luna', name: 'GPT-6 Luna', shortName: '6 Luna', provider: 'codex', descriptors: [] },
 ]
 
 function accountModel(model: ProfileModelInfo, provider: Provider, now = Date.now()): ModelDef {

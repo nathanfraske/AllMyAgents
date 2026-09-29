@@ -14,6 +14,8 @@ function errText(err: unknown): string {
  *  first result instead of writing a second row (§8.2). Reads are naturally idempotent, so they are not
  *  cached (a re-flushed read just re-runs and returns fresh data). Exactly the doc's list. */
 const WRITE_RELAY_METHODS = new Set<RelayMethod>([
+  'tasks.plan',
+  'tools.assistance',
   'memory.write',
   'practices.write',
   'bus.send',

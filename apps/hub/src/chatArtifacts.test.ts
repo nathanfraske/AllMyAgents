@@ -163,7 +163,12 @@ describe('chat artifact publication', () => {
 
   it.each(['codex', 'claude'] as const)('exposes the same explicit display tool to %s, including worker relay', async provider => {
     const h = fixture()
-    const relayRpc = vi.fn(async (_method, args) => h.artifacts.publish(h.workspace, args.input))
+    const relayRpc = vi.fn(async (method, args) => {
+      if (method === 'tasks.gate') return undefined
+      if (method === 'tools.assistance') return { blocked: false }
+      if (method === 'artifact.publish') return h.artifacts.publish(h.workspace, args.input)
+      throw new Error(`Unexpected relay: ${method}`)
+    })
     const services = buildWorkerAgentServices({ relayRpc, relayApproval: async () => false, isBusTurn: () => true, danger: () => ({ busCanUseRiskyTools: false, autoApprovePractices: false }), journal: () => {} })
     const result = JSON.parse(String(await runAgentTool('publish_artifact', { path: 'render.png', sessionId: 'forged' }, { identity: { sessionId: h.workspace.id, provider, profileId: 'p', label: 'agent' }, services })))
     expect(result.displayed).toBe(true)
@@ -172,7 +177,12 @@ describe('chat artifact publication', () => {
   })
 
   it('relays artifact storage actions with the authenticated chat identity, not a caller-supplied id', async () => {
-    const relayRpc = vi.fn(async () => ({ usage: { files: 0, bytes: 0 } }))
+    const relayRpc = vi.fn(async (method) => {
+      if (method === 'tasks.gate') return undefined
+      if (method === 'tools.assistance') return { blocked: false }
+      if (method === 'artifact.manage') return { usage: { files: 0, bytes: 0 } }
+      throw new Error(`Unexpected relay: ${method}`)
+    })
     const services = buildWorkerAgentServices({ relayRpc, relayApproval: async () => false, isBusTurn: () => true, danger: () => ({ busCanUseRiskyTools: false, autoApprovePractices: false }), journal: () => {} })
     await runAgentTool('manage_artifacts', { operation: 'list', sessionId: 'forged' }, { identity: { sessionId: 'own', provider: 'codex', profileId: 'p', label: 'agent' }, services })
     expect(relayRpc).toHaveBeenCalledWith('artifact.manage', { sessionId: 'own', input: { operation: 'list' } })

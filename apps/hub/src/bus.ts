@@ -163,6 +163,14 @@ export class AgentBus {
     }))
   }
 
+  pendingDuplicate(fromSession: string, recipient: string, subject: string | undefined, body: string, wake: boolean): boolean {
+    // Only byte-identical still-undelivered agent mail. Changed evidence, delivered messages and
+    // priority/control-plane events are never suppressed. The pending partial index bounds this query.
+    return !!this.db.prepare(`SELECT 1 FROM bus_messages WHERE toSession = ? AND delivered = 0
+      AND fromSession = ? AND subject IS ? AND body = ? AND wake = ? AND attentionRequired = 0 LIMIT 1`)
+      .get(recipient, fromSession, subject ?? null, body, wake ? 1 : 0)
+  }
+
   /** Fan a message out to a resolved set of recipient session ids. Returns the stored messages. */
   post(input: {
     from: SessionIdentity

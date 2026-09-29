@@ -7,9 +7,15 @@ import os from 'node:os'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { pathToFileURL } from 'node:url'
+import { mock } from 'node:test'
 
 if (process.platform !== 'linux') throw new Error('Run the installed Linux qualification on Linux')
-const packageFile = path.resolve(process.argv[2])
+const [input, ...flags] = process.argv.slice(2)
+// Retain --short as a compatibility alias, not a reduced-checks mode. All runners use the default.
+if (!input || input.startsWith('-') || flags.length > 1 || flags.some(flag => flag !== '--short')) {
+  throw new Error('Usage: node scripts/test-linux-testbed.mjs <package.deb> [--short (deprecated no-op)]')
+}
+const packageFile = path.resolve(input)
 const work = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-linux-package-'))
 try {
   execFileSync('dpkg-deb', ['--extract', packageFile, work])
@@ -71,28 +77,46 @@ try {
   assert.equal(downloaded.digest('hex'), digest)
   console.log(JSON.stringify({ qualification: 'installed-package-file-transfer', bytes: bytes.length, sha256: digest,
     upload: true, download: true, ownerBound: true, noOverwrite: true, noReplay: true, retainedReceipt: true }))
-  // More than the former 120-second interactive limit, with no execution deadline.
-  // Short mode is for iterative packaging checks; CI/release always uses the full interval.
-  const seconds = process.argv.includes('--short') ? 1 : 125
-  const jobId = crypto.randomUUID()
-  const actor = { durableRunId: jobId }
-  const action = { op: 'exec_start', rootId: caps.roots[0].id, jobId,
-    command: `sleep ${seconds}; printf 'linux packaged node OK'`, timeoutMs: 0 }
-  assert.equal((await executor.execute(action, actor)).jobState, 'running')
-  assert.equal((await executor.execute(action, actor)).ok, false) // No duplicate start.
-  let result
-  const deadline = Date.now() + (seconds + 20) * 1000
-  do {
-    await new Promise(resolve => setTimeout(resolve, 250))
-    result = await executor.execute({ op: 'exec_status', rootId: action.rootId, jobId }, actor)
-    if (Date.now() > deadline) throw new Error('Packaged command did not complete')
-  } while (result.jobState === 'running')
-  assert.equal(result.ok, true)
-  assert.equal(result.stdout, 'linux packaged node OK')
-  assert.equal(result.timedOut, false)
-  assert.ok(result.telemetry.targetMs >= seconds * 1000, 'Retained duration must measure the command, not the last status query')
-  console.log(JSON.stringify({ packageFile, platform: caps.platform, arch: caps.arch, seconds,
-    unlimited: true, exactOnce: true, targetMs: result.telemetry.targetMs, exitCode: result.exitCode }))
+  // Keep the installed-executor regression past the former 120-second limit, without making every
+  // hosted/fleet/release job sleep 125 seconds. Only the executor's JS deadline timers are advanced;
+  // the child, polling, Date and performance clock remain real. The finite-deadline positive control
+  // proves the packaged timer/kill path fires; ignored deadlines must not produce a green result.
+  const seconds = 1
+  const simulatedDeadlineMs = 125_000
+  for (const timeoutMs of [0, 120_000]) {
+    const jobId = crypto.randomUUID()
+    const actor = { durableRunId: jobId }
+    const action = { op: 'exec_start', rootId: caps.roots[0].id, jobId,
+      command: `sleep ${seconds}; printf 'linux packaged node OK'`, timeoutMs }
+    mock.timers.enable({ apis: ['setTimeout'] })
+    try {
+      assert.equal((await executor.execute(action, actor)).jobState, 'running')
+      assert.equal((await executor.execute(action, actor)).ok, false) // No duplicate start.
+      mock.timers.tick(simulatedDeadlineMs)
+    } finally {
+      mock.timers.reset() // Poll/telemetry assertions below must use real time, even on failure.
+    }
+    let result
+    const deadline = Date.now() + (seconds + 20) * 1000
+    do {
+      await new Promise(resolve => setTimeout(resolve, 250))
+      result = await executor.execute({ op: 'exec_status', rootId: action.rootId, jobId }, actor)
+      if (Date.now() > deadline) throw new Error('Packaged command did not complete')
+    } while (result.jobState === 'running')
+    assert.equal(result.jobState, 'completed')
+    assert.equal(result.ok, timeoutMs === 0)
+    assert.equal(result.timedOut, timeoutMs !== 0)
+    if (timeoutMs === 0) {
+      assert.equal(result.stdout, 'linux packaged node OK')
+      assert.equal(result.exitCode, 0)
+      assert.ok(result.telemetry.targetMs >= seconds * 1000, 'Retained duration must measure the command, not the last status query')
+    } else {
+      assert.match(result.error, /command timed out after 120000ms/)
+    }
+    console.log(JSON.stringify({ packageFile, platform: caps.platform, arch: caps.arch, seconds,
+      simulatedDeadlineMs, timeoutMs, unlimited: timeoutMs === 0, timedOut: result.timedOut,
+      exactOnce: true, targetMs: result.telemetry.targetMs, exitCode: result.exitCode }))
+  }
 } finally {
   fs.rmSync(work, { recursive: true, force: true })
 }

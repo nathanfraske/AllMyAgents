@@ -1,4 +1,5 @@
 import type { ChatNamePool } from './title.js'
+import type { CyberAccessProgram } from './daybreak.js'
 
 export type Provider = 'claude' | 'codex'
 
@@ -10,6 +11,8 @@ export interface ProfileAvailableModel {
   supportedEfforts: string[]
   defaultEffort?: string
   serviceTiers: Array<{ id: string; name: string }>
+  /** Caller-specific explicit programs; missing means older/unknown metadata, [] means none. */
+  cyberAccessPrograms?: CyberAccessProgram[]
   isDefault?: boolean
   /** Provider release date, when supplied; never the local discovery/cache timestamp. */
   releasedAt?: string
@@ -178,6 +181,7 @@ export interface DeferredOperatorTurn {
     model?: string
     effort?: string
     serviceTier?: string
+    cyberAccessProgram?: CyberAccessProgram
   }
   queuedAt: string
   state: 'pending' | 'dispatching'
@@ -185,6 +189,10 @@ export interface DeferredOperatorTurn {
 }
 
 export interface SessionRecord {
+  workPlan?: import('./workPlan.js').WorkPlan
+  workBinding?: import('./workPlan.js').WorkBinding
+  toolHelp?: import('./operatorAssistance.js').ToolHelpIncident[]
+  tokenWarning?: import('./operatorAssistance.js').TokenWarningState
   /** One fresh bus wake after a transient Overseer failure; never replay the failed turn. */
   overseerErrorRecovery?: 'ready' | 'attempted' | 'blocked'
   id: string
@@ -221,6 +229,7 @@ export interface SessionRecord {
   model?: string
   effort?: string
   serviceTier?: string
+  cyberAccessProgram?: CyberAccessProgram
   permissionMode?: 'safe' | 'edits' | 'full'
   /** An authenticated, explicit operator choice for this one chat. It bypasses manager ceilings without
    *  silently widening the manager's reusable grant for every other child. */
@@ -237,6 +246,9 @@ export interface SessionRecord {
   remoteDeviceGrants?: RemoteDeviceGrant[]
   /** Operator input accepted mid-turn and waiting for its own non-escalating operator-origin boundary. */
   deferredOperatorTurns?: DeferredOperatorTurn[]
+  /** Hub-only receipt of direct operator input, not a message body or a permission grant. Legacy absent
+   * means no retained receipt, not proof that the operator never spoke to this chat. */
+  lastOperatorInput?: { seq: number; at: string }
   /** App-owned browser capability. Safe default is OFF when absent. The profile remains session-keyed. */
   browserEnabled?: boolean
   /** Public http(s) origins approved for this exact session. Values are canonical URL origins. */
@@ -503,6 +515,11 @@ export interface FeaturesConfig {
  * runtime object index.ts fills defaults into and shares by reference.
  */
 export interface PrefsConfig {
+  leanCoordination?: boolean
+  toolFailureEscalation?: boolean
+  highTokenUsageWarnings?: boolean
+  highTokenUsageThreshold?: number
+  highContextUsagePercent?: number
   /** Which pool a new chat's name is drawn from. Absent → DEFAULT_CHAT_NAME_POOL. See title.ts. */
   chatNamePool?: ChatNamePool
   /** Deliver new operator/bus input into a running turn at its next tool boundary. Absent means ON. */
@@ -606,6 +623,11 @@ export function asUiPreferences(value: unknown, fallback = DEFAULT_UI_PREFERENCE
 
 /** Resolved owner preferences (always present; index.ts fills defaults from PrefsConfig). */
 export interface HubPrefs {
+  leanCoordination?: boolean
+  toolFailureEscalation?: boolean
+  highTokenUsageWarnings?: boolean
+  highTokenUsageThreshold?: number
+  highContextUsagePercent?: number
   chatNamePool: ChatNamePool
   steerMessagesAtToolBoundary: boolean
   // index.ts always resolves this; optional only so SessionManager's untouched legacy fallback literal
@@ -710,16 +732,19 @@ export interface OverseerConfig {
   approvalPolicy?: OverseerApprovalPolicy
 }
 
-export type OverseerApprovalRisk = 'low' | 'medium'
+export type OverseerApprovalRisk = 'low' | 'medium' | 'high'
 
 export interface OverseerApprovalPolicy {
   enabled: boolean
-  /** Unknown/high-risk requests are never eligible, so the ceiling cannot be configured to high. */
+  /** Changes even for rapid revoke/re-enable cycles, invalidating old review tokens. */
+  revision?: string
+  /** High requires a supported effect adapter plus an explicit scoped delegation; never unknown. */
   maxRisk: OverseerApprovalRisk
   /** Exact requester sessions only. Empty means none; absent preserves a pre-existing legacy policy. */
   requesterSessionIds?: string[]
   /** Optional exact operator-reviewed no-execution file contracts; never automatic approvals. */
   fileReviews?: import('./approvalReview.js').ApprovalFileReview[]
+  delegations?: import('./githubApprovalReview.js').ApprovalDelegation[]
   /** Explicit operator precedent for REVIEW, never a risk classification or a new grant. */
   reviewGuidance?: string
   updatedAt?: string

@@ -80,6 +80,8 @@ describe('approval reconciliation across a hub restart (§7.2) — end-to-end ov
     // The hub-side relay dispatch shared by both eras: an rpc(practices.write) → the real PracticeStore (the
     // same call SessionManager.runRelay makes). The approval dispatch differs per era (fresh ApprovalService).
     const runRelay = (method: RelayMethod, args: unknown): unknown => {
+      if (method === 'tasks.gate') return undefined // This fixture has admitted work; approval is still required.
+      if (method === 'tools.assistance') return { blocked: false }
       if (method === 'practices.write') return practices.write(args as Parameters<PracticeStore['write']>[0])
       throw new Error(`unexpected relay in this test: ${method}`)
     }
@@ -176,6 +178,8 @@ describe('approval reconciliation across a hub restart (§7.2) — end-to-end ov
     const practiceWrite = handlerOf(mcp, 'practice_write')
 
     const runRelay = (method: RelayMethod, args: unknown): unknown => {
+      if (method === 'tasks.gate') return undefined
+      if (method === 'tools.assistance') return { blocked: false }
       if (method === 'practices.write') return practices.write(args as Parameters<PracticeStore['write']>[0])
       throw new Error(`unexpected relay in this test: ${method}`)
     }

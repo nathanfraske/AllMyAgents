@@ -61,6 +61,9 @@ function codexRec(id: string, cwd: string, opts: { projectId?: string; status?: 
     cwd,
     status: opts.status ?? 'active',
     createdAt: new Date().toISOString(),
+    // These attribution/ACL fixtures represent already admitted work, not task creation.
+    workPlan: { id: `fixture:${id}`, inputSeq: 1, revision: 1, status: 'active', createdAt: new Date().toISOString(),
+      steps: [{ id: `task:${id}`, title: 'Scoped fixture operation', doneWhen: 'Exact assertion', ownerSessionId: id, status: 'in_progress' }] },
   }
 }
 
@@ -133,7 +136,7 @@ describe('SessionManager.execAgentTool — the Codex agent-tool path (cwd → se
         codexRec('sess-B', '/work/b', { projectId: 'proj1', status: 'active' }),
       ])
       const out = await sessions.execAgentTool('codex-a', '/work/a', 'send_message', { to_session: 'sess-B', body: 'ping' })
-      expect(out).toBe('Delivered to 1 agent(s).')
+      expect(out).toBe('Saved for 1 agent(s); automatic waking follows the configured coordination policy.')
       const inbox = bus.inbox('sess-B')
       expect(inbox.map((m) => m.body)).toContain('ping')
       expect(inbox[0]!.fromSession).toBe('sess-A')

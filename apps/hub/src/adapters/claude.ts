@@ -197,6 +197,7 @@ export class ClaudeDriver {
     // server name; the SDK exposes their tools to the agent as `mcp__<name>__<tool>`.
     private readonly mcpServers?: Record<string, unknown>,
     private readonly wsl?: { distro: string },
+    private readonly workGate?: (tool: string, input: unknown) => Promise<string | undefined>,
   ) {}
 
   get sessionId(): string | undefined {
@@ -283,8 +284,20 @@ export class ClaudeDriver {
       // per-invocation identity AND `matchedAskRule` — so a user-configured permissions.ask rule, whose
       // entire purpose is to force a human prompt, was invisible to the hub's auto-approval and got
       // overridden by Full access.
-      options.canUseTool = async (toolName: string, input: unknown, context?: ClaudePermissionContext) =>
-        this.canUseTool!(toolName, input, context)
+      options.canUseTool = async (toolName: string, input: unknown, context?: ClaudePermissionContext) => {
+        const hold = await this.workGate?.(toolName, input)
+        return hold ? { behavior: 'deny', message: hold } : this.canUseTool!(toolName, input, context)
+      }
+    }
+    if (this.workGate) options.hooks = {
+      PreToolUse: [{ hooks: [async (event: { tool_name?: string; tool_input?: unknown }) => {
+        try {
+          const hold = await this.workGate!(event.tool_name ?? '', event.tool_input)
+          return hold ? { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: hold } } : {}
+        } catch {
+          return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'Task gate unavailable. Stop affected work and ask the operator; do not bypass the host.' } }
+        }
+      }] }],
     }
     if (this.mcpServers) options.mcpServers = this.mcpServers
     // SAFE DEFAULT — do not silently execute a project's own configuration. A project's `.mcp.json`
@@ -324,7 +337,7 @@ export class ClaudeDriver {
           subtype?: string
           session_id?: string
           usage?: unknown
-          message?: { usage?: unknown }
+          message?: { usage?: unknown; id?: string }
           terminal_reason?: string
         }
         // A queued priority-next message really did become another SDK run. It commonly appears only a
@@ -346,7 +359,7 @@ export class ClaudeDriver {
         // Surface token usage to the UI's live counter as the turn streams. Assistant messages
         // carry usage under `.message.usage` (the Anthropic API message); the final `result`
         // message carries it at the top level. The SDK gives no total, so we derive it.
-        if (m.type === 'assistant') this.emitTokens(m.message?.usage, 'request')
+        if (m.type === 'assistant') this.emitTokens(m.message?.usage, 'request', m.message?.id)
         else if (m.type === 'result') {
           completedResults += 1
           this.emitTokens(m.usage, 'turn')
@@ -394,7 +407,7 @@ export class ClaudeDriver {
   //
   // Kept as separate fields as well as the total, so a reader can still distinguish fresh input from
   // cache reads — that distinction is the whole reason prompt caching is worth having.
-  private emitTokens(usage: unknown, scope: 'request' | 'turn'): void {
+  private emitTokens(usage: unknown, scope: 'request' | 'turn', requestId?: string): void {
     if (!usage || typeof usage !== 'object') return
     const u = usage as Record<string, unknown>
     const input = numField(u.input_tokens)
@@ -410,7 +423,9 @@ export class ClaudeDriver {
       total?: number
       contextUsed?: number
       scope: 'request' | 'turn'
+      requestId?: string
     } = { scope }
+    if (requestId) out.requestId = requestId
     if (input !== undefined) out.input = input
     if (cacheRead !== undefined) out.cacheRead = cacheRead
     if (cacheWrite !== undefined) out.cacheWrite = cacheWrite

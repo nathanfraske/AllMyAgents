@@ -11,6 +11,7 @@ export function sameProviderAccount(left: Profile, right: Profile): boolean {
 /** Only terminal provider/hub error text enters here, never assistant/tool transcript text. */
 export function isUsageLimitFailure(message: string): boolean {
   if (/cyberPolicy|cybersecurity|context (?:window|length)|maximum context|organization.*access/i.test(message)) return false
+  if (/\b(?:insufficient[_ ]credits|credits? (?:balance )?(?:exhausted|depleted)|out of credits|no credits remaining)\b/i.test(message)) return true
   return /(?:usage|rate|quota|spend)[ _-]?(?:limit|control)(?:[^.\n]{0,60})(?:reached|exceeded|exhausted|hit|reject|100%)|(?:hit|reached|exceeded) (?:your |the |its )?(?:usage |rate |quota )limit|hit your limit|(?:is|are) at (?:its |your |the )?(?:usage|rate|quota) limit|rate limited|insufficient_quota/i.test(message)
 }
 

@@ -24,16 +24,18 @@ it('recovers complete task state across restart and partial index backfill, hydr
       { type: 'tool_use', id: 'update', name: 'TaskUpdate', input: { taskId: '7', status: 'completed' } },
     ] } })
     journal.append('s', 'manager/task-assigned', { id: 'manager:m', title: 'Manager task', managerSessionId: 'manager' })
+    journal.append('s', 'session/work-plan', { id: 'plan', revision: 1, steps: [{ id: 'work:1', title: 'Execution outcome', status: 'in_progress', doneWhen: 'Exact evidence' }] })
     journal.append('other', 'manager/task-assigned', { id: 'manager:hidden', title: 'Other project' })
     journal.append('s', 'claude/user', { message: { content: 'Ordinary operator input is not a task block' } })
     journal.append('s', 'claude/assistant', { message: { content: [null, 'odd block', 17] } })
     const decode = vi.fn((payload: string) => JSON.parse(payload))
-    expect(readTaskBoardEvents(journal.db, 's', decode)).toHaveLength(4)
+    expect(readTaskBoardEvents(journal.db, 's', decode)).toHaveLength(5)
     expect(decode.mock.calls.every(([payload]) => payload.length < 500)).toBe(true)
     const expected = buildTaskBoard(taskBoardItemsFromEvents(journal.taskBoardEventsForSession('s')))
     expect(expected.tasks).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: '7', status: 'completed' }),
       expect.objectContaining({ id: 'manager:m', origin: 'manager' }),
+      expect.objectContaining({ id: 'work:1', origin: 'contract', doneWhen: 'Exact evidence' }),
     ]))
     journal.db.close()
     journal = new Journal(file)

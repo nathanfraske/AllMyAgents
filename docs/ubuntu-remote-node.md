@@ -170,7 +170,16 @@ restart an active service. Drain runs, reinstall with the same profile if using 
 runtime, then explicitly restart only that testbed service. No OS reboot is needed. Profile changes
 require an explicit `configure`; reinstall does not silently broaden an existing scoped setup.
 
-Qualification order: isolated package extraction/checksums and >120-second unlimited command;
+The project-owned package qualification is identical on hosted, fleet and release runners:
+`node scripts/test-linux-testbed.mjs <package.deb>`. It retains extraction, checksum, configure,
+installed-executor, duplicate-start, transfer and elapsed-time checks. A real one-second command
+tests no deadline while the packaged executor's JavaScript timers advance past 120 seconds; a
+finite-deadline positive control must time out. This replaces a forced 125-second wall-clock sleep,
+not the timeout regression. It is not a claim of a real two-minute soak or systemd deadline testing.
+The former `--short` flag is a deprecated no-op: it runs exactly the same checks. Runner adapters
+must call the default project script and must not omit checks or substitute their own timing policy.
+
+Qualification order: isolated package extraction/checksums and accelerated timeout regression;
 then separately authorized target install; inspect the exact peer identity, pair once, grant the
 intended scope; run harmless filesystem and machine-mode commands in a non-Git directory; prove a
 second command can run concurrently; test cancel, temporary disconnection, and root revocation.

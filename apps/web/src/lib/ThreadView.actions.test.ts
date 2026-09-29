@@ -64,6 +64,7 @@ beforeEach(() => {
   store.approvals = []
   store.usage = []
   store.selectedId = null
+  store.profiles = []
   store.replayPresentationActive = false
 })
 afterEach(() => cleanup())
@@ -161,6 +162,20 @@ describe('replay presentation', () => {
 })
 
 describe('a failed model-pill write reverts the pill (no confidently-wrong UI)', () => {
+  it.each(['response', 'network'])('rolls the Daybreak switch back on a %s failure', async failure => {
+    const model = { slug: 'gpt-5.6-sol', name: 'Sol', supportedEfforts: [], serviceTiers: [] }
+    store.profiles = [{ id: 'p2', provider: 'codex', availableModels: [model, { ...model, slug: 'gpt-daybreak-blue-latest' }] }]
+    seed({ profileId: 'p2', provider: 'codex', model: model.slug, cyberAccessProgram: 'standard' })
+    if (failure === 'response') apiMock.setSettings.mockResolvedValue({ error: 'not persisted' })
+    else apiMock.setSettings.mockRejectedValue(Error('not persisted'))
+    render(ThreadView, { props: { sessionId: 's1' } })
+    await fireEvent.click(screen.getByText('5.6 Sol'))
+    await fireEvent.click(screen.getByRole('switch', { name: 'Daybreak' }))
+    expect(await screen.findByText(/model change failed: not persisted/)).toBeTruthy()
+    expect(apiMock.setSettings).toHaveBeenCalledWith('s1', { model: model.slug, cyberAccessProgram: 'daybreakBlue' })
+    expect(store.sessions.s1?.record.cyberAccessProgram).toBe('standard')
+    expect(screen.getByRole('switch').getAttribute('aria-checked')).toBe('false')
+  })
   it('rolls the pill back to the hub value and shows the error when the write fails', async () => {
     // Need two distinct models to switch between.
     expect(claudeModels.length).toBeGreaterThanOrEqual(2)

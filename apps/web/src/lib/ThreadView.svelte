@@ -6,7 +6,7 @@
 </script>
 
 <script lang="ts">
-  import { api } from './api'
+  import { api, type CyberAccessProgram } from './api'
   import { store, displayedThreadItems, type ThreadItem } from './store.svelte'
   import ItemCard from './ItemCard.svelte'
   import CodexActivityGroup from './CodexActivityGroup.svelte'
@@ -926,6 +926,7 @@
   // non-2xx as {error} rather than throwing — records `${label} failed: …` when it did not take, else
   // clears the slot. Returns whether it took, so an optimistic caller can roll back.
   let actionErr = $state<Record<string, string>>({})
+  let modelWriteSession = $state('')
   async function runAction(key: string, label: string, fn: () => Promise<unknown>): Promise<boolean> {
     const out = (await fn()) as { error?: string } | null | undefined
     actionErr = { ...actionErr, [key]: out?.error ? `${label} failed: ${out.error}` : '' }
@@ -977,19 +978,29 @@
   // hub never persisted: the record is the source of truth the next turn is built from, so a pill that
   // disagrees with the hub is the UI being confidently wrong — the same silent divergence we've been
   // killing all day. Reverting keeps pill and hub in agreement (the change simply didn't happen).
-  async function setModel(slug: string): Promise<boolean> {
+  async function setModel(slug: string, program?: CyberAccessProgram): Promise<boolean> {
     const v = view
     const s = sid
-    if (!s || !v) return false
+    if (!s || !v || modelWriteSession === s) return false
     if (v.draft) {
-      store.updateDraft(s, { model: slug || undefined }) // draft picks live on the record
+      store.updateDraft(s, { model: slug || undefined, ...(program !== undefined ? { cyberAccessProgram: program } : {}) })
       return true
     }
     const prev = v.record.model
+    const prevProgram = v.record.cyberAccessProgram
     v.record.model = slug || undefined // optimistic
-    const ok = await runAction('settings', 'model change', () => api.setSettings(s, { model: slug }))
-    if (!ok) v.record.model = prev
-    return ok
+    if (program !== undefined) v.record.cyberAccessProgram = program
+    modelWriteSession = s
+    try {
+      const out = await api.setSettings(s, { model: slug, ...(program !== undefined ? { cyberAccessProgram: program } : {}) })
+      if (out && 'error' in out) throw new Error(out.error)
+      if (sid === s) actionErr = { ...actionErr, settings: '' }
+      return true
+    } catch (e) {
+      v.record.model = prev; v.record.cyberAccessProgram = prevProgram
+      if (sid === s) actionErr = { ...actionErr, settings: `model change failed: ${e instanceof Error ? e.message : String(e)}` }
+      return false
+    } finally { if (modelWriteSession === s) modelWriteSession = '' }
   }
   async function setOption(id: string, value: string): Promise<void> {
     const v = view
@@ -1642,7 +1653,7 @@
       </button>
     {/if}
     <!-- The agent's task board, directly above the chatbar. -->
-    {#if !composerOnly}<TaskStrip items={transcriptItems} />{/if}
+    {#if !composerOnly}<TaskStrip items={transcriptItems} sessionId={view?.record.siteId ? undefined : sid} />{/if}
 
     {#if questions.length > 0}
       <div class="question-stack" role="region" aria-label="Pending questions">
@@ -1750,7 +1761,7 @@
           onclick={() => attachmentInput?.click()}
         ><Icon name="paperclip" size={15} /></button>
         <div class="ccontrol c-account" title={`Account: ${view.record.profileId}`}><AccountPicker {view} /></div>
-        <div class="ccontrol c-model" title={`Model: ${modelDef?.name ?? model ?? view.record.provider}`}><ModelPicker provider={view.record.provider} {model} availableModels={modelProfile?.availableModels} onselect={setModel} catalogKey={modelProfile?.id} updatedAt={modelProfile?.modelCatalogUpdatedAt} onrefresh={modelProfile ? () => store.refreshModels(modelProfile!.id) : undefined} /></div>
+        <div class="ccontrol c-model" title={`Model: ${modelDef?.name ?? model ?? view.record.provider}`}><ModelPicker provider={view.record.provider} {model} cyberAccessProgram={view.record.cyberAccessProgram} disabled={modelWriteSession === sid} availableModels={modelProfile?.availableModels} onselect={setModel} catalogKey={modelProfile?.id} updatedAt={modelProfile?.modelCatalogUpdatedAt} onrefresh={modelProfile ? () => store.refreshModels(modelProfile!.id) : undefined} /></div>
         {#if modelDef}<div class="ccontrol c-traits" title="Model effort and options"><TraitsControl descriptors={modelDef.descriptors} values={options} onchange={setOption} /></div>{/if}
         {#if isDraft}
           <div class="dperm ccontrol" data-overseer-anchor="permissions" title={`Permission mode: ${draftModeDef.label}`}>

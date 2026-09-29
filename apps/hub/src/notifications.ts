@@ -9,6 +9,8 @@ export type NotificationKind =
   | 'session-stalled'
   | 'journal-pressure'
   | 'hub-warning'
+  | 'tool-help-required'
+  | 'high-token-usage'
 
 export type NotificationSeverity = 'info' | 'warning' | 'error'
 export type NotificationSourceRole = 'agent' | 'manager' | 'overseer' | 'system'
@@ -148,6 +150,9 @@ function notificationEnabled(
     case 'session-stalled': return preferences.stalls
     case 'journal-pressure': return preferences.journalPressure
     case 'hub-warning': return true
+    // These have separate operator-owned feature toggles, not the generic error preference.
+    case 'tool-help-required': return true
+    case 'high-token-usage': return true
   }
 }
 

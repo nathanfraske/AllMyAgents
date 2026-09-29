@@ -69,6 +69,29 @@ async function waitForTerminal(store: DurableRunStore, id: string): Promise<void
 }
 
 describe('DurableRunStore', () => {
+  it('holds task completion for queued, running and uncertain owner/target work without a bounded-list blind spot', async () => {
+    const { store, cwd, db } = harness()
+    const start = { ...input(cwd), targetSessionId: 'worker' }
+    const provenance = await captureRunProvenance(start)
+    const run = store.create(start, provenance)
+    for (const state of ['queued', 'running', 'outcome_unknown']) {
+      db.prepare('UPDATE durable_runs SET state = ? WHERE id = ?').run(state, run.id)
+      expect(store.hasOutstandingForSession('manager', '2000-01-01')).toBe(true)
+      expect(store.hasOutstandingForSession('worker', '2000-01-01')).toBe(true)
+      expect(store.hasOutstandingForSession('other', '2000-01-01')).toBe(false)
+      expect(store.hasOutstandingForSession('worker', '9999-01-01')).toBe(false)
+    }
+    for (let n = 0; n < 205; n++) {
+      const finished = store.create(start, provenance)
+      store.failQueued(finished.id, 'fixture terminal')
+    }
+    expect(store.hasOutstandingForSession('worker', '2000-01-01')).toBe(true)
+    for (const state of ['succeeded', 'failed', 'cancelled']) {
+      db.prepare('UPDATE durable_runs SET state = ? WHERE id = ?').run(state, run.id)
+      expect(store.hasOutstandingForSession('worker', '2000-01-01')).toBe(false)
+    }
+  })
+
   it('clears local timers and fences late child output and completion after shutdown', async () => {
     const { store, cwd, db } = harness()
     const journal = { append: vi.fn() }

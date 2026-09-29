@@ -11,7 +11,7 @@ it('uses provider identity, not a shared label, and respects conflicting account
 })
 
 it('classifies quota failures but not provider policy, login, context or unrelated failures', () => {
-  for (const message of ["You've hit your limit", 'Usage limit reached', 'rate_limit_exceeded', 'rate limited']) expect(isUsageLimitFailure(message)).toBe(true)
+  for (const message of ["You've hit your limit", 'Usage limit reached', 'rate_limit_exceeded', 'rate limited', 'credits exhausted', 'out of credits', 'insufficient_credits']) expect(isUsageLimitFailure(message)).toBe(true)
   for (const message of ['cyberPolicy', 'flagged for cybersecurity risk', 'OAuth expired', 'Maximum context length exceeded', 'compile failed', 'compiler reached the limit']) expect(isUsageLimitFailure(message)).toBe(false)
 })
 

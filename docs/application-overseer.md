@@ -52,6 +52,13 @@ its own request, and it cannot stop or message itself through the control tool.
 
 ## Requester-scoped standing approvals
 
+The original low/medium contract below remains the default. Explicit configurable high-risk/effect
+delegation and separate review repository resource grants are described in
+[Operator-configured individual approval review](operator-approval-delegation.md). That extension
+supersedes this section's former permanent high-risk/executable-workflow exclusion **only when the
+operator explicitly configures the new controls**. It does not alter existing live policies or the
+old inert-file contract.
+
 On a direct operator turn, `overseer_control` can configure the fallback reviewer policy using
 `configure_approval_policy`, `approval_policy_enabled`, `approval_risk_ceiling` (`low` or `medium`),
 and `approval_requester_session_ids` (at most 32 exact local session IDs). It does not auto-click a tool:

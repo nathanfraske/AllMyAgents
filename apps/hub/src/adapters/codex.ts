@@ -174,6 +174,7 @@ export interface CodexTurnOptions {
   model?: string
   effort?: string
   serviceTier?: string
+  cyberAccessProgram?: import('../daybreak.js').CyberAccessProgram
   approvalPolicy?: string
   /** `{ mode, writableRoots }` — what the agent is allowed to touch. See {@link codexTurnPolicy}. */
   sandboxPolicy?: { type: string; writableRoots?: string[] }
@@ -810,6 +811,7 @@ export class CodexClient {
     if (opts.model) params.model = opts.model
     if (opts.effort) params.effort = opts.effort
     if (opts.serviceTier) params.serviceTier = opts.serviceTier
+    if (opts.cyberAccessProgram !== undefined) params.cyberAccessProgram = opts.cyberAccessProgram
     if (opts.approvalPolicy) params.approvalPolicy = opts.approvalPolicy
     if (opts.sandboxPolicy) params.sandboxPolicy = opts.sandboxPolicy
     await this.request('turn/start', params)

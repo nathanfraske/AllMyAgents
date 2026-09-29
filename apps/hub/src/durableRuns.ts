@@ -744,6 +744,12 @@ export class DurableRunStore {
     return updated.changes === 1 ? this.get(id) : undefined
   }
 
+  hasOutstandingForSession(sessionId: string, since: string): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM durable_runs
+      WHERE (sessionId = ? OR targetSessionId = ?) AND createdAt >= ?
+      AND state IN ('queued', 'running', 'outcome_unknown') LIMIT 1`).get(sessionId, sessionId, since)
+  }
+
   list(input: {
     projectId: string
     sessionIds?: string[]

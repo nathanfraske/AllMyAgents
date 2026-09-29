@@ -197,4 +197,19 @@ describe('ClaudeDriver project-config gate (safe default)', () => {
       autoCompactWindow: CLAUDE_AUTO_COMPACT_WINDOW,
     })
   })
+
+  it('installs an app-owned fail-closed work hook and permission gate without trusting project hooks', async () => {
+    const gate = vi.fn(async () => 'Record the requested task first')
+    const permission = vi.fn(async () => ({ behavior: 'allow' as const, updatedInput: {} }))
+    const d = new ClaudeDriver('/tmp/profile', '/tmp/cwd', () => {}, permission, undefined, undefined, gate)
+    await d.send('work', { permissionMode: 'full' })
+    const o = captured[0]!
+    const hook = (o.hooks as { PreToolUse: Array<{ hooks: Array<(input: unknown) => Promise<unknown>> }> }).PreToolUse[0]!.hooks[0]!
+    expect(await hook({ tool_name: 'Bash', tool_input: { command: 'do work' } })).toMatchObject({ hookSpecificOutput: { permissionDecision: 'deny' } })
+    expect(await (o.canUseTool as (name: string, input: unknown) => Promise<unknown>)('Edit', {})).toMatchObject({ behavior: 'deny' })
+    expect(permission).not.toHaveBeenCalled()
+    gate.mockRejectedValueOnce(new Error('hub gone'))
+    expect(await hook({ tool_name: 'Edit', tool_input: {} })).toMatchObject({ hookSpecificOutput: { permissionDecision: 'deny' } })
+    expect((o.settings as { disableAllHooks: boolean }).disableAllHooks).toBe(true)
+  })
 })

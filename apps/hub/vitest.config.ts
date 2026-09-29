@@ -1,4 +1,5 @@
 import { defineConfig } from 'vitest/config'
+import { testWorkerPool } from '../../scripts/test-worker-budget.mjs'
 
 // The hub is authored as NodeNext ESM: every intra-package import carries an explicit `.js`
 // extension (e.g. `import { deriveTitle } from './title.js'`) even though the source is `.ts`.
@@ -28,7 +29,7 @@ export default defineConfig({
     // from every logical CPU starves those child compilers on release machines until their independent
     // 60-second safety bounds fire, followed by cleanup racing the still-running process. Four workers
     // keeps ordinary tests parallel while leaving enough CPU/I/O for the production-path harnesses.
-    minWorkers: 1,
-    maxWorkers: 4,
+    // Respect a smaller reviewed runner budget; do not oversubscribe small guests.
+    ...testWorkerPool(),
   },
 })

@@ -4,6 +4,8 @@
  * which the hub does not send) — deliberately only what actually comes back. `id` is what send/steer
  * reference. The composer derives `kind` from `mime` itself (see attachments.ts) when it needs it.
  */
+export type CyberAccessProgram = 'standard' | 'daybreakBlue' | 'daybreakRed'
+
 export interface AttachmentRef {
   id: string
   name: string
@@ -52,6 +54,8 @@ export interface ProfileModelInfo {
   supportedEfforts: string[]
   defaultEffort?: string
   serviceTiers: Array<{ id: string; name: string }>
+  /** Caller-specific explicit programs; missing differs from an authoritative empty list. */
+  cyberAccessPrograms?: CyberAccessProgram[]
   isDefault?: boolean
   releasedAt?: string
 }
@@ -227,6 +231,7 @@ export interface GitHubCloneJob {
 }
 
 export interface SessionRecord {
+  toolHelp?: ToolHelpIncident[]
   id: string
   profileId: string
   provider: 'claude' | 'codex'
@@ -253,6 +258,7 @@ export interface SessionRecord {
   model?: string
   effort?: string
   serviceTier?: string
+  cyberAccessProgram?: CyberAccessProgram
   permissionMode?: string
   permissionModeOperatorOverride?: boolean
   permissionModeOperatorOverrideCeiling?: 'safe' | 'edits' | 'full'
@@ -1277,6 +1283,11 @@ export interface UiPreferences {
  * devices disagreeing about the pool would produce chats named from whichever one happened to spawn them.
  */
 export interface HubPrefs {
+  leanCoordination?: boolean
+  toolFailureEscalation?: boolean
+  highTokenUsageWarnings?: boolean
+  highTokenUsageThreshold?: number
+  highContextUsagePercent?: number
   chatNamePool: ChatNamePool
   steerMessagesAtToolBoundary: boolean
   /** Optional while bootstrap is using its pre-fetch fallback; the hub always returns a resolved value. */
@@ -1298,7 +1309,7 @@ export interface NotificationPreferences {
 
 export interface NotificationRecord {
   id: string
-  kind: 'session-completed' | 'session-error' | 'approval-required' | 'question-required' | 'session-stalled' | 'journal-pressure' | 'hub-warning'
+  kind: 'session-completed' | 'session-error' | 'approval-required' | 'question-required' | 'session-stalled' | 'journal-pressure' | 'hub-warning' | 'tool-help-required' | 'high-token-usage'
   severity: 'info' | 'warning' | 'error'
   title: string
   body: string
@@ -1315,6 +1326,16 @@ export interface NotificationRecord {
 export interface NotificationInbox {
   items: NotificationRecord[]
   unread: number
+}
+
+export interface ToolHelpIncident {
+  id: string
+  tool: string
+  summary: string
+  failures: number
+  status: 'retryable' | 'waiting' | 'skipped' | 'investigating'
+  createdAt: string
+  updatedAt: string
 }
 
 export interface ElevationBrokerStatus {
@@ -1854,7 +1875,7 @@ export const api = {
   },
   // `attachments` is an array of attachment IDs (from uploadAttachment), NOT the metadata objects — the
   // hub resolves ids to the stored files (server.ts stringArray: "must be an array of ids").
-  send: (id: string, text: string, extra: { model?: string; effort?: string; serviceTier?: string; attachments?: string[]; requestId?: string } = {}) =>
+  send: (id: string, text: string, extra: { model?: string; effort?: string; serviceTier?: string; cyberAccessProgram?: CyberAccessProgram; attachments?: string[]; requestId?: string } = {}) =>
     routedPost<{ ok?: boolean; error?: string }>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/input`, { text, ...extra }),
   steer: (id: string, text: string, attachments?: string[], requestId?: string) =>
     routedPost<{ ok?: boolean; error?: string }>(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/steer`, {
@@ -2033,7 +2054,7 @@ export const api = {
       {},
     ),
   /** Persist a per-chat model / thinking effort / service tier immediately (survives reload + restart). */
-  setSettings: (id: string, patch: { model?: string; effort?: string; serviceTier?: string }) =>
+  setSettings: (id: string, patch: { model?: string; effort?: string; serviceTier?: string; cyberAccessProgram?: CyberAccessProgram }) =>
     routedSessionPost(id, (raw) => `/api/sessions/${encodeURIComponent(raw)}/settings`, patch),
   /** Mandatory pre-push/pre-merge check; `ok:false` means main touched files this branch changes. */
   checkIntegration: (id: string) =>
@@ -2081,6 +2102,10 @@ export const api = {
   revokePractice: (id: string) => jpost<{ ok?: boolean; error?: string }>(`/api/practices/${id}/revoke`),
   // Owner preferences (hub-side settings that are not safety switches).
   prefs: () => jget<HubPrefs>('/api/config/prefs'),
+  resolveToolHelp: (sessionId: string, id: string, action: 'retry' | 'diagnose' | 'skip') =>
+    jpost<{ ok: boolean; warning?: string } | ApiError>(`/api/sessions/${encodeURIComponent(sessionId)}/tool-help/${encodeURIComponent(id)}`, { action }),
+  amendTask: (sessionId: string, input: { taskId: string; title: string; status: 'pending' | 'in_progress' | 'completed' | 'abandoned'; expectedRevision: number; changeReason: string }) =>
+    jpost<{ ok: boolean; taskId?: string } | ApiError>(`/api/sessions/${encodeURIComponent(sessionId)}/task-amendments`, input),
   setPrefs: (patch: Partial<HubPrefs>) => jpost<HubPrefs | ApiError>('/api/config/prefs', patch),
   notifications: (limit = 100) => jget<NotificationInbox>(`/api/notifications?limit=${Math.max(1, Math.min(250, Math.trunc(limit)))}`),
   notificationPreferences: () => jget<NotificationPreferences>('/api/notifications/preferences'),

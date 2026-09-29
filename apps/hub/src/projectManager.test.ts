@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { ApprovalService } from './approvals.js'
 import { AgentBus } from './bus.js'
 import type { Executor } from './executor.js'
@@ -24,7 +24,7 @@ import { WorkspaceManager } from './workspace.js'
 import { QuestionService } from './questions.js'
 import { DurableRunController, DurableRunStore } from './durableRuns.js'
 
-const cleanups: Array<() => void> = []
+const cleanups: Array<() => void | Promise<void>> = []
 
 afterEach(async () => {
   vi.useRealTimers()
@@ -32,25 +32,63 @@ afterEach(async () => {
   // lifecycle work before closing the shared SQLite handle so successful tests cannot leave an
   // unhandled callback racing the next file's teardown.
   await new Promise<void>((resolve) => setImmediate(resolve))
-  while (cleanups.length) cleanups.pop()?.()
+  while (cleanups.length) await cleanups.pop()?.()
 })
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', windowsHide: true }).trim()
 }
 
+// Each harness needs a real independent repo, but the identical initial commit need not run 81
+// times. Copy the immutable seed, including .git, without clone hardlinks or shared worktree state.
+let repositorySeed: string
+beforeAll(() => {
+  repositorySeed = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-manager-seed-'))
+  git(repositorySeed, 'init', '--quiet')
+  fs.writeFileSync(path.join(repositorySeed, 'base.txt'), 'base\n')
+  git(repositorySeed, 'add', 'base.txt')
+  git(repositorySeed, '-c', 'user.name=AllMyAgents Test', '-c', 'user.email=test@example.invalid', 'commit', '--quiet', '-m', 'base')
+})
+afterAll(() => {
+  if (repositorySeed) fs.rmSync(repositorySeed, { recursive: true, force: true })
+})
+function copyRepositoryFixture(repo: string): void {
+  fs.cpSync(repositorySeed, repo, { recursive: true, force: false, errorOnExist: true })
+}
+
+it('keeps copied Git fixtures independent in worktree, index, config, refs and objects', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-manager-isolation-'))
+  cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }))
+  const left = path.join(root, 'left')
+  const right = path.join(root, 'right')
+  copyRepositoryFixture(left)
+  copyRepositoryFixture(right)
+  const original = git(right, 'rev-parse', 'HEAD')
+  fs.writeFileSync(path.join(left, 'base.txt'), 'isolated\n')
+  git(left, 'config', '--local', 'user.name', 'Only the left fixture')
+  git(left, 'checkout', '-b', 'isolated')
+  git(left, 'add', 'base.txt')
+  git(left, '-c', 'user.email=test@example.invalid', 'commit', '-m', 'isolated')
+  const changed = git(left, 'rev-parse', 'HEAD')
+  expect(changed).not.toBe(original)
+  for (const untouched of [right, repositorySeed]) {
+    expect(git(untouched, 'status', '--porcelain')).toBe('')
+    expect(git(untouched, 'rev-parse', 'HEAD')).toBe(original)
+    expect(fs.readFileSync(path.join(untouched, 'base.txt'), 'utf8')).toBe('base\n')
+    expect(fs.readFileSync(path.join(untouched, '.git', 'config'), 'utf8')).not.toContain('Only the left fixture')
+    expect(fs.existsSync(path.join(untouched, '.git', 'refs', 'heads', 'isolated'))).toBe(false)
+    expect(fs.existsSync(path.join(untouched, '.git', 'objects', changed.slice(0, 2), changed.slice(2)))).toBe(false)
+  }
+})
+
 function buildHub() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-manager-'))
   const repo = path.join(root, 'repo')
   const profileDir = path.join(root, 'profile')
   const secondProfileDir = path.join(root, 'profile-2')
-  fs.mkdirSync(repo)
+  copyRepositoryFixture(repo)
   fs.mkdirSync(profileDir)
   fs.mkdirSync(secondProfileDir)
-  git(repo, 'init')
-  fs.writeFileSync(path.join(repo, 'base.txt'), 'base\n')
-  git(repo, 'add', 'base.txt')
-  git(repo, '-c', 'user.name=AllMyAgents Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'base')
 
   const journal = new Journal(path.join(root, 'hub.db'))
   const approvals = new ApprovalService(journal)
@@ -113,8 +151,9 @@ function buildHub() {
     ;(sessions as unknown as { sessions: Map<string, SessionRecord> }).sessions.set(full.id, full)
     return full
   }
-  cleanups.push(() => {
-    journal.db.close()
+  cleanups.push(async () => {
+    await sessions.shutdown()
+    if (journal.db.open) journal.db.close()
     fs.rmSync(root, { recursive: true, force: true })
   })
   return { sessions, journal, approvals, usage, projects, instructions, bus, seed, repo, steer, runTurn, startThread, pauseAutonomousGoal }
@@ -123,6 +162,263 @@ function buildHub() {
 function transition(sessions: SessionManager, id: string, status: SessionStatus): void {
   ;(sessions as unknown as { setStatusById(id: string, status: SessionStatus): void }).setStatusById(id, status)
 }
+
+describe('host-enforced task lifecycle', () => {
+  it('rolls back a failed ledger audit and never mistakes Claude completion for a Codex goal', async () => {
+    const h = buildHub(), owner = h.seed({ id: 'owner', provider: 'claude', projectId: 'p' })
+    await h.sessions.send('owner', 'Implement the requested change')
+    const host = h.sessions as unknown as { changeWorkPlan(id: string, input: import('./workPlan.js').WorkPlanInput): Promise<{ plan: import('./workPlan.js').WorkPlan; warning?: string }> }
+    const append = h.journal.append.bind(h.journal)
+    const audit = vi.spyOn(h.journal, 'append').mockImplementation((sessionId, kind, payload) => {
+      if (kind === 'session/work-plan') throw new Error('fixture audit unavailable')
+      return append(sessionId, kind, payload)
+    })
+    const create = { operation: 'create' as const, steps: [{ title: 'Requested change', doneWhen: 'Regression verified' }] }
+    await expect(host.changeWorkPlan('owner', create)).rejects.toThrow('fixture audit')
+    expect(owner.workPlan).toBeUndefined()
+    expect(h.journal.taskBoardEventsForSession('owner')).toEqual([])
+    audit.mockRestore()
+    const p = (await host.changeWorkPlan('owner', create)).plan
+    const result = await host.changeWorkPlan('owner', { operation: 'update', planId: p.id, expectedRevision: p.revision, taskId: p.steps[0]!.id, status: 'completed', evidence: 'exact passing receipt' })
+    expect(result.warning).toBeUndefined()
+    expect(h.pauseAutonomousGoal).not.toHaveBeenCalled()
+  })
+
+  it('binds admitted input, worker relay, quiet completion and a fresh operator request on existing records', async () => {
+    const h = buildHub()
+    h.seed({ id: 'owner', provider: 'codex', profileId: 'p2', projectId: 'project' })
+    h.seed({ id: 'peer', projectId: 'project' })
+    const change = (input: import('./workPlan.js').WorkPlanInput) => h.sessions.runRelay('tasks.plan', { sessionId: 'owner', input }) as Promise<{ plan: import('./workPlan.js').WorkPlan; warning?: string }>
+    const gate = () => h.sessions.runRelay('tasks.gate', { sessionId: 'owner', tool: 'start_run', args: {} })
+    expect(gate()).toContain('Task-first')
+    await expect(change({ operation: 'create', steps: [{ title: 'No operator', doneWhen: 'Not authorized' }] })).rejects.toThrow('operator')
+    await h.sessions.send('owner', 'Implement the bounded change')
+    const first = await change({ operation: 'create', steps: [{ title: 'Bounded change', doneWhen: 'Regression passes' }] })
+    const active = await change({ operation: 'update', planId: first.plan.id, expectedRevision: first.plan.revision, taskId: first.plan.steps[0]!.id, status: 'in_progress' })
+    expect(gate()).toBeUndefined()
+    const done = await change({ operation: 'update', planId: active.plan.id, expectedRevision: active.plan.revision, taskId: active.plan.steps[0]!.id, status: 'completed', evidence: 'run verified' })
+    await change({ operation: 'finish', planId: done.plan.id, expectedRevision: done.plan.revision })
+    expect(h.pauseAutonomousGoal).toHaveBeenCalledTimes(1)
+    expect(gate()).toContain('complete')
+    transition(h.sessions, 'owner', 'idle')
+    h.runTurn.mockClear()
+    h.sessions.busSend('peer', { kind: 'session', id: 'owner' }, 'receipt', 'Review the same completed change again', true)
+    await new Promise<void>(r => setImmediate(r))
+    expect(h.runTurn).not.toHaveBeenCalled()
+    expect(h.bus.pending('owner')[0]?.wake).toBe(false)
+    await h.sessions.send('owner', 'Now implement a second change')
+    const next = await change({ operation: 'create', steps: [{ title: 'Second change', doneWhen: 'Second result' }] })
+    expect(next.plan.id).not.toBe(first.plan.id)
+  })
+
+  it('adopts legacy assignments once without rewriting them or waking stopped workers', () => {
+    const h = buildHub()
+    h.seed({ id: 'manager', isProjectManager: true, projectId: 'p' })
+    const child = h.seed({ id: 'child', parentSessionId: 'manager', projectId: 'p', status: 'stopped' })
+    h.journal.append('child', 'manager/task-assigned', { id: 'manager:original', title: 'Original outcome', status: 'in_progress', managerSessionId: 'manager' })
+    const host = h.sessions as unknown as { runtimeHostInstructions(r: SessionRecord): string }
+    expect(host.runtimeHostInstructions(child)).toContain('Task-first execution is ON')
+    host.runtimeHostInstructions(child)
+    expect(child.workPlan?.steps[0]).toMatchObject({ id: 'manager:original', title: 'Original outcome', status: 'in_progress' })
+    expect(h.journal.taskBoardEventsForSession('child').filter(e => e.kind === 'session/work-plan')).toHaveLength(1)
+    expect(child.status).toBe('stopped')
+    expect(h.runTurn).not.toHaveBeenCalled()
+  })
+})
+
+describe('manager visibility of direct operator work', () => {
+  function setup(provider: 'claude' | 'codex' = 'claude') {
+    const h = buildHub()
+    const manager = h.seed({ id: 'manager', projectId: 'project' })
+    h.sessions.configureProjectManager(manager.id, {
+      enabled: true, allowedProfiles: ['p1', 'p2'], maxLiveChildren: 4,
+    }, 'operator')
+    const child = h.seed({ id: 'child', parentSessionId: manager.id, projectId: manager.projectId,
+      title: 'Worker', titleSource: 'user',
+      profileId: provider === 'codex' ? 'p2' : 'p1', provider,
+      managerTeamId: manager.managerActiveTeamId, managerTeamName: manager.managerTeams![0]!.name,
+      role: 'Implementation worker', permissionMode: 'safe',
+    })
+    const control = h.sessions as unknown as {
+      managerManageTeam(id: string, input: { operation: 'create' | 'activate'; name?: string; teamId?: string; activate?: boolean; interruptActive?: boolean }): Promise<{ ok: boolean; error?: string }>
+      managerManageChild(id: string, input: { operation: 'set_role'; childSessionId: string; role: string }): Promise<{ ok: boolean; error?: string }>
+      operatorTurnSessions: Set<string>
+      busTurnSessions: Set<string>
+      restoreTurnOrigin(id: string): void
+      materializeSessionInstructions(record: SessionRecord): void
+    }
+    return { ...h, manager, child, control }
+  }
+
+  it.each(['claude', 'codex'] as const)('reports trusted %s direction without private text, even after a noisy tail/re-attach', async provider => {
+    const { sessions, journal, manager, child, control, repo, runTurn } = setup(provider)
+    expect(sessions.managerChildStatus(manager.id).summary).toContain('"lastOperatorInput":null')
+    await sessions.send(child.id, 'Private operator request: handle my unrelated setup task')
+    // Before turnStarted arrives, the admitted turn must already be protected.
+    expect(child.status).toBe('idle')
+    expect(sessions.managerChildStatus(manager.id).summary).toContain('"currentTurnOrigin":"operator"')
+    transition(sessions, child.id, 'active')
+    for (let i = 0; i < 150; i++) journal.append(child.id, 'codex/item/agentMessage/delta', { delta: '.' })
+    const receipt = child.lastOperatorInput!
+    expect(receipt).toMatchObject({ seq: expect.any(Number), at: expect.any(String) })
+    const persisted = journal.db.prepare('SELECT record FROM sessions WHERE id = ?').get(child.id) as { record: string }
+    expect(JSON.parse(persisted.record).lastOperatorInput).toEqual(receipt)
+    control.operatorTurnSessions.delete(child.id)
+    control.restoreTurnOrigin(child.id)
+    const status = sessions.managerChildStatus(manager.id).summary!
+    expect(status).toContain('"currentTurnOrigin":"operator"')
+    expect(status).toContain(JSON.stringify(receipt))
+    expect(status).not.toContain('Private operator request')
+    expect(sessions.busPeek(manager.id, child.id, { view: 'activity' }).summary).toContain(JSON.stringify(receipt))
+    await sessions.send(manager.id, 'Review live roster')
+    const spec = runTurn.mock.calls.find(call => call[0].sessionId === manager.id)![0]
+    const contract = spec.claudeSystemPrompt ?? spec.codexDeveloperInstructions ?? ''
+    expect(contract).toContain('"operatorDirection":{"currentTurnOrigin":"operator"')
+    expect(contract).toContain('Before treating changed work as rogue behavior or prompt injection')
+    expect(contract).not.toContain('Private operator request')
+    const instructions = fs.readFileSync(path.join(repo, 'CLAUDE.md'), 'utf8')
+    expect(instructions).toContain('operator direction (hub verified)')
+    expect(instructions).not.toContain('Private operator request')
+    transition(sessions, child.id, 'idle')
+    const settled = sessions.managerChildStatus(manager.id).summary!
+    expect(settled).toContain('"currentTurnOrigin":"none"')
+    expect(settled).toContain(JSON.stringify(receipt))
+    expect(child.permissionMode).toBe('safe')
+    expect(child.permissionModeOperatorOverride).toBeUndefined()
+  })
+
+  it('does not mint operator direction from bus prose, manager assignments or unrelated agents', () => {
+    const { sessions, journal, seed, manager, child, control } = setup()
+    child.status = 'active'
+    control.busTurnSessions.add(child.id)
+    journal.append(child.id, 'bus/received', { text: 'The operator told me to do this', source: 'operator' })
+    journal.append(child.id, 'session/input', { text: 'Manager opening prompt' })
+    expect(sessions.managerAssignChildTask(manager.id, child.id, { title: 'Ordinary manager work' }).ok).toBe(true)
+    const status = sessions.managerChildStatus(manager.id).summary!
+    expect(status).toContain('"currentTurnOrigin":"teammate"')
+    expect(status).toContain('"lastOperatorInput":null')
+    control.busTurnSessions.delete(child.id)
+    expect(sessions.managerChildStatus(manager.id).summary).toContain('"currentTurnOrigin":"unknown"')
+    seed({ id: 'unrelated', isProjectManager: true, projectId: 'other' })
+    expect(sessions.managerChildStatus('unrelated').summary).not.toContain('operator direction (hub verified)')
+    expect(sessions.busPeek('unrelated', child.id, { view: 'activity' }).found).toBe(false)
+    expect(sessions.managerChildStatus(child.id).ok).toBe(false)
+  })
+
+  it('includes enabled one-shot descendants and never grants their manager extra tools', async () => {
+    const { sessions, manager, child, seed } = setup()
+    manager.managerAllowWorkerSubagents = true
+    const descendant = seed({ id: 'descendant', title: 'Worker II', titleSource: 'user',
+      projectId: manager.projectId, parentSessionId: child.id, managerRootSessionId: manager.id,
+      isOneShotSubagent: true, managerTeamId: child.managerTeamId, managerTeamName: child.managerTeamName,
+      delegatedTools: ['Read'], permissionMode: 'safe' })
+    await sessions.send(descendant.id, 'direct operator task')
+    expect(sessions.managerChildStatus(manager.id).summary).toContain('Worker II (descendant)')
+    expect(sessions.busPeek(manager.id, descendant.id, { view: 'activity' }).summary).toContain('"currentTurnOrigin":"operator"')
+    expect(sessions.managerAssignChildTask(manager.id, descendant.id, { title: 'Replacement' }).ok).toBe(false)
+    expect(descendant.delegatedTools).toEqual(['Read'])
+    expect(manager.managerAllowedTools).toEqual([])
+  })
+
+  it('commits the input receipt with the accepted-input audit, not on a failed store write', async () => {
+    const { sessions, journal, child, runTurn } = setup()
+    const store = (sessions as unknown as { store: SessionStore }).store
+    vi.spyOn(store, 'upsert').mockImplementationOnce(() => { throw new Error('disk full') })
+    await expect(sessions.send(child.id, 'must not acquire a receipt')).rejects.toThrow('disk full')
+    expect(child.lastOperatorInput).toBeUndefined()
+    expect(journal.latestEventForSessionKind(child.id, 'session/input')).toBeUndefined()
+    expect(runTurn).not.toHaveBeenCalled()
+  })
+
+  it('keeps the last direct steer receipt and exposes queued input when the provider rejects a steer', async () => {
+    const { sessions, journal, manager, child, steer } = setup()
+    await sessions.send(child.id, 'first direct request')
+    transition(sessions, child.id, 'active')
+    const firstSeq = child.lastOperatorInput!.seq
+    await sessions.send(child.id, 'private follow-up')
+    expect(child.lastOperatorInput!.seq).toBeGreaterThan(firstSeq)
+    const last = child.lastOperatorInput
+    steer.mockRejectedValueOnce(new Error('turn ended'))
+    await expect(sessions.send(child.id, 'not accepted')).rejects.toThrow('turn ended')
+    expect(child.lastOperatorInput).toEqual(last)
+    transition(sessions, child.id, 'idle')
+    transition(sessions, child.id, 'active') // unknown/non-operator turn
+    steer.mockRejectedValueOnce(new Error('steer not accepted'))
+    await sessions.send(child.id, 'queued private request')
+    expect(child.deferredOperatorTurns).toHaveLength(1)
+    const status = sessions.managerChildStatus(manager.id).summary!
+    expect(status).toContain('"queuedOperatorInputs":1')
+    expect(status).toContain('"currentTurnOrigin":"unknown"')
+    expect(status).not.toContain('queued private request')
+    expect(journal.lastTurnOrigin(child.id)).toBe('operator') // history is not current authority
+    expect(sessions.managerAssignChildTask(manager.id, child.id, { title: 'Conflicting replacement' }).error).toMatch(/Operator-directed work/)
+  })
+
+  it('prevents shelving, role replacement and new assignments during direct work but allows operator stop', async () => {
+    const { sessions, manager, child, control } = setup()
+    const existing = sessions.managerAssignChildTask(manager.id, child.id, { title: 'Manager task' })
+    await control.managerManageTeam(manager.id, { operation: 'create', name: 'Next team' })
+    const next = manager.managerTeams!.find(team => team.name === 'Next team')!
+    await sessions.send(child.id, 'Direct task')
+    transition(sessions, child.id, 'active')
+    const stop = vi.spyOn(sessions, 'stop')
+    for (const interruptActive of [false, true]) {
+      expect(await control.managerManageTeam(manager.id, { operation: 'activate', teamId: next.id, interruptActive }))
+        .toMatchObject({ ok: false, error: expect.stringContaining('Operator-directed work') })
+    }
+    expect(await control.managerManageTeam(manager.id, { operation: 'create', name: 'Must not create', activate: true, interruptActive: true }))
+      .toMatchObject({ ok: false, error: expect.stringContaining('Operator-directed work') })
+    expect(manager.managerTeams).toHaveLength(2)
+    expect(stop).not.toHaveBeenCalled()
+    expect(await control.managerManageChild(manager.id, { operation: 'set_role', childSessionId: child.id, role: 'Replacement' }))
+      .toMatchObject({ ok: false, error: expect.stringContaining('Operator-directed work') })
+    expect(child.role).toBe('Implementation worker')
+    expect(sessions.managerAssignChildTask(manager.id, child.id, { title: 'New work' }).ok).toBe(false)
+    expect(sessions.managerAssignChildTask(manager.id, child.id, { taskId: existing.taskId, title: 'Manager task', status: 'completed' }).ok).toBe(true)
+    await sessions.stop(child.id) // operator control remains available, no new permission is needed
+    expect(child.status).toBe('stopped')
+    expect(await control.managerManageTeam(manager.id, { operation: 'activate', teamId: next.id })).toMatchObject({ ok: true })
+  })
+
+  it('queues manager mail rather than steering direct work, then delivers once at the next turn', async () => {
+    const { sessions, manager, child, seed, bus, steer, runTurn } = setup()
+    seed({ id: 'peer', projectId: 'project' })
+    await sessions.send(child.id, 'Direct task')
+    transition(sessions, child.id, 'active')
+    const result = sessions.busSend(manager.id, { kind: 'session', id: child.id }, 'coordination', 'Manager replacement request', true, true)
+    expect(result).toMatchObject({ ok: true, deferred: 1, error: expect.stringContaining('not steered') })
+    expect(steer).not.toHaveBeenCalled()
+    sessions.busSend('peer', { kind: 'session', id: child.id }, 'result', 'Peer result')
+    await vi.waitFor(() => expect(steer).toHaveBeenCalledOnce())
+    expect(steer).toHaveBeenCalledWith(child.id, expect.stringContaining('Peer result'))
+    expect(steer).not.toHaveBeenCalledWith(child.id, expect.stringContaining('Manager replacement request'))
+    await vi.waitFor(() => expect(bus.pending(child.id)).toHaveLength(1))
+    transition(sessions, child.id, 'idle')
+    await vi.waitFor(() => expect(runTurn.mock.calls.filter(call => call[0].sessionId === child.id && call[2] === 'bus')).toHaveLength(1))
+    expect(bus.pending(child.id)).toHaveLength(0)
+  })
+
+  it('rechecks other children after an awaited stop and rejects racing input before accepting it', async () => {
+    const { sessions, manager, child, seed, control } = setup()
+    const second = seed({ id: 'second', projectId: 'project', parentSessionId: manager.id,
+      managerTeamId: manager.managerActiveTeamId, managerTeamName: child.managerTeamName })
+    await control.managerManageTeam(manager.id, { operation: 'create', name: 'Next team' })
+    const next = manager.managerTeams!.find(team => team.name === 'Next team')!
+    const originalStop = sessions.stop.bind(sessions)
+    let release!: () => void
+    const paused = new Promise<void>(resolve => { release = resolve })
+    vi.spyOn(sessions, 'stop').mockImplementationOnce(async id => { await paused; await originalStop(id) })
+    const switching = control.managerManageTeam(manager.id, { operation: 'activate', teamId: next.id })
+    await expect(sessions.send(child.id, 'racing first input')).rejects.toThrow('your input was not accepted')
+    expect(child.lastOperatorInput).toBeUndefined()
+    await sessions.send(second.id, 'Direct task starts during the other stop')
+    release()
+    expect(await switching).toMatchObject({ ok: false, error: expect.stringContaining('Operator-directed work') })
+    expect(manager.managerActiveTeamId).not.toBe(next.id)
+    expect(second.status).not.toBe('stopped')
+    expect(sessions.stop).toHaveBeenCalledTimes(1)
+  })
+})
 
 describe('project manager permission ceiling', () => {
   it('persists a bounded parallel staffing target and refuses one above the live-child ceiling', () => {
@@ -352,6 +648,64 @@ describe('project manager exhausted-account dispatch guard', () => {
 })
 
 describe('high-context teammate wake guard', () => {
+  it('defaults routine mail to quiet, coalesces exact pending copies, and preserves changed evidence and explicit action', async () => {
+    const h = buildHub()
+    h.seed({ id: 'manager', projectId: 'project', isProjectManager: true })
+    h.seed({ id: 'child', projectId: 'project', parentSessionId: 'manager' })
+    for (let n = 0; n < 100; n++) h.sessions.busSend('manager', { kind: 'session', id: 'child' }, 'FYI', 'same evidence')
+    expect(h.bus.pending('child')).toHaveLength(1)
+    expect(h.runTurn).not.toHaveBeenCalled()
+    h.sessions.busSend('manager', { kind: 'session', id: 'child' }, 'FYI', 'new evidence')
+    expect(h.bus.pending('child')).toHaveLength(2)
+    h.sessions.busSend('manager', { kind: 'session', id: 'child' }, 'Action', 'Apply the change', true, true)
+    await vi.waitFor(() => expect(h.runTurn).toHaveBeenCalledOnce())
+    expect(h.runTurn.mock.calls[0]![1]).toContain('same evidence')
+    expect(h.runTurn.mock.calls[0]![1]).toContain('new evidence')
+    expect(h.runTurn.mock.calls[0]![1]).toContain('Apply the change')
+    // recentEventsForSession intentionally caps at 100; count this exact fixture's audit kind instead.
+    expect(h.journal.since(0).filter(e => e.sessionId === 'manager' && e.kind === 'bus/coordination-saved')).toHaveLength(99)
+  })
+  it('stores receipt-only chatter without steering; explicit priority and opt-out remain available', () => {
+    const h = buildHub()
+    h.seed({ id: 'manager', projectId: 'project', isProjectManager: true })
+    h.seed({ id: 'child', projectId: 'project', parentSessionId: 'manager', status: 'active' })
+    expect(h.sessions.busSend('manager', { kind: 'session', id: 'child' }, 'ack', 'Thanks.', true)).toMatchObject({ error: expect.stringContaining('without waking or steering') })
+    expect(h.steer).not.toHaveBeenCalled()
+    expect(h.bus.pending('child')).toMatchObject([{ wake: false }])
+    const priority = h.sessions.busSend('manager', { kind: 'session', id: 'child' }, 'ack', 'Thanks.', true, true)
+    expect(priority.ok).toBe(true)
+    const old = buildHub()
+    ;(old.sessions as unknown as { prefs: { leanCoordination?: boolean } }).prefs.leanCoordination = false
+    old.seed({ id: 'manager', projectId: 'project', isProjectManager: true })
+    old.seed({ id: 'child', projectId: 'project', parentSessionId: 'manager' })
+    old.sessions.busSend('manager', { kind: 'session', id: 'child' }, 'ack', 'Thanks.')
+    expect(old.runTurn).toHaveBeenCalledOnce()
+  })
+  it('restores durable task evidence, deduplicates assignments and denies stale/silent scope rewrites', () => {
+    const h = buildHub()
+    h.seed({ id: 'manager', projectId: 'project', isProjectManager: true })
+    const child = h.seed({ id: 'child', projectId: 'project', parentSessionId: 'manager' })
+    const original = h.sessions.managerAssignChildTask('manager', 'child', { title: 'Fix parser' })
+    expect(h.sessions.managerAssignChildTask('manager', 'child', { title: 'Fix parser' }).taskId).toBe(original.taskId)
+    expect(h.journal.taskBoardEventsForSession('child')).toHaveLength(1)
+    expect(h.sessions.managerAssignChildTask('manager', 'child', { taskId: original.taskId, title: 'Rewrite compiler' }).ok).toBe(false)
+    expect(h.sessions.managerAssignChildTask('manager', 'child', { taskId: original.taskId, title: 'Fix parser', status: 'completed', expectedRevision: 1 }).ok).toBe(true)
+    expect(h.sessions.managerAssignChildTask('manager', 'child', { title: 'Fix parser' }).ok).toBe(false)
+    expect(h.sessions.managerAssignChildTask('manager', 'child', { taskId: original.taskId, title: 'Fix parser', expectedRevision: 1, changeReason: 'New bug' }).ok).toBe(false)
+    expect(h.sessions.managerAssignChildTask('manager', 'child', { taskId: original.taskId, title: 'Fix parser', expectedRevision: 2, changeReason: 'Operator reports a new failing grammar' }).ok).toBe(false)
+    expect(h.sessions.amendTaskByOperator('child', { taskId: original.taskId!, title: 'Fix parser', status: 'pending', expectedRevision: 2, changeReason: 'New failing grammar' }).ok).toBe(true)
+    expect(h.sessions.amendTaskByOperator('child', { taskId: original.taskId!, title: 'Rewrite compiler', status: 'pending', expectedRevision: 2, changeReason: 'Stale click' }).ok).toBe(false)
+    h.journal.append('child', 'codex/turn/plan/updated', { plan: [{ step: 'Existing verification', status: 'completed' }] })
+    h.journal.append('child', 'codex/turn/plan/updated', { plan: [{ step: 'Unrelated audit', status: 'pending' }] })
+    const own = h.sessions.busPeek('child', 'child', { view: 'tasks' })
+    expect(own.summary).toContain('Existing verification')
+    expect(own.summary).toContain('Fix parser')
+    expect(h.sessions.busPeek('child', 'manager', { view: 'tasks' }).found).toBe(false)
+    const protectedPrefix = (h.sessions as unknown as { runtimeHostInstructions(r: SessionRecord): string }).runtimeHostInstructions(child)
+    expect(protectedPrefix).toContain('Durable task checkpoint')
+    expect(protectedPrefix).toContain('Existing verification')
+    expect(protectedPrefix).toContain('Compaction does not start a new assignment')
+  })
   it('queues an idle Claude message without launching another giant resumed turn', () => {
     const { sessions, journal, bus, seed, runTurn } = buildHub()
     seed({ id: 'manager', projectId: 'project-1', isProjectManager: true })
@@ -368,6 +722,7 @@ describe('high-context teammate wake guard', () => {
       { kind: 'session', id: 'child' },
       'checkpoint',
       'Acknowledge the checkpoint.',
+      true,
     )).toMatchObject({ ok: true, delivered: 1, deferred: 1 })
     expect(runTurn).not.toHaveBeenCalled()
     expect(bus.pending('child')).toMatchObject([{ wake: false, delivered: false }])
@@ -548,6 +903,7 @@ describe('high-context teammate wake guard', () => {
       { kind: 'session', id: 'codex-child' },
       'review',
       'Please re-open the review.',
+      true,
     )).toMatchObject({ ok: true, delivered: 1, deferred: 1 })
     expect(runTurn).not.toHaveBeenCalled()
     expect(bus.pending('codex-child')[0]).toMatchObject({ wake: false })
@@ -614,6 +970,7 @@ describe('high-context teammate wake guard', () => {
       { kind: 'session', id: child.id },
       'continue parser ownership',
       'Take the next parser task within your durable role.',
+      true,
     )).toEqual({ ok: true, delivered: 1 })
     await vi.waitFor(() => expect(runTurn).toHaveBeenCalledOnce())
     expect(journal.recentEventsForSession(manager.id)).toContainEqual(expect.objectContaining({
@@ -774,6 +1131,38 @@ describe('project manager durable child identity', () => {
 })
 
 describe('project manager lifecycle awareness', () => {
+  it.each([false, true])('retires manager timers before journal teardown (graceful=%s)', async graceful => {
+    vi.useFakeTimers()
+    const { sessions, journal, bus, seed } = buildHub()
+    seed({ id: 'manager', isProjectManager: true, status: 'active' })
+    seed({ id: 'child', parentSessionId: 'manager', status: 'starting' })
+    transition(sessions, 'child', 'active')
+    const observers = sessions as unknown as {
+      managerStallTimers: Map<string, NodeJS.Timeout>
+      managerAssistantPulseTimers: Map<string, NodeJS.Timeout>
+      scheduleManagerStallCheck(id: string): void
+      scheduleManagerAssistantPulse(id: string, actionable: boolean): void
+    }
+    expect(observers.managerStallTimers.size).toBe(1)
+    expect(observers.managerAssistantPulseTimers.size).toBe(1)
+    const stopped = sessions.shutdown({ graceful })
+    // Timer ownership must end synchronously, before async transfer/vendor teardown yields.
+    expect(observers.managerStallTimers.size).toBe(0)
+    expect(observers.managerAssistantPulseTimers.size).toBe(0)
+    await stopped
+    const read = vi.spyOn(journal, 'lastEventForSession')
+    const pending = vi.spyOn(bus, 'pending')
+    journal.db.close()
+    // A late lifecycle notification cannot re-arm a retired hub's watchdogs.
+    observers.scheduleManagerStallCheck('child')
+    observers.scheduleManagerAssistantPulse('manager', true)
+    await vi.advanceTimersByTimeAsync(2 * MANAGER_STALL_MS)
+    expect(read).not.toHaveBeenCalled()
+    expect(pending).not.toHaveBeenCalled()
+    expect(observers.managerStallTimers.size).toBe(0)
+    expect(observers.managerAssistantPulseTimers.size).toBe(0)
+  })
+
   it('batches simultaneous actionable child transitions into one manager steer', async () => {
     vi.useFakeTimers()
     const { sessions, bus, seed, steer } = buildHub()
@@ -1475,6 +1864,10 @@ describe('project manager durable live roster', () => {
     const workerRuntime = runTurn.mock.calls[1]?.[0].claudeSystemPrompt ?? ''
     const codexManagerRuntime = runTurn.mock.calls[2]?.[0].codexDeveloperInstructions ?? ''
     const codexWorkerRuntime = runTurn.mock.calls[3]?.[0].codexDeveloperInstructions ?? ''
+    for (const runtime of [managerRuntime, workerRuntime, codexManagerRuntime, codexWorkerRuntime]) {
+      expect(runtime).toContain('Lean coordination is ON')
+      expect(runtime).toContain('Broken-tool policy is ON')
+    }
     expect(managerRuntime).toContain('Before or with every worker dispatch')
     expect(managerRuntime).toContain('Before every progress or completion report')
     expect(workerRuntime).toContain('Keep your provider-native task/plan board current')
@@ -1495,6 +1888,36 @@ describe('project manager durable live roster', () => {
     expect(bus.pending('legacy-worker')).toHaveLength(0)
     expect(bus.pending(codexManager.id)).toHaveLength(0)
     expect(bus.pending('legacy-codex-worker')).toHaveLength(0)
+  })
+
+  it('applies defaults to old Overseer, ordinary and stashed records without waking them or rewriting old assignments', () => {
+    const { sessions, journal, seed, runTurn, bus } = buildHub()
+    const manager = seed({ id: 'old-manager', isProjectManager: true, projectId: 'project' })
+    const records = [
+      manager,
+      seed({ id: 'old-overseer', isOverseer: true }),
+      seed({ id: 'old-ordinary' }),
+      seed({ id: 'stashed-worker', parentSessionId: manager.id, projectId: 'project', status: 'stopped', managerTeamId: 'stashed-team' }),
+    ]
+    journal.append('stashed-worker', 'manager/task-assigned', {
+      id: 'manager:legacy', title: 'Existing finished outcome', status: 'completed', managerSessionId: manager.id,
+      // Written by an old build: no revision or new assistance fields.
+    })
+    const host = sessions as unknown as { runtimeHostInstructions(r: SessionRecord): string }
+    for (const record of records) {
+      const before = { id: record.id, status: record.status, parent: record.parentSessionId, mode: record.permissionMode }
+      expect(host.runtimeHostInstructions(record)).toContain('Lean coordination is ON')
+      expect(host.runtimeHostInstructions(record)).toContain('Broken-tool policy is ON')
+      expect({ id: record.id, status: record.status, parent: record.parentSessionId, mode: record.permissionMode }).toEqual(before)
+      expect(bus.pending(record.id)).toEqual([])
+    }
+    expect(host.runtimeHostInstructions(records[3]!)).toContain('Existing finished outcome')
+    expect(sessions.managerAssignChildTask(manager.id, 'stashed-worker', {
+      taskId: 'manager:legacy', title: 'Existing finished outcome', status: 'pending', expectedRevision: 1, changeReason: 'Compaction',
+    }).ok).toBe(false)
+    expect(journal.taskBoardEventsForSession('stashed-worker').filter(e => e.kind === 'manager/task-assigned')).toHaveLength(1)
+    expect(journal.taskBoardEventsForSession('stashed-worker').filter(e => e.kind === 'session/work-plan')).toHaveLength(1)
+    expect(runTurn).not.toHaveBeenCalled()
   })
 
   it('does not add a manager roster to an ordinary chat turn', async () => {
@@ -2074,7 +2497,7 @@ describe('project manager visibility into its own workers', () => {
     })()
     const recent = sessions.managerAssignChildTask('manager', 'child', { title: 'Recent assignment' })
     for (const task of [old, recent]) {
-      expect(sessions.managerAssignChildTask('manager', 'child', { taskId: task.taskId, title: task === old ? 'Old complete' : 'Recent complete', status: 'completed' }).ok).toBe(true)
+      expect(sessions.amendTaskByOperator('child', { taskId: task.taskId!, title: task === old ? 'Old complete' : 'Recent complete', status: 'completed', expectedRevision: 1, changeReason: 'Clarify the completed result' }).ok).toBe(true)
     }
     journal.append('child', 'codex/turn/plan/updated', { plan: [{ step: 'Vendor plan', status: 'in_progress' }] })
     const board = sessions.busPeek('manager', 'child', { view: 'tasks' })

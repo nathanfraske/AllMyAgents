@@ -85,6 +85,21 @@ describe('bounded account catalog discovery', () => {
 })
 
 describe('Codex discovery protocol', () => {
+  it('retains GPT-6 Sol/Luna and caller-specific programs from live and cached metadata', () => {
+    const models = parseCodexModels([
+      { model: 'gpt-6-sol', displayName: 'GPT-6 Sol', availableAccessPrograms: { cyber: ['standard', 'daybreakBlue', 'daybreakRed'] } },
+      { slug: 'gpt-6-luna', display_name: 'GPT-6 Luna', available_access_programs: { cyber: ['standard', 'daybreakBlue'] } },
+      { model: 'gpt-6-astra', availableAccessPrograms: { cyber: ['standard'] } },
+      { model: 'none', availableAccessPrograms: { cyber: [] } },
+      { model: 'malformed', availableAccessPrograms: { cyber: 'daybreakBlue' } },
+      { model: 'unknown', availableAccessPrograms: { cyber: ['future', 'standard', 'standard'] } },
+      { model: 'legacy', availableAccessPrograms: null },
+    ])
+    expect(models.map(m => m.slug)).toEqual(['gpt-6-sol', 'gpt-6-luna', 'gpt-6-astra', 'none', 'malformed', 'unknown', 'legacy'])
+    expect(models.map(m => m.cyberAccessPrograms)).toEqual([
+      ['standard', 'daybreakBlue', 'daybreakRed'], ['standard', 'daybreakBlue'], ['standard'], [], [], ['standard'], undefined,
+    ])
+  })
   it('pages the account list without starting, steering, or interrupting a turn', async () => {
     const client = new CodexClient('unused', vi.fn())
     vi.spyOn(client, 'ensureStarted').mockResolvedValue()
