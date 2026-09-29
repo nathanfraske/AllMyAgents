@@ -53,8 +53,34 @@ afterAll(() => {
   if (repositorySeed) fs.rmSync(repositorySeed, { recursive: true, force: true })
 })
 function copyRepositoryFixture(repo: string): void {
-  fs.cpSync(repositorySeed, repo, { recursive: true, force: false, errorOnExist: true })
+  // Node 22's native recursive cp failed inside .git/objects on the hosted Mac.
+  // Copy this small, regular-file-only seed parent-first; preserve empty directories,
+  // reject existing destinations and propagate each exact file error without retries.
+  function copyDirectory(source: string, destination: string): void {
+    fs.mkdirSync(destination)
+    for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
+      const from = path.join(source, entry.name)
+      const to = path.join(destination, entry.name)
+      if (entry.isDirectory()) copyDirectory(from, to)
+      else if (entry.isFile()) fs.copyFileSync(from, to, fs.constants.COPYFILE_EXCL)
+      else throw new Error(`Unsupported Git fixture entry: ${from}`)
+    }
+  }
+  copyDirectory(repositorySeed, repo)
 }
+
+it('propagates a fixture file-copy error without retrying or ignoring it', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-manager-copy-error-'))
+  cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }))
+  const error = Object.assign(new Error('fixture copy denied'), { code: 'EACCES' })
+  const copy = vi.spyOn(fs, 'copyFileSync').mockImplementation(() => { throw error })
+  try {
+    expect(() => copyRepositoryFixture(path.join(root, 'repo'))).toThrow(error)
+    expect(copy).toHaveBeenCalledTimes(1)
+  } finally {
+    copy.mockRestore()
+  }
+})
 
 it('keeps copied Git fixtures independent in worktree, index, config, refs and objects', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-manager-isolation-'))
@@ -63,6 +89,10 @@ it('keeps copied Git fixtures independent in worktree, index, config, refs and o
   const right = path.join(root, 'right')
   copyRepositoryFixture(left)
   copyRepositoryFixture(right)
+  expect(() => copyRepositoryFixture(left)).toThrow()
+  for (const repo of [left, right]) {
+    expect(fs.statSync(path.join(repo, '.git', 'objects', 'info')).isDirectory()).toBe(true)
+  }
   const original = git(right, 'rev-parse', 'HEAD')
   fs.writeFileSync(path.join(left, 'base.txt'), 'isolated\n')
   git(left, 'config', '--local', 'user.name', 'Only the left fixture')
@@ -79,6 +109,13 @@ it('keeps copied Git fixtures independent in worktree, index, config, refs and o
     expect(fs.existsSync(path.join(untouched, '.git', 'refs', 'heads', 'isolated'))).toBe(false)
     expect(fs.existsSync(path.join(untouched, '.git', 'objects', changed.slice(0, 2), changed.slice(2)))).toBe(false)
   }
+  // New commits alone do not distinguish a copy from a hardlinked object store.
+  const objectPath = path.join('.git', 'objects', original.slice(0, 2), original.slice(2))
+  const objectBytes = fs.readFileSync(path.join(right, objectPath))
+  fs.chmodSync(path.join(left, objectPath), 0o600)
+  fs.writeFileSync(path.join(left, objectPath), 'damaged only in the disposable left copy')
+  expect(fs.readFileSync(path.join(right, objectPath))).toEqual(objectBytes)
+  expect(fs.readFileSync(path.join(repositorySeed, objectPath))).toEqual(objectBytes)
 })
 
 function buildHub() {
