@@ -1052,6 +1052,7 @@ export class HubStore {
     if (this.statusReconcileInFlight) return
     this.statusReconcileInFlight = true
     const requestStartedAtSeq = this.lastSeq
+    const toolHelpAtStart = new Map(Object.values(this.sessions).map(v => [v.record.id, v.record.toolHelp]))
     try {
       const [rows, profiles] = await Promise.all([
         boundedHubRead('Hub status refresh', (signal) => api.sessions(signal)).catch(() => null),
@@ -1062,6 +1063,9 @@ export class HubStore {
       for (const rec of rows) {
         const v = this.sessions[rec.id]
         if (!v || v.draft) continue // not merged yet (a later pass catches it), or a local draft we own
+        // Holds are persisted after session/created and have no record-update stream event.
+        // Reconcile them too, without resurrecting a hold resolved while this read was in flight.
+        if (v.record.toolHelp === toolHelpAtStart.get(rec.id)) v.record.toolHelp = rec.toolHelp
         v.record.permissionMode = rec.permissionMode
         v.record.permissionModeOperatorOverride = rec.permissionModeOperatorOverride
         v.record.permissionModeOperatorOverrideCeiling = rec.permissionModeOperatorOverrideCeiling
