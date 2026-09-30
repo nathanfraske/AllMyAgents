@@ -222,7 +222,7 @@
             },
             {
               "label": "Warn if the updater signing key is missing",
-              "sha256": "c188ba13f68b4bb70354d5d5ff7b74322777c065480c6b37d5401734ca72be9f"
+              "sha256": "99893353eb4337c1b7a984c8f52ec5953b37504d6f202fcd5f24790793be015b"
             },
             {
               "label": "Refuse a non-increasing app version",
@@ -237,8 +237,8 @@
               "sha256": "2efeb786dade7c6b217cc6bdd1c35d7ad2a8f1048b4404753add51355f13e8b1"
             },
             {
-              "label": "Build, sign, and publish (tauri-action)",
-              "sha256": "3396dbda68f6f6353bbd2e8435eb254255f64049c21c6b868cc7f370bad2ce92"
+              "label": "Build, sign, and stage (tauri-action)",
+              "sha256": "106cc1afcc21319bf4355cbc82a76f4d770ecaaa169766f7b41689710023058a"
             }
           ]
         },
@@ -252,6 +252,19 @@
             {
               "label": "Attach packages to the exact desktop release",
               "sha256": "23a1662b1005fad5c1c98d9b5b9343bd745edac57f33f073f2fe5c0e4b4e130c"
+            }
+          ]
+        },
+        "publish-release": {
+          "matrix": null,
+          "steps": [
+            {
+              "label": "actions/checkout@v4",
+              "sha256": "dd0465395fff2eaf34fe466af3f46904442331f18fbcb4d67ae136cd3ae05d18"
+            },
+            {
+              "label": "Verify all platform assets and publish",
+              "sha256": "2150cacfe9f6e8671291b86b0eb256f1b9c4fb7fbb8bfcc6f37748e3350e0a60"
             }
           ]
         }
@@ -591,5 +604,6 @@
         }
       }
     }
-  }
+  },
+  "releasePublicationRevision": "Only release staging, signing-key warning and final publication changed from source 86fc72b2f5cf9b032214be0cadc81818b8bc02c8; behavioral checks live in release-promotion.test.mjs."
 }
