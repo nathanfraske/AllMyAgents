@@ -286,7 +286,7 @@
             },
             {
               "label": "Run the real CLI installer and require its health verdict",
-              "sha256": "0c69a40ab89b69d072d4bc358f5e8a3962c638bbb106f1103f05e601646d0cf7"
+              "sha256": "1cf46af8e7b71c2893d38de071db590f135e9d5aa86285520c951f3bef070541"
             },
             {
               "label": "Cleanup",

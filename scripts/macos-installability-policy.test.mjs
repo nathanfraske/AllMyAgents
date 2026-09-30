@@ -28,6 +28,20 @@ test('PR installer baseline cannot replace current-source builds or exact-releas
   assert.deepEqual(jobs.installability.strategy.matrix.runner, ['macos-latest', 'macos-15-intel'])
 })
 
+test('pre-publication P0 CLI check uses a complete baseline while launch/repair builds the current ref', () => {
+  const jobs = parse(fs.readFileSync(new URL('../.github/workflows/macos-p0-verification.yml', import.meta.url), 'utf8')).jobs
+  const cli = jobs['cli-installer-health'].steps.find(step => step.name === 'Run the real CLI installer and require its health verdict')
+  assert.equal(cli.env.AMA_TAG, 'v0.1.48-alpha.52')
+  assert.equal(cli.if, undefined)
+  assert.equal(cli['continue-on-error'], undefined)
+  assert.match(cli.run, /set -euo pipefail/)
+  assert.match(cli.run, /Verified: the installed app launched through LaunchServices and its hub answers \/api\/health/)
+  const current = jobs['launch-and-repair']
+  assert.deepEqual(current.strategy.matrix.runner, ['macos-latest', 'macos-15-intel'])
+  assert.equal(current.steps.find(step => step.uses === 'actions/checkout@v4').with?.ref, undefined)
+  assert.match(current.steps.find(step => step.name === 'Build and install the app').run, /tauri build --bundles app/)
+})
+
 test('macOS install and failed-build cleanup delete only the exact test app', () => {
   const deletes = workflow.split(/\r?\n/).map(line => line.trim()).filter(line => line.startsWith('rm -rf '))
   assert.equal(deletes.length, 3, 'Review any additional recursive deletion explicitly')

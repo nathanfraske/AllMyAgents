@@ -33,6 +33,10 @@ jobs:
         # token. A flaky gate gets ignored, so removing the flake is part of making the gate real.
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          # This is the published CLI baseline, including on a pre-publication tag dispatch. alpha.53
+          # has no Intel DMG. The separate launch-and-repair job builds THIS ref on both architectures;
+          # macos-installability's explicit-tag checks verify the new published installers afterward.
+          AMA_TAG: v0.1.48-alpha.52
         run: |
           set -euo pipefail
           /bin/bash scripts/install-macos.sh --no-path 2>&1 | tee /tmp/cli-install.log
