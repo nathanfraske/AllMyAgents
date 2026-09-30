@@ -25,6 +25,8 @@ import type { RestartState } from './restartController.js'
 import { RestartController } from './restartController.js'
 import { QuestionService } from './questions.js'
 import { waitForPortRelease } from './restartRollback.js'
+import { createAgentToolSecret, takeAgentToolSecret } from './agentBridgeAuth.js'
+import { makeHubExecutor } from './agentBridge.js'
 
 const cleanups: Array<() => void | Promise<void>> = []
 // Match the attachment API harness: an OS-assigned ephemeral port can still be forbidden by Fetch.
@@ -76,7 +78,7 @@ afterEach(async () => {
   while (cleanups.length) await cleanups.pop()?.()
 })
 
-async function build(overrides: Partial<Pick<ServerOptions, 'mesh' | 'meshPeerPorts' | 'remoteDevices' | 'directMesh' | 'deviceExecutor'>> = {}) {
+async function build(overrides: Partial<Pick<ServerOptions, 'mesh' | 'meshPeerPorts' | 'remoteDevices' | 'directMesh' | 'deviceExecutor' | 'agentToolSecret'>> = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-server-security-'))
   const journal = new Journal(path.join(root, 'hub.db'))
   const projects = new ProjectStore(journal.db)
@@ -177,7 +179,7 @@ async function build(overrides: Partial<Pick<ServerOptions, 'mesh' | 'meshPeerPo
     deviceToken,
     // The old control plane failed open in precisely this configuration.
     requireToken: false,
-    agentToolSecret: 'test-agent-bridge-secret-at-least-32-characters',
+    agentToolSecret: overrides.agentToolSecret ?? 'test-agent-bridge-secret-at-least-32-characters',
     restartState,
     executor,
     workspace,
@@ -335,6 +337,27 @@ describe('account model discovery', () => {
 })
 
 describe('device-authenticated control plane', () => {
+  it('accepts an existing bridge on a successor hub without accepting unrelated credentials or operator API access', async () => {
+    const secret = createAgentToolSecret()
+    const boot = () => build({ agentToolSecret: takeAgentToolSecret(true, { HUB_AGENT_TOOL_SECRET: secret }) })
+    const blue = await boot()
+    let destination = blue.base
+    const bridge = makeHubExecutor({ hubUrl: blue.base, secret, profileId: 'p', sessionId: 'bound', cwd: blue.root },
+      ((url, init) => fetch(String(url).replace(blue.base, destination), init)) as typeof fetch)
+    const first = vi.spyOn(blue.sessions, 'execAgentTool').mockResolvedValue('before restart')
+    expect(await bridge('list_agents', {})).toBe('before restart')
+    expect(first).toHaveBeenCalledTimes(1)
+    await new Promise<void>(resolve => { blue.server.close(() => resolve()); blue.server.closeAllConnections() })
+    const green = await boot()
+    destination = green.base
+    const next = vi.spyOn(green.sessions, 'execAgentTool').mockResolvedValue('after restart')
+    expect(await bridge('list_agents', {})).toBe('after restart')
+    expect(next).toHaveBeenCalledWith('p', blue.root, 'list_agents', {}, 'bound')
+    const denied = makeHubExecutor({ hubUrl: destination, secret: createAgentToolSecret(), profileId: 'p', cwd: blue.root })
+    expect(await denied('list_agents', {})).toBe('Tool error: forbidden')
+    expect(next).toHaveBeenCalledTimes(1)
+    expect((await fetch(`${destination}/api/sessions`, { headers: auth(secret) })).status).toBe(401)
+  })
   it('defaults assistance on, persists explicit opt-out and rejects malformed thresholds', async () => {
     const h = await build()
     const headers = { ...auth(h.deviceToken), 'content-type': 'application/json' }

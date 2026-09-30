@@ -17,6 +17,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
+import { createAgentToolSecret } from './agentBridgeAuth.js'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import {
   HUB_DRAIN_RELEASE_TIMEOUT_MS,
@@ -50,6 +51,10 @@ import { readJournalProgress } from './journalProgress.js'
  *  HUB_FIXED_PORT overrides it for an isolated harness (e.g. the restart-survival acceptance test) so a
  *  second supervisor can run beside the live hub without fighting for 7777; unset → 7777 exactly as before. */
 const FIXED_PORT = Number(process.env.HUB_FIXED_PORT ?? 7777)
+// Codex MCP children outlive a blue-green hub flip. Keep their bearer valid for this supervisor,
+// but rotate it on a full app restart. Never inherit an older supervisor's credential.
+const agentToolSecret = createAgentToolSecret()
+delete process.env.HUB_AGENT_TOOL_SECRET
 const profileOwnerId = process.env.HUB_PROFILE_OWNER_ID ?? crypto.randomUUID()
 const profileOwnerEnv = {
   HUB_PROFILE_OWNER_ID: profileOwnerId,
@@ -248,6 +253,7 @@ function spawnHub(
       ...profileGenerationEnvironment(profileAuthority),
       HUB_PORT: String(port),
       HUB_SUPERVISED: '1',
+      HUB_AGENT_TOOL_SECRET: agentToolSecret,
       HUB_PREFLIGHT_ATTEMPT_ID: preflightAttemptId,
       ...(preflightCacheIdentity ? { HUB_PREFLIGHT_CACHE_ID: preflightCacheIdentity } : {}),
       ...(workerSocket && workerSecret

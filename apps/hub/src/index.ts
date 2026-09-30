@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import { takeAgentToolSecret } from './agentBridgeAuth.js'
 import { fork, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -133,6 +134,7 @@ function configuredInteger(
     : fallback
 }
 const supervised = process.env.HUB_SUPERVISED === '1' && typeof process.send === 'function'
+const agentToolSecret = takeAgentToolSecret(supervised)
 const bootPort = Number(process.env.HUB_PORT ?? 7777)
 const publicPort = supervised ? Number(process.env.HUB_FIXED_PORT ?? 7777) : bootPort
 const isGreen = supervised && bootPort === 0
@@ -944,7 +946,6 @@ process.once('exit', stopJournalMaintenance)
 // bridge script; codex app-server spawns it per thread, and it forwards each tool call to
 // POST /internal/agent-tool — which the hub authenticates with this secret and attributes to the
 // calling Codex session (by profile id + the bridge child's cwd). See docs/codex-agent-tools-parity.md.
-const agentToolSecret = crypto.randomBytes(32).toString('hex')
 /**
  * How to launch the bridge that `codex app-server` spawns per thread.
  *
