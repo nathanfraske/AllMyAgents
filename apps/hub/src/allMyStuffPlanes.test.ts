@@ -64,7 +64,7 @@ describe('AllMyStuff privileged planes bootstrap client', () => {
     })
   })
 
-  it('uploads a directory tree in bounded file-plane pieces and waits for each final acknowledgement', async () => {
+  it.each([undefined, 8192])('uploads a directory tree with chunk size %s and waits for each final acknowledgement', async (fileChunkBytes) => {
     const root = temporaryRoot()
     fs.mkdirSync(path.join(root, 'dist'))
     fs.writeFileSync(path.join(root, 'README.txt'), 'hello')
@@ -72,6 +72,7 @@ describe('AllMyStuff privileged planes bootstrap client', () => {
     const responses: FilePlaneEvent[] = []
     const writes: Array<Extract<FilePlaneEvent, { kind: 'write' }>> = []
     const planes = new AllMyStuffPlanes({
+      fileChunkBytes,
       request: async (command, args, expectedTag) => {
         if (command === 'file_watch') return json(9)
         if (command === 'file_unwatch') return json(null)
@@ -96,7 +97,10 @@ describe('AllMyStuff privileged planes bootstrap client', () => {
       progress.push(value.bytesTransferred)
     })
     expect(result).toMatchObject({ files: 2, bytes: 700_005 })
-    expect(writes.filter((event) => event.path.endsWith('node.js'))).toHaveLength(2)
+    const moduleWrites = writes.filter((event) => event.path.endsWith('node.js'))
+    expect(moduleWrites).toHaveLength(Math.ceil(700_000 / (fileChunkBytes ?? 512 * 1024)))
+    expect(Buffer.concat(moduleWrites.map(event => Buffer.from(event.data, 'base64')))).toEqual(Buffer.alloc(700_000, 7))
+    if (fileChunkBytes) expect(moduleWrites.every(event => Buffer.byteLength(JSON.stringify(event)) < 16 * 1024)).toBe(true)
     expect(writes.at(-1)?.eof).toBe(true)
     expect(progress.at(-1)).toBe(700_005)
   })

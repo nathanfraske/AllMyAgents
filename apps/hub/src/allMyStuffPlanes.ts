@@ -156,8 +156,13 @@ function payloadFiles(root: string): Array<{ absolute: string; relative: string;
 export class AllMyStuffPlanes {
   private requestId = 0
   private readonly request: PlaneFrameRequest
+  private readonly fileChunkBytes: number
 
-  constructor(input?: { socketPath?: string; request?: PlaneFrameRequest }) {
+  constructor(input?: { socketPath?: string; request?: PlaneFrameRequest; fileChunkBytes?: number }) {
+    this.fileChunkBytes = input?.fileChunkBytes ?? FILE_CHUNK_BYTES
+    if (!Number.isSafeInteger(this.fileChunkBytes) || this.fileChunkBytes < 1 || this.fileChunkBytes > FILE_CHUNK_BYTES) {
+      throw new Error('invalid bounded AllMyStuff file chunk size')
+    }
     const socketPath = input?.socketPath ?? defaultSocketPath()
     this.request = input?.request ?? ((command, args, expectedTag, timeoutMs) =>
       framedRequest(socketPath, command, args, expectedTag, timeoutMs))
@@ -336,7 +341,7 @@ export class AllMyStuffPlanes {
           if (file.bytes === 0) {
             await this.sendFileEvent(routeId, { kind: 'write', req, path: remoteJoin(remoteRoot, file.relative), data: '', append: false, eof: true })
           } else {
-            const buffer = Buffer.allocUnsafe(Math.min(FILE_CHUNK_BYTES, file.bytes))
+            const buffer = Buffer.allocUnsafe(Math.min(this.fileChunkBytes, file.bytes))
             while (offset < file.bytes) {
               const count = fs.readSync(handle, buffer, 0, Math.min(buffer.length, file.bytes - offset), offset)
               if (count <= 0) throw new Error(`local testbed payload ended early at ${file.relative}`)
