@@ -5,8 +5,8 @@ import path from 'node:path'
 
 // These are transport buffers, not model/tool payload limits. The model sees only a receipt.
 export const FILE_TRANSFER_CHUNK = 512 * 1024
-// Reply delivery can fail independently of request delivery. Keep remote read replies conservative;
-// v1 callers already accept shorter chunks. This is not a claimed Mesh packet-size limit.
+// Reads feed upload requests or download replies. Keep both wire directions conservative;
+// v1 accepts shorter chunks. This is not a claimed Mesh packet-size limit.
 export const FILE_TRANSFER_READ_CHUNK = 8 * 1024
 export const FILE_TRANSFER_MAX = 256 * 1024 * 1024
 export type FileTransferRequest = {
