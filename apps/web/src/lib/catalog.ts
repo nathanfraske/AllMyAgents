@@ -1,5 +1,5 @@
 // Plain-TS port of t3code's model/option-descriptor contract (no Effect).
-// Codex models + params are from the live `codex app-server` model/list (Codex 0.156.1).
+// Codex models + params are from the live `codex app-server` model/list (Codex 0.159.2).
 import type { ProfileModelInfo, CyberAccessProgram } from './api'
 import { isRecentlyReleased, modelReleaseDate } from './modelReleaseDates'
 
@@ -68,7 +68,7 @@ function effort(values: string[], def: string): OptionDescriptor {
   }
 }
 
-// Codex "Speed" = service tier. Standard (default) or priority/"Fast" (1.5x).
+// Codex "Speed" = service tier. Account metadata supplies the current supported tiers.
 const SPEED: OptionDescriptor = {
   id: 'serviceTier',
   label: 'Speed',
@@ -116,6 +116,7 @@ export const MODELS: ModelDef[] = [
 // profile has no provider catalog, so putting Astra there would falsely grant it to every Codex account.
 // This metadata is applied only after the account's own model/list cache advertises the exact slug.
 const ACCOUNT_SCOPED_CODEX_MODEL_METADATA: ModelDef[] = [
+  { slug: 'gpt-6.1-sol', name: 'GPT-6.1 Sol', shortName: '6.1 Sol', provider: 'codex', descriptors: [] },
   { slug: 'gpt-6-astra', name: 'GPT-6 Astra', shortName: '6 Astra', provider: 'codex', descriptors: [effort(FULL_EFFORT, 'medium'), SPEED] },
   { slug: 'gpt-6-sol', name: 'GPT-6 Sol', shortName: '6 Sol', provider: 'codex', descriptors: [] },
   { slug: 'gpt-6-luna', name: 'GPT-6 Luna', shortName: '6 Luna', provider: 'codex', descriptors: [] },

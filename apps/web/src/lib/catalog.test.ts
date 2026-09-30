@@ -31,6 +31,23 @@ const astra: ProfileModelInfo = {
 }
 
 describe('account-scoped Codex model catalogs', () => {
+  it('shows GPT-6.1 Sol only for an advertising account and retains its exact options', () => {
+    const sol: ProfileModelInfo = {
+      slug: 'gpt-6.1-sol', name: 'GPT-6.1 Sol',
+      supportedEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultEffort: 'medium',
+      serviceTiers: [], cyberAccessPrograms: ['standard'],
+    }
+    const now = Date.parse('2026-09-30T00:00:00Z')
+    const [model] = modelsFor('codex', [sol], now)
+    expect(model).toMatchObject({ slug: sol.slug, shortName: '6.1 Sol', releasedAt: '2026-09-29', isNew: true })
+    expect(model.descriptors).toHaveLength(1)
+    expect(model.descriptors[0].options?.map(o => o.value)).toEqual(sol.supportedEfforts)
+    expect(model.descriptors[0].options?.find(o => o.isDefault)?.value).toBe('medium')
+    expect(modelSupportsProgram(sol, 'daybreakBlue')).toBe(false)
+    expect(findModel(sol.slug, [ordinary])).toBeUndefined()
+    expect(modelsFor('codex').map(m => m.slug)).not.toContain(sol.slug)
+    expect(modelsFor('codex', [ordinary], now)[0].slug).toBe(ordinary.slug)
+  })
   it('uses per-model programs, not hard-coded GPT-6 availability or retired Spark fallback', () => {
     const sol: ProfileModelInfo = { ...ordinary, slug: 'gpt-6-sol', name: 'GPT-6 Sol', cyberAccessPrograms: ['standard', 'daybreakBlue'] }
     const luna: ProfileModelInfo = { ...sol, slug: 'gpt-6-luna', name: 'GPT-6 Luna' }

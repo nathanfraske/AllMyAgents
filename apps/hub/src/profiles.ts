@@ -56,13 +56,13 @@ export function readCodexProfileModelCatalog(
 
   try {
     const root = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>
+    if (!Array.isArray(root.models) && !Array.isArray(root.data)) throw new Error('Invalid provider model catalog')
     const rows = Array.isArray(root.models) ? root.models : Array.isArray(root.data) ? root.data : []
     const models = parseCodexModels(rows)
     const fetched = boundedString(root.fetched_at ?? root.fetchedAt, 80)
     const fetchedMs = fetched ? Date.parse(fetched) : Number.NaN
-    const value = models.length > 0
-      ? { models, updatedAt: Number.isFinite(fetchedMs) ? new Date(fetchedMs).toISOString() : stat.mtime.toISOString() }
-      : undefined
+    // An authoritative empty/hidden-only catalog must not restore the static fallback after restart.
+    const value = { models, updatedAt: Number.isFinite(fetchedMs) ? new Date(fetchedMs).toISOString() : stat.mtime.toISOString() }
     codexCatalogCache.set(file, { signature, value })
     return value
   } catch {

@@ -3,6 +3,7 @@
 // creation time proves a release. Unknown dates deliberately have no New badge.
 // Sources verified 2026-09-23:
 // https://developers.openai.com/api/docs/changelog (Jul 9, Sep 3, Sep 22)
+// GPT-6.1 Sol: Sep 29 entry verified 2026-09-30 at the same official changelog.
 // https://www.anthropic.com/news/claude-opus-5 (Jul 24)
 // https://www.anthropic.com/news (Opus 5.5 announcement, Sep 22)
 const RELEASES: Record<string, string> = {
@@ -11,6 +12,7 @@ const RELEASES: Record<string, string> = {
   'gpt-5.6-luna': '2026-07-09',
   'gpt-6-astra': '2026-09-03',
   'gpt-6-sol': '2026-09-22',
+  'gpt-6.1-sol': '2026-09-29',
   'gpt-6-luna': '2026-09-22',
   'claude-opus-5': '2026-07-24',
   'claude-opus-5-5': '2026-09-22',

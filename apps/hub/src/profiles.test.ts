@@ -160,6 +160,22 @@ describe('profileAccountIdentity', () => {
 })
 
 describe('readCodexProfileModelCatalog', () => {
+  it.each([{ models: [] }, { models: [{ model: 'gpt-6.1-sol', hidden: true }] }])('preserves an authoritative empty visible catalog across cached reads (%j)', ({ models }) => {
+    const profile = tmpProfile('codex-empty', 'codex')
+    try {
+      fs.writeFileSync(path.join(profile.dir, 'models_cache.json'), JSON.stringify({ models }))
+      expect(readCodexProfileModelCatalog(profile.dir)?.models).toEqual([])
+      expect(readCodexProfileModelCatalog(profile.dir)?.models).toEqual([])
+    } finally { fs.rmSync(profile.dir, { recursive: true, force: true }) }
+  })
+
+  it('does not confuse a malformed cache with an authoritative empty catalog', () => {
+    const profile = tmpProfile('codex-invalid-catalog', 'codex')
+    try {
+      fs.writeFileSync(path.join(profile.dir, 'models_cache.json'), JSON.stringify({ models: 'invalid' }))
+      expect(readCodexProfileModelCatalog(profile.dir)).toBeUndefined()
+    } finally { fs.rmSync(profile.dir, { recursive: true, force: true }) }
+  })
   it('projects preview access per account without exposing hidden models or provider instructions', () => {
     const profileA = tmpProfile('codex-a', 'codex')
     const profileB = tmpProfile('codex-b', 'codex')
