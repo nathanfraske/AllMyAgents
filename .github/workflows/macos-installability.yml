@@ -372,9 +372,12 @@ jobs:
 
       # Runs the script FROM THIS CHECKOUT, not from raw.githubusercontent, so a PR tests its own
       # version of the installer rather than whatever is currently on main.
+      # PRs use the last complete public baseline: alpha.53 was partially published without its Intel
+      # DMG. The separate installability job still builds/tests this PR on BOTH architectures. Release
+      # and explicit-tag runs verify that exact release; scheduled runs keep checking public latest.
       - name: Install via scripts/install-macos.sh
         env:
-          AMA_TAG: ${{ github.event.inputs.tag || github.event.release.tag_name }}
+          AMA_TAG: ${{ github.event.inputs.tag || github.event.release.tag_name || (github.event_name == 'pull_request' && 'v0.1.48-alpha.52') || '' }}
           # Shared macOS runner IPs routinely exhaust GitHub's anonymous release-API quota. The
           # installer already supports authenticated lookups; make this gate exercise that stable path.
           GITHUB_TOKEN: ${{ github.token }}

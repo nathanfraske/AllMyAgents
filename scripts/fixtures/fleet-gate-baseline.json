@@ -582,7 +582,7 @@
             },
             {
               "label": "Install via scripts/install-macos.sh",
-              "sha256": "b4efcf4aa02261141847b5ff1515f1729ebd1d3d2157c6bf26bd6ee38dbbe093"
+              "sha256": "a62588328487d49b3c8c2fe2ae390399c428905fec1b935ec4365d18ee3cf84a"
             },
             {
               "label": "GATE — the installed app is NOT quarantined",
