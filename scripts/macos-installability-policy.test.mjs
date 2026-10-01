@@ -61,3 +61,27 @@ test('DMG failures retain verbose bundler diagnostics without hiding the failing
   assert.doesNotMatch(step, /continue-on-error|\|\| true/)
   assert.match(workflow, /path: \|\r?\n\s+\/tmp\/ama-bundle\.log/)
 })
+
+test('release action uses headless DMG layout only on self-hosted Macs without dropping signed bundles', () => {
+  const release = parse(fs.readFileSync(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8'))
+  const build = release.jobs.release.steps.find(step => step.uses === 'tauri-apps/tauri-action@v0')
+  assert.equal(build.env.CI, 'true')
+  for (const [os, environment, expected] of [
+    ['macOS', 'self-hosted', 'false'],
+    ['macOS', 'github-hosted', 'true'],
+    ['Windows', 'self-hosted', 'true'],
+    ['Linux', 'self-hosted', 'true'],
+  ]) {
+    const override = vm.runInNewContext(build.env.TAURI_BUNDLER_DMG_IGNORE_CI.slice(3, -2), {
+      runner: { os, environment },
+    }, { timeout: 1000 })
+    assert.equal(override, expected, `${environment}/${os}`)
+  }
+  assert.equal(build['continue-on-error'], undefined)
+  assert.equal(build.with.releaseDraft, true)
+  assert.equal(build.with.includeUpdaterJson, true)
+  assert.doesNotMatch(build.with.args, /--no-sign|--bundles/)
+  const config = JSON.parse(fs.readFileSync(new URL('../apps/desktop/src-tauri/tauri.conf.json', import.meta.url), 'utf8'))
+  assert(config.bundle.targets.includes('dmg'))
+  assert.equal(config.bundle.createUpdaterArtifacts, true)
+})

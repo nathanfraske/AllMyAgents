@@ -238,7 +238,7 @@
             },
             {
               "label": "Build, sign, and stage (tauri-action)",
-              "sha256": "106cc1afcc21319bf4355cbc82a76f4d770ecaaa169766f7b41689710023058a"
+              "sha256": "cb660ab3052942d03cc855464ea26d804e3150dfbf9bca1d010f1f060ae52519"
             }
           ]
         },
