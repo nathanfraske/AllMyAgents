@@ -1,7 +1,7 @@
 name: Release
 
 # Build + sign the desktop installers for Windows and macOS on a version tag, generate the Tauri v2
-# updater artifacts + latest.json, and attach everything to a GitHub PRE-release.
+# updater artifacts + latest.json, and stage everything in one draft. Publish only after all platforms pass.
 #
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
 #  ⚠️ OPERATOR SETUP #1 — the UPDATER signing keypair (required; a key, not a server)
@@ -90,7 +90,7 @@ on:
     tags:
       - 'v*'
 
-# tauri-action creates the GitHub Release and uploads the installers/updater assets to it.
+# The launch gate creates the draft; builders upload assets; the final gate publishes it.
 permissions:
   contents: write
   actions: write
@@ -161,12 +161,19 @@ jobs:
     name: installed launch-and-repair gate
     runs-on: ubuntu-latest
     timeout-minutes: 55
+    outputs:
+      release_id: ${{ steps.draft.outputs.release_id }}
     steps:
       - uses: actions/checkout@v4
       - name: Dispatch exact-tag durability verification and wait for both platforms
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node scripts/wait-release-verification.mjs
+      - name: Prepare the exact-source draft release
+        id: draft
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/release-promotion.mjs prepare
 
   release:
     name: build (${{ matrix.platform }})
@@ -254,15 +261,15 @@ jobs:
         run: node scripts/release-notes-output.mjs "${{ github.ref_name }}"
 
       # A release whose installers carry no updater artifacts cannot ever auto-update the fleet, and
-      # that is silent otherwise — you only find out when alpha.2 never reaches anyone. Warn loudly
-      # (not fatal: an operator may deliberately cut an unsigned smoke-test build).
+      # that is silent otherwise — you only find out when alpha.2 never reaches anyone. An unsigned
+      # build may finish as a draft, but the final publication gate requires signed updater assets.
       - name: Warn if the updater signing key is missing
         shell: bash
         env:
           HAS_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
         run: |
           if [ "$HAS_KEY" != "true" ]; then
-            echo "::warning title=No updater signing key::TAURI_SIGNING_PRIVATE_KEY is not set. This release will ship installers with NO signed updater artifacts and NO latest.json, so no installed build can auto-update from it. See the OPERATOR SETUP #1 header in .github/workflows/release.yml."
+            echo "::warning title=No updater signing key::TAURI_SIGNING_PRIVATE_KEY is not set. Installers may be built into the draft, but publication requires signed updater artifacts and latest.json. See the OPERATOR SETUP #1 header in .github/workflows/release.yml."
           fi
 
       # REFUSE TO PUBLISH A RELEASE NOBODY CAN RECEIVE.
@@ -410,7 +417,7 @@ jobs:
       # macOS .app + .dmg — tauri.conf.json's `targets` list is filtered per host OS), and, once
       # bundle.createUpdaterArtifacts is true and the signing key is present, also emits the SIGNED
       # updater artifacts and (with includeUpdaterJson) the latest.json manifest — all uploaded to a
-      # GitHub pre-release.
+      # same draft release. The final job alone changes visibility after every build succeeds.
       - name: Place Windows bundling tools outside the SYSTEM profile
         if: runner.os == 'Windows'
         shell: pwsh
@@ -418,7 +425,7 @@ jobs:
           $path=Join-Path $env:GITHUB_WORKSPACE 'apps/desktop/fleet-release-config.json'
           [IO.File]::WriteAllText($path,'{"bundle":{"useLocalToolsDir":true}}',[Text.UTF8Encoding]::new($false))
 
-      - name: Build, sign, and publish (tauri-action)
+      - name: Build, sign, and stage (tauri-action)
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -428,7 +435,9 @@ jobs:
           # would define it as an empty string again and resurrect the codesign failure described above.
         with:
           projectPath: apps/desktop
-          args: ${{ runner.os == 'Windows' && '--config fleet-release-config.json' || '' }}
+          args: ${{ runner.os == 'Windows' && '--verbose --config fleet-release-config.json' || '--verbose' }}
+          releaseId: ${{ needs.launch-and-repair-gate.outputs.release_id }}
+          releaseDraft: true
           tagName: ${{ github.ref_name }}
           releaseName: 'AllMyAgents ${{ github.ref_name }}'
           releaseBody: ${{ steps.release_notes.outputs.body }}
@@ -449,16 +458,34 @@ jobs:
           includeUpdaterJson: true
 
   publish-linux-testbed:
-    name: Publish qualified Linux remote-node packages
-    needs: [release, linux-testbed]
+    name: Stage qualified Linux remote-node packages
+    needs: [launch-and-repair-gate, release, linux-testbed]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: linux-testbed-*
           path: linux-testbed
           merge-multiple: true
+      - name: Verify the exact-source draft before attaching packages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.launch-and-repair-gate.outputs.release_id }}
+        run: node scripts/release-promotion.mjs check
       - name: Attach packages to the exact desktop release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "$GITHUB_REF_NAME" linux-testbed/*.deb* --repo "$GITHUB_REPOSITORY" --clobber
+
+  publish-release:
+    name: Publish the complete qualified release
+    needs: [launch-and-repair-gate, release, publish-linux-testbed]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify all platform assets and publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.launch-and-repair-gate.outputs.release_id }}
+        run: node scripts/release-promotion.mjs publish

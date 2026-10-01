@@ -14,8 +14,21 @@
   let unread = $state(0)
   let now = $state(Date.now())
   let error = $state('')
+  let refreshing = false
+  // Only opaque IDs are retained locally. The inbox remains authoritative, but a lost acknowledgement
+  // must not turn a window reload into another burst of the same desktop failures.
+  const deliveryKey = 'ama.desktop-notification-deliveries.v1'
+  const deliveredHere = new Set<string>()
+  try {
+    const saved: unknown = JSON.parse(localStorage.getItem(deliveryKey) ?? '[]')
+    if (Array.isArray(saved)) for (const id of saved.slice(-1_000)) {
+      if (typeof id === 'string' && id.length <= 256) deliveredHere.add(id)
+    }
+  } catch { /* local storage can be unavailable; this window still deduplicates */ }
 
   async function refresh(): Promise<void> {
+    if (refreshing) return
+    refreshing = true
     try {
       const inbox = await api.notifications(100)
       items = inbox.items
@@ -24,27 +37,33 @@
       await deliverDesktop(inbox.items)
     } catch (reason) {
       error = reason instanceof Error ? reason.message : String(reason)
-    }
+    } finally { refreshing = false }
   }
 
   async function deliverDesktop(records: NotificationRecord[]): Promise<void> {
     if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return
     const pending = records
-      .filter((record) => record.desktopEligible && !record.desktopDeliveredAt)
+      .filter((record) => record.desktopEligible && !record.desktopDeliveredAt && !record.readAt)
       .slice()
       .reverse()
       .slice(0, 8)
     const delivered: string[] = []
     for (const record of pending) {
       try {
-        new Notification(record.title, { body: record.body, tag: record.id })
+        if (!deliveredHere.has(record.id)) {
+          new Notification(record.title, { body: record.body, tag: record.id })
+          deliveredHere.add(record.id)
+          while (deliveredHere.size > 1_000) deliveredHere.delete(deliveredHere.values().next().value!)
+          try { localStorage.setItem(deliveryKey, JSON.stringify([...deliveredHere])) } catch { /* memory fallback */ }
+        }
         delivered.push(record.id)
       } catch {
         break
       }
     }
     if (delivered.length) {
-      await api.markNotificationsDesktopDelivered(delivered)
+      const result = await api.markNotificationsDesktopDelivered(delivered)
+      if ('error' in result) throw new Error(result.error)
       const deliveredIds = new Set(delivered)
       items = items.map((record) => deliveredIds.has(record.id)
         ? { ...record, desktopDeliveredAt: new Date().toISOString() }

@@ -23,11 +23,14 @@
       else {
         deliveryWarning = result.warning ?? ''
         opened = false
-        // Keep the current record until the next roster refresh; only retire this exact request.
-        if (action === 'retry') request.session.toolHelp = request.session.toolHelp?.filter(item => item.id !== request.item.id)
-        else request.item.status = action === 'diagnose' ? 'investigating' : 'skipped'
+        // Replace the array so an older in-flight roster cannot resurrect this exact decision.
+        const record = store.sessions[request.session.id]?.record
+        if (record) record.toolHelp = record.toolHelp?.flatMap(item => item.id !== request.item.id
+          ? [item] : action === 'retry' ? [] : [{ ...item, status: action === 'diagnose' ? 'investigating' : 'skipped' }])
       }
-      await store.refreshSideData()
+      // Side data contains approvals/questions, not tool holds. Read the canonical session record,
+      // including the new incident identity issued for a bounded diagnosis.
+      await store.syncRecordsFromHub()
     } catch (reason) {
       error = reason instanceof Error ? reason.message : String(reason)
     } finally { busy = false }

@@ -19,8 +19,10 @@ let hubctlEntry = ''
 
 const fixtureHub = `
 import fs from 'node:fs'
+import crypto from 'node:crypto'
 import http from 'node:http'
 import path from 'node:path'
+import { takeAgentToolSecret } from './agentBridgeAuth.js'
 import { runHubPreflight } from './preflight.js'
 import { verifyNormalJournalLineage } from './journalRecovery.js'
 import { parseProfileGenerationEnvironment, SCHEMA_VERSION } from './restartHandshake.js'
@@ -39,6 +41,9 @@ const marker = (name) => path.join(stateDir, name)
 const mark = (name) => fs.writeFileSync(marker(name), String(process.pid))
 const has = (name) => fs.existsSync(marker(name))
 const role = requestedPort === 0 ? 'green' : 'blue'
+const bridgeSecret = takeAgentToolSecret(true)
+fs.writeFileSync(marker(role + '-bridge-fingerprint'), crypto.createHash('sha256').update(bridgeSecret).digest('hex'))
+if (process.env.HUB_AGENT_TOOL_SECRET !== undefined) throw new Error('bridge credential leaked to child environment')
 const profileAuthority = parseProfileGenerationEnvironment(process.env)
 if (profileAuthority.active !== (role === 'blue')) {
   throw new Error('fixture hub received the wrong profile public-generation role')
@@ -975,6 +980,9 @@ describe('hubctl live-blue death during backup handoff', () => {
     await capture.waitFor(/blue retiring|post-flip cleanup error/)
     await new Promise<void>((resolve) => setImmediate(resolve))
 
+    expect(fs.readFileSync(path.join(stateDir, 'green-bridge-fingerprint'), 'utf8')).toBe(
+      fs.readFileSync(path.join(stateDir, 'blue-bridge-fingerprint'), 'utf8')
+    )
     expect(capture.text).not.toContain('EADDRINUSE')
     expect(capture.count('live hub is down — respawning')).toBe(0)
   }, 15_000)

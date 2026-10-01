@@ -1,7 +1,7 @@
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   defaultMyOwnMeshSocketPath,
   mergeFleetPeers,
@@ -17,6 +17,36 @@ const allMyStuffPeer = (device_id: string, status = 'active') => ({
   device_id,
   status,
   capabilities: { tags: ['allmystuff', 'sites'] },
+})
+
+describe('inbound RPC reply acknowledgements', () => {
+  it.each(['rejected', 'unknown'] as const)('observes a %s acknowledgement without replaying the handler', async outcome => {
+    const secretContent = 'private-file-content-not-for-diagnostics'
+    const request = vi.fn(async (_input: Record<string, unknown>, _timeout?: number) => {
+      if (request.mock.calls.length > 1) return { ok: true }
+      if (outcome === 'unknown') throw new Error('acknowledgement lost')
+      return { ok: false, error: `reply rejected: ${secretContent}` }
+    })
+    const handler = vi.fn(async () => ({ content: secretContent }))
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const bridge = new MyOwnMeshRpcBridge(request as MyOwnMeshControlRequest)
+    bridge.setHandler(handler)
+    try {
+      await (bridge as unknown as { handleFrame(frame: Record<string, unknown>): Promise<void> }).handleFrame({
+        kind: 'rpc_inbound', method: 'allmyagents.hub.v1', request_id: 'request-1', network: 'fleet', from: 'peer', payload: {},
+      })
+      expect(handler).toHaveBeenCalledTimes(1)
+      expect(request).toHaveBeenCalledTimes(outcome === 'rejected' ? 2 : 1)
+      if (outcome === 'rejected') expect(request.mock.calls[1]).toEqual([
+        expect.objectContaining({ op: 'rpc_respond', request_id: 'request-1', error: expect.stringMatching(/reply.*rejected.*may have completed/i) }),
+        10_000,
+      ])
+      expect(warn).toHaveBeenCalledWith('[myownmesh-rpc] reply delivery failed', expect.objectContaining({
+        requestId: 'request-1', outcome, responseBytes: expect.any(Number),
+      }))
+      expect(JSON.stringify(warn.mock.calls)).not.toContain(secretContent)
+    } finally { warn.mockRestore(); bridge.stop() }
+  })
 })
 
 describe('site-free MyOwnMesh RPC network selection', () => {

@@ -105,10 +105,15 @@ describe('Codex discovery protocol', () => {
     vi.spyOn(client, 'ensureStarted').mockResolvedValue()
     const request = vi.spyOn(client, 'request')
       .mockResolvedValueOnce({ data: [{ model: 'new-model', displayName: 'New Model', hidden: false }], nextCursor: 'second' })
-      .mockResolvedValueOnce({ data: [{ model: 'hidden', hidden: true }, { model: 'another', releasedAt: '2026-09-22' }], nextCursor: null })
+      .mockResolvedValueOnce({ data: [{ model: 'hidden', hidden: true }, {
+        model: 'gpt-6.1-sol', displayName: 'GPT-6.1 Sol', releasedAt: '2026-09-29',
+        supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'].map(reasoningEffort => ({ reasoningEffort })),
+        defaultReasoningEffort: 'medium', isDefault: true,
+      }], nextCursor: null })
     const result = await client.listModels()
-    expect(result.map(row => row.slug)).toEqual(['new-model', 'another'])
-    expect(result[1]?.releasedAt).toBe('2026-09-22T00:00:00.000Z')
+    expect(result.map(row => row.slug)).toEqual(['new-model', 'gpt-6.1-sol'])
+    expect(result[1]).toMatchObject({ releasedAt: '2026-09-29T00:00:00.000Z',
+      supportedEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultEffort: 'medium', isDefault: true })
     expect(request.mock.calls.map(call => call[0])).toEqual(['model/list', 'model/list'])
     expect(request.mock.calls[1]?.[1]).toEqual({ limit: 100, includeHidden: false, cursor: 'second' })
   })

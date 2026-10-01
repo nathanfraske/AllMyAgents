@@ -20,11 +20,15 @@ async function fixture() {
   const target = new FileTransferTarget(path.join(root, 'target-receipts'))
   cleanups.push(() => target.shutdown())
   let allowed = true, resolve!: (r: TransferFileRecord) => void
+  let requestBudget = Infinity
   let hook: ((request: FileTransferRequest, result: RemoteDeviceActionResult) => RemoteDeviceActionResult) | undefined
   const terminal = new Promise<TransferFileRecord>(r => { resolve = r })
   const completed = vi.fn((r: TransferFileRecord) => resolve(r))
   const call = vi.fn(async (_s: string, _d: string, _r: string, request: FileTransferRequest): Promise<RemoteDeviceActionResult> => {
     if (!allowed) return { ok: false, error: 'revoked' }
+    if (Buffer.byteLength(JSON.stringify(request)) > requestBudget) return {
+      ok: false, error: 'Synthetic transport rejected an oversized request', failure: { stage: 'transport' },
+    }
     try {
       const transfer = await target.execute(remote, 'peer:chat', request, () => allowed)
       const result: RemoteDeviceActionResult = { ok: true, transfer, telemetry: { transport: 'myownmesh-rpc', targetMs: 1, networkMs: 2, roundTripMs: 3 } }
@@ -36,7 +40,8 @@ async function fixture() {
   cleanups.push(() => transfers.shutdown())
   const input = { operation: 'upload' as const, device_id: 'device', root_id: 'root', local_path: 'source.bin', remote_path: 'output.bin' }
   return { root, local, remote, journal, target, transfers, input, terminal, completed, call, services,
-    revoke: () => { allowed = false }, setHook: (fn: NonNullable<typeof hook>) => { hook = fn } }
+    revoke: () => { allowed = false }, setHook: (fn: NonNullable<typeof hook>) => { hook = fn },
+    setRequestBudget: (bytes: number) => { requestBudget = bytes } }
 }
 
 it.each(['upload', 'download'] as const)('copies a whole binary %s with one model call, metadata-only coalesced progress and exact checksum', async operation => {
@@ -56,6 +61,53 @@ it.each(['upload', 'download'] as const)('copies a whole binary %s with one mode
   expect(h.completed).toHaveBeenCalledTimes(1)
   expect(await h.transfers.manage('chat', { operation: 'status', transfer_id: receipt.id })).toMatchObject({ state: 'completed' })
   await expect(h.transfers.manage('other-chat', { operation: 'status', transfer_id: receipt.id })).rejects.toThrow(/not found/)
+})
+
+it('downloads a multi-megabyte file through bounded replies with the existing v1 caller', async () => {
+  const h = await fixture(), bytes = crypto.randomBytes(9_101_212)
+  await fs.writeFile(path.join(h.remote, 'source.bin'), bytes)
+  let largestReply = 0
+  h.setHook((_request, result) => {
+    const wireBytes = Buffer.byteLength(JSON.stringify(result))
+    largestReply = Math.max(largestReply, wireBytes)
+    // Synthetic reply budget, not a claim about a live Mesh transport limit.
+    return wireBytes <= 16 * 1024 ? result : {
+      ok: false, error: 'Synthetic transport rejected an oversized reply', failure: { stage: 'protocol' },
+    }
+  })
+  await h.transfers.manage('chat', { ...h.input, operation: 'download', local_path: 'output.bin', remote_path: 'source.bin' })
+  expect(await h.terminal).toMatchObject({ state: 'completed', transferred: bytes.length, size: bytes.length, sha256: crypto.createHash('sha256').update(bytes).digest('hex') })
+  expect(largestReply).toBeLessThanOrEqual(16 * 1024)
+  expect((await fs.readFile(path.join(h.local, 'output.bin'))).equals(bytes)).toBe(true)
+  expect(h.completed).toHaveBeenCalledTimes(1)
+})
+
+it('uploads a 351163-byte archive through bounded requests', async () => {
+  const h = await fixture(), bytes = crypto.randomBytes(351_163)
+  await fs.writeFile(path.join(h.local, 'source.bin'), bytes)
+  // Synthetic envelope budget exercises the request lane separately from download replies.
+  h.setRequestBudget(16 * 1024)
+  await h.transfers.manage('chat', h.input)
+  expect(await h.terminal).toMatchObject({ state: 'completed', transferred: bytes.length, size: bytes.length, sha256: crypto.createHash('sha256').update(bytes).digest('hex') })
+  expect((await fs.readFile(path.join(h.remote, 'output.bin'))).equals(bytes)).toBe(true)
+  expect(Math.max(...h.call.mock.calls.map(args => Buffer.byteLength(JSON.stringify(args[3]))))).toBeLessThanOrEqual(16 * 1024)
+  expect(h.completed).toHaveBeenCalledTimes(1)
+})
+
+it('holds a lost upload chunk acknowledgement without replay or abort', async () => {
+  const h = await fixture(), bytes = crypto.randomBytes(35_163)
+  await fs.writeFile(path.join(h.local, 'source.bin'), bytes)
+  h.setHook((request, result) => request.operation === 'chunk' ? {
+    ok: false, error: 'lost upload chunk acknowledgement', failure: { stage: 'transport' },
+  } : result)
+  const receipt = await h.transfers.manage('chat', h.input)
+  expect(await h.terminal).toMatchObject({ state: 'outcome_unknown', transferred: 0 })
+  const reconciled = await h.transfers.manage('chat', { operation: 'status', transfer_id: receipt.id })
+  expect(reconciled).toMatchObject({ state: 'outcome_unknown', remoteReceipt: { state: 'active' } })
+  expect(reconciled.remoteReceipt!.offset).toBeGreaterThan(0)
+  expect(h.call.mock.calls.filter(args => args[3].operation === 'chunk')).toHaveLength(1)
+  expect(h.call.mock.calls.filter(args => args[3].operation === 'abort')).toHaveLength(0)
+  await expect(fs.stat(path.join(h.remote, 'output.bin'))).rejects.toMatchObject({ code: 'ENOENT' })
 })
 
 it('does not start bytes when the target lacks protocol support, or source is outside workspace/private config', async () => {

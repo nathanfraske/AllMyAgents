@@ -5,6 +5,17 @@ feature and fix log used on the corresponding GitHub release.
 
 ## Unreleased
 
+## v0.1.50-alpha.54 — 2026-09-30
+
+[Full v0.1.50-alpha.54 release notes](docs/releases/v0.1.50-alpha.54.md)
+
+- Account-discovered GPT-6.1 Sol support and bundled Codex 0.159.2; saved model selections remain unchanged.
+- Bounded whole-file upload/download and legacy testbed-update packets, with checksum verification and retained recovery staging.
+- Tool-help decisions appear in live chats and cannot be resurrected by an older roster response.
+- Hub-only restarts preserve agent-tool authentication; desktop failure notices do not replay after reload.
+- Windows, both macOS architectures and Linux node packages stage together before release publication.
+- Includes the task-first, usage-warning, manager, Daybreak and runner-routing improvements from v0.1.49.
+
 ## v0.1.43-alpha.47 — 2026-09-09
 
 [Full v0.1.43-alpha.47 release notes](docs/releases/v0.1.43-alpha.47.md)

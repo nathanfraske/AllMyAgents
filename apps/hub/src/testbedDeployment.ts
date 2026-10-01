@@ -255,6 +255,45 @@ function resultOutput(result: RemoteDeviceActionResult, operation: string): stri
   return `${result.stdout ?? ''}${result.stderr ?? ''}`
 }
 
+// Legacy paired nodes have write+exec, but not fileTransfers v1. Keep each authenticated RPC well
+// below the data-channel packet limit; never retry an uncertain write or expose bytes to the model.
+const SYNC_WRITE_CHUNK_BYTES = 8 * 1024
+type SyncAction = Parameters<RemoteDeviceController['execute']>[1]
+export async function stageTestbedFile(
+  run: (action: SyncAction) => Promise<RemoteDeviceActionResult>,
+  rootId: string,
+  nodePath: string,
+  relative: string,
+  data: Buffer,
+): Promise<void> {
+  if (!relative || path.posix.isAbsolute(relative) || relative.split('/').includes('..') || /[\r\n\0]/u.test(relative)) {
+    throw new Error('unsafe update staging path')
+  }
+  const write = async (target: string, bytes: Buffer): Promise<void> => {
+    const action: SyncAction = { op: 'write', rootId, path: target, content: bytes.toString('base64'), encoding: 'base64' }
+    if (Buffer.byteLength(JSON.stringify(action)) > 16 * 1024) throw new Error('update write envelope exceeds its bounded packet size')
+    const result = await run(action)
+    resultOutput(result, `transferring ${target}`)
+    if (result.bytes !== bytes.length) throw new Error(`target reported a short write for ${target}`)
+  }
+  if (data.length <= SYNC_WRITE_CHUNK_BYTES) { await write(relative, data); return }
+  const count = Math.ceil(data.length / SYNC_WRITE_CHUNK_BYTES)
+  for (let index = 0; index < count; index += 1) {
+    await write(`${relative}.part-${index}`, data.subarray(index * SYNC_WRITE_CHUNK_BYTES, (index + 1) * SYNC_WRITE_CHUNK_BYTES))
+  }
+  const digest = crypto.createHash('sha256').update(data).digest('hex')
+  // Assembly creates a new staged file only after checking every byte. A lost response leaves the
+  // original parts and assembly file for reconciliation; it never causes a resend or activation.
+  const script = `const fs=require('node:fs'),c=require('node:crypto');const [p,n,size,sha]=process.argv.slice(1);` +
+    `const tmp=p+'.assembling',fd=fs.openSync(tmp,'wx',0o600),h=c.createHash('sha256');let total=0;` +
+    `try{for(let i=0;i<Number(n);i++){const part=p+'.part-'+i;if(!fs.lstatSync(part).isFile())throw Error('invalid staged part');` +
+    `const b=fs.readFileSync(part);if(b.length>8192)throw Error('oversized staged part');fs.writeFileSync(fd,b);h.update(b);total+=b.length;}fs.fsyncSync(fd);}finally{fs.closeSync(fd);}` +
+    `if(total!==Number(size)||h.digest('hex')!==sha)throw Error('staged checksum mismatch');fs.linkSync(tmp,p);fs.unlinkSync(tmp);console.log(JSON.stringify({bytes:total,sha256:sha}));`
+  const command = `${shellLiteral(nodePath)} -e ${shellLiteral(script)} ${shellLiteral('/' + relative)} ${count} ${data.length} ${digest}`
+  if (Buffer.byteLength(command) > 8 * 1024) throw new Error('update assembly command exceeds its size bound')
+  resultOutput(await run({ op: 'exec', rootId, command, timeoutMs: 120_000 }), `assembling ${relative}`)
+}
+
 function parseLinuxServiceLayout(output: string): { installRoot: string; dataDir: string } {
   const script = /(?:^|[\s;])(?:"([^"]*\/dist\/testbedNode\.js)"|'([^']*\/dist\/testbedNode\.js)'|([^\s;]+\/dist\/testbedNode\.js))/u.exec(output)
   const data = /--data-dir(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^\s;]+))/u.exec(output)
@@ -294,7 +333,7 @@ function linuxApplyScript(input: {
     'mkdir -p "$ama_backup"',
     'ama_unit=/etc/systemd/system/allmyagents-testbed.service',
     'if [ -f "$ama_unit" ]; then cp -p "$ama_unit" "$ama_backup/allmyagents-testbed.service"; fi',
-    'ama_rollback=1',
+    'ama_rollback=0',
     'ama_restore() {',
     '  [ "$ama_rollback" = 1 ] || return 0',
     '  ama_rollback=0',
@@ -303,11 +342,16 @@ function linuxApplyScript(input: {
     ]),
     '  if [ -f "$ama_backup/allmyagents-testbed.service" ]; then cp -p "$ama_backup/allmyagents-testbed.service" "$ama_unit"; systemctl daemon-reload || true; fi',
     '}',
-    'trap ama_restore EXIT HUP INT TERM',
     ...input.files.map((file) => `printf '%s  %s\n' ${shellLiteral(file.sha256)} ${shellLiteral(`${input.stage}/${file.relative}`)} | sha256sum -c - >/dev/null`),
     ...changed.flatMap((relative) => [
       `mkdir -p "$(dirname "$ama_backup/${relative}")" "$(dirname "$ama_root/${relative}")"`,
       `if [ -f "$ama_root/${relative}" ]; then cp -p "$ama_root/${relative}" "$ama_backup/${relative}"; fi`,
+    ]),
+    // Arm rollback only after all checksums and all backups succeed. Previously a failed preflight
+    // could run restore against empty backups and delete untouched installed modules.
+    'ama_rollback=1',
+    'trap ama_restore EXIT HUP INT TERM',
+    ...changed.flatMap((relative) => [
       `ama_tmp="$ama_root/${relative}.ama-${input.syncId}.tmp"`,
       `cp "$ama_stage/${relative}" "$ama_tmp"`,
       `chmod ${relative === 'node' ? '0755' : '0644'} "$ama_tmp"`,
@@ -317,9 +361,7 @@ function linuxApplyScript(input: {
     `systemd-run --quiet --collect --unit=${shellLiteral(`allmyagents-testbed-restart-${input.syncId}`)} --on-active=2s /bin/systemctl restart allmyagents-testbed.service`,
     'ama_rollback=0',
     'trap - EXIT HUP INT TERM',
-    'rm -rf "$ama_root/.ama-rollback"',
-    'mv "$ama_backup" "$ama_root/.ama-rollback"',
-    'rm -rf "$ama_stage"',
+    `printf '%s\n' ${shellLiteral(JSON.stringify({ syncId: input.syncId, state: 'applied-restart-scheduled', changedFiles: changed, rollbackPath: `${input.stage}/rollback` }))} > "$ama_stage/receipt.json"`,
     `printf '%s\n' ${shellLiteral(`update ${input.syncId} applied; detached restart scheduled`)}`,
   ]
   return `${lines.join('\n')}\n`
@@ -422,6 +464,7 @@ export class TestbedDeploymentService {
     const baseEvent = { deploymentId: `sync_${syncId}`, siteId, profile: capabilities.deploymentProfile ?? 'elevated-machine' as TestbedNodeProfile }
     this.event({ ...baseEvent, stage: 'requested', detail: { operation: 'payload-sync', codePayloadId: descriptor.codePayloadId } })
     const run = (action: Parameters<RemoteDeviceController['execute']>[1]) => this.deps.remoteDevices.execute(siteId, action, actor)
+    let retainedStage: string | undefined
     try {
       const layoutResult = await run({
         op: 'exec', rootId: root.id,
@@ -456,6 +499,7 @@ export class TestbedDeploymentService {
       }
       if (changed.some((file) => file.bytes > 1024 * 1024)) throw new Error('a changed payload file exceeds the bounded remote write limit')
       const stage = path.posix.join(layout.installRoot, `.ama-sync-${syncId}`)
+      retainedStage = stage
       const stageRelative = stage.replace(/^\/+/, '')
       const started = performance.now()
       resultOutput(await run({ op: 'mkdir', rootId: root.id, path: stageRelative, recursive: true }), 'update staging')
@@ -464,15 +508,12 @@ export class TestbedDeploymentService {
         const relative = path.posix.join(stageRelative, file.relative)
         const parent = path.posix.dirname(relative)
         if (parent !== stageRelative) resultOutput(await run({ op: 'mkdir', rootId: root.id, path: parent, recursive: true }), `staging ${file.relative}`)
-        const content = fs.readFileSync(file.absolute).toString('base64')
-        const written = await run({ op: 'write', rootId: root.id, path: relative, content, encoding: 'base64' })
-        resultOutput(written, `transferring ${file.relative}`)
-        if (written.bytes !== file.bytes) throw new Error(`target reported a short write for ${file.relative}`)
+        await stageTestbedFile(run, root.id, path.posix.join(layout.installRoot, 'node'), relative, fs.readFileSync(file.absolute))
         bytesTransferred += file.bytes
       }
       const script = linuxApplyScript({ syncId, installRoot: layout.installRoot, dataDir: layout.dataDir, stage, files: changed })
       const scriptRelative = path.posix.join(stageRelative, 'apply.sh')
-      resultOutput(await run({ op: 'write', rootId: root.id, path: scriptRelative, content: script }), 'transferring update transaction')
+      await stageTestbedFile(run, root.id, path.posix.join(layout.installRoot, 'node'), scriptRelative, Buffer.from(script))
       bytesTransferred += Buffer.byteLength(script)
       const transferMs = Math.round((performance.now() - started) * 10) / 10
       this.event({ ...baseEvent, stage: 'syncing', detail: { changedFiles: changed.map((file) => file.relative), bytesTransferred, transferMs } })
@@ -507,12 +548,13 @@ export class TestbedDeploymentService {
         payloadId: descriptor.codePayloadId,
         changedFiles: changed.map((file) => file.relative), bytesTransferred, transferMs, restartMs,
         activeTransport: observed.activeTransport, verified: true,
-        rollbackPath: path.posix.join(layout.installRoot, '.ama-rollback'),
+        rollbackPath: path.posix.join(stage, 'rollback'),
       }
       this.event({ ...baseEvent, stage: 'verified', detail: { ...result } })
       return result
     } catch (error) {
       this.event({ ...baseEvent, stage: 'failed', detail: { error: (error instanceof Error ? error.message : String(error)).slice(0, 2_000) } })
+      if (retainedStage) throw new Error(`sync ${syncId} failed; inspect retained staging ${retainedStage} before any new attempt: ${error instanceof Error ? error.message : String(error)}`)
       throw error
     }
   }

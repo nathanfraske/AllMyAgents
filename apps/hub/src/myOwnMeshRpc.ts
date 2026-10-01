@@ -548,16 +548,35 @@ export class MyOwnMeshRpcBridge {
     const network = typeof frame.network === 'string' ? frame.network : ''
     const from = typeof frame.from === 'string' ? canonicalDevice(frame.from) : ''
     if (!requestId || !network || !from) return
-    try {
-      const result = await this.handler({ network, from, payload: frame.payload })
-      await this.request({ op: 'rpc_respond', request_id: requestId, ok: result ?? null }, 10_000)
-    } catch (error) {
-      await this.request({
-        op: 'rpc_respond',
-        request_id: requestId,
-        error: (error instanceof Error ? error.message : String(error)).slice(0, MAX_ERROR_CHARS),
-      }, 10_000).catch(() => undefined)
+    let result: unknown
+    try { result = await this.handler({ network, from, payload: frame.payload }) }
+    catch (error) {
+      await this.respond(requestId, { error: (error instanceof Error ? error.message : String(error)).slice(0, MAX_ERROR_CHARS) })
+      return
     }
+    const outcome = await this.respond(requestId, { ok: result ?? null })
+    if (outcome === 'rejected') {
+      // An explicit negative ACK permits one compact error response, not another execution of the
+      // handler. A missing ACK is ambiguous: do not send a competing response or replay the action.
+      await this.respond(requestId, { error: 'MyOwnMesh reply was rejected; the target action may have completed. Inspect its receipt before retrying.' })
+    }
+  }
+
+  private async respond(requestId: string, reply: { ok: unknown } | { error: string }): Promise<'accepted' | 'rejected' | 'unknown'> {
+    let responseBytes = 0
+    let outcome: 'rejected' | 'unknown' = 'unknown'
+    try {
+      const request = { op: 'rpc_respond', request_id: requestId, ...reply }
+      responseBytes = Buffer.byteLength(JSON.stringify(request)) + 1
+      const acknowledgement = await this.request(request, 10_000)
+      if (acknowledgement.ok) return 'accepted'
+      outcome = 'rejected'
+    } catch { /* An unconfirmed response must never cause another handler execution. */ }
+    // Do not log payloads, raw daemon errors (which may echo payloads), or credentials.
+    console.warn('[myownmesh-rpc] reply delivery failed', {
+      requestId: requestId.slice(0, 200).replace(/[\x00-\x1f\x7f]/gu, '?'), responseBytes, outcome,
+    })
+    return outcome
   }
 
   private scheduleReconnect(): void {

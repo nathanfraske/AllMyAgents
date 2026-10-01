@@ -12,10 +12,46 @@ beforeEach(() => {
   store.sessions = { worker: session() }; store.selectedId = 'other'
   vi.spyOn(store, 'select').mockImplementation(() => {})
   vi.spyOn(store, 'refreshSideData').mockResolvedValue(undefined)
+  vi.spyOn(store, 'syncRecordsFromHub').mockResolvedValue(undefined)
   HTMLDialogElement.prototype.showModal = function () { this.setAttribute('open', '') }
   HTMLDialogElement.prototype.close = function () { this.removeAttribute('open') }
 })
 afterEach(() => { cleanup(); vi.restoreAllMocks(); store.sessions = {} })
+
+it('shows newly persisted holds through the real roster refresh and clears the exact operator decision', async () => {
+  vi.mocked(store.syncRecordsFromHub).mockRestore()
+  vi.spyOn(api, 'profiles').mockResolvedValue([])
+  const waiting = session() as unknown as { record: import('./api').SessionRecord }
+  const roster = vi.spyOn(api, 'sessions').mockResolvedValue([waiting.record])
+  store.sessions.worker!.record.toolHelp = undefined
+  render(ToolHelpAttention)
+  expect(screen.queryByLabelText('Operator tool help')).toBeNull()
+
+  await store.syncRecordsFromHub(); await tick()
+  await fireEvent.click(screen.getByText('Review tool failure'))
+  const decide = vi.spyOn(api, 'resolveToolHelp').mockImplementation(async () => {
+    roster.mockResolvedValue([{ ...waiting.record, toolHelp: [] }])
+    return { ok: true }
+  })
+  await fireEvent.click(screen.getByText('I fixed it — allow retry'))
+  expect(decide).toHaveBeenCalledWith('worker', 'incident', 'retry')
+  expect(screen.queryByLabelText('Operator tool help')).toBeNull()
+})
+
+it('does not resurrect a resolved hold from a roster request started before the decision', async () => {
+  vi.mocked(store.syncRecordsFromHub).mockRestore()
+  vi.spyOn(api, 'profiles').mockResolvedValue([])
+  let finish!: (records: import('./api').SessionRecord[]) => void
+  vi.spyOn(api, 'sessions').mockImplementation(() => new Promise(resolve => { finish = resolve }))
+  vi.spyOn(api, 'resolveToolHelp').mockResolvedValue({ ok: true })
+  render(ToolHelpAttention)
+  const refreshing = store.syncRecordsFromHub()
+  await fireEvent.click(screen.getByText('Review tool failure'))
+  await fireEvent.click(screen.getByText('I fixed it — allow retry'))
+  finish([(session() as unknown as { record: import('./api').SessionRecord }).record])
+  await refreshing; await tick()
+  expect(screen.queryByLabelText('Operator tool help')).toBeNull()
+})
 
 it('shows metadata only until explicitly opened and resolves the exact pinned request', async () => {
   const decide = vi.spyOn(api, 'resolveToolHelp').mockResolvedValue({ ok: true })

@@ -7,6 +7,7 @@ import type { AllMyStuffPlanes } from './allMyStuffPlanes.js'
 import type { MyOwnMeshRpcBridge } from './myOwnMeshRpc.js'
 import type { DeviceExecutorCapabilities, RemoteDeviceController } from './remoteDevices.js'
 import {
+  stageTestbedFile,
   TestbedDeploymentService,
   verifyTestbedBundle,
   type TestbedDeploymentEvent,
@@ -238,7 +239,8 @@ describe('lightweight testbed deployment orchestration', () => {
       } } : {}),
     }))
     const writes: string[] = []
-    const execute = vi.fn(async (_siteId: string, action: { op: string; command?: string; path?: string; content?: string }) => {
+    let applyScript = ''
+    const execute = vi.fn(async (_siteId: string, action: { op: string; command?: string; path?: string; content?: string; encoding?: string }) => {
       if (action.op === 'exec' && action.command?.startsWith('systemctl show')) {
         return { ok: true, stdout: 'path=/home/admini/amt/node ; argv[]=/home/admini/amt/node /home/admini/amt/dist/testbedNode.js run --data-dir /home/admini/amt/data ;' }
       }
@@ -248,7 +250,9 @@ describe('lightweight testbed deployment orchestration', () => {
       if (action.op === 'mkdir') return { ok: true, created: true }
       if (action.op === 'write') {
         writes.push(action.path ?? '')
-        return { ok: true, bytes: Buffer.from(action.content ?? '', action.path?.endsWith('apply.sh') ? 'utf8' : 'base64').length }
+        const data = Buffer.from(action.content ?? '', action.encoding === 'base64' ? 'base64' : 'utf8')
+        if (action.path?.endsWith('apply.sh')) applyScript = data.toString('utf8')
+        return { ok: true, bytes: data.length }
       }
       if (action.op === 'exec' && action.command?.includes('/apply.sh')) {
         committed = true
@@ -271,10 +275,44 @@ describe('lightweight testbed deployment orchestration', () => {
       verified: true,
       activeTransport: 'myownmesh-rpc',
       changedFiles: expect.arrayContaining(['build.json', 'dist/myOwnMeshRpc.js']),
-      rollbackPath: '/home/admini/amt/.ama-rollback',
+      rollbackPath: expect.stringMatching(/^\/home\/admini\/amt\/\.ama-sync-[a-f0-9]+\/rollback$/u),
     })
     expect(writes.some((value) => value.includes(firstModule))).toBe(false)
     expect(writes.some((value) => /apply\.sh$/u.test(value))).toBe(true)
     expect(capabilities.mock.calls.length).toBeGreaterThanOrEqual(2)
+    expect(applyScript.indexOf('sha256sum -c')).toBeLessThan(applyScript.indexOf('trap ama_restore'))
+    expect(applyScript.lastIndexOf('"$ama_backup/build.json"')).toBeLessThan(applyScript.indexOf('trap ama_restore'))
+    expect(applyScript).toContain('receipt.json')
+    expect(applyScript).not.toContain('rm -rf')
+  })
+
+  it('stages a legacy oversized module below the RPC packet budget and verifies assembly before activation', async () => {
+    const data = crypto.randomBytes(110_001)
+    const writes: Buffer[] = []
+    const actions: Array<{ op: string; command?: string }> = []
+    await stageTestbedFile(async action => {
+      expect(Buffer.byteLength(JSON.stringify(action))).toBeLessThan(16 * 1024)
+      actions.push(action)
+      if (action.op === 'write') {
+        expect(action.path).toBe(`opt/testbed/.ama-sync-case/dist/remoteDevices.js.part-${writes.length}`)
+        writes.push(Buffer.from(action.content, 'base64'))
+        return { ok: true, bytes: writes.at(-1)!.length }
+      }
+      expect(action.op).toBe('exec')
+      const digest = crypto.createHash('sha256').update(data).digest('hex')
+      expect((action as { command: string }).command).toContain(digest)
+      expect((action as { command: string }).command).toContain('fs.linkSync(tmp,p)')
+      return { ok: true, exitCode: 0 }
+    }, 'root', '/opt/testbed/node', 'opt/testbed/.ama-sync-case/dist/remoteDevices.js', data)
+    expect(Buffer.concat(writes)).toEqual(data)
+    expect(writes.every(part => part.length <= 8192)).toBe(true)
+    expect(actions.filter(action => action.op === 'exec')).toHaveLength(1)
+  })
+
+  it('does not replay a failed staging write or assemble/activate its partial module', async () => {
+    const run = vi.fn(async () => ({ ok: false as const, error: 'uncertain transport acknowledgement' }))
+    await expect(stageTestbedFile(run, 'root', '/opt/testbed/node', 'opt/testbed/.ama-sync-case/dist/node.js', Buffer.alloc(100_000)))
+      .rejects.toThrow(/uncertain transport acknowledgement/u)
+    expect(run).toHaveBeenCalledTimes(1)
   })
 })

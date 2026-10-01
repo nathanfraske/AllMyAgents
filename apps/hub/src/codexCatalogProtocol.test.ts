@@ -10,7 +10,7 @@ it('qualifies the pinned native catalog and Daybreak wire contract without start
   const require = createRequire(import.meta.url)
   const launcher = require.resolve('@openai/codex/bin/codex.js')
   const installed = JSON.parse(fs.readFileSync(path.resolve(path.dirname(launcher), '../package.json'), 'utf8'))
-  expect(installed.version).toBe('0.156.1')
+  expect(installed.version).toBe('0.159.2')
   const out = fs.mkdtempSync(path.join(os.tmpdir(), 'ama-codex-schema-'))
   try {
     // Offline schema generation only: no app-server listener, auth read, account refresh or inference.

@@ -274,7 +274,9 @@ Use `remote_transfer_file` with `operation: "upload"` or `"download"`, the grant
 The initial response returns immediately with a `transfer_id`. Keep it: completion mail is delivered
 once; `operation: "status"` reads its receipt and `operation: "cancel"` requests cancellation.
 Do not repeatedly send file bytes through model tool calls. The hub performs the byte loop itself with
-512 KiB buffers, asynchronous file I/O, and incremental SHA-256 verification. Progress updates at most
+512 KiB local/upload buffers and conservative 8 KiB remote-read replies, asynchronous file I/O, and
+incremental SHA-256 verification. The smaller replies remain compatible with v1 callers and are not
+a claimed Mesh transport limit. Progress updates at most
 once per second in one stable chat row. Journal and completion messages contain metadata, not file bytes.
 These transfers do not consume chat attachment storage. Publishing a finished download as a chat artifact
 is a separate, explicit operation with its own attachment quota.

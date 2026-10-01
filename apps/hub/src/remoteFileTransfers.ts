@@ -42,6 +42,8 @@ export class RemoteFileTransfers {
   private stopped = false
   private stopping = false
   constructor(private journal: Journal, directory: string, private services: Services) {
+    // Upload reads become remote write requests, just as download reads become RPC replies.
+    // Bound both directions; the larger accepted v1 chunk limit is not a safe wire buffer size.
     this.local = new FileTransferTarget(directory)
     journal.db.exec('CREATE TABLE IF NOT EXISTS remote_file_transfers (id TEXT PRIMARY KEY, session TEXT NOT NULL, state TEXT NOT NULL, record TEXT NOT NULL); CREATE INDEX IF NOT EXISTS remote_file_transfers_state ON remote_file_transfers(state)')
     const rows = journal.db.prepare("SELECT record FROM remote_file_transfers WHERE state='running'").all() as { record: string }[]
