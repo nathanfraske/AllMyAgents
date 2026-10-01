@@ -429,6 +429,11 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI: 'true'
+          # tauri-action defaults this override to true, forcing Finder layout even on headless Macs.
+          # Restore Tauri's supported CI mode only on the local Mac fleet. This skips cosmetic
+          # AppleScript, not DMG creation, code signing, updater signatures or installer qualification.
+          TAURI_BUNDLER_DMG_IGNORE_CI: ${{ runner.os == 'macOS' && runner.environment == 'self-hosted' && 'false' || 'true' }}
           # The signing vars (OPERATOR SETUP #1 and #2) are deliberately NOT listed here. They are
           # exported by the step above, and only when the corresponding secret is actually set. Do not
           # add them back: a step-level `env:` entry wins over the job environment, so re-listing one
